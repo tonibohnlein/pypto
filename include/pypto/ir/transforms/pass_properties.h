@@ -261,6 +261,12 @@ inline const PassProperties kCanonicalizeIOOrderProperties{
 inline const PassProperties kDeriveCallDirectionsProperties{.required = {IRProperty::SplitIncoreOrch},
                                                             .produced = {IRProperty::CallDirectionsResolved}};
 
+inline const PassProperties kExpandManualPhaseFenceProperties{
+    .required = {IRProperty::NoNestedCalls, IRProperty::NormalizedStmtStructure,
+                 IRProperty::CallDirectionsResolved},
+    .produced = {IRProperty::NoNestedCalls, IRProperty::NormalizedStmtStructure,
+                 IRProperty::CallDirectionsResolved}};
+
 // -- No-op tile.reshape folding pass -----------------------------------------
 
 inline const PassProperties kFoldNoOpReshapeProperties{

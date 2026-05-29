@@ -84,6 +84,7 @@ struct PassProperties {
 | FoldNoOpReshape | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
 | FuseCreateAssembleToSlice | — | — | — |
 | DeriveCallDirections | SplitIncoreOrch | CallDirectionsResolved | — |
+| ExpandManualPhaseFence | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | — |
 | CollectCommGroups | — | CommGroupsCollected | — |
 | Simplify | — | — | — |
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
@@ -392,9 +393,10 @@ The PTO-oriented tile stage shared by `Default` and `DebugTileOptimization` is:
 19. [`FoldNoOpReshape`](32-fold_no_op_reshape.md)
 20. [`FuseCreateAssembleToSlice`](33-fuse_create_assemble_to_slice.md)
 21. [`DeriveCallDirections`](34-derive_call_directions.md)
-22. [`CollectCommGroups`](35-collect_comm_groups.md) (distributed: WindowBuffer + Program.comm_groups_; no-op for comm-less programs)
-23. `Simplify`
-24. [`MaterializeRuntimeScopes`](36-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
+22. [`ExpandManualPhaseFence`](35-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
+23. [`CollectCommGroups`](36-collect_comm_groups.md) (distributed: WindowBuffer + Program.comm_groups_; no-op for comm-less programs)
+24. `Simplify`
+25. [`MaterializeRuntimeScopes`](37-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
 
 `DebugTileOptimization` is a debug-only strategy for inspecting this tile stage
 without the tensor-only prefix passes. Use `Default` for normal compilation and

@@ -916,6 +916,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // TaskId of a ``pl.submit(...)`` call is handled separately (see
       // ``GenerateSubmitReturnAliases``) — it is a tuple element of the
       // kernel Call, not a standalone op.
+      if (op_name == "system.task_dummy") {
+        INTERNAL_CHECK_SPAN(call->GetAttr<bool>(kAttrDummyTask, false), assign->span_)
+            << "Internal error: system.task_dummy must be marked with attrs['" << kAttrDummyTask << "']";
+        EmitDummyTask(call, var_name);
+        manual_task_id_map_[assign->var_.get()] = var_name;
+        return;
+      }
       if (op_name == "system.task_invalid") {
         // The Python literal ``None`` in a TaskId position lowers here.
         code_ << Indent() << "PTO2TaskId " << var_name << " = PTO2TaskId::invalid();\n";
@@ -960,6 +967,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
             if (auto extent = As<ConstInt>(arr_ty->extent())) {
               RegisterArrayCarry(assign->var_.get(), var_name, extent->value_);
             }
+          }
+        } else if (op_name == "array.get_element") {
+          auto scalar_ty = As<ScalarType>(assign->var_->GetType());
+          if (scalar_ty && scalar_ty->dtype_ == DataType::TASK_ID) {
+            manual_task_id_map_[assign->var_.get()] = var_name;
           }
         }
       } else if (!IsBuiltinOp(op_name)) {
@@ -1666,6 +1678,29 @@ class OrchestrationStmtCodegen : public CodegenBase {
       code_ << Indent() << task_var << ".set_dependencies(" << deps_arr << ", " << deps_cnt << ");\n";
       break;
     }
+  }
+
+  void EmitDummyTask(const CallPtr& call, const std::string& tid_name) {
+    const int barrier_idx = phase_fence_barrier_counter_++;
+    const std::string task_var = "params_phase_fence_barrier_" + std::to_string(barrier_idx);
+    const std::string deps_cnt = task_var + "_deps_count";
+    const std::string outs_var = "phase_fence_barrier_" + std::to_string(barrier_idx) + "_outs";
+    const size_t dep_capacity = CountManualDeps(call);
+    code_ << "\n";
+    code_ << Indent() << "// Phase-fence barrier " << barrier_idx << ": dependency-only dummy task\n";
+    EmitTaskParamsDecl(Indent(), task_var);
+    if (dep_capacity > 0) {
+      EmitManualDeps(call, task_var);
+    } else {
+      code_ << Indent() << "uint32_t " << deps_cnt << " = 0;\n";
+    }
+    code_ << Indent() << "PTO2TaskId " << tid_name << " = PTO2TaskId::invalid();\n";
+    code_ << Indent() << "if (" << deps_cnt << " > 0) {\n";
+    indent_ += 4;
+    code_ << Indent() << "TaskOutputTensors " << outs_var << " = rt_submit_dummy_task(" << task_var << ");\n";
+    code_ << Indent() << tid_name << " = " << outs_var << ".task_id();\n";
+    indent_ -= 4;
+    code_ << Indent() << "}\n";
   }
 
   static constexpr size_t kMaxAllocTensorsArgs = 16;
@@ -2491,6 +2526,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::string current_result_var_;
   std::vector<VarPtr> current_return_vars_;
   int task_counter_ = 0;
+  int phase_fence_barrier_counter_ = 0;
   int alloc_counter_ = 0;
   /// Depth of nested ``RuntimeScopeStmt(manual=true)``. While > 0, the codegen
   /// suppresses the implicit ``PTO2_SCOPE()`` wrapper around ForStmt/IfStmt
