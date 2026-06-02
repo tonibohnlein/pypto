@@ -461,6 +461,14 @@ def optimize_orch_tensors() -> Pass:
 def flatten_tile_nd_to_2d() -> Pass:
     """Create a pass that flattens ND tile ops to 2D in InCore functions."""
 
+def auto_fuse() -> Pass:
+    """Create the AutoFuse pass: automatic operator fusion + tile-size selection.
+
+    For each function marked with the ``auto_fuse`` attribute, extracts the
+    tensor-op DAG and runs the MLSys graph-scheduling solver to choose a
+    memory-reuse partition (fusion groups) and tile granularity.
+    """
+
 def auto_tile_matmul_l0() -> Pass:
     """Create a pass that auto-tiles static 2D ``tile.matmul`` / ``tile.matmul_acc`` for L0.
 

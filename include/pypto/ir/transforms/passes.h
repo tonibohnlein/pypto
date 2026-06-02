@@ -462,6 +462,17 @@ Pass FlattenTileNdTo2D();
 Pass AutoTileMatmulL0();
 
 /**
+ * @brief Create the AutoFuse pass — automatic operator fusion + tile sizing.
+ *
+ * For each function carrying the ``auto_fuse`` attribute, extracts the
+ * tensor-op DAG and uses the MLSys graph-scheduling solver (linked from
+ * 3rdparty/mlsys26) to choose a memory-reuse partition (fusion groups) and tile
+ * granularity. v0 builds the problem and solves it; the IR rewrite that emits
+ * InCoreScopeStmt regions from the schedule is the next increment.
+ */
+Pass AutoFuse();
+
+/**
  * @brief Canonicalize Mat-resident ``tile.slice`` into ``tile.extract``
  *
  * A ``tile.slice`` whose result tile is ``Mem.Mat`` is a legal high-level
