@@ -516,6 +516,14 @@ def legalize_tile_cast() -> Pass:
     ``INT32 -> FP32 -> FP16``). Already-native casts are left untouched.
     """
 
+def auto_fuse() -> Pass:
+    """Create the AutoFuse pass: automatic operator fusion + tile-size selection.
+
+    For each function marked with the ``auto_fuse`` attribute, extracts the
+    tensor-op DAG and runs the MLSys graph-scheduling solver to choose a
+    memory-reuse partition (fusion groups) and tile granularity.
+    """
+
 def auto_tile_matmul_l0() -> Pass:
     """Create a pass that auto-tiles static 2D ``tile.matmul`` family calls for L0.
 
