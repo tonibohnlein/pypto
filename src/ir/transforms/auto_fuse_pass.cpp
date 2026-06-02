@@ -9,22 +9,28 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-// AutoFuse: automatic operator fusion + tile-size selection on the tensor graph.
+// AutoFuse: automatic operator fusion + tile-size selection.
 //
-// The pass extracts the tensor-op DAG from a (static-shape, tensor-level)
-// function, hands it to the MLSys graph-scheduling solver (linked as
-// `solver_lib` from 3rdparty/mlsys26) to choose a memory-reuse partition and
-// tile granularity, and then materialises the chosen grouping as nested
-// InCoreScopeStmt regions for OutlineIncoreScopes to lift into kernels.
-//
-// v0 status: builds the solver `Problem` from the IR and runs `solve()`. The
-// IR rewrite (emit InCoreScopeStmt from the returned schedule) is the next
-// increment — see TODO in AutoFuseTransform.
+// The extractor builds the MLSys solver's op+tensor DAG (`Problem`) from an
+// `auto_fuse`-marked function by reusing PyPTO's own dependency analysis
+// (`BuildStmtDependencyGraph`), which is Out/InOut/SSA-correct. This handles
+// both forms uniformly:
+//   * a flat tensor-level function (each AssignStmt is a tensor op), and
+//   * an orchestration kernel-call DAG (`c_v1 = self.kernel_add(a, b, c)`),
+//     where `tensor.create` allocations and Out-buffer args are skipped.
+// The DAG is handed to the linked MLSys solver (`3rdparty/mlsys26`) to choose a
+// memory-reuse fusion partition. v0 computes + logs (and optionally dumps) the
+// grouping; the IR rewrite (emit InCoreScopeStmt) is the next increment.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
@@ -34,9 +40,9 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
-#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/stmt_dependency_analysis.h"
 #include "pypto/ir/type.h"
 
 // MLSys graph-scheduling solver (3rdparty/mlsys26), linked as `solver_lib`.
@@ -50,12 +56,11 @@ namespace ir {
 namespace pass {
 namespace {
 
-// Placeholder compute-cost model. TODO: ground in BackendHandler throughput.
+// Placeholder work/throughput cost model. The throughput is tuned so a pointwise
+// op is memory-bound (compute < DDR transfer) like the real vector unit —
+// otherwise fusion, which only saves memory traffic, shows no benefit.
+// TODO(cost-model): ground in BackendHandler throughput.
 int64_t ComputeCost(::OpType type, int64_t w, int64_t h, int64_t k) {
-  // PLACEHOLDER work/throughput model. The throughput is tuned so a pointwise op
-  // is memory-bound (compute < DDR transfer) like the real vector unit —
-  // otherwise fusion, which only saves memory traffic, shows no benefit.
-  // TODO(cost-model): ground in BackendHandler throughput.
   constexpr int64_t kThroughput = 64;
   if (type == ::OpType::MatMul) {
     return (w * h * (k > 0 ? k : w)) / kThroughput;
@@ -63,51 +68,111 @@ int64_t ComputeCost(::OpType type, int64_t w, int64_t h, int64_t k) {
   return (w * h) / kThroughput;
 }
 
-// Hardware parameters (placeholders). TODO: read from the active BackendHandler.
-constexpr int64_t kFastMemoryCapacity = 50000;   // UB capacity, element-count convention
+// Hardware parameters (placeholders). TODO(cost-model): read from BackendHandler.
+constexpr int64_t kFastMemoryCapacity = 50000;  // UB capacity, element-count convention
 constexpr int64_t kSlowMemoryBandwidth = 10;     // DDR bandwidth
 constexpr int64_t kNativeW = 128;
 constexpr int64_t kNativeH = 128;
 
-// Walk a tensor-level function body and build the solver Problem.
-class ProblemBuilder : public IRVisitor {
+// A call is an allocation (output-buffer creation), not a compute op.
+bool IsAllocCall(const CallPtr& call) {
+  const std::string& name = call->op_->name_;
+  return name.find("create") != std::string::npos || name.find("alloc") != std::string::npos;
+}
+
+// A statement is a compute op iff it is `var = <call>` for a non-allocation call.
+bool IsComputeOp(const StmtPtr& stmt, CallPtr* out_call) {
+  auto assign = As<AssignStmt>(stmt);
+  if (assign == nullptr) {
+    return false;
+  }
+  auto call = As<Call>(assign->value_);
+  if (call == nullptr || IsAllocCall(call)) {
+    return false;
+  }
+  *out_call = call;
+  return true;
+}
+
+// Classify an op/kernel call. Matmul ops and matmul-named kernels are MatMul;
+// everything else is Pointwise. TODO: inspect the kernel body for a tile.matmul.
+::OpType ClassifyOp(const CallPtr& call) {
+  return call->op_->name_.find("matmul") != std::string::npos ? ::OpType::MatMul : ::OpType::Pointwise;
+}
+
+// Build the MLSys solver `Problem` (op+tensor DAG) from a function, reusing
+// `BuildStmtDependencyGraph` for sound op-dependency edges.
+class ProblemBuilder {
  public:
   ::Problem problem;
 
-  void Build(const FunctionPtr& func) {
+  void Build(const FunctionPtr& func, const ProgramPtr& prog) {
     problem.fast_memory_capacity = kFastMemoryCapacity;
     problem.slow_memory_bandwidth = kSlowMemoryBandwidth;
     problem.native_w = kNativeW;
     problem.native_h = kNativeH;
-    for (const auto& param : func->params_) {
-      TensorId(param);
-    }
-    VisitStmt(func->body_);
-  }
 
-  void VisitStmt_(const AssignStmtPtr& op) override {
-    auto call = As<Call>(op->value_);
-    if (call != nullptr) {
+    // 1. In-direction params are graph-input tensors (Out/InOut params are
+    //    output buffers, not inputs).
+    for (size_t i = 0; i < func->params_.size(); ++i) {
+      if (i < func->param_directions_.size() && func->param_directions_[i] == ParamDirection::In) {
+        in_params_.insert(func->params_[i].get());
+        TensorId(func->params_[i]);
+      }
+    }
+
+    // 2. Sound op-dependency graph (handles Out/InOut/SSA per RFC #1026).
+    stmt_dep::StmtDependencyGraph dep = stmt_dep::BuildStmtDependencyGraph(func->body_, prog);
+
+    // 3. First pass: register each compute op's output tensor (skip allocations).
+    std::vector<std::pair<const Stmt*, CallPtr>> ops;
+    for (const StmtPtr& stmt : dep.stmts) {
+      CallPtr call;
+      if (!IsComputeOp(stmt, &call)) {
+        continue;
+      }
+      auto assign = As<AssignStmt>(stmt);
+      stmt_output_[stmt.get()] = TensorId(assign->var_);
+      ops.emplace_back(stmt.get(), call);
+    }
+
+    // 4. Second pass: emit ops. Inputs = predecessor-op outputs (from the
+    //    dependency graph) + In-param args. Out-buffers/allocs fall out because
+    //    they are never registered as tensors.
+    for (const auto& entry : ops) {
+      const Stmt* stmt = entry.first;
+      const CallPtr& call = entry.second;
       ::Op sop;
-      const std::string& name = call->op_->name_;
-      sop.type = (name.find("matmul") != std::string::npos) ? ::OpType::MatMul : ::OpType::Pointwise;
-      for (const auto& arg : call->args_) {
-        auto var = AsVarLike(arg);
-        if (var != nullptr) {
-          sop.inputs.push_back(TensorId(var));
+      sop.type = ClassifyOp(call);
+      std::set<size_t> inputs;
+      auto pit = dep.predecessors.find(stmt);
+      if (pit != dep.predecessors.end()) {
+        for (const Stmt* pred : pit->second) {
+          auto oit = stmt_output_.find(pred);
+          if (oit != stmt_output_.end()) {
+            inputs.insert(oit->second);
+          }
         }
       }
-      const size_t out = TensorId(op->var_);
+      for (const ExprPtr& arg : call->args_) {
+        auto var = AsVarLike(arg);
+        if (var != nullptr && in_params_.count(var.get()) != 0) {
+          inputs.insert(tensor_index_.at(var.get()));
+        }
+      }
+      sop.inputs.assign(inputs.begin(), inputs.end());
+      const size_t out = stmt_output_.at(stmt);
       sop.outputs.push_back(out);
-      const ::Tensor& out_t = problem.tensors[out];
-      sop.base_cost = ComputeCost(sop.type, out_t.width, out_t.height, out_t.width);
+      const ::Tensor& ot = problem.tensors[out];
+      sop.base_cost = ComputeCost(sop.type, ot.width, ot.height, ot.width);
       problem.ops.push_back(std::move(sop));
     }
-    // Do not descend into the value expression — ops are AssignStmt-granular here.
   }
 
  private:
   std::unordered_map<const Var*, size_t> tensor_index_;
+  std::unordered_map<const Stmt*, size_t> stmt_output_;
+  std::unordered_set<const Var*> in_params_;
 
   size_t TensorId(const VarPtr& var) {
     const Var* raw = var.get();
@@ -116,8 +181,7 @@ class ProblemBuilder : public IRVisitor {
       return it->second;
     }
     auto tt = As<TensorType>(var->GetType());
-    CHECK(tt != nullptr) << "AutoFuse: variable '" << var->name_hint_
-                         << "' is not tensor-typed (only static tensor-level functions are supported)";
+    CHECK(tt != nullptr) << "AutoFuse: variable '" << var->name_hint_ << "' is not tensor-typed";
     int64_t w = 0;
     int64_t h = 0;
     ShapeWH(tt, &w, &h);
@@ -147,6 +211,41 @@ class ProblemBuilder : public IRVisitor {
   }
 };
 
+// Dump the extracted DAG as a competition-format JSON instance (for
+// visualization via 3rdparty/mlsys26/scripts/visualize.py). Hand-rolled JSON.
+void DumpProblemJson(const ::Problem& p, const std::string& path) {
+  std::ofstream f(path);
+  if (!f) {
+    return;
+  }
+  const size_t nt = p.tensors.size();
+  const size_t no = p.ops.size();
+  f << "{\n  \"widths\": [";
+  for (size_t i = 0; i < nt; ++i) f << (i ? "," : "") << p.tensors[i].width;
+  f << "],\n  \"heights\": [";
+  for (size_t i = 0; i < nt; ++i) f << (i ? "," : "") << p.tensors[i].height;
+  f << "],\n  \"inputs\": [";
+  for (size_t i = 0; i < no; ++i) {
+    f << (i ? "," : "") << "[";
+    for (size_t j = 0; j < p.ops[i].inputs.size(); ++j) f << (j ? "," : "") << p.ops[i].inputs[j];
+    f << "]";
+  }
+  f << "],\n  \"outputs\": [";
+  for (size_t i = 0; i < no; ++i) {
+    f << (i ? "," : "") << "[";
+    for (size_t j = 0; j < p.ops[i].outputs.size(); ++j) f << (j ? "," : "") << p.ops[i].outputs[j];
+    f << "]";
+  }
+  f << "],\n  \"base_costs\": [";
+  for (size_t i = 0; i < no; ++i) f << (i ? "," : "") << p.ops[i].base_cost;
+  f << "],\n  \"op_types\": [";
+  for (size_t i = 0; i < no; ++i)
+    f << (i ? "," : "") << (p.ops[i].type == ::OpType::MatMul ? "\"MatMul\"" : "\"Pointwise\"");
+  f << "],\n  \"fast_memory_capacity\": " << p.fast_memory_capacity
+    << ",\n  \"slow_memory_bandwidth\": " << p.slow_memory_bandwidth << ",\n  \"native_granularity\": ["
+    << p.native_w << ", " << p.native_h << "]\n}\n";
+}
+
 ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
   for (const auto& entry : prog->functions_) {
     const FunctionPtr& func = entry.second;
@@ -158,7 +257,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       continue;
     }
     ProblemBuilder builder;
-    builder.Build(func);
+    builder.Build(func, prog);
     if (builder.problem.ops.empty()) {
       continue;
     }
@@ -166,6 +265,9 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     ::Solution sol = ::solve(builder.problem, dag);
     LOG_INFO << "AutoFuse[" << func->name_ << "]: " << builder.problem.ops.size() << " ops -> "
              << sol.num_steps() << " fused subgraph(s), total latency " << sol.total_latency();
+    if (const char* dump_dir = std::getenv("PYPTO_AUTOFUSE_DUMP")) {
+      DumpProblemJson(builder.problem, std::string(dump_dir) + "/" + func->name_ + ".dag.json");
+    }
     // TODO(next increment): rewrite `func` — emit one InCoreScopeStmt per
     // sol.step(i).subgraph, with the chosen tile config, in a valid topological
     // order, for OutlineIncoreScopes to lift into kernels.
