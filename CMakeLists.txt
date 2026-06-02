@@ -175,6 +175,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/expand_mixed_kernel_pass.cpp
     src/ir/transforms/split_vector_kernel_pass.cpp
     src/ir/transforms/auto_tile_matmul_l0_pass.cpp
+    src/ir/transforms/auto_fuse_pass.cpp
     src/ir/transforms/flatten_tile_nd_to_2d_pass.cpp
     src/ir/transforms/pass_context.cpp
     src/ir/transforms/passes.cpp
@@ -271,6 +272,18 @@ set(PYPTO_SOURCES
     src/backend/common/pto_ops_common.cpp
     src/backend/common/soc.cpp
 )
+
+# MLSys graph-scheduling solver (used by the AutoFuse pass). EXCLUDE_FROM_ALL so
+# only the `solver_lib` static library builds (pulled in via the pypto_core link),
+# not the solver's own executables/tests.
+add_subdirectory(3rdparty/mlsys26 EXCLUDE_FROM_ALL)
+# solver_lib's own CMake sets its include root via CMAKE_SOURCE_DIR, which under
+# add_subdirectory resolves to the pypto root (not mlsys). Point it at the real
+# mlsys src/ so the solver's own sources resolve "core/*.h" etc.
+target_include_directories(solver_lib PUBLIC ${CMAKE_SOURCE_DIR}/3rdparty/mlsys26/src)
+# solver_lib is linked into the pypto_core *shared* module, so its objects must
+# be position-independent (the solver's own CMake builds it for executables).
+set_target_properties(solver_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Include Python bindings
 add_subdirectory(python/bindings)

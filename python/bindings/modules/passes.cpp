@@ -413,6 +413,11 @@ void BindPass(nb::module_& m) {
              "Create a pass that flattens ND tile ops to 2D in InCore functions\n\n"
              "Merges all dimensions except the last into a single dimension.\n"
              "E.g., tile [A, B, C] becomes [A*B, C]. Only converts 3D+ tiles.");
+  passes.def("auto_fuse", &pass::AutoFuse,
+             "Create the AutoFuse pass: automatic operator fusion + tile-size selection.\n\n"
+             "For each function marked with the `auto_fuse` attribute, extracts the\n"
+             "tensor-op DAG and runs the MLSys graph-scheduling solver to choose a\n"
+             "memory-reuse partition (fusion groups) and tile granularity.");
   passes.def("auto_tile_matmul_l0", &pass::AutoTileMatmulL0,
              "Create a pass that auto-tiles Mat-resident tile.matmul / tile.matmul_acc into a\n"
              "C-stationary K-loop\n\n"
