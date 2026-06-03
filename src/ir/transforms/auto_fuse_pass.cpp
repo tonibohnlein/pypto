@@ -249,6 +249,38 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     << p.native_w << ", " << p.native_h << "]\n}\n";
 }
 
+// Dump the solver's DECISION (fusion groups + per-group tile/latency/retain) as
+// JSON for `3rdparty/mlsys26/scripts/visualize.py solution <dag.json> <sol.json>`.
+void DumpSolutionJson(const ::Solution& sol, const std::string& path) {
+  std::ofstream f(path);
+  if (!f) {
+    return;
+  }
+  const size_t ns = sol.num_steps();
+  f << "{\n  \"subgraphs\": [";
+  for (size_t s = 0; s < ns; ++s) {
+    const std::vector<size_t>& ops = sol.step(s).subgraph.ops();
+    f << (s ? "," : "") << "[";
+    for (size_t j = 0; j < ops.size(); ++j) f << (j ? "," : "") << ops[j];
+    f << "]";
+  }
+  f << "],\n  \"granularities\": [";  // per-group [w,h,k] — the tiling decision
+  for (size_t s = 0; s < ns; ++s) {
+    const ::TileConfig& c = sol.step(s).config;
+    f << (s ? "," : "") << "[" << c.w << "," << c.h << "," << c.k << "]";
+  }
+  f << "],\n  \"subgraph_latencies\": [";
+  for (size_t s = 0; s < ns; ++s) f << (s ? "," : "") << sol.step_latency(s);
+  f << "],\n  \"tensors_to_retain\": [";
+  for (size_t s = 0; s < ns; ++s) {
+    const std::vector<size_t>& rt = sol.step(s).retain_these.underlying();
+    f << (s ? "," : "") << "[";
+    for (size_t j = 0; j < rt.size(); ++j) f << (j ? "," : "") << rt[j];
+    f << "]";
+  }
+  f << "]\n}\n";
+}
+
 ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
   for (const auto& entry : prog->functions_) {
     const FunctionPtr& func = entry.second;
@@ -300,7 +332,9 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     }
 
     if (const char* dump_dir = std::getenv("PYPTO_AUTOFUSE_DUMP")) {
-      DumpProblemJson(builder.problem, std::string(dump_dir) + "/" + func->name_ + ".dag.json");
+      const std::string base = std::string(dump_dir) + "/" + func->name_;
+      DumpProblemJson(builder.problem, base + ".dag.json");
+      DumpSolutionJson(sol, base + ".sol.json");
     }
     // TODO(next increment): rewrite `func` — emit one AutoInCoreScopeStmt per
     // sol.step(i).subgraph, with a ChunkConfig from step.config, in a valid
