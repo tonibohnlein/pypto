@@ -165,6 +165,10 @@ class PassManager:
             passes.flatten_call_expr,
         )
         tensor_only_passes: tuple[PassFactory, ...] = (
+            # Automatic fusion + tiling. Runs on the clean post-normalize tensor
+            # graph before scope outlining. It is a no-op for functions that are
+            # not marked with attrs={"auto_fuse": True}.
+            passes.auto_fuse,
             passes.outline_hierarchy_scopes,
             passes.outline_incore_scopes,
             passes.outline_cluster_scopes,
