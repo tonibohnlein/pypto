@@ -132,6 +132,12 @@ class PassManager:
             ("FlattenCallExpr", lambda: passes.flatten_call_expr()),
         ]
         tensor_only_passes: list[PassSpec] = [
+            # Automatic fusion + tiling. Runs on the clean post-normalize tensor
+            # graph, BEFORE the partition passes below. For functions marked
+            # attrs={"auto_fuse": True} it extracts the op+tensor DAG, runs the
+            # MLSys solver, and (next increment) emits AutoInCoreScopeStmt groups
+            # for Split/Interchange/Outline to lower. No-op for unmarked functions.
+            ("AutoFuse", lambda: passes.auto_fuse()),
             ("SplitChunkedLoops", lambda: passes.split_chunked_loops()),
             ("InterchangeChunkLoops", lambda: passes.interchange_chunk_loops()),
             ("OutlineHierarchyScopes", lambda: passes.outline_hierarchy_scopes()),
