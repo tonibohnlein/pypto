@@ -47,6 +47,7 @@
 
 // MLSys graph-scheduling solver (3rdparty/mlsys26), linked as `solver_lib`.
 #include "core/dag.h"
+#include "core/subgraph.h"
 #include "core/types.h"
 #include "pipeline/solver.h"
 #include "solution/solution.h"
@@ -105,6 +106,7 @@ bool IsComputeOp(const StmtPtr& stmt, CallPtr* out_call) {
 class ProblemBuilder {
  public:
   ::Problem problem;
+  std::vector<std::string> op_labels;  // per-op kernel/op name, for readable logging
 
   void Build(const FunctionPtr& func, const ProgramPtr& prog) {
     problem.fast_memory_capacity = kFastMemoryCapacity;
@@ -166,6 +168,7 @@ class ProblemBuilder {
       const ::Tensor& ot = problem.tensors[out];
       sop.base_cost = ComputeCost(sop.type, ot.width, ot.height, ot.width);
       problem.ops.push_back(std::move(sop));
+      op_labels.push_back(call->op_->name_);
     }
   }
 
@@ -261,16 +264,47 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     if (builder.problem.ops.empty()) {
       continue;
     }
+    // Print the intercepted tensor graph (the raw op+tensor DAG the pass sees).
+    const ::Problem& p = builder.problem;
+    LOG_INFO << "AutoFuse[" << func->name_ << "]: intercepted tensor graph — " << p.ops.size()
+             << " ops, " << p.tensors.size() << " tensors";
+    for (size_t i = 0; i < p.ops.size(); ++i) {
+      const ::Op& op = p.ops[i];
+      std::string ins;
+      for (size_t j = 0; j < op.inputs.size(); ++j) {
+        ins += (j ? "," : "");
+        ins += "t" + std::to_string(op.inputs[j]);
+      }
+      const ::Tensor& ot = p.tensors[op.outputs[0]];
+      LOG_INFO << "  op[" << i << "] " << (op.type == ::OpType::MatMul ? "MatMul   " : "Pointwise")
+               << " " << builder.op_labels[i] << "  in={" << ins << "} -> t" << op.outputs[0] << " ["
+               << ot.width << "x" << ot.height << "]  cost=" << op.base_cost;
+    }
+
+    // Solve, then print the fusion decision: each group's member ops + chosen tile.
     ::DAG dag = ::DAG::build(builder.problem);
     ::Solution sol = ::solve(builder.problem, dag);
-    LOG_INFO << "AutoFuse[" << func->name_ << "]: " << builder.problem.ops.size() << " ops -> "
-             << sol.num_steps() << " fused subgraph(s), total latency " << sol.total_latency();
+    LOG_INFO << "AutoFuse[" << func->name_ << "]: solver -> " << sol.num_steps()
+             << " fused group(s), total latency " << sol.total_latency();
+    for (size_t s = 0; s < sol.num_steps(); ++s) {
+      const ::ScheduleStep& step = sol.step(s);
+      std::string members;
+      const std::vector<size_t>& gops = step.subgraph.ops();
+      for (size_t j = 0; j < gops.size(); ++j) {
+        members += (j ? "," : "");
+        members += builder.op_labels[gops[j]];
+      }
+      LOG_INFO << "  group[" << s << "] ops={" << members << "}  tile=" << step.config.w << "x"
+               << step.config.h << (step.config.k ? ("x" + std::to_string(step.config.k)) : std::string())
+               << "  latency=" << sol.step_latency(s);
+    }
+
     if (const char* dump_dir = std::getenv("PYPTO_AUTOFUSE_DUMP")) {
       DumpProblemJson(builder.problem, std::string(dump_dir) + "/" + func->name_ + ".dag.json");
     }
-    // TODO(next increment): rewrite `func` — emit one InCoreScopeStmt per
-    // sol.step(i).subgraph, with the chosen tile config, in a valid topological
-    // order, for OutlineIncoreScopes to lift into kernels.
+    // TODO(next increment): rewrite `func` — emit one AutoInCoreScopeStmt per
+    // sol.step(i).subgraph, with a ChunkConfig from step.config, in a valid
+    // topological order, for the Split/Interchange/Outline passes to lower.
   }
   return prog;
 }
