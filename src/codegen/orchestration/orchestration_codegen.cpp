@@ -266,13 +266,16 @@ class CodegenEffectiveUseCollector : public var_collectors::VarDefUseCollector {
 class OrchestrationStmtCodegen : public CodegenBase {
  public:
   explicit OrchestrationStmtCodegen(const ProgramPtr& prog, std::map<std::string, int>* func_ids,
-                                    std::map<std::string, CoreType>* core_types, int* next_id,
+                                    std::map<std::string, CoreType>* core_types,
+                                    std::map<std::string, std::vector<std::string>>* func_signatures,
+                                    int* next_id,
                                     std::unordered_map<const Var*, std::string> param_to_emit_name,
                                     std::set<std::string> param_name_set,
                                     std::map<std::string, int> param_name_to_orch_index)
       : program_(prog),
         func_name_to_id_(func_ids),
         func_name_to_core_type_(core_types),
+        func_name_to_signature_(func_signatures),
         next_func_id_(next_id),
         emit_name_map_(std::move(param_to_emit_name)),
         param_name_set_(std::move(param_name_set)),
@@ -287,8 +290,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
                 [](const TupleElement& a, const TupleElement& b) { return a.index < b.index; });
     }
   }
-
-  void SetCallToTupleKey(const std::map<const Call*, std::string>& mapping) { call_to_tuple_key_ = mapping; }
 
   void SetTupleVarToKey(std::map<const Var*, std::string> mapping) { tuple_var_to_key_ = std::move(mapping); }
 
@@ -439,7 +440,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
             if (tuple_var) {
               auto it = var_to_assign.find(tuple_var.get());
               if (it != var_to_assign.end()) {
-                auto tcall = As<Call>(it->second->value_);
+                // The tuple producer may be a Submit (pl.submit / `as tid`);
+                // view it as a Call so its output args alias identically.
+                auto tcall = AsCallOrSubmitView(it->second->value_);
                 if (tcall) {
                   auto tdirs = tcall->GetArgDirections();
                   if (tdirs.size() == tcall->args_.size()) {
@@ -470,7 +473,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
             }
             continue;
           }
-          auto call = As<Call>(assign->value_);
+          auto call = AsCallOrSubmitView(assign->value_);
           if (!call) continue;
           // (a) tensor.assemble: result var aliases its first arg (the target).
           if (call->op_->name_ == "tensor.assemble" && !call->args_.empty()) {
@@ -905,13 +908,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // Funnel Submit through the existing Call codepath via the synthetic
     // SubmitToCallView adapter (deps_ → attrs[manual_dep_edges]). The IR
     // still has Submit as the canonical form; only this view is consumed
-    // by the Call-shaped codegen logic.
-    CallPtr call = As<Call>(assign->value_);
-    if (!call) {
-      if (auto submit = As<Submit>(assign->value_)) {
-        call = SubmitToCallView(submit);
-      }
-    }
+    // by the Call-shaped codegen logic. Tuple keys are looked up by the
+    // binding Var (stable), never this transient view's pointer.
+    CallPtr call = AsCallOrSubmitView(assign->value_);
     if (call) {
       const std::string& op_name = call->op_->name_;
 
@@ -994,8 +993,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
       } else if (!IsBuiltinOp(op_name)) {
         std::string result_key;
         if (As<TupleType>(call->GetType())) {
-          auto it = call_to_tuple_key_.find(call.get());
-          result_key = (it != call_to_tuple_key_.end()) ? it->second : var_name;
+          // Key on the binding Var (stable for both Call and the Submit view).
+          auto it = tuple_var_to_key_.find(assign->var_.get());
+          result_key = (it != tuple_var_to_key_.end()) ? it->second : var_name;
         } else {
           result_key = var_name;
         }
@@ -1013,9 +1013,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
             GenerateSingleReturnAlias(call, var_name);
           }
         } else if (IsSubmitCall(call)) {
-          GenerateSubmitReturnAliases(call, task_idx_before);
+          GenerateSubmitReturnAliases(call, task_idx_before, assign->var_.get());
         } else {
-          GenerateTupleReturnAliases(call);
+          GenerateTupleReturnAliases(call, assign->var_.get());
         }
       } else {
         INTERNAL_CHECK_SPAN(false, assign->span_)
@@ -1150,7 +1150,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void VisitStmt_(const EvalStmtPtr& eval) override {
-    if (auto call = As<Call>(eval->expr_)) {
+    // A fire-and-forget ``pl.submit(...)`` statement (no result binding) is a
+    // Submit; view it as a Call so the dispatch is still emitted.
+    if (auto call = AsCallOrSubmitView(eval->expr_)) {
       const std::string& op_name = call->op_->name_;
       if (IsTensorOp(op_name) || IsArrayOp(op_name)) {
         GenerateTensorOpCode(call, "", nullptr);
@@ -1238,6 +1240,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
   struct ParamEntry {
     ArgDirection direction;
     std::string value;
+    /// True when this arg's Var is listed in the Call's ``kAttrDumpVars`` set
+    /// (selective dump from ``pl.dump_tag`` / ``dumps=``). Set by
+    /// VarPtr identity in the param builders — no name comparison.
+    bool dump = false;
   };
 
   /// Build one ParamEntry from the call-site arg at `arg_idx`. Centralises the
@@ -1273,6 +1279,52 @@ class OrchestrationStmtCodegen : public CodegenBase {
                                             << " is neither a variable nor a recognized constant literal "
                                             << "(unsupported expression kind for orchestration codegen).";
     return {};  // unreachable
+  }
+
+  /// Collect the set of arg Var pointers a Call marks for selective dump via
+  /// its ``kAttrDumpVars`` attr (``pl.dump_tag`` / ``dumps=``).
+  /// Matched by VarPtr identity in ``BuildTaskParams`` — never by name.
+  std::set<const Var*> CollectDumpVarSet(const CallPtr& call) {
+    std::set<const Var*> out;
+    for (const auto& [k, v] : call->attrs_) {
+      if (k != kAttrDumpVars) continue;
+      if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&v)) {
+        for (const auto& var : *vars) {
+          if (var) out.insert(var.get());
+        }
+      }
+    }
+    return out;
+  }
+
+  /// Return the ``ParamEntry::value`` strings to pass to ``Arg::dump(...)``.
+  /// An entry is selected when its arg's Var was marked via ``kAttrDumpVars``
+  /// (``p.dump``, set by VarPtr identity in the param builders). Scalar entries
+  /// are never dumpable (the runtime rejects them in ``Arg::dump``'s
+  /// static_assert) and are skipped.
+  std::vector<std::string> CollectSelectiveDumpValues(const std::vector<ParamEntry>& params) {
+    std::vector<std::string> out;
+    for (const auto& p : params) {
+      if (p.direction == ArgDirection::Scalar) continue;
+      if (!p.dump) continue;
+      out.push_back(p.value);
+    }
+    return out;
+  }
+
+  /// Emit ``<task_var>.dump(v1, v2, ...);`` for the ``params`` entries marked
+  /// for selective dump (``kAttrDumpVars``). No-op when no param is marked
+  /// (legacy full-dump path is preserved).
+  void EmitSelectiveDumpCall(const std::string& ind, const std::string& task_var,
+                             const std::vector<ParamEntry>& params) {
+    auto dump_vals = CollectSelectiveDumpValues(params);
+    if (dump_vals.empty()) return;
+    code_ << ind << task_var << ".dump(";
+    for (size_t i = 0; i < dump_vals.size(); ++i) {
+      if (i > 0) code_ << ", ";
+      code_ << dump_vals[i];
+    }
+    code_ << ");\n";
   }
 
   /// For a Submit's Out param at callee position `param_idx` that is *not*
@@ -1312,6 +1364,51 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return {ArgDirection::Output, ci_var};
   }
 
+  // Map an IR ArgDirection to the runtime ArgDirection enum name used by the
+  // CoreCallable signature (simpler.task_interface.ArgDirection). The runtime
+  // enum only distinguishes SCALAR / IN / OUT / INOUT; NoDep tensors are
+  // emitted as INOUT so the tensor dump captures them at both stages.
+  static const char* ArgDirectionToRuntimeName(ArgDirection dir) {
+    switch (dir) {
+      case ArgDirection::Input:
+        return "IN";
+      case ArgDirection::Output:
+      case ArgDirection::OutputExisting:
+        return "OUT";
+      case ArgDirection::InOut:
+      case ArgDirection::NoDep:
+        return "INOUT";
+      case ArgDirection::Scalar:
+        return "SCALAR";
+    }
+    INTERNAL_CHECK(false) << "Internal error: unexpected ArgDirection value";
+    return "";
+  }
+
+  // Record a kernel's runtime ArgDirection signature, in task-payload order.
+  // The CoreCallable signature_[] array is sized to CORE_MAX_TENSOR_ARGS and is
+  // a per-tensor-arg direction list: scalars are NOT recorded. They live in a
+  // separate scalar-arg store (CORE_MAX_SCALAR_ARGS) and the runtime tensor
+  // dump skips SCALAR entries anyway, so excluding them keeps the recorded
+  // signature 1:1 with the payload tensors and bounds sig_count by the same
+  // CORE_MAX_TENSOR_ARGS cap that check_add_tensor_valid enforces on the
+  // payload. Including scalars would inflate sig_count past CORE_MAX_TENSOR_ARGS
+  // and trip make_callable's "sig_count exceeds MaxSig" guard.
+  // func_id is name-deduped, so we record once per kernel (first call wins).
+  void RecordKernelSignature(const std::string& func_name, const std::vector<ParamEntry>& params) {
+    auto [it, inserted] = func_name_to_signature_->try_emplace(func_name);
+    if (!inserted) {
+      return;
+    }
+    it->second.reserve(params.size());
+    for (const auto& p : params) {
+      if (p.direction == ArgDirection::Scalar) {
+        continue;
+      }
+      it->second.emplace_back(ArgDirectionToRuntimeName(p.direction));
+    }
+  }
+
   std::vector<ParamEntry> BuildTaskParams(const CallPtr& call, const FunctionPtr& callee_func) {
     std::vector<ParamEntry> params;
     const std::string& callee_name = callee_func->name_;
@@ -1334,9 +1431,19 @@ class OrchestrationStmtCodegen : public CodegenBase {
     //     appends them at the tail of the callee signature, so we synth an
     //     add_output(TensorCreateInfo) entry for each. See
     //     `.claude/rules/pass-submit-awareness.md` §5.
+    // Selective dump (``pl.dump_tag`` / ``dumps=``):
+    // ``kAttrDumpVars`` lists the arg Vars to mark via ``Arg::dump``. Match by
+    // VarPtr identity against each arg — never by name.
+    std::set<const Var*> dump_var_set = CollectDumpVarSet(call);
+
     params.reserve(callee_func->params_.size());
     for (size_t arg_idx = 0; arg_idx < call->args_.size(); ++arg_idx) {
       params.push_back(BuildOneArgParam(call, callee_name, call_arg_directions, arg_idx));
+      if (!dump_var_set.empty()) {
+        if (auto v = AsVarLike(call->args_[arg_idx])) {
+          params.back().dump = dump_var_set.count(v.get()) > 0;
+        }
+      }
     }
     if (IsSubmitCall(call)) {
       INTERNAL_CHECK_SPAN(call->args_.size() <= callee_func->params_.size(), call->span_)
@@ -1416,6 +1523,29 @@ class OrchestrationStmtCodegen : public CodegenBase {
     FunctionPtr inner_callee;
   };
 
+  /// Bridges the two-level nesting that arises when a ``Group`` is dispatched
+  /// *through* a ``Spmd`` wrapper (``GenerateSpmdCallCode`` ->
+  /// ``GenerateGroupCallCode``). In that case the function ``outer_call``
+  /// actually invokes is the Spmd wrapper, NOT the Group that
+  /// ``BuildWrapperReorderedParams`` receives as ``wrapper_func``. The two can
+  /// have different param counts: the Spmd outliner deduplicates an aliased
+  /// arg (the same buffer passed as both an input and the output, e.g.
+  /// ``self.kernel(out, b, bias, out)``) into a single wrapper param, while the
+  /// Group keeps every kernel param. Without the bridge, codegen would index
+  /// ``outer_call->args_[<group_param_idx>]`` out of bounds.
+  ///
+  /// ``bridge_call`` is the Group call inside the Spmd-wrapper body
+  /// (``FindFirstInnerCall(spmd_func).inner_call``); its args are positionally
+  /// 1:1 with the Group's params and reference the Spmd-wrapper params (or
+  /// constants). ``bridge_func`` is the Spmd wrapper, whose params are
+  /// positionally 1:1 with ``outer_call->args_``. An empty ``bridge_func``
+  /// means "no bridge" (plain-Spmd / direct-Group): ``wrapper_func`` IS the
+  /// function ``outer_call`` invokes, and the legacy 1-hop lookup is correct.
+  struct WrapperBridge {
+    CallPtr bridge_call;
+    FunctionPtr bridge_func;
+  };
+
   WrapperCallInfo FindWrapperInnerCall(const FunctionPtr& wrapper_func) {
     auto info = ir::FindFirstInnerCall(wrapper_func, program_);
     return {std::move(info.inner_call), std::move(info.inner_callee)};
@@ -1438,7 +1568,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::vector<ParamEntry> BuildWrapperReorderedParams(const CallPtr& outer_call,
                                                       const FunctionPtr& wrapper_func,
                                                       const CallPtr& inner_call,
-                                                      const FunctionPtr& inner_callee) {
+                                                      const FunctionPtr& inner_callee,
+                                                      const WrapperBridge& bridge = {}) {
     std::unordered_map<const Var*, size_t> wrapper_param_to_outer_idx;
     for (size_t i = 0; i < wrapper_func->params_.size(); ++i) {
       wrapper_param_to_outer_idx[wrapper_func->params_[i].get()] = i;
@@ -1452,6 +1583,76 @@ class OrchestrationStmtCodegen : public CodegenBase {
         << "Outer call to wrapper '" << wrapper_func->name_ << "' has arg_directions size "
         << outer_arg_directions.size() << " but args size " << outer_call->args_.size()
         << ". DeriveCallDirections must run before orchestration codegen.";
+
+    // Second hop for the Spmd-wrapped Group case (see WrapperBridge): map each
+    // Spmd-wrapper param Var to its position, which is positionally 1:1 with
+    // ``outer_call->args_`` (because ``outer_call`` invokes the Spmd wrapper).
+    const bool has_bridge = (bridge.bridge_func != nullptr);
+    std::unordered_map<const Var*, size_t> outer_param_to_arg_idx;
+    if (has_bridge) {
+      // A non-null bridge_func always pairs with a non-null bridge_call (the
+      // Group call inside it); guard here so resolve_outer_arg can safely read
+      // bridge.bridge_call->span_ below.
+      INTERNAL_CHECK(bridge.bridge_call != nullptr)
+          << "Internal error: WrapperBridge has a non-null bridge_func but a null bridge_call.";
+      for (size_t i = 0; i < bridge.bridge_func->params_.size(); ++i) {
+        outer_param_to_arg_idx[bridge.bridge_func->params_[i].get()] = i;
+      }
+    }
+
+    // Resolve a ``wrapper_func`` (Group/Spmd) param position to the concrete
+    // orchestration-level arg Expr, and report which ``outer_arg_directions``
+    // slot governs it (``*dir_idx``). ``*dir_idx == kNoDir`` means the resolved
+    // Expr is a constant baked into the Spmd-wrapper body (no outer direction);
+    // the caller's const branches emit it inline as a Scalar.
+    //
+    // No bridge (plain-Spmd / direct-Group): ``wrapper_func`` IS the called
+    // function, so the wrapper param index is the outer arg index directly.
+    //
+    // With bridge (Spmd-wrapped Group): ``wrapper_idx`` is a Group param index.
+    // The Group call inside the Spmd wrapper (``bridge.bridge_call``) passes one
+    // expr per Group param at the same position; that expr is a Spmd-wrapper
+    // param (resolved to its outer arg) or a constant.
+    constexpr size_t kNoDir = static_cast<size_t>(-1);
+    auto resolve_outer_arg = [&](size_t wrapper_idx, size_t* dir_idx) -> ExprPtr {
+      if (!has_bridge) {
+        INTERNAL_CHECK_SPAN(wrapper_idx < outer_call->args_.size(), outer_call->span_)
+            << "Internal error: wrapper param index " << wrapper_idx << " out of range for call to '"
+            << wrapper_func->name_ << "' (" << outer_call->args_.size() << " args).";
+        *dir_idx = wrapper_idx;
+        return outer_call->args_[wrapper_idx];
+      }
+      INTERNAL_CHECK_SPAN(wrapper_idx < bridge.bridge_call->args_.size(), bridge.bridge_call->span_)
+          << "Internal error: Group param index " << wrapper_idx << " out of range for bridge call to '"
+          << wrapper_func->name_ << "' (" << bridge.bridge_call->args_.size() << " args).";
+      const auto& bridge_arg = bridge.bridge_call->args_[wrapper_idx];
+      auto bridge_var = AsVarLike(bridge_arg);
+      if (!bridge_var) {
+        *dir_idx = kNoDir;  // constant in the Spmd-wrapper body -> emit inline
+        return bridge_arg;
+      }
+      auto oit = outer_param_to_arg_idx.find(bridge_var.get());
+      INTERNAL_CHECK_SPAN(oit != outer_param_to_arg_idx.end(), bridge.bridge_call->span_)
+          << "Internal error: Spmd-wrapper arg for Group '" << wrapper_func->name_ << "' param "
+          << wrapper_idx << " does not map to any Spmd-wrapper parameter (deduped/aliased arg tracking "
+          << "is inconsistent).";
+      INTERNAL_CHECK_SPAN(oit->second < outer_call->args_.size(), outer_call->span_)
+          << "Internal error: outer arg index " << oit->second << " out of range ("
+          << outer_call->args_.size() << " args).";
+      *dir_idx = oit->second;
+      return outer_call->args_[oit->second];
+    };
+
+    // Per-call selective dump rides on the outer Call's ``kAttrDumpVars``
+    // (e.g. a parent ``pl.dump_tag`` transferred onto the wrapper call by
+    // InlineFunctions). It can equally ride on the *inner* call's
+    // ``kAttrDumpVars`` — a ``pl.dump_tag`` inside the wrapped body (e.g. before
+    // a for-form ``pl.spmd`` loop) attaches to the inner InCore scope, which
+    // OutlineIncoreScopes carries onto the inner kernel Call. Match against
+    // both: outer dump vars are outer-arg Vars, inner dump vars are inner-arg
+    // Vars (mapped to the outer arg below via ``wrapper_param_to_outer_idx``).
+    std::set<const Var*> dump_var_set = CollectDumpVarSet(outer_call);
+    std::set<const Var*> inner_dump_var_set = CollectDumpVarSet(inner_call);
 
     std::vector<ParamEntry> params;
     for (size_t inner_idx = 0; inner_idx < inner_call->args_.size(); ++inner_idx) {
@@ -1490,7 +1691,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
 
       size_t outer_idx = it->second;
-      const auto& outer_arg = outer_call->args_[outer_idx];
+      size_t dir_idx = kNoDir;
+      ExprPtr outer_arg = resolve_outer_arg(outer_idx, &dir_idx);
       std::string var_name = TryGetVarName(outer_arg);
 
       if (!var_name.empty()) {
@@ -1501,7 +1703,20 @@ class OrchestrationStmtCodegen : public CodegenBase {
         }
 
         std::string ext_name = GetExternalTensorName(var_name);
-        params.push_back({outer_arg_directions[outer_idx], ext_name});
+        bool is_dump = false;
+        if (!dump_var_set.empty()) {
+          if (auto v = AsVarLike(outer_arg)) is_dump = dump_var_set.count(v.get()) > 0;
+        }
+        // A dump tag inside the wrapped body marks the *inner* arg Var.
+        if (!is_dump && !inner_dump_var_set.empty()) {
+          is_dump = inner_dump_var_set.count(inner_arg_var.get()) > 0;
+        }
+        // A tensor arg always resolves to a real outer Var (never a baked-in
+        // constant), so ``dir_idx`` is a valid ``outer_arg_directions`` slot.
+        INTERNAL_CHECK_SPAN(dir_idx < outer_arg_directions.size(), outer_call->span_)
+            << "Internal error: resolved direction index " << dir_idx << " out of range for tensor arg of '"
+            << wrapper_func->name_ << "' (" << outer_arg_directions.size() << " directions).";
+        params.push_back({outer_arg_directions[dir_idx], ext_name, is_dump});
       } else if (auto const_int = As<ConstInt>(outer_arg)) {
         std::string cpp_type = const_int->dtype().ToCTypeString();
         std::string value = FormatConstIntValue(const_int, cpp_type);
@@ -1554,9 +1769,24 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return GenerateExprString(expr);
   }
 
-  void EmitLaunchSpec(const std::string& ind, const std::string& task_var, const FunctionPtr& launch_func) {
-    auto core_num_expr = launch_func->GetAttr<ExprPtr>("core_num", nullptr);
-    bool sync_start = launch_func->GetAttr<bool>("sync_start", false);
+  // Resolve the effective SPMD launch spec for a dispatch. ``pl.spmd_submit``
+  // carries core_num/sync_start on the Submit, surfaced as Call attrs by
+  // SubmitToCallView; the scope-based ``with pl.spmd`` path carries them on
+  // the Spmd-wrapper function. Prefer the call's own attrs (spmd_submit), then
+  // fall back to the launch function's attrs (scope-based spmd / group).
+  [[nodiscard]] std::pair<ExprPtr, bool> EffectiveLaunchSpec(const CallPtr& call,
+                                                             const FunctionPtr& launch_func) const {
+    ExprPtr core_num = call->GetAttr<ExprPtr>("core_num", nullptr);
+    bool sync_start = call->GetAttr<bool>("sync_start", false);
+    if (!core_num && launch_func) {
+      core_num = launch_func->GetAttr<ExprPtr>("core_num", nullptr);
+      sync_start = launch_func->GetAttr<bool>("sync_start", false);
+    }
+    return {core_num, sync_start};
+  }
+
+  void EmitLaunchSpec(const std::string& ind, const std::string& task_var, const ExprPtr& core_num_expr,
+                      bool sync_start) {
     if (core_num_expr) {
       const std::string method = pypto::backend::GetBackend()->GetHandler()->GetLaunchSpecCoreCountMethod();
       code_ << ind << task_var << ".launch_spec." << method << "(" << RenderLaunchCoreNum(core_num_expr)
@@ -1764,11 +1994,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
         break;
       }
 
+      // The consumer may be a Submit (e.g. pl.spmd_submit of a mixed kernel
+      // that receives the injected gm_pipe_buffer create); view it as a Call.
       CallPtr call;
       if (assign) {
-        call = As<Call>(assign->value_);
+        call = AsCallOrSubmitView(assign->value_);
       } else if (auto eval = As<EvalStmt>(stmts[i])) {
-        call = As<Call>(eval->expr_);
+        call = AsCallOrSubmitView(eval->expr_);
       }
       if (!call) continue;
 
@@ -1787,10 +2019,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
       auto callee_func = program_->GetFunction(gv->name_);
       if (!callee_func) return std::nullopt;
 
-      auto core_num_expr = callee_func->GetAttr<ExprPtr>("core_num", nullptr);
+      // Resolve core_num from the same source as the launch spec: pl.spmd_submit
+      // carries it on the dispatch call's attrs, while scope-based pl.spmd /
+      // Group wrappers carry it on the callee function's attrs. Sizing the
+      // GM-pipe workspace from callee attrs alone would under-allocate for a
+      // direct ``pl.spmd_submit(self.aic_or_aiv_kernel, ..., core_num=N)``
+      // (N blocks launched, 1-block workspace).
+      auto core_num_expr = EffectiveLaunchSpec(call, callee_func).first;
       std::string rendered_core_num;
-      if ((callee_func->func_type_ == FunctionType::Spmd || callee_func->func_type_ == FunctionType::Group) &&
-          core_num_expr) {
+      if (core_num_expr) {
         rendered_core_num = RenderLaunchCoreNum(core_num_expr);
       }
       return GMPipeCreateUse{callee_func, rendered_core_num};
@@ -1953,6 +2190,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     int func_id = GetOrCreateFuncId(callee_name, func_name_to_id_, next_func_id_);
 
     auto params = BuildTaskParams(call, callee_func);
+    RecordKernelSignature(callee_name, params);
 
     std::string ind = Indent();
     std::string task_var = "params_t" + std::to_string(task_counter_);
@@ -1962,6 +2200,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (const auto& p : params) {
       code_ << ind << task_var << "." << ArgDirectionToMethodName(p.direction) << "(" << p.value << ");\n";
     }
+    EmitSelectiveDumpCall(ind, task_var, params);
     // For each DistributedTensor formal of the callee, append the matching
     // outer ext_<name>_ctx scalar so the L1 kernel's trailing CommContext
     // ptr arg gets populated. The outer ctx variable is unpacked in
@@ -1969,6 +2208,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // pointers block) and named ``ext_<outer-arg-name>_ctx``.
     EmitDistTensorCtxScalars(call, callee_func, ind, task_var);
     EmitManualDeps(call, task_var);
+    // SPMD launch spec for pl.spmd_submit targeting an AIC/AIV kernel directly
+    // (no Spmd-wrapper function). core_num/sync_start ride on the Submit and
+    // are surfaced as Call attrs by SubmitToCallView; a plain submit / call
+    // has neither, so EffectiveLaunchSpec yields (nullptr, false) → no-op.
+    auto [launch_core_num, launch_sync_start] = EffectiveLaunchSpec(call, callee_func);
+    EmitLaunchSpec(ind, task_var, launch_core_num, launch_sync_start);
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
@@ -1981,7 +2226,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
         << "Internal error: no inner call found in Spmd function '" << spmd_func->name_ << "'";
 
     if (info.inner_callee->func_type_ == FunctionType::Group) {
-      GenerateGroupCallCode(call, info.inner_callee, spmd_func);
+      // The Group is dispatched THROUGH this Spmd wrapper: ``call`` invokes
+      // ``spmd_func``, not the Group. Pass the Group call inside the wrapper
+      // (``info.inner_call``) as the bridge: its args are positionally 1:1 with
+      // the Group's params, and each arg references a ``spmd_func`` param (or a
+      // constant) — so BuildWrapperReorderedParams can map Group params ->
+      // Spmd-wrapper params -> outer args even when an aliased-arg dedup shrank
+      // the wrapper's param count below the Group's.
+      GenerateGroupCallCode(call, info.inner_callee, spmd_func, WrapperBridge{info.inner_call, spmd_func});
       return;
     }
 
@@ -1991,6 +2243,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     int func_id = GetOrCreateFuncId(callee_name, func_name_to_id_, next_func_id_);
     auto params = BuildWrapperReorderedParams(call, spmd_func, info.inner_call, info.inner_callee);
+    RecordKernelSignature(callee_name, params);
 
     std::string ind = Indent();
     std::string task_var = "params_t" + std::to_string(task_counter_);
@@ -2000,7 +2253,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (const auto& p : params) {
       code_ << ind << task_var << "." << ArgDirectionToMethodName(p.direction) << "(" << p.value << ");\n";
     }
-    EmitLaunchSpec(ind, task_var, spmd_func);
+    EmitSelectiveDumpCall(ind, task_var, params);
+    auto [launch_core_num, launch_sync_start] = EffectiveLaunchSpec(call, spmd_func);
+    EmitLaunchSpec(ind, task_var, launch_core_num, launch_sync_start);
     EmitManualDeps(call, task_var);
 
     std::string submit_expr =
@@ -2009,7 +2264,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void GenerateGroupCallCode(const CallPtr& call, const FunctionPtr& group_func,
-                             const FunctionPtr& launch_func) {
+                             const FunctionPtr& launch_func, const WrapperBridge& bridge = {}) {
     std::string group_name = group_func->name_;
 
     auto info = FindGroupCallees(group_func);
@@ -2029,7 +2284,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // Reorder params from wrapper param order to inner kernel arg order.
       INTERNAL_CHECK(info.inner_call != nullptr && info.inner_callee != nullptr)
           << "Internal error: no inner call found in AIV-only Group '" << group_name << "'";
-      auto params = BuildWrapperReorderedParams(call, group_func, info.inner_call, info.inner_callee);
+      auto params = BuildWrapperReorderedParams(call, group_func, info.inner_call, info.inner_callee, bridge);
+      RecordKernelSignature(info.aiv_name, params);
 
       std::string ind = Indent();
       std::string task_var = "params_t" + std::to_string(task_counter_);
@@ -2039,8 +2295,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
       for (const auto& p : params) {
         code_ << ind << task_var << "." << ArgDirectionToMethodName(p.direction) << "(" << p.value << ");\n";
       }
+      EmitSelectiveDumpCall(ind, task_var, params);
 
-      EmitLaunchSpec(ind, task_var, launch_func);
+      auto [launch_core_num, launch_sync_start] = EffectiveLaunchSpec(call, launch_func);
+      EmitLaunchSpec(ind, task_var, launch_core_num, launch_sync_start);
       EmitManualDeps(call, task_var);
 
       std::string submit_expr =
@@ -2067,7 +2325,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // Reorder params from wrapper param order to inner kernel arg order.
     INTERNAL_CHECK(info.inner_call != nullptr && info.inner_callee != nullptr)
         << "Internal error: no inner call found in MixedKernels Group '" << group_name << "'";
-    auto params = BuildWrapperReorderedParams(call, group_func, info.inner_call, info.inner_callee);
+    auto params = BuildWrapperReorderedParams(call, group_func, info.inner_call, info.inner_callee, bridge);
+    RecordKernelSignature(info.aic_name, params);
+    RecordKernelSignature(info.aiv_name, params);
 
     int aic_id = GetOrCreateFuncId(info.aic_name, func_name_to_id_, next_func_id_);
     int aiv_id = GetOrCreateFuncId(info.aiv_name, func_name_to_id_, next_func_id_);
@@ -2081,13 +2341,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (const auto& p : params) {
       code_ << ind << task_var << "." << ArgDirectionToMethodName(p.direction) << "(" << p.value << ");\n";
     }
+    EmitSelectiveDumpCall(ind, task_var, params);
     // Split AIV groups dispatch the same kernel on both vector lanes. The
     // kernel body uses tile.get_subblock_idx() to select its lane-local slice.
     std::string third_id = RequiresDualAivDispatch(aiv_func) ? std::to_string(aiv_id) : "INVALID_KERNEL_ID";
     code_ << ind << "MixedKernels mixed_" << task_counter_ << " = {" << aic_id << ", " << aiv_id << ", "
           << third_id << "};\n";
 
-    EmitLaunchSpec(ind, task_var, launch_func);
+    auto [launch_core_num, launch_sync_start] = EffectiveLaunchSpec(call, launch_func);
+    EmitLaunchSpec(ind, task_var, launch_core_num, launch_sync_start);
     EmitManualDeps(call, task_var);
 
     std::string submit_expr = "rt_submit_task(mixed_" + std::to_string(task_counter_) + ", " + task_var + ")";
@@ -2198,9 +2460,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
     EmitTensorAlias(var_name, call, param_idx);
   }
 
-  void GenerateTupleReturnAliases(const CallPtr& call) {
-    auto tuple_key_it = call_to_tuple_key_.find(call.get());
-    if (tuple_key_it == call_to_tuple_key_.end()) return;
+  void GenerateTupleReturnAliases(const CallPtr& call, const Var* result_var) {
+    auto tuple_key_it = tuple_var_to_key_.find(result_var);
+    if (tuple_key_it == tuple_var_to_key_.end()) return;
     auto elements_it = tuple_var_to_elements_.find(tuple_key_it->second);
     if (elements_it == tuple_var_to_elements_.end()) return;
     FunctionPtr callee = program_->GetFunction(call->op_->name_);
@@ -2310,9 +2572,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
   ///     ``runtime_out_pos = param_idx - args_.size()`` because
   ///     ``BuildTaskParams`` appends one synth ``add_output`` per callee Out
   ///     in the tail, in callee param order.
-  void GenerateSubmitReturnAliases(const CallPtr& call, int task_idx) {
-    auto tuple_key_it = call_to_tuple_key_.find(call.get());
-    if (tuple_key_it == call_to_tuple_key_.end()) return;
+  void GenerateSubmitReturnAliases(const CallPtr& call, int task_idx, const Var* result_var) {
+    auto tuple_key_it = tuple_var_to_key_.find(result_var);
+    if (tuple_key_it == tuple_var_to_key_.end()) return;
     auto elements_it = tuple_var_to_elements_.find(tuple_key_it->second);
     if (elements_it == tuple_var_to_elements_.end()) return;
 
@@ -2611,6 +2873,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   const ProgramPtr& program_;
   std::map<std::string, int>* func_name_to_id_;
   std::map<std::string, CoreType>* func_name_to_core_type_;
+  std::map<std::string, std::vector<std::string>>* func_name_to_signature_;
   int* next_func_id_;
   std::unordered_map<const Var*, std::string> emit_name_map_;
   std::set<std::string> declared_var_names_;
@@ -2677,7 +2940,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// just ``loop_var`` when start=0 and step=1.
   std::vector<std::string> current_loop_slot_exprs_;
   std::map<std::string, std::vector<TupleElement>> tuple_var_to_elements_;
-  std::map<const Call*, std::string> call_to_tuple_key_;
   std::map<const Var*, std::string> tuple_var_to_key_;
   std::unordered_set<const Var*> declared_var_ptrs_;
   std::unordered_set<const Stmt*> batched_create_stmts_;
@@ -2701,6 +2963,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   std::map<std::string, int> func_name_to_id;
   std::map<std::string, CoreType> func_name_to_core_type;
+  std::map<std::string, std::vector<std::string>> func_name_to_signature;
   int next_func_id = 0;
 
   OrchestrationInfoCollector info_collector;
@@ -2761,11 +3024,10 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   std::ostringstream oss;
 
-  OrchestrationStmtCodegen stmt_codegen(program, &func_name_to_id, &func_name_to_core_type, &next_func_id,
-                                        std::move(emit_name_map), std::move(param_name_set),
-                                        std::move(param_name_to_orch_index));
+  OrchestrationStmtCodegen stmt_codegen(program, &func_name_to_id, &func_name_to_core_type,
+                                        &func_name_to_signature, &next_func_id, std::move(emit_name_map),
+                                        std::move(param_name_set), std::move(param_name_to_orch_index));
   stmt_codegen.SetCallTupleElements(info_collector.call_tuple_elements);
-  stmt_codegen.SetCallToTupleKey(info_collector.call_to_tuple_key);
   stmt_codegen.SetTupleVarToKey(info_collector.tuple_var_to_key);
   stmt_codegen.SetEffectiveUses(std::move(use_collector.var_uses));
   // MaterializeRuntimeScopes wraps the whole body in an AUTO RuntimeScopeStmt,
@@ -2782,6 +3044,15 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   oss << "__attribute__((visibility(\"default\")))\n";
   oss << "void aicpu_orchestration_entry(const ChipStorageTaskArgs& orch_args) {\n";
+
+  // Selective vs. full tensor dump is no longer requested from the orch body.
+  // simpler#953 removed the ``enable_dump_tensor_selective()`` toggle: the
+  // runtime now latches the dump level (off / partial / full) host-side at
+  // ``dump_tensor_init`` from ``DumpDataHeader`` (driven by
+  // ``CallConfig.enable_dump_tensor``), race-free regardless of submit order.
+  // Codegen only emits the per-task ``Arg::dump(...)`` markers (see
+  // ``EmitSelectiveDumpCall``); partial mode selecting exactly those marked
+  // tensors is enabled by ``enable_dump_tensor == 1``.
 
   oss << "    // External tensors\n";
   int orch_idx = 0;
@@ -2819,7 +3090,8 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   oss << "}\n\n";
   oss << "}  // extern \"C\"\n";
 
-  return OrchestrationResult{oss.str(), std::move(func_name_to_id), std::move(func_name_to_core_type)};
+  return OrchestrationResult{oss.str(), std::move(func_name_to_id), std::move(func_name_to_core_type),
+                             std::move(func_name_to_signature)};
 }
 
 }  // namespace codegen

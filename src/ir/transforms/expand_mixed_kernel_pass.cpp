@@ -1085,19 +1085,22 @@ FunctionPtr RewriteGroupCaller(const FunctionPtr& group_func, const std::string&
       if (gv && gv->name_ == incore_name) {
         // Emit AIC call (always fire-and-forget). Original's leading_comments
         // attach here — AIC is the semantic front of the split pair.
-        auto aic_call =
-            std::make_shared<Call>(std::make_shared<GlobalVar>(aic_name), call->args_, stmt->span_);
+        // Carry kwargs_ + attrs_ (e.g. kAttrDumpVars) onto both lanes: the
+        // split reuses call->args_ unchanged, so dump/dep Var references stay
+        // valid, and orchestration codegen matches them per-arg by identity.
+        auto aic_call = std::make_shared<Call>(std::make_shared<GlobalVar>(aic_name), call->args_,
+                                               call->kwargs_, call->attrs_, GetUnknownType(), stmt->span_);
         new_stmts.push_back(std::make_shared<EvalStmt>(aic_call, stmt->span_, stmt->leading_comments_));
 
         // Emit AIV call: AssignStmt preserves return value, EvalStmt for void.
         // AIV is a continuation of the same logical op, so no comments attach.
         if (assign) {
           auto aiv_call = std::make_shared<Call>(std::make_shared<GlobalVar>(aiv_name), call->args_,
-                                                 call->GetType(), stmt->span_);
+                                                 call->kwargs_, call->attrs_, call->GetType(), stmt->span_);
           new_stmts.push_back(std::make_shared<AssignStmt>(assign->var_, aiv_call, stmt->span_));
         } else {
-          auto aiv_call =
-              std::make_shared<Call>(std::make_shared<GlobalVar>(aiv_name), call->args_, stmt->span_);
+          auto aiv_call = std::make_shared<Call>(std::make_shared<GlobalVar>(aiv_name), call->args_,
+                                                 call->kwargs_, call->attrs_, GetUnknownType(), stmt->span_);
           new_stmts.push_back(std::make_shared<EvalStmt>(aiv_call, stmt->span_));
         }
         continue;

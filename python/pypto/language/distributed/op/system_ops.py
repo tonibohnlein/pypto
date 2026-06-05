@@ -80,7 +80,7 @@ def get_comm_ctx(dist_tensor: DistributedTensor) -> CommCtx:
 def rank(ctx: CommCtx) -> Scalar:
     """Return the local rank as an ``INT32`` :class:`Scalar`.
 
-    Codegen lowers each call site to a scalar load of the runtime
+    Codegen lowers each call site to an ``i32`` load of the runtime
     ``CommContext::rankId`` field.
 
     Args:
@@ -96,7 +96,7 @@ def rank(ctx: CommCtx) -> Scalar:
 def nranks(ctx: CommCtx) -> Scalar:
     """Return the rank count of the comm group as an ``INT32`` :class:`Scalar`.
 
-    Codegen lowers each call site to a scalar load of the runtime
+    Codegen lowers each call site to an ``i32`` load of the runtime
     ``CommContext::rankNum`` field.
 
     Args:

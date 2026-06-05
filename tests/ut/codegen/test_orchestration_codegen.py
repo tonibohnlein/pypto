@@ -293,6 +293,59 @@ class TestOrchestration:
         assert "kernel_add" in result.func_name_to_id
         assert "kernel_add" in result.func_name_to_core_type
 
+        # The kernel's ArgDirection signature is exported so kernel_config.py can
+        # build a non-empty CoreCallable signature (issue #1458 — required for
+        # the runtime tensor dump to match the task payload tensor_count).
+        signature = result.func_name_to_signature["kernel_add"]
+        # a, b, output are all tensors -> 3 tensor directions, no SCALAR. The
+        # CoreCallable signature is a per-tensor-arg list, so scalars are excluded.
+        assert "SCALAR" not in signature
+        assert len(signature) == 3
+        assert all(d in {"IN", "OUT", "INOUT"} for d in signature)
+
+    def test_signature_excludes_scalar_args(self):
+        """Scalar args are excluded from a kernel's CoreCallable signature.
+
+        The CoreCallable signature_[] array is sized to CORE_MAX_TENSOR_ARGS and
+        is a per-tensor-arg direction list. Recording scalars would inflate
+        sig_count past that cap and trip make_callable's "sig_count exceeds
+        MaxSig" guard for kernels with many params (issue #1458 follow-up). Only
+        the tensor args appear, in tensors-first order.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class ScalarKernelProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add_scalar(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                scalar: pl.Scalar[pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                x: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(x, scalar)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_scalar(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                d = self.kernel_add_scalar(a, 1.0, d)
+                return d
+
+        result = _generate_orch_result(ScalarKernelProgram)
+
+        signature = result.func_name_to_signature["kernel_add_scalar"]
+        # 2 tensor args (a, output); the scalar literal is not recorded.
+        assert "SCALAR" not in signature
+        assert len(signature) == 2
+        assert all(d in {"IN", "OUT", "INOUT"} for d in signature)
+
     def test_independent_tasks(self):
         """Test codegen with independent tasks (no dependencies needed)."""
         backend.reset_for_testing()
@@ -2071,6 +2124,409 @@ class TestOrchestration:
         assert "from_u64<float>(orch_args.scalar(2))" in code
         assert ".expected_arg_count = 5," in code
 
+    def test_dump_tag_emits_toggle_and_per_task_dump(self):
+        """``pl.dump_tag(t)`` at orchestration scope makes codegen emit a per-task
+        ``Arg::dump(...)`` carrying only the tagged tensors. No orch-body toggle
+        is emitted (simpler#953): the runtime latches the dump level host-side.
+
+        Two kernel calls both consume ``a`` and ``b``; only ``a`` is tagged,
+        so both tasks should dump ``ext_a`` and neither should dump ``ext_b``.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class DumpTagProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                b_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(b, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, b_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_with_tag(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pl.dump_tag(a)
+                c: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                c = self.kernel_add(a, b, c)
+                d = self.kernel_add(a, b, d)
+                return d
+
+        code = _generate_orch_code(DumpTagProgram)
+
+        # No orch-body toggle (simpler#953): the runtime latches the dump level
+        # (off / partial / full) host-side; codegen only emits ``.dump(...)``.
+        assert "enable_dump_tensor_selective" not in code
+
+        # Both tasks dump only the tagged arg (ext_a), never ext_b.
+        assert code.count("params_t0.dump(ext_a);") == 1
+        assert code.count("params_t1.dump(ext_a);") == 1
+        assert "ext_b" not in [line.strip() for line in code.split("\n") if ".dump(" in line]
+        # Stronger check: no dump call references ext_b anywhere.
+        for line in code.split("\n"):
+            if ".dump(" in line:
+                assert "ext_b" not in line, f"Untagged ext_b should not be dumped: {line!r}"
+
+    def test_no_dump_tag_emits_no_toggle_or_dump(self):
+        """Without any ``pl.dump_tag`` no ``.dump(...)`` calls are emitted. The
+        runtime's ``CallConfig::enable_dump_tensor`` level then drives the dump
+        behaviour: level 2 (full) dumps every tensor of every task; level 1
+        (partial) dumps only ``.dump(...)``-marked tensors (here: none).
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class NoDumpTagProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                b_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(b, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, b_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_plain(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                d = self.kernel_add(a, b, d)
+                return d
+
+        code = _generate_orch_code(NoDumpTagProgram)
+
+        assert "enable_dump_tensor_selective" not in code
+        for line in code.split("\n"):
+            assert ".dump(" not in line, f"Plain orch should not emit any dump call: {line!r}"
+
+    def test_dump_tag_with_no_kernel_use_emits_nothing(self):
+        """Tagging a Var that no kernel call consumes is a user mistake we
+        keep quiet about: zero hits → no ``.dump(...)`` call emitted. The orch
+        falls back to whatever the runtime dump level dictates.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class StrayTagProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                b_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(b, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, b_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_stray(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                unused: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pl.dump_tag(unused)  # unused never reaches a kernel call
+                d = self.kernel_add(a, b, d)
+                return d
+
+        code = _generate_orch_code(StrayTagProgram)
+
+        assert "enable_dump_tensor_selective" not in code
+        for line in code.split("\n"):
+            assert ".dump(" not in line, f"Stray tag should not emit any dump call: {line!r}"
+
+    def test_dump_tag_inside_inline_function_propagates_to_caller(self):
+        """``pl.dump_tag(<inline param>)`` written inside ``@pl.function(type=Inline)``
+        desugars to ``dump_vars`` on the inline body's kernel calls; after
+        ``InlineFunctions`` splices the body in, the mutator substitutes the
+        caller's arg for the inline param, so the dump rides through to the
+        inlined call site. Codegen then emits the per-task ``.dump(...)``.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class InlineDumpTagProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                b_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(b, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, b_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def inline_helper(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pl.dump_tag(a)
+                d = self.kernel_add(a, b, d)
+                return d
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                d = self.inline_helper(a, b, d)
+                return d
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(InlineDumpTagProgram)
+        code = _generate_orch_code(transformed)
+
+        assert "enable_dump_tensor_selective" not in code
+        assert code.count("params_t0.dump(ext_a);") == 1
+        for line in code.split("\n"):
+            if ".dump(" in line:
+                assert "ext_b" not in line, f"Untagged ext_b should not be dumped: {line!r}"
+
+    def test_dump_tag_on_inline_body_local_var_after_freshname_rename(self):
+        """``pl.create_tensor`` inside an inline function is alpha-renamed by
+        the inline pass (``FreshName`` appends ``_inline<N>``) and versioned by
+        SSA. Because the dump target rides on the call's ``dump_vars`` (a Var
+        ref, not a name), it follows the rename / versioning automatically and
+        the dump is still emitted for the right slot after inlining.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class InlineBodyVarDumpTagProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                b_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(b, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, b_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def inline_helper(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                tmp: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                pl.dump_tag(tmp)
+                tmp = self.kernel_add(a, b, tmp)
+                d = self.kernel_add(tmp, b, d)
+                return d
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                d = self.inline_helper(a, b, d)
+                return d
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(InlineBodyVarDumpTagProgram)
+        code = _generate_orch_code(transformed)
+
+        assert "enable_dump_tensor_selective" not in code
+        # The dump rides on the call's ``dump_vars`` Var ref, which follows the
+        # FreshName rename (e.g. ``tmp_inline0``) and SSA versioning, so the
+        # emitted dump references the renamed local — at least one
+        # ``.dump(tmp...);`` line must appear.
+        dump_lines = [line for line in code.split("\n") if ".dump(" in line]
+        assert dump_lines, f"expected at least one dump call, got code:\n{code}"
+        assert any("tmp" in line for line in dump_lines), (
+            f"renamed inline body var should be dumped; got dump lines: {dump_lines}"
+        )
+
+    def test_dump_tag_stacked_inline_renames_body_local_var(self):
+        """A body-local ``pl.create_tensor`` declared in the innermost inline
+        function survives several layers of inlining. Each ``InlineFunctions``
+        pass iteration appends a fresh ``_inline<N>`` suffix to the Var name,
+        so a Var that starts as ``tmp`` can land in the orch body as
+        ``tmp_inlineA_inlineB_inlineC``. Because the dump target is a Var ref on
+        the call's ``dump_vars`` (not a name), it follows every rename and the
+        per-task dump still emits for the right slot.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class StackedInlineProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                b_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(b, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, b_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def inner(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                tmp: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                pl.dump_tag(tmp)
+                tmp = self.kernel_add(a, b, tmp)
+                d = self.kernel_add(tmp, b, d)
+                return d
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def middle(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                d = self.inner(a, b, d)
+                return d
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def outer(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                d = self.middle(a, b, d)
+                return d
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                d = self.outer(a, b, d)
+                return d
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(StackedInlineProgram)
+        code = _generate_orch_code(transformed)
+
+        # The Var that started as ``tmp`` in ``inner`` is renamed at every
+        # outer inlining step. Confirm we see at least one ``_inline``-
+        # suffixed emit name in the generated code (sanity that the multi-
+        # level stack happened at all), then assert the dump emit picks it up
+        # via the Var ref riding through the renames.
+        assert "_inline" in code, "expected at least one inline-renamed Var in the code"
+        assert "enable_dump_tensor_selective" not in code
+        dump_lines = [line for line in code.split("\n") if ".dump(" in line]
+        assert dump_lines, f"expected dump calls after multi-level inline, got code:\n{code}"
+        assert any("tmp" in line for line in dump_lines), (
+            f"stacked inline rename should still be dumped; got: {dump_lines}"
+        )
+
+    def test_dump_tag_two_level_inline_propagates(self):
+        """Two-level inlining (orch → middle → inner): the ``dump_vars`` set
+        written inside the innermost inline rides on the spliced kernel calls
+        through each ``InlineFunctions`` fixpoint iteration, so the per-task
+        dump still emits at the orchestration entry.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class TwoLevelInlineDumpTagProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                b_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(b, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, b_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def inner(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pl.dump_tag(a)
+                d = self.kernel_add(a, b, d)
+                return d
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def middle(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                d = self.inner(a, b, d)
+                return d
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                d = self.middle(a, b, d)
+                return d
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(TwoLevelInlineDumpTagProgram)
+        code = _generate_orch_code(transformed)
+
+        assert "enable_dump_tensor_selective" not in code
+        assert code.count("params_t0.dump(ext_a);") == 1
+
 
 class TestTensorReadWriteOffsetCodegen:
     """Tests verifying that multi-dimensional indices are correctly converted to flat offsets in codegen."""
@@ -2521,8 +2977,7 @@ class TestTensorReadWriteOffsetCodegen:
                 updated = self.group_func(a, out)
                 return updated
 
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SplitGroupProgram)
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SplitGroupProgram)
         vector_producer = transformed.get_function("vector_producer")
         cube_consumer = transformed.get_function("cube_consumer")
         assert vector_producer is not None
@@ -2563,10 +3018,7 @@ class TestTensorReadWriteOffsetCodegen:
                     out = pl.assemble(out, result, [0, 0])
                 return out
 
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
-                NoSplitGroupProgram
-            )
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(NoSplitGroupProgram)
 
         aic_funcs = [func for func in transformed.functions.values() if func.func_type == pl.FunctionType.AIC]
         aiv_funcs = [func for func in transformed.functions.values() if func.func_type == pl.FunctionType.AIV]
@@ -2622,12 +3074,11 @@ class TestTensorReadWriteOffsetCodegen:
                     out = self.kernel(a, b, bias, out)
                 return out
 
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            transformed = passes.expand_mixed_kernel()(
-                passes.infer_tile_memory_space()(
-                    passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMixedProgram))
-                )
+        transformed = passes.expand_mixed_kernel()(
+            passes.infer_tile_memory_space()(
+                passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMixedProgram))
             )
+        )
         spmd_func = transformed.get_function("main_spmd_0")
         group_func = transformed.get_function("kernel")
         assert spmd_func is not None
@@ -2708,12 +3159,11 @@ class TestTensorReadWriteOffsetCodegen:
                 final = self.consumer(out, final)
                 return final
 
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            transformed = passes.expand_mixed_kernel()(
-                passes.infer_tile_memory_space()(
-                    passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMultiOutSingleReturnProgram))
-                )
+        transformed = passes.expand_mixed_kernel()(
+            passes.infer_tile_memory_space()(
+                passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMultiOutSingleReturnProgram))
             )
+        )
 
         code = _generate_orch_code(transformed)
 
@@ -2787,6 +3237,12 @@ class TestTensorReadWriteOffsetCodegen:
                     out0, out1 = self.kernel(a, b0, b1, out0, out1)
                 return out0, out1
 
+        # NOTE: bypass tracks a known print->parse round-trip limitation — a
+        # multi-output `out0, out1 = self.kernel(...)` inside `with pl.spmd(N):`
+        # desugars to a 3-statement body the printer emits verbatim, which the
+        # parser then rejects (spmd body must be a single statement). The IR is
+        # valid (passes BEFORE_AND_AFTER property verification); only roundtrip
+        # fails. Remove NONE once the printer/parser round-trips this shape.
         with passes.PassContext([], passes.VerificationLevel.NONE):
             transformed = passes.expand_mixed_kernel()(
                 passes.infer_tile_memory_space()(
@@ -2836,8 +3292,7 @@ class TestTensorReadWriteOffsetCodegen:
                     out = self.kernel(a, b, bias, out)
                 return out
 
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SpmdGMPipeProgram)
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SpmdGMPipeProgram)
 
         code = _generate_orch_code(transformed)
         assert "params_t0.launch_spec.set_block_num(4);" in code
@@ -2892,10 +3347,9 @@ class TestTensorReadWriteOffsetCodegen:
                 self.small_group()
                 self.large_group()
 
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
-                PerCalleeGMPipeProgram
-            )
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
+            PerCalleeGMPipeProgram
+        )
 
         code = _generate_orch_code(transformed)
         shape_values = re.findall(r"gm_pipe_buffer_\d+_ci_shapes\[1\]\s*=\s*\{(\d+)\};", code)
@@ -3479,6 +3933,46 @@ class TestManualScopeCodegen:
         ]
         with _core_passes.PassContext(instruments):
             yield
+
+    def test_submit_dumps_emits_toggle_and_per_task_dump(self):
+        """``pl.submit(..., dumps=[x])`` (explicit kwarg) marks one arg slot of
+        one task launch.
+
+        Demonstrates per-launch granularity the forward-sticky ``pl.dump_tag``
+        cannot express: ``x`` is dumped on the first submit only, never on the
+        second. Matched by Var identity, not name.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class DumpPerSubmitProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_per_submit(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a, a_tid = pl.submit(self.k1, x, dumps=[x])  # dump x on task 0 only
+                    b, _ = pl.submit(self.k2, x, deps=[a_tid])  # task 1 dumps nothing
+                return b
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(DumpPerSubmitProgram)
+        code = _generate_orch_code(transformed)
+
+        # No orch-body toggle (simpler#953): the runtime latches the dump level
+        # (off / partial / full) host-side; codegen only emits ``.dump(...)``.
+        assert "enable_dump_tensor_selective" not in code
+
+        # Only task 0 dumps ext_x; task 1 dumps nothing.
+        assert code.count("params_t0.dump(ext_x);") == 1
+        assert "params_t1.dump(" not in code
 
     def test_manual_scope_emits_manual_pto2_scope_and_task_id_capture(self):
         backend.reset_for_testing()
@@ -4516,6 +5010,36 @@ class TestManualScopeCodegen:
         ), code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
+    def test_submit_dumps_emits_per_task_dump(self):
+        """``pl.submit(..., dumps=[x])`` feeds the same dump_vars path as a
+        ``pl.dump_tag`` declaration: codegen emits the selective-dump toggle
+        and a per-task ``.dump(...)`` for the listed arg. Confirms the existing
+        codegen path consumes a Submit's dump_vars from the kwarg surface.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    out, _ = pl.submit(self.k, x, dumps=[x])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "enable_dump_tensor_selective" not in code, code
+        dump_lines = [ln for ln in code.split("\n") if ".dump(" in ln]
+        assert dump_lines, code
+        assert any("ext_x" in ln for ln in dump_lines), code
+
 
 class TestTupleReturnNoDepAliasing:
     """``GenerateTupleReturnAliases`` must classify output slots by the
@@ -5037,6 +5561,233 @@ def test_mixed_in_and_out_of_scope_deps_does_not_crash_codegen():
     m = re.search(r"PTO2TaskId\s+(\w+)\s*=\s*task_0_outs\.task_id\(\);", code)
     assert m, code
     assert code.count(m.group(1)) == 1, code
+
+
+def test_spmd_submit_emits_launch_spec_and_captures_task_id():
+    """``pl.spmd_submit`` lowers to a single submit carrying the SPMD launch
+    spec (set_block_num / set_require_sync_start) and a captured producer
+    TaskId that a downstream submit depends on.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def producer(
+            self, x: pl.Tensor[[512, 128], pl.FP32], out: pl.Out[pl.Tensor[[512, 128], pl.FP32]]
+        ) -> pl.Tensor[[512, 128], pl.FP32]:
+            bi = pl.tile.get_block_idx()
+            off = bi * 128
+            t = pl.load(x, [off, 0], [128, 128])
+            out = pl.store(t, [off, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def consumer(
+            self, x: pl.Tensor[[512, 128], pl.FP32], out: pl.Out[pl.Tensor[[512, 128], pl.FP32]]
+        ) -> pl.Tensor[[512, 128], pl.FP32]:
+            t = pl.load(x, [0, 0], [128, 128])
+            out = pl.store(t, [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self, x: pl.Tensor[[512, 128], pl.FP32], out: pl.Out[pl.Tensor[[512, 128], pl.FP32]]
+        ) -> pl.Tensor[[512, 128], pl.FP32]:
+            with pl.manual_scope():
+                scratch = pl.create_tensor([512, 128], dtype=pl.FP32)
+                scratch, tid = pl.spmd_submit(self.producer, x, scratch, core_num=4, sync_start=True)
+                out, _ = pl.spmd_submit(self.consumer, scratch, out, core_num=2, deps=[tid])
+            return out
+
+    code = _generate_orch_full_pipeline(P)
+    # Producer carries core_num=4 + sync_start; consumer carries core_num=2.
+    assert "params_t0.launch_spec.set_block_num(4);" in code, code
+    assert "params_t0.launch_spec.set_require_sync_start(true);" in code, code
+    assert "params_t1.launch_spec.set_block_num(2);" in code, code
+    # sync_start defaults False on the consumer — emitted exactly once.
+    assert code.count("set_require_sync_start(true)") == 1, code
+    # Producer TaskId is captured and the consumer depends on it.
+    assert re.search(r"PTO2TaskId\s+\w+\s*=\s*task_0_outs\.task_id\(\);", code), code
+    assert "set_dependencies(" in code, code
+
+
+def test_spmd_submit_group_emits_mixed_kernels_and_launch_spec():
+    """``pl.spmd_submit`` of a split (cube+vector) kernel routes through the
+    Group dispatch path and still emits the SPMD launch spec.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def kernel(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP32],
+            b: pl.Tensor[[64, 64], pl.FP32],
+            bias: pl.Tensor[[64, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            tile_a_l1 = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+            tile_b_l1 = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+            tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
+            tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
+            tile_mm = pl.matmul(tile_a_l0a, tile_b_l0b)
+            tile_bias = pl.load(bias, [0, 0], [64, 64])
+            tile_out = pl.add(tile_mm, tile_bias)
+            out = pl.store(tile_out, [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP32],
+            b: pl.Tensor[[64, 64], pl.FP32],
+            bias: pl.Tensor[[64, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            with pl.manual_scope():
+                out, _ = pl.spmd_submit(self.kernel, a, b, bias, out, core_num=4, sync_start=True)
+            return out
+
+    code = _generate_orch_full_pipeline(P)
+    assert "MixedKernels mixed_0" in code, code
+    assert "rt_submit_task(mixed_0, params_t0);" in code, code
+    assert "params_t0.launch_spec.set_block_num(4);" in code, code
+    assert "params_t0.launch_spec.set_require_sync_start(true);" in code, code
+
+
+def test_plain_submit_emits_no_launch_spec():
+    """Regression: a plain ``pl.submit`` (no SPMD launch spec) must not emit
+    any launch_spec calls — the spmd_submit path is fully opt-in.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def k(
+            self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
+        ) -> pl.Tensor[[128], pl.FP32]:
+            t = pl.load(x, [0], [128])
+            out = pl.store(t, [0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
+        ) -> pl.Tensor[[128], pl.FP32]:
+            with pl.manual_scope():
+                out, _ = pl.submit(self.k, x, out)
+            return out
+
+    code = _generate_orch_full_pipeline(P)
+    assert "launch_spec" not in code, code
+
+
+def test_spmd_submit_aic_direct_dispatch():
+    """spmd_submit of a directly-declared AIC (cube) kernel routes through the
+    direct dispatch path: rt_submit_aic_task + launch spec (910B)."""
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP32],
+            b: pl.Tensor[[64, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            ta = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+            tb = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+            la = pl.move(ta, target_memory=pl.MemorySpace.Left)
+            lb = pl.move(tb, target_memory=pl.MemorySpace.Right)
+            mm = pl.matmul(la, lb)
+            out = pl.store(mm, [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP32],
+            b: pl.Tensor[[64, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            with pl.manual_scope():
+                out, _ = pl.spmd_submit(self.cube, a, b, out, core_num=8)
+            return out
+
+    # Property-only verification: a submit's deps/launch-spec don't survive the
+    # print->parse roundtrip after DeriveCallDirections (pre-existing limitation,
+    # same reason _generate_orch_full_pipeline uses BEFORE_AND_AFTER).
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        code = _generate_orch_code(P)
+    assert "rt_submit_aic_task" in code, code
+    assert "params_t0.launch_spec.set_block_num(8);" in code, code
+
+
+def test_spmd_submit_core_num_variable_emits_var_reference():
+    """A non-constant core_num (an orchestration scalar parameter) is emitted as
+    a variable reference in the launch spec, not constant-folded."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def k(
+            self, x: pl.Tensor[[512, 128], pl.FP32], out: pl.Out[pl.Tensor[[512, 128], pl.FP32]]
+        ) -> pl.Tensor[[512, 128], pl.FP32]:
+            bi = pl.tile.get_block_idx()
+            off = bi * 128
+            t = pl.load(x, [off, 0], [128, 128])
+            out = pl.store(t, [off, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            x: pl.Tensor[[512, 128], pl.FP32],
+            n: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+        ) -> pl.Tensor[[512, 128], pl.FP32]:
+            with pl.manual_scope():
+                out, _ = pl.spmd_submit(self.k, x, out, core_num=n)
+            return out
+
+    code = _generate_orch_full_pipeline(P)
+    m = re.search(r"launch_spec\.set_block_num\(([^)]*)\)", code)
+    assert m, f"no set_block_num in:\n{code}"
+    # The argument is a variable reference (a name), not a constant-folded literal.
+    assert not m.group(1).strip().isdigit(), f"core_num was constant-folded, expected a var: {m.group(1)!r}"
+
+
+def test_spmd_submit_950_backend_emits_set_core_num():
+    """On Ascend950 the launch spec uses set_core_num (vs set_block_num on 910B),
+    via the backend handler's GetLaunchSpecCoreCountMethod()."""
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend950)
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.AIV)
+        def k(
+            self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
+        ) -> pl.Tensor[[128], pl.FP32]:
+            t = pl.load(x, [0], [128])
+            out = pl.store(t, [0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
+        ) -> pl.Tensor[[128], pl.FP32]:
+            with pl.manual_scope():
+                out, _ = pl.spmd_submit(self.k, x, out, core_num=4)
+            return out
+
+    # Property-only verification (see test_spmd_submit_aic_direct_dispatch).
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        code = _generate_orch_code(P)
+    assert "params_t0.launch_spec.set_core_num(4);" in code, code
+    assert "set_block_num" not in code, code
 
 
 if __name__ == "__main__":

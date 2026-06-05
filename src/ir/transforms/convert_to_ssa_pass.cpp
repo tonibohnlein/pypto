@@ -298,7 +298,8 @@ class SSAConverter {
       auto new_type = converter_.SubstType(submit->GetType());
       if (new_type.get() != submit->GetType().get()) {
         return std::make_shared<const Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
-                                              submit->attrs_, new_type, submit->span_);
+                                              submit->attrs_, new_type, submit->span_, submit->core_num_,
+                                              submit->sync_start_);
       }
       return result;
     }
@@ -325,6 +326,8 @@ class SSAConverter {
 
   /// Substitute Var references stored in Call attrs. Currently covers:
   ///   * ``kAttrManualDepEdges`` — ``std::vector<VarPtr>`` (dep edges)
+  ///   * ``kAttrDumpVars`` — ``std::vector<VarPtr>`` (selective dump
+  ///     targets from ``pl.dump_tag`` / ``dumps=``)
   ///   * ``kAttrDevice`` — ``ExprPtr`` (host-orch dispatch device selector,
   ///     typically a loop induction Var that SSA must version)
   ///
@@ -338,7 +341,7 @@ class SSAConverter {
     std::vector<std::pair<std::string, std::any>> out;
     out.reserve(attrs.size());
     for (const auto& [k, v] : attrs) {
-      if (k == kAttrManualDepEdges) {
+      if (k == kAttrManualDepEdges || k == kAttrDumpVars) {
         const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
         if (edges) {
           std::vector<VarPtr> new_edges;
@@ -382,7 +385,7 @@ class SSAConverter {
 
   TypePtr SubstType(const TypePtr& type) {
     if (!type) return type;
-    if (auto t = As<TensorType>(type)) {
+    if (auto t = AsTensorTypeLike(type)) {
       auto [shape, changed] = SubstExprVec(t->shape_);
       std::optional<TensorView> new_tv = t->tensor_view_;
       if (t->tensor_view_.has_value()) {
@@ -394,10 +397,12 @@ class SSAConverter {
           new_tv = TensorView(std::move(st), tv.layout, std::move(vs), tv.pad);
         }
       }
-      if (changed) {
-        return std::make_shared<TensorType>(std::move(shape), t->dtype_, t->memref_, std::move(new_tv));
+      if (!changed) return type;
+      if (auto dt = As<DistributedTensorType>(type)) {
+        return std::make_shared<DistributedTensorType>(std::move(shape), t->dtype_, t->memref_,
+                                                       std::move(new_tv), dt->window_buffer_);
       }
-      return type;
+      return std::make_shared<TensorType>(std::move(shape), t->dtype_, t->memref_, std::move(new_tv));
     }
     if (auto t = As<TileType>(type)) {
       if (!t->tile_view_.has_value()) return type;
@@ -963,17 +968,21 @@ class SSAConverter {
   }
 
   /// Substitute Var-typed entries in a ScopeStmt's ``attrs_``
-  /// (``manual_dep_edges`` / ``task_id_var`` / ``arg_direction_overrides_vars``).
-  /// Returns the rebuilt attrs and a flag indicating whether any entry was
-  /// rewritten — mirrors the per-Call ``SubstCallAttrs`` so SSA renaming
-  /// propagates into scope-level attrs the same way it does for Call attrs.
+  /// (``manual_dep_edges`` / ``task_id_var`` / ``arg_direction_overrides_vars`` /
+  /// ``dump_vars``). Returns the rebuilt attrs and a flag indicating whether any
+  /// entry was rewritten — mirrors the per-Call ``SubstCallAttrs`` so SSA
+  /// renaming propagates into scope-level attrs the same way it does for Call
+  /// attrs. ``dump_vars`` rides here as the carrier from ``pl.dump_tag`` /
+  /// ``dumps=`` to the outliner: substituting BEFORE the body (see
+  /// ``ConvertScope``) resolves each tagged tensor to the SSA version visible at
+  /// scope entry — exactly the value the synthesised dispatch receives as an arg.
   std::pair<std::vector<std::pair<std::string, std::any>>, bool> SubstScopeAttrs(
       const std::vector<std::pair<std::string, std::any>>& attrs) {
     bool changed = false;
     std::vector<std::pair<std::string, std::any>> out;
     out.reserve(attrs.size());
     for (const auto& [k, v] : attrs) {
-      if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
+      if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
         const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
         if (edges) {
           std::vector<VarPtr> new_edges;
@@ -1036,7 +1045,47 @@ class SSAConverter {
       new_core_num = SubstExpr(spmd->core_num_);
       core_num_changed = (new_core_num.get() != spmd->core_num_.get());
     }
+
+    // Block escaping-var promotion across non-Runtime scope boundaries (#1351).
+    //
+    // ``HierarchyScopeStmt`` / ``InCoreScopeStmt`` / ``AutoInCoreScopeStmt`` /
+    // ``ClusterScopeStmt`` / ``SpmdScopeStmt`` separate the loops *inside*
+    // their body from the use-site of any variable defined further down the
+    // *outer* sequence. The inner loops cannot manufacture a working init
+    // value for such a use (FindInitValue typically falls back to an
+    // unversioned ``foo__FREE_VAR`` placeholder, which the SSA verifier
+    // rejects) and would carry a value that is never threaded back to the
+    // outer use site anyway. Trim ``future_needs_`` to variables already
+    // visible in ``cur_`` at scope entry so the inner-loop escaping
+    // detection (see ConvertFor::escaping above) ignores scope-local vars.
+    //
+    // ``cur_`` is intentionally NOT restored after the body — variables
+    // first-defined inside the body and referenced after the scope must
+    // still substitute to their in-body SSA version (relied on by passes
+    // like InterchangeChunkLoops that emit ``out = pl.assemble(...)`` inside
+    // ``pl.at`` and return ``out`` outside). Whether such a leak is
+    // user-legal is enforced by other property verifiers, not by SSA.
+    //
+    // ``RuntimeScopeStmt`` is a thin ``pl.scope()`` codegen wrapper, not a
+    // boundary — its body shares SSA state with the enclosing function and
+    // stays fully transparent.
+    const bool is_outline_boundary = !As<RuntimeScopeStmt>(op);
+    std::unordered_set<const Var*> saved_future_needs;
+    if (is_outline_boundary) {
+      saved_future_needs = future_needs_;
+      std::unordered_set<const Var*> restricted;
+      restricted.reserve(future_needs_.size());
+      for (const auto* v : future_needs_) {
+        if (cur_.count(v)) restricted.insert(v);
+      }
+      future_needs_ = std::move(restricted);
+    }
+
     auto body = ConvertStmt(op->body_);
+
+    if (is_outline_boundary) {
+      future_needs_ = std::move(saved_future_needs);
+    }
     auto& new_attrs = subst.first;
     const bool attrs_changed = subst.second;
     if (body == op->body_ && !attrs_changed && !core_num_changed) return op;

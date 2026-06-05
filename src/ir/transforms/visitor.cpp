@@ -79,11 +79,12 @@ void IRVisitor::VisitExpr_(const CallPtr& op) {
     INTERNAL_CHECK_SPAN(op->args_[i], op->span_) << "Call has null argument at index " << i;
     VisitExpr(op->args_[i]);
   }
-  // Var-typed attr ``manual_dep_edges`` references Vars defined elsewhere
-  // in the IR. Treat them as real uses so analyses such as the unused-variable
-  // check don't flag a Var that is referenced only via ``deps=[tid]``.
+  // Var-typed attrs ``manual_dep_edges`` / ``dump_vars`` reference Vars defined
+  // elsewhere in the IR. Treat them as real uses so analyses such as the
+  // unused-variable check don't flag a Var referenced only via ``deps=[tid]``
+  // or ``dumps=[t]`` / ``pl.dump_tag``.
   for (const auto& [k, v] : op->attrs_) {
-    if (k != kAttrManualDepEdges) continue;
+    if (k != kAttrManualDepEdges && k != kAttrDumpVars) continue;
     const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
     if (!edges) continue;
     for (const auto& e : *edges) {
@@ -104,13 +105,20 @@ void IRVisitor::VisitExpr_(const SubmitPtr& op) {
     INTERNAL_CHECK_SPAN(op->deps_[i], op->span_) << "Submit has null dep at index " << i;
     VisitExpr(op->deps_[i]);
   }
-  // Var-typed attr ``arg_direction_overrides_vars`` references Vars defined
-  // elsewhere in the IR. IRMutator::VisitExpr_(SubmitPtr) already rewrites
-  // those Vars on substitution; the visitor must walk them too so unused-var
-  // / def-use / SSA-liveness analyses do not silently drop a Var that is
-  // referenced only through this attr.
+  // core_num_ (pl.spmd_submit SPMD block count) is a first-class Expr operand —
+  // a ConstInt or a closure Var defined elsewhere. Visit it so unused-var /
+  // def-use / SSA-liveness analyses see the use (mirrors the deps_ rationale).
+  if (op->core_num_.has_value()) {
+    INTERNAL_CHECK_SPAN(*op->core_num_, op->span_) << "Submit core_num is null";
+    VisitExpr(*op->core_num_);
+  }
+  // Var-typed attrs ``arg_direction_overrides_vars`` / ``dump_vars`` reference
+  // Vars defined elsewhere in the IR. IRMutator::VisitExpr_(SubmitPtr) already
+  // rewrites those Vars on substitution; the visitor must walk them too so
+  // unused-var / def-use / SSA-liveness analyses do not silently drop a Var
+  // that is referenced only through these attrs.
   for (const auto& [k, v] : op->attrs_) {
-    if (k != kAttrArgDirOverrideVars) continue;
+    if (k != kAttrArgDirOverrideVars && k != kAttrDumpVars) continue;
     const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
     if (!edges) continue;
     for (const auto& e : *edges) {
@@ -258,10 +266,10 @@ void IRVisitor::VisitStmt_(const WhileStmtPtr& op) {
 // Visit Var-typed entries in a ScopeStmt's ``attrs_``. Mirrors the Call.attrs
 // handling in VisitExpr_(CallPtr) so analyses (unused-var detection, SSA Var
 // liveness, etc.) see Var refs stashed on a ScopeStmt's ``manual_dep_edges`` /
-// ``task_id_var`` / ``arg_direction_overrides_vars`` attrs.
+// ``task_id_var`` / ``arg_direction_overrides_vars`` / ``dump_vars`` attrs.
 void IRVisitor::VisitScopeAttrs(const ScopeStmtPtr& op) {
   for (const auto& [k, v] : op->attrs_) {
-    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
+    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (!edges) continue;
       for (const auto& e : *edges) {
@@ -300,6 +308,10 @@ void IRVisitor::VisitStmt_(const HierarchyScopeStmtPtr& op) {
 void IRVisitor::VisitStmt_(const SpmdScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->core_num_, op->span_) << "SpmdScopeStmt has null core_num";
   VisitExpr(op->core_num_);
+  // Visit kAttrTaskIdVar / kAttrManualDepEdges attr Vars (the
+  // `with pl.spmd(...) as tid:` capture form), like the InCore / AutoInCore /
+  // Hierarchy handlers — so free-var / use-def analyses see the tid and dep edges.
+  VisitScopeAttrs(op);
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "SpmdScopeStmt has null body";
   VisitStmt(op->body_);
 }

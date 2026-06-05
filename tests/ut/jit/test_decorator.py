@@ -9,21 +9,29 @@
 
 """Tests for @pl.jit decorator: decoration, cache hit/miss, and bind_dynamic."""
 
+import ast
 import importlib
 import inspect
 import warnings
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 from pypto.ir import OptimizationStrategy, PassManager
 from pypto.ir.compiled_program import CompiledProgram
 from pypto.jit.decorator import (
     JITFunction,
+    _arg_ref,
+    _build_param_mapping,
+    _compute_per_func_dyndim_maps,
     _discover_deps,
+    _extract_call_args_for_dep,
     _extract_local_tensor_metas,
+    _resolve_dep_call_metadata,
     _rewrite_jit_error,
     _run_config_compile_kwargs,
     _scan_dynamic_dims,
+    _SlicedArg,
     jit,
 )
 from pypto.jit.specializer import TensorMeta
@@ -84,6 +92,32 @@ class TestJitDecoration:
 
         assert isinstance(kernel, JITFunction)
 
+    def test_jit_default_auto_scope_true(self):
+        @jit
+        def entry(a: pl.Tensor):
+            return a
+
+        assert entry._auto_scope is True
+
+    def test_jit_auto_scope_false(self):
+        @jit(auto_scope=False)
+        def entry(a: pl.Tensor):
+            return a
+
+        assert isinstance(entry, JITFunction)
+        assert entry._func_type == "orchestration"
+        assert entry._auto_scope is False
+
+    def test_jit_empty_parens_form(self):
+        """@pl.jit() (bare parens) is equivalent to @pl.jit."""
+
+        @jit()
+        def entry(a: pl.Tensor):
+            return a
+
+        assert isinstance(entry, JITFunction)
+        assert entry._auto_scope is True
+
 
 # ---------------------------------------------------------------------------
 # @pl.jit.host decoration
@@ -130,6 +164,46 @@ class TestJitHostDecoration:
 
         assert isinstance(host_orch, JITFunction)
         assert host_orch._func_type == "host"
+
+    def test_jit_host_accepts_auto_scope_false(self):
+        @jit.host(auto_scope=False)
+        def host_orch(a: pl.Tensor):
+            return a
+
+        assert isinstance(host_orch, JITFunction)
+        assert host_orch._func_type == "host"
+        assert host_orch._auto_scope is False
+
+    def test_jit_incore_rejects_auto_scope_kwarg(self):
+        with pytest.raises(TypeError, match="does not accept an auto_scope= argument"):
+
+            @jit.incore(auto_scope=False)
+            def sub_fn(a: pl.Tensor):
+                return a
+
+    def test_jit_inline_rejects_auto_scope_kwarg(self):
+        with pytest.raises(TypeError, match="does not accept an auto_scope= argument"):
+
+            @jit.inline(auto_scope=False)
+            def sub_fn(a: pl.Tensor):
+                return a
+
+    def test_jit_opaque_rejects_auto_scope_kwarg(self):
+        with pytest.raises(TypeError, match="does not accept an auto_scope= argument"):
+
+            @jit.opaque(auto_scope=False)
+            def sub_fn(a: pl.Tensor):
+                return a
+
+    def test_jit_incore_rejects_auto_scope_true(self):
+        """Sub-decorators reject auto_scope= even when explicitly True — the
+        kwarg is not part of their API surface, so passing any value is an
+        error, not just a non-True value."""
+        with pytest.raises(TypeError, match="does not accept an auto_scope= argument"):
+
+            @jit.incore(auto_scope=True)
+            def sub_fn(a: pl.Tensor):
+                return a
 
 
 class TestHostDiscoversOrchestrationDep:
@@ -179,6 +253,28 @@ class TestHostDiscoversOrchestrationDep:
         deps = host_orch._get_deps()
         assert len(deps) == 1
         assert deps[0]._func_type == "incore"
+
+    def test_host_forwards_dep_auto_scope(self):
+        """An @pl.jit(auto_scope=False) chip orchestrator discovered as a dep of
+        an @pl.jit.host entry keeps its auto_scope=False when its
+        SpecializeContext is built — the flag must be forwarded to the dep
+        context, not defaulted to True."""
+        torch = pytest.importorskip("torch")
+
+        @jit(auto_scope=False)
+        def chip_orch(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            return c
+
+        @jit.host
+        def host_orch(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            return chip_orch(a, c)
+
+        a = torch.empty(128, 128)
+        c = torch.empty(128, 128)
+        _, _, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = host_orch._bind_args((a, c), {})
+        contexts = host_orch._build_contexts(tensor_meta, scalar_values, scalar_dtypes, per_func_dyn)
+        dep_ctx = next(ctx for ctx in contexts if ctx.func_name == "chip_orch")
+        assert dep_ctx.auto_scope is False
 
 
 # ---------------------------------------------------------------------------
@@ -1024,6 +1120,203 @@ class TestDynamicLocalTensorMetadata:
         fwd_1524.compile_for_test(hidden, out)
 
 
+# ---------------------------------------------------------------------------
+# Per-rank sliced dispatch (chip_orch(x[r], ...)) and pld.window metadata.
+# Module-level dynvar + functions so inspect.getsource / inspect.signature
+# see real source and annotations (the host-orchestration distributed shape).
+# ---------------------------------------------------------------------------
+_M_SLICE = pl.dynamic("M_SLICE")
+
+
+@jit.incore
+def _sliced_chip(data: pl.Tensor, out: pl.Out[pl.Tensor]) -> pl.Tensor:
+    """Chip orchestrator dep reached via a per-rank ``_sliced_chip(x[r], ...)``
+    dispatch from a host orchestrator body."""
+    M, N = data.shape
+    t = pl.load(data, [0, 0], [M, N])
+    pl.store(t, [0, 0], out)
+    return out
+
+
+@jit.incore
+def _dyn_sliced_chip(data: pl.Tensor[[_M_SLICE, 128], pl.FP32], out: pl.Out[pl.Tensor]) -> pl.Tensor:
+    """Chip orchestrator dep whose leading dim is dynamic — used to verify the
+    DynDim cascade does not flow through a per-rank sliced (dropped) dim."""
+    M, N = data.shape
+    t = pl.load(data, [0, 0], [M, N])
+    pl.store(t, [0, 0], out)
+    return out
+
+
+def _per_rank_dispatch_body(inputs: pl.Tensor, outputs: pl.Out[pl.Tensor]) -> None:
+    """Host orchestrator body: dispatch one chip orchestrator per rank by
+    subscripting the leading (rank) dim — ``_sliced_chip(inputs[r], outputs[r])``."""
+    for r in pl.range(2):
+        _sliced_chip(inputs[r], outputs[r])
+
+
+def _window_local_body(data_buf, signal_buf):
+    """Host orchestrator body: per-rank window views over window buffers.
+    The body is parsed from source only (never executed) — matching the
+    existing ``_slice_then_dep_body`` style."""
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [1, 1], dtype=pl.INT32)
+    return data, signal
+
+
+class TestArgRef:
+    """Unit tests for ``_arg_ref`` — caller-side reference classification."""
+
+    @staticmethod
+    def _ref(expr_src: str):
+        return _arg_ref(ast.parse(expr_src, mode="eval").body)
+
+    def test_plain_name(self):
+        assert self._ref("x") == "x"
+
+    def test_single_integer_index_drops_one_dim(self):
+        assert self._ref("x[r]") == _SlicedArg("x", 1)
+
+    def test_multi_integer_index_drops_each_dim(self):
+        assert self._ref("x[r, 0]") == _SlicedArg("x", 2)
+
+    def test_slice_index_keeps_dim(self):
+        # ``x[r:r+1]`` selects a range — the dim survives, so drop == 0 → None.
+        assert self._ref("x[r:r+1]") is None
+
+    def test_mixed_integer_and_slice_counts_only_integers(self):
+        # One integer index (dropped) + one slice (kept) → drop == 1.
+        assert self._ref("x[r, 0:2]") == _SlicedArg("x", 1)
+
+    def test_literal_returns_none(self):
+        assert self._ref("3") is None
+
+    def test_attribute_returns_none(self):
+        assert self._ref("obj.attr") is None
+
+    def test_subscript_of_non_name_returns_none(self):
+        # ``f()[0]`` — base is a call, not a Name.
+        assert self._ref("f()[0]") is None
+
+
+class TestExtractCallArgsSlicedDispatch:
+    """``_extract_call_args_for_dep`` + ``_build_param_mapping`` must carry a
+    per-rank subscript (``x[r]``) through as a ``_SlicedArg``."""
+
+    def test_sliced_positional_args_extracted(self):
+        call_args = _extract_call_args_for_dep(_per_rank_dispatch_body, "_sliced_chip")
+        assert call_args == [
+            (None, _SlicedArg("inputs", 1)),
+            (None, _SlicedArg("outputs", 1)),
+        ]
+
+    def test_param_mapping_pairs_sliced_args_by_position(self):
+        call_args = _extract_call_args_for_dep(_per_rank_dispatch_body, "_sliced_chip")
+        assert call_args is not None
+        mapping = _build_param_mapping(["data", "out"], call_args)
+        assert mapping == {
+            "data": _SlicedArg("inputs", 1),
+            "out": _SlicedArg("outputs", 1),
+        }
+
+
+class TestWindowLocalMetadata:
+    """``_extract_local_tensor_metas`` must infer metas for ``pld.window`` views
+    so a host orchestrator's per-rank window locals propagate into the chip
+    orchestrator's ``pld.DistributedTensor`` parameters."""
+
+    def test_window_view_meta_inferred(self):
+        metas = _extract_local_tensor_metas(_window_local_body, seed_meta={})
+        # Shape from the 2nd positional arg, dtype from the ``dtype=`` keyword.
+        assert metas["data"] == TensorMeta(shape=(1, 256), dtype=DataType.FP32)
+        assert metas["signal"] == TensorMeta(shape=(1, 1), dtype=DataType.INT32)
+
+    def test_window_missing_dtype_untracked(self):
+        def body(buf):
+            data = pld.window(buf, [1, 256])  # no dtype= kw
+            return data
+
+        metas = _extract_local_tensor_metas(body, seed_meta={})
+        assert "data" not in metas
+
+    def test_window_missing_shape_untracked(self):
+        def body(buf):
+            data = pld.window(buf, dtype=pl.FP32)  # no shape arg
+            return data
+
+        metas = _extract_local_tensor_metas(body, seed_meta={})
+        assert "data" not in metas
+
+
+class TestSlicedDispatchMetadata:
+    """``_resolve_dep_call_metadata`` must give a per-rank chip orchestrator dep
+    the base tensor's meta with the subscripted leading dims removed, and the
+    DynDim cascade must not flow through a dropped dim."""
+
+    def test_sliced_arg_drops_leading_dim(self):
+        # Host passes ``inputs[r]`` / ``outputs[r]`` — each drops the rank dim.
+        seed = {
+            "inputs": TensorMeta(shape=(2, 1, 256), dtype=DataType.FP32),
+            "outputs": TensorMeta(shape=(2, 1, 256), dtype=DataType.FP32),
+        }
+        tensor_meta, _, _ = _resolve_dep_call_metadata(
+            _sliced_chip,
+            _per_rank_dispatch_body,
+            seed,
+            {},
+            {},
+            {},
+            caller_func_type="host",
+        )
+        assert tensor_meta["data"] == TensorMeta(shape=(1, 256), dtype=DataType.FP32)
+        assert tensor_meta["out"] == TensorMeta(shape=(1, 256), dtype=DataType.FP32)
+
+    def test_sliced_arg_drop_at_or_past_rank_is_untracked(self):
+        # Base is 1-D; dropping a leading dim leaves nothing meaningful, so the
+        # guard ``drop < len(shape)`` skips it rather than producing an empty meta.
+        seed = {
+            "inputs": TensorMeta(shape=(2,), dtype=DataType.FP32),
+            "outputs": TensorMeta(shape=(2,), dtype=DataType.FP32),
+        }
+        tensor_meta, _, _ = _resolve_dep_call_metadata(
+            _sliced_chip,
+            _per_rank_dispatch_body,
+            seed,
+            {},
+            {},
+            {},
+            caller_func_type="host",
+        )
+        assert "data" not in tensor_meta
+        assert "out" not in tensor_meta
+
+    def test_dyndim_cascade_skips_sliced_arg(self):
+        # The dep declares a dynamic leading dim; the host reaches it via
+        # ``_dyn_sliced_chip(inputs[r], ...)``. The DynDim must NOT cascade onto
+        # a ``_SlicedArg`` key — doing so would corrupt the caller's dim map with
+        # a non-string key (and is semantically wrong: the rank dim is dropped).
+        call_args_cache: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None] = {
+            (id(_per_rank_dispatch_body), "_dyn_sliced_chip"): [
+                (None, _SlicedArg("inputs", 1)),
+                (None, _SlicedArg("outputs", 1)),
+            ]
+        }
+        maps = _compute_per_func_dyndim_maps(
+            entry_func=_per_rank_dispatch_body,
+            entry_param_names=["inputs", "outputs"],
+            deps=[_dyn_sliced_chip],
+            callers_by_dep_id={id(_dyn_sliced_chip._func): [_per_rank_dispatch_body]},
+            call_args_cache=call_args_cache,
+        )
+        host_map = maps[id(_per_rank_dispatch_body)]
+        # Sanity: the dep itself carries the dynamic dim.
+        assert maps[id(_dyn_sliced_chip._func)]["data"][0].literal == "M_SLICE"
+        # The host map must only ever be keyed by parameter name strings.
+        assert all(isinstance(key, str) for key in host_map)
+        assert _SlicedArg("inputs", 1) not in host_map
+        assert _SlicedArg("outputs", 1) not in host_map
+
+
 class TestInlineFuncIntegration:
     """End-to-end @pl.jit.inline: dep body is spliced into entry by the IR pass."""
 
@@ -1619,6 +1912,93 @@ class TestCompileKwargForwarding:
         kwargs = _run_config_compile_kwargs(RunConfig())
         assert "output_dir" not in kwargs
 
+    def test_run_config_compile_kwargs_forwards_distributed_config(self):
+        """A RunConfig.distributed_config is forwarded so @pl.jit.host kernels go distributed."""
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+
+        dc = DistributedConfig(device_ids=[0, 1])
+        kwargs = _run_config_compile_kwargs(RunConfig(distributed_config=dc))
+        # Forwarded verbatim (same object) so ir.compile() emits a
+        # DistributedCompiledProgram for the HOST-level entry.
+        assert kwargs["distributed_config"] is dc
+
+    def test_run_config_compile_kwargs_omits_unset_distributed_config(self):
+        """distributed_config left unset is omitted so ir.compile()'s single-chip default applies."""
+        kwargs = _run_config_compile_kwargs(RunConfig())
+        assert "distributed_config" not in kwargs
+
+    def test_make_cache_key_splits_on_distributed_config(self):
+        """distributed_config participates in the cache key (distinct device_ids ≠ collide)."""
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+        from pypto.jit.cache import make_cache_key  # noqa: PLC0415
+
+        def key_for(distributed_config):
+            return make_cache_key(
+                source_hash="h",
+                param_names=["x"],
+                tensor_shapes={"x": (128, 128)},
+                tensor_dtypes={"x": DataType.FP32},
+                dynamic_dims=set(),
+                scalar_values={},
+                platform="a2a3",
+                strategy=OptimizationStrategy.Default,
+                distributed_config=distributed_config,
+            )
+
+        key_none = key_for(None)
+        key_01 = key_for(DistributedConfig(device_ids=[0, 1]))
+        key_23 = key_for(DistributedConfig(device_ids=[2, 3]))
+        key_01_again = key_for(DistributedConfig(device_ids=[0, 1]))
+
+        # Distinct device_ids must not collide, and a distributed config must
+        # not collide with the single-chip (None) default.
+        assert len({key_none, key_01, key_23}) == 3
+        # Equal configs yield equal keys, so a genuine re-call still hits the
+        # cache; the key stays hashable (usable in a set / as a dict key).
+        assert key_01 == key_01_again
+
+    def test_resolve_compiled_splits_cache_on_distributed_config(self, monkeypatch):
+        """Two calls differing only in distributed_config compile distinct artifacts.
+
+        Regression for the JIT cache key omitting ``distributed_config``: the
+        config is baked into the ``DistributedCompiledProgram`` and drives
+        per-rank dispatch, so reusing the first artifact for a second call with
+        different ``device_ids`` would silently target the wrong ranks.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+
+        @jit
+        def cfg_kernel(a: pl.Tensor[[128, 128], pl.FP32], c: pl.Out[pl.Tensor[[128, 128], pl.FP32]]):
+            c = a
+            return c
+
+        # Stub out the actual compile so the test stays device-free and only
+        # exercises the cache-key / cache-miss logic in _resolve_compiled.
+        compile_calls = {"n": 0}
+
+        def fake_compile(*_args, **_kwargs):
+            compile_calls["n"] += 1
+            return f"compiled-{compile_calls['n']}"
+
+        monkeypatch.setattr(cfg_kernel, "_compile", fake_compile)
+
+        a = torch.randn(128, 128)
+        c = torch.empty(128, 128)
+
+        def resolve(device_ids):
+            cfg = RunConfig(distributed_config=DistributedConfig(device_ids=device_ids))
+            return cfg_kernel._resolve_compiled((a, c), {"config": cfg})[0]
+
+        first = resolve([0, 1])
+        second = resolve([2, 3])  # different device_ids → cache miss
+        third = resolve([0, 1])  # same as first → cache hit
+
+        assert compile_calls["n"] == 2  # only two compiles, not three
+        assert len(cfg_kernel._cache) == 2  # two distinct cached artifacts
+        assert first != second  # not the same cached object
+        assert third == first  # re-uses the first artifact
+
     def test_compile_forwards_run_config_kwargs(self, monkeypatch):
         """_compile forwards ir_compile_kwargs verbatim to ir.compile()."""
         # `pypto.ir.compile` the attribute is the re-exported function, so
@@ -1642,10 +2022,14 @@ class TestCompileKwargForwarding:
         # so patching the module attribute intercepts the real compilation.
         monkeypatch.setattr(ir_compile_mod, "compile", fake_compile)
 
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+
+        dc = DistributedConfig(device_ids=[0, 1])
         cfg = RunConfig(
             strategy=OptimizationStrategy.DebugTileOptimization,
             dump_passes=True,
             compile_profiling=True,
+            distributed_config=dc,
         )
         result = fwd_kernel._compile(
             tensor_meta={
@@ -1665,6 +2049,9 @@ class TestCompileKwargForwarding:
         assert captured["profiling"] is True
         assert captured["platform"] == "a2a3sim"
         assert "skip_ptoas" in captured
+        # distributed_config reaches ir.compile() so a @pl.jit.host entry can
+        # compile to a DistributedCompiledProgram and dispatch per-rank.
+        assert captured["distributed_config"] is dc
 
     def test_compile_without_kwargs_forwards_only_defaults(self, monkeypatch):
         """_compile with no extra kwargs forwards only skip_ptoas + platform."""

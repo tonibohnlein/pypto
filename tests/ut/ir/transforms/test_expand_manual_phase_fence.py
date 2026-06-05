@@ -24,6 +24,26 @@ from pypto.pypto_core import passes
 
 
 def _expand(program: ir.Program) -> ir.Program:
+    # NOTE: VerificationLevel.NONE is required here. The fixtures use plain
+    # cross-function calls (``self.kernel(...)``) that carry manual_scope
+    # dependency edges in ``attrs["manual_dep_edges"]`` — exactly the IR shape
+    # this pass consumes and produces. Two layers of the conftest default
+    # verification block these fixtures:
+    #
+    #   1. CallDirectionsResolved (BEFORE_AND_AFTER property verification) —
+    #      fixable by giving ``kernel`` a real scalar param and a matching
+    #      ``arg_directions=[pl.adir.scalar]`` at each call site.
+    #   2. The print->parse roundtrip instrument — NOT fixable in this file.
+    #      The printer emits a plain Call's ``manual_dep_edges`` as the
+    #      ``deps=[...]`` kwarg (src/ir/transforms/python_printer.cpp:670), but
+    #      the parser only accepts ``deps=`` on ``pl.submit(...)`` and rejects
+    #      it on a plain ``self.kernel(...)`` call
+    #      (python/pypto/language/parser/ast_parser.py:4570). So any plain Call
+    #      bearing manual_dep_edges fails the roundtrip regardless of args.
+    #
+    # Removing this NONE wrapper trips (2) for every test. The fix belongs in
+    # the printer/parser (a non-test change), not in these fixtures, since the
+    # tests legitimately require plain-Call manual_dep_edges.
     with passes.PassContext([], passes.VerificationLevel.NONE):
         return passes.expand_manual_phase_fence()(program)
 
@@ -70,6 +90,54 @@ def test_profitable_parallel_array_dep_inserts_dummy_and_rewrites_consumers():
             return pl.system.task_invalid()
 
     _assert_expands(Before, Expected)
+
+
+def test_profitable_parallel_submit_dep_inserts_dummy_and_rewrites_submits():
+    """The Submit path: ``pl.submit(..., deps=[tids])`` consumers in a parallel
+    loop get a phase-fence barrier, and the rewritten consumers STAY Submits
+    (the barrier lands in the typed ``deps_`` field, not a ``manual_dep_edges``
+    attr). This is the real post-DeriveCallDirections shape now that the pass
+    preserves Submit-ness (pass-submit-awareness.md rule 3). Unlike the
+    plain-Call fixtures, the Submit form round-trips, so this runs under the
+    default verification — no ``VerificationLevel.NONE`` bypass.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function
+        def kernel(self) -> pl.Scalar[pl.TASK_ID]:
+            return pl.system.task_invalid()
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self) -> pl.Scalar[pl.TASK_ID]:
+            with pl.manual_scope():
+                tids = pl.array.create(4, pl.TASK_ID)
+                for p in pl.parallel(4):
+                    a, atid = pl.submit(self.kernel, deps=[tids])
+                    b, btid = pl.submit(self.kernel, deps=[tids])
+            return pl.system.task_invalid()
+
+    @pl.program
+    class Expected:
+        @pl.function
+        def kernel(self) -> pl.Scalar[pl.TASK_ID]:
+            return pl.system.task_invalid()
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self) -> pl.Scalar[pl.TASK_ID]:
+            with pl.manual_scope():
+                tids = pl.array.create(4, pl.TASK_ID)
+                phase_fence_barrier_0_tid = pl.system.task_dummy(deps=[tids])
+                for p in pl.parallel(4):
+                    a, atid = pl.submit(self.kernel, deps=[phase_fence_barrier_0_tid])
+                    b, btid = pl.submit(self.kernel, deps=[phase_fence_barrier_0_tid])
+            return pl.system.task_invalid()
+
+    # No NONE wrapper: the Submit form round-trips through print -> parse and a
+    # 0-arg submit carries no arg_directions to verify, so the pass runs under
+    # the conftest's default verification (roundtrip + property checks).
+    after = passes.expand_manual_phase_fence()(Before)
+    ir.assert_structural_equal(after, Expected)
 
 
 def test_parallel_iter_arg_dep_falls_back_even_with_visible_init_value():

@@ -92,6 +92,60 @@ class TestIterArgReuse:
         After = passes.optimize_orch_tensors()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_iter_arg_merge_preserves_dump_vars(self):
+        """The Out->InOut merge rewrites the incore call site; a ``kAttrDumpVars``
+        tag on a surviving (non-merged) In arg must ride through the rewrite.
+
+        Regression: ``CallSiteRewriter::VisitStmt_`` rebuilt the call with a Call
+        constructor that drops ``attrs_``, so ``pl.dump_tag``-seeded ``dump_vars``
+        was lost. ``x`` is loop-invariant (same Var across iterations) and is
+        consumed by the in-loop dispatch but is NOT the merged Out param, so its
+        dump tag must survive the merge."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                acc: pl.Tensor[[64], pl.FP32],
+                x: pl.Tensor[[64], pl.FP32],
+                ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                acc__tile: pl.Tile[[64], pl.FP32] = pl.load(acc, [0], [64])
+                x__tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y__tile: pl.Tile[[64], pl.FP32] = pl.tile.add(acc__tile, x__tile)
+                ret0__store: pl.Tensor[[64], pl.FP32] = pl.store(y__tile, [0], ret0__out)
+                return ret0__store
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, acc0: pl.Tensor[[64], pl.FP32], x: pl.Tensor[[64], pl.FP32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                pl.dump_tag(x)
+                for i, (acc,) in pl.range(10, init_values=(acc0,)):
+                    ret0__out: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                    result: pl.Tensor[[64], pl.FP32] = self.main_incore_0(acc, x, ret0__out)
+                    new_acc = pl.yield_(result)
+                return new_acc
+
+        After = passes.optimize_orch_tensors()(Before)
+
+        dump_var_names: list[str] = []
+
+        class _Collector(ir.IRVisitor):
+            def visit_call(self, op):
+                name = getattr(getattr(op, "op", None), "name", "")
+                if name == "main_incore_0":
+                    dv = (op.attrs or {}).get("dump_vars")
+                    if dv:
+                        dump_var_names.extend(v.name_hint.split("__", 1)[0] for v in dv)
+                super().visit_call(op)
+
+        _Collector().visit_program(After)
+        assert "x" in dump_var_names, (
+            f"dump_vars dropped by the iter-arg-merge call rewrite; got {dump_var_names}"
+        )
+
     def test_multi_return_iter_arg(self):
         """Multi-return InCore with two iter-arg-fed Out params: both merged to InOut."""
 

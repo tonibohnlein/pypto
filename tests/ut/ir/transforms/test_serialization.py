@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import cast
 
+import pypto.language as pl
 import pytest
 from pypto import DataType, ir
 
@@ -122,6 +123,173 @@ class TestBasicSerialization:
         data = ir.serialize(call)
         restored = ir.deserialize(data)
 
+        ir.assert_structural_equal(call, restored, enable_auto_mapping=True)
+
+
+class TestSubmitSerialization:
+    """Round-trip the Submit task-launch node (pl.submit / pl.spmd_submit),
+    including its first-class deps_ and the SPMD launch spec (core_num / sync_start),
+    plus the RuntimeScopeStmt (pl.manual_scope) wrapper it lives inside."""
+
+    @staticmethod
+    def _submit_ret_ty() -> "ir.TupleType":
+        return ir.TupleType([ir.ScalarType(DataType.INDEX), ir.ScalarType(DataType.TASK_ID)])
+
+    def test_serialize_plain_submit(self):
+        """A plain pl.submit (no launch spec): core_num round-trips as None."""
+        span = ir.Span.unknown()
+        gv = ir.GlobalVar("kernel")
+        a = ir.Var("a", ir.ScalarType(DataType.INDEX), span)
+        tid = ir.Var("t", ir.ScalarType(DataType.TASK_ID), span)
+        submit = ir.Submit(gv, [a], [tid], self._submit_ret_ty(), span)
+
+        restored = cast("ir.Submit", ir.deserialize(ir.serialize(submit)))
+        ir.assert_structural_equal(submit, restored, enable_auto_mapping=True)
+        assert restored.core_num is None
+        assert restored.sync_start is False
+        assert len(restored.deps) == 1
+
+    def test_serialize_spmd_submit_launch_spec(self):
+        """pl.spmd_submit: the SPMD launch spec (core_num + sync_start) survives
+        the msgpack round-trip on the Submit's first-class fields."""
+        span = ir.Span.unknown()
+        gv = ir.GlobalVar("kernel")
+        a = ir.Var("a", ir.ScalarType(DataType.INDEX), span)
+        core_num = ir.ConstInt(8, DataType.INDEX, span)
+        submit = ir.Submit(
+            gv, [a], [], {}, None, self._submit_ret_ty(), span, core_num=core_num, sync_start=True
+        )
+
+        restored = cast("ir.Submit", ir.deserialize(ir.serialize(submit)))
+        ir.assert_structural_equal(submit, restored, enable_auto_mapping=True)
+        assert isinstance(restored.core_num, ir.ConstInt)
+        assert restored.core_num.value == 8
+        assert restored.sync_start is True
+
+    def test_serialize_manual_scope_spmd_submit_program(self):
+        """A full @pl.program with `with pl.manual_scope(): out, tid =
+        pl.spmd_submit(...)` round-trips — exercises both RuntimeScopeStmt and
+        the Submit launch spec end-to-end."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k(
+                self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
+            ) -> pl.Tensor[[128], pl.FP32]:
+                t = pl.load(x, [0], [128])
+                out = pl.store(t, [0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
+            ) -> pl.Tensor[[128], pl.FP32]:
+                with pl.manual_scope():
+                    out, tid = pl.spmd_submit(self.k, x, out, core_num=4, sync_start=True)
+                return out
+
+        restored = ir.deserialize(ir.serialize(Prog))
+        ir.assert_structural_equal(Prog, restored, enable_auto_mapping=True)
+
+
+class TestCapturedScopeAttrSerialization:
+    """Round-trip un-outlined captured/deps scopes whose ScopeStmt.attrs_ carry the
+    reserved Var-valued attrs ``task_id_var`` (a ``VarPtr``) and ``manual_dep_edges``
+    (a ``std::vector<VarPtr>``).
+
+    Before the serializer learned these attr value types, ``ir.serialize`` of such a
+    program aborted with ``TypeError: Invalid kwarg type for key: task_id_var``. The
+    captured Var also round-trips by identity: the producer TaskId bound by one scope
+    (``as tid``) is the same Var object referenced by a later scope's ``deps=[tid]``,
+    so ``assert_structural_equal`` validates both that the attrs survive and that the
+    Var-identity edge between scopes is preserved.
+    """
+
+    def test_serialize_at_capture_and_deps_chain(self):
+        """``with pl.at(...) as tid0:`` then ``with pl.at(..., deps=[tid0]):`` —
+        the issue's exact repro. Exercises ``task_id_var`` + ``manual_dep_edges`` on
+        the un-outlined InCore-family scopes (no outlining runs, so the attrs are
+        still on the ScopeStmt, not yet folded into an ``ir.Submit``)."""
+
+        @pl.program
+        class AtProg:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP) as tid0:
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[tid0]) as tid1:  # noqa: F841
+                    z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
+                return z
+
+        restored = ir.deserialize(ir.serialize(AtProg))
+        ir.assert_structural_equal(AtProg, restored, enable_auto_mapping=True)
+
+    def test_serialize_spmd_capture_and_deps_chain(self):
+        """``with pl.spmd(...) as tid0:`` then ``with pl.spmd(..., deps=[tid0]):`` —
+        the same capture/deps attrs on un-outlined ``SpmdScopeStmt`` nodes."""
+
+        @pl.program
+        class SpmdProg:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="stage1") as tid0:
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(t, [i * 128, 0], out)
+                with pl.spmd(4, name_hint="stage2", deps=[tid0]) as tid1:  # noqa: F841
+                    j = pl.tile.get_block_idx()
+                    u: pl.Tile[[128, 128], pl.FP32] = pl.load(out, [j * 128, 0], [128, 128])
+                    out = pl.store(pl.add(u, u), [j * 128, 0], out)
+                return out
+
+        restored = ir.deserialize(ir.serialize(SpmdProg))
+        ir.assert_structural_equal(SpmdProg, restored, enable_auto_mapping=True)
+
+
+class TestExtendedAttrSerialization:
+    """Round-trip the remaining non-scalar call/scope attr value types that the
+    serializer's type ladder originally omitted (while ``structural_equal`` already
+    handled them): ``arg_direction_overrides`` (a ``std::vector<int32_t>`` no_dep
+    index list) and ``device`` (an ``ExprPtr`` placement expression). Both aborted
+    serialization with ``Invalid kwarg type for key: ...`` before these branches
+    were added."""
+
+    def test_serialize_call_with_arg_direction_overrides(self):
+        """``arg_direction_overrides`` (``std::vector<int32_t>``) round-trips as an
+        int list; structural-equal validates both the type and the values."""
+        op = ir.Op("kernel")
+        x = ir.Var("x", ir.ScalarType(DataType.INT64), ir.Span.unknown())
+        y = ir.Var("y", ir.ScalarType(DataType.INT64), ir.Span.unknown())
+        call = ir.Call(
+            op,
+            [x, y],
+            {},
+            {"arg_direction_overrides": [0, 1]},
+            ir.ScalarType(DataType.INT64),
+            ir.Span.unknown(),
+        )
+
+        restored = cast(ir.Call, ir.deserialize(ir.serialize(call)))
+        ir.assert_structural_equal(call, restored, enable_auto_mapping=True)
+        assert restored.attrs["arg_direction_overrides"] == [0, 1]
+
+    def test_serialize_call_with_device_expr_attr(self):
+        """``device`` (an ``ExprPtr``) round-trips through the node-reference path.
+        The device expression references arg ``x``, so the restored ExprPtr must
+        resolve to the *same* Var object as the call arg — structural-equal checks
+        that cross-reference identity via its Var map."""
+        span = ir.Span.unknown()
+        op = ir.Op("kernel")
+        x = ir.Var("x", ir.ScalarType(DataType.INT64), span)
+        device = ir.Add(x, ir.ConstInt(1, DataType.INT64, span), DataType.INT64, span)
+        call = ir.Call(op, [x], {}, {"device": device}, ir.ScalarType(DataType.INT64), span)
+
+        restored = ir.deserialize(ir.serialize(call))
         ir.assert_structural_equal(call, restored, enable_auto_mapping=True)
 
 

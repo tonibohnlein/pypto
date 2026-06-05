@@ -183,14 +183,18 @@ def pytest_addoption(parser):
         "--enable-l2-swimlane",
         action="store_true",
         default=False,
-        help="Capture per-task L2 perf records into <work_dir>/dfx_outputs/l2_perf_records.json "
+        help="Capture per-task L2 perf records into <work_dir>/dfx_outputs/l2_swimlane_records.json "
         "and render merged_swimlane_*.json after execution.",
     )
     parser.addoption(
         "--dump-tensor",
-        action="store_true",
-        default=False,
-        help="Dump per-task tensor I/O into <work_dir>/dfx_outputs/tensor_dump/.",
+        nargs="?",
+        type=int,
+        const=1,
+        default=0,
+        help="Per-task tensor dump level into <work_dir>/dfx_outputs/tensor_dump/. "
+        "Bare flag = 1 (partial: only pl.dump_tag / dumps= marked tensors); "
+        "'--dump-tensor 2' = full (every task); absent = 0 (off).",
     )
     parser.addoption(
         "--enable-dep-gen",
@@ -208,6 +212,12 @@ def pytest_addoption(parser):
         metavar="EVENT_TYPE",
         help="Enable AICore PMU CSV collection. Bare flag = PIPE_UTILIZATION(2). "
         "Pass an event type (e.g. 4 = MEMORY) to override.",
+    )
+    parser.addoption(
+        "--enable-scope-stats",
+        action="store_true",
+        default=False,
+        help="Capture per-scope ring-fill peaks into <work_dir>/dfx_outputs/scope_stats/scope_stats.jsonl.",
     )
 
 
@@ -381,6 +391,7 @@ def test_config(request) -> RunConfig:
         enable_dump_tensor=request.config.getoption("--dump-tensor"),
         enable_pmu=request.config.getoption("--enable-pmu"),
         enable_dep_gen=request.config.getoption("--enable-dep-gen"),
+        enable_scope_stats=request.config.getoption("--enable-scope-stats"),
     )
 
 
@@ -603,9 +614,10 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     codegen_only: bool = session.config.getoption("--codegen-only")
     pto_isa_commit: str | None = session.config.getoption("--pto-isa-commit")
     enable_l2_swimlane: bool = session.config.getoption("--enable-l2-swimlane")
-    enable_dump_tensor: bool = session.config.getoption("--dump-tensor")
+    enable_dump_tensor: int = session.config.getoption("--dump-tensor")
     enable_pmu: int = session.config.getoption("--enable-pmu")
     enable_dep_gen: bool = session.config.getoption("--enable-dep-gen")
+    enable_scope_stats: bool = session.config.getoption("--enable-scope-stats")
 
     # ── determine cache directory ─────────────────────────────────────────────
     save_kernels: bool = session.config.getoption("--save-kernels")
@@ -650,6 +662,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         enable_dump_tensor=enable_dump_tensor,
         enable_pmu=enable_pmu,
         enable_dep_gen=enable_dep_gen,
+        enable_scope_stats=enable_scope_stats,
     )
     print("[PyPTO] Pipeline scheduled — pytest item loop starting\n")
 

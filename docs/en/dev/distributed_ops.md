@@ -220,13 +220,15 @@ binds physical buffers to.
   `test_get_op.py`, `test_put_op.py`, plus the negative verifier coverage
   in `tests/ut/ir/test_distributed_ops.py`.
 - **Codegen**: `tests/ut/codegen/distributed/test_distributed_pto_codegen.py`.
-- **End-to-end (ST)**: `tests/st/distributed/test_l3_allreduce.py`,
-  `test_l3_allgather.py`, `test_l3_reduce_scatter.py`, `test_l3_broadcast.py`,
-  `test_l3_gemm.py`, `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`,
-  and related L3 STs under `tests/st/distributed/`. `test_l3_put.py` and
-  `test_l3_get.py` are currently **skipped** pending the N7 host codegen
-  (`add_scalar(ctx)` per `DistributedTensor`, `ContinuousTensor.make(..., child_memory=True)`)
-  and N8 driver glue (`HostBufferStaging` window wiring on the codegen-emitted
+- **End-to-end (ST)**: `tests/st/distributed/test_l3_allreduce.py` (mesh
+  allreduce; **P=2** default, **P=4** on any four devices (e.g.
+  `--device=0,1,2,3` or `--device=0-3`)), `test_l3_allgather.py`,
+  `test_l3_reduce_scatter.py`, `test_l3_broadcast.py`, `test_l3_gemm.py`,
+  `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`, and related L3 STs
+  under `tests/st/distributed/`. `test_l3_put.py` and `test_l3_get.py` are
+  currently **skipped** pending the N7 host codegen (`add_scalar(ctx)` per
+  `DistributedTensor`, `ContinuousTensor.make(..., child_memory=True)`) and N8
+  driver glue (`HostBufferStaging` window wiring on the codegen-emitted
   `orch.allocate_domain(...)` block). The embedded programs and golden checks
   are the canonical e2e contracts — drop the skip markers once that host-side
   work lands.

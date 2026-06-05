@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -765,6 +766,57 @@ inline std::vector<std::pair<std::string, std::any>> WithManualDepEdgesAttr(
 }
 
 /**
+ * @brief Reserved attr key on a ``Call`` for the per-call selective tensor
+ * dump set (simpler#844). Holds ``std::vector<VarPtr>`` — a subset of the
+ * call's ``args_`` (tensor Vars) whose ``Arg`` slots orchestration codegen
+ * marks via the runtime's per-task ``Arg::dump(...)`` API.
+ *
+ * Set by the DSL parser from the declarative ``pl.dump_tag(t)`` marker and the
+ * explicit ``dumps=[...]`` kwarg on ``pl.submit(...)`` / ``pl.at(...)``.
+ * Because the value is a Var list, it is tracked by Var identity
+ * through every pass: SSA rewrites the entries (``SubstCallAttrs``), inlining
+ * substitutes the callee Vars for the caller's, and DCE / liveness count them
+ * as uses — exactly like ``kAttrManualDepEdges`` / ``kAttrArgDirOverrideVars``.
+ * Codegen matches each ``args_[i]`` against this set by VarPtr identity, so no
+ * name comparison is ever needed.
+ *
+ * Empty / absent attr means the call dumps nothing. Codegen emits one
+ * ``Arg::dump(...)`` marker per call carrying a non-empty set; the runtime
+ * latches the dump level (off / partial / full) host-side, so no orch-body
+ * toggle is emitted.
+ *
+ * Also appears on a ``ScopeStmt`` as the post-outline carrier (simpler#844):
+ * for the ``@pl.jit`` / tensor-op style the kernel dispatch is synthesised by
+ * the outline passes rather than written as an explicit ``self.kernel(...)``.
+ * ``pl.dump_tag`` (forward-sticky) seeds the enclosing scope's ``kAttrDumpVars``
+ * at parse; ``InlineFunctions`` transfers an inline call's ``kAttrDumpVars``
+ * onto the scopes it splices in; the scope list round-trips as ``dumps=``
+ * on ``pl.at(...)`` and is rewritten by SSA/inline/DCE just like the no_dep
+ * scope attr ``kAttrArgDirOverrideVars``. The outliner then translates each
+ * captured scope dump Var into the synthesised dispatch's ``kAttrDumpVars`` by
+ * Var identity (mirroring the ``kAttrArgDirOverrideVars`` ->
+ * ``kAttrArgDirectionOverrides`` translation). Scope dump Vars not captured by
+ * that scope are skipped (a forward-sticky tag the scope simply never consumes).
+ */
+inline constexpr const char* kAttrDumpVars = "dump_vars";
+
+/**
+ * Build a copy of ``attrs`` with ``kAttrDumpVars`` set to ``vars``.
+ * Replaces an existing entry if present; otherwise appends.
+ */
+inline std::vector<std::pair<std::string, std::any>> WithDumpVarsAttr(
+    std::vector<std::pair<std::string, std::any>> attrs, std::vector<VarPtr> vars) {
+  for (auto& [k, v] : attrs) {
+    if (k == kAttrDumpVars) {
+      v = std::move(vars);
+      return attrs;
+    }
+  }
+  attrs.emplace_back(kAttrDumpVars, std::move(vars));
+  return attrs;
+}
+
+/**
  * @brief Reserved attr key for the physical device selector on a
  * host-orchestrator dispatch to a chip-level Orchestration function.
  *
@@ -806,6 +858,19 @@ class Submit : public Expr {
   OpPtr op_;                   // Callee (typically a GlobalVar)
   std::vector<ExprPtr> args_;  // Positional arguments
   std::vector<ExprPtr> deps_;  // TaskId dependencies (Scalar[TASK_ID] / Array[N, TASK_ID])
+  // SPMD launch spec — populated only by ``pl.spmd_submit(...)``.
+  // ``core_num_`` is the block count (an INDEX/INT-typed Expr — typically a
+  // ConstInt or a closure Var); ``std::nullopt`` marks a plain
+  // ``pl.submit(...)`` (single-block launch, no launch spec). ``sync_start_``
+  // requires all logical blocks to launch atomically and is only meaningful
+  // when ``core_num_`` is present. These lower to ``Arg::launch_spec`` in
+  // orchestration codegen via SubmitToCallView (attrs ``"core_num"`` /
+  // ``"sync_start"``) → EmitLaunchSpec. ``core_num_`` is a first-class field
+  // (not an attr) because it is an SSA value in the use-def chain — passes
+  // that substitute / DCE / dominance-check Vars must walk it (see
+  // .claude/rules/pass-submit-awareness.md, rule 2).
+  std::optional<ExprPtr> core_num_;
+  bool sync_start_ = false;
   std::vector<std::pair<std::string, std::any>> attrs_;   // Compiler-internal metadata (ordered)
   std::vector<std::pair<std::string, std::any>> kwargs_;  // Keyword arguments (metadata, ordered)
 
@@ -823,19 +888,28 @@ class Submit : public Expr {
   /**
    * @brief Create a Submit with attrs and kwargs.
    *
+   * The trailing ``core_num`` / ``sync_start`` carry the SPMD launch spec for
+   * ``pl.spmd_submit(...)``; they default to "no launch spec" so every
+   * existing 7-arg construction site keeps building a plain submit.
+   *
    * Validates that, when present, ``attrs[kAttrArgDirections]`` is a
-   * ``std::vector<ArgDirection>`` whose length matches ``args``.
+   * ``std::vector<ArgDirection>`` whose length matches ``args``, and that the
+   * launch spec is well-formed (``sync_start`` implies ``core_num``).
    */
   Submit(OpPtr op, std::vector<ExprPtr> args, std::vector<ExprPtr> deps,
          std::vector<std::pair<std::string, std::any>> kwargs,
-         std::vector<std::pair<std::string, std::any>> attrs, TypePtr type, Span span)
+         std::vector<std::pair<std::string, std::any>> attrs, TypePtr type, Span span,
+         std::optional<ExprPtr> core_num = std::nullopt, bool sync_start = false)
       : Expr(std::move(span), std::move(type)),
         op_(std::move(op)),
         args_(std::move(args)),
         deps_(std::move(deps)),
+        core_num_(std::move(core_num)),
+        sync_start_(sync_start),
         attrs_(std::move(attrs)),
         kwargs_(std::move(kwargs)) {
     ValidateArgDirectionsAttr();
+    ValidateLaunchSpec();
   }
 
   template <typename T>
@@ -890,11 +964,35 @@ class Submit : public Expr {
                           std::make_tuple(reflection::UsualField(&Submit::op_, "op"),
                                           reflection::UsualField(&Submit::args_, "args"),
                                           reflection::UsualField(&Submit::deps_, "deps"),
+                                          reflection::UsualField(&Submit::core_num_, "core_num"),
+                                          reflection::UsualField(&Submit::sync_start_, "sync_start"),
                                           reflection::UsualField(&Submit::attrs_, "attrs"),
                                           reflection::UsualField(&Submit::kwargs_, "kwargs")));
   }
 
  private:
+  void ValidateLaunchSpec() const {
+    if (sync_start_ && !core_num_.has_value()) {
+      throw pypto::ValueError(
+          "Submit sync_start=true requires core_num (an SPMD launch). Plain "
+          "pl.submit(...) has no launch spec — use pl.spmd_submit(...) for SPMD.");
+    }
+    if (core_num_.has_value() && !*core_num_) {
+      throw pypto::TypeError("Submit core_num must be a non-null Expr when present");
+    }
+    // core_num is an SPMD block count — reject a non-integer launch dimension
+    // at the public boundary (the DSL parser already enforces this, but direct
+    // C++/Python construction would otherwise let a float/bool expr through).
+    // Only reject a *typed* non-integer scalar; leave other expr shapes alone.
+    if (core_num_.has_value()) {
+      if (auto scalar = std::dynamic_pointer_cast<const ScalarType>((*core_num_)->GetType())) {
+        if (!scalar->dtype_.IsInt() && !scalar->dtype_.IsIndexLike()) {
+          throw pypto::TypeError("Submit core_num must be an integer/index expression (SPMD block count)");
+        }
+      }
+    }
+  }
+
   void ValidateArgDirectionsAttr() const {
     for (const auto& [k, v] : attrs_) {
       if (k != kAttrArgDirections) {
@@ -939,7 +1037,13 @@ inline CallPtr SubmitToCallView(const SubmitPtr& submit) {
   std::vector<std::pair<std::string, std::any>> attrs;
   attrs.reserve(submit->attrs_.size());
   for (const auto& [k, v] : submit->attrs_) {
-    if (k != kAttrManualDepEdges) attrs.emplace_back(k, v);
+    // ``core_num`` / ``sync_start`` are first-class Submit fields and are
+    // re-emitted below from core_num_ / sync_start_. Drop any stray attr of
+    // the same key so the field stays the single source of truth (Call::GetAttr
+    // returns the first match, so a stale attr would otherwise shadow it).
+    if (k != kAttrManualDepEdges && k != "core_num" && k != "sync_start") {
+      attrs.emplace_back(k, v);
+    }
   }
   if (!submit->deps_.empty()) {
     std::vector<VarPtr> dep_vars;
@@ -966,6 +1070,15 @@ inline CallPtr SubmitToCallView(const SubmitPtr& submit) {
       dep_vars.push_back(std::static_pointer_cast<const Var>(d));
     }
     attrs = WithManualDepEdgesAttr(std::move(attrs), std::move(dep_vars));
+  }
+  // Carry the SPMD launch spec (pl.spmd_submit) through to the Call view as
+  // attrs so orchestration codegen's EmitLaunchSpec reads core_num/sync_start
+  // uniformly with the scope-based pl.spmd path (which stores them on the
+  // Spmd-wrapper function's attrs). core_num_/sync_start_ are first-class
+  // Submit fields and never appear in submit->attrs_, so no duplication.
+  if (submit->core_num_.has_value()) {
+    attrs.emplace_back("core_num", std::any(*submit->core_num_));
+    attrs.emplace_back("sync_start", std::any(submit->sync_start_));
   }
   return std::make_shared<Call>(submit->op_, submit->args_, submit->kwargs_, std::move(attrs),
                                 submit->GetType(), submit->span_);

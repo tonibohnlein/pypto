@@ -356,6 +356,45 @@ PropertyVerifierPtr CreateOrchestrationReferencesResolvedPropertyVerifier();
  */
 PropertyVerifierPtr CreateTensorViewCanonicalPropertyVerifier(bool require_materialized = false);
 
+/**
+ * @brief Factory function for creating CommGroupsCollected property verifier
+ *
+ * Verifies that every ``WindowBuffer`` slot in ``Program.comm_groups_`` appears
+ * in exactly one ``CommGroup``. ``DistributedCodegen`` relies on this
+ * shared_ptr-identity uniqueness to route each Submit's per-arg ``device_ctx``
+ * handle to the correct domain; a duplicate slot would misroute communication
+ * traffic at runtime. The ``CollectCommGroups`` pass enforces this invariant
+ * by construction; the verifier independently checks it.
+ *
+ * @return Shared pointer to CommGroupsCollected PropertyVerifier
+ */
+PropertyVerifierPtr CreateCommGroupsCollectedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating AssignTypeSymmetry property verifier
+ *
+ * Verifies that every ``AssignStmt(var, value)`` satisfies
+ * ``structural_equal(var->GetType(), value->GetType())``. ``structural_equal``
+ * is the IR's own type-equality contract (the one the roundtrip verifier uses).
+ * It compares, per type kind: TileType → dtype, shape, tile_view, memory_space;
+ * TensorType → dtype, shape, tensor_view (DistributedTensorType also compares
+ * window_buffer); TupleType → every element recursively. It intentionally
+ * excludes ``memref_`` — a MemRef is an allocation detail bound to the Var, not
+ * part of the value's structural type — so MemRef asymmetry (legitimate after
+ * ``InitMemRef``) is out of scope here and is governed instead by
+ * ``HasMemRefs`` / ``AllocatedMemoryAddr``. (``memory_space`` exists only on
+ * TileType, not TensorType.)
+ *
+ * Catches passes that mutate one side of an AssignStmt without keeping the
+ * other in sync — e.g. #1262, where ``InferTileMemorySpace`` wrote ``Mem.Acc``
+ * onto a Var whose producing ``tile.full`` Call still declared ``Mem.Vec``.
+ * Turning silent type corruption into a hard error localises the bug to the
+ * pass that caused it instead of a downstream consumer.
+ *
+ * @return Shared pointer to AssignTypeSymmetry PropertyVerifier
+ */
+PropertyVerifierPtr CreateAssignTypeSymmetryPropertyVerifier();
+
 }  // namespace ir
 }  // namespace pypto
 

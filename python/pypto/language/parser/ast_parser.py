@@ -368,9 +368,26 @@ class _AtKwargState:
     # ScopeStmt.attrs[arg_direction_overrides_vars], and translated into
     # per-arg-index overrides by the outliner.
     no_dep_args_kw: "ast.keyword | None" = field(default=None)
+    # ``dumps=[t1, t2]`` AST kept verbatim; resolved into outer-scope Var
+    # refs by the caller and written to ScopeStmt.attrs[dump_vars]. The
+    # scope-level selective-dump surface, symmetric with ``deps=``: the printer
+    # emits it for any scope carrying ``kAttrDumpVars`` (seeded by ``pl.dump_tag``
+    # at parse, by an explicit ``dumps=`` list, and by the inline-call
+    # ``dump_vars`` transfer), and the outliner translates it into the
+    # synthesised dispatch's ``kAttrDumpVars``.
+    dumps_kw: "ast.keyword | None" = field(default=None)
 
 
 _SPMD_SCOPE_NAME_SUFFIX = "_spmd"
+
+# ``pl.at()`` kwargs whose AST node is stashed verbatim on ``_AtKwargState`` for
+# later resolution (duplicate-checked, then resolved by ``_parse_at_meta``).
+# Maps the kwarg name to its ``_AtKwargState`` field.
+_AT_STASH_KWARGS = {
+    "deps": "deps_kw",
+    "no_dep_args": "no_dep_args_kw",
+    "dumps": "dumps_kw",
+}
 
 
 def _split_spmd_for_loop_name_hints(name_hint: str) -> tuple[str, str]:
@@ -464,6 +481,11 @@ class ASTParser:
         # ``deps=[var]`` kwarg recognition on kernel calls.
         self._manual_scope_depth: int = 0
 
+        # Forward-sticky ``pl.dump_tag`` set (per function, reset at function
+        # entry). Holds the bound Vars whose subsequent kernel-call uses get a
+        # per-call ``dump_vars`` entry. See ``_handle_dump_tag``.
+        self._dump_tagged_vars: list[Any] = []
+
         # Inline function expansion state
         self._inline_mode = False
         self._inline_return_expr: ir.Expr | None = None
@@ -485,6 +507,10 @@ class ASTParser:
         # Current function level (set during parse_function). Drives
         # context-scoped op constraints (e.g. pld.system.world_size is host-only).
         self._func_level: ir.Level | None = None
+        # Current function type (set during parse_function). Used by markers
+        # whose validity is scoped to a specific function type — e.g.
+        # ``pl.dump_tag`` only makes sense in Orchestration functions.
+        self._func_type: ir.FunctionType = ir.FunctionType.Opaque
 
         # Current function's auto_scope flag (set during parse_function). When
         # True (default) the compiler owns AUTO scope placement, so a hand-placed
@@ -585,10 +611,24 @@ class ASTParser:
         self._func_level = func_level
         # auto_scope rides in func_attrs (key "auto_scope"); absent ⇒ default True.
         self._func_auto_scope = bool((func_attrs or {}).get("auto_scope", True))
+        self._func_type = func_type
         func_span = self.span_tracker.get_span(func_def)
 
         # Enter function scope
         self.scope_manager.enter_scope("function")
+
+        # Forward-sticky selective tensor dump (simpler#844): a
+        # ``pl.dump_tag(t)`` statement (handled in ``_handle_dump_tag``) records
+        # the bound Var; every subsequent kernel dispatch consuming that exact
+        # Var gets it merged into the dispatch's ``dump_vars`` attr (Call or
+        # Submit). Tracked by Var identity — the scope
+        # manager returns a stable object per binding, so a later reassignment
+        # of the same name yields a new Var that is not tagged. Reset per
+        # function; populated only inside Orchestration / Inline bodies (other
+        # scopes reject the marker in ``_handle_dump_tag``). Inlining needs no
+        # special migration: ``dump_vars`` rides on the spliced Call nodes and
+        # the mutator substitutes the callee Var for the caller's arg.
+        self._dump_tagged_vars: list[Any] = []
 
         # Begin building function
         with self.builder.function(
@@ -1041,6 +1081,14 @@ class ASTParser:
             # validates the annotation against the inferred Submit return
             # type the way every other annotated RHS does.
             value_expr = self._build_submit_single_lhs_expr(stmt.value)
+        elif _is_pl_call(stmt.value, "spmd_submit"):
+            if not isinstance(stmt.target, ast.Name):
+                raise ParserSyntaxError(
+                    "Annotated assignment of pl.spmd_submit must target a simple variable name",
+                    span=self.span_tracker.get_span(stmt.target),
+                    hint="Use `result: pl.Tuple[..., TASK_ID] = pl.spmd_submit(self.kernel, core_num=N)`.",
+                )
+            value_expr = self._build_submit_single_lhs_expr(stmt.value, is_spmd=True)
         else:
             value_expr = self.parse_expression(stmt.value)
 
@@ -1213,6 +1261,12 @@ class ASTParser:
                 if _is_pl_call(stmt.value, "submit"):
                     self._parse_submit_assignment(target, stmt.value)
                     return
+                # ``out, tid = pl.spmd_submit(self.kernel, *args, core_num=N,
+                # sync_start=..., deps=[...])`` — SPMD task launch. Same desugar
+                # as pl.submit, but the Submit carries the SPMD launch spec.
+                if _is_pl_call(stmt.value, "spmd_submit"):
+                    self._parse_submit_assignment(target, stmt.value, is_spmd=True)
+                    return
 
                 # General tuple unpacking for function calls returning TupleType
                 span = self.span_tracker.get_span(stmt)
@@ -1247,6 +1301,9 @@ class ASTParser:
                 # ``_parse_submit_assignment``.
                 if _is_pl_call(stmt.value, "submit"):
                     self._parse_submit_single_lhs(target, stmt.value)
+                    return
+                if _is_pl_call(stmt.value, "spmd_submit"):
+                    self._parse_submit_single_lhs(target, stmt.value, is_spmd=True)
                     return
 
                 # Check if this is a yield assignment: var = pl.yield_(...)
@@ -1316,38 +1373,42 @@ class ASTParser:
             hint="Use simple variable names in tuple unpacking: a, b, c = func()",
         )
 
-    def _parse_submit_assignment(self, target: ast.Tuple, call: ast.Call) -> None:
-        """Parse ``out, tid = pl.submit(self.kernel, *args, deps=[...])``.
+    def _parse_submit_assignment(self, target: ast.Tuple, call: ast.Call, *, is_spmd: bool = False) -> None:
+        """Parse ``out, tid = pl.submit(self.kernel, *args, deps=[...])`` and the
+        ``pl.spmd_submit(self.kernel, *args, core_num=N, sync_start=...)`` SPMD
+        variant (``is_spmd=True``).
 
-        ``pl.submit`` is a manual_scope construct: it submits a kernel call
-        and binds both the kernel result(s) and the producer TaskId. The
-        desugared IR is a single :class:`ir.Call` whose return type is the
-        flat ``TupleType([*<kernel results>, Scalar[TASK_ID]])`` — elements
-        ``0..N-1`` are the kernel's results (one element per output, matching
-        the kernel's declared return arity) and element ``N`` is the producer
-        ``Scalar[TASK_ID]``.
+        ``pl.submit`` / ``pl.spmd_submit`` are manual_scope constructs: they
+        submit a kernel call and bind both the kernel result(s) and the
+        producer TaskId. The desugared IR is a single :class:`ir.Submit` whose
+        return type is the flat ``TupleType([*<kernel results>, Scalar[TASK_ID]])``
+        — elements ``0..N-1`` are the kernel's results (one element per output,
+        matching the kernel's declared return arity) and element ``N`` is the
+        producer ``Scalar[TASK_ID]``. ``pl.spmd_submit`` additionally records
+        the SPMD launch spec (``core_num`` / ``sync_start``) on the Submit.
         """
+        construct = "pl.spmd_submit" if is_spmd else "pl.submit"
         span = self.span_tracker.get_span(call)
-        # ``pl.submit`` and ``deps=`` are orthogonal to ``manual_scope``: the
-        # runtime's ``Arg::set_dependencies`` adds explicit edges on top of the
-        # auto-tracked deps (final fanin = auto union explicit), so both
-        # flavours of orchestrator scope (auto or manual) accept
-        # ``pl.submit(..., deps=[...])``. In auto scope it is a precision tool
-        # — auto handles most of the dep graph; explicit edges patch the
-        # cases the runtime cannot infer (or infers too conservatively).
+        # ``pl.submit`` / ``pl.spmd_submit`` and ``deps=`` are orthogonal to
+        # ``manual_scope``: the runtime's ``Arg::set_dependencies`` adds
+        # explicit edges on top of the auto-tracked deps (final fanin = auto
+        # union explicit), so both flavours of orchestrator scope (auto or
+        # manual) accept ``deps=[...]``. In auto scope it is a precision tool —
+        # auto handles most of the dep graph; explicit edges patch the cases
+        # the runtime cannot infer (or infers too conservatively).
         if len(target.elts) != 2:
             raise ParserSyntaxError(
-                f"pl.submit(...) must be unpacked as exactly 2 targets "
+                f"{construct}(...) must be unpacked as exactly 2 targets "
                 f"(result, task_id), got {len(target.elts)}",
                 span=span,
-                hint="Use `out, tid = pl.submit(self.kernel, ...)`.",
+                hint=f"Use `out, tid = {construct}(self.kernel, ...)`.",
             )
         out_target, tid_target = target.elts
         if not isinstance(tid_target, ast.Name):
             raise ParserSyntaxError(
-                "pl.submit(...) task_id target must be a plain variable name",
+                f"{construct}(...) task_id target must be a plain variable name",
                 span=span,
-                hint="Use `out, tid = pl.submit(self.kernel, ...)`.",
+                hint=f"Use `out, tid = {construct}(self.kernel, ...)`.",
             )
         # The result target is either a single Name (single-output kernel) or
         # a flat tuple of Names (multi-output kernel). Nested tuples are
@@ -1360,24 +1421,24 @@ class ASTParser:
             out_names = list(out_target.elts)
         else:
             raise ParserSyntaxError(
-                "pl.submit(...) result target must be a variable name or a tuple of names",
+                f"{construct}(...) result target must be a variable name or a tuple of names",
                 span=span,
-                hint="Use `out, tid = pl.submit(...)` or `(a, b), tid = pl.submit(...)`.",
+                hint=f"Use `out, tid = {construct}(...)` or `(a, b), tid = {construct}(...)`.",
             )
         for elt in out_names:
             if not isinstance(elt, ast.Name):
                 raise ParserSyntaxError(
-                    "pl.submit(...) result target must contain plain variable names only "
+                    f"{construct}(...) result target must contain plain variable names only "
                     f"(no nested tuples), got '{ast.unparse(elt)}'",
                     span=span,
-                    hint="Use `out, tid = pl.submit(...)` or `(a, b), tid = pl.submit(...)`.",
+                    hint=f"Use `out, tid = {construct}(...)` or `(a, b), tid = {construct}(...)`.",
                 )
         n_outs = len(out_names)
         if not call.args:
             raise ParserSyntaxError(
-                "pl.submit(...) requires the kernel as its first argument",
+                f"{construct}(...) requires the kernel as its first argument",
                 span=span,
-                hint="Use `out, tid = pl.submit(self.kernel, *kernel_args, deps=[...])`.",
+                hint=f"Use `out, tid = {construct}(self.kernel, *kernel_args, deps=[...])`.",
             )
         method_attr = call.args[0]
         if not (
@@ -1386,20 +1447,22 @@ class ASTParser:
             and method_attr.value.id == "self"
         ):
             raise ParserSyntaxError(
-                "pl.submit(...) first argument must be a `self.<kernel>` method reference",
+                f"{construct}(...) first argument must be a `self.<kernel>` method reference",
                 span=span,
                 hint="Pass the kernel itself, not a call: "
-                "`pl.submit(self.kernel, x, y)` — not `pl.submit(self.kernel(x, y))`.",
+                f"`{construct}(self.kernel, x, y)` — not `{construct}(self.kernel(x, y))`.",
             )
 
-        call_expr = self._parse_kernel_call(method_attr, call.args[1:], call.keywords, span, as_submit=True)
+        call_expr = self._parse_kernel_call(
+            method_attr, call.args[1:], call.keywords, span, as_submit=True, as_spmd=is_spmd
+        )
 
         # The submit Call returns a flat Tuple{*<kernel results>, TaskId};
         # validate the result-target arity against the kernel's return arity.
         ret_type = call_expr.type
         if isinstance(ret_type, ir.TupleType) and len(ret_type.types) != n_outs + 1:
             raise ParserTypeError(
-                f"pl.submit(...) unpacks {n_outs} result value(s) but kernel "
+                f"{construct}(...) unpacks {n_outs} result value(s) but kernel "
                 f"'{method_attr.attr}' returns {len(ret_type.types) - 1}",
                 span=span,
                 hint="Match the number of result targets to the kernel's return arity.",
@@ -1414,21 +1477,23 @@ class ASTParser:
         tid_var = self._assign_or_let(tid_target.id, task_id_expr, span)
         self.scope_manager.define_var(tid_target.id, tid_var, span=span)
 
-    def _build_submit_single_lhs_expr(self, call: ast.Call) -> ir.Expr:
+    def _build_submit_single_lhs_expr(self, call: ast.Call, *, is_spmd: bool = False) -> ir.Expr:
         """Build the ``ir.Submit`` expression for the single-LHS form
-        ``result = pl.submit(self.kernel, ...)`` without binding it.
+        ``result = pl.submit(self.kernel, ...)`` (or ``pl.spmd_submit`` when
+        ``is_spmd=True``) without binding it.
 
         Separated from :meth:`_parse_submit_single_lhs` so the annotated
         assignment path can feed the inferred Submit type through the
         standard annotation-consistency / ``override_type`` validation flow
         that all other RHS expressions go through.
         """
+        construct = "pl.spmd_submit" if is_spmd else "pl.submit"
         span = self.span_tracker.get_span(call)
         if not call.args:
             raise ParserSyntaxError(
-                "pl.submit(...) requires the kernel as its first argument",
+                f"{construct}(...) requires the kernel as its first argument",
                 span=span,
-                hint="Use `result = pl.submit(self.kernel, *kernel_args, deps=[...])`.",
+                hint=f"Use `result = {construct}(self.kernel, *kernel_args, deps=[...])`.",
             )
         method_attr = call.args[0]
         if not (
@@ -1437,15 +1502,18 @@ class ASTParser:
             and method_attr.value.id == "self"
         ):
             raise ParserSyntaxError(
-                "pl.submit(...) first argument must be a `self.<kernel>` method reference",
+                f"{construct}(...) first argument must be a `self.<kernel>` method reference",
                 span=span,
                 hint="Pass the kernel itself, not a call: "
-                "`pl.submit(self.kernel, x, y)` — not `pl.submit(self.kernel(x, y))`.",
+                f"`{construct}(self.kernel, x, y)` — not `{construct}(self.kernel(x, y))`.",
             )
-        return self._parse_kernel_call(method_attr, call.args[1:], call.keywords, span, as_submit=True)
+        return self._parse_kernel_call(
+            method_attr, call.args[1:], call.keywords, span, as_submit=True, as_spmd=is_spmd
+        )
 
-    def _parse_submit_single_lhs(self, target: ast.Name, call: ast.Call) -> None:
-        """Parse the bare single-LHS form ``result = pl.submit(self.kernel, ...)``.
+    def _parse_submit_single_lhs(self, target: ast.Name, call: ast.Call, *, is_spmd: bool = False) -> None:
+        """Parse the bare single-LHS form ``result = pl.submit(self.kernel, ...)``
+        (or ``pl.spmd_submit`` when ``is_spmd=True``).
 
         Used by :meth:`parse_assignment` (no annotation). The annotated form
         ``result: pl.Tuple[..., TASK_ID] = pl.submit(...)`` builds the Submit
@@ -1453,7 +1521,7 @@ class ASTParser:
         annotation-consistency flow before binding.
         """
         span = self.span_tracker.get_span(call)
-        call_expr = self._build_submit_single_lhs_expr(call)
+        call_expr = self._build_submit_single_lhs_expr(call, is_spmd=is_spmd)
         var = self._assign_or_let(target.id, call_expr, span)
         self.scope_manager.define_var(target.id, var, span=span)
 
@@ -1539,12 +1607,21 @@ class ASTParser:
             self._parse_array_subscript_assignment(target, base_expr, var_name, value_node, span)
             return
 
+        # ``base_kind`` is the *kind* class (Tensor or Tile) — not the concrete
+        # subclass — so the source-type check below accepts any tensor-shaped
+        # sibling (``DistributedTensorType`` for tensor target, future tile
+        # subclasses for tile target). Without this, mixed-kind writes such as
+        # ``dist_win[i:j, :] = plain_tensor_src`` would be rejected even though
+        # the underlying ``tensor.assemble`` deducer accepts both via
+        # ``AsTensorTypeLike``.
         if isinstance(base_type, ir.TensorType):
             kind_name = "tensor"
             assemble_op = ir_op.tensor.assemble
+            base_kind: type = ir.TensorType
         elif isinstance(base_type, ir.TileType):
             kind_name = "tile"
             assemble_op = ir_op.tile.assemble
+            base_kind = ir.TileType
         else:
             raise ParserTypeError(
                 f"Subscript-write requires a Tensor, Tile, or Array target, got {type(base_type).__name__}",
@@ -1566,7 +1643,9 @@ class ASTParser:
 
         source_expr = self.parse_expression(value_node)
         source_type = source_expr.type
-        if not isinstance(source_type, type(base_type)):
+        # Union form gives pyright the narrowing it needs to use ``.shape`` below;
+        # ``base_kind`` is the runtime kind discriminator (Tensor vs Tile).
+        if not (isinstance(source_type, (ir.TensorType, ir.TileType)) and isinstance(source_type, base_kind)):
             raise ParserTypeError(
                 f"Subscript-write source must also be a {kind_name}, got {type(source_type).__name__}",
                 span=span,
@@ -2440,6 +2519,79 @@ class ASTParser:
             hint=f"Condition `{condition_src}` produced a non-constant IR expression",
         )
 
+    def _handle_dump_tag(self, stmt: ast.Expr) -> None:
+        """Handle ``pl.dump_tag(<name>)`` at statement position.
+
+        ``pl.dump_tag(t)`` is the declarative per-tensor dump marker. It records
+        the bound Var so that every *subsequent* kernel dispatch consuming that
+        exact Var gets it merged into the dispatch's ``dump_vars`` attr (Call or
+        Submit; see :meth:`_parse_kernel_call`). No IR statement is emitted; the
+        marker is consumed here.
+
+        ``FunctionType.Inline`` is accepted because the InlineFunctions pass
+        splices the inline body — including any ``dump_vars`` attrs on its
+        kernel calls — into the caller orchestration, with the mutator
+        substituting the callee Var for the caller's arg. No attr migration is
+        needed.
+        """
+        call = stmt.value
+        assert isinstance(call, ast.Call)
+        span = self.span_tracker.get_span(stmt)
+
+        if self._func_type not in (ir.FunctionType.Orchestration, ir.FunctionType.Inline):
+            raise ParserSyntaxError(
+                "pl.dump_tag() is only valid inside an Orchestration or Inline function",
+                span=span,
+                hint=(
+                    "Move the pl.dump_tag(...) marker into the @pl.function(type=pl."
+                    "FunctionType.Orchestration) function whose tasks consume the tagged "
+                    "tensor, or into an @pl.jit.inline / @pl.function(type=pl."
+                    "FunctionType.Inline) helper that the orchestration inlines. Selective "
+                    "tensor dump is filtered per kernel call by the orchestration codegen; "
+                    "kernel-body (AIV / AIC / Group) usage has no effect."
+                ),
+            )
+        if len(call.args) != 1 or call.keywords:
+            raise ParserSyntaxError(
+                "pl.dump_tag() takes exactly one positional argument (no keywords)",
+                span=span,
+                hint="Use: pl.dump_tag(tensor_var)",
+            )
+        if not isinstance(call.args[0], ast.Name):
+            raise ParserSyntaxError(
+                "pl.dump_tag() argument must be a bare variable name",
+                span=self.span_tracker.get_span(call.args[0]),
+                hint=(
+                    "Write pl.dump_tag(q) where q is a tensor variable bound in this "
+                    "orchestration scope. Attribute / subscript / call expressions are "
+                    "not supported."
+                ),
+            )
+        # Forward-sticky: record the bound Var so subsequent kernel calls that
+        # consume this exact Var add it to their ``dump_vars`` attr (see
+        # ``_parse_kernel_call``). The scope manager returns a stable object per
+        # binding, so identity matching is reliable and a later reassignment of
+        # the same name yields a new (untagged) Var.
+        name = call.args[0].id
+        var = self.scope_manager.lookup_var(name)
+        if var is None:
+            raise ParserSyntaxError(
+                f"pl.dump_tag() argument '{name}' is not defined at this point",
+                span=span,
+                hint="Tag a tensor only after it is bound (a parameter or an earlier assignment).",
+            )
+        # ``lookup_var`` may return a non-Var placeholder (e.g. a loop-yield
+        # name string), and only tensors are dumpable. Reject early so
+        # ``_merge_forward_sticky_dump`` never sees a typeless binding.
+        if not isinstance(var, ir.Var) or not isinstance(var.type, ir.TensorType):
+            raise ParserTypeError(
+                f"pl.dump_tag() argument '{name}' is not a tensor (got {type(var).__name__})",
+                span=self.span_tracker.get_span(call.args[0]),
+                hint="Only tensors can be selectively dumped.",
+            )
+        if not any(var is t for t in self._dump_tagged_vars):
+            self._dump_tagged_vars.append(var)
+
     def _validate_while_call_args(self, while_call: ast.Call) -> None:
         """Validate that pl.while_() has no positional arguments."""
         if len(while_call.args) > 0:
@@ -2851,20 +3003,8 @@ class ASTParser:
             self._handle_at_legacy_split_kw(kw, state)
         elif kw.arg == "name_hint":
             state.name_hint = self._parse_scope_name_hint(kw.value, "pl.at()")
-        elif kw.arg == "deps":
-            if state.deps_kw is not None:
-                raise ParserSyntaxError(
-                    "pl.at() got multiple values for argument 'deps'",
-                    span=self.span_tracker.get_span(kw),
-                )
-            state.deps_kw = kw
-        elif kw.arg == "no_dep_args":
-            if state.no_dep_args_kw is not None:
-                raise ParserSyntaxError(
-                    "pl.at() got multiple values for argument 'no_dep_args'",
-                    span=self.span_tracker.get_span(kw),
-                )
-            state.no_dep_args_kw = kw
+        elif kw.arg in _AT_STASH_KWARGS:
+            self._stash_at_kwarg(kw, state)
         elif kw.arg is None:
             raise ParserSyntaxError(
                 "Unsupported **kwargs in pl.at()",
@@ -2875,8 +3015,20 @@ class ASTParser:
             raise ParserSyntaxError(
                 f"Unknown keyword argument '{kw.arg}' in pl.at()",
                 span=self.span_tracker.get_span(kw),
-                hint="Supported arguments: level, role, optimizations, deps, no_dep_args, name_hint",
+                hint=("Supported arguments: level, role, optimizations, deps, no_dep_args, dumps, name_hint"),
             )
+
+    def _stash_at_kwarg(self, kw: ast.keyword, state: "_AtKwargState") -> None:
+        """Stash a verbatim-kept ``pl.at()`` kwarg (``deps`` / ``no_dep_args`` /
+        ``dumps``) onto ``state``, rejecting a duplicate."""
+        assert kw.arg is not None  # caller dispatches here only for _AT_STASH_KWARGS keys
+        attr = _AT_STASH_KWARGS[kw.arg]
+        if getattr(state, attr) is not None:
+            raise ParserSyntaxError(
+                f"pl.at() got multiple values for argument '{kw.arg}'",
+                span=self.span_tracker.get_span(kw),
+            )
+        setattr(state, attr, kw)
 
     def _handle_at_optimizations_kw(self, kw: ast.keyword, state: "_AtKwargState") -> None:
         if state.new_optimizations_kw is not None:
@@ -3268,8 +3420,14 @@ class ASTParser:
         context_expr: ast.Call,
         func_attr: str,
         scope_kind_map: dict[str, "ir.ScopeKind"],
+        optional_vars: "ast.expr | None" = None,
     ) -> None:
-        """Parse legacy scope context managers (pl.incore, pl.auto_incore, pl.cluster)."""
+        """Parse legacy scope context managers (pl.incore, pl.auto_incore, pl.cluster, pl.spmd).
+
+        ``optional_vars`` (the ``as <target>`` clause) is only meaningful for
+        ``pl.spmd`` (``with pl.spmd(...) as tid:``); the caller rejects it on the
+        other kinds before dispatching here.
+        """
         split_mode = None
         name_hint = ""
         if func_attr in ("auto_incore", "incore"):
@@ -3326,7 +3484,7 @@ class ASTParser:
             self._parse_scope_body(stmt, scope_kind, span, name_hint=name_hint)
             return
         elif func_attr == "spmd":
-            self._parse_spmd_scope(stmt, context_expr, scope_kind_map)
+            self._parse_spmd_scope(stmt, context_expr, scope_kind_map, optional_vars=optional_vars)
             return
         elif context_expr.args or context_expr.keywords:
             raise ParserSyntaxError(
@@ -3338,60 +3496,117 @@ class ASTParser:
         span = self.span_tracker.get_span(stmt)
         self._parse_scope_body(stmt, scope_kind, span, split=split_mode, name_hint=name_hint)
 
+    # Integer dtypes accepted for an SPMD ``core_num`` (block count). Shared by
+    # the ``pl.spmd`` scope path and the ``pl.spmd_submit`` task-launch path.
+    _CORE_NUM_INTEGER_DTYPES = frozenset(
+        {
+            DataType.INT4,
+            DataType.INT8,
+            DataType.INT16,
+            DataType.INT32,
+            DataType.INT64,
+            DataType.UINT4,
+            DataType.UINT8,
+            DataType.UINT16,
+            DataType.UINT32,
+            DataType.UINT64,
+            DataType.INDEX,
+        }
+    )
+
+    def _parse_and_validate_core_num(
+        self, value_node: ast.AST, source: ast.AST, usage_hint: str
+    ) -> "ir.Expr":
+        """Parse and validate an SPMD ``core_num`` expression.
+
+        ``core_num`` must be an integer-typed IR expression; a compile-time
+        constant must be strictly positive. Shared by ``pl.spmd`` (scope) and
+        ``pl.spmd_submit`` (task launch) so both reject the same bad inputs.
+        """
+        # ast.AST covers any expression; parse_expression expects ast.expr. The
+        # grammar for keyword values and positional args always gives ast.expr
+        # here, but cast for mypy's sake.
+        expr = self.parse_expression(cast("ast.expr", value_node))
+        expr_type = expr.type
+        is_integer = isinstance(expr_type, ir.ScalarType) and expr_type.dtype in self._CORE_NUM_INTEGER_DTYPES
+        if not is_integer:
+            raise ParserSyntaxError(
+                f"core_num must be an integer expression, got {python_print(expr_type, format=False)}",
+                span=self.span_tracker.get_span(source),
+                hint=usage_hint,
+            )
+        if isinstance(expr, ir.ConstInt) and expr.value <= 0:
+            raise ParserSyntaxError(
+                f"core_num must be a positive integer, got {expr.value}",
+                span=self.span_tracker.get_span(source),
+                hint=usage_hint,
+            )
+        return expr
+
+    def _parse_spmd_submit_kwargs(
+        self, method_name: str, keywords: list[ast.keyword], span: ir.Span
+    ) -> tuple["ir.Expr", bool]:
+        """Parse the SPMD launch-spec kwargs of ``pl.spmd_submit(...)``.
+
+        ``core_num=N`` is required (keyword-only — the positional slots are the
+        kernel's own arguments) and must be a positive integer expression.
+        ``sync_start=True/False`` is optional and must be a boolean literal.
+        Returns ``(core_num_expr, sync_start)``.
+        """
+        # Concrete, arg-syntax-free hint: this fires on core_num / sync_start
+        # validation, so point at the keyword itself (core_num is required, a
+        # positive int; sync_start is optional and defaults to False).
+        usage_hint = (
+            f"pl.spmd_submit(self.{method_name}, ...) requires a positive integer "
+            "'core_num' keyword (e.g. core_num=8); 'sync_start' is optional (default False)."
+        )
+        core_num: ir.Expr | None = None
+        sync_start = False
+        for kw in keywords:
+            if kw.arg == "core_num":
+                core_num = self._parse_and_validate_core_num(kw.value, kw.value, usage_hint)
+            elif kw.arg == "sync_start":
+                if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, bool):
+                    raise ParserSyntaxError(
+                        "sync_start must be a boolean literal (True/False)",
+                        span=self.span_tracker.get_span(kw.value),
+                        hint=usage_hint,
+                    )
+                sync_start = kw.value.value
+            # 'deps' / 'attrs' / 'device' are validated and consumed elsewhere
+            # in _parse_kernel_call; ignore them here.
+        if core_num is None:
+            raise ParserSyntaxError(
+                f"pl.spmd_submit(self.{method_name}, ...) requires the core_num keyword argument",
+                span=span,
+                hint=usage_hint,
+            )
+        return core_num, sync_start
+
     def _parse_spmd_kwargs(
         self,
         anchor: ast.AST,
         call: ast.Call,
         *,
         usage_hint: str,
-    ) -> tuple["ir.Expr", bool, str, "ir.SplitMode | None"]:
-        """Parse ``pl.spmd(core_num, *, sync_start=, name_hint=, optimizations=)`` arguments.
+        allow_deps: bool = False,
+    ) -> tuple["ir.Expr", bool, str, "ir.SplitMode | None", "list[ir.Var]"]:
+        """Parse ``pl.spmd(core_num, *, sync_start=, name_hint=, optimizations=, deps=)`` arguments.
 
         The first positional argument is ``core_num`` (range-like). Returns
-        ``(core_num, sync_start, name_hint, split_mode)`` with ``sync_start``
-        defaulting to ``False`` and ``split_mode`` to ``None``.
+        ``(core_num, sync_start, name_hint, split_mode, dep_vars)`` with
+        ``sync_start`` defaulting to ``False``, ``split_mode`` to ``None``, and
+        ``dep_vars`` to ``[]``.
 
         ``optimizations=[...]`` accepts only ``pl.split(MODE)`` — see
         :meth:`_parse_spmd_optimizations_list`.
+
+        ``deps=[...]`` is accepted only when ``allow_deps`` is True (the
+        ``with pl.spmd(...) as tid:`` form). It takes the same shapes as
+        ``pl.submit(..., deps=)`` / ``pl.at(..., deps=)`` — producer TaskId
+        ``Scalar[TASK_ID]`` Vars, an ``Array[N, TASK_ID]`` carry, or the ``None``
+        sentinel — resolved via :meth:`_parse_submit_deps_kwarg`.
         """
-
-        integer_dtypes = frozenset(
-            {
-                DataType.INT4,
-                DataType.INT8,
-                DataType.INT16,
-                DataType.INT32,
-                DataType.INT64,
-                DataType.UINT4,
-                DataType.UINT8,
-                DataType.UINT16,
-                DataType.UINT32,
-                DataType.UINT64,
-                DataType.INDEX,
-            }
-        )
-
-        def _parse_core_num_node(value_node: ast.AST, source: ast.AST) -> "ir.Expr":
-            # ast.AST covers any expression; parse_expression expects ast.expr.
-            # The grammar for keyword values and positional args always gives
-            # ast.expr here, but cast for mypy's sake.
-            expr = self.parse_expression(cast("ast.expr", value_node))
-            expr_type = expr.type
-            is_integer = isinstance(expr_type, ir.ScalarType) and expr_type.dtype in integer_dtypes
-            if not is_integer:
-                raise ParserSyntaxError(
-                    f"core_num must be an integer expression, got {python_print(expr_type, format=False)}",
-                    span=self.span_tracker.get_span(source),
-                    hint=usage_hint,
-                )
-            if isinstance(expr, ir.ConstInt) and expr.value <= 0:
-                raise ParserSyntaxError(
-                    f"core_num must be a positive integer, got {expr.value}",
-                    span=self.span_tracker.get_span(source),
-                    hint=usage_hint,
-                )
-            return expr
-
         if len(call.args) > 1:
             raise ParserSyntaxError(
                 "pl.spmd() accepts at most one positional argument (core_num)",
@@ -3400,10 +3615,11 @@ class ASTParser:
             )
         core_num: ir.Expr | None = None
         if call.args:
-            core_num = _parse_core_num_node(call.args[0], call.args[0])
+            core_num = self._parse_and_validate_core_num(call.args[0], call.args[0], usage_hint)
         sync_start: bool = False
         name_hint = ""
         split_mode: ir.SplitMode | None = None
+        deps_kw: ast.keyword | None = None
         for kw in call.keywords:
             if kw.arg is None:
                 # `pl.spmd(**cfg)` — ast.keyword.arg is None for **kwargs unpacking.
@@ -3422,7 +3638,7 @@ class ASTParser:
                         span=self.span_tracker.get_span(kw.value),
                         hint=usage_hint,
                     )
-                core_num = _parse_core_num_node(kw.value, kw.value)
+                core_num = self._parse_and_validate_core_num(kw.value, kw.value, usage_hint)
             elif kw.arg == "sync_start":
                 if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, bool):
                     raise ParserSyntaxError(
@@ -3433,11 +3649,26 @@ class ASTParser:
                 sync_start = kw.value.value
             elif kw.arg == "optimizations":
                 split_mode = self._parse_spmd_optimizations_list(kw.value, span_anchor=anchor)
+            elif kw.arg == "deps":
+                if not allow_deps:
+                    raise ParserSyntaxError(
+                        "pl.spmd() does not accept 'deps=' here",
+                        span=self.span_tracker.get_span(kw.value),
+                        hint="Use `with pl.spmd(n, deps=[...]) as tid:` (the with-form) to "
+                        "declare explicit TaskId deps, or `out, tid = pl.spmd_submit(..., "
+                        "deps=[...])` for the single-call form.",
+                    )
+                deps_kw = kw
             else:
+                supported = (
+                    "Supported keywords: 'sync_start', 'name_hint', 'optimizations', 'deps'"
+                    if allow_deps
+                    else "Supported keywords: 'sync_start', 'name_hint', 'optimizations'"
+                )
                 raise ParserSyntaxError(
                     f"pl.spmd() got unexpected keyword argument '{kw.arg}'",
                     span=self.span_tracker.get_span(anchor),
-                    hint="Supported keywords: 'sync_start', 'name_hint', 'optimizations'",
+                    hint=supported,
                 )
         if core_num is None:
             raise ParserSyntaxError(
@@ -3445,26 +3676,63 @@ class ASTParser:
                 span=self.span_tracker.get_span(anchor),
                 hint=usage_hint,
             )
-        return core_num, sync_start, name_hint, split_mode
+        dep_vars: list[ir.Var] = []
+        if deps_kw is not None:
+            anchor_span = self.span_tracker.get_span(anchor)
+            dep_vars = self._parse_submit_deps_kwarg("pl.spmd()", [deps_kw], anchor_span)
+        return core_num, sync_start, name_hint, split_mode, dep_vars
 
     def _parse_spmd_scope(
         self,
         stmt: ast.With,
         context_expr: ast.Call,
         scope_kind_map: dict[str, "ir.ScopeKind"],
+        optional_vars: "ast.expr | None" = None,
     ) -> None:
-        """Parse ``with pl.spmd(...):`` into a ScopeStmt(Spmd)."""
-        with_hint = "Use 'with pl.spmd(4):' with a single function call inside."
-        core_num, sync_start, name_hint, split_mode = self._parse_spmd_kwargs(
-            stmt, context_expr, usage_hint=with_hint
+        """Parse ``with pl.spmd(...):`` / ``with pl.spmd(...) as tid:`` into a ScopeStmt(Spmd).
+
+        Two forms:
+
+        * ``with pl.spmd(n): self.kernel(...)`` — wraps a single kernel call
+          (historical shape; no producer TaskId captured, no ``deps=``).
+        * ``with pl.spmd(n, deps=[...]) as tid:`` — captures the grid dispatch's
+          producer ``Scalar[TASK_ID]`` (mirrors ``with pl.at(...) as tid:``) and
+          accepts an inline multi-statement body that is auto-outlined into an
+          InCore kernel, exactly like ``for i in pl.spmd(n):``. The per-block
+          index is read inside the body via ``pl.tile.get_block_idx()``.
+        """
+        with_hint = (
+            "Use 'with pl.spmd(4):' with a single function call inside, or "
+            "'with pl.spmd(4) as tid:' to capture the dispatch TaskId."
         )
+        # ``deps=`` is accepted ONLY with ``as tid`` — gate it by keyword presence,
+        # not by the resolved list being non-empty. _parse_submit_deps_kwarg
+        # normalizes ``deps=[]`` / ``deps=[None]`` to ``[]``, so a truthiness check
+        # would silently accept those unsupported forms on the plain with-form.
+        # Passing allow_deps=(optional_vars is not None) makes _parse_spmd_kwargs
+        # reject any ``deps=`` on the non-capturing form (and keeps its "supported
+        # keywords" hint accurate).
+        core_num, sync_start, name_hint, split_mode, dep_vars = self._parse_spmd_kwargs(
+            stmt, context_expr, usage_hint=with_hint, allow_deps=optional_vars is not None
+        )
+        scope_kind = scope_kind_map["spmd"]
+        span = self.span_tracker.get_span(stmt)
+
+        if optional_vars is not None:
+            self._parse_spmd_scope_with_tid(
+                stmt, span, scope_kind, core_num, sync_start, name_hint, split_mode, dep_vars, optional_vars
+            )
+            return
+
+        # No ``as tid``: the historical single-kernel-call with-form. ``deps=`` was
+        # already rejected above (allow_deps=False), so dep_vars is empty here.
         # Validate body is exactly one statement that is a function call.
-        # The loop form (for i in pl.spmd(n):) is what accepts inline
-        # multi-statement bodies.
+        # The loop form (for i in pl.spmd(n):) and the `as tid` with-form are
+        # what accept inline multi-statement bodies.
         spmd_hint = (
-            "The 'with pl.spmd()' form wraps a single kernel call. Use "
-            "'for i in pl.spmd(4):' to write inline tile/tensor ops with "
-            "access to the block index."
+            "The 'with pl.spmd()' form (without 'as tid') wraps a single kernel call. "
+            "Use 'with pl.spmd(4) as tid:' to write inline tile/tensor ops and capture the "
+            "dispatch TaskId, or 'for i in pl.spmd(4):' for an inline loop body."
         )
         if len(stmt.body) != 1:
             raise ParserSyntaxError(
@@ -3484,8 +3752,6 @@ class ASTParser:
                 span=self.span_tracker.get_span(stmt),
                 hint=spmd_hint,
             )
-        scope_kind = scope_kind_map["spmd"]
-        span = self.span_tracker.get_span(stmt)
         if split_mode is None:
             # No optimizations — preserve the historical IR shape:
             # SpmdScopeStmt(<call>) with no inner InCore wrapper.
@@ -3501,6 +3767,11 @@ class ASTParser:
             # split= hint requires an inner InCoreScopeStmt to carry the
             # split_ field. Build SpmdScopeStmt(InCoreScopeStmt(split_=mode, <call>)).
             spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
+            # Like the for-form, this path builds the InCore scope directly
+            # instead of routing through _parse_scope_body, so merge any
+            # forward-sticky pl.dump_tag tensors onto it here (see
+            # _parse_spmd_for_loop for the full rationale).
+            incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
             with self.builder.scope(
                 scope_kind,
                 span,
@@ -3515,6 +3786,7 @@ class ASTParser:
                         span,
                         split=split_mode,
                         name_hint=incore_name_hint,
+                        attrs=incore_attrs,
                     ):
                         with self._scope_kind_context(ir.ScopeKind.InCore):
                             self.scope_manager.enter_scope("spmd_with_incore")
@@ -3522,6 +3794,123 @@ class ASTParser:
                             self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
                             self.scope_manager.exit_scope(leak_vars=True)
                     self.scope_manager.exit_scope(leak_vars=True)
+
+    def _parse_spmd_scope_with_tid(  # noqa: PLR0913 — args map 1:1 to the SpmdScopeStmt + capture
+        self,
+        stmt: ast.With,
+        span: "ir.Span",
+        scope_kind: "ir.ScopeKind",
+        core_num: "ir.Expr",
+        sync_start: bool,
+        name_hint: str,
+        split_mode: "ir.SplitMode | None",
+        dep_vars: "list[ir.Var]",
+        optional_vars: "ast.expr",
+    ) -> None:
+        """Parse ``with pl.spmd(n, deps=[...]) as tid:`` capturing the dispatch TaskId.
+
+        Records ``{manual_dep_edges?, task_id_var}`` on the ``SpmdScopeStmt`` and
+        emits the ``system.task_invalid()`` placeholder. The body shape mirrors the
+        plain with-form so the IR is identical to the post-``OutlineIncoreScopes``
+        shape (a single Call) and round-trips through print -> reparse:
+
+        * single call, no split → ``SpmdScopeStmt(attrs, body=Call)`` (no InCore
+          wrapper) — the same shape ``OutlineIncoreScopes`` leaves behind once the
+          inline body is outlined, so reparse is stable across passes.
+        * inline multi-statement body, or single-call with split → wrap in
+          ``InCoreScopeStmt(split, <body>)``, exactly like the for-form (minus the
+          synthesised ``loop_var = tile.get_block_idx()``; the body reads the block
+          index explicitly via ``pl.tile.get_block_idx()``).
+
+        The ``kAttrTaskIdVar`` on the outer Spmd scope makes ``OutlineClusterScopes``
+        lower the dispatch to an ``ir.Submit`` whose trailing tuple element is the
+        grid-wide producer TaskId — identical to the ``pl.at(...) as tid:`` rail.
+        """
+        if self._is_inside_scope(ir.ScopeKind.Cluster):
+            raise ParserSyntaxError(
+                "`with pl.spmd(...) as tid:` cannot capture a TaskId when nested inside "
+                "`pl.cluster()` — a cluster-nested pl.spmd is unwrapped into the Group "
+                "function and never produces a Submit.",
+                span=span,
+                hint="Use a standalone `with pl.spmd(...) as tid:` (implicit cluster) to "
+                "capture the dispatch TaskId.",
+            )
+        if not isinstance(optional_vars, ast.Name):
+            raise ParserSyntaxError(
+                "`as` target on `with pl.spmd(...)` must be a plain variable name",
+                span=span,
+                hint="Use `with pl.spmd(...) as tid:` (single name; nested tuples are not allowed).",
+            )
+
+        # Canonical attr order (deps before tid) mirrors _parse_at_meta so a
+        # print -> reparse cycle compares equal under structural_equal's
+        # positional attr check.
+        scope_attrs: list[tuple[str, Any]] = []
+        if dep_vars:
+            scope_attrs.append(("manual_dep_edges", dep_vars))
+        tid_var = self.builder.var(optional_vars.id, ir.ScalarType(DataType.TASK_ID), span=span)
+        self.scope_manager.define_var(optional_vars.id, tid_var, span=span)
+        scope_attrs.append(("task_id_var", tid_var))
+
+        # Emit the transient ``AssignStmt(tid, system.task_invalid())`` placeholder
+        # one stmt BEFORE the scope so ConvertToSSA has a def for the tid Var; the
+        # spmd outliner drops it and synthesises the real
+        # ``AssignStmt(tid, TupleGetItem(ret_tmp, n_outputs))`` binding. Pop/re-push
+        # pending leading comments so they land on the surviving SpmdScopeStmt, not
+        # the placeholder (mirrors _parse_at_scope).
+        leading = self.builder.pop_pending_leading_comments()
+        placeholder_rhs = ir.create_op_call("system.task_invalid", [], {}, span)
+        self.builder.assign(tid_var, placeholder_rhs, span=span)
+        self.builder.push_pending_leading_comments(leading)
+
+        # A lone kernel call (no split) keeps the no-InCore-wrapper shape — the
+        # same SpmdScopeStmt(body=Call) that OutlineIncoreScopes leaves behind once
+        # an inline body is outlined — so the IR round-trips identically across
+        # passes. Anything else (inline multi-statement body, or single-call with a
+        # split hint) wraps in an InCoreScopeStmt, exactly like the for-form.
+        body_stmt = stmt.body[0] if len(stmt.body) == 1 else None
+        is_single_call = body_stmt is not None and (
+            (isinstance(body_stmt, ast.Assign) and isinstance(body_stmt.value, ast.Call))
+            or (isinstance(body_stmt, ast.AnnAssign) and isinstance(body_stmt.value, ast.Call))
+            or (isinstance(body_stmt, ast.Expr) and isinstance(body_stmt.value, ast.Call))
+        )
+        if is_single_call and split_mode is None:
+            self._parse_scope_body(
+                stmt,
+                scope_kind,
+                span,
+                name_hint=name_hint,
+                core_num=core_num,
+                sync_start=sync_start,
+                attrs=scope_attrs,
+            )
+            return
+
+        spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
+        incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
+        with self.builder.scope(
+            scope_kind,
+            span,
+            name_hint=spmd_name_hint,
+            core_num=core_num,
+            sync_start=sync_start,
+            attrs=scope_attrs,
+        ):
+            with self._scope_kind_context(scope_kind):
+                self.scope_manager.enter_scope("spmd_with")
+                with self.builder.scope(
+                    ir.ScopeKind.InCore,
+                    span,
+                    split=split_mode,
+                    name_hint=incore_name_hint,
+                    attrs=incore_attrs,
+                ):
+                    with self._scope_kind_context(ir.ScopeKind.InCore):
+                        self.scope_manager.enter_scope("spmd_with_incore")
+                        self._parse_body_siblings(stmt.body)
+                        self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
+                        self.scope_manager.exit_scope(leak_vars=True)
+                self.scope_manager.exit_scope(leak_vars=True)
 
     def _parse_spmd_for_loop(self, stmt: ast.For, iter_call: ast.Call) -> None:
         """Parse ``for i in pl.spmd(N, ...): body`` into
@@ -3554,12 +3943,23 @@ class ASTParser:
                     hint=spmd_hint,
                 )
 
-        core_num, sync_start, name_hint, split_mode = self._parse_spmd_kwargs(
+        # The for-form does not capture a TaskId, so it rejects deps= (allow_deps
+        # defaults False): use the with-form `with pl.spmd(n, deps=[...]) as tid:`
+        # to wire explicit deps. dep_vars is therefore always empty here.
+        core_num, sync_start, name_hint, split_mode, _ = self._parse_spmd_kwargs(
             stmt, iter_call, usage_hint=spmd_hint
         )
         spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
 
         span = self.span_tracker.get_span(stmt)
+        # Merge forward-sticky pl.dump_tag tensors onto the auto-outlined InCore
+        # scope — the kernel the loop body lowers to. The with-form (pl.at /
+        # pl.spmd / pl.incore) routes through _parse_scope_body for this; the
+        # for-form builds its scope directly, so attach here to keep the two
+        # paths symmetric. OutlineIncoreScopes then carries the dump_vars onto
+        # the synthesised inner-kernel Call; the wrapper-dispatch codegen
+        # (BuildWrapperReorderedParams) honours that inner call's dump_vars.
+        incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
         with self.builder.scope(
             ir.ScopeKind.Spmd,
             span,
@@ -3570,7 +3970,11 @@ class ASTParser:
             with self._scope_kind_context(ir.ScopeKind.Spmd):
                 self.scope_manager.enter_scope("spmd_for")
                 with self.builder.scope(
-                    ir.ScopeKind.InCore, span, split=split_mode, name_hint=incore_name_hint
+                    ir.ScopeKind.InCore,
+                    span,
+                    split=split_mode,
+                    name_hint=incore_name_hint,
+                    attrs=incore_attrs,
                 ):
                     with self._scope_kind_context(ir.ScopeKind.InCore):
                         # Bind `i = pl.tile.get_block_idx()` as the first
@@ -3585,6 +3989,51 @@ class ASTParser:
                 # subsequent statements like ``return out``. Matches Python's
                 # own for-loop variable-leaking semantics.
                 self.scope_manager.exit_scope(leak_vars=True)
+
+    def _merge_forward_sticky_dump(
+        self,
+        attrs: "list[tuple[str, Any]] | None",
+        scope_kind: "ir.ScopeKind",
+    ) -> "list[tuple[str, Any]] | None":
+        """Merge forward-sticky ``pl.dump_tag`` tensors into a scope's dump_vars attr.
+
+        The single injection point for the scope-level selective-dump carrier on
+        first parse — the explicit / round-trip ``dumps=`` surface is handled
+        separately by :meth:`_parse_at_meta`. Both the ``pl.at`` and the legacy
+        ``pl.incore`` / ``pl.cluster`` paths route through
+        :meth:`_parse_scope_body`, so attaching here covers every scope kind that
+        becomes a kernel dispatch. Runtime scopes (``pl.manual_scope`` /
+        ``pl.auto_scope``) are skipped: they are not outlined into a dispatch, and
+        ``pl.submit`` inside a manual scope carries its own per-call ``dump_vars``.
+
+        Tags are captured at scope entry (forward-sticky), so they are bound
+        before the scope and live at its entry — exactly the SSA version the
+        synthesised dispatch receives as an arg. Entries the scope never consumes
+        are dropped later by the outliner. ``dump_vars`` is kept before
+        ``task_id_var`` so a print -> reparse (which rebuilds the canonical order
+        via :meth:`_parse_at_meta`) compares equal under structural_equal's
+        positional attr check.
+        """
+        if scope_kind == ir.ScopeKind.Runtime:
+            return attrs
+        tagged = [v for v in self._dump_tagged_vars if isinstance(v.type, ir.TensorType)]
+        if not tagged:
+            return attrs
+
+        new_attrs: list[tuple[str, Any]] = list(attrs) if attrs else []
+        for i, (k, v) in enumerate(new_attrs):
+            if k == "dump_vars":
+                merged = list(v)
+                seen = {id(x) for x in merged}
+                for t in tagged:
+                    if id(t) not in seen:
+                        merged.append(t)
+                        seen.add(id(t))
+                new_attrs[i] = ("dump_vars", merged)
+                return new_attrs
+        insert_at = next((i for i, (k, _) in enumerate(new_attrs) if k == "task_id_var"), len(new_attrs))
+        new_attrs.insert(insert_at, ("dump_vars", tagged))
+        return new_attrs
 
     def _parse_scope_body(  # noqa: PLR0913 — kwargs map 1:1 to ScopeStmt fields
         self,
@@ -3602,6 +4051,7 @@ class ASTParser:
         attrs: "list[tuple[str, Any]] | None" = None,
     ) -> None:
         """Build a scope statement from a with-statement body."""
+        attrs = self._merge_forward_sticky_dump(attrs, scope_kind)
         with self.builder.scope(
             scope_kind,
             span,
@@ -3632,6 +4082,7 @@ class ASTParser:
         name_hint = state.name_hint
         deps_kw = state.deps_kw
         no_dep_args_kw = state.no_dep_args_kw
+        dumps_kw = state.dumps_kw
         assert level is not None  # _parse_at_kwargs raises if level is missing
         span = self.span_tracker.get_span(stmt)
 
@@ -3669,7 +4120,7 @@ class ASTParser:
         # an ``Array[N, TASK_ID]`` carry. ``with pl.at(...) as tid:`` binds a
         # fresh ``Scalar[TASK_ID]`` Var in the outer scope; the outliner
         # later wires it to ``TupleGetItem(call_lhs, last_idx)``.
-        scope_attrs = self._parse_at_meta(deps_kw, no_dep_args_kw, optional_vars, span)
+        scope_attrs = self._parse_at_meta(deps_kw, no_dep_args_kw, dumps_kw, optional_vars, span)
 
         # ``with pl.at(...) as tid:`` allocates ``tid`` as an outer-scope Var
         # whose real definition is synthesised later by ``OutlineIncoreScopes``
@@ -3738,31 +4189,48 @@ class ASTParser:
         self,
         deps_kw: "ast.keyword | None",
         no_dep_args_kw: "ast.keyword | None",
+        dumps_kw: "ast.keyword | None",
         optional_vars: "ast.expr | None",
         span: "ir.Span",
     ) -> "list[tuple[str, Any]] | None":
         """Build the ScopeStmt ``attrs`` list from a ``pl.at(...)`` ``deps=`` /
-        ``no_dep_args=`` kwarg pair and a ``with ... as <tid>:`` capture target.
+        ``no_dep_args=`` / ``dumps=`` kwarg set and a ``with ... as <tid>:``
+        capture target.
 
         Returns ``None`` when none are present, leaving the scope's ``attrs_``
         empty (the typical plain ``pl.at(...)`` case). Otherwise returns a list
-        with up to three reserved keys:
+        with up to four reserved keys, always in this canonical order (so a
+        print -> reparse cycle reproduces it byte-for-byte; structural_equal
+        compares scope attrs positionally):
 
           * ``manual_dep_edges``: ``list[VarPtr]`` — same shape as the
             ``pl.submit(..., deps=)`` attr; consumed by codegen via
             ``Arg::set_dependencies``.
-          * ``task_id_var``: ``VarPtr`` — the outer-scope ``Scalar[TASK_ID]``
-            Var the outliner binds to the producer TaskId tuple element.
           * ``arg_direction_overrides_vars``: ``list[VarPtr]`` — outer-scope
             tensor Vars whose corresponding arg slots on the synthesised Call
             must be ``ArgDirection.NoDep``. The outliner translates this Var
             list into positional indices using the captured-var order and
             writes the result back as ``arg_direction_overrides`` on the Call.
+          * ``dump_vars``: ``list[VarPtr]`` — outer-scope tensor Vars to mark for
+            selective tensor dump. Seeded by ``pl.dump_tag`` (forward-sticky,
+            from :attr:`_dump_tagged_vars`) at parse and from an explicit
+            ``dumps=`` kwarg (also the print/reparse roundtrip surface). The
+            outliner translates this into the synthesised dispatch's ``kAttrDumpVars``.
+          * ``task_id_var``: ``VarPtr`` — the outer-scope ``Scalar[TASK_ID]``
+            Var the outliner binds to the producer TaskId tuple element.
 
         The ``tid`` Var is defined in the outer scope so subsequent statements
         (e.g. another ``pl.at(..., deps=[tid])``) can reference it.
         """
-        if deps_kw is None and no_dep_args_kw is None and optional_vars is None:
+        # ``dumps=`` is the explicit scope-level dump surface (symmetric with
+        # ``deps=``) and also the print/reparse round-trip surface. The
+        # forward-sticky ``pl.dump_tag`` seed is merged in later by
+        # :meth:`_parse_scope_body` (the single injection point shared by the
+        # ``pl.at`` and legacy ``pl.incore`` / ``pl.cluster`` paths), so it is
+        # not consulted here.
+        dump_vars: list[ir.Var] = self._parse_at_dumps_kwarg(dumps_kw) if dumps_kw else []
+
+        if deps_kw is None and no_dep_args_kw is None and not dump_vars and optional_vars is None:
             return None
 
         attrs: list[tuple[str, Any]] = []
@@ -3771,15 +4239,18 @@ class ASTParser:
             dep_vars = self._parse_submit_deps_kwarg("pl.at()", [deps_kw], span)
             if dep_vars:
                 # Attr keys mirror the C++ ``kAttrManualDepEdges`` /
-                # ``kAttrTaskIdVar`` / ``kAttrArgDirOverrideVars`` constants
-                # (include/pypto/ir/expr.h); passed as raw strings since they
-                # are not exposed to Python.
+                # ``kAttrTaskIdVar`` / ``kAttrArgDirOverrideVars`` /
+                # ``kAttrDumpVars`` constants (include/pypto/ir/expr.h); passed
+                # as raw strings since they are not exposed to Python.
                 attrs.append(("manual_dep_edges", dep_vars))
 
         if no_dep_args_kw is not None:
             no_dep_vars = self._parse_at_no_dep_args_kwarg(no_dep_args_kw)
             if no_dep_vars:
                 attrs.append(("arg_direction_overrides_vars", no_dep_vars))
+
+        if dump_vars:
+            attrs.append(("dump_vars", dump_vars))
 
         if optional_vars is not None:
             if not isinstance(optional_vars, ast.Name):
@@ -3856,6 +4327,62 @@ class ASTParser:
             resolved.append(var)
         return resolved
 
+    def _parse_at_dumps_kwarg(self, kw: "ast.keyword") -> list[ir.Var]:
+        """Resolve ``pl.at(dumps=[t1, t2])`` entries to outer-scope tensor Vars.
+
+        Mirrors :meth:`_parse_at_no_dep_args_kwarg`: each entry must be a bare
+        Name resolving to a Tensor-typed Var. ``dumps=`` is the explicit
+        scope-level selective-dump surface (symmetric with ``deps=``) and also
+        the print/reparse round-trip surface — the printer emits it for any
+        scope carrying ``kAttrDumpVars`` (seeded by ``pl.dump_tag`` at parse, by
+        an explicit ``dumps=`` list, and by the inline-call ``dump_vars``
+        transfer). The outliner translates the returned Var list into the
+        synthesised dispatch's ``kAttrDumpVars`` by Var identity; entries the
+        scope does not actually capture are skipped there (no error), so unlike
+        ``no_dep_args`` there is no capture requirement at parse.
+
+        Returns an empty list for ``dumps=[]`` so callers treat it as a no-op.
+        """
+        if not isinstance(kw.value, (ast.List, ast.Tuple)):
+            raise ParserTypeError(
+                "pl.at(dumps=...) must be a list literal of tensor names",
+                span=self.span_tracker.get_span(kw),
+                hint="Use `dumps=[t1, t2]` with bare tensor names visible to the enclosing function.",
+            )
+
+        resolved: list[ir.Var] = []
+        seen: set[int] = set()
+        for elt in kw.value.elts:
+            if not isinstance(elt, ast.Name):
+                raise ParserTypeError(
+                    "pl.at(dumps=[...]) entries must be bare tensor names",
+                    span=self.span_tracker.get_span(elt),
+                    hint="Use `dumps=[t]` where `t` is a tensor variable visible "
+                    "to the enclosing function scope.",
+                )
+            var = self.scope_manager.lookup_var(elt.id)
+            if var is None:
+                raise ParserTypeError(
+                    f"pl.at(dumps=[...]) references unknown name '{elt.id}'",
+                    span=self.span_tracker.get_span(elt),
+                    hint="Each entry must resolve to a tensor visible in the enclosing function scope.",
+                )
+            if not isinstance(var.type, ir.TensorType):
+                raise ParserTypeError(
+                    f"pl.at(dumps=[...]) entry '{elt.id}' is not a tensor (got type {var.type})",
+                    span=self.span_tracker.get_span(elt),
+                    hint="Only tensors can be selectively dumped.",
+                )
+            if id(var) in seen:
+                raise ParserTypeError(
+                    f"pl.at(dumps=[...]) lists '{elt.id}' more than once",
+                    span=self.span_tracker.get_span(elt),
+                    hint="Each tensor may appear at most once in `dumps=`.",
+                )
+            seen.add(id(var))
+            resolved.append(var)
+        return resolved
+
     def parse_with_statement(self, stmt: ast.With) -> None:
         """Parse with statement for scope contexts.
 
@@ -3899,17 +4426,20 @@ class ASTParser:
         if isinstance(context_expr, ast.Call):
             func = context_expr.func
             if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "pl":
-                # ``as <target>`` is currently only meaningful on ``pl.at(...)``
-                # (binds the producer TaskId of the outlined kernel Call).
-                # Reject it on every other scope construct so misuses surface
-                # at parse time rather than silently dropping the binding.
-                if optional_vars is not None and func.attr != "at":
+                # ``as <target>`` binds the producer TaskId of the outlined kernel
+                # dispatch. It is meaningful on ``pl.at(...) as tid:`` (InCore /
+                # Hierarchy scope) and ``pl.spmd(...) as tid:`` (grid dispatch).
+                # Reject it on every other scope construct so misuses surface at
+                # parse time rather than silently dropping the binding.
+                if optional_vars is not None and func.attr not in ("at", "spmd"):
                     raise ParserSyntaxError(
                         f"`with pl.{func.attr}(...) as ...:` is not supported "
-                        "— the `as` clause only applies to `with pl.at(...) as tid:`",
+                        "— the `as` clause only applies to `with pl.at(...) as tid:` and "
+                        "`with pl.spmd(...) as tid:`",
                         span=self.span_tracker.get_span(stmt),
-                        hint="Drop the `as` target, or use `with pl.at(...) as tid:` "
-                        "to capture the outlined kernel's producer TaskId.",
+                        hint="Drop the `as` target, or use `with pl.at(...) as tid:` / "
+                        "`with pl.spmd(...) as tid:` to capture the outlined dispatch's "
+                        "producer TaskId.",
                     )
 
                 # Unified runtime scope: with pl.scope(mode=...): ...
@@ -3922,9 +4452,11 @@ class ASTParser:
                     self._parse_manual_scope(stmt, context_expr)
                     return
 
-                # Existing scope kinds: pl.incore(), pl.auto_incore(), pl.cluster()
+                # Existing scope kinds: pl.incore(), pl.auto_incore(), pl.cluster(), pl.spmd()
                 if func.attr in _SCOPE_KIND_MAP:
-                    self._parse_legacy_scope(stmt, context_expr, func.attr, _SCOPE_KIND_MAP)
+                    self._parse_legacy_scope(
+                        stmt, context_expr, func.attr, _SCOPE_KIND_MAP, optional_vars=optional_vars
+                    )
                     return
 
                 # pl.at(level=..., role=..., deps=...) [as tid]
@@ -3990,6 +4522,9 @@ class ASTParser:
             return
         if self._is_dsl_call(stmt, "static_assert"):
             self._handle_static_assert(stmt)
+            return
+        if _is_pl_call(stmt.value, "dump_tag"):
+            self._handle_dump_tag(stmt)
             return
 
         # Special case: bare pl.yield_() emits a YieldStmt via parse_yield_call.
@@ -4378,6 +4913,13 @@ class ASTParser:
                 span=self.span_tracker.get_span(call),
                 hint="pl.submit returns (kernel result, producer TaskId); bind both with tuple unpacking.",
             )
+        if _is_pl_call(call, "spmd_submit"):
+            raise ParserSyntaxError(
+                "pl.spmd_submit(...) must be unpacked as a 2-tuple: "
+                "`out, tid = pl.spmd_submit(self.kernel, ..., core_num=N)`",
+                span=self.span_tracker.get_span(call),
+                hint="pl.spmd_submit returns (kernel result, producer TaskId); unpack both as a 2-tuple.",
+            )
 
         # Handle cross-function calls via self.method_name() in @pl.program classes
         if isinstance(func, ast.Attribute):
@@ -4516,6 +5058,60 @@ class ASTParser:
             hint="Use pl.*, pl.tensor.*, pl.tile.*, or pl.system.* operations",
         )
 
+    @staticmethod
+    def _validate_kernel_call_kwargs(
+        method_name: str,
+        func_obj: ir.Function | None,
+        keywords: list[ast.keyword],
+        as_submit: bool,
+        as_spmd: bool,
+        span: ir.Span,
+    ) -> None:
+        """Reject unknown keyword arguments on a cross-function kernel call.
+
+        ``attrs=`` surfaces call-site directions and is always allowed.
+        ``deps=`` / ``dumps=`` are accepted only on ``pl.submit(...)``;
+        ``core_num=`` / ``sync_start=`` only on ``pl.spmd_submit(...)``;
+        ``device=`` only when the callee is an Orchestrator. Raises
+        ``ParserTypeError`` with a targeted hint for the common
+        deps/dumps-on-a-plain-call mistakes.
+        """
+        allowed_kwargs = {"attrs"}
+        if as_submit:
+            allowed_kwargs.add("deps")
+            allowed_kwargs.add("dumps")
+        if as_spmd:
+            allowed_kwargs.update({"core_num", "sync_start"})
+        if func_obj is not None and func_obj.role == ir.Role.Orchestrator:
+            allowed_kwargs.add("device")
+        for kw in keywords:
+            if kw.arg in allowed_kwargs:
+                continue
+            hint = f"Allowed keyword arguments: {sorted(allowed_kwargs)}"
+            if kw.arg == "deps" and not as_submit:
+                hint = (
+                    "Plain self.kernel(...) is fire-and-forget. To attach "
+                    "dependency edges, submit it: "
+                    "`out, tid = pl.submit(self.kernel, ..., deps=[...])`."
+                )
+            elif kw.arg in ("core_num", "sync_start") and not as_spmd:
+                hint = (
+                    f"'{kw.arg}' is an SPMD launch parameter. Launch the kernel "
+                    "across multiple blocks with "
+                    "`out, tid = pl.spmd_submit(self.kernel, ..., core_num=N)`."
+                )
+            elif kw.arg == "dumps" and not as_submit:
+                hint = (
+                    "dumps= is only valid on pl.submit(...) / pl.at(...). For a "
+                    "plain self.kernel(...) call, declare the dump target with a "
+                    "`pl.dump_tag(x)` statement before the call instead."
+                )
+            raise ParserTypeError(
+                f"Function '{method_name}' does not accept keyword argument '{kw.arg}'",
+                span=span,
+                hint=hint,
+            )
+
     def _parse_kernel_call(
         self,
         method_attr: ast.Attribute,
@@ -4524,10 +5120,11 @@ class ASTParser:
         span: ir.Span,
         *,
         as_submit: bool,
+        as_spmd: bool = False,
     ) -> ir.Expr:
         """Build the ``ir.Call`` for a cross-function ``self.<method>(...)`` invocation.
 
-        Shared by two call surfaces:
+        Shared by three call surfaces:
 
         * the plain-call path in :meth:`parse_call` (``as_submit=False``) — a
           fire-and-forget kernel call; ``deps=`` is rejected and the call's
@@ -4536,13 +5133,19 @@ class ASTParser:
           (``as_submit=True``) — the call captures a producer TaskId; ``deps=``
           is accepted and the return type is augmented to the flat
           ``TupleType([*<callee returns>, Scalar[TASK_ID]])``.
+        * the ``pl.spmd_submit(...)`` path (``as_submit=True, as_spmd=True``) —
+          as above, plus the ``core_num=`` / ``sync_start=`` SPMD launch-spec
+          kwargs are accepted and recorded on the resulting ``ir.Submit``.
 
         Args:
             method_attr: The ``self.<method>`` attribute node.
             arg_nodes: Positional kernel argument AST nodes (no ``self.method``).
             keywords: Keyword AST nodes from the call site.
             span: Source span of the call.
-            as_submit: Whether this originates from a ``pl.submit(...)`` call.
+            as_submit: Whether this originates from a ``pl.submit``/
+                ``pl.spmd_submit`` call.
+            as_spmd: Whether this originates from a ``pl.spmd_submit(...)`` call
+                (accepts the ``core_num`` / ``sync_start`` launch-spec kwargs).
         """
         method_name = method_attr.attr
         if method_name not in self.global_vars:
@@ -4554,30 +5157,10 @@ class ASTParser:
         gvar = self.global_vars[method_name]
         func_obj = self.gvar_to_func.get(gvar)
 
-        # ``attrs={"arg_directions": [...]}`` surfaces call-site directions on
-        # any cross-function call. ``deps=[...]`` attaches explicit manual_scope
-        # dependency edges and is accepted only on ``pl.submit(...)``.
-        # ``device=`` selects the physical device for an Orchestration
-        # dispatch. Other kwargs are rejected.
-        allowed_kwargs = {"attrs"}
-        if as_submit:
-            allowed_kwargs.add("deps")
-        if func_obj is not None and func_obj.role == ir.Role.Orchestrator:
-            allowed_kwargs.add("device")
-        for kw in keywords:
-            if kw.arg not in allowed_kwargs:
-                hint = f"Allowed keyword arguments: {sorted(allowed_kwargs)}"
-                if kw.arg == "deps" and not as_submit:
-                    hint = (
-                        "Plain self.kernel(...) is fire-and-forget. To attach "
-                        "dependency edges, submit it: "
-                        "`out, tid = pl.submit(self.kernel, ..., deps=[...])`."
-                    )
-                raise ParserTypeError(
-                    f"Function '{method_name}' does not accept keyword argument '{kw.arg}'",
-                    span=span,
-                    hint=hint,
-                )
+        # Reject unknown kwargs (``attrs`` always; ``deps`` / ``dumps`` only on
+        # submit; ``core_num`` / ``sync_start`` only on spmd_submit; ``device``
+        # only for an Orchestrator callee).
+        self._validate_kernel_call_kwargs(method_name, func_obj, keywords, as_submit, as_spmd, span)
 
         # Validate argument count before parsing args to fail fast.
         if func_obj is not None:
@@ -4591,18 +5174,46 @@ class ASTParser:
         manual_dep_edges = self._extract_manual_dep_edges_from_attrs(method_name, keywords, span)
         # Detect ``pl.no_dep(...)`` wrappers at call-arg positions and collect
         # their indices for the arg_direction_overrides attr.
-        unwrapped_args, no_dep_indices = self._strip_no_dep_wrappers(arg_nodes)
+        unwrapped_args, no_dep_indices = self._strip_call_arg_markers(arg_nodes)
         args = [self.parse_expression(arg) for arg in unwrapped_args]
-        # ``pl.submit`` parses the optional ``deps=[tid, ...]`` kwarg into a
-        # list of TaskId Vars for the explicit-edge attr.
+        # ``pl.submit`` parses the optional ``deps=[tid, ...]`` (explicit-edge
+        # attr) and ``dumps=[tensor, ...]`` (selective dump) kwargs. A plain
+        # Call recovers its selective-dump targets from the machine-only
+        # ``attrs={"dump_vars": [...]}`` round-trip dict (printed metadata), not
+        # a user-facing kwarg.
         user_dep_vars: list[ir.Var] = []
+        explicit_dump_vars: list[ir.Var] = []
         if as_submit:
             user_dep_vars = self._parse_submit_deps_kwarg(method_name, keywords, span)
-        elif manual_dep_edges is not None:
-            user_dep_vars = manual_dep_edges
+            explicit_dump_vars = self._parse_submit_dumps_kwarg(method_name, args, keywords, span)
+        else:
+            if manual_dep_edges is not None:
+                user_dep_vars = manual_dep_edges
+            explicit_dump_vars = self._extract_dump_vars_from_attrs(method_name, args, keywords, span)
+        # Build the selective-dump set in arg order (stable round-trip):
+        # forward-sticky ``pl.dump_tag`` matches, ``dumps=`` entries (submit),
+        # and round-tripped ``attrs['dump_vars']`` entries (plain Call) — all by
+        # Var identity. Stored as ``attrs['dump_vars']`` (VarPtr list) on the
+        # Call/Submit, so the dump target is tracked by Var through SSA / inline
+        # / codegen. There is no call-arg wrapper surface: ``dump_vars`` is an
+        # IR-level attr, never spelled as a user kwarg at a plain
+        # ``self.kernel(...)`` call site.
+        dump_vars: list[ir.Var] = []
+        for arg in args:
+            tagged = any(arg is t for t in self._dump_tagged_vars)
+            in_dumps = any(arg is d for d in explicit_dump_vars)
+            if (tagged or in_dumps) and isinstance(arg, ir.Var):
+                dump_vars.append(arg)
         # Orchestration dispatch ``device=`` kwarg: resolves to a ConstInt or
         # an enclosing-loop induction Var.
         device_expr = self._parse_dispatch_device_kwarg(keywords)
+        # ``pl.spmd_submit`` parses the SPMD launch spec (``core_num=`` /
+        # ``sync_start=``) into a (positive int Expr, bool) pair recorded on
+        # the resulting Submit.
+        core_num_expr: ir.Expr | None = None
+        sync_start = False
+        if as_spmd:
+            core_num_expr, sync_start = self._parse_spmd_submit_kwargs(method_name, keywords, span)
         return_types = func_obj.return_types if func_obj else []
         if func_obj is not None and return_types:
             return_types = ir.deduce_call_return_type(
@@ -4617,9 +5228,12 @@ class ASTParser:
             span,
             arg_directions=arg_directions,
             no_dep_indices=no_dep_indices,
+            dump_vars=dump_vars,
             user_dep_vars=user_dep_vars,
             device_expr=device_expr,
             augment_task_id=as_submit,
+            core_num=core_num_expr,
+            sync_start=sync_start,
         )
 
     def _is_python_resolvable_ast(
@@ -4919,6 +5533,50 @@ class ASTParser:
         synth = self._synthesize_deps_array(direct_entries, span)
         return [synth]
 
+    def _parse_submit_dumps_kwarg(
+        self, method_name: str, args: list[ir.Expr], keywords: list[ast.keyword], span: ir.Span
+    ) -> list[ir.Var]:
+        """Extract the optional ``dumps=[t1, t2]`` kwarg on a ``pl.submit(...)`` call.
+
+        The submit-side selective-dump surface, symmetric with ``deps=``: each
+        entry marks one tensor argument of this submit for selective tensor dump
+        (simpler#844). Entries feed the same ``attrs['dump_vars']`` set as a
+        ``pl.dump_tag`` declaration, tracked by Var identity through SSA /
+        inline / codegen.
+
+        Each entry must be a tensor-typed Var that is a positional argument of
+        this submit (matched by identity). Returns an empty list when ``dumps=``
+        is absent.
+        """
+        dumps_kw = next((kw for kw in keywords if kw.arg == "dumps"), None)
+        if dumps_kw is None:
+            return []
+        if not isinstance(dumps_kw.value, (ast.List, ast.Tuple)):
+            raise ParserTypeError(
+                f"'{method_name}' dumps= must be a list / tuple of tensor arguments",
+                span=self.span_tracker.get_span(dumps_kw.value),
+                hint="Write dumps=[x, y] listing tensors passed to this submit.",
+            )
+        result: list[ir.Var] = []
+        for elt in dumps_kw.value.elts:
+            elt_span = self.span_tracker.get_span(elt)
+            val = self.parse_expression(elt)
+            if not isinstance(val, ir.Var) or not isinstance(val.type, ir.TensorType):
+                raise ParserTypeError(
+                    f"'{method_name}' dumps= entries must be tensor variables — got '{ast.unparse(elt)}'",
+                    span=elt_span,
+                    hint="List tensors passed to this submit, e.g. dumps=[x].",
+                )
+            if not any(val is a for a in args):
+                raise ParserTypeError(
+                    f"'{method_name}' dumps= entry '{ast.unparse(elt)}' is not an argument of this submit",
+                    span=elt_span,
+                    hint="dumps= may only name tensors passed positionally to the submitted kernel.",
+                )
+            if not any(val is e for e in result):  # dedup by identity
+                result.append(val)
+        return result
+
     def _parse_dispatch_device_kwarg(
         self,
         keywords: list[ast.keyword],
@@ -4952,7 +5610,7 @@ class ASTParser:
             return None
         return self.parse_expression(device_kw.value)
 
-    def _make_call_with_return_type(
+    def _make_call_with_return_type(  # noqa: PLR0913 — cohesive call-builder; bundling args hurts clarity
         self,
         gvar: ir.GlobalVar,
         args: list[ir.Expr],
@@ -4960,9 +5618,12 @@ class ASTParser:
         span: ir.Span,
         arg_directions: list[ir.ArgDirection] | None = None,
         no_dep_indices: list[int] | None = None,
+        dump_vars: list[ir.Var] | None = None,
         user_dep_vars: list[ir.Var] | None = None,
         device_expr: ir.Expr | None = None,
         augment_task_id: bool = False,
+        core_num: ir.Expr | None = None,
+        sync_start: bool = False,
     ) -> ir.Expr:
         """Create an ir.Call, attaching the return type, optional call-site directions
         and optional per-arg ``NoDep`` overrides.
@@ -4982,6 +5643,11 @@ class ASTParser:
                 at the call site. Stored as ``attrs['arg_direction_overrides']`` so
                 ``DeriveCallDirections`` can overwrite the auto-derived direction at
                 each indicated slot to ``ArgDirection.NoDep``.
+            dump_vars: Optional list of argument Vars marked for selective
+                tensor dump (via ``pl.dump_tag`` / ``dumps=``). Stored as ``attrs['dump_vars']``
+                (``vector<VarPtr>``); orchestration codegen marks each matching
+                ``Arg`` slot via ``Arg::dump(...)``. Tracked by Var identity so it
+                stays consistent with ``args_`` through SSA / inline / codegen.
             user_dep_vars: Optional list of TaskId Vars from a ``pl.submit(...)``
                 ``deps=[tid1, tid2]`` kwarg. Each entry is a
                 ``Scalar[TASK_ID]`` (from a prior ``_, tid = pl.submit(...)`` /
@@ -4999,6 +5665,12 @@ class ASTParser:
                 ``TupleType([*<callee returns>, Scalar[TASK_ID]])`` — elements
                 ``0..N-1`` are the kernel results, element ``N`` is the
                 producer TaskId.
+            core_num: Optional SPMD block-count :class:`ir.Expr` from the
+                ``pl.spmd_submit(..., core_num=N)`` path. Recorded on the
+                resulting ``ir.Submit.core_num`` (only valid with
+                ``augment_task_id=True``).
+            sync_start: SPMD sync-start flag from ``pl.spmd_submit(...,
+                sync_start=...)``. Recorded on ``ir.Submit.sync_start``.
         """
         if not return_types:
             return_type: ir.Type = ir.UnknownType()
@@ -5008,8 +5680,15 @@ class ASTParser:
             return_type = ir.TupleType(return_types)
 
         attrs: dict[str, Any] | None = None
+        # dump_vars is written at parse time; arg_directions is appended later by
+        # DeriveCallDirections. Insert dump_vars first so a print -> reparse of a
+        # post-derive Call reproduces the canonical [dump_vars, arg_directions]
+        # attr order (structural_equal compares attrs positionally).
+        if dump_vars:
+            attrs = {"dump_vars": list(dump_vars)}
         if arg_directions:
-            attrs = {"arg_directions": list(arg_directions)}
+            attrs = attrs or {}
+            attrs["arg_directions"] = list(arg_directions)
         if no_dep_indices:
             attrs = attrs or {}
             attrs["arg_direction_overrides"] = list(no_dep_indices)
@@ -5038,8 +5717,22 @@ class ASTParser:
                 submit_attrs = {k: v for k, v in attrs.items() if k != "manual_dep_edges"}
                 if not submit_attrs:
                     submit_attrs = None
-            if submit_attrs is not None:
-                return ir.Submit(gvar, args, deps_list, {}, submit_attrs, return_type, span)
+            # pl.spmd_submit carries an SPMD launch spec (core_num/sync_start) on
+            # the Submit; that requires the full ctor form even when there are
+            # no attrs. A plain pl.submit with no attrs keeps the minimal form
+            # so existing golden output is byte-identical.
+            if submit_attrs is not None or core_num is not None:
+                return ir.Submit(
+                    gvar,
+                    args,
+                    deps_list,
+                    {},
+                    submit_attrs,
+                    return_type,
+                    span,
+                    core_num=core_num,
+                    sync_start=sync_start,
+                )
             return ir.Submit(gvar, args, deps_list, return_type, span)
 
         if attrs is not None:
@@ -5050,52 +5743,68 @@ class ASTParser:
         return ir.Call(gvar, args, return_type, span)
 
     @staticmethod
-    def _strip_no_dep_wrappers(
+    def _match_call_arg_marker(node: ast.expr, name: str) -> ast.expr | None:
+        """Return the inner arg if *node* is a ``pl.<name>(arg)`` / ``<name>(arg)``
+        single-positional-arg marker call, else ``None``.
+
+        The match is intentionally tight — only the bare ``pl.<name>`` attribute
+        access (or a bare ``<name>`` import) with exactly one positional arg and
+        no keywords qualifies. ``obj.<name>(x)`` on a user-defined object is left
+        in place so the parser surfaces a normal-call error instead of silently
+        stripping the wrapper.
+        """
+        if (
+            isinstance(node, ast.Call)
+            and len(node.args) == 1
+            and not node.keywords
+            and (
+                (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == name
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "pl"
+                )
+                or (isinstance(node.func, ast.Name) and node.func.id == name)
+            )
+        ):
+            return node.args[0]
+        return None
+
+    @classmethod
+    def _strip_call_arg_markers(
+        cls,
         arg_nodes: list[ast.expr],
     ) -> tuple[list[ast.expr], list[int]]:
-        """Detect ``pl.no_dep(arg)`` wrappers in a kernel-call argument list.
+        """Peel ``pl.no_dep(arg)`` wrappers from a kernel-call argument list.
 
-        Returns a parallel list of unwrapped arg ASTs (so the inner expression
-        is what gets parsed into IR) plus the indices of arguments that were
-        wrapped — these become ``ArgDirection.NoDep`` overrides at codegen
-        time via ``DeriveCallDirections``.
+        Returns the unwrapped arg ASTs (innermost expression parsed into IR)
+        plus the indices of arguments wrapped by ``pl.no_dep(...)`` →
+        ``ArgDirection.NoDep`` overrides applied later by
+        ``DeriveCallDirections`` (stored as ``attrs['arg_direction_overrides']``).
 
-        Recognised forms (single positional arg only, no kwargs):
-            pl.no_dep(t)   — Attribute(value=Name("pl"), attr="no_dep")
-            no_dep(t)      — Name("no_dep")  (in case the user does
-                             ``from pypto.language import no_dep``)
-
-        The match is intentionally tight — only the bare ``pl.no_dep``
-        attribute access (or a ``no_dep`` import) qualifies. ``obj.no_dep(x)``
-        on a user-defined object is left in place so the parser surfaces a
-        normal-call error path instead of silently stripping the wrapper.
-
-        A trailing ``pl.no_dep`` with multiple args or any keyword is NOT a
-        valid wrapper and is left in place; the parser will hit it later
-        as a normal call and surface a clear error.
+        Selective tensor dump is *not* a call-arg wrapper: the only dump
+        surfaces are the declarative ``pl.dump_tag(t)`` statement and the
+        explicit ``dumps=[...]`` kwarg on ``pl.submit(...)`` / ``pl.at(...)``.
+        A wrapper with multiple args or any keyword is not recognized and is
+        left in place (the parser hits it later as a normal call and surfaces a
+        clear error).
         """
         unwrapped: list[ast.expr] = []
-        indices: list[int] = []
+        no_dep_indices: list[int] = []
         for i, raw in enumerate(arg_nodes):
-            if (
-                isinstance(raw, ast.Call)
-                and len(raw.args) == 1
-                and not raw.keywords
-                and (
-                    (
-                        isinstance(raw.func, ast.Attribute)
-                        and raw.func.attr == "no_dep"
-                        and isinstance(raw.func.value, ast.Name)
-                        and raw.func.value.id == "pl"
-                    )
-                    or (isinstance(raw.func, ast.Name) and raw.func.id == "no_dep")
-                )
-            ):
-                unwrapped.append(raw.args[0])
-                indices.append(i)
-            else:
-                unwrapped.append(raw)
-        return unwrapped, indices
+            node = raw
+            saw_no_dep = False
+            while True:
+                inner = cls._match_call_arg_marker(node, "no_dep")
+                if inner is not None:
+                    saw_no_dep = True
+                    node = inner
+                    continue
+                break
+            unwrapped.append(node)
+            if saw_no_dep:
+                no_dep_indices.append(i)
+        return unwrapped, no_dep_indices
 
     @staticmethod
     def _reject_keyword_args(
@@ -5149,11 +5858,11 @@ class ASTParser:
                     f"'attrs=' on call to '{method_name}' must use string-literal keys",
                     span=self.span_tracker.get_span(key_node) if key_node else span,
                 )
-            if key_node.value not in {"arg_directions", "manual_dep_edges"}:
+            if key_node.value not in {"arg_directions", "manual_dep_edges", "dump_vars"}:
                 raise ParserSyntaxError(
                     f"Unsupported attrs key '{key_node.value}' on call to '{method_name}'",
                     span=self.span_tracker.get_span(key_node),
-                    hint="Only 'arg_directions' and 'manual_dep_edges' are currently recognized",
+                    hint="Only 'arg_directions', 'manual_dep_edges', 'dump_vars' are currently recognized",
                 )
         return attrs_kw.value
 
@@ -5239,6 +5948,60 @@ class ASTParser:
             deps_kw = ast.keyword(arg="deps", value=value_node)
             return self._parse_submit_deps_kwarg(method_name, [deps_kw], span)
         return None
+
+    def _extract_dump_vars_from_attrs(
+        self,
+        method_name: str,
+        args: list[ir.Expr],
+        keywords: list[ast.keyword],
+        span: ir.Span,
+    ) -> list[ir.Var]:
+        """Extract selective-dump targets from an ``attrs={"dump_vars": [...]}`` dict.
+
+        This is the machine-only round-trip surface for the Call's ``dump_vars``
+        attr: a plain ``self.kernel(...)`` exposes no user-facing ``dumps=``
+        kwarg (the dump targets are seeded by ``pl.dump_tag`` / scope ``dumps=``
+        and live in IR only), so the printer surfaces them inside the same
+        ``attrs={...}`` dict as ``arg_directions``. Each entry must be a bare
+        tensor variable that is a positional argument of this call (matched by
+        identity, same contract as the submit-side ``dumps=`` kwarg). Returns an
+        empty list when the key is absent.
+        """
+        attrs_dict = self._get_call_attrs_dict(method_name, keywords, span)
+        if attrs_dict is None:
+            return []
+        for key_node, value_node in zip(attrs_dict.keys, attrs_dict.values):
+            if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+                continue
+            if key_node.value != "dump_vars":
+                continue
+            if not isinstance(value_node, (ast.List, ast.Tuple)):
+                raise ParserTypeError(
+                    f"attrs['dump_vars'] on call to '{method_name}' must be a list literal",
+                    span=self.span_tracker.get_span(value_node),
+                )
+            result: list[ir.Var] = []
+            seen: set[int] = set()
+            for elt in value_node.elts:
+                elt_span = self.span_tracker.get_span(elt)
+                val = self.parse_expression(elt)
+                if not isinstance(val, ir.Var) or not isinstance(val.type, ir.TensorType):
+                    raise ParserTypeError(
+                        f"attrs['dump_vars'] entries on call to '{method_name}' must be tensor "
+                        f"variables — got '{ast.unparse(elt)}'",
+                        span=elt_span,
+                    )
+                if not any(val is a for a in args):
+                    raise ParserTypeError(
+                        f"attrs['dump_vars'] entry '{ast.unparse(elt)}' is not an argument of "
+                        f"call to '{method_name}'",
+                        span=elt_span,
+                    )
+                if id(val) not in seen:  # dedup by identity, matching _parse_at_dumps_kwarg
+                    seen.add(id(val))
+                    result.append(val)
+            return result
+        return []
 
     @staticmethod
     def _validate_call_arg_count(func_name: str, func: ir.Function, got: int, span: ir.Span) -> None:

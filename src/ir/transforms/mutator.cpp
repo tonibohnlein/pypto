@@ -351,7 +351,7 @@ ExprPtr IRMutator::VisitExpr_(const CallPtr& op) {
   bool attrs_changed = false;
   new_attrs.reserve(op->attrs_.size());
   for (const auto& [k, v] : op->attrs_) {
-    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
+    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (edges) {
         std::vector<VarPtr> new_edges;
@@ -428,17 +428,34 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
     }
   }
 
+  // Mutate core_num_ — an SPMD launch-spec Expr (pl.spmd_submit). It is a
+  // first-class field carrying an SSA value (ConstInt or closure Var), so
+  // substitution must rewrite it just like args_/deps_ (see
+  // .claude/rules/pass-submit-awareness.md, rule 2: deps_ / launch operands
+  // are part of the use-def chain).
+  std::optional<ExprPtr> new_core_num = op->core_num_;
+  bool core_num_changed = false;
+  if (op->core_num_.has_value()) {
+    INTERNAL_CHECK_SPAN(*op->core_num_, op->span_) << "Submit core_num is null";
+    auto remapped = ExprFunctor<ExprPtr>::VisitExpr(*op->core_num_);
+    INTERNAL_CHECK_SPAN(remapped, op->span_) << "Submit core_num mutated to null";
+    if (remapped.get() != op->core_num_->get()) {
+      new_core_num = remapped;
+      core_num_changed = true;
+    }
+  }
+
   auto new_type = RemapTypeViaVisitor(op->GetType());
   bool type_changed = (new_type.get() != op->GetType().get());
 
-  // Mutate Var-typed attrs (arg_direction_overrides_vars on Submit args).
-  // Note: kAttrManualDepEdges is intentionally NOT consulted on Submit — deps_
-  // is the source of truth (see .claude/rules/pass-submit-awareness.md).
+  // Mutate Var-typed attrs (arg_direction_overrides_vars / dump_vars on Submit
+  // args). Note: kAttrManualDepEdges is intentionally NOT consulted on Submit —
+  // deps_ is the source of truth (see .claude/rules/pass-submit-awareness.md).
   std::vector<std::pair<std::string, std::any>> new_attrs;
   bool attrs_changed = false;
   new_attrs.reserve(op->attrs_.size());
   for (const auto& [k, v] : op->attrs_) {
-    if (k == kAttrArgDirOverrideVars) {
+    if (k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (edges) {
         std::vector<VarPtr> new_edges;
@@ -475,7 +492,7 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
     new_attrs.emplace_back(k, v);
   }
 
-  if (!args_changed && !deps_changed && !type_changed && !attrs_changed) return op;
+  if (!args_changed && !deps_changed && !type_changed && !attrs_changed && !core_num_changed) return op;
   std::vector<std::pair<std::string, std::any>> attrs_to_use;
   if (attrs_changed) {
     attrs_to_use = std::move(new_attrs);
@@ -483,7 +500,8 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
     attrs_to_use = op->attrs_;
   }
   return std::make_shared<const Submit>(op->op_, std::move(new_args), std::move(new_deps), op->kwargs_,
-                                        std::move(attrs_to_use), std::move(new_type), op->span_);
+                                        std::move(attrs_to_use), std::move(new_type), op->span_,
+                                        std::move(new_core_num), op->sync_start_);
 }
 
 ExprPtr IRMutator::VisitExpr_(const MakeTuplePtr& op) {
@@ -883,7 +901,7 @@ std::pair<std::vector<std::pair<std::string, std::any>>, bool> IRMutator::Mutate
   new_attrs.reserve(attrs.size());
   bool any_changed = false;
   for (const auto& [k, v] : attrs) {
-    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
+    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (edges) {
         std::vector<VarPtr> new_edges;
@@ -989,10 +1007,16 @@ StmtPtr IRMutator::VisitStmt_(const SpmdScopeStmtPtr& op) {
   auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
   INTERNAL_CHECK_SPAN(new_body, op->span_) << "SpmdScopeStmt body mutated to null";
 
-  if (new_core_num.get() != op->core_num_.get() || new_body.get() != op->body_.get()) {
+  // Spmd scopes can carry kAttrTaskIdVar / kAttrManualDepEdges (the
+  // `with pl.spmd(...) as tid:` capture form), so substitute over the attr Vars
+  // just like the InCore / AutoInCore / Hierarchy handlers — otherwise a
+  // Var-substituting pass would leave the tid / dep edges pointing at stale Vars.
+  auto [new_attrs, attrs_changed] = MutateScopeAttrs(op->attrs_);
+  if (new_core_num.get() != op->core_num_.get() || new_body.get() != op->body_.get() || attrs_changed) {
     auto result = MutableCopy(op);
     result->core_num_ = std::move(new_core_num);
     result->body_ = std::move(new_body);
+    if (attrs_changed) result->attrs_ = std::move(new_attrs);
     return result;
   }
   return op;

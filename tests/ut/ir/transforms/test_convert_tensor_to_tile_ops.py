@@ -378,13 +378,15 @@ class TestConvertTensorToTileOps:
         )
         _assert_convert_equal(before, expected)
 
-    def test_transpose_emits_tile_create_plus_transpose(self):
-        """tensor.transpose lowers to tile.create + tile.transpose(input, axis1, axis2, tmp)."""
+    def test_transpose_emits_tile_transpose(self):
+        """tensor.transpose lowers to a 3-arg tile.transpose(input, axis1, axis2).
+
+        The pto.ttrans scratch is materialized later by FlattenTileNdTo2D, not here.
+        """
         in_specs: list[InSpec] = [("x", [32, 64], DataType.FP16)]
 
         def expected_body(ib, tiles):
-            tmp = ib.let("transpose_tmp", tile_ops.create([32, 64], DataType.FP16))
-            return ib.let("y_tile", tile_ops.transpose(tiles[0], 0, 1, tmp=tmp))
+            return ib.let("y_tile", tile_ops.transpose(tiles[0], 0, 1))
 
         before = _make_before(
             in_specs=in_specs,
@@ -590,6 +592,57 @@ class TestConvertTensorToTileOps:
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_dump_vars_attr_preserved_through_call_site_update(self):
+        """Regression: ``pl.dump_tag`` on an orchestration call must survive the
+        output-appending rewrite.
+
+        When the InCore callee gains a runtime-allocated ``Out`` param, the
+        call-site rewrite (``CallSiteUpdateMutator``) rebuilds the ``Call`` with
+        the extra arg. Previously it routed through a ``Call`` ctor that
+        default-inits ``attrs_`` to empty, silently dropping ``dump_vars`` so the
+        dumped tensor never reached the device manifest. The rewrite must copy
+        ``attrs_`` verbatim.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.FP32],
+                rhs: pl.Tensor[[128, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                result: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(lhs, rhs)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.FP32],
+                rhs: pl.Tensor[[128, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                pl.dump_tag(lhs)
+                result: pl.Tensor[[16, 64], pl.FP32] = self.main_incore_0(lhs, rhs)
+                return result
+
+        # Sanity: the dump tag rides the orchestration call before the pass.
+        before_main = Before.get_function("main")
+        assert before_main is not None
+        before_call = _find_first_call_to(before_main, "main_incore_0")
+        assert before_call is not None
+        assert {v.name_hint for v in before_call.attrs["dump_vars"]} == {"lhs"}
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+
+        # The call gains the ``ret0__out`` arg, but its dump_vars attr must
+        # survive the rewrite.
+        after_main = After.get_function("main")
+        assert after_main is not None
+        after_call = _find_first_call_to(after_main, "main_incore_0")
+        assert after_call is not None
+        assert "dump_vars" in after_call.attrs
+        assert {v.name_hint for v in after_call.attrs["dump_vars"]} == {"lhs"}
 
     def test_matmul_nd_dispatches_to_batch_matmul(self):
         """tensor.matmul with any operand of rank > 2 must lower to tile.batch_matmul.
@@ -2033,6 +2086,9 @@ class TestScatterUpdateConversion:
                 result: pl.Tensor[[16, 64], pl.FP16] = self.main_incore_0(index, src)
                 return result
 
+        # NOTE: bypass tracks a known pass bug — ConvertTensorToTileOps scatter_update
+        # emits tile.cast without the declared `mode` attr (op_conversion_registry.cpp),
+        # which fails the print->parse roundtrip. Remove NONE once the pass is fixed.
         with passes.PassContext([], passes.VerificationLevel.NONE):
             After = passes.convert_tensor_to_tile_ops()(Before)
         text = ir.python_print(After)
@@ -2068,8 +2124,7 @@ class TestScatterUpdateConversion:
                 return result
 
         with pytest.raises(Exception, match="i16 flat-index limit"):
-            with passes.PassContext([], passes.VerificationLevel.NONE):
-                passes.convert_tensor_to_tile_ops()(Before)
+            passes.convert_tensor_to_tile_ops()(Before)
 
     def test_scatter_update_rejects_4d(self):
         """4D input type-checks but is not yet lowered — must raise a clear user error, not crash."""
@@ -2096,8 +2151,7 @@ class TestScatterUpdateConversion:
                 return result
 
         with pytest.raises(Exception, match="only 2D input/src is currently supported"):
-            with passes.PassContext([], passes.VerificationLevel.NONE):
-                passes.convert_tensor_to_tile_ops()(Before)
+            passes.convert_tensor_to_tile_ops()(Before)
 
 
 class TestTensorFullConversion:
@@ -2850,8 +2904,7 @@ class TestSubmitCallSiteUpdate:
                     a, a_tid = pl.submit(self.kernel, x, ret0__out)
                 return a
 
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            After = passes.convert_tensor_to_tile_ops()(Before)
+        After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
 
 

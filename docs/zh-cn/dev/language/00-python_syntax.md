@@ -338,10 +338,12 @@ for (x,) in pl.while_(init_values=(x_init,)):
 
 #### `pl.spmd` 多 block 派发
 
-`pl.spmd(N)` 把一个 kernel 派发到 `N` 个 block。两种形式：
+`pl.spmd(N)` 把一个 kernel 派发到 `N` 个 block。形式：
 
 - `with pl.spmd(N): kernel(...)` —— body 必须是对一个已声明 InCore kernel 的单次调用。
 - `for i in pl.spmd(N): ...` —— 循环变量绑定到每个 block 的索引（`pl.tile.get_block_idx()`）；body 自动外包成一段隐式 InCore 区域。
+- `with pl.spmd(N, deps=[...]) as tid: ...` —— **捕获形式**：与 `with pl.at(...) as tid:` 对称。在 `tid` 中捕获该分发的 grid 级 producer `pl.Scalar[pl.TASK_ID]`（可用作 `deps=` 边、存入 `pl.array.create(N, pl.TASK_ID)`、或跨入 `pl.manual_scope`），并像 for-form 一样接受内联多语句 body（在 body 内通过 `pl.tile.get_block_idx()` 读取每个 block 的索引）。lower 成一个 `ir.Submit`，其尾部 tuple 元素即 grid TaskId；`core_num` / `sync_start` 记录在外包出的 `Spmd` Function attrs 上。参见下文“手动依赖原语”小节。
+- `out, tid = pl.spmd_submit(kernel, *args, core_num=N)` —— **submit 形式**：将 kernel 在 `N` 个 block 上分发，同时捕获该分发的 producer `pl.Scalar[pl.TASK_ID]`（针对已声明 kernel 的 `pl.submit` 版本）。参见下文“手动依赖原语”小节。
 
 可选 `optimizations=[pl.split(MODE)]`（**不支持** `pl.auto_chunk`；chunk 循环请在内层使用 `pl.at(..., optimizations=[pl.auto_chunk])`）：
 
@@ -380,7 +382,9 @@ DSL 暴露**两套正交的机制**，用户可任意组合：
 | 表层语法 | producer 形态 | 备注 |
 | -------- | ------------- | ---- |
 | `result, tid = pl.submit(kernel, *args, deps=[...])` | 单个 kernel 调用 | 尾部 `tid` 是 producer `pl.Scalar[pl.TASK_ID]`。它是 parser construct（类似 `pl.range`），不是 runtime 函数。 |
+| `result, tid = pl.spmd_submit(kernel, *args, core_num=N, sync_start=False, deps=[...])` | 单个 SPMD task launch | `pl.submit` 的 SPMD 版本：将 kernel 在 `N` 个 block 上分发（一个 orchestration task → 一个 `tid`）。`core_num` 是必填关键字参数（正整数表达式）；`sync_start=True` 强制所有 block 原子启动。callee 可以是 InCore / AIC / AIV / Group。launch spec 记录在 `Submit.core_num` / `Submit.sync_start` 上。 |
 | `with pl.at(level=pl.Level.CORE_GROUP, deps=[...]) as tid:` | outlined `pl.at`-块 | 整块被 outline 成 InCore kernel + Call；`tid` 捕获被合成的 Call 的 TaskId，可作为后续 `pl.submit` / `pl.at` 的 dep。 |
+| `with pl.spmd(N, deps=[...]) as tid:` | outlined SPMD 分发 | `pl.at ... as tid` 形式的 SPMD 版本。内联 body 自动外包成 InCore kernel 并在 `N` 个 block 上分发；`tid` 捕获 grid 级 producer TaskId。`deps=` 仅在带 `as tid` 时可用。`core_num` / `sync_start` 记录在外包出的 `Spmd` Function attrs 上（lower 出的 `Submit.core_num` 为 `None`）；codegen 通过 launch-function 回退读取。不能嵌套在 `pl.cluster()` 内。 |
 | `barrier = pl.system.task_dummy(deps=[...])` | dependency-only barrier | 不提交 kernel。返回的 TaskId 是一个紧凑的 fan-in 点，可供后续 `deps=[barrier]` 使用。 |
 | `None`（Python 字面量） | 种子 / dep 条目 | "暂无 producer" 的哨兵。`prev_tid = None` 用作 TaskId 循环 iter_arg 的种子；`deps=[None]` 中的 `None` 被丢弃（不贡献任何边）。下沉为 `system.task_invalid` → `PTO2TaskId::invalid()`。 |
 
@@ -523,13 +527,15 @@ def func(x: pl.Tensor[[128, 64], pl.FP16]) -> pl.Tensor[[128, 64], pl.FP16]:
 | ---- | ---- | ------ |
 | `pl.static_print(*args)` | 将变量类型/值打印到 stdout | 需要 ≥1 个参数 |
 | `pl.static_assert(cond, msg="")` | 断言编译期条件 | 抛出 `ParserError` |
+| `pl.dump_tag(tensor)` | 把某个张量标记为运行期选择性 dump 的目标 —— 声明式逐张量标记（在 Orchestration 作用域，或被 orch 内联的 Inline helper 中均可使用 —— 见 [运行期 DFX](../03-runtime-dfx.md#选择性张量-dump)） | 在非 Orchestration / Inline 函数中使用、或参数不是裸变量名时抛出 `ParserSyntaxError` |
 
 **要点：**
 
-- 两者均为语句级构造（不能用在表达式中）
+- 三者均为语句级构造（不能用在表达式中）
 - `static_print` 接受变量、常量、字符串标签（原样打印）和 f-string 的简单 `{expr}` 占位符（格式化为 IR）。不支持转换标志（`!r`、`!s`、`!a`）和格式说明符（`:...`）。
 - `static_assert` 支持闭包变量表达式（如 `N > 32`）和 IR 常量
 - `static_assert` 的消息参数必须是字符串字面量
+- `dump_tag` 接受单个绑定在外层 Orchestration（或 Inline）作用域内的张量变量名，在解析期被消耗，并自始至终以 Var 身份（而非名字）跟踪到 codegen。在显式 `self.kernel(...)` 调用点，它把该张量记录到每个后续消费它的 Call 的 `dump_vars` 上；在 `@pl.jit` / `with pl.at(level=...)` 风格（派发由 outline pass 合成）下，它改为写入所在 scope 的 `dump_vars`，再由 outliner 映射到合成派发的实参上（见 [运行期 DFX](../03-runtime-dfx.md#选择性张量-dump)）。若需要在单次 task 启动处显式列出 dump 目标，请用 `pl.submit(...)` / `pl.at(...)` 上的 `dumps=[...]` kwarg（与 `deps=` 对称）
 - 即使后续解析失败，输出仍会显示——适用于调试解析错误
 
 ### 语句序列

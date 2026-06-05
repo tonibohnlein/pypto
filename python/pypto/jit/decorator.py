@@ -59,7 +59,7 @@ import os
 import re
 import shutil
 import textwrap
-from typing import Any
+from typing import Any, NamedTuple
 
 from pypto.pypto_core import DataType
 
@@ -340,7 +340,7 @@ def _compute_per_func_dyndim_maps(
     entry_param_names: list[str],
     deps: list[Any],
     callers_by_dep_id: dict[int, list[Any]],
-    call_args_cache: dict[tuple[int, str], list[tuple[str | None, str | None]] | None],
+    call_args_cache: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
 ) -> dict[int, dict[str, dict[int, DynDim]]]:
     """Per JIT function in the dep graph, return ``param → dim_idx → DynDim``.
 
@@ -382,7 +382,10 @@ def _compute_per_func_dyndim_maps(
                 continue
             for dep_param, dim_to_dyn in dep_map.items():
                 caller_arg = param_mapping.get(dep_param)
-                if caller_arg is None:
+                # A per-rank sliced arg (x[r]) is keyed by a _SlicedArg, not a
+                # caller variable name; DynDim does not flow through the dropped
+                # leading dim, so skip it here.
+                if caller_arg is None or isinstance(caller_arg, _SlicedArg):
                     continue
                 target = caller_map.setdefault(caller_arg, {})
                 for i, dyn in dim_to_dyn.items():
@@ -705,20 +708,34 @@ def _extract_local_tensor_metas(
             dims.append(v)
         return tuple(dims)
 
-    def _create_tensor_meta(call: ast.Call) -> TensorMeta | None:
-        shape = _resolve_shape(call.args[0]) if call.args else None
-        if shape is None:
-            return None
+    def _dtype_from_kw(call: ast.Call) -> DataType | None:
         for kw in call.keywords:
             if (
                 kw.arg == "dtype"
                 and isinstance(kw.value, ast.Attribute)
                 and isinstance(kw.value.value, ast.Name)
             ):
-                dtype_val = dtype_map.get(kw.value.attr)
-                if dtype_val is not None:
-                    return TensorMeta(shape=shape, dtype=dtype_val)
+                return dtype_map.get(kw.value.attr)
         return None
+
+    def _create_tensor_meta(call: ast.Call) -> TensorMeta | None:
+        shape = _resolve_shape(call.args[0]) if call.args else None
+        dtype_val = _dtype_from_kw(call)
+        if shape is None or dtype_val is None:
+            return None
+        return TensorMeta(shape=shape, dtype=dtype_val)
+
+    def _window_meta(call: ast.Call) -> TensorMeta | None:
+        # pld.window(buffer, [shape], dtype=pl.XXX) — a distributed window view
+        # over a window buffer. Shape is the 2nd positional arg; dtype is the
+        # ``dtype=`` keyword (same spelling as create_tensor). Lets a host
+        # orchestrator's per-rank window locals propagate their meta into the
+        # ``pld.DistributedTensor`` parameters of the chip orchestrator it calls.
+        shape = _resolve_shape(call.args[1]) if len(call.args) >= 2 else None
+        dtype_val = _dtype_from_kw(call)
+        if shape is None or dtype_val is None:
+            return None
+        return TensorMeta(shape=shape, dtype=dtype_val)
 
     def _slice_meta(call: ast.Call) -> TensorMeta | None:
         # pl.slice(tensor, shape, offset, ...) — shape is positional index 1 or kw `shape=`.
@@ -784,6 +801,11 @@ def _extract_local_tensor_metas(
                     if meta is not None:
                         local[target.id] = meta
                     continue
+                if fn.attr == "window":
+                    meta = _window_meta(call)
+                    if meta is not None:
+                        local[target.id] = meta
+                    continue
             if isinstance(fn, ast.Name) and fn.id in dep_io:
                 _record_dep_result_metas(call, fn.id, target)
 
@@ -791,17 +813,51 @@ def _extract_local_tensor_metas(
     return local
 
 
-def _extract_call_args_for_dep(entry_func: Any, dep_name: str) -> list[tuple[str | None, str | None]] | None:
-    """Find the argument names passed to ``dep_name`` in ``entry_func``'s body.
+class _SlicedArg(NamedTuple):
+    """A call-site argument of the form ``base[i]`` / ``base[i, j]`` that drops
+    one or more leading dims of a Name (the per-rank ``chip_orch(x[r], ...)``
+    dispatch pattern). ``drop`` counts the integer (non-slice) index elements;
+    the dep parameter inherits ``base``'s meta with those leading dims removed.
+    """
 
-    Returns a unified list of ``(param_name, arg_name)`` pairs:
+    base: str
+    drop: int
+
+
+def _arg_ref(arg: ast.expr) -> str | _SlicedArg | None:
+    """Caller-side reference for a call argument.
+
+    - ``ast.Name`` → the variable name (``str``).
+    - ``ast.Subscript`` of a Name with integer indices (``x[r]``, ``x[r, 0]``)
+      → a :class:`_SlicedArg` recording the base name and how many leading
+      dims the indexing drops. Slice indices (``x[r:r+1]``) keep their dim and
+      are not counted.
+    - anything else (literal, attribute, computed expr) → ``None``.
+    """
+    if isinstance(arg, ast.Name):
+        return arg.id
+    if isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name):
+        sl = arg.slice
+        elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+        drop = sum(1 for e in elts if not isinstance(e, ast.Slice))
+        if drop > 0:
+            return _SlicedArg(arg.value.id, drop)
+    return None
+
+
+def _extract_call_args_for_dep(
+    entry_func: Any, dep_name: str
+) -> list[tuple[str | None, str | _SlicedArg | None]] | None:
+    """Find the arguments passed to ``dep_name`` in ``entry_func``'s body.
+
+    Returns a unified list of ``(param_name, arg_ref)`` pairs:
 
     - ``param_name`` is ``None`` for a positional argument (the consumer
       pairs it with the dep's parameter list by index) and the keyword
       name for a keyword argument.
-    - ``arg_name`` is the caller-side variable name, or ``None`` for
-      non-``Name`` expressions (literals, attribute access, computed
-      expressions, …).
+    - ``arg_ref`` is the caller-side reference: a variable name (``str``), a
+      :class:`_SlicedArg` for a per-rank subscript (``x[r]``), or ``None`` for
+      other non-``Name`` expressions (literals, attribute access, …).
 
     Mixed calls like ``dep(a, out=out)`` are preserved correctly. Returns
     ``None`` if no call site to ``dep_name`` is found. Only the first call
@@ -813,11 +869,11 @@ def _extract_call_args_for_dep(entry_func: Any, dep_name: str) -> list[tuple[str
             continue
         if not (isinstance(node.func, ast.Name) and node.func.id == dep_name):
             continue
-        result: list[tuple[str | None, str | None]] = [
-            (None, arg.id if isinstance(arg, ast.Name) else None) for arg in node.args
+        result: list[tuple[str | None, str | _SlicedArg | None]] = [
+            (None, _arg_ref(arg)) for arg in node.args
         ]
         result.extend(
-            (kw.arg, kw.value.id if isinstance(kw.value, ast.Name) else None)
+            (kw.arg, _arg_ref(kw.value))
             for kw in node.keywords
             if kw.arg is not None  # skip **kwargs splats
         )
@@ -827,17 +883,18 @@ def _extract_call_args_for_dep(entry_func: Any, dep_name: str) -> list[tuple[str
 
 def _build_param_mapping(
     dep_param_names: list[str],
-    call_args: list[tuple[str | None, str | None]],
-) -> dict[str, str | None]:
-    """Map dep parameter name → caller argument name from call-site args.
+    call_args: list[tuple[str | None, str | _SlicedArg | None]],
+) -> dict[str, str | _SlicedArg | None]:
+    """Map dep parameter name → caller argument ref from call-site args.
 
     ``call_args`` is the unified form returned by
-    ``_extract_call_args_for_dep``: a list of ``(param_name, arg_name)``
+    ``_extract_call_args_for_dep``: a list of ``(param_name, arg_ref)``
     pairs where ``param_name is None`` marks a positional argument (paired
-    with ``dep_param_names`` by index) and a string is a keyword name.
+    with ``dep_param_names`` by index) and a string is a keyword name. The
+    ``arg_ref`` may be a name (``str``), a :class:`_SlicedArg`, or ``None``.
     Mixed positional + keyword call sites collapse to the same dict.
     """
-    mapping: dict[str, str | None] = {}
+    mapping: dict[str, str | _SlicedArg | None] = {}
     pos_idx = 0
     for param_name, arg_name in call_args:
         if param_name is None:
@@ -894,6 +951,17 @@ def _resolve_dep_call_metadata(
     if call_args is not None:
         for dep_param, caller_arg in _build_param_mapping(dep_param_names, call_args).items():
             if caller_arg is None:
+                continue
+            if isinstance(caller_arg, _SlicedArg):
+                # Per-rank dispatch ``chip_orch(x[r], ...)``: the dep parameter
+                # inherits the base tensor's meta with ``drop`` leading dims
+                # removed (the subscripted dims selected by integer indices).
+                base_meta = all_tensor_meta.get(caller_arg.base)
+                if base_meta is not None and caller_arg.drop < len(base_meta.shape):
+                    dep_tensor_meta[dep_param] = TensorMeta(
+                        shape=base_meta.shape[caller_arg.drop :],
+                        dtype=base_meta.dtype,
+                    )
                 continue
             if caller_arg in all_tensor_meta:
                 dep_tensor_meta[dep_param] = all_tensor_meta[caller_arg]
@@ -958,6 +1026,13 @@ def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
 
     ``output_dir`` is forwarded only when set, so an unset value defers to
     ``ir.compile()``'s own default.
+
+    ``distributed_config`` is likewise forwarded only when set. When supplied it
+    makes ``ir.compile()`` emit a ``DistributedCompiledProgram`` (HOST-level
+    ``@pl.jit.host`` kernels), which ``__call__`` then dispatches per-rank. An
+    unset value defers to ``ir.compile()``'s default (a single-chip
+    ``CompiledProgram``) and keeps it out of the cache key for non-distributed
+    callers.
     """
     kwargs: dict[str, Any] = {
         "strategy": run_config.strategy,
@@ -968,6 +1043,8 @@ def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
     }
     if run_config.save_kernels_dir is not None:
         kwargs["output_dir"] = run_config.save_kernels_dir
+    if run_config.distributed_config is not None:
+        kwargs["distributed_config"] = run_config.distributed_config
     return kwargs
 
 
@@ -985,10 +1062,19 @@ class JITFunction:
             ``'host'`` is the HOST-level orchestrator produced by
             ``@pl.jit.host`` — it owns ``pld.alloc_window_buffer`` /
             ``pld.window`` / ``pld.world_size()`` and the per-rank
-            ``device=`` dispatch loop. End-to-end runtime dispatch for a
-            ``'host'`` entry needs a ``distributed_config`` plumbed through
-            :meth:`_compile`; that wiring is tracked as follow-up work.
+            ``device=`` dispatch loop. End-to-end runtime dispatch works when
+            the caller supplies ``config=RunConfig(distributed_config=...)``:
+            the config is forwarded through :meth:`_compile` → ``ir.compile()``
+            (see :func:`_run_config_compile_kwargs`), which yields a
+            ``DistributedCompiledProgram`` that :meth:`__call__` dispatches
+            per-rank.
         _level: pl.Level or None.
+        _auto_scope: Whether the compiler auto-inserts AUTO runtime scopes
+            (PTO2_SCOPE) around the body and each for/if body. ``True`` by
+            default; set ``False`` via ``@pl.jit(auto_scope=False)`` /
+            ``@pl.jit.host(auto_scope=False)`` to place scopes by hand with
+            ``with pl.scope()``. Only meaningful for the Orchestration entry
+            and HOST orchestrator — sub-function kinds reject it.
         _dep_graph: Lazily-computed transitive JIT dep graph rooted here —
             ``(deps_topo, callers_by_dep_id, callees_by_func_id,
             call_args_cache)``.  ``None`` until first ``_get_dep_graph()``
@@ -1002,16 +1088,18 @@ class JITFunction:
         func: Any,
         func_type: str | None = None,
         level: Any = None,
+        auto_scope: bool = True,
     ) -> None:
         self._func = func
         self._func_type = func_type or "orchestration"
         self._level = level
+        self._auto_scope = auto_scope
         self._dep_graph: (
             tuple[
                 list[JITFunction],
                 dict[int, list[Any]],
                 dict[int, list[str]],
-                dict[tuple[int, str], list[tuple[str | None, str | None]] | None],
+                dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
             ]
             | None
         ) = None
@@ -1045,7 +1133,7 @@ class JITFunction:
         list[JITFunction],
         dict[int, list[Any]],
         dict[int, list[str]],
-        dict[tuple[int, str], list[tuple[str | None, str | None]] | None],
+        dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
     ]:
         """Return the transitive JIT dep graph rooted at this function.
 
@@ -1080,7 +1168,9 @@ class JITFunction:
             seen: set[int] = set()
             callers_by_dep_id: dict[int, list[Any]] = {}
             callees_by_func_id: dict[int, list[str]] = {}
-            call_args_cache: dict[tuple[int, str], list[tuple[str | None, str | None]] | None] = {}
+            call_args_cache: dict[
+                tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None
+            ] = {}
 
             def visit(func: Any, caller_func_type: str) -> None:
                 direct = _discover_deps(func, caller_func_type)
@@ -1244,6 +1334,10 @@ class JITFunction:
 
         platform = run_config.platform if run_config is not None else None
         strategy = run_config.strategy if run_config is not None else OptimizationStrategy.Default
+        # distributed_config is baked into the DistributedCompiledProgram and
+        # drives per-rank dispatch, so it must split the cache: two @pl.jit.host
+        # calls with different device_ids compile to distinct artifacts.
+        distributed_config = run_config.distributed_config if run_config is not None else None
         key = make_cache_key(
             source_hash=self._get_source_hash(),
             param_names=param_names,
@@ -1253,6 +1347,7 @@ class JITFunction:
             scalar_values=scalar_values,
             platform=platform,
             strategy=strategy,
+            distributed_config=distributed_config,
         )
 
         # L1 cache lookup
@@ -1513,6 +1608,7 @@ class JITFunction:
                     scalar_values=dep_sv,
                     scalar_dtypes=dep_sd,
                     dep_names=callees_by_id[id(dep._func)],
+                    auto_scope=dep._auto_scope,
                 )
             )
         dep_contexts.reverse()
@@ -1526,6 +1622,7 @@ class JITFunction:
             scalar_values=scalar_values,
             scalar_dtypes=scalar_dtypes,
             dep_names=callees_by_id[id(self._func)],
+            auto_scope=self._auto_scope,
         )
         return dep_contexts + [entry_ctx]
 
@@ -1653,6 +1750,11 @@ def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[J
 # _JITDecorator — supports @jit, @jit.incore, @jit.incore(level=...)
 # ---------------------------------------------------------------------------
 
+# Sentinel distinguishing "auto_scope= was not passed" from an explicit value.
+# Lets sub-decorators that don't support the kwarg reject ANY explicit
+# auto_scope= (including auto_scope=True), not just non-True values.
+_AUTO_SCOPE_UNSET: Any = object()
+
 
 class _SubFunctionDecorator:
     """Sub-decorator factory for ``@jit.<kind>`` (host / incore / inline / opaque).
@@ -1670,16 +1772,26 @@ class _SubFunctionDecorator:
         orchestration loops and ``pl.at`` scopes).
     """
 
-    def __init__(self, func_type: str, *, allow_level: bool) -> None:
+    def __init__(self, func_type: str, *, allow_level: bool, allow_auto_scope: bool = False) -> None:
         self._func_type = func_type
         self._allow_level = allow_level
+        self._allow_auto_scope = allow_auto_scope
 
-    def __call__(self, func: Any = None, *, level: Any = None) -> Any:
+    def __call__(self, func: Any = None, *, level: Any = None, auto_scope: Any = _AUTO_SCOPE_UNSET) -> Any:
         if level is not None and not self._allow_level:
             raise TypeError(f"@pl.jit.{self._func_type} does not accept a level= argument")
+        if auto_scope is not _AUTO_SCOPE_UNSET and not self._allow_auto_scope:
+            raise TypeError(
+                f"@pl.jit.{self._func_type} does not accept an auto_scope= argument "
+                "(auto_scope is only meaningful for the Orchestration entry and the "
+                "HOST orchestrator)"
+            )
+        resolved_auto_scope = True if auto_scope is _AUTO_SCOPE_UNSET else auto_scope
         if func is None:
-            return lambda f: JITFunction(f, func_type=self._func_type, level=level)
-        return JITFunction(func, func_type=self._func_type, level=None)
+            return lambda f: JITFunction(
+                f, func_type=self._func_type, level=level, auto_scope=resolved_auto_scope
+            )
+        return JITFunction(func, func_type=self._func_type, level=None, auto_scope=resolved_auto_scope)
 
 
 class _JITDecorator:
@@ -1703,14 +1815,22 @@ class _JITDecorator:
     """
 
     def __init__(self) -> None:
-        self.host = _SubFunctionDecorator("host", allow_level=False)
+        self.host = _SubFunctionDecorator("host", allow_level=False, allow_auto_scope=True)
         self.incore = _SubFunctionDecorator("incore", allow_level=True)
         self.inline = _SubFunctionDecorator("inline", allow_level=False)
         self.opaque = _SubFunctionDecorator("opaque", allow_level=False)
 
-    def __call__(self, func: Any) -> JITFunction:
-        """Decorate an entry-point JIT function (Orchestration)."""
-        return JITFunction(func, func_type="orchestration", level=None)
+    def __call__(self, func: Any = None, *, auto_scope: bool = True) -> Any:
+        """Decorate an entry-point JIT function (Orchestration).
+
+        Supports both the bare ``@pl.jit`` form and the parenthesized
+        ``@pl.jit(auto_scope=False)`` form. Setting ``auto_scope=False`` opts
+        out of compiler-inserted AUTO runtime scopes so the body can place
+        them by hand with ``with pl.scope()``.
+        """
+        if func is None:
+            return lambda f: JITFunction(f, func_type="orchestration", level=None, auto_scope=auto_scope)
+        return JITFunction(func, func_type="orchestration", level=None, auto_scope=auto_scope)
 
 
 # Singleton decorator object exposed as ``pl.jit``

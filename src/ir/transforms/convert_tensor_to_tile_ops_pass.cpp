@@ -749,11 +749,17 @@ ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   if (op_name == "tensor.assemble" && !call->args_.empty()) {
     return call->args_[0];
   }
+  // pld.tile.remote_store(src_tile, target, peer, offsets): the cross-rank write
+  // lands in `target` (args_[1]). Recognising it here lets the enclosing window
+  // param be upgraded from In to Out/InOut so a later reader gets a RAW edge.
+  if (op_name == "pld.tile.remote_store" && call->args_.size() >= 2) {
+    return call->args_[1];
+  }
   return nullptr;
 }
 
 void UpdateTensorAliasOrigin(const VarPtr& var, const ParamOrigins& origins, AliasOriginMap& origin_map) {
-  if (As<TensorType>(var->GetType()) && !origins.empty()) {
+  if (AsTensorTypeLike(var->GetType()) && !origins.empty()) {
     origin_map[var.get()] = origins;
   } else {
     origin_map.erase(var.get());
@@ -854,6 +860,21 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     return;
   }
 
+  if (op_name == "pld.tile.remote_store") {
+    // remote_store(src_tile, target, peer, offsets): src_tile/peer/offsets read,
+    // target (args_[1]) written. Mirrors the tile.store handling above.
+    if (!call->args_.empty()) {
+      MarkAccess(CollectReferencedOrigins(call->args_[0], origin_map), has_read);
+    }
+    for (size_t i = 2; i < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    if (auto write_target = GetWriteTargetExpr(call)) {
+      MarkAccess(GetAliasOrigins(write_target, origin_map), has_write);
+    }
+    return;
+  }
+
   if (op_name == "tensor.write") {
     for (size_t i = 1; i < call->args_.size(); ++i) {
       MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
@@ -927,7 +948,7 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
       AnalyzeCallAccess(call, origin_map, has_read, has_write);
     }
 
-    if (As<TensorType>(assign->var_->GetType())) {
+    if (AsTensorTypeLike(assign->var_->GetType())) {
       auto origins = GetAliasOrigins(assign->value_, origin_map);
       UpdateTensorAliasOrigin(assign->var_, origins, origin_map);
     }
@@ -1037,7 +1058,7 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
       if (origins.empty() && i < init_origins.size()) {
         origins = init_origins[i];
       }
-      if (As<TensorType>(while_stmt->return_vars_[i]->GetType()) && !origins.empty()) {
+      if (AsTensorTypeLike(while_stmt->return_vars_[i]->GetType()) && !origins.empty()) {
         origin_map[while_stmt->return_vars_[i].get()] = origins;
       } else {
         origin_map.erase(while_stmt->return_vars_[i].get());
@@ -1067,7 +1088,9 @@ void UpgradeWrittenTensorParamDirections(const std::vector<StmtPtr>& stmts, cons
   AliasOriginMap origin_map;
 
   for (size_t i = 0; i < params.size() && i < param_directions.size(); ++i) {
-    if (!As<TensorType>(params[i]->GetType())) {
+    // AsTensorTypeLike also seeds DistributedTensorType window params, so a
+    // pld.tile.remote_store into such a param is attributed as a write below.
+    if (!AsTensorTypeLike(params[i]->GetType())) {
       continue;
     }
     origin_map[params[i].get()] = ParamOrigins{i};
@@ -1477,9 +1500,14 @@ class WrapperForwardMutator : public TypePropagatingMutator {
       new_return_type = std::make_shared<TupleType>(incore_func->return_types_);
     }
 
-    auto new_call = new_return_type ? std::make_shared<Call>(call->op_, new_args, call->kwargs_,
-                                                             new_return_type, call->span_)
-                                    : std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->span_);
+    // Preserve the original call's attrs_ (e.g. kAttrDumpVars from
+    // pl.dump_tag / dumps=) through the arg-appending rewrite — mirrors the
+    // base IRMutator and the Submit path below. The appended outputs do not
+    // rename existing arg Vars, so a verbatim attr copy keeps any dump/dep Var
+    // references valid. Fall back to UnknownType for a void-return callee so the
+    // rewritten Call's type_ stays identical to the prior 4-arg ctor path.
+    auto new_call = std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->attrs_,
+                                           new_return_type ? new_return_type : GetUnknownType(), call->span_);
 
     auto new_assign_var = std::make_shared<Var>(op->var_->name_hint_, new_return_type, op->var_->span_);
     std::shared_ptr<AssignStmt> new_assign = MutableCopy(op);
@@ -1644,12 +1672,13 @@ class CallSiteUpdateMutator : public TypePropagatingMutator {
       new_return_type = std::make_shared<TupleType>(incore_func->return_types_);
     }
 
-    std::shared_ptr<Call> new_call;
-    if (new_return_type) {
-      new_call = std::make_shared<Call>(call->op_, new_args, call->kwargs_, new_return_type, call->span_);
-    } else {
-      new_call = std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->span_);
-    }
+    // Preserve attrs_ (e.g. kAttrDumpVars) through the arg-appending rewrite —
+    // mirrors the base IRMutator and the Submit path below. Appended outputs do
+    // not rename existing arg Vars, so a verbatim attr copy stays valid. Fall
+    // back to UnknownType for a void-return callee so the rewritten Call's type_
+    // stays identical to the prior 4-arg ctor path.
+    auto new_call = std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->attrs_,
+                                           new_return_type ? new_return_type : GetUnknownType(), call->span_);
 
     auto new_assign_var = std::make_shared<Var>(op->var_->name_hint_, new_return_type, op->var_->span_);
     auto new_assign = MutableCopy(op);
@@ -1703,9 +1732,9 @@ class CallSiteUpdateMutator : public TypePropagatingMutator {
     new_args.insert(new_args.end(), extra_args.begin(), extra_args.end());
 
     // Note: 7-arg Submit ctor order is (op, args, deps, kwargs, attrs, type, span).
-    auto new_submit =
-        std::make_shared<Submit>(submit->op_, std::move(new_args), submit->deps_, submit->kwargs_,
-                                 submit->attrs_, submit->GetType(), submit->span_);
+    auto new_submit = std::make_shared<Submit>(submit->op_, std::move(new_args), submit->deps_,
+                                               submit->kwargs_, submit->attrs_, submit->GetType(),
+                                               submit->span_, submit->core_num_, submit->sync_start_);
     auto new_assign = MutableCopy(op);
     new_assign->value_ = new_submit;
     stmts.push_back(std::move(new_assign));

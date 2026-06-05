@@ -131,13 +131,23 @@ static std::string MakePartitionTensorViewType(const std::vector<std::string>& d
   return oss.str();
 }
 
-// Convert expressions to MLIR operand strings.
-static std::vector<std::string> GetExprCodes(const std::vector<ir::ExprPtr>& exprs,
-                                             codegen::PTOCodegen& codegen) {
+// Coerce each offset operand to `index`. A
+// pto.partition_view offset MUST be `index`; a bare i32 offset (e.g. a
+// data-dependent row from a scalar param or pl.read) would otherwise reach
+// PTOAS as i32 and fail type unification ('index' vs 'i32'). ConstInts are
+// emitted as index constants; loop vars are already index (EmitCastToIndex is
+// a no-op). Used for every pto.partition_view offset (load/store/remote_store/
+// notify/wait/put), so all paths coerce offsets identically.
+static std::vector<std::string> GetIndexOffsetCodes(const std::vector<ir::ExprPtr>& exprs,
+                                                    codegen::PTOCodegen& codegen) {
   std::vector<std::string> codes;
   codes.reserve(exprs.size());
   for (const auto& expr : exprs) {
-    codes.push_back(codegen.GetExprAsCode(expr));
+    if (auto ci = As<ir::ConstInt>(expr)) {
+      codes.push_back(codegen.GetOrEmitConstant(ci->value_, DataType::INDEX));
+    } else {
+      codes.push_back(codegen.EmitCastToIndex(expr, codegen.GetExprAsCode(expr)));
+    }
   }
   return codes;
 }
@@ -1212,9 +1222,9 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   const auto& offset_elems = offsets_tuple->elements_;
 
   std::string partition_type = MakePartitionTensorViewType(GetDimStrings(valid_elems), dtype_str);
-  std::string partition_view =
-      EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
-                           GetExprCodes(offset_elems, codegen), GetSizeCodes(valid_elems, codegen), codegen);
+  std::string partition_view = EmitPartitionViewPTO(
+      tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
+      GetIndexOffsetCodes(offset_elems, codegen), GetSizeCodes(valid_elems, codegen), codegen);
 
   std::ostringstream tload_line;
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
@@ -1280,7 +1290,7 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     const auto& offset_elems = offsets_tuple->elements_;
     partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
     partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
-                                          partition_type, GetExprCodes(offset_elems, codegen),
+                                          partition_type, GetIndexOffsetCodes(offset_elems, codegen),
                                           GetSizeCodes(shape_elems, codegen), codegen);
   } else {
     // Standard 1D/2D path
@@ -1288,9 +1298,9 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     if (auto h = As<ir::ConstInt>(valid_shape[0])) height_dim = std::to_string(h->value_);
     if (auto w = As<ir::ConstInt>(valid_shape[1])) width_dim = std::to_string(w->value_);
     partition_type = MakePartitionTensorViewType({height_dim, width_dim}, dtype_str);
-    partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
-                                          partition_type, GetExprCodes(offsets_tuple->elements_, codegen),
-                                          {height_code, width_code}, codegen);
+    partition_view = EmitPartitionViewPTO(
+        output_tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
+        GetIndexOffsetCodes(offsets_tuple->elements_, codegen), {height_code, width_code}, codegen);
   }
 
   std::ostringstream tstore_line;
@@ -1318,6 +1328,11 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     codegen.RegisterTensorView(result_var, tensor_view);
     codegen.RegisterVarToMlir(result_var, tensor_view);
     codegen.RegisterBasePtr(result_var, codegen.GetTensorBasePtr(output_tensor));
+    // SSA-capture form ``data = pl.store(local, [0, 0], data)`` rebinds the
+    // DistributedTensor LHS to a fresh Var; mirror the base-ptr alias so
+    // ``pld.tile.remote_load`` etc. on the rebound name resolve the same
+    // CommContext as the original source.
+    codegen.RegisterCommCtxFor(result_var, codegen.GetCommCtxSSAFor(output_tensor.get()));
   }
 
   return "";
@@ -1391,12 +1406,14 @@ static std::string MakeTileMscatterCodegenPTO(const CallPtr& op, codegen::Codege
   mscatter_line << ") outs(" << partition_view << " : " << partition_type << ")";
   codegen.Emit(mscatter_line.str());
 
-  // Propagate tensor_view to the result var so downstream ops see the updated tensor
+  // Propagate tensor_view, base-ptr, and CommContext aliases to the result var
+  // so downstream ops on an SSA-rebound DistributedTensor LHS still resolve.
   auto result_var = codegen.GetCurrentResultVar();
   if (result_var != nullptr) {
     codegen.RegisterTensorView(result_var, tensor_view);
     codegen.RegisterVarToMlir(result_var, tensor_view);
     codegen.RegisterBasePtr(result_var, codegen.GetTensorBasePtr(output_tensor));
+    codegen.RegisterCommCtxFor(result_var, codegen.GetCommCtxSSAFor(output_tensor.get()));
   }
 
   return "";
@@ -1590,6 +1607,7 @@ static std::string MakeTensorWriteCodegenPTO(const CallPtr& op, codegen::Codegen
     codegen.RegisterTensorView(result_var, tensor);
     codegen.RegisterVarToMlir(result_var, tensor);
     codegen.RegisterBasePtr(result_var, tensor);
+    codegen.RegisterCommCtxFor(result_var, codegen.GetCommCtxSSAFor(AsVarLike(op->args_[0]).get()));
   }
   return "";
 }
@@ -2170,22 +2188,6 @@ static const SimpleOpEntry kSimpleOps[] = {
 
 namespace {
 
-// Lower a tile-op offsets/shape MakeTuple to a vector of MLIR SSA strings (one
-// per dimension). Constants are materialised via GetOrEmitConstant; dynamic
-// dims fall back to GetExprAsCode + EmitCastToIndex when needed.
-std::vector<std::string> LowerTupleToIndexSSA(const ir::MakeTuplePtr& tuple, codegen::PTOCodegen& codegen) {
-  std::vector<std::string> ssa_names;
-  ssa_names.reserve(tuple->elements_.size());
-  for (const auto& elem : tuple->elements_) {
-    if (auto ci = As<ir::ConstInt>(elem)) {
-      ssa_names.push_back(codegen.GetOrEmitConstant(ci->value_, DataType::INDEX));
-    } else {
-      ssa_names.push_back(codegen.EmitCastToIndex(elem, codegen.GetExprAsCode(elem)));
-    }
-  }
-  return ssa_names;
-}
-
 // Resolve a DistributedTensor argument to its parameter Var + matching
 // CommContext SSA. The argument is expected to be a Var directly bound to a
 // function parameter (no aliasing); the verifier on remote_load / notify /
@@ -2205,7 +2207,14 @@ DistTensorBinding ResolveDistTensorBinding(const ExprPtr& arg, codegen::PTOCodeg
              << arg->TypeName();
   auto dist_type = As<ir::DistributedTensorType>(var->GetType());
   CHECK(dist_type) << op_name << " expects DistributedTensorType, got " << var->GetType()->TypeName();
-  std::string local_ptr = codegen.GetVarName(var);
+  // Resolve via the base-ptr alias mechanism rather than the raw ``var_to_mlir``
+  // binding. For a function parameter both return ``%argN`` (the ``!pto.ptr``);
+  // for an SSA-rebound Var (``data = pl.store(local, [0, 0], data)``) the
+  // store codegen rewrites ``var_to_mlir`` to the tensor-view alias but
+  // propagates the underlying base pointer via ``RegisterBasePtr`` —
+  // ``GetTensorBasePtr`` follows that alias and returns the original
+  // ``!pto.ptr`` SSA, which is what ``pto.addptr`` expects below.
+  std::string local_ptr = codegen.GetTensorBasePtr(var);
   std::string ctx_ssa = codegen.GetCommCtxSSAFor(var.get());
   CHECK(!ctx_ssa.empty()) << op_name << " requires a CommContext pointer arg threaded for DistributedTensor '"
                           << var->name_hint_ << "', but none was found in the function signature";
@@ -2356,7 +2365,7 @@ static std::string MakeRemoteLoadCodegenPTO(const CallPtr& op, codegen::CodegenB
   std::string partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
   std::string partition_view = EmitPartitionViewPTO(
       binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
-      LowerTupleToIndexSSA(offsets_tuple, codegen), GetSizeCodes(shape_elems, codegen), codegen);
+      GetIndexOffsetCodes(offsets_tuple->elements_, codegen), GetSizeCodes(shape_elems, codegen), codegen);
 
   std::string tile_buf = codegen.GetCurrentResultTarget();
   INTERNAL_CHECK_SPAN(!tile_buf.empty(), op->span_)
@@ -2425,9 +2434,9 @@ static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::Codegen
   append_dim(valid_shape[1]);
   const std::string partition_type = MakePartitionTensorViewType(dim_strs, dtype_str);
 
-  std::string partition_view =
-      EmitPartitionViewPTO(binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str,
-                           partition_type, LowerTupleToIndexSSA(offsets_tuple, codegen), size_codes, codegen);
+  std::string partition_view = EmitPartitionViewPTO(
+      binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
+      GetIndexOffsetCodes(offsets_tuple->elements_, codegen), size_codes, codegen);
 
   std::string tile_buf = codegen.GetVarName(src_tile);
   std::string tile_buf_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -2477,7 +2486,7 @@ static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase&
   std::string partition_type = MakePartitionTensorViewType(one_dims, dtype_str);
   std::string partition_view = EmitPartitionViewPTO(
       binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
-      LowerTupleToIndexSSA(offsets_tuple, codegen), one_size_ssa, codegen);
+      GetIndexOffsetCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
 
   // PTOAS contract: tnotify value's MLIR type must match the signal element
   // type. Emit using the value's own ScalarType — mismatched IR-level dtypes
@@ -2535,7 +2544,7 @@ static std::string MakeWaitCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
   std::string partition_type = MakePartitionTensorViewType(one_dims, dtype_str);
   std::string partition_view =
       EmitPartitionViewPTO(signal_var->name_hint_ + "_local", local_view, local_view_type, partition_type,
-                           LowerTupleToIndexSSA(offsets_tuple, codegen), one_size_ssa, codegen);
+                           GetIndexOffsetCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
 
   // PTOAS contract: twait expected value's MLIR type must match the signal
   // element type. Emit using the expected value's own ScalarType — see notify
@@ -2629,8 +2638,8 @@ static std::string MakePutCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
         << "pld.tile.put src_offsets rank must match tensor rank";
     INTERNAL_CHECK_SPAN(shape_tuple->elements_.size() == rank, op->span_)
         << "pld.tile.put shape rank must match tensor rank";
-    dst_offsets = GetExprCodes(dst_offsets_tuple->elements_, codegen);
-    src_offsets = GetExprCodes(src_offsets_tuple->elements_, codegen);
+    dst_offsets = GetIndexOffsetCodes(dst_offsets_tuple->elements_, codegen);
+    src_offsets = GetIndexOffsetCodes(src_offsets_tuple->elements_, codegen);
     transfer_shape = shape_tuple->elements_;
     size_ssa = GetSizeCodes(transfer_shape, codegen);
   }
@@ -3110,8 +3119,9 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
         return "";
       });
 
-  // ``pld.system.rank(ctx) -> i32``: low 32 bits of the (rankId, rankNum)
-  // u64 slot. Emits ``pto.load_scalar`` (via EmitLoadRankPair) + arith.trunci.
+  // ``pld.system.rank(ctx)``: IR ``ScalarType(INT32)``; MLIR type is ``i32``.
+  // ``i32`` (PTOAS rejects ``arith.trunci`` to ``ui32``). Low 32 bits of the
+  // (rankId, rankNum) u64 slot via ``pto.load_scalar`` + ``arith.trunci``.
   reg("pld.system.rank", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
     auto& cg = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
     CHECK(op->args_.size() == 1) << "pld.system.rank expects exactly 1 argument, got " << op->args_.size();
@@ -3123,7 +3133,8 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     return "";
   });
 
-  // ``pld.system.nranks(ctx) -> i32``: high 32 bits of the same slot —
+  // ``pld.system.nranks(ctx)``: same INT32 IR / i32 MLIR convention.
+  // High 32 bits of the same slot —
   // ``kRankNumOffset == kRankIdOffset + 4`` lets us shift the already-loaded
   // i64 right by 32 instead of issuing a second pto.load_scalar.
   reg("pld.system.nranks", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {

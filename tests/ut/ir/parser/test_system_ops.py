@@ -101,7 +101,7 @@ def test_rank_short_form():
     rank_calls = _find_calls_in_func(func, "pld.system.rank")
     assert len(rank_calls) == 1
     assert isinstance(rank_calls[0].type, ir.ScalarType)
-    assert rank_calls[0].type.dtype == DataType.UINT32
+    assert rank_calls[0].type.dtype == DataType.INT32
 
 
 def test_nranks_short_form():
@@ -116,7 +116,7 @@ def test_nranks_short_form():
     nranks_calls = _find_calls_in_func(func, "pld.system.nranks")
     assert len(nranks_calls) == 1
     assert isinstance(nranks_calls[0].type, ir.ScalarType)
-    assert nranks_calls[0].type.dtype == DataType.UINT32
+    assert nranks_calls[0].type.dtype == DataType.INT32
 
 
 def test_long_form_system_ops():

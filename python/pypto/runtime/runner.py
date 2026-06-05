@@ -32,7 +32,7 @@ from ctypes import _SimpleCData
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -42,6 +42,13 @@ from pypto.pypto_core import backend as _backend_core
 from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase
 
 from .device_tensor import DeviceTensor
+
+if TYPE_CHECKING:
+    # Imported under TYPE_CHECKING only: ``distributed_compiled_program`` already
+    # imports from ``pypto.runtime`` (``device_tensor``), so importing it eagerly
+    # here would risk a partially-initialised ``pypto.runtime`` package at import
+    # time. The field is plumbed through to ``ir.compile()`` lazily anyway.
+    from pypto.ir.distributed_compiled_program import DistributedConfig
 
 
 def _load_golden_from_data_dir(out_dir: Path, output_names: set[str]) -> dict[str, torch.Tensor] | None:
@@ -84,17 +91,28 @@ class RunConfig:
         pto_isa_commit: If set, pin the pto-isa clone to this specific git
             commit (hash or tag).  ``None`` means use the latest remote HEAD.
         enable_l2_swimlane: Capture per-task L2 perf records into
-            ``<work_dir>/dfx_outputs/l2_perf_records.json``. On onboard
+            ``<work_dir>/dfx_outputs/l2_swimlane_records.json``. On onboard
             platforms, ``swimlane_converter`` then produces
             ``merged_swimlane_*.json`` alongside it. Simulator platforms
-            (``*sim``) only emit ``l2_perf_records.json`` — the merged
+            (``*sim``) only emit ``l2_swimlane_records.json`` — the merged
             swimlane file is intentionally skipped because the simulator
             does not yet ship the task metadata the converter needs.
             Mirrors runtime's ``--enable-l2-swimlane`` flag.
-        enable_dump_tensor: Dump per-task tensor I/O into
+        enable_dump_tensor: Per-task tensor dump **level** written into
             ``<work_dir>/dfx_outputs/tensor_dump/``. Inspect with
             ``python -m simpler_setup.tools.dump_viewer``. Mirrors
-            ``--dump-tensor``.
+            ``--dump-tensor``:
+
+            * ``0`` / ``False`` — off (no dump).
+            * ``1`` / ``True`` — **partial**: only the tensors marked via the
+              DSL marker ``pl.dump_tag(t)`` (or ``pl.submit(..., dumps=[...])``).
+            * ``2`` — **full**: every task's tensor inputs and outputs.
+
+            Full dump on a large workload can saturate the host-side dump
+            collector (~42 MB/s drain rate) and get the AICPU killed by a STARS
+            op-execute timeout — prefer partial (level ``1``) plus
+            ``pl.dump_tag(t)`` to limit dump to specific tensors
+            (simpler#844 selective tensor dump).
         enable_pmu: AICore PMU event type. ``0`` disables collection;
             ``>0`` enables and selects the event (``2`` = PIPE_UTILIZATION,
             ``4`` = MEMORY — see ``runtime/docs/dfx/pmu-profiling.md``).
@@ -104,6 +122,11 @@ class RunConfig:
             ``<work_dir>/dfx_outputs/deps.json``. Render to HTML on demand
             via ``python -m simpler_setup.tools.deps_to_graph``. Mirrors
             ``--enable-dep-gen``.
+        enable_scope_stats: Capture per-scope heap / task_window / tensormap
+            ring-fill peaks into
+            ``<work_dir>/dfx_outputs/scope_stats/scope_stats.jsonl``. Render to
+            HTML on demand via ``runtime/tools/scope_stats_plot.py``. Mirrors
+            ``--enable-scope-stats``.
         compile_profiling: If ``True``, enable compile profiling that records
             per-stage wall-clock timings (parse, passes, codegen).
             Results are written to ``report/pipeline_profile.{txt,json}`` in
@@ -131,6 +154,17 @@ class RunConfig:
             counts.
         aicpu_thread_num: Optional per-invocation override of the AICPU
             thread count. Same precedence rules as ``block_dim``.
+        distributed_config: Optional L3 distributed-execution config, consumed
+            only on the ``@pl.jit`` path. When set, it is forwarded to
+            ``ir.compile()`` (via :func:`~pypto.jit.decorator._run_config_compile_kwargs`)
+            so a HOST-level ``@pl.jit.host`` kernel compiles to a
+            :class:`~pypto.ir.distributed_compiled_program.DistributedCompiledProgram`
+            and dispatches per-rank. ``None`` (default) compiles a regular
+            single-chip :class:`~pypto.ir.compiled_program.CompiledProgram`. The
+            ``@pl.program`` :func:`run` entry point does not read this field; it
+            forwards no compile-side overrides, so distributed ``@pl.program``
+            execution is driven by ``ir.compile(..., distributed_config=...)``
+            directly rather than through ``RunConfig``.
     """
 
     __test__ = False  # Not a pytest test class
@@ -147,15 +181,17 @@ class RunConfig:
     codegen_only: bool = False
     pto_isa_commit: str | None = None
     enable_l2_swimlane: bool = False
-    enable_dump_tensor: bool = False
+    enable_dump_tensor: int = 0  # 0=off, 1=partial (dump_tag-marked), 2=full
     enable_pmu: int = 0
     enable_dep_gen: bool = False
+    enable_scope_stats: bool = False
     compile_profiling: bool = False
     diagnostic_phase: DiagnosticPhase | None = None
     disabled_diagnostics: DiagnosticCheckSet | None = None
     golden_data_dir: str | None = None
     block_dim: int | None = None
     aicpu_thread_num: int | None = None
+    distributed_config: "DistributedConfig | None" = None
 
     def __post_init__(self) -> None:
         if self.platform not in ("a2a3sim", "a2a3", "a5sim", "a5"):
@@ -185,13 +221,17 @@ class RunConfig:
     def any_dfx_enabled(self) -> bool:
         """Return ``True`` when at least one DFX flag is enabled.
 
-        DFX (Design For X) covers the four runtime diagnostic sub-features
+        DFX (Design For X) covers the five runtime diagnostic sub-features
         carried on :class:`~simpler.task_interface.CallConfig`:
-        L2 swimlane, tensor dump, PMU and dep_gen. They are independent
-        toggles that share an output directory.
+        L2 swimlane, tensor dump, PMU, dep_gen and scope_stats. They are
+        independent toggles that share an output directory.
         """
         return (
-            self.enable_l2_swimlane or self.enable_dump_tensor or self.enable_pmu > 0 or self.enable_dep_gen
+            self.enable_l2_swimlane
+            or self.enable_dump_tensor > 0
+            or self.enable_pmu > 0
+            or self.enable_dep_gen
+            or self.enable_scope_stats
         )
 
 
@@ -342,13 +382,18 @@ class _DfxOpts:
     """
 
     enable_l2_swimlane: bool = False
-    enable_dump_tensor: bool = False
+    enable_dump_tensor: int = 0  # 0=off, 1=partial, 2=full
     enable_pmu: int = 0
     enable_dep_gen: bool = False
+    enable_scope_stats: bool = False
 
     def any(self) -> bool:
         return (
-            self.enable_l2_swimlane or self.enable_dump_tensor or self.enable_pmu > 0 or self.enable_dep_gen
+            self.enable_l2_swimlane
+            or self.enable_dump_tensor > 0
+            or self.enable_pmu > 0
+            or self.enable_dep_gen
+            or self.enable_scope_stats
         )
 
     @classmethod
@@ -358,6 +403,7 @@ class _DfxOpts:
             enable_dump_tensor=cfg.enable_dump_tensor,
             enable_pmu=cfg.enable_pmu,
             enable_dep_gen=cfg.enable_dep_gen,
+            enable_scope_stats=cfg.enable_scope_stats,
         )
 
 
@@ -457,6 +503,7 @@ def _build_call_config(
     cfg.enable_dump_tensor = run_config.enable_dump_tensor
     cfg.enable_pmu = run_config.enable_pmu
     cfg.enable_dep_gen = run_config.enable_dep_gen
+    cfg.enable_scope_stats = run_config.enable_scope_stats
     if dfx_dir is not None:
         cfg.output_prefix = str(dfx_dir)
     return cfg
@@ -535,6 +582,7 @@ def _execute_on_device(
         enable_dump_tensor=dfx.enable_dump_tensor,
         enable_pmu=dfx.enable_pmu,
         enable_dep_gen=dfx.enable_dep_gen,
+        enable_scope_stats=dfx.enable_scope_stats,
     )
 
     if dfx_dir is not None:
@@ -565,17 +613,17 @@ def _collect_dfx_artifacts(
     ``CallConfig.output_prefix`` passed at submit). Each branch below is
     independent and skips silently when its artefact is missing — a
     partial DFX run (e.g. only ``enable_dump_tensor``) must not crash on
-    the swimlane converter looking for ``l2_perf_records.json``.
+    the swimlane converter looking for ``l2_swimlane_records.json``.
     """
-    if dfx.enable_l2_swimlane and (dfx_dir / "l2_perf_records.json").exists():
+    if dfx.enable_l2_swimlane and (dfx_dir / "l2_swimlane_records.json").exists():
         # Swimlane conversion is onboard-only — the simulator produces
-        # ``l2_perf_records.json`` but does not yet ship the matching
+        # ``l2_swimlane_records.json`` but does not yet ship the matching
         # task metadata the converter expects.
         if not platform.endswith("sim"):
             _generate_swimlane(
                 dfx_dir.parent,
                 dfx_dir,
-                dfx_dir / "l2_perf_records.json",
+                dfx_dir / "l2_swimlane_records.json",
             )
         else:
             print(
@@ -599,17 +647,31 @@ def _collect_dfx_artifacts(
             f"  # --engine choices: dot | sfdp | fdp | neato | circo | twopi"
         )
 
-    if dfx.enable_dump_tensor and (dfx_dir / "tensor_dump" / "tensor_dump.json").exists():
+    if dfx.enable_dump_tensor > 0 and (dfx_dir / "tensor_dump" / "tensor_dump.json").exists():
         # ``dump_viewer`` is interactive; leave the artefact in place and
         # point the user at the inspection command.
         print(
             f"tensor_dump written to {dfx_dir / 'tensor_dump'} — inspect with: "
             f"python -m simpler_setup.tools.dump_viewer "
-            f"{dfx_dir / 'tensor_dump' / 'tensor_dump.json'}"
+            f"{dfx_dir / 'tensor_dump'}"
         )
 
     if dfx.enable_pmu > 0 and (dfx_dir / "pmu.csv").exists():
         print(f"PMU CSV written to: {dfx_dir / 'pmu.csv'}")
+
+    # scope_stats writes a ``scope_stats/`` subdir (sibling of the flat
+    # artefacts above), not a top-level file — the collector groups the
+    # JSONL alongside any future per-scope companions. ``scope_stats_plot``
+    # is an offline renderer; leave the JSONL in place and point the user
+    # at the HTML-report command rather than running Graphviz-style layout
+    # on the hot path.
+    scope_stats_jsonl = dfx_dir / "scope_stats" / "scope_stats.jsonl"
+    if dfx.enable_scope_stats and scope_stats_jsonl.exists():
+        jsonl_path = shlex.quote(str(scope_stats_jsonl))
+        print(
+            f"scope_stats written to {jsonl_path} — render an HTML report with:\n"
+            f"  python runtime/tools/scope_stats_plot.py {jsonl_path}"
+        )
 
 
 def _generate_swimlane(
@@ -619,12 +681,12 @@ def _generate_swimlane(
 ) -> None:
     """Run ``python -m simpler_setup.tools.swimlane_converter`` to generate ``merged_swimlane_*.json``.
 
-    Output is written to *swimlane_dir* alongside the input ``l2_perf_records_*.json``.
+    Output is written to *swimlane_dir* alongside the input ``l2_swimlane_records_*.json``.
 
     Args:
         work_dir: Directory containing ``kernel_config.py``.
         swimlane_dir: Directory where swimlane JSON files are written.
-        perf_file: Path to the ``l2_perf_records_*.json`` file produced by
+        perf_file: Path to the ``l2_swimlane_records_*.json`` file produced by
             CodeRunner and already moved into *swimlane_dir*.  When ``None``,
             swimlane conversion is skipped.
     """
@@ -638,7 +700,7 @@ def _generate_swimlane(
         return
 
     if perf_file is None:
-        print("No l2_perf_records_*.json found, skipping swimlane conversion")
+        print("No l2_swimlane_records_*.json found, skipping swimlane conversion")
         return
 
     kernel_config_path = work_dir / "kernel_config.py"
@@ -813,6 +875,7 @@ def execute_compiled(  # noqa: PLR0913
         enable_dump_tensor=dfx.enable_dump_tensor,
         enable_pmu=dfx.enable_pmu,
         enable_dep_gen=dfx.enable_dep_gen,
+        enable_scope_stats=dfx.enable_scope_stats,
     )
 
     # Collect DFX artefacts after execution (no-op when dfx_dir is None)

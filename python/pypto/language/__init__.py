@@ -100,6 +100,7 @@ from .op.tensor_ops import (
     cos,
     create_tensor,
     dim,
+    dump_tag,
     expand_clone,
     full,
     gather,
@@ -203,7 +204,7 @@ from .op.unified_ops import (
 from .optimizations import auto_chunk, split
 from .parser.decorator import InlineFunction, function, inline, program
 from .parser.text_parser import loads, loads_program, parse, parse_program
-from .scope import ScopeMode, manual_scope, scope, submit
+from .scope import ScopeMode, manual_scope, scope, spmd_submit, submit
 from .typing import Array, DynVar, InOut, IntLike, MemRef, Out, Scalar, Tensor, Tile, Tuple, dynamic
 
 # Short alias for MemorySpace (pl.Mem.Vec instead of pl.MemorySpace.Vec)
@@ -395,7 +396,9 @@ __all__ = [
     "scope",
     "manual_scope",
     "submit",
+    "spmd_submit",
     "no_dep",
+    "dump_tag",
     "scatter_update",
     "sin",
     "arange",

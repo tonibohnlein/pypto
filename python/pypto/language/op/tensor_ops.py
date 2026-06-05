@@ -15,12 +15,13 @@ that accept and return Tensor types instead of raw Expr/Call objects.
 
 import warnings
 from collections.abc import Sequence
-from typing import Any, overload
+from typing import Any, TypeVar, overload
 
 __all__ = [
     "create_tensor",
     "create",
     "no_dep",
+    "dump_tag",
     "read",
     "write",
     "dim",
@@ -94,6 +95,12 @@ from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import AtomicType, Expr, MemorySpace, PadValue, PtrType, TensorLayout
 
 from ..typing import IntLike, Scalar, Tensor
+
+# Bound TypeVar lets slice / assemble propagate the caller's concrete tensor
+# class (Tensor or its DistributedTensor subclass) through to the return type.
+# Runtime polymorphism comes from ``tensor.__class__(expr=call_expr)``; no
+# DistributedTensor import is needed here.
+_TensorT = TypeVar("_TensorT", bound=Tensor)
 
 
 def _unwrap_rhs(rhs: int | float | Expr | Tensor | Scalar) -> int | float | Expr:
@@ -197,6 +204,103 @@ def no_dep(tensor: Tensor) -> Tensor:
     return tensor
 
 
+def dump_tag(tensor: Tensor) -> Tensor:
+    """Mark a tensor for selective dump within the enclosing orchestration.
+
+    Declarative per-tensor dump marker (simpler#844 selective tensor dump).
+    Writing ``pl.dump_tag(q)`` as a standalone statement records ``q`` so that
+    every *subsequent* kernel dispatch consuming that exact value gets ``q``
+    merged into the dispatch's ``dump_vars`` — whether that dispatch lowers to
+    a plain ``ir.Call`` (the typical ``@pl.jit`` / tensor-op path) or an
+    ``ir.Submit``. The runtime then marks those ``Arg`` slots via
+    ``Arg::dump(...)``.
+
+    This is the declarative counterpart to the explicit ``dumps=[...]`` kwarg
+    on ``pl.submit(...)`` / ``pl.at(...)`` — both feed the same ``dump_vars``
+    set (mirroring how a scope's auto-inferred and explicit ``deps=`` edges
+    both feed ``manual_dep_edges``). Use ``dumps=`` when you want to list the
+    targets explicitly at a single task launch; use ``pl.dump_tag`` when one
+    declaration should stick across every subsequent consumer.
+
+    Use this to keep tensor dump viable on large workloads (e.g.
+    paged-attention 64bat/8192ctx) where full dump (``enable_dump_tensor=2``)
+    saturates the host-side dump collector (~42 MB/s drain rate) by dumping
+    every binding, eventually triggering a STARS op-timeout kill on the AICPU
+    side. Run partial dump (``enable_dump_tensor=1``) and tag only the tensors
+    of interest, so the runtime filters out large bindings (1 GB kv-cache,
+    output buffers, etc.) from the collector queue.
+
+    Semantics:
+
+    * Forward-sticky over the orch scope — one ``pl.dump_tag(q)`` statement
+      affects all *subsequent* kernel calls in the same orch that consume the
+      tagged value. Tracked by **Var identity**, never by name: reassigning
+      ``q`` (e.g. ``q = self.foo(q)``) produces a new value that the prior
+      tag does **not** cover — re-tag it if needed.
+    * Only effective under partial dump (``RunConfig.enable_dump_tensor == 1``)
+      — selective dump filters within the partial pipeline. A no-op when dump
+      is off (``0``); under full dump (``2``) every binding is captured, so the
+      tag has nothing to narrow.
+    * Consumed at parse time — recorded into the consuming dispatch's
+      ``dump_vars`` and emits no IR statement of its own.
+
+    Valid as a standalone statement inside an Orchestration function or an
+    Inline helper (``@pl.jit.inline`` / ``FunctionType.Inline``) that the
+    orchestration inlines. The parser rejects ``pl.dump_tag`` written in any
+    other function type (AIV / AIC / Mix kernel bodies) with a clear error::
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orch(self, q: pl.Tensor[...], k_cache: pl.Tensor[...], out: pl.Out[...]):
+            pl.dump_tag(q)           # mark q for selective dump
+            pl.dump_tag(out)         # mark out for selective dump
+            s = self.qk_matmul(q, k_cache, scratch)  # q is dumped here
+            out = self.pv_matmul(s, k_cache, out)    # out is dumped here
+
+    For a single task launch, list the targets explicitly with the
+    ``dumps=[...]`` kwarg: ``out, tid = pl.submit(self.qk_matmul, q, k_cache,
+    scratch, dumps=[q])`` or ``with pl.at(..., dumps=[q]) as tid:``.
+
+    Inside an Inline helper, the recorded ``dump_vars`` ride on the inline
+    body's kernel calls; the ``InlineFunctions`` pass splices those calls into
+    the caller and the mutator substitutes the caller's arg for each inline
+    parameter, so tags on both inline parameters and inline body-local
+    ``pl.create_tensor(...)`` results take effect at the inlined call sites.
+    No tag migration is needed; multi-level inlining works at the pass's
+    fixpoint.
+
+    Limitations (MVP):
+
+    A tag fires only when the tagged Var reaches a kernel dispatch as a
+    **static, whole-tensor Arg**. Values that never reach such an Arg are
+    silently not dumped:
+
+    * Dynamic-offset reads — a value read only through a data-dependent
+      offset (``q_flat[runtime_row : runtime_row + N, ...]``) lowers to a
+      gather / dynamic-address load, not a whole-tensor Arg, so the tag does
+      not attach. Stage it through a buffer read with static, compile-time
+      tiled offsets and tag that buffer.
+    * Orch-level ``pl.assemble`` buffers — ``y = pl.assemble(y, tile, off)``
+      lowers to a pure name-alias and emits no kernel dispatch, so there is
+      no Arg to mark. Use a static in-place slice store ``y[off_slice] =
+      tile`` and tag ``y``, or dump the producer kernels' output Args.
+    * Orch-tier scalar reads — a tensor consumed only by orchestration-level
+      ``pl.read(...)`` (e.g. block tables read to compute offsets) never
+      enters a device kernel as a Tensor Arg; the MVP runtime path covers
+      per-task device Args only.
+    * Distributed L3+ programs: only chip-level orchestration tasks honour
+      the tag; HOST-tier Python SubWorker tensors are not covered by the
+      runtime's selective dump path.
+
+    Args:
+        tensor: The tensor to mark. Must be a ``Tensor`` value bound in
+            the enclosing orchestration's scope.
+
+    Returns:
+        The tensor unchanged. The marker is consumed at parse time.
+    """
+    return tensor
+
+
 def read(tensor: Tensor, indices: IntLike | Sequence[IntLike]) -> Scalar:
     """Read a scalar value from a tensor at given indices.
 
@@ -253,13 +357,13 @@ def dim(tensor: Tensor, axis: int | _ir_core.ConstInt) -> Scalar:
 
 
 def slice(
-    tensor: Tensor,
+    tensor: _TensorT,
     shape: Sequence[IntLike],
     offset: Sequence[IntLike],
     valid_shape: Sequence[IntLike] | None = None,
     drop_dims: Sequence[int | Expr] | None = None,
     pad_value: PadValue | int | float | None = None,
-) -> Tensor:
+) -> _TensorT:
     """Create a slice of a tensor with new shape and optional valid shape.
 
     Args:
@@ -301,7 +405,7 @@ def slice(
         drop_dims,
         pad_value=pad_value,
     )
-    return Tensor(expr=call_expr)
+    return tensor.__class__(expr=call_expr)
 
 
 def fillpad(tensor: Tensor, pad_value: PadValue | int | float = PadValue.zero) -> Tensor:
@@ -1054,12 +1158,12 @@ def cast(
 
 
 def assemble(
-    target: Tensor,
+    target: _TensorT,
     source: Tensor,
     offset: Sequence[IntLike],
     *,
     atomic: AtomicType = AtomicType.None_,
-) -> Tensor:
+) -> _TensorT:
     """Write/update tensor values at specified offset.
 
     Args:
@@ -1084,7 +1188,7 @@ def assemble(
     target_expr = target.unwrap()
     source_expr = source.unwrap()
     call_expr = _ir_ops.assemble(target_expr, source_expr, _normalize_intlike(offset), atomic=int(atomic))
-    return Tensor(expr=call_expr)
+    return target.__class__(expr=call_expr)
 
 
 def concat(src0: Tensor, src1: Tensor) -> Tensor:

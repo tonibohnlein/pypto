@@ -202,11 +202,13 @@ Verifier：`signal` 必须是 `DistributedTensorType`；`expected` 必须是
   `test_get_op.py`、`test_put_op.py`,以及
   `tests/ut/ir/test_distributed_ops.py` 中的 negative verifier 覆盖。
 - **Codegen**：`tests/ut/codegen/distributed/test_distributed_pto_codegen.py`。
-- **端到端（ST）**：`tests/st/distributed/test_l3_allreduce.py`、
-  `test_l3_allgather.py`、`test_l3_reduce_scatter.py`、`test_l3_broadcast.py`、
-  `test_l3_gemm.py`、`test_l3_ep_dispatch_combine.py`、`test_l3_notify_wait.py`，
-  以及 `tests/st/distributed/` 下其他 L3 ST。`test_l3_put.py` 与
-  `test_l3_get.py` 目前**被 skip**，等待 N7 host codegen（每个 `DistributedTensor` 的
-  `add_scalar(ctx)`、`ContinuousTensor.make(..., child_memory=True)`）与 N8 driver glue
-  （在 codegen 发出的 `orch.allocate_domain(...)` 块上接线 `HostBufferStaging`
-  窗口）。其中内嵌的程序与 golden 校验是端到端的权威契约 —— 待上述 host 侧工作落地后即可移除 skip 标记。
+- **端到端（ST）**：`tests/st/distributed/test_l3_allreduce.py`（mesh allreduce；默认
+  **P=2**，任意四卡跑 **P=4**，例如 ``--device=0,1,2,3`` 或
+  ``--device=0-3``）、`test_l3_allgather.py`、
+  `test_l3_reduce_scatter.py`、`test_l3_broadcast.py`、`test_l3_gemm.py`、
+  `test_l3_ep_dispatch_combine.py`、`test_l3_notify_wait.py`，以及
+  `tests/st/distributed/` 下其他 L3 ST。`test_l3_put.py` 与 `test_l3_get.py` 目前**被
+  skip**，等待 N7 host codegen（每个 `DistributedTensor` 的 `add_scalar(ctx)`、
+  `ContinuousTensor.make(..., child_memory=True)`）与 N8 driver glue（在 codegen 发出的
+  `orch.allocate_domain(...)` 块上接线 `HostBufferStaging` 窗口）。其中内嵌的程序与 golden
+  校验是端到端的权威契约 —— 待上述 host 侧工作落地后即可移除 skip 标记。

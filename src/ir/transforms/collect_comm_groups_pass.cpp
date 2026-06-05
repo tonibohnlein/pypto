@@ -9,8 +9,12 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <any>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -19,10 +23,13 @@
 #include <vector>
 
 #include "pypto/core/error.h"
+#include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/program.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
@@ -30,6 +37,7 @@
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/verifier/verifier.h"
 
 namespace pypto {
 namespace ir {
@@ -240,28 +248,37 @@ class DispatchAnalyzer : public IRVisitor {
     for_stack_.pop_back();
   }
 
-  void VisitExpr_(const CallPtr& op) override {
-    if (IsChipOrchDispatch(op, chip_orchs_)) {
-      ExprPtr device;
-      for (const auto& [k, v] : op->attrs_) {
-        if (k == kAttrDevice) {
-          // attrs["device"] is stored as ExprPtr by N3 parser.
-          if (const auto* p = std::any_cast<ExprPtr>(&v)) device = *p;
-          break;
-        }
-      }
-      if (device) {
-        DeviceDescriptor desc = ResolveDeviceDescriptor(device, for_stack_, var_defs_, op->span_);
-        for (const auto& arg : op->args_) {
-          auto arg_var = As<Var>(arg);
-          if (!arg_var) continue;
-          auto it = view_to_window_.find(arg_var.get());
-          if (it != view_to_window_.end()) {
-            it->second.alloc->seen.push_back(desc);
-          }
-        }
+  void AnalyzeDispatch(const CallPtr& op) {
+    if (!IsChipOrchDispatch(op, chip_orchs_)) return;
+    ExprPtr device;
+    for (const auto& [k, v] : op->attrs_) {
+      if (k == kAttrDevice) {
+        // attrs["device"] is stored as ExprPtr by N3 parser.
+        if (const auto* p = std::any_cast<ExprPtr>(&v)) device = *p;
+        break;
       }
     }
+    if (!device) return;
+    DeviceDescriptor desc = ResolveDeviceDescriptor(device, for_stack_, var_defs_, op->span_);
+    for (const auto& arg : op->args_) {
+      auto arg_var = As<Var>(arg);
+      if (!arg_var) continue;
+      auto it = view_to_window_.find(arg_var.get());
+      if (it != view_to_window_.end()) {
+        it->second.alloc->seen.push_back(desc);
+      }
+    }
+  }
+
+  void VisitExpr_(const CallPtr& op) override {
+    AnalyzeDispatch(op);
+    IRVisitor::VisitExpr_(op);
+  }
+
+  // A captured (`as tid`) chip-orch dispatch is a Submit; the ``device=`` attr
+  // it carries is analysed identically through the Call-shaped view.
+  void VisitExpr_(const SubmitPtr& op) override {
+    AnalyzeDispatch(SubmitToCallView(op));
     IRVisitor::VisitExpr_(op);
   }
 
@@ -431,6 +448,48 @@ Pass CollectCommGroups() {
 }
 
 }  // namespace pass
+
+// ============================================================================
+// CommGroupsCollected property verifier
+// ============================================================================
+
+class CommGroupsCollectedPropertyVerifierImpl : public PropertyVerifier {
+ public:
+  [[nodiscard]] std::string GetName() const override { return "CommGroupsCollected"; }
+
+  void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
+    if (!program) return;
+    std::unordered_map<const WindowBuffer*, size_t> first_seen_group;
+    for (size_t gi = 0; gi < program->comm_groups_.size(); ++gi) {
+      const auto& group = program->comm_groups_[gi];
+      if (!group) {
+        diagnostics.emplace_back(DiagnosticSeverity::Error, "CommGroupsCollected", 0,
+                                 "CommGroup at index " + std::to_string(gi) + " is null", Span::unknown());
+        continue;
+      }
+      for (const auto& slot : group->slots_) {
+        if (!slot) {
+          diagnostics.emplace_back(DiagnosticSeverity::Error, "CommGroupsCollected", 0,
+                                   "CommGroup at index " + std::to_string(gi) + " has a null slot",
+                                   group->span_);
+          continue;
+        }
+        auto [it, inserted] = first_seen_group.emplace(slot.get(), gi);
+        if (!inserted) {
+          diagnostics.emplace_back(DiagnosticSeverity::Error, "CommGroupsCollected", 0,
+                                   "WindowBuffer '" + slot->name_hint_ +
+                                       "' appears in multiple CommGroups (" + std::to_string(it->second) +
+                                       " and " + std::to_string(gi) + ")",
+                                   slot->span_);
+        }
+      }
+    }
+  }
+};
+
+PropertyVerifierPtr CreateCommGroupsCollectedPropertyVerifier() {
+  return std::make_shared<CommGroupsCollectedPropertyVerifierImpl>();
+}
 
 }  // namespace ir
 }  // namespace pypto

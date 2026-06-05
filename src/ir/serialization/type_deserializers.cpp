@@ -130,8 +130,10 @@ DataType DeserializeDataType(const msgpack::object& fields_obj, const std::strin
   }
 }
 
-std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msgpack::object& kwargs_obj,
-                                                                const std::string& field_name) {
+static std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msgpack::object& kwargs_obj,
+                                                                       const std::string& field_name,
+                                                                       DeserializerContext& ctx,
+                                                                       msgpack::zone& zone) {
   std::vector<std::pair<std::string, std::any>> kwargs;
   if (kwargs_obj.type != msgpack::type::ARRAY) {
     throw TypeError("Invalid kwargs type for field: " + field_name);
@@ -248,6 +250,62 @@ std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msgpack::o
           throw TypeError("Missing 'value' field for LoopOrigin kwarg: " + key);
         }
         kwargs.emplace_back(key, StringToLoopOrigin(value_str));
+      } else if (type_name == "Var") {
+        // Reserved Var-valued attr (kAttrTaskIdVar). Resolved through the node
+        // table so it round-trips by identity. A missing 'value' field is a
+        // malformed envelope (fail fast, like VarList/Int32Vector); an explicit
+        // nil value is the null placeholder (the attr held a null VarPtr).
+        if (!has_value_obj) {
+          throw TypeError("Var kwarg '" + key + "' must have a 'value' field");
+        }
+        if (value_obj_inner.type == msgpack::type::NIL) {
+          kwargs.emplace_back(key, VarPtr(nullptr));
+        } else {
+          kwargs.emplace_back(
+              key, std::static_pointer_cast<const Var>(ctx.DeserializeNode(value_obj_inner, zone)));
+        }
+      } else if (type_name == "VarList") {
+        // Reserved Var-list attrs (kAttrManualDepEdges / kAttrArgDirOverrideVars /
+        // kAttrDumpVars). Each entry resolves through the node table; a nil entry
+        // reconstructs a null VarPtr so list positions are preserved.
+        if (!has_value_obj || value_obj_inner.type != msgpack::type::ARRAY) {
+          throw TypeError("VarList kwarg '" + key + "' must have ARRAY value");
+        }
+        std::vector<VarPtr> vars;
+        vars.reserve(value_obj_inner.via.array.size);
+        for (uint32_t j = 0; j < value_obj_inner.via.array.size; ++j) {
+          const msgpack::object& elem = value_obj_inner.via.array.ptr[j];
+          if (elem.type == msgpack::type::NIL) {
+            vars.emplace_back(nullptr);
+          } else {
+            vars.push_back(std::static_pointer_cast<const Var>(ctx.DeserializeNode(elem, zone)));
+          }
+        }
+        kwargs.emplace_back(key, std::move(vars));
+      } else if (type_name == "Int32Vector") {
+        // kAttrArgDirectionOverrides — no_dep argument indices (std::vector<int32_t>).
+        if (!has_value_obj || value_obj_inner.type != msgpack::type::ARRAY) {
+          throw TypeError("Int32Vector kwarg '" + key + "' must have ARRAY value");
+        }
+        std::vector<int32_t> idxs;
+        idxs.reserve(value_obj_inner.via.array.size);
+        for (uint32_t j = 0; j < value_obj_inner.via.array.size; ++j) {
+          idxs.push_back(value_obj_inner.via.array.ptr[j].as<int32_t>());
+        }
+        kwargs.emplace_back(key, std::move(idxs));
+      } else if (type_name == "Expr") {
+        // Reserved Expr-valued attr (kAttrDevice). Resolved through the node table.
+        // A missing 'value' field is a malformed envelope (fail fast); an
+        // explicit nil value is the null placeholder.
+        if (!has_value_obj) {
+          throw TypeError("Expr kwarg '" + key + "' must have a 'value' field");
+        }
+        if (value_obj_inner.type == msgpack::type::NIL) {
+          kwargs.emplace_back(key, ExprPtr(nullptr));
+        } else {
+          kwargs.emplace_back(
+              key, std::static_pointer_cast<const Expr>(ctx.DeserializeNode(value_obj_inner, zone)));
+        }
       } else {
         // Try to deserialize as DataType
         try {
@@ -351,7 +409,7 @@ static IRNodePtr DeserializeCall(const msgpack::object& fields_obj, msgpack::zon
   std::vector<std::pair<std::string, std::any>> attrs;
   auto attrs_opt = GetOptionalFieldObj(fields_obj, "attrs", ctx);
   if (attrs_opt.has_value() && attrs_opt->type != msgpack::type::NIL) {
-    attrs = DeserializeKwargs(*attrs_opt, "attrs");
+    attrs = DeserializeKwargs(*attrs_opt, "attrs", ctx, zone);
   }
 
   // Backward compatibility: legacy .pir payloads stored arg_directions as a top-level
@@ -381,9 +439,74 @@ static IRNodePtr DeserializeCall(const msgpack::object& fields_obj, msgpack::zon
 
   // Deserialize kwargs (preserve order using vector)
   auto kwargs_obj = GET_FIELD_OBJ("kwargs");
-  std::vector<std::pair<std::string, std::any>> kwargs = DeserializeKwargs(kwargs_obj, "kwargs");
+  std::vector<std::pair<std::string, std::any>> kwargs = DeserializeKwargs(kwargs_obj, "kwargs", ctx, zone);
 
   return std::make_shared<Call>(op, args, std::move(kwargs), std::move(attrs), type, span);
+}
+
+// Deserialize Submit (pl.submit / pl.spmd_submit task launch). Mirrors
+// DeserializeCall plus the first-class deps_ field and the SPMD launch spec
+// (core_num / sync_start). Serialization is reflection-driven, so this is the
+// only hand-written half (see serializer.cpp SERIALIZE_FIELDS(Submit)).
+static IRNodePtr DeserializeSubmit(const msgpack::object& fields_obj, msgpack::zone& zone,
+                                   DeserializerContext& ctx) {
+  auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
+  auto op = ctx.DeserializeOp(GET_FIELD_OBJ("op"));
+  auto type = ctx.DeserializeType(GET_FIELD_OBJ("type"), zone);
+
+  std::vector<ExprPtr> args;
+  auto args_obj = GET_FIELD_OBJ("args");
+  if (args_obj.type == msgpack::type::ARRAY) {
+    for (uint32_t i = 0; i < args_obj.via.array.size; ++i) {
+      args.push_back(
+          std::static_pointer_cast<const Expr>(ctx.DeserializeNode(args_obj.via.array.ptr[i], zone)));
+    }
+  }
+
+  // deps_ is a first-class field (Scalar[TASK_ID] / Array[N, TASK_ID] Vars),
+  // serialized as an array of nodes.
+  std::vector<ExprPtr> deps;
+  auto deps_obj = GET_FIELD_OBJ("deps");
+  if (deps_obj.type == msgpack::type::ARRAY) {
+    for (uint32_t i = 0; i < deps_obj.via.array.size; ++i) {
+      deps.push_back(
+          std::static_pointer_cast<const Expr>(ctx.DeserializeNode(deps_obj.via.array.ptr[i], zone)));
+    }
+  }
+
+  // SPMD launch spec (pl.spmd_submit). core_num is an optional Expr node —
+  // NIL / absent means a plain submit (single block). sync_start is a bool
+  // (default false), only meaningful when core_num is present.
+  std::optional<ExprPtr> core_num;
+  auto core_num_opt = GetOptionalFieldObj(fields_obj, "core_num", ctx);
+  // GetOptionalFieldObj already maps a NIL payload to nullopt, but guard
+  // explicitly so a present-but-NIL field never deserializes to a null ExprPtr
+  // (which would trip the Submit ctor's launch-spec validation).
+  if (core_num_opt.has_value() && core_num_opt->type != msgpack::type::NIL) {
+    core_num = std::static_pointer_cast<const Expr>(ctx.DeserializeNode(*core_num_opt, zone));
+  }
+  bool sync_start = false;
+  auto sync_start_obj = GetOptionalFieldObj(fields_obj, "sync_start", ctx);
+  if (sync_start_obj.has_value() && sync_start_obj->type != msgpack::type::NIL) {
+    CHECK_SPAN(sync_start_obj->type == msgpack::type::BOOLEAN, span)
+        << "Submit sync_start must be a bool, got msgpack type " << static_cast<int>(sync_start_obj->type);
+    sync_start = sync_start_obj->as<bool>();
+  }
+
+  // Generic attrs map. Submit never stores manual_dep_edges in attrs (deps_ is
+  // the source of truth), so no legacy top-level arg_directions lifting is
+  // needed — arg_directions, when present, round-trips through the attrs map.
+  std::vector<std::pair<std::string, std::any>> attrs;
+  auto attrs_opt = GetOptionalFieldObj(fields_obj, "attrs", ctx);
+  if (attrs_opt.has_value() && attrs_opt->type != msgpack::type::NIL) {
+    attrs = DeserializeKwargs(*attrs_opt, "attrs", ctx, zone);
+  }
+
+  auto kwargs_obj = GET_FIELD_OBJ("kwargs");
+  std::vector<std::pair<std::string, std::any>> kwargs = DeserializeKwargs(kwargs_obj, "kwargs", ctx, zone);
+
+  return std::make_shared<Submit>(op, args, deps, std::move(kwargs), std::move(attrs), type, span,
+                                  std::move(core_num), sync_start);
 }
 
 // Macro for binary expressions
@@ -573,7 +696,7 @@ static IRNodePtr DeserializeForStmt(const msgpack::object& fields_obj, msgpack::
   std::vector<std::pair<std::string, std::any>> attrs;
   auto attrs_obj = GetOptionalFieldObj(fields_obj, "attrs", ctx);
   if (attrs_obj.has_value() && attrs_obj->type != msgpack::type::NIL) {
-    attrs = DeserializeKwargs(*attrs_obj, "attrs");
+    attrs = DeserializeKwargs(*attrs_obj, "attrs", ctx, zone);
   } else {
     // Legacy backward compat: convert old "loop_origin" field to attrs
     auto loop_origin_obj = GetOptionalFieldObj(fields_obj, "loop_origin", ctx);
@@ -645,6 +768,23 @@ static std::optional<SplitMode> DeserializeScopeSplit(const msgpack::object& fie
   return split;
 }
 
+// Deserialize a ScopeStmt's generic attrs_ map (preserve order; absent ⇒ empty).
+// ScopeStmt serializes attrs_ via reflection, so every scope kind must read it
+// back to survive a round-trip — captured scopes (``with pl.at(...) as tid:`` /
+// ``with pl.spmd(...) as tid:`` / ``deps=[...]``) carry the reserved Var-valued
+// kAttrTaskIdVar / kAttrManualDepEdges here, which DeserializeKwargs resolves
+// through its "Var" / "VarList" branches.
+static std::vector<std::pair<std::string, std::any>> DeserializeScopeAttrs(const msgpack::object& fields_obj,
+                                                                           DeserializerContext& ctx,
+                                                                           msgpack::zone& zone) {
+  std::vector<std::pair<std::string, std::any>> attrs;
+  auto attrs_opt = GetOptionalFieldObj(fields_obj, "attrs", ctx);
+  if (attrs_opt.has_value() && attrs_opt->type != msgpack::type::NIL) {
+    attrs = DeserializeKwargs(*attrs_opt, "attrs", ctx, zone);
+  }
+  return attrs;
+}
+
 // Deserialize InCoreScopeStmt
 static IRNodePtr DeserializeInCoreScopeStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
                                             DeserializerContext& ctx) {
@@ -653,7 +793,8 @@ static IRNodePtr DeserializeInCoreScopeStmt(const msgpack::object& fields_obj, m
   auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
   auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
   return std::make_shared<InCoreScopeStmt>(split, std::move(name_hint), body, span,
-                                           DeserializeLeadingComments(fields_obj));
+                                           DeserializeLeadingComments(fields_obj),
+                                           DeserializeScopeAttrs(fields_obj, ctx, zone));
 }
 
 // Deserialize AutoInCoreScopeStmt
@@ -664,7 +805,8 @@ static IRNodePtr DeserializeAutoInCoreScopeStmt(const msgpack::object& fields_ob
   auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
   auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
   return std::make_shared<AutoInCoreScopeStmt>(split, std::move(name_hint), body, span,
-                                               DeserializeLeadingComments(fields_obj));
+                                               DeserializeLeadingComments(fields_obj),
+                                               DeserializeScopeAttrs(fields_obj, ctx, zone));
 }
 
 // Deserialize ClusterScopeStmt
@@ -674,7 +816,8 @@ static IRNodePtr DeserializeClusterScopeStmt(const msgpack::object& fields_obj, 
   auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
   auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
   return std::make_shared<ClusterScopeStmt>(std::move(name_hint), body, span,
-                                            DeserializeLeadingComments(fields_obj));
+                                            DeserializeLeadingComments(fields_obj),
+                                            DeserializeScopeAttrs(fields_obj, ctx, zone));
 }
 
 // Deserialize HierarchyScopeStmt
@@ -697,7 +840,8 @@ static IRNodePtr DeserializeHierarchyScopeStmt(const msgpack::object& fields_obj
   auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
   auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
   return std::make_shared<HierarchyScopeStmt>(level, role, std::move(name_hint), body, span,
-                                              DeserializeLeadingComments(fields_obj));
+                                              DeserializeLeadingComments(fields_obj),
+                                              DeserializeScopeAttrs(fields_obj, ctx, zone));
 }
 
 // Deserialize SpmdScopeStmt
@@ -721,7 +865,32 @@ static IRNodePtr DeserializeSpmdScopeStmt(const msgpack::object& fields_obj, msg
   auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
   auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
   return std::make_shared<SpmdScopeStmt>(core_num, sync_start, std::move(name_hint), body, span,
-                                         DeserializeLeadingComments(fields_obj));
+                                         DeserializeLeadingComments(fields_obj),
+                                         DeserializeScopeAttrs(fields_obj, ctx, zone));
+}
+
+// Deserialize RuntimeScopeStmt (pl.manual_scope MANUAL wrapper / AUTO PTO2_SCOPE
+// wrapper added by MaterializeRuntimeScopes). Submit nodes live inside this, so
+// serializing a manual_scope program requires it.
+static IRNodePtr DeserializeRuntimeScopeStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
+                                             DeserializerContext& ctx) {
+  auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
+
+  // manual is required (bool, defaults to false = AUTO if missing).
+  bool manual = false;
+  auto manual_obj = GetOptionalFieldObj(fields_obj, "manual", ctx);
+  if (manual_obj.has_value() && manual_obj->type != msgpack::type::NIL) {
+    CHECK_SPAN(manual_obj->type == msgpack::type::BOOLEAN, span)
+        << "RuntimeScopeStmt manual must be a bool, got msgpack type " << static_cast<int>(manual_obj->type);
+    manual = manual_obj->as<bool>();
+  }
+
+  auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
+  auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
+
+  return std::make_shared<RuntimeScopeStmt>(manual, std::move(name_hint), body, span,
+                                            DeserializeLeadingComments(fields_obj),
+                                            DeserializeScopeAttrs(fields_obj, ctx, zone));
 }
 
 // Deserialize SeqStmts
@@ -841,7 +1010,7 @@ static IRNodePtr DeserializeFunction(const msgpack::object& fields_obj, msgpack:
   std::vector<std::pair<std::string, std::any>> attrs;
   auto attrs_obj = GetOptionalFieldObj(fields_obj, "attrs", ctx);
   if (attrs_obj.has_value() && attrs_obj->type != msgpack::type::NIL) {
-    attrs = DeserializeKwargs(*attrs_obj, "attrs");
+    attrs = DeserializeKwargs(*attrs_obj, "attrs", ctx, zone);
   } else {
     // Legacy backward compat: convert old "split" field to attrs
     auto split_obj = GetOptionalFieldObj(fields_obj, "split", ctx);
@@ -987,6 +1156,7 @@ static TypeRegistrar _const_int_registrar("ConstInt", DeserializeConstInt);
 static TypeRegistrar _const_float_registrar("ConstFloat", DeserializeConstFloat);
 static TypeRegistrar _const_bool_registrar("ConstBool", DeserializeConstBool);
 static TypeRegistrar _call_registrar("Call", DeserializeCall);
+static TypeRegistrar _submit_registrar("Submit", DeserializeSubmit);
 
 static TypeRegistrar _add_registrar("Add", DeserializeAdd);
 static TypeRegistrar _sub_registrar("Sub", DeserializeSub);
@@ -1030,6 +1200,7 @@ static TypeRegistrar _auto_in_core_scope_stmt_registrar("AutoInCoreScopeStmt",
 static TypeRegistrar _cluster_scope_stmt_registrar("ClusterScopeStmt", DeserializeClusterScopeStmt);
 static TypeRegistrar _hierarchy_scope_stmt_registrar("HierarchyScopeStmt", DeserializeHierarchyScopeStmt);
 static TypeRegistrar _spmd_scope_stmt_registrar("SpmdScopeStmt", DeserializeSpmdScopeStmt);
+static TypeRegistrar _runtime_scope_stmt_registrar("RuntimeScopeStmt", DeserializeRuntimeScopeStmt);
 static TypeRegistrar _seq_stmts_registrar("SeqStmts", DeserializeSeqStmts);
 static TypeRegistrar _eval_stmt_registrar("EvalStmt", DeserializeEvalStmt);
 static TypeRegistrar _break_stmt_registrar("BreakStmt", DeserializeBreakStmt);

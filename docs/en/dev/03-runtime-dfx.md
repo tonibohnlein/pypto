@@ -1,20 +1,21 @@
 # Runtime DFX (Design For X) Flags
 
-PyPTO exposes Simpler's four runtime diagnostic sub-features as independent
+PyPTO exposes Simpler's five runtime diagnostic sub-features as independent
 toggles on [`RunConfig`](../../../python/pypto/runtime/runner.py). Each
 toggle maps 1:1 to a field on Simpler's `CallConfig` and to the matching
-flag in `runtime/conftest.py`, so the two surfaces stay aligned.
+pytest flag in `tests/st/conftest.py`, so the two surfaces stay aligned.
 
 ## Flag matrix
 
 | `RunConfig` field | pytest flag | `CallConfig` member | Artefact under `dfx_outputs/` | Post-run converter |
 | ----------------- | ----------- | ------------------- | ----------------------------- | ------------------ |
-| `enable_l2_swimlane: bool` | `--enable-l2-swimlane` | `enable_l2_swimlane` | `l2_perf_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
-| `enable_dump_tensor: bool` | `--dump-tensor` | `enable_dump_tensor` | `tensor_dump/{tensor_dump.json,bin}` | `dump_viewer` (manual) |
+| `enable_l2_swimlane: bool` | `--enable-l2-swimlane` | `enable_l2_swimlane` | `l2_swimlane_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
+| `enable_dump_tensor: int` | `--dump-tensor [LEVEL]` (bare = `1`) | `enable_dump_tensor` (`0` off, `1` partial, `2` full) | `tensor_dump/{tensor_dump.json,bin}` | `dump_viewer` (manual) |
 | `enable_pmu: int` | `--enable-pmu [N]` (bare = `2`) | `enable_pmu` (`0` off, `>0` event type) | `pmu.csv` | — |
 | `enable_dep_gen: bool` | `--enable-dep-gen` | `enable_dep_gen` | `deps.json` | `deps_to_graph` (manual) |
+| `enable_scope_stats: bool` | `--enable-scope-stats` | `enable_scope_stats` | `scope_stats/scope_stats.jsonl` | `scope_stats_plot` (manual) |
 
-The four flags are **fully independent** and may be combined in any
+The five flags are **fully independent** and may be combined in any
 subset. Enabling *any* of them auto-forces `RunConfig.save_kernels=True`
 so the `<work_dir>/dfx_outputs/` directory survives the run.
 
@@ -23,7 +24,10 @@ so the `<work_dir>/dfx_outputs/` directory survives the run.
 The runtime writes every artefact under a single directory passed via
 `CallConfig.output_prefix`. PyPTO sets that prefix to
 `<work_dir>/dfx_outputs/` and the constituent subpaths are fixed per the
-table above. Simpler's `CallConfig::validate()` rejects the call if any
+table above. Most artefacts are flat files directly under the prefix;
+`scope_stats` is the exception — its collector writes a `scope_stats/`
+subdir holding `scope_stats.jsonl`. Simpler's `CallConfig::validate()`
+rejects the call if any
 flag is enabled but `output_prefix` is empty; PyPTO mirrors that contract
 on the Python side and raises `ValueError` from `execute_on_device`
 *before* the C++ boundary so the failure traceback points at the
@@ -40,7 +44,7 @@ run(
     MyProgram, a, b, c,
     config=RunConfig(
         platform="a2a3sim",
-        enable_l2_swimlane=True,     # produces l2_perf_records.json
+        enable_l2_swimlane=True,     # produces l2_swimlane_records.json
         enable_dep_gen=True,         # produces deps.json (render with deps_to_graph on demand)
         enable_pmu=4,                # PMU event = MEMORY
     ),
@@ -56,6 +60,95 @@ pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py \
 pytest tests/st/runtime/ \
     --platform a2a3sim --enable-l2-swimlane --enable-dep-gen
 ```
+
+## Selective tensor dump
+
+`enable_dump_tensor` is a **level** (`0`=off, `1`=partial, `2`=full;
+`True`→`1`, `False`→`0`). Level `2` writes every binding of every task to
+`tensor_dump/`. On large workloads that can saturate the host-side dump
+collector (~42 MB/s drain) and the AICPU will be killed by the STARS
+op-execute timeout — large bindings such as a 1 GB KV-cache fill the
+queue faster than it drains. Run **partial** dump (level `1`) and mark the
+*interesting* tensors to limit dump to those tensors. Two surfaces, both backed
+by the runtime `Arg::dump(...)` API (simpler#844). Selective-vs-full is latched
+host-side from the dump level, so no orch-body toggle is emitted (simpler#953).
+They mirror the two `deps=` surfaces exactly — a declarative
+marker (`pl.dump_tag`, the dump analogue of auto-inferred deps) and an
+explicit kwarg (`dumps=`, the dump analogue of `deps=`):
+
+**Declarative (`pl.dump_tag(t)`)** — a statement that marks `t` so every
+*subsequent* kernel dispatch consuming that exact value dumps it, whether the
+dispatch lowers to a plain `ir.Call` (the typical `@pl.jit` / tensor-op path)
+or an `ir.Submit`:
+
+```python
+@pl.function(type=pl.FunctionType.Orchestration)
+def orch(self, q: pl.Tensor[...], k_cache: pl.Tensor[...], out: pl.Out[...]):
+    pl.dump_tag(q)
+    pl.dump_tag(out)
+    out = self.qk_pv(q, k_cache, out)   # q and out dumped; k_cache filtered out
+```
+
+**Explicit kwarg (`dumps=[...]`)** — `pl.submit(...)` and `pl.at(...)` accept a
+`dumps=[...]` kwarg (symmetric with `deps=[...]`) listing the tensors to dump
+at that one task launch. Each entry must be a tensor argument of that submit /
+a tensor captured by that scope:
+
+```python
+with pl.manual_scope():
+    out, tid = pl.submit(self.qk_pv, q, k_cache, out, deps=[prev], dumps=[q, out])
+    # codegen → params_t0.dump(ext_q, ext_out);
+```
+
+There is **no call-arg wrapper** — a plain `self.kernel(...)` call site offers
+no `dumps=` surface; use `pl.dump_tag` to mark its inputs, or submit it with
+`pl.submit(..., dumps=[...])`. Both surfaces feed the same `dump_vars` attr on
+the consuming Call / `Submit`, tracked by **Var identity** — never by name. It
+rides through SSA, inlining, and codegen the same way `manual_dep_edges` does,
+so no fuzzy name matching and no false positives. The marks only take effect
+under partial dump (`enable_dump_tensor == 1`); they are inert when dump is off
+(`0`) and irrelevant under full dump (`2`), which captures every binding.
+
+`pl.dump_tag` is also accepted inside an Inline helper
+(`@pl.jit.inline` / `FunctionType.Inline`), and works for both kernel-call
+styles:
+
+- **Explicit `self.kernel(...)` dispatch** — the tag records `dump_vars`
+  on the consuming Call; the `InlineFunctions` pass splices that call into the
+  caller and substitutes the caller's arg for each inline parameter, so tags
+  on inline parameters and inline body-local `pl.create_tensor(...)` results
+  take effect at the inlined call sites.
+- **`@pl.jit` / tensor-op style (`with pl.at(level=...)`, `c = a + 1.0`)** —
+  here the kernel dispatch is *synthesised by the outline passes*, not written
+  at parse time. The tag instead seeds the enclosing scope's `dump_vars` (which
+  round-trips as `pl.at(..., dumps=[...])`); a tag applied at the inline
+  call site rides the call's `dump_vars` and is transferred by
+  `InlineFunctions` onto the scopes it splices in. The outliner then
+  translates each captured scope dump Var into the synthesised dispatch's
+  `dump_vars` by Var identity — the same scope-attr → Call-attr path
+  `no_dep_args=` uses. A tag the scope never consumes as a kernel arg is
+  silently dropped.
+
+No tag migration is needed in either case; multi-level inlining is handled at
+the pass's fixpoint.
+
+### Limitations
+
+| Marker location / target | Status |
+| ------------------------ | ------ |
+| `pl.dump_tag(t)` as a standalone statement in an Orchestration or Inline body | Supported (declarative marker; affects every subsequent consuming dispatch). |
+| `dumps=[arg]` on `pl.submit(...)` | Supported — explicit submit-side surface (symmetric with `deps=`); each entry must be a positional arg of the submit. |
+| `dumps=[t]` on `pl.at(...)` | Supported — explicit scope-side surface (symmetric with `deps=`); each entry must be a tensor captured by the scope body. |
+| `dumps=` on a plain `self.kernel(...)` call | Not supported — raises `ParserTypeError`. A plain call is fire-and-forget; declare the target with `pl.dump_tag(t)` or submit it with `pl.submit(..., dumps=[...])`. |
+| Tag consumed by an outline-synthesised dispatch (`@pl.jit` / `with pl.at(level=...)` / tensor-op style) | Supported — the tag rides a scope-level `dump_vars` carrier (`dumps=`) and the outliner maps it onto the synthesised dispatch arg. |
+| `pl.dump_tag(t)` inside a `@pl.function(type=pl.FunctionType.InCore/AIC/AIV/Group)` body | Not supported — raises `ParserSyntaxError` at parse time. Dump filtering is applied by orchestration codegen at the kernel-call site; kernel-body functions have no corresponding call-site arg to attach the marker to. Place `pl.dump_tag` in the enclosing `Orchestration` (or `Inline`) function instead. |
+| Synthetic outputs of `pl.submit(...)` (implicit `Out`) | Not supported — synth outputs have no call-site arg to wrap. |
+| HOST-tier Python `SubWorker` tensors | Not supported — runtime exposes no equivalent `Arg::dump` hook. |
+| Reassigning a tagged value (e.g. `q = self.foo(q)`) | The rebound result is a **new value**; a previous `pl.dump_tag(q)` does **not** carry over (tracked by Var identity, not name). Re-tag the rebound value if the kernel consumes it. |
+| Tagging a value consumed only after a shape/dtype transform (`q2 = pl.reshape(q)`, `pl.cast`, an elementwise op, …) | The transform produces a **new Var**, so `pl.dump_tag(q)` does **not** cover `q2`. Same root cause as reassignment (Var identity, not name). Tag the value the kernel actually receives — e.g. `pl.dump_tag(q2)`. |
+| Tagging a value read only through a dynamic, data-dependent offset (`q_flat[runtime_row : runtime_row + N, …]`) | Not supported — the indexed read lowers to a gather / dynamic-address load, not a static whole-tensor `Arg`. Orchestration codegen extracts no whole-Var from that arg slot (`AsVarLike` yields nothing to match by identity), so the tag never attaches. Stage the value through a buffer read with **static, compile-time-tiled** offsets and tag that buffer. |
+| Tagging an orch-tier buffer filled by `y = pl.assemble(y, tile, offset)` | Not supported — an orch-level `pl.assemble` lowers to a pure name-alias (`emit_name_map_[lhs] = target`, `HandleTensorAssembleAssign`) and emits **no kernel dispatch**. The buffer never reaches a task as a whole-tensor `Arg`, so there is nothing for `Arg::dump` to mark (compounded by `assemble` rebinding the Var each iteration). Use a static in-place slice store `y[offset_slice] = tile` and tag `y`, or dump the producer kernels' output Args instead. |
+| Tagging a tensor consumed only by orchestration-level scalar reads (`pl.read(block_table_flat, […])`) | Not supported — the tensor is read element-wise at orch/AICPU/HOST tier (e.g. to compute page offsets) and never enters a device kernel as a Tensor `Arg`. The MVP runtime selective-dump path covers per-task **device** Args only. Stage it into a tensor that a device kernel consumes as a whole Arg. |
 
 ## Rendering `deps.json` to HTML
 
@@ -85,6 +178,22 @@ prints this same hint at the end of every dep_gen-enabled run.
 Requires Graphviz on `PATH` (`apt install graphviz` /
 `brew install graphviz`). Open the resulting HTML in any browser —
 drag to pan, wheel to zoom, `f` to fit, `r` to reset.
+
+## Rendering `scope_stats.jsonl` to HTML
+
+`enable_scope_stats` emits the raw `scope_stats/scope_stats.jsonl`
+(line 1 is run metadata; each later line is one per-scope record). Turn
+it into a single self-contained HTML report — one timeline per ring with
+the heap / task_window / tensormap peaks — with the offline renderer:
+
+```bash
+python runtime/tools/scope_stats_plot.py \
+    <work_dir>/dfx_outputs/scope_stats/scope_stats.jsonl
+```
+
+The report is written next to the input as `scope_stats.html`. Like
+`deps_to_graph`, it is **not** invoked automatically — the runner prints
+this hint at the end of every scope-stats-enabled run.
 
 ## Implementation map
 
@@ -208,6 +317,6 @@ module / CLI is still usable directly against the output directory.
 ## Related
 
 - Simpler's runtime-side reference: `runtime/docs/dfx/{l2-swimlane,
-  tensor-dump,pmu-profiling,dep_gen}.md`.
+  tensor-dump,pmu-profiling,dep_gen,scope-stats}.md`.
 - Compile-time profiling (orthogonal, single PyPTO process):
   [01-compile-profiling.md](01-compile-profiling.md).

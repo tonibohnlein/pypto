@@ -124,6 +124,11 @@ class SpecializeContext:
             starts at. Anchors the generated→original line remap.
         orig_col_offset: Indentation (in columns) stripped by ``textwrap.dedent``
             from the original source — added back to recover original columns.
+        auto_scope: Whether the compiler auto-inserts AUTO runtime scopes
+            (PTO2_SCOPE). ``True`` by default; ``False`` emits
+            ``@pl.function(..., auto_scope=False)`` so the body places scopes
+            by hand. Only honored for the Orchestration entry and HOST
+            orchestrator decorators (see :meth:`Specializer._build_decorator`).
     """
 
     func_name: str
@@ -139,6 +144,9 @@ class SpecializeContext:
     orig_file: str | None = None
     orig_start_line: int = 1
     orig_col_offset: int = 0
+    # Appended at the tail to preserve positional construction of this exported
+    # dataclass for external callers (auto_scope is keyword-only in practice).
+    auto_scope: bool = True
 
     @property
     def dynamic_dims(self) -> set[tuple[str, int]]:
@@ -698,6 +706,11 @@ class _BodyTransformer(ast.NodeTransformer):
             return cast("ast.stmt", self.generic_visit(node))
         var_name = node.target.id
         node.value = self.visit(node.value)
+        # Inline shape constants in the local annotation too (e.g. a body-level
+        # ``x: pl.Tile[[1, W_PAD], pl.FP32]`` where ``W_PAD`` is a module-level
+        # int). Without this the un-inlined name leaks into the generated source
+        # and the parser rejects it ("Unknown shape variable: W_PAD").
+        node.annotation = self.visit(node.annotation)
         if var_name in self._assign_count:
             if self._scope_depth == self._assign_depth[var_name]:
                 new_name = self._rebind(var_name)
@@ -1613,12 +1626,17 @@ class Specializer:
         (``include/pypto/ir/function.h``), so a HOST Opaque function keeps
         the explicit ``role=Orchestrator``.
         """
+        # auto_scope=False is only meaningful for orchestration-level entries
+        # (the Orchestration entry and the HOST orchestrator); sub-function
+        # kinds reject it at the decorator layer, so ctx.auto_scope is always
+        # True for them and the suffix stays empty.
+        auto_scope_suffix = "" if ctx.auto_scope else ", auto_scope=False"
         if ctx.func_type == "host":
-            return "@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)"
+            return f"@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator{auto_scope_suffix})"
         if ctx.func_type is None or ctx.func_type == "orchestration":
             if func_def is not None and _has_incore_scope(func_def):
-                return "@pl.function(type=pl.FunctionType.Opaque)"
-            return "@pl.function(type=pl.FunctionType.Orchestration)"
+                return f"@pl.function(type=pl.FunctionType.Opaque{auto_scope_suffix})"
+            return f"@pl.function(type=pl.FunctionType.Orchestration{auto_scope_suffix})"
         if ctx.func_type == "inline":
             return "@pl.function(type=pl.FunctionType.Inline)"
         if ctx.func_type == "opaque":
@@ -1709,6 +1727,7 @@ def build_specialize_context(
     scalar_values: dict[str, int | float | bool],
     scalar_dtypes: dict[str, DataType],
     dep_names: list[str],
+    auto_scope: bool = True,
 ) -> SpecializeContext:
     """Build a SpecializeContext from a Python function and call-site data.
 
@@ -1721,6 +1740,9 @@ def build_specialize_context(
         scalar_values: Concrete scalar values from the call site.
         scalar_dtypes: DataType per scalar param name.
         dep_names: Names of @pl.jit.incore functions called from this function.
+        auto_scope: Whether the compiler auto-inserts AUTO runtime scopes.
+            Forwarded to the generated ``@pl.function`` decorator; only the
+            Orchestration entry and HOST orchestrator honor ``False``.
 
     Dynamic dims live inside ``tensor_meta`` as :class:`DynDim` entries —
     no separate set is passed in.
@@ -1759,6 +1781,7 @@ def build_specialize_context(
         scalar_values=scalar_values,
         scalar_dtypes=scalar_dtypes,
         dep_names=dep_names,
+        auto_scope=auto_scope,
         py_globals=getattr(func, "__globals__", {}),
         orig_file=orig_file,
         orig_start_line=orig_start_line,

@@ -126,6 +126,7 @@ def submit(*args: Any, **kwargs: Any) -> Any:
 
         out, tid    = pl.submit(self.stage1, x, scratch, deps=[prev_tid])
         (a, b), tid = pl.submit(self.multi_out_kernel, x)
+        out, tid    = pl.submit(self.stage1, x, scratch, deps=[prev_tid], dumps=[x])
 
     The kernel-side ``ir.Submit`` natively returns
     ``Tuple[<kernel return>, TASK_ID]``; element 0 is the tensor result(s),
@@ -140,6 +141,17 @@ def submit(*args: Any, **kwargs: Any) -> Any:
     ``deps=[...]`` as a precision tool to patch edges the runtime cannot
     infer; in ``pl.manual_scope()``, use it to declare every edge.
 
+    The optional ``dumps=[...]`` kwarg is the submit-side selective tensor
+    dump surface (symmetric with ``deps=``): it lists tensor arguments of
+    this submit to mark for dump (simpler#844), so an enabled dump pipeline
+    filters down to just those bindings. Each entry must be a tensor passed
+    positionally to the submitted kernel. ``dumps=`` is the explicit dump
+    surface on a submit; the declarative ``pl.dump_tag(t)`` statement feeds the
+    same ``dump_vars`` set. These marks only take effect under partial dump
+    (``RunConfig.enable_dump_tensor == 1``); they are a no-op when dump is off
+    (``0``) and irrelevant under full dump (``2``), which captures every
+    binding regardless.
+
     The return annotation is ``Any`` (not ``NoReturn``) because the parser
     intercepts the call and binds a 2-tuple to the LHS — downstream code
     that does ``out, tid = pl.submit(...)`` would not type-check under
@@ -152,4 +164,40 @@ def submit(*args: Any, **kwargs: Any) -> Any:
     )
 
 
-__all__ = ["ScopeMode", "manual_scope", "scope", "submit"]
+def spmd_submit(*args: Any, **kwargs: Any) -> Any:
+    """Launch a kernel as an SPMD task and capture its producer TaskId.
+
+    ``pl.spmd_submit`` is a **parser construct**, not a runtime function — the
+    DSL parser intercepts ``result, tid = pl.spmd_submit(self.kernel, *args,
+    core_num=N, sync_start=..., deps=[...])`` syntactically and never actually
+    calls this body. It is defined only so the name resolves (imports / linters).
+
+    It is the SPMD sibling of :func:`submit`: a single orchestration task that
+    the runtime fans out across ``core_num`` logical blocks (each kernel reads
+    its block index via ``pl.tile.get_block_idx()``). Like :func:`submit` it
+    returns one producer TaskId, so the whole dispatch can be named as a
+    dependency of later tasks.
+
+    Surface form (must be unpacked as a 2-tuple)::
+
+        out, tid = pl.spmd_submit(self.incore_kernel, x, y, core_num=8)
+        out, tid = pl.spmd_submit(self.kernel, x, core_num=8, sync_start=True,
+                                  deps=[prev_tid])
+
+    ``core_num`` is a **required keyword argument** (a positive integer
+    expression) — the positional slots are the kernel's own arguments.
+    ``sync_start`` (default ``False``) requires all blocks to launch atomically.
+    ``deps=[...]`` works exactly as on :func:`submit`. The callee may be an
+    InCore / AIC / AIV kernel or a co-scheduled Group.
+
+    Like :func:`submit`, it works in both auto and manual scope; its primary use
+    is explicit dependency wiring inside ``pl.manual_scope()``.
+    """
+    raise RuntimeError(
+        "pl.spmd_submit is a DSL parser construct and cannot be called directly; "
+        "use it as `result, task_id = pl.spmd_submit(self.kernel, *args, core_num=N, deps=[...])` "
+        "inside a @pl.function body."
+    )
+
+
+__all__ = ["ScopeMode", "manual_scope", "scope", "submit", "spmd_submit"]

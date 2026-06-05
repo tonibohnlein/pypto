@@ -16,6 +16,7 @@ auto-mapping at def sites) is sufficient.
 """
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 from pypto import DataType, ir, passes
 from pypto.language.parser.diagnostics import SSAViolationError
@@ -882,6 +883,66 @@ class TestEdgeCases:
 
         After = passes.convert_to_ssa()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_distributed_tensor_view_valid_shape_substitution(self):
+        """``SubstType`` must preserve ``DistributedTensorType`` (and its
+        ``window_buffer_`` back-reference) when shape / view substitution
+        runs on a distributed tensor type — otherwise the SSA-versioned Var
+        silently downgrades to a plain ``TensorType`` and downstream passes
+        (``CollectCommGroups``, codegen) lose the comm-group binding.
+
+        The dynamic-shape ``valid_shape`` is what forces the
+        ``changed=true`` branch in ``SubstType``; the static-shape happy
+        path is covered by the polymorphism tests in
+        ``tests/ut/language/parser/test_distributed_tensor_polymorphism.py``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                data: pl.InOut[pld.DistributedTensor[[16, 64], pl.FP32]],
+                n: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[8, 64], pl.FP32]],
+            ) -> pl.Tensor[[8, 64], pl.FP32]:
+                valid_len: pl.Scalar[pl.INDEX] = pl.min(n, 64)
+                sub = pl.tensor.slice(data, [8, 64], [0, 0], valid_shape=[8, valid_len])
+                tile = pl.load(sub, [0, 0], [8, 64])
+                return pl.store(tile, [0, 0], out)
+
+        After = passes.convert_to_ssa()(Before)
+
+        # Locate the post-SSA tensor.slice Call and assert its return type
+        # remains a DistributedTensorType (window_buffer_ stays None — it is
+        # populated later by CollectCommGroups; the load-bearing invariant
+        # here is the preserved ObjectKind).
+        gvar = After.get_global_var("main")
+        assert gvar is not None
+        func = After.functions[gvar]
+
+        slice_calls: list[ir.Call] = []
+
+        def walk(stmt: ir.Stmt) -> None:
+            if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call):
+                if stmt.value.op.name == "tensor.slice":
+                    slice_calls.append(stmt.value)
+            if isinstance(stmt, ir.SeqStmts):
+                for s in stmt.stmts:
+                    walk(s)
+            if isinstance(stmt, ir.ForStmt):
+                walk(stmt.body)
+            if isinstance(stmt, ir.IfStmt):
+                walk(stmt.then_body)
+                if stmt.else_body is not None:
+                    walk(stmt.else_body)
+
+        walk(func.body)
+        assert len(slice_calls) == 1
+        t = slice_calls[0].type
+        assert isinstance(t, ir.DistributedTensorType), (
+            f"SSA substitution must preserve DistributedTensorType, got {type(t).__name__}"
+        )
 
     def test_unused_variable(self):
         """Unused variable should still be versioned."""
@@ -2135,6 +2196,143 @@ class TestScopeTransparentToSSA:
             self._verify_ssa(after)
         finally:
             backend.reset_for_testing()
+
+
+class TestScopeOutlineBoundary:
+    """For non-``RuntimeScopeStmt`` scopes, ``ConvertScope`` blocks
+    inner-loop escaping-var promotion for variables first-defined inside
+    the scope body. ``cur_`` stays transparent (later passes such as
+    ``InterchangeChunkLoops`` rely on scope-local vars flowing out for
+    sequential references), but the escaping path is gated to avoid the
+    ``init_values=(foo__FREE_VAR,)`` failure mode. Regression for #1351."""
+
+    @staticmethod
+    def _collect_for_stmts(stmt):
+        out: list[ir.ForStmt] = []
+
+        def walk(s):
+            if s is None:
+                return
+            if isinstance(s, ir.ForStmt):
+                out.append(s)
+            for attr in ("body", "then_body", "else_body"):
+                child = getattr(s, attr, None)
+                if child is not None:
+                    walk(child)
+            if isinstance(s, ir.SeqStmts):
+                for child in s.stmts:
+                    walk(child)
+
+        walk(stmt)
+        return out
+
+    def test_scope_blocks_escaping_var_promotion_in_inner_loop(self):
+        """Issue #1351. A var first-defined inside ``pl.at`` body must NOT
+        be promoted to inner-loop ``init_values`` just because some
+        subsequent statement (outside the scope) references it.
+
+        Pre-fix produced ``init_values=(k0__FREE_VAR,)`` on both ``pl.parallel``
+        and ``pl.range`` (FindInitValue had no pre-loop scalar of the right
+        type, so it created an unversioned placeholder). The downstream
+        ``k0__rv_*`` was then defined inside ``pl.at`` but used after it,
+        which the SSA verifier rejected. Post-fix: neither inner loop
+        carries ``k0``; the post-scope reference itself remains a user
+        error caught by other verifiers."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[256], pl.FP32],
+                result: pl.Out[pl.Tensor[[256], pl.FP32]],
+                out_scalar: pl.Out[pl.Scalar[pl.INDEX]],
+            ) -> pl.Tensor[[256], pl.FP32]:
+                K_CHUNK = 16
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for ob in pl.parallel(4):
+                        for kb in pl.range(4):
+                            k0 = kb * K_CHUNK
+                            t = pl.load(x, [k0], [K_CHUNK])
+                            pl.store(t, [k0], result)
+                out_scalar = k0  # noqa: F841 — bug trigger: puts ``k0`` into future_needs
+                return result
+
+        # The post-scope ``out_scalar = k0`` is the user-side scope leak
+        # that triggers the bug: it puts ``k0`` into ``future_needs`` at
+        # the pl.at level. The leak itself is a user error (and downstream
+        # property verifiers correctly flag it), so disable verification
+        # here — the regression we are protecting is purely structural
+        # (no bogus iter_args on the inner loops).
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            After = passes.convert_to_ssa()(Before)
+        fn = next(f for _, f in After.functions.items() if f.name == "main")
+        for_stmts = self._collect_for_stmts(fn.body)
+        assert len(for_stmts) == 2, f"expected 2 for-loops, found {len(for_stmts)}"
+        for loop in for_stmts:
+            assert len(loop.iter_args) == 0, (
+                f"loop with var {loop.loop_var.name_hint!r} got "
+                f"iter_args={[ia.name_hint for ia in loop.iter_args]}; "
+                f"scope-local ``k0`` must not be promoted past the pl.at boundary"
+            )
+
+    def test_scope_preserves_pre_existing_carried_var(self):
+        """The scope-boundary trim must NOT block carried-var promotion of
+        variables that exist *before* the scope (typical accumulator pattern).
+        ``result`` here is an outer parameter that the inner loop updates;
+        it must still be threaded through as an iter_arg/return_var."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                result: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for i in pl.range(4):
+                        result = pl.add(result, x)
+                return result
+
+        After = passes.convert_to_ssa()(Before)
+        fn = next(f for _, f in After.functions.items() if f.name == "main")
+        for_stmts = self._collect_for_stmts(fn.body)
+        assert len(for_stmts) == 1
+        loop = for_stmts[0]
+        carried_names = [ia.name_hint for ia in loop.iter_args]
+        # ``result`` is pre-existing → must be carried even inside pl.at.
+        assert any(n.startswith("result") for n in carried_names), (
+            f"pre-existing ``result`` must remain a carried iter_arg inside pl.at, "
+            f"got iter_args={carried_names}"
+        )
+
+    def test_runtime_scope_remains_transparent_to_escaping(self):
+        """``RuntimeScopeStmt`` (``pl.scope()``) is a thin codegen wrapper,
+        NOT an outline boundary. A variable first-defined inside ``pl.scope()``
+        and used after the scope must still be promoted through enclosing
+        loops the same as in plain non-scoped code."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+            def main(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                for i, (acc,) in pl.range(4, init_values=(out,)):
+                    with pl.scope():
+                        nxt: pl.Tensor[[16, 16], pl.FP32] = pl.tensor.adds(acc, 1.0)
+                        acc = pl.yield_(nxt)
+                return acc
+
+        After = passes.convert_to_ssa()(Before)
+        ps = passes.IRPropertySet()
+        ps.insert(passes.IRProperty.SSAForm)
+        # Successful SSA verification is the key signal — pl.scope() must
+        # stay transparent so the carry-yield inside it threads through.
+        passes.run_verifier(ps)(After)
 
 
 if __name__ == "__main__":
