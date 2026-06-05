@@ -10,4 +10,4 @@
 	url = https://github.com/hw-native-sys/simpler
 [submodule "3rdparty/mlsys26"]
 	path = 3rdparty/mlsys26
-	url = https://github.com/huawei-csl/mlsys-2026-graph-scheduling-vnrc-submission.git
+	url = git@github.com:tonibohnlein/mlsys26.git
