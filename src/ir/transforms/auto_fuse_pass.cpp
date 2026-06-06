@@ -95,10 +95,30 @@ bool IsComputeOp(const StmtPtr& stmt, CallPtr* out_call) {
   return true;
 }
 
-// Classify an op/kernel call. Matmul ops and matmul-named kernels are MatMul;
-// everything else is Pointwise. TODO: inspect the kernel body for a tile.matmul.
+// Map a PyPTO op/kernel name to a tiling cost category. Broadcast folds into
+// Pointwise (its FIXED operand is shape-inferred from the size-1 dim). Memory /
+// cross-core / sync ops are not graph nodes, so they never reach this point.
+// (For orchestration kernel calls the name is the kernel's — matmul kernels must
+// be named *matmul*; body inspection is a TODO.)
 ::OpType ClassifyOp(const CallPtr& call) {
-  return call->op_->name_.find("matmul") != std::string::npos ? ::OpType::MatMul : ::OpType::Pointwise;
+  const std::string& n = call->op_->name_;
+  auto has = [&](const char* s) { return n.find(s) != std::string::npos; };
+  auto ends = [&](const char* s) {
+    const size_t l = std::char_traits<char>::length(s);
+    return n.size() >= l && n.compare(n.size() - l, l, s) == 0;
+  };
+  if (has("matmul") || has("gemv")) {
+    return ::OpType::MatMul;
+  }
+  if (ends(".sum") || ends(".max") || ends(".min") || has("row_sum") ||
+      has("row_max") || has("row_min") || has("col_sum") || has("col_max") || has("col_min")) {
+    return ::OpType::Reduction;
+  }
+  if (has("gather") || has("scatter") || has("sort") || has("transpose") || has("reshape") ||
+      has("concat") || has("assemble")) {
+    return ::OpType::Opaque;  // data-dependent / relayout — un-fusable barrier
+  }
+  return ::OpType::Pointwise;  // elementwise / unary / cast / expand(broadcast)
 }
 
 // Build the MLSys solver `Problem` (op+tensor DAG) from a function, reusing
