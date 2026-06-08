@@ -14,6 +14,7 @@ from __future__ import annotations
 import ctypes
 import importlib.util
 import sys
+import types
 import weakref
 from collections.abc import Callable
 from pathlib import Path
@@ -131,8 +132,20 @@ def _assemble_chip_callables(compiled: DistributedCompiledProgram) -> tuple[dict
     return chip_callables, runtime_name
 
 
+# Sentinel attribute that DistributedCodegen sets on the generated host
+# orchestrator function (``<name>._pypto_distributed_entry = True``). The entry
+# is resolved by this marker rather than by function name, so renaming the
+# ``@pl.jit.host`` orchestrator does not break dispatch (issue #1678). Keep in
+# sync with ``EmitEntryMarker`` in src/codegen/distributed/distributed_codegen.cpp.
+_ENTRY_MARKER = "_pypto_distributed_entry"
+
+
 def _load_orch_entry(output_dir: Path) -> tuple[Any, Any]:
     """Load the generated ``host_orch.py`` and return ``(entry_fn, alloc_fn)``.
+
+    The dispatch entry is the unique module-level function carrying the
+    ``_pypto_distributed_entry`` marker emitted by codegen — resolution never
+    depends on the function's Python name (issue #1678).
 
     ``alloc_fn`` is the optional ``_alloc_intermediates(tensors)`` that
     pre-allocates HOST-level scratch tensors (``None`` when absent).
@@ -144,19 +157,21 @@ def _load_orch_entry(output_dir: Path) -> tuple[Any, Any]:
         )
     orch_module = _load_generated_module(orch_path)
 
-    entry_fn = None
-    for attr_name in ("entry", "host_orch"):
-        entry_fn = getattr(orch_module, attr_name, None)
-        if entry_fn is not None:
-            break
-    if entry_fn is None:
-        for name in dir(orch_module):
-            obj = getattr(orch_module, name)
-            if callable(obj) and not name.startswith("_"):
-                entry_fn = obj
-                break
-    if entry_fn is None:
-        raise RuntimeError(f"No entry function found in {orch_path}")
+    entry_candidates = [
+        obj
+        for name in dir(orch_module)
+        if isinstance((obj := getattr(orch_module, name)), types.FunctionType)
+        and getattr(obj, "__module__", None) == orch_module.__name__
+        and getattr(obj, _ENTRY_MARKER, False)
+    ]
+    if len(entry_candidates) != 1:
+        found = [fn.__name__ for fn in entry_candidates]
+        raise RuntimeError(
+            f"Expected exactly one entry function marked with `{_ENTRY_MARKER}` in "
+            f"{orch_path}, found {len(entry_candidates)}: {found}. The generated "
+            f"orchestration module is malformed — regenerate via distributed codegen."
+        )
+    entry_fn = entry_candidates[0]
 
     alloc_fn = getattr(orch_module, "_alloc_intermediates", None)
     return entry_fn, alloc_fn

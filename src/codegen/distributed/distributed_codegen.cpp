@@ -124,8 +124,10 @@ std::string DistributedCodegen::Generate(const ir::ProgramPtr& program) {
     } else {
       EmitFunction(best_orch);
     }
+    EmitEntryMarker(best_orch->name_);
   } else if (entry_func_) {
     EmitEntryFunction();
+    EmitEntryMarker("entry");
   }
 
   return emitter_.GetCode();
@@ -395,6 +397,17 @@ void DistributedCodegen::EmitEntryFunction() {
   }
 
   emitter_.DecreaseIndent();
+  emitter_.EmitLine("");
+}
+
+void DistributedCodegen::EmitEntryMarker(const std::string& func_name) {
+  // The runtime (distributed_runner._load_orch_entry) selects the unique
+  // module-level function carrying this sentinel attribute as the dispatch
+  // entry. This decouples entry resolution from the user's Python function
+  // name, so renaming the @pl.jit.host orchestrator no longer breaks dispatch
+  // (issue #1678). Keep the attribute name in sync with `_ENTRY_MARKER` in
+  // python/pypto/runtime/distributed_runner.py.
+  emitter_.EmitLine(func_name + "._pypto_distributed_entry = True");
   emitter_.EmitLine("");
 }
 

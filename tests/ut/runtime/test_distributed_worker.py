@@ -386,5 +386,77 @@ class TestExplicitDispatchAPI:
         assert orch.free.called
 
 
+class TestLoadOrchEntry:
+    """Entry resolution in ``_load_orch_entry`` (issue #1678).
+
+    The dispatch entry is the unique module-level function tagged with the
+    ``_pypto_distributed_entry`` marker — resolution must not depend on the
+    function's Python name nor fall back to scanning callables by name.
+    """
+
+    @staticmethod
+    def _write_orch(tmp_path, src: str):
+        orch_dir = tmp_path / "orchestration"
+        orch_dir.mkdir()
+        (orch_dir / "host_orch.py").write_text(src)
+        return tmp_path
+
+    def test_resolves_marked_function_not_imported_class(self, tmp_path):
+        """Resolution follows the marker, never an alphabetically-earlier import
+        such as ``CommBufferSpec`` (the original failure mode of issue #1678)."""
+        from pypto.runtime.distributed_runner import _load_orch_entry  # noqa: PLC0415
+
+        root = self._write_orch(
+            tmp_path,
+            "class CommBufferSpec:\n"
+            "    def __init__(self, **kw):\n"
+            "        raise AssertionError('wrong callable resolved')\n\n\n"
+            "def moe_ep_l3(orch, _args, config, **kw):\n"
+            "    return 'ok'\n\n\n"
+            "moe_ep_l3._pypto_distributed_entry = True\n",
+        )
+        entry_fn, alloc_fn = _load_orch_entry(root)
+        assert entry_fn.__name__ == "moe_ep_l3"
+        assert alloc_fn is None
+
+    def test_returns_alloc_intermediates_when_present(self, tmp_path):
+        from pypto.runtime.distributed_runner import _load_orch_entry  # noqa: PLC0415
+
+        root = self._write_orch(
+            tmp_path,
+            "def host_orch(orch, _args, config, **kw):\n"
+            "    return 'ok'\n\n\n"
+            "host_orch._pypto_distributed_entry = True\n\n\n"
+            "def _alloc_intermediates(tensors):\n"
+            "    return None\n",
+        )
+        entry_fn, alloc_fn = _load_orch_entry(root)
+        assert entry_fn.__name__ == "host_orch"
+        assert alloc_fn is not None and alloc_fn.__name__ == "_alloc_intermediates"
+
+    def test_no_marker_raises(self, tmp_path):
+        from pypto.runtime.distributed_runner import _load_orch_entry  # noqa: PLC0415
+
+        root = self._write_orch(
+            tmp_path,
+            "def moe_ep_l3(orch, _args, config, **kw):\n    return 'ok'\n",
+        )
+        with pytest.raises(RuntimeError, match="exactly one entry function"):
+            _load_orch_entry(root)
+
+    def test_multiple_markers_raise(self, tmp_path):
+        from pypto.runtime.distributed_runner import _load_orch_entry  # noqa: PLC0415
+
+        root = self._write_orch(
+            tmp_path,
+            "def a(orch, _args, config, **kw):\n    return 'a'\n\n\n"
+            "def b(orch, _args, config, **kw):\n    return 'b'\n\n\n"
+            "a._pypto_distributed_entry = True\n"
+            "b._pypto_distributed_entry = True\n",
+        )
+        with pytest.raises(RuntimeError, match="exactly one entry function"):
+            _load_orch_entry(root)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

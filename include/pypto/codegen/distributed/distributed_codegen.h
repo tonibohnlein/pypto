@@ -131,6 +131,10 @@ class DistributedCodegen : public CodegenBase {
   void EmitImports();
   void EmitFunction(const ir::FunctionPtr& func);
   void EmitEntryFunction();
+  // Tag the emitted orchestrator/entry with a sentinel attribute so the runtime
+  // resolves it by marker, not by function name (issue #1678). Keep the
+  // attribute name in sync with `_ENTRY_MARKER` in distributed_runner.py.
+  void EmitEntryMarker(const std::string& func_name);
 
   // Call-site lowering
   void EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee);

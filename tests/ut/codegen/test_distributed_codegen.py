@@ -57,6 +57,34 @@ class TestDistributedCodegen:
         assert 'callables["chip_orch"]' in code
         assert "TaskArgs()" in code
 
+    def test_renamed_host_orch_marks_entry(self):
+        """Host orchestrator under any name gets the runtime entry marker.
+
+        Regression for issue #1678: the runtime resolves the dispatch entry by
+        the ``_pypto_distributed_entry`` marker, not by function name, so a
+        renamed ``@pl.jit.host`` orchestrator must carry the marker.
+        """
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def moe_ep_l3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.chip_orch(x)
+                return y
+
+        program = passes.convert_to_ssa()(Input)
+        code = codegen.DistributedCodegen().generate(program)
+
+        assert "def moe_ep_l3(" in code
+        assert "moe_ep_l3._pypto_distributed_entry = True" in code
+        # The marker must follow the function definition it tags.
+        assert code.index("def moe_ep_l3(") < code.index("moe_ep_l3._pypto_distributed_entry")
+
     def test_sub_worker_submit_sub(self):
         """HOST worker (SubWorker) produces submit_sub call."""
 
