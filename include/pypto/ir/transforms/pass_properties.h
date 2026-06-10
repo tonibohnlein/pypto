@@ -28,14 +28,17 @@ namespace pass {
 
 inline const PassProperties kInlineFunctionsProperties{.produced = {IRProperty::InlineFunctionsEliminated}};
 
-// -- CollectCommGroups pass (runs at the end of the pipeline, just before -----
+// -- MaterializeCommDomainScopes pass (runs at the end of the pipeline, just before -----
 //    the final Simplify). Nothing between InlineFunctions and here touches
 //    the host_orch alloc/window/dispatch chain (host_orch is never tile-
 //    lowered), so the alloc/view/dispatch sites are still discoverable.
-//    Traces pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r) and
-//    materialises WindowBuffer + Program.comm_groups_.
+//    Traces pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r),
+//    materialises WindowBuffer back-references on every DistributedTensorType view,
+//    and wraps the host_orch body in nested CommDomainScopeStmts (one per
+//    inferred comm domain).
 
-inline const PassProperties kCollectCommGroupsProperties{.produced = {IRProperty::CommGroupsCollected}};
+inline const PassProperties kMaterializeCommDomainScopesProperties{
+    .produced = {IRProperty::CommDomainScopesMaterialized}};
 
 // -- MaterializeRuntimeScopes pass (runs last, after the final Simplify) ------
 //    Inserts explicit AUTO RuntimeScopeStmt nodes for the orchestration function
@@ -253,11 +256,6 @@ inline const PassProperties kCanonicalizeIOOrderProperties{
 // PropertyVerifierRegistry), so PassPipeline auto-verifies it whenever this
 // pass produces the property — no separate verify pass is needed.
 
-// DeriveCallDirections also performs manual-scope lowering as Phase 2 (the
-// former DeriveManualScopeDeps pass). Phase 2 reads the arg_directions
-// populated by Phase 1 and writes the per-Call ``manual_dep_edges`` attr
-// inside ``RuntimeScopeStmt(manual=true)`` regions; codegen reads that attr
-// directly, so no separate IRProperty is needed.
 inline const PassProperties kDeriveCallDirectionsProperties{.required = {IRProperty::SplitIncoreOrch},
                                                             .produced = {IRProperty::CallDirectionsResolved}};
 
@@ -266,6 +264,18 @@ inline const PassProperties kExpandManualPhaseFenceProperties{
                  IRProperty::CallDirectionsResolved},
     .produced = {IRProperty::NoNestedCalls, IRProperty::NormalizedStmtStructure,
                  IRProperty::CallDirectionsResolved}};
+
+// -- Automatic runtime-scope task dependency pass -----------------------------
+//
+// Reads ``Call.attrs_["arg_directions"]`` and writes
+// ``Call.attrs_["compiler_manual_dep_edges"]`` for runtime scopes. MANUAL
+// scopes are analyzed in the default pipeline. AUTO-scope analysis is
+// controlled by the pass option and remains off by default at high-level
+// pipeline entry points. The pass preserves CallDirectionsResolved because it
+// does not rewrite call args or direction attrs.
+inline const PassProperties kAutoDeriveTaskDependenciesProperties{
+    .required = {IRProperty::SplitIncoreOrch, IRProperty::CallDirectionsResolved},
+    .produced = {IRProperty::CallDirectionsResolved}};
 
 // -- No-op tile.reshape folding pass -----------------------------------------
 

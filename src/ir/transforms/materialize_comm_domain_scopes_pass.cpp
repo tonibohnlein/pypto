@@ -108,12 +108,12 @@ class AllocAndWindowCollector : public IRVisitor {
       const auto& op_name = call->op_->name_;
       if (op_name == "pld.tensor.alloc_window_buffer") {
         INTERNAL_CHECK_SPAN(call->args_.size() == 1, call->span_)
-            << "CollectCommGroups: pld.tensor.alloc_window_buffer expects exactly one arg (size)";
+            << "MaterializeCommDomainScopes: pld.tensor.alloc_window_buffer expects exactly one arg (size)";
         // The parser injects ``name`` as a kwarg derived from the assignment
         // LHS — not as an ``attrs`` entry — so use GetKwarg here.
         auto name = call->GetKwarg<std::string>("name");
         INTERNAL_CHECK_SPAN(!name.empty(), call->span_)
-            << "CollectCommGroups: pld.tensor.alloc_window_buffer missing 'name' kwarg";
+            << "MaterializeCommDomainScopes: pld.tensor.alloc_window_buffer missing 'name' kwarg";
         auto rec = std::make_unique<AllocRecord>(call, var, call->args_[0], name, call->span_);
         ptr_to_alloc[var.get()] = rec.get();
         allocs.push_back(std::move(rec));
@@ -184,7 +184,7 @@ DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device, const std::vecto
   DeviceDescriptor desc;
   if (auto ci = As<ConstInt>(device)) {
     INTERNAL_CHECK_SPAN(ci->value_ >= 0, dispatch_span)
-        << "CollectCommGroups: device= ConstInt must be non-negative, got " << ci->value_;
+        << "MaterializeCommDomainScopes: device= ConstInt must be non-negative, got " << ci->value_;
     desc.subset.insert(ci->value_);
     return desc;
   }
@@ -205,29 +205,31 @@ DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device, const std::vecto
         if (auto stop_ci = As<ConstInt>(stop)) {
           auto start_ci = As<ConstInt>(UnwrapStopExpr(fs->start_, var_defs));
           INTERNAL_CHECK_SPAN(start_ci, dispatch_span)
-              << "CollectCommGroups: device=r loop start must unwrap to ConstInt";
+              << "MaterializeCommDomainScopes: device=r loop start must unwrap to ConstInt";
           int64_t start = start_ci->value_;
           auto step_ci = As<ConstInt>(UnwrapStopExpr(fs->step_, var_defs));
           INTERNAL_CHECK_SPAN(step_ci, dispatch_span)
-              << "CollectCommGroups: device=r loop step must unwrap to ConstInt";
+              << "MaterializeCommDomainScopes: device=r loop step must unwrap to ConstInt";
           int64_t step = step_ci->value_;
           INTERNAL_CHECK_SPAN(step == 1, dispatch_span)
-              << "CollectCommGroups: device=r over a non-unit-step loop is not supported (step=" << step
-              << ")";
+              << "MaterializeCommDomainScopes: device=r over a non-unit-step loop is not supported (step="
+              << step << ")";
           INTERNAL_CHECK_SPAN(start >= 0 && stop_ci->value_ >= start, dispatch_span)
-              << "CollectCommGroups: device=r loop range must be [0, N) with N>=0";
+              << "MaterializeCommDomainScopes: device=r loop range must be [0, N) with N>=0";
           for (int64_t i = start; i < stop_ci->value_; ++i) desc.subset.insert(i);
           return desc;
         }
         throw pypto::ValueError(
-            "CollectCommGroups: device=r loop bound must be ConstInt or pld.system.world_size()");
+            "MaterializeCommDomainScopes: device=r loop bound must be ConstInt or pld.system.world_size()");
       }
     }
     throw pypto::ValueError(
-        "CollectCommGroups: device= Var is not the induction variable of any enclosing pl.range loop");
+        "MaterializeCommDomainScopes: device= Var is not the induction variable of any enclosing pl.range "
+        "loop");
   }
   throw pypto::ValueError(
-      "CollectCommGroups: device= expression must be ConstInt or the induction var of pl.range; got "
+      "MaterializeCommDomainScopes: device= expression must be ConstInt or the induction var of pl.range; "
+      "got "
       "an unsupported expression at " +
       dispatch_span.to_string());
 }
@@ -312,7 +314,7 @@ class DispatchAnalyzer : public IRVisitor {
 [[nodiscard]] VarPtr MintViewVar(const VarPtr& old_var, const WindowBufferPtr& wb) {
   auto dt = As<DistributedTensorType>(old_var->GetType());
   INTERNAL_CHECK_SPAN(dt, old_var->span_)
-      << "CollectCommGroups: pld.tensor.window result Var should have DistributedTensorType";
+      << "MaterializeCommDomainScopes: pld.tensor.window result Var should have DistributedTensorType";
   // Preserve every field (shape / dtype / memref / tensor_view) and set
   // window_buffer to the freshly-built ``wb``. ``pld.tensor.window`` outputs never
   // carry memref / tensor_view today (parser-fresh views), but the full-fields
@@ -324,9 +326,18 @@ class DispatchAnalyzer : public IRVisitor {
 
 /// Process one host_orch function: identify allocs/windows/dispatches,
 /// construct WindowBuffer instances, rewrite the body to substitute view Vars
-/// with type-updated copies. Appends newly-built CommGroups to ``groups``.
-FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string, FunctionPtr>& chip_orchs,
-                            std::vector<CommGroupPtr>& groups) {
+/// with type-updated copies, and wrap the body in a chain of
+/// ``CommDomainScopeStmt`` (one per inferred comm domain, outer = first
+/// declared, inner = last declared).
+FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string, FunctionPtr>& chip_orchs) {
+  // Idempotence: if this function's body is already wrapped in a
+  // CommDomainScopeStmt, the pass has run on it before — skip to avoid
+  // double-wrapping the body and minting a fresh set of WindowBuffer
+  // instances that would shadow the existing ones on every view.
+  if (func->body_ && As<CommDomainScopeStmt>(func->body_)) {
+    return func;
+  }
+
   AllocAndWindowCollector collector;
   collector.VisitStmt(func->body_);
 
@@ -347,12 +358,12 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
     allocs_with_windows[w.alloc->ptr_var.get()].push_back(&w);
   }
   for (const auto& rec : collector.allocs) {
-    INTERNAL_CHECK(!allocs_with_windows[rec->ptr_var.get()].empty())
-        << "CollectCommGroups: pld.tensor.alloc_window_buffer '" << rec->name
-        << "' has no pld.tensor.window materialisation (dead allocation) at " << rec->span.to_string();
-    INTERNAL_CHECK(!rec->seen.empty())
-        << "CollectCommGroups: pld.tensor.alloc_window_buffer '" << rec->name
-        << "' is not consumed by any chip_orch dispatch at " << rec->span.to_string();
+    INTERNAL_CHECK_SPAN(!allocs_with_windows[rec->ptr_var.get()].empty(), rec->span)
+        << "MaterializeCommDomainScopes: pld.tensor.alloc_window_buffer '" << rec->name
+        << "' has no pld.tensor.window materialisation (dead allocation)";
+    INTERNAL_CHECK_SPAN(!rec->seen.empty(), rec->span)
+        << "MaterializeCommDomainScopes: pld.tensor.alloc_window_buffer '" << rec->name
+        << "' is not consumed by any chip_orch dispatch";
   }
 
   // Phase 4: construct WindowBuffer for each alloc. Final descriptor merging
@@ -369,21 +380,21 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
     view_subst[w.old_view_var.get()] = MintViewVar(w.old_view_var, w.alloc->wb);
   }
 
-  // Phase 6: cluster allocs into CommGroups by merged descriptor (alloc-order
-  // within a group). Use a vector for deterministic group order: scan
-  // collector.allocs in source order and append to the first matching group
+  // Phase 6: cluster allocs into pending domain entries by merged descriptor
+  // (alloc-order within a domain). Use a vector for deterministic order: scan
+  // collector.allocs in source order and append to the first matching entry
   // or create a new one.
-  struct PendingGroup {
+  struct PendingDomain {
     DeviceDescriptor desc;
     std::vector<WindowBufferPtr> slots;
     std::set<std::string> names;  // sanity check
     Span span;
   };
-  std::vector<PendingGroup> pending;
+  std::vector<PendingDomain> pending;
   for (const auto& rec : collector.allocs) {
     DeviceDescriptor merged;
     for (const auto& d : rec->seen) merged.Merge(d);
-    PendingGroup* tgt = nullptr;
+    PendingDomain* tgt = nullptr;
     for (auto& g : pending) {
       if (g.desc == merged) {
         tgt = &g;
@@ -395,18 +406,30 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
       tgt = &pending.back();
     }
     INTERNAL_CHECK_SPAN(tgt->names.insert(rec->name).second, rec->span)
-        << "CollectCommGroups: duplicate allocation name '" << rec->name << "' within the same CommGroup";
+        << "MaterializeCommDomainScopes: duplicate allocation name '" << rec->name
+        << "' within the same comm domain";
     tgt->slots.push_back(rec->wb);
-  }
-  for (auto& g : pending) {
-    groups.push_back(std::make_shared<const CommGroup>(g.desc.ToDevices(), std::move(g.slots), g.span));
   }
 
   // Phase 7: rewrite host_orch body so every reference to a pld.tensor.window result
   // Var picks up the type-updated copy. The base IRMutator handles all uses;
   // Substitute is the wrapper that does exactly this transformation.
-  if (view_subst.empty()) return func;
-  auto new_body = transform_utils::Substitute(func->body_, view_subst);
+  StmtPtr new_body = view_subst.empty() ? func->body_ : transform_utils::Substitute(func->body_, view_subst);
+
+  // Phase 8: wrap new_body in nested CommDomainScopeStmts. Outer = first
+  // declared domain, inner = last. ``name_hint_`` is ``"comm_d<n>"`` so
+  // DistributedCodegen emits the matching ``__comm_d<n>`` handle var.
+  //
+  // Build inner-out: start from the substituted body, wrap once per group
+  // in reverse iteration order.
+  for (size_t i = pending.size(); i-- > 0;) {
+    auto& g = pending[i];
+    std::string name_hint = "comm_d" + std::to_string(i);
+    new_body = std::make_shared<const CommDomainScopeStmt>(g.desc.ToDevices(), std::move(g.slots),
+                                                           std::move(name_hint), new_body, g.span);
+  }
+
+  if (new_body.get() == func->body_.get()) return func;
   auto new_func = MutableCopy(func);
   new_func->body_ = new_body;
   return new_func;
@@ -416,7 +439,7 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
 
 namespace pass {
 
-Pass CollectCommGroups() {
+Pass MaterializeCommDomainScopes() {
   auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
     // Index chip-level Orchestration functions by name so the dispatch
     // analyzer can recognise host → chip Calls.
@@ -425,7 +448,6 @@ Pass CollectCommGroups() {
       if (IsChipOrch(func)) chip_orchs[func->name_] = func;
     }
 
-    std::vector<CommGroupPtr> all_groups;
     std::map<GlobalVarPtr, FunctionPtr, GlobalVarPtrLess> new_functions;
     bool modified = false;
 
@@ -434,52 +456,77 @@ Pass CollectCommGroups() {
         new_functions[gvar] = func;
         continue;
       }
-      auto new_func = ProcessHostOrch(func, chip_orchs, all_groups);
+      auto new_func = ProcessHostOrch(func, chip_orchs);
       new_functions[gvar] = new_func;
       if (new_func.get() != func.get()) modified = true;
     }
 
-    if (!modified && all_groups.empty()) return program;
-    return std::make_shared<Program>(std::move(new_functions), std::move(all_groups), program->name_,
-                                     program->span_);
+    if (!modified) return program;
+    return std::make_shared<Program>(std::move(new_functions), program->name_, program->span_);
   };
 
-  return CreateProgramPass(pass_func, "CollectCommGroups", kCollectCommGroupsProperties);
+  return CreateProgramPass(pass_func, "MaterializeCommDomainScopes", kMaterializeCommDomainScopesProperties);
 }
 
 }  // namespace pass
 
 // ============================================================================
-// CommGroupsCollected property verifier
+// CommDomainScopesMaterialized property verifier
+//
+// Walks each host_orch function body looking for ``CommDomainScopeStmt``s and
+// asserts: (a) ``slots_`` is non-empty (an empty domain would emit
+// ``window_size=0`` and the runtime would reject it); (b) every slot is
+// non-null; (c) each ``WindowBuffer`` appears as a slot in at most one
+// scope program-wide (cross-scope identity uniqueness).
 // ============================================================================
 
-class CommGroupsCollectedPropertyVerifierImpl : public PropertyVerifier {
+class CommDomainScopeCollector : public IRVisitor {
  public:
-  [[nodiscard]] std::string GetName() const override { return "CommGroupsCollected"; }
+  std::vector<CommDomainScopeStmtPtr> scopes;
+  void VisitStmt_(const CommDomainScopeStmtPtr& op) override {
+    scopes.push_back(op);
+    if (op->body_) VisitStmt(op->body_);
+  }
+};
+
+class CommDomainScopesMaterializedPropertyVerifierImpl : public PropertyVerifier {
+ public:
+  [[nodiscard]] std::string GetName() const override { return "CommDomainScopesMaterialized"; }
 
   void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
     if (!program) return;
-    std::unordered_map<const WindowBuffer*, size_t> first_seen_group;
-    for (size_t gi = 0; gi < program->comm_groups_.size(); ++gi) {
-      const auto& group = program->comm_groups_[gi];
-      if (!group) {
-        diagnostics.emplace_back(DiagnosticSeverity::Error, "CommGroupsCollected", 0,
-                                 "CommGroup at index " + std::to_string(gi) + " is null", Span::unknown());
+    CommDomainScopeCollector collector;
+    for (const auto& [gvar, func] : program->functions_) {
+      if (func && func->body_) collector.VisitStmt(func->body_);
+    }
+    std::unordered_map<const WindowBuffer*, const CommDomainScopeStmt*> first_seen;
+    for (const auto& scope : collector.scopes) {
+      if (!scope) {
+        diagnostics.emplace_back(DiagnosticSeverity::Error, "CommDomainScopesMaterialized", 0,
+                                 "null CommDomainScopeStmt in IR", Span::unknown());
         continue;
       }
-      for (const auto& slot : group->slots_) {
+      if (scope->slots_.empty()) {
+        diagnostics.emplace_back(DiagnosticSeverity::Error, "CommDomainScopesMaterialized", 0,
+                                 "CommDomainScopeStmt '" + scope->name_hint_ +
+                                     "' has no slots — every comm-domain scope must carry at least one "
+                                     "WindowBuffer",
+                                 scope->span_);
+        continue;
+      }
+      for (const auto& slot : scope->slots_) {
         if (!slot) {
-          diagnostics.emplace_back(DiagnosticSeverity::Error, "CommGroupsCollected", 0,
-                                   "CommGroup at index " + std::to_string(gi) + " has a null slot",
-                                   group->span_);
+          diagnostics.emplace_back(DiagnosticSeverity::Error, "CommDomainScopesMaterialized", 0,
+                                   "CommDomainScopeStmt '" + scope->name_hint_ + "' has a null slot",
+                                   scope->span_);
           continue;
         }
-        auto [it, inserted] = first_seen_group.emplace(slot.get(), gi);
+        auto [it, inserted] = first_seen.emplace(slot.get(), scope.get());
         if (!inserted) {
-          diagnostics.emplace_back(DiagnosticSeverity::Error, "CommGroupsCollected", 0,
+          diagnostics.emplace_back(DiagnosticSeverity::Error, "CommDomainScopesMaterialized", 0,
                                    "WindowBuffer '" + slot->name_hint_ +
-                                       "' appears in multiple CommGroups (" + std::to_string(it->second) +
-                                       " and " + std::to_string(gi) + ")",
+                                       "' appears in multiple CommDomainScopeStmts ('" +
+                                       it->second->name_hint_ + "' and '" + scope->name_hint_ + "')",
                                    slot->span_);
         }
       }
@@ -487,8 +534,8 @@ class CommGroupsCollectedPropertyVerifierImpl : public PropertyVerifier {
   }
 };
 
-PropertyVerifierPtr CreateCommGroupsCollectedPropertyVerifier() {
-  return std::make_shared<CommGroupsCollectedPropertyVerifierImpl>();
+PropertyVerifierPtr CreateCommDomainScopesMaterializedPropertyVerifier() {
+  return std::make_shared<CommDomainScopesMaterializedPropertyVerifierImpl>();
 }
 
 }  // namespace ir

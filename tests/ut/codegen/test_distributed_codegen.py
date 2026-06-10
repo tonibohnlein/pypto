@@ -290,6 +290,94 @@ class TestDistributedCodegen:
         assert isinstance(verify_fn.body, ir.InlineStmt)
         assert verify_fn.body.language == ir.InlineLanguage.Python
         assert isinstance(verify_fn.body.body, str)
+        # A concrete (`pass`) body is NOT a runtime-bound callback.
+        assert verify_fn.requires_runtime_binding is False
+
+    def test_abstract_sub_worker_is_runtime_bound(self):
+        """A SubWorker declared with a `...` body is an abstract callback."""
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def sample(logits: pl.Tensor[[8, 16], pl.FP32]) -> pl.Tensor[[8], pl.INT32]: ...
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self, x: pl.Tensor[[8, 16], pl.FP32]) -> pl.Tensor[[8, 16], pl.FP32]:
+                self.sample(x)
+                return x
+
+        sample_fn = Input.get_function("sample")
+        assert sample_fn is not None
+        assert sample_fn.requires_runtime_binding is True
+        # Abstract body carries no captured source text.
+        assert isinstance(sample_fn.body, ir.InlineStmt)
+        assert sample_fn.body.body == ""
+
+    def test_abstract_sub_worker_round_trips_as_ellipsis(self):
+        """An abstract SubWorker prints as `...` and reparses to the same flag."""
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def sample(logits: pl.Tensor[[8, 16], pl.FP32]) -> pl.Tensor[[8], pl.INT32]: ...
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self, x: pl.Tensor[[8, 16], pl.FP32]) -> pl.Tensor[[8, 16], pl.FP32]:
+                self.sample(x)
+                return x
+
+        printed = str(Input)
+        assert "def sample(" in printed
+        assert "..." in printed
+
+        reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(Input, reparsed)
+        sample_fn = reparsed.get_function("sample")
+        assert sample_fn is not None
+        assert sample_fn.requires_runtime_binding is True
+
+    def test_abstract_sub_worker_emits_guard_stub(self):
+        """Codegen emits a raising guard for an abstract SubWorker module."""
+        from pypto.backend.pto_backend import _emit_sub_worker_module  # noqa: PLC0415
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def sample(logits: pl.Tensor[[8, 16], pl.FP32]) -> pl.Tensor[[8], pl.INT32]: ...
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self, x: pl.Tensor[[8, 16], pl.FP32]) -> pl.Tensor[[8, 16], pl.FP32]:
+                self.sample(x)
+                return x
+
+        sample_fn = Input.get_function("sample")
+        assert sample_fn is not None
+        module = _emit_sub_worker_module(sample_fn)
+        assert "def sample(args):" in module
+        assert "raise RuntimeError" in module
+        assert "prepare(callbacks=" in module
+        # Generated stub must be syntactically valid Python.
+        compile(module, "<sample>", "exec")
+
+    def test_abstract_sub_worker_survives_pto_serialization(self):
+        """requires_runtime_binding round-trips through binary .pto serialization."""
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def sample(logits: pl.Tensor[[8, 16], pl.FP32]) -> pl.Tensor[[8], pl.INT32]: ...
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self, x: pl.Tensor[[8, 16], pl.FP32]) -> pl.Tensor[[8, 16], pl.FP32]:
+                self.sample(x)
+                return x
+
+        restored = ir.deserialize(ir.serialize(Input))
+        assert isinstance(restored, ir.Program)
+        sample_fn = restored.get_function("sample")
+        assert sample_fn is not None
+        assert sample_fn.requires_runtime_binding is True
+        ir.assert_structural_equal(Input, restored)
 
     def test_create_tensor_emits_shared_torch_zeros(self):
         """tensor.create in HOST orchestrator emits torch.zeros(...).share_memory_()."""
@@ -620,6 +708,39 @@ class TestSubWorkerSourceGeneration:
         assert worker_fn is not None
         source = _emit_sub_worker_module(worker_fn)
         assert "import torch" in source
+
+
+class TestChipTaskCollection:
+    """Next-level program extraction must follow Submit callees, not just Call."""
+
+    def test_collect_chip_funcs_includes_submit_callee(self):
+        """Regression for issue #1707: a kernel reached only via ``pl.submit``.
+
+        Orchestration submits ``down_seed`` through ``pl.submit`` inside a
+        ``pl.manual_scope``. The submitted InCore callee must appear in the
+        collected chip program, or distributed codegen drops it and fails with
+        ``function 'down_seed' not found after validation``.
+        """
+        from pypto.backend.pto_backend import _collect_chip_task_functions  # noqa: PLC0415
+
+        @pl.program
+        class Input:
+            @pl.function(type=pl.FunctionType.InCore)
+            def down_seed(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def decode_fwd(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a, _a_tid = pl.submit(self.down_seed, x)
+                return a
+
+        orch = Input.get_function("decode_fwd")
+        assert orch is not None
+        chip_funcs = _collect_chip_task_functions(orch, Input)
+        names = {f.name for f in chip_funcs}
+        assert "down_seed" in names, names
 
 
 if __name__ == "__main__":

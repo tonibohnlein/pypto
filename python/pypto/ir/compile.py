@@ -64,6 +64,7 @@ def compile(  # noqa: PLR0913
     platform: str | None = None,
     distributed_config: Any = None,
     block_dim: int | None = None,
+    analyze_auto_scopes_for_deps: bool = False,
 ) -> "CompiledProgram | DistributedCompiledProgram":
     """Compile a Program through passes and codegen.
 
@@ -111,6 +112,11 @@ def compile(  # noqa: PLR0913
             count is below simpler's default of 24, or when the kernel
             needs a specific block count. Ignored for L3+ distributed
             programs — set ``DistributedConfig.block_dim`` instead.
+
+        analyze_auto_scopes_for_deps: If True, let
+            ``AutoDeriveTaskDependencies`` analyze AUTO runtime scopes in
+            addition to manual scopes. The default is False to preserve the
+            existing TensorMap-fallback behavior unless explicitly enabled.
 
     Returns:
         A :class:`CompiledProgram` that wraps the output directory and can
@@ -189,7 +195,10 @@ def compile(  # noqa: PLR0913
 
     try:
         with ctx:
-            pm = PassManager.get_strategy(strategy)
+            pm = PassManager.get_strategy(
+                strategy,
+                analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+            )
             passes_dump_dir = os.path.join(output_dir, "passes_dump")
             with _stage("passes"):
                 transformed_program = pm.run_passes(program, dump_ir=dump_passes, output_dir=passes_dump_dir)

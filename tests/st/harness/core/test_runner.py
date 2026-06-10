@@ -223,7 +223,12 @@ def _write_golden_for_test_case(test_case: PTOTestCase, output_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-def _compile_for_cache(test_case: "PTOTestCase", work_dir: Path, dump_passes: bool) -> None:
+def _compile_for_cache(
+    test_case: "PTOTestCase",
+    work_dir: Path,
+    dump_passes: bool,
+    analyze_auto_scopes_for_deps: bool,
+) -> None:
     """Compile one test case into *work_dir* (called from thread pool).
 
     The backend type MUST already be set by the caller before entering the pool.
@@ -245,6 +250,7 @@ def _compile_for_cache(test_case: "PTOTestCase", work_dir: Path, dump_passes: bo
         strategy=test_case.get_strategy(),
         backend_type=backend_type,
         dump_passes=dump_passes,
+        analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
     )
     if not list((work_dir / "kernels").rglob("*.cpp")):
         raise ValueError(f"No kernels generated for {test_case.get_name()}")
@@ -277,6 +283,7 @@ def _fused_compile_task(
     cache_dir: Path,
     session_platform: str,
     dump_passes: bool,
+    analyze_auto_scopes_for_deps: bool,
     pto_isa_commit: str | None,
 ) -> CompileArtifact:
     """Compile IR → kernels/orch C++ → golden.py → .so for one test case.
@@ -290,7 +297,7 @@ def _fused_compile_task(
     work_dir = cache_dir / _cache_key(tc, resolved)
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        _compile_for_cache(tc, work_dir, dump_passes)
+        _compile_for_cache(tc, work_dir, dump_passes, analyze_auto_scopes_for_deps)
         # Codegen-only runs skip assembly: the .so is never loaded by the
         # execute task (see _fused_execute_task) and assembling here would
         # both waste work and race on PTO_ISA_ROOT (start_pipeline skips
@@ -355,7 +362,7 @@ def _fused_execute_task(
     device_id = _device_pool.get()
     try:
         _executed_device[cache_key] = device_id
-        _execute_on_device(
+        timing = _execute_on_device(
             artifact.work_dir,
             artifact.work_dir / "golden.py",
             artifact.chip_callable,
@@ -368,6 +375,8 @@ def _fused_execute_task(
             passed=True,
             test_name=name,
             execution_time=time.time() - start,
+            device_wall_us=timing.device_wall_us,
+            host_wall_us=timing.host_wall_us,
         )
     except Exception as exc:
         return RunResult(
@@ -409,6 +418,7 @@ def start_pipeline(  # noqa: PLR0913
     pto_isa_commit: str | None,
     compile_workers: int,
     device_pool: "queue.Queue[int]",
+    analyze_auto_scopes_for_deps: bool = False,
     enable_l2_swimlane: bool = False,
     enable_dump_tensor: int = 0,
     enable_pmu: int = 0,
@@ -449,6 +459,7 @@ def start_pipeline(  # noqa: PLR0913
         "dump_passes": dump_passes,
         "codegen_only": codegen_only,
         "pto_isa_commit": pto_isa_commit,
+        "analyze_auto_scopes_for_deps": analyze_auto_scopes_for_deps,
         "dfx": _DfxOpts(
             enable_l2_swimlane=enable_l2_swimlane,
             enable_dump_tensor=enable_dump_tensor,
@@ -479,6 +490,7 @@ def start_pipeline(  # noqa: PLR0913
                 cache_dir,
                 session_platform,
                 dump_passes,
+                analyze_auto_scopes_for_deps,
                 pto_isa_commit,
             )
             # TestRunner.run() blocks on this compile future, rewrites
@@ -622,6 +634,7 @@ class TestRunner:
                 strategy=strategy,
                 backend_type=backend_type,
                 dump_passes=self.config.dump_passes,
+                analyze_auto_scopes_for_deps=self.config.analyze_auto_scopes_for_deps,
             )
 
             if not list((work_dir / "kernels").rglob("*.cpp")):
@@ -648,7 +661,7 @@ class TestRunner:
             chip_callable, runtime_name, _ = compile_and_assemble(
                 work_dir, resolved_platform, pto_isa_commit=self.config.pto_isa_commit
             )
-            _execute_on_device(
+            timing = _execute_on_device(
                 work_dir,
                 golden_path,
                 chip_callable,
@@ -662,6 +675,8 @@ class TestRunner:
                 passed=True,
                 test_name=test_name,
                 execution_time=time.time() - start_time,
+                device_wall_us=timing.device_wall_us,
+                host_wall_us=timing.host_wall_us,
             )
 
         except Exception as e:

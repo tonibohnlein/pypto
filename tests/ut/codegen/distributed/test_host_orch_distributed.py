@@ -11,7 +11,7 @@
 
 Covers four orthogonal pieces of the host_orch emit:
 
-1. Programs with at least one CommGroup wrap the body in
+1. Programs with at least one comm domain wrap the body in
    ``with orch.allocate_domain(name=..., workers=..., window_size=...,
    buffers=[CommBufferSpec(...)]) as __comm_d0:``.
 2. DistributedTensor formal → ``add_tensor(ContinuousTensor.make(data=__comm_d0[<r>]
@@ -45,11 +45,11 @@ SIZE = 64
 def pass_verification_context():
     """Override ``ut/conftest.py``'s autouse roundtrip-verification fixture.
 
-    ``CollectCommGroups`` materialises ``DistributedTensorType.window_buffer_``
+    ``MaterializeCommDomainScopes`` materialises ``DistributedTensorType.window_buffer_``
     back-references that the printer / parser pair has no surface syntax for —
     the roundtrip check would fail despite the in-memory IR being correct.
     Mirrors the same override in
-    [tests/ut/ir/transforms/test_collect_comm_groups.py](../../ir/transforms/test_collect_comm_groups.py).
+    [tests/ut/ir/transforms/test_materialize_comm_domain_scopes.py](../../ir/transforms/test_materialize_comm_domain_scopes.py).
     The fixture name MUST be ``pass_verification_context`` to shadow the
     conftest's same-named autouse fixture (pytest fixture override semantics).
     """
@@ -58,9 +58,9 @@ def pass_verification_context():
 
 
 def _lower(program) -> str:
-    """Apply ``CollectCommGroups`` (so ``DistributedTensorType.window_buffer_``
+    """Apply ``MaterializeCommDomainScopes`` (so ``DistributedTensorType.window_buffer_``
     is populated), then run distributed codegen directly."""
-    program = passes.collect_comm_groups()(program)
+    program = passes.materialize_comm_domain_scopes()(program)
     cg = codegen.DistributedCodegen()
     return cg.generate(program)
 
@@ -219,7 +219,7 @@ def test_comm_group_program_emits_allocate_domain_with_block():
     # The with-block opens with the literal spec list and binds the handle.
     assert re.search(r"with orch\.allocate_domain\(", code), code
     assert re.search(r'name="comm_d0",', code), code
-    # Empty CommGroup.devices_ (this program declares no explicit subset on
+    # Empty CommDomainScopeStmt.devices_ (this program declares no explicit subset on
     # the alloc) lowers to `workers=[*range(world_size)]` — resolved at
     # orch_fn time against the runner-bound `world_size` kwarg.
     assert re.search(r"workers=\[\*range\(world_size\)\],", code), code
@@ -348,12 +348,12 @@ def test_hoisted_world_size_temp_in_alloc_size_lowers_to_kwarg():
 
 
 # ---------------------------------------------------------------------------
-# Multi-CommGroup: two allocs dispatched to disjoint device subsets emit
+# Multi-comm-domain: two allocs dispatched to disjoint device subsets emit
 # nested ``with orch.allocate_domain(...)`` blocks and route each
 # DistributedTensor through its own ``__comm_d<idx>`` handle.
 # Mirrors the IR-level test
 # ``test_two_allocs_different_descriptors_two_groups`` in
-# tests/ut/ir/transforms/test_collect_comm_groups.py.
+# tests/ut/ir/transforms/test_materialize_comm_domain_scopes.py.
 # ---------------------------------------------------------------------------
 
 

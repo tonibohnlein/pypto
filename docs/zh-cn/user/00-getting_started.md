@@ -326,6 +326,34 @@ with compiled.prepare() as rt:                  # setup 只跑一次
 # 退出时自动 rt.close()
 ```
 
+#### 在同一个 worker 上调度多个程序（multi-program）
+
+Serving 场景需要把 prefill 和 decode 作为两个独立的 HOST 程序,共享同一个 L3
+worker 和同一份设备常驻 KV cache。把一组兼容的 `DistributedCompiledProgram`
+以列表形式传给 `DistributedWorker`,或等价地用
+`prefill.prepare(extra_compiled=[decode])`——它们会在同一个 worker 上一次性
+准备好,再用 `rt.run(compiled, *args)` 选择分发哪一个。各程序必须使用相同的
+platform、runtime 和 device ids。多程序模式下 `rt(*args)` 这个快捷方式会被禁用
+(目标程序有歧义)——一律用 `rt.run(...)`。worker 常驻的 `DeviceTensor`
+(如 KV cache)在两个程序的多次 dispatch 之间始终有效。
+
+可运行的端到端示例见
+[`examples/runtime/multi_program_kv_cache.py`](../../../examples/runtime/multi_program_kv_cache.py)。
+
+```python
+from pypto.runtime import DistributedWorker, RunConfig
+
+cfg = RunConfig(platform="a2a3", distributed_config=dc)
+prefill_c = prefill.compile(host_prompt, kv_sample, config=cfg)   # @pl.jit.host kernel:
+decode_c = decode.compile(host_token, kv_sample, host_logits, config=cfg)  # 只编译不下发
+
+with DistributedWorker([prefill_c, decode_c]) as rt:    # 一个 worker,一次 fork
+    kv_cache = rt.alloc_tensor(kv_shape, torch.float16)  # 两个程序共享常驻
+    rt.run(prefill_c, host_prompt, kv_cache)             # 写入 KV cache
+    for _ in range(max_new_tokens):
+        rt.run(decode_c, host_token, kv_cache, host_logits)  # 读取/更新 KV cache
+```
+
 ## 下一步
 
 - **[语言指南](01-language_guide.md)** —— 类型、操作、控制流、内存和编译的完整参考

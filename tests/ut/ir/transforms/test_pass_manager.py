@@ -56,8 +56,9 @@ TENSOR_OPTIMIZATION_PASSES = [
     "FoldNoOpReshape",
     "FuseCreateAssembleToSlice",
     "DeriveCallDirections",
+    "AutoDeriveTaskDependencies",
     "ExpandManualPhaseFence",
-    "CollectCommGroups",
+    "MaterializeCommDomainScopes",
     "Simplify",
     "MaterializeRuntimeScopes",
 ]
@@ -91,8 +92,9 @@ DEBUG_TILE_OPTIMIZATION_PASSES = [
     "FoldNoOpReshape",
     "FuseCreateAssembleToSlice",
     "DeriveCallDirections",
+    "AutoDeriveTaskDependencies",
     "ExpandManualPhaseFence",
-    "CollectCommGroups",
+    "MaterializeCommDomainScopes",
     "Simplify",
     "MaterializeRuntimeScopes",
 ]
@@ -151,6 +153,26 @@ class TestPassManagerBasics:
         assert pm.strategy == ir.OptimizationStrategy.DebugTileOptimization
         assert pm.pass_names == DEBUG_TILE_OPTIMIZATION_PASSES
         assert not set(TENSOR_ONLY_PASSES).intersection(pm.pass_names)
+
+    def test_auto_scope_deps_switch_forwarded_to_pass_factory(self, monkeypatch):
+        """PassManager forwards the high-level AUTO-scope deps switch."""
+        import pypto.ir.pass_manager as pass_manager_mod  # noqa: PLC0415
+
+        captured: list[bool] = []
+
+        def fake_auto_deps(*, analyze_auto_scopes=False):
+            captured.append(analyze_auto_scopes)
+            return passes.simplify()
+
+        monkeypatch.setattr(pass_manager_mod.passes, "auto_derive_task_dependencies", fake_auto_deps)
+
+        ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        ir.PassManager.get_strategy(
+            ir.OptimizationStrategy.Default,
+            analyze_auto_scopes_for_deps=True,
+        )
+
+        assert captured == [False, True]
 
 
 class TestPassManagerExecution:

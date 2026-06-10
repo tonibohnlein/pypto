@@ -74,7 +74,7 @@ class ScalarCacheInfo:
 
 
 # A cache key is a tuple of
-# (source_hash, platform, strategy, tensor_infos, scalar_infos, dist_config).
+# (source_hash, platform, strategy, tensor_infos, scalar_infos, dist_config, compile_opts).
 # Using a plain tuple keeps it hashable without a custom __hash__.
 CacheKey = tuple[
     str,
@@ -82,6 +82,7 @@ CacheKey = tuple[
     "OptimizationStrategy | None",
     tuple[TensorCacheInfo, ...],
     tuple[ScalarCacheInfo, ...],
+    tuple[Any, ...] | None,
     tuple[Any, ...] | None,
 ]
 
@@ -132,6 +133,7 @@ def make_cache_key(
     platform: str | None = None,
     strategy: "OptimizationStrategy | None" = None,
     distributed_config: Any = None,
+    analyze_auto_scopes_for_deps: bool = False,
 ) -> CacheKey:
     """Build a cache key for a JIT call site.
 
@@ -161,6 +163,9 @@ def make_cache_key(
             would silently reuse the first-compiled artifact. ``None`` (the
             single-chip default) leaves the key unchanged for non-distributed
             callers.
+        analyze_auto_scopes_for_deps: Compile-side switch for deriving explicit
+            task dependencies from AUTO runtime scopes. Included in the key
+            because it changes generated orchestration dependencies.
 
     Returns:
         Hashable CacheKey tuple.
@@ -182,7 +187,16 @@ def make_cache_key(
         scalar_infos.append(ScalarCacheInfo(name=name, value=scalar_values[name]))
 
     dist_key = _freeze(distributed_config) if distributed_config is not None else None
-    return (source_hash, platform, strategy, tuple(tensor_infos), tuple(scalar_infos), dist_key)
+    compile_opts = (("analyze_auto_scopes_for_deps", analyze_auto_scopes_for_deps),)
+    return (
+        source_hash,
+        platform,
+        strategy,
+        tuple(tensor_infos),
+        tuple(scalar_infos),
+        dist_key,
+        compile_opts,
+    )
 
 
 def _key_to_hash(key: CacheKey) -> str:

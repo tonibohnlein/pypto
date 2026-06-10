@@ -23,7 +23,11 @@ from simpler.task_interface import (  # pyright: ignore[reportMissingImports]
     DataType,
     scalar_to_uint64,
 )
-from simpler.worker import Worker  # pyright: ignore[reportMissingImports]
+
+# ``RunTiming`` is a native ``_task_interface`` nanobind type re-exported by
+# ``simpler.worker`` (not by ``simpler.task_interface``), so import it alongside
+# ``Worker`` from there.
+from simpler.worker import RunTiming, Worker  # pyright: ignore[reportMissingImports]
 from simpler_setup.torch_interop import (  # pyright: ignore[reportMissingImports]
     make_tensor_arg,
     torch_dtype_to_datatype,
@@ -54,6 +58,7 @@ __all__ = [
     "ContinuousTensor",
     "CoreCallable",
     "DataType",
+    "RunTiming",
     "Worker",
     "device_tensor_to_continuous",
     "make_tensor_arg",

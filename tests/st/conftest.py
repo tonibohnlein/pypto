@@ -175,6 +175,14 @@ def pytest_addoption(parser):
         default=None,
         help="Pin the pto-isa clone to a specific git commit (hash or tag). Default: use latest remote HEAD.",
     )
+    parser.addoption(
+        "--analyze-auto-scopes-for-deps",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable compile-time AUTO-scope task dependency derivation for both inline and precompiled runs."
+        ),
+    )
     # ── DFX (Design For X) toggles ────────────────────────────────────────
     # Each maps 1:1 to the same-named field on ``RunConfig`` and to the
     # corresponding ``CallConfig`` member on the runtime side. Names match
@@ -392,6 +400,7 @@ def test_config(request) -> RunConfig:
         enable_pmu=request.config.getoption("--enable-pmu"),
         enable_dep_gen=request.config.getoption("--enable-dep-gen"),
         enable_scope_stats=request.config.getoption("--enable-scope-stats"),
+        analyze_auto_scopes_for_deps=request.config.getoption("--analyze-auto-scopes-for-deps"),
     )
 
 
@@ -618,6 +627,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     enable_pmu: int = session.config.getoption("--enable-pmu")
     enable_dep_gen: bool = session.config.getoption("--enable-dep-gen")
     enable_scope_stats: bool = session.config.getoption("--enable-scope-stats")
+    analyze_auto_scopes_for_deps: bool = session.config.getoption("--analyze-auto-scopes-for-deps")
 
     # ── determine cache directory ─────────────────────────────────────────────
     save_kernels: bool = session.config.getoption("--save-kernels")
@@ -663,6 +673,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         enable_pmu=enable_pmu,
         enable_dep_gen=enable_dep_gen,
         enable_scope_stats=enable_scope_stats,
+        analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
     )
     print("[PyPTO] Pipeline scheduled — pytest item loop starting\n")
 

@@ -15,6 +15,7 @@ import pypto.language as pl
 import pytest
 from pypto import backend, ir, passes
 from pypto.backend import BackendType
+from pypto.ir import op as ir_op
 from pypto.ir.printer import python_print
 
 
@@ -955,7 +956,7 @@ class TestSplitVectorKernelNoSplitA2A3:
 
         _assert_split_matches_expected(Before, Expected)
 
-    def test_no_split_dual_dispatch_rewrites_lane1_three_arg_tile_load(self):
+    def test_no_split_dual_dispatch_rewrites_lane1_tile_load_to_create(self):
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -964,6 +965,7 @@ class TestSplitVectorKernelNoSplitA2A3:
         dim = ir.ConstInt(16, pl.INDEX, span)
         offsets = ir.MakeTuple([zero, zero], span)
         shapes = ir.MakeTuple([dim, dim], span)
+        valid_shapes = ir.MakeTuple([dim, dim], span)
 
         data = ir.Var("data", ir.TensorType([16, 16], pl.FP32), span)
         out = ir.Var("out", ir.TensorType([16, 16], pl.FP32), span)
@@ -971,17 +973,37 @@ class TestSplitVectorKernelNoSplitA2A3:
         load_view = ir.TileView(valid_shape=[dim, dim])
         load_type = ir.TileType([16, 16], pl.FP32, None, load_view, ir.MemorySpace.Vec)
         loaded = ir.Var("loaded", load_type, span)
+        # Canonical 4-operand tile.load ([tensor, offsets, shapes, valid_shapes])
+        # with the full kwarg set the DSL/IR builder emits (target_memory +
+        # transpose). Matching the canonical operand/kwarg arity is what lets the
+        # hand-built body survive the print->parse roundtrip verifier.
         load_call = ir.Call(
             ir.Op("tile.load"),
-            [data, offsets, shapes],
-            {"target_memory": ir.MemorySpace.Vec},
+            [data, offsets, shapes, valid_shapes],
+            {"target_memory": ir.MemorySpace.Vec, "transpose": False},
             load_type,
             span,
         )
 
         tpush_call = ir.Call(ir.Op("tile.tpush_to_aic"), [loaded], {"split": 0}, ir.UnknownType(), span)
+
+        # Cross-core pipe scaffolding the MixedKernelExpanded property requires
+        # for an AIV function that uses a V2C op (tpush_to_aic): a dominating
+        # import_peer_buffer + aiv_initialize_pipe. Built via the IR op builders
+        # so the Calls are canonical and survive the roundtrip verifier. This is
+        # the same scaffolding ExpandMixedKernel injects in the real pipeline.
+        peer_buf_call = ir_op.system.import_peer_buffer(
+            name="v2c_slot_buffer", peer_func="main_aic", span=span
+        )
+        peer_buf = ir.Var("peer_buf", peer_buf_call.type, span)
+        init_pipe_call = ir_op.system.aiv_initialize_pipe(
+            v2c_consumer_buf=peer_buf, dir_mask=2, slot_size=512, span=span
+        )
+
         body = ir.SeqStmts(
             [
+                ir.AssignStmt(peer_buf, peer_buf_call, span),
+                ir.EvalStmt(init_pipe_call, span),
                 ir.AssignStmt(loaded, load_call, span),
                 ir.EvalStmt(tpush_call, span),
                 ir.ReturnStmt([out], span),
@@ -998,18 +1020,7 @@ class TestSplitVectorKernelNoSplitA2A3:
             attrs={"dual_aiv_dispatch": True},
         )
 
-        # NOTE: Verification is disabled only for this case because the body is
-        # hand-built with a non-canonical 3-arg ``tile.load`` (explicit
-        # ``valid_shape`` operand). The printer canonicalizes that to the 2-arg
-        # form, so print->reparse yields a 2-arg load and the roundtrip
-        # structural-equality check fails on ``body[...].value.args`` — already
-        # at ``convert_to_ssa``, independent of SplitVectorKernel and of the
-        # MixedKernelExpanded property. The purpose of this test is the lane1
-        # 3-arg ``tile.load`` -> ``tile.create`` rewrite (asserted on printed
-        # text below), which the NONE bypass preserves; the roundtrip
-        # limitation of the raw 3-arg load is orthogonal.
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            actual = _run_split_vector_kernel(ir.Program([func], "three_arg_tile_load_program", span))
+        actual = _run_split_vector_kernel(ir.Program([func], "tile_load_program", span))
         printed = python_print(actual)
 
         assert "if subblock_idx == 0:" in printed
@@ -1018,6 +1029,102 @@ class TestSplitVectorKernelNoSplitA2A3:
         assert printed.count("pl.tile.tpush_to_aic(") == 2
         assert re.search(
             r"loaded__ssa_v0_\d+: pl.Tile\[\[16, 16\], pl.FP32, pl.Mem.Vec, "
+            r"pl.TileView\(valid_shape=\[0, 0\]\)\] = pl.tile.create",
+            printed,
+        )
+
+    def test_no_split_dual_dispatch_rewrites_lane1_tile_slice_to_create(self):
+        """Lane1 replay rewrites a producer ``tile.slice`` into ``tile.create``.
+
+        A ``tile.slice`` is a pure view with no cross-core sync, so the replay
+        lane only needs an empty tile of the slice's result shape. Forcing the
+        slice's explicit ``valid_shape`` to a static 0 would emit a
+        ``v_row=0, v_col=0`` subview that pto-isa cannot compile (no
+        ``GetValidRow`` overload for a static mask of 0); the rewrite to
+        ``tile.create`` yields a dynamic-valid empty tile instead (gh#1649).
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        span = ir.Span.unknown()
+        zero = ir.ConstInt(0, pl.INDEX, span)
+        dim = ir.ConstInt(16, pl.INDEX, span)
+        sub = ir.ConstInt(8, pl.INDEX, span)
+        offsets = ir.MakeTuple([zero, zero], span)
+        shapes = ir.MakeTuple([dim, dim], span)
+        valid_shapes = ir.MakeTuple([dim, dim], span)
+        slice_shape = ir.MakeTuple([dim, sub], span)
+
+        data = ir.Var("data", ir.TensorType([16, 16], pl.FP32), span)
+        out = ir.Var("out", ir.TensorType([16, 8], pl.FP32), span)
+
+        load_type = ir.TileType(
+            [16, 16], pl.FP32, None, ir.TileView(valid_shape=[dim, dim]), ir.MemorySpace.Vec
+        )
+        loaded = ir.Var("loaded", load_type, span)
+        # Canonical 4-operand tile.load + full kwarg set (see the load->create
+        # test above) so the hand-built body round-trips under verification. The
+        # producer ``tile.slice`` below is already canonical: a 3-operand
+        # ``[tile, shape, offset]`` slice (no explicit valid_shape) is exactly
+        # what the DSL/IR builder emits, so it needs no padding.
+        load_call = ir.Call(
+            ir.Op("tile.load"),
+            [data, offsets, shapes, valid_shapes],
+            {"target_memory": ir.MemorySpace.Vec, "transpose": False},
+            load_type,
+            span,
+        )
+
+        slice_type = ir.TileType(
+            [16, 8], pl.FP32, None, ir.TileView(valid_shape=[dim, sub]), ir.MemorySpace.Vec
+        )
+        sliced = ir.Var("sliced", slice_type, span)
+        slice_call = ir.Call(ir.Op("tile.slice"), [loaded, slice_shape, offsets], {}, slice_type, span)
+
+        tpush_call = ir.Call(ir.Op("tile.tpush_to_aic"), [sliced], {"split": 0}, ir.UnknownType(), span)
+
+        # Cross-core pipe scaffolding required by MixedKernelExpanded for an AIV
+        # function using a V2C op (see the load->create test above).
+        peer_buf_call = ir_op.system.import_peer_buffer(
+            name="v2c_slot_buffer", peer_func="main_aic", span=span
+        )
+        peer_buf = ir.Var("peer_buf", peer_buf_call.type, span)
+        init_pipe_call = ir_op.system.aiv_initialize_pipe(
+            v2c_consumer_buf=peer_buf, dir_mask=2, slot_size=512, span=span
+        )
+
+        body = ir.SeqStmts(
+            [
+                ir.AssignStmt(peer_buf, peer_buf_call, span),
+                ir.EvalStmt(init_pipe_call, span),
+                ir.AssignStmt(loaded, load_call, span),
+                ir.AssignStmt(sliced, slice_call, span),
+                ir.EvalStmt(tpush_call, span),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        )
+        func = ir.Function(
+            "main_aiv",
+            [(data, ir.ParamDirection.In), (out, ir.ParamDirection.Out)],
+            [out.type],
+            body,
+            span,
+            ir.FunctionType.AIV,
+            attrs={"dual_aiv_dispatch": True},
+        )
+
+        actual = _run_split_vector_kernel(ir.Program([func], "tile_slice_program", span))
+        printed = python_print(actual)
+
+        assert "if subblock_idx == 0:" in printed
+        # Lane0 keeps the real slice; lane1 replaces it (and the load) with create.
+        assert printed.count("pl.tile.slice(") == 1
+        assert printed.count("pl.tile.create(") == 2
+        # The lane1 slice result is a dynamic-valid empty [16, 8] tile, never a
+        # static v_row=0/v_col=0 subview.
+        assert re.search(
+            r"sliced__ssa_v0_\d+: pl.Tile\[\[16, 8\], pl.FP32, pl.Mem.Vec, "
             r"pl.TileView\(valid_shape=\[0, 0\]\)\] = pl.tile.create",
             printed,
         )

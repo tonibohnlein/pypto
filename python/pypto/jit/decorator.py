@@ -1033,6 +1033,9 @@ def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
     unset value defers to ``ir.compile()``'s default (a single-chip
     ``CompiledProgram``) and keeps it out of the cache key for non-distributed
     callers.
+
+    ``analyze_auto_scopes_for_deps`` is forwarded because it changes the pass
+    pipeline's dependency derivation and therefore the generated orchestration.
     """
     kwargs: dict[str, Any] = {
         "strategy": run_config.strategy,
@@ -1040,6 +1043,7 @@ def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
         "profiling": run_config.compile_profiling,
         "diagnostic_phase": run_config.diagnostic_phase,
         "disabled_diagnostics": run_config.disabled_diagnostics,
+        "analyze_auto_scopes_for_deps": run_config.analyze_auto_scopes_for_deps,
     }
     if run_config.save_kernels_dir is not None:
         kwargs["output_dir"] = run_config.save_kernels_dir
@@ -1105,6 +1109,12 @@ class JITFunction:
         ) = None
         self._cache: dict[CacheKey, Any] = {}  # CacheKey → CompiledProgram
         self._source_hash: str | None = None
+
+        # RunTiming from the most recent __call__, forwarded from the dispatched
+        # CompiledProgram (host_wall_us / device_wall_us), or None before the
+        # first on-device run. Lets callers read timing for a plain
+        # ``kernel(*args, config=...)`` dispatch without changing its return.
+        self.last_run_timing: Any = None
 
         # Preserve function metadata
         self.__name__ = func.__name__
@@ -1338,6 +1348,9 @@ class JITFunction:
         # drives per-rank dispatch, so it must split the cache: two @pl.jit.host
         # calls with different device_ids compile to distinct artifacts.
         distributed_config = run_config.distributed_config if run_config is not None else None
+        analyze_auto_scopes_for_deps = (
+            run_config.analyze_auto_scopes_for_deps if run_config is not None else False
+        )
         key = make_cache_key(
             source_hash=self._get_source_hash(),
             param_names=param_names,
@@ -1348,6 +1361,7 @@ class JITFunction:
             platform=platform,
             strategy=strategy,
             distributed_config=distributed_config,
+            analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
         )
 
         # L1 cache lookup
@@ -1397,12 +1411,17 @@ class JITFunction:
         Returns:
             ``None`` for in-place calls (output tensors modified on device),
             or ``torch.Tensor`` / ``tuple[torch.Tensor, ...]`` for return-style
-            calls.
+            calls. The on-device timing for this call is stored on
+            :attr:`last_run_timing` (a simpler ``RunTiming`` with
+            ``host_wall_us`` / ``device_wall_us``).
         """
         compiled, ordered_args, run_config = self._resolve_compiled(args, kwargs)
         if run_config is not None:
-            return compiled(*ordered_args, config=run_config)
-        return compiled(*ordered_args)
+            result = compiled(*ordered_args, config=run_config)
+        else:
+            result = compiled(*ordered_args)
+        self.last_run_timing = getattr(compiled, "last_run_timing", None)
+        return result
 
     def compile(self, *args: Any, **kwargs: Any) -> Any:
         """Specialize + compile for the shape/dtype combination implied by *args*,

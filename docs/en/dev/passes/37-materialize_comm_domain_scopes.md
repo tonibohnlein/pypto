@@ -1,8 +1,8 @@
-# CollectCommGroups Pass
+# MaterializeCommDomainScopes Pass
 
 ## Overview
 
-`CollectCommGroups` walks each host-orchestration function and assembles the
+`MaterializeCommDomainScopes` walks each host-orchestration function and assembles the
 host-side metadata that the distributed runtime needs in order to size and
 populate per-rank communication windows. It is the structural analogue of
 [`InitMemRef`](28-init_memref.md): it traces an allocation through to its
@@ -15,14 +15,14 @@ the IR types so downstream codegen has O(1) access.
 | Assignment LHS at parse time | `Var(PtrType)` | `Var(PtrType)` (same singleton) |
 | Wrapper Var subclass | `MemRef` | `WindowBuffer` |
 | Wrapper's SSA-edge type | `MemRefType` (singleton) | `WindowBufferType` (singleton) |
-| Built by | `InitMemRef` | **`CollectCommGroups`** (this pass) |
+| Built by | `InitMemRef` | **`MaterializeCommDomainScopes`** (this pass) |
 | Threaded back onto | `TensorType.memref_` | `DistributedTensorType.window_buffer_` |
-| Program-level registry | `Program.functions_` (alloc stmts) | `Program.comm_groups_` |
+| IR-level registry | `Program.functions_` (alloc stmts) | `CommDomainScopeStmt` wrapping each host_orch body (one per inferred comm domain) |
 
 ## Position in the pipeline
 
 ```text
-…  →  DeriveCallDirections  →  CollectCommGroups  →  Simplify (final)
+... -> DeriveCallDirections -> AutoDeriveTaskDependencies -> ExpandManualPhaseFence -> MaterializeCommDomainScopes -> Simplify (final)
 ```
 
 The pass runs at the very end of the default pipeline, immediately before the
@@ -78,9 +78,16 @@ For every host-orchestration function (`Function::level_ == Level::HOST` and
    `shared_ptr<const WindowBuffer>`. Chip-orch / InCore parameter types are
    not touched.
 
-7. **Cluster into groups.** Walk the allocation list in source order; append
-   to the first existing `CommGroup` whose descriptor matches, or open a new
-   one. `Program.comm_groups_` ends up populated with the resulting list.
+7. **Cluster into comm domains.** Walk the allocation list in source order;
+   append a slot to the first existing comm domain whose merged device
+   descriptor matches, or open a new one.
+
+8. **Wrap the body in scope statements.** Build a chain of nested
+   `CommDomainScopeStmt`s — one per comm domain, outer = first declared,
+   inner = last — and substitute it for the host_orch function body. Each
+   scope carries its `devices` list and its slot vector; `name_hint_` is
+   set to `"comm_d<n>"` so codegen emits the matching `__comm_d<n>` handle
+   variable verbatim.
 
 ## Sanity checks
 
@@ -90,15 +97,17 @@ The pass raises `pypto::ValueError` (carrying the alloc's span) if:
 - An allocation has at least one view but no chip-orch dispatch consumes it.
 - The `device=` expression on a dispatch is something other than `ConstInt`
   or a recognised `pl.range` induction var.
-- Two allocations within the same `CommGroup` share a `name_hint_` (the
+- Two allocations within the same comm domain share a `name_hint_` (the
   parser already enforces global uniqueness; the pass re-asserts).
 
 ## Output invariants
 
 After the pass:
 
-- `Program.comm_groups_` is populated (possibly empty if the program does no
-  window-buffer allocation).
+- Every host_orch function whose body contains at least one alloc has its
+  body wrapped in a chain of nested `CommDomainScopeStmt`s (one per
+  inferred comm domain, outer = first declared, inner = last).
+  Allocation-free host_orchs are left unchanged.
 - Every `pld.tensor.window` result Var's type is a `DistributedTensorType` whose
   `window_buffer_` field points to the corresponding `WindowBuffer`.
 - `pld.tensor.window` views over the same allocation share the same
@@ -113,15 +122,17 @@ After the pass:
 | Field | Value |
 | ----- | ----- |
 | `required` | `{}` |
-| `produced` | `{IRProperty::CommGroupsCollected}` |
+| `produced` | `{IRProperty::CommDomainScopesMaterialized}` |
 | `invalidated` | `{}` |
 
 ## Reference
 
-- Source: [src/ir/transforms/collect_comm_groups_pass.cpp](../../../../src/ir/transforms/collect_comm_groups_pass.cpp)
+- Source: [src/ir/transforms/materialize_comm_domain_scopes_pass.cpp](../../../../src/ir/transforms/materialize_comm_domain_scopes_pass.cpp)
 - Header: [include/pypto/ir/transforms/passes.h](../../../../include/pypto/ir/transforms/passes.h)
 - Schema: [include/pypto/ir/program.h](../../../../include/pypto/ir/program.h)
-  defines `WindowBuffer` and `CommGroup`.
+  defines `WindowBuffer`;
+  [include/pypto/ir/stmt.h](../../../../include/pypto/ir/stmt.h) defines
+  `CommDomainScopeStmt`.
 - DSL: [`pld.tensor.alloc_window_buffer`](../../../../python/pypto/language/distributed/op/tensor_ops.py),
   [`pld.tensor.window`](../../../../python/pypto/language/distributed/op/tensor_ops.py),
   [`pld.system.world_size`](../../../../python/pypto/language/distributed/op/system_ops.py).

@@ -9,11 +9,13 @@
 
 """Unit tests for ``pypto.runtime.runner.RunConfig`` and DFX plumbing."""
 
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 from pypto.backend import BackendType
-from pypto.runtime.runner import RunConfig, _DfxOpts
+from pypto.runtime.runner import RunConfig, _DfxOpts, compile_program, execute_compiled, run
 
 
 class TestRunConfigPlatformResolution:
@@ -40,6 +42,11 @@ class TestRunConfigPlatformResolution:
         assert cfg.platform == "a5"
         assert cfg.backend_type == BackendType.Ascend950
         assert cfg.save_kernels is True
+
+    def test_auto_scope_deps_switch_defaults_off(self):
+        cfg = RunConfig(platform="a5")
+
+        assert cfg.analyze_auto_scopes_for_deps is False
 
 
 class TestRunConfigDfxFlags:
@@ -141,6 +148,96 @@ class TestRunConfigDfxFlags:
         assert _DfxOpts().any() is False
 
 
+class TestRunConfigCompileForwarding:
+    """Compile-side RunConfig fields are forwarded into ``ir.compile``."""
+
+    def test_run_forwards_auto_scope_deps_switch(self, monkeypatch):
+        captured: dict = {}
+
+        class FakeCompiled:
+            def __call__(self, *_args, **_kwargs):
+                return None
+
+        def fake_compile(_program, **kwargs):
+            captured.update(kwargs)
+            return FakeCompiled()
+
+        import pypto.ir as ir_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(ir_mod, "compile", fake_compile)
+
+        run(object(), config=RunConfig(platform="a2a3sim", analyze_auto_scopes_for_deps=True))
+
+        assert captured["analyze_auto_scopes_for_deps"] is True
+
+    def test_execute_compiled_accepts_auto_scope_deps_switch(self, tmp_path, monkeypatch):
+        captured: dict = {}
+
+        def fake_compile_and_assemble(_work_dir, platform, pto_isa_commit):
+            captured["compile"] = {
+                "platform": platform,
+                "pto_isa_commit": pto_isa_commit,
+            }
+            return object(), "fake_runtime", {}
+
+        def fake_execute_on_device(*args, **kwargs):
+            captured["execute"] = {"args": args, "kwargs": kwargs}
+
+        class FakeChipStorageTaskArgs:
+            def add_tensor(self, _arg):
+                return None
+
+            def add_scalar(self, _arg):
+                return None
+
+        fake_device_runner = types.SimpleNamespace(
+            ChipStorageTaskArgs=FakeChipStorageTaskArgs,
+            compile_and_assemble=fake_compile_and_assemble,
+            execute_on_device=fake_execute_on_device,
+            make_tensor_arg=lambda _arg: object(),
+            scalar_to_uint64=lambda _arg: 0,
+        )
+        fake_task_interface = types.SimpleNamespace(device_tensor_to_continuous=lambda _arg: object())
+        monkeypatch.setitem(sys.modules, "pypto.runtime.device_runner", fake_device_runner)
+        monkeypatch.setitem(sys.modules, "pypto.runtime.task_interface", fake_task_interface)
+
+        execute_compiled(
+            tmp_path,
+            [],
+            platform="a2a3sim",
+            device_id=0,
+            analyze_auto_scopes_for_deps=True,
+        )
+
+        assert captured["compile"]["platform"] == "a2a3sim"
+        assert captured["execute"]["args"][3] == "fake_runtime"
+        assert captured["execute"]["kwargs"]["block_dim"] is None
+        assert captured["execute"]["kwargs"]["aicpu_thread_num"] is None
+
+    def test_compile_program_forwards_auto_scope_deps_switch(self, tmp_path, monkeypatch):
+        captured: dict = {}
+
+        def fake_compile(_program, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        import pypto.ir as ir_mod  # noqa: PLC0415
+        import pypto.runtime.runner as runner_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(ir_mod, "compile", fake_compile)
+        monkeypatch.setattr(runner_mod, "_patch_orchestration_headers", lambda _work_dir: None)
+
+        compile_program(
+            object(),
+            tmp_path,
+            strategy=RunConfig().strategy,
+            backend_type=BackendType.Ascend910B,
+            analyze_auto_scopes_for_deps=True,
+        )
+
+        assert captured["analyze_auto_scopes_for_deps"] is True
+
+
 # ``execute_on_device`` lives in ``device_runner`` which eagerly imports the
 # ``simpler`` package (via ``task_interface``). Unit-tests CI runs without
 # ``simpler`` installed, so the import fails at collection time. Mirror the
@@ -201,7 +298,8 @@ class TestExecuteOnDeviceDfxValidation:
         with patch.object(device_runner, "Worker") as worker_cls:
             worker = worker_cls.return_value
             # _PyptoWorker.current returns None → falls to the new-Worker path.
-            with patch("pypto.runtime.worker.Worker.current", return_value=None):
+            # ``current`` lives on ``ChipWorker``, not the ABC base ``Worker``.
+            with patch("pypto.runtime.worker.ChipWorker.current", return_value=None):
                 device_runner.execute_on_device(
                     chip_callable=MagicMock(),
                     orch_args=MagicMock(),

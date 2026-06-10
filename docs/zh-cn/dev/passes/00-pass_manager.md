@@ -84,8 +84,9 @@ struct PassProperties {
 | FoldNoOpReshape | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
 | FuseCreateAssembleToSlice | — | — | — |
 | DeriveCallDirections | SplitIncoreOrch | CallDirectionsResolved | — |
+| AutoDeriveTaskDependencies | SplitIncoreOrch, CallDirectionsResolved | CallDirectionsResolved | — |
 | ExpandManualPhaseFence | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | — |
-| CollectCommGroups | — | CommGroupsCollected | — |
+| MaterializeCommDomainScopes | — | CommDomainScopesMaterialized | — |
 | Simplify | — | — | — |
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
 
@@ -393,10 +394,11 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 19. [`FoldNoOpReshape`](32-fold_no_op_reshape.md)
 20. [`FuseCreateAssembleToSlice`](33-fuse_create_assemble_to_slice.md)
 21. [`DeriveCallDirections`](34-derive_call_directions.md)
-22. [`ExpandManualPhaseFence`](35-expand_manual_phase_fence.md)（manual-scope phase-fence TaskId 依赖压缩）
-23. [`CollectCommGroups`](36-collect_comm_groups.md)（分布式：构造 WindowBuffer 并写 Program.comm_groups_；无通信程序为 no-op）
-24. `Simplify`
-25. [`MaterializeRuntimeScopes`](37-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit PTO2_SCOPE）
+22. [`AutoDeriveTaskDependencies`](35-auto_derive_task_dependencies.md)（runtime scope 编译器依赖；AUTO-scope 分析需要显式开启）
+23. [`ExpandManualPhaseFence`](36-expand_manual_phase_fence.md)（manual-scope phase-fence TaskId 依赖压缩）
+24. [`MaterializeCommDomainScopes`](37-materialize_comm_domain_scopes.md)（分布式：构造 WindowBuffer 并写 CommDomainScopeStmt wrappers in each host_orch body；无通信程序为 no-op）
+25. `Simplify`
+26. [`MaterializeRuntimeScopes`](38-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit PTO2_SCOPE）
 
 `DebugTileOptimization` 只是用于排查 PTO tile 阶段的调试策略，会跳过
 tensor-only 前缀 pass。正常编译和非 strategy 专项测试都应优先使用

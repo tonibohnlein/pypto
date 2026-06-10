@@ -79,12 +79,11 @@ void IRVisitor::VisitExpr_(const CallPtr& op) {
     INTERNAL_CHECK_SPAN(op->args_[i], op->span_) << "Call has null argument at index " << i;
     VisitExpr(op->args_[i]);
   }
-  // Var-typed attrs ``manual_dep_edges`` / ``dump_vars`` reference Vars defined
-  // elsewhere in the IR. Treat them as real uses so analyses such as the
-  // unused-variable check don't flag a Var referenced only via ``deps=[tid]``
-  // or ``dumps=[t]`` / ``pl.dump_tag``.
+  // Var-typed attrs reference Vars defined elsewhere in the IR. Treat them as
+  // real uses so analyses such as the unused-variable check don't flag a Var
+  // referenced only via ``deps=[tid]`` or ``dumps=[t]`` / ``pl.dump_tag``.
   for (const auto& [k, v] : op->attrs_) {
-    if (k != kAttrManualDepEdges && k != kAttrDumpVars) continue;
+    if (k != kAttrManualDepEdges && k != kAttrCompilerManualDepEdges && k != kAttrDumpVars) continue;
     const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
     if (!edges) continue;
     for (const auto& e : *edges) {
@@ -112,13 +111,13 @@ void IRVisitor::VisitExpr_(const SubmitPtr& op) {
     INTERNAL_CHECK_SPAN(*op->core_num_, op->span_) << "Submit core_num is null";
     VisitExpr(*op->core_num_);
   }
-  // Var-typed attrs ``arg_direction_overrides_vars`` / ``dump_vars`` reference
-  // Vars defined elsewhere in the IR. IRMutator::VisitExpr_(SubmitPtr) already
-  // rewrites those Vars on substitution; the visitor must walk them too so
-  // unused-var / def-use / SSA-liveness analyses do not silently drop a Var
-  // that is referenced only through these attrs.
+  // Var-typed attrs reference Vars defined elsewhere in the IR.
+  // IRMutator::VisitExpr_(SubmitPtr) already rewrites those Vars on
+  // substitution; the visitor must walk them too so unused-var / def-use /
+  // SSA-liveness analyses do not silently drop a Var that is referenced only
+  // through these attrs.
   for (const auto& [k, v] : op->attrs_) {
-    if (k != kAttrArgDirOverrideVars && k != kAttrDumpVars) continue;
+    if (k != kAttrArgDirOverrideVars && k != kAttrCompilerManualDepEdges && k != kAttrDumpVars) continue;
     const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
     if (!edges) continue;
     for (const auto& e : *edges) {
@@ -318,6 +317,16 @@ void IRVisitor::VisitStmt_(const SpmdScopeStmtPtr& op) {
 
 void IRVisitor::VisitStmt_(const RuntimeScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "RuntimeScopeStmt has null body";
+  VisitStmt(op->body_);
+}
+
+void IRVisitor::VisitStmt_(const CommDomainScopeStmtPtr& op) {
+  INTERNAL_CHECK_SPAN(op->body_, op->span_) << "CommDomainScopeStmt has null body";
+  VisitScopeAttrs(op);
+  for (size_t i = 0; i < op->slots_.size(); ++i) {
+    INTERNAL_CHECK_SPAN(op->slots_[i], op->span_) << "CommDomainScopeStmt has null slot at index " << i;
+    VisitExpr(op->slots_[i]);
+  }
   VisitStmt(op->body_);
 }
 

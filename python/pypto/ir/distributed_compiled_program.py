@@ -17,7 +17,7 @@ through simpler's distributed runtime (Worker level=3)::
 """
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -125,6 +125,11 @@ class DistributedCompiledProgram:
         self._param_infos = None
         self._output_indices = None
         self._return_types = None
+
+        # RunTiming from the most recent __call__ (host_wall_us; device_wall_us
+        # is 0 for the L3 DAG), or None before the first on-device run. Surfaced
+        # as a side channel so the call return value stays outputs/None.
+        self.last_run_timing: Any = None
 
         self._emit_debug_runner()
 
@@ -239,7 +244,7 @@ class DistributedCompiledProgram:
                 )
             coerced.append(arg)
 
-        execute_distributed(self, coerced, config)
+        self.last_run_timing = execute_distributed(self, coerced, config)
 
         if not return_style:
             return None
@@ -250,6 +255,8 @@ class DistributedCompiledProgram:
         self,
         config: Any = None,
         *,
+        extra_compiled: Sequence["DistributedCompiledProgram"] = (),
+        callbacks: dict[str, Callable[..., Any]] | None = None,
         sub_worker_overrides: dict[str, Callable[..., Any]] | None = None,
     ) -> "DistributedWorker":
         """Prepare a reusable L3 execution handle (setup once, dispatch many).
@@ -272,11 +279,22 @@ class DistributedCompiledProgram:
 
         Args:
             config: Optional run configuration (reserved; currently unused).
-            sub_worker_overrides: Replace a generated sub-worker placeholder
-                (matched by name) with your own callable — e.g. a real sampling
-                closure in place of the codegen stub. Each name must be a
-                sub-worker the program declares; an unknown name raises
-                ``ValueError``.
+            extra_compiled: Additional compatible programs to prepare on the
+                same L3 worker (multi-program serving — e.g. ``prefill`` prepares
+                the worker and passes ``[decode]`` here so both share the worker
+                and its device-resident KV cache). ``self`` is the *primary*
+                program dispatched by ``rt(*args)``; the rest are dispatched via
+                ``rt.run(other, *args)``. All must agree on platform, runtime,
+                and device ids. Defaults to none (single-program).
+            callbacks: Bind a callable to a SubWorker by name — e.g. a real
+                sampling closure. Abstract SubWorkers (declared with a ``...``
+                body) are runtime-bound callback points and MUST be supplied
+                here; a missing binding raises ``ValueError``. A callback may
+                also replace a concrete SubWorker's generated body. Each name
+                must be a sub-worker the program declares; an unknown name
+                raises ``ValueError``. In multi-program mode the callbacks apply
+                to every prepared program.
+            sub_worker_overrides: Deprecated alias for ``callbacks``.
 
         Returns:
             A :class:`DistributedWorker`; use it as a context manager or call
@@ -284,7 +302,12 @@ class DistributedCompiledProgram:
         """
         from pypto.runtime.distributed_runner import DistributedWorker  # noqa: PLC0415
 
-        return DistributedWorker(self, config, sub_worker_overrides=sub_worker_overrides)
+        return DistributedWorker(
+            [self, *extra_compiled],
+            config,
+            callbacks=callbacks,
+            sub_worker_overrides=sub_worker_overrides,
+        )
 
     @staticmethod
     def _build_full_args(input_args, param_infos, output_indices):

@@ -97,6 +97,7 @@ enum class ObjectKind {
   HierarchyScopeStmt,
   SpmdScopeStmt,
   RuntimeScopeStmt,
+  CommDomainScopeStmt,
   SeqStmts,
   EvalStmt,
   BreakStmt,
@@ -121,7 +122,6 @@ enum class ObjectKind {
   Function,
   Program,
   WindowBuffer,
-  CommGroup,
 
   // Op kinds
   Op,

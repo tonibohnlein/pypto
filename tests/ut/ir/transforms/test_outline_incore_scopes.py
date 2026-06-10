@@ -1205,6 +1205,62 @@ class TestOutlineNamedIncoreScopes:
         After = passes.outline_incore_scopes()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_outline_duplicate_name_hint_across_functions(self):
+        """Sibling functions reusing the same ``name_hint`` must not collide.
+
+        Regression test for issue #1711: composing independently-runnable child
+        kernels (e.g. two kernels reusing one ``@pl.jit.inline`` helper) yields a
+        program where multiple Orchestration functions each outline an InCore
+        scope carrying the *same* ``name_hint``. The outlined functions land in a
+        single namespace, so the bare hint would clash at Program construction.
+        The pass disambiguates a *cross-function* collision by namespacing it
+        under the originating function: ``fn_a`` keeps ``dup`` (first seen,
+        stable, matching its standalone compilation), ``fn_b`` gets the
+        source-derived ``fn_b_dup``. This differs from the *in-function* dedup
+        above, which keeps the historical numeric ``_0`` suffix.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def fn_a(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dup"):
+                    a: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return a
+
+            @pl.function
+            def fn_b(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dup"):
+                    b: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return b
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def dup(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                a: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return a
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def fn_b_dup(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                b: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return b
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def fn_a(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                a: pl.Tensor[[64], pl.FP32] = self.dup(x)
+                return a
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def fn_b(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                b: pl.Tensor[[64], pl.FP32] = self.fn_b_dup(x)
+                return b
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_incore_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
 
 class TestOutlineNoDepArgs:
     """``pl.at(no_dep_args=[t])`` lowering: ScopeStmt.attrs[arg_direction_overrides_vars]
@@ -1212,12 +1268,10 @@ class TestOutlineNoDepArgs:
     ``Call.attrs[arg_direction_overrides]``, which DeriveCallDirections then
     consumes to overwrite the auto-derived direction at each slot to NoDep.
 
-    These tests use a ``PassContext`` with only ``VerificationInstrument`` —
-    the default RoundtripInstrument runs print/reparse after every pass, but
-    the Call printer does not surface ``attrs[arg_direction_overrides]`` (a
-    pre-existing limitation also affecting ``pl.submit(..., deps=)``; see
-    ``test_flatten_call_expr_pass.TestFlattenPreservesAttrs`` for the same
-    workaround).
+    These tests run under the default RoundtripInstrument (print/reparse after
+    every pass). The Call printer now surfaces ``attrs[arg_direction_overrides]``
+    generically (``PrintAttrValue``) and the parser recovers it
+    (``_parse_attr_value``), so the synthesised no-dep dispatch round-trips.
     """
 
     @staticmethod
@@ -1236,14 +1290,6 @@ class TestOutlineNoDepArgs:
                     return s.expr
         raise AssertionError(f"no outlined kernel Call found in main, stmts={stmts}")
 
-    @staticmethod
-    def _verify_only_ctx():
-        from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
-
-        return _core_passes.PassContext(
-            [_core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)]
-        )
-
     def test_outline_translates_no_dep_args_to_indices(self):
         """Captured-Var order → positional indices on the synthesised Call."""
 
@@ -1259,8 +1305,7 @@ class TestOutlineNoDepArgs:
                     y: pl.Tensor[[64], pl.FP32] = pl.add(x, w)
                 return y
 
-        with self._verify_only_ctx():
-            After = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
+        After = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
 
         call = self._outlined_user_call(After)
         # Captured order: x first (referenced before w), w second.
@@ -1289,9 +1334,8 @@ class TestOutlineNoDepArgs:
                     y: pl.Tensor[[64], pl.FP32] = pl.add(x, w)
                 return y
 
-        with self._verify_only_ctx():
-            After = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
-            After = passes.derive_call_directions()(After)
+        After = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
+        After = passes.derive_call_directions()(After)
 
         call = self._outlined_user_call(After)
         dirs = list(call.arg_directions)
@@ -1332,9 +1376,8 @@ class TestOutlineNoDepArgs:
                     k_cache = pl.assemble(k_cache, x, [0])
                 return k_cache
 
-        with self._verify_only_ctx():
-            After = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
-            After = passes.derive_call_directions()(After)
+        After = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
+        After = passes.derive_call_directions()(After)
 
         call = self._outlined_user_call(After)
         # Locate the k_cache slot. SSA conversion renames k_cache to a

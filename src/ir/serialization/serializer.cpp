@@ -231,6 +231,7 @@ class IRSerializer::Impl {
     SERIALIZE_FIELDS(HierarchyScopeStmt);
     SERIALIZE_FIELDS(SpmdScopeStmt);
     SERIALIZE_FIELDS(RuntimeScopeStmt);
+    SERIALIZE_FIELDS(CommDomainScopeStmt);
     SERIALIZE_FIELDS(SeqStmts);
     SERIALIZE_FIELDS(EvalStmt);
     SERIALIZE_FIELDS(BreakStmt);
@@ -239,7 +240,6 @@ class IRSerializer::Impl {
     SERIALIZE_FIELDS(Function);
     SERIALIZE_FIELDS(Program);
     SERIALIZE_FIELDS(WindowBuffer);
-    SERIALIZE_FIELDS(CommGroup);
 
 #undef SERIALIZE_FIELDS
 #undef SERIALIZE_FIELDS_BASE

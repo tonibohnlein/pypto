@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import ctypes
 import importlib.util
+import inspect
+import json
 import sys
 import types
+import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -191,6 +194,18 @@ def _load_sub_worker_fns(output_dir: Path) -> dict[str, Any]:
     return sub_worker_fns
 
 
+def _load_required_callbacks(output_dir: Path) -> set[str]:
+    """Names of abstract SubWorkers that MUST be bound via ``callbacks={...}``.
+
+    Read from the ``sub_workers/__required__.json`` manifest emitted by codegen
+    for ``...``-body SubWorkers. Missing manifest ⇒ no required callbacks.
+    """
+    manifest = output_dir / "sub_workers" / "__required__.json"
+    if not manifest.exists():
+        return set()
+    return set(json.loads(manifest.read_text()))
+
+
 def _construct_worker(
     dc: DistributedConfig,
     platform: str,
@@ -225,25 +240,80 @@ def _register_callables(
     return sub_ids, chip_cids
 
 
-def _merge_sub_worker_overrides(
-    loaded: dict[str, Any], overrides: dict[str, Callable[..., Any]] | None
-) -> dict[str, Any]:
-    """Merge user sub-worker overrides onto the codegen-loaded set (by name).
+def _check_callback_arity(name: str, fn: Callable[..., Any]) -> None:
+    """Validate that a user callback can be invoked as ``fn(args)``.
 
-    Each override replaces the generated placeholder for an existing sub-worker.
-    Overriding a name the program does not declare is rejected: it would register
-    an unused callable while the generated orchestrator kept calling the
-    placeholder (a silent no-op the caller almost never intends — usually a typo).
+    SubWorker callables receive a single ``TaskArgs`` positional argument. A
+    callback that cannot accept exactly one positional arg is almost certainly
+    the wrong function — reject it with a clear error instead of failing deep
+    inside dispatch with an opaque ``TypeError``.
     """
-    if not overrides:
-        return loaded
-    unknown = sorted(set(overrides) - set(loaded))
+    if not callable(fn):
+        raise TypeError(f"callback for SubWorker '{name}' is not callable: {fn!r}")
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return  # builtins / C callables expose no signature — skip the check
+    try:
+        sig.bind(object())  # one positional arg, like the runtime's fn(args)
+    except TypeError as exc:
+        raise TypeError(
+            f"callback for SubWorker '{name}' must accept a single positional "
+            f"argument fn(args: TaskArgs); got signature {sig}."
+        ) from exc
+
+
+def _coalesce_callbacks(
+    callbacks: dict[str, Callable[..., Any]] | None,
+    sub_worker_overrides: dict[str, Callable[..., Any]] | None,
+) -> dict[str, Callable[..., Any]] | None:
+    """Merge the deprecated ``sub_worker_overrides`` alias into ``callbacks``.
+
+    ``callbacks`` takes precedence on name collisions. Returns ``None`` when both
+    are empty so downstream ``or {}`` handling stays simple.
+    """
+    if sub_worker_overrides is None:
+        return callbacks
+    warnings.warn(
+        "sub_worker_overrides is deprecated; use callbacks= instead.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return {**sub_worker_overrides, **(callbacks or {})}
+
+
+def _bind_sub_workers(
+    loaded: dict[str, Any],
+    callbacks: dict[str, Callable[..., Any]] | None,
+    required: set[str],
+) -> dict[str, Any]:
+    """Bind user callbacks onto the codegen-loaded SubWorker set (by name).
+
+    Each callback replaces the generated module for an existing SubWorker.
+
+    - Unknown names are rejected: binding a name the program does not declare
+      would register an unused callable while the orchestrator kept calling the
+      generated module (a silent no-op, usually a typo).
+    - Abstract SubWorkers (``...`` body, listed in *required*) MUST be bound —
+      their generated module only raises. A missing binding is reported here, at
+      prepare time, rather than at dispatch.
+    """
+    callbacks = callbacks or {}
+    unknown = sorted(set(callbacks) - set(loaded))
     if unknown:
         raise ValueError(
-            f"sub_worker_overrides names {unknown} are not sub-workers of this "
-            f"program. Available sub-workers: {sorted(loaded)}."
+            f"callbacks names {unknown} are not sub-workers of this program. "
+            f"Available sub-workers: {sorted(loaded)}."
         )
-    return {**loaded, **overrides}
+    missing = sorted(required - set(callbacks))
+    if missing:
+        raise ValueError(
+            f"SubWorkers {missing} are runtime-bound callbacks (declared with a "
+            f"`...` body) and must be supplied via callbacks={{...}}."
+        )
+    for name, fn in callbacks.items():
+        _check_callback_arity(name, fn)
+    return {**loaded, **callbacks}
 
 
 def _make_call_config(dc: DistributedConfig) -> Any:
@@ -282,8 +352,13 @@ def _dispatch(
     sub_ids: dict[str, int],
     call_config: Any,
     device_nums: int,
-) -> None:
-    """Build the orchestration closure and run it once on ``w``."""
+) -> Any:
+    """Build the orchestration closure and run it once on ``w``.
+
+    Returns the simpler ``RunTiming`` from ``w.run`` (``host_wall_us`` /
+    ``device_wall_us``). For an L3 DAG ``device_wall_us`` is ``0`` — only the
+    host wall around the dispatch is meaningful here.
+    """
     # Fresh _keep per dispatch: it pins per-call TaskArgs alive for the run.
     _keep: list[Any] = []
 
@@ -303,14 +378,14 @@ def _dispatch(
             world_size=device_nums,
         )
 
-    w.run(orch_fn)
+    return w.run(orch_fn)
 
 
 def execute_distributed(
     compiled: DistributedCompiledProgram,
     coerced_args: list[torch.Tensor | DeviceTensor],
     config: Any = None,
-) -> None:
+) -> Any:
     """Execute a distributed compiled program once via simpler Worker(level=3).
 
     One-shot path: runs the full setup, dispatches once, then tears the Worker
@@ -323,6 +398,11 @@ def execute_distributed(
         coerced_args: Coerced arguments — host ``torch.Tensor`` or
             worker-resident :class:`~pypto.runtime.DeviceTensor`.
         config: Optional run configuration (unused for now).
+
+    Returns:
+        The simpler ``RunTiming`` from the dispatch (``host_wall_us`` /
+        ``device_wall_us``; ``device_wall_us`` is ``0`` for the L3 DAG), or
+        ``None`` if dispatch produced no timing.
     """
     dc = compiled._distributed_config
     output_dir = compiled.output_dir
@@ -349,6 +429,10 @@ def execute_distributed(
         alloc_fn(tensors)
 
     sub_worker_fns = _load_sub_worker_fns(output_dir)
+    # The one-shot path cannot supply callbacks; if the program declares any
+    # runtime-bound (`...`-body) SubWorker, fail early with a clear message
+    # pointing at prepare(callbacks={...}).
+    sub_worker_fns = _bind_sub_workers(sub_worker_fns, None, _load_required_callbacks(output_dir))
 
     num_sub = max(dc.num_sub_workers, len(sub_worker_fns))
 
@@ -359,7 +443,7 @@ def execute_distributed(
         w = _construct_worker(dc, compiled.platform, runtime_name, num_sub)
         sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
         w.init()
-        _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, _make_call_config(dc), len(dc.device_ids))
+        return _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, _make_call_config(dc), len(dc.device_ids))
     finally:
         if w is not None:
             w.close()
@@ -389,10 +473,26 @@ class DistributedWorker(Worker):
     (its ``init`` source must likewise be a pre-``prepare`` shared tensor) and
     mixed in. This mirrors the runtime's ``child_memory`` example.
 
-    ``sub_worker_overrides`` replaces a generated sub-worker placeholder (matched
-    by name) with a caller-supplied callable — e.g. a real sampling closure in
-    place of the codegen stub. Each name must be a sub-worker the program
-    declares; an unknown name raises ``ValueError``.
+    ``callbacks`` binds a caller-supplied callable to a SubWorker by name — e.g.
+    a real sampling closure. Abstract SubWorkers (declared with a ``...`` body)
+    are runtime-bound callback points and MUST be supplied here; a missing
+    binding raises ``ValueError`` at prepare time. A callback may also replace a
+    concrete SubWorker's generated body. Each name must be a sub-worker the
+    program declares; an unknown name raises ``ValueError``.
+    (``sub_worker_overrides`` is a deprecated alias for ``callbacks``.)
+
+    **Multi-program dispatch.** Pass a sequence of compatible
+    :class:`DistributedCompiledProgram` objects (or use
+    ``compiled.prepare(extra_compiled=[...])``) to prepare several HOST programs
+    on one L3 worker. Each program's chip callables, sub-worker functions,
+    orchestration entry, base tensors, and parameter metadata are registered
+    independently and selected at dispatch via ``rt.run(compiled, *args)``. This
+    is what serving needs: prefill and decode are separate JIT HOST programs that
+    must share one worker lifecycle and one worker-resident
+    :class:`DeviceTensor` KV cache. Programs must agree on platform, runtime, and
+    device ids; a mismatch raises ``ValueError``. The ``rt(*args)`` shortcut is
+    only for single-program workers — in multi-program mode it raises
+    ``TypeError`` since the target program is ambiguous.
 
     Obtain via :meth:`DistributedCompiledProgram.prepare`. Use as a context
     manager (recommended) or call :meth:`close` when done::
@@ -413,15 +513,31 @@ class DistributedWorker(Worker):
 
     def __init__(
         self,
-        compiled: DistributedCompiledProgram,
+        compiled: DistributedCompiledProgram | Sequence[DistributedCompiledProgram],
         config: Any = None,
         *,
+        callbacks: dict[str, Callable[..., Any]] | None = None,
         sub_worker_overrides: dict[str, Callable[..., Any]] | None = None,
     ) -> None:
         super().__init__()  # initialize Worker ABC state (_owned_tensors)
         del config  # reserved for future per-runtime overrides
-        self.dc = compiled._distributed_config
-        self._compiled = compiled  # held for run/register
+        callbacks = _coalesce_callbacks(callbacks, sub_worker_overrides)
+
+        programs = list(compiled) if isinstance(compiled, Sequence) else [compiled]
+        if not programs:
+            raise ValueError("DistributedWorker requires at least one compiled program")
+
+        primary = programs[0]
+        self.dc = primary._distributed_config
+        self._compiled = primary  # primary program: dispatched by ``rt(*args)``
+        # In multi-program mode ``rt(*args)`` is ambiguous (which program?), so it
+        # is disabled — callers must pick explicitly via ``rt.run(compiled, ...)``.
+        self._multi_program = len(programs) > 1
+        # Per-program dispatch state keyed by the program object (not id(prog)):
+        # the dict keeps every prepared program alive for the worker's lifetime,
+        # so there is no id()-reuse hazard from a GC'd program. ``run(compiled,
+        # ...)`` looks the selected program up here; ``__call__`` uses ``_compiled``.
+        self._states: dict[DistributedCompiledProgram, dict[str, Any]] = {}
 
         # Wrap setup so a failure at any step still releases the worker and the
         # comm rootinfo temp file. ``self.close()`` can't be used here — it reads
@@ -429,23 +545,61 @@ class DistributedWorker(Worker):
         # inlined and guarded against the partially-constructed state.
         self._w: Any = None
         try:
-            self._chip_callables, runtime_name = _assemble_chip_callables(compiled)
-            self._entry_fn, alloc_fn = _load_orch_entry(compiled.output_dir)
-            sub_worker_fns = _load_sub_worker_fns(compiled.output_dir)
-            sub_worker_fns = _merge_sub_worker_overrides(sub_worker_fns, sub_worker_overrides)
+            # Phase 1 (pre-fork): load + validate every program's artifacts and
+            # allocate its HOST-level scratch tensors. All shared-memory mappings
+            # must exist before ``init()`` forks so the children inherit them.
+            runtime_name: str | None = None
+            num_sub = 0
+            # (program, chip_callables, sub_worker_fns) deferred to phase 2 so all
+            # registrations happen on one already-constructed worker.
+            loaded: list[tuple[DistributedCompiledProgram, dict[str, Any], dict[str, Any]]] = []
+            # A callback applies to whichever prepared programs declare that
+            # sub-worker (e.g. a shared sampler used by both prefill and decode);
+            # programs with different sub-worker sets are fine. We track which
+            # callback names were consumed so a typo that matches no program is
+            # still reported (see the post-loop check), while each program's own
+            # required-callback manifest is enforced per program.
+            callbacks = callbacks or {}
+            consumed: set[str] = set()
+            for prog in programs:
+                self._check_compatible(prog, primary)
+                chip_callables, prog_runtime = _assemble_chip_callables(prog)
+                runtime_name = self._unify_runtime(runtime_name, prog_runtime)
+                entry_fn, alloc_fn = _load_orch_entry(prog.output_dir)
+                loaded_subs = _load_sub_worker_fns(prog.output_dir)
+                prog_callbacks = {name: fn for name, fn in callbacks.items() if name in loaded_subs}
+                consumed |= set(prog_callbacks)
+                sub_worker_fns = _bind_sub_workers(
+                    loaded_subs, prog_callbacks, _load_required_callbacks(prog.output_dir)
+                )
+                num_sub = max(num_sub, prog._distributed_config.num_sub_workers, len(sub_worker_fns))
+                base_tensors: dict[str, Any] = {}
+                if alloc_fn is not None:
+                    alloc_fn(base_tensors)
+                self._states[prog] = {
+                    "entry_fn": entry_fn,
+                    "base_tensors": base_tensors,
+                    "call_config": _make_call_config(prog._distributed_config),
+                    "param_infos": tuple(prog._get_metadata()[0]),
+                    "device_nums": len(prog._distributed_config.device_ids),
+                }
+                loaded.append((prog, chip_callables, sub_worker_fns))
 
-            num_sub = max(self.dc.num_sub_workers, len(sub_worker_fns))
-            self._w = _construct_worker(self.dc, compiled.platform, runtime_name, num_sub)
-            self._sub_ids, self._chip_cids = _register_callables(
-                self._w, sub_worker_fns, self._chip_callables
-            )
+            unconsumed = sorted(set(callbacks) - consumed)
+            if unconsumed:
+                raise ValueError(f"callbacks names {unconsumed} are not sub-workers of any prepared program.")
 
-            # Allocate HOST-level intermediate scratch tensors ONCE, before init()
-            # forks. They are reused (by name) across every dispatch; per-call
-            # inputs are merged on top in __call__.
-            self._base_tensors: dict[str, Any] = {}
-            if alloc_fn is not None:
-                alloc_fn(self._base_tensors)
+            if runtime_name is None:  # unreachable: programs is non-empty
+                raise RuntimeError("failed to resolve distributed runtime")
+
+            # Phase 2: one worker for all programs. Register every program's
+            # callables before ``init()`` so the L3 fork inherits the whole
+            # registry via COW; each program keeps its own cids in its state.
+            self._w = _construct_worker(self.dc, primary.platform, runtime_name, num_sub)
+            for prog, chip_callables, sub_worker_fns in loaded:
+                sub_ids, chip_cids = _register_callables(self._w, sub_worker_fns, chip_callables)
+                self._states[prog]["sub_ids"] = sub_ids
+                self._states[prog]["chip_cids"] = chip_cids
 
             self._w.init()
 
@@ -466,14 +620,40 @@ class DistributedWorker(Worker):
                     pass
             raise
 
-        self._call_config = _make_call_config(self.dc)
-        # Cache param metadata once: the dispatch contract is "setup once, run
-        # many", so re-extracting it on every __call__ would be wasted work.
-        self._param_infos, _, _ = compiled._get_metadata()
         self._closed = False
         # Live RegistrationHandles so close() can mark them closed. WeakSet
         # so handles that drop out of scope first don't pin DistributedWorker.
         self._handles: weakref.WeakSet[Any] = weakref.WeakSet()
+        # RunTiming from the most recent dispatch (host_wall_us; device_wall_us
+        # is 0 for the L3 DAG), or None before the first run.
+        self.last_run_timing: Any = None
+
+    @staticmethod
+    def _check_compatible(prog: DistributedCompiledProgram, primary: DistributedCompiledProgram) -> None:
+        """Reject programs that cannot share one L3 worker with *primary*."""
+        if prog.platform != primary.platform:
+            raise ValueError(
+                "DistributedWorker multi-program mode requires the same platform: "
+                f"{primary.platform!r} != {prog.platform!r}"
+            )
+        primary_ids = list(primary._distributed_config.device_ids)
+        if list(prog._distributed_config.device_ids) != primary_ids:
+            raise ValueError(
+                "DistributedWorker multi-program mode requires the same device_ids: "
+                f"{primary_ids} != {list(prog._distributed_config.device_ids)}"
+            )
+
+    @staticmethod
+    def _unify_runtime(runtime_name: str | None, prog_runtime: str) -> str:
+        """Return the shared runtime name, rejecting a per-program mismatch."""
+        if runtime_name is None:
+            return prog_runtime
+        if runtime_name != prog_runtime:
+            raise ValueError(
+                "DistributedWorker multi-program mode requires the same runtime: "
+                f"{runtime_name!r} != {prog_runtime!r}"
+            )
+        return runtime_name
 
     # ------------------------------------------------------------------
     # Device memory primitives
@@ -547,7 +727,7 @@ class DistributedWorker(Worker):
     # ------------------------------------------------------------------
 
     def __call__(self, *args: Any, config: Any = None) -> None:
-        """Dispatch one run on the held Worker, reusing all setup.
+        """Dispatch one run on the primary compiled program, reusing all setup.
 
         Pass one argument per program parameter (in-place). Each argument is
         either:
@@ -562,12 +742,32 @@ class DistributedWorker(Worker):
 
         A non-shared ``torch.Tensor`` is rejected: a buffer allocated after the
         fork is invisible to the chip worker.
+
+        Available only for single-program workers. When several programs were
+        prepared together (multi-program), the target is ambiguous, so this
+        raises ``TypeError`` — dispatch explicitly via ``rt.run(compiled, ...)``.
         """
+        if self._multi_program:
+            raise TypeError(
+                "rt(*args) is ambiguous on a multi-program DistributedWorker; "
+                "dispatch explicitly with rt.run(compiled, *args)."
+            )
+        return self._run_compiled(self._compiled, *args, config=config)
+
+    def _run_compiled(self, compiled: DistributedCompiledProgram, *args: Any, config: Any = None) -> None:
+        """Dispatch *compiled* on the shared Worker via its per-program state."""
         del config  # reserved for future per-call overrides
-        self._require_open("__call__")
+        self._require_open("run")
         from pypto.ir.compiled_program import _validate_device_tensor  # noqa: PLC0415
 
-        param_infos = self._param_infos
+        state = self._states.get(compiled)
+        if state is None:
+            raise ValueError(
+                "DistributedWorker.run(compiled, ...) requires a DistributedCompiledProgram "
+                "registered when this worker was constructed."
+            )
+
+        param_infos = state["param_infos"]
         n_params = len(param_infos)
         if len(args) != n_params:
             raise TypeError(
@@ -575,8 +775,12 @@ class DistributedWorker(Worker):
                 f"got {len(args)}. Parameters: {[p.name for p in param_infos]}"
             )
 
-        tensors: dict[str, Any] = dict(self._base_tensors)
+        tensors: dict[str, Any] = dict(state["base_tensors"])
         for info, arg in zip(param_infos, args, strict=True):
+            if info.shape is None:
+                # Scalar parameter (e.g. seq_len): forwarded as-is to the entry.
+                tensors[info.name] = arg
+                continue
             if isinstance(arg, DeviceTensor):
                 _validate_device_tensor(arg, info)
             elif isinstance(arg, torch.Tensor):
@@ -594,14 +798,14 @@ class DistributedWorker(Worker):
                 )
             tensors[info.name] = arg
 
-        _dispatch(
+        self.last_run_timing = _dispatch(
             self._w,
-            self._entry_fn,
+            state["entry_fn"],
             tensors,
-            self._chip_cids,
-            self._sub_ids,
-            self._call_config,
-            len(self.dc.device_ids),
+            state["chip_cids"],
+            state["sub_ids"],
+            state["call_config"],
+            state["device_nums"],
         )
 
     # ------------------------------------------------------------------
@@ -648,21 +852,15 @@ class DistributedWorker(Worker):
     ) -> None:
         """Dispatch *compiled* on this DistributedWorker.
 
-        Equivalent to the legacy ``self(*args, config=config)`` call. Provided
-        for symmetry with :meth:`ChipWorker.run`, so library code can write
-        ``rt.run(compiled, *args)`` and accept either runtime kind.
+        Provided for symmetry with :meth:`ChipWorker.run`, so library code can
+        write ``rt.run(compiled, *args)`` and accept either runtime kind. For a
+        multi-program worker this selects which prepared program to dispatch.
 
-        *compiled* must be the same :class:`DistributedCompiledProgram` this
-        runtime was prepared from; passing a different one raises
+        *compiled* must be one of the :class:`DistributedCompiledProgram` objects
+        this worker was constructed from; passing an unregistered one raises
         ``ValueError``.
         """
-        if compiled is not self._compiled:
-            raise ValueError(
-                "DistributedWorker.run(compiled, ...) requires the same "
-                "DistributedCompiledProgram this runtime was prepared from. "
-                "Construct a new DistributedWorker via the other compiled.prepare()."
-            )
-        return self(*args, config=config)
+        return self._run_compiled(compiled, *args, config=config)
 
     def register(self, compiled: DistributedCompiledProgram) -> RegistrationHandle:
         """Pre-register *compiled* on this DistributedWorker.
@@ -678,14 +876,14 @@ class DistributedWorker(Worker):
 
         Raises:
             RuntimeError: This DistributedWorker has been closed.
-            ValueError: *compiled* is not the program this runtime was prepared
-                from.
+            ValueError: *compiled* is not one of the programs this worker was
+                constructed from.
         """
         self._require_open("register")
-        if compiled is not self._compiled:
+        if compiled not in self._states:
             raise ValueError(
-                "DistributedWorker.register(compiled) requires the same "
-                "DistributedCompiledProgram this runtime was prepared from."
+                "DistributedWorker.register(compiled) requires a DistributedCompiledProgram "
+                "registered when this worker was constructed."
             )
         # Avoid a hard cycle: distributed_runner imports from worker only
         # for RegistrationHandle; worker never imports from distributed_runner.

@@ -47,7 +47,7 @@ class IRProperty(Enum):
     OrchestrationReferencesResolved = ...
     TensorViewCanonical = ...
     ArrayNotEscaped = ...
-    CommGroupsCollected = ...
+    CommDomainScopesMaterialized = ...
     RuntimeScopesMaterialized = ...
     AssignTypeSymmetry = ...
 
@@ -549,6 +549,18 @@ def derive_call_directions() -> Pass:
     auto-verified by the pipeline.
     """
 
+def auto_derive_task_dependencies(analyze_auto_scopes: bool = False) -> Pass:
+    """Create a pass that derives compiler-owned runtime-scope task dependencies.
+
+    Runs after :func:`derive_call_directions` and writes
+    ``Call.attrs['compiler_manual_dep_edges']`` for RAW/WAR/WAW hazards inside
+    manual runtime scopes. AUTO scopes are skipped by default. Pass
+    ``analyze_auto_scopes=True`` to analyze them without changing their runtime
+    scope mode; unanalyzable hazards fall back to AUTO tracking with partial
+    compiler deps stripped. User-written ``deps=[...]`` entries remain under
+    ``Call.attrs['manual_dep_edges']``.
+    """
+
 def expand_manual_phase_fence() -> Pass:
     """Create a pass that inserts dummy TaskId barriers for manual phase fences."""
 
@@ -571,14 +583,16 @@ def inline_functions() -> Pass:
 def normalize_stmt_structure() -> Pass:
     """Create a pass that normalizes statement structure."""
 
-def collect_comm_groups() -> Pass:
-    """Collect CommGroups for distributed window-buffer allocations.
+def materialize_comm_domain_scopes() -> Pass:
+    """Collect comm domains and materialise them as scope statements.
 
     For each ``@pl.program`` host_orch function, traces
     ``pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r)``
     chains, constructs a :class:`WindowBuffer` per alloc, back-fills the
     ``DistributedTensorType.window_buffer_`` field on every ``pld.tensor.window``
-    result Var, and writes :attr:`Program.comm_groups`.
+    result Var, and wraps the host_orch body in nested
+    :class:`CommDomainScopeStmt` nodes (one per inferred comm domain,
+    outer = first declared, inner = last).
 
     Runs immediately after :func:`inline_functions` — L2 orchestrations are
     never inlined into L3, so the dispatch chain survives inlining.
@@ -773,6 +787,7 @@ __all__ = [
     "inline_functions",
     "normalize_stmt_structure",
     "derive_call_directions",
+    "auto_derive_task_dependencies",
     "expand_manual_phase_fence",
     "NestedCallErrorType",
     "UseAfterDefErrorType",

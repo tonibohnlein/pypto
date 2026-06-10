@@ -174,16 +174,19 @@ class PassManager:
             ("FoldNoOpReshape", lambda: passes.fold_no_op_reshape()),
             ("FuseCreateAssembleToSlice", lambda: passes.fuse_create_assemble_to_slice()),
             ("DeriveCallDirections", lambda: passes.derive_call_directions()),
+            ("AutoDeriveTaskDependencies", lambda: passes.auto_derive_task_dependencies()),
             ("ExpandManualPhaseFence", lambda: passes.expand_manual_phase_fence()),
             # Trace pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r)
-            # in each host_orch and materialise WindowBuffer +
-            # Program.comm_groups_. Runs at the end of the pipeline because
-            # nothing between InlineFunctions and here touches the host_orch
+            # in each host_orch, materialise WindowBuffer back-references on
+            # every DistributedTensorType view, and wrap the host_orch body
+            # in nested CommDomainScopeStmts (one per inferred comm domain).
+            # Runs at the end of the pipeline because nothing between
+            # InlineFunctions and here touches the host_orch
             # alloc/window/dispatch chain (host_orch is never tile-lowered),
             # so the alloc/view/dispatch sites are still discoverable. Runs
             # before the final Simplify so any constant folding it does on the
             # collected sizes is applied uniformly.
-            ("CollectCommGroups", lambda: passes.collect_comm_groups()),
+            ("MaterializeCommDomainScopes", lambda: passes.materialize_comm_domain_scopes()),
             ("Simplify", lambda: passes.simplify()),
             # Insert explicit AUTO RuntimeScopeStmt nodes (function body + for/if
             # bodies) into Orchestration functions so codegen emits PTO2_SCOPE
@@ -200,32 +203,50 @@ class PassManager:
     def get_strategy(
         cls,
         strategy: OptimizationStrategy = OptimizationStrategy.Default,
+        *,
+        analyze_auto_scopes_for_deps: bool = False,
     ) -> "PassManager":
         """Get a PassManager configured for the specified strategy.
 
         Args:
             strategy: The optimization strategy to use (default: Default)
+            analyze_auto_scopes_for_deps: If True, enable compiler-derived task
+                dependency analysis for AUTO runtime scopes. The default stays
+                False so only manual scopes are analyzed.
 
         Returns:
             A PassManager instance configured with the appropriate passes
         """
         if not cls._strategy_passes:
             cls._register_passes()
-        return cls(strategy)
+        return cls(strategy, analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps)
 
-    def __init__(self, strategy: OptimizationStrategy):
+    def __init__(
+        self,
+        strategy: OptimizationStrategy,
+        *,
+        analyze_auto_scopes_for_deps: bool = False,
+    ):
         """Initialize PassManager with a specific strategy.
 
         Args:
             strategy: The optimization strategy to use
+            analyze_auto_scopes_for_deps: If True, enable compiler-derived task
+                dependency analysis for AUTO runtime scopes.
         """
         self.strategy = strategy
+        self.analyze_auto_scopes_for_deps = analyze_auto_scopes_for_deps
         self.passes: list[passes.Pass] = []
         self.pass_names: list[str] = []
 
         # Build pass list
         for pass_name, pass_factory in self._strategy_passes[strategy]:
-            self.passes.append(pass_factory())
+            if pass_name == "AutoDeriveTaskDependencies":
+                self.passes.append(
+                    passes.auto_derive_task_dependencies(analyze_auto_scopes=analyze_auto_scopes_for_deps)
+                )
+            else:
+                self.passes.append(pass_factory())
             self.pass_names.append(pass_name)
 
         # Build C++ PassPipeline

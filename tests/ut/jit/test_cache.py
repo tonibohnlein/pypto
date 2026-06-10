@@ -58,6 +58,7 @@ class TestMakeCacheKey:
         platform=None,
         strategy=None,
         distributed_config=None,
+        analyze_auto_scopes_for_deps=False,
     ):
         return make_cache_key(
             source_hash=source_hash,
@@ -69,6 +70,7 @@ class TestMakeCacheKey:
             platform=platform,
             strategy=strategy,
             distributed_config=distributed_config,
+            analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
         )
 
     def test_basic_key_structure(self):
@@ -78,14 +80,15 @@ class TestMakeCacheKey:
             tensor_dtypes={"a": DataType.FP32},
         )
         assert isinstance(key, tuple)
-        assert len(key) == 6
-        source_hash, platform, strategy, tensor_part, scalar_part, dist_part = key
+        assert len(key) == 7
+        source_hash, platform, strategy, tensor_part, scalar_part, dist_part, compile_opts = key
         assert source_hash == "abc"
         assert platform is None
         assert strategy is None
         assert isinstance(tensor_part, tuple)
         assert isinstance(scalar_part, tuple)
         assert dist_part is None  # single-chip default
+        assert compile_opts == (("analyze_auto_scopes_for_deps", False),)
 
     def test_tensor_shape_in_key(self):
         key = self._make_key(
@@ -93,7 +96,7 @@ class TestMakeCacheKey:
             tensor_shapes={"a": (128, 64)},
             tensor_dtypes={"a": DataType.FP32},
         )
-        _, _, _, tensor_part, _, _ = key
+        _, _, _, tensor_part, _, _, _ = key
         assert len(tensor_part) == 1
         info = tensor_part[0]
         assert info.name == "a"
@@ -107,7 +110,7 @@ class TestMakeCacheKey:
             tensor_dtypes={"a": DataType.FP32},
             dynamic_dims={("a", 0)},
         )
-        _, _, _, tensor_part, _, _ = key
+        _, _, _, tensor_part, _, _, _ = key
         assert tensor_part[0].shape == (None, 128)
 
     def test_dynamic_dim_cache_hit_on_different_concrete_value(self):
@@ -155,7 +158,7 @@ class TestMakeCacheKey:
             param_names=["BLOCK_M"],
             scalar_values={"BLOCK_M": 64},
         )
-        _, _, _, _, scalar_part, _ = key
+        _, _, _, _, scalar_part, _, _ = key
         assert len(scalar_part) == 1
         assert scalar_part[0].name == "BLOCK_M"
         assert scalar_part[0].value == 64
@@ -175,7 +178,7 @@ class TestMakeCacheKey:
             dynamic_dims=set(),
             scalar_values={},
         )
-        _, _, _, tensor_part, _, _ = key
+        _, _, _, tensor_part, _, _, _ = key
         assert tensor_part[0].name == "b"
         assert tensor_part[1].name == "a"
 
@@ -334,6 +337,22 @@ class TestMakeCacheKey:
         )
         d = {key: "value"}
         assert d[key] == "value"
+
+    def test_analyze_auto_scopes_for_deps_splits_key(self):
+        """AUTO-scope auto-deps changes generated code, so it must split cache."""
+        k_off = self._make_key(
+            param_names=["a"],
+            tensor_shapes={"a": (8, 8)},
+            tensor_dtypes={"a": DataType.FP32},
+            analyze_auto_scopes_for_deps=False,
+        )
+        k_on = self._make_key(
+            param_names=["a"],
+            tensor_shapes={"a": (8, 8)},
+            tensor_dtypes={"a": DataType.FP32},
+            analyze_auto_scopes_for_deps=True,
+        )
+        assert k_off != k_on
 
 
 if __name__ == "__main__":

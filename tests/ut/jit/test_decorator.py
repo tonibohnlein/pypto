@@ -1892,12 +1892,14 @@ class TestCompileKwargForwarding:
             compile_profiling=True,
             save_kernels_dir=str(artifacts_dir),
             block_dim=8,
+            analyze_auto_scopes_for_deps=True,
         )
         kwargs = _run_config_compile_kwargs(cfg)
         assert kwargs["strategy"] == OptimizationStrategy.DebugTileOptimization
         assert kwargs["dump_passes"] is True
         assert kwargs["profiling"] is True  # mapped from RunConfig.compile_profiling
         assert kwargs["output_dir"] == str(artifacts_dir)  # from RunConfig.save_kernels_dir
+        assert kwargs["analyze_auto_scopes_for_deps"] is True
         assert "diagnostic_phase" in kwargs
         assert "disabled_diagnostics" in kwargs
         # backend_type is derived from `platform` by ir.compile(); not forwarded.
@@ -1926,6 +1928,7 @@ class TestCompileKwargForwarding:
         """distributed_config left unset is omitted so ir.compile()'s single-chip default applies."""
         kwargs = _run_config_compile_kwargs(RunConfig())
         assert "distributed_config" not in kwargs
+        assert kwargs["analyze_auto_scopes_for_deps"] is False
 
     def test_make_cache_key_splits_on_distributed_config(self):
         """distributed_config participates in the cache key (distinct device_ids ≠ collide)."""
@@ -1957,6 +1960,25 @@ class TestCompileKwargForwarding:
         # cache; the key stays hashable (usable in a set / as a dict key).
         assert key_01 == key_01_again
 
+    def test_make_cache_key_splits_on_auto_scope_deps_switch(self):
+        """AUTO-scope dependency analysis changes codegen, so it splits cache."""
+        from pypto.jit.cache import make_cache_key  # noqa: PLC0415
+
+        def key_for(enabled):
+            return make_cache_key(
+                source_hash="h",
+                param_names=["x"],
+                tensor_shapes={"x": (128, 128)},
+                tensor_dtypes={"x": DataType.FP32},
+                dynamic_dims=set(),
+                scalar_values={},
+                platform="a2a3",
+                strategy=OptimizationStrategy.Default,
+                analyze_auto_scopes_for_deps=enabled,
+            )
+
+        assert key_for(False) != key_for(True)
+
     def test_resolve_compiled_splits_cache_on_distributed_config(self, monkeypatch):
         """Two calls differing only in distributed_config compile distinct artifacts.
 
@@ -1986,8 +2008,11 @@ class TestCompileKwargForwarding:
         a = torch.randn(128, 128)
         c = torch.empty(128, 128)
 
-        def resolve(device_ids):
-            cfg = RunConfig(distributed_config=DistributedConfig(device_ids=device_ids))
+        def resolve(device_ids, analyze_auto_scopes_for_deps=False):
+            cfg = RunConfig(
+                distributed_config=DistributedConfig(device_ids=device_ids),
+                analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+            )
             return cfg_kernel._resolve_compiled((a, c), {"config": cfg})[0]
 
         first = resolve([0, 1])
@@ -1998,6 +2023,39 @@ class TestCompileKwargForwarding:
         assert len(cfg_kernel._cache) == 2  # two distinct cached artifacts
         assert first != second  # not the same cached object
         assert third == first  # re-uses the first artifact
+
+    def test_resolve_compiled_splits_cache_on_auto_scope_deps_switch(self, monkeypatch):
+        """The same JIT call compiles separately when the AUTO-scope deps switch changes."""
+        torch = pytest.importorskip("torch")
+
+        @jit
+        def cfg_kernel(a: pl.Tensor[[128, 128], pl.FP32], c: pl.Out[pl.Tensor[[128, 128], pl.FP32]]):
+            c = a
+            return c
+
+        compile_calls = {"n": 0}
+
+        def fake_compile(*_args, **_kwargs):
+            compile_calls["n"] += 1
+            return f"compiled-{compile_calls['n']}"
+
+        monkeypatch.setattr(cfg_kernel, "_compile", fake_compile)
+
+        a = torch.randn(128, 128)
+        c = torch.empty(128, 128)
+
+        def resolve(enabled):
+            cfg = RunConfig(analyze_auto_scopes_for_deps=enabled)
+            return cfg_kernel._resolve_compiled((a, c), {"config": cfg})[0]
+
+        first = resolve(False)
+        second = resolve(True)
+        third = resolve(False)
+
+        assert compile_calls["n"] == 2
+        assert len(cfg_kernel._cache) == 2
+        assert first != second
+        assert third == first
 
     def test_compile_forwards_run_config_kwargs(self, monkeypatch):
         """_compile forwards ir_compile_kwargs verbatim to ir.compile()."""
@@ -2030,6 +2088,7 @@ class TestCompileKwargForwarding:
             dump_passes=True,
             compile_profiling=True,
             distributed_config=dc,
+            analyze_auto_scopes_for_deps=True,
         )
         result = fwd_kernel._compile(
             tensor_meta={
@@ -2048,6 +2107,7 @@ class TestCompileKwargForwarding:
         assert captured["dump_passes"] is True
         assert captured["profiling"] is True
         assert captured["platform"] == "a2a3sim"
+        assert captured["analyze_auto_scopes_for_deps"] is True
         assert "skip_ptoas" in captured
         # distributed_config reaches ir.compile() so a @pl.jit.host entry can
         # compile to a DistributedCompiledProgram and dispatch per-rank.

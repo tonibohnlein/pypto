@@ -18,6 +18,7 @@ Orchestrates the full PTO backend output pipeline:
 Entry point: ``generate(program, output_dir) -> dict[str, str]``
 """
 
+import json
 import logging
 import os
 import re
@@ -248,8 +249,16 @@ def _preprocess_ptoas_output(content: str) -> str:
             continue
         filtered.append(line)
     result = "".join(filtered)
-    # Non-mixed kernels: optional __global__ AICORE void -> static __aicore__ void.
-    result = re.sub(r"(?:__global__\s+)?AICORE\s+void", "static __aicore__ void", result)
+    # Non-mixed kernels: optional [extern "C"] [__global__] AICORE void -> static
+    # __aicore__ void. Newer ptoas prefixes the function with extern "C"; it must be
+    # consumed too, else the rewrite yields the illegal `extern "C" static` (external
+    # vs. internal linkage clash that clang rejects). kernel_entry below is the sole
+    # extern "C" export.
+    result = re.sub(
+        r'(?:extern\s*"C"\s*)?(?:__global__\s+)?AICORE\s+void',
+        "static __aicore__ void",
+        result,
+    )
     # Mixed-kernel sub-functions and helpers: normalize remaining AICORE qualifiers.
     result = re.sub(r"\bAICORE\b", "__aicore__", result)
     return result
@@ -765,7 +774,14 @@ def _generate_config_file(
 
 
 class _CallCollector(_ir_core.IRVisitor):
-    """Collect all GlobalVar callee names reachable from a function body."""
+    """Collect all GlobalVar callee names reachable from a function body.
+
+    Both ``Call`` (plain function call) and ``Submit`` (task launch from
+    ``pl.submit`` inside a ``pl.manual_scope``) reference a callee through a
+    ``GlobalVar`` op. Next-level program extraction must follow both kinds, or
+    helper kernels that orchestration only reaches via ``Submit`` get dropped
+    from the generated chip program (see ``pass-submit-awareness.md``).
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -775,6 +791,14 @@ class _CallCollector(_ir_core.IRVisitor):
         if isinstance(op.op, _ir_core.GlobalVar):
             self.callee_names.append(op.op.name)
         super().visit_call(op)
+
+    def visit_expr(self, expr: _ir_core.Expr) -> None:
+        # ``Submit`` has no dedicated Python visitor hook, so collect its callee
+        # here on the generic expr dispatch before delegating. ``super()`` routes
+        # ``Call`` nodes on to ``visit_call`` and recurses into children.
+        if isinstance(expr, _ir_core.Submit) and isinstance(expr.op, _ir_core.GlobalVar):
+            self.callee_names.append(expr.op.name)
+        super().visit_expr(expr)
 
 
 def _extract_group_member_names(
@@ -1147,6 +1171,7 @@ def _generate_with_distributed(
     # captured by the decorator. Lower-level role=SubWorker kernels (e.g. CHIP
     # InCore promoted by auto-derive) keep their DSL body and are emitted by
     # chip-level codegen above.
+    required_callbacks: list[str] = []
     for func in transformed_program.functions.values():
         if (
             func.role == _ir_core.Role.SubWorker
@@ -1154,6 +1179,14 @@ def _generate_with_distributed(
             and _ir_core.level_to_linqu_level(func.level) >= 3
         ):
             result_files[f"sub_workers/{func.name}.py"] = _emit_sub_worker_module(func)
+            if func.requires_runtime_binding:
+                required_callbacks.append(func.name)
+
+    # Manifest of abstract SubWorkers that MUST be bound at runtime via
+    # ``prepare(callbacks={...})``. The runtime reads this to fail early (at
+    # prepare time) when a required callback is missing, rather than at dispatch.
+    if required_callbacks:
+        result_files["sub_workers/__required__.json"] = json.dumps(sorted(required_callbacks), indent=2)
 
     return result_files
 
@@ -1168,12 +1201,29 @@ def _emit_sub_worker_module(func: _ir_core.Function) -> str:
     """
     import textwrap  # noqa: PLC0415
 
+    param_names = [p.name_hint for p in func.params]
+    params_str = ", ".join(param_names)
+
+    # Abstract SubWorker (`...` body): no implementation to embed. Emit a guard
+    # that fails loudly if dispatched without a runtime binding, instead of
+    # silently no-op'ing.
+    if func.requires_runtime_binding:
+        return (
+            f'"""SubWorker: {func.name} — runtime-bound callback (no default impl)."""\n'
+            f"\n"
+            f"\n"
+            f"def {func.name}(args):\n"
+            f"    raise RuntimeError(\n"
+            f"        \"SubWorker '{func.name}' is a runtime-bound callback with no \"\n"
+            f'        "default implementation; supply it via "\n'
+            f"        \"prepare(callbacks={{'{func.name}': <fn>}}).\"\n"
+            f"    )\n"
+        )
+
     body = func.body
     if not isinstance(body, _ir_core.InlineStmt):
         raise RuntimeError(f"SubWorker '{func.name}' must have an InlineStmt body, got {type(body).__name__}")
 
-    param_names = [p.name_hint for p in func.params]
-    params_str = ", ".join(param_names)
     indented_body = textwrap.indent(body.body, "    ") if body.body else "    pass"
     unpack_block = (
         "\n".join(

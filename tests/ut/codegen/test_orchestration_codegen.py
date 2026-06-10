@@ -83,6 +83,76 @@ def _generate_orch_result(program) -> "codegen.OrchestrationResult":
     raise ValueError("No orchestration function found in program")
 
 
+def _out_of_scope_tensor_refs(code: str) -> list[str]:
+    """Return tensor identifiers used outside the C++ brace scope that declares
+    them — a lightweight stand-in for ``g++`` that catches the
+    ``'<name>' was not declared in this scope`` class of orchestration codegen
+    bugs (issues #1697, #1713) without invoking a real C++ compiler.
+
+    Walks brace scopes recording the tensor identifiers declared in each, then
+    flags any *use* that names a declared tensor not visible at the use site.
+    Three use shapes are scanned (a name escaping a closed ``PTO2_SCOPE`` block
+    can surface as any of them):
+
+      * ``add_input/output/inout/no_dep(X)``         — call-arg reads (#1697)
+      * ``X.reshape/.view/.transpose/.assemble/.slice/.get_ref(...)`` —
+        method-receiver reads (the after-scope ``buf_rv.reshape(...)`` shape that
+        an ``add_*``-only checker missed, #1713)
+      * ``... = X;`` / ``... = X.method(...)``        — assignment-RHS reads
+
+    A used name out of scope is flagged when it is *either* declared as a tensor
+    somewhere (``declared_anywhere``) *or* an SSA-versioned tensor temp
+    (``__ssa_v``/``__rv``/``__window``/...). The latter is checked independently
+    so a dangling reference to a name whose declaration was wrongly *collapsed
+    away* — which would never land in ``declared_anywhere`` — is still reported.
+    Numeric literals (``= 0;``), casts, and scalar locals carry neither marker,
+    so they never yield false positives.
+    """
+    decl_re = re.compile(r"\b(?:const\s+Tensor\s*&|Tensor|TaskOutputTensors|Arg)\s+(\w+)")
+    declared_anywhere = set(decl_re.findall(code))
+    # An SSA-versioned tensor temp is unambiguously a tensor regardless of whether
+    # its declaration still exists, so an out-of-scope reference to one is always
+    # a bug worth flagging (independent of declared_anywhere).
+    ssa_tensor = re.compile(r"__(?:ssa_v\d|rv\b|rv_v\d|window|windowed|assembled)")
+    use_add = re.compile(r"\badd_(?:input|output|inout|no_dep)\(\s*(\w+)\s*\)")
+    use_method = re.compile(r"\b(\w+)\s*\.(?:reshape|view|transpose|assemble|slice|get_ref)\s*\(")
+    use_rhs = re.compile(r"=\s*(\w+)\s*[;.]")
+    scopes: list[set[str]] = [set()]
+    bad: list[str] = []
+    for raw in code.splitlines():
+        line = raw.strip()
+        # Declarations and uses are each emitted on their own line (never sharing
+        # a line with a scope brace), so resolve them against the current scope
+        # set first. Declarations are recorded before uses so a ``const Tensor& Y
+        # = X`` line registers Y while still checking the RHS read of X.
+        for m in decl_re.finditer(line):
+            scopes[-1].add(m.group(1))
+        names = [m.group(1) for m in use_add.finditer(line)]
+        names += [m.group(1) for m in use_method.finditer(line)]
+        names += [m.group(1) for m in use_rhs.finditer(line)]
+        for name in names:
+            if any(name in s for s in scopes):
+                continue
+            if name in declared_anywhere or ssa_tensor.search(name):
+                bad.append(name)
+        # Apply braces in source order so a ``} else {`` line closes the prior
+        # block then opens a fresh one (counting separately would mis-nest it).
+        for ch in line:
+            if ch == "{":
+                scopes.append(set())
+            elif ch == "}" and len(scopes) > 1:
+                scopes.pop()
+    return bad
+
+
+def _run_default_pipeline_with_auto_scope_deps(program):
+    """Run the default pipeline with AUTO-scope auto-deps enabled in-place."""
+    return PassManager.get_strategy(
+        OptimizationStrategy.Default,
+        analyze_auto_scopes_for_deps=True,
+    ).run_passes(program)
+
+
 class TestOrchestration:
     """Test orchestration codegen format."""
 
@@ -816,14 +886,555 @@ class TestOrchestration:
         # inout_t is InOut (written in place) but not part of the return tuple.
         assert "params_t0.add_inout(ext_inout_t)" in code
 
-        # Each tuple result aliases to its OWN arg — not shifted onto inout_t.
-        assert "const Tensor& o1 = ext_ta;" in code
-        assert "const Tensor& o2 = ext_tb;" in code
-        assert "const Tensor& o3 = ext_tc;" in code
-        # The scrambled (shifted-by-one) bindings must NOT appear.
-        assert "const Tensor& o1 = ext_inout_t;" not in code
-        assert "const Tensor& o2 = ext_ta;" not in code
-        assert "const Tensor& o3 = ext_tb;" not in code
+        # Each tuple result is the in-place arg it writes, so it remaps to that
+        # arg (no per-output ``const Tensor&`` alias is minted). The consumer
+        # ``combine`` reads ta/tb/tc — each result mapped to its OWN arg, NOT
+        # shifted onto inout_t (issue #1573).
+        ia = code.index("params_t1.add_input(ext_ta)")
+        ib = code.index("params_t1.add_input(ext_tb)")
+        ic = code.index("params_t1.add_input(ext_tc)")
+        assert ia < ib < ic, code
+        # The scrambled (shifted-by-one) mapping must NOT appear: combine must
+        # not read inout_t, and no const-ref output alias is emitted.
+        assert "add_input(ext_inout_t)" not in code
+        assert all(f"const Tensor& o{i}" not in code for i in (1, 2, 3)), code
+
+    @staticmethod
+    def _manual_cross_scope_code(create_inside: bool) -> str:
+        """Orchestration code for a tensor written inside a ``pl.manual_scope``
+        and read by a task placed after it, with the ``pl.create_tensor`` placed
+        either before or inside the scope (issue #1697)."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class CrossScopeProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def producer(
+                self,
+                x: pl.Tensor[[16, 256], pl.FP32],
+                buf: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                t: pl.Tile[[16, 256], pl.FP32] = pl.load(x, [0, 0], [16, 256])
+                out: pl.Tensor[[16, 256], pl.FP32] = pl.store(t, [0, 0], buf)
+                return out
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consumer(
+                self,
+                buf: pl.Tensor[[16, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                t: pl.Tile[[16, 256], pl.FP32] = pl.load(buf, [0, 0], [16, 256])
+                r: pl.Tensor[[16, 256], pl.FP32] = pl.store(t, [0, 0], out)
+                return r
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main_before(
+                self,
+                x: pl.Tensor[[16, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                buf: pl.Tensor[[16, 256], pl.FP32] = pl.create_tensor([16, 256], dtype=pl.FP32)
+                with pl.manual_scope():
+                    buf, _ptid = pl.submit(self.producer, x, buf)
+                out = self.consumer(buf, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main_inside(
+                self,
+                x: pl.Tensor[[16, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                with pl.manual_scope():
+                    buf: pl.Tensor[[16, 256], pl.FP32] = pl.create_tensor([16, 256], dtype=pl.FP32)
+                    buf, _ptid = pl.submit(self.producer, x, buf)
+                out = self.consumer(buf, out)
+                return out
+
+        which = "main_inside" if create_inside else "main_before"
+        program = passes.materialize_runtime_scopes()(
+            passes.derive_call_directions()(
+                PassManager.get_strategy(OptimizationStrategy.Default).run_passes(CrossScopeProgram)
+            )
+        )
+        for func in program.functions.values():
+            if func.func_type == ir.FunctionType.Orchestration and func.name == which:
+                return codegen.generate_orchestration(program, func).code
+        raise AssertionError(f"orchestration function {which} not found")
+
+    @staticmethod
+    def _assert_cross_scope_resolves(code: str) -> None:
+        """A tensor written inside a manual_scope and read after it must resolve:
+        no add_* may name an out-of-scope identifier, the buffer is declared in
+        the enclosing scope, and the after-scope reader references it directly
+        (issue #1697 — remap to the canonical name, not a per-SSA alias)."""
+        assert _out_of_scope_tensor_refs(code) == [], code
+        manual_open = code.index("PTO2_SCOPE(PTO2ScopeMode::MANUAL)")
+        manual_close = code.index("}", manual_open)
+        # The buffer AND the alloc handle backing it are declared in the
+        # enclosing scope, ahead of the block — if only ``const Tensor& buf`` were
+        # hoisted while ``TaskOutputTensors alloc_0 = ...`` stayed inside, ``buf``
+        # would reference an out-of-scope handle and the .cpp would not compile.
+        assert code.index("TaskOutputTensors alloc_") < manual_open, code
+        assert code.index("alloc_tensors(") < manual_open, code
+        decl = code.index("const Tensor& buf = ")
+        assert decl < manual_open, code
+        # The after-scope consumer reads ``buf`` directly — no const-ref alias
+        # is minted for the producer's SSA output.
+        assert "add_input(buf)" in code[manual_close:], code
+        assert "const Tensor& buf__" not in code, code
+
+    def test_manual_scope_tensor_created_before_read_after(self):
+        """Regression for #1697: a tensor created BEFORE a ``pl.manual_scope``,
+        written by a submit inside it, and read by a task after it. The output
+        previously minted ``const Tensor& buf__ssa_v1 = buf;`` at the deep block
+        indent; the after-scope ``add_input(buf__ssa_v1)`` then named an
+        out-of-scope identifier and the orchestration ``.cpp`` failed to compile.
+        The output is now remapped to read ``buf`` directly."""
+        self._assert_cross_scope_resolves(self._manual_cross_scope_code(create_inside=False))
+
+    def test_manual_scope_tensor_created_inside_read_after(self):
+        """Companion to #1697: the same after-scope read when the
+        ``pl.create_tensor`` is INSIDE the manual scope. Its ``alloc_tensors``
+        declaration (a storage reservation with no scheduling dependency) is
+        hoisted to the enclosing scope, so the after-scope reader still resolves
+        ``buf``."""
+        self._assert_cross_scope_resolves(self._manual_cross_scope_code(create_inside=True))
+
+    @staticmethod
+    def _manual_scope_loop_carry_code(fresh_carry: bool) -> str:
+        """Orchestration code for a tensor carried through a ``pl.range`` loop
+        *inside* a ``pl.manual_scope`` and read by a task after the scope
+        (issue #1713). The loop body submits a windowed (sub-region) write of the
+        carried tensor, so OptimizeOrchTensors Pattern-5 externalizes it
+        (``produce__windowed`` + ``.view`` slicing).
+
+        ``fresh_carry`` selects which lowering shape the loop carry takes:
+          * False — the carry threads the before-scope tensor in place, so the
+            post-loop ``score = score_rv`` rebind lowers to a catch-all
+            ``Tensor score__ssa_v1 = score;`` copy emitted at the deep block
+            indent; the after-scope ``pl.reshape`` reader then named the
+            out-of-scope ``score__ssa_v1``.
+          * True — the loop yields a freshly created tensor each iteration
+            (``is_rebind``), so codegen mints a mutable carry ``Tensor acc_rv =
+            acc;`` *inside* the block AND a chained ``acc__ssa_v1 = acc_rv;``
+            post-loop copy. The after-scope kernel read named the out-of-scope
+            chain. The carry decl is now hoisted out and the copy collapses.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N, M, W = 64, 512, 64
+
+        @pl.program
+        class LoopCarryProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def produce(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                col: pl.Scalar[pl.INDEX],
+                score: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                t: pl.Tile[[N, W], pl.FP32] = pl.load(x, [0, col], [N, W])
+                r: pl.Tensor[[N, M], pl.FP32] = pl.store(t, [0, col], score)
+                return r
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consume(
+                self,
+                score: pl.Tensor[[N, M], pl.FP32],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                t: pl.Tile[[N, M], pl.FP32] = pl.load(score, [0, 0], [N, M])
+                r: pl.Tensor[[N, M], pl.FP32] = pl.store(t, [0, 0], out)
+                return r
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main_inplace(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                score: pl.Tensor[[N, M], pl.FP32] = pl.create_tensor([N, M], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for col, (score_iter,) in pl.range(0, M, W, init_values=(score,)):
+                        score_next: pl.Tensor[[N, M], pl.FP32] = self.produce(x, col, score_iter)
+                        (score_rv,) = pl.yield_(score_next)
+                    score = score_rv
+                # After-scope read via a method receiver (pl.reshape) — the shape
+                # an ``add_*``-only scope check would miss.
+                score_flat: pl.Tensor[[N, M], pl.FP32] = pl.reshape(score, [N, M])
+                out = self.consume(score_flat, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main_fresh(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                seed: pl.Tensor[[N, M], pl.FP32],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                acc: pl.Tensor[[N, M], pl.FP32] = pl.create_tensor([N, M], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for col, (acc_iter,) in pl.range(0, M, W, init_values=(acc,)):
+                        # A fresh per-iteration tensor makes the yield value not
+                        # alias the carry -> a true rebind -> mutable carry decl.
+                        fresh: pl.Tensor[[N, M], pl.FP32] = pl.create_tensor([N, M], dtype=pl.FP32)
+                        fresh2: pl.Tensor[[N, M], pl.FP32] = self.produce(x, col, fresh)
+                        (acc_rv,) = pl.yield_(fresh2)
+                    acc = acc_rv
+                out = self.consume(acc, out)
+                return out
+
+        which = "main_fresh" if fresh_carry else "main_inplace"
+        program = passes.materialize_runtime_scopes()(
+            passes.derive_call_directions()(
+                PassManager.get_strategy(OptimizationStrategy.Default).run_passes(LoopCarryProgram)
+            )
+        )
+        for func in program.functions.values():
+            if func.func_type == ir.FunctionType.Orchestration and func.name == which:
+                return codegen.generate_orchestration(program, func).code
+        raise AssertionError(f"orchestration function {which} not found")
+
+    def test_manual_scope_loop_carry_read_after_reshape(self):
+        """Regression for #1713: a tensor carried through a ``pl.range`` loop
+        inside a ``pl.manual_scope`` and read after the scope via ``pl.reshape``
+        (a method-receiver use the old ``add_*``-only scope checker missed).
+
+        The post-loop ``score = score_rv`` rebind lowered to a catch-all
+        ``Tensor score__ssa_v1 = score;`` copy at the deep block indent; the
+        after-scope ``score_flat = score__ssa_v1.reshape(...)`` then named an
+        out-of-scope identifier and the ``.cpp`` failed to C++-compile. The copy
+        is now collapsed onto the enclosing ``score``."""
+        code = self._manual_scope_loop_carry_code(fresh_carry=False)
+        # No identifier — including a ``.reshape`` receiver — names an
+        # out-of-scope name.
+        assert _out_of_scope_tensor_refs(code) == [], code
+        # The post-loop rebind collapsed: the after-scope reshape reads the
+        # enclosing ``score`` directly, never a scope-local ``score__ssa_v<N>``.
+        assert re.search(r"=\s*score\.reshape\(", code), code
+        assert not re.search(r"score__ssa_v\d+\s*\.reshape", code), code
+
+    def test_manual_scope_fresh_loop_carry_chained_read_after(self):
+        """Regression for #1713: a *fresh-rebind* loop carry inside a
+        ``pl.manual_scope`` (the loop yields a freshly created tensor each
+        iteration, so OptimizeOrchTensors Pattern-5 externalizes the windowed
+        write) read by a kernel after the scope. Codegen minted a mutable carry
+        ``Tensor acc_rv = acc;`` inside the block plus a chained
+        ``Tensor acc__ssa_v1 = acc_rv;`` post-loop copy; the after-scope
+        ``add_input`` named the out-of-scope chain.
+
+        The carry decl is now hoisted to the enclosing scope and the chained copy
+        collapses onto it, so the reader resolves a single enclosing name."""
+        code = self._manual_scope_loop_carry_code(fresh_carry=True)
+        assert _out_of_scope_tensor_refs(code) == [], code
+        # The windowed externalization actually fired (exercises Pattern-5).
+        assert "produce__windowed" in code, code
+        manual_open = code.index("PTO2_SCOPE(PTO2ScopeMode::MANUAL)")
+        # The mutable carry for ``acc`` (``Tensor acc_rv = acc;``) is hoisted AHEAD
+        # of the manual block header (declared in the enclosing scope). Anchor the
+        # match to the ``acc`` carry initialised from ``acc`` so an unrelated
+        # ``_rv`` temp emitted earlier can't be picked by mistake.
+        carry_decls = list(
+            re.finditer(r"^\s*Tensor\s+(acc\w*_rv\w*)\s*=\s*acc;", code[:manual_open], flags=re.MULTILINE)
+        )
+        assert len(carry_decls) == 1, code[:manual_open]
+        carry_name = carry_decls[0].group(1)
+        # The after-scope kernel reads the hoisted carry directly; the chained
+        # ``acc__ssa_v<N>`` post-loop copy collapsed away entirely.
+        assert f"add_input({carry_name})" in code, code
+        assert "acc__ssa_v" not in code, code
+
+    def test_manual_scope_loop_carry_not_hoisted_outside_manual(self):
+        """Negative control for #1713: an identical loop carry NOT inside a
+        ``pl.manual_scope`` keeps its in-place ``Tensor <carry> = <init>;`` decl
+        (the hoist is gated on a manual-scope body). Guards against the hoist
+        firing in ordinary AUTO-scope codegen."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N, M, W = 64, 512, 64
+
+        @pl.program
+        class NoManualScopeProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def produce(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                col: pl.Scalar[pl.INDEX],
+                acc: pl.Tensor[[N, M], pl.FP32],
+                score: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                t: pl.Tile[[N, W], pl.FP32] = pl.load(x, [0, col], [N, W])
+                r: pl.Tensor[[N, M], pl.FP32] = pl.store(t, [0, col], score)
+                return r
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consume(
+                self,
+                score: pl.Tensor[[N, M], pl.FP32],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                t: pl.Tile[[N, M], pl.FP32] = pl.load(score, [0, 0], [N, M])
+                r: pl.Tensor[[N, M], pl.FP32] = pl.store(t, [0, 0], out)
+                return r
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                seed: pl.Tensor[[N, M], pl.FP32],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                acc: pl.Tensor[[N, M], pl.FP32] = pl.create_tensor([N, M], dtype=pl.FP32)
+                for col, (acc_iter,) in pl.range(0, M, W, init_values=(acc,)):
+                    fresh: pl.Tensor[[N, M], pl.FP32] = pl.create_tensor([N, M], dtype=pl.FP32)
+                    fresh2: pl.Tensor[[N, M], pl.FP32] = self.produce(x, col, acc_iter, fresh)
+                    (acc_rv,) = pl.yield_(fresh2)
+                out = self.consume(acc_rv, out)
+                return out
+
+        code = _generate_orch_code(NoManualScopeProgram)
+        assert _out_of_scope_tensor_refs(code) == [], code
+        # No manual scope present -> no hoist machinery engaged; the mutable carry
+        # decl stays in place (a `Tensor <carry> = <init>;` exists) and is
+        # reassigned in the loop.
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert re.search(r"^\s*Tensor\s+\w*_rv\w*\s*=\s*\w+;", code, flags=re.MULTILINE), code
+
+    def test_manual_scope_windowed_submit_read_after_reshape(self):
+        """Regression for #1713 (the issue's headline shape): a tensor created
+        BEFORE a ``pl.manual_scope``, written INSIDE it by a ``pl.submit`` whose
+        callee writes a param-offset sub-window in a loop (so OptimizeOrchTensors
+        Pattern-5 externalizes it into ``produce__windowed`` + ``score.view(...)``
+        + ``tensor.assemble``), and read AFTER the scope via ``pl.reshape``.
+
+        The assemble result's SSA rebind lowered to ``Tensor score__ssa_v1 =
+        score;`` at the deep block indent; the after-scope ``score__ssa_v1.reshape
+        (...)`` named an out-of-scope identifier (``'<name>__ssa_v<N>' was not
+        declared in this scope``). The copy now collapses onto the enclosing
+        ``score``."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N, M, W = 64, 2048, 8
+
+        @pl.program
+        class WindowedSubmitProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def produce(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                base: pl.Scalar[pl.INDEX],
+                score: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                # Internal loop writes a contiguous sub-window [base, base+4W) of
+                # `score`, so the callee is windowable at the orchestration site.
+                for c, (score_iter,) in pl.range(base, base + 4 * W, W, init_values=(score,)):
+                    tile: pl.Tile[[N, W], pl.FP32] = pl.load(x, [0, c], [N, W])
+                    score_next: pl.Tensor[[N, M], pl.FP32] = pl.store(tile, [0, c], score_iter)
+                    (score_rv,) = pl.yield_(score_next)
+                return score_rv
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consume(
+                self,
+                score: pl.Tensor[[N, M], pl.FP32],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                tile: pl.Tile[[N, W], pl.FP32] = pl.load(score, [0, 0], [N, W])
+                ret: pl.Tensor[[N, M], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                score: pl.Tensor[[N, M], pl.FP32] = pl.create_tensor([N, M], dtype=pl.FP32)
+                with pl.manual_scope():
+                    score, _tid = pl.submit(self.produce, x, 0, score)
+                score_flat: pl.Tensor[[N, M], pl.FP32] = pl.reshape(score, [N, M])
+                out = self.consume(score_flat, out)
+                return out
+
+        program = passes.materialize_runtime_scopes()(
+            passes.derive_call_directions()(
+                PassManager.get_strategy(OptimizationStrategy.Default).run_passes(WindowedSubmitProgram)
+            )
+        )
+        code = next(
+            codegen.generate_orchestration(program, f).code
+            for f in program.functions.values()
+            if f.func_type == ir.FunctionType.Orchestration and f.name == "main"
+        )
+        # Windowing fired (the test exercises the Pattern-5 ``.view()`` path).
+        assert "produce__windowed" in code and ".view(" in code, code
+        # The after-scope ``.reshape`` reader resolves: no out-of-scope name, and
+        # the windowed-assemble SSA rebind collapsed onto the enclosing ``score``.
+        assert _out_of_scope_tensor_refs(code) == [], code
+        assert re.search(r"=\s*score\.reshape\(", code), code
+        assert not re.search(r"score__ssa_v\d+\s*\.reshape", code), code
+
+    def test_manual_scope_in_loop_carry_copy_keeps_snapshot(self):
+        """Snapshot-safety guard for the #1713 collapse: a bare copy of a loop
+        carry taken INSIDE the loop body (a deeper indent than the manual-scope
+        body) must NOT collapse onto the hoisted carry — otherwise a reader of
+        the copy placed before the loop's yield rebind would alias the carry's
+        later value. The copy keeps a distinct ``Tensor snap = <carry>;`` decl.
+
+        (The post-loop ``acc = acc_rv`` rebind, at the manual-scope body indent,
+        still collapses — exercised by the other #1713 tests; this guards the
+        indent condition that distinguishes the two.)"""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N, M, W = 64, 512, 64
+
+        @pl.program
+        class SnapshotProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def produce(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                col: pl.Scalar[pl.INDEX],
+                s: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                t: pl.Tile[[N, W], pl.FP32] = pl.load(x, [0, col], [N, W])
+                return pl.store(t, [0, col], s)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def snapshot_use(
+                self,
+                snap: pl.Tensor[[N, M], pl.FP32],
+                o: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                t: pl.Tile[[N, M], pl.FP32] = pl.load(snap, [0, 0], [N, M])
+                return pl.store(t, [0, 0], o)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consume(
+                self,
+                s: pl.Tensor[[N, M], pl.FP32],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                t: pl.Tile[[N, M], pl.FP32] = pl.load(s, [0, 0], [N, M])
+                return pl.store(t, [0, 0], out)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                side: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                acc: pl.Tensor[[N, M], pl.FP32] = pl.create_tensor([N, M], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for col, (acc_iter,) in pl.range(0, M, W, init_values=(acc,)):
+                        fresh: pl.Tensor[[N, M], pl.FP32] = pl.create_tensor([N, M], dtype=pl.FP32)
+                        snap: pl.Tensor[[N, M], pl.FP32] = acc_iter  # in-loop copy of the carry
+                        acc_next: pl.Tensor[[N, M], pl.FP32] = self.produce(x, col, fresh)
+                        side = self.snapshot_use(snap, side)  # read snap before the yield rebind
+                        (acc_rv,) = pl.yield_(acc_next)
+                    acc = acc_rv
+                out = self.consume(acc, out)
+                return out
+
+        code = next(
+            codegen.generate_orchestration(program, f).code
+            for program in [
+                passes.materialize_runtime_scopes()(
+                    passes.derive_call_directions()(
+                        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SnapshotProgram)
+                    )
+                )
+            ]
+            for f in program.functions.values()
+            if f.func_type == ir.FunctionType.Orchestration and f.name == "main"
+        )
+        assert _out_of_scope_tensor_refs(code) == [], code
+        # The in-loop snapshot is materialised as its own ``Tensor snap = ...;``
+        # value and read as ``add_input(snap)`` — NOT collapsed onto the carry,
+        # so the later ``<carry> = ...;`` yield rebind cannot change what the
+        # snapshot reader sees.
+        assert re.search(r"^\s*Tensor\s+snap\s*=\s*\w+;", code, flags=re.MULTILINE), code
+        assert "add_input(snap)" in code, code
+
+    def test_manual_scope_ifstmt_phi_read_after(self):
+        """Regression for #1713 (IfStmt phi sibling of the loop-carry hoist): an
+        ``if`` inside a ``pl.manual_scope`` that conditionally rewrites a tensor
+        produces a phi placeholder ``Tensor <buf>__phi_v<N> = <init>;`` at the
+        block indent (reassigned in each branch); a task after the scope reading
+        the phi then named an out-of-scope identifier.
+
+        The phi decl is now hoisted to the enclosing scope (its init is the
+        enclosing param/buffer), so the after-scope reader resolves it."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N, M = 16, 256
+
+        @pl.program
+        class IfPhiProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def producer(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                buf: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                t: pl.Tile[[N, M], pl.FP32] = pl.load(x, [0, 0], [N, M])
+                return pl.store(t, [0, 0], buf)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consumer(
+                self,
+                buf: pl.Tensor[[N, M], pl.FP32],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                t: pl.Tile[[N, M], pl.FP32] = pl.load(buf, [0, 0], [N, M])
+                return pl.store(t, [0, 0], out)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                flag: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                buf: pl.Tensor[[N, M], pl.FP32] = pl.create_tensor([N, M], dtype=pl.FP32)
+                with pl.manual_scope():
+                    if flag > 0:
+                        buf, _t = pl.submit(self.producer, x, buf)
+                out = self.consumer(buf, out)
+                return out
+
+        program = passes.materialize_runtime_scopes()(
+            passes.derive_call_directions()(
+                PassManager.get_strategy(OptimizationStrategy.Default).run_passes(IfPhiProgram)
+            )
+        )
+        code = next(
+            codegen.generate_orchestration(program, f).code
+            for f in program.functions.values()
+            if f.func_type == ir.FunctionType.Orchestration and f.name == "main"
+        )
+        # The IfStmt actually produced a Tensor phi placeholder (exercises the path).
+        assert re.search(r"Tensor\s+\w+__phi_v\d+\s*=", code), code
+        # No identifier names an out-of-scope name (including the after-scope read).
+        assert _out_of_scope_tensor_refs(code) == [], code
+        # The phi decl is hoisted AHEAD of the manual block header; the branch
+        # ``<phi> = ...;`` merges stay inside the block (resolving through the
+        # enclosing frame).
+        manual_open = code.index("PTO2_SCOPE(PTO2ScopeMode::MANUAL)")
+        phi_decl = re.search(r"^\s*Tensor\s+(\w+__phi_v\d+)\s*=", code[:manual_open], flags=re.MULTILINE)
+        assert phi_decl, code[:manual_open]
+        phi_name = phi_decl.group(1)
+        # The after-scope consumer reads the hoisted phi directly (in scope).
+        assert f"add_input({phi_name})" in code, code
 
     def test_tensor_create(self):
         """Test tensor.create generates TensorCreateInfo with shape/dtype."""
@@ -1829,7 +2440,11 @@ class TestOrchestration:
         # OutputExisting (→ add_output) rather than promoting to InOut.
         assert "params_t0.add_output(ret0__out)" in code
         assert "params_t1.add_output(ret0__out_1)" in code
-        assert "const Tensor& first = ret0__out;" in code
+        # ``first`` is kernel_add's in-place output buffer ret0__out, so it
+        # remaps to ret0__out (no ``const Tensor& first = ...`` alias is minted);
+        # the second call reads that buffer directly.
+        assert "params_t1.add_input(ret0__out)" in code
+        assert "const Tensor& first" not in code
         assert "const Tensor& second" not in code
 
     def test_unused_alias_not_emitted(self):
@@ -4158,6 +4773,51 @@ class TestManualScopeCodegen:
             code,
         ), code
 
+    def test_manual_scope_merges_user_and_compiler_deps(self):
+        """Auto-deps: compiler deps merge with user deps in manual scope."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def unrelated(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                scratch: pl.Tensor[[64], pl.FP32],
+                other: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    produced, _producer_tid = pl.submit(self.fill, scratch)
+                    _unused, user_tid = pl.submit(self.unrelated, other)
+                    out, _ = pl.submit(self.consume, produced, deps=[user_tid])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2TaskId params_t2_deps[2];" in code
+        assert "params_t2_deps[params_t2_deps_count++] = user_tid;" in code
+        producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
+        assert producer_tid, code
+        assert f"params_t2_deps[params_t2_deps_count++] = {producer_tid.group(1)};" in code
+        assert code.count("params_t2.set_dependencies(") == 1
+
     def test_auto_scope_does_not_emit_task_id_capture(self):
         """Sanity: plain ``self.kernel(...)`` in auto scope stays fire-and-forget."""
         backend.reset_for_testing()
@@ -4327,6 +4987,183 @@ class TestManualScopeCodegen:
         assert "if (a_tid.is_valid()) params_t1_deps[params_t1_deps_count++] = a_tid;" in code, code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
+    def test_compiler_derived_deps_in_auto_scope_emit_set_dependencies_when_enabled_without_manual_scope(
+        self,
+    ):
+        """AutoDeriveTaskDependencies may add explicit deps inside AUTO scopes.
+
+        The scope must stay AUTO (``PTO2_SCOPE()`` / OverlapMap still enabled),
+        while compiler-derived edges use the same ``set_dependencies`` codegen
+        path as user-written deps when AUTO-scope analysis is explicitly enabled.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.scope(mode=pl.ScopeMode.AUTO):
+                    produced = self.fill(scratch)
+                    out = self.consume(produced)
+                return out
+
+        transformed = _run_default_pipeline_with_auto_scope_deps(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert "PTO2_SCOPE() {" in code, code
+        producer_tid = re.search(r"PTO2TaskId (\w+_tid) = task_0_outs\.task_id\(\);", code)
+        assert producer_tid, code
+        assert "PTO2TaskId params_t1_deps[1];" in code, code
+        assert f"params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};" in code, code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
+
+    def test_compiler_derived_deps_in_default_auto_scope_do_not_emit_set_dependencies(self):
+        """Default auto_scope=True is skipped unless AUTO-scope analysis is enabled."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                produced = self.fill(scratch)
+                out = self.consume(produced)
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert "PTO2_SCOPE() {" in code, code
+        assert "PTO2TaskId producer_tid = task_0_outs.task_id();" not in code, code
+        assert "params_t1.set_dependencies(" not in code, code
+
+    def test_compiler_derived_deps_in_default_auto_scope_emit_set_dependencies_when_enabled(self):
+        """AUTO-scope analysis can be enabled explicitly for default auto_scope=True."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                produced = self.fill(scratch)
+                out = self.consume(produced)
+                return out
+
+        transformed = _run_default_pipeline_with_auto_scope_deps(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert "PTO2_SCOPE() {" in code, code
+        producer_tid = re.search(r"PTO2TaskId (\w+_tid) = task_0_outs\.task_id\(\);", code)
+        assert producer_tid, code
+        assert "PTO2TaskId params_t1_deps[1];" in code, code
+        assert f"params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};" in code, code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
+
+    def test_compiler_derived_deps_for_plain_auto_call_do_not_capture_task_id_by_default(self):
+        """pl.at-style ordinary calls stay fire-and-forget by default."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                produced = self.fill(scratch)
+                out = self.consume(produced)
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" not in code, code
+        assert "set_dependencies(" not in code, code
+
+    def test_compiler_derived_deps_for_plain_auto_call_capture_task_id_when_enabled(self):
+        """pl.at-style ordinary calls can be captured only when deps need them."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                produced = self.fill(scratch)
+                out = self.consume(produced)
+                return out
+
+        transformed = _run_default_pipeline_with_auto_scope_deps(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
+        producer_tid = re.search(r"PTO2TaskId (\w+_tid) = task_0_outs\.task_id\(\);", code)
+        assert producer_tid, code
+        assert f"params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};" in code, code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
+
     def test_auto_scope_task_id_array_slot_dep_uses_scalar_snapshot(self):
         """A TaskId array slot read is a valid explicit dep in auto scope."""
         backend.reset_for_testing()
@@ -4444,12 +5281,13 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        # MANUAL wrapper + both loops survive without extra auto-scope wrappers.
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        # With AutoDeriveTaskDependencies, loop-carried hazards (stage1 in the
+        # inner pl.parallel loop produces dynamic producers) trigger a manual→auto
+        # scope fallback.  The scope survives as AUTO; the intra-iteration user
+        # dep still wires correctly.
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
         assert "for (int64_t i = 0; i < 4; i += 1)" in code, code
         assert "for (int64_t j = 0; j < 8; j += 1)" in code, code
-        assert code.count("PTO2_SCOPE() {") == 1, code
-        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
         # The producer TaskId is preserved through windowed rewriting and is
         # threaded into the consumer dependency edge.
@@ -4534,11 +5372,11 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        # With AutoDeriveTaskDependencies, loop-carried hazards trigger a
+        # manual→auto scope fallback (same as the seq-outer/parallel-inner case).
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
         assert "for (int64_t i = 0; i < 8; i += 1)" in code, code
         assert "for (int64_t j = 0; j < 4; j += 1)" in code, code
-        assert code.count("PTO2_SCOPE() {") == 1, code
-        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
         # The producer TaskId is preserved through windowed rewriting and is
         # threaded into the consumer dependency edge.
@@ -4752,7 +5590,9 @@ class TestManualScopeCodegen:
         code = _generate_orch_code(transformed)
 
         assert "rt_submit_dummy_task" not in code, code
-        assert re.search(r"PTO2TaskId params_t\d+_deps\[5\];", code), code
+        # 4 user deps (tids[0..3]) + 1 user dep (seed_tid) + 1 compiler dep
+        # (WAW hazard seed_tid → iter tid from prior phase) = 6
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[6\];", code), code
 
     def test_auto_scope_array_dep_does_not_emit_dummy_barrier(self):
         """Array deps outside manual_scope keep the existing explicit-deps lowering."""
@@ -5144,8 +5984,14 @@ class TestTupleReturnNameHintCollision:
 
         input_a = ir.Var("input_a", tensor_type, span)
         input_b = ir.Var("input_b", tensor_type, span)
-        first_out = ir.Var("first_out", tensor_type, span)
-        second_out = ir.Var("second_out", tensor_type, span)
+        # Distinct Out tensors per call, so the two tuple results' element->call
+        # attachment is observable in the consumer's inputs under emit-name
+        # remap (the alias-decl form this test predates is no longer emitted).
+        out_a1 = ir.Var("out_a1", tensor_type, span)
+        out_a2 = ir.Var("out_a2", tensor_type, span)
+        out_b1 = ir.Var("out_b1", tensor_type, span)
+        out_b2 = ir.Var("out_b2", tensor_type, span)
+        final_out = ir.Var("final_out", tensor_type, span)
         kernel_a_input = ir.Var("input_a", tensor_type, span)
         kernel_a_first = ir.Var("first_out", tensor_type, span)
         kernel_a_second = ir.Var("second_out", tensor_type, span)
@@ -5212,7 +6058,7 @@ class TestTupleReturnNameHintCollision:
 
         call_a = ir.Call(
             ir.GlobalVar("kernel_a"),
-            [input_a, first_out, second_out],
+            [input_a, out_a1, out_a2],
             {},
             {
                 "arg_directions": [
@@ -5226,7 +6072,7 @@ class TestTupleReturnNameHintCollision:
         )
         call_b = ir.Call(
             ir.GlobalVar("kernel_b"),
-            [input_b, first_out, second_out],
+            [input_b, out_b1, out_b2],
             {},
             {
                 "arg_directions": [
@@ -5240,7 +6086,7 @@ class TestTupleReturnNameHintCollision:
         )
         call_consume = ir.Call(
             ir.GlobalVar("kernel_consume"),
-            [first_a, second_a, first_b, second_b, first_out],
+            [first_a, second_a, first_b, second_b, final_out],
             {},
             {
                 "arg_directions": [
@@ -5273,8 +6119,11 @@ class TestTupleReturnNameHintCollision:
             [
                 (input_a, ir.ParamDirection.In),
                 (input_b, ir.ParamDirection.In),
-                (first_out, ir.ParamDirection.Out),
-                (second_out, ir.ParamDirection.Out),
+                (out_a1, ir.ParamDirection.Out),
+                (out_a2, ir.ParamDirection.Out),
+                (out_b1, ir.ParamDirection.Out),
+                (out_b2, ir.ParamDirection.Out),
+                (final_out, ir.ParamDirection.Out),
             ],
             [tensor_type],
             orch_body,
@@ -5289,18 +6138,22 @@ class TestTupleReturnNameHintCollision:
 
         code = codegen.generate_orchestration(program, orch).code
 
-        assert "const Tensor& first_a = ext_first_out;" in code, code
-        assert "const Tensor& second_a = ext_second_out;" in code, code
-        assert "const Tensor& first_b = ext_first_out;" in code, code
-        assert "const Tensor& second_b = ext_second_out;" in code, code
-
-        task_0 = code.index("// Task 0: kernel_a")
-        task_1 = code.index("// Task 1: kernel_b")
-        task_2 = code.index("// Task 2: kernel_consume")
-        # With name_hint-keyed tuple metadata, first_a/second_a are attached
-        # to the second call because tmp_first and tmp_second share name_hint.
-        assert code.index("const Tensor& first_a", task_0) < task_1, code
-        assert task_1 < code.index("const Tensor& first_b", task_1) < task_2, code
+        # tmp_first and tmp_second share the name_hint "ret__tmp_v0"; the tuple
+        # metadata must still attach each call's elements to that call. Each
+        # element is the in-place Out arg of its call, so it remaps to that arg
+        # (no ``const Tensor& first_a = ...`` alias is minted). The consumer
+        # reading first_a/second_a/first_b/second_b therefore reads call_a's
+        # outs then call_b's outs, in order — not cross-contaminated.
+        i_a1 = code.index("// Task 2: kernel_consume")
+        consume = code[i_a1:]
+        a1 = consume.index("add_input(ext_out_a1)")
+        a2 = consume.index("add_input(ext_out_a2)")
+        b1 = consume.index("add_input(ext_out_b1)")
+        b2 = consume.index("add_input(ext_out_b2)")
+        assert a1 < a2 < b1 < b2, code
+        # No per-element const-ref alias survives the remap.
+        for name in ("first_a", "second_a", "first_b", "second_b"):
+            assert f"const Tensor& {name} " not in code, code
 
         declared_names = re.findall(
             r"^\s*(?:const\s+Tensor&|Tensor)\s+([A-Za-z_]\w*)\s*=",

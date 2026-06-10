@@ -341,7 +341,7 @@ class SSAConverter {
     std::vector<std::pair<std::string, std::any>> out;
     out.reserve(attrs.size());
     for (const auto& [k, v] : attrs) {
-      if (k == kAttrManualDepEdges || k == kAttrDumpVars) {
+      if (k == kAttrManualDepEdges || k == kAttrCompilerManualDepEdges || k == kAttrDumpVars) {
         const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
         if (edges) {
           std::vector<VarPtr> new_edges;
@@ -475,7 +475,8 @@ class SSAConverter {
     if (kind == ObjectKind::EvalStmt) return ConvertEval(As<EvalStmt>(s));
     if (kind == ObjectKind::InCoreScopeStmt || kind == ObjectKind::AutoInCoreScopeStmt ||
         kind == ObjectKind::ClusterScopeStmt || kind == ObjectKind::HierarchyScopeStmt ||
-        kind == ObjectKind::SpmdScopeStmt || kind == ObjectKind::RuntimeScopeStmt) {
+        kind == ObjectKind::SpmdScopeStmt || kind == ObjectKind::RuntimeScopeStmt ||
+        kind == ObjectKind::CommDomainScopeStmt) {
       return ConvertScope(As<ScopeStmt>(s));
     }
     return s;
@@ -982,7 +983,8 @@ class SSAConverter {
     std::vector<std::pair<std::string, std::any>> out;
     out.reserve(attrs.size());
     for (const auto& [k, v] : attrs) {
-      if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
+      if (k == kAttrManualDepEdges || k == kAttrCompilerManualDepEdges || k == kAttrArgDirOverrideVars ||
+          k == kAttrDumpVars) {
         const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
         if (edges) {
           std::vector<VarPtr> new_edges;
@@ -1111,6 +1113,7 @@ class SSAConverter {
       return result;
     }
     if (auto runtime_scope = As<RuntimeScopeStmt>(op)) return rewrite(runtime_scope);
+    if (auto comm_domain = As<CommDomainScopeStmt>(op)) return rewrite(comm_domain);
     INTERNAL_UNREACHABLE_SPAN(op->span_) << "Unknown ScopeStmt subclass: " << op->TypeName();
     return op;
   }

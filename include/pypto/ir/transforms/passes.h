@@ -213,7 +213,7 @@ Pass InterchangeChunkLoops();
 Pass InlineFunctions();
 
 /**
- * @brief Collect CommGroups for distributed window-buffer allocations.
+ * @brief Materialise comm-domain scope statements for distributed window-buffer allocations.
  *
  * Runs at the end of the pipeline, just before the final Simplify. None of
  * the intervening passes touches the host_orch alloc/window/dispatch chain
@@ -236,9 +236,10 @@ Pass InlineFunctions();
  *     so ``DistributedTensorType.window_buffer_`` points to the new
  *     ``WindowBuffer`` (host_orch only — chip_orch / InCore param types
  *     remain ``nullopt``).
- *  5. Cluster ``WindowBuffer`` s by ``DeviceDescriptor`` into ``CommGroup`` s
- *     (same descriptor → one group, slots in alloc-source order) and write
- *     ``Program.comm_groups_``.
+ *  5. Cluster ``WindowBuffer`` s by ``DeviceDescriptor`` (same descriptor →
+ *     one comm domain, slots in alloc-source order) and wrap the host_orch
+ *     body in nested ``CommDomainScopeStmt`` nodes (outer = first declared
+ *     domain, inner = last).
  *
  * Sanity-checks (``pypto::ValueError`` on failure):
  *  - Every alloc must have at least one ``pld.tensor.window`` materialisation and
@@ -246,7 +247,7 @@ Pass InlineFunctions();
  *  - Allocation names are unique within a group (parser-enforced globally;
  *    re-asserted here).
  */
-Pass CollectCommGroups();
+Pass MaterializeCommDomainScopes();
 
 /**
  * @brief Create a loop unrolling pass
@@ -706,6 +707,25 @@ Pass DeriveCallDirections();
  * ``system.task_dummy`` assignment at the chosen phase-fence placement point.
  */
 Pass ExpandManualPhaseFence();
+
+/**
+ * @brief Derive explicit task-to-task dependency edges inside runtime scopes.
+ *
+ * Walks manual runtime scopes as dependency-analysis regions. For each submit-style
+ * Call with a producer ``Scalar[TASK_ID]`` tuple element, computes a conservative
+ * storage access summary from ``arg_directions`` and attaches RAW/WAR/WAW hazards
+ * against prior calls in the same scope under
+ * ``Call.attrs["compiler_manual_dep_edges"]``. AUTO scopes are skipped by default;
+ * pass ``analyze_auto_scopes=true`` to analyze them while keeping ``manual=false``
+ * in the output IR. On unanalyzable hazards, partial compiler deps are stripped
+ * and the scope falls back to AUTO tracking. User-provided ``manual_dep_edges``
+ * remain authoritative and separate; codegen merges both attrs before emitting
+ * ``Arg::set_dependencies``.
+ *
+ * Requirements:
+ *   - Call directions resolved (run DeriveCallDirections first)
+ */
+Pass AutoDeriveTaskDependencies(bool analyze_auto_scopes = false);
 
 /**
  * @brief Fold no-op tile.reshape assignments into Var-to-Var assignments

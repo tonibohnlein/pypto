@@ -11,10 +11,10 @@
 
 /**
  * @file memory.cpp
- * @brief Distributed-memory ops — CommGroup window-buffer allocation & materialization.
+ * @brief Distributed-memory ops — HCCL window-buffer in a comm-domain scope allocation & materialization.
  *
  * Mirrors :file:`src/ir/op/tile_ops/memory.cpp` in structure: this translation
- * unit owns every op that touches CommGroup window-buffer address-space life
+ * unit owns every op that touches HCCL window-buffer in a comm-domain scope address-space life
  * cycle. Two ops are registered:
  *
  * * ``pld.tensor.alloc_window_buffer(size, *, name)`` — pure address-space
@@ -100,22 +100,22 @@ TypePtr DeduceWindowType(const std::vector<ExprPtr>& args,
   auto dtype = GetKwarg<DataType>(kwargs, "dtype", "pld.tensor.window");
 
   // Shape & dtype enter the type system here. window_buffer_ stays nullopt
-  // until CollectCommGroups (N4) wires it to the originating WindowBuffer.
+  // until MaterializeCommDomainScopes (N4) wires it to the originating WindowBuffer.
   return std::make_shared<DistributedTensorType>(shape_tuple->elements_, dtype);
 }
 
 }  // namespace
 
 // ============================================================================
-// pld.tensor.alloc_window_buffer — per-rank CommGroup window-buffer allocation
+// pld.tensor.alloc_window_buffer — per-rank HCCL window-buffer in a comm-domain scope allocation
 // ============================================================================
 
 REGISTER_OP("pld.tensor.alloc_window_buffer")
     .set_description(
-        "Declare a per-rank CommGroup window-buffer slot of `size` bytes. Returns a Ptr "
+        "Declare a per-rank HCCL window-buffer in a comm-domain scope slot of `size` bytes. Returns a Ptr "
         "(allocation-identity token, exactly like tile.alloc / tensor.alloc). The "
         "comm-collection pass later wraps the Ptr into an ir.WindowBuffer Var subclass and "
-        "registers it on the program's CommGroup metadata.")
+        "registers it on the program's comm-domain scope metadata.")
     .set_op_category("DistributedOp")
     .add_argument("size", "Per-rank allocation size in bytes (ScalarType expression)")
     .set_attr<std::string>("name")
