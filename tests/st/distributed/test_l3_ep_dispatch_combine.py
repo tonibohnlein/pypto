@@ -7,8 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""L3 distributed st: 2-rank EP dispatch + local_expert + combine — 1:1 PyPTO
+"""L3 distributed st: N-rank EP dispatch + local_expert + combine — 1:1 PyPTO
 port of ``runtime/examples/workers/l3/ep_dispatch_combine``.
+
+Runs at real DeepSeek-V4 FLASH MoE scale (pypto-lib/models/deepseek/v4):
+T=128, TOPK=6, D=4096, L=16 local experts per rank, R=192 receive cap.
 
 This is a structural port of the C++ runtime example. The three AIV kernels
 (``dispatch`` / ``local_expert`` / ``combine``) become three
@@ -44,8 +47,7 @@ explicit insertion sort.
 (``count_done`` / ``data_done`` / ``combine_done``) is sized ``[N_RANKS, 1]``;
 each rank notifies peer's ``[my_rank, 0]`` cell and waits on its local
 ``[src, 0]`` for every ``src != my_rank``. Matches ``count_done_sig[N]`` /
-``data_done_sig[N]`` / ``combine_done_sig[N]`` in the C++ kernel and
-generalizes to ``N_RANKS > 2``.
+``data_done_sig[N]`` / ``combine_done_sig[N]`` in the C++ kernel.
 
 **Stage-out — 1:1 with runtime.** The dispatch kernel emits four host-backed
 outputs: ``recv_x_out [L*R, D] BF16``, ``recv_w_out [L, R] FP32``,
@@ -64,25 +66,29 @@ import torch
 from pypto import ir
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-# Demo dimensions — must mirror the runtime example's constants.
-N_RANKS = 2
-T = 8
-TOPK = 2
-D = 64
-L = 4  # N_LOCAL_EXPERTS per rank
-R = 32  # RECV_MAX (single-expert receive upper bound)
+# Real DeepSeek-V4 FLASH MoE shapes (pypto-lib/models/deepseek/v4) — must
+# mirror the runtime example's constants. ``N_RANKS`` is supplied per-test via
+# ``_build_ep_dispatch_combine_program(n_ranks)``; everything below is
+# rank-count-independent. T = DECODE_BATCH*DECODE_SEQ, TOPK = experts/tok,
+# D = hidden_size, L = N_LOCAL experts/rank, R = RECV_MAX (single-expert
+# receive cap).
+T = 128
+TOPK = 6
+D = 4096
+L = 16  # N_LOCAL_EXPERTS per rank
+R = 192  # RECV_MAX (single-expert receive upper bound)
 W_PAD = 8  # weight tile width — minimum vector tile (1x8 FP32 = 32 B)
 IDX_PAD = 8  # idx tile width   — minimum vector tile (1x8 INT32 = 32 B)
-E_GLOBAL = N_RANKS * L
-N_ROUTES = T * TOPK  # 16
+N_ROUTES = T * TOPK  # 768
 
 
-def _build_ep_dispatch_combine_program():
-    """Build the 2-rank ep_dispatch_combine program at call time.
+def _build_ep_dispatch_combine_program(n_ranks: int):
+    """Build the n-rank ep_dispatch_combine program at call time.
 
     Deferred construction matches other L3 tests — keeps the module importable
     even if the embedded body trips the parser at collection time.
     """
+    N_RANKS = n_ranks  # noqa: N806 — closed over by IR shape annotations below
 
     @pl.program
     class EpDispatchCombine:
@@ -212,17 +218,35 @@ def _build_ep_dispatch_combine_program():
                     cursor[bucket] = cur_val + 1
                     r_route = t * TOPK + k
 
-                    # Channel 1: x BF16 [1, D]
-                    x_tile = pl.load(x_norm, [t, 0], [1, D])
-                    pld.tile.remote_store(x_tile, target=recv_x, peer=dst, offsets=[row, 0])
+                    # Channel 1: x BF16 [1, D] — HCCL TPUT (load + store fused)
+                    pld.tensor.put(
+                        dst=recv_x,
+                        peer=dst,
+                        src=x_norm,
+                        dst_offsets=[row, 0],
+                        src_offsets=[t, 0],
+                        shape=[1, D],
+                    )
 
-                    # Channel 2: w FP32 [1, W_PAD]
-                    w_tile = pl.load(w_padded, [r_route, 0], [1, W_PAD])
-                    pld.tile.remote_store(w_tile, target=recv_w, peer=dst, offsets=[row, 0])
+                    # Channel 2: w FP32 [1, W_PAD] — HCCL TPUT
+                    pld.tensor.put(
+                        dst=recv_w,
+                        peer=dst,
+                        src=w_padded,
+                        dst_offsets=[row, 0],
+                        src_offsets=[r_route, 0],
+                        shape=[1, W_PAD],
+                    )
 
-                    # Channel 3: idx INT32 [1, IDX_PAD]
-                    idx_tile = pl.load(idx_padded, [r_route, 0], [1, IDX_PAD])
-                    pld.tile.remote_store(idx_tile, target=recv_idx, peer=dst, offsets=[row, 0])
+                    # Channel 3: idx INT32 [1, IDX_PAD] — HCCL TPUT
+                    pld.tensor.put(
+                        dst=recv_idx,
+                        peer=dst,
+                        src=idx_padded,
+                        dst_offsets=[row, 0],
+                        src_offsets=[r_route, 0],
+                        shape=[1, IDX_PAD],
+                    )
 
             # ---------- data_done barrier — per-src signal cells ----------
             for peer in pl.range(N_RANKS):
@@ -332,9 +356,16 @@ def _build_ep_dispatch_combine_program():
                     src_off_idx = pl.cast(src_off, pl.INDEX)
                     for row in pl.range(n):
                         idx_lin = e * R + src_off_idx + row
-                        r_route = pl.read(recv_idx_out, [e, src_off_idx + row])
-                        y_tile = pl.load(recv_y, [idx_lin, 0], [1, D])
-                        pld.tile.remote_store(y_tile, target=routed_y_buf, peer=dst, offsets=[r_route, 0])
+                        r_route = pl.cast(pl.read(recv_idx_out, [e, src_off_idx + row]), pl.INDEX)
+                        # HCCL TPUT — load recv_y row + store to peer's routed_y_buf
+                        pld.tensor.put(
+                            dst=routed_y_buf,
+                            peer=dst,
+                            src=recv_y,
+                            dst_offsets=[r_route, 0],
+                            src_offsets=[idx_lin, 0],
+                            shape=[1, D],
+                        )
 
             # ---------- combine_done barrier — per-src signal cells ----------
             for peer in pl.range(N_RANKS):
@@ -356,12 +387,17 @@ def _build_ep_dispatch_combine_program():
                     )
 
             # ---------- reduce: routed_y[t] = sum_k cast_fp32(routed_y_buf[t*TOPK+k]) ----
+            # FP32 accumulator across TOPK BF16 contributions. Seed `acc` from
+            # k=0 then add k=1..TOPK-1 in a loop — works for any TOPK ≥ 1; the
+            # SSA pass picks up `acc` as a loop-carried variable.
             for t in pl.range(T):
                 y0 = pl.load(routed_y_buf, [t * TOPK, 0], [1, D])
-                y1 = pl.load(routed_y_buf, [t * TOPK + 1, 0], [1, D])
-                y0_fp = pl.cast(y0, target_type=pl.FP32)
-                y1_fp = pl.cast(y1, target_type=pl.FP32)
-                acc = pl.add(y0_fp, y1_fp)
+                acc = pl.cast(y0, target_type=pl.FP32)
+                for kk in pl.range(TOPK - 1):
+                    k = kk + 1
+                    y = pl.load(routed_y_buf, [t * TOPK + k, 0], [1, D])
+                    y_fp = pl.cast(y, target_type=pl.FP32)
+                    acc = pl.add(acc, y_fp)
                 pl.store(acc, [t, 0], routed_y_out)
             return routed_y_out
 
@@ -478,18 +514,19 @@ def _build_ep_dispatch_combine_program():
     return EpDispatchCombine
 
 
-def _generate_routing_indices(seed: int) -> torch.Tensor:
-    """Generate ``indices[N_RANKS][T, TOPK]`` so no expert exceeds RECV_MAX."""
+def _generate_routing_indices(seed: int, n_ranks: int) -> torch.Tensor:
+    """Generate ``indices[n_ranks][T, TOPK]`` so no expert exceeds RECV_MAX."""
+    e_global = n_ranks * L
     rng = torch.Generator().manual_seed(seed)
     while True:
-        indices = torch.zeros(N_RANKS, T, TOPK, dtype=torch.int32)
-        for r in range(N_RANKS):
+        indices = torch.zeros(n_ranks, T, TOPK, dtype=torch.int32)
+        for r in range(n_ranks):
             for t in range(T):
-                perm = torch.randperm(E_GLOBAL, generator=rng)[:TOPK]
+                perm = torch.randperm(e_global, generator=rng)[:TOPK]
                 indices[r, t, :] = perm.to(torch.int32)
 
-        per_expert = torch.zeros(N_RANKS, L, dtype=torch.int32)
-        for r in range(N_RANKS):
+        per_expert = torch.zeros(n_ranks, L, dtype=torch.int32)
+        for r in range(n_ranks):
             for t in range(T):
                 for k in range(TOPK):
                     eid = int(indices[r, t, k].item())
@@ -503,8 +540,9 @@ def _generate_routing_indices(seed: int) -> torch.Tensor:
 
 
 def _pack_weights_padded(weights: torch.Tensor) -> torch.Tensor:
-    out = torch.zeros((N_RANKS, N_ROUTES, W_PAD), dtype=torch.float32)
-    for r in range(N_RANKS):
+    n_ranks = weights.shape[0]
+    out = torch.zeros((n_ranks, N_ROUTES, W_PAD), dtype=torch.float32)
+    for r in range(n_ranks):
         for t in range(T):
             for k in range(TOPK):
                 r_route = t * TOPK + k
@@ -512,8 +550,8 @@ def _pack_weights_padded(weights: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _pack_idx_padded() -> torch.Tensor:
-    out = torch.zeros((N_RANKS, N_ROUTES, IDX_PAD), dtype=torch.int32)
+def _pack_idx_padded(n_ranks: int) -> torch.Tensor:
+    out = torch.zeros((n_ranks, N_ROUTES, IDX_PAD), dtype=torch.int32)
     for t in range(T):
         for k in range(TOPK):
             r_route = t * TOPK + k
@@ -534,13 +572,14 @@ def _compute_golden_recv(
       expected_recv_idx[r] INT32 [L, R]   (r_route = t * TOPK + k)
       expected_count[r]    INT32 [L]
     """
-    expected_recv_x = torch.zeros(N_RANKS, L, R, D, dtype=torch.bfloat16)
-    expected_recv_w = torch.zeros(N_RANKS, L, R, dtype=torch.float32)
-    expected_recv_idx = torch.zeros(N_RANKS, L, R, dtype=torch.int32)
-    expected_count = torch.zeros(N_RANKS, L, dtype=torch.int32)
+    n_ranks = x_norms.shape[0]
+    expected_recv_x = torch.zeros(n_ranks, L, R, D, dtype=torch.bfloat16)
+    expected_recv_w = torch.zeros(n_ranks, L, R, dtype=torch.float32)
+    expected_recv_idx = torch.zeros(n_ranks, L, R, dtype=torch.int32)
+    expected_count = torch.zeros(n_ranks, L, dtype=torch.int32)
 
-    send_counts = torch.zeros(N_RANKS, N_RANKS, L, dtype=torch.int32)
-    for src in range(N_RANKS):
+    send_counts = torch.zeros(n_ranks, n_ranks, L, dtype=torch.int32)
+    for src in range(n_ranks):
         for t in range(T):
             for k in range(TOPK):
                 eid = int(indices[src, t, k].item())
@@ -548,14 +587,14 @@ def _compute_golden_recv(
                 loc_e = eid % L
                 send_counts[src, dst, loc_e] += 1
 
-    for dst in range(N_RANKS):
-        slot_offset = torch.zeros(N_RANKS, L, dtype=torch.int32)
+    for dst in range(n_ranks):
+        slot_offset = torch.zeros(n_ranks, L, dtype=torch.int32)
         running = torch.zeros(L, dtype=torch.int32)
-        for src in range(N_RANKS):
+        for src in range(n_ranks):
             slot_offset[src] = running.clone()
             running = running + send_counts[src, dst]
 
-        for src in range(N_RANKS):
+        for src in range(n_ranks):
             cursor = torch.zeros(L, dtype=torch.int32)
             for t in range(T):
                 for k in range(TOPK):
@@ -580,8 +619,9 @@ def _compute_golden_routed(x_norms: torch.Tensor, weights: torch.Tensor) -> torc
     the dispatch+combine protocol is end-to-end shape-preserving for routed_y
     (each (t, k) on rank r round-trips back to the original (t, k) slot).
     """
-    expected = torch.zeros((N_RANKS, T, D), dtype=torch.float32)
-    for r in range(N_RANKS):
+    n_ranks = x_norms.shape[0]
+    expected = torch.zeros((n_ranks, T, D), dtype=torch.float32)
+    for r in range(n_ranks):
         for t in range(T):
             for k in range(TOPK):
                 weighted = float(weights[r, t, k].item()) * x_norms[r, t, :].to(torch.float32)
@@ -590,52 +630,44 @@ def _compute_golden_routed(x_norms: torch.Tensor, weights: torch.Tensor) -> torc
 
 
 class TestL3EpDispatchCombine:
-    """L3 distributed runtime: 2-rank EP dispatch + local_expert + combine."""
+    """L3 distributed runtime: N-rank EP dispatch + local_expert + combine."""
 
-    def test_ep_dispatch_combine(self, test_config, device_ids):
-        if len(device_ids) < 2:
-            pytest.skip(f"ep_dispatch_combine needs 2 devices, got {device_ids}")
-        if test_config.platform.endswith("sim"):
-            pytest.skip(
-                "PTOAS auto-emits a tail pipe_barrier+dcci+dsb block outside the "
-                "__DAV_VEC__ guard for kernels of this size/shape; sim builds "
-                "leave dcci/dsb/ENTIRE_DATA_CACHE undefined at file scope (they "
-                "live in inner_kernel.h, which isn't transitively included from "
-                "pto-inst.hpp). Re-enable once either PTOAS guards both dcci "
-                "blocks or inner_kernel.h is included unconditionally."
-            )
+    @pytest.mark.parametrize("n_ranks", [2, 4])
+    def test_ep_dispatch_combine(self, test_config, device_ids, n_ranks):
+        if len(device_ids) < n_ranks:
+            pytest.skip(f"ep_dispatch_combine needs {n_ranks} devices, got {device_ids}")
 
-        program = _build_ep_dispatch_combine_program()
+        program = _build_ep_dispatch_combine_program(n_ranks)
         compiled = ir.compile(
             program,
             platform=test_config.platform,
             distributed_config=DistributedConfig(
-                device_ids=device_ids[:2],
+                device_ids=device_ids[:n_ranks],
                 num_sub_workers=0,
             ),
         )
 
         x_norms = torch.tensor(
-            [[[r * 100 + t * 10 + d for d in range(D)] for t in range(T)] for r in range(N_RANKS)],
+            [[[r * 100 + t * 10 + d for d in range(D)] for t in range(T)] for r in range(n_ranks)],
             dtype=torch.bfloat16,
         )
         weights = torch.tensor(
             [
                 [[(r + 1) * 0.01 + t * 0.1 + k * 0.001 for k in range(TOPK)] for t in range(T)]
-                for r in range(N_RANKS)
+                for r in range(n_ranks)
             ],
             dtype=torch.float32,
         )
-        indices = _generate_routing_indices(seed=20260510)
+        indices = _generate_routing_indices(seed=20260510, n_ranks=n_ranks)
         weights_padded = _pack_weights_padded(weights)
-        idx_padded = _pack_idx_padded()
+        idx_padded = _pack_idx_padded(n_ranks)
 
-        recv_x_outs = torch.zeros((N_RANKS, L * R, D), dtype=torch.bfloat16)
-        recv_w_outs = torch.zeros((N_RANKS, L, R), dtype=torch.float32)
-        recv_idx_outs = torch.zeros((N_RANKS, L, R), dtype=torch.int32)
-        recv_count_outs = torch.zeros((N_RANKS, L, 1), dtype=torch.int32)
-        recv_ys = torch.zeros((N_RANKS, L * R, D), dtype=torch.bfloat16)
-        routed_ys = torch.zeros((N_RANKS, T, D), dtype=torch.float32)
+        recv_x_outs = torch.zeros((n_ranks, L * R, D), dtype=torch.bfloat16)
+        recv_w_outs = torch.zeros((n_ranks, L, R), dtype=torch.float32)
+        recv_idx_outs = torch.zeros((n_ranks, L, R), dtype=torch.int32)
+        recv_count_outs = torch.zeros((n_ranks, L, 1), dtype=torch.int32)
+        recv_ys = torch.zeros((n_ranks, L * R, D), dtype=torch.bfloat16)
+        routed_ys = torch.zeros((n_ranks, T, D), dtype=torch.float32)
 
         compiled(
             indices,
@@ -658,8 +690,8 @@ class TestL3EpDispatchCombine:
         assert torch.equal(recv_count_outs_2d, expected_count), (
             f"recv_count mismatch: got={recv_count_outs_2d.tolist()} expected={expected_count.tolist()}"
         )
-        recv_x_outs_4d = recv_x_outs.reshape(N_RANKS, L, R, D)
-        for r in range(N_RANKS):
+        recv_x_outs_4d = recv_x_outs.reshape(n_ranks, L, R, D)
+        for r in range(n_ranks):
             for e in range(L):
                 n = int(expected_count[r, e].item())
                 if n == 0:
@@ -682,9 +714,16 @@ class TestL3EpDispatchCombine:
                 )
 
         # ---------- combine-stage golden ----------
+        # routed_y[t, :] = sum_k bf16(weights[t,k] * x_norms[t]) accumulated in
+        # FP32 — each BF16 cast can differ from torch's round-to-nearest-even
+        # by 1 ULP on an exact tie, and summing TOPK terms keeps the *relative*
+        # error within ~2 BF16 ULPs (FP32 accumulation is exact). 2**-7 is one
+        # BF16 ULP relative; rtol = 2**-6 admits 2-ULP slack. Mirrors the
+        # runtime example's `_verify_routed_y` tolerance.
         expected_routed = _compute_golden_routed(x_norms, weights)
         max_diff = (routed_ys - expected_routed).abs().max().item()
-        assert torch.allclose(routed_ys, expected_routed, atol=1e-3), (
+        ulp_2 = 2.0**-6
+        assert torch.allclose(routed_ys, expected_routed, atol=ulp_2, rtol=ulp_2), (
             f"ep_dispatch_combine routed_y mismatch: max diff = {max_diff}"
         )
 
