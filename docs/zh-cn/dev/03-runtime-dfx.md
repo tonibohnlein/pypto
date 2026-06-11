@@ -292,6 +292,66 @@ python build_output/<jit_dir>/debug/run.py
 （编译量大、不需要 runner）。关闭后底层的
 `pypto.runtime.debug.replay` 模块 / CLI 仍可直接对 output 目录使用。
 
+### 重放 L3 / 分布式构建
+
+分布式（L3）程序——即 `@pl.jit.host` orchestrator 编译出的
+`DistributedCompiledProgram`——支持同样的「改 `.pto` 再重跑」循环，
+但它的 build 目录形态不同：**没有顶层 `kernel_config.py`**（每个 rank
+的配置在 `next_levels/{rank}/` 下），host 驱动是
+`orchestration/host_orch.py`，并且 `ir.compile()` 会额外写一个
+`distributed_meta.json`：
+
+```text
+build_output/<jit_dir>/
+  distributed_meta.json          # 参数元数据 + platform + DistributedConfig
+  orchestration/host_orch.py     # L3 host 驱动
+  next_levels/{rank}/            # 每个 rank 一个完整的单芯片子构建
+      kernels/{aic,aiv}/*.cpp
+      ptoas/*.pto
+      kernel_config.py
+```
+
+`replay` 会自动识别这种布局（无顶层 `kernel_config.py` 但存在
+`orchestration/host_orch.py`），并改用 simpler `Worker(level=3)` 派发，
+而不是 `execute_compiled`。同样的 CLI / `debug/run.py` 流程无需改动：
+
+```bash
+python -m pypto.runtime.debug.replay build_output/<jit_dir>/
+# 或
+python build_output/<jit_dir>/debug/run.py
+```
+
+`.pto` → cpp 拼接和 `.so` 失效都会递归进每个 `next_levels/{rank}/`，
+所以改 `next_levels/rank0/ptoas/<unit>.pto`（或直接改 kernel cpp）会
+被识别，行为与单芯片完全一致。
+
+底层只凭 `distributed_meta.json` 就能把目录重建成一个可调用的程序——
+**不重新编译 pypto、不重跑 pass**。两个入口直接暴露这个能力：
+
+```python
+from pypto.runtime import execute_distributed_compiled
+# 一次性（对标单芯片的 execute_compiled）：
+execute_distributed_compiled("build_output/<jit_dir>/", [a, b, c])
+
+# 可复用对象（需要时覆盖持久化的 platform / 设备）：
+from pypto.ir.distributed_compiled_program import DistributedCompiledProgram, DistributedConfig
+prog = DistributedCompiledProgram.from_dir(
+    "build_output/<jit_dir>/",
+    platform="a2a3",
+    distributed_config=DistributedConfig(device_ids=[0, 1]),
+)
+prog(a, b, c)
+```
+
+`from_dir` 读取持久化的 HOST orchestrator 参数元数据（与 `host_orch.py`
+匹配的 post-SSA 名字、方向、形状、dtype），并通过遍历 `next_levels/`
+重建 chip callables；`platform` 与 `distributed_config` 默认取编译时
+记录的值，可覆盖以在不同目标 / 设备集上重放。
+
+**限制**：DFX 标志（`--pmu`、`--swimlane`、`--dump-tensor` 等）**尚未
+透传到 L3 派发路径**——目前仅对单芯片重放生效。L3 的「改完再跑」循环
+本身（改 `.pto`/cpp 后的正确性复检）是完整支持的。
+
 ## 相关文档
 
 - Simpler runtime 侧参考：`runtime/docs/dfx/{l2-swimlane,

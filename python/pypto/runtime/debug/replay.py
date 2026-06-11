@@ -58,13 +58,42 @@ from pypto.runtime.runner import RunConfig, _DfxOpts, execute_compiled
 __all__ = ["replay", "invalidate_binary_cache"]
 
 
+def _invalidate_one_dir(base: Path) -> int:
+    """Remove cached binaries directly under *base*; return the count removed.
+
+    Deletes ``<base>/cache/*.bin`` (the pre-build cache written by
+    ``prebuild_binaries``) and the sibling ``.so`` / ``.o`` files under
+    ``<base>/kernels`` and ``<base>/orchestration``. CPP sources are untouched.
+    """
+    removed = 0
+    cache_dir = base / "cache"
+    if cache_dir.is_dir():
+        for f in cache_dir.glob("*.bin"):
+            f.unlink()
+            removed += 1
+    for sub in ("kernels", "orchestration"):
+        root = base / sub
+        if not root.is_dir():
+            continue
+        for ext in ("*.so", "*.o"):
+            for f in root.rglob(ext):
+                f.unlink()
+                removed += 1
+    return removed
+
+
 def invalidate_binary_cache(work_dir: Path | str) -> None:
     """Remove cached kernel/orchestration binaries under *work_dir*.
 
-    Both ``<work_dir>/cache/*.bin`` (the pre-build cache written by
-    ``prebuild_binaries``) and the sibling ``.so`` / ``.o`` files next to
-    each cpp are deleted. CPP sources are untouched, so the next
-    ``compile_and_assemble`` rebuilds from source and picks up hand-edits.
+    Both ``cache/*.bin`` (the pre-build cache written by ``prebuild_binaries``)
+    and the sibling ``.so`` / ``.o`` files next to each cpp are deleted. CPP
+    sources are untouched, so the next ``compile_and_assemble`` rebuilds from
+    source and picks up hand-edits.
+
+    Handles both layouts: a single-chip / L2 build keeps ``cache/`` +
+    ``kernels/`` + ``orchestration/`` at the root; an L3 distributed build also
+    has one complete sub-build per rank under ``next_levels/{rank}/``, each with
+    its own cache + binaries — those are invalidated too.
 
     Safe to call when nothing is cached — silently no-ops on missing
     files / directories.
@@ -73,20 +102,12 @@ def invalidate_binary_cache(work_dir: Path | str) -> None:
     can see the ``cpp -> .o`` rebuild path was taken.
     """
     work_dir = Path(work_dir)
-    removed = 0
-    cache_dir = work_dir / "cache"
-    if cache_dir.is_dir():
-        for f in cache_dir.glob("*.bin"):
-            f.unlink()
-            removed += 1
-    for sub in ("kernels", "orchestration"):
-        root = work_dir / sub
-        if not root.is_dir():
-            continue
-        for ext in ("*.so", "*.o"):
-            for f in root.rglob(ext):
-                f.unlink()
-                removed += 1
+    removed = _invalidate_one_dir(work_dir)
+    next_levels = work_dir / "next_levels"
+    if next_levels.is_dir():
+        for rank_dir in sorted(next_levels.iterdir()):
+            if rank_dir.is_dir():
+                removed += _invalidate_one_dir(rank_dir)
     if removed:
         print(f"[cpp->.so] invalidated {removed} cached binary file(s); cpp will rebuild")
     else:
@@ -105,8 +126,11 @@ def replay(
 
     Args:
         work_dir: A ``build_output/<jit_dir>/`` produced by a prior
-            ``ir.compile`` / ``run`` call. Must contain ``kernel_config.py``,
-            ``orchestration/`` and ``kernels/``.
+            ``ir.compile`` / ``run`` call. For a single-chip / L2 build this
+            contains ``kernel_config.py``, ``orchestration/`` and ``kernels/``.
+            An L3 distributed build (``orchestration/host_orch.py`` +
+            ``next_levels/{rank}/`` + ``distributed_meta.json``) is detected
+            automatically and dispatched via ``execute_distributed_compiled``.
         *tensors: Positional ``torch.Tensor`` (host), :class:`DeviceTensor`,
             or ctypes scalar arguments matching the orchestration entry's
             parameter order. Outputs are written in-place into the
@@ -134,8 +158,9 @@ def replay(
             the directory has no ``golden.py``.
 
     Raises:
-        FileNotFoundError: If *work_dir* does not contain ``kernel_config.py``,
-            or ``golden.py`` is missing when ``validate=True``.
+        FileNotFoundError: If *work_dir* contains neither ``kernel_config.py``
+            (single-chip) nor ``orchestration/host_orch.py`` (L3), or
+            ``golden.py`` is missing when ``validate=True``.
         ValueError: If ``validate=True`` and the number of *tensors* does not
             match the orchestration parameter count from ``golden.py``.
         AssertionError: If ``validate=True`` and any output tensor disagrees
@@ -143,9 +168,17 @@ def replay(
     """
     config = config or RunConfig()
     work_dir = Path(work_dir)
-    if not (work_dir / "kernel_config.py").exists():
+    # L3 distributed builds have no top-level ``kernel_config.py`` (per-rank
+    # configs live under ``next_levels/{rank}/``); they are identified by the
+    # generated HOST orchestrator and dispatched via ``execute_distributed_compiled``.
+    is_l3 = (
+        not (work_dir / "kernel_config.py").exists()
+        and (work_dir / "orchestration" / "host_orch.py").exists()
+    )
+    if not is_l3 and not (work_dir / "kernel_config.py").exists():
         raise FileNotFoundError(
-            f"replay(): {work_dir} is not a build_output directory (missing kernel_config.py)"
+            f"replay(): {work_dir} is not a build_output directory "
+            f"(missing kernel_config.py and orchestration/host_orch.py)"
         )
 
     named_tensors: list[tuple[str, torch.Tensor]] | None = None
@@ -179,14 +212,24 @@ def replay(
         print("[cpp->.so] reusing cached binaries (recompile=False)")
 
     print("[execute] running on device...")
-    execute_compiled(
-        work_dir,
-        list(tensors),
-        platform=config.platform,
-        device_id=config.device_id,
-        pto_isa_commit=config.pto_isa_commit,
-        dfx=_DfxOpts.from_run_config(config),
-    )
+    if is_l3:
+        # L3: reconstruct the distributed program from the build dir and dispatch
+        # via simpler Worker(level=3). DFX flags on ``config`` are not yet plumbed
+        # through the distributed dispatch path (tracked separately).
+        from pypto.runtime.distributed_runner import (  # noqa: PLC0415
+            execute_distributed_compiled,
+        )
+
+        execute_distributed_compiled(work_dir, list(tensors), config=config, platform=config.platform)
+    else:
+        execute_compiled(
+            work_dir,
+            list(tensors),
+            platform=config.platform,
+            device_id=config.device_id,
+            pto_isa_commit=config.pto_isa_commit,
+            dfx=_DfxOpts.from_run_config(config),
+        )
 
     if named_tensors is not None:
         assert golden_module is not None

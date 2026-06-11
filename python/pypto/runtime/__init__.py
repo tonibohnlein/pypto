@@ -27,7 +27,7 @@ Example::
 from typing import TYPE_CHECKING, Any
 
 from .device_tensor import DeviceTensor
-from .distributed_runner import DistributedWorker
+from .distributed_runner import DistributedWorker, execute_distributed_compiled
 from .log_config import _ensure_configured as _ensure_log_configured
 from .log_config import configure_log
 from .log_config import current_level as log_level
@@ -71,6 +71,7 @@ __all__ = [
     "run",
     "compile_program",
     "execute_compiled",
+    "execute_distributed_compiled",
     "configure_log",
     "log_level",
     "ChipWorker",

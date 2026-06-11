@@ -314,6 +314,70 @@ benchmark pipelines that compile many programs and don't need the
 runner. When disabled, the underlying `pypto.runtime.debug.replay`
 module / CLI is still usable directly against the output directory.
 
+### Replaying an L3 / distributed build
+
+Distributed (L3) programs — a `@pl.jit.host` orchestrator compiled to a
+`DistributedCompiledProgram` — support the same edit-`.pto`-and-rerun loop,
+but their build directory has a different shape: there is **no top-level
+`kernel_config.py`** (per-rank configs live under `next_levels/{rank}/`), the
+host driver is `orchestration/host_orch.py`, and `ir.compile()` writes a
+`distributed_meta.json` sidecar:
+
+```text
+build_output/<jit_dir>/
+  distributed_meta.json          # param metadata + platform + DistributedConfig
+  orchestration/host_orch.py     # L3 host driver
+  next_levels/{rank}/            # one complete single-chip sub-build per rank
+      kernels/{aic,aiv}/*.cpp
+      ptoas/*.pto
+      kernel_config.py
+```
+
+`replay` detects this layout automatically (no top-level `kernel_config.py`
+but `orchestration/host_orch.py` present) and dispatches via simpler
+`Worker(level=3)` instead of `execute_compiled`. The same CLI / `debug/run.py`
+flow works unchanged:
+
+```bash
+python -m pypto.runtime.debug.replay build_output/<jit_dir>/
+# or
+python build_output/<jit_dir>/debug/run.py
+```
+
+The `.pto` → cpp splice and `.so` invalidation recurse into every
+`next_levels/{rank}/`, so editing `next_levels/rank0/ptoas/<unit>.pto` (or the
+kernel cpp directly) is picked up exactly as in the single-chip case.
+
+Under the hood the directory is reconstructed into a callable program from
+`distributed_meta.json` alone — **no pypto recompile, no pass re-run**. Two
+entry points expose this directly:
+
+```python
+from pypto.runtime import execute_distributed_compiled
+# one-shot (distributed counterpart of execute_compiled):
+execute_distributed_compiled("build_output/<jit_dir>/", [a, b, c])
+
+# reusable object (override the persisted platform / devices if needed):
+from pypto.ir.distributed_compiled_program import DistributedCompiledProgram, DistributedConfig
+prog = DistributedCompiledProgram.from_dir(
+    "build_output/<jit_dir>/",
+    platform="a2a3",
+    distributed_config=DistributedConfig(device_ids=[0, 1]),
+)
+prog(a, b, c)
+```
+
+`from_dir` reads the persisted HOST-orchestrator param metadata (post-SSA names
+matching `host_orch.py`, directions, shapes, dtypes) and rebuilds chip callables
+by walking `next_levels/`; `platform` and `distributed_config` default to the
+values recorded at compile time and can be overridden to replay on a different
+target / device set.
+
+**Limitation:** DFX flags (`--pmu`, `--swimlane`, `--dump-tensor`, …) are **not
+yet plumbed through the L3 dispatch path** — they apply to single-chip replay
+only. The L3 edit-and-rerun loop itself (correctness re-check after a `.pto`/cpp
+edit) is fully supported.
+
 ## Related
 
 - Simpler's runtime-side reference: `runtime/docs/dfx/{l2-swimlane,

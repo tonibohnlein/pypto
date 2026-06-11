@@ -124,10 +124,15 @@ def _extract_func_names(ptoas_cpp: str) -> list[str]:
     return _PTOAS_FUNC_DEF_RE.findall(ptoas_cpp)
 
 
-def _find_kernel_cpp(work_dir: Path, func_name: str) -> Path | None:
-    """Locate ``kernels/{aic,aiv}/<func_name>.cpp`` under *work_dir*."""
+def _find_kernel_cpp(base_dir: Path, func_name: str) -> Path | None:
+    """Locate ``kernels/{aic,aiv}/<func_name>.cpp`` under *base_dir*.
+
+    *base_dir* is the directory holding the ``kernels/`` tree — the build root
+    for a single-chip / L2 build, or a per-rank ``next_levels/{rank}/`` sub-build
+    for an L3 program.
+    """
     for core in ("aic", "aiv"):
-        candidate = work_dir / "kernels" / core / f"{func_name}.cpp"
+        candidate = base_dir / "kernels" / core / f"{func_name}.cpp"
         if candidate.is_file():
             return candidate
     return None
@@ -154,32 +159,19 @@ def _splice_body(target: Path, new_body: str) -> None:
     target.write_text(f"{head}\n{new_body}\n{tail}")
 
 
-def rebuild_kernel_cpp_from_pto(work_dir: Path | str) -> list[str]:
-    """Re-run ptoas for any ``.pto`` newer than its derived kernel cpp(s).
+def _rebuild_one_dir(scan_dir: Path, rel_root: Path, ptoas_bin: str) -> list[str]:
+    """Re-run ptoas for stale ``.pto`` under ``scan_dir/ptoas`` and splice cpps.
 
-    Per ``.pto``: if its sibling ``ptoas/<unit>.cpp`` is older than the
-    ``.pto`` (or missing), rerun ``ptoas`` and splice the new preprocessed
-    body into every matching ``kernels/<core>/<func>.cpp``. Other .pto
-    files in the same directory are untouched.
+    Per ``.pto`` in ``scan_dir/ptoas``: if its sibling ``ptoas/<unit>.cpp`` is
+    older than the ``.pto`` (or missing), rerun ``ptoas`` and splice the new
+    preprocessed body into every matching ``scan_dir/kernels/<core>/<func>.cpp``.
 
-    Returns the list of touched cpp paths (relative to *work_dir*) for
-    logging. No-op (returns ``[]``) when ``ptoas/`` is missing, when the
-    ptoas binary cannot be found, or when ``PYPTO_REBUILD_FROM_PTO=0``.
-
-    Prints stage status to stdout so users running ``debug/run.py`` see
-    which mode is taken (``pto -> cpp`` vs ``cpp -> .o``) without needing
-    to enable verbose logging.
+    Paths printed and returned are relative to *rel_root* (the build root), so a
+    per-rank sub-build under ``next_levels/{rank}/`` surfaces as
+    ``next_levels/{rank}/kernels/...`` rather than a bare ``kernels/...``.
     """
-    work_dir = Path(work_dir)
-    if _disabled_via_env():
-        print("[pto->cpp] skipped (PYPTO_REBUILD_FROM_PTO=0)")
-        return []
-    ptoas_dir = work_dir / "ptoas"
+    ptoas_dir = scan_dir / "ptoas"
     if not ptoas_dir.is_dir():
-        return []
-    ptoas_bin = _ptoas_binary()
-    if ptoas_bin is None:
-        print("[pto->cpp] skipped: ptoas binary not found (set PTOAS_ROOT or PATH)")
         return []
 
     touched: list[str] = []
@@ -190,19 +182,68 @@ def rebuild_kernel_cpp_from_pto(work_dir: Path | str) -> list[str]:
         if out_cpp.exists() and out_cpp.stat().st_mtime >= pto_path.stat().st_mtime:
             continue
 
-        print(f"[pto->cpp] regenerating from ptoas/{pto_path.name}")
+        print(f"[pto->cpp] regenerating from {pto_path.relative_to(rel_root)}")
         _run_ptoas(ptoas_bin, pto_path, out_cpp)
         raw_cpp = out_cpp.read_text()
         new_body = _preprocess_ptoas_body(raw_cpp)
 
         for func_name in _extract_func_names(raw_cpp):
-            target = _find_kernel_cpp(work_dir, func_name)
+            target = _find_kernel_cpp(scan_dir, func_name)
             if target is None:
                 continue  # ptoas may emit helpers that are not exported kernels
             _splice_body(target, new_body)
-            rel = str(target.relative_to(work_dir))
+            rel = str(target.relative_to(rel_root))
             print(f"[pto->cpp]   spliced -> {rel}")
             touched.append(rel)
+
+    return touched
+
+
+def rebuild_kernel_cpp_from_pto(work_dir: Path | str) -> list[str]:
+    """Re-run ptoas for any ``.pto`` newer than its derived kernel cpp(s).
+
+    Per ``.pto``: if its sibling ``ptoas/<unit>.cpp`` is older than the
+    ``.pto`` (or missing), rerun ``ptoas`` and splice the new preprocessed
+    body into every matching ``kernels/<core>/<func>.cpp``. Other .pto
+    files in the same directory are untouched.
+
+    Handles both layouts: a single-chip / L2 build keeps ``ptoas/`` and
+    ``kernels/`` at the root; an L3 distributed build puts one complete
+    sub-build per rank under ``next_levels/{rank}/``. Both the root and every
+    ``next_levels/{rank}/`` are scanned.
+
+    Returns the list of touched cpp paths (relative to *work_dir*, so per-rank
+    paths read ``next_levels/{rank}/kernels/...``) for logging. No-op (returns
+    ``[]``) when no ``ptoas/`` stage exists anywhere, when the ptoas binary
+    cannot be found, or when ``PYPTO_REBUILD_FROM_PTO=0``.
+
+    Prints stage status to stdout so users running ``debug/run.py`` see
+    which mode is taken (``pto -> cpp`` vs ``cpp -> .o``) without needing
+    to enable verbose logging.
+    """
+    work_dir = Path(work_dir)
+    if _disabled_via_env():
+        print("[pto->cpp] skipped (PYPTO_REBUILD_FROM_PTO=0)")
+        return []
+
+    # Collect every dir that holds a ``ptoas/`` stage: the build root
+    # (single-chip / L2) plus each per-rank sub-build under next_levels/ (L3).
+    scan_dirs: list[Path] = [work_dir]
+    next_levels = work_dir / "next_levels"
+    if next_levels.is_dir():
+        scan_dirs += [d for d in sorted(next_levels.iterdir()) if d.is_dir()]
+    scan_dirs = [d for d in scan_dirs if (d / "ptoas").is_dir()]
+    if not scan_dirs:
+        return []
+
+    ptoas_bin = _ptoas_binary()
+    if ptoas_bin is None:
+        print("[pto->cpp] skipped: ptoas binary not found (set PTOAS_ROOT or PATH)")
+        return []
+
+    touched: list[str] = []
+    for scan_dir in scan_dirs:
+        touched += _rebuild_one_dir(scan_dir, work_dir, ptoas_bin)
 
     if not touched:
         print("[pto->cpp] no .pto changes detected")

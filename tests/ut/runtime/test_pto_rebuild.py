@@ -313,5 +313,79 @@ def test_prints_status_when_ptoas_binary_missing(tmp_path: Path, monkeypatch, ca
     assert "[pto->cpp] skipped: ptoas binary not found" in out
 
 
+# ---------------------------------------------------------------------------
+# L3 distributed builds: per-rank sub-builds under next_levels/{rank}/ (#1689)
+# ---------------------------------------------------------------------------
+
+
+def _setup_l3_build_output(tmp_path: Path, ranks: dict[str, list[tuple[str, str]]]) -> Path:
+    """Create an L3 skeleton: each rank is a chip sub-build under next_levels/.
+
+    Args:
+        ranks: ``{rank_name: [(core_type, func_name), ...]}``. Each rank gets its
+            own ``ptoas/<func>.pto`` + ``kernels/<core>/<func>.cpp`` (wrapper-shaped).
+    """
+    # An L3 build has no top-level ptoas/ or kernels/; just the host orchestrator.
+    (tmp_path / "orchestration").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "orchestration" / "host_orch.py").write_text("# host orch\n")
+    for rank, targets in ranks.items():
+        rank_dir = tmp_path / "next_levels" / rank
+        (rank_dir / "ptoas").mkdir(parents=True, exist_ok=True)
+        for core, func in targets:
+            (rank_dir / "ptoas" / f"{func}.pto").write_text(f"// stub pto for {func}\n")
+            cpp = rank_dir / "kernels" / core / f"{func}.cpp"
+            cpp.parent.mkdir(parents=True, exist_ok=True)
+            cpp.write_text(_wrapped_cpp(f"// OLD body for {func}\nstatic __aicore__ void {func}() {{}}\n"))
+    return tmp_path
+
+
+def _fake_run_ptoas_by_stem(_ptoas_bin: str, pto_path: Path, out_cpp: Path) -> None:
+    """Emit a cpp defining a single function named after the .pto stem."""
+    fn = pto_path.stem
+    out_cpp.write_text(
+        "#include <pto/pto-inst.hpp>\nusing namespace pto;\n"
+        f"\nAICORE void {fn}() {{\n    // FRESH body for {fn}\n}}\n"
+    )
+
+
+def test_l3_rebuilds_each_rank_under_next_levels(tmp_path: Path, monkeypatch) -> None:
+    """Stale .pto in any next_levels/{rank}/ptoas is rebuilt and spliced per rank."""
+    work_dir = _setup_l3_build_output(tmp_path, {"rank0": [("aiv", "foo")], "rank1": [("aic", "bar")]})
+    later = time.time() + 10
+    os.utime(work_dir / "next_levels" / "rank0" / "ptoas" / "foo.pto", (later, later))
+    os.utime(work_dir / "next_levels" / "rank1" / "ptoas" / "bar.pto", (later, later))
+
+    monkeypatch.setattr(pto_rebuild, "_ptoas_binary", lambda: "/fake/ptoas")
+    monkeypatch.setattr(pto_rebuild, "_run_ptoas", _fake_run_ptoas_by_stem)
+
+    touched = rebuild_kernel_cpp_from_pto(work_dir)
+
+    # Returned paths are rooted at work_dir, so they carry the next_levels prefix.
+    assert set(touched) == {
+        "next_levels/rank0/kernels/aiv/foo.cpp",
+        "next_levels/rank1/kernels/aic/bar.cpp",
+    }
+    foo = (work_dir / "next_levels" / "rank0" / "kernels" / "aiv" / "foo.cpp").read_text()
+    bar = (work_dir / "next_levels" / "rank1" / "kernels" / "aic" / "bar.cpp").read_text()
+    assert "FRESH body for foo" in foo and "OLD body for foo" not in foo
+    assert "FRESH body for bar" in bar and "OLD body for bar" not in bar
+
+
+def test_l3_skips_fresh_rank_pto(tmp_path: Path, monkeypatch) -> None:
+    """A rank whose .pto is older than its intermediate cpp is left untouched."""
+    work_dir = _setup_l3_build_output(tmp_path, {"rank0": [("aiv", "foo")], "rank1": [("aic", "bar")]})
+    # Pre-create rank1's intermediate cpp and make it newer than bar.pto (fresh).
+    (work_dir / "next_levels" / "rank1" / "ptoas" / "bar.cpp").write_text("// up to date\n")
+    later, earlier = time.time() + 10, time.time() - 10
+    os.utime(work_dir / "next_levels" / "rank0" / "ptoas" / "foo.pto", (later, later))
+    os.utime(work_dir / "next_levels" / "rank1" / "ptoas" / "bar.pto", (earlier, earlier))
+
+    monkeypatch.setattr(pto_rebuild, "_ptoas_binary", lambda: "/fake/ptoas")
+    monkeypatch.setattr(pto_rebuild, "_run_ptoas", _fake_run_ptoas_by_stem)
+
+    touched = rebuild_kernel_cpp_from_pto(work_dir)
+    assert touched == ["next_levels/rank0/kernels/aiv/foo.cpp"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
