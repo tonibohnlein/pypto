@@ -1299,6 +1299,43 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const std::map<VarPtr, VarPtr>& 
           return IRMutator::VisitStmt_(op);
         }
 
+        // Rebase a sharing-group member onto the reuse target, keeping its
+        // offset relative to the representative and its own size — substituting
+        // the target MemRef wholesale would collapse every member onto the
+        // target's base offset (issue #1723: all per-head row slices read row 0).
+        // Members coinciding with the representative reuse the target MemRef
+        // object so plain reuse keeps MemRef identity.
+        //
+        // Const-offset only. A dynamic byte offset falls back to the target as-is;
+        // this is safe for the same reason AllocateMemoryAddr falls back to the
+        // bare base for dynamic offsets — such a view reaches codegen via
+        // tile.slice → pto.subview, which re-derives its address from the slice
+        // operands, not this MemRef's byte_offset (only const reshape-of-slice
+        // chains, rebased below, depend on it).
+        const MemRefPtr curr_memref = curr_tile_type->memref_.value_or(nullptr);
+        auto rebase_memref = [&](const TileTypePtr& tile) -> std::optional<MemRefPtr> {
+          if (!tile->memref_.has_value() || !curr_memref) return source_memref;
+          const auto& old = tile->memref_.value();
+          auto old_off = As<ConstInt>(old->byte_offset_);
+          auto curr_off = As<ConstInt>(curr_memref->byte_offset_);
+          if (!old_off || !curr_off) return source_memref;
+          const int64_t rel = old_off->value_ - curr_off->value_;
+          if (rel == 0 && old->size_ == (*source_memref)->size_) return source_memref;
+          // The representative is the earliest-defined member (the whole-buffer
+          // base in the alloc→subview flow), so members sit at non-negative
+          // offsets within the target; a negative or out-of-range rel would
+          // silently rebase onto a neighbouring allocation.
+          INTERNAL_CHECK_SPAN(rel >= 0 && static_cast<uint64_t>(rel) + old->size_ <= (*source_memref)->size_,
+                              old->span_)
+              << "Internal error: sharing-group member offset " << old_off->value_
+              << " rebased to rel=" << rel << " size=" << old->size_ << " falls outside reuse target (size "
+              << (*source_memref)->size_ << ")";
+          auto rel_expr = std::make_shared<ConstInt>(rel, DataType::INDEX, Span::unknown());
+          return std::make_shared<MemRef>((*source_memref)->base_,
+                                          AddByteOffsets((*source_memref)->byte_offset_, rel_expr),
+                                          old->size_, old->span_);
+        };
+
         // Create new TileType with shared MemRef
         auto new_tile_type = std::dynamic_pointer_cast<const TileType>(CloneTypeWithMemRefAndRemapExprs(
             curr_tile_type, source_memref, [this](const ExprPtr& expr) { return VisitExpr(expr); }));
@@ -1321,7 +1358,7 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const std::map<VarPtr, VarPtr>& 
               if (shared_tile_type) {
                 auto new_shared_tile_type =
                     std::dynamic_pointer_cast<const TileType>(CloneTypeWithMemRefAndRemapExprs(
-                        shared_tile_type, source_memref,
+                        shared_tile_type, rebase_memref(shared_tile_type),
                         [this](const ExprPtr& expr) { return VisitExpr(expr); }));
                 auto new_shared_var = std::make_shared<const Var>(shared_var->name_hint_,
                                                                   new_shared_tile_type, shared_var->span_);
