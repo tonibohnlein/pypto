@@ -91,6 +91,8 @@ std::string IRPropertyToString(IRProperty prop) {
       return "ManualDepsOnSubmitOnly";
     case IRProperty::ReturnParamsExplicit:
       return "ReturnParamsExplicit";
+    case IRProperty::UnrollResolved:
+      return "UnrollResolved";
     default:
       return "Unknown";
   }

@@ -233,6 +233,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_pipeline_loop_valid.cpp
     src/ir/verifier/verify_manual_deps_on_submit_only.cpp
     src/ir/verifier/verify_pipeline_resolved.cpp
+    src/ir/verifier/verify_unroll_resolved.cpp
     src/ir/verifier/verify_call_directions.cpp
     src/ir/verifier/verify_tile_type_coherence.cpp
     src/ir/verifier/verify_assign_type_symmetry.cpp

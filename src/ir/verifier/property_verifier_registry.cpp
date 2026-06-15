@@ -63,6 +63,7 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::PipelineLoopValid, CreatePipelineLoopValidPropertyVerifier);
   Register(IRProperty::ManualDepsOnSubmitOnly, CreateManualDepsOnSubmitOnlyPropertyVerifier);
   Register(IRProperty::PipelineResolved, CreatePipelineResolvedPropertyVerifier);
+  Register(IRProperty::UnrollResolved, CreateUnrollResolvedPropertyVerifier);
   Register(IRProperty::CallDirectionsResolved, CreateCallDirectionsResolvedPropertyVerifier);
   Register(IRProperty::TileTypeCoherence, CreateTileTypeCoherencePropertyVerifier);
   Register(IRProperty::InlineFunctionsEliminated, CreateInlineFunctionsEliminatedPropertyVerifier);

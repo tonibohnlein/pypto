@@ -344,13 +344,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void VisitStmt_(const ForStmtPtr& for_stmt) override {
-    if (for_stmt->kind_ == ForKind::Unroll) {
-      LOG_WARN << "ForKind::Unroll loop was not expanded before codegen; "
-                  "generating sequential loop as fallback";
-    } else if (for_stmt->kind_ == ForKind::Pipeline) {
-      LOG_WARN << "ForKind::Pipeline loop reached codegen; CanonicalizeIOOrder "
-                  "should have demoted it to Sequential. Generating sequential loop as fallback.";
-    }
+    INTERNAL_CHECK_SPAN(for_stmt->kind_ != ForKind::Unroll, for_stmt->span_)
+        << "Internal error: ForKind::Unroll reached codegen — UnrollLoops and "
+        << "SplitChunkedLoops should have resolved it. The pipeline is incomplete.";
+    INTERNAL_CHECK_SPAN(for_stmt->kind_ != ForKind::Pipeline, for_stmt->span_)
+        << "Internal error: ForKind::Pipeline reached codegen — LowerPipelineLoops "
+        << "and CanonicalizeIOOrder should have demoted it to Sequential. "
+        << "The pipeline is incomplete.";
 
     std::string loop_var = GetVarName(for_stmt->loop_var_);
     // Guard against an empty emit name (e.g. python `for _ in pl.range(...)`

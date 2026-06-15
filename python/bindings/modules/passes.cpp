@@ -78,6 +78,8 @@ void BindPass(nb::module_& m) {
              "Bidirectional invariant: ForStmt.kind_ == Pipeline ⇔ has pipeline_stages attr")
       .value("PipelineResolved", IRProperty::PipelineResolved,
              "No ForKind::Pipeline survives; produced by CanonicalizeIOOrder")
+      .value("UnrollResolved", IRProperty::UnrollResolved,
+             "No ForKind::Unroll survives; produced by UnrollLoops")
       .value("CallDirectionsResolved", IRProperty::CallDirectionsResolved,
              "Every non-builtin Call has explicit attrs['arg_directions'] (see Call::GetArgDirections)")
       .value("TileTypeCoherence", IRProperty::TileTypeCoherence,

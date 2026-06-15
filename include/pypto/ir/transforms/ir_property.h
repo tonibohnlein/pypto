@@ -76,6 +76,7 @@ enum class IRProperty : uint64_t {
                                     ///< typed Submit::deps_ field. Op calls (system.task_dummy) are exempt
   ReturnParamsExplicit,             ///< InCore/Group/Spmd tensor returns reference function params by
                                     ///< pointer identity, so the return->param map is a lookup (#1702)
+  UnrollResolved,                   ///< No ForKind::Unroll survives; produced by UnrollLoops
   kCount                            ///< Sentinel (must be last)
 };
 

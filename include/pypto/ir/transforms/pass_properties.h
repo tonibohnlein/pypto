@@ -59,7 +59,7 @@ inline const PassProperties kCtrlFlowTransformProperties{.produced = {IRProperty
 
 inline const PassProperties kSplitChunkedLoopsProperties{
     .required = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure}};
+    .produced = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure, IRProperty::UnrollResolved}};
 
 // -- Chunk loop interchange pass (runs after SplitChunkedLoops) ---------------
 
