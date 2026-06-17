@@ -10,11 +10,12 @@
 """Centralized expression evaluator for resolving Python expressions against closure variables."""
 
 import ast
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pypto.pypto_core import DataType, ir
 
 from ..typing.dynamic import DynVar
+from ..typing.scalar import Scalar
 from .diagnostics import ParserTypeError
 
 if TYPE_CHECKING:
@@ -137,6 +138,10 @@ class ExprEvaluator:
             return value
         if isinstance(value, DynVar):
             return self.get_or_create_dynvar(value, span)
+        if isinstance(value, Scalar) and not value._annotation_only and value.expr is not None:
+            # Composite over DynVars (e.g. `m + 0`) built via DSL operator
+            # overloading — keep the IR tree as-is (no constant folding).
+            return value.expr
         if isinstance(value, (list, tuple)):
             return ir.MakeTuple([self.python_value_to_ir(elt, span) for elt in value], span)
         raise ParserTypeError(
@@ -153,8 +158,17 @@ class ExprEvaluator:
         """
         cached = self.dynvar_cache.get(dv.name)
         if cached is not None:
+            # Always re-sync the DynVar so a stale _ir_var from an earlier
+            # parse cannot diverge from this parse's cached Var.
+            dv._ir_var = cached
+            dv.expr = cached
             return cached
-        var = ir.Var(dv.name, ir.ScalarType(DataType.INDEX), span)
+        # Share the DynVar's lazily-created ir.Var so annotation shapes and
+        # call arguments resolve to the same Var instance, creating it with
+        # the call-site span (DynVar.unwrap() would use Span.unknown()).
+        if dv._ir_var is None:
+            dv._ir_var = ir.Var(dv.name, ir.ScalarType(DataType.INDEX), span)
+        var = cast(ir.Var, dv.unwrap())
         self.dynvar_cache[dv.name] = var
         return var
 

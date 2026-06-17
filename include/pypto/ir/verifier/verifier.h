@@ -271,6 +271,20 @@ PropertyVerifierPtr CreateInOutUseValidPropertyVerifier();
 PropertyVerifierPtr CreatePipelineLoopValidPropertyVerifier();
 
 /**
+ * @brief Factory function for creating ManualDepsOnSubmitOnly property verifier
+ *
+ * Verifies that no plain cross-function Call (GlobalVar callee) carries
+ * ``attrs["manual_dep_edges"]`` — manual dependency edges live in the typed
+ * ``Submit::deps_`` field. Op calls (``system.task_dummy``) keep the attr as
+ * their codegen fanin contract and are exempt. Listed in
+ * ``GetStructuralProperties()``, so ``VerificationInstrument`` checks it
+ * before/after every pass.
+ *
+ * @return Shared pointer to ManualDepsOnSubmitOnly PropertyVerifier
+ */
+PropertyVerifierPtr CreateManualDepsOnSubmitOnlyPropertyVerifier();
+
+/**
  * @brief Factory function for creating PipelineResolved property verifier
  *
  * Verifies the post-canonicalize invariant: no ``ForStmt`` may carry
@@ -284,6 +298,18 @@ PropertyVerifierPtr CreatePipelineLoopValidPropertyVerifier();
  * @return Shared pointer to PipelineResolved PropertyVerifier
  */
 PropertyVerifierPtr CreatePipelineResolvedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating UnrollResolved property verifier
+ *
+ * Verifies the post-unroll invariant: no ``ForStmt`` may carry
+ * ``kind_ == ForKind::Unroll``. ``ForKind::Unroll`` is a compile-time marker
+ * expanded by ``UnrollLoops`` into ``SeqStmts``; any survivor downstream of
+ * UnrollLoops indicates the pass failed to expand it.
+ *
+ * @return Shared pointer to UnrollResolved PropertyVerifier
+ */
+PropertyVerifierPtr CreateUnrollResolvedPropertyVerifier();
 
 /**
  * @brief Factory function for creating CallDirectionsResolved property verifier
@@ -397,6 +423,19 @@ PropertyVerifierPtr CreateCommDomainScopesMaterializedPropertyVerifier();
  * @return Shared pointer to AssignTypeSymmetry PropertyVerifier
  */
 PropertyVerifierPtr CreateAssignTypeSymmetryPropertyVerifier();
+
+/**
+ * @brief Create a verifier for IRProperty::ReturnParamsExplicit
+ *
+ * Checks every InCore/Group/Spmd function: each tensor return value that is a
+ * param writeback must reference the param by pointer identity (not an SSA
+ * alias of it), and tensor-returning functions must carry a ReturnStmt.
+ * Kernel-allocated tensors (untraceable to any param) and scalars are exempt.
+ * Keeps orchestration return->arg aliasing a lookup (#1702).
+ *
+ * @return Shared pointer to ReturnParamsExplicit PropertyVerifier
+ */
+PropertyVerifierPtr CreateReturnParamsExplicitPropertyVerifier();
 
 }  // namespace ir
 }  // namespace pypto

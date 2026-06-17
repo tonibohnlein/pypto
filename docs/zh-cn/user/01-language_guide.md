@@ -445,13 +445,21 @@ def orchestrator(a: pl.Tensor, b: pl.Tensor, out: pl.Out[pl.Tensor]):
 
 @pl.jit.host(auto_scope=False)         # HOST orchestrator
 def host_orch(...): ...
+
+@pl.jit.inline(auto_scope=False)       # inline 子函数
+def layer(...):
+    with pl.scope():                   # 内联后落入调用方
+        ...
 ```
 
-`auto_scope=False` 仅在 Orchestration 入口（`@pl.jit`）和 HOST
-orchestrator（`@pl.jit.host`）上被接受；子函数类型
-（`.incore` / `.inline` / `.opaque`）会拒绝它。它会 specialize 成
+`auto_scope=False` 在 Orchestration 入口（`@pl.jit`）、HOST
+orchestrator（`@pl.jit.host`）和 inline 子函数（`@pl.jit.inline`）上
+被接受——inline 函数体会被拼接进调用方，手放的 scope 因此落入调用方
+（入口通常也应设 `auto_scope=False`；入口 `True` + inline `False` 合法，
+只是手放 scope 会嵌套在编译器 AUTO scope 之内）。`.incore` / `.opaque`
+仍会拒绝它——它们外提为独立 kernel。它会 specialize 成
 `@pl.function(..., auto_scope=False)`——具体的 scope 放置语义见
-[MaterializeRuntimeScopes pass](../dev/passes/37-materialize_runtime_scopes.md)。
+[MaterializeRuntimeScopes pass](../dev/passes/39-materialize_runtime_scopes.md)。
 
 ### `@pl.inline`
 
@@ -638,8 +646,7 @@ output_dir = ir.compile(
 15. **ExpandMixedKernel** —— 在需要时拆分 mixed kernel
 16. **InitMemRef** —— 分配内存空间并插入缓冲区分配
 17. **MemoryReuse** —— 共享生命周期不重叠的缓冲区
-18. **LegalizePTOBufferReuse** —— 规范化 PTO 缓冲区复用模式
-19. **AllocateMemoryAddr** —— 分配具体内存地址
+18. **AllocateMemoryAddr** —— 分配具体内存地址
 
 ### `JITFunction.compile()`（用于 `@pl.jit` 内核）
 

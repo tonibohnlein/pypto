@@ -155,17 +155,6 @@ Pass InitMemRef();
 Pass MemoryReuse();
 
 /**
- * @brief Create a PTO buffer reuse legalisation pass
- *
- * After generic MemoryReuse, multiple tile variables with different
- * TileBufSignatures may share the same MemRef.  PTO codegen requires that
- * every non-view writer sharing a MemRef produces the same typed alloc_tile
- * signature.  This pass detects illegal cross-type sharing and splits the
- * offending MemRef into distinct allocations.
- */
-Pass LegalizePTOBufferReuse();
-
-/**
  * @brief Create an allocate memory address pass
  *
  * Allocates real memory addresses for existing alloc operations.
@@ -250,6 +239,11 @@ Pass InlineFunctions();
 Pass MaterializeCommDomainScopes();
 
 /**
+ * @brief Lower host-level ``pld.tensor.allreduce`` calls to internal builtin chip dispatches.
+ */
+Pass LowerHostTensorCollectives();
+
+/**
  * @brief Create a loop unrolling pass
  *
  * Expands ForStmt nodes with ForKind::Unroll into inlined copies of the loop
@@ -257,6 +251,29 @@ Pass MaterializeCommDomainScopes();
  * Must run before ConvertToSSA.
  */
 Pass UnrollLoops();
+
+/**
+ * @brief Skew cross-core (cube/vector) ``pl.pipeline`` loops; runs immediately
+ *        before ``LowerPipelineLoops``.
+ *
+ * For a mixed-core pipeline loop whose body has both a cross-core ``tile.tpush_*``
+ * and ``tile.tpop_*`` (``F > 1``), rewrites it to overlap the two cores:
+ *   - Single round-trip, producer role (one tpush + one tpop, the tpush's
+ *     backward slice does not feed the body via SSA): run the producer one
+ *     iteration ahead — produce(start) prologue, a ``ForKind::Sequential`` steady
+ *     loop pairing produce(k) with the trailing consume(k-step), and a
+ *     consume(last) epilogue.
+ *   - Consumer role or multi-round-trip: demote to a plain ``ForKind::Sequential``
+ *     loop (order-preserving; cross-core overlap comes from the peer's producer
+ *     skew). Demotion avoids reordering the in-order cross-core FIFO.
+ *
+ * The output carries no ``pipeline_stages`` marker and ``ForKind::Sequential``, so
+ * the downstream ``LowerPipelineLoops`` skips it and ``CanonicalizeIOOrder`` does
+ * not re-sort the hand-ordered skew. Every NON-cross-core pipeline loop (same-core
+ * GM->L1 / L1->L0 / nested matmul stage loops) is left intact for
+ * ``LowerPipelineLoops`` to replicate.
+ */
+Pass SkewCrossCorePipeline();
 
 /**
  * @brief Lower ``pl.pipeline(N, stage=F)`` loops at the tile level
@@ -689,9 +706,9 @@ Pass FuseCreateAssembleToSlice();
  *
  * Builtin ops (tensor.*, tile.*, system.*) are left untouched (arg_directions empty).
  *
- * Manual-scope dependency edges (``Call.attrs[manual_dep_edges]``) are written
- * directly by the parser from a ``pl.submit(...)`` ``deps=[...]`` kwarg — this
- * pass does not synthesise or lower them.
+ * Manual-scope dependency edges (typed ``Submit::deps_``) are written directly
+ * by the parser from a ``pl.submit(...)`` ``deps=[...]`` kwarg — this pass
+ * does not synthesise or lower them (ManualDepsOnSubmitOnly invariant).
  *
  * Requirements:
  *   - InCore scopes outlined (run OutlineIncoreScopes first)
@@ -702,26 +719,26 @@ Pass DeriveCallDirections();
  * @brief Expand profitable manual_scope Array[TASK_ID] fanout deps into
  *        explicit dependency-only dummy barrier calls.
  *
- * Rewrites selected consumer ``manual_dep_edges=[source_array]`` to
- * ``manual_dep_edges=[barrier_tid]`` after inserting a marked
- * ``system.task_dummy`` assignment at the chosen phase-fence placement point.
+ * Rewrites selected consumer Submits' ``deps_=[source_array]`` to
+ * ``deps_=[barrier_tid]`` after inserting a marked ``system.task_dummy``
+ * assignment at the chosen phase-fence placement point.
  */
 Pass ExpandManualPhaseFence();
 
 /**
  * @brief Derive explicit task-to-task dependency edges inside runtime scopes.
  *
- * Walks manual runtime scopes as dependency-analysis regions. For each submit-style
- * Call with a producer ``Scalar[TASK_ID]`` tuple element, computes a conservative
- * storage access summary from ``arg_directions`` and attaches RAW/WAR/WAW hazards
- * against prior calls in the same scope under
- * ``Call.attrs["compiler_manual_dep_edges"]``. AUTO scopes are skipped by default;
- * pass ``analyze_auto_scopes=true`` to analyze them while keeping ``manual=false``
- * in the output IR. On unanalyzable hazards, partial compiler deps are stripped
- * and the scope falls back to AUTO tracking. User-provided ``manual_dep_edges``
- * remain authoritative and separate; codegen merges both attrs before emitting
- * ``Arg::set_dependencies``.
+ * User-written manual runtime scopes are skipped: the user's explicit
+ * ``deps=[...]`` edges are treated as the complete scheduling contract. AUTO
+ * scopes are skipped by default; pass ``analyze_auto_scopes=true`` to analyze
+ * them while keeping ``manual=false`` in the output IR. For each analyzed AUTO
+ * scope, the pass computes a conservative storage access summary from
+ * ``arg_directions`` and attaches RAW/WAR/WAW hazards against prior calls in the
+ * same scope under ``Call.attrs["compiler_manual_dep_edges"]``. On unanalyzable
+ * hazards, partial compiler deps are stripped and AUTO tracking remains active.
  *
+ * User-provided ``manual_dep_edges`` remain authoritative and separate; codegen
+ * merges both attrs before emitting ``Arg::set_dependencies``.
  * Requirements:
  *   - Call directions resolved (run DeriveCallDirections first)
  */
@@ -730,7 +747,7 @@ Pass AutoDeriveTaskDependencies(bool analyze_auto_scopes = false);
 /**
  * @brief Fold no-op tile.reshape assignments into Var-to-Var assignments
  *
- * After LegalizePTOBufferReuse, two TileType variables can share the same
+ * After MemoryReuse, two TileType variables can share the same
  * MemRef and the same TileBufSignature — in that case the `tile.reshape`
  * connecting them is a no-op at the PTO level. This pass rewrites such
  * `lhs = tile.reshape(rhs, shape)` AssignStmts into plain `lhs = rhs`,
@@ -739,7 +756,7 @@ Pass AutoDeriveTaskDependencies(bool analyze_auto_scopes = false);
  *
  * Requirements:
  * - InCore-type functions only (Opaque/Orchestration are unaffected)
- * - Must run after LegalizePTOBufferReuse so MemRef merging is finalized
+ * - Must run after MemoryReuse so MemRef merging is finalized
  */
 Pass FoldNoOpReshape();
 

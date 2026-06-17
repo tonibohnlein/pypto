@@ -344,13 +344,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void VisitStmt_(const ForStmtPtr& for_stmt) override {
-    if (for_stmt->kind_ == ForKind::Unroll) {
-      LOG_WARN << "ForKind::Unroll loop was not expanded before codegen; "
-                  "generating sequential loop as fallback";
-    } else if (for_stmt->kind_ == ForKind::Pipeline) {
-      LOG_WARN << "ForKind::Pipeline loop reached codegen; CanonicalizeIOOrder "
-                  "should have demoted it to Sequential. Generating sequential loop as fallback.";
-    }
+    INTERNAL_CHECK_SPAN(for_stmt->kind_ != ForKind::Unroll, for_stmt->span_)
+        << "Internal error: ForKind::Unroll reached codegen — UnrollLoops and "
+        << "SplitChunkedLoops should have resolved it. The pipeline is incomplete.";
+    INTERNAL_CHECK_SPAN(for_stmt->kind_ != ForKind::Pipeline, for_stmt->span_)
+        << "Internal error: ForKind::Pipeline reached codegen — LowerPipelineLoops "
+        << "and CanonicalizeIOOrder should have demoted it to Sequential. "
+        << "The pipeline is incomplete.";
 
     std::string loop_var = GetVarName(for_stmt->loop_var_);
     // Guard against an empty emit name (e.g. python `for _ in pl.range(...)`
@@ -1493,6 +1493,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
     code_ << "};\n";
 
+    // No set_initial_value() here: this CI is synthesised for a callee Out param
+    // that the caller never passed (a runtime-allocated output), so there is no
+    // user-facing `pl.create_tensor(..., init_value=...)` to honour. Buffer
+    // pre-fill is emitted only on the originating `tensor.create` op (see
+    // tensor_op_codegen.cpp), which keeps its own CI on the orchestration path.
     code_ << ind << "TensorCreateInfo " << ci_var << "(" << ci_var << "_shapes, " << ndim << ", "
           << GetRuntimeDataTypeString(tensor_ty->dtype_) << ");\n";
 
@@ -2160,6 +2165,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   struct GMPipeCreateUse {
     FunctionPtr callee;
     std::string core_num_expr;
+    ExprPtr core_num_node;
   };
 
   [[nodiscard]] std::optional<GMPipeCreateUse> ResolveGMPipeCreateUse(const std::vector<StmtPtr>& stmts,
@@ -2209,7 +2215,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       if (core_num_expr) {
         rendered_core_num = RenderLaunchCoreNum(core_num_expr);
       }
-      return GMPipeCreateUse{callee_func, rendered_core_num};
+      return GMPipeCreateUse{callee_func, rendered_core_num, core_num_expr};
     }
     return std::nullopt;
   }
@@ -2307,6 +2313,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
           size_expr = "static_cast<uint32_t>((" + size_expr + ") * (" + core_num_expr + "))";
         }
         tensor_create_size_expr_by_emit_name_[emit_var] = size_expr;
+        // Keep the create in body order when core_num is computed from a body-local.
+        if (ExprRefsAnyOf(create_use->core_num_node, locally_defined)) {
+          declared_var_ptrs_.erase(assign->var_.get());
+          locally_defined.insert(assign->var_.get());
+          continue;
+        }
       }
       creates.push_back({emit_var, call});
       batched_create_stmts_.insert(stmt.get());
@@ -2767,11 +2779,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // Find the Out/InOut parameter that the callee's ReturnStmt actually
     // returns. When the kernel declares multiple Out params (e.g., a real
     // result plus per-block GM scratch tensors used by a pl.spmd-dispatched
-    // mixed kernel), out_indices[0] is the scratch buffer and aliasing the
-    // call site SSA to it would route every downstream consumer into the
-    // scratch instead of the actual result. Fall back to out_indices[0] only
-    // when the return cannot be traced back to a Param.
+    // mixed kernel), guessing wrong silently routes every downstream consumer
+    // into the wrong buffer (#1702). Pipeline IR satisfies ReturnParamsExplicit
+    // so the trace is a pointer-identity lookup; the fallback is reachable
+    // only for parsed IR with a single output, where it is unambiguous.
     auto returned_idx = FindReturnedParamIndex(callee, program_);
+    INTERNAL_CHECK_SPAN(returned_idx.has_value() || out_indices.size() == 1, call->span_)
+        << "Internal error: cannot map return of callee '" << callee->name_ << "' to one of its "
+        << out_indices.size() << " Out/InOut params (no traceable ReturnStmt); aliasing would be a guess";
     size_t param_idx = returned_idx.value_or(out_indices[0]);
     EmitTensorAlias(result_var, var_name, call, param_idx);
   }

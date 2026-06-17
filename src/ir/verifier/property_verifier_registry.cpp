@@ -61,7 +61,9 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::NoNestedInCore, CreateNoNestedIncorePropertyVerifier);
   Register(IRProperty::InOutUseValid, CreateInOutUseValidPropertyVerifier);
   Register(IRProperty::PipelineLoopValid, CreatePipelineLoopValidPropertyVerifier);
+  Register(IRProperty::ManualDepsOnSubmitOnly, CreateManualDepsOnSubmitOnlyPropertyVerifier);
   Register(IRProperty::PipelineResolved, CreatePipelineResolvedPropertyVerifier);
+  Register(IRProperty::UnrollResolved, CreateUnrollResolvedPropertyVerifier);
   Register(IRProperty::CallDirectionsResolved, CreateCallDirectionsResolvedPropertyVerifier);
   Register(IRProperty::TileTypeCoherence, CreateTileTypeCoherencePropertyVerifier);
   Register(IRProperty::InlineFunctionsEliminated, CreateInlineFunctionsEliminatedPropertyVerifier);
@@ -87,6 +89,7 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   // rank asymmetry in LowerTransposeLoadParamLayout) is fixed, so it does not
   // hard-fail that compile path.
   Register(IRProperty::AssignTypeSymmetry, CreateAssignTypeSymmetryPropertyVerifier);
+  Register(IRProperty::ReturnParamsExplicit, CreateReturnParamsExplicitPropertyVerifier);
 }
 
 void PropertyVerifierRegistry::Register(IRProperty prop, std::function<PropertyVerifierPtr()> factory) {

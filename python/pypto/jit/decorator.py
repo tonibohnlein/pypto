@@ -737,6 +737,26 @@ def _extract_local_tensor_metas(
             return None
         return TensorMeta(shape=shape, dtype=dtype_val)
 
+    def _reshape_meta(call: ast.Call) -> TensorMeta | None:
+        # pl.reshape(input, shape) — dtype inherited from source tensor.
+        src = (
+            call.args[0] if call.args else next((kw.value for kw in call.keywords if kw.arg == "input"), None)
+        )
+        if not isinstance(src, ast.Name) or src.id not in local:
+            return None
+        src_meta = local[src.id]
+        shape_node = (
+            call.args[1]
+            if len(call.args) >= 2
+            else next((kw.value for kw in call.keywords if kw.arg == "shape"), None)
+        )
+        if shape_node is None:
+            return None
+        shape = _resolve_shape(shape_node)
+        if shape is None:
+            return None
+        return TensorMeta(shape=shape, dtype=src_meta.dtype)
+
     def _slice_meta(call: ast.Call) -> TensorMeta | None:
         # pl.slice(tensor, shape, offset, ...) — shape is positional index 1 or kw `shape=`.
         src = call.args[0] if call.args else None
@@ -766,6 +786,15 @@ def _extract_local_tensor_metas(
     def _record_dep_result_metas(call: ast.Call, dep_name: str, target: ast.expr) -> None:
         _propagate_dep_out_metas(call, dep_name, target, dep_io, local)
 
+    # Dispatch table: pl.<attr>(...) → meta extraction function.
+    # Replaces sequential if-chains, reducing branch and statement counts.
+    _pl_attr_handlers = {
+        "create_tensor": _create_tensor_meta,
+        "slice": _slice_meta,
+        "window": _window_meta,
+        "reshape": _reshape_meta,
+    }
+
     def _walk(stmts: list[ast.stmt]) -> None:
         for stmt in stmts:
             # Descend into nested DSL scopes (for / if / with / while) first so
@@ -791,18 +820,9 @@ def _extract_local_tensor_metas(
                 and isinstance(fn.value, ast.Name)
                 and isinstance(target, ast.Name)
             ):
-                if fn.attr == "create_tensor":
-                    meta = _create_tensor_meta(call)
-                    if meta is not None:
-                        local[target.id] = meta
-                    continue
-                if fn.attr == "slice":
-                    meta = _slice_meta(call)
-                    if meta is not None:
-                        local[target.id] = meta
-                    continue
-                if fn.attr == "window":
-                    meta = _window_meta(call)
+                handler = _pl_attr_handlers.get(fn.attr)
+                if handler is not None:
+                    meta = handler(call)
                     if meta is not None:
                         local[target.id] = meta
                     continue
@@ -1077,8 +1097,11 @@ class JITFunction:
             (PTO2_SCOPE) around the body and each for/if body. ``True`` by
             default; set ``False`` via ``@pl.jit(auto_scope=False)`` /
             ``@pl.jit.host(auto_scope=False)`` to place scopes by hand with
-            ``with pl.scope()``. Only meaningful for the Orchestration entry
-            and HOST orchestrator — sub-function kinds reject it.
+            ``with pl.scope()``. Also accepted on
+            ``@pl.jit.inline(auto_scope=False)`` — after the ``InlineFunctions``
+            pass splices the body, hand-placed scopes land in the caller.
+            ``incore`` / ``opaque`` kinds reject it (they outline into
+            separate kernels, so scopes never land in the caller).
         _dep_graph: Lazily-computed transitive JIT dep graph rooted here —
             ``(deps_topo, callers_by_dep_id, callees_by_func_id,
             call_args_cache)``.  ``None`` until first ``_get_dep_graph()``
@@ -1780,6 +1803,9 @@ class _SubFunctionDecorator:
 
     Every kind supports both ``@jit.kind`` (bare) and ``@jit.kind()`` (parens).
     Only ``incore`` honors a ``level=`` kwarg; passing it to other kinds raises.
+    Only ``host`` and ``inline`` honor an ``auto_scope=`` kwarg — ``inline``
+    because its body is spliced into the caller, so hand-placed scopes land
+    there; ``incore``/``opaque`` outline into separate kernels and reject it.
 
     See `_JITDecorator` for the kind semantics:
       - ``host``    → HOST Orchestrator entry (specialized to
@@ -1802,8 +1828,8 @@ class _SubFunctionDecorator:
         if auto_scope is not _AUTO_SCOPE_UNSET and not self._allow_auto_scope:
             raise TypeError(
                 f"@pl.jit.{self._func_type} does not accept an auto_scope= argument "
-                "(auto_scope is only meaningful for the Orchestration entry and the "
-                "HOST orchestrator)"
+                "(auto_scope is only meaningful for the Orchestration entry, the "
+                "HOST orchestrator, and inline sub-functions)"
             )
         resolved_auto_scope = True if auto_scope is _AUTO_SCOPE_UNSET else auto_scope
         if func is None:
@@ -1836,7 +1862,7 @@ class _JITDecorator:
     def __init__(self) -> None:
         self.host = _SubFunctionDecorator("host", allow_level=False, allow_auto_scope=True)
         self.incore = _SubFunctionDecorator("incore", allow_level=True)
-        self.inline = _SubFunctionDecorator("inline", allow_level=False)
+        self.inline = _SubFunctionDecorator("inline", allow_level=False, allow_auto_scope=True)
         self.opaque = _SubFunctionDecorator("opaque", allow_level=False)
 
     def __call__(self, func: Any = None, *, auto_scope: bool = True) -> Any:

@@ -53,18 +53,48 @@ program_optimized = reuse_pass(program)
 
 - 生命周期不重叠（无干涉）。当 `prev.last_use <= curr.def` 时，两个变量不重叠（即源的最后使用可以和目标的定义在同一语句，因为在同一语句内输入先于输出被消费）
 - 相同内存空间
-- 大小兼容（复用目标必须足够大）
-- **L0 cube 输入例外（Left/Right）**：`Mem.Left` / `Mem.Right` 的缓冲区存放的是由 view 算子（`tile.extract` / `tile.slice` / `tile.reshape`）产生的子 tile，PTO codegen 会按每个 tile 变量在缓冲区基址处单独物化。因此同一 L0 空间、生命周期不重叠、**字节**大小足够的两个这类缓冲区，即使 **shape 不同**也可以共享同一槽位 —— 对它们跳过下面的 `AreTileTypesCompatible`（shape/dtype/view）检查（前提是两端的 producer 都是 view 算子，且属于 [`LegalizePtoBufferReuse`](30-legalize_pto_buffer_reuse.md) 的 `IsLegalViewOp` 子集，从而共享的 MemRef 能在该 pass 中存活）。这使 fused-attention 能用 QK 的 `Right` 缓冲区（`[k, SEQ]`）复用 PV 的 `Right` 缓冲区（`[k', HEAD]`），将 L0B 峰值减半（issue #1595）。其它空间（Vec/Acc/Mat）仍保持严格匹配：
-- TileType 兼容性 — 由 `AreTileTypesCompatible` 检查：
-  - 相同 shape（所有维度必须精确匹配）
-  - 相同 dtype（例如 FP32 与 BF16 阻止复用，自动处理 `tile.cast`）
-  - 相同 TileView 存储属性：`stride`、`start_offset`、`blayout`、`slayout`、`fractal`、`pad` 必须都结构相等（例如 `tile.fillpad` 改变 `pad`，因此其输出不能复用其输入 —— 仅 `pad` 不一致即阻止复用）
-  - 当存在的 view 在存储上是平凡的（trivial）时，view 的**有无**可以不同：无 TileView 的 tile 具有默认物理存储（连续、零偏移、row-major/none-box、默认 fractal、无 pad），因此它与一个仅设置了 `valid_shape`（其余存储字段均为默认值）的 view tile 兼容。这使得复用可以跨越带有非对称 view 的结构克隆 tile，例如 `SplitVectorKernel` 产生的 dual-AIV 派发 `if` 的两个互斥分支 —— 其中一个分支的 tile 带有平凡的 `valid_shape` view，另一个分支的 tile 没有 view。若某个 view 的存储字段偏离默认值，则它仍与无 view 的 tile 不兼容。
-  - 对于 2D tile，`valid_shape` 不要求匹配：复用后每个 tile 在自己的 TileType 中保留各自的 `valid_shape`，PTO codegen 会为每个变量发射带有各自静态 valid 范围的 `alloc_tile` 声明，它们共享底层 buffer。这样，`PartialUnrollTileLoops` 产生的仅在边界守护 `valid_shape` 上不同的兄弟分支 tile 可以共用一个后备分配。对于 N-D tile，`valid_shape` 不一致仍然阻止复用。
+- **字节**大小兼容（复用目标必须足够大）
+- **No-alias 守护**（算子语义）：定义复用变量的算子可以禁止其输出与某些输入操作数共享缓冲区——因为硬件在**写输出的同时读取**这些输入,原地写会中途破坏该算子。三个来源汇入同一个"每个输出禁止 alias 的输入集合"（`ForbidAliasCollector`）：
+  - `not_inplace_safe()` —— 该算子无法以 `src == dst` 运行，因此其输出不得 alias **任何**输入操作数。
+  - `forbid_output_alias(i)` —— 该算子对其值操作数 in-place-safe，但在写输出时读取**某个特定**操作数，因此输出不得 alias 该操作数的缓冲区。
+  - **升精度 `tile.cast`**（直接在 `ForbidAliasCollector` 处理）—— 输出 dtype 比输入**更宽**时,cast 无法原地：元素 `i` 在 `i*in_bytes` 处读、`i*out_bytes` 处写,写指针超前于读指针,冲掉尚未转换的输入。降精度 / 同宽 cast 仍 in-place-safe（保留下方的跨 dtype 复用）。
+
+  MemoryReuse 拒绝将输出放到任一禁止操作数的**物理缓冲区**上,并通过 reuse-map 合并**与** VIEW 继承（`reshape`/`slice` 共享其源的 MemRef base）解析每个操作数——因此间接到达的禁止操作数（其 owner tile 被复用到别的缓冲区,或经 view 占用）也能被捕获。
+
+  当前声明 no-alias 约束的算子：
+
+  | 算子 | 约束 | 为何输出不能 alias 输入 |
+  | ---- | ---- | ----------------------- |
+  | `tile.recip`、`tile.rsqrt` | `not_inplace_safe` | 高精度路径在写输出时读取输入**和** tmp scratch |
+  | `tile.row_sum` / `row_max` / `row_min` | `not_inplace_safe` | `TROW*` 在写规约输出 `[M, 1]` 时读取整行输入 + tmp scratch |
+  | `tile.mrgsort_format1` | `not_inplace_safe` | 归并排序 intrinsic 要求 `src != dst` |
+  | `tile.sel` | `forbid_output_alias(0)`（mask）、`(3)`（tmp） | `TSEL` 在写 `dst` 时读取 mask + tmp scratch |
+  | `tile.{row,col}_expand{,_mul,_add,_sub,_div}` | `forbid_output_alias(1)`（广播向量） | 行/列向量（arg 1）会被**每个**输出行/列重读,输出若 alias 它则在第一行/列后被覆盖 |
+  | `tile.cast`（仅升精度） | 输出 ≠ 输入缓冲区（条件式,在 `ForbidAliasCollector`） | 更宽的输出写指针超前于读指针（见上） |
+
+**不再有 shape / dtype / TileView 兼容性门槛**：共享同一物理 MemRef 的 tile 可以携带**不同**的 shape、dtype 或 `TileView` 属性。PTO codegen 为每个 tile 绑定一条 per-variable 的 `alloc_tile`，因此每个别名都以各自的静态 shape / dtype / layout / `valid_shape` 声明共享基址。这允许例如：
+
+- 跨 dtype 复用 —— BF16 tile 复用已死亡的 FP32 tile 的缓冲区（例如跨 `tile.cast`）；
+- `tile.fillpad` 输出复用其输入，以及两个 `pad` 不同的 fillpad 输出共享一个缓冲区；
+- N-D tile 在 `valid_shape` 不同的情况下共享缓冲区（各自在自己的 `alloc_tile` 上保留各自的 `valid_shape`）；
+- L0 cube 输入 `Left` / `Right` 中 shape 不同的子 tile 共享同一槽位（例如 fused-attention QK 的 `Right` `[k, SEQ]` 被 PV 的 `Right` `[k', HEAD]` 复用，将 L0B 峰值减半 —— issue #1595）。
+
+  早期版本以 `AreTileTypesCompatible`（shape / dtype / view 匹配，外加一个狭窄的 L0 字节复用例外）作为门槛；该门槛已移除。对读-写同体（read-while-write）算子的正确性现由上面的 no-alias 守护精确处理，而不再依赖粗粒度的整块匹配。
 
 **Alloc 清理**：
 
 MemRef 共享完成后，部分 MemRef 对象变为无引用状态（其变量现在指向不同的共享 MemRef）。该 Pass 遍历周围的 `SeqStmts`，移除所有左值 MemRef 指针不在仍使用集合中的 `tile.alloc` `AssignStmt`。
+
+## Ascend910B load + tpop_from_aic 危害
+
+在 `SplitMode` 非 `None` 的 Ascend910B AIV 函数中，如果某个 writer **同时**消费 `tile.load` 的结果（或其合法 view 派生）**和** `tile.tpop_from_aic` 的值，则它的输出不能与该 load 结果落在同一块物理 buffer 上。让 writer 的输出原地复用 load buffer 会在该硬件上产生**静默的错误结果**。
+
+MemoryReuse 掌管所有 buffer 合并决策，因此它从源头上阻止这种危害共享的形成，而不依赖后续的拆分。当 guard 生效时，复用决策在以下条件**同时满足**时被阻止：
+
+- writer 的定义 op 消费了 `tile.tpop_from_aic` 的值，**且**
+- 它将要原地复用的那个 buffer 成员（其 last use 正是该 writer 的定义语句）是 load 派生的。
+
+该 guard 由 `BackendHandler::RequiresSplitLoadTpopWorkaround()`（仅 Ascend910B 为 true）以及函数为 split-AIV 这两个条件门控；在其他任何 backend / 函数类型下输入集合为空，复用行为不变。writer 仍可自由复用任何**非** load buffer —— 只有 load + tpop 的原地组合会被拒绝。（该 guard 此前由独立的 `LegalizePTOBufferReuse` pass 在事后拆分 buffer 来实现，现已并入 MemoryReuse。）
 
 ## 示例
 
@@ -142,7 +172,14 @@ passes.def("memory_reuse", &pass::MemoryReuse, "Memory reuse optimization");
 - 测试非重叠生命周期的 MemRef 共享复用
 - 测试重叠生命周期不复用
 - 测试内存空间隔离
-- 测试大小兼容性
+- 测试字节大小兼容性
+- 测试跨 dtype / 跨 `TileView` 复用（现已允许：BF16↔FP32、fillpad 输出↔输入、`valid_shape` 不同）
+- 测试 no-alias 守护（`TestForbidOutputAlias` + `TestInplaceOps`），上表每条约束一个用例：
+  - `tile.recip` / `tile.rsqrt` / `tile.row_sum` —— 输出不得 alias 输入（`not_inplace_safe`）
+  - `tile.sel` —— 输出不得 alias mask / tmp（`forbid_output_alias`）
+  - `tile.col_expand_mul` —— 输出不得 alias 广播向量
+  - 升精度 `tile.cast` —— 输出不得 alias（更窄的）输入
+  - 经 VIEW 间接到达的禁止操作数也被遵守（物理缓冲区解析）
 - 测试切片操作的 MemRef 共享保持
 - 测试冗余 alloc 语句移除
 - 测试控制流生命周期分析（ForStmt 内嵌套 IfStmt、分支变量共享）

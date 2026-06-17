@@ -38,6 +38,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
@@ -286,7 +287,7 @@ class ScopeOutliner : public IRMutator {
    *      original defensive fallback: all defined vars + store targets are
    *      treated as outputs so the caller retains access.
    */
-  std::unordered_set<const Var*> ComputeFallbackUsedAfter(const ScopeStmtPtr& scope) const {
+  [[nodiscard]] std::unordered_set<const Var*> ComputeFallbackUsedAfter(const ScopeStmtPtr& scope) const {
     StoreTargetCollector store_collector;
     store_collector.VisitStmt(scope->body_);
     std::unordered_set<const Var*> used_after;
@@ -747,7 +748,7 @@ class ScopeOutliner : public IRMutator {
           var_remap_[k] = v;
         }
       }
-      const std::unordered_map<const Expr*, ExprPtr>& GetVarRemap() const { return var_remap_; }
+      [[nodiscard]] const std::unordered_map<const Expr*, ExprPtr>& GetVarRemap() const { return var_remap_; }
     };
     TrackingSubstituteMutator subst_mutator(var_substitution_map);
     auto transformed_body = subst_mutator.VisitStmt(pre_sub_body);
@@ -790,12 +791,36 @@ class ScopeOutliner : public IRMutator {
       return_types[i] = freshened->GetType();
     }
 
-    // Build outlined function body (transformed body + return statement)
+    // Build outlined function body (transformed body + return statement).
+    //
+    // Return params, not SSA result vars: every tensor output the scope
+    // produces is physically one of the function's params (store targets are
+    // InOut inputs; call results write through Out/InOut args). Returning
+    // the param makes the return->param mapping explicit by pointer identity
+    // so orchestration codegen never re-derives it heuristically (#1702).
     StmtPtr outlined_body;
     if (outlined_output_vars.empty()) {
       outlined_body = transformed_body;
     } else {
-      std::vector<ExprPtr> return_exprs(outlined_output_vars.begin(), outlined_output_vars.end());
+      std::unordered_map<const Var*, VarPtr> input_to_param;
+      for (size_t i = 0; i < input_vars.size(); ++i) {
+        input_to_param[input_vars[i].get()] = input_params[i];
+      }
+      std::vector<ExprPtr> return_exprs;
+      return_exprs.reserve(outlined_output_vars.size());
+      for (size_t i = 0; i < output_vars.size(); ++i) {
+        VarPtr ret = outlined_output_vars[i];
+        if (store_output_set.count(output_vars[i].get())) {
+          // Store target: also an input, so the param is known directly.
+          auto param_it = input_to_param.find(output_vars[i].get());
+          if (param_it != input_to_param.end()) ret = param_it->second;
+        } else if (AsTensorTypeLike(ret->GetType())) {
+          if (auto param = return_lineage::TraceToParam(ret, transformed_body, input_params, program_)) {
+            ret = param;
+          }
+        }
+        return_exprs.push_back(ret);
+      }
       auto return_stmt = std::make_shared<ReturnStmt>(return_exprs, op->span_);
 
       std::vector<StmtPtr> body_stmts;
@@ -815,10 +840,20 @@ class ScopeOutliner : public IRMutator {
         outlined_attrs.emplace_back("split", static_cast<int>(split.value()));
       }
     };
+    // Propagate the optional cross-core ring depth (pl.split(mode, slot_num=N))
+    // from the scope's attrs onto the outlined function, where ExpandMixedKernel
+    // reads it to size the automatic cube->vector pipe.
+    auto append_slot_num_attr = [&]() {
+      if (op->HasAttr("slot_num")) {
+        outlined_attrs.emplace_back("slot_num", op->GetAttr<int>("slot_num", 0));
+      }
+    };
     if (auto incore = As<InCoreScopeStmt>(op)) {
       append_split_attr(incore->split_);
+      append_slot_num_attr();
     } else if (auto auto_incore = As<AutoInCoreScopeStmt>(op)) {
       append_split_attr(auto_incore->split_);
+      append_slot_num_attr();
     } else if (auto spmd = As<SpmdScopeStmt>(op)) {
       outlined_attrs.emplace_back("core_num", spmd->core_num_);
       if (spmd->sync_start_) {
@@ -867,10 +902,10 @@ class ScopeOutliner : public IRMutator {
     //     dumps print the synthesised call as ``pl.submit(self.<outlined>,
     //     ..., deps=[...])`` — visually distinct from a plain function call,
     //     matching the explicit ``pl.submit(...)`` surface.
-    //   * ``manual_dep_edges`` → fold into ``Submit::deps_`` when
-    //     ``task_id_var`` is set; otherwise (no-TaskId path) attach as
-    //     ``Call.attrs[manual_dep_edges]`` so codegen still emits the
-    //     ``set_dependencies`` call.
+    //   * ``manual_dep_edges`` → fold into ``Submit::deps_``. A scope with
+    //     deps but no ``as tid`` binding gets a synthetic TaskId Var so the
+    //     dispatch is still a Submit — a plain GlobalVar Call must never
+    //     carry ``manual_dep_edges`` (ManualDepsOnSubmitOnly invariant).
     //   * ``arg_direction_overrides_vars`` (from ``pl.at(no_dep_args=[...])``) →
     //     translate the captured-Var list into positional indices into
     //     ``call_args`` (using the ``input_vars`` order, which call_args
@@ -888,6 +923,19 @@ class ScopeOutliner : public IRMutator {
     // ``kAttrDumpVars`` by Var identity, exactly as ``scope_no_dep_vars`` is
     // translated into ``kAttrArgDirectionOverrides``.
     std::vector<VarPtr> scope_dump_vars = op->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
+
+    // Dependency edges force the Submit shape: deps live in the typed
+    // ``Submit::deps_`` field, never in a plain Call's attrs. A scope written
+    // without ``as tid`` gets a synthetic (unused) TaskId Var; DCE keeps the
+    // Submit itself alive (task launches are effectful) and codegen skips the
+    // unconsumed trailing tuple element.
+    if (!scope_dep_edges.empty() && !scope_task_id_var) {
+      scope_task_id_var = std::make_shared<Var>(GenerateFreshSSAName("tid"),
+                                                std::make_shared<ScalarType>(DataType::TASK_ID), op->span_);
+      var_types_[scope_task_id_var.get()] = scope_task_id_var->GetType();
+      var_objects_[scope_task_id_var.get()] = scope_task_id_var;
+      known_names_.insert(scope_task_id_var->name_hint_);
+    }
 
     // Map each captured input Var to its positional arg index. Shared by the
     // no_dep override translation and the dump translation below; built once
@@ -970,11 +1018,11 @@ class ScopeOutliner : public IRMutator {
     }
 
     // Build the synthesised call expression. When ``scope_task_id_var`` is
-    // set the scope captures a producer TaskId, so we emit an ``ir.Submit``
-    // (matching the explicit ``pl.submit(...)`` surface): deps_ comes from
-    // the scope's ``kAttrManualDepEdges`` attr, and only the non-deps attrs
-    // (arg_direction_overrides) land in ``attrs_``. Otherwise we keep the
-    // legacy Call shape with deps attached via ``attrs[manual_dep_edges]``.
+    // set (user-written ``as tid`` OR synthesized above for a deps-only
+    // scope) we emit an ``ir.Submit`` matching the explicit ``pl.submit(...)``
+    // surface: deps_ comes from the scope's ``kAttrManualDepEdges`` attr, and
+    // only the non-deps attrs (dump_vars / arg_direction_overrides) land in
+    // ``attrs_``. The dep-free path keeps the plain Call shape.
     ExprPtr synthesised_call_expr;
     if (scope_task_id_var) {
       std::vector<ExprPtr> submit_deps;
@@ -1002,9 +1050,6 @@ class ScopeOutliner : public IRMutator {
       // rationale (matches _parse_kernel_call's reparse order).
       if (!dump_call_args.empty()) {
         call_attrs.emplace_back(kAttrDumpVars, std::move(dump_call_args));
-      }
-      if (!scope_dep_edges.empty()) {
-        call_attrs.emplace_back(kAttrManualDepEdges, std::move(scope_dep_edges));
       }
       if (!arg_dir_override_indices.empty()) {
         call_attrs.emplace_back(kAttrArgDirectionOverrides, std::move(arg_dir_override_indices));
@@ -1198,7 +1243,7 @@ class ScopeOutliner : public IRMutator {
   ///      keeps direction In on the shared output and the orchestration
   ///      codegen drops the SSA-result alias for the inout call)
   ///   3. Merge ``Out``/``InOut`` directions from inner GlobalVar calls
-  std::vector<ParamDirection> InferParamDirections(
+  [[nodiscard]] std::vector<ParamDirection> InferParamDirections(
       const std::vector<VarPtr>& input_vars, const StmtPtr& body,
       const std::unordered_set<const Var*>& store_output_set) const {
     std::vector<ParamDirection> directions(input_vars.size(), ParamDirection::In);

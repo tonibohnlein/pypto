@@ -487,6 +487,18 @@ def _dyn(name: str) -> ir.Var:
     return ir.Var(name, ir.ScalarType(DataType.INDEX), ir.Span.unknown())
 
 
+def _shape_exprs(dims: list) -> list[ir.Expr]:
+    """Normalize a mixed Python shape list to the Expr-only TensorType constructor."""
+    span = ir.Span.unknown()
+    exprs: list[ir.Expr] = []
+    for dim in dims:
+        if isinstance(dim, int):
+            exprs.append(ir.ConstInt(dim, DataType.INDEX, span))
+        else:
+            exprs.append(dim)
+    return exprs
+
+
 def _incore_cast_chain(shapes: list, valid: list, tensor_shape: list) -> ir.Program:
     """Bare InCore function: ``tile.load -> tile.cast -> tile.store -> return``.
 
@@ -497,8 +509,9 @@ def _incore_cast_chain(shapes: list, valid: list, tensor_shape: list) -> ir.Prog
     ``valid_shapes``) the user writes when chunking a dynamic dim themselves.
     """
     span = ir.Span.unknown()
-    in_type = ir.TensorType(tensor_shape, DataType.BF16)
-    out_type = ir.TensorType(tensor_shape, DataType.FP32)
+    tensor_shape_exprs = _shape_exprs(tensor_shape)
+    in_type = ir.TensorType(tensor_shape_exprs, DataType.BF16)
+    out_type = ir.TensorType(tensor_shape_exprs, DataType.FP32)
     zeros = [0] * len(tensor_shape)
 
     ib = IRBuilder()
@@ -562,7 +575,10 @@ class TestFlattenTileNdTo2DDynamicValid:
 
         after_func = after.get_function("cast_incore")
         assert after_func is not None
-        loads = [c for c in _tile_calls(after_func.body) if c.op.name == "tile.load"]
+        tile_calls = _tile_calls(after_func.body)
+        assert tile_calls, "expected flattened tile ops in the rewritten body"
+        assert all(len(cast(ir.TileType, call.type).shape) == 2 for call in tile_calls)
+        loads = [c for c in tile_calls if c.op.name == "tile.load"]
         assert loads, "expected a tile.load in the flattened body"
         load_type = cast(ir.TileType, loads[0].type)
         # Physical shape flattened to 2D and is fully static.

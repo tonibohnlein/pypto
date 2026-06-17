@@ -121,8 +121,8 @@ class TensorArgsInConvertedOpsCollector : public IRVisitor {
       // they create loads with specific offsets/spaces, so Phase-1 default Vec loads
       // would be redundant or wrong.
       static const std::unordered_set<std::string> kSelfLoadingOps = {
-          "tensor.slice", "tensor.assemble",     "tensor.read",
-          "tensor.write", "tensor.expand_clone", "tensor.gather"};
+          "tensor.slice",        "tensor.assemble", "tensor.read",        "tensor.write",
+          "tensor.expand_clone", "tensor.gather",   "tensor.paged_gather"};
       if (kSelfLoadingOps.count(call->op_->name_)) {
         IRVisitor::VisitStmt_(op);
         return;
@@ -448,6 +448,21 @@ class TypePropagatingMutator : public IRMutator {
     return result;
   }
 
+  /// Keep a Var shared_ptr alive for the lifetime of this mutator.
+  ///
+  /// ``var_remap_`` is keyed by raw ``const Expr*`` pointers (inherited from
+  /// IRMutator). Converters create temporary Vars (e.g. ``paged_gather`` builds
+  /// per-row scalars like ``pg_idx`` in its loop body); when a converter's
+  /// ``AssignStmt`` is replaced during conversion, the old Var is freed and the
+  /// allocator can hand its address to a *later* Var. A stale ``var_remap_``
+  /// entry keyed on the freed address would then mis-resolve the new Var,
+  /// silently rewriting an unrelated value (observed: a matmul result resolving
+  /// to a freed ``pg_idx`` scalar). Retaining every mapped-from Var prevents the
+  /// address reuse that triggers the collision.
+  void RetainVar(const ExprPtr& v) {
+    if (v) retained_vars_.push_back(v);
+  }
+
  private:
   /// Shared logic for ForStmt/WhileStmt: update return_vars types to match iter_arg types.
   template <typename ReconstructFn>
@@ -474,6 +489,9 @@ class TypePropagatingMutator : public IRMutator {
     if (!rv_changed) return original;
     return reconstruct(std::move(updated_rv));
   }
+
+  /// Vars kept alive for the pass lifetime — see RetainVar.
+  std::vector<ExprPtr> retained_vars_;
 };
 
 // ============================================================================
@@ -491,6 +509,9 @@ class TensorToTileMutator : public TypePropagatingMutator {
 
  protected:
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    // Pin this Var's address for the pass so a freed-then-reused address cannot
+    // alias a stale var_remap_ entry (see TypePropagatingMutator::RetainVar).
+    RetainVar(op->var_);
     auto new_value = VisitExpr(op->value_);
     auto call = As<Call>(new_value);
 
@@ -755,6 +776,25 @@ ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   if (op_name == "pld.tile.remote_store" && call->args_.size() >= 2) {
     return call->args_[1];
   }
+  // pld.tile.put(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
+  //   the HCCL TPUT writes through `dst` (args_[0]).
+  // pld.tile.get(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
+  //   the HCCL TGET writes the pulled bytes into local `dst` (args_[0]).
+  // Both mirror the remote_store handling above so the enclosing window
+  // param is upgraded from In to Out/InOut and a later reader gets a RAW edge.
+  if ((op_name == "pld.tile.put" || op_name == "pld.tile.get") && !call->args_.empty()) {
+    return call->args_[0];
+  }
+  // pld.tensor.allreduce(target, signal, *, op): the composite collective
+  // writes the reduced value back into `target` (args_[0]) — the in-place
+  // rebind idiom shared with `pl.store`. `signal` (args_[1]) is also
+  // written (Phase 2a/3.5a notify), but the marker below for
+  // ``pld.tensor.allreduce`` already records both args as InOut; this
+  // entry just identifies the primary data target for any downstream
+  // consumer that walks GetWriteTargetExpr.
+  if (op_name == "pld.tensor.allreduce" && !call->args_.empty()) {
+    return call->args_[0];
+  }
   return nullptr;
 }
 
@@ -871,6 +911,40 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     }
     if (auto write_target = GetWriteTargetExpr(call)) {
       MarkAccess(GetAliasOrigins(write_target, origin_map), has_write);
+    }
+    return;
+  }
+
+  if (op_name == "pld.tile.put" || op_name == "pld.tile.get") {
+    // pld.tile.put(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
+    //   dst (args_[0]) is the cross-rank write target; peer/src/stage and any
+    //   subregion offsets are all read.
+    // pld.tile.get(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
+    //   dst (args_[0]) is the local write target (HCCL TGET lands bytes into
+    //   the local window slot); peer/src/stage and any subregion offsets are
+    //   all read.
+    // Mirrors the pld.tile.remote_store handling above.
+    for (size_t i = 1; i < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    if (auto write_target = GetWriteTargetExpr(call)) {
+      MarkAccess(GetAliasOrigins(write_target, origin_map), has_write);
+    }
+    return;
+  }
+
+  if (op_name == "pld.tensor.allreduce") {
+    // pld.tensor.allreduce(target, signal, *, op): both target (args_[0])
+    // and signal (args_[1]) are InOut — read AND written across the
+    // 4-phase decomposition (target read in Phase 3, written in Phase 4;
+    // signal written in Phase 2a/3.5a notify, read in Phase 2b/3.5b wait).
+    // Marking both args on both sides makes the enclosing window params
+    // surface as InOut without needing LowerCompositeOps to have run yet
+    // (this pass is upstream of LowerCompositeOps).
+    for (size_t i = 0; i < std::min<size_t>(2, call->args_.size()); ++i) {
+      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
+      MarkAccess(origins, has_read);
+      MarkAccess(origins, has_write);
     }
     return;
   }
@@ -1464,6 +1538,9 @@ class WrapperForwardMutator : public TypePropagatingMutator {
 
  protected:
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    // Pin this Var's address for the pass so a freed-then-reused address cannot
+    // alias a stale var_remap_ entry (see TypePropagatingMutator::RetainVar).
+    RetainVar(op->var_);
     auto new_value = VisitExpr(op->value_);
     auto call = As<Call>(new_value);
     if (!call) return HandlePassThroughAssign(op, new_value);
@@ -1611,6 +1688,9 @@ class CallSiteUpdateMutator : public TypePropagatingMutator {
 
  protected:
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    // Pin this Var's address for the pass so a freed-then-reused address cannot
+    // alias a stale var_remap_ entry (see TypePropagatingMutator::RetainVar).
+    RetainVar(op->var_);
     auto new_value = VisitExpr(op->value_);
     auto call = As<Call>(new_value);
 

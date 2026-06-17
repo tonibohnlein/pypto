@@ -104,6 +104,25 @@ def _load_generated_module(path: Path) -> Any:
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
+    # Generated modules live only in ``sys.modules`` — there is no
+    # ``_pypto_generated`` package on disk to re-import them by name. The
+    # runtime cloudpickles every registered callable to derive its hashid
+    # descriptor (runtime #891); without this, cloudpickle would serialize
+    # functions from this module *by reference* and fail to re-import
+    # ``_pypto_generated.<stem>`` (PicklingError). Force by-value pickling so
+    # the function code travels inside the payload.
+    #
+    # Best-effort: cloudpickle is a ``simpler`` (runtime) dependency, absent in
+    # lean codegen-only / unit-test environments. When it is missing the
+    # callable-registration path that needs by-value pickling cannot run
+    # either, so there is nothing to protect — skip the registration. The
+    # import is local so plain ``import pypto`` never requires cloudpickle.
+    try:
+        import cloudpickle  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+
+        cloudpickle.register_pickle_by_value(module)
+    except ImportError:
+        pass
     return module
 
 
@@ -116,22 +135,44 @@ def _load_generated_module(path: Path) -> Any:
 
 
 def _assemble_chip_callables(compiled: DistributedCompiledProgram) -> tuple[dict[str, Any], str]:
-    """Build a ChipCallable for each chip-level task under ``next_levels/{name}/``."""
-    from pypto.pypto_core.ir import FunctionType  # noqa: PLC0415
-    from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+    """Build a ChipCallable for each chip-level task under ``next_levels/{name}/``.
 
+    Driven entirely by the on-disk layout — each ``next_levels/{name}/`` that
+    contains a ``kernel_config.py`` is a complete single-chip sub-build that
+    :func:`compile_and_assemble` consumes directly. This requires no live IR, so
+    it works identically for a freshly-compiled program and one reconstructed via
+    :meth:`DistributedCompiledProgram.from_dir` (the ``runtime_dir`` replay path).
+    """
     chip_callables: dict[str, Any] = {}
-    runtime_name = "tensormap_and_ringbuffer"
+    runtime_name: str | None = None
     next_levels_dir = compiled.output_dir / "next_levels"
-    for func in compiled._program.functions.values():
-        if func.func_type == FunctionType.Orchestration:
-            chip_dir = next_levels_dir / func.name
-            if chip_dir.exists():
-                chip_callable, runtime_name, _ = compile_and_assemble(chip_dir, compiled.platform)
-                chip_callables[func.name] = chip_callable
+    if next_levels_dir.is_dir():
+        for chip_dir in sorted(next_levels_dir.iterdir()):
+            if not (chip_dir / "kernel_config.py").exists():
+                continue
+            # Imported lazily — and only once there is a real chip to build — so
+            # the "no chip-level tasks" error path below stays usable without the
+            # heavy device_runner → simpler toolchain import.
+            from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+
+            chip_callable, chip_runtime, _ = compile_and_assemble(chip_dir, compiled.platform)
+            chip_callables[chip_dir.name] = chip_callable
+            if runtime_name is None:
+                runtime_name = chip_runtime
+            elif chip_runtime != runtime_name:
+                raise RuntimeError(
+                    f"Inconsistent runtime across next_levels/ sub-builds in {next_levels_dir}: "
+                    f"{runtime_name!r} (earlier chip) vs {chip_runtime!r} (chip {chip_dir.name!r}). "
+                    f"All chip-level tasks in one distributed build must share a single runtime."
+                )
 
     if not chip_callables:
-        raise RuntimeError(f"No chip-level tasks found in {next_levels_dir}")
+        raise RuntimeError(
+            f"No chip-level tasks found in {next_levels_dir} (expected one or more "
+            f"next_levels/<name>/ sub-builds each containing a kernel_config.py)."
+        )
+    # Non-empty chip_callables guarantees the loop set runtime_name at least once.
+    assert runtime_name is not None
     return chip_callables, runtime_name
 
 
@@ -235,8 +276,11 @@ def _register_callables(
     via COW (runtime PR #710); the emitted host_orch then dispatches via cids —
     ``orch.submit_sub(sub_ids[name], …)`` / ``orch.submit_next_level(callables[name], …)``.
     """
-    sub_ids: dict[str, int] = {name: w.register(fn) for name, fn in sub_worker_fns.items()}
-    chip_cids: dict[str, int] = {name: w.register(cc) for name, cc in chip_callables.items()}
+    # ``w.register`` returns an opaque ``CallableHandle`` (runtime #891); typed
+    # ``Any`` here and threaded straight back into ``submit_sub`` /
+    # ``submit_next_level``, which accept the handle.
+    sub_ids: dict[str, Any] = {name: w.register(fn) for name, fn in sub_worker_fns.items()}
+    chip_cids: dict[str, Any] = {name: w.register(cc) for name, cc in chip_callables.items()}
     return sub_ids, chip_cids
 
 
@@ -348,8 +392,8 @@ def _dispatch(
     w: Any,
     entry_fn: Any,
     tensors: dict[str, Any],
-    chip_cids: dict[str, int],
-    sub_ids: dict[str, int],
+    chip_cids: dict[str, Any],
+    sub_ids: dict[str, Any],
     call_config: Any,
     device_nums: int,
 ) -> Any:
@@ -447,6 +491,48 @@ def execute_distributed(
     finally:
         if w is not None:
             w.close()
+
+
+def execute_distributed_compiled(
+    output_dir: str | Path,
+    args: Sequence[torch.Tensor | DeviceTensor | ctypes._SimpleCData],
+    config: Any = None,
+    *,
+    platform: str | None = None,
+    distributed_config: DistributedConfig | None = None,
+) -> torch.Tensor | DeviceTensor | tuple[torch.Tensor | DeviceTensor, ...] | None:
+    """Reconstruct a distributed program from ``output_dir`` and run it once.
+
+    The distributed counterpart of :func:`pypto.runtime.execute_compiled`: it
+    reconstructs a :class:`~pypto.ir.distributed_compiled_program.DistributedCompiledProgram`
+    from an already-compiled build directory (via
+    :meth:`DistributedCompiledProgram.from_dir`) and dispatches it once —
+    **without** re-running the pypto compile. This is the entry point the
+    ``runtime_dir`` replay workflow uses for L3 programs (point it at a
+    ``build_output/`` with hand-edited ``.pto``/``.cpp`` and re-run on device).
+
+    Args:
+        output_dir: A build directory produced by a prior ``ir.compile`` of a
+            distributed (L3+) program (must contain ``distributed_meta.json``).
+        args: Positional arguments — host ``torch.Tensor`` or worker-resident
+            :class:`~pypto.runtime.DeviceTensor` — matching the orchestrator's
+            parameter order (in-place, or input-only for a return-style program).
+        config: Optional run configuration (forwarded to ``__call__``; the L3
+            dispatch path does not yet consume DFX flags from it).
+        platform: Override the persisted platform (e.g. ``a2a3sim`` → ``a2a3``).
+        distributed_config: Override the persisted run config (e.g. a different
+            set of ``device_ids``).
+
+    Returns:
+        The call result: allocated output tensor(s) for a return-style program,
+        otherwise ``None`` (outputs written in place into the passed arguments).
+    """
+    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+
+    compiled = DistributedCompiledProgram.from_dir(
+        output_dir, platform=platform, distributed_config=distributed_config
+    )
+    return compiled(*args, config=config)
 
 
 class DistributedWorker(Worker):

@@ -75,6 +75,19 @@ def test_invalidate_binary_cache_removes_sibling_so_and_o(tmp_path: Path) -> Non
     assert cpp.exists(), "cpp source must not be deleted"
 
 
+def test_invalidate_binary_cache_walks_next_levels(tmp_path: Path) -> None:
+    """L3 builds keep per-rank binaries under next_levels/{rank}/ — invalidate them too."""
+    bin_r0 = _touch(tmp_path / "next_levels" / "rank0" / "cache" / "incore_aiv_foo.bin")
+    so_r0 = _touch(tmp_path / "next_levels" / "rank0" / "kernels" / "aiv" / "k.so")
+    o_r1 = _touch(tmp_path / "next_levels" / "rank1" / "orchestration" / "m.o")
+    cpp_r0 = _touch(tmp_path / "next_levels" / "rank0" / "kernels" / "aiv" / "k.cpp")  # survives
+    invalidate_binary_cache(tmp_path)
+    assert not bin_r0.exists()
+    assert not so_r0.exists()
+    assert not o_r1.exists()
+    assert cpp_r0.exists(), "cpp source must not be deleted"
+
+
 def test_invalidate_binary_cache_noop_on_empty_dir(tmp_path: Path) -> None:
     invalidate_binary_cache(tmp_path)  # must not raise
 
@@ -196,6 +209,54 @@ def test_replay_prints_execute_banner(tmp_path: Path, capsys) -> None:
 def test_replay_missing_kernel_config_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match=r"kernel_config\.py"):
         replay(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# L3 distributed builds route to execute_distributed_compiled (#1689)
+# ---------------------------------------------------------------------------
+
+
+def _make_l3_build_output(tmp_path: Path) -> Path:
+    """L3 skeleton: a HOST orchestrator and no top-level kernel_config.py."""
+    (tmp_path / "orchestration").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "orchestration" / "host_orch.py").write_text("# host orch\n")
+    return tmp_path
+
+
+def test_replay_routes_l3_to_execute_distributed_compiled(tmp_path: Path) -> None:
+    work_dir = _make_l3_build_output(tmp_path)
+    a, b = torch.zeros(2), torch.zeros(2)
+    with (
+        patch("pypto.runtime.distributed_runner.execute_distributed_compiled") as edc,
+        patch.object(replay_module, "execute_compiled") as ec,
+    ):
+        replay(work_dir, a, b, config=RunConfig(platform="a2a3sim"), rebuild_from_pto=False, recompile=False)
+    edc.assert_called_once()
+    ec.assert_not_called()  # single-chip path must not be taken for L3
+    assert edc.call_args.args[0] == work_dir
+    assert edc.call_args.args[1] == [a, b]
+    assert edc.call_args.kwargs["platform"] == "a2a3sim"
+
+
+def test_replay_l3_runs_l3_aware_rebuild_and_invalidate(tmp_path: Path) -> None:
+    """The L3 path still runs the (now L3-aware) rebuild + invalidate helpers."""
+    work_dir = _make_l3_build_output(tmp_path)
+    order: list[str] = []
+
+    def _rebuild(*_a, **_k):
+        order.append("rebuild")
+        return []
+
+    def _invalidate(*_a, **_k):
+        order.append("invalidate")
+
+    with (
+        patch("pypto.runtime.distributed_runner.execute_distributed_compiled"),
+        patch.object(replay_module, "rebuild_kernel_cpp_from_pto", side_effect=_rebuild),
+        patch.object(replay_module, "invalidate_binary_cache", side_effect=_invalidate),
+    ):
+        replay(work_dir, torch.zeros(1))
+    assert order == ["rebuild", "invalidate"]
 
 
 def test_replay_uses_default_run_config_when_none(tmp_path: Path) -> None:

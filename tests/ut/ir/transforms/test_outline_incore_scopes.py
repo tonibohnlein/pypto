@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 import pytest
-from pypto import ir, passes
+from pypto import DataType, ir, passes
 
 
 class TestOutlineIncoreScopes:
@@ -446,7 +446,7 @@ class TestOutlineIncoreScopes:
             ) -> pl.Tensor[[16, 128], pl.FP32]:
                 tile = pl.tile.full([16, 128], dtype=pl.FP32, value=0.0)
                 buf_store: pl.Tensor[[16, 128], pl.FP32] = pl.store(tile, [0, 0], buf)
-                return buf_store
+                return buf
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
@@ -493,7 +493,7 @@ class TestOutlineIncoreScopes:
                 tile_b = pl.tile.full([16, 1], dtype=pl.FP32, value=0.0)
                 buf_a_store: pl.Tensor[[16, 128], pl.FP32] = pl.store(tile_a, [0, 0], buf_a)
                 buf_b_store: pl.Tensor[[16, 1], pl.FP32] = pl.store(tile_b, [0, 0], buf_b)
-                return (buf_b_store, buf_a_store)
+                return (buf_b, buf_a)
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
@@ -515,7 +515,8 @@ class TestOutlineIncoreScopes:
 
         Regression test for issue #1462. Each scope writing the shared store
         target ``out`` is outlined into a function that takes it as a parameter
-        and returns a fresh renamed value (``out -> out_v1 -> out_v2 -> ...``).
+        and returns that param; the call site still binds a fresh renamed value
+        (``out -> out_v1 -> out_v2 -> ...``).
         ScopeOutliner must keep every reference consistent:
 
         - the outlined body's store use-site must resolve to that function's
@@ -600,7 +601,7 @@ class TestOutlineIncoreScopes:
                 for j, (inner,) in pl.range(2, init_values=(acc,)):
                     updated: pl.Tensor[[64], pl.FP32] = pl.add(inner, y)
                     inner_rv = pl.yield_(updated)
-                return inner_rv
+                return acc
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(
@@ -689,7 +690,7 @@ class TestOutlineIncoreScopes:
                 self, dst: pl.InOut[pl.Tensor[[64], pl.FP32]], src: pl.Tensor[[32], pl.FP32]
             ) -> pl.Tensor[[64], pl.FP32]:
                 updated: pl.Tensor[[64], pl.FP32] = pl.assemble(dst, src, [0])
-                return updated
+                return dst
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(
@@ -849,6 +850,51 @@ class TestOutlineSubmitTaskId:
         After = passes.outline_incore_scopes()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_outline_deps_only_scope_emits_submit(self):
+        """A ``deps=[tid0]`` scope WITHOUT ``as tid`` still outlines to an ``ir.Submit``.
+
+        The second scope consumes ``tid0`` via ``deps=[...]`` but does not bind
+        a TaskId of its own. The outliner must still emit an ``ir.Submit`` (not
+        a plain Call): its first-class ``deps_`` carries the single ``tid0``
+        edge, and the return type is augmented with the trailing
+        ``Scalar[TASK_ID]`` — the synthesized TaskId name is internal, so only
+        kind/deps/type-shape are asserted (no exact tid name).
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP) as tid0:
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[tid0]):
+                    z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
+                return z
+
+        Before = passes.convert_to_ssa()(Before)
+        After = passes.outline_incore_scopes()(Before)
+
+        submits: list[ir.Submit] = []
+
+        class _Collector(ir.IRVisitor):
+            def visit_submit(self, op):
+                submits.append(op)
+                super().visit_submit(op)
+
+        _Collector().visit_program(After)
+
+        # Both scopes outline to Submits; the deps-only scope is the second.
+        assert len(submits) == 2
+        call = submits[1]
+        assert isinstance(call, ir.Submit)
+        assert len(call.deps) == 1
+        assert call.op.name == "main_incore_1"
+        # Return type carries the trailing Scalar[TASK_ID].
+        assert isinstance(call.type, ir.TupleType)
+        tail = call.type.types[-1]
+        assert isinstance(tail, ir.ScalarType)
+        assert tail.dtype == DataType.TASK_ID
+
 
 class TestOutlineSpmdScope:
     """InCore scopes nested inside a ``SpmdScopeStmt`` are outlined, wrapper kept.
@@ -865,8 +911,8 @@ class TestOutlineSpmdScope:
         """The inner InCore body is outlined; the SpmdScope wrapper survives.
 
         The scope body writes ``out`` via ``tile.store``, so ``out`` is a store
-        target: it becomes an ``InOut`` callee param and a returned (renamed)
-        value (``out_v1`` -> ``out_store``), mirroring
+        target: it becomes an ``InOut`` callee param and the outlined function
+        returns the param itself (param-writeback alias return), mirroring
         ``test_outline_scope_with_store_only_outputs``.
         """
 
@@ -897,7 +943,7 @@ class TestOutlineSpmdScope:
                 t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
                 out_v1: pl.Tensor[[512, 128], pl.FP32] = pl.store(t, [offset, 0], out)
                 out_store: pl.Tensor[[512, 128], pl.FP32] = out_v1
-                return out_store
+                return out
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(
@@ -1055,7 +1101,7 @@ class TestSplitIncoreOrchVerifier:
                 ):
                     x4: pl.Tensor[[64], pl.FP32] = pl.add(xi, 2.0)
                     xrv = pl.yield_(x4)
-                return xrv
+                return x
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:

@@ -26,6 +26,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <typeindex>
 #include <unordered_map>
@@ -434,6 +435,23 @@ class OpRegistryEntry {
   /// explicitly call not_inplace_safe() during registration.
   [[nodiscard]] bool IsInplaceSafe() const { return is_inplace_safe_; }
 
+  /// Mark input argument `arg_index` as one whose buffer must NOT be reused as
+  /// this op's output buffer. Unlike not_inplace_safe() (which forbids the
+  /// output aliasing ANY still-live input), this targets a *specific* operand
+  /// that the op reads while writing its output, so aliasing the output with it
+  /// corrupts results even though the op is otherwise in-place-safe — e.g.
+  /// tile.sel's mask (and tmp scratch), which the TSEL intrinsic reads while
+  /// writing dst. MemoryReuse consults this to forbid the output from landing
+  /// on such an operand's buffer.
+  inline OpRegistryEntry& forbid_output_alias(size_t arg_index) {
+    forbid_output_alias_args_.insert(arg_index);
+    return *this;
+  }
+
+  /// Input argument indices whose buffer the output must not alias. Empty for
+  /// most ops (see forbid_output_alias()).
+  [[nodiscard]] const std::set<size_t>& ForbidOutputAliasArgs() const { return forbid_output_alias_args_; }
+
   /// Declare which core executes this op. When unset, ClassifyCallAffinity
   /// derives the affinity from the op's memory spec (output memory space, or
   /// first tile input memory space for view/store ops). Use this for ops
@@ -462,6 +480,21 @@ class OpRegistryEntry {
   [[nodiscard]] std::optional<core_affinity::CrossCoreRole> GetCrossCoreRole() const {
     return cross_core_role_;
   }
+
+  inline OpRegistryEntry& set_internal_only(bool value = true) {
+    internal_only_ = value;
+    return *this;
+  }
+
+  [[nodiscard]] bool IsInternalOnly() const { return internal_only_; }
+
+  inline OpRegistryEntry& set_template_dir(std::string template_dir) {
+    CHECK(!template_dir_.has_value()) << "Operator '" << name_ << "' template_dir is already set";
+    template_dir_ = std::move(template_dir);
+    return *this;
+  }
+
+  [[nodiscard]] const std::optional<std::string>& GetTemplateDir() const { return template_dir_; }
 
  private:
   void EnsureMemorySpec() {
@@ -496,8 +529,11 @@ class OpRegistryEntry {
       deduce_type_;                               ///< Type deduction function
   std::optional<OpMemorySpaceSpec> memory_spec_;  ///< Memory space specification
   bool is_inplace_safe_{true};  ///< Whether the op supports in-place execution (src == dst buffer)
+  std::set<size_t> forbid_output_alias_args_;  ///< Input args whose buffer the output must not reuse
   std::optional<core_affinity::CoreAffinity> core_affinity_;     ///< Explicit core-affinity override
   std::optional<core_affinity::CrossCoreRole> cross_core_role_;  ///< Cross-core role (for predicates)
+  bool internal_only_{false};                                    ///< True for compiler-created ops only.
+  std::optional<std::string> template_dir_;                      ///< Package resource for builtin templates.
 };
 
 /**
@@ -567,6 +603,41 @@ class OpRegistry {
                                const std::vector<std::pair<std::string, std::any>>& kwargs, Span span) const;
 
   /**
+   * @brief Create a Call expression from user-facing parser/binding paths.
+   *
+   * Unlike compiler-internal ``Create`` calls, this path rejects operators
+   * marked ``internal_only`` so builtin implementation details cannot be
+   * reached by spelling their registry name in user code.
+   */
+  [[nodiscard]] CallPtr CreateUserFacing(const std::string& op_name, const std::vector<ExprPtr>& args,
+                                         Span span) const;
+
+  /**
+   * @brief Create a user-facing Call expression with kwargs.
+   */
+  [[nodiscard]] CallPtr CreateUserFacing(const std::string& op_name, const std::vector<ExprPtr>& args,
+                                         const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                         Span span) const;
+
+  /**
+   * @brief Create a Call expression for a compiler-internal operator.
+   *
+   * This explicit spelling is intended for passes that synthesize operators
+   * marked ``internal_only``. User-facing bindings and parser helpers must keep
+   * using ``CreateUserFacing`` so internal builtin ops cannot be reached by
+   * name.
+   */
+  [[nodiscard]] CallPtr CreateInternal(const std::string& op_name, const std::vector<ExprPtr>& args,
+                                       Span span) const;
+
+  /**
+   * @brief Create a compiler-internal Call expression with kwargs.
+   */
+  [[nodiscard]] CallPtr CreateInternal(const std::string& op_name, const std::vector<ExprPtr>& args,
+                                       const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                       Span span) const;
+
+  /**
    * @brief Check if an operator is registered
    *
    * @param op_name Name of the operator
@@ -609,6 +680,10 @@ class OpRegistry {
  private:
   OpRegistry() = default;
   ~OpRegistry() = default;
+
+  [[nodiscard]] CallPtr CreateImpl(const std::string& op_name, const std::vector<ExprPtr>& args,
+                                   const std::vector<std::pair<std::string, std::any>>& kwargs, Span span,
+                                   bool allow_internal) const;
 
   std::unordered_map<std::string, OpRegistryEntry> registry_;
 };

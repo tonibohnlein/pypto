@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-Decomposes composite tile ops into compositions of primitive arithmetic tile ops, so codegen never has to emit a high-level intrinsic. Today only `tile.sin` / `tile.cos` are handled; new composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
+Decomposes composite tile / distributed ops into compositions of primitive ops, so codegen never has to emit a high-level intrinsic. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner) and `pld.tensor.allreduce` (4-phase notify / wait / remote_load / store). New composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
 
 ## Overview
 
@@ -28,16 +28,19 @@ The pass is a single translation unit, `src/ir/transforms/lower_composite_ops_pa
 
 ```text
 src/ir/transforms/lower_composite_ops_pass.cpp
-  LoweringBuilder           — per-call scratchpad (Bind + primitive op builders)
-  CompositeLoweringFn       — (args, span, builder) -> result expr
-  Lower<Op>Rule             — one rule function per composite op (e.g. LowerSinRule, LowerCosRule)
+  LoweringBuilder           — per-call scratchpad (Bind + primitive op builders
+                              + structured control-flow: EmitFor / EmitForReduce
+                              / EmitIf / EmitIfExpr + NotEq scalar guard)
+  CompositeLoweringFn       — (call, visited_args, builder) -> result expr
+  Lower<Op>Rule             — one rule function per composite op (LowerSinRule,
+                              LowerCosRule, LowerTensorAllReduceRule, ...)
   LookupCompositeRule       — file-local op-name → rule dispatch table (kRules)
   LowerCompositeOpsMutator  — walks the function, looks up a rule per Call
 ```
 
 Adding a new composite op (all edits stay in `lower_composite_ops_pass.cpp`):
 
-1. Write a `Lower<Op>Rule(args, span, builder)` function. It receives the visited arg expressions, a `Span`, and a `LoweringBuilder` whose `Bind` helper appends an `AssignStmt` for each intermediate temp.
+1. Write a `Lower<Op>Rule(call, args, builder)` function. It receives the original `CallPtr` (use `call->span_`, `call->kwargs_`, `call->op_->name_` as needed), the visited arg expressions (var-remap already applied), and a `LoweringBuilder` whose `Bind` helper appends an `AssignStmt` per intermediate temp. For rules that need control flow, use `builder.EmitFor` / `builder.EmitForReduce` / `builder.EmitIf` / `builder.EmitIfExpr` — each takes a body callback that receives a nested builder sharing the same temp counter, so emitted temps stay uniquely named regardless of nesting depth. `LowerTensorAllReduceRule` is the canonical example of a control-flow-bearing rule (4-phase notify / wait / remote_load+accumulate / store).
 2. Add a `{"<op>", &Lower<Op>Rule}` row to `kRules` inside `LookupCompositeRule`.
 
 No edits to the mutator are needed. When the table grows past a handful of entries — or a rule wants its own translation unit — promote it back to a standalone registry under `src/ir/transforms/composite_ops/`.
@@ -178,6 +181,14 @@ All constants are FP32 literals (the `k*` literals near the top of `src/ir/trans
 ## Idempotency
 
 Running `LowerCompositeOps` twice produces identical IR after the first run: the recipe emits only primitive ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and the mutator only rewrites `tile.sin` / `tile.cos` `Call`s, so the second invocation visits the body and changes nothing. This is verified by `test_sin_lowering_is_idempotent` and `test_cos_lowering_is_idempotent` in `tests/ut/ir/transforms/test_lower_composite_ops.py`.
+
+## `pld.tensor.allreduce` — signal buffer is single-shot per call
+
+The allreduce rule decomposes one composite call into two cross-rank barriers reusing the same `signal` cells: Phase 2a `Set 1` + Phase 2b `wait ≥1`, then Phase 3.5a `AtomicAdd 1` + Phase 3.5b `wait ≥2`. By the time the call returns, every cell sits at `2` rather than its initial `0`.
+
+**Signal buffers must NOT be reused for back-to-back allreduce calls.** A stale `2` in any cell would let the next call's Phase 2b `wait ≥1` pass immediately on the leftover value, breaking the barrier and racing the next Phase 3 reads against the previous reduction's Phase 4 writes. Callers issuing multiple allreduces must allocate a fresh signal buffer (via `alloc_window_buffer` + `window`) for each call. The user-facing DSL docstring at `python/pypto/language/distributed/op/tensor_ops.py::allreduce` carries the same warning.
+
+`kGe` (not `kEq`) is the load-bearing choice for both wait predicates. The cell is monotonically increasing within a single call, but a slow rank's first poll may already see the cell past `1` if a faster peer has completed Phase 3 (microseconds-long remote loads) and started Phase 3.5a. `kEq(==1)` would then deadlock; `kGe(≥1)` does not. The hand-written reference at `tests/st/distributed/test_l3_allreduce.py` uses `Ge(1)` for the same reason. A self-resetting variant (Set 0 / Eq 0 at Phase 3.5) is blocked on PTOAS issue #797.
 
 ## Implementation Notes
 

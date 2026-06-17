@@ -9,12 +9,23 @@
 
 """Tensor operations for PyPTO IR."""
 
+import math
 from collections.abc import Sequence
 from typing import Any
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import Call, ConstFloat, ConstInt, Expr, PadValue, ScalarType, Span, TensorLayout
+from pypto.pypto_core.ir import (
+    Call,
+    ConstFloat,
+    ConstInt,
+    Expr,
+    MemorySpace,
+    PadValue,
+    ScalarType,
+    Span,
+    TensorLayout,
+)
 
 from ..utils import _get_span_or_capture, _normalize_expr, _to_make_tuple, resolve_cast_mode
 from ._pad_value import normalize_pad_value
@@ -26,6 +37,7 @@ def create(
     dtype: DataType,
     layout: TensorLayout = TensorLayout.ND,
     manual_dep: bool = False,
+    init_value: int | float | None = None,
     span: Span | None = None,
 ) -> Call:
     """Create a new tensor with specified shape and dtype.
@@ -34,6 +46,14 @@ def create(
         shape: List of dimension sizes (int or Expr), or a MakeTuple
         dtype: Data type of tensor elements
         layout: Tensor layout (default: ND)
+        init_value: If given, the runtime pre-fills the freshly allocated
+            buffer with this scalar on the AICPU (via the runtime's
+            ``TensorCreateInfo::set_initial_value``) before any kernel writes
+            it. ``init_value=0`` zeroes the buffer and is valid for every
+            dtype. Non-zero values are supported for integer and 32/64-bit
+            float dtypes; non-zero fills of sub-32-bit float dtypes
+            (fp16/bf16) are rejected at codegen because the orchestration
+            translation unit has no ``half``/``bfloat16`` type to pack them.
         manual_dep: Opt this tensor out of OverlapMap auto-dep tracking
             for its **entire lifetime**. When True, codegen marks the
             ``tensor.create`` call so every task that reads or writes the
@@ -63,6 +83,24 @@ def create(
     kwargs: dict[str, Any] = {"dtype": dtype, "layout": layout}
     if manual_dep:
         kwargs["manual_dep"] = True
+    if init_value is not None:
+        # Store as float so the attr type is unambiguous (Python float -> C++
+        # double); codegen casts it back to the tensor dtype's C type. Because
+        # double only represents integers exactly up to 2**53, reject larger
+        # integer inputs instead of silently corrupting the fill value.
+        # NOTE: this module defines a ``abs`` tensor op that shadows the builtin,
+        # so use an explicit range comparison rather than ``abs(...)``.
+        if isinstance(init_value, int) and not (-(2**53) <= init_value <= 2**53):
+            raise ValueError(
+                f"create_tensor: integer init_value {init_value} exceeds the exactly-representable "
+                f"range (+/-2**53); large-magnitude integer fills are not supported. "
+                f"Use init_value=0 or a smaller value."
+            )
+        # Reject NaN/Inf here so they never reach the printer (which cannot
+        # round-trip them) or codegen (where they would emit invalid C++).
+        if not math.isfinite(init_value):
+            raise ValueError(f"create_tensor: init_value must be finite, got {init_value}.")
+        kwargs["init_value"] = float(init_value)
 
     return _ir_core.create_op_call("tensor.create", args, kwargs, actual_span)
 
@@ -1609,6 +1647,66 @@ def gather_compare(
         count_dtype=count_dtype,
         span=span,
     )
+
+
+# ============================================================================
+# Paged Gather Operation
+# ============================================================================
+
+
+def paged_gather(  # noqa: PLR0913
+    src: Expr,
+    indices: Expr,
+    block_table: Expr,
+    block_size: int,
+    size: int,
+    max_indices: int,
+    *,
+    space: MemorySpace = MemorySpace.Mat,
+    col_off: int = 0,
+    is_trans: bool = False,
+    is_b_matrix: bool = False,
+    span: Span | None = None,
+) -> Call:
+    """Paged gather directly into an on-chip buffer (tensor-level).
+
+    Gathers scattered rows of a 2D paged KV pool ``src`` selected by ``indices``,
+    translated through a paged ``block_table``, directly into an L1 (``space=Mat``,
+    default) or UB (``space=Vec``) tile. Lowered by ``ConvertTensorToTileOps`` to a
+    fully-scalar per-row ``GM -> on-chip`` load loop on the Cube core: the bulk KV
+    data goes straight to L1 (never UB), eliminating the GM round-trip.
+
+    Physical row resolution per logical index ``idx``::
+
+        phys = block_table[idx // block_size] * block_size + idx % block_size
+
+    Args:
+        src: Paged KV pool in GM (TensorType, 2D; FP16/BF16/FP32/INT8).
+        indices: Logical row indices to gather (TensorType, INT32; 1D ``[n]`` or 2D ``[1, n]``).
+        block_table: Page table mapping logical block -> physical block (TensorType, INT32).
+        block_size: Number of tokens per page block.
+        size: Number of elements gathered per row (<= src columns).
+        max_indices: Static upper bound on gathered rows; sizes the on-chip tile.
+        space: Destination memory space (``MemorySpace.Mat`` (L1) default, or ``MemorySpace.Vec``).
+        col_off: Column start offset within each src row (default 0).
+        is_trans: Transpose the gathered tile for matmul B-operand layout (requires ``space=Mat``).
+        is_b_matrix: Hint that the result feeds matmul as the B matrix (layout selection).
+        span: Optional source span for debugging (auto-captured if not provided).
+
+    Returns:
+        Call expression with TensorType result ``[max_indices, size]`` (or transposed).
+    """
+    actual_span = _get_span_or_capture(span)
+    kwargs: dict[str, Any] = {
+        "block_size": block_size,
+        "size": size,
+        "max_indices": max_indices,
+        "col_off": col_off,
+        "is_trans": is_trans,
+        "is_b_matrix": is_b_matrix,
+        "space": space,
+    }
+    return _ir_core.create_op_call("tensor.paged_gather", [src, indices, block_table], kwargs, actual_span)
 
 
 # ============================================================================

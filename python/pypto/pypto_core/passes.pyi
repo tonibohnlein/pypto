@@ -41,6 +41,7 @@ class IRProperty(Enum):
     InOutUseValid = ...
     PipelineLoopValid = ...
     PipelineResolved = ...
+    UnrollResolved = ...
     CallDirectionsResolved = ...
     TileTypeCoherence = ...
     InlineFunctionsEliminated = ...
@@ -50,6 +51,8 @@ class IRProperty(Enum):
     CommDomainScopesMaterialized = ...
     RuntimeScopesMaterialized = ...
     AssignTypeSymmetry = ...
+    ManualDepsOnSubmitOnly = ...
+    ReturnParamsExplicit = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -315,9 +318,6 @@ def init_mem_ref() -> Pass:
 def memory_reuse() -> Pass:
     """Create a memory reuse pass."""
 
-def legalize_pto_buffer_reuse() -> Pass:
-    """Create a PTO buffer reuse legalisation pass."""
-
 def allocate_memory_addr() -> Pass:
     """Create an allocate memory address pass."""
 
@@ -367,6 +367,21 @@ def interchange_chunk_loops() -> Pass:
 
 def unroll_loops() -> Pass:
     """Create a loop unrolling pass that expands ForKind.Unroll loops at compile time."""
+
+def skew_cross_core_pipeline() -> Pass:
+    """Create the cross-core pipeline skew pass; runs immediately before ``lower_pipeline_loops``.
+
+    For a mixed cube/vector ``pl.pipeline`` loop (``F > 1``) whose body has both a
+    cross-core ``tile.tpush_*`` and ``tile.tpop_*``: a single-round-trip producer-role
+    loop runs the producer one iteration ahead (produce(start) prologue + a
+    ``ForKind.Sequential`` steady loop pairing produce(k)/consume(k-step) +
+    consume(last) epilogue); a consumer-role or multi-round-trip loop demotes to a
+    plain ``ForKind.Sequential`` loop (order-preserving — cross-core overlap comes
+    from the peer's producer skew). The output is Sequential with no
+    ``pipeline_stages`` marker, so ``lower_pipeline_loops`` and ``canonicalize_io_order``
+    leave it untouched. Non-cross-core pipeline loops are left intact for
+    ``lower_pipeline_loops``.
+    """
 
 def lower_pipeline_loops() -> Pass:
     """Create a tile-level lowering pass for ``pl.pipeline(N, stage=F)`` loops.
@@ -554,11 +569,12 @@ def auto_derive_task_dependencies(analyze_auto_scopes: bool = False) -> Pass:
 
     Runs after :func:`derive_call_directions` and writes
     ``Call.attrs['compiler_manual_dep_edges']`` for RAW/WAR/WAW hazards inside
-    manual runtime scopes. AUTO scopes are skipped by default. Pass
-    ``analyze_auto_scopes=True`` to analyze them without changing their runtime
-    scope mode; unanalyzable hazards fall back to AUTO tracking with partial
-    compiler deps stripped. User-written ``deps=[...]`` entries remain under
-    ``Call.attrs['manual_dep_edges']``.
+    analyzed AUTO runtime scopes. User-written manual runtime scopes are skipped.
+    AUTO scopes are skipped by default; pass ``analyze_auto_scopes=True`` to
+    analyze them without changing their runtime scope mode. Unanalyzable hazards
+    keep AUTO tracking with partial compiler deps stripped. User-written
+    ``deps=[...]`` entries stay in ``Submit::deps_``, preserving the
+    ``ManualDepsOnSubmitOnly`` invariant for codegen.
     """
 
 def expand_manual_phase_fence() -> Pass:
@@ -597,6 +613,9 @@ def materialize_comm_domain_scopes() -> Pass:
     Runs immediately after :func:`inline_functions` — L2 orchestrations are
     never inlined into L3, so the dispatch chain survives inlining.
     """
+
+def lower_host_tensor_collectives() -> Pass:
+    """Lower host-level ``pld.tensor.allreduce`` calls to builtin collective dispatches."""
 
 def materialize_runtime_scopes() -> Pass:
     """Materialize implicit orchestration scopes as explicit RuntimeScopeStmt nodes.
@@ -753,7 +772,6 @@ __all__ = [
     "PassPipeline",
     "init_mem_ref",
     "memory_reuse",
-    "legalize_pto_buffer_reuse",
     "allocate_memory_addr",
     "fuse_create_assemble_to_slice",
     "fold_no_op_reshape",
@@ -799,6 +817,7 @@ __all__ = [
     "create_function_pass",
     "create_program_pass",
     "stmt_dependency_analysis",
+    "skew_cross_core_pipeline",
     "lower_pipeline_loops",
     "canonicalize_io_order",
 ]

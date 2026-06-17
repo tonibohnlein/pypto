@@ -106,6 +106,52 @@ class _ParamInfo:
     dtype: DataType
 
 
+# Reverse map ``str(DataType) -> DataType`` for JSON round-tripping (e.g. the L3
+# ``distributed_meta.json`` consumed by ``DistributedCompiledProgram.from_dir``).
+# ``DataType`` is a non-singleton nanobind type, so reconstruction goes through
+# the canonical string (``str(DataType.FP32) == "fp32"``) rather than identity.
+# Built from the named constants exposed on ``DataType`` so it tracks the C++
+# enum without a hand-maintained literal table.
+_STR_TO_DATATYPE: dict[str, DataType] = {}
+for _dt_name in (
+    "BOOL", "INT4", "INT8", "INT16", "INT32", "INT64", "UINT4", "UINT8", "UINT16",
+    "UINT32", "UINT64", "FP4", "FP8E4M3FN", "FP8E5M2", "FP16", "FP32", "BF16",
+    "HF4", "HF8", "INDEX", "TASK_ID",
+):  # fmt: skip
+    _dt = getattr(DataType, _dt_name, None)
+    if _dt is not None:
+        _STR_TO_DATATYPE[str(_dt)] = _dt
+del _dt_name, _dt
+
+
+def _datatype_from_string(s: str) -> DataType:
+    """Reconstruct a :class:`DataType` from its ``str()`` form (e.g. ``"fp32"``)."""
+    dt = _STR_TO_DATATYPE.get(s)
+    if dt is None:
+        raise ValueError(f"Unknown DataType string {s!r}; known: {sorted(_STR_TO_DATATYPE)}")
+    return dt
+
+
+def _param_info_to_dict(info: _ParamInfo) -> dict[str, Any]:
+    """Serialise a :class:`_ParamInfo` to a JSON-safe dict (see :func:`_param_info_from_dict`)."""
+    return {
+        "name": info.name,
+        "direction": info.direction.name,
+        "shape": info.shape,
+        "dtype": str(info.dtype),
+    }
+
+
+def _param_info_from_dict(d: dict[str, Any]) -> _ParamInfo:
+    """Reconstruct a :class:`_ParamInfo` from :func:`_param_info_to_dict` output."""
+    return _ParamInfo(
+        name=d["name"],
+        direction=getattr(ParamDirection, d["direction"]),
+        shape=d["shape"],
+        dtype=_datatype_from_string(d["dtype"]),
+    )
+
+
 def _extract_func_param_infos(func: Function) -> tuple[list[_ParamInfo], list[int], list[Any]]:
     """Extract parameter metadata from a specific IR function.
 
@@ -496,6 +542,55 @@ class CompiledProgram:
     def platform(self) -> str:
         """Target execution platform (e.g. ``"a2a3sim"``, ``"a5"``)."""
         return self._platform
+
+    # --- Pre-runtime IR validation -------------------------------------------
+
+    def validate_ir(
+        self,
+        tensors: dict[str, torch.Tensor],
+        expected: dict[str, torch.Tensor],
+        *,
+        rtol: float = 5e-2,
+        atol: float = 5e-2,
+    ) -> None:
+        """Re-run ``torch_codegen`` on each dumped pass IR and numerically
+        compare against golden outputs.
+
+        This gives per-pass correctness checking before ever touching the
+        device: each ``passes_dump/`` file is re-executed via
+        :func:`pypto.debug.torch_codegen` and compared to *expected*.
+
+        Requires the program to have been compiled with ``dump_passes=True``
+        (the default), which produces ``<output_dir>/passes_dump/``.
+
+        Args:
+            tensors: Input tensors for executing generated functions, keyed
+                by function parameter name.
+            expected: Golden output tensors keyed by tensor name.
+            rtol: Relative tolerance forwarded to ``torch.allclose``.
+            atol: Absolute tolerance forwarded to ``torch.allclose``.
+
+        Raises:
+            FileNotFoundError: If no ``passes_dump/`` directory exists
+                (i.e. compiled with ``dump_passes=False``).
+            AssertionError: If any pass IR's numeric result diverges from
+                *expected*.
+
+        Example:
+            >>> compiled = ir.compile(MyProgram)        # dump_passes=True
+            >>> compiled.validate_ir(inputs, expected)  # per-pass check
+        """
+        # Lazy import keeps the core ir layer free of a debug-layer
+        # dependency at import time.
+        from pypto.debug import validate_pass_ir_codegen_results  # noqa: PLC0415
+
+        passes_dump = self._output_dir / "passes_dump"
+        if not passes_dump.is_dir():
+            raise FileNotFoundError(
+                f"No passes_dump/ under {self._output_dir}. "
+                "Compile with dump_passes=True to enable IR validation."
+            )
+        validate_pass_ir_codegen_results(str(passes_dump), tensors, expected, rtol=rtol, atol=atol)
 
     # --- Runtime artefacts (lazy) --------------------------------------------
     #

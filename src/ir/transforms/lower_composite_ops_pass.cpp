@@ -11,7 +11,9 @@
 
 #include <any>
 #include <cstddef>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -19,9 +21,11 @@
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
@@ -31,6 +35,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -46,6 +51,13 @@ namespace {
 // result ``ExprPtr``; the mutator wraps that result in the original target
 // ``Var`` (or a fresh result ``Var`` for ``ReturnStmt`` calls) before splicing
 // the accumulated statements into the surrounding sequence.
+//
+// In addition to ``Bind`` and the primitive op builders, the builder exposes
+// structured control-flow constructors — ``EmitFor`` / ``EmitForReduce`` /
+// ``EmitIf`` / ``EmitIfExpr`` — that hand the body off to a nested builder
+// callback. The nested builder shares this builder's temp counter so every
+// emitted temp gets a unique name across the entire rule, regardless of
+// nesting depth.
 //
 // The temp counter is borrowed from the mutator so distinct composite-op calls
 // in the same function get distinct temp names.
@@ -95,6 +107,119 @@ class LoweringBuilder {
     return OpRegistry::GetInstance().Create("tile.cast", {x}, kw, span);
   }
 
+  // ---- Scalar comparison helpers (yield BOOL-typed expressions, suitable as
+  //      IfStmt conditions or loop guards). Delegated to the scalar_expr
+  //      Make* helpers so operand promotion stays consistent with parser
+  //      output.
+  ExprPtr NotEq(const ExprPtr& left, const ExprPtr& right, const Span& span) {
+    return MakeNe(left, right, span);
+  }
+
+  // ---- Structured control-flow constructors ----
+  //
+  // Each method takes a body callback that receives a freshly-constructed
+  // nested ``LoweringBuilder`` scoped to the body region. The callback emits
+  // its body via the nested builder; this builder then drains the nested
+  // stmts, wraps them in a ``SeqStmts`` (when there is more than one), and
+  // emits the resulting ``ForStmt`` / ``IfStmt`` against its own ``stmts_``.
+  //
+  // The nested builder shares this builder's ``temp_counter_`` reference so
+  // emitted temp names stay unique across the entire rule regardless of
+  // nesting depth.
+
+  /// Emit a side-effect-only ``for`` loop:
+  ///
+  ///     for loop_var in range(start, stop, step):
+  ///         <body_fn-produced stmts>
+  ///
+  /// ``body_fn`` receives a fresh body builder and the freshly-created loop
+  /// variable. The callback's return value is discarded — use this overload
+  /// for loops whose only purpose is side effects (e.g. issuing notify /
+  /// wait sequences).
+  void EmitFor(const std::string& loop_var_name, const ExprPtr& start, const ExprPtr& stop,
+               const ExprPtr& step, const std::function<void(LoweringBuilder&, const VarPtr&)>& body_fn,
+               const Span& span) {
+    auto loop_var = std::make_shared<Var>(MakeTempName(loop_var_name), start->GetType(), span);
+    LoweringBuilder body_builder(base_name_, temp_counter_);
+    body_fn(body_builder, loop_var);
+    auto body_stmt = WrapBodyStmts(body_builder.TakeStmts(), span);
+    stmts_.push_back(std::make_shared<ForStmt>(loop_var, start, stop, step, std::vector<IterArgPtr>{},
+                                               body_stmt, std::vector<VarPtr>{}, span));
+  }
+
+  /// Emit a reducing ``for`` loop with one loop-carried accumulator. The
+  /// body callback receives a nested builder, the loop variable, and the
+  /// accumulator (typed via ``init_value``); it returns the next iteration's
+  /// accumulator value. The method returns an expression holding the
+  /// post-loop accumulator, ready to feed into subsequent ops.
+  ExprPtr EmitForReduce(const std::string& loop_var_name, const ExprPtr& start, const ExprPtr& stop,
+                        const ExprPtr& step, const ExprPtr& init_value,
+                        const std::function<ExprPtr(LoweringBuilder&, const VarPtr&, const VarPtr&)>& body_fn,
+                        const Span& span) {
+    auto loop_var = std::make_shared<Var>(MakeTempName(loop_var_name), start->GetType(), span);
+    auto iter_arg = std::make_shared<IterArg>(MakeTempName(loop_var_name + "_acc"), init_value->GetType(),
+                                              init_value, span);
+    LoweringBuilder body_builder(base_name_, temp_counter_);
+    ExprPtr yield_val = body_fn(body_builder, loop_var, iter_arg);
+    INTERNAL_CHECK_SPAN(yield_val, span)
+        << "EmitForReduce body_fn must return the next iteration's accumulator value";
+    body_builder.stmts_.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{yield_val}, span));
+    auto body_stmt = WrapBodyStmts(body_builder.TakeStmts(), span);
+    auto return_var =
+        std::make_shared<Var>(MakeTempName(loop_var_name + "_final"), init_value->GetType(), span);
+    stmts_.push_back(std::make_shared<ForStmt>(loop_var, start, stop, step, std::vector<IterArgPtr>{iter_arg},
+                                               body_stmt, std::vector<VarPtr>{return_var}, span));
+    return return_var;
+  }
+
+  /// Emit a side-effect-only ``if`` statement:
+  ///
+  ///     if cond:
+  ///         <then_fn stmts>
+  ///     [else:
+  ///         <else_fn stmts>]
+  ///
+  /// Pass ``nullptr`` for ``else_fn`` when there is no else branch.
+  void EmitIf(const ExprPtr& cond, const std::function<void(LoweringBuilder&)>& then_fn,
+              const std::function<void(LoweringBuilder&)>& else_fn, const Span& span) {
+    LoweringBuilder then_builder(base_name_, temp_counter_);
+    then_fn(then_builder);
+    auto then_body = WrapBodyStmts(then_builder.TakeStmts(), span);
+
+    std::optional<StmtPtr> else_body = std::nullopt;
+    if (else_fn) {
+      LoweringBuilder else_builder(base_name_, temp_counter_);
+      else_fn(else_builder);
+      else_body = WrapBodyStmts(else_builder.TakeStmts(), span);
+    }
+    stmts_.push_back(std::make_shared<IfStmt>(cond, then_body, else_body, std::vector<VarPtr>{}, span));
+  }
+
+  /// Emit a value-producing ``if`` statement. Both branches must yield a
+  /// value (via their body_fn's ExprPtr return); the method returns an
+  /// expression holding the chosen value, ready to feed into subsequent ops.
+  ExprPtr EmitIfExpr(const ExprPtr& cond, const std::function<ExprPtr(LoweringBuilder&)>& then_fn,
+                     const std::function<ExprPtr(LoweringBuilder&)>& else_fn, const Span& span) {
+    INTERNAL_CHECK_SPAN(then_fn && else_fn, span)
+        << "EmitIfExpr requires both then_fn and else_fn (the if must yield a value on every path)";
+    LoweringBuilder then_builder(base_name_, temp_counter_);
+    ExprPtr then_val = then_fn(then_builder);
+    INTERNAL_CHECK_SPAN(then_val, span) << "EmitIfExpr then_fn must return the yielded value";
+    then_builder.stmts_.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{then_val}, span));
+    auto then_body = WrapBodyStmts(then_builder.TakeStmts(), span);
+
+    LoweringBuilder else_builder(base_name_, temp_counter_);
+    ExprPtr else_val = else_fn(else_builder);
+    INTERNAL_CHECK_SPAN(else_val, span) << "EmitIfExpr else_fn must return the yielded value";
+    else_builder.stmts_.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{else_val}, span));
+    auto else_body = WrapBodyStmts(else_builder.TakeStmts(), span);
+
+    auto return_var = std::make_shared<Var>(MakeTempName("if_res"), then_val->GetType(), span);
+    stmts_.push_back(std::make_shared<IfStmt>(cond, then_body, std::optional<StmtPtr>(else_body),
+                                              std::vector<VarPtr>{return_var}, span));
+    return return_var;
+  }
+
   /// Drain accumulated statements (called by the mutator after the rule
   /// returns).
   std::vector<StmtPtr> TakeStmts() { return std::move(stmts_); }
@@ -105,6 +230,15 @@ class LoweringBuilder {
                                 static_cast<int>(temp_counter_++));
   }
 
+  // Wrap a sequence of body stmts into a single StmtPtr: pass through a sole
+  // stmt, wrap multiple into a SeqStmts, and synthesise an empty SeqStmts
+  // when the body is empty (a no-op body is still a valid loop / if branch).
+  static StmtPtr WrapBodyStmts(std::vector<StmtPtr> body_stmts, const Span& span) {
+    if (body_stmts.empty()) return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, span);
+    if (body_stmts.size() == 1) return body_stmts.front();
+    return std::make_shared<SeqStmts>(std::move(body_stmts), span);
+  }
+
   std::string base_name_;
   std::size_t& temp_counter_;
   std::vector<StmtPtr> stmts_;
@@ -112,13 +246,17 @@ class LoweringBuilder {
 
 // Signature for a composite-lowering rule.
 //
+// @param call     Original composite-op Call. Rules read ``call->kwargs_``,
+//                 ``call->span_``, and ``call->op_->name_`` for diagnostics.
 // @param args     Visited operand expressions (var-remap already applied).
-// @param span     Source location of the original call.
+//                 Prefer these over ``call->args_`` so the rule sees post-
+//                 visitor expressions.
 // @param builder  Scratchpad: rule appends intermediate temps via builder.Bind
-//                 and returns the final result expression.
+//                 (and structured control-flow via EmitFor / EmitIf / ...) and
+//                 returns the final result expression.
 // @return Final result expression. The mutator binds this to the target ``Var``
 //         and splices the builder's accumulated statements before it.
-using CompositeLoweringFn = ExprPtr (*)(const std::vector<ExprPtr>& args, const Span& span,
+using CompositeLoweringFn = ExprPtr (*)(const CallPtr& call, const std::vector<ExprPtr>& args,
                                         LoweringBuilder& builder);
 
 // ============================================================================
@@ -234,14 +372,257 @@ ExprPtr LowerSinCos(const ExprPtr& x, bool is_cos, LoweringBuilder& b, const Spa
   return b.Mul(sign, t_p, span);
 }
 
-ExprPtr LowerSinRule(const std::vector<ExprPtr>& args, const Span& span, LoweringBuilder& builder) {
-  ValidateTrigArgs(args, span, "tile.sin");
-  return LowerSinCos(args[0], /*is_cos=*/false, builder, span);
+ExprPtr LowerSinRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& builder) {
+  ValidateTrigArgs(args, call->span_, "tile.sin");
+  return LowerSinCos(args[0], /*is_cos=*/false, builder, call->span_);
 }
 
-ExprPtr LowerCosRule(const std::vector<ExprPtr>& args, const Span& span, LoweringBuilder& builder) {
-  ValidateTrigArgs(args, span, "tile.cos");
-  return LowerSinCos(args[0], /*is_cos=*/true, builder, span);
+ExprPtr LowerCosRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& builder) {
+  ValidateTrigArgs(args, call->span_, "tile.cos");
+  return LowerSinCos(args[0], /*is_cos=*/true, builder, call->span_);
+}
+
+// ============================================================================
+// ``pld.tensor.allreduce`` lowering rule
+//
+// In-place all-reduce of a window-bound DistributedTensor across every rank
+// of its comm group. Expands the single composite Call into the 4-phase
+// decomposition validated by the hand-written reference in
+// ``tests/st/distributed/test_l3_allreduce.py`` (``reduce_step``):
+//
+//   Phase 2a: for peer in 0..nranks:
+//               if peer != my_rank:
+//                 pld.system.notify(signal, peer, [my_rank, 0], 1, op=AtomicAdd)
+//   Phase 2b: for src  in 0..nranks:
+//               if src != my_rank:
+//                 pld.system.wait(signal, [src, 0], 1, cmp=Ge)
+//   Phase 3 : acc = tile.load(target, [0..], shape)
+//             for peer in 0..nranks:
+//               if peer != my_rank:
+//                 recv = pld.tile.remote_load(target, peer, [0..], shape)
+//                 acc = tile.add(acc, recv)
+//               else:
+//                 acc = acc
+//   Phase 4 : tile.store(acc, [0..], target)
+//
+// The loop bound ``nranks`` is read at runtime via
+// ``pld.system.nranks(pld.system.get_comm_ctx(target))`` so the lowering does
+// not depend on CommGroup materialisation (which runs later in the pipeline).
+// First-version implementation: ``ReduceOp::kSum`` only — the deducer rejects
+// other variants before the rule is invoked, so the rule asserts that
+// invariant rather than dispatching.
+//
+// The Call's source-level form is the in-place rebind idiom shared with
+// ``pl.store``:
+//
+//     pub = pld.tensor.allreduce(pub, sig, op=pld.ReduceOp.Sum)
+//
+// so the rule returns the (post-reduce) ``target`` ExprPtr and lets the
+// mutator bind it to the AssignStmt's LHS Var.
+// ============================================================================
+
+namespace {
+
+// Build the signal-slot offset tuple ``[rank_expr, 0]``. The signal matrix is
+// shape ``[nranks, 1]`` so two elements is sufficient. Allreduce-specific —
+// the generic zero-offset / shape-tuple builders live in
+// ``tile_conversion_utils``.
+ExprPtr MakeSignalOffsets(const ExprPtr& rank_expr, const Span& span) {
+  std::vector<ExprPtr> elements = {rank_expr, std::make_shared<ConstInt>(0, DataType::INDEX, span)};
+  return std::make_shared<MakeTuple>(std::move(elements), span);
+}
+
+}  // namespace
+
+ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
+  const Span& span = call->span_;
+  // Deducer already enforces these — re-assert as internal invariants so the
+  // rule body can use direct indexing without further bounds / kind checks.
+  INTERNAL_CHECK_SPAN(args.size() == 2, span)
+      << "pld.tensor.allreduce rule expects 2 args, got " << args.size();
+  const auto& target = args[0];
+  const auto& signal = args[1];
+  auto target_type = As<DistributedTensorType>(target->GetType());
+  INTERNAL_CHECK_SPAN(target_type, span)
+      << "pld.tensor.allreduce target must be DistributedTensorType (deducer-rejected otherwise)";
+
+  // First-version constraint — Max / Min / Prod lowerings not yet implemented.
+  auto op_value = GetRequiredKwarg<int>(call->kwargs_, "op", "pld.tensor.allreduce");
+  INTERNAL_CHECK_SPAN(op_value == static_cast<int>(ReduceOp::kSum), span)
+      << "pld.tensor.allreduce lowering supports ReduceOp::kSum only (got int " << op_value
+      << ") — deducer should have rejected this";
+
+  const std::size_t ndim = target_type->shape_.size();
+
+  // ---- Pre-build expressions shared across phases ----
+  auto& reg = OpRegistry::GetInstance();
+  auto ctx = b.Bind("ctx", reg.Create("pld.system.get_comm_ctx", {target}, {}, span), span);
+  // nranks comes back as ScalarType(INT32) from pld.system.nranks; cast to
+  // INDEX so it can serve as the for-loop stop bound alongside INDEX-typed
+  // start/step constants — matches the parser's `pl.range(int)` convention
+  // (Python ints normalise to INDEX via `_to_make_tuple`/`_normalize_expr`).
+  auto nranks_i32 = b.Bind("nranks", reg.Create("pld.system.nranks", {ctx}, {}, span), span);
+  auto nranks_idx = b.Bind("nranks_idx", std::make_shared<Cast>(nranks_i32, DataType::INDEX, span), span);
+  auto my_rank = b.Bind("my_rank", reg.Create("pld.system.rank", {ctx}, {}, span), span);
+
+  // Loop bounds: INDEX (must agree across start/stop/step). Notify's `value`
+  // and wait's `expected` are INT32 per the Python builder's int_dtype
+  // override — keep separate constants for those distinct slots.
+  //
+  // Signal scheme: hybrid Set / AtomicAdd, both waits use ``WaitCmp::kGe``.
+  // Phase 2a uses ``Set value=1`` (race-free: each cell has exactly one
+  // writer, the corresponding peer); Phase 2b waits for ``>= 1``. Phase 3.5
+  // uses ``AtomicAdd 1`` for the post-reduce barrier (cell 1 → 2) with wait
+  // for ``>= 2``.
+  //
+  // ``kGe`` (not ``kEq``) is load-bearing. The cell is monotonically
+  // increasing within a single call, but the observer (the waiting rank)
+  // is NOT guaranteed to read each intermediate value: if a faster peer
+  // races ahead — e.g. rank A pauses between its own Phase 2a and 2b
+  // while rank B completes 2a, 2b, the full Phase 3 (remote loads,
+  // microseconds), and Phase 3.5a — then by the time A polls its
+  // cell[B], it has already been advanced from 1 (B's 2a Set) to 2
+  // (B's 3.5a AtomicAdd). ``kEq(==1)`` would never unblock; ``kGe(>=1)``
+  // does. The hand-written reference at
+  // ``tests/st/distributed/test_l3_allreduce.py`` uses ``Ge(1)`` for
+  // exactly this reason and survives the same race window.
+  //
+  // The cells end the call at 2, so the buffer is **not reusable** across
+  // multiple allreduce calls without per-call reallocation — a stale ``2``
+  // would let the next call's ``Ge(1)`` Phase 2b pass before any peer
+  // notifies, breaking the barrier. The symmetric ``Set value=0`` reset
+  // path would let the buffer self-clear, but on-board ``TWAIT(==0)`` did
+  // not unblock reliably in our trials (P=4 deadlocked on AICPU stream
+  // sync — see PTOAS issue #797). Until that runtime path is verified,
+  // callers needing back-to-back allreduces must allocate a fresh signal
+  // buffer per call. The user-facing DSL docstring repeats this contract.
+  auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+  auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+  auto one_i32 = std::make_shared<ConstInt>(1, DataType::INT32, span);
+  auto two_i32 = std::make_shared<ConstInt>(2, DataType::INT32, span);
+  auto zero_offsets = tile_conversion_utils::MakeZeroOffsets(ndim, span);
+  auto shape_tuple = tile_conversion_utils::MakeShapeTuple(target_type->shape_, span);
+  auto my_signal_offsets = MakeSignalOffsets(my_rank, span);
+
+  // ---- Phase 2a: notify all peers (Set cell[my_rank, 0] on each peer to 1) ----
+  b.EmitFor(
+      "peer", zero_idx, nranks_idx, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& peer) {
+        body.EmitIf(
+            body.NotEq(peer, my_rank, span),
+            [&](LoweringBuilder& then_body) {
+              auto notify_call = OpRegistry::GetInstance().Create(
+                  "pld.system.notify", {signal, peer, my_signal_offsets, one_i32},
+                  {{"op", static_cast<int>(NotifyOp::kSet)}}, span);
+              then_body.Bind("notify_ret", notify_call, span);
+            },
+            /*else_fn=*/nullptr, span);
+      },
+      span);
+
+  // ---- Phase 2b: wait on every peer's signal slot (cell[src, 0] >= 1) ----
+  b.EmitFor(
+      "src", zero_idx, nranks_idx, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& src) {
+        // signal_offsets = [src, 0] — must be built per-iteration since
+        // src is the loop variable.
+        auto src_signal_offsets = MakeSignalOffsets(src, span);
+        body.EmitIf(
+            body.NotEq(src, my_rank, span),
+            [&](LoweringBuilder& then_body) {
+              auto wait_call =
+                  OpRegistry::GetInstance().Create("pld.system.wait", {signal, src_signal_offsets, one_i32},
+                                                   {{"cmp", static_cast<int>(WaitCmp::kGe)}}, span);
+              then_body.Bind("wait_ret", wait_call, span);
+            },
+            /*else_fn=*/nullptr, span);
+      },
+      span);
+
+  // ---- Phase 3: acc = load(target); for peer != my_rank: acc += remote_load(peer) ----
+  // tile.load needs the valid_shapes arg (same as shapes when omitted) plus
+  // target_memory / transpose kwargs — mirrors `pl.load(...)`.
+  auto acc_initial = b.Bind("acc_initial",
+                            reg.Create("tile.load", {target, zero_offsets, shape_tuple, shape_tuple},
+                                       {{"target_memory", MemorySpace::Vec}, {"transpose", false}}, span),
+                            span);
+
+  auto acc_final = b.EmitForReduce(
+      "peer", zero_idx, nranks_idx, one_idx, acc_initial,
+      [&](LoweringBuilder& body, const VarPtr& peer, const VarPtr& acc) {
+        return body.EmitIfExpr(
+            body.NotEq(peer, my_rank, span),
+            [&](LoweringBuilder& then_body) {
+              auto recv = then_body.Bind(
+                  "recv",
+                  OpRegistry::GetInstance().Create("pld.tile.remote_load",
+                                                   {target, peer, zero_offsets, shape_tuple}, {}, span),
+                  span);
+              // Bind the add result so codegen sees a named tile buffer to
+              // write into (pto.tadd lowers to `ins(...) outs(<bound>)`);
+              // yielding a raw Call leaves outs() empty and MLIR rejects it.
+              return then_body.Bind("acc_next", then_body.Add(acc, recv, span), span);
+            },
+            [&](LoweringBuilder& /*else_body*/) -> ExprPtr {
+              // peer == my_rank: pass acc through unchanged.
+              return acc;
+            },
+            span);
+      },
+      span);
+
+  // ---- Phase 3.5: post-reduce barrier (AtomicAdd 1 → wait >= 2) ----
+  // Phase 4 overwrites every rank's slot of ``target``; without this barrier,
+  // a fast rank could write its reduced value back to ``target`` while a slow
+  // rank is still in Phase 3 reading the original Phase-1 staged data from
+  // the same slot via ``pld.tile.remote_load`` — a write-after-read hazard
+  // that surfaces as wrong sums on slower ranks.
+  //
+  // Reuse the same signal cells: each peer atomic-adds 1 again, raising my
+  // cell from 1 to 2, so the second wait checks ``cell >= 2``. ``kGe`` (not
+  // ``kEq``) is required for the same race-window reason as Phase 2b: a
+  // faster peer can advance the cell past 2 before the slower rank gets
+  // around to polling — but since the buffer is single-shot per call and
+  // no peer adds more than ``+1`` here, the cell tops out at 2 and
+  // ``>= 2`` is both safe and tight. See the prelude comment block above
+  // and the hand-written reference at
+  // ``tests/st/distributed/test_l3_allreduce.py``.
+  b.EmitFor(
+      "peer2", zero_idx, nranks_idx, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& peer) {
+        body.EmitIf(
+            body.NotEq(peer, my_rank, span),
+            [&](LoweringBuilder& then_body) {
+              auto notify_call = OpRegistry::GetInstance().Create(
+                  "pld.system.notify", {signal, peer, my_signal_offsets, one_i32},
+                  {{"op", static_cast<int>(NotifyOp::kAtomicAdd)}}, span);
+              then_body.Bind("notify2_ret", notify_call, span);
+            },
+            /*else_fn=*/nullptr, span);
+      },
+      span);
+
+  b.EmitFor(
+      "src2", zero_idx, nranks_idx, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& src) {
+        auto src_signal_offsets = MakeSignalOffsets(src, span);
+        body.EmitIf(
+            body.NotEq(src, my_rank, span),
+            [&](LoweringBuilder& then_body) {
+              auto wait_call =
+                  OpRegistry::GetInstance().Create("pld.system.wait", {signal, src_signal_offsets, two_i32},
+                                                   {{"cmp", static_cast<int>(WaitCmp::kGe)}}, span);
+              then_body.Bind("wait2_ret", wait_call, span);
+            },
+            /*else_fn=*/nullptr, span);
+      },
+      span);
+
+  // ---- Phase 4: store the reduced accumulator back into the target slot ----
+  b.Bind("store_ret", reg.Create("tile.store", {acc_final, zero_offsets, target}, {}, span), span);
+
+  // In-place semantics: the rebind LHS receives the (post-reduce) target view.
+  return target;
 }
 
 // ----------------------------------------------------------------------------
@@ -265,6 +646,7 @@ CompositeLoweringFn LookupCompositeRule(const std::string& op_name) {
   static const std::unordered_map<std::string, CompositeLoweringFn> kRules = {
       {"tile.sin", &LowerSinRule},
       {"tile.cos", &LowerCosRule},
+      {"pld.tensor.allreduce", &LowerTensorAllReduceRule},
   };
   auto it = kRules.find(op_name);
   return it == kRules.end() ? nullptr : it->second;
@@ -285,12 +667,15 @@ CompositeLoweringFn LookupCompositeRule(const std::string& op_name) {
 // ============================================================================
 class LowerCompositeOpsMutator : public IRMutator {
  public:
+  explicit LowerCompositeOpsMutator(bool skip_host_allreduce = false)
+      : skip_host_allreduce_(skip_host_allreduce) {}
+
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto call = As<Call>(op->value_);
     if (!call) {
       return IRMutator::VisitStmt_(op);
     }
-    CompositeLoweringFn rule = LookupCompositeRule(call->op_->name_);
+    CompositeLoweringFn rule = LookupRule(call);
     if (!rule) {
       return IRMutator::VisitStmt_(op);
     }
@@ -300,7 +685,7 @@ class LowerCompositeOpsMutator : public IRMutator {
     std::vector<ExprPtr> visited_args = VisitArgs(call->args_, op->span_);
 
     LoweringBuilder builder(op->var_->name_hint_, temp_counter_);
-    ExprPtr result = rule(visited_args, call->span_, builder);
+    ExprPtr result = rule(call, visited_args, builder);
 
     auto stmts = builder.TakeStmts();
     // Bind the final result to the original target Var (preserves uses
@@ -331,12 +716,12 @@ class LowerCompositeOpsMutator : public IRMutator {
       INTERNAL_CHECK_SPAN(op->value_[i], op->span_) << "ReturnStmt has null value at index " << i;
       ExprPtr value = op->value_[i];
       auto call = As<Call>(value);
-      CompositeLoweringFn rule = call ? LookupCompositeRule(call->op_->name_) : nullptr;
+      CompositeLoweringFn rule = call ? LookupRule(call) : nullptr;
       if (rule) {
         std::vector<ExprPtr> visited_args = VisitArgs(call->args_, op->span_);
         const std::string base = "ret" + std::to_string(i);
         LoweringBuilder builder(base, temp_counter_);
-        ExprPtr decomposed = rule(visited_args, call->span_, builder);
+        ExprPtr decomposed = rule(call, visited_args, builder);
         // Bind the decomposed result to a fresh Var so ReturnStmt::value_
         // continues to hold a Var (matches the SSA invariant the rest of the
         // pipeline expects). The Bind appends to the same builder, so a single
@@ -365,6 +750,13 @@ class LowerCompositeOpsMutator : public IRMutator {
   }
 
  private:
+  CompositeLoweringFn LookupRule(const CallPtr& call) const {
+    if (skip_host_allreduce_ && call && call->op_ && call->op_->name_ == "pld.tensor.allreduce") {
+      return nullptr;
+    }
+    return call && call->op_ ? LookupCompositeRule(call->op_->name_) : nullptr;
+  }
+
   std::vector<ExprPtr> VisitArgs(const std::vector<ExprPtr>& args, const Span& span) {
     std::vector<ExprPtr> out;
     out.reserve(args.size());
@@ -377,10 +769,14 @@ class LowerCompositeOpsMutator : public IRMutator {
   }
 
   std::size_t temp_counter_ = 0;
+  bool skip_host_allreduce_{false};
 };
 
 FunctionPtr TransformLowerCompositeOps(const FunctionPtr& func) {
-  LowerCompositeOpsMutator mutator;
+  const bool skip_host_allreduce = func && func->level_.has_value() && *func->level_ == Level::HOST &&
+                                   (func->func_type_ == FunctionType::Orchestration ||
+                                    (func->role_.has_value() && *func->role_ == Role::Orchestrator));
+  LowerCompositeOpsMutator mutator(skip_host_allreduce);
   return mutator.VisitFunction(func);
 }
 

@@ -926,6 +926,43 @@ class TestSpecializer:
         )
         assert "@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator, auto_scope=False)" in out
 
+    def test_inline_dep_emits_auto_scope_false(self):
+        """auto_scope=False on an inline sub-function emits
+        ``@pl.function(type=pl.FunctionType.Inline, auto_scope=False)`` so its
+        body can place runtime scopes by hand (#1733)."""
+        src = """
+            def kernel(a: pl.Tensor, c: pl.Tensor):
+                return c
+        """
+        out = self._specialize_simple(
+            src,
+            ["a", "c"],
+            {
+                "a": TensorMeta((128, 128), DataType.FP32),
+                "c": TensorMeta((128, 128), DataType.FP32),
+            },
+            func_type="inline",
+            auto_scope=False,
+        )
+        assert "@pl.function(type=pl.FunctionType.Inline, auto_scope=False)" in out
+
+    def test_inline_dep_default_omits_auto_scope(self):
+        """The default (auto_scope=True) inline decorator emits no auto_scope= kwarg."""
+        src = """
+            def kernel(a: pl.Tensor, c: pl.Tensor):
+                return c
+        """
+        out = self._specialize_simple(
+            src,
+            ["a", "c"],
+            {
+                "a": TensorMeta((128, 128), DataType.FP32),
+                "c": TensorMeta((128, 128), DataType.FP32),
+            },
+            func_type="inline",
+        )
+        assert "auto_scope" not in out
+
 
 # ---------------------------------------------------------------------------
 # Integration: specialize → parseable by pl.parse()
@@ -1009,6 +1046,49 @@ class TestSpecializerIntegration:
         got = pl.parse(generated_src)
 
         ir.assert_structural_equal(got, Expected)
+
+    def test_inline_dep_with_hand_scope_parseable(self):
+        """An auto_scope=False entry calling an auto_scope=False inline dep whose
+        body hand-places ``with pl.scope()`` specializes to parseable source —
+        the parser accepts hand AUTO scopes in both functions (#1733)."""
+        entry_src = textwrap.dedent("""
+            def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+                with pl.scope():
+                    c = inline_fn(a, c)
+                return c
+        """)
+        inline_src = textwrap.dedent("""
+            def inline_fn(a: pl.Tensor, c: pl.Tensor):
+                with pl.scope():
+                    c = pl.add(a, c)
+                return c
+        """)
+        meta = {
+            "a": TensorMeta((128, 128), DataType.FP32),
+            "c": TensorMeta((128, 128), DataType.FP32),
+        }
+        inline_ctx = _make_ctx(
+            func_name="inline_fn",
+            source=inline_src,
+            func_type="inline",
+            param_names=["a", "c"],
+            tensor_meta=meta,
+            auto_scope=False,
+        )
+        entry_ctx = _make_ctx(
+            func_name="entry",
+            source=entry_src,
+            func_type="orchestration",
+            param_names=["a", "c"],
+            tensor_meta=meta,
+            dep_names=["inline_fn"],
+            auto_scope=False,
+        )
+        out = specialize("_InlineHandScope", [inline_ctx, entry_ctx])
+        assert "@pl.function(type=pl.FunctionType.Inline, auto_scope=False)" in out
+        assert "@pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)" in out
+        prog = pl.parse(out)
+        assert isinstance(prog, ir.Program)
 
 
 # ---------------------------------------------------------------------------
@@ -1550,6 +1630,219 @@ class TestSpecializerSourceMap:
         # The body collapses to a synthesized `pass`; it must not be mapped, and
         # in particular must not point at the decorator line (100).
         assert spec.source_map == {}
+
+
+# ---------------------------------------------------------------------------
+# Array-typed parameter annotations (e.g. pl.Array[N, pl.TASK_ID])
+# ---------------------------------------------------------------------------
+
+
+class TestArrayParamAnnotation:
+    """A param that is neither a tensor nor a scalar — a fixed-size on-core
+    ``pl.Array[N, dtype]`` (the TaskId-array dependency-threading idiom) — must
+    round-trip through specialization with its annotation rendered.
+
+    Before the fix, ``_build_params`` emitted such params *bare* (just the name).
+    The generated ``@pl.function`` source then failed PyPTO parsing with
+    ``ParserTypeError: Parameter '<name>' missing type annotation``.
+    """
+
+    def _specialize_with_globals(
+        self,
+        func_source: str,
+        param_names: list[str],
+        tensor_meta: dict[str, TensorMeta],
+        py_globals: dict,
+        func_type: str = "orchestration",
+    ) -> str:
+        ctx = SpecializeContext(
+            func_name="kernel",
+            source=textwrap.dedent(func_source),
+            func_type=func_type,
+            level=None,
+            param_names=param_names,
+            tensor_meta=tensor_meta,
+            scalar_values={},
+            scalar_dtypes={},
+            py_globals=py_globals,
+        )
+        return specialize("_TestClass", [ctx])
+
+    # --- _build_params plumbing (unit) --------------------------------------
+
+    def test_build_params_renders_extra_ann(self):
+        """extra_anns entries are emitted as ``name: <annotation>``."""
+        ctx = _make_ctx(
+            param_names=["a", "tids"],
+            tensor_meta={"a": TensorMeta((4, 4), DataType.FP32)},
+        )
+        spec = Specializer("_T", [ctx])
+        params = spec._build_params(
+            all_param_names=["a", "tids"],
+            out_params=[],
+            tensor_params=["a"],
+            scalar_dtype_strs={},
+            distributed_params=set(),
+            ctx=ctx,
+            extra_anns={"tids": "pl.Array[4, pl.TASK_ID]"},
+        )
+        assert "tids: pl.Array[4, pl.TASK_ID]" in params
+
+    def test_build_params_without_extra_ann_stays_bare(self):
+        """A non-tensor, non-scalar param with no extra_anns is emitted bare —
+        documents the pre-fix behaviour that broke PyPTO parsing."""
+        ctx = _make_ctx(
+            param_names=["a", "tids"],
+            tensor_meta={"a": TensorMeta((4, 4), DataType.FP32)},
+        )
+        spec = Specializer("_T", [ctx])
+        params = spec._build_params(
+            all_param_names=["a", "tids"],
+            out_params=[],
+            tensor_params=["a"],
+            scalar_dtype_strs={},
+            distributed_params=set(),
+            ctx=ctx,
+            extra_anns=None,
+        )
+        assert "tids" in params  # bare, unannotated
+
+    # --- end-to-end rendering through specialize() --------------------------
+
+    def test_task_id_array_param_rendered(self):
+        """``tids: pl.Array[N, pl.TASK_ID]`` renders with N folded to its value."""
+        N = 4
+        src = """
+            def kernel(a: pl.Tensor, tids: pl.Array[N, pl.TASK_ID], out: pl.Out[pl.Tensor]):
+                return out
+        """
+        out = self._specialize_with_globals(
+            src,
+            ["a", "tids", "out"],
+            {
+                "a": TensorMeta((16, 16), DataType.FP32),
+                "out": TensorMeta((16, 16), DataType.FP32),
+            },
+            py_globals={"pl": pl, "N": N},
+        )
+        assert "tids: pl.Array[4, pl.TASK_ID]" in out
+
+    def test_array_param_literal_extent(self):
+        """A literal extent (no closure constant) renders unchanged."""
+        src = """
+            def kernel(a: pl.Tensor, tids: pl.Array[3, pl.TASK_ID], out: pl.Out[pl.Tensor]):
+                return out
+        """
+        out = self._specialize_with_globals(
+            src,
+            ["a", "tids", "out"],
+            {
+                "a": TensorMeta((8, 8), DataType.FP32),
+                "out": TensorMeta((8, 8), DataType.FP32),
+            },
+            py_globals={"pl": pl},
+        )
+        assert "tids: pl.Array[3, pl.TASK_ID]" in out
+
+    def test_array_param_non_task_id_dtype(self):
+        """The rendering generalises to any Array dtype, not just TASK_ID."""
+        src = """
+            def kernel(a: pl.Tensor, route: pl.Array[8, pl.INT32], out: pl.Out[pl.Tensor]):
+                return out
+        """
+        out = self._specialize_with_globals(
+            src,
+            ["a", "route", "out"],
+            {
+                "a": TensorMeta((8, 8), DataType.FP32),
+                "out": TensorMeta((8, 8), DataType.FP32),
+            },
+            py_globals={"pl": pl},
+        )
+        assert "route: pl.Array[8, pl.INT32]" in out
+
+    def test_array_param_bf16_dtype_renders_pl_constant(self):
+        """Regression: a dtype whose enum ``str`` diverges from its DSL constant
+        (``BF16`` → enum str ``bfloat16``) must render as the real ``pl.BF16``,
+        not ``pl.BFLOAT16`` (which does not exist on ``pl`` and would make the
+        generated source fail at import)."""
+        src = """
+            def kernel(a: pl.Tensor, buf: pl.Array[4, pl.BF16], out: pl.Out[pl.Tensor]):
+                return out
+        """
+        out = self._specialize_with_globals(
+            src,
+            ["a", "buf", "out"],
+            {
+                "a": TensorMeta((8, 8), DataType.FP32),
+                "out": TensorMeta((8, 8), DataType.FP32),
+            },
+            py_globals={"pl": pl},
+        )
+        assert "buf: pl.Array[4, pl.BF16]" in out
+        assert "BFLOAT16" not in out
+
+    def test_generated_source_is_parseable(self):
+        """The generated source is syntactically valid Python and carries no
+        bare (unannotated) parameter — the concrete regression guard."""
+        N = 5
+        src = """
+            def kernel(a: pl.Tensor, tids: pl.Array[N, pl.TASK_ID], out: pl.Out[pl.Tensor]):
+                return out
+        """
+        out = self._specialize_with_globals(
+            src,
+            ["a", "tids", "out"],
+            {
+                "a": TensorMeta((16, 16), DataType.FP32),
+                "out": TensorMeta((16, 16), DataType.FP32),
+            },
+            py_globals={"pl": pl, "N": N},
+        )
+        ast.parse(out)  # must be valid Python
+        # The param must be annotated, never emitted bare as ", tids,".
+        assert "tids: pl.Array[5, pl.TASK_ID]" in out
+        assert ", tids," not in out and ", tids)" not in out
+
+    def test_unevaluable_annotation_stays_bare_without_crash(self):
+        """An annotation that cannot be evaluated (unknown name, not in globals)
+        is best-effort skipped — the specializer must not raise."""
+        src = """
+            def kernel(a: pl.Tensor, weird: SomeUndefinedType, out: pl.Out[pl.Tensor]):
+                return out
+        """
+        # No exception expected; `weird` simply stays bare.
+        out = self._specialize_with_globals(
+            src,
+            ["a", "weird", "out"],
+            {
+                "a": TensorMeta((8, 8), DataType.FP32),
+                "out": TensorMeta((8, 8), DataType.FP32),
+            },
+            py_globals={"pl": pl},
+        )
+        assert "pl.Array" not in out  # not misclassified as an Array
+
+    def test_annotation_eval_excludes_builtins(self):
+        """The annotation-eval namespace strips Python builtins: an annotation
+        that depends on one (here ``len``) cannot evaluate, so it is silently
+        skipped (stays bare) rather than executed at specialization time."""
+        src = """
+            def kernel(a: pl.Tensor, x: pl.Array[len([0, 0, 0, 0]), pl.TASK_ID], out: pl.Out[pl.Tensor]):
+                return out
+        """
+        out = self._specialize_with_globals(
+            src,
+            ["a", "x", "out"],
+            {
+                "a": TensorMeta((8, 8), DataType.FP32),
+                "out": TensorMeta((8, 8), DataType.FP32),
+            },
+            py_globals={"pl": pl},
+        )
+        # `len(...)` is unavailable without builtins -> eval fails -> no Array
+        # annotation is emitted for `x` (best-effort, no execution, no crash).
+        assert "x: pl.Array" not in out
 
 
 if __name__ == "__main__":

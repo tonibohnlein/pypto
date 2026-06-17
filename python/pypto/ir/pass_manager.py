@@ -158,6 +158,7 @@ class PassManager:
             ("InjectGMPipeBuffer", lambda: passes.inject_gm_pipe_buffer()),
             ("SplitVectorKernel", lambda: passes.split_vector_kernel()),
             ("NormalizeReturnOrder", lambda: passes.normalize_return_order()),
+            ("SkewCrossCorePipeline", lambda: passes.skew_cross_core_pipeline()),
             ("LowerPipelineLoops", lambda: passes.lower_pipeline_loops()),
             ("CanonicalizeIOOrder", lambda: passes.canonicalize_io_order()),
             # MaterializeTensorStrides fills empty stride slots on every
@@ -168,8 +169,10 @@ class PassManager:
             # without going through the legacy `dn_swap` codegen path.
             ("MaterializeTensorStrides", lambda: passes.materialize_tensor_strides()),
             ("InitMemRef", lambda: passes.init_mem_ref()),
+            # MemoryReuse coalesces tile buffers; on Ascend910B split-AIV it also
+            # avoids the load + tpop_from_aic in-place hazard so a separate
+            # legalisation pass is no longer needed.
             ("MemoryReuse", lambda: passes.memory_reuse()),
-            ("LegalizePTOBufferReuse", lambda: passes.legalize_pto_buffer_reuse()),
             ("AllocateMemoryAddr", lambda: passes.allocate_memory_addr()),
             ("FoldNoOpReshape", lambda: passes.fold_no_op_reshape()),
             ("FuseCreateAssembleToSlice", lambda: passes.fuse_create_assemble_to_slice()),
@@ -187,6 +190,7 @@ class PassManager:
             # before the final Simplify so any constant folding it does on the
             # collected sizes is applied uniformly.
             ("MaterializeCommDomainScopes", lambda: passes.materialize_comm_domain_scopes()),
+            ("LowerHostTensorCollectives", lambda: passes.lower_host_tensor_collectives()),
             ("Simplify", lambda: passes.simplify()),
             # Insert explicit AUTO RuntimeScopeStmt nodes (function body + for/if
             # bodies) into Orchestration functions so codegen emits PTO2_SCOPE
@@ -212,7 +216,9 @@ class PassManager:
             strategy: The optimization strategy to use (default: Default)
             analyze_auto_scopes_for_deps: If True, enable compiler-derived task
                 dependency analysis for AUTO runtime scopes. The default stays
-                False so only manual scopes are analyzed.
+                False so runtime AUTO tracking remains the only AUTO-scope
+                dependency mechanism. User-written manual scopes are not
+                analyzed by this pass.
 
         Returns:
             A PassManager instance configured with the appropriate passes

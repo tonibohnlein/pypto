@@ -78,6 +78,8 @@ void BindPass(nb::module_& m) {
              "Bidirectional invariant: ForStmt.kind_ == Pipeline ⇔ has pipeline_stages attr")
       .value("PipelineResolved", IRProperty::PipelineResolved,
              "No ForKind::Pipeline survives; produced by CanonicalizeIOOrder")
+      .value("UnrollResolved", IRProperty::UnrollResolved,
+             "No ForKind::Unroll survives; produced by UnrollLoops")
       .value("CallDirectionsResolved", IRProperty::CallDirectionsResolved,
              "Every non-builtin Call has explicit attrs['arg_directions'] (see Call::GetArgDirections)")
       .value("TileTypeCoherence", IRProperty::TileTypeCoherence,
@@ -99,7 +101,14 @@ void BindPass(nb::module_& m) {
       .value("AssignTypeSymmetry", IRProperty::AssignTypeSymmetry,
              "Every AssignStmt has structural_equal(var->GetType(), value->GetType()) — covers dtype, "
              "shape, tile_view/tensor_view, and TileType memory_space (memref excluded as an allocation "
-             "detail; memory_space exists only on TileType, not TensorType)");
+             "detail; memory_space exists only on TileType, not TensorType)")
+      .value("ManualDepsOnSubmitOnly", IRProperty::ManualDepsOnSubmitOnly,
+             "No plain cross-function Call (GlobalVar callee) carries attrs['manual_dep_edges'] — manual "
+             "dependency edges live in the typed Submit::deps_ field. Op calls (system.task_dummy) are "
+             "exempt")
+      .value("ReturnParamsExplicit", IRProperty::ReturnParamsExplicit,
+             "InCore/Group/Spmd tensor returns reference function params by pointer identity, so the "
+             "return->param map is a lookup (#1702)");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -298,11 +307,6 @@ void BindPass(nb::module_& m) {
              "Variables with non-overlapping lifetimes in the same memory space can share MemRef objects.\n"
              "Handles nested control flow (for-loops, if/else branches) for accurate lifetime tracking.");
 
-  passes.def("legalize_pto_buffer_reuse", &pass::LegalizePTOBufferReuse,
-             "Create a PTO buffer reuse legalisation pass\n\n"
-             "After generic MemoryReuse, detects illegal cross-type MemRef sharing\n"
-             "that PTO codegen cannot express and splits such MemRefs.");
-
   passes.def("allocate_memory_addr", &pass::AllocateMemoryAddr,
              "Create an allocate memory address pass\n\n"
              "Allocates real memory addresses for existing alloc operations.\n"
@@ -377,6 +381,13 @@ void BindPass(nb::module_& m) {
   passes.def("interchange_chunk_loops", &pass::InterchangeChunkLoops,
              "Create a pass that interchanges chunk loops and inserts InCore scopes");
   passes.def("unroll_loops", &pass::UnrollLoops, "Create a loop unrolling pass");
+  passes.def("skew_cross_core_pipeline", &pass::SkewCrossCorePipeline,
+             "Skew cross-core (cube/vector) ``pl.pipeline`` loops; runs immediately before\n"
+             "lower_pipeline_loops. A single-round-trip producer-role loop runs the producer\n"
+             "one iteration ahead (prologue + Sequential steady loop + epilogue); a consumer-role\n"
+             "or multi-round-trip loop demotes to a plain Sequential loop (order-preserving).\n"
+             "Output is Sequential with no pipeline marker, so lower_pipeline_loops and\n"
+             "canonicalize_io_order leave it alone. Non-cross-core loops are untouched.");
   passes.def("lower_pipeline_loops", &pass::LowerPipelineLoops,
              "Lower ``pl.pipeline(N, stage=F)`` loops at the tile level (triggers on F > 1):\n"
              "replicate the body F times per outer iteration with a bare-SeqStmts remainder\n"
@@ -499,6 +510,8 @@ void BindPass(nb::module_& m) {
              "DistributedTensorType.window_buffer_ on view Vars, and wrap the host_orch\n"
              "body in nested CommDomainScopeStmts (one per inferred comm domain). Runs\n"
              "immediately after InlineFunctions (L2 orch is never inlined into L3).");
+  passes.def("lower_host_tensor_collectives", &pass::LowerHostTensorCollectives,
+             "Lower host-level pld.tensor.allreduce calls to builtin tensor collective dispatches.");
   passes.def("materialize_runtime_scopes", &pass::MaterializeRuntimeScopes,
              "Materialize implicit orchestration scopes as explicit RuntimeScopeStmt nodes.\n\n"
              "For every Orchestration function, inserts AUTO RuntimeScopeStmt (manual_=false)\n"
@@ -522,10 +535,10 @@ void BindPass(nb::module_& m) {
              nb::arg("analyze_auto_scopes") = false,
              "Derive compiler-owned runtime-scope task dependency edges.\n\n"
              "Runs after derive_call_directions and writes "
-             "Call.attrs['compiler_manual_dep_edges'] inside runtime scopes. "
-             "By default only manual scopes are analyzed; pass analyze_auto_scopes=True "
-             "to also analyze AUTO scopes without changing their runtime scope mode. "
-             "unanalyzable hazards fall back to AUTO tracking with partial compiler deps stripped. "
+             "Call.attrs['compiler_manual_dep_edges'] inside analyzed AUTO runtime scopes. "
+             "User-written manual scopes are skipped. Pass analyze_auto_scopes=True "
+             "to analyze AUTO scopes without changing their runtime scope mode. "
+             "Unanalyzable hazards keep AUTO tracking with partial compiler deps stripped. "
              "User-provided Call.attrs['manual_dep_edges'] remain separate; orchestration "
              "codegen merges both attrs before emitting Arg::set_dependencies.");
   passes.def("expand_manual_phase_fence", &pass::ExpandManualPhaseFence,

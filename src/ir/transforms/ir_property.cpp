@@ -87,6 +87,12 @@ std::string IRPropertyToString(IRProperty prop) {
       return "RuntimeScopesMaterialized";
     case IRProperty::AssignTypeSymmetry:
       return "AssignTypeSymmetry";
+    case IRProperty::ManualDepsOnSubmitOnly:
+      return "ManualDepsOnSubmitOnly";
+    case IRProperty::ReturnParamsExplicit:
+      return "ReturnParamsExplicit";
+    case IRProperty::UnrollResolved:
+      return "UnrollResolved";
     default:
       return "Unknown";
   }
@@ -129,7 +135,9 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::BreakContinueValid,
                                    IRProperty::NoRedundantBlocks,
                                    IRProperty::InOutUseValid,
-                                   IRProperty::CallDirectionsResolved};
+                                   IRProperty::CallDirectionsResolved,
+                                   IRProperty::ManualDepsOnSubmitOnly,
+                                   IRProperty::ReturnParamsExplicit};
   return props;
 }
 
@@ -153,10 +161,11 @@ VerificationLevel GetDefaultVerificationLevel() {
 }
 
 const IRPropertySet& GetStructuralProperties() {
-  static const IRPropertySet props{
-      IRProperty::TypeChecked,   IRProperty::BreakContinueValid,  IRProperty::NoRedundantBlocks,
-      IRProperty::UseAfterDef,   IRProperty::OutParamNotShadowed, IRProperty::NoNestedInCore,
-      IRProperty::InOutUseValid, IRProperty::PipelineLoopValid,   IRProperty::ArrayNotEscaped};
+  static const IRPropertySet props{IRProperty::TypeChecked,         IRProperty::BreakContinueValid,
+                                   IRProperty::NoRedundantBlocks,   IRProperty::UseAfterDef,
+                                   IRProperty::OutParamNotShadowed, IRProperty::NoNestedInCore,
+                                   IRProperty::InOutUseValid,       IRProperty::PipelineLoopValid,
+                                   IRProperty::ArrayNotEscaped,     IRProperty::ManualDepsOnSubmitOnly};
   return props;
 }
 

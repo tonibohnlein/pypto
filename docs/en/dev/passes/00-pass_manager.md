@@ -87,6 +87,7 @@ struct PassProperties {
 | AutoDeriveTaskDependencies | SplitIncoreOrch, CallDirectionsResolved | CallDirectionsResolved | — |
 | ExpandManualPhaseFence | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | — |
 | MaterializeCommDomainScopes | — | CommDomainScopesMaterialized | — |
+| LowerHostTensorCollectives | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
 | Simplify | — | — | — |
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
 
@@ -384,12 +385,12 @@ The PTO-oriented tile stage shared by `Default` and `DebugTileOptimization` is:
 9. [`InjectGMPipeBuffer`](22-inject_gm_pipe_buffer.md)
 10. [`SplitVectorKernel`](23-split_vector_kernel.md)
 11. `NormalizeReturnOrder`
-12. [`LowerPipelineLoops`](25-lower_pipeline_loops.md)
-13. [`CanonicalizeIOOrder`](26-canonicalize_io_order.md)
-14. [`MaterializeTensorStrides`](27-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
-15. `InitMemRef`
-16. `MemoryReuse`
-17. [`LegalizePTOBufferReuse`](30-legalize_pto_buffer_reuse.md)
+12. [`SkewCrossCorePipeline`](25-skew_cross_core_pipeline.md) (cross-core cube/vector software-pipeline skew; runs immediately before LowerPipelineLoops)
+13. [`LowerPipelineLoops`](26-lower_pipeline_loops.md)
+14. [`CanonicalizeIOOrder`](27-canonicalize_io_order.md)
+15. [`MaterializeTensorStrides`](28-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
+16. `InitMemRef`
+17. `MemoryReuse`
 18. `AllocateMemoryAddr`
 19. [`FoldNoOpReshape`](32-fold_no_op_reshape.md)
 20. [`FuseCreateAssembleToSlice`](33-fuse_create_assemble_to_slice.md)
@@ -397,8 +398,9 @@ The PTO-oriented tile stage shared by `Default` and `DebugTileOptimization` is:
 22. [`AutoDeriveTaskDependencies`](35-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
 23. [`ExpandManualPhaseFence`](36-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
 24. [`MaterializeCommDomainScopes`](37-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
-25. `Simplify`
-26. [`MaterializeRuntimeScopes`](38-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
+25. [`LowerHostTensorCollectives`](38-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
+26. `Simplify`
+27. [`MaterializeRuntimeScopes`](39-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
 
 `DebugTileOptimization` is a debug-only strategy for inspecting this tile stage
 without the tensor-only prefix passes. Use `Default` for normal compilation and

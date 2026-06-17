@@ -240,6 +240,108 @@ class TestOrchestration:
         """
         assert_code_equal(code, expected)
 
+    @staticmethod
+    def _init_value_program(dtype, init_value):
+        """Build a minimal orch program whose runtime-allocated output `c` is
+        created with `init_value`, then consumed by a kernel."""
+
+        @pl.program
+        class InitValueProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], dtype],
+                b: pl.Tensor[[16, 16], dtype],
+                output: pl.Out[pl.Tensor[[16, 16], dtype]],
+            ) -> pl.Tensor[[16, 16], dtype]:
+                a_tile: pl.Tile[[16, 16], dtype] = pl.load(a, [0, 0], [16, 16])
+                b_tile: pl.Tile[[16, 16], dtype] = pl.load(b, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], dtype] = pl.add(a_tile, b_tile)
+                out: pl.Tensor[[16, 16], dtype] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                a: pl.Tensor[[16, 16], dtype],
+                b: pl.Tensor[[16, 16], dtype],
+                d: pl.Out[pl.Tensor[[16, 16], dtype]],
+            ) -> pl.Tensor[[16, 16], dtype]:
+                c: pl.Tensor[[16, 16], dtype] = pl.create_tensor([16, 16], dtype=dtype, init_value=init_value)
+                c = self.kernel_add(a, b, c)
+                d = self.kernel_add(c, b, d)
+                return d
+
+        return InitValueProgram
+
+    def test_create_tensor_init_value_zero(self):
+        """init_value=0 emits the dtype-agnostic uint64 set_initial_value(0) call
+        right after the TensorCreateInfo declaration."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        code = _generate_orch_code(self._init_value_program(pl.FP32, 0))
+        assert "TensorCreateInfo c_ci(c_ci_shapes, 2, DataType::FLOAT32);" in code
+        assert "c_ci.set_initial_value(0);" in code
+
+    def test_create_tensor_init_value_nonzero_float(self):
+        """Non-zero fp32 init_value emits a typed static_cast so the runtime
+        packs the correct element bytes."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        code = _generate_orch_code(self._init_value_program(pl.FP32, 2.5))
+        assert "c_ci.set_initial_value(static_cast<float>(2.5" in code
+
+    def test_create_tensor_init_value_nonzero_int(self):
+        """Non-zero integer init_value truncates the stored double back to the
+        integer C type."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        code = _generate_orch_code(self._init_value_program(pl.INT32, 7))
+        assert "c_ci.set_initial_value(static_cast<int32_t>(7));" in code
+
+    def test_create_tensor_init_value_fractional_int_rejected(self):
+        """A fractional init_value into an integer dtype would be silently
+        truncated, so codegen rejects it."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        with pytest.raises(ValueError, match="is not an integer but the tensor"):
+            _generate_orch_code(self._init_value_program(pl.INT32, 2.5))
+
+    def test_create_tensor_init_value_large_int_rejected(self):
+        """An integer init_value beyond 2**53 loses precision through the double
+        attr, so it is rejected at the IR boundary."""
+        with pytest.raises(ValueError, match="exactly-representable"):
+            pl.create_tensor([16, 16], dtype=pl.INT64, init_value=2**53 + 1)
+
+    def test_create_tensor_init_value_nonfinite_rejected(self):
+        """NaN / Inf init_value would emit invalid C++ ("nan"/"inf") or be UB to
+        cast to an integer, so they are rejected at the IR boundary."""
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="must be finite"):
+                pl.create_tensor([16, 16], dtype=pl.FP32, init_value=bad)
+
+    def test_create_tensor_init_value_fp16_nonzero_rejected(self):
+        """Non-zero fp16 fills are not representable in the orchestration TU
+        (no half type), so codegen raises a clear user-facing error."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        with pytest.raises(ValueError, match="non-zero init_value is not supported"):
+            _generate_orch_code(self._init_value_program(pl.FP16, 1.0))
+
+    def test_create_tensor_init_value_fp16_zero_allowed(self):
+        """init_value=0 is valid for fp16 (zero packs to zero bytes for any
+        dtype)."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        code = _generate_orch_code(self._init_value_program(pl.FP16, 0))
+        assert "c_ci.set_initial_value(0);" in code
+
     def test_tensor_read(self):
         """Test tensor.read emits get_tensor_data<T>() so the runtime spin-waits
         on the producer task before reading (no raw host buffer deref)."""
@@ -1655,6 +1757,72 @@ class TestOrchestration:
 
         # tensor.dim generates int64_t assignment
         assert "int64_t d0 = 64" in code
+
+    def test_dynamic_gm_pipe_buffer_alloc_follows_its_size_local(self):
+        """A dynamically-sized injected GM pipe buffer must not be hoisted above
+        the body-local it is sized by (issue #1768).
+
+        A cube matmul feeding a vector op, fused into ONE ``pl.spmd`` scope with
+        a dynamic block count, makes ``InjectGMPipeBuffer`` add a placeholder
+        ``tensor.create([1])`` whose *real* size is ``slot_size * (m // ROW)``.
+        That size references the body-local ``m = orch_args.tensor(0).shapes[0]``.
+        The placeholder's IR shape is constant, so the generic hoist guard cannot
+        see the dependency; the size-override branch must route the alloc to the
+        per-op path so it is emitted after ``m`` rather than at the scope top
+        (which produced ``'m' was not declared in this scope``).
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        K = 64
+        SPMD_N = 16
+        ROW_TILE = 16
+        M_DYN = pl.dynamic("M_DYN")
+
+        @pl.program
+        class DynPipeProgram:
+            @pl.function(type=pl.FunctionType.Opaque)
+            def main(
+                self,
+                a: pl.Tensor[[M_DYN, K], pl.FP32],
+                b: pl.Tensor[[K, SPMD_N], pl.FP32],
+                out: pl.Tensor[[M_DYN, SPMD_N], pl.FP32],
+            ) -> pl.Tensor[[M_DYN, SPMD_N], pl.FP32]:
+                m = pl.tensor.dim(a, 0)
+                for ob in pl.spmd(m // ROW_TILE, name_hint="hc"):
+                    m0 = ob * ROW_TILE
+                    a_slice = pl.slice(a, [ROW_TILE, K], [m0, 0])
+                    a_add = pl.add(a_slice, 1.0)  # vector produces matmul operand (V->C)
+                    c_tile = pl.matmul(a_add, b)  # cube
+                    c_vec = pl.add(c_tile, 1.0)  # vector consumes matmul result (C->V)
+                    out = pl.assemble(out, c_vec, [m0, 0])
+                return out
+
+        # VerificationLevel.NONE: a dynamic ``pl.spmd`` block count lands on the
+        # outlined Spmd function as a ``core_num`` attr that references a local
+        # defined in the *caller* Orchestration function. The printer emits that
+        # attr verbatim, but the roundtrip parser rejects the standalone function
+        # (the var is out of scope) — a known print/parse gap unrelated to the
+        # codegen ordering under test here.
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            program = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(DynPipeProgram)
+        orch_func = next(
+            f for f in program.functions.values() if f.func_type == ir.FunctionType.Orchestration
+        )
+        code = codegen.generate_orchestration(program, orch_func).code
+
+        # The pipe-buffer size must genuinely be dynamic (references the local),
+        # otherwise the test would pass vacuously on a constant size.
+        size_decl = re.search(r"gm_pipe_buffer_\w+_ci_shapes\[1\] = \{(.+?)\};", code)
+        assert size_decl is not None, code
+        assert "/ 16" in size_decl.group(1), size_decl.group(1)
+
+        # The body-local that sizes the buffer must be declared before the alloc.
+        m_decl = re.search(r"int64_t (\w+) = \(int64_t\)orch_args\.tensor\(0\)\.shapes\[0\];", code)
+        assert m_decl is not None, code
+        m_name = m_decl.group(1)
+        assert m_name in size_decl.group(1), (m_name, size_decl.group(1))
+        assert code.index(f"int64_t {m_name} =") < code.index("gm_pipe_buffer"), code
 
     def test_for_loop_with_slice(self):
         """Test for loop + tensor.slice: simplified paged attention pattern.
@@ -3474,17 +3642,13 @@ class TestTensorReadWriteOffsetCodegen:
             for name in rv_carry_names
         ), code
 
-    def test_windowed_writer_before_full_parent_reader_stays_unwindowed(self):
-        """Issue #1444: window writes followed by full-parent reads must not be externalized.
+    def test_windowed_writer_before_full_parent_reader_exposes_windowed_writer(self):
+        """Window writers may stay windowed before a later full-parent reader.
 
-        The unsafe codegen shape is:
-            producer writes score_flat.view(...) with add_output/add_inout
-            later consumer reads score_flat with add_input
-            no explicit set_dependencies edge bridges view -> parent
-
-        Until runtime/codegen has a generic root-aware dependency bridge,
-        OutWindowExternalizer must keep this producer unwindowed so auto deps
-        operate on the same parent Tensor object.
+        The old #1468 guard disabled this producer-side windowing shape because
+        #1444 exposed a runtime TensorMap overlap bug. Runtime overlap is fixed
+        by simpler#808, so Pattern 5 should expose the precise writer window and
+        leave the later global reader as a full tensor input.
         """
 
         backend.reset_for_testing()
@@ -3513,7 +3677,9 @@ class TestTensorReadWriteOffsetCodegen:
                 row: pl.Scalar[pl.INDEX],
             ) -> pl.Tensor[[N, M], pl.FP32]:
                 tile: pl.Tile[[1, M], pl.FP32] = pl.tile.load(score, [row, 0], [1, M], [1, M])
-                ret: pl.Tensor[[N, M], pl.FP32] = pl.tile.store(tile, [row, 0], probe)
+                fence: pl.Tile[[1, M], pl.FP32] = pl.tile.load(score, [0, 0], [1, M], [1, M])
+                merged: pl.Tile[[1, M], pl.FP32] = pl.tile.add(tile, fence)
+                ret: pl.Tensor[[N, M], pl.FP32] = pl.tile.store(merged, [row, 0], probe)
                 return ret
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -3537,10 +3703,10 @@ class TestTensorReadWriteOffsetCodegen:
         )
         code = _generate_orch_code(transformed)
 
-        assert "produce__windowed" not in code, code
-        assert "params_t0.add_inout(score_flat)" in code, code
+        assert "produce__windowed" in code, code
+        assert "params_t0.add_inout(score_iter)" in code, code
         assert "params_t1.add_input(score_flat)" in code, code
-        assert "score_flat.view(" not in code, code
+        assert "score_flat.view(" in code, code
 
     def test_group_submit_uses_both_aiv_slots_for_split_vector_kernel(self):
         """Cross-core split inferred from pipe ops should reuse one AIV kernel across both slots."""
@@ -3812,6 +3978,98 @@ class TestTensorReadWriteOffsetCodegen:
         for line in out_alias_lines:
             assert "ext_out" in line and "ext_scratch" not in line, (
                 f"SSA alias for the multi-Out SPMD result must bind to ext_out:\n{line}\n\nFull code:\n{code}"
+            )
+
+    def test_spmd_multi_out_return_value_aliases_actual_output(self):
+        """Multi-output SPMD scope whose return value is the LAST output must alias
+        to that output, never the first Out/InOut arg (issue #1702).
+
+        The kernel writes three GM tensors (two InOut + one Out, the Out last and
+        returned). After cluster outlining, the Spmd wrapper's single return must
+        be traced to the ``out`` param; pre-#1702 the wrapper's return value was a
+        TupleGetItem of the inner call, the lineage trace failed and
+        ``GenerateSingleReturnAlias`` aliased to ``out_indices[0]`` (= ``pre``).
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class SpmdMultiOutReturnLast:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                pre: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+                post: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> tuple[
+                pl.Tensor[[64, 64], pl.FP32],
+                pl.Tensor[[64, 64], pl.FP32],
+                pl.Tensor[[64, 64], pl.FP32],
+            ]:
+                tile = pl.load(a, [0, 0], [64, 64])
+                pre = pl.store(tile, [0, 0], pre)
+                post = pl.store(tile, [0, 0], post)
+                tile_out = pl.add(tile, tile)
+                out = pl.store(tile_out, [0, 0], out)
+                return pre, post, out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consumer(
+                self,
+                in_buf: pl.Tensor[[64, 64], pl.FP32],
+                final: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile = pl.load(in_buf, [0, 0], [64, 64])
+                final = pl.store(tile, [0, 0], final)
+                return final
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                pre: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+                post: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+                final: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.spmd(4):
+                    pre, post, out = self.kernel(a, pre, post, out)
+                final = self.consumer(out, final)
+                return final
+
+        # VerificationLevel.NONE: tuple destructuring inside `with pl.spmd(N):`
+        # desugars to a multi-statement body the printer emits verbatim but the
+        # parser rejects (same known roundtrip gap as test_spmd_multi_assemble).
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            transformed = passes.expand_mixed_kernel()(
+                passes.infer_tile_memory_space()(
+                    passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMultiOutReturnLast))
+                )
+            )
+
+        code = _generate_orch_code(transformed)
+
+        # The downstream consumer must read the actually-returned output
+        # (``ext_out``), never the first InOut (``ext_pre``) or ``ext_post``.
+        consumer_input_lines = [line for line in code.splitlines() if "params_t1.add_input" in line]
+        assert consumer_input_lines, f"Expected a consumer task reading the SPMD result, got:\n{code}"
+        first_consumer_input = consumer_input_lines[0]
+        assert "ext_out" in first_consumer_input, (
+            "Consumer of the SPMD scope result must read the returned Out param (ext_out). "
+            f"Got: {first_consumer_input}\n\nFull code:\n{code}"
+        )
+        for wrong in ("ext_pre", "ext_post"):
+            assert wrong not in first_consumer_input, (
+                f"Consumer reads {wrong} — multi-output return alias bug (#1702):\n"
+                f"{first_consumer_input}\n\nFull code:\n{code}"
+            )
+
+        # Any explicit SSA alias for the result must bind to ext_out as well.
+        alias_lines = [line for line in code.splitlines() if line.lstrip().startswith("const Tensor& out")]
+        for line in alias_lines:
+            assert "ext_pre" not in line and "ext_post" not in line, (
+                f"SPMD return alias bound to the wrong output:\n{line}\n\nFull code:\n{code}"
             )
 
     def test_spmd_multi_assemble(self):
@@ -4532,22 +4790,11 @@ class TestNoOpAliasSkip:
 
 
 class TestManualScopeCodegen:
-    """Codegen for ``with pl.manual_scope():`` and the ``deps=[var]`` Call kwarg."""
+    """Codegen for ``with pl.manual_scope():`` and the ``deps=[var]`` submit kwarg.
 
-    @pytest.fixture(autouse=True)
-    def _no_roundtrip_verification(self):
-        """The python_printer doesn't surface ``Call.attrs['manual_dep_edges']``,
-        so the pipeline's print -> parse -> assert_structural_equal roundtrip
-        fails for programs that use ``deps=[...]`` inside manual_scope.
-        Property verification still runs.
-        """
-        from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
-
-        instruments: list[_core_passes.PassInstrument] = [
-            _core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)
-        ]
-        with _core_passes.PassContext(instruments):
-            yield
+    Runs under the default (roundtrip) verification: ``Submit::deps_`` is a
+    first-class typed field that survives print -> parse.
+    """
 
     def test_submit_dumps_emits_toggle_and_per_task_dump(self):
         """``pl.submit(..., dumps=[x])`` (explicit kwarg) marks one arg slot of
@@ -4773,8 +5020,8 @@ class TestManualScopeCodegen:
             code,
         ), code
 
-    def test_manual_scope_merges_user_and_compiler_deps(self):
-        """Auto-deps: compiler deps merge with user deps in manual scope."""
+    def test_manual_scope_preserves_user_deps_without_compiler_deps(self):
+        """Auto-deps: user deps stay intact while manual scopes are skipped."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -4811,11 +5058,9 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        assert "PTO2TaskId params_t2_deps[2];" in code
+        assert "PTO2TaskId params_t2_deps[1];" in code
         assert "params_t2_deps[params_t2_deps_count++] = user_tid;" in code
-        producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
-        assert producer_tid, code
-        assert f"params_t2_deps[params_t2_deps_count++] = {producer_tid.group(1)};" in code
+        assert "task_0_outs.task_id()" not in code
         assert code.count("params_t2.set_dependencies(") == 1
 
     def test_auto_scope_does_not_emit_task_id_capture(self):
@@ -4845,11 +5090,11 @@ class TestManualScopeCodegen:
         """``with pl.at(..., deps=[tid]) as tid:`` extends the dep interface
         to the ``pl.at``-block style (no explicit ``self.kernel(...)`` calls).
 
-        The outlined kernel ``Call``'s return type is augmented with
-        ``Scalar[TASK_ID]`` so codegen's ``IsSubmitCall`` detection fires:
-        the call captures a ``TaskOutputTensors`` handle, binds the producer
-        TaskId Var, and downstream ``deps=[tid]`` flows through the same
-        stack-array + ``set_dependencies`` codegen path used by
+        Each block outlines to a first-class ``Submit`` whose return type
+        carries the trailing ``Scalar[TASK_ID]``: codegen captures a
+        ``TaskOutputTensors`` handle, binds the producer TaskId Var, and the
+        downstream ``deps=[tid]`` flows through ``Submit::deps_`` into the
+        same stack-array + ``set_dependencies`` codegen path used by
         ``pl.submit(...)``. Equivalent to writing two ``pl.submit`` calls,
         but matches the ``pl.at``-block programming style.
         """
@@ -5278,14 +5523,13 @@ class TestManualScopeCodegen:
                 return out
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
-        transformed = pm.run_passes(Prog)
+        with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+            transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        # With AutoDeriveTaskDependencies, loop-carried hazards (stage1 in the
-        # inner pl.parallel loop produces dynamic producers) trigger a manual→auto
-        # scope fallback.  The scope survives as AUTO; the intra-iteration user
-        # dep still wires correctly.
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        # User-written manual_scope is preserved; the intra-iteration user dep
+        # still wires correctly.
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
         assert "for (int64_t i = 0; i < 4; i += 1)" in code, code
         assert "for (int64_t j = 0; j < 8; j += 1)" in code, code
 
@@ -5369,12 +5613,13 @@ class TestManualScopeCodegen:
                 return out
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
-        transformed = pm.run_passes(Prog)
+        with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+            transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        # With AutoDeriveTaskDependencies, loop-carried hazards trigger a
-        # manual→auto scope fallback (same as the seq-outer/parallel-inner case).
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        # User-written manual_scope is preserved; the intra-iteration user dep
+        # still wires correctly.
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
         assert "for (int64_t i = 0; i < 8; i += 1)" in code, code
         assert "for (int64_t j = 0; j < 4; j += 1)" in code, code
 
@@ -5590,9 +5835,8 @@ class TestManualScopeCodegen:
         code = _generate_orch_code(transformed)
 
         assert "rt_submit_dummy_task" not in code, code
-        # 4 user deps (tids[0..3]) + 1 user dep (seed_tid) + 1 compiler dep
-        # (WAW hazard seed_tid → iter tid from prior phase) = 6
-        assert re.search(r"PTO2TaskId params_t\d+_deps\[6\];", code), code
+        # 4 user deps (tids[0..3]) + 1 user dep (seed_tid) = 5
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[5\];", code), code
 
     def test_auto_scope_array_dep_does_not_emit_dummy_barrier(self):
         """Array deps outside manual_scope keep the existing explicit-deps lowering."""
@@ -5707,7 +5951,8 @@ class TestManualScopeCodegen:
                 return out
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
-        transformed = pm.run_passes(Prog)
+        with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+            transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
         # The producer TaskId is attached to the consumer dependency edge.
@@ -6261,14 +6506,7 @@ def _generate_orch_full_pipeline(program_cls) -> str:
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend910B)
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
-    # Scope to BASIC (property) verification, overriding conftest's default
-    # roundtrip instrument. ``pl.submit(..., deps=[...])`` in an auto
-    # orchestration does not survive a print->parse roundtrip after
-    # DeriveCallDirections (a separate printer/parser bug, unrelated to the
-    # orchestration codegen behaviour under test here). Property verification
-    # still runs so real IR invariant violations are caught.
-    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
-        optimized = pm.run_passes(program_cls)
+    optimized = pm.run_passes(program_cls)
     for func in optimized.functions.values():
         if func.func_type == ir.FunctionType.Orchestration:
             return codegen.generate_orchestration(optimized, func).code
@@ -6569,11 +6807,7 @@ def test_spmd_submit_aic_direct_dispatch():
                 out, _ = pl.spmd_submit(self.cube, a, b, out, core_num=8)
             return out
 
-    # Property-only verification: a submit's deps/launch-spec don't survive the
-    # print->parse roundtrip after DeriveCallDirections (pre-existing limitation,
-    # same reason _generate_orch_full_pipeline uses BEFORE_AND_AFTER).
-    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
-        code = _generate_orch_code(P)
+    code = _generate_orch_code(P)
     assert "rt_submit_aic_task" in code, code
     assert "params_t0.launch_spec.set_block_num(8);" in code, code
 

@@ -754,11 +754,19 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   }
 
   std::string body_content = stream_.str();
+
+  // Render the prologue before flushing constants so constants unique to a
+  // shape/stride expression (e.g. the 2 in M * 2) are declared before use.
+  stream_.str("");
+  stream_.clear();
+  EmitMakeTensorViews(func);
+  EmitExtraAllocTiles();
+  std::string prologue_content = stream_.str();
+
   stream_ = std::move(saved_stream);
 
   stream_ << fs_.constants_section.str();
-  EmitMakeTensorViews(func);
-  EmitExtraAllocTiles();
+  stream_ << prologue_content;
   stream_ << body_content;
   stream_ << GetIndent() << "return\n";
 

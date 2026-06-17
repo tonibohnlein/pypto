@@ -34,13 +34,13 @@
 #include "pypto/ir/memref.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
-#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -318,7 +318,7 @@ bool AutoDepsLoopCarryDebugEnabled() {
 
 void DebugLog(const std::string& message) {
   if (!AutoDepsLoopCarryDebugEnabled()) return;
-  std::cerr << "[auto-deps-loop-debug] " << message << std::endl;
+  std::cerr << "[auto-deps-loop-debug] " << message << '\n';
 }
 
 std::string DebugVar(const VarPtr& var) {
@@ -471,7 +471,7 @@ class StorageRootAnalysis : public IRVisitor {
       if (ExceedsRootAlternativeLimit(merged)) {
         RegisterUnsupportedLocation(op->return_vars_[i]);
       } else {
-        RegisterVarLocation(op->return_vars_[i], std::move(merged));
+        RegisterVarLocation(op->return_vars_[i], merged);
       }
     }
   }
@@ -479,11 +479,11 @@ class StorageRootAnalysis : public IRVisitor {
   void VisitStmt_(const ForStmtPtr& op) override {
     std::vector<StorageLocation> init_locations;
     init_locations.reserve(op->iter_args_.size());
-    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      auto location = ResolveExpr(op->iter_args_[i]->initValue_);
+    for (const auto& iter_arg : op->iter_args_) {
+      auto location = ResolveExpr(iter_arg->initValue_);
       init_locations.push_back(location);
       if (HasLocation(location)) {
-        RegisterVarLocation(op->iter_args_[i], std::move(location));
+        RegisterVarLocation(iter_arg, location);
       }
     }
     IRVisitor::VisitStmt_(op);
@@ -503,7 +503,7 @@ class StorageRootAnalysis : public IRVisitor {
       if (ExceedsRootAlternativeLimit(location)) {
         RegisterUnsupportedLocation(op->return_vars_[i]);
       } else if (HasLocation(location)) {
-        RegisterVarLocation(op->return_vars_[i], std::move(location));
+        RegisterVarLocation(op->return_vars_[i], location);
       }
     }
   }
@@ -511,11 +511,11 @@ class StorageRootAnalysis : public IRVisitor {
   void VisitStmt_(const WhileStmtPtr& op) override {
     std::vector<StorageLocation> init_locations;
     init_locations.reserve(op->iter_args_.size());
-    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      auto location = ResolveExpr(op->iter_args_[i]->initValue_);
+    for (const auto& iter_arg : op->iter_args_) {
+      auto location = ResolveExpr(iter_arg->initValue_);
       init_locations.push_back(location);
       if (HasLocation(location)) {
-        RegisterVarLocation(op->iter_args_[i], std::move(location));
+        RegisterVarLocation(iter_arg, location);
       }
     }
     IRVisitor::VisitStmt_(op);
@@ -535,7 +535,7 @@ class StorageRootAnalysis : public IRVisitor {
       if (ExceedsRootAlternativeLimit(location)) {
         RegisterUnsupportedLocation(op->return_vars_[i]);
       } else if (HasLocation(location)) {
-        RegisterVarLocation(op->return_vars_[i], std::move(location));
+        RegisterVarLocation(op->return_vars_[i], location);
       }
     }
   }
@@ -636,7 +636,7 @@ class StorageRootAnalysis : public IRVisitor {
     return shaped->memref_.value();
   }
 
-  void RegisterVarLocation(const VarPtr& var, StorageLocation location) {
+  void RegisterVarLocation(const VarPtr& var, const StorageLocation& location) {
     if (!var || !HasLocation(location)) return;
     if (ExceedsRootAlternativeLimit(location)) {
       RegisterUnsupportedLocation(var);
@@ -742,6 +742,14 @@ class SubmitTaskIdCollector : public IRVisitor {
               task_id_by_var_id_[op->var_->UniqueId()] = tid_it->second;
             }
           }
+        }
+      }
+    }
+
+    if (IsTaskIdVar(op->var_)) {
+      if (auto source_task_id = CanonicalTaskIdForExpr(op->value_)) {
+        if (source_task_id->UniqueId() != op->var_->UniqueId()) {
+          task_id_by_var_id_[op->var_->UniqueId()] = source_task_id;
         }
       }
     }
@@ -861,8 +869,8 @@ class AutoDepMutator : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const RuntimeScopeStmtPtr& op) override {
-    if (!op->manual_ && !analyze_auto_scopes_) {
-      return IRMutator::VisitStmt_(op);
+    if (op->manual_ || !analyze_auto_scopes_) {
+      return op;
     }
     return AnalyzeRuntimeScopeBody(op->body_, op->manual_, op->name_hint_, op->span_,
                                    /*is_virtual_whole_body=*/false, op, op->leading_comments_, op->attrs_);
@@ -944,7 +952,8 @@ class AutoDepMutator : public IRMutator {
       }
     }
     bool needs_fallback = false;
-    auto user_edges = CanonicalizeTaskIds(GetDepAttr(call, kAttrManualDepEdges));
+    auto raw_user_edges = GetDepAttr(call, kAttrManualDepEdges);
+    auto user_edges = CanonicalizeTaskIds(raw_user_edges);
     const bool debug_loop_carry = AutoDepsLoopCarryDebugEnabled();
     auto summary = SummarizeAccesses(call, user_edges, &needs_fallback);
     if (debug_loop_carry) {
@@ -969,15 +978,18 @@ class AutoDepMutator : public IRMutator {
         if (!storage_ || !storage_->MayAlias(access.location.root, prior.location.root)) continue;
         if (!RegionsMayOverlap(access.location.region, prior.location.region)) continue;
         if (!HasHazard(access.kind, prior.kind)) continue;
-        const bool covered_by_user_edge = ContainsVar(user_edges, prior.task_id_var);
+        VarPtr prior_edge = CanonicalTaskId(prior.task_id_var);
+        if (!prior_edge) prior_edge = prior.task_id_var;
+        const bool covered_by_user_edge = ContainsVar(user_edges, prior_edge);
         if (debug_loop_carry) {
           DebugLog("hazard call=" + call->op_->name_ + " prior_task_id=" + DebugVar(prior.task_id_var) +
+                   " prior_edge=" + DebugVar(prior_edge) +
                    " covered_by_user_edge=" + (covered_by_user_edge ? std::string("true") : "false") +
                    " dynamic_producer=" + (prior.dynamic_producer ? std::string("true") : "false") +
                    " current_task_id=" + DebugVar(task_id));
         }
-        if (covered_by_user_edge) continue;
         if (prior.dynamic_producer) {
+          if (covered_by_user_edge && loop_depth_ == 0) continue;
           if (debug_loop_carry) {
             DebugLog("fallback_reason=dynamic_prior_producer_requires_scope_lift call=" + call->op_->name_ +
                      " prior_task_id=" + DebugVar(prior.task_id_var));
@@ -985,6 +997,7 @@ class AutoDepMutator : public IRMutator {
           fallback_stack_.back() = true;
           return call;
         }
+        if (covered_by_user_edge) continue;
         if (!prior.task_id_var) {
           if (debug_loop_carry) {
             DebugLog("fallback_reason=" +
@@ -995,7 +1008,7 @@ class AutoDepMutator : public IRMutator {
           fallback_stack_.back() = true;
           return call;
         }
-        AppendUnique(&compiler_edges, prior.task_id_var);
+        AppendUnique(&compiler_edges, prior_edge);
       }
     }
 

@@ -176,13 +176,18 @@ CallPtr CreateImportPeerBuffer(const std::string& buffer_name, const std::string
 
 CallPtr CreateInitializePipe(core_affinity::CoreSide side, int dir_mask, int slot_size_bytes,
                              const ExprPtr& c2v_consumer_buf, const ExprPtr& v2c_consumer_buf,
-                             const Span& span) {
+                             std::optional<int> slot_num, const Span& span) {
   INTERNAL_CHECK_SPAN(slot_size_bytes >= 0 && slot_size_bytes <= std::numeric_limits<int>::max(), span)
       << "Cross-core slot_size out of range: " << slot_size_bytes;
+  std::vector<std::pair<std::string, std::any>> kwargs = {{"dir_mask", std::any(dir_mask)},
+                                                          {"slot_size", std::any(slot_size_bytes)}};
+  if (slot_num.has_value()) {
+    INTERNAL_CHECK_SPAN(slot_num.value() > 0, span)
+        << "Cross-core slot_num override must be positive: " << slot_num.value();
+    kwargs.emplace_back("slot_num", std::any(slot_num.value()));
+  }
   const std::string op_name = core_side_ops::InitializePipeOp(side);
-  return CreateSystemOpCall(op_name, {c2v_consumer_buf, v2c_consumer_buf},
-                            {{"dir_mask", std::any(dir_mask)}, {"slot_size", std::any(slot_size_bytes)}},
-                            span);
+  return CreateSystemOpCall(op_name, {c2v_consumer_buf, v2c_consumer_buf}, kwargs, span);
 }
 
 void CollectCrossCorePipeMetadata(const std::vector<StmtPtr>& stmts, CrossCorePipeMetadata& metadata) {
@@ -266,7 +271,8 @@ CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtP
 
 AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const std::string& aic_name,
                                            const std::string& aiv_name, const std::vector<StmtPtr>& aic_stmts,
-                                           const std::vector<StmtPtr>& aiv_stmts, const Span& span) {
+                                           const std::vector<StmtPtr>& aiv_stmts,
+                                           std::optional<int> slot_num_override, const Span& span) {
   CrossCorePipeMetadata aic_metadata;
   CollectCrossCorePipeMetadata(aic_stmts, aic_metadata);
   CrossCorePipeMetadata aiv_metadata;
@@ -283,10 +289,23 @@ AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const s
     return {};
   }
 
-  const int64_t buffer_size = common_slot_size.value() * GetSlotNumForDirMask(dir_mask);
-  INTERNAL_CHECK_SPAN(common_slot_size.value() <= std::numeric_limits<int>::max(), span)
-      << "Cross-core slot_size out of range: " << common_slot_size.value();
-  const int slot_size_bytes = static_cast<int>(common_slot_size.value());
+  // Ring depth: pl.split(mode, slot_num=N) override, else the PTOAS-matching
+  // default (8 unidirectional / 4 bidirectional). The reserved buffer and the
+  // emitted initialize_pipe slot_num attribute both use this value, so PTOAS
+  // and the auto-reserved buffer stay consistent on a3 (local footprint =
+  // slot_num when local_slot_num is omitted) and a5 (footprint = slot_num).
+  if (slot_num_override.has_value()) {
+    INTERNAL_CHECK_SPAN(slot_num_override.value() > 0, span)
+        << "Cross-core slot_num override must be positive: " << slot_num_override.value();
+  }
+  const int effective_slot_num = slot_num_override.value_or(GetSlotNumForDirMask(dir_mask));
+  // Bound-check the slot size before multiplying so an oversized inferred size
+  // can't overflow the int64 buffer_size computation.
+  const int64_t slot_size_i64 = common_slot_size.value();
+  INTERNAL_CHECK_SPAN(slot_size_i64 >= 0 && slot_size_i64 <= std::numeric_limits<int>::max(), span)
+      << "Cross-core slot_size out of range: " << slot_size_i64;
+  const int slot_size_bytes = static_cast<int>(slot_size_i64);
+  const int64_t buffer_size = slot_size_i64 * effective_slot_num;
   AutomaticPipeSetup setup;
 
   std::shared_ptr<Var> aic_v2c_reserve_var;
@@ -328,11 +347,11 @@ AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const s
 
   setup.aic_stmts.push_back(
       std::make_shared<EvalStmt>(CreateInitializePipe(core_affinity::CoreSide::AIC, dir_mask, slot_size_bytes,
-                                                      aic_c2v_arg, aic_v2c_arg, span),
+                                                      aic_c2v_arg, aic_v2c_arg, slot_num_override, span),
                                  span));
   setup.aiv_stmts.push_back(
       std::make_shared<EvalStmt>(CreateInitializePipe(core_affinity::CoreSide::AIV, dir_mask, slot_size_bytes,
-                                                      aiv_c2v_arg, aiv_v2c_arg, span),
+                                                      aiv_c2v_arg, aiv_v2c_arg, slot_num_override, span),
                                  span));
 
   return setup;

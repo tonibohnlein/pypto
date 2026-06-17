@@ -81,6 +81,7 @@ __all__ = [
     "sort32",
     "mrgsort",
     "gather",
+    "paged_gather",
     "scatter",
     "alloc",
     "get_block_idx",
@@ -120,6 +121,7 @@ def create(
     dtype: DataType,
     layout: TensorLayout = TensorLayout.ND,
     manual_dep: bool = False,
+    init_value: int | float | None = None,
 ) -> Tensor:
     """Create a new tensor with specified shape and dtype.
 
@@ -127,6 +129,13 @@ def create(
         shape: List of dimension sizes (int or Expr)
         dtype: Data type of tensor elements
         layout: Tensor layout (default: ND)
+        init_value: If given, the runtime pre-fills the freshly allocated
+            buffer with this scalar on the AICPU (before any kernel writes it).
+            ``init_value=0`` zeroes the buffer and works for every dtype.
+            Non-zero values work for integer and 32/64-bit float dtypes;
+            non-zero fills of fp16/bf16 are rejected at codegen. The fill only
+            applies to this runtime-allocated buffer and is cheaper than
+            ``pl.full`` (which materializes a constant tensor via a kernel).
         manual_dep: Opt this tensor out of OverlapMap auto-dep tracking for
             its **entire lifetime**. When True, every task that reads or
             writes this tensor skips OverlapMap lookup and insert, so the
@@ -155,7 +164,9 @@ def create(
     Returns:
         Tensor wrapping the create operation
     """
-    call_expr = _ir_ops.create(_normalize_intlike(shape), dtype, layout, manual_dep=manual_dep)
+    call_expr = _ir_ops.create(
+        _normalize_intlike(shape), dtype, layout, manual_dep=manual_dep, init_value=init_value
+    )
     return Tensor(expr=call_expr)
 
 
@@ -1509,6 +1520,66 @@ def gather(
     if dim is None or index is None:
         raise ValueError("gather() index form requires both dim and index")
     call_expr = _ir_ops.gather(input.unwrap(), dim, index.unwrap())
+    return Tensor(expr=call_expr)
+
+
+def paged_gather(  # noqa: PLR0913
+    src: Tensor,
+    indices: Tensor,
+    block_table: Tensor,
+    block_size: int,
+    size: int,
+    max_indices: int,
+    *,
+    space: MemorySpace = MemorySpace.Mat,
+    col_off: int = 0,
+    is_trans: bool = False,
+    is_b_matrix: bool = False,
+) -> Tensor:
+    """Paged gather directly into an on-chip buffer (L1 by default, or UB).
+
+    Gathers scattered rows of a 2D paged KV pool ``src`` selected by ``indices``,
+    translated through a paged ``block_table``, directly into an L1 (``space=Mat``,
+    default) or UB (``space=Vec``) tile — so a subsequent matmul reads from L1
+    without a GM round-trip. The lowering is a fully-scalar per-row ``GM -> on-chip``
+    load loop on the Cube core (the bulk KV never touches UB).
+
+    Physical row per logical index ``idx``::
+
+        phys = block_table[idx // block_size] * block_size + idx % block_size
+
+    Args:
+        src: Paged KV pool in GM (2D; FP16/BF16/FP32/INT8).
+        indices: Logical row indices (INT32; 1D ``[n]`` or 2D ``[1, n]``).
+        block_table: Page table mapping logical block -> physical block (INT32).
+        block_size: Number of tokens per page block.
+        size: Number of elements gathered per row (<= src columns).
+        max_indices: Static upper bound on gathered rows; sizes the on-chip tile.
+        space: Destination space — ``MemorySpace.Mat`` (L1, default) or ``MemorySpace.Vec`` (UB).
+        col_off: Column start offset within each src row (default 0).
+        is_trans: Transpose for matmul B-operand layout (requires ``space=Mat``).
+        is_b_matrix: Hint that the result feeds matmul as the B matrix.
+
+    Returns:
+        Tensor of shape ``[max_indices, size]`` (or transposed) in the chosen space.
+
+    Examples:
+        kv_l1 = pl.paged_gather(kv_pool, topk_idx, block_table, block_size=128,
+                                size=head_dim, max_indices=256)
+        out = pl.matmul(q, kv_l1)
+    """
+    call_expr = _ir_ops.paged_gather(
+        src.unwrap(),
+        indices.unwrap(),
+        block_table.unwrap(),
+        block_size,
+        size,
+        max_indices,
+        space=space,
+        col_off=col_off,
+        is_trans=is_trans,
+        is_b_matrix=is_b_matrix,
+    )
     return Tensor(expr=call_expr)
 
 

@@ -292,6 +292,13 @@ class IRPythonPrinter : public IRVisitor {
   // When two distinct Var* share the same name_hint_, they get unique suffixed names.
   std::unordered_map<const Var*, std::string> dyn_var_rename_map_;
 
+  // When true, INDEX-typed ConstInt leaves print as pl.const(v, pl.INDEX)
+  // instead of bare literals. Enabled inside composite type-context dims
+  // (shape / valid_shape) so the parser rebuilds them verbatim instead of
+  // Python-eval folding `32 + 32` into `64`. Bare literals stay the default
+  // everywhere else.
+  bool typed_index_consts_ = false;
+
   // Helper methods
   std::string GetIndent() const;
   void IncreaseIndent();
@@ -346,6 +353,16 @@ class IRPythonPrinter : public IRVisitor {
   // ``kAttrDumpVars``), so it must survive a print/reparse roundtrip while the
   // scope still exists.
   bool PrintScopeDumpAttr(const ScopeStmtPtr& op);
+
+  // Emit ``pl.split(pl.SplitMode.X[, slot_num=N])`` (a single optimizations list
+  // entry, no leading comma / wrapper), reading the optional ``slot_num`` ring
+  // depth from ``slot_num_holder``'s attrs (the scope carrying it).
+  void PrintSplitCall(SplitMode split, const ScopeStmtPtr& slot_num_holder);
+
+  // Emit ``, optimizations=[pl.split(pl.SplitMode.X[, slot_num=N])]`` for a
+  // split scope. Used by the flattened spmd with-tid / for-loop forms; the
+  // nested-scope forms round-trip slot_num via the InCoreScopeStmt printer.
+  void PrintSplitOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder);
 
   // Emit `` as <tid>`` if the scope carries ``kAttrTaskIdVar``. The caller is
   // responsible for placing the ``)`` before and the ``:\n`` after this call.
@@ -616,7 +633,7 @@ void IRPythonPrinter::VisitExpr_(const ConstIntPtr& op) {
   // the parser (`ast_parser.parse_constant`) produces. Only INDEX may print
   // bare; every other integer dtype (INT64 included) must carry an explicit
   // `pl.const(value, pl.<DTYPE>)` annotation so print -> reparse round-trips.
-  if (op->dtype() == DataType::INDEX) {
+  if (op->dtype() == DataType::INDEX && !typed_index_consts_) {
     stream_ << op->value_;
   } else {
     stream_ << prefix_ << ".const(" << op->value_ << ", " << prefix_ << "." << DataTypeToString(op->dtype())
@@ -723,11 +740,10 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       // This is a cross-function call - print as self.method_name()
       stream_ << "self." << gvar->name_ << "(";
 
-      // Selective dump (``kAttrDumpVars``) is surfaced below as a ``dumps=[...]``
-      // kwarg (symmetric with ``deps=`` and matching the Submit surface), NOT
-      // by wrapping args — there is no call-arg wrapper. Collect the marked
-      // Vars now; emit the kwarg after ``deps=`` so the round-trip recovers the
-      // same attr by VarPtr identity.
+      // Selective dump (``kAttrDumpVars``) is surfaced below inside the
+      // machine-only ``attrs={...}`` dict, NOT by wrapping args — there is no
+      // call-arg wrapper. Collect the marked Vars now so the round-trip
+      // recovers the same attr by VarPtr identity.
       std::set<const Var*> dump_set;
       for (const auto& [k, v] : op->attrs_) {
         if (k != kAttrDumpVars) continue;
@@ -743,33 +759,18 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
         VisitExpr(op->args_[i]);
       }
 
-      // Surface manual_scope dep edges so they show up in IR dumps. The
-      // parser writes ``deps=[tid, ...]`` directly into
-      // ``kAttrManualDepEdges`` (each entry a ``Scalar[TASK_ID]`` Var), and
-      // the printer round-trips it via the same ``deps=[...]`` kwarg.
-      const std::vector<VarPtr>* deps_to_print = nullptr;
-      for (const auto& [k, v] : op->attrs_) {
-        if (k != kAttrManualDepEdges) continue;
-        const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
-        if (!edges || edges->empty()) continue;
-        deps_to_print = edges;
-        break;
-      }
+      // Manual dependency edges live on ``Submit::deps_``, never on a plain
+      // cross-function Call (ManualDepsOnSubmitOnly invariant). There is no
+      // ``deps=`` surface for plain calls — the parser rejects it — so a Call
+      // carrying the attr is a compiler bug; fail loudly instead of printing
+      // unparseable text.
+      INTERNAL_CHECK_SPAN(!op->HasAttr(kAttrManualDepEdges), op->span_)
+          << "Internal error: plain cross-function Call to '" << gvar->name_
+          << "' carries attrs[\"manual_dep_edges\"]; manual deps must be on Submit::deps_";
       // Zero-arg self.fn() needs no leading comma before the first kwarg, so
       // gate every kwarg separator on a shared flag rather than hard-coding
-      // ", " — otherwise self.fn(, deps=[...]) breaks the round-trip.
+      // ", " — otherwise self.fn(, device=...) breaks the round-trip.
       bool need_kwarg_comma = !op->args_.empty();
-      if (deps_to_print) {
-        stream_ << (need_kwarg_comma ? ", " : "") << "deps=[";
-        for (size_t i = 0; i < deps_to_print->size(); ++i) {
-          if (i > 0) stream_ << ", ";
-          if ((*deps_to_print)[i]) {
-            stream_ << GetVarName((*deps_to_print)[i].get());
-          }
-        }
-        stream_ << "]";
-        need_kwarg_comma = true;
-      }
 
       // Surface ``attrs["device"]`` (set by N3 parser on host_orch → chip_orch
       // dispatches) as a ``device=<expr>`` kwarg so it round-trips through
@@ -792,17 +793,17 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       // ``dumps=``) and ``arg_directions`` (post DeriveCallDirections). EVERY
       // other attr — ``arg_direction_overrides``, ``dummy_task``, any future
       // key — is rendered generically by ``PrintAttrValue`` into the same dict
-      // (the round-trip safety net), so nothing is silently dropped. Sugar keys
-      // already surfaced above (``manual_dep_edges`` -> ``deps=``, ``device`` ->
-      // ``device=``) are skipped here. The parser recovers the bespoke keys via
-      // dedicated extractors and the rest via ``_parse_attr_value``.
+      // (the round-trip safety net), so nothing is silently dropped. The sugar
+      // key already surfaced above (``device`` -> ``device=``) is skipped
+      // here. The parser recovers the bespoke keys via dedicated extractors
+      // and the rest via ``_parse_attr_value``.
       auto call_arg_directions = op->GetArgDirections();
       const bool has_dirs = !call_arg_directions.empty();
       const bool has_dump = !dump_set.empty();
       std::vector<const std::pair<std::string, std::any>*> generic_attrs;
       for (const auto& kv : op->attrs_) {
         const std::string& k = kv.first;
-        if (k == kAttrManualDepEdges || k == kAttrDevice) continue;   // emitted as deps= / device=
+        if (k == kAttrDevice) continue;                               // emitted as device=
         if (k == kAttrDumpVars || k == kAttrArgDirections) continue;  // bespoke emitters below
         generic_attrs.push_back(&kv);
       }
@@ -1193,10 +1194,29 @@ bool IRPythonPrinter::NeedsParens(const ExprPtr& parent, const ExprPtr& child, b
   return false;
 }
 
+namespace {
+// A binary tree whose leaves are all ConstInt would print as bare Python
+// arithmetic (e.g. `32 + 32`) and fold to one int on reparse. Such trees
+// must print typed const leaves so the parser rebuilds them verbatim;
+// folding is the Simplify pass's job, not the printer/parser's.
+bool IsPureConstIntTree(const ExprPtr& expr) {
+  if (As<ConstInt>(expr)) return true;
+  if (auto bin = As<BinaryExpr>(expr)) {
+    return IsPureConstIntTree(bin->left_) && IsPureConstIntTree(bin->right_);
+  }
+  return false;
+}
+}  // namespace
+
 void IRPythonPrinter::PrintBinaryOp(const BinaryExprPtr& op, const char* op_symbol) {
+  const bool saved_typed = typed_index_consts_;
+  if (!typed_index_consts_ && IsPureConstIntTree(op)) {
+    typed_index_consts_ = true;
+  }
   PrintChild(op, op->left_, true);
   stream_ << " " << op_symbol << " ";
   PrintChild(op, op->right_, false);
+  typed_index_consts_ = saved_typed;
 }
 
 void IRPythonPrinter::PrintFunctionBinaryOp(const BinaryExprPtr& op, const char* func_name) {
@@ -1587,6 +1607,20 @@ bool IRPythonPrinter::PrintScopeDepsAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrManualDepEdges, "deps");
 }
 
+void IRPythonPrinter::PrintSplitCall(SplitMode split, const ScopeStmtPtr& slot_num_holder) {
+  stream_ << prefix_ << ".split(" << prefix_ << ".SplitMode." << SplitModeToPythonString(split);
+  if (slot_num_holder && slot_num_holder->HasAttr("slot_num")) {
+    stream_ << ", slot_num=" << slot_num_holder->GetAttr<int>("slot_num", 0);
+  }
+  stream_ << ")";
+}
+
+void IRPythonPrinter::PrintSplitOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder) {
+  stream_ << ", optimizations=[";
+  PrintSplitCall(split, slot_num_holder);
+  stream_ << "]";
+}
+
 bool IRPythonPrinter::PrintScopeDumpAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrDumpVars, "dumps");
 }
@@ -1656,7 +1690,14 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
 void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   stream_ << "with " << prefix_ << ".at(level=" << prefix_ << ".Level.CORE_GROUP";
   if (op->split_.has_value() && op->split_.value() != SplitMode::None) {
-    stream_ << ", split=" << prefix_ << ".SplitMode." << SplitModeToPythonString(op->split_.value());
+    // The deprecated ``split=`` kwarg cannot carry a ring depth, so switch to
+    // the ``optimizations=[pl.split(mode, slot_num=N)]`` form whenever slot_num
+    // is set; otherwise keep the compact ``split=`` form (no churn).
+    if (op->HasAttr("slot_num")) {
+      PrintSplitOptimizations(op->split_.value(), op);
+    } else {
+      stream_ << ", split=" << prefix_ << ".SplitMode." << SplitModeToPythonString(op->split_.value());
+    }
   }
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
@@ -1673,12 +1714,23 @@ void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
 }
 
 void IRPythonPrinter::VisitStmt_(const AutoInCoreScopeStmtPtr& op) {
-  stream_ << "with " << prefix_ << ".at(level=" << prefix_ << ".Level.CORE_GROUP, optimization=";
-  if (op->split_.has_value() && op->split_.value() != SplitMode::None) {
-    stream_ << prefix_ << ".chunked_loop_optimizer(split=" << prefix_ << ".SplitMode."
-            << SplitModeToPythonString(op->split_.value()) << ")";
+  const bool has_split = op->split_.has_value() && op->split_.value() != SplitMode::None;
+  if (has_split && op->HasAttr("slot_num")) {
+    // The deprecated ``optimization=chunked_loop_optimizer(split=...)`` form
+    // cannot carry a ring depth; emit the new ``optimizations=[pl.auto_chunk,
+    // pl.split(mode, slot_num=N)]`` list so slot_num round-trips.
+    stream_ << "with " << prefix_ << ".at(level=" << prefix_ << ".Level.CORE_GROUP, optimizations=["
+            << prefix_ << ".auto_chunk, ";
+    PrintSplitCall(op->split_.value(), op);
+    stream_ << "]";
   } else {
-    stream_ << prefix_ << ".chunked_loop_optimizer";
+    stream_ << "with " << prefix_ << ".at(level=" << prefix_ << ".Level.CORE_GROUP, optimization=";
+    if (has_split) {
+      stream_ << prefix_ << ".chunked_loop_optimizer(split=" << prefix_ << ".SplitMode."
+              << SplitModeToPythonString(op->split_.value()) << ")";
+    } else {
+      stream_ << prefix_ << ".chunked_loop_optimizer";
+    }
   }
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
@@ -1732,8 +1784,7 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
     }
     if (incore && incore->split_.has_value() && incore->split_.value() != SplitMode::None) {
-      stream_ << ", optimizations=[" << prefix_ << ".split(" << prefix_ << ".SplitMode."
-              << SplitModeToPythonString(incore->split_.value()) << ")]";
+      PrintSplitOptimizations(incore->split_.value(), incore);
     }
     PrintScopeDepsAttr(op);
     stream_ << ")";
@@ -1769,6 +1820,9 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     }
     if (!op->name_hint_.empty()) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
+    }
+    if (incore && incore->split_.has_value() && incore->split_.value() != SplitMode::None) {
+      PrintSplitOptimizations(incore->split_.value(), incore);
     }
     stream_ << "):\n";
     IncreaseIndent();
@@ -2503,6 +2557,10 @@ void IRPythonPrinter::VisitProgram(const ProgramPtr& program) {
 }
 
 std::string IRPythonPrinter::PrintExprForType(const ExprPtr& expr) {
+  // Top-level static dims always print bare regardless of dtype: dim dtype is
+  // insignificant for static shapes (structural equality compares ConstInt by
+  // value) and bare literals reparse to the canonical INDEX form. Only leaves
+  // inside composite trees need pl.const typing — see typed_index_consts_.
   if (auto const_int = As<ConstInt>(expr)) {
     return std::to_string(const_int->value_);
   }
@@ -2511,6 +2569,10 @@ std::string IRPythonPrinter::PrintExprForType(const ExprPtr& expr) {
   }
   IRPythonPrinter temp_printer(prefix_);
   temp_printer.dyn_var_rename_map_ = dyn_var_rename_map_;
+  // Composite dims must reparse to the same tree, not Python-eval to a folded
+  // int. Typed const leaves (pl.const(v, pl.INDEX)) make them self-describing;
+  // simplification stays the Simplify pass's job.
+  temp_printer.typed_index_consts_ = true;
   return temp_printer.Print(expr);
 }
 

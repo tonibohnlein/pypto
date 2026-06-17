@@ -2237,6 +2237,27 @@ class AtomicType(enum.IntEnum):
     Add = 1
     """Atomically add the source data into the destination."""
 
+class ReduceOp(enum.IntEnum):
+    """Reduction operator for collective reductions — ``pld.tensor.allreduce`` and friends.
+
+    Stored as ``int`` in op kwargs; the C++ deducer validates the int falls
+    within this enum's range. First-version lowering accepts only ``Sum``;
+    ``Max`` / ``Min`` / ``Prod`` are reserved enum values and are rejected
+    at the deducer until their lowerings land.
+    """
+
+    Sum = 0
+    """Element-wise sum across ranks."""
+
+    Max = 1
+    """Element-wise max across ranks (reserved; lowering pending)."""
+
+    Min = 2
+    """Element-wise min across ranks (reserved; lowering pending)."""
+
+    Prod = 3
+    """Element-wise product across ranks (reserved; lowering pending)."""
+
 class ScopeStmt(Stmt):
     """Scope statement: marks a region with specific execution context (abstract base).
 
@@ -2919,7 +2940,7 @@ def create_op_call(op_name: str, args: Sequence[Expr], span: Span) -> Call:
         Call expression with automatically deduced result type
 
     Raises:
-        Exception: If operator is not registered or type deduction fails
+        Exception: If operator is not registered, is internal-only, or type deduction fails
     """
 
 @overload
@@ -2941,7 +2962,7 @@ def create_op_call(
         Call expression with automatically deduced result type
 
     Raises:
-        Exception: If operator is not registered or type deduction fails
+        Exception: If operator is not registered, is internal-only, or type deduction fails
     """
 
 def is_incore_type(func_type: FunctionType) -> bool:
@@ -3762,6 +3783,7 @@ class IRVisitor:
     def visit_const_float(self, op: ConstFloat) -> None: ...
     def visit_const_bool(self, op: ConstBool) -> None: ...
     def visit_call(self, op: Call) -> None: ...
+    def visit_submit(self, op: Submit) -> None: ...
     def visit_make_tuple(self, op: MakeTuple) -> None: ...
     def visit_tuple_get_item_expr(self, op: TupleGetItemExpr) -> None: ...
     # Individual binary expression handlers (default: delegates to visit_binary_expr)
@@ -3843,6 +3865,7 @@ class IRMutator:
     def visit_const_float(self, op: ConstFloat) -> Expr: ...
     def visit_const_bool(self, op: ConstBool) -> Expr: ...
     def visit_call(self, op: Call) -> Expr: ...
+    def visit_submit(self, op: Submit) -> Expr: ...
     def visit_make_tuple(self, op: MakeTuple) -> Expr: ...
     def visit_tuple_get_item_expr(self, op: TupleGetItemExpr) -> Expr: ...
     # Individual binary expression handlers (default: delegates to visit_binary_expr)

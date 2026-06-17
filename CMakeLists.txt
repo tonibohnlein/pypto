@@ -106,6 +106,7 @@ set(PYPTO_SOURCES
     src/ir/op/tile_ops/cross_core.cpp
     src/ir/op/tile_ops/sort.cpp
     src/ir/op/tile_ops/gather.cpp
+    src/ir/op/tile_ops/paged_gather.cpp
     src/ir/op/tile_ops/scatter.cpp
     src/ir/op/sync_ops/sync.cpp
     src/ir/op/sync_ops/cross_core.cpp
@@ -114,10 +115,12 @@ set(PYPTO_SOURCES
     src/ir/op/distributed/world_size.cpp
     src/ir/op/distributed/remote_load.cpp
     src/ir/op/distributed/remote_store.cpp
+    src/ir/op/distributed/collective.cpp
     src/ir/op/distributed/get.cpp
     src/ir/op/distributed/put.cpp
     src/ir/op/distributed/get_comm_ctx.cpp
     src/ir/op/distributed/system.cpp
+    src/ir/op/distributed/allreduce.cpp
     src/ir/op/tensor_ops/broadcast.cpp
     src/ir/op/tensor_ops/elementwise.cpp
     src/ir/op/tensor_ops/matmul.cpp
@@ -126,6 +129,7 @@ set(PYPTO_SOURCES
     src/ir/op/tensor_ops/reduction.cpp
     src/ir/op/tensor_ops/sort.cpp
     src/ir/op/tensor_ops/gather.cpp
+    src/ir/op/tensor_ops/paged_gather.cpp
     src/ir/op/tensor_ops/scatter.cpp
     src/ir/op/tensor_ops/transform.cpp
     src/ir/op/tensor_ops/unary.cpp
@@ -153,6 +157,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/normalize_return_order_pass.cpp
     src/ir/transforms/convert_tensor_to_tile_ops_pass.cpp
     src/ir/transforms/materialize_comm_domain_scopes_pass.cpp
+    src/ir/transforms/lower_host_tensor_collectives_pass.cpp
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
     src/ir/transforms/auto_derive_task_dependencies_pass.cpp
@@ -163,7 +168,6 @@ set(PYPTO_SOURCES
     src/ir/transforms/infer_tile_memory_space_pass.cpp
     src/ir/transforms/inline_functions_pass.cpp
     src/ir/transforms/init_memref.cpp
-    src/ir/transforms/legalize_pto_buffer_reuse_pass.cpp
     src/ir/transforms/lower_composite_ops_pass.cpp
     src/ir/transforms/materialize_tensor_strides_pass.cpp
     src/ir/transforms/ir_property.cpp
@@ -188,6 +192,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/split_chunked_loops_pass.cpp
     src/ir/transforms/interchange_chunk_loops_pass.cpp
     src/ir/transforms/unroll_loops_pass.cpp
+    src/ir/transforms/skew_cross_core_pipeline_pass.cpp
     src/ir/transforms/lower_pipeline_loops_pass.cpp
     src/ir/transforms/canonicalize_io_order_pass.cpp
     src/ir/transforms/structural_equal.cpp
@@ -203,6 +208,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/normalize_stmt_structure.cpp
     src/ir/transforms/utils/op_predicates.cpp
     src/ir/transforms/utils/parent_stmt_analysis.cpp
+    src/ir/transforms/utils/return_lineage_utils.cpp
     src/ir/transforms/utils/stmt_dependency_analysis.cpp
     src/ir/transforms/utils/transform_utils.cpp
     src/ir/transforms/utils/wrapper_call_utils.cpp
@@ -227,8 +233,11 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_out_param_pass.cpp
     src/ir/verifier/verify_array_not_escaped.cpp
     src/ir/verifier/verify_inout_use.cpp
+    src/ir/verifier/verify_return_params_explicit.cpp
     src/ir/verifier/verify_pipeline_loop_valid.cpp
+    src/ir/verifier/verify_manual_deps_on_submit_only.cpp
     src/ir/verifier/verify_pipeline_resolved.cpp
+    src/ir/verifier/verify_unroll_resolved.cpp
     src/ir/verifier/verify_call_directions.cpp
     src/ir/verifier/verify_tile_type_coherence.cpp
     src/ir/verifier/verify_assign_type_symmetry.cpp

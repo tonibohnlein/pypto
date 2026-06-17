@@ -292,13 +292,13 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
       << "ForStmt iter_args size (" << op->iter_args_.size() << ") must equal return_vars size ("
       << op->return_vars_.size() << ")";
 
-  if (op->kind_ == ir::ForKind::Unroll) {
-    LOG_WARN << "ForKind::Unroll loop was not expanded before codegen; "
-                "generating sequential loop as fallback";
-  } else if (op->kind_ == ir::ForKind::Pipeline) {
-    LOG_WARN << "ForKind::Pipeline loop reached codegen; CanonicalizeIOOrder "
-                "should have demoted it to Sequential. Generating sequential loop as fallback.";
-  }
+  INTERNAL_CHECK_SPAN(op->kind_ != ir::ForKind::Unroll, op->span_)
+      << "Internal error: ForKind::Unroll reached codegen — UnrollLoops and "
+      << "SplitChunkedLoops should have resolved it. The pipeline is incomplete.";
+  INTERNAL_CHECK_SPAN(op->kind_ != ir::ForKind::Pipeline, op->span_)
+      << "Internal error: ForKind::Pipeline reached codegen — LowerPipelineLoops "
+      << "and CanonicalizeIOOrder should have demoted it to Sequential. "
+      << "The pipeline is incomplete.";
 
   // Evaluate loop bounds and ensure they are index-typed for scf.for.
   // EmitCastToIndex is a no-op when the bound is already DataType::INDEX

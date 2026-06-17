@@ -406,6 +406,11 @@ class TestConvertTensorToTileOps:
         (here [16, 64] flattens to itself) with the dst's FP16 dtype, threaded as the
         4th positional arg of ``pld.tile.put``; the ``atomic`` kwarg is forwarded
         unchanged. The InCore is void (no return), so no Out param is appended.
+
+        The ``dst`` window param is upgraded from In to Out by
+        ``UpgradeWrittenTensorParamDirections`` since the HCCL TPUT writes
+        through it — without this, a downstream reader of the same window
+        gets no RAW edge from the orchestration codegen (issue #1732).
         """
 
         @pl.program
@@ -427,7 +432,7 @@ class TestConvertTensorToTileOps:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                dst: pld.DistributedTensor[[16, 64], pl.FP16],
+                dst: pl.Out[pld.DistributedTensor[[16, 64], pl.FP16]],
                 src: pld.DistributedTensor[[16, 64], pl.FP16],
                 peer: pl.Scalar[pl.INT32],
             ):
@@ -445,7 +450,14 @@ class TestConvertTensorToTileOps:
         ir.assert_structural_equal(After, Expected)
 
     def test_get_emits_tile_create_plus_tile_get(self):
-        """pld.tensor.get lowers to tile.create(stage) + pld.tile.get(dst, peer, src, stage)."""
+        """pld.tensor.get lowers to tile.create(stage) + pld.tile.get(dst, peer, src, stage).
+
+        The ``dst`` window param is upgraded from In to Out by
+        ``UpgradeWrittenTensorParamDirections`` since the HCCL TGET writes
+        the pulled bytes into the local window slot — without this, a
+        downstream reader of the same window gets no RAW edge from the
+        orchestration codegen (issue #1732).
+        """
 
         @pl.program
         class Before:
@@ -463,7 +475,7 @@ class TestConvertTensorToTileOps:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                dst: pld.DistributedTensor[[16, 64], pl.FP16],
+                dst: pl.Out[pld.DistributedTensor[[16, 64], pl.FP16]],
                 src: pld.DistributedTensor[[16, 64], pl.FP16],
                 peer: pl.Scalar[pl.INT32],
             ):
@@ -472,6 +484,50 @@ class TestConvertTensorToTileOps:
                 )
                 pld.tile.get(dst, peer, src, tget_stage)
                 return  # noqa: PLR1711  (DSL return terminator, not a Python no-op)
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_allreduce_upgrades_target_and_signal_to_inout(self):
+        """``pld.tensor.allreduce(target, signal, op=...)`` upgrades both
+        ``target`` and ``signal`` params from In to InOut.
+
+        ConvertTensorToTileOps runs upstream of LowerCompositeOps (pass 14),
+        so it sees ``pld.tensor.allreduce`` as a single composite Call before
+        the 4-phase decomposition exists. Without the explicit
+        ``has_read | has_write`` marking, the param-direction analysis
+        would leave the window params as In and a downstream reader of
+        the same window slot would miss the RAW edge (issue #1732), same
+        failure mode as the put/get tests above.
+
+        The Call itself is NOT lowered by this pass — ``pld.tensor.allreduce``
+        is a composite op consumed by ``LowerCompositeOps`` later. Only the
+        param directions change.
+        """
+        SIZE = 16
+        nr = 2
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                target: pld.DistributedTensor[[1, SIZE], pl.FP32],
+                signal: pld.DistributedTensor[[nr, 1], pl.INT32],
+            ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+                target = pld.tensor.allreduce(target, signal, op=pld.ReduceOp.Sum)
+                return target
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                target: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+                signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+            ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+                target = pld.tensor.allreduce(target, signal, op=pld.ReduceOp.Sum)
+                return target
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)

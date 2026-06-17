@@ -211,11 +211,9 @@ class TestPhaseFenceDepCompressionCodegen:
     def test_chained_snapshot_example_emits_branch_sized_barriers(self):
         branches = 4
         code = _compile_program(build_chained_snapshot_phase_fence(branches=branches))
-        # With AutoDeriveTaskDependencies, compiler-derived deps for RAW/WAR/WAW
-        # hazards produce per-task fan-in arrays directly instead of phase-fence
-        # barrier tasks.  Each task carries deps[4] on the previous phase's tids.
-        assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") == 0, code
-        assert re.search(r"PTO2TaskId params_t\d+_deps\[4\];", code), code
+        # User-written manual scopes are not analyzed by AutoDeriveTaskDependencies;
+        # array deps are compressed by the manual phase-fence pass.
+        _assert_single_barrier_shape(code, fanin=branches)
         _assert_ordered(
             code,
             "for (int64_t a_phase =",
@@ -274,10 +272,9 @@ class TestPhaseFenceDepCompressionCodegen:
                 return out
 
         code = _compile_program(Prog)
-        # With AutoDeriveTaskDependencies, compiler-derived deps produce direct
-        # per-task fan-in dependencies instead of a phase-fence barrier.
-        assert "rt_submit_dummy_task" not in code, code
-        assert re.search(r"PTO2TaskId params_t\d+_deps\[4\];", code), code
+        # User-written manual scopes are not analyzed by AutoDeriveTaskDependencies;
+        # the array dep between sibling loops is represented as a phase fence.
+        _assert_single_barrier_shape(code, fanin=branches)
         # Producer and consumer loops both survive.
         assert "for (int64_t producer_branch =" in code, code
         assert "for (int64_t consumer_branch =" in code, code
@@ -363,14 +360,11 @@ class TestPhaseFenceDepCompressionCodegen:
                 return out
 
         code = _compile_program(Prog)
-        # With AutoDeriveTaskDependencies, compiler-derived deps produce direct
-        # per-task fan-in dependencies instead of phase-fence barriers.
-        assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") == 0, code
-        # k1 (r1/p1 loop): 4 user deps (tids) + compiler deps on tids = deps[4]
-        # k2 (r2/p2 loop): deps on tids[0..3] = deps[4]
-        # k3 (r3/p3 loop): deps on tids2[0..7] = deps[8]
-        assert re.search(r"PTO2TaskId params_t\d+_deps\[4\];", code), code
-        assert re.search(r"PTO2TaskId params_t\d+_deps\[8\];", code), code
+        # User-written manual scopes are not analyzed by AutoDeriveTaskDependencies;
+        # stable array deps are still compressed to manual phase-fence barriers.
+        assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") >= 1, code
+        assert re.search(r"PTO2TaskId params_phase_fence_barrier_\d+_deps\[4\];", code), code
+        assert re.search(r"PTO2TaskId params_phase_fence_barrier_\d+_deps\[8\];", code), code
         _assert_ordered(
             code,
             "for (int64_t r1 =",
@@ -445,10 +439,15 @@ class TestPhaseFenceDepCompressionCodegen:
                 return out
 
         code = _compile_program(Prog)
-        # With AutoDeriveTaskDependencies, compiler-derived deps produce direct
-        # per-task fan-in dependencies instead of a phase-fence barrier.
-        assert "rt_submit_dummy_task" not in code, code
-        # All task dep arrays carry direct fan-in deps[3] on the relevant tids
+        # Mixed shapes keep compressible array deps as phase fences and leave
+        # the non-covered deps as direct fan-in arrays.
+        assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") == 1, code
+        assert re.search(r"PTO2TaskId params_phase_fence_barrier_\d+_deps\[3\];", code), code
+        assert re.search(
+            r"if \(phase_fence_barrier_\d+_tid\.is_valid\(\)\) "
+            r"params_t\d+_deps\[params_t\d+_deps_count\+\+\] = phase_fence_barrier_\d+_tid;",
+            code,
+        ), code
         assert re.search(r"PTO2TaskId params_t\d+_deps\[3\];", code), code
         _assert_ordered(
             code,

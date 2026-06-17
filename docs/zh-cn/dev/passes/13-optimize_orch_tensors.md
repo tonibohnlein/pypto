@@ -1,10 +1,10 @@
 # OptimizeOrchTensors Pass
 
-优化编排函数与 InCore 函数之间的张量缓冲区使用，消除冗余分配、改善布局信息，并把静态可证明的局部 Out 窗口写显式化。
+优化编排函数与 InCore 函数之间的张量缓冲区使用，消除冗余分配、改善布局信息，并把静态可证明的局部张量窗口在 orchestration callsite 显式化。
 
 ## 概述
 
-`ConvertTensorToTileOps` 之后，编排函数在每个 InCore 调用点分配输出张量（`tensor.create`），即使在循环内同一缓冲区可以复用。本 pass 应用五个优化模式来减少分配、改善缓冲区布局信息，并显式化可静态证明的局部 Out 窗口写。
+`ConvertTensorToTileOps` 之后，编排函数在每个 InCore 调用点分配输出张量（`tensor.create`），即使在循环内同一缓冲区可以复用。本 pass 应用五个优化模式来减少分配、改善缓冲区布局信息，并在 orchestration callsite 显式化可静态证明的局部张量窗口。
 
 **前置条件**：
 
@@ -72,11 +72,11 @@ for i in pl.range(N, init_values=[init_buf]):
 
 **方案**：分析编排函数中的 `tensor.slice(parent, size, offset)` 模式。当切片结果作为 `In` 参数传递给 InCore 调用时，将父张量形状推导出的步长通过 `TensorView` 附加到 InCore 函数的 `In` 参数类型上，使 `tile.load` 能使用正确的内存布局。
 
-### 模式 5：静态 Out 窗口外提（OutWindowExternalizer）
+### 模式 5：静态窗口外提（OutWindowExternalizer）
 
-**问题**：某些 outlined callee 实际只写入大 `Out` 张量中的一个静态可证明局部窗口，但调用点仍传入整块张量。后续依赖分析会把它视为整块缓冲区写者，从而引入不必要的串行化。
+**问题**：某些 outlined callee 实际只写入大 `Out` 张量中的一个静态可证明局部窗口，或只消费大 `In` 张量中的一个静态可证明局部窗口，但调用点仍传入整块张量。后续依赖分析会把它视为整块缓冲区访问，从而引入不必要的串行化。
 
-**方案**：为 callee 克隆出 `__windowed` 版本，收窄被改写 `Out` 参数类型及返回类型，并局部化内部 `tile.store` offset。然后将 orchestration callsite 改写为显式的 `slice + __windowed call + assemble`：
+**方案**：为 callee 克隆出 `__windowed` 版本，收窄被改写的张量参数类型，并局部化内部 offset。然后在 orchestration callsite 物化局部 slice。输出窗口使用 `slice + __windowed call + assemble`：
 
 ```python
 out_window = pl.tensor.slice(out, shape, offset)
@@ -84,18 +84,64 @@ out_window_next = self.kernel__windowed(..., out_window)
 out = pl.tensor.assemble(out, out_window_next, offset)
 ```
 
+输入窗口使用相同的 callsite 局部 slice 物化，但不需要 assemble：
+
+```python
+in_window = pl.tensor.slice(inp, shape, offset)
+result = self.consumer__windowed(in_window, ...)
+```
+
+如果待物化 slice 的 parent 是循环返回 alias，pass 会对 `ForStmt` 和 `WhileStmt`
+都把这个 parent 改写为该循环 codegen 可见的 init tensor，避免生成的
+orchestration C++ 在作用域外引用 loop-return SSA 名字。循环体内部的
+loop-carried iter-arg 不会被这样折叠。
+
+本 pass 有意保持保守的 window eligibility。它不会按 `topk` 等算子名字做特判；只有 callee 函数体能证明满足下面的访问模式时，才会 window 化。
+
 支持的改写形态：
 
 - `FinalStore`：callee 返回一次写入局部窗口的最终 `tile.store(...)` 结果
 - `AggregateWindowLoop`：callee 在循环中携带一个或多个 `Out`，并写入静态可证明的聚合窗口，例如 outlined `kv_proj` 分组形态
+- `PureInputWindowConsumer`：有数据返回的 callee 中，某个 `In` 张量参数只通过同一个局部输入窗口被使用
+- `AggregateInputWindowLoop`：与 `AggregateWindowLoop` 输出改写配套使用；某个 `In` 张量参数只通过内部 loop 的局部 `tile.load`/`tensor.slice` 窗口读取，并且这些 offset 能沿同一个内部 loop 展开为一个静态可证明的 parent-shaped region，例如 qk norm 的 q/k 输入
 
-安全规则：
+输出窗口 eligibility：
 
-- 只接受静态可证明的仿射 offset
+- 写入必须是静态可证明的局部 `tile.store` 窗口或聚合窗口循环
+- window shape 和 offset 必须足够静态，能够物化为 `tensor.slice`
+- offset 必须是该 pass 可接受的外层循环变量仿射表达式
 - multi-`Out` 改写采用全有或全无策略
+- 如果同一 callsite 中多个被 externalize 的 `Out` 参数解析到同一个 parent tensor，该 callsite 保持 full-tensor；Pattern 5 不尝试把多个 `tensor.assemble` 串成同一个 parent state
 - 顺序循环 sibling 只有在每个被改写 `Out` 都能证明跨 sibling iteration 不重叠时才改写
-- 如果被改写的窗口输出所属 buffer root 后续会在外围 orchestration scope 中以完整 parent tensor 形式读取，则跳过该 call-site externalization；在 runtime 尚未具备 view/parent root-aware 依赖跟踪前，这能让自动依赖继续落在同一个 parent `Tensor` 上
-- `DeriveCallDirections` 保持现有 sound 的顺序 `Out -> InOut` 规则；Pattern 5 只是在该 pass 运行前显式化不重叠窗口
+- 同一 scope 内写入同一 parent 或 alias parent tensor 的 sibling writer，只要每个 writer 自身满足静态 output-window eligibility，仍然可以 externalize；但如果同一个 parent 还存在无法 externalize 成 output window 的 sibling full writer（`Out` 或 `InOut`），则写同一 parent 的其他 writer 也保持 full-tensor，避免这个非 window writer 掩盖只被部分初始化的区域
+- 对剩余 windowed writer，写写/写读顺序交给 runtime TensorMap 对实际 submit 的 window descriptor 做 overlap 建边
+- sibling-writer alias 收集会递归进入嵌套 `SeqStmts`、`ForStmt`、`WhileStmt` 和 `IfStmt` body，因此 loop return、tuple projection 这类 tensor alias 会先折叠到 codegen 可见的 parent，再生成 call-site slice
+- 后续 full-parent read 不会关闭输出 window；callsite 暴露真实窗口张量之后，正确性依赖 runtime TensorMap overlap dependence
+
+输入窗口 eligibility：
+
+- 参数必须是 `In` 张量
+- callee 内部对该参数的每一次引用都必须匹配同一个局部窗口
+- 支持的引用只有 `tile.load` 和 `tensor.slice`
+- 拒绝 transpose load
+- `tile.load` 的 read shape 必须等于候选 window shape
+- 所有匹配引用必须具有相同 window shape 和 offset
+- 如果存在任何 unsupported ref，则整个输入参数保持 full-tensor
+- pure input-window 的 shape 和 callee-local offset 表达式只能引用 callee 参数；callsite 替换后这些参数可以携带外层 loop-affine 值，windowed callee 内部再相对 `[0, ...]` 读取
+- 对 `PureInputWindowConsumer`，如果匹配出的窗口其实是 zero offset 的 full shape，则跳过，因为 slice 不能暴露更窄依赖
+- 对 `PureInputWindowConsumer`，如果 callee 没有数据返回，则保持 full-tensor；这类 consumer 可能是 side-effect 或 fence task，full input 本身用于表达更宽的依赖
+- input-only 的 `Submit` callsite 保持 full-tensor；在 `manual_scope` 中，即使 callee body 只读局部窗口，full input 也可能有意表达更宽的依赖
+- 如果同一个 callee 同时满足 output-window 改写，已经证明成立的 pure input window 会被保留，并在同一个 callsite 一起物化
+- 对 `AggregateInputWindowLoop`，所有引用必须位于同一个静态 `ForStmt` 内，至少一个 offset 维度必须随该 loop 变化，并且聚合窗口必须等于输入 parent shape；权重子窗口这类 partial aggregate read 仍保持 full-tensor
+
+非目标与依赖模型：
+
+- pass 不添加 explicit dependency edges
+- pass 不重新引入 later full-parent-read guard
+- pass 不预生成全局 window descriptor 数组
+- pass 不拆分 SPMD launch，也不 externalize per-block SPMD window
+- unsupported consumer，包括 full-tensor reader，保持 baseline/full-tensor input
+- `DeriveCallDirections` 保持现有 sound 的顺序 `Out -> InOut` 规则；Pattern 5 只是在该 pass 运行前显式化可证明的局部窗口
 
 ## 示例（模式 1）
 
@@ -169,7 +215,7 @@ class After:
 | `AssembleParentStridesOptimizer` | 模式 2 — 通过 TensorView 附加父张量步长 |
 | `SliceInputStridesOptimizer` | 模式 4 — 通过 TensorView 为切片输入的 In 参数附加父张量步长 |
 | `AssembleLoopRewriter` | 模式 3 — 将 tile.assemble 循环重写为 tile.store 循环 |
-| `OutWindowExternalizer` | 模式 5 — 识别静态可证明的局部 Out 窗口写，并改写为显式 `slice + call + assemble` |
+| `OutWindowExternalizer` | 模式 5 — 将 eligible 的局部 Out 写和 eligible In-window consumer 改写为显式 callsite slice |
 | `BuildOutParamReturnMappings` | 共享辅助函数 — 通过 tile.store 映射 Out 参数到返回索引 |
 | `ComputeRowMajorStrides` | 共享辅助函数 — 从形状计算行主序步长 |
 

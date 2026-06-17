@@ -76,12 +76,42 @@ Setup is derived from the split bodies:
 - `dir_mask`: `C2V=1`, `V2C=2`, bidirectional=`3`
 - `id`: omitted for automatic setup, so PTOAS uses the default frontend pipe id `0`
 - `slot_size`: max tile byte size across all directions (`shape * dtype bits / 8`)
-- `slot_num`: `8` for unidirectional, `4` per direction for bidirectional
+- `slot_num`: ring depth — `8` for unidirectional, `4` per direction for bidirectional by default; overridable per scope (see below)
 - `buffer_size`: `slot_num * slot_size`
 - buffer names: `<func>_c2v_slot_buffer` / `<func>_v2c_slot_buffer`
 - reserve-buffer base: `AUTO` on insertion, then resolved to an explicit address by `AllocateMemoryAddr`
 
 When cross-core directions use different tile sizes, the pass picks `max(all observed tile byte sizes)` as the common `slot_size` for `initialize_pipe`. Smaller tiles leave unused bytes in each slot but hardware correctness is preserved. Explicit user-authored programs can still create multiple independent pipes by supplying different `id` values to `initialize_pipe` and matching `tpush` / `tpop` / `tfree` ops.
+
+### Overriding the ring depth (`slot_num`)
+
+The default ring depth (8 / 4) can be tuned per split scope with the optional
+`slot_num=` argument on `pl.split`:
+
+```python
+# Shrink the auto-inserted cube->vector ring to free buffer space for a larger
+# vector tile (e.g. grow the vec tile past the default-8-slot ceiling).
+with pl.spmd(4, optimizations=[pl.split(pl.SplitMode.UP_DOWN, slot_num=4)]):
+    ...
+
+# Or on the pl.at form:
+with pl.at(level=pl.Level.CORE_GROUP,
+           optimizations=[pl.split(pl.SplitMode.UP_DOWN, slot_num=16)]):
+    ...
+```
+
+The value is carried as the `slot_num` scope attr, propagated by
+`OutlineIncoreScopes` to the outlined function's `slot_num` attr, and read here.
+When set it drives **both** the reserved buffer (`slot_size * slot_num`) and the
+emitted `initialize_pipe` `slot_num` attribute, so PTOAS and the auto-reserved
+buffer stay consistent. Omitting it keeps the PTOAS-derived default. `slot_num`
+must be positive and only applies when the scope enables a cross-core split
+(`UP_DOWN` / `LEFT_RIGHT`).
+
+> Decoupling the logical ring depth from a smaller local resident window
+> (`local_slot_num < slot_num`, an a2/a3-only optimisation) is not yet exposed
+> on the automatic split path — use the manual `pl.aic_initialize_pipe` /
+> `pl.aiv_initialize_pipe` system ops for that.
 
 For consumer-side cross-core tiles, the pass also ensures each `tile.tpop_*` has a matching
 `system.tfree_*`. When an existing free is obviously too early, the pass delays it to a later statement in the same
@@ -198,6 +228,14 @@ Phase 3 — Rewrite Group callers:
 
 **Loop-state repair after splitting**: mixed-loop control flow is intentionally preserved during body construction, which can leave one side with extra iter_args, missing init-value definitions, or yields that reference stripped branch-local values. The pass repairs those cases before DCE, then normalizes loop-carried state once more after DCE because dead shared aliases can disappear and make an iter_arg removable only at that stage. A final DCE pass cleans up any init-value chains that become dead after the second strip.
 
+**Group wrapper param-returns**: a newly created Group wrapper
+returns its own parameters when every return position traces to a param
+writeback (via `return_lineage::ReturnedParamIndices`) — the AIV call is
+emitted as a bare `EvalStmt` and the wrapper returns the matching Group
+params directly (e.g. `return out_0`), keeping the `ReturnParamsExplicit`
+invariant. Only when some position is not a param writeback does it fall back
+to the legacy `result = aiv_call(); return result` form.
+
 ## Example 1: InCore without existing Group caller
 
 When Orchestration calls InCore directly, a new Group wrapper is created.
@@ -252,8 +290,8 @@ class After:
     @pl.function(type=pl.FunctionType.Group)
     def compute_incore_0(self, x, y, out_0) -> pl.Tensor[[16, 128], pl.FP32]:
         self.compute_incore_0_aic(x, y, out_0)
-        result = self.compute_incore_0_aiv(x, y, out_0)
-        return result
+        self.compute_incore_0_aiv(x, y, out_0)
+        return out_0  # param-return: the AIV result writes through out_0
 
     @pl.function(type=pl.FunctionType.Orchestration)
     def main(self, x, y) -> pl.Tensor[[16, 128], pl.FP32]:

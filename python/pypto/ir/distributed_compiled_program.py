@@ -16,6 +16,7 @@ through simpler's distributed runtime (Worker level=3)::
     compiled(a, b, c)   # executes via simpler Worker(level=3)
 """
 
+import json
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -25,17 +26,25 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from pypto.backend import BackendType
-from pypto.pypto_core.ir import Program, Role, level_to_linqu_level
+from pypto.pypto_core.ir import ParamDirection, Program, Role, level_to_linqu_level
 from pypto.runtime.device_tensor import DeviceTensor
 
 from .compiled_program import (
     CallArg,
     _default_platform,
     _extract_param_infos,
+    _param_info_from_dict,
+    _param_info_to_dict,
     _ParamInfo,
     _to_torch_dtype,
     _validate_device_tensor,
 )
+
+# Filename of the small JSON sidecar persisted alongside the build artifacts so
+# the program can be reconstructed (``from_dir``) without the live post-pass IR.
+# Bump ``_META_SCHEMA`` on any incompatible format change.
+_DISTRIBUTED_META_FILENAME = "distributed_meta.json"
+_META_SCHEMA = 1
 
 if TYPE_CHECKING:
     from pypto.runtime.distributed_runner import DistributedWorker
@@ -106,32 +115,46 @@ class DistributedCompiledProgram:
 
     def __init__(
         self,
-        program: Program,
+        program: Program | None,
         output_dir: str,
         *,
         backend_type: BackendType = BackendType.Ascend910B,
         platform: str | None = None,
         distributed_config: DistributedConfig | None = None,
+        _param_infos: list[_ParamInfo] | None = None,
+        _output_indices: list[int] | None = None,
+        _return_types: list[Any] | None = None,
     ) -> None:
         # ``program`` is the post-pass IR. The runtime needs post-pass IR for
         # orchestrator metadata (post-SSA names that match the generated
         # host_orch.py) and to iterate Orchestration functions synthesized by
         # passes such as OutlineHierarchyScopes.
+        #
+        # ``program`` is ``None`` on the :meth:`from_dir` reload path: param
+        # metadata is supplied pre-derived via the ``_param_infos`` /
+        # ``_output_indices`` / ``_return_types`` kwargs (read back from
+        # ``distributed_meta.json``), and chip-callable assembly is driven by
+        # the on-disk ``next_levels/`` layout — so no live IR is needed.
         self._program = program
         self._output_dir = Path(output_dir).resolve()
         self._backend_type = backend_type
         self._platform = platform or _default_platform(backend_type)
         self._distributed_config = distributed_config or DistributedConfig()
-        self._param_infos = None
-        self._output_indices = None
-        self._return_types = None
+        self._param_infos = _param_infos
+        self._output_indices = _output_indices
+        self._return_types = _return_types
 
         # RunTiming from the most recent __call__ (host_wall_us; device_wall_us
         # is 0 for the L3 DAG), or None before the first on-device run. Surfaced
         # as a side channel so the call return value stays outputs/None.
         self.last_run_timing: Any = None
 
-        self._emit_debug_runner()
+        # Only the fresh-compile path (live IR) writes artifacts. The reload
+        # path must not clobber a user's hand-edited debug/run.py or the
+        # already-present metadata file.
+        if program is not None:
+            self._persist_metadata()
+            self._emit_debug_runner()
 
     def _emit_debug_runner(self) -> None:
         """Write ``<output_dir>/debug/run.py`` for replaying this program.
@@ -153,12 +176,122 @@ class DistributedCompiledProgram:
             return
         write_run_script(self._output_dir, param_infos, platform=self._platform)
 
+    def _persist_metadata(self) -> None:
+        """Write ``<output_dir>/distributed_meta.json`` for :meth:`from_dir`.
+
+        Captures exactly what :func:`execute_distributed` reads from the
+        post-pass IR — the HOST-orchestrator param metadata (post-SSA names,
+        directions, shapes, dtypes) plus the return-type count — alongside the
+        platform / backend / :class:`DistributedConfig` so a later reload can
+        reconstruct a fully functional program without re-running the pass
+        chain. Chip-callable assembly is rederived from the ``next_levels/``
+        layout and needs no persistence.
+
+        Best-effort: a program without a resolvable orchestrator signature
+        skips emission (mirrors :meth:`_emit_debug_runner`); :meth:`from_dir`
+        then reports the missing file with a recompile hint.
+        """
+        try:
+            param_infos, _, return_types = self._get_metadata()
+        except (ValueError, TypeError):
+            return
+        dc = self._distributed_config
+        meta = {
+            "schema": _META_SCHEMA,
+            "params": [_param_info_to_dict(p) for p in param_infos],
+            "num_return_types": len(return_types),
+            "platform": self._platform,
+            "backend_type": self._backend_type.name,
+            "distributed_config": {
+                "device_ids": list(dc.device_ids),
+                "num_sub_workers": dc.num_sub_workers,
+                "runtime": dc.runtime,
+                "block_dim": dc.block_dim,
+                "aicpu_thread_num": dc.aicpu_thread_num,
+            },
+        }
+        (self._output_dir / _DISTRIBUTED_META_FILENAME).write_text(json.dumps(meta, indent=2))
+
+    @classmethod
+    def from_dir(
+        cls,
+        output_dir: str | os.PathLike[str],
+        *,
+        platform: str | None = None,
+        backend_type: BackendType | None = None,
+        distributed_config: DistributedConfig | None = None,
+    ) -> "DistributedCompiledProgram":
+        """Reconstruct a distributed program from an existing ``build_output/`` dir.
+
+        Rebuilds metadata from ``distributed_meta.json`` (written at compile
+        time) so the program is callable / dispatchable **without** re-running
+        the pypto compile — the basis of the ``runtime_dir`` replay workflow for
+        L3 programs. Chip callables are assembled from the on-disk
+        ``next_levels/`` layout at dispatch time.
+
+        Args:
+            output_dir: A build directory produced by a prior ``ir.compile`` of
+                a distributed (L3+) program. Must contain
+                ``distributed_meta.json``.
+            platform: Override the persisted platform (e.g. swap ``a2a3sim`` →
+                ``a2a3`` to replay on hardware). ``None`` keeps the persisted
+                value.
+            backend_type: Override the persisted codegen backend. ``None`` keeps
+                the persisted value.
+            distributed_config: Override the persisted run config (e.g. to
+                replay on a different set of ``device_ids``). ``None`` rebuilds
+                the :class:`DistributedConfig` recorded at compile time.
+
+        Returns:
+            A :class:`DistributedCompiledProgram` whose ``__call__`` / ``prepare``
+            behave exactly like the freshly-compiled object.
+
+        Raises:
+            FileNotFoundError: ``distributed_meta.json`` is absent (the directory
+                predates this feature or is not a distributed build).
+            ValueError: ``distributed_meta.json`` records a ``schema`` version
+                incompatible with this pypto build (the metadata format changed).
+        """
+        meta_path = Path(output_dir).resolve() / _DISTRIBUTED_META_FILENAME
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"{meta_path} not found — cannot reconstruct a distributed program from this "
+                f"directory. It predates the L3 replay feature or is not a distributed (L3+) "
+                f"build. Recompile via ir.compile() to refresh."
+            )
+        meta = json.loads(meta_path.read_text())
+        schema = meta.get("schema")
+        if schema != _META_SCHEMA:
+            raise ValueError(
+                f"Incompatible {_DISTRIBUTED_META_FILENAME} schema {schema!r} (expected "
+                f"{_META_SCHEMA}) in {meta_path}. The metadata was written by a different "
+                f"pypto version — recompile via ir.compile() to refresh."
+            )
+        param_infos = [_param_info_from_dict(p) for p in meta["params"]]
+        output_indices = [i for i, p in enumerate(param_infos) if p.direction == ParamDirection.Out]
+        # ``return_types`` contents are never inspected at runtime — only the
+        # count matters (has_return = len(...) > 0), so placeholders suffice.
+        return_types: list[Any] = [None] * int(meta.get("num_return_types", 0))
+        dc = distributed_config or DistributedConfig(**meta.get("distributed_config", {}))
+        bt = backend_type or getattr(BackendType, meta.get("backend_type", "Ascend910B"))
+        return cls(
+            None,
+            str(output_dir),
+            backend_type=bt,
+            platform=platform or meta.get("platform"),
+            distributed_config=dc,
+            _param_infos=param_infos,
+            _output_indices=output_indices,
+            _return_types=return_types,
+        )
+
     @property
     def output_dir(self) -> Path:
         return self._output_dir
 
     @property
-    def program(self) -> Program:
+    def program(self) -> Program | None:
+        """Post-pass IR, or ``None`` for a program reconstructed via :meth:`from_dir`."""
         return self._program
 
     @property
@@ -176,6 +309,13 @@ class DistributedCompiledProgram:
 
     def _get_metadata(self) -> tuple[list[_ParamInfo], list[int], list[Any]]:
         if self._param_infos is None:
+            if self._program is None:
+                # Reload path with no pre-filled metadata — should not happen
+                # (``from_dir`` always supplies it); guard rather than deref None.
+                raise RuntimeError(
+                    "DistributedCompiledProgram has neither live IR nor persisted param "
+                    "metadata; reconstruct via DistributedCompiledProgram.from_dir()."
+                )
             # Find the HOST orchestrator function (post-SSA names match the
             # generated Python code).
             host_orch = None

@@ -40,6 +40,10 @@ inline const PassProperties kInlineFunctionsProperties{.produced = {IRProperty::
 inline const PassProperties kMaterializeCommDomainScopesProperties{
     .produced = {IRProperty::CommDomainScopesMaterialized}};
 
+inline const PassProperties kLowerHostTensorCollectivesProperties{
+    .required = {IRProperty::CommDomainScopesMaterialized},
+    .produced = {IRProperty::CommDomainScopesMaterialized}};
+
 // -- MaterializeRuntimeScopes pass (runs last, after the final Simplify) ------
 //    Inserts explicit AUTO RuntimeScopeStmt nodes for the orchestration function
 //    body and for/if bodies so codegen emits PTO2_SCOPE 1:1 from the IR.
@@ -59,7 +63,7 @@ inline const PassProperties kCtrlFlowTransformProperties{.produced = {IRProperty
 
 inline const PassProperties kSplitChunkedLoopsProperties{
     .required = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure}};
+    .produced = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure, IRProperty::UnrollResolved}};
 
 // -- Chunk loop interchange pass (runs after SplitChunkedLoops) ---------------
 
@@ -232,9 +236,20 @@ inline const PassProperties kAllocateMemoryAddrProperties{
 // -- Return order normalization pass ------------------------------------------
 
 inline const PassProperties kNormalizeReturnOrderProperties{
-    .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps}};
+    .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps},
+    .produced = {IRProperty::ReturnParamsExplicit}};
 
 // -- Pipeline lowering + IO-order canonicalization passes (tile-level, before InitMemRef) ------
+
+// SkewCrossCorePipeline runs immediately before LowerPipelineLoops and rewrites
+// cross-core (cube/vector) pipeline loops into prologue/steady/epilogue skew or a
+// Sequential demotion; same tile-level property set as the unroll pass
+// (structural rewrite, no property added or removed).
+inline const PassProperties kSkewCrossCorePipelineProperties{
+    .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
 
 inline const PassProperties kLowerPipelineLoopsProperties{
     .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
@@ -256,6 +271,11 @@ inline const PassProperties kCanonicalizeIOOrderProperties{
 // PropertyVerifierRegistry), so PassPipeline auto-verifies it whenever this
 // pass produces the property — no separate verify pass is needed.
 
+// DeriveCallDirections also performs manual-scope lowering as Phase 2 (the
+// former DeriveManualScopeDeps pass). Phase 2 reads the arg_directions
+// populated by Phase 1; manual dependency edges stay in the typed
+// ``Submit::deps_`` field throughout (ManualDepsOnSubmitOnly invariant), so
+// no separate IRProperty is needed here.
 inline const PassProperties kDeriveCallDirectionsProperties{.required = {IRProperty::SplitIncoreOrch},
                                                             .produced = {IRProperty::CallDirectionsResolved}};
 

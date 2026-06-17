@@ -14,7 +14,7 @@ Codegen must be a **strict 1-to-1 translation** from IR to generated code. Each 
 
 **Why:** Codegen that embeds analysis becomes fragile — it duplicates logic that passes already handle, and it's harder to test in isolation. Keeping codegen a straightforward translation ensures it stays predictable and maintainable.
 
-**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass.
+**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/24-normalize_return_order.md) pass.
 
 ## Overview
 
@@ -35,6 +35,11 @@ The codegen generates MLIR in the following fixed order:
 2. **Tensor Views**: `pto.make_tensor_view` for all tensor parameters
 3. **Allocations**: `pto.alloc_tile` for all tile buffers (based on MemRef)
 4. **Operations**: Function body with load, compute, store operations
+
+The tensor-view and allocation prologue is rendered into a buffer *before* the
+constants block is finalized, so a constant that appears only inside a shape or
+stride expression — e.g. the `2` in a composite parameter dim `M * 2` — is still
+declared in the constants block before its use.
 
 ## Architecture
 
@@ -221,7 +226,8 @@ For each `TensorType` parameter, the codegen generates:
 
 - Shape from `TensorType.shape_`
 - Strides computed as row-major: `[dim1, 1]` for 2D tensors
-- Constants (`%c32_index`, `%c1_index`) auto-generated
+- Constants (`%c32_index`, `%c1_index`) auto-generated, including any that appear only inside a composite shape/stride expression
+- Composite dims lower to arithmetic, e.g. `M * 2` → `arith.muli %M, %c2_index`
 - Tensor view type uses `?` for each dimension (e.g., `?x?xf32` for 2D)
 
 #### Layout Handling for 2D Tensors
