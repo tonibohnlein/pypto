@@ -124,6 +124,23 @@ class TestSwimlaneOutput:
         """A l2_swimlane_records.json file is created in build_output/*/dfx_outputs/."""
         assert swimlane_file.exists(), f"Swimlane file not found: {swimlane_file}"
 
+    def test_name_map_generated(self, swimlane_file: Path):
+        """A name_map_*.json (func_id→kernel name) is written next to the records.
+
+        pypto does not use simpler's SceneTest harness, so it synthesises the
+        name map from ``kernel_config.py``. Without it the profiling tools
+        (``swimlane_converter --func-names`` / ``deps_to_graph`` sibling
+        auto-load) render anonymous ``task(rXtY)`` labels instead of real
+        kernel names.
+        """
+        import json  # noqa: PLC0415
+
+        dfx_dir = swimlane_file.parent
+        name_maps = list(dfx_dir.glob("name_map_*.json"))
+        assert name_maps, f"No name_map_*.json generated in {dfx_dir}"
+        data = json.loads(name_maps[0].read_text(encoding="utf-8"))
+        assert data.get("callable_id_to_name"), f"name_map {name_maps[0].name} has empty callable_id_to_name"
+
     def test_top_level_structure(self, swimlane_data: dict):
         """Top-level 'l2_swimlane_level' and 'tasks' fields are present and valid."""
         assert "l2_swimlane_level" in swimlane_data, "Missing top-level field: 'l2_swimlane_level'"
