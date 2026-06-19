@@ -32,12 +32,17 @@
 #include <unordered_set>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/soc.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/pipe.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
@@ -89,6 +94,60 @@ constexpr int64_t kCubeComputeCost = 64;        // per 16x16x16 cube fractal (me
 constexpr int64_t kVectorComputeCost = 1;       // per vector SIMD step
 constexpr int64_t kVectorLanes = 256;           // elements per vector SIMD step
 constexpr int64_t kKernelFillCost = 10000;      // per-kernel pipeline fill
+
+// Core counts + on-chip capacities. Defaults are the 910B values above; the
+// real ones are read from the configured backend's SoC (so the safe-UB cap and
+// 950 specs are picked up automatically). Compute-cost / bandwidth params are
+// cost-model calibration (not in the SoC) and stay as tuned constants.
+struct HwParams {
+  int num_cube_cores = kNumCubeCores;
+  int num_vector_cores = kNumVectorCores;
+  int64_t l1_capacity = kL1Capacity;      // per-cube Mat
+  int64_t cube_capacity = kCubeCapacity;  // per-cube Acc (L0c)
+  int64_t vec_capacity = kVecCapacity;    // per-vector Vec (UB)
+};
+
+// Read the topology + capacities from the configured backend's SoC (SoC -> Die
+// -> Cluster -> Core -> Mem). Falls back to the 910B defaults when no backend is
+// configured (e.g. standalone `passes.auto_fuse()` with no PassContext/backend).
+HwParams ReadHwParams() {
+  HwParams p;
+  if (!backend::BackendConfig::IsConfigured()) {
+    return p;
+  }
+  const backend::SoC& soc = backend::GetBackend()->GetSoC();
+  int cube = 0, vec = 0;
+  int64_t l1 = 0, acc = 0, ub = 0;
+  for (const auto& [die, die_n] : soc.GetDieCounts()) {
+    for (const auto& [cluster, cl_n] : die.GetClusterCounts()) {
+      for (const auto& [core, core_n] : cluster.GetCoreCounts()) {
+        const int n = die_n * cl_n * core_n;
+        if (core.GetCoreType() == CoreType::CUBE) {
+          cube += n;
+          for (const auto& m : core.GetMems()) {
+            if (m.GetMemType() == MemorySpace::Mat) l1 = static_cast<int64_t>(m.GetMemSize());
+            if (m.GetMemType() == MemorySpace::Acc) acc = static_cast<int64_t>(m.GetMemSize());
+          }
+        } else if (core.GetCoreType() == CoreType::VECTOR) {
+          vec += n;
+          for (const auto& m : core.GetMems()) {
+            if (m.GetMemType() == MemorySpace::Vec) ub = static_cast<int64_t>(m.GetMemSize());
+          }
+        }
+      }
+    }
+  }
+  if (cube > 0) {
+    p.num_cube_cores = cube;
+    if (l1 > 0) p.l1_capacity = l1;
+    if (acc > 0) p.cube_capacity = acc;
+  }
+  if (vec > 0) {
+    p.num_vector_cores = vec;
+    if (ub > 0) p.vec_capacity = ub;
+  }
+  return p;
+}
 
 // A call is an allocation (output-buffer creation), not a compute op.
 bool IsAllocCall(const CallPtr& call) {
@@ -149,11 +208,15 @@ class ProblemBuilder {
     problem.slow_memory_bandwidth = kSlowMemoryBandwidth;
     problem.native_w = kNativeW;
     problem.native_h = kNativeH;
-    problem.num_cube_cores = kNumCubeCores;
-    problem.num_vector_cores = kNumVectorCores;
-    problem.l1_capacity = kL1Capacity;
-    problem.cube_capacity = kCubeCapacity;
-    problem.vec_capacity = kVecCapacity;
+    // Topology + on-chip capacities from the configured backend's SoC (the safe
+    // UB cap and 950 specs are picked up automatically; 910B defaults if none).
+    const HwParams hw = ReadHwParams();
+    problem.num_cube_cores = hw.num_cube_cores;
+    problem.num_vector_cores = hw.num_vector_cores;
+    problem.l1_capacity = hw.l1_capacity;
+    problem.cube_capacity = hw.cube_capacity;
+    problem.vec_capacity = hw.vec_capacity;
+    // Cost-model calibration (not in the SoC).
     problem.cube_compute_cost = kCubeComputeCost;
     problem.vector_compute_cost = kVectorComputeCost;
     problem.vector_lanes = kVectorLanes;
@@ -620,6 +683,10 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     }
     // Print the intercepted tensor graph (the raw op+tensor DAG the pass sees).
     const ::Problem& p = builder.problem;
+    LOG_INFO << "AutoFuse[" << func->name_ << "]: backend "
+             << (backend::BackendConfig::IsConfigured() ? "SoC" : "default(910B)") << " — cube_cores="
+             << p.num_cube_cores << " vector_cores=" << p.num_vector_cores << " L1=" << p.l1_capacity
+             << " Acc=" << p.cube_capacity << " UB=" << p.vec_capacity;
     LOG_INFO << "AutoFuse[" << func->name_ << "]: intercepted tensor graph — " << p.ops.size()
              << " ops, " << p.tensors.size() << " tensors";
     for (size_t i = 0; i < p.ops.size(); ++i) {
