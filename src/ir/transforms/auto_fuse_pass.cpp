@@ -42,6 +42,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/stmt_dependency_analysis.h"
 #include "pypto/ir/type.h"
 
@@ -69,11 +70,23 @@ int64_t ComputeCost(::OpType type, int64_t w, int64_t h, int64_t k) {
   return (w * h) / kThroughput;
 }
 
-// Hardware parameters (placeholders). TODO(cost-model): read from BackendHandler.
-constexpr int64_t kFastMemoryCapacity = 50000;  // UB capacity, element-count convention
-constexpr int64_t kSlowMemoryBandwidth = 10;     // DDR bandwidth
+// Hardware parameters. v0 hardcodes the Ascend 910B machine model (mirrors
+// `set_910b` in 3rdparty/mlsys26/test/ascend_910b_test.cpp); with the
+// tile-geometry compute model set, the per-op base_cost above is ignored.
+// TODO(cost-model): read these from BackendHandler instead of hardcoding 910B.
+constexpr int64_t kFastMemoryCapacity = 1LL << 30;  // legacy single-pool fallback
+constexpr int64_t kSlowMemoryBandwidth = 10;        // DDR bandwidth
 constexpr int64_t kNativeW = 128;
 constexpr int64_t kNativeH = 128;
+constexpr int kNumCubeCores = 24;               // AIC cores (matmul)
+constexpr int kNumVectorCores = 48;             // AIV cores (pointwise / reduction)
+constexpr int64_t kL1Capacity = 512 * 1024;     // per-cube L1/Mat operand pool
+constexpr int64_t kCubeCapacity = 128 * 1024;   // per-cube L0c accumulator
+constexpr int64_t kVecCapacity = 192 * 1024;    // per-vector UB
+constexpr int64_t kCubeComputeCost = 64;        // per 16x16x16 cube fractal (memory-bound default)
+constexpr int64_t kVectorComputeCost = 1;       // per vector SIMD step
+constexpr int64_t kVectorLanes = 256;           // elements per vector SIMD step
+constexpr int64_t kKernelFillCost = 10000;      // per-kernel pipeline fill
 
 // A call is an allocation (output-buffer creation), not a compute op.
 bool IsAllocCall(const CallPtr& call) {
@@ -126,13 +139,24 @@ bool IsComputeOp(const StmtPtr& stmt, CallPtr* out_call) {
 class ProblemBuilder {
  public:
   ::Problem problem;
-  std::vector<std::string> op_labels;  // per-op kernel/op name, for readable logging
+  std::vector<std::string> op_labels;     // per-op kernel/op name, for readable logging
+  std::vector<const Stmt*> op_stmts;      // per-op source AssignStmt (op index -> Stmt), for the emit
 
   void Build(const FunctionPtr& func, const ProgramPtr& prog) {
     problem.fast_memory_capacity = kFastMemoryCapacity;
     problem.slow_memory_bandwidth = kSlowMemoryBandwidth;
     problem.native_w = kNativeW;
     problem.native_h = kNativeH;
+    problem.num_cube_cores = kNumCubeCores;
+    problem.num_vector_cores = kNumVectorCores;
+    problem.l1_capacity = kL1Capacity;
+    problem.cube_capacity = kCubeCapacity;
+    problem.vec_capacity = kVecCapacity;
+    problem.cube_compute_cost = kCubeComputeCost;
+    problem.vector_compute_cost = kVectorComputeCost;
+    problem.vector_lanes = kVectorLanes;
+    problem.kernel_fill_cost = kKernelFillCost;
+    problem.ddr_atomic_add = true;  // 910B SetAtomicAdd (split-K partials merge in DDR)
 
     // 1. In-direction params are graph-input tensors (Out/InOut params are
     //    output buffers, not inputs).
@@ -189,6 +213,7 @@ class ProblemBuilder {
       sop.base_cost = ComputeCost(sop.type, ot.width, ot.height, ot.width);
       problem.ops.push_back(std::move(sop));
       op_labels.push_back(call->op_->name_);
+      op_stmts.push_back(stmt);
     }
   }
 
@@ -301,19 +326,70 @@ void DumpSolutionJson(const ::Solution& sol, const std::string& path) {
   f << "]\n}\n";
 }
 
+// Rewrite a function body so each fused group's compute statements are wrapped
+// in an InCoreScopeStmt for the Outline/Convert/Tile pipeline to lower into a
+// kernel. v0 wraps each maximal *contiguous* run of same-group compute stmts;
+// the body is already in SSA dependency order, so a single matmul (or any group
+// whose members are contiguous) becomes exactly one InCore scope. A group whose
+// members are interleaved with another group's splits into several scopes —
+// still correct (every op is lowered), just less fused than the solver intended.
+// TODO(next): topologically reorder so every group's members are contiguous.
+StmtPtr EmitFusedScopes(const StmtPtr& body,
+                        const std::unordered_map<const Stmt*, size_t>& stmt_group) {
+  std::vector<StmtPtr> body_stmts;
+  if (auto seq = As<SeqStmts>(body)) {
+    body_stmts = seq->stmts_;
+  } else {
+    body_stmts.push_back(body);
+  }
+  std::vector<StmtPtr> top;
+  std::vector<StmtPtr> run;
+  long run_group = -1;
+  auto flush = [&]() {
+    if (run.empty()) {
+      return;
+    }
+    const Span scope_span = run.front()->span_;
+    StmtPtr scope_body = SeqStmts::Flatten(run, scope_span);
+    top.push_back(std::make_shared<InCoreScopeStmt>(
+        std::nullopt, "fused_" + std::to_string(run_group), std::move(scope_body), scope_span));
+    run.clear();
+    run_group = -1;
+  };
+  for (const StmtPtr& stmt : body_stmts) {
+    auto it = stmt_group.find(stmt.get());
+    if (it != stmt_group.end()) {  // a compute op assigned to a fused group
+      const long g = static_cast<long>(it->second);
+      if (run_group != -1 && run_group != g) {
+        flush();
+      }
+      run_group = g;
+      run.push_back(stmt);
+    } else {  // allocation / return / other non-grouped statement
+      flush();
+      top.push_back(stmt);
+    }
+  }
+  flush();
+  return SeqStmts::Flatten(std::move(top), body->span_);
+}
+
 ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
-  for (const auto& entry : prog->functions_) {
-    const FunctionPtr& func = entry.second;
+  std::map<GlobalVarPtr, FunctionPtr, GlobalVarPtrLess> new_functions;
+  bool any_change = false;
+  for (const auto& [gvar, func] : prog->functions_) {
     // v0 gate: only functions explicitly marked for auto-fusion. attrs_ is an
     // ordered vector of (key, value) pairs, not a map.
     const bool marked = std::any_of(func->attrs_.begin(), func->attrs_.end(),
                                     [](const auto& kv) { return kv.first == "auto_fuse"; });
     if (!marked) {
+      new_functions.emplace(gvar, func);
       continue;
     }
     ProblemBuilder builder;
     builder.Build(func, prog);
     if (builder.problem.ops.empty()) {
+      new_functions.emplace(gvar, func);
       continue;
     }
     // Print the intercepted tensor graph (the raw op+tensor DAG the pass sees).
@@ -356,11 +432,35 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       DumpProblemJson(builder.problem, base + ".dag.json");
       DumpSolutionJson(sol, base + ".sol.json");
     }
-    // TODO(next increment): rewrite `func` — emit one AutoInCoreScopeStmt per
-    // sol.step(i).subgraph, with a ChunkConfig from step.config, in a valid
-    // topological order, for the Split/Interchange/Outline passes to lower.
+
+    // Emit: map each solver op back to its source statement, then wrap each
+    // fused group's statements in an InCoreScopeStmt. v0 ignores the chosen tile
+    // (step.config) — one InCore scope per group; AutoTileMatmulL0 picks the L0
+    // tile downstream. (Applying step.config as AutoInCore chunk loops for
+    // cross-core spatial tiling is the next increment.)
+    std::unordered_map<const Stmt*, size_t> stmt_group;
+    for (size_t s = 0; s < sol.num_steps(); ++s) {
+      for (size_t op_idx : sol.step(s).subgraph.ops()) {
+        stmt_group[builder.op_stmts[op_idx]] = s;
+      }
+    }
+    auto new_func = MutableCopy(func);
+    new_func->body_ = EmitFusedScopes(func->body_, stmt_group);
+    // Drop the marker once fused: the body is now an InCore-scoped kernel graph,
+    // not a flat tensor-op DAG, so the pass is idempotent (a second run no-ops).
+    new_func->attrs_.erase(
+        std::remove_if(new_func->attrs_.begin(), new_func->attrs_.end(),
+                       [](const auto& kv) { return kv.first == "auto_fuse"; }),
+        new_func->attrs_.end());
+    new_functions.emplace(gvar, new_func);
+    any_change = true;
   }
-  return prog;
+  if (!any_change) {
+    return prog;
+  }
+  auto new_prog = MutableCopy(prog);
+  new_prog->functions_ = std::move(new_functions);
+  return new_prog;
 }
 
 }  // namespace
