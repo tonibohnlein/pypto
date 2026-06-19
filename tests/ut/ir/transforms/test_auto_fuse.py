@@ -11,13 +11,12 @@
 
 AutoFuse intercepts the raw tensor-op DAG of a function marked
 ``attrs={"auto_fuse": True}``, runs the MLSys solver to choose a fusion
-partition + tile, and rewrites the body so each fused group is wrapped in an
-``InCoreScopeStmt`` for the Outline/Convert/Tile pipeline to lower into a kernel.
-
-v0 emits one InCore scope per group and ignores the chosen spatial tile
-(``AutoTileMatmulL0`` picks the L0 tile downstream), so a matmul whose output
-fits L0 lowers end-to-end; applying the solver's ``[w,h]`` as cross-core chunk
-loops (for larger outputs) is a later increment.
+partition + tile, and rewrites the body to realize that decision: a matmul or
+pointwise op becomes the solver's ``[w,h]`` output tiling distributed across
+cores (chunked-parallel ``AutoInCore`` scopes, k-pipelined per tile for matmul),
+and two chained matmuls the solver groups together fuse into one kernel with the
+intermediate kept on-chip. The Outline/Convert/Tile pipeline then lowers each
+scope to a cube (AIC) or vector (AIV) kernel.
 """
 
 import re
@@ -25,7 +24,6 @@ import re
 import pypto.language as pl
 import pytest
 from pypto import codegen, ir, passes
-from pypto.backend import BackendType, set_backend_type
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
@@ -63,9 +61,8 @@ class TestAutoFuse:
         assert "pl.tensor.slice(" in body  # the k-strip operand slices
         assert "pl.tensor.assemble(" in body  # the output-tile assembly
 
-    def test_single_matmul_lowers_to_cube_kernel(self):
+    def test_single_matmul_lowers_to_cube_kernel(self, ascend_backend):
         """The emitted scope lowers through the full pipeline to a cube PTO kernel."""
-        set_backend_type(BackendType.Ascend910B)
 
         @pl.program
         class Prog:
@@ -103,7 +100,7 @@ class TestAutoFuse:
         assert len(mat_addrs) >= 2, sorted(mat_addrs)  # distinct buffers = ping-pong
         assert "pto.tmatmul.acc" in mlir  # the k-strip accumulation
 
-    def test_large_matmul_tiles_to_fit_l0c(self):
+    def test_large_matmul_tiles_to_fit_l0c(self, ascend_backend):
         """A matmul whose full output exceeds L0c lowers via the output `[w,h]`
         tiling — each per-tile kernel's accumulator fits the L0c (Acc) budget.
 
@@ -111,7 +108,6 @@ class TestAutoFuse:
         Acc buffer overflows; the solver's `[64,128]` tile keeps each kernel's
         output within L0c.
         """
-        set_backend_type(BackendType.Ascend910B)
 
         @pl.program
         class Prog:
@@ -133,13 +129,12 @@ class TestAutoFuse:
         )
         assert "pto.tmatmul.acc" in mlir  # k-pipelined per tile
 
-    def test_single_pointwise_tiles_across_vector_cores(self):
+    def test_single_pointwise_tiles_across_vector_cores(self, ascend_backend):
         """A large pointwise op is tiled into the solver's `[w,h]` regions and
         distributed across the vector cores, lowering to a vector (AIV) kernel.
 
         For `[4096,384]` the solver picks 48 output tiles — one per AIV core.
         """
-        set_backend_type(BackendType.Ascend910B)
 
         @pl.program
         class Prog:
@@ -157,6 +152,43 @@ class TestAutoFuse:
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
         assert len(incores) == 1
         assert str(incores[0].func_type) == "FunctionType.AIV"  # pointwise -> vector kernel
+
+    def test_chained_matmul_fuses_to_one_cube_kernel(self, ascend_backend):
+        """Two back-to-back matmuls the solver groups together fuse into ONE kernel,
+        with the intermediate staying on-chip.
+
+        For ``C = (A@B)@D`` the solver fuses both matmuls; AutoFuse emits a single
+        AutoInCore scope tiling C's output across cores, and each tile's body is the
+        inner serial chain ``T_band = A_slice@B`` (on-chip) then ``C_tile =
+        T_band@D_slice`` — so both matmuls land in one cube kernel rather than two
+        kernels with the intermediate round-tripping DDR.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def chain(
+                self,
+                a: pl.Tensor[[128, 256], pl.FP32],
+                b: pl.Tensor[[256, 128], pl.FP32],
+                d: pl.Tensor[[128, 256], pl.FP32],
+            ) -> pl.Tensor[[128, 256], pl.FP32]:
+                t: pl.Tensor[[128, 128], pl.FP32] = pl.matmul(a, b)
+                c: pl.Tensor[[128, 256], pl.FP32] = pl.matmul(t, d)
+                return c
+
+        body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "chain").as_python()
+        assert "chunked_loop_optimizer" in body  # one fused AutoInCore scope
+        assert body.count("pl.tensor.matmul(") == 2  # both matmuls in the same per-tile body
+        assert "_tband" in body  # the on-chip intermediate (T never touches DDR)
+
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        # The fused chain is ONE cube kernel, not two separate matmul kernels.
+        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
+        assert str(incores[0].func_type) == "FunctionType.AIC"
+        mlir = codegen.PTOCodegen().generate(ir.Program([incores[0]], incores[0].name, incores[0].span))
+        assert "cube" in mlir and mlir.count("pto.tmatmul") >= 2  # both matmuls fused in
 
 
 if __name__ == "__main__":
