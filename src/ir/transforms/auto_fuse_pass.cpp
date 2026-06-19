@@ -457,7 +457,7 @@ std::vector<StmtPtr> BuildTileMatmul(const ExprPtr& a, const ExprPtr& b, const E
   }
 
   // acc accumulates over the K-strips; double-buffered via stage=2.
-  auto acc_call = reg.Create("tensor.create", {MakeIndexTuple({h, w}, sp)}, {{"dtype", dtype}}, sp);
+  auto acc_call = reg.Create("tensor.create", {MakeIndexTuple({h, w}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
   auto acc_var = std::make_shared<Var>(base + "_acc_init", acc_call->GetType(), sp);
   auto acc_assign = std::make_shared<AssignStmt>(acc_var, acc_call, sp);
   auto ko = std::make_shared<Var>(base + "_ko", std::make_shared<ScalarType>(DataType::INDEX), sp);
@@ -560,7 +560,7 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   auto& reg = OpRegistry::GetInstance();
   auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
 
-  auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}}, sp);
+  auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
   auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
   auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
 
@@ -637,7 +637,7 @@ std::optional<std::vector<StmtPtr>> TilePointwise(const AssignStmtPtr& assign, S
   auto& reg = OpRegistry::GetInstance();
   auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
 
-  auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}}, sp);
+  auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
   auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
   auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
   auto mt = std::make_shared<Var>(base + "_mt", index_type, sp);
@@ -661,10 +661,12 @@ std::optional<std::vector<StmtPtr>> TilePointwise(const AssignStmtPtr& assign, S
       tile_args.push_back(arg);  // scalar / non-output-shaped operand kept as-is
     }
   }
-  auto pw = MutableCopy(call);
-  pw->args_ = std::move(tile_args);
-  auto tile_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
-  auto tile_var = std::make_shared<Var>(base + "_tile", tile_type, sp);
+  // Re-create the op (not MutableCopy) so its result type is re-inferred from the
+  // [h,w] tile-shaped args — a copied call keeps the original full-output type and
+  // fails the print->parse roundtrip. The original kwargs (e.g. the scalar operand
+  // for `tensor.adds`) are preserved.
+  auto pw = reg.Create(call->op_->name_, tile_args, call->kwargs_, sp);
+  auto tile_var = std::make_shared<Var>(base + "_tile", pw->GetType(), sp);
   body_stmts.push_back(std::make_shared<AssignStmt>(tile_var, pw, sp));
 
   auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_n), tile_var, MakeTuple2(mi, ni, sp)}, sp);
@@ -688,13 +690,129 @@ std::optional<std::vector<StmtPtr>> TilePointwise(const AssignStmtPtr& assign, S
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
+// Realize the solver's FUSED chained matmul: two matmuls `T = A @ B` and
+// `C = T @ D` placed in ONE group, where MM2 consumes MM1's output T. The
+// intermediate T never touches DDR (the fusion) — it is recomputed on-chip per
+// output tile. Tile C's output `[M,N]` into `[h,w]` regions across cores (the
+// parallel outer, same wrapper as TileMatmul); each tile's body is the inner
+// serial chain: T_band = `A[mi:mi+h, :] @ B` ([h,K2], on-chip), then
+// `C_tile = T_band @ D[:, ni:ni+w]` ([h,w]). MM1 keeps the DDR<->L1 k-pipeline
+// (its operands stream from DDR); MM2 is a single matmul (its left operand T_band
+// is already on-chip). Returns nullopt if the pair is not a default-orientation
+// static-shape chain or the tile does not divide the output. Constraint: the
+// per-tile T_band (MM1's output) must fit L0c — larger intermediates need the
+// AutoTileMatmulL0 M/N-tiling work. TODO: share the wrapper with TileMatmul.
+std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1,
+                                                      const AssignStmtPtr& mm2, SolverTile tile,
+                                                      const std::string& name) {
+  auto c1 = As<Call>(mm1->value_);  // T = matmul(A, B)
+  auto c2 = As<Call>(mm2->value_);  // C = matmul(T, D)
+  if (c1 == nullptr || c2 == nullptr || c1->op_ == nullptr || c2->op_ == nullptr) {
+    return std::nullopt;
+  }
+  if (c1->op_->name_ != "tensor.matmul" || c2->op_->name_ != "tensor.matmul" ||
+      c1->args_.size() != 2 || c2->args_.size() != 2) {
+    return std::nullopt;
+  }
+  const ExprPtr A = c1->args_[0];
+  const ExprPtr B = c1->args_[1];
+  const ExprPtr D = c2->args_[1];  // c2->args_[0] is T (== mm1 output), verified by the caller
+  const VarPtr c_var = mm2->var_;
+  auto ct = As<TensorType>(c_var->GetType());
+  if (ct == nullptr) {
+    return std::nullopt;
+  }
+  const DataType dtype = ct->dtype_;
+  const auto [M, N] = Static2DShape(c_var->GetType());
+  const auto [aM, aK1] = Static2DShape(A->GetType());
+  const auto [bK1, bK2] = Static2DShape(B->GetType());
+  const auto [dK2, dN] = Static2DShape(D->GetType());
+  // Default-orientation chain: a[M,K1]@b[K1,K2] -> T[M,K2]; T@d[K2,N] -> c[M,N].
+  if (M < 0 || aM != M || bK1 != aK1 || dN != N || dK2 != bK2) {
+    return std::nullopt;
+  }
+  const int64_t K1 = aK1;
+  const int64_t K2 = bK2;
+
+  int64_t h = (tile.h > 0 && tile.h < M) ? tile.h : M;
+  int64_t w = (tile.w > 0 && tile.w < N) ? tile.w : N;
+  if (M % h != 0 || N % w != 0) {
+    return std::nullopt;
+  }
+  const int64_t num_m = M / h;
+  const int64_t num_n = N / w;
+
+  const Span sp = mm2->span_;
+  const std::string base = c_var->name_hint_;
+  auto& reg = OpRegistry::GetInstance();
+
+  // Inner serial chain for one output tile at element offset [mi,ni]:
+  //   T_band = A[mi:mi+h, :] @ B            -> [h,K2]  (k-pipelined: A streams from DDR)
+  //   out_tile = T_band @ D[:, ni:ni+w]     -> [h,w]   (single: T_band is on-chip)
+  auto build_chain = [&](const ExprPtr& mi, const ExprPtr& ni, const VarPtr& out_tile) {
+    std::vector<StmtPtr> stmts;
+    auto tband_type =
+        std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(K2, sp)}, dtype);
+    auto tband = std::make_shared<Var>(base + "_tband", tband_type, sp);
+    auto s1 = BuildTileMatmul(A, B, mi, MakeIndex(0, sp), h, K2, K1, tile.k, dtype, tband, base + "_t", sp);
+    auto s2 = BuildTileMatmul(tband, D, MakeIndex(0, sp), ni, h, w, K2, /*k=*/0, dtype, out_tile, base + "_c", sp);
+    for (auto& s : s1) stmts.push_back(std::move(s));
+    for (auto& s : s2) stmts.push_back(std::move(s));
+    return stmts;
+  };
+
+  // Whole output is one tile: the fused chain in one InCore kernel (T on-chip).
+  if (num_m == 1 && num_n == 1) {
+    auto stmts = build_chain(MakeIndex(0, sp), MakeIndex(0, sp), c_var);
+    return std::vector<StmtPtr>{
+        std::make_shared<InCoreScopeStmt>(std::nullopt, name, SeqStmts::Flatten(std::move(stmts), sp), sp)};
+  }
+
+  // Spatial output tiling distributed across cores (same chunked-parallel wrapper
+  // as TileMatmul): the [w,h] output tiles fan out across cores, each per-tile
+  // kernel runs the inner serial chain with its T_band on-chip.
+  auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
+  auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
+  auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
+  auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
+  auto mt = std::make_shared<Var>(base + "_mt", index_type, sp);
+  auto nt = std::make_shared<Var>(base + "_nt", index_type, sp);
+  auto mi = MakeMul(mt, MakeIndex(h, sp), sp);
+  auto ni = MakeMul(nt, MakeIndex(w, sp), sp);
+  auto c_m = std::make_shared<IterArg>(base + "_cm", c_init->GetType(), c_init, sp);
+  auto c_n = std::make_shared<IterArg>(base + "_cn", c_init->GetType(), c_m, sp);
+
+  auto tile_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
+  auto tile_var = std::make_shared<Var>(base + "_tile", tile_type, sp);
+  std::vector<StmtPtr> n_body_stmts = build_chain(mi, ni, tile_var);
+  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_n), tile_var, MakeTuple2(mi, ni, sp)}, sp);
+  auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
+  n_body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
+  n_body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
+  StmtPtr n_body = SeqStmts::Flatten(std::move(n_body_stmts), sp);
+
+  auto c_row = std::make_shared<Var>(base + "_crow", c_init->GetType(), sp);
+  ChunkConfig n_chunk{MakeIndex(num_n, sp), ChunkPolicy::LeadingFull};
+  auto n_loop = std::make_shared<ForStmt>(nt, MakeIndex(0, sp), MakeIndex(num_n, sp), MakeIndex(1, sp),
+                                          std::vector<IterArgPtr>{c_n}, n_body, std::vector<VarPtr>{c_row}, sp,
+                                          ForKind::Parallel, n_chunk);
+  StmtPtr m_body = SeqStmts::Flatten(
+      std::vector<StmtPtr>{n_loop, std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_row}, sp)}, sp);
+  ChunkConfig m_chunk{MakeIndex(num_m, sp), ChunkPolicy::LeadingFull};
+  auto m_loop = std::make_shared<ForStmt>(mt, MakeIndex(0, sp), MakeIndex(num_m, sp), MakeIndex(1, sp),
+                                          std::vector<IterArgPtr>{c_m}, m_body, std::vector<VarPtr>{c_var}, sp,
+                                          ForKind::Parallel, m_chunk);
+  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, m_loop, sp);
+  return std::vector<StmtPtr>{c_init_assign, scope};
+}
+
 // Rewrite a function body to realize the solver's decision. A matmul becomes its
 // own self-scoped tiled kernel (the solver's `[w,h]` output tiling, an InCore
 // kernel per tile, the per-tile k-pipeline inside) emitted at the orchestration
-// level; every other fused group is a maximal *contiguous* run of same-group
-// compute stmts wrapped in one InCoreScopeStmt. The body is already in SSA
-// dependency order. (v0 emits matmuls as their own group — fusing a matmul with
-// a pointwise epilogue into one tiled kernel is a later increment.)
+// level; two chained matmuls in one group become a single fused kernel (the
+// intermediate stays on-chip, see TileChainedMatmul); every other fused group is
+// a maximal *contiguous* run of same-group compute stmts wrapped in one
+// InCoreScopeStmt. The body is already in SSA dependency order.
 StmtPtr EmitFusedScopes(const StmtPtr& body,
                         const std::unordered_map<const Stmt*, size_t>& stmt_group,
                         const std::unordered_map<const Stmt*, SolverTile>& stmt_tile) {
@@ -704,6 +822,41 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
   } else {
     body_stmts.push_back(body);
   }
+
+  // Detect 2-matmul chains within a group: MM2 = matmul(T, D) where its left
+  // operand T is the output of MM1 = matmul(A, B) in the SAME group. Such a pair
+  // is emitted as one fused kernel (T on-chip) instead of two separate matmul
+  // kernels (T round-tripping DDR). The body is in SSA order, so MM1 precedes MM2.
+  auto matmul_call = [](const StmtPtr& s) -> CallPtr {
+    auto a = As<AssignStmt>(s);
+    if (a == nullptr) return nullptr;
+    auto c = As<Call>(a->value_);
+    if (c == nullptr || c->op_ == nullptr || c->op_->name_ != "tensor.matmul" || c->args_.size() != 2) {
+      return nullptr;
+    }
+    return c;
+  };
+  std::unordered_map<const Var*, const Stmt*> mm_out;  // grouped matmul output var -> its stmt
+  for (const StmtPtr& stmt : body_stmts) {
+    if (stmt_group.find(stmt.get()) == stmt_group.end()) continue;
+    if (matmul_call(stmt) != nullptr) {
+      mm_out[As<AssignStmt>(stmt)->var_.get()] = stmt.get();
+    }
+  }
+  std::unordered_map<const Stmt*, AssignStmtPtr> chain_head;  // MM1 stmt -> MM2 assign
+  for (const StmtPtr& stmt : body_stmts) {
+    auto git = stmt_group.find(stmt.get());
+    if (git == stmt_group.end()) continue;
+    CallPtr c = matmul_call(stmt);
+    if (c == nullptr) continue;
+    auto lhs = AsVarLike(c->args_[0]);  // T = left operand of MM2
+    if (lhs == nullptr) continue;
+    auto it = mm_out.find(lhs.get());
+    if (it == mm_out.end() || it->second == stmt.get()) continue;  // left operand not a prior matmul
+    if (stmt_group.at(it->second) != git->second) continue;        // must be the same fused group
+    chain_head[it->second] = As<AssignStmt>(stmt);
+  }
+  std::unordered_set<const Stmt*> chain_done;  // chain tails already emitted with their head
   std::vector<StmtPtr> top;
   std::vector<StmtPtr> run;
   long run_group = -1;
@@ -737,6 +890,9 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
     run_group = -1;
   };
   for (const StmtPtr& stmt : body_stmts) {
+    if (chain_done.count(stmt.get()) != 0) {
+      continue;  // chain tail (MM2) already emitted with its head (MM1)
+    }
     auto git = stmt_group.find(stmt.get());
     if (git == stmt_group.end()) {  // allocation / return / other non-grouped stmt
       flush();
@@ -744,8 +900,26 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
       continue;
     }
     const long g = static_cast<long>(git->second);
-    // A matmul is realized as its own self-scoped tiled kernel at orchestration
-    // level (output `[w,h]` loop + per-tile InCore scope + k-pipeline).
+    // A chained matmul pair (MM1 -> MM2 in the same group) is realized as one
+    // fused kernel — the parallel-outer output tiling with the inner serial chain
+    // and the intermediate on-chip (see TileChainedMatmul).
+    auto hit = chain_head.find(stmt.get());
+    if (hit != chain_head.end()) {
+      auto tit = stmt_tile.find(stmt.get());
+      const SolverTile tile = (tit != stmt_tile.end()) ? tit->second : SolverTile{};
+      if (auto chained = TileChainedMatmul(As<AssignStmt>(stmt), hit->second, tile, "fused_" + std::to_string(g))) {
+        flush();
+        for (auto& s : *chained) {
+          top.push_back(std::move(s));
+        }
+        chain_done.insert(hit->second.get());  // MM2 emitted as part of this chain
+        continue;
+      }
+      // Not a tileable chain: fall through — MM1 and MM2 each become standalone
+      // matmul kernels (MM2 is not in chain_done, so it is handled when reached).
+    }
+    // A standalone matmul is realized as its own self-scoped tiled kernel at
+    // orchestration level (output `[w,h]` loop + per-tile InCore scope + k-pipeline).
     std::optional<std::vector<StmtPtr>> tiled;
     if (auto assign = As<AssignStmt>(stmt)) {
       auto tit = stmt_tile.find(stmt.get());
