@@ -811,6 +811,81 @@ class TestAutoTileMatmulL0MNTiling:
             f"end-to-end M/N-tiled matmul mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
         )
 
+    def test_mn_tiling_reversed_def_store_chain_stays_ssa(self):
+        """Two oversized matmuls whose **definitions are in the reverse order of
+        their chained stores** must still produce valid SSA.
+
+        Ordering (all valid SSA — each matmul precedes its store): ``c2`` is
+        defined first, then ``c1``; the stores chain ``out → out1`` (via ``c1``)
+        → ``out2`` (via ``c2``).  Each fold is built when its matmul is visited,
+        but the folded stores are only *emitted* at the consumer-store site —
+        with the now-current remap applied.  So ``c2``'s fold (built before
+        ``c1``'s fold redefined ``out1``) chains from ``c1``'s fold output, not a
+        stale/dangling ``out1``.  Regression for that bug: assert ``SSAForm`` +
+        ``UseAfterDef`` hold after the pass and the result is numerically
+        correct.  Each store writes a disjoint half of the [512, 1024] output."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a1: pl.Tensor[[512, 512], pl.FP32],
+                b1: pl.Tensor[[512, 512], pl.FP32],
+                a2: pl.Tensor[[512, 512], pl.FP32],
+                b2: pl.Tensor[[512, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 1024], pl.FP32]],
+            ) -> pl.Tensor[[512, 1024], pl.FP32]:
+                a2m: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    a2, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                b2m: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    b2, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                c2: pl.Tile[[512, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a2m, b2m)
+                a1m: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    a1, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                b1m: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    b1, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                c1: pl.Tile[[512, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a1m, b1m)
+                out1: pl.Tensor[[512, 1024], pl.FP32] = pl.store(c1, [0, 0], out)
+                out2: pl.Tensor[[512, 1024], pl.FP32] = pl.store(c2, [0, 512], out1)
+                return out2
+
+        After = passes.auto_tile_matmul_l0()(Before)
+
+        # SSA invariants must hold — the pass declares it preserves SSAForm.
+        # A stale `out1` reference (the bug) is a use-before-def and fails here.
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.SSAForm)
+        props.insert(passes.IRProperty.UseAfterDef)
+        passes.verify_properties(props, After, "test_reversed_def_store_chain")
+
+        # Numerically: out[:, 0:512] = a1 @ b1, out[:, 512:1024] = a2 @ b2.
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen
+
+        torch.manual_seed(0)
+        a1 = torch.randn(512, 512, dtype=torch.float32)
+        b1 = torch.randn(512, 512, dtype=torch.float32)
+        a2 = torch.randn(512, 512, dtype=torch.float32)
+        b2 = torch.randn(512, 512, dtype=torch.float32)
+        out = torch.zeros(512, 1024, dtype=torch.float32)
+
+        code = torch_codegen(After)
+        ns: dict = {}
+        exec(code, ns)  # noqa: S102 — executing generated reference code is the point
+        ns["kernel"](a1, b1, a2, b2, out)
+
+        expected = torch.zeros(512, 1024, dtype=torch.float32)
+        expected[:, 0:512] = torch.matmul(a1, b1)
+        expected[:, 512:1024] = torch.matmul(a2, b2)
+        assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
+            f"reversed def/store-chain mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
 
 class TestAutoTileMatmulL0Skips:
     """Cases where the pass intentionally leaves the matmul untouched."""

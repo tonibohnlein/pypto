@@ -98,6 +98,13 @@
 ///
 /// Already-L0-sized matmuls (chooser returns ``(M, N, K)``) are left
 /// untouched.
+///
+/// TODO(M/N tiling): the general Mat-scratch path from the original TODO is
+/// still open — for on-chip / non-store consumers (chained matmul, elementwise)
+/// the [M, N] result must land in a Mat scratch and each [m, n] sub-tile be
+/// inserted via an Acc→Mat ``tile.assemble`` (lowering to ``pto.tinsert``).
+/// That path also needs Mat-capacity checking and per-sub-tile accumulator
+/// slicing for ``tile.matmul_acc``.  Until then those cases emit ``PH-AT-006``.
 
 #include <algorithm>
 #include <any>
@@ -690,7 +697,6 @@ struct MNFold {
 /// left operand both need the Mat-scratch / per-iter assemble path that is
 /// still deferred.
 std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, const AssignStmt* store_stmt,
-                                      const std::unordered_map<const Var*, VarPtr>& remap,
                                       std::vector<Diagnostic>& hints) {
   const Span sp = t.assign->span_;
   auto skip = [&](const std::string& msg) -> std::optional<MNFold> {
@@ -736,11 +742,14 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
                 "untouched");
   }
 
-  // Chain the per-sub-tile stores from the (possibly already-remapped) output
-  // tensor so a sequence of folded matmul→store chains writing the same output
-  // composes correctly.
+  // Chain the per-sub-tile stores from the raw output tensor.  The folded
+  // stmts are emitted later, at the consumer-store position, where the caller
+  // re-applies the then-current remap — so if a prior fold redefines this
+  // output between the matmul and its store (independent of statement order),
+  // the chain start is rewritten correctly at emission time.  Resolving it
+  // here against the matmul-visit-time remap would miss folds processed after
+  // this one but emitted before it (a stale-output SSA bug).
   ExprPtr out_value = out_in;
-  if (auto it = remap.find(out_in.get()); it != remap.end()) out_value = it->second;
 
   auto& reg = OpRegistry::GetInstance();
   const std::string base = t.assign->var_->name_hint_;
@@ -808,8 +817,24 @@ class AutoTileMutator : public IRMutator {
 
       // A consumer store folded into a prior M/N rewrite: emit the sub-tile
       // stmts in the store's original position and drop the store itself.
+      // Apply the now-current remap so the folded stores' output-tensor chain
+      // start (and any other operands) reflect rewrites installed between the
+      // matmul and this store — in particular a prior fold that redefined the
+      // output this store fed from.  Without this, a fold built before that
+      // remap existed (e.g. when the matmuls are defined in the reverse order
+      // of their stores) would keep a stale, now-undefined output Var.
+      //
+      // Exclude this fold's *own* store-result var: its rewrite targets only
+      // downstream uses, never the fold's internal chain start.  For an
+      // output-param store the input tensor and the store result are the same
+      // SSA var, so applying that one entry would rewrite the chain start onto
+      // the fold's final output — a self-referential use-before-def.
       if (auto it = pending_folds.find(child.get()); it != pending_folds.end()) {
-        for (auto& s : it->second.stmts) out.push_back(std::move(s));
+        auto self = remap.extract(it->second.store_result_var.get());
+        for (auto& s : it->second.stmts) {
+          out.push_back(remap.empty() ? s : transform_utils::Substitute(s, remap));
+        }
+        if (!self.empty()) remap.insert(std::move(self));  // restore for downstream uses
         changed = true;
         continue;
       }
@@ -847,7 +872,7 @@ class AutoTileMutator : public IRMutator {
           auto store_it = sibling_index->store_of.find(result);
           const AssignStmt* store_stmt =
               store_it == sibling_index->store_of.end() ? nullptr : store_it->second;
-          if (auto fold = TryFoldMNTiling(*tiling, result_uses, store_stmt, remap, hints)) {
+          if (auto fold = TryFoldMNTiling(*tiling, result_uses, store_stmt, hints)) {
             remap[fold->store_result_var.get()] = fold->return_var;
             pending_folds.emplace(static_cast<const Stmt*>(fold->store), std::move(*fold));
             changed = true;
