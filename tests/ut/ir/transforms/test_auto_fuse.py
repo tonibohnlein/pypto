@@ -133,6 +133,31 @@ class TestAutoFuse:
         )
         assert "pto.tmatmul.acc" in mlir  # k-pipelined per tile
 
+    def test_single_pointwise_tiles_across_vector_cores(self):
+        """A large pointwise op is tiled into the solver's `[w,h]` regions and
+        distributed across the vector cores, lowering to a vector (AIV) kernel.
+
+        For `[4096,384]` the solver picks 48 output tiles — one per AIV core.
+        """
+        set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw(self, a: pl.Tensor[[4096, 384], pl.FP32]) -> pl.Tensor[[4096, 384], pl.FP32]:
+                c: pl.Tensor[[4096, 384], pl.FP32] = pl.add(a, 1.0)
+                return c
+
+        body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw").as_python()
+        assert "chunked_loop_optimizer" in body  # AutoInCore chunked scope
+        assert "pl.parallel(48" in body  # 48 output tiles — one per vector core
+        assert "pl.tensor.adds(" in body and "pl.tensor.assemble(" in body  # per-tile op + output assembly
+
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        assert len(incores) == 1
+        assert str(incores[0].func_type) == "FunctionType.AIV"  # pointwise -> vector kernel
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

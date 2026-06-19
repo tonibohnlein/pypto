@@ -599,6 +599,95 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
+// Realize the solver's [w,h] tiling for a single POINTWISE op (`c = pw(a, ...)`):
+// tile the output into [w,h] regions distributed across the VECTOR cores via the
+// standard AutoInCore chunked-parallel path — each tile a per-tile kernel that
+// slices its output-shaped operands, applies the op (preserving its kwargs via
+// MutableCopy), and assembles into the DDR output. Same wrapper as TileMatmul's
+// spatial path, but the per-tile body is the op on [h,w] slices (no k-loop).
+// nullopt if not eligible. TODO: share the chunked-parallel wrapper with TileMatmul.
+std::optional<std::vector<StmtPtr>> TilePointwise(const AssignStmtPtr& assign, SolverTile tile,
+                                                  const std::string& name) {
+  auto call = As<Call>(assign->value_);
+  if (call == nullptr || call->op_ == nullptr || ClassifyOp(call) != ::OpType::Pointwise) {
+    return std::nullopt;
+  }
+  const VarPtr c_var = assign->var_;
+  auto ct = As<TensorType>(c_var->GetType());
+  if (ct == nullptr) {
+    return std::nullopt;
+  }
+  const DataType dtype = ct->dtype_;
+  const auto [M, N] = Static2DShape(c_var->GetType());
+  if (M < 0) {
+    return std::nullopt;
+  }
+  int64_t h = (tile.h > 0 && tile.h < M) ? tile.h : M;
+  int64_t w = (tile.w > 0 && tile.w < N) ? tile.w : N;
+  if (M % h != 0 || N % w != 0) {
+    return std::nullopt;
+  }
+  const int64_t num_m = M / h, num_n = N / w;
+  if (num_m == 1 && num_n == 1) {
+    return std::nullopt;  // whole output is one tile -> the plain InCore scope handles it
+  }
+
+  const Span sp = assign->span_;
+  const std::string base = c_var->name_hint_;
+  auto& reg = OpRegistry::GetInstance();
+  auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
+
+  auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}}, sp);
+  auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
+  auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
+  auto mt = std::make_shared<Var>(base + "_mt", index_type, sp);
+  auto nt = std::make_shared<Var>(base + "_nt", index_type, sp);
+  auto mi = MakeMul(mt, MakeIndex(h, sp), sp);
+  auto ni = MakeMul(nt, MakeIndex(w, sp), sp);
+  auto c_m = std::make_shared<IterArg>(base + "_cm", c_init->GetType(), c_init, sp);
+  auto c_n = std::make_shared<IterArg>(base + "_cn", c_init->GetType(), c_m, sp);
+
+  // Per-tile body: slice each output-shaped operand to [h,w]@[mi,ni]; apply the op.
+  std::vector<ExprPtr> tile_args;
+  std::vector<StmtPtr> body_stmts;
+  for (const ExprPtr& arg : call->args_) {
+    const auto [aM, aN] = Static2DShape(arg->GetType());
+    if (aM == M && aN == N) {
+      auto sl = reg.Create("tensor.slice", {arg, MakeIndexTuple({h, w}, sp), MakeTuple2(mi, ni, sp)}, sp);
+      auto sv = std::make_shared<Var>(base + "_in", sl->GetType(), sp);
+      body_stmts.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
+      tile_args.push_back(sv);
+    } else {
+      tile_args.push_back(arg);  // scalar / non-output-shaped operand kept as-is
+    }
+  }
+  auto pw = MutableCopy(call);
+  pw->args_ = std::move(tile_args);
+  auto tile_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
+  auto tile_var = std::make_shared<Var>(base + "_tile", tile_type, sp);
+  body_stmts.push_back(std::make_shared<AssignStmt>(tile_var, pw, sp));
+
+  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_n), tile_var, MakeTuple2(mi, ni, sp)}, sp);
+  auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
+  body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
+  body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
+  StmtPtr n_body = SeqStmts::Flatten(std::move(body_stmts), sp);
+
+  auto c_row = std::make_shared<Var>(base + "_crow", c_init->GetType(), sp);
+  ChunkConfig n_chunk{MakeIndex(num_n, sp), ChunkPolicy::LeadingFull};
+  auto n_loop = std::make_shared<ForStmt>(nt, MakeIndex(0, sp), MakeIndex(num_n, sp), MakeIndex(1, sp),
+                                          std::vector<IterArgPtr>{c_n}, n_body, std::vector<VarPtr>{c_row}, sp,
+                                          ForKind::Parallel, n_chunk);
+  StmtPtr m_body = SeqStmts::Flatten(
+      std::vector<StmtPtr>{n_loop, std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_row}, sp)}, sp);
+  ChunkConfig m_chunk{MakeIndex(num_m, sp), ChunkPolicy::LeadingFull};
+  auto m_loop = std::make_shared<ForStmt>(mt, MakeIndex(0, sp), MakeIndex(num_m, sp), MakeIndex(1, sp),
+                                          std::vector<IterArgPtr>{c_m}, m_body, std::vector<VarPtr>{c_var}, sp,
+                                          ForKind::Parallel, m_chunk);
+  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, m_loop, sp);
+  return std::vector<StmtPtr>{c_init_assign, scope};
+}
+
 // Rewrite a function body to realize the solver's decision. A matmul becomes its
 // own self-scoped tiled kernel (the solver's `[w,h]` output tiling, an InCore
 // kernel per tile, the per-tile k-pipeline inside) emitted at the orchestration
@@ -618,14 +707,32 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
   std::vector<StmtPtr> top;
   std::vector<StmtPtr> run;
   long run_group = -1;
-  // Wrap the accumulated non-matmul run in one InCore scope.
+  // Flush the accumulated run. A lone pointwise op gets the solver's [w,h]
+  // cross-core tiling (TilePointwise); everything else is wrapped in one InCore
+  // scope (multi-op groups, reductions, or pointwise that needs no tiling).
   auto flush = [&]() {
     if (run.empty()) {
       return;
     }
     const Span scope_span = run.front()->span_;
-    top.push_back(std::make_shared<InCoreScopeStmt>(std::nullopt, "fused_" + std::to_string(run_group),
-                                                    SeqStmts::Flatten(run, scope_span), scope_span));
+    const std::string nm = "fused_" + std::to_string(run_group);
+    if (run.size() == 1) {
+      if (auto assign = As<AssignStmt>(run[0])) {
+        auto tit = stmt_tile.find(run[0].get());
+        if (tit != stmt_tile.end()) {
+          if (auto tiled = TilePointwise(assign, tit->second, nm)) {
+            for (auto& s : *tiled) {
+              top.push_back(std::move(s));
+            }
+            run.clear();
+            run_group = -1;
+            return;
+          }
+        }
+      }
+    }
+    top.push_back(
+        std::make_shared<InCoreScopeStmt>(std::nullopt, nm, SeqStmts::Flatten(run, scope_span), scope_span));
     run.clear();
     run_group = -1;
   };
