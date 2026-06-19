@@ -363,6 +363,12 @@ class IRPythonPrinter : public IRVisitor {
   // scope still exists.
   bool PrintScopeDumpAttr(const ScopeStmtPtr& op);
 
+  // Emit ``allow_early_resolve=True`` if the scope carries the
+  // ``allow_early_resolve`` attr; returns true when printed. The outliner reads
+  // this bool off the scope and threads it onto the synthesised ``Submit`` —
+  // it must survive a print/reparse roundtrip while the scope still exists.
+  bool PrintScopeAllowEarlyResolveAttr(const ScopeStmtPtr& op);
+
   // Emit ``pl.split(pl.SplitMode.X[, slot_num=N])`` (a single optimizations list
   // entry, no leading comma / wrapper), reading the optional ``slot_num`` ring
   // depth from ``slot_num_holder``'s attrs (the scope carrying it).
@@ -1115,6 +1121,13 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
     }
   }
 
+  // Speculative early-dispatch opt-in — emitted as a kwarg so the parser
+  // recovers it via the submit/spmd_submit kwargs path. Independent of the
+  // launch spec, so emit it for a plain pl.submit too (not nested above).
+  if (op->allow_early_resolve_) {
+    stream_ << ", allow_early_resolve=True";
+  }
+
   // Surface the machine-only ``attrs={...}`` dict the same way Call does:
   // ``arg_directions`` keeps a bespoke emitter; every other attr (e.g.
   // ``arg_direction_overrides``) is rendered generically by ``PrintAttrValue``
@@ -1634,6 +1647,12 @@ bool IRPythonPrinter::PrintScopeDumpAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrDumpVars, "dumps");
 }
 
+bool IRPythonPrinter::PrintScopeAllowEarlyResolveAttr(const ScopeStmtPtr& op) {
+  if (!op->GetAttr<bool>("allow_early_resolve", false)) return false;
+  stream_ << ", allow_early_resolve=True";
+  return true;
+}
+
 bool IRPythonPrinter::PrintScopeTaskIdVarSuffix(const ScopeStmtPtr& op) {
   for (const auto& [k, v] : op->attrs_) {
     if (k != kAttrTaskIdVar) continue;
@@ -1688,6 +1707,7 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
   PrintScopeDumpAttr(op);
+  PrintScopeAllowEarlyResolveAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1714,6 +1734,7 @@ void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
   PrintScopeDumpAttr(op);
+  PrintScopeAllowEarlyResolveAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1748,6 +1769,7 @@ void IRPythonPrinter::VisitStmt_(const AutoInCoreScopeStmtPtr& op) {
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
   PrintScopeDumpAttr(op);
+  PrintScopeAllowEarlyResolveAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
