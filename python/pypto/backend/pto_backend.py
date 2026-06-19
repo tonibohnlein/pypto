@@ -31,7 +31,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from importlib import resources
-from importlib.abc import Traversable
+try:
+    from importlib.resources.abc import Traversable  # Python >= 3.11
+except ImportError:  # pragma: no cover - fallback for older interpreters
+    from importlib.abc import Traversable
 from typing import Any
 
 from pypto.compile_profiling import CompileProfiler, StageRecord
