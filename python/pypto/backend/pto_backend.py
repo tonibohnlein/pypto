@@ -31,7 +31,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from importlib import resources
-from importlib.abc import Traversable
+
+try:  # Python 3.11+: Traversable lives in importlib.resources.abc (removed from importlib.abc in 3.14)
+    from importlib.resources.abc import Traversable
+except ImportError:  # Python < 3.11
+    from importlib.abc import Traversable
 from typing import Any
 
 from pypto.compile_profiling import CompileProfiler, StageRecord
