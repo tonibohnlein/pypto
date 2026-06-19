@@ -17,15 +17,16 @@ kernel* and *what tile* — are exactly what AutoFuse automates.
 This file expresses the matmul as a pure tensor-op graph (``c = pl.matmul(a, b)`` — no
 ``pl.incore``, no tile shapes) and marks it ``attrs={"auto_fuse": True}``. Compiling it runs
 the AutoFuse pass: it extracts the op+tensor DAG, runs the MLSys solver to choose the fusion
-partition + tile, and emits one ``InCoreScopeStmt`` per fused group for the rest of the
-pipeline (Outline -> ConvertTensorToTileOps -> AutoTileMatmulL0 -> ... -> codegen) to lower
-into a cube kernel.
+partition + tile, and rewrites the body to realize that decision for the rest of the pipeline
+(Outline -> ConvertTensorToTileOps -> AutoTileMatmulL0 -> ... -> codegen) to lower into a cube
+kernel.
 
-v0 note: AutoFuse emits one InCore scope per group and lets ``AutoTileMatmulL0`` pick the L0
-tile — the solver's spatial ``[w, h]`` tile is computed but not yet applied (that is the next
-increment, which will emit it as ``AutoInCore`` chunk loops + a DDR<->L1 software pipeline).
-So this lowers a matmul that fits L0 (here 64x64) end-to-end to a single cube kernel; larger
-matmuls await the spatial-tiling increment.
+AutoFuse applies the solver's spatial ``[w, h]`` tile: it emits the output tiling as
+``AutoInCore`` chunked-parallel loops distributed across the cube cores, each tile's body
+streaming the contraction in k-strips through a ``stage=2`` DDR<->L1 software pipeline
+(``matmul``/``matmul_acc`` accumulator). ``AutoTileMatmulL0`` then picks the L0 sub-tile
+downstream. So even this 64x64 matmul lowers to the solver's sub-tile regions fanned across
+the cores, each a cube kernel; a larger output is simply more regions.
 
 Run (repo root, extension built):
     PYTHONPATH=python PYPTO_LOG_LEVEL=info python examples/auto_fuse_matmul.py
