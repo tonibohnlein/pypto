@@ -32,14 +32,15 @@ from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 class TestAutoFuse:
     """AutoFuse solver-driven fusion + emit."""
 
-    def test_single_matmul_emits_tiled_pipeline(self):
-        """A lone matmul becomes the solver's output ``[w,h]`` tiling, each tile a
-        per-tile InCore kernel with a stage=2 k-pipeline inside.
+    def test_single_matmul_emits_chunked_tiled_kernel(self):
+        """A lone matmul becomes the solver's output ``[w,h]`` tiling distributed
+        across cores.
 
-        The output is tiled into ``[w,h]`` regions (assembled into the DDR output),
-        and within each tile the contraction is streamed in k-strips with a
-        ``matmul``/``matmul_acc`` accumulator — the DDR<->L1 double-buffer that
-        ``LowerPipelineLoops`` lowers to ping-pong GM->Mat loads.
+        An AutoInCore (``chunked_loop_optimizer``) scope wraps chunked ``parallel``
+        loops over the output tiles — the existing Split/Interchange/Outline passes
+        distribute those tiles across cores. Each tile's body streams the
+        contraction in k-strips with a ``matmul``/``matmul_acc`` accumulator (the
+        DDR<->L1 double-buffer) and assembles the tile into the DDR output.
         """
 
         @pl.program
@@ -55,8 +56,9 @@ class TestAutoFuse:
 
         After = passes.auto_fuse()(Before)
         body = next(f for _, f in After.functions.items() if f.name == "mm").as_python()
-        assert body.count("pl.at(level=pl.Level.CORE_GROUP") == 1  # the per-tile InCore kernel
-        assert "pl.pipeline(" in body and "stage=2" in body  # the k-pipeline
+        assert "chunked_loop_optimizer" in body  # AutoInCore chunked scope
+        assert "pl.parallel(" in body and "chunk=" in body  # cross-core tile distribution
+        assert "pl.pipeline(" in body and "stage=2" in body  # the per-tile k-pipeline
         assert "pl.tensor.matmul_acc(" in body  # the per-strip accumulation
         assert "pl.tensor.slice(" in body  # the k-strip operand slices
         assert "pl.tensor.assemble(" in body  # the output-tile assembly
