@@ -11,12 +11,13 @@
 
 AutoFuse intercepts the raw tensor-op DAG of a function marked
 ``attrs={"auto_fuse": True}``, runs the MLSys solver to choose a fusion
-partition + tile, and rewrites the body to realize that decision: a matmul or
-pointwise op becomes the solver's ``[w,h]`` output tiling distributed across
-cores (chunked-parallel ``AutoInCore`` scopes, k-pipelined per tile for matmul),
-and two chained matmuls the solver groups together fuse into one kernel with the
-intermediate kept on-chip. The Outline/Convert/Tile pipeline then lowers each
-scope to a cube (AIC) or vector (AIV) kernel.
+partition + tile, and rewrites the body to realize that decision: a matmul or a
+run of fused pointwise ops becomes the solver's ``[w,h]`` output tiling distributed
+across cores (chunked-parallel ``AutoInCore`` scopes — k-pipelined per tile for
+matmul, the whole op chain replayed per tile with intermediates on-chip for
+pointwise), and two chained matmuls the solver groups together likewise fuse into
+one kernel. The Outline/Convert/Tile pipeline then lowers each scope to a cube
+(AIC) or vector (AIV) kernel.
 """
 
 import re
@@ -189,6 +190,37 @@ class TestAutoFuse:
         assert str(incores[0].func_type) == "FunctionType.AIC"
         mlir = codegen.PTOCodegen().generate(ir.Program([incores[0]], incores[0].name, incores[0].span))
         assert "cube" in mlir and mlir.count("pto.tmatmul") >= 2  # both matmuls fused in
+
+    def test_chained_pointwise_fuses_into_one_tiled_kernel(self, ascend_backend):
+        """Two chained pointwise ops the solver groups fuse into one tiled vector
+        kernel, with the intermediate staying on-chip.
+
+        For ``c = (a+1.0)*2.0`` over ``[4096,384]`` the solver fuses both ops and
+        tiles the output across the vector cores (48 tiles). Each tile's body
+        replays the whole chain on a ``[h,w]`` slice — so both ops land in one AIV
+        kernel and the intermediate ``t`` is never materialized to DDR (a single
+        output assemble), rather than two kernels round-tripping ``t`` through memory.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw2(self, a: pl.Tensor[[4096, 384], pl.FP32]) -> pl.Tensor[[4096, 384], pl.FP32]:
+                t: pl.Tensor[[4096, 384], pl.FP32] = pl.add(a, 1.0)
+                c: pl.Tensor[[4096, 384], pl.FP32] = pl.mul(t, 2.0)
+                return c
+
+        body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw2").as_python()
+        assert "chunked_loop_optimizer" in body  # one fused AutoInCore scope
+        assert "pl.parallel(48" in body  # 48 output tiles — one per vector core
+        assert "pl.tensor.adds(" in body and "pl.tensor.muls(" in body  # both ops in the per-tile body
+        assert body.count("pl.tensor.assemble(") == 1  # only the output is assembled; the intermediate stays on-chip
+
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        # The fused chain is ONE vector kernel, not two.
+        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
+        assert str(incores[0].func_type) == "FunctionType.AIV"
 
 
 if __name__ == "__main__":
