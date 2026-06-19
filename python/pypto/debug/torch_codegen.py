@@ -663,6 +663,14 @@ def _handle_slice(a: list[str], _kw: dict[str, Any]) -> str:
     return f"_tensor_slice({a[0]}, {a[2]}, {a[1]})"
 
 
+def _handle_tile_extract(a: list[str], _kw: dict[str, Any]) -> str:
+    # args: [src, idx_row, idx_col, shape] — the SSA-form Mat->Left/Right slice
+    # produced by AutoTileMatmulL0.  Numerically a 2D slice
+    # ``src[idx_row : idx_row + shape[0], idx_col : idx_col + shape[1]]``; the
+    # target memory space is irrelevant to the reference semantics.
+    return f"_tensor_slice({a[0]}, [{a[1]}, {a[2]}], {a[3]})"
+
+
 def _pad_mode_literal(kw: dict[str, Any]) -> str:
     pad_value = kw.get("pad_value")
     if pad_value is None:
@@ -942,6 +950,7 @@ def _register_ops() -> None:
     m["tile.alloc"] = _handle_create
     m["tile.move"] = _identity()
     m["tile.slice"] = _handle_slice
+    m["tile.extract"] = _handle_tile_extract
     m["tile.read"] = lambda a, _kw: f"{a[0]}[{a[1]}]"
     m["tile.write"] = lambda a, _kw: f"_write_and_return({a[0]}, {a[1]}, {a[2]})"
     m["tile.get_block_idx"] = lambda _a, _kw: "0"
