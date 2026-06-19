@@ -599,40 +599,81 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
-// Realize the solver's [w,h] tiling for a single POINTWISE op (`c = pw(a, ...)`):
-// tile the output into [w,h] regions distributed across the VECTOR cores via the
-// standard AutoInCore chunked-parallel path — each tile a per-tile kernel that
-// slices its output-shaped operands, applies the op (preserving its kwargs via
-// MutableCopy), and assembles into the DDR output. Same wrapper as TileMatmul's
-// spatial path, but the per-tile body is the op on [h,w] slices (no k-loop).
-// nullopt if not eligible. TODO: share the chunked-parallel wrapper with TileMatmul.
-std::optional<std::vector<StmtPtr>> TilePointwise(const AssignStmtPtr& assign, SolverTile tile,
-                                                  const std::string& name) {
-  auto call = As<Call>(assign->value_);
-  if (call == nullptr || call->op_ == nullptr || ClassifyOp(call) != ::OpType::Pointwise) {
-    return std::nullopt;
+// Realize the solver's [w,h] tiling for a RUN of fused POINTWISE ops (1+ ops in
+// one group; later ops consume earlier ones' outputs): tile the group output into
+// [w,h] regions distributed across the VECTOR cores via the standard AutoInCore
+// chunked-parallel path. Each tile's body REPLAYS the whole op chain on [h,w]
+// slices — external inputs are sliced (cached per input), the intermediates stay
+// on-chip (the fusion), and each op is re-created so its result type is re-inferred
+// — then assembles the group output. nullopt if not eligible: a non-pointwise op,
+// more than one live-out (a fused group keeps its intermediates internal), a
+// non-[M,N]/non-scalar operand (e.g. broadcast), or the whole output being one
+// tile (the plain InCore scope handles that). TODO: share the chunked-parallel
+// wrapper with TileMatmul.
+std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr>& run, SolverTile tile,
+                                                       const std::string& name) {
+  // 1. Every stmt must be `var = <pointwise call>`.
+  std::vector<AssignStmtPtr> ops;
+  ops.reserve(run.size());
+  for (const StmtPtr& s : run) {
+    auto a = As<AssignStmt>(s);
+    if (a == nullptr) return std::nullopt;
+    auto c = As<Call>(a->value_);
+    if (c == nullptr || c->op_ == nullptr || ClassifyOp(c) != ::OpType::Pointwise) return std::nullopt;
+    ops.push_back(a);
   }
-  const VarPtr c_var = assign->var_;
+  if (ops.empty()) return std::nullopt;
+
+  // 2. The group output is the single run-var not consumed within the run (a fused
+  //    group keeps its intermediates internal). More than one live-out -> bail.
+  std::unordered_set<const Var*> defined;
+  for (const auto& a : ops) defined.insert(a->var_.get());
+  std::unordered_set<const Var*> used_within;
+  for (const auto& a : ops) {
+    for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
+      auto v = AsVarLike(arg);
+      if (v != nullptr && defined.count(v.get()) != 0) used_within.insert(v.get());
+    }
+  }
+  AssignStmtPtr out_stmt = nullptr;
+  for (const auto& a : ops) {
+    if (used_within.count(a->var_.get()) == 0) {
+      if (out_stmt != nullptr) return std::nullopt;  // >1 live-out
+      out_stmt = a;
+    }
+  }
+  if (out_stmt == nullptr) return std::nullopt;
+
+  const VarPtr c_var = out_stmt->var_;
   auto ct = As<TensorType>(c_var->GetType());
-  if (ct == nullptr) {
-    return std::nullopt;
-  }
+  if (ct == nullptr) return std::nullopt;
   const DataType dtype = ct->dtype_;
   const auto [M, N] = Static2DShape(c_var->GetType());
-  if (M < 0) {
-    return std::nullopt;
+  if (M < 0) return std::nullopt;
+
+  // 3. Every operand must be an intermediate, an [M,N] external input, or a scalar
+  //    (non-2D). A differently-shaped tensor operand (e.g. broadcast) is not handled
+  //    by the simple [h,w] slice -> bail.
+  for (const auto& a : ops) {
+    for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
+      auto v = AsVarLike(arg);
+      if (v != nullptr && defined.count(v.get()) != 0) continue;  // intermediate
+      const auto [aM, aN] = Static2DShape(arg->GetType());
+      if (aM < 0) continue;                       // scalar / non-2D -> kept as-is
+      if (aM == M && aN == N) continue;           // [M,N] external input -> sliced
+      return std::nullopt;                        // other 2D shape -> not tileable here
+    }
   }
+
   int64_t h = (tile.h > 0 && tile.h < M) ? tile.h : M;
   int64_t w = (tile.w > 0 && tile.w < N) ? tile.w : N;
-  if (M % h != 0 || N % w != 0) {
-    return std::nullopt;
-  }
+  if (M % h != 0 || N % w != 0) return std::nullopt;
   const int64_t num_m = M / h, num_n = N / w;
   if (num_m == 1 && num_n == 1) {
     return std::nullopt;  // whole output is one tile -> the plain InCore scope handles it
   }
 
-  const Span sp = assign->span_;
+  const Span sp = out_stmt->span_;
   const std::string base = c_var->name_hint_;
   auto& reg = OpRegistry::GetInstance();
   auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
@@ -647,27 +688,51 @@ std::optional<std::vector<StmtPtr>> TilePointwise(const AssignStmtPtr& assign, S
   auto c_m = std::make_shared<IterArg>(base + "_cm", c_init->GetType(), c_init, sp);
   auto c_n = std::make_shared<IterArg>(base + "_cn", c_init->GetType(), c_m, sp);
 
-  // Per-tile body: slice each output-shaped operand to [h,w]@[mi,ni]; apply the op.
-  std::vector<ExprPtr> tile_args;
+  // Per-tile body: replay the op chain at element offset [mi,ni]. Each op's operands
+  // are mapped to tile-shaped values — an intermediate uses its on-chip tile result,
+  // an [M,N] external input is sliced [h,w] (cached per input var), a scalar is kept.
+  // Each op is re-created (not copied) so its result type is re-inferred. The group
+  // output op writes `tile_var`.
   std::vector<StmtPtr> body_stmts;
-  for (const ExprPtr& arg : call->args_) {
-    const auto [aM, aN] = Static2DShape(arg->GetType());
-    if (aM == M && aN == N) {
-      auto sl = reg.Create("tensor.slice", {arg, MakeIndexTuple({h, w}, sp), MakeTuple2(mi, ni, sp)}, sp);
-      auto sv = std::make_shared<Var>(base + "_in", sl->GetType(), sp);
-      body_stmts.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
-      tile_args.push_back(sv);
-    } else {
-      tile_args.push_back(arg);  // scalar / non-output-shaped operand kept as-is
+  std::unordered_map<const Var*, VarPtr> tilemap;   // intermediate orig var -> tile result
+  std::unordered_map<const Var*, VarPtr> slicemap;  // external input var -> its [h,w] slice
+  VarPtr tile_var;
+  for (const auto& a : ops) {
+    auto c = As<Call>(a->value_);
+    std::vector<ExprPtr> targs;
+    for (const ExprPtr& arg : c->args_) {
+      auto v = AsVarLike(arg);
+      if (v != nullptr) {
+        auto it = tilemap.find(v.get());
+        if (it != tilemap.end()) {
+          targs.push_back(it->second);
+          continue;
+        }
+      }
+      const auto [aM, aN] = Static2DShape(arg->GetType());
+      if (aM == M && aN == N) {  // external input -> slice (cached per input var)
+        if (v != nullptr) {
+          auto sit = slicemap.find(v.get());
+          if (sit != slicemap.end()) {
+            targs.push_back(sit->second);
+            continue;
+          }
+        }
+        auto sl = reg.Create("tensor.slice", {arg, MakeIndexTuple({h, w}, sp), MakeTuple2(mi, ni, sp)}, sp);
+        auto sv = std::make_shared<Var>(base + "_in", sl->GetType(), sp);
+        body_stmts.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
+        if (v != nullptr) slicemap[v.get()] = sv;
+        targs.push_back(sv);
+      } else {
+        targs.push_back(arg);  // scalar / non-2D -> as-is
+      }
     }
+    auto pw = reg.Create(c->op_->name_, targs, c->kwargs_, sp);
+    auto res = std::make_shared<Var>(base + (a == out_stmt ? "_tile" : "_t"), pw->GetType(), sp);
+    body_stmts.push_back(std::make_shared<AssignStmt>(res, pw, sp));
+    tilemap[a->var_.get()] = res;
+    if (a == out_stmt) tile_var = res;
   }
-  // Re-create the op (not MutableCopy) so its result type is re-inferred from the
-  // [h,w] tile-shaped args — a copied call keeps the original full-output type and
-  // fails the print->parse roundtrip. The original kwargs (e.g. the scalar operand
-  // for `tensor.adds`) are preserved.
-  auto pw = reg.Create(call->op_->name_, tile_args, call->kwargs_, sp);
-  auto tile_var = std::make_shared<Var>(base + "_tile", pw->GetType(), sp);
-  body_stmts.push_back(std::make_shared<AssignStmt>(tile_var, pw, sp));
 
   auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_n), tile_var, MakeTuple2(mi, ni, sp)}, sp);
   auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
@@ -869,19 +934,18 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
     }
     const Span scope_span = run.front()->span_;
     const std::string nm = "fused_" + std::to_string(run_group);
-    if (run.size() == 1) {
-      if (auto assign = As<AssignStmt>(run[0])) {
-        auto tit = stmt_tile.find(run[0].get());
-        if (tit != stmt_tile.end()) {
-          if (auto tiled = TilePointwise(assign, tit->second, nm)) {
-            for (auto& s : *tiled) {
-              top.push_back(std::move(s));
-            }
-            run.clear();
-            run_group = -1;
-            return;
-          }
+    // A run of fused pointwise ops gets the solver's [w,h] cross-core tiling
+    // (TilePointwiseGroup); anything it cannot tile (non-pointwise op, >1 live-out,
+    // single-tile output) falls back to one plain InCore scope.
+    auto tit = stmt_tile.find(run.front().get());
+    if (tit != stmt_tile.end()) {
+      if (auto tiled = TilePointwiseGroup(run, tit->second, nm)) {
+        for (auto& s : *tiled) {
+          top.push_back(std::move(s));
         }
+        run.clear();
+        run_group = -1;
+        return;
       }
     }
     top.push_back(
