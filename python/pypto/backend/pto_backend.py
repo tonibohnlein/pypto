@@ -32,9 +32,9 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from importlib import resources
 
-try:
+try:  # Python 3.11+: Traversable lives in importlib.resources.abc (removed from importlib.abc in 3.14)
     from importlib.resources.abc import Traversable  # pyright: ignore[reportMissingImports]
-except ImportError:  # pragma: no cover - fallback for older interpreters
+except ImportError:  # pragma: no cover - Python < 3.11
     from importlib.abc import Traversable
 from typing import Any
 
