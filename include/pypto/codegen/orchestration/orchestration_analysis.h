@@ -203,6 +203,18 @@ std::vector<std::optional<size_t>> FindReturnedParamIndices(const ir::FunctionPt
 std::vector<ir::ParamDirection> ComputeGroupEffectiveDirections(const ir::FunctionPtr& group_func,
                                                                 const ir::ProgramPtr& program);
 
+/// AssignStmts and nested ForStmts collected from a loop (or other) body.
+/// Used by iter-arg aliasing analysis in orchestration codegen.
+struct BodyAliases {
+  std::vector<ir::AssignStmtPtr> assigns;
+  std::vector<ir::ForStmtPtr> nested_fors;
+};
+
+/// Walk ``body`` and collect every AssignStmt and nested ForStmt (including
+/// those inside nested control flow). Does not compute alias equivalence —
+/// callers run the fixpoint over ``assigns`` / ``nested_fors``.
+BodyAliases CollectBodyAliases(const ir::StmtPtr& body);
+
 }  // namespace codegen
 }  // namespace pypto
 

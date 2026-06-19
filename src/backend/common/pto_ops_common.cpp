@@ -885,16 +885,51 @@ static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBa
   codegen.Emit(sv.str());
   if (!view_type.empty()) codegen.RegisterTileBufType(dst_view, view_type);
 
-  // GM source window [r, c] -> partition_view, then tload straight into the subview.
-  std::string src_view = codegen.GetOrCreateTensorView(src);
+  // GM source window [r, c] -> partition_view, then tload into the subview.
   std::string dtype_str = codegen.GetTypeString(src_tensor_type->dtype_);
   std::string src_view_type = codegen.GetTensorViewTypeString(src_tensor_type.get());
   const auto& shape_elems = shapes->elements_;
   const auto& soff_elems = src_off->elements_;
-  std::string partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
-  std::string src_pview = EmitPartitionViewPTO(src->name_hint_, src_view, src_view_type, partition_type,
-                                               GetIndexOffsetCodes(soff_elems, codegen),
-                                               GetSizeCodes(shape_elems, codegen), codegen);
+
+  std::string src_pview;
+  std::string partition_type;
+  if (transpose) {
+    // Transposing per-row gather: the GM row [r=1, c] must land as the L1 column
+    // [c, 1]. pto.tload itself does NOT transpose, so we feed it a DN-strided
+    // source (a [c, 1] DN partition) -> pto.tload runs DN2NZ, which IS the
+    // transpose. Build a DN make_tensor_view of the GM source (shape/strides
+    // swapped vs the canonical ND view, same base ptr) and partition the row as
+    // a column, mirroring the matmul b_trans load (which loads a DN view into an
+    // NZ tile). Without this the straight ND2NZ tload scrambles in the fractal
+    // layout (wrong results / AICore 507018 at scale).
+    INTERNAL_CHECK_SPAN(src_tensor_type->shape_.size() == 2, op->span_)
+        << "tile.gather_row transpose requires a 2D src";
+    std::string src_ptr = codegen.GetVarName(src);
+    std::string rows_code = codegen.GetExprAsCode(src_tensor_type->shape_[0]);
+    std::string cols_code = codegen.GetExprAsCode(src_tensor_type->shape_[1]);
+    std::string one_code = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    std::string dn_view = codegen.NewNamedTemp(src->name_hint_ + "_dn_view");
+    std::ostringstream mv;
+    // DN view: shape [C, R], strides [1, C] -> DN[i, j] aliases src[j, i].
+    mv << dn_view << " = pto.make_tensor_view " << src_ptr << ", shape = [" << cols_code << ", " << rows_code
+       << "], strides = [" << one_code << ", " << cols_code
+       << "] {layout = #pto.layout<dn>}: " << src_view_type;
+    codegen.Emit(mv.str());
+    // Read src[phys, col_off : col_off + c] presented as the DN column [c, 1]:
+    // offsets [col_off, phys] (swapped), sizes [c, r] (swapped).
+    std::vector<ExprPtr> tr_off = {soff_elems[1], soff_elems[0]};
+    std::vector<ExprPtr> tr_shape = {shape_elems[1], shape_elems[0]};
+    partition_type = MakePartitionTensorViewType(GetDimStrings(tr_shape), dtype_str);
+    src_pview =
+        EmitPartitionViewPTO(src->name_hint_, dn_view, src_view_type, partition_type,
+                             GetIndexOffsetCodes(tr_off, codegen), GetSizeCodes(tr_shape, codegen), codegen);
+  } else {
+    std::string src_view = codegen.GetOrCreateTensorView(src);
+    partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
+    src_pview = EmitPartitionViewPTO(src->name_hint_, src_view, src_view_type, partition_type,
+                                     GetIndexOffsetCodes(soff_elems, codegen),
+                                     GetSizeCodes(shape_elems, codegen), codegen);
+  }
 
   std::ostringstream tload_line;
   tload_line << "pto.tload ins(" << src_pview << " : " << partition_type << ") outs(" << dst_view;
@@ -3791,6 +3826,17 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
       oss << " : " << src_type << " -> " << result_type;
     }
     codegen.Emit(oss.str());
+    return std::string("");
+  });
+  reg("tile.transpose_view", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+    // Zero-copy fractal-layout reinterpretation (NZ<->ZN). The result var owns a
+    // pre-declared pto.alloc_tile carrying the transposed (ZN) type, aliased to
+    // the source buffer's address through the shared MemRef. The two alloc_tile
+    // declarations at the same addr ARE the whole mechanism — there is no
+    // data-movement instruction to emit (issue #1776).
+    CHECK(op->args_.size() == 1) << "Operation:[tile.transpose_view] requires 1 argument (tile), but got "
+                                 << op->args_.size();
+    (void)codegen_base;
     return std::string("");
   });
   reg("tile.set_validshape", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {

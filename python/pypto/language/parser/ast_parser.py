@@ -389,6 +389,10 @@ class _AtKwargState:
     level: "ir.Level | None" = None
     role: "ir.Role | None" = None
     name_hint: str = ""
+    # ``allow_early_resolve=True`` — speculative early-dispatch opt-in, stored as
+    # the scope's ``allow_early_resolve`` attr and threaded onto the synthesised
+    # ``Submit`` by the outliner (mirrors ``pl.submit(..., allow_early_resolve=)``).
+    allow_early_resolve: bool = False
     requests_auto_chunk: bool = False
     split_mode: "ir.SplitMode | None" = None
     # Optional cross-core ring-buffer depth from ``pl.split(mode, slot_num=N)``.
@@ -3059,6 +3063,14 @@ class ASTParser:
             self._handle_at_legacy_split_kw(kw, state)
         elif kw.arg == "name_hint":
             state.name_hint = self._parse_scope_name_hint(kw.value, "pl.at()")
+        elif kw.arg == "allow_early_resolve":
+            if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, bool):
+                raise ParserSyntaxError(
+                    "pl.at() allow_early_resolve must be a boolean literal (True/False)",
+                    span=self.span_tracker.get_span(kw.value),
+                    hint="Write allow_early_resolve=True to opt this scope into early-dispatch.",
+                )
+            state.allow_early_resolve = kw.value.value
         elif kw.arg in _AT_STASH_KWARGS:
             self._stash_at_kwarg(kw, state)
         elif kw.arg is None:
@@ -3071,7 +3083,10 @@ class ASTParser:
             raise ParserSyntaxError(
                 f"Unknown keyword argument '{kw.arg}' in pl.at()",
                 span=self.span_tracker.get_span(kw),
-                hint=("Supported arguments: level, role, optimizations, deps, no_dep_args, dumps, name_hint"),
+                hint=(
+                    "Supported arguments: level, role, optimizations, deps, no_dep_args, dumps, "
+                    "allow_early_resolve, name_hint"
+                ),
             )
 
     def _stash_at_kwarg(self, kw: ast.keyword, state: "_AtKwargState") -> None:
@@ -3229,13 +3244,10 @@ class ASTParser:
                     )
                 seen_split = True
                 split_mode, slot_num = parsed
-                if slot_num is not None and (split_mode is None or split_mode == ir.SplitMode.NONE):
-                    raise ParserSyntaxError(
-                        "pl.split(slot_num=...) is only valid with a cross-core split mode",
-                        span=self.span_tracker.get_span(entry),
-                        hint="Set mode to pl.SplitMode.UP_DOWN or pl.SplitMode.LEFT_RIGHT, "
-                        "or drop slot_num=.",
-                    )
+                # slot_num is valid with any split mode, including SplitMode.NONE:
+                # a NONE mixed kernel still drives a cube->vector cross-core pipe
+                # (on a2a3 via dual-AIV dispatch), and ExpandMixedKernel sizes
+                # that ring from slot_num regardless of split mode.
                 split_slot_num = slot_num
             else:
                 raise ParserSyntaxError(
@@ -4238,7 +4250,9 @@ class ASTParser:
         # an ``Array[N, TASK_ID]`` carry. ``with pl.at(...) as tid:`` binds a
         # fresh ``Scalar[TASK_ID]`` Var in the outer scope; the outliner
         # later wires it to ``TupleGetItem(call_lhs, last_idx)``.
-        scope_attrs = self._parse_at_meta(deps_kw, no_dep_args_kw, dumps_kw, optional_vars, span)
+        scope_attrs = self._parse_at_meta(
+            deps_kw, no_dep_args_kw, dumps_kw, optional_vars, state.allow_early_resolve, span
+        )
         scope_attrs = self._append_split_slot_num_attr(scope_attrs, state.split_slot_num)
 
         # ``with pl.at(...) as tid:`` allocates ``tid`` as an outer-scope Var
@@ -4327,6 +4341,7 @@ class ASTParser:
         no_dep_args_kw: "ast.keyword | None",
         dumps_kw: "ast.keyword | None",
         optional_vars: "ast.expr | None",
+        allow_early_resolve: bool,
         span: "ir.Span",
     ) -> "list[tuple[str, Any]] | None":
         """Build the ScopeStmt ``attrs`` list from a ``pl.at(...)`` ``deps=`` /
@@ -4366,7 +4381,13 @@ class ASTParser:
         # not consulted here.
         dump_vars: list[ir.Var] = self._parse_at_dumps_kwarg(dumps_kw) if dumps_kw else []
 
-        if deps_kw is None and no_dep_args_kw is None and not dump_vars and optional_vars is None:
+        if (
+            deps_kw is None
+            and no_dep_args_kw is None
+            and not dump_vars
+            and optional_vars is None
+            and not allow_early_resolve
+        ):
             return None
 
         attrs: list[tuple[str, Any]] = []
@@ -4398,6 +4419,11 @@ class ASTParser:
             tid_var = self.builder.var(optional_vars.id, ir.ScalarType(DataType.TASK_ID), span=span)
             self.scope_manager.define_var(optional_vars.id, tid_var, span=span)
             attrs.append(("task_id_var", tid_var))
+
+        # ``allow_early_resolve`` last (canonical order) — a plain bool the
+        # outliner reads off the scope and threads onto the synthesised Submit.
+        if allow_early_resolve:
+            attrs.append(("allow_early_resolve", True))
 
         return attrs if attrs else None
 
@@ -5216,6 +5242,7 @@ class ASTParser:
         if as_submit:
             allowed_kwargs.add("deps")
             allowed_kwargs.add("dumps")
+            allowed_kwargs.add("allow_early_resolve")
         if as_spmd:
             allowed_kwargs.update({"core_num", "sync_start"})
         if func_obj is not None and func_obj.role == ir.Role.Orchestrator:
@@ -5352,6 +5379,12 @@ class ASTParser:
         sync_start = False
         if as_spmd:
             core_num_expr, sync_start = self._parse_spmd_submit_kwargs(method_name, keywords, span)
+        # ``allow_early_resolve=True`` opts this task in as a speculative
+        # early-dispatch producer. Accepted on both pl.submit and pl.spmd_submit
+        # (recorded on the Submit; no-op for a plain self.kernel(...) call).
+        allow_early_resolve = False
+        if as_submit:
+            allow_early_resolve = self._parse_submit_allow_early_resolve_kwarg(method_name, keywords)
         return_types = func_obj.return_types if func_obj else []
         # A callee that declares no ``-> `` annotation has empty ``return_types``
         # but may ``return <value>`` (e.g. an InCore kernel returning its
@@ -5382,6 +5415,7 @@ class ASTParser:
             augment_task_id=as_submit,
             core_num=core_num_expr,
             sync_start=sync_start,
+            allow_early_resolve=allow_early_resolve,
             extra_attrs=extra_attrs,
         )
 
@@ -5726,6 +5760,25 @@ class ASTParser:
                 result.append(val)
         return result
 
+    def _parse_submit_allow_early_resolve_kwarg(self, method_name: str, keywords: list[ast.keyword]) -> bool:
+        """Extract the optional ``allow_early_resolve=True/False`` kwarg.
+
+        Accepted on ``pl.submit(...)`` and ``pl.spmd_submit(...)``. Opts this
+        task in as a speculative early-dispatch producer — the scheduler may
+        pre-stage its consumers before it completes (simpler#1065). Must be a
+        boolean literal; defaults to ``False`` when absent.
+        """
+        kw = next((k for k in keywords if k.arg == "allow_early_resolve"), None)
+        if kw is None:
+            return False
+        if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, bool):
+            raise ParserSyntaxError(
+                f"'{method_name}' allow_early_resolve must be a boolean literal (True/False)",
+                span=self.span_tracker.get_span(kw.value),
+                hint="Write allow_early_resolve=True to opt this submit into early-dispatch.",
+            )
+        return kw.value.value
+
     def _parse_dispatch_device_kwarg(
         self,
         keywords: list[ast.keyword],
@@ -5795,6 +5848,7 @@ class ASTParser:
         augment_task_id: bool = False,
         core_num: ir.Expr | None = None,
         sync_start: bool = False,
+        allow_early_resolve: bool = False,
         extra_attrs: dict[str, Any] | None = None,
     ) -> ir.Expr:
         """Create an ir.Call, attaching the return type, optional call-site directions
@@ -5844,6 +5898,11 @@ class ASTParser:
                 ``augment_task_id=True``).
             sync_start: SPMD sync-start flag from ``pl.spmd_submit(...,
                 sync_start=...)``. Recorded on ``ir.Submit.sync_start``.
+            allow_early_resolve: Speculative early-dispatch opt-in from
+                ``pl.submit(..., allow_early_resolve=True)`` /
+                ``pl.spmd_submit(...)``. Recorded on
+                ``ir.Submit.allow_early_resolve`` (only valid with
+                ``augment_task_id=True``).
             extra_attrs: Generic round-trip attrs recovered from a printed
                 ``attrs={...}`` dict that have no dedicated param above
                 (e.g. ``arg_direction_overrides``, ``dummy_task``). Merged into
@@ -5894,10 +5953,11 @@ class ASTParser:
             # manual_dep_edges (ManualDepsOnSubmitOnly invariant).
             submit_attrs: dict[str, Any] | None = attrs if attrs else None
             # pl.spmd_submit carries an SPMD launch spec (core_num/sync_start) on
-            # the Submit; that requires the full ctor form even when there are
-            # no attrs. A plain pl.submit with no attrs keeps the minimal form
-            # so existing golden output is byte-identical.
-            if submit_attrs is not None or core_num is not None:
+            # the Submit, and allow_early_resolve carries the early-dispatch
+            # opt-in; either requires the full ctor form even when there are no
+            # attrs. A plain pl.submit with no attrs / hints keeps the minimal
+            # form so existing golden output is byte-identical.
+            if submit_attrs is not None or core_num is not None or allow_early_resolve:
                 return ir.Submit(
                     gvar,
                     args,
@@ -5908,6 +5968,7 @@ class ASTParser:
                     span,
                     core_num=core_num,
                     sync_start=sync_start,
+                    allow_early_resolve=allow_early_resolve,
                 )
             return ir.Submit(gvar, args, deps_list, return_type, span)
 

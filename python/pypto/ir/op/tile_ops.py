@@ -117,6 +117,7 @@ def create(
     shape: Sequence[int | Expr] | _ir_core.MakeTuple,
     dtype: DataType,
     target_memory: MemorySpace = MemorySpace.Vec,
+    transpose: bool | None = None,
     span: Span | None = None,
 ) -> Call:
     """Create a tile from a shape.
@@ -125,6 +126,12 @@ def create(
         shape: Shape of the tile, or a MakeTuple
         dtype: Data type of the tile
         target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right)
+        transpose: When True, allocate the transposed Mat (ZN) fractal layout
+            (blayout=row_major, slayout=col_major) — the layout a matmul ``b_trans``
+            B-operand carries, and the only Mat layout a DN-source ``gather_row``
+            (DN2NZ tload) can fill. Default ``None`` keeps the canonical layout and
+            is omitted from the op kwargs, so ordinary ``tile.create`` output is
+            unchanged; only forwarded to the op when explicitly set.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -133,6 +140,8 @@ def create(
     actual_span = _get_span_or_capture(span)
     shape_tuple = _to_make_tuple(shape, actual_span)
     kwargs: dict[str, Any] = {"dtype": dtype, "target_memory": target_memory}
+    if transpose is not None:
+        kwargs["transpose"] = transpose
     return _ir_core.create_op_call("tile.create", [shape_tuple], kwargs, actual_span)
 
 
@@ -411,6 +420,29 @@ def concat(
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.concat", [src0, src1], {}, actual_span)
+
+
+def transpose_view(
+    tile: Expr,
+    span: Span | None = None,
+) -> Call:
+    """Zero-copy fractal-layout reinterpretation (NZ<->ZN) of a tile.
+
+    Swaps the trailing two dims together with the block/scatter layouts, aliasing
+    the source buffer byte-for-byte (an NZ ``[..., N, K]`` tile and a ZN
+    ``[..., K, N]`` tile over the same L1 bytes are mutual transposes). Emits no
+    data movement: it lets one GM->L1 load feed both a ``b_trans=True`` and a
+    ``b_trans=False`` matmul on a shared operand.
+
+    Args:
+        tile: Input tile (TileType, >=2D; typically Mat-resident)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression returning the transposed-layout view tile
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.transpose_view", [tile], {}, actual_span)
 
 
 def move(

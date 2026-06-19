@@ -73,6 +73,15 @@ std::string SplitModeToPythonString(SplitMode mode) {
   throw pypto::TypeError("Unknown SplitMode");
 }
 
+/// True when a scope must emit a ``pl.split(...)`` optimization entry: it carries
+/// a concrete split mode (UP_DOWN / LEFT_RIGHT) or a ``slot_num`` ring depth.
+/// ``slot_num`` is valid with ``SplitMode.None`` too (a NONE mixed kernel still
+/// drives a cube->vector pipe), so a bare ``slot_num`` forces the entry.
+bool ScopeHasSplitInfo(const std::optional<SplitMode>& split, const ScopeStmtPtr& slot_holder) {
+  const bool has_mode = split.has_value() && split.value() != SplitMode::None;
+  return has_mode || (slot_holder && slot_holder->HasAttr("slot_num"));
+}
+
 /// Convert cast round mode integer to its string name for printing.
 /// Inverse of the CAST_MODE_NAMES mapping in python/pypto/ir/utils.py.
 std::string CastModeToString(int mode) {
@@ -353,6 +362,12 @@ class IRPythonPrinter : public IRVisitor {
   // ``kAttrDumpVars``), so it must survive a print/reparse roundtrip while the
   // scope still exists.
   bool PrintScopeDumpAttr(const ScopeStmtPtr& op);
+
+  // Emit ``allow_early_resolve=True`` if the scope carries the
+  // ``allow_early_resolve`` attr; returns true when printed. The outliner reads
+  // this bool off the scope and threads it onto the synthesised ``Submit`` —
+  // it must survive a print/reparse roundtrip while the scope still exists.
+  bool PrintScopeAllowEarlyResolveAttr(const ScopeStmtPtr& op);
 
   // Emit ``pl.split(pl.SplitMode.X[, slot_num=N])`` (a single optimizations list
   // entry, no leading comma / wrapper), reading the optional ``slot_num`` ring
@@ -1106,6 +1121,13 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
     }
   }
 
+  // Speculative early-dispatch opt-in — emitted as a kwarg so the parser
+  // recovers it via the submit/spmd_submit kwargs path. Independent of the
+  // launch spec, so emit it for a plain pl.submit too (not nested above).
+  if (op->allow_early_resolve_) {
+    stream_ << ", allow_early_resolve=True";
+  }
+
   // Surface the machine-only ``attrs={...}`` dict the same way Call does:
   // ``arg_directions`` keeps a bespoke emitter; every other attr (e.g.
   // ``arg_direction_overrides``) is rendered generically by ``PrintAttrValue``
@@ -1625,6 +1647,12 @@ bool IRPythonPrinter::PrintScopeDumpAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrDumpVars, "dumps");
 }
 
+bool IRPythonPrinter::PrintScopeAllowEarlyResolveAttr(const ScopeStmtPtr& op) {
+  if (!op->GetAttr<bool>("allow_early_resolve", false)) return false;
+  stream_ << ", allow_early_resolve=True";
+  return true;
+}
+
 bool IRPythonPrinter::PrintScopeTaskIdVarSuffix(const ScopeStmtPtr& op) {
   for (const auto& [k, v] : op->attrs_) {
     if (k != kAttrTaskIdVar) continue;
@@ -1679,6 +1707,7 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
   PrintScopeDumpAttr(op);
+  PrintScopeAllowEarlyResolveAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1689,15 +1718,15 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
 
 void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   stream_ << "with " << prefix_ << ".at(level=" << prefix_ << ".Level.CORE_GROUP";
-  if (op->split_.has_value() && op->split_.value() != SplitMode::None) {
-    // The deprecated ``split=`` kwarg cannot carry a ring depth, so switch to
-    // the ``optimizations=[pl.split(mode, slot_num=N)]`` form whenever slot_num
-    // is set; otherwise keep the compact ``split=`` form (no churn).
-    if (op->HasAttr("slot_num")) {
-      PrintSplitOptimizations(op->split_.value(), op);
-    } else {
-      stream_ << ", split=" << prefix_ << ".SplitMode." << SplitModeToPythonString(op->split_.value());
-    }
+  if (op->HasAttr("slot_num")) {
+    // slot_num accompanies any split mode, including SplitMode.None (a NONE mixed
+    // kernel still drives a cube->vector pipe). The deprecated ``split=`` kwarg
+    // cannot carry a ring depth, so emit the
+    // ``optimizations=[pl.split(mode, slot_num=N)]`` form whenever slot_num is set.
+    PrintSplitOptimizations(op->split_.value_or(SplitMode::None), op);
+  } else if (op->split_.has_value() && op->split_.value() != SplitMode::None) {
+    // No ring depth — keep the compact ``split=`` form (no churn).
+    stream_ << ", split=" << prefix_ << ".SplitMode." << SplitModeToPythonString(op->split_.value());
   }
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
@@ -1705,6 +1734,7 @@ void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
   PrintScopeDumpAttr(op);
+  PrintScopeAllowEarlyResolveAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1715,13 +1745,14 @@ void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
 
 void IRPythonPrinter::VisitStmt_(const AutoInCoreScopeStmtPtr& op) {
   const bool has_split = op->split_.has_value() && op->split_.value() != SplitMode::None;
-  if (has_split && op->HasAttr("slot_num")) {
-    // The deprecated ``optimization=chunked_loop_optimizer(split=...)`` form
-    // cannot carry a ring depth; emit the new ``optimizations=[pl.auto_chunk,
+  if (op->HasAttr("slot_num")) {
+    // slot_num accompanies any split mode, including SplitMode.None. The
+    // deprecated ``optimization=chunked_loop_optimizer(split=...)`` form cannot
+    // carry a ring depth; emit the new ``optimizations=[pl.auto_chunk,
     // pl.split(mode, slot_num=N)]`` list so slot_num round-trips.
     stream_ << "with " << prefix_ << ".at(level=" << prefix_ << ".Level.CORE_GROUP, optimizations=["
             << prefix_ << ".auto_chunk, ";
-    PrintSplitCall(op->split_.value(), op);
+    PrintSplitCall(op->split_.value_or(SplitMode::None), op);
     stream_ << "]";
   } else {
     stream_ << "with " << prefix_ << ".at(level=" << prefix_ << ".Level.CORE_GROUP, optimization=";
@@ -1738,6 +1769,7 @@ void IRPythonPrinter::VisitStmt_(const AutoInCoreScopeStmtPtr& op) {
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
   PrintScopeDumpAttr(op);
+  PrintScopeAllowEarlyResolveAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1783,8 +1815,8 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     if (!op->name_hint_.empty()) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
     }
-    if (incore && incore->split_.has_value() && incore->split_.value() != SplitMode::None) {
-      PrintSplitOptimizations(incore->split_.value(), incore);
+    if (incore && ScopeHasSplitInfo(incore->split_, incore)) {
+      PrintSplitOptimizations(incore->split_.value_or(SplitMode::None), incore);
     }
     PrintScopeDepsAttr(op);
     stream_ << ")";
@@ -1821,8 +1853,8 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     if (!op->name_hint_.empty()) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
     }
-    if (incore && incore->split_.has_value() && incore->split_.value() != SplitMode::None) {
-      PrintSplitOptimizations(incore->split_.value(), incore);
+    if (incore && ScopeHasSplitInfo(incore->split_, incore)) {
+      PrintSplitOptimizations(incore->split_.value_or(SplitMode::None), incore);
     }
     stream_ << "):\n";
     IncreaseIndent();

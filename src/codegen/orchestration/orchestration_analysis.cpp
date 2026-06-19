@@ -425,5 +425,27 @@ std::vector<ParamDirection> ComputeGroupEffectiveDirections(const FunctionPtr& g
   return compute_effective(group_func);
 }
 
+// ---------------------------------------------------------------------------
+// CollectBodyAliases
+// ---------------------------------------------------------------------------
+
+BodyAliases CollectBodyAliases(const StmtPtr& body) {
+  class AliasingNodeCollector : public IRVisitor {
+   public:
+    BodyAliases result;
+    void VisitStmt_(const AssignStmtPtr& a) override {
+      result.assigns.push_back(a);
+      IRVisitor::VisitStmt_(a);
+    }
+    void VisitStmt_(const ForStmtPtr& f) override {
+      result.nested_fors.push_back(f);
+      IRVisitor::VisitStmt_(f);
+    }
+  };
+  AliasingNodeCollector collector;
+  collector.VisitStmt(body);
+  return collector.result;
+}
+
 }  // namespace codegen
 }  // namespace pypto
