@@ -32,10 +32,12 @@ from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 class TestAutoFuse:
     """AutoFuse solver-driven fusion + emit."""
 
-    def test_single_matmul_emits_pipelined_kloop(self):
-        """A lone matmul becomes one InCore scope wrapping a stage=2 k-pipeline.
+    def test_single_matmul_emits_tiled_pipeline(self):
+        """A lone matmul becomes the solver's output ``[w,h]`` tiling, each tile a
+        per-tile InCore kernel with a stage=2 k-pipeline inside.
 
-        The contraction (K=64) is streamed in k-strips (solver tile k=32) with a
+        The output is tiled into ``[w,h]`` regions (assembled into the DDR output),
+        and within each tile the contraction is streamed in k-strips with a
         ``matmul``/``matmul_acc`` accumulator — the DDR<->L1 double-buffer that
         ``LowerPipelineLoops`` lowers to ping-pong GM->Mat loads.
         """
@@ -53,10 +55,11 @@ class TestAutoFuse:
 
         After = passes.auto_fuse()(Before)
         body = next(f for _, f in After.functions.items() if f.name == "mm").as_python()
-        assert body.count("pl.at(level=pl.Level.CORE_GROUP") == 1  # one InCore scope
+        assert body.count("pl.at(level=pl.Level.CORE_GROUP") == 1  # the per-tile InCore kernel
         assert "pl.pipeline(" in body and "stage=2" in body  # the k-pipeline
         assert "pl.tensor.matmul_acc(" in body  # the per-strip accumulation
         assert "pl.tensor.slice(" in body  # the k-strip operand slices
+        assert "pl.tensor.assemble(" in body  # the output-tile assembly
 
     def test_single_matmul_lowers_to_cube_kernel(self):
         """The emitted scope lowers through the full pipeline to a cube PTO kernel."""
@@ -97,6 +100,36 @@ class TestAutoFuse:
                     mat_addrs.add(m.group(1))
         assert len(mat_addrs) >= 2, sorted(mat_addrs)  # distinct buffers = ping-pong
         assert "pto.tmatmul.acc" in mlir  # the k-strip accumulation
+
+    def test_large_matmul_tiles_to_fit_l0c(self):
+        """A matmul whose full output exceeds L0c lowers via the output `[w,h]`
+        tiling — each per-tile kernel's accumulator fits the L0c (Acc) budget.
+
+        256x256 FP32 output = 256 KB > 128 KB L0c, so without output tiling the
+        Acc buffer overflows; the solver's `[64,128]` tile keeps each kernel's
+        output within L0c.
+        """
+        set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mm(
+                self,
+                a: pl.Tensor[[256, 256], pl.FP32],
+                b: pl.Tensor[[256, 256], pl.FP32],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b)
+                return c
+
+        # Lowers end-to-end without an L0c-overflow (raises on failure).
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        assert len(incores) == 1
+        mlir = codegen.PTOCodegen().generate(
+            ir.Program([incores[0]], incores[0].name, incores[0].span)
+        )
+        assert "pto.tmatmul.acc" in mlir  # k-pipelined per tile
 
 
 if __name__ == "__main__":
