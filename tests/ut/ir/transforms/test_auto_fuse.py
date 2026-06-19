@@ -20,6 +20,8 @@ fits L0 lowers end-to-end; applying the solver's ``[w,h]`` as cross-core chunk
 loops (for larger outputs) is a later increment.
 """
 
+import re
+
 import pypto.language as pl
 import pytest
 from pypto import codegen, ir, passes
@@ -30,8 +32,13 @@ from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 class TestAutoFuse:
     """AutoFuse solver-driven fusion + emit."""
 
-    def test_single_matmul_emits_one_incore_scope(self):
-        """A lone matmul becomes a single group wrapped in one InCore scope."""
+    def test_single_matmul_emits_pipelined_kloop(self):
+        """A lone matmul becomes one InCore scope wrapping a stage=2 k-pipeline.
+
+        The contraction (K=64) is streamed in k-strips (solver tile k=32) with a
+        ``matmul``/``matmul_acc`` accumulator — the DDR<->L1 double-buffer that
+        ``LowerPipelineLoops`` lowers to ping-pong GM->Mat loads.
+        """
 
         @pl.program
         class Before:
@@ -44,20 +51,12 @@ class TestAutoFuse:
                 c: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
                 return c
 
-        @pl.program
-        class Expected:
-            @pl.function
-            def mm(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP32],
-                b: pl.Tensor[[64, 64], pl.FP32],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="fused_0"):
-                    c: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
-                return c
-
         After = passes.auto_fuse()(Before)
-        ir.assert_structural_equal(After, Expected)
+        body = next(f for _, f in After.functions.items() if f.name == "mm").as_python()
+        assert body.count("pl.at(level=pl.Level.CORE_GROUP") == 1  # one InCore scope
+        assert "pl.pipeline(" in body and "stage=2" in body  # the k-pipeline
+        assert "pl.tensor.matmul_acc(" in body  # the per-strip accumulation
+        assert "pl.tensor.slice(" in body  # the k-strip operand slices
 
     def test_single_matmul_lowers_to_cube_kernel(self):
         """The emitted scope lowers through the full pipeline to a cube PTO kernel."""
@@ -87,6 +86,17 @@ class TestAutoFuse:
         assert "pto.kernel_kind" in mlir
         assert "cube" in mlir  # a pure matmul lowers to a cube kernel
         assert "pto.tload" in mlir
+
+        # The k-pipeline lowered to a ping-pong DDR<->L1 double-buffer: the k-strip
+        # GM->Mat loads land in distinct L1 buffers and accumulate via tmatmul.acc.
+        mat_addrs = set()
+        for line in mlir.splitlines():
+            if "alloc_tile" in line and "loc=mat" in line:
+                m = re.search(r"addr = (%c\d+_i64)", line)
+                if m:
+                    mat_addrs.add(m.group(1))
+        assert len(mat_addrs) >= 2, sorted(mat_addrs)  # distinct buffers = ping-pong
+        assert "pto.tmatmul.acc" in mlir  # the k-strip accumulation
 
 
 if __name__ == "__main__":

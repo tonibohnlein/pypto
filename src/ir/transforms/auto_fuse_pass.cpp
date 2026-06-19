@@ -37,11 +37,13 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/stmt_dependency_analysis.h"
 #include "pypto/ir/type.h"
@@ -326,6 +328,125 @@ void DumpSolutionJson(const ::Solution& sol, const std::string& path) {
   f << "]\n}\n";
 }
 
+ExprPtr MakeIndex(int64_t v, const Span& span) {
+  return std::make_shared<ConstInt>(v, DataType::INDEX, span);
+}
+
+ExprPtr MakeIndexTuple(const std::vector<int64_t>& values, const Span& span) {
+  std::vector<ExprPtr> elements;
+  elements.reserve(values.size());
+  for (auto v : values) elements.push_back(MakeIndex(v, span));
+  return std::make_shared<MakeTuple>(std::move(elements), span);
+}
+
+// Static 2D extent of a tensor-typed expr's type, or {-1,-1} if not a static 2D
+// TensorType (dynamic / wrong rank — caller bails out of pipelining).
+std::pair<int64_t, int64_t> Static2DShape(const TypePtr& type) {
+  auto tt = As<TensorType>(type);
+  if (tt == nullptr || tt->shape_.size() != 2) {
+    return {-1, -1};
+  }
+  auto r = As<ConstInt>(tt->shape_[0]);
+  auto c = As<ConstInt>(tt->shape_[1]);
+  if (r == nullptr || c == nullptr) {
+    return {-1, -1};
+  }
+  return {r->value_, c->value_};
+}
+
+// Turn a `c = tensor.matmul(a, b)` into the k-pipelined accumulator loop that
+// streams the contraction in `k`-strips with a stage=2 software pipeline — the
+// DDR<->L1 (GM->Mat) double-buffer that justifies the roofline `max(compute,
+// ddr)`. Returns [acc_init, ForStmt(Pipeline)] replacing the matmul, or nullopt
+// if not eligible. Mirrors AutoTileMatmulL0's K-loop builder, but at the TENSOR
+// level (tensor.slice + tensor.matmul/_acc, GM->Mat) since AutoFuse runs before
+// ConvertTensorToTileOps. v0 handles the default orientation only (lhs[M,K] @
+// rhs[K,N] -> c[M,N]); other orientations / non-static shapes / fewer than two
+// clean k-strips fall back to the plain (un-pipelined) matmul.
+std::optional<std::vector<StmtPtr>> PipelineMatmul(const AssignStmtPtr& assign, int64_t k) {
+  auto call = As<Call>(assign->value_);
+  if (call == nullptr || call->op_ == nullptr || call->op_->name_ != "tensor.matmul" ||
+      call->args_.size() != 2) {
+    return std::nullopt;
+  }
+  const ExprPtr lhs = call->args_[0];
+  const ExprPtr rhs = call->args_[1];
+  const VarPtr c_var = assign->var_;
+  auto ct = As<TensorType>(c_var->GetType());
+  if (ct == nullptr) {
+    return std::nullopt;
+  }
+  const DataType dtype = ct->dtype_;
+  const auto [M, N] = Static2DShape(c_var->GetType());
+  const auto [lM, lK] = Static2DShape(lhs->GetType());
+  const auto [rK, rN] = Static2DShape(rhs->GetType());
+  // Default-orientation guard: lhs[M,K] @ rhs[K,N] -> c[M,N]. This also rejects
+  // transposed / non-static / wrong-rank operands (any -1 fails a comparison).
+  const int64_t K = lK;
+  if (M < 0 || lM != M || rN != N || rK != K) {
+    return std::nullopt;
+  }
+  // Need at least two clean k-strips to pipeline; otherwise no steady state.
+  if (k <= 0 || K % k != 0 || K / k < 2) {
+    return std::nullopt;
+  }
+
+  const Span sp = assign->span_;
+  const std::string base = c_var->name_hint_;
+  auto& reg = OpRegistry::GetInstance();
+
+  // acc_init = tensor.create([M, N], dtype) — the loop-carried accumulator.
+  auto acc_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}}, sp);
+  auto acc_var = std::make_shared<Var>(base + "_acc_init", acc_call->GetType(), sp);
+  auto acc_assign = std::make_shared<AssignStmt>(acc_var, acc_call, sp);
+
+  // ko iterates element offsets along K (0, k, 2k, ...); c_iter carries the acc.
+  auto ko = std::make_shared<Var>(base + "_ko", std::make_shared<ScalarType>(DataType::INDEX), sp);
+  auto c_iter = std::make_shared<IterArg>(base + "_c", acc_var->GetType(), acc_var, sp);
+
+  // Per-iteration k-strip slices (GM-resident; lowered to GM->Mat tloads).
+  auto off_a = std::make_shared<MakeTuple>(std::vector<ExprPtr>{MakeIndex(0, sp), ko}, sp);
+  auto a_k_call = reg.Create("tensor.slice", {lhs, MakeIndexTuple({M, k}, sp), off_a}, sp);
+  auto a_k = std::make_shared<Var>(base + "_a_k", a_k_call->GetType(), sp);
+  auto a_k_assign = std::make_shared<AssignStmt>(a_k, a_k_call, sp);
+
+  auto off_b = std::make_shared<MakeTuple>(std::vector<ExprPtr>{ko, MakeIndex(0, sp)}, sp);
+  auto b_k_call = reg.Create("tensor.slice", {rhs, MakeIndexTuple({k, N}, sp), off_b}, sp);
+  auto b_k = std::make_shared<Var>(base + "_b_k", b_k_call->GetType(), sp);
+  auto b_k_assign = std::make_shared<AssignStmt>(b_k, b_k_call, sp);
+
+  // if (ko == 0): c = matmul(a_k, b_k)  else  c = matmul_acc(c_iter, a_k, b_k).
+  std::vector<std::pair<std::string, std::any>> mm_kwargs = {
+      {"a_trans", false}, {"b_trans", false}, {"c_matrix_nz", false}, {"out_dtype", dtype}};
+  auto then_call = reg.Create("tensor.matmul", {a_k, b_k}, mm_kwargs, sp);
+  auto then_var = std::make_shared<Var>(base + "_mm", then_call->GetType(), sp);
+  auto then_assign = std::make_shared<AssignStmt>(then_var, then_call, sp);
+  auto then_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{then_var}, sp);
+  StmtPtr then_body = SeqStmts::Flatten(std::vector<StmtPtr>{then_assign, then_yield}, sp);
+
+  std::vector<std::pair<std::string, std::any>> acc_kwargs = {{"a_trans", false}, {"b_trans", false}};
+  auto else_call = reg.Create("tensor.matmul_acc", {ExprPtr(c_iter), a_k, b_k}, acc_kwargs, sp);
+  auto else_var = std::make_shared<Var>(base + "_mm_acc", else_call->GetType(), sp);
+  auto else_assign = std::make_shared<AssignStmt>(else_var, else_call, sp);
+  auto else_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{else_var}, sp);
+  StmtPtr else_body = SeqStmts::Flatten(std::vector<StmtPtr>{else_assign, else_yield}, sp);
+
+  auto phi = std::make_shared<Var>(base + "_phi", then_call->GetType(), sp);
+  auto cond = MakeEq(ko, MakeIndex(0, sp), sp);
+  auto if_stmt = std::make_shared<IfStmt>(cond, then_body, std::optional<StmtPtr>(else_body),
+                                          std::vector<VarPtr>{phi}, sp);
+  auto body_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{phi}, sp);
+  StmtPtr body = SeqStmts::Flatten(std::vector<StmtPtr>{a_k_assign, b_k_assign, if_stmt, body_yield}, sp);
+
+  // The loop returns into the ORIGINAL output var `c` (downstream uses unchanged).
+  std::vector<std::pair<std::string, std::any>> loop_attrs = {{kPipelineStagesAttr, /*stages=*/2}};
+  auto for_stmt = std::make_shared<ForStmt>(ko, MakeIndex(0, sp), MakeIndex(K, sp), MakeIndex(k, sp),
+                                            std::vector<IterArgPtr>{c_iter}, body,
+                                            std::vector<VarPtr>{c_var}, sp, ForKind::Pipeline,
+                                            /*chunk_config=*/std::nullopt, std::move(loop_attrs));
+  return std::vector<StmtPtr>{acc_assign, for_stmt};
+}
+
 // Rewrite a function body so each fused group's compute statements are wrapped
 // in an InCoreScopeStmt for the Outline/Convert/Tile pipeline to lower into a
 // kernel. v0 wraps each maximal *contiguous* run of same-group compute stmts;
@@ -335,7 +456,8 @@ void DumpSolutionJson(const ::Solution& sol, const std::string& path) {
 // still correct (every op is lowered), just less fused than the solver intended.
 // TODO(next): topologically reorder so every group's members are contiguous.
 StmtPtr EmitFusedScopes(const StmtPtr& body,
-                        const std::unordered_map<const Stmt*, size_t>& stmt_group) {
+                        const std::unordered_map<const Stmt*, size_t>& stmt_group,
+                        const std::unordered_map<const Stmt*, int64_t>& stmt_k) {
   std::vector<StmtPtr> body_stmts;
   if (auto seq = As<SeqStmts>(body)) {
     body_stmts = seq->stmts_;
@@ -350,7 +472,26 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
       return;
     }
     const Span scope_span = run.front()->span_;
-    StmtPtr scope_body = SeqStmts::Flatten(run, scope_span);
+    // A matmul with the solver's contraction tile `k` is emitted as a stage=2
+    // k-pipeline (DDR<->L1 double-buffer); every other stmt is kept as-is.
+    std::vector<StmtPtr> scope_stmts;
+    for (const StmtPtr& s : run) {
+      std::optional<std::vector<StmtPtr>> pipelined;
+      if (auto assign = As<AssignStmt>(s)) {
+        auto kit = stmt_k.find(s.get());
+        if (kit != stmt_k.end()) {
+          pipelined = PipelineMatmul(assign, kit->second);
+        }
+      }
+      if (pipelined) {
+        for (auto& ps : *pipelined) {
+          scope_stmts.push_back(std::move(ps));
+        }
+      } else {
+        scope_stmts.push_back(s);
+      }
+    }
+    StmtPtr scope_body = SeqStmts::Flatten(std::move(scope_stmts), scope_span);
     top.push_back(std::make_shared<InCoreScopeStmt>(
         std::nullopt, "fused_" + std::to_string(run_group), std::move(scope_body), scope_span));
     run.clear();
@@ -439,13 +580,17 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     // tile downstream. (Applying step.config as AutoInCore chunk loops for
     // cross-core spatial tiling is the next increment.)
     std::unordered_map<const Stmt*, size_t> stmt_group;
+    std::unordered_map<const Stmt*, int64_t> stmt_k;  // group's contraction tile, for matmul pipelining
     for (size_t s = 0; s < sol.num_steps(); ++s) {
+      const int64_t k = sol.step(s).config.k;
       for (size_t op_idx : sol.step(s).subgraph.ops()) {
-        stmt_group[builder.op_stmts[op_idx]] = s;
+        const Stmt* stmt = builder.op_stmts[op_idx];
+        stmt_group[stmt] = s;
+        stmt_k[stmt] = k;
       }
     }
     auto new_func = MutableCopy(func);
-    new_func->body_ = EmitFusedScopes(func->body_, stmt_group);
+    new_func->body_ = EmitFusedScopes(func->body_, stmt_group, stmt_k);
     // Drop the marker once fused: the body is now an InCore-scoped kernel graph,
     // not a flat tensor-op DAG, so the pass is idempotent (a second run no-ops).
     new_func->attrs_.erase(
