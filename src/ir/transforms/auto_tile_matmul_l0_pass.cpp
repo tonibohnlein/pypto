@@ -116,6 +116,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -260,6 +261,34 @@ AssignStmtPtr BuildAccInit(int64_t m, int64_t n, const DataType& dtype, const st
   std::vector<std::pair<std::string, std::any>> kwargs = {{"dtype", dtype},
                                                           {"target_memory", MemorySpace::Acc}};
   auto call = reg.Create("tile.create", {MakeIndexTuple({m, n}, span)}, kwargs, span);
+  auto var = std::make_shared<Var>(name_hint, call->GetType(), span);
+  return std::make_shared<AssignStmt>(var, call, span);
+}
+
+/// Build the ``tile.create([M, N], dtype, target_memory=Mat)`` output scratch
+/// for the M/N Mat-scratch path: an L1-resident [M, N] buffer that each
+/// ``[m, n]`` Acc sub-tile is assembled into.  Mat carries the same Nz TileView
+/// as the matmul output, so the Acc→Mat ``tile.assemble`` (lowering to the
+/// hardware NZ TINSERT) is layout-compatible — see ``BuildMatAssemble``.
+AssignStmtPtr BuildMatScratch(int64_t M, int64_t N, const DataType& dtype, const std::string& name_hint,
+                              const Span& span) {
+  auto& reg = OpRegistry::GetInstance();
+  std::vector<std::pair<std::string, std::any>> kwargs = {{"dtype", dtype},
+                                                          {"target_memory", MemorySpace::Mat}};
+  auto call = reg.Create("tile.create", {MakeIndexTuple({M, N}, span)}, kwargs, span);
+  auto var = std::make_shared<Var>(name_hint, call->GetType(), span);
+  return std::make_shared<AssignStmt>(var, call, span);
+}
+
+/// Build ``tile.assemble(scratch, sub, [mi, ni])`` — insert the ``[m, n]`` Acc
+/// sub-tile into the Mat scratch at origin ``(mi, ni)``.  Result inherits the
+/// target (Mat) type; the chain ``scratch_{k+1} = assemble(scratch_k, …)`` is
+/// single-use so MemoryReuse aliases the buffers (no full-scratch copy per
+/// insert).  Lowers to ``pto.subview`` + ``pto.tmov`` (Acc→Mat NZ TINSERT).
+AssignStmtPtr BuildMatAssemble(const VarPtr& scratch, const VarPtr& sub, int64_t mi, int64_t ni,
+                               const std::string& name_hint, const Span& span) {
+  auto& reg = OpRegistry::GetInstance();
+  auto call = reg.Create("tile.assemble", {scratch, sub, MakeIndexTuple({mi, ni}, span)}, span);
   auto var = std::make_shared<Var>(name_hint, call->GetType(), span);
   return std::make_shared<AssignStmt>(var, call, span);
 }
@@ -635,9 +664,30 @@ ExprPtr OffsetPlus(const ExprPtr& base, int64_t delta, const Span& sp) {
 class SiblingUseCounter : public IRVisitor {
  public:
   std::unordered_map<const Var*, int> counts;
+  // Vars that appear in at least one position other than a direct operand of a
+  // ``tile.matmul`` / ``tile.matmul_acc``.  A matmul result whose every use is
+  // a matmul operand is safe to materialize in Mat (the consumer K-tiles it,
+  // so each operand slice fits L0a) — that gates the Mat-scratch M/N path.
+  std::unordered_set<const Var*> non_matmul_used;
 
  protected:
-  void VisitVarLike_(const VarPtr& op) override { ++counts[op.get()]; }
+  bool in_matmul_arg_ = false;
+  void VisitVarLike_(const VarPtr& op) override {
+    ++counts[op.get()];
+    if (!in_matmul_arg_) non_matmul_used.insert(op.get());
+  }
+  void VisitExpr_(const CallPtr& op) override {
+    const bool is_mm =
+        op->op_ && (op->op_->name_ == "tile.matmul" || op->op_->name_ == "tile.matmul_acc");
+    for (const auto& a : op->args_) {
+      // A *direct* Var arg of a matmul is a matmul-operand use; nested exprs
+      // (and any arg of a non-matmul call) are non-matmul uses.
+      const bool prev = in_matmul_arg_;
+      in_matmul_arg_ = is_mm && (AsVarLike(a) != nullptr);
+      VisitExpr(a);
+      in_matmul_arg_ = prev;
+    }
+  }
   // Skip the LHS (a def); count only reads in the RHS value.
   void VisitStmt_(const AssignStmtPtr& op) override { VisitExpr(op->value_); }
 };
@@ -653,6 +703,7 @@ class SiblingUseCounter : public IRVisitor {
 struct SiblingIndex {
   std::unordered_map<const Var*, int> use_counts;
   std::unordered_map<const Var*, const AssignStmt*> store_of;
+  std::unordered_set<const Var*> non_matmul_used;
 };
 
 SiblingIndex BuildSiblingIndex(const std::vector<StmtPtr>& stmts) {
@@ -663,11 +714,16 @@ SiblingIndex BuildSiblingIndex(const std::vector<StmtPtr>& stmts) {
     auto as = std::dynamic_pointer_cast<const AssignStmt>(s);
     if (!as) continue;
     auto call = As<Call>(as->value_);
-    // Record top-level 2D ``tile.store(src, offsets, out)`` by source operand.
+    // Record only fully-foldable top-level 2D ``tile.store(src, offsets, out)``
+    // by source operand: var source, 2-element offset tuple, var output tensor.
     if (!call || !call->op_ || call->op_->name_ != "tile.store" || call->args_.size() != 3) continue;
-    if (auto src = AsVarLike(call->args_[0])) idx.store_of.emplace(src.get(), as.get());
+    auto src = AsVarLike(call->args_[0]);
+    auto offs = As<MakeTuple>(call->args_[1]);
+    auto dst = AsVarLike(call->args_[2]);
+    if (src && offs && offs->elements_.size() == 2 && dst) idx.store_of.emplace(src.get(), as.get());
   }
   idx.use_counts = std::move(counter.counts);
+  idx.non_matmul_used = std::move(counter.non_matmul_used);
   return idx;
 }
 
@@ -681,66 +737,28 @@ struct MNFold {
   const AssignStmt* store = nullptr;   ///< consumer store to drop from the SeqStmts
 };
 
-/// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
-/// L0c into an unrolled grid of ``ceil(M/m) x ceil(N/n)`` sub-tile matmuls,
-/// each computing an ``[m, n]`` (partial on the boundary) Acc result and
-/// storing it straight to the output tensor at ``out[mi:, ni:]``.  Operands are
-/// already Mat-resident, so only the output Acc overflows; sub-tiling the
-/// output keeps every Acc tile within L0c.
-///
-/// Requires the matmul's result to be consumed by exactly one 2D
-/// ``tile.store(c, base, out)`` (``result_uses`` and ``store_stmt`` come from
-/// the precomputed SiblingIndex); that store is folded into the per-sub-tile
-/// rewrite (the DDR-output case our solver kernels need).  Returns nullopt
-/// (with a PerfHint) when the pattern does not match — the matmul is then left
-/// untouched.  ``matmul_acc`` (caller-supplied [M, N] accumulator) and a Vec
-/// left operand both need the Mat-scratch / per-iter assemble path that is
-/// still deferred.
-std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, const AssignStmt* store_stmt,
-                                      std::vector<Diagnostic>& hints) {
+/// Build the **direct-store** M/N fold: a plain ``tile.matmul`` whose oversized
+/// [M, N] output is consumed by exactly one 2D ``tile.store(c, base, out)`` is
+/// unrolled into a ``ceil(M/m) x ceil(N/n)`` grid of ``[m, n]`` (partial on the
+/// boundary) Acc sub-tiles, each stored straight to ``out[base + (mi, ni)]``
+/// (the DDR-output case the solver kernels need).  The store is folded in; the
+/// chain threads the output tensor in SSA form.  Preconditions (plain matmul,
+/// ``K/k >= 2``, foldable store) are guaranteed by the caller — ``store_stmt``
+/// is a 2D store with a var source / 2-tuple offsets / var output by
+/// ``SiblingIndex``.
+MNFold BuildDirectStoreMNFold(const MatmulTiling& t, const AssignStmt* store_stmt) {
   const Span sp = t.assign->span_;
-  auto skip = [&](const std::string& msg) -> std::optional<MNFold> {
-    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006", msg, sp);
-    return std::nullopt;
-  };
-
-  if (t.is_acc()) {
-    return skip(
-        "tile.matmul_acc with an oversized [M, N] output needs M/N tiling — the matmul_acc path is "
-        "deferred (needs per-sub-tile accumulator slicing); left untouched");
-  }
-  if (t.stage_lhs_to_mat) {
-    return skip(
-        "tile.matmul with a Vec left operand needs M/N tiling — the PV path is deferred; left untouched");
-  }
-  // M/N tiling reuses the whole-output K-loop builder per sub-tile, which
-  // assumes a real (>= 2-trip) pipelined K-loop.  K == k (single block) would
-  // need a straight-line per-sub-tile matmul instead — deferred.
-  if (t.K / t.k < 2) {
-    return skip("tile.matmul output exceeds L0c but K fits in a single L0 block (K / k < 2); the "
-                "single-K-block M/N form is not yet supported — left untouched");
-  }
-
-  // The result must be consumed exactly once, by the 2D store we fold in.
-  if (result_uses != 1 || !store_stmt) {
-    return skip("tile.matmul output exceeds L0c but its result is not consumed by exactly one 2D "
-                "tile.store — M/N direct-store fold needs `out = tile.store(c, ...)`; left untouched");
-  }
   auto store_call = As<Call>(store_stmt->value_);
   INTERNAL_CHECK_SPAN(store_call, store_stmt->span_)
       << "Internal error: SiblingIndex store_of mapped a non-Call AssignStmt";
-
   auto offs = As<MakeTuple>(store_call->args_[1]);
-  if (!offs || offs->elements_.size() != 2) {
-    return skip("tile.store offsets are not a 2D tuple — M/N fold not applicable; left untouched");
-  }
+  INTERNAL_CHECK_SPAN(offs && offs->elements_.size() == 2, store_stmt->span_)
+      << "Internal error: store_of recorded a non-2D-tuple store offset";
   const ExprPtr base_r = offs->elements_[0];
   const ExprPtr base_c = offs->elements_[1];
   auto out_in = AsVarLike(store_call->args_[2]);
-  if (!out_in) {
-    return skip("tile.store target is not a simple tensor variable — M/N fold not applicable; left "
-                "untouched");
-  }
+  INTERNAL_CHECK_SPAN(out_in, store_stmt->span_)
+      << "Internal error: store_of recorded a non-var store output";
 
   // Chain the per-sub-tile stores from the raw output tensor.  The folded
   // stmts are emitted later, at the consumer-store position, where the caller
@@ -788,6 +806,79 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
   }
 
   return MNFold{std::move(stmts), last_out, store_stmt->var_, store_stmt};
+}
+
+/// Conservative check that a Mat-resident [M, N] output scratch fits in L1
+/// alongside the (already Mat-resident) operands.  Counts the full scratch plus
+/// both operands against ``Backend::GetMemSize(Mat)`` — operand liveness could
+/// free space earlier, so over-counting only makes a borderline case skip (with
+/// a PerfHint) rather than overflow L1 at ``AllocateMemoryAddr``.  Returns true
+/// when no backend / no Mat limit is configured (let it through; the verifier
+/// is the backstop).
+bool MatScratchFitsL1(const MatmulTiling& t) {
+  auto lhs_tile = As<TileType>(t.lhs->GetType());
+  auto rhs_tile = As<TileType>(t.rhs->GetType());
+  auto out_tile = As<TileType>(t.assign->var_->GetType());
+  if (!lhs_tile || !rhs_tile || !out_tile) return false;
+  const uint32_t ba = DTypeBytes(lhs_tile->dtype_);
+  const uint32_t bb = DTypeBytes(rhs_tile->dtype_);
+  const uint32_t bc = DTypeBytes(out_tile->dtype_);
+  if (ba == 0 || bb == 0 || bc == 0) return false;
+  const int64_t needed = t.M * t.N * bc + t.M * t.K * ba + t.K * t.N * bb;
+  if (!pypto::backend::BackendConfig::IsConfigured()) return true;
+  const uint64_t limit = pypto::backend::GetBackend()->GetMemSize(MemorySpace::Mat);
+  return limit == 0 || static_cast<uint64_t>(needed) <= limit;
+}
+
+/// Build the **Mat-scratch** M/N rewrite: a plain ``tile.matmul`` whose
+/// oversized [M, N] output is consumed *on-chip* (no direct store) is computed
+/// into an L1-resident [M, N] ``tile.create(target=Mat)`` scratch — each
+/// ``[m, n]`` (partial on the boundary) Acc sub-tile is assembled into the
+/// scratch via ``tile.assemble`` (Acc→Mat NZ insert) — and the final Mat
+/// scratch replaces the matmul's result for downstream consumers.  Unlike the
+/// direct-store fold this is local (no consumer folding): it produces a value
+/// and the caller remaps the original result to it, exactly like the K-only
+/// path.  ``InferTileMemorySpace`` (which runs after this pass) reconciles the
+/// Mat result with whatever the consumer needs.
+RewriteResult BuildMatScratchMNRewrite(const MatmulTiling& t) {
+  const Span sp = t.assign->span_;
+  const std::string base = t.assign->var_->name_hint_;
+  auto out_tile = As<TileType>(t.assign->var_->GetType());
+  INTERNAL_CHECK_SPAN(out_tile, sp) << "Internal error: matmul result is not a TileType";
+  const DataType dtype = out_tile->dtype_;
+
+  std::vector<StmtPtr> stmts;
+  auto scratch_init = BuildMatScratch(t.M, t.N, dtype, base + "_mat", sp);
+  stmts.push_back(scratch_init);
+  VarPtr scratch = scratch_init->var_;
+
+  const int64_t num_m = (t.M + t.m - 1) / t.m;
+  const int64_t num_n = (t.N + t.n - 1) / t.n;
+  int tile_idx = 0;
+  for (int64_t nj = 0; nj < num_n; ++nj) {
+    const int64_t ni = nj * t.n;
+    const int64_t n_eff = std::min<int64_t>(t.n, t.N - ni);
+    for (int64_t mj = 0; mj < num_m; ++mj) {
+      const int64_t mi = mj * t.m;
+      const int64_t m_eff = std::min<int64_t>(t.m, t.M - mi);
+      const std::string tbase = base + "_t" + std::to_string(tile_idx);
+
+      // Inner K-loop producing the [m_eff, n_eff] Acc sub-tile.
+      auto inner =
+          BuildKLoopRewrite(MakeKLoop(t, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, tbase));
+      for (auto& s : inner.stmts) stmts.push_back(std::move(s));
+
+      // Assemble it into the Mat scratch at (mi, ni); chain stays single-use so
+      // MemoryReuse aliases the scratch buffers (no full-scratch copy per insert).
+      auto asm_stmt = BuildMatAssemble(scratch, inner.return_var, mi, ni,
+                                       base + "_mat_t" + std::to_string(tile_idx), sp);
+      stmts.push_back(asm_stmt);
+      scratch = asm_stmt->var_;
+      ++tile_idx;
+    }
+  }
+
+  return RewriteResult{std::move(stmts), scratch};
 }
 
 class AutoTileMutator : public IRMutator {
@@ -861,24 +952,70 @@ class AutoTileMutator : public IRMutator {
             changed = true;
             continue;
           }
-          // Output exceeds L0c — tile M/N by folding the consumer store, found
-          // via the raw (un-substituted) SiblingIndex: the matmul's result is
-          // freshly defined here, so its use count / store site are never
-          // affected by the running remap.
-          if (!sibling_index) sibling_index = BuildSiblingIndex(op->stmts_);
-          const Var* result = assign->var_.get();
-          auto uc_it = sibling_index->use_counts.find(result);
-          const int result_uses = uc_it == sibling_index->use_counts.end() ? 0 : uc_it->second;
-          auto store_it = sibling_index->store_of.find(result);
-          const AssignStmt* store_stmt =
-              store_it == sibling_index->store_of.end() ? nullptr : store_it->second;
-          if (auto fold = TryFoldMNTiling(*tiling, result_uses, store_stmt, hints)) {
-            remap[fold->store_result_var.get()] = fold->return_var;
-            pending_folds.emplace(static_cast<const Stmt*>(fold->store), std::move(*fold));
-            changed = true;
-            continue;  // drop the matmul; sub-tile stmts emit at the store site
+          // Output exceeds L0c — tile M/N.  Both paths reuse the >= 2-trip
+          // K-loop builder per sub-tile and support plain Mat-fed tile.matmul
+          // only; matmul_acc (per-sub-tile accumulator slicing), a Vec left
+          // operand (PV path), and a single K block (K/k < 2, needs straight-
+          // line per-sub-tile matmul) are deferred.
+          auto defer = [&](const std::string& msg) {
+            hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006", msg,
+                               tiling->assign->span_);
+          };
+          if (tiling->is_acc()) {
+            defer(
+                "tile.matmul_acc with an oversized [M, N] output needs M/N tiling — the matmul_acc path "
+                "is deferred (needs per-sub-tile accumulator slicing); left untouched");
+          } else if (tiling->stage_lhs_to_mat) {
+            defer("tile.matmul with a Vec left operand needs M/N tiling — the PV path is deferred; left "
+                  "untouched");
+          } else if (tiling->K / tiling->k < 2) {
+            defer("tile.matmul output exceeds L0c but K fits in a single L0 block (K/k < 2); the "
+                  "single-K-block M/N form is not yet supported — left untouched");
+          } else {
+            // Foldability / consumer site from the raw (un-substituted)
+            // SiblingIndex: the matmul's result is freshly defined here, so its
+            // use count / store site are never affected by the running remap.
+            if (!sibling_index) sibling_index = BuildSiblingIndex(op->stmts_);
+            const Var* result = assign->var_.get();
+            auto uc_it = sibling_index->use_counts.find(result);
+            const int result_uses = uc_it == sibling_index->use_counts.end() ? 0 : uc_it->second;
+            auto store_it = sibling_index->store_of.find(result);
+            const AssignStmt* store_stmt =
+                store_it == sibling_index->store_of.end() ? nullptr : store_it->second;
+
+            if (store_stmt != nullptr && result_uses == 1) {
+              // Sole consumer is a foldable 2D store — write each sub-tile to
+              // DDR directly (no on-chip scratch).
+              auto fold = BuildDirectStoreMNFold(*tiling, store_stmt);
+              remap[fold.store_result_var.get()] = fold.return_var;
+              pending_folds.emplace(static_cast<const Stmt*>(fold.store), std::move(fold));
+              changed = true;
+              continue;  // drop the matmul; sub-tile stmts emit at the store site
+            }
+            // Mat-scratch path: the result is consumed on-chip *only* as a
+            // matmul operand (every use is a tile.matmul[_acc] arg, so the
+            // consumer K-tiles it and each operand slice fits L0a — a provably
+            // Mat-safe consumer), and the [M, N] scratch + operands fit L1.
+            const bool matmul_only_consumer =
+                result_uses > 0 && sibling_index->non_matmul_used.count(result) == 0;
+            if (store_stmt == nullptr && matmul_only_consumer && MatScratchFitsL1(*tiling)) {
+              // Assemble each sub-tile into a Mat scratch; downstream matmul(s)
+              // consume the Mat result.
+              auto rewrite = BuildMatScratchMNRewrite(*tiling);
+              remap[result] = rewrite.return_var;
+              for (auto& s : rewrite.stmts) out.push_back(std::move(s));
+              changed = true;
+              continue;
+            }
+            // Not foldable to either path: stored *and* reused, consumed by a
+            // non-matmul op (which would need the result in Vec — likely an L0c-
+            // class overflow again), or the [M, N] Mat scratch does not fit L1
+            // (needs a DDR spill).  All deferred.
+            defer("tile.matmul output exceeds L0c but M/N tiling is not applicable: the result is stored "
+                  "and reused, consumed by a non-matmul op (needs Vec / DDR), or its [M, N] Mat scratch "
+                  "does not fit L1 (needs a DDR spill); left untouched");
           }
-          // M/N tiling not applicable — fall through and leave it untouched.
+          // M/N tiling not applied — fall through and leave it untouched.
         }
       }
       auto visited = VisitStmt(current);
