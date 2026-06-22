@@ -75,11 +75,16 @@
 /// output overflows: for a plain ``tile.matmul`` whose result is consumed by a
 /// single 2D ``tile.store(c, base, out)``, the pass unrolls the output into a
 /// ``ceil(M/m) x ceil(N/n)`` grid and emits, per sub-tile origin ``(mi, ni)``,
-/// the K-loop above for the ``[m_eff, n_eff]`` (partial on the boundary) sub-
-/// tile followed by ``tile.store(c_sub, [base_r + mi, base_c + ni], out_prev)``.
-/// The stores chain the output tensor in SSA form; the final store's result
-/// replaces the original store downstream.  Boundary sub-tiles use static
-/// partial extents, so ``m`` / ``n`` need not divide ``M`` / ``N``.
+/// the ``[m_eff, n_eff]`` (partial on the boundary) sub-tile compute followed by
+/// ``tile.store(c_sub, [base_r + mi, base_c + ni], out_prev)``.  Each sub-tile
+/// uses the pipelined K-loop above when K spans >= 2 L0 blocks, or — when
+/// ``k == K`` (the full K fits L0a/L0b at once) — a single straight-line
+/// ``tile.matmul``, emitted as a serpentine (snake) grid that keeps one operand
+/// panel resident in L0 and reuses it across sub-tiles (see ``BuildFullKSnake``;
+/// row vs column snake is auto-picked by panel cost).  The stores chain the
+/// output tensor in SSA form; the final store's result replaces the original
+/// store downstream.  Boundary sub-tiles use static partial extents, so ``m`` /
+/// ``n`` need not divide ``M`` / ``N``.
 ///
 /// Supported today:
 ///   * ``tile.matmul`` and ``tile.matmul_acc``.  ``tile.matmul_bias`` is
@@ -87,11 +92,11 @@
 ///     rewriting that is not yet implemented.
 ///   * K tiling (``m == M and n == N``) for ``tile.matmul`` and
 ///     ``tile.matmul_acc``; M/N tiling for plain ``tile.matmul`` with a single
-///     2D ``tile.store`` consumer.  M/N tiling of ``tile.matmul_acc`` (needs
-///     per-sub-tile accumulator slicing), of a Vec left operand, of a single
-///     K block (``K / k < 2``), or of a non-store consumer (needs the
-///     Mat-scratch / ``tile.assemble`` path) is deferred — those emit a
-///     ``PerfHint`` and skip.
+///     2D ``tile.store`` consumer, with either a pipelined K-loop or a
+///     straight-line single-K-block (``k == K``) per sub-tile.  M/N tiling of
+///     ``tile.matmul_acc`` (needs per-sub-tile accumulator slicing), of a Vec
+///     left operand, or of a non-store consumer (needs the Mat-scratch /
+///     ``tile.assemble`` path) is deferred — those emit a ``PerfHint`` and skip.
 ///   * ``K % k == 0``.  K-boundary handling (slice valid_shape on the last
 ///     iteration) is not yet implemented; mismatched cases emit a
 ///     ``PerfHint`` and skip.
@@ -679,6 +684,110 @@ struct MNFold {
   const AssignStmt* store = nullptr;  ///< consumer store to drop from the SeqStmts
 };
 
+/// Build the full-K (``k == K``) M/N grid with a **serpentine (snake)**
+/// traversal that keeps one operand panel resident in L0 across the sweep and
+/// re-extracts it only when it changes.  Because the full K fits L0a/L0b, the
+/// whole ``[m, K]`` left panel (or ``[K, n]`` right panel) can stay in
+/// Left/Right across many ``tile.matmul``s — each output sub-tile is a single
+/// straight-line matmul (no K-loop / pipeline / iter-arg).
+///
+/// **Operand-content reuse.** The left panel depends only on the M-row ``mi``;
+/// the right panel only on the N-col ``ni``.  We emit a fresh
+/// ``tile.extract(..., Left/Right)`` only when that index changes, so the same
+/// extract Var feeds several matmuls (the cube reads the resident L0 buffer
+/// without re-loading from Mat).
+///
+/// **Row vs column snake (auto).** The *stationary* operand is the more
+/// expensive panel — extracted ``P`` (or ``Q``) times instead of ``~P*Q``.
+/// With ``P = ceil(M/m)``, ``Q = ceil(N/n)``, ``A_cost = m*K*bytes_a``,
+/// ``B_cost = K*n*bytes_b`` and ``T_row − T_col = (P−1)(Q−1)(B_cost − A_cost)``,
+/// we pick a **row snake** (A-stationary, sweep N within each M-row) when the
+/// left panel is the larger, else a **column snake** (B-stationary).  Reversing
+/// the inner sweep direction every outer step also reuses the *moving* panel
+/// across each turn, so the grid issues only ``P*Q + 1`` extracts instead of
+/// ``2*P*Q``.  Each ``[m_eff, n_eff]`` (partial on the boundary) result is
+/// stored straight to ``out[mi:, ni:]``, chaining the output in SSA form.
+///
+/// Plain ``tile.matmul`` with Mat-resident operands only (matmul_acc / Vec-lhs
+/// deferred upstream).  Returns the emitted stmts and the final output Var.
+std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKSnake(
+    const MatmulTiling& t, const ExprPtr& base_r, const ExprPtr& base_c, const VarPtr& out_in,
+    const std::vector<std::pair<std::string, std::any>>& store_kwargs) {
+  const Span sp = t.assign->span_;
+  auto& reg = OpRegistry::GetInstance();
+  const std::string base = t.assign->var_->name_hint_;
+  const std::string out_base = out_in->name_hint_;
+  const int64_t num_m = (t.M + t.m - 1) / t.m;
+  const int64_t num_n = (t.N + t.n - 1) / t.n;
+
+  // Keep the more expensive operand panel stationary.  AnalyzeMatmul already
+  // verified both operands are TileType before building this MatmulTiling, so
+  // these casts cannot fail here (a null would silently skew the panel-cost
+  // comparison and pick the wrong snake direction).
+  auto lhs_tile = As<TileType>(t.lhs->GetType());
+  auto rhs_tile = As<TileType>(t.rhs->GetType());
+  INTERNAL_CHECK_SPAN(lhs_tile && rhs_tile, sp)
+      << "Internal error: full-K snake operands must be TileType (guaranteed by AnalyzeMatmul)";
+  const uint32_t bytes_a = DTypeBytes(lhs_tile->dtype_);
+  const uint32_t bytes_b = DTypeBytes(rhs_tile->dtype_);
+  const int64_t a_panel = t.m * t.K * static_cast<int64_t>(bytes_a);
+  const int64_t b_panel = t.K * t.n * static_cast<int64_t>(bytes_b);
+  const bool row_snake = a_panel >= b_panel;  // A-stationary when the left panel is larger
+
+  // Serpentine sequence of (mi_idx, ni_idx) grid coordinates.  Row snake sweeps
+  // N within each M-row, reversing direction every row; column snake is the
+  // transpose.  Reversing the inner axis carries the endpoint moving-panel into
+  // the next outer step (so it is reused, not re-extracted).
+  std::vector<std::pair<int64_t, int64_t>> seq;
+  seq.reserve(static_cast<size_t>(num_m * num_n));
+  if (row_snake) {
+    for (int64_t r = 0; r < num_m; ++r)
+      for (int64_t q = 0; q < num_n; ++q) seq.emplace_back(r, (r % 2 == 0) ? q : (num_n - 1 - q));
+  } else {
+    for (int64_t c = 0; c < num_n; ++c)
+      for (int64_t p = 0; p < num_m; ++p) seq.emplace_back((c % 2 == 0) ? p : (num_m - 1 - p), c);
+  }
+
+  std::vector<StmtPtr> stmts;
+  VarPtr a_var, b_var, out_value = out_in, last_out = out_in;
+  int64_t held_mi = -1, held_ni = -1;  // grid indices of the currently-resident panels
+  int a_idx = 0, b_idx = 0, step = 0;
+  for (const auto& [mi_idx, ni_idx] : seq) {
+    const int64_t mi = mi_idx * t.m;
+    const int64_t m_eff = std::min<int64_t>(t.m, t.M - mi);
+    const int64_t ni = ni_idx * t.n;
+    const int64_t n_eff = std::min<int64_t>(t.n, t.N - ni);
+
+    if (mi_idx != held_mi) {
+      auto sa = BuildExtract(t.lhs, {m_eff, t.K}, MakeIndex(mi, sp), MakeIndex(0, sp), MemorySpace::Left,
+                             base + "_a" + std::to_string(a_idx++), sp);
+      stmts.push_back(sa);
+      a_var = sa->var_;
+      held_mi = mi_idx;
+    }
+    if (ni_idx != held_ni) {
+      auto sb = BuildExtract(t.rhs, {t.K, n_eff}, MakeIndex(0, sp), MakeIndex(ni, sp), MemorySpace::Right,
+                             base + "_b" + std::to_string(b_idx++), sp);
+      stmts.push_back(sb);
+      b_var = sb->var_;
+      held_ni = ni_idx;
+    }
+    auto c_call = reg.Create("tile.matmul", {a_var, b_var}, sp);
+    auto c_var = std::make_shared<Var>(base + "_c" + std::to_string(step), c_call->GetType(), sp);
+    stmts.push_back(std::make_shared<AssignStmt>(c_var, c_call, sp));
+
+    auto store_offs = std::make_shared<MakeTuple>(
+        std::vector<ExprPtr>{OffsetPlus(base_r, mi, sp), OffsetPlus(base_c, ni, sp)}, sp);
+    auto scall = reg.Create("tile.store", {c_var, store_offs, out_value}, store_kwargs, sp);
+    auto sv = std::make_shared<Var>(out_base + "_t" + std::to_string(step), scall->GetType(), sp);
+    stmts.push_back(std::make_shared<AssignStmt>(sv, scall, sp));
+    out_value = sv;
+    last_out = sv;
+    ++step;
+  }
+  return {std::move(stmts), last_out};
+}
+
 /// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
 /// L0c into an unrolled grid of ``ceil(M/m) x ceil(N/n)`` sub-tile matmuls,
 /// each computing an ``[m, n]`` (partial on the boundary) Acc result and
@@ -711,14 +820,9 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
     return skip(
         "tile.matmul with a Vec left operand needs M/N tiling — the PV path is deferred; left untouched");
   }
-  // M/N tiling reuses the whole-output K-loop builder per sub-tile, which
-  // assumes a real (>= 2-trip) pipelined K-loop.  K == k (single block) would
-  // need a straight-line per-sub-tile matmul instead — deferred.
-  if (t.K / t.k < 2) {
-    return skip(
-        "tile.matmul output exceeds L0c but K fits in a single L0 block (K / k < 2); the "
-        "single-K-block M/N form is not yet supported — left untouched");
-  }
+  // K spans >= 2 L0 blocks → pipelined K-loop per sub-tile; k == K (full K fits
+  // L0a/L0b) → straight-line snake grid with operand reuse (see BuildFullKSnake).
+  const bool full_k = t.K / t.k < 2;
 
   // The result must be consumed exactly once, by the 2D store we fold in.
   if (result_uses != 1 || !store_stmt) {
@@ -741,6 +845,16 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
     return skip(
         "tile.store target is not a simple tensor variable — M/N fold not applicable; left "
         "untouched");
+  }
+
+  // Full-K (k == K): the whole operand panel fits L0, so emit the grid as a
+  // serpentine snake that keeps one panel resident and reuses it across
+  // sub-tiles (see BuildFullKSnake).  Cross-sub-tile operand reuse is only
+  // possible when the panel fits L0 — i.e. exactly the full-K case — so the
+  // K-loop path (panel does not fit L0) keeps the simple per-sub-tile grid.
+  if (full_k) {
+    auto [snake_stmts, snake_last] = BuildFullKSnake(t, base_r, base_c, out_in, store_call->kwargs_);
+    return MNFold{std::move(snake_stmts), snake_last, store_stmt->var_, store_stmt};
   }
 
   // Chain the per-sub-tile stores from the raw output tensor.  The folded
@@ -769,8 +883,8 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
       const int64_t m_eff = std::min<int64_t>(t.m, t.M - mi);
       const std::string tbase = base + "_t" + std::to_string(tile_idx);
 
-      // Inner K-loop: accumulate lhs[mi:mi+m_eff, :] @ rhs[:, ni:ni+n_eff] over
-      // K into an [m_eff, n_eff] Acc result.
+      // Pipelined K-loop over the [m_eff, n_eff] sub-tile (K spans >= 2 L0
+      // blocks).  The full-K case is handled by the snake builder above.
       auto inner = BuildKLoopRewrite(MakeKLoop(t, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, tbase));
       for (auto& s : inner.stmts) stmts.push_back(std::move(s));
 

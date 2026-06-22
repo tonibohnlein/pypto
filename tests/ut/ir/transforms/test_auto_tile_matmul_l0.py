@@ -568,6 +568,20 @@ def _torch_codegen_matches_matmul(program, m_dim, n_dim, k_dim):
     return torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (out - expected).abs().max().item()
 
 
+def _assert_ssa_valid(after, label):
+    """Assert the rewritten program still satisfies ``SSAForm`` + ``UseAfterDef``.
+
+    The snake reuses one Left/Right extract Var across several ``tile.matmul``s,
+    so every reused operand must remain defined before all its uses — a check
+    that would catch a stale/dangling reuse the same way the reversed-store
+    regression catches a stale remap.
+    """
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.SSAForm)
+    props.insert(passes.IRProperty.UseAfterDef)
+    passes.verify_properties(props, after, label)
+
+
 class TestAutoTileMatmulL0MNTiling:
     """M/N output tiling.
 
@@ -884,6 +898,146 @@ class TestAutoTileMatmulL0MNTiling:
         expected[:, 512:1024] = torch.matmul(a2, b2)
         assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
             f"reversed def/store-chain mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+    def test_mn_tiling_full_k_single_block_row_snake(self):
+        """When the chosen ``k == K`` (the full K fits L0a/L0b at once), each M/N
+        sub-tile is a **straight-line** single ``tile.matmul`` over the full K —
+        no pipelined K-loop, no ``tile.matmul_acc``, no Acc-init placeholder —
+        emitted as a serpentine **snake** that keeps one operand panel resident
+        in L0 and reuses it across sub-tiles.
+
+        256×256 @ 64 with BF16 operands on Ascend910B: output `[256,256]` FP32 is
+        256 KB > L0c (128 KB) so M/N tiles (chooser picks m=192, n=160), and the
+        full K=64 panel fits L0a/L0b so k=64=K.  The left panel (192×64) is larger
+        than the right (64×160), so a **row snake** (A-stationary) is auto-picked:
+        the 2×2 grid issues 2 Left + 3 Right extracts (P·Q+1 = 5) instead of 8,
+        with 4 matmuls / 4 stores, and is numerically correct."""
+
+        # Override the autouse Ascend950 fixture: 256×256 FP32 fits L0c on 950 but
+        # overflows it on 910B, which forces the M/N tiling exercised here.
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                lhs_mat: pl.Tile[[256, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [256, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 256], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        _assert_ssa_valid(After, "test_full_k_row_snake")
+
+        # Rewrote (no longer a single [256,256] matmul) into a straight-line grid.
+        printed = ir.python_print(After)
+        assert "pl.pipeline" not in printed, "full-K sub-tiles must be straight-line, not a K-loop"
+        assert "matmul_acc" not in printed, "single-K-block sub-tiles need no accumulation"
+        # 2×2 grid (m=192/64, n=160/96) → 4 sub-tiles: 4 matmuls, 4 stores.
+        assert printed.count("pl.tile.matmul(") == 4
+        assert printed.count("pl.tile.store(") == 4
+        # Row snake (A-stationary): the [192×64] left panel is reused across each
+        # row, so only 2 Left extracts (one per M-row) but 3 Right extracts
+        # (P·Q+1 = 5 total, not 8).  Fewer Left extracts ⇒ A is the stationary one.
+        left = printed.count("target_memory=pl.Mem.Left")
+        right = printed.count("target_memory=pl.Mem.Right")
+        assert (left, right) == (2, 3), f"expected row-snake 2 Left + 3 Right extracts, got {left}+{right}"
+        assert printed.count("pl.tile.extract(") == 5
+
+        # Numerically matches torch.matmul (BF16 operands → bf16-tolerance).
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(256, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 256, dtype=torch.bfloat16)
+        out = torch.zeros(256, 256, dtype=torch.float32)
+        code = torch_codegen(After)
+        ns: dict = {}
+        exec(code, ns)  # noqa: S102 — executing generated reference code is the point
+        ns["kernel"](a, b, out)
+        expected = torch.matmul(a, b).float()
+        assert torch.allclose(out, expected, rtol=1e-2, atol=1e-2), (
+            f"full-K single-block mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+    def test_mn_tiling_full_k_column_snake(self):
+        """When the right panel is the larger operand, the full-K snake auto-picks
+        a **column snake** (B-stationary): the right ``[K, n]`` panel stays
+        resident and is reused down each N-column.
+
+        384×256 @ 64 with BF16 operands on Ascend910B: output `[384,256]` FP32
+        overflows L0c so M/N tiles (chooser picks m=144, n=208) and k=64=K.  Here
+        the right panel (64×208) is larger than the left (144×64), so the 3×2 grid
+        traverses column-major: 2 Right extracts (one per N-col, reused down the 3
+        rows) + 5 Left extracts (P·Q+1 = 7 total), 6 matmuls / 6 stores, and is
+        numerically correct."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[384, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[384, 256], pl.FP32]],
+            ) -> pl.Tensor[[384, 256], pl.FP32]:
+                lhs_mat: pl.Tile[[384, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [384, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 256], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[384, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        _assert_ssa_valid(After, "test_full_k_column_snake")
+
+        printed = ir.python_print(After)
+        assert "pl.pipeline" not in printed, "full-K sub-tiles must be straight-line, not a K-loop"
+        assert "matmul_acc" not in printed, "single-K-block sub-tiles need no accumulation"
+        # 3×2 grid (m=144, n=208) → 6 sub-tiles: 6 matmuls, 6 stores.
+        assert printed.count("pl.tile.matmul(") == 6
+        assert printed.count("pl.tile.store(") == 6
+        # Column snake (B-stationary): the [64×208] right panel is reused down each
+        # N-column, so only 2 Right extracts but 5 Left (P·Q+1 = 7, not 12).
+        # Fewer Right extracts ⇒ B is the stationary one.
+        left = printed.count("target_memory=pl.Mem.Left")
+        right = printed.count("target_memory=pl.Mem.Right")
+        assert (left, right) == (5, 2), f"expected column-snake 5 Left + 2 Right extracts, got {left}+{right}"
+        assert printed.count("pl.tile.extract(") == 7
+
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(384, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 256, dtype=torch.bfloat16)
+        out = torch.zeros(384, 256, dtype=torch.float32)
+        code = torch_codegen(After)
+        ns: dict = {}
+        exec(code, ns)  # noqa: S102 — executing generated reference code is the point
+        ns["kernel"](a, b, out)
+        expected = torch.matmul(a, b).float()
+        assert torch.allclose(out, expected, rtol=1e-2, atol=1e-2), (
+            f"full-K column-snake mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
         )
 
 
