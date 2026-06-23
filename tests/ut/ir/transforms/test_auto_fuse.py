@@ -55,7 +55,7 @@ class TestAutoFuse:
 
         After = passes.auto_fuse()(Before)
         body = next(f for _, f in After.functions.items() if f.name == "mm").as_python()
-        assert "chunked_loop_optimizer" in body  # AutoInCore chunked scope
+        assert "pl.auto_chunk" in body  # AutoInCore chunked scope
         assert "pl.parallel(" in body and "chunk=" in body  # cross-core tile distribution
         assert "pl.pipeline(" in body and "stage=2" in body  # the per-tile k-pipeline
         assert "pl.tensor.matmul_acc(" in body  # the per-strip accumulation
@@ -145,7 +145,7 @@ class TestAutoFuse:
                 return c
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw").as_python()
-        assert "chunked_loop_optimizer" in body  # AutoInCore chunked scope
+        assert "pl.auto_chunk" in body  # AutoInCore chunked scope
         assert "pl.parallel(48" in body  # 48 output tiles — one per vector core
         assert "pl.tensor.adds(" in body and "pl.tensor.assemble(" in body  # per-tile op + output assembly
 
@@ -179,7 +179,7 @@ class TestAutoFuse:
                 return c
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "chain").as_python()
-        assert "chunked_loop_optimizer" in body  # one fused AutoInCore scope
+        assert "pl.auto_chunk" in body  # one fused AutoInCore scope
         assert body.count("pl.tensor.matmul(") == 2  # both matmuls in the same per-tile body
         assert "_tband" in body  # the on-chip intermediate (T never touches DDR)
 
@@ -211,7 +211,7 @@ class TestAutoFuse:
                 return c
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw2").as_python()
-        assert "chunked_loop_optimizer" in body  # one fused AutoInCore scope
+        assert "pl.auto_chunk" in body  # one fused AutoInCore scope
         assert "pl.parallel(48" in body  # 48 output tiles — one per vector core
         assert "pl.tensor.adds(" in body and "pl.tensor.muls(" in body  # both ops in the per-tile body
         assert body.count("pl.tensor.assemble(") == 1  # only the output is assembled; the intermediate stays on-chip

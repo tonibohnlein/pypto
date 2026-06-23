@@ -32,7 +32,7 @@ This document provides a complete reference of all IR node types, organized by c
 <return_stmt> ::= "return" [ <var_list> ]
 <eval_stmt>  ::= <expr>
 <seq_stmts>  ::= <stmt> { ";" <stmt> }
-<scope_stmt> ::= "with" "pl.incore" "(" ")" ":" <stmt_list>
+<scope_stmt> ::= "with" "pl.at" "(" "level" "=" "pl.Level.CORE_GROUP" ")" ":" <stmt_list>
 <break_stmt> ::= "break"
 <continue_stmt> ::= "continue"
 
@@ -167,7 +167,7 @@ for the dispatch rule.
 | Where it appears | Anywhere | Inside `manual_scope` bodies (parser-produced) and as the outlined dispatch of a `pl.at(..., deps=[...])` scope (a missing `as tid` binding gets a synthetic unused TaskId Var); preserved through the whole pipeline |
 | Return type | Callee's declared return | `Tuple[<callee return>..., Scalar[TASK_ID]]` |
 | Has `deps` | No — a plain `Call` never carries dep edges (`attrs["manual_dep_edges"]` appears only on `ScopeStmt` from `pl.at`, consumed at scope outlining; ManualDepsOnSubmitOnly verifies this) | First-class `deps_` field — `Scalar[TASK_ID]` Vars / `Array[N, TASK_ID]` Vars |
-| SPMD launch spec | none | `core_num_` (`optional<ExprPtr>` block count) + `sync_start_` (bool), set only by `pl.spmd_submit`; `nullopt` ⇒ plain single-block submit |
+| SPMD launch spec | none | `core_num_` (`optional<ExprPtr>` block count) + `sync_start_` (bool), set only by `pl.spmd_submit`; `sync_start_` is meaningful only when `core_num_` is present (the constructor enforces `sync_start ⇒ core_num`); `nullopt` ⇒ plain single-block submit |
 | Use-def chain | `args_` only | `args_`, `deps_`, **and** `core_num_` |
 | Python syntax | `out = self.foo(...)` | `out, tid = pl.submit(self.foo, ...)` (or `pl.spmd_submit(self.foo, ..., core_num=N)`) |
 
@@ -317,10 +317,10 @@ at `CORE_GROUP`. `HierarchyScopeStmt` is reserved for non-`CORE_GROUP` levels
 (host, cluster, global) and is not a general replacement for in-core scopes.
 
 ```python
-# with pl.incore(): y = pl.add(x, x)
+# with pl.at(level=Level.CORE_GROUP): y = pl.add(x, x)
 in_core = ir.InCoreScopeStmt(name_hint="", body=body, span=span)
 
-# with pl.auto_incore():       (split is optional)
+# with pl.at(level=Level.CORE_GROUP, optimizations=[pl.auto_chunk]):  (split is optional)
 auto = ir.AutoInCoreScopeStmt(name_hint="", body=body, span=span)
 
 # with pl.cluster():
@@ -358,8 +358,10 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
   expression can be any integer-typed IR value — `Simplify` folds closure
   arithmetic to `ConstInt`, and codegen resolves `Var` references against
   the enclosing function scope.
-- `InCoreScopeStmt` / `AutoInCoreScopeStmt` are scheduled for deprecation;
-  prefer `HierarchyScopeStmt` or other surviving kinds in new code.
+- `InCoreScopeStmt` / `AutoInCoreScopeStmt` are the lowering target of
+  `pl.at(level=Level.CORE_GROUP)` (the `AutoInCore` form when
+  `optimizations=[pl.auto_chunk]` is supplied); the parser rejects `role=` at
+  `CORE_GROUP`, so `HierarchyScopeStmt` is reserved for the other levels.
 - Pass behavior:
   - `InterchangeChunkLoops` consumes `AutoInCoreScopeStmt`
   - `OutlineIncoreScopes` extracts `InCoreScopeStmt` into `Function(InCore)`
@@ -388,7 +390,7 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
 **Transformation:**
 
 ```python
-# Before: with pl.incore(): y = pl.add(x, x); return y
+# Before: with pl.at(level=Level.CORE_GROUP): y = pl.add(x, x); return y
 # After: main_incore_0(x) -> y; main(x): y = main_incore_0(x); return y
 ```
 

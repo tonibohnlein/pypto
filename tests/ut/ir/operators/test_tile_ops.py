@@ -712,6 +712,47 @@ class TestTileReductionOps:
         ir_str = str(Program)
         assert "tile.col_min" in ir_str
 
+    def test_tile_row_prod(self):
+        """Test tile.row_prod operation (2 args: tile + tmp_tile)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 1], pl.FP32],
+            ) -> pl.Tensor[[128, 1], pl.FP32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tmp_tile: pl.Tile[[32, 128], pl.FP32] = pl.tile.create(
+                    [32, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_row_prod: pl.Tile[[32, 1], pl.FP32] = pl.row_prod(tile_in, tmp_tile)
+                result: pl.Tensor[[128, 1], pl.FP32] = pl.store(tile_row_prod, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_prod" in ir_str
+
+    def test_tile_col_prod(self):
+        """Test tile.col_prod operation (1 arg)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[1, 128], pl.FP32],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tile_col_prod: pl.Tile[[1, 128], pl.FP32] = pl.tile.col_prod(tile_in)
+                result: pl.Tensor[[1, 128], pl.FP32] = pl.store(tile_col_prod, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_prod" in ir_str
+
     def test_tile_min_axis0(self):
         """Test tile.min operator - min along axis 0 (column-wise)."""
 
@@ -1048,6 +1089,132 @@ class TestTileBroadcastOps:
 
         ir_str = str(Program)
         assert "tile.row_expand_mul" in ir_str
+
+    def test_tile_row_expand_max(self):
+        """Test tile.row_expand_max operator - max of each tile row and row vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_max(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_expand_max" in ir_str
+
+    def test_tile_row_expand_min(self):
+        """Test tile.row_expand_min operator - min of each tile row and row vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_min(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_expand_min" in ir_str
+
+    def test_tile_row_expand_expdif(self):
+        """Test tile.row_expand_expdif operator - exp(tile - row vector) per row."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_expdif(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_expand_expdif" in ir_str
+
+    def test_tile_col_expand_max(self):
+        """Test tile.col_expand_max operator - max of each tile column and col vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                col: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand_max(tile_a, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_expand_max" in ir_str
+
+    def test_tile_col_expand_min(self):
+        """Test tile.col_expand_min operator - min of each tile column and col vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                col: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand_min(tile_a, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_expand_min" in ir_str
+
+    def test_tile_col_expand_expdif(self):
+        """Test tile.col_expand_expdif operator - exp(tile - col vector) per column."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                col: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand_expdif(tile_a, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_expand_expdif" in ir_str
 
     def test_tile_row_expand(self):
         """Test tile.row_expand operator - expand row vector to target tile shape."""
@@ -2092,7 +2259,10 @@ class TestTileBitwiseArithmeticOps:
             ) -> pl.Tensor[[128, 128], pl.FP32]:
                 tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
                 tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rem(tile_a, tile_b)
+                tmp: pl.Tile[[32, 32], pl.FP32] = pl.tile.create(
+                    [32, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rem(tile_a, tile_b, tmp)
                 result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
                 return result
 
@@ -2111,7 +2281,10 @@ class TestTileBitwiseArithmeticOps:
                 output: pl.Tensor[[128, 128], pl.FP32],
             ) -> pl.Tensor[[128, 128], pl.FP32]:
                 tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rems(tile_a, 3.0)
+                tmp: pl.Tile[[32, 32], pl.FP32] = pl.tile.create(
+                    [32, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rems(tile_a, 3.0, tmp)
                 result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
                 return result
 

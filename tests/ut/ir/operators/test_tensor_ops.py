@@ -277,6 +277,52 @@ def test_tensor_col_sum():
     assert len(result_type.shape) == 2
 
 
+def test_tensor_row_prod():
+    """Test tensor.row_prod reduction (reduce last axis)."""
+    span = ir.Span.unknown()
+
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    call = ir.op.tensor.row_prod(tensor_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_prod"
+
+    # Row reduction collapses the last axis (keepdim): [64, 128] -> [64, 1].
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP16
+    assert len(result_type.shape) == 2
+    assert isinstance(result_type.shape[0], ir.ConstInt) and result_type.shape[0].value == 64
+    assert isinstance(result_type.shape[1], ir.ConstInt) and result_type.shape[1].value == 1
+
+
+def test_tensor_col_prod():
+    """tensor.col_prod reduces axis=-2 (the M dim of [..., M, N]) with keepdim=True."""
+    span = ir.Span.unknown()
+
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    call = ir.op.tensor.col_prod(tensor_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_prod"
+
+    # Column reduction collapses axis=-2 (keepdim): [64, 128] -> [1, 128].
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP16
+    assert len(result_type.shape) == 2
+    assert isinstance(result_type.shape[0], ir.ConstInt) and result_type.shape[0].value == 1
+    assert isinstance(result_type.shape[1], ir.ConstInt) and result_type.shape[1].value == 128
+
+
 def test_tensor_col_max():
     """tensor.col_max reduces axis=-2 (the M dim of [..., M, N]) with keepdim=True."""
     span = ir.Span.unknown()
@@ -751,6 +797,86 @@ def test_tensor_row_expand_mul():
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
     assert len(result_type.shape) == 2
+
+
+def _row_expand_pair():
+    span = ir.Span.unknown()
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    dim1 = ir.ConstInt(1, DataType.INT32, span)
+    tensor_var = ir.Var("t", ir.TensorType([dim64, dim128], DataType.FP16), span)
+    row_var = ir.Var("rv", ir.TensorType([dim64, dim1], DataType.FP16), span)
+    return tensor_var, row_var
+
+
+def _col_expand_pair():
+    span = ir.Span.unknown()
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    dim1 = ir.ConstInt(1, DataType.INT32, span)
+    tensor_var = ir.Var("t", ir.TensorType([dim64, dim128], DataType.FP16), span)
+    col_var = ir.Var("cv", ir.TensorType([dim1, dim128], DataType.FP16), span)
+    return tensor_var, col_var
+
+
+def test_tensor_row_expand_max():
+    """Test tensor.row_expand_max operation."""
+    tensor_var, row_var = _row_expand_pair()
+    call = ir.op.tensor.row_expand_max(tensor_var, row_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_expand_max"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_row_expand_min():
+    """Test tensor.row_expand_min operation."""
+    tensor_var, row_var = _row_expand_pair()
+    call = ir.op.tensor.row_expand_min(tensor_var, row_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_expand_min"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_row_expand_expdif():
+    """Test tensor.row_expand_expdif operation."""
+    tensor_var, row_var = _row_expand_pair()
+    call = ir.op.tensor.row_expand_expdif(tensor_var, row_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_expand_expdif"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_col_expand_max():
+    """Test tensor.col_expand_max operation."""
+    tensor_var, col_var = _col_expand_pair()
+    call = ir.op.tensor.col_expand_max(tensor_var, col_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_expand_max"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_col_expand_min():
+    """Test tensor.col_expand_min operation."""
+    tensor_var, col_var = _col_expand_pair()
+    call = ir.op.tensor.col_expand_min(tensor_var, col_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_expand_min"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_col_expand_expdif():
+    """Test tensor.col_expand_expdif operation."""
+    tensor_var, col_var = _col_expand_pair()
+    call = ir.op.tensor.col_expand_expdif(tensor_var, col_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_expand_expdif"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
 
 
 def test_tensor_row_expand_mul_dtype_promotion():

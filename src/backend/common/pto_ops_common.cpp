@@ -436,12 +436,14 @@ static std::string MakeNaryCodegenPTO(const std::string& pto_op_name, size_t ari
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
   CHECK(op->args_.size() == arity) << "Operation:[" << pto_op_name << "] requires " << arity << " argument"
                                    << (arity != 1 ? "s" : "") << ", but got " << op->args_.size();
-  // pto.tcolexpand{mul,add} require materialized tile data — their hardware
+  // The pto.tcolexpand* family requires materialized tile data — their hardware
   // lowering reads physical tile rows/cols from the operand type, which is
   // incorrect for a pto.subview alias.  Other tile ops (tmov, tfillpad, tadd,
   // ...) accept subview SSAs natively, so only the tcolexpand family needs
   // eager materialization.
-  if (pto_op_name == "pto.tcolexpandmul" || pto_op_name == "pto.tcolexpandadd") {
+  if (pto_op_name == "pto.tcolexpandmul" || pto_op_name == "pto.tcolexpandadd" ||
+      pto_op_name == "pto.tcolexpandmax" || pto_op_name == "pto.tcolexpandmin" ||
+      pto_op_name == "pto.tcolexpandexpdif") {
     // Derive a debug hint from the op name (e.g. "pto.tcolexpandmul" -> "colexpandmul").
     const std::string mat_tag = pto_op_name.substr(std::string("pto.t").size());
     auto lhs_operand = MaterializeSubviewOperandIfNeeded(op->args_[0], codegen, mat_tag + "_mat");
@@ -2245,11 +2247,11 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.sub",             "pto.tsub",             2},
     {"tile.mul",             "pto.tmul",             2},
     {"tile.div",             "pto.tdiv",             2},
-    {"tile.rem",             "pto.trem",             2},
+    {"tile.rem",             "pto.trem",             3},  // src0, src1, tmp
     // Tile x Tile bitwise operations
     {"tile.and",             "pto.tand",             2},
     {"tile.or",              "pto.tor",              2},
-    {"tile.xor",             "pto.txor",             2},
+    {"tile.xor",             "pto.txor",             3},  // src0, src1, tmp
     {"tile.shl",             "pto.tshl",             2},
     {"tile.shr",             "pto.tshr",             2},
     // Tile x Tile comparison/selection operations
@@ -2274,10 +2276,10 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.subs",            "pto.tsubs",            2},
     {"tile.muls",            "pto.tmuls",            2},
     {"tile.divs",            "pto.tdivs",            2},
-    {"tile.rems",            "pto.trems",            2},
+    {"tile.rems",            "pto.trems",            3},  // src0, scalar, tmp
     {"tile.ands",            "pto.tands",            2},
     {"tile.ors",             "pto.tors",             2},
-    {"tile.xors",            "pto.txors",            2},
+    {"tile.xors",            "pto.txors",            3},  // src0, scalar, tmp
     {"tile.shls",            "pto.tshls",            2},
     {"tile.shrs",            "pto.tshrs",            2},
     {"tile.maximums",        "pto.tmaxs",            2},
@@ -2291,14 +2293,22 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.row_sum",         "pto.trowsum",          2},
     {"tile.row_max",         "pto.trowmax",          2},
     {"tile.row_min",         "pto.trowmin",          2},
+    {"tile.row_prod",        "pto.trowprod",         2},
     {"tile.col_max",         "pto.tcolmax",          1},
     {"tile.col_min",         "pto.tcolmin",          1},
+    {"tile.col_prod",        "pto.tcolprod",         1},
     {"tile.col_expand_mul",  "pto.tcolexpandmul",    2},
     {"tile.col_expand_add",  "pto.tcolexpandadd",    2},
+    {"tile.col_expand_max",  "pto.tcolexpandmax",    2},
+    {"tile.col_expand_min",  "pto.tcolexpandmin",    2},
+    {"tile.col_expand_expdif", "pto.tcolexpandexpdif", 2},
     {"tile.row_expand_add",  "pto.trowexpandadd",    2},
     {"tile.row_expand_div",  "pto.trowexpanddiv",    2},
     {"tile.row_expand_mul",  "pto.trowexpandmul",    2},
     {"tile.row_expand_sub",  "pto.trowexpandsub",    2},
+    {"tile.row_expand_max",  "pto.trowexpandmax",    2},
+    {"tile.row_expand_min",  "pto.trowexpandmin",    2},
+    {"tile.row_expand_expdif", "pto.trowexpandexpdif", 2},
     // Padding operations
     {"tile.fillpad",         "pto.tfillpad",         1},
     // Inplace variant: set_output_reuses_input(0) makes src/dst share UB addr.

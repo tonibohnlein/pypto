@@ -37,11 +37,17 @@ __all__ = [
     "row_expand_div",
     "row_expand_add",
     "row_expand_sub",
+    "row_expand_max",
+    "row_expand_min",
+    "row_expand_expdif",
     "col_expand",
     "col_expand_mul",
     "col_expand_div",
     "col_expand_sub",
     "col_expand_add",
+    "col_expand_max",
+    "col_expand_min",
+    "col_expand_expdif",
     "concat",
     "expands",
     "reshape",
@@ -54,9 +60,11 @@ __all__ = [
     "row_max",
     "row_sum",
     "row_min",
+    "row_prod",
     "col_sum",
     "col_max",
     "col_min",
+    "col_prod",
     "cast",
     "cmp",
     "set_validshape",
@@ -425,6 +433,60 @@ def col_expand_add(lhs: T, rhs: T) -> T:
     _raise_type_dispatch_error("col_expand_add", lhs, rhs)
 
 
+def row_expand_max(lhs: T, rhs: T) -> T:
+    """Row-wise broadcast maximum, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.row_expand_max(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.row_expand_max(lhs, rhs)
+    _raise_type_dispatch_error("row_expand_max", lhs, rhs)
+
+
+def row_expand_min(lhs: T, rhs: T) -> T:
+    """Row-wise broadcast minimum, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.row_expand_min(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.row_expand_min(lhs, rhs)
+    _raise_type_dispatch_error("row_expand_min", lhs, rhs)
+
+
+def row_expand_expdif(lhs: T, rhs: T) -> T:
+    """Row-wise exp-diff (exp(lhs - rhs) with per-row scalar), dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.row_expand_expdif(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.row_expand_expdif(lhs, rhs)
+    _raise_type_dispatch_error("row_expand_expdif", lhs, rhs)
+
+
+def col_expand_max(lhs: T, rhs: T) -> T:
+    """Column-wise broadcast maximum, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.col_expand_max(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.col_expand_max(lhs, rhs)
+    _raise_type_dispatch_error("col_expand_max", lhs, rhs)
+
+
+def col_expand_min(lhs: T, rhs: T) -> T:
+    """Column-wise broadcast minimum, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.col_expand_min(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.col_expand_min(lhs, rhs)
+    _raise_type_dispatch_error("col_expand_min", lhs, rhs)
+
+
+def col_expand_expdif(lhs: T, rhs: T) -> T:
+    """Column-wise exp-diff (exp(lhs - rhs) with per-column scalar), dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.col_expand_expdif(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.col_expand_expdif(lhs, rhs)
+    _raise_type_dispatch_error("col_expand_expdif", lhs, rhs)
+
+
 def expands(target: Tensor | Tile, scalar: int | float | Scalar) -> Tensor | Tile:
     """Expand scalar to target shape, dispatched by target type."""
     if isinstance(target, Tensor):
@@ -638,6 +700,21 @@ def row_min(input: T, tmp_tile: Tile | None = None) -> T:
     raise TypeError(f"pl.row_min: expected Tensor or Tile, got {type(input).__name__}")
 
 
+def row_prod(input: T, tmp_tile: Tile | None = None) -> T:
+    """Row-wise product reduction, dispatched by input type.
+
+    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tensor inputs, tmp_tile is ignored.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.row_prod(input)
+    if isinstance(input, Tile):
+        if tmp_tile is None:
+            raise ValueError("row_prod on Tile requires tmp_tile argument")
+        return _tile.row_prod(input, tmp_tile)
+    raise TypeError(f"pl.row_prod: expected Tensor or Tile, got {type(input).__name__}")
+
+
 def col_sum(input: T, tmp_tile: Tile | None = None) -> T:
     """Column-wise sum reduction, dispatched by input type.
 
@@ -674,6 +751,18 @@ def col_min(input: T) -> T:
     if isinstance(input, Tile):
         return _tile.col_min(input)
     _raise_type_dispatch_error("col_min", input)
+
+
+def col_prod(input: T) -> T:
+    """Column-wise product reduction, dispatched by input type.
+
+    For Tensor inputs, the tensor-to-tile conversion lowers to ``tile.col_prod``.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.col_prod(input)
+    if isinstance(input, Tile):
+        return _tile.col_prod(input)
+    _raise_type_dispatch_error("col_prod", input)
 
 
 @overload

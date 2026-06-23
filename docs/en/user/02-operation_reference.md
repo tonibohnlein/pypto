@@ -24,9 +24,11 @@ Auto-selects between tensor and tile implementation based on input type.
 | `matmul_acc` | `(acc: T, lhs: T, rhs: T, a_trans=False, b_trans=False) -> T` | Matrix multiply with accumulation: `acc += lhs @ rhs` |
 | `row_max` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise max (tile path requires `tmp_tile`) |
 | `row_sum` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise sum (tile path requires `tmp_tile`) |
+| `row_prod` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise product (tile path requires `tmp_tile`) |
 | `col_sum` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Column-wise sum. On Tile, passing `tmp_tile` activates binary-tree reduction; omitting it uses sequential reduction. Tensor input lowers to the sequential path. |
 | `col_max` | `(input: T) -> T` | Column-wise max |
 | `col_min` | `(input: T) -> T` | Column-wise min |
+| `col_prod` | `(input: T) -> T` | Column-wise product |
 | `rsqrt` | `(input: T, high_precision: bool = False) -> T` | Reciprocal square root; `high_precision=True` selects the high-precision path (tensor input only — tile callers must use `pl.tile.rsqrt(src, tmp=...)`) |
 | `create` / `create_tile` | `(shape: Sequence[IntLike], dtype: DataType, target_memory: Mem) -> Tile` | Tile-only (promoted from `pl.tile.create`): create tile at specific memory space |
 | `read` | `(src: T, offset: IntLike \| Sequence[IntLike]) -> Scalar` | Read scalar at indices (dispatched by source type). Sugar: `A[i, j]` |
@@ -58,9 +60,11 @@ Operate on `Tensor` objects (DDR memory).
 | `maximum` | `(lhs: Tensor, rhs: Tensor) -> Tensor` | Element-wise maximum |
 | `row_max` | `(input: Tensor) -> Tensor` | Row-wise max reduction |
 | `row_sum` | `(input: Tensor) -> Tensor` | Row-wise sum reduction |
+| `row_prod` | `(input: Tensor) -> Tensor` | Row-wise product reduction |
 | `col_sum` | `(input: Tensor) -> Tensor` | Column-wise sum reduction (reduces along axis=-2) |
 | `col_max` | `(input: Tensor) -> Tensor` | Column-wise max reduction (reduces along axis=-2) |
 | `col_min` | `(input: Tensor) -> Tensor` | Column-wise min reduction (reduces along axis=-2) |
+| `col_prod` | `(input: Tensor) -> Tensor` | Column-wise product reduction (reduces along axis=-2) |
 | `rsqrt` | `(input: Tensor, high_precision: bool = False) -> Tensor` | Element-wise reciprocal square root; `high_precision=True` allocates a scratch tile during lowering for the higher-precision PTO path (requires static tile shape, same constraint as `row_max`/`row_sum`) |
 | `exp` | `(input: Tensor) -> Tensor` | Element-wise exponential |
 | `cast` | `(input: Tensor, target_type: DataType, mode="round") -> Tensor` | Type cast |
@@ -137,9 +141,11 @@ Transfer data between memory hierarchy levels.
 | `row_max` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise max (requires tmp buffer) |
 | `row_sum` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise sum (requires tmp buffer) |
 | `row_min` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise min (requires tmp buffer) |
+| `row_prod` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise product (requires tmp buffer) |
 | `col_sum` | `(tile: Tile, tmp_tile: Tile \| None = None) -> Tile` | Column-wise sum. Passing `tmp_tile` activates binary-tree reduction; omitting it uses sequential reduction. |
 | `col_max` | `(tile: Tile) -> Tile` | Column-wise max |
 | `col_min` | `(tile: Tile) -> Tile` | Column-wise min |
+| `col_prod` | `(tile: Tile) -> Tile` | Column-wise product |
 | `sum` | `(tile: Tile, axis: int, keepdim: bool = False) -> Tile` | Sum along axis |
 | `max` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Max along axis |
 | `min` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Min along axis |
@@ -164,11 +170,17 @@ Transfer data between memory hierarchy levels.
 | `row_expand_sub` | `(tile: Tile, row_vec: Tile) -> Tile` | `tile - row_vec` broadcast |
 | `row_expand_mul` | `(tile: Tile, row_vec: Tile) -> Tile` | `tile * row_vec` broadcast |
 | `row_expand_div` | `(tile: Tile, row_vec: Tile) -> Tile` | `tile / row_vec` broadcast |
+| `row_expand_max` | `(tile: Tile, row_vec: Tile) -> Tile` | `max(tile, row_vec)` broadcast |
+| `row_expand_min` | `(tile: Tile, row_vec: Tile) -> Tile` | `min(tile, row_vec)` broadcast |
+| `row_expand_expdif` | `(tile: Tile, row_vec: Tile) -> Tile` | `exp(tile - row_vec[M,1])` broadcast |
 | `col_expand` | `(target: Tile, col_vec: Tile) -> Tile` | Expand `col_vec[1,N]` to `target[M,N]` |
 | `col_expand_mul` | `(tile: Tile, col_vec: Tile) -> Tile` | `tile * col_vec` broadcast |
 | `col_expand_div` | `(tile: Tile, col_vec: Tile) -> Tile` | `tile / col_vec` broadcast |
 | `col_expand_sub` | `(tile: Tile, col_vec: Tile) -> Tile` | `tile - col_vec` broadcast |
 | `col_expand_add` | `(tile: Tile, col_vec: Tile) -> Tile` | `tile + col_vec[1,N]` broadcast |
+| `col_expand_max` | `(tile: Tile, col_vec: Tile) -> Tile` | `max(tile, col_vec)` broadcast |
+| `col_expand_min` | `(tile: Tile, col_vec: Tile) -> Tile` | `min(tile, col_vec)` broadcast |
+| `col_expand_expdif` | `(tile: Tile, col_vec: Tile) -> Tile` | `exp(tile - col_vec[1,N])` broadcast |
 | `expands` | `(target: Tile, scalar: int \| float \| Scalar) -> Tile` | Expand scalar to tile shape |
 
 ## Comparison / Selection (`pl.tile.*`)

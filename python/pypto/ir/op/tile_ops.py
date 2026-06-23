@@ -718,7 +718,7 @@ def sub(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     return _create_tile_binary_call("tile.sub", "tile.subs", lhs, rhs, actual_span)
 
 
-def rem(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+def rem(lhs: Expr, rhs: Expr, tmp: Expr, span: Span | None = None) -> Call:
     """Element-wise remainder (modulo) of two tiles.
 
     Computes lhs % rhs element-wise. Maps to the TREM hardware intrinsic.
@@ -726,16 +726,17 @@ def rem(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
     Args:
         lhs: Left-hand side tile (TileType)
         rhs: Right-hand side tile (TileType)
+        tmp: Temporary tile (TileType) required by the hardware
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise remainder
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.rem", [lhs, rhs], {}, actual_span)
+    return _ir_core.create_op_call("tile.rem", [lhs, rhs, tmp], {}, actual_span)
 
 
-def rems(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+def rems(lhs: Expr, rhs: int | float | Expr, tmp: Expr, span: Span | None = None) -> Call:
     """Element-wise remainder (modulo) of tile and scalar.
 
     Computes lhs % rhs element-wise. Maps to the TREMS hardware intrinsic.
@@ -743,6 +744,7 @@ def rems(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     Args:
         lhs: Tile (TileType)
         rhs: Scalar (int/float/Expr with ScalarType)
+        tmp: Temporary tile (TileType) required by the hardware
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -754,7 +756,7 @@ def rems(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         if not isinstance(rhs, Expr)
         else rhs
     )
-    return _ir_core.create_op_call("tile.rems", [lhs, rhs_expr], {}, actual_span)
+    return _ir_core.create_op_call("tile.rems", [lhs, rhs_expr, tmp], {}, actual_span)
 
 
 def shl(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
@@ -1690,6 +1692,59 @@ def row_expand_add(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.row_expand_add", [tile, row_vec], {}, actual_span)
 
 
+def row_expand_max(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+    """Row-wise broadcast maximum.
+
+    Takes the element-wise maximum of each row and the row vector value.
+    max(tile[i, :], row_vec[i, 0]) for all i.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        row_vec: Row vector (TileType [M, 1])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise broadcast maximum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_expand_max", [tile, row_vec], {}, actual_span)
+
+
+def row_expand_min(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+    """Row-wise broadcast minimum.
+
+    Takes the element-wise minimum of each row and the row vector value.
+    min(tile[i, :], row_vec[i, 0]) for all i.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        row_vec: Row vector (TileType [M, 1])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise broadcast minimum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_expand_min", [tile, row_vec], {}, actual_span)
+
+
+def row_expand_expdif(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+    """Row-wise exp-diff with per-row scalar.
+
+    Computes exp(tile[i, :] - row_vec[i, 0]) for all i.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        row_vec: Row vector providing per-row scalar (TileType [M, 1])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise exp-diff
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_expand_expdif", [tile, row_vec], {}, actual_span)
+
+
 def col_expand(target: Expr, col_vec: Expr, span: Span | None = None) -> Call:
     """Expand column vector [1, cols] to target shape [rows, cols].
 
@@ -1757,6 +1812,57 @@ def col_expand_sub(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.col_expand_sub", [tile, col_vec], {}, actual_span)
+
+
+def col_expand_max(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
+    """Expand column vector and take element-wise maximum with target tile.
+
+    max(tile[:, j], col_vec[0, j]) for all j.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        col_vec: Column vector (TileType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise broadcast maximum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_expand_max", [tile, col_vec], {}, actual_span)
+
+
+def col_expand_min(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
+    """Expand column vector and take element-wise minimum with target tile.
+
+    min(tile[:, j], col_vec[0, j]) for all j.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        col_vec: Column vector (TileType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise broadcast minimum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_expand_min", [tile, col_vec], {}, actual_span)
+
+
+def col_expand_expdif(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
+    """Expand column vector and compute exp-diff with per-column scalar.
+
+    Computes exp(tile[:, j] - col_vec[0, j]) for all j.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        col_vec: Column vector providing per-column scalar (TileType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise exp-diff
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_expand_expdif", [tile, col_vec], {}, actual_span)
 
 
 def col_expand_add(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
@@ -2005,6 +2111,23 @@ def row_min(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.row_min", [tile, tmp_tile], {}, actual_span)
 
 
+def row_prod(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
+    """Row-wise product reduction (reduces along axis=1, maps to TROWPROD).
+
+    Reduces each row to a single value, producing output shape [rows, 1].
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        tmp_tile: Temporary tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise product reduction (TileType [M, 1])
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_prod", [tile, tmp_tile], {}, actual_span)
+
+
 def col_sum(tile: Expr, tmp_tile: Expr | None = None, span: Span | None = None) -> Call:
     """Column-wise sum reduction of a tile (reduces along axis=0, maps to TCOLSUM).
 
@@ -2057,6 +2180,22 @@ def col_min(tile: Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.col_min", [tile], {}, actual_span)
+
+
+def col_prod(tile: Expr, span: Span | None = None) -> Call:
+    """Column-wise product reduction (reduces along axis=0, maps to TCOLPROD).
+
+    Output shape is [1, N] for an [M, N] input.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise product reduction (TileType [1, N])
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_prod", [tile], {}, actual_span)
 
 
 def read(tile: Expr, indices: Expr | list[int | Expr] | _ir_core.MakeTuple, span: Span | None = None) -> Call:

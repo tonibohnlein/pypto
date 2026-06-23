@@ -71,20 +71,28 @@ __all__ = [
     "row_max",
     "row_sum",
     "row_min",
+    "row_prod",
     "col_sum",
     "col_max",
     "col_min",
+    "col_prod",
     "maximum",
     "row_expand",
     "row_expand_sub",
     "row_expand_div",
     "row_expand_mul",
     "row_expand_add",
+    "row_expand_max",
+    "row_expand_min",
+    "row_expand_expdif",
     "col_expand",
     "col_expand_mul",
     "col_expand_div",
     "col_expand_sub",
     "col_expand_add",
+    "col_expand_max",
+    "col_expand_min",
+    "col_expand_expdif",
     "expands",
     "minimum",
     "cmp",
@@ -1081,6 +1089,20 @@ def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
+def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Row-wise product reduction.
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the row_prod operation
+    """
+    call_expr = _ir_ops.row_prod(tile.unwrap(), tmp_tile.unwrap())
+    return Tile(expr=call_expr)
+
+
 def col_sum(tile: Tile, tmp_tile: Tile | None = None) -> Tile:
     """Column-wise sum reduction.
 
@@ -1123,6 +1145,19 @@ def col_min(tile: Tile) -> Tile:
         Tile wrapping the col_min operation
     """
     call_expr = _ir_ops.col_min(tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_prod(tile: Tile) -> Tile:
+    """Column-wise product reduction.
+
+    Args:
+        tile: Input tile
+
+    Returns:
+        Tile wrapping the col_prod operation
+    """
+    call_expr = _ir_ops.col_prod(tile.unwrap())
     return Tile(expr=call_expr)
 
 
@@ -1277,6 +1312,90 @@ def col_expand_add(tile: Tile, col_vec: Tile) -> Tile:
         Tile wrapping the col_expand_add operation
     """
     call_expr = _ir_ops.col_expand_add(tile.unwrap(), col_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_expand_max(tile: Tile, row_vec: Tile) -> Tile:
+    """Row-wise broadcast maximum: max(tile, row_vec broadcasted).
+
+    Args:
+        tile: Input tile [M, N]
+        row_vec: Row vector [M, 1]
+
+    Returns:
+        Tile wrapping the row_expand_max operation
+    """
+    call_expr = _ir_ops.row_expand_max(tile.unwrap(), row_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_expand_min(tile: Tile, row_vec: Tile) -> Tile:
+    """Row-wise broadcast minimum: min(tile, row_vec broadcasted).
+
+    Args:
+        tile: Input tile [M, N]
+        row_vec: Row vector [M, 1]
+
+    Returns:
+        Tile wrapping the row_expand_min operation
+    """
+    call_expr = _ir_ops.row_expand_min(tile.unwrap(), row_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_expand_expdif(tile: Tile, row_vec: Tile) -> Tile:
+    """Row-wise exp-diff: exp(tile - row_vec) with per-row scalar.
+
+    Args:
+        tile: Input tile [M, N]
+        row_vec: Row vector providing per-row scalar [M, 1]
+
+    Returns:
+        Tile wrapping the row_expand_expdif operation
+    """
+    call_expr = _ir_ops.row_expand_expdif(tile.unwrap(), row_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_expand_max(tile: Tile, col_vec: Tile) -> Tile:
+    """Expand column vector and take element-wise maximum with tile.
+
+    Args:
+        tile: Input tile [M, N]
+        col_vec: Column vector [1, N]
+
+    Returns:
+        Tile wrapping the col_expand_max operation
+    """
+    call_expr = _ir_ops.col_expand_max(tile.unwrap(), col_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_expand_min(tile: Tile, col_vec: Tile) -> Tile:
+    """Expand column vector and take element-wise minimum with tile.
+
+    Args:
+        tile: Input tile [M, N]
+        col_vec: Column vector [1, N]
+
+    Returns:
+        Tile wrapping the col_expand_min operation
+    """
+    call_expr = _ir_ops.col_expand_min(tile.unwrap(), col_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_expand_expdif(tile: Tile, col_vec: Tile) -> Tile:
+    """Expand column vector and compute exp-diff with per-column scalar.
+
+    Args:
+        tile: Input tile [M, N]
+        col_vec: Column vector providing per-column scalar [1, N]
+
+    Returns:
+        Tile wrapping the col_expand_expdif operation
+    """
+    call_expr = _ir_ops.col_expand_expdif(tile.unwrap(), col_vec.unwrap())
     return Tile(expr=call_expr)
 
 
@@ -1528,7 +1647,7 @@ def set_validshape(tile: Tile, valid_rows: IntLike, valid_cols: IntLike) -> Tile
     return Tile(expr=call_expr)
 
 
-def rem(lhs: Tile, rhs: Tile) -> Tile:
+def rem(lhs: Tile, rhs: Tile, tmp: Tile) -> Tile:
     """Element-wise remainder (modulo) of two tiles.
 
     Computes lhs % rhs element-wise. Maps to the TREM hardware intrinsic.
@@ -1536,15 +1655,16 @@ def rem(lhs: Tile, rhs: Tile) -> Tile:
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile
+        tmp: Temporary tile (same shape/dtype) required by the hardware
 
     Returns:
         Tile wrapping the rem operation
     """
-    call_expr = _ir_ops.rem(lhs.unwrap(), rhs.unwrap())
+    call_expr = _ir_ops.rem(lhs.unwrap(), rhs.unwrap(), tmp.unwrap())
     return Tile(expr=call_expr)
 
 
-def rems(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
+def rems(lhs: Tile, rhs: int | float | Expr | Scalar, tmp: Tile) -> Tile:
     """Element-wise remainder (modulo) of tile and scalar.
 
     Computes lhs % rhs element-wise. Maps to the TREMS hardware intrinsic.
@@ -1552,12 +1672,13 @@ def rems(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
     Args:
         lhs: Tile
         rhs: Scalar value
+        tmp: Temporary tile (same shape/dtype) required by the hardware
 
     Returns:
         Tile wrapping the rems operation
     """
     rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
-    call_expr = _ir_ops.rems(lhs.unwrap(), rhs_expr)
+    call_expr = _ir_ops.rems(lhs.unwrap(), rhs_expr, tmp.unwrap())
     return Tile(expr=call_expr)
 
 

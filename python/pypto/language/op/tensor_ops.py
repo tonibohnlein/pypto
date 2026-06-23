@@ -46,19 +46,27 @@ __all__ = [
     "row_max",
     "row_sum",
     "row_min",
+    "row_prod",
     "col_sum",
     "col_max",
     "col_min",
+    "col_prod",
     "row_expand",
     "row_expand_mul",
     "row_expand_div",
     "row_expand_add",
     "row_expand_sub",
+    "row_expand_max",
+    "row_expand_min",
+    "row_expand_expdif",
     "col_expand_mul",
     "col_expand",
     "col_expand_div",
     "col_expand_sub",
     "col_expand_add",
+    "col_expand_max",
+    "col_expand_min",
+    "col_expand_expdif",
     "expands",
     "expand_clone",
     "exp",
@@ -781,6 +789,20 @@ def row_min(input: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
+def row_prod(input: Tensor) -> Tensor:
+    """Row-wise product reduction (reduces along last axis, keeps dim).
+
+    Args:
+        input: Input tensor
+
+    Returns:
+        Tensor wrapping the row_prod operation
+    """
+    input_expr = input.unwrap()
+    call_expr = _ir_ops.row_prod(input_expr)
+    return Tensor(expr=call_expr)
+
+
 def col_sum(input: Tensor) -> Tensor:
     """Column-wise sum reduction (reduces along axis=-2, keeps dim).
 
@@ -826,6 +848,22 @@ def col_min(input: Tensor) -> Tensor:
     """
     input_expr = input.unwrap()
     call_expr = _ir_ops.col_min(input_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_prod(input: Tensor) -> Tensor:
+    """Column-wise product reduction (reduces along axis=-2, keeps dim).
+
+    Output shape is ``[..., 1, N]`` for an input of shape ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+
+    Returns:
+        Tensor wrapping the col_prod operation
+    """
+    input_expr = input.unwrap()
+    call_expr = _ir_ops.col_prod(input_expr)
     return Tensor(expr=call_expr)
 
 
@@ -909,6 +947,54 @@ def row_expand_sub(tensor: Tensor, row_vec: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
+def row_expand_max(tensor: Tensor, row_vec: Tensor) -> Tensor:
+    """Row-wise broadcast maximum: max(tensor[i,:], row_vec[i,0]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        row_vec: Row vector (TensorType [M, 1])
+
+    Returns:
+        Tensor wrapping the row_expand_max operation
+    """
+    tensor_expr = tensor.unwrap()
+    row_vec_expr = row_vec.unwrap()
+    call_expr = _ir_ops.row_expand_max(tensor_expr, row_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def row_expand_min(tensor: Tensor, row_vec: Tensor) -> Tensor:
+    """Row-wise broadcast minimum: min(tensor[i,:], row_vec[i,0]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        row_vec: Row vector (TensorType [M, 1])
+
+    Returns:
+        Tensor wrapping the row_expand_min operation
+    """
+    tensor_expr = tensor.unwrap()
+    row_vec_expr = row_vec.unwrap()
+    call_expr = _ir_ops.row_expand_min(tensor_expr, row_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def row_expand_expdif(tensor: Tensor, row_vec: Tensor) -> Tensor:
+    """Row-wise exp-diff: exp(tensor[i,:] - row_vec[i,0]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        row_vec: Row vector providing per-row scalar (TensorType [M, 1])
+
+    Returns:
+        Tensor wrapping the row_expand_expdif operation
+    """
+    tensor_expr = tensor.unwrap()
+    row_vec_expr = row_vec.unwrap()
+    call_expr = _ir_ops.row_expand_expdif(tensor_expr, row_vec_expr)
+    return Tensor(expr=call_expr)
+
+
 def col_expand_mul(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast multiplication: tensor[:,j] * col_vec[0,j].
 
@@ -986,6 +1072,54 @@ def col_expand_add(tensor: Tensor, col_vec: Tensor) -> Tensor:
     tensor_expr = tensor.unwrap()
     col_vec_expr = col_vec.unwrap()
     call_expr = _ir_ops.col_expand_add(tensor_expr, col_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_expand_max(tensor: Tensor, col_vec: Tensor) -> Tensor:
+    """Column-wise broadcast maximum: max(tensor[:,j], col_vec[0,j]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector (TensorType [1, N])
+
+    Returns:
+        Tensor wrapping the col_expand_max operation
+    """
+    tensor_expr = tensor.unwrap()
+    col_vec_expr = col_vec.unwrap()
+    call_expr = _ir_ops.col_expand_max(tensor_expr, col_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_expand_min(tensor: Tensor, col_vec: Tensor) -> Tensor:
+    """Column-wise broadcast minimum: min(tensor[:,j], col_vec[0,j]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector (TensorType [1, N])
+
+    Returns:
+        Tensor wrapping the col_expand_min operation
+    """
+    tensor_expr = tensor.unwrap()
+    col_vec_expr = col_vec.unwrap()
+    call_expr = _ir_ops.col_expand_min(tensor_expr, col_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_expand_expdif(tensor: Tensor, col_vec: Tensor) -> Tensor:
+    """Column-wise exp-diff: exp(tensor[:,j] - col_vec[0,j]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector providing per-column scalar (TensorType [1, N])
+
+    Returns:
+        Tensor wrapping the col_expand_expdif operation
+    """
+    tensor_expr = tensor.unwrap()
+    col_vec_expr = col_vec.unwrap()
+    call_expr = _ir_ops.col_expand_expdif(tensor_expr, col_vec_expr)
     return Tensor(expr=call_expr)
 
 

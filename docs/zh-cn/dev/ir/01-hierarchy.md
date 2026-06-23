@@ -32,7 +32,7 @@
 <return_stmt> ::= "return" [ <var_list> ]
 <eval_stmt>  ::= <expr>
 <seq_stmts>  ::= <stmt> { ";" <stmt> }
-<scope_stmt> ::= "with" "pl.incore" "(" ")" ":" <stmt_list>
+<scope_stmt> ::= "with" "pl.at" "(" "level" "=" "pl.Level.CORE_GROUP" ")" ":" <stmt_list>
 <break_stmt> ::= "break"
 <continue_stmt> ::= "continue"
 
@@ -73,6 +73,7 @@
 | **ConstBool** | `value_` | 布尔常量（始终为 BOOL dtype） |
 | **ConstFloat** | `value_`, `dtype_` | 浮点常量 |
 | **Call** | `op_`, `args_`, `kwargs_`, `attrs_` | 函数/运算符调用（参见 [Call attrs 与 kwargs 的区别](#call-attrs-与-kwargs-的区别)） |
+| **Submit** | `op_`, `args_`, `deps_`, `core_num_`, `sync_start_`, `allow_early_resolve_`, `kwargs_`, `attrs_` | 任务启动（`pl.submit(...)` / `pl.spmd_submit(...)`）。`core_num_`/`sync_start_` 携带 SPMD 启动规格；`allow_early_resolve_` 是推测式提前派发（speculative early-dispatch）的开关（下沉为 `Arg::set_allow_early_resolve(true)`）。参见 [Submit 与 Call 的区别](#submit-与-call-的区别)。 |
 | **TupleGetItemExpr** | `tuple_`, `index_` | 元组元素访问 |
 
 ### Var 的标识（Identity）
@@ -149,6 +150,32 @@ gvar = ir.GlobalVar("helper"); call = ir.Call(gvar, [x], span)  # Internal
 `WithArgDirectionsAttr(...)` 是构造带该 attr 的 `attrs` 向量的标准入口。
 `IRProperty::CallDirectionsResolved` 校验的就是该 attr 在 `DeriveCallDirections`
 pass 之后是否存在。
+
+### Submit 与 Call 的区别
+
+`Submit` 是与 `Call` 并列的一等 IR 类型（first-class IR kind），表示在
+`pl.manual_scope` 体内由 `pl.submit(...)` 发起的任务启动（task launch）。两者
+在语义上截然不同，pass 作者必须同时考虑——分派规则参见
+[`.claude/rules/pass-submit-awareness.md`](../../../../.claude/rules/pass-submit-awareness.md)。
+
+| 方面 | `Call` | `Submit` |
+| ---- | ------ | -------- |
+| 语义 | 同步函数调用 | 异步任务启动 |
+| 出现位置 | 任意位置 | `manual_scope` 体内（由 parser 产生），以及作为 `pl.at(..., deps=[...])` 作用域外提后的派发点（缺失 `as tid` 绑定时会得到一个合成的未使用 TaskId Var）；在整个流水线中保持不变 |
+| 返回类型 | 被调方声明的返回 | `Tuple[<callee return>..., Scalar[TASK_ID]]` |
+| 是否有 `deps` | 无 —— 普通 `Call` 从不携带依赖边（`attrs["manual_dep_edges"]` 仅出现在由 `pl.at` 产生的 `ScopeStmt` 上，在作用域外提时被消费；由 ManualDepsOnSubmitOnly 校验） | 一等的 `deps_` 字段 —— `Scalar[TASK_ID]` Var / `Array[N, TASK_ID]` Var |
+| SPMD 启动规格 | 无 | `core_num_`（`optional<ExprPtr>` 块数）+ `sync_start_`（bool），仅由 `pl.spmd_submit` 设置；`sync_start_` 仅在 `core_num_` 存在时才有意义（构造函数强制 `sync_start ⇒ core_num`）；`nullopt` ⇒ 普通单块 submit |
+| Use-def 链 | 仅 `args_` | `args_`、`deps_`，**以及** `core_num_` |
+| Python 语法 | `out = self.foo(...)` | `out, tid = pl.submit(self.foo, ...)`（或 `pl.spmd_submit(self.foo, ..., core_num=N)`） |
+
+parser 发出 `Submit`；printer / structural-equal / structural-hash / visitor /
+mutator（Python 钩子 `visit_submit`）/ DCE / SSA 全部直接按 `Submit` 类型分派，
+且 `Submit` 会在整个流水线中存活——没有任何 pass 会把它下沉为普通 `Call`。
+形如 Call 的消费者（`DeriveCallDirections`、`ExpandManualPhaseFence`、
+orchestration codegen）通过临时的 `SubmitToCallView` 检视 `Submit`，该 view 把
+`Submit::deps_` 合成为一个 `attrs["manual_dep_edges"]` 条目。该 attrs 编码
+**仅存在于 view 中**：它永远不会落到 IR 的 `Call` 节点上，并且
+ManualDepsOnSubmitOnly 结构属性 verifier 会在每个 pass 前后校验这一点。
 
 ### IterArg - 循环携带值
 
@@ -252,10 +279,10 @@ while_stmt = ir.WhileStmt(condition, [x_iter], body, [x_final], span)
 （host、cluster、global），并不是 in-core 作用域的通用替代。
 
 ```python
-# with pl.incore(): y = pl.add(x, x)
+# with pl.at(level=Level.CORE_GROUP): y = pl.add(x, x)
 in_core = ir.InCoreScopeStmt(name_hint="", body=body, span=span)
 
-# with pl.auto_incore():       (split 可选)
+# with pl.at(level=Level.CORE_GROUP, optimizations=[pl.auto_chunk]):  (split 可选)
 auto = ir.AutoInCoreScopeStmt(name_hint="", body=body, span=span)
 
 # with pl.cluster():
@@ -318,7 +345,7 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
 **变换示例：**
 
 ```python
-# Before: with pl.incore(): y = pl.add(x, x); return y
+# Before: with pl.at(level=Level.CORE_GROUP): y = pl.add(x, x); return y
 # After: main_incore_0(x) -> y; main(x): y = main_incore_0(x); return y
 ```
 

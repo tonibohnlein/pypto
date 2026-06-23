@@ -39,7 +39,9 @@ cleanly through the autouse print/parse fixture.
 
 import pypto.language as pl
 import pytest
+from pypto import backend as _backend
 from pypto import ir, passes
+from pypto.backend import BackendType
 
 
 class TestAutoTileMatmulL0KOnly:
@@ -542,6 +544,349 @@ class TestAutoTileMatmulL0KOnly:
         ir.assert_structural_equal(After, Before)
 
 
+def _torch_codegen_matches_matmul(program, m_dim, n_dim, k_dim):
+    """Drive ``program`` through ``torch_codegen`` and check the executed
+    reference matches ``torch.matmul``.  Used to numerically validate the M/N
+    + K tiled output the pass emits, independent of the device toolchain.
+
+    Returns ``(ok, max_abs_diff)``.  The generated entry is named ``kernel``
+    (the function name in the Before/After programs below).
+    """
+    torch = pytest.importorskip("torch")
+    from pypto.debug import torch_codegen  # noqa: PLC0415
+
+    torch.manual_seed(0)
+    a = torch.randn(m_dim, k_dim, dtype=torch.float32)
+    b = torch.randn(k_dim, n_dim, dtype=torch.float32)
+    out = torch.zeros(m_dim, n_dim, dtype=torch.float32)
+
+    code = torch_codegen(program)
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102 — executing generated reference code is the point
+    ns["kernel"](a, b, out)
+    expected = torch.matmul(a, b)
+    return torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (out - expected).abs().max().item()
+
+
+class TestAutoTileMatmulL0MNTiling:
+    """M/N output tiling.
+
+    When ``ChooseL0Tile`` picks ``m < M`` or ``n < N`` the [M, N] output Acc
+    overflows L0c.  The operands are already Mat-resident, so only the output
+    overflows: the pass tiles the output into a ``ceil(M/m) x ceil(N/n)`` grid
+    of ``[m, n]`` (partial on the boundary) sub-tiles, each computed by the
+    existing pipelined K-loop and stored straight to ``out[mi:, ni:]`` (the
+    direct-store / DDR-output path).  The output tensor is chained through the
+    per-sub-tile stores in SSA form.
+    """
+
+    def test_mn_tiling_rewrites_to_subtile_grid(self):
+        """512×512 @ 512 FP32 on Ascend950 (L0c = 256 KB): the [512, 512] FP32
+        output is 1 MB > L0c, so ChooseL0Tile picks m = n = 256, k = 32.  The
+        pass unrolls the output into a 2×2 grid of [256, 256] Acc sub-tiles —
+        each an independent 16-trip pipelined K-loop — and stores each straight
+        to ``out[mi:, ni:]``, chaining the output tensor through the four
+        stores (out → out_t0 → out_t1 → out_t2 → out_t3)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[512, 512], pl.FP32],
+                rhs: pl.Tensor[[512, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 512], pl.FP32]],
+            ) -> pl.Tensor[[512, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[512, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[512, 512], pl.FP32],
+                rhs: pl.Tensor[[512, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 512], pl.FP32]],
+            ) -> pl.Tensor[[512, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                # Sub-tile (mi=0, ni=0).
+                c0_init: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                    [256, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc
+                )
+                for ko0, (c0_iter,) in pl.pipeline(0, 512, 32, init_values=(c0_init,), stage=2):
+                    a0: pl.Tile[[256, 32], pl.FP32, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 0, ko0, shape=[256, 32], target_memory=pl.Mem.Left
+                    )
+                    b0: pl.Tile[[32, 256], pl.FP32, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko0, 0, shape=[32, 256], target_memory=pl.Mem.Right
+                    )
+                    if ko0 == 0:
+                        c0_first: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a0, b0)
+                        c0_phi: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c0_first)
+                    else:
+                        c0_acc: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(c0_iter, a0, b0)
+                        c0_phi: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c0_acc)
+                    c0: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c0_phi)
+                out_t0: pl.Tensor[[512, 512], pl.FP32] = pl.store(c0, [0, 0], out)
+                # Sub-tile (mi=256, ni=0).
+                c1_init: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                    [256, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc
+                )
+                for ko1, (c1_iter,) in pl.pipeline(0, 512, 32, init_values=(c1_init,), stage=2):
+                    a1: pl.Tile[[256, 32], pl.FP32, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 256, ko1, shape=[256, 32], target_memory=pl.Mem.Left
+                    )
+                    b1: pl.Tile[[32, 256], pl.FP32, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko1, 0, shape=[32, 256], target_memory=pl.Mem.Right
+                    )
+                    if ko1 == 0:
+                        c1_first: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a1, b1)
+                        c1_phi: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c1_first)
+                    else:
+                        c1_acc: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(c1_iter, a1, b1)
+                        c1_phi: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c1_acc)
+                    c1: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c1_phi)
+                out_t1: pl.Tensor[[512, 512], pl.FP32] = pl.store(c1, [256, 0], out_t0)
+                # Sub-tile (mi=0, ni=256).
+                c2_init: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                    [256, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc
+                )
+                for ko2, (c2_iter,) in pl.pipeline(0, 512, 32, init_values=(c2_init,), stage=2):
+                    a2: pl.Tile[[256, 32], pl.FP32, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 0, ko2, shape=[256, 32], target_memory=pl.Mem.Left
+                    )
+                    b2: pl.Tile[[32, 256], pl.FP32, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko2, 256, shape=[32, 256], target_memory=pl.Mem.Right
+                    )
+                    if ko2 == 0:
+                        c2_first: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a2, b2)
+                        c2_phi: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c2_first)
+                    else:
+                        c2_acc: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(c2_iter, a2, b2)
+                        c2_phi: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c2_acc)
+                    c2: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c2_phi)
+                out_t2: pl.Tensor[[512, 512], pl.FP32] = pl.store(c2, [0, 256], out_t1)
+                # Sub-tile (mi=256, ni=256).
+                c3_init: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                    [256, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc
+                )
+                for ko3, (c3_iter,) in pl.pipeline(0, 512, 32, init_values=(c3_init,), stage=2):
+                    a3: pl.Tile[[256, 32], pl.FP32, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 256, ko3, shape=[256, 32], target_memory=pl.Mem.Left
+                    )
+                    b3: pl.Tile[[32, 256], pl.FP32, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko3, 256, shape=[32, 256], target_memory=pl.Mem.Right
+                    )
+                    if ko3 == 0:
+                        c3_first: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a3, b3)
+                        c3_phi: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c3_first)
+                    else:
+                        c3_acc: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(c3_iter, a3, b3)
+                        c3_phi: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c3_acc)
+                    c3: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.yield_(c3_phi)
+                out_t3: pl.Tensor[[512, 512], pl.FP32] = pl.store(c3, [256, 256], out_t2)
+                return out_t3
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_mn_tiling_numerically_correct(self):
+        """The 2×2-tiled 512×512 output (clean tiles) numerically matches
+        ``torch.matmul`` when driven through ``torch_codegen``."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[512, 512], pl.FP32],
+                rhs: pl.Tensor[[512, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 512], pl.FP32]],
+            ) -> pl.Tensor[[512, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[512, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        # Sanity: the pass actually tiled (otherwise the numeric check is vacuous).
+        with pytest.raises(ValueError, match="Structural equality"):
+            ir.assert_structural_equal(After, Before)
+        ok, max_diff = _torch_codegen_matches_matmul(After, 512, 512, 512)
+        assert ok, f"512×512 M/N-tiled output mismatch: max abs diff {max_diff:.3e}"
+
+    def test_mn_tiling_partial_tiles_numerically_correct(self):
+        """384×384 @ 512 FP32 on Ascend950: ChooseL0Tile still picks m = n = 256,
+        so the output tiles into a 2×2 grid with **partial boundary sub-tiles**
+        (256 + 128 on each axis → sub-tiles 256×256, 256×128, 128×256, 128×128).
+        Exercises static partial-extent handling; the result must still match
+        ``torch.matmul``."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[384, 512], pl.FP32],
+                rhs: pl.Tensor[[512, 384], pl.FP32],
+                out: pl.Out[pl.Tensor[[384, 384], pl.FP32]],
+            ) -> pl.Tensor[[384, 384], pl.FP32]:
+                lhs_mat: pl.Tile[[384, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [384, 512], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[512, 384], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [512, 384], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[384, 384], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        with pytest.raises(ValueError, match="Structural equality"):
+            ir.assert_structural_equal(After, Before)
+        ok, max_diff = _torch_codegen_matches_matmul(After, 384, 384, 512)
+        assert ok, f"384×384 partial-tile output mismatch: max abs diff {max_diff:.3e}"
+
+    def test_mn_tiling_end_to_end_no_l0c_overflow(self):
+        """End-to-end acceptance: a 256×256 @ 256 FP32 matmul on Ascend910B
+        (output 256 KB > L0c = 128 KB; operands fit L1) compiles through the
+        **full** pass pipeline — M/N tiling makes it pass ``AllocateMemoryAddr``
+        with no L0c overflow — and the executed ``torch_codegen`` reference
+        matches ``torch.matmul``.  ChooseL0Tile picks m = 192, n = 160, so the
+        output tiles into a 2×2 grid with partial boundary sub-tiles."""
+
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+        from pypto.jit.decorator import jit  # noqa: PLC0415
+
+        # Override the autouse Ascend950 fixture: 256×256 FP32 fits L0c on 950
+        # but overflows it on 910B, which is the configuration that forces M/N
+        # tiling here (and matches the solver's per-tile-kernel target backend).
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @jit
+        def kernel(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                ta = pl.load(a, [0, 0], [256, 256], target_memory=pl.MemorySpace.Mat)
+                tb = pl.load(b, [0, 0], [256, 256], target_memory=pl.MemorySpace.Mat)
+                tc = pl.matmul(ta, tb)
+                pl.store(tc, [0, 0], c)
+            return c
+
+        torch.manual_seed(0)
+        a = torch.randn(256, 256, dtype=torch.float32)
+        b = torch.randn(256, 256, dtype=torch.float32)
+        c = torch.zeros(256, 256, dtype=torch.float32)
+
+        # compile_for_test runs the full pipeline; AllocateMemoryAddr would
+        # raise on an L0c overflow if the output were not tiled.
+        post = kernel.compile_for_test(a, b, c)
+        code = torch_codegen(post)
+        ns: dict = {}
+        exec(code, ns)  # noqa: S102 — executing generated reference code is the point
+
+        out = c.clone()
+        ns["kernel"](a, b, out)
+        expected = torch.matmul(a, b)
+        assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
+            f"end-to-end M/N-tiled matmul mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+    def test_mn_tiling_reversed_def_store_chain_stays_ssa(self):
+        """Two oversized matmuls whose **definitions are in the reverse order of
+        their chained stores** must still produce valid SSA.
+
+        Ordering (all valid SSA — each matmul precedes its store): ``c2`` is
+        defined first, then ``c1``; the stores chain ``out → out1`` (via ``c1``)
+        → ``out2`` (via ``c2``).  Each fold is built when its matmul is visited,
+        but the folded stores are only *emitted* at the consumer-store site —
+        with the now-current remap applied.  So ``c2``'s fold (built before
+        ``c1``'s fold redefined ``out1``) chains from ``c1``'s fold output, not a
+        stale/dangling ``out1``.  Regression for that bug: assert ``SSAForm`` +
+        ``UseAfterDef`` hold after the pass and the result is numerically
+        correct.  Each store writes a disjoint half of the [512, 1024] output."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a1: pl.Tensor[[512, 512], pl.FP32],
+                b1: pl.Tensor[[512, 512], pl.FP32],
+                a2: pl.Tensor[[512, 512], pl.FP32],
+                b2: pl.Tensor[[512, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 1024], pl.FP32]],
+            ) -> pl.Tensor[[512, 1024], pl.FP32]:
+                a2m: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    a2, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                b2m: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    b2, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                c2: pl.Tile[[512, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a2m, b2m)
+                a1m: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    a1, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                b1m: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    b1, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                c1: pl.Tile[[512, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a1m, b1m)
+                out1: pl.Tensor[[512, 1024], pl.FP32] = pl.store(c1, [0, 0], out)
+                out2: pl.Tensor[[512, 1024], pl.FP32] = pl.store(c2, [0, 512], out1)
+                return out2
+
+        After = passes.auto_tile_matmul_l0()(Before)
+
+        # SSA invariants must hold — the pass declares it preserves SSAForm.
+        # A stale `out1` reference (the bug) is a use-before-def and fails here.
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.SSAForm)
+        props.insert(passes.IRProperty.UseAfterDef)
+        passes.verify_properties(props, After, "test_reversed_def_store_chain")
+
+        # Numerically: out[:, 0:512] = a1 @ b1, out[:, 512:1024] = a2 @ b2.
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a1 = torch.randn(512, 512, dtype=torch.float32)
+        b1 = torch.randn(512, 512, dtype=torch.float32)
+        a2 = torch.randn(512, 512, dtype=torch.float32)
+        b2 = torch.randn(512, 512, dtype=torch.float32)
+        out = torch.zeros(512, 1024, dtype=torch.float32)
+
+        code = torch_codegen(After)
+        ns: dict = {}
+        exec(code, ns)  # noqa: S102 — executing generated reference code is the point
+        ns["kernel"](a1, b1, a2, b2, out)
+
+        expected = torch.zeros(512, 1024, dtype=torch.float32)
+        expected[:, 0:512] = torch.matmul(a1, b1)
+        expected[:, 512:1024] = torch.matmul(a2, b2)
+        assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
+            f"reversed def/store-chain mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+
 class TestAutoTileMatmulL0Skips:
     """Cases where the pass intentionally leaves the matmul untouched."""
 
@@ -651,30 +996,62 @@ class TestAutoTileMatmulL0Skips:
         After = passes.auto_tile_matmul_l0()(Before)
         ir.assert_structural_equal(After, Before)
 
-    def test_mn_tiling_unsupported_skipped(self):
-        """A 4096×4096 @ 4096 BF16 matmul forces the chooser to tile M and N
-        (it picks m=256, n=256 ≠ M=N=4096).  M/N tiling needs a Mat-resident
-        output scratch + per-iter assemble that is not yet implemented, so the
-        pass emits ``PH-AT-006`` and leaves the matmul untouched (pass lines
-        507-514)."""
+    def test_oversized_matmul_acc_mn_deferred(self):
+        """An oversized ``tile.matmul_acc`` output (512×512 FP32 on Ascend950,
+        1 MB > L0c) would need M/N tiling, but the ``matmul_acc`` M/N path —
+        which must slice the caller's [M, N] accumulator per sub-tile — is
+        deferred.  The pass emits ``PH-AT-006`` and leaves the call untouched
+        (only the *plain* ``tile.matmul`` direct-store M/N fold is implemented)."""
 
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                lhs: pl.Tensor[[4096, 4096], pl.BF16],
-                rhs: pl.Tensor[[4096, 4096], pl.BF16],
-                out: pl.Out[pl.Tensor[[4096, 4096], pl.FP32]],
-            ) -> pl.Tensor[[4096, 4096], pl.FP32]:
-                lhs_mat: pl.Tile[[4096, 4096], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    lhs, [0, 0], [4096, 4096], target_memory=pl.Mem.Mat
+                lhs: pl.Tensor[[512, 512], pl.FP32],
+                rhs: pl.Tensor[[512, 512], pl.FP32],
+                acc_init: pl.Tile[[512, 512], pl.FP32, pl.Mem.Acc],
+                out: pl.Out[pl.Tensor[[512, 512], pl.FP32]],
+            ) -> pl.Tensor[[512, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
                 )
-                rhs_mat: pl.Tile[[4096, 4096], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    rhs, [0, 0], [4096, 4096], target_memory=pl.Mem.Mat
+                rhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
                 )
-                c: pl.Tile[[4096, 4096], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                c: pl.Tile[[512, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(acc_init, lhs_mat, rhs_mat)
                 out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        ir.assert_structural_equal(After, Before)
+
+    def test_oversized_matmul_no_store_consumer_untouched(self):
+        """An oversized plain ``tile.matmul`` whose result is *not* consumed by a
+        2D ``tile.store`` cannot use the direct-store M/N fold.  Here the [512,
+        512] Acc result feeds a ``tile.move`` (Acc→Vec) before any store, so the
+        pass emits ``PH-AT-006`` and leaves the matmul untouched — the
+        Mat-scratch / assemble path for on-chip consumers is deferred."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[512, 512], pl.FP32],
+                rhs: pl.Tensor[[512, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 512], pl.FP32]],
+            ) -> pl.Tensor[[512, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[512, 512], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [512, 512], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[512, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                # Consumer is a tile.move (Acc→Vec), not a store → not foldable.
+                c_vec: pl.Tile[[512, 512], pl.FP32, pl.Mem.Vec] = pl.tile.move(c, target_memory=pl.Mem.Vec)
+                out = pl.store(c_vec, [0, 0], out)
                 return out
 
         After = passes.auto_tile_matmul_l0()(Before)
