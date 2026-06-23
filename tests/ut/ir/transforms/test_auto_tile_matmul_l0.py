@@ -1057,6 +1057,43 @@ def _lower_to_tile_ops(program):
     return program
 
 
+def _run_default_to(program, stop_after):
+    """Run the Default-strategy passes in order up to and including ``stop_after``."""
+    from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+    if not PassManager._strategy_passes:
+        PassManager._register_passes()
+    for name, factory in PassManager._strategy_passes[OptimizationStrategy.Default]:
+        program = factory()(program)
+        if name == stop_after:
+            break
+    return program
+
+
+def _packed_bytes_per_space(program):
+    """Measure the post-packing memory footprint per ``MemorySpace`` — group every
+    tile MemRef by its physical base (the same coalescing the allocator applies),
+    size each slot to its largest member, and sum per space.  Run after
+    ``MemoryReuse`` this is the real packed peak, not a closed-form estimate."""
+    groups: dict = {}
+    for gv in program.functions:
+        fn = program.get_function(gv.name if isinstance(gv.name, str) else str(gv.name))
+        if fn is None or fn.body is None:
+            continue
+        for v in ir.collect_def_vars(fn.body):
+            t = getattr(v, "type", None)
+            mr = getattr(t, "memref", None) if t is not None else None
+            if mr is None:
+                continue
+            space = str(getattr(t, "memory_space", "?")).split(".")[-1]
+            base = mr.base_.unique_id if mr.base_ is not None else mr.unique_id
+            groups[(space, base)] = max(groups.get((space, base), 0), mr.size_)
+    packed: dict = {}
+    for (space, _), size in groups.items():
+        packed[space] = packed.get(space, 0) + size
+    return packed
+
+
 class TestAutoTileMatmulL0MatScratch:
     """M/N output tiling to an L1/Mat scratch (on-chip consumer), not DDR.
 
@@ -1146,6 +1183,224 @@ class TestAutoTileMatmulL0MatScratch:
 
         # Must reach AllocateMemoryAddr without a "Left buffer usage exceeds" error.
         PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+
+    def test_chained_matmul_packed_peak_fits_l0(self):
+        """Measure the real packed peak after MemoryReuse (not a closed-form
+        estimate): the BF16-producer / FP32-consumer Left buffers, ~192 KB if not
+        shared, pack down to ≤ 64 KB (L0a) via largest-first reuse — the concrete
+        evidence that the cross-phase Left buffers alias.  All spaces fit 910B."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 128], pl.BF16],
+                b: pl.Tensor[[128, 256], pl.BF16],
+                e: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                c = pl.matmul(a, b)
+                d = pl.matmul(c, e)
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        before = _packed_bytes_per_space(_run_default_to(Before, "InitMemRef"))
+        after = _packed_bytes_per_space(_run_default_to(Before, "MemoryReuse"))
+
+        l0a, l0c = 64 * 1024, 128 * 1024
+        mat = 512 * 1024
+        # The Left footprint actually shrinks via reuse (cross-phase sharing).
+        assert after["Left"] < before["Left"], "producer/consumer Left buffers must pack via reuse"
+        assert after["Left"] <= l0a, f"packed Left {after['Left']} must fit L0a ({l0a})"
+        assert after["Acc"] <= l0c, f"packed Acc {after['Acc']} must fit L0c ({l0c})"
+        assert after["Mat"] <= mat, f"packed Mat scratch {after['Mat']} must fit L1 ({mat})"
+
+    def test_assemble_chain_shares_one_mat_base(self):
+        """``tile.assemble`` inherits its target memory, so after InitMemRef the
+        whole scratch chain (``create`` + per-sub-tile ``assemble``s) resolves to a
+        single physical Mat base — the result is built in place, not copied per
+        insert."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                e: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                c = pl.matmul(a, b)
+                d = pl.matmul(c, e)
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        prog = _run_default_to(Before, "InitMemRef")
+        scratch_bases = set()
+        for gv in prog.functions:
+            fn = prog.get_function(gv.name if isinstance(gv.name, str) else str(gv.name))
+            if fn is None or fn.body is None:
+                continue
+            for v in ir.collect_def_vars(fn.body):
+                # The scratch chain vars are "<producer>_mat[_t*]" — here the
+                # producer result is "c", so "c__tile_mat" and its inserts.
+                # (Operand loads like "a__ssa_v0_mat" also end in _mat — exclude.)
+                if "c__tile_mat" not in v.name_hint:
+                    continue
+                t = getattr(v, "type", None)
+                mr = getattr(t, "memref", None) if t is not None else None
+                if mr is None or "Mat" not in str(getattr(t, "memory_space", "")):
+                    continue
+                scratch_bases.add(mr.base_.unique_id if mr.base_ is not None else mr.unique_id)
+        assert len(scratch_bases) == 1, (
+            f"assemble chain must share exactly one Mat base, got {len(scratch_bases)}"
+        )
+
+    def test_multiple_mat_consumers_share_one_scratch(self):
+        """A result consumed by *several* matmuls (all operands) is still
+        Mat-scratch eligible: one scratch is assembled once and both consumers
+        read it; the two outputs are numerically correct."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                e1: pl.Tensor[[256, 64], pl.FP32],
+                e2: pl.Tensor[[256, 64], pl.FP32],
+                o1: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+                o2: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ):
+                c = pl.matmul(a, b)
+                d1 = pl.matmul(c, e1)
+                d2 = pl.matmul(c, e2)
+                o1 = pl.assemble(o1, d1, [0, 0])
+                o2 = pl.assemble(o2, d2, [0, 0])
+                return o1, o2
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+        # One Mat scratch (one tile.create Mem.Mat), four sub-tile assembles into it.
+        assert printed.count("pl.tile.create([256, 256]") == 1, "the result needs exactly one Mat scratch"
+        assert printed.count("pl.tile.assemble(") == 4
+        _assert_ssa_valid(After, "test_multiple_mat_consumers")
+
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a, b = torch.randn(256, 128), torch.randn(128, 256)
+        e1, e2 = torch.randn(256, 64), torch.randn(256, 64)
+        o1, o2 = torch.zeros(256, 64), torch.zeros(256, 64)
+        ns: dict = {}
+        exec(torch_codegen(After), ns)  # noqa: S102
+        ns["kernel"](a, b, e1, e2, o1, o2)
+        ab = a @ b
+        assert torch.allclose(o1, ab @ e1, rtol=1e-3, atol=1e-3)
+        assert torch.allclose(o2, ab @ e2, rtol=1e-3, atol=1e-3)
+
+    def test_stored_and_reused_left_untouched(self):
+        """A result that is *both* assembled out and fed to a matmul is neither a
+        clean direct-GM store nor a pure on-chip consumer — it is deferred
+        (PH-AT-006), not forced down either path."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                e: pl.Tensor[[256, 64], pl.FP32],
+                cout: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ):
+                c = pl.matmul(a, b)
+                cout = pl.assemble(cout, c, [0, 0])  # one use: assemble out
+                d = pl.matmul(c, e)  # another use: matmul operand
+                out = pl.assemble(out, d, [0, 0])
+                return cout, out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+        # The oversized producer is left whole (mixed consumer → deferred).
+        assert "pl.tile.matmul(a__ssa_v0_mat, b__ssa_v0_mat)" in printed
+
+    def test_matmul_acc_accumulator_use_not_mat_scratch(self):
+        """A result used as a ``tile.matmul_acc`` **accumulator** (arg 0, which is
+        Acc-resident) must NOT be turned into a Mat scratch — that would be an
+        illegal Mat-for-Acc substitution.  The operand-index-aware classifier
+        keeps it deferred."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                x: pl.Tensor[[256, 128], pl.FP32],
+                y: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ):
+                c = pl.matmul(a, b)
+                d = pl.matmul_acc(c, x, y)  # c is the accumulator (arg 0), not an operand
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+        # The producer must not be assembled into a Mat scratch.
+        assert "c__tile_mat" not in printed, "matmul_acc accumulator use must not trigger Mat-scratch"
+
+    def test_matmul_acc_operand_use_is_mat_scratch(self):
+        """A result used as a ``tile.matmul_acc`` **operand** (arg 1/2) is
+        Mat-scratch eligible, unlike the accumulator (arg 0)."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                acc: pl.Tensor[[256, 64], pl.FP32],
+                y: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ):
+                c = pl.matmul(a, b)
+                d = pl.matmul_acc(acc, c, y)  # c is the lhs operand (arg 1)
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+        assert "c__tile_mat" in printed and "pl.tile.assemble(" in printed, (
+            "matmul_acc operand use should trigger Mat-scratch"
+        )
+        _assert_ssa_valid(After, "test_matmul_acc_operand")
 
 
 class TestAutoTileMatmulL0Skips:
