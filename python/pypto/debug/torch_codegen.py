@@ -861,7 +861,7 @@ def _build_group_meta(program: _ir.Program) -> dict[str, dict[str, Any]]:
 _OP_MAP: dict[str, OpHandler] = {}
 
 
-def _register_ops() -> None:
+def _register_ops() -> None:  # noqa: PLR0915
     m = _OP_MAP
 
     # --- Tensor element-wise binary ---

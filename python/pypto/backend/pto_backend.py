@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from importlib import resources
+
 try:
     from importlib.resources.abc import Traversable  # Python >= 3.11
 except ImportError:  # pragma: no cover - fallback for older interpreters

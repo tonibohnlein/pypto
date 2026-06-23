@@ -553,7 +553,7 @@ def _torch_codegen_matches_matmul(program, m_dim, n_dim, k_dim):
     (the function name in the Before/After programs below).
     """
     torch = pytest.importorskip("torch")
-    from pypto.debug import torch_codegen
+    from pypto.debug import torch_codegen  # noqa: PLC0415
 
     torch.manual_seed(0)
     a = torch.randn(m_dim, k_dim, dtype=torch.float32)
@@ -774,8 +774,8 @@ class TestAutoTileMatmulL0MNTiling:
         output tiles into a 2×2 grid with partial boundary sub-tiles."""
 
         torch = pytest.importorskip("torch")
-        from pypto.debug import torch_codegen
-        from pypto.jit.decorator import jit
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+        from pypto.jit.decorator import jit  # noqa: PLC0415
 
         # Override the autouse Ascend950 fixture: 256×256 FP32 fits L0c on 950
         # but overflows it on 910B, which is the configuration that forces M/N
@@ -788,7 +788,7 @@ class TestAutoTileMatmulL0MNTiling:
             with pl.at(level=pl.Level.CORE_GROUP):
                 ta = pl.load(a, [0, 0], [256, 256], target_memory=pl.MemorySpace.Mat)
                 tb = pl.load(b, [0, 0], [256, 256], target_memory=pl.MemorySpace.Mat)
-                tc = pl.matmul(ta, tb, out_dtype=pl.FP32)
+                tc = pl.matmul(ta, tb)
                 pl.store(tc, [0, 0], c)
             return c
 
@@ -865,7 +865,7 @@ class TestAutoTileMatmulL0MNTiling:
 
         # Numerically: out[:, 0:512] = a1 @ b1, out[:, 512:1024] = a2 @ b2.
         torch = pytest.importorskip("torch")
-        from pypto.debug import torch_codegen
+        from pypto.debug import torch_codegen  # noqa: PLC0415
 
         torch.manual_seed(0)
         a1 = torch.randn(512, 512, dtype=torch.float32)

@@ -391,10 +391,8 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
   // m == M, n == N, so the extracts are identical to the un-tiled case.
   ExprPtr mi_off = r.mi ? r.mi : MakeIndex(0, sp);
   ExprPtr ni_off = r.ni ? r.ni : MakeIndex(0, sp);
-  auto sa = BuildExtract(lhs_extract_src, {r.m, r.k}, mi_off, ko_var, MemorySpace::Left,
-                         base + "_l0_a", sp);
-  auto sb =
-      BuildExtract(r.rhs_src, {r.k, r.n}, ko_var, ni_off, MemorySpace::Right, base + "_l0_b", sp);
+  auto sa = BuildExtract(lhs_extract_src, {r.m, r.k}, mi_off, ko_var, MemorySpace::Left, base + "_l0_a", sp);
+  auto sb = BuildExtract(r.rhs_src, {r.k, r.n}, ko_var, ni_off, MemorySpace::Right, base + "_l0_b", sp);
 
   StmtPtr body = is_acc ? BuildMatmulAccBody(c_iter, sa, sb, base, sp)
                         : BuildMatmulBody(ko_var, c_iter, sa, sb, base, sp);
@@ -675,10 +673,10 @@ SiblingIndex BuildSiblingIndex(const std::vector<StmtPtr>& stmts) {
 /// replace ``c = tile.matmul(...)`` together with its consumer store
 /// ``out = tile.store(c, base, out)``.
 struct MNFold {
-  std::vector<StmtPtr> stmts;          ///< inner K-loops + per-sub-tile stores (emitted at the store site)
-  VarPtr return_var;                   ///< final output-tensor SSA value
-  VarPtr store_result_var;             ///< the consumer store's LHS (remapped to return_var)
-  const AssignStmt* store = nullptr;   ///< consumer store to drop from the SeqStmts
+  std::vector<StmtPtr> stmts;         ///< inner K-loops + per-sub-tile stores (emitted at the store site)
+  VarPtr return_var;                  ///< final output-tensor SSA value
+  VarPtr store_result_var;            ///< the consumer store's LHS (remapped to return_var)
+  const AssignStmt* store = nullptr;  ///< consumer store to drop from the SeqStmts
 };
 
 /// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
@@ -717,14 +715,16 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
   // assumes a real (>= 2-trip) pipelined K-loop.  K == k (single block) would
   // need a straight-line per-sub-tile matmul instead — deferred.
   if (t.K / t.k < 2) {
-    return skip("tile.matmul output exceeds L0c but K fits in a single L0 block (K / k < 2); the "
-                "single-K-block M/N form is not yet supported — left untouched");
+    return skip(
+        "tile.matmul output exceeds L0c but K fits in a single L0 block (K / k < 2); the "
+        "single-K-block M/N form is not yet supported — left untouched");
   }
 
   // The result must be consumed exactly once, by the 2D store we fold in.
   if (result_uses != 1 || !store_stmt) {
-    return skip("tile.matmul output exceeds L0c but its result is not consumed by exactly one 2D "
-                "tile.store — M/N direct-store fold needs `out = tile.store(c, ...)`; left untouched");
+    return skip(
+        "tile.matmul output exceeds L0c but its result is not consumed by exactly one 2D "
+        "tile.store — M/N direct-store fold needs `out = tile.store(c, ...)`; left untouched");
   }
   auto store_call = As<Call>(store_stmt->value_);
   INTERNAL_CHECK_SPAN(store_call, store_stmt->span_)
@@ -738,8 +738,9 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
   const ExprPtr base_c = offs->elements_[1];
   auto out_in = AsVarLike(store_call->args_[2]);
   if (!out_in) {
-    return skip("tile.store target is not a simple tensor variable — M/N fold not applicable; left "
-                "untouched");
+    return skip(
+        "tile.store target is not a simple tensor variable — M/N fold not applicable; left "
+        "untouched");
   }
 
   // Chain the per-sub-tile stores from the raw output tensor.  The folded
@@ -770,15 +771,14 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
 
       // Inner K-loop: accumulate lhs[mi:mi+m_eff, :] @ rhs[:, ni:ni+n_eff] over
       // K into an [m_eff, n_eff] Acc result.
-      auto inner =
-          BuildKLoopRewrite(MakeKLoop(t, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, tbase));
+      auto inner = BuildKLoopRewrite(MakeKLoop(t, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, tbase));
       for (auto& s : inner.stmts) stmts.push_back(std::move(s));
 
       // Store the sub-tile straight to out[base_r + mi :, base_c + ni :].
       auto store_offs = std::make_shared<MakeTuple>(
           std::vector<ExprPtr>{OffsetPlus(base_r, mi, sp), OffsetPlus(base_c, ni, sp)}, sp);
-      auto scall = reg.Create("tile.store", {inner.return_var, store_offs, out_value},
-                              store_call->kwargs_, sp);
+      auto scall =
+          reg.Create("tile.store", {inner.return_var, store_offs, out_value}, store_call->kwargs_, sp);
       auto sv = std::make_shared<Var>(out_base + "_t" + std::to_string(tile_idx), scall->GetType(), sp);
       stmts.push_back(std::make_shared<AssignStmt>(sv, scall, sp));
       out_value = sv;
@@ -852,8 +852,8 @@ class AutoTileMutator : public IRMutator {
           if (!tiling->needs_mn_tiling()) {
             // Whole output fits L0c — tile K only (existing behaviour).
             INTERNAL_CHECK_SPAN(tiling->K / tiling->k >= 2, tiling->assign->span_)
-                << "Internal error: K-only tiling expects K / k >= 2 (K=" << tiling->K
-                << ", k=" << tiling->k << ")";
+                << "Internal error: K-only tiling expects K / k >= 2 (K=" << tiling->K << ", k=" << tiling->k
+                << ")";
             auto rewrite = BuildKLoopRewrite(
                 MakeKLoop(*tiling, /*mi=*/nullptr, /*ni=*/nullptr, tiling->m, tiling->n, /*name_base=*/""));
             remap[assign->var_.get()] = rewrite.return_var;
