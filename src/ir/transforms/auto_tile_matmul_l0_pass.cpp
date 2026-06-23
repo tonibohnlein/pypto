@@ -269,6 +269,36 @@ AssignStmtPtr BuildAccInit(int64_t m, int64_t n, const DataType& dtype, const st
   return std::make_shared<AssignStmt>(var, call, span);
 }
 
+/// Build the ``tile.create([M, N], dtype, target_memory=Mat)`` L1/Mat output
+/// scratch for the Mat-scratch M/N path: an L1-resident ``[M, N]`` buffer that
+/// each ``[m, n]`` Acc sub-tile is assembled into.  ``tile.create`` emits the
+/// same Nz TileView as a matmul output, so the Acc→Mat ``tile.assemble``
+/// (lowering to the hardware NZ TINSERT) is layout-compatible — see
+/// ``BuildMatAssemble``.
+AssignStmtPtr BuildMatScratch(int64_t M, int64_t N, const DataType& dtype, const std::string& name_hint,
+                              const Span& span) {
+  auto& reg = OpRegistry::GetInstance();
+  std::vector<std::pair<std::string, std::any>> kwargs = {{"dtype", dtype},
+                                                          {"target_memory", MemorySpace::Mat}};
+  auto call = reg.Create("tile.create", {MakeIndexTuple({M, N}, span)}, kwargs, span);
+  auto var = std::make_shared<Var>(name_hint, call->GetType(), span);
+  return std::make_shared<AssignStmt>(var, call, span);
+}
+
+/// Insert an ``[m, n]`` Acc sub-tile into the Mat scratch at origin ``(mi, ni)``:
+/// ``tile.assemble(scratch, sub, [mi, ni])``.  ``tile.assemble`` is registered
+/// ``set_output_memory_inherit_input()``, so ``InitMemRef`` makes the whole
+/// chain ``scratch_{k+1} = assemble(scratch_k, …)`` share one Mat base before
+/// MemoryReuse runs (no full-scratch copy per insert).  Lowers to
+/// ``pto.subview`` + ``pto.tmov`` (Acc→Mat NZ TINSERT).
+AssignStmtPtr BuildMatAssemble(const VarPtr& scratch, const VarPtr& sub, int64_t mi, int64_t ni,
+                               const std::string& name_hint, const Span& span) {
+  auto& reg = OpRegistry::GetInstance();
+  auto call = reg.Create("tile.assemble", {scratch, sub, MakeIndexTuple({mi, ni}, span)}, span);
+  auto var = std::make_shared<Var>(name_hint, call->GetType(), span);
+  return std::make_shared<AssignStmt>(var, call, span);
+}
+
 struct KLoopRewrite {
   AssignStmtPtr original;
   VarPtr lhs_src;                 ///< [M, K] left operand — Mat- or Vec-resident
@@ -637,12 +667,37 @@ ExprPtr OffsetPlus(const ExprPtr& base, int64_t delta, const Span& sp) {
 /// ``VisitVarLike_`` covers both Var and IterArg (.claude/rules/ir-kind-traits.md).
 class SiblingUseCounter : public IRVisitor {
  public:
-  std::unordered_map<const Var*, int> counts;
+  std::unordered_map<const Var*, int> counts;               ///< all reads
+  std::unordered_map<const Var*, int> matmul_operand_uses;  ///< reads at a matmul-operand position
 
  protected:
-  void VisitVarLike_(const VarPtr& op) override { ++counts[op.get()]; }
+  void VisitVarLike_(const VarPtr& op) override {
+    ++counts[op.get()];
+    if (in_matmul_operand_) ++matmul_operand_uses[op.get()];
+  }
   // Skip the LHS (a def); count only reads in the RHS value.
   void VisitStmt_(const AssignStmtPtr& op) override { VisitExpr(op->value_); }
+  // A *direct* Var at a matmul OPERAND position (``tile.matmul`` args {0,1};
+  // ``tile.matmul_acc`` args {1,2} — arg 0 is the Acc accumulator, NOT a matrix
+  // operand) is a Mat-safe consumer use: the consumer K-tiles that operand, so a
+  // Mat scratch produced upstream is legal there.  Classifying by operand index
+  // is essential — a scratch fed to ``matmul_acc`` arg 0 would be an illegal
+  // Mat-for-Acc substitution and must stay deferred.
+  void VisitExpr_(const CallPtr& op) override {
+    const std::string& name = op->op_ ? op->op_->name_ : std::string();
+    const bool is_mm = name == "tile.matmul";
+    const bool is_acc = name == "tile.matmul_acc";
+    for (size_t i = 0; i < op->args_.size(); ++i) {
+      const bool operand_pos = (is_mm && (i == 0 || i == 1)) || (is_acc && (i == 1 || i == 2));
+      const bool prev = in_matmul_operand_;
+      in_matmul_operand_ = operand_pos && (AsVarLike(op->args_[i]) != nullptr);
+      VisitExpr(op->args_[i]);
+      in_matmul_operand_ = prev;
+    }
+  }
+
+ private:
+  bool in_matmul_operand_ = false;
 };
 
 /// One-shot index over a SeqStmts' children, built lazily on the first
@@ -655,6 +710,7 @@ class SiblingUseCounter : public IRVisitor {
 /// not change until we rewrite it).
 struct SiblingIndex {
   std::unordered_map<const Var*, int> use_counts;
+  std::unordered_map<const Var*, int> matmul_operand_uses;
   std::unordered_map<const Var*, const AssignStmt*> store_of;
 };
 
@@ -671,6 +727,7 @@ SiblingIndex BuildSiblingIndex(const std::vector<StmtPtr>& stmts) {
     if (auto src = AsVarLike(call->args_[0])) idx.store_of.emplace(src.get(), as.get());
   }
   idx.use_counts = std::move(counter.counts);
+  idx.matmul_operand_uses = std::move(counter.matmul_operand_uses);
   return idx;
 }
 
@@ -678,11 +735,112 @@ SiblingIndex BuildSiblingIndex(const std::vector<StmtPtr>& stmts) {
 /// replace ``c = tile.matmul(...)`` together with its consumer store
 /// ``out = tile.store(c, base, out)``.
 struct MNFold {
-  std::vector<StmtPtr> stmts;         ///< inner K-loops + per-sub-tile stores (emitted at the store site)
-  VarPtr return_var;                  ///< final output-tensor SSA value
+  std::vector<StmtPtr> stmts;  ///< inner K-loops / snake + per-sub-tile placement
+  VarPtr return_var;           ///< final value (output tensor for DirectGM, Mat scratch for MatScratch)
+  // DirectGM (deferred): the grid emits at the consumer-store position; the
+  // store's LHS is remapped to return_var and the store dropped.
   VarPtr store_result_var;            ///< the consumer store's LHS (remapped to return_var)
   const AssignStmt* store = nullptr;  ///< consumer store to drop from the SeqStmts
+  // MatScratch (in-place): the grid emits at the matmul's own position (no store
+  // to defer); the matmul's result Var is remapped to the scratch return_var so
+  // the on-chip consumer reads the assembled scratch.
+  bool in_place = false;       ///< emit at the matmul, not at a store site
+  VarPtr in_place_result_var;  ///< the matmul's own result Var (remapped to return_var)
 };
+
+/// Where each computed ``[m_eff, n_eff]`` Acc sub-tile is placed.  The M/N grid
+/// builders (``BuildFullKSnake`` snake, ``BuildSplitKGrid`` K-loop grid) are
+/// placement-agnostic: they compute each sub-tile's Acc result and hand it to a
+/// ``SubtilePlacer``, which either stores it straight to a DDR output tensor
+/// (``DirectGmPlacer``) or assembles it into an L1/Mat scratch
+/// (``MatScratchPlacer``).  The placer threads its chained output/scratch Var in
+/// traversal order and yields the final Var via ``Result()``.
+class SubtilePlacer {
+ public:
+  virtual ~SubtilePlacer() = default;
+  /// Emitted once before the grid (e.g. the Mat scratch ``tile.create``).
+  virtual void Prologue(std::vector<StmtPtr>& /*stmts*/) {}
+  /// Place ``sub`` (the ``[m_eff, n_eff]`` Acc result) at origin ``(mi, ni)``,
+  /// pushing the placement stmt(s) onto ``stmts`` and advancing the chained Var.
+  virtual void Place(std::vector<StmtPtr>& stmts, const VarPtr& sub, int64_t mi, int64_t ni, int step) = 0;
+  /// The final chained Var after the last placement.
+  [[nodiscard]] virtual VarPtr Result() const = 0;
+};
+
+/// Direct-store placement: ``out = tile.store(sub, [base_r + mi, base_c + ni],
+/// out_prev)`` per sub-tile, chaining the DDR output tensor in SSA form.
+class DirectGmPlacer : public SubtilePlacer {
+ public:
+  DirectGmPlacer(ExprPtr base_r, ExprPtr base_c, VarPtr out_in,
+                 std::vector<std::pair<std::string, std::any>> store_kwargs, Span span)
+      : base_r_(std::move(base_r)),
+        base_c_(std::move(base_c)),
+        out_value_(std::move(out_in)),
+        out_base_(out_value_->name_hint_),
+        kwargs_(std::move(store_kwargs)),
+        sp_(std::move(span)) {}
+
+  void Place(std::vector<StmtPtr>& stmts, const VarPtr& sub, int64_t mi, int64_t ni, int step) override {
+    auto& reg = OpRegistry::GetInstance();
+    auto offs = std::make_shared<MakeTuple>(
+        std::vector<ExprPtr>{OffsetPlus(base_r_, mi, sp_), OffsetPlus(base_c_, ni, sp_)}, sp_);
+    auto scall = reg.Create("tile.store", {sub, offs, out_value_}, kwargs_, sp_);
+    auto sv = std::make_shared<Var>(out_base_ + "_t" + std::to_string(step), scall->GetType(), sp_);
+    stmts.push_back(std::make_shared<AssignStmt>(sv, scall, sp_));
+    out_value_ = sv;
+  }
+
+  [[nodiscard]] VarPtr Result() const override { return out_value_; }
+
+ private:
+  ExprPtr base_r_, base_c_;
+  VarPtr out_value_;
+  std::string out_base_;
+  std::vector<std::pair<std::string, std::any>> kwargs_;
+  Span sp_;
+};
+
+/// Mat-scratch placement: an L1-resident ``[M, N]`` scratch (``BuildMatScratch``)
+/// that each sub-tile is assembled into — ``scratch_{k+1} = tile.assemble(
+/// scratch_k, sub, [mi, ni])`` — keeping the whole result on-chip for a
+/// downstream matmul consumer (no DDR round-trip).
+class MatScratchPlacer : public SubtilePlacer {
+ public:
+  MatScratchPlacer(int64_t M, int64_t N, DataType dtype, std::string base, Span span)
+      : M_(M), N_(N), dtype_(std::move(dtype)), base_(std::move(base)), sp_(std::move(span)) {}
+
+  void Prologue(std::vector<StmtPtr>& stmts) override {
+    auto init = BuildMatScratch(M_, N_, dtype_, base_ + "_mat", sp_);
+    stmts.push_back(init);
+    scratch_ = init->var_;
+  }
+
+  void Place(std::vector<StmtPtr>& stmts, const VarPtr& sub, int64_t mi, int64_t ni, int step) override {
+    auto asm_stmt = BuildMatAssemble(scratch_, sub, mi, ni, base_ + "_mat_t" + std::to_string(step), sp_);
+    stmts.push_back(asm_stmt);
+    scratch_ = asm_stmt->var_;
+  }
+
+  [[nodiscard]] VarPtr Result() const override { return scratch_; }
+
+ private:
+  int64_t M_, N_;
+  DataType dtype_;
+  std::string base_;
+  Span sp_;
+  VarPtr scratch_;
+};
+
+/// Cheap **prefilter** only: does the ``[M, N]`` Mat scratch *alone* fit L1?
+/// This is a necessary, not sufficient, condition — true legality (the scratch
+/// packed alongside every other live Mat allocation, after ``can_share``) must
+/// be measured by the allocator, never assumed from this closed form.  Used to
+/// avoid obviously-hopeless rewrites; the real check is the packed-peak measure.
+bool ScratchAloneFits(int64_t M, int64_t N, const DataType& dtype) {
+  const uint64_t scratch_bytes = static_cast<uint64_t>(M) * static_cast<uint64_t>(N) * DTypeBytes(dtype);
+  const uint64_t mat_capacity = pypto::backend::GetBackend()->GetMemSize(MemorySpace::Mat);
+  return scratch_bytes <= mat_capacity;
+}
 
 /// Build the full-K (``k == K``) M/N grid with a **serpentine (snake)**
 /// traversal that keeps one operand panel resident in L0 across the sweep and
@@ -705,18 +863,15 @@ struct MNFold {
 /// left panel is the larger, else a **column snake** (B-stationary).  Reversing
 /// the inner sweep direction every outer step also reuses the *moving* panel
 /// across each turn, so the grid issues only ``P*Q + 1`` extracts instead of
-/// ``2*P*Q``.  Each ``[m_eff, n_eff]`` (partial on the boundary) result is
-/// stored straight to ``out[mi:, ni:]``, chaining the output in SSA form.
+/// ``2*P*Q``.  Each ``[m_eff, n_eff]`` (partial on the boundary) result is handed
+/// to ``placer`` (DDR store or Mat-scratch assemble) in traversal order.
 ///
 /// Plain ``tile.matmul`` with Mat-resident operands only (matmul_acc / Vec-lhs
-/// deferred upstream).  Returns the emitted stmts and the final output Var.
-std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKSnake(
-    const MatmulTiling& t, const ExprPtr& base_r, const ExprPtr& base_c, const VarPtr& out_in,
-    const std::vector<std::pair<std::string, std::any>>& store_kwargs) {
+/// deferred upstream).  Returns the emitted stmts and the placer's final Var.
+std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKSnake(const MatmulTiling& t, SubtilePlacer& placer) {
   const Span sp = t.assign->span_;
   auto& reg = OpRegistry::GetInstance();
   const std::string base = t.assign->var_->name_hint_;
-  const std::string out_base = out_in->name_hint_;
   const int64_t num_m = (t.M + t.m - 1) / t.m;
   const int64_t num_n = (t.N + t.n - 1) / t.n;
 
@@ -749,7 +904,8 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKSnake(
   }
 
   std::vector<StmtPtr> stmts;
-  VarPtr a_var, b_var, out_value = out_in, last_out = out_in;
+  placer.Prologue(stmts);
+  VarPtr a_var, b_var;
   int64_t held_mi = -1, held_ni = -1;  // grid indices of the currently-resident panels
   int a_idx = 0, b_idx = 0, step = 0;
   for (const auto& [mi_idx, ni_idx] : seq) {
@@ -776,35 +932,65 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKSnake(
     auto c_var = std::make_shared<Var>(base + "_c" + std::to_string(step), c_call->GetType(), sp);
     stmts.push_back(std::make_shared<AssignStmt>(c_var, c_call, sp));
 
-    auto store_offs = std::make_shared<MakeTuple>(
-        std::vector<ExprPtr>{OffsetPlus(base_r, mi, sp), OffsetPlus(base_c, ni, sp)}, sp);
-    auto scall = reg.Create("tile.store", {c_var, store_offs, out_value}, store_kwargs, sp);
-    auto sv = std::make_shared<Var>(out_base + "_t" + std::to_string(step), scall->GetType(), sp);
-    stmts.push_back(std::make_shared<AssignStmt>(sv, scall, sp));
-    out_value = sv;
-    last_out = sv;
+    placer.Place(stmts, c_var, mi, ni, step);
     ++step;
   }
-  return {std::move(stmts), last_out};
+  return {std::move(stmts), placer.Result()};
+}
+
+/// Build the split-K M/N grid: ``ceil(M/m) x ceil(N/n)`` sub-tiles, each a
+/// pipelined K-loop (``BuildKLoopRewrite``) over the ``[m_eff, n_eff]`` output,
+/// handed to ``placer`` for placement.  Used when K spans >= 2 L0 blocks, so the
+/// operand panel does not fit L0 and cannot be reused across sub-tiles (unlike
+/// the full-K snake).  N-major traversal preserves the historical sub-tile
+/// ordering / naming.
+std::pair<std::vector<StmtPtr>, VarPtr> BuildSplitKGrid(const MatmulTiling& t, SubtilePlacer& placer) {
+  const Span sp = t.assign->span_;
+  const std::string base = t.assign->var_->name_hint_;
+  const int64_t num_m = (t.M + t.m - 1) / t.m;
+  const int64_t num_n = (t.N + t.n - 1) / t.n;
+
+  std::vector<StmtPtr> stmts;
+  placer.Prologue(stmts);
+  int step = 0;
+  for (int64_t nj = 0; nj < num_n; ++nj) {
+    const int64_t ni = nj * t.n;
+    const int64_t n_eff = std::min<int64_t>(t.n, t.N - ni);
+    for (int64_t mj = 0; mj < num_m; ++mj) {
+      const int64_t mi = mj * t.m;
+      const int64_t m_eff = std::min<int64_t>(t.m, t.M - mi);
+      const std::string tbase = base + "_t" + std::to_string(step);
+
+      auto inner = BuildKLoopRewrite(MakeKLoop(t, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, tbase));
+      for (auto& s : inner.stmts) stmts.push_back(std::move(s));
+      placer.Place(stmts, inner.return_var, mi, ni, step);
+      ++step;
+    }
+  }
+  return {std::move(stmts), placer.Result()};
 }
 
 /// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
-/// L0c into an unrolled grid of ``ceil(M/m) x ceil(N/n)`` sub-tile matmuls,
-/// each computing an ``[m, n]`` (partial on the boundary) Acc result and
-/// storing it straight to the output tensor at ``out[mi:, ni:]``.  Operands are
-/// already Mat-resident, so only the output Acc overflows; sub-tiling the
-/// output keeps every Acc tile within L0c.
+/// L0c into a ``ceil(M/m) x ceil(N/n)`` grid of sub-tile matmuls, each computing
+/// an ``[m, n]`` (partial on the boundary) Acc result.  Operands are already
+/// Mat-resident, so only the output Acc overflows; sub-tiling keeps every Acc
+/// tile within L0c.  Where each sub-tile lands depends on the consumer:
 ///
-/// Requires the matmul's result to be consumed by exactly one 2D
-/// ``tile.store(c, base, out)`` (``result_uses`` and ``store_stmt`` come from
-/// the precomputed SiblingIndex); that store is folded into the per-sub-tile
-/// rewrite (the DDR-output case our solver kernels need).  Returns nullopt
-/// (with a PerfHint) when the pattern does not match — the matmul is then left
-/// untouched.  ``matmul_acc`` (caller-supplied [M, N] accumulator) and a Vec
-/// left operand both need the Mat-scratch / per-iter assemble path that is
-/// still deferred.
-std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, const AssignStmt* store_stmt,
-                                      std::vector<Diagnostic>& hints) {
+///   * **Direct-GM** — the sole consumer is a 2D ``tile.store(c, base, out)``:
+///     each sub-tile stores straight to ``out[mi:, ni:]`` (the DDR-output case
+///     our solver kernels need).  The store is folded in and emitted at the
+///     store site.
+///   * **Mat-scratch** — every use of the result is a *matmul operand*
+///     (``matmul_operand_uses == result_uses``, no store): each sub-tile is
+///     ``tile.assemble``d into an L1/Mat scratch kept on-chip for the downstream
+///     matmul (no DDR round-trip).  Emitted in place of the matmul.
+///
+/// ``result_uses`` / ``matmul_operand_uses`` / ``store_stmt`` come from the
+/// precomputed SiblingIndex.  Returns nullopt (with a PerfHint) when neither
+/// pattern matches.  ``matmul_acc`` (caller-supplied [M, N] accumulator) and a
+/// Vec left operand are still deferred.
+std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, int matmul_operand_uses,
+                                      const AssignStmt* store_stmt, std::vector<Diagnostic>& hints) {
   const Span sp = t.assign->span_;
   auto skip = [&](const std::string& msg) -> std::optional<MNFold> {
     hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006", msg, sp);
@@ -820,88 +1006,59 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
     return skip(
         "tile.matmul with a Vec left operand needs M/N tiling — the PV path is deferred; left untouched");
   }
-  // K spans >= 2 L0 blocks → pipelined K-loop per sub-tile; k == K (full K fits
-  // L0a/L0b) → straight-line snake grid with operand reuse (see BuildFullKSnake).
+  // K spans >= 2 L0 blocks → pipelined K-loop per sub-tile (BuildSplitKGrid);
+  // k == K (full K fits L0a/L0b) → straight-line snake grid with operand reuse
+  // (BuildFullKSnake).  Either grid drives the chosen SubtilePlacer.
   const bool full_k = t.K / t.k < 2;
 
-  // The result must be consumed exactly once, by the 2D store we fold in.
-  if (result_uses != 1 || !store_stmt) {
-    return skip(
-        "tile.matmul output exceeds L0c but its result is not consumed by exactly one 2D "
-        "tile.store — M/N direct-store fold needs `out = tile.store(c, ...)`; left untouched");
-  }
-  auto store_call = As<Call>(store_stmt->value_);
-  INTERNAL_CHECK_SPAN(store_call, store_stmt->span_)
-      << "Internal error: SiblingIndex store_of mapped a non-Call AssignStmt";
-
-  auto offs = As<MakeTuple>(store_call->args_[1]);
-  if (!offs || offs->elements_.size() != 2) {
-    return skip("tile.store offsets are not a 2D tuple — M/N fold not applicable; left untouched");
-  }
-  const ExprPtr base_r = offs->elements_[0];
-  const ExprPtr base_c = offs->elements_[1];
-  auto out_in = AsVarLike(store_call->args_[2]);
-  if (!out_in) {
-    return skip(
-        "tile.store target is not a simple tensor variable — M/N fold not applicable; left "
-        "untouched");
-  }
-
-  // Full-K (k == K): the whole operand panel fits L0, so emit the grid as a
-  // serpentine snake that keeps one panel resident and reuses it across
-  // sub-tiles (see BuildFullKSnake).  Cross-sub-tile operand reuse is only
-  // possible when the panel fits L0 — i.e. exactly the full-K case — so the
-  // K-loop path (panel does not fit L0) keeps the simple per-sub-tile grid.
-  if (full_k) {
-    auto [snake_stmts, snake_last] = BuildFullKSnake(t, base_r, base_c, out_in, store_call->kwargs_);
-    return MNFold{std::move(snake_stmts), snake_last, store_stmt->var_, store_stmt};
-  }
-
-  // Chain the per-sub-tile stores from the raw output tensor.  The folded
-  // stmts are emitted later, at the consumer-store position, where the caller
-  // re-applies the then-current remap — so if a prior fold redefines this
-  // output between the matmul and its store (independent of statement order),
-  // the chain start is rewritten correctly at emission time.  Resolving it
-  // here against the matmul-visit-time remap would miss folds processed after
-  // this one but emitted before it (a stale-output SSA bug).
-  ExprPtr out_value = out_in;
-
-  auto& reg = OpRegistry::GetInstance();
-  const std::string base = t.assign->var_->name_hint_;
-  const std::string out_base = out_in->name_hint_;
-  const int64_t num_m = (t.M + t.m - 1) / t.m;
-  const int64_t num_n = (t.N + t.n - 1) / t.n;
-
-  std::vector<StmtPtr> stmts;
-  VarPtr last_out = out_in;
-  int tile_idx = 0;
-  for (int64_t nj = 0; nj < num_n; ++nj) {
-    const int64_t ni = nj * t.n;
-    const int64_t n_eff = std::min<int64_t>(t.n, t.N - ni);
-    for (int64_t mj = 0; mj < num_m; ++mj) {
-      const int64_t mi = mj * t.m;
-      const int64_t m_eff = std::min<int64_t>(t.m, t.M - mi);
-      const std::string tbase = base + "_t" + std::to_string(tile_idx);
-
-      // Pipelined K-loop over the [m_eff, n_eff] sub-tile (K spans >= 2 L0
-      // blocks).  The full-K case is handled by the snake builder above.
-      auto inner = BuildKLoopRewrite(MakeKLoop(t, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, tbase));
-      for (auto& s : inner.stmts) stmts.push_back(std::move(s));
-
-      // Store the sub-tile straight to out[base_r + mi :, base_c + ni :].
-      auto store_offs = std::make_shared<MakeTuple>(
-          std::vector<ExprPtr>{OffsetPlus(base_r, mi, sp), OffsetPlus(base_c, ni, sp)}, sp);
-      auto scall =
-          reg.Create("tile.store", {inner.return_var, store_offs, out_value}, store_call->kwargs_, sp);
-      auto sv = std::make_shared<Var>(out_base + "_t" + std::to_string(tile_idx), scall->GetType(), sp);
-      stmts.push_back(std::make_shared<AssignStmt>(sv, scall, sp));
-      out_value = sv;
-      last_out = sv;
-      ++tile_idx;
+  // Direct-GM: the sole consumer is a 2D tile.store.  The grid is emitted later
+  // at the store site, where the caller re-applies the then-current remap — so a
+  // prior fold that redefined this output is rewritten correctly (a stale-output
+  // SSA guard); resolving it here would miss folds emitted before this one.
+  if (store_stmt && result_uses == 1) {
+    auto store_call = As<Call>(store_stmt->value_);
+    INTERNAL_CHECK_SPAN(store_call, store_stmt->span_)
+        << "Internal error: SiblingIndex store_of mapped a non-Call AssignStmt";
+    auto offs = As<MakeTuple>(store_call->args_[1]);
+    if (!offs || offs->elements_.size() != 2) {
+      return skip("tile.store offsets are not a 2D tuple — M/N fold not applicable; left untouched");
     }
+    auto out_in = AsVarLike(store_call->args_[2]);
+    if (!out_in) {
+      return skip(
+          "tile.store target is not a simple tensor variable — M/N fold not applicable; left untouched");
+    }
+    DirectGmPlacer placer(offs->elements_[0], offs->elements_[1], out_in, store_call->kwargs_, sp);
+    auto [stmts, last_out] = full_k ? BuildFullKSnake(t, placer) : BuildSplitKGrid(t, placer);
+    return MNFold{std::move(stmts), last_out, store_stmt->var_, store_stmt};
   }
 
-  return MNFold{std::move(stmts), last_out, store_stmt->var_, store_stmt};
+  // Mat-scratch: every use of the result is a matmul operand (the consumer
+  // K-tiles it, so each operand slice fits L0a).  Assemble each [m, n] sub-tile
+  // into an L1/Mat scratch kept on-chip; the grid is emitted in place of the
+  // matmul and the matmul's result Var is remapped to the scratch.
+  if (!store_stmt && result_uses >= 1 && matmul_operand_uses == result_uses) {
+    auto out_tile = As<TileType>(t.assign->var_->GetType());
+    INTERNAL_CHECK_SPAN(out_tile, sp) << "Internal error: matmul result is not a TileType";
+    if (!ScratchAloneFits(t.M, t.N, out_tile->dtype_)) {
+      return skip(
+          "tile.matmul output exceeds L0c and its [M, N] Mat scratch does not fit L1 (needs a DDR "
+          "spill); left untouched");
+    }
+    MatScratchPlacer placer(t.M, t.N, out_tile->dtype_, t.assign->var_->name_hint_, sp);
+    auto [stmts, scratch_result] = full_k ? BuildFullKSnake(t, placer) : BuildSplitKGrid(t, placer);
+    MNFold fold;
+    fold.stmts = std::move(stmts);
+    fold.return_var = scratch_result;
+    fold.in_place = true;
+    fold.in_place_result_var = t.assign->var_;
+    return fold;
+  }
+
+  return skip(
+      "tile.matmul output exceeds L0c but its result is neither a single 2D tile.store (direct-GM) "
+      "nor consumed solely as matmul operands (Mat-scratch) — stored-and-reused, a non-matmul "
+      "consumer (needs Vec/DDR), or a mix; left untouched");
 }
 
 class AutoTileMutator : public IRMutator {
@@ -983,10 +1140,21 @@ class AutoTileMutator : public IRMutator {
           const Var* result = assign->var_.get();
           auto uc_it = sibling_index->use_counts.find(result);
           const int result_uses = uc_it == sibling_index->use_counts.end() ? 0 : uc_it->second;
+          auto mo_it = sibling_index->matmul_operand_uses.find(result);
+          const int matmul_operand_uses =
+              mo_it == sibling_index->matmul_operand_uses.end() ? 0 : mo_it->second;
           auto store_it = sibling_index->store_of.find(result);
           const AssignStmt* store_stmt =
               store_it == sibling_index->store_of.end() ? nullptr : store_it->second;
-          if (auto fold = TryFoldMNTiling(*tiling, result_uses, store_stmt, hints)) {
+          if (auto fold = TryFoldMNTiling(*tiling, result_uses, matmul_operand_uses, store_stmt, hints)) {
+            if (fold->in_place) {
+              // Mat-scratch: emit the grid here (in place of the matmul) and
+              // redirect the matmul's downstream uses to the assembled scratch.
+              remap[fold->in_place_result_var.get()] = fold->return_var;
+              for (auto& s : fold->stmts) out.push_back(std::move(s));
+              changed = true;
+              continue;
+            }
             remap[fold->store_result_var.get()] = fold->return_var;
             pending_folds.emplace(static_cast<const Stmt*>(fold->store), std::move(*fold));
             changed = true;

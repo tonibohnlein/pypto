@@ -1041,6 +1041,113 @@ class TestAutoTileMatmulL0MNTiling:
         )
 
 
+def _lower_to_tile_ops(program):
+    """Run the tensor→tile lowering prefix so a tensor-level chained matmul
+    reaches ``AutoTileMatmulL0`` as the real ``c = tile.matmul(a, b);
+    d = tile.matmul(c, e)`` it would see in the pipeline (the chained tile-matmul
+    is not hand-constructible — the user-facing op guard rejects an Acc operand,
+    but ConvertTensorToTileOps builds it internally)."""
+    for p in (
+        passes.convert_to_ssa(),
+        passes.convert_tensor_to_tile_ops(),
+        passes.lower_composite_ops(),
+        passes.flatten_tile_nd_to_2d(),
+    ):
+        program = p(program)
+    return program
+
+
+class TestAutoTileMatmulL0MatScratch:
+    """M/N output tiling to an L1/Mat scratch (on-chip consumer), not DDR.
+
+    When an oversized ``[M, N]`` matmul result is consumed *only* as a matmul
+    operand (a chained matmul), the pass tiles the output into a ``tile.create(
+    target=Mat)`` scratch via per-sub-tile ``tile.assemble`` and keeps it on-chip
+    for the consumer — instead of the direct-GM store path."""
+
+    def test_chained_matmul_uses_mat_scratch(self):
+        """Oversized producer feeding a matmul: the pass assembles the result
+        into a Mat scratch and the consumer reads the scratch, SSA stays valid,
+        and it is numerically correct (FP32, so no bf16 chain-rounding noise)."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                e: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                c = pl.matmul(a, b)  # [256, 256] FP32 > L0c → on-chip consumer → Mat scratch
+                d = pl.matmul(c, e)  # consumes c only as a matmul operand
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        lowered = _lower_to_tile_ops(Before)
+        After = passes.auto_tile_matmul_l0()(lowered)
+        printed = ir.python_print(After)
+
+        # The producer is tiled into a Mat scratch assembled per sub-tile.
+        assert "tile.create" in printed and "Mem.Mat" in printed, "expected a Mat output scratch"
+        assert printed.count("pl.tile.assemble(") == 4, "2×2 grid → 4 Acc→Mat assembles"
+        assert "pl.tile.matmul(a__ssa_v0_mat, b__ssa_v0_mat)" not in printed, (
+            "the oversized producer must be tiled, not left whole"
+        )
+        _assert_ssa_valid(After, "test_mat_scratch_chained")
+
+        # Numerically correct vs (a @ b) @ e (FP32 throughout → fp32 rounding only).
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(256, 128)
+        b = torch.randn(128, 256)
+        e = torch.randn(256, 64)
+        out = torch.zeros(256, 64)
+        code = torch_codegen(After)
+        ns: dict = {}
+        exec(code, ns)  # noqa: S102 — executing generated reference code is the point
+        ns["kernel"](a, b, e, out)
+        expected = (a @ b) @ e
+        assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
+            f"Mat-scratch chained mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+    def test_chained_matmul_packs_through_full_pipeline(self):
+        """End-to-end: a BF16 producer (small Left) feeding an FP32 consumer
+        (larger Left) compiles through the full pipeline without overflowing L0a
+        — the producer/consumer Left buffers pack via the largest-first MemoryReuse
+        (#1805), which is the allocator behaviour the Mat-scratch path depends on."""
+
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 128], pl.BF16],
+                b: pl.Tensor[[128, 256], pl.BF16],
+                e: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                c = pl.matmul(a, b)
+                d = pl.matmul(c, e)
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        # Must reach AllocateMemoryAddr without a "Left buffer usage exceeds" error.
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+
+
 class TestAutoTileMatmulL0Skips:
     """Cases where the pass intentionally leaves the matmul untouched."""
 
