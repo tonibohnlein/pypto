@@ -1042,8 +1042,10 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, in
     INTERNAL_CHECK_SPAN(out_tile, sp) << "Internal error: matmul result is not a TileType";
     if (!ScratchAloneFits(t.M, t.N, out_tile->dtype_)) {
       return skip(
-          "tile.matmul output exceeds L0c and its [M, N] Mat scratch does not fit L1 (needs a DDR "
-          "spill); left untouched");
+          "tile.matmul output is consumed on-chip but its [M, N] intermediate does not fit L1 — "
+          "keeping it on-chip is impossible at this size.  Reduce the InCore tile so the "
+          "intermediate fits, or write the result to DDR with a single tile.store (the direct-store "
+          "M/N path).  Left untouched.");
     }
     MatScratchPlacer placer(t.M, t.N, out_tile->dtype_, t.assign->var_->name_hint_, sp);
     auto [stmts, scratch_result] = full_k ? BuildFullKSnake(t, placer) : BuildSplitKGrid(t, placer);
