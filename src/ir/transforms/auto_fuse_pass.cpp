@@ -82,7 +82,7 @@ int64_t ComputeCost(::OpType type, int64_t w, int64_t h, int64_t k) {
 // tile-geometry compute model set, the per-op base_cost above is ignored.
 // TODO(cost-model): read these from BackendHandler instead of hardcoding 910B.
 constexpr int64_t kFastMemoryCapacity = 1LL << 30;  // legacy single-pool fallback
-constexpr int64_t kSlowMemoryBandwidth = 10;        // DDR bandwidth
+constexpr int64_t kSlowMemoryBandwidth = 10;        // legacy lumped DDR (grounded path overrides)
 constexpr int64_t kNativeW = 128;
 constexpr int64_t kNativeH = 128;
 constexpr int kNumCubeCores = 24;               // AIC cores (matmul)
@@ -90,10 +90,24 @@ constexpr int kNumVectorCores = 48;             // AIV cores (pointwise / reduct
 constexpr int64_t kL1Capacity = 512 * 1024;     // per-cube L1/Mat operand pool
 constexpr int64_t kCubeCapacity = 128 * 1024;   // per-cube L0c accumulator
 constexpr int64_t kVecCapacity = 192 * 1024;    // per-vector UB
-constexpr int64_t kCubeComputeCost = 64;        // per 16x16x16 cube fractal (memory-bound default)
+constexpr int64_t kCubeComputeCost = 1;         // grounded per-repeat multiplier (cyc applies fp32 2x)
 constexpr int64_t kVectorComputeCost = 1;       // per vector SIMD step
 constexpr int64_t kVectorLanes = 256;           // elements per vector SIMD step
-constexpr int64_t kKernelFillCost = 10000;      // per-kernel pipeline fill
+constexpr int64_t kKernelFillCost = 10000;      // per-kernel pipeline fill (cycles)
+
+// Grounded pto-isa machine model (Ascend 910B / A2A3). Costs are in CORE CYCLES;
+// bandwidths are GiB/s per direction (pto-isa arch_config.hpp). See the solver's
+// types.h Problem::cube_freq_hz block for the exact formulas. These replace the
+// coarse kSlowMemoryBandwidth / kCubeComputeCost placeholders on the cube path.
+constexpr double kCubeFreqHz = 1.85e9;          // core clock (A2A3)
+constexpr double kBwGmL1   = 135.0;             // GM->L1 operand reload
+constexpr double kBwL0cGm  = 70.0;              // L0C->GM output store
+constexpr double kBwL1L0a  = 441.0;             // L1->L0A lhs extract
+constexpr double kBwL1L0b  = 220.5;             // L1->L0B rhs extract
+constexpr double kBwGmUb   = 100.9;             // GM->UB vector load
+constexpr double kBwUbGm   = 188.46;            // UB->GM vector store
+constexpr int64_t kL0TileM = 128;               // L0 GEMM base M (pto-isa oracle)
+constexpr int64_t kL0TileN = 256;               // L0 GEMM base N (pto-isa oracle)
 
 // Core counts + on-chip capacities. Defaults are the 910B values above; the
 // real ones are read from the configured backend's SoC (so the safe-UB cap and
@@ -195,6 +209,20 @@ bool IsComputeOp(const StmtPtr& stmt, CallPtr* out_call) {
   return ::OpType::Pointwise;  // elementwise / unary / cast / expand(broadcast)
 }
 
+// Map a PyPTO DataType to the solver's byte-aware DType. The grounded cube cost
+// is dtype-sensitive (fp32 is 4x fp16: kF halves AND cyc_per_repeat doubles), so
+// the precision must survive into the cost model. Unmapped types fall back to
+// FP32 (the conservative / heaviest cube cost).
+::DType MapSolverDType(const DataType& dt) {
+  if (dt == DataType::FP16) return ::DType::FP16;
+  if (dt == DataType::BF16) return ::DType::BF16;
+  if (dt == DataType::INT32) return ::DType::INT32;
+  if (dt == DataType::INT16) return ::DType::INT16;
+  if (dt == DataType::INT8) return ::DType::INT8;
+  if (dt == DataType::BOOL) return ::DType::BOOL;
+  return ::DType::FP32;  // FP32 + anything wider/unmapped
+}
+
 // Build the MLSys solver `Problem` (op+tensor DAG) from a function, reusing
 // `BuildStmtDependencyGraph` for sound op-dependency edges.
 class ProblemBuilder {
@@ -222,6 +250,17 @@ class ProblemBuilder {
     problem.vector_lanes = kVectorLanes;
     problem.kernel_fill_cost = kKernelFillCost;
     problem.ddr_atomic_add = true;  // 910B SetAtomicAdd (split-K partials merge in DDR)
+    // Grounded pto-isa machine model (cycles + per-direction GiB/s bandwidths +
+    // hierarchical L1<->L0 cube work). Activates the grounded cost path.
+    problem.cube_freq_hz = kCubeFreqHz;
+    problem.bw_gm_l1 = kBwGmL1;
+    problem.bw_l0c_gm = kBwL0cGm;
+    problem.bw_l1_l0a = kBwL1L0a;
+    problem.bw_l1_l0b = kBwL1L0b;
+    problem.bw_gm_ub = kBwGmUb;
+    problem.bw_ub_gm = kBwUbGm;
+    problem.l0_tile_m = kL0TileM;
+    problem.l0_tile_n = kL0TileN;
 
     // 1. In-direction params are graph-input tensors (Out/InOut params are
     //    output buffers, not inputs).
@@ -299,7 +338,7 @@ class ProblemBuilder {
     int64_t h = 0;
     ShapeWH(tt, &w, &h);
     const size_t idx = problem.tensors.size();
-    problem.tensors.push_back(::Tensor{w, h});
+    problem.tensors.push_back(::Tensor{w, h, MapSolverDType(tt->dtype_)});
     tensor_index_[raw] = idx;
     return idx;
   }
@@ -349,6 +388,20 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     for (size_t j = 0; j < p.ops[i].outputs.size(); ++j) f << (j ? "," : "") << p.ops[i].outputs[j];
     f << "]";
   }
+  f << "],\n  \"dtypes\": [";
+  for (size_t i = 0; i < nt; ++i) {
+    const char* s = "FP32";
+    switch (p.tensors[i].dtype) {
+      case ::DType::FP16:  s = "FP16";  break;
+      case ::DType::BF16:  s = "BF16";  break;
+      case ::DType::INT32: s = "INT32"; break;
+      case ::DType::INT16: s = "INT16"; break;
+      case ::DType::INT8:  s = "INT8";  break;
+      case ::DType::BOOL:  s = "BOOL";  break;
+      case ::DType::FP32:  s = "FP32";  break;
+    }
+    f << (i ? "," : "") << "\"" << s << "\"";
+  }
   f << "],\n  \"base_costs\": [";
   for (size_t i = 0; i < no; ++i) f << (i ? "," : "") << p.ops[i].base_cost;
   f << "],\n  \"op_types\": [";
@@ -356,7 +409,29 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     f << (i ? "," : "") << (p.ops[i].type == ::OpType::MatMul ? "\"MatMul\"" : "\"Pointwise\"");
   f << "],\n  \"fast_memory_capacity\": " << p.fast_memory_capacity
     << ",\n  \"slow_memory_bandwidth\": " << p.slow_memory_bandwidth << ",\n  \"native_granularity\": ["
-    << p.native_w << ", " << p.native_h << "]\n}\n";
+    << p.native_w << ", " << p.native_h << "]";
+  // 910B topology + grounded pto-isa machine model — emit so a dumped instance
+  // re-loads (io.cpp) into the SAME grounded cost path the pass solved with,
+  // not the single-context legacy fallback.
+  f << ",\n  \"num_cube_cores\": " << p.num_cube_cores
+    << ",\n  \"num_vector_cores\": " << p.num_vector_cores
+    << ",\n  \"cube_capacity\": " << p.cube_capacity
+    << ",\n  \"vec_capacity\": " << p.vec_capacity
+    << ",\n  \"l1_capacity\": " << p.l1_capacity
+    << ",\n  \"cube_compute_cost\": " << p.cube_compute_cost
+    << ",\n  \"vector_compute_cost\": " << p.vector_compute_cost
+    << ",\n  \"vector_lanes\": " << p.vector_lanes
+    << ",\n  \"kernel_fill_cost\": " << p.kernel_fill_cost
+    << ",\n  \"ddr_atomic_add\": " << (p.ddr_atomic_add ? "true" : "false")
+    << ",\n  \"cube_freq_hz\": " << p.cube_freq_hz
+    << ",\n  \"bw_gm_l1\": " << p.bw_gm_l1
+    << ",\n  \"bw_l0c_gm\": " << p.bw_l0c_gm
+    << ",\n  \"bw_l1_l0a\": " << p.bw_l1_l0a
+    << ",\n  \"bw_l1_l0b\": " << p.bw_l1_l0b
+    << ",\n  \"bw_gm_ub\": " << p.bw_gm_ub
+    << ",\n  \"bw_ub_gm\": " << p.bw_ub_gm
+    << ",\n  \"l0_tile_m\": " << p.l0_tile_m
+    << ",\n  \"l0_tile_n\": " << p.l0_tile_n << "\n}\n";
 }
 
 // Dump the solver's DECISION (fusion groups + per-group tile/latency/retain) as
@@ -423,6 +498,8 @@ struct SolverTile {
   int64_t w = 0;
   int64_t h = 0;
   int64_t k = 0;
+  int64_t split = 1;  // parallel split-K factor S (cores ganged per spatial tile; the
+                      // S partials over K/S each are atomic-added). 1 = no split-K.
 };
 
 ExprPtr MakeTuple2(ExprPtr a, ExprPtr b, const Span& sp) {
@@ -540,6 +617,76 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
 
   const Span sp = assign->span_;
   const std::string base = c_var->name_hint_;
+
+  // Parallel split-K: the solver ganged S cores per spatial tile (the cost model
+  // guarantees S | K/16, so S | K). Split K into S equal slices, each a partial
+  // matmul on a separate core, atomic-added into a ZERO-SEEDED output. The
+  // (spatial tile, k-slice) pairs form one flat parallel loop of num_m*num_n*S
+  // tasks (chunk=1 -> one task submission each); the S slices of a tile atomic-add
+  // into the SAME output region, so they merge correctly under concurrency
+  // (tensor.assemble atomic=1 -> pto.tstore atomicType=kAdd -> HW SetAtomicAdd).
+  if (tile.split > 1 && K % tile.split == 0) {
+    const int64_t S = tile.split;
+    const int64_t ksz = K / S;
+    const int64_t num_tiles = num_m * num_n;
+    auto& reg = OpRegistry::GetInstance();
+    auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
+
+    // Allocate the output, then ZERO it in a seed kernel: tensor.full must live inside
+    // an InCore block, and the seed is a barrier the S atomic-add partials accumulate
+    // onto. (TODO: tile the seed for outputs that exceed on-chip capacity.)
+    auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
+    auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
+    auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
+    auto zero = std::make_shared<ConstFloat>(0.0, dtype, sp);
+    auto z_call = reg.Create("tensor.full", {MakeIndexTuple({M, N}, sp), zero}, {{"dtype", dtype}}, sp);
+    auto z = std::make_shared<Var>(base + "_z", z_call->GetType(), sp);
+    auto seed_asm = reg.Create("tensor.assemble", {c_init, z, MakeTuple2(MakeIndex(0, sp), MakeIndex(0, sp), sp)}, sp);
+    auto c_seeded = std::make_shared<Var>(base + "_seeded", seed_asm->GetType(), sp);
+    auto seed_scope = std::make_shared<InCoreScopeStmt>(
+        std::nullopt, name + "_seed",
+        SeqStmts::Flatten(std::vector<StmtPtr>{std::make_shared<AssignStmt>(z, z_call, sp),
+                                               std::make_shared<AssignStmt>(c_seeded, seed_asm, sp)},
+                          sp),
+        sp);
+
+    // t in [0, num_tiles*S): ks = t % S (k-slice), sp_idx = t / S (spatial tile) ->
+    // mt = sp_idx / num_n, nt = sp_idx % num_n; offsets mi/ni and k_base = ks*ksz.
+    auto t = std::make_shared<Var>(base + "_t", index_type, sp);
+    auto ks = MakeFloorMod(t, MakeIndex(S, sp), sp);
+    auto sp_idx = MakeFloorDiv(t, MakeIndex(S, sp), sp);
+    auto mi = MakeMul(MakeFloorDiv(sp_idx, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
+    auto ni = MakeMul(MakeFloorMod(sp_idx, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+    auto k_base = MakeMul(ks, MakeIndex(ksz, sp), sp);
+    auto c_t = std::make_shared<IterArg>(base + "_ct", c_seeded->GetType(), c_seeded, sp);
+
+    // Per-task partial: pre-slice A/B to this k-slice, then the [h,w] tile matmul over
+    // it (k-pipelined within the slice). Pre-slicing keeps BuildTileMatmul unchanged.
+    auto a_ks = reg.Create("tensor.slice", {a, MakeIndexTuple({M, ksz}, sp), MakeTuple2(MakeIndex(0, sp), k_base, sp)}, sp);
+    auto a_ks_v = std::make_shared<Var>(base + "_aks", a_ks->GetType(), sp);
+    auto b_ks = reg.Create("tensor.slice", {b, MakeIndexTuple({ksz, N}, sp), MakeTuple2(k_base, MakeIndex(0, sp), sp)}, sp);
+    auto b_ks_v = std::make_shared<Var>(base + "_bks", b_ks->GetType(), sp);
+    auto part_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
+    auto part = std::make_shared<Var>(base + "_part", part_type, sp);
+    std::vector<StmtPtr> body{std::make_shared<AssignStmt>(a_ks_v, a_ks, sp),
+                              std::make_shared<AssignStmt>(b_ks_v, b_ks, sp)};
+    for (auto& s : BuildTileMatmul(a_ks_v, b_ks_v, mi, ni, h, w, ksz, tile.k, dtype, part, base, sp))
+      body.push_back(std::move(s));
+
+    // Atomic-add the partial into the output tile.
+    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_t), part, MakeTuple2(mi, ni, sp)}, {{"atomic", 1}}, sp);
+    auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
+    body.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
+    body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
+    StmtPtr loop_body = SeqStmts::Flatten(std::move(body), sp);
+
+    ChunkConfig chunk{MakeIndex(1, sp), ChunkPolicy::LeadingFull};
+    auto loop = std::make_shared<ForStmt>(t, MakeIndex(0, sp), MakeIndex(num_tiles * S, sp), MakeIndex(1, sp),
+                                          std::vector<IterArgPtr>{c_t}, loop_body, std::vector<VarPtr>{c_var}, sp,
+                                          ForKind::Parallel, chunk);
+    auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, loop, sp);
+    return std::vector<StmtPtr>{c_init_assign, seed_scope, scope};
+  }
 
   // The solver's tile is the whole output: no output loop — just the k-pipeline
   // (writing directly into the original output var), wrapped in one InCore kernel.
@@ -1048,8 +1195,10 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
         members += (j ? "," : "");
         members += builder.op_labels[gops[j]];
       }
+      const ::CostResult& cost = sol.step_cost(s);
       LOG_INFO << "  group[" << s << "] ops={" << members << "}  tile=" << step.config.w << "x"
                << step.config.h << (step.config.k ? ("x" + std::to_string(step.config.k)) : std::string())
+               << "  split=" << cost.parallel_split << " cores=" << cost.cores_used
                << "  latency=" << sol.step_latency(s);
     }
 
@@ -1066,7 +1215,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     std::unordered_map<const Stmt*, SolverTile> stmt_tile;  // group's [w,h,k] tile, for matmul tiling
     for (size_t s = 0; s < sol.num_steps(); ++s) {
       const ::TileConfig& cfg = sol.step(s).config;
-      const SolverTile tile{cfg.w, cfg.h, cfg.k};
+      const SolverTile tile{cfg.w, cfg.h, cfg.k, sol.step_cost(s).parallel_split};
       for (size_t op_idx : sol.step(s).subgraph.ops()) {
         const Stmt* stmt = builder.op_stmts[op_idx];
         stmt_group[stmt] = s;
