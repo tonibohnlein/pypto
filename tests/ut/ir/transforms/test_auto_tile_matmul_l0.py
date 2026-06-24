@@ -568,6 +568,59 @@ def _torch_codegen_matches_matmul(program, m_dim, n_dim, k_dim):
     return torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (out - expected).abs().max().item()
 
 
+def _assert_ssa_valid(after, label):
+    """Assert the rewritten program still satisfies ``SSAForm`` + ``UseAfterDef``.
+
+    The snake reuses one Left/Right extract Var across several ``tile.matmul``s,
+    so every reused operand must remain defined before all its uses — a check
+    that would catch a stale/dangling reuse the same way the reversed-store
+    regression catches a stale remap.
+    """
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.SSAForm)
+    props.insert(passes.IRProperty.UseAfterDef)
+    passes.verify_properties(props, after, label)
+
+
+def _assert_pipelined_full_k(after, n_pipeline_levels=2):
+    """Assert the full-K M/N path emitted its nested pipelined **interior**:
+    ``n_pipeline_levels`` ``pl.pipeline`` loops (the straight-line boundary tail,
+    if any, adds no pipelines), no K-loop accumulation, at least the interior
+    matmul + store, and every interior loop's trip count is exact (``full_m`` /
+    ``full_n`` are multiples of ``m`` / ``n`` by construction)."""
+    import re  # noqa: PLC0415
+
+    printed = ir.python_print(after)
+    assert printed.count("pl.pipeline(") == n_pipeline_levels, (
+        f"expected {n_pipeline_levels} pipelined interior loops, got {printed.count('pl.pipeline(')}"
+    )
+    assert "matmul_acc" not in printed, "full-K body is a single matmul, no accumulation"
+    assert printed.count("pl.tile.matmul(") >= 1 and printed.count("pl.tile.store(") >= 1, (
+        "the full-K schedule has at least the interior matmul + store (plus any boundary tail tiles)"
+    )
+    bounds = re.findall(r"pl\.pipeline\(0, (\d+), (\d+)", printed)
+    assert len(bounds) == n_pipeline_levels, "every pipeline loop should be pl.pipeline(0, stop, step, ...)"
+    for stop, step in bounds:
+        assert int(stop) % int(step) == 0, f"interior trip count must be exact: stop={stop} step={step}"
+
+
+def _full_k_stationary_operand(after) -> str:
+    """Which operand the full-K interior keeps stationary in the OUTER loop —
+    ``"A"`` (row-outer) or ``"B"`` (column-outer).  The stationary panel is the
+    single ``tile.extract`` emitted in the outer loop body, between the outer and
+    inner ``pl.pipeline`` headers: a ``Mem.Left`` extract ⇒ A-stationary, a
+    ``Mem.Right`` extract ⇒ B-stationary."""
+    lines = ir.python_print(after).splitlines()
+    outer_i = next(i for i, ln in enumerate(lines) if "pl.pipeline(" in ln)
+    inner_i = next(i for i in range(outer_i + 1, len(lines)) if "pl.pipeline(" in lines[i])
+    for i in range(outer_i + 1, inner_i):
+        if ".extract(" in lines[i] and "pl.Mem.Left" in lines[i]:
+            return "A"
+        if ".extract(" in lines[i] and "pl.Mem.Right" in lines[i]:
+            return "B"
+    raise AssertionError("no stationary extract found in the outer loop body")
+
+
 class TestAutoTileMatmulL0MNTiling:
     """M/N output tiling.
 
@@ -885,6 +938,288 @@ class TestAutoTileMatmulL0MNTiling:
         assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
             f"reversed def/store-chain mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
         )
+
+    def test_mn_tiling_full_k_row_outer_pipelined(self):
+        """Full-K (k == K) M/N tiling emits **nested pipelined loops** — outer rows,
+        inner cols, both ``ForKind::Pipeline`` stage=2 — so ``LowerPipelineLoops``
+        double-buffers both operand extracts (the pto-isa cost model's ~15% win).
+        The chooser runs in ``require_divisible`` mode so the tiles divide M/N
+        exactly (integer trip counts, no partial last iteration).
+
+        256×256 @ 64 BF16 on Ascend910B: output [256,256] FP32 overflows L0c; the
+        left panel (m×K) is not smaller than the right (K×n), so A is stationary
+        and the M-row loop is the outer one."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                lhs_mat: pl.Tile[[256, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [256, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 256], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        _assert_ssa_valid(After, "test_full_k_row_outer")
+        _assert_pipelined_full_k(After, n_pipeline_levels=2)
+        # The traversal-cost rule keeps A stationary (rows outer) here: the chosen
+        # tile makes row traversal no more expensive than column.
+        assert _full_k_stationary_operand(After) == "A", "expected A-stationary (row-outer) traversal"
+
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(256, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 256, dtype=torch.bfloat16)
+        out = torch.zeros(256, 256, dtype=torch.float32)
+        ns: dict = {}
+        exec(torch_codegen(After), ns)  # noqa: S102
+        ns["kernel"](a, b, out)
+        expected = torch.matmul(a, b).float()
+        assert torch.allclose(out, expected, rtol=1e-2, atol=1e-2), (
+            f"full-K pipelined mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+    def test_mn_tiling_full_k_column_outer_pipelined(self):
+        """When the right panel is the larger operand, B is stationary and the
+        N-col loop is the **outer** one (the column-stationary mirror of the row
+        case).  Same nested-pipelined-loop structure; the outer loop iterates over
+        N, the inner over M.
+
+        384×256 @ 64 BF16 on Ascend910B."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[384, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[384, 256], pl.FP32]],
+            ) -> pl.Tensor[[384, 256], pl.FP32]:
+                lhs_mat: pl.Tile[[384, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [384, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 256], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[384, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        _assert_ssa_valid(After, "test_full_k_column_outer")
+        _assert_pipelined_full_k(After, n_pipeline_levels=2)
+        # Here the right panel is the more expensive one and the grid makes column
+        # traversal cheaper, so the cost rule keeps B stationary (cols outer).
+        assert _full_k_stationary_operand(After) == "B", "expected B-stationary (column-outer) traversal"
+
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(384, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 256, dtype=torch.bfloat16)
+        out = torch.zeros(384, 256, dtype=torch.float32)
+        ns: dict = {}
+        exec(torch_codegen(After), ns)  # noqa: S102
+        ns["kernel"](a, b, out)
+        expected = torch.matmul(a, b).float()
+        assert torch.allclose(out, expected, rtol=1e-2, atol=1e-2), (
+            f"full-K column-outer mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+    def test_full_k_partial_boundary_is_peeled_into_tail(self):
+        """When the chosen tile does not divide M/N, the full-K emitter pipelines
+        the ``[0,full_m)×[0,full_n)`` interior (full m×n blocks) and peels the
+        L-shaped partial boundary into straight-line tail tiles — instead of
+        forcing a tiny exact-divisor tile.  272 = 16·17 (17 prime) would snap to a
+        16×16 tile (~289 sub-tiles) under exact-divisibility; here the chooser
+        picks freely (m=192, n=160 → 1×1 interior + 3 partial tail tiles) and the
+        partial boundary, including the [80×112] corner, is numerically exact."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[272, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 272], pl.BF16],
+                out: pl.Out[pl.Tensor[[272, 272], pl.FP32]],
+            ) -> pl.Tensor[[272, 272], pl.FP32]:
+                lhs_mat: pl.Tile[[272, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [272, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 272], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 272], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[272, 272], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        _assert_ssa_valid(After, "test_full_k_tail")
+        printed = ir.python_print(After)
+        # Interior pipelines (2 levels); the boundary is peeled into extra tiles.
+        assert printed.count("pl.pipeline(") == 2, "the interior must pipeline"
+        assert printed.count("pl.tile.matmul(") > 1, "the partial boundary must be peeled into tail tiles"
+        # No exact-divisor collapse: every interior tile step is large (≥ 64), not 16.
+        import re  # noqa: PLC0415
+
+        steps = [int(s) for s in re.findall(r"pl\.pipeline\(0, \d+, (\d+)", printed)]
+        assert steps and all(s >= 64 for s in steps), f"tile collapsed to a tiny divisor: steps={steps}"
+
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(272, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 272, dtype=torch.bfloat16)
+        out = torch.zeros(272, 272, dtype=torch.float32)
+        ns: dict = {}
+        exec(torch_codegen(After), ns)  # noqa: S102
+        ns["kernel"](a, b, out)
+        expected = torch.matmul(a, b).float()
+        assert torch.allclose(out, expected, rtol=1e-2, atol=1e-2), (
+            f"full-K tail mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+    def test_full_k_direct_gm_keeps_one_l0c_accumulator(self):
+        """Full-K direct-GM tiling keeps **one** L0C accumulator through the whole
+        pipeline.  The stage-2 inner loop sets ``overlap_stores=false`` so
+        ``CanonicalizeIOOrder`` schedules each store adjacent to its matmul
+        (``matmul_i, store_i, matmul_{i+1}, …``) instead of floating both stores
+        below both matmuls — the latter co-lives two ``[m,n]`` results
+        (``2·m·n·bytes_c``) while the chooser budgets a single L0C buffer
+        (``double_buffer_c=false``), overflowing allocation.
+
+        320×320 @ 64 BF16: chooser picks m=n=160 → C tile = 160·160·4 = 100 KB.
+        One accumulator (100 KB) fits L0C (128 KB); two (200 KB) would not.  The
+        full Default pipeline raised an Acc-overflow before the one-accumulator
+        schedule; here it must allocate cleanly, and the moving-operand extract
+        stays double-buffered (hoisted Load tier)."""
+
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[320, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 320], pl.BF16],
+                out: pl.Out[pl.Tensor[[320, 320], pl.FP32]],
+            ) -> pl.Tensor[[320, 320], pl.FP32]:
+                lhs_mat: pl.Tile[[320, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [320, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 320], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 320], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[320, 320], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        # The full Default pipeline must allocate without an L0C (Acc) overflow.
+        # (Pre-fix this raised "Acc buffer usage (204800 bytes) exceeds platform
+        # limit (131072 bytes)" — 2× the 100 KB C tile.)
+        result = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+        assert result is not None
+
+        # Structural check on the one-accumulator schedule: after pipeline lowering
+        # + IO canonicalization the operand extracts hoist (double-buffered) and
+        # each store interleaves with its matmul (one C), not floating to the end.
+        prog = passes.auto_tile_matmul_l0()(Before)
+        prog = passes.infer_tile_memory_space()(prog)
+        prog = passes.lower_pipeline_loops()(prog)
+        prog = passes.canonicalize_io_order()(prog)
+        seq = []
+        for line in ir.python_print(prog).splitlines():
+            s = line.strip()
+            if ".extract(" in s and ("Left" in s or "Right" in s):
+                seq.append("extract")
+            elif "matmul" in s and "=" in s:
+                seq.append("matmul")
+            elif ".store(" in s and "=" in s:
+                seq.append("store")
+        # Every matmul is immediately followed by its store (interleaved one-C),
+        # and no two matmuls are adjacent (which would mean two live accumulators).
+        matmul_idxs = [i for i, op in enumerate(seq) if op == "matmul"]
+        assert matmul_idxs, "expected matmuls in the lowered full-K schedule"
+        for i in matmul_idxs:
+            assert i + 1 < len(seq) and seq[i + 1] == "store", (
+                f"matmul at {i} not immediately followed by its store (two-accumulator schedule): {seq}"
+            )
+
+    @pytest.mark.parametrize(
+        ("M", "N"),
+        [
+            (320, 320),  # clean divisible interior, no tail
+            (272, 272),  # 272 = 16·17 → 1×1 interior + partial-boundary tail tiles
+        ],
+    )
+    def test_full_k_direct_gm_generates_valid_pto(self, M: int, N: int):
+        """Direct-store full-K tiling lowers to valid PTO MLIR (PTOCodegen
+        succeeds) — for both a clean divisible grid and a shape whose partial
+        boundary is peeled into a straight-line tail (the tail reuses the same
+        extract/matmul/store primitives, so it must also codegen)."""
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+        from pypto.pypto_core import codegen as _codegen_core  # noqa: PLC0415
+        from pypto.pypto_core import ir as _ir_core  # noqa: PLC0415
+
+        K = 64
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.BF16],
+                rhs: pl.Tensor[[K, N], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_mat: pl.Tile[[M, K], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [M, K], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[K, N], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[M, N], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        prog = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+        generated = False
+        for _name, func in prog.functions.items():
+            mlir = _codegen_core.PTOCodegen().generate(_ir_core.Program([func], func.name, prog.span))
+            if "pto." in mlir or "func.func" in mlir:
+                generated = True
+        assert generated, "direct-store full-K must generate valid PTO MLIR"
 
 
 class TestAutoTileMatmulL0Skips:

@@ -114,13 +114,19 @@ struct IOCategoryOps {
   }
 };
 
-IOCategory CategorizeStmt(const StmtPtr& stmt, const IOCategoryOps& ops) {
+/// @param overlap_stores When false, store-like ops are categorized as
+///   ``TileCompute`` instead of ``Store`` so the (category, index) sort keeps
+///   each store adjacent to its producing compute rather than floating it below
+///   the next iteration's compute — the one-accumulator schedule. See
+///   ``kPipelineOverlapStoresAttr``.
+IOCategory CategorizeStmt(const StmtPtr& stmt, const IOCategoryOps& ops, bool overlap_stores) {
+  const IOCategory store_tier = overlap_stores ? IOCategory::Store : IOCategory::TileCompute;
   if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
     if (auto call = std::dynamic_pointer_cast<const Call>(assign->value_)) {
       // tile.read keeps Load even though its LHS is scalar — it's I/O against
       // a tile and belongs in the load tier alongside tile.load.
       if (ops.IsLoadLike(call->op_)) return IOCategory::Load;
-      if (ops.IsStoreLike(call->op_)) return IOCategory::Store;
+      if (ops.IsStoreLike(call->op_)) return store_tier;
       // tile.extract is load-like only when it represents an L1→L0 transfer
       // (Mat source, Left/Right target). Other extract shapes stay in
       // TileCompute — see IsL1ToL0ExtractCall doc for rationale.
@@ -136,7 +142,7 @@ IOCategory CategorizeStmt(const StmtPtr& stmt, const IOCategoryOps& ops) {
   }
   if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
     if (auto call = std::dynamic_pointer_cast<const Call>(eval->expr_)) {
-      if (ops.IsStoreLike(call->op_)) return IOCategory::Store;
+      if (ops.IsStoreLike(call->op_)) return store_tier;
     }
   }
   return IOCategory::TileCompute;
@@ -185,16 +191,27 @@ class CanonicalizeIOOrderMutator : public IRMutator {
   /// ForKind::Pipeline loops downstream of CanonicalizeIOOrder.
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     const bool is_pipeline = (op->kind_ == ForKind::Pipeline);
-    if (is_pipeline) inside_pipeline_depth_++;
+    const bool saved_overlap = overlap_stores_;
+    if (is_pipeline) {
+      inside_pipeline_depth_++;
+      // Default true: stores float to the Store tier (output ping-pong). A loop
+      // opts into the one-accumulator schedule with overlap_stores=false.
+      overlap_stores_ = op->GetAttr<bool>(kPipelineOverlapStoresAttr, true);
+    }
     auto visited = IRMutator::VisitStmt_(op);
-    if (is_pipeline) inside_pipeline_depth_--;
+    if (is_pipeline) {
+      inside_pipeline_depth_--;
+      overlap_stores_ = saved_overlap;
+    }
 
     if (!is_pipeline) return visited;
     auto visited_for = std::dynamic_pointer_cast<const ForStmt>(visited);
     if (!visited_for) return visited;
     auto demoted = MutableCopy(visited_for);
     demoted->kind_ = ForKind::Sequential;
-    demoted->attrs_ = StripAttr(demoted->attrs_, kPipelineStagesAttr);
+    // Strip both pipeline markers — they have served their purpose (gated this
+    // reorder) and must not survive past this pass.
+    demoted->attrs_ = StripAttr(StripAttr(demoted->attrs_, kPipelineStagesAttr), kPipelineOverlapStoresAttr);
     return demoted;
   }
 
@@ -216,6 +233,11 @@ class CanonicalizeIOOrderMutator : public IRMutator {
   /// on exit. Non-zero when a pipeline loop is an ancestor of the currently
   /// visited SeqStmts. Supports nested pipelines (each level increments).
   int inside_pipeline_depth_ = 0;
+
+  /// Store-overlap policy of the nearest enclosing `ForKind::Pipeline` loop
+  /// (saved/restored across nested pipelines). False ⇒ keep stores in the
+  /// compute tier (one-accumulator schedule). See `kPipelineOverlapStoresAttr`.
+  bool overlap_stores_ = true;
 
   /// Stable, priority-aware topological sort.
   ///
@@ -248,7 +270,7 @@ class CanonicalizeIOOrderMutator : public IRMutator {
     std::unordered_map<const Stmt*, size_t> idx_of;
     idx_of.reserve(sort_count);
     for (size_t i = 0; i < sort_count; ++i) {
-      cats[i] = CategorizeStmt(stmts[i], io_ops_);
+      cats[i] = CategorizeStmt(stmts[i], io_ops_, overlap_stores_);
       idx_of.emplace(stmts[i].get(), i);
     }
 
