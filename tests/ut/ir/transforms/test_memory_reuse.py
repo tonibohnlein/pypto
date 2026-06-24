@@ -950,6 +950,80 @@ class TestViewOps:
         # Each member keeps its own 64-byte size, not the target's 512.
         assert members["r0"][2] == 64 and members["r1"][2] == 64
 
+    def test_loop_carry_retarget_keeps_slice_view_aliased(self):
+        """A sub-region view must follow its input when the input is loop-carry
+        retargeted (issue #1776 follow-up).
+
+        ``ti`` is reloaded each iteration and yielded back, so the loop-carry
+        retargeter (``PropagateFromForStmt``) aligns it onto the iter_arg buffer
+        (``t0``'s). The ``si = slice(ti)`` sub-region view is an off-chain
+        consumer: without forward propagation its declared MemRef stays on
+        ``ti``'s original (now-orphaned) buffer, so the view would read a buffer
+        the reload never wrote. After the fix ``si`` re-anchors onto ``ti``'s
+        retargeted buffer.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                inp: pl.Tensor[[16, 16], pl.FP32],
+                out_acc: pl.Out[pl.Tensor[[16, 8], pl.FP32]],
+            ) -> pl.Tensor[[16, 8], pl.FP32]:
+                t0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(inp, [0, 0], [16, 16])
+                s0: pl.Tile[[16, 8], pl.FP32, pl.MemorySpace.Vec] = pl.slice(t0, [16, 8], [0, 0])
+                # Independent accumulator so t0's buffer is free for the reload to reuse.
+                acc0: pl.Tile[[16, 8], pl.FP32, pl.MemorySpace.Vec] = pl.add(s0, s0)
+                for _i, (t_c, acc_c) in pl.range(0, 4, init_values=(t0, acc0)):
+                    ti: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(inp, [0, 0], [16, 16])
+                    si: pl.Tile[[16, 8], pl.FP32, pl.MemorySpace.Vec] = pl.slice(ti, [16, 8], [0, 0])
+                    acc_n: pl.Tile[[16, 8], pl.FP32, pl.MemorySpace.Vec] = pl.add(acc_c, si)
+                    _t_y, acc_y = pl.yield_(ti, acc_n)
+                result: pl.Tensor[[16, 8], pl.FP32] = pl.store(acc_y, [0, 0], out_acc)
+                return result
+
+        bases = _collect_tile_memref_bases(_run_pipeline(Before))
+        # The scenario is real: the reload retargeted onto the carried buffer.
+        assert bases["ti"] == bases["t0"], "expected loop-carry retarget of the reload"
+        # The fix: the sub-region view follows its retargeted input (not orphaned).
+        assert bases["si"] == bases["ti"], (
+            f"slice view orphaned: si on {bases['si']} but its input ti on {bases['ti']}"
+        )
+
+    def test_loop_carry_retarget_keeps_reshape_view_aliased(self):
+        """Full-alias view (reshape) variant of the loop-carry orphan guard.
+
+        Same shape as the slice test but the off-chain view is a whole-buffer
+        ``reshape`` (the pure-alias path shared with ``tile.transpose_view``,
+        the original #1776 regression). It must also follow the retargeted input.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                inp: pl.Tensor[[16, 16], pl.FP32],
+                out_acc: pl.Out[pl.Tensor[[256, 1], pl.FP32]],
+            ) -> pl.Tensor[[256, 1], pl.FP32]:
+                t0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(inp, [0, 0], [16, 16])
+                r0: pl.Tile[[256, 1], pl.FP32, pl.MemorySpace.Vec] = pl.reshape(t0, [256, 1])
+                acc0: pl.Tile[[256, 1], pl.FP32, pl.MemorySpace.Vec] = pl.add(r0, r0)
+                for _i, (t_c, acc_c) in pl.range(0, 4, init_values=(t0, acc0)):
+                    ti: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(inp, [0, 0], [16, 16])
+                    ri: pl.Tile[[256, 1], pl.FP32, pl.MemorySpace.Vec] = pl.reshape(ti, [256, 1])
+                    acc_n: pl.Tile[[256, 1], pl.FP32, pl.MemorySpace.Vec] = pl.add(acc_c, ri)
+                    _t_y, acc_y = pl.yield_(ti, acc_n)
+                result: pl.Tensor[[256, 1], pl.FP32] = pl.store(acc_y, [0, 0], out_acc)
+                return result
+
+        bases = _collect_tile_memref_bases(_run_pipeline(Before))
+        assert bases["ti"] == bases["t0"], "expected loop-carry retarget of the reload"
+        assert bases["ri"] == bases["ti"], (
+            f"reshape view orphaned: ri on {bases['ri']} but its input ti on {bases['ti']}"
+        )
+
     def test_reshape_chain_shares_memref(self):
         """Chained reshapes should all share the same MemRef."""
 
@@ -2244,6 +2318,85 @@ class TestControlFlow:
                 )
                 result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
                     tile_e, [0, 0], output
+                )
+                return result
+
+        After = _run_pipeline(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_if_phi_read_after_branch_blocks_reuse(self):
+        """An scf.if return_var (phi) read *after* the branch keeps its buffer
+        live; a later temporary must not be packed onto it.
+
+        Regression test for issue #1821: the lifetime analyzer did not track
+        IfStmt return_vars, so reads of a phi after the if were dropped and its
+        buffer's live range collapsed at the yield.  A later temporary (`e`) was
+        then packed onto the still-live phi buffer, corrupting the value `f`
+        reads (manifested as ~17.5% wrong output in the dsv4 prefill_sparse_attn
+        merge_norm kernel).
+
+        Here `a` stays live across the whole body (used by `e` and `g`), so its
+        buffer is occupied and `e` would otherwise fall back onto the phi's
+        buffer.  Pre-fix, `e` took the phi buffer `mem_vec_3` (clobbering `r`
+        before `f = r + e` read it); post-fix, `e` gets its own `mem_vec_6`.  The
+        branch-local sources `b`/`c` still share one buffer (`mem_vec_3`),
+        proving the fix keeps legitimate mutually-exclusive branch sharing.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32],
+                cond_param: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(input_a, [0, 0], [64, 64])
+                if cond_param < 2:
+                    b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(a, a)
+                    r = pl.yield_(b)
+                else:
+                    c: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.mul(a, a)
+                    r = pl.yield_(c)
+                e: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(a, a)
+                f: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(r, e)
+                g: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(a, f)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(g, [0, 0], output)
+                return result
+
+        # a → mem_vec_2 (live to the end). b/c/r (phi) share mem_vec_3. e must
+        # NOT take mem_vec_3 (the phi is live until f reads it) → e gets mem_vec_6.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                cond_param: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
+                )
+                if cond_param < 2:
+                    b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.add(
+                        a, a
+                    )
+                    r: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.yield_(b)
+                else:
+                    c: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.mul(
+                        a, a
+                    )
+                    r: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.yield_(c)
+                e: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = pl.tile.add(a, a)
+                f: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.add(r, e)
+                g: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(a, f)
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                    g, [0, 0], output
                 )
                 return result
 
