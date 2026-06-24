@@ -1190,6 +1190,16 @@ class TestAutoTileMatmulL0MatScratch:
         assert "c__tile_mat" in printed and printed.count("pl.tile.assemble(") == 4, (
             "full-K producer must assemble its 2×2 grid into one Mat scratch"
         )
+        # The snake operand-reuse optimization carries over to the Mat-scratch
+        # placement: the 2×2 producer grid issues P·Q+1 = 5 operand extracts
+        # (2 Left + 3 Right), not 2·P·Q = 8 — A held across each row, B reused at
+        # the row turn — identical to the direct-store snake, just assembling.
+        prod_left = printed.count("pl.tile.extract(a__ssa_v0_mat")
+        prod_right = printed.count("pl.tile.extract(b__ssa_v0_mat")
+        assert (prod_left, prod_right) == (2, 3), (
+            f"full-K Mat-scratch must reuse the snake (expected 2 Left + 3 Right producer extracts, "
+            f"got {prod_left}+{prod_right})"
+        )
         _assert_ssa_valid(After, "test_full_k_mat_scratch")
 
         torch = pytest.importorskip("torch")
