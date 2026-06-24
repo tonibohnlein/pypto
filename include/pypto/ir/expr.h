@@ -650,6 +650,35 @@ inline std::vector<std::pair<std::string, std::any>> WithArgDirectionsAttr(
 }
 
 /**
+ * @brief Reserved attr key for atomic-add (commutative) output arg positions.
+ *
+ * Set by DeriveCallDirections on a kernel CALL whose callee atomic-adds into the
+ * corresponding output arg (e.g. a split-K partial: `tile.store(..., atomic=Add)`).
+ * AutoDeriveTaskDependencies reads it to exempt these commutative writes from the
+ * serializing WAW edges they would otherwise get (the S partials into one buffer
+ * must stay concurrent). Value type: `std::vector<int32_t>` (arg indices) — the type
+ * the DSL attr-value codec round-trips.
+ */
+inline constexpr const char* kAttrAtomicInoutArgs = "atomic_inout_args";
+
+/**
+ * @brief Build a copy of `attrs` with `kAttrAtomicInoutArgs` set to `args`.
+ *
+ * Replaces an existing entry if present; otherwise appends.
+ */
+inline std::vector<std::pair<std::string, std::any>> WithAtomicInoutArgsAttr(
+    std::vector<std::pair<std::string, std::any>> attrs, std::vector<int32_t> args) {
+  for (auto& [k, v] : attrs) {
+    if (k == kAttrAtomicInoutArgs) {
+      v = std::move(args);
+      return attrs;
+    }
+  }
+  attrs.emplace_back(kAttrAtomicInoutArgs, std::move(args));
+  return attrs;
+}
+
+/**
  * @brief Reserved attr key for per-arg ``ArgDirection::NoDep`` overrides
  *
  * The parser sets this when the user wraps a kernel-call argument in
