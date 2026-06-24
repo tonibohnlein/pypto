@@ -60,6 +60,38 @@ std::vector<ParamDirection> ResolveCalleeDirections(const ProgramPtr& program, c
   return callee->param_directions_;
 }
 
+/// True if `expr` is an atomic-add store/assemble (`tile.store` / `tensor.assemble`
+/// with `atomic != 0`) — a commutative write into global memory.
+bool ExprIsAtomicStore(const ExprPtr& expr) {
+  auto call = As<Call>(expr);
+  if (!call || !call->op_) return false;
+  const std::string& n = call->op_->name_;
+  if (n != "tile.store" && n != "tensor.assemble") return false;
+  return call->GetKwarg<int>("atomic", 0) != 0;
+}
+
+/// True if `stmt`'s subtree contains an atomic-add store — used to detect a callee
+/// that atomic-adds into its output param (e.g. a split-K partial kernel).
+bool BodyHasAtomicStore(const StmtPtr& stmt) {
+  if (!stmt) return false;
+  if (auto seq = As<SeqStmts>(stmt)) {
+    for (const auto& s : seq->stmts_)
+      if (BodyHasAtomicStore(s)) return true;
+    return false;
+  }
+  if (auto for_stmt = As<ForStmt>(stmt)) return BodyHasAtomicStore(for_stmt->body_);
+  if (auto while_stmt = As<WhileStmt>(stmt)) return BodyHasAtomicStore(while_stmt->body_);
+  if (auto if_stmt = As<IfStmt>(stmt)) {
+    if (BodyHasAtomicStore(if_stmt->then_body_)) return true;
+    return if_stmt->else_body_.has_value() && if_stmt->else_body_.value() &&
+           BodyHasAtomicStore(if_stmt->else_body_.value());
+  }
+  if (auto scope = std::dynamic_pointer_cast<const ScopeStmt>(stmt)) return BodyHasAtomicStore(scope->body_);
+  if (auto assign = As<AssignStmt>(stmt)) return ExprIsAtomicStore(assign->value_);
+  if (auto eval = As<EvalStmt>(stmt)) return ExprIsAtomicStore(eval->expr_);
+  return false;
+}
+
 /// Uniform view of a call-like expression's positional args for direction
 /// analysis. Both Call and Submit use identity positional mapping:
 /// args_[i] ↔ callee->params_[i].
@@ -333,7 +365,25 @@ class CallDirectionMutator : public IRMutator {
     // params (those materialise as return-tuple elements).
     auto dirs = DeriveDirectionsForCallLike(call, op.get(), /*is_submit=*/false);
     if (!dirs) return call;
+    // Atomic-add output detection (first cut: single-output callees). If the callee
+    // atomic-adds into its lone output arg (a split-K partial), tag that arg so
+    // AutoDeriveTaskDependencies can keep the commutative writes concurrent instead
+    // of serializing them with WAW edges. Generalize the store-target -> param trace
+    // for multi-output kernels later.
+    std::vector<int32_t> atomic_args;
+    {
+      std::vector<int32_t> outs;
+      for (size_t i = 0; i < dirs->size(); ++i) {
+        const ArgDirection d = (*dirs)[i];
+        if (d == ArgDirection::Output || d == ArgDirection::OutputExisting || d == ArgDirection::InOut)
+          outs.push_back(static_cast<int32_t>(i));
+      }
+      auto callee = program_ ? program_->GetFunction(call->op_->name_) : nullptr;
+      if (outs.size() == 1 && callee && BodyHasAtomicStore(callee->body_)) atomic_args = std::move(outs);
+    }
     auto new_attrs = WithArgDirectionsAttr(call->attrs_, std::move(*dirs));
+    if (!atomic_args.empty())
+      new_attrs = WithAtomicInoutArgsAttr(std::move(new_attrs), std::move(atomic_args));
     return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, std::move(new_attrs),
                                   call->GetType(), call->span_);
   }
