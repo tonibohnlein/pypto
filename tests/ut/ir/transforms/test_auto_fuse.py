@@ -182,6 +182,7 @@ class TestAutoFuse:
         assert "chunked_loop_optimizer" in body  # one fused AutoInCore scope
         assert body.count("pl.tensor.matmul(") == 2  # both matmuls in the same per-tile body
         assert "_tband" in body  # the on-chip intermediate (T never touches DDR)
+        assert body.count("pl.parallel(") == 1 and "chunk=1" in body  # one flat tile loop -> N cross-core submissions
 
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]

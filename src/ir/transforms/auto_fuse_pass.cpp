@@ -564,38 +564,35 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
   auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
 
-  // Loop vars are TILE INDICES (0..num_m / 0..num_n); element offset = idx * tile.
-  auto mt = std::make_shared<Var>(base + "_mt", index_type, sp);
-  auto nt = std::make_shared<Var>(base + "_nt", index_type, sp);
-  auto mi = MakeMul(mt, MakeIndex(h, sp), sp);
-  auto ni = MakeMul(nt, MakeIndex(w, sp), sp);
-  auto c_m = std::make_shared<IterArg>(base + "_cm", c_init->GetType(), c_init, sp);
-  auto c_n = std::make_shared<IterArg>(base + "_cn", c_init->GetType(), c_m, sp);
+  // A SINGLE flat parallel loop over the num_m*num_n output tiles: t in
+  // [0, num_m*num_n), with element offsets mi = (t / num_n)*h, ni = (t % num_n)*w.
+  // chunk=1 makes each tile one chunk, so SplitChunkedLoops emits the OUTER
+  // (per-tile) loop into the orchestration as N task submissions of one kernel and
+  // the INNER (trip 1) as the per-tile kernel — distributed across cores (chunk =
+  // tile-count would collapse the OUTER to trip-1, serializing all tiles on one
+  // core). The loop is flattened to 1D (not nested 2D) so the orchestration has a
+  // single loop var; nested chunk-outer loops collide in the orchestration codegen's
+  // variable naming.
+  auto t = std::make_shared<Var>(base + "_t", index_type, sp);
+  auto mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
+  auto ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+  auto c_t = std::make_shared<IterArg>(base + "_ct", c_init->GetType(), c_init, sp);
 
-  // Inner N-loop body: compute the [h,w] tile (k-pipeline) and assemble into c.
+  // Per-tile body: compute the [h,w] tile (k-pipeline) and assemble into the output.
   auto tile_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
   auto tile_var = std::make_shared<Var>(base + "_tile", tile_type, sp);
-  std::vector<StmtPtr> n_body_stmts = BuildTileMatmul(a, b, mi, ni, h, w, K, tile.k, dtype, tile_var, base, sp);
-  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_n), tile_var, MakeTuple2(mi, ni, sp)}, sp);
+  std::vector<StmtPtr> body_stmts = BuildTileMatmul(a, b, mi, ni, h, w, K, tile.k, dtype, tile_var, base, sp);
+  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_t), tile_var, MakeTuple2(mi, ni, sp)}, sp);
   auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
-  n_body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
-  n_body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
-  StmtPtr n_body = SeqStmts::Flatten(std::move(n_body_stmts), sp);
+  body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
+  body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
+  StmtPtr loop_body = SeqStmts::Flatten(std::move(body_stmts), sp);
 
-  auto c_row = std::make_shared<Var>(base + "_crow", c_init->GetType(), sp);
-  ChunkConfig n_chunk{MakeIndex(num_n, sp), ChunkPolicy::LeadingFull};
-  auto n_loop = std::make_shared<ForStmt>(nt, MakeIndex(0, sp), MakeIndex(num_n, sp), MakeIndex(1, sp),
-                                          std::vector<IterArgPtr>{c_n}, n_body, std::vector<VarPtr>{c_row}, sp,
-                                          ForKind::Parallel, n_chunk);
-
-  StmtPtr m_body = SeqStmts::Flatten(
-      std::vector<StmtPtr>{n_loop, std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_row}, sp)}, sp);
-  ChunkConfig m_chunk{MakeIndex(num_m, sp), ChunkPolicy::LeadingFull};
-  auto m_loop = std::make_shared<ForStmt>(mt, MakeIndex(0, sp), MakeIndex(num_m, sp), MakeIndex(1, sp),
-                                          std::vector<IterArgPtr>{c_m}, m_body, std::vector<VarPtr>{c_var}, sp,
-                                          ForKind::Parallel, m_chunk);
-
-  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, m_loop, sp);
+  ChunkConfig chunk{MakeIndex(1, sp), ChunkPolicy::LeadingFull};
+  auto loop = std::make_shared<ForStmt>(t, MakeIndex(0, sp), MakeIndex(num_m * num_n, sp), MakeIndex(1, sp),
+                                        std::vector<IterArgPtr>{c_t}, loop_body, std::vector<VarPtr>{c_var}, sp,
+                                        ForKind::Parallel, chunk);
+  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, loop, sp);
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
@@ -681,12 +678,14 @@ std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr
   auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
   auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
   auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
-  auto mt = std::make_shared<Var>(base + "_mt", index_type, sp);
-  auto nt = std::make_shared<Var>(base + "_nt", index_type, sp);
-  auto mi = MakeMul(mt, MakeIndex(h, sp), sp);
-  auto ni = MakeMul(nt, MakeIndex(w, sp), sp);
-  auto c_m = std::make_shared<IterArg>(base + "_cm", c_init->GetType(), c_init, sp);
-  auto c_n = std::make_shared<IterArg>(base + "_cn", c_init->GetType(), c_m, sp);
+  // A single flat parallel loop over the num_m*num_n tiles (see TileMatmul): t in
+  // [0, num_m*num_n), offsets mi = (t / num_n)*h, ni = (t % num_n)*w. chunk=1 -> one
+  // task submission per tile; 1D (not nested) avoids the orchestration codegen's
+  // nested-loop variable-name collision.
+  auto t = std::make_shared<Var>(base + "_t", index_type, sp);
+  auto mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
+  auto ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+  auto c_t = std::make_shared<IterArg>(base + "_ct", c_init->GetType(), c_init, sp);
 
   // Per-tile body: replay the op chain at element offset [mi,ni]. Each op's operands
   // are mapped to tile-shaped values — an intermediate uses its on-chip tile result,
@@ -734,24 +733,17 @@ std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr
     if (a == out_stmt) tile_var = res;
   }
 
-  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_n), tile_var, MakeTuple2(mi, ni, sp)}, sp);
+  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_t), tile_var, MakeTuple2(mi, ni, sp)}, sp);
   auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
   body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
   body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
-  StmtPtr n_body = SeqStmts::Flatten(std::move(body_stmts), sp);
+  StmtPtr loop_body = SeqStmts::Flatten(std::move(body_stmts), sp);
 
-  auto c_row = std::make_shared<Var>(base + "_crow", c_init->GetType(), sp);
-  ChunkConfig n_chunk{MakeIndex(num_n, sp), ChunkPolicy::LeadingFull};
-  auto n_loop = std::make_shared<ForStmt>(nt, MakeIndex(0, sp), MakeIndex(num_n, sp), MakeIndex(1, sp),
-                                          std::vector<IterArgPtr>{c_n}, n_body, std::vector<VarPtr>{c_row}, sp,
-                                          ForKind::Parallel, n_chunk);
-  StmtPtr m_body = SeqStmts::Flatten(
-      std::vector<StmtPtr>{n_loop, std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_row}, sp)}, sp);
-  ChunkConfig m_chunk{MakeIndex(num_m, sp), ChunkPolicy::LeadingFull};
-  auto m_loop = std::make_shared<ForStmt>(mt, MakeIndex(0, sp), MakeIndex(num_m, sp), MakeIndex(1, sp),
-                                          std::vector<IterArgPtr>{c_m}, m_body, std::vector<VarPtr>{c_var}, sp,
-                                          ForKind::Parallel, m_chunk);
-  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, m_loop, sp);
+  ChunkConfig chunk{MakeIndex(1, sp), ChunkPolicy::LeadingFull};
+  auto loop = std::make_shared<ForStmt>(t, MakeIndex(0, sp), MakeIndex(num_m * num_n, sp), MakeIndex(1, sp),
+                                        std::vector<IterArgPtr>{c_t}, loop_body, std::vector<VarPtr>{c_var}, sp,
+                                        ForKind::Parallel, chunk);
+  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, loop, sp);
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
@@ -840,34 +832,30 @@ std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1,
   auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
   auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
   auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
-  auto mt = std::make_shared<Var>(base + "_mt", index_type, sp);
-  auto nt = std::make_shared<Var>(base + "_nt", index_type, sp);
-  auto mi = MakeMul(mt, MakeIndex(h, sp), sp);
-  auto ni = MakeMul(nt, MakeIndex(w, sp), sp);
-  auto c_m = std::make_shared<IterArg>(base + "_cm", c_init->GetType(), c_init, sp);
-  auto c_n = std::make_shared<IterArg>(base + "_cn", c_init->GetType(), c_m, sp);
+  // A single flat parallel loop over the num_m*num_n tiles (see TileMatmul): t in
+  // [0, num_m*num_n), offsets mi = (t / num_n)*h, ni = (t % num_n)*w. chunk=1 -> one
+  // task submission per tile; 1D (not nested) avoids the orchestration codegen's
+  // nested-loop variable-name collision.
+  auto t = std::make_shared<Var>(base + "_t", index_type, sp);
+  auto mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
+  auto ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+  auto c_t = std::make_shared<IterArg>(base + "_ct", c_init->GetType(), c_init, sp);
 
+  // Per-tile body: the inner serial chain (T_band on-chip), assembled into the output.
   auto tile_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
   auto tile_var = std::make_shared<Var>(base + "_tile", tile_type, sp);
-  std::vector<StmtPtr> n_body_stmts = build_chain(mi, ni, tile_var);
-  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_n), tile_var, MakeTuple2(mi, ni, sp)}, sp);
+  std::vector<StmtPtr> body_stmts = build_chain(mi, ni, tile_var);
+  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_t), tile_var, MakeTuple2(mi, ni, sp)}, sp);
   auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
-  n_body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
-  n_body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
-  StmtPtr n_body = SeqStmts::Flatten(std::move(n_body_stmts), sp);
+  body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
+  body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
+  StmtPtr loop_body = SeqStmts::Flatten(std::move(body_stmts), sp);
 
-  auto c_row = std::make_shared<Var>(base + "_crow", c_init->GetType(), sp);
-  ChunkConfig n_chunk{MakeIndex(num_n, sp), ChunkPolicy::LeadingFull};
-  auto n_loop = std::make_shared<ForStmt>(nt, MakeIndex(0, sp), MakeIndex(num_n, sp), MakeIndex(1, sp),
-                                          std::vector<IterArgPtr>{c_n}, n_body, std::vector<VarPtr>{c_row}, sp,
-                                          ForKind::Parallel, n_chunk);
-  StmtPtr m_body = SeqStmts::Flatten(
-      std::vector<StmtPtr>{n_loop, std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_row}, sp)}, sp);
-  ChunkConfig m_chunk{MakeIndex(num_m, sp), ChunkPolicy::LeadingFull};
-  auto m_loop = std::make_shared<ForStmt>(mt, MakeIndex(0, sp), MakeIndex(num_m, sp), MakeIndex(1, sp),
-                                          std::vector<IterArgPtr>{c_m}, m_body, std::vector<VarPtr>{c_var}, sp,
-                                          ForKind::Parallel, m_chunk);
-  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, m_loop, sp);
+  ChunkConfig chunk{MakeIndex(1, sp), ChunkPolicy::LeadingFull};
+  auto loop = std::make_shared<ForStmt>(t, MakeIndex(0, sp), MakeIndex(num_m * num_n, sp), MakeIndex(1, sp),
+                                        std::vector<IterArgPtr>{c_t}, loop_body, std::vector<VarPtr>{c_var}, sp,
+                                        ForKind::Parallel, chunk);
+  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, loop, sp);
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
