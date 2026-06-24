@@ -56,7 +56,10 @@ class TestAutoFuse:
         After = passes.auto_fuse()(Before)
         body = next(f for _, f in After.functions.items() if f.name == "mm").as_python()
         assert "pl.auto_chunk" in body  # AutoInCore chunked scope
-        assert "pl.parallel(" in body and "chunk=" in body  # cross-core tile distribution
+        # A SINGLE flat tile loop with chunk=1 — so each tile lowers to one cross-core
+        # task submission of one kernel (chunk=tile-count would serialize them on one
+        # core; a nested 2D loop would collide in the orchestration codegen's naming).
+        assert body.count("pl.parallel(") == 1 and "chunk=1" in body
         assert "pl.pipeline(" in body and "stage=2" in body  # the per-tile k-pipeline
         assert "pl.tensor.matmul_acc(" in body  # the per-strip accumulation
         assert "pl.tensor.slice(" in body  # the k-strip operand slices
@@ -146,7 +149,8 @@ class TestAutoFuse:
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw").as_python()
         assert "pl.auto_chunk" in body  # AutoInCore chunked scope
-        assert "pl.parallel(48" in body  # 48 output tiles — one per vector core
+        # one flat 48-tile loop with chunk=1 -> 48 cross-core task submissions of one kernel
+        assert "pl.parallel(48" in body and body.count("pl.parallel(") == 1 and "chunk=1" in body
         assert "pl.tensor.adds(" in body and "pl.tensor.assemble(" in body  # per-tile op + output assembly
 
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
@@ -182,6 +186,7 @@ class TestAutoFuse:
         assert "pl.auto_chunk" in body  # one fused AutoInCore scope
         assert body.count("pl.tensor.matmul(") == 2  # both matmuls in the same per-tile body
         assert "_tband" in body  # the on-chip intermediate (T never touches DDR)
+        assert body.count("pl.parallel(") == 1 and "chunk=1" in body  # one flat tile loop -> N cross-core submissions
 
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
@@ -212,7 +217,8 @@ class TestAutoFuse:
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw2").as_python()
         assert "pl.auto_chunk" in body  # one fused AutoInCore scope
-        assert "pl.parallel(48" in body  # 48 output tiles — one per vector core
+        # one flat 48-tile loop with chunk=1 -> 48 cross-core task submissions of one kernel
+        assert "pl.parallel(48" in body and body.count("pl.parallel(") == 1 and "chunk=1" in body
         assert "pl.tensor.adds(" in body and "pl.tensor.muls(" in body  # both ops in the per-tile body
         assert body.count("pl.tensor.assemble(") == 1  # only the output is assembled; the intermediate stays on-chip
 
