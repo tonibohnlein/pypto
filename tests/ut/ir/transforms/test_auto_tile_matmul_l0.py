@@ -1154,6 +1154,59 @@ class TestAutoTileMatmulL0MatScratch:
         assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
             f"Mat-scratch chained mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
         )
+        # This producer (K=128) is K-split; the full-K case is covered below.
+        assert "c__tile_t0_l0_init" in printed, "K=128 producer should be a K-loop (split-K)"
+
+    def test_chained_matmul_full_k_uses_mat_scratch(self):
+        """Mat-scratch works for the **full-K** producer too (k == K), not only
+        K-split: the placement callback drives the full-K *snake* into the Mat
+        scratch.  BF16 256×64 @ 64×256 → the K=64 producer fits L0a in one block,
+        so each sub-tile is a straight-line matmul (no K-loop) assembled into the
+        scratch; the FP32 consumer then K-loops over it."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 64], pl.BF16],
+                b: pl.Tensor[[64, 256], pl.BF16],
+                e: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                c = pl.matmul(a, b)
+                d = pl.matmul(c, e)
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+        # The producer's sub-tiles have no K-loop iter-arg init ("<producer>_t*_l0_init")
+        # — straight-line full-K snake — and assemble straight into one Mat scratch.
+        assert "c__tile_t0_l0_init" not in printed, "the full-K producer must be straight-line (no K-loop)"
+        assert "c__tile_mat" in printed and printed.count("pl.tile.assemble(") == 4, (
+            "full-K producer must assemble its 2×2 grid into one Mat scratch"
+        )
+        _assert_ssa_valid(After, "test_full_k_mat_scratch")
+
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(256, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 256, dtype=torch.bfloat16)
+        e = torch.randn(256, 64)
+        out = torch.zeros(256, 64)
+        ns: dict = {}
+        exec(torch_codegen(After), ns)  # noqa: S102
+        ns["kernel"](a, b, e, out)
+        expected = (a.float() @ b.float()) @ e  # bf16 producer → tolerate chain rounding
+        assert torch.allclose(out, expected, rtol=2e-2, atol=2.0), (
+            f"full-K Mat-scratch mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
 
     def test_chained_matmul_packs_through_full_pipeline(self):
         """End-to-end: a BF16 producer (small Left) feeding an FP32 consumer
