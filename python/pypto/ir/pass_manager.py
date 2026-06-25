@@ -151,6 +151,11 @@ class PassManager:
             ("ExpandMixedKernel", lambda: passes.expand_mixed_kernel()),
             ("InjectGMPipeBuffer", lambda: passes.inject_gm_pipe_buffer()),
             ("SplitVectorKernel", lambda: passes.split_vector_kernel()),
+            # Copy each cross-core tpop's split/pipe-id onto its matching tfree op so
+            # codegen reads them from the op (no codegen-side tpop lookup table). Runs
+            # right after SplitVectorKernel finalizes split on tpops and before
+            # SkewCrossCorePipeline clones tpop/tfree pairs (so clones carry split).
+            ("StampTfreeSplit", lambda: passes.stamp_tfree_split()),
             ("NormalizeReturnOrder", lambda: passes.normalize_return_order()),
             ("SkewCrossCorePipeline", lambda: passes.skew_cross_core_pipeline()),
             ("LowerPipelineLoops", lambda: passes.lower_pipeline_loops()),
