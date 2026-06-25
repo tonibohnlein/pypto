@@ -1167,7 +1167,7 @@ static std::string MakeScatterCodegenPTO(const CallPtr& op, codegen::CodegenBase
   return "";
 }
 
-// Helper for tile.scatter_mask (TSCATTER mask form, DPS):
+// Helper for tile.scatter_mask (DPS; PyPTO codegen mask form, not a real ISA op):
 //   pto.tscatter ins(%src, {maskPattern = #pto.mask_pattern<Pxxxx>} : src_ty)
 //                outs(%dst : dst_ty)
 //
@@ -1177,8 +1177,10 @@ static std::string MakeScatterCodegenPTO(const CallPtr& op, codegen::CodegenBase
 // The type annotation follows the attr dict, still inside ins().
 //
 // IR surface: 2-input op (dst, src) + mask_pattern attr; dst aliased via
-// set_output_reuses_input(0). Mask form is targeted at A2/A3 backends; A5
-// (Ascend950) rejects it on the PTOAS side.
+// set_output_reuses_input(0). NOTE: pto-isa/PTOAS expose a maskPattern form
+// only for tgather, not tscatter — this tscatter mask emission is a PyPTO
+// codegen construct, not a distinct ISA instruction. Emitted for A2/A3 /
+// CPU-sim style lowering paths.
 static std::string MakeScatterMaskCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
   CHECK(op->args_.size() == 2) << "tile.scatter_mask requires 2 arguments (dst, src), but got "
@@ -1193,9 +1195,11 @@ static std::string MakeScatterMaskCodegenPTO(const CallPtr& op, codegen::Codegen
   std::string dst = codegen.GetCurrentResultTarget();
   std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
 
-  // DPS in-place contract (mirror of tile.scatter): result must alias the `dst`
-  // input tile (args_[0]) so mask-marked columns are written in-place and the
-  // unselected columns keep `dst`'s values.
+  // DPS in-place contract (mirror of tile.scatter): the result must alias the
+  // `dst` input tile (args_[0]). NOTE: the mask-form emission zero-fills dst and
+  // writes only the mask-marked columns, so it does NOT itself preserve dst's
+  // unselected columns — DPS preserve is reconstructed upstream by the
+  // tensor.scatter_mask lowering (sel-blend); see op_conversion_registry.cpp.
   std::string input_ssa = codegen.GetExprAsCode(op->args_[0]);
   INTERNAL_CHECK(!dst.empty() && dst == input_ssa)
       << "Internal error: tile.scatter_mask result SSA must alias the dst input tile SSA, got dst=" << dst
@@ -1936,18 +1940,6 @@ static std::string FormatFrontendPipeAttrs(const CallPtr& op, int split) {
   return oss.str();
 }
 
-static std::string FormatFrontendPipeAttrs(std::optional<int> pipe_id, int split) {
-  std::ostringstream oss;
-  oss << "{";
-  if (pipe_id.has_value()) {
-    CHECK(pipe_id.value() >= 0) << "Frontend pipe 'id' attribute must be non-negative, got "
-                                << pipe_id.value();
-    oss << "id = " << pipe_id.value() << ", ";
-  }
-  oss << "split = " << split << "}";
-  return oss.str();
-}
-
 static std::string FormatInitializePipeAttrs(const CallPtr& op, int dir_mask, int slot_size) {
   std::ostringstream oss;
   oss << "{";
@@ -2102,21 +2094,13 @@ static std::string MakeTfreeToAicCodegenPTO(const CallPtr& op, codegen::CodegenB
 
   CHECK(op->args_.size() == 1) << "tfree_to_aic requires 1 argument (tile from tpop), got "
                                << op->args_.size();
-  auto tile = AsVarLike(op->args_[0]);
-  INTERNAL_CHECK_SPAN(tile, op->span_) << "tfree_to_aic first argument must be a Var or IterArg";
-  const auto& tpop_info =
-      codegen.GetValidatedTpopInfo(tile.get(), "tile.tpop_from_aic", "system.tfree_to_aic");
-  if (op->HasKwarg("id")) {
-    const int tfree_id = op->GetKwarg<int>("id", 0);
-    const int tpop_id = tpop_info.pipe_id.value_or(0);
-    CHECK(tpop_id == tfree_id) << "system.tfree_to_aic pipe id " << tfree_id
-                               << " does not match originating tile.tpop_from_aic pipe id " << tpop_id;
-  }
-  const std::optional<int> pipe_id =
-      op->HasKwarg("id") ? std::optional<int>(op->GetKwarg<int>("id", 0)) : tpop_info.pipe_id;
+  INTERNAL_CHECK_SPAN(op->HasKwarg("split"), op->span_)
+      << "Internal error: system.tfree_to_aic is missing its 'split' kwarg; StampTfreeSplit must "
+         "run before codegen to copy it from the originating tpop";
+  const int split = op->GetKwarg<int>("split", 0);
 
   std::ostringstream oss;
-  oss << "pto.tfree_from_aic " << FormatFrontendPipeAttrs(pipe_id, tpop_info.split);
+  oss << "pto.tfree_from_aic " << FormatFrontendPipeAttrs(op, split);
   codegen.Emit(oss.str());
 
   return "";
@@ -2128,22 +2112,13 @@ static std::string MakeTfreeToAivCodegenPTO(const CallPtr& op, codegen::CodegenB
 
   CHECK(op->args_.size() == 1) << "tfree_to_aiv requires 1 argument (tile from tpop), got "
                                << op->args_.size();
-  auto tile = AsVarLike(op->args_[0]);
-  INTERNAL_CHECK_SPAN(tile, op->span_) << "tfree_to_aiv first argument must be a Var or IterArg";
-
-  const auto& tpop_info =
-      codegen.GetValidatedTpopInfo(tile.get(), "tile.tpop_from_aiv", "system.tfree_to_aiv");
-  if (op->HasKwarg("id")) {
-    const int tfree_id = op->GetKwarg<int>("id", 0);
-    const int tpop_id = tpop_info.pipe_id.value_or(0);
-    CHECK(tpop_id == tfree_id) << "system.tfree_to_aiv pipe id " << tfree_id
-                               << " does not match originating tile.tpop_from_aiv pipe id " << tpop_id;
-  }
-  const std::optional<int> pipe_id =
-      op->HasKwarg("id") ? std::optional<int>(op->GetKwarg<int>("id", 0)) : tpop_info.pipe_id;
+  INTERNAL_CHECK_SPAN(op->HasKwarg("split"), op->span_)
+      << "Internal error: system.tfree_to_aiv is missing its 'split' kwarg; StampTfreeSplit must "
+         "run before codegen to copy it from the originating tpop";
+  const int split = op->GetKwarg<int>("split", 0);
 
   std::ostringstream oss;
-  oss << "pto.tfree_from_aiv " << FormatFrontendPipeAttrs(pipe_id, tpop_info.split);
+  oss << "pto.tfree_from_aiv " << FormatFrontendPipeAttrs(op, split);
   codegen.Emit(oss.str());
 
   return "";
@@ -2883,12 +2858,15 @@ static std::string MakeGetCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
          "(dst, peer, src, stage, dst_offsets, src_offsets, shape), got "
       << op->args_.size();
 
-  // dst: local DistributedTensor destination — reuses the local tensor_view
-  // created by EmitMakeTensorViews (no peer arithmetic, like wait's signal).
+  // dst: local destination — DistributedTensor (window-bound) or plain Tensor.
+  // Both reuse the local tensor_view created by EmitMakeTensorViews (no peer
+  // arithmetic, like wait's signal). TGET only requires dst to be a writable
+  // local GM region; window membership is not needed on the destination side.
   auto dst_var = AsVarLike(op->args_[0]);
   CHECK(dst_var) << "pld.tile.get dst must be a Var-like expression";
-  auto dst_dist = As<ir::DistributedTensorType>(dst_var->GetType());
-  CHECK(dst_dist) << "pld.tile.get dst must be DistributedTensorType, got " << dst_var->GetType()->TypeName();
+  auto dst_tt = AsTensorTypeLike(dst_var->GetType());
+  CHECK(dst_tt) << "pld.tile.get dst must be a Tensor or DistributedTensor, got "
+                << dst_var->GetType()->TypeName();
 
   // src: remote (peer-addressed) DistributedTensor source.
   auto src_binding = ResolveDistTensorBinding(op->args_[2], codegen, "pld.tile.get");
@@ -2896,9 +2874,9 @@ static std::string MakeGetCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
   CHECK(peer_scalar) << "pld.tile.get peer must be ScalarType at codegen, got "
                      << op->args_[1]->GetType()->TypeName();
 
-  const auto& dst_shape = dst_dist->shape_;
+  const auto& dst_shape = dst_tt->shape_;
   const size_t rank = dst_shape.size();
-  const std::string dtype_str = codegen.GetTypeString(dst_dist->dtype_);
+  const std::string dtype_str = codegen.GetTypeString(dst_tt->dtype_);
 
   std::vector<std::string> dst_offsets;
   std::vector<std::string> src_offsets;
@@ -2934,7 +2912,7 @@ static std::string MakeGetCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
 
   // dst: local tensor_view + full-slice partition_view.
   std::string dst_local_view = codegen.GetOrCreateTensorView(dst_var);
-  std::string dst_view_type = codegen.GetTensorViewTypeString(dst_dist.get());
+  std::string dst_view_type = codegen.GetTensorViewTypeString(dst_tt.get());
   std::string dst_pview = EmitPartitionViewPTO(dst_var->name_hint_ + "_local", dst_local_view, dst_view_type,
                                                partition_type, dst_offsets, size_ssa, codegen);
 
@@ -3482,8 +3460,9 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   reg("tile.scatter", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeScatterCodegenPTO(op, codegen);
   });
-  // tile.scatter_mask (TSCATTER mask form, DPS): 2-input op (dst, src) +
-  // maskPattern attr. A3 / CPU-sim style backends only.
+  // tile.scatter_mask (DPS): 2-input op (dst, src) + maskPattern attr. PyPTO
+  // codegen form lowered to a pto.tscatter mask emission — not a distinct ISA
+  // instruction (see MakeScatterMaskCodegenPTO).
   reg("tile.scatter_mask", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeScatterMaskCodegenPTO(op, codegen);
   });
@@ -3813,24 +3792,33 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     CHECK(op->args_.size() == 2) << "Operation:[tile.reshape] requires 2 arguments (tile, shape), but got "
                                  << op->args_.size();
     std::string result_target = codegen.GetCurrentResultTarget();
-    std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
 
-    // With per-var alloc model, the result variable already has a pre-declared
-    // alloc_tile with the correct reshaped type and shared addr. If the types
-    // match, the reshape is a no-op at the PTO level.
+    // Derive the result type from the result var's TileType so a MemRef-less
+    // result (a zero-copy view over a tpop slot) still gets a type — the shared
+    // helper only returns one for alloc-backed results. Also note whether the
+    // result is alloc-backed: the reshape is a PTO-level no-op only then (the
+    // per-var alloc model pre-declared it with the reshaped type at a shared
+    // addr); a MemRef-less result has no alloc, so it must emit pto.treshape.
+    std::string result_type;
+    bool result_has_memref = false;
+    if (auto result_var = codegen.GetCurrentResultVar()) {
+      if (auto result_tile = ir::As<ir::TileType>(result_var->GetType())) {
+        result_type = codegen.GetTileBufTypeStringFromTileType(result_tile);
+        result_has_memref = result_tile->memref_.has_value();
+      }
+    }
     auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (!existing_type.empty() && existing_type == result_type) {
+    if (result_has_memref && !existing_type.empty() && existing_type == result_type) {
       return std::string("");
     }
 
-    // Fallback: emit pto.treshape for cases without pre-declared alloc
+    // Fallback: emit pto.treshape. Derive the source type from its TileType so a
+    // MemRef-less source (a tpop result) still gets its `: src -> dst` annotation.
     std::string src = codegen.GetExprAsCode(op->args_[0]);
     std::string src_type;
     if (auto src_var = AsVarLike(op->args_[0])) {
       if (auto tile_type = ir::As<ir::TileType>(src_var->GetType())) {
-        if (tile_type->memref_.has_value()) {
-          src_type = codegen.GetTileBufTypeStringFromTileType(tile_type);
-        }
+        src_type = codegen.GetTileBufTypeStringFromTileType(tile_type);
       }
     }
 
