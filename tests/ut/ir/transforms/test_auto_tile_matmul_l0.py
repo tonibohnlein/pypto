@@ -1524,6 +1524,40 @@ class TestAutoTileMatmulL0MatScratch:
             f"split-K Mat-scratch chained mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
         )
 
+    def test_chained_matmul_exceeding_mat_capacity_deferred(self):
+        """The conservative Mat-capacity gate: a chained matmul whose result is consumed
+        entirely as a matmul operand WOULD take the Mat-scratch path, but its ``[512, 512]``
+        FP32 scratch (1 MiB) exceeds the backend's Mat/L1 capacity (512 KiB on Ascend910B).
+        The pass leaves the producer on the deferred ``PH-AT-006`` path (left whole, no
+        Acc->Mat assemble) instead of emitting an impossible on-chip allocation."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[512, 512], pl.FP32],
+                b: pl.Tensor[[512, 512], pl.FP32],
+                e: pl.Tensor[[512, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 64], pl.FP32]],
+            ) -> pl.Tensor[[512, 64], pl.FP32]:
+                c = pl.matmul(a, b)  # [512, 512] FP32 = 1 MiB Mat scratch → exceeds Mat capacity
+                d = pl.matmul(c, e)  # consumes c only as a matmul operand
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+
+        assert printed.count("pl.tile.assemble(") == 0, (
+            "a chained-matmul scratch exceeding Mat capacity must not emit any Acc->Mat assemble"
+        )
+        assert "pl.tile.matmul(a__ssa_v0_mat, b__ssa_v0_mat)" in printed, (
+            "the gated producer matmul must be left whole (deferred), not tiled into a Mat scratch"
+        )
+
     def test_chained_matmul_full_k_uses_pipelined_mat_scratch(self):
         """A *full-K* (K fits L0) oversized chained matmul tiles into a Mat scratch via
         the **pipelined** emitter — the Acc->Mat ``tile.assemble`` lands inside the
