@@ -26,7 +26,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -108,6 +107,15 @@ constexpr double kBwGmUb   = 100.9;             // GM->UB vector load
 constexpr double kBwUbGm   = 188.46;            // UB->GM vector store
 constexpr int64_t kL0TileM = 128;               // L0 GEMM base M (pto-isa oracle)
 constexpr int64_t kL0TileN = 256;               // L0 GEMM base N (pto-isa oracle)
+// Grounded vector (AIV) cost: per op = head + slope*repeat + tail cycles, repeat
+// = ceil(elems / (vec_reg_bytes/dtype_bytes)). pto-isa A2A3
+// cce_costmodel_vector_compute.hpp: 256-byte vreg; vadd head 14 / slope 1 / tail
+// 18, vmul slope 2; vreducev2 slope 14.
+constexpr int64_t kVecRegBytes = 256;           // vector register size (bytes)
+constexpr double kVecOpHead = 14.0;             // per-op pipeline startup
+constexpr double kVecOpTail = 18.0;             // per-op drain
+constexpr double kVecSlopePw = 2.0;             // elementwise cycles/repeat (vmul-ish)
+constexpr double kVecSlopeReduce = 14.0;        // reduction cycles/repeat (vreducev2)
 
 // Core counts + on-chip capacities. Defaults are the 910B values above; the
 // real ones are read from the configured backend's SoC (so the safe-UB cap and
@@ -261,6 +269,11 @@ class ProblemBuilder {
     problem.bw_ub_gm = kBwUbGm;
     problem.l0_tile_m = kL0TileM;
     problem.l0_tile_n = kL0TileN;
+    problem.vec_reg_bytes = kVecRegBytes;
+    problem.vec_op_head = kVecOpHead;
+    problem.vec_op_tail = kVecOpTail;
+    problem.vec_slope_pw = kVecSlopePw;
+    problem.vec_slope_reduce = kVecSlopeReduce;
 
     // 1. In-direction params are graph-input tensors (Out/InOut params are
     //    output buffers, not inputs).
@@ -294,23 +307,29 @@ class ProblemBuilder {
       const CallPtr& call = entry.second;
       ::Op sop;
       sop.type = ClassifyOp(call);
-      std::set<size_t> inputs;
-      auto pit = dep.predecessors.find(stmt);
-      if (pit != dep.predecessors.end()) {
-        for (const Stmt* pred : pit->second) {
-          auto oit = stmt_output_.find(pred);
-          if (oit != stmt_output_.end()) {
-            inputs.insert(oit->second);
-          }
-        }
-      }
+      // Inputs in OPERAND ORDER (call->args_). The solver derives M/N/K
+      // positionally (inputs[0]=LHS [K,M], inputs[1]=RHS [N,K]), so the order is
+      // load-bearing. Both in-params and predecessor-op outputs are registered
+      // in tensor_index_ (steps 1 and 3 above), so one ordered pass over args
+      // covers both sources. A std::set would re-sort by tensor index
+      // (in-params, registered first, before intermediates), silently swapping a
+      // chained matmul's operands (e.g. (A@B)@D's sink [T,D] -> [D,T]).
+      std::vector<size_t> inputs;
+      std::unordered_set<size_t> seen;
       for (const ExprPtr& arg : call->args_) {
         auto var = AsVarLike(arg);
-        if (var != nullptr && in_params_.count(var.get()) != 0) {
-          inputs.insert(tensor_index_.at(var.get()));
+        if (var == nullptr) {
+          continue;
+        }
+        auto it = tensor_index_.find(var.get());
+        if (it == tensor_index_.end()) {
+          continue;  // alloc / scalar / Out buffer — not a tracked input tensor
+        }
+        if (seen.insert(it->second).second) {
+          inputs.push_back(it->second);
         }
       }
-      sop.inputs.assign(inputs.begin(), inputs.end());
+      sop.inputs = std::move(inputs);
       const size_t out = stmt_output_.at(stmt);
       sop.outputs.push_back(out);
       const ::Tensor& ot = problem.tensors[out];
@@ -431,7 +450,12 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     << ",\n  \"bw_gm_ub\": " << p.bw_gm_ub
     << ",\n  \"bw_ub_gm\": " << p.bw_ub_gm
     << ",\n  \"l0_tile_m\": " << p.l0_tile_m
-    << ",\n  \"l0_tile_n\": " << p.l0_tile_n << "\n}\n";
+    << ",\n  \"l0_tile_n\": " << p.l0_tile_n
+    << ",\n  \"vec_reg_bytes\": " << p.vec_reg_bytes
+    << ",\n  \"vec_op_head\": " << p.vec_op_head
+    << ",\n  \"vec_op_tail\": " << p.vec_op_tail
+    << ",\n  \"vec_slope_pw\": " << p.vec_slope_pw
+    << ",\n  \"vec_slope_reduce\": " << p.vec_slope_reduce << "\n}\n";
 }
 
 // Dump the solver's DECISION (fusion groups + per-group tile/latency/retain) as
