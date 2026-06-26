@@ -1395,6 +1395,115 @@ class TestTileAssembleCodegen:
             f"tile.assemble should pto.tmov into the subview SSA {view_ssa!r}, got:\n{mlir}"
         )
 
+    def _generate_mlir_all_incore(self, program_cls) -> str:
+        """Like ``_generate_mlir`` but concatenates PTOCodegen output for every
+        InCore (AIC/AIV) leaf function, skipping the Group/orchestration wrapper a
+        mixed (cube+vector) kernel splits into (those are not PTOCodegen targets)."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        return "\n".join(
+            codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
+            for func in optimized.functions.values()
+            if ir.is_incore_type(func.func_type)
+        )
+
+    def test_tile_assemble_acc_to_mat_full_window_codegen(self):
+        """A whole-tile Acc->Mat ``tile.assemble`` (a matmul result drained into an
+        L1/Mat scratch — the representative Mat-scratch pattern) lowers to a
+        converting ``pto.subview`` + ``pto.tmov``. The subview is typed from the
+        **Mat result** (the dst — ``loc=mat``, ``fractal=512``); the ``pto.tmov``
+        moves the Acc source (``loc=acc``, ``fractal=1024``) into it.
+
+        Because the insert covers the whole result tile, no out-of-window
+        preservation copy is emitted, so the output carries no unsupported Mat->Mat
+        tmov and is accepted by PTOAS's verifier (``TMovOp::isAccToMat`` only
+        requires the Mat dst fractal to be 512). The IR enforces
+        ``source.dtype == result.dtype`` (DeduceTileAssembleType), so this is a
+        layout/space conversion, not a dtype cast. Regression for the codegen the
+        Mat-scratch path depends on (PTOCodegen previously aborted here)."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[32, 32], pl.FP32],
+                a: pl.Tensor[[32, 16], pl.FP16],
+                b: pl.Tensor[[16, 32], pl.FP16],
+                y: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                target = pl.load(x, [0, 0], [32, 32], target_memory=pl.MemorySpace.Mat)
+                tile_a = pl.load(a, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat)
+                tile_b = pl.load(b, [0, 0], [16, 32], target_memory=pl.MemorySpace.Mat)
+                src = pl.matmul(
+                    pl.move(tile_a, target_memory=pl.MemorySpace.Left),
+                    pl.move(tile_b, target_memory=pl.MemorySpace.Right),
+                )  # Acc (L0C) [32, 32]
+                result = pl.tile.assemble(target, src, [0, 0])  # full-window Acc -> Mat
+                return pl.store(pl.move(result, target_memory=pl.MemorySpace.Vec), [0, 0], y)
+
+        mlir = self._generate_mlir_all_incore(Prog)
+        subview = next((line for line in mlir.splitlines() if "pto.subview" in line and "->" in line), None)
+        assert subview is not None, f"expected an Acc->Mat assemble pto.subview, got:\n{mlir}"
+        view_ty = subview.split("->", 1)[1]
+        assert "loc=mat" in view_ty and "fractal=512" in view_ty, (
+            f"Acc->Mat assemble subview must be typed from the Mat result (loc=mat, fractal=512): {view_ty}"
+        )
+        # The data write is a converting pto.tmov from the Acc source into the Mat view.
+        view_ssa = subview.split(" = ", 1)[0].strip()
+        tmov = next(
+            (line for line in mlir.splitlines() if "pto.tmov" in line and f"outs({view_ssa}" in line),
+            None,
+        )
+        assert tmov is not None, f"expected pto.tmov into the assemble subview {view_ssa!r}, got:\n{mlir}"
+        tmov_src = tmov.split("outs", 1)[0]
+        assert "loc=acc" in tmov_src and "fractal=1024" in tmov_src, (
+            f"the assemble tmov source must be the Acc matmul result (loc=acc, fractal=1024): {tmov}"
+        )
+        # A full-window insert overwrites the whole tile, so the dead out-of-window
+        # preservation copy is skipped — and therefore no unsupported Mat->Mat tmov.
+        mat_to_mat = [
+            line
+            for line in mlir.splitlines()
+            if "pto.tmov" in line
+            and "loc=mat" in line.split("ins(", 1)[-1].split(")", 1)[0]
+            and "loc=mat" in line.split("outs(", 1)[-1]
+        ]
+        assert not mat_to_mat, "full-window Acc->Mat must not emit a Mat->Mat pre-copy, got:\n" + "\n".join(
+            mat_to_mat
+        )
+
+    def test_tile_assemble_acc_to_mat_partial_non_merged_rejected(self):
+        """A *partial* Acc->Mat ``tile.assemble`` whose Mat target is not reused
+        in-place as the result needs an out-of-window preservation copy, which would
+        be an unsupported Mat->Mat ``pto.tmov``. Codegen must reject it with a clear
+        message rather than silently emit invalid IR. The Mat-scratch autotiler's
+        in-place iter-arg chain makes target == result, dissolving this path."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[32, 32], pl.FP32],
+                a: pl.Tensor[[32, 16], pl.FP16],
+                b: pl.Tensor[[16, 16], pl.FP16],
+                y: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                tile_x = pl.load(x, [0, 0], [32, 32], target_memory=pl.MemorySpace.Mat)
+                tile_a = pl.load(a, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat)
+                tile_b = pl.load(b, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                src = pl.matmul(
+                    pl.move(tile_a, target_memory=pl.MemorySpace.Left),
+                    pl.move(tile_b, target_memory=pl.MemorySpace.Right),
+                )  # Acc (L0C) [32, 16]
+                result = pl.tile.assemble(tile_x, src, [0, 16])  # partial Acc -> Mat, non-merged
+                return pl.store(pl.move(result, target_memory=pl.MemorySpace.Vec), [0, 0], y)
+
+        with pytest.raises(Exception, match="partial Acc->Mat"):
+            self._generate_mlir_all_incore(Prog)
+
 
 class TestSetValidShapeCodegen:
     """Tests for tile.set_validshape PTO code generation."""

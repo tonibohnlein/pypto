@@ -687,7 +687,36 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
   auto source_tile_type = ir::As<ir::TileType>(op->args_[1]->GetType());
   INTERNAL_CHECK_SPAN(target_tile_type && source_tile_type, op->span_)
       << "tile.assemble target and source must both be TileType";
-  CheckSubviewTileCompat(*target_tile_type, *source_tile_type, "tile.assemble");
+  // The result tile is the actual base that pto.subview views (the dst %r); its
+  // tile config — not the target arg's — is what the subview must match.
+  auto result_tile_type = ir::As<ir::TileType>(op->GetType());
+  INTERNAL_CHECK_SPAN(result_tile_type, op->span_) << "tile.assemble result must be a TileType";
+
+  // An Acc->Mat assemble is a *converting* move, not a pure same-config view: the
+  // Mat destination uses a different tile config than the Acc source (Mat fractal
+  // 512 vs Acc fractal 1024). PTOAS supports this as an MTE1 `pto.tmov` (its TMovOp
+  // verifier handles isAccToMat and only requires the Mat *result* fractal to be
+  // 512 — no element-type constraint). The subview is typed entirely from the Mat
+  // result below, so we skip CheckSubviewTileCompat (which enforces identical
+  // source/result config and must stay strict for every other, pure subview).
+  // Gate on the *result* space — that is the tile pto.subview is actually OF, and
+  // what every downstream decision (view config + space) reads.
+  const bool cross_space_acc_to_mat = source_tile_type->memory_space_ == ir::MemorySpace::Acc &&
+                                      result_tile_type->memory_space_ == ir::MemorySpace::Mat;
+  if (!cross_space_acc_to_mat) {
+    CheckSubviewTileCompat(*target_tile_type, *source_tile_type, "tile.assemble");
+  } else {
+    // Element-type, address-space, and full-config equality with the base are
+    // guaranteed by construction (the view is built from the result tile below, and
+    // the IR already requires source.dtype == result.dtype — see
+    // DeduceTileAssembleType). The one invariant the bypass must still enforce is
+    // CheckSubviewTileCompat's pad rule: pto.subview cannot carry a pad_value.
+    const auto src_v = ir::tile_view_semantics::GetEffectiveTileView(*source_tile_type);
+    const auto res_v = ir::tile_view_semantics::GetEffectiveTileView(*result_tile_type);
+    CHECK_SPAN(src_v.pad == ir::PadValue::null && res_v.pad == ir::PadValue::null, op->span_)
+        << "tile.assemble: Acc->Mat pto.subview does not support pad_value; apply "
+           "tile.fillpad on the result tile instead of carrying a pad on the window";
+  }
 
   std::string target = codegen.GetExprAsCode(op->args_[0]);
   std::string src = codegen.GetExprAsCode(op->args_[1]);
@@ -707,7 +736,37 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
   // [row, col]+sizes window.  Data outside that window must already be present
   // in dst — when target and dst are different buffers (memory reuse did not
   // merge them), copy target → dst first to preserve target's outer data.
-  if (target != dst) {
+  //
+  // For a full-window cross-space Acc->Mat insert (offset 0 and source physical
+  // shape == result physical shape) the source tmov below overwrites the entire
+  // result tile, so this preservation copy is a dead write that is immediately
+  // overwritten — and it would otherwise be an unsupported Mat->Mat tmov. Skip it.
+  // Scoped to the Acc->Mat path so same-config assemble codegen is untouched.
+  // Physical shapes are the right test: a full-window tmov rewrites the whole
+  // window, so source valid_shape < physical does not retain target data (plain
+  // replace — DeduceTileAssembleType sets the result valid to the target's full
+  // shape). Dynamic dims fall through to the guard below.
+  auto off_row_c = ir::As<ir::ConstInt>(offset_tuple->elements_[0]);
+  auto off_col_c = ir::As<ir::ConstInt>(offset_tuple->elements_[1]);
+  bool full_window_acc_to_mat = cross_space_acc_to_mat && off_row_c && off_col_c && off_row_c->value_ == 0 &&
+                                off_col_c->value_ == 0 &&
+                                source_tile_type->shape_.size() == result_tile_type->shape_.size();
+  for (size_t i = 0; full_window_acc_to_mat && i < source_tile_type->shape_.size(); ++i) {
+    auto s = ir::As<ir::ConstInt>(source_tile_type->shape_[i]);
+    auto r = ir::As<ir::ConstInt>(result_tile_type->shape_[i]);
+    full_window_acc_to_mat = s && r && s->value_ == r->value_;
+  }
+  if (target != dst && !full_window_acc_to_mat) {
+    // A partial, non-merged insert needs target's out-of-window data copied into
+    // dst. For a cross-space Acc->Mat assemble that copy is an unsupported Mat->Mat
+    // tmov; it is only reachable when the Mat target is not reused in-place as the
+    // result (PR3's iter-arg merging makes target == dst, dissolving this path).
+    // Fail loud rather than emit invalid IR.
+    CHECK_SPAN(!cross_space_acc_to_mat, op->span_)
+        << "tile.assemble: a partial Acc->Mat insert whose Mat target is not reused "
+           "in-place as the result is not yet supported — the out-of-window "
+           "preservation copy would be an unsupported Mat->Mat move; assemble into a "
+           "result tile that reuses the Mat target in place";
     std::string target_type = codegen.GetExprTypeAnnotation(op->args_[0]);
     std::ostringstream mov;
     mov << "pto.tmov ins(" << target;
@@ -750,9 +809,29 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
 
   INTERNAL_CHECK_SPAN(source_tile_type->memory_space_.has_value(), op->span_)
       << "tile.assemble source must carry a memory space for pto.subview result typing";
-  const auto source_memory_space = source_tile_type->memory_space_.value_or(ir::MemorySpace::DDR);
+  // The pto.subview is a window OF the assemble's RESULT tile (the dst %r), and
+  // SubViewOp::verify requires the view to match its base in element type, address
+  // space, AND the whole tile config (it compares TileBufConfigAttr as one attr).
+  // For a same-config assemble the source equals the result (guaranteed by
+  // CheckSubviewTileCompat above), so seeding from the source is unchanged behavior.
+  // For a cross-space Acc->Mat assemble the Acc source and Mat result differ, so
+  // build the view from the *result* and keep only the source's physical window
+  // size (rows/cols; valid extents are applied below). Every dtype/layout/fractal/
+  // pad/space field then comes from the base by construction — no field-by-field
+  // patch to keep in sync, and it stays correct if a future IR change permits a
+  // requantising Acc->Mat (TMovOp::isAccToMat imposes no element-type constraint).
   auto view_type_info =
       codegen::ExtractTileTypeInfo(*source_tile_type, codegen.GetTypeString(source_tile_type->dtype_));
+  auto view_memory_space = source_tile_type->memory_space_.value();
+  if (cross_space_acc_to_mat) {
+    const int64_t window_rows = view_type_info.rows;
+    const int64_t window_cols = view_type_info.cols;
+    view_type_info =
+        codegen::ExtractTileTypeInfo(*result_tile_type, codegen.GetTypeString(result_tile_type->dtype_));
+    view_type_info.rows = window_rows;
+    view_type_info.cols = window_cols;
+    view_memory_space = result_tile_type->memory_space_.value();
+  }
   if (valid_row_const) {
     view_type_info.v_row = valid_row_const->value_;
     view_type_info.v_row_dynamic = false;
@@ -762,7 +841,7 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
     view_type_info.v_col_dynamic = false;
   }
   std::string view_type = codegen::FormatTileBufTypeString(
-      codegen::MemorySpaceToMLIR(source_memory_space), view_type_info.dtype_str, view_type_info.rows,
+      codegen::MemorySpaceToMLIR(view_memory_space), view_type_info.dtype_str, view_type_info.rows,
       view_type_info.cols, view_type_info.blayout, view_type_info.slayout, view_type_info.fractal,
       view_type_info.pad, view_type_info.v_row, view_type_info.v_col, view_type_info.v_row_dynamic,
       view_type_info.v_col_dynamic);

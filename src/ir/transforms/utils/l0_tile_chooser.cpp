@@ -146,7 +146,8 @@ void TryCandidate(int m, int n, const L0TileConfig& cfg, int64_t A0, int64_t B0,
   if (m < cfg.min_m || n < cfg.min_n) return;
   // Without padding, the chosen tile must not exceed the problem dimensions.
   // Aligned-down boundary tiles (m <= M but M % m != 0) are still permitted —
-  // those are handled by the outer loop, not by chooser-introduced padding.
+  // those are handled by the outer loop (the full-K emitter peels the partial
+  // boundary into a straight-line tail), not by chooser-introduced padding.
   if (!cfg.allow_padding) {
     if (m > cfg.M || n > cfg.N) return;
   }

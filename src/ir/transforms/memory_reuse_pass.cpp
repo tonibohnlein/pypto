@@ -40,6 +40,7 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
@@ -72,6 +73,19 @@ struct LifetimeAnalysisResult {
   // var -> its individual [def, last_use] interval (with phi/loop extension), for
   // the precise per-var pairwise interference check in the reuse packer.
   std::map<const Var*, std::pair<int, int>> var_liveness;
+  /// Pipeline-stage membership per reuse-interval representative
+  /// (``LifetimeInterval::variable``), read from the defining ``Call``'s
+  /// ``pipeline_membership`` attr, parsed once into ``(group, stage)`` pairs so
+  /// the O(N²) reuse packer never re-parses strings. Empty for non-pipelined
+  /// tiles. Consumed by ``IdentifyReuseOpportunities`` to forbid cross-stage
+  /// buffer coalescing.
+  std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>> pipeline_membership;
+  /// Subset of ``pipeline_membership`` keys whose tile is produced by a *load*
+  /// (``tile.load`` / ``tile.read``) rather than a compute op. Cross-stage reuse
+  /// is forbidden whenever *either* tile is a load (a load buffer must stay
+  /// private for ping-pong); compute↔compute cross-stage reuse is allowed so the
+  /// bulk of intermediates can still coalesce and fit the on-chip budget.
+  std::set<const Var*> pipeline_load_tiles;
 };
 
 /**
@@ -1078,6 +1092,12 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
   // Step 3: Compute lifetime intervals (with MemRef sharing group merging)
   std::set<VarPtr> processed_vars;
 
+  // Pipeline-stage membership per interval representative (parsed once from the
+  // defining Call's pipeline_membership attr, set by LowerPipelineLoops), plus
+  // the subset whose defining op is a load (vs compute).
+  std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>> pipeline_membership;
+  std::set<const Var*> pipeline_load_tiles;
+
   for (const auto& var : result.ordered_defs) {
     if (processed_vars.count(var)) {
       continue;
@@ -1126,6 +1146,30 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
 
     lifetimes.push_back(interval);
 
+    // Record pipeline-stage membership for this interval's representative so the
+    // reuse packer can forbid cross-stage coalescing. Every sharing-group member
+    // is a tile of one pipeline clone and carries the same membership; take the
+    // first non-empty one (views with no Call def simply contribute nothing).
+    for (const auto& group_var : sharing_group) {
+      auto dit = result.var_def_stmt.find(group_var);
+      if (dit == result.var_def_stmt.end()) continue;
+      auto assign = As<AssignStmt>(dit->second);
+      if (!assign) continue;
+      auto call = As<Call>(assign->value_);
+      if (!call) continue;
+      auto packed = call->GetAttr<std::string>(kPipelineMembershipAttr, std::string());
+      if (!packed.empty()) {
+        // Parse the membership string once here; the packer compares pre-parsed
+        // vectors so it never re-parses in its O(N²) pairwise loop.
+        pipeline_membership[interval.variable.get()] = ParsePipelineMembership(packed);
+        const std::string& op_name = call->op_ ? call->op_->name_ : std::string();
+        if (op_name == "tile.load" || op_name == "tile.read") {
+          pipeline_load_tiles.insert(interval.variable.get());
+        }
+        break;
+      }
+    }
+
     for (const auto& group_var : sharing_group) {
       processed_vars.insert(group_var);
     }
@@ -1143,7 +1187,12 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
     var_liveness[var.get()] = {def_point, last_use};
   }
 
-  return {lifetimes, var_sharing_groups, std::move(result.phi_family_ids), std::move(var_liveness)};
+  return {lifetimes,
+          var_sharing_groups,
+          std::move(result.phi_family_ids),
+          std::move(var_liveness),
+          std::move(pipeline_membership),
+          std::move(pipeline_load_tiles)};
 }
 
 // NOTE: The former tile-type reuse-compatibility gate (AreTileTypesCompatible)
@@ -1393,7 +1442,9 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::vector<LifetimeInterval>& lifetimes, const HazardInputs& hazard,
     const ForbidAliasMap& forbid_alias, const std::map<const Var*, std::set<int>>& phi_family_ids,
     const std::map<VarPtr, std::vector<VarPtr>>& sharing_groups,
-    const std::map<const Var*, std::pair<int, int>>& var_liveness) {
+    const std::map<const Var*, std::pair<int, int>>& var_liveness,
+    const std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>>& pipeline_membership,
+    const std::set<const Var*>& pipeline_load_tiles) {
   std::map<VarPtr, VarPtr> reuse_map;
 
   // Members of a sharing group (the vars that already physically share one base).
@@ -1512,6 +1563,46 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     return false;
   };
 
+  // Pipeline ping-pong guard (symmetric): two tiles that share a pipeline group
+  // with a *different* stage index belong to replicated clones the scheduler
+  // overlaps, so a *load* buffer of one stage must never share storage with any
+  // buffer of another stage — even though their program-order lifetimes are
+  // disjoint (that disjointness is exactly what pipelining hides). Non-pipelined
+  // tiles carry no membership and never trigger this. See ``kPipelineMembershipAttr``.
+  //
+  // Role-aware granularity: forbidding *all* cross-stage reuse (depth = F) is
+  // physically infeasible — F full copies of every intermediate overflow the
+  // on-chip budget (e.g. stage=4 RMSNorm needs 4x67KB > 188KB UB). Only the
+  // *load* buffers genuinely need per-stage privacy so iteration i+1's prefetch
+  // overlaps iteration i's compute. Compute intermediates do not stream across
+  // the stage boundary, so two compute tiles of different stages MAY still
+  // coalesce. Hence: block iff the two tiles are same-group / different-stage
+  // AND at least one of them is a load.
+  //
+  // Scope: the L0 matmul spaces (Left/Right/Acc/Bias) are exempt entirely. They
+  // are capacity-bound (a single operand tile can already fill L0B) and owned by
+  // the matmul-L0 machinery — L1->L0 ping-pong is handled by CanonicalizeIOOrder's
+  // extract clustering and accumulator carries by AlignLoopCarriesToInit. Forcing
+  // per-stage separation there both fights that machinery and overflows L0 (e.g.
+  // 2x64KB Right > 64KB). The pl.pipeline multi-buffer intent targets the
+  // data-movement spaces (Vec / Mat-L1 / GM), so the guard applies only there.
+  auto is_l0_space = [](MemorySpace s) {
+    return s == MemorySpace::Left || s == MemorySpace::Right || s == MemorySpace::Acc ||
+           s == MemorySpace::Bias;
+  };
+  auto pipeline_blocks = [&pipeline_membership, &pipeline_load_tiles, &is_l0_space](
+                             const LifetimeInterval& a, const LifetimeInterval& b) {
+    if (is_l0_space(a.memory_space)) return false;  // reuse is within one space, so a==b space
+    auto ia = pipeline_membership.find(a.variable.get());
+    if (ia == pipeline_membership.end()) return false;
+    auto ib = pipeline_membership.find(b.variable.get());
+    if (ib == pipeline_membership.end()) return false;
+    if (!PipelineMembershipsConflict(ia->second, ib->second)) return false;  // not cross-stage
+    // Cross-stage: block only if at least one side is a load buffer.
+    return pipeline_load_tiles.count(a.variable.get()) != 0 ||
+           pipeline_load_tiles.count(b.variable.get()) != 0;
+  };
+
   // Can `cand` join a single physical buffer that already holds `member`?
   // Lifetimes must not overlap (touching is allowed: a buffer's reader is
   // consumed before the writer at the same statement produces its output), and
@@ -1527,6 +1618,7 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     if (LifetimesOverlap(cand, member) && overlap_blocks_sharing(cand, member)) return false;
     if (hazard_blocks(cand, member) || hazard_blocks(member, cand)) return false;
     if (forbid_blocks(cand, member) || forbid_blocks(member, cand)) return false;
+    if (pipeline_blocks(cand, member)) return false;  // symmetric — one call suffices
     return true;
   };
 
@@ -1547,6 +1639,11 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
 
     // Each buffer is a list of interval indices sharing one MemRef; element 0 is
     // the representative (largest, earliest on ties) every member is rebased to.
+    // Pipeline-stage separation (pipeline_blocks in can_share) is applied
+    // unconditionally — it is NOT relaxed to fit a budget. When separation pushes
+    // a space past its on-chip limit the overflow surfaces as a hard
+    // AllocateMemoryAddr error rather than being silently coalesced away; the
+    // kernel must reduce its stage= count or tile size to fit.
     std::vector<std::vector<size_t>> buffers;
     for (size_t idx : indices) {
       const auto& cand = lifetimes[idx];
@@ -1571,9 +1668,6 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
         }
         buf.push_back(idx);
         placed = true;
-        LOG_DEBUG << "Variable " << cand.variable->name_hint_ << " reuses representative "
-                  << representative->name_hint_ << " (lifetime [" << cand.def_point << ", "
-                  << cand.last_use_point << "])";
         break;
       }
       if (!placed) buffers.push_back({idx});
@@ -2134,6 +2228,23 @@ StmtPtr RemoveUnusedAllocStatements(const StmtPtr& body, const std::set<const Va
   return SeqStmts::Flatten(std::move(new_seq_stmts), body->span_);
 }
 
+/// Strip the transient ``pipeline_membership`` attr from every Call once
+/// MemoryReuse has consumed it (in ComputeLifetimes). The attr exists only to
+/// carry pipeline-stage identity from LowerPipelineLoops to here; leaving it on
+/// the IR would ride downstream into later passes and codegen. Stripping at the
+/// end of MemoryReuse keeps the post-reuse IR clean.
+class StripPipelineMembershipMutator : public IRMutator {
+ public:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto visited = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(visited);
+    if (!call || !call->HasAttr(kPipelineMembershipAttr)) return visited;
+    auto new_attrs = StripAttr(call->attrs_, kPipelineMembershipAttr);
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, std::move(new_attrs),
+                                  call->GetType(), call->span_);
+  }
+};
+
 /**
  * @brief Transform a function by identifying and applying memory reuse
  *
@@ -2190,7 +2301,8 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
 
   auto reuse_map = IdentifyReuseOpportunities(
       analysis_result.lifetimes, hazard, forbid_alias, analysis_result.phi_family_ids,
-      analysis_result.var_sharing_groups, analysis_result.var_liveness);
+      analysis_result.var_sharing_groups, analysis_result.var_liveness, analysis_result.pipeline_membership,
+      analysis_result.pipeline_load_tiles);
 
   // Step 3: Apply MemRef sharing (skip if no reuse candidates)
   if (!reuse_map.empty()) {
@@ -2212,6 +2324,11 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   // Step 5: Remove alloc statements for MemRefs no longer in use
   auto used_bases = memref_collectors::CollectUsedBasePtrs(new_body);
   new_body = RemoveUnusedAllocStatements(new_body, used_bases);
+
+  // Step 6: Strip the now-consumed pipeline_membership attr so it does not ride
+  // downstream into later passes / codegen. It was only needed to carry stage
+  // identity from LowerPipelineLoops to the reuse decision above.
+  new_body = StripPipelineMembershipMutator().VisitStmt(new_body);
 
   auto result = std::make_shared<const Function>(func->name_, func->params_, func->param_directions_,
                                                  func->return_types_, new_body, func->span_, func->func_type_,
