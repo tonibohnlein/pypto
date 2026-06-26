@@ -1571,12 +1571,12 @@ class TestAutoTileMatmulL0MatScratch:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                a: pl.Tensor[[256, 64], pl.FP32],
-                b: pl.Tensor[[64, 256], pl.FP32],
+                a: pl.Tensor[[256, 32], pl.FP32],
+                b: pl.Tensor[[32, 256], pl.FP32],
                 e: pl.Tensor[[256, 64], pl.FP32],
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
-                c = pl.matmul(a, b)  # [256, 256] > L0c, K=64 fits L0 -> full-K; consumed on-chip
+                c = pl.matmul(a, b)  # [256, 256] > L0c, K=32 fits L0 (k == K) -> full-K; consumed on-chip
                 d = pl.matmul(c, e)
                 out = pl.assemble(out, d, [0, 0])
                 return out
@@ -1584,10 +1584,20 @@ class TestAutoTileMatmulL0MatScratch:
         After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
         printed = ir.python_print(After)
         assert "tile.create" in printed and "Mem.Mat" in printed, "expected a Mat output scratch"
-        assert "pl.tile.assemble(" in printed, "the Mat scratch is filled by Acc->Mat assembles"
-        # Full-K → the pipelined emitter; the assembles live inside a pl.pipeline loop.
-        assert any("pl.pipeline(" in line for line in printed.splitlines()), (
-            "full-K Mat-scratch must use the pipelined emitter (pl.pipeline loop)"
+        assemble_lines = [line for line in printed.splitlines() if "pl.tile.assemble(" in line]
+        assert assemble_lines, "the Mat scratch is filled by Acc->Mat assembles"
+
+        # Full-K → the pipelined emitter, whose interior assembles carry LOOP-VARIABLE
+        # offsets. Split-K (BuildSplitKGrid) also pipelines but emits CONSTANT offsets,
+        # so a bare `pl.pipeline` check cannot distinguish the two — the offset form can.
+        def _offset_is_loop_variable(line: str) -> bool:
+            offset = line.rsplit("[", 1)[-1].split("]", 1)[0]  # content of the final [...] (the offset)
+            return any(ch.isalpha() for ch in offset)
+
+        assert any(_offset_is_loop_variable(line) for line in assemble_lines), (
+            "full-K Mat-scratch must emit loop-variable assemble offsets (the pipelined "
+            "interior of BuildFullKPipelined); only constant offsets means split-K:\n"
+            + "\n".join(assemble_lines)
         )
         _assert_ssa_valid(After, "test_full_k_mat_scratch_chained")
 
@@ -1596,8 +1606,8 @@ class TestAutoTileMatmulL0MatScratch:
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         torch.manual_seed(0)
-        a = torch.randn(256, 64)
-        b = torch.randn(64, 256)
+        a = torch.randn(256, 32)
+        b = torch.randn(32, 256)
         e = torch.randn(256, 64)
         out = torch.zeros(256, 64)
         ns: dict = {}
