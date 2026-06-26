@@ -621,6 +621,22 @@ def _full_k_stationary_operand(after) -> str:
     raise AssertionError("no stationary extract found in the outer loop body")
 
 
+def _lower_to_tile_ops(program):
+    """Run the tensor→tile lowering prefix so a tensor-level chained matmul reaches
+    ``AutoTileMatmulL0`` as the real ``c = tile.matmul(a, b); d = tile.matmul(c, e)``
+    it sees in the pipeline (the chained tile-matmul is not hand-constructible — the
+    user-facing op guard rejects an Acc operand, but ConvertTensorToTileOps builds it
+    internally)."""
+    for p in (
+        passes.convert_to_ssa(),
+        passes.convert_tensor_to_tile_ops(),
+        passes.lower_composite_ops(),
+        passes.flatten_tile_nd_to_2d(),
+    ):
+        program = p(program)
+    return program
+
+
 class TestAutoTileMatmulL0MNTiling:
     """M/N output tiling.
 
@@ -1447,6 +1463,116 @@ class TestAutoTileMatmulL0Skips:
         incore_after = passes.auto_tile_matmul_l0()(InCoreProg)
         with pytest.raises(ValueError, match="Structural equality"):
             ir.assert_structural_equal(incore_after, InCoreProg)
+
+
+class TestAutoTileMatmulL0MatScratch:
+    """M/N output tiling to an L1/Mat scratch (on-chip matmul consumer), not DDR.
+
+    When an oversized ``[M, N]`` matmul result is consumed *only* as a matmul operand
+    (a chained matmul), the pass tiles the output into a ``tile.create(target=Mat)``
+    scratch via per-sub-tile ``tile.assemble`` (Acc→Mat) and keeps it on-chip for the
+    consumer, instead of the direct-GM store path.  K-split only for now — the
+    constant-offset grid satisfies ``tile.assemble``'s literal-offset requirement."""
+
+    def test_chained_matmul_uses_mat_scratch(self):
+        """An oversized producer feeding a matmul: the pass assembles the result into a
+        Mat scratch (2×2 grid → 4 Acc→Mat assembles), the consumer reads the scratch,
+        and SSA stays valid.  Structural — the numerical end-to-end path depends on the
+        in-place merge + full pipeline (a follow-up)."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                e: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                c = pl.matmul(a, b)  # [256, 256] FP32 > L0c → on-chip consumer → Mat scratch
+                d = pl.matmul(c, e)  # consumes c only as a matmul operand
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+
+        assert "tile.create" in printed and "Mem.Mat" in printed, "expected a Mat output scratch"
+        assert printed.count("pl.tile.assemble(") == 4, "2×2 grid → 4 Acc→Mat assembles"
+        assert "pl.tile.matmul(a__ssa_v0_mat, b__ssa_v0_mat)" not in printed, (
+            "the oversized producer must be tiled, not left whole"
+        )
+        _assert_ssa_valid(After, "test_mat_scratch_chained")
+
+        # Numerically correct vs (a @ b) @ e, executed through torch_codegen.
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(256, 128)
+        b = torch.randn(128, 256)
+        e = torch.randn(256, 64)
+        out = torch.zeros(256, 64)
+        ns: dict = {}
+        exec(torch_codegen(After), ns)  # noqa: S102 — executing generated reference code is the point
+        ns["kernel"](a, b, e, out)
+        expected = (a @ b) @ e
+        assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
+            f"split-K Mat-scratch chained mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+    def test_chained_matmul_full_k_uses_pipelined_mat_scratch(self):
+        """A *full-K* (K fits L0) oversized chained matmul tiles into a Mat scratch via
+        the **pipelined** emitter — the Acc->Mat ``tile.assemble`` lands inside the
+        ``pl.pipeline`` loop with loop-variable offsets (``tile.assemble`` accepts a
+        ``MakeTuple`` of index-typed variables, not only constants)."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 64], pl.FP32],
+                b: pl.Tensor[[64, 256], pl.FP32],
+                e: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                c = pl.matmul(a, b)  # [256, 256] > L0c, K=64 fits L0 -> full-K; consumed on-chip
+                d = pl.matmul(c, e)
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+        assert "tile.create" in printed and "Mem.Mat" in printed, "expected a Mat output scratch"
+        assert "pl.tile.assemble(" in printed, "the Mat scratch is filled by Acc->Mat assembles"
+        # Full-K → the pipelined emitter; the assembles live inside a pl.pipeline loop.
+        assert any("pl.pipeline(" in line for line in printed.splitlines()), (
+            "full-K Mat-scratch must use the pipelined emitter (pl.pipeline loop)"
+        )
+        _assert_ssa_valid(After, "test_full_k_mat_scratch_chained")
+
+        # Numerically correct vs (a @ b) @ e, executed through torch_codegen.
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(256, 64)
+        b = torch.randn(64, 256)
+        e = torch.randn(256, 64)
+        out = torch.zeros(256, 64)
+        ns: dict = {}
+        exec(torch_codegen(After), ns)  # noqa: S102 — executing generated reference code is the point
+        ns["kernel"](a, b, e, out)
+        expected = (a @ b) @ e
+        assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
+            f"full-K Mat-scratch chained mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
 
 
 if __name__ == "__main__":

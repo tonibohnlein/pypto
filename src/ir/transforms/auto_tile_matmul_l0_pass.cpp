@@ -646,12 +646,37 @@ ExprPtr AddOffset(const ExprPtr& base, const ExprPtr& delta, const Span& sp) {
 /// ``VisitVarLike_`` covers both Var and IterArg (.claude/rules/ir-kind-traits.md).
 class SiblingUseCounter : public IRVisitor {
  public:
-  std::unordered_map<const Var*, int> counts;  ///< all reads
+  std::unordered_map<const Var*, int> counts;               ///< all reads
+  std::unordered_map<const Var*, int> matmul_operand_uses;  ///< reads at a matmul-operand position
 
  protected:
-  void VisitVarLike_(const VarPtr& op) override { ++counts[op.get()]; }
+  void VisitVarLike_(const VarPtr& op) override {
+    ++counts[op.get()];
+    if (in_matmul_operand_) ++matmul_operand_uses[op.get()];
+  }
   // Skip the LHS (a def); count only reads in the RHS value.
   void VisitStmt_(const AssignStmtPtr& op) override { VisitExpr(op->value_); }
+  // A *direct* Var at a matmul OPERAND position (``tile.matmul`` args {0,1};
+  // ``tile.matmul_acc`` args {1,2} — arg 0 is the Acc accumulator, NOT a matrix
+  // operand) is a Mat-safe consumer use: the consumer K-tiles that operand, so an
+  // L1/Mat scratch produced upstream is legal there.  Classifying by operand index
+  // is essential — a scratch fed to ``matmul_acc`` arg 0 would be an illegal
+  // Mat-for-Acc substitution and must stay deferred.
+  void VisitExpr_(const CallPtr& op) override {
+    const std::string& name = op->op_ ? op->op_->name_ : std::string();
+    const bool is_mm = name == "tile.matmul";
+    const bool is_acc = name == "tile.matmul_acc";
+    for (size_t i = 0; i < op->args_.size(); ++i) {
+      const bool operand_pos = (is_mm && (i == 0 || i == 1)) || (is_acc && (i == 1 || i == 2));
+      const bool prev = in_matmul_operand_;
+      in_matmul_operand_ = operand_pos && (AsVarLike(op->args_[i]) != nullptr);
+      VisitExpr(op->args_[i]);
+      in_matmul_operand_ = prev;
+    }
+  }
+
+ private:
+  bool in_matmul_operand_ = false;
 };
 
 /// One-shot index over a SeqStmts' children, built lazily on the first
@@ -664,6 +689,7 @@ class SiblingUseCounter : public IRVisitor {
 /// not change until we rewrite it).
 struct SiblingIndex {
   std::unordered_map<const Var*, int> use_counts;
+  std::unordered_map<const Var*, int> matmul_operand_uses;  ///< reads at a matmul-operand position
   std::unordered_map<const Var*, const AssignStmt*> store_of;
 };
 
@@ -680,6 +706,7 @@ SiblingIndex BuildSiblingIndex(const std::vector<StmtPtr>& stmts) {
     if (auto src = AsVarLike(call->args_[0])) idx.store_of.emplace(src.get(), as.get());
   }
   idx.use_counts = std::move(counter.counts);
+  idx.matmul_operand_uses = std::move(counter.matmul_operand_uses);
   return idx;
 }
 
@@ -751,6 +778,52 @@ class DirectGmPlacer : public SubtilePlacer {
   VarPtr out_in_;
   std::string out_base_;
   std::vector<std::pair<std::string, std::any>> kwargs_;
+  Span sp_;
+};
+
+/// Mat-scratch placement (on-chip matmul consumers): keep the whole ``[M, N]``
+/// result in an L1/Mat scratch instead of storing it to a DDR tensor, so a
+/// matmul-operand consumer reads it on-chip.  ``Init`` creates the scratch (mirrors
+/// ``BuildAccInit`` but in ``Mat``); each ``PlaceAt`` assembles a sub-tile in place:
+/// ``scratch_{k+1} = tile.assemble(scratch_k, sub, [row_off, col_off])`` — Acc→Mat,
+/// lowering to ``pto.subview`` + ``pto.tmov`` (the codegen landed in PR #1860).
+/// ``tile.assemble`` is ``set_output_memory_inherit_input()``, so the chain shares
+/// one Mat base before MemoryReuse runs (no full-scratch copy per insert).
+///
+/// ``tile.assemble``'s offset is a literal ``MakeTuple`` whose *elements* may be
+/// loop variables (``ValidateIndexTupleElements`` only requires index-typed
+/// elements, not constants), so this placer drives both the constant-offset
+/// unrolled grid (``BuildSplitKGrid``, K-split) and the loop-variable pipelined
+/// emitter (``BuildFullKPipelined``, full-K).
+class MatScratchPlacer : public SubtilePlacer {
+ public:
+  MatScratchPlacer(int64_t big_m, int64_t big_n, DataType dtype, std::string base, Span span)
+      : m_(big_m), n_(big_n), dtype_(std::move(dtype)), base_(std::move(base)), sp_(std::move(span)) {}
+
+  [[nodiscard]] VarPtr Init(std::vector<StmtPtr>& stmts) override {
+    auto& reg = OpRegistry::GetInstance();
+    std::vector<std::pair<std::string, std::any>> kwargs = {{"dtype", dtype_},
+                                                            {"target_memory", MemorySpace::Mat}};
+    auto call = reg.Create("tile.create", {MakeIndexTuple({m_, n_}, sp_)}, kwargs, sp_);
+    auto scratch = std::make_shared<Var>(base_, call->GetType(), sp_);
+    stmts.push_back(std::make_shared<AssignStmt>(scratch, call, sp_));
+    return scratch;
+  }
+
+  [[nodiscard]] VarPtr PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub, const ExprPtr& row_off,
+                               const ExprPtr& col_off, const VarPtr& chain_in, int step) override {
+    auto& reg = OpRegistry::GetInstance();
+    auto offs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{row_off, col_off}, sp_);
+    auto call = reg.Create("tile.assemble", {chain_in, sub, offs}, sp_);
+    auto sv = std::make_shared<Var>(base_ + "_t" + std::to_string(step), call->GetType(), sp_);
+    stmts.push_back(std::make_shared<AssignStmt>(sv, call, sp_));
+    return sv;
+  }
+
+ private:
+  int64_t m_, n_;
+  DataType dtype_;
+  std::string base_;
   Span sp_;
 };
 
@@ -1010,6 +1083,40 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
       "or fed to a non-store consumer is deferred; left untouched");
 }
 
+/// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
+/// L0c into a Mat-scratch grid when the result is consumed *entirely* at
+/// matmul-operand positions (a chained matmul reads it on-chip).  Each sub-tile is
+/// assembled into an L1/Mat scratch (``MatScratchPlacer``) instead of stored to a
+/// DDR tensor, keeping the whole result on-chip; the caller remaps the matmul
+/// result Var to the returned scratch Var.  Returns the grid stmts + scratch Var.
+///
+/// Both K-split (unrolled, constant offsets) and full-K (pipelined, loop-variable
+/// offsets) are supported: ``tile.assemble`` only needs a literal ``MakeTuple``
+/// offset whose *elements* may be loop variables (`ValidateIndexTupleElements`
+/// requires index-typed elements, not constants).  ``matmul_acc`` and Vec-left
+/// stay deferred.
+std::optional<std::pair<std::vector<StmtPtr>, VarPtr>> TryFoldMatScratch(const MatmulTiling& t,
+                                                                         int result_uses, int operand_uses,
+                                                                         std::vector<Diagnostic>& hints) {
+  const Span sp = t.assign->span_;
+  // matmul_acc / Vec-left are deferred (the direct-store path already hinted these).
+  if (t.is_acc() || t.stage_lhs_to_mat) return std::nullopt;
+  // Every use must be a matmul operand: a non-operand use (store, elementwise,
+  // matmul_acc accumulator) means substituting an upstream Mat scratch is illegal.
+  if (result_uses < 1 || operand_uses != result_uses) return std::nullopt;
+  auto result_ty = As<TileType>(t.assign->var_->GetType());
+  INTERNAL_CHECK_SPAN(result_ty, sp) << "Internal error: matmul result is not a TileType";
+  const std::string base = t.assign->var_->name_hint_ + "_mat";
+  MatScratchPlacer placer(t.M, t.N, result_ty->dtype_, base, sp);
+  // K-split (K spans >= 2 L0 blocks) → unrolled per-sub-tile K-loop grid; full-K →
+  // the pipelined interior + straight-line tail.  Both drive MatScratchPlacer,
+  // which assembles each sub-tile into the L1/Mat scratch (tile.assemble accepts
+  // constant or loop-variable offsets).
+  const bool full_k = t.K / t.k < 2;
+  auto [stmts, scratch] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
+  return std::make_pair(std::move(stmts), scratch);
+}
+
 class AutoTileMutator : public IRMutator {
  public:
   std::vector<Diagnostic> hints;
@@ -1089,6 +1196,19 @@ class AutoTileMutator : public IRMutator {
           const Var* result = assign->var_.get();
           auto uc_it = sibling_index->use_counts.find(result);
           const int result_uses = uc_it == sibling_index->use_counts.end() ? 0 : uc_it->second;
+          auto mo_it = sibling_index->matmul_operand_uses.find(result);
+          const int operand_uses = mo_it == sibling_index->matmul_operand_uses.end() ? 0 : mo_it->second;
+          // Mat-scratch: result consumed entirely on-chip at matmul-operand
+          // positions — assemble the sub-tiles into an L1/Mat scratch and remap the
+          // matmul result to it.  Emitted at the matmul site (like the K-only
+          // rewrite), with no store to defer.  Checked before the direct-store fold
+          // so its hints stay clean (a stored result has a non-operand use here).
+          if (auto ms = TryFoldMatScratch(*tiling, result_uses, operand_uses, hints)) {
+            for (auto& s : ms->first) out.push_back(std::move(s));
+            remap[assign->var_.get()] = ms->second;
+            changed = true;
+            continue;
+          }
           auto store_it = sibling_index->store_of.find(result);
           const AssignStmt* store_stmt =
               store_it == sibling_index->store_of.end() ? nullptr : store_it->second;
