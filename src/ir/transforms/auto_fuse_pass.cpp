@@ -81,8 +81,6 @@ int64_t ComputeCost(::OpType type, int64_t w, int64_t h, int64_t k) {
 // tile-geometry compute model set, the per-op base_cost above is ignored.
 // TODO(cost-model): read these from BackendHandler instead of hardcoding 910B.
 constexpr int64_t kFastMemoryCapacity = 1LL << 30;  // single-pool capacity hint
-constexpr int64_t kNativeW = 128;
-constexpr int64_t kNativeH = 128;
 constexpr int kNumCubeCores = 24;               // AIC cores (matmul)
 constexpr int kNumVectorCores = 48;             // AIV cores (pointwise / reduction)
 constexpr int64_t kL1Capacity = 512 * 1024;     // per-cube L1/Mat operand pool
@@ -237,8 +235,6 @@ class ProblemBuilder {
 
   void Build(const FunctionPtr& func, const ProgramPtr& prog) {
     problem.fast_memory_capacity = kFastMemoryCapacity;
-    problem.native_w = kNativeW;
-    problem.native_h = kNativeH;
     // Topology + on-chip capacities from the configured backend's SoC (the safe
     // UB cap and 950 specs are picked up automatically; 910B defaults if none).
     const HwParams hw = ReadHwParams();
@@ -419,9 +415,7 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
   f << "],\n  \"op_types\": [";
   for (size_t i = 0; i < no; ++i)
     f << (i ? "," : "") << (p.ops[i].type == ::OpType::MatMul ? "\"MatMul\"" : "\"Pointwise\"");
-  f << "],\n  \"fast_memory_capacity\": " << p.fast_memory_capacity
-    << ",\n  \"native_granularity\": ["
-    << p.native_w << ", " << p.native_h << "]";
+  f << "],\n  \"fast_memory_capacity\": " << p.fast_memory_capacity;
   // 910B topology + grounded pto-isa machine model — emit so a dumped instance
   // re-loads (io.cpp) into the SAME grounded cost path the pass solved with.
   f << ",\n  \"num_cube_cores\": " << p.num_cube_cores
