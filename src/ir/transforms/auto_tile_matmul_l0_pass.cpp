@@ -73,13 +73,20 @@
 /// When ``ChooseL0Tile`` returns ``m < M`` or ``n < N`` the ``[M, N]`` output
 /// Acc overflows L0c.  The operands are already Mat-resident, so only the
 /// output overflows: for a plain ``tile.matmul`` whose result is consumed by a
-/// single 2D ``tile.store(c, base, out)``, the pass unrolls the output into a
-/// ``ceil(M/m) x ceil(N/n)`` grid and emits, per sub-tile origin ``(mi, ni)``,
-/// the K-loop above for the ``[m_eff, n_eff]`` (partial on the boundary) sub-
-/// tile followed by ``tile.store(c_sub, [base_r + mi, base_c + ni], out_prev)``.
-/// The stores chain the output tensor in SSA form; the final store's result
-/// replaces the original store downstream.  Boundary sub-tiles use static
-/// partial extents, so ``m`` / ``n`` need not divide ``M`` / ``N``.
+/// single 2D ``tile.store(c, base, out)`` (the direct-store path), the pass
+/// unrolls the output into a ``ceil(M/m) x ceil(N/n)`` grid and emits, per
+/// sub-tile origin ``(mi, ni)``, the ``[m_eff, n_eff]`` (partial on the
+/// boundary) sub-tile compute followed by
+/// ``tile.store(c_sub, [base_r + mi, base_c + ni], out_prev)``.  Each sub-tile
+/// uses the pipelined K-loop above when K spans >= 2 L0 blocks, or — when
+/// ``k == K`` (the full K fits L0a/L0b at once) — a single straight-line
+/// ``tile.matmul``, emitted as **nested pipelined loops** over the divisible
+/// interior so ``LowerPipelineLoops`` double-buffers the operand extracts (see
+/// ``BuildFullKPipelined``; the partial boundary is peeled into a straight-line
+/// tail, and the stationary axis is auto-picked by panel cost).  The stores
+/// chain the output tensor in SSA form; the final store's result replaces the
+/// original store downstream.  Boundary sub-tiles use static partial extents, so
+/// ``m`` / ``n`` need not divide ``M`` / ``N``.
 ///
 /// Supported today:
 ///   * ``tile.matmul`` and ``tile.matmul_acc``.  ``tile.matmul_bias`` is
@@ -87,10 +94,11 @@
 ///     rewriting that is not yet implemented.
 ///   * K tiling (``m == M and n == N``) for ``tile.matmul`` and
 ///     ``tile.matmul_acc``; M/N tiling for plain ``tile.matmul`` with a single
-///     2D ``tile.store`` consumer.  M/N tiling of ``tile.matmul_acc`` (needs
-///     per-sub-tile accumulator slicing), of a Vec left operand, of a single
-///     K block (``K / k < 2``), or of a non-store consumer (needs the
-///     Mat-scratch / ``tile.assemble`` path) is deferred — those emit a
+///     2D ``tile.store`` consumer (the direct-store path), with either a
+///     pipelined K-loop or a straight-line single-K-block (``k == K``) per
+///     sub-tile.  M/N tiling of ``tile.matmul_acc`` (needs per-sub-tile
+///     accumulator slicing), of a Vec left operand, or of a result consumed
+///     on-chip (not by a single 2D store) is deferred — those emit a
 ///     ``PerfHint`` and skip.
 ///   * ``K % k == 0``.  K-boundary handling (slice valid_shape on the last
 ///     iteration) is not yet implemented; mismatched cases emit a
@@ -98,13 +106,6 @@
 ///
 /// Already-L0-sized matmuls (chooser returns ``(M, N, K)``) are left
 /// untouched.
-///
-/// TODO(M/N tiling): the general Mat-scratch path from the original TODO is
-/// still open — for on-chip / non-store consumers (chained matmul, elementwise)
-/// the [M, N] result must land in a Mat scratch and each [m, n] sub-tile be
-/// inserted via an Acc→Mat ``tile.assemble`` (lowering to ``pto.tinsert``).
-/// That path also needs Mat-capacity checking and per-sub-tile accumulator
-/// slicing for ``tile.matmul_acc``.  Until then those cases emit ``PH-AT-006``.
 
 #include <algorithm>
 #include <any>
@@ -624,15 +625,29 @@ ExprPtr OffsetPlus(const ExprPtr& base, int64_t delta, const Span& sp) {
   return MakeAdd(base, MakeIndex(delta, sp), sp);
 }
 
+/// ``base + delta`` where ``delta`` is an Expr — a static ConstInt in the
+/// unrolled grid (folded like ``OffsetPlus``) or a loop variable in the
+/// pipelined emitter (left as a ``MakeAdd``).
+ExprPtr AddOffset(const ExprPtr& base, const ExprPtr& delta, const Span& sp) {
+  if (auto cd = As<ConstInt>(delta)) {
+    if (cd->value_ == 0) return base;  // base + 0 = base (folds even for a dynamic base)
+    if (auto cb = As<ConstInt>(base)) return MakeIndex(cb->value_ + cd->value_, sp);
+  }
+  if (auto cb = As<ConstInt>(base)) {
+    if (cb->value_ == 0) return delta;  // 0 + delta = delta
+  }
+  return MakeAdd(base, delta, sp);
+}
+
 /// Counts reads (uses) of every Var/IterArg across a statement list, excluding
-/// AssignStmt LHS defs.  Built once per SeqStmts (see ``CountSiblingUses``) so
+/// AssignStmt LHS defs.  Built once per SeqStmts (see ``BuildSiblingIndex``) so
 /// the M/N foldability check — "is the matmul result used exactly once?" — is
 /// an O(1) lookup, keeping the pass O(N) overall rather than rescanning the
 /// siblings for every oversized matmul (.claude/rules/pass-complexity.md).
 /// ``VisitVarLike_`` covers both Var and IterArg (.claude/rules/ir-kind-traits.md).
 class SiblingUseCounter : public IRVisitor {
  public:
-  std::unordered_map<const Var*, int> counts;
+  std::unordered_map<const Var*, int> counts;  ///< all reads
 
  protected:
   void VisitVarLike_(const VarPtr& op) override { ++counts[op.get()]; }
@@ -671,29 +686,279 @@ SiblingIndex BuildSiblingIndex(const std::vector<StmtPtr>& stmts) {
 
 /// One folded M/N rewrite: the unrolled per-sub-tile K-loops + stores that
 /// replace ``c = tile.matmul(...)`` together with its consumer store
-/// ``out = tile.store(c, base, out)``.
+/// ``out = tile.store(c, base, out)``.  The grid emits at the consumer-store
+/// position; the store's LHS is remapped to ``return_var`` and the store
+/// dropped.
 struct MNFold {
-  std::vector<StmtPtr> stmts;         ///< inner K-loops + per-sub-tile stores (emitted at the store site)
-  VarPtr return_var;                  ///< final output-tensor SSA value
+  std::vector<StmtPtr> stmts;         ///< pipelined interior + tail / K-loops + per-sub-tile placement
+  VarPtr return_var;                  ///< final output tensor value (replaces the store's result downstream)
   VarPtr store_result_var;            ///< the consumer store's LHS (remapped to return_var)
   const AssignStmt* store = nullptr;  ///< consumer store to drop from the SeqStmts
 };
 
-/// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
-/// L0c into an unrolled grid of ``ceil(M/m) x ceil(N/n)`` sub-tile matmuls,
-/// each computing an ``[m, n]`` (partial on the boundary) Acc result and
-/// storing it straight to the output tensor at ``out[mi:, ni:]``.  Operands are
-/// already Mat-resident, so only the output Acc overflows; sub-tiling the
-/// output keeps every Acc tile within L0c.
+/// Where each computed ``[m_eff, n_eff]`` Acc sub-tile is placed.  The M/N grid
+/// builders (``BuildFullKPipelined`` interior+tail, ``BuildSplitKGrid`` K-loop
+/// grid) are placement-agnostic: they compute each sub-tile's Acc result and
+/// hand it to a ``SubtilePlacer``, which stores it to a DDR output tensor
+/// (``DirectGmPlacer`` — the only placement supported today).  The placer
+/// threads its chained output Var in traversal order and yields the final Var
+/// via ``PlaceAt``.  The abstraction is kept (rather than inlining the single
+/// placer) so additional placements can be added without touching the grid
+/// builders.
+class SubtilePlacer {
+ public:
+  virtual ~SubtilePlacer() = default;
+  /// Emit any prologue and return the initial chained Var: the raw output
+  /// tensor for DirectGM.  The grid threads this Var through each ``PlaceAt``
+  /// and returns the final one.
+  [[nodiscard]] virtual VarPtr Init(std::vector<StmtPtr>& stmts) = 0;
+  /// Place ``sub`` (an ``[m, n]`` Acc result) into ``chain_in`` at output offsets
+  /// ``(row_off, col_off)`` — both Exprs (static ConstInt in the unrolled grid,
+  /// loop variables in the pipelined emitter).  Append the placement stmt and
+  /// return the new chained Var.  Stateless so it works inside a loop body where
+  /// the chain is a loop iter-arg.
+  [[nodiscard]] virtual VarPtr PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub, const ExprPtr& row_off,
+                                       const ExprPtr& col_off, const VarPtr& chain_in, int step) = 0;
+};
+
+/// Direct-store placement: ``out = tile.store(sub, [base_r + mi, base_c + ni],
+/// out_prev)`` per sub-tile, chaining the DDR output tensor in SSA form.
+class DirectGmPlacer : public SubtilePlacer {
+ public:
+  DirectGmPlacer(ExprPtr base_r, ExprPtr base_c, VarPtr out_in,
+                 std::vector<std::pair<std::string, std::any>> store_kwargs, Span span)
+      : base_r_(std::move(base_r)),
+        base_c_(std::move(base_c)),
+        out_in_(std::move(out_in)),
+        out_base_(out_in_->name_hint_),
+        kwargs_(std::move(store_kwargs)),
+        sp_(std::move(span)) {}
+
+  [[nodiscard]] VarPtr Init(std::vector<StmtPtr>& /*stmts*/) override { return out_in_; }
+
+  [[nodiscard]] VarPtr PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub, const ExprPtr& row_off,
+                               const ExprPtr& col_off, const VarPtr& chain_in, int step) override {
+    auto& reg = OpRegistry::GetInstance();
+    auto offs = std::make_shared<MakeTuple>(
+        std::vector<ExprPtr>{AddOffset(base_r_, row_off, sp_), AddOffset(base_c_, col_off, sp_)}, sp_);
+    auto scall = reg.Create("tile.store", {sub, offs, chain_in}, kwargs_, sp_);
+    auto sv = std::make_shared<Var>(out_base_ + "_t" + std::to_string(step), scall->GetType(), sp_);
+    stmts.push_back(std::make_shared<AssignStmt>(sv, scall, sp_));
+    return sv;
+  }
+
+ private:
+  ExprPtr base_r_, base_c_;
+  VarPtr out_in_;
+  std::string out_base_;
+  std::vector<std::pair<std::string, std::any>> kwargs_;
+  Span sp_;
+};
+
+/// Emit one straight-line full-K sub-tile (no K-loop): extract the ``[m_eff, K]``
+/// left and ``[K, n_eff]`` right panels, ``tile.matmul``, and hand the
+/// ``[m_eff, n_eff]`` result to ``placer``.  ``m_eff`` / ``n_eff`` may be a
+/// partial (< m / < n) remainder — this is the boundary-tile emitter for the
+/// full-K grid's L-shaped tail (the divisible interior is pipelined instead).
+/// Returns the chain after placement.
+VarPtr EmitFullKTile(std::vector<StmtPtr>& stmts, const MatmulTiling& t, SubtilePlacer& placer,
+                     const VarPtr& chain, int64_t mi, int64_t ni, int64_t m_eff, int64_t n_eff,
+                     const std::string& base, int step) {
+  const Span sp = t.assign->span_;
+  auto& reg = OpRegistry::GetInstance();
+  auto sa = BuildExtract(t.lhs, {m_eff, t.K}, MakeIndex(mi, sp), MakeIndex(0, sp), MemorySpace::Left,
+                         base + "_ta" + std::to_string(step), sp);
+  auto sb = BuildExtract(t.rhs, {t.K, n_eff}, MakeIndex(0, sp), MakeIndex(ni, sp), MemorySpace::Right,
+                         base + "_tb" + std::to_string(step), sp);
+  stmts.push_back(sa);
+  stmts.push_back(sb);
+  auto c_call = reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
+  auto c_var = std::make_shared<Var>(base + "_tc" + std::to_string(step), c_call->GetType(), sp);
+  stmts.push_back(std::make_shared<AssignStmt>(c_var, c_call, sp));
+  return placer.PlaceAt(stmts, c_var, MakeIndex(mi, sp), MakeIndex(ni, sp), chain, step);
+}
+
+/// Build the full-K (``k == K``) M/N grid as a pipelined **interior** plus a
+/// straight-line **tail**, so the downstream ``LowerPipelineLoops`` double-buffers
+/// both operand extracts (the latency win the pto-isa A2A3 cost model predicts:
+/// hiding the per-sub-tile L1→L0 extract behind the cube keeps it fed).
 ///
-/// Requires the matmul's result to be consumed by exactly one 2D
-/// ``tile.store(c, base, out)`` (``result_uses`` and ``store_stmt`` come from
-/// the precomputed SiblingIndex); that store is folded into the per-sub-tile
-/// rewrite (the DDR-output case our solver kernels need).  Returns nullopt
-/// (with a PerfHint) when the pattern does not match — the matmul is then left
-/// untouched.  ``matmul_acc`` (caller-supplied [M, N] accumulator) and a Vec
-/// left operand both need the Mat-scratch / per-iter assemble path that is
-/// still deferred.
+///   # interior: the [0, full_m) x [0, full_n) region tiled by FULL m x n blocks
+///   out = for mi in pipeline(0, full_m, m):       # outer (stationary) axis
+///       A = extract(lhs, mi, 0, [m, K], Left)
+///       out = for ni in pipeline(0, full_n, n):   # inner (moving) axis → B double-buffered
+///           B = extract(rhs, 0, ni, [K, n], Right)
+///           out = place(matmul(A, B), mi, ni, out)
+///   # tail: straight-line partial tiles over the L-shaped boundary
+///   for ni in 0..N:           out = place(matmul(A[M-full_m,K], B[K, n_eff]), full_m, ni, out)
+///   for mi in 0..full_m:      out = place(matmul(A[m, K], B[K, N-full_n]), mi, full_n, out)
+///
+/// The interior pipelines with **exact trip counts** (``full_m`` / ``full_n`` are
+/// multiples of ``m`` / ``n`` by construction), so no divisibility constraint on
+/// ``M`` / ``N`` is needed — any aligned tile the chooser picks works, and the
+/// partial boundary is peeled rather than forcing a tiny exact-divisor tile.
+/// The outer-loop (stationary) axis is chosen to minimise total operand-extract
+/// traffic over the interior grid: A-stationary (rows outer) costs
+/// ``P*A + P*Q*B``, B-stationary (cols outer) ``P*Q*A + Q*B`` (``P`` / ``Q`` =
+/// interior row/col blocks, ``A`` / ``B`` = the per-panel extract bytes), so the
+/// stationary operand is re-extracted once per outer step.  Drives the same
+/// ``SubtilePlacer`` as the split-K grid, so the direct-store placement comes
+/// out double-buffered.
+std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& t, SubtilePlacer& placer) {
+  const Span sp = t.assign->span_;
+  auto& reg = OpRegistry::GetInstance();
+  const std::string base = t.assign->var_->name_hint_;
+  // A tile never exceeds the problem dims (you cannot tile M into blocks larger
+  // than M); the chooser guarantees this, so the interior always has >= 1 block.
+  INTERNAL_CHECK_SPAN(t.m <= t.M && t.n <= t.N, sp)
+      << "Internal error: full-K tile must not exceed the problem dims; got M=" << t.M << " m=" << t.m
+      << " N=" << t.N << " n=" << t.n;
+
+  // Choose the OUTER (stationary) panel by total interior extract traffic (see
+  // the row/column cost below) — the cheaper traversal's panel is re-extracted
+  // once per outer step.  AnalyzeMatmul guarantees both operands are TileType.
+  auto lhs_tile = As<TileType>(t.lhs->GetType());
+  auto rhs_tile = As<TileType>(t.rhs->GetType());
+  INTERNAL_CHECK_SPAN(lhs_tile && rhs_tile, sp)
+      << "Internal error: full-K pipelined operands must be TileType (guaranteed by AnalyzeMatmul)";
+  const int64_t a_panel = t.m * t.K * static_cast<int64_t>(DTypeBytes(lhs_tile->dtype_));
+  const int64_t b_panel = t.K * t.n * static_cast<int64_t>(DTypeBytes(rhs_tile->dtype_));
+  // Pick the traversal that minimises total operand-extract traffic over the
+  // interior grid (``p_blocks`` rows x ``q_blocks`` cols).  A-stationary (rows
+  // outer) extracts A once per row + B every step: T_row = P*A + P*Q*B.
+  // B-stationary (cols outer): T_col = P*Q*A + Q*B.  Comparing the totals is
+  // exact for rectangular grids — unlike the ``A >= B`` panel-size heuristic,
+  // which mis-picks when one axis has far more blocks (e.g. P=100, Q=2,
+  // A=1.5B: T_row=350B > T_col=302B, so column traversal wins despite A > B).
+  const int64_t p_blocks = t.M / t.m;  // interior row blocks (>= 1)
+  const int64_t q_blocks = t.N / t.n;  // interior col blocks (>= 1)
+  const int64_t t_row = p_blocks * a_panel + p_blocks * q_blocks * b_panel;
+  const int64_t t_col = p_blocks * q_blocks * a_panel + q_blocks * b_panel;
+  const bool row_outer = t_row <= t_col;  // A-stationary (rows outer) when row traversal is cheaper
+
+  // Interior = the region tiled by FULL m x n blocks; the L-shaped partial
+  // boundary beyond it is peeled into straight-line tiles below.
+  const int64_t full_m = (t.M / t.m) * t.m;
+  const int64_t full_n = (t.N / t.n) * t.n;
+
+  std::vector<StmtPtr> stmts;
+  VarPtr chain = placer.Init(stmts);
+
+  // --- Interior: nested pipelined loops over [0, full_m) x [0, full_n) ---
+  {
+    const int64_t outer_extent = row_outer ? full_m : full_n;
+    const int64_t outer_step = row_outer ? t.m : t.n;
+    const int64_t inner_extent = row_outer ? full_n : full_m;
+    const int64_t inner_step = row_outer ? t.n : t.m;
+    const TypePtr out_type = chain->GetType();
+    auto idx_type = std::make_shared<ScalarType>(DataType::INDEX);
+    auto outer_var = std::make_shared<Var>(base + "_o", idx_type, sp);
+    auto inner_var = std::make_shared<Var>(base + "_i", idx_type, sp);
+    ExprPtr mi = row_outer ? ExprPtr(outer_var) : ExprPtr(inner_var);
+    ExprPtr ni = row_outer ? ExprPtr(inner_var) : ExprPtr(outer_var);
+    // The output/scratch chain threads through both loops as an iter-arg; the
+    // inner iter-arg is initialised from the outer iter-arg.
+    auto out_outer = std::make_shared<IterArg>(base + "_oc", out_type, chain, sp);
+    auto out_inner = std::make_shared<IterArg>(base + "_ic", out_type, out_outer, sp);
+    auto sa = BuildExtract(t.lhs, {t.m, t.K}, mi, MakeIndex(0, sp), MemorySpace::Left, base + "_a", sp);
+    auto sb = BuildExtract(t.rhs, {t.K, t.n}, MakeIndex(0, sp), ni, MemorySpace::Right, base + "_b", sp);
+    const AssignStmtPtr& outer_extract = row_outer ? sa : sb;  // stationary panel
+    const AssignStmtPtr& inner_extract = row_outer ? sb : sa;  // moving panel
+    auto c_call = reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
+    auto c_var = std::make_shared<Var>(base + "_c", c_call->GetType(), sp);
+    std::vector<StmtPtr> inner_body{inner_extract, std::make_shared<AssignStmt>(c_var, c_call, sp)};
+    VarPtr inner_chain = placer.PlaceAt(inner_body, c_var, mi, ni, out_inner, /*step=*/0);
+    inner_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{inner_chain}, sp));
+    // overlap_stores=false: keep one L0C accumulator.  Letting CanonicalizeIOOrder
+    // float the stores below the next matmul would keep two [m, n] results co-live
+    // (2·m·n·bytes_c) while the chooser budgets one L0C buffer (double_buffer_c=
+    // false) → L0C overflow.  The one-accumulator schedule still double-buffers
+    // the moving-operand extract.
+    std::vector<std::pair<std::string, std::any>> inner_attrs = {{kPipelineStagesAttr, /*pipeline_stages=*/2},
+                                                                 {kPipelineOverlapStoresAttr, false}};
+    auto inner_rv = std::make_shared<Var>(base + "_irv", out_type, sp);
+    auto inner_for = std::make_shared<ForStmt>(inner_var, MakeIndex(0, sp), MakeIndex(inner_extent, sp),
+                                               MakeIndex(inner_step, sp), std::vector<IterArgPtr>{out_inner},
+                                               SeqStmts::Flatten(std::move(inner_body), sp),
+                                               std::vector<VarPtr>{inner_rv}, sp, ForKind::Pipeline,
+                                               /*chunk_config=*/std::nullopt, std::move(inner_attrs));
+    std::vector<StmtPtr> outer_body{outer_extract, inner_for,
+                                    std::make_shared<YieldStmt>(std::vector<ExprPtr>{inner_rv}, sp)};
+    std::vector<std::pair<std::string, std::any>> outer_attrs = {{kPipelineStagesAttr, /*pipeline_stages=*/2},
+                                                                 {kPipelineOverlapStoresAttr, false}};
+    auto outer_rv = std::make_shared<Var>(base + "_orv", out_type, sp);
+    auto outer_for = std::make_shared<ForStmt>(outer_var, MakeIndex(0, sp), MakeIndex(outer_extent, sp),
+                                               MakeIndex(outer_step, sp), std::vector<IterArgPtr>{out_outer},
+                                               SeqStmts::Flatten(std::move(outer_body), sp),
+                                               std::vector<VarPtr>{outer_rv}, sp, ForKind::Pipeline,
+                                               /*chunk_config=*/std::nullopt, std::move(outer_attrs));
+    stmts.push_back(outer_for);
+    chain = outer_rv;
+  }
+
+  // --- Tail: straight-line partial tiles for the L-shaped boundary ---
+  // Bottom strip [full_m, M) x [0, N) (covers the corner), then right strip
+  // [0, full_m) x [full_n, N).  Either is empty when its dim divides evenly.
+  // step 0 is used by the interior placement; the tail continues from step 1.
+  int tail_step = 1;
+  for (int64_t ni = 0; full_m < t.M && ni < t.N; ni += t.n) {
+    chain = EmitFullKTile(stmts, t, placer, chain, full_m, ni, t.M - full_m, std::min<int64_t>(t.n, t.N - ni),
+                          base, tail_step++);
+  }
+  for (int64_t mi = 0; full_n < t.N && mi < full_m; mi += t.m) {
+    chain = EmitFullKTile(stmts, t, placer, chain, mi, full_n, t.m, t.N - full_n, base, tail_step++);
+  }
+  return {std::move(stmts), chain};
+}
+
+/// Build the split-K M/N grid: ``ceil(M/m) x ceil(N/n)`` sub-tiles, each a
+/// pipelined K-loop (``BuildKLoopRewrite``) over the ``[m_eff, n_eff]`` output,
+/// handed to ``placer`` for placement.  Used when K spans >= 2 L0 blocks, so the
+/// operand panel does not fit L0 and cannot stay resident across sub-tiles
+/// (unlike the full-K pipelined path).  N-major traversal preserves the
+/// historical sub-tile ordering / naming.
+std::pair<std::vector<StmtPtr>, VarPtr> BuildSplitKGrid(const MatmulTiling& t, SubtilePlacer& placer) {
+  const Span sp = t.assign->span_;
+  const std::string base = t.assign->var_->name_hint_;
+  const int64_t num_m = (t.M + t.m - 1) / t.m;
+  const int64_t num_n = (t.N + t.n - 1) / t.n;
+
+  std::vector<StmtPtr> stmts;
+  VarPtr chain = placer.Init(stmts);
+  int step = 0;
+  for (int64_t nj = 0; nj < num_n; ++nj) {
+    const int64_t ni = nj * t.n;
+    const int64_t n_eff = std::min<int64_t>(t.n, t.N - ni);
+    for (int64_t mj = 0; mj < num_m; ++mj) {
+      const int64_t mi = mj * t.m;
+      const int64_t m_eff = std::min<int64_t>(t.m, t.M - mi);
+      const std::string tbase = base + "_t" + std::to_string(step);
+
+      auto inner = BuildKLoopRewrite(MakeKLoop(t, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, tbase));
+      for (auto& s : inner.stmts) stmts.push_back(std::move(s));
+      chain = placer.PlaceAt(stmts, inner.return_var, MakeIndex(mi, sp), MakeIndex(ni, sp), chain, step);
+      ++step;
+    }
+  }
+  return {std::move(stmts), chain};
+}
+
+/// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
+/// L0c into a ``ceil(M/m) x ceil(N/n)`` grid of sub-tile matmuls, each computing
+/// an ``[m, n]`` (partial on the boundary) Acc result.  Operands are already
+/// Mat-resident, so only the output Acc overflows; sub-tiling keeps every Acc
+/// tile within L0c.  Only the direct-store consumer is supported today:
+///
+///   * **Direct-store** — the sole consumer is a 2D ``tile.store(c, base, out)``:
+///     each sub-tile stores straight to ``out[mi:, ni:]`` (the DDR-output case
+///     our solver kernels need).  The store is folded in and emitted at the
+///     store site.
+///
+/// ``result_uses`` / ``store_stmt`` come from the precomputed SiblingIndex.
+/// Returns nullopt (with a PerfHint) when the consumer is not a single 2D
+/// store — ``matmul_acc`` (caller-supplied [M, N] accumulator), a Vec left
+/// operand, and a result consumed on-chip (not by a single 2D store) are all
+/// deferred.
 std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, const AssignStmt* store_stmt,
                                       std::vector<Diagnostic>& hints) {
   const Span sp = t.assign->span_;
@@ -711,83 +976,39 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
     return skip(
         "tile.matmul with a Vec left operand needs M/N tiling — the PV path is deferred; left untouched");
   }
-  // M/N tiling reuses the whole-output K-loop builder per sub-tile, which
-  // assumes a real (>= 2-trip) pipelined K-loop.  K == k (single block) would
-  // need a straight-line per-sub-tile matmul instead — deferred.
-  if (t.K / t.k < 2) {
-    return skip(
-        "tile.matmul output exceeds L0c but K fits in a single L0 block (K / k < 2); the "
-        "single-K-block M/N form is not yet supported — left untouched");
-  }
+  // K spans >= 2 L0 blocks → pipelined K-loop per sub-tile (BuildSplitKGrid);
+  // k == K (full K fits L0a/L0b) → pipelined interior + straight-line partial
+  // tail (BuildFullKPipelined).  Either grid drives the chosen SubtilePlacer;
+  // neither requires m | M or n | N (the full-K tail peels the partial boundary).
+  const bool full_k = t.K / t.k < 2;
 
-  // The result must be consumed exactly once, by the 2D store we fold in.
-  if (result_uses != 1 || !store_stmt) {
-    return skip(
-        "tile.matmul output exceeds L0c but its result is not consumed by exactly one 2D "
-        "tile.store — M/N direct-store fold needs `out = tile.store(c, ...)`; left untouched");
-  }
-  auto store_call = As<Call>(store_stmt->value_);
-  INTERNAL_CHECK_SPAN(store_call, store_stmt->span_)
-      << "Internal error: SiblingIndex store_of mapped a non-Call AssignStmt";
-
-  auto offs = As<MakeTuple>(store_call->args_[1]);
-  if (!offs || offs->elements_.size() != 2) {
-    return skip("tile.store offsets are not a 2D tuple — M/N fold not applicable; left untouched");
-  }
-  const ExprPtr base_r = offs->elements_[0];
-  const ExprPtr base_c = offs->elements_[1];
-  auto out_in = AsVarLike(store_call->args_[2]);
-  if (!out_in) {
-    return skip(
-        "tile.store target is not a simple tensor variable — M/N fold not applicable; left "
-        "untouched");
-  }
-
-  // Chain the per-sub-tile stores from the raw output tensor.  The folded
-  // stmts are emitted later, at the consumer-store position, where the caller
-  // re-applies the then-current remap — so if a prior fold redefines this
-  // output between the matmul and its store (independent of statement order),
-  // the chain start is rewritten correctly at emission time.  Resolving it
-  // here against the matmul-visit-time remap would miss folds processed after
-  // this one but emitted before it (a stale-output SSA bug).
-  ExprPtr out_value = out_in;
-
-  auto& reg = OpRegistry::GetInstance();
-  const std::string base = t.assign->var_->name_hint_;
-  const std::string out_base = out_in->name_hint_;
-  const int64_t num_m = (t.M + t.m - 1) / t.m;
-  const int64_t num_n = (t.N + t.n - 1) / t.n;
-
-  std::vector<StmtPtr> stmts;
-  VarPtr last_out = out_in;
-  int tile_idx = 0;
-  for (int64_t nj = 0; nj < num_n; ++nj) {
-    const int64_t ni = nj * t.n;
-    const int64_t n_eff = std::min<int64_t>(t.n, t.N - ni);
-    for (int64_t mj = 0; mj < num_m; ++mj) {
-      const int64_t mi = mj * t.m;
-      const int64_t m_eff = std::min<int64_t>(t.m, t.M - mi);
-      const std::string tbase = base + "_t" + std::to_string(tile_idx);
-
-      // Inner K-loop: accumulate lhs[mi:mi+m_eff, :] @ rhs[:, ni:ni+n_eff] over
-      // K into an [m_eff, n_eff] Acc result.
-      auto inner = BuildKLoopRewrite(MakeKLoop(t, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, tbase));
-      for (auto& s : inner.stmts) stmts.push_back(std::move(s));
-
-      // Store the sub-tile straight to out[base_r + mi :, base_c + ni :].
-      auto store_offs = std::make_shared<MakeTuple>(
-          std::vector<ExprPtr>{OffsetPlus(base_r, mi, sp), OffsetPlus(base_c, ni, sp)}, sp);
-      auto scall =
-          reg.Create("tile.store", {inner.return_var, store_offs, out_value}, store_call->kwargs_, sp);
-      auto sv = std::make_shared<Var>(out_base + "_t" + std::to_string(tile_idx), scall->GetType(), sp);
-      stmts.push_back(std::make_shared<AssignStmt>(sv, scall, sp));
-      out_value = sv;
-      last_out = sv;
-      ++tile_idx;
+  // Direct-store: the sole consumer is a 2D tile.store.  The grid is emitted
+  // later at the store site, where the caller re-applies the then-current remap
+  // — so a prior fold that redefined this output is rewritten correctly (a
+  // stale-output SSA guard); resolving it here would miss folds emitted before
+  // this one.
+  if (store_stmt && result_uses == 1) {
+    auto store_call = As<Call>(store_stmt->value_);
+    INTERNAL_CHECK_SPAN(store_call, store_stmt->span_)
+        << "Internal error: SiblingIndex store_of mapped a non-Call AssignStmt";
+    auto offs = As<MakeTuple>(store_call->args_[1]);
+    if (!offs || offs->elements_.size() != 2) {
+      return skip("tile.store offsets are not a 2D tuple — M/N fold not applicable; left untouched");
     }
+    auto out_in = AsVarLike(store_call->args_[2]);
+    if (!out_in) {
+      return skip(
+          "tile.store target is not a simple tensor variable — M/N fold not applicable; left untouched");
+    }
+    DirectGmPlacer placer(offs->elements_[0], offs->elements_[1], out_in, store_call->kwargs_, sp);
+    auto [stmts, last_out] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
+    return MNFold{std::move(stmts), last_out, store_stmt->var_, store_stmt};
   }
 
-  return MNFold{std::move(stmts), last_out, store_stmt->var_, store_stmt};
+  return skip(
+      "tile.matmul output exceeds L0c but its result is not consumed by a single 2D tile.store "
+      "(direct-store) — a result consumed on-chip (chained matmul / elementwise), stored-and-reused, "
+      "or fed to a non-store consumer is deferred; left untouched");
 }
 
 class AutoTileMutator : public IRMutator {

@@ -34,6 +34,24 @@ namespace ir {
 /// (loop is left intact for ``CanonicalizeIOOrder`` to reorder and demote).
 inline constexpr const char* kPipelineStagesAttr = "pipeline_stages";
 
+/// Optional ``bool`` policy attr on a ``ForKind::Pipeline`` ``ForStmt``: when
+/// ``false``, ``CanonicalizeIOOrder`` keeps store-like ops in the *compute*
+/// stage tier instead of floating them to the bottom ``Store`` tier.
+///
+/// Rationale: the default (absent ⇒ ``true``) floats all sibling-iteration
+/// stores below all compute, which keeps both iterations' *output* tiles
+/// co-live — a ping-pong on the output buffer. For the full-K M/N matmul
+/// pipeline each iteration writes a *different, large* L0C result, so output
+/// ping-pong would force two L0C buffers co-live (``2·m·n·bytes_c``) while the
+/// tile chooser budgets only one (``double_buffer_c == false``) — an L0C
+/// overflow at allocation. Setting this ``false`` yields the one-accumulator
+/// schedule ``extract_i, extract_{i+1}, matmul_i, store_i, matmul_{i+1}, …``:
+/// the moving-operand extract is still double-buffered (Load tier, hoisted),
+/// but ``store_i`` drains before ``matmul_{i+1}`` overwrites the single L0C
+/// accumulator. Consumed (stripped) by ``CanonicalizeIOOrder`` alongside
+/// ``pipeline_stages``.
+inline constexpr const char* kPipelineOverlapStoresAttr = "pipeline_overlap_stores";
+
 /// Return a copy of `attrs` with any entry matching `key` removed. The order of
 /// the remaining entries is preserved.
 inline std::vector<std::pair<std::string, std::any>> StripAttr(
