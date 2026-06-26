@@ -20,6 +20,7 @@ one kernel. The Outline/Convert/Tile pipeline then lowers each scope to a cube
 (AIC) or vector (AIV) kernel.
 """
 
+import json
 import re
 
 import pypto.language as pl
@@ -191,6 +192,49 @@ class TestAutoFuse:
         assert str(incores[0].func_type) == "FunctionType.AIC"
         mlir = codegen.PTOCodegen().generate(ir.Program([incores[0]], incores[0].name, incores[0].span))
         assert "cube" in mlir and mlir.count("pto.tmatmul") >= 2  # both matmuls fused in
+
+    def test_chained_matmul_preserves_operand_input_order(self, tmp_path, monkeypatch):
+        """Regression: the solver Problem must list each matmul's inputs in OPERAND
+        order — inputs[0]=LHS, inputs[1]=RHS — because the cost model derives
+        M/N/K positionally (K = inputs[0].width, N = inputs[1].width).
+
+        The builder collected inputs into a ``std::set<size_t>``, which re-sorts by
+        tensor index. In-params are registered before op outputs, so for a chained
+        ``(A@B)@D`` the sink ``matmul(t, d)`` came out as ``[d, t]`` (in-param d has
+        the lower index) instead of ``[t, d]`` — silently swapping LHS/RHS and
+        scrambling the sink's M/N/K. We assert via the env-gated Problem dump that
+        the on-chip intermediate is the sink's FIRST input.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def chain(
+                self,
+                a: pl.Tensor[[128, 256], pl.FP32],
+                b: pl.Tensor[[256, 128], pl.FP32],
+                d: pl.Tensor[[128, 256], pl.FP32],
+            ) -> pl.Tensor[[128, 256], pl.FP32]:
+                t: pl.Tensor[[128, 128], pl.FP32] = pl.matmul(a, b)
+                c: pl.Tensor[[128, 256], pl.FP32] = pl.matmul(t, d)
+                return c
+
+        passes.auto_fuse()(Prog)
+
+        dag = json.loads((tmp_path / "chain.dag.json").read_text())
+        inputs, outputs = dag["inputs"], dag["outputs"]
+        # The sink is the op that consumes another op's output (the intermediate t).
+        sink_idx = intermediate = None
+        for i, ins in enumerate(inputs):
+            for j, outs in enumerate(outputs):
+                if j != i and outs[0] in ins:
+                    sink_idx, intermediate = i, outs[0]
+        assert sink_idx is not None, dag
+        sink_inputs = inputs[sink_idx]
+        # pl.matmul(t, d): the intermediate t is the LHS, so it MUST be inputs[0].
+        assert sink_inputs[0] == intermediate, (sink_inputs, intermediate)
+        assert len(sink_inputs) == 2 and sink_inputs[1] != intermediate
 
     def test_chained_pointwise_fuses_into_one_tiled_kernel(self, ascend_backend):
         """Two chained pointwise ops the solver groups fuse into one tiled vector
