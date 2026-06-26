@@ -80,8 +80,7 @@ int64_t ComputeCost(::OpType type, int64_t w, int64_t h, int64_t k) {
 // `set_910b` in 3rdparty/mlsys26/test/ascend_910b_test.cpp); with the
 // tile-geometry compute model set, the per-op base_cost above is ignored.
 // TODO(cost-model): read these from BackendHandler instead of hardcoding 910B.
-constexpr int64_t kFastMemoryCapacity = 1LL << 30;  // legacy single-pool fallback
-constexpr int64_t kSlowMemoryBandwidth = 10;        // legacy lumped DDR (grounded path overrides)
+constexpr int64_t kFastMemoryCapacity = 1LL << 30;  // single-pool capacity hint
 constexpr int64_t kNativeW = 128;
 constexpr int64_t kNativeH = 128;
 constexpr int kNumCubeCores = 24;               // AIC cores (matmul)
@@ -90,14 +89,11 @@ constexpr int64_t kL1Capacity = 512 * 1024;     // per-cube L1/Mat operand pool
 constexpr int64_t kCubeCapacity = 128 * 1024;   // per-cube L0c accumulator
 constexpr int64_t kVecCapacity = 192 * 1024;    // per-vector UB
 constexpr int64_t kCubeComputeCost = 1;         // grounded per-repeat multiplier (cyc applies fp32 2x)
-constexpr int64_t kVectorComputeCost = 1;       // per vector SIMD step
-constexpr int64_t kVectorLanes = 256;           // elements per vector SIMD step
 constexpr int64_t kKernelFillCost = 10000;      // per-kernel pipeline fill (cycles)
 
 // Grounded pto-isa machine model (Ascend 910B / A2A3). Costs are in CORE CYCLES;
 // bandwidths are GiB/s per direction (pto-isa arch_config.hpp). See the solver's
-// types.h Problem::cube_freq_hz block for the exact formulas. These replace the
-// coarse kSlowMemoryBandwidth / kCubeComputeCost placeholders on the cube path.
+// types.h Problem::cube_freq_hz block for the exact formulas.
 constexpr double kCubeFreqHz = 1.85e9;          // core clock (A2A3)
 constexpr double kBwGmL1   = 135.0;             // GM->L1 operand reload
 constexpr double kBwL0cGm  = 70.0;              // L0C->GM output store
@@ -241,7 +237,6 @@ class ProblemBuilder {
 
   void Build(const FunctionPtr& func, const ProgramPtr& prog) {
     problem.fast_memory_capacity = kFastMemoryCapacity;
-    problem.slow_memory_bandwidth = kSlowMemoryBandwidth;
     problem.native_w = kNativeW;
     problem.native_h = kNativeH;
     // Topology + on-chip capacities from the configured backend's SoC (the safe
@@ -254,8 +249,6 @@ class ProblemBuilder {
     problem.vec_capacity = hw.vec_capacity;
     // Cost-model calibration (not in the SoC).
     problem.cube_compute_cost = kCubeComputeCost;
-    problem.vector_compute_cost = kVectorComputeCost;
-    problem.vector_lanes = kVectorLanes;
     problem.kernel_fill_cost = kKernelFillCost;
     problem.ddr_atomic_add = true;  // 910B SetAtomicAdd (split-K partials merge in DDR)
     // Grounded pto-isa machine model (cycles + per-direction GiB/s bandwidths +
@@ -427,19 +420,16 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
   for (size_t i = 0; i < no; ++i)
     f << (i ? "," : "") << (p.ops[i].type == ::OpType::MatMul ? "\"MatMul\"" : "\"Pointwise\"");
   f << "],\n  \"fast_memory_capacity\": " << p.fast_memory_capacity
-    << ",\n  \"slow_memory_bandwidth\": " << p.slow_memory_bandwidth << ",\n  \"native_granularity\": ["
+    << ",\n  \"native_granularity\": ["
     << p.native_w << ", " << p.native_h << "]";
   // 910B topology + grounded pto-isa machine model — emit so a dumped instance
-  // re-loads (io.cpp) into the SAME grounded cost path the pass solved with,
-  // not the single-context legacy fallback.
+  // re-loads (io.cpp) into the SAME grounded cost path the pass solved with.
   f << ",\n  \"num_cube_cores\": " << p.num_cube_cores
     << ",\n  \"num_vector_cores\": " << p.num_vector_cores
     << ",\n  \"cube_capacity\": " << p.cube_capacity
     << ",\n  \"vec_capacity\": " << p.vec_capacity
     << ",\n  \"l1_capacity\": " << p.l1_capacity
     << ",\n  \"cube_compute_cost\": " << p.cube_compute_cost
-    << ",\n  \"vector_compute_cost\": " << p.vector_compute_cost
-    << ",\n  \"vector_lanes\": " << p.vector_lanes
     << ",\n  \"kernel_fill_cost\": " << p.kernel_fill_cost
     << ",\n  \"ddr_atomic_add\": " << (p.ddr_atomic_add ? "true" : "false")
     << ",\n  \"cube_freq_hz\": " << p.cube_freq_hz
