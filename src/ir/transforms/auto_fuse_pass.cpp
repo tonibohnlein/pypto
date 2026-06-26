@@ -64,21 +64,9 @@ namespace ir {
 namespace pass {
 namespace {
 
-// Placeholder work/throughput cost model. The throughput is tuned so a pointwise
-// op is memory-bound (compute < DDR transfer) like the real vector unit —
-// otherwise fusion, which only saves memory traffic, shows no benefit.
-// TODO(cost-model): ground in BackendHandler throughput.
-int64_t ComputeCost(::OpType type, int64_t w, int64_t h, int64_t k) {
-  constexpr int64_t kThroughput = 64;
-  if (type == ::OpType::MatMul) {
-    return (w * h * (k > 0 ? k : w)) / kThroughput;
-  }
-  return (w * h) / kThroughput;
-}
-
 // Hardware parameters. v0 hardcodes the Ascend 910B machine model (mirrors
-// `set_910b` in 3rdparty/mlsys26/test/ascend_910b_test.cpp); with the
-// tile-geometry compute model set, the per-op base_cost above is ignored.
+// `set_910b` in 3rdparty/mlsys26/test/ascend_910b_test.cpp); the solver derives
+// per-op compute from tile geometry (the grounded pto-isa fractal/vector model).
 // TODO(cost-model): read these from BackendHandler instead of hardcoding 910B.
 constexpr int64_t kFastMemoryCapacity = 1LL << 30;  // single-pool capacity hint
 constexpr int kNumCubeCores = 24;               // AIC cores (matmul)
@@ -321,8 +309,6 @@ class ProblemBuilder {
       sop.inputs = std::move(inputs);
       const size_t out = stmt_output_.at(stmt);
       sop.outputs.push_back(out);
-      const ::Tensor& ot = problem.tensors[out];
-      sop.base_cost = ComputeCost(sop.type, ot.width, ot.height, ot.width);
       problem.ops.push_back(std::move(sop));
       op_labels.push_back(call->op_->name_);
       op_stmts.push_back(stmt);
@@ -410,8 +396,6 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     }
     f << (i ? "," : "") << "\"" << s << "\"";
   }
-  f << "],\n  \"base_costs\": [";
-  for (size_t i = 0; i < no; ++i) f << (i ? "," : "") << p.ops[i].base_cost;
   f << "],\n  \"op_types\": [";
   for (size_t i = 0; i < no; ++i)
     f << (i ? "," : "") << (p.ops[i].type == ::OpType::MatMul ? "\"MatMul\"" : "\"Pointwise\"");
@@ -1187,7 +1171,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       const ::Tensor& ot = p.tensors[op.outputs[0]];
       LOG_INFO << "  op[" << i << "] " << (op.type == ::OpType::MatMul ? "MatMul   " : "Pointwise")
                << " " << builder.op_labels[i] << "  in={" << ins << "} -> t" << op.outputs[0] << " ["
-               << ot.width << "x" << ot.height << "]  cost=" << op.base_cost;
+               << ot.width << "x" << ot.height << "]";
     }
 
     // Solve, then print the fusion decision: each group's member ops + chosen tile.
