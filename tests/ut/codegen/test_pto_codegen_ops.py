@@ -1570,12 +1570,12 @@ class TestTileAssembleCodegen:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                a: pl.Tensor[[256, 64], pl.FP32],
-                b: pl.Tensor[[64, 256], pl.FP32],
+                a: pl.Tensor[[256, 32], pl.FP32],
+                b: pl.Tensor[[32, 256], pl.FP32],
                 e: pl.Tensor[[256, 64], pl.FP32],
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
-                c = pl.matmul(a, b)  # [256, 256] > L0c, K=64 fits L0 -> full-K; consumed on-chip
+                c = pl.matmul(a, b)  # [256, 256] > L0c, K=32 fits L0 (k == K) -> full-K; consumed on-chip
                 d = pl.matmul(c, e)
                 out = pl.assemble(out, d, [0, 0])
                 return out
