@@ -15,8 +15,9 @@ Validates on device the four cases from examples/kernels/11_auto_tile_matmul.py:
 **full-K** (K=32, k == K) or **split-K** (K=128) reduction. Golden: torch.
 
 This is the on-device validation the unit / codegen / pto-verify checks cannot give (actual
-execution). Ascend910B (``a2a3``) only: the Mat-scratch Acc->Mat lowering is the 910B
-converting-``pto.tmov`` path; the a5 ``TINSERT`` assemble is a separate lowering.
+execution). Ascend910B (``a2a3``) only: the Mat-scratch Acc->Mat lowering is the 910B bf16
+``pto.tinsert`` FIXPIPE path (the f32 accumulator is downcast into the bf16 scratch); the a5
+f32 converting-``pto.tmov`` assemble is a separate lowering.
 """
 
 import pytest
