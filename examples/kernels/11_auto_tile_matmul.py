@@ -74,7 +74,7 @@ def mat_split_k(a: pl.Tensor, b: pl.Tensor, e: pl.Tensor, out: pl.Out[pl.Tensor]
     ``pto.tinsert`` that fills the scratch."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="mat_split_k"):
         c = pl.matmul(a, b, out_dtype=pl.FP32)  # bf16 @ bf16 -> f32 [256, 256] (> L0c)
-        cb = pl.cast(c, pl.BF16)                # FIXPIPE downcast -> bf16 Mat scratch
+        cb = pl.cast(c, pl.BF16)  # FIXPIPE downcast -> bf16 Mat scratch
         d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumes the scratch on-chip
         out = pl.assemble(out, d, [0, 0])
     return out
@@ -87,7 +87,7 @@ def mat_full_k(a: pl.Tensor, b: pl.Tensor, e: pl.Tensor, out: pl.Out[pl.Tensor])
     the pipelined full-K nest with loop-variable offsets."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="mat_full_k"):
         c = pl.matmul(a, b, out_dtype=pl.FP32)  # bf16 @ bf16 -> f32 [256, 256] (> L0c)
-        cb = pl.cast(c, pl.BF16)                # FIXPIPE downcast -> bf16 Mat scratch
+        cb = pl.cast(c, pl.BF16)  # FIXPIPE downcast -> bf16 Mat scratch
         d = pl.matmul(cb, e, out_dtype=pl.FP32)
         out = pl.assemble(out, d, [0, 0])
     return out

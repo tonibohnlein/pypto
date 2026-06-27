@@ -816,9 +816,8 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
   // subview's *base* [M, N], not the [m, n] window — verified against ptoas
   // v0.45), and the f32->bf16 cast has no MTE1 `tmov` form. A same-dtype (f32)
   // full-window cross-space assemble keeps the subview/tmov path below.
-  const bool fixpipe_insert =
-      cross_space_acc_to_mat &&
-      (result_tile_type->dtype_ == DataType::BF16 || result_tile_type->dtype_ == DataType::FP16);
+  const bool fixpipe_insert = cross_space_acc_to_mat && (result_tile_type->dtype_ == DataType::BF16 ||
+                                                         result_tile_type->dtype_ == DataType::FP16);
   if (fixpipe_insert) {
     std::ostringstream tins;
     tins << "pto.tinsert ins(" << src << ", " << row_off << ", " << col_off;
