@@ -361,7 +361,13 @@ def _bind_sub_workers(
     return {**loaded, **callbacks}
 
 
-def _make_call_config(dc: DistributedConfig, run_config: RunConfig | None = None) -> Any:
+def _make_call_config(
+    dc: DistributedConfig,
+    run_config: RunConfig | None = None,
+    *,
+    dfx_base: Path | None = None,
+    co_enable_swimlane_dep_gen: bool = True,
+) -> Any:
     """Build a simpler ``CallConfig`` from the distributed config.
 
     The ``block_dim`` / ``aicpu_thread_num`` baseline always comes from the
@@ -372,13 +378,27 @@ def _make_call_config(dc: DistributedConfig, run_config: RunConfig | None = None
     config. ``None`` (the default) leaves the baseline untouched and the runtime
     applies its own ``PTO2_RING_*`` env var / compile-time fallback.
 
+    DFX diagnostics (``enable_dump_tensor`` / ``enable_pmu`` / ``enable_dep_gen``
+    / ``enable_scope_stats`` / ``enable_l2_swimlane``) are likewise read from
+    *run_config* and written to the shared ``config`` the host_orch chip dispatch
+    forwards to every ``orch.submit_next_level``; their artifacts land under
+    *dfx_base* (``<output_dir>/dfx_outputs``). ``enable_l2_swimlane`` co-enables
+    dep_gen so the converter can resolve task arrows / kernel names (see the
+    inline note on the single-pass timing trade-off vs the L2 two-pass).
+
     Args:
         dc: The program's distributed configuration (baseline).
-        run_config: Optional per-dispatch :class:`RunConfig` whose ``ring_*``
-            overrides are applied. ``None`` means no ring override.
+        run_config: Optional per-dispatch :class:`RunConfig` whose ``ring_*`` and
+            DFX overrides are applied. ``None`` means no override.
+        dfx_base: Directory under which DFX artifacts are written
+            (``<output_dir>/dfx_outputs``). Required whenever *run_config*
+            enables a DFX flag; created if missing.
 
     Returns:
         A fresh simpler ``CallConfig``.
+
+    Raises:
+        ValueError: a DFX flag is enabled but *dfx_base* is ``None``.
     """
     from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
         CallConfig,
@@ -389,10 +409,129 @@ def _make_call_config(dc: DistributedConfig, run_config: RunConfig | None = None
         call_config.block_dim = dc.block_dim
     call_config.aicpu_thread_num = dc.aicpu_thread_num
     if run_config is not None:
-        from .runner import _apply_ring_overrides  # noqa: PLC0415
+        from .runner import _apply_ring_overrides, _DfxOpts  # noqa: PLC0415
 
         _apply_ring_overrides(call_config, run_config)
+
+        dfx = _DfxOpts.from_run_config(run_config)
+        if dfx.any():
+            if dfx_base is None:
+                raise ValueError("_make_call_config: dfx_base is required when a DFX flag is enabled on L3")
+            dfx_base.mkdir(parents=True, exist_ok=True)
+            call_config.enable_dump_tensor = dfx.enable_dump_tensor
+            call_config.enable_pmu = dfx.enable_pmu
+            # Swimlane needs ``deps.json`` so the converter can resolve task
+            # arrows / kernel names. The one-shot path runs a clean two-pass
+            # (pass 1 dep_gen → deps.json, pass 2 swimlane → clean records) and
+            # sets ``co_enable_swimlane_dep_gen=False`` on the timing pass so
+            # dep_gen does not perturb it. Everywhere else (the timing-pass-less
+            # single-pass: prepared worker, or sim where conversion is skipped)
+            # co-enable dep_gen so swimlane still has a graph in one dispatch.
+            call_config.enable_dep_gen = dfx.enable_dep_gen or (
+                co_enable_swimlane_dep_gen and dfx.enable_l2_swimlane
+            )
+            call_config.enable_scope_stats = dfx.enable_scope_stats
+            call_config.enable_l2_swimlane = dfx.enable_l2_swimlane
+            # Base dir shared by every chip; ``_submit_chip`` namespaces it per
+            # rank (``<dfx_base>/rank{worker}``) so per-chip artifacts (pmu.csv,
+            # deps.json, l2_swimlane_records.json, ...) don't overwrite each other.
+            call_config.output_prefix = str(dfx_base)
     return call_config
+
+
+def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int) -> Any:
+    """``orch.submit_next_level`` with per-rank DFX ``output_prefix`` isolation.
+
+    The runtime path helpers root every diagnostic artifact at a fixed filename
+    under ``output_prefix`` (``<prefix>/pmu.csv`` etc.), so multiple chips
+    sharing one prefix would clobber each other. This wrapper appends
+    ``/rank{worker}`` for the duration of the submit, then restores the shared
+    ``config`` — safe because ``submit_next_level`` copies the ``CallConfig`` into
+    the task slot synchronously (orchestrator ``s.config = config``) before it
+    returns, so the restore never races the already-queued task.
+
+    When DFX is off (``output_prefix`` unset) or the dispatch is unconstrained
+    (``worker < 0``) the call is forwarded unchanged.
+
+    The codegen emits this for every rank-pinned chip dispatch; the comm-less
+    single-dispatch path keeps the bare ``orch.submit_next_level(...)`` call.
+    """
+    base = config.output_prefix
+    if not base or worker < 0:
+        return orch.submit_next_level(callable_id, task_args, config, worker=worker)
+    config.output_prefix = f"{base}/rank{worker}"
+    try:
+        return orch.submit_next_level(callable_id, task_args, config, worker=worker)
+    finally:
+        config.output_prefix = base
+
+
+def _collect_l3_swimlane(output_dir: Path, n_ranks: int, platform: str) -> None:
+    """Convert each rank's swimlane records into a ``merged_swimlane_*.json``.
+
+    The runtime writes ``rank{r}/l2_swimlane_records.json`` + ``rank{r}/deps.json``
+    per chip (``_submit_chip`` namespaced the dir; dep_gen is co-enabled with
+    swimlane). This best-effort post-pass runs the offline
+    ``swimlane_converter`` once per rank, resolving kernel names from a merged
+    map of every chip callable's ``kernel_config.py`` (``next_levels/*/``). Each
+    rank's records are single-chip, so the L2 converter applies unchanged.
+
+    Onboard-only: the simulator emits records but not the task metadata the
+    converter joins against, so conversion is skipped there (mirrors the L2
+    ``_collect_dfx_artifacts`` swimlane branch). Any failure is logged, never
+    raised — the raw records remain for manual conversion.
+    """
+    if platform.endswith("sim"):
+        print(
+            "Skipping L3 swimlane conversion on simulator: merged_swimlane_*.json "
+            "is only generated for onboard runs (raw l2_swimlane_records.json kept)."
+        )
+        return
+
+    from .runner import _generate_swimlane  # noqa: PLC0415
+
+    # ``glob("*/")`` directory filtering is only reliable on 3.11+; filter
+    # explicitly so this works on the 3.10 baseline too.
+    chip_dirs = sorted(d for d in (output_dir / "next_levels").glob("*") if d.is_dir())
+    merged: dict = {}
+    try:
+        from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+            load_kernel_config,
+        )
+
+        for chip_dir in chip_dirs:
+            kc = chip_dir / "kernel_config.py"
+            if kc.exists():
+                merged.update(load_kernel_config(str(kc)))
+    except Exception as e:  # noqa: BLE001 - best-effort label resolution, never fatal
+        print(f"Skipping L3 swimlane name_map ({type(e).__name__}: {e}); labels fall back to defaults")
+
+    dfx_base = output_dir / "dfx_outputs"
+    for r in range(n_ranks):
+        rank_dir = dfx_base / f"rank{r}"
+        records = rank_dir / "l2_swimlane_records.json"
+        if not records.exists():
+            continue
+        # Best-effort, as documented: a write/convert failure for one rank must
+        # not turn a successful dispatch into a post-processing crash. The raw
+        # records remain on disk for manual conversion.
+        try:
+            name_map_path: Path | None = None
+            if merged:
+                name_map_path = rank_dir / "name_map.json"
+                name_map_path.write_text(
+                    json.dumps(
+                        {"level": 2, "orchestrator_name": None, "callable_id_to_name": merged},
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            # ``work_dir`` only feeds the converter's ``-k`` fallback; the merged
+            # ``name_map`` passed as ``func_names`` takes precedence for labels.
+            work_dir = chip_dirs[0] if chip_dirs else output_dir
+            _generate_swimlane(work_dir, rank_dir, records, func_names=name_map_path)
+        except Exception as e:  # noqa: BLE001 - best-effort post-pass, never fatal
+            print(f"Skipping L3 swimlane conversion for rank {r} ({type(e).__name__}: {e}); raw records kept")
 
 
 def _is_simpler_tensor(arg: Any) -> bool:
@@ -465,9 +604,16 @@ def execute_distributed(
             worker-resident :class:`~pypto.runtime.DeviceTensor`.
         config: Optional per-dispatch :class:`RunConfig`. Its per-task
             ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
-            ``ring_dep_pool``) size this dispatch's runtime ring buffers; the
-            remaining (compile-side / DFX) fields are not consumed on the L3
-            dispatch path. ``None`` defers every ring field to the runtime.
+            ``ring_dep_pool``) size this dispatch's runtime ring buffers, and its
+            runtime-diagnostic DFX flags (``enable_dump_tensor`` / ``enable_pmu``
+            / ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``)
+            are written per rank under ``<output_dir>/dfx_outputs/rank{r}/``.
+            Onboard, ``enable_l2_swimlane`` runs a clean two-pass dispatch
+            (pass 1 dep_gen → ``deps.json``, pass 2 swimlane → records with
+            unperturbed timing) and additionally produces ``merged_swimlane_*.json``
+            per rank. The remaining compile-side fields are not consumed on the
+            dispatch path. ``None`` defers every ring field to the runtime and
+            leaves DFX off.
 
     Returns:
         The simpler ``RunTiming`` from the dispatch (``host_wall_us`` /
@@ -506,19 +652,64 @@ def execute_distributed(
 
     num_sub = max(dc.num_sub_workers, len(sub_worker_fns))
 
-    # Construct/register/init inside the try so a failure in any setup step still
-    # closes the worker and unlinks the rootinfo temp file — none of these leak.
-    w = None
-    try:
-        w = _construct_worker(dc, compiled.platform, runtime_name, num_sub)
-        sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
-        w.init()
-        return _dispatch(
-            w, entry_fn, tensors, chip_cids, sub_ids, _make_call_config(dc, config), len(dc.device_ids)
+    def _run_once(call_config: Any) -> Any:
+        """One full worker lifecycle (construct → register → init → dispatch → close).
+
+        Each call forks fresh chip workers and closes them, so the per-pass DFX
+        collectors — which live in the forked children, not this host process —
+        get clean SVM state every pass. That is why the L3 two-pass below does
+        not need the subprocess the in-process L2 path uses to dodge the
+        ``halHostRegister`` cap (rc 8).
+
+        Construct/register/init run inside the try so a failure in any setup step
+        still closes the worker and unlinks the rootinfo temp file.
+        """
+        w = None
+        try:
+            w = _construct_worker(dc, compiled.platform, runtime_name, num_sub)
+            sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
+            w.init()
+            return _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, call_config, len(dc.device_ids))
+        finally:
+            if w is not None:
+                w.close()
+
+    dfx_base = output_dir / "dfx_outputs"
+    swimlane = config is not None and config.enable_l2_swimlane
+
+    if config is not None and config.enable_l2_swimlane and not compiled.platform.endswith("sim"):
+        # Two-pass for clean timing, mirroring the L2 swimlane workflow: dep_gen
+        # collection perturbs timing, so the per-rank task graph and the kept
+        # timing come from separate dispatches.
+        import dataclasses  # noqa: PLC0415
+
+        print(
+            "[swimlane] L3 swimlane enabled -> running the dispatch twice "
+            "(dep_gen perturbs timing, so the graph and the timing are captured separately):"
         )
-    finally:
-        if w is not None:
-            w.close()
+        print("[swimlane] run 1/2: capturing the per-rank task graph (deps.json); its timing is discarded.")
+        deps_cfg = dataclasses.replace(
+            config,
+            enable_l2_swimlane=False,
+            enable_dep_gen=True,
+            enable_pmu=0,
+            enable_scope_stats=False,
+            enable_dump_tensor=0,
+        )
+        _run_once(_make_call_config(dc, deps_cfg, dfx_base=dfx_base))
+
+        print("[swimlane] run 2/2: measuring clean per-task timing (these are the reported numbers).")
+        timing_cfg = dataclasses.replace(config, enable_dep_gen=False)
+        timing = _run_once(
+            _make_call_config(dc, timing_cfg, dfx_base=dfx_base, co_enable_swimlane_dep_gen=False)
+        )
+    else:
+        timing = _run_once(_make_call_config(dc, config, dfx_base=dfx_base))
+
+    # Offline post-pass (reads the per-rank deps.json + records on disk).
+    if swimlane:
+        _collect_l3_swimlane(output_dir, len(dc.device_ids), compiled.platform)
+    return timing
 
 
 def execute_distributed_compiled(
@@ -547,8 +738,11 @@ def execute_distributed_compiled(
             parameter order (in-place, or input-only for a return-style program).
         config: Optional per-dispatch :class:`RunConfig`, forwarded to
             ``__call__``. Its per-task ring-sizing overrides size this dispatch's
-            runtime ring buffers; other (compile-side / DFX) fields are not
-            consumed on the L3 dispatch path.
+            runtime ring buffers, and its runtime-diagnostic DFX flags
+            (``enable_dump_tensor`` / ``enable_pmu`` / ``enable_dep_gen`` /
+            ``enable_scope_stats`` / ``enable_l2_swimlane``) are written per rank
+            under ``<output_dir>/dfx_outputs/rank{r}/``. Other compile-side
+            fields are not consumed on the dispatch path.
         platform: Override the persisted platform (e.g. ``a2a3sim`` → ``a2a3``).
         distributed_config: Override the persisted run config (e.g. a different
             set of ``device_ids``).
@@ -903,7 +1097,9 @@ class DistributedWorker(Worker):
         # mutated). With no RunConfig the prepared baseline is reused as-is.
         call_config = state["call_config"]
         if config is not None:
-            call_config = _make_call_config(compiled._distributed_config, config)
+            call_config = _make_call_config(
+                compiled._distributed_config, config, dfx_base=compiled.output_dir / "dfx_outputs"
+            )
 
         param_infos = state["param_infos"]
         n_params = len(param_infos)
@@ -945,6 +1141,17 @@ class DistributedWorker(Worker):
             call_config,
             state["device_nums"],
         )
+
+        # Offline post-pass (reads the per-rank records on disk; no worker needed).
+        # Note: unlike the one-shot ``execute_distributed`` path, the prepared
+        # worker reuses its forked chip children across dispatches, so it cannot
+        # re-fork between a deps pass and a timing pass without tripping the
+        # per-child ``halHostRegister`` cap (rc 8). It therefore runs swimlane
+        # single-pass (dep_gen co-enabled), so ``last_run_timing`` here includes
+        # dep_gen collection overhead. Use ``execute_distributed`` (one-shot) for
+        # clean two-pass swimlane timing.
+        if config is not None and config.enable_l2_swimlane:
+            _collect_l3_swimlane(compiled.output_dir, state["device_nums"], compiled.platform)
 
     # ------------------------------------------------------------------
     # Lifecycle

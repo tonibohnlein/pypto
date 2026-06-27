@@ -232,10 +232,21 @@ class _SpyRuntimeEnv:
 
 
 class _SpyCallConfig:
-    """Stand-in for simpler's ``CallConfig`` with a nested ``runtime_env``."""
+    """Stand-in for simpler's ``CallConfig`` with a nested ``runtime_env``.
+
+    Carries the same DFX defaults as the real ``CallConfig`` (all off,
+    ``output_prefix`` empty) so tests can assert the builder leaves them
+    untouched on the no-DFX path.
+    """
 
     def __init__(self) -> None:
         self.runtime_env = _SpyRuntimeEnv()
+        self.enable_l2_swimlane = False
+        self.enable_dump_tensor = 0
+        self.enable_pmu = 0
+        self.enable_dep_gen = False
+        self.enable_scope_stats = False
+        self.output_prefix = ""
 
 
 def _build_with_fake_callconfig(run_config, monkeypatch, **kwargs):
@@ -279,7 +290,7 @@ class TestBuildCallConfigRing:
         assert cfg.runtime_env.ring_dep_pool == 0
 
 
-def _make_dist_call_config_with_fake(dc, run_config, monkeypatch):
+def _make_dist_call_config_with_fake(dc, run_config, monkeypatch, *, dfx_base=None):
     """Invoke ``distributed_runner._make_call_config`` with a spy ``CallConfig``.
 
     Injects a fake ``simpler.task_interface`` so the L3 config builder runs
@@ -293,7 +304,7 @@ def _make_dist_call_config_with_fake(dc, run_config, monkeypatch):
     monkeypatch.setitem(sys.modules, "simpler.task_interface", fake_task_interface)
     from pypto.runtime.distributed_runner import _make_call_config  # noqa: PLC0415
 
-    return _make_call_config(dc, run_config)
+    return _make_call_config(dc, run_config, dfx_base=dfx_base)
 
 
 class TestMakeCallConfigRing:
@@ -340,6 +351,81 @@ class TestMakeCallConfigRing:
         assert cfg.runtime_env.ring_heap == 1024 * 1024
         assert cfg.runtime_env.ring_task_window == 0
         assert cfg.runtime_env.ring_dep_pool == 0
+
+
+class TestMakeCallConfigDfx:
+    """Verify L3 ``_make_call_config`` wires the runtime DFX diagnostics.
+
+    The runtime-diagnostic flags (``enable_dump_tensor`` / ``enable_pmu`` /
+    ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``) are
+    transcribed onto the shared ``CallConfig`` and their artifacts rooted at
+    ``dfx_base``. ``enable_l2_swimlane`` additionally co-enables ``dep_gen`` so
+    the converter has a task graph (see :class:`test_swimlane_sets_flag...`).
+    """
+
+    def test_dfx_flags_transcribed_and_prefix_set(self, monkeypatch, tmp_path):
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+
+        dfx_base = tmp_path / "dfx_outputs"
+        run_config = RunConfig(
+            platform="a2a3sim",
+            enable_dump_tensor=2,
+            enable_pmu=1,
+            enable_dep_gen=True,
+            enable_scope_stats=True,
+        )
+        cfg = _make_dist_call_config_with_fake(
+            DistributedConfig(), run_config, monkeypatch, dfx_base=dfx_base
+        )
+        assert cfg.enable_dump_tensor == 2
+        assert cfg.enable_pmu == 1
+        assert cfg.enable_dep_gen is True
+        assert cfg.enable_scope_stats is True
+        assert cfg.output_prefix == str(dfx_base)
+        # The builder creates the base dir so the runtime's validate() accepts it.
+        assert dfx_base.is_dir()
+
+    def test_swimlane_sets_flag_and_co_enables_dep_gen(self, monkeypatch, tmp_path):
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+
+        dfx_base = tmp_path / "dfx_outputs"
+        # User asks for swimlane only; dep_gen is auto-enabled because the
+        # converter needs deps.json to resolve task arrows / kernel names.
+        run_config = RunConfig(platform="a2a3sim", enable_l2_swimlane=True)
+        cfg = _make_dist_call_config_with_fake(
+            DistributedConfig(), run_config, monkeypatch, dfx_base=dfx_base
+        )
+        assert cfg.enable_l2_swimlane is True
+        assert cfg.enable_dep_gen is True  # co-enabled
+        assert cfg.output_prefix == str(dfx_base)
+
+    def test_dfx_without_base_raises(self, monkeypatch):
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+
+        run_config = RunConfig(platform="a2a3sim", enable_pmu=1)
+        with pytest.raises(ValueError, match="dfx_base is required"):
+            _make_dist_call_config_with_fake(DistributedConfig(), run_config, monkeypatch, dfx_base=None)
+
+    def test_no_run_config_leaves_dfx_off(self, monkeypatch):
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+
+        cfg = _make_dist_call_config_with_fake(DistributedConfig(), None, monkeypatch)
+        assert cfg.output_prefix == ""
+        assert cfg.enable_pmu == 0
+        assert cfg.enable_dep_gen is False
+
+    def test_ring_only_run_config_creates_no_dfx_dir(self, monkeypatch, tmp_path):
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+
+        dfx_base = tmp_path / "dfx_outputs"
+        run_config = RunConfig(platform="a2a3sim", ring_heap=1024 * 1024)
+        cfg = _make_dist_call_config_with_fake(
+            DistributedConfig(), run_config, monkeypatch, dfx_base=dfx_base
+        )
+        # Ring sizing applied, DFX untouched, and no artifact dir materialized.
+        assert cfg.runtime_env.ring_heap == 1024 * 1024
+        assert cfg.output_prefix == ""
+        assert not dfx_base.exists()
 
 
 class TestRunConfigCompileForwarding:

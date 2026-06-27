@@ -327,4 +327,162 @@ def allreduce(
     return DistributedTensor(expr=call)
 
 
-__all__ = ["alloc_window_buffer", "allreduce", "get", "put", "window"]
+def barrier(
+    signal: DistributedTensor,
+) -> DistributedTensor:
+    """Cross-rank barrier synchronisation.
+
+    Blocks until all ranks in the comm group have reached the barrier.
+    Uses a window-bound INT32 ``signal`` matrix for cross-rank
+    synchronisation (one slot per rank).  LowerCompositeOps expands this
+    into a notify-all / wait-all sequence.
+
+    .. code-block:: python
+
+        sig = pld.tensor.barrier(sig)
+
+    **Signal buffer is single-shot per call.**  The lowering uses
+    ``Set(1)`` + ``Ge(1)`` — cells go from 0 to 1.  Do not reuse the
+    same signal buffer for back-to-back barriers without reallocation.
+
+    Args:
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` whose
+            shape provides one cell per rank.  Must be freshly allocated
+            for this call.
+
+    Returns:
+        The rebound :class:`pld.DistributedTensor` view of ``signal``.
+    """
+    signal_expr: Expr
+    (signal_expr,) = _unwrap_distributed_tensors("pld.tensor.barrier", signal=signal)
+    call = _ir_tensor.barrier(signal_expr)
+    return DistributedTensor(expr=call)
+
+
+def broadcast(
+    target: DistributedTensor,
+    signal: DistributedTensor,
+    *,
+    root: int,
+) -> DistributedTensor:
+    """Broadcast root rank's data to all ranks.
+
+    After this call returns, every rank's slice of ``target`` holds
+    root's data.  Uses a window-bound INT32 ``signal`` matrix for the
+    cross-rank barrier.
+
+    .. code-block:: python
+
+        # Root stages data; non-root skip.
+        if my_rank == ROOT_RANK:
+            data = pl.store(local, [0, 0], data)
+        data = pld.tensor.broadcast(data, sig, root=ROOT_RANK)
+        # Every rank now has root's data in data[0, 0:SIZE].
+
+    Args:
+        target: Window-bound :class:`pld.DistributedTensor` holding per-rank
+            data.  Root must stage its data before the call; non-root slots
+            are ignored on input.
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` for the
+            cross-rank barrier.  Single-shot per call.
+        root: Root rank index (int, keyword-only).  Must be non-negative.
+
+    Returns:
+        The rebound :class:`pld.DistributedTensor` view of ``target``.
+    """
+    target_expr, signal_expr = _unwrap_distributed_tensors(
+        "pld.tensor.broadcast", target=target, signal=signal
+    )
+    call = _ir_tensor.broadcast(target_expr, signal_expr, root)
+    return DistributedTensor(expr=call)
+
+
+def allgather(
+    local_data: Tensor,
+    target: DistributedTensor,
+    signal: DistributedTensor,
+    out: Tensor,
+) -> Tensor:
+    """Gather data from all ranks, writing the concatenated result into a user-provided output Tensor.
+
+    ``local_data`` is a plain Tensor [1, SIZE] with this rank's chunk —
+    the intrinsic handles the ``pl.load`` internally.  ``target`` has shape
+    [NR, SIZE] — used internally as a staging window (the intrinsic handles
+    the stage-in).  ``signal`` is a window-bound INT32 barrier tensor.
+    ``out`` is a plain Tensor [1, NR*SIZE] that receives the rank-ordered
+    concatenated result.
+
+    Usage::
+
+        result = pld.tensor.allgather(inp, data, sig, out)
+        return out  # out now holds [1, NR*SIZE] of gathered data
+
+    Args:
+        local_data: :class:`pl.Tensor` of shape [1, SIZE] — this rank's
+            chunk to gather.  The intrinsic loads it into a tile internally.
+        target: Window-bound :class:`pld.DistributedTensor` of shape
+            [NR, SIZE] used as the internal staging window.
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` for the
+            cross-rank barrier.
+        out: A :class:`pl.Tensor` of shape [1, NR*SIZE] that receives the
+            rank-ordered concatenation of all gathered chunks.
+
+    Returns:
+        The ``out`` :class:`pl.Tensor` containing the gathered result —
+        identical on every rank.
+    """
+    target_expr, signal_expr = _unwrap_distributed_tensors(
+        "pld.tensor.allgather", target=target, signal=signal
+    )
+    local_data_expr = _unwrap(local_data)
+    out_expr = _unwrap(out)
+    call = _ir_tensor.allgather(local_data_expr, target_expr, signal_expr, out_expr)
+    return Tensor(expr=call)
+
+
+def reduce_scatter(
+    target: DistributedTensor,
+    signal: DistributedTensor,
+    *,
+    op: ReduceOp = ReduceOp.Sum,
+) -> DistributedTensor:
+    """Reduce-scatter: reduce chunks across ranks, one reduced chunk per rank.
+
+    ``target`` has shape [NR, SIZE] — one row per chunk.  Each rank must
+    stage all NR chunks before calling::
+
+        for j in range(nranks):
+            data = pl.store(chunk_j, [j, 0], data)
+        data = pld.tensor.reduce_scatter(data, sig, op=pld.ReduceOp.Sum)
+        # data[my_rank, 0:SIZE] now holds this rank's reduced chunk.
+
+    Args:
+        target: Window-bound :class:`pld.DistributedTensor` of shape
+            [NR, SIZE].  Each rank stages all NR chunks, one per row.
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` for
+            the cross-rank barrier.  Single-shot per call.
+        op: :class:`pld.ReduceOp` (keyword-only).  ``Sum`` only in
+            first version; ``Max`` / ``Min`` / ``Prod`` reserved.
+
+    Returns:
+        The rebound :class:`pld.DistributedTensor` — rank r's row
+        [r, 0:SIZE] holds the reduced chunk r.
+    """
+    target_expr, signal_expr = _unwrap_distributed_tensors(
+        "pld.tensor.reduce_scatter", target=target, signal=signal
+    )
+    call = _ir_tensor.reduce_scatter(target_expr, signal_expr, op)
+    return DistributedTensor(expr=call)
+
+
+__all__ = [
+    "alloc_window_buffer",
+    "allgather",
+    "allreduce",
+    "barrier",
+    "broadcast",
+    "get",
+    "put",
+    "reduce_scatter",
+    "window",
+]

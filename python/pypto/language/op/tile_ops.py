@@ -103,6 +103,7 @@ __all__ = [
     "slice",
     "reshape",
     "transpose",
+    "transpose_view",
     "set_validshape",
     "rem",
     "rems",
@@ -110,6 +111,8 @@ __all__ = [
     "part_mul",
     "part_max",
     "part_min",
+    "fmod",
+    "fmods",
     "and_",
     "ands",
     "or_",
@@ -362,8 +365,11 @@ def load(
         valid_shapes: Valid shape of the tile in each dimension. When provided, sets
             TileView.valid_shape in the output TileType. When omitted, shapes is used
             as valid_shape. Uses the same coordinate convention as shapes.
-        transpose: Whether to transpose the tile during load (default: False).
-            Only supported when target_memory is MemorySpace.Mat (L1).
+        transpose: **Deprecated, will be removed.** Transpose the tile during load
+            (only on MemorySpace.Mat). The load-time transpose is superseded by a
+            zero-copy ``tile.transpose_view``: pass ``b_trans=True`` / ``a_trans=True``
+            to ``pl.matmul`` for matmul operands, or load natural and apply
+            ``pl.tile.transpose_view(...)``.
 
     Returns:
         Tile wrapping the load operation
@@ -371,10 +377,16 @@ def load(
     Example:
         >>> # 2D load
         >>> tile = load(tensor, offsets=[0, 0], shapes=[32, 32])
-        >>> # 2D load with transpose to L1 (tensor is [N, K], output tile is [K, N])
-        >>> tile = load(tensor, offsets=[0, 0], shapes=[N, K],
-        ...             target_memory=pl.MemorySpace.Mat, transpose=True)
     """
+    if transpose:
+        warnings.warn(
+            "load(..., transpose=True) is deprecated and will be removed. The "
+            "load-time transpose is replaced by a zero-copy tile.transpose_view: "
+            "use pl.matmul(..., b_trans=True/a_trans=True) for matmul operands, or "
+            "load natural and apply pl.tile.transpose_view(...).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     if valid_shapes is None:
         valid_shapes = shapes
     call_expr = _ir_ops.load(
@@ -1629,6 +1641,26 @@ def transpose(tile: Tile, axis1: int, axis2: int, tmp_tile: Tile | None = None) 
     return Tile(expr=call_expr)
 
 
+def transpose_view(tile: Tile) -> Tile:
+    """Zero-copy fractal-layout reinterpretation (NZ<->ZN) of a tile.
+
+    Swaps the trailing two dims together with the block/scatter layouts, aliasing
+    the source buffer byte-for-byte: an NZ ``[..., N, K]`` tile and a ZN
+    ``[..., K, N]`` tile over the same L1 bytes are mutual transposes. Emits no
+    data movement, so one GM->L1 load can feed both a ``b_trans=True`` and a
+    ``b_trans=False`` matmul on a shared operand.
+
+    Args:
+        tile: Input tile (TileType, >=2D; typically Mat-resident).
+
+    Returns:
+        Tile wrapping the transposed-layout view.
+    """
+    tile_expr = tile.unwrap()
+    call_expr = _ir_ops.transpose_view(tile_expr)
+    return Tile(expr=call_expr)
+
+
 def set_validshape(tile: Tile, valid_rows: IntLike, valid_cols: IntLike) -> Tile:
     """Update valid-shape metadata of a tile without data movement.
 
@@ -1751,6 +1783,41 @@ def part_min(src0: Tile, src1: Tile) -> Tile:
         Tile wrapping the part_min operation
     """
     call_expr = _ir_ops.part_min(src0.unwrap(), src1.unwrap())
+    return Tile(expr=call_expr)
+
+
+def fmod(lhs: Tile, rhs: Tile) -> Tile:
+    """Element-wise floating-point remainder of two tiles.
+
+    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
+    ``torch.fmod``). Maps to the TFMOD hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+
+    Returns:
+        Tile wrapping the fmod operation
+    """
+    call_expr = _ir_ops.fmod(lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def fmods(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
+    """Element-wise floating-point remainder of tile and scalar.
+
+    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
+    ``torch.fmod``). Maps to the TFMODS hardware intrinsic.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar value
+
+    Returns:
+        Tile wrapping the fmods operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.fmods(lhs.unwrap(), rhs_expr)
     return Tile(expr=call_expr)
 
 

@@ -19,7 +19,8 @@ Covers four orthogonal pieces of the host_orch emit:
 3. Per-DistributedTensor trailing ctx scalar:
    ``add_scalar(__comm_d0[<r>].device_ctx)`` placed AFTER all tensor adds,
    in IR-arg order (matches the incore func.func trailing-ctx segment).
-4. dispatch ``device=`` attr → ``submit_next_level(..., worker=<r>)`` kwarg.
+4. dispatch ``device=`` attr → ``_submit_chip(orch, ..., config, <r>)`` (the
+   rank-pinned wrapper that namespaces per-rank DFX ``output_prefix``).
 
 Plus regressions:
 
@@ -123,8 +124,9 @@ def test_dist_tensor_formal_emits_continuous_tensor_make():
     # Trailing per-DistributedTensor ctx scalar — same rank index as
     # the Tensor.make above.
     assert re.search(r"\.add_scalar\(__comm_d0\[\w+\]\.device_ctx\)", code), code
-    # ``device=r`` → ``worker=r`` kwarg on submit_next_level.
-    assert re.search(r"submit_next_level\(callables\[\"chip_orch\"\],.*config, worker=\w+\)", code), code
+    # ``device=r`` → rank-pinned dispatch routes through ``_submit_chip`` (which
+    # namespaces the per-rank DFX ``output_prefix``), passing the rank last.
+    assert re.search(r"_submit_chip\(orch, callables\[\"chip_orch\"\],.*config, \w+\)", code), code
 
 
 def test_two_dist_tensor_formals_emit_two_ctx_scalars():
@@ -172,8 +174,8 @@ def test_two_dist_tensor_formals_emit_two_ctx_scalars():
 
 
 def test_const_device_kwarg_renders_literal_worker():
-    """``device=0`` (ConstInt) lowers to ``worker=0`` literal — both the
-    ``submit_next_level`` worker kwarg AND the ``__comm_d0[0]`` subscript.
+    """``device=0`` (ConstInt) lowers to the literal rank ``0`` — both the
+    trailing ``_submit_chip(..., config, 0)`` arg AND the ``__comm_d0[0]`` subscript.
 
     The dispatch call is in an ``AssignStmt`` (rather than the outer ``return``)
     because DistributedCodegen routes chip-orch dispatches through
@@ -199,7 +201,7 @@ def test_const_device_kwarg_renders_literal_worker():
             return result
 
     code = _lower(Prog)
-    assert "submit_next_level" in code and "worker=0" in code, code
+    assert re.search(r"_submit_chip\(orch, callables\[\"chip_orch\"\],.*config, 0\)", code), code
     assert "__comm_d0[0].buffer_ptrs" in code, code
     assert "__comm_d0[0].device_ctx" in code, code
 

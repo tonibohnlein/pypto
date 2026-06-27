@@ -27,7 +27,7 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 from pypto.runtime import DeviceTensor
-from pypto.runtime.distributed_runner import DistributedWorker, _assemble_chip_callables
+from pypto.runtime.distributed_runner import DistributedWorker, _assemble_chip_callables, _submit_chip
 
 
 def _param(name: str, shape: list[int], direction: ParamDirection = ParamDirection.In) -> _ParamInfo:
@@ -829,6 +829,68 @@ class TestAssembleChipCallables:
         compiled: Any = SimpleNamespace(output_dir=tmp_path, platform="a2a3sim")
         with pytest.raises(RuntimeError, match="No chip-level tasks found"):
             _assemble_chip_callables(compiled)
+
+
+class _SpyDfxConfig:
+    """Minimal stand-in for ``CallConfig`` exposing a mutable ``output_prefix``."""
+
+    def __init__(self, output_prefix: str = "") -> None:
+        self.output_prefix = output_prefix
+
+
+class _RecordingOrch:
+    """Records the ``output_prefix`` observed at each ``submit_next_level``.
+
+    Captures the prefix *at submit time* (not after) so tests can prove
+    ``_submit_chip`` applied the per-rank suffix before the task was queued.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, int, str]] = []
+
+    def submit_next_level(self, callable_id: Any, task_args: Any, config: Any, *, worker: int) -> str:
+        self.calls.append((callable_id, worker, config.output_prefix))
+        return "submitted"
+
+
+class TestSubmitChip:
+    """``_submit_chip`` namespaces per-rank DFX ``output_prefix`` then restores it."""
+
+    def test_suffixes_prefix_at_submit_and_restores(self):
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
+        ret = _submit_chip(orch, "chip_a", "ta", cfg, 3)
+        # Suffix was visible to the runtime at submit time...
+        assert orch.calls == [("chip_a", 3, "/work/dfx_outputs/rank3")]
+        # ...and the shared config is restored afterward.
+        assert cfg.output_prefix == "/work/dfx_outputs"
+        assert ret == "submitted"
+
+    def test_distinct_ranks_get_distinct_dirs(self):
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
+        for r in (0, 1, 2):
+            _submit_chip(orch, "chip", "ta", cfg, r)
+        assert [c[2] for c in orch.calls] == [
+            "/work/dfx_outputs/rank0",
+            "/work/dfx_outputs/rank1",
+            "/work/dfx_outputs/rank2",
+        ]
+        assert cfg.output_prefix == "/work/dfx_outputs"
+
+    def test_dfx_off_forwards_unchanged(self):
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix="")
+        _submit_chip(orch, "chip", "ta", cfg, 5)
+        assert orch.calls == [("chip", 5, "")]
+        assert cfg.output_prefix == ""
+
+    def test_unconstrained_worker_not_suffixed(self):
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
+        _submit_chip(orch, "chip", "ta", cfg, -1)
+        assert orch.calls == [("chip", -1, "/work/dfx_outputs")]
+        assert cfg.output_prefix == "/work/dfx_outputs"
 
 
 if __name__ == "__main__":

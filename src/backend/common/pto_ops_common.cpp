@@ -47,6 +47,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -67,6 +68,7 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       "tile.add",
       "tile.and",
       "tile.div",
+      "tile.fmod",
       "tile.maximum",
       "tile.minimum",
       "tile.mul",
@@ -92,6 +94,7 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       "tile.adds",
       "tile.muls",
       "tile.divs",
+      "tile.fmods",
       "tile.maximums",
       "tile.lrelu",
       // Ternary scalar ops (Tile x Scalar x Tile)
@@ -1461,13 +1464,97 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   // canonical coordinates (matching the source TensorType's shape). There is
   // no implicit dn_swap here — ``LowerTransposeLoadParamLayout`` (P6) is
   // responsible for ensuring all coordinate systems match before codegen.
-  const auto& valid_elems = valid_shapes_tuple->elements_;
-  const auto& offset_elems = offsets_tuple->elements_;
+  std::vector<std::string> partition_dims = GetDimStrings(valid_shapes_tuple->elements_);
+  std::vector<std::string> offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
+  std::vector<std::string> size_codes = GetSizeCodes(valid_shapes_tuple->elements_, codegen);
 
-  std::string partition_type = MakePartitionTensorViewType(GetDimStrings(valid_elems), dtype_str);
-  std::string partition_view = EmitPartitionViewPTO(
-      tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
-      GetIndexOffsetCodes(offset_elems, codegen), GetSizeCodes(valid_elems, codegen), codegen);
+  // ND2NZ constraint: a natural Mat load fills an NZ tile (the implicit Mat view,
+  // blayout=col_major / slayout=row_major), and the hardware ND2NZ path requires a
+  // 2-dim GlobalTensor. When such an NZ load has a rank>2 source window, collapse
+  // the contiguous leading dims to 2D — emit a fresh 2D tensor_view ([prod(leading
+  // window dims), last] with strides [last, 1]) over the same base pointer and a
+  // matching 2D partition (offset folded mixed-radix over the source tensor dims).
+  // Transposed (DN) Mat loads keep their ND window for DN addressing; Vec/other
+  // loads are plain ND and are not NZ.
+  auto result_tile_type = ir::As<ir::TileType>(op->GetType());
+  bool is_nz_mat_load = false;
+  if (result_tile_type && result_tile_type->memory_space_ == ir::MemorySpace::Mat) {
+    const auto rv = ir::tile_view_semantics::GetEffectiveTileView(*result_tile_type);
+    is_nz_mat_load = rv.blayout == ir::TileLayout::col_major && rv.slayout == ir::TileLayout::row_major;
+  }
+  if (is_nz_mat_load && ndim > 2) {
+    const ir::Span& span = op->span_;
+    // The leading-dim collapse folds the row dims [0, ndim-1) into one axis with a
+    // contiguous row stride, so it is sound only when the valid sub-box of those
+    // dims is contiguous in row-major order (see IsRowMajorCollapseContiguous —
+    // the shared rule that FlattenTileNdTo2D uses to route non-contiguous operands
+    // to a per-batch load, so this guard should never fire on a batch_matmul
+    // operand). A partial middle dim under a non-singleton outer dim (e.g. a
+    // multi-batch slice that also cuts the matrix-row dim) is non-contiguous.
+    INTERNAL_CHECK_SPAN(ir::tile_conversion_utils::IsRowMajorCollapseContiguous(valid_shapes_tuple->elements_,
+                                                                                tensor_type->shape_),
+                        span)
+        << "tile.load NZ 2D source-window collapse: the valid sub-box of the leading dims is not "
+           "contiguous in row-major order (a partial middle dim under a non-singleton outer dim), so "
+           "the collapse cannot legalize this to a 2D ND2NZ load";
+    // ConstInt-folding index arithmetic: a static window (the common matmul case)
+    // folds to clean constants, while a dynamic dim/offset/valid stays symbolic and
+    // is materialized by GetSizeCodes / GetIndexOffsetCodes (arith.muli/addi) below
+    // — the same constant-or-symbol handling the function-parameter make_tensor_view
+    // uses, so this path is not limited to static-shape tensors.
+    auto idx = [&](int64_t v) -> ir::ExprPtr {
+      return std::make_shared<ir::ConstInt>(v, DataType::INDEX, span);
+    };
+    auto fold_mul = [&](const ir::ExprPtr& a, const ir::ExprPtr& b) -> ir::ExprPtr {
+      auto ca = ir::As<ir::ConstInt>(a);
+      auto cb = ir::As<ir::ConstInt>(b);
+      if (ca && cb) return idx(ca->value_ * cb->value_);
+      if (ca && ca->value_ == 1) return b;
+      if (cb && cb->value_ == 1) return a;
+      return ir::MakeMul(a, b, span);
+    };
+    auto fold_add = [&](const ir::ExprPtr& a, const ir::ExprPtr& b) -> ir::ExprPtr {
+      auto ca = ir::As<ir::ConstInt>(a);
+      auto cb = ir::As<ir::ConstInt>(b);
+      if (ca && cb) return idx(ca->value_ + cb->value_);
+      if (ca && ca->value_ == 0) return b;
+      if (cb && cb->value_ == 0) return a;
+      return ir::MakeAdd(a, b, span);
+    };
+
+    // make_tensor_view describes the collapsed SOURCE TENSOR: [prod(tensor leading
+    // dims), tensor_last] with a contiguous row stride [tensor_last, 1] — the
+    // tensor's real row stride, so a window narrower than the last dim (e.g. a
+    // K-slice) still strides by the full tensor width. The partition then slices the
+    // window's VALID region; its offset folds mixed-radix over the tensor dims.
+    ir::ExprPtr tensor_rows = tensor_type->shape_[0];
+    ir::ExprPtr valid_rows = valid_shapes_tuple->elements_[0];
+    ir::ExprPtr row_offset = offsets_tuple->elements_[0];
+    for (size_t i = 1; i + 1 < ndim; ++i) {
+      tensor_rows = fold_mul(tensor_rows, tensor_type->shape_[i]);
+      valid_rows = fold_mul(valid_rows, valid_shapes_tuple->elements_[i]);
+      row_offset = fold_add(fold_mul(row_offset, tensor_type->shape_[i]), offsets_tuple->elements_[i]);
+    }
+    const ir::ExprPtr tensor_cols = tensor_type->shape_.back();
+
+    const std::vector<std::string> view_shape = GetSizeCodes({tensor_rows, tensor_cols}, codegen);
+    const std::string one = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    const std::string view2d = codegen.NewNamedTemp(tensor->name_hint_ + "_view2d");
+    std::ostringstream mtv;
+    mtv << view2d << " = pto.make_tensor_view " << codegen.GetVarName(tensor) << ", shape = ["
+        << view_shape[0] << ", " << view_shape[1] << "], strides = [" << view_shape[1] << ", " << one
+        << "] {layout = #pto.layout<nd>}: !pto.tensor_view<?x?x" << dtype_str << ">";
+    codegen.Emit(mtv.str());
+    tensor_view = view2d;
+    tensor_view_type = "!pto.tensor_view<?x?x" + dtype_str + ">";
+    partition_dims = {"?", "?"};
+    offset_codes = GetIndexOffsetCodes({row_offset, offsets_tuple->elements_.back()}, codegen);
+    size_codes = GetSizeCodes({valid_rows, valid_shapes_tuple->elements_.back()}, codegen);
+  }
+
+  std::string partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
+  std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
+                                                    partition_type, offset_codes, size_codes, codegen);
 
   std::ostringstream tload_line;
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
@@ -2311,6 +2398,7 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.part_mul",        "pto.tpartmul",         2},
     {"tile.part_max",        "pto.tpartmax",         2},
     {"tile.part_min",        "pto.tpartmin",         2},
+    {"tile.fmod",            "pto.tfmod",            2},
     // Tile x Tile bitwise operations
     {"tile.and",             "pto.tand",             2},
     {"tile.or",              "pto.tor",              2},
@@ -2340,6 +2428,7 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.muls",            "pto.tmuls",            2},
     {"tile.divs",            "pto.tdivs",            2},
     {"tile.rems",            "pto.trems",            3},  // src0, scalar, tmp
+    {"tile.fmods",           "pto.tfmods",           2},
     {"tile.ands",            "pto.tands",            2},
     {"tile.ors",             "pto.tors",             2},
     {"tile.xors",            "pto.txors",            3},  // src0, scalar, tmp
@@ -3076,6 +3165,36 @@ static std::string EmitLoadRankPair(codegen::PTOCodegen& cg, const std::string& 
   return rk_pair;
 }
 
+// Emit a metadata-only `pto.treshape` reinterpret of `src_arg` into the current
+// result. Shared by the tile.reshape and tile.transpose_view codegen lambdas:
+// both lower a MemRef-less view (e.g. over a cross-core tpop slot) to a
+// pto.treshape that READS the source SSA — no data movement. `result_type` is the
+// result var's TileType buf-type (empty if none); when present a fresh temp
+// buffer is bound so the view gets its own SSA name and `: src -> dst` annotation
+// (the MemRef-less source's type comes from the TileType, not a MemRef).
+static void EmitTreshapeView(codegen::PTOCodegen& codegen, const ir::ExprPtr& src_arg,
+                             std::string result_target, const std::string& result_type,
+                             const std::string& temp_prefix) {
+  std::string src = codegen.GetExprAsCode(src_arg);
+  std::string src_type;
+  if (auto src_var = AsVarLike(src_arg)) {
+    if (auto tile_type = As<ir::TileType>(src_var->GetType())) {
+      src_type = codegen.GetTileBufTypeStringFromTileType(tile_type);
+    }
+  }
+  if (!result_type.empty()) {
+    result_target = codegen.NewNamedTemp(temp_prefix);
+    codegen.SetCurrentResultBuf(result_target);
+    codegen.RegisterTileBufType(result_target, result_type);
+  }
+  std::ostringstream oss;
+  oss << result_target << " = pto.treshape " << src;
+  if (!src_type.empty() && !result_type.empty()) {
+    oss << " : " << src_type << " -> " << result_type;
+  }
+  codegen.Emit(oss.str());
+}
+
 void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exclude_ops) {
   // Register simple N-ary ops
   for (const auto& entry : kSimpleOps) {
@@ -3148,27 +3267,16 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     return std::string("");
   });
 
-  // Helper for zero-arg i64 query ops that need index_cast (get_subblock_idx, get_block_idx, etc.)
-  auto reg_i64_to_index_op = [&](const char* tile_op, const char* pto_op) {
-    reg(tile_op, [tile_op, pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
-      auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
-      CHECK(op->args_.empty()) << tile_op << " takes no arguments, got " << op->args_.size();
-      std::string result = codegen.GetCurrentResultTarget();
-      INTERNAL_CHECK_SPAN(!result.empty(), op->span_) << tile_op << " requires assignment target";
-      std::string i64_tmp = codegen.NewTemp();
-      codegen.Emit(i64_tmp + " = " + pto_op);
-      codegen.Emit(result + " = arith.index_cast " + i64_tmp + " : i64 to index");
-      return std::string("");
-    });
-  };
-  reg_i64_to_index_op("tile.get_subblock_idx", "pto.get_subblock_idx");
-
-  // SPMD block identity ops read from synthetic i32 %arg prefix params that
-  // PTOCodegen prepends to the func.func signature whenever the function
-  // body contains tile.get_block_idx / tile.get_block_num. The kernel
+  // SPMD identity ops read from synthetic i32 params that PTOCodegen appends to
+  // the func.func signature whenever the function body contains
+  // tile.get_block_idx / tile.get_block_num / tile.get_subblock_idx. The kernel
   // wrapper resolves the runtime values from intrinsic.h::get_block_idx(args) /
-  // get_block_num(args) and forwards them as the first two call args.
-  auto reg_spmd_block_op = [&](const char* tile_op, std::string (codegen::PTOCodegen::*getter)() const) {
+  // get_block_num(args) / get_sub_block_id(args) and forwards them as the
+  // trailing call args (canonical order: block_idx, block_num, subblock_idx).
+  // subblock_idx deliberately reads the runtime lane id rather than the ccec
+  // get_subblockid() register, which returns a stale value under the
+  // tensormap_and_ringbuffer dispatch (see intrinsic.h).
+  auto reg_spmd_identity_op = [&](const char* tile_op, std::string (codegen::PTOCodegen::*getter)() const) {
     reg(tile_op, [tile_op, getter](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
       auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
       CHECK(op->args_.empty()) << tile_op << " takes no arguments, got " << op->args_.size();
@@ -3176,13 +3284,14 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
       INTERNAL_CHECK_SPAN(!result.empty(), op->span_) << tile_op << " requires assignment target";
       std::string arg_ssa = (codegen.*getter)();
       INTERNAL_CHECK_SPAN(!arg_ssa.empty(), op->span_)
-          << tile_op << " requires PTOCodegen SPMD prefix params to be initialised";
+          << tile_op << " requires PTOCodegen SPMD signature params to be initialised";
       codegen.Emit(result + " = arith.index_cast " + arg_ssa + " : i32 to index");
       return std::string("");
     });
   };
-  reg_spmd_block_op("tile.get_block_idx", &codegen::PTOCodegen::GetSpmdBlockIdxArgSSA);
-  reg_spmd_block_op("tile.get_block_num", &codegen::PTOCodegen::GetSpmdBlockNumArgSSA);
+  reg_spmd_identity_op("tile.get_block_idx", &codegen::PTOCodegen::GetSpmdBlockIdxArgSSA);
+  reg_spmd_identity_op("tile.get_block_num", &codegen::PTOCodegen::GetSpmdBlockNumArgSSA);
+  reg_spmd_identity_op("tile.get_subblock_idx", &codegen::PTOCodegen::GetSpmdSubblockIdxArgSSA);
 
   // tile.move → pto.tmov with no-op elision.
   // When MemoryReuse inserts a tile.move between two MemRefs that end up at the
@@ -3891,38 +4000,41 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
       return std::string("");
     }
 
-    // Fallback: emit pto.treshape. Derive the source type from its TileType so a
-    // MemRef-less source (a tpop result) still gets its `: src -> dst` annotation.
-    std::string src = codegen.GetExprAsCode(op->args_[0]);
-    std::string src_type;
-    if (auto src_var = AsVarLike(op->args_[0])) {
-      if (auto tile_type = ir::As<ir::TileType>(src_var->GetType())) {
-        src_type = codegen.GetTileBufTypeStringFromTileType(tile_type);
-      }
-    }
-
-    if (!result_type.empty()) {
-      result_target = codegen.NewNamedTemp("reshape_buf");
-      codegen.SetCurrentResultBuf(result_target);
-      codegen.RegisterTileBufType(result_target, result_type);
-    }
-    std::ostringstream oss;
-    oss << result_target << " = pto.treshape " << src;
-    if (!src_type.empty() && !result_type.empty()) {
-      oss << " : " << src_type << " -> " << result_type;
-    }
-    codegen.Emit(oss.str());
+    // Fallback: emit pto.treshape reading the source SSA.
+    EmitTreshapeView(codegen, op->args_[0], result_target, result_type, "reshape_buf");
     return std::string("");
   });
   reg("tile.transpose_view", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
-    // Zero-copy fractal-layout reinterpretation (NZ<->ZN). The result var owns a
-    // pre-declared pto.alloc_tile carrying the transposed (ZN) type, aliased to
-    // the source buffer's address through the shared MemRef. The two alloc_tile
-    // declarations at the same addr ARE the whole mechanism — there is no
-    // data-movement instruction to emit (issue #1776).
+    // Zero-copy fractal-layout reinterpretation (NZ<->ZN).
+    //  - Alloc-backed result (the #1776 case): the result var owns a pre-declared
+    //    pto.alloc_tile carrying the transposed (ZN) type, aliased to the source
+    //    buffer's address through the shared MemRef. The two alloc_tile decls at
+    //    the same addr ARE the whole mechanism — emit nothing.
+    //  - MemRef-less result (a view over a cross-core tpop slot, which owns no
+    //    buffer): there is no alloc to alias, so reinterpret the slot in place
+    //    with pto.treshape reading the source SSA (a metadata-only op — no data
+    //    movement), exactly like tile.reshape over a tpop.
     CHECK(op->args_.size() == 1) << "Operation:[tile.transpose_view] requires 1 argument (tile), but got "
                                  << op->args_.size();
-    (void)codegen_base;
+    auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+    std::string result_target = codegen.GetCurrentResultTarget();
+
+    std::string result_type;
+    bool result_has_memref = false;
+    if (auto result_var = codegen.GetCurrentResultVar()) {
+      if (auto result_tile = ir::As<ir::TileType>(result_var->GetType())) {
+        result_type = codegen.GetTileBufTypeStringFromTileType(result_tile);
+        result_has_memref = result_tile->memref_.has_value();
+      }
+    }
+    // Alloc-backed: the pre-declared alloc_tile at the shared addr is the view.
+    if (result_has_memref) {
+      return std::string("");
+    }
+
+    // MemRef-less: reinterpret the slot in place via pto.treshape reading the
+    // source SSA — exactly like tile.reshape over a tpop.
+    EmitTreshapeView(codegen, op->args_[0], result_target, result_type, "transpose_view_buf");
     return std::string("");
   });
   reg("tile.set_validshape", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
