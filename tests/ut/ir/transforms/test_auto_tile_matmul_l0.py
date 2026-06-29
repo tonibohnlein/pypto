@@ -1493,7 +1493,7 @@ class TestAutoTileMatmulL0MatScratch:
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
                 c = pl.matmul(a, b, out_dtype=pl.FP32)  # [256, 256] f32 > L0c → on-chip consumer
-                cb = pl.cast(c, pl.BF16)  # FIXPIPE downcast → bf16 Mat scratch (cast fused into assemble)
+                cb = pl.cast(c, pl.BF16, mode="rint")  # rint -> bf16 Mat scratch (cast fused)
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumes the scratch only as a matmul operand
                 out = pl.assemble(out, d, [0, 0])
                 return out
@@ -1550,7 +1550,7 @@ class TestAutoTileMatmulL0MatScratch:
                 out: pl.Out[pl.Tensor[[512, 64], pl.FP32]],
             ) -> pl.Tensor[[512, 64], pl.FP32]:
                 c = pl.matmul(a, b, out_dtype=pl.FP32)  # [512, 1024] → 1 MiB bf16 scratch > Mat cap
-                cb = pl.cast(c, pl.BF16)  # would feed a bf16 Mat scratch, but it exceeds capacity
+                cb = pl.cast(c, pl.BF16, mode="rint")  # feeds a bf16 Mat scratch, but exceeds capacity
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumes c only as a matmul operand
                 out = pl.assemble(out, d, [0, 0])
                 return out
@@ -1584,7 +1584,7 @@ class TestAutoTileMatmulL0MatScratch:
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
                 c = pl.matmul(a, b, out_dtype=pl.FP32)  # [256, 256] > L0c, K=32 fits L0 -> full-K
-                cb = pl.cast(c, pl.BF16)  # FIXPIPE downcast -> bf16 Mat scratch (cast fused)
+                cb = pl.cast(c, pl.BF16, mode="rint")  # FIXPIPE downcast -> bf16 Mat scratch (cast fused)
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)
                 out = pl.assemble(out, d, [0, 0])
                 return out
@@ -1654,7 +1654,7 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
                 out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
             ) -> pl.Tensor[[128, 64], pl.FP32]:
                 c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 128] f32, fits L0c
-                cb = pl.cast(c, pl.BF16)  # FIXPIPE downcast -> bf16 Mat scratch (folded)
+                cb = pl.cast(c, pl.BF16, mode="rint")  # FIXPIPE downcast -> bf16 Mat scratch (folded)
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumes the scratch on-chip
                 out = pl.assemble(out, d, [0, 0])
                 return out
@@ -1733,7 +1733,7 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
                 out: pl.Out[pl.Tensor[[128, 128], pl.BF16]],
             ) -> pl.Tensor[[128, 128], pl.BF16]:
                 c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 128] f32, fits L0c
-                cb = pl.cast(c, pl.BF16)  # consumed by a store, not a matmul operand
+                cb = pl.cast(c, pl.BF16, mode="rint")  # consumed by a store, not a matmul operand
                 out = pl.assemble(out, cb, [0, 0])
                 return out
 
@@ -1742,6 +1742,68 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
 
         assert "pl.tile.cast(" in printed, "a non-matmul (store) consumer must keep the Vector cast"
         assert "pl.tile.assemble(" not in printed, "the fold must not assemble into a Mat scratch"
+
+    def test_nondefault_round_mode_not_folded(self):
+        """Guard: a fits-L0c chained cast with a directional round mode (e.g.
+        ``mode="floor"``) must keep the Vector cast — FIXPIPE's Acc->Mat writeback
+        applies a single fixed tie rule and carries no ``rmode``, so folding ``floor``
+        into ``pto.tinsert`` would silently change rounding. Only ``rint``
+        (round-half-to-even — FIXPIPE's fixed tie rule) is foldable."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 64], pl.BF16],
+                b: pl.Tensor[[64, 128], pl.BF16],
+                e: pl.Tensor[[128, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 128] f32, fits L0c
+                cb = pl.cast(c, pl.BF16, mode="floor")  # non-default rounding FIXPIPE can't do
+                d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumed as a matmul operand
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+
+        assert "pl.tile.cast(" in printed, "a non-default (floor) round mode must keep the Vector cast"
+        assert "pl.tile.assemble(" not in printed, "the floor cast must not fold into a Mat-scratch assemble"
+
+    def test_default_round_mode_not_folded(self):
+        """Guard: the cast default mode is ``"round"`` (round-half-*away*), but FIXPIPE's
+        fixed Acc->Mat narrowing is round-half-to-*even* (``rint``). So a default
+        ``pl.cast(c, bf16)`` in a chained matmul is NOT folded — it keeps the Vector cast
+        (the pass also emits a ``PH-AT-010`` hint pointing at ``mode="rint"``). Only an
+        explicit ``rint`` cast folds onto the cube (see the ``*cast_folds*`` tests)."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 64], pl.BF16],
+                b: pl.Tensor[[64, 128], pl.BF16],
+                e: pl.Tensor[[128, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 128] f32, fits L0c
+                cb = pl.cast(c, pl.BF16)  # default mode="round" (ties away); FIXPIPE does ties-even
+                d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumed as a matmul operand
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+
+        assert "pl.tile.cast(" in printed, "the default (round/ties-away) cast must keep the Vector cast"
+        assert "pl.tile.assemble(" not in printed, "the default cast must not fold into a Mat scratch"
 
     @pytest.mark.parametrize("backend", [BackendType.Ascend910B, BackendType.Ascend950])
     def test_cast_fold_lowers_cube_only_no_vector(self, backend):

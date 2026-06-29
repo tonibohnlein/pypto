@@ -1092,6 +1092,31 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
       "or fed to a non-store consumer is deferred; left untouched");
 }
 
+/// True when a ``tile.cast`` may be folded into a cube FIXPIPE Acc->Mat writeback
+/// (``pto.tinsert``) instead of a standalone Vector ``pto.tcvt``.  FIXPIPE narrows
+/// only ``f32 -> bf16`` / ``f32 -> f16`` (the ``F322BF16`` / ``F322F16`` writeback
+/// modes; an ``int32`` source would need a *scaled dequant*, not a plain cast) and
+/// applies a single fixed tie rule: **round-to-nearest-even** — the pto-isa CPU
+/// reference narrows via ``std::bfloat16_t`` and ``pto.tinsert`` carries no
+/// ``rmode``.  So fold only an ``f32`` source cast to ``bf16``/``f16`` whose round
+/// mode is ``RINT`` (round-half-to-even).  ``ROUND`` (round-half-*away*, the
+/// frontend default) and the directional/truncating modes round ties differently,
+/// so they must keep the Vector cast — it lowers to ``pto.tcvt``, the only path
+/// that honors the requested ``rmode``.
+bool CastFoldableToFixpipeMat(const CallPtr& cast, const TileTypePtr& src_ty, DataType dst_dtype) {
+  if (!cast || !src_ty) return false;
+  if (src_ty->dtype_ != DataType::FP32) return false;
+  if (dst_dtype != DataType::BF16 && dst_dtype != DataType::FP16) return false;
+  // ``tile.cast`` "mode" (see src/ir/op/tile_ops/unary.cpp): NONE(0), RINT(1),
+  // ROUND(2), FLOOR(3), CEIL(4), TRUNC(5), ODD(6).  FIXPIPE's fixed narrowing is
+  // round-half-to-even == RINT; only that mode matches.  A missing "mode" defaults
+  // to the frontend's ROUND (ties away) — not foldable.
+  constexpr int kRoundRint = 1;
+  constexpr int kRoundRound = 2;
+  const int mode = cast->GetKwarg<int>("mode", kRoundRound);
+  return mode == kRoundRint;
+}
+
 /// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
 /// L0c into a Mat-scratch grid when the result is consumed *entirely* at
 /// matmul-operand positions (a chained matmul reads it on-chip).  Each sub-tile is
@@ -1246,11 +1271,12 @@ class AutoTileMutator : public IRMutator {
       if (auto cast_as = std::dynamic_pointer_cast<const AssignStmt>(current)) {
         auto cast = As<Call>(cast_as->value_);
         auto cb_ty = As<TileType>(cast_as->var_->GetType());
-        if (cast && IsOp(cast, "tile.cast") && !cast->args_.empty() && cb_ty &&
-            (cb_ty->dtype_ == DataType::BF16 || cb_ty->dtype_ == DataType::FP16)) {
+        if (cast && IsOp(cast, "tile.cast") && !cast->args_.empty() && cb_ty) {
           auto src = AsVarLike(cast->args_[0]);
           auto src_ty = src ? As<TileType>(src->GetType()) : nullptr;
           const bool src_acc = src_ty && src_ty->memory_space_ == MemorySpace::Acc;
+          // Only fold what FIXPIPE can reproduce: f32 -> bf16/f16, round-to-nearest.
+          const bool fixpipe_castable = CastFoldableToFixpipeMat(cast, src_ty, cb_ty->dtype_);
           // Static [M, N] — a fits-L0c chained matmul result is always static here.
           auto m_ci = cb_ty->shape_.size() == 2 ? As<ConstInt>(cb_ty->shape_[0]) : nullptr;
           auto n_ci = cb_ty->shape_.size() == 2 ? As<ConstInt>(cb_ty->shape_[1]) : nullptr;
@@ -1273,18 +1299,33 @@ class AutoTileMutator : public IRMutator {
             auto mo = sibling_index->matmul_operand_uses.find(cb);
             const int cb_uses = uc == sibling_index->use_counts.end() ? 0 : uc->second;
             const int cb_mm = mo == sibling_index->matmul_operand_uses.end() ? 0 : mo->second;
-            // Fold only when every use of ``cb`` is a matmul operand: the bf16
-            // value can then live entirely in Mat (a store / elementwise consumer
-            // could not read it there, so those keep the Vector cast path).
+            // A chained cast: every use of ``cb`` is a matmul operand, so the bf16
+            // value can live entirely in Mat (a store / elementwise consumer could
+            // not read it there, so those keep the Vector cast path regardless).
             if (cb_uses >= 1 && cb_uses == cb_mm) {
-              MatScratchPlacer placer(m_ci->value_, n_ci->value_, cb_ty->dtype_, src->name_hint_ + "_mat",
-                                      cast_as->span_);
-              VarPtr scratch = placer.Init(out);
-              VarPtr cmat = placer.PlaceAt(out, src, MakeIndex(0, cast_as->span_),
-                                           MakeIndex(0, cast_as->span_), scratch, /*step=*/0);
-              remap[cb] = cmat;  // the consumer matmul now reads the Mat scratch
-              changed = true;
-              continue;  // drop the dead tile.cast
+              if (fixpipe_castable) {
+                MatScratchPlacer placer(m_ci->value_, n_ci->value_, cb_ty->dtype_, src->name_hint_ + "_mat",
+                                        cast_as->span_);
+                VarPtr scratch = placer.Init(out);
+                VarPtr cmat = placer.PlaceAt(out, src, MakeIndex(0, cast_as->span_),
+                                             MakeIndex(0, cast_as->span_), scratch, /*step=*/0);
+                remap[cb] = cmat;  // the consumer matmul now reads the Mat scratch
+                changed = true;
+                continue;  // drop the dead tile.cast
+              }
+              // Chained cast that fits L0c but FIXPIPE cannot reproduce (a non-f32
+              // accumulator, or a round mode other than round-half-to-even): keep
+              // the standalone Vector cast and warn — it stays a cube->vector->cube
+              // round-trip that overflows the Vec buffer at large [M, N].
+              hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-010",
+                                 "chained-matmul [" + std::to_string(m_ci->value_) + ", " +
+                                     std::to_string(n_ci->value_) + "] cast to " + cb_ty->dtype_.ToString() +
+                                     " cannot fold onto the cube FIXPIPE (which narrows f32->bf16/f16 with "
+                                     "round-half-to-even only); kept on the Vector path (pto.tcvt), a "
+                                     "cube->vector->cube round-trip that may overflow the Vec buffer at this "
+                                     "[M, N] — cast an f32 result with mode=\"rint\" to keep it on the cube",
+                                 cast_as->span_);
+              // fall through: the tile.cast stays (Vector pto.tcvt)
             }
           }
         }
@@ -1333,7 +1374,12 @@ class AutoTileMutator : public IRMutator {
           if (auto cast_it = sibling_index->cast_of.find(result); cast_it != sibling_index->cast_of.end()) {
             const Var* cb = cast_it->second->var_.get();
             auto cb_ty = As<TileType>(cb->GetType());
-            if (cb_ty && (cb_ty->dtype_ == DataType::BF16 || cb_ty->dtype_ == DataType::FP16)) {
+            auto cast_call = As<Call>(cast_it->second->value_);
+            // Fold the downcast into the FIXPIPE Acc->Mat writeback only when FIXPIPE
+            // can reproduce it: f32 (the matmul Acc) -> bf16/f16, round-to-nearest.
+            // Otherwise keep the standalone Vector cast (e.g. an int accumulator, or a
+            // directional/truncating round mode FIXPIPE has no `rmode` for).
+            if (cb_ty && CastFoldableToFixpipeMat(cast_call, result_tile_ty, cb_ty->dtype_)) {
               auto cb_uc = sibling_index->use_counts.find(cb);
               auto cb_mo = sibling_index->matmul_operand_uses.find(cb);
               const int cb_uses = cb_uc == sibling_index->use_counts.end() ? 0 : cb_uc->second;

@@ -1537,7 +1537,7 @@ class TestTileAssembleCodegen:
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
                 c = pl.matmul(a, b, out_dtype=pl.FP32)  # [256, 256] > L0c, consumed on-chip
-                cb = pl.cast(c, pl.BF16)  # FIXPIPE downcast -> bf16 Mat scratch
+                cb = pl.cast(c, pl.BF16, mode="rint")  # rint -> bf16 Mat scratch (FIXPIPE tie-even)
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)
                 out = pl.assemble(out, d, [0, 0])
                 return out
@@ -1566,7 +1566,7 @@ class TestTileAssembleCodegen:
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
                 c = pl.matmul(a, b, out_dtype=pl.FP32)  # K=32 fits L0 (k == K) -> full-K; on-chip
-                cb = pl.cast(c, pl.BF16)  # FIXPIPE downcast -> bf16 Mat scratch
+                cb = pl.cast(c, pl.BF16, mode="rint")  # rint -> bf16 Mat scratch (FIXPIPE tie-even)
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)
                 out = pl.assemble(out, d, [0, 0])
                 return out
