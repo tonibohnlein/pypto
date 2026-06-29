@@ -87,6 +87,13 @@ constexpr double kBwL1L0a  = 441.0;             // L1->L0A lhs extract
 constexpr double kBwL1L0b  = 220.5;             // L1->L0B rhs extract
 constexpr double kBwGmUb   = 100.9;             // GM->UB vector load
 constexpr double kBwUbGm   = 188.46;            // UB->GM vector store
+// Aggregate HBM bandwidth (GiB/s) shared by all cores — caps the sum of the
+// per-core GM pipes (DDR divides across cores up to here). Realistic A3 aggregate
+// (~900 GiB/s): par() binds at ~900/135 = 6.7 cores, so reload-bound matmuls
+// saturate HBM rather than scale linearly to 24 cores. Perf-sim VALIDATED in the
+// saturation regime (pto-isa gml1_multicore: per-core bw = min(135, 900/B) to
+// <=0.4%). The exact aggregate is DEVICE-EVAL-PENDING; 900 is the perf-sim estimate.
+constexpr double kHbmAggregateGiBps = 900.0;
 constexpr int64_t kL0TileM = 128;               // L0 GEMM base M (pto-isa oracle)
 constexpr int64_t kL0TileN = 256;               // L0 GEMM base N (pto-isa oracle)
 // Grounded vector (AIV) cost: per op = head + slope*repeat + tail cycles, repeat
@@ -234,7 +241,6 @@ class ProblemBuilder {
     // Cost-model calibration (not in the SoC).
     problem.cube_compute_cost = kCubeComputeCost;
     problem.kernel_fill_cost = kKernelFillCost;
-    problem.ddr_atomic_add = true;  // 910B SetAtomicAdd (split-K partials merge in DDR)
     // Grounded pto-isa machine model (cycles + per-direction GiB/s bandwidths +
     // hierarchical L1<->L0 cube work). Activates the grounded cost path.
     problem.cube_freq_hz = kCubeFreqHz;
@@ -244,6 +250,7 @@ class ProblemBuilder {
     problem.bw_l1_l0b = kBwL1L0b;
     problem.bw_gm_ub = kBwGmUb;
     problem.bw_ub_gm = kBwUbGm;
+    problem.hbm_aggregate_gibps = kHbmAggregateGiBps;
     problem.l0_tile_m = kL0TileM;
     problem.l0_tile_n = kL0TileN;
     problem.vec_reg_bytes = kVecRegBytes;
@@ -409,7 +416,6 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     << ",\n  \"l1_capacity\": " << p.l1_capacity
     << ",\n  \"cube_compute_cost\": " << p.cube_compute_cost
     << ",\n  \"kernel_fill_cost\": " << p.kernel_fill_cost
-    << ",\n  \"ddr_atomic_add\": " << (p.ddr_atomic_add ? "true" : "false")
     << ",\n  \"cube_freq_hz\": " << p.cube_freq_hz
     << ",\n  \"bw_gm_l1\": " << p.bw_gm_l1
     << ",\n  \"bw_l0c_gm\": " << p.bw_l0c_gm
@@ -417,6 +423,7 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     << ",\n  \"bw_l1_l0b\": " << p.bw_l1_l0b
     << ",\n  \"bw_gm_ub\": " << p.bw_gm_ub
     << ",\n  \"bw_ub_gm\": " << p.bw_ub_gm
+    << ",\n  \"hbm_aggregate_gibps\": " << p.hbm_aggregate_gibps
     << ",\n  \"l0_tile_m\": " << p.l0_tile_m
     << ",\n  \"l0_tile_n\": " << p.l0_tile_n
     << ",\n  \"vec_reg_bytes\": " << p.vec_reg_bytes
