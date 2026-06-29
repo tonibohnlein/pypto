@@ -122,6 +122,7 @@ set(PYPTO_SOURCES
     src/ir/op/distributed/system.cpp
     src/ir/op/distributed/allreduce.cpp
     src/ir/op/distributed/collective.cpp
+    src/ir/op/distributed/intrinsics.cpp
     src/ir/op/tensor_ops/broadcast.cpp
     src/ir/op/tensor_ops/elementwise.cpp
     src/ir/op/tensor_ops/matmul.cpp
@@ -214,6 +215,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/stmt_dependency_analysis.cpp
     src/ir/transforms/utils/transform_utils.cpp
     src/ir/transforms/utils/wrapper_call_utils.cpp
+    src/ir/transforms/utils/window_externalization.cpp
     src/ir/transforms/visitor.cpp
 
     # IR - Reporter

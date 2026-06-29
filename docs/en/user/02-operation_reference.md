@@ -35,6 +35,10 @@ Auto-selects between tensor and tile implementation based on input type.
 | `col_max` | `(input: T) -> T` | Column-wise max |
 | `col_min` | `(input: T) -> T` | Column-wise min |
 | `col_prod` | `(input: T) -> T` | Column-wise product |
+| `row_argmax` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise argmax (column index of per-row max, int32 output; tile path requires `tmp_tile`) |
+| `row_argmin` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise argmin (column index of per-row min, int32 output; tile path requires `tmp_tile`) |
+| `col_argmax` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Column-wise argmax (row index of per-column max, int32 output; tile path requires `tmp_tile`) |
+| `col_argmin` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Column-wise argmin (row index of per-column min, int32 output; tile path requires `tmp_tile`) |
 | `rsqrt` | `(input: T, high_precision: bool = False) -> T` | Reciprocal square root; `high_precision=True` selects the high-precision path (tensor input only — tile callers must use `pl.tile.rsqrt(src, tmp=...)`) |
 | `create` / `create_tile` | `(shape: Sequence[IntLike], dtype: DataType, target_memory: Mem) -> Tile` | Tile-only (promoted from `pl.tile.create`): create tile at specific memory space |
 | `read` | `(src: T, offset: IntLike \| Sequence[IntLike]) -> Scalar` | Read scalar at indices (dispatched by source type). Sugar: `A[i, j]` |
@@ -77,6 +81,10 @@ Operate on `Tensor` objects (DDR memory).
 | `col_max` | `(input: Tensor) -> Tensor` | Column-wise max reduction (reduces along axis=-2) |
 | `col_min` | `(input: Tensor) -> Tensor` | Column-wise min reduction (reduces along axis=-2) |
 | `col_prod` | `(input: Tensor) -> Tensor` | Column-wise product reduction (reduces along axis=-2) |
+| `row_argmax` | `(input: Tensor) -> Tensor` | Row-wise argmax reduction (int32 index output) |
+| `row_argmin` | `(input: Tensor) -> Tensor` | Row-wise argmin reduction (int32 index output) |
+| `col_argmax` | `(input: Tensor) -> Tensor` | Column-wise argmax reduction (reduces along axis=-2, int32 index output) |
+| `col_argmin` | `(input: Tensor) -> Tensor` | Column-wise argmin reduction (reduces along axis=-2, int32 index output) |
 | `rsqrt` | `(input: Tensor, high_precision: bool = False) -> Tensor` | Element-wise reciprocal square root; `high_precision=True` allocates a scratch tile during lowering for the higher-precision PTO path (requires static tile shape, same constraint as `row_max`/`row_sum`) |
 | `exp` | `(input: Tensor) -> Tensor` | Element-wise exponential |
 | `cast` | `(input: Tensor, target_type: DataType, mode="round") -> Tensor` | Type cast |
@@ -99,6 +107,7 @@ Transfer data between memory hierarchy levels.
 | `create` | `(shape: Sequence[IntLike], dtype: DataType, target_memory: Mem = Mem.Vec) -> Tile` | Create tile at memory space |
 | `full` | `(shape: list[int], dtype: DataType, value: int \| float) -> Tile` | Create tile filled with constant |
 | `fillpad` | `(input: Tensor \| Tile, pad_value: PadValue \| int \| float = PadValue.zero) -> Tensor \| Tile` | Fill invalid view elements using the requested pad value; accepts the `PadValue.zero/max/min` enum or the literal sugars `0`, `0.0`, `math.inf`, `-math.inf` (other values raise). Tensor inputs lower to tile fillpad in InCore code |
+| `fillpad_expand` | `(input: Tensor \| Tile, shape: Sequence[IntLike], pad_value: PadValue \| int \| float = PadValue.zero) -> Tensor \| Tile` | Like `fillpad` but the destination `shape` may be **larger** than the source in either dimension: the source's valid region is copied to the top-left and every other element is filled with `pad_value`. Each destination dimension must be `>=` the source. Tensor inputs lower to tile fillpad_expand in InCore code |
 | `get_block_idx` | `() -> Scalar` | Get current hardware block index (UINT64) |
 
 ## Tile Arithmetic (`pl.tile.*`)
@@ -158,6 +167,10 @@ Transfer data between memory hierarchy levels.
 | `col_max` | `(tile: Tile) -> Tile` | Column-wise max |
 | `col_min` | `(tile: Tile) -> Tile` | Column-wise min |
 | `col_prod` | `(tile: Tile) -> Tile` | Column-wise product |
+| `row_argmax` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise argmax, column index of per-row max (requires tmp buffer, int32 output) |
+| `row_argmin` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise argmin, column index of per-row min (requires tmp buffer, int32 output) |
+| `col_argmax` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Column-wise argmax, row index of per-column max (requires tmp buffer, int32 output) |
+| `col_argmin` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Column-wise argmin, row index of per-column min (requires tmp buffer, int32 output) |
 | `sum` | `(tile: Tile, axis: int, keepdim: bool = False) -> Tile` | Sum along axis |
 | `max` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Max along axis |
 | `min` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Min along axis |

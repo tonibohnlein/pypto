@@ -38,6 +38,7 @@ __all__ = [
     "arange",
     "fillpad",
     "fillpad_inplace",
+    "fillpad_expand",
     "get_block_idx",
     "get_subblock_idx",
     "get_block_num",
@@ -76,6 +77,10 @@ __all__ = [
     "col_max",
     "col_min",
     "col_prod",
+    "row_argmax",
+    "row_argmin",
+    "col_argmax",
+    "col_argmin",
     "maximum",
     "row_expand",
     "row_expand_sub",
@@ -628,6 +633,31 @@ def fillpad_inplace(tile: Tile, pad_value: PadValue | int | float = PadValue.zer
     return Tile(expr=call_expr)
 
 
+def fillpad_expand(
+    tile: Tile, shape: Sequence[IntLike], pad_value: PadValue | int | float = PadValue.zero
+) -> Tile:
+    """Copy a smaller source tile into a larger destination tile, padding the rest.
+
+    Unlike :func:`fillpad` (which keeps the same physical shape and only fills the
+    valid-region expansion), this op produces a *larger* output tile: the source's
+    valid region is copied to the top-left and every other element is filled with
+    ``pad_value``. Equivalent to TFILLPAD_EXPAND on the hardware.
+
+    Args:
+        tile: Source tile
+        shape: Destination shape; each dimension must be >= the source dimension
+        pad_value: ``PadValue`` enum (``zero`` / ``max`` / ``min``), or one of
+            the literal sugars ``0``, ``math.inf``, ``-math.inf``. Default is
+            ``PadValue.zero``. Other values raise — the hardware only supports
+            the three padding modes.
+
+    Returns:
+        Tile wrapping the fillpad_expand operation (a new, larger tile).
+    """
+    call_expr = _ir_ops.fillpad_expand(tile.unwrap(), _normalize_intlike(shape), pad_value=pad_value)
+    return Tile(expr=call_expr)
+
+
 def get_block_idx() -> Scalar:
     """Get the current block index.
 
@@ -1174,6 +1204,62 @@ def col_prod(tile: Tile) -> Tile:
         Tile wrapping the col_prod operation
     """
     call_expr = _ir_ops.col_prod(tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Row-wise argmax (column index of the per-row maximum, int32 output).
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the row_argmax operation
+    """
+    call_expr = _ir_ops.row_argmax(tile.unwrap(), tmp_tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Row-wise argmin (column index of the per-row minimum, int32 output).
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the row_argmin operation
+    """
+    call_expr = _ir_ops.row_argmin(tile.unwrap(), tmp_tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Column-wise argmax (row index of the per-column maximum, int32 output).
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the col_argmax operation
+    """
+    call_expr = _ir_ops.col_argmax(tile.unwrap(), tmp_tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Column-wise argmin (row index of the per-column minimum, int32 output).
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the col_argmin operation
+    """
+    call_expr = _ir_ops.col_argmin(tile.unwrap(), tmp_tile.unwrap())
     return Tile(expr=call_expr)
 
 

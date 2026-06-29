@@ -134,6 +134,36 @@ def bar_all(*, span: Span | None = None) -> Call:
     return _create_barrier_op("system.bar_all", span=span)
 
 
+_SYNCALL_CORE_TYPES = ("aiv_only", "aic_only", "mix")
+
+
+def syncall(*, core_type: str = "mix", span: Span | None = None) -> Call:
+    """Cross-core all-participant barrier (``pto::SYNCALL``, hard/FFTS form).
+
+    Every core in the participant set selected by ``core_type`` must execute
+    past this point before any participant may proceed. Lowers to
+    ``pto.syncall() mode = #pto.sync_all_mode<hard>``.
+
+    .. warning::
+        The hard/FFTS form waits for **all** physical cores of the participant
+        set to arrive. The kernel must therefore be launched at full occupancy
+        (one block per physical core of that type). A partial-occupancy launch
+        leaves some cores unreached, so the barrier never completes and the
+        AICore times out (error 507018). Use a full-core SPMD/grid dispatch.
+
+    Args:
+        core_type: Participant set, one of "aiv_only", "aic_only", or "mix".
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for system.syncall
+    """
+    if core_type not in _SYNCALL_CORE_TYPES:
+        raise ValueError(f"syncall core_type must be one of {_SYNCALL_CORE_TYPES}, got {core_type!r}")
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    return _ir_core.create_op_call("system.syncall", [], {"core_type": core_type}, actual_span)
+
+
 # Sentinel value: compiler auto-assigns the buffer base address
 AUTO: int = -1
 

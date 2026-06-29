@@ -134,7 +134,7 @@
 | pto.tmrgsort | TMRGSORT | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | reg as mrgsort_format1/2 |
 | pto.tfillpad | TFILLPAD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tfillpad_inpace | TFILLPAD_INPLACE | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tfillpad_expand | TFILLPAD_EXPAND | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING |
+| pto.tfillpad_expand | TFILLPAD_EXPAND | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | NEW tile+tensor 前端+codegen+ST；tile a2a3 CI 通过，tensor 待 CI |
 | pto.tpartadd | TPARTADD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | NEW 前端+codegen+ST；a2a3 真机待 CI（irregular 家族留意 ISA 缺陷） |
 | pto.tpartmul | TPARTMUL | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | NEW 前端+codegen+ST；a2a3 真机待 CI（irregular 家族留意 ISA 缺陷） |
 | pto.tpartmax | TPARTMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | NEW 前端+codegen+ST；a2a3 真机待 CI（irregular 家族留意 ISA 缺陷） |
@@ -166,10 +166,10 @@
 | pto.ttri | TTRI | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING (王淼) |
 | pto.tget_scale_addr | TGET_SCALE_ADDR | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING (王淼) |
 | pto.tprefetch | TPREFETCH | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING (infra, skip) |
-| pto.trowargmax | TROWARGMAX | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING (王淼) |
-| pto.trowargmin | TROWARGMIN | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING (王淼) |
-| pto.tcolargmax | TCOLARGMAX | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING (王淼) |
-| pto.tcolargmin | TCOLARGMIN | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING (王淼) |
+| pto.trowargmax | TROWARGMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | int32 索引输出 + tmp tile；真机 a2a3 已验证 (feat-add-ptoas-argmax) |
+| pto.trowargmin | TROWARGMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | int32 索引输出 + tmp tile；真机 a2a3 已验证 (feat-add-ptoas-argmax) |
+| pto.tcolargmax | TCOLARGMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | int32 索引输出 + tmp tile（tmp 必须与 src 同形，不可补到 128）；真机 a2a3 已验证 (feat-add-ptoas-argmax) |
+| pto.tcolargmin | TCOLARGMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | int32 索引输出 + tmp tile（tmp 必须与 src 同形）；真机 a2a3 已验证 (feat-add-ptoas-argmax) |
 | pto.tpartargmax | TPARTARGMAX | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING (方锐) |
 | pto.tpartargmin | TPARTARGMIN | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING (方锐) |
 | **手动模式** |  |  |  |  |  |  |  |  |

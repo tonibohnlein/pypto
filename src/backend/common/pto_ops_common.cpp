@@ -574,6 +574,33 @@ static std::string MakeRowExpandCodegenPTO(const CallPtr& op, codegen::CodegenBa
   return "";
 }
 
+// pto.tfillpad_expand ins(%src) outs(%dst). IR tile.fillpad_expand(src, shape)
+// carries the destination shape tuple as args_[1] for type deduction only; the
+// hardware reads dst extents from the result type, so only the source tile is
+// emitted as an operand. The pad value rides on the result tile-buf type.
+static std::string MakeFillpadExpandCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+  CHECK(op->args_.size() == 2) << "tile.fillpad_expand requires 2 arguments (src, shape), got "
+                               << op->args_.size();
+  const ir::ExprPtr& src = op->args_[0];
+  std::string operand = codegen.GetExprAsCode(src);
+  std::string in_type = codegen.GetExprTypeAnnotation(src);
+  std::string result_target = codegen.GetCurrentResultTarget();
+  std::string result_type = codegen.GetCurrentResultTileBufTypeString();
+  std::ostringstream oss;
+  oss << "pto.tfillpad_expand ins(" << operand;
+  if (!in_type.empty()) {
+    oss << " : " << in_type;
+  }
+  oss << ") outs(" << result_target;
+  if (!result_type.empty()) {
+    oss << " : " << result_type;
+  }
+  oss << ")";
+  codegen.Emit(oss.str());
+  return "";
+}
+
 // Helper function for StoreFP
 static std::string MakeStoreFPCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                          codegen::CodegenBase& codegen_base) {
@@ -2449,6 +2476,11 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.col_max",         "pto.tcolmax",          1},
     {"tile.col_min",         "pto.tcolmin",          1},
     {"tile.col_prod",        "pto.tcolprod",         1},
+    // Argmax/argmin reductions — int32 index output, require a tmp scratch tile.
+    {"tile.row_argmax",      "pto.trowargmax",       2},
+    {"tile.row_argmin",      "pto.trowargmin",       2},
+    {"tile.col_argmax",      "pto.tcolargmax",       2},
+    {"tile.col_argmin",      "pto.tcolargmin",       2},
     {"tile.col_expand_mul",  "pto.tcolexpandmul",    2},
     {"tile.col_expand_add",  "pto.tcolexpandadd",    2},
     {"tile.col_expand_max",  "pto.tcolexpandmax",    2},
@@ -3558,6 +3590,9 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   reg("tile.row_expand", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeRowExpandCodegenPTO(op, codegen);
   });
+  reg("tile.fillpad_expand", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeFillpadExpandCodegenPTO(op, codegen);
+  });
   reg("tile.store_fp", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeStoreFPCodegenPTO("pto.tstore.fp", op, codegen);
   });
@@ -3804,6 +3839,17 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
         << "} -> i32";
     codegen.Emit(oss.str());
 
+    return std::string("");
+  });
+  reg("system.syncall", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    // Cross-core all-participant barrier (pto::SYNCALL), hard/FFTS form: no
+    // operands, only the participating core set is selected.
+    CHECK(op->args_.empty()) << "system.syncall (hard form) takes no arguments, got " << op->args_.size();
+    const auto core_type = op->GetKwarg<std::string>("core_type", "mix");
+    CHECK(core_type == "aiv_only" || core_type == "aic_only" || core_type == "mix")
+        << "system.syncall: core_type must be aiv_only|aic_only|mix, got " << core_type;
+    codegen.Emit("pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<" +
+                 core_type + ">");
     return std::string("");
   });
   reg("tile.slice", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {

@@ -152,7 +152,7 @@ def _is_per_element_task_id_read(expr: ir.Expr) -> bool:
     """
     if not isinstance(expr, ir.Call):
         return False
-    if expr.op.name != "array.get_element":
+    if expr.op.name != ir.get_op("array.get_element").name:
         return False
     if not isinstance(expr.type, ir.ScalarType) or expr.type.dtype != DataType.TASK_ID:
         return False
@@ -330,7 +330,7 @@ def _normalize_inferred_type_for_annotation(
         isinstance(annotation_type, ir.TileType)
         and isinstance(inferred_type, ir.TileType)
         and isinstance(value_expr, ir.Call)
-        and value_expr.op.name in {"tile.load", "tile.create"}
+        and value_expr.op.name in {ir.get_op("tile.load").name, ir.get_op("tile.create").name}
         and len(annotation_type.shape) <= 2
         and len(inferred_type.shape) > 2
     ):
@@ -417,6 +417,7 @@ class _AtKwargState:
     # ``dump_vars`` transfer), and the outliner translates it into the
     # synthesised dispatch's ``kAttrDumpVars``.
     dumps_kw: "ast.keyword | None" = field(default=None)
+    windowize: bool = False
 
 
 _SPMD_SCOPE_NAME_SUFFIX = "_spmd"
@@ -1235,7 +1236,11 @@ class ASTParser:
                 (
                     isinstance(override_type, ir.TileType)
                     and isinstance(value_expr.type, ir.UnknownType)
-                    and value_expr.op.name in ("tile.tpop_from_aiv", "tile.tpop_from_aic")
+                    and value_expr.op.name
+                    in {
+                        ir.get_op("tile.tpop_from_aiv").name,
+                        ir.get_op("tile.tpop_from_aic").name,
+                    }
                 )
                 or not _types_match(value_expr.type, override_type)
             )
@@ -3061,6 +3066,14 @@ class ASTParser:
                     hint="Write allow_early_resolve=True to opt this scope into early-dispatch.",
                 )
             state.allow_early_resolve = kw.value.value
+        elif kw.arg == "windowize":
+            if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, bool):
+                raise ParserSyntaxError(
+                    "pl.at() windowize must be a boolean literal (True/False)",
+                    span=self.span_tracker.get_span(kw.value),
+                    hint="Write windowize=True to allow local windowization for this InCore scope.",
+                )
+            state.windowize = kw.value.value
         elif kw.arg in _AT_STASH_KWARGS:
             self._stash_at_kwarg(kw, state)
         elif kw.arg is None:
@@ -3075,7 +3088,7 @@ class ASTParser:
                 span=self.span_tracker.get_span(kw),
                 hint=(
                     "Supported arguments: level, role, optimizations, deps, no_dep_args, dumps, "
-                    "allow_early_resolve, name_hint"
+                    "allow_early_resolve, name_hint, windowize"
                 ),
             )
 
@@ -4165,6 +4178,9 @@ class ASTParser:
             deps_kw, no_dep_args_kw, dumps_kw, optional_vars, state.allow_early_resolve, span
         )
         scope_attrs = self._append_split_slot_num_attr(scope_attrs, state.split_slot_num)
+        if state.windowize:
+            scope_attrs = list(scope_attrs or [])
+            scope_attrs.append(("windowize", True))
 
         # ``with pl.at(...) as tid:`` allocates ``tid`` as an outer-scope Var
         # whose real definition is synthesised later by ``OutlineIncoreScopes``
