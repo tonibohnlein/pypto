@@ -161,7 +161,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
     } else if (nb::isinstance<nb::list>(item.second) || nb::isinstance<nb::tuple>(item.second)) {
       // Lists/tuples carry exactly one element type, dispatched by attr key:
       //   - kAttrArgDirections             -> vector<ArgDirection>
-      //   - kAttrArgDirectionOverrides     -> vector<int32_t>
+      //   - kAttrArgDirectionOverrides /
+      //     kAttrAtomicInoutArgs           -> vector<int32_t> (arg positions)
       //   - kAttrManualDepEdges /
       //     kAttrCompilerManualDepEdges /
       //     kAttrArgDirOverrideVars /
@@ -170,7 +171,7 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
       // payloads (e.g. ``manual_dep_edges=[1]``) and fail later in codegen
       // instead of raising at parse time.
       auto seq = nb::cast<nb::sequence>(item.second);
-      if (key == kAttrArgDirectionOverrides) {
+      if (key == kAttrArgDirectionOverrides || key == kAttrAtomicInoutArgs) {
         std::vector<int32_t> idxs;
         for (auto elem : seq) {
           if (nb::isinstance<nb::bool_>(elem) || !nb::isinstance<nb::int_>(elem)) {
