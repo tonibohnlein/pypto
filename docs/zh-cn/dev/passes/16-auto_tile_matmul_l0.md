@@ -8,6 +8,8 @@
 
 **K 切分 vs M/N 切分。** 当 chooser 返回 `m == M` 且 `n == N` 时，输出已能放进 L0c，因此只切分 K 维（一个 K-loop）。当返回 `m < M` 或 `n < N` 时，`[M, N]` 输出 Acc 会超过 L0c。由于操作数已经是 Mat-resident，*只有*输出溢出：本 pass 把**输出**切成 `ceil(M/m) × ceil(N/n)` 的 `[m, n]` 子块网格（边界处为部分块——`m`/`n` 不必整除 `M`/`N`），每个子块用同样的流水化 K-loop 计算，并把每个 `[m, n]` 的 Acc 子块直接 store 到 `out[mi:, ni:]`（direct-store / 输出落 DDR 的路径）。这样每个 Acc tile 都 ≤ L0c，matmul 能顺利通过 `AllocateMemoryAddr` 而不溢出。输出张量以 SSA 形式在各子块 store 间串联（`out → out_t0 → out_t1 → …`）。
 
+**Fits-L0c 链式 cast-fold（cast 折叠）。** 当链式 matmul 的 `[M, N]` 结果*能放进* L0c（无需 M/N 切分），但经一次降精度后再喂给第二个 matmul —— `c = matmul(a, b); cb = cast(c, bf16); d = matmul(cb, e)` —— 消费者需要 bf16 中间值位于 **Mat**（L1）。若不处理，`tile.cast` 会 lower 成 **Vector** 的 `pto.tcvt`（一次 cube→vector→cube 往返，在 `[128, 128]` 形状下会撑爆 Vec buffer）。本 pass 改为把 cast 折叠成**一次整窗**的 Acc→Mat `tile.assemble` —— 与超大 Mat-scratch 路径用的是同一个 `MatScratchPlacer`，只是单次 `PlaceAt` 于偏移 `(0, 0)` 而非一个网格 —— 从而让降精度留在 cube 上，作为 FIXPIPE 的 `pto.tinsert`。这是一个与 K 切分无关的 cast-peephole：无论 producer 是保持整体（`k == K`）还是被 K-loop 切分（`k < K`）都会触发，且仅当 cast 结果的每一处使用都是矩阵乘操作数时才折叠（非矩阵乘消费者保留 Vector cast）。折叠还严格对齐 FIXPIPE 能复现的能力——即 **`f32 → bf16/f16`** 降精度、且舍入模式为 **`rint`**（就近、**取偶**），这是 FIXPIPE 固定的 tie 规则——A2/A3 与 A5 一致（pto-isa 的 CPU 参考实现用 `std::bfloat16_t` 降精度、无 arch 分支，且 `pto.tinsert` 不带 `rmode`；两个 backend 仅 scratch dtype 不同，舍入相同）。若源不是 `f32`（例如 `int32` 矩阵乘结果，需要带 scale 的 *dequant*）、为 cast 默认的 **`round`** 模式（就近、**远离零**），或为有方向/截断的模式（`none`/`floor`/`ceil`/`trunc`/`odd`），则都保留 Vector `pto.tcvt`——只有它才会遵循所请求的 `rmode`——并由本 pass 发出指向 `mode="rint"` 的 `PH-AT-010` 提示。同一道 gate（`CastFoldableToFixpipeMat`）也用于下面的超大 Mat-scratch 折叠。超大结果不会到达这个 peephole——它们的 cast 由上面的 M/N 路径逐子块折叠。
+
 **Pipeline 位置**：紧跟在 [`FlattenTileNdTo2D`](15-flatten_tile_nd_to_2d.md) 之后，先于 [`InferTileMemorySpace`](18-infer_tile_memory_space.md)。此时 tile op 已是 2D，但 memory space 尚未推断。
 
 **前置属性 (Required)**：`SSAForm`、`SplitIncoreOrch`、`IncoreTileOps`、`TileOps2D`、`NormalizedStmtStructure`。
@@ -136,6 +138,29 @@ out_t1 = pl.store(c_t1, [256, 0], out_t0)  # 子块 store 到 out[256:512, 0:256
 
 边界子块（当 `m`/`n` 不整除 `M`/`N`）使用静态部分尺寸 `[min(m, M-mi), min(n, N-ni)]` —— 例如 Ascend910B 上的 256×256 FP32 matmul（chooser 选 `m = 192, n = 160`）会切成 `192×160`、`192×96`、`64×160`、`64×96` 四个子块。
 
+### Fits-L0c 链式 matmul（cast-fold）
+
+**Before**（`[128, 128]` 中间值能放进 L0c；`K = 64` 能放进 L0，因此 producer 是单个 matmul）：
+
+```python
+c  = pl.tile.matmul(a_mat, b_mat)          # [128, 128] Acc f32 —— 能放进 L0c
+cb = pl.tile.cast(c, pl.BF16)              # 若不处理会 lower 成 Vector pto.tcvt
+d  = pl.tile.matmul(cb, e_mat)             # 在片上消费 bf16 中间值
+out = pl.tile.store(d, [0, 0], out)
+```
+
+**After**（cast 被折叠成一次整窗 Acc→Mat assemble；`cb` 的消费者读取 Mat scratch）：
+
+```python
+c       = pl.tile.matmul(a_mat, b_mat)                       # 不变（能放进 L0c）
+c_mat   = pl.tile.create([128, 128], dtype=pl.BF16, target_memory=Mat)  # L1/Mat scratch
+c_mat_t0 = pl.tile.assemble(c_mat, c, [0, 0])                # Acc f32 → Mat bf16（cube pto.tinsert）
+d       = pl.tile.matmul(c_mat_t0, e_mat)                    # 在片上读取 scratch
+out     = pl.tile.store(d, [0, 0], out)
+```
+
+`tile.cast` 被删除。当 producer 需要 K-loop（`k < K`）时，照常发出 K-loop，其 Acc 结果喂给*同一个*单次 `tile.assemble` —— 折叠与 K 切分无关。
+
 ## Backend 约束
 
 L0 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从 `PassContext::Current()->GetBackendHandler()` 读取，若无活动 context 则回退到 `pypto::backend::GetBackend()->GetHandler()`（例如未包 `PassContext` 直接调用的测试场景）。
@@ -179,6 +204,7 @@ L0 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从 `Pa
 | 静态 2D、右操作数为 Mat（左为 Mat 或 PV 的 Vec）、输出可放进 L0c 的 `tile.matmul` | 改写为 2 阶段流水化 K-loop；Vec 左操作数先预存到 Mat |
 | 输出超过 L0c、被唯一一个 2D `tile.store` 消费的普通 `tile.matmul`（左右均 Mat） | M/N 切分：`ceil(M/m) × ceil(N/n)` 子块网格，每个子块一个 K-loop 并直接 store 到输出（direct-store） |
 | 输出超过 L0c、被**完全作为矩阵乘操作数**消费（链式 matmul）、且 `[M, N]` scratch 能放进 Mat/L1 的普通 `tile.matmul` | M/N 切分到 L1/**Mat** scratch（逐子块 Acc→Mat `tile.assemble`），保留在片上供消费者读取（Mat-scratch） |
+| 输出*能放进* L0c、经 `tile.cast(c, bf16/f16)` 降精度、且 cast 结果被**完全作为矩阵乘操作数**消费（链式）的 `tile.matmul` | cast-fold：一次整窗 Acc→Mat `tile.assemble`（cube `pto.tinsert`），并删除 cast —— 无 Vector `pto.tcvt` 往返 |
 | 静态 2D、右操作数为 Mat（左为 Mat 或 PV 的 Vec）、输出可放进 L0c 的 `tile.matmul_acc` | 改写为 2 阶段流水化 K-loop（循环体统一为 `matmul_acc`） |
 | 右（B）操作数为 Vec 的 `tile.matmul[_acc]` | 跳过（B 操作数必须从 L1 送入 L0B） |
 | `tile.matmul_bias` | 跳过（待支持——「最后一次迭代后再 bias-add」的改写尚未实现） |
@@ -198,6 +224,8 @@ L0 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从 `Pa
 | `PH-AT-006` | 输出超过 L0c，但两种 M/N 放置都不适用——`tile.matmul_acc`、左操作数为 Vec、或结果在片上被消费但**并非**完全作为矩阵乘操作数（混合 store + 片上、或 elementwise）。结果被完全作为矩阵乘操作数消费时走 **Mat-scratch** 路径（不发提示）——但若其 `[M, N]` scratch 超过 backend 的 Mat/L1 容量，则同样在此延后（保守的必要条件 gate；完整的 packed-peak 检查为后续工作）。 |
 | `PH-AT-007` | `K % k != 0`（K 边界处理暂不支持） |
 | `PH-AT-008` | `ChooseL0Tile` 返回了 fallback 配置并附带 perf hint |
+| `PH-AT-009` | 该 backend 需要 bf16/f16 的片上 Mat scratch（如 Ascend910B），但超大链式 matmul 的中间结果是 f32——在消费 matmul 之前把 matmul 结果 cast 成 bf16/f16；否则留在延后路径上 |
+| `PH-AT-010` | fits-L0c 链式 matmul 的 cast 无法折叠进 cube FIXPIPE（FIXPIPE 仅以就近取偶把 `f32 → bf16/f16` 降精度）：源非 f32，或舍入模式不是 `rint`（例如默认的 `round`，或 `floor`/`ceil`/`trunc`/`odd`/`none`）。保留在 Vector `pto.tcvt` 路径——一次 cube→vector→cube 往返，在较大 `[M, N]` 下可能撑爆 Vec buffer。对 f32 结果使用 `mode="rint"` 即可留在 cube 上。 |
 
 ## 相关 Pass
 
