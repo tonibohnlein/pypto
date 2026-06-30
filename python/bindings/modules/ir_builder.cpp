@@ -107,16 +107,11 @@ void BindIRBuilder(nb::module_& m) {
       .def(
           "begin_for_loop",
           [](IRBuilder& self, const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop,
-             const ExprPtr& step, const Span& span, ForKind kind, std::optional<ExprPtr> chunk_size,
-             ChunkPolicy chunk_policy, const nb::object& attrs_or_none) {
-            std::optional<ChunkConfig> chunk_config =
-                chunk_size.has_value() ? std::optional{ChunkConfig{*chunk_size, chunk_policy}} : std::nullopt;
-            self.BeginForLoop(loop_var, start, stop, step, span, kind, std::move(chunk_config),
-                              ConvertAttrsFromPython(attrs_or_none));
+             const ExprPtr& step, const Span& span, ForKind kind, const nb::object& attrs_or_none) {
+            self.BeginForLoop(loop_var, start, stop, step, span, kind, ConvertAttrsFromPython(attrs_or_none));
           },
           nb::arg("loop_var"), nb::arg("start"), nb::arg("stop"), nb::arg("step"), nb::arg("span"),
-          nb::arg("kind") = ForKind::Sequential, nb::arg("chunk_size") = nb::none(),
-          nb::arg("chunk_policy") = ChunkPolicy::Guarded, nb::arg("attrs") = nb::none(),
+          nb::arg("kind") = ForKind::Sequential, nb::arg("attrs") = nb::none(),
           "Begin building a for loop.\n\n"
           "Creates a new for loop context. Must be closed with end_for_loop().\n\n"
           "Args:\n"
@@ -126,8 +121,6 @@ void BindIRBuilder(nb::module_& m) {
           "    step: Step value expression\n"
           "    span: Source location for loop definition\n"
           "    kind: Loop kind (Sequential or Parallel, default: Sequential)\n"
-          "    chunk_size: Optional chunk size for loop chunking\n"
-          "    chunk_policy: Chunk distribution policy (default: Guarded)\n"
           "    attrs: Loop-level attributes (default: empty)\n\n"
           "Raises:\n"
           "    RuntimeError: If not inside a valid context")
@@ -276,6 +269,16 @@ void BindIRBuilder(nb::module_& m) {
           "        ``Call``.\n\n"
           "Raises:\n"
           "    RuntimeError: If not inside a function or loop")
+      .def("mark_current_scope_split_aiv", &IRBuilder::MarkCurrentScopeSplitAiv, nb::arg("split"),
+           "Stamp the explicit AIV-split marker onto the currently-open scope.\n\n"
+           "Sets the enclosing open InCore scope's split mode to ``split`` and\n"
+           "appends a ``(\"split_aiv\", True)`` attr. Used by the parser to flatten\n"
+           "a ``for aiv_id in pl.split_aiv(...)`` loop nested inside a CORE_GROUP\n"
+           "InCore scope (the body is then emitted inline, no nested sub-scope).\n\n"
+           "Args:\n"
+           "    split: Split mode declared by pl.split_aiv(..., mode=...)\n\n"
+           "Raises:\n"
+           "    ValueError: If the current context is not an open InCore scope")
       .def("end_scope", &IRBuilder::EndScope, nb::arg("end_span"),
            "End building a scope statement.\n\n"
            "Finalizes the scope statement and returns it.\n\n"

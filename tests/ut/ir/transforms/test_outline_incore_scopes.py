@@ -1074,55 +1074,6 @@ class TestSplitIncoreOrchVerifier:
         After = passes.outline_incore_scopes()(program)
         ir.assert_structural_equal(After, Expected)
 
-    def test_full_pipeline_with_verification_passes(self):
-        """Full pipeline with auto_incore: no compute ops leak into Orchestration."""
-
-        @pl.program
-        class Input:
-            @pl.function
-            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                    x = pl.add(x, 1.0)
-                    for i in pl.parallel(0, 8, 1, chunk=4, chunk_policy="leading_full"):
-                        x = pl.add(x, 2.0)
-                return x
-
-        @pl.program
-        class Expected:
-            @pl.function(type=pl.FunctionType.InCore)
-            def main_incore_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                x1: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
-                return x1
-
-            @pl.function(type=pl.FunctionType.InCore)
-            def main_incore_1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                for i, (xi,) in pl.parallel(
-                    4, init_values=(x,), attrs={"loop_origin": pl.LoopOrigin.ChunkInner}
-                ):
-                    x4: pl.Tensor[[64], pl.FP32] = pl.add(xi, 2.0)
-                    xrv = pl.yield_(x4)
-                return x
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                x1: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x)
-                for i, (xi,) in pl.parallel(
-                    2, init_values=(x1,), attrs={"loop_origin": pl.LoopOrigin.ChunkOuter}
-                ):
-                    xrv: pl.Tensor[[64], pl.FP32] = self.main_incore_1(xi)
-                    xorv = pl.yield_(xrv)
-                return xorv
-
-        # Run the full pipeline with verification enabled — should not throw
-        program = passes.unroll_loops()(Input)
-        program = passes.convert_to_ssa()(program)
-        program = passes.flatten_call_expr()(program)
-        program = passes.split_chunked_loops()(program)
-        program = passes.interchange_chunk_loops()(program)
-        program = passes.outline_incore_scopes()(program)
-
-        ir.assert_structural_equal(program, Expected)
-
 
 class TestOutlineNamedIncoreScopes:
     """Test OutlineIncoreScopes pass with user-provided scope names."""
@@ -1469,6 +1420,44 @@ class TestOutlineNoDepArgs:
         assert outlined.param_directions[k_cache_idx] == ir.ParamDirection.InOut, (
             f"expected InOut at outlined callee param {k_cache_idx}, got {list(outlined.param_directions)}"
         )
+
+    def test_outline_propagates_split_aiv_attr(self):
+        """A pl.split_aiv InCore scope carries split + split_aiv onto the outlined function.
+
+        OutlineIncoreScopes must propagate the manual AIV-split marker
+        (``split_aiv``) — not just the ``split`` mode — so the downstream
+        SplitVectorKernel bypass can find it on the
+        outlined function.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                b: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    offset = aiv_id * 128
+                    tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    tile_b: pl.Tile[[128, 128], pl.FP32] = pl.load(b, [offset, 0], [128, 128])
+                    out = pl.store(pl.add(tile_a, tile_b), [offset, 0], out)
+                return out
+
+        # Use BEFORE_AND_AFTER property verification (not the default `roundtrip`
+        # level): the python printer does not yet emit the InCoreScopeStmt
+        # `split_aiv` marker, so a print->parse roundtrip of a split_aiv program
+        # spuriously fails on the scope's attrs. That printer gap is unrelated to
+        # the outliner propagation this test exercises.
+        with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+            Before = passes.convert_to_ssa()(Before)
+            After = passes.outline_incore_scopes()(Before)
+
+        outlined = next(f for gv, f in After.functions.items() if f.func_type == ir.FunctionType.InCore)
+        assert outlined.attrs["split"] == pl.SplitMode.UP_DOWN.value
+        assert outlined.attrs["split_aiv"] is True
 
 
 if __name__ == "__main__":

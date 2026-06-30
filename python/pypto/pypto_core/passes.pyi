@@ -53,6 +53,7 @@ class IRProperty(Enum):
     AssignTypeSymmetry = ...
     ManualDepsOnSubmitOnly = ...
     ReturnParamsExplicit = ...
+    AivSplitValid = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -359,12 +360,6 @@ class TypeCheckErrorType(Enum):
     FOR_RANGE_MUST_BE_SCALAR = ...
     CONDITION_MUST_BE_BOOL = ...
 
-def split_chunked_loops() -> Pass:
-    """Create a pass that splits chunked loops into nested loops."""
-
-def interchange_chunk_loops() -> Pass:
-    """Create a pass that interchanges chunk loops and inserts InCore scopes."""
-
 def unroll_loops() -> Pass:
     """Create a loop unrolling pass that expands ForKind.Unroll loops at compile time."""
 
@@ -488,24 +483,6 @@ def canonicalize_tile_slice() -> Pass:
 def infer_tile_memory_space() -> Pass:
     """Create a pass that infers memory_space for TileType variables in InCore functions."""
 
-def lower_transpose_load_param_layout() -> Pass:
-    """Create the LowerTransposeLoadParamLayout pass (RFC #1300 P6).
-
-    For each InCore function, detects ``tile.load(..., transpose=True)`` whose
-    source is a function parameter ``p`` and rewrites the body to encode the
-    transpose intent as an explicit ``tensor.as_layout`` view:
-
-    - prepends ``p_dn = tensor.as_layout(p, layout=DN)`` to the InCore body
-      (``p_dn`` carries the canonical ``[..., b, a] DN`` view);
-    - substitutes body uses of ``p`` with ``p_dn``;
-    - swaps the trailing pair of offsets/shapes/valid_shapes on the matching
-      ``tile.load`` calls and drops ``transpose=True``.
-
-    Parameter signatures are left unchanged. Non-InCore (orch) functions are
-    untouched. Mixed-use parameters (both ``transpose=True`` and
-    ``transpose=False`` loads on the same param) are rejected.
-    """
-
 def materialize_tensor_strides() -> Pass:
     """Create the MaterializeTensorStrides pass (RFC #1300 §2.4).
 
@@ -521,6 +498,19 @@ def resolve_backend_op_layouts() -> Pass:
 
 def expand_mixed_kernel() -> Pass:
     """Create a pass that expands mixed InCore functions into AIC + AIV + Group."""
+
+def lower_auto_vector_split() -> Pass:
+    """Lower AUTO ``pl.split`` mixed InCore functions into the explicit ``split_aiv`` form.
+
+    Inserts ``tile.aiv_shard`` at C->V boundaries and ``tile.aic_gather`` at V->C
+    boundaries, halves only the vector sub-region (affinity-gated), injects
+    ``get_subblock_idx``, and stamps ``split`` + ``split_aiv`` — all BEFORE
+    ExpandMixedKernel folds the reshape ops into split-stamped tpush/tpop.
+
+    This is the live auto-split lowering path: it always runs immediately before
+    ExpandMixedKernel, so SplitVectorKernel only stamps attrs for the resulting
+    ``split_aiv`` functions.
+    """
 
 def inject_gm_pipe_buffer() -> Pass:
     """Create a backend-gated pass that injects ``__gm_pipe_buffer`` for cross-core pipes.
@@ -788,8 +778,6 @@ __all__ = [
     "VerificationError",
     "SSAErrorType",
     "TypeCheckErrorType",
-    "split_chunked_loops",
-    "interchange_chunk_loops",
     "unroll_loops",
     "ctrl_flow_transform",
     "convert_to_ssa",
@@ -802,11 +790,11 @@ __all__ = [
     "auto_tile_matmul_l0",
     "canonicalize_tile_slice",
     "infer_tile_memory_space",
-    "lower_transpose_load_param_layout",
     "materialize_tensor_strides",
     "resolve_backend_op_layouts",
     "normalize_return_order",
     "expand_mixed_kernel",
+    "lower_auto_vector_split",
     "inject_gm_pipe_buffer",
     "split_vector_kernel",
     "simplify",

@@ -17,8 +17,6 @@ from pypto import DataType, backend, ir, passes
 from pypto.backend import BackendType
 
 TENSOR_ONLY_PASSES = [
-    "SplitChunkedLoops",
-    "InterchangeChunkLoops",
     "OutlineHierarchyScopes",
     "OutlineIncoreScopes",
     "OutlineClusterScopes",
@@ -40,8 +38,8 @@ TENSOR_OPTIMIZATION_PASSES = [
     "AutoTileMatmulL0",
     "CanonicalizeTileSlice",
     "InferTileMemorySpace",
-    "LowerTransposeLoadParamLayout",
     "ResolveBackendOpLayouts",
+    "LowerAutoVectorSplit",
     "ExpandMixedKernel",
     "InjectGMPipeBuffer",
     "SplitVectorKernel",
@@ -78,8 +76,8 @@ DEBUG_TILE_OPTIMIZATION_PASSES = [
     "AutoTileMatmulL0",
     "CanonicalizeTileSlice",
     "InferTileMemorySpace",
-    "LowerTransposeLoadParamLayout",
     "ResolveBackendOpLayouts",
+    "LowerAutoVectorSplit",
     "ExpandMixedKernel",
     "InjectGMPipeBuffer",
     "SplitVectorKernel",

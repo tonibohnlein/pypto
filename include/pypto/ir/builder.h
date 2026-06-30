@@ -146,7 +146,6 @@ class IRBuilder {
    */
   void BeginForLoop(const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop, const ExprPtr& step,
                     const Span& span, ForKind kind = ForKind::Sequential,
-                    std::optional<ChunkConfig> chunk_config = std::nullopt,
                     std::vector<std::pair<std::string, std::any>> attrs = {});
 
   /**
@@ -316,6 +315,23 @@ class IRBuilder {
    * @throws RuntimeError if not inside a scope context
    */
   StmtPtr EndScope(const Span& end_span);
+
+  /**
+   * @brief Stamp the explicit AIV-split marker onto the currently-open scope.
+   *
+   * Used by the parser to flatten a ``for aiv_id in pl.split_aiv(...)`` loop
+   * that is already nested inside an InCore (CORE_GROUP) scope: instead of
+   * opening a nested InCore sub-scope (which OutlineIncoreScopes would outline
+   * as a separate tile-I/O sub-function and break ConvertTensorToTileOps /
+   * InferTileMemorySpace), the loop's split mode and ``("split_aiv", true)``
+   * attr are stamped directly onto the enclosing InCore scope and the body is
+   * emitted inline. Sets ``split_`` to ``split`` and appends the
+   * ``("split_aiv", true)`` attr on the current scope context.
+   *
+   * @param split The split mode declared by ``pl.split_aiv(..., mode=...)``
+   * @throws ValueError if the current context is not an open InCore scope
+   */
+  void MarkCurrentScopeSplitAiv(SplitMode split);
 
   // ========== Statement Recording ==========
 
@@ -633,15 +649,13 @@ class FunctionContext : public BuildContext {
 class ForLoopContext : public BuildContext {
  public:
   ForLoopContext(VarPtr loop_var, ExprPtr start, ExprPtr stop, ExprPtr step, Span span,
-                 ForKind kind = ForKind::Sequential, std::optional<ChunkConfig> chunk_config = std::nullopt,
-                 std::vector<std::pair<std::string, std::any>> attrs = {})
+                 ForKind kind = ForKind::Sequential, std::vector<std::pair<std::string, std::any>> attrs = {})
       : BuildContext(Type::FOR_LOOP, std::move(span)),
         loop_var_(std::move(loop_var)),
         start_(std::move(start)),
         stop_(std::move(stop)),
         step_(std::move(step)),
         kind_(kind),
-        chunk_config_(std::move(chunk_config)),
         attrs_(std::move(attrs)) {}
 
   void AddIterArg(const IterArgPtr& iter_arg) { iter_args_.push_back(iter_arg); }
@@ -655,7 +669,6 @@ class ForLoopContext : public BuildContext {
   [[nodiscard]] const std::vector<IterArgPtr>& GetIterArgs() const { return iter_args_; }
   [[nodiscard]] const std::vector<VarPtr>& GetReturnVars() const { return return_vars_; }
   [[nodiscard]] ForKind GetKind() const { return kind_; }
-  [[nodiscard]] const std::optional<ChunkConfig>& GetChunkConfig() const { return chunk_config_; }
   [[nodiscard]] const std::vector<std::pair<std::string, std::any>>& GetAttrs() const { return attrs_; }
 
  private:
@@ -664,7 +677,6 @@ class ForLoopContext : public BuildContext {
   ExprPtr stop_;
   ExprPtr step_;
   ForKind kind_;
-  std::optional<ChunkConfig> chunk_config_;
   std::vector<std::pair<std::string, std::any>> attrs_;
   std::vector<IterArgPtr> iter_args_;
   std::vector<VarPtr> return_vars_;
@@ -748,6 +760,8 @@ class ScopeContext : public BuildContext {
   [[nodiscard]] std::optional<Level> GetLevel() const { return level_; }
   [[nodiscard]] std::optional<Role> GetRole() const { return role_; }
   [[nodiscard]] std::optional<SplitMode> GetSplit() const { return split_; }
+  void SetSplit(std::optional<SplitMode> split) { split_ = split; }
+  void AddAttr(std::pair<std::string, std::any> attr) { attrs_.push_back(std::move(attr)); }
   [[nodiscard]] const std::string& GetNameHint() const { return name_hint_; }
   [[nodiscard]] const ExprPtr& GetCoreNum() const { return core_num_; }
   [[nodiscard]] std::optional<bool> GetSyncStart() const { return sync_start_; }

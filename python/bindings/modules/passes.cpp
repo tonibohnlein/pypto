@@ -108,7 +108,10 @@ void BindPass(nb::module_& m) {
              "exempt")
       .value("ReturnParamsExplicit", IRProperty::ReturnParamsExplicit,
              "InCore/Group/Spmd tensor returns reference function params by pointer identity, so the "
-             "return->param map is a lookup (#1702)");
+             "return->param map is a lookup (#1702)")
+      .value("AivSplitValid", IRProperty::AivSplitValid,
+             "Split-mode AIV/AIC functions (explicit split_aiv marker + non-None split mode) have no "
+             "vector reduce op that collapses the split axis (partial-reduction miscompile)");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -376,10 +379,6 @@ void BindPass(nb::module_& m) {
       .value("USE_BEFORE_DEF", use_after_def::ErrorType::USE_BEFORE_DEF,
              "Variable used before any definition in scope");
 
-  passes.def("split_chunked_loops", &pass::SplitChunkedLoops,
-             "Create a pass that splits chunked loops into nested loops");
-  passes.def("interchange_chunk_loops", &pass::InterchangeChunkLoops,
-             "Create a pass that interchanges chunk loops and inserts InCore scopes");
   passes.def("unroll_loops", &pass::UnrollLoops, "Create a loop unrolling pass");
   passes.def("skew_cross_core_pipeline", &pass::SkewCrossCorePipeline,
              "Skew cross-core (cube/vector) ``pl.pipeline`` loops; runs immediately before\n"
@@ -454,19 +453,6 @@ void BindPass(nb::module_& m) {
              "The dead tile.slice is then dropped, unifying Mat->Left/Right on pto.textract.");
   passes.def("infer_tile_memory_space", &pass::InferTileMemorySpace,
              "Create a pass that infers memory_space for TileType variables in InCore functions");
-  passes.def("lower_transpose_load_param_layout", &pass::LowerTransposeLoadParamLayout,
-             "Create the LowerTransposeLoadParamLayout pass (RFC #1300 P6).\n\n"
-             "For each InCore function, detects tile.load(..., transpose=True) whose source\n"
-             "is a function parameter `p` and rewrites the body to encode the transpose\n"
-             "intent as an explicit `tensor.as_layout` view:\n"
-             "  - prepends `p_dn = tensor.as_layout(p, layout=DN)` to the InCore body\n"
-             "    (`p_dn` carries the canonical `[..., b, a] DN` view);\n"
-             "  - substitutes body uses of `p` with `p_dn`;\n"
-             "  - swaps the trailing pair of offsets/shapes/valid_shapes on the matching\n"
-             "    tile.load calls and drops `transpose=True`.\n"
-             "Parameter signatures are left unchanged. Non-InCore (orch) functions are\n"
-             "untouched. Mixed-use params (both transpose=True and transpose=False loads on\n"
-             "the same param) are rejected.");
   passes.def("materialize_tensor_strides", &pass::MaterializeTensorStrides,
              "Create the MaterializeTensorStrides pass (RFC #1300 §2.4).\n\n"
              "Walks every TensorType reachable from the program and rewrites any\n"
@@ -480,6 +466,11 @@ void BindPass(nb::module_& m) {
              "into `[1,N]` row-major views before the consumer and reshaping the output back when needed.");
   passes.def("expand_mixed_kernel", &pass::ExpandMixedKernel,
              "Create a pass that expands mixed InCore functions into AIC + AIV + Group");
+  passes.def("lower_auto_vector_split", &pass::LowerAutoVectorSplit,
+             "Create a pass that lowers AUTO pl.split mixed InCore functions into the explicit\n"
+             "split_aiv form (tile.aiv_shard at C->V, tile.aic_gather at V->C, halved vector\n"
+             "sub-region, get_subblock_idx) BEFORE ExpandMixedKernel. This is the live auto-split\n"
+             "lowering path; SplitVectorKernel then only stamps attrs for the split_aiv functions.");
   passes.def("inject_gm_pipe_buffer", &pass::InjectGMPipeBuffer,
              "Create a backend-gated pass that injects the __gm_pipe_buffer workspace parameter\n"
              "into functions containing cross-core initialize_pipe ops, propagating the parameter\n"

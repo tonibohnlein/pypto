@@ -53,23 +53,11 @@ inline const PassProperties kMaterializeRuntimeScopesProperties{
 
 // -- Loop unrolling pass (runs before SSA) ------------------------------------
 
-inline const PassProperties kUnrollLoopsProperties{};
+inline const PassProperties kUnrollLoopsProperties{.produced = {IRProperty::UnrollResolved}};
 
 // -- Control flow structuring pass (runs before SSA, after unrolling) ---------
 
 inline const PassProperties kCtrlFlowTransformProperties{.produced = {IRProperty::StructuredCtrlFlow}};
-
-// -- Loop chunking pass (runs after SSA) --------------------------------------
-
-inline const PassProperties kSplitChunkedLoopsProperties{
-    .required = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure, IRProperty::UnrollResolved}};
-
-// -- Chunk loop interchange pass (runs after SplitChunkedLoops) ---------------
-
-inline const PassProperties kInterchangeChunkLoopsProperties{
-    .required = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure}};
 
 // -- SSA conversion pass ------------------------------------------------------
 
@@ -168,14 +156,6 @@ inline const PassProperties kInferTileMemorySpaceProperties{
                  IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
 
-// -- Lower transpose-load parameter layout pass (RFC #1300 P6) ----------------
-
-inline const PassProperties kLowerTransposeLoadParamLayoutProperties{
-    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
-                 IRProperty::TileOps2D},
-    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
-                 IRProperty::TileOps2D}};
-
 // -- Materialize tensor strides pass (RFC #1300 §2.4) ------------------------
 
 inline const PassProperties kMaterializeTensorStridesProperties{
@@ -196,6 +176,20 @@ inline const PassProperties kResolveBackendOpLayoutsProperties{
     .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure}};
 
+// -- Auto vector-split lowering pass (RFC #1300; live, always-on) --------------
+//
+// Converts AUTO pl.split mixed InCore functions into the explicit split_aiv form
+// (aiv_shard / aic_gather + halved vector sub-region) BEFORE ExpandMixedKernel.
+// Runs unconditionally in the Default strategy. Same pre/post properties as
+// ExpandMixedKernel's required set: it rewrites the still-mixed InCore body in
+// place without changing the structural property set (and is a no-op for
+// functions with no split mode or already in explicit split_aiv form).
+inline const PassProperties kLowerAutoVectorSplitProperties{
+    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
+
 // -- Mixed kernel expansion pass ----------------------------------------------
 
 inline const PassProperties kExpandMixedKernelProperties{
@@ -213,7 +207,8 @@ inline const PassProperties kInjectGMPipeBufferProperties{
 
 inline const PassProperties kSplitVectorKernelProperties{
     .required = {IRProperty::SSAForm, IRProperty::MixedKernelExpanded},
-    .produced = {IRProperty::SSAForm, IRProperty::VectorKernelSplit, IRProperty::NormalizedStmtStructure}};
+    .produced = {IRProperty::SSAForm, IRProperty::VectorKernelSplit, IRProperty::AivSplitValid,
+                 IRProperty::NormalizedStmtStructure}};
 
 // -- Memory / codegen passes --------------------------------------------------
 

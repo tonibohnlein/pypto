@@ -628,8 +628,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
 
     // The consumer-driven load is always natural; a transposed (b_trans/a_trans)
     // operand gets a zero-copy tile.transpose_view at the matmul site instead.
-    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space},
-                                                                 {"transpose", false}};
+    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space}};
     auto load_call = op_registry_.Create("tile.load", {input, offset_arg, shape_arg, valid_shapes},
                                          load_kwargs, call->span_);
 
@@ -660,13 +659,13 @@ class TensorToTileMutator : public TypePropagatingMutator {
     // batch; the tile-level (batch_)matmul carries no transpose semantic.
 
     // Emit a `tile.load` of `arg` (TensorType) into `space`, append its AssignStmt,
-    // and return the bound load Var.
+    // and return the bound load Var. The load is always natural; a transposed
+    // operand is realised by a zero-copy tile.transpose_view on the result.
     auto emit_load = [&](const ExprPtr& arg, const TensorTypePtr& tensor_type, MemorySpace space,
-                         bool transpose, size_t idx) -> VarPtr {
+                         size_t idx) -> VarPtr {
       auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), call->span_);
       auto shapes = MakeShapeTuple(tensor_type->shape_, call->span_);
-      std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", space},
-                                                               {"transpose", transpose}};
+      std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", space}};
       auto load = op_registry_.Create("tile.load", {arg, offsets, shapes, shapes}, load_kw, call->span_);
       std::string var_name;
       if (auto var = As<Var>(arg)) {
@@ -719,7 +718,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
       if (tensor_type) {
         // GM operand: load NATURAL (2D and ND alike), then reinterpret as its
         // transpose with a zero-copy view when b_trans/a_trans.
-        auto loaded = emit_load(args[idx], tensor_type, req.space, /*transpose=*/false, idx);
+        auto loaded = emit_load(args[idx], tensor_type, req.space, idx);
         args[idx] = use_view ? emit_view(loaded) : loaded;
         continue;
       }
@@ -1113,6 +1112,19 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     return;
   }
 
+  if (IsOp(call, "system.syncall") && call->args_.size() == 3) {
+    // Soft form: each core writes its arrival counter into gm_workspace
+    // (args_[0]) and polls the others, so the workspace is read AND written.
+    // The scratch tile and used_cores (args_[1:]) are reads. Marking the write
+    // lets dependency analysis order barriers that reuse one workspace.
+    MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_read);
+    MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_write);
+    for (size_t i = 1; i < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    return;
+  }
+
   for (const auto& arg : call->args_) {
     MarkAccess(CollectReferencedOrigins(arg, origin_map), has_read);
   }
@@ -1212,11 +1224,6 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
     }
     if (auto step_call = As<Call>(for_stmt->step_)) {
       AnalyzeCallAccess(step_call, origin_map, has_read, has_write);
-    }
-    if (for_stmt->chunk_config_.has_value()) {
-      if (auto chunk_call = As<Call>(for_stmt->chunk_config_->size)) {
-        AnalyzeCallAccess(chunk_call, origin_map, has_read, has_write);
-      }
     }
 
     auto body_map = origin_map;
@@ -1503,8 +1510,7 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
 
     auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), span);
     auto shapes = MakeShapeTuple(tensor_type->shape_, span);
-    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec},
-                                                                 {"transpose", false}};
+    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
     auto load_call = op_registry.Create("tile.load", {var, offsets, shapes, shapes}, load_kwargs, span);
 
     std::string tile_name = MakeTileValueName(var->name_hint_);

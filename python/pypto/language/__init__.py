@@ -42,12 +42,9 @@ from pypto.jit import JITFunction, jit
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import (
     AtomicType,
-    ChunkConfig,
-    ChunkPolicy,
     ForKind,
     FunctionType,
     Level,
-    LoopOrigin,
     MemorySpace,
     PadValue,
     PipeType,
@@ -68,6 +65,7 @@ from .dsl_api import (
     parallel,
     pipeline,
     range,
+    split_aiv,
     spmd,
     static_assert,
     static_print,
@@ -119,6 +117,8 @@ from .op.tile_ops import (
     MemRefType,
     addc,
     addsc,
+    aic_gather,
+    aiv_shard,
     and_,
     ands,
     cmps,
@@ -221,7 +221,7 @@ from .op.unified_ops import (
     transpose,
     write,
 )
-from .optimizations import auto_chunk, split
+from .optimizations import split
 from .parser.decorator import InlineFunction, function, inline, program
 from .parser.text_parser import loads, loads_program, parse, parse_program
 from .scope import ScopeMode, manual_scope, scope, spmd_submit, submit
@@ -300,9 +300,9 @@ __all__ = [
     "at",
     "cluster",
     "spmd",
+    "split_aiv",
     "optimizations",
     "split",
-    "auto_chunk",
     "adir",
     "array",
     "tile",
@@ -414,6 +414,8 @@ __all__ = [
     "AUTO",
     "tpush_to_aiv",
     "tpush_to_aic",
+    "aiv_shard",
+    "aic_gather",
     "tpop_from_aic",
     "tpop_from_aiv",
     "aic_initialize_pipe",
@@ -448,13 +450,10 @@ __all__ = [
     "get_subblock_idx",
     "mrgsort",
     "sort32",
-    "ChunkConfig",
-    "ChunkPolicy",
     "FunctionType",
     "ForKind",
     "AtomicType",
     "Level",
-    "LoopOrigin",
     "MemRef",
     "Role",
     "SplitMode",

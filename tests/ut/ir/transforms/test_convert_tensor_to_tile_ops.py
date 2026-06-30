@@ -526,6 +526,89 @@ class TestConvertTensorToTileOps:
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_put_chunk_sizes_staging_tile_to_subtile(self):
+        """``chunk_rows`` / ``chunk_cols`` size the VEC staging tile to a sub-tile
+        of the flattened [rows, cols] transfer; pto-isa TPUT auto-chunks the rest,
+        so the staging tile no longer has to hold the whole transfer."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                dst: pld.DistributedTensor[[16, 64], pl.FP16],
+                src: pld.DistributedTensor[[16, 64], pl.FP16],
+                peer: pl.Scalar[pl.INT32],
+            ):
+                pld.tensor.put(
+                    dst, peer=peer, src=src, atomic=pld.AtomicType.None_, chunk_rows=4, chunk_cols=32
+                )
+
+        # Stage is [4, 32] (capped from the full [16, 64]); pld.tile.put carries no
+        # chunk attr — the stage tile shape encodes the chunk.
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                dst: pl.Out[pld.DistributedTensor[[16, 64], pl.FP16]],
+                src: pld.DistributedTensor[[16, 64], pl.FP16],
+                peer: pl.Scalar[pl.INT32],
+            ):
+                tput_stage: pl.Tile[[4, 32], pl.FP16, pl.Mem.Vec] = pl.tile.create(
+                    [4, 32], dtype=pl.FP16, target_memory=pl.Mem.Vec
+                )
+                pld.tile.put(dst, peer, src, tput_stage, atomic=pld.AtomicType.None_)
+                return  # noqa: PLR1711  (DSL return terminator, not a Python no-op)
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_put_pipeline_emits_two_staging_tiles(self):
+        """``pipeline=True`` lowers to *two* tile.create staging tiles (ping/pong)
+        threaded into pld.tile.put so pto-isa TPUT double-buffers the chunked
+        transfer. Both tiles carry the chunked [4, 32] shape."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                dst: pld.DistributedTensor[[16, 64], pl.FP16],
+                src: pld.DistributedTensor[[16, 64], pl.FP16],
+                peer: pl.Scalar[pl.INT32],
+            ):
+                pld.tensor.put(
+                    dst,
+                    peer=peer,
+                    src=src,
+                    atomic=pld.AtomicType.None_,
+                    chunk_rows=4,
+                    chunk_cols=32,
+                    pipeline=True,
+                )
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                dst: pl.Out[pld.DistributedTensor[[16, 64], pl.FP16]],
+                src: pld.DistributedTensor[[16, 64], pl.FP16],
+                peer: pl.Scalar[pl.INT32],
+            ):
+                tput_stage_ping: pl.Tile[[4, 32], pl.FP16, pl.Mem.Vec] = pl.tile.create(
+                    [4, 32], dtype=pl.FP16, target_memory=pl.Mem.Vec
+                )
+                tput_stage_pong: pl.Tile[[4, 32], pl.FP16, pl.Mem.Vec] = pl.tile.create(
+                    [4, 32], dtype=pl.FP16, target_memory=pl.Mem.Vec
+                )
+                pld.tile.put(dst, peer, src, tput_stage_ping, tput_stage_pong, atomic=pld.AtomicType.None_)
+                return  # noqa: PLR1711  (DSL return terminator, not a Python no-op)
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
     def test_get_emits_tile_create_plus_tile_get(self):
         """pld.tensor.get lowers to tile.create(stage) + pld.tile.get(dst, peer, src, stage).
 
@@ -773,9 +856,7 @@ class TestConvertTensorToTileOps:
             )
             rhs_mat = ib.let(
                 "rhs_mat",
-                tile_ops.load(
-                    rhs_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat, transpose=False
-                ),
+                tile_ops.load(rhs_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
             )
             rhs_operand = ib.let("rhs_mat_t", tile_ops.transpose_view(rhs_mat)) if b_trans else rhs_mat
             return ib.let("y_tile", tile_ops.matmul(lhs_mat, rhs_operand))
@@ -832,16 +913,16 @@ class TestConvertTensorToTileOps:
             ) -> pl.Tensor[[16, 128], pl.FP32]:
                 # add operands load naturally to Vec; the add stays in Vec.
                 b0_vec: pl.Tile[[128, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    b0, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Vec, transpose=False
+                    b0, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Vec
                 )
                 b1_vec: pl.Tile[[128, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    b1, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Vec, transpose=False
+                    b1, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Vec
                 )
                 bt_vec: pl.Tile[[128, 64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.add(b0_vec, b1_vec)
                 # a loads natural to Mat; the Vec add result is moved to Mat in its
                 # natural shape, then reinterpreted as its transpose via a zero-copy view.
                 a_mat: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Mat] = pl.load(
-                    a, [0, 0], [16, 64], [16, 64], target_memory=pl.MemorySpace.Mat, transpose=False
+                    a, [0, 0], [16, 64], [16, 64], target_memory=pl.MemorySpace.Mat
                 )
                 bt_mat: pl.Tile[[128, 64], pl.FP32, pl.MemorySpace.Mat] = pl.tile.move(
                     bt_vec, target_memory=pl.MemorySpace.Mat
@@ -912,16 +993,16 @@ class TestConvertTensorToTileOps:
             ) -> pl.Tensor[[16, 64], pl.FP32]:
                 # The sliced kv loads ONCE to Mat (consumer-driven), shared by both matmuls.
                 kv_tile: pl.Tile[[64, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
-                    kv_src, [0, 0], [64, 64], [64, 64], target_memory=pl.MemorySpace.Mat, transpose=False
+                    kv_src, [0, 0], [64, 64], [64, 64], target_memory=pl.MemorySpace.Mat
                 )
                 q_mat: pl.Tile[[16, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
-                    q, [0, 0], [16, 64], [16, 64], target_memory=pl.MemorySpace.Mat, transpose=False
+                    q, [0, 0], [16, 64], [16, 64], target_memory=pl.MemorySpace.Mat
                 )
                 # b_trans=True reinterprets the SAME kv buffer in place (NZ<->ZN).
                 kv_tile_t = pl.tile.transpose_view(kv_tile)
                 qk_tile: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Acc] = pl.tile.matmul(q_mat, kv_tile_t)
                 p_mat: pl.Tile[[16, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
-                    p, [0, 0], [16, 64], [16, 64], target_memory=pl.MemorySpace.Mat, transpose=False
+                    p, [0, 0], [16, 64], [16, 64], target_memory=pl.MemorySpace.Mat
                 )
                 # b_trans=False reads the natural kv tile directly.
                 pv_tile: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Acc] = pl.tile.matmul(p_mat, kv_tile)
@@ -980,19 +1061,11 @@ class TestConvertTensorToTileOps:
                 rhs: pl.Tensor[[128, 64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
             ) -> pl.Tensor[[16, 64], pl.FP32]:
-                lhs_mat = pl.load(
-                    lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
-                rhs_mat = pl.load(
-                    rhs, [0, 0], [128, 64], [128, 64], target_memory=pl.Mem.Mat, transpose=False
-                )
+                lhs_mat = pl.load(lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.load(rhs, [0, 0], [128, 64], [128, 64], target_memory=pl.Mem.Mat)
                 acc__tile = pl.tile.matmul(lhs_mat, rhs_mat)
-                lhs_mat_1 = pl.load(
-                    lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
-                rhs_mat_1 = pl.load(
-                    rhs, [0, 0], [128, 64], [128, 64], target_memory=pl.Mem.Mat, transpose=False
-                )
+                lhs_mat_1 = pl.load(lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat)
+                rhs_mat_1 = pl.load(rhs, [0, 0], [128, 64], [128, 64], target_memory=pl.Mem.Mat)
                 result__tile = pl.tile.matmul_acc(acc__tile, lhs_mat_1, rhs_mat_1)
                 ret0__store = pl.store(result__tile, [0, 0], ret0__out)
                 return ret0__store
@@ -1091,7 +1164,7 @@ class TestConvertTensorToTileOps:
                 return result
 
         # The rank dispatch picks tile.batch_matmul for the whole chain (no plain
-        # tile.matmul). The b_trans operand is a NATURAL load (transpose=False)
+        # tile.matmul). The b_trans operand is a NATURAL load
         # followed by a zero-copy tile.transpose_view, not a transpose-at-load.
         @pl.program
         class Expected:
@@ -1102,12 +1175,8 @@ class TestConvertTensorToTileOps:
                 rhs: pl.Tensor[[1, 64, 128], pl.BF16],
                 ret0__out: pl.Out[pl.Tensor[[1, 16, 64], pl.FP32]],
             ) -> pl.Tensor[[1, 16, 64], pl.FP32]:
-                lhs_mat = pl.load(
-                    lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
-                rhs_mat = pl.load(
-                    rhs, [0, 0, 0], [1, 64, 128], [1, 64, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
+                lhs_mat = pl.load(lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.load(rhs, [0, 0, 0], [1, 64, 128], [1, 64, 128], target_memory=pl.Mem.Mat)
                 rhs_mat_t: pl.Tile[
                     [1, 128, 64],
                     pl.BF16,
@@ -1133,7 +1202,7 @@ class TestConvertTensorToTileOps:
 
     def test_nd_batch_matmul_b_trans_slice_uses_transpose_view(self):
         """A SLICE of a 3D tensor fed to a b_trans matmul (-> tile.batch_matmul) lowers
-        the operand to a NATURAL load (transpose=False) followed by a zero-copy
+        the operand to a NATURAL load followed by a zero-copy
         tile.transpose_view, NOT a transpose-at-load.
 
         Covers the dsv4 proj_a slice case (#1776) under the migrated transpose_view
@@ -1224,12 +1293,8 @@ class TestConvertTensorToTileOps:
                 rhs1: pl.Tensor[[1, 64, 128], pl.BF16],
                 ret0__out: pl.Out[pl.Tensor[[1, 16, 64], pl.FP32]],
             ) -> pl.Tensor[[1, 16, 64], pl.FP32]:
-                lhs_mat = pl.load(
-                    lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
-                rhs0_mat = pl.load(
-                    rhs0, [0, 0, 0], [1, 64, 128], [1, 64, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
+                lhs_mat = pl.load(lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat)
+                rhs0_mat = pl.load(rhs0, [0, 0, 0], [1, 64, 128], [1, 64, 128], target_memory=pl.Mem.Mat)
                 rhs0_mat_t: pl.Tile[
                     [1, 128, 64],
                     pl.BF16,
@@ -1237,12 +1302,8 @@ class TestConvertTensorToTileOps:
                     pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
                 ] = pl.tile.transpose_view(rhs0_mat)
                 acc__tile = pl.tile.batch_matmul(lhs_mat, rhs0_mat_t)
-                lhs_mat_1 = pl.load(
-                    lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
-                rhs1_mat = pl.load(
-                    rhs1, [0, 0, 0], [1, 64, 128], [1, 64, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
+                lhs_mat_1 = pl.load(lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat)
+                rhs1_mat = pl.load(rhs1, [0, 0, 0], [1, 64, 128], [1, 64, 128], target_memory=pl.Mem.Mat)
                 rhs1_mat_t: pl.Tile[
                     [1, 128, 64],
                     pl.BF16,
@@ -1311,11 +1372,9 @@ class TestConvertTensorToTileOps:
                 ret0__out: pl.Out[pl.Tensor[[1, 64], pl.BF16]],
             ) -> pl.Tensor[[1, 64], pl.BF16]:
                 t__tile = pl.tile.create([1, 64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-                assemble_src = pl.load(a, [0, 0], [1, 32], [1, 32], target_memory=pl.Mem.Vec, transpose=False)
+                assemble_src = pl.load(a, [0, 0], [1, 32], [1, 32], target_memory=pl.Mem.Vec)
                 t_1__tile = pl.tile.assemble(t__tile, assemble_src, [0, 0])
-                assemble_src_1 = pl.load(
-                    b, [0, 0], [1, 32], [1, 32], target_memory=pl.Mem.Vec, transpose=False
-                )
+                assemble_src_1 = pl.load(b, [0, 0], [1, 32], [1, 32], target_memory=pl.Mem.Vec)
                 t_2__tile = pl.tile.assemble(t_1__tile, assemble_src_1, [0, 32])
                 out__tile = pl.tile.cast(t_2__tile, target_type=pl.BF16, mode="round")
                 ret0__store = pl.store(out__tile, [0, 0], ret0__out)
@@ -1368,9 +1427,7 @@ class TestConvertTensorToTileOps:
             ) -> pl.Tensor[[1, 64], pl.FP32]:
                 for i, (acc,) in pl.range(2, init_values=(ret0__out,)):
                     off: pl.Scalar[pl.INDEX] = i * 32
-                    chunk__tile = pl.load(
-                        x, [0, 0], [1, 32], [1, 32], target_memory=pl.MemorySpace.Vec, transpose=False
-                    )
+                    chunk__tile = pl.load(x, [0, 0], [1, 32], [1, 32], target_memory=pl.MemorySpace.Vec)
                     acc_next__tile = pl.store(chunk__tile, [0, off], acc)
                     result = pl.yield_(acc_next__tile)
                 return result
@@ -1413,9 +1470,7 @@ class TestConvertTensorToTileOps:
                 buf: pl.Tensor[[1, 64], pl.FP32] = x
                 for i, (acc,) in pl.range(2, init_values=(buf,)):
                     off: pl.Scalar[pl.INDEX] = i * 32
-                    chunk__tile = pl.load(
-                        buf, [0, off], [1, 32], [1, 32], target_memory=pl.Mem.Vec, transpose=False
-                    )
+                    chunk__tile = pl.load(buf, [0, off], [1, 32], [1, 32], target_memory=pl.Mem.Vec)
                     acc_next__tile = pl.store(chunk__tile, [0, off], acc)
                     result = pl.yield_(acc_next__tile)
                 return result
@@ -1427,55 +1482,6 @@ class TestConvertTensorToTileOps:
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
-
-    def test_returned_assemble_loop_treats_chunk_expr_as_iter_arg_use(self):
-        """Chunk expressions must count as loop-carried uses during rewrite checks."""
-
-        span = ir.Span.unknown()
-        idx_type = ir.ScalarType(DataType.INDEX)
-        small_tensor_type = ir.TensorType([1, 32], DataType.FP32)
-        large_tensor_type = ir.TensorType([1, 64], DataType.FP32)
-
-        x = ir.Var("x", small_tensor_type, span)
-        buf_init = ir.Var("buf_init", large_tensor_type, span)
-        loop_var = ir.Var("i", idx_type, span)
-        iter_arg = ir.IterArg("acc", large_tensor_type, buf_init, span)
-        yielded_var = ir.Var("acc_next", large_tensor_type, span)
-        return_var = ir.Var("result", large_tensor_type, span)
-        inner_loop_var = ir.Var("j", idx_type, span)
-
-        inner_loop = ir.ForStmt(
-            inner_loop_var,
-            ir.ConstInt(0, DataType.INDEX, span),
-            ir.ConstInt(1, DataType.INDEX, span),
-            ir.ConstInt(1, DataType.INDEX, span),
-            [],
-            ir.SeqStmts([], span),
-            [],
-            span,
-            chunk_size=iter_arg,
-        )
-        assemble_stmt = ir.AssignStmt(yielded_var, ir.op.tensor.assemble(iter_arg, x, [0, 0]), span)
-        outer_loop = ir.ForStmt(
-            loop_var,
-            ir.ConstInt(0, DataType.INDEX, span),
-            ir.ConstInt(2, DataType.INDEX, span),
-            ir.ConstInt(1, DataType.INDEX, span),
-            [iter_arg],
-            ir.SeqStmts([inner_loop, assemble_stmt, ir.YieldStmt([yielded_var], span)], span),
-            [return_var],
-            span,
-        )
-        func = ir.Function(
-            "main_incore_0",
-            [x, buf_init],
-            [large_tensor_type],
-            ir.SeqStmts([outer_loop, ir.ReturnStmt([return_var], span)], span),
-            span,
-            ir.FunctionType.InCore,
-        )
-        with pytest.raises(ValueError, match="tensor\\.assemble"):
-            passes.convert_tensor_to_tile_ops()(ir.Program([func], "ChunkUseProg", span))
 
     def test_no_spurious_loads_for_explicit_tile_ops(self):
         """Regression test for #334: no redundant Vec loads when params are consumed by tile ops only.
@@ -1498,9 +1504,10 @@ class TestConvertTensorToTileOps:
                 qi_l1_0: pl.Tile[[16, 128], pl.BF16] = pl.load(
                     qi_0, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
                 )
-                kj_l1_0: pl.Tile[[128, 128], pl.BF16] = pl.load(
-                    kj_t_0, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat, transpose=True
+                kj_nat_0: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    kj_t_0, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
                 )
+                kj_l1_0: pl.Tile[[128, 128], pl.BF16] = pl.tile.transpose_view(kj_nat_0)
                 qi_l0a_0: pl.Tile[[16, 128], pl.BF16] = pl.move(qi_l1_0, target_memory=pl.MemorySpace.Left)
                 kj_l0b_0: pl.Tile[[128, 128], pl.BF16] = pl.move(kj_l1_0, target_memory=pl.MemorySpace.Right)
                 sij_l0c_0: pl.Tile[[16, 128], pl.FP32] = pl.matmul(qi_l0a_0, kj_l0b_0)
@@ -2321,8 +2328,9 @@ class TestSliceMatmulConversion:
     """Test tensor.slice + tensor.matmul conversion patterns.
 
     When a tensor.slice result feeds into tensor.matmul, the slice should produce
-    tile.load(Mat, transpose=...) instead of tile.load(Vec), and the matmul should
-    skip its own load for that operand (using the tile directly for move + matmul).
+    a Mat tile.load (a natural load, plus a zero-copy tile.transpose_view when the
+    operand is transposed) instead of tile.load(Vec), and the matmul should skip
+    its own load for that operand (using the tile directly for move + matmul).
     """
 
     @pytest.mark.parametrize(
@@ -2334,7 +2342,7 @@ class TestSliceMatmulConversion:
         ],
     )
     def test_slice_then_matmul(self, name, lhs_shape, rhs_shape, out_shape, slice_side, trans_kw):
-        """slice + matmul -> tile.load(Mat, transpose=...) for sliced operand + load + matmul.
+        """slice + matmul -> Mat tile.load (+ tile.transpose_view if transposed) for sliced operand.
 
         ``slice_side`` selects which operand of matmul is sliced; ``trans_kw`` selects
         which transpose flag (a_trans/b_trans) is set on the matmul (or ``None`` for none).
@@ -2366,9 +2374,7 @@ class TestSliceMatmulConversion:
             if slice_side == "lhs":
                 sliced_tile = ib.let(
                     "a_slice_tile",
-                    tile_ops.load(
-                        a_p, [0, 0], lhs_shape, lhs_shape, target_memory=MemorySpace.Mat, transpose=False
-                    ),
+                    tile_ops.load(a_p, [0, 0], lhs_shape, lhs_shape, target_memory=MemorySpace.Mat),
                 )
                 lhs_operand = (
                     ib.let("a_slice_tile_t", tile_ops.transpose_view(sliced_tile))
@@ -2377,22 +2383,16 @@ class TestSliceMatmulConversion:
                 )
                 other_tile = ib.let(
                     "rhs_mat",
-                    tile_ops.load(
-                        b_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat, transpose=False
-                    ),
+                    tile_ops.load(b_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
                 )
                 return ib.let("result_tile", tile_ops.matmul(lhs_operand, other_tile))
             sliced_tile = ib.let(
                 "b_slice_tile",
-                tile_ops.load(
-                    b_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat, transpose=False
-                ),
+                tile_ops.load(b_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
             )
             other_tile = ib.let(
                 "lhs_mat",
-                tile_ops.load(
-                    a_p, [0, 0], lhs_shape, lhs_shape, target_memory=MemorySpace.Mat, transpose=False
-                ),
+                tile_ops.load(a_p, [0, 0], lhs_shape, lhs_shape, target_memory=MemorySpace.Mat),
             )
             rhs_operand = (
                 ib.let("b_slice_tile_t", tile_ops.transpose_view(sliced_tile)) if slice_trans else sliced_tile
@@ -2457,12 +2457,8 @@ class TestSliceMatmulConversion:
                 b: pl.Tensor[[128, 128], pl.BF16],
                 out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
             ) -> pl.Tensor[[16, 128], pl.BF16]:
-                a_slice__tile = pl.tile.load(
-                    a, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
-                b_slice__tile = pl.tile.load(
-                    b, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
+                a_slice__tile = pl.tile.load(a, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat)
+                b_slice__tile = pl.tile.load(b, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat)
                 a_alias: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = a_slice__tile
                 b_alias: pl.Tile[[128, 128], pl.BF16, pl.Mem.Mat] = b_slice__tile
                 c__tile = pl.tile.matmul(a_alias, b_alias)
@@ -2523,14 +2519,10 @@ class TestSliceMatmulConversion:
                 b: pl.Tensor[[128, 64], pl.BF16],
                 out_0: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
             ) -> pl.Tensor[[16, 64], pl.BF16]:
-                a_slice__tile = pl.tile.load(
-                    a, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat, transpose=False
-                )
+                a_slice__tile = pl.tile.load(a, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat)
                 a_alias1: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = a_slice__tile
                 a_alias2: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = a_alias1
-                b__tile = pl.tile.load(
-                    b, [0, 0], [128, 64], [128, 64], target_memory=pl.Mem.Mat, transpose=False
-                )
+                b__tile = pl.tile.load(b, [0, 0], [128, 64], [128, 64], target_memory=pl.Mem.Mat)
                 c__tile = pl.tile.matmul(a_alias2, b__tile)
                 out_0__tile = pl.tile.store(c__tile, [0, 0], out_0)
                 return out_0__tile
@@ -2668,7 +2660,7 @@ class TestTensorFullConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec, transpose=False)
+                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
                 t__tile = pl.tile.full([64], dtype=pl.FP32, value=0.0)
                 y__tile = pl.tile.add(t__tile, x__tile)
                 ret0__store = pl.store(y__tile, [0], ret0__out)
@@ -2710,7 +2702,7 @@ class TestTensorCiConversion:
                 x: pl.Tensor[[1, 32], pl.INT32],
                 ret0__out: pl.Out[pl.Tensor[[1, 32], pl.INT32]],
             ) -> pl.Tensor[[1, 32], pl.INT32]:
-                x__tile = pl.load(x, [0, 0], [1, 32], [1, 32], target_memory=pl.Mem.Vec, transpose=False)
+                x__tile = pl.load(x, [0, 0], [1, 32], [1, 32], target_memory=pl.Mem.Vec)
                 idx__tile = pl.tile.ci(pl.const(0, pl.INT32), [1, 32], dtype=pl.INT32, descending=True)
                 y__tile = pl.tile.add(idx__tile, x__tile)
                 ret0__store = pl.store(y__tile, [0, 0], ret0__out)
@@ -2776,9 +2768,7 @@ class TestAssembleParentStride:
                 nb: pl.Scalar[pl.INDEX],
                 ret0__out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
             ) -> pl.Tensor[[32, 32], pl.FP32]:
-                tile__tile = pl.load(
-                    a, [mb, nb], [32, 32], [32, 32], target_memory=pl.Mem.Vec, transpose=False
-                )
+                tile__tile = pl.load(a, [mb, nb], [32, 32], [32, 32], target_memory=pl.Mem.Vec)
                 ret0__store = pl.store(tile__tile, [0, 0], ret0__out)
                 return ret0__store
 
@@ -2930,12 +2920,8 @@ class TestConvertGatherOp:
             ) -> pl.Tensor[[4, 3], pl.FP32]:
                 gather_acc_init = pl.tile.create([4, 3], dtype=pl.FP32, target_memory=pl.Mem.Vec)
                 for gather_lv, (gather_ia,) in pl.range(4, init_values=(gather_acc_init,)):
-                    gather_inp_row = pl.load(
-                        inp, [gather_lv, 0], [1, 16], [1, 16], target_memory=pl.Mem.Vec, transpose=False
-                    )
-                    gather_idx_row = pl.load(
-                        idx, [gather_lv, 0], [1, 3], [1, 3], target_memory=pl.Mem.Vec, transpose=False
-                    )
+                    gather_inp_row = pl.load(inp, [gather_lv, 0], [1, 16], [1, 16], target_memory=pl.Mem.Vec)
+                    gather_idx_row = pl.load(idx, [gather_lv, 0], [1, 3], [1, 3], target_memory=pl.Mem.Vec)
                     gather_row_tmp = pl.tile.create([1, 3], dtype=pl.INT32, target_memory=pl.Mem.Vec)
                     gather_row = pl.tile.gather(gather_inp_row, gather_idx_row, gather_row_tmp)
                     gather_asmbl = pl.tile.assemble(gather_ia, gather_row, [gather_lv, 0])
@@ -2999,16 +2985,12 @@ class TestConvertGatherOp:
                 ret0__out: pl.Out[pl.Tensor[[4, 3], pl.FP32]],
             ) -> pl.Tensor[[4, 3], pl.FP32]:
                 tmp__tile = pl.tile.create([4, 16], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-                assemble_src = pl.load(
-                    src, [0, 0], [4, 16], [4, 16], target_memory=pl.Mem.Vec, transpose=False
-                )
+                assemble_src = pl.load(src, [0, 0], [4, 16], [4, 16], target_memory=pl.Mem.Vec)
                 tmp_1__tile = pl.tile.assemble(tmp__tile, assemble_src, [0, 0])
                 gather_acc_init = pl.tile.create([4, 3], dtype=pl.FP32, target_memory=pl.Mem.Vec)
                 for gather_lv, (gather_ia,) in pl.range(4, init_values=(gather_acc_init,)):
                     gather_inp_row = pl.tile.slice(tmp_1__tile, [1, 16], [gather_lv, 0], [1, 16])
-                    gather_idx_row = pl.load(
-                        idx, [gather_lv, 0], [1, 3], [1, 3], target_memory=pl.Mem.Vec, transpose=False
-                    )
+                    gather_idx_row = pl.load(idx, [gather_lv, 0], [1, 3], [1, 3], target_memory=pl.Mem.Vec)
                     gather_row_tmp = pl.tile.create([1, 3], dtype=pl.INT32, target_memory=pl.Mem.Vec)
                     gather_row = pl.tile.gather(gather_inp_row, gather_idx_row, gather_row_tmp)
                     gather_asmbl = pl.tile.assemble(gather_ia, gather_row, [gather_lv, 0])
@@ -3381,7 +3363,7 @@ class TestSubmitCallSiteUpdate:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec, transpose=False)
+                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
                 y__tile = pl.tile.add(x__tile, x__tile)
                 ret0__store = pl.store(y__tile, [0], ret0__out)
                 return ret0__store
@@ -3422,7 +3404,7 @@ class TestSpmdBlockIdentityConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec, transpose=False)
+                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
                 idx = pl.tile.get_block_idx()
                 y__tile = pl.tile.adds(x__tile, idx)
                 ret0__store = pl.store(y__tile, [0], ret0__out)
@@ -3459,7 +3441,7 @@ class TestSpmdBlockIdentityConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec, transpose=False)
+                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
                 idx = pl.tile.get_subblock_idx()
                 y__tile = pl.tile.adds(x__tile, idx)
                 ret0__store = pl.store(y__tile, [0], ret0__out)
@@ -3496,7 +3478,7 @@ class TestSpmdBlockIdentityConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec, transpose=False)
+                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
                 n = pl.tile.get_block_num()
                 y__tile = pl.tile.adds(x__tile, n)
                 ret0__store = pl.store(y__tile, [0], ret0__out)
@@ -3538,7 +3520,7 @@ class TestSpmdBlockIdentityConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec, transpose=False)
+                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
                 i = pl.tile.get_block_idx()
                 s = pl.tile.get_subblock_idx()
                 n = pl.tile.get_block_num()

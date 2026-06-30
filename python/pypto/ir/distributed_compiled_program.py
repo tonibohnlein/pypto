@@ -145,11 +145,6 @@ class DistributedCompiledProgram:
         self._output_indices = _output_indices
         self._return_types = _return_types
 
-        # RunTiming from the most recent __call__ (host_wall_us; device_wall_us
-        # is 0 for the L3 DAG), or None before the first on-device run. Surfaced
-        # as a side channel so the call return value stays outputs/None.
-        self.last_run_timing: Any = None
-
         # Only the fresh-compile path (live IR) writes artifacts. The reload
         # path must not clobber a user's hand-edited debug/run.py or the
         # already-present metadata file.
@@ -353,9 +348,11 @@ class DistributedCompiledProgram:
         ``ring_dep_pool``) size this dispatch's runtime ring buffers, and its
         runtime-diagnostic DFX flags (``enable_dump_tensor`` / ``enable_pmu`` /
         ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``) are
-        written per rank under ``<output_dir>/dfx_outputs/rank{r}/`` (swimlane
-        co-enables dep_gen and emits ``merged_swimlane_*.json`` per rank, onboard
-        only). Other compile-side fields are not consumed on the dispatch path.
+        written per dispatch under ``<output_dir>/dfx_outputs/rank{r}/d{k}/``
+        (``d{k}`` is the card's k-th dispatch, so multiple dispatches to one card
+        keep separate artifacts; swimlane co-enables dep_gen and emits
+        ``merged_swimlane_*.json`` per dispatch, onboard only). Other compile-side
+        fields are not consumed on the dispatch path.
         """
         from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
 
@@ -395,7 +392,7 @@ class DistributedCompiledProgram:
                 )
             coerced.append(arg)
 
-        self.last_run_timing = execute_distributed(self, coerced, config)
+        execute_distributed(self, coerced, config)
 
         if not return_style:
             return None

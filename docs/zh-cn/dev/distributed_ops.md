@@ -137,8 +137,10 @@ DSL（`python/pypto/language/distributed/op/tile_ops.py`）把 `target` / `peer`
 ### `pld.tensor.put`（TPUT）
 
 ```text
-pld.tensor.put(dst, peer, src, *, atomic: int) -> Unknown
-pld.tensor.put(dst, peer, src, dst_offsets, src_offsets, shape, *, atomic: int) -> Unknown
+pld.tensor.put(dst, peer, src, *, atomic: int,
+               chunk_rows: int = 0, chunk_cols: int = 0, pipeline: bool = False) -> Unknown
+pld.tensor.put(dst, peer, src, dst_offsets, src_offsets, shape,
+               *, atomic: int, chunk_rows: int = 0, chunk_cols: int = 0, pipeline: bool = False) -> Unknown
 ```
 
 同步地把本地 `src` 数据写入 `peer` rank 的窗口绑定 `dst` 切片。`dst` 是 GM
@@ -152,18 +154,49 @@ PyPTO 的内存分配器,但不出现在 DSL 表面。
 切片。提供 `dst_offsets`、`src_offsets` 和 `shape` 时,传输会缩小到匹配的
 subregion；三者必须一起提供。
 
+**staging tile 分块。** 默认 staging tile 覆盖整个展平后的传输 `[rows, cols]`
+范围（`rows` = 前导维之积,`cols` = 最内维），因此一次传输必须放得进 UB。可选的
+`chunk_rows` / `chunk_cols`（`0` = 全量）把 staging tile 缩成该范围的子块；codegen
+仍让 `pto.comm.tput` 的 partition view 保持**完整**传输范围,由 pto-isa TPUT 在
+更小的 stage 上做 2D 滑窗。这样单个 `put` 即可搬运大于 UB 的数据,无需调用方手写
+分块循环。超出范围的 chunk 值会被钳到传输范围内。
+
+**双缓冲（`pipeline`）。** 设置 `pipeline=True` 时,
+`ConvertTensorToTileOps` 会物化**两个**完全相同的 VEC staging tile
+（`tput_stage_ping` / `tput_stage_pong`）并作为第二个 `stage` 操作数一起传给
+`pld.tile.put`。codegen 随后发出 ping-pong 形式
+`pto.comm.tput(dst_pv, src_pv, buf(%ping, %pong) : …)`,PTOAS 将其路由到 pto-isa
+的双缓冲 `TPUT` 重载 —— 它跨两个 tile 把下一个 chunk 的 TLOAD 与上一个 chunk 的
+TSTORE 重叠流水。由于只有传输被切成多个 chunk 时双缓冲才有收益,`pipeline`
+**要求同时设置 `chunk_rows` 与 `chunk_cols`**（deducer 与 DSL 都会拒绝缺少完整
+chunk 的 `pipeline`）。两个 tile 是各自独立的 `tile.create` 分配,内存分配器会给
+它们不重叠的 UB 地址（满足 pto-isa 对 ping/pong 的要求）。
+
+**动态传输范围。** 传输范围可以是**动态**的 —— 既可以是 subregion 的 `shape`
+（窗口内一段运行时子范围）,也可以是 full-slice 时 `dst` / `src` 窗口
+（`DistributedTensorType`）本身的维度。pto-isa 在运行时从 partition view 读取
+范围,因此 codegen 发出动态 partition view（`<?x…>`）并对其分块。动态的展平维
+必须由对应的静态 chunk 约束,因为 VEC staging tile 是静态分配的:动态最内维需要
+`chunk_cols`,动态前导维需要 `chunk_rows`。full-slice 时 `dst` 与 `src` 的维度
+必须一致 —— 静态维按值比较,动态维按结构（structural）比较。
+
 Verifier：`dst` 必须是 `DistributedTensorType`；`src` 必须是 `TensorType` 或
 `DistributedTensorType`（通过 `AsTensorTypeLike` 匹配）；`peer` 必须是
 `ScalarType`；`dst` 与 `src` 必须 element type 相同、rank 相同,且各维都是
-**正的静态（positive static）**维度。full-slice `put` 要求形状完全相同；
-subregion `put` 允许完整切片尺寸不同,只要显式传输区域不越界。`atomic` 选择覆盖
-还是原子加（见 `AtomicType`）。
+**正（positive）**维度（正性仅对静态维校验；动态维允许,由 chunk 约束）。
+full-slice `put` 要求 `dst` / `src` 形状一致；subregion `put` 允许完整切片尺寸
+不同,只要显式传输区域不越界（仅校验静态维）；任何动态传输维都需配套静态 chunk
+（见上）。`atomic` 选择覆盖还是原子加（见 `AtomicType`）。下降出的
+`pld.tile.put` verifier 要求 staging tile 在两个
+**静态**维度上都**不超过**展平后的传输范围（可以更小 —— 即一个 chunk —— 但不能
+更大；动态维由 chunk 在运行时约束）。
 
 ### `pld.tensor.get`（TGET）
 
 ```text
-pld.tensor.get(dst, peer, src) -> Unknown
-pld.tensor.get(dst, peer, src, dst_offsets, src_offsets, shape) -> Unknown
+pld.tensor.get(dst, peer, src, *, chunk_rows: int = 0, chunk_cols: int = 0, pipeline: bool = False) -> Unknown
+pld.tensor.get(dst, peer, src, dst_offsets, src_offsets, shape,
+               *, chunk_rows: int = 0, chunk_cols: int = 0, pipeline: bool = False) -> Unknown
 ```
 
 同步地把 `peer` rank 的窗口绑定 `src` 切片读入本地 `dst`。`dst` 可以是窗口绑
@@ -174,14 +207,22 @@ pld.tensor.get(dst, peer, src, dst_offsets, src_offsets, shape) -> Unknown
 
 不提供 offsets/shape 时,该操作把完整的 peer `src` 切片读入完整的本地 `dst`
 切片。提供 `dst_offsets`、`src_offsets` 和 `shape` 时,传输会缩小到匹配的
-subregion；三者必须一起提供。
+subregion；三者必须一起提供。可选的 `chunk_rows` / `chunk_cols`（`0` = 全量）把
+staging tile 缩成展平后传输范围的子块,由 pto-isa TGET 自动分块搬运 —— 与上面
+`put` 的契约一致,**包括动态传输**（subregion 的 `shape`,或 full-slice 时
+`dst` / `src` 窗口维度）,需配套静态 chunk（动态最内维需 `chunk_cols`,动态前导维
+需 `chunk_rows`）。设置 `pipeline=True` 时,会通过两个 staging
+tile（`tget_stage_ping` / `tget_stage_pong`）对分块读做双缓冲,发出
+`pto.comm.tget(…, buf(%ping, %pong) : …)` 以使用 pto-isa 的 ping-pong `TGET`
+重载 —— 契约与 `put` 一致,同样**要求同时设置 `chunk_rows` 与 `chunk_cols`**。
 
 Verifier：`dst` 可以是 `DistributedTensorType` 或普通 `TensorType`（通过
 `AsTensorTypeLike` 匹配）；`src` 必须是 `DistributedTensorType`；`peer` 必须是
 `ScalarType`；`dst` 与 `src` 必须 element type 相同、rank 相同,且各维都是
-**正的静态（positive static）**维度。full-slice `get` 要求形状完全相同；
-subregion `get` 允许完整切片尺寸不同,只要显式传输区域不越界。`get` 不接受
-keyword attributes。
+**正（positive）**维度（正性仅对静态维校验；动态维允许,由 chunk 约束）。
+full-slice `get` 要求 `dst` / `src` 形状一致；subregion `get` 允许完整切片尺寸
+不同,只要显式传输区域不越界（仅校验静态维）；任何动态传输维都需配套静态 chunk。
+除 `chunk_rows` / `chunk_cols` 外,`get` 不接受 keyword attributes。
 
 ### `pld.tensor.allreduce`
 
@@ -243,10 +284,10 @@ Verifier：`signal` 必须是 `DistributedTensorType`；`expected` 必须是
 ## 流水线集成
 
 通信域与其槽位分配由
-[`MaterializeCommDomainScopes`](passes/38-materialize_comm_domain_scopes.md) pass 完成。该 pass 将每个
+[`MaterializeCommDomainScopes`](passes/36-materialize_comm_domain_scopes.md) pass 完成。该 pass 将每个
 host_orch 函数体包裹进嵌套的 `CommDomainScopeStmt` 节点（按推断出的通信域逐层嵌套），并产生运行时据以
 绑定物理缓冲的按窗口 `WindowBuffer` 记录。
-随后 [`LowerHostTensorCollectives`](passes/39-lower_host_tensor_collectives.md) 会在最终
+随后 [`LowerHostTensorCollectives`](passes/37-lower_host_tensor_collectives.md) 会在最终
 `Simplify` 之前把 host-level tensor collectives 降为内部 builtin chip dispatch。
 
 ## 测试

@@ -181,6 +181,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/outline_cluster_scopes_pass.cpp
     src/ir/transforms/outline_hierarchy_scopes_pass.cpp
     src/ir/transforms/expand_mixed_kernel_pass.cpp
+    src/ir/transforms/lower_auto_vector_split_pass.cpp
     src/ir/transforms/split_vector_kernel_pass.cpp
     src/ir/transforms/auto_tile_matmul_l0_pass.cpp
     src/ir/transforms/auto_fuse_pass.cpp
@@ -188,12 +189,9 @@ set(PYPTO_SOURCES
     src/ir/transforms/pass_context.cpp
     src/ir/transforms/passes.cpp
     src/ir/transforms/resolve_backend_op_layouts_pass.cpp
-    src/ir/transforms/lower_transpose_load_param_layout_pass.cpp
     src/ir/transforms/python_printer.cpp
     src/ir/transforms/simplify_pass.cpp
     src/ir/transforms/inject_gm_pipe_buffer_pass.cpp
-    src/ir/transforms/split_chunked_loops_pass.cpp
-    src/ir/transforms/interchange_chunk_loops_pass.cpp
     src/ir/transforms/unroll_loops_pass.cpp
     src/ir/transforms/skew_cross_core_pipeline_pass.cpp
     src/ir/transforms/lower_pipeline_loops_pass.cpp
@@ -212,6 +210,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/op_predicates.cpp
     src/ir/transforms/utils/parent_stmt_analysis.cpp
     src/ir/transforms/utils/return_lineage_utils.cpp
+    src/ir/transforms/utils/split_axis_utils.cpp
     src/ir/transforms/utils/stmt_dependency_analysis.cpp
     src/ir/transforms/utils/transform_utils.cpp
     src/ir/transforms/utils/wrapper_call_utils.cpp
@@ -227,8 +226,10 @@ set(PYPTO_SOURCES
     src/ir/verifier/verifier.cpp
     src/ir/verifier/property_verifier_registry.cpp
     src/ir/verifier/mixed_kernel_expanded_verifier.cpp
+    src/ir/verifier/verify_aiv_split.cpp
     src/ir/verifier/verify_ssa_pass.cpp
     src/ir/verifier/verify_no_nested_call_pass.cpp
+    src/ir/verifier/verify_no_nested_incore.cpp
     src/ir/verifier/verify_break_continue_pass.cpp
     src/ir/verifier/verify_inline_functions_eliminated.cpp
     src/ir/verifier/verify_use_after_def.cpp

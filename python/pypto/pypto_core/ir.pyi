@@ -976,57 +976,6 @@ class ForKind(enum.Enum):
     persists as a marker through ``CanonicalizeIOOrder`` (which demotes it to
     ``Sequential`` on exit) and must not survive past that pass."""
 
-class ChunkPolicy(enum.Enum):
-    """Chunk policy for loop chunking.
-
-    Controls how iterations are distributed across chunks.
-    """
-
-    LeadingFull = ...
-    """Full chunks first, smaller remainder at end (splits into main + remainder kernels)."""
-
-    Guarded = ...
-    """Single loop over ceil(N/C) chunks with per-iteration if-guard (default)."""
-
-class ChunkConfig:
-    """Chunk configuration for parallel loop splitting."""
-
-    size: Final[Expr]
-    """Chunk size expression."""
-
-    policy: Final[ChunkPolicy]
-    """Chunk distribution policy."""
-
-    def __init__(self, size: Expr, policy: ChunkPolicy = ChunkPolicy.Guarded) -> None:
-        """Create a chunk configuration.
-
-        Args:
-            size: Chunk size expression
-            policy: Chunk distribution policy (default: Guarded)
-        """
-
-class LoopOrigin(enum.Enum):
-    """Loop origin classification.
-
-    Tracks how a loop was generated:
-    - Original: Regular loop (default)
-    - ChunkOuter: Outer loop from chunk splitting
-    - ChunkInner: Inner loop from chunk splitting
-    - ChunkRemainder: Remainder loop from chunk splitting
-    """
-
-    Original = ...
-    """Regular loop (default)."""
-
-    ChunkOuter = ...
-    """Outer loop from chunk splitting."""
-
-    ChunkInner = ...
-    """Inner loop from chunk splitting."""
-
-    ChunkRemainder = ...
-    """Remainder loop from chunk splitting."""
-
 class MemorySpace(enum.Enum):
     """Memory space enumeration."""
 
@@ -2094,15 +2043,6 @@ class ForStmt(Stmt):
     kind: Final[ForKind]
     """Loop kind (Sequential, Parallel, or Unroll)."""
 
-    chunk_config: Final[ChunkConfig | None]
-    """Chunk configuration (None = no chunking)."""
-
-    chunk_size: Final[Expr | None]
-    """Chunk size expression (None if no chunking). Convenience for chunk_config.size."""
-
-    chunk_policy: Final[ChunkPolicy]
-    """Chunk distribution policy. Convenience for chunk_config.policy."""
-
     attrs: Final[dict[str, object]]
     """Loop-level attributes (key-value metadata)."""
 
@@ -2117,8 +2057,6 @@ class ForStmt(Stmt):
         return_vars: list[Var],
         span: Span,
         kind: ForKind = ForKind.Sequential,
-        chunk_size: Expr | None = None,
-        chunk_policy: ChunkPolicy = ChunkPolicy.Guarded,
         attrs: dict[str, object] | list[tuple[str, object]] | None = None,
     ) -> None:
         """Create a for loop statement.
@@ -2133,8 +2071,6 @@ class ForStmt(Stmt):
             return_vars: Return variables (can be empty)
             span: Source location
             kind: Loop kind (default: Sequential)
-            chunk_size: Optional chunk size for loop chunking
-            chunk_policy: Chunk distribution policy (default: Guarded)
             attrs: Loop-level attributes (default: empty)
         """
 
@@ -2176,9 +2112,6 @@ class ScopeKind(enum.Enum):
 
     InCore = 0
     """InCore scope for AICore sub-graphs."""
-
-    AutoInCore = 1
-    """AutoInCore scope for automatic chunking."""
 
     Cluster = 2
     """Cluster scope for co-scheduled AIC + AIV groups."""
@@ -2289,7 +2222,7 @@ class ScopeStmt(Stmt):
     (a ``list[Var]`` of TaskId producers populated by ``pl.at(..., deps=[...])``)."""
 
     def __init__(self, *args: object, **kwargs: object) -> None:
-        """ScopeStmt is abstract — construct an InCoreScopeStmt, AutoInCoreScopeStmt,
+        """ScopeStmt is abstract — construct an InCoreScopeStmt,
         ClusterScopeStmt, HierarchyScopeStmt, or SpmdScopeStmt instead."""
 
 class InCoreScopeStmt(ScopeStmt):
@@ -2307,22 +2240,6 @@ class InCoreScopeStmt(ScopeStmt):
         span: Span,
     ) -> None:
         """Create an InCore scope statement."""
-
-class AutoInCoreScopeStmt(ScopeStmt):
-    """AutoInCore scope: InCore region with automatic chunking."""
-
-    split: Final[SplitMode | None]
-    """Split mode for cross-core transfer (None or SplitMode.None for no split)."""
-
-    def __init__(
-        self,
-        split: SplitMode | None = None,
-        name_hint: str = "",
-        *,
-        body: Stmt,
-        span: Span,
-    ) -> None:
-        """Create an AutoInCore scope statement."""
 
 class ClusterScopeStmt(ScopeStmt):
     """Cluster scope: co-scheduled AIC + AIV group."""
@@ -3164,8 +3081,6 @@ class IRBuilder:
         step: Expr,
         span: Span,
         kind: ForKind = ForKind.Sequential,
-        chunk_size: Expr | None = None,
-        chunk_policy: ChunkPolicy = ChunkPolicy.Guarded,
         attrs: dict[str, object] | list[tuple[str, object]] | None = None,
     ) -> None:
         """Begin building a for loop.
@@ -3177,8 +3092,6 @@ class IRBuilder:
             step: Step value expression
             span: Source location for loop definition
             kind: Loop kind (default: Sequential)
-            chunk_size: Optional chunk size for loop chunking
-            chunk_policy: Chunk distribution policy (default: Guarded)
             attrs: Loop-level attributes (default: empty)
         """
 
@@ -3316,6 +3229,21 @@ class IRBuilder:
             sync_start: Require sync-start for SPMD dispatch (default: None)
             manual: Required for ``ScopeKind.Runtime`` — selects manual vs.
                 auto dependency tracking. Must be None for other scope kinds.
+        """
+
+    def mark_current_scope_split_aiv(self, split: SplitMode) -> None:
+        """Stamp the explicit AIV-split marker onto the currently-open scope.
+
+        Sets the enclosing open InCore scope's split mode to ``split`` and
+        appends a ``("split_aiv", True)`` attr. Used by the parser to flatten a
+        ``for aiv_id in pl.split_aiv(...)`` loop nested inside a CORE_GROUP
+        InCore scope (the body is emitted inline, with no nested sub-scope).
+
+        Args:
+            split: Split mode declared by ``pl.split_aiv(..., mode=...)``
+
+        Raises:
+            ValueError: If the current context is not an open InCore scope.
         """
 
     def end_scope(self, end_span: Span) -> ScopeStmt:
@@ -3848,7 +3776,6 @@ class IRVisitor:
     def visit_for_stmt(self, op: ForStmt) -> None: ...
     def visit_while_stmt(self, op: WhileStmt) -> None: ...
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> None: ...
-    def visit_auto_in_core_scope_stmt(self, op: AutoInCoreScopeStmt) -> None: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> None: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> None: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> None: ...
@@ -3930,7 +3857,6 @@ class IRMutator:
     def visit_for_stmt(self, op: ForStmt) -> Stmt: ...
     def visit_while_stmt(self, op: WhileStmt) -> Stmt: ...
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> Stmt: ...
-    def visit_auto_in_core_scope_stmt(self, op: AutoInCoreScopeStmt) -> Stmt: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> Stmt: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> Stmt: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> Stmt: ...

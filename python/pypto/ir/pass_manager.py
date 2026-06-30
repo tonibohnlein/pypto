@@ -134,12 +134,11 @@ class PassManager:
         tensor_only_passes: list[PassSpec] = [
             # Automatic fusion + tiling. Runs on the clean post-normalize tensor
             # graph, BEFORE the partition passes below. For functions marked
-            # attrs={"auto_fuse": True} it extracts the op+tensor DAG, runs the
-            # MLSys solver, and (next increment) emits AutoInCoreScopeStmt groups
-            # for Split/Interchange/Outline to lower. No-op for unmarked functions.
+            # attrs={"auto_fuse": True} it extracts the op+tensor DAG, runs the MLSys
+            # solver, and emits the fused/tiled IR. The emit is being re-targeted from
+            # the retired auto-chunk path (upstream #1895) onto the explicit
+            # aiv_shard/aic_gather + manual loop tiling forms. No-op for unmarked funcs.
             ("AutoFuse", lambda: passes.auto_fuse()),
-            ("SplitChunkedLoops", lambda: passes.split_chunked_loops()),
-            ("InterchangeChunkLoops", lambda: passes.interchange_chunk_loops()),
             ("OutlineHierarchyScopes", lambda: passes.outline_hierarchy_scopes()),
             ("OutlineIncoreScopes", lambda: passes.outline_incore_scopes()),
             ("OutlineClusterScopes", lambda: passes.outline_cluster_scopes()),
@@ -152,8 +151,14 @@ class PassManager:
             ("AutoTileMatmulL0", lambda: passes.auto_tile_matmul_l0()),
             ("CanonicalizeTileSlice", lambda: passes.canonicalize_tile_slice()),
             ("InferTileMemorySpace", lambda: passes.infer_tile_memory_space()),
-            ("LowerTransposeLoadParamLayout", lambda: passes.lower_transpose_load_param_layout()),
             ("ResolveBackendOpLayouts", lambda: passes.resolve_backend_op_layouts()),
+            # RFC #1300: convert AUTO pl.split mixed InCore functions into the explicit
+            # split_aiv form (aiv_shard/aic_gather + halved vector sub-region) so
+            # ExpandMixedKernel folds them into split-stamped tpush/tpop uniformly. This
+            # is the live auto-split lowering path; after it runs every split function
+            # reaches SplitVectorKernel already split_aiv-marked, so SplitVectorKernel
+            # only stamps attrs. Runs immediately before ExpandMixedKernel.
+            ("LowerAutoVectorSplit", lambda: passes.lower_auto_vector_split()),
             ("ExpandMixedKernel", lambda: passes.expand_mixed_kernel()),
             ("InjectGMPipeBuffer", lambda: passes.inject_gm_pipe_buffer()),
             ("SplitVectorKernel", lambda: passes.split_vector_kernel()),
@@ -168,10 +173,6 @@ class PassManager:
             ("CanonicalizeIOOrder", lambda: passes.canonicalize_io_order()),
             # MaterializeTensorStrides fills empty stride slots on every
             # TensorView with packed canonical strides (RFC #1300 §2.4).
-            # Active in the default pipeline starting at P6 — by this point
-            # LowerTransposeLoadParamLayout has produced canonical-form DN
-            # parameters, so the materialized strides match the IR shape
-            # without going through the legacy `dn_swap` codegen path.
             ("MaterializeTensorStrides", lambda: passes.materialize_tensor_strides()),
             ("InitMemRef", lambda: passes.init_mem_ref()),
             # MemoryReuse coalesces tile buffers; on Ascend910B split-AIV it also
@@ -230,7 +231,10 @@ class PassManager:
         """
         if not cls._strategy_passes:
             cls._register_passes()
-        return cls(strategy, analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps)
+        return cls(
+            strategy,
+            analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+        )
 
     def __init__(
         self,

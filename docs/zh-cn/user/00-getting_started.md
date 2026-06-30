@@ -281,21 +281,20 @@ for batch in stream:
 完整三种使用模式（推理服务、训练循环、register/dispatch 开销验证）见
 `examples/runtime/explicit_dispatch.py`。
 
-### 读取单次 launch 的计时（`run_timed`、`benchmark`）
+### 读取单次 launch 的计时
 
-`worker.run` / `handle(...)` 只返回张量输出。要在 register-once 路径上读取单次
-launch 的 `RunTiming`（`host_wall_us` / `device_wall_us`），使用可选的
-`run_timed`，它返回 `(outputs, timing)`：
+`worker.run` / `handle(...)` 只返回张量输出，不再暴露单次 launch 的计时对象。
+runtime 以 `[STRACE]` 日志标记的形式输出每次运行的 host/device 计时（simpler
+PR #1177，在 `PTO2_PROFILING` 下默认开启）；用 simpler 的 `strace_timing` /
+`device_log_timing` 工具解析这些标记，而不是读取返回值。需要 per-task 的 device
+计时时，开启 L2 swimlane DFX（`RunConfig(enable_l2_swimlane=True)`）并读取
+`l2_swimlane_records.json`。
 
-```python
-with ChipWorker(config=RunConfig(platform="a2a3sim")) as worker:
-    handle = worker.register(compiled)
-    out, timing = handle.run_timed(a, b, c)          # 注册一次，计时 launch
-    print(timing.device_wall_us)                     # NPU 上的 orchestrator 墙钟
-```
+### 性能基准（`benchmark`）
 
-做 benchmark 时，`pypto.runtime.benchmark` 封装了循环与聚合——它注册一次并发起
-`rounds` 次廉价 launch（不再每轮重付 register/load），返回 `BenchmarkStats`：
+对于 register-once + 多轮（rounds）模式，`pypto.runtime.benchmark` 封装了循环
+与聚合：它注册 *compiled* 一次并发起 `rounds` 次廉价 launch（不再每轮重付
+register/load），读取每次 launch 的 `[STRACE]` 标记并返回 `BenchmarkStats`：
 
 ```python
 from pypto.runtime import benchmark
@@ -307,13 +306,40 @@ print(stats.device_wall_us_median, stats.device_wall_us_min, len(stats.samples))
 
 常见情况传 `platform=` / `device_id=`；需要 `block_dim` / `aicpu_thread_num` 等
 精细控制时传完整的 `RunConfig`（通过 `config=`）——两者不能同时给。聚合指标同时
-以 `device_wall_us_*`（与 issue 对齐）和更短的 `device_us_*` 两套命名暴露，`samples`
-是原始 `device_wall_us` 列表的别名。
+以 `device_wall_us_*` 和更短的 `device_us_*` 两套命名暴露，`samples` 是原始
+`device_wall_us` 列表的别名。
 
-`device_wall_us` 仅在 L2 单芯片运行时是真实的 NPU 墙钟；在未开启
-`PTO2_PROFILING` 的 runtime 上为 `0`（用 `stats.all_zero_device` 判断）。L3+
-DAG 运行当前不支持聚合 device 墙钟——`run_timed` / `benchmark` 会直接报错，而不是
-返回 0 值。
+`benchmark` 从 `[STRACE]` 标记读取计时（simpler PR #1177）：它在 worker 生命周期内
+将 runtime 日志级别提升到 `v9`，并在测量循环期间以 fd 级别捕获 `stderr`，因此循环
+期间产生的 stderr 会被转存到临时文件，而非实时打印。`device_wall_us` 仅在 L2 单芯片
+运行时是真实的 NPU 墙钟；在未开启 `SIMPLER_PROFILING` 的 runtime 上或 `*sim` 平台
+上为 `0`（用 `stats.all_zero_device` 判断）。
+
+除聚合值外，每次测量 launch 的完整 `[STRACE]` span 树保存在 `stats.invocations`
+（`TraceInvocation` 列表，已排除 warmup）。可用分支连接符渲染——单次 launch，或跨所有
+launch 求均值并标注每个节点的离散度（`spread` 取 `"stdev"`（默认）、`"minmax"`、
+`"both"` 或 `"none"`）：
+
+```python
+stats.print_tree(launch=0)            # 某次 launch 的嵌套 span 树
+stats.print_mean_tree(spread="both")  # 每节点均值 + ±stdev + [min..max]
+```
+
+```text
+mean of 20 launches (warmup 5 excluded); each node: mean ±stdev [min..max]:
+run_prepared               71784.1us  ±6797.5  [66482.4..89832.6]
+|- bind                    27943.6us  ±4163.7  [24836.7..37713.3]
+|- runner_run               3030.8us   ±184.4    [2822.3..3694.7]
+|  `- device_wall [dev]     2005.2us    ±74.6    [1875.1..2173.2]
+|     `- graph_build [dev]  1634.8us    ±64.6    [1490.2..1777.6]
+`- validate                40697.7us  ±3063.5  [38606.3..48200.6]
+```
+
+嵌套关系由点分 span 名重建,因此设备域 span（`...device_wall.*`,标 `[dev]`）会正确挂在
+其 host 父节点下。每个节点是一段**墙钟窗口而非时间划分**:子节点可能并发重叠（如 `orch`/
+`sched` 并行）或处于不同时钟域（`runner_run` 是 host 墙钟、`device_wall` 是 NPU 墙钟）,
+故子节点时长之和不必等于父节点。要取原始 span 用
+`stats.invocations[i].by_name()[<name>].dur_us`。
 
 ### 分布式（L3+）程序
 

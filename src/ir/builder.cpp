@@ -95,15 +95,14 @@ FunctionPtr IRBuilder::EndFunction(const Span& end_span) {
 
 void IRBuilder::BeginForLoop(const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop,
                              const ExprPtr& step, const Span& span, ForKind kind,
-                             std::optional<ChunkConfig> chunk_config,
                              std::vector<std::pair<std::string, std::any>> attrs) {
   if (context_stack_.empty()) {
     throw pypto::RuntimeError("Cannot begin for loop: not inside a function or another valid context at " +
                               span.to_string());
   }
 
-  context_stack_.push_back(std::make_unique<ForLoopContext>(loop_var, start, stop, step, span, kind,
-                                                            std::move(chunk_config), std::move(attrs)));
+  context_stack_.push_back(
+      std::make_unique<ForLoopContext>(loop_var, start, stop, step, span, kind, std::move(attrs)));
 }
 
 void IRBuilder::AddIterArg(const IterArgPtr& iter_arg) {
@@ -142,10 +141,10 @@ StmtPtr IRBuilder::EndForLoop(const Span& end_span) {
                      end_span.begin_line_, end_span.begin_column_);
 
   // Create for statement
-  auto for_stmt = std::make_shared<ForStmt>(loop_ctx->GetLoopVar(), loop_ctx->GetStart(), loop_ctx->GetStop(),
-                                            loop_ctx->GetStep(), loop_ctx->GetIterArgs(), body,
-                                            loop_ctx->GetReturnVars(), combined_span, loop_ctx->GetKind(),
-                                            loop_ctx->GetChunkConfig(), loop_ctx->GetAttrs());
+  auto for_stmt =
+      std::make_shared<ForStmt>(loop_ctx->GetLoopVar(), loop_ctx->GetStart(), loop_ctx->GetStop(),
+                                loop_ctx->GetStep(), loop_ctx->GetIterArgs(), body, loop_ctx->GetReturnVars(),
+                                combined_span, loop_ctx->GetKind(), loop_ctx->GetAttrs());
 
   // Pop context
   context_stack_.pop_back();
@@ -306,6 +305,33 @@ void IRBuilder::BeginScope(ScopeKind scope_kind, const Span& span, std::optional
                                                           sync_start, manual, std::move(attrs)));
 }
 
+void IRBuilder::MarkCurrentScopeSplitAiv(SplitMode split) {
+  CHECK(!context_stack_.empty() && CurrentContext()->GetType() == BuildContext::Type::SCOPE)
+      << "pl.split_aiv must appear directly inside a pl.at(...) scope (e.g. "
+         "'with pl.at(level=pl.Level.CORE_GROUP): ... for aiv_id in pl.split_aiv(2, mode=...)'), "
+         "not nested within an intervening loop or conditional.";
+  auto* scope_ctx = static_cast<ScopeContext*>(CurrentContext());
+  CHECK(scope_ctx->GetScopeKind() == ScopeKind::InCore)
+      << "pl.split_aiv must appear directly inside a pl.at(...) InCore scope, but the enclosing "
+         "open scope is "
+      << ScopeKindToString(scope_ctx->GetScopeKind())
+      << ". Place the split_aiv loop as a direct child of the pl.at(level=pl.Level.CORE_GROUP) scope.";
+  // One InCore scope represents the two AIV lanes, so multiple sibling
+  // `for ... in pl.split_aiv(...)` loops flattened into the same scope is not a
+  // meaningful pattern. Reject a second stamp on an already-marked scope: without
+  // this guard the SetSplit below would silently overwrite the scope's split mode
+  // (earlier ops parsed under one axis while the function advertises another) and
+  // AddAttr would append a duplicate ("split_aiv", true).
+  for (const auto& attr : scope_ctx->GetAttrs()) {
+    CHECK(attr.first != "split_aiv")
+        << "Multiple pl.split_aiv(...) loops in one pl.at(...) InCore scope are not supported: the "
+           "scope is already marked split_aiv. One InCore scope represents the two AIV lanes — use a "
+           "single 'for aiv_id in pl.split_aiv(...)' loop per pl.at(level=pl.Level.CORE_GROUP) scope.";
+  }
+  scope_ctx->SetSplit(split);
+  scope_ctx->AddAttr({"split_aiv", true});
+}
+
 StmtPtr IRBuilder::EndScope(const Span& end_span) {
   CHECK(!context_stack_.empty() && CurrentContext()->GetType() == BuildContext::Type::SCOPE)
       << "Cannot end scope: not inside a scope context at " << end_span.to_string();
@@ -339,10 +365,6 @@ StmtPtr IRBuilder::EndScope(const Span& end_span) {
     case ScopeKind::InCore:
       scope_stmt = std::make_shared<const InCoreScopeStmt>(split, std::move(name_hint), body, combined_span,
                                                            std::vector<std::string>{}, std::move(attrs));
-      break;
-    case ScopeKind::AutoInCore:
-      scope_stmt = std::make_shared<const AutoInCoreScopeStmt>(
-          split, std::move(name_hint), body, combined_span, std::vector<std::string>{}, std::move(attrs));
       break;
     case ScopeKind::Cluster:
       scope_stmt = std::make_shared<const ClusterScopeStmt>(std::move(name_hint), body, combined_span,

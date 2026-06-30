@@ -437,7 +437,6 @@ class ScopeOutliner : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const InCoreScopeStmtPtr& op) override { return VisitScopeKind(op); }
-  StmtPtr VisitStmt_(const AutoInCoreScopeStmtPtr& op) override { return VisitScopeKind(op); }
   StmtPtr VisitStmt_(const ClusterScopeStmtPtr& op) override { return VisitScopeKind(op); }
   StmtPtr VisitStmt_(const HierarchyScopeStmtPtr& op) override { return VisitScopeKind(op); }
   StmtPtr VisitStmt_(const SpmdScopeStmtPtr& op) override { return VisitScopeKind(op); }
@@ -854,14 +853,20 @@ class ScopeOutliner : public IRMutator {
         outlined_attrs.emplace_back("windowize", true);
       }
     };
+    // Propagate the manual AIV-split marker (pl.split(..., split_aiv=True)) from
+    // the scope onto the outlined function. ExpandMixedKernel copies it to both
+    // the AIC and AIV lanes; SplitVectorKernel reads it to bypass its automatic
+    // per-op halving for hand-written split_aiv kernels.
+    auto append_split_aiv_attr = [&]() {
+      if (op->HasAttr("split_aiv") && op->GetAttr<bool>("split_aiv", false)) {
+        outlined_attrs.emplace_back("split_aiv", true);
+      }
+    };
     if (auto incore = As<InCoreScopeStmt>(op)) {
       append_split_attr(incore->split_);
       append_slot_num_attr();
       append_windowize_attr();
-    } else if (auto auto_incore = As<AutoInCoreScopeStmt>(op)) {
-      append_split_attr(auto_incore->split_);
-      append_slot_num_attr();
-      append_windowize_attr();
+      append_split_aiv_attr();
     } else if (auto spmd = As<SpmdScopeStmt>(op)) {
       outlined_attrs.emplace_back("core_num", spmd->core_num_);
       if (spmd->sync_start_) {
@@ -1403,7 +1408,6 @@ class ScopeKindAbsenceVerifier : public IRVisitor {
   }
 
   void VisitStmt_(const InCoreScopeStmtPtr& op) override { CheckKind(op); }
-  void VisitStmt_(const AutoInCoreScopeStmtPtr& op) override { CheckKind(op); }
   void VisitStmt_(const ClusterScopeStmtPtr& op) override { CheckKind(op); }
   void VisitStmt_(const HierarchyScopeStmtPtr& op) override { CheckKind(op); }
   void VisitStmt_(const SpmdScopeStmtPtr& op) override { CheckKind(op); }

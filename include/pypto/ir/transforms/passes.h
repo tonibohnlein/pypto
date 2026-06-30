@@ -163,25 +163,6 @@ Pass MemoryReuse();
 Pass AllocateMemoryAddr();
 
 /**
- * @brief Create a loop chunking pass
- *
- * Splits ForStmt nodes with chunk_size into nested loops: an outer loop
- * iterating over chunk indices and an inner loop iterating within each chunk.
- * Requires SSA form input and produces SSA form output.
- */
-Pass SplitChunkedLoops();
-
-/**
- * @brief Interchange chunk loops and insert InCore scopes
- *
- * Reorders nested ChunkOuter/ChunkInner loop pairs so that all outer loops
- * are on top, then wraps the inner loops + body in a ScopeStmt(InCore).
- * Only interchanges when all ChunkInner loops are Parallel.
- * Requires SSA form input and produces SSA form output.
- */
-Pass InterchangeChunkLoops();
-
-/**
  * @brief Eliminate FunctionType::Inline functions by splicing their bodies
  *        into every call site.
  *
@@ -515,36 +496,6 @@ Pass CanonicalizeTileSlice();
 Pass InferTileMemorySpace();
 
 /**
- * @brief Lower ``tile.load(transpose=True)`` to a body-local DN view (RFC #1300 P6)
- *
- * For each InCore function, detects ``tile.load(..., transpose=True)`` whose source
- * is a function parameter ``p`` and rewrites the body so the transpose intent is
- * encoded as an explicit ``tensor.as_layout`` view at the top of the body
- * (RFC #1300 §3.3 + §4.2):
- *
- *   - Prepends ``p_dn = tensor.as_layout(p, layout=DN)`` to the InCore body.
- *     ``p_dn`` carries the canonical ``[..., b, a] DN`` view; ``p``'s parameter
- *     signature is left unchanged.
- *   - Substitutes body uses of ``p`` with ``p_dn``.
- *   - Rewrites each ``tile.load(p_dn, offsets, shapes, valid_shapes, ..., transpose=True)``
- *     to swap the trailing pair of offsets / shapes / valid_shapes into canonical
- *     coords and drop the ``transpose=True`` kwarg — the DN-source + Mat-target
- *     signal on ``p_dn`` now fully encodes the load's tile-view orientation.
- *
- * Non-InCore (orch) functions are left untouched: the orch caller continues to
- * pass its original row-major ND tensor straight through to the kernel, which
- * keeps the cross-function type boundary trivial.
- *
- * Mixed-use parameters (same param loaded with both ``transpose=True`` and
- * ``transpose=False``) are rejected with ``pypto::ValueError``.
- *
- * Requirements:
- * - Input IR must have tile ops (run ConvertTensorToTileOps first)
- * - Input IR must have InCore scopes outlined (run OutlineIncoreScopes first)
- */
-Pass LowerTransposeLoadParamLayout();
-
-/**
  * @brief Materialize implicit ND/DN strides on every TensorType (RFC #1300 §2.4)
  *
  * Walks every TensorType reachable from the program and rewrites any
@@ -585,6 +536,25 @@ Pass ResolveBackendOpLayouts();
  * - Input IR must have InCore scopes outlined (run OutlineIncoreScopes first)
  */
 Pass ExpandMixedKernel();
+
+/**
+ * @brief Lower AUTO pl.split mixed InCore functions into the explicit split_aiv
+ *        form before ExpandMixedKernel (RFC #1300 staged convergence).
+ *
+ * For each mixed InCore function carrying a function-level split mode (UP_DOWN /
+ * LEFT_RIGHT), inserts tile.aiv_shard at C->V boundaries and tile.aic_gather at
+ * V->C boundaries, halves only the VECTOR sub-region (affinity-gated reuse of the
+ * split_axis machinery), injects get_subblock_idx, and stamps split + split_aiv.
+ * ExpandMixedKernel then folds aiv_shard/aic_gather into split-stamped tpush/tpop
+ * via its op-driven boundary arm, and SplitVectorKernel takes its "already
+ * explicit" arm (attribute stamping only).
+ *
+ * This is the LIVE auto-split lowering path: it always runs, immediately before
+ * ExpandMixedKernel. SplitVectorKernel's former per-op halving driver was deleted
+ * once this pass became unconditional — the halving machinery now lives only in
+ * split_axis_utils, shared by this pass.
+ */
+Pass LowerAutoVectorSplit();
 
 /**
  * @brief Inject __gm_pipe_buffer workspace parameter for cross-core pipes

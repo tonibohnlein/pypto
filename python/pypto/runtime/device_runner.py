@@ -51,7 +51,6 @@ from .task_interface import (
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
     CoreCallable,  # pyright: ignore[reportAttributeAccessIssue]
-    RunTiming,  # pyright: ignore[reportAttributeAccessIssue]
     Worker,  # pyright: ignore[reportAttributeAccessIssue]
     make_tensor_arg,  # pyright: ignore[reportAttributeAccessIssue]
     scalar_to_uint64,  # pyright: ignore[reportAttributeAccessIssue]
@@ -449,13 +448,15 @@ def compile_and_assemble(
         cached_bin = _load_binary(cache_file)
         if cached_bin is not None:
             sig = kernel.get("signature", [])
-            return (func_id, CoreCallable.build(signature=sig, binary=cached_bin))
+            arg_index = kernel.get("arg_index", list(range(len(sig))))
+            return (func_id, CoreCallable.build(signature=sig, binary=cached_bin, arg_index=arg_index))
 
         # Compile via shared function; skip secondary prebuild cache write
         _, kernel_bin = compile_single_kernel(kernel, compiler, platform, pto_isa_root, runtime_name)
 
         sig = kernel.get("signature", [])
-        return (func_id, CoreCallable.build(signature=sig, binary=kernel_bin))
+        arg_index = kernel.get("arg_index", list(range(len(sig))))
+        return (func_id, CoreCallable.build(signature=sig, binary=kernel_bin, arg_index=arg_index))
 
     def _compile_orchestration() -> bytes:
         source = Path(orchestration["source"])
@@ -512,7 +513,7 @@ def execute_on_device(  # noqa: PLR0913
     enable_dep_gen: bool = False,
     enable_scope_stats: bool = False,
     runtime_env: dict[str, str] | None = None,
-) -> RunTiming:
+) -> None:
     """Execute *chip_callable* on device via Simpler's unified ``Worker``.
 
     If a :class:`pypto.runtime.ChipWorker` is currently active (the call site is
@@ -576,12 +577,10 @@ def execute_on_device(  # noqa: PLR0913
             those at ``ChipWorker(...)`` construction instead.
 
     Returns:
-        The :class:`RunTiming` produced by the underlying simpler ``Worker``
-        run — ``host_wall_us`` plus ``device_wall_us``. For L2 single-task
-        runs ``device_wall_us`` is the real on-NPU orchestrator wall time;
-        for L3+ DAG runs it is ``0`` (per-task device cycles are not
-        aggregated in the ring scheduler — see ``simpler.worker.Worker.run``).
-        Callers that do not need timing can simply ignore the return value.
+        ``None``. The dispatch writes device results back into the host
+        tensors in *orch_args* in place; per-run timing is no longer
+        returned — read it from the runtime's ``[STRACE]`` log markers
+        (simpler PR #1177) or the L2 swimlane records instead.
 
     Raises:
         ValueError: If ``level != 2`` (L3 not yet exposed), or any DFX flag
@@ -627,7 +626,8 @@ def execute_on_device(  # noqa: PLR0913
     active = _PyptoWorker.current(level=level, platform=platform, device_id=device_id, runtime=runtime_name)
     with _temporary_env(env):
         if active is not None:
-            return active._run_chip(chip_callable, orch_args, cfg)
+            active._run_chip(chip_callable, orch_args, cfg)
+            return
         worker = Worker(level=level, device_id=device_id, platform=platform, runtime=runtime_name)
         worker.init()
         try:
@@ -635,7 +635,7 @@ def execute_on_device(  # noqa: PLR0913
             # register the callable, run it, then close — close() runs finalize()
             # so explicit unregister is unnecessary here.
             cid = worker.register(chip_callable)
-            return worker.run(cid, orch_args, cfg)
+            worker.run(cid, orch_args, cfg)
         finally:
             worker.close()
 
