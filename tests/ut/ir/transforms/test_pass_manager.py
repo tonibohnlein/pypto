@@ -15,6 +15,7 @@ import pytest
 from pypto import DataType, ir, passes
 
 TENSOR_ONLY_PASSES = [
+    "AutoFuse",
     "OutlineHierarchyScopes",
     "OutlineIncoreScopes",
     "OutlineClusterScopes",
