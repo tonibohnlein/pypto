@@ -17,6 +17,7 @@ from pypto import DataType, backend, ir, passes
 from pypto.backend import BackendType
 
 TENSOR_ONLY_PASSES = [
+    "AutoFuse",
     "OutlineHierarchyScopes",
     "OutlineIncoreScopes",
     "OutlineClusterScopes",
