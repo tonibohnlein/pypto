@@ -570,9 +570,27 @@ std::vector<StmtPtr> BuildTileMatmul(const ExprPtr& a, const ExprPtr& b, const E
   std::vector<std::pair<std::string, std::any>> loop_attrs = {{kPipelineStagesAttr, /*stages=*/2}};
   auto for_stmt = std::make_shared<ForStmt>(ko, MakeIndex(0, sp), MakeIndex(K, sp), MakeIndex(k, sp),
                                             std::vector<IterArgPtr>{c_iter}, body, std::vector<VarPtr>{out_var},
-                                            sp, ForKind::Pipeline, /*chunk_config=*/std::nullopt,
-                                            std::move(loop_attrs));
+                                            sp, ForKind::Pipeline, std::move(loop_attrs));
   return {acc_assign, for_stmt};
+}
+
+// Distribute a per-tile `body` across the AI cores via SPMD. Replaces the retired
+// AutoInCore + chunked-parallel-loop path (upstream #1895, "remove auto_chunk"): each core
+// runs ONE tile selected by `tile.get_block_idx()` and assembles its disjoint region into
+// the shared output; OutlineIncoreScopes outlines the per-core InCore kernel and propagates
+// `core_num`. `t` is the tile-index var the body reads (offset math drives off it); the body
+// computes one tile and binds the function output (no IterArg/Yield -- SPMD is data-parallel).
+// Emits `tile.get_block_idx` (what the `for i in pl.spmd(...)` parser desugaring produces, so
+// the print/parse round-trip is stable); it is index-only and survives ConvertTensorToTileOps.
+static StmtPtr SpmdWrap(const VarPtr& t, std::vector<StmtPtr> body, const ExprPtr& count,
+                        const std::string& name, const Span& sp) {
+  body.insert(body.begin(), std::make_shared<AssignStmt>(
+                                t, OpRegistry::GetInstance().Create("tile.get_block_idx", {}, sp), sp));
+  // Naming convention of the `for i in pl.spmd(...)` desugaring (ast_parser
+  // _split_spmd_for_loop_name_hints): the InCore kernel keeps the base name, the Spmd
+  // wrapper gets the `_spmd` suffix -- so the print/parse round-trip stays structurally stable.
+  auto kernel = std::make_shared<InCoreScopeStmt>(std::nullopt, name, SeqStmts::Flatten(std::move(body), sp), sp);
+  return std::make_shared<SpmdScopeStmt>(count, /*sync_start=*/false, name + "_spmd", kernel, sp);
 }
 
 // Realize the solver's tile for a `c = tensor.matmul(a, b)`: tile the output
@@ -657,8 +675,6 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
     auto mi = MakeMul(MakeFloorDiv(sp_idx, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
     auto ni = MakeMul(MakeFloorMod(sp_idx, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
     auto k_base = MakeMul(ks, MakeIndex(ksz, sp), sp);
-    auto c_t = std::make_shared<IterArg>(base + "_ct", c_seeded->GetType(), c_seeded, sp);
-
     // Per-task partial: pre-slice A/B to this k-slice, then the [h,w] tile matmul over
     // it (k-pipelined within the slice). Pre-slicing keeps BuildTileMatmul unchanged.
     auto a_ks = reg.Create("tensor.slice", {a, MakeIndexTuple({M, ksz}, sp), MakeTuple2(MakeIndex(0, sp), k_base, sp)}, sp);
@@ -672,18 +688,13 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
     for (auto& s : BuildTileMatmul(a_ks_v, b_ks_v, mi, ni, h, w, ksz, tile.k, dtype, part, base, sp))
       body.push_back(std::move(s));
 
-    // Atomic-add the partial into the output tile.
-    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_t), part, MakeTuple2(mi, ni, sp)}, {{"atomic", 1}}, sp);
-    auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
-    body.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
-    body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
-    StmtPtr loop_body = SeqStmts::Flatten(std::move(body), sp);
+    // Atomic-add the partial into the shared output tile -- the S partials per tile merge
+    // across SPMD cores. Each core runs ONE (tile, k-slice) selected by get_block_idx; binds c_var.
+    auto asm_call =
+        reg.Create("tensor.assemble", {ExprPtr(c_seeded), part, MakeTuple2(mi, ni, sp)}, {{"atomic", 1}}, sp);
+    body.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
 
-    ChunkConfig chunk{MakeIndex(1, sp), ChunkPolicy::LeadingFull};
-    auto loop = std::make_shared<ForStmt>(t, MakeIndex(0, sp), MakeIndex(num_tiles * S, sp), MakeIndex(1, sp),
-                                          std::vector<IterArgPtr>{c_t}, loop_body, std::vector<VarPtr>{c_var}, sp,
-                                          ForKind::Parallel, chunk);
-    auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, loop, sp);
+    auto scope = SpmdWrap(t, std::move(body), MakeIndex(num_tiles * S, sp), name, sp);
     return std::vector<StmtPtr>{c_init_assign, seed_scope, scope};
   }
 
@@ -722,23 +733,16 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   auto t = std::make_shared<Var>(base + "_t", index_type, sp);
   auto mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
   auto ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
-  auto c_t = std::make_shared<IterArg>(base + "_ct", c_init->GetType(), c_init, sp);
-
-  // Per-tile body: compute the [h,w] tile (k-pipeline) and assemble into the output.
+  // Per-tile body: compute the [h,w] tile (k-pipeline) and assemble it into the shared
+  // output. Each SPMD core runs ONE tile (selected by get_block_idx, prepended by SpmdWrap)
+  // and writes its disjoint [h,w] region, binding c_var (no IterArg/Yield -- data-parallel).
   auto tile_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
   auto tile_var = std::make_shared<Var>(base + "_tile", tile_type, sp);
   std::vector<StmtPtr> body_stmts = BuildTileMatmul(a, b, mi, ni, h, w, K, tile.k, dtype, tile_var, base, sp);
-  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_t), tile_var, MakeTuple2(mi, ni, sp)}, sp);
-  auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
-  body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
-  body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
-  StmtPtr loop_body = SeqStmts::Flatten(std::move(body_stmts), sp);
+  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tile_var, MakeTuple2(mi, ni, sp)}, sp);
+  body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
 
-  ChunkConfig chunk{MakeIndex(1, sp), ChunkPolicy::LeadingFull};
-  auto loop = std::make_shared<ForStmt>(t, MakeIndex(0, sp), MakeIndex(num_m * num_n, sp), MakeIndex(1, sp),
-                                        std::vector<IterArgPtr>{c_t}, loop_body, std::vector<VarPtr>{c_var}, sp,
-                                        ForKind::Parallel, chunk);
-  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, loop, sp);
+  auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
@@ -831,7 +835,6 @@ std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr
   auto t = std::make_shared<Var>(base + "_t", index_type, sp);
   auto mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
   auto ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
-  auto c_t = std::make_shared<IterArg>(base + "_ct", c_init->GetType(), c_init, sp);
 
   // Per-tile body: replay the op chain at element offset [mi,ni]. Each op's operands
   // are mapped to tile-shaped values — an intermediate uses its on-chip tile result,
@@ -879,17 +882,10 @@ std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr
     if (a == out_stmt) tile_var = res;
   }
 
-  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_t), tile_var, MakeTuple2(mi, ni, sp)}, sp);
-  auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
-  body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
-  body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
-  StmtPtr loop_body = SeqStmts::Flatten(std::move(body_stmts), sp);
+  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tile_var, MakeTuple2(mi, ni, sp)}, sp);
+  body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
 
-  ChunkConfig chunk{MakeIndex(1, sp), ChunkPolicy::LeadingFull};
-  auto loop = std::make_shared<ForStmt>(t, MakeIndex(0, sp), MakeIndex(num_m * num_n, sp), MakeIndex(1, sp),
-                                        std::vector<IterArgPtr>{c_t}, loop_body, std::vector<VarPtr>{c_var}, sp,
-                                        ForKind::Parallel, chunk);
-  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, loop, sp);
+  auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
@@ -985,23 +981,15 @@ std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1,
   auto t = std::make_shared<Var>(base + "_t", index_type, sp);
   auto mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
   auto ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
-  auto c_t = std::make_shared<IterArg>(base + "_ct", c_init->GetType(), c_init, sp);
 
   // Per-tile body: the inner serial chain (T_band on-chip), assembled into the output.
   auto tile_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
   auto tile_var = std::make_shared<Var>(base + "_tile", tile_type, sp);
   std::vector<StmtPtr> body_stmts = build_chain(mi, ni, tile_var);
-  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_t), tile_var, MakeTuple2(mi, ni, sp)}, sp);
-  auto c_new = std::make_shared<Var>(base + "_cnew", asm_call->GetType(), sp);
-  body_stmts.push_back(std::make_shared<AssignStmt>(c_new, asm_call, sp));
-  body_stmts.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_new}, sp));
-  StmtPtr loop_body = SeqStmts::Flatten(std::move(body_stmts), sp);
+  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tile_var, MakeTuple2(mi, ni, sp)}, sp);
+  body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
 
-  ChunkConfig chunk{MakeIndex(1, sp), ChunkPolicy::LeadingFull};
-  auto loop = std::make_shared<ForStmt>(t, MakeIndex(0, sp), MakeIndex(num_m * num_n, sp), MakeIndex(1, sp),
-                                        std::vector<IterArgPtr>{c_t}, loop_body, std::vector<VarPtr>{c_var}, sp,
-                                        ForKind::Parallel, chunk);
-  auto scope = std::make_shared<AutoInCoreScopeStmt>(std::nullopt, name, loop, sp);
+  auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
