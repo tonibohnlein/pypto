@@ -4189,6 +4189,140 @@ class TestCapacityGatedReuse:
             allocated = passes.allocate_memory_addr()(after_reuse)
         assert allocated.get_function("kernel") is not None
 
+    def test_on_stage4_uses_balanced_modulo_coloring(self):
+        """Stage-4 group, room for 2 buffers (F = min(4, 64/32) = 2): the surviving
+        coloring must be the balanced modulo-2 residues {0,2},{1,3} — every adjacent
+        clone pair in different buffers — not a def-order adjacent collapse. This is the
+        adjacency guarantee at depth > 2 that a distance-blind shed would break; it is
+        why mod F is kept rather than recovered from a scalar ShedScore."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                # One Left / one Mat load reused; the four stage clones r0..r3 are distinct
+                # disjoint-lifetime moves (each its own buffer candidate), tagged 0:0..0:3.
+                am: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                bm: pl.Tile[[128, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 128], target_memory=pl.Mem.Mat
+                )
+                lt: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(am, target_memory=pl.Mem.Left)
+                r0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bm, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:0"}
+                )
+                m0: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, r0)
+                out = pl.store(m0, [0, 0], out)
+                r1: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bm, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:1"}
+                )
+                m1: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, r1)
+                out = pl.store(m1, [0, 0], out)
+                r2: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bm, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:2"}
+                )
+                m2: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, r2)
+                out = pl.store(m2, [0, 0], out)
+                r3: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bm, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:3"}
+                )
+                m3: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, r3)
+                out = pl.store(m3, [0, 0], out)
+                return out
+
+        with passes.PassContext([], capacity_gated_reuse=True):
+            after = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        bases = self._collect_bases(after, ("r0", "r1", "r2", "r3"))
+        assert len({b.name_hint for b in bases.values()}) == 2, "exactly 2 ping-pong buffers at F=2"
+        assert bases["r0"] is bases["r2"], "residue 0 = stages {0,2} share a buffer"
+        assert bases["r1"] is bases["r3"], "residue 1 = stages {1,3} share a buffer"
+        assert bases["r0"] is not bases["r1"], "adjacent stages 0,1 must be in different buffers"
+        allocated = passes.allocate_memory_addr()(after)
+        assert allocated.get_function("kernel") is not None
+
+    def test_on_sequential_groups_time_share_without_false_shed(self):
+        """Two *sequential* pipeline groups in L0b — group A (16 KB slots, stages 0:0/0:1)
+        then group B (24 KB slots, 1:0/1:1). The naive per-group sum is 2·16 + 2·24 =
+        80 KB > 64 KB, but the groups are disjoint in time, so the exact SpaceFootprint
+        lets them **cross-merge diagonally** (A's operands reuse B's freed buffers) and
+        both keep depth 2 in just 2 physical buffers (48 KB). No false shed — this is the
+        co-resident/whole-space accuracy that the old Sum(size) estimate lacked. (The shed
+        loop itself is exercised by the co-resident test, where a co-live tile forces it.)"""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                la: pl.Tensor[[16, 128], pl.BF16],
+                ba0: pl.Tensor[[128, 64], pl.BF16],
+                ba1: pl.Tensor[[128, 64], pl.BF16],
+                bb0: pl.Tensor[[128, 96], pl.BF16],
+                bb1: pl.Tensor[[128, 96], pl.BF16],
+                outa0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+                outa1: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+                outb0: pl.Out[pl.Tensor[[16, 96], pl.FP32]],
+                outb1: pl.Out[pl.Tensor[[16, 96], pl.FP32]],
+            ) -> pl.Tensor[[16, 96], pl.FP32]:
+                lam: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    la, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                lt: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(lam, target_memory=pl.Mem.Left)
+                # group A (16 KB Right slots), stages 0:0 / 0:1
+                ba0m: pl.Tile[[128, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    ba0, [0, 0], [128, 64], target_memory=pl.Mem.Mat
+                )
+                ra0: pl.Tile[[128, 64], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    ba0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:0"}
+                )
+                ma0: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, ra0)
+                outa0 = pl.store(ma0, [0, 0], outa0)
+                ba1m: pl.Tile[[128, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    ba1, [0, 0], [128, 64], target_memory=pl.Mem.Mat
+                )
+                ra1: pl.Tile[[128, 64], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    ba1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:1"}
+                )
+                ma1: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, ra1)
+                outa1 = pl.store(ma1, [0, 0], outa1)
+                # group B (24 KB Right slots), stages 1:0 / 1:1
+                bb0m: pl.Tile[[128, 96], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    bb0, [0, 0], [128, 96], target_memory=pl.Mem.Mat
+                )
+                rb0: pl.Tile[[128, 96], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bb0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "1:0"}
+                )
+                mb0: pl.Tile[[16, 96], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, rb0)
+                outb0 = pl.store(mb0, [0, 0], outb0)
+                bb1m: pl.Tile[[128, 96], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    bb1, [0, 0], [128, 96], target_memory=pl.Mem.Mat
+                )
+                rb1: pl.Tile[[128, 96], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bb1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "1:1"}
+                )
+                mb1: pl.Tile[[16, 96], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, rb1)
+                outb1 = pl.store(mb1, [0, 0], outb1)
+                return outb1
+
+        with passes.PassContext([], capacity_gated_reuse=True):
+            after = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        bases = self._collect_bases(after, ("ra0", "ra1", "rb0", "rb1"))
+        assert bases["ra0"] is not bases["ra1"], "group A keeps depth 2 — its operands stay separate"
+        assert bases["rb0"] is not bases["rb1"], "group B keeps depth 2 — its operands stay separate"
+        assert len({b.name_hint for b in bases.values()}) == 2, "both groups fit in 2 buffers by time-sharing"
+        allocated = passes.allocate_memory_addr()(after)
+        assert allocated.get_function("kernel") is not None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
