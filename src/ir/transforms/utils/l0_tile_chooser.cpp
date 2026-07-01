@@ -14,7 +14,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
+#include <string>
 #include <sstream>
 #include <vector>
 
@@ -348,6 +350,35 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
   CHECK(cfg.bw_a > 0.0 && cfg.bw_b > 0.0 && cfg.bw_drain > 0.0)
       << "ChooseL0Tile: roofline bandwidths must be strictly positive (got bw_a=" << cfg.bw_a
       << ", bw_b=" << cfg.bw_b << ", bw_drain=" << cfg.bw_drain << ") -- they divide the load/drain cost.";
+
+  // === CALIBRATION-ONLY tile override (calib/force-l0-tile branch; NEVER merged) ===
+  // env PYPTO_FORCE_L0_TILE="m,n,k,stat,dbc" (stat in {OS,A,B}, dbc in {0,1}) returns
+  // that design point verbatim so a device sweep can A/B it against the chooser's
+  // pick. Applies to EVERY matmul in the program -> use single-matmul kernels.
+  if (const char* env = std::getenv("PYPTO_FORCE_L0_TILE")) {
+    std::stringstream fss(env);
+    std::string tok;
+    std::vector<std::string> parts;
+    while (std::getline(fss, tok, ',')) parts.push_back(tok);
+    CHECK(parts.size() == 5) << "PYPTO_FORCE_L0_TILE must be 'm,n,k,stat,dbc', got: " << env;
+    Regime fr;
+    fr.stat = parts[3] == "A"   ? Stationarity::kAStationary
+              : parts[3] == "B" ? Stationarity::kBStationary
+                                : Stationarity::kOutputStationary;
+    fr.dbc = std::stoi(parts[4]) != 0;
+    const int fm = std::stoi(parts[0]), fn = std::stoi(parts[1]), fk = std::stoi(parts[2]);
+    L0TileResult forced;
+    forced.m = fm;
+    forced.n = fn;
+    forced.k = fk;
+    forced.stationarity = fr.stat;
+    forced.double_buffer_c = fr.dbc;
+    forced.estimated_traffic_bytes = EstimateTraffic(fm, fn, fk, cfg, fr);
+    forced.estimated_cost_cycles = WallCycles(fm, fn, fk, cfg, fr);
+    forced.padded_compute_volume = PaddedComputeVolume(fm, fn, fk, cfg);
+    forced.perf_hint = "FORCED via PYPTO_FORCE_L0_TILE (calibration build)";
+    return forced;
+  }
 
   // Without padding, the problem dimensions themselves must already meet the
   // cube minimum. Callers (the pass) should pre-screen and skip with a
