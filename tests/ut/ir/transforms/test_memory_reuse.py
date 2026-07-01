@@ -4122,6 +4122,63 @@ class TestCapacityGatedReuse:
             after_on = passes.memory_reuse()(passes.init_mem_ref()(Before))
         ir.assert_structural_equal(after_on, after_off)
 
+    def test_real_pipeline_membership_tags_reach_the_gate(self):
+        """End-to-end tag flow on a REAL same-core ``pl.pipeline``: AutoTileMatmulL0
+        turns a full-K matmul into ``pl.pipeline(stage=2)``, LowerPipelineLoops stamps
+        real ``pipeline_membership`` tags, and they must reach MemoryReuse — verified
+        by running the actual Default pipeline (truncated at MemoryReuse), not by
+        hand-stamping tags.
+
+        Note: same-core stage clones are *co-live*, so they are already double-buffered
+        (OFF and ON both keep 2). The fa 8->1 *collapse* is cross-core-skew-specific —
+        SkewCrossCorePipeline leaves the operands disjoint in each core's local order,
+        which is what the legacy gate over-merges — and is modeled by the hand-tagged
+        tests above. This guards the real tag production/consumption flow and that the
+        gate yields a valid <=L0b allocation on a real pipeline."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 2048], pl.BF16],
+                rhs: pl.Tensor[[2048, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[16, 2048], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [16, 2048], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[2048, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [2048, 64], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        def pm_upto(upto: str) -> PassManager:
+            pm = PassManager.get_strategy(OptimizationStrategy.Default)
+            idx = pm.pass_names.index(upto)
+            pipe = passes.PassPipeline()
+            for p in pm.passes[: idx + 1]:
+                pipe.add_pass(p)
+            pm._pipeline = pipe
+            pm.pass_names = pm.pass_names[: idx + 1]
+            return pm
+
+        # Real LowerPipelineLoops tags reach MemoryReuse's input (they are stripped in
+        # MemoryReuse's own output, so assert on the pre-pass IR).
+        before_reuse = ir.python_print(pm_upto("InitMemRef").run_passes(Prog))
+        assert '"pipeline_membership"' in before_reuse, "LowerPipelineLoops tags must reach MemoryReuse"
+        assert "Mem.Right" in before_reuse, "expected pipelined Right operands in the lowered IR"
+
+        # The gate runs on the real tags and yields a valid ≤ L0b allocation (no overflow).
+        with passes.PassContext([], capacity_gated_reuse=True):
+            after_reuse = pm_upto("MemoryReuse").run_passes(Prog)
+            allocated = passes.allocate_memory_addr()(after_reuse)
+        assert allocated.get_function("kernel") is not None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
