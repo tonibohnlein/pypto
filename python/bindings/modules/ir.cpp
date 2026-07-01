@@ -1269,6 +1269,7 @@ void BindIR(nb::module_& m) {
       .value("Runtime", ScopeKind::Runtime, "Runtime orchestration scope (PTO2_SCOPE wrapper)")
       .value("CommDomain", ScopeKind::CommDomain,
              "Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch window buffers)")
+      .value("SplitAiv", ScopeKind::SplitAiv, "Explicit AIV-split region (pl.split_aiv)")
       .export_values();
 
   // SplitMode enum
@@ -1391,6 +1392,24 @@ void BindIR(nb::module_& m) {
   spmd_scope_stmt_class.def_prop_ro(
       "attrs",
       [kwargs_to_pydict](const std::shared_ptr<const SpmdScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  // SplitAivScopeStmt
+  auto split_aiv_scope_stmt_class = nb::class_<SplitAivScopeStmt, ScopeStmt>(
+      ir, "SplitAivScopeStmt",
+      "Explicit AIV-split region across 2 subblocks. mode=NONE is task-parallel "
+      "(no halving; both lanes run the full body via aiv_id); UP_DOWN/LEFT_RIGHT "
+      "halve vector compute on the split axis. Erased by LowerAutoVectorSplit "
+      "(pass 20); never reaches codegen.");
+  split_aiv_scope_stmt_class.def(nb::init<SplitMode, int, std::string, const StmtPtr&, const Span&>(),
+                                 nb::arg("split"), nb::arg("count") = 2, nb::arg("name_hint") = "",
+                                 nb::arg("body"), nb::arg("span"), "Create an AIV-split scope statement");
+  BindFields<SplitAivScopeStmt>(split_aiv_scope_stmt_class);
+  split_aiv_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const SplitAivScopeStmt>& self) {
         return kwargs_to_pydict(self->attrs_);
       },
       scope_attrs_doc);

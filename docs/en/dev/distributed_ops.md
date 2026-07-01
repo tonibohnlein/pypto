@@ -20,7 +20,7 @@ the `dst` side via `AsTensorTypeLike` — TGET only needs a writable local GM
 region to receive into, so kernels can TGET directly into host-backed output
 tensors; `src` still requires a window-bound `DistributedTensor`.
 
-There are **seven ops** and **four ABI enums**:
+There are **eleven ops** and **four ABI enums**:
 
 | Op | Direction | Result | Hardware |
 | -- | --------- | ------ | -------- |
@@ -29,6 +29,10 @@ There are **seven ops** and **four ABI enums**:
 | `pld.tensor.get` | pull (read peer → local GM) | `Unknown` (side effect) | TGET |
 | `pld.tensor.put` | push (write local → peer) | `Unknown` (side effect) | TPUT |
 | `pld.tensor.allreduce` | collective reduce over window slices | `DistributedTensorType` (same as src) | builtin collective |
+| `pld.tensor.barrier` | synchronise visibility of window data across ranks | `DistributedTensorType` (same as src) | builtin collective |
+| `pld.tensor.broadcast` | replicate root rank's data to all ranks | `DistributedTensorType` (same as src) | builtin collective |
+| `pld.tensor.reduce_scatter` | reduce and scatter chunks across ranks | `DistributedTensorType` (same as src) | builtin collective |
+| `pld.tensor.allgather` | gather data from all ranks via window | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
 
@@ -337,9 +341,9 @@ dispatches before the final `Simplify`.
 - **End-to-end (ST)**: `tests/st/distributed/test_l3_allreduce.py` (mesh
   allreduce with dynamic rank dim `NR = pl.dynamic("NR")`; **P=2** default,
   **P=4** on any four devices (e.g. `--device=0,1,2,3` or `--device=0-3`)),
+  `test_l3_allgather.py`, `test_l3_reduce_scatter.py`, `test_l3_broadcast.py`
+  (each likewise dynamic-NR, P=2/P=4),
   `test_l3_tensor_allreduce_intrinsic.py`, `test_l3_host_tensor_allreduce.py`,
-  `test_l3_allgather.py`,
-  `test_l3_reduce_scatter.py`, `test_l3_broadcast.py`, `test_l3_gemm.py`,
   `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`, and related L3 STs
   under `tests/st/distributed/`. `test_l3_put.py` and `test_l3_get.py` are
   currently **skipped** pending the N7 host codegen (`add_scalar(ctx)` per

@@ -32,6 +32,7 @@ Plus regressions:
 """
 
 import re
+from importlib import resources
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -680,6 +681,179 @@ def test_host_orch_binds_composite_dynamic_dim_from_shape():
     # The raw symbol is bound before the composite slice bound consumes it.
     assert "0:(NR * 64)" in code, code
     assert code.index("NR = (tensors") < code.index("0:(NR * 64)"), code
+
+
+def test_backend_materializes_barrier_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self, data: pld.DistributedTensor[[SIZE], pl.FP32], sig: pld.DistributedTensor[[SIZE], pl.INT32]
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [SIZE], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, signal, device=r)
+            pld.tensor.barrier(signal)
+            return 0
+
+    _assert_host_collective_next_level_files(
+        Prog,
+        tmp_path,
+        variant="builtin.tensor.barrier__fp32",
+        signature='"signature": [_D.INOUT]',
+        kernel_snippet="TNOTIFY",
+    )
+
+
+def test_backend_materializes_broadcast_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self, data: pld.DistributedTensor[[SIZE], pl.FP32], sig: pld.DistributedTensor[[SIZE], pl.INT32]
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [SIZE], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, signal, device=r)
+            pld.tensor.broadcast(data, signal, root=0)
+            return 0
+
+    _assert_host_collective_next_level_files(
+        Prog,
+        tmp_path,
+        variant="builtin.tensor.broadcast__root0__fp32",
+        signature='"signature": [_D.INOUT, _D.INOUT]',
+        kernel_snippet="kRoot = 0",
+    )
+
+
+def test_backend_materializes_reduce_scatter_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            data: pld.DistributedTensor[[4, SIZE], pl.FP32],
+            sig: pld.DistributedTensor[[SIZE], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(4 * SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [4, SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [SIZE], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, signal, device=r)
+            pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Sum)
+            return 0
+
+    _assert_host_collective_next_level_files(
+        Prog,
+        tmp_path,
+        variant="builtin.tensor.reduce_scatter__sum__fp32",
+        signature='"signature": [_D.INOUT, _D.INOUT]',
+        kernel_snippet="TADD",
+    )
+
+
+def test_backend_materializes_allgather_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            data: pld.DistributedTensor[[4, SIZE], pl.FP32],
+            sig: pld.DistributedTensor[[SIZE], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(4 * SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [4, SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [SIZE], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, signal, device=r)
+            pld.tensor.allgather(data, signal)
+            return 0
+
+    _assert_host_collective_next_level_files(
+        Prog,
+        tmp_path,
+        variant="builtin.tensor.barrier__fp32",
+        signature='"signature": [_D.INOUT]',
+        kernel_snippet="platform_comm/comm_context.h",
+    )
+
+
+def _assert_host_collective_next_level_files(program_cls, tmp_path, variant, signature, kernel_snippet):
+    program = passes.materialize_comm_domain_scopes()(program_cls)
+    program = passes.lower_host_tensor_collectives()(program)
+    files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True)
+
+    entry = variant.replace(".", "_")
+    base = f"next_levels/{variant}"
+    assert f"{base}/kernel_config.py" in files
+    assert f"{base}/orchestration/{entry}.cpp" in files
+    assert f"{base}/kernels/aiv/{entry}_kernel.cpp" in files
+
+    kernel_config = files[f"{base}/kernel_config.py"]
+    assert signature in kernel_config
+    assert '"block_dim": 1' in kernel_config
+
+    kernel_cpp = files[f"{base}/kernels/aiv/{entry}_kernel.cpp"]
+    assert kernel_snippet in kernel_cpp
+
+
+@pytest.mark.parametrize(
+    ("package_name", "variant"),
+    [
+        ("barrier", "builtin.tensor.barrier__fp32"),
+        ("broadcast", "builtin.tensor.broadcast__root0__fp32"),
+        ("reduce_scatter", "builtin.tensor.reduce_scatter__sum__fp32"),
+    ],
+)
+def test_host_collective_builtin_template_package_exists(package_name, variant):
+    """Each host collective builtin must ship a template package under collectives/."""
+    root = resources.files("pypto.runtime.builtins.collectives") / package_name
+    templates = root / "templates"
+    assert templates.is_dir(), f"missing templates/ for {package_name}"
+    for name in ("entry.cpp.in", "kernel.cpp.in", "kernel_config.py.in"):
+        assert (templates / name).is_file(), f"missing {name} in {package_name}"
+    assert (root / "__init__.py").is_file(), f"missing __init__.py in {package_name}"
+    assert variant.startswith("builtin.tensor."), variant
+
+
+def test_allgather_builtin_template_package_reserved_for_future_use():
+    """allgather builtin template package exists but is NOT YET WIRED.
+
+    The HOST allgather path lowers to builtin.tensor.barrier (see
+    test_backend_materializes_allgather_next_level_files). The
+    builtin.tensor.allgather op/templates are reserved for future
+    concurrent-dispatch lowering and must carry a NOT YET WIRED marker.
+    """
+    root = resources.files("pypto.runtime.builtins.collectives") / "allgather"
+    init_content = (root / "__init__.py").read_text()
+    assert "NOT YET WIRED" in init_content, (
+        "allgather __init__.py must carry a NOT YET WIRED marker until the concurrent-dispatch lowering lands"
+    )
 
 
 if __name__ == "__main__":

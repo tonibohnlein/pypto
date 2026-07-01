@@ -121,7 +121,6 @@ set(PYPTO_SOURCES
     src/ir/op/distributed/get_comm_ctx.cpp
     src/ir/op/distributed/system.cpp
     src/ir/op/distributed/allreduce.cpp
-    src/ir/op/distributed/collective.cpp
     src/ir/op/distributed/intrinsics.cpp
     src/ir/op/tensor_ops/broadcast.cpp
     src/ir/op/tensor_ops/elementwise.cpp

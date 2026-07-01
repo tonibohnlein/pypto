@@ -562,6 +562,38 @@ def test_allreduce_in_host_orchestrator_is_left_for_host_collective_lowering():
     assert "pld.tile.remote_load" not in op_names
 
 
+def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_lowering():
+    """barrier/broadcast/allgather/reduce_scatter skipped by LowerCompositeOps in HOST orch."""
+    SIZE = 64
+    NR = 2
+
+    @pl.program
+    class HostCollectives:
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self,
+            data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
+            signal: pld.DistributedTensor[[NR, 1], pl.INT32],
+        ):
+            pld.tensor.barrier(signal)
+            data = pld.tensor.broadcast(data, signal, root=0)
+            pld.tensor.allgather(data, signal)
+            data = pld.tensor.reduce_scatter(data, signal)
+            return 0
+
+    After = passes.lower_composite_ops()(HostCollectives)
+    op_names = set(_collect_op_names(After))
+
+    for op_name in (
+        "pld.tensor.barrier",
+        "pld.tensor.broadcast",
+        "pld.tensor.allgather",
+        "pld.tensor.reduce_scatter",
+    ):
+        assert op_name in op_names, f"HOST collective {op_name!r} should survive LowerCompositeOps"
+    assert "pld.system.notify" not in op_names
+
+
 def test_allreduce_emits_for_and_if_control_flow():
     """The recipe emits five ForStmts and five IfStmts:
 

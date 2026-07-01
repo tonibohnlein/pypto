@@ -61,12 +61,13 @@ enum class ForKind : uint8_t {
  * @brief Distinguishes different scope kinds
  */
 enum class ScopeKind : uint8_t {
-  InCore = 0,     ///< InCore scope for AICore sub-graphs
-  Cluster = 2,    ///< Cluster scope for co-scheduled AIC + AIV groups
-  Hierarchy = 3,  ///< Distributed hierarchy scope (uses level_/role_ on ScopeStmt)
-  Spmd = 4,       ///< SPMD dispatch scope (core_num/sync_start on ScopeStmt)
-  Runtime = 5,    ///< Runtime orchestration scope (PTO2_SCOPE wrapper, manual on/off)
-  CommDomain = 6  ///< CommDomain scope (with orch.allocate_domain(...) wrapper)
+  InCore = 0,      ///< InCore scope for AICore sub-graphs
+  Cluster = 2,     ///< Cluster scope for co-scheduled AIC + AIV groups
+  Hierarchy = 3,   ///< Distributed hierarchy scope (uses level_/role_ on ScopeStmt)
+  Spmd = 4,        ///< SPMD dispatch scope (core_num/sync_start on ScopeStmt)
+  Runtime = 5,     ///< Runtime orchestration scope (PTO2_SCOPE wrapper, manual on/off)
+  CommDomain = 6,  ///< CommDomain scope (with orch.allocate_domain(...) wrapper)
+  SplitAiv = 7     ///< Explicit AIV-split region (pl.split_aiv, nestable in loops/conditionals)
 };
 
 /**
@@ -177,6 +178,8 @@ inline std::string ScopeKindToString(ScopeKind kind) {
       return "Runtime";
     case ScopeKind::CommDomain:
       return "CommDomain";
+    case ScopeKind::SplitAiv:
+      return "SplitAiv";
   }
   throw pypto::TypeError("Unknown ScopeKind");
 }
@@ -793,6 +796,56 @@ class SpmdScopeStmt : public ScopeStmt {
 };
 
 using SpmdScopeStmtPtr = std::shared_ptr<const SpmdScopeStmt>;
+
+/**
+ * @brief Explicit AIV-split region: `for aiv_id in pl.split_aiv(2, mode=...)`.
+ *
+ * Marks a region dispatched across the 2 AIV subblocks. The mode selects how:
+ *   - `UpDown` / `LeftRight` — *data-parallel*: the region's vector compute is
+ *     halved on the split axis (rows / cols), so each lane processes one half.
+ *   - `None` — *task-parallel*: NO halving. Both lanes run the full body for
+ *     disjoint work the author selects via the `aiv_id` lane index (e.g. an
+ *     `aiv_id`-strided loop). Useful when the region's tiles cannot be halved
+ *     (unit dims) or when a reduction must stay full-width.
+ *
+ * Unlike the legacy whole-InCore-scope split, this is a structural region that
+ * may appear anywhere in an InCore body — inside a pl.range/pl.pipeline loop or
+ * an if. The region body begins with `aiv_id = tile.get_subblock_idx()`. The
+ * node is consumed and erased by LowerAutoVectorSplit (pass 20); never reaches
+ * codegen.
+ */
+class SplitAivScopeStmt : public ScopeStmt {
+ public:
+  SplitAivScopeStmt(SplitMode split, int count, std::string name_hint, StmtPtr body, Span span,
+                    std::vector<std::string> leading_comments = {},
+                    std::vector<std::pair<std::string, std::any>> attrs = {})
+      : ScopeStmt(std::move(name_hint), std::move(body), std::move(span), std::move(leading_comments),
+                  std::move(attrs)),
+        split_(split),
+        count_(count) {
+    // split_ == None is VALID: it marks a task-parallel dual-AIV region (no
+    // halving; both lanes run the full body, dispatched via aiv_id). UpDown /
+    // LeftRight are the data-parallel forms (vector compute halved on the split
+    // axis). count_ is hardware-fixed at 2 (the two AIV lanes of one AICore).
+    INTERNAL_CHECK(count_ == 2) << "SplitAivScopeStmt count must be 2 (AIV sub-core count), got " << count_;
+  }
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::SplitAivScopeStmt; }
+  [[nodiscard]] ScopeKind GetScopeKind() const override { return ScopeKind::SplitAiv; }
+  [[nodiscard]] std::string TypeName() const override { return "SplitAivScopeStmt"; }
+
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(ScopeStmt::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&SplitAivScopeStmt::split_, "split"),
+                                          reflection::UsualField(&SplitAivScopeStmt::count_, "count")));
+  }
+
+ public:
+  SplitMode split_;  ///< None=task-parallel (no halving); UpDown/LeftRight=data-parallel halving
+  int count_;        ///< AIV sub-core count (hardware-fixed at 2)
+};
+
+using SplitAivScopeStmtPtr = std::shared_ptr<const SplitAivScopeStmt>;
 
 /**
  * @brief Runtime orchestration scope: a PTO2_SCOPE wrapper at codegen.

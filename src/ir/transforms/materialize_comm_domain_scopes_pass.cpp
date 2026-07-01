@@ -98,8 +98,8 @@ struct WindowRecord {
   AllocRecord* alloc;
 };
 
-struct AllReduceConsumer {
-  AllocRecord* data_alloc;
+struct CollectiveConsumer {
+  AllocRecord* data_alloc;  ///< nullptr for barrier-only consumers
   AllocRecord* signal_alloc;
   Span span;
 };
@@ -278,29 +278,58 @@ class DispatchAnalyzer : public IRVisitor {
     }
   }
 
-  void AnalyzeAllReduce(const CallPtr& op) {
-    if (!op || !op->op_ || !IsOp(op, "pld.tensor.allreduce")) return;
-    INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
-        << "MaterializeCommDomainScopes: pld.tensor.allreduce expects exactly two args";
-    auto data_var = As<Var>(op->args_[0]);
-    auto signal_var = As<Var>(op->args_[1]);
-    CHECK(data_var && signal_var)
-        << "MaterializeCommDomainScopes: pld.tensor.allreduce arguments must be window view Vars at "
-        << op->span_.to_string();
-    auto data_it = view_to_window_.find(data_var.get());
-    auto signal_it = view_to_window_.find(signal_var.get());
-    CHECK(data_it != view_to_window_.end())
-        << "MaterializeCommDomainScopes: pld.tensor.allreduce data must be produced by pld.tensor.window at "
-        << op->span_.to_string();
-    CHECK(signal_it != view_to_window_.end()) << "MaterializeCommDomainScopes: pld.tensor.allreduce signal "
-                                                 "must be produced by pld.tensor.window at "
-                                              << op->span_.to_string();
-    allreduce_consumers.push_back({data_it->second.alloc, signal_it->second.alloc, op->span_});
+  [[nodiscard]] AllocRecord* ResolveWindowAlloc(const ExprPtr& expr, const std::string& op_name,
+                                                const char* role) {
+    auto view_var = As<Var>(expr);
+    INTERNAL_CHECK_SPAN(view_var, expr->span_)
+        << "MaterializeCommDomainScopes: " << op_name << " " << role << " must be a window view Var";
+    auto it = view_to_window_.find(view_var.get());
+    INTERNAL_CHECK_SPAN(it != view_to_window_.end(), expr->span_)
+        << "MaterializeCommDomainScopes: " << op_name << " " << role
+        << " must be produced by pld.tensor.window";
+    return it->second.alloc;
+  }
+
+  void AnalyzeCollective(const CallPtr& op) {
+    if (!op || !op->op_) return;
+
+    if (IsOp(op, "pld.tensor.allreduce") || IsOp(op, "pld.tensor.broadcast") ||
+        IsOp(op, "pld.tensor.reduce_scatter")) {
+      const auto& op_name = op->op_->name_;
+      INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+          << "MaterializeCommDomainScopes: " << op_name << " expects exactly two args";
+      collective_consumers.push_back({ResolveWindowAlloc(op->args_[0], op_name, "data/target"),
+                                      ResolveWindowAlloc(op->args_[1], op_name, "signal"), op->span_});
+      return;
+    }
+
+    if (IsOp(op, "pld.tensor.barrier")) {
+      INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+          << "MaterializeCommDomainScopes: pld.tensor.barrier expects exactly one arg";
+      collective_consumers.push_back(
+          {nullptr, ResolveWindowAlloc(op->args_[0], "pld.tensor.barrier", "signal"), op->span_});
+      return;
+    }
+
+    if (IsOp(op, "pld.tensor.allgather")) {
+      if (op->args_.size() == 2) {
+        collective_consumers.push_back({ResolveWindowAlloc(op->args_[0], "pld.tensor.allgather", "target"),
+                                        ResolveWindowAlloc(op->args_[1], "pld.tensor.allgather", "signal"),
+                                        op->span_});
+        return;
+      }
+      INTERNAL_CHECK_SPAN(op->args_.size() == 4, op->span_)
+          << "MaterializeCommDomainScopes: pld.tensor.allgather expects 2 args (host builtin) or "
+             "4 args (InCore composite)";
+      collective_consumers.push_back({ResolveWindowAlloc(op->args_[1], "pld.tensor.allgather", "target"),
+                                      ResolveWindowAlloc(op->args_[2], "pld.tensor.allgather", "signal"),
+                                      op->span_});
+    }
   }
 
   void VisitExpr_(const CallPtr& op) override {
     AnalyzeDispatch(op);
-    AnalyzeAllReduce(op);
+    AnalyzeCollective(op);
     IRVisitor::VisitExpr_(op);
   }
 
@@ -311,7 +340,7 @@ class DispatchAnalyzer : public IRVisitor {
     IRVisitor::VisitExpr_(op);
   }
 
-  std::vector<AllReduceConsumer> allreduce_consumers;
+  std::vector<CollectiveConsumer> collective_consumers;
 
  private:
   const std::unordered_map<const Var*, WindowRecord>& view_to_window_;
@@ -380,17 +409,28 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   analyzer.VisitStmt(func->body_);
 
   // Host-level collectives do not carry their own device= selector. Their
-  // signal buffer is a user-visible window slot, so inherit the data buffer's
-  // inferred comm-domain coverage before the dead-allocation check.
-  for (const auto& consumer : analyzer.allreduce_consumers) {
-    INTERNAL_CHECK_SPAN(consumer.data_alloc && consumer.signal_alloc, consumer.span)
-        << "MaterializeCommDomainScopes: invalid pld.tensor.allreduce consumer bookkeeping";
-    CHECK(!consumer.data_alloc->seen.empty())
-        << "MaterializeCommDomainScopes: pld.tensor.allreduce data buffer has no inferred comm-domain "
-           "coverage to share with its signal buffer at "
-        << consumer.span.to_string();
-    consumer.signal_alloc->seen.insert(consumer.signal_alloc->seen.end(), consumer.data_alloc->seen.begin(),
-                                       consumer.data_alloc->seen.end());
+  // signal buffer is a user-visible window slot, so inherit paired data/target
+  // coverage when present. Barrier-only consumers keep signal coverage from
+  // dispatch sites, or fall back to the full comm-domain device set.
+  for (const auto& consumer : analyzer.collective_consumers) {
+    INTERNAL_CHECK_SPAN(consumer.signal_alloc, consumer.span)
+        << "MaterializeCommDomainScopes: invalid collective consumer bookkeeping";
+    if (consumer.data_alloc) {
+      INTERNAL_CHECK_SPAN(!consumer.data_alloc->seen.empty(), consumer.span)
+          << "MaterializeCommDomainScopes: collective data/target buffer has no inferred comm-domain "
+             "coverage to share with its signal buffer";
+      consumer.signal_alloc->seen.insert(consumer.signal_alloc->seen.end(), consumer.data_alloc->seen.begin(),
+                                         consumer.data_alloc->seen.end());
+      continue;
+    }
+    // Barrier-only consumer: if no dispatch sites registered coverage for the
+    // signal window, surface the missing coverage as a user-facing diagnostic
+    // rather than silently widening to the full comm domain (which would cause
+    // a cross-rank hang for device-subset barriers).
+    CHECK_SPAN(!consumer.signal_alloc->seen.empty(), consumer.span)
+        << "MaterializeCommDomainScopes: pld.tensor.barrier signal buffer has no inferred "
+           "comm-domain coverage — add a device= annotation or ensure the signal window "
+           "is consumed by a device-tagged chip dispatch";
   }
 
   // Phase 3: each alloc must have at least one window AND at least one

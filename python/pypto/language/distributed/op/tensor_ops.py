@@ -484,39 +484,45 @@ def broadcast(
 
 
 def allgather(
-    local_data: Tensor,
-    target: DistributedTensor,
-    signal: DistributedTensor,
-    out: Tensor,
-) -> Tensor:
-    """Gather data from all ranks, writing the concatenated result into a user-provided output Tensor.
+    local_data: Tensor | DistributedTensor,
+    target: DistributedTensor | None = None,
+    signal: DistributedTensor | None = None,
+    out: Tensor | None = None,
+) -> Tensor | DistributedTensor:
+    """Gather data from all ranks, either as an InCore composite or HOST builtin.
 
-    ``local_data`` is a plain Tensor [1, SIZE] with this rank's chunk —
-    the intrinsic handles the ``pl.load`` internally.  ``target`` has shape
-    [NR, SIZE] — used internally as a staging window (the intrinsic handles
-    the stage-in).  ``signal`` is a window-bound INT32 barrier tensor.
-    ``out`` is a plain Tensor [1, NR*SIZE] that receives the rank-ordered
-    concatenated result.
+        **InCore composite (4 args):** ``pld.tensor.allgather(local_data, target, signal, out)`` —
+        ``local_data`` is a plain Tensor [1, SIZE] with this rank's chunk.
+        The intrinsic handles ``pl.load``, stage-in, notify/wait, and per-peer
+        ``remote_load`` into ``out``.
 
-    Usage::
+        **HOST builtin (2 args):** ``pld.tensor.allgather(data, signal)`` —
+        each rank's chunk is already staged in ``data[my_rank, :]`` via a prior
+    publish step.  The host lowering emits ``builtin.tensor.barrier`` per chip
+            (the allgather AIV kernel requires concurrent cross-chip dispatch;
+            a barrier synchronises pre-staged window data).
 
-        result = pld.tensor.allgather(inp, data, sig, out)
-        return out  # out now holds [1, NR*SIZE] of gathered data
+        Args:
+            local_data: For InCore: :class:`pl.Tensor` [1, SIZE].  For HOST:
+                window-bound :class:`pld.DistributedTensor` [NR, SIZE] with
+                pre-staged chunks.
+            target: InCore only: :class:`pld.DistributedTensor` [NR, SIZE] staging window.
+            signal: Window-bound INT32 :class:`pld.DistributedTensor` barrier tensor.
+            out: InCore only: :class:`pl.Tensor` [1, NR*SIZE] output.
 
-    Args:
-        local_data: :class:`pl.Tensor` of shape [1, SIZE] — this rank's
-            chunk to gather.  The intrinsic loads it into a tile internally.
-        target: Window-bound :class:`pld.DistributedTensor` of shape
-            [NR, SIZE] used as the internal staging window.
-        signal: Window-bound INT32 :class:`pld.DistributedTensor` for the
-            cross-rank barrier.
-        out: A :class:`pl.Tensor` of shape [1, NR*SIZE] that receives the
-            rank-ordered concatenation of all gathered chunks.
-
-    Returns:
-        The ``out`` :class:`pl.Tensor` containing the gathered result —
-        identical on every rank.
+        Returns:
+            InCore: the ``out`` :class:`pl.Tensor`.  HOST: the rebound
+            :class:`pld.DistributedTensor`.
     """
+    if isinstance(target, DistributedTensor) and signal is None and out is None:
+        # 2-arg HOST builtin path: allgather(data, signal)
+        # Positional mapping: data→local_data, signal→target
+        data_expr, signal_expr = _unwrap_distributed_tensors(
+            "pld.tensor.allgather", target=local_data, signal=target
+        )
+        call = _ir_tensor.allgather(data_expr, signal_expr)
+        return DistributedTensor(expr=call)
+    # 4-arg InCore composite path
     target_expr, signal_expr = _unwrap_distributed_tensors(
         "pld.tensor.allgather", target=target, signal=signal
     )
