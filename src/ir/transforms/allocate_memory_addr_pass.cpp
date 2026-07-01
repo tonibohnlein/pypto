@@ -47,6 +47,7 @@
 #include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/reserve_buffer_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -56,111 +57,8 @@ namespace ir {
 namespace {
 
 using MemRefWithSpace = std::pair<MemRefPtr, MemorySpace>;
-using ReserveBufferBaseMap = std::unordered_map<const Call*, int64_t>;
-using ReservedEndBySpace = std::unordered_map<MemorySpace, uint64_t>;
-
-MemorySpace GetReserveBufferMemorySpace(const FunctionPtr& func) {
-  INTERNAL_CHECK(func) << "AllocateMemoryAddr requires a valid function when resolving reserve_buffer space";
-  switch (func->func_type_) {
-    case FunctionType::AIC:
-      return MemorySpace::Mat;
-    case FunctionType::AIV:
-    case FunctionType::InCore:
-      return MemorySpace::Vec;
-    default:
-      INTERNAL_UNREACHABLE_SPAN(func->span_)
-          << "AllocateMemoryAddr cannot resolve reserve_buffer memory space for function '" << func->name_
-          << "' with type " << FunctionTypeToString(func->func_type_);
-  }
-  return MemorySpace::DDR;
-}
-
-struct ReserveBufferInfo {
-  const Call* call = nullptr;
-  int64_t size = 0;
-  int64_t base = -1;
-};
-
-class ReserveBufferCollector : public IRVisitor {
- public:
-  [[nodiscard]] const std::vector<ReserveBufferInfo>& GetReserveBuffers() const { return reserve_buffers_; }
-
-  void VisitExpr_(const CallPtr& op) override {
-    if (IsOp(op, "system.reserve_buffer")) {
-      const int size = op->GetKwarg<int>("size", -1);
-      const int base = op->GetKwarg<int>("base", -1);
-      INTERNAL_CHECK_SPAN(size > 0, op->span_)
-          << "AllocateMemoryAddr requires reserve_buffer size > 0, got " << size;
-      reserve_buffers_.push_back(
-          ReserveBufferInfo{op.get(), static_cast<int64_t>(size), static_cast<int64_t>(base)});
-    }
-    IRVisitor::VisitExpr_(op);
-  }
-
- private:
-  std::vector<ReserveBufferInfo> reserve_buffers_;
-};
-
-struct ReserveBufferResolution {
-  ReserveBufferBaseMap resolved_bases;
-  ReservedEndBySpace reserved_end_by_space;
-};
-
-ReserveBufferResolution ResolveReserveBufferBases(const FunctionPtr& func,
-                                                  const MemoryAllocatorPolicy& policy) {
-  ReserveBufferResolution resolution;
-  if (!func || !func->body_) return resolution;
-
-  ReserveBufferCollector collector;
-  collector.VisitStmt(func->body_);
-  if (collector.GetReserveBuffers().empty()) return resolution;
-
-  const MemorySpace reserve_space = GetReserveBufferMemorySpace(func);
-
-  std::unordered_map<MemorySpace, uint64_t> next_base_by_space;
-  std::unordered_map<MemorySpace, std::map<uint64_t, uint64_t>> reserved_ranges_by_space;
-  for (const auto& reserve : collector.GetReserveBuffers()) {
-    uint64_t resolved_base = 0;
-    auto& next_base = next_base_by_space[reserve_space];
-    if (reserve.base >= 0) {
-      resolved_base = static_cast<uint64_t>(reserve.base);
-    } else {
-      resolved_base = next_base;
-    }
-
-    INTERNAL_CHECK_SPAN(resolved_base <= static_cast<uint64_t>(std::numeric_limits<int>::max()), func->span_)
-        << "AllocateMemoryAddr resolved reserve_buffer base out of int range in function '" << func->name_
-        << "': " << resolved_base;
-    resolution.resolved_bases[reserve.call] = static_cast<int64_t>(resolved_base);
-
-    const uint64_t buffer_end =
-        policy.AlignAddress(resolved_base + static_cast<uint64_t>(reserve.size), reserve_space);
-    auto& reserved_ranges = reserved_ranges_by_space[reserve_space];
-    auto next_it = reserved_ranges.lower_bound(resolved_base);
-    auto overlaps = [&](const std::pair<const uint64_t, uint64_t>& range) {
-      return resolved_base < range.second && range.first < buffer_end;
-    };
-    INTERNAL_CHECK_SPAN(next_it == reserved_ranges.end() || !overlaps(*next_it), func->span_)
-        << "AllocateMemoryAddr found overlapping reserve_buffer ranges in function '" << func->name_ << "': ["
-        << resolved_base << ", " << buffer_end << ") overlaps with [" << next_it->first << ", "
-        << next_it->second << ")";
-    if (next_it != reserved_ranges.begin()) {
-      auto prev_it = std::prev(next_it);
-      INTERNAL_CHECK_SPAN(!overlaps(*prev_it), func->span_)
-          << "AllocateMemoryAddr found overlapping reserve_buffer ranges in function '" << func->name_
-          << "': [" << resolved_base << ", " << buffer_end << ") overlaps with [" << prev_it->first << ", "
-          << prev_it->second << ")";
-    }
-    reserved_ranges.emplace(resolved_base, buffer_end);
-
-    next_base = std::max(next_base, buffer_end);
-
-    auto& reserved_end = resolution.reserved_end_by_space[reserve_space];
-    reserved_end = std::max(reserved_end, buffer_end);
-  }
-
-  return resolution;
-}
+// ReserveBufferBaseMap / ReservedEndBySpace / ResolveReserveBufferBases now live in the shared
+// reserve_buffer_utils.h so AllocateMemoryAddr and MemoryReuse resolve the reserved region identically.
 
 // Mutator to update MemRef addresses in IR (both variable types and alloc statements)
 class MemRefUpdateMutator : public IRMutator {

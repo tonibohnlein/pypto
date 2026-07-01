@@ -46,6 +46,7 @@
 #include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/reserve_buffer_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -1443,54 +1444,6 @@ bool NeedsLoadTpopHazardGuard(const FunctionPtr& func) {
  * tile intervals (M a subset of the N IR nodes) — same class as the prior
  * greedy implementation.
  */
-// Mirror AllocateMemoryAddr's reserve-buffer resolution to get the per-space *reserved end* — the
-// address where free allocation begins, i.e. the SpaceFootprint reserved_start. `system.reserve_buffer`
-// lives in the function's cross-core space (Mat for AIC, Vec for AIV/InCore); L0 (the #1475 target) has
-// none, so its reserved_start is 0 and the footprint there is already exact. Kept in sync with
-// allocate_memory_addr_pass.cpp's ResolveReserveBufferBases — only the reserved END is needed here.
-class ReserveBufferScanner : public IRVisitor {
- public:
-  std::vector<std::pair<int64_t, int64_t>> reserves;  // (size, base); base < 0 means auto-placed
-  void VisitExpr_(const CallPtr& op) override {
-    if (IsOp(op, "system.reserve_buffer")) {
-      const int size = op->GetKwarg<int>("size", -1);
-      const int base = op->GetKwarg<int>("base", -1);
-      if (size > 0) reserves.emplace_back(static_cast<int64_t>(size), static_cast<int64_t>(base));
-    }
-    IRVisitor::VisitExpr_(op);
-  }
-};
-
-std::map<MemorySpace, uint64_t> ComputeReservedEndBySpace(const FunctionPtr& func,
-                                                          const MemoryAllocatorPolicy& policy) {
-  std::map<MemorySpace, uint64_t> reserved_end;
-  if (!func || !func->body_) return reserved_end;
-  MemorySpace space = MemorySpace::DDR;
-  switch (func->func_type_) {
-    case FunctionType::AIC:
-      space = MemorySpace::Mat;
-      break;
-    case FunctionType::AIV:
-    case FunctionType::InCore:
-      space = MemorySpace::Vec;
-      break;
-    default:
-      return reserved_end;  // other function types have no reserve region
-  }
-  ReserveBufferScanner scanner;
-  scanner.VisitStmt(func->body_);
-  uint64_t next_base = 0;
-  uint64_t end = 0;
-  for (const auto& [size, base] : scanner.reserves) {
-    const uint64_t resolved_base = base >= 0 ? static_cast<uint64_t>(base) : next_base;
-    const uint64_t buffer_end = policy.AlignAddress(resolved_base + static_cast<uint64_t>(size), space);
-    next_base = std::max(next_base, buffer_end);
-    end = std::max(end, buffer_end);
-  }
-  if (end > 0) reserved_end[space] = end;
-  return reserved_end;
-}
-
 std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::vector<LifetimeInterval>& lifetimes, const HazardInputs& hazard,
     const ForbidAliasMap& forbid_alias, const std::map<const Var*, std::set<int>>& phi_family_ids,
@@ -1682,19 +1635,23 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
       for (const int32_t st : group_stages[key]) group_stage_ordinal[key][st] = ordinal++;
     }
   }
+  // `force_legacy` (set by the driver's fallback below) makes the guard behave exactly like the
+  // flag-OFF path for a space whose gated packing overflowed — so the fallback is legacy by construction.
+  bool force_legacy = false;
   auto pipeline_blocks = [&pipeline_membership, &pipeline_load_tiles, &is_l0_space, &group_depth,
-                          &group_stage_ordinal,
+                          &group_stage_ordinal, &force_legacy,
                           capacity_gated](const LifetimeInterval& a, const LifetimeInterval& b) {
     // The binding matmul operands live in L0 and are `tile.move` results, so the legacy guard's
     // `is_l0_space` exemption AND its load-only restriction both skip them — the per-stage operands
     // merge (8 → 1) and the cube matmuls serialize. When the flag is on, protect pipeline operands in
     // every space and regardless of load/move, up to the max-affordable double-buffering depth.
-    if (!capacity_gated && is_l0_space(a.memory_space)) return false;  // legacy: L0 exempt
+    const bool gated = capacity_gated && !force_legacy;
+    if (!gated && is_l0_space(a.memory_space)) return false;  // legacy: L0 exempt
     auto ia = pipeline_membership.find(a.variable.get());
     if (ia == pipeline_membership.end()) return false;
     auto ib = pipeline_membership.find(b.variable.get());
     if (ib == pipeline_membership.end()) return false;
-    if (capacity_gated) {
+    if (gated) {
       // Keep separate iff a shared group's dense stage ordinals fall in different residues mod F_g (the
       // current, possibly-shed, affordable residue count). F_g == 1 ⇒ same residue ⇒ mergeable (legacy).
       // The whole-space fit is decided by the driver's exact SpaceFootprint, not here.
@@ -1820,7 +1777,20 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
             shed_group = key.second;
           }
         }
-        if (!shed_group) break;  // every group already at depth 1 → this is the legacy packing
+        if (!shed_group) {
+          // Every pipeline group is at depth 1 and the space still overflows. FFD is NOT monotone under
+          // the relaxed (F_g==1) predicate — a permitted merge can foreclose a later reuse — so this
+          // packing may be worse than legacy. Re-pack in legacy mode (byte-identical to the flag-OFF
+          // path): that guarantees no fit regression vs flag-OFF; if legacy also overflows it is a
+          // genuine overflow flag-OFF would hit too (AllocateMemoryAddr surfaces it).
+          force_legacy = true;
+          buffers = pack();
+          force_legacy = false;
+          LOG_WARN << "MemoryReuse: capacity-gated reuse could not fit memory space "
+                   << static_cast<int>(space) << " at any double-buffering depth; fell back to the legacy "
+                   << "packing" << (footprint(buffers) > cap ? " (which also overflows)" : "") << ".";
+          break;
+        }
         group_depth[std::make_pair(space, *shed_group)] -= 1;
         buffers = pack();
       }
@@ -2476,7 +2446,11 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   std::map<MemorySpace, uint64_t> reserved_end_by_space;
   if (capacity_gated && backend::BackendConfig::IsConfigured()) {
     auto policy = backend::GetBackend()->CreateMemoryAllocatorPolicy();
-    if (policy) reserved_end_by_space = ComputeReservedEndBySpace(func, *policy);
+    if (policy) {
+      // Shared with AllocateMemoryAddr — the reserved start is parity-by-construction, not comment-synced.
+      const auto resolution = ResolveReserveBufferBases(func, *policy);
+      for (const auto& [space, end] : resolution.reserved_end_by_space) reserved_end_by_space[space] = end;
+    }
   }
   auto reuse_map = IdentifyReuseOpportunities(
       analysis_result.lifetimes, hazard, forbid_alias, analysis_result.phi_family_ids,
