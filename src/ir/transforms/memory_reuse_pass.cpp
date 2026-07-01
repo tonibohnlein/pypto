@@ -1749,10 +1749,11 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
 
     // Graceful cross-group depth shed: while the space's exact allocator footprint (SpaceFootprint,
     // Primitive A) overflows, lower the largest-slot group's depth by one residue and re-pack. Re-running
-    // the FFD (not merging in place) means F_g == 1 reproduces the legacy packing exactly, so this never
-    // overflows where legacy fits — no fallback ladder, no in-place non-monotonicity. ShedScore is
-    // `max_relief` for v1 (largest slot first, tie by lowest group id); the pluggable/benchmarked
-    // objective (and reserved-region start, ignored here) are follow-ups.
+    // the FFD (not merging in place) avoids in-place non-monotonicity, but the FFD is still not monotone
+    // under the *relaxed* (F_g==1) predicate, so exhausting the shed does NOT guarantee a fit: the loop
+    // ends in a from-scratch legacy re-pack + diagnostic (see the `!shed_group` branch below), which
+    // guarantees no fit regression vs flag-OFF. ShedScore is `max_relief` for v1 (largest slot first, tie
+    // by lowest group id); the pluggable/benchmarked objective is a follow-up.
     if (capacity_gated && alloc_policy) {
       const uint64_t cap = pack_be->GetMemSize(space);
       auto rit = reserved_end_by_space.find(space);
