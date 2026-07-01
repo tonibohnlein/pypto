@@ -43,6 +43,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/memory_footprint.h"
 #include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
@@ -309,11 +310,14 @@ std::vector<std::pair<const MemRef*, MemRefPtr>> AllocateMemoryAddresses(
       inserted.first->second.push_back(ref);
     }
 
-    uint64_t current_addr = 0;
+    // The ordering + alignment bump walk lives in SpaceFootprint, shared with MemoryReuse's
+    // capacity fit check so the two footprints are identical by construction (#1475).
+    uint64_t reserved_start = 0;
     auto reserved_it = reserved_end_by_space.find(space);
     if (reserved_it != reserved_end_by_space.end()) {
-      current_addr = reserved_it->second;
+      reserved_start = reserved_it->second;
     }
+    SpaceFootprint footprint(space, policy, reserved_start);
     for (const Var* base_key : base_order) {
       const auto& group = base_groups.at(base_key);
 
@@ -326,6 +330,8 @@ std::vector<std::pair<const MemRef*, MemRefPtr>> AllocateMemoryAddresses(
             << "'. InitMemRef should reject dynamic or invalid allocation shapes before address assignment.";
         slot_size = std::max(slot_size, static_cast<uint64_t>(ref->size_));
       }
+      // Reserve this base-group's physical buffer; base_addr is where its members land.
+      const uint64_t base_addr = footprint.OpenBuffer(slot_size);
 
       // Bump the whole group to `current_addr`, then preserve each member's
       // own offset within the slot: new byte_offset = base_addr + old offset.
@@ -357,8 +363,8 @@ std::vector<std::pair<const MemRef*, MemRefPtr>> AllocateMemoryAddresses(
         }
         // INT64 dtype is required by the PTOAS dialect's `pto.alloc_tile` addr
         // operand; PTO codegen reads this dtype from the ConstInt 1:1.
-        auto member_addr_expr = std::make_shared<ConstInt>(
-            static_cast<int64_t>(current_addr) + relative_offset, DataType::INT64, Span::unknown());
+        auto member_addr_expr = std::make_shared<ConstInt>(static_cast<int64_t>(base_addr) + relative_offset,
+                                                           DataType::INT64, Span::unknown());
         // NOTE: MemRef is identity-bearing — each result must get a fresh
         // unique_id_, so build it via the explicit constructor (MutableCopy is
         // static_assert-forbidden for Var/MemRef).
@@ -366,8 +372,6 @@ std::vector<std::pair<const MemRef*, MemRefPtr>> AllocateMemoryAddresses(
                                                    member_addr_expr, old_memref->size_, old_memref->span_);
         memref_pairs.emplace_back(old_memref.get(), new_memref);
       }
-
-      current_addr = policy.AlignAddress(current_addr + slot_size, space);
     }
   }
 
