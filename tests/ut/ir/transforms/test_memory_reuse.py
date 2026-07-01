@@ -3966,11 +3966,17 @@ class TestCapacityGatedReuse:
         )
 
     def test_on_falls_back_when_coresident_tile_would_overflow(self):
-        """Whole-space footprint safety: two 32 KB pipeline operands fill L0b at depth
-        2 (64 KB) on their own, but a co-resident non-pipeline Right tile pushes the
-        space over 64 KB. The gate counts co-resident tiles, so it falls back to
-        merging — and AllocateMemoryAddr then completes without overflow (the pre-fix
-        pipeline-only footprint would have separated and overflowed)."""
+        """Whole-space footprint safety with the *exact* SpaceFootprint: two 32 KB
+        pipeline operands fill L0b at depth 2 (64 KB) on their own; a **co-live**
+        non-pipeline Right tile ``np0`` (defined before stage 0, used after stage 1)
+        cannot reuse either pipeline buffer, so it adds real capacity and the space
+        overflows. The gate sheds the pipeline group's depth (2 -> 1) so the two
+        operands merge, and AllocateMemoryAddr completes without overflow.
+
+        Note ``np0`` must be *co-live*: a disjoint-lifetime non-pipeline tile would
+        reuse a pipeline buffer for free (the exact footprint sees this), so the
+        operands would correctly stay separated — the old conservative Sum(size)
+        estimate over-counted a disjoint tile as its own buffer."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -3984,11 +3990,23 @@ class TestCapacityGatedReuse:
                 a1: pl.Tensor[[16, 128], pl.BF16],
                 b1: pl.Tensor[[128, 128], pl.BF16],
                 a2: pl.Tensor[[16, 128], pl.BF16],
-                b2: pl.Tensor[[128, 16], pl.BF16],
+                b2: pl.Tensor[[128, 128], pl.BF16],
                 out0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
                 out1: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
-                out2: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
-            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out2: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                # np0 sourced + defined at the top and consumed last, so it is live
+                # across both pipeline stages — a genuine co-resident that cannot reuse.
+                a2m: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a2, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b2m: pl.Tile[[128, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b2, [0, 0], [128, 128], target_memory=pl.Mem.Mat
+                )
+                l2: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(a2m, target_memory=pl.Mem.Left)
+                np0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b2m, target_memory=pl.Mem.Right
+                )
                 a0m: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
                     a0, [0, 0], [16, 128], target_memory=pl.Mem.Mat
                 )
@@ -4013,15 +4031,7 @@ class TestCapacityGatedReuse:
                 )
                 m1: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l1, r1)
                 out1 = pl.store(m1, [0, 0], out1)
-                a2m: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    a2, [0, 0], [16, 128], target_memory=pl.Mem.Mat
-                )
-                b2m: pl.Tile[[128, 16], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    b2, [0, 0], [128, 16], target_memory=pl.Mem.Mat
-                )
-                l2: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(a2m, target_memory=pl.Mem.Left)
-                np0: pl.Tile[[128, 16], pl.BF16, pl.Mem.Right] = pl.tile.move(b2m, target_memory=pl.Mem.Right)
-                m2: pl.Tile[[16, 16], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l2, np0)
+                m2: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l2, np0)
                 out2 = pl.store(m2, [0, 0], out2)
                 return out2
 
