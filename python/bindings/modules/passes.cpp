@@ -269,12 +269,14 @@ void BindPass(nb::module_& m) {
                           "before/after each pass execution. Also controls automatic\n"
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
-      .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet>(),
+      .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
+                    bool>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
+           nb::arg("capacity_gated_reuse") = false,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
-           "and optional disabled diagnostic checks")
+           "disabled diagnostic checks, and the capacity-gated-reuse flag")
       .def("__enter__",
            [](PassContext& self) -> PassContext& {
              self.EnterContext();
@@ -283,6 +285,8 @@ void BindPass(nb::module_& m) {
       .def("__exit__", [](PassContext& self, const nb::args&) { self.ExitContext(); })
       .def("get_verification_level", &PassContext::GetVerificationLevel,
            "Get the verification level for this context")
+      .def("get_capacity_gated_reuse", &PassContext::GetCapacityGatedReuse,
+           "Whether capacity-gated (anti-dependency-aware) reuse is enabled (#1475 L0b fix)")
       .def("get_diagnostic_phase", &PassContext::GetDiagnosticPhase,
            "Get the diagnostic phase gate for this context")
       .def("get_disabled_diagnostics", &PassContext::GetDisabledDiagnostics,

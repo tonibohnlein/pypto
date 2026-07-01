@@ -264,8 +264,10 @@ class PassContext:
         verification_level: VerificationLevel = VerificationLevel.BASIC,
         diagnostic_phase: DiagnosticPhase = DiagnosticPhase.PRE_PIPELINE,
         disabled_diagnostics: DiagnosticCheckSet = ...,  # default: {UnusedControlFlowResult}
+        capacity_gated_reuse: bool = False,
     ) -> None:
-        """Create a PassContext with instruments, verification level, phase, and disabled diagnostics."""
+        """Create a PassContext with instruments, verification level, phase, disabled diagnostics,
+        and the capacity-gated-reuse flag (#1475 L0b fix; off by default)."""
         ...
 
     def __enter__(self) -> PassContext: ...
@@ -277,6 +279,10 @@ class PassContext:
     ) -> None: ...
     def get_verification_level(self) -> VerificationLevel:
         """Get the verification level for this context."""
+        ...
+
+    def get_capacity_gated_reuse(self) -> bool:
+        """Whether capacity-gated (anti-dependency-aware) reuse is enabled (#1475 L0b fix)."""
         ...
 
     def get_diagnostic_phase(self) -> DiagnosticPhase:

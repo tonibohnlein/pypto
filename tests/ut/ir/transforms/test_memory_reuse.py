@@ -3602,5 +3602,246 @@ class TestPipelineStageSeparation:
         )
 
 
+class TestCapacityGatedReuse:
+    """The capacity-gated flag (#1475 L0b fix) keeps cross-stage pipeline operands
+    in separate L0 buffers when the space can afford it — instead of the legacy
+    ``is_l0_space`` exemption that merges them and serialises the matmuls.
+
+    Asserted by the **buffer signature**, not by synchronisation count: OFF the two
+    cross-stage ``Right`` operands share one L0b buffer (the fa_fused 8->1 collapse
+    in miniature); ON they get distinct buffers (the depth-2 ping-pong that shows up
+    downstream as the ``0 A 0 A`` address stream). Per RFC §2a the success metric is
+    WAR distance / overlap, *never* sync-flag count — which actually rises slightly
+    with the second buffer's ping-pong handshake. The operands are ``tile.move``
+    results (not loads), so the legacy load-only guard never protected them either.
+    """
+
+    @staticmethod
+    def _collect_bases(program: ir.Program, names: tuple[str, ...]) -> dict[str, ir.Var]:
+        """MemRef ``base_`` of each named Right operand in the result IR."""
+        func = program.get_function("kernel")
+        assert func is not None
+        bases: dict[str, ir.Var] = {}
+
+        def visit(stmt: ir.Stmt) -> None:
+            if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint in names:
+                t = stmt.var.type
+                assert isinstance(t, ir.TileType) and t.memref is not None
+                bases[stmt.var.name_hint] = t.memref.base_
+            if isinstance(stmt, ir.SeqStmts):
+                for s in stmt.stmts:
+                    visit(s)
+            elif isinstance(stmt, ir.IfStmt):
+                visit(stmt.then_body)
+                if stmt.else_body is not None:
+                    visit(stmt.else_body)
+            elif isinstance(stmt, ir.ForStmt):
+                visit(stmt.body)
+
+        visit(func.body)
+        missing = [n for n in names if n not in bases]
+        assert not missing, f"operands {missing} not found in After IR: {list(bases)}"
+        return bases
+
+    @staticmethod
+    def _two_stage_matmuls() -> ir.Program:
+        """Two matmuls whose Right operands ``r0``/``r1`` are cross-stage pipeline
+        clones (``pipeline_membership`` ``"0:0"`` vs ``"0:1"`` — same group, distinct
+        stage) with disjoint lifetimes: the minimal fa_fused shape. ``[32, 32]`` BF16
+        => 2 KB each, so both fit L0b (64 KB) with room to spare."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a0: pl.Tensor[[32, 32], pl.BF16],
+                b0: pl.Tensor[[32, 32], pl.BF16],
+                a1: pl.Tensor[[32, 32], pl.BF16],
+                b1: pl.Tensor[[32, 32], pl.BF16],
+                out0: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                a0m: pl.Tile[[32, 32], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a0, [0, 0], [32, 32], target_memory=pl.Mem.Mat
+                )
+                b0m: pl.Tile[[32, 32], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b0, [0, 0], [32, 32], target_memory=pl.Mem.Mat
+                )
+                l0: pl.Tile[[32, 32], pl.BF16, pl.Mem.Left] = pl.tile.move(a0m, target_memory=pl.Mem.Left)
+                r0: pl.Tile[[32, 32], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:0"}
+                )
+                m0: pl.Tile[[32, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l0, r0)
+                out0 = pl.store(m0, [0, 0], out0)
+                a1m: pl.Tile[[32, 32], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a1, [0, 0], [32, 32], target_memory=pl.Mem.Mat
+                )
+                b1m: pl.Tile[[32, 32], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b1, [0, 0], [32, 32], target_memory=pl.Mem.Mat
+                )
+                l1: pl.Tile[[32, 32], pl.BF16, pl.Mem.Left] = pl.tile.move(a1m, target_memory=pl.Mem.Left)
+                r1: pl.Tile[[32, 32], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:1"}
+                )
+                m1: pl.Tile[[32, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l1, r1)
+                out1 = pl.store(m1, [0, 0], out1)
+                return out1
+
+        return Before
+
+    def test_off_merges_cross_stage_right_operands(self):
+        """Baseline (flag OFF): the ``is_l0_space`` exemption merges the two
+        cross-stage Right operands into one L0b buffer — the #1475 serialisation."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        Before = self._two_stage_matmuls()
+        After = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        bases = self._collect_bases(After, ("r0", "r1"))
+        assert bases["r0"] is bases["r1"], (
+            "flag OFF should merge cross-stage Right operands (legacy is_l0_space exemption)"
+        )
+
+    def test_on_separates_affordable_cross_stage_right_operands(self):
+        """Flag ON, affordable: L0b (64 KB) holds both 2 KB operands, so the gate
+        keeps them in distinct buffers — the depth-2 ping-pong. This is the ON->2
+        vs OFF->1 address signature (the ``0 A 0 A`` stream) the fix produces."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        Before = self._two_stage_matmuls()
+        with passes.PassContext([], capacity_gated_reuse=True):
+            After = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        bases = self._collect_bases(After, ("r0", "r1"))
+        assert bases["r0"] is not bases["r1"], (
+            "flag ON should keep affordable cross-stage Right operands in separate L0b buffers"
+        )
+
+    def test_on_merges_when_slot_too_large_to_double_buffer(self):
+        """Flag ON, slot too large to double-buffer: each 48 KB Right operand leaves
+        room for only k = min(2, floor(64/48)) = 1 buffer in the 64 KB L0b, so the two
+        stages share it (depth-1). Depth-2 would need 96 KB > 64 KB. This is the
+        capacity-pinned projection behaviour, preventing the overflow that blind
+        separation would cause."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a0: pl.Tensor[[16, 128], pl.BF16],
+                b0: pl.Tensor[[128, 192], pl.BF16],
+                a1: pl.Tensor[[16, 128], pl.BF16],
+                b1: pl.Tensor[[128, 192], pl.BF16],
+                out0: pl.Out[pl.Tensor[[16, 192], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[16, 192], pl.FP32]],
+            ) -> pl.Tensor[[16, 192], pl.FP32]:
+                a0m: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a0, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b0m: pl.Tile[[128, 192], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b0, [0, 0], [128, 192], target_memory=pl.Mem.Mat
+                )
+                l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(a0m, target_memory=pl.Mem.Left)
+                r0: pl.Tile[[128, 192], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:0"}
+                )
+                m0: pl.Tile[[16, 192], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l0, r0)
+                out0 = pl.store(m0, [0, 0], out0)
+                a1m: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a1, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b1m: pl.Tile[[128, 192], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b1, [0, 0], [128, 192], target_memory=pl.Mem.Mat
+                )
+                l1: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(a1m, target_memory=pl.Mem.Left)
+                r1: pl.Tile[[128, 192], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:1"}
+                )
+                m1: pl.Tile[[16, 192], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l1, r1)
+                out1 = pl.store(m1, [0, 0], out1)
+                return out1
+
+        with passes.PassContext([], capacity_gated_reuse=True):
+            After = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        bases = self._collect_bases(After, ("r0", "r1"))
+        assert bases["r0"] is bases["r1"], (
+            "L0b that fits only one 48 KB buffer (k=1) must merge the two stages even with flag ON"
+        )
+
+    def test_on_finds_max_affordable_double_buffer_depth(self):
+        """Flag ON, depth-aware: a 3-stage group whose full separation (3 x 32 = 96 KB)
+        exceeds L0b (64 KB) is capped to the max-affordable double-buffering depth
+        k = min(3, floor(64/32)) = 2 — NOT collapsed to depth-1. The stages ping-pong
+        through 2 buffers (stage mod 2): r0 and r2 share, r1 is separate. This is the
+        proper modulo-variable-expansion an all-or-nothing gate would miss."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a0: pl.Tensor[[16, 128], pl.BF16],
+                b0: pl.Tensor[[128, 128], pl.BF16],
+                a1: pl.Tensor[[16, 128], pl.BF16],
+                b1: pl.Tensor[[128, 128], pl.BF16],
+                a2: pl.Tensor[[16, 128], pl.BF16],
+                b2: pl.Tensor[[128, 128], pl.BF16],
+                out0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+                out2: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                a0m: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a0, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b0m: pl.Tile[[128, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b0, [0, 0], [128, 128], target_memory=pl.Mem.Mat
+                )
+                l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(a0m, target_memory=pl.Mem.Left)
+                r0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:0"}
+                )
+                m0: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l0, r0)
+                out0 = pl.store(m0, [0, 0], out0)
+                a1m: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a1, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b1m: pl.Tile[[128, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b1, [0, 0], [128, 128], target_memory=pl.Mem.Mat
+                )
+                l1: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(a1m, target_memory=pl.Mem.Left)
+                r1: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:1"}
+                )
+                m1: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l1, r1)
+                out1 = pl.store(m1, [0, 0], out1)
+                a2m: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a2, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b2m: pl.Tile[[128, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b2, [0, 0], [128, 128], target_memory=pl.Mem.Mat
+                )
+                l2: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(a2m, target_memory=pl.Mem.Left)
+                r2: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b2m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:2"}
+                )
+                m2: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(l2, r2)
+                out2 = pl.store(m2, [0, 0], out2)
+                return out2
+
+        with passes.PassContext([], capacity_gated_reuse=True):
+            After = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        bases = self._collect_bases(After, ("r0", "r1", "r2"))
+        distinct = {b.name_hint for b in bases.values()}
+        assert len(distinct) == 2, (
+            f"depth-aware gate must keep the max-affordable depth-2 (2 buffers), got {len(distinct)}: {distinct}"
+        )
+        assert bases["r0"] is bases["r2"], "stages 0 and 2 (0 mod 2 == 2 mod 2) must share a ping-pong buffer"
+        assert bases["r0"] is not bases["r1"], "stages 0 and 1 must occupy different ping-pong buffers"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

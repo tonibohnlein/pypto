@@ -250,7 +250,8 @@ class PassContext {
   explicit PassContext(std::vector<PassInstrumentPtr> instruments,
                        VerificationLevel verification_level = VerificationLevel::Basic,
                        DiagnosticPhase diagnostic_phase = DiagnosticPhase::PrePipeline,
-                       DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult});
+                       DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
+                       bool capacity_gated_reuse = false);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -282,6 +283,15 @@ class PassContext {
    * @brief Get the verification level for this context
    */
   [[nodiscard]] VerificationLevel GetVerificationLevel() const;
+
+  /**
+   * @brief Whether capacity-gated (anti-dependency-aware) reuse is enabled for
+   *        this context. When false (default), `MemoryReuse` uses the legacy
+   *        maximal-merge packer. When true, it keeps cross-stage pipeline
+   *        operands in separate buffers up to each space's capacity (fixes the
+   *        L0b half of #1475). Dark-launch flag — off by default.
+   */
+  [[nodiscard]] bool GetCapacityGatedReuse() const;
 
   /**
    * @brief Get the diagnostic phase gate for this context.
@@ -327,6 +337,7 @@ class PassContext {
   VerificationLevel verification_level_;
   DiagnosticPhase diagnostic_phase_;
   DiagnosticCheckSet disabled_diagnostics_;
+  bool capacity_gated_reuse_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;
