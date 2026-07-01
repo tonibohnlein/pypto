@@ -4323,6 +4323,70 @@ class TestCapacityGatedReuse:
         allocated = passes.allocate_memory_addr()(after)
         assert allocated.get_function("kernel") is not None
 
+    def test_on_reserved_region_reduces_available_capacity(self):
+        """The fit check begins free allocation at reserved_start — the top of any
+        system.reserve_buffer region — matching AllocateMemoryAddr. Two 48 KB Vec
+        pipeline operands fit at depth 2 (96 KB) on their own, but a 128 KB reserved
+        buffer leaves too little Vec room, so the gate sheds them to a shared buffer.
+        Without the reserve they stay separate: the only difference is the
+        reserved_start accounting. (reserve_buffer lives in Vec for InCore functions;
+        L0 — the #1475 L0b target — has no reserve region, so it is unaffected.)"""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class WithReserve:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x0: pl.Tensor[[128, 96], pl.FP32],
+                x1: pl.Tensor[[128, 96], pl.FP32],
+                out0: pl.Out[pl.Tensor[[128, 96], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[128, 96], pl.FP32]],
+            ) -> pl.Tensor[[128, 96], pl.FP32]:
+                pl.reserve_buffer(name="scratch", size=131072)
+                r0: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    x0, [0, 0], [128, 96], target_memory=pl.Mem.Vec, attrs={"pipeline_membership": "0:0"}
+                )
+                s0: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.add(r0, r0)
+                out0 = pl.store(s0, [0, 0], out0)
+                r1: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    x1, [0, 0], [128, 96], target_memory=pl.Mem.Vec, attrs={"pipeline_membership": "0:1"}
+                )
+                s1: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.add(r1, r1)
+                out1 = pl.store(s1, [0, 0], out1)
+                return out1
+
+        @pl.program
+        class NoReserve:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x0: pl.Tensor[[128, 96], pl.FP32],
+                x1: pl.Tensor[[128, 96], pl.FP32],
+                out0: pl.Out[pl.Tensor[[128, 96], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[128, 96], pl.FP32]],
+            ) -> pl.Tensor[[128, 96], pl.FP32]:
+                r0: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    x0, [0, 0], [128, 96], target_memory=pl.Mem.Vec, attrs={"pipeline_membership": "0:0"}
+                )
+                s0: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.add(r0, r0)
+                out0 = pl.store(s0, [0, 0], out0)
+                r1: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    x1, [0, 0], [128, 96], target_memory=pl.Mem.Vec, attrs={"pipeline_membership": "0:1"}
+                )
+                s1: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.add(r1, r1)
+                out1 = pl.store(s1, [0, 0], out1)
+                return out1
+
+        with passes.PassContext([], capacity_gated_reuse=True):
+            no_r = self._collect_bases(passes.memory_reuse()(passes.init_mem_ref()(NoReserve)), ("r0", "r1"))
+            with_r = self._collect_bases(
+                passes.memory_reuse()(passes.init_mem_ref()(WithReserve)), ("r0", "r1")
+            )
+        assert no_r["r0"] is not no_r["r1"], "without the reserve, 96 KB of Vec operands fit at depth 2"
+        assert with_r["r0"] is with_r["r1"], "the 128 KB reserve reduces free Vec room, forcing the merge"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

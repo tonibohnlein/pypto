@@ -1444,13 +1444,62 @@ bool NeedsLoadTpopHazardGuard(const FunctionPtr& func) {
  * tile intervals (M a subset of the N IR nodes) — same class as the prior
  * greedy implementation.
  */
+// Mirror AllocateMemoryAddr's reserve-buffer resolution to get the per-space *reserved end* — the
+// address where free allocation begins, i.e. the SpaceFootprint reserved_start. `system.reserve_buffer`
+// lives in the function's cross-core space (Mat for AIC, Vec for AIV/InCore); L0 (the #1475 target) has
+// none, so its reserved_start is 0 and the footprint there is already exact. Kept in sync with
+// allocate_memory_addr_pass.cpp's ResolveReserveBufferBases — only the reserved END is needed here.
+class ReserveBufferScanner : public IRVisitor {
+ public:
+  std::vector<std::pair<int64_t, int64_t>> reserves;  // (size, base); base < 0 means auto-placed
+  void VisitExpr_(const CallPtr& op) override {
+    if (IsOp(op, "system.reserve_buffer")) {
+      const int size = op->GetKwarg<int>("size", -1);
+      const int base = op->GetKwarg<int>("base", -1);
+      if (size > 0) reserves.emplace_back(static_cast<int64_t>(size), static_cast<int64_t>(base));
+    }
+    IRVisitor::VisitExpr_(op);
+  }
+};
+
+std::map<MemorySpace, uint64_t> ComputeReservedEndBySpace(const FunctionPtr& func,
+                                                          const MemoryAllocatorPolicy& policy) {
+  std::map<MemorySpace, uint64_t> reserved_end;
+  if (!func || !func->body_) return reserved_end;
+  MemorySpace space = MemorySpace::DDR;
+  switch (func->func_type_) {
+    case FunctionType::AIC:
+      space = MemorySpace::Mat;
+      break;
+    case FunctionType::AIV:
+    case FunctionType::InCore:
+      space = MemorySpace::Vec;
+      break;
+    default:
+      return reserved_end;  // other function types have no reserve region
+  }
+  ReserveBufferScanner scanner;
+  scanner.VisitStmt(func->body_);
+  uint64_t next_base = 0;
+  uint64_t end = 0;
+  for (const auto& [size, base] : scanner.reserves) {
+    const uint64_t resolved_base = base >= 0 ? static_cast<uint64_t>(base) : next_base;
+    const uint64_t buffer_end = policy.AlignAddress(resolved_base + static_cast<uint64_t>(size), space);
+    next_base = std::max(next_base, buffer_end);
+    end = std::max(end, buffer_end);
+  }
+  if (end > 0) reserved_end[space] = end;
+  return reserved_end;
+}
+
 std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::vector<LifetimeInterval>& lifetimes, const HazardInputs& hazard,
     const ForbidAliasMap& forbid_alias, const std::map<const Var*, std::set<int>>& phi_family_ids,
     const std::map<VarPtr, std::vector<VarPtr>>& sharing_groups,
     const std::map<const Var*, std::pair<int, int>>& var_liveness,
     const std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>>& pipeline_membership,
-    const std::set<const Var*>& pipeline_load_tiles, bool capacity_gated) {
+    const std::set<const Var*>& pipeline_load_tiles, bool capacity_gated,
+    const std::map<MemorySpace, uint64_t>& reserved_end_by_space) {
   std::map<VarPtr, VarPtr> reuse_map;
 
   // Members of a sharing group (the vars that already physically share one base).
@@ -1750,8 +1799,10 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     // objective (and reserved-region start, ignored here) are follow-ups.
     if (capacity_gated && alloc_policy) {
       const uint64_t cap = pack_be->GetMemSize(space);
+      auto rit = reserved_end_by_space.find(space);
+      const uint64_t reserved_start = rit != reserved_end_by_space.end() ? rit->second : 0;
       auto footprint = [&](const std::vector<std::vector<size_t>>& bufs) {
-        SpaceFootprint fp(space, *alloc_policy);
+        SpaceFootprint fp(space, *alloc_policy, reserved_start);
         for (const auto& buf : bufs) {
           uint64_t slot = 0;
           for (size_t idx : buf) slot = std::max(slot, lifetimes[idx].size);
@@ -2423,10 +2474,17 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   // active — a rollout crutch to be removed once the flag is wired through the compile entry points.
   const bool capacity_gated =
       ctx != nullptr ? ctx->GetCapacityGatedReuse() : std::getenv("PYPTO_CAPACITY_GATED_REUSE") != nullptr;
+  // Per-space reserved end (the SpaceFootprint reserved_start for the exact fit check). Only meaningful
+  // on the gated path with a configured backend; empty otherwise ⇒ reserved_start defaults to 0.
+  std::map<MemorySpace, uint64_t> reserved_end_by_space;
+  if (capacity_gated && backend::BackendConfig::IsConfigured()) {
+    auto policy = backend::GetBackend()->CreateMemoryAllocatorPolicy();
+    if (policy) reserved_end_by_space = ComputeReservedEndBySpace(func, *policy);
+  }
   auto reuse_map = IdentifyReuseOpportunities(
       analysis_result.lifetimes, hazard, forbid_alias, analysis_result.phi_family_ids,
       analysis_result.var_sharing_groups, analysis_result.var_liveness, analysis_result.pipeline_membership,
-      analysis_result.pipeline_load_tiles, capacity_gated);
+      analysis_result.pipeline_load_tiles, capacity_gated, reserved_end_by_space);
 
   // Step 3: Apply MemRef sharing (skip if no reuse candidates)
   if (!reuse_map.empty()) {
