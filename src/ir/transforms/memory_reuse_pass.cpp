@@ -14,6 +14,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <memory>
@@ -1599,20 +1600,29 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   // tags give each operand its (group, stage). Rather than an all-or-nothing "separate every stage or
   // none" test, pick the *max-affordable double-buffering depth* per group — the modulo-variable-
   // expansion factor k_g = min(D_g, ⌊C_s / slot_g⌋): with k_g physical buffers the stages ping-pong
-  // through them (stage mod k_g), so consecutive stages never collide yet the footprint stays ≤ C_s.
-  //   • fa_fused (1 group, D=2, 32 KB, L0b 64 KB): k = min(2, 2) = 2 → full depth-2 ping-pong.
-  //   • a 3-stage group in the same 64 KB: k = min(3, 2) = 2 → depth-2 (stage0≡stage2, stage1 apart),
-  //     NOT the depth-1 collapse an all-or-nothing afford/deny test produces.
-  // Safety: apply depth-capping only where the capped footprint Σ_g k_g·slot_g fits (single-group
-  // spaces always do); otherwise fall back to merging (conservative, never overflows). The remaining
-  // gaps — a greedy shrink that maximizes depth across *concurrent* groups under pressure (RFC §6),
-  // and liveness so *sequential* groups time-share the space — are follow-ups.
-  std::map<MemorySpace, bool> space_depth_gated;                   // depth-capping fits this space
+  // through them (dense-stage-ordinal mod k_g), so consecutive stages never collide while the footprint
+  // stays within C_s. fa_fused (1 group, D=2, 32 KB, L0b 64 KB) → k = 2 (full depth-2); a 3-stage group
+  // in the same 64 KB → k = 2 (stage0≡stage2, stage1 apart), not the depth-1 an all-or-nothing collapse.
+  //
+  // Feasibility: gate a space only when its *whole-space* upper-bound footprint fits a *known* bound —
+  // Σ over pipeline groups of k_g·slot_g PLUS every co-resident non-pipeline tile at its own size (an
+  // upper bound on the FFD-packed footprint, since merging only shrinks it). Counting the co-resident
+  // tiles the earlier pipeline-only sum ignored means separating the operands can no longer silently
+  // overflow a space that also holds non-pipeline buffers. Caveats, all conservative (fall back, never
+  // overflow): a missing/zero capacity is treated as *unknown* → not gated (merge), not "unbounded";
+  // the bound ignores inter-buffer *alignment* padding (exact only for aligned slots such as the
+  // 64-aligned 32 KB L0 tiles) — Phase-1's OrderedBumpWalk shared with AllocateMemoryAddr closes that
+  // residual before the flag defaults on; and one per-space fit/merge decision does not yet do the
+  // RFC §6 greedy shrink across *concurrent* groups nor liveness time-sharing for *sequential* ones.
+  std::map<MemorySpace, bool> space_depth_gated;                   // whole-space footprint fits a known bound
   std::map<std::pair<MemorySpace, int32_t>, int32_t> group_depth;  // (space, group) -> k_g
+  std::map<std::pair<MemorySpace, int32_t>, std::map<int32_t, int32_t>>
+      group_stage_ordinal;  // stage -> ordinal
   if (capacity_gated) {
     const backend::Backend* be = backend::BackendConfig::IsConfigured() ? backend::GetBackend() : nullptr;
-    std::map<std::pair<MemorySpace, int32_t>, uint64_t> group_slot;             // (space,group)->max tile
-    std::map<std::pair<MemorySpace, int32_t>, std::set<int32_t>> group_stages;  // (space,group)->stages
+    // 1. Gather each pipeline group's slot size (max tile) and its stage set.
+    std::map<std::pair<MemorySpace, int32_t>, uint64_t> group_slot;
+    std::map<std::pair<MemorySpace, int32_t>, std::set<int32_t>> group_stages;
     for (const auto& iv : lifetimes) {
       auto it = pipeline_membership.find(iv.variable.get());
       if (it == pipeline_membership.end()) continue;
@@ -1622,27 +1632,39 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
         group_stages[key].insert(st);
       }
     }
-    std::map<MemorySpace, uint64_t> capped_footprint;
+    // 2. Per group: max-affordable depth k_g and a dense stage->ordinal map (stages may be sparse, so
+    //    the guard compares `ordinal mod k`, not `stage mod k`). Accumulate k_g·slot per space.
+    std::map<MemorySpace, uint64_t> space_footprint;
     std::set<MemorySpace> spaces_seen;
     for (const auto& [key, slot] : group_slot) {
       const MemorySpace space = key.first;
       spaces_seen.insert(space);
       const uint64_t cap = be ? be->GetMemSize(space) : 0;
       const int32_t depth = static_cast<int32_t>(group_stages[key].size());
-      int32_t k = depth;  // cap == 0 (unbounded / no backend) keeps full depth
+      int32_t k = depth;
       if (cap != 0 && slot != 0) {
         k = std::min(depth, std::max<int32_t>(1, static_cast<int32_t>(cap / slot)));
       }
       group_depth[key] = k;
-      capped_footprint[space] += static_cast<uint64_t>(k) * slot;
+      int32_t ordinal = 0;
+      for (const int32_t st : group_stages[key]) group_stage_ordinal[key][st] = ordinal++;
+      space_footprint[space] += static_cast<uint64_t>(k) * slot;
     }
+    // 3. Add every co-resident *non-pipeline* tile (each as its own buffer — an upper bound over FFD
+    //    reuse) so the fit check reflects the whole space, not just the pipeline operands.
+    for (const auto& iv : lifetimes) {
+      if (pipeline_membership.count(iv.variable.get()) != 0) continue;
+      if (spaces_seen.count(iv.memory_space) == 0) continue;
+      space_footprint[iv.memory_space] += iv.size;
+    }
+    // 4. Gate a space only when its capacity is *known* (cap != 0) and the upper-bound footprint fits.
     for (const MemorySpace space : spaces_seen) {
       const uint64_t cap = be ? be->GetMemSize(space) : 0;
-      space_depth_gated[space] = (cap == 0) || (capped_footprint[space] <= cap);
+      space_depth_gated[space] = (cap != 0) && (space_footprint[space] <= cap);
     }
   }
   auto pipeline_blocks = [&pipeline_membership, &pipeline_load_tiles, &is_l0_space, &space_depth_gated,
-                          &group_depth,
+                          &group_depth, &group_stage_ordinal,
                           capacity_gated](const LifetimeInterval& a, const LifetimeInterval& b) {
     // The binding matmul operands live in L0 and are `tile.move` results, so the legacy guard's
     // `is_l0_space` exemption AND its load-only restriction both skip them — the per-stage operands
@@ -1655,15 +1677,26 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     if (ib == pipeline_membership.end()) return false;
     if (capacity_gated) {
       auto sg = space_depth_gated.find(a.memory_space);
-      if (sg == space_depth_gated.end() || !sg->second) return false;  // space can't afford it → merge
+      if (sg == space_depth_gated.end() || !sg->second) return false;  // space not depth-gated → merge
       // Keep separate iff, for a shared group, the two stages land in different physical ping-pong
-      // buffers (stage mod k_g differ). Same slot (or no shared group) → mergeable.
+      // buffers — compared on the group's *dense stage ordinal* mod k_g (stage IDs may be sparse, so
+      // raw `stage mod k` could alias two distinct stages onto one residue). No shared group → merge.
       for (const auto& [ga, sa] : ia->second) {
         for (const auto& [gb, sb] : ib->second) {
           if (ga != gb) continue;
-          auto dit = group_depth.find({a.memory_space, ga});
+          const auto key = std::make_pair(a.memory_space, ga);
+          auto dit = group_depth.find(key);
           const int32_t k = (dit != group_depth.end() && dit->second > 0) ? dit->second : 1;
-          if (((sa % k) + k) % k != ((sb % k) + k) % k) return true;  // different buffer → separate
+          int32_t ra = sa;
+          int32_t rb = sb;
+          auto omit = group_stage_ordinal.find(key);
+          if (omit != group_stage_ordinal.end()) {
+            auto oa = omit->second.find(sa);
+            if (oa != omit->second.end()) ra = oa->second;
+            auto ob = omit->second.find(sb);
+            if (ob != omit->second.end()) rb = ob->second;
+          }
+          if (((ra % k) + k) % k != ((rb % k) + k) % k) return true;  // different buffer → separate
         }
       }
       return false;
@@ -2371,10 +2404,11 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   ForbidAliasMap forbid_alias = forbid_collector.Take();
 
   const auto* ctx = PassContext::Current();
-  // Env override provides a default for testing / rollout (pass-context-config.md: env vars are
-  // defaults, PassContext overrides). Remove once the flag is wired through the compile entry points.
-  const bool capacity_gated = (ctx != nullptr && ctx->GetCapacityGatedReuse()) ||
-                              std::getenv("PYPTO_CAPACITY_GATED_REUSE") != nullptr;
+  // PassContext is authoritative when present (pass-context-config.md: an env var is only the default,
+  // the context overrides it). The env var is a dark-launch default consulted *only* when no context is
+  // active — a rollout crutch to be removed once the flag is wired through the compile entry points.
+  const bool capacity_gated =
+      ctx != nullptr ? ctx->GetCapacityGatedReuse() : std::getenv("PYPTO_CAPACITY_GATED_REUSE") != nullptr;
   auto reuse_map = IdentifyReuseOpportunities(
       analysis_result.lifetimes, hazard, forbid_alias, analysis_result.phi_family_ids,
       analysis_result.var_sharing_groups, analysis_result.var_liveness, analysis_result.pipeline_membership,
