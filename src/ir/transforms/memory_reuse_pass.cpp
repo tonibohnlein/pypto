@@ -14,7 +14,6 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <functional>
 #include <map>
 #include <memory>
@@ -2469,11 +2468,9 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   ForbidAliasMap forbid_alias = forbid_collector.Take();
 
   const auto* ctx = PassContext::Current();
-  // PassContext is authoritative when present (pass-context-config.md: an env var is only the default,
-  // the context overrides it). The env var is a dark-launch default consulted *only* when no context is
-  // active — a rollout crutch to be removed once the flag is wired through the compile entry points.
-  const bool capacity_gated =
-      ctx != nullptr ? ctx->GetCapacityGatedReuse() : std::getenv("PYPTO_CAPACITY_GATED_REUSE") != nullptr;
+  // Activation is via PassContext only, propagated through compile()/run_passes (Phase 0). There is no
+  // env-var escape hatch: once propagation was wired it was dead for real compiles anyway.
+  const bool capacity_gated = ctx != nullptr && ctx->GetCapacityGatedReuse();
   // Per-space reserved end (the SpaceFootprint reserved_start for the exact fit check). Only meaningful
   // on the gated path with a configured backend; empty otherwise ⇒ reserved_start defaults to 0.
   std::map<MemorySpace, uint64_t> reserved_end_by_space;

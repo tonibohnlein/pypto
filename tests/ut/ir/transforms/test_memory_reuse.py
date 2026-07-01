@@ -3845,24 +3845,6 @@ class TestCapacityGatedReuse:
         assert bases["r0"] is bases["r2"], "stages 0 and 2 (0 mod 2 == 2 mod 2) must share a ping-pong buffer"
         assert bases["r0"] is not bases["r1"], "stages 0 and 1 must occupy different ping-pong buffers"
 
-    @pytest.fixture(autouse=True)
-    def _scrub_env(self, monkeypatch):
-        """The env var is a process-global dark-launch override; scrub it so these
-        tests are driven only by the explicit PassContext flag (no cross-test leak)."""
-        monkeypatch.delenv("PYPTO_CAPACITY_GATED_REUSE", raising=False)
-
-    def test_passcontext_false_overrides_env_var(self, monkeypatch):
-        """PassContext is authoritative: an explicit capacity_gated_reuse=False wins
-        even when PYPTO_CAPACITY_GATED_REUSE is set (env is only the no-context default)."""
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-        monkeypatch.setenv("PYPTO_CAPACITY_GATED_REUSE", "1")
-        Before = self._two_stage_matmuls()
-        with passes.PassContext([], capacity_gated_reuse=False):
-            After = passes.memory_reuse()(passes.init_mem_ref()(Before))
-        bases = self._collect_bases(After, ("r0", "r1"))
-        assert bases["r0"] is bases["r1"], "PassContext(False) must override the env var (legacy merge)"
-
     def test_on_merges_same_stage_operands(self):
         """Within-stage coalescing (the other half of the §5 tie-break): two operands
         tagged the SAME (group, stage) map to the same ping-pong residue, so they merge
