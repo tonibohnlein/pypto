@@ -16,11 +16,14 @@ This aligns MemRef objects consistently: if two tiles share a MemRef in
 ``After``, the corresponding tiles in ``Expected`` must also share.
 """
 
+import tempfile
+
 import pypto.language as pl
 import pytest
 from pypto import DataType, backend, ir, passes
 from pypto.backend import BackendType
 from pypto.ir.op import tile
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
 def _run_pipeline(program: ir.Program) -> ir.Program:
@@ -4041,6 +4044,83 @@ class TestCapacityGatedReuse:
             second = self._collect_bases(passes.memory_reuse()(passes.init_mem_ref()(Before)), ("r0", "r1"))
         assert (first["r0"] is first["r1"]) == (second["r0"] is second["r1"])
         assert {b.name_hint for b in first.values()} == {b.name_hint for b in second.values()}
+
+    def test_flag_propagates_through_run_passes(self):
+        """The flag must reach MemoryReuse through ``run_passes``' *nested* PassContext
+        (the compile()/dump path), not only when the pass is invoked directly. Guards
+        the compile.py + pass_manager.py propagation wiring — without it an outer
+        ``PassContext(capacity_gated_reuse=True)`` is silently dropped by the fresh
+        context ``run_passes`` builds. White-box: swaps in a minimal 2-pass pipeline."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        def minimal_pm() -> PassManager:
+            pm = PassManager.get_strategy(OptimizationStrategy.Default)
+            pipeline = passes.PassPipeline()
+            pipeline.add_pass(passes.init_mem_ref())
+            pipeline.add_pass(passes.memory_reuse())
+            pm._pipeline = pipeline
+            pm.pass_names = ["InitMemRef", "MemoryReuse"]
+            return pm
+
+        # No outer context ⇒ flag off ⇒ legacy merge.
+        off = self._collect_bases(
+            minimal_pm().run_passes(self._two_stage_matmuls(), dump_ir=True, output_dir=tempfile.mkdtemp()),
+            ("r0", "r1"),
+        )
+        assert off["r0"] is off["r1"], "no context should leave the legacy merge"
+        # Outer PassContext(True) must propagate through run_passes' nested context.
+        with passes.PassContext([], capacity_gated_reuse=True):
+            on = self._collect_bases(
+                minimal_pm().run_passes(
+                    self._two_stage_matmuls(), dump_ir=True, output_dir=tempfile.mkdtemp()
+                ),
+                ("r0", "r1"),
+            )
+        assert on["r0"] is not on["r1"], "outer PassContext(True) must reach MemoryReuse via run_passes"
+
+    def test_flag_on_composes_with_matmul_acc_carry(self):
+        """RFC §8 carry composition (#1352): the gate only ever *adds* separation and
+        excludes loop carries from the packer, so enabling the flag must not disturb a
+        matmul_acc accumulator chain. With untagged operands the gated path is the
+        fallback path, so flag-ON output is structurally identical to flag-OFF."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[32, 32], pl.FP16],
+                input_b: pl.Tensor[[32, 32], pl.FP16],
+                output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                tile_a_l1: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    input_a, [0, 0], [32, 32], target_memory=pl.MemorySpace.Mat
+                )
+                tile_b_l1: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    input_b, [0, 0], [32, 32], target_memory=pl.MemorySpace.Mat
+                )
+                tile_a_l0a: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Left] = pl.move(
+                    tile_a_l1, target_memory=pl.MemorySpace.Left
+                )
+                tile_b_l0b: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Right] = pl.move(
+                    tile_b_l1, target_memory=pl.MemorySpace.Right
+                )
+                init_acc: pl.Tile[[32, 32], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(tile_a_l0a, tile_b_l0b)
+                for _k, (acc,) in pl.range(0, 4, init_values=(init_acc,)):
+                    acc_next: pl.Tile[[32, 32], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(
+                        acc, tile_a_l0a, tile_b_l0b
+                    )
+                    loop_out = pl.yield_(acc_next)
+                result: pl.Tensor[[32, 32], pl.FP32] = pl.store(loop_out, [0, 0], output)
+                return result
+
+        after_off = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        with passes.PassContext([], capacity_gated_reuse=True):
+            after_on = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        ir.assert_structural_equal(after_on, after_off)
 
 
 if __name__ == "__main__":

@@ -187,7 +187,11 @@ def compile(  # noqa: PLR0913
         )
         dphase = diagnostic_phase if diagnostic_phase is not None else _passes.get_default_diagnostic_phase()
         disabled = disabled_diagnostics if disabled_diagnostics is not None else default_disabled
-    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled)
+    # Inherit the capacity-gated-reuse flag from the outer context so a caller can enable it via
+    # ``with PassContext(capacity_gated_reuse=True): compile(...)`` (#1475). compile() builds its own
+    # context here, so without this the outer flag would be silently dropped.
+    cap_gated = outer.get_capacity_gated_reuse() if outer is not None else False
+    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled, capacity_gated_reuse=cap_gated)
 
     def _stage(name: str) -> AbstractContextManager[Any]:
         if prof is not None:

@@ -386,7 +386,14 @@ class PassManager:
         else:
             inner_phase = outer_phase
 
-        with passes.PassContext([*outer_instruments, *extra_instruments], level, inner_phase, disabled):
+        cap_gated = ctx.get_capacity_gated_reuse() if ctx else False
+        with passes.PassContext(
+            [*outer_instruments, *extra_instruments],
+            level,
+            inner_phase,
+            disabled,
+            capacity_gated_reuse=cap_gated,
+        ):
             try:
                 return self._pipeline.run(input_ir)
             finally:
@@ -423,7 +430,10 @@ class PassManager:
             disabled = passes.DiagnosticCheckSet()
             disabled.insert(passes.DiagnosticCheck.UnusedControlFlowResult)
 
-        with passes.PassContext([*outer_instruments, timing_instrument], level, dphase, disabled):
+        cap_gated = ctx.get_capacity_gated_reuse() if ctx else False
+        with passes.PassContext(
+            [*outer_instruments, timing_instrument], level, dphase, disabled, capacity_gated_reuse=cap_gated
+        ):
             try:
                 return self._pipeline.run(input_ir)
             finally:
