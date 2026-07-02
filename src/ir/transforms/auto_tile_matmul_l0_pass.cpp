@@ -473,6 +473,12 @@ struct MatmulTiling {
   /// (k == K); BuildFullKPipelined sets the loop order + single-buffers the
   /// stationary (outer) operand accordingly.
   utils::Stationarity stationarity = utils::Stationarity::kOutputStationary;
+  /// For full-K output-stationary (BuildFullKPipelined at k == K): which operand
+  /// the chooser hoists to the outer loop — true = hold A (rows outer), false =
+  /// hold B (cols outer). Set from L0TileResult::os_holds_a so the emitted hoist
+  /// matches the bandwidth-weighted hoist the wall cost was scored under. Ignored
+  /// for A/B-stationary (loop order comes from `stationarity`) and split-K.
+  bool os_holds_a = true;
   [[nodiscard]] bool is_acc() const { return acc_init != nullptr; }
   /// True when the chosen L0 tile is smaller than the [M, N] output on either
   /// axis — the output Acc would overflow L0c, so the output must be tiled.
@@ -689,6 +695,7 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   t.n = res.n;
   t.k = res.k;
   t.stationarity = res.stationarity;
+  t.os_holds_a = res.os_holds_a;
   return t;
 }
 
@@ -883,7 +890,7 @@ class DirectGmPlacer : public SubtilePlacer {
 class MatScratchPlacer : public SubtilePlacer {
  public:
   MatScratchPlacer(int64_t big_m, int64_t big_n, DataType dtype, std::string base, Span span)
-      : m_(big_m), n_(big_n), dtype_(std::move(dtype)), base_(std::move(base)), sp_(std::move(span)) {}
+      : m_(big_m), n_(big_n), dtype_(dtype), base_(std::move(base)), sp_(std::move(span)) {}
 
   [[nodiscard]] VarPtr Init(std::vector<StmtPtr>& stmts) override {
     auto& reg = OpRegistry::GetInstance();
@@ -971,36 +978,20 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& 
       << "Internal error: full-K tile must not exceed the problem dims; got M=" << t.M << " m=" << t.m
       << " N=" << t.N << " n=" << t.n;
 
-  // Choose the OUTER (stationary) panel by total interior extract traffic (see
-  // the row/column cost below) — the cheaper traversal's panel is re-extracted
-  // once per outer step.  AnalyzeMatmul guarantees both operands are TileType.
-  auto lhs_tile = As<TileType>(t.lhs->GetType());
-  auto rhs_tile = As<TileType>(t.rhs->GetType());
-  INTERNAL_CHECK_SPAN(lhs_tile && rhs_tile, sp)
-      << "Internal error: full-K pipelined operands must be TileType (guaranteed by AnalyzeMatmul)";
-  const int64_t a_panel = t.m * t.K * static_cast<int64_t>(DTypeBytes(lhs_tile->dtype_));
-  const int64_t b_panel = t.K * t.n * static_cast<int64_t>(DTypeBytes(rhs_tile->dtype_));
-  // Pick the traversal that minimises total operand-extract traffic over the
-  // interior grid (``p_blocks`` rows x ``q_blocks`` cols).  A-stationary (rows
-  // outer) extracts A once per row + B every step: T_row = P*A + P*Q*B.
-  // B-stationary (cols outer): T_col = P*Q*A + Q*B.  Comparing the totals is
-  // exact for rectangular grids — unlike the ``A >= B`` panel-size heuristic,
-  // which mis-picks when one axis has far more blocks (e.g. P=100, Q=2,
-  // A=1.5B: T_row=350B > T_col=302B, so column traversal wins despite A > B).
-  const int64_t p_blocks = t.M / t.m;  // interior row blocks (>= 1)
-  const int64_t q_blocks = t.N / t.n;  // interior col blocks (>= 1)
-  const int64_t t_row = p_blocks * a_panel + p_blocks * q_blocks * b_panel;
-  const int64_t t_col = p_blocks * q_blocks * a_panel + q_blocks * b_panel;
   // Loop order + buffering. When the chooser picked an operand-stationary point
   // (k == K), the stationary operand is the OUTER (held) panel and is SINGLE-
   // buffered — the chooser budgeted it the full L0 buffer (no /2). A-stationary
   // -> A held -> rows outer; B-stationary -> B held -> cols outer. Output-
-  // stationary double-buffers both and picks the loop order by extract traffic
-  // (T_row vs T_col).
+  // stationary double-buffers both and hoists one operand to the outer loop; the
+  // chooser already made that bandwidth-weighted choice while scoring the wall
+  // (LoadCycles' min-hoist) and recorded it in `os_holds_a`, so we obey it here
+  // rather than re-derive from raw bytes — the two objectives disagree under the
+  // ~200:132 L0A:L0B bandwidth ratio, and diverging would emit a different loop
+  // order than the wall was scored under.
   const bool a_stationary = t.stationarity == utils::Stationarity::kAStationary;
   const bool b_stationary = t.stationarity == utils::Stationarity::kBStationary;
   const bool stationary_single_buffered = a_stationary || b_stationary;
-  const bool row_outer = stationary_single_buffered ? a_stationary : (t_row <= t_col);
+  const bool row_outer = stationary_single_buffered ? a_stationary : t.os_holds_a;
 
   // Interior = the region tiled by FULL m x n blocks; the L-shaped partial
   // boundary beyond it is peeled into straight-line tiles below.

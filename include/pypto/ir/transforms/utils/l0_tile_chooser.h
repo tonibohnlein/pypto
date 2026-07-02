@@ -165,6 +165,17 @@ struct L0TileResult {
   // stationary -> depth 1 / full buffer); see the Stationarity enum doc.
   Stationarity stationarity = Stationarity::kOutputStationary;
 
+  // For the full-K output-stationary emit (BuildFullKPipelined at k == K), which
+  // operand is hoisted to the outer loop (loaded once per outer step, reused
+  // across the inner sweep): true = hold A (rows outer), false = hold B (cols
+  // outer). This is the SAME bandwidth-weighted decision the wall cost is scored
+  // under (LoadCycles' min-hoist), recorded here so the emit obeys the scored
+  // hoist by construction rather than re-deriving it from raw byte traffic (the
+  // ~200:132 L0A:L0B ratio makes "fewest bytes" and "fewest cycles" disagree).
+  // Only meaningful for output-stationary k == K; A/B-stationary force the loop
+  // order from `stationarity`, and split-K (k < K) uses a different emitter.
+  bool os_holds_a = true;
+
   // Whether the chooser chose to double-buffer L0C (two accumulators ping-ponged
   // to overlap the FIXPIPE drain). True only when allow_double_buffer_c was set,
   // the single-L0C optimum already tiles the output (a full [M, N, K] tile that

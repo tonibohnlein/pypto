@@ -164,6 +164,28 @@ int64_t MadCycles(int m, int n, int k, const L0TileConfig& cfg) {
   return CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n) * CeilDiv(cfg.K, k) * per_tile;
 }
 
+// Bandwidth-weighted held-A vs held-B interior load cycles for a full-K OS tile
+// (see LoadCycles below for the two expressions). Returns true when hoisting A
+// (rows outer) is at least as cheap as hoisting B. This is the SINGLE definition
+// of the OS hoist: LoadCycles routes its k==K cost through it, and ChooseL0Tile
+// records the result into L0TileResult::os_holds_a so BuildFullKPipelined emits
+// the SAME hoist the wall was scored under. (Previously the emit re-derived the
+// hoist from raw byte traffic, which disagrees with this cycle-weighted min under
+// the ~200:132 L0A:L0B bandwidth ratio -- latent because the final tile pick was
+// unaffected, but it made estimated_cost_cycles wrong and the emitted loop order
+// diverge from the scored one on asymmetric shapes.) Tie -> hold A (rows outer),
+// matching the Stationarity enum / ascending-aspect order.
+bool OSHoldsHoldA(int m, int n, const L0TileConfig& cfg) {
+  const double M = cfg.M, N = cfg.N, K = cfg.K;
+  const double ceil_n = static_cast<double>(CeilDiv(cfg.N, n));
+  const double ceil_m = static_cast<double>(CeilDiv(cfg.M, m));
+  const double ba = static_cast<double>(cfg.bytes_a);
+  const double bb = static_cast<double>(cfg.bytes_b);
+  const double held_a = (ba * M * K) / cfg.bw_a + (bb * K * N * ceil_m) / cfg.bw_b;  // hold A, stream B
+  const double held_b = (ba * M * K * ceil_n) / cfg.bw_a + (bb * K * N) / cfg.bw_b;  // hold B, stream A
+  return held_a <= held_b;
+}
+
 // L1->L0 load cost (cycles). The MTE1 pipe is shared, so A and B loads serialize;
 // each is weighted by its port bandwidth (the 2:1 L0A/L0B asymmetry). The reload
 // counts depend on the stationarity / reuse route. The full-K emitter
@@ -194,7 +216,9 @@ double LoadCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r)
       return held_b;  // B held (requires k == K)
     case Stationarity::kOutputStationary:
       if (k >= static_cast<int>(K)) {
-        return std::min(held_a, held_b);  // full-K: the emit hoists the cheaper operand
+        // Route through the shared hoist decision so the scored cost matches the
+        // operand BuildFullKPipelined actually hoists (recorded in os_holds_a).
+        return OSHoldsHoldA(m, n, cfg) ? held_a : held_b;
       }
       // split-K: BuildSplitKGrid re-streams both operands across the K blocks.
       return (ba * M * K * ceil_n) / cfg.bw_a + (bb * K * N * ceil_m) / cfg.bw_b;
@@ -438,6 +462,11 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
   result.padded_compute_volume = best->padded_compute;
   result.stationarity = best->regime.stat;
   result.double_buffer_c = best->regime.dbc;
+  // Record the full-K OS hoist (bandwidth-weighted held-A vs held-B) so
+  // BuildFullKPipelined emits the same operand the wall was scored under. Only
+  // consulted for output-stationary k == K; A/B-stationary force the loop order
+  // from `stationarity` and split-K uses a different emitter.
+  result.os_holds_a = OSHoldsHoldA(best->m, best->n, cfg);
 
   // 6. Perf-hint diagnostics for borderline cases (callers may forward via
   //    EmitDiagnostics with severity PerfHint).
