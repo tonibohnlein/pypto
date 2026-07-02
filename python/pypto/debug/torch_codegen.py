@@ -1097,12 +1097,25 @@ class TorchCodegen(_ir.IRVisitor):
     """Emit executable PyTorch code from PyPTO IR."""
 
     def __init__(
-        self, *, check_shapes: bool = False, group_meta: dict[str, dict[str, Any]] | None = None
+        self,
+        *,
+        check_shapes: bool = False,
+        group_meta: dict[str, dict[str, Any]] | None = None,
+        run_all_spmd_blocks: bool = False,
     ) -> None:
         super().__init__()
         self._lines: list[str] = []
         self._indent: int = 0
         self._expr_result: str = ""
+        # SPMD execution model. By default an SPMD scope is emitted as a single
+        # representative block (``tile.get_block_idx() -> "0"``) — enough to verify
+        # one core's logic. With ``run_all_spmd_blocks`` the scope becomes a real
+        # ``for`` loop over ``core_num`` blocks executed serially into the shared
+        # (atomic-seeded) output, so the generated function computes the FULL
+        # assembled result. Faithful for output-tiling emits (disjoint tiles +
+        # atomic split-K merge); it does not model cross-block dependencies.
+        self._run_all_spmd_blocks: bool = run_all_spmd_blocks
+        self._spmd_block_expr: str = "0"  # what tile.get_block_idx() resolves to
         # Fast-path name cache keyed by Python wrapper id.
         self._var_names_by_id: dict[int, str] = {}
         # Stable name cache keyed by semantic variable identity.
@@ -1301,6 +1314,15 @@ class TorchCodegen(_ir.IRVisitor):
 
     def visit_call(self, op: _ir.Call) -> None:
         op_name = op.op.name
+
+        # The SPMD block index resolves to the current block expression: "0" for the
+        # default single-block model, or the loop variable when running all blocks
+        # (see visit_spmd_scope_stmt). Instance state, so it can't live in the
+        # module-level _OP_MAP.
+        if op_name == "tile.get_block_idx":
+            self._expr_result = self._spmd_block_expr
+            return
+
         handler = _OP_MAP.get(op_name)
 
         # Evaluate arguments
@@ -1436,6 +1458,30 @@ class TorchCodegen(_ir.IRVisitor):
 
         self._yield_targets = old_targets
         self._alias_return_vars(op.return_vars, iter_arg_names)
+
+    def visit_spmd_scope_stmt(self, op: _ir.SpmdScopeStmt) -> None:
+        # Default: a single representative block (block 0). tile.get_block_idx()
+        # resolves to "0" (see visit_call), so the body runs once — enough to verify
+        # one core's logic, but it computes only that block's tile.
+        if not self._run_all_spmd_blocks:
+            self.visit_stmt(op.body)
+            return
+        # All-blocks: a serial loop over core_num executed into the shared, atomic-
+        # seeded output built before this scope. tile.get_block_idx() binds to the loop
+        # var, so each iteration slices + writes its own tile (split-K blocks atomic-add
+        # into the same tile) — reproducing the FULL assembled result.
+        core_num = op.core_num
+        count = core_num if isinstance(core_num, int) else self._visit_expr_str(core_num)
+        blk = self._unique_name("spmd_blk")
+        self._emit(f"for {blk} in range({count}):")
+        self._indent += 1
+        old_block_expr = self._spmd_block_expr
+        self._spmd_block_expr = blk
+        self.visit_stmt(op.body)
+        if not self._has_body_content(op.body):
+            self._emit("pass")
+        self._spmd_block_expr = old_block_expr
+        self._indent -= 1
 
     def visit_while_stmt(self, op: _ir.WhileStmt) -> None:
         iter_arg_names = self._emit_iter_arg_inits(op.iter_args)
@@ -1641,7 +1687,12 @@ def _compare_expected_tensors(
 # ---------------------------------------------------------------------------
 
 
-def torch_codegen(node: _ir.Program | _ir.Function, *, check_shapes: bool = False) -> str:
+def torch_codegen(
+    node: _ir.Program | _ir.Function,
+    *,
+    check_shapes: bool = False,
+    run_all_spmd_blocks: bool = False,
+) -> str:
     """Emit executable PyTorch code from a PyPTO IR Program or Function.
 
     The generated code can be exec()'d with torch available to numerically
@@ -1651,6 +1702,12 @@ def torch_codegen(node: _ir.Program | _ir.Function, *, check_shapes: bool = Fals
         node: A Program or Function IR node
         check_shapes: If True, emit runtime assertions to verify that every
             tensor/tile variable's shape and dtype match the IR type annotations.
+        run_all_spmd_blocks: If True, emit each SPMD scope as a serial ``for`` loop
+            over all ``core_num`` blocks (executed into the shared, atomic-seeded
+            output) so the generated function computes the FULL assembled result.
+            Default False keeps the single-representative-block model (block 0).
+            Faithful for output-tiling emits (disjoint tiles + atomic split-K); it
+            does not model cross-block dependencies.
 
     Returns:
         String of executable Python/PyTorch code
@@ -1659,7 +1716,11 @@ def torch_codegen(node: _ir.Program | _ir.Function, *, check_shapes: bool = Fals
     if isinstance(node, _ir.Program):
         group_meta = _build_group_meta(node)
 
-    cg = TorchCodegen(check_shapes=check_shapes, group_meta=group_meta)
+    cg = TorchCodegen(
+        check_shapes=check_shapes,
+        group_meta=group_meta,
+        run_all_spmd_blocks=run_all_spmd_blocks,
+    )
     lines = [_PREAMBLE]
     if group_meta:
         lines.append(f"_GROUP_META.update({group_meta!r})")
