@@ -23,6 +23,7 @@ After the MemRef-mirror redesign:
 """
 
 from importlib import resources
+from typing import Any, cast
 
 import pytest
 from pypto import DataType, ir
@@ -30,6 +31,7 @@ from pypto.ir.op.distributed import tensor_ops as dist_tensor_ops
 from pypto.ir.op.distributed import tile_ops as dist_tile_ops
 from pypto.language.distributed.op import tensor_ops as dsl_tensor_ops
 from pypto.language.distributed.op.tensor_ops import _validate_chunk, _validate_pipeline
+from pypto.language.distributed.typing.distributed_tensor import DistributedTensor
 
 
 def _make_shape_tuple(values: list[int], span: ir.Span) -> ir.MakeTuple:
@@ -237,6 +239,29 @@ def test_tensor_allreduce_defaults_to_sum():
     call = dist_tensor_ops.allreduce(src, signal, span=span)
     assert call.type is src.type
     assert call.kwargs["op"] == int(ir.ReduceOp.Sum)
+
+
+def test_tensor_allreduce_accepts_missing_signal_for_later_host_synthesis():
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
+    call = dist_tensor_ops.allreduce(src, op=ir.ReduceOp.Sum, span=span)
+    assert call.type is src.type
+    assert len(call.args) == 1
+    assert call.kwargs["op"] == int(ir.ReduceOp.Sum)
+
+
+def test_tensor_allreduce_rejects_explicit_none_signal():
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
+    with pytest.raises(TypeError, match="signal cannot be None"):
+        dist_tensor_ops.allreduce(src, cast(Any, None), op=ir.ReduceOp.Sum, span=span)
+
+
+def test_dsl_tensor_allreduce_rejects_explicit_none_signal():
+    span = ir.Span.unknown()
+    src = DistributedTensor(expr=_make_distributed_tensor_var("src", [16], DataType.FP32, span))
+    with pytest.raises(TypeError, match="signal cannot be None"):
+        dsl_tensor_ops.allreduce(src, cast(Any, None), op=ir.ReduceOp.Sum)
 
 
 def test_tensor_allreduce_accepts_dynamic_shape():

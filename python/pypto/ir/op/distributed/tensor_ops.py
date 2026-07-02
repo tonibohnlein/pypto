@@ -19,12 +19,15 @@ DSL types and unwrap the result back to a :class:`DistributedTensor`.
 """
 
 from collections.abc import Sequence
+from typing import overload
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import AtomicType, Call, Expr, ReduceOp, Span
 
 from ...utils import _get_span_or_capture, _normalize_expr, _to_make_tuple
+
+_ALLREDUCE_SIGNAL_MISSING = object()
 
 
 def alloc_window_buffer(size: int | Expr, *, name: str, span: Span | None = None) -> Call:
@@ -197,29 +200,57 @@ def get(
     return _ir_core.create_op_call("pld.tensor.get", args, attrs, actual_span)
 
 
+@overload
+def allreduce(target: Expr, *, op: ReduceOp = ReduceOp.Sum, span: Span | None = None) -> Call: ...
+
+
+@overload
 def allreduce(
     target: Expr,
     signal: Expr,
     op: ReduceOp = ReduceOp.Sum,
     *,
     span: Span | None = None,
+) -> Call: ...
+
+
+def allreduce(
+    target: Expr,
+    signal: Expr | object = _ALLREDUCE_SIGNAL_MISSING,
+    op: ReduceOp = ReduceOp.Sum,
+    *,
+    span: Span | None = None,
 ) -> Call:
-    """Build a ``pld.tensor.allreduce(target, signal)`` Call.
+    """Build a ``pld.tensor.allreduce(target[, signal])`` Call.
 
     In-place cross-rank allreduce: after the call, every rank's slice of
-    ``target`` holds the reduced value. ``signal`` is a window-bound INT32
-    matrix used as the cross-rank barrier. ``op`` (:class:`ir.ReduceOp`)
-    selects the reduction operator, defaults to ``ReduceOp.Sum``, and is
-    packed as an ``int`` attr. The result type is ``target``'s
+    ``target`` holds the reduced value. ``signal``, when provided, is a
+    window-bound INT32 matrix used as the cross-rank barrier. Host-level calls
+    may omit it; SynthesizeAllReduceSignals inserts a private signal before
+    downstream lowering. Explicit signals are single-shot: callers issuing
+    multiple allreduces must provide a fresh signal for each call. ``op``
+    (:class:`ir.ReduceOp`) selects the reduction operator, defaults to
+    ``ReduceOp.Sum``, and is packed as an ``int`` attr. The result type is ``target``'s
     :class:`ir.DistributedTensorType` (the rebind target — same semantics as
     :func:`pl.store`).
 
-    LowerCompositeOps expands this into the 4-phase
-    notify/wait/remote_load+accumulate/store decomposition; this Call never
-    survives past that pass.
+    Explicit-signal InCore allreduce is expanded by LowerCompositeOps into the
+    4-phase notify/wait/remote_load+accumulate/store decomposition. Host-level
+    allreduce is lowered later by LowerHostTensorCollectives after signal
+    synthesis and comm-domain materialization.
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    return _ir_core.create_op_call("pld.tensor.allreduce", [target, signal], {"op": int(op)}, actual_span)
+    if signal is _ALLREDUCE_SIGNAL_MISSING:
+        args = [target]
+    elif signal is None:
+        raise TypeError(
+            "pld.tensor.allreduce signal cannot be None; omit the signal argument for host synthesis"
+        )
+    elif isinstance(signal, Expr):
+        args = [target, signal]
+    else:
+        raise TypeError(f"pld.tensor.allreduce signal must be an Expr, got {type(signal).__name__}")
+    return _ir_core.create_op_call("pld.tensor.allreduce", args, {"op": int(op)}, actual_span)
 
 
 def barrier(

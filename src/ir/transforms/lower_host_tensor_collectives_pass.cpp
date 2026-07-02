@@ -97,9 +97,18 @@ void CheckStaticSignalCapacity(const CallPtr& call, const ExprPtr& signal_expr, 
   auto signal_type = As<DistributedTensorType>(signal_expr->GetType());
   INTERNAL_CHECK_SPAN(signal_type, call->span_)
       << "LowerHostTensorCollectives: collective signal must be DistributedTensorType";
-  CHECK_SPAN(signal_type->shape_.size() == 1, call->span_)
-      << "LowerHostTensorCollectives: collective signal must be rank-1";
+  CHECK_SPAN(signal_type->shape_.size() == 1 || signal_type->shape_.size() == 2, call->span_)
+      << "LowerHostTensorCollectives: collective signal must be rank-1 [world_size] "
+         "or rank-2 [world_size, 1]";
   if (signal_type->shape_.empty()) return;
+  if (signal_type->shape_.size() == 2) {
+    auto second_extent = As<ConstInt>(signal_type->shape_[1]);
+    CHECK_SPAN(second_extent, call->span_)
+        << "LowerHostTensorCollectives: collective rank-2 signal shape[1] must be the constant 1";
+    CHECK_SPAN(second_extent->value_ == 1, call->span_)
+        << "LowerHostTensorCollectives: collective rank-2 signal shape[1] must be 1, got "
+        << second_extent->value_;
+  }
   auto extent = As<ConstInt>(signal_type->shape_[0]);
   if (!extent) return;
   CHECK_SPAN(extent->value_ >= static_cast<int64_t>(required_slots), call->span_)

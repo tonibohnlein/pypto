@@ -483,9 +483,10 @@ void BindPass(nb::module_& m) {
       "simplify", &pass::Simplify,
       "Create a pass that simplifies expressions and statements using algebraic rules and bound analysis");
   passes.def("lower_composite_ops", &pass::LowerCompositeOps,
-             "Decompose composite tile ops into primitives via the composite-lowering registry. "
-             "Today lowers tile.sin/tile.cos (Cody-Waite range reduction + degree-9 Horner polynomial); "
-             "FP32-only. Idempotent.");
+             "Decompose composite tile/distributed ops into primitives via the "
+             "composite-lowering registry. Today lowers tile.sin/tile.cos and "
+             "explicit-signal InCore pld.tensor.allreduce; host allreduce is "
+             "skipped for LowerHostTensorCollectives. FP32-only for trig. Idempotent.");
   passes.def("flatten_call_expr", &pass::FlattenCallExpr,
              "Create a pass that flattens nested call expressions");
   passes.def("inline_functions", &pass::InlineFunctions,
@@ -494,13 +495,17 @@ void BindPass(nb::module_& m) {
              "Detects cycles in the Inline → Inline call graph and raises ValueError.\n"
              "Supports multi-return inline (emits MakeTuple at call site) and nested\n"
              "Inline-calls-Inline (iterates to fixpoint).");
+  passes.def("synthesize_allreduce_signals", &pass::SynthesizeAllReduceSignals,
+             "Synthesize private signal windows for host-level pld.tensor.allreduce calls that omit "
+             "the signal argument. Existing explicit-signal calls are preserved.");
   passes.def("materialize_comm_domain_scopes", &pass::MaterializeCommDomainScopes,
              "Trace pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r) "
              "chains in each\n"
              "host_orch function, materialise WindowBuffer instances back-referenced from\n"
              "DistributedTensorType.window_buffer_ on view Vars, and wrap the host_orch\n"
              "body in nested CommDomainScopeStmts (one per inferred comm domain). Runs\n"
-             "immediately after InlineFunctions (L2 orch is never inlined into L3).");
+             "late in the default pipeline after phase-fence expansion and before\n"
+             "LowerHostTensorCollectives, while the host dispatch chain is still intact.");
   passes.def("lower_host_tensor_collectives", &pass::LowerHostTensorCollectives,
              "Lower host-level pld.tensor.allreduce calls to builtin tensor collective dispatches.");
   passes.def("stamp_tfree_split", &pass::StampTfreeSplit,

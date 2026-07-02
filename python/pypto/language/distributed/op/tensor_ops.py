@@ -41,6 +41,7 @@ site singular.
 """
 
 from collections.abc import Sequence
+from typing import overload
 
 from pypto.ir.op.distributed import tensor_ops as _ir_tensor
 from pypto.language.typing import IntLike, Ptr
@@ -51,6 +52,8 @@ from pypto.pypto_core.ir import AtomicType, Call, Expr, ReduceOp
 
 from ..typing.distributed_tensor import DistributedTensor
 from ._utils import _normalize_intlike, _unwrap, _unwrap_distributed_tensors
+
+_ALLREDUCE_SIGNAL_MISSING = object()
 
 
 def _validate_chunk(chunk_rows: int, chunk_cols: int, op_name: str) -> None:
@@ -356,9 +359,22 @@ def get(
     )
 
 
+@overload
+def allreduce(target: DistributedTensor, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensor: ...
+
+
+@overload
 def allreduce(
     target: DistributedTensor,
     signal: DistributedTensor,
+    *,
+    op: ReduceOp = ReduceOp.Sum,
+) -> DistributedTensor: ...
+
+
+def allreduce(
+    target: DistributedTensor,
+    signal: DistributedTensor | object = _ALLREDUCE_SIGNAL_MISSING,
     *,
     op: ReduceOp = ReduceOp.Sum,
 ) -> DistributedTensor:
@@ -372,31 +388,34 @@ def allreduce(
 
         pub = pld.tensor.allreduce(pub, sig, op=pld.ReduceOp.Sum)
 
-    LowerCompositeOps expands this single Call into the 4-phase
+    LowerCompositeOps expands the explicit-signal InCore form into the 4-phase
     notify/wait/remote_load+accumulate/store decomposition; the kernel sees
-    only the lowered primitives. ``signal`` must be a window-bound INT32
-    :class:`pld.DistributedTensor` used as the cross-rank barrier (one slot
-    per rank); the host orchestrator allocates and zero-initialises it via
-    :func:`alloc_window_buffer` + :func:`window`.
+    only the lowered primitives. Host-orchestrator code can omit ``signal``
+    outside ``for`` and ``while`` loops; the compiler synthesizes a private
+    INT32 signal window of shape ``[pld.world_size(), 1]`` for that call.
 
-    **Signal buffer is single-shot per call.** The lowering uses two
+    **Signal buffers are single-shot per call.** The lowering uses two
     barrier waves on the same cells (Set 1 → wait ≥1, then AtomicAdd 1
     → wait ≥2), so by the time the call returns every cell sits at
     ``2`` rather than its initial ``0``. **Do not reuse the same signal
     buffer for a back-to-back allreduce** — the second call's first
     wait would pass immediately on the stale ``≥1``, breaking the
     barrier and racing Phase 3 against the previous reduction's
-    Phase 4. Callers issuing multiple allreduces must allocate a fresh
-    signal buffer (``alloc_window_buffer`` + ``window``) for each
-    call. A self-resetting variant is blocked on a runtime fix —
-    PTOAS issue #797.
+    Phase 4. Explicit-signal callers issuing multiple allreduces must allocate
+    a fresh signal buffer (``alloc_window_buffer`` + ``window``) for each
+    allreduce call. All allreduce calls in ``for`` and ``while`` loops are
+    rejected because the current signal protocol cannot provide a fresh signal
+    for every dynamic iteration. A self-resetting variant is blocked on a
+    runtime fix — PTOAS issue #797.
 
     Args:
         target: Window-bound :class:`pld.DistributedTensor` holding per-rank
             data. The C++ verifier refuses a plain :class:`pl.Tensor`.
-        signal: Window-bound INT32 :class:`pld.DistributedTensor` whose shape
-            is ``[nranks, 1]`` (or any shape providing one cell per rank).
-            Must be **freshly allocated for this call** (see warning above).
+        signal: Optional window-bound INT32 :class:`pld.DistributedTensor`.
+            In InCore code this remains required. In host-orchestrator code,
+            omitting it outside ``for`` and ``while`` loops lets the compiler
+            synthesize a private signal of shape ``[pld.world_size(), 1]``.
+            Allreduce calls in those loops are rejected for both signatures.
         op: :class:`pld.ReduceOp` selecting the reduction operator
             (keyword-only). Defaults to :attr:`pld.ReduceOp.Sum`. First-version
             lowering accepts only ``Sum``; ``Max`` / ``Min`` / ``Prod`` are
@@ -406,6 +425,15 @@ def allreduce(
         The rebound :class:`pld.DistributedTensor` view of ``target`` —
         identical shape / dtype / window-buffer binding, post-reduce content.
     """
+    if signal is _ALLREDUCE_SIGNAL_MISSING:
+        (target_expr,) = _unwrap_distributed_tensors("pld.tensor.allreduce", target=target)
+        call = _ir_tensor.allreduce(target_expr, op=op)
+        return DistributedTensor(expr=call)
+    if signal is None:
+        raise TypeError(
+            "pld.tensor.allreduce signal cannot be None; omit the signal argument for host synthesis"
+        )
+
     target_expr, signal_expr = _unwrap_distributed_tensors(
         "pld.tensor.allreduce", target=target, signal=signal
     )

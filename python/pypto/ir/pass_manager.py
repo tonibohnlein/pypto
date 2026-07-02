@@ -185,16 +185,17 @@ class PassManager:
             ("DeriveCallDirections", lambda: passes.derive_call_directions()),
             ("AutoDeriveTaskDependencies", lambda: passes.auto_derive_task_dependencies()),
             ("ExpandManualPhaseFence", lambda: passes.expand_manual_phase_fence()),
-            # Trace pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r)
-            # in each host_orch, materialise WindowBuffer back-references on
-            # every DistributedTensorType view, and wrap the host_orch body
-            # in nested CommDomainScopeStmts (one per inferred comm domain).
-            # Runs at the end of the pipeline because nothing between
-            # InlineFunctions and here touches the host_orch
-            # alloc/window/dispatch chain (host_orch is never tile-lowered),
-            # so the alloc/view/dispatch sites are still discoverable. Runs
-            # before the final Simplify so any constant folding it does on the
-            # collected sizes is applied uniformly.
+            # First normalize host allreduce calls that omit signal into the
+            # explicit internal allreduce(data, signal, op=...) form. Then
+            # trace pld.tensor.alloc_window_buffer -> pld.tensor.window ->
+            # dispatch(device=r) / allreduce in each host_orch, materialize
+            # WindowBuffer back-references on every DistributedTensorType view,
+            # and wrap the host_orch body in nested CommDomainScopeStmts.
+            # This sequence runs late, immediately before
+            # LowerHostTensorCollectives, because host_orch is never
+            # tile-lowered and the alloc/window/dispatch/allreduce chain is
+            # still discoverable.
+            ("SynthesizeAllReduceSignals", lambda: passes.synthesize_allreduce_signals()),
             ("MaterializeCommDomainScopes", lambda: passes.materialize_comm_domain_scopes()),
             ("LowerHostTensorCollectives", lambda: passes.lower_host_tensor_collectives()),
             ("Simplify", lambda: passes.simplify()),

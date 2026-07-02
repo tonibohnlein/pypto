@@ -67,14 +67,15 @@ def pass_verification_context():
 
 
 def _lower(program) -> str:
-    """Apply ``MaterializeCommDomainScopes`` (so ``DistributedTensorType.window_buffer_``
-    is populated), then run distributed codegen directly."""
+    """Apply the late host-distributed pipeline, then run distributed codegen directly."""
+    program = passes.synthesize_allreduce_signals()(program)
     program = passes.materialize_comm_domain_scopes()(program)
     cg = codegen.DistributedCodegen()
     return cg.generate(program)
 
 
 def _lower_host_collectives(program):
+    program = passes.synthesize_allreduce_signals()(program)
     program = passes.materialize_comm_domain_scopes()(program)
     program = passes.lower_host_tensor_collectives()(program)
     cg = codegen.DistributedCodegen()
@@ -542,6 +543,38 @@ def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
     assert spec.template_vars == {"op_cpp": "ReduceOp::kSum", "dtype_cpp": "float"}
 
 
+def test_implicit_host_allreduce_builtin_codegen_materializes_signal():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            self.chip_orch(data, device=0)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+
+    assert 'callables["builtin.tensor.allreduce__sum__fp32"]' in generated, generated
+    assert 'buffer_ptrs["__allreduce_signal_buf_0"]' in generated, generated
+    assert 'buffer_ptrs["data_buf"]' in generated, generated
+    assert 'buffer_ptrs["signal_buf"]' not in generated, generated
+    assert "orch.submit_next_level" in generated, generated
+    assert ".add_scalar(__comm_d0[" in generated and "].domain_size)" in generated, generated
+    assert "data = data" not in generated, generated
+
+    specs = cg.get_builtin_next_level_specs()
+    assert len(specs) == 1
+    assert specs[0].variant == "builtin.tensor.allreduce__sum__fp32"
+
+
 def test_host_allreduce_builtin_variant_is_recorded_once():
     @pl.program
     class Prog:
@@ -553,12 +586,14 @@ def test_host_allreduce_builtin_variant_is_recorded_once():
         def host_orch(self):
             data_buf = pld.alloc_window_buffer(SIZE * 4)
             signal_buf = pld.alloc_window_buffer(pld.world_size() * 4)
+            signal_buf_1 = pld.alloc_window_buffer(pld.world_size() * 4)
             data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
             signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            signal_1 = pld.window(signal_buf_1, [pld.world_size()], dtype=pl.INT32)
             for r in pl.range(pld.world_size()):
                 self.chip_orch(data, device=r)
             pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
-            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            pld.tensor.allreduce(data, signal_1, op=pld.ReduceOp.Sum)
             return 0
 
     generated, cg = _lower_host_collectives(Prog)

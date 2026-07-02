@@ -512,10 +512,12 @@ ExprPtr LowerCosRule(const CallPtr& call, const std::vector<ExprPtr>& args, Lowe
 
 ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
   const Span& span = call->span_;
-  // Deducer already enforces these — re-assert as internal invariants so the
-  // rule body can use direct indexing without further bounds / kind checks.
-  INTERNAL_CHECK_SPAN(args.size() == 2, span)
-      << "pld.tensor.allreduce rule expects 2 args, got " << args.size();
+  // Host-orchestrator calls may omit the signal and get one synthesized before
+  // host collective lowering. InCore/composite lowering keeps the old explicit
+  // signal contract so users get a direct error instead of an internal assert.
+  CHECK_SPAN(args.size() == 2, span)
+      << "pld.tensor.allreduce requires an explicit signal outside host orchestrator functions. "
+         "Use pld.tensor.allreduce(target, signal, op=...) for InCore/lowered composite paths.";
   const auto& target = args[0];
   const auto& signal = args[1];
   auto target_type = As<DistributedTensorType>(target->GetType());
@@ -966,6 +968,11 @@ ExprPtr LowerTensorBarrierRule(const CallPtr& call, const std::vector<ExprPtr>& 
 // when the callee name appears here. Adding a new composite op = add a rule
 // function above + one row in ``kRules``; the mutator below needs no change.
 //
+// Today the rules are ``tile.sin`` / ``tile.cos`` and ``pld.tensor.*``
+// distributed collectives. Host-level allreduce is skipped here and lowered
+// later by LowerHostTensorCollectives. The pass is idempotent provided each
+// rule emits only ops not listed here.
+//
 // When the table grows past a handful of entries — or a rule wants its own
 // translation unit — promote this back to a standalone registry under
 // ``src/ir/transforms/composite_ops/``.
@@ -1011,6 +1018,7 @@ class LowerCompositeOpsMutator : public IRMutator {
     if (!rule) {
       return IRMutator::VisitStmt_(op);
     }
+    CheckAllReduceLoopUse(call);
 
     // Apply var_remap_ (if any) to operand expressions before handing them
     // to the rule.
@@ -1026,6 +1034,25 @@ class LowerCompositeOpsMutator : public IRMutator {
     final_assign->value_ = result;
     stmts.push_back(std::move(final_assign));
 
+    if (stmts.size() == 1) return stmts.front();
+    return std::make_shared<SeqStmts>(std::move(stmts), op->span_);
+  }
+
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    auto call = As<Call>(op->expr_);
+    CompositeLoweringFn rule = call ? LookupRule(call) : nullptr;
+    if (!rule) {
+      return IRMutator::VisitStmt_(op);
+    }
+    CheckAllReduceLoopUse(call);
+
+    std::vector<ExprPtr> visited_args = VisitArgs(call->args_, op->span_);
+
+    LoweringBuilder builder("eval", temp_counter_);
+    static_cast<void>(rule(call, visited_args, builder));
+
+    auto stmts = builder.TakeStmts();
+    if (stmts.empty()) return op;
     if (stmts.size() == 1) return stmts.front();
     return std::make_shared<SeqStmts>(std::move(stmts), op->span_);
   }
@@ -1050,6 +1077,7 @@ class LowerCompositeOpsMutator : public IRMutator {
       auto call = As<Call>(value);
       CompositeLoweringFn rule = call ? LookupRule(call) : nullptr;
       if (rule) {
+        CheckAllReduceLoopUse(call);
         std::vector<ExprPtr> visited_args = VisitArgs(call->args_, op->span_);
         const std::string base = "ret" + std::to_string(i);
         LoweringBuilder builder(base, temp_counter_);
@@ -1081,6 +1109,20 @@ class LowerCompositeOpsMutator : public IRMutator {
     return std::make_shared<SeqStmts>(std::move(prelude), op->span_);
   }
 
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    ++repeating_scope_depth_;
+    auto result = IRMutator::VisitStmt_(op);
+    --repeating_scope_depth_;
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    ++repeating_scope_depth_;
+    auto result = IRMutator::VisitStmt_(op);
+    --repeating_scope_depth_;
+    return result;
+  }
+
  private:
   [[nodiscard]] static bool ShouldSkipHostCollective(const CallPtr& call) {
     if (!call || !call->op_) return false;
@@ -1100,6 +1142,13 @@ class LowerCompositeOpsMutator : public IRMutator {
     return call && call->op_ ? LookupCompositeRule(call->op_->name_) : nullptr;
   }
 
+  void CheckAllReduceLoopUse(const CallPtr& call) const {
+    if (!call || !call->op_ || !IsOp(call, "pld.tensor.allreduce")) return;
+    CHECK_SPAN(repeating_scope_depth_ == 0, call->span_)
+        << "pld.tensor.allreduce is not supported inside a for/while loop. "
+           "The signal protocol is single-use and cannot reuse a signal across dynamic invocations.";
+  }
+
   std::vector<ExprPtr> VisitArgs(const std::vector<ExprPtr>& args, const Span& span) {
     std::vector<ExprPtr> out;
     out.reserve(args.size());
@@ -1112,6 +1161,7 @@ class LowerCompositeOpsMutator : public IRMutator {
   }
 
   std::size_t temp_counter_ = 0;
+  int repeating_scope_depth_ = 0;
   bool skip_host_collectives_{false};
 };
 

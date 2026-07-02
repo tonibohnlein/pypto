@@ -85,6 +85,7 @@ struct PassProperties {
 | DeriveCallDirections | SplitIncoreOrch | CallDirectionsResolved | — |
 | AutoDeriveTaskDependencies | SplitIncoreOrch, CallDirectionsResolved | CallDirectionsResolved | — |
 | ExpandManualPhaseFence | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | — |
+| SynthesizeAllReduceSignals | — | — | — |
 | MaterializeCommDomainScopes | — | CommDomainScopesMaterialized | — |
 | LowerHostTensorCollectives | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
 | Simplify | — | — | — |
@@ -397,10 +398,11 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 22. [`DeriveCallDirections`](33-derive_call_directions.md)
 23. [`AutoDeriveTaskDependencies`](34-auto_derive_task_dependencies.md)（runtime scope 编译器依赖；AUTO-scope 分析需要显式开启）
 24. [`ExpandManualPhaseFence`](35-expand_manual_phase_fence.md)（manual-scope phase-fence TaskId 依赖压缩）
-25. [`MaterializeCommDomainScopes`](36-materialize_comm_domain_scopes.md)（分布式：构造 WindowBuffer 并写 CommDomainScopeStmt wrappers in each host_orch body；无通信程序为 no-op）
-26. [`LowerHostTensorCollectives`](37-lower_host_tensor_collectives.md)（host-level tensor collectives -> internal builtin chip dispatches）
-27. `Simplify`
-28. [`MaterializeRuntimeScopes`](38-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit PTO2_SCOPE）
+25. [`SynthesizeAllReduceSignals`](36-synthesize_allreduce_signals.md)（分布式：host allreduce optional signal -> explicit internal signal IR）
+26. [`MaterializeCommDomainScopes`](37-materialize_comm_domain_scopes.md)（分布式：构造 WindowBuffer 并写 CommDomainScopeStmt wrappers in each host_orch body；无通信程序为 no-op）
+27. [`LowerHostTensorCollectives`](38-lower_host_tensor_collectives.md)（host-level tensor collectives -> internal builtin chip dispatches）
+28. `Simplify`
+29. [`MaterializeRuntimeScopes`](39-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit PTO2_SCOPE）
 
 `DebugTileOptimization` 只是用于排查 PTO tile 阶段的调试策略，会跳过
 tensor-only 前缀 pass。正常编译和非 strategy 专项测试都应优先使用

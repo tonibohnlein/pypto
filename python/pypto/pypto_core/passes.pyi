@@ -529,19 +529,19 @@ def simplify() -> Pass:
     """Create a pass that simplifies expressions and statements using algebraic rules and bound analysis."""
 
 def lower_composite_ops() -> Pass:
-    """Decompose composite tile ops into primitive arithmetic tile ops.
+    """Decompose composite tile/distributed ops into primitive ops.
 
-    Lowering rules are registered through the composite-lowering registry; today
-    the only composite ops handled are ``tile.sin`` / ``tile.cos`` (Cody-Waite
-    range reduction with a 4-part π split and a degree-9 odd Horner polynomial
-    in t²). The trig rules emit only ``tile.muls``, ``tile.adds``, ``tile.add``,
-    ``tile.sub``, ``tile.mul``, ``tile.cast``.
+    Lowering rules are registered through the composite-lowering registry.
+    Today the pass handles ``tile.sin`` / ``tile.cos`` and explicit-signal
+    InCore ``pld.tensor.allreduce``. Host-level allreduce is skipped here and
+    lowered later by :func:`lower_host_tensor_collectives`.
 
     FP32-only for the trig rules. Non-FP32 inputs are rejected at
     op-construction time.
 
-    Idempotent: every registered rule emits only primitives, so running the
-    pass twice yields the same IR after the first run.
+    Idempotent: registered rules emit ops that are not themselves in the
+    dispatch table, so running the pass twice yields the same IR after the
+    first run.
     """
 
 def derive_call_directions() -> Pass:
@@ -589,6 +589,15 @@ def inline_functions() -> Pass:
 def normalize_stmt_structure() -> Pass:
     """Create a pass that normalizes statement structure."""
 
+def synthesize_allreduce_signals() -> Pass:
+    """Synthesize private signal windows for host-level allreduce calls.
+
+    Host orchestration calls written as ``pld.tensor.allreduce(target, op=...)``
+    are normalized to the internal explicit-signal form by inserting ordinary
+    ``pld.tensor.alloc_window_buffer`` and ``pld.tensor.window`` assignments
+    before the call. Existing explicit-signal calls are preserved.
+    """
+
 def materialize_comm_domain_scopes() -> Pass:
     """Collect comm domains and materialise them as scope statements.
 
@@ -600,8 +609,10 @@ def materialize_comm_domain_scopes() -> Pass:
     :class:`CommDomainScopeStmt` nodes (one per inferred comm domain,
     outer = first declared, inner = last).
 
-    Runs immediately after :func:`inline_functions` — L2 orchestrations are
-    never inlined into L3, so the dispatch chain survives inlining.
+    Runs late in the default pipeline after
+    :func:`synthesize_allreduce_signals` and before
+    :func:`lower_host_tensor_collectives`, while the host dispatch chain is
+    still intact.
     """
 
 def lower_host_tensor_collectives() -> Pass:

@@ -594,6 +594,108 @@ def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_
     assert "pld.system.notify" not in op_names
 
 
+def test_allreduce_without_signal_is_rejected_outside_host_orchestrator():
+    SIZE = _ALLREDUCE_SIZE
+
+    @pl.program
+    class MissingSignal:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            inp: pl.Tensor[[1, SIZE], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, SIZE], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+        ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+            local = pl.load(inp, [0, 0], [1, SIZE])
+            data = pl.store(local, [0, 0], data)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            acc = pl.load(data, [0, 0], [1, SIZE])
+            return pl.store(acc, [0, 0], out)
+
+    with pytest.raises(Exception, match="requires an explicit signal outside host orchestrator"):
+        passes.lower_composite_ops()(MissingSignal)
+
+
+def test_allreduce_eval_stmt_without_signal_is_rejected_outside_host_orchestrator():
+    SIZE = _ALLREDUCE_SIZE
+
+    @pl.program
+    class MissingSignalEval:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="requires an explicit signal outside host orchestrator"):
+        passes.lower_composite_ops()(MissingSignalEval)
+
+
+def test_allreduce_eval_stmt_with_signal_is_decomposed():
+    SIZE = _ALLREDUCE_SIZE
+    nr = _ALLREDUCE_NRANKS
+
+    @pl.program
+    class EvalAllreduce:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    After = passes.lower_composite_ops()(EvalAllreduce)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.allreduce" not in op_names
+    missing = _ALLREDUCE_REQUIRED_OPS - op_names
+    assert not missing, f"lowered IR missing expected ops: {missing}"
+
+
+def test_allreduce_in_for_loop_is_rejected():
+    SIZE = _ALLREDUCE_SIZE
+    nr = _ALLREDUCE_NRANKS
+
+    @pl.program
+    class LoopAllreduce:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            for _ in pl.range(2):
+                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+        passes.lower_composite_ops()(LoopAllreduce)
+
+
+def test_allreduce_in_while_loop_is_rejected():
+    SIZE = _ALLREDUCE_SIZE
+    nr = _ALLREDUCE_NRANKS
+
+    @pl.program
+    class LoopAllreduce:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            while True:
+                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+        passes.lower_composite_ops()(LoopAllreduce)
+
+
 def test_allreduce_emits_for_and_if_control_flow():
     """The recipe emits five ForStmts and five IfStmts:
 

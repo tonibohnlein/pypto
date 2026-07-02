@@ -6,8 +6,8 @@
 `pld.tensor.allreduce`, `pld.tensor.barrier`, `pld.tensor.broadcast`,
 `pld.tensor.reduce_scatter`, and `pld.tensor.allgather` into compiler-internal
 builtin chip dispatches. It runs
-after [`MaterializeCommDomainScopes`](38-materialize_comm_domain_scopes.md), so
-each window-bound data tensor and explicit signal tensor already has a
+after [`MaterializeCommDomainScopes`](37-materialize_comm_domain_scopes.md), so
+each window-bound data tensor and explicit or synthesized signal tensor already has a
 `WindowBuffer` back-reference and belongs to an inferred communication domain.
 
 The pass does not change non-host functions. InCore allreduce calls continue to
@@ -16,7 +16,7 @@ use [`LowerCompositeOps`](12-lower_composite_ops.md).
 ## Position in the pipeline
 
 ```text
-... -> MaterializeCommDomainScopes -> LowerHostTensorCollectives -> Simplify (final) -> MaterializeRuntimeScopes
+... -> SynthesizeAllReduceSignals -> MaterializeCommDomainScopes -> LowerHostTensorCollectives -> Simplify (final) -> MaterializeRuntimeScopes
 ```
 
 The final `Simplify` runs after this pass so any generated loop bounds or
@@ -51,8 +51,9 @@ Assignments preserve the user-facing rebind idiom by appending
 
 The pass requires both args to be materialized `DistributedTensorType` views in
 the same `CommDomainScopeStmt`. The current host builtin path supports only
-`ReduceOp.Sum` over FP32 data and a rank-1 INT32 signal tensor with enough
-static capacity when the participating device count is statically known.
+`ReduceOp.Sum` over FP32 data and an INT32 signal tensor shaped either as
+rank-1 `[world_size]` or rank-2 `[world_size, 1]`, with enough static capacity
+when the participating device count is statically known.
 
 ## Pass properties
 

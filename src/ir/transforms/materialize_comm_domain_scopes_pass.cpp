@@ -29,9 +29,9 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
-#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
@@ -44,6 +44,10 @@ namespace pypto {
 namespace ir {
 
 namespace {
+
+[[nodiscard]] bool IsTensorAllReduce(const CallPtr& call) {
+  return call && call->op_ && IsOp(call, "pld.tensor.allreduce");
+}
 
 /// Device coverage descriptor inferred from a dispatch ``device=`` expression.
 struct DeviceDescriptor {
@@ -271,9 +275,9 @@ class DispatchAnalyzer : public IRVisitor {
     for (const auto& arg : op->args_) {
       auto arg_var = As<Var>(arg);
       if (!arg_var) continue;
-      auto it = view_to_window_.find(arg_var.get());
-      if (it != view_to_window_.end()) {
-        it->second.alloc->seen.push_back(desc);
+      auto window = ResolveWindowRecord(arg_var);
+      if (window) {
+        window->alloc->seen.push_back(desc);
       }
     }
   }
@@ -283,11 +287,10 @@ class DispatchAnalyzer : public IRVisitor {
     auto view_var = As<Var>(expr);
     INTERNAL_CHECK_SPAN(view_var, expr->span_)
         << "MaterializeCommDomainScopes: " << op_name << " " << role << " must be a window view Var";
-    auto it = view_to_window_.find(view_var.get());
-    INTERNAL_CHECK_SPAN(it != view_to_window_.end(), expr->span_)
-        << "MaterializeCommDomainScopes: " << op_name << " " << role
-        << " must be produced by pld.tensor.window";
-    return it->second.alloc;
+    auto window = ResolveWindowRecord(view_var);
+    INTERNAL_CHECK_SPAN(window, expr->span_) << "MaterializeCommDomainScopes: " << op_name << " " << role
+                                             << " must be produced by pld.tensor.window";
+    return window->alloc;
   }
 
   void AnalyzeCollective(const CallPtr& op) {
@@ -343,6 +346,27 @@ class DispatchAnalyzer : public IRVisitor {
   std::vector<CollectiveConsumer> collective_consumers;
 
  private:
+  [[nodiscard]] const WindowRecord* ResolveWindowRecord(const VarPtr& var) const {
+    std::unordered_set<const Var*> visited;
+    return ResolveWindowRecord(var, &visited);
+  }
+
+  [[nodiscard]] const WindowRecord* ResolveWindowRecord(const VarPtr& var,
+                                                        std::unordered_set<const Var*>* visited) const {
+    if (!var || !visited->insert(var.get()).second) return nullptr;
+    auto direct = view_to_window_.find(var.get());
+    if (direct != view_to_window_.end()) return &direct->second;
+
+    auto def_it = var_defs_.find(var.get());
+    if (def_it == var_defs_.end() || !def_it->second) return nullptr;
+    if (auto alias = As<Var>(def_it->second)) {
+      return ResolveWindowRecord(alias, visited);
+    }
+    auto call = As<Call>(def_it->second);
+    if (!IsTensorAllReduce(call) || call->args_.empty()) return nullptr;
+    return ResolveWindowRecord(As<Var>(call->args_[0]), visited);
+  }
+
   const std::unordered_map<const Var*, WindowRecord>& view_to_window_;
   const std::map<std::string, FunctionPtr>& chip_orchs_;
   const std::unordered_map<const Var*, ExprPtr>& var_defs_;
@@ -396,8 +420,10 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
     return func;
   }
 
+  StmtPtr materialization_body = func->body_;
+
   AllocAndWindowCollector collector;
-  collector.VisitStmt(func->body_);
+  collector.VisitStmt(materialization_body);
 
   if (collector.allocs.empty()) {
     // No window-buffer allocations in this host_orch — nothing to do.
@@ -406,7 +432,7 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
 
   // Phase 2: record device-descriptor evidence from dispatch sites.
   DispatchAnalyzer analyzer(collector.view_to_window, chip_orchs, collector.var_defs);
-  analyzer.VisitStmt(func->body_);
+  analyzer.VisitStmt(materialization_body);
 
   // Host-level collectives do not carry their own device= selector. Their
   // signal buffer is a user-visible window slot, so inherit paired data/target
@@ -497,7 +523,8 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   // Phase 7: rewrite host_orch body so every reference to a pld.tensor.window result
   // Var picks up the type-updated copy. The base IRMutator handles all uses;
   // Substitute is the wrapper that does exactly this transformation.
-  StmtPtr new_body = view_subst.empty() ? func->body_ : transform_utils::Substitute(func->body_, view_subst);
+  StmtPtr new_body = view_subst.empty() ? materialization_body
+                                        : transform_utils::Substitute(materialization_body, view_subst);
 
   // Phase 8: wrap new_body in nested CommDomainScopeStmts. Outer = first
   // declared domain, inner = last. ``name_hint_`` is ``"comm_d<n>"`` so

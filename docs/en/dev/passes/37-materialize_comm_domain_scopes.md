@@ -22,11 +22,11 @@ the IR types so downstream codegen has O(1) access.
 ## Position in the pipeline
 
 ```text
-... -> DeriveCallDirections -> AutoDeriveTaskDependencies -> ExpandManualPhaseFence -> MaterializeCommDomainScopes -> LowerHostTensorCollectives -> Simplify (final)
+... -> ExpandManualPhaseFence -> SynthesizeAllReduceSignals -> MaterializeCommDomainScopes -> LowerHostTensorCollectives -> Simplify (final)
 ```
 
 The pass runs near the end of the default pipeline, immediately before
-[`LowerHostTensorCollectives`](37-lower_host_tensor_collectives.md) and the final
+[`LowerHostTensorCollectives`](38-lower_host_tensor_collectives.md) and the final
 `Simplify`. None of the intervening passes between `InlineFunctions` and here
 touches the host_orch alloc/window/dispatch chain: host_orch is never
 tile-lowered, and L2 (chip-level) orchestrations are never inlined into L3, so
@@ -111,6 +111,10 @@ After the pass:
   Allocation-free host_orchs are left unchanged.
 - Every `pld.tensor.window` result Var's type is a `DistributedTensorType` whose
   `window_buffer_` field points to the corresponding `WindowBuffer`.
+- Every host-level `pld.tensor.allreduce` call has two positional arguments
+  after [`SynthesizeAllReduceSignals`](36-synthesize_allreduce_signals.md) runs.
+  For an omitted user signal, the second argument is a synthesized Var produced
+  by a preceding `pld.tensor.window` assignment.
 - `pld.tensor.window` views over the same allocation share the same
   `shared_ptr<const WindowBuffer>` — pointer-equality is a load-bearing
   invariant for downstream codegen.

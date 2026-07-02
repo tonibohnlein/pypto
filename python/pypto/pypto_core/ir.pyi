@@ -2341,8 +2341,8 @@ class CommDomainScopeStmt(ScopeStmt):
     buffers=[CommBufferSpec(...)]) as __comm_d<n>:`` block at the top of the
     host orchestration function, then emits ``body`` inside that block.
 
-    Synthesized by the ``MaterializeCommDomainScopes`` pass (formerly
-    ``MaterializeCommDomainScopes``); no user DSL surface. The Python printer is
+    Synthesized by the ``MaterializeCommDomainScopes`` pass; no user DSL surface.
+    The Python printer is
     transparent over this stmt — reparse + re-run the pass pipeline restores
     the scope. ``.pto`` binary round-trip is lossless via reflection.
     """

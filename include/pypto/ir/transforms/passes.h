@@ -183,6 +183,16 @@ Pass AllocateMemoryAddr();
 Pass InlineFunctions();
 
 /**
+ * @brief Synthesize private signal windows for host-level allreduce calls that omit signal.
+ *
+ * Rewrites host orchestration ``pld.tensor.allreduce(target, op=...)`` calls to
+ * the internal explicit-signal form by inserting ordinary
+ * ``pld.tensor.alloc_window_buffer`` and ``pld.tensor.window`` assignments
+ * immediately before the call. Existing explicit-signal calls are preserved.
+ */
+Pass SynthesizeAllReduceSignals();
+
+/**
  * @brief Materialise comm-domain scope statements for distributed window-buffer allocations.
  *
  * Runs at the end of the pipeline, just before the final Simplify. None of
@@ -599,16 +609,15 @@ Pass RunVerifier(const IRPropertySet& properties);
 Pass Simplify();
 
 /**
- * @brief Decompose composite tile ops into primitive tile ops.
+ * @brief Decompose composite tile/distributed ops into primitive ops.
  *
  * Lowering rules live in a file-local dispatch table inside
- * ``src/ir/transforms/lower_composite_ops_pass.cpp``. Today the only composite
- * ops handled are ``tile.sin`` / ``tile.cos``, which lower to ``tile.muls``,
- * ``tile.adds``, ``tile.add``, ``tile.sub``, ``tile.mul``, and ``tile.cast``
- * using Cody-Waite range reduction with a 4-part π split and a degree-9 odd
- * Horner polynomial in t². Future composite ops (softmax, gelu, layernorm, ...)
- * are added by appending a rule function + one dispatch-table row, without
- * touching the mutator.
+ * ``src/ir/transforms/lower_composite_ops_pass.cpp``. Today the pass handles
+ * ``tile.sin`` / ``tile.cos`` and explicit-signal InCore
+ * ``pld.tensor.allreduce``; host-level allreduce is skipped and lowered later
+ * by ``LowerHostTensorCollectives``. Future composite ops (softmax, gelu,
+ * layernorm, ...) are added by appending a rule function + one dispatch-table
+ * row, without touching the mutator.
  *
  * FP32-only for the trig rules — non-FP32 inputs are rejected at
  * op-construction time by the op deducer, never reaching this pass.

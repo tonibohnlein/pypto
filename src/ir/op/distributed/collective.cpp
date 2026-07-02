@@ -90,7 +90,20 @@ TypePtr DeduceBuiltinTensorAllReduceType(const std::vector<ExprPtr>& args,
 
   auto src_type = As<DistributedTensorType>(args[0]->GetType());
   CHECK(src_type) << kOpName << " src must be a DistributedTensor, got " << args[0]->GetType()->TypeName();
-  CheckSignalDistributedTensor(As<DistributedTensorType>(args[1]->GetType()), kOpName);
+  auto signal_type = As<DistributedTensorType>(args[1]->GetType());
+  CHECK(signal_type) << kOpName << " signal must be a DistributedTensor, got "
+                     << args[1]->GetType()->TypeName();
+  CHECK(signal_type->dtype_ == DataType::INT32)
+      << kOpName << " signal dtype must be INT32, got " << signal_type->dtype_.ToString();
+  CHECK(signal_type->shape_.size() == 1 || signal_type->shape_.size() == 2)
+      << kOpName << " signal must be rank-1 [world_size] or rank-2 [world_size, 1], got rank "
+      << signal_type->shape_.size();
+  if (signal_type->shape_.size() == 2) {
+    auto second_extent = As<ConstInt>(signal_type->shape_[1]);
+    CHECK(second_extent) << kOpName << " rank-2 signal shape[1] must be the constant 1";
+    CHECK(second_extent->value_ == 1)
+        << kOpName << " rank-2 signal shape[1] must be 1, got " << second_extent->value_;
+  }
 
   auto op_value = GetRequiredKwarg<int>(kwargs, "op", kOpName);
   auto dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);

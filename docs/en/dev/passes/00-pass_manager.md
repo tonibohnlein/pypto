@@ -85,6 +85,7 @@ struct PassProperties {
 | DeriveCallDirections | SplitIncoreOrch | CallDirectionsResolved | — |
 | AutoDeriveTaskDependencies | SplitIncoreOrch, CallDirectionsResolved | CallDirectionsResolved | — |
 | ExpandManualPhaseFence | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | — |
+| SynthesizeAllReduceSignals | — | — | — |
 | MaterializeCommDomainScopes | — | CommDomainScopesMaterialized | — |
 | LowerHostTensorCollectives | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
 | Simplify | — | — | — |
@@ -397,10 +398,11 @@ The PTO-oriented tile stage shared by `Default` and `DebugTileOptimization` is:
 22. [`DeriveCallDirections`](33-derive_call_directions.md)
 23. [`AutoDeriveTaskDependencies`](34-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
 24. [`ExpandManualPhaseFence`](35-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
-25. [`MaterializeCommDomainScopes`](36-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
-26. [`LowerHostTensorCollectives`](37-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
-27. `Simplify`
-28. [`MaterializeRuntimeScopes`](38-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
+25. [`SynthesizeAllReduceSignals`](36-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
+26. [`MaterializeCommDomainScopes`](37-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
+27. [`LowerHostTensorCollectives`](38-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
+28. `Simplify`
+29. [`MaterializeRuntimeScopes`](39-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
 
 `DebugTileOptimization` is a debug-only strategy for inspecting this tile stage
 without the tensor-only prefix passes. Use `Default` for normal compilation and
