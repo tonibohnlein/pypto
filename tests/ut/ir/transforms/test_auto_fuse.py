@@ -21,7 +21,6 @@ one kernel. The Outline/Convert/Tile pipeline then lowers each scope to a cube
 """
 
 import json
-import re
 
 import pypto.language as pl
 import pytest
@@ -127,9 +126,16 @@ class TestAutoFuse:
             f"max abs diff {(out - a @ b).abs().max().item():.3e}"
         )
 
-    @_STALE_EMIT
     def test_single_matmul_lowers_to_cube_kernel(self, ascend_backend):
-        """The emitted scope lowers through the full pipeline to a cube PTO kernel."""
+        """The emitted scope lowers through the full pipeline to a cube PTO kernel.
+
+        Under the grounded 910B split-K decision (split=2), the 64x64 matmul lowers to
+        TWO in-core kernels: a vector (AIV) kernel that zero-seeds the output, and the
+        cube (AIC) matmul kernel whose SPMD blocks accumulate their 32x32 tile into that
+        seed via atomic-add — the K partials merge across blocks in DDR. (The pre-grounding
+        emit was a single non-split kernel with a k-pipeline ping-pong / ``tmatmul.acc``;
+        that shape no longer applies.)
+        """
 
         @pl.program
         class Prog:
@@ -142,30 +148,26 @@ class TestAutoFuse:
                 c: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
                 return c
 
-        pm = PassManager.get_strategy(OptimizationStrategy.Default)
-        out = pm.run_passes(Prog)
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
 
-        # The matmul group was outlined into exactly one kernel (cube/AIC) and the
-        # host became an orchestration function calling it.
+        # split-K outlines into a cube (AIC) matmul kernel + a vector (AIV) zero-seed kernel;
+        # the host `mm` becomes an Orchestration function driving the SPMD dispatch.
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
-        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
-        kernel = incores[0]
+        by_type: dict[str, list] = {}
+        for f in incores:
+            by_type.setdefault(str(f.func_type), []).append(f)
+        assert len(by_type.get("FunctionType.AIC", [])) == 1, [f.name for f in incores]
+        assert len(by_type.get("FunctionType.AIV", [])) == 1, [f.name for f in incores]
 
-        mlir = codegen.PTOCodegen().generate(ir.Program([kernel], kernel.name, kernel.span))
+        cube = by_type["FunctionType.AIC"][0]
+        mlir = codegen.PTOCodegen().generate(ir.Program([cube], cube.name, cube.span))
         assert "pto.kernel_kind" in mlir
         assert "cube" in mlir  # a pure matmul lowers to a cube kernel
-        assert "pto.tload" in mlir
-
-        # The k-pipeline lowered to a ping-pong DDR<->L1 double-buffer: the k-strip
-        # GM->Mat loads land in distinct L1 buffers and accumulate via tmatmul.acc.
-        mat_addrs = set()
-        for line in mlir.splitlines():
-            if "alloc_tile" in line and "loc=mat" in line:
-                m = re.search(r"addr = (%c\d+_i64)", line)
-                if m:
-                    mat_addrs.add(m.group(1))
-        assert len(mat_addrs) >= 2, sorted(mat_addrs)  # distinct buffers = ping-pong
-        assert "pto.tmatmul.acc" in mlir  # the k-strip accumulation
+        assert "pto.tload" in mlir and "pto.tmatmul" in mlir
+        # SPMD-distributed split-K: each block indexes off spmd_block_idx and merges its
+        # partial into the seeded output via atomic-add (not a per-tile tmatmul.acc).
+        assert "spmd_block_idx" in mlir
+        assert "atomic_add" in mlir
 
     @_STALE_EMIT
     def test_large_matmul_tiles_to_fit_l0c(self, ascend_backend):
