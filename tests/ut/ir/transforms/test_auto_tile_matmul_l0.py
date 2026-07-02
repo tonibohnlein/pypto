@@ -1093,6 +1093,73 @@ class TestAutoTileMatmulL0MNTiling:
             f"full-K column-outer mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
         )
 
+    def test_full_k_os_hoist_obeys_scored_bandwidth_weighted_choice(self):
+        """The full-K OS emit must hoist the SAME operand the chooser scored the
+        wall under — a bandwidth-weighted (not raw-byte) decision.
+
+        320×320 @ 64 BF16 on Ascend910B → output-stationary, square tile
+        (m = n = 160), a 2×2 grid. The two operand panels are byte-identical
+        (160×64 vs 64×160 BF16), so raw interior-extract traffic **ties**
+        (T_row == T_col). But L0A is faster than L0B (~200 vs ~132 B/cyc), so
+        streaming A across the grid is cheaper than streaming B: the chooser's
+        min-hoist load scores **hold B** (held_b ≈ 720 < held_a ≈ 825 cyc), and
+        records it in ``os_holds_a``. The emit therefore hoists B (column-outer).
+
+        This is a regression pin for the chooser/emit hoist-objective unification:
+        the previous emit re-derived the hoist from raw bytes, and on this tie it
+        picked ``T_row <= T_col`` → **A** — a loop order the wall was never scored
+        under (``estimated_cost_cycles`` assumed B). The single-source
+        ``os_holds_a`` makes the emitted hoist match the scored hoist by
+        construction, so this asserts **B**; it fails ("A") on the pre-fix code."""
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[320, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 320], pl.BF16],
+                out: pl.Out[pl.Tensor[[320, 320], pl.FP32]],
+            ) -> pl.Tensor[[320, 320], pl.FP32]:
+                lhs_mat: pl.Tile[[320, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [320, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 320], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 320], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[320, 320], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        _assert_ssa_valid(After, "test_full_k_os_hoist")
+        _assert_pipelined_full_k(After, n_pipeline_levels=2)
+        # Byte traffic ties on the square tile; the bandwidth-weighted scored hoist
+        # is B, so the emit must hoist B (column-outer). Pre-fix (byte heuristic)
+        # this was A — the assertion that pins the fix.
+        assert _full_k_stationary_operand(After) == "B", (
+            "OS full-K emit must obey the scored bandwidth-weighted hoist (hold B), "
+            "not the raw-byte tie (which held A)"
+        )
+
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        a = torch.randn(320, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 320, dtype=torch.bfloat16)
+        out = torch.zeros(320, 320, dtype=torch.float32)
+        ns: dict = {}
+        exec(torch_codegen(After), ns)  # noqa: S102
+        ns["kernel"](a, b, out)
+        expected = torch.matmul(a, b).float()
+        assert torch.allclose(out, expected, rtol=1e-2, atol=1e-2), (
+            f"OS hoist full-K mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
     def test_full_k_partial_boundary_is_peeled_into_tail(self):
         """When the chosen tile does not divide M/N, the full-K emitter pipelines
         the ``[0,full_m)×[0,full_n)`` interior (full m×n blocks) and peels the
