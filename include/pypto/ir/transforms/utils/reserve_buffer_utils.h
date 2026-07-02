@@ -135,6 +135,11 @@ inline ReserveBufferResolution ResolveReserveBufferBases(const FunctionPtr& func
 
     next_base = std::max(next_base, buffer_end);
 
+    // `reserved_end` is a max-END, not a free list: a reserve buffer placed high (e.g. base = 40 KB in a
+    // 64 KB space) makes reused buffers start above its end, even though [0, 40 KB) is free. This matches
+    // AllocateMemoryAddr's own placement (parity), so it is not a regression — but the capacity gate now
+    // makes it observable as a merge decision under pressure. A packed free-list would be a separate change
+    // to BOTH passes.
     auto& reserved_end = resolution.reserved_end_by_space[reserve_space];
     reserved_end = std::max(reserved_end, buffer_end);
   }

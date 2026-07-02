@@ -3947,7 +3947,7 @@ class TestCapacityGatedReuse:
             "sparse stages {0,2} are distinct; dense-ordinal mod k must keep them apart"
         )
 
-    def test_on_falls_back_when_coresident_tile_would_overflow(self):
+    def test_on_sheds_depth_when_coresident_tile_would_overflow(self):
         """Whole-space footprint safety with the *exact* SpaceFootprint: two 32 KB
         pipeline operands fill L0b at depth 2 (64 KB) on their own; a **co-live**
         non-pipeline Right tile ``np0`` (defined before stage 0, used after stage 1)
@@ -4467,6 +4467,118 @@ class TestCapacityGatedReuse:
         # After the shed the space fits at exactly cap — AllocateMemoryAddr must complete.
         allocated = passes.allocate_memory_addr()(after)
         assert allocated.get_function("kernel") is not None
+
+    def test_on_unknown_capacity_matches_off_not_merge_all(self):
+        """Unknown capacity (`cap == 0` — here no backend configured) must fall through to the
+        legacy predicate, **not** gate every group to F_g == 1. Gating to F_g == 1 would merge
+        everything and silently drop the legacy non-L0 load-only separation (#1900's Mat/L1 fix),
+        separating strictly *less* than flag-OFF. The fix makes flag-ON == flag-OFF byte-for-byte
+        when the budget is unknown, so "never worse than flag-OFF" holds for separation, not only
+        for overflow. Two cross-stage Vec (non-L0) *load* tiles: flag-OFF keeps them apart."""
+        backend.reset_for_testing()  # deliberately NO backend → GetMemSize == 0 for every space
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x0: pl.Tensor[[128, 96], pl.FP32],
+                x1: pl.Tensor[[128, 96], pl.FP32],
+                o0: pl.Out[pl.Tensor[[128, 96], pl.FP32]],
+                o1: pl.Out[pl.Tensor[[128, 96], pl.FP32]],
+            ) -> pl.Tensor[[128, 96], pl.FP32]:
+                r0: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    x0, [0, 0], [128, 96], target_memory=pl.Mem.Vec, attrs={"pipeline_membership": "0:0"}
+                )
+                s0: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.add(r0, r0)
+                o0 = pl.store(s0, [0, 0], o0)
+                r1: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    x1, [0, 0], [128, 96], target_memory=pl.Mem.Vec, attrs={"pipeline_membership": "0:1"}
+                )
+                s1: pl.Tile[[128, 96], pl.FP32, pl.Mem.Vec] = pl.tile.add(r1, r1)
+                o1 = pl.store(s1, [0, 0], o1)
+                return o1
+
+        off = self._collect_bases(passes.memory_reuse()(passes.init_mem_ref()(Before)), ("r0", "r1"))
+        with passes.PassContext([], capacity_gated_reuse=True):
+            on = self._collect_bases(passes.memory_reuse()(passes.init_mem_ref()(Before)), ("r0", "r1"))
+        assert off["r0"] is not off["r1"], "flag-OFF keeps the two cross-stage Vec load tiles separate"
+        assert on["r0"] is not on["r1"], (
+            "flag-ON with unknown capacity must NOT merge them (legacy fallthrough)"
+        )
+
+    def test_on_fallback_repacks_legacy_on_genuine_overflow(self):
+        """The ``force_legacy`` shed-loop floor (§8.4): when a tagged space genuinely cannot fit
+        at *any* depth, the shed exhausts (every group at F_g == 1) and the packer re-runs the
+        legacy flag-OFF predicate + logs a diagnostic. One pipeline group, 4 co-live 20 KB stages
+        (all four defined before any use ⇒ lifetimes overlap): 4×20 = 80 KB > 64 KB L0b, and
+        co-liveness keeps ``can_share`` false at every depth, so the shed can never reduce the
+        footprint and lands in ``force_legacy``. This is a real overflow flag-OFF would also hit,
+        so we don't assert allocation succeeds — we assert the branch's contract: flag-ON buffers
+        are **byte-identical to flag-OFF** (the fallback re-runs exactly the flag-OFF packing)."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                la: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 80], pl.BF16],
+                o0: pl.Out[pl.Tensor[[16, 80], pl.FP32]],
+                o1: pl.Out[pl.Tensor[[16, 80], pl.FP32]],
+                o2: pl.Out[pl.Tensor[[16, 80], pl.FP32]],
+                o3: pl.Out[pl.Tensor[[16, 80], pl.FP32]],
+            ) -> pl.Tensor[[16, 80], pl.FP32]:
+                lam: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    la, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                lt: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(lam, target_memory=pl.Mem.Left)
+                # all four stages of one group defined before any use → mutually co-live (20 KB each)
+                b0m: pl.Tile[[128, 80], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 80], target_memory=pl.Mem.Mat
+                )
+                r0: pl.Tile[[128, 80], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:0"}
+                )
+                b1m: pl.Tile[[128, 80], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 80], target_memory=pl.Mem.Mat
+                )
+                r1: pl.Tile[[128, 80], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:1"}
+                )
+                b2m: pl.Tile[[128, 80], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 80], target_memory=pl.Mem.Mat
+                )
+                r2: pl.Tile[[128, 80], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b2m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:2"}
+                )
+                b3m: pl.Tile[[128, 80], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 80], target_memory=pl.Mem.Mat
+                )
+                r3: pl.Tile[[128, 80], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b3m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:3"}
+                )
+                m0: pl.Tile[[16, 80], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, r0)
+                o0 = pl.store(m0, [0, 0], o0)
+                m1: pl.Tile[[16, 80], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, r1)
+                o1 = pl.store(m1, [0, 0], o1)
+                m2: pl.Tile[[16, 80], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, r2)
+                o2 = pl.store(m2, [0, 0], o2)
+                m3: pl.Tile[[16, 80], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, r3)
+                o3 = pl.store(m3, [0, 0], o3)
+                return o3
+
+        names = ("r0", "r1", "r2", "r3")
+        off = self._collect_bases(passes.memory_reuse()(passes.init_mem_ref()(Before)), names)
+        with passes.PassContext([], capacity_gated_reuse=True):
+            on = self._collect_bases(passes.memory_reuse()(passes.init_mem_ref()(Before)), names)
+        # co-live ⇒ legacy keeps all four separate; the fallback must reproduce exactly that.
+        assert len({off[n].name_hint for n in names}) == 4, "flag-OFF keeps the 4 co-live operands separate"
+        assert {n: off[n].name_hint for n in names} == {n: on[n].name_hint for n in names}, (
+            "force_legacy fallback must reproduce the flag-OFF packing byte-for-byte"
+        )
 
 
 if __name__ == "__main__":

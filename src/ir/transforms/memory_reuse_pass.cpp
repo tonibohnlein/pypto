@@ -1613,6 +1613,12 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   std::map<std::pair<MemorySpace, int32_t>, int32_t> group_depth;  // (space, group) -> F_g (mutable)
   std::map<std::pair<MemorySpace, int32_t>, std::map<int32_t, int32_t>>
       group_stage_ordinal;  // stage->ordinal
+  // Spaces with a *known* (non-zero) capacity — only these are capacity-gated. A space whose bound is
+  // unknown (`cap == 0`, incl. no backend configured) falls through to the legacy predicate: gating it to
+  // F_g == 1 would merge *everything*, dropping even the legacy non-L0 load-only separation (#1900) and
+  // thus separating strictly LESS than flag-OFF. Legacy-for-unknown makes "never worse than flag-OFF" hold
+  // for separation too, not just for overflow.
+  std::set<MemorySpace> capacity_known_spaces;
   if (capacity_gated) {
     const backend::Backend* be = backend::BackendConfig::IsConfigured() ? backend::GetBackend() : nullptr;
     std::map<std::pair<MemorySpace, int32_t>, std::set<int32_t>> group_stages;
@@ -1628,8 +1634,11 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     for (const auto& [key, slot] : group_slot) {
       const uint64_t cap = be ? be->GetMemSize(key.first) : 0;
       const int32_t depth = static_cast<int32_t>(group_stages[key].size());
-      int32_t f = 1;  // cap == 0 (unknown capacity) ⇒ conservative merge
-      if (cap != 0 && slot != 0) f = std::min(depth, std::max<int32_t>(1, static_cast<int32_t>(cap / slot)));
+      int32_t f = 1;  // cap == 0 (unknown capacity) ⇒ this space is NOT gated (legacy predicate below)
+      if (cap != 0 && slot != 0) {
+        f = std::min(depth, std::max<int32_t>(1, static_cast<int32_t>(cap / slot)));
+        capacity_known_spaces.insert(key.first);
+      }
       group_depth[key] = f;
       int32_t ordinal = 0;  // stages may be sparse; compare dense ordinals mod F, not raw stage mod F
       for (const int32_t st : group_stages[key]) group_stage_ordinal[key][st] = ordinal++;
@@ -1639,13 +1648,15 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   // flag-OFF path for a space whose gated packing overflowed — so the fallback is legacy by construction.
   bool force_legacy = false;
   auto pipeline_blocks = [&pipeline_membership, &pipeline_load_tiles, &is_l0_space, &group_depth,
-                          &group_stage_ordinal, &force_legacy,
+                          &group_stage_ordinal, &force_legacy, &capacity_known_spaces,
                           capacity_gated](const LifetimeInterval& a, const LifetimeInterval& b) {
     // The binding matmul operands live in L0 and are `tile.move` results, so the legacy guard's
     // `is_l0_space` exemption AND its load-only restriction both skip them — the per-stage operands
     // merge (8 → 1) and the cube matmuls serialize. When the flag is on, protect pipeline operands in
-    // every space and regardless of load/move, up to the max-affordable double-buffering depth.
-    const bool gated = capacity_gated && !force_legacy;
+    // every space and regardless of load/move, up to the max-affordable double-buffering depth. A space
+    // whose capacity is unknown (`cap == 0`) is NOT gated — it uses the legacy predicate, so flag-ON is
+    // never worse than flag-OFF there. (a and b share a memory space — reuse only happens within a space.)
+    const bool gated = capacity_gated && !force_legacy && capacity_known_spaces.count(a.memory_space) != 0;
     if (!gated && is_l0_space(a.memory_space)) return false;  // legacy: L0 exempt
     auto ia = pipeline_membership.find(a.variable.get());
     if (ia == pipeline_membership.end()) return false;
