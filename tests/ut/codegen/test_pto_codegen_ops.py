@@ -1608,8 +1608,10 @@ class TestTileAssembleCodegen:
         """End-to-end: an oversized chained matmul whose bf16 result is consumed on-chip
         tiles into an L1/Mat scratch via the Acc->Mat **FIXPIPE writeback** — each
         per-sub-tile assemble lowers to ``pto.tinsert`` (the offset Acc->Mat path on
-        A2/A3, which downcasts f32->bf16), filling a bf16 Mat scratch. (Assembles green
-        through ptoas v0.45.)"""
+        A2/A3, which downcasts f32->bf16), filling a bf16 Mat scratch. Under the
+        drain-count cost model (#1912) the 256x256x256 producer picks (256,128,64) OS
+        split-K (wider m halves the drain count) → a 1x2 grid → 2 tinserts. (Assembles
+        green through ptoas v0.45.)"""
 
         @pl.program
         class Prog:
@@ -1631,7 +1633,7 @@ class TestTileAssembleCodegen:
 
         mlir = self._generate_mlir_all_incore(Prog)
         tinserts = [line for line in mlir.splitlines() if "pto.tinsert" in line]
-        assert len(tinserts) == 4, f"2x2 grid -> 4 Acc->Mat tinserts, got {len(tinserts)}:\n{mlir}"
+        assert len(tinserts) == 2, f"1x2 grid (m=256, n=128) -> 2 Acc->Mat tinserts, got {len(tinserts)}:\n{mlir}"
         assert "loc=mat, dtype=bf16" in mlir, (
             f"the chained-matmul intermediate must be a bf16 Mat scratch:\n{mlir}"
         )

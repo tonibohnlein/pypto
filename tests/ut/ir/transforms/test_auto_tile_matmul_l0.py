@@ -1145,10 +1145,13 @@ class TestAutoTileMatmulL0MNTiling:
         outer (M) loop carrying A's extract + a **pipelined** inner (N) loop — one
         pipeline, not the two nested pipelines of the output-stationary path.
 
-        496×544 @ 64 → A-stationary (m=496, n=32, k=64): A = [496, 64] = 63.5 KB
-        fits L0A single-buffered (≤ 64 KB) but would overflow double-buffered, so
-        the single-buffered Sequential outer is what makes the chooser's tile legal;
-        the full Default pipeline must allocate cleanly. (Numerics: st suite.)"""
+        496×544 @ 64 → A-stationary (m=496, n=64, k=64) under the drain-count model
+        (#1912): A = [496, 64] = 63.5 KB fits L0A single-buffered (≤ 64 KB) but would
+        overflow double-buffered, so the single-buffered Sequential outer is what
+        makes the tile legal. n=64 (not the pre-drain-count n=32) cuts the drain
+        count in half; 544 = 8*64 + 32, so the inner pipeline runs the 8 full 64-wide
+        blocks and a straight-line 32-wide N-peel follows. The full Default pipeline
+        must allocate cleanly. (Numerics: st suite.)"""
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
@@ -1193,18 +1196,27 @@ class TestAutoTileMatmulL0MNTiling:
                     a_held: pl.Tile[[496, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
                         lhs_mat, mo, 0, [496, 64], target_memory=pl.Mem.Left
                     )
-                    # Pipelined inner (N) loop streams B double-buffered.
+                    # Pipelined inner (N) loop over the 8 full 64-wide blocks; B double-buffered.
                     for ni, (out_i,) in pl.pipeline(
-                        0, 544, 32, stage=2, init_values=(out_o,), attrs={"pipeline_overlap_stores": False}
+                        0, 512, 64, stage=2, init_values=(out_o,), attrs={"pipeline_overlap_stores": False}
                     ):
-                        b_mov: pl.Tile[[64, 32], pl.BF16, pl.Mem.Right] = pl.tile.extract(
-                            rhs_mat, 0, ni, [64, 32], target_memory=pl.Mem.Right
+                        b_mov: pl.Tile[[64, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                            rhs_mat, 0, ni, [64, 64], target_memory=pl.Mem.Right
                         )
-                        c_sub: pl.Tile[[496, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_held, b_mov)
+                        c_sub: pl.Tile[[496, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_held, b_mov)
                         out_s: pl.Tensor[[496, 544], pl.FP32] = pl.store(c_sub, [mo, ni], out_i)
                         out_iy = pl.yield_(out_s)
                     out_oy = pl.yield_(out_iy)
-                return out_oy
+                # N-boundary peel: the last 32-wide block (544 = 8*64 + 32), straight-line.
+                a_peel: pl.Tile[[496, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                    lhs_mat, 0, 0, [496, 64], target_memory=pl.Mem.Left
+                )
+                b_peel: pl.Tile[[64, 32], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                    rhs_mat, 0, 512, [64, 32], target_memory=pl.Mem.Right
+                )
+                c_peel: pl.Tile[[496, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_peel, b_peel)
+                out_peel: pl.Tensor[[496, 544], pl.FP32] = pl.store(c_peel, [0, 512], out_oy)
+                return out_peel
 
         After = passes.auto_tile_matmul_l0()(Before)
         ir.assert_structural_equal(After, Expected)
@@ -1234,8 +1246,11 @@ class TestAutoTileMatmulL0MNTiling:
         held B is the outer (Sequential) panel and A the moving (pipelined) inner
         panel — the loop order flips vs A-stationary, the single-buffering does not.
 
-        256×272 @ 64 → B-stationary (m=64, n=272, k=64): B = [64, 272] held in full
-        L0B, A = [64, 64] streamed across the 4 m-blocks."""
+        192×512 @ 64 → B-stationary (m=64, n=512, k=64) under the drain-count model
+        (#1912): B = [64, 512] = 64 KB held in full L0B single-buffered (double would
+        overflow), A = [64, 64] streamed across the 3 clean m-blocks. (256×272 no
+        longer selects B-stationary under the drain-count model — B-stat splits the
+        output over M, so on that small shape output-stationary has fewer drains.)"""
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
@@ -1246,17 +1261,17 @@ class TestAutoTileMatmulL0MNTiling:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                lhs: pl.Tensor[[256, 64], pl.BF16],
-                rhs: pl.Tensor[[64, 272], pl.BF16],
-                out: pl.Out[pl.Tensor[[256, 272], pl.FP32]],
-            ) -> pl.Tensor[[256, 272], pl.FP32]:
-                lhs_mat: pl.Tile[[256, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    lhs, [0, 0], [256, 64], target_memory=pl.Mem.Mat
+                lhs: pl.Tensor[[192, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[192, 512], pl.FP32]],
+            ) -> pl.Tensor[[192, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[192, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [192, 64], target_memory=pl.Mem.Mat
                 )
-                rhs_mat: pl.Tile[[64, 272], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    rhs, [0, 0], [64, 272], target_memory=pl.Mem.Mat
+                rhs_mat: pl.Tile[[64, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 512], target_memory=pl.Mem.Mat
                 )
-                c: pl.Tile[[256, 272], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                c: pl.Tile[[192, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
                 out = pl.store(c, [0, 0], out)
                 return out
 
@@ -1265,30 +1280,30 @@ class TestAutoTileMatmulL0MNTiling:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                lhs: pl.Tensor[[256, 64], pl.BF16],
-                rhs: pl.Tensor[[64, 272], pl.BF16],
-                out: pl.Out[pl.Tensor[[256, 272], pl.FP32]],
-            ) -> pl.Tensor[[256, 272], pl.FP32]:
-                lhs_mat: pl.Tile[[256, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    lhs, [0, 0], [256, 64], target_memory=pl.Mem.Mat
+                lhs: pl.Tensor[[192, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[192, 512], pl.FP32]],
+            ) -> pl.Tensor[[192, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[192, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [192, 64], target_memory=pl.Mem.Mat
                 )
-                rhs_mat: pl.Tile[[64, 272], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    rhs, [0, 0], [64, 272], target_memory=pl.Mem.Mat
+                rhs_mat: pl.Tile[[64, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 512], target_memory=pl.Mem.Mat
                 )
                 # Sequential outer (N) loop holds the single-buffered B panel (full L0B).
-                for no, (out_o,) in pl.range(0, 272, 272, init_values=(out,)):
-                    b_held: pl.Tile[[64, 272], pl.BF16, pl.Mem.Right] = pl.tile.extract(
-                        rhs_mat, 0, no, [64, 272], target_memory=pl.Mem.Right
+                for no, (out_o,) in pl.range(0, 512, 512, init_values=(out,)):
+                    b_held: pl.Tile[[64, 512], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, 0, no, [64, 512], target_memory=pl.Mem.Right
                     )
-                    # Pipelined inner (M) loop streams A double-buffered.
+                    # Pipelined inner (M) loop streams A double-buffered over 3 m-blocks.
                     for mi, (out_i,) in pl.pipeline(
-                        0, 256, 64, stage=2, init_values=(out_o,), attrs={"pipeline_overlap_stores": False}
+                        0, 192, 64, stage=2, init_values=(out_o,), attrs={"pipeline_overlap_stores": False}
                     ):
                         a_mov: pl.Tile[[64, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
                             lhs_mat, mi, 0, [64, 64], target_memory=pl.Mem.Left
                         )
-                        c_sub: pl.Tile[[64, 272], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_mov, b_held)
-                        out_s: pl.Tensor[[256, 272], pl.FP32] = pl.store(c_sub, [mi, no], out_i)
+                        c_sub: pl.Tile[[64, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_mov, b_held)
+                        out_s: pl.Tensor[[192, 512], pl.FP32] = pl.store(c_sub, [mi, no], out_i)
                         out_iy = pl.yield_(out_s)
                     out_oy = pl.yield_(out_iy)
                 return out_oy
@@ -1301,9 +1316,9 @@ class TestAutoTileMatmulL0MNTiling:
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         torch.manual_seed(0)
-        a = torch.randn(256, 64, dtype=torch.bfloat16)
-        b = torch.randn(64, 272, dtype=torch.bfloat16)
-        out = torch.zeros(256, 272, dtype=torch.float32)
+        a = torch.randn(192, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 512, dtype=torch.bfloat16)
+        out = torch.zeros(192, 512, dtype=torch.float32)
         ns: dict = {}
         exec(torch_codegen(After), ns)  # noqa: S102
         ns["kernel"](a, b, out)
@@ -1669,9 +1684,10 @@ class TestAutoTileMatmulL0MatScratch:
     def test_chained_matmul_uses_mat_scratch(self):
         """An oversized producer feeding a matmul: the pass assembles the result into an
         L1/Mat scratch via per-sub-tile Acc→Mat assembles, and the consumer reads the
-        scratch on-chip (no DDR — the L0C→L1→L0A trip).  256×256 @ 256 producer: the
-        roofline chooser picks (128,128,128) **output-stationary** split-K → a 2×2 grid
-        → 4 Acc→Mat assembles at constant offsets; the consumer is also output-stationary.
+        scratch on-chip (no DDR — the L0C→L1→L0A trip).  256×256 @ 256 producer: under
+        the drain-count cost model (#1912) the chooser picks (256, 128, 64)
+        **output-stationary** split-K (wider m halves the drain count) → a 1×2 grid
+        → 2 Acc→Mat assembles at constant offsets; the consumer is also output-stationary.
 
         The dims are chosen so BOTH matmuls are output-stationary: their L0 operand
         buffers are the same 32 KB shape, so the producer's (sequential, dead before the
@@ -1703,8 +1719,8 @@ class TestAutoTileMatmulL0MatScratch:
         printed = ir.python_print(After)
 
         assert "tile.create" in printed and "Mem.Mat" in printed, "expected a Mat output scratch"
-        assert printed.count("pl.tile.assemble(") == 4, (
-            "output-stationary split-K 2×2 grid → 4 Acc→Mat assembles at constant offsets"
+        assert printed.count("pl.tile.assemble(") == 2, (
+            "output-stationary split-K 1×2 grid (m=256, n=128) → 2 Acc→Mat assembles at constant offsets"
         )
         assert "pl.tile.matmul(a__ssa_v0_mat, b__ssa_v0_mat)" not in printed, (
             "the oversized producer must be tiled, not left whole"

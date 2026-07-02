@@ -98,11 +98,12 @@ struct L0TileConfig {
   // chooser scores wall-clock directly: wall ~= max(C_load, C_mad) + C_drain.
   // Defaults are Ascend a2a3 (910B) for the common BF16 x BF16 -> FP32 GEMM, so
   // standalone callers (tests) get a sane model without wiring a backend.
-  double bw_a = 200.0;           // L1->L0A bytes/cycle (op-sim work-fit; datasheet 238).
-  double bw_b = 132.0;           // L1->L0B bytes/cycle (op-sim work-fit; ~1.5:1 vs L0A, not 2:1).
-  double bw_drain = 69.19;       // L0C->L1 drain bytes/cycle (128 GB/s).
-  int mad_head = 6;              // Fixed per-TMATMUL issue overhead.
-  int mad_k_fractal_bytes = 32;  // Cube K-fractal width (kt = this / bytes_a).
+  double bw_a = 200.0;                // L1->L0A bytes/cycle (op-sim work-fit; datasheet 238).
+  double bw_b = 132.0;                // L1->L0B bytes/cycle (op-sim work-fit; ~1.5:1 vs L0A, not 2:1).
+  double bw_drain = 118.0;            // FIXPIPE L0C drain bytes/cycle (op-sim work-fit; per-drain slope).
+  double drain_fixed_cycles = 245.0;  // Per-FIXPIPE-drain fixed overhead (penalizes M/N-split, not K-split).
+  int mad_head = 6;                   // Fixed per-TMATMUL issue overhead.
+  int mad_k_fractal_bytes = 32;       // Cube K-fractal width (kt = this / bytes_a).
 
   // Whether the chooser may pick a tile dimension larger than the problem
   // dimension (i.e. pad M / N / K up to reach `min_m` / `min_n` / `min_k`).
