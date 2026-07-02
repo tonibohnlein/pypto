@@ -598,6 +598,7 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   cfg.bw_a = cost_model.bw_l0a;
   cfg.bw_b = cost_model.bw_l0b;
   cfg.bw_drain = cost_model.bw_drain;
+  cfg.drain_fixed_cycles = cost_model.drain_fixed_cycles;
   cfg.mad_head = cost_model.mad_head_cycles;
   cfg.mad_k_fractal_bytes = cost_model.mad_k_fractal_bytes;
   cfg.bytes_a = bytes_a;

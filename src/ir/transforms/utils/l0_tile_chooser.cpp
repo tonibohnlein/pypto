@@ -202,12 +202,21 @@ double LoadCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r)
   return std::min(held_a, held_b);
 }
 
-// L0C drain cost. Shape-invariant (every output element drains once; gamma_c=2
-// when the accumulator is read), so under dbC=1 it shifts wall uniformly across
-// candidates and does not change the pick -- included so the value is honest.
-double DrainCycles(const L0TileConfig& cfg) {
+// L0C drain cost over the full problem. FIXPIPE drains one output tile at a time:
+// each drain pays a fixed issue overhead plus its bytes at the drain bandwidth,
+// and there are ceil(M/m)*ceil(N/n) output tiles. So drain is TILE-DEPENDENT --
+// splitting the OUTPUT (M/N) raises the drain count, while splitting K does NOT
+// (partial sums accumulate in the single L0C, one drain per (m,n) block). This
+// is the term that stops the chooser from over-splitting M/N on shallow-K shapes
+// (op-sim device-validated: per-drain work = drain_fixed_cycles + bytes/bw_drain;
+// omitting it under-priced M/N-split tiles and cost 2-13% on small shallow-K).
+// NOTE: bw_drain is the 32-aligned-N slope; N % 32 != 0 drains slower (a separate
+// fixpipe fractal cliff) -- not modelled, ~ranking-neutral within a problem.
+double DrainCycles(int m, int n, const L0TileConfig& cfg) {
   const double gamma_c = cfg.c_read ? 2.0 : 1.0;
-  return gamma_c * static_cast<double>(cfg.bytes_c) * cfg.M * cfg.N / cfg.bw_drain;
+  const double num_drains = static_cast<double>(CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n));
+  const double bytes = gamma_c * static_cast<double>(cfg.bytes_c) * m * n;
+  return num_drains * (cfg.drain_fixed_cycles + bytes / cfg.bw_drain);
 }
 
 // Roofline wall in cycles. With a single L0C (drain_hidden=false) the FIXPIPE
@@ -216,7 +225,7 @@ double DrainCycles(const L0TileConfig& cfg) {
 // the next tile's compute, so it JOINS the maximum instead of adding.
 int64_t WallCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
   const double compute = std::max(LoadCycles(m, n, k, cfg, r), static_cast<double>(MadCycles(m, n, k, cfg)));
-  const double drain = DrainCycles(cfg);
+  const double drain = DrainCycles(m, n, cfg);
   const double wall = r.dbc ? std::max(compute, drain) : compute + drain;
   // Guard the float->int cast: a non-finite or out-of-exact-range wall would be UB.
   // Given the validated positive bandwidths and aligned-bounded dims this never fires.

@@ -25,11 +25,13 @@ namespace backend {
 /**
  * @brief Closed-form GEMM cost-model parameters consumed by ChooseL0Tile.
  *
- * Bandwidths are in BYTES PER CORE CYCLE (GB/s ÷ clock-GHz), so the chooser can
- * weight L1->L0 traffic and the L0C drain directly in cycles. Defaults are
- * Ascend a2a3 (910B), grounded in the pto-isa perf-sim cost model:
- *   L1->L0A 441 GB/s, L1->L0B 220.5 GB/s (exactly half — the cube's port
- *   asymmetry), L0C->L1 drain 128 GB/s, all @ 1.85 GHz.
+ * Bandwidths are in BYTES PER CORE CYCLE, so the chooser can weight L1->L0
+ * traffic and the L0C drain directly in cycles. Defaults are Ascend a2a3 (910B),
+ * op-sim work-calibrated: L1->L0A ~200, L1->L0B ~132 B/cyc (~1.5:1, not the
+ * datasheet 2:1). The FIXPIPE L0C drain is PER-DRAIN: `drain_fixed_cycles` issue
+ * overhead plus `bytes_c*m*n/bw_drain`, scaled by the output-tile count
+ * `ceil(M/m)*ceil(N/n)` -- so splitting the OUTPUT (M/N) adds drains while
+ * splitting K does not (accumulate in one L0C). Device-validated (op-sim).
  *
  * The MAD term mirrors the cube's per-TMATMUL cost
  * `mad_head_cycles + cpr * ceil(m/16) * ceil(k/kt) * ceil(n/16)`, where
@@ -40,8 +42,10 @@ struct L0CostModel {
   double bw_l0a = 200.0;  ///< L1->L0A bytes/cycle (a2a3 op-sim work-fit; datasheet 441 GB/s/1.85 GHz = 238).
   double bw_l0b =
       132.0;  ///< L1->L0B bytes/cycle (a2a3 op-sim work-fit; ~1.5:1 vs L0A, not the datasheet 2:1).
-  double bw_drain = 69.19;       ///< L0C->L1 drain bytes/cycle (a2a3: 128 GB/s / 1.85 GHz).
-  int mad_head_cycles = 6;       ///< Fixed per-TMATMUL issue overhead.
+  double bw_drain = 118.0;  ///< FIXPIPE L0C drain bytes/cycle (a2a3 op-sim work-fit; per-drain byte slope).
+  double drain_fixed_cycles =
+      245.0;                ///< Per-FIXPIPE-drain fixed cycles (a2a3 op-sim work-fit; penalizes M/N-split).
+  int mad_head_cycles = 6;  ///< Fixed per-TMATMUL issue overhead.
   int mad_k_fractal_bytes = 32;  ///< Cube K-fractal width in bytes (kt = this / bytes_a).
 };
 

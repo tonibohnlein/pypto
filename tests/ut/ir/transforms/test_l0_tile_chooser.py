@@ -76,35 +76,39 @@ class TestL0TilingDocExamples:
     """Pin the five examples in L0_TILING.md §12 (Examples 1-5)."""
 
     def test_example_1_skinny_gemm(self):
-        """M=16, N=256, K=512 → (16, 32, 512) under the op-sim-calibrated load model
-        (full-K hoist of the [16, 512] A-panel; N split so B streams). Matches the
-        brute-force optimum. (Pre-calibration this was (16, 256, 64).)"""
+        """M=16, N=256, K=512 → (16, 256, 64) under the drain-count cost model.
+
+        The full-K hoist (16, 32, 512) has lower load but splits N into 8 output
+        tiles → 8 FIXPIPE drains; the per-drain fixed overhead outweighs the load
+        saving, so the chooser keeps the whole N (1 drain) and splits K instead.
+        Matches the brute-force optimum. (op-sim device-validated: the 8-drain
+        over-split is 2-13% slower on shallow-K shapes.)"""
         cfg = _default_config(M=16, N=256, K=512)
         result = passes.l0_tile_chooser.choose_l0_tile(cfg)
-        assert (result.m, result.n, result.k) == (16, 32, 512)
+        assert (result.m, result.n, result.k) == (16, 256, 64)
         assert _capacities_ok(result.m, result.n, result.k, cfg)
         assert result.perf_hint == ""
 
     def test_example_2_large_square_gemm(self):
-        """M=N=K=4096 → (128, 128, 128) under the roofline cost model.
+        """M=N=K=4096 → (256, 128, 64) under the drain-count cost model.
 
         This GEMM is deeply compute-bound: C_mad (~1.8e7 cycles) dwarfs C_load,
-        so every cube-filling tile ties on wall = max(C_load, C_mad) + C_drain.
-        The lex tie-break then prefers fewer K-blocks (larger k), selecting the
-        balanced (128, 128, 128): m*k = k*n = 16384 = A0 = B0 with k=128 the
-        largest aligned divisor of K that fits both operand buffers. The
-        brute-force oracle (see test_matches_bruteforce_optimum) confirms this
-        is the global wall-minimum. (Supersedes the earlier bytes-traffic
-        heuristic, which cited an ~(176, 176, 64) continuous optimum.)
+        so cube-filling tiles tie on max(C_load, C_mad). Among those the drain-count
+        term (num_drains = ceil(M/m)*ceil(N/n)) breaks the tie toward FEWER output
+        tiles: the wider m=256 halves the M-block count vs m=128. m=256 forces
+        k<=64 (L0A holds m*k*2*dbA <= 64KB), giving (256, 128, 64). The brute-force
+        oracle confirms the global wall-minimum. Device-neutral vs (128,128,128)
+        on large compute-bound shapes (op-sim sweep-4: <1% wash); the drain-count
+        term earns its keep on the SMALL shallow-K shapes it de-over-splits.
         """
         cfg = _default_config(M=4096, N=4096, K=4096)
         result = passes.l0_tile_chooser.choose_l0_tile(cfg)
-        assert (result.m, result.n, result.k) == (128, 128, 128)
+        assert (result.m, result.n, result.k) == (256, 128, 64)
         assert _capacities_ok(result.m, result.n, result.k, cfg)
         assert cfg.K % result.k == 0, f"k must divide K=4096; got k={result.k}"
 
     def test_example_3_c_double_buffer_declined_when_compute_bound(self):
-        """M=N=K=4096 with allow_double_buffer_c=True → still (128, 128, 128), dbC=1.
+        """M=N=K=4096 with allow_double_buffer_c=True → still (256, 128, 64), dbC=1.
 
         This GEMM is deeply compute-bound (C_mad dwarfs C_drain), so hiding the
         drain behind the next tile's compute buys nothing while halving the L0C
@@ -114,7 +118,7 @@ class TestL0TilingDocExamples:
         cfg = _default_config(M=4096, N=4096, K=4096)
         cfg.allow_double_buffer_c = True
         result = passes.l0_tile_chooser.choose_l0_tile(cfg)
-        assert (result.m, result.n, result.k) == (128, 128, 128)
+        assert (result.m, result.n, result.k) == (256, 128, 64)
         assert result.double_buffer_c is False
         assert _capacities_ok(result.m, result.n, result.k, cfg, dbc=result.double_buffer_c)
 
@@ -331,7 +335,12 @@ def _wall_key(m: int, n: int, k: int, cfg, stat: str, dbc: bool) -> tuple:
     cpr = max(1, cfg.bytes_a // 2)
     per = cfg.mad_head + cpr * _cdiv(m, cfg.align_m) * _cdiv(k, kt) * _cdiv(n, cfg.align_n)
     mad = _cdiv(M, m) * _cdiv(N, n) * _cdiv(K, k) * per
-    drain = (2.0 if cfg.c_read else 1.0) * cfg.bytes_c * M * N / cfg.bw_drain
+    # Tile-dependent FIXPIPE drain: one drain per (m, n) output block, each paying a
+    # fixed issue overhead + its bytes at bw_drain (mirrors C++ DrainCycles). M/N-split
+    # raises the drain count; K-split does not. Penalizes over-splitting the output.
+    num_drains = _cdiv(M, m) * _cdiv(N, n)
+    per_drain = cfg.drain_fixed_cycles + (2.0 if cfg.c_read else 1.0) * cfg.bytes_c * m * n / cfg.bw_drain
+    drain = num_drains * per_drain
     compute = max(load, float(mad))
     wall = int((max(compute, drain) if dbc else compute + drain) + 0.5)
     pvol = _cdiv(M, m) * m * _cdiv(N, n) * n * _cdiv(K, k) * k
@@ -669,7 +678,7 @@ class TestL0TilingRooflineMigration:
             ),  # min-hoist: aspect tie -> enum order picks m<n
             (272, 272, 64, 2, (192, 160, 64), (272, 96, 32)),
             (320, 320, 64, 2, (192, 160, 64), (160, 160, 64)),
-            (256, 256, 256, 4, (192, 160, 32), (128, 128, 64)),
+            (256, 256, 256, 4, (192, 160, 32), (256, 128, 32)),
         ],
     )
     def test_roofline_tile_migration(self, M, N, K, bytes_ab, old_closed_form, new_roofline):

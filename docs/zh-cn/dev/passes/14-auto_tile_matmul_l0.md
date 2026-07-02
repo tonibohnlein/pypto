@@ -66,7 +66,7 @@ program_tiled = l0_tile_pass(program)
 - 当 FIXPIPE 的 L0C→L1 drain 暴露在外（单 L0C）时，`wall ≈ max(C_load, C_mad) + C_drain`；
 - 当 drain 被计算掩盖（L0C 双缓冲）时，`wall ≈ max(C_load, C_mad, C_drain)`。
 
-`C_load` 是所选循环序下 L1→L0A/L0B 的操作数流量，按 `GetL0CostModel()` 给出的各 buffer 带宽缩放（L0A 约为 L0B 的 2 倍）；`C_mad` 是 cube MAD 代价（每条 `TMATMUL` 的发射开销 × K-fractal 数）；`C_drain` 是 L0C→L1 回写。搜索对每个 `(m, n)` 的**所有**合法 `k` 都穷举（不是只取最大合法 k —— 当 `kt ≠ align_k` 时 `⌈K/k⌉·⌈k/kt⌉` 关于 `k` 非单调）。wall 平局时按 `(padded_compute, ⌈K/k⌉, C_load, …)` 字典序决出；其中 `C_load` 键在 MAD-bound 的 `(m,n)`↔`(n,m)` 平局中挑出隐藏 load 更低的那一侧（L0B 带宽减半，故 m-block 更少者更省）。
+`C_load` 是所选循环序下 L1→L0A/L0B 的操作数流量，按 `GetL0CostModel()` 给出的各 buffer 带宽缩放（op-sim 实测标定：L0A 约为 L0B 的 1.5 倍，而非 datasheet 的 2 倍）；`C_mad` 是 cube MAD 代价（每条 `TMATMUL` 的发射开销 × K-fractal 数）。`C_drain` 是 FIXPIPE 的 L0C→L1 回写，**按每个输出 tile 计费**：`⌈M/m⌉·⌈N/n⌉ · (drain_fixed + bytes_c·m·n / bw_drain)`。由于 drain 数为 `⌈M/m⌉·⌈N/n⌉`，**拆分输出（M/N）会增加 drain 数，而拆分 K 不会**（部分和在单块 L0C 上累加，每个 `(m,n)` 块只回写一次）—— 这一每-drain 固定开销正是阻止 chooser 在浅 K 形状上过度拆分 M/N 的关键（op-sim 设备验证：早期与形状无关的 drain 对 M/N-拆分 tile 低估了 2–13%）。搜索对每个 `(m, n)` 的**所有**合法 `k` 都穷举（不是只取最大合法 k —— 当 `kt ≠ align_k` 时 `⌈K/k⌉·⌈k/kt⌉` 关于 `k` 非单调）。wall 平局时按 `(padded_compute, ⌈K/k⌉, C_load, …)` 字典序决出；其中 `C_load` 键在 MAD-bound 的 `(m,n)`↔`(n,m)` 平局中挑出隐藏 load 更低的那一侧（L0B 带宽更慢，故 m-block 更少者更省）。
 
 搜索覆盖**设计空间（design space）** `P = (m, n, k, stationarity, dbC)`：
 
