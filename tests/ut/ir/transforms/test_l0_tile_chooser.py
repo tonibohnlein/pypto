@@ -333,8 +333,15 @@ def _wall_key(m: int, n: int, k: int, cfg, stat: str, dbc: bool) -> tuple:
     load = _load_cycles(m, n, k, cfg, stat)
     kt = max(1, cfg.mad_k_fractal_bytes // cfg.bytes_a)
     cpr = max(1, cfg.bytes_a // 2)
-    per = cfg.mad_head + cpr * _cdiv(m, cfg.align_m) * _cdiv(k, kt) * _cdiv(n, cfg.align_n)
-    mad = _cdiv(M, m) * _cdiv(N, n) * _cdiv(K, k) * per
+    # Tail-aware K-fractal count (mirrors C++ MadCycles): floor(K/k) full k-wide
+    # blocks + a narrower peel tail (width K - floor(K/k)*k) scored at its own
+    # width, not rounded up to k. For a divisor k this is (K/k)*ceil(k/kt).
+    num_full = K // k
+    k_tail = K - num_full * k
+    k_blocks = num_full + (1 if k_tail > 0 else 0)  # == ceil(K/k)
+    k_fractals = num_full * _cdiv(k, kt) + (_cdiv(k_tail, kt) if k_tail > 0 else 0)
+    per_mn = k_blocks * cfg.mad_head + cpr * _cdiv(m, cfg.align_m) * k_fractals * _cdiv(n, cfg.align_n)
+    mad = _cdiv(M, m) * _cdiv(N, n) * per_mn
     # Tile-dependent FIXPIPE drain: one drain per (m, n) output block, each paying a
     # fixed issue overhead + its bytes at bw_drain (mirrors C++ DrainCycles). M/N-split
     # raises the drain count; K-split does not. Penalizes over-splitting the output.
