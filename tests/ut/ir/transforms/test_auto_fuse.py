@@ -28,31 +28,41 @@ import pytest
 from pypto import codegen, ir, passes
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
-# The AutoFuse emit exercised below was co-designed with the pre-grounding
-# (competition-era) cost model. The cost-model rework (grounded HBM aggregate cap,
-# vector cost model, MTE1 tiebreaker) together with the upstream #1895 auto_chunk
-# removal changed the solver's decisions out from under it (e.g. small matmuls now
-# take the split-K path), so the emit in auto_fuse_pass.cpp -- and every assertion
-# here -- is stale. These tests are skipped (not deleted, to preserve the
-# scaffolding) pending a revision of the emit against the grounded cost model, at
-# which point they get rewritten alongside it.
-pytestmark = pytest.mark.skip(
-    reason="AutoFuse emit + tests stale pending revision against the grounded cost model (post #1895 merge)"
+# The AutoFuse emit was co-designed with the pre-grounding (competition-era) cost
+# model. The grounded rework (HBM aggregate cap, vector cost model, MTE1 tiebreaker)
+# plus the upstream #1895 auto_chunk removal changed the solver's decisions (e.g. small
+# matmuls now take the split-K path) AND migrated the emit onto SPMD (pl.spmd + a
+# CORE_GROUP split-K seed + atomic-add merge), so the old `pl.auto_chunk` /
+# `pl.pipeline(stage=2)` / `matmul_acc` assertions are stale.
+#
+# These tests are being re-derived against the grounded SPMD emit ONE case at a time.
+# A rewritten, live test drops the marker below; every case not yet re-derived keeps
+# `@_STALE_EMIT` until its turn. (Re-activated so far: single-matmul emit.)
+_STALE_EMIT = pytest.mark.skip(
+    reason="AutoFuse emit test stale pending re-derivation against the grounded SPMD emit "
+    "(#1895); re-activated incrementally"
 )
 
 
 class TestAutoFuse:
     """AutoFuse solver-driven fusion + emit."""
 
-    def test_single_matmul_emits_chunked_tiled_kernel(self):
-        """A lone matmul becomes the solver's output ``[w,h]`` tiling distributed
-        across cores.
+    def test_single_matmul_emits_spmd_tiled_split_k_kernel(self, ascend_backend):
+        """A lone 64x64 matmul becomes the grounded solver's SPMD output tiling with split-K.
 
-        An AutoInCore (``chunked_loop_optimizer``) scope wraps chunked ``parallel``
-        loops over the output tiles — the existing Split/Interchange/Outline passes
-        distribute those tiles across cores. Each tile's body streams the
-        contraction in k-strips with a ``matmul``/``matmul_acc`` accumulator (the
-        DDR<->L1 double-buffer) and assembles the tile into the DDR output.
+        Pinned to Ascend910B (``ascend_backend``): the solver's tile/split decision is
+        backend-specific — the grounded 910B model (24 cube cores) tiles the 64x64 output
+        into 32x32 regions (tile=32x32x32) and splits the K axis in 2 to fill more cores —
+        4 output tiles x 2 K-partials = 8 SPMD blocks. (Under this directory's default
+        Ascend950 the solver instead picks tile=32x32x64, split=1 — a different emit.)
+        AutoFuse emits:
+
+          - a CORE_GROUP ``pl.at`` seed scope that zeroes the output (``pl.tensor.full`` +
+            ``assemble``) so the split-K partials can accumulate onto it;
+          - a SINGLE flat ``pl.spmd(8)`` loop (one block = one cross-core task submission)
+            whose body slices the K-strip and output tile (``pl.tensor.slice``), runs the
+            32x32x32 tile matmul, and scatters the partial back with
+            ``atomic=pl.AtomicType.Add`` — the split-K merge.
         """
 
         @pl.program
@@ -68,13 +78,19 @@ class TestAutoFuse:
 
         After = passes.auto_fuse()(Before)
         body = next(f for _, f in After.functions.items() if f.name == "mm").as_python()
-        assert "chunked_loop_optimizer" in body  # AutoInCore chunked scope
-        assert "pl.parallel(" in body and "chunk=" in body  # cross-core tile distribution
-        assert "pl.pipeline(" in body and "stage=2" in body  # the per-tile k-pipeline
-        assert "pl.tensor.matmul_acc(" in body  # the per-strip accumulation
-        assert "pl.tensor.slice(" in body  # the k-strip operand slices
-        assert "pl.tensor.assemble(" in body  # the output-tile assembly
+        # 8 SPMD blocks = 4 output tiles (64x64 / 32x32) x 2 K-split; a SINGLE flat loop so
+        # each block is one cross-core task submission (not a nested 2D loop, which would
+        # collide in the orchestration codegen's variable naming).
+        assert "pl.spmd(8" in body and body.count("pl.spmd(") == 1
+        # Split-K accumulates onto a zero-seeded output: a CORE_GROUP scope that fulls + assembles.
+        assert "pl.at(level=pl.Level.CORE_GROUP" in body
+        assert "pl.tensor.full(" in body
+        # Per-block body: K-strip + output-tile slices, the 32x32x32 tile matmul, atomic-add merge.
+        assert "pl.tensor.slice(" in body
+        assert "pl.tensor.matmul(" in body
+        assert "atomic=pl.AtomicType.Add" in body
 
+    @_STALE_EMIT
     def test_single_matmul_lowers_to_cube_kernel(self, ascend_backend):
         """The emitted scope lowers through the full pipeline to a cube PTO kernel."""
 
@@ -114,6 +130,7 @@ class TestAutoFuse:
         assert len(mat_addrs) >= 2, sorted(mat_addrs)  # distinct buffers = ping-pong
         assert "pto.tmatmul.acc" in mlir  # the k-strip accumulation
 
+    @_STALE_EMIT
     def test_large_matmul_tiles_to_fit_l0c(self, ascend_backend):
         """A matmul whose full output exceeds L0c lowers via the output `[w,h]`
         tiling — each per-tile kernel's accumulator fits the L0c (Acc) budget.
@@ -143,6 +160,7 @@ class TestAutoFuse:
         )
         assert "pto.tmatmul.acc" in mlir  # k-pipelined per tile
 
+    @_STALE_EMIT
     def test_single_pointwise_tiles_across_vector_cores(self, ascend_backend):
         """A large pointwise op is tiled into the solver's `[w,h]` regions and
         distributed across the vector cores, lowering to a vector (AIV) kernel.
@@ -167,6 +185,7 @@ class TestAutoFuse:
         assert len(incores) == 1
         assert str(incores[0].func_type) == "FunctionType.AIV"  # pointwise -> vector kernel
 
+    @_STALE_EMIT
     def test_chained_matmul_fuses_to_one_cube_kernel(self, ascend_backend):
         """Two back-to-back matmuls the solver groups together fuse into ONE kernel,
         with the intermediate staying on-chip.
@@ -205,6 +224,7 @@ class TestAutoFuse:
         mlir = codegen.PTOCodegen().generate(ir.Program([incores[0]], incores[0].name, incores[0].span))
         assert "cube" in mlir and mlir.count("pto.tmatmul") >= 2  # both matmuls fused in
 
+    @_STALE_EMIT
     def test_chained_matmul_preserves_operand_input_order(self, tmp_path, monkeypatch):
         """Regression: the solver Problem must list each matmul's inputs in OPERAND
         order — inputs[0]=LHS, inputs[1]=RHS — because the cost model derives
@@ -248,6 +268,7 @@ class TestAutoFuse:
         assert sink_inputs[0] == intermediate, (sink_inputs, intermediate)
         assert len(sink_inputs) == 2 and sink_inputs[1] != intermediate
 
+    @_STALE_EMIT
     def test_chained_pointwise_fuses_into_one_tiled_kernel(self, ascend_backend):
         """Two chained pointwise ops the solver groups fuse into one tiled vector
         kernel, with the intermediate staying on-chip.
