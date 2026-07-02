@@ -4074,8 +4074,11 @@ class TestCapacityGatedReuse:
     def test_flag_on_composes_with_matmul_acc_carry(self):
         """RFC §8 carry composition (#1352): the gate only ever *adds* separation and
         excludes loop carries from the packer, so enabling the flag must not disturb a
-        matmul_acc accumulator chain. With untagged operands the gated path is the
-        fallback path, so flag-ON output is structurally identical to flag-OFF."""
+        matmul_acc accumulator chain. These operands carry no pipeline_membership tags,
+        so they never trip the gated residue constraint and behave like legacy — flag-ON
+        output is structurally identical to flag-OFF. (Note: this exercises the *untagged*
+        bypass, NOT the shed-loop `force_legacy` fallback branch, which needs a tagged,
+        capacity-overflowing space to fire.)"""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -4368,6 +4371,102 @@ class TestCapacityGatedReuse:
             )
         assert no_r["r0"] is not no_r["r1"], "without the reserve, 96 KB of Vec operands fit at depth 2"
         assert with_r["r0"] is with_r["r1"], "the 128 KB reserve reduces free Vec room, forcing the merge"
+
+    def test_on_multi_group_shed_prefers_largest_slot(self):
+        """The hardcoded ``max_relief`` shed policy: when a space overflows and *two*
+        pipeline groups can each give up double-buffering, shed the **larger-slot**
+        group first (freeing the most bytes per level ⇒ fewest levels lost).
+
+        Two sheddable groups alone cannot force this — being lifetime-disjoint within a
+        group is precisely what lets them *diagonal cross-merge* and time-share, so they
+        never overflow (see ``test_on_sequential_groups_time_share_without_false_shed``;
+        this is provable, not incidental: a group sheddable enough to merge its own
+        stages always has a stage disjoint from the other group's, so a diagonal merge
+        exists). The selection only becomes reachable with a **co-live non-pipeline
+        blocker** that adds fixed pressure on top of the time-shared groups.
+
+        Here group A (24 KB slots, ``0:0``/``0:1``) and B (16 KB slots, ``1:0``/``1:1``)
+        are sequential (so they diagonal-merge to 2×24 KB), and ``np0`` (24 KB) is live
+        across both. Full: 24 (A/B shared) + 24 (A/B shared) + 24 (np0) = 72 KB > 64 KB
+        L0b ⇒ shed. ``max_relief`` drops A (24 KB > 16 KB) to depth 1; the space then
+        fits at exactly 64 KB with **B still double-buffered**. A min-relief / arrival
+        policy would instead shed B first — which does *not* relieve enough (A's two
+        24 KB buffers + np0 still overflow), so it would go on to shed A too and lose
+        B's depth as well. So the assertion below discriminates ``max_relief`` from the
+        alternatives, not merely "some group shed"."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                la: pl.Tensor[[16, 128], pl.BF16],
+                bnp: pl.Tensor[[128, 96], pl.BF16],
+                ba: pl.Tensor[[128, 96], pl.BF16],
+                bb: pl.Tensor[[128, 64], pl.BF16],
+                onp: pl.Out[pl.Tensor[[16, 96], pl.FP32]],
+                oa: pl.Out[pl.Tensor[[16, 96], pl.FP32]],
+                ob: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 96], pl.FP32]:
+                lam: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    la, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                lt: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(lam, target_memory=pl.Mem.Left)
+                # co-live blocker np0: defined at the top, consumed last — cannot reuse a pipeline buffer.
+                bnpm: pl.Tile[[128, 96], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    bnp, [0, 0], [128, 96], target_memory=pl.Mem.Mat
+                )
+                np0: pl.Tile[[128, 96], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bnpm, target_memory=pl.Mem.Right
+                )
+                # group A (24 KB Right slots), sequential stages 0:0 / 0:1 (both loads reuse `ba`)
+                ba0m: pl.Tile[[128, 96], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    ba, [0, 0], [128, 96], target_memory=pl.Mem.Mat
+                )
+                ra0: pl.Tile[[128, 96], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    ba0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:0"}
+                )
+                ma0: pl.Tile[[16, 96], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, ra0)
+                oa = pl.store(ma0, [0, 0], oa)
+                ba1m: pl.Tile[[128, 96], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    ba, [0, 0], [128, 96], target_memory=pl.Mem.Mat
+                )
+                ra1: pl.Tile[[128, 96], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    ba1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:1"}
+                )
+                ma1: pl.Tile[[16, 96], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, ra1)
+                oa = pl.store(ma1, [0, 0], oa)
+                # group B (16 KB Right slots), sequential stages 1:0 / 1:1 (both loads reuse `bb`)
+                bb0m: pl.Tile[[128, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    bb, [0, 0], [128, 64], target_memory=pl.Mem.Mat
+                )
+                rb0: pl.Tile[[128, 64], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bb0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "1:0"}
+                )
+                mb0: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, rb0)
+                ob = pl.store(mb0, [0, 0], ob)
+                bb1m: pl.Tile[[128, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    bb, [0, 0], [128, 64], target_memory=pl.Mem.Mat
+                )
+                rb1: pl.Tile[[128, 64], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bb1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "1:1"}
+                )
+                mb1: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, rb1)
+                ob = pl.store(mb1, [0, 0], ob)
+                mnp: pl.Tile[[16, 96], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, np0)
+                onp = pl.store(mnp, [0, 0], onp)
+                return onp
+
+        with passes.PassContext([], capacity_gated_reuse=True):
+            after = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        bases = self._collect_bases(after, ("ra0", "ra1", "rb0", "rb1"))
+        assert bases["ra0"] is bases["ra1"], "max_relief sheds the larger-slot group A to depth 1"
+        assert bases["rb0"] is not bases["rb1"], "the smaller group B keeps its depth-2 double-buffering"
+        # After the shed the space fits at exactly cap — AllocateMemoryAddr must complete.
+        allocated = passes.allocate_memory_addr()(after)
+        assert allocated.get_function("kernel") is not None
 
 
 if __name__ == "__main__":
