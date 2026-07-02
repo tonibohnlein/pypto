@@ -91,6 +91,42 @@ class TestAutoFuse:
         assert "pl.tensor.matmul(" in body
         assert "atomic=pl.AtomicType.Add" in body
 
+    def test_single_matmul_emit_is_numerically_correct(self, ascend_backend):
+        """The SPMD-tiled + split-K emit computes the same result as a plain matmul.
+
+        ``torch_codegen(..., run_all_spmd_blocks=True)`` runs all 8 SPMD blocks serially
+        into the shared atomic-seeded output, so the generated function reproduces the
+        FULL 64x64 result (not just block 0). It must match ``torch.matmul`` to fp32
+        tolerance — verifying the tiling, K-strip slicing, and split-K atomic merge are
+        numerically faithful, not only structurally present.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        @pl.program
+        class Before:
+            @pl.function(attrs={"auto_fuse": True})
+            def mm(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                c: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                return c
+
+        After = passes.auto_fuse()(Before)
+        code = torch_codegen(After, run_all_spmd_blocks=True)
+        namespace: dict = {}
+        exec(code, namespace)  # noqa: S102
+
+        torch.manual_seed(0)
+        a = torch.randn(64, 64, dtype=torch.float32)
+        b = torch.randn(64, 64, dtype=torch.float32)
+        out = namespace["mm"](a, b)
+        assert torch.allclose(out, a @ b, rtol=1e-4, atol=1e-4), (
+            f"max abs diff {(out - a @ b).abs().max().item():.3e}"
+        )
+
     @_STALE_EMIT
     def test_single_matmul_lowers_to_cube_kernel(self, ascend_backend):
         """The emitted scope lowers through the full pipeline to a cube PTO kernel."""
