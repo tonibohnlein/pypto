@@ -304,17 +304,20 @@ std::string DiagnosticInstrument::GetName() const { return "DiagnosticInstrument
 
 PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, VerificationLevel verification_level,
                          DiagnosticPhase diagnostic_phase, DiagnosticCheckSet disabled_diagnostics,
-                         bool capacity_gated_reuse)
+                         bool capacity_gated_reuse, ShedObjective shed_objective)
     : instruments_(std::move(instruments)),
       verification_level_(verification_level),
       diagnostic_phase_(diagnostic_phase),
       disabled_diagnostics_(disabled_diagnostics),
       capacity_gated_reuse_(capacity_gated_reuse),
+      shed_objective_(shed_objective),
       previous_(nullptr) {}
 
 VerificationLevel PassContext::GetVerificationLevel() const { return verification_level_; }
 
 bool PassContext::GetCapacityGatedReuse() const { return capacity_gated_reuse_; }
+
+ShedObjective PassContext::GetShedObjective() const { return shed_objective_; }
 
 DiagnosticPhase PassContext::GetDiagnosticPhase() const { return diagnostic_phase_; }
 

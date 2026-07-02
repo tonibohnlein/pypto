@@ -191,7 +191,10 @@ def compile(  # noqa: PLR0913
     # ``with PassContext(capacity_gated_reuse=True): compile(...)`` (#1475). compile() builds its own
     # context here, so without this the outer flag would be silently dropped.
     cap_gated = outer.get_capacity_gated_reuse() if outer is not None else False
-    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled, capacity_gated_reuse=cap_gated)
+    shed_obj = outer.get_shed_objective() if outer is not None else _passes.ShedObjective.MAX_RELIEF
+    ctx = _passes.PassContext(
+        instruments, vlevel, dphase, disabled, capacity_gated_reuse=cap_gated, shed_objective=shed_obj
+    )
 
     def _stage(name: str) -> AbstractContextManager[Any]:
         if prof is not None:

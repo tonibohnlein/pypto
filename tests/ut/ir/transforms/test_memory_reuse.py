@@ -4580,6 +4580,98 @@ class TestCapacityGatedReuse:
             "force_legacy fallback must reproduce the flag-OFF packing byte-for-byte"
         )
 
+    def test_shed_objective_selects_which_group_sheds(self):
+        """The `shed_objective` knob (Phase 3) picks *which* group loses double-buffering
+        when a space overflows — same kernel, two objectives, opposite outcomes. Group 0
+        (16 KB, lowest id) + group 1 (24 KB, larger) + a co-live 24 KB blocker overflow the
+        64 KB L0b. `MAX_RELIEF` sheds the larger group 1 (keeps group 0 at depth 2 — fewest
+        levels lost); `ARRIVAL_ORDER` sheds the lowest-id group 0 first, which does not
+        relieve enough, so it goes on to shed group 1 too and loses group 0's depth as well.
+        The discriminator is group 0's depth: **kept under MAX_RELIEF, lost under
+        ARRIVAL_ORDER** — proving the knob selects the pick. (Which objective is *better* is
+        the deferred a2a3 perf sweep; this only proves the objective is honoured.)"""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                la: pl.Tensor[[16, 128], pl.BF16],
+                bnp: pl.Tensor[[128, 96], pl.BF16],
+                ba: pl.Tensor[[128, 64], pl.BF16],
+                bb: pl.Tensor[[128, 96], pl.BF16],
+                onp: pl.Out[pl.Tensor[[16, 96], pl.FP32]],
+                oa0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+                oa1: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+                ob0: pl.Out[pl.Tensor[[16, 96], pl.FP32]],
+                ob1: pl.Out[pl.Tensor[[16, 96], pl.FP32]],
+            ) -> pl.Tensor[[16, 96], pl.FP32]:
+                lam: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    la, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                lt: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(lam, target_memory=pl.Mem.Left)
+                bnpm: pl.Tile[[128, 96], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    bnp, [0, 0], [128, 96], target_memory=pl.Mem.Mat
+                )
+                np0: pl.Tile[[128, 96], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bnpm, target_memory=pl.Mem.Right
+                )
+                # group 0 — 16 KB Right slots, lowest group id
+                ba0m: pl.Tile[[128, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    ba, [0, 0], [128, 64], target_memory=pl.Mem.Mat
+                )
+                ra0: pl.Tile[[128, 64], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    ba0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:0"}
+                )
+                ma0: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, ra0)
+                oa0 = pl.store(ma0, [0, 0], oa0)
+                ba1m: pl.Tile[[128, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    ba, [0, 0], [128, 64], target_memory=pl.Mem.Mat
+                )
+                ra1: pl.Tile[[128, 64], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    ba1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "0:1"}
+                )
+                ma1: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, ra1)
+                oa1 = pl.store(ma1, [0, 0], oa1)
+                # group 1 — 24 KB Right slots (larger), higher group id
+                bb0m: pl.Tile[[128, 96], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    bb, [0, 0], [128, 96], target_memory=pl.Mem.Mat
+                )
+                rb0: pl.Tile[[128, 96], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bb0m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "1:0"}
+                )
+                mb0: pl.Tile[[16, 96], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, rb0)
+                ob0 = pl.store(mb0, [0, 0], ob0)
+                bb1m: pl.Tile[[128, 96], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    bb, [0, 0], [128, 96], target_memory=pl.Mem.Mat
+                )
+                rb1: pl.Tile[[128, 96], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    bb1m, target_memory=pl.Mem.Right, attrs={"pipeline_membership": "1:1"}
+                )
+                mb1: pl.Tile[[16, 96], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, rb1)
+                ob1 = pl.store(mb1, [0, 0], ob1)
+                mnp: pl.Tile[[16, 96], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lt, np0)
+                onp = pl.store(mnp, [0, 0], onp)
+                return onp
+
+        def shed(objective: passes.ShedObjective) -> dict[str, ir.Var]:
+            with passes.PassContext([], capacity_gated_reuse=True, shed_objective=objective):
+                after = passes.memory_reuse()(passes.init_mem_ref()(Before))
+            allocated = passes.allocate_memory_addr()(after)  # both objectives must still fit
+            assert allocated.get_function("kernel") is not None
+            return self._collect_bases(after, ("ra0", "ra1", "rb0", "rb1"))
+
+        mr = shed(passes.ShedObjective.MAX_RELIEF)
+        ao = shed(passes.ShedObjective.ARRIVAL_ORDER)
+        assert mr["ra0"] is not mr["ra1"], "MAX_RELIEF keeps the smaller group 0 double-buffered"
+        assert mr["rb0"] is mr["rb1"], "MAX_RELIEF sheds the larger group 1"
+        assert ao["ra0"] is ao["ra1"], "ARRIVAL_ORDER sheds the lowest-id group 0 first"
+        assert (mr["ra0"] is not mr["ra1"]) != (ao["ra0"] is not ao["ra1"]), (
+            "the shed_objective knob must change which group loses depth"
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -1444,6 +1444,31 @@ bool NeedsLoadTpopHazardGuard(const FunctionPtr& func) {
  * tile intervals (M a subset of the N IR nodes) — same class as the prior
  * greedy implementation.
  */
+// Cross-group shed objective (DESIGN §4): when a space overflows at every group's max-affordable depth,
+// the packer lowers one pipeline group's double-buffering depth by a residue. `ShedScore` selects **which**
+// group loses a level — lower score sheds first; ties always break by lowest group id (deterministic).
+// Only model-free objectives ship; a perf-model-based objective is a deferred drop-in on this struct.
+struct ShedCandidate {
+  int32_t group;         ///< pipeline group id (the tie-break key)
+  uint64_t bytes_freed;  ///< align(slot_g): bytes reclaimed by dropping one residue buffer of this group
+};
+using ShedScore = double (*)(const ShedCandidate&);
+
+/// MaxRelief: shed the group that frees the most bytes per level ⇒ fewest levels lost to fit the space.
+inline double ScoreMaxRelief(const ShedCandidate& c) { return -static_cast<double>(c.bytes_freed); }
+/// ArrivalOrder: indifferent to slot size; the group-id tie-break alone sheds the lowest id first (baseline).
+inline double ScoreArrivalOrder(const ShedCandidate& /*c*/) { return 0.0; }
+
+inline ShedScore SelectShedScore(ShedObjective objective) {
+  switch (objective) {
+    case ShedObjective::ArrivalOrder:
+      return &ScoreArrivalOrder;
+    case ShedObjective::MaxRelief:
+      return &ScoreMaxRelief;
+  }
+  return &ScoreMaxRelief;  // default (unreachable — every enumerator handled)
+}
+
 std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::vector<LifetimeInterval>& lifetimes, const HazardInputs& hazard,
     const ForbidAliasMap& forbid_alias, const std::map<const Var*, std::set<int>>& phi_family_ids,
@@ -1451,7 +1476,7 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::map<const Var*, std::pair<int, int>>& var_liveness,
     const std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>>& pipeline_membership,
     const std::set<const Var*>& pipeline_load_tiles, bool capacity_gated,
-    const std::map<MemorySpace, uint64_t>& reserved_end_by_space) {
+    const std::map<MemorySpace, uint64_t>& reserved_end_by_space, ShedObjective shed_objective) {
   std::map<VarPtr, VarPtr> reuse_map;
 
   // Members of a sharing group (the vars that already physically share one base).
@@ -1778,14 +1803,17 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
         }
         return fp.HighWater();
       };
+      const ShedScore shed_score = SelectShedScore(shed_objective);
       while (cap != 0 && footprint(buffers) > cap) {
+        // Pick the group to shed by the selected objective; ties break by lowest group id (deterministic).
         std::optional<int32_t> shed_group;
-        uint64_t best_slot = 0;
+        double best_score = 0.0;
         for (const auto& [key, f] : group_depth) {
           if (key.first != space || f <= 1) continue;
           const uint64_t slot = group_slot.count(key) ? group_slot.at(key) : 0;
-          if (!shed_group || slot > best_slot) {
-            best_slot = slot;
+          const double s = shed_score(ShedCandidate{key.second, alloc_policy->AlignAddress(slot, space)});
+          if (!shed_group || s < best_score || (s == best_score && key.second < *shed_group)) {
+            best_score = s;
             shed_group = key.second;
           }
         }
@@ -2453,6 +2481,7 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   // Activation is via PassContext only, propagated through compile()/run_passes (Phase 0). There is no
   // env-var escape hatch: once propagation was wired it was dead for real compiles anyway.
   const bool capacity_gated = ctx != nullptr && ctx->GetCapacityGatedReuse();
+  const ShedObjective shed_objective = ctx != nullptr ? ctx->GetShedObjective() : ShedObjective::MaxRelief;
   // Per-space reserved end (the SpaceFootprint reserved_start for the exact fit check). Only meaningful
   // on the gated path with a configured backend; empty otherwise ⇒ reserved_start defaults to 0.
   std::map<MemorySpace, uint64_t> reserved_end_by_space;
@@ -2467,7 +2496,7 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   auto reuse_map = IdentifyReuseOpportunities(
       analysis_result.lifetimes, hazard, forbid_alias, analysis_result.phi_family_ids,
       analysis_result.var_sharing_groups, analysis_result.var_liveness, analysis_result.pipeline_membership,
-      analysis_result.pipeline_load_tiles, capacity_gated, reserved_end_by_space);
+      analysis_result.pipeline_load_tiles, capacity_gated, reserved_end_by_space, shed_objective);
 
   // Step 3: Apply MemRef sharing (skip if no reuse candidates)
   if (!reuse_map.empty()) {

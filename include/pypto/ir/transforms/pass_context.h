@@ -65,6 +65,22 @@ enum class VerificationMode {
 };
 
 /**
+ * @brief Objective for the capacity-gated shed's cross-group depth pick.
+ *
+ * When a memory space still overflows at every group's max-affordable depth,
+ * `MemoryReuse` lowers *one* pipeline group's double-buffering depth by a
+ * residue and re-packs. This selects **which** group loses a level. Only
+ * model-free objectives ship today; the empirical choice among them (and any
+ * perf-model-based objective) is the deferred a2a3 perf sweep. Ties always
+ * break by lowest group id (deterministic).
+ */
+enum class ShedObjective {
+  MaxRelief,     ///< Shed the largest-slot group first — frees the most bytes per level, fewest levels lost.
+  ArrivalOrder,  ///< Shed the lowest-group-id group first, regardless of slot (baseline; not claimed
+                 ///< optimal).
+};
+
+/**
  * @brief Abstract base class for pass instrumentation
  *
  * PassInstruments are callbacks that run before/after each pass execution.
@@ -251,7 +267,8 @@ class PassContext {
                        VerificationLevel verification_level = VerificationLevel::Basic,
                        DiagnosticPhase diagnostic_phase = DiagnosticPhase::PrePipeline,
                        DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
-                       bool capacity_gated_reuse = false);
+                       bool capacity_gated_reuse = false,
+                       ShedObjective shed_objective = ShedObjective::MaxRelief);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -292,6 +309,15 @@ class PassContext {
    *        L0b half of #1475). Dark-launch flag — off by default.
    */
   [[nodiscard]] bool GetCapacityGatedReuse() const;
+
+  /**
+   * @brief The objective the capacity-gated shed uses to pick which group loses
+   *        double-buffering depth under pressure. Default `MaxRelief` (largest
+   *        slot first) — the only shipping behaviour; other objectives are
+   *        selectable for the perf sweep. Only consulted when
+   *        `GetCapacityGatedReuse()` is true.
+   */
+  [[nodiscard]] ShedObjective GetShedObjective() const;
 
   /**
    * @brief Get the diagnostic phase gate for this context.
@@ -338,6 +364,7 @@ class PassContext {
   DiagnosticPhase diagnostic_phase_;
   DiagnosticCheckSet disabled_diagnostics_;
   bool capacity_gated_reuse_;
+  ShedObjective shed_objective_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

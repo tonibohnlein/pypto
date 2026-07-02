@@ -387,12 +387,14 @@ class PassManager:
             inner_phase = outer_phase
 
         cap_gated = ctx.get_capacity_gated_reuse() if ctx else False
+        shed_obj = ctx.get_shed_objective() if ctx else passes.ShedObjective.MAX_RELIEF
         with passes.PassContext(
             [*outer_instruments, *extra_instruments],
             level,
             inner_phase,
             disabled,
             capacity_gated_reuse=cap_gated,
+            shed_objective=shed_obj,
         ):
             try:
                 return self._pipeline.run(input_ir)
@@ -431,8 +433,14 @@ class PassManager:
             disabled.insert(passes.DiagnosticCheck.UnusedControlFlowResult)
 
         cap_gated = ctx.get_capacity_gated_reuse() if ctx else False
+        shed_obj = ctx.get_shed_objective() if ctx else passes.ShedObjective.MAX_RELIEF
         with passes.PassContext(
-            [*outer_instruments, timing_instrument], level, dphase, disabled, capacity_gated_reuse=cap_gated
+            [*outer_instruments, timing_instrument],
+            level,
+            dphase,
+            disabled,
+            capacity_gated_reuse=cap_gated,
+            shed_objective=shed_obj,
         ):
             try:
                 return self._pipeline.run(input_ir)

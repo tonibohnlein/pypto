@@ -92,6 +92,12 @@ class VerificationLevel(Enum):
     BASIC = ...
     ROUNDTRIP = ...
 
+class ShedObjective(Enum):
+    """Objective for the capacity-gated shed's cross-group depth pick (#1475)."""
+
+    MAX_RELIEF = ...
+    ARRIVAL_ORDER = ...
+
 class DiagnosticPhase(Enum):
     """Controls when DiagnosticInstrument runs registered checks (warnings + perf hints)."""
 
@@ -265,9 +271,10 @@ class PassContext:
         diagnostic_phase: DiagnosticPhase = DiagnosticPhase.PRE_PIPELINE,
         disabled_diagnostics: DiagnosticCheckSet = ...,  # default: {UnusedControlFlowResult}
         capacity_gated_reuse: bool = False,
+        shed_objective: ShedObjective = ShedObjective.MAX_RELIEF,
     ) -> None:
         """Create a PassContext with instruments, verification level, phase, disabled diagnostics,
-        and the capacity-gated-reuse flag (#1475 L0b fix; off by default)."""
+        the capacity-gated-reuse flag (#1475 L0b fix; off by default), and the shed objective."""
         ...
 
     def __enter__(self) -> PassContext: ...
@@ -283,6 +290,10 @@ class PassContext:
 
     def get_capacity_gated_reuse(self) -> bool:
         """Whether capacity-gated (anti-dependency-aware) reuse is enabled (#1475 L0b fix)."""
+        ...
+
+    def get_shed_objective(self) -> ShedObjective:
+        """The objective the capacity-gated shed uses to pick which group loses depth."""
         ...
 
     def get_diagnostic_phase(self) -> DiagnosticPhase:

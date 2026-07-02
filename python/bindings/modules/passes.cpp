@@ -149,6 +149,14 @@ void BindPass(nb::module_& m) {
       .value("ROUNDTRIP", VerificationLevel::Roundtrip,
              "BASIC + print→parse structural-equality check after every pass");
 
+  // Bind ShedObjective enum — the capacity-gated shed's cross-group depth pick (#1475)
+  nb::enum_<ShedObjective>(passes, "ShedObjective",
+                           "Objective for the capacity-gated shed's cross-group depth pick")
+      .value("MAX_RELIEF", ShedObjective::MaxRelief,
+             "Shed the largest-slot group first — frees the most bytes per level (default)")
+      .value("ARRIVAL_ORDER", ShedObjective::ArrivalOrder,
+             "Shed the lowest-group-id group first, regardless of slot (baseline)");
+
   // Bind DiagnosticPhase enum
   nb::enum_<DiagnosticPhase>(passes, "DiagnosticPhase",
                              "Controls when DiagnosticInstrument runs registered checks "
@@ -270,13 +278,13 @@ void BindPass(nb::module_& m) {
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
       .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
-                    bool>(),
+                    bool, ShedObjective>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
-           nb::arg("capacity_gated_reuse") = false,
+           nb::arg("capacity_gated_reuse") = false, nb::arg("shed_objective") = ShedObjective::MaxRelief,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
-           "disabled diagnostic checks, and the capacity-gated-reuse flag")
+           "disabled diagnostic checks, the capacity-gated-reuse flag, and the shed objective")
       .def("__enter__",
            [](PassContext& self) -> PassContext& {
              self.EnterContext();
@@ -287,6 +295,8 @@ void BindPass(nb::module_& m) {
            "Get the verification level for this context")
       .def("get_capacity_gated_reuse", &PassContext::GetCapacityGatedReuse,
            "Whether capacity-gated (anti-dependency-aware) reuse is enabled (#1475 L0b fix)")
+      .def("get_shed_objective", &PassContext::GetShedObjective,
+           "The objective the capacity-gated shed uses to pick which group loses depth")
       .def("get_diagnostic_phase", &PassContext::GetDiagnosticPhase,
            "Get the diagnostic phase gate for this context")
       .def("get_disabled_diagnostics", &PassContext::GetDisabledDiagnostics,
