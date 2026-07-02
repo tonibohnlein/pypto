@@ -156,12 +156,22 @@ int64_t PaddedComputeVolume(int m, int n, int k, const L0TileConfig& cfg) {
 // Cube MAD cost over the full padded grid. Per-TMATMUL cost is
 //   mad_head + cpr * ceil(m/16) * ceil(k/kt) * ceil(n/16),
 // with kt = mad_k_fractal_bytes/bytes_a and cpr = bytes_a/2 (1 BF16 / 2 FP32).
+// The K-fractal count is summed over the K-blocks the emit ACTUALLY runs:
+// floor(K/k) full k-wide blocks plus, when k does not divide K (the K-peel), one
+// narrower tail block of width K - floor(K/k)*k scored at ITS width -- not rounded
+// up to k. MAD is the primary ranking key, so charging the peel tail as a full
+// k-block would over-price non-divisor candidates and mis-rank them. For a divisor
+// k this reduces exactly to (K/k)*ceil(k/kt) -- unchanged.
 int64_t MadCycles(int m, int n, int k, const L0TileConfig& cfg) {
   const int64_t kt = std::max<int64_t>(1, cfg.mad_k_fractal_bytes / static_cast<int64_t>(cfg.bytes_a));
   const int64_t cpr = std::max<int64_t>(1, static_cast<int64_t>(cfg.bytes_a) / 2);
-  const int64_t per_tile =
-      cfg.mad_head + cpr * CeilDiv(m, cfg.align_m) * CeilDiv(k, kt) * CeilDiv(n, cfg.align_n);
-  return CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n) * CeilDiv(cfg.K, k) * per_tile;
+  const int64_t num_full = cfg.K / k;                        // full k-wide K-blocks
+  const int64_t k_tail = cfg.K - num_full * k;               // peel tail width (0 if k | K)
+  const int64_t k_blocks = num_full + (k_tail > 0 ? 1 : 0);  // == CeilDiv(K, k)
+  const int64_t k_fractals = num_full * CeilDiv(k, kt) + (k_tail > 0 ? CeilDiv(k_tail, kt) : 0);
+  const int64_t per_mn =
+      k_blocks * cfg.mad_head + cpr * CeilDiv(m, cfg.align_m) * k_fractals * CeilDiv(n, cfg.align_n);
+  return CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n) * per_mn;
 }
 
 // Bandwidth-weighted held-A vs held-B interior load cycles for a full-K OS tile

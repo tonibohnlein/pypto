@@ -217,8 +217,10 @@ struct L0TileResult {
  *      are scored -- ceil(K/k)*ceil(k/kt) is non-monotone in k when kt != align_k,
  *      so the largest legal k is not always wall-optimal.
  *   3. Score each tile by wall (cycles):
- *        C_mad  = ceil(M/m)*ceil(N/n)*ceil(K/k) *
- *                 (mad_head + cpr*ceil(m/16)*ceil(k/kt)*ceil(n/16))
+ *        C_mad  = ceil(M/m)*ceil(N/n) *
+ *                 (ceil(K/k)*mad_head + cpr*ceil(m/16)*Kfrac*ceil(n/16))
+ *          Kfrac = floor(K/k)*ceil(k/kt) + ceil((K - floor(K/k)*k)/kt)
+ *                  (the K-peel tail is scored at its own width, not rounded to k)
  *        C_drain = gamma_c*bytes_c*M*N/BW_drain
  *        C_load (BW-weighted, by stationarity):
  *          OS     : ba*M*K*ceil(N/n)/BW_A + bb*K*N*ceil(M/m)/BW_B
