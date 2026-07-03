@@ -499,6 +499,17 @@ struct SolverTile {
   int64_t k = 0;
   int64_t split = 1;  // parallel split-K factor S (cores ganged per spatial tile; the
                       // S partials over K/S each are atomic-added). 1 = no split-K.
+  // Solver spatial grid region COUNTS (TileConfig::parts_m/parts_n). 0 => UNSET:
+  // w/h are exact divisors (the legacy uniform-tile path). >0 => the solver chose a
+  // parts_m x parts_n grid whose region extents differ by <=1 fractal per axis, and
+  // w/h then carry the MAX (physical) region extent (types.h:180-194, partition_axis).
+  // Threaded so the emitter can DETECT a non-uniform grid: PyPTO reconstructs a
+  // ceil(M/h) x ceil(N/w) grid, which diverges from the solver's balanced partition
+  // when the axis is non-uniform. The generic matmul rule floors that grid (under-
+  // covers the tail => wrong result) so it Tier-B-declines a non-uniform grid; the
+  // vector rule's ceil+clamp overlap stays numerically correct (idempotent, D3).
+  int64_t parts_m = 0;
+  int64_t parts_n = 0;
 };
 
 ExprPtr MakeTuple2(ExprPtr a, ExprPtr b, const Span& sp) {
@@ -920,6 +931,61 @@ static bool GenericEmitEnabled() {
   return v != nullptr && v[0] != '\0' && std::string(v) != "0";
 }
 
+// Strict mode turns Tier-B declines (below) into hard failures. OFF in production
+// (Tier-B just warns + falls back to legacy); ON in CI/tests so the bake window
+// SURFACES illegal-plan conditions instead of silently masking them behind the
+// legacy fallback. Set PYPTO_AUTOFUSE_STRICT=1 in the differential/instrumentation
+// tests.
+static bool GenericStrict() {
+  const char* v = std::getenv("PYPTO_AUTOFUSE_STRICT");
+  return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+}
+
+// The generic emitter declines a group in two very different situations, and
+// collapsing both into a bare `return std::nullopt` masks solver bugs during the
+// dark launch (the window whose whole point is to find them before the legacy net
+// is deleted). So split them:
+//
+//   Tier-A (capability decline) — "not my scope yet": a matmul chain, a broadcast
+//     operand, a single-tile output, a dynamic shape. These fire constantly on
+//     normal workloads; falling back silently is correct. Call sites just
+//     `return std::nullopt;` (optionally a debug counter).
+//
+//   Tier-B (suspected illegal plan) — "this should be impossible if the solver is
+//     correct": a mis-pinned reduction axis (partial reduction), a non-dividing
+//     split, an unexpected multi-sink group, a non-uniform grid the floor
+//     reconstruction can't cover, a cross-engine group. These are exactly the
+//     A2/A3/A4/A7/SR7 conditions the assert list was designed to catch. GenericDeclineB
+//     warns (a greppable, metric-able line) and, under strict, fails loudly — then
+//     returns std::nullopt so production still falls back to legacy.
+//
+// `span` is a Span value (safe to evaluate on failure), so INTERNAL_CHECK_SPAN is OK.
+static std::nullopt_t GenericDeclineB(const std::string& reason, const Span& span) {
+  LOG_WARN << "AutoFuse[generic] TIER-B decline (suspected illegal plan): " << reason;
+  if (GenericStrict()) {
+    INTERNAL_CHECK_SPAN(false, span)
+        << "AutoFuse generic emit TIER-B: " << reason
+        << " — the solver produced a plan the v1 emitter contract forbids "
+           "(PYPTO_AUTOFUSE_STRICT is on).";
+  }
+  return std::nullopt;
+}
+
+// A CAPABILITY decline — distinct from both Tier-A (silent "not my scope") and Tier-B
+// (illegal plan). The solver LEGITIMATELY produced this plan, but a v1 emitter rule to
+// realize it faithfully is deferred, so we fall back to a correct-but-lower-fidelity
+// path (typically an untiled InCore scope, ignoring the solver's parallel grid). This
+// is NOT a correctness bug — the fallback computes the right values — but it IS a
+// fidelity gap (the costed parallel schedule is not realized), so it is worth SEEING.
+// Logged (not silent) so the bake window can measure how often the solver's grid is
+// dropped, feeding the priority of the deferred rule; NEVER asserts (it is expected,
+// and common — e.g. non-uniform parts_m/parts_n grids), so strict mode does not abort.
+static std::nullopt_t GenericDeclineCap(const std::string& reason) {
+  LOG_INFO << "AutoFuse[generic] CAPABILITY decline (plan not faithfully tiled, runs "
+              "lower-fidelity fallback): " << reason;
+  return std::nullopt;
+}
+
 std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<StmtPtr>& run,
                                                           SolverTile tile, const std::string& name) {
   auto& reg = OpRegistry::GetInstance();
@@ -933,11 +999,17 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   bool has_reduction = false;
   for (const StmtPtr& s : run) {
     auto a = As<AssignStmt>(s);
-    if (a == nullptr) return std::nullopt;
+    if (a == nullptr) return std::nullopt;                          // Tier-A: non-assign in run (capability)
     auto c = As<Call>(a->value_);
-    if (c == nullptr || c->op_ == nullptr) return std::nullopt;
+    if (c == nullptr || c->op_ == nullptr) return std::nullopt;     // Tier-A: non-call value (capability)
     const ::OpType cls = ClassifyOp(c);
-    if (cls != ::OpType::Pointwise && cls != ::OpType::Reduction) return std::nullopt;  // MatMul/Opaque -> fall back
+    // Tier-A: a non-{Pointwise,Reduction} op in the run -> fall back. NB a MatMul can land
+    // here legitimately — a lone matmul the tiler declined (e.g. a non-uniform grid it runs
+    // untiled) is pushed into `run` and reaches flush(); that is NOT a cross-engine group,
+    // so it must NOT Tier-B here. Real mixed-group detection is the engine-homogeneity guard
+    // at the import boundary (A2/S1), which classifies the solver's group members directly.
+    if (cls != ::OpType::Pointwise && cls != ::OpType::Reduction)
+      return std::nullopt;
     if (cls == ::OpType::Reduction) has_reduction = true;
     ops.push_back(a);
   }
@@ -956,10 +1028,30 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   AssignStmtPtr out_stmt = nullptr;
   for (const auto& a : ops)
     if (used_within.count(a->var_.get()) == 0) {
-      if (out_stmt != nullptr) return std::nullopt;  // A7: >1 live-out -> multi-output (S5)
+      // Tier-B (A7): >1 live-out. The safe fallback is correct regardless (the group
+      // declines to a plain InCore scope, which computes all outputs), so this never
+      // corrupts results. It is kept Tier-B (strict-abort) rather than capability because
+      // strict is test-scoped and no current test forms a multi-sink group, so it cannot
+      // false-abort. NB the cost model CAN legitimately form multi-sink groups (S5,
+      // sink_ops is a vector) — if that starts happening in practice, reclassify to a
+      // capability decline like the non-uniform grid (solver-legitimate + safe fallback).
+      if (out_stmt != nullptr)
+        return GenericDeclineB("group has >1 live-out (multi-sink, A7/S5)", a->span_);
       out_stmt = a;
     }
-  if (out_stmt == nullptr) return std::nullopt;
+  // Tier-B: a group with NO live-out is structurally impossible in SSA (every group has
+  // an output; a cycle among run ops cannot exist). If it happens the run/group mapping
+  // is corrupt -> surface it.
+  if (out_stmt == nullptr)
+    return GenericDeclineB("group has no live-out (corrupt run/group mapping)", ops.front()->span_);
+
+  // Capability (S2): the vector rule emits a FULL-axis reduction per spatial tile with a
+  // non-atomic assemble; it does not realize a reduction-sink split. If the solver chose
+  // split>1 for a vector group, the legacy fallback (also split-agnostic) computes the
+  // right values as split=1 — correct, but not the costed parallel-reduction schedule.
+  // Reduction-sink split is deferred (S2); surface the fidelity gap, do not abort.
+  if (tile.split > 1)
+    return GenericDeclineCap("vector group with split>1 (reduction-sink split not emitted, S2)");
 
   const VarPtr c_var = out_stmt->var_;
   auto ct = As<TensorType>(c_var->GetType());
@@ -1006,12 +1098,20 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       if (ClassifyOp(c) != ::OpType::Reduction || c->args_.empty()) continue;
       const auto [iM, iN] = Static2DShape(c->args_[0]->GetType());
       const auto [oM, oN] = Static2DShape(a->var_->GetType());
-      if (iM < 0 || oM < 0) return std::nullopt;
+      if (iM < 0 || oM < 0) return std::nullopt;  // Tier-A: dynamic shape (capability)
       const bool reduces_N = (iN > 1 && oN == 1);   // row reduction [M,N] -> [M,1]
       const bool reduces_M = (iM > 1 && oM == 1);   // col reduction [M,N] -> [1,N]
-      if (reduces_N && w != N) return std::nullopt;  // N (reduced) not pinned -> partial -> fall back
-      if (reduces_M && h != M) return std::nullopt;  // M (reduced) not pinned -> partial -> fall back
-      if (!reduces_N && !reduces_M) return std::nullopt;  // unexpected reduction shape
+      // Tier-B (A4): the reduced axis is NOT pinned full -> a per-tile reduction covers
+      // only part of the axis = a partial (wrong) reduction. The solver pins it (grid
+      // num=1 on the reduced axis); a plan that does not is illegal for v1.
+      if (reduces_N && w != N)
+        return GenericDeclineB("reduction's reduced axis N not pinned full (partial reduction, A4)", a->span_);
+      if (reduces_M && h != M)
+        return GenericDeclineB("reduction's reduced axis M not pinned full (partial reduction, A4)", a->span_);
+      // Tier-B: a Reduction-classed op whose shape is neither a row nor a col collapse =
+      // classifier/plan inconsistency.
+      if (!reduces_N && !reduces_M)
+        return GenericDeclineB("Reduction op with unexpected shape (not a row/col collapse)", a->span_);
     }
   }
 
@@ -1114,14 +1214,32 @@ std::optional<std::vector<StmtPtr>> EmitLoneMatmulGeneric(const AssignStmtPtr& a
   if (M < 0 || lM != M) return std::nullopt;
   const int64_t K = lK;
 
-  // A3 (split legality) + SR7/A3(iv): a split may only fractal-partition the contraction
-  // into equal 16-aligned slices -> split | (K/16). The sink IS a matmul (A3(iii)) and the
-  // sole atomic target. The solver only picks split ∈ divisors(K/16); a plan that violates
-  // it would leave a ragged/misaligned K-slice -> fall back rather than emit a wrong split.
+  // Tier-B — A3 (split legality) + SR7/A3(iv): a split may only fractal-partition the
+  // contraction into equal 16-aligned slices -> split | (K/16). The sink IS a matmul
+  // (A3(iii)) and the sole atomic target. The solver only picks split ∈ divisors(K/16); a
+  // plan that violates it would leave a ragged/misaligned K-slice — surface it rather than
+  // emit a wrong split.
   if (tile.split > 1) {
     const int64_t kfrac = K / 16;
-    if (K % 16 != 0 || kfrac % tile.split != 0 || K % tile.split != 0) return std::nullopt;
+    if (K % 16 != 0 || kfrac % tile.split != 0 || K % tile.split != 0)
+      return GenericDeclineB("split-K does not fractal-partition K (split ∤ K/16, A3/SR7)", assign->span_);
   }
+
+  // Capability — non-uniform grid: when the solver chose a parts_m/parts_n grid (parts_*>0),
+  // w/h are the MAX region extents and the balanced partition has some smaller regions
+  // (extents differ by <=1 fractal). The v1 emitter tiles only UNIFORM grids: TileMatmul
+  // guards `M%h==0 && N%w==0` (line ~640) and safely declines a non-uniform grid to a
+  // single UNTILED InCore scope — correct values, but the solver's parallel parts×split
+  // grid is not realized (a fidelity gap, not a correctness bug: there is NO tail-dropping,
+  // the guard prevents it). Faithfully realizing the balanced grid needs the AxisPartition
+  // decode (deferred, P2). Surface it so we can measure how often it happens; do not abort.
+  // parts_*==0 (uniform/ad-hoc tile) => w/h are exact divisors => M%h==0, guard never fires.
+  const int64_t mh = (tile.h > 0 && tile.h < M) ? tile.h : M;
+  const int64_t mw = (tile.w > 0 && tile.w < N) ? tile.w : N;
+  if ((mh < M && M % mh != 0) || (mw < N && N % mw != 0))
+    return GenericDeclineCap("non-uniform spatial grid (parts_m=" + std::to_string(tile.parts_m) +
+                             ",parts_n=" + std::to_string(tile.parts_n) +
+                             "): runs untiled (uniform-grid only in v1, P2 decode deferred)");
 
   auto tiled = TileMatmul(assign, tile, name);  // MatMul rule body: grid + split-K seed + k-pipeline
   if (!tiled) return std::nullopt;
@@ -1458,6 +1576,29 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       DumpSolutionJson(sol, base + ".sol.json");
     }
 
+    // Tier-B (A2 homogeneity): the generic emitter assumes each group is single-engine.
+    // The base solver enforces that (allow_mixed off, ascend910b_cost.cpp:241), so a MIXED
+    // cube+vector step can only appear under a PYPTO_FUSE_CUBE_VECTOR build. The emitter
+    // would then SPLIT it across dispatch paths (matmul standalone, vector standalone) with
+    // the intermediate through DDR — correct output, but NOT the on-chip-fused kernel the
+    // solver costed. Surface it (S1 move-insertion is the real fix, not relaxing A2). Only
+    // checked under the flag; legacy already splits mixed groups as existing behavior.
+    if (GenericEmitEnabled()) {
+      for (size_t s = 0; s < sol.num_steps(); ++s) {
+        bool has_cube = false, has_vector = false;
+        const auto& gops = sol.step(s).subgraph.ops();
+        for (size_t op_idx : gops) {
+          const ::OpType t = builder.problem.ops[op_idx].type;
+          if (t == ::OpType::MatMul) has_cube = true;
+          else if (t != ::OpType::Opaque) has_vector = true;  // Pointwise / Reduction -> vector
+        }
+        if (has_cube && has_vector)
+          GenericDeclineB("mixed cube+vector group " + std::to_string(s) +
+                              " (cross-engine, A2/S1) — realized as split kernels, not fused",
+                          builder.op_stmts[gops.front()]->span_);
+      }
+    }
+
     // Emit: map each solver op back to its source statement, wrap each fused
     // group in an InCoreScopeStmt, and realize the chosen tile (step.config) for
     // matmuls — the output `[w,h]` tiling + the per-tile k-pipeline.
@@ -1465,7 +1606,8 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     std::unordered_map<const Stmt*, SolverTile> stmt_tile;  // group's [w,h,k] tile, for matmul tiling
     for (size_t s = 0; s < sol.num_steps(); ++s) {
       const ::TileConfig& cfg = sol.step(s).config;
-      const SolverTile tile{cfg.w, cfg.h, cfg.k, sol.step_cost(s).parallel_split};
+      const SolverTile tile{cfg.w, cfg.h, cfg.k, sol.step_cost(s).parallel_split,
+                            cfg.parts_m, cfg.parts_n};
       for (size_t op_idx : sol.step(s).subgraph.ops()) {
         const Stmt* stmt = builder.op_stmts[op_idx];
         stmt_group[stmt] = s;
