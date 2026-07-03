@@ -545,11 +545,24 @@ class TestChainedMatmulMatScratch(PTOTestCase):
         return f"chained_matmul_mat_scratch_{self.M}x{self.K}x{self.NMID}x{self.N}"
 
     def define_tensors(self) -> list[TensorSpec]:
+        M, K, NMID, N = self.M, self.K, self.NMID, self.N
+
+        # Activation `a` is natural; the weights `b`/`e` are scaled by 1/sqrt(fan-in)
+        # so the intermediate and the output stay O(1) (the gate_up s-test pattern).
+        # With |out| ~ O(1) the inherent bf16 rounding error sits under atol=2e-2 even
+        # on the chain's cancellation elements -- unscaled randn gives |out| ~ 170, at
+        # which a per-element allclose intermittently fails on those near-zero elements
+        # (a numerically-correct bf16 (a@b)@e chain differs from torch only by fp32
+        # accumulation order, which flips a few intermediates across a bf16 boundary).
+        # Seeded generators make the data deterministic (the harness does not seed torch).
+        def seeded(rows, cols, seed, scale=1.0):
+            return torch.randn(rows, cols, generator=torch.Generator().manual_seed(seed)) * scale
+
         return [
-            TensorSpec("a", [self.M, self.K], DataType.BF16, init_value=torch.randn),
-            TensorSpec("b", [self.K, self.NMID], DataType.BF16, init_value=torch.randn),
-            TensorSpec("e", [self.NMID, self.N], DataType.BF16, init_value=torch.randn),
-            TensorSpec("out", [self.M, self.N], DataType.FP32, is_output=True),
+            TensorSpec("a", [M, K], DataType.BF16, init_value=lambda: seeded(M, K, 1)),
+            TensorSpec("b", [K, NMID], DataType.BF16, init_value=lambda: seeded(K, NMID, 2, 1 / K**0.5)),
+            TensorSpec("e", [NMID, N], DataType.BF16, init_value=lambda: seeded(NMID, N, 3, 1 / NMID**0.5)),
+            TensorSpec("out", [M, N], DataType.FP32, is_output=True),
         ]
 
     def get_program(self) -> Any:
@@ -1394,7 +1407,9 @@ class TestMatmulOperations:
         """Chained (a@b)@e with the oversized intermediate kept on-chip in an L1/Mat
         scratch (per-sub-tile Acc->Mat assembles, bf16 downcast fused), consumed by
         the second matmul from L1 — no DDR round-trip. Validates the Mat-scratch
-        assembly path numerically on device. (bf16 intermediate -> looser tol.)"""
+        assembly path numerically on device. Weights are scaled 1/sqrt(fan-in) so the
+        bf16 intermediate keeps the output O(1) (see define_tensors) -- a per-element
+        allclose at rtol=atol=2e-2 is then robust on the chain's cancellation elements."""
         cfg = RunConfig(platform=platform, rtol=2e-2, atol=2e-2)
         result = test_runner.run(TestChainedMatmulMatScratch(platform=platform, config=cfg))
         assert result.passed, f"Test failed: {result.error}"
