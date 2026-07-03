@@ -1077,6 +1077,41 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
+// The MATMUL rule (increment 3), for a LONE matmul (chains are S4 -> fall back). Its
+// tiling IS TileMatmul (the grid + split-K tiled-seed + BuildTileMatmul k-pipeline); the
+// generic path adds the fail-loud A3/SR7 contract asserts the legacy tiler lacks and
+// unifies dispatch behind the flag. The tiling body is REUSED for now; absorbing it so
+// the legacy TileMatmul dispatch can retire is the parity-prep step.
+std::optional<std::vector<StmtPtr>> EmitLoneMatmulGeneric(const AssignStmtPtr& assign,
+                                                          SolverTile tile, const std::string& name) {
+  auto call = As<Call>(assign->value_);
+  if (call == nullptr || call->op_ == nullptr || ClassifyOp(call) != ::OpType::MatMul ||
+      call->args_.size() != 2) {
+    return std::nullopt;  // A1: not a lone matmul -> fall back (a chain is S4)
+  }
+  auto ct = As<TensorType>(assign->var_->GetType());
+  if (ct == nullptr) return std::nullopt;
+  const auto [M, N] = Static2DShape(assign->var_->GetType());
+  const auto [lM, lK] = Static2DShape(call->args_[0]->GetType());
+  if (M < 0 || lM != M) return std::nullopt;
+  const int64_t K = lK;
+
+  // A3 (split legality) + SR7/A3(iv): a split may only fractal-partition the contraction
+  // into equal 16-aligned slices -> split | (K/16). The sink IS a matmul (A3(iii)) and the
+  // sole atomic target. The solver only picks split ∈ divisors(K/16); a plan that violates
+  // it would leave a ragged/misaligned K-slice -> fall back rather than emit a wrong split.
+  if (tile.split > 1) {
+    const int64_t kfrac = K / 16;
+    if (K % 16 != 0 || kfrac % tile.split != 0 || K % tile.split != 0) return std::nullopt;
+  }
+
+  auto tiled = TileMatmul(assign, tile, name);  // MatMul rule body: grid + split-K seed + k-pipeline
+  if (!tiled) return std::nullopt;
+  LOG_INFO << "AutoFuse[generic]: matmul group '" << name << "' tiled by the generic driver (split="
+           << tile.split << ")";
+  return tiled;
+}
+
 // Realize the solver's FUSED chained matmul: two matmuls `T = A @ B` and
 // `C = T @ D` placed in ONE group, where MM2 consumes MM1's output T. The
 // intermediate T never touches DDR (the fusion) — it is recomputed on-chip per
@@ -1311,7 +1346,16 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
     if (auto assign = As<AssignStmt>(stmt)) {
       auto tit = stmt_tile.find(stmt.get());
       if (tit != stmt_tile.end()) {
-        tiled = TileMatmul(assign, tit->second, "fused_" + std::to_string(g));
+        const std::string nm = "fused_" + std::to_string(g);
+        // Behind the flag, the generic MatMul rule gets first refusal (adds the A3/SR7
+        // asserts); it returns nullopt if it can't own the group, so we fall back to the
+        // legacy tiler. Flag off => never called.
+        if (GenericEmitEnabled()) {
+          tiled = EmitLoneMatmulGeneric(assign, tit->second, nm);
+        }
+        if (!tiled) {
+          tiled = TileMatmul(assign, tit->second, nm);
+        }
       }
     }
     if (tiled) {
