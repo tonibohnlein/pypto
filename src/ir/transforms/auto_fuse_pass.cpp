@@ -981,12 +981,15 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     }
 
   // Grid: single shared parallel tile space; pure elementwise has NO pinned axis, so we
-  // tile all output axes. Ragged (valid/alloc mask-to-full, R1) is TODO -> require exact
-  // division for now (non-dividing -> fall back); whole-output single tile -> plain scope.
+  // tile all output axes. R1 ragged: SPMD compiles ONE [h,w] body for all blocks, so a
+  // non-dividing free axis uses a CEIL grid with the tail block's offset CLAMPED in-bounds
+  // (mi <= M-h). The tail overlaps the previous tile and recomputes it, but the assemble
+  // here is NON-ATOMIC (elementwise/reduction — no split-K), so the overlap is idempotent
+  // (same input -> same output) and correct without masking. (Split-K matmul cannot use
+  // this: atomic-add would double-count the overlap; that path keeps exact division.)
   int64_t h = (tile.h > 0 && tile.h < M) ? tile.h : M;
   int64_t w = (tile.w > 0 && tile.w < N) ? tile.w : N;
-  if (M % h != 0 || N % w != 0) return std::nullopt;
-  const int64_t num_m = M / h, num_n = N / w;
+  const int64_t num_m = (M + h - 1) / h, num_n = (N + w - 1) / w;  // ceil
   if (num_m == 1 && num_n == 1) return std::nullopt;
 
   // A4 (reduction rule): the reduced axis must be PINNED FULL in the tile, else a
@@ -1021,9 +1024,14 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
 
   // Flat SPMD grid over the num_m*num_n free-axis tiles; block -> (mi,ni). Elementwise
   // never split-Ks, so this decode is spatial-only (the MatMul rule adds the k_slice).
+  // On a ragged axis, clamp the offset to <= extent-tile so the last (ceil) block stays
+  // in-bounds (overlapping, idempotent per above). Divisible axes get no clamp, so their
+  // emit is byte-identical to before.
   auto t = std::make_shared<Var>(base + "_t", index_type, sp);
-  auto mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
-  auto ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+  ExprPtr mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
+  ExprPtr ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+  if (M % h != 0) mi = MakeMin(mi, MakeIndex(M - h, sp), sp);
+  if (N % w != 0) ni = MakeMin(ni, MakeIndex(N - w, sp), sp);
 
   // Driver loop: walk the group in order; per op apply the ELEMENTWISE rule — slice each
   // [M,N] input to [h,w] (identity map), read intermediates from on-chip scratch, then
@@ -1050,7 +1058,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           if (sit != input_cache.end()) { targs.push_back(sit->second); continue; }
         }
         auto sl = reg.Create("tensor.slice", {arg, MakeIndexTuple({h, w}, sp), MakeTuple2(mi, ni, sp)}, sp);
-        auto sv = std::make_shared<Var>(base + "_in", sl->GetType(), sp);
+        // Unique name per distinct external input (input_cache.size() is the next index):
+        // a group with >1 external input (e.g. c = a + b) must not name both slices "_in",
+        // or a name-based consumer (torch_codegen) collapses them and reads the wrong operand.
+        auto sv = std::make_shared<Var>(base + "_in" + std::to_string(input_cache.size()), sl->GetType(), sp);
         body_stmts.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
         if (v != nullptr) input_cache[v.get()] = sv;
         targs.push_back(sv);
@@ -1059,7 +1070,13 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       }
     }
     auto pw = reg.Create(c->op_->name_, targs, c->kwargs_, sp);
-    auto res = std::make_shared<Var>(base + (a == out_stmt ? "_tile" : "_t"), pw->GetType(), sp);
+    // Unique name per intermediate (onchip.size() is the next index). A multi-consumer
+    // intermediate (e.g. the diamond's `c`, used by d, e AND f) must keep a distinct name:
+    // reusing one name is only benign for a LINEAR chain (`x = f(x)` reads old, writes new);
+    // with a second consumer, that consumer would read the overwritten value.
+    auto res = std::make_shared<Var>(
+        a == out_stmt ? (base + "_tile") : (base + "_t" + std::to_string(onchip.size())),
+        pw->GetType(), sp);
     body_stmts.push_back(std::make_shared<AssignStmt>(res, pw, sp));
     onchip[a->var_.get()] = res;
     if (a == out_stmt) tile_var = res;
