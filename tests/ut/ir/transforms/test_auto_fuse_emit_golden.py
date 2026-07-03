@@ -42,7 +42,16 @@ from pypto import passes
 
 def _emit_matches_reference(program, entry, inputs, ref, *, rtol=1e-4, atol=1e-4):
     """Run AutoFuse, execute the emit's every SPMD block into the shared output,
-    and assert the tile-stitched full result equals the unfused reference."""
+    and assert the tile-stitched full result equals the unfused reference.
+
+    Tolerance note: most paths reproduce the reference to ~1e-6 because the tiling is
+    a pure partition of the same work in the same order. The exception is **split-K**:
+    partial products accumulate via atomic-add across K-slice blocks, so the sum is
+    reassociated vs. the single unfused matmul, and fp rounding differs. Split-K cases
+    therefore pass a looser ``rtol``/``atol`` — an exact/bit-match check would be
+    falsely-red. (Reductions do NOT reassociate: S2 pins the full reduced axis on one
+    core, so softmax stays tight.)
+    """
     torch = pytest.importorskip("torch")
     from pypto.debug import torch_codegen  # noqa: PLC0415
 
@@ -91,6 +100,25 @@ class TestAutoFuseEmitGolden:
         torch.manual_seed(1)
         a, b = torch.randn(128, 192), torch.randn(192, 256)
         _emit_matches_reference(Prog, "mm", (a, b), a @ b)
+
+    def test_matmul_split_k(self, ascend_backend):
+        """Force split-K explicitly: a small output (few spatial tiles) with a deep K, so
+        the solver splits the contraction across cores to fill them — exercising the
+        riskiest new path (tiled zero-seed + DDR atomic-add merge + the flat-index decode).
+        Looser tolerance because atomic-add reassociates the K partials vs. the unfused
+        matmul (see ``_emit_matches_reference``)."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mm(self, a: pl.Tensor[[64, 512], pl.FP32], b: pl.Tensor[[512, 64], pl.FP32]) -> pl.Tensor[[64, 64], pl.FP32]:
+                c: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                return c
+
+        torch.manual_seed(6)
+        a, b = torch.randn(64, 512), torch.randn(512, 64)
+        _emit_matches_reference(Prog, "mm", (a, b), a @ b, rtol=3e-3, atol=3e-3)
 
     # ---- TileChainedMatmul (fused chain; emit only — lowering is #1908-blocked) ----
 
