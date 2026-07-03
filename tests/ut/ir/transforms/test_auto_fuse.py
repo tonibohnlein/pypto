@@ -54,11 +54,12 @@ class TestAutoFuse:
         into 32x32 regions (tile=32x32x32) and splits the K axis in 2 to fill more cores —
         4 output tiles x 2 K-partials = 8 SPMD blocks. (Under this directory's default
         Ascend950 the solver instead picks tile=32x32x64, split=1 — a different emit.)
-        AutoFuse emits:
+        AutoFuse emits TWO flat SPMD loops:
 
-          - a CORE_GROUP ``pl.at`` seed scope that zeroes the output (``pl.tensor.full`` +
-            ``assemble``) so the split-K partials can accumulate onto it;
-          - a SINGLE flat ``pl.spmd(8)`` loop (one block = one cross-core task submission)
+          - a 4-block ``pl.spmd(4)`` zero-seed — one ``[32,32]`` ``pl.tensor.full`` tile per
+            output tile — so the split-K partials accumulate onto a zeroed output WITHOUT
+            any core materializing the full ``[64,64]`` (which would overflow UB at scale);
+          - an 8-block ``pl.spmd(8)`` matmul (one block = one cross-core task submission)
             whose body slices the K-strip and output tile (``pl.tensor.slice``), runs the
             32x32x32 tile matmul, and scatters the partial back with
             ``atomic=pl.AtomicType.Add`` — the split-K merge.
@@ -78,14 +79,15 @@ class TestAutoFuse:
         After = passes.auto_fuse()(Before)
         body = next(f for _, f in After.functions.items() if f.name == "mm").as_python()
 
-        # 8 SPMD blocks = 4 output tiles (64x64 / 32x32) x 2 K-split; a SINGLE flat loop so
-        # each block is one cross-core task submission (not a nested 2D loop, which would
-        # collide in the orchestration codegen's variable naming).
-        assert "pl.spmd(8" in body and body.count("pl.spmd(") == 1
-        # Split-K accumulates onto a zero-seeded output: a CORE_GROUP scope that fulls + assembles.
-        assert "pl.at(level=pl.Level.CORE_GROUP" in body
+        # Two flat SPMD loops: the tiled zero-seed (4 output tiles) and the matmul (4 tiles
+        # x 2 K-split = 8 blocks). Both flat (not nested 2D, which would collide in the
+        # orchestration codegen's variable naming).
+        assert "pl.spmd(4" in body  # tiled zero-seed, one [32,32] tile per output tile
+        assert "pl.spmd(8" in body  # split-K matmul
+        assert body.count("pl.spmd(") == 2
+        # The seed zeroes per-tile (pl.tensor.full on a [32,32] tile, never the full output).
         assert "pl.tensor.full(" in body
-        # Per-block body: K-strip + output-tile slices, the 32x32x32 tile matmul, atomic-add merge.
+        # Per-block matmul body: K-strip + output-tile slices, the 32x32x32 tile matmul, atomic merge.
         assert "pl.tensor.slice(" in body
         assert "pl.tensor.matmul(" in body
         assert "atomic=pl.AtomicType.Add" in body
@@ -169,14 +171,14 @@ class TestAutoFuse:
         assert "spmd_block_idx" in mlir
         assert "atomic_add" in mlir
 
-    @_STALE_EMIT
-    def test_large_matmul_tiles_to_fit_l0c(self, ascend_backend):
-        """A matmul whose full output exceeds L0c lowers via the output `[w,h]`
-        tiling — each per-tile kernel's accumulator fits the L0c (Acc) budget.
+    def test_large_matmul_tiled_seed_avoids_ub_overflow(self, ascend_backend):
+        """A large matmul's split-K zero-seed is TILED so it never overflows UB.
 
-        256x256 FP32 output = 256 KB > 128 KB L0c, so without output tiling the
-        Acc buffer overflows; the solver's `[64,128]` tile keeps each kernel's
-        output within L0c.
+        The grounded 910B solver splits-K on a 256x256 matmul (tile=128x128/split=4). The
+        zero-seed must NOT materialize the full 256x256 output (262144 B > the 188416 B UB
+        budget) on one core — AutoFuse tiles it across SPMD blocks (one [128,128] zero tile
+        each), so the whole thing lowers end-to-end. Regression for the seed-overflow bug.
+        (The old L0c-overflow framing is obsolete: fitting Acc is AutoTileMatmulL0's job.)
         """
 
         @pl.program
@@ -190,14 +192,22 @@ class TestAutoFuse:
                 c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b)
                 return c
 
-        # Lowers end-to-end without an L0c-overflow (raises on failure).
+        # Must lower end-to-end without a UB-overflow VerificationError on the seed kernel.
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
-        assert len(incores) == 1
-        mlir = codegen.PTOCodegen().generate(
-            ir.Program([incores[0]], incores[0].name, incores[0].span)
-        )
-        assert "pto.tmatmul.acc" in mlir  # k-pipelined per tile
+        by_type: dict[str, list] = {}
+        for f in incores:
+            by_type.setdefault(str(f.func_type), []).append(f)
+        assert len(by_type.get("FunctionType.AIC", [])) == 1, [f.name for f in incores]
+        assert len(by_type.get("FunctionType.AIV", [])) == 1, [f.name for f in incores]
+
+        # The seed kernel is SPMD-tiled (block-indexed), not a single full-output alloc.
+        seed = by_type["FunctionType.AIV"][0]
+        seed_mlir = codegen.PTOCodegen().generate(ir.Program([seed], seed.name, seed.span))
+        assert "spmd_block_idx" in seed_mlir
+        cube = by_type["FunctionType.AIC"][0]
+        cube_mlir = codegen.PTOCodegen().generate(ir.Program([cube], cube.name, cube.span))
+        assert "cube" in cube_mlir and "atomic_add" in cube_mlir  # split-K merge
 
     def test_single_pointwise_tiles_across_vector_cores(self, ascend_backend):
         """A large pointwise op is tiled into the solver's `[w,h]` regions and

@@ -649,23 +649,29 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
     auto& reg = OpRegistry::GetInstance();
     auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
 
-    // Allocate the output, then ZERO it in a seed kernel: tensor.full must live inside
-    // an InCore block, and the seed is a barrier the S atomic-add partials accumulate
-    // onto. (TODO: tile the seed for outputs that exceed on-chip capacity.)
+    // Allocate the output, then ZERO it in a SEPARATE seed kernel: a barrier the S
+    // atomic-add partials accumulate onto. TILE the seed across SPMD blocks exactly like
+    // the matmul's spatial tiles -- one [h,w] zero tile per block, num_tiles blocks
+    // (disjoint -> non-atomic assemble) -- so a large output never materializes a full
+    // [M,N] tensor.full in one core's UB (which would overflow: e.g. 256x256 FP32 =
+    // 256KB > the 188KB UB budget).
     auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
     auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
     auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
     auto zero = std::make_shared<ConstFloat>(0.0, dtype, sp);
-    auto z_call = reg.Create("tensor.full", {MakeIndexTuple({M, N}, sp), zero}, {{"dtype", dtype}}, sp);
+    // Per-seed-block tile offsets from its block index (SpmdWrap prepends st = get_block_idx()).
+    auto st = std::make_shared<Var>(base + "_st", index_type, sp);
+    auto s_mi = MakeMul(MakeFloorDiv(st, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
+    auto s_ni = MakeMul(MakeFloorMod(st, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+    auto z_call = reg.Create("tensor.full", {MakeIndexTuple({h, w}, sp), zero}, {{"dtype", dtype}}, sp);
     auto z = std::make_shared<Var>(base + "_z", z_call->GetType(), sp);
-    auto seed_asm = reg.Create("tensor.assemble", {c_init, z, MakeTuple2(MakeIndex(0, sp), MakeIndex(0, sp), sp)}, sp);
+    auto seed_asm = reg.Create("tensor.assemble", {c_init, z, MakeTuple2(s_mi, s_ni, sp)}, sp);
     auto c_seeded = std::make_shared<Var>(base + "_seeded", seed_asm->GetType(), sp);
-    auto seed_scope = std::make_shared<InCoreScopeStmt>(
-        std::nullopt, name + "_seed",
-        SeqStmts::Flatten(std::vector<StmtPtr>{std::make_shared<AssignStmt>(z, z_call, sp),
-                                               std::make_shared<AssignStmt>(c_seeded, seed_asm, sp)},
-                          sp),
-        sp);
+    auto seed_scope = SpmdWrap(
+        st,
+        std::vector<StmtPtr>{std::make_shared<AssignStmt>(z, z_call, sp),
+                             std::make_shared<AssignStmt>(c_seeded, seed_asm, sp)},
+        MakeIndex(num_tiles, sp), name + "_seed", sp);
 
     // t in [0, num_tiles*S): ks = t % S (k-slice), sp_idx = t / S (spatial tile) ->
     // mt = sp_idx / num_n, nt = sp_idx % num_n; offsets mi/ni and k_base = ks*ksz.
