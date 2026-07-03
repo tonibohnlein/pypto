@@ -904,10 +904,12 @@ std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr
 // single-pinned-axis, single-sink, engine-homogeneous groups. See the design doc
 // "Generic tile-and-fuse emitter" for the full SR/A/S contract.
 //
-// INCREMENT 1: the ELEMENTWISE rule only (the identity slice-and-replay — the same
-// tiling TilePointwiseGroup does today, restructured as the driver + explicit asserts).
-// A group needing the Reduction or MatMul rule returns nullopt so the caller falls back
-// to the legacy tiler; the flag defaults OFF, so production is byte-for-byte unchanged.
+// INCREMENTS 1-2: the ELEMENTWISE rule (identity slice-and-replay) + the REDUCTION rule
+// (pin the reduced axis full, tile the free axis — the same slice-and-replay, since the
+// solver pins the reduced axis and reductions reduce their full sliced axis on-core).
+// This unlocks softmax. A group with a MatMul returns nullopt (increment 3, TODO) so the
+// caller falls back to the legacy tiler; the flag defaults OFF, so production is
+// byte-for-byte unchanged.
 // ============================================================================
 static bool GenericEmitEnabled() {
   static const bool on = [] {
@@ -921,18 +923,21 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
                                                           SolverTile tile, const std::string& name) {
   auto& reg = OpRegistry::GetInstance();
 
-  // A1 (classify allowlist). Increment 1 supports ELEMENTWISE only: a Reduction/MatMul
-  // member is out of this increment's scope (its rule is TODO) and any other class
-  // (transform / opaque / position-dependent) is permanently REJECT — both -> nullopt
-  // so the caller falls back to the legacy tiler.
+  // A1 (classify allowlist). Increments 1-2 support ELEMENTWISE + REDUCTION. A MatMul
+  // member is out of scope until increment 3 (its rule is TODO); any other class
+  // (transform / opaque / position-dependent) is permanently REJECT — both -> nullopt so
+  // the caller falls back to the legacy tiler.
   std::vector<AssignStmtPtr> ops;
   ops.reserve(run.size());
+  bool has_reduction = false;
   for (const StmtPtr& s : run) {
     auto a = As<AssignStmt>(s);
     if (a == nullptr) return std::nullopt;
     auto c = As<Call>(a->value_);
     if (c == nullptr || c->op_ == nullptr) return std::nullopt;
-    if (ClassifyOp(c) != ::OpType::Pointwise) return std::nullopt;  // Elementwise-only (increment 1)
+    const ::OpType cls = ClassifyOp(c);
+    if (cls != ::OpType::Pointwise && cls != ::OpType::Reduction) return std::nullopt;  // MatMul/Opaque -> fall back
+    if (cls == ::OpType::Reduction) has_reduction = true;
     ops.push_back(a);
   }
   if (ops.empty()) return std::nullopt;
@@ -983,6 +988,28 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   if (M % h != 0 || N % w != 0) return std::nullopt;
   const int64_t num_m = M / h, num_n = N / w;
   if (num_m == 1 && num_n == 1) return std::nullopt;
+
+  // A4 (reduction rule): the reduced axis must be PINNED FULL in the tile, else a
+  // per-tile reduction would cover only part of the axis (partial reduction = wrong
+  // result). Derive each reduction's reduced axis from its input->output collapse and
+  // require the tile spans it fully. The solver pins it (grid num=1 on the reduced axis);
+  // if a plan somehow does not, fall back to the legacy scope rather than emit a partial
+  // reduction. A group whose reductions disagree on the axis reduces both -> both must be
+  // full -> num_m==num_n==1 -> already bailed above (matches the cost model's reject).
+  if (has_reduction) {
+    for (const auto& a : ops) {
+      auto c = As<Call>(a->value_);
+      if (ClassifyOp(c) != ::OpType::Reduction || c->args_.empty()) continue;
+      const auto [iM, iN] = Static2DShape(c->args_[0]->GetType());
+      const auto [oM, oN] = Static2DShape(a->var_->GetType());
+      if (iM < 0 || oM < 0) return std::nullopt;
+      const bool reduces_N = (iN > 1 && oN == 1);   // row reduction [M,N] -> [M,1]
+      const bool reduces_M = (iM > 1 && oM == 1);   // col reduction [M,N] -> [1,N]
+      if (reduces_N && w != N) return std::nullopt;  // N (reduced) not pinned -> partial -> fall back
+      if (reduces_M && h != M) return std::nullopt;  // M (reduced) not pinned -> partial -> fall back
+      if (!reduces_N && !reduces_M) return std::nullopt;  // unexpected reduction shape
+    }
+  }
 
   const Span sp = out_stmt->span_;
   const std::string base = c_var->name_hint_;
@@ -1044,8 +1071,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
 
   auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
-  LOG_INFO << "AutoFuse[generic]: elementwise group '" << name << "' tiled by the generic driver ("
-           << ops.size() << " ops, " << (num_m * num_n) << " tiles)";
+  LOG_INFO << "AutoFuse[generic]: " << (has_reduction ? "elementwise+reduction" : "elementwise")
+           << " group '" << name << "' tiled by the generic driver (" << ops.size() << " ops, "
+           << (num_m * num_n) << " tiles)";
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 

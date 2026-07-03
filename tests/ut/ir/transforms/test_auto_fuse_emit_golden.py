@@ -236,23 +236,25 @@ class TestAutoFuseEmitGolden:
         """Row-wise softmax — the reduction rule: pinned reduced axis + fused
         max/sub/exp/sum/div, with the intermediate on-chip. Tight tolerance: the reduced
         axis is pinned full on one core (S2), so it does NOT reassociate vs. the reference
-        (unlike split-K matmul). Untiled/fallback today; the reduction rule tiles the free
-        axis when the driver lands, and this must still match."""
+        (unlike split-K matmul). Shape 384x128 divides the solver's free-axis tile, so the
+        generic Reduction rule tiles it across cores (flag on); flag off / pre-driver it
+        lowers via the untiled fallback — both must match. (A ragged free axis like 256x128
+        falls back until R1 lands; that raggedness is covered by test_pointwise_ragged.)"""
         torch = pytest.importorskip("torch")
 
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def softmax(self, a: pl.Tensor[[256, 128], pl.FP32]) -> pl.Tensor[[256, 128], pl.FP32]:
-                m: pl.Tensor[[256, 1], pl.FP32] = pl.row_max(a)
-                s: pl.Tensor[[256, 128], pl.FP32] = pl.row_expand_sub(a, m)
-                e: pl.Tensor[[256, 128], pl.FP32] = pl.exp(s)
-                d: pl.Tensor[[256, 1], pl.FP32] = pl.row_sum(e)
-                c: pl.Tensor[[256, 128], pl.FP32] = pl.row_expand_div(e, d)
+            def softmax(self, a: pl.Tensor[[384, 128], pl.FP32]) -> pl.Tensor[[384, 128], pl.FP32]:
+                m: pl.Tensor[[384, 1], pl.FP32] = pl.row_max(a)
+                s: pl.Tensor[[384, 128], pl.FP32] = pl.row_expand_sub(a, m)
+                e: pl.Tensor[[384, 128], pl.FP32] = pl.exp(s)
+                d: pl.Tensor[[384, 1], pl.FP32] = pl.row_sum(e)
+                c: pl.Tensor[[384, 128], pl.FP32] = pl.row_expand_div(e, d)
                 return c
 
         torch.manual_seed(9)
-        a = torch.randn(256, 128)
+        a = torch.randn(384, 128)
         _emit_matches_reference(Prog, "softmax", (a,), torch.softmax(a, dim=1))
 
 
