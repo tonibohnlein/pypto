@@ -94,6 +94,12 @@ class _UnaryMathBase(PTOTestCase):
         config=None,
     ):
         super().__init__(config)
+        # fp16 transcendentals (sqrt/sin/cos) use a HW Newton/poly approximation that
+        # differs from torch by up to ~1 fp16 ULP (2^-11 ~ 4.9e-4 near 1); the 1e-5
+        # default is ~50x too tight. Loosen for fp16 only (fp32 stays effectively exact).
+        if dtype == DataType.FP16 and config is None:
+            self.config.rtol = 1e-3
+            self.config.atol = 1e-3
         self._m, self._n, self._valid, self._dtype = m, n, valid_shapes, dtype
         self._input_fn = input_fn or _positive
         self._out_m, self._out_n, self._off = out_m or m, out_n or n, off

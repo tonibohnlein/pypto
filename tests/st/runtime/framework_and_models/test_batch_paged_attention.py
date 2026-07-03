@@ -878,8 +878,11 @@ class BatchPagedAttentionTestCase(PTOTestCase):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        # BF16 QK/PV matmuls + bf16 softmax exp: a residual bf16-ULP rounding of pij
+        # flows through the PV matmul. rtol=2e-2 matches the other bf16 attention
+        # s-tests (>= one bf16 ULP, eps_bf16 = 2^-7); the prior 1e-3 is below one ULP.
         self.config.atol = 1e-3
-        self.config.rtol = 1e-3
+        self.config.rtol = 2e-2
         self.batch = batch
         self.num_heads = num_heads
         self.head_dim = head_dim

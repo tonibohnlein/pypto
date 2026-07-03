@@ -51,6 +51,12 @@ class TestTensorMatmul2dBy3d(PTOTestCase):
         config=None,
     ):
         super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
         self.M = m
         self.K = k
         self.N = n
@@ -124,6 +130,12 @@ class TestTensorMatmulAcc2dBy3d(PTOTestCase):
         config=None,
     ):
         super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
         self.M = m
         self.K = k
         self.N = n
@@ -205,6 +217,12 @@ class TestTensorBatchMatmulMixedAddBTrans(PTOTestCase):
         config=None,
     ):
         super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
         self.B = b
         self.M = m
         self.K = k
@@ -284,6 +302,12 @@ class TestTensorBatchMatmul3dBy3dBTrans(PTOTestCase):
         config=None,
     ):
         super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
         self.B = b
         self.M = m
         self.K = k
@@ -359,6 +383,12 @@ class TestTensorBatchMatmulSlicedBTrans(PTOTestCase):
         config=None,
     ):
         super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
         self.G, self.G0, self.B, self.M, self.K, self.N = g, g0, b, m, k, n
 
     def get_name(self) -> str:
