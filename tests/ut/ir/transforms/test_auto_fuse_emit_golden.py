@@ -120,6 +120,24 @@ class TestAutoFuseEmitGolden:
         a, b = torch.randn(64, 512), torch.randn(512, 64)
         _emit_matches_reference(Prog, "mm", (a, b), a @ b, rtol=3e-3, atol=3e-3)
 
+    def test_matmul_ragged(self, ascend_backend):
+        """Non-power-of-two, awkwardly-divisible M/N (48x112, K=96): the matmul rule's
+        ragged M/N + the sink write-back (R1's stated raggedness locus). Green today via
+        the current emit; when the generic driver tiles it with valid/alloc mask-to-full,
+        it must still match. Loose tolerance in case the solver split-Ks."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mm(self, a: pl.Tensor[[48, 96], pl.FP32], b: pl.Tensor[[96, 112], pl.FP32]) -> pl.Tensor[[48, 112], pl.FP32]:
+                c: pl.Tensor[[48, 112], pl.FP32] = pl.matmul(a, b)
+                return c
+
+        torch.manual_seed(7)
+        a, b = torch.randn(48, 96), torch.randn(96, 112)
+        _emit_matches_reference(Prog, "mm", (a, b), a @ b, rtol=3e-3, atol=3e-3)
+
     # ---- TileChainedMatmul (fused chain; emit only — lowering is #1908-blocked) ----
 
     def test_chained_matmul(self, ascend_backend):
@@ -194,6 +212,48 @@ class TestAutoFuseEmitGolden:
         a, b = torch.randn(128, 128), torch.randn(128, 128)
         c = a + b
         _emit_matches_reference(Prog, "dag", (a, b), (c + 1.0) * (c + 2.0) + c)
+
+    def test_pointwise_ragged(self, ascend_backend):
+        """Non-16-aligned M AND N (130x66): the hardest tail for the future driver's
+        valid/alloc mask-to-full (R1). Elementwise, so exact today; must stay exact when
+        the driver tiles it raggedly."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw(self, a: pl.Tensor[[130, 66], pl.FP32]) -> pl.Tensor[[130, 66], pl.FP32]:
+                c: pl.Tensor[[130, 66], pl.FP32] = pl.add(a, 1.0)
+                return c
+
+        torch.manual_seed(8)
+        a = torch.randn(130, 66)
+        _emit_matches_reference(Prog, "pw", (a,), a + 1.0)
+
+    # ---- Reduction rule (the v1-new reduction path: softmax) ----
+
+    def test_softmax_reduction(self, ascend_backend):
+        """Row-wise softmax — the reduction rule: pinned reduced axis + fused
+        max/sub/exp/sum/div, with the intermediate on-chip. Tight tolerance: the reduced
+        axis is pinned full on one core (S2), so it does NOT reassociate vs. the reference
+        (unlike split-K matmul). Untiled/fallback today; the reduction rule tiles the free
+        axis when the driver lands, and this must still match."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def softmax(self, a: pl.Tensor[[256, 128], pl.FP32]) -> pl.Tensor[[256, 128], pl.FP32]:
+                m: pl.Tensor[[256, 1], pl.FP32] = pl.row_max(a)
+                s: pl.Tensor[[256, 128], pl.FP32] = pl.row_expand_sub(a, m)
+                e: pl.Tensor[[256, 128], pl.FP32] = pl.exp(s)
+                d: pl.Tensor[[256, 1], pl.FP32] = pl.row_sum(e)
+                c: pl.Tensor[[256, 128], pl.FP32] = pl.row_expand_div(e, d)
+                return c
+
+        torch.manual_seed(9)
+        a = torch.randn(256, 128)
+        _emit_matches_reference(Prog, "softmax", (a,), torch.softmax(a, dim=1))
 
 
 if __name__ == "__main__":
