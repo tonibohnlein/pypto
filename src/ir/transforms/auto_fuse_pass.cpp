@@ -895,6 +895,160 @@ std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
+// ============================================================================
+// Generic tile-and-fuse driver (behind the PYPTO_AUTOFUSE_GENERIC_EMIT flag).
+//
+// Replacement-in-progress for the per-shape tilers (TileMatmul / TileChainedMatmul /
+// TilePointwiseGroup): ONE driver walks a fused group in plan order and applies a
+// per-op-class TilingRule, materializing intermediates on-chip. v1 scope:
+// single-pinned-axis, single-sink, engine-homogeneous groups. See the design doc
+// "Generic tile-and-fuse emitter" for the full SR/A/S contract.
+//
+// INCREMENT 1: the ELEMENTWISE rule only (the identity slice-and-replay — the same
+// tiling TilePointwiseGroup does today, restructured as the driver + explicit asserts).
+// A group needing the Reduction or MatMul rule returns nullopt so the caller falls back
+// to the legacy tiler; the flag defaults OFF, so production is byte-for-byte unchanged.
+// ============================================================================
+static bool GenericEmitEnabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("PYPTO_AUTOFUSE_GENERIC_EMIT");
+    return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+  }();
+  return on;
+}
+
+std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<StmtPtr>& run,
+                                                          SolverTile tile, const std::string& name) {
+  auto& reg = OpRegistry::GetInstance();
+
+  // A1 (classify allowlist). Increment 1 supports ELEMENTWISE only: a Reduction/MatMul
+  // member is out of this increment's scope (its rule is TODO) and any other class
+  // (transform / opaque / position-dependent) is permanently REJECT — both -> nullopt
+  // so the caller falls back to the legacy tiler.
+  std::vector<AssignStmtPtr> ops;
+  ops.reserve(run.size());
+  for (const StmtPtr& s : run) {
+    auto a = As<AssignStmt>(s);
+    if (a == nullptr) return std::nullopt;
+    auto c = As<Call>(a->value_);
+    if (c == nullptr || c->op_ == nullptr) return std::nullopt;
+    if (ClassifyOp(c) != ::OpType::Pointwise) return std::nullopt;  // Elementwise-only (increment 1)
+    ops.push_back(a);
+  }
+  if (ops.empty()) return std::nullopt;
+
+  // A7 (single sink): the group output is the single run-var not consumed within the run
+  // (a fused group keeps its intermediates on-chip). >1 live-out = multi-output -> S5.
+  std::unordered_set<const Var*> defined;
+  for (const auto& a : ops) defined.insert(a->var_.get());
+  std::unordered_set<const Var*> used_within;
+  for (const auto& a : ops)
+    for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
+      auto v = AsVarLike(arg);
+      if (v != nullptr && defined.count(v.get()) != 0) used_within.insert(v.get());
+    }
+  AssignStmtPtr out_stmt = nullptr;
+  for (const auto& a : ops)
+    if (used_within.count(a->var_.get()) == 0) {
+      if (out_stmt != nullptr) return std::nullopt;  // A7: >1 live-out -> multi-output (S5)
+      out_stmt = a;
+    }
+  if (out_stmt == nullptr) return std::nullopt;
+
+  const VarPtr c_var = out_stmt->var_;
+  auto ct = As<TensorType>(c_var->GetType());
+  if (ct == nullptr) return std::nullopt;
+  const DataType dtype = ct->dtype_;
+  const auto [M, N] = Static2DShape(c_var->GetType());
+  if (M < 0) return std::nullopt;
+
+  // Elementwise operand map is IDENTITY: every operand is an intermediate, an [M,N]
+  // external input (sliced), or a scalar. A differently-shaped 2D operand (broadcast)
+  // is not identity -> out of the increment-1 Elementwise rule (a Broadcast rule is TODO).
+  for (const auto& a : ops)
+    for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
+      auto v = AsVarLike(arg);
+      if (v != nullptr && defined.count(v.get()) != 0) continue;
+      const auto [aM, aN] = Static2DShape(arg->GetType());
+      if (aM < 0) continue;                     // scalar / non-2D -> kept as-is
+      if (aM == M && aN == N) continue;         // [M,N] external input -> sliced
+      return std::nullopt;                      // other 2D shape (broadcast) -> not increment 1
+    }
+
+  // Grid: single shared parallel tile space; pure elementwise has NO pinned axis, so we
+  // tile all output axes. Ragged (valid/alloc mask-to-full, R1) is TODO -> require exact
+  // division for now (non-dividing -> fall back); whole-output single tile -> plain scope.
+  int64_t h = (tile.h > 0 && tile.h < M) ? tile.h : M;
+  int64_t w = (tile.w > 0 && tile.w < N) ? tile.w : N;
+  if (M % h != 0 || N % w != 0) return std::nullopt;
+  const int64_t num_m = M / h, num_n = N / w;
+  if (num_m == 1 && num_n == 1) return std::nullopt;
+
+  const Span sp = out_stmt->span_;
+  const std::string base = c_var->name_hint_;
+  auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
+
+  auto c_init_call = reg.Create("tensor.create", {MakeIndexTuple({M, N}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
+  auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
+  auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
+
+  // Flat SPMD grid over the num_m*num_n free-axis tiles; block -> (mi,ni). Elementwise
+  // never split-Ks, so this decode is spatial-only (the MatMul rule adds the k_slice).
+  auto t = std::make_shared<Var>(base + "_t", index_type, sp);
+  auto mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
+  auto ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+
+  // Driver loop: walk the group in order; per op apply the ELEMENTWISE rule — slice each
+  // [M,N] input to [h,w] (identity map), read intermediates from on-chip scratch, then
+  // reg.Create the op at tile shape (its type-deduction re-infers the tile result), and
+  // materialize on-chip. Two caches (§8 unified scratch): `onchip` for intermediates,
+  // `input_cache` for external-input slices (dedups DMA under shared coordinates).
+  std::vector<StmtPtr> body_stmts;
+  std::unordered_map<const Var*, VarPtr> onchip;       // intermediate -> on-chip tile (ScratchMap)
+  std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [h,w] slice
+  VarPtr tile_var;
+  for (const auto& a : ops) {
+    auto c = As<Call>(a->value_);
+    std::vector<ExprPtr> targs;
+    for (const ExprPtr& arg : c->args_) {
+      auto v = AsVarLike(arg);
+      if (v != nullptr) {
+        auto it = onchip.find(v.get());
+        if (it != onchip.end()) { targs.push_back(it->second); continue; }  // intermediate on-chip
+      }
+      const auto [aM, aN] = Static2DShape(arg->GetType());
+      if (aM == M && aN == N) {  // external input -> identity [h,w] slice (cached per input var)
+        if (v != nullptr) {
+          auto sit = input_cache.find(v.get());
+          if (sit != input_cache.end()) { targs.push_back(sit->second); continue; }
+        }
+        auto sl = reg.Create("tensor.slice", {arg, MakeIndexTuple({h, w}, sp), MakeTuple2(mi, ni, sp)}, sp);
+        auto sv = std::make_shared<Var>(base + "_in", sl->GetType(), sp);
+        body_stmts.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
+        if (v != nullptr) input_cache[v.get()] = sv;
+        targs.push_back(sv);
+      } else {
+        targs.push_back(arg);  // scalar / non-2D -> as-is
+      }
+    }
+    auto pw = reg.Create(c->op_->name_, targs, c->kwargs_, sp);
+    auto res = std::make_shared<Var>(base + (a == out_stmt ? "_tile" : "_t"), pw->GetType(), sp);
+    body_stmts.push_back(std::make_shared<AssignStmt>(res, pw, sp));
+    onchip[a->var_.get()] = res;
+    if (a == out_stmt) tile_var = res;
+  }
+
+  // Assemble the sink tile into the output (disjoint tiles; no atomic — elementwise has
+  // no split-K), then distribute across cores via SpmdWrap.
+  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tile_var, MakeTuple2(mi, ni, sp)}, sp);
+  body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+
+  auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
+  LOG_INFO << "AutoFuse[generic]: elementwise group '" << name << "' tiled by the generic driver ("
+           << ops.size() << " ops, " << (num_m * num_n) << " tiles)";
+  return std::vector<StmtPtr>{c_init_assign, scope};
+}
+
 // Realize the solver's FUSED chained matmul: two matmuls `T = A @ B` and
 // `C = T @ D` placed in ONE group, where MM2 consumes MM1's output T. The
 // intermediate T never touches DDR (the fusion) — it is recomputed on-chip per
@@ -1067,6 +1221,19 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
     // single-tile output) falls back to one plain InCore scope.
     auto tit = stmt_tile.find(run.front().get());
     if (tit != stmt_tile.end()) {
+      // Behind the flag, the generic tile-and-fuse driver gets first refusal; it handles
+      // only what its implemented rules cover (increment 1: elementwise) and returns
+      // nullopt otherwise, so we fall through to the legacy tiler. Flag off => never called.
+      if (GenericEmitEnabled()) {
+        if (auto generic = EmitFusedGroupGeneric(run, tit->second, nm)) {
+          for (auto& s : *generic) {
+            top.push_back(std::move(s));
+          }
+          run.clear();
+          run_group = -1;
+          return;
+        }
+      }
       if (auto tiled = TilePointwiseGroup(run, tit->second, nm)) {
         for (auto& s : *tiled) {
           top.push_back(std::move(s));
