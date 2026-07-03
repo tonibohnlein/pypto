@@ -198,12 +198,14 @@ class TestAutoFuse:
         )
         assert "pto.tmatmul.acc" in mlir  # k-pipelined per tile
 
-    @_STALE_EMIT
     def test_single_pointwise_tiles_across_vector_cores(self, ascend_backend):
         """A large pointwise op is tiled into the solver's `[w,h]` regions and
         distributed across the vector cores, lowering to a vector (AIV) kernel.
 
-        For `[4096,384]` the solver picks 48 output tiles — one per AIV core.
+        Pinned to Ascend910B (48 vector cores): for `[4096,384]` the grounded solver picks
+        a `[512,64]` tile, so the output tiles into 8x6 = 48 disjoint regions — one per AIV
+        core — emitted as a single flat `pl.spmd(48)` loop. No split-K (pointwise has no
+        contraction), so no zero-seed and a plain (non-atomic) per-tile `assemble`.
         """
 
         @pl.program
@@ -214,13 +216,17 @@ class TestAutoFuse:
                 return c
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw").as_python()
-        assert "chunked_loop_optimizer" in body  # AutoInCore chunked scope
-        assert "pl.parallel(48" in body  # 48 output tiles — one per vector core
-        assert "pl.tensor.adds(" in body and "pl.tensor.assemble(" in body  # per-tile op + output assembly
+        # A single flat 48-block SPMD loop -> 48 cross-core task submissions of one kernel.
+        assert "pl.spmd(48" in body and body.count("pl.spmd(") == 1
+        # Per-block: slice the tile, apply the op, assemble into the output. No split-K, so
+        # no CORE_GROUP zero-seed and no atomic merge.
+        assert "pl.tensor.slice(" in body
+        assert "pl.tensor.adds(" in body and "pl.tensor.assemble(" in body
+        assert "pl.at(level=pl.Level.CORE_GROUP" not in body and "AtomicType" not in body
 
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
-        assert len(incores) == 1
+        assert len(incores) == 1  # no split-K seed kernel -> just the vector kernel
         assert str(incores[0].func_type) == "FunctionType.AIV"  # pointwise -> vector kernel
 
     @_STALE_EMIT
@@ -306,16 +312,15 @@ class TestAutoFuse:
         assert sink_inputs[0] == intermediate, (sink_inputs, intermediate)
         assert len(sink_inputs) == 2 and sink_inputs[1] != intermediate
 
-    @_STALE_EMIT
     def test_chained_pointwise_fuses_into_one_tiled_kernel(self, ascend_backend):
         """Two chained pointwise ops the solver groups fuse into one tiled vector
         kernel, with the intermediate staying on-chip.
 
-        For ``c = (a+1.0)*2.0`` over ``[4096,384]`` the solver fuses both ops and
-        tiles the output across the vector cores (48 tiles). Each tile's body
-        replays the whole chain on a ``[h,w]`` slice — so both ops land in one AIV
-        kernel and the intermediate ``t`` is never materialized to DDR (a single
-        output assemble), rather than two kernels round-tripping ``t`` through memory.
+        For ``c = (a+1.0)*2.0`` over ``[4096,384]`` (Ascend910B) the solver fuses both ops
+        and tiles the output into 48 `[512,64]` regions across the vector cores, emitted as
+        one flat ``pl.spmd(48)`` loop. Each block replays the whole chain on its slice — so
+        both ops land in one AIV kernel and the intermediate ``t`` is never materialized to
+        DDR (a single output ``assemble``), rather than two kernels round-tripping ``t``.
         """
 
         @pl.program
@@ -327,9 +332,9 @@ class TestAutoFuse:
                 return c
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw2").as_python()
-        assert "chunked_loop_optimizer" in body  # one fused AutoInCore scope
-        assert "pl.parallel(48" in body  # 48 output tiles — one per vector core
-        assert "pl.tensor.adds(" in body and "pl.tensor.muls(" in body  # both ops in the per-tile body
+        # One fused flat 48-block SPMD loop -> 48 cross-core task submissions of one kernel.
+        assert "pl.spmd(48" in body and body.count("pl.spmd(") == 1
+        assert "pl.tensor.adds(" in body and "pl.tensor.muls(" in body  # both ops in the per-block body
         assert body.count("pl.tensor.assemble(") == 1  # only the output is assembled; the intermediate stays on-chip
 
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
