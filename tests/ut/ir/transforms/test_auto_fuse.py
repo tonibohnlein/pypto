@@ -27,20 +27,13 @@ import pytest
 from pypto import codegen, ir, passes
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
-# The AutoFuse emit was co-designed with the pre-grounding (competition-era) cost
-# model. The grounded rework (HBM aggregate cap, vector cost model, MTE1 tiebreaker)
-# plus the upstream #1895 auto_chunk removal changed the solver's decisions (e.g. small
-# matmuls now take the split-K path) AND migrated the emit onto SPMD (pl.spmd + a
-# CORE_GROUP split-K seed + atomic-add merge), so the old `pl.auto_chunk` /
-# `pl.pipeline(stage=2)` / `matmul_acc` assertions are stale.
-#
-# These tests are being re-derived against the grounded SPMD emit ONE case at a time.
-# A rewritten, live test drops the marker below; every case not yet re-derived keeps
-# `@_STALE_EMIT` until its turn. (Re-activated so far: single-matmul emit.)
-_STALE_EMIT = pytest.mark.skip(
-    reason="AutoFuse emit test stale pending re-derivation against the grounded SPMD emit "
-    "(#1895); re-activated incrementally"
-)
+# These tests were rewritten against the grounded SPMD emit: the pre-grounding cost model
+# plus the #1895 auto_chunk removal changed the solver's decisions (small matmuls now
+# split-K) and migrated the emit onto SPMD (pl.spmd + a tiled zero-seed + atomic-add
+# merge), so the old pl.auto_chunk / pl.pipeline(stage=2) / matmul_acc assertions were
+# stale. All cases are now re-derived and live. The one exception is the chained-matmul
+# LOWERING, which is xfail on hw-native-sys/pypto#1908 (an AllocateMemoryAddr bump-allocator
+# limitation that can't pack the chain's L0A buffers — NOT an AutoFuse emit bug).
 
 
 class TestAutoFuse:
@@ -239,16 +232,17 @@ class TestAutoFuse:
         assert len(incores) == 1  # no split-K seed kernel -> just the vector kernel
         assert str(incores[0].func_type) == "FunctionType.AIV"  # pointwise -> vector kernel
 
-    @_STALE_EMIT
-    def test_chained_matmul_fuses_to_one_cube_kernel(self, ascend_backend):
+    def test_chained_matmul_fuses_to_one_kernel(self, ascend_backend):
         """Two back-to-back matmuls the solver groups together fuse into ONE kernel,
         with the intermediate staying on-chip.
 
-        For ``C = (A@B)@D`` the solver fuses both matmuls; AutoFuse emits a single
-        AutoInCore scope tiling C's output across cores, and each tile's body is the
-        inner serial chain ``T_band = A_slice@B`` (on-chip) then ``C_tile =
-        T_band@D_slice`` — so both matmuls land in one cube kernel rather than two
-        kernels with the intermediate round-tripping DDR.
+        For ``C = (A@B)@D`` the solver fuses both matmuls into one group; AutoFuse emits a
+        single CORE_GROUP scope holding both ``tensor.matmul``s, with the intermediate ``t``
+        as a scope-local consumed by the second matmul — never assembled out to DDR. That is
+        the fusion this checks (one kernel, not two round-tripping ``t``). NB: the solver's
+        96x64 tile does not divide the 128x256 output, so the emit uses the whole-output
+        fused scope rather than a spatial SPMD tiling; the lowering of this scope is exercised
+        separately (test_chained_matmul_lowers_to_cube_kernel, xfail on #1908).
         """
 
         @pl.program
@@ -265,10 +259,39 @@ class TestAutoFuse:
                 return c
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "chain").as_python()
-        assert "chunked_loop_optimizer" in body  # one fused AutoInCore scope
-        assert body.count("pl.tensor.matmul(") == 2  # both matmuls in the same per-tile body
-        assert "_tband" in body  # the on-chip intermediate (T never touches DDR)
-        assert body.count("pl.parallel(") == 1 and "chunk=1" in body  # one flat tile loop -> N cross-core submissions
+        # Both matmuls fused into ONE CORE_GROUP scope; the intermediate t stays on-chip
+        # (consumed by the second matmul), never assembled to DDR -> one kernel, not two.
+        assert "pl.at(level=pl.Level.CORE_GROUP" in body
+        assert body.count("pl.tensor.matmul(") == 2
+        assert "pl.tensor.assemble(" not in body  # t never round-trips DDR
+
+    @pytest.mark.xfail(
+        reason="chained-matmul lowering blocked on hw-native-sys/pypto#1908: AllocateMemoryAddr "
+        "(bump allocator) can't pack the chain's A-stationary producer (64KB L0A) + "
+        "double-buffered consumer (2x32KB) -> 'Left buffer usage 98304 > 65536'. Not an "
+        "AutoFuse emit bug. Remove this marker when #1908's offset-packing lands.",
+        strict=True,
+    )
+    def test_chained_matmul_lowers_to_cube_kernel(self, ascend_backend):
+        """The fused chain lowers through the Default pipeline to a single cube kernel.
+
+        XFAIL(#1908): the Default pipeline currently raises an AllocateMemoryAddr L0A
+        overflow on the chained kernel. When #1908 lands this XPASSes (strict) -> drop the
+        marker.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def chain(
+                self,
+                a: pl.Tensor[[128, 256], pl.FP32],
+                b: pl.Tensor[[256, 128], pl.FP32],
+                d: pl.Tensor[[128, 256], pl.FP32],
+            ) -> pl.Tensor[[128, 256], pl.FP32]:
+                t: pl.Tensor[[128, 128], pl.FP32] = pl.matmul(a, b)
+                c: pl.Tensor[[128, 256], pl.FP32] = pl.matmul(t, d)
+                return c
 
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
@@ -278,7 +301,6 @@ class TestAutoFuse:
         mlir = codegen.PTOCodegen().generate(ir.Program([incores[0]], incores[0].name, incores[0].span))
         assert "cube" in mlir and mlir.count("pto.tmatmul") >= 2  # both matmuls fused in
 
-    @_STALE_EMIT
     def test_chained_matmul_preserves_operand_input_order(self, tmp_path, monkeypatch):
         """Regression: the solver Problem must list each matmul's inputs in OPERAND
         order — inputs[0]=LHS, inputs[1]=RHS — because the cost model derives
