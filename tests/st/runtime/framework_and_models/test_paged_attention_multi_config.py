@@ -60,8 +60,9 @@ class SoftmaxPrepareTestCase(PTOTestCase):
         # 3.9e-3 near 0.5) must be admitted; rtol must be >= one bf16 ULP relative
         # (eps_bf16 = 2^-7 ~ 7.8e-3). 1.6e-2 = PyTorch bf16 default; the 1e-5 default
         # (and 1e-3) are too tight.
-        self.config.atol = 1e-3
-        self.config.rtol = 1.6e-2
+        if kwargs.get("config") is None:  # respect a caller-supplied (e.g. stricter) config
+            self.config.atol = 1e-3
+            self.config.rtol = 1.6e-2
 
     def get_name(self) -> str:
         return f"softmax_prepare_nb{self.n_blocks}"

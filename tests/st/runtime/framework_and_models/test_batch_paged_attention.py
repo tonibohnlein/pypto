@@ -243,10 +243,13 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
         # >= one BF16 ULP relative; rtol=1.6e-2 (PyTorch's bf16 assert_close
         # default, ~2 ULP of margin) covers it across (0, 1] -- e.g. at 0.5 the
         # threshold is atol + rtol*0.5 = 9e-3 > 3.9e-3 -- with atol=1e-3 for
-        # near-zero summands. The default rtol=atol=1e-5 is ~3 orders of
+        # near-zero summands. Observed CI flake (a2a3): 1/32 elements,
+        # |1.6414794921875 - 1.6405029296875| = 2^-10 ~ 9.8e-4 (1 bf16 ULP of a
+        # summand); 1.6e-2 clears it. The default rtol=atol=1e-5 is ~3 orders of
         # magnitude too tight and flakes intermittently.
-        self.config.atol = 1e-3
-        self.config.rtol = 1.6e-2
+        if kwargs.get("config") is None:  # respect a caller-supplied (e.g. stricter) config
+            self.config.atol = 1e-3
+            self.config.rtol = 1.6e-2
         self.batch = batch
         self.num_heads = num_heads
         self.block_size = block_size
@@ -878,11 +881,15 @@ class BatchPagedAttentionTestCase(PTOTestCase):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        # BF16 QK/PV matmuls + bf16 softmax exp: a residual bf16-ULP rounding of pij
-        # flows through the PV matmul. rtol=2e-2 matches the other bf16 attention
-        # s-tests (>= one bf16 ULP, eps_bf16 = 2^-7); the prior 1e-3 is below one ULP.
-        self.config.atol = 1e-3
-        self.config.rtol = 2e-2
+        # Full attention: BF16 QK/PV matmuls + an FP16 softmax pij intermediate (the
+        # assembled program's pij_b is pl.FP16; the golden casts pij through
+        # torch.float16). The dominant error is the bf16 matmul reductions -- one bf16
+        # ULP (up to 2^-8 ~ 3.9e-3) exceeds the fp16 pij's ULP -- so rtol=2e-2 (bf16
+        # scale) matches the other bf16 attention s-tests; the prior 1e-3 is below one
+        # bf16 ULP.
+        if kwargs.get("config") is None:  # respect a caller-supplied (e.g. stricter) config
+            self.config.atol = 1e-3
+            self.config.rtol = 2e-2
         self.batch = batch
         self.num_heads = num_heads
         self.head_dim = head_dim
