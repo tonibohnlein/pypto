@@ -40,6 +40,21 @@ import pytest
 from pypto import passes
 
 
+@pytest.fixture(params=["legacy", "generic"], autouse=True)
+def emit_path(request, monkeypatch):
+    """Run EVERY golden case both ways — flag OFF (legacy per-shape tilers) and flag ON
+    (the generic tile-and-fuse driver) — so this file is a true DIFFERENTIAL net: both
+    paths must reproduce the unfused reference. This is the migration guard that lets the
+    driver be promoted / the legacy tilers retired with CI confidence, not just manual
+    checks. The C++ flag re-reads the env var per compile, so monkeypatch toggles it
+    in-process (see GenericEmitEnabled in auto_fuse_pass.cpp)."""
+    if request.param == "generic":
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+    else:
+        monkeypatch.delenv("PYPTO_AUTOFUSE_GENERIC_EMIT", raising=False)
+    return request.param
+
+
 def _emit_matches_reference(program, entry, inputs, ref, *, rtol=1e-4, atol=1e-4):
     """Run AutoFuse, execute the emit's every SPMD block into the shared output,
     and assert the tile-stitched full result equals the unfused reference.

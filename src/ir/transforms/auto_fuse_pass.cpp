@@ -912,11 +912,12 @@ std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr
 // byte-for-byte unchanged.
 // ============================================================================
 static bool GenericEmitEnabled() {
-  static const bool on = [] {
-    const char* v = std::getenv("PYPTO_AUTOFUSE_GENERIC_EMIT");
-    return v != nullptr && v[0] != '\0' && std::string(v) != "0";
-  }();
-  return on;
+  // Re-read per call (not cached) so a test can toggle the flag in-process — the
+  // golden net runs every case both flag-off (legacy) and flag-on (driver) to diff
+  // them. Cost is negligible (a getenv per fused group). The env var is stable within
+  // any one compile, so re-reading never changes behavior mid-compilation.
+  const char* v = std::getenv("PYPTO_AUTOFUSE_GENERIC_EMIT");
+  return v != nullptr && v[0] != '\0' && std::string(v) != "0";
 }
 
 std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<StmtPtr>& run,
