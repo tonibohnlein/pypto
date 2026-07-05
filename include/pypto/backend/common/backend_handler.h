@@ -250,6 +250,18 @@ class BackendHandler {
    * outer matmul shape is itself smaller than this threshold).
    */
   [[nodiscard]] virtual int GetMinL0TileDim() const { return 16; }
+
+  /**
+   * @brief Contiguous-axis byte alignment for VECTOR (none_box) tiles.
+   *
+   * A vector tile's contiguous-axis byte extent (cols*sizeof(dtype) for
+   * row-major, rows*sizeof(dtype) for col-major) must be a multiple of this —
+   * the vector DMA block. On Ascend this is 32 bytes (the cube analogue is the
+   * 16-element fractal, GetL0FractalAlignment). Emitters that produce ragged
+   * vector tiles pad the allocated extent up to this granule while keeping the
+   * valid (compute) extent ragged.
+   */
+  [[nodiscard]] virtual int GetVectorDmaAlignmentBytes() const { return 32; }
 };
 
 }  // namespace backend

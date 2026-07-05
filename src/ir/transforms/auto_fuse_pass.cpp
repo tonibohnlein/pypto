@@ -32,6 +32,8 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_handler.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/soc.h"
 #include "pypto/core/error.h"
@@ -1134,6 +1136,52 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   if (M % h != 0) mi = MakeMin(mi, MakeIndex(M - h, sp), sp);
   if (N % w != 0) ni = MakeMin(ni, MakeIndex(N - w, sp), sp);
 
+  // Vector DMA-block granule (elements): a vector (none_box) tile's contiguous-axis byte
+  // extent must be a multiple of GetVectorDmaAlignmentBytes() (32). Pad each ragged tile
+  // axis up to this granule in the ALLOCATED shape while keeping the valid/compute extent
+  // ragged (the tile.load 4th arg). Use the MAX granule over the group's dtypes (= smallest
+  // dtype_bytes) since type inference forces every tile in the chain to share the padded
+  // extent: a mixed FP16/FP32 chain must satisfy the FP16 16-element block, which also
+  // satisfies FP32's 8-element one. FP32 -> 8, FP16 -> 16.
+  const auto* pctx = PassContext::Current();
+  const auto* handler = pctx ? pctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+  INTERNAL_CHECK(handler) << "Internal error: BackendHandler is null in AutoFuse generic emit";
+  int64_t min_dtype_bits = static_cast<int64_t>(dtype.GetBit());
+  for (const auto& a : ops) {
+    if (auto tt = As<TensorType>(a->var_->GetType()))
+      min_dtype_bits = std::min(min_dtype_bits, static_cast<int64_t>(tt->dtype_.GetBit()));
+    for (const ExprPtr& arg : As<Call>(a->value_)->args_)
+      if (auto att = As<TensorType>(arg->GetType()))
+        min_dtype_bits = std::min(min_dtype_bits, static_cast<int64_t>(att->dtype_.GetBit()));
+  }
+  const int64_t g = std::max<int64_t>(1, handler->GetVectorDmaAlignmentBytes() / ((min_dtype_bits + 7) / 8));
+
+  // Reduced-axis padding is UNVERIFIED (§4.4): padding a reduction's reduced axis is only
+  // correct if trowsum/tcolsum bound the sum by valid — a ptoas semantic not yet proven on
+  // device. Phase 1 pads FREE axes only. A reduction pins its reduced axis full (w==N / h==M
+  // by the A4 guard above); if that full extent is not granule-aligned, padding it would be
+  // the unproven reduced-axis case -> decline (correct-but-unfused via the legacy fallback),
+  // rather than emit a possibly-garbage sum.
+  if (has_reduction) {
+    for (const auto& a : ops) {
+      auto c = As<Call>(a->value_);
+      if (ClassifyOp(c) != ::OpType::Reduction || c->args_.empty()) continue;
+      const auto [iM, iN] = Static2DShape(c->args_[0]->GetType());
+      const auto [oM, oN] = Static2DShape(a->var_->GetType());
+      if (iN > 1 && oN == 1 && N % g != 0)
+        return GenericDeclineCap("ragged reduced axis N (reduced-axis padding needs the "
+                                 "trowsum-honors-valid proof, §4.4)");
+      if (iM > 1 && oM == 1 && M % g != 0)
+        return GenericDeclineCap("ragged reduced axis M (reduced-axis padding needs the "
+                                 "tcolsum-honors-valid proof, §4.4)");
+    }
+  }
+
+  // Padded ALLOCATED tile extent; valid stays [h,w]. Padding is a no-op on already-aligned
+  // axes (AlignUp(x,g)==x), so aligned shapes emit the 3-arg slice byte-identically to before.
+  const int64_t h_al = AlignUp(h, g), w_al = AlignUp(w, g);
+  const bool tile_ragged = (h_al != h) || (w_al != w);
+
   // Driver loop: walk the group in order; per op apply the ELEMENTWISE rule — slice each
   // [M,N] input to [h,w] (identity map), read intermediates from on-chip scratch, then
   // reg.Create the op at tile shape (its type-deduction re-infers the tile result), and
@@ -1158,7 +1206,17 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           auto sit = input_cache.find(v.get());
           if (sit != input_cache.end()) { targs.push_back(sit->second); continue; }
         }
-        auto sl = reg.Create("tensor.slice", {arg, MakeIndexTuple({h, w}, sp), MakeTuple2(mi, ni, sp)}, sp);
+        // Pad the ALLOCATED slice to the granule ([h_al,w_al]) with a ragged VALID extent
+        // ([h,w], the 4th arg) so the on-chip tile assembles (contiguous byte extent aligned)
+        // while the DMA reads only the in-bounds valid region. Aligned axes -> 3-arg slice
+        // (byte-identical). tile.load/store, elementwise/reduction type-inference, and
+        // torch_codegen all honor valid, so the compute + write-back stay the valid [h,w].
+        ExprPtr sl = tile_ragged
+                         ? reg.Create("tensor.slice",
+                                      {arg, MakeIndexTuple({h_al, w_al}, sp), MakeTuple2(mi, ni, sp),
+                                       MakeIndexTuple({h, w}, sp)},
+                                      sp)
+                         : reg.Create("tensor.slice", {arg, MakeIndexTuple({h, w}, sp), MakeTuple2(mi, ni, sp)}, sp);
         // Unique name per distinct external input (input_cache.size() is the next index):
         // a group with >1 external input (e.g. c = a + b) must not name both slices "_in",
         // or a name-based consumer (torch_codegen) collapses them and reads the wrong operand.

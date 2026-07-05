@@ -50,8 +50,18 @@ def emit_path(request, monkeypatch):
     in-process (see GenericEmitEnabled in auto_fuse_pass.cpp)."""
     if request.param == "generic":
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        # STRICT mode turns every Tier-B decline (a plan the emitter contract forbids —
+        # mis-pinned reduction, split ∤ K/16, mixed cube+vector, multi-sink) into a hard
+        # failure instead of a silent legacy fallback. Enabling it on the generic golden
+        # run makes CI ENFORCE the tier invariant "no Tier-B fires on the v1 surface" —
+        # otherwise a future golden case (or a solver change) that trips a Tier-B would
+        # pass green via the legacy fallback, masking exactly the bug the tiers exist to
+        # surface. Capability declines (non-uniform grid, vector split>1) do NOT abort
+        # under strict, so legitimate deferred-fidelity cases stay green.
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
     else:
         monkeypatch.delenv("PYPTO_AUTOFUSE_GENERIC_EMIT", raising=False)
+        monkeypatch.delenv("PYPTO_AUTOFUSE_STRICT", raising=False)
     return request.param
 
 
