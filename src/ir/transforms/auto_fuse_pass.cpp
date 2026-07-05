@@ -1156,26 +1156,15 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   }
   const int64_t g = std::max<int64_t>(1, handler->GetVectorDmaAlignmentBytes() / ((min_dtype_bits + 7) / 8));
 
-  // Reduced-axis padding is UNVERIFIED (§4.4): padding a reduction's reduced axis is only
-  // correct if trowsum/tcolsum bound the sum by valid — a ptoas semantic not yet proven on
-  // device. Phase 1 pads FREE axes only. A reduction pins its reduced axis full (w==N / h==M
-  // by the A4 guard above); if that full extent is not granule-aligned, padding it would be
-  // the unproven reduced-axis case -> decline (correct-but-unfused via the legacy fallback),
-  // rather than emit a possibly-garbage sum.
-  if (has_reduction) {
-    for (const auto& a : ops) {
-      auto c = As<Call>(a->value_);
-      if (ClassifyOp(c) != ::OpType::Reduction || c->args_.empty()) continue;
-      const auto [iM, iN] = Static2DShape(c->args_[0]->GetType());
-      const auto [oM, oN] = Static2DShape(a->var_->GetType());
-      if (iN > 1 && oN == 1 && N % g != 0)
-        return GenericDeclineCap("ragged reduced axis N (reduced-axis padding needs the "
-                                 "trowsum-honors-valid proof, §4.4)");
-      if (iM > 1 && oM == 1 && M % g != 0)
-        return GenericDeclineCap("ragged reduced axis M (reduced-axis padding needs the "
-                                 "tcolsum-honors-valid proof, §4.4)");
-    }
-  }
+  // Reduced-axis padding is now ALLOWED. The original §4.4 concern — a reduction over a ragged
+  // reduced axis pads the reduced axis, leaving uninitialized lanes that feed the sum — is
+  // resolved: a device experiment on Ascend 910B proved pto.trowsum / pto.tcolsum bound the
+  // reduction by the tile's `valid` extent, not the physical (padded) extent (a poison value in
+  // the padded lanes is excluded from the result). So the padded reduced-axis lanes cannot
+  // corrupt the valid output; the same axis-padding machinery below handles the reduced axis
+  // like any free axis, and `valid` (propagated through tile.load/row_sum) bounds the reduction.
+  // (Proven for SUM reductions; MAX/MIN use the same valid mechanism and are confirmed by a
+  // device row_max probe — see tests/st/runtime/ops/test_auto_fuse_device.py.)
 
   // Padded ALLOCATED tile extent; valid stays [h,w]. Padding is a no-op on already-aligned
   // axes (AlignUp(x,g)==x), so aligned shapes emit the 3-arg slice byte-identically to before.

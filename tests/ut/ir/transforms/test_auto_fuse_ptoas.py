@@ -102,7 +102,26 @@ def test_vector_ragged_softmax_assembles(tmp_path):
     _assembles(sm, "sm_ragged", tmp_path)
 
 
-# ---- deferred: cube ragged matmul (Phase 2) + vector ragged-REDUCED axis (needs trowsum proof) ----
+# ---- ragged REDUCED axis — now padded (device-proven trowsum/tcolsum honor valid) ----
+
+def test_vector_ragged_reduced_axis_softmax_assembles(tmp_path):
+    """Softmax over a ragged REDUCED axis (N=66): the reduction axis (N) is itself ragged and
+    gets padded 66->72, valid=66. Exercises BOTH row_max and row_sum over the padded reduced
+    axis. A device experiment proved trowsum/tcolsum bound by valid, so the padded lanes are
+    inert; the guard that previously declined this is lifted."""
+    @pl.function(attrs={"auto_fuse": True})
+    def sm(x: pl.Tensor[[256, 66], pl.FP32]) -> pl.Tensor[[256, 66], pl.FP32]:
+        m: pl.Tensor[[256, 1], pl.FP32] = pl.row_max(x)
+        s: pl.Tensor[[256, 66], pl.FP32] = pl.sub(x, m)
+        e: pl.Tensor[[256, 66], pl.FP32] = pl.exp(s)
+        d: pl.Tensor[[256, 1], pl.FP32] = pl.row_sum(e)
+        o: pl.Tensor[[256, 66], pl.FP32] = pl.div(e, d)
+        return o
+
+    _assembles(sm, "sm_ragged_reduced", tmp_path)
+
+
+# ---- deferred: cube ragged matmul (Phase 2 — tmatmul sums physical K, needs K-tail zero-fill) ----
 
 @pytest.mark.xfail(strict=True, reason="Phase 2: ragged cube matmul needs M/N/K padding + K-tail "
                                        "zero-fill (tmatmul sums physical K). Documented limitation.")
@@ -113,18 +132,6 @@ def test_cube_ragged_matmul_assembles(tmp_path):
         return c
 
     _assembles(mm, "mm_ragged", tmp_path)
-
-
-@pytest.mark.xfail(strict=True, reason="Deferred: padding a ragged REDUCED axis (row_sum over N=66) "
-                                       "is only safe if trowsum bounds the sum by valid_col — an "
-                                       "on-device proof (§4.4 gate). Phase 1 guards/declines this.")
-def test_vector_ragged_reduced_axis_assembles(tmp_path):
-    @pl.function(attrs={"auto_fuse": True})
-    def rs(x: pl.Tensor[[128, 66], pl.FP32]) -> pl.Tensor[[128, 1], pl.FP32]:
-        d: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(x)
-        return d
-
-    _assembles(rs, "rs_ragged_reduced", tmp_path)
 
 
 if __name__ == "__main__":

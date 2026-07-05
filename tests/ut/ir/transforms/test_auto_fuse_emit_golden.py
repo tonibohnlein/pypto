@@ -282,6 +282,29 @@ class TestAutoFuseEmitGolden:
         a = torch.randn(256, 128)
         _emit_matches_reference(Prog, "softmax", (a,), torch.softmax(a, dim=1))
 
+    def test_softmax_reduced_axis_ragged(self, ascend_backend):
+        """Softmax over a RAGGED REDUCED axis (N=66): the reduction axis itself is ragged, so
+        the generic driver pads it 66->72 (valid=66) and the reductions run over the padded
+        axis. A device experiment proved trowsum/tcolsum bound the reduction by valid (the
+        padded lanes are excluded), so the guard that previously declined this is lifted; this
+        checks the emit is numerically correct (both paths)."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def softmax(self, a: pl.Tensor[[256, 66], pl.FP32]) -> pl.Tensor[[256, 66], pl.FP32]:
+                m: pl.Tensor[[256, 1], pl.FP32] = pl.row_max(a)
+                s: pl.Tensor[[256, 66], pl.FP32] = pl.row_expand_sub(a, m)
+                e: pl.Tensor[[256, 66], pl.FP32] = pl.exp(s)
+                d: pl.Tensor[[256, 1], pl.FP32] = pl.row_sum(e)
+                c: pl.Tensor[[256, 66], pl.FP32] = pl.row_expand_div(e, d)
+                return c
+
+        torch.manual_seed(10)
+        a = torch.randn(256, 66)
+        _emit_matches_reference(Prog, "softmax", (a,), torch.softmax(a, dim=1))
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
