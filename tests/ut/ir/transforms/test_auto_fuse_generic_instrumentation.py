@@ -29,7 +29,7 @@ loud illegal-plan failure — never an invisible fallback.
 
 import pypto.language as pl
 import pytest
-from pypto import passes
+from pypto import ir, passes
 from pypto.pypto_core import LogLevel, set_log_level
 
 
@@ -105,6 +105,64 @@ class TestGenericDriverEngages:
         log = _autofuse_log(Prog, capfd, monkeypatch)
         assert "CAPABILITY decline" in log and "non-uniform spatial grid" in log, (
             "non-uniform grid decline was not logged (silent fallback masks the fidelity gap)\n" + log
+        )
+
+
+class TestVectorPipelining:
+    """The vector emit is software-pipelined so DMA overlaps compute — the max(compute,ddr)
+    roofline the cost model prices (db_roofline), not a serial load->compute->store."""
+
+    def test_vector_group_emits_pipeline_strips(self, ascend_backend, capfd, monkeypatch):
+        """A vector group is chunked into >=2 pipeline strips (emit side)."""
+        import re  # noqa: PLC0415
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw(
+                self, a: pl.Tensor[[512, 512], pl.FP32], b: pl.Tensor[[512, 512], pl.FP32]
+            ) -> pl.Tensor[[512, 512], pl.FP32]:
+                c: pl.Tensor[[512, 512], pl.FP32] = pl.add(a, b)
+                d: pl.Tensor[[512, 512], pl.FP32] = pl.mul(c, b)
+                return d
+
+        log = _autofuse_log(Prog, capfd, monkeypatch)
+        m = re.search(r"(\d+) pipeline strips", log)
+        assert m and int(m.group(1)) >= 2, (
+            f"vector group not pipelined (expected >=2 strips)\n{log}"
+        )
+
+    def test_vector_pipeline_realizes_overlap(self, ascend_backend, tmp_path, monkeypatch):
+        """The LOWERED vector kernel loads each input per-strip into distinct ping-pong buffers
+        (LowerPipelineLoops unroll+tag -> CanonicalizeIOOrder cluster -> MemoryReuse), so DMA
+        overlaps compute. A loop's structural presence alone is not proof of overlap; per-strip
+        loading (more tloads than inputs) is the realized-pipeline signature."""
+        import os  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.function(attrs={"auto_fuse": True})
+        def pw(
+            a: pl.Tensor[[512, 512], pl.FP32], b: pl.Tensor[[512, 512], pl.FP32]
+        ) -> pl.Tensor[[512, 512], pl.FP32]:
+            c: pl.Tensor[[512, 512], pl.FP32] = pl.add(a, b)
+            d: pl.Tensor[[512, 512], pl.FP32] = pl.mul(c, b)
+            return d
+
+        out = tmp_path / "pw_pipe"
+        ir.compile(ir.Program([pw], "pw", ir.Span.unknown()), output_dir=str(out), skip_ptoas=True)
+        aiv = ""
+        for root, _, files in os.walk(str(out)):
+            if "aiv" in root:
+                for f in files:
+                    if f.endswith(".pto"):
+                        aiv = open(os.path.join(root, f), encoding="utf-8").read()
+        assert aiv, "no aiv (vector) kernel emitted"
+        n_loads = aiv.count("pto.tload")
+        # 2 inputs (a, b); a SERIAL kernel loads each once (2 tloads). A pipelined kernel loads each
+        # input PER STRIP (>=2 strips -> >2 tloads) into distinct buffers -> load overlaps compute.
+        assert n_loads > 2, (
+            f"vector kernel not pipelined: expected per-strip loads (>2 tloads for 2 inputs), got {n_loads}"
         )
 
 
