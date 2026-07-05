@@ -1176,69 +1176,124 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // reg.Create the op at tile shape (its type-deduction re-infers the tile result), and
   // materialize on-chip. Two caches (§8 unified scratch): `onchip` for intermediates,
   // `input_cache` for external-input slices (dedups DMA under shared coordinates).
-  std::vector<StmtPtr> body_stmts;
-  std::unordered_map<const Var*, VarPtr> onchip;       // intermediate -> on-chip tile (ScratchMap)
-  std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [h,w] slice
-  VarPtr tile_var;
-  for (const auto& a : ops) {
-    auto c = As<Call>(a->value_);
-    std::vector<ExprPtr> targs;
-    for (const ExprPtr& arg : c->args_) {
-      auto v = AsVarLike(arg);
-      if (v != nullptr) {
-        auto it = onchip.find(v.get());
-        if (it != onchip.end()) { targs.push_back(it->second); continue; }  // intermediate on-chip
-      }
-      const auto [aM, aN] = Static2DShape(arg->GetType());
-      if (aM == M && aN == N) {  // external input -> identity [h,w] slice (cached per input var)
+  // emit_strip: slice each [M,N] input to a [sh, w] strip at (smi, ni) (padded to the granule with
+  // a ragged VALID extent), read intermediates from on-chip scratch, replay each op at strip shape,
+  // and return the SINK strip tile. Shared by the serial body and the software-pipeline loop body,
+  // so both realize the same slice-and-replay per strip.
+  auto emit_strip = [&](int64_t sh, const ExprPtr& smi, std::vector<StmtPtr>& out) -> VarPtr {
+    const int64_t sh_al = AlignUp(sh, g);
+    const bool strip_ragged = (sh_al != sh) || (w_al != w);
+    std::unordered_map<const Var*, VarPtr> onchip;       // intermediate -> on-chip tile
+    std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [sh,w] slice
+    VarPtr tv;
+    for (const auto& a : ops) {
+      auto c = As<Call>(a->value_);
+      std::vector<ExprPtr> targs;
+      for (const ExprPtr& arg : c->args_) {
+        auto v = AsVarLike(arg);
         if (v != nullptr) {
-          auto sit = input_cache.find(v.get());
-          if (sit != input_cache.end()) { targs.push_back(sit->second); continue; }
+          auto it = onchip.find(v.get());
+          if (it != onchip.end()) { targs.push_back(it->second); continue; }  // intermediate on-chip
         }
-        // Pad the ALLOCATED slice to the granule ([h_al,w_al]) with a ragged VALID extent
-        // ([h,w], the 4th arg) so the on-chip tile assembles (contiguous byte extent aligned)
-        // while the DMA reads only the in-bounds valid region. Aligned axes -> 3-arg slice
-        // (byte-identical). tile.load/store, elementwise/reduction type-inference, and
-        // torch_codegen all honor valid, so the compute + write-back stay the valid [h,w].
-        ExprPtr sl = tile_ragged
-                         ? reg.Create("tensor.slice",
-                                      {arg, MakeIndexTuple({h_al, w_al}, sp), MakeTuple2(mi, ni, sp),
-                                       MakeIndexTuple({h, w}, sp)},
-                                      sp)
-                         : reg.Create("tensor.slice", {arg, MakeIndexTuple({h, w}, sp), MakeTuple2(mi, ni, sp)}, sp);
-        // Unique name per distinct external input (input_cache.size() is the next index):
-        // a group with >1 external input (e.g. c = a + b) must not name both slices "_in",
-        // or a name-based consumer (torch_codegen) collapses them and reads the wrong operand.
-        auto sv = std::make_shared<Var>(base + "_in" + std::to_string(input_cache.size()), sl->GetType(), sp);
-        body_stmts.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
-        if (v != nullptr) input_cache[v.get()] = sv;
-        targs.push_back(sv);
-      } else {
-        targs.push_back(arg);  // scalar / non-2D -> as-is
+        const auto [aM, aN] = Static2DShape(arg->GetType());
+        if (aM == M && aN == N) {  // external input -> identity [sh,w] slice (cached per input var)
+          if (v != nullptr) {
+            auto sit = input_cache.find(v.get());
+            if (sit != input_cache.end()) { targs.push_back(sit->second); continue; }
+          }
+          // Pad the ALLOCATED slice to the granule ([sh_al,w_al]) with a ragged VALID extent
+          // ([sh,w], the 4th arg); aligned axes -> 3-arg slice (byte-identical). tile.load/store
+          // and elementwise/reduction type-inference honor valid.
+          ExprPtr sl = strip_ragged
+                           ? reg.Create("tensor.slice",
+                                        {arg, MakeIndexTuple({sh_al, w_al}, sp), MakeTuple2(smi, ni, sp),
+                                         MakeIndexTuple({sh, w}, sp)},
+                                        sp)
+                           : reg.Create("tensor.slice", {arg, MakeIndexTuple({sh, w}, sp), MakeTuple2(smi, ni, sp)}, sp);
+          // Unique name per distinct external input; a name-based consumer must not collapse >1 input.
+          auto sv = std::make_shared<Var>(base + "_in" + std::to_string(input_cache.size()), sl->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
+          if (v != nullptr) input_cache[v.get()] = sv;
+          targs.push_back(sv);
+        } else {
+          targs.push_back(arg);  // scalar / non-2D -> as-is
+        }
       }
+      auto pw = reg.Create(c->op_->name_, targs, c->kwargs_, sp);
+      // Unique name per intermediate (a multi-consumer intermediate must keep a distinct name).
+      auto res = std::make_shared<Var>(
+          a == out_stmt ? (base + "_tile") : (base + "_t" + std::to_string(onchip.size())),
+          pw->GetType(), sp);
+      out.push_back(std::make_shared<AssignStmt>(res, pw, sp));
+      onchip[a->var_.get()] = res;
+      if (a == out_stmt) tv = res;
     }
-    auto pw = reg.Create(c->op_->name_, targs, c->kwargs_, sp);
-    // Unique name per intermediate (onchip.size() is the next index). A multi-consumer
-    // intermediate (e.g. the diamond's `c`, used by d, e AND f) must keep a distinct name:
-    // reusing one name is only benign for a LINEAR chain (`x = f(x)` reads old, writes new);
-    // with a second consumer, that consumer would read the overwritten value.
-    auto res = std::make_shared<Var>(
-        a == out_stmt ? (base + "_tile") : (base + "_t" + std::to_string(onchip.size())),
-        pw->GetType(), sp);
-    body_stmts.push_back(std::make_shared<AssignStmt>(res, pw, sp));
-    onchip[a->var_.get()] = res;
-    if (a == out_stmt) tile_var = res;
+    return tv;
+  };
+
+  // Software-pipelining: chunk the FREE axis into strips and emit a ForKind::Pipeline loop threading
+  // the output through ONE iter_arg, so LowerPipelineLoops (unroll+tag) + CanonicalizeIOOrder (cluster
+  // loads) + MemoryReuse (per-stage ping-pong load buffers) realize the max(compute,ddr) roofline the
+  // cost model prices (db_roofline). A reduction pins its reduced axis full, so we chunk the NON-PINNED
+  // axis: h (rows) for row-reduction/pointwise. A COL reduction pins h (=M); chunking it would split
+  // the reduction -> keep the SERIAL body there (deferred), which the model's db=false path prices as
+  // compute+ddr anyway.
+  bool has_col_reduction = false;
+  if (has_reduction) {
+    for (const auto& a : ops) {
+      auto c = As<Call>(a->value_);
+      if (ClassifyOp(c) != ::OpType::Reduction || c->args_.empty()) continue;
+      const auto [ciM, ciN] = Static2DShape(c->args_[0]->GetType());
+      const auto [coM, coN] = Static2DShape(a->var_->GetType());
+      if (ciM > 1 && coM == 1) has_col_reduction = true;  // reduces height -> pins h
+    }
+  }
+  // Strip count: the largest divisor of h in {8,4,2} (prefer more strips for a steady-state pipeline,
+  // trip >= 2*stage) giving EQUAL strips (h % num_strips == 0 -> no ragged-strip clamp; tile-level
+  // ragged M is already handled by the mi clamp). Fall back to serial (1 strip) when h can't be
+  // chunked >=2 ways or the group has a col reduction.
+  int64_t num_strips = 1;
+  if (!has_col_reduction) {
+    for (int64_t ns : {8, 4, 2}) {
+      if (ns <= h && h % ns == 0) { num_strips = ns; break; }
+    }
   }
 
-  // Assemble the sink tile into the output (disjoint tiles; no atomic — elementwise has
-  // no split-K), then distribute across cores via SpmdWrap.
-  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tile_var, MakeTuple2(mi, ni, sp)}, sp);
-  body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+  std::vector<StmtPtr> body_stmts;
+  if (num_strips < 2) {
+    // Serial (matches the cost model's db=false): the whole tile is one strip.
+    VarPtr tv = emit_strip(h, mi, body_stmts);
+    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tv, MakeTuple2(mi, ni, sp)}, sp);
+    body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+  } else {
+    // Pipelined: for s in pipeline(0, num_strips, stage=2) iter_args=[out <- c_init]:
+    //   strip at (mi + s*strip_h, ni); replay ops -> strip tile; out = assemble(out, strip, off); yield.
+    // The output iter_arg is used ONLY as the assemble target (source/offset reference s & t, not the
+    // iter_arg), so ConvertTensorToTileOps::RewriteReturnedAssembleLoopToStore lowers it to an in-place
+    // tile.store while preserving kind==Pipeline + pipeline_stages.
+    const int64_t strip_h = h / num_strips;
+    auto index_ty = std::make_shared<ScalarType>(DataType::INDEX);
+    auto s = std::make_shared<Var>(base + "_s", index_ty, sp);
+    auto out_iter = std::make_shared<IterArg>(base + "_out_it", c_init->GetType(), ExprPtr(c_init), sp);
+    ExprPtr smi = MakeAdd(mi, MakeMul(s, MakeIndex(strip_h, sp), sp), sp);
+    std::vector<StmtPtr> loop_body;
+    VarPtr tv = emit_strip(strip_h, smi, loop_body);
+    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_iter), tv, MakeTuple2(smi, ni, sp)}, sp);
+    auto out_next = std::make_shared<Var>(base + "_out_n", asm_call->GetType(), sp);
+    loop_body.push_back(std::make_shared<AssignStmt>(out_next, asm_call, sp));
+    loop_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{out_next}, sp));
+    StmtPtr body = SeqStmts::Flatten(std::move(loop_body), sp);
+    std::vector<std::pair<std::string, std::any>> loop_attrs = {{kPipelineStagesAttr, /*stages=*/2}};
+    auto for_stmt = std::make_shared<ForStmt>(s, MakeIndex(0, sp), MakeIndex(num_strips, sp), MakeIndex(1, sp),
+                                              std::vector<IterArgPtr>{out_iter}, body, std::vector<VarPtr>{c_var},
+                                              sp, ForKind::Pipeline, std::move(loop_attrs));
+    body_stmts.push_back(for_stmt);
+  }
 
   auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
   LOG_INFO << "AutoFuse[generic]: " << (has_reduction ? "elementwise+reduction" : "elementwise")
            << " group '" << name << "' tiled by the generic driver (" << ops.size() << " ops, "
-           << (num_m * num_n) << " tiles)";
+           << (num_m * num_n) << " tiles, " << (num_strips >= 2 ? num_strips : 1) << " pipeline strips)";
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
