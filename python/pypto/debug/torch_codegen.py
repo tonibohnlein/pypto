@@ -123,6 +123,26 @@ def _prop_valid(result, *srcs):
     return result
 
 
+def _reduce_valid(t, op, dim):
+    # Reduce ONLY the valid extent along `dim` (the reduced axis), as the Ascend hardware
+    # reductions do (pto.trowsum/tcolsum bound the sum by valid, device-verified) — the padded
+    # lanes (alloc > valid, from ragged-tile padding) must NOT be summed/maxed. `op` is a torch
+    # reduce method name (sum/amax/amin/prod). Output valid: reduced dim -> 1, others preserved.
+    d = dim if dim >= 0 else t.ndim + dim
+    vs = getattr(t, "_pypto_valid_shape", None)
+    src = t
+    if vs is not None and d < len(vs):
+        sl = [slice(None)] * t.ndim
+        sl[d] = slice(0, int(vs[d]))
+        src = t[tuple(sl)]
+    r = getattr(src, op)(dim=dim, keepdim=True)
+    if vs is not None:
+        ov = list(int(x) for x in vs)
+        ov[d] = 1
+        r._pypto_valid_shape = tuple(ov)
+    return r
+
+
 class _CrossCoreRuntime:
     def __init__(self):
         self._lock = threading.Lock()
@@ -878,14 +898,16 @@ _OP_MAP: dict[str, OpHandler] = {}
 
 def _register_reductions(m: dict, prefix: str) -> None:
     """Register row/col reduction handlers (tile forms may carry an ignored tmp_tile)."""
-    m[f"{prefix}.row_sum"] = lambda a, _kw: f"{a[0]}.sum(dim=-1, keepdim=True)"
-    m[f"{prefix}.row_max"] = lambda a, _kw: f"{a[0]}.amax(dim=-1, keepdim=True)"
-    m[f"{prefix}.row_min"] = lambda a, _kw: f"{a[0]}.amin(dim=-1, keepdim=True)"
-    m[f"{prefix}.row_prod"] = lambda a, _kw: f"{a[0]}.prod(dim=-1, keepdim=True)"
-    m[f"{prefix}.col_sum"] = lambda a, _kw: f"{a[0]}.sum(dim=-2, keepdim=True)"
-    m[f"{prefix}.col_max"] = lambda a, _kw: f"{a[0]}.amax(dim=-2, keepdim=True)"
-    m[f"{prefix}.col_min"] = lambda a, _kw: f"{a[0]}.amin(dim=-2, keepdim=True)"
-    m[f"{prefix}.col_prod"] = lambda a, _kw: f"{a[0]}.prod(dim=-2, keepdim=True)"
+    # Reduce only the VALID extent along the reduced axis (hardware honors valid — the padded
+    # lanes of a ragged reduced axis must not feed the reduction; see _reduce_valid).
+    m[f"{prefix}.row_sum"] = lambda a, _kw: f"_reduce_valid({a[0]}, 'sum', -1)"
+    m[f"{prefix}.row_max"] = lambda a, _kw: f"_reduce_valid({a[0]}, 'amax', -1)"
+    m[f"{prefix}.row_min"] = lambda a, _kw: f"_reduce_valid({a[0]}, 'amin', -1)"
+    m[f"{prefix}.row_prod"] = lambda a, _kw: f"_reduce_valid({a[0]}, 'prod', -1)"
+    m[f"{prefix}.col_sum"] = lambda a, _kw: f"_reduce_valid({a[0]}, 'sum', -2)"
+    m[f"{prefix}.col_max"] = lambda a, _kw: f"_reduce_valid({a[0]}, 'amax', -2)"
+    m[f"{prefix}.col_min"] = lambda a, _kw: f"_reduce_valid({a[0]}, 'amin', -2)"
+    m[f"{prefix}.col_prod"] = lambda a, _kw: f"_reduce_valid({a[0]}, 'prod', -2)"
 
 
 def _register_expands(m: dict, prefix: str) -> None:

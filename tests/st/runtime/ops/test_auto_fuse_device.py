@@ -137,6 +137,35 @@ class ColSumValidProbe:
         return out
 
 
+@pl.program
+class RowMaxValidProbe:
+    """row_max over a tile with valid_col=66 < physical cols=72; poison (a LARGE value) in
+    [66,72). Confirms MAX reductions honor valid too (the SUM proof does not cover max/min)."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        x: pl.Tensor[[PHYS_R, PHYS_C], pl.FP32],
+        out: pl.Out[pl.Tensor[[PHYS_R, 1], pl.FP32]],
+    ) -> pl.Tensor[[PHYS_R, 1], pl.FP32]:
+        tile: pl.Tile[[PHYS_R, PHYS_C], pl.FP32] = pl.load(x, [0, 0], [PHYS_R, PHYS_C])
+        narrowed = pl.set_validshape(tile, PHYS_R, VALID_C)  # valid cols -> 66
+        tmp: pl.Tile[[PHYS_R, PHYS_C], pl.FP32] = pl.tile.create(
+            [PHYS_R, PHYS_C], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+        )
+        result: pl.Tile[[PHYS_R, 1], pl.FP32] = pl.tile.row_max(narrowed, tmp)
+        return pl.store(result, [0, 0], out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def orchestrator(
+        self,
+        x: pl.Tensor[[PHYS_R, PHYS_C], pl.FP32],
+        out: pl.Out[pl.Tensor[[PHYS_R, 1], pl.FP32]],
+    ) -> pl.Tensor[[PHYS_R, 1], pl.FP32]:
+        out = self.kernel(x, out)
+        return out
+
+
 class RowSumValidProbeCase(PTOTestCase):
     """PROBE: does trowsum bound the sum by valid_col? Expect 66.0/row (poison excluded)."""
 
@@ -186,6 +215,32 @@ class ColSumValidProbeCase(PTOTestCase):
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         tensors["out"][:] = tensors["x"][:VALID_C, :].sum(dim=0, keepdim=True)
+
+
+class RowMaxValidProbeCase(PTOTestCase):
+    """PROBE: does trowmax bound the max by valid_col? Expect 1.0/row (poison 1e9 excluded)."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_rowmax_valid_probe"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [PHYS_R, PHYS_C], DataType.FP32, init_value=_poison_cols),  # valid=1.0, pad=1e9
+            TensorSpec("out", [PHYS_R, 1], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return RowMaxValidProbe
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        # Honors-valid expectation: max over the 66 valid cols (all 1.0) = 1.0/row. If the op
+        # maxes the physical extent, it would return the 1e9 poison and FAIL against 1.0.
+        tensors["out"][:] = tensors["x"][:, :VALID_C].amax(dim=1, keepdim=True)
 
 
 # ---- Part B: AutoFuse free-axis padding on device (needs PYPTO_AUTOFUSE_GENERIC_EMIT=1) ----
@@ -275,6 +330,14 @@ class TestAutoFuseDevice:
         assert result.passed, (
             "trowsum honored valid_col? If this FAILS with device out ~6e9, the op sums the "
             f"PHYSICAL extent -> reduced-axis padding needs zero-fill. {result.error}"
+        )
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_rowmax_honors_valid(self, test_runner, platform):
+        result = test_runner.run(RowMaxValidProbeCase(platform=platform))
+        assert result.passed, (
+            "trowmax honored valid_col? If this FAILS with device out ~1e9, the op maxes the "
+            f"PHYSICAL extent -> max-reduced-axis padding needs an identity (-inf) fill. {result.error}"
         )
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
