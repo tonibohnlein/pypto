@@ -50,6 +50,7 @@
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/reserve_buffer_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -905,10 +906,12 @@ class LifetimeAnalyzer : public IRVisitor {
       auto add_source = [&](const ExprPtr& val, int start, int end) {
         if (auto src = AsVarLike(val)) add_source_var(src, start, end);
       };
-      if (then_yield && i < then_yield->value_.size())
+      if (then_yield && i < then_yield->value_.size()) {
         add_source(then_yield->value_[i], then_start, then_end);
-      if (else_yield && i < else_yield->value_.size())
+      }
+      if (else_yield && i < else_yield->value_.size()) {
         add_source(else_yield->value_[i], else_start, else_end);
+      }
       if (!local_sources.empty()) {
         var_family_ids_[rv.get()].insert(family_id);
         phi_local_sources_[rv.get()] = std::move(local_sources);
@@ -1664,7 +1667,8 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
       const int32_t depth = static_cast<int32_t>(group_stages[key].size());
       int32_t f = 1;  // cap == 0 (unknown capacity) ⇒ this space is NOT gated (legacy predicate below)
       if (cap != 0 && slot != 0) {
-        f = std::min(depth, std::max<int32_t>(1, static_cast<int32_t>(cap / slot)));
+        f = static_cast<int32_t>(
+            std::max<uint64_t>(1, std::min<uint64_t>(static_cast<uint64_t>(depth), cap / slot)));
         capacity_known_spaces.insert(key.first);
       }
       group_depth[key] = f;
@@ -1751,7 +1755,11 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   const backend::Backend* pack_be = backend::BackendConfig::IsConfigured() ? backend::GetBackend() : nullptr;
   auto alloc_policy = pack_be ? pack_be->CreateMemoryAllocatorPolicy() : nullptr;
 
-  for (auto& [space, indices] : by_space) {
+  for (auto& [space_binding, indices_binding] : by_space) {
+    // Bind the structured bindings to regular local references: the lambdas below capture by `[&]`,
+    // and capturing a structured binding name directly is only a C++20 extension (project is C++17).
+    auto& space = space_binding;
+    auto& indices = indices_binding;
     // Largest-first; ties broken by definition order for determinism and so that
     // equal-size workloads reproduce the prior definition-order grouping.
     std::stable_sort(indices.begin(), indices.end(), [&lifetimes](size_t a, size_t b) {
@@ -1807,25 +1815,39 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
         }
         return fp.HighWater();
       };
+      // Bound the shed re-packs so the loop stays within the pass-complexity budget
+      // (.claude/rules/pass-complexity.md). A legitimate shed converges in Σ_g(F_g−1) steps over the few
+      // co-live groups, but the pipeline-group count can grow with generated IR, so cap the full re-packs
+      // at a constant. The cap only trips in a pathological many-group overflow, where the legacy fallback
+      // is the correct safe outcome anyway — keeping the shed at O(kMaxShedRepacks · M²), the same O(M²)
+      // class as the base FFD packer, instead of O(groups · M²).
+      constexpr int kMaxShedRepacks = 256;
+      int shed_repacks = 0;
       while (cap != 0 && footprint(buffers) > cap) {
-        // Pick the group to shed by MaxRelief; ties break by lowest group id (deterministic).
+        // Pick the group to shed by MaxRelief; ties break by lowest group id (deterministic). Once the
+        // re-pack budget is spent, stop picking (shed_group stays empty) and take the legacy fallback.
+        const bool within_budget = (++shed_repacks <= kMaxShedRepacks);
         std::optional<int32_t> shed_group;
         double best_score = 0.0;
-        for (const auto& [key, f] : group_depth) {
-          if (key.first != space || f <= 1) continue;
-          const uint64_t slot = group_slot.count(key) ? group_slot.at(key) : 0;
-          const double s = ScoreMaxRelief(ShedCandidate{key.second, alloc_policy->AlignAddress(slot, space)});
-          if (!shed_group || s < best_score || (s == best_score && key.second < *shed_group)) {
-            best_score = s;
-            shed_group = key.second;
+        if (within_budget) {
+          for (const auto& [key, f] : group_depth) {
+            if (key.first != space || f <= 1) continue;
+            const uint64_t slot = group_slot.count(key) ? group_slot.at(key) : 0;
+            const double s =
+                ScoreMaxRelief(ShedCandidate{key.second, alloc_policy->AlignAddress(slot, space)});
+            if (!shed_group || s < best_score || (s == best_score && key.second < *shed_group)) {
+              best_score = s;
+              shed_group = key.second;
+            }
           }
         }
         if (!shed_group) {
-          // Every pipeline group is at depth 1 and the space still overflows. FFD is NOT monotone under
-          // the relaxed (F_g==1) predicate — a permitted merge can foreclose a later reuse — so this
-          // packing may be worse than legacy. Re-pack in legacy mode (`force_legacy`, byte-identical to
-          // the legacy predicate): that guarantees no fit regression vs legacy; if legacy also overflows
-          // it is a genuine overflow legacy would hit too (AllocateMemoryAddr surfaces it).
+          // No group left to shed — either every group is at depth 1 (shed exhausted) or the re-pack
+          // budget was spent (pathological many-group overflow). FFD is NOT monotone under the relaxed
+          // (F_g==1) predicate, so this packing may be worse than legacy; re-pack in legacy mode
+          // (`force_legacy`, byte-identical to the legacy predicate) — no fit regression vs legacy, and if
+          // legacy also overflows it is a genuine overflow legacy would hit too (AllocateMemoryAddr surfaces
+          // it).
           force_legacy = true;
           buffers = pack();
           force_legacy = false;
@@ -1834,10 +1856,12 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
           // place (perf hint for a partial reduction below; this Warning for a space that fits at no depth).
           if (out_hints != nullptr) {
             const bool still_overflows = footprint(buffers) > cap;
+            const std::string why =
+                within_budget ? "at any double-buffering depth" : "within the shed-repack budget";
             out_hints->emplace_back(
                 DiagnosticSeverity::Warning, "MemoryReuse", 0,
-                "capacity-gated reuse could not fit memory space " + MemorySpaceToString(space) +
-                    " at any double-buffering depth; fell back to the legacy packing" +
+                "capacity-gated reuse could not fit memory space " + MemorySpaceToString(space) + " " + why +
+                    "; fell back to the legacy packing" +
                     (still_overflows ? " (which also overflows — reduce tile size or stage count)" : "") +
                     ".",
                 func ? func->span_ : Span::unknown());
