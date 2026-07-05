@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "pypto/core/common.h"  // AlignUp / AlignDown / CeilDiv (promoted from here)
 #include "pypto/core/logging.h"
 #include "pypto/ir/transforms/utils/l0c_footprint.h"
 
@@ -29,15 +30,8 @@ namespace utils {
 
 namespace {
 
-// ===========================================================================
-// Small numerical helpers
-// ===========================================================================
-
-constexpr int64_t AlignDown(int64_t x, int64_t a) { return (x / a) * a; }
-
-constexpr int64_t AlignUp(int64_t x, int64_t a) { return ((x + a - 1) / a) * a; }
-
-constexpr int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+// AlignUp / AlignDown / CeilDiv now live in pypto/core/common.h; unqualified
+// calls below resolve to pypto::AlignUp via lookup from this nested namespace.
 
 // Physical extent after the caller's boxed-layout padding. Reuse the shared
 // overflow-safe L0C alignment helper rather than duplicating unsigned
