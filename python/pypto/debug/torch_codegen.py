@@ -105,6 +105,24 @@ def _copy_region_attrs(src, dst):
     return dst
 
 
+def _prop_valid(result, *srcs):
+    # Fill a MISSING _pypto_valid_shape on a shape-preserving op result from an
+    # identically-shaped tensor source. Shape-preserving handlers (add/mul/exp/...)
+    # emit bare tensor exprs that drop the padded tile's valid (alloc > valid), so
+    # without this the store would write the full padded extent and go out of bounds.
+    # No-op when the result already carries valid, isn't a tensor, or no source
+    # matches its shape (slices/reductions set their own valid and are untouched).
+    if not hasattr(result, "shape"):
+        return result
+    if getattr(result, "_pypto_valid_shape", None) is not None:
+        return result
+    for s in srcs:
+        if hasattr(s, "shape") and tuple(s.shape) == tuple(result.shape) \
+                and getattr(s, "_pypto_valid_shape", None) is not None:
+            return _copy_region_attrs(s, result)
+    return result
+
+
 class _CrossCoreRuntime:
     def __init__(self):
         self._lock = threading.Lock()
@@ -1382,7 +1400,15 @@ class TorchCodegen(_ir.IRVisitor):
                 else:
                     self._expr_result = arg_strs[0]
         elif handler is not None:
-            self._expr_result = handler(arg_strs, kw)
+            expr = handler(arg_strs, kw)
+            # Propagate _pypto_valid_shape through shape-preserving ops: the handlers
+            # emit bare tensor expressions that drop it, so a padded tile's valid
+            # (alloc > valid, from ragged-tile padding) would be lost after the first
+            # elementwise op and the store would write the full padded extent. Forward
+            # only simple-identifier args (var refs) to avoid re-evaluating expressions
+            # with side effects; _prop_valid fills a MISSING valid from a shape match.
+            src_args = [s for s in arg_strs if s.isidentifier()]
+            self._expr_result = f"_prop_valid({expr}, {', '.join(src_args)})" if src_args else expr
         elif isinstance(op.op, _ir.GlobalVar):
             # Cross-function call
             if op_name in self._group_meta:

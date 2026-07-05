@@ -163,6 +163,13 @@ class TestBackend910BL0Tiling:
         handler = Backend910B.instance().get_handler()
         assert handler.get_min_l0_tile_dim() == 16
 
+    def test_vector_dma_alignment_bytes_default(self):
+        # The vector (none_box) tile's contiguous-axis byte extent must be a
+        # multiple of this (the DMA block) — the vector analogue of the cube's
+        # 16-element fractal. Ascend = 32 bytes.
+        handler = Backend910B.instance().get_handler()
+        assert handler.get_vector_dma_alignment_bytes() == 32
+
 
 class TestBackend910BSerialization:
     """Tests for 910B backend serialization."""

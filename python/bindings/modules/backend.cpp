@@ -160,7 +160,9 @@ void BindBackend(nb::module_& m) {
       .def("get_l0_fractal_alignment", &BackendHandler::GetL0FractalAlignment,
            "Cube fractal alignment in elements for L0 tile dimensions m, n, k")
       .def("get_min_l0_tile_dim", &BackendHandler::GetMinL0TileDim,
-           "Minimum legal value for L0 tile dimensions m, n, k");
+           "Minimum legal value for L0 tile dimensions m, n, k")
+      .def("get_vector_dma_alignment_bytes", &BackendHandler::GetVectorDmaAlignmentBytes,
+           "Contiguous-axis byte alignment for vector (none_box) tiles — the DMA block");
 
   // ========== Backend abstract base class ==========
   nb::class_<Backend>(backend_mod, "Backend", "Abstract backend base class")
