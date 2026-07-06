@@ -52,6 +52,17 @@ import pypto.language as pl
 import pytest
 import torch
 from harness.core.harness import ONBOARD_PLATFORMS, DataType, PTOTestCase, TensorSpec
+from pypto.runtime.runner import RunConfig
+
+# Silicon-appropriate tolerances. The device-free gate (torch_codegen) checks against EXACT fp32
+# math and cannot see two hardware realities that the on-device golden (default rtol=atol=1e-5)
+# does: (1) the Ascend HW reciprocal-sqrt (`pl.rsqrt`) is a ~12-bit approximation, ~1e-4 relative
+# vs torch.rsqrt — so norms that call rsqrt need ~1e-3; (2) an end-to-end FP16 kernel is at the
+# fp16 rounding floor (eps ~1e-3), so 1e-5 is ~100x tighter than the format can represent. These
+# are op-precision facts, NOT emit/wiring errors (the FP32 softmax with the identical `exp` emit
+# passes at 1e-5). Bit-exact rsqrt would be a separate `pl.rsqrt` Newton-refinement, out of scope.
+_RSQRT_TOL = RunConfig(rtol=1e-3, atol=1e-3)   # fp32 norms calling HW rsqrt
+_FP16_TOL = RunConfig(rtol=1e-2, atol=1e-2)    # end-to-end fp16 (rounding floor)
 
 # Physical 8x72 tile: 72 FP32 cols = 288 bytes (32-aligned, assembles). Valid cols = 66 (264
 # bytes, NOT 32-aligned) — exactly the ragged reduced axis the emitter would pad. Poison the
@@ -703,12 +714,14 @@ class TestAutoFuseDevice:
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_autofuse_rmsnorm(self, test_runner, platform):
-        result = test_runner.run(AutoFuseRmsNormCase(platform=platform))
+        # rtol 1e-3: RMSNorm calls HW rsqrt (~1e-4 approximation vs exact torch.rsqrt).
+        result = test_runner.run(AutoFuseRmsNormCase(platform=platform, config=_RSQRT_TOL))
         assert result.passed, f"AutoFuse RMSNorm [256,512] mismatch on device: {result.error}"
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_autofuse_layernorm(self, test_runner, platform):
-        result = test_runner.run(AutoFuseLayerNormCase(platform=platform))
+        # rtol 1e-3: LayerNorm calls HW rsqrt (~1e-4 approximation vs exact torch.rsqrt).
+        result = test_runner.run(AutoFuseLayerNormCase(platform=platform, config=_RSQRT_TOL))
         assert result.passed, f"AutoFuse LayerNorm [256,512] mismatch on device: {result.error}"
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
@@ -733,7 +746,9 @@ class TestAutoFuseDevice:
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_autofuse_fp16_softmax(self, test_runner, platform):
-        result = test_runner.run(AutoFuseFp16SoftmaxCase(platform=platform))
+        # rtol 1e-2: end-to-end FP16 is at the fp16 rounding floor (eps ~1e-3); the FP32 softmax
+        # with the identical `exp` emit passes at 1e-5, so this is fp16 precision, not the emit.
+        result = test_runner.run(AutoFuseFp16SoftmaxCase(platform=platform, config=_FP16_TOL))
         assert result.passed, f"AutoFuse FP16 softmax [256,128] mismatch on device: {result.error}"
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
