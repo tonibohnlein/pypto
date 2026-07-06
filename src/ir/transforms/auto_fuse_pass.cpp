@@ -1048,13 +1048,12 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   if (out_stmt == nullptr)
     return GenericDeclineB("group has no live-out (corrupt run/group mapping)", ops.front()->span_);
 
-  // Capability (S2): the vector rule emits a FULL-axis reduction per spatial tile with a
-  // non-atomic assemble; it does not realize a reduction-sink split. If the solver chose
-  // split>1 for a vector group, the legacy fallback (also split-agnostic) computes the
-  // right values as split=1 — correct, but not the costed parallel-reduction schedule.
-  // Reduction-sink split is deferred (S2); surface the fidelity gap, do not abort.
-  if (tile.split > 1)
-    return GenericDeclineCap("vector group with split>1 (reduction-sink split not emitted, S2)");
+  // S2 (reduction-sink split): the solver may gang S cores per spatial tile, each reducing
+  // a SLICE of the reduced axis, the S partials atomic-merged. Realized below for a SUM
+  // col-reduction sink (the only lowered AtomicType is kAdd, and emit_strip slices rows =
+  // the reduced axis of a col reduction). Any other split>1 (max/min reduction, row-
+  // reduction split, reduction-feeds-pointwise) falls through to the NON-split body, which
+  // computes the correct values at split=1 — correct, just without the costed parallelism.
 
   const VarPtr c_var = out_stmt->var_;
   auto ct = As<TensorType>(c_var->GetType());
@@ -1214,7 +1213,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // a ragged VALID extent), read intermediates from on-chip scratch, replay each op at strip shape,
   // and return the SINK strip tile. Shared by the serial body and the software-pipeline loop body,
   // so both realize the same slice-and-replay per strip.
-  auto emit_strip = [&](int64_t sh, const ExprPtr& smi, std::vector<StmtPtr>& out) -> VarPtr {
+  auto emit_strip = [&](int64_t sh, const ExprPtr& smi, const ExprPtr& sni, std::vector<StmtPtr>& out) -> VarPtr {
     // The 32B DMA granule is on the CONTIGUOUS axis only; the other (free) axis has
     // granule 1 (see ascend910b_cost.cpp: "free row axis tiles at 1 element, the
     // contiguous width axis at the 32-byte DMA block"). So pad the row axis ONLY when
@@ -1249,10 +1248,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           // and elementwise/reduction type-inference honor valid.
           ExprPtr sl = strip_ragged
                            ? reg.Create("tensor.slice",
-                                        {arg, MakeIndexTuple({sh_al, w_al}, sp), MakeTuple2(smi, ni, sp),
+                                        {arg, MakeIndexTuple({sh_al, w_al}, sp), MakeTuple2(smi, sni, sp),
                                          MakeIndexTuple({sh, w}, sp)},
                                         sp)
-                           : reg.Create("tensor.slice", {arg, MakeIndexTuple({sh, w}, sp), MakeTuple2(smi, ni, sp)}, sp);
+                           : reg.Create("tensor.slice", {arg, MakeIndexTuple({sh, w}, sp), MakeTuple2(smi, sni, sp)}, sp);
           // Unique name per distinct external input; a name-based consumer must not collapse >1 input.
           auto sv = std::make_shared<Var>(base + "_in" + std::to_string(input_cache.size()), sl->GetType(), sp);
           out.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
@@ -1273,6 +1272,55 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     }
     return tv;
   };
+
+  // S2 — SUM col-reduction split. When the solver gangs S cores per free tile (tile.split>1)
+  // to parallelize a reduction, partition the reduced M axis across S cores: each reduces its
+  // disjoint M-slice to a [1,w] partial, and the S partials ATOMIC-ADD into a zero-seeded [1,N]
+  // output (same seed+atomic structure as matmul split-K). Scoped to what is realizable today:
+  // the sink IS a `col_sum` (only kAdd is a lowered AtomicType, and emit_strip slices rows = a
+  // col reduction's reduced axis). S is rounded to a divisor of IM so the partition is clean
+  // (disjoint, no double-count); a ragged S would need per-slice valid extents. Anything else
+  // (max/min, row-reduction split, reduction-feeds-pointwise) falls through to the non-split body.
+  if (tile.split > 1 && pin_m && As<Call>(out_stmt->value_) &&
+      IsOp(As<Call>(out_stmt->value_), "tensor.col_sum")) {
+    int64_t S = 1;
+    for (int64_t d = std::min<int64_t>(tile.split, IM); d >= 2; --d)
+      if (IM % d == 0) { S = d; break; }
+    if (S >= 2) {
+      const int64_t rsz = IM / S;  // disjoint reduced-axis slice per core (IM % S == 0)
+      auto index_ty = std::make_shared<ScalarType>(DataType::INDEX);
+      // Seed: zero each [1,w] output tile (disjoint -> non-atomic), tiled over the num_n free tiles,
+      // so a large [1,N] output never materializes in one core's UB.
+      auto zero = std::make_shared<ConstFloat>(0.0, dtype, sp);
+      auto st = std::make_shared<Var>(base + "_st", index_ty, sp);
+      ExprPtr s_ni = MakeMul(st, MakeIndex(w, sp), sp);
+      if (IN % w != 0) s_ni = MakeMin(s_ni, MakeIndex(IN - w, sp), sp);
+      auto z_call = reg.Create("tensor.full", {MakeIndexTuple({M, w}, sp), zero}, {{"dtype", dtype}}, sp);
+      auto z = std::make_shared<Var>(base + "_z", z_call->GetType(), sp);
+      auto seed_asm = reg.Create("tensor.assemble", {c_init, z, MakeTuple2(MakeIndex(0, sp), s_ni, sp)}, sp);
+      auto c_seeded = std::make_shared<Var>(base + "_seeded", seed_asm->GetType(), sp);
+      auto seed_scope = SpmdWrap(st,
+                                 std::vector<StmtPtr>{std::make_shared<AssignStmt>(z, z_call, sp),
+                                                      std::make_shared<AssignStmt>(c_seeded, seed_asm, sp)},
+                                 MakeIndex(num_n, sp), name + "_seed", sp);
+      // Main grid: t in [0, num_n*S). ks = t % S (M-slice), fidx = t / S (free N tile).
+      auto t2 = std::make_shared<Var>(base + "_t", index_ty, sp);
+      auto ks = MakeFloorMod(t2, MakeIndex(S, sp), sp);
+      auto fidx = MakeFloorDiv(t2, MakeIndex(S, sp), sp);
+      ExprPtr r_mi = MakeMul(ks, MakeIndex(rsz, sp), sp);      // disjoint reduced-M slice offset
+      ExprPtr sni = MakeMul(fidx, MakeIndex(w, sp), sp);       // free-N tile offset (ceil clamp on ragged N)
+      if (IN % w != 0) sni = MakeMin(sni, MakeIndex(IN - w, sp), sp);
+      std::vector<StmtPtr> sbody;
+      VarPtr part = emit_strip(rsz, r_mi, sni, sbody);         // [1,w] partial col_sum over the M-slice
+      auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_seeded), part, MakeTuple2(MakeIndex(0, sp), sni, sp)},
+                                 {{"atomic", 1}}, sp);
+      sbody.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+      auto scope = SpmdWrap(t2, std::move(sbody), MakeIndex(num_n * S, sp), name, sp);
+      LOG_INFO << "AutoFuse[generic]: SUM col-reduction group '" << name << "' split " << S
+               << " ways over the reduced axis (S2, atomic-add merge)";
+      return std::vector<StmtPtr>{c_init_assign, seed_scope, scope};
+    }
+  }
 
   // Software-pipelining: chunk the FREE axis into strips and emit a ForKind::Pipeline loop threading
   // the output through ONE iter_arg, so LowerPipelineLoops (unroll+tag) + CanonicalizeIOOrder (cluster
@@ -1305,7 +1353,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   std::vector<StmtPtr> body_stmts;
   if (num_strips < 2) {
     // Serial (matches the cost model's db=false): the whole tile is one strip.
-    VarPtr tv = emit_strip(h, mi, body_stmts);
+    VarPtr tv = emit_strip(h, mi, ni, body_stmts);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tv, MakeTuple2(mi, ni, sp)}, sp);
     body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
   } else {
@@ -1320,7 +1368,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     auto out_iter = std::make_shared<IterArg>(base + "_out_it", c_init->GetType(), ExprPtr(c_init), sp);
     ExprPtr smi = MakeAdd(mi, MakeMul(s, MakeIndex(strip_h, sp), sp), sp);
     std::vector<StmtPtr> loop_body;
-    VarPtr tv = emit_strip(strip_h, smi, loop_body);
+    VarPtr tv = emit_strip(strip_h, smi, ni, loop_body);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_iter), tv, MakeTuple2(smi, ni, sp)}, sp);
     auto out_next = std::make_shared<Var>(base + "_out_n", asm_call->GetType(), sp);
     loop_body.push_back(std::make_shared<AssignStmt>(out_next, asm_call, sp));

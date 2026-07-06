@@ -253,6 +253,7 @@ TL_M, TL_N = 4096, 64       # tall pointwise: many free-axis strips
 SMR_M, SMR_N = 256, 66      # softmax ragged reduced N (padded reduced axis)
 RRB_M, RRB_N = 256, 128     # row-reduce + broadcast (reduction intermediate, no div)
 F16_M, F16_N = 256, 128     # FP16 softmax (granule g=16)
+CS_M, CS_N = 128, 256       # bare col_sum sink -> S2 split-reduction (atomic-add merge)
 
 
 class AutoFuseRaggedPointwiseCase(PTOTestCase):
@@ -578,6 +579,39 @@ class AutoFuseFp16SoftmaxCase(PTOTestCase):
         tensors["out"][:] = torch.softmax(x.float(), dim=1).to(x.dtype)
 
 
+class AutoFuseColSumCase(PTOTestCase):
+    """Bare col_sum [128,256]->[1,256]: the reduced-sink S2 split-reduction path. The solver
+    splits the reduced M axis across cores; each computes a partial col_sum, the partials
+    atomic-add into a zero-seeded output. Validates the atomic-add merge on hardware."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_col_sum_128x256"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [CS_M, CS_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [1, CS_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def f(self, x: pl.Tensor[[CS_M, CS_N], pl.FP32]) -> pl.Tensor[[1, CS_N], pl.FP32]:
+                y: pl.Tensor[[1, CS_N], pl.FP32] = pl.col_sum(x)
+                return y
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = tensors["x"].sum(dim=0, keepdim=True)
+
+
 class TestAutoFuseDevice:
     """AutoFuse on device: the reduction-valid probe + free-axis padding numerics."""
 
@@ -659,6 +693,11 @@ class TestAutoFuseDevice:
     def test_autofuse_fp16_softmax(self, test_runner, platform):
         result = test_runner.run(AutoFuseFp16SoftmaxCase(platform=platform))
         assert result.passed, f"AutoFuse FP16 softmax [256,128] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_col_sum(self, test_runner, platform):
+        result = test_runner.run(AutoFuseColSumCase(platform=platform))
+        assert result.passed, f"AutoFuse col_sum [128,256] (S2 split) mismatch on device: {result.error}"
 
 
 if __name__ == "__main__":
