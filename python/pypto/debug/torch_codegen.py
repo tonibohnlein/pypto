@@ -1283,9 +1283,35 @@ class TorchCodegen(_ir.IRVisitor):
         self._name_counter = {}
         self._yield_targets = []
 
-        params = [self._name_of(p) for p in func.params]
-        self._emit(f"def {func.name}({', '.join(params)}):")
+        # Trailing output params (Out/InOut) are given a ``=None`` default and
+        # allocated on entry when omitted. This lets a return-based caller invoke
+        # ``fn(*inputs)`` even after AutoFuse lifts the returned buffer into an
+        # appended Out param (the function still ``return``s the value, so the
+        # numeric result is unchanged). Only the trailing suffix is defaulted —
+        # Python requires defaults to form a suffix — so an interior Out param
+        # (rare) stays required, exactly as before.
+        directions = list(func.param_directions)
+        n = len(func.params)
+        auto_alloc_from = n
+        for i in range(n - 1, -1, -1):
+            d = directions[i] if i < len(directions) else _ir.ParamDirection.In
+            if d in (_ir.ParamDirection.Out, _ir.ParamDirection.InOut):
+                auto_alloc_from = i
+            else:
+                break
+
+        param_decls = []
+        for i, p in enumerate(func.params):
+            nm = self._name_of(p)
+            param_decls.append(f"{nm}=None" if i >= auto_alloc_from else nm)
+        self._emit(f"def {func.name}({', '.join(param_decls)}):")
         self._indent += 1
+        # Allocate any omitted trailing output param before it is read/checked.
+        for i in range(auto_alloc_from, n):
+            p = func.params[i]
+            alloc = self._render_param_alloc(p.type)
+            if alloc is not None:
+                self._emit(f"if {self._name_of(p)} is None: {self._name_of(p)} = {alloc}")
         if self._check_shapes:
             for p in func.params:
                 # InCore kernel params may receive partial data (boundary tiles),
@@ -1396,6 +1422,22 @@ class TorchCodegen(_ir.IRVisitor):
             )
 
     # -- statement visitors --
+
+    def _render_param_alloc(self, var_type: _ir.Type) -> str | None:
+        """Render a ``torch.zeros(...)`` allocation for a static tensor/tile param.
+
+        Used to auto-allocate an omitted trailing output param (see
+        ``visit_function``). Returns ``None`` when the type is not a fully-static
+        tensor/tile, in which case the param stays required (no default).
+        """
+        if not isinstance(var_type, (_ir.TensorType, _ir.TileType)):
+            return None
+        ir_shape = var_type.shape
+        if not all(isinstance(d, _ir.ConstInt) for d in ir_shape):
+            return None  # dynamic dim — cannot size the buffer here
+        dim_strs = [self._visit_expr_str(d) for d in ir_shape]
+        shape_expr = f"({', '.join(dim_strs)},)" if len(dim_strs) == 1 else f"({', '.join(dim_strs)})"
+        return f"torch.zeros({shape_expr}, dtype={_torch_dtype(var_type.dtype)})"
 
     def _emit_shape_dtype_check(self, var_name: str, var_type: _ir.Type, *, shape: bool = True) -> None:
         """Emit runtime assertions for tensor/tile shape and dtype.

@@ -47,6 +47,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/attrs.h"
@@ -1613,9 +1614,169 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
   return SeqStmts::Flatten(std::move(top), body->span_);
 }
 
+// ---------------------------------------------------------------------------
+// Wire a return-based fused function to a named Out param
+// ---------------------------------------------------------------------------
+//
+// A marked auto_fuse function is return-based (`def f(a) -> Tensor: ...; return
+// d`) and the emitters realize its output as a runtime-allocated `c_init =
+// tensor.create([M,N])` that the final `tensor.assemble` (serial) / pipeline
+// loop-carry (pipelined) writes and the ReturnStmt returns. Orchestration
+// codegen only emits an `add_output` write-back for a param the return ALIASES
+// (see return_lineage), so a purely-allocated output is written to a throwaway
+// buffer — invisible to a by-parameter caller (the device / ST harness binds
+// I/O by param position, not by return value; the output buffer stays
+// unwritten). Lift the output buffer into an appended `Out` param: the SAME
+// `c_init` Var is MOVED from its `tensor.create` binding into the param list,
+// so every body reference (assemble arg0 / iter_arg init) still resolves to it,
+// the return lineage now lands on a param, and codegen emits the write-back.
+// The emit is otherwise byte-identical.
+//
+// Scoped to the safe, common case (a standalone entry kernel): a single-tensor
+// return, no existing Out param, and not called by another function (appending
+// a param would break its callsites). Anything else is left return-based.
+void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
+                               const std::unordered_set<std::string>& called_funcs) {
+  // Already has an output param (user-written) -> nothing to wire.
+  for (ParamDirection d : func->param_directions_) {
+    if (d == ParamDirection::Out || d == ParamDirection::InOut) return;
+  }
+  // Called internally: changing the signature would break its callsites.
+  if (called_funcs.count(func->name_) != 0) return;
+
+  // Index the body: first ReturnStmt, per-var defining assign, and for-loop
+  // carry edges (iter_arg / tensor return_var -> iter_arg init var). Mirrors
+  // return_lineage's tracer so the return-buffer trace below matches codegen.
+  class Indexer : public IRVisitor {
+   public:
+    ReturnStmtPtr ret;
+    std::unordered_map<const Var*, AssignStmtPtr> var_def;
+    std::unordered_map<const Var*, const Var*> carry;
+
+   protected:
+    void VisitStmt_(const ReturnStmtPtr& r) override {
+      if (!ret) ret = r;
+    }
+    void VisitStmt_(const AssignStmtPtr& a) override {
+      if (a->var_) var_def.emplace(a->var_.get(), a);
+      IRVisitor::VisitStmt_(a);
+    }
+    void VisitStmt_(const ForStmtPtr& f) override {
+      for (size_t i = 0; i < f->iter_args_.size(); ++i) {
+        auto init = AsVarLike(f->iter_args_[i]->initValue_);
+        if (!init) continue;
+        carry[f->iter_args_[i].get()] = init.get();
+        // Scalar carries may be overwritten by the body; only tensor carries
+        // propagate the init (matches return_lineage).
+        if (i < f->return_vars_.size() && AsTensorTypeLike(f->return_vars_[i]->GetType())) {
+          carry[f->return_vars_[i].get()] = init.get();
+        }
+      }
+      IRVisitor::VisitStmt_(f);
+    }
+  } idx;
+  idx.VisitStmt(func->body_);
+
+  if (!idx.ret || idx.ret->value_.size() != 1) return;  // single-tensor return only
+  auto ret_var = AsVarLike(idx.ret->value_[0]);
+  if (!ret_var) return;
+
+  // Trace the returned var back to the output buffer's `tensor.create`, through
+  // SSA rebinds, tensor.assemble / set_validshape (arg0), tile.store (arg2), and
+  // for-loop carries. The create's AssignStmt is `c_init`.
+  const Var* cur = ret_var.get();
+  std::unordered_set<const Var*> seen;
+  AssignStmtPtr create_assign;
+  while (cur != nullptr) {
+    if (!seen.insert(cur).second) break;
+    if (auto it = idx.carry.find(cur); it != idx.carry.end()) {
+      cur = it->second;
+      continue;
+    }
+    auto dit = idx.var_def.find(cur);
+    if (dit == idx.var_def.end()) break;
+    const ExprPtr& val = dit->second->value_;
+    if (auto rv = AsVarLike(val)) {
+      cur = rv.get();
+      continue;
+    }
+    auto call = As<Call>(val);
+    if (call == nullptr) break;
+    if (IsOp(call, "tensor.create")) {
+      create_assign = dit->second;
+      break;
+    }
+    if (IsOp(call, "tensor.assemble") || IsOp(call, "tensor.set_validshape")) {
+      auto a0 = !call->args_.empty() ? AsVarLike(call->args_[0]) : nullptr;
+      if (!a0) break;
+      cur = a0.get();
+      continue;
+    }
+    if (IsOp(call, "tile.store")) {
+      auto a2 = call->args_.size() >= 3 ? AsVarLike(call->args_[2]) : nullptr;
+      if (!a2) break;
+      cur = a2.get();
+      continue;
+    }
+    break;
+  }
+  if (!create_assign) return;  // could not reach the output buffer's create
+
+  // The create MUST be a direct child of the top-level body SeqStmts (the
+  // emitters return it as one) so removing it is safe. If not, abort the lift —
+  // never append a param without dropping its create (would leave two live
+  // buffers: the param and the still-allocated create).
+  auto seq = As<SeqStmts>(func->body_);
+  if (seq == nullptr) return;
+  const bool at_top = std::any_of(seq->stmts_.begin(), seq->stmts_.end(),
+                                  [&](const StmtPtr& s) { return s.get() == create_assign.get(); });
+  if (!at_top) return;
+
+  // Move c_init from the tensor.create binding into an appended Out param (same
+  // Var -> body references still resolve), and drop the now-dead create.
+  func->params_.push_back(create_assign->var_);
+  func->param_directions_.push_back(ParamDirection::Out);
+  std::vector<StmtPtr> kept;
+  kept.reserve(seq->stmts_.size());
+  for (const StmtPtr& s : seq->stmts_) {
+    if (s.get() != create_assign.get()) kept.push_back(s);
+  }
+  func->body_ = SeqStmts::Flatten(std::move(kept), seq->span_);
+
+  LOG_INFO << "AutoFuse[" << func->name_ << "]: wired return -> appended Out param '"
+           << create_assign->var_->name_hint_ << "' (device/harness binds output by param)";
+}
+
 ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
   std::map<GlobalVarPtr, FunctionPtr, GlobalVarPtrLess> new_functions;
   bool any_change = false;
+
+  // Function names referenced by a Call/Submit anywhere in the program. A marked
+  // function that is CALLED must keep its signature (MaybeLiftReturnToOutParam
+  // skips it), so appending an Out param cannot break a callsite.
+  std::unordered_set<std::string> called_funcs;
+  {
+    class CallCollector : public IRVisitor {
+     public:
+      std::unordered_set<std::string>* out = nullptr;
+      const Program* prog = nullptr;
+
+     protected:
+      void VisitExpr_(const CallPtr& c) override {
+        if (c->op_ && prog->GetFunction(c->op_->name_)) out->insert(c->op_->name_);
+        IRVisitor::VisitExpr_(c);
+      }
+      void VisitExpr_(const SubmitPtr& s) override {
+        if (s->op_ && prog->GetFunction(s->op_->name_)) out->insert(s->op_->name_);
+        IRVisitor::VisitExpr_(s);
+      }
+    } cc;
+    cc.out = &called_funcs;
+    cc.prog = prog.get();
+    for (const auto& [gv, fn] : prog->functions_) {
+      if (fn->body_) cc.VisitStmt(fn->body_);
+    }
+  }
   for (const auto& [gvar, func] : prog->functions_) {
     // v0 gate: only functions explicitly marked for auto-fusion. attrs_ is an
     // ordered vector of (key, value) pairs, not a map.
@@ -1718,6 +1879,11 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     }
     auto new_func = MutableCopy(func);
     new_func->body_ = EmitFusedScopes(func->body_, stmt_group, stmt_tile);
+    // Wire the return-based fused function to a named Out param so orchestration
+    // codegen emits an add_output write-back (device / ST harness bind output by
+    // param position, not by return value). No-op for functions that already
+    // have an Out param or are called internally.
+    MaybeLiftReturnToOutParam(new_func, called_funcs);
     // Drop the marker once fused: the body is now an InCore-scoped kernel graph,
     // not a flat tensor-op DAG, so the pass is idempotent (a second run no-ops).
     new_func->attrs_.erase(
