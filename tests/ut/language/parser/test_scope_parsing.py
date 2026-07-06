@@ -9,9 +9,12 @@
 
 """Unit tests for parsing ScopeStmt with pl.at(level=pl.Level.CORE_GROUP): syntax."""
 
+import ast
+
 import pypto.language as pl
 import pytest
 from pypto import ir
+from pypto.language.parser.ast_parser import ASTParser
 from pypto.language.parser.diagnostics.exceptions import ParserSyntaxError
 from pypto.language.parser.text_parser import parse_program
 
@@ -1395,6 +1398,227 @@ class TestSpmdScopeTaskId:
                 with pl.cluster() as tid:  # type: ignore[misc]
                     y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
                 return y
+
+
+class TestSpmdInlineWithForm:
+    """``with pl.spmd(n):`` (no ``as tid``) with an inline multi-statement body.
+
+    Decouples inline-body support from TaskId capture: the plain with-form now
+    auto-outlines an inline body into a synthetic InCore kernel — exactly like the
+    ``as tid`` form and the for-form — WITHOUT capturing a producer TaskId. The two
+    concerns are orthogonal (TaskId capture is opt-in via ``as tid``), but an inline
+    body must still read the per-block index via ``pl.tile.get_block_idx()``.
+    """
+
+    @staticmethod
+    def _descendants(node, cls):
+        found = []
+
+        def walk(n):
+            if isinstance(n, cls):
+                found.append(n)
+            if isinstance(n, ir.SeqStmts):
+                for s in n.stmts:
+                    walk(s)
+            elif hasattr(n, "body") and n.body is not None:
+                walk(n.body)
+
+        walk(node)
+        return found
+
+    @classmethod
+    def _unique(cls, node, klass):
+        found = cls._descendants(node, klass)
+        assert len(found) == 1, f"expected exactly one {klass.__name__}, got {len(found)}"
+        return found[0]
+
+    def test_inline_with_spmd_no_tid_wraps_incore(self):
+        """An inline body (no ``as tid``) is auto-outlined into an InCore wrapper and
+        carries NO task_id_var / manual_dep_edges — the TaskId is not captured."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="stage1"):
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(pl.add(t, t), [i * 128, 0], out)
+                return out
+
+        main_func = list(Prog.functions.values())[0]
+        spmd = self._unique(main_func.body, ir.SpmdScopeStmt)
+        # No TaskId captured — the decoupled feature under test.
+        assert "task_id_var" not in spmd.attrs
+        assert "manual_dep_edges" not in spmd.attrs
+        # The inline body is wrapped in an InCoreScopeStmt for outlining (like the
+        # for-form / as-tid form), not left as a bare Call.
+        incore = self._unique(spmd.body, ir.InCoreScopeStmt)
+        body = incore.body
+        stmts = list(body.stmts) if isinstance(body, ir.SeqStmts) else [body]
+        # The user-written get_block_idx is the first body stmt (NOT synthesized).
+        first = stmts[0]
+        assert isinstance(first, ir.AssignStmt)
+        assert isinstance(first.value, ir.Call)
+        assert first.value.op.name == "tile.get_block_idx"
+        assert len(stmts) > 1, "inline body should carry multiple statements"
+
+    def test_inline_with_spmd_no_placeholder_before_scope(self):
+        """Unlike the ``as tid`` form, the plain inline form emits NO
+        ``AssignStmt(tid, system.task_invalid())`` placeholder before the scope."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4):
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(pl.add(t, t), [i * 128, 0], out)
+                return out
+
+        main_func = list(Prog.functions.values())[0]
+        placeholders = [
+            s
+            for s in self._descendants(main_func.body, ir.AssignStmt)
+            if isinstance(s.value, ir.Call) and s.value.op.name == "system.task_invalid"
+        ]
+        assert not placeholders, "plain inline form must not emit a task_invalid placeholder"
+
+    def test_inline_with_spmd_split_wraps_incore_with_split(self):
+        """``optimizations=[pl.split(...)]`` on the inline plain form sets split_ on the
+        inner InCore wrapper (same as the for-form / as-tid form)."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(t, [i * 128, 0], out)
+                return out
+
+        main_func = list(Prog.functions.values())[0]
+        spmd = self._unique(main_func.body, ir.SpmdScopeStmt)
+        assert "task_id_var" not in spmd.attrs
+        incore = self._unique(spmd.body, ir.InCoreScopeStmt)
+        assert incore.split == ir.SplitMode.UP_DOWN
+
+    def test_inline_with_spmd_round_trip(self):
+        """The inline plain form survives print -> parse round-trip (no ``as tid``)."""
+
+        @pl.program
+        class Original:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="stage1"):
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(pl.add(t, t), [i * 128, 0], out)
+                return out
+
+        printed = Original.as_python()
+        assert ".spmd(" in printed and " as tid:" not in printed
+        Reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(Original, Reparsed)
+
+    def test_inline_with_spmd_missing_block_idx_rejected(self):
+        """An inline body that never reads the per-block index is rejected — without
+        ``get_block_idx()`` every block runs identical work, so it is almost always a
+        bug. The single-call direct-dispatch form is exempt (see the regression test
+        ``test_with_spmd_single_call_still_supported``)."""
+        with pytest.raises(ParserSyntaxError, match="must read the per-block index"):
+
+            @pl.program
+            class Bad:
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def main(
+                    self,
+                    a: pl.Tensor[[512, 128], pl.FP32],
+                    out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+                ) -> pl.Tensor[[512, 128], pl.FP32]:
+                    with pl.spmd(4):
+                        # No pl.tile.get_block_idx() anywhere — every block would run
+                        # identical work writing the same output region.
+                        t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [0, 0], [128, 128])
+                        out = pl.store(pl.add(t, t), [0, 0], out)
+                    return out
+
+    def test_inline_as_tid_missing_block_idx_rejected(self):
+        """The same block-index requirement applies to the ``as tid`` inline form —
+        the check lives in the shared body-emit path, so both with-forms enforce it."""
+        with pytest.raises(ParserSyntaxError, match="must read the per-block index"):
+
+            @pl.program
+            class Bad:
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def main(
+                    self,
+                    a: pl.Tensor[[512, 128], pl.FP32],
+                    out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+                ) -> pl.Tensor[[512, 128], pl.FP32]:
+                    with pl.spmd(4) as tid:  # noqa: F841
+                        t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [0, 0], [128, 128])
+                        out = pl.store(pl.add(t, t), [0, 0], out)
+                    return out
+
+    def test_inline_with_spmd_accepts_top_level_get_block_idx(self):
+        """Regression (qwen3 decode / pypto-lib-model CI): an inline body that reads
+        the block index via the top-level ``pl.get_block_idx()`` alias (not the
+        qualified ``pl.tile.get_block_idx()``) is accepted, not rejected by the guard."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="fa_fused"):
+                    i = pl.get_block_idx()  # top-level alias, as real models use
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(pl.add(t, t), [i * 128, 0], out)
+                return out
+
+        main_func = list(Prog.functions.values())[0]
+        spmd = self._unique(main_func.body, ir.SpmdScopeStmt)
+        # Outlined (InCore wrapper present), not rejected by the block-index guard.
+        self._unique(spmd.body, ir.InCoreScopeStmt)
+
+    def test_block_idx_guard_matches_every_get_block_idx_spelling(self):
+        """The block-index guard matches ``get_block_idx()`` by name, across every
+        valid spelling regardless of receiver. Regression: the top-level
+        ``pl.get_block_idx()`` alias (used by real models, e.g. qwen3 decode) must be
+        accepted — a receiver-restricted match wrongly rejected it."""
+        reads = ASTParser._spmd_body_reads_block_idx
+        # Top-level alias (the regression case), qualified forms, and bare import.
+        assert reads(ast.parse("x = pl.get_block_idx()").body)
+        assert reads(ast.parse("x = pl.tile.get_block_idx()").body)
+        assert reads(ast.parse("x = tile.get_block_idx()").body)
+        assert reads(ast.parse("x = get_block_idx()").body)
+        # A nested use (inside an expression argument) still counts.
+        assert reads(ast.parse("t = pl.load(a, [pl.get_block_idx() * 8, 0], [8, 8])").body)
+        # A body with no block-index read at all is rejected.
+        assert not reads(ast.parse("x = pl.load(a, [0, 0], [8, 8])").body)
+        assert not reads(ast.parse("x = foo.get_subblock_idx()").body)
 
 
 class TestSpmdAllowEarlyResolve:
