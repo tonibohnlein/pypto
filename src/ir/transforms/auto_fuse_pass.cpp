@@ -1615,13 +1615,137 @@ std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1,
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
+// Collect the Vars a flat tensor-op stmt READS. Covers the pre-emit auto_fuse body shapes:
+// an AssignStmt of a Call (its args), an SSA rebind (a plain Var value), and a ReturnStmt (its
+// values). The marked body is a flat DAG of Calls before outlining — no control flow, no Submit.
+void CollectStmtUses(const StmtPtr& s, std::vector<const Var*>* out) {
+  auto add = [&](const ExprPtr& e) {
+    if (auto v = AsVarLike(e)) out->push_back(v.get());
+  };
+  if (auto a = As<AssignStmt>(s)) {
+    if (auto c = As<Call>(a->value_)) {
+      for (const ExprPtr& arg : c->args_) add(arg);
+    } else {
+      add(a->value_);  // SSA rebind `b = a`
+    }
+  } else if (auto r = As<ReturnStmt>(s)) {
+    for (const ExprPtr& v : r->value_) add(v);
+  }
+}
+
+// True when some solver group's stmts are NOT a contiguous run in SSA body order — i.e. an op of
+// another group (or an ungrouped stmt) lexically separates two of its members. A group occupies
+// [min,max] body indices; if it has fewer members than that span is wide, something is interspersed.
+bool GroupsAreFragmented(const std::vector<StmtPtr>& body,
+                         const std::unordered_map<const Stmt*, size_t>& stmt_group) {
+  std::unordered_map<size_t, size_t> gmin, gmax, gcount;
+  for (size_t i = 0; i < body.size(); ++i) {
+    auto it = stmt_group.find(body[i].get());
+    if (it == stmt_group.end()) continue;
+    const size_t g = it->second;
+    if (gcount.find(g) == gcount.end()) {
+      gmin[g] = i;
+      gmax[g] = i;
+      gcount[g] = 1;
+    } else {
+      gmax[g] = i;
+      gcount[g]++;
+    }
+  }
+  for (const auto& [g, c] : gcount)
+    if (gmax[g] - gmin[g] + 1 != c) return true;
+  return false;
+}
+
+// Reorder a flat body so every solver group is CONTIGUOUS while preserving data dependencies, so
+// the contiguous-run emit below realizes each group as ONE fused scope (the on-chip working set the
+// cost model priced) instead of fragmenting a non-contiguous group into several scopes that
+// round-trip the shared intermediate through DDR. Contract each group to one "unit" (each ungrouped
+// stmt is its own unit); the solver's grouping is convex, so the unit graph is a DAG — a topological
+// sort clusters each group. Falls back to the original order if a cycle appears (a non-convex
+// grouping — the contiguous-run emit then still produces correct, if fragmented, code).
+std::vector<StmtPtr> ReorderBodyByGroup(const std::vector<StmtPtr>& body,
+                                        const std::unordered_map<const Stmt*, size_t>& stmt_group) {
+  if (!GroupsAreFragmented(body, stmt_group)) return body;  // common case: already contiguous
+  const size_t n = body.size();
+  size_t max_group = 0;
+  for (const auto& kv : stmt_group) max_group = std::max(max_group, kv.second);
+  const size_t ungrouped_base = max_group + 1;  // ungrouped stmt i -> its own unit key
+
+  // Assign dense unit ids in first-appearance (SSA) order: grouped stmts share their group's unit.
+  std::unordered_map<size_t, size_t> unit_index;  // raw key -> dense id
+  std::vector<std::vector<size_t>> unit_stmts;     // dense id -> body indices (in SSA order)
+  std::vector<size_t> unit_of_stmt(n);
+  std::unordered_map<const Var*, size_t> def_unit;  // defined Var -> its unit
+  for (size_t i = 0; i < n; ++i) {
+    auto git = stmt_group.find(body[i].get());
+    const size_t key = (git != stmt_group.end()) ? git->second : ungrouped_base + i;
+    auto uit = unit_index.find(key);
+    size_t u;
+    if (uit == unit_index.end()) {
+      u = unit_stmts.size();
+      unit_index[key] = u;
+      unit_stmts.emplace_back();
+    } else {
+      u = uit->second;
+    }
+    unit_stmts[u].push_back(i);
+    unit_of_stmt[i] = u;
+    if (auto a = As<AssignStmt>(body[i]))
+      if (a->var_) def_unit[a->var_.get()] = u;
+  }
+  const size_t U = unit_stmts.size();
+
+  // Unit dependency graph: unit X depends on unit Y if a stmt in X reads a Var defined in Y.
+  std::vector<std::set<size_t>> preds(U);
+  std::vector<const Var*> uses;
+  for (size_t i = 0; i < n; ++i) {
+    uses.clear();
+    CollectStmtUses(body[i], &uses);
+    for (const Var* v : uses) {
+      auto dit = def_unit.find(v);
+      if (dit != def_unit.end() && dit->second != unit_of_stmt[i]) preds[unit_of_stmt[i]].insert(dit->second);
+    }
+  }
+  std::vector<size_t> indeg(U, 0);
+  std::vector<std::vector<size_t>> succ(U);
+  for (size_t u = 0; u < U; ++u)
+    for (size_t p : preds[u]) {
+      succ[p].push_back(u);
+      indeg[u]++;
+    }
+
+  // Kahn topological sort; the ready set is ordered so the smallest dense unit id (earliest SSA
+  // appearance) wins ties — deterministic, and identity on an already-contiguous body.
+  std::set<size_t> ready;
+  for (size_t u = 0; u < U; ++u)
+    if (indeg[u] == 0) ready.insert(u);
+  std::vector<size_t> order;
+  order.reserve(U);
+  while (!ready.empty()) {
+    const size_t u = *ready.begin();
+    ready.erase(ready.begin());
+    order.push_back(u);
+    for (size_t w : succ[u])
+      if (--indeg[w] == 0) ready.insert(w);
+  }
+  if (order.size() != U) return body;  // cycle (non-convex grouping) -> keep original order
+
+  std::vector<StmtPtr> out;
+  out.reserve(n);
+  for (size_t u : order)
+    for (size_t i : unit_stmts[u]) out.push_back(body[i]);
+  return out;
+}
+
 // Rewrite a function body to realize the solver's decision. A matmul becomes its
 // own self-scoped tiled kernel (the solver's `[w,h]` output tiling, an InCore
 // kernel per tile, the per-tile k-pipeline inside) emitted at the orchestration
 // level; two chained matmuls in one group become a single fused kernel (the
 // intermediate stays on-chip, see TileChainedMatmul); every other fused group is
 // a maximal *contiguous* run of same-group compute stmts wrapped in one
-// InCoreScopeStmt. The body is already in SSA dependency order.
+// InCoreScopeStmt. Non-contiguous groups are first reordered contiguous
+// (ReorderBodyByGroup) so each group emits as one scope. The body is in SSA order.
 StmtPtr EmitFusedScopes(const StmtPtr& body,
                         const std::unordered_map<const Stmt*, size_t>& stmt_group,
                         const std::unordered_map<const Stmt*, SolverTile>& stmt_tile,
@@ -1632,6 +1756,10 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
   } else {
     body_stmts.push_back(body);
   }
+
+  // Cluster each solver group into a contiguous run (dependency-preserving) so a group whose
+  // members are interleaved with another group's in SSA order still emits as ONE fused scope.
+  body_stmts = ReorderBodyByGroup(body_stmts, stmt_group);
 
   // Detect 2-matmul chains within a group: MM2 = matmul(T, D) where its left
   // operand T is the output of MM1 = matmul(A, B) in the SAME group. Such a pair
@@ -1670,12 +1798,22 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
   std::vector<StmtPtr> top;
   std::vector<StmtPtr> run;
   long run_group = -1;
+  std::unordered_set<long> flushed_groups;  // DIAGNOSTIC: detect a group emitted as >1 scope
   // Flush the accumulated run. A lone pointwise op gets the solver's [w,h]
   // cross-core tiling (TilePointwise); everything else is wrapped in one InCore
   // scope (multi-op groups, reductions, or pointwise that needs no tiling).
   auto flush = [&]() {
     if (run.empty()) {
       return;
+    }
+    // ReorderBodyByGroup makes every group contiguous before this loop, so a group should flush
+    // exactly once. If it flushes twice, the reorder fell back (a non-convex grouping -> cycle in
+    // the unit graph): the group is emitted as multiple scopes, so the cross-fragment intermediate
+    // round-trips DDR instead of staying on-chip (correctness preserved: it becomes a materialized
+    // live-out; only the on-chip working set the solver costed is lost). Surface it.
+    if (run_group >= 0 && !flushed_groups.insert(run_group).second) {
+      LOG_INFO << "AutoFuse[generic]: WARNING group " << run_group
+               << " emitted as multiple scopes (non-convex grouping -> reorder fell back; fidelity loss)";
     }
     // Replay the group in the solver's EXECUTION ORDER (its depth-first pebbling order),
     // NOT the SSA/body order. That order is what the cost model evaluated the working-set
