@@ -1100,7 +1100,14 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       auto v = AsVarLike(arg);
       if (v != nullptr && defined.count(v.get()) != 0) continue;
       const auto [aM, aN] = Static2DShape(arg->GetType());
-      if (aM < 0) continue;                     // scalar / non-2D -> kept as-is
+      if (aM < 0) {
+        // Static2DShape returns {-1,-1} for a true scalar AND for a non-2D / dynamic-shape
+        // TENSOR alike. Only the former (a non-tensor operand — e.g. a broadcast scale) is
+        // carried through as-is; a rank!=2 or symbolic tensor is out of scope for the 2D emit,
+        // so DECLINE rather than misclassify it as a scalar and slice it as [IM,IN].
+        if (As<TensorType>(arg->GetType()) != nullptr) return std::nullopt;
+        continue;                               // true scalar -> kept as-is
+      }
       if (aM == IM && aN == IN) continue;       // full external input -> sliced
       return std::nullopt;                      // other 2D shape (broadcast) -> TODO
     }
