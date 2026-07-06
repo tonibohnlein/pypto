@@ -479,6 +479,14 @@ struct MatmulTiling {
   /// matches the bandwidth-weighted hoist the wall cost was scored under. Ignored
   /// for A/B-stationary (loop order comes from `stationarity`) and split-K.
   bool os_holds_a = true;
+  /// True when the chooser picked dbC=2 (double-buffered L0C): the accumulator is
+  /// budgeted at L0C/2 so two co-live [m, n] Acc tiles fit, and BuildFullKPipelined
+  /// tags the moving loop with kPipelineDoubleBufferCAttr so CanonicalizeIOOrder
+  /// floats the stores past the next matmul, keeping the two tiles co-live — under
+  /// the ptoas planner they then land on distinct L0C offsets, hiding tile i's
+  /// drain behind tile i+1's MAD.  Set from L0TileResult::double_buffer_c; only
+  /// true under the ptoas memory planner.
+  bool double_buffer_c = false;
   [[nodiscard]] bool is_acc() const { return acc_init != nullptr; }
   /// True when the chosen L0 tile is smaller than the [M, N] output on either
   /// axis — the output Acc would overflow L0c, so the output must be tiled.
@@ -631,17 +639,17 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   // matmul's double-buffered operands, so those producers must stay output-stationary.
   cfg.allow_a_stationary = !force_output_stationary;
   cfg.allow_b_stationary = !force_output_stationary;
-  // TODO(dbC=2): L0C double-buffering (the chooser's allow_double_buffer_c / dbC=2
-  // design point) is left OFF here: the chooser can score it, but the full-K
-  // emitter threads the output accumulator as a single iter-arg chain through the
-  // M/N grid, so the lowering allocates ONE L0C buffer (MemoryReuse reuses it
-  // across tiles) and pipeline_overlap_stores does not float consecutive tiles into
-  // two co-live accumulators. Enabling it would only shrink the tile (budgeting
-  // L0C/2) without hiding the drain — a regression. Re-enable once the emitter
-  // realizes a genuine two-accumulator ping-pong (two co-live L0C buffers with the
-  // drain of tile i overlapping the MAD of tile i+1; needs the direct-store output
-  // chain broken so the per-tile FIXPIPE drains can overlap).
-  cfg.allow_double_buffer_c = false;
+  // L0C double-buffering (dbC=2): the chooser budgets the accumulator at L0C/2 and
+  // scores the drain-hidden wall (max(C_load, C_mad, C_drain)) so tile i's FIXPIPE
+  // drain overlaps tile i+1's MAD.  This needs two *co-live* L0C accumulators.  Only
+  // the ptoas memory planner can realize that today: it allocates co-live tiles to
+  // distinct L0C offsets (its reuse gate never overlaps live buffers), whereas pypto
+  // MemoryReuse would coalesce them into one buffer.  Under the default PyPTO planner
+  // dbC=2 stays OFF — enabling it would only shrink the tile (L0C/2) with no second
+  // buffer, a regression.  The co-live emit itself is gated on the chooser's
+  // `double_buffer_c` result below (see BuildFullKPipelined's overlap_stores).
+  const bool ptoas_planner = ctx && ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS;
+  cfg.allow_double_buffer_c = ptoas_planner;
   // tile.matmul_acc threads the caller's accumulator into the K-loop's
   // iter-arg, so each invocation reads C from L1 at start and writes back at
   // end (gamma_c = 2 in the chooser's traffic model).  Plain tile.matmul
@@ -701,6 +709,7 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   t.k = res.k;
   t.stationarity = res.stationarity;
   t.os_holds_a = res.os_holds_a;
+  t.double_buffer_c = res.double_buffer_c;
   return t;
 }
 
@@ -1031,13 +1040,22 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& 
     std::vector<StmtPtr> inner_body{inner_extract, std::make_shared<AssignStmt>(c_var, c_call, sp)};
     VarPtr inner_chain = placer.PlaceAt(inner_body, c_var, mi, ni, out_inner, /*step=*/0);
     inner_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{inner_chain}, sp));
-    // overlap_stores=false: keep one L0C accumulator.  Letting CanonicalizeIOOrder
-    // float the stores below the next matmul would keep two [m, n] results co-live
-    // (2·m·n·bytes_c) while the chooser budgets one L0C buffer (double_buffer_c=
-    // false) → L0C overflow.  The one-accumulator schedule still double-buffers
-    // the moving-operand extract.
+    // overlap_stores stays false: the one-accumulator schedule
+    // (matmul_i, store_i, matmul_{i+1}, store_{i+1}) drains each L0C result before
+    // the next matmul overwrites it.  dbC=2 (double_buffer_c) instead sets the
+    // stronger double_buffer_c attr, which floats *both* stores below *both*
+    // matmuls (matmul c, matmul c₁, store c, store c₁) so the two [m, n] Acc tiles
+    // stay co-live; the chooser budgeted them at L0C/2 so both fit, and under the
+    // ptoas planner they land on distinct L0C offsets — tile i's FIXPIPE drain then
+    // overlaps tile i+1's MAD.  Absent (⇒ false) under the pypto planner, where
+    // MemoryReuse budgets one accumulator.  The moving-operand extract is
+    // double-buffered (Load tier, hoisted) in both schedules.
     std::vector<std::pair<std::string, std::any>> inner_attrs = {{kPipelineStagesAttr, /*pipeline_stages=*/2},
                                                                  {kPipelineOverlapStoresAttr, false}};
+    // Only dbC=2 loops carry the attr (absent ⇒ false), so non-dbC=2 emit is
+    // unchanged.  It lifts the moving-loop stores above both matmuls in
+    // CanonicalizeIOOrder to keep the two L0C accumulators co-live.
+    if (t.double_buffer_c) inner_attrs.emplace_back(kPipelineDoubleBufferCAttr, true);
     auto inner_rv = std::make_shared<Var>(base + "_irv", out_type, sp);
     auto inner_for = std::make_shared<ForStmt>(
         inner_var, MakeIndex(0, sp), MakeIndex(inner_extent, sp), MakeIndex(inner_step, sp),
