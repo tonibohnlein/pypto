@@ -254,6 +254,7 @@ SMR_M, SMR_N = 256, 66      # softmax ragged reduced N (padded reduced axis)
 RRB_M, RRB_N = 256, 128     # row-reduce + broadcast (reduction intermediate, no div)
 F16_M, F16_N = 256, 128     # FP16 softmax (granule g=16)
 CS_M, CS_N = 128, 256       # bare col_sum sink -> S2 split-reduction (atomic-add merge)
+FK_M, FK_N = 256, 256       # multi-sink fork: two live-outs sharing an input
 
 
 class AutoFuseRaggedPointwiseCase(PTOTestCase):
@@ -612,6 +613,47 @@ class AutoFuseColSumCase(PTOTestCase):
         tensors["out"][:] = tensors["x"].sum(dim=0, keepdim=True)
 
 
+class AutoFuseForkCase(PTOTestCase):
+    """Multi-sink fork [256,256] -> (a, b): a=(x+1)*2, b=(x+1)*3 share the intermediate c=x+1.
+    Two live-outs in one fused group, each assembled to its own output; validates the
+    multi-sink emit + the multi-RETURN -> multiple-Out-param wiring on hardware. Outputs are
+    positionally [x, a, b] to match the appended Out params [x, a_out, b_out]."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_fork_256x256"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [FK_M, FK_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("outa", [FK_M, FK_N], DataType.FP32, is_output=True),
+            TensorSpec("outb", [FK_M, FK_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def f(
+                self, x: pl.Tensor[[FK_M, FK_N], pl.FP32]
+            ) -> tuple[pl.Tensor[[FK_M, FK_N], pl.FP32], pl.Tensor[[FK_M, FK_N], pl.FP32]]:
+                c: pl.Tensor[[FK_M, FK_N], pl.FP32] = pl.add(x, 1.0)
+                a: pl.Tensor[[FK_M, FK_N], pl.FP32] = pl.mul(c, 2.0)
+                b: pl.Tensor[[FK_M, FK_N], pl.FP32] = pl.mul(c, 3.0)
+                return a, b
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        tensors["outa"][:] = (x + 1.0) * 2.0
+        tensors["outb"][:] = (x + 1.0) * 3.0
+
+
 class TestAutoFuseDevice:
     """AutoFuse on device: the reduction-valid probe + free-axis padding numerics."""
 
@@ -698,6 +740,11 @@ class TestAutoFuseDevice:
     def test_autofuse_col_sum(self, test_runner, platform):
         result = test_runner.run(AutoFuseColSumCase(platform=platform))
         assert result.passed, f"AutoFuse col_sum [128,256] (S2 split) mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_fork(self, test_runner, platform):
+        result = test_runner.run(AutoFuseForkCase(platform=platform))
+        assert result.passed, f"AutoFuse multi-sink fork [256,256] mismatch on device: {result.error}"
 
 
 if __name__ == "__main__":
