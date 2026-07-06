@@ -305,6 +305,45 @@ class TestAutoFuseEmitGolden:
         a = torch.randn(256, 66)
         _emit_matches_reference(Prog, "softmax", (a,), torch.softmax(a, dim=1))
 
+    def test_col_sum_ragged_split(self, ascend_backend):
+        """Bare col_sum sink whose solver plan gangs S cores over the reduced axis (split>1)
+        on a RAGGED free axis (N=100) — the exact shape that made the S2 atomic-add merge
+        DOUBLE-COUNT before the fix (the ceil+clamp free-axis overlap summed twice under an
+        atomic assemble). The emit now declines the un-realizable ragged split to the CORRECT
+        non-split body; this asserts the generic emit equals the unfused column reduction, so a
+        regression that re-enables the overlapping atomic split turns this red. Tight tolerance:
+        the non-split body pins the full reduced axis on one core (no atomic reassociation)."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def cs(self, a: pl.Tensor[[256, 100], pl.FP32]) -> pl.Tensor[[1, 100], pl.FP32]:
+                c: pl.Tensor[[1, 100], pl.FP32] = pl.col_sum(a)
+                return c
+
+        torch.manual_seed(11)
+        a = torch.randn(256, 100)
+        _emit_matches_reference(Prog, "cs", (a,), a.sum(dim=0, keepdim=True))
+
+    def test_scalar_param_broadcast(self, ascend_backend):
+        """A scalar In-param (broadcast scale) carried as an operand, not a tiled tensor. Before
+        the fix, registering it as a solver tensor CHECK-crashed the whole compile ('not
+        tensor-typed'); now it is skipped and the pointwise mul fuses with the scalar threaded
+        through the emit as-is. Guards the graceful-skip path (both legacy and generic)."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def scaled(self, a: pl.Tensor[[64, 64], pl.FP32], s: pl.Scalar[pl.FP32]) -> pl.Tensor[[64, 64], pl.FP32]:
+                c: pl.Tensor[[64, 64], pl.FP32] = pl.mul(a, s)
+                return c
+
+        torch.manual_seed(12)
+        a = torch.randn(64, 64)
+        _emit_matches_reference(Prog, "scaled", (a, 2.5), a * 2.5)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
