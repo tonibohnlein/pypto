@@ -402,13 +402,20 @@ class PassManager:
         # so callers' diagnostic intent isn't reset.
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
+        # Propagate the outer memory planner: a nested PassContext otherwise resets it
+        # to the PYPTO binding default, which silently disables PTOAS-gated pass
+        # behaviour (e.g. AutoTileMatmulL0's dbC=2 tile selection reads
+        # GetMemoryPlanner() *during* pass execution) whenever the pipeline dumps IR.
+        mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         outer_phase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if outer_phase == passes.DiagnosticPhase.POST_PASS:
             inner_phase = passes.DiagnosticPhase.PRE_PIPELINE
         else:
             inner_phase = outer_phase
 
-        with passes.PassContext([*outer_instruments, *extra_instruments], level, inner_phase, disabled):
+        with passes.PassContext(
+            [*outer_instruments, *extra_instruments], level, inner_phase, disabled, mplan
+        ):
             try:
                 return self._pipeline.run(input_ir)
             finally:
@@ -438,6 +445,9 @@ class PassManager:
         ctx = passes.PassContext.current()
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
+        # Propagate the outer memory planner (see run_passes) so profiling doesn't
+        # silently reset it to PYPTO and disable PTOAS-gated pass behaviour.
+        mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         dphase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if ctx:
             disabled = ctx.get_disabled_diagnostics()
@@ -445,7 +455,7 @@ class PassManager:
             disabled = passes.DiagnosticCheckSet()
             disabled.insert(passes.DiagnosticCheck.UnusedControlFlowResult)
 
-        with passes.PassContext([*outer_instruments, timing_instrument], level, dphase, disabled):
+        with passes.PassContext([*outer_instruments, timing_instrument], level, dphase, disabled, mplan):
             try:
                 return self._pipeline.run(input_ir)
             finally:
