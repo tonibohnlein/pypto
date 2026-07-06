@@ -1060,20 +1060,37 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   auto ct = As<TensorType>(c_var->GetType());
   if (ct == nullptr) return std::nullopt;
   const DataType dtype = ct->dtype_;
-  const auto [M, N] = Static2DShape(c_var->GetType());
+  const auto [M, N] = Static2DShape(c_var->GetType());  // SINK shape (for the output buffer)
   if (M < 0) return std::nullopt;
 
-  // Elementwise operand map is IDENTITY: every operand is an intermediate, an [M,N]
-  // external input (sliced), or a scalar. A differently-shaped 2D operand (broadcast)
-  // is not identity -> out of the increment-1 Elementwise rule (a Broadcast rule is TODO).
+  // Iteration space = the reference frame for tiling: the MAX extent over every op's
+  // input and output shapes, NOT the sink shape. A reduced sink ([M,1]/[1,N]) is
+  // smaller than the pre-reduction working shape; tiling must run over the working
+  // shape (IM,IN) and pin the reduced axis, while the sink is assembled at its own
+  // (reduced) shape. For a plain [M,N] sink IM,IN == M,N, so this is a no-op there.
+  int64_t IM = M, IN = N;
+  for (const auto& a : ops) {
+    const auto [oM, oN] = Static2DShape(a->var_->GetType());
+    IM = std::max(IM, oM);
+    IN = std::max(IN, oN);
+    for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
+      const auto [aM, aN] = Static2DShape(arg->GetType());
+      IM = std::max(IM, aM);
+      IN = std::max(IN, aN);
+    }
+  }
+
+  // Operand map is IDENTITY over the iteration space: every operand is an intermediate,
+  // an [IM,IN] external input (sliced), or a scalar. A differently-shaped 2D external
+  // operand (broadcast) is not identity -> out of scope (a Broadcast rule is TODO).
   for (const auto& a : ops)
     for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
       auto v = AsVarLike(arg);
       if (v != nullptr && defined.count(v.get()) != 0) continue;
       const auto [aM, aN] = Static2DShape(arg->GetType());
       if (aM < 0) continue;                     // scalar / non-2D -> kept as-is
-      if (aM == M && aN == N) continue;         // [M,N] external input -> sliced
-      return std::nullopt;                      // other 2D shape (broadcast) -> not increment 1
+      if (aM == IM && aN == IN) continue;       // full external input -> sliced
+      return std::nullopt;                      // other 2D shape (broadcast) -> TODO
     }
 
   // Grid: single shared parallel tile space; pure elementwise has NO pinned axis, so we
@@ -1083,9 +1100,25 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // here is NON-ATOMIC (elementwise/reduction — no split-K), so the overlap is idempotent
   // (same input -> same output) and correct without masking. (Split-K matmul cannot use
   // this: atomic-add would double-count the overlap; that path keeps exact division.)
-  int64_t h = (tile.h > 0 && tile.h < M) ? tile.h : M;
-  int64_t w = (tile.w > 0 && tile.w < N) ? tile.w : N;
-  const int64_t num_m = (M + h - 1) / h, num_n = (N + w - 1) / w;  // ceil
+  // Pinned (reduced) axes: a col reduction reduces M, a row reduction reduces N. The
+  // reduced axis must span its FULL iteration extent (a per-tile partial reduction is
+  // wrong), so PIN it to IM/IN — the solver's per-axis tile value on a reduced axis is
+  // the OUTPUT extent (1), not a tile size, so it can't be used there. Only the FREE
+  // axis takes the solver's tile.
+  bool pin_m = false, pin_n = false;
+  if (has_reduction) {
+    for (const auto& a : ops) {
+      auto rc = As<Call>(a->value_);
+      if (ClassifyOp(rc) != ::OpType::Reduction || rc->args_.empty()) continue;
+      const auto [riM, riN] = Static2DShape(rc->args_[0]->GetType());
+      const auto [roM, roN] = Static2DShape(a->var_->GetType());
+      if (riN > 1 && roN == 1) pin_n = true;  // row reduction -> N pinned
+      if (riM > 1 && roM == 1) pin_m = true;  // col reduction -> M pinned
+    }
+  }
+  int64_t h = pin_m ? IM : ((tile.h > 0 && tile.h < IM) ? tile.h : IM);
+  int64_t w = pin_n ? IN : ((tile.w > 0 && tile.w < IN) ? tile.w : IN);
+  const int64_t num_m = (IM + h - 1) / h, num_n = (IN + w - 1) / w;  // ceil
   if (num_m == 1 && num_n == 1) return std::nullopt;
 
   // A4 (reduction rule): the reduced axis must be PINNED FULL in the tile, else a
@@ -1107,9 +1140,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       // Tier-B (A4): the reduced axis is NOT pinned full -> a per-tile reduction covers
       // only part of the axis = a partial (wrong) reduction. The solver pins it (grid
       // num=1 on the reduced axis); a plan that does not is illegal for v1.
-      if (reduces_N && w != N)
+      if (reduces_N && w != IN)
         return GenericDeclineB("reduction's reduced axis N not pinned full (partial reduction, A4)", a->span_);
-      if (reduces_M && h != M)
+      if (reduces_M && h != IM)
         return GenericDeclineB("reduction's reduced axis M not pinned full (partial reduction, A4)", a->span_);
       // Tier-B: a Reduction-classed op whose shape is neither a row nor a col collapse =
       // classifier/plan inconsistency.
@@ -1134,8 +1167,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   auto t = std::make_shared<Var>(base + "_t", index_type, sp);
   ExprPtr mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
   ExprPtr ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
-  if (M % h != 0) mi = MakeMin(mi, MakeIndex(M - h, sp), sp);
-  if (N % w != 0) ni = MakeMin(ni, MakeIndex(N - w, sp), sp);
+  if (IM % h != 0) mi = MakeMin(mi, MakeIndex(IM - h, sp), sp);
+  if (IN % w != 0) ni = MakeMin(ni, MakeIndex(IN - w, sp), sp);
 
   // Vector DMA-block granule (elements): a vector (none_box) tile's contiguous-axis byte
   // extent must be a multiple of GetVectorDmaAlignmentBytes() (32). Pad each ragged tile
@@ -1206,7 +1239,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           if (it != onchip.end()) { targs.push_back(it->second); continue; }  // intermediate on-chip
         }
         const auto [aM, aN] = Static2DShape(arg->GetType());
-        if (aM == M && aN == N) {  // external input -> identity [sh,w] slice (cached per input var)
+        if (aM == IM && aN == IN) {  // full external input -> identity [sh,w] slice (cached per input var)
           if (v != nullptr) {
             auto sit = input_cache.find(v.get());
             if (sit != input_cache.end()) { targs.push_back(sit->second); continue; }
