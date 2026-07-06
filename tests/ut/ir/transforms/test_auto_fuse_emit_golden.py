@@ -84,8 +84,14 @@ def _emit_matches_reference(program, entry, inputs, ref, *, rtol=1e-4, atol=1e-4
     namespace: dict = {}
     exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)  # noqa: S102
     out = namespace[entry](*inputs)
-    diff = (out - ref).abs().max().item()
-    assert torch.allclose(out, ref, rtol=rtol, atol=atol), f"{entry}: max abs diff {diff:.3e}"
+    # A multi-return kernel yields a tuple of outputs (one per lifted Out param); compare each
+    # against the matching reference. A single return is wrapped so the loop covers both.
+    outs = out if isinstance(out, (tuple, list)) else (out,)
+    refs = ref if isinstance(ref, (tuple, list)) else (ref,)
+    assert len(outs) == len(refs), f"{entry}: expected {len(refs)} outputs, got {len(outs)}"
+    for i, (o, r) in enumerate(zip(outs, refs)):
+        diff = (o - r).abs().max().item()
+        assert torch.allclose(o, r, rtol=rtol, atol=atol), f"{entry}: output {i} max abs diff {diff:.3e}"
 
 
 class TestAutoFuseEmitGolden:
@@ -345,6 +351,29 @@ class TestAutoFuseEmitGolden:
         torch.manual_seed(13)
         a = torch.randn(128, 256)
         _emit_matches_reference(Prog, "cs", (a,), a.sum(dim=0, keepdim=True), rtol=1e-4, atol=1e-4)
+
+    def test_interleaved_groups(self, ascend_backend):
+        """Two INDEPENDENT elementwise chains (exp->neg on x, exp->neg on y) interleaved in SSA
+        order. The solver puts each chain in its own fused group, so the groups interleave in body
+        order — which the contiguous-run emit used to FRAGMENT into four single-op scopes (each
+        chain's intermediate round-tripping DDR). ReorderBodyByGroup now clusters each group into
+        one contiguous scope; this asserts the emit still equals the two unfused chains (both
+        outputs), guarding the reorder + the multi-return wiring."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def two(self, x: pl.Tensor[[256, 128], pl.FP32], y: pl.Tensor[[256, 128], pl.FP32]):
+                a1: pl.Tensor[[256, 128], pl.FP32] = pl.exp(x)
+                b1: pl.Tensor[[256, 128], pl.FP32] = pl.exp(y)
+                a2: pl.Tensor[[256, 128], pl.FP32] = pl.neg(a1)
+                b2: pl.Tensor[[256, 128], pl.FP32] = pl.neg(b1)
+                return a2, b2
+
+        torch.manual_seed(14)
+        x, y = torch.randn(256, 128), torch.randn(256, 128)
+        _emit_matches_reference(Prog, "two", (x, y), (-torch.exp(x), -torch.exp(y)))
 
     def test_scalar_param_broadcast(self, ascend_backend):
         """A scalar In-param (broadcast scale) carried as an operand, not a tiled tensor. Before
