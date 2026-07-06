@@ -1028,25 +1028,20 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       auto v = AsVarLike(arg);
       if (v != nullptr && defined.count(v.get()) != 0) used_within.insert(v.get());
     }
-  AssignStmtPtr out_stmt = nullptr;
+  // Sinks = the group's live-outs (the solver's boundary outputs), in execution order.
+  // A fused group MAY have >1 sink (the solver merges sinks that share input data — the
+  // point of the fusion). We assemble each into its own output buffer; the shared-input
+  // serialization falls out of replaying the ops in the solver's execution order.
+  std::vector<AssignStmtPtr> sinks;
   for (const auto& a : ops)
-    if (used_within.count(a->var_.get()) == 0) {
-      // Tier-B (A7): >1 live-out. The safe fallback is correct regardless (the group
-      // declines to a plain InCore scope, which computes all outputs), so this never
-      // corrupts results. It is kept Tier-B (strict-abort) rather than capability because
-      // strict is test-scoped and no current test forms a multi-sink group, so it cannot
-      // false-abort. NB the cost model CAN legitimately form multi-sink groups (S5,
-      // sink_ops is a vector) — if that starts happening in practice, reclassify to a
-      // capability decline like the non-uniform grid (solver-legitimate + safe fallback).
-      if (out_stmt != nullptr)
-        return GenericDeclineB("group has >1 live-out (multi-sink, A7/S5)", a->span_);
-      out_stmt = a;
-    }
+    if (used_within.count(a->var_.get()) == 0) sinks.push_back(a);
   // Tier-B: a group with NO live-out is structurally impossible in SSA (every group has
   // an output; a cycle among run ops cannot exist). If it happens the run/group mapping
   // is corrupt -> surface it.
-  if (out_stmt == nullptr)
+  if (sinks.empty())
     return GenericDeclineB("group has no live-out (corrupt run/group mapping)", ops.front()->span_);
+  AssignStmtPtr out_stmt = sinks.back();  // primary sink (last in exec order): shape/base for
+                                          // the single-sink pipeline/split/serial paths
 
   // S2 (reduction-sink split): the solver may gang S cores per spatial tile, each reducing
   // a SLICE of the reduced axis, the S partials atomic-merged. Realized below for a SUM
@@ -1213,7 +1208,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // a ragged VALID extent), read intermediates from on-chip scratch, replay each op at strip shape,
   // and return the SINK strip tile. Shared by the serial body and the software-pipeline loop body,
   // so both realize the same slice-and-replay per strip.
-  auto emit_strip = [&](int64_t sh, const ExprPtr& smi, const ExprPtr& sni, std::vector<StmtPtr>& out) -> VarPtr {
+  // `onchip` (op var -> its emitted tile) is caller-provided so a MULTI-SINK group can read
+  // every sink's tile out after one replay; single-sink callers pass a fresh throwaway map.
+  auto emit_strip = [&](int64_t sh, const ExprPtr& smi, const ExprPtr& sni, std::vector<StmtPtr>& out,
+                        std::unordered_map<const Var*, VarPtr>& onchip) -> VarPtr {
     // The 32B DMA granule is on the CONTIGUOUS axis only; the other (free) axis has
     // granule 1 (see ascend910b_cost.cpp: "free row axis tiles at 1 element, the
     // contiguous width axis at the 32-byte DMA block"). So pad the row axis ONLY when
@@ -1225,7 +1223,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // post-layout padding pass (which also fixes the legacy tilers — KNOWN_ISSUES).
     const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
     const bool strip_ragged = (sh_al != sh) || (w_al != w);
-    std::unordered_map<const Var*, VarPtr> onchip;       // intermediate -> on-chip tile
+    onchip.clear();                                      // fresh per replay
     std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [sh,w] slice
     VarPtr tv;
     for (const auto& a : ops) {
@@ -1273,6 +1271,38 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     return tv;
   };
 
+  // MULTI-SINK: a group with >1 live-out (the solver merges sinks that share inputs).
+  // Serial for now (pipeline/split are the single-sink refinements): replay the group ONCE
+  // in the solver's execution order, then assemble EACH sink into its own output buffer at
+  // its (projected) offset. The shared inputs stay resident across sinks precisely because
+  // the replay follows the pebbling order — that is the whole point of the merge.
+  if (sinks.size() > 1) {
+    std::vector<StmtPtr> prologue;  // one tensor.create per sink
+    std::vector<StmtPtr> mbody;
+    std::unordered_map<const Var*, VarPtr> onchip;
+    emit_strip(h, mi, ni, mbody, onchip);  // replay all ops; onchip[var] = every op's tile
+    for (const auto& sink : sinks) {
+      auto stt = As<TensorType>(sink->var_->GetType());
+      if (stt == nullptr) return std::nullopt;  // non-tensor sink -> out of scope
+      const auto [sM, sN] = Static2DShape(sink->var_->GetType());
+      auto ci_call = reg.Create("tensor.create", {MakeIndexTuple({sM, sN}, sp)},
+                                {{"dtype", stt->dtype_}, {"layout", TensorLayout::ND}}, sp);
+      auto ci = std::make_shared<Var>(sink->var_->name_hint_ + "_out", ci_call->GetType(), sp);
+      prologue.push_back(std::make_shared<AssignStmt>(ci, ci_call, sp));
+      auto it = onchip.find(sink->var_.get());
+      INTERNAL_CHECK(it != onchip.end()) << "Internal error: multi-sink tile missing for a live-out";
+      ExprPtr off_m = (sM < IM) ? MakeIndex(0, sp) : mi;  // reduced axis -> offset 0
+      ExprPtr off_n = (sN < IN) ? MakeIndex(0, sp) : ni;
+      auto asm_call = reg.Create("tensor.assemble", {ExprPtr(ci), it->second, MakeTuple2(off_m, off_n, sp)}, sp);
+      mbody.push_back(std::make_shared<AssignStmt>(sink->var_, asm_call, sp));
+    }
+    auto scope = SpmdWrap(t, std::move(mbody), MakeIndex(num_m * num_n, sp), name, sp);
+    prologue.push_back(scope);
+    LOG_INFO << "AutoFuse[generic]: multi-sink group '" << name << "' (" << sinks.size()
+             << " live-outs) emitted in execution order";
+    return prologue;
+  }
+
   // S2 — SUM col-reduction split. When the solver gangs S cores per free tile (tile.split>1)
   // to parallelize a reduction, partition the reduced M axis across S cores: each reduces its
   // disjoint M-slice to a [1,w] partial, and the S partials ATOMIC-ADD into a zero-seeded [1,N]
@@ -1311,7 +1341,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       ExprPtr sni = MakeMul(fidx, MakeIndex(w, sp), sp);       // free-N tile offset (ceil clamp on ragged N)
       if (IN % w != 0) sni = MakeMin(sni, MakeIndex(IN - w, sp), sp);
       std::vector<StmtPtr> sbody;
-      VarPtr part = emit_strip(rsz, r_mi, sni, sbody);         // [1,w] partial col_sum over the M-slice
+      std::unordered_map<const Var*, VarPtr> oc_split;
+      VarPtr part = emit_strip(rsz, r_mi, sni, sbody, oc_split);  // [1,w] partial col_sum over the M-slice
       auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_seeded), part, MakeTuple2(MakeIndex(0, sp), sni, sp)},
                                  {{"atomic", 1}}, sp);
       sbody.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
@@ -1353,7 +1384,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   std::vector<StmtPtr> body_stmts;
   if (num_strips < 2) {
     // Serial (matches the cost model's db=false): the whole tile is one strip.
-    VarPtr tv = emit_strip(h, mi, ni, body_stmts);
+    std::unordered_map<const Var*, VarPtr> oc_serial;
+    VarPtr tv = emit_strip(h, mi, ni, body_stmts, oc_serial);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tv, MakeTuple2(mi, ni, sp)}, sp);
     body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
   } else {
@@ -1368,7 +1400,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     auto out_iter = std::make_shared<IterArg>(base + "_out_it", c_init->GetType(), ExprPtr(c_init), sp);
     ExprPtr smi = MakeAdd(mi, MakeMul(s, MakeIndex(strip_h, sp), sp), sp);
     std::vector<StmtPtr> loop_body;
-    VarPtr tv = emit_strip(strip_h, smi, ni, loop_body);
+    std::unordered_map<const Var*, VarPtr> oc_pipe;
+    VarPtr tv = emit_strip(strip_h, smi, ni, loop_body, oc_pipe);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_iter), tv, MakeTuple2(smi, ni, sp)}, sp);
     auto out_next = std::make_shared<Var>(base + "_out_n", asm_call->GetType(), sp);
     loop_body.push_back(std::make_shared<AssignStmt>(out_next, asm_call, sp));
