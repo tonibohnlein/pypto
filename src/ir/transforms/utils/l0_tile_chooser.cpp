@@ -14,8 +14,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>   // calib override: std::getenv
+#include <iostream>  // calib override: std::cerr breakdown dump
 #include <optional>
 #include <sstream>
+#include <string>  // calib override: std::stoi
 #include <vector>
 
 #include "pypto/core/logging.h"
@@ -429,6 +432,68 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
       << "ChooseL0Tile: drain params must be non-negative with a positive fractal C0 (got drain_c0_bytes="
       << cfg.drain_c0_bytes << ", drain_penalty_cycles=" << cfg.drain_penalty_cycles
       << ", drain_fixed_cycles=" << cfg.drain_fixed_cycles << ").";
+
+  // ===== CALIBRATION-ONLY tile override (calib/force-l0-tile-dbc2 branch; NEVER merge) =====
+  // env PYPTO_FORCE_L0_TILE="m,n,k,stat,dbc" (stat in {OS,A,B}, dbc in {0,1}) makes
+  // ChooseL0Tile return that design point verbatim, so a device sweep can A/B tile
+  // choices against the chooser's pick -- and, crucially for dbC=2, force dbc=0 vs
+  // dbc=1 on the SAME (m,n,k) tile to isolate the drain-hiding effect (a PyPTO-vs-
+  // PTOAS A/B would also change the tile size and confound it). Applies to EVERY
+  // matmul in the program -> use single-matmul kernels.
+  //
+  // dbc=1 only realises two CO-LIVE L0C buffers under memory_planner=PTOAS (the
+  // default PyPTO MemoryReuse re-coalesces them into one); run the calibration
+  // harness under PTOAS. dbc=2 is emitted only by the full-K path, so dbc=1 requires
+  // k==K (matches the emit-side assert).
+  //
+  // The perf_hint carries the model's cost breakdown -- C_load, C_mad, C_drain and
+  // the dbc=0 (compute+drain, exposed) vs dbc=1 (max(compute,drain), hidden) walls --
+  // so the sweep can compare the measured device wall against both predictions and
+  // read off whether the drain actually hid.
+  if (const char* env = std::getenv("PYPTO_FORCE_L0_TILE")) {
+    std::stringstream fss(env);
+    std::string tok;
+    std::vector<std::string> parts;
+    while (std::getline(fss, tok, ',')) parts.push_back(tok);
+    CHECK(parts.size() == 5) << "PYPTO_FORCE_L0_TILE must be 'm,n,k,stat,dbc', got: " << env;
+    const int fm = std::stoi(parts[0]), fn = std::stoi(parts[1]), fk = std::stoi(parts[2]);
+    Regime fr;
+    fr.stat = parts[3] == "A"   ? Stationarity::kAStationary
+              : parts[3] == "B" ? Stationarity::kBStationary
+                                : Stationarity::kOutputStationary;
+    fr.dbc = std::stoi(parts[4]) != 0;
+    CHECK(!fr.dbc || fk == static_cast<int>(cfg.K))
+        << "PYPTO_FORCE_L0_TILE: dbc=1 requires k==K (full-K emitter), got k=" << fk << ", K=" << cfg.K;
+    Regime r0 = fr;
+    r0.dbc = false;
+    Regime r1 = fr;
+    r1.dbc = true;
+    const int64_t c_load = static_cast<int64_t>(std::llround(LoadCycles(fm, fn, fk, cfg, fr)));
+    const int64_t c_mad = MadCycles(fm, fn, fk, cfg);
+    const int64_t c_drain = static_cast<int64_t>(std::llround(DrainCycles(fm, fn, cfg)));
+    L0TileResult forced;
+    forced.m = fm;
+    forced.n = fn;
+    forced.k = fk;
+    forced.stationarity = fr.stat;
+    forced.double_buffer_c = fr.dbc;
+    forced.estimated_traffic_bytes = EstimateTraffic(fm, fn, fk, cfg, fr);
+    forced.estimated_cost_cycles = WallCycles(fm, fn, fk, cfg, fr);
+    forced.padded_compute_volume = PaddedComputeVolume(fm, fn, fk, cfg);
+    std::stringstream hs;
+    hs << "FORCE_L0[M=" << cfg.M << ",N=" << cfg.N << ",K=" << cfg.K << "][m=" << fm << ",n=" << fn
+       << ",k=" << fk << ",stat=" << parts[3] << ",dbc=" << (fr.dbc ? 1 : 0)
+       << ",tiles=" << (CeilDiv(cfg.M, fm) * CeilDiv(cfg.N, fn)) << "] C_load=" << c_load
+       << " C_mad=" << c_mad << " C_drain=" << c_drain << " wall=" << forced.estimated_cost_cycles
+       << " (dbc0_wall=" << WallCycles(fm, fn, fk, cfg, r0)
+       << " dbc1_wall=" << WallCycles(fm, fn, fk, cfg, r1) << ") -- FORCED (calibration build)";
+    forced.perf_hint = hs.str();
+    // Direct stderr dump (the diagnostic channel is phase-gated and may not print in
+    // a device compile) so the calibration sweep can always grep the model prediction.
+    std::cerr << "[PYPTO_FORCE_L0_TILE] " << hs.str() << '\n';
+    return forced;
+  }
+  // ===== end calibration-only override =====
 
   // Without padding, the problem dimensions themselves must already meet the
   // cube minimum. Callers (the pass) should pre-screen and skip with a
