@@ -107,6 +107,26 @@ class TestGenericDriverEngages:
             "non-uniform grid decline was not logged (silent fallback masks the fidelity gap)\n" + log
         )
 
+    def test_generic_owns_multi_sink_fork(self, ascend_backend, capfd, monkeypatch):
+        """A fork — two sink ops sharing an input — is one fused group with 2 live-outs, emitted
+        by the multi-sink path (each sink assembled into its own output, in execution order)."""
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def fork(
+                self, x: pl.Tensor[[256, 256], pl.FP32]
+            ) -> tuple[pl.Tensor[[256, 256], pl.FP32], pl.Tensor[[256, 256], pl.FP32]]:
+                c: pl.Tensor[[256, 256], pl.FP32] = pl.add(x, 1.0)
+                a: pl.Tensor[[256, 256], pl.FP32] = pl.mul(c, 2.0)
+                b: pl.Tensor[[256, 256], pl.FP32] = pl.mul(c, 3.0)
+                return a, b
+
+        log = _autofuse_log(Prog, capfd, monkeypatch)
+        assert "multi-sink group" in log and "2 live-outs" in log, (
+            "multi-sink fork did not route through the multi-sink path (declined or single-sink?)\n" + log
+        )
+
 
 class TestVectorPipelining:
     """The vector emit is software-pipelined so DMA overlaps compute — the max(compute,ddr)
