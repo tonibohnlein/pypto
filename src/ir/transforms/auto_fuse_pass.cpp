@@ -231,6 +231,12 @@ class ProblemBuilder {
   std::vector<std::string> op_labels;     // per-op kernel/op name, for readable logging
   std::vector<const Stmt*> op_stmts;      // per-op source AssignStmt (op index -> Stmt), for the emit
 
+  // The function is OUT OF SCOPE for AutoFuse v0 (a non-tensor compute output or a
+  // dynamic/symbolic tensor shape) — the caller must leave it for legacy lowering. This
+  // is NOT a user error (both are legal signatures), so it is a graceful decline, not a
+  // CHECK: an auto_fuse-marked function with a symbolic dim must still compile.
+  bool declined() const { return declined_; }
+
   void Build(const FunctionPtr& func, const ProgramPtr& prog) {
     problem.fast_memory_capacity = kFastMemoryCapacity;
     // Topology + on-chip capacities from the configured backend's SoC (the safe
@@ -267,7 +273,11 @@ class ProblemBuilder {
     for (size_t i = 0; i < func->params_.size(); ++i) {
       if (i < func->param_directions_.size() && func->param_directions_[i] == ParamDirection::In) {
         in_params_.insert(func->params_[i].get());
-        TensorId(func->params_[i]);
+        // Only tensor-typed In-params are tiled tensors in the solver's model; a scalar
+        // In-param (e.g. a broadcast scale) is an operand carried through the emit as-is,
+        // never a tracked tensor -> skip it. Registering it would trip TensorId's
+        // tensor-type decline and needlessly abandon a fusable function.
+        if (As<TensorType>(func->params_[i]->GetType()) != nullptr) TensorId(func->params_[i]);
       }
     }
 
@@ -329,6 +339,7 @@ class ProblemBuilder {
   std::unordered_map<const Var*, size_t> tensor_index_;
   std::unordered_map<const Stmt*, size_t> stmt_output_;
   std::unordered_set<const Var*> in_params_;
+  bool declined_ = false;
 
   size_t TensorId(const VarPtr& var) {
     const Var* raw = var.get();
@@ -337,21 +348,28 @@ class ProblemBuilder {
       return it->second;
     }
     auto tt = As<TensorType>(var->GetType());
-    CHECK(tt != nullptr) << "AutoFuse: variable '" << var->name_hint_ << "' is not tensor-typed";
-    int64_t w = 0;
-    int64_t h = 0;
-    ShapeWH(tt, &w, &h);
+    int64_t w = 1;
+    int64_t h = 1;
+    // Out of scope for v0 (non-tensor compute output, or a dynamic/symbolic shape): mark the
+    // function declined rather than CHECK-crashing. A placeholder tensor still gets registered
+    // so tensor indices stay consistent for the remainder of the (now-discarded) build.
+    if (tt == nullptr || !ShapeWH(tt, &w, &h)) declined_ = true;
     const size_t idx = problem.tensors.size();
-    problem.tensors.push_back(::Tensor{w, h, MapSolverDType(tt->dtype_)});
+    problem.tensors.push_back(::Tensor{w, h, MapSolverDType(tt != nullptr ? tt->dtype_ : DataType::FP32)});
     tensor_index_[raw] = idx;
     return idx;
   }
 
-  static void ShapeWH(const TensorTypePtr& tt, int64_t* w, int64_t* h) {
+  // Returns false (and leaves *w,*h at a safe placeholder) if any dim is dynamic/symbolic.
+  static bool ShapeWH(const TensorTypePtr& tt, int64_t* w, int64_t* h) {
     const auto& shape = tt->shape_;
+    bool ok = true;
     auto dim = [&](size_t i) -> int64_t {
       auto ci = As<ConstInt>(shape[i]);
-      CHECK(ci != nullptr) << "AutoFuse: dynamic/symbolic tensor shapes are out of scope for v0";
+      if (ci == nullptr) {  // dynamic/symbolic -> out of scope for v0
+        ok = false;
+        return 1;
+      }
       return ci->value_;
     };
     if (shape.size() >= 2) {
@@ -364,6 +382,7 @@ class ProblemBuilder {
       *w = 1;
       *h = 1;
     }
+    return ok;
   }
 };
 
@@ -616,8 +635,7 @@ static StmtPtr SpmdWrap(const VarPtr& t, std::vector<StmtPtr> body, const ExprPt
 std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, SolverTile tile,
                                               const std::string& name) {
   auto call = As<Call>(assign->value_);
-  if (call == nullptr || call->op_ == nullptr || call->op_->name_ != "tensor.matmul" ||
-      call->args_.size() != 2) {
+  if (call == nullptr || !IsOp(call, "tensor.matmul") || call->args_.size() != 2) {
     return std::nullopt;
   }
   const ExprPtr a = call->args_[0];
@@ -1113,7 +1131,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   int64_t h = pin_m ? IM : ((tile.h > 0 && tile.h < IM) ? tile.h : IM);
   int64_t w = pin_n ? IN : ((tile.w > 0 && tile.w < IN) ? tile.w : IN);
   const int64_t num_m = (IM + h - 1) / h, num_n = (IN + w - 1) / w;  // ceil
-  if (num_m == 1 && num_n == 1) return std::nullopt;
+  // A single spatial tile is left to the legacy tiler — UNLESS the solver split the reduced
+  // axis (tile.split>1): then the S2 path below still needs to run (the split is what fills the
+  // cores, and for a large reduced axis it is what makes the per-core slice fit UB).
+  if (num_m == 1 && num_n == 1 && tile.split <= 1) return std::nullopt;
 
   // A4 (reduction rule): the reduced axis must be PINNED FULL in the tile, else a
   // per-tile reduction would cover only part of the axis (partial reduction = wrong
@@ -1306,51 +1327,65 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // S2 — SUM col-reduction split. When the solver gangs S cores per free tile (tile.split>1)
   // to parallelize a reduction, partition the reduced M axis across S cores: each reduces its
   // disjoint M-slice to a [1,w] partial, and the S partials ATOMIC-ADD into a zero-seeded [1,N]
-  // output (same seed+atomic structure as matmul split-K). Scoped to what is realizable today:
-  // the sink IS a `col_sum` (only kAdd is a lowered AtomicType, and emit_strip slices rows = a
-  // col reduction's reduced axis). S is rounded to a divisor of IM so the partition is clean
-  // (disjoint, no double-count); a ragged S would need per-slice valid extents. Anything else
-  // (max/min, row-reduction split, reduction-feeds-pointwise) falls through to the non-split body.
+  // output (same seed+atomic structure as matmul split-K). Realized ONLY for a clean partition:
+  //   - the sink IS a `col_sum` (kAdd is the only lowered AtomicType; emit_strip slices rows =
+  //     the reduced axis of a col reduction),
+  //   - S == tile.split EXACTLY with IM % S == 0, and
+  //   - IN % w == 0 (non-overlapping free tiles).
+  // Why BOTH exact-divisibility conditions are REQUIRED, not conservative — under R1 (one SPMD
+  // body compiled for every block) a ragged split has NO safe realization when the merge is
+  // ATOMIC-ADD:
+  //   - Reduced axis, IM % S != 0: rsz=ceil gives S disjoint row-slices whose last one runs
+  //     past IM. Clamping its offset in-bounds (the pointwise trick) OVERLAPS the prior slice ->
+  //     atomic-add double-counts the overlapped rows; NOT clamping it reads past the source
+  //     tensor -> out-of-bounds DMA. (The elementwise path tolerates the clamp overlap only
+  //     because its assemble is NON-atomic/idempotent.) So a ragged reduced split is unrealizable.
+  //   - Free axis, IN % w != 0: same overlap, same atomic double-count on the tail column band.
+  // The costed split is therefore trusted EXACTLY (never rounded to a nearby divisor — that would
+  // enlarge each slice and break the solver's UB-fit proof). A non-dividing S falls through to the
+  // CORRECT non-split body; the solver SHOULD only ever cost a realizable S (a divisor of the
+  // reduced extent) so this fallthrough is never hit for a split that was NEEDED to fit UB. It
+  // currently CAN be: the solver draws vector S from divisors of 2*num_cores capped by
+  // reduced_extent/16 (mlsys26 ascend910b_cost.cpp:890), NOT divisors of the reduced extent as
+  // matmul split-K does (id.:1659) -- so e.g. col_sum[128,256] is costed at S=6 (6 | 96 cores,
+  // 6 ∤ 128) and declines to non-split here, losing the costed parallelism (correct, just serial).
+  // FOLLOW-UP (solver, cost-model change -> needs re-benchmark): constrain vector S to divisors of
+  // the reduced fractal count, mirroring the matmul kfrac gate, to close this fidelity gap.
+  // Everything else (max/min, row-reduction split, reduction-feeds-pointwise) also falls through.
   if (tile.split > 1 && pin_m && As<Call>(out_stmt->value_) &&
-      IsOp(As<Call>(out_stmt->value_), "tensor.col_sum")) {
-    int64_t S = 1;
-    for (int64_t d = std::min<int64_t>(tile.split, IM); d >= 2; --d)
-      if (IM % d == 0) { S = d; break; }
-    if (S >= 2) {
-      const int64_t rsz = IM / S;  // disjoint reduced-axis slice per core (IM % S == 0)
-      auto index_ty = std::make_shared<ScalarType>(DataType::INDEX);
-      // Seed: zero each [1,w] output tile (disjoint -> non-atomic), tiled over the num_n free tiles,
-      // so a large [1,N] output never materializes in one core's UB.
-      auto zero = std::make_shared<ConstFloat>(0.0, dtype, sp);
-      auto st = std::make_shared<Var>(base + "_st", index_ty, sp);
-      ExprPtr s_ni = MakeMul(st, MakeIndex(w, sp), sp);
-      if (IN % w != 0) s_ni = MakeMin(s_ni, MakeIndex(IN - w, sp), sp);
-      auto z_call = reg.Create("tensor.full", {MakeIndexTuple({M, w}, sp), zero}, {{"dtype", dtype}}, sp);
-      auto z = std::make_shared<Var>(base + "_z", z_call->GetType(), sp);
-      auto seed_asm = reg.Create("tensor.assemble", {c_init, z, MakeTuple2(MakeIndex(0, sp), s_ni, sp)}, sp);
-      auto c_seeded = std::make_shared<Var>(base + "_seeded", seed_asm->GetType(), sp);
-      auto seed_scope = SpmdWrap(st,
-                                 std::vector<StmtPtr>{std::make_shared<AssignStmt>(z, z_call, sp),
-                                                      std::make_shared<AssignStmt>(c_seeded, seed_asm, sp)},
-                                 MakeIndex(num_n, sp), name + "_seed", sp);
-      // Main grid: t in [0, num_n*S). ks = t % S (M-slice), fidx = t / S (free N tile).
-      auto t2 = std::make_shared<Var>(base + "_t", index_ty, sp);
-      auto ks = MakeFloorMod(t2, MakeIndex(S, sp), sp);
-      auto fidx = MakeFloorDiv(t2, MakeIndex(S, sp), sp);
-      ExprPtr r_mi = MakeMul(ks, MakeIndex(rsz, sp), sp);      // disjoint reduced-M slice offset
-      ExprPtr sni = MakeMul(fidx, MakeIndex(w, sp), sp);       // free-N tile offset (ceil clamp on ragged N)
-      if (IN % w != 0) sni = MakeMin(sni, MakeIndex(IN - w, sp), sp);
-      std::vector<StmtPtr> sbody;
-      std::unordered_map<const Var*, VarPtr> oc_split;
-      VarPtr part = emit_strip(rsz, r_mi, sni, sbody, oc_split);  // [1,w] partial col_sum over the M-slice
-      auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_seeded), part, MakeTuple2(MakeIndex(0, sp), sni, sp)},
-                                 {{"atomic", 1}}, sp);
-      sbody.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
-      auto scope = SpmdWrap(t2, std::move(sbody), MakeIndex(num_n * S, sp), name, sp);
-      LOG_INFO << "AutoFuse[generic]: SUM col-reduction group '" << name << "' split " << S
-               << " ways over the reduced axis (S2, atomic-add merge)";
-      return std::vector<StmtPtr>{c_init_assign, seed_scope, scope};
-    }
+      IsOp(As<Call>(out_stmt->value_), "tensor.col_sum") && IM % tile.split == 0 && IN % w == 0) {
+    const int64_t S = tile.split;               // emit exactly the costed split (no rounding)
+    const int64_t rsz = IM / S;                 // disjoint reduced-axis slice per core (IM % S == 0)
+    auto index_ty = std::make_shared<ScalarType>(DataType::INDEX);
+    // Seed: zero each [1,w] output tile (disjoint + non-overlapping since IN % w == 0), tiled over
+    // the num_n free tiles, so a large [1,N] output never materializes in one core's UB.
+    auto zero = std::make_shared<ConstFloat>(0.0, dtype, sp);
+    auto st = std::make_shared<Var>(base + "_st", index_ty, sp);
+    ExprPtr s_ni = MakeMul(st, MakeIndex(w, sp), sp);
+    auto z_call = reg.Create("tensor.full", {MakeIndexTuple({M, w}, sp), zero}, {{"dtype", dtype}}, sp);
+    auto z = std::make_shared<Var>(base + "_z", z_call->GetType(), sp);
+    auto seed_asm = reg.Create("tensor.assemble", {c_init, z, MakeTuple2(MakeIndex(0, sp), s_ni, sp)}, sp);
+    auto c_seeded = std::make_shared<Var>(base + "_seeded", seed_asm->GetType(), sp);
+    auto seed_scope = SpmdWrap(st,
+                               std::vector<StmtPtr>{std::make_shared<AssignStmt>(z, z_call, sp),
+                                                    std::make_shared<AssignStmt>(c_seeded, seed_asm, sp)},
+                               MakeIndex(num_n, sp), name + "_seed", sp);
+    // Main grid: t in [0, num_n*S). ks = t % S (M-slice), fidx = t / S (free N tile).
+    auto t2 = std::make_shared<Var>(base + "_t", index_ty, sp);
+    auto ks = MakeFloorMod(t2, MakeIndex(S, sp), sp);
+    auto fidx = MakeFloorDiv(t2, MakeIndex(S, sp), sp);
+    ExprPtr r_mi = MakeMul(ks, MakeIndex(rsz, sp), sp);   // disjoint reduced-M slice offset
+    ExprPtr sni = MakeMul(fidx, MakeIndex(w, sp), sp);    // free-N tile offset (exact, no overlap)
+    std::vector<StmtPtr> sbody;
+    std::unordered_map<const Var*, VarPtr> oc_split;
+    VarPtr part = emit_strip(rsz, r_mi, sni, sbody, oc_split);  // [1,w] partial col_sum over the M-slice
+    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_seeded), part, MakeTuple2(MakeIndex(0, sp), sni, sp)},
+                               {{"atomic", 1}}, sp);
+    sbody.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+    auto scope = SpmdWrap(t2, std::move(sbody), MakeIndex(num_n * S, sp), name, sp);
+    LOG_INFO << "AutoFuse[generic]: SUM col-reduction group '" << name << "' split " << S
+             << " ways over the reduced axis (S2, atomic-add merge)";
+    return std::vector<StmtPtr>{c_init_assign, seed_scope, scope};
   }
 
   // Software-pipelining: chunk the FREE axis into strips and emit a ForKind::Pipeline loop threading
@@ -1491,11 +1526,8 @@ std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1,
                                                       const std::string& name) {
   auto c1 = As<Call>(mm1->value_);  // T = matmul(A, B)
   auto c2 = As<Call>(mm2->value_);  // C = matmul(T, D)
-  if (c1 == nullptr || c2 == nullptr || c1->op_ == nullptr || c2->op_ == nullptr) {
-    return std::nullopt;
-  }
-  if (c1->op_->name_ != "tensor.matmul" || c2->op_->name_ != "tensor.matmul" ||
-      c1->args_.size() != 2 || c2->args_.size() != 2) {
+  if (c1 == nullptr || c2 == nullptr || !IsOp(c1, "tensor.matmul") ||
+      !IsOp(c2, "tensor.matmul") || c1->args_.size() != 2 || c2->args_.size() != 2) {
     return std::nullopt;
   }
   const ExprPtr A = c1->args_[0];
@@ -1604,7 +1636,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
     auto a = As<AssignStmt>(s);
     if (a == nullptr) return nullptr;
     auto c = As<Call>(a->value_);
-    if (c == nullptr || c->op_ == nullptr || c->op_->name_ != "tensor.matmul" || c->args_.size() != 2) {
+    if (c == nullptr || !IsOp(c, "tensor.matmul") || c->args_.size() != 2) {
       return nullptr;
     }
     return c;
@@ -1854,6 +1886,11 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
   // and DISTINCT (two returns aliasing one buffer -> bail).
   auto seq = As<SeqStmts>(func->body_);
   if (seq == nullptr) return;
+  // Index the top-level children ONCE (O(N)) so the per-return "is this create a top-level
+  // child?" test is an O(1) lookup, not an O(N) scan -> the loop is O(R) not O(R*N).
+  std::unordered_set<const Stmt*> top_level;
+  top_level.reserve(seq->stmts_.size());
+  for (const StmtPtr& s : seq->stmts_) top_level.insert(s.get());
   std::vector<AssignStmtPtr> creates;
   std::unordered_set<const Stmt*> create_set;
   for (const ExprPtr& rv : idx.ret->value_) {
@@ -1861,9 +1898,7 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
     if (!ret_var) return;
     auto ca = trace_to_create(ret_var);
     if (!ca) return;
-    const bool at_top = std::any_of(seq->stmts_.begin(), seq->stmts_.end(),
-                                    [&](const StmtPtr& s) { return s.get() == ca.get(); });
-    if (!at_top) return;
+    if (top_level.count(ca.get()) == 0) return;       // create not a removable top-level child
     if (!create_set.insert(ca.get()).second) return;  // returns share a buffer -> aliasing, bail
     creates.push_back(ca);
   }
@@ -1927,7 +1962,9 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     }
     ProblemBuilder builder;
     builder.Build(func, prog);
-    if (builder.problem.ops.empty()) {
+    // Empty problem (no compute ops) or out-of-scope (non-tensor output / dynamic shape)
+    // -> leave the function untouched for legacy lowering.
+    if (builder.declined() || builder.problem.ops.empty()) {
       new_functions.emplace(gvar, func);
       continue;
     }
