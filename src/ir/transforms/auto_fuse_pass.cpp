@@ -1813,74 +1813,77 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
   } idx;
   idx.VisitStmt(func->body_);
 
-  if (!idx.ret || idx.ret->value_.size() != 1) return;  // single-tensor return only
-  auto ret_var = AsVarLike(idx.ret->value_[0]);
-  if (!ret_var) return;
+  if (!idx.ret || idx.ret->value_.empty()) return;
 
-  // Trace the returned var back to the output buffer's `tensor.create`, through
-  // SSA rebinds, tensor.assemble / set_validshape (arg0), tile.store (arg2), and
-  // for-loop carries. The create's AssignStmt is `c_init`.
-  const Var* cur = ret_var.get();
-  std::unordered_set<const Var*> seen;
-  AssignStmtPtr create_assign;
-  while (cur != nullptr) {
-    if (!seen.insert(cur).second) break;
-    if (auto it = idx.carry.find(cur); it != idx.carry.end()) {
-      cur = it->second;
-      continue;
-    }
-    auto dit = idx.var_def.find(cur);
-    if (dit == idx.var_def.end()) break;
-    const ExprPtr& val = dit->second->value_;
-    if (auto rv = AsVarLike(val)) {
-      cur = rv.get();
-      continue;
-    }
-    auto call = As<Call>(val);
-    if (call == nullptr) break;
-    if (IsOp(call, "tensor.create")) {
-      create_assign = dit->second;
+  // Trace a returned var back to its output buffer's `tensor.create`, through SSA rebinds,
+  // tensor.assemble / set_validshape (arg0), tile.store (arg2), and for-loop carries. The
+  // create's AssignStmt is that output's `c_init`; returns nullptr if it can't be reached.
+  auto trace_to_create = [&](const VarPtr& ret_var) -> AssignStmtPtr {
+    const Var* cur = ret_var.get();
+    std::unordered_set<const Var*> seen;
+    while (cur != nullptr) {
+      if (!seen.insert(cur).second) break;
+      if (auto it = idx.carry.find(cur); it != idx.carry.end()) { cur = it->second; continue; }
+      auto dit = idx.var_def.find(cur);
+      if (dit == idx.var_def.end()) break;
+      const ExprPtr& val = dit->second->value_;
+      if (auto rv = AsVarLike(val)) { cur = rv.get(); continue; }
+      auto call = As<Call>(val);
+      if (call == nullptr) break;
+      if (IsOp(call, "tensor.create")) return dit->second;
+      if (IsOp(call, "tensor.assemble") || IsOp(call, "tensor.set_validshape")) {
+        auto a0 = !call->args_.empty() ? AsVarLike(call->args_[0]) : nullptr;
+        if (!a0) break;
+        cur = a0.get();
+        continue;
+      }
+      if (IsOp(call, "tile.store")) {
+        auto a2 = call->args_.size() >= 3 ? AsVarLike(call->args_[2]) : nullptr;
+        if (!a2) break;
+        cur = a2.get();
+        continue;
+      }
       break;
     }
-    if (IsOp(call, "tensor.assemble") || IsOp(call, "tensor.set_validshape")) {
-      auto a0 = !call->args_.empty() ? AsVarLike(call->args_[0]) : nullptr;
-      if (!a0) break;
-      cur = a0.get();
-      continue;
-    }
-    if (IsOp(call, "tile.store")) {
-      auto a2 = call->args_.size() >= 3 ? AsVarLike(call->args_[2]) : nullptr;
-      if (!a2) break;
-      cur = a2.get();
-      continue;
-    }
-    break;
-  }
-  if (!create_assign) return;  // could not reach the output buffer's create
+    return nullptr;
+  };
 
-  // The create MUST be a direct child of the top-level body SeqStmts (the
-  // emitters return it as one) so removing it is safe. If not, abort the lift —
-  // never append a param without dropping its create (would leave two live
-  // buffers: the param and the still-allocated create).
+  // Trace EVERY returned tensor to its output buffer's create. All-or-nothing: a partial
+  // lift (some returns wired, some not) would leave an inconsistent ABI, so bail on any
+  // return we can't wire. Each buffer's create must be a top-level child (safe to remove)
+  // and DISTINCT (two returns aliasing one buffer -> bail).
   auto seq = As<SeqStmts>(func->body_);
   if (seq == nullptr) return;
-  const bool at_top = std::any_of(seq->stmts_.begin(), seq->stmts_.end(),
-                                  [&](const StmtPtr& s) { return s.get() == create_assign.get(); });
-  if (!at_top) return;
+  std::vector<AssignStmtPtr> creates;
+  std::unordered_set<const Stmt*> create_set;
+  for (const ExprPtr& rv : idx.ret->value_) {
+    auto ret_var = AsVarLike(rv);
+    if (!ret_var) return;
+    auto ca = trace_to_create(ret_var);
+    if (!ca) return;
+    const bool at_top = std::any_of(seq->stmts_.begin(), seq->stmts_.end(),
+                                    [&](const StmtPtr& s) { return s.get() == ca.get(); });
+    if (!at_top) return;
+    if (!create_set.insert(ca.get()).second) return;  // returns share a buffer -> aliasing, bail
+    creates.push_back(ca);
+  }
 
-  // Move c_init from the tensor.create binding into an appended Out param (same
-  // Var -> body references still resolve), and drop the now-dead create.
-  func->params_.push_back(create_assign->var_);
-  func->param_directions_.push_back(ParamDirection::Out);
+  // Append an Out param per returned buffer (in return order — the harness binds by
+  // position), moving each c_init Var from its create into the param list, and drop the
+  // now-dead creates. The return lineage rebinds each return to its Out param.
+  for (const auto& ca : creates) {
+    func->params_.push_back(ca->var_);
+    func->param_directions_.push_back(ParamDirection::Out);
+  }
   std::vector<StmtPtr> kept;
   kept.reserve(seq->stmts_.size());
   for (const StmtPtr& s : seq->stmts_) {
-    if (s.get() != create_assign.get()) kept.push_back(s);
+    if (create_set.count(s.get()) == 0) kept.push_back(s);
   }
   func->body_ = SeqStmts::Flatten(std::move(kept), seq->span_);
 
-  LOG_INFO << "AutoFuse[" << func->name_ << "]: wired return -> appended Out param '"
-           << create_assign->var_->name_hint_ << "' (device/harness binds output by param)";
+  LOG_INFO << "AutoFuse[" << func->name_ << "]: wired " << creates.size()
+           << " return(s) -> appended Out param(s) (device/harness binds outputs by param)";
 }
 
 ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
