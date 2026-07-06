@@ -248,6 +248,11 @@ SM_M, SM_N = 256, 128       # softmax: ragged M=256 (h tile padded); reduced N=1
 RMS_M, RMS_N = 256, 512     # RMSNorm: aligned; one reduction (row_sum of squares) + broadcast
 LN_M, LN_N = 256, 512       # LayerNorm: aligned; two reductions (mean + variance) + broadcast
 NORM_EPS = 1.0e-6
+WS_M, WS_N = 64, 4096       # wide-short pointwise: the free-axis over-pad overflow case
+TL_M, TL_N = 4096, 64       # tall pointwise: many free-axis strips
+SMR_M, SMR_N = 256, 66      # softmax ragged reduced N (padded reduced axis)
+RRB_M, RRB_N = 256, 128     # row-reduce + broadcast (reduction intermediate, no div)
+F16_M, F16_N = 256, 128     # FP16 softmax (granule g=16)
 
 
 class AutoFuseRaggedPointwiseCase(PTOTestCase):
@@ -401,6 +406,178 @@ class AutoFuseLayerNormCase(PTOTestCase):
         tensors["out"][:] = xc * torch.rsqrt(xc.pow(2).mean(-1, keepdim=True) + NORM_EPS)
 
 
+class AutoFusePwWideShortCase(PTOTestCase):
+    """Wide-short pointwise [64,4096]: the free-axis over-pad case. Rows are the FREE
+    (row-major) axis → must NOT be granule-padded; before the fix this overflowed UB."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pw_wide_short_64x4096"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [WS_M, WS_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b", [WS_M, WS_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [WS_M, WS_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw(self, a: pl.Tensor[[WS_M, WS_N], pl.FP32], b: pl.Tensor[[WS_M, WS_N], pl.FP32]) -> pl.Tensor[[WS_M, WS_N], pl.FP32]:
+                c: pl.Tensor[[WS_M, WS_N], pl.FP32] = pl.add(a, b)
+                d: pl.Tensor[[WS_M, WS_N], pl.FP32] = pl.mul(c, b)
+                return d
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = (tensors["a"] + tensors["b"]) * tensors["b"]
+
+
+class AutoFusePwTallCase(PTOTestCase):
+    """Tall pointwise [4096,64]: many free-axis strips."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pw_tall_4096x64"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [TL_M, TL_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b", [TL_M, TL_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [TL_M, TL_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw(self, a: pl.Tensor[[TL_M, TL_N], pl.FP32], b: pl.Tensor[[TL_M, TL_N], pl.FP32]) -> pl.Tensor[[TL_M, TL_N], pl.FP32]:
+                c: pl.Tensor[[TL_M, TL_N], pl.FP32] = pl.add(a, b)
+                d: pl.Tensor[[TL_M, TL_N], pl.FP32] = pl.mul(c, b)
+                return d
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = (tensors["a"] + tensors["b"]) * tensors["b"]
+
+
+class AutoFuseSoftmaxRaggedNCase(PTOTestCase):
+    """Softmax [256,66]: ragged REDUCED axis N=66 (padded). Reduction honors valid."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_softmax_ragged_256x66"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [SMR_M, SMR_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [SMR_M, SMR_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[SMR_M, SMR_N], pl.FP32]) -> pl.Tensor[[SMR_M, SMR_N], pl.FP32]:
+                m: pl.Tensor[[SMR_M, 1], pl.FP32] = pl.row_max(x)
+                s: pl.Tensor[[SMR_M, SMR_N], pl.FP32] = pl.sub(x, m)
+                e: pl.Tensor[[SMR_M, SMR_N], pl.FP32] = pl.exp(s)
+                d: pl.Tensor[[SMR_M, 1], pl.FP32] = pl.row_sum(e)
+                o: pl.Tensor[[SMR_M, SMR_N], pl.FP32] = pl.div(e, d)
+                return o
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = torch.softmax(tensors["x"], dim=1)
+
+
+class AutoFuseRowReduceBroadcastCase(PTOTestCase):
+    """row_max + broadcast subtract [256,128]: y = x - row_max(x). Reduction intermediate
+    broadcast back to [M,N], no division — isolates the reduction+broadcast path."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_row_reduce_broadcast_256x128"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [RRB_M, RRB_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [RRB_M, RRB_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def f(self, x: pl.Tensor[[RRB_M, RRB_N], pl.FP32]) -> pl.Tensor[[RRB_M, RRB_N], pl.FP32]:
+                m: pl.Tensor[[RRB_M, 1], pl.FP32] = pl.row_max(x)
+                y: pl.Tensor[[RRB_M, RRB_N], pl.FP32] = pl.sub(x, m)
+                return y
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        tensors["out"][:] = x - x.amax(dim=1, keepdim=True)
+
+
+class AutoFuseFp16SoftmaxCase(PTOTestCase):
+    """FP16 softmax [256,128]: exercises the FP16 granule (g=16 elements = 32 bytes)."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_fp16_softmax_256x128"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [F16_M, F16_N], DataType.FP16, init_value=torch.randn),
+            TensorSpec("out", [F16_M, F16_N], DataType.FP16, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[F16_M, F16_N], pl.FP16]) -> pl.Tensor[[F16_M, F16_N], pl.FP16]:
+                m: pl.Tensor[[F16_M, 1], pl.FP16] = pl.row_max(x)
+                s: pl.Tensor[[F16_M, F16_N], pl.FP16] = pl.sub(x, m)
+                e: pl.Tensor[[F16_M, F16_N], pl.FP16] = pl.exp(s)
+                d: pl.Tensor[[F16_M, 1], pl.FP16] = pl.row_sum(e)
+                o: pl.Tensor[[F16_M, F16_N], pl.FP16] = pl.div(e, d)
+                return o
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        tensors["out"][:] = torch.softmax(x.float(), dim=1).to(x.dtype)
+
+
 class TestAutoFuseDevice:
     """AutoFuse on device: the reduction-valid probe + free-axis padding numerics."""
 
@@ -457,6 +634,31 @@ class TestAutoFuseDevice:
     def test_autofuse_layernorm(self, test_runner, platform):
         result = test_runner.run(AutoFuseLayerNormCase(platform=platform))
         assert result.passed, f"AutoFuse LayerNorm [256,512] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_pw_wide_short(self, test_runner, platform):
+        result = test_runner.run(AutoFusePwWideShortCase(platform=platform))
+        assert result.passed, f"AutoFuse wide-short pointwise [64,4096] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_pw_tall(self, test_runner, platform):
+        result = test_runner.run(AutoFusePwTallCase(platform=platform))
+        assert result.passed, f"AutoFuse tall pointwise [4096,64] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_softmax_ragged_n(self, test_runner, platform):
+        result = test_runner.run(AutoFuseSoftmaxRaggedNCase(platform=platform))
+        assert result.passed, f"AutoFuse softmax ragged-N [256,66] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_row_reduce_broadcast(self, test_runner, platform):
+        result = test_runner.run(AutoFuseRowReduceBroadcastCase(platform=platform))
+        assert result.passed, f"AutoFuse row-reduce+broadcast [256,128] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_fp16_softmax(self, test_runner, platform):
+        result = test_runner.run(AutoFuseFp16SoftmaxCase(platform=platform))
+        assert result.passed, f"AutoFuse FP16 softmax [256,128] mismatch on device: {result.error}"
 
 
 if __name__ == "__main__":
