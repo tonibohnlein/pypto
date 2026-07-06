@@ -326,6 +326,26 @@ class TestAutoFuseEmitGolden:
         a = torch.randn(256, 100)
         _emit_matches_reference(Prog, "cs", (a,), a.sum(dim=0, keepdim=True))
 
+    def test_col_sum_split_atomic_merge(self, ascend_backend):
+        """Bare col_sum sink on a CLEAN shape (M=128, N=256) where the solver splits the
+        reduced axis across cores (now S=8, a divisor of the reduced fractal count 128/16=8,
+        so IM/S=16 is granule-aligned and the split is emit-realizable). Exercises the S2
+        atomic-add merge itself: S disjoint 16-row partials zero-seeded then atomic-added into
+        the [1,256] output. Looser tolerance because atomic-add reassociates the partials vs.
+        the single unfused reduction (same as split-K matmul)."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def cs(self, a: pl.Tensor[[128, 256], pl.FP32]) -> pl.Tensor[[1, 256], pl.FP32]:
+                c: pl.Tensor[[1, 256], pl.FP32] = pl.col_sum(a)
+                return c
+
+        torch.manual_seed(13)
+        a = torch.randn(128, 256)
+        _emit_matches_reference(Prog, "cs", (a,), a.sum(dim=0, keepdim=True), rtol=1e-4, atol=1e-4)
+
     def test_scalar_param_broadcast(self, ascend_backend):
         """A scalar In-param (broadcast scale) carried as an operand, not a tiled tensor. Before
         the fix, registering it as a solver tensor CHECK-crashed the whole compile ('not
