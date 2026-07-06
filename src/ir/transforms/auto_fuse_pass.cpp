@@ -1182,7 +1182,16 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // and return the SINK strip tile. Shared by the serial body and the software-pipeline loop body,
   // so both realize the same slice-and-replay per strip.
   auto emit_strip = [&](int64_t sh, const ExprPtr& smi, std::vector<StmtPtr>& out) -> VarPtr {
-    const int64_t sh_al = AlignUp(sh, g);
+    // The 32B DMA granule is on the CONTIGUOUS axis only; the other (free) axis has
+    // granule 1 (see ascend910b_cost.cpp: "free row axis tiles at 1 element, the
+    // contiguous width axis at the 32-byte DMA block"). So pad the row axis ONLY when
+    // rows are contiguous — i.e. the tile is col-major, which a reduction group is
+    // (softmax/norms). A pure pointwise tile is row-major (cols contiguous) → rows are
+    // the FREE axis and need no padding; padding them is the [64,4096] over-fetch that
+    // overflows UB. `has_reduction` is an interim proxy for the tile layout, which is
+    // not decided until InferTileMemorySpace; the layout-exact version belongs in a
+    // post-layout padding pass (which also fixes the legacy tilers — KNOWN_ISSUES).
+    const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
     const bool strip_ragged = (sh_al != sh) || (w_al != w);
     std::unordered_map<const Var*, VarPtr> onchip;       // intermediate -> on-chip tile
     std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [sh,w] slice
