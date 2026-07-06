@@ -165,7 +165,11 @@ def test_nested_call_arg_preserves_call_codegen():
     func = _simple_function("f", [hidden_states], assign)
     code = torch_codegen(func)
 
-    assert "_tensor_slice(hidden_states, (0, 0), (16, 512)).to(torch.float32)" in code
+    # The nested arg emits the slice expression (valid-aware: wrapped in
+    # _prop_valid so a padded slice keeps its valid extent) with the cast
+    # applied to the whole slice — never to a bare offset tuple.
+    assert "_tensor_slice(hidden_states, (0, 0), (16, 512))" in code
+    assert ".to(torch.float32)" in code
     assert "(0, 0).to(torch.float32)" not in code
 
 
@@ -177,7 +181,11 @@ def test_tensor_row_reduction():
     assign = ir.AssignStmt(out, call, _span())
     func = _simple_function("f", [a], assign)
     code = torch_codegen(func)
-    assert ".sum(dim=-1, keepdim=True)" in code
+    # Tensor-level reductions are valid-aware (a ragged-padded tensor must sum
+    # only its valid extent), so they route through the _reduce_valid helper
+    # rather than a bare torch .sum(). (Tile reductions stay .sum(dim=...) — see
+    # test_tile_reduction_with_axis.)
+    assert "_reduce_valid(a, 'sum', -1)" in code
 
 
 # ---------------------------------------------------------------------------
