@@ -1554,7 +1554,8 @@ std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1,
 // InCoreScopeStmt. The body is already in SSA dependency order.
 StmtPtr EmitFusedScopes(const StmtPtr& body,
                         const std::unordered_map<const Stmt*, size_t>& stmt_group,
-                        const std::unordered_map<const Stmt*, SolverTile>& stmt_tile) {
+                        const std::unordered_map<const Stmt*, SolverTile>& stmt_tile,
+                        const std::unordered_map<const Stmt*, size_t>& stmt_exec) {
   std::vector<StmtPtr> body_stmts;
   if (auto seq = As<SeqStmts>(body)) {
     body_stmts = seq->stmts_;
@@ -1606,6 +1607,18 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
     if (run.empty()) {
       return;
     }
+    // Replay the group in the solver's EXECUTION ORDER (its depth-first pebbling order),
+    // NOT the SSA/body order. That order is what the cost model evaluated the working-set
+    // peak against, so it is the only order guaranteed to fit UB — any other valid topo
+    // order may exceed it. stable_sort keeps SSA order as the tie-break for ops the solver
+    // left mutually unordered (and for any stmt missing from the map, defensively).
+    std::stable_sort(run.begin(), run.end(), [&](const StmtPtr& a, const StmtPtr& b) {
+      auto ia = stmt_exec.find(a.get());
+      auto ib = stmt_exec.find(b.get());
+      const size_t pa = ia != stmt_exec.end() ? ia->second : 0;
+      const size_t pb = ib != stmt_exec.end() ? ib->second : 0;
+      return pa < pb;
+    });
     const Span scope_span = run.front()->span_;
     const std::string nm = "fused_" + std::to_string(run_group);
     // A run of fused pointwise ops gets the solver's [w,h] cross-core tiling
@@ -1957,6 +1970,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     // matmuls — the output `[w,h]` tiling + the per-tile k-pipeline.
     std::unordered_map<const Stmt*, size_t> stmt_group;
     std::unordered_map<const Stmt*, SolverTile> stmt_tile;  // group's [w,h,k] tile, for matmul tiling
+    std::unordered_map<const Stmt*, size_t> stmt_exec;      // solver's per-group pebbling order
     for (size_t s = 0; s < sol.num_steps(); ++s) {
       const ::TileConfig& cfg = sol.step(s).config;
       const SolverTile tile{cfg.w, cfg.h, cfg.k, sol.step_cost(s).parallel_split,
@@ -1966,9 +1980,15 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
         stmt_group[stmt] = s;
         stmt_tile[stmt] = tile;
       }
+      // The solver's execution_order() is the depth-first pebbling order it costed the
+      // working-set peak along — the order the emit MUST replay to stay within UB.
+      const std::vector<size_t>& exec = sol.step(s).subgraph.execution_order();
+      for (size_t pos = 0; pos < exec.size(); ++pos) {
+        stmt_exec[builder.op_stmts[exec[pos]]] = pos;
+      }
     }
     auto new_func = MutableCopy(func);
-    new_func->body_ = EmitFusedScopes(func->body_, stmt_group, stmt_tile);
+    new_func->body_ = EmitFusedScopes(func->body_, stmt_group, stmt_tile, stmt_exec);
     // Wire the return-based fused function to a named Out param so orchestration
     // codegen emits an add_output write-back (device / ST harness bind output by
     // param position, not by return value). No-op for functions that already
