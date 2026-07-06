@@ -1249,12 +1249,14 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // The 32B DMA granule is on the CONTIGUOUS axis only; the other (free) axis has
     // granule 1 (see ascend910b_cost.cpp: "free row axis tiles at 1 element, the
     // contiguous width axis at the 32-byte DMA block"). So pad the row axis ONLY when
-    // rows are contiguous — i.e. the tile is col-major, which a reduction group is
-    // (softmax/norms). A pure pointwise tile is row-major (cols contiguous) → rows are
-    // the FREE axis and need no padding; padding them is the [64,4096] over-fetch that
-    // overflows UB. `has_reduction` is an interim proxy for the tile layout, which is
-    // not decided until InferTileMemorySpace; the layout-exact version belongs in a
-    // post-layout padding pass (which also fixes the legacy tilers — KNOWN_ISSUES).
+    // rows are contiguous — i.e. the tile is col-major, which a reduction group is (ptoas
+    // treats softmax/norm tiles as col-major none_box: "column byte size (rows*dtype)" must
+    // be 32-aligned, so the ROWS are the contiguous axis and DO need padding — verified by
+    // the ptoas assembly gate). A pure pointwise tile is row-major (cols contiguous) → rows
+    // are the FREE axis and need no padding; padding them is the [64,4096] over-fetch that
+    // overflows UB. `has_reduction` is an interim proxy for the tile layout, which is not
+    // decided until InferTileMemorySpace; the layout-exact version belongs in a post-layout
+    // padding pass (which also fixes the legacy tilers — KNOWN_ISSUES).
     const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
     const bool strip_ragged = (sh_al != sh) || (w_al != w);
     onchip.clear();                                      // fresh per replay
@@ -1420,10 +1422,22 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // trip >= 2*stage) giving EQUAL strips (h % num_strips == 0 -> no ragged-strip clamp; tile-level
   // ragged M is already handled by the mi clamp). Fall back to serial (1 strip) when h can't be
   // chunked >=2 ways or the group has a col reduction.
+  //
+  // For a REDUCTION group the row axis is padded to the DMA granule g (col-major tile), so a
+  // SUB-GRANULE strip (strip_h = h/ns not a multiple of g) pads EACH strip up to g -> DMA
+  // over-fetch, and the pipeline's stage=2 ping-pong then double-buffers those padded strips ->
+  // the working set overflows UB on wide tiles (e.g. rmsnorm[256,2048]: h=6 -> strip_h=3 padded
+  // to 8, x2 ping-pong x wide w blows past UB, though the un-chunked [8,2048] serial tile fits).
+  // Require granule-multiple strips there (zero per-strip padding); if none exists, stay serial —
+  // the cost model prices that as compute+ddr, which is honest for a tile too short to pipeline at
+  // granule granularity. Pointwise tiles (rows free, unpadded) pipeline at any strip height.
   int64_t num_strips = 1;
   if (!has_col_reduction) {
     for (int64_t ns : {8, 4, 2}) {
-      if (ns <= h && h % ns == 0) { num_strips = ns; break; }
+      if (ns > h || h % ns != 0) continue;
+      if (has_reduction && (h / ns) % g != 0) continue;  // no sub-granule reduction strips
+      num_strips = ns;
+      break;
     }
   }
 
