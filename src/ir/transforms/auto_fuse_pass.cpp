@@ -268,15 +268,21 @@ class ProblemBuilder {
     problem.vec_slope_pw = kVecSlopePw;
     problem.vec_slope_reduce = kVecSlopeReduce;
 
-    // 1. In-direction params are graph-input tensors (Out/InOut params are
-    //    output buffers, not inputs).
+    // 1. In AND InOut params are graph-input tensors: both are READ by the body. An InOut param
+    //    is also written, but its updated value is a SEPARATE SSA tensor produced by a compute op
+    //    (which becomes a live-out on its own); the param itself carries the initial value = a
+    //    boundary input. Omitting InOut here would leave an op that reads it with an incomplete
+    //    input set (undercounting its DDR read, or making it appear input-less). Out params are
+    //    write-only boundary buffers, never a graph input.
     for (size_t i = 0; i < func->params_.size(); ++i) {
-      if (i < func->param_directions_.size() && func->param_directions_[i] == ParamDirection::In) {
+      if (i >= func->param_directions_.size()) continue;
+      const ParamDirection dir = func->param_directions_[i];
+      if (dir == ParamDirection::In || dir == ParamDirection::InOut) {
         in_params_.insert(func->params_[i].get());
-        // Only tensor-typed In-params are tiled tensors in the solver's model; a scalar
-        // In-param (e.g. a broadcast scale) is an operand carried through the emit as-is,
-        // never a tracked tensor -> skip it. Registering it would trip TensorId's
-        // tensor-type decline and needlessly abandon a fusable function.
+        // Only tensor-typed params are tiled tensors in the solver's model; a scalar In-param
+        // (e.g. a broadcast scale) is an operand carried through the emit as-is, never a tracked
+        // tensor -> skip it. Registering it would trip TensorId's tensor-type decline and
+        // needlessly abandon a fusable function.
         if (As<TensorType>(func->params_[i]->GetType()) != nullptr) TensorId(func->params_[i]);
       }
     }

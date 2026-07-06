@@ -375,6 +375,36 @@ class TestAutoFuse:
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
         assert str(incores[0].func_type) == "FunctionType.AIV"
 
+    def test_inout_param_is_a_solver_input(self, ascend_backend):
+        """An InOut param is READ by a fused op, so the solver must register it as a graph
+        input (like an In param). Before, only In params were registered, so ``add(T, x)`` was
+        seen with an incomplete input set (the InOut ``T`` dropped — undercounting its DDR read
+        or making the op look input-less). This asserts an InOut auto_fuse function fuses (the
+        add scoped, reading BOTH ``T`` and ``x``) and lowers end-to-end through the pipeline.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def acc(
+                self,
+                T: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+                x: pl.Tensor[[64, 64], pl.FP32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                r: pl.Tensor[[64, 64], pl.FP32] = pl.add(T, x)
+                return r
+
+        body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "acc").as_python()
+        # The add is fused + tiled across cores; its per-tile body slices BOTH the InOut T (now a
+        # registered graph input) and x, then adds the slices — so T is read as a tracked input.
+        assert "fused_0" in body
+        assert "pl.tensor.slice(T," in body  # the InOut param is read (sliced) as an input
+        assert "pl.tensor.add(" in body
+        # Lowers end-to-end through the full pipeline (InOut discipline write-back included).
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
