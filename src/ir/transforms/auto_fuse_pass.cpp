@@ -1337,32 +1337,30 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // output (same seed+atomic structure as matmul split-K). Realized ONLY for a clean partition:
   //   - the sink IS a `col_sum` (kAdd is the only lowered AtomicType; emit_strip slices rows =
   //     the reduced axis of a col reduction),
-  //   - S == tile.split EXACTLY with IM % S == 0, and
+  //   - S == tile.split EXACTLY with IM % (S*g) == 0 (each core's reduced slice rsz=IM/S is a
+  //     multiple of the DMA granule g), and
   //   - IN % w == 0 (non-overlapping free tiles).
-  // Why BOTH exact-divisibility conditions are REQUIRED, not conservative — under R1 (one SPMD
+  // Why these exact-divisibility conditions are REQUIRED, not conservative — under R1 (one SPMD
   // body compiled for every block) a ragged split has NO safe realization when the merge is
   // ATOMIC-ADD:
-  //   - Reduced axis, IM % S != 0: rsz=ceil gives S disjoint row-slices whose last one runs
-  //     past IM. Clamping its offset in-bounds (the pointwise trick) OVERLAPS the prior slice ->
-  //     atomic-add double-counts the overlapped rows; NOT clamping it reads past the source
-  //     tensor -> out-of-bounds DMA. (The elementwise path tolerates the clamp overlap only
-  //     because its assemble is NON-atomic/idempotent.) So a ragged reduced split is unrealizable.
+  //   - Reduced axis, rsz not granule-aligned: emit_strip pads each slice to AlignUp(rsz,g), so
+  //     the last slice at offset (S-1)*rsz reads (S-1)*rsz+AlignUp(rsz,g) rows. If rsz % g != 0
+  //     that runs PAST IM -> out-of-bounds DMA (and clamping the offset in-bounds instead would
+  //     OVERLAP the prior slice -> atomic-add double-counts). Requiring IM % (S*g) == 0 makes
+  //     rsz a multiple of g, so AlignUp(rsz,g)==rsz: exactly S disjoint in-bounds slices.
+  //     (The elementwise path tolerates a clamp overlap only because its assemble is NON-atomic.)
   //   - Free axis, IN % w != 0: same overlap, same atomic double-count on the tail column band.
-  // The costed split is therefore trusted EXACTLY (never rounded to a nearby divisor — that would
-  // enlarge each slice and break the solver's UB-fit proof). A non-dividing S falls through to the
-  // CORRECT non-split body; the solver SHOULD only ever cost a realizable S (a divisor of the
-  // reduced extent) so this fallthrough is never hit for a split that was NEEDED to fit UB. It
-  // currently CAN be: the solver draws vector S from divisors of 2*num_cores capped by
-  // reduced_extent/16 (mlsys26 ascend910b_cost.cpp:890), NOT divisors of the reduced extent as
-  // matmul split-K does (id.:1659) -- so e.g. col_sum[128,256] is costed at S=6 (6 | 96 cores,
-  // 6 ∤ 128) and declines to non-split here, losing the costed parallelism (correct, just serial).
-  // FOLLOW-UP (solver, cost-model change -> needs re-benchmark): constrain vector S to divisors of
-  // the reduced fractal count, mirroring the matmul kfrac gate, to close this fidelity gap.
-  // Everything else (max/min, row-reduction split, reduction-feeds-pointwise) also falls through.
+  // The costed split is trusted EXACTLY (never rounded to a nearby divisor — that would enlarge
+  // each slice and break the solver's UB-fit proof). The solver only costs a realizable S: it
+  // draws vector S from divisors of the reduced FRACTAL count (reduced_extent/16) when that axis
+  // is 16-aligned (mlsys26 ascend910b_cost.cpp:886, mirroring the matmul kfrac gate id.:870), so
+  // IM/S is 16-aligned and this gate holds. The gate is kept as DEFENSE-IN-DEPTH: a non-conforming
+  // S from any other cost model declines to the CORRECT non-split body rather than emitting an OOB
+  // read. Everything else (max/min, row-reduction split, reduction-feeds-pointwise) also declines.
   if (tile.split > 1 && pin_m && As<Call>(out_stmt->value_) &&
-      IsOp(As<Call>(out_stmt->value_), "tensor.col_sum") && IM % tile.split == 0 && IN % w == 0) {
+      IsOp(As<Call>(out_stmt->value_), "tensor.col_sum") && IM % (tile.split * g) == 0 && IN % w == 0) {
     const int64_t S = tile.split;               // emit exactly the costed split (no rounding)
-    const int64_t rsz = IM / S;                 // disjoint reduced-axis slice per core (IM % S == 0)
+    const int64_t rsz = IM / S;                 // disjoint granule-aligned reduced slice (IM % (S*g) == 0)
     auto index_ty = std::make_shared<ScalarType>(DataType::INDEX);
     // Seed: zero each [1,w] output tile (disjoint + non-overlapping since IN % w == 0), tiled over
     // the num_n free tiles, so a large [1,N] output never materializes in one core's UB.
