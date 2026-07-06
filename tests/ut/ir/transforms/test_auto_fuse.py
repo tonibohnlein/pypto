@@ -405,6 +405,33 @@ class TestAutoFuse:
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
 
+    def test_wide_reduction_avoids_subgranule_strip_overflow(self, ascend_backend, monkeypatch):
+        """A wide fused row reduction (rmsnorm over W=1024) must lower without a UB overflow.
+
+        A reduction tile is col-major, so its row axis is padded to the DMA granule g. The
+        pipeline chunks the free row axis h; when h/num_strips < g (or not a multiple of it),
+        each strip is padded up to g and the stage=2 ping-pong double-buffers those padded
+        strips, blowing past UB on a wide tile. The generic emit now requires granule-multiple
+        reduction strips and otherwise stays serial (the un-chunked tile fits). This asserts the
+        wide case lowers through AllocateMemoryAddr end-to-end — with sub-granule pipelining it
+        overflowed. (Behind the generic-emit flag, where the fix lives.)
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def rms(self, a: pl.Tensor[[256, 1024], pl.FP32]) -> pl.Tensor[[256, 1024], pl.FP32]:
+                sq: pl.Tensor[[256, 1024], pl.FP32] = pl.mul(a, a)
+                ms: pl.Tensor[[256, 1], pl.FP32] = pl.row_sum(sq)
+                r: pl.Tensor[[256, 1024], pl.FP32] = pl.row_expand_div(a, ms)
+                return r
+
+        # Reaches AllocateMemoryAddr without raising a Vec-buffer-overflow (the serial fallback fits).
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
