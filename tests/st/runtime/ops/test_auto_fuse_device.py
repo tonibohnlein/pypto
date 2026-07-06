@@ -23,25 +23,23 @@ TWO parts:
     reduction's *reduced* axis (currently guarded/declined in EmitFusedGroupGeneric).  These
     kernels do NOT use AutoFuse — they isolate the hardware-op semantics.
 
-  Part B — AutoFuse free-axis padding on device.  The shipped Phase-1 cases (ragged pointwise,
-    softmax) compiled with ``attrs={"auto_fuse": True}`` and ``PYPTO_AUTOFUSE_GENERIC_EMIT=1``,
-    numerically verified against a torch reference on hardware.
+  Part B — AutoFuse end-to-end on device.  Realistic fused-vector kernels (ragged pointwise,
+    softmax, RMSNorm, LayerNorm) compiled with ``attrs={"auto_fuse": True}`` and
+    ``PYPTO_AUTOFUSE_GENERIC_EMIT=1``, numerically verified against a torch reference on hardware.
+    The return->named-output wiring is handled by the compiler (AutoFuse lifts the returned buffer
+    into an appended Out param -> orchestration codegen emits the add_output write-back), so these
+    return-based programs bind their output by position ([x, out]) in the harness.
 
 RUN:
     # Part A needs no env flag; Part B needs the generic emitter enabled:
     PYPTO_AUTOFUSE_GENERIC_EMIT=1 python -m pytest tests/st/runtime/ops/test_auto_fuse_device.py \\
         --platform a2a3 -sv
 
-NOTE TO THE DEVICE AGENT — this is the FIRST AutoFuse system test, so verify two integrations:
-  (1) The probe DSL forms (``pl.load`` / ``pl.set_validshape`` / ``pl.tile.row_sum(t, tmp)`` /
-      ``pl.store``) mirror ``test_col_reduction.py`` + ``test_set_validshape.py``; adjust to your
-      DSL version if a signature differs (e.g. row_sum's ``tmp`` tile, or set_validshape on a
-      tile vs tensor).
-  (2) Part B wires a return-based ``auto_fuse`` function into the harness's named-output model.
-      If the harness needs an explicit output param, switch the Part-B programs to the Out-param
-      + ``pl.assemble(output, fused, [0, 0])`` form used by ``test_set_validshape.py`` (the
-      auto_fuse programs are defined lazily inside ``get_program`` so a mismatch fails at run,
-      not at import/collection).
+NOTE TO THE DEVICE AGENT — verify the probe DSL forms (``pl.load`` / ``pl.set_validshape`` /
+  ``pl.tile.row_sum(t, tmp)`` / ``pl.store``) mirror ``test_col_reduction.py`` +
+  ``test_set_validshape.py``; adjust to your DSL version if a signature differs (e.g. row_sum's
+  ``tmp`` tile, or set_validshape on a tile vs tensor). Part B needs no such adjustment — the
+  auto_fuse programs are plain return-based functions and the output wiring is compiler-side.
 
 THE ONE NUMBER THAT MATTERS: the Part-A ``row_sum`` device output.  ``66.0``/row => honors
 valid (lift the reduced-axis guard).  ``~6e9``/row => sums physical (keep the guard / add a
@@ -247,6 +245,9 @@ class RowMaxValidProbeCase(PTOTestCase):
 
 RPW_M, RPW_N = 130, 66      # ragged pointwise: N=66 free axis padded 66->72
 SM_M, SM_N = 256, 128       # softmax: ragged M=256 (h tile padded); reduced N=128 aligned
+RMS_M, RMS_N = 256, 512     # RMSNorm: aligned; one reduction (row_sum of squares) + broadcast
+LN_M, LN_N = 256, 512       # LayerNorm: aligned; two reductions (mean + variance) + broadcast
+NORM_EPS = 1.0e-6
 
 
 class AutoFuseRaggedPointwiseCase(PTOTestCase):
@@ -319,6 +320,87 @@ class AutoFuseSoftmaxCase(PTOTestCase):
         tensors["out"][:] = torch.softmax(tensors["x"], dim=1)
 
 
+class AutoFuseRmsNormCase(PTOTestCase):
+    """AutoFuse RMSNorm [256,512]: sq=x*x; ms=mean(sq); out=x*rsqrt(ms+eps). One
+    reduction + a [M,1]-over-[M,N] broadcast — a canonical transformer norm."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_rmsnorm_256x512"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [RMS_M, RMS_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [RMS_M, RMS_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def rmsnorm(self, x: pl.Tensor[[RMS_M, RMS_N], pl.FP32]) -> pl.Tensor[[RMS_M, RMS_N], pl.FP32]:
+                sq: pl.Tensor[[RMS_M, RMS_N], pl.FP32] = pl.mul(x, x)
+                ss: pl.Tensor[[RMS_M, 1], pl.FP32] = pl.row_sum(sq)
+                ms: pl.Tensor[[RMS_M, 1], pl.FP32] = pl.mul(ss, 1.0 / RMS_N)
+                var: pl.Tensor[[RMS_M, 1], pl.FP32] = pl.add(ms, NORM_EPS)
+                rms: pl.Tensor[[RMS_M, 1], pl.FP32] = pl.rsqrt(var)
+                out: pl.Tensor[[RMS_M, RMS_N], pl.FP32] = pl.mul(x, rms)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        tensors["out"][:] = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + NORM_EPS)
+
+
+class AutoFuseLayerNormCase(PTOTestCase):
+    """AutoFuse LayerNorm [256,512]: mu=mean(x); xc=x-mu; var=mean(xc^2); out=xc*rsqrt(var+eps).
+    Two reductions (mean + variance) + broadcast — the richest fused-vector norm."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_layernorm_256x512"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [LN_M, LN_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [LN_M, LN_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def layernorm(self, x: pl.Tensor[[LN_M, LN_N], pl.FP32]) -> pl.Tensor[[LN_M, LN_N], pl.FP32]:
+                sx: pl.Tensor[[LN_M, 1], pl.FP32] = pl.row_sum(x)
+                mu: pl.Tensor[[LN_M, 1], pl.FP32] = pl.mul(sx, 1.0 / LN_N)
+                xc: pl.Tensor[[LN_M, LN_N], pl.FP32] = pl.sub(x, mu)
+                sq: pl.Tensor[[LN_M, LN_N], pl.FP32] = pl.mul(xc, xc)
+                sv: pl.Tensor[[LN_M, 1], pl.FP32] = pl.row_sum(sq)
+                var: pl.Tensor[[LN_M, 1], pl.FP32] = pl.mul(sv, 1.0 / LN_N)
+                vare: pl.Tensor[[LN_M, 1], pl.FP32] = pl.add(var, NORM_EPS)
+                inv: pl.Tensor[[LN_M, 1], pl.FP32] = pl.rsqrt(vare)
+                out: pl.Tensor[[LN_M, LN_N], pl.FP32] = pl.mul(xc, inv)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        mu = x.mean(-1, keepdim=True)
+        xc = x - mu
+        tensors["out"][:] = xc * torch.rsqrt(xc.pow(2).mean(-1, keepdim=True) + NORM_EPS)
+
+
 class TestAutoFuseDevice:
     """AutoFuse on device: the reduction-valid probe + free-axis padding numerics."""
 
@@ -348,30 +430,33 @@ class TestAutoFuseDevice:
             f"PHYSICAL extent -> reduced-axis padding needs zero-fill. {result.error}"
         )
 
-    # -- Part B: AutoFuse free-axis padding numerics (set PYPTO_AUTOFUSE_GENERIC_EMIT=1) --
+    # -- Part B: AutoFuse end-to-end numerics on device (set PYPTO_AUTOFUSE_GENERIC_EMIT=1) --
+    #
+    # The return->named-output wiring is now handled in the compiler: AutoFuse
+    # (MaybeLiftReturnToOutParam) lifts a return-based fused function's output buffer into an
+    # appended Out param, so orchestration codegen emits the add_output write-back the harness
+    # binds by position ([in..., out]). Verified compile-side (expected_arg_count matches, the
+    # output param carries the write-back). These run the fully-lowered kernels on hardware.
 
-    # XFAIL: blocked on an auto_fuse<->device-harness OUTPUT-WIRING gap (verified on a 910B: all
-    # four wirings fail — return-based leaves the named output unwritten; Out-param+assemble
-    # inside the fused fn breaks fusion (Subgraph::create); an orchestration wrapper dangles
-    # because AutoFuse renames the fused function). The AutoFuse pass emits a return-based fused
-    # function, but the device harness maps outputs by named param — bridging return->named-output
-    # is a small emitter/harness task, ORTHOGONAL to correctness (free-axis correctness stands via
-    # the ptoas gate + torch_codegen). Remove the marker when that bridge lands. See KNOWN_ISSUES.
-    @pytest.mark.xfail(reason="auto_fuse return-based output not wired to the device harness's "
-                              "named-output model (integration gap, not a numeric failure)",
-                       strict=False)
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_autofuse_ragged_pointwise(self, test_runner, platform):
         result = test_runner.run(AutoFuseRaggedPointwiseCase(platform=platform))
         assert result.passed, f"AutoFuse ragged pointwise [130,66] mismatch on device: {result.error}"
 
-    @pytest.mark.xfail(reason="auto_fuse return-based output not wired to the device harness's "
-                              "named-output model (integration gap, not a numeric failure)",
-                       strict=False)
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_autofuse_softmax(self, test_runner, platform):
         result = test_runner.run(AutoFuseSoftmaxCase(platform=platform))
         assert result.passed, f"AutoFuse softmax [256,128] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_rmsnorm(self, test_runner, platform):
+        result = test_runner.run(AutoFuseRmsNormCase(platform=platform))
+        assert result.passed, f"AutoFuse RMSNorm [256,512] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_layernorm(self, test_runner, platform):
+        result = test_runner.run(AutoFuseLayerNormCase(platform=platform))
+        assert result.passed, f"AutoFuse LayerNorm [256,512] mismatch on device: {result.error}"
 
 
 if __name__ == "__main__":
