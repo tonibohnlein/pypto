@@ -294,6 +294,52 @@ class TestPassManagerWithProgram:
         assert "single_func" in func_names
 
 
+class TestPassManagerPlannerGate:
+    """The dbC=2 planner gate.
+
+    The pass LIST is fixed at construction (``MemoryReuse`` / ``AllocateMemoryAddr``
+    are dropped only when the construction-time context selects PTOAS), while dbC=2 is
+    selected from the *run-time* planner inside ``AutoTileMatmulL0``. If the two
+    disagree, a pipeline that still contains ``MemoryReuse`` would run while the chooser
+    picks dbC=2 -> the two co-live L0C accumulators get coalesced. ``run_passes`` must
+    fail loud instead.
+    """
+
+    @staticmethod
+    def _trivial_program():
+        span = ir.Span.unknown()
+        dt = DataType.INT64
+        x = ir.Var("x", ir.ScalarType(dt), span)
+        z = ir.Var("z", ir.ScalarType(dt), span)
+        func = ir.Function("f", [x], [ir.ScalarType(dt)], ir.AssignStmt(z, x, span), span)
+        return ir.Program([func], "p", span)
+
+    def test_construct_pypto_run_ptoas_raises(self):
+        """Built outside PTOAS (default PYPTO, so MemoryReuse is IN the pipeline), then
+        run inside a PTOAS context -> the mismatch must raise, not silently mis-schedule."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            with pytest.raises(RuntimeError, match="memory_planner"):
+                pm.run_passes(self._trivial_program())
+
+    def test_construct_ptoas_run_pypto_raises(self):
+        """The converse: built under PTOAS (MemoryReuse dropped) then run under the
+        default PYPTO planner leaves no memory planning at all -> also a mismatch."""
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with pytest.raises(RuntimeError, match="memory_planner"):
+            pm.run_passes(self._trivial_program())
+
+    def test_construct_and_run_same_planner_ok(self):
+        """Matched planner at construction and run -> the guard does not fire (both the
+        default PYPTO and an explicit PTOAS context)."""
+        pm_pypto = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        pm_pypto._check_planner_consistency()  # PYPTO == PYPTO, no raise
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            pm_ptoas = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+            pm_ptoas._check_planner_consistency()  # PTOAS == PTOAS, no raise
+
+
 class TestPassManagerDumpIR:
     """Test dump_ir mode in PassManager."""
 

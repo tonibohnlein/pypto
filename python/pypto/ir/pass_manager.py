@@ -265,7 +265,15 @@ class PassManager:
         # recover that from independent addr-less allocs. Read here because
         # __init__ runs inside the compile() PassContext (see compile.py).
         ctx = passes.PassContext.current()
-        skip_mem_planning = ctx is not None and ctx.get_memory_planner() == passes.MemoryPlanner.PTOAS
+        # The construction-time planner fixes the pass LIST (MemoryReuse +
+        # AllocateMemoryAddr are dropped only for PTOAS). PTOAS-gated pass *behaviour*
+        # (AutoTileMatmulL0's dbC=2) reads the planner again at execution time, so
+        # run_passes re-asserts the run-time planner still matches this one — otherwise a
+        # PassManager built outside PTOAS but run inside a PTOAS context would keep
+        # MemoryReuse yet still select dbC=2, coalescing the two co-live L0C accumulators
+        # into one shrunk single-buffer tile (see _check_planner_consistency).
+        self._construction_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        skip_mem_planning = self._construction_planner == passes.MemoryPlanner.PTOAS
         _mem_planning_passes = ("MemoryReuse", "AllocateMemoryAddr")
 
         # Build pass list
@@ -284,6 +292,29 @@ class PassManager:
         self._pipeline = passes.PassPipeline()
         for p in self.passes:
             self._pipeline.add_pass(p)
+
+    def _check_planner_consistency(self) -> None:
+        """Fail loud if the run-time memory planner differs from the construction-time one.
+
+        The pass LIST is fixed at construction: ``MemoryReuse`` / ``AllocateMemoryAddr``
+        are dropped iff the construction-time ``PassContext`` selected PTOAS. But
+        PTOAS-gated pass *behaviour* — ``AutoTileMatmulL0``'s dbC=2 selection — reads
+        ``GetMemoryPlanner()`` at *execution* time. If a PassManager built outside PTOAS
+        is then run inside a PTOAS context, the pipeline still contains ``MemoryReuse``
+        yet the chooser selects dbC=2, so ``MemoryReuse`` coalesces the two co-live L0C
+        accumulators into one — a shrunk single-buffer tile, the exact regression dbC=2
+        exists to avoid. ``compile()`` builds and runs under the same context, so this
+        never fires there; it guards misuse (build under one planner, run under another).
+        """
+        ctx = passes.PassContext.current()
+        run_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        if run_planner != self._construction_planner:
+            raise RuntimeError(
+                f"PassManager was constructed under memory_planner={self._construction_planner!r} "
+                f"(which fixed whether MemoryReuse/AllocateMemoryAddr are in the pipeline) but is "
+                f"being run under memory_planner={run_planner!r}. Build the PassManager inside the "
+                f"same PassContext it is run in (compile() does this)."
+            )
 
     def run_passes(
         self,
@@ -305,7 +336,10 @@ class PassManager:
 
         Raises:
             ValueError: If dump_ir=True but output_dir is None
+            RuntimeError: If the run-time memory planner differs from the one the
+                PassManager was constructed under (see _check_planner_consistency)
         """
+        self._check_planner_consistency()
         if not dump_ir:
             prof = CompileProfiler.current()
             if prof is not None:
