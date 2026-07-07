@@ -2075,33 +2075,64 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
   std::unordered_set<const Stmt*> top_level;
   top_level.reserve(seq->stmts_.size());
   for (const StmtPtr& s : seq->stmts_) top_level.insert(s.get());
-  std::vector<AssignStmtPtr> creates;
-  std::unordered_set<const Stmt*> create_set;
+  auto& reg = OpRegistry::GetInstance();
+  const Span rsp = idx.ret->span_;
+  std::vector<VarPtr> out_params;             // Out-param Var per return, in return order
+  std::unordered_set<const Stmt*> drop_set;   // traceable creates to remove (their Var -> param)
+  std::vector<StmtPtr> synth_copies;          // synthesized assemble-copies, inserted before return
+  std::vector<ExprPtr> new_ret;               // rewritten return values
   for (const ExprPtr& rv : idx.ret->value_) {
     auto ret_var = AsVarLike(rv);
     if (!ret_var) return;
     auto ca = trace_to_create(ret_var);
-    if (!ca) return;
-    if (top_level.count(ca.get()) == 0) return;       // create not a removable top-level child
-    if (!create_set.insert(ca.get()).second) return;  // returns share a buffer -> aliasing, bail
-    creates.push_back(ca);
+    if (ca != nullptr) {
+      // Traceable to the output buffer's `tensor.create`: move that Var into the param list (no
+      // copy). Must be a distinct top-level child (safe to remove) — else bail (inconsistent ABI).
+      if (top_level.count(ca.get()) == 0) return;
+      if (!drop_set.insert(ca.get()).second) return;  // two returns share a buffer -> aliasing
+      out_params.push_back(ca->var_);
+      new_ret.push_back(rv);
+    } else {
+      // NOT traceable: the return is a computed value with no output `create`/`assemble` to move —
+      // e.g. a returned `tensor.matmul` whose tiling DECLINED (non-uniform grid), left untiled. The
+      // harness binds by param position, so append an Out param and COPY the computed result into it
+      // with a full `tensor.assemble(out, val, [0,0])` (return_lineage traces the returned copy back
+      // to the appended Out param). One extra full-tensor write; correctness over the fused-matmul
+      // tiling gap. (Vector-ending fns hit the traceable branch above and pay no copy.)
+      const auto [rM, rN] = Static2DShape(ret_var->GetType());
+      if (rM < 0) return;  // dynamic / non-2D return -> out of scope
+      (void)rN;
+      auto out_var = std::make_shared<Var>(ret_var->name_hint_ + "_out", ret_var->GetType(), rsp);
+      auto asm_call = reg.Create(
+          "tensor.assemble",
+          {ExprPtr(out_var), ExprPtr(ret_var), MakeTuple2(MakeIndex(0, rsp), MakeIndex(0, rsp), rsp)}, rsp);
+      auto wr_var = std::make_shared<Var>(ret_var->name_hint_ + "_wr", asm_call->GetType(), rsp);
+      synth_copies.push_back(std::make_shared<AssignStmt>(wr_var, asm_call, rsp));
+      out_params.push_back(out_var);
+      new_ret.push_back(ExprPtr(wr_var));
+    }
   }
 
-  // Append an Out param per returned buffer (in return order — the harness binds by
-  // position), moving each c_init Var from its create into the param list, and drop the
-  // now-dead creates. The return lineage rebinds each return to its Out param.
-  for (const auto& ca : creates) {
-    func->params_.push_back(ca->var_);
+  // Append the Out params (return order — the harness binds by position), drop the moved creates,
+  // and insert the synthesized copies right before the (rewritten) return.
+  for (const auto& v : out_params) {
+    func->params_.push_back(v);
     func->param_directions_.push_back(ParamDirection::Out);
   }
   std::vector<StmtPtr> kept;
-  kept.reserve(seq->stmts_.size());
+  kept.reserve(seq->stmts_.size() + synth_copies.size());
   for (const StmtPtr& s : seq->stmts_) {
-    if (create_set.count(s.get()) == 0) kept.push_back(s);
+    if (drop_set.count(s.get()) != 0) continue;  // dead create -> now the Out param
+    if (As<ReturnStmt>(s)) {
+      for (auto& w : synth_copies) kept.push_back(w);
+      kept.push_back(std::make_shared<ReturnStmt>(new_ret, s->span_));
+    } else {
+      kept.push_back(s);
+    }
   }
   func->body_ = SeqStmts::Flatten(std::move(kept), seq->span_);
 
-  LOG_INFO << "AutoFuse[" << func->name_ << "]: wired " << creates.size()
+  LOG_INFO << "AutoFuse[" << func->name_ << "]: wired " << out_params.size()
            << " return(s) -> appended Out param(s) (device/harness binds outputs by param)";
 }
 
