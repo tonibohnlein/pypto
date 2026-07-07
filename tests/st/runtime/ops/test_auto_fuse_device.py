@@ -1107,6 +1107,62 @@ class AutoFuseSweepCase(PTOTestCase):
         tensors["out"][:] = r.to(tensors["out"].dtype)
 
 
+# Attention (q@k -> scaled softmax -> p@v) swept across seq/head shapes — the marquee model
+# fragment AND the matmul-ending output-wiring fix (a matmul return copied into an appended Out
+# param). Each is a full single-head attention block.
+ATTN_GRID = [(128, 64), (64, 64), (256, 64), (128, 32)]
+
+
+class ModelAttentionSweepCase(PTOTestCase):
+    """One attention block at (seq=S, head_dim=D). Exercises the matmul-ending output wiring
+    across shapes — the fix for the all-zero-output device regression."""
+
+    __test__ = False
+
+    def __init__(self, S: int, D: int, *, platform: str | None = None, config=None):
+        self.S, self.D = S, D
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"model_attention_{self.S}x{self.D}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("q", [self.S, self.D], DataType.FP32, init_value=torch.randn),
+            TensorSpec("k", [self.D, self.S], DataType.FP32, init_value=torch.randn),
+            TensorSpec("v", [self.S, self.D], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [self.S, self.D], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        S, D = self.S, self.D
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def attn(
+                self,
+                q: pl.Tensor[[S, D], pl.FP32],
+                k: pl.Tensor[[D, S], pl.FP32],
+                v: pl.Tensor[[S, D], pl.FP32],
+            ) -> pl.Tensor[[S, D], pl.FP32]:
+                s: pl.Tensor[[S, S], pl.FP32] = pl.matmul(q, k)
+                sc: pl.Tensor[[S, S], pl.FP32] = pl.mul(s, 0.125)
+                m: pl.Tensor[[S, 1], pl.FP32] = pl.row_max(sc)
+                dd: pl.Tensor[[S, S], pl.FP32] = pl.row_expand_sub(sc, m)
+                e: pl.Tensor[[S, S], pl.FP32] = pl.exp(dd)
+                sm: pl.Tensor[[S, 1], pl.FP32] = pl.row_sum(e)
+                p: pl.Tensor[[S, S], pl.FP32] = pl.row_expand_div(e, sm)
+                o: pl.Tensor[[S, D], pl.FP32] = pl.matmul(p, v)
+                return o
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        q, k, v = tensors["q"], tensors["k"], tensors["v"]
+        tensors["out"][:] = torch.softmax((q @ k) * 0.125, dim=-1) @ v
+
+
 class TestAutoFuseDevice:
     """AutoFuse on device: the reduction-valid probe + free-axis padding numerics."""
 
@@ -1255,6 +1311,13 @@ class TestAutoFuseDevice:
         cfg = _FP16_TOL if dt == "fp16" else (_RSQRT_TOL if kernel == "rms" else None)
         result = test_runner.run(AutoFuseSweepCase(kernel, M, N, dt, platform=platform, config=cfg))
         assert result.passed, f"AutoFuse sweep {kernel}[{M},{N}]/{dt} mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.parametrize("S,D", ATTN_GRID)
+    def test_model_attention_sweep(self, test_runner, platform, S, D):
+        # matmul reassociation -> the rsqrt-level tolerance; watch for actual==0.0 (the wiring fix).
+        result = test_runner.run(ModelAttentionSweepCase(S, D, platform=platform, config=_RSQRT_TOL))
+        assert result.passed, f"AutoFuse attention [{S},{D}] mismatch on device (any actual=0.0?): {result.error}"
 
 
 if __name__ == "__main__":
