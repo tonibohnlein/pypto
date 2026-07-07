@@ -45,9 +45,18 @@ namespace backend {
  * (crossover ~n=131 fp32) -- the sweep confirmed both regimes (a flat base below
  * the crossover, byte-throughput above). A non-pow2 fractal count adds the odd
  * residual `odd(N1)-1` serial burst passes at `drain_penalty_cycles` per M-row
- * (the N%32 cliff, e.g. n=80 -> odd(10)=5). Splitting the OUTPUT (M/N) adds drains;
+ * (the non-pow2 N-fractal-count cliff -- n=80 -> odd(10)=5, and n=96 -> odd(12)=3 despite
+ * 96%32==0; it is NOT literally N%32). Splitting the OUTPUT (M/N) adds drains;
  * splitting K does not (accumulate in one L0C). Device-validated (drain 0.93-1.09x,
  * loads R^2 0.993).
+ *
+ * CALIBRATION SURFACE (a2a3, so the next backend / lowering path can tell when it
+ * has left the fitted envelope): forced-tile FIXPIPE + MTE1 sweep, direct-store
+ * (Acc->GM) and Mat-scratch (Acc->Mat) drains, bf16 and fp32; m in {16..256},
+ * n aligned {16..512}; N-fractal N1 sampled at power-of-2 and small non-pow2 counts
+ * (n up to 128 densely, plus n=320); FIXPIPE isolated via the dbc0-dbc1 difference.
+ * NOT yet swept: large odd-part N1 (n=136/264 -> odd 17/33) -- the odd(N1) burst-
+ * grouping form there is interpolated, not measured (follow-up sweep pending).
  *
  * The MAD term mirrors the cube's per-TMATMUL cost
  * `mad_head_cycles + cpr * ceil(m/16) * ceil(k/kt) * ceil(n/16)`, where
@@ -68,8 +77,12 @@ struct L0CostModel {
       2.6;                  ///< Misalignment cost: FIXPIPE cycles per L0C M-row per extra
                             ///< serial burst pass, charged (odd(N1)-1) times (a2a3 on-device sweep).
   int drain_c0_bytes = 32;  ///< NZ fractal C0 constant in bytes (N0 = C0 / bytes_c; 8 for fp32, 16 for bf16).
-  int mad_head_cycles = 21;      ///< Fixed per-TMATMUL issue overhead (a2a3 op-sim: 21 cyc/MMAD,
-                                 ///< regime- and K-independent; per-tile CUBE = mad_head + 16*K).
+  int mad_head_cycles = 21;      ///< Fixed per-TMATMUL issue overhead, per K-block (a2a3 op-sim fit,
+                                 ///< device-confirmed within ~2%; was 6, +15/tile clean on device).
+                                 ///< Enters C_mad as `k_blocks*mad_head + cpr*ceil(m/16)*k_fractals*
+                                 ///< ceil(n/16)` (see MadCycles) -- NOT `mad_head + 16*K`.
+                                 ///< Backend-specific: a new backend should shallow-K device-spot-check
+                                 ///< it (it competes with the drain floor on shallow-K/small tiles).
   int mad_k_fractal_bytes = 32;  ///< Cube K-fractal width in bytes (kt = this / bytes_a).
 };
 
