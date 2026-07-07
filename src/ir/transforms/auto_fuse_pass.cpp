@@ -99,15 +99,18 @@ constexpr double kBwUbGm   = 188.46;            // UB->GM vector store
 constexpr double kHbmAggregateGiBps = 900.0;
 constexpr int64_t kL0TileM = 128;               // L0 GEMM base M (pto-isa oracle)
 constexpr int64_t kL0TileN = 256;               // L0 GEMM base N (pto-isa oracle)
-// Grounded vector (AIV) cost: per op = head + slope*repeat + tail cycles, repeat
-// = ceil(elems / (vec_reg_bytes/dtype_bytes)). pto-isa A2A3
-// cce_costmodel_vector_compute.hpp: 256-byte vreg; vadd head 14 / slope 1 / tail
-// 18, vmul slope 2; vreducev2 slope 14.
+// Grounded vector (AIV) cost: per op = slope*repeat + head+tail (once per chain), repeat =
+// ceil(elems / (vec_reg_bytes/dtype_bytes)). pto-isa A2A3 cce_costmodel_vector_compute.hpp,
+// 910B3-calibrated (`标定`, dav-2201, R^2~1.0): 256-byte vreg (64 fp32 / 128 fp16 per repeat);
+// per-op fixed (head+tail) ~24 (vadd) to ~31 (vexp); slope 2 for vadd/vsub/vmul/vexp, 4 for vdiv,
+// 1 for vrsqrt/vrelu/vmuls. Per-op slope overrides are set per Op via VecOpSlope; the +16
+// count-mode floor for unaligned width lives in the solver's VecOpCompute. The head/tail SPLIT
+// is an unmeasured assumption upstream (only the ~32 SUM is used, charged once per chain).
 constexpr int64_t kVecRegBytes = 256;           // vector register size (bytes)
-constexpr double kVecOpHead = 14.0;             // per-op pipeline startup
+constexpr double kVecOpHead = 14.0;             // per-op pipeline startup (head+tail sum is what matters)
 constexpr double kVecOpTail = 18.0;             // per-op drain
-constexpr double kVecSlopePw = 2.0;             // elementwise cycles/repeat (vmul-ish)
-constexpr double kVecSlopeReduce = 14.0;        // reduction cycles/repeat (vreducev2)
+constexpr double kVecSlopePw = 2.0;             // default elementwise cycles/repeat (vadd/vmul/vexp)
+constexpr double kVecSlopeReduce = 14.0;        // DEPRECATED: solver uses the reduction TREE, not this
 
 // Core counts + on-chip capacities. Defaults are the 910B values above; the
 // real ones are read from the configured backend's SoC (so the safe-UB cap and
@@ -207,6 +210,23 @@ bool IsComputeOp(const StmtPtr& stmt, CallPtr* out_call) {
     return ::OpType::Opaque;  // data-dependent / relayout — un-fusable barrier
   }
   return ::OpType::Pointwise;  // elementwise / unary / cast / expand(broadcast)
+}
+
+// Per-op VECTOR compute slope (cycles per SIMD repeat) when it differs from the elementwise
+// default (~2). pto-isa vec_tile_study measured: most pointwise ops are slope 2, but the div
+// family (`tensor.div` / `row_expand_div` / `col_expand_div` -> `vdiv`) is 4 and `tensor.rsqrt`
+// (-> `vrsqrt`) is 1. Returns 0.0 = "use the group default vec_slope_pw". This is a cost
+// heuristic keyed on the op FAMILY (not a correctness branch), so an unmatched op safely keeps
+// the default; div-heavy kernels (softmax, RMS/LayerNorm) are the ones this de-underprices.
+double VecOpSlope(const CallPtr& call) {
+  const std::string& n = call->op_->name_;
+  auto ends = [&](const char* s) {
+    const size_t l = std::char_traits<char>::length(s);
+    return n.size() >= l && n.compare(n.size() - l, l, s) == 0;
+  };
+  if (ends("div")) return 4.0;      // vdiv
+  if (ends(".rsqrt")) return 1.0;   // vrsqrt (also vrelu/vmuls family, but rsqrt is the one in norms)
+  return 0.0;                        // -> vec_slope_pw
 }
 
 // Map a PyPTO DataType to the solver's byte-aware DType. The grounded cube cost
@@ -310,6 +330,7 @@ class ProblemBuilder {
       const CallPtr& call = entry.second;
       ::Op sop;
       sop.type = ClassifyOp(call);
+      sop.vec_slope = VecOpSlope(call);  // vdiv=4 / vrsqrt=1 override the elementwise default
       // Inputs in OPERAND ORDER (call->args_). The solver derives M/N/K
       // positionally (inputs[0]=LHS [K,M], inputs[1]=RHS [N,K]), so the order is
       // load-bearing. Both in-params and predecessor-op outputs are registered
