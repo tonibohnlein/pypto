@@ -263,7 +263,13 @@ class TestAutoFuse:
         # (consumed by the second matmul), never assembled to DDR -> one kernel, not two.
         assert "pl.at(level=pl.Level.CORE_GROUP" in body
         assert body.count("pl.tensor.matmul(") == 2
-        assert "pl.tensor.assemble(" not in body  # t never round-trips DDR
+        # The intermediate t is a scope-local consumed inside the CORE_GROUP scope (never
+        # assembled). The ONLY assemble is the output-wiring copy of the returned result `c` into
+        # the appended `c_out` param — a matmul-produced return has no create to lift, so it is
+        # copied into an Out param (device/harness binds outputs by position; without it the
+        # output is unwritten). So exactly one assemble, and the return is wired to an Out param.
+        assert body.count("pl.tensor.assemble(") == 1
+        assert "pl.Out[" in body
 
     @pytest.mark.xfail(
         reason="chained-matmul lowering blocked on hw-native-sys/pypto#1908: AllocateMemoryAddr "
