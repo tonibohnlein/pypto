@@ -1056,23 +1056,27 @@ class AutoFuseSweepCase(PTOTestCase):
     def get_program(self) -> Any:
         M, N = self.M, self.N
         DT = pl.FP16 if self.dt == "fp16" else pl.FP32
-        # Distinct entry-function names per kernel (like the fixed cases sm/rmsnorm/silu) — a shared
-        # `def f` risks the harness binding/caching the wrong kernel across sweep points.
+        # DISTINCT CLASS names per kernel. `@pl.program` resolves each class by its source via
+        # inspect.getsource keyed on __qualname__; three identically-named `class Prog` in this one
+        # method collide, so getsource returns the FIRST (pw) — silently compiling the pointwise
+        # kernel for every softmax/rms sweep point (device run4: sweep_pw.cpp vs the softmax golden).
+        # The function-name rename alone did NOT fix it; the class name is the resolution key. The
+        # fixed cases don't collide because each `class Prog` lives in a different case class.
         if self.kernel == "pw":
 
             @pl.program
-            class Prog:
+            class ProgPw:
                 @pl.function(attrs={"auto_fuse": True})
                 def sweep_pw(self, x: pl.Tensor[[M, N], DT]) -> pl.Tensor[[M, N], DT]:
                     a: pl.Tensor[[M, N], DT] = pl.add(x, 1.0)
                     b: pl.Tensor[[M, N], DT] = pl.mul(a, 2.0)
                     return b
 
-            return Prog
+            return ProgPw
         if self.kernel == "softmax":
 
             @pl.program
-            class Prog:
+            class ProgSoftmax:
                 @pl.function(attrs={"auto_fuse": True})
                 def sweep_softmax(self, x: pl.Tensor[[M, N], DT]) -> pl.Tensor[[M, N], DT]:
                     m: pl.Tensor[[M, 1], DT] = pl.row_max(x)
@@ -1082,10 +1086,10 @@ class AutoFuseSweepCase(PTOTestCase):
                     o: pl.Tensor[[M, N], DT] = pl.row_expand_div(e, d)
                     return o
 
-            return Prog
+            return ProgSoftmax
 
         @pl.program
-        class Prog:
+        class ProgRms:
             @pl.function(attrs={"auto_fuse": True})
             def sweep_rms(self, x: pl.Tensor[[M, N], DT]) -> pl.Tensor[[M, N], DT]:
                 sq: pl.Tensor[[M, N], DT] = pl.mul(x, x)
@@ -1094,7 +1098,7 @@ class AutoFuseSweepCase(PTOTestCase):
                 o: pl.Tensor[[M, N], DT] = pl.row_expand_mul(x, inv)
                 return o
 
-        return Prog
+        return ProgRms
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         x = tensors["x"].to(torch.float32)  # reference in fp32; result cast back to the tile dtype
