@@ -1002,6 +1002,105 @@ class ModelAttentionCase(PTOTestCase):
         tensors["out"][:] = torch.softmax((q @ k) * 0.125, dim=-1) @ v
 
 
+# ===========================================================================
+# Part D — shape x dtype SWEEP (wide model-verification coverage)
+# ===========================================================================
+#
+# One kernel family (pointwise / softmax / RMSNorm-style) swept across the shape space and both
+# dtypes, to stress the emit where fixed cases can't: ragged widths (66/130 -> padding +
+# count-mode floor), wide tiles (1024 -> sub-granule strip cap), tall tiles (4096 rows -> many
+# strips), the wide-short over-pad case (64x4096), and the fp32/fp16 granule (64 vs 128 elems/
+# repeat). Widths stay <= 1024 for reductions (>= 2048 fused reductions need streaming, not built).
+# FP16 covers only the scalar-free reduction kernels (a fp16 tensor + a fp32 scalar const promotes
+# to fp32 in the DSL, so fp16 pointwise-with-scalar is skipped — an authoring limitation, not emit).
+SWEEP_GRID = [
+    ("pw", 64, 64, "fp32"), ("pw", 130, 66, "fp32"), ("pw", 256, 512, "fp32"),
+    ("pw", 512, 1024, "fp32"), ("pw", 4096, 64, "fp32"), ("pw", 64, 4096, "fp32"),
+    ("softmax", 256, 128, "fp32"), ("softmax", 256, 66, "fp32"), ("softmax", 128, 512, "fp32"),
+    ("softmax", 512, 1024, "fp32"), ("softmax", 64, 256, "fp32"),
+    ("rms", 256, 512, "fp32"), ("rms", 256, 1024, "fp32"), ("rms", 128, 256, "fp32"),
+    ("rms", 130, 128, "fp32"),
+    ("softmax", 256, 128, "fp16"), ("softmax", 256, 512, "fp16"), ("softmax", 128, 256, "fp16"),
+    ("rms", 256, 512, "fp16"), ("rms", 256, 1024, "fp16"), ("rms", 128, 128, "fp16"),
+]
+
+
+class AutoFuseSweepCase(PTOTestCase):
+    """One sweep point: kernel `kernel` at shape (M,N), dtype `dt`. The RMSNorm-style kernel here
+    is the bare `x * rsqrt(sum(x^2))` (reduction + broadcast + rsqrt, no mean/eps) — enough to
+    stress the reduction path; the real eps/mean RMSNorm is the fixed Part-C case."""
+
+    __test__ = False
+
+    def __init__(self, kernel: str, M: int, N: int, dt: str, *, platform: str | None = None, config=None):
+        self.kernel, self.M, self.N, self.dt = kernel, M, N, dt
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"autofuse_sweep_{self.kernel}_{self.M}x{self.N}_{self.dt}"
+
+    def _dtype(self) -> Any:
+        return DataType.FP16 if self.dt == "fp16" else DataType.FP32
+
+    def define_tensors(self) -> list[TensorSpec]:
+        d = self._dtype()
+        return [
+            TensorSpec("x", [self.M, self.N], d, init_value=torch.randn),
+            TensorSpec("out", [self.M, self.N], d, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, N = self.M, self.N
+        DT = pl.FP16 if self.dt == "fp16" else pl.FP32
+        if self.kernel == "pw":
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def f(self, x: pl.Tensor[[M, N], DT]) -> pl.Tensor[[M, N], DT]:
+                    a: pl.Tensor[[M, N], DT] = pl.add(x, 1.0)
+                    b: pl.Tensor[[M, N], DT] = pl.mul(a, 2.0)
+                    return b
+
+            return Prog
+        if self.kernel == "softmax":
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def f(self, x: pl.Tensor[[M, N], DT]) -> pl.Tensor[[M, N], DT]:
+                    m: pl.Tensor[[M, 1], DT] = pl.row_max(x)
+                    s: pl.Tensor[[M, N], DT] = pl.row_expand_sub(x, m)
+                    e: pl.Tensor[[M, N], DT] = pl.exp(s)
+                    d: pl.Tensor[[M, 1], DT] = pl.row_sum(e)
+                    o: pl.Tensor[[M, N], DT] = pl.row_expand_div(e, d)
+                    return o
+
+            return Prog
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def f(self, x: pl.Tensor[[M, N], DT]) -> pl.Tensor[[M, N], DT]:
+                sq: pl.Tensor[[M, N], DT] = pl.mul(x, x)
+                ss: pl.Tensor[[M, 1], DT] = pl.row_sum(sq)
+                inv: pl.Tensor[[M, 1], DT] = pl.rsqrt(ss)
+                o: pl.Tensor[[M, N], DT] = pl.row_expand_mul(x, inv)
+                return o
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"].to(torch.float32)  # reference in fp32; result cast back to the tile dtype
+        if self.kernel == "pw":
+            r = (x + 1.0) * 2.0
+        elif self.kernel == "softmax":
+            r = torch.softmax(x, dim=-1)
+        else:  # bare rms: x * rsqrt(sum(x^2))
+            r = x * torch.rsqrt(x.pow(2).sum(-1, keepdim=True))
+        tensors["out"][:] = r.to(tensors["out"].dtype)
+
+
 class TestAutoFuseDevice:
     """AutoFuse on device: the reduction-valid probe + free-axis padding numerics."""
 
@@ -1139,6 +1238,17 @@ class TestAutoFuseDevice:
     def test_model_attention(self, test_runner, platform):
         result = test_runner.run(ModelAttentionCase(platform=platform, config=_RSQRT_TOL))
         assert result.passed, f"Attention block [128,64] mismatch on device: {result.error}"
+
+    # -- Part D: shape x dtype sweep (wide coverage) --
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.parametrize("kernel,M,N,dt", SWEEP_GRID)
+    def test_autofuse_sweep(self, test_runner, platform, kernel, M, N, dt):
+        # fp16 -> the rounding-floor tolerance; fp32 rms -> the HW-rsqrt tolerance; fp32 pw/softmax
+        # are exact (no rsqrt), default tight tolerance.
+        cfg = _FP16_TOL if dt == "fp16" else (_RSQRT_TOL if kernel == "rms" else None)
+        result = test_runner.run(AutoFuseSweepCase(kernel, M, N, dt, platform=platform, config=cfg))
+        assert result.passed, f"AutoFuse sweep {kernel}[{M},{N}]/{dt} mismatch on device: {result.error}"
 
 
 if __name__ == "__main__":
