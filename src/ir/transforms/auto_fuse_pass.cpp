@@ -25,8 +25,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1553,8 +1556,19 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
 
   auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
   LOG_INFO << "AutoFuse[generic]: " << (has_reduction ? "elementwise+reduction" : "elementwise")
-           << " group '" << name << "' tiled by the generic driver (" << ops.size() << " ops, "
-           << (num_m * num_n) << " tiles, " << (num_strips >= 2 ? num_strips : 1) << " pipeline strips)";
+           << " group '" << name << "' tiled by the generic driver (" << ops.size() << " ops, grid "
+           << num_m << "x" << num_n << " = " << (num_m * num_n) << " tiles, "
+           << (num_strips >= 2 ? num_strips : 1) << " pipeline strips)";
+  // Grid fidelity (cost-vs-latency experiment): the emit realizes a ceil(IM/h) x ceil(IN/w) grid,
+  // whose MAX region extent is h/w -> its critical-path latency matches the solver's balanced
+  // parts_m x parts_n partition (which also has max extent h/w). But the region COUNT can differ
+  // (ceil(M/h) <= parts_m), perturbing core occupancy (a >C-core / multi-wave effect). Surface any
+  // mismatch so a forced-plan measurement can record it -- the cost is the parts grid's, the wall
+  // time is the emitted grid's; they diverge only when the counts do.
+  if ((tile.parts_m > 0 && tile.parts_m != num_m) || (tile.parts_n > 0 && tile.parts_n != num_n))
+    LOG_INFO << "AutoFuse[generic]: group '" << name << "' emitted grid " << num_m << "x" << num_n
+             << " != solver parts " << tile.parts_m << "x" << tile.parts_n
+             << " (same max-extent h/w -> same critical path; region count differs -> occupancy only)";
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
@@ -2367,14 +2381,25 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     // group in an InCoreScopeStmt, and realize the chosen tile (step.config) for
     // matmuls — the output `[w,h]` tiling + the per-tile k-pipeline.
     // Cost-vs-wall-time validation knobs (off the hot path — only when set):
-    //   PYPTO_AUTOFUSE_DUMP_PLANS=1       -> log every feasible (w,h,split)+modeled cost per group
-    //   PYPTO_AUTOFUSE_FORCE_PLAN="w,h,s" -> EMIT that plan instead of the solver argmin, so the
-    //       device runs it; the paired modeled cost is the logged FORCED line. A field = -1 (e.g.
-    //       "-1,6,2") wildcards it. The plan must be a feasible candidate (from enumerate_plans).
+    //   PYPTO_AUTOFUSE_DUMP_PLANS=1       -> log every feasible candidate + modeled cost per group,
+    //       as the FULL plan key: w,h,split,parts_m,parts_n (the solver's spatial grid, not just the
+    //       tile). Two candidates can share (w,h,split) but differ in (parts_m,parts_n) -> different
+    //       modeled cost, same emitted kernel; dumping the grid makes that collapse visible.
+    //   PYPTO_AUTOFUSE_FORCE_PLAN="[g<N>:]w,h,s[,pm,pn]" -> EMIT that plan instead of the solver
+    //       argmin, so the device runs it; the paired modeled cost is the logged FORCED line. A field
+    //       = -1 (e.g. "-1,6,2") wildcards it. parts_m/parts_n are optional (default wildcard) —
+    //       supply them to disambiguate two candidates sharing (w,h,split). An optional "g<N>:" prefix
+    //       restricts the force to group N (else every matching group is forced — vary ONE group in a
+    //       multi-group kernel with "g1:16,32,2"). The plan must be a feasible candidate.
     static const bool dump_plans = std::getenv("PYPTO_AUTOFUSE_DUMP_PLANS") != nullptr;
     static const char* force_env = std::getenv("PYPTO_AUTOFUSE_FORCE_PLAN");
-    long fw = -1, fh = -1, fs = -1;
-    if (force_env != nullptr) std::sscanf(force_env, "%ld,%ld,%ld", &fw, &fh, &fs);
+    long fw = -1, fh = -1, fs = -1, fpm = -1, fpn = -1, fg = -1;
+    if (force_env != nullptr) {
+      const char* spec = force_env;
+      if (spec[0] == 'g') std::sscanf(spec, "g%ld:", &fg);        // optional group selector
+      if (const char* colon = std::strchr(spec, ':')) spec = colon + 1;
+      std::sscanf(spec, "%ld,%ld,%ld,%ld,%ld", &fw, &fh, &fs, &fpm, &fpn);
+    }
 
     std::unordered_map<const Stmt*, size_t> stmt_group;
     std::unordered_map<const Stmt*, SolverTile> stmt_tile;  // group's [w,h,k] tile, for matmul tiling
@@ -2384,18 +2409,28 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       SolverTile tile{cfg.w, cfg.h, cfg.k, sol.step_cost(s).parallel_split, cfg.parts_m, cfg.parts_n};
       if (dump_plans || force_env != nullptr) {
         bool forced_here = false;
+        std::set<std::tuple<int64_t, int64_t, size_t, int64_t, int64_t>> seen_plans;  // dedup identical keys
         for (const auto& [pc, pr] : sol.step(s).subgraph.enumerate_plans()) {
-          if (dump_plans)
+          if (dump_plans &&
+              seen_plans.emplace(pc.w, pc.h, pr.parallel_split, pc.parts_m, pc.parts_n).second)
             LOG_INFO << "AutoFuse[" << func->name_ << "]: PLAN group=" << s << " w=" << pc.w << " h="
-                     << pc.h << " split=" << pr.parallel_split << " cost=" << pr.latency;
-          if (force_env != nullptr && !forced_here && (fw < 0 || pc.w == fw) && (fh < 0 || pc.h == fh) &&
-              (fs < 0 || static_cast<long>(pr.parallel_split) == fs)) {
+                     << pc.h << " split=" << pr.parallel_split << " parts_m=" << pc.parts_m
+                     << " parts_n=" << pc.parts_n << " cost=" << pr.latency;
+          if (force_env != nullptr && !forced_here && (fg < 0 || static_cast<long>(s) == fg) &&
+              (fw < 0 || pc.w == fw) && (fh < 0 || pc.h == fh) &&
+              (fs < 0 || static_cast<long>(pr.parallel_split) == fs) &&
+              (fpm < 0 || pc.parts_m == fpm) && (fpn < 0 || pc.parts_n == fpn)) {
             tile = SolverTile{pc.w, pc.h, pc.k, pr.parallel_split, pc.parts_m, pc.parts_n};
             forced_here = true;
             LOG_INFO << "AutoFuse[" << func->name_ << "]: FORCED group=" << s << " w=" << pc.w << " h="
-                     << pc.h << " split=" << pr.parallel_split << " cost=" << pr.latency;
+                     << pc.h << " split=" << pr.parallel_split << " parts_m=" << pc.parts_m
+                     << " parts_n=" << pc.parts_n << " cost=" << pr.latency;
           }
         }
+        if (force_env != nullptr && !forced_here && (fg < 0 || static_cast<long>(s) == fg))
+          LOG_WARN << "AutoFuse[" << func->name_ << "]: FORCE_PLAN '" << force_env
+                   << "' matched NO feasible candidate for group=" << s
+                   << " -> using the solver argmin (experiment plan is NOT the one you forced)";
       }
       for (size_t op_idx : sol.step(s).subgraph.ops()) {
         const Stmt* stmt = builder.op_stmts[op_idx];
