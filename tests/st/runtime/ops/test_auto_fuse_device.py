@@ -267,6 +267,16 @@ F16_M, F16_N = 256, 128     # FP16 softmax (granule g=16)
 CS_M, CS_N = 128, 256       # bare col_sum sink -> S2 split-reduction (atomic-add merge)
 FK_M, FK_N = 256, 256       # multi-sink fork: two live-outs sharing an input
 
+# --- Part C: model-fragment experiments (realistic transformer components) ---
+MRMS_M, MRMS_N = 256, 1024   # wider RMSNorm: exercises the sub-granule reduction-strip cap
+MLN_M, MLN_N = 256, 1024     # wider LayerNorm (two reductions)
+RES_M, RES_N = 256, 1024     # residual add + RMSNorm (a pre-norm block head)
+SILU_M, SILU_N = 256, 1024   # SiLU/Swish activation: x*sigmoid(x) = x/(1+exp(-x))
+SWG_M, SWG_N = 256, 1024     # SwiGLU FFN gating: silu(gate)*up (two inputs)
+SSM_M, SSM_N = 256, 512      # scaled softmax (attention scores * 1/sqrt(d))
+TWIN_M, TWIN_N = 256, 512    # two interleaved independent chains (group-reorder fix)
+ATT_S, ATT_D = 128, 64       # attention block: q@k -> scaled softmax -> p@v
+
 
 class AutoFuseRaggedPointwiseCase(PTOTestCase):
     """AutoFuse ragged pointwise [130,66]: c=a+1; d=c*2. Free-axis N padding, on device."""
@@ -665,6 +675,333 @@ class AutoFuseForkCase(PTOTestCase):
         tensors["outb"][:] = (x + 1.0) * 3.0
 
 
+# ===========================================================================
+# Part C — model-fragment experiments (realistic transformer components)
+# ===========================================================================
+
+
+class ModelRmsNormWideCase(PTOTestCase):
+    """RMSNorm at hidden=1024 — wider than the [256,512] Part-B case, so the free-axis
+    reduction strips are sub-granule and the emit falls to the serial (granule-multiple)
+    path. Validates the sub-granule-strip cap end-to-end on hardware."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "model_rmsnorm_256x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [MRMS_M, MRMS_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [MRMS_M, MRMS_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def rms(self, x: pl.Tensor[[MRMS_M, MRMS_N], pl.FP32]) -> pl.Tensor[[MRMS_M, MRMS_N], pl.FP32]:
+                sq: pl.Tensor[[MRMS_M, MRMS_N], pl.FP32] = pl.mul(x, x)
+                ss: pl.Tensor[[MRMS_M, 1], pl.FP32] = pl.row_sum(sq)
+                ms: pl.Tensor[[MRMS_M, 1], pl.FP32] = pl.mul(ss, 1.0 / MRMS_N)
+                var: pl.Tensor[[MRMS_M, 1], pl.FP32] = pl.add(ms, NORM_EPS)
+                inv: pl.Tensor[[MRMS_M, 1], pl.FP32] = pl.rsqrt(var)
+                out: pl.Tensor[[MRMS_M, MRMS_N], pl.FP32] = pl.mul(x, inv)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        tensors["out"][:] = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + NORM_EPS)
+
+
+class ModelLayerNormWideCase(PTOTestCase):
+    """LayerNorm at hidden=1024 — two reductions (mean + variance) + broadcast, wide."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "model_layernorm_256x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [MLN_M, MLN_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [MLN_M, MLN_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def ln(self, x: pl.Tensor[[MLN_M, MLN_N], pl.FP32]) -> pl.Tensor[[MLN_M, MLN_N], pl.FP32]:
+                sx: pl.Tensor[[MLN_M, 1], pl.FP32] = pl.row_sum(x)
+                mu: pl.Tensor[[MLN_M, 1], pl.FP32] = pl.mul(sx, 1.0 / MLN_N)
+                xc: pl.Tensor[[MLN_M, MLN_N], pl.FP32] = pl.sub(x, mu)
+                sq: pl.Tensor[[MLN_M, MLN_N], pl.FP32] = pl.mul(xc, xc)
+                sv: pl.Tensor[[MLN_M, 1], pl.FP32] = pl.row_sum(sq)
+                var: pl.Tensor[[MLN_M, 1], pl.FP32] = pl.mul(sv, 1.0 / MLN_N)
+                ve: pl.Tensor[[MLN_M, 1], pl.FP32] = pl.add(var, NORM_EPS)
+                inv: pl.Tensor[[MLN_M, 1], pl.FP32] = pl.rsqrt(ve)
+                out: pl.Tensor[[MLN_M, MLN_N], pl.FP32] = pl.mul(xc, inv)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        xc = x - x.mean(-1, keepdim=True)
+        tensors["out"][:] = xc * torch.rsqrt(xc.pow(2).mean(-1, keepdim=True) + NORM_EPS)
+
+
+class ModelResidualRmsNormCase(PTOTestCase):
+    """Pre-norm block head: h = x + residual; out = RMSNorm(h). A reduction over an
+    elementwise-produced intermediate — the residual add and the norm fuse into one kernel."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "model_residual_rmsnorm_256x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [RES_M, RES_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("res", [RES_M, RES_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [RES_M, RES_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def resrms(
+                self, x: pl.Tensor[[RES_M, RES_N], pl.FP32], res: pl.Tensor[[RES_M, RES_N], pl.FP32]
+            ) -> pl.Tensor[[RES_M, RES_N], pl.FP32]:
+                h: pl.Tensor[[RES_M, RES_N], pl.FP32] = pl.add(x, res)
+                sq: pl.Tensor[[RES_M, RES_N], pl.FP32] = pl.mul(h, h)
+                ss: pl.Tensor[[RES_M, 1], pl.FP32] = pl.row_sum(sq)
+                ms: pl.Tensor[[RES_M, 1], pl.FP32] = pl.mul(ss, 1.0 / RES_N)
+                var: pl.Tensor[[RES_M, 1], pl.FP32] = pl.add(ms, NORM_EPS)
+                inv: pl.Tensor[[RES_M, 1], pl.FP32] = pl.rsqrt(var)
+                out: pl.Tensor[[RES_M, RES_N], pl.FP32] = pl.mul(h, inv)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        h = tensors["x"] + tensors["res"]
+        tensors["out"][:] = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + NORM_EPS)
+
+
+class ModelSiluCase(PTOTestCase):
+    """SiLU/Swish activation out = x*sigmoid(x), composed as x/(1+exp(-x)) — a pure
+    pointwise chain (neg, exp, add, div) at FFN width."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "model_silu_256x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [SILU_M, SILU_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [SILU_M, SILU_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def silu(self, x: pl.Tensor[[SILU_M, SILU_N], pl.FP32]) -> pl.Tensor[[SILU_M, SILU_N], pl.FP32]:
+                nx: pl.Tensor[[SILU_M, SILU_N], pl.FP32] = pl.neg(x)
+                e: pl.Tensor[[SILU_M, SILU_N], pl.FP32] = pl.exp(nx)
+                d: pl.Tensor[[SILU_M, SILU_N], pl.FP32] = pl.add(e, 1.0)
+                out: pl.Tensor[[SILU_M, SILU_N], pl.FP32] = pl.div(x, d)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        tensors["out"][:] = x * torch.sigmoid(x)
+
+
+class ModelSwiGluCase(PTOTestCase):
+    """SwiGLU FFN gating out = silu(gate)*up — the LLaMA/PaLM FFN nonlinearity, two inputs."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "model_swiglu_256x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("gate", [SWG_M, SWG_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("up", [SWG_M, SWG_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [SWG_M, SWG_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def swiglu(
+                self, gate: pl.Tensor[[SWG_M, SWG_N], pl.FP32], up: pl.Tensor[[SWG_M, SWG_N], pl.FP32]
+            ) -> pl.Tensor[[SWG_M, SWG_N], pl.FP32]:
+                ng: pl.Tensor[[SWG_M, SWG_N], pl.FP32] = pl.neg(gate)
+                e: pl.Tensor[[SWG_M, SWG_N], pl.FP32] = pl.exp(ng)
+                d: pl.Tensor[[SWG_M, SWG_N], pl.FP32] = pl.add(e, 1.0)
+                s: pl.Tensor[[SWG_M, SWG_N], pl.FP32] = pl.div(gate, d)
+                out: pl.Tensor[[SWG_M, SWG_N], pl.FP32] = pl.mul(s, up)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        gate, up = tensors["gate"], tensors["up"]
+        tensors["out"][:] = (gate * torch.sigmoid(gate)) * up
+
+
+class ModelScaledSoftmaxCase(PTOTestCase):
+    """Attention-score softmax: out = softmax(scores / sqrt(d)) — a scale then the numerically
+    stable softmax (row_max, sub, exp, row_sum, div). The pre-scale is the attention 1/sqrt(d)."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "model_scaled_softmax_256x512"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("s", [SSM_M, SSM_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [SSM_M, SSM_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, s: pl.Tensor[[SSM_M, SSM_N], pl.FP32]) -> pl.Tensor[[SSM_M, SSM_N], pl.FP32]:
+                sc: pl.Tensor[[SSM_M, SSM_N], pl.FP32] = pl.mul(s, 0.125)
+                m: pl.Tensor[[SSM_M, 1], pl.FP32] = pl.row_max(sc)
+                d: pl.Tensor[[SSM_M, SSM_N], pl.FP32] = pl.row_expand_sub(sc, m)
+                e: pl.Tensor[[SSM_M, SSM_N], pl.FP32] = pl.exp(d)
+                sm: pl.Tensor[[SSM_M, 1], pl.FP32] = pl.row_sum(e)
+                out: pl.Tensor[[SSM_M, SSM_N], pl.FP32] = pl.row_expand_div(e, sm)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = torch.softmax(tensors["s"] * 0.125, dim=-1)
+
+
+class ModelInterleavedTwinCase(PTOTestCase):
+    """Two INDEPENDENT elementwise chains (exp->neg on x, exp->mul on y) interleaved in source
+    order. The solver puts each in its own group; the group-reorder fix emits each as ONE fused
+    scope (was fragmented into single-op scopes spilling the intermediate to DDR). Multi-return."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "model_interleaved_twin_256x512"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [TWIN_M, TWIN_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("y", [TWIN_M, TWIN_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("outa", [TWIN_M, TWIN_N], DataType.FP32, is_output=True),
+            TensorSpec("outb", [TWIN_M, TWIN_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def twin(
+                self, x: pl.Tensor[[TWIN_M, TWIN_N], pl.FP32], y: pl.Tensor[[TWIN_M, TWIN_N], pl.FP32]
+            ) -> tuple[pl.Tensor[[TWIN_M, TWIN_N], pl.FP32], pl.Tensor[[TWIN_M, TWIN_N], pl.FP32]]:
+                a: pl.Tensor[[TWIN_M, TWIN_N], pl.FP32] = pl.exp(x)
+                b: pl.Tensor[[TWIN_M, TWIN_N], pl.FP32] = pl.exp(y)
+                a2: pl.Tensor[[TWIN_M, TWIN_N], pl.FP32] = pl.neg(a)
+                b2: pl.Tensor[[TWIN_M, TWIN_N], pl.FP32] = pl.mul(b, b)
+                return a2, b2
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["outa"][:] = -torch.exp(tensors["x"])
+        tensors["outb"][:] = torch.exp(tensors["y"]) ** 2
+
+
+class ModelAttentionCase(PTOTestCase):
+    """A full single-head attention block: p = softmax((q@k) / sqrt(d)); out = p@v. Two matmuls
+    (cube) with a scaled softmax (vector) between — the matmul + vector engines composed."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "model_attention_128x64"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("q", [ATT_S, ATT_D], DataType.FP32, init_value=torch.randn),
+            TensorSpec("k", [ATT_D, ATT_S], DataType.FP32, init_value=torch.randn),
+            TensorSpec("v", [ATT_S, ATT_D], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [ATT_S, ATT_D], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def attn(
+                self,
+                q: pl.Tensor[[ATT_S, ATT_D], pl.FP32],
+                k: pl.Tensor[[ATT_D, ATT_S], pl.FP32],
+                v: pl.Tensor[[ATT_S, ATT_D], pl.FP32],
+            ) -> pl.Tensor[[ATT_S, ATT_D], pl.FP32]:
+                s: pl.Tensor[[ATT_S, ATT_S], pl.FP32] = pl.matmul(q, k)
+                sc: pl.Tensor[[ATT_S, ATT_S], pl.FP32] = pl.mul(s, 0.125)
+                m: pl.Tensor[[ATT_S, 1], pl.FP32] = pl.row_max(sc)
+                dd: pl.Tensor[[ATT_S, ATT_S], pl.FP32] = pl.row_expand_sub(sc, m)
+                e: pl.Tensor[[ATT_S, ATT_S], pl.FP32] = pl.exp(dd)
+                sm: pl.Tensor[[ATT_S, 1], pl.FP32] = pl.row_sum(e)
+                p: pl.Tensor[[ATT_S, ATT_S], pl.FP32] = pl.row_expand_div(e, sm)
+                out: pl.Tensor[[ATT_S, ATT_D], pl.FP32] = pl.matmul(p, v)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        q, k, v = tensors["q"], tensors["k"], tensors["v"]
+        tensors["out"][:] = torch.softmax((q @ k) * 0.125, dim=-1) @ v
+
+
 class TestAutoFuseDevice:
     """AutoFuse on device: the reduction-valid probe + free-axis padding numerics."""
 
@@ -760,6 +1097,48 @@ class TestAutoFuseDevice:
     def test_autofuse_fork(self, test_runner, platform):
         result = test_runner.run(AutoFuseForkCase(platform=platform))
         assert result.passed, f"AutoFuse multi-sink fork [256,256] mismatch on device: {result.error}"
+
+    # -- Part C: model-fragment experiments (transformer components) --
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_model_rmsnorm_wide(self, test_runner, platform):
+        result = test_runner.run(ModelRmsNormWideCase(platform=platform, config=_RSQRT_TOL))
+        assert result.passed, f"RMSNorm [256,1024] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_model_layernorm_wide(self, test_runner, platform):
+        result = test_runner.run(ModelLayerNormWideCase(platform=platform, config=_RSQRT_TOL))
+        assert result.passed, f"LayerNorm [256,1024] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_model_residual_rmsnorm(self, test_runner, platform):
+        result = test_runner.run(ModelResidualRmsNormCase(platform=platform, config=_RSQRT_TOL))
+        assert result.passed, f"Residual+RMSNorm [256,1024] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_model_silu(self, test_runner, platform):
+        result = test_runner.run(ModelSiluCase(platform=platform))
+        assert result.passed, f"SiLU [256,1024] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_model_swiglu(self, test_runner, platform):
+        result = test_runner.run(ModelSwiGluCase(platform=platform))
+        assert result.passed, f"SwiGLU [256,1024] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_model_scaled_softmax(self, test_runner, platform):
+        result = test_runner.run(ModelScaledSoftmaxCase(platform=platform))
+        assert result.passed, f"Scaled softmax [256,512] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_model_interleaved_twin(self, test_runner, platform):
+        result = test_runner.run(ModelInterleavedTwinCase(platform=platform))
+        assert result.passed, f"Interleaved twin [256,512] (group-reorder) mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_model_attention(self, test_runner, platform):
+        result = test_runner.run(ModelAttentionCase(platform=platform, config=_RSQRT_TOL))
+        assert result.passed, f"Attention block [128,64] mismatch on device: {result.error}"
 
 
 if __name__ == "__main__":
