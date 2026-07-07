@@ -103,12 +103,15 @@ class TestL0TilingDocExamples:
         """
         cfg = _default_config(M=4096, N=4096, K=4096)
         result = passes.l0_tile_chooser.choose_l0_tile(cfg)
-        assert (result.m, result.n, result.k) == (256, 128, 64)
+        # The per-M-row drain (∝m) breaks the square-shape aspect toward wide-N/small-M
+        # (fewer FIXPIPE rows per drain). Deeply compute-bound, so device-neutral vs the
+        # transposed (256,128,64) — the drain is hidden either way.
+        assert (result.m, result.n, result.k) == (128, 256, 64)
         assert _capacities_ok(result.m, result.n, result.k, cfg)
         assert cfg.K % result.k == 0, f"k must divide K=4096; got k={result.k}"
 
     def test_example_3_c_double_buffer_declined_when_compute_bound(self):
-        """M=N=K=4096 with allow_double_buffer_c=True → still (256, 128, 64), dbC=1.
+        """M=N=K=4096 with allow_double_buffer_c=True → still (128, 256, 64), dbC=1.
 
         This GEMM is deeply compute-bound (C_mad dwarfs C_drain), so hiding the
         drain behind the next tile's compute buys nothing while halving the L0C
@@ -118,7 +121,7 @@ class TestL0TilingDocExamples:
         cfg = _default_config(M=4096, N=4096, K=4096)
         cfg.allow_double_buffer_c = True
         result = passes.l0_tile_chooser.choose_l0_tile(cfg)
-        assert (result.m, result.n, result.k) == (256, 128, 64)
+        assert (result.m, result.n, result.k) == (128, 256, 64)
         assert result.double_buffer_c is False
         assert _capacities_ok(result.m, result.n, result.k, cfg, dbc=result.double_buffer_c)
 
@@ -350,21 +353,19 @@ def _wall_key(m: int, n: int, k: int, cfg, stat: str, dbc: bool) -> tuple:
     per_mn = k_blocks * cfg.mad_head + cpr * _cdiv(m, cfg.align_m) * k_fractals * _cdiv(n, cfg.align_n)
     mad = _cdiv(M, m) * _cdiv(N, n) * per_mn
     # Tile-dependent FIXPIPE drain (mirrors C++ DrainCycles): one drain per (m, n)
-    # output block = fixed issue overhead + the #1912 aligned byte-throughput term +
-    # a misalignment term. FIXPIPE addresses one M-row of the N1 M1 M0 N0 accumulator
-    # at a time, bursting the N1 = ceil(n/N0) fractals (N0 = drain_c0_bytes/bytes_c)
-    # in pow2-aligned groups; the odd part of N1 counts the serial passes it cannot
-    # parallelize (the N%32 drain cliff). M/N-split raises the drain count; K-split
-    # does not. gamma_c (C read-back) rides the byte term only; misalignment is write-side.
+    # output block = m-independent fixed issue overhead + a PER-M-ROW cost. FIXPIPE
+    # addresses one M-row of the N1 M1 M0 N0 accumulator at a time; the per-row cost is
+    # max(floor, throughput) -- a fixed burst-issue floor (drain_row) for narrow N, or
+    # the fractal byte throughput (bytes_c*n/bw_drain) for wide N -- plus the odd
+    # residual (odd(N1)-1) for a non-pow2 N (the N%32 cliff). Write-side, so no gamma_c.
+    # M/N-split raises the drain count; K-split does not.
     num_drains = _cdiv(M, m) * _cdiv(N, n)
     n0 = max(1, cfg.drain_c0_bytes // cfg.bytes_c)
     n1 = _cdiv(n, n0)
-    gamma_c = 2.0 if cfg.c_read else 1.0
-    per_drain = (
-        cfg.drain_fixed_cycles
-        + gamma_c * cfg.bytes_c * m * n / cfg.bw_drain
-        + m * cfg.drain_penalty_cycles * (_odd_part(n1) - 1)
+    per_row = max(cfg.drain_row_cycles, cfg.bytes_c * n / cfg.bw_drain) + cfg.drain_penalty_cycles * (
+        _odd_part(n1) - 1
     )
+    per_drain = cfg.drain_fixed_cycles + m * per_row
     drain = num_drains * per_drain
     compute = max(load, float(mad))
     wall = int((max(compute, drain) if dbc else compute + drain) + 0.5)
@@ -545,10 +546,14 @@ class TestL0TilingRooflineOptimum:
         """Opening the stationarity gates lets the chooser pin an operand (k == K),
         and the derived per-operand depth follows (stationary operand single-buffered).
 
-        256x256x256: pinning A in a full (single-buffered) L0A admits a k = K = 256
-        tile that the output-stationary route (half L0A) cannot, and combined with a
-        hidden drain it beats the OS optimum. Without the gate the chooser stays OS.
+        256x256x256: pinning an operand in a full (single-buffered) L0 admits a
+        k = K = 256 tile that the output-stationary route (half L0) cannot, and
+        combined with a hidden drain it beats the OS optimum. For this symmetric shape
+        A- and B-stationary are transposes; the per-M-row drain (∝m) breaks the tie
+        toward the aspect with fewer M-rows (B-stationary here). Without the gate OS.
         """
+        AS = passes.l0_tile_chooser.Stationarity.AStationary
+        BS = passes.l0_tile_chooser.Stationarity.BStationary
         OS = passes.l0_tile_chooser.Stationarity.OutputStationary
         assert passes.l0_tile_chooser.choose_l0_tile(_default_config(M=256, N=256, K=256)).stationarity == OS
         cfg = _default_config(M=256, N=256, K=256)
@@ -556,46 +561,52 @@ class TestL0TilingRooflineOptimum:
         cfg.allow_b_stationary = True
         cfg.allow_double_buffer_c = True
         r = passes.l0_tile_chooser.choose_l0_tile(cfg)
-        assert r.stationarity == passes.l0_tile_chooser.Stationarity.AStationary
+        assert r.stationarity in (AS, BS), "an operand must be pinned once the gate is open"
         assert r.k == 256, "operand-stationary pins across the full K reduction (k == K)"
-        # A-stationary derives dbA=1 (A pinned, full L0A), dbB=2 (B streams).
-        assert _capacities_ok(r.m, r.n, r.k, cfg, dba=False, dbb=True, dbc=r.double_buffer_c)
+        # Depths derive from the chosen stationarity: the pinned operand single-buffers.
+        stat = _AS if r.stationarity == AS else _BS
+        dba, dbb = _derive_db(stat)
+        assert _capacities_ok(r.m, r.n, r.k, cfg, dba=dba, dbb=dbb, dbc=r.double_buffer_c)
 
-    def test_aspect_swap_ties_under_min_hoist(self):
-        """MAD-bound square shape: the aspect-swapped tiles (m, n) and (n, m) are
-        FULLY wall-tied under the op-sim-calibrated min-hoist load model. OS loads
-        min(hold-A, hold-B), so (256,128) [holds A] and (128,256) [holds B] have the
-        identical load -> identical wall key. The aligned drain is symmetric in m*n
-        (odd(N1)==1 for both), so it does not break the tie either. We accept the
-        tie: the chooser returns a deterministic aspect by enumeration order (m <= n),
-        matching the exhaustive oracle. (Pre-calibration this picked (256,128,64).)"""
+    def test_aspect_swap_broken_by_per_row_drain(self):
+        """MAD-bound square shape: the aspect-swapped tiles (m, n) and (n, m) tie on
+        load (OS min-hoist) and compute, but the per-M-row FIXPIPE drain BREAKS the tie
+        toward the smaller-M aspect (drain ∝ m -- FIXPIPE addresses one M-row at a time),
+        so (128,256) [128 rows] drains cheaper than (256,128) [256 rows] -> strictly
+        lower wall. (Pre-per-row-drain these aspects were fully wall-tied.)"""
         cfg = _default_config(M=256, N=256, K=64)
-        # The two aspects genuinely tie on the full wall key -- nothing to break on:
-        assert _wall_key(256, 128, 64, cfg, _OS, False) == _wall_key(128, 256, 64, cfg, _OS, False)
+        assert _wall_key(128, 256, 64, cfg, _OS, False) < _wall_key(256, 128, 64, cfg, _OS, False)
         r = passes.l0_tile_chooser.choose_l0_tile(cfg)
-        assert (r.m, r.n, r.k) == (128, 256, 64)  # deterministic (enum order); a valid tied optimum
+        assert (r.m, r.n, r.k) == (128, 256, 64)  # the strictly-lower-drain aspect
         btile, _, _, _ = _brute_optimum(cfg)
         assert (r.m, r.n, r.k) == btile
 
     def test_estimated_traffic_matches_chosen_stationarity(self):
         """estimated_traffic_bytes (inspection metadata) must reflect the CHOSEN
-        stationarity, not always output-stationary. An A-stationary tile loads A
-        once (not ceil(N/n) times), so its reported traffic is the A-stationary
-        sum and never exceeds the output-stationary sum for the same tile."""
+        stationarity, not always output-stationary. An operand-stationary tile loads
+        its pinned operand once (not ceil(.) times), so its reported traffic is the
+        pinned-operand sum and never exceeds the output-stationary sum for the same
+        tile. (Symmetric shape: the per-M-row drain pins B here; derive from the
+        actual stationarity.)"""
+        AS = passes.l0_tile_chooser.Stationarity.AStationary
+        BS = passes.l0_tile_chooser.Stationarity.BStationary
         cfg = _default_config(M=256, N=256, K=256)
         cfg.allow_a_stationary = True
         cfg.allow_b_stationary = True
         cfg.allow_double_buffer_c = True
         r = passes.l0_tile_chooser.choose_l0_tile(cfg)
-        assert r.stationarity == passes.l0_tile_chooser.Stationarity.AStationary
+        assert r.stationarity in (AS, BS)
         M, N, K = 256, 256, 256
         cn, cm = _cdiv(N, r.n), _cdiv(M, r.m)
         gamma_c = 2 if cfg.c_read else 1
         c_traffic = gamma_c * cfg.bytes_c * M * N
-        a_stat = cfg.bytes_a * M * K + cfg.bytes_b * K * N * cm + c_traffic  # A loaded once
+        if r.stationarity == AS:
+            pinned = cfg.bytes_a * M * K + cfg.bytes_b * K * N * cm + c_traffic  # A loaded once
+        else:
+            pinned = cfg.bytes_a * M * K * cn + cfg.bytes_b * K * N + c_traffic  # B loaded once
         os = cfg.bytes_a * M * K * cn + cfg.bytes_b * K * N * cm + c_traffic
-        assert r.estimated_traffic_bytes == a_stat, "traffic must use the A-stationary reload counts"
-        assert a_stat <= os, "A-stationary never charges more A traffic than output-stationary"
+        assert r.estimated_traffic_bytes == pinned, "traffic must use the pinned-operand reload counts"
+        assert pinned <= os, "operand-stationary never charges more than output-stationary"
 
     def test_estimated_traffic_matches_os_full_k_hoist(self):
         """For a full-K output-stationary tile the emit hoists ONE operand (recorded in
@@ -721,11 +732,13 @@ class TestL0TilingRooflineMigration:
                 2,
                 (192, 160, 64),
                 (128, 256, 64),
-            ),  # min-hoist: aspect tie -> enum order picks m<n
-            # drain misalignment penalty steers off n=96/n=160 (odd(N1)>1) to aligned n=64:
-            (272, 272, 64, 2, (192, 160, 64), (272, 64, 32)),
-            (320, 320, 64, 2, (192, 160, 64), (320, 64, 32)),
-            (256, 256, 256, 4, (192, 160, 32), (256, 128, 32)),
+            ),  # per-M-row drain (∝m) picks the wide-N / small-M aspect
+            # the misalignment penalty + narrow-N floor steer off n=96/n=160 (odd>1) to
+            # aligned n=128; the byte-throughput term keeps wide-N correctly priced so the
+            # chooser lands an aligned tile (not a wide-misaligned one):
+            (272, 272, 64, 2, (192, 160, 64), (144, 128, 64)),
+            (320, 320, 64, 2, (192, 160, 64), (160, 128, 64)),
+            (256, 256, 256, 4, (192, 160, 32), (128, 256, 32)),
         ],
     )
     def test_roofline_tile_migration(self, M, N, K, bytes_ab, old_closed_form, new_roofline):

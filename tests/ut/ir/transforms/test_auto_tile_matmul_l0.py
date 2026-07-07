@@ -1184,13 +1184,12 @@ class TestAutoTileMatmulL0MNTiling:
         outer (M) loop carrying A's extract + a **pipelined** inner (N) loop — one
         pipeline, not the two nested pipelines of the output-stationary path.
 
-        496×544 @ 64 → A-stationary (m=496, n=64, k=64) under the drain-count model
-        (#1912): A = [496, 64] = 63.5 KB fits L0A single-buffered (≤ 64 KB) but would
-        overflow double-buffered, so the single-buffered Sequential outer is what
-        makes the tile legal. n=64 (not the pre-drain-count n=32) cuts the drain
-        count in half; 544 = 8*64 + 32, so the inner pipeline runs the 8 full 64-wide
-        blocks and a straight-line 32-wide N-peel follows. The full Default pipeline
-        must allocate cleanly. (Numerics: st suite.)"""
+        256×544 @ 128 → A-stationary (m=256, n=128, k=128) under the per-M-row drain
+        cost model: A = [256, 128] = 64 KB fits L0A single-buffered (= 64 KB) but
+        would overflow double-buffered, so the single-buffered Sequential outer is
+        what makes the tile legal. 544 = 4*128 + 32, so the inner pipeline runs the 4
+        full 128-wide blocks and a straight-line 32-wide N-peel follows. The full
+        Default pipeline must allocate cleanly. (Numerics: st suite.)"""
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
@@ -1201,17 +1200,17 @@ class TestAutoTileMatmulL0MNTiling:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                lhs: pl.Tensor[[496, 64], pl.BF16],
-                rhs: pl.Tensor[[64, 544], pl.BF16],
-                out: pl.Out[pl.Tensor[[496, 544], pl.FP32]],
-            ) -> pl.Tensor[[496, 544], pl.FP32]:
-                lhs_mat: pl.Tile[[496, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    lhs, [0, 0], [496, 64], target_memory=pl.Mem.Mat
+                lhs: pl.Tensor[[256, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 544], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 544], pl.FP32]],
+            ) -> pl.Tensor[[256, 544], pl.FP32]:
+                lhs_mat: pl.Tile[[256, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [256, 128], target_memory=pl.Mem.Mat
                 )
-                rhs_mat: pl.Tile[[64, 544], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    rhs, [0, 0], [64, 544], target_memory=pl.Mem.Mat
+                rhs_mat: pl.Tile[[128, 544], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [128, 544], target_memory=pl.Mem.Mat
                 )
-                c: pl.Tile[[496, 544], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                c: pl.Tile[[256, 544], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
                 out = pl.store(c, [0, 0], out)
                 return out
 
@@ -1220,57 +1219,57 @@ class TestAutoTileMatmulL0MNTiling:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                lhs: pl.Tensor[[496, 64], pl.BF16],
-                rhs: pl.Tensor[[64, 544], pl.BF16],
-                out: pl.Out[pl.Tensor[[496, 544], pl.FP32]],
-            ) -> pl.Tensor[[496, 544], pl.FP32]:
-                lhs_mat: pl.Tile[[496, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    lhs, [0, 0], [496, 64], target_memory=pl.Mem.Mat
+                lhs: pl.Tensor[[256, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 544], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 544], pl.FP32]],
+            ) -> pl.Tensor[[256, 544], pl.FP32]:
+                lhs_mat: pl.Tile[[256, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [256, 128], target_memory=pl.Mem.Mat
                 )
-                rhs_mat: pl.Tile[[64, 544], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    rhs, [0, 0], [64, 544], target_memory=pl.Mem.Mat
+                rhs_mat: pl.Tile[[128, 544], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [128, 544], target_memory=pl.Mem.Mat
                 )
                 # Sequential outer (M) loop holds the single-buffered A panel (full L0A).
-                for mo, (out_o,) in pl.range(0, 496, 496, init_values=(out,)):
-                    a_held: pl.Tile[[496, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
-                        lhs_mat, mo, 0, [496, 64], target_memory=pl.Mem.Left
+                for mo, (out_o,) in pl.range(0, 256, 256, init_values=(out,)):
+                    a_held: pl.Tile[[256, 128], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, mo, 0, [256, 128], target_memory=pl.Mem.Left
                     )
-                    # Pipelined inner (N) loop over the 8 full 64-wide blocks; B double-buffered.
+                    # Pipelined inner (N) loop over the 4 full 128-wide blocks; B double-buffered.
                     for ni, (out_i,) in pl.pipeline(
-                        0, 512, 64, stage=2, init_values=(out_o,), attrs={"pipeline_overlap_stores": False}
+                        0, 512, 128, stage=2, init_values=(out_o,), attrs={"pipeline_overlap_stores": False}
                     ):
-                        b_mov: pl.Tile[[64, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
-                            rhs_mat, 0, ni, [64, 64], target_memory=pl.Mem.Right
+                        b_mov: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                            rhs_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
                         )
-                        c_sub: pl.Tile[[496, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_held, b_mov)
-                        out_s: pl.Tensor[[496, 544], pl.FP32] = pl.store(c_sub, [mo, ni], out_i)
+                        c_sub: pl.Tile[[256, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_held, b_mov)
+                        out_s: pl.Tensor[[256, 544], pl.FP32] = pl.store(c_sub, [mo, ni], out_i)
                         out_iy = pl.yield_(out_s)
                     out_oy = pl.yield_(out_iy)
-                # N-boundary peel: the last 32-wide block (544 = 8*64 + 32), straight-line.
-                a_peel: pl.Tile[[496, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
-                    lhs_mat, 0, 0, [496, 64], target_memory=pl.Mem.Left
+                # N-boundary peel: the last 32-wide block (544 = 4*128 + 32), straight-line.
+                a_peel: pl.Tile[[256, 128], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                    lhs_mat, 0, 0, [256, 128], target_memory=pl.Mem.Left
                 )
-                b_peel: pl.Tile[[64, 32], pl.BF16, pl.Mem.Right] = pl.tile.extract(
-                    rhs_mat, 0, 512, [64, 32], target_memory=pl.Mem.Right
+                b_peel: pl.Tile[[128, 32], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                    rhs_mat, 0, 512, [128, 32], target_memory=pl.Mem.Right
                 )
-                c_peel: pl.Tile[[496, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_peel, b_peel)
-                out_peel: pl.Tensor[[496, 544], pl.FP32] = pl.store(c_peel, [0, 512], out_oy)
+                c_peel: pl.Tile[[256, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_peel, b_peel)
+                out_peel: pl.Tensor[[256, 544], pl.FP32] = pl.store(c_peel, [0, 512], out_oy)
                 return out_peel
 
         After = passes.auto_tile_matmul_l0()(Before)
         ir.assert_structural_equal(After, Expected)
         # The chooser's single-buffered A tile must also allocate without an L0A
-        # overflow through the full pipeline (A = 63.5 KB single-buffered; double-
-        # buffering it, 127 KB, would exceed the 64 KB L0A).
+        # overflow through the full pipeline (A = 64 KB single-buffered; double-
+        # buffering it, 128 KB, would exceed the 64 KB L0A).
         assert PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before) is not None
 
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         torch.manual_seed(0)
-        a = torch.randn(496, 64, dtype=torch.bfloat16)
-        b = torch.randn(64, 544, dtype=torch.bfloat16)
-        out = torch.zeros(496, 544, dtype=torch.float32)
+        a = torch.randn(256, 128, dtype=torch.bfloat16)
+        b = torch.randn(128, 544, dtype=torch.bfloat16)
+        out = torch.zeros(256, 544, dtype=torch.float32)
         ns: dict = {}
         exec(torch_codegen(After), ns)  # noqa: S102
         ns["kernel"](a, b, out)
@@ -1798,7 +1797,7 @@ class TestAutoTileMatmulL0MatScratch:
 
     def test_chained_mat_scratch_producer_forced_output_stationary(self):
         """#1908 guard: a chained Mat-scratch producer whose geometry standalone picks
-        B-stationary (128×272×64) is forced OUTPUT-STATIONARY when its result is consumed
+        B-stationary (128×512×128) is forced OUTPUT-STATIONARY when its result is consumed
         on-chip. The Mat-scratch offset-packing path can't yet pack an A/B-stationary
         producer's monolithic single-buffered L0 panel against the consumer's
         double-buffered operands (#1908), so the pass re-chooses OS (always legal) rather
@@ -1806,8 +1805,8 @@ class TestAutoTileMatmulL0MatScratch:
         standalone (``test_b_stationary_single_buffers_held_operand`` mirror) — as a
         chained producer it must not be.
 
-        128×272 FP32 output (136 KB) > L0c so the producer is tiled; the 128×272 bf16
-        Mat scratch (68 KB) fits Mat/L1, so it reaches the fold (not the capacity gate).
+        128×512 FP32 output (256 KB) > L0c so the producer is tiled; the 128×512 bf16
+        Mat scratch (128 KB) fits Mat/L1, so it reaches the fold (not the capacity gate).
         The consumer [128, 64] fits L0c (no loop), so any Sequential ``pl.range`` in the
         emitted kernel would be the producer's A/B-stationary held-operand loop."""
         _backend.reset_for_testing()
@@ -1818,12 +1817,12 @@ class TestAutoTileMatmulL0MatScratch:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                a: pl.Tensor[[128, 64], pl.BF16],
-                b: pl.Tensor[[64, 272], pl.BF16],
-                e: pl.Tensor[[272, 64], pl.BF16],
+                a: pl.Tensor[[128, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+                e: pl.Tensor[[512, 64], pl.BF16],
                 out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
             ) -> pl.Tensor[[128, 64], pl.FP32]:
-                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 272] f32 > L0c → Mat scratch
+                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 512] f32 > L0c → Mat scratch
                 cb = pl.cast(c, pl.BF16, mode="rint")
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumes the scratch as a matmul operand
                 out = pl.assemble(out, d, [0, 0])
