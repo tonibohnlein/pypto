@@ -168,8 +168,11 @@ HwParams ReadHwParams() {
 
 // A call is an allocation (output-buffer creation), not a compute op.
 bool IsAllocCall(const CallPtr& call) {
-  const std::string& name = call->op_->name_;
-  return name.find("create") != std::string::npos || name.find("alloc") != std::string::npos;
+  // Output-buffer allocation, skipped by IsComputeOp. Exact IsOp, not a name substring: the old
+  // find("create")/find("alloc") also matched an unrelated op named e.g. `my_alloc_scale`, silently
+  // dropping its compute op from the solver graph (external-review finding). `tensor.create` is the
+  // only allocation in the tensor-level auto_fuse DAG (`tensor.full` is a constant-fill = compute).
+  return IsOp(call, "tensor.create");
 }
 
 // A statement is a compute op iff it is `var = <call>` for a non-allocation call.
@@ -408,7 +411,11 @@ class ProblemBuilder {
     return idx;
   }
 
-  // Returns false (and leaves *w,*h at a safe placeholder) if any dim is dynamic/symbolic.
+  // Returns false (and leaves *w,*h at a safe placeholder) if any dim is dynamic/symbolic OR the
+  // tensor is rank>2. A rank>=3 tensor read as its last two dims would UNDERCOUNT the solver's cost
+  // by the product of the leading dims (a [B,M,N] tensor priced as [M,N]) AND never examine dim 0
+  // (so a dynamic batch dim would pass) — the emit only handles 2D (Static2DShape hard-requires
+  // rank 2), so a rank>=3 operand is out of scope; decline the whole function instead.
   static bool ShapeWH(const TensorTypePtr& tt, int64_t* w, int64_t* h) {
     const auto& shape = tt->shape_;
     bool ok = true;
@@ -420,15 +427,19 @@ class ProblemBuilder {
       }
       return ci->value_;
     };
-    if (shape.size() >= 2) {
-      *h = dim(shape.size() - 2);
-      *w = dim(shape.size() - 1);
+    if (shape.size() == 2) {
+      *h = dim(0);
+      *w = dim(1);
     } else if (shape.size() == 1) {
       *w = dim(0);
       *h = 1;
-    } else {
+    } else if (shape.size() == 0) {
       *w = 1;
       *h = 1;
+    } else {  // rank >= 3 -> out of scope (would undercount + miss a dynamic leading dim)
+      *w = 1;
+      *h = 1;
+      ok = false;
     }
     return ok;
   }
@@ -1711,6 +1722,12 @@ void CollectStmtUses(const StmtPtr& s, std::vector<const Var*>* out) {
   if (auto a = As<AssignStmt>(s)) {
     if (auto c = As<Call>(a->value_)) {
       for (const ExprPtr& arg : c->args_) add(arg);
+    } else if (auto sub = As<Submit>(a->value_)) {
+      // Submit-aware (pass-submit-awareness rule): a Submit's uses are its args AND its deps_
+      // (TaskId SSA values). A manual_scope body should not reach the flat auto_fuse DAG, but if
+      // one does, the reorder's dependency edges must include deps_ or a TaskId use is dropped.
+      for (const ExprPtr& arg : sub->args_) add(arg);
+      for (const ExprPtr& dep : sub->deps_) add(dep);
     } else {
       add(a->value_);  // SSA rebind `b = a`
     }
@@ -2034,10 +2051,16 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
 // a param would break its callsites). Anything else is left return-based.
 void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
                                const std::unordered_set<std::string>& called_funcs) {
-  // Already has an output param (user-written) -> nothing to wire.
-  for (ParamDirection d : func->param_directions_) {
-    if (d == ParamDirection::Out || d == ParamDirection::InOut) return;
-  }
+  // Existing user-written output params: a return that already ALIASES one of these is wired by
+  // codegen (no action). But a return that is a NEW fused buffer, even alongside an existing Out
+  // param, still needs lifting — a blanket "has any Out param -> skip" would leave that buffer
+  // unwritten on the by-position harness (external-review finding). So collect the existing output
+  // params and skip only the returns that reach them; lift the rest (appended AFTER these).
+  std::unordered_set<const Var*> existing_out;
+  for (size_t i = 0; i < func->params_.size() && i < func->param_directions_.size(); ++i)
+    if (func->param_directions_[i] == ParamDirection::Out ||
+        func->param_directions_[i] == ParamDirection::InOut)
+      existing_out.insert(func->params_[i].get());
   // Called internally: changing the signature would break its callsites.
   if (called_funcs.count(func->name_) != 0) return;
 
@@ -2109,6 +2132,40 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
     return nullptr;
   };
 
+  // Walk the same return lineage; TRUE if it lands on an existing Out/InOut param (already wired by
+  // codegen — leave it alone). Mirrors trace_to_create's chain (rebind / assemble arg0 /
+  // set_validshape arg0 / tile.store arg2 / for-carry).
+  auto reaches_out_param = [&](const VarPtr& ret_var) -> bool {
+    if (existing_out.empty()) return false;
+    const Var* cur = ret_var.get();
+    std::unordered_set<const Var*> seen;
+    while (cur != nullptr) {
+      if (existing_out.count(cur) != 0) return true;
+      if (!seen.insert(cur).second) break;
+      if (auto it = idx.carry.find(cur); it != idx.carry.end()) { cur = it->second; continue; }
+      auto dit = idx.var_def.find(cur);
+      if (dit == idx.var_def.end()) break;
+      const ExprPtr& val = dit->second->value_;
+      if (auto rv = AsVarLike(val)) { cur = rv.get(); continue; }
+      auto call = As<Call>(val);
+      if (call == nullptr) break;
+      if (IsOp(call, "tensor.assemble") || IsOp(call, "tensor.set_validshape")) {
+        auto a0 = !call->args_.empty() ? AsVarLike(call->args_[0]) : nullptr;
+        if (!a0) break;
+        cur = a0.get();
+        continue;
+      }
+      if (IsOp(call, "tile.store")) {
+        auto a2 = call->args_.size() >= 3 ? AsVarLike(call->args_[2]) : nullptr;
+        if (!a2) break;
+        cur = a2.get();
+        continue;
+      }
+      break;
+    }
+    return false;
+  };
+
   // Trace EVERY returned tensor to its output buffer's create. All-or-nothing: a partial
   // lift (some returns wired, some not) would leave an inconsistent ABI, so bail on any
   // return we can't wire. Each buffer's create must be a top-level child (safe to remove)
@@ -2129,6 +2186,10 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
   for (const ExprPtr& rv : idx.ret->value_) {
     auto ret_var = AsVarLike(rv);
     if (!ret_var) return;
+    if (reaches_out_param(ret_var)) {  // already an existing Out/InOut param -> codegen wires it
+      new_ret.push_back(rv);
+      continue;
+    }
     auto ca = trace_to_create(ret_var);
     if (ca != nullptr) {
       // Traceable to the output buffer's `tensor.create`: move that Var into the param list (no
@@ -2157,6 +2218,10 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
       new_ret.push_back(ExprPtr(wr_var));
     }
   }
+
+  // Every return already aliases an existing Out/InOut param -> nothing to wire (the old blanket
+  // skip's common case, now reached only when it is actually safe).
+  if (out_params.empty()) return;
 
   // Append the Out params (return order — the harness binds by position), drop the moved creates,
   // and insert the synthesized copies right before the (rewritten) return.
