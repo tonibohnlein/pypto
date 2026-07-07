@@ -375,6 +375,39 @@ class TestAutoFuseEmitGolden:
         x, y = torch.randn(256, 128), torch.randn(256, 128)
         _emit_matches_reference(Prog, "two", (x, y), (-torch.exp(x), -torch.exp(y)))
 
+    def test_attention_block_output_wired(self, ascend_backend):
+        """A full single-head attention block p=softmax(q@k/sqrt(d)); out=p@v — a matmul-ending
+        fused function. Its return is a `tensor.matmul` output (no create/assemble to lift), so
+        MaybeLiftReturnToOutParam synthesizes an Out param + a full-copy assemble to wire it (else
+        the by-position device harness sees an unwritten, all-zero output). This asserts the emit
+        reproduces the reference — exercising the matmul-ending output wiring end-to-end. Loose
+        tolerance: two matmuls reassociate vs. the reference."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def attn(
+                self,
+                q: pl.Tensor[[128, 64], pl.FP32],
+                k: pl.Tensor[[64, 128], pl.FP32],
+                v: pl.Tensor[[128, 64], pl.FP32],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                s: pl.Tensor[[128, 128], pl.FP32] = pl.matmul(q, k)
+                sc: pl.Tensor[[128, 128], pl.FP32] = pl.mul(s, 0.125)
+                m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(sc)
+                dd: pl.Tensor[[128, 128], pl.FP32] = pl.row_expand_sub(sc, m)
+                e: pl.Tensor[[128, 128], pl.FP32] = pl.exp(dd)
+                sm: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(e)
+                p: pl.Tensor[[128, 128], pl.FP32] = pl.row_expand_div(e, sm)
+                o: pl.Tensor[[128, 64], pl.FP32] = pl.matmul(p, v)
+                return o
+
+        torch.manual_seed(15)
+        q, k, v = torch.randn(128, 64), torch.randn(64, 128), torch.randn(128, 64)
+        ref = torch.softmax((q @ k) * 0.125, dim=-1) @ v
+        _emit_matches_reference(Prog, "attn", (q, k, v), ref, rtol=2e-3, atol=2e-3)
+
     def test_scalar_param_broadcast(self, ascend_backend):
         """A scalar In-param (broadcast scale) carried as an operand, not a tiled tensor. Before
         the fix, registering it as a solver tensor CHECK-crashed the whole compile ('not
