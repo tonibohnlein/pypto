@@ -1407,7 +1407,23 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // IM/S is 16-aligned and this gate holds. The gate is kept as DEFENSE-IN-DEPTH: a non-conforming
   // S from any other cost model declines to the CORRECT non-split body rather than emitting an OOB
   // read. Everything else (max/min, row-reduction split, reduction-feeds-pointwise) also declines.
-  if (tile.split > 1 && pin_m && As<Call>(out_stmt->value_) &&
+  // Dependency-cone safety: S2 replays the WHOLE group over each disjoint M-slice, so a per-slice
+  // result is a valid atomic-add partial ONLY when every op UPSTREAM of the terminal col_sum is
+  // pointwise/broadcast. If another op reduces M (a prior col_max / col_sum / col_min), its
+  // per-slice result is a LOCAL reduction, not the global one -> wrong (col_max->sub->col_sum would
+  // subtract each slice's own max). Decline S2 for such a cone. The solver currently groups a prior
+  // M-reduction into a SEPARATE group (verified), so this is defense-in-depth — correct regardless
+  // of the fusion decision.
+  bool cone_reduces_m_upstream = false;
+  for (const auto& a : ops) {
+    if (a == out_stmt) continue;
+    auto c = As<Call>(a->value_);
+    if (c == nullptr || ClassifyOp(c) != ::OpType::Reduction || c->args_.empty()) continue;
+    const auto [ciM, ciN] = Static2DShape(c->args_[0]->GetType());
+    const auto [coM, coN] = Static2DShape(a->var_->GetType());
+    if (ciM > 1 && coM == 1) cone_reduces_m_upstream = true;  // an upstream col (M) reduction
+  }
+  if (tile.split > 1 && pin_m && !cone_reduces_m_upstream && As<Call>(out_stmt->value_) &&
       IsOp(As<Call>(out_stmt->value_), "tensor.col_sum") && IM % (tile.split * g) == 0 && IN % w == 0) {
     const int64_t S = tile.split;               // emit exactly the costed split (no rounding)
     const int64_t rsz = IM / S;                 // disjoint granule-aligned reduced slice (IM % (S*g) == 0)
@@ -1442,6 +1458,14 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
              << " ways over the reduced axis (S2, atomic-add merge)";
     return std::vector<StmtPtr>{c_init_assign, seed_scope, scope};
   }
+  // The solver costed split>1 but S2 could not realize it (not a bare col_sum sink, ragged, upstream
+  // M-reduction, or row-reduction split): the body below emits it SERIAL (split=1). Numerically
+  // correct, but NOT the plan the solver priced — surface it so the cost-vs-wall-time experiment
+  // does not pair an S>1 model cost with an S=1 measured latency, and so a lost-parallelism decline
+  // is visible (the split families the emit does not yet realize: max/min, row-reduction, non-bare).
+  if (tile.split > 1)
+    LOG_INFO << "AutoFuse[generic]: group '" << name << "' costed split=" << tile.split
+             << " NOT realized (only a bare col_sum sink splits) -> emitting SERIAL (split=1)";
 
   // Software-pipelining: chunk the FREE axis into strips and emit a ForKind::Pipeline loop threading
   // the output through ONE iter_arg, so LowerPipelineLoops (unroll+tag) + CanonicalizeIOOrder (cluster
