@@ -62,6 +62,7 @@
 #include "core/dag.h"
 #include "core/subgraph.h"
 #include "core/types.h"
+#include "partition/partition.h"
 #include "pipeline/solver.h"
 #include "solution/solution.h"
 
@@ -2260,6 +2261,41 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
            << " return(s) -> appended Out param(s) (device/harness binds outputs by param)";
 }
 
+// Merge-decision knob (cost-vs-latency experiment, Round 3): override the solver's Phase-1
+// PARTITION — which ops fuse into one group — with a fixed one, so the device can measure
+// alternative fusion boundaries against the model's prediction (the partition-layer analog of
+// PYPTO_AUTOFUSE_FORCE_PLAN). Env PYPTO_AUTOFUSE_FORCE_MERGE:
+//   unset / "solver" -> the solver's argmin partition (::solve, the default; no override).
+//   "none"           -> Partition::trivial (each op its own group = fully UNFUSED baseline).
+//   "all"            -> one group holding every op (fully FUSED). If the ops cannot unify under a
+//                       single grid, finalize() prices the group 1e18 and the emit declines — that
+//                       infeasibility IS the answer "this cannot be fully fused", recorded honestly.
+// The chosen partition is finalized and lowered via Solution::from_partition (the SAME ordering +
+// costing the solver's Phase 2 uses), so its total_latency is the model's cost for that merge.
+::Solution SolveWithMergeOverride(const ::Problem& prob, const ::DAG& dag, const std::string& fn) {
+  const char* merge = std::getenv("PYPTO_AUTOFUSE_FORCE_MERGE");
+  if (merge == nullptr || std::string(merge) == "solver") return ::solve(prob, dag);
+  const std::string mode = merge;
+  if (mode != "none" && mode != "all") {
+    LOG_WARN << "AutoFuse[" << fn << "]: unknown PYPTO_AUTOFUSE_FORCE_MERGE='" << mode
+             << "' (want none|all|solver) -> using the solver argmin partition";
+    return ::solve(prob, dag);
+  }
+  ::Partition part = ::Partition::trivial(prob, dag);  // singletons (fully unfused)
+  if (mode == "all") {
+    std::vector<size_t> all_ops(prob.num_ops());
+    for (size_t i = 0; i < prob.num_ops(); ++i) all_ops[i] = i;
+    part.groups.assign(1, ::Partition::Group{});
+    part.groups[0].ops = FlatSet<size_t>(all_ops.begin(), all_ops.end());
+    part.groups[0].alive = true;
+  }
+  part.finalize();  // rebuild_index + per-group Subgraph::create/best_cost + rebuild_group_dag
+  ::Solution sol = ::Solution::from_partition(prob, dag, part);
+  LOG_INFO << "AutoFuse[" << fn << "]: FORCED MERGE '" << mode << "' -> " << sol.num_steps()
+           << " group(s), total latency " << sol.total_latency();
+  return sol;
+}
+
 ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
   std::map<GlobalVarPtr, FunctionPtr, GlobalVarPtrLess> new_functions;
   bool any_change = false;
@@ -2330,7 +2366,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
 
     // Solve, then print the fusion decision: each group's member ops + chosen tile.
     ::DAG dag = ::DAG::build(builder.problem);
-    ::Solution sol = ::solve(builder.problem, dag);
+    ::Solution sol = SolveWithMergeOverride(builder.problem, dag, func->name_);
     LOG_INFO << "AutoFuse[" << func->name_ << "]: solver -> " << sol.num_steps()
              << " fused group(s), total latency " << sol.total_latency();
     for (size_t s = 0; s < sol.num_steps(); ++s) {
