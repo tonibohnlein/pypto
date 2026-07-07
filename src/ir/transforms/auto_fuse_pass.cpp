@@ -229,6 +229,26 @@ double VecOpSlope(const CallPtr& call) {
   return 0.0;                        // -> vec_slope_pw
 }
 
+// Per-op VECTOR fixed (head+tail) cycles, device-calibrated (pto-isa cce_costmodel_vector_compute):
+// vadd/vsub/vmax/vmin 24, vmul 25, vexp/vln 31, vdiv 30, vrsqrt ~24. Charged once per chain (the
+// stream-start op). Returns 0.0 = "use the group default `vec_op_head+vec_op_tail` (~32)". A cost
+// heuristic keyed on the op family; unmatched ops keep the default.
+double VecOpFixed(const CallPtr& call) {
+  const std::string& n = call->op_->name_;
+  auto ends = [&](const char* s) {
+    const size_t l = std::char_traits<char>::length(s);
+    return n.size() >= l && n.compare(n.size() - l, l, s) == 0;
+  };
+  if (ends("div")) return 30.0;                          // vdiv
+  if (ends(".exp") || ends(".ln")) return 31.0;          // vexp / vln
+  if (ends(".mul") || ends(".muls")) return 25.0;        // vmul / vmuls
+  if (ends(".rsqrt") || ends(".sqrt")) return 24.0;      // vrsqrt / vsqrt
+  if (ends(".add") || ends(".adds") || ends(".sub") || ends(".subs") || ends(".neg") ||
+      ends(".max") || ends(".min") || ends(".maximum") || ends(".minimum"))
+    return 24.0;                                          // vadd / vsub / vmax / vmin family
+  return 0.0;                                             // -> vec_op_head + vec_op_tail
+}
+
 // Map a PyPTO DataType to the solver's byte-aware DType. The grounded cube cost
 // is dtype-sensitive (fp32 is 4x fp16: kF halves AND cyc_per_repeat doubles), so
 // the precision must survive into the cost model. Unmapped types fall back to
@@ -331,6 +351,7 @@ class ProblemBuilder {
       ::Op sop;
       sop.type = ClassifyOp(call);
       sop.vec_slope = VecOpSlope(call);  // vdiv=4 / vrsqrt=1 override the elementwise default
+      sop.vec_fixed = VecOpFixed(call);  // per-op head+tail (vadd 24 / vexp 31 / vdiv 30 / ...)
       // Inputs in OPERAND ORDER (call->args_). The solver derives M/N/K
       // positionally (inputs[0]=LHS [K,M], inputs[1]=RHS [N,K]), so the order is
       // load-bearing. Both in-params and predecessor-op outputs are registered
@@ -2256,13 +2277,37 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     // Emit: map each solver op back to its source statement, wrap each fused
     // group in an InCoreScopeStmt, and realize the chosen tile (step.config) for
     // matmuls — the output `[w,h]` tiling + the per-tile k-pipeline.
+    // Cost-vs-wall-time validation knobs (off the hot path — only when set):
+    //   PYPTO_AUTOFUSE_DUMP_PLANS=1       -> log every feasible (w,h,split)+modeled cost per group
+    //   PYPTO_AUTOFUSE_FORCE_PLAN="w,h,s" -> EMIT that plan instead of the solver argmin, so the
+    //       device runs it; the paired modeled cost is the logged FORCED line. A field = -1 (e.g.
+    //       "-1,6,2") wildcards it. The plan must be a feasible candidate (from enumerate_plans).
+    static const bool dump_plans = std::getenv("PYPTO_AUTOFUSE_DUMP_PLANS") != nullptr;
+    static const char* force_env = std::getenv("PYPTO_AUTOFUSE_FORCE_PLAN");
+    long fw = -1, fh = -1, fs = -1;
+    if (force_env != nullptr) std::sscanf(force_env, "%ld,%ld,%ld", &fw, &fh, &fs);
+
     std::unordered_map<const Stmt*, size_t> stmt_group;
     std::unordered_map<const Stmt*, SolverTile> stmt_tile;  // group's [w,h,k] tile, for matmul tiling
     std::unordered_map<const Stmt*, size_t> stmt_exec;      // solver's per-group pebbling order
     for (size_t s = 0; s < sol.num_steps(); ++s) {
       const ::TileConfig& cfg = sol.step(s).config;
-      const SolverTile tile{cfg.w, cfg.h, cfg.k, sol.step_cost(s).parallel_split,
-                            cfg.parts_m, cfg.parts_n};
+      SolverTile tile{cfg.w, cfg.h, cfg.k, sol.step_cost(s).parallel_split, cfg.parts_m, cfg.parts_n};
+      if (dump_plans || force_env != nullptr) {
+        bool forced_here = false;
+        for (const auto& [pc, pr] : sol.step(s).subgraph.enumerate_plans()) {
+          if (dump_plans)
+            LOG_INFO << "AutoFuse[" << func->name_ << "]: PLAN group=" << s << " w=" << pc.w << " h="
+                     << pc.h << " split=" << pr.parallel_split << " cost=" << pr.latency;
+          if (force_env != nullptr && !forced_here && (fw < 0 || pc.w == fw) && (fh < 0 || pc.h == fh) &&
+              (fs < 0 || static_cast<long>(pr.parallel_split) == fs)) {
+            tile = SolverTile{pc.w, pc.h, pc.k, pr.parallel_split, pc.parts_m, pc.parts_n};
+            forced_here = true;
+            LOG_INFO << "AutoFuse[" << func->name_ << "]: FORCED group=" << s << " w=" << pc.w << " h="
+                     << pc.h << " split=" << pr.parallel_split << " cost=" << pr.latency;
+          }
+        }
+      }
       for (size_t op_idx : sol.step(s).subgraph.ops()) {
         const Stmt* stmt = builder.op_stmts[op_idx];
         stmt_group[stmt] = s;
