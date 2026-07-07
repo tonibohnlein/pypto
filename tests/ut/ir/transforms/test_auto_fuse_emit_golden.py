@@ -332,6 +332,28 @@ class TestAutoFuseEmitGolden:
         a = torch.randn(256, 100)
         _emit_matches_reference(Prog, "cs", (a,), a.sum(dim=0, keepdim=True))
 
+    def test_col_reduction_cone_not_split_locally(self, ascend_backend):
+        """A col_sum whose cone contains a PRIOR M-reduction: m=col_max(x); y=x-m; z=col_sum(y).
+        If an S2 split replayed the whole cone per M-slice, col_max would be computed LOCALLY per
+        slice (each slice subtracts its own max) → wrong. Adversarial data (top half 0, bottom half
+        10) makes a local-max error a large, obvious miss. Guards the S2 cone-safety gate (the emit
+        must not split a cone with an upstream M-reduction) end-to-end, both legacy and generic."""
+        torch = pytest.importorskip("torch")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def cs(self, x: pl.Tensor[[128, 256], pl.FP32]) -> pl.Tensor[[1, 256], pl.FP32]:
+                m: pl.Tensor[[1, 256], pl.FP32] = pl.col_max(x)
+                y: pl.Tensor[[128, 256], pl.FP32] = pl.sub(x, m)
+                z: pl.Tensor[[1, 256], pl.FP32] = pl.col_sum(y)
+                return z
+
+        x = torch.zeros(128, 256)
+        x[64:, :] = 10.0
+        ref = (x - x.max(dim=0, keepdim=True).values).sum(dim=0, keepdim=True)  # sum(x - global_max)
+        _emit_matches_reference(Prog, "cs", (x,), ref)
+
     def test_col_sum_split_atomic_merge(self, ascend_backend):
         """Bare col_sum sink on a CLEAN shape (M=128, N=256) where the solver splits the
         reduced axis across cores (now S=8, a divisor of the reduced fractal count 128/16=8,
