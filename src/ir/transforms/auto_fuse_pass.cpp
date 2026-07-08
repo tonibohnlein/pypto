@@ -1301,7 +1301,12 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // so both realize the same slice-and-replay per strip.
   // `onchip` (op var -> its emitted tile) is caller-provided so a MULTI-SINK group can read
   // every sink's tile out after one replay; single-sink callers pass a fresh throwaway map.
-  auto emit_strip = [&](int64_t sh, const ExprPtr& smi, const ExprPtr& sni, std::vector<StmtPtr>& out,
+  // Axis-symmetric slice-and-replay (streamed-reduction §4): slice each full external input to a
+  // [sh, sw] region at (smi, sni) — BOTH extents are parameters, so a caller can chunk the row axis
+  // (S2 split / col-reduction stream) OR the col axis (row-reduction stream), not just rows. Spatial
+  // and pipeline callers pass sw = w (the full tile width) → byte-identical to the pre-refactor form.
+  auto emit_strip = [&](int64_t sh, int64_t sw, const ExprPtr& smi, const ExprPtr& sni,
+                        std::vector<StmtPtr>& out,
                         std::unordered_map<const Var*, VarPtr>& onchip) -> VarPtr {
     // The 32B DMA granule is on the CONTIGUOUS axis only; the other (free) axis has
     // granule 1 (see ascend910b_cost.cpp: "free row axis tiles at 1 element, the
@@ -1315,7 +1320,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // decided until InferTileMemorySpace; the layout-exact version belongs in a post-layout
     // padding pass (which also fixes the legacy tilers — KNOWN_ISSUES).
     const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
-    const bool strip_ragged = (sh_al != sh) || (w_al != w);
+    const int64_t sw_al = AlignUp(sw, g);
+    const bool strip_ragged = (sh_al != sh) || (sw_al != sw);
     onchip.clear();                                      // fresh per replay
     std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [sh,w] slice
     VarPtr tv;
@@ -1339,10 +1345,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           // and elementwise/reduction type-inference honor valid.
           ExprPtr sl = strip_ragged
                            ? reg.Create("tensor.slice",
-                                        {arg, MakeIndexTuple({sh_al, w_al}, sp), MakeTuple2(smi, sni, sp),
-                                         MakeIndexTuple({sh, w}, sp)},
+                                        {arg, MakeIndexTuple({sh_al, sw_al}, sp), MakeTuple2(smi, sni, sp),
+                                         MakeIndexTuple({sh, sw}, sp)},
                                         sp)
-                           : reg.Create("tensor.slice", {arg, MakeIndexTuple({sh, w}, sp), MakeTuple2(smi, sni, sp)}, sp);
+                           : reg.Create("tensor.slice", {arg, MakeIndexTuple({sh, sw}, sp), MakeTuple2(smi, sni, sp)}, sp);
           // Unique name per distinct external input; a name-based consumer must not collapse >1 input.
           auto sv = std::make_shared<Var>(base + "_in" + std::to_string(input_cache.size()), sl->GetType(), sp);
           out.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
@@ -1373,7 +1379,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     std::vector<StmtPtr> prologue;  // one tensor.create per sink
     std::vector<StmtPtr> mbody;
     std::unordered_map<const Var*, VarPtr> onchip;
-    emit_strip(h, mi, ni, mbody, onchip);  // replay all ops; onchip[var] = every op's tile
+    emit_strip(h, w, mi, ni, mbody, onchip);  // replay all ops; onchip[var] = every op's tile
     for (const auto& sink : sinks) {
       auto stt = As<TensorType>(sink->var_->GetType());
       if (stt == nullptr) return std::nullopt;  // non-tensor sink -> out of scope
@@ -1464,7 +1470,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     ExprPtr sni = MakeMul(fidx, MakeIndex(w, sp), sp);    // free-N tile offset (exact, no overlap)
     std::vector<StmtPtr> sbody;
     std::unordered_map<const Var*, VarPtr> oc_split;
-    VarPtr part = emit_strip(rsz, r_mi, sni, sbody, oc_split);  // [1,w] partial col_sum over the M-slice
+    VarPtr part = emit_strip(rsz, w, r_mi, sni, sbody, oc_split);  // [1,w] partial col_sum over the M-slice
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_seeded), part, MakeTuple2(MakeIndex(0, sp), sni, sp)},
                                {{"atomic", 1}}, sp);
     sbody.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
@@ -1526,7 +1532,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   if (num_strips < 2) {
     // Serial (matches the cost model's db=false): the whole tile is one strip.
     std::unordered_map<const Var*, VarPtr> oc_serial;
-    VarPtr tv = emit_strip(h, mi, ni, body_stmts, oc_serial);
+    VarPtr tv = emit_strip(h, w, mi, ni, body_stmts, oc_serial);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tv, MakeTuple2(mi, ni, sp)}, sp);
     body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
   } else {
@@ -1542,7 +1548,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     ExprPtr smi = MakeAdd(mi, MakeMul(s, MakeIndex(strip_h, sp), sp), sp);
     std::vector<StmtPtr> loop_body;
     std::unordered_map<const Var*, VarPtr> oc_pipe;
-    VarPtr tv = emit_strip(strip_h, smi, ni, loop_body, oc_pipe);
+    VarPtr tv = emit_strip(strip_h, w, smi, ni, loop_body, oc_pipe);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_iter), tv, MakeTuple2(smi, ni, sp)}, sp);
     auto out_next = std::make_shared<Var>(base + "_out_n", asm_call->GetType(), sp);
     loop_body.push_back(std::make_shared<AssignStmt>(out_next, asm_call, sp));
