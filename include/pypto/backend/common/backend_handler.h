@@ -284,6 +284,18 @@ class BackendHandler {
   [[nodiscard]] virtual uint64_t GetMatCapacityBytes() const = 0;
 
   /**
+   * @brief Vector (UB / unified buffer) SAFE on-chip capacity, in bytes.
+   *
+   * The per-vector-core budget an emitter must keep a materialized tile (plus
+   * its live bands) under. This is the *safe usable* size, which may be smaller
+   * than the physical UB when the SoC reserves headroom (e.g. Ascend 910B caps
+   * 192KB physical to 184KB safe, pto-isa#170 — see src/backend/common/soc.cpp).
+   * Consumed by AutoFuse's streamed-reduction path to size the reduced-axis
+   * chunk. Default is the 910B safe value; backends with a different UB override.
+   */
+  [[nodiscard]] virtual uint64_t GetVectorBufferCapacityBytes() const { return 184ULL * 1024; }
+
+  /**
    * @brief Cube fractal alignment in *elements* for L0 tile dimensions.
    *
    * Distinct from memory access alignment (which is a byte-level concept on

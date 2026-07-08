@@ -1201,10 +1201,35 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   int64_t h = pin_m ? IM : ((tile.h > 0 && tile.h < IM) ? tile.h : IM);
   int64_t w = pin_n ? IN : ((tile.w > 0 && tile.w < IN) ? tile.w : IN);
   const int64_t num_m = (IM + h - 1) / h, num_n = (IN + w - 1) / w;  // ceil
-  // A single spatial tile is left to the legacy tiler — UNLESS the solver split the reduced
-  // axis (tile.split>1): then the S2 path below still needs to run (the split is what fills the
-  // cores, and for a large reduced axis it is what makes the per-core slice fit UB).
-  if (num_m == 1 && num_n == 1 && tile.split <= 1) return std::nullopt;
+
+  // P1 STREAMED REDUCTION — decide whether the pinned reduced-axis tile overflows UB. When it does,
+  // the reduced axis cannot be materialized in one tile; stream it (SPMD over the FREE axis, inner
+  // chunk-accumulation loop over the pinned axis, persisting only the small [.,1]/[1,.] accumulator).
+  // The realized streamed emit is below (after emit_strip). P1 scope: exactly one reduced axis; a
+  // SINGLE reduction sink that is sum or max; the ONLY reduction (single level — a pre-reduction
+  // pointwise is recomputed per chunk, but no reduction may feed a pointwise/another reduction, which
+  // is P2/P3). fp32 accumulation and the ragged tail are handled in the emit.
+  const auto* pctx = PassContext::Current();
+  const auto* handler = pctx ? pctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+  INTERNAL_CHECK(handler) << "Internal error: BackendHandler is null in AutoFuse generic emit";
+  const int64_t p1_dtb = std::max<int64_t>(1, static_cast<int64_t>(dtype.GetBit()) / 8);
+  const int64_t p1_ub = static_cast<int64_t>(handler->GetVectorBufferCapacityBytes());
+  int p1_nreds = 0;
+  for (const auto& a : ops)
+    if (ClassifyOp(As<Call>(a->value_)) == ::OpType::Reduction) p1_nreds++;
+  auto p1_sink = As<Call>(out_stmt->value_);
+  const bool p1_sum = p1_sink != nullptr && (IsOp(p1_sink, "tensor.col_sum") || IsOp(p1_sink, "tensor.row_sum"));
+  const bool p1_max = p1_sink != nullptr && (IsOp(p1_sink, "tensor.col_max") || IsOp(p1_sink, "tensor.row_max"));
+  const bool p1_eligible =
+      has_reduction && (pin_m != pin_n) && sinks.size() == 1 && p1_nreds == 1 && (p1_sum || p1_max);
+  // Trigger: the current emit materializes a [h,w] tile with the reduced axis pinned FULL; if that
+  // (~2 live bands) exceeds the safe UB, stream instead.
+  const bool stream_p1 = p1_eligible && (2 * h * w * p1_dtb > p1_ub);
+
+  // A single spatial tile is left to the legacy tiler — UNLESS the solver split the reduced axis
+  // (tile.split>1) or the reduced axis must be STREAMED (stream_p1): both still need to run below
+  // (the split fills cores; streaming is what makes a too-large reduced axis fit UB at all).
+  if (num_m == 1 && num_n == 1 && tile.split <= 1 && !stream_p1) return std::nullopt;
 
   // A4 (reduction rule): the reduced axis must be PINNED FULL in the tile, else a
   // per-tile reduction would cover only part of the axis (partial reduction = wrong
@@ -1262,9 +1287,6 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // dtype_bytes) since type inference forces every tile in the chain to share the padded
   // extent: a mixed FP16/FP32 chain must satisfy the FP16 16-element block, which also
   // satisfies FP32's 8-element one. FP32 -> 8, FP16 -> 16.
-  const auto* pctx = PassContext::Current();
-  const auto* handler = pctx ? pctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
-  INTERNAL_CHECK(handler) << "Internal error: BackendHandler is null in AutoFuse generic emit";
   int64_t min_dtype_bits = static_cast<int64_t>(dtype.GetBit());
   for (const auto& a : ops) {
     if (auto tt = As<TensorType>(a->var_->GetType()))
@@ -1369,6 +1391,82 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     }
     return tv;
   };
+
+  // P1 STREAMED REDUCTION (realize the decision made above). The reduced axis is too large to
+  // materialize; stream it. SPMD over the FREE axis; each core runs an inner chunk-accumulation
+  // loop over the pinned axis, persisting only the small reduced [.,1]/[1,.] accumulator (the big
+  // [.,chunk] slices are transient per iteration). Accumulation is ON-CORE (ordinary tile add/max,
+  // NOT the cross-core atomic), so it is exact for sum AND max. Chunks are DISJOINT (no clamp-
+  // overlap: a reduction overlap would double-count), ragged tail via `valid`. The accumulator loop
+  // is a Sequential ForStmt whose iter_arg is the accumulator — lowering-proven (the §11.3 spike:
+  // MemoryReuse aliases the carry in place). Single pass (level-0 reduction); P2/P3 add recompute.
+  if (stream_p1) {
+    const int64_t red_ext = pin_m ? IM : IN;    // pinned/reduced axis extent
+    const int64_t free_ext = pin_m ? IN : IM;   // free axis extent
+    const int64_t free_tile = pin_m ? w : h;    // solver's free-axis tile
+    const std::string merge_op = p1_max ? "tensor.maximum" : "tensor.add";
+    // Largest granule-aligned chunk whose live set fits UB. Conservative band count: each op's
+    // output can be a live [chunk]-extent band, plus the input slice and accumulator/alignment
+    // slack (a pre-reduction pointwise like x*x adds a band, so scale with ops.size()).
+    const int64_t n_bands = static_cast<int64_t>(ops.size()) + 2;
+    int64_t rc = p1_ub / std::max<int64_t>(1, n_bands * free_tile * p1_dtb);
+    rc = std::max<int64_t>(g, (rc / g) * g);    // align down to the DMA granule, >= one granule
+    rc = std::min(rc, red_ext);
+    const int64_t num_full = red_ext / rc;                 // full disjoint chunks
+    const int64_t rem = red_ext - num_full * rc;           // ragged tail extent (0 if divides)
+    const int64_t num_free = (free_ext + free_tile - 1) / free_tile;  // ceil grid over the free axis
+
+    auto t = std::make_shared<Var>(base + "_t", index_type, sp);
+    // Free-axis offset for this core, clamped in-bounds for a ragged free tail. The free axis is
+    // NOT reduced, so a clamp-overlap recomputes identically (idempotent) — same trick as pointwise.
+    ExprPtr foff = MakeMul(t, MakeIndex(free_tile, sp), sp);
+    if (free_ext % free_tile != 0) foff = MakeMin(foff, MakeIndex(free_ext - free_tile, sp), sp);
+    // Reduce the [chunk_ext along the reduced axis, free_tile] slice at `red_off` -> partial.
+    auto strip_at = [&](int64_t chunk_ext, const ExprPtr& red_off, std::vector<StmtPtr>& out,
+                        std::unordered_map<const Var*, VarPtr>& oc) -> VarPtr {
+      return pin_m ? emit_strip(chunk_ext, w, red_off, foff, out, oc)    // chunk M rows, N free
+                   : emit_strip(h, chunk_ext, foff, red_off, out, oc);   // chunk N cols, M free
+    };
+
+    std::vector<StmtPtr> body;
+    std::unordered_map<const Var*, VarPtr> oc0;
+    VarPtr acc = strip_at(rc, MakeIndex(0, sp), body, oc0);  // chunk 0 -> initial accumulator
+    if (num_full >= 2) {  // accumulate chunks 1..num_full-1 in a Sequential loop with an acc iter_arg
+      auto k = std::make_shared<Var>(base + "_k", index_type, sp);
+      auto acc_it = std::make_shared<IterArg>(base + "_acc_it", acc->GetType(), ExprPtr(acc), sp);
+      std::vector<StmtPtr> lbody;
+      std::unordered_map<const Var*, VarPtr> ock;
+      VarPtr part = strip_at(rc, MakeMul(k, MakeIndex(rc, sp), sp), lbody, ock);
+      auto m_call = reg.Create(merge_op, {ExprPtr(acc_it), ExprPtr(part)}, sp);
+      auto acc_n = std::make_shared<Var>(base + "_acc_n", m_call->GetType(), sp);
+      lbody.push_back(std::make_shared<AssignStmt>(acc_n, m_call, sp));
+      lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{acc_n}, sp));
+      auto acc_out = std::make_shared<Var>(base + "_acc", acc->GetType(), sp);
+      body.push_back(std::make_shared<ForStmt>(
+          k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{acc_it},
+          SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{acc_out}, sp, ForKind::Sequential));
+      acc = acc_out;
+    }
+    if (rem > 0) {  // ragged tail chunk (valid=rem excludes the granule padding)
+      std::unordered_map<const Var*, VarPtr> oct;
+      VarPtr tpart = strip_at(rem, MakeIndex(num_full * rc, sp), body, oct);
+      auto m_call = reg.Create(merge_op, {ExprPtr(acc), ExprPtr(tpart)}, sp);
+      auto acc_t = std::make_shared<Var>(base + "_acc_t", m_call->GetType(), sp);
+      body.push_back(std::make_shared<AssignStmt>(acc_t, m_call, sp));
+      acc = acc_t;
+    }
+    // Assemble the reduced accumulator into the sink output at the free-axis offset.
+    ExprPtr asm_off = pin_m ? MakeTuple2(MakeIndex(0, sp), foff, sp)   // [1,w] at [0, n]
+                            : MakeTuple2(foff, MakeIndex(0, sp), sp);  // [h,1] at [m, 0]
+    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), ExprPtr(acc), asm_off}, sp);
+    body.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+
+    auto scope = SpmdWrap(t, std::move(body), MakeIndex(num_free, sp), name, sp);
+    LOG_INFO << "AutoFuse[generic]: STREAMED reduction '" << name << "' (" << ops.size() << " ops, "
+             << (pin_m ? "reduce M" : "reduce N") << " ext=" << red_ext << " chunk=" << rc << "x"
+             << num_full << (rem ? "+tail" : "") << ", free grid " << num_free << ", " << merge_op << ")";
+    return std::vector<StmtPtr>{c_init_assign, scope};
+  }
 
   // MULTI-SINK: a group with >1 live-out (the solver merges sinks that share inputs).
   // Serial for now (pipeline/split are the single-sink refinements): replay the group ONCE

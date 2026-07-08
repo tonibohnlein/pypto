@@ -439,6 +439,60 @@ class TestAutoFuse:
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
 
+    def test_streamed_reduction_lowers_and_is_correct(self, ascend_backend, monkeypatch):
+        """A reduction whose reduced axis is too large to fit one UB tile must STREAM (P1): SPMD
+        over the FREE axis + an inner chunk-accumulation loop over the pinned axis, persisting only
+        the small [.,1]/[1,.] accumulator (the big [.,chunk] slices are transient). Without streaming
+        the [IM,w] / [h,IN] pinned tile overflows UB. Asserts (a) a huge-axis reduction lowers
+        through AllocateMemoryAddr without a Vec overflow (streaming fired), and (b) a smaller
+        streamed reduction is NUMERICALLY exact for BOTH merges — add (col_sum) and max on SIGNED
+        data (row_max) — via torch_codegen. On-core accumulation, so exact (no reassociation).
+        (Behind the generic-emit flag, where streaming lives.)
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        # (a) huge reduced axis lowers via streaming — col_sum[16384,128] = 8 MB >> 184 KB UB.
+        @pl.program
+        class Big:
+            @pl.function(attrs={"auto_fuse": True})
+            def cs(self, a: pl.Tensor[[16384, 128], pl.FP32]) -> pl.Tensor[[1, 128], pl.FP32]:
+                c: pl.Tensor[[1, 128], pl.FP32] = pl.col_sum(a)
+                return c
+
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Big)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
+
+        # (b) numerical exactness of the streamed emit (executes the actual streamed IR on CPU).
+        def _numeric(program, entry, x, ref):
+            ns: dict = {}
+            exec(torch_codegen(passes.auto_fuse()(program), run_all_spmd_blocks=True), ns)  # noqa: S102
+            got = ns[entry](x)
+            diff = (got - ref).abs().max().item()
+            assert torch.allclose(got, ref, rtol=1e-4, atol=1e-4), f"{entry}: max abs diff {diff:.3e}"
+
+        @pl.program
+        class ColSum:  # reduce M, add-merge; [256,128] streams (2*256*128*4 = 256 KB > 184 KB)
+            @pl.function(attrs={"auto_fuse": True})
+            def cs(self, a: pl.Tensor[[256, 128], pl.FP32]) -> pl.Tensor[[1, 128], pl.FP32]:
+                c: pl.Tensor[[1, 128], pl.FP32] = pl.col_sum(a)
+                return c
+
+        @pl.program
+        class RowMax:  # reduce N, max-merge on SIGNED data (proves mask != zero-fill)
+            @pl.function(attrs={"auto_fuse": True})
+            def rm(self, a: pl.Tensor[[128, 256], pl.FP32]) -> pl.Tensor[[128, 1], pl.FP32]:
+                c: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(a)
+                return c
+
+        x_cs = torch.arange(256 * 128, dtype=torch.float32).reshape(256, 128) * 0.01
+        _numeric(ColSum, "cs", x_cs, x_cs.sum(dim=0, keepdim=True))
+        x_rm = (torch.arange(128 * 256, dtype=torch.float32).reshape(128, 256) % 97) - 48.0
+        _numeric(RowMax, "rm", x_rm, x_rm.max(dim=1, keepdim=True).values)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
