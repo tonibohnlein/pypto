@@ -492,6 +492,61 @@ class TestAutoFuse:
         x_rm = (torch.arange(128 * 256, dtype=torch.float32).reshape(128, 256) % 97) - 48.0
         _numeric(RowMax, "rm", x_rm, x_rm.max(dim=1, keepdim=True).values)
 
+    def test_streamed_reduction_apply_p2(self, ascend_backend, monkeypatch):
+        """P2: a POINTWISE sink consuming a single reduction (x - row_max(x), rmsnorm) whose output
+        SPANS the reduced axis. Two-pass stream: pass 0 accumulates the reduction; pass 1 re-streams
+        the reduced axis, recomputes the pointwise cone with the finalized reduction substituted, and
+        assembles each output chunk — the final apply CHUNKS the reduced axis (else the full-shape
+        output re-overflows UB, review R3 #2). Asserts a huge case lowers and two shapes are exact
+        (incl. a pre-reduction pointwise x*x recomputed per chunk).
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        # (a) huge full-shape output over the reduced axis lowers via the chunked final apply.
+        @pl.program
+        class Big:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[128, 16384], pl.FP32]) -> pl.Tensor[[128, 16384], pl.FP32]:
+                m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
+                return pl.sub(x, m)
+
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Big)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
+
+        def _numeric(program, entry, x, ref):
+            ns: dict = {}
+            exec(torch_codegen(passes.auto_fuse()(program), run_all_spmd_blocks=True), ns)  # noqa: S102
+            got = ns[entry](x)
+            diff = (got - ref).abs().max().item()
+            assert torch.allclose(got, ref, rtol=1e-4, atol=1e-4), f"{entry}: max abs diff {diff:.3e}"
+
+        # The numerical cases use [128, 16384] — large enough that the solver FUSES the
+        # reduction+pointwise into one group AND the reduced axis overflows UB, so the STREAMED
+        # 2-pass P2 apply (not the non-streaming path) is what is exercised.
+        @pl.program
+        class SubMax:  # reduction -> pointwise (max-merge, signed data)
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[128, 16384], pl.FP32]) -> pl.Tensor[[128, 16384], pl.FP32]:
+                m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
+                return pl.sub(x, m)
+
+        @pl.program
+        class RmsLike:  # pre-reduction pointwise (x*x) recomputed per chunk + reduction -> pointwise
+            @pl.function(attrs={"auto_fuse": True})
+            def rms(self, x: pl.Tensor[[128, 16384], pl.FP32]) -> pl.Tensor[[128, 16384], pl.FP32]:
+                sq: pl.Tensor[[128, 16384], pl.FP32] = pl.mul(x, x)
+                ms: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(sq)
+                return pl.mul(x, ms)
+
+        x_sm = (torch.arange(128 * 16384, dtype=torch.float32).reshape(128, 16384) % 91) - 45.0
+        _numeric(SubMax, "sm", x_sm, x_sm - x_sm.max(dim=1, keepdim=True).values)
+        x_rms = (torch.arange(128 * 16384, dtype=torch.float32).reshape(128, 16384) % 13) * 0.1 + 0.05
+        _numeric(RmsLike, "rms", x_rms, x_rms * (x_rms * x_rms).sum(dim=1, keepdim=True))
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
