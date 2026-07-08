@@ -1215,21 +1215,28 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   const int64_t p1_dtb = std::max<int64_t>(1, static_cast<int64_t>(dtype.GetBit()) / 8);
   const int64_t p1_ub = static_cast<int64_t>(handler->GetVectorBufferCapacityBytes());
   int p1_nreds = 0;
+  bool p1_red_sum_or_max = false;  // the single reduction's family (sum/max = the on-core merges)
   for (const auto& a : ops)
-    if (ClassifyOp(As<Call>(a->value_)) == ::OpType::Reduction) p1_nreds++;
+    if (ClassifyOp(As<Call>(a->value_)) == ::OpType::Reduction) {
+      p1_nreds++;
+      auto rc = As<Call>(a->value_);
+      p1_red_sum_or_max = IsOp(rc, "tensor.col_sum") || IsOp(rc, "tensor.row_sum") ||
+                          IsOp(rc, "tensor.col_max") || IsOp(rc, "tensor.row_max");
+    }
   auto p1_sink = As<Call>(out_stmt->value_);
-  const bool p1_sum = p1_sink != nullptr && (IsOp(p1_sink, "tensor.col_sum") || IsOp(p1_sink, "tensor.row_sum"));
-  const bool p1_max = p1_sink != nullptr && (IsOp(p1_sink, "tensor.col_max") || IsOp(p1_sink, "tensor.row_max"));
-  const bool p1_eligible =
-      has_reduction && (pin_m != pin_n) && sinks.size() == 1 && p1_nreds == 1 && (p1_sum || p1_max);
-  // Trigger: the current emit materializes a [h,w] tile with the reduced axis pinned FULL; if that
-  // (~2 live bands) exceeds the safe UB, stream instead.
-  const bool stream_p1 = p1_eligible && (2 * h * w * p1_dtb > p1_ub);
+  const bool sink_is_reduction = p1_sink != nullptr && ClassifyOp(p1_sink) == ::OpType::Reduction;
+  // Common gate: exactly one reduced axis, one sum/max reduction (single level). P1 = the reduction
+  // IS the sink (bare reduction). P2 = a pointwise sink CONSUMES the reduction (rmsnorm / x-row_max);
+  // its output spans the reduced axis, so the final apply chunks it. >1 reduction / level>=2 = P3.
+  const bool stream_ok = has_reduction && (pin_m != pin_n) && sinks.size() == 1 && p1_nreds == 1 &&
+                         p1_red_sum_or_max && (2 * h * w * p1_dtb > p1_ub);
+  const bool stream_p1 = stream_ok && sink_is_reduction;
+  const bool stream_p2 = stream_ok && !sink_is_reduction;
 
   // A single spatial tile is left to the legacy tiler — UNLESS the solver split the reduced axis
-  // (tile.split>1) or the reduced axis must be STREAMED (stream_p1): both still need to run below
-  // (the split fills cores; streaming is what makes a too-large reduced axis fit UB at all).
-  if (num_m == 1 && num_n == 1 && tile.split <= 1 && !stream_p1) return std::nullopt;
+  // (tile.split>1) or the reduced axis must be STREAMED (P1/P2): both still need to run below (the
+  // split fills cores; streaming is what makes a too-large reduced axis fit UB at all).
+  if (num_m == 1 && num_n == 1 && tile.split <= 1 && !stream_p1 && !stream_p2) return std::nullopt;
 
   // A4 (reduction rule): the reduced axis must be PINNED FULL in the tile, else a
   // per-tile reduction would cover only part of the axis (partial reduction = wrong
@@ -1327,9 +1334,17 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // [sh, sw] region at (smi, sni) — BOTH extents are parameters, so a caller can chunk the row axis
   // (S2 split / col-reduction stream) OR the col axis (row-reduction stream), not just rows. Spatial
   // and pipeline callers pass sw = w (the full tile width) → byte-identical to the pre-refactor form.
+  // `stop_at` (default = out_stmt): replay ops up to AND INCLUDING this op, return its tile, then
+  //   stop — so a streamed pass can stop at the REDUCTION (P2 pass 0) instead of the group sink.
+  //   nullptr keeps the pre-P2 behavior (replay every op; multi-sink reads all sinks from onchip).
+  // `subs` (op-var -> finalized-accumulator tile): when an op's OUTPUT is in `subs`, do NOT replay
+  //   it — bind the substitute tile (P2 pass 1 uses the finalized reduction result instead of
+  //   recomputing a partial). This is the value-level "substitute reductions at level < k" rule.
   auto emit_strip = [&](int64_t sh, int64_t sw, const ExprPtr& smi, const ExprPtr& sni,
-                        std::vector<StmtPtr>& out,
-                        std::unordered_map<const Var*, VarPtr>& onchip) -> VarPtr {
+                        std::vector<StmtPtr>& out, std::unordered_map<const Var*, VarPtr>& onchip,
+                        const Stmt* stop_at = nullptr,
+                        const std::unordered_map<const Var*, VarPtr>* subs = nullptr) -> VarPtr {
+    const Stmt* sink_op = stop_at != nullptr ? stop_at : out_stmt.get();
     // The 32B DMA granule is on the CONTIGUOUS axis only; the other (free) axis has
     // granule 1 (see ascend910b_cost.cpp: "free row axis tiles at 1 element, the
     // contiguous width axis at the 32-byte DMA block"). So pad the row axis ONLY when
@@ -1348,6 +1363,14 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [sh,w] slice
     VarPtr tv;
     for (const auto& a : ops) {
+      if (subs != nullptr) {  // finalized accumulator from an earlier pass -> substitute, don't replay
+        auto sit = subs->find(a->var_.get());
+        if (sit != subs->end()) {
+          onchip[a->var_.get()] = sit->second;
+          if (a.get() == sink_op) { tv = sit->second; break; }
+          continue;
+        }
+      }
       auto c = As<Call>(a->value_);
       std::vector<ExprPtr> targs;
       for (const ExprPtr& arg : c->args_) {
@@ -1387,7 +1410,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           pw->GetType(), sp);
       out.push_back(std::make_shared<AssignStmt>(res, pw, sp));
       onchip[a->var_.get()] = res;
-      if (a == out_stmt) tv = res;
+      if (a.get() == sink_op) {
+        tv = res;
+        if (stop_at != nullptr) break;  // stop after the designated sink (P1/P2); else replay all
+      }
     }
     return tv;
   };
@@ -1400,15 +1426,28 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // overlap: a reduction overlap would double-count), ragged tail via `valid`. The accumulator loop
   // is a Sequential ForStmt whose iter_arg is the accumulator — lowering-proven (the §11.3 spike:
   // MemoryReuse aliases the carry in place). Single pass (level-0 reduction); P2/P3 add recompute.
-  if (stream_p1) {
+  if (stream_p1 || stream_p2) {
     const int64_t red_ext = pin_m ? IM : IN;    // pinned/reduced axis extent
     const int64_t free_ext = pin_m ? IN : IM;   // free axis extent
-    const int64_t free_tile = pin_m ? w : h;    // solver's free-axis tile
-    const std::string merge_op = p1_max ? "tensor.maximum" : "tensor.add";
+    // Free-axis tile, GRANULE-ALIGNED. The reduced accumulator ([1,w] col-reduce / [h,1] row-reduce)
+    // is padded to the DMA granule; a non-aligned free tile leaves a PARTIAL valid_shape (h=3 -> alloc
+    // 8, valid 3), which ResolveBackendOpLayouts' reshape of the [h,1] col-vector does not round-trip.
+    // Aligning the free tile makes the accumulator full-valid (coarser spatial grid, still correct).
+    int64_t free_tile = std::min(AlignUp(pin_m ? w : h, g), free_ext);
+    // The single reduction op (nreds==1): P1 -> it IS the sink; P2 -> a non-sink reduction consumed
+    // by the pointwise sink. Its family fixes the merge op (sum->add, max->maximum).
+    auto red_stmt = out_stmt;  // AssignStmtPtr (same element type as ops)
+    for (const auto& a : ops)
+      if (ClassifyOp(As<Call>(a->value_)) == ::OpType::Reduction) red_stmt = a;
+    auto red_call = As<Call>(red_stmt->value_);
+    const bool is_max = IsOp(red_call, "tensor.col_max") || IsOp(red_call, "tensor.row_max");
+    const std::string merge_op = is_max ? "tensor.maximum" : "tensor.add";
     // Largest granule-aligned chunk whose live set fits UB. Conservative band count: each op's
     // output can be a live [chunk]-extent band, plus the input slice and accumulator/alignment
-    // slack (a pre-reduction pointwise like x*x adds a band, so scale with ops.size()).
-    const int64_t n_bands = static_cast<int64_t>(ops.size()) + 2;
+    // slack. P2's APPLY pass re-reads the input, recomputes the full cone, AND holds the output
+    // chunk being assembled (device: ~5 bands for a 2-op group) — so it needs more headroom than
+    // P1's accumulate pass. Size against the heavier pass (v3 §1d).
+    const int64_t n_bands = static_cast<int64_t>(ops.size()) + (stream_p2 ? 5 : 2);
     int64_t rc = p1_ub / std::max<int64_t>(1, n_bands * free_tile * p1_dtb);
     rc = std::max<int64_t>(g, (rc / g) * g);    // align down to the DMA granule, >= one granule
     rc = std::min(rc, red_ext);
@@ -1421,22 +1460,27 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // NOT reduced, so a clamp-overlap recomputes identically (idempotent) — same trick as pointwise.
     ExprPtr foff = MakeMul(t, MakeIndex(free_tile, sp), sp);
     if (free_ext % free_tile != 0) foff = MakeMin(foff, MakeIndex(free_ext - free_tile, sp), sp);
-    // Reduce the [chunk_ext along the reduced axis, free_tile] slice at `red_off` -> partial.
+    // Slice the [chunk_ext along the reduced axis, free_tile] region at `red_off` and replay the
+    // cone up to `stop` (nullptr = the group sink), substituting finalized accumulators from `subs`.
     auto strip_at = [&](int64_t chunk_ext, const ExprPtr& red_off, std::vector<StmtPtr>& out,
-                        std::unordered_map<const Var*, VarPtr>& oc) -> VarPtr {
-      return pin_m ? emit_strip(chunk_ext, w, red_off, foff, out, oc)    // chunk M rows, N free
-                   : emit_strip(h, chunk_ext, foff, red_off, out, oc);   // chunk N cols, M free
+                        std::unordered_map<const Var*, VarPtr>& oc, const Stmt* stop,
+                        const std::unordered_map<const Var*, VarPtr>* subs) -> VarPtr {
+      return pin_m ? emit_strip(chunk_ext, w, red_off, foff, out, oc, stop, subs)   // chunk M rows
+                   : emit_strip(h, chunk_ext, foff, red_off, out, oc, stop, subs);  // chunk N cols
     };
 
     std::vector<StmtPtr> body;
+    // PASS 0 — accumulate the reduction over disjoint reduced-axis chunks (stop at the reduction op).
+    // The accumulator is the small reduced [.,1]/[1,.]; chunk 0 inits it, chunks 1.. merge in a
+    // Sequential loop (acc iter_arg, spike-proven), the ragged tail merges after.
     std::unordered_map<const Var*, VarPtr> oc0;
-    VarPtr acc = strip_at(rc, MakeIndex(0, sp), body, oc0);  // chunk 0 -> initial accumulator
-    if (num_full >= 2) {  // accumulate chunks 1..num_full-1 in a Sequential loop with an acc iter_arg
+    VarPtr acc = strip_at(rc, MakeIndex(0, sp), body, oc0, red_stmt.get(), nullptr);
+    if (num_full >= 2) {
       auto k = std::make_shared<Var>(base + "_k", index_type, sp);
       auto acc_it = std::make_shared<IterArg>(base + "_acc_it", acc->GetType(), ExprPtr(acc), sp);
       std::vector<StmtPtr> lbody;
       std::unordered_map<const Var*, VarPtr> ock;
-      VarPtr part = strip_at(rc, MakeMul(k, MakeIndex(rc, sp), sp), lbody, ock);
+      VarPtr part = strip_at(rc, MakeMul(k, MakeIndex(rc, sp), sp), lbody, ock, red_stmt.get(), nullptr);
       auto m_call = reg.Create(merge_op, {ExprPtr(acc_it), ExprPtr(part)}, sp);
       auto acc_n = std::make_shared<Var>(base + "_acc_n", m_call->GetType(), sp);
       lbody.push_back(std::make_shared<AssignStmt>(acc_n, m_call, sp));
@@ -1447,24 +1491,65 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{acc_out}, sp, ForKind::Sequential));
       acc = acc_out;
     }
-    if (rem > 0) {  // ragged tail chunk (valid=rem excludes the granule padding)
+    if (rem > 0) {
       std::unordered_map<const Var*, VarPtr> oct;
-      VarPtr tpart = strip_at(rem, MakeIndex(num_full * rc, sp), body, oct);
+      VarPtr tpart = strip_at(rem, MakeIndex(num_full * rc, sp), body, oct, red_stmt.get(), nullptr);
       auto m_call = reg.Create(merge_op, {ExprPtr(acc), ExprPtr(tpart)}, sp);
       auto acc_t = std::make_shared<Var>(base + "_acc_t", m_call->GetType(), sp);
       body.push_back(std::make_shared<AssignStmt>(acc_t, m_call, sp));
       acc = acc_t;
     }
-    // Assemble the reduced accumulator into the sink output at the free-axis offset.
-    ExprPtr asm_off = pin_m ? MakeTuple2(MakeIndex(0, sp), foff, sp)   // [1,w] at [0, n]
-                            : MakeTuple2(foff, MakeIndex(0, sp), sp);  // [h,1] at [m, 0]
-    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), ExprPtr(acc), asm_off}, sp);
-    body.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+
+    if (stream_p1) {
+      // P1: the sink IS the reduction — assemble the finalized accumulator into the reduced output.
+      ExprPtr asm_off = pin_m ? MakeTuple2(MakeIndex(0, sp), foff, sp)   // [1,w] at [0, n]
+                              : MakeTuple2(foff, MakeIndex(0, sp), sp);  // [h,1] at [m, 0]
+      auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), ExprPtr(acc), asm_off}, sp);
+      body.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+    } else {
+      // P2 PASS 1 — final apply. The output spans the reduced axis, so re-stream it: for each chunk,
+      // recompute the FULL pointwise cone (subs the finalized reduction `acc`) over the [free_tile,
+      // chunk] slice and assemble it into the full-shape sink at the chunk's reduced-axis offset.
+      // Output threaded as an iter_arg (assemble-into-output -> in-place stores, like the pipeline).
+      const std::unordered_map<const Var*, VarPtr> subs = {{red_stmt->var_.get(), acc}};
+      auto asm_at = [&](const ExprPtr& coff, VarPtr chunk_tile) -> ExprPtr {
+        return pin_m ? MakeTuple2(coff, foff, sp)    // reduce M: [rc, w] at [coff, n]
+                     : MakeTuple2(foff, coff, sp);   // reduce N: [h, rc] at [m, coff]
+      };
+      VarPtr out_cur = c_init;
+      {  // Sequential loop over the num_full full chunks; s -> reduced-axis offset s*rc.
+        auto s = std::make_shared<Var>(base + "_ps", index_type, sp);
+        auto out_it = std::make_shared<IterArg>(base + "_oit", c_init->GetType(), ExprPtr(c_init), sp);
+        ExprPtr coff = MakeMul(s, MakeIndex(rc, sp), sp);
+        std::vector<StmtPtr> lbody;
+        std::unordered_map<const Var*, VarPtr> ocp;
+        VarPtr och = strip_at(rc, coff, lbody, ocp, nullptr, &subs);
+        auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_it), ExprPtr(och), asm_at(coff, och)}, sp);
+        auto on = std::make_shared<Var>(base + "_on", asm_call->GetType(), sp);
+        lbody.push_back(std::make_shared<AssignStmt>(on, asm_call, sp));
+        lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{on}, sp));
+        // No ragged tail -> the loop output IS the sink; else an intermediate the tail assembles into.
+        auto ofin = std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
+        body.push_back(std::make_shared<ForStmt>(
+            s, MakeIndex(0, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{out_it},
+            SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{rem > 0 ? ofin : c_var}, sp,
+            ForKind::Sequential));
+        out_cur = rem > 0 ? ofin : c_var;
+      }
+      if (rem > 0) {  // ragged tail apply chunk
+        std::unordered_map<const Var*, VarPtr> oct;
+        ExprPtr coff = MakeIndex(num_full * rc, sp);
+        VarPtr och = strip_at(rem, coff, body, oct, nullptr, &subs);
+        auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_cur), ExprPtr(och), asm_at(coff, och)}, sp);
+        body.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+      }
+    }
 
     auto scope = SpmdWrap(t, std::move(body), MakeIndex(num_free, sp), name, sp);
-    LOG_INFO << "AutoFuse[generic]: STREAMED reduction '" << name << "' (" << ops.size() << " ops, "
-             << (pin_m ? "reduce M" : "reduce N") << " ext=" << red_ext << " chunk=" << rc << "x"
-             << num_full << (rem ? "+tail" : "") << ", free grid " << num_free << ", " << merge_op << ")";
+    LOG_INFO << "AutoFuse[generic]: STREAMED " << (stream_p2 ? "reduction+apply (P2)" : "reduction (P1)")
+             << " '" << name << "' (" << ops.size() << " ops, " << (pin_m ? "reduce M" : "reduce N")
+             << " ext=" << red_ext << " chunk=" << rc << "x" << num_full << (rem ? "+tail" : "")
+             << ", free grid " << num_free << ", " << merge_op << ")";
     return std::vector<StmtPtr>{c_init_assign, scope};
   }
 
