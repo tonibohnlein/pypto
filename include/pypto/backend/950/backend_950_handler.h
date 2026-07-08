@@ -84,19 +84,25 @@ class Ascend950Handler : public BackendHandler {
   // baseline before trusting it broadly.
   [[nodiscard]] L0CostModel GetL0CostModel() const override {
     L0CostModel m;
-    m.bw_l0a = 129.7;              // TODO(a5): refit from a5-sim MTE1 lane (a2a3: dev 129.7)
-    m.bw_l0b = 85.4;               // TODO(a5): refit from a5-sim MTE2 lane (a2a3: dev 85.4)
-    m.bw_drain = 118.0;            // TODO(a5): refit from a5-sim FIXP lane (a2a3: dev 118.0)
+    // BW + drain: still a2a3-inherited. TODO(a5): a5-sim couldn't fit these yet (a5-sim
+    // ~8x slower + LOAD source is LOAD_2Dv2/MTE1 not LOAD_L1_TO_DST); left at a2a3 = the
+    // documented inheritance (no worse than status quo). Preliminary a5 signal: drain
+    // misalignment looks MILDER on a5 (n=128->144 +1.20x vs a2a3 +3.96x) -> drain_penalty
+    // likely < 2.6. Refit via analytic bytes (see a5_cost_model_device_task.md).
+    m.bw_l0a = 129.7;              // TODO(a5): refit (a2a3: 129.7)
+    m.bw_l0b = 85.4;               // TODO(a5): refit (a2a3: 85.4)
+    m.bw_drain = 118.0;            // TODO(a5): refit (a2a3: 118.0)
     m.drain_fixed_cycles = 164.0;  // TODO(a5): refit (a2a3: 164.0)
-    m.drain_row_cycles = 4.45;     // TODO(a5): refit a5 per-row floor (a2a3: 4.45)
-    m.drain_penalty_cycles = 2.6;  // TODO(a5): refit a5 misalignment penalty (a2a3: 2.6)
-    m.drain_c0_bytes = 32;         // ISA NZ-fractal C0; a5-invariant (keep 32)
-    m.mad_head_cycles = 21;        // TODO(a5): confirm on a5 cube (a2a3 transfers ~2%; 21)
-    m.mad_k_fractal_bytes = 32;    // ISA cube K-fractal; a5-invariant (keep 32)
-    m.mad_fp32_passes = 8;         // a5-sim MEASURED: full fp32 MMAD is ~4x a2a3/fractal
-                                   // (a2a3=2); confirmed by MMAD(128,128,64)=4121 (=21+8*512).
-                                   // a5 does a fuller fp32 mantissa decomposition. TODO(a5):
-                                   // confirm bf16 cube is still 1 pass (unmeasured).
+    m.drain_row_cycles = 4.45;     // TODO(a5): refit (a2a3: 4.45)
+    m.drain_penalty_cycles = 2.6;  // TODO(a5): refit -- likely lower on a5 (a2a3: 2.6)
+    m.drain_c0_bytes = 32;         // ISA NZ-fractal C0; a5-invariant
+    m.mad_k_fractal_bytes = 32;    // ISA cube K-fractal; a5-invariant
+    // Cube: MEASURED on a5-sim (the primary calibration, high confidence).
+    m.mad_head_cycles = 25;  // a5-sim: intercept of fp32 AND bf16 k-sweeps (a2a3: 21)
+    m.mad_fp32_passes = 8;   // a5-sim CONFIRMED: full fp32 MMAD ~4x a2a3/fractal
+                             // (a2a3=2). mmad = 25 + 512*k_fractal at m=128 (4121) and
+                             // m=256 (8217). bf16 stays 1 pass (bf16 mmad=281=25+256,
+                             // unaffected by the 4x) -- so the 8x is fp32-only, as intended.
     return m;
   }
 

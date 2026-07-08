@@ -45,11 +45,11 @@ A2A3_BASELINE = dict(
     mad_fp32_passes=2,
 )
 
-# --- a5-fitted constants — EDIT after the a5-sim sweep. ---
-# mad_fp32_passes=8 is already MEASURED (a5-sim: full fp32 cube ~4x a2a3/fractal). The rest
-# still equal the baseline until the sweep re-fits bw / drain, so the diff below currently
-# isolates the cube-form fix (which is the point). TODO(a5): + bw/drain from the sweep.
-A5_FITTED = dict(A2A3_BASELINE, mad_fp32_passes=8)
+# --- a5-fitted constants. ---
+# MEASURED on a5-sim: mad_fp32_passes=8 (fp32 cube ~4x a2a3/fractal), mad_head=25 (fp32+bf16
+# k-sweep intercept; a2a3=21). bf16 confirmed cpr=1. bw / drain NOT yet fit (a5-sim too slow
+# + LOAD_2Dv2 extractor gap) -> left at baseline, so the diff below isolates the CUBE fix.
+A5_FITTED = dict(A2A3_BASELINE, mad_fp32_passes=8, mad_head=25)
 
 STAT = {Stationarity.OutputStationary: "OS", Stationarity.AStationary: "A", Stationarity.BStationary: "B"}
 
