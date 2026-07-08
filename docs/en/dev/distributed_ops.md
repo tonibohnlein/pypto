@@ -20,7 +20,7 @@ the `dst` side via `AsTensorTypeLike` — TGET only needs a writable local GM
 region to receive into, so kernels can TGET directly into host-backed output
 tensors; `src` still requires a window-bound `DistributedTensor`.
 
-There are **eleven ops** and **four ABI enums**:
+There are **twelve ops** and **four ABI enums**:
 
 | Op | Direction | Result | Hardware |
 | -- | --------- | ------ | -------- |
@@ -33,6 +33,7 @@ There are **eleven ops** and **four ABI enums**:
 | `pld.tensor.broadcast` | replicate root rank's data to all ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.reduce_scatter` | reduce and scatter chunks across ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.allgather` | gather data from all ranks via window | `DistributedTensorType` (same as src) | builtin collective |
+| `pld.tensor.all_to_all` | push-based symmetric personalized exchange — every rank pushes its per-destination chunks to every peer's window via `pld.tensor.put` (TPUT), returns window as result | `DistributedTensorType` (same as src) | composite |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
 
@@ -270,7 +271,7 @@ pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum) -> Distributed
 Reduces every participating rank's window-bound `src` slice in place and returns
 the same type as `src`. Host-orchestrator user code may omit `signal` outside
 `for` and `while` loops; the
-[`SynthesizeAllReduceSignals`](passes/36-synthesize_allreduce_signals.md) pass
+[`SynthesizeAllReduceSignals`](passes/37-synthesize_allreduce_signals.md) pass
 inserts a private INT32 signal window with semantic shape `[world_size, 1]` for
 that call. The pass binds `world_size = pld.world_size()` as a standalone
 statement and uses that variable in the synthesized buffer size and window
@@ -335,11 +336,11 @@ The local-vs-remote split is intentional: a *local* operand (e.g. `get`'s
 ## Pipeline integration
 
 Comm domains and their slot allocations are materialised by the
-[`MaterializeCommDomainScopes`](passes/37-materialize_comm_domain_scopes.md) pass, which wraps each
+[`MaterializeCommDomainScopes`](passes/38-materialize_comm_domain_scopes.md) pass, which wraps each
 host_orch body in nested `CommDomainScopeStmt` nodes (one per inferred comm domain) and produces the
 per-window `WindowBuffer` records that the runtime binds physical buffers to.
 Host-level tensor collectives are then lowered by
-[`LowerHostTensorCollectives`](passes/38-lower_host_tensor_collectives.md) into internal builtin chip
+[`LowerHostTensorCollectives`](passes/39-lower_host_tensor_collectives.md) into internal builtin chip
 dispatches before the final `Simplify`.
 
 ## Testing
@@ -356,10 +357,9 @@ dispatches before the final `Simplify`.
   (each likewise dynamic-NR, P=2/P=4),
   `test_l3_tensor_allreduce_intrinsic.py`, `test_l3_host_tensor_allreduce.py`,
   `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`, and related L3 STs
-  under `tests/st/distributed/`. `test_l3_put.py` and `test_l3_get.py` are
-  currently **skipped** pending the N7 host codegen (`add_scalar(ctx)` per
-  `DistributedTensor`, `Tensor.make(..., child_memory=True)`) and N8
-  driver glue (`HostBufferStaging` window wiring on the codegen-emitted
-  `orch.allocate_domain(...)` block). The embedded programs and golden checks
-  are the canonical e2e contracts — drop the skip markers once that host-side
-  work lands.
+  under `tests/st/distributed/`. **Put/get canonical e2e contracts** are now
+  enabled: `test_l3_put.py` (ring overwrite, row-offset put, atomic-add put, and
+  chunked/pipelined transfers ✅), `test_l3_get.py` (ring read, row-offset get ✅),
+  and `test_l3_remote_store.py` (tile-level subview push ✅). All tests use the
+  `pld.system.notify` / `pld.system.wait` handshake pattern established by
+  notify/wait and collective STs.

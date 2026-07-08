@@ -448,15 +448,13 @@ def compile_and_assemble(
         cached_bin = _load_binary(cache_file)
         if cached_bin is not None:
             sig = kernel.get("signature", [])
-            arg_index = kernel.get("arg_index", list(range(len(sig))))
-            return (func_id, CoreCallable.build(signature=sig, binary=cached_bin, arg_index=arg_index))
+            return (func_id, CoreCallable.build(signature=sig, binary=cached_bin))
 
         # Compile via shared function; skip secondary prebuild cache write
         _, kernel_bin = compile_single_kernel(kernel, compiler, platform, pto_isa_root, runtime_name)
 
         sig = kernel.get("signature", [])
-        arg_index = kernel.get("arg_index", list(range(len(sig))))
-        return (func_id, CoreCallable.build(signature=sig, binary=kernel_bin, arg_index=arg_index))
+        return (func_id, CoreCallable.build(signature=sig, binary=kernel_bin))
 
     def _compile_orchestration() -> bytes:
         source = Path(orchestration["source"])

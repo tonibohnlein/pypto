@@ -1417,6 +1417,46 @@ class TestTileSliceCodegen:
             f"on the subview result (ptoas would reject); got:\n{subview_lines[0]}"
         )
 
+    def _generate_mlir_all_incore(self, program_cls) -> str:
+        """Like ``_generate_mlir`` but concatenates PTOCodegen output for every
+        InCore (AIC/AIV) leaf function, skipping the Group/orchestration wrapper that
+        a mixed (cube+vector) kernel splits into (those are not PTOCodegen targets)."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        return "\n".join(
+            codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
+            for func in optimized.functions.values()
+            if ir.is_incore_type(func.func_type)
+        )
+
+    def test_tile_slice_mat_subview_emits_loc_mat(self):
+        """A Mat tile.slice that survives the full pass pipeline (consumed by
+        tile.move Mat→Vec, not extract/matmul) lowers to pto.subview with
+        loc=mat on both source and result types."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[32, 64], pl.FP32],
+                dst: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                src_mat = pl.tile.load(src, [0, 0], [32, 64], target_memory=pl.Mem.Mat)
+                sliced = pl.tile.slice(src_mat, [16, 64], [16, 0])
+                vec_tile = pl.tile.move(sliced, target_memory=pl.Mem.Vec)
+                return pl.store(vec_tile, [0, 0], dst)
+
+        mlir = self._generate_mlir_all_incore(Prog)
+        subview_lines = [line.strip() for line in mlir.splitlines() if "pto.subview" in line]
+        assert subview_lines, f"Expected pto.subview for Mat tile.slice, got:\n{mlir}"
+        sv = subview_lines[0]
+        assert "loc=mat" in sv, f"pto.subview source must be loc=mat: {sv}"
+        result_type = sv.split("->", 1)[-1] if "->" in sv else ""
+        assert "loc=mat" in result_type, f"pto.subview result must be loc=mat: {sv}"
+        assert "sizes [16, 64]" in sv, f"subview sizes must match slice shape: {sv}"
+
 
 class TestTileAssembleCodegen:
     """Tests for tile.assemble PTO code generation (pto.subview + pto.tmov).
@@ -1482,8 +1522,8 @@ class TestTileAssembleCodegen:
 
     def _generate_mlir_all_incore(self, program_cls) -> str:
         """Like ``_generate_mlir`` but concatenates PTOCodegen output for every
-        InCore (AIC/AIV) leaf function, skipping the Group/orchestration wrapper a
-        mixed (cube+vector) kernel splits into (those are not PTOCodegen targets)."""
+        InCore (AIC/AIV) leaf function, skipping the Group/orchestration wrapper that
+        a mixed (cube+vector) kernel splits into (those are not PTOCodegen targets)."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
@@ -1608,20 +1648,24 @@ class TestTileAssembleCodegen:
         """End-to-end: an oversized chained matmul whose bf16 result is consumed on-chip
         tiles into an L1/Mat scratch via the Acc->Mat **FIXPIPE writeback** — each
         per-sub-tile assemble lowers to ``pto.tinsert`` (the offset Acc->Mat path on
-        A2/A3, which downcasts f32->bf16), filling a bf16 Mat scratch. (Assembles green
-        through ptoas v0.45.)"""
+        A2/A3, which downcasts f32->bf16), filling a bf16 Mat scratch. Under the
+        drain-count cost model (#1912) the 256x256x256 producer picks (256,128,64) OS
+        split-K (wider m halves the drain count) → a 1x2 grid → 2 tinserts. (Assembles
+        green through ptoas v0.45.)"""
 
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                a: pl.Tensor[[256, 128], pl.BF16],
-                b: pl.Tensor[[128, 256], pl.BF16],
+                a: pl.Tensor[[256, 256], pl.BF16],
+                b: pl.Tensor[[256, 256], pl.BF16],
                 e: pl.Tensor[[256, 64], pl.BF16],
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
-                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [256, 256] > L0c, consumed on-chip
+                c = pl.matmul(
+                    a, b, out_dtype=pl.FP32
+                )  # [256, 256] > L0c, consumed on-chip (K-split, both OS -> packs)
                 cb = pl.cast(c, pl.BF16, mode="rint")  # rint -> bf16 Mat scratch (FIXPIPE tie-even)
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)
                 out = pl.assemble(out, d, [0, 0])
@@ -1629,7 +1673,7 @@ class TestTileAssembleCodegen:
 
         mlir = self._generate_mlir_all_incore(Prog)
         tinserts = [line for line in mlir.splitlines() if "pto.tinsert" in line]
-        assert len(tinserts) == 4, f"2x2 grid -> 4 Acc->Mat tinserts, got {len(tinserts)}:\n{mlir}"
+        assert len(tinserts) == 2, f"1x2 grid -> 2 Acc->Mat tinserts, got {len(tinserts)}:\n{mlir}"
         assert "loc=mat, dtype=bf16" in mlir, (
             f"the chained-matmul intermediate must be a bf16 Mat scratch:\n{mlir}"
         )
@@ -1645,12 +1689,12 @@ class TestTileAssembleCodegen:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                a: pl.Tensor[[256, 32], pl.BF16],
-                b: pl.Tensor[[32, 256], pl.BF16],
+                a: pl.Tensor[[256, 64], pl.BF16],
+                b: pl.Tensor[[64, 256], pl.BF16],
                 e: pl.Tensor[[256, 64], pl.BF16],
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
-                c = pl.matmul(a, b, out_dtype=pl.FP32)  # K=32 fits L0 (k == K) -> full-K; on-chip
+                c = pl.matmul(a, b, out_dtype=pl.FP32)  # K=64 fits L0 (k == K) -> full-K; on-chip
                 cb = pl.cast(c, pl.BF16, mode="rint")  # rint -> bf16 Mat scratch (FIXPIPE tie-even)
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)
                 out = pl.assemble(out, d, [0, 0])
@@ -1658,7 +1702,9 @@ class TestTileAssembleCodegen:
 
         mlir = self._generate_mlir_all_incore(Prog)
         tinserts = [line for line in mlir.splitlines() if "pto.tinsert" in line]
-        assert len(tinserts) == 4, f"2x2 grid -> 4 Acc->Mat tinserts, got {len(tinserts)}:\n{mlir}"
+        assert len(tinserts) == 2, (
+            f"full-M, N-tiled (1x2 grid) -> 2 Acc->Mat tinserts, got {len(tinserts)}:\n{mlir}"
+        )
         assert "loc=mat, dtype=bf16" in mlir, (
             f"the full-K chained-matmul intermediate must be a bf16 Mat scratch:\n{mlir}"
         )
@@ -2279,22 +2325,54 @@ class TestTileStoreAtomicCodegen:
         single = ir.Program([target], target.name, optimized.span)
         return codegen_instance.generate(single)
 
-    def test_atomic_add_store_emits_atomic_type(self):
-        """pl.store(..., atomic=AtomicType.Add) emits the atomic_add attribute."""
-
+    # -- Vector (AIV) atomic-add store: one hardware atomic-add dtype per test. --
+    # Every hardware atomic-add dtype (set_atomic_{f32,f16,bf16,s32,s16,s8}) is a
+    # plain loaded Vec tile stored to a GM tensor of the same dtype -> a `loc=vec`
+    # atomic store on the AIV UB->GM (MTE3) pipe. These vector-path dtypes are not
+    # constrained by the Acc->GM whitelist (that only bounds the cube path).
+    def _assert_vec_atomic_store(self, dtype, mlir_dt, cols=16):
+        # `cols` widens the tile so the row byte size (cols * sizeof(dtype)) meets
+        # ptoas' 32-byte row alignment — int8 needs 32 cols (16 would be 16 bytes).
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
-            def kernel(self, x: pl.Tensor[[16, 16], pl.FP32], out: pl.Tensor[[16, 16], pl.FP32]):
-                t = pl.load(x, [0, 0], [16, 16])
+            def kernel(self, x: pl.Tensor[[16, cols], dtype], out: pl.Tensor[[16, cols], dtype]):
+                t = pl.load(x, [0, 0], [16, cols])
                 pl.store(t, [0, 0], out, atomic=pl.AtomicType.Add)
 
         mlir = self._generate_mlir(Prog)
         tstore_lines = [line.strip() for line in mlir.splitlines() if "pto.tstore" in line]
         assert tstore_lines, f"no pto.tstore line emitted:\n{mlir}"
         assert all("{atomicType = #pto<atomic_type atomic_add>}" in line for line in tstore_lines), (
-            f"expected atomic_add attribute on every pto.tstore, got:\n{tstore_lines}"
+            f"expected atomic_add on every {mlir_dt} pto.tstore, got:\n{tstore_lines}"
         )
+        assert all("loc=vec" in line and f"dtype={mlir_dt}" in line for line in tstore_lines), (
+            f"expected a {mlir_dt} vector (loc=vec) store, got:\n{tstore_lines}"
+        )
+
+    def test_atomic_add_store_fp32_emits_atomic_type(self):
+        """fp32 vector (AIV) atomic-add store (set_atomic_f32)."""
+        self._assert_vec_atomic_store(pl.FP32, "f32")
+
+    def test_atomic_add_store_fp16_emits_atomic_type(self):
+        """fp16 vector (AIV) atomic-add store (set_atomic_f16)."""
+        self._assert_vec_atomic_store(pl.FP16, "f16")
+
+    def test_atomic_add_store_bf16_emits_atomic_type(self):
+        """bf16 vector (AIV) atomic-add store (set_atomic_bf16; A2/A3 only)."""
+        self._assert_vec_atomic_store(pl.BF16, "bf16")
+
+    def test_atomic_add_store_int32_emits_atomic_type(self):
+        """int32 vector (AIV) atomic-add store (set_atomic_s32)."""
+        self._assert_vec_atomic_store(pl.INT32, "i32")
+
+    def test_atomic_add_store_int16_emits_atomic_type(self):
+        """int16 vector (AIV) atomic-add store (set_atomic_s16)."""
+        self._assert_vec_atomic_store(pl.INT16, "i16")
+
+    def test_atomic_add_store_int8_emits_atomic_type(self):
+        """int8 vector (AIV) atomic-add store (set_atomic_s8); 32 cols for row alignment."""
+        self._assert_vec_atomic_store(pl.INT8, "i8", cols=32)
 
     def test_plain_store_omits_atomic_type(self):
         """A plain pl.store emits no atomicType attribute (byte-identical codegen)."""
@@ -2313,9 +2391,23 @@ class TestTileStoreAtomicCodegen:
             f"plain store must not emit atomicType, got:\n{tstore_lines}"
         )
 
-    def test_atomic_add_bf16_tile_rejected(self):
-        """atomic=Add with a bf16 tile is rejected — bf16 is not a hardware atomic dtype."""
-        with pytest.raises(Exception, match="atomic.*fp32/fp16/int32/int16/int8"):
+    def test_atomic_add_bf16_rejected_on_ascend950(self):
+        """bf16 atomic-add is A2/A3-only; on Ascend950 (A5) codegen rejects it cleanly.
+
+        The IR-level dtype gate is backend-agnostic (a program may target A2/A3),
+        so bf16 atomic passes op validation. The backend-aware guard lives in
+        codegen: on Ascend950 the ``pto.tstore`` emit raises a clean PyPTO error
+        rather than deferring to a downstream pto-isa ``static_assert``.
+        """
+        # Capture the prior backend so the A5 override does not leak; it may be
+        # unset (get_backend_type raises when no backend is configured yet).
+        try:
+            prev_backend = backend.get_backend_type()
+        except Exception:
+            prev_backend = None
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+        try:
 
             @pl.program
             class Prog:
@@ -2323,6 +2415,17 @@ class TestTileStoreAtomicCodegen:
                 def kernel(self, x: pl.Tensor[[16, 16], pl.BF16], out: pl.Tensor[[16, 16], pl.BF16]):
                     t = pl.load(x, [0, 0], [16, 16])
                     pl.store(t, [0, 0], out, atomic=pl.AtomicType.Add)
+
+            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            funcs = list(optimized.functions.values())
+            target = next((f for f in funcs if ir.is_incore_type(f.func_type)), funcs[0])
+            single = ir.Program([target], target.name, optimized.span)
+            with pytest.raises(Exception, match="bf16 atomic-add requires the Ascend910B"):
+                codegen.PTOCodegen().generate(single)
+        finally:
+            backend.reset_for_testing()
+            if prev_backend is not None:
+                backend.set_backend_type(prev_backend)
 
 
 class TestTensorAssembleAtomicCodegen:
@@ -2378,17 +2481,27 @@ class TestTensorAssembleAtomicCodegen:
             f"plain assemble must not emit atomicType, got:\n{tstore_lines}"
         )
 
-    def test_atomic_add_bf16_target_rejected(self):
-        """atomic=Add with a bf16 target is rejected — bf16 is not a hardware atomic dtype."""
-        with pytest.raises(Exception, match="atomic.*fp32/fp16/int32/int16/int8"):
+    def test_atomic_add_bf16_target_emits_atomic_type(self):
+        """atomic=Add into a bf16 GM target is a hardware atomic-add dtype on A2/A3.
 
-            @pl.program
-            class Prog:
-                @pl.function(type=pl.FunctionType.InCore)
-                def kernel(self, x: pl.Tensor[[16, 16], pl.BF16], out: pl.Tensor[[16, 16], pl.BF16]):
-                    y = pl.add(x, x)
-                    out = pl.assemble(out, y, [0, 0], atomic=pl.AtomicType.Add)
-                    return out
+        The bf16 assemble lowers to a bf16 atomic-add tile.store (set_atomic_bf16
+        on pto-isa), so the emitted pto.tstore must carry the atomic_add attribute.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, x: pl.Tensor[[16, 16], pl.BF16], out: pl.Tensor[[16, 16], pl.BF16]):
+                y = pl.add(x, x)
+                out = pl.assemble(out, y, [0, 0], atomic=pl.AtomicType.Add)
+                return out
+
+        mlir = self._generate_mlir(Prog)
+        tstore_lines = [line.strip() for line in mlir.splitlines() if "pto.tstore" in line]
+        assert tstore_lines, f"no pto.tstore line emitted:\n{mlir}"
+        assert all("{atomicType = #pto<atomic_type atomic_add>}" in line for line in tstore_lines), (
+            f"expected atomic_add attribute on the lowered bf16 pto.tstore, got:\n{tstore_lines}"
+        )
 
     def test_atomic_add_tile_target_rejected(self):
         """atomic=Add into an on-chip tile is rejected — no global-memory destination."""

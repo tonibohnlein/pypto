@@ -47,6 +47,9 @@ class Ascend910BHandler : public BackendHandler {
   // A2/A3 offset Acc->Mat tinsert requires f32->bf16/f16 (cannot keep f32).
   [[nodiscard]] bool RequiresLowPrecisionMatScratch() const override { return true; }
 
+  // A2/A3 store pipe supports bf16 atomic-add (pto-isa set_atomic_bf16).
+  [[nodiscard]] bool SupportsBf16AtomicAdd() const override { return true; }
+
   [[nodiscard]] ir::TileView BuildCrossCoreTransferView(ir::MemorySpace dest_ms,
                                                         const ir::TileView& original_view) const override;
 
@@ -58,6 +61,7 @@ class Ascend910BHandler : public BackendHandler {
   [[nodiscard]] uint32_t GetL0aCapacityBytes() const override { return 64ULL * 1024; }
   [[nodiscard]] uint32_t GetL0bCapacityBytes() const override { return 64ULL * 1024; }
   [[nodiscard]] uint32_t GetL0cCapacityBytes() const override { return 128ULL * 1024; }
+  [[nodiscard]] uint64_t GetMatCapacityBytes() const override { return 512ULL * 1024; }
 
  private:
   Ascend910BHandler() = default;

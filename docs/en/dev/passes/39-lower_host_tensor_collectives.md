@@ -6,7 +6,7 @@
 `pld.tensor.allreduce`, `pld.tensor.barrier`, `pld.tensor.broadcast`,
 `pld.tensor.reduce_scatter`, and `pld.tensor.allgather` into compiler-internal
 builtin chip dispatches. It runs
-after [`MaterializeCommDomainScopes`](37-materialize_comm_domain_scopes.md), so
+after [`MaterializeCommDomainScopes`](38-materialize_comm_domain_scopes.md), so
 each window-bound data tensor and explicit or synthesized signal tensor already has a
 `WindowBuffer` back-reference and belongs to an inferred communication domain.
 
@@ -16,7 +16,7 @@ use [`LowerCompositeOps`](12-lower_composite_ops.md).
 ## Position in the pipeline
 
 ```text
-... -> SynthesizeAllReduceSignals -> MaterializeCommDomainScopes -> LowerHostTensorCollectives -> Simplify (final) -> MaterializeRuntimeScopes
+... -> SynthesizeAllReduceSignals -> MaterializeCommDomainScopes -> LowerHostTensorCollectives -> MaterializeDistTensorCtx -> Simplify (final) -> MaterializeRuntimeScopes
 ```
 
 The final `Simplify` runs after this pass so any generated loop bounds or

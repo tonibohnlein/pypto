@@ -149,6 +149,13 @@ void BindPass(nb::module_& m) {
       .value("ROUNDTRIP", VerificationLevel::Roundtrip,
              "BASIC + print→parse structural-equality check after every pass");
 
+  // Bind MemoryPlanner enum
+  nb::enum_<MemoryPlanner>(passes, "MemoryPlanner", "Selects who plans on-chip buffer memory")
+      .value("PYPTO", MemoryPlanner::PyPTO,
+             "PyPTO's AllocateMemoryAddr bakes physical addresses (ptoas --pto-level=level3)")
+      .value("PTOAS", MemoryPlanner::PtoAS,
+             "Skip pypto allocation passes; ptoas PlanMemory allocates (--pto-level=level2)");
+
   // Bind DiagnosticPhase enum
   nb::enum_<DiagnosticPhase>(passes, "DiagnosticPhase",
                              "Controls when DiagnosticInstrument runs registered checks "
@@ -269,12 +276,14 @@ void BindPass(nb::module_& m) {
                           "before/after each pass execution. Also controls automatic\n"
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
-      .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet>(),
+      .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
+                    MemoryPlanner>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
+           nb::arg("memory_planner") = MemoryPlanner::PyPTO,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
-           "and optional disabled diagnostic checks")
+           "optional disabled diagnostic checks, and memory planner selection")
       .def("__enter__",
            [](PassContext& self) -> PassContext& {
              self.EnterContext();
@@ -288,6 +297,8 @@ void BindPass(nb::module_& m) {
       .def("get_disabled_diagnostics", &PassContext::GetDisabledDiagnostics,
            "Get the diagnostic checks suppressed by this context")
       .def("get_instruments", &PassContext::GetInstruments, "Get the instruments registered on this context")
+      .def("get_memory_planner", &PassContext::GetMemoryPlanner,
+           "Get the memory planner selection for this context")
       .def_static("current", &PassContext::Current, nb::rv_policy::reference,
                   "Get the currently active context, or None if no context is active");
 
@@ -303,6 +314,12 @@ void BindPass(nb::module_& m) {
              "Create an init memref pass\n\n"
              "Initializes MemRef for all variables in functions.\n"
              "Sets memory space to UB by default, or DDR for tile.load/tile.store operands.");
+
+  passes.def("materialize_semantic_aliases", &pass::MaterializeSemanticAliases,
+             "Create the semantic must-alias materialization pass\n\n"
+             "Propagates loop-carried iter_arg/initValue MemRefs down the yield/producer chain so\n"
+             "accumulator producers write directly into the carried buffer. Split out of MemoryReuse\n"
+             "so it can run without the opportunistic lifetime-reuse phase (memory_planner=PTOAS).");
 
   passes.def("memory_reuse", &pass::MemoryReuse,
              "Create a memory reuse pass\n\n"
@@ -441,8 +458,12 @@ void BindPass(nb::module_& m) {
              "tile.matmul_acc the body is uniform — every iteration is tile.matmul_acc with the\n"
              "iter-arg init = caller's accumulator. The K-loop is marked ForKind::Pipeline +\n"
              "pipeline_stages=2 so LowerPipelineLoops produces a 2-deep ping-pong. Already-L0-\n"
-             "sized matmuls are left untouched. tile.matmul_bias is not yet supported. Only K\n"
-             "tiling; M/N tiling and K%k!=0 cases emit a PerfHint and skip.");
+             "sized matmuls are left untouched. tile.matmul_bias is not yet supported. The tile\n"
+             "(m,n,k,stationarity) comes from a roofline cost-model search: besides the K-loop\n"
+             "the pass emits M/N output tiling (direct-store grid or on-chip Mat-scratch\n"
+             "assemble), a non-divisor-K boundary peel for 16-aligned K, and operand-stationary\n"
+             "(A/B-stationary) schedules. Non-16-aligned K and other deferred regimes emit a\n"
+             "PerfHint and are left untouched.");
   passes.def("canonicalize_tile_slice", &pass::CanonicalizeTileSlice,
              "Create a pass that lowers Mat-resident tile.slice into tile.extract\n\n"
              "A tile.slice whose result tile is Mem.Mat (e.g. a batch-page slice emitted by\n"
@@ -508,6 +529,8 @@ void BindPass(nb::module_& m) {
              "LowerHostTensorCollectives, while the host dispatch chain is still intact.");
   passes.def("lower_host_tensor_collectives", &pass::LowerHostTensorCollectives,
              "Lower host-level pld.tensor.allreduce calls to builtin tensor collective dispatches.");
+  passes.def("materialize_dist_tensor_ctx", &pass::MaterializeDistTensorCtx,
+             "Materialize CommCtx parameters and arguments for DistributedTensor function parameters.");
   passes.def("stamp_tfree_split", &pass::StampTfreeSplit,
              "Copy each cross-core tpop's split/pipe-id onto its matching tfree op so codegen\n"
              "reads them from the op directly. Covers mixed-kernel and explicit AIC/AIV tfrees.");
@@ -530,16 +553,18 @@ void BindPass(nb::module_& m) {
              "Post-condition: ``IRProperty::CallDirectionsResolved``. The integrity of\n"
              "the produced ``Call.attrs['arg_directions']`` is verified automatically by the\n"
              "``CallDirectionsResolved`` PropertyVerifier (no separate verify pass).");
-  passes.def("auto_derive_task_dependencies", &pass::AutoDeriveTaskDependencies,
-             nb::arg("analyze_auto_scopes") = false,
-             "Derive compiler-owned runtime-scope task dependency edges.\n\n"
-             "Runs after derive_call_directions and writes "
-             "Call.attrs['compiler_manual_dep_edges'] inside analyzed AUTO runtime scopes. "
-             "User-written manual scopes are skipped. Pass analyze_auto_scopes=True "
-             "to analyze AUTO scopes without changing their runtime scope mode. "
-             "Unanalyzable hazards keep AUTO tracking with partial compiler deps stripped. "
-             "User-provided Call.attrs['manual_dep_edges'] remain separate; orchestration "
-             "codegen merges both attrs before emitting Arg::set_dependencies.");
+  passes.def(
+      "auto_derive_task_dependencies", &pass::AutoDeriveTaskDependencies,
+      nb::arg("analyze_auto_scopes") = false,
+      "Derive compiler-owned runtime-scope task dependency edges.\n\n"
+      "Runs after derive_call_directions and writes "
+      "Call.attrs['compiler_manual_dep_edges'] inside analyzed AUTO runtime scopes. "
+      "User-written manual scopes are skipped: they do not get compiler deps or "
+      "automatic NoDep/OutputExisting direction rewrites. "
+      "Pass analyze_auto_scopes=True to analyze AUTO scopes without changing their runtime scope mode. "
+      "Unanalyzable hazards keep AUTO tracking with partial compiler deps stripped. "
+      "User-provided Call.attrs['manual_dep_edges'] remain separate; orchestration "
+      "codegen merges both attrs before emitting Arg::set_dependencies.");
   passes.def("expand_manual_phase_fence", &pass::ExpandManualPhaseFence,
              "Insert dependency-only dummy TaskId barriers for profitable manual_scope "
              "Array[TASK_ID] phase-fence fanout and rewrite covered consumers to depend "
@@ -662,11 +687,18 @@ void BindPass(nb::module_& m) {
                    "Enforce the InOut-use discipline; raises pypto.Error (VerificationError) "
                    "on any violation so compilation halts rather than proceeding with unsound IR.");
 
-  // L0 tile-size chooser submodule (closed-form heuristic; consumed by the
+  // L0 tile-size chooser submodule (roofline cost model; consumed by the
   // AutoTileMatmulL0 pass and exposed for testing / inspection).
-  nb::module_ l0_tile = passes.def_submodule(
-      "l0_tile_chooser",
-      "Closed-form chooser for L0 matmul tile shape (m, n, k) under L1->L0 traffic minimisation");
+  nb::module_ l0_tile =
+      passes.def_submodule("l0_tile_chooser",
+                           "Chooser for the L0 matmul design point (m, n, k, stationarity, dbA/dbB/dbC) "
+                           "by roofline cost model: min wall over the legal aligned tile grid");
+
+  nb::enum_<utils::Stationarity>(l0_tile, "Stationarity",
+                                 "Which GEMM operand is pinned across the L0 tiling loops")
+      .value("OutputStationary", utils::Stationarity::kOutputStationary)
+      .value("AStationary", utils::Stationarity::kAStationary)
+      .value("BStationary", utils::Stationarity::kBStationary);
 
   nb::class_<utils::L0TileConfig>(l0_tile, "L0TileConfig",
                                   "Inputs to ChooseL0Tile: problem dims + hardware + schedule knobs")
@@ -686,11 +718,18 @@ void BindPass(nb::module_& m) {
       .def_rw("align_m", &utils::L0TileConfig::align_m)
       .def_rw("align_n", &utils::L0TileConfig::align_n)
       .def_rw("align_k", &utils::L0TileConfig::align_k)
-      .def_rw("double_buffer_a", &utils::L0TileConfig::double_buffer_a)
-      .def_rw("double_buffer_b", &utils::L0TileConfig::double_buffer_b)
-      .def_rw("double_buffer_c", &utils::L0TileConfig::double_buffer_c)
+      .def_rw("allow_a_stationary", &utils::L0TileConfig::allow_a_stationary)
+      .def_rw("allow_b_stationary", &utils::L0TileConfig::allow_b_stationary)
+      .def_rw("allow_double_buffer_c", &utils::L0TileConfig::allow_double_buffer_c)
       .def_rw("c_read", &utils::L0TileConfig::c_read)
-      .def_rw("allow_padding", &utils::L0TileConfig::allow_padding);
+      .def_rw("bw_a", &utils::L0TileConfig::bw_a)
+      .def_rw("bw_b", &utils::L0TileConfig::bw_b)
+      .def_rw("bw_drain", &utils::L0TileConfig::bw_drain)
+      .def_rw("drain_fixed_cycles", &utils::L0TileConfig::drain_fixed_cycles)
+      .def_rw("mad_head", &utils::L0TileConfig::mad_head)
+      .def_rw("mad_k_fractal_bytes", &utils::L0TileConfig::mad_k_fractal_bytes)
+      .def_rw("allow_padding", &utils::L0TileConfig::allow_padding)
+      .def_rw("allow_k_boundary", &utils::L0TileConfig::allow_k_boundary);
 
   nb::class_<utils::L0TileResult>(l0_tile, "L0TileResult",
                                   "Output of ChooseL0Tile: the chosen (m, n, k) plus diagnostics")
@@ -698,11 +737,15 @@ void BindPass(nb::module_& m) {
       .def_ro("n", &utils::L0TileResult::n)
       .def_ro("k", &utils::L0TileResult::k)
       .def_ro("estimated_traffic_bytes", &utils::L0TileResult::estimated_traffic_bytes)
+      .def_ro("estimated_cost_cycles", &utils::L0TileResult::estimated_cost_cycles)
       .def_ro("padded_compute_volume", &utils::L0TileResult::padded_compute_volume)
+      .def_ro("stationarity", &utils::L0TileResult::stationarity)
+      .def_ro("os_holds_a", &utils::L0TileResult::os_holds_a)
+      .def_ro("double_buffer_c", &utils::L0TileResult::double_buffer_c)
       .def_ro("perf_hint", &utils::L0TileResult::perf_hint);
 
   l0_tile.def("choose_l0_tile", &utils::ChooseL0Tile, nb::arg("config"),
-              "Pick an approximately-optimal L0 tile shape (m, n, k) by closed-form heuristic.");
+              "Pick the minimum-cost L0 tile shape (m, n, k) under the roofline cost model.");
 }
 
 }  // namespace python

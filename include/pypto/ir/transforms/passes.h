@@ -147,6 +147,18 @@ Pass CreateProgramPass(std::function<ProgramPtr(const ProgramPtr&)> transform, c
 Pass InitMemRef();
 
 /**
+ * @brief Create the semantic must-alias materialization pass
+ *
+ * Propagates each loop-carried iter_arg/initValue MemRef down the yield/producer
+ * chain so accumulator producers (and other loop-carry chains) write directly
+ * into the carried buffer. This is a semantics-required aliasing (the loop
+ * accumulator must live in one buffer), split out of MemoryReuse so it can run
+ * without the opportunistic lifetime-reuse phase (e.g. when ptoas owns reuse via
+ * memory_planner=PTOAS). Runs after InitMemRef, before MemoryReuse.
+ */
+Pass MaterializeSemanticAliases();
+
+/**
  * @brief Create a memory reuse pass
  *
  * Uses dependency analysis to identify memory reuse opportunities.
@@ -233,6 +245,11 @@ Pass MaterializeCommDomainScopes();
  * @brief Lower host-level ``pld.tensor.allreduce`` calls to internal builtin chip dispatches.
  */
 Pass LowerHostTensorCollectives();
+
+/**
+ * @brief Materialize one CommCtx parameter/argument per DistributedTensor parameter.
+ */
+Pass MaterializeDistTensorCtx();
 
 /**
  * @brief Create a loop unrolling pass
@@ -708,10 +725,12 @@ Pass ExpandManualPhaseFence();
  * @brief Derive explicit task-to-task dependency edges inside runtime scopes.
  *
  * User-written manual runtime scopes are skipped: the user's explicit
- * ``deps=[...]`` edges are treated as the complete scheduling contract. AUTO
- * scopes are skipped by default; pass ``analyze_auto_scopes=true`` to analyze
- * them while keeping ``manual=false`` in the output IR. For each analyzed AUTO
- * scope, the pass computes a conservative storage access summary from
+ * ``deps=[...]`` edges are treated as the complete scheduling contract, and the
+ * pass does not rewrite their call-site directions to ``NoDep`` or
+ * ``OutputExisting``. AUTO scopes are skipped by default; pass
+ * ``analyze_auto_scopes=true`` to analyze them while keeping ``manual=false`` in
+ * the output IR. For each analyzed AUTO scope, the pass computes a conservative
+ * storage access summary from
  * ``arg_directions`` and attaches RAW/WAR/WAW hazards against prior calls in the
  * same scope under ``Call.attrs["compiler_manual_dep_edges"]``. On unanalyzable
  * hazards, partial compiler deps are stripped and AUTO tracking remains active.

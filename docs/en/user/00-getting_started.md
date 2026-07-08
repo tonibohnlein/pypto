@@ -323,9 +323,9 @@ exposed under both `device_wall_us_*` and shorter `device_us_*` names, with
 raises the runtime log level to `v9` for the worker's lifetime and captures
 `stderr` at the fd level around the measured loop, so stderr emitted during the
 loop is diverted into a temp file rather than shown live. `device_wall_us` is a
-real on-NPU wall only for L2 single-chip runs; it is `0` on runtimes built
-without `SIMPLER_PROFILING` or on `*sim` platforms (check
-`stats.all_zero_device`).
+real on-NPU wall for L2 single-chip runs (see the L3 note below for distributed
+programs); it is `0` on runtimes built without `SIMPLER_PROFILING` or on `*sim`
+platforms (check `stats.all_zero_device`).
 
 Beyond the aggregates, each measured launch keeps its full `[STRACE]` span tree
 on `stats.invocations` (a list of `TraceInvocation`; warmup excluded). Render it
@@ -340,7 +340,7 @@ stats.print_mean_tree(spread="both")  # mean per node, with ±stdev and [min..ma
 
 ```text
 mean of 20 launches (warmup 5 excluded); each node: mean ±stdev [min..max]:
-run_prepared               71784.1us  ±6797.5  [66482.4..89832.6]
+simpler_run                71784.1us  ±6797.5  [66482.4..89832.6]
 |- bind                    27943.6us  ±4163.7  [24836.7..37713.3]
 |- runner_run               3030.8us   ±184.4    [2822.3..3694.7]
 |  `- device_wall [dev]     2005.2us    ±74.6    [1875.1..2173.2]
@@ -354,6 +354,34 @@ wall-clock window, *not* a partition: children may overlap (e.g. `orch`/`sched`
 run concurrently) or sit in a different clock domain (`runner_run` host wall vs
 `device_wall` on-NPU), so child durations need not sum to the parent. Drill into
 raw spans via `stats.invocations[i].by_name()[<name>].dur_us`.
+
+`benchmark` also accepts an L3 `DistributedCompiledProgram` (opened via
+`compiled.prepare()`): pass shared-memory host tensors (or `DeviceTensor`s) and
+omit `platform=` / `device_id=` (the device set is fixed at compile time via
+`distributed_config`). L3 has no single DAG-level device wall, so timing is
+folded from the per-rank chip-child markers into per-round samples — the headline
+`device_wall_us[k]` is the max across ranks of each rank's summed dispatch device
+walls. Query the four metrics uniformly:
+
+```python
+stats.per_round("device" | "host" | "effective" | "union")  # -> [one value per round]
+stats.per_rank("device" | "host" | "effective")             # -> {pid: [one per round]}
+```
+
+Both views aggregate **per rank per round**: each entry sums that rank's
+dispatches within the round (a card runs its dispatches serially), so they are
+per-round-per-rank figures, **not** per-dispatch. When a rank runs exactly one
+dispatch per round the sum is that single dispatch's value; for the individual
+dispatches in any case, read `stats.rounds_dispatches[k][pid]` (see below).
+
+`effective` is the orch∪sched on-device window (per-card L2 Effective); `union`
+is the cross-rank host-timeline window (captures start skew — host-domain, so it
+includes dispatch overhead). The navigable `round -> rank -> [dispatch]` grid is
+`stats.rounds_dispatches`, where each `TraceInvocation` exposes `.task` (callable
+id), `.device_wall_us`, `.host_wall_us`, `.effective_us`. A pure-device
+cross-rank end-to-end wall is not recoverable from the markers today. If the
+dispatch shape is non-deterministic, `stats.fallback_flattened` is set and the
+per-rank / `union` views are empty.
 
 ### Distributed (L3+) programs
 
@@ -405,6 +433,62 @@ with compiled.prepare() as rt:                  # setup runs once
     rt.free_tensor(weight)
 # rt.close() runs on exit
 ```
+
+#### Sharding a weight across cards (`alloc_stacked_tensor`)
+
+When a HOST orchestrator slices a `[B, N, M]` weight along its leading dimension
+and dispatches a per-rank child — the canonical
+`for r in range(world_size): child(x[r], device=r)` — passing the whole host
+tensor re-uploads each `x[r]` slice to its card on **every** dispatch. To upload
+each shard **once** and keep it resident on its card, build a
+`StackedDeviceTensor` with `rt.alloc_stacked_tensor`:
+
+```python
+host_w = load_weight().share_memory_()           # [B, N, M], B == world_size
+host_a = torch.zeros((B, N, M), dtype=...).share_memory_()
+host_out = torch.zeros((B, N, M), dtype=...).share_memory_()
+
+with compiled.prepare() as rt:
+    w = rt.alloc_stacked_tensor(host_w)          # shard i uploaded to card i, once
+    for step in steps:
+        host_a.copy_(next_input(step))
+        rt(host_a, w, host_out)                  # x[r] resolves to the resident shard r
+        consume(host_out)
+    rt.free_stacked_tensor(w)
+```
+
+Internally each shard `host_w[i]` becomes a worker-resident `DeviceTensor`, so the
+generated `x[r]` indexing skips the H2D upload (`child_memory`). Shards are
+auto-freed on `close()` if not released earlier via `free_stacked_tensor`.
+
+Like a single `DeviceTensor`, a `StackedDeviceTensor` is never copied back
+automatically. To read the current device contents of every shard back to the
+host in one call — e.g. a resident KV cache at the end of a step — use
+`rt.copy_stacked_from(w, host_out)`, the read-back symmetric of
+`alloc_stacked_tensor`. `host_out` is filled in place (`host_out[i]` receives
+shard `i`) and, like the upload source, must be a CPU, contiguous, **shared-memory**
+`[B, *tail]` tensor matching the stack's shape and dtype, allocated before
+`prepare()` (call `.share_memory_()`): the D2H copy runs in the forked chip worker,
+which can only write host memory it inherited at fork.
+
+The leading dimension is the shard dimension and `B` must equal the number of
+cards the program dispatches to. By default shard `i` lands on worker `i`
+(matching `device=r`). If the program uses a **non-identity** placement — a
+permutation or a subset of cards (e.g. `device=2*r`, or literal `device=1` /
+`device=0`) — pass the matching `worker_ids`, where `worker_ids[i]` is the worker
+the program submits `x[i]`'s task to:
+
+```python
+# orchestrator dispatches x[0] to card 1 and x[1] to card 0
+w = rt.alloc_stacked_tensor(host_w, worker_ids=[1, 0])
+```
+
+`worker_ids` must be distinct and within `[0, world_size)`; a mismatch with the
+program's `device=` would leave a shard on the wrong card and read garbage.
+
+`rt.alloc_tensor(..., worker_id=r)` similarly accepts a non-default `worker_id`
+to place a single resident `DeviceTensor` on any card (pass the same `worker_id`
+to `free_tensor`).
 
 #### Dispatching several programs on one worker (multi-program)
 

@@ -94,6 +94,16 @@ class _UnaryMathBase(PTOTestCase):
         config=None,
     ):
         super().__init__(config)
+        # fp16 transcendentals (sqrt/sin/cos) use a HW Newton/poly approximation that
+        # differs from torch by ~1-2 fp16 ULP. fp16 has 11 significand bits; the max
+        # ULP near 1 is 2^-10 ~ 9.8e-4 (just above 1.0). Observed CI flake
+        # (tile_sqrt_fp16, a2a3): |1.0 - 0.99951171875| = 2^-11 ~ 4.9e-4 (1 ULP just
+        # below 1). rtol=atol=2e-3 clears that observed max with ~8x threshold margin
+        # (~4 fp16 ULP near 1) so a full-ULP HW error plus golden rounding at a binade
+        # bottom still passes; the 1e-5 default is ~50x too tight. fp16 only (fp32 exact).
+        if dtype == DataType.FP16 and config is None:
+            self.config.rtol = 2e-3
+            self.config.atol = 2e-3
         self._m, self._n, self._valid, self._dtype = m, n, valid_shapes, dtype
         self._input_fn = input_fn or _positive
         self._out_m, self._out_n, self._off = out_m or m, out_n or n, off

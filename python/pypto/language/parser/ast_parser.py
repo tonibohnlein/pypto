@@ -66,6 +66,35 @@ if TYPE_CHECKING:
 _PLD_CATEGORIES: frozenset[str] = frozenset({"system", "tensor", "tile"})
 
 
+def _is_empty_body(body: list[ast.stmt]) -> bool:
+    """True if a function body carries no statements beyond a signature marker.
+
+    Accepts a bare ``...`` (the documented spelling), a bare ``pass`` (what the
+    IR printer emits for an empty body — required so external-kernel functions
+    survive print -> reparse round-trips), and an optional leading docstring.
+
+    Used to validate external-kernel declarations, whose implementation lives in
+    a hand-written C++ source rather than a parsed DSL body.
+    """
+    non_doc = [
+        stmt
+        for stmt in body
+        if not (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        )
+    ]
+    if not non_doc:
+        return True
+    if len(non_doc) != 1:
+        return False
+    only = non_doc[0]
+    if isinstance(only, ast.Pass):
+        return True
+    return isinstance(only, ast.Expr) and isinstance(only.value, ast.Constant) and only.value.value is ...
+
+
 def _is_pld_call(node: object, attr_name: str) -> TypeGuard[ast.Call]:
     """Match ``pld.<attr_name>(...)`` or ``pld.<category>.<attr_name>(...)``.
 
@@ -752,7 +781,28 @@ class ASTParser:
 
             # Parse function body. HOST SubWorkers carry pure-Python source
             # via ``inline_body`` and are not parsed as DSL.
-            if inline_body is not None:
+            external_source = (func_attrs or {}).get("external_source")
+            if external_source is not None:
+                # Header-only external C++ kernel: no DSL body to parse. The
+                # signature (params + directions + return types) is the contract
+                # the orchestration submits against; the backend compiles the
+                # referenced ``.cpp`` as the InCore kernel by func_id.
+                if func_type not in (ir.FunctionType.AIC, ir.FunctionType.AIV):
+                    raise ParserTypeError(
+                        f"external_source is only valid on FunctionType.AIC or "
+                        f"FunctionType.AIV, got {func_type!r} for function '{func_name}'",
+                        span=func_span,
+                        hint="Declare the external kernel as pl.FunctionType.AIC or pl.FunctionType.AIV.",
+                    )
+                if not _is_empty_body(func_def.body):
+                    raise ParserSyntaxError(
+                        f"External kernel '{func_name}' must have an empty '...' body "
+                        "(signature only) — its implementation is the C++ source "
+                        "given by external_source.",
+                        span=func_span,
+                        hint="Replace the function body with a bare '...'.",
+                    )
+            elif inline_body is not None:
                 self.builder.inline_stmt(inline_body, ir.InlineLanguage.Python, func_span)
             else:
                 self._parse_body_siblings(func_def.body)
@@ -3587,6 +3637,128 @@ class ASTParser:
                 "cluster) to keep the hint.",
             )
 
+    @staticmethod
+    def _spmd_body_reads_block_idx(body: "list[ast.stmt]") -> bool:
+        """True if any statement in an inline SPMD body calls ``get_block_idx()``.
+
+        An inline (auto-outlined) ``pl.spmd`` body distinguishes blocks solely via
+        the per-block index; without it every block executes identical work — almost
+        always a bug, and the reason the body is being outlined into a per-block
+        kernel at all. The single-call direct-dispatch shape is exempt (the callee
+        reads the index internally), so this is only consulted for inline bodies.
+
+        Matched at the AST layer (no IR ``Op`` exists yet) by the trailing call name,
+        so every valid spelling of the API counts regardless of receiver:
+        ``pl.get_block_idx()`` (the top-level alias real models use), the qualified
+        ``pl.tile.get_block_idx()`` / ``tile.get_block_idx()``, and a bare
+        ``get_block_idx()`` imported directly. Matching by name only is deliberately
+        lenient: ``get_block_idx`` is unique to this API (no other DSL object exposes
+        it), and being lenient here is far safer than rejecting a real body that
+        distinguishes blocks. ``ast.walk`` recurses the whole body subtree, so a
+        nested use (inside a ``pl.range`` loop or an expression argument) is found.
+        """
+        for body_stmt in body:
+            for node in ast.walk(body_stmt):
+                if isinstance(node, ast.Call):
+                    func = node.func
+                    if (isinstance(func, ast.Attribute) and func.attr == "get_block_idx") or (
+                        isinstance(func, ast.Name) and func.id == "get_block_idx"
+                    ):
+                        return True
+        return False
+
+    def _emit_spmd_body(  # noqa: PLR0913 — args map 1:1 to the SpmdScopeStmt fields
+        self,
+        stmt: ast.With,
+        span: "ir.Span",
+        scope_kind: "ir.ScopeKind",
+        core_num: "ir.Expr",
+        sync_start: bool,
+        name_hint: str,
+        split_mode: "ir.SplitMode | None",
+        split_slot_num: "int | None",
+        scope_attrs: "list[tuple[str, Any]]",
+    ) -> None:
+        """Emit the ``SpmdScopeStmt`` body shared by the plain and ``as tid`` with-forms.
+
+        The two forms differ only in ``scope_attrs`` (the ``as tid`` form adds
+        ``task_id_var`` / ``manual_dep_edges``); the body dispatch is identical:
+
+        * single call + no split → ``SpmdScopeStmt(body=Call)`` with no inner InCore
+          wrapper — the historical direct-dispatch shape (the callee is a pre-defined
+          kernel that reads the block index internally). This is also the shape
+          ``OutlineIncoreScopes`` leaves behind once an inline body is outlined, so
+          the IR round-trips identically across passes.
+        * inline multi-statement body, or single-call + split → wrap in
+          ``InCoreScopeStmt(split, <body>)`` for ``OutlineIncoreScopes`` to outline
+          into a synthetic per-block kernel, exactly like ``for i in pl.spmd(n):``.
+          Such an inline body must read the per-block index (see below).
+        """
+        # A single body statement whose value is a Call — Assign/AnnAssign/Expr all
+        # expose a `.value`, so one membership test covers the three call-carrying
+        # statement kinds (`x = f()`, `x: T = f()`, and a bare `f()`).
+        body_stmt = stmt.body[0] if len(stmt.body) == 1 else None
+        is_single_call = isinstance(body_stmt, (ast.Assign, ast.AnnAssign, ast.Expr)) and isinstance(
+            body_stmt.value, ast.Call
+        )
+        # An inline (auto-outlined) body must read the per-block index — the
+        # single-call dispatch is exempt (its callee reads it internally). Unlike
+        # the for-form, the with-forms do not bind the index for you, so require an
+        # explicit ``pl.tile.get_block_idx()`` somewhere in the body.
+        if not is_single_call and not self._spmd_body_reads_block_idx(stmt.body):
+            raise ParserSyntaxError(
+                "inline `with pl.spmd(...)` body must read the per-block index via "
+                "`pl.tile.get_block_idx()`; without it every block runs identical work.",
+                span=span,
+                hint="Add `i = pl.tile.get_block_idx()` inside the scope, or use "
+                "`for i in pl.spmd(n):` to bind the block index automatically.",
+            )
+        if is_single_call and split_mode is None:
+            # Historical no-InCore-wrapper shape. Any ``scope_attrs``
+            # (allow_early_resolve, and for the ``as tid`` form task_id_var /
+            # manual_dep_edges) ride on the SpmdScopeStmt.
+            self._parse_scope_body(
+                stmt,
+                scope_kind,
+                span,
+                name_hint=name_hint,
+                core_num=core_num,
+                sync_start=sync_start,
+                attrs=scope_attrs or None,
+            )
+            return
+        # split= hint or an inline multi-statement body requires an inner
+        # InCoreScopeStmt to carry split_ / be outlined. Build the scope directly
+        # instead of routing through _parse_scope_body, so merge any forward-sticky
+        # pl.dump_tag tensors onto it here (see _parse_spmd_for_loop for the full
+        # rationale).
+        spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
+        incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
+        incore_attrs = self._append_split_slot_num_attr(incore_attrs, split_slot_num)
+        with self.builder.scope(
+            scope_kind,
+            span,
+            name_hint=spmd_name_hint,
+            core_num=core_num,
+            sync_start=sync_start,
+            attrs=scope_attrs or None,
+        ):
+            with self._scope_kind_context(scope_kind):
+                self.scope_manager.enter_scope("spmd_with")
+                with self.builder.scope(
+                    ir.ScopeKind.InCore,
+                    span,
+                    split=split_mode,
+                    name_hint=incore_name_hint,
+                    attrs=incore_attrs,
+                ):
+                    with self._scope_kind_context(ir.ScopeKind.InCore):
+                        self.scope_manager.enter_scope("spmd_with_incore")
+                        self._parse_body_siblings(stmt.body)
+                        self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
+                        self.scope_manager.exit_scope(leak_vars=True)
+                self.scope_manager.exit_scope(leak_vars=True)
+
     def _parse_spmd_scope(
         self,
         stmt: ast.With,
@@ -3596,19 +3768,26 @@ class ASTParser:
     ) -> None:
         """Parse ``with pl.spmd(...):`` / ``with pl.spmd(...) as tid:`` into a ScopeStmt(Spmd).
 
-        Two forms:
+        Two forms, differing only in whether the grid dispatch's producer TaskId is
+        captured — the body shape is identical (see :meth:`_emit_spmd_body`):
 
-        * ``with pl.spmd(n): self.kernel(...)`` — wraps a single kernel call
-          (historical shape; no producer TaskId captured, no ``deps=``).
-        * ``with pl.spmd(n, deps=[...]) as tid:`` — captures the grid dispatch's
-          producer ``Scalar[TASK_ID]`` (mirrors ``with pl.at(...) as tid:``) and
-          accepts an inline multi-statement body that is auto-outlined into an
-          InCore kernel, exactly like ``for i in pl.spmd(n):``. The per-block
-          index is read inside the body via ``pl.tile.get_block_idx()``.
+        * ``with pl.spmd(n):`` — no captured TaskId, no ``deps=``. Accepts either a
+          single kernel call (historical direct-dispatch shape) or an inline
+          multi-statement body auto-outlined into an InCore kernel (like
+          ``for i in pl.spmd(n):``, minus the auto-bound loop var — read the
+          per-block index inside via ``pl.tile.get_block_idx()``).
+        * ``with pl.spmd(n, deps=[...]) as tid:`` — same body shapes, and
+          additionally captures the producer ``Scalar[TASK_ID]`` (mirrors
+          ``with pl.at(...) as tid:``) so it can feed a ``deps=`` edge.
+
+        TaskId capture and inline bodies are orthogonal: the inline body is outlined
+        the same way with or without ``as tid``; ``as tid`` only adds the
+        ``task_id_var`` attr that makes the dispatch lower to an ``ir.Submit``.
         """
         with_hint = (
-            "Use 'with pl.spmd(4):' with a single function call inside, or "
-            "'with pl.spmd(4) as tid:' to capture the dispatch TaskId."
+            "Use 'with pl.spmd(4):' with a single call or an inline block that reads "
+            "'pl.tile.get_block_idx()', or 'with pl.spmd(4) as tid:' to also capture "
+            "the dispatch TaskId."
         )
         # ``deps=`` is accepted ONLY with ``as tid`` — gate it by keyword presence,
         # not by the resolved list being non-empty. _parse_submit_deps_kwarg
@@ -3656,81 +3835,22 @@ class ASTParser:
         self._reject_spmd_early_resolve_in_cluster(allow_early_resolve, span)
         spmd_attrs: list[tuple[str, Any]] = [("allow_early_resolve", True)] if allow_early_resolve else []
 
-        # No ``as tid``: the historical single-kernel-call with-form. ``deps=`` was
-        # already rejected above (allow_deps=False), so dep_vars is empty here.
-        # Validate body is exactly one statement that is a function call.
-        # The loop form (for i in pl.spmd(n):) and the `as tid` with-form are
-        # what accept inline multi-statement bodies.
-        spmd_hint = (
-            "The 'with pl.spmd()' form (without 'as tid') wraps a single kernel call. "
-            "Use 'with pl.spmd(4) as tid:' to write inline tile/tensor ops and capture the "
-            "dispatch TaskId, or 'for i in pl.spmd(4):' for an inline loop body."
+        # No ``as tid``: the plain with-form. ``deps=`` was already rejected above
+        # (allow_deps=False), so dep_vars is empty here. The shared helper keeps the
+        # historical single-call direct-dispatch shape and outlines an inline
+        # multi-statement body into a synthetic InCore kernel — identical to the
+        # ``as tid`` form, minus the captured TaskId.
+        self._emit_spmd_body(
+            stmt,
+            span,
+            scope_kind,
+            core_num,
+            sync_start,
+            name_hint,
+            split_mode,
+            split_slot_num,
+            spmd_attrs,
         )
-        if len(stmt.body) != 1:
-            raise ParserSyntaxError(
-                f"pl.spmd() body must contain exactly one statement, got {len(stmt.body)}",
-                span=self.span_tracker.get_span(stmt),
-                hint=spmd_hint,
-            )
-        body_stmt = stmt.body[0]
-        is_call = (
-            (isinstance(body_stmt, ast.Assign) and isinstance(body_stmt.value, ast.Call))
-            or (isinstance(body_stmt, ast.AnnAssign) and isinstance(body_stmt.value, ast.Call))
-            or (isinstance(body_stmt, ast.Expr) and isinstance(body_stmt.value, ast.Call))
-        )
-        if not is_call:
-            raise ParserSyntaxError(
-                "pl.spmd() body statement must be a function call",
-                span=self.span_tracker.get_span(stmt),
-                hint=spmd_hint,
-            )
-        if split_mode is None:
-            # No optimizations — preserve the historical IR shape:
-            # SpmdScopeStmt(<call>) with no inner InCore wrapper. The optional
-            # ``allow_early_resolve`` attr rides on the SpmdScopeStmt; the Spmd
-            # outliner reads it and threads it onto the synthesised Submit.
-            self._parse_scope_body(
-                stmt,
-                scope_kind,
-                span,
-                name_hint=name_hint,
-                core_num=core_num,
-                sync_start=sync_start,
-                attrs=spmd_attrs or None,
-            )
-        else:
-            # split= hint requires an inner InCoreScopeStmt to carry the
-            # split_ field. Build SpmdScopeStmt(InCoreScopeStmt(split_=mode, <call>)).
-            spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
-            # Like the for-form, this path builds the InCore scope directly
-            # instead of routing through _parse_scope_body, so merge any
-            # forward-sticky pl.dump_tag tensors onto it here (see
-            # _parse_spmd_for_loop for the full rationale).
-            incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
-            incore_attrs = self._append_split_slot_num_attr(incore_attrs, split_slot_num)
-            with self.builder.scope(
-                scope_kind,
-                span,
-                name_hint=spmd_name_hint,
-                core_num=core_num,
-                sync_start=sync_start,
-                attrs=spmd_attrs or None,
-            ):
-                with self._scope_kind_context(scope_kind):
-                    self.scope_manager.enter_scope("spmd_with")
-                    with self.builder.scope(
-                        ir.ScopeKind.InCore,
-                        span,
-                        split=split_mode,
-                        name_hint=incore_name_hint,
-                        attrs=incore_attrs,
-                    ):
-                        with self._scope_kind_context(ir.ScopeKind.InCore):
-                            self.scope_manager.enter_scope("spmd_with_incore")
-                            self._parse_body_siblings(stmt.body)
-                            self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
-                            self.scope_manager.exit_scope(leak_vars=True)
-                    self.scope_manager.exit_scope(leak_vars=True)
 
     def _parse_spmd_scope_with_tid(  # noqa: PLR0913 — args map 1:1 to the SpmdScopeStmt + capture
         self,
@@ -3807,55 +3927,22 @@ class ASTParser:
         self.builder.assign(tid_var, placeholder_rhs, span=span)
         self.builder.push_pending_leading_comments(leading)
 
-        # A lone kernel call (no split) keeps the no-InCore-wrapper shape — the
-        # same SpmdScopeStmt(body=Call) that OutlineIncoreScopes leaves behind once
-        # an inline body is outlined — so the IR round-trips identically across
-        # passes. Anything else (inline multi-statement body, or single-call with a
-        # split hint) wraps in an InCoreScopeStmt, exactly like the for-form.
-        body_stmt = stmt.body[0] if len(stmt.body) == 1 else None
-        is_single_call = body_stmt is not None and (
-            (isinstance(body_stmt, ast.Assign) and isinstance(body_stmt.value, ast.Call))
-            or (isinstance(body_stmt, ast.AnnAssign) and isinstance(body_stmt.value, ast.Call))
-            or (isinstance(body_stmt, ast.Expr) and isinstance(body_stmt.value, ast.Call))
-        )
-        if is_single_call and split_mode is None:
-            self._parse_scope_body(
-                stmt,
-                scope_kind,
-                span,
-                name_hint=name_hint,
-                core_num=core_num,
-                sync_start=sync_start,
-                attrs=scope_attrs,
-            )
-            return
-
-        spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
-        incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
-        incore_attrs = self._append_split_slot_num_attr(incore_attrs, split_slot_num)
-        with self.builder.scope(
-            scope_kind,
+        # Emit the body via the shared helper — identical shape to the plain
+        # with-form, plus the task_id_var / manual_dep_edges built into scope_attrs
+        # above: a lone call (no split) keeps the no-InCore-wrapper direct-dispatch
+        # shape; an inline multi-statement body (or single call + split) wraps in an
+        # InCoreScopeStmt for outlining and must read the per-block index.
+        self._emit_spmd_body(
+            stmt,
             span,
-            name_hint=spmd_name_hint,
-            core_num=core_num,
-            sync_start=sync_start,
-            attrs=scope_attrs,
-        ):
-            with self._scope_kind_context(scope_kind):
-                self.scope_manager.enter_scope("spmd_with")
-                with self.builder.scope(
-                    ir.ScopeKind.InCore,
-                    span,
-                    split=split_mode,
-                    name_hint=incore_name_hint,
-                    attrs=incore_attrs,
-                ):
-                    with self._scope_kind_context(ir.ScopeKind.InCore):
-                        self.scope_manager.enter_scope("spmd_with_incore")
-                        self._parse_body_siblings(stmt.body)
-                        self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
-                        self.scope_manager.exit_scope(leak_vars=True)
-                self.scope_manager.exit_scope(leak_vars=True)
+            scope_kind,
+            core_num,
+            sync_start,
+            name_hint,
+            split_mode,
+            split_slot_num,
+            scope_attrs,
+        )
 
     def _parse_spmd_for_loop(self, stmt: ast.For, iter_call: ast.Call) -> None:
         """Parse ``for i in pl.spmd(N, ...): body`` into
@@ -5407,6 +5494,34 @@ class ASTParser:
                 hint=hint,
             )
 
+    @staticmethod
+    def _call_args_for_return_deduction(
+        func_obj: ir.Function,
+        args: list[ir.Expr],
+        *,
+        as_submit: bool,
+    ) -> tuple[list[ir.Var], list[ir.Expr]]:
+        """Pair callee params with actual args for return-type substitution."""
+        if not as_submit or len(args) == len(func_obj.params):
+            return list(func_obj.params), args
+
+        callee_params: list[ir.Var] = []
+        paired_args: list[ir.Expr] = []
+        arg_idx = 0
+        for param_idx, (param, direction) in enumerate(zip(func_obj.params, func_obj.param_directions)):
+            if direction in (ir.ParamDirection.Out, ir.ParamDirection.InOut):
+                remaining_required = sum(
+                    1
+                    for d in func_obj.param_directions[param_idx + 1 :]
+                    if d not in (ir.ParamDirection.Out, ir.ParamDirection.InOut)
+                )
+                if len(args) - arg_idx <= remaining_required:
+                    continue
+            callee_params.append(param)
+            paired_args.append(args[arg_idx])
+            arg_idx += 1
+        return callee_params, paired_args
+
     def _parse_kernel_call(
         self,
         method_attr: ast.Attribute,
@@ -5459,7 +5574,38 @@ class ASTParser:
 
         # Validate argument count before parsing args to fail fast.
         if func_obj is not None:
-            self._validate_call_arg_count(method_name, func_obj, len(arg_nodes), span)
+            if as_submit:
+                # For submit (pl.submit / pl.spmd_submit), Out- and InOut-
+                # directed parameters are runtime-allocated outputs that
+                # MAY be omitted at the call site. The lower bound is the
+                # count of non-Out/InOut params; the upper bound is all
+                # params (when Out params are passed explicitly).
+                expected_lo = sum(
+                    1
+                    for d in func_obj.param_directions
+                    if d not in (ir.ParamDirection.Out, ir.ParamDirection.InOut)
+                )
+                expected_hi = len(func_obj.params)
+                ok = expected_lo <= len(arg_nodes) <= expected_hi
+            else:
+                expected_hi = len(func_obj.params)
+                ok = len(arg_nodes) == len(func_obj.params)
+            if not ok:
+                param_info = [
+                    f"{p.name_hint}: {d.name}" for p, d in zip(func_obj.params, func_obj.param_directions)
+                ]
+                hint = (
+                    f"Parameters: {param_info}. Out/InOut params may be omitted in submit calls."
+                    if as_submit
+                    else f"Parameters: {param_info}"
+                )
+                raise ParserTypeError(
+                    f"Function '{method_name}' expects "
+                    + (f"{expected_lo}..{expected_hi}" if as_submit else f"{expected_hi}")
+                    + f" argument(s), got {len(arg_nodes)}",
+                    span=span,
+                    hint=hint,
+                )
 
         arg_directions = self._extract_arg_directions_from_attrs(method_name, keywords, len(arg_nodes), span)
         if arg_directions is None:
@@ -5529,9 +5675,14 @@ class ASTParser:
         if func_obj is not None and not return_types and not as_submit:
             return_types = self._effective_return_types(func_obj)
         if func_obj is not None and return_types:
-            return_types = ir.deduce_call_return_type(
-                list(func_obj.params),
+            callee_params_for_return, args_for_return = self._call_args_for_return_deduction(
+                func_obj,
                 args,
+                as_submit=as_submit,
+            )
+            return_types = ir.deduce_call_return_type(
+                callee_params_for_return,
+                args_for_return,
                 return_types,
             )
         return self._make_call_with_return_type(

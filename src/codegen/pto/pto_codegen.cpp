@@ -76,6 +76,23 @@ namespace transform_utils = ir::transform_utils;
 
 namespace {
 
+// Full-MemRef-identity key used by PTOAS memory-planner codegen to decide when
+// two tile variables denote the *same* buffer (and must share one tile_buf
+// handle so the op writes in place). Same base + byte_offset + size = same
+// buffer (loop-carried accumulator, in-place op result). A view shares the
+// base but differs in offset and/or size, so it gets a distinct key.
+std::string MemRefIdentityKey(const ir::MemRefPtr& memref) {
+  std::ostringstream key;
+  key << static_cast<const void*>(memref->base_.get()) << '|';
+  if (auto off = As<ir::ConstInt>(memref->byte_offset_)) {
+    key << "off" << off->value_;
+  } else {
+    key << "off@" << static_cast<const void*>(memref->byte_offset_.get());
+  }
+  key << "|sz" << memref->size_;
+  return key.str();
+}
+
 bool IsSameDimExpr(const ExprPtr& lhs, const ExprPtr& rhs) {
   if (lhs == rhs) {
     return true;
@@ -378,11 +395,14 @@ PTOCodegen::PTOCodegen(const backend::Backend* backend) : backend_(backend) {
   CHECK(backend->GetHandler() != nullptr) << "PTOCodegen requires a backend that exposes a BackendHandler";
 }
 
+const backend::BackendHandler* PTOCodegen::GetBackendHandler() const { return backend_->GetHandler(); }
+
 // ========================================================================
 // Generate entry and GenerateFunction
 // ========================================================================
 
-std::string PTOCodegen::Generate(const ProgramPtr& program) {
+std::string PTOCodegen::Generate(const ProgramPtr& program, bool emit_tile_addr) {
+  emit_tile_addr_ = emit_tile_addr;
   stream_.str("");
   stream_.clear();
   fs_.constants_section.str("");
@@ -545,17 +565,10 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   for (size_t i = 0; i < func->params_.size(); i++) {
     fs_.used_ssa_names.insert("arg" + std::to_string(i));
   }
-  // Reserve extra %argN slots for the trailing signature args: one
-  // CommContext ptr per DistributedTensor param, then the dyn-dim Vars
-  // (``dyn_vars`` computed at the top of GenerateFunction). Order here only
-  // affects the reserved name count; the actual layout is emitted below.
-  size_t dist_tensor_count = 0;
-  for (const auto& param : func->params_) {
-    if (As<ir::DistributedTensorType>(param->GetType())) {
-      ++dist_tensor_count;
-    }
-  }
-  for (size_t i = 0; i < dist_tensor_count + dyn_vars.size(); i++) {
+  // Reserve extra %argN slots for generated trailing signature args
+  // (``dyn_vars`` computed at the top of GenerateFunction). Explicit
+  // CommCtxType params are already included in func->params_.
+  for (size_t i = 0; i < dyn_vars.size(); i++) {
     fs_.used_ssa_names.insert("arg" + std::to_string(func->params_.size() + i));
   }
 
@@ -586,17 +599,35 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   // Still collect fs_.memref_to_tile_type for GetTileBufTypeString fallback paths
   fs_.memref_to_tile_type = collector.GetMemRefTileTypes();
 
-  // Per-var SSA binding: each tile variable gets its own SSA name
+  // Per-var SSA binding: each tile variable gets its own SSA name — except in
+  // PTOAS memory-planner mode (no addr baked), where variables denoting the
+  // *same* buffer (same MemRef base+offset+size, e.g. a loop-carried
+  // accumulator coalesced by MemoryReuse) must share one tile_buf handle. In
+  // level3 that aliasing was carried by an identical `addr`; without addr, ptoas
+  // PlanMemory would otherwise allocate them separately, so we instead emit a
+  // single alloc_tile and let the op write in place (`outs(%acc)`).
   for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
-    std::string ssa_name = NewNamedTemp(tile_var->name_hint_);
+    auto memref = ir::GetDefinedMemRef(tile_type);
+
+    std::string ssa_name;
+    if (!emit_tile_addr_) {
+      const std::string ident = MemRefIdentityKey(memref);
+      auto it = fs_.memref_identity_to_mlir.find(ident);
+      if (it != fs_.memref_identity_to_mlir.end()) {
+        ssa_name = it->second;  // reuse the shared handle (in-place aliasing)
+      } else {
+        ssa_name = NewNamedTemp(tile_var->name_hint_);
+        fs_.memref_identity_to_mlir[ident] = ssa_name;
+      }
+    } else {
+      ssa_name = NewNamedTemp(tile_var->name_hint_);
+    }
     BindVarToMlir(tile_var, ssa_name);
 
     // Pre-populate type so body visitors (e.g., tile.reshape no-op check)
     // can query it before per-variable alloc_tile emission runs.
     std::string type_str = GetTileBufTypeStringFromTileType(tile_type);
     fs_.ssa_to_tile_buf_type[ssa_name] = type_str;
-
-    auto memref = ir::GetDefinedMemRef(tile_type);
 
     // Also maintain fs_.memref_to_mlir for compatibility (first var per allocation)
     const ir::Var* base_ptr = memref->base_.get();
@@ -608,13 +639,16 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   // ``dyn_vars`` was computed at the top of GenerateFunction; it carries the
   // trailing %argN: index parameters in first-seen order.
 
-  // Collect ordered DistributedTensor params (in IR-param order). One
-  // CommContext pointer arg is appended per DistributedTensor at the end
-  // of the func.func signature.
+  // Collect ordered DistributedTensor params and their materialized CommCtx
+  // params (both in IR-param order) so get_comm_ctx aliases can resolve to the
+  // explicit ctx pointer argument.
   std::vector<VarPtr> dist_tensor_params;
+  std::vector<VarPtr> comm_ctx_params;
   for (const auto& param : func->params_) {
     if (As<ir::DistributedTensorType>(param->GetType())) {
       dist_tensor_params.push_back(param);
+    } else if (ir::IsA<ir::CommCtxType>(param->GetType())) {
+      comm_ctx_params.push_back(param);
     }
   }
 
@@ -665,25 +699,27 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
     stream_ << "%arg" << (scalar_start_idx + j) << ": ";
     if (auto scalar_type = As<ScalarType>(param->GetType())) {
       stream_ << GetTypeString(scalar_type->dtype_);
+    } else if (ir::IsA<ir::CommCtxType>(param->GetType())) {
+      stream_ << "!pto.ptr<i64>";
     } else {
       stream_ << "!pto.ptr<f32>";
     }
   }
 
-  // Append one CommContext pointer arg per DistributedTensor param (in IR-param
-  // order). The runtime CommContext is passed as a GM ``uint64_t*`` (see
-  // ``runtime/src/common/platform_comm/comm_context.h``); codegen indexes its
-  // fields via ``pto.load_scalar`` and the ``comm_layout::k*`` constants. The
-  // host-side L2 orch flattens these as ``add_scalar(ctx)`` calls — i.e. they
-  // are passed as trailing scalar slots, mirroring dynamic-shape flattening.
-  size_t next_arg_idx = func->params_.size();
-  for (const auto& dist_param : dist_tensor_params) {
-    std::string arg_name = "%arg" + std::to_string(next_arg_idx++);
-    stream_ << ", " << arg_name << ": !pto.ptr<i64>";
-    fs_.dist_tensor_to_ctx[GetVarKey(dist_param)] = arg_name;
+  // Pair each DistributedTensor param with its explicit CommCtxType param (in
+  // IR-param order). The runtime CommContext is passed as a GM ``uint64_t*``
+  // (see ``runtime/src/common/platform_comm/comm_context.h``); codegen indexes
+  // its fields via ``pto.load_scalar`` and the ``comm_layout::k*`` constants.
+  INTERNAL_CHECK_SPAN(dist_tensor_params.size() == comm_ctx_params.size(), func->span_)
+      << "PTOCodegen: function '" << func->name_ << "' has " << dist_tensor_params.size()
+      << " DistributedTensor params but " << comm_ctx_params.size()
+      << " CommCtxType params; run MaterializeDistTensorCtx before PTO codegen";
+  for (size_t i = 0; i < dist_tensor_params.size(); ++i) {
+    fs_.dist_tensor_to_ctx[GetVarKey(dist_tensor_params[i])] = GetVarName(comm_ctx_params[i]);
   }
 
   // Append trailing index parameters for each unique dynamic dimension variable
+  size_t next_arg_idx = func->params_.size();
   for (const auto& dyn_var : dyn_vars) {
     std::string arg_name = "%arg" + std::to_string(next_arg_idx++);
     stream_ << ", " << arg_name << ": index";
@@ -726,10 +762,12 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   // For addr constants specifically, codegen preserves the IR ConstInt
   // dtype 1:1 (other operands like valid_row/valid_col adapt to the
   // consumer's type via cast_to_index — see ComputeAllocTileFields).
-  for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
-    auto memref = ir::GetDefinedMemRef(tile_type);
-    if (auto const_offset = memref ? As<ir::ConstInt>(memref->byte_offset_) : nullptr) {
-      GetOrEmitConstant(const_offset->value_, const_offset->dtype());
+  if (emit_tile_addr_) {
+    for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
+      auto memref = ir::GetDefinedMemRef(tile_type);
+      if (auto const_offset = memref ? As<ir::ConstInt>(memref->byte_offset_) : nullptr) {
+        GetOrEmitConstant(const_offset->value_, const_offset->dtype());
+      }
     }
   }
 
@@ -1072,7 +1110,7 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   }
 
   auto memref = ir::GetDefinedMemRef(tile_type);
-  if (memref) {
+  if (memref && emit_tile_addr_) {
     if (auto const_offset = As<ir::ConstInt>(memref->byte_offset_)) {
       fields.addr_ssa = GetOrEmitConstant(const_offset->value_, const_offset->dtype());
     }
@@ -1091,6 +1129,12 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
   INTERNAL_CHECK_SPAN(mlir_it != fs_.var_to_mlir.end(), tile_var->span_)
       << "Tile var " << tile_var->name_hint_ << " not found in fs_.var_to_mlir";
   std::string tile_buf = mlir_it->second;
+
+  // In PTOAS mode several vars may share one handle (in-place aliasing); emit
+  // the alloc_tile only once per handle so the shared buffer has a single def.
+  if (!fs_.emitted_tile_alloc_names.insert(tile_buf).second) {
+    return;
+  }
 
   AllocTileFields fields = ComputeAllocTileFields(tile_type);
 
@@ -1303,7 +1347,7 @@ bool PTOCodegen::IsDualAivDispatchFunction() const {
 void PTOCodegen::EmitExtraAllocTiles() {
   for (const auto& alloc : fs_.extra_alloc_tiles) {
     stream_ << GetIndent() << alloc.name << " = pto.alloc_tile";
-    if (!alloc.addr_ssa.empty()) {
+    if (emit_tile_addr_ && !alloc.addr_ssa.empty()) {
       stream_ << " addr = " << alloc.addr_ssa;
     }
     if (!alloc.valid_row_ssa.empty()) {
@@ -1447,7 +1491,7 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   VisitExpr(op->value_);
   // Register scalar/index/CommCtx result so subsequent expressions can look up
   // this variable. N7: CommCtxType is a singleton marker; the bound SSA is the
-  // matching ``!pto.ptr<i64>`` ctx ptr from the func.func trailing-ctx segment
+  // matching explicit ``!pto.ptr<i64>`` ctx ptr from the func.func signature
   // (no MLIR is emitted for ``pld.system.get_comm_ctx`` — its lambda just sets
   // ``current_expr_value`` to the ctx SSA). Treating it like a scalar here lets
   // downstream ``pld.system.rank(ctx)`` / ``pld.system.nranks(ctx)`` codegen

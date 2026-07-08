@@ -303,6 +303,8 @@ def create(
     dtype: DataType,
     target_memory: MemorySpace = MemorySpace.Vec,
     transpose: bool | None = None,
+    *,
+    flat_layout: bool | None = None,
 ) -> Tile:
     """Create a tile from a shape.
 
@@ -313,6 +315,11 @@ def create(
         transpose: When True, allocate the transposed Mat (ZN) fractal layout for a
             matmul ``b_trans`` B-operand (the layout a DN-source ``gather_row`` fills).
             Default ``None`` keeps the canonical layout and is omitted from the op.
+        flat_layout: Keyword-only. When True, allocate a flat (non-fractal,
+            slayout=none_box) L1/cbuf tile — a contiguous staging buffer rather
+            than the boxed NZ layout Mat tiles normally carry. Requires
+            ``target_memory=Mat`` and is mutually exclusive with ``transpose``.
+            Default ``None`` keeps the canonical layout.
 
     Returns:
         Tile wrapping the create operation
@@ -324,6 +331,7 @@ def create(
         dtype,
         target_memory,
         transpose,
+        flat_layout=flat_layout,
     )
     return Tile(expr=call_expr)
 
@@ -429,7 +437,9 @@ def store(
             NOTE: atomic-add accumulation order across cores is not fixed, so
             floating-point results are non-deterministic. The destination must
             be zero-initialised before the kernel runs. Supported tile dtypes:
-            fp32 / fp16 / int32 / int16 / int8 (not bf16).
+            fp32 / bf16 / fp16 / int32 / int16 / int8. bf16 atomic-add is
+            available on the Ascend910B (A2/A3) profile; it is not supported on
+            A5, where an fp32 accumulator + cast is required instead.
 
     Returns:
         Tensor wrapping the store operation

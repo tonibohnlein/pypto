@@ -161,6 +161,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/synthesize_allreduce_signals_pass.cpp
     src/ir/transforms/materialize_comm_domain_scopes_pass.cpp
     src/ir/transforms/lower_host_tensor_collectives_pass.cpp
+    src/ir/transforms/materialize_dist_tensor_ctx_pass.cpp
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
     src/ir/transforms/auto_derive_task_dependencies_pass.cpp
@@ -226,6 +227,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verifier.cpp
     src/ir/verifier/property_verifier_registry.cpp
     src/ir/verifier/mixed_kernel_expanded_verifier.cpp
+    src/ir/verifier/verify_hard_syncall_occupancy.cpp
     src/ir/verifier/verify_aiv_split.cpp
     src/ir/verifier/verify_ssa_pass.cpp
     src/ir/verifier/verify_no_nested_call_pass.cpp
@@ -260,8 +262,10 @@ set(PYPTO_SOURCES
 
     # Codegen
     src/codegen/code_emitter.cpp
+    src/codegen/codegen_preconditions.cpp
     src/codegen/codegen_base.cpp
     src/codegen/orchestration/orchestration_analysis.cpp
+    src/codegen/orchestration/iter_arg_carry_analyzer.cpp
     src/codegen/orchestration/orchestration_codegen.cpp
     src/codegen/orchestration_op_registry.cpp
     src/codegen/pto/pto_codegen.cpp

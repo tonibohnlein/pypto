@@ -175,9 +175,14 @@ class PassManager:
             # TensorView with packed canonical strides (RFC #1300 §2.4).
             ("MaterializeTensorStrides", lambda: passes.materialize_tensor_strides()),
             ("InitMemRef", lambda: passes.init_mem_ref()),
-            # MemoryReuse coalesces tile buffers; on Ascend910B split-AIV it also
-            # avoids the load + tpop_from_aic in-place hazard so a separate
-            # legalisation pass is no longer needed.
+            # MaterializeSemanticAliases forces loop-carried / in-place buffers to
+            # share one MemRef (semantics-required aliasing). It always runs; only
+            # the opportunistic lifetime coalescing (MemoryReuse) is skippable when
+            # ptoas owns reuse (memory_planner=PTOAS).
+            ("MaterializeSemanticAliases", lambda: passes.materialize_semantic_aliases()),
+            # MemoryReuse coalesces independent tile buffers by lifetime; on
+            # Ascend910B split-AIV it also avoids the load + tpop_from_aic in-place
+            # hazard so a separate legalisation pass is no longer needed.
             ("MemoryReuse", lambda: passes.memory_reuse()),
             ("AllocateMemoryAddr", lambda: passes.allocate_memory_addr()),
             ("FoldNoOpReshape", lambda: passes.fold_no_op_reshape()),
@@ -198,6 +203,7 @@ class PassManager:
             ("SynthesizeAllReduceSignals", lambda: passes.synthesize_allreduce_signals()),
             ("MaterializeCommDomainScopes", lambda: passes.materialize_comm_domain_scopes()),
             ("LowerHostTensorCollectives", lambda: passes.lower_host_tensor_collectives()),
+            ("MaterializeDistTensorCtx", lambda: passes.materialize_dist_tensor_ctx()),
             ("Simplify", lambda: passes.simplify()),
             # Insert explicit AUTO RuntimeScopeStmt nodes (function body + for/if
             # bodies) into Orchestration functions so codegen emits PTO2_SCOPE
@@ -224,8 +230,9 @@ class PassManager:
             analyze_auto_scopes_for_deps: If True, enable compiler-derived task
                 dependency analysis for AUTO runtime scopes. The default stays
                 False so runtime AUTO tracking remains the only AUTO-scope
-                dependency mechanism. User-written manual scopes are not
-                analyzed by this pass.
+                dependency mechanism. User-written manual scopes are skipped:
+                they do not get compiler deps or automatic NoDep/OutputExisting
+                direction rewrites.
 
         Returns:
             A PassManager instance configured with the appropriate passes
@@ -255,8 +262,23 @@ class PassManager:
         self.passes: list[passes.Pass] = []
         self.pass_names: list[str] = []
 
+        # When the active PassContext selects ptoas as the memory planner, skip
+        # the opportunistic lifetime reuse (MemoryReuse) and address assignment
+        # (AllocateMemoryAddr) so ptoas PlanMemory owns them (codegen emits no
+        # `pto.alloc_tile addr` and ptoas runs at --pto-level=level2).
+        # MaterializeSemanticAliases still runs, so semantics-required aliasing
+        # (loop-carried accumulators, in-place ops) is preserved as a shared
+        # MemRef that codegen renders as one tile_buf handle — ptoas cannot
+        # recover that from independent addr-less allocs. Read here because
+        # __init__ runs inside the compile() PassContext (see compile.py).
+        ctx = passes.PassContext.current()
+        skip_mem_planning = ctx is not None and ctx.get_memory_planner() == passes.MemoryPlanner.PTOAS
+        _mem_planning_passes = ("MemoryReuse", "AllocateMemoryAddr")
+
         # Build pass list
         for pass_name, pass_factory in self._strategy_passes[strategy]:
+            if skip_mem_planning and pass_name in _mem_planning_passes:
+                continue
             if pass_name == "AutoDeriveTaskDependencies":
                 self.passes.append(
                     passes.auto_derive_task_dependencies(analyze_auto_scopes=analyze_auto_scopes_for_deps)

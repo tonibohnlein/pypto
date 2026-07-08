@@ -20,6 +20,7 @@ from _orchestration_codegen_common import (
 )
 from pypto import backend, passes
 from pypto.backend import BackendType
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
 def test_array_slot_task_id_usable_as_submit_dep():
@@ -66,10 +67,55 @@ def test_array_slot_task_id_usable_as_submit_dep():
     # the array slot (the dep site references the snapshot, not a slot re-read).
     assert re.search(r"PTO2TaskId\s+prev\w*\s*=\s*tids\w*\[0\];", code), code
     # The consumer gets exactly one dependency array, filled from BOTH the direct
-    # producer tid (seed_tid) and the array-slot snapshot (prev), each guarded.
+    # producer tid (seed_tid) and the array-slot snapshot (prev).
     assert code.count("set_dependencies(") == 1, code
-    assert re.search(r"if \(seed_tid\w*\.is_valid\(\)\)", code), code
+    # ``seed_tid`` is a fresh direct-producer TaskId (issue #1966): its insert is
+    # unguarded. ``prev`` is an array-slot snapshot that may hold the invalid
+    # sentinel, so it keeps the is_valid() guard.
+    assert not re.search(r"if \(seed_tid\w*\.is_valid\(\)\)", code), code
+    assert re.search(r"\] = seed_tid\w*;", code), code
     assert re.search(r"if \(prev\w*\.is_valid\(\)\)", code), code
+
+
+def test_direct_producer_dep_skips_is_valid_guard():
+    """Regression for issue #1966.
+
+    A dependency TaskId produced by a ``pl.submit(...)`` earlier in the same
+    straight-line scope is statically always-valid — the runtime never hands it
+    the ``PTO2TaskId::invalid()`` sentinel. Orchestration codegen must therefore
+    emit its ``set_dependencies`` insert *without* the redundant ``is_valid()``
+    guard. Loop-carried ``iter_arg`` / ``None``-seed / array-slot TaskIds still
+    keep the guard (see ``test_compiler_derived_deps_for_fixed_trip_loop_fan_in_``
+    ``capture_task_ids`` and ``test_array_slot_task_id_usable_as_submit_dep``).
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            _a, prod_tid = pl.submit(self.k1, x)
+            b, _ = pl.submit(self.k2, x, deps=[prod_tid])
+            return b
+
+    code = _generate_orch_full_pipeline(P, allow_relaxed_verification=True)
+
+    # The producer TaskId (task 0) is a fresh direct-producer local.
+    producer = re.search(r"PTO2TaskId\s+(\w+)\s*=\s*task_0_outs\.task_id\(\);", code)
+    assert producer, code
+    name = producer.group(1)
+    # Its dependency-array insert is UNGUARDED (the #1966 optimization) ...
+    assert re.search(rf"\w+_deps\[[^\]]*\] = {re.escape(name)};", code), code
+    # ... with no redundant is_valid() branch emitted for it.
+    assert f"if ({name}.is_valid())" not in code, code
+    assert re.search(r"\.set_dependencies\(", code), code
 
 
 def test_task_id_binding_does_not_leak_past_pl_scope():
@@ -343,7 +389,11 @@ def test_compiler_derived_deps_for_fixed_trip_loop_fan_in_capture_task_ids():
             out = self.consume(carried)
             return out
 
-    code = _generate_orch_full_pipeline(P, analyze_auto_scopes_for_deps=True)
+    code = _generate_orch_full_pipeline(
+        P,
+        analyze_auto_scopes_for_deps=True,
+        allow_relaxed_verification=True,
+    )
 
     fan_in = re.search(r"PTO2TaskId\s+(last_tid\w*)\[4\];", code)
     assert fan_in, code
@@ -398,6 +448,7 @@ def test_compiler_derived_deps_for_dynamic_trip_loop_fan_in_falls_back():
     assert "std::vector<PTO2TaskId>" not in code
     assert "#include <vector>" not in code
     assert ".set_dependencies(" not in code
+    assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code
 
 
 def test_compiler_derived_deps_for_dynamic_trip_tensor_carrier_falls_back():
@@ -441,6 +492,90 @@ def test_compiler_derived_deps_for_dynamic_trip_tensor_carrier_falls_back():
     assert "std::vector<PTO2TaskId>" not in code
     assert "#include <vector>" not in code
     assert ".set_dependencies(" not in code
+
+
+def test_compiler_derived_deps_for_dynamic_parallel_tensor_carriers_share_phase_barrier():
+    """Dynamic parallel tensor producers in one phase should share one dummy barrier."""
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.AIV)
+        def fill_q(
+            self,
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def fill_k(
+            self,
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def fill_v(
+            self,
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def consume(
+            self,
+            q: pl.Tensor[[64], pl.FP32],
+            k: pl.Tensor[[64], pl.FP32],
+            v: pl.Tensor[[64], pl.FP32],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            return q
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            q: pl.Tensor[[64], pl.FP32],
+            k: pl.Tensor[[64], pl.FP32],
+            v: pl.Tensor[[64], pl.FP32],
+            n_steps: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            q_carried = q
+            k_carried = k
+            v_carried = v
+            for _i, (q_carried, k_carried, v_carried) in pl.parallel(
+                0,
+                n_steps,
+                init_values=(q_carried, k_carried, v_carried),
+            ):
+                q_carried = self.fill_q(q_carried)
+                k_carried = self.fill_k(k_carried)
+                v_carried = self.fill_v(v_carried)
+                q_carried, k_carried, v_carried = pl.yield_(q_carried, k_carried, v_carried)
+            out = self.consume(q_carried, k_carried, v_carried)
+            return out
+
+    code = _generate_orch_full_pipeline(P, analyze_auto_scopes_for_deps=True)
+
+    assert "#include <vector>" in code
+    collection = re.search(
+        r"std::vector<PTO2TaskId>\s+(\w+)\(static_cast<size_t>\((\w+)\)\);\n\s+uint32_t\s+(\w+)\s*=\s*0;",
+        code,
+    )
+    assert collection, code
+    buffer_name, capacity_name, count_name = collection.groups()
+    capacity_init = re.search(rf"const int64_t {capacity_name} = ([^\n]+);", code)
+    assert capacity_init, code
+    assert " * 3" in capacity_init.group(1), code
+    assert ".push_back(" not in code
+    assert code.count(f"{buffer_name}[{count_name}++] =") == 3, code
+    assert code.count("rt_orch_profile_add_dynamic_dep_vector") == 4, code
+    assert code.count("Dynamic compiler-dependency barrier") == 1, code
+    assert code.count("rt_submit_dummy_task") == 1, code
+    assert f".set_dependencies({buffer_name}.data(), {count_name});" in code, code
+    assert re.search(r"PTO2TaskId params_t\d+_deps\[1\];", code), code
+    assert not re.search(r"PTO2TaskId params_t\d+_deps\[[23]\];", code), code
+    assert code.count(".add_no_dep(") >= 3, code
 
 
 def test_compiler_derived_deps_for_dynamic_trip_tuple_output_tensor_carrier_falls_back():
@@ -487,12 +622,14 @@ def test_compiler_derived_deps_for_dynamic_trip_tuple_output_tensor_carrier_fall
     assert ".set_dependencies(" not in code
 
 
-def test_compiler_derived_deps_keep_outer_tuple_producer_task_id_stable_in_dynamic_parallel_loop():
+def test_compiler_auto_manual_scope_is_not_tied_to_function_name():
     """A loop-local tuple producer must not overwrite an outer tuple producer TaskId.
 
-    This mirrors the Qwen decode qk_norm -> rope_kv_cache pattern.  The loop
-    body should depend on the stable qk_norm producer every iteration, while the
-    rope producer TaskIds are collected separately for the later fan-in.
+    This mirrors the Qwen decode qk_norm -> cache-update shape.  The loop body
+    should depend on the stable qk_norm producer every iteration, while the
+    loop-local producer TaskIds are collected separately for the later fan-in.
+    The compiler-created MANUAL wrapper must come from dependency analysis, not
+    from a callee-name substring.
     """
 
     backend.reset_for_testing()
@@ -511,7 +648,7 @@ def test_compiler_derived_deps_keep_outer_tuple_producer_task_id_stable_in_dynam
             return q_out, k_out
 
         @pl.function(type=pl.FunctionType.AIV)
-        def rope_kv_cache(
+        def cache_update(
             self,
             q_norm: pl.Tensor[[64], pl.FP32],
             k_norm: pl.Tensor[[64], pl.FP32],
@@ -541,20 +678,38 @@ def test_compiler_derived_deps_keep_outer_tuple_producer_task_id_stable_in_dynam
                 n_steps,
                 init_values=(all_q, k_cache),
             ):
-                all_q_carried, k_cache_carried = self.rope_kv_cache(
+                all_q_carried, k_cache_carried = self.cache_update(
                     q_norm_buf, k_norm_buf, all_q_carried, k_cache_carried
                 )
                 all_q_carried, k_cache_carried = pl.yield_(all_q_carried, k_cache_carried)
             out = self.consume(k_cache_carried)
             return out
 
-    code = _generate_orch_full_pipeline(P, analyze_auto_scopes_for_deps=True)
+    code = _generate_orch_full_pipeline(
+        P,
+        analyze_auto_scopes_for_deps=True,
+        allow_relaxed_verification=True,
+    )
 
+    assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
     qk_tid = re.search(r"\b(\w+_tid)\s*=\s*task_0_outs\.task_id\(\);", code)
     assert qk_tid, code
     rope_tid = re.search(r"(?:PTO2TaskId\s+)?(\w+_tid\w*)\s*=\s*task_1_outs\.task_id\(\);", code)
     assert rope_tid, code
     assert qk_tid.group(1) != rope_tid.group(1), code
+    collection = re.search(
+        r"std::vector<PTO2TaskId>\s+(\w+)\(static_cast<size_t>\(\w+\)\);\n\s+uint32_t\s+(\w+)\s*=\s*0;",
+        code,
+    )
+    assert collection, code
+    buffer_name, count_name = collection.groups()
+    assert code.count(f"{buffer_name}[{count_name}++] =") == 1, code
+    manual_scope_idx = code.index("PTO2_SCOPE(PTO2ScopeMode::MANUAL)")
+    qk_submit_idx = code.index("TaskOutputTensors task_0_outs")
+    assert manual_scope_idx < qk_submit_idx, code
+    rope_submit_idx = code.index("TaskOutputTensors task_1_outs", manual_scope_idx)
+    rope_deps_idx = code.rfind("params_t1.set_dependencies", manual_scope_idx, rope_submit_idx)
+    assert rope_deps_idx > manual_scope_idx, code
     assert re.search(
         rf"if \({qk_tid.group(1)}\.is_valid\(\)\) "
         rf"params_t1_deps\[params_t1_deps_count\+\+\] = {qk_tid.group(1)};",
@@ -605,7 +760,9 @@ def test_mixed_in_and_out_of_scope_deps_does_not_crash_codegen():
 
     # The in-scope edge is wired; the out-of-scope ``scoped_tid`` is dropped.
     assert code.count("set_dependencies(") == 1, code
-    assert re.search(r"if \(seed_tid\w*\.is_valid\(\)\)", code), code
+    # ``seed_tid`` is a fresh direct-producer TaskId (issue #1966): unguarded insert.
+    assert not re.search(r"if \(seed_tid\w*\.is_valid\(\)\)", code), code
+    assert re.search(r"\] = seed_tid\w*;", code), code
     m = re.search(r"PTO2TaskId\s+(\w+)\s*=\s*task_0_outs\.task_id\(\);", code)
     assert m, code
     assert code.count(m.group(1)) == 1, code
@@ -657,6 +814,12 @@ def test_spmd_submit_emits_launch_spec_and_captures_task_id():
     # Producer TaskId is captured and the consumer depends on it.
     assert re.search(r"PTO2TaskId\s+\w+\s*=\s*task_0_outs\.task_id\(\);", code), code
     assert "set_dependencies(" in code, code
+    # Direct-call dispatch emits set_dependencies BEFORE the launch spec (deps
+    # -> launch_spec -> early_resolve). This locks the byte-identical per-path
+    # emission order; wrapper paths (Spmd/Group/Mixed) use the opposite order.
+    deps_pos = code.index("params_t1.set_dependencies(")
+    launch_pos = code.index("params_t1.launch_spec.set_block_num(2);")
+    assert deps_pos < launch_pos, code
 
 
 def test_spmd_submit_group_emits_mixed_kernels_and_launch_spec():
@@ -915,6 +1078,70 @@ def test_spmd_submit_950_backend_emits_set_core_num():
         code = _generate_orch_code(P)
     assert "params_t0.launch_spec.set_core_num(4);" in code, code
     assert "set_block_num" not in code, code
+
+
+def test_compiler_dep_carry_array_sized_by_outer_loop_trip_count():
+    """Compiler-dep TaskId carry arrays must be sized by the *outer* Sequential loop.
+
+    When a Sequential outer loop (trip M) wraps a Parallel inner loop (trip N)
+    inside a ``pl.manual_scope``, and the outer loop's TaskId iter_arg receives a
+    compiler-derived dependency edge, the carry array must declare
+    ``PTO2TaskId arr[M]`` (outer trip), NOT ``arr[N]`` (inner trip).
+
+    ``ResolveArrayCarrySize`` would otherwise recurse into the inner Parallel loop
+    and return N, producing a mis-sized fan-in array that over- or under-fences
+    (YunjiQin review, PR #1813).  The codegen post-process must unconditionally
+    use ``EvalConstTripCount`` of the outer loop for compiler-dep carries.
+    """
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+
+    M, N = 4, 8
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.AIV)
+        def k1(
+            self,
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            with pl.manual_scope():
+                prev = pl.system.task_invalid()
+                for _i in pl.range(M):
+                    for _j in pl.parallel(N):
+                        _, _tid = pl.submit(self.k1, scratch)
+                    # compiler_manual_dep_edges on prev: makes it an
+                    # iter_arg carry of the outer Sequential loop,
+                    # and triggers NeedsCompilerDepTaskId for its
+                    # return_var.
+                    self.k2(scratch, attrs={"compiler_manual_dep_edges": [prev]})
+                    prev = pl.system.task_invalid()
+                return scratch
+
+    pm = PassManager.get_strategy(OptimizationStrategy.Default)
+    transformed = pm.run_passes(Prog)
+    code = _generate_orch_code(transformed)
+
+    # The compiler-dep carry array must be sized by the outer loop trip M=4.
+    # The emit name is derived from prev's return_var (SSA-base "prev").
+    outer_arr = re.search(r"PTO2TaskId\s+(prev\w*)\[(" + str(M) + r")\];", code)
+    assert outer_arr, f"Expected PTO2TaskId <prev...>[{M}] (outer trip) in:\n{code}"
+    # The init loop also iterates M times, not N.
+    assert f"for (int64_t __init_i = 0; __init_i < {M}; ++__init_i)" in code, (
+        f"Expected init loop bound {M} in:\n{code}"
+    )
+    # No array declaration should be sized by the inner trip N=8.
+    assert not re.search(r"PTO2TaskId\s+\w+\[" + str(N) + r"\];", code), (
+        f"Unexpected PTO2TaskId array sized [{N}] (inner trip) in:\n{code}"
+    )
 
 
 if __name__ == "__main__":

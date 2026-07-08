@@ -355,7 +355,10 @@ class Qwen3DecodeScope3MixedTestCase(PTOTestCase):
         platform: str | None = None,
         config: RunConfig | None = None,
     ):
-        super().__init__(config or RunConfig(rtol=1e-3, atol=1e-3), platform=platform)
+        # BF16 mixed decode kernel (bf16 matmuls + rsqrt/exp/sigmoid, bf16-cast output):
+        # rtol=2e-2 admits >= one bf16 ULP (eps_bf16 = 2^-7 ~ 7.8e-3), matching the other
+        # bf16 attention/decode s-tests; the prior 1e-3 is below a single bf16 ULP.
+        super().__init__(config or RunConfig(rtol=2e-2, atol=1e-3), platform=platform)
         self._batch = batch
         self._hidden_size = hidden_size
         self._intermediate_size = intermediate_size

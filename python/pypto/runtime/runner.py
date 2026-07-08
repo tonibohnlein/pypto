@@ -42,7 +42,7 @@ import torch
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy
 from pypto.pypto_core import backend as _backend_core
-from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase
+from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase, MemoryPlanner
 
 from .device_tensor import DeviceTensor
 
@@ -396,6 +396,7 @@ def compile_program(
     disabled_diagnostics: DiagnosticCheckSet | None = None,
     profiling: bool = False,
     analyze_auto_scopes_for_deps: bool = False,
+    memory_planner: MemoryPlanner | None = None,
 ) -> None:
     """Compile *program* to *work_dir* and patch orchestration headers.
 
@@ -426,6 +427,7 @@ def compile_program(
         disabled_diagnostics=disabled_diagnostics,
         profiling=profiling,
         analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+        memory_planner=memory_planner,
     )
     _patch_orchestration_headers(work_dir)
 
@@ -830,6 +832,8 @@ def _execute_on_device(
     platform: str,
     device_id: int,
     dfx: _DfxOpts = _DfxOpts(),
+    validate: bool = True,
+    actual_out_dir: "Path | None" = None,
 ) -> None:
     """Load inputs, execute on device, and validate against golden.
 
@@ -924,13 +928,47 @@ def _execute_on_device(
     if dfx_dir is not None:
         _collect_dfx_artifacts(dfx_dir, platform, dfx)
 
-    # Validate
-    validate_golden(
-        outputs,
-        golden_out,
-        rtol=getattr(golden_module, "RTOL", 1e-5),
-        atol=getattr(golden_module, "ATOL", 1e-5),
-    )
+    # Persist actual device outputs (tolerance-independent) for callers that
+    # validate separately with the test's real tolerance — the "split
+    # execute/validate" path used by the task-submit harness, where the device
+    # run is eager/parallel and ``TestRunner.run`` does the allclose later.
+    if actual_out_dir is not None:
+        from .golden_writer import _save_data_files  # noqa: PLC0415
+
+        _save_data_files(outputs, actual_out_dir)
+
+    # Validate in-process unless the caller defers it.
+    if validate:
+        validate_golden(
+            outputs,
+            golden_out,
+            rtol=getattr(golden_module, "RTOL", 1e-5),
+            atol=getattr(golden_module, "ATOL", 1e-5),
+        )
+
+
+def validate_persisted_outputs(work_dir: Path, rtol: float, atol: float) -> None:
+    """Validate persisted device outputs against the golden with a given tolerance.
+
+    The counterpart to ``_execute_on_device(..., validate=False,
+    actual_out_dir=...)``: the device run (tolerance-independent) persisted the
+    actual outputs under ``data/actual/``; this compares them against the
+    pre-computed golden under ``data/out/`` using *rtol*/*atol* — letting the
+    harness apply each test's real tolerance after an eager, validation-free
+    device run. Raises ``AssertionError`` on mismatch.
+    """
+    from .device_runner import validate_golden  # noqa: PLC0415
+
+    golden_module = _load_golden_module(work_dir / "golden.py")
+    output_names = set(getattr(golden_module, "__outputs__", []))
+    actual = _load_golden_from_data_dir(work_dir / "data" / "actual", output_names)
+    expected = _load_golden_from_data_dir(work_dir / "data" / "out", output_names)
+    if actual is None or expected is None:
+        raise AssertionError(
+            f"validate_persisted_outputs: missing actual/expected outputs under {work_dir}/data "
+            f"(actual={'ok' if actual else 'missing'}, expected={'ok' if expected else 'missing'})"
+        )
+    validate_golden(actual, expected, rtol=rtol, atol=atol)
 
 
 # ---------------------------------------------------------------------------

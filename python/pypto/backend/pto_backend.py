@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from importlib import resources
 
 try:
-    from importlib.resources.abc import Traversable  # Python >= 3.11
+    from importlib.resources.abc import Traversable  # pyright: ignore[reportMissingImports] # Python >= 3.11
 except ImportError:  # pragma: no cover - fallback for older interpreters
     from importlib.abc import Traversable
 from typing import Any
@@ -42,6 +42,7 @@ from pypto.compile_profiling import CompileProfiler, StageRecord
 from pypto.pypto_core import backend as _backend_core
 from pypto.pypto_core import codegen as _codegen_core
 from pypto.pypto_core import ir as _ir_core
+from pypto.pypto_core import passes as _passes
 
 logger = logging.getLogger(__name__)
 
@@ -419,11 +420,17 @@ def _generate_arg_unpacking(func: _ir_core.Function, *, uses_spmd: bool = False)
     lines: list[str] = []
     var_names: list[str] = []
 
-    # Separate params into tensors and scalars for tensors-first dispatch order
+    # Separate params into tensors and scalar-like values for tensors-first dispatch order.
+    # CommCtxType is materialized as an explicit scalar payload by
+    # MaterializeDistTensorCtx and lowered to a GM int64_t* in the wrapper.
     tensor_params = [p for p in func.params if isinstance(p.type, _ir_core.TensorType)]
-    scalar_params = [p for p in func.params if isinstance(p.type, _ir_core.ScalarType)]
+    scalar_params = [
+        p for p in func.params if isinstance(p.type, (_ir_core.ScalarType, _ir_core.CommCtxType))
+    ]
     other_params = [
-        p for p in func.params if not isinstance(p.type, (_ir_core.TensorType, _ir_core.ScalarType))
+        p
+        for p in func.params
+        if not isinstance(p.type, (_ir_core.TensorType, _ir_core.ScalarType, _ir_core.CommCtxType))
     ]
     if other_params:
         raise ValueError(
@@ -471,31 +478,23 @@ def _generate_arg_unpacking(func: _ir_core.Function, *, uses_spmd: bool = False)
     # Unpack scalars: args[N_tensors..]
     for j, param in enumerate(scalar_params):
         param_name = param.name_hint
+        arg_idx = scalar_start_idx + j
+        if isinstance(param.type, _ir_core.CommCtxType):
+            lines.append(f"    // Unpack CommContext: {param_name}")
+            lines.append(
+                f"    __gm__ int64_t* {param_name} = reinterpret_cast<__gm__ int64_t*>(args[{arg_idx}]);"
+            )
+            lines.append("")
+            var_names.append(param_name)
+            continue
         assert isinstance(param.type, _ir_core.ScalarType)
         c_type = param.type.dtype.to_c_type_string()
-        arg_idx = scalar_start_idx + j
         lines.append(f"    // Unpack scalar: {param_name}")
         lines.append(f"    union {{ uint64_t u64; {c_type} val; }} {param_name}_conv;")
         lines.append(f"    {param_name}_conv.u64 = args[{arg_idx}];")
         lines.append(f"    {c_type} {param_name} = {param_name}_conv.val;")
         lines.append("")
         var_names.append(param_name)
-
-    # Unpack one trailing __gm__ int64_t* CommContext pointer per DistributedTensor
-    # param. Mirrors the func.func signature emitted by PTOCodegen
-    # (src/codegen/pto/pto_codegen.cpp around the dist_tensor_to_ctx loop): one
-    # `!pto.ptr<i64>` arg per DistributedTensor at the end of the regular params,
-    # before any dynamic-dim trailing args. The L2 orch threads the matching
-    # `add_scalar(ctx)` slots into the dispatch payload in IR-param order.
-    dist_tensor_params = [p for p in tensor_params if isinstance(p.type, _ir_core.DistributedTensorType)]
-    ctx_start_idx = scalar_start_idx + len(scalar_params)
-    for k, param in enumerate(dist_tensor_params):
-        ctx_name = f"{param.name_hint}_ctx"
-        arg_idx = ctx_start_idx + k
-        lines.append(f"    // Unpack CommContext for DistributedTensor: {param.name_hint}")
-        lines.append(f"    __gm__ int64_t* {ctx_name} = reinterpret_cast<__gm__ int64_t*>(args[{arg_idx}]);")
-        lines.append("")
-        var_names.append(ctx_name)
 
     # Extract dynamic dim values from tensor structs (shapes[] holds current view shape at runtime).
     # Dedup by Var.unique_id (stable C++ identity) -- name_hint is cosmetic, and Python wrapper
@@ -506,7 +505,9 @@ def _generate_arg_unpacking(func: _ir_core.Function, *, uses_spmd: bool = False)
     # the wrong tensor.
     used_c_names: set[str] = set(var_names)
     used_c_names.update(f"{p.name_hint}_tensor" for p in tensor_params)
-    used_c_names.update(f"{p.name_hint}_conv" for p in scalar_params)
+    used_c_names.update(
+        f"{p.name_hint}_conv" for p in scalar_params if isinstance(p.type, _ir_core.ScalarType)
+    )
     _append_dynamic_dim_unpacking(tensor_params, used_c_names, lines, var_names)
 
     return "\n".join(lines), var_names
@@ -738,11 +739,22 @@ def _generate_kernel_wrapper(
     return f"{header}\n// --- ptoas-generated code ---\n{ptoas_body}\n{wrapper_func}"
 
 
+def _format_signature(directions: list[str]) -> str:
+    """Render a runtime ArgDirection name list as a ``[_D.IN, _D.OUT, ...]`` body.
+
+    Used for both the per-kernel ``KERNELS`` signature and the ``ORCHESTRATION``
+    signature so the ``_D.{name}`` token format lives in one place.
+    """
+    return ", ".join(f"_D.{d}" for d in directions)
+
+
 def _generate_config_file(
     orch_func_name: str,
     func_name_to_id: dict[str, int],
     func_name_to_core_type: dict[str, _ir_core.CoreType],
     func_name_to_signature: dict[str, list[str]] | None = None,
+    orchestration_signature: list[str] | None = None,
+    func_name_to_external_source: dict[str, str] | None = None,
     *,
     block_dim: int | None = None,
 ) -> str:
@@ -763,9 +775,21 @@ def _generate_config_file(
     runtime builds a non-empty CoreCallable signature — required for the tensor
     dump to match the task payload tensor_count. Kernels without an entry fall
     back to an empty signature (the pre-existing behavior).
+
+    ``orchestration_signature`` is the orchestration entry's per-tensor
+    ``ArgDirection`` names ("IN"/"OUT"/"INOUT"), in ``orch_args`` tensor order
+    (scalars excluded). When present, the ``ORCHESTRATION`` dict gains a
+    ``"signature"`` field so the runtime builds a non-empty ChipCallable
+    signature, indexed by the orch tensor index in
+    ``bind_callable_to_runtime_impl``. This lets read-only IN tensors skip the
+    wasteful D2H copy-back and pure-OUT tensors take the on-device memset fast
+    path. Without it the signature is empty and every tensor is conservatively
+    copied back (the pre-existing behavior).
     """
     func_name_to_signature = func_name_to_signature or {}
-    has_signatures = any(func_name_to_signature.values())
+    func_name_to_external_source = func_name_to_external_source or {}
+    orchestration_signature = orchestration_signature or []
+    has_signatures = any(func_name_to_signature.values()) or bool(orchestration_signature)
 
     runtime_lines = [
         "RUNTIME_CONFIG = {",
@@ -795,7 +819,11 @@ def _generate_config_file(
         *runtime_lines,
         "ORCHESTRATION = {",
         f'\t"source": str(_ROOT_DIR / "orchestration" / "{orch_func_name}.cpp"),',
-        '\t"function_name": "aicpu_orchestration_entry"',
+        '\t"function_name": "aicpu_orchestration_entry",',
+    ]
+    if orchestration_signature:
+        lines.append(f'\t"signature": [{_format_signature(orchestration_signature)}],')
+    lines += [
         "}\n",
         "KERNELS = [",
     ]
@@ -803,24 +831,20 @@ def _generate_config_file(
     for name, func_id in sorted(func_name_to_id.items(), key=lambda x: x[1]):
         core_type = func_name_to_core_type[name]
         ct_str = "aiv" if core_type == _ir_core.CoreType.VECTOR else "aic"
+        # External kernels are referenced in place at their original path so the
+        # entry .cpp keeps its sibling files (relative #include "../..." resolve);
+        # DSL kernels are generated at kernels/<ct>/<name>.cpp under the artifact.
+        ext_source = func_name_to_external_source.get(name)
+        if ext_source is not None:
+            source_expr = repr(ext_source)
+        else:
+            source_expr = f'str(_ROOT_DIR / "kernels" / "{ct_str}" / "{name}.cpp")'
         entry = (
-            f'\t{{"func_id": {func_id}, '
-            f'"name": "{name}", '
-            f'"source": str(_ROOT_DIR / "kernels" / "{ct_str}" / "{name}.cpp"), '
-            f'"core_type": "{ct_str}"'
+            f'\t{{"func_id": {func_id}, "name": "{name}", "source": {source_expr}, "core_type": "{ct_str}"'
         )
         signature = func_name_to_signature.get(name)
         if signature:
-            sig_str = ", ".join(f"_D.{d}" for d in signature)
-            entry += f', "signature": [{sig_str}]'
-            # arg_index is mandatory and parallel to signature: it gives each
-            # signature entry's absolute slot in the task payload (used by the
-            # runtime tensor dump). pypto's payload is tensors-first (scalars
-            # are reordered after tensors by the orchestration codegen) and the
-            # signature excludes scalars, so each tensor entry maps 1:1 to
-            # payload slot i — an identity index.
-            idx_str = ", ".join(str(i) for i in range(len(signature)))
-            entry += f', "arg_index": [{idx_str}]'
+            entry += f', "signature": [{_format_signature(signature)}]'
         entry += "},"
         lines.append(entry)
 
@@ -922,11 +946,17 @@ def _build_group_mapping(
     return groups, ungrouped
 
 
-def _get_ptoas_flags() -> list[str]:
-    """Build the common ptoas flag list for kernel compilation."""
+def _get_ptoas_flags(memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO) -> list[str]:
+    """Build the common ptoas flag list for kernel compilation.
+
+    ``MemoryPlanner.PYPTO`` bakes physical addresses in PyPTO and trusts them
+    (``--pto-level=level3``); ``MemoryPlanner.PTOAS`` emits no addresses and
+    lets the ptoas PlanMemory pass allocate (``--pto-level=level2``).
+    """
+    level = "level3" if memory_planner == _passes.MemoryPlanner.PYPTO else "level2"
     flags = [
         "--enable-insert-sync",
-        "--pto-level=level3",
+        f"--pto-level={level}",
     ]
     flags.extend(_backend_core.get_handler().get_extra_ptoas_flags())
     return flags
@@ -942,10 +972,24 @@ def _get_kernel_output_path(
     return os.path.join("kernels", ct_str, f"{func.name}.{suffix}")
 
 
+def _external_source_of(func: _ir_core.Function) -> str | None:
+    """Return the ``external_source`` path of a header-only external kernel, else None.
+
+    External kernels (declared via ``@pl.function(type=AIC/AIV,
+    external_source=...)``) carry the absolute path to a hand-written C++
+    ``.cpp`` in their ``external_source`` attr and have an empty ``...`` DSL
+    body. The backend skips PyPTO codegen for them and references the source at
+    this original path in the manifest (so its sibling files stay reachable),
+    instead of generating a kernel.
+    """
+    return dict(func.attrs).get("external_source")
+
+
 def _compile_pto_module(
     pto_code: str,
     unit_name: str,
     output_dir: str,
+    memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
 ) -> str:
     """Run ptoas for one MLIR module and return the generated C++."""
     ptoas_dir = os.path.join(output_dir, "ptoas")
@@ -959,7 +1003,7 @@ def _compile_pto_module(
     _run_ptoas(
         pto_path,
         cpp_path,
-        ptoas_flags=_get_ptoas_flags(),
+        ptoas_flags=_get_ptoas_flags(memory_planner),
     )
 
     with open(cpp_path) as f:
@@ -972,6 +1016,7 @@ def _emit_single_function_output(
     pto_code: str,
     output_dir: str,
     skip_ptoas: bool,
+    memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
 ) -> None:
     """Emit output files for one InCore function."""
     suffix = "pto" if skip_ptoas else "cpp"
@@ -980,7 +1025,7 @@ def _emit_single_function_output(
         result_files[kernel_rel] = pto_code
         return
 
-    ptoas_cpp = _compile_pto_module(pto_code, func.name, output_dir)
+    ptoas_cpp = _compile_pto_module(pto_code, func.name, output_dir, memory_planner)
     result_files[kernel_rel] = _generate_kernel_wrapper(func, ptoas_cpp)
 
 
@@ -991,13 +1036,14 @@ def _emit_group_output(
     pto_code: str,
     output_dir: str,
     skip_ptoas: bool,
+    memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
 ) -> None:
     """Emit output files for one grouped MLIR module."""
     if skip_ptoas:
         result_files[os.path.join("kernels", f"{group_name}.pto")] = pto_code
         return
 
-    ptoas_cpp = _compile_pto_module(pto_code, group_name, output_dir)
+    ptoas_cpp = _compile_pto_module(pto_code, group_name, output_dir, memory_planner)
     group_uses_spmd = any(_uses_spmd_block_ops(f) for f in members)
     for func in members:
         result_files[_get_kernel_output_path(func, "cpp")] = _generate_kernel_wrapper(
@@ -1062,6 +1108,7 @@ def _emit_unit(
     unit: _CodegenUnit,
     output_dir: str,
     skip_ptoas: bool,
+    memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
 ) -> _EmitResult:
     """Run ptoas + wrapper generation for one codegen unit.
 
@@ -1072,9 +1119,13 @@ def _emit_unit(
     ptoas_record = StageRecord(name="ptoas", start=time.perf_counter())
     try:
         if unit.is_group:
-            _emit_group_output(local_files, unit.name, unit.funcs, unit.pto_code, output_dir, skip_ptoas)
+            _emit_group_output(
+                local_files, unit.name, unit.funcs, unit.pto_code, output_dir, skip_ptoas, memory_planner
+            )
         else:
-            _emit_single_function_output(local_files, unit.funcs[0], unit.pto_code, output_dir, skip_ptoas)
+            _emit_single_function_output(
+                local_files, unit.funcs[0], unit.pto_code, output_dir, skip_ptoas, memory_planner
+            )
         ptoas_record.end = time.perf_counter()
         return _EmitResult(name=unit.name, files=local_files, ptoas_record=ptoas_record)
     except Exception as e:
@@ -1116,17 +1167,20 @@ def _run_ptoas_phase(
     prof: CompileProfiler | None,
     result_files: dict[str, str],
     errors: list[tuple[str, Exception]],
+    memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
 ) -> None:
     """Phase 2: run ptoas for all codegen units, sequentially or in parallel."""
     max_workers = _get_max_workers()
 
     if max_workers == 1 or len(units) <= 1:
         for unit in units:
-            result = _emit_unit(unit, output_dir, skip_ptoas)
+            result = _emit_unit(unit, output_dir, skip_ptoas, memory_planner)
             _collect_emit_result(result, unit, prof, result_files, errors)
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_emit_unit, unit, output_dir, skip_ptoas) for unit in units]
+            futures = [
+                executor.submit(_emit_unit, unit, output_dir, skip_ptoas, memory_planner) for unit in units
+            ]
             for unit, future in zip(units, futures):
                 result = future.result()  # exceptions caught inside _emit_unit
                 _collect_emit_result(result, unit, prof, result_files, errors)
@@ -1138,6 +1192,7 @@ def generate(
     skip_ptoas: bool = False,
     *,
     block_dim: int | None = None,
+    memory_planner: _passes.MemoryPlanner | None = None,
 ) -> dict[str, str]:
     """Generate all PTO backend output files (kernels + orchestration + config).
 
@@ -1164,6 +1219,9 @@ def generate(
     Returns:
         Dict mapping relative file paths to their content.
     """
+    if memory_planner is None:
+        memory_planner = _passes.MemoryPlanner.PYPTO
+
     # Check for distributed functions (level >= HOST = Linqu level 3)
     has_distributed = any(
         f.level is not None and _ir_core.level_to_linqu_level(f.level) >= 3
@@ -1171,7 +1229,9 @@ def generate(
     )
 
     if has_distributed:
-        return _generate_with_distributed(transformed_program, output_dir, skip_ptoas)
+        return _generate_with_distributed(
+            transformed_program, output_dir, skip_ptoas, memory_planner=memory_planner
+        )
 
     # L2-only program with multiple Orchestrations: emit each as a
     # self-contained sub-build under ``next_levels/{orch_name}/``.
@@ -1183,15 +1243,21 @@ def generate(
         if f.func_type == _ir_core.FunctionType.Orchestration
     )
     if orch_count > 1:
-        return _generate_multi_chip(transformed_program, output_dir, skip_ptoas, block_dim=block_dim)
+        return _generate_multi_chip(
+            transformed_program, output_dir, skip_ptoas, block_dim=block_dim, memory_planner=memory_planner
+        )
 
-    return _generate_single_chip(transformed_program, output_dir, skip_ptoas, block_dim=block_dim)
+    return _generate_single_chip(
+        transformed_program, output_dir, skip_ptoas, block_dim=block_dim, memory_planner=memory_planner
+    )
 
 
 def _generate_with_distributed(
     transformed_program: _ir_core.Program,
     output_dir: str,
     skip_ptoas: bool,
+    *,
+    memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
 ) -> dict[str, str]:
     """Generate artifacts for a distributed (L3+) program.
 
@@ -1218,7 +1284,9 @@ def _generate_with_distributed(
             chip_funcs = _collect_chip_task_functions(func, transformed_program)
             chip_program = _ir_core.Program(chip_funcs, func.name, transformed_program.span)
             chip_subdir = os.path.join(output_dir, "next_levels", func.name)
-            chip_files = _generate_single_chip(chip_program, chip_subdir, skip_ptoas)
+            chip_files = _generate_single_chip(
+                chip_program, chip_subdir, skip_ptoas, memory_planner=memory_planner
+            )
             for path, content in chip_files.items():
                 result_files[f"next_levels/{func.name}/{path}"] = content
 
@@ -1409,6 +1477,7 @@ def _generate_multi_chip(
     skip_ptoas: bool = False,
     *,
     block_dim: int | None = None,
+    memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
 ) -> dict[str, str]:
     """Generate artifacts for an L2-only program with multiple Orchestrations.
 
@@ -1426,7 +1495,9 @@ def _generate_multi_chip(
         chip_funcs = _collect_chip_task_functions(func, transformed_program)
         chip_program = _ir_core.Program(chip_funcs, func.name, transformed_program.span)
         chip_subdir = os.path.join(output_dir, "next_levels", func.name)
-        chip_files = _generate_single_chip(chip_program, chip_subdir, skip_ptoas, block_dim=block_dim)
+        chip_files = _generate_single_chip(
+            chip_program, chip_subdir, skip_ptoas, block_dim=block_dim, memory_planner=memory_planner
+        )
         for path, content in chip_files.items():
             result_files[f"next_levels/{func.name}/{path}"] = content
     return result_files
@@ -1438,6 +1509,7 @@ def _generate_single_chip(
     skip_ptoas: bool = False,
     *,
     block_dim: int | None = None,
+    memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
 ) -> dict[str, str]:
     """Generate artifacts for a single-chip (L0-L2) program.
 
@@ -1461,18 +1533,43 @@ def _generate_single_chip(
 
     groups, ungrouped = _build_group_mapping(transformed_program)
 
+    # External kernels are referenced at their original path in the manifest
+    # (kept beside their sibling sources so relative #include "../..." resolve),
+    # so PyPTO neither codegens nor copies them.
+    func_name_to_external_source: dict[str, str] = {
+        f.name: src
+        for f in transformed_program.functions.values()
+        if (src := _external_source_of(f)) is not None
+    }
+
     # ── Phase 1: IR → MLIR (sequential, fast) ────────────────────────
     # PTOCodegen converts IR to MLIR strings. This is cheap (pure string
     # generation) and runs sequentially so that we don't contend on the GIL.
+    # When ptoas owns memory planning, omit the physical `pto.alloc_tile addr`
+    # so ptoas runs at --pto-level=level2 (which rejects any addr operand).
+    emit_tile_addr = memory_planner == _passes.MemoryPlanner.PYPTO
     units: list[_CodegenUnit] = []
 
     # Grouped functions: one MLIR module per group
     for group_name, members in groups.items():
         try:
+            # External kernels are referenced in place (see the manifest map);
+            # skip PyPTO codegen for them. A group must be all-external or
+            # all-DSL — mixing is rejected (the DSL members would need cross-core
+            # protocol wiring the external source can't participate in).
+            ext_members = [m for m in members if _external_source_of(m) is not None]
+            if ext_members:
+                if len(ext_members) != len(members):
+                    dsl = ", ".join(m.name for m in members if _external_source_of(m) is None)
+                    raise RuntimeError(
+                        f"Group '{group_name}' mixes external and DSL kernels "
+                        f"(DSL members: {dsl}). A group must be all-external or all-DSL."
+                    )
+                continue
             grouped_program = _ir_core.Program(members, group_name, transformed_program.span)
             stage = StageRecord(name=f"kernel_codegen:{group_name}", start=time.perf_counter())
             ir_record = StageRecord(name="ir_to_mlir", start=time.perf_counter())
-            pto_code = _codegen_core.PTOCodegen().generate(grouped_program)
+            pto_code = _codegen_core.PTOCodegen().generate(grouped_program, emit_tile_addr=emit_tile_addr)
             ir_record.end = time.perf_counter()
             stage.children.append(ir_record)
             units.append(_CodegenUnit(group_name, pto_code, members, is_group=True, stage_record=stage))
@@ -1483,6 +1580,10 @@ def _generate_single_chip(
 
     for func in ungrouped:
         try:
+            # External kernel: referenced in place (see the manifest map);
+            # skip PyPTO codegen.
+            if _external_source_of(func) is not None:
+                continue
             peer_names = _extract_peer_function_names(func)
             peer_funcs: list[_ir_core.Function] = []
             for name in peer_names:
@@ -1492,7 +1593,7 @@ def _generate_single_chip(
             single_program = _ir_core.Program([*peer_funcs, func], func.name, transformed_program.span)
             stage = StageRecord(name=f"kernel_codegen:{func.name}", start=time.perf_counter())
             ir_record = StageRecord(name="ir_to_mlir", start=time.perf_counter())
-            pto_code = _codegen_core.PTOCodegen().generate(single_program)
+            pto_code = _codegen_core.PTOCodegen().generate(single_program, emit_tile_addr=emit_tile_addr)
             ir_record.end = time.perf_counter()
             stage.children.append(ir_record)
             units.append(_CodegenUnit(func.name, pto_code, [func], is_group=False, stage_record=stage))
@@ -1504,7 +1605,7 @@ def _generate_single_chip(
     # Each _emit_unit call runs the ptoas subprocess and generates the
     # kernel wrapper.  These are data-independent and subprocess-heavy, so
     # a thread pool gives real parallelism (subprocess.run releases the GIL).
-    _run_ptoas_phase(units, output_dir, skip_ptoas, prof, result_files, errors)
+    _run_ptoas_phase(units, output_dir, skip_ptoas, prof, result_files, errors, memory_planner)
 
     # Orchestration + config
     if orch_func is not None:
@@ -1522,6 +1623,8 @@ def _generate_single_chip(
                     orch_result.func_name_to_id,
                     orch_result.func_name_to_core_type,
                     orch_result.func_name_to_signature,
+                    orch_result.orchestration_signature,
+                    func_name_to_external_source,
                     block_dim=block_dim,
                 )
         except Exception as e:

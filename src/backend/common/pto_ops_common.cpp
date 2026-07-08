@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/distributed/comm_layout.h"
 #include "pypto/codegen/pto/pto_codegen.h"
@@ -422,6 +423,12 @@ static std::string MaterializeSubviewOperandIfNeeded(const ir::ExprPtr& expr, co
   auto* mat = codegen.GetSubviewMaterialization(operand);
   if (!mat) return operand;
   if (mat->emitted) return mat->materialize_target_ssa;
+
+  INTERNAL_CHECK_SPAN(
+      !mat->source_memory_space.has_value() || *mat->source_memory_space != ir::MemorySpace::Mat, expr->span_)
+      << "Internal error: lazy materialization of a Mat-resident pto.subview "
+         "would produce an unsupported Mat->Mat pto.textract (no L1->L1 DMA); "
+         "the consumer should accept the subview SSA directly";
 
   auto result_type = mat->materialize_target_type;
   std::ostringstream extract;
@@ -1752,6 +1759,20 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
                       op->span_)
       << "tile.store atomic kwarg must encode AtomicType::kNone or kAdd, got " << atomic_int;
   if (atomic_int == static_cast<int>(ir::AtomicType::kAdd)) {
+    // bf16 atomic-add into GM is only honoured on the A2/A3 store path
+    // (pto-isa set_atomic_bf16); the A5 store path rejects it. Fail here with a
+    // clean, backend-aware user error instead of deferring to a downstream
+    // pto-isa static_assert. The hardware atomic dispatch keys on the GM
+    // *destination* dtype, so this also guards the cube path (fp32 Acc -> bf16
+    // GM via fix-pipe), where the source tile is fp32 but the target is bf16.
+    if (tensor_type->dtype_ == DataType::BF16) {
+      const auto* handler = codegen.GetBackendHandler();
+      CHECK_SPAN(handler->SupportsBf16AtomicAdd(), op->span_)
+          << "tile.store with atomic=AtomicType.Add into a bf16 global tensor is not supported on the '"
+          << handler->GetPtoTargetArch()
+          << "' backend; bf16 atomic-add requires the Ascend910B (A2/A3) profile. Accumulate into an fp32 "
+             "tensor and cast to bf16 after the reduction instead.";
+    }
     tstore_line << " {atomicType = #pto<atomic_type atomic_add>}";
   }
   codegen.Emit(tstore_line.str());
@@ -4005,14 +4026,22 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     }
 
     CHECK(mode == "soft") << "system.syncall: mode must be hard|soft, got " << mode;
-    // Soft form operands: [gm_workspace, scratch, used_cores]. Currently only
-    // aiv_only is wired (aic_only needs a flat L1 scratch; mix needs both UB +
-    // L1 scratch across a mixed kernel) — both are follow-ups.
-    CHECK(core_type == "aiv_only") << "system.syncall: soft form currently supports only aiv_only, got "
-                                   << core_type;
-    CHECK(op->args_.size() == 3) << "system.syncall (soft aiv_only) requires 3 operands "
-                                    "(gm_workspace, scratch, used_cores), got "
-                                 << op->args_.size();
+    // Soft form operands (all validated below):
+    //   aiv_only: [gm_workspace, ub_scratch, used_cores]
+    //   aic_only: [gm_workspace, l1_scratch, used_cores]
+    //   mix:      [gm_workspace, ub_scratch, l1_scratch, used_cores]
+    // gm_workspace is a shared 1-D GM int32 buffer (used_cores*8 slots, zero-init);
+    // the scratch tiles are local int32 staging (UB=Vec on the vector lane, flat
+    // L1=Mat on the cube lane); used_cores is an i32 participant count. A mix
+    // barrier carries both scratch tiles and is emitted on both lanes (SHARED);
+    // pto-isa's soft-mix lowering uses the L1 tile on the cube path and the UB
+    // tile on the vector path (the other is dead on each lane).
+    const bool is_mix = core_type == "mix";
+    const size_t num_scratch = is_mix ? 2 : 1;
+    const size_t expected_args = num_scratch + 2;  // gm_workspace + scratch(es) + used_cores
+    CHECK(op->args_.size() == expected_args) << "system.syncall (soft " << core_type << ") requires "
+                                             << expected_args << " operands, got " << op->args_.size();
+    const size_t used_idx = op->args_.size() - 1;
 
     // gm_workspace: shared 1-D GM int32 tensor -> pto.partition_view over the
     // whole buffer.
@@ -4027,7 +4056,7 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     CHECK_SPAN(dtype_str == "i32", op->span_)
         << "system.syncall soft: gm_workspace must be an INT32 tensor, got " << dtype_str;
     constexpr int64_t kSyncAllSoftSlotInt32 = 8;  // pto::SYNCALL soft: 8 int32 slots per core
-    if (auto used_const = As<ir::ConstInt>(op->args_[2])) {
+    if (auto used_const = As<ir::ConstInt>(op->args_[used_idx])) {
       const int64_t required = used_const->value_ * kSyncAllSoftSlotInt32;
       if (auto gm_dim = As<ir::ConstInt>(gm_tt->shape_[0])) {
         CHECK_SPAN(gm_dim->value_ >= required, op->span_)
@@ -4035,10 +4064,12 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
             << ") int32 slots, got " << gm_dim->value_;
       }
     }
-    // scratch must be an INT32 staging tile (it mirrors the int32 GM slots).
-    if (auto scratch_tt = As<ir::TileType>(op->args_[1]->GetType())) {
-      CHECK_SPAN(codegen.GetTypeString(scratch_tt->dtype_) == "i32", op->span_)
-          << "system.syncall soft: scratch tile must be INT32";
+    // Each scratch tile must be an INT32 staging tile (it mirrors the int32 GM slots).
+    for (size_t i = 1; i <= num_scratch; ++i) {
+      if (auto scratch_tt = As<ir::TileType>(op->args_[i]->GetType())) {
+        CHECK_SPAN(codegen.GetTypeString(scratch_tt->dtype_) == "i32", op->span_)
+            << "system.syncall soft: scratch tile must be INT32";
+      }
     }
     const std::string gm_view = codegen.GetOrCreateTensorView(gm_var);
     const std::string gm_view_type = codegen.GetTensorViewTypeString(gm_tt.get());
@@ -4048,18 +4079,32 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     const std::string gm_pview = EmitPartitionViewPTO(gm_var->name_hint_ + "_syncgm", gm_view, gm_view_type,
                                                       partition_type, offset_codes, size_codes, codegen);
 
-    // scratch: local int32 staging tile (UB on AIV, L1 on AIC).
-    const std::string scratch = codegen.GetExprAsCode(op->args_[1]);
-    const std::string scratch_type = codegen.GetExprTypeAnnotation(op->args_[1]);
-    CHECK_SPAN(!scratch_type.empty(), op->span_)
-        << "system.syncall soft: scratch tile has no tile_buf type annotation";
-    // used_cores: i32 participant count.
-    const std::string used_cores = codegen.GetExprAsCode(op->args_[2]);
+    // Assemble the operand + type-annotation lists: gm_pview, scratch(es), used_cores.
+    std::vector<std::string> operands = {gm_pview};
+    std::vector<std::string> types = {partition_type};
+    for (size_t i = 1; i <= num_scratch; ++i) {
+      const std::string scratch = codegen.GetExprAsCode(op->args_[i]);
+      const std::string scratch_type = codegen.GetExprTypeAnnotation(op->args_[i]);
+      CHECK_SPAN(!scratch_type.empty(), op->span_)
+          << "system.syncall soft: scratch tile has no tile_buf type annotation";
+      operands.push_back(scratch);
+      types.push_back(scratch_type);
+    }
+    operands.push_back(codegen.GetExprAsCode(op->args_[used_idx]));  // used_cores (i32)
+    types.push_back("i32");
 
     std::ostringstream oss;
-    oss << "pto.syncall(" << gm_pview << ", " << scratch << ", " << used_cores << " : " << partition_type
-        << ", " << scratch_type << ", i32) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<"
-        << core_type << ">";
+    oss << "pto.syncall(";
+    for (size_t i = 0; i < operands.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << operands[i];
+    }
+    oss << " : ";
+    for (size_t i = 0; i < types.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << types[i];
+    }
+    oss << ") mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<" << core_type << ">";
     codegen.Emit(oss.str());
     return std::string("");
   });
@@ -4176,6 +4221,7 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     mat_info.col_off_ssa = col_off;
     mat_info.materialize_target_ssa = result_target;
     mat_info.materialize_target_type = result_type;
+    mat_info.source_memory_space = source_tile_type->memory_space_;
     codegen.RegisterSubviewMaterialization(view_ssa, mat_info);
 
     // Bind the slice's result variable to the subview SSA; the pre-emitted

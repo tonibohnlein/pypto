@@ -49,6 +49,10 @@ inline const PassProperties kLowerHostTensorCollectivesProperties{
     .required = {IRProperty::CommDomainScopesMaterialized},
     .produced = {IRProperty::CommDomainScopesMaterialized}};
 
+inline const PassProperties kMaterializeDistTensorCtxProperties{
+    .required = {IRProperty::CommDomainScopesMaterialized},
+    .produced = {IRProperty::CommDomainScopesMaterialized}};
+
 // -- MaterializeRuntimeScopes pass (runs last, after the final Simplify) ------
 //    Inserts explicit AUTO RuntimeScopeStmt nodes for the orchestration function
 //    body and for/if bodies so codegen emits PTO2_SCOPE 1:1 from the IR.
@@ -211,10 +215,15 @@ inline const PassProperties kLowerAutoVectorSplitProperties{
 
 // -- Mixed kernel expansion pass ----------------------------------------------
 
+// HardSyncallOccupancyValid is produced here (not by a transformation ExpandMixedKernel
+// performs, but because this pass resolves each kernel's FunctionType to AIV/AIC/Group —
+// the precondition the hard-syncall occupancy verifier depends on). The verifier fires
+// once, right after this pass.
 inline const PassProperties kExpandMixedKernelProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::MixedKernelExpanded, IRProperty::NormalizedStmtStructure}};
+    .produced = {IRProperty::SSAForm, IRProperty::MixedKernelExpanded, IRProperty::NormalizedStmtStructure,
+                 IRProperty::HardSyncallOccupancyValid}};
 
 // -- GM pipe buffer injection pass (backend-gated; extracted from ExpandMixedKernel) --
 
@@ -235,6 +244,14 @@ inline const PassProperties kInitMemRefProperties{
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred},
     .produced = {IRProperty::HasMemRefs, IRProperty::NormalizedStmtStructure},
     .invalidated = {IRProperty::SSAForm}};
+
+// Semantic must-alias materialization (Step 0 formerly inside MemoryReuse).
+// Same requirements as MemoryReuse; retargets MemRefs in place without adding or
+// removing structural IR properties.
+inline const PassProperties kMaterializeSemanticAliasesProperties{
+    .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps, IRProperty::HasMemRefs,
+                 IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::NormalizedStmtStructure}};
 
 inline const PassProperties kMemoryReuseProperties{
     .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps, IRProperty::HasMemRefs,

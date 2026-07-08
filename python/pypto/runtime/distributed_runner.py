@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np  # pyright: ignore[reportMissingImports]
 import torch
 
-from .device_tensor import DeviceTensor
+from .device_tensor import DeviceTensor, StackedDeviceTensor
 from .runtime_base import Worker
 
 if TYPE_CHECKING:
@@ -428,8 +428,11 @@ def _make_call_config(
             # dep_gen does not perturb it. Everywhere else (the timing-pass-less
             # single-pass: prepared worker, or sim where conversion is skipped)
             # co-enable dep_gen so swimlane still has a graph in one dispatch.
-            call_config.enable_dep_gen = dfx.enable_dep_gen or (
-                co_enable_swimlane_dep_gen and dfx.enable_l2_swimlane
+            # ``enable_l2_swimlane`` is an int (0/1/2), so the ``or``/``and`` chain
+            # can yield an int; the ``CallConfig.enable_dep_gen`` pybind setter
+            # only accepts ``bool``. Wrap in ``bool(...)`` to avoid a TypeError.
+            call_config.enable_dep_gen = bool(
+                dfx.enable_dep_gen or (co_enable_swimlane_dep_gen and dfx.enable_l2_swimlane)
             )
             call_config.enable_scope_stats = dfx.enable_scope_stats
             call_config.enable_l2_swimlane = dfx.enable_l2_swimlane
@@ -649,7 +652,7 @@ def _dispatch(
 
 def execute_distributed(
     compiled: DistributedCompiledProgram,
-    coerced_args: list[torch.Tensor | DeviceTensor],
+    coerced_args: list[torch.Tensor | DeviceTensor | StackedDeviceTensor],
     config: RunConfig | None = None,
 ) -> None:
     """Execute a distributed compiled program once via simpler Worker(level=3).
@@ -694,9 +697,12 @@ def execute_distributed(
     # be in shared memory before the fork; DeviceTensor inputs are device
     # pointers forwarded at submit time and need no pre-fork shared memory.
     param_infos, _, _ = compiled._get_metadata()
-    tensors: dict[str, torch.Tensor | DeviceTensor] = {}
+    tensors: dict[str, torch.Tensor | DeviceTensor | StackedDeviceTensor] = {}
     for info, arg in zip(param_infos, coerced_args, strict=True):
-        if isinstance(arg, DeviceTensor):
+        # Worker-resident inputs (a DeviceTensor, or a StackedDeviceTensor whose
+        # per-rank shards are each DeviceTensors) are device pointers forwarded
+        # at submit time — no pre-fork shared memory needed.
+        if isinstance(arg, (DeviceTensor, StackedDeviceTensor)):
             tensors[info.name] = arg
             continue
         if not arg.is_shared():
@@ -785,12 +791,18 @@ def execute_distributed(
 
 def execute_distributed_compiled(
     output_dir: str | Path,
-    args: Sequence[torch.Tensor | DeviceTensor | ctypes._SimpleCData],
+    args: Sequence[torch.Tensor | DeviceTensor | StackedDeviceTensor | ctypes._SimpleCData],
     config: RunConfig | None = None,
     *,
     platform: str | None = None,
     distributed_config: DistributedConfig | None = None,
-) -> torch.Tensor | DeviceTensor | tuple[torch.Tensor | DeviceTensor, ...] | None:
+) -> (
+    torch.Tensor
+    | DeviceTensor
+    | StackedDeviceTensor
+    | tuple[torch.Tensor | DeviceTensor | StackedDeviceTensor, ...]
+    | None
+):
     """Reconstruct a distributed program from ``output_dir`` and run it once.
 
     The distributed counterpart of :func:`pypto.runtime.execute_compiled`: it
@@ -1078,27 +1090,174 @@ class DistributedWorker(Worker):
     # the readiness guard (open vs. closed) and the host-init upload policy (the
     # upload runs in a forked chip worker, so no defensive copy is possible).
 
-    _WORKER_KIND = "chip worker"
-
     def _require_ready(self, op: str) -> None:
         # Worker ABC hook: device-memory ops are valid until close().
         self._require_open(op)
 
-    def _prepare_init(self, init: torch.Tensor) -> torch.Tensor:
-        # Worker ABC hook: the upload (``copy_to``) runs **inside the
-        # forked chip worker**, so ``init`` must be a CPU, contiguous,
-        # shared-memory tensor allocated **before**
-        # :meth:`DistributedCompiledProgram.prepare` (call ``.share_memory_()``).
-        # Unlike L2 we cannot make a defensive ``.cpu().contiguous()`` copy: that
-        # copy would live only in the parent and be invisible to the child.
-        if not (init.is_shared() and init.is_contiguous() and init.device.type == "cpu"):
+    @staticmethod
+    def _require_forked_host_buffer(tensor: torch.Tensor, api: str, access: str) -> None:
+        """Validate *tensor* is a host buffer the forked chip worker can ``access``.
+
+        Every H2D/D2H copy runs **inside the forked chip worker**, which can only
+        touch host memory it inherited at fork. So *tensor* must be a CPU,
+        contiguous, **shared-memory** tensor allocated **before**
+        :meth:`DistributedCompiledProgram.prepare` (call ``.share_memory_()``); a
+        buffer allocated after ``prepare()`` — or a non-shared one — is invisible
+        to the child.
+
+        Args:
+            tensor: The host buffer to validate.
+            api: The calling API signature, woven into the error message
+                (e.g. ``"copy_stacked_from(host=...)"``).
+            access: The child's access verb — ``"read"`` for uploads, ``"write"``
+                for read-backs.
+
+        Raises:
+            ValueError: If *tensor* is not CPU, contiguous, and shared-memory.
+        """
+        if not (tensor.is_shared() and tensor.is_contiguous() and tensor.device.type == "cpu"):
             raise ValueError(
-                "DistributedWorker.alloc_tensor(init=...) requires a CPU, contiguous, "
-                "shared-memory tensor allocated BEFORE prepare() (call .share_memory_()). "
-                "The upload runs in the forked chip worker, which can only read host "
-                "memory it inherited at fork."
+                f"{api} requires a CPU, contiguous, shared-memory tensor allocated "
+                f"BEFORE prepare() (call .share_memory_()). The copy runs in the forked "
+                f"chip worker, which can only {access} host memory it inherited at fork."
             )
+
+    def _prepare_init(self, init: torch.Tensor) -> torch.Tensor:
+        # Worker ABC hook: the upload (``copy_to``) runs **inside the forked chip
+        # worker**, so ``init`` must be a CPU, contiguous, shared-memory tensor
+        # allocated **before** prepare() (see _require_forked_host_buffer). Unlike
+        # L2 we cannot make a defensive ``.cpu().contiguous()`` copy: that copy
+        # would live only in the parent and be invisible to the child.
+        self._require_forked_host_buffer(init, "DistributedWorker.alloc_tensor(init=...)", "read")
         return init
+
+    def alloc_stacked_tensor(
+        self,
+        host: torch.Tensor,
+        *,
+        worker_ids: Sequence[int] | None = None,
+    ) -> StackedDeviceTensor:
+        """Upload each leading-dim shard of *host* to a worker once; reuse it.
+
+        The leading dimension of *host* is the stack/shard dimension: shard ``i``
+        (``host[i]``, shape ``host.shape[1:]``) is uploaded to worker
+        ``worker_ids[i]`` and stays resident for the worker's lifetime. Pass the
+        returned :class:`~pypto.runtime.StackedDeviceTensor` in place of *host*
+        for a leading-dim-sharded program parameter (a ``[B, *tail]`` tensor the
+        orchestrator slices per rank: ``for r in range(world_size):
+        child(x[r], device=...)``). The generated ``host_orch`` indexes ``x[i]``
+        to shard ``i``'s :class:`~pypto.runtime.DeviceTensor`, so the runtime
+        skips the per-dispatch H2D upload (``child_memory``) — the stack is
+        uploaded once here and reused across every ``rt(...)`` dispatch.
+
+        Args:
+            host: A CPU, contiguous, **shared-memory** ``[B, *tail]`` tensor
+                allocated BEFORE :meth:`~DistributedCompiledProgram.prepare`
+                (call ``.share_memory_()``); the upload runs in the forked chip
+                worker, which can only read host memory inherited at fork.
+            worker_ids: ``worker_ids[i]`` is the worker that holds shard ``i``
+                and whose task consumes ``x[i]``; it MUST equal the worker the
+                program submits ``x[i]``'s dispatch to (its ``device=``
+                expression). Entries must be distinct and within
+                ``[0, world_size)``. Defaults to ``range(B)`` — the canonical
+                ``for r in range(world_size): child(x[r], device=r)`` program. A
+                permuted/subset placement (``device=perm[r]`` / ``device=2*r``)
+                needs the matching ``worker_ids``.
+
+        Returns:
+            A :class:`~pypto.runtime.StackedDeviceTensor`; its shards are tracked
+            by this worker and auto-freed on :meth:`close` if not released earlier
+            via :meth:`free_stacked_tensor`.
+        """
+        self._require_open("alloc_stacked_tensor")
+        if not isinstance(host, torch.Tensor):
+            raise TypeError(
+                f"alloc_stacked_tensor(host=...) expects a torch.Tensor, got {type(host).__name__}"
+            )
+        if host.ndim < 2:
+            raise ValueError(
+                f"alloc_stacked_tensor needs a [B, *tail] tensor (rank >= 2), got shape {tuple(host.shape)}"
+            )
+        b = int(host.shape[0])
+        if b < 1:
+            raise ValueError(
+                f"alloc_stacked_tensor needs at least one shard in the leading dim, "
+                f"got shape {tuple(host.shape)}"
+            )
+        world = len(self.dc.device_ids)
+        ids = list(range(b)) if worker_ids is None else [int(w) for w in worker_ids]
+        if len(ids) != b:
+            raise ValueError(f"worker_ids has {len(ids)} entries; host leading dim is {b}")
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"worker_ids must be distinct (one shard per worker), got {ids}")
+        for w in ids:
+            if not 0 <= w < world:
+                raise ValueError(f"worker id {w} out of range [0, {world}) (world_size from device_ids)")
+
+        shards: list[DeviceTensor] = []
+        try:
+            for i, w in enumerate(ids):
+                shards.append(
+                    self.alloc_tensor(
+                        tuple(host.shape[1:]),
+                        host.dtype,
+                        init=host[i].contiguous(),
+                        worker_id=w,
+                    )
+                )
+        except Exception:
+            # Roll back any shards already uploaded so a mid-loop failure
+            # (e.g. a non-shared host) never leaks device memory.
+            for shard, w in zip(shards, ids, strict=False):
+                self.free_tensor(shard, worker_id=w)
+            raise
+        return StackedDeviceTensor(shards, tuple(host.shape), tuple(ids))
+
+    def free_stacked_tensor(self, stacked: StackedDeviceTensor) -> None:
+        """Release every shard of *stacked* against its owning worker. Idempotent."""
+        for shard, w in zip(stacked.shards, stacked.worker_ids, strict=True):
+            self.free_tensor(shard, worker_id=w)
+
+    def copy_stacked_from(self, stacked: StackedDeviceTensor, host: torch.Tensor) -> None:
+        """Read every shard of *stacked* back to *host* (D2H) — the read-back
+        symmetric to :meth:`alloc_stacked_tensor`.
+
+        Because a :class:`~pypto.runtime.StackedDeviceTensor` skips the
+        per-dispatch D2H copy, callers that want the shards' current device
+        contents (e.g. a resident KV cache at the end of an L3 step) must read
+        them back explicitly. Shard ``i`` is copied from its owning worker
+        ``stacked.worker_ids[i]`` into ``host[i]``.
+
+        Args:
+            stacked: The resident stacked tensor to read back.
+            host: A CPU, contiguous, **shared-memory** ``[B, *tail]`` tensor
+                allocated BEFORE :meth:`~DistributedCompiledProgram.prepare`
+                (call ``.share_memory_()``), whose shape and dtype match
+                ``stacked.full_shape`` / ``stacked.dtype``. Filled in place
+                (``host[i]`` receives shard ``i``). The D2H copy runs in the
+                forked chip worker, which can only write to host memory it
+                inherited at fork — a buffer allocated after ``prepare()`` (or a
+                non-shared one) would leave *host* untouched.
+        """
+        self._require_open("copy_stacked_from")
+        if not isinstance(stacked, StackedDeviceTensor):
+            raise TypeError(
+                f"copy_stacked_from(stacked=...) expects a StackedDeviceTensor, got {type(stacked).__name__}"
+            )
+        if not isinstance(host, torch.Tensor):
+            raise TypeError(f"copy_stacked_from(host=...) expects a torch.Tensor, got {type(host).__name__}")
+        if tuple(host.shape) != stacked.full_shape:
+            raise ValueError(
+                f"host shape {tuple(host.shape)} does not match stacked full_shape {stacked.full_shape}"
+            )
+        if host.dtype != stacked.dtype:
+            raise ValueError(f"host dtype {host.dtype} does not match stacked dtype {stacked.dtype}")
+        self._require_forked_host_buffer(host, "copy_stacked_from(host=...)", "write")
+        for i, (shard, w) in enumerate(zip(stacked.shards, stacked.worker_ids, strict=True)):
+            # host is contiguous + shared, so host[i] is a contiguous view at the
+            # right offset into the same shm segment the child inherited at fork;
+            # host[i].data_ptr() is therefore the correct cross-process D2H dst.
+            self.copy_from(host[i].data_ptr(), shard.data_ptr, shard.nbytes, worker_id=w)
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -1152,7 +1311,10 @@ class DistributedWorker(Worker):
         ``None``, the prepared baseline is reused with zero extra allocation.
         """
         self._require_open("run")
-        from pypto.ir.compiled_program import _validate_device_tensor  # noqa: PLC0415
+        from pypto.ir.compiled_program import (  # noqa: PLC0415
+            _validate_device_tensor,
+            _validate_stacked_tensor,
+        )
 
         state = self._states.get(compiled)
         if state is None:
@@ -1190,7 +1352,9 @@ class DistributedWorker(Worker):
                 # Scalar parameter (e.g. seq_len): forwarded as-is to the entry.
                 tensors[info.name] = arg
                 continue
-            if isinstance(arg, DeviceTensor):
+            if isinstance(arg, StackedDeviceTensor):
+                _validate_stacked_tensor(arg, info)
+            elif isinstance(arg, DeviceTensor):
                 _validate_device_tensor(arg, info)
             elif isinstance(arg, torch.Tensor):
                 if not arg.is_shared():
@@ -1203,7 +1367,8 @@ class DistributedWorker(Worker):
             elif not _is_simpler_tensor(arg):
                 raise TypeError(
                     f"DistributedWorker parameter {info.name!r} got {type(arg).__name__}; expected a "
-                    f"shared-memory torch.Tensor, a worker-resident DeviceTensor, or a simpler Tensor."
+                    f"shared-memory torch.Tensor, a worker-resident DeviceTensor, a "
+                    f"StackedDeviceTensor, or a simpler Tensor."
                 )
             tensors[info.name] = arg
 

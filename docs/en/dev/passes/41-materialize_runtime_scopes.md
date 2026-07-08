@@ -21,6 +21,13 @@ runtime forbids AUTO nested in MANUAL). Codegen then emits `PTO2_SCOPE` **only**
 from `RuntimeScopeStmt` nodes — staying 1:1 with the IR (see
 [orchestration codegen](../codegen/01-orchestration_codegen.md)).
 
+When `AutoDeriveTaskDependencies(analyze_auto_scopes=True)` has proven a
+default-mode function body or future for/if partition is fully covered by
+compiler-derived explicit deps, this pass emits a compiler-owned MANUAL
+`RuntimeScopeStmt` for that region instead of matching on any specific callee
+name. The call-level marker is consumed here; only the scope-level marker remains
+for codegen's structural lookahead.
+
 Under `@pl.function(auto_scope=False)` the pass inserts **nothing**: the user
 places scopes with `with pl.scope()` / `with pl.scope(mode=pl.ScopeMode.MANUAL)`,
 which the parser materialises directly into the IR. This is the knob for
@@ -57,7 +64,7 @@ scoped = passes.materialize_runtime_scopes()(program)
 
 | Function | for/if + function body | Hand-placed `with pl.scope()` |
 | -------- | ---------------------- | ----------------------------- |
-| `auto_scope=True` (default) | Auto-wrapped in AUTO scope (suppressed inside a manual scope) | Rejected by the parser (use `auto_scope=False`) |
+| `auto_scope=True` (default) | Auto-wrapped in AUTO scope, except fully compiler-covered regions may become compiler-owned MANUAL scopes | Rejected by the parser (use `auto_scope=False`) |
 | `auto_scope=False` | Not auto-wrapped (pass is a no-op) | The only scopes; `with pl.scope(mode=MANUAL)` and the `manual_scope` alias also allowed |
 
 In the default mode the `InsertAutoScopeMutator` walks the body:
@@ -66,9 +73,12 @@ In the default mode the `InsertAutoScopeMutator` walks the body:
    AUTO insertion is suppressed while the counter is non-zero (AUTO-in-MANUAL is
    forbidden). AUTO scopes do not suppress nesting.
 2. Each `ForStmt` body is wrapped in `RuntimeScopeStmt(manual=false)` unless
-   already AUTO-wrapped; each `IfStmt` then/else body likewise.
-3. The whole function body is then wrapped in one outermost AUTO scope, and the
-   function is marked `auto_scope=False`.
+   already AUTO-wrapped; each `IfStmt` then/else body likewise. If all task
+   calls in that future partition carry the compiler auto-manual marker, the
+   wrapper is compiler-owned MANUAL instead.
+3. The whole function body is then wrapped in one outermost AUTO scope, or a
+   compiler-owned MANUAL scope when the function-level marker is present, and
+   the function is marked `auto_scope=False`.
 
 ## Example
 

@@ -28,9 +28,8 @@ Both use the ``pld.system.notify`` / ``pld.system.wait`` handshake as the
 barrier that orders the synchronous put against the local read-back (see
 :file:`test_l3_notify_wait.py` for the handshake contract in isolation).
 
-The non-atomic full-slice and row-offset scenarios are enabled as the canonical
-e2e contract for ``pld.tensor.put``. The atomic-add scenario remains skipped
-until the current runtime/PTOAS stack can execute it reliably.
+The non-atomic full-slice, row-offset, and atomic-add scenarios are enabled as
+the canonical e2e contract for ``pld.tensor.put``.
 """
 
 import sys
@@ -226,8 +225,11 @@ def _build_atomic_add_program():
             acc: pld.DistributedTensor[[16, 16], pl.INT32],
             signal: pld.DistributedTensor[[1, 1], pl.INT32],
             root: pl.Scalar[pl.INT32],
-            nranks: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[16, 16], pl.INT32]:
+            ctx = pld.get_comm_ctx(acc)
+            my_rank = pld.rank(ctx)
+            nranks = pld.nranks(ctx)
+
             # Phase 1: stage our contribution into our own src cell.
             local = pl.load(inp, [0, 0], [16, 16])
             src = pl.store(local, [0, 0], src)
@@ -237,8 +239,11 @@ def _build_atomic_add_program():
             # device-side atomic_add is what makes this correct.
             pld.tensor.put(acc, peer=root, src=src, atomic=pld.AtomicType.Add)
 
-            # Phase 3: every rank bumps the root's signal; the root waits until
-            # all nranks contributions (including its own) have landed.
+            # Phase 3: every rank bumps the root's signal; only the root waits
+            # on that root-local cell until all contributions, including its
+            # own, have landed. Non-root ranks must not wait on their local
+            # signal cells because nobody increments them in this reduce-to-root
+            # protocol.
             pld.system.notify(
                 target=signal,
                 peer=root,
@@ -246,16 +251,19 @@ def _build_atomic_add_program():
                 value=1,
                 op=pld.NotifyOp.AtomicAdd,
             )
-            pld.system.wait(
-                signal=signal,
-                offsets=[0, 0],
-                expected=nranks,
-                cmp=pld.WaitCmp.Ge,
-            )
 
-            # Phase 4: the root reads the accumulated sum from its acc cell.
-            recv = pl.load(acc, [0, 0], [16, 16])
-            return pl.store(recv, [0, 0], out)
+            if my_rank == root:
+                pld.system.wait(
+                    signal=signal,
+                    offsets=[0, 0],
+                    expected=nranks,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
+                # Phase 4: the root reads the accumulated sum from its acc cell.
+                recv = pl.load(acc, [0, 0], [16, 16])
+                return pl.store(recv, [0, 0], out)
+            return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_orch(
@@ -266,9 +274,8 @@ def _build_atomic_add_program():
             acc: pld.DistributedTensor[[16, 16], pl.INT32],
             signal: pld.DistributedTensor[[1, 1], pl.INT32],
             root: pl.Scalar[pl.INT32],
-            nranks: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[16, 16], pl.INT32]:
-            return self.add_step(inp, out, src, acc, signal, root, nranks)
+            return self.add_step(inp, out, src, acc, signal, root)
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(
@@ -285,7 +292,7 @@ def _build_atomic_add_program():
                 acc = pld.window(acc_buf, [16, 16], dtype=pl.INT32)
                 signal = pld.window(signal_buf, [1, 1], dtype=pl.INT32)
                 # All ranks accumulate into root rank 0.
-                self.chip_orch(inputs[r], outputs[r], src, acc, signal, 0, pld.world_size(), device=r)
+                self.chip_orch(inputs[r], outputs[r], src, acc, signal, 0, device=r)
             return outputs
 
     return AtomicAddReduce
@@ -361,7 +368,6 @@ class TestL3Put:
             f"pipeline ring put mismatch: max diff = {(outputs - expected).abs().max().item()}"
         )
 
-    @pytest.mark.skip(reason="atomic-add put still fails on the current runtime/PTOAS stack")
     def test_atomic_add_accumulate(self, test_config, device_ids):
         """Atomic add: all ranks accumulate into root rank 0's single cell."""
         if len(device_ids) < 2:

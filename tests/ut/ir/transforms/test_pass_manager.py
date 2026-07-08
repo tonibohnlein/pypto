@@ -51,6 +51,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "CanonicalizeIOOrder",
     "MaterializeTensorStrides",
     "InitMemRef",
+    "MaterializeSemanticAliases",
     "MemoryReuse",
     "AllocateMemoryAddr",
     "FoldNoOpReshape",
@@ -61,6 +62,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "SynthesizeAllReduceSignals",
     "MaterializeCommDomainScopes",
     "LowerHostTensorCollectives",
+    "MaterializeDistTensorCtx",
     "Simplify",
     "MaterializeRuntimeScopes",
 ]
@@ -90,6 +92,7 @@ DEBUG_TILE_OPTIMIZATION_PASSES = [
     "CanonicalizeIOOrder",
     "MaterializeTensorStrides",
     "InitMemRef",
+    "MaterializeSemanticAliases",
     "MemoryReuse",
     "AllocateMemoryAddr",
     "FoldNoOpReshape",
@@ -100,6 +103,7 @@ DEBUG_TILE_OPTIMIZATION_PASSES = [
     "SynthesizeAllReduceSignals",
     "MaterializeCommDomainScopes",
     "LowerHostTensorCollectives",
+    "MaterializeDistTensorCtx",
     "Simplify",
     "MaterializeRuntimeScopes",
 ]

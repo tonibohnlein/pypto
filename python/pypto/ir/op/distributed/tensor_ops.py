@@ -349,7 +349,27 @@ def reduce_scatter(
     )
 
 
+def all_to_all(
+    input: Expr,
+    target: Expr,
+    signal: Expr,
+    *,
+    span: Span | None = None,
+) -> Call:
+    """Build a ``pld.tensor.all_to_all(...)`` Call.
+
+    3-arg push-based InCore composite: Tensor [NR, SIZE] input, DistributedTensor
+    [NR, SIZE] target (window-as-result), INT32 barrier signal.  Lowered by
+    LowerCompositeOps into a 2-phase push decomposition (push via
+    ``pld.tensor.put`` / TPUT → barrier → return target).
+    """
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    _args: list[Expr] = [input, target, signal]
+    return _ir_core.create_op_call("pld.tensor.all_to_all", _args, {}, actual_span)
+
+
 __all__ = [
+    "all_to_all",
     "alloc_window_buffer",
     "allgather",
     "allreduce",
