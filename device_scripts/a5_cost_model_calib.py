@@ -45,11 +45,23 @@ A2A3_BASELINE = dict(
     mad_fp32_passes=2,
 )
 
-# --- a5-fitted constants. ---
-# MEASURED on a5-sim: mad_fp32_passes=8 (fp32 cube ~4x a2a3/fractal), mad_head=25 (fp32+bf16
-# k-sweep intercept; a2a3=21). bf16 confirmed cpr=1. bw / drain NOT yet fit (a5-sim too slow
-# + LOAD_2Dv2 extractor gap) -> left at baseline, so the diff below isolates the CUBE fix.
-A5_FITTED = dict(A2A3_BASELINE, mad_fp32_passes=8, mad_head=25)
+# --- a5-fitted constants — FULL a5-sim calibration (raw work-cycle fit; no a5 device). ---
+# Cube: mad_fp32_passes=8, mad_head=25 (bf16 cpr=1). Load: bw a5 ports faster (206/224).
+# Drain: bw_drain=30 (⚠ ~4x sim-vs-device gap, shipped raw), drain_fixed doubled (343),
+# drain_penalty much milder (0.26 vs 2.6). Fits the a5-sim sweeps to <1%; single-tile
+# roofline ranking Spearman ~0.9. See Backend950::GetL0CostModel() for the caveats.
+A5_FITTED = dict(
+    bw_a=206.3,
+    bw_b=223.8,
+    bw_drain=30.0,
+    drain_fixed_cycles=343.4,
+    drain_row_cycles=4.59,
+    drain_penalty_cycles=0.26,
+    drain_c0_bytes=32,
+    mad_head=25,
+    mad_k_fractal_bytes=32,
+    mad_fp32_passes=8,
+)
 
 STAT = {Stationarity.OutputStationary: "OS", Stationarity.AStationary: "A", Stationarity.BStationary: "B"}
 

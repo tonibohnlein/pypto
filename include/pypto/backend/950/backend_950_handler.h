@@ -69,38 +69,43 @@ class Ascend950Handler : public BackendHandler {
   [[nodiscard]] uint32_t GetL0cCapacityBytes() const override { return 256ULL * 1024; }
   [[nodiscard]] uint64_t GetMatCapacityBytes() const override { return 512ULL * 1024; }
 
-  // a5 roofline cost-model constants (EXPLICIT, so each is an a5-sim-calibratable slot).
-  // Cube is a5-sim-CALIBRATED (mad_head=25, mad_fp32_passes=8, bf16 cpr=1); bw + drain are
-  // still a2a3-inherited (a5-sim sweep pending -- see below). Calibration recipe (full
-  // spec: a5_cost_model_device_task.md): fit each constant from an a5-sim forced-tile
-  // sweep using WORK-CYCLE extraction by instruction source (excluding WAIT_FLAG/BAR
-  // stalls) on the cube / MTE1 (LOAD_2Dv2) / FIXP lanes. That method reproduces the shipped
-  // a2a3 *device* model within ~15%, so fit RAW a5-sim work-cycle numbers -- NO transfer
-  // correction (the earlier BW/~1.54 idea was for raw pipe sums, superseded). No a5 device
-  // exists, so a5-sim IS the ground truth; validate picks with an a5-sim OLD-vs-NEW wall
-  // check. The form (per-M-row max(floor,throughput) + oddPart) is arch-general; only these
-  // magnitudes vary (plus the already-measured fp32 cube pass count).
+  // a5 roofline cost-model constants -- FULLY a5-sim-CALIBRATED (all 7; raw work-cycle fit;
+  // no a5 device, so a5-sim is the ground truth). Recipe (a5_cost_model_device_task.md): fit
+  // each from an a5-sim forced-tile sweep via WORK-CYCLE extraction by instruction source
+  // (excluding WAIT_FLAG/BAR stalls) on the cube / MTE1 (LOAD_2Dv2) / FIXP lanes -- that
+  // method reproduces the shipped a2a3 *device* model within ~15% on the load/cube lanes
+  // (so fit RAW, no transfer correction), though NOT on the drain lane (see bw_drain caveat
+  // below). The form (per-M-row max(floor,throughput) + oddPart) is arch-general; only the
+  // magnitudes + the fp32 cube pass count vary. Single-tile roofline ranking validated on
+  // a5-sim (Spearman ~0.9); multi-tile wall validation is blocked by broken a5-sim span
+  // tooling (a follow-up).
   [[nodiscard]] L0CostModel GetL0CostModel() const override {
     L0CostModel m;
-    // BW + drain: still a2a3-inherited. TODO(a5): a5-sim couldn't fit these yet (a5-sim
-    // ~8x slower + LOAD source is LOAD_2Dv2/MTE1 not LOAD_L1_TO_DST); left at a2a3 = the
-    // documented inheritance (no worse than status quo). Preliminary a5 signal: drain
-    // misalignment looks MILDER on a5 (n=128->144 +1.20x vs a2a3 +3.96x) -> drain_penalty
-    // likely < 2.6. Refit via analytic bytes (see a5_cost_model_device_task.md).
-    m.bw_l0a = 129.7;              // TODO(a5): refit (a2a3: 129.7)
-    m.bw_l0b = 85.4;               // TODO(a5): refit (a2a3: 85.4)
-    m.bw_drain = 118.0;            // TODO(a5): refit (a2a3: 118.0)
-    m.drain_fixed_cycles = 164.0;  // TODO(a5): refit (a2a3: 164.0)
-    m.drain_row_cycles = 4.45;     // TODO(a5): refit (a2a3: 4.45)
-    m.drain_penalty_cycles = 2.6;  // TODO(a5): refit -- likely lower on a5 (a2a3: 2.6)
-    m.drain_c0_bytes = 32;         // ISA NZ-fractal C0; a5-invariant
-    m.mad_k_fractal_bytes = 32;    // ISA cube K-fractal; a5-invariant
-    // Cube: MEASURED on a5-sim (the primary calibration, high confidence).
+    // FULL a5-sim calibration (raw work-cycle fit; no a5 device, so a5-sim is ground truth).
+    // Load bandwidths (analytic bytes / LOAD_2Dv2 work-cycles): a5 L0 ports are faster than
+    // a2a3 (bw_l0a 129.7->206, bw_l0b 85.4->224 -- note a5 L0B is not the slower port).
+    m.bw_l0a = 206.3;  // a5-sim MTE1 (LOAD_2Dv2), analytic-bytes fit (a2a3: 129.7)
+    m.bw_l0b = 223.8;  // a5-sim MTE1 (a2a3: 85.4)
+    // Drain (FIX_L0C_TO_DST work-cycles): fits the a5-sim FIXP sweep to <1%.
+    // ⚠ bw_drain=30 carries a known ~4x SIM-vs-DEVICE gap: the work-cycle method matches
+    // device on the load/cube lanes but a5-sim FIXPIPE drain is ~4x its would-be device
+    // value (a2a3-sim drain is likewise ~4x a2a3-device's 118). Shipped raw per "a5-sim is
+    // ground truth". Effect: drain becomes ~90% of the (sequential wall=max(load,mad)+drain)
+    // predicted wall and OVER-predicts wide-N single-tile walls ~34%, because a5-sim
+    // actually pipelines the drain under the next tile's compute. If this mis-picks tiles,
+    // the fix is to price wide-N drain via the drain-hidden max(compute,drain) path (dbC=2),
+    // NOT to hand-edit bw_drain. Single-tile roofline ranking is still strong (Spearman ~0.9).
+    m.bw_drain = 30.0;              // a5-sim FIXP throughput (a2a3: 118; see warning above)
+    m.drain_fixed_cycles = 343.4;   // a5-sim per-drain fixed (a2a3: 164)
+    m.drain_row_cycles = 4.59;      // a5-sim narrow-N floor (a2a3: 4.45; ~arch-invariant)
+    m.drain_penalty_cycles = 0.26;  // a5-sim misalignment (a2a3: 2.6) -- a5 is much MILDER
+    m.drain_c0_bytes = 32;          // ISA NZ-fractal C0; a5-invariant
+    m.mad_k_fractal_bytes = 32;     // ISA cube K-fractal; a5-invariant
+    // Cube: a5-sim MEASURED (the primary, highest-confidence calibration).
     m.mad_head_cycles = 25;  // a5-sim: intercept of fp32 AND bf16 k-sweeps (a2a3: 21)
-    m.mad_fp32_passes = 8;   // a5-sim CONFIRMED: full fp32 MMAD ~4x a2a3/fractal
-                             // (a2a3=2). mmad = 25 + 512*k_fractal at m=128 (4121) and
-                             // m=256 (8217). bf16 stays 1 pass (bf16 mmad=281=25+256,
-                             // unaffected by the 4x) -- so the 8x is fp32-only, as intended.
+    m.mad_fp32_passes = 8;   // a5-sim CONFIRMED: full fp32 MMAD ~4x a2a3/fractal (a2a3=2;
+                             // mmad = 25 + 8*fractals, R^2=1). bf16 stays 1 pass -- the 8x
+                             // is fp32-only, as intended.
     return m;
   }
 
