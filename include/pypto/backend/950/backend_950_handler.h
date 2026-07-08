@@ -93,6 +93,10 @@ class Ascend950Handler : public BackendHandler {
     m.drain_c0_bytes = 32;         // ISA NZ-fractal C0; a5-invariant (keep 32)
     m.mad_head_cycles = 21;        // TODO(a5): confirm on a5 cube (a2a3 transfers ~2%; 21)
     m.mad_k_fractal_bytes = 32;    // ISA cube K-fractal; a5-invariant (keep 32)
+    m.mad_fp32_passes = 8;         // a5-sim MEASURED: full fp32 MMAD is ~4x a2a3/fractal
+                                   // (a2a3=2); confirmed by MMAD(128,128,64)=4121 (=21+8*512).
+                                   // a5 does a fuller fp32 mantissa decomposition. TODO(a5):
+                                   // confirm bf16 cube is still 1 pass (unmeasured).
     return m;
   }
 

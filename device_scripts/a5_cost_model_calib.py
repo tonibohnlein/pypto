@@ -1,3 +1,12 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
 """a5 (Ascend950) L0 cost-model calibration probe.
 
 Two things:
@@ -33,10 +42,14 @@ A2A3_BASELINE = dict(
     drain_c0_bytes=32,
     mad_head=21,
     mad_k_fractal_bytes=32,
+    mad_fp32_passes=2,
 )
 
-# --- a5-fitted constants — EDIT after the a5-sim sweep. Starts == baseline (no-op). ---
-A5_FITTED = dict(A2A3_BASELINE)  # TODO(a5): replace with the a5-sim fit (+ transfer correction)
+# --- a5-fitted constants — EDIT after the a5-sim sweep. ---
+# mad_fp32_passes=8 is already MEASURED (a5-sim: full fp32 cube ~4x a2a3/fractal). The rest
+# still equal the baseline until the sweep re-fits bw / drain, so the diff below currently
+# isolates the cube-form fix (which is the point). TODO(a5): + bw/drain from the sweep.
+A5_FITTED = dict(A2A3_BASELINE, mad_fp32_passes=8)
 
 STAT = {Stationarity.OutputStationary: "OS", Stationarity.AStationary: "A", Stationarity.BStationary: "B"}
 
@@ -59,6 +72,7 @@ def _cfg(M, K, N, bytes_ab, c):
     x.drain_c0_bytes = c["drain_c0_bytes"]
     x.mad_head = c["mad_head"]
     x.mad_k_fractal_bytes = c["mad_k_fractal_bytes"]
+    x.mad_fp32_passes = c["mad_fp32_passes"]
     x.allow_padding = x.allow_k_boundary = True
     return x
 
