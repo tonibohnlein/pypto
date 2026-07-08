@@ -84,6 +84,9 @@ class Ascend910BHandler : public BackendHandler {
   [[nodiscard]] int GetL0cMAlignment(const DataType& accumulator_dtype) const override {
     return accumulator_dtype == DataType::INT32 ? 32 : GetL0FractalAlignment();
   }
+  // 192KB physical UB, capped to 184KB safe (pto-isa#170 reserves ~8KB) — matches
+  // the AIV Mem record in Create910BSoC (src/backend/common/soc.cpp).
+  [[nodiscard]] uint64_t GetVectorBufferCapacityBytes() const override { return 184ULL * 1024; }
 
  private:
   Ascend910BHandler() = default;
