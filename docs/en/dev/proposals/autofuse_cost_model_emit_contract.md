@@ -157,7 +157,7 @@ its back-propagated operand tile shapes.
 |---|---|---|---|
 | A1 | compute spreads over `U = parts_m·parts_n` invocations (wave makespan) | emit ONE per-tile kernel body and launch it over the grid (`SpmdScopeStmt` + `get_block_idx` → offset), one invocation per output tile | ⚠️ mechanism honored, but the emit launches **`ceil(IM/h)·ceil(IN/w)`** invocations, NOT the priced `parts_m·parts_n` — equal for uniform grids, **divergent (fictional occupancy) for non-uniform/ragged grids** (logged not reconciled, `auto_fuse_pass.cpp:1758`) |
 | A2 | ephemeral intermediates cost **0 DDR** (fusion win) | keep intermediates **on-chip** (UB scratch), never round-trip them through DDR | ✅ honored |
-| A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to `[h,w]`; read `FIXED_1` operands in full (broadcast / reduced-axis) — `emit_strip :1343` | ⚠️ reduced-axis `FIXED_1` honored; **broadcast `FIXED_1` NOT** — model prices a pointwise-broadcast group (bias-add `[IM,IN]+[1,IN]`) as fusible (`cost :638`) but the emit **declines** any 2D broadcast operand (`auto_fuse_pass.cpp:1174`, Tier-A) → legacy tiler |
+| A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to `[h,w]`; read `FIXED_1` operands in full (broadcast / reduced-axis) — `emit_strip` | ✅ honored (G4 done, 2026-07-09). `emit_strip` slices any 2D operand per-axis: a full axis follows the tile `[sh/sw]` at `[smi/sni]`, a size-1 (broadcast/`FIXED_1`) axis stays `[1]` at offset 0; the op replay re-infers the broadcast. Covers `[1,N]` bias-add, `[M,1]` scale / reduced-axis stat, `[1,1]`. Other 2D shapes still decline. |
 | A4 | UB feasibility = peak live bands over the **pebbling order** | replay ops in `dfs_order_`; let MemoryReuse alloc/free UB per the emitted liveness | ✅ honored (order matched) |
 | A5 | roofline `max(compute, DDR)` (load k+1 overlaps compute k) | emit the per-core loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) | ⚠️ **only for non-streamed loops** — pointwise strip `:1740` is Pipeline; **streamed P1/P2 loops are `Sequential` `:1489/:1533` → serial → real latency = compute+DDR** |
 | A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a bare **sum col-reduction** sink `:1630`; else fall back to serial | ⚠️ partial — model must NOT price `S` where the emit declines it (see C2) |
@@ -336,10 +336,13 @@ the chunk buffers double-buffer; the accumulator stays single-buffered persisten
 a thin compute term; io stays ×1. Spanning-output reductions (P2 / softmax / layernorm) read the
 input twice. Fix per §5.2 — but it needs R0 first (the model must detect streaming to price it).
 
-**G4 — A3 — broadcast priced-fusible but emit-declined.** Model prices `[IM,IN]+[1,IN]` bias-add
-as fusible (`cost :638`); emit declines any 2D broadcast operand (`auto_fuse_pass.cpp:1174`,
-Tier-A) → legacy tiler. Ubiquitous in FFN/attention. Fix: implement broadcast-operand emit, or
-make the model decline broadcast groups (align the two).
+**G4 — A3 — broadcast priced-fusible but emit-declined — FIXED (2026-07-09).** The emit now
+builds a broadcast operand (one axis full, the other 1): `emit_strip` slices per-axis (full axis
+follows the tile, size-1 axis stays `[1]` at offset 0; the op replay re-infers the broadcast).
+Covers `[1,N]` bias-add (FFN/attention), `[M,1]` scale / reduced-axis stat, `[1,1]`. This also
+unblocked **G3** (its accurate pricing routes a cross-group `[M,1]` stat that the emit can now
+take), so G3's 2× read is applied unconditionally (was gated on the model-ahead flag until G4).
+Other (ragged) 2D operand shapes still decline.
 
 **G5 — A1 — grid-count divergence.** Emit launches `ceil(IM/h)·ceil(IN/w)`, model prices
 `parts_m·parts_n` (`:1465`); fictional occupancy for non-uniform/ragged grids (logged not
