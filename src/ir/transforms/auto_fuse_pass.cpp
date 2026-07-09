@@ -1473,8 +1473,14 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     auto strip_at = [&](int64_t chunk_ext, const ExprPtr& red_off, std::vector<StmtPtr>& out,
                         std::unordered_map<const Var*, VarPtr>& oc, const Stmt* stop,
                         const std::unordered_map<const Var*, VarPtr>* subs) -> VarPtr {
-      return pin_m ? emit_strip(chunk_ext, w, red_off, foff, out, oc, stop, subs)   // chunk M rows
-                   : emit_strip(h, chunk_ext, foff, red_off, out, oc, stop, subs);  // chunk N cols
+      // Free extent = free_tile (the GRANULE-ALIGNED block), NOT the solver's raw h/w. The grid
+      // strides by free_tile (foff = t*free_tile, num_free = ceil(free_ext/free_tile)); slicing only
+      // h/w here when free_tile = AlignUp(h/w, g) > h/w left the top (free_tile - h/w) rows of every
+      // block UNWRITTEN — a softmax/layernorm whose solver free tile is not g-aligned (e.g. h=3 ->
+      // free_tile=8) wrote 3 of every 8 rows (BUG-LN). free_tile is clamped to free_ext + foff is
+      // clamped in-bounds, so the wider slice never runs past the tensor.
+      return pin_m ? emit_strip(chunk_ext, free_tile, red_off, foff, out, oc, stop, subs)   // chunk M rows, free_tile N
+                   : emit_strip(free_tile, chunk_ext, foff, red_off, out, oc, stop, subs);  // free_tile M, chunk N
     };
 
     std::vector<StmtPtr> body;
