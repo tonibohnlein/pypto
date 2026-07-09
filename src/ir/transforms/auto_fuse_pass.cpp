@@ -785,23 +785,11 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
     return std::nullopt;
   }
 
-  // Clamp the output tile to the output and require clean division.
+  // Clamp the output tile to the output. The grid need NOT divide the output: the
+  // non-split path below tiles ceil(M/h) x ceil(N/w) with clamped (overlapping,
+  // idempotent) offsets — only the split-K path requires exact division.
   int64_t h = (tile.h > 0 && tile.h < M) ? tile.h : M;
   int64_t w = (tile.w > 0 && tile.w < N) ? tile.w : N;
-  if (M % h != 0 || N % w != 0) {
-    // Non-uniform spatial grid (the "matmul-tiling gap"): the solver's balanced
-    // parts_m x parts_n partition has ragged regions, so w/h (the MAX region extent)
-    // does not divide the output. v1 declines -> a single UNTILED InCore scope (correct
-    // values, but the solver's parallel grid is dropped). Instrumented log-only so its
-    // frequency is visible during the bake; the ceil+clamp grid decode replaces it next.
-    LOG_INFO << "AutoFuse[matmul]: non-uniform spatial grid decline — output [" << M << "," << N
-             << "] not divisible by tile [" << h << "," << w << "] (parts_m=" << tile.parts_m
-             << ",parts_n=" << tile.parts_n << ",split=" << tile.split
-             << "); runs untiled InCore (uniform-grid only in v1, ceil+clamp decode deferred)";
-    return std::nullopt;
-  }
-  const int64_t num_m = M / h;
-  const int64_t num_n = N / w;
 
   const Span sp = assign->span_;
   const std::string base = c_var->name_hint_;
@@ -814,8 +802,20 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   // into the SAME output region, so they merge correctly under concurrency
   // (tensor.assemble atomic=1 -> pto.tstore atomicType=kAdd -> HW SetAtomicAdd).
   if (tile.split > 1 && K % tile.split == 0) {
+    // Split-K STAYS divisor-only: the S partials atomic-ADD into a shared output tile, so
+    // a ceil+clamp grid (whose ragged blocks OVERLAP the previous) would DOUBLE-COUNT the
+    // overlap under the atomic add. Require exact division; a non-uniform split-K grid
+    // declines to an untiled InCore scope (correct values, the parallel grid dropped).
+    if (M % h != 0 || N % w != 0) {
+      LOG_INFO << "AutoFuse[matmul]: split-K non-uniform grid decline — atomic-add cannot "
+                  "overlap-recompute; output [" << M << "," << N << "] not divisible by tile ["
+               << h << "," << w << "] (split=" << tile.split << "); runs untiled InCore";
+      return std::nullopt;
+    }
     const int64_t S = tile.split;
     const int64_t ksz = K / S;
+    const int64_t num_m = M / h;
+    const int64_t num_n = N / w;
     const int64_t num_tiles = num_m * num_n;
     auto& reg = OpRegistry::GetInstance();
     auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
@@ -875,6 +875,22 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
     return std::vector<StmtPtr>{c_init_assign, seed_scope, scope};
   }
 
+  // Non-split spatial grid — CEIL+CLAMP (G-A). The solver's balanced parts_m x parts_n
+  // partition may have ragged regions (w/h = the MAX region extent), so the grid need not
+  // divide the output. Emit num_m x num_n = ceil(M/h) x ceil(N/w) blocks (>= the priced
+  // parts count, so coverage holds) and CLAMP each block's offset in-bounds below; every
+  // block is then a FULL [h,w] tile whose ragged blocks OVERLAP the previous. The spatial
+  // assemble is NON-atomic (a plain tile.store), so the overlap recomputes the SAME value
+  // -> idempotent, numerically correct (mirrors the vector emit_strip ceil+clamp). parts
+  // drives the block count so emitted blocks track the priced parts_m*parts_n; ceil <=
+  // parts, so max() keeps coverage while honoring the priced grid.
+  const int64_t num_m = std::max<int64_t>(tile.parts_m, CeilDiv(M, h));
+  const int64_t num_n = std::max<int64_t>(tile.parts_n, CeilDiv(N, w));
+  if ((tile.parts_m > 0 && num_m != tile.parts_m) || (tile.parts_n > 0 && num_n != tile.parts_n))
+    LOG_INFO << "AutoFuse[matmul]: group '" << name << "' emitted grid " << num_m << "x" << num_n
+             << " diverges from solver parts " << tile.parts_m << "x" << tile.parts_n
+             << " (ceil > parts -> coverage-safe bump; occupancy only, same max-extent critical path)";
+
   // The solver's tile is the whole output: no output loop — just the k-pipeline
   // (writing directly into the original output var), wrapped in one InCore kernel.
   if (num_m == 1 && num_n == 1) {
@@ -908,8 +924,15 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   // single loop var; nested chunk-outer loops collide in the orchestration codegen's
   // variable naming.
   auto t = std::make_shared<Var>(base + "_t", index_type, sp);
-  auto mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
-  auto ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+  // Clamp the ceil-grid offsets in-bounds: a ragged (or over-tiled parts>ceil) block's raw
+  // offset mt*h can exceed M-h, so pin it to M-h -> the block reads a full [h,w] tile that
+  // OVERLAPS the previous. The spatial assemble is non-atomic (tile.store), so the overlap
+  // recomputes the same value (idempotent). A grid that divides exactly (num_m*h == M) skips
+  // the clamp -> byte-identical to the pre-ceil emit.
+  ExprPtr mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
+  ExprPtr ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
+  if (num_m * h > M) mi = MakeMin(mi, MakeIndex(M - h, sp), sp);
+  if (num_n * w > N) ni = MakeMin(ni, MakeIndex(N - w, sp), sp);
   // Per-tile body: compute the [h,w] tile (k-pipeline) and assemble it into the shared
   // output. Each SPMD core runs ONE tile (selected by get_block_idx, prepended by SpmdWrap)
   // and writes its disjoint [h,w] region, binding c_var (no IterArg/Yield -- data-parallel).
@@ -1128,21 +1151,6 @@ static std::nullopt_t GenericDeclineB(const std::string& reason, const Span& spa
         << " — the solver produced a plan the v1 emitter contract forbids "
            "(PYPTO_AUTOFUSE_STRICT is on).";
   }
-  return std::nullopt;
-}
-
-// A CAPABILITY decline — distinct from both Tier-A (silent "not my scope") and Tier-B
-// (illegal plan). The solver LEGITIMATELY produced this plan, but a v1 emitter rule to
-// realize it faithfully is deferred, so we fall back to a correct-but-lower-fidelity
-// path (typically an untiled InCore scope, ignoring the solver's parallel grid). This
-// is NOT a correctness bug — the fallback computes the right values — but it IS a
-// fidelity gap (the costed parallel schedule is not realized), so it is worth SEEING.
-// Logged (not silent) so the bake window can measure how often the solver's grid is
-// dropped, feeding the priority of the deferred rule; NEVER asserts (it is expected,
-// and common — e.g. non-uniform parts_m/parts_n grids), so strict mode does not abort.
-static std::nullopt_t GenericDeclineCap(const std::string& reason) {
-  LOG_INFO << "AutoFuse[generic] CAPABILITY decline (plan not faithfully tiled, runs "
-              "lower-fidelity fallback): " << reason;
   return std::nullopt;
 }
 
@@ -1909,22 +1917,11 @@ std::optional<std::vector<StmtPtr>> EmitLoneMatmulGeneric(const AssignStmtPtr& a
       return GenericDeclineB("split-K does not fractal-partition K (split ∤ K/16, A3/SR7)", assign->span_);
   }
 
-  // Capability — non-uniform grid: when the solver chose a parts_m/parts_n grid (parts_*>0),
-  // w/h are the MAX region extents and the balanced partition has some smaller regions
-  // (extents differ by <=1 fractal). The v1 emitter tiles only UNIFORM grids: TileMatmul
-  // guards `M%h==0 && N%w==0` (line ~640) and safely declines a non-uniform grid to a
-  // single UNTILED InCore scope — correct values, but the solver's parallel parts×split
-  // grid is not realized (a fidelity gap, not a correctness bug: there is NO tail-dropping,
-  // the guard prevents it). Faithfully realizing the balanced grid needs the AxisPartition
-  // decode (deferred, P2). Surface it so we can measure how often it happens; do not abort.
-  // parts_*==0 (uniform/ad-hoc tile) => w/h are exact divisors => M%h==0, guard never fires.
-  const int64_t mh = (tile.h > 0 && tile.h < M) ? tile.h : M;
-  const int64_t mw = (tile.w > 0 && tile.w < N) ? tile.w : N;
-  if ((mh < M && M % mh != 0) || (mw < N && N % mw != 0))
-    return GenericDeclineCap("non-uniform spatial grid (parts_m=" + std::to_string(tile.parts_m) +
-                             ",parts_n=" + std::to_string(tile.parts_n) +
-                             "): runs untiled (uniform-grid only in v1, P2 decode deferred)");
-
+  // Non-uniform grid is now REALIZED (G-A): TileMatmul's non-split path tiles a
+  // ceil(M/h) x ceil(N/w) grid with clamped (overlapping, idempotent) offsets, so a
+  // parts_m/parts_n grid whose max-extent w/h does not divide the output is faithfully
+  // emitted rather than declined. The split-K path stays divisor-only (its atomic-add
+  // merge cannot tolerate the clamp overlap); TileMatmul declines that case internally.
   auto tiled = TileMatmul(assign, tile, name);  // MatMul rule body: grid + split-K seed + k-pipeline
   if (!tiled) return std::nullopt;
   LOG_INFO << "AutoFuse[generic]: matmul group '" << name << "' tiled by the generic driver (split="
