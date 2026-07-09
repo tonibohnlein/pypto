@@ -487,10 +487,30 @@ class TestAutoFuse:
                 c: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(a)
                 return c
 
+        @pl.program
+        class ColMax:  # reduce M, MAX-merge on SIGNED data; [256,128] streams — guards merge-op
+            @pl.function(attrs={"auto_fuse": True})
+            def cm(self, a: pl.Tensor[[256, 128], pl.FP32]) -> pl.Tensor[[1, 128], pl.FP32]:
+                c: pl.Tensor[[1, 128], pl.FP32] = pl.col_max(a)
+                return c
+
+        @pl.program
+        class RowSum:  # reduce N, add-merge; bare row reduction — guards the reduced AXIS
+            @pl.function(attrs={"auto_fuse": True})
+            def rs(self, a: pl.Tensor[[128, 256], pl.FP32]) -> pl.Tensor[[128, 1], pl.FP32]:
+                c: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(a)
+                return c
+
         x_cs = torch.arange(256 * 128, dtype=torch.float32).reshape(256, 128) * 0.01
         _numeric(ColSum, "cs", x_cs, x_cs.sum(dim=0, keepdim=True))
         x_rm = (torch.arange(128 * 256, dtype=torch.float32).reshape(128, 256) % 97) - 48.0
         _numeric(RowMax, "rm", x_rm, x_rm.max(dim=1, keepdim=True).values)
+        # col_max: MAX-merge (not add) on signed data — a sum would flip the sign of the answer.
+        x_cm = (torch.arange(256 * 128, dtype=torch.float32).reshape(256, 128) % 97) - 48.0
+        _numeric(ColMax, "cm", x_cm, x_cm.max(dim=0, keepdim=True).values)
+        # bare row_sum: reduces N (width), not M — a wrong-axis reduction gives [128,1] of Σ over M.
+        x_rs = torch.arange(128 * 256, dtype=torch.float32).reshape(128, 256) * 0.01
+        _numeric(RowSum, "rs", x_rs, x_rs.sum(dim=1, keepdim=True))
 
     def test_streamed_reduction_apply_p2(self, ascend_backend, monkeypatch):
         """P2: a POINTWISE sink consuming a single reduction (x - row_max(x), rmsnorm) whose output
