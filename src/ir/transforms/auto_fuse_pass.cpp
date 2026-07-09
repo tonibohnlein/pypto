@@ -361,6 +361,14 @@ class ProblemBuilder {
     problem.l0_tile_m = kL0TileM;
     problem.l0_tile_n = kL0TileN;
     problem.vec_reg_bytes = kVecRegBytes;
+    // DMA-block granule (bytes) from the backend handler — keeps the cost model's tile-footprint
+    // padding (vector_peak_ub) in lockstep with the emit's AlignUp tile allocation so a thin free
+    // axis is not under-counted as UB-feasible (BUG-G1THRESH). Falls back to the field default (32).
+    {
+      const auto* pctx = PassContext::Current();
+      const auto* h = pctx ? pctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+      if (h != nullptr) problem.vec_dma_align_bytes = h->GetVectorDmaAlignmentBytes();
+    }
     problem.vec_op_head = kVecOpHead;
     problem.vec_op_tail = kVecOpTail;
     problem.vec_slope_pw = kVecSlopePw;
@@ -1273,6 +1281,23 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   INTERNAL_CHECK(handler) << "Internal error: BackendHandler is null in AutoFuse generic emit";
   const int64_t p1_dtb = std::max<int64_t>(1, static_cast<int64_t>(dtype.GetBit()) / 8);
   const int64_t p1_ub = static_cast<int64_t>(handler->GetVectorBufferCapacityBytes());
+  // Vector DMA-block granule (elements): a tile's contiguous-axis byte extent must be a multiple of
+  // GetVectorDmaAlignmentBytes() (32), so the emit allocates AlignUp(extent, g)-padded tiles. Use
+  // the MAX granule over the group's dtypes (= smallest dtype_bytes): a mixed FP16/FP32 chain must
+  // satisfy FP16's 16-element block, which also satisfies FP32's 8. FP32 -> 8, FP16 -> 16. Computed
+  // HERE (not only at the emit below) because the materialize-vs-stream trigger must count the
+  // PADDED tile — the same footprint the cost model's vector_peak_ub prices. Without it a thin free
+  // axis (an M-tile of 3 -> 8, ~2.7x) is under-counted, materializes an over-UB tile, and overflows
+  // AllocateMemoryAddr (BUG-G1THRESH). See ascend910b_cost.cpp vector_peak_ub for the model side.
+  int64_t min_dtype_bits = static_cast<int64_t>(dtype.GetBit());
+  for (const auto& a : ops) {
+    if (auto tt = As<TensorType>(a->var_->GetType()))
+      min_dtype_bits = std::min(min_dtype_bits, static_cast<int64_t>(tt->dtype_.GetBit()));
+    for (const ExprPtr& arg : As<Call>(a->value_)->args_)
+      if (auto att = As<TensorType>(arg->GetType()))
+        min_dtype_bits = std::min(min_dtype_bits, static_cast<int64_t>(att->dtype_.GetBit()));
+  }
+  const int64_t g = std::max<int64_t>(1, handler->GetVectorDmaAlignmentBytes() / ((min_dtype_bits + 7) / 8));
   int p1_nreds = 0;
   bool p1_red_sum_or_max = false;  // the single reduction's family (sum/max = the on-core merges)
   for (const auto& a : ops)
@@ -1287,8 +1312,12 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // Common gate: exactly one reduced axis, one sum/max reduction (single level). P1 = the reduction
   // IS the sink (bare reduction). P2 = a pointwise sink CONSUMES the reduction (rmsnorm / x-row_max);
   // its output spans the reduced axis, so the final apply chunks it. >1 reduction / level>=2 = P3.
+  // Materialize-vs-stream: does the pinned reduced-axis tile fit UB? Count the GRANULE-PADDED
+  // allocation (AlignUp(h,g) x AlignUp(w,g)) — the emit's real footprint, matching the cost model.
+  // The unpadded 2*h*w under-counts a thin free axis (M-tile 3, ~2.7x) and would materialize an
+  // over-UB tile (BUG-G1THRESH). Reductions pad both axes (col-major tile).
   const bool stream_ok = has_reduction && (pin_m != pin_n) && sinks.size() == 1 && p1_nreds == 1 &&
-                         p1_red_sum_or_max && (2 * h * w * p1_dtb > p1_ub);
+                         p1_red_sum_or_max && (2 * AlignUp(h, g) * AlignUp(w, g) * p1_dtb > p1_ub);
   const bool stream_p1 = stream_ok && sink_is_reduction;
   const bool stream_p2 = stream_ok && !sink_is_reduction;
 
@@ -1346,24 +1375,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   if (IM % h != 0) mi = MakeMin(mi, MakeIndex(IM - h, sp), sp);
   if (IN % w != 0) ni = MakeMin(ni, MakeIndex(IN - w, sp), sp);
 
-  // Vector DMA-block granule (elements): a vector (none_box) tile's contiguous-axis byte
-  // extent must be a multiple of GetVectorDmaAlignmentBytes() (32). Pad each ragged tile
-  // axis up to this granule in the ALLOCATED shape while keeping the valid/compute extent
-  // ragged (the tile.load 4th arg). Use the MAX granule over the group's dtypes (= smallest
-  // dtype_bytes) since type inference forces every tile in the chain to share the padded
-  // extent: a mixed FP16/FP32 chain must satisfy the FP16 16-element block, which also
-  // satisfies FP32's 8-element one. FP32 -> 8, FP16 -> 16.
-  int64_t min_dtype_bits = static_cast<int64_t>(dtype.GetBit());
-  for (const auto& a : ops) {
-    if (auto tt = As<TensorType>(a->var_->GetType()))
-      min_dtype_bits = std::min(min_dtype_bits, static_cast<int64_t>(tt->dtype_.GetBit()));
-    for (const ExprPtr& arg : As<Call>(a->value_)->args_)
-      if (auto att = As<TensorType>(arg->GetType()))
-        min_dtype_bits = std::min(min_dtype_bits, static_cast<int64_t>(att->dtype_.GetBit()));
-  }
-  const int64_t g = std::max<int64_t>(1, handler->GetVectorDmaAlignmentBytes() / ((min_dtype_bits + 7) / 8));
-
-  // Reduced-axis padding is now ALLOWED. The original §4.4 concern — a reduction over a ragged
+  // Vector DMA-block granule `g` (elements) is computed above (before the stream trigger) so the
+  // materialize-vs-stream decision counts the padded tile. Reduced-axis padding is now ALLOWED. The original §4.4 concern — a reduction over a ragged
   // reduced axis pads the reduced axis, leaving uninitialized lanes that feed the sum — is
   // resolved: a device experiment on Ascend 910B proved pto.trowsum / pto.tcolsum bound the
   // reduction by the tile's `valid` extent, not the physical (padded) extent (a poison value in
