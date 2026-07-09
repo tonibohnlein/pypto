@@ -314,6 +314,14 @@ class ProblemBuilder {
     problem.vec_op_tail = kVecOpTail;
     problem.vec_slope_pw = kVecSlopePw;
     problem.vec_slope_reduce = kVecSlopeReduce;
+    // BUILDABLE mode: a streamed MULTI-reduction group (softmax/layernorm: >1 reduction over
+    // the streamed axis) is not yet emittable — the emit streams only a single reduction (P1/P2),
+    // and the online multi-reduction path (P4) is not built. Mark such groups infeasible so the
+    // partitioner cuts them into single-reduction (streamable) + pointwise pieces (an unfused
+    // softmax IS buildable) rather than fusing a group the emit can only lower to an over-UB tile
+    // (G1: was a hard AllocateMemoryAddr failure). (split-K stays model-ahead: its emit declines
+    // an unrealizable split gracefully to serial; multi-reduction streaming has no such fallback.)
+    problem.allow_model_ahead_multi_reduction_stream = false;
 
     // 1. In AND InOut params are graph-input tensors: both are READ by the body. An InOut param
     //    is also written, but its updated value is a SEPARATE SSA tensor produced by a compute op
@@ -1670,6 +1678,23 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   if (tile.split > 1)
     LOG_INFO << "AutoFuse[generic]: group '" << name << "' costed split=" << tile.split
              << " NOT realized (only a bare col_sum sink splits) -> emitting SERIAL (split=1)";
+
+  // G1 (emit defense): a MULTI-reduction group (softmax/layernorm: >1 reduction over the reduced
+  // axis) that reached the materialized path pins its reduced axis FULL. If even the thinnest tile
+  // — one free lane over the full reduced axis, one band per op — overflows UB, no materialized
+  // tiling fits and the emit cannot stream it (streaming handles a SINGLE reduction only; the
+  // online multi-reduction path P4 is not built). The BUILDABLE cost model marks such groups
+  // infeasible so the solver cuts them (an unfused softmax IS buildable); this is defense-in-depth
+  // for an analytic plan that slips through — decline to the legacy tiler rather than emit an
+  // over-UB tile that fails downstream at AllocateMemoryAddr. Small multi-reduction groups (the
+  // thinnest tile fits) and single-reduction streamed groups (returned above) are unaffected.
+  if (has_reduction && p1_nreds > 1 && (pin_m || pin_n)) {
+    const int64_t g1_red = pin_m ? IM : IN;  // pinned reduced axis (full)
+    if (static_cast<int64_t>(ops.size()) * g1_red * p1_dtb > p1_ub)
+      return GenericDeclineB("streamed multi-reduction (softmax/layernorm) over a reduced axis too "
+                             "large for UB — the online multi-reduction path (P4) is not yet built; "
+                             "declining to the legacy tiler", out_stmt->span_);
+  }
 
   // Software-pipelining: chunk the FREE axis into strips and emit a ForKind::Pipeline loop threading
   // the output through ONE iter_arg, so LowerPipelineLoops (unroll+tag) + CanonicalizeIOOrder (cluster
