@@ -140,9 +140,14 @@ VarPtr MakeFreshVar(const VarPtr& original, const std::string& suffix) {
 /// on the *producer* op, not on `Mem.Acc`: a data-movement op that also targets
 /// Acc (e.g. `tile.extract(..., target_memory=Acc)`) is a real per-stage buffer
 /// that overlaps across stages, so it stays tagged like any other loaded operand.
+///
+/// One loop *does* tag its cube accumulator: the moving loop of a dbC=2
+/// double-buffered-L0C emit (kPipelineDoubleBufferCAttr), which genuinely co-lives
+/// two accumulators. See `loop_double_buffers_c_` in the tagger.
 class PipelineMembershipTagger : public IRMutator {
  public:
-  PipelineMembershipTagger(int32_t group, int32_t stage) : group_(group), stage_(stage) {}
+  PipelineMembershipTagger(int32_t group, int32_t stage, bool loop_double_buffers_c)
+      : group_(group), stage_(stage), loop_double_buffers_c_(loop_double_buffers_c) {}
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     // Recurse first so nested control flow (e.g. an inner lowered pipeline) is
@@ -163,8 +168,19 @@ class PipelineMembershipTagger : public IRMutator {
     // on `Mem.Acc` alone: a data-movement op that also targets Acc (e.g.
     // `tile.extract(..., target_memory=Acc)`) is a genuine per-stage buffer that
     // overlaps across stages and must keep its membership.
+    //
+    // The dbC=2 exception (loop_double_buffers_c_): the moving loop that carries
+    // kPipelineDoubleBufferCAttr *does* co-live two accumulators — tile i's FIXPIPE
+    // drain overlaps tile i+1's MAD — so its accumulator DOES need this loop's
+    // (group, stage) to double-buffer. Only that loop tags it; every enclosing
+    // pipeline loop still skips it (the outer loop double-buffers operands, but the
+    // MADs writing successive outer-stage accumulators still serialize on the one
+    // cube). The result is a flat depth-2 membership from the dbC loop alone, so the
+    // PyPTO capacity-gate (#1475) allocates exactly the two co-live L0C buffers
+    // rather than the per-loop cross-product it would shed back to one.
     const bool is_cube_matmul = call->op_ && call->op_->name_.rfind("tile.matmul", 0) == 0;
-    if (is_cube_matmul && tile_type->GetMemorySpace() == MemorySpace::Acc) return visited;
+    const bool is_cube_accumulator = is_cube_matmul && tile_type->GetMemorySpace() == MemorySpace::Acc;
+    if (is_cube_accumulator && !loop_double_buffers_c_) return visited;
 
     auto packed = call->GetAttr<std::string>(kPipelineMembershipAttr, std::string());
     packed = AppendPipelineMembership(packed, group_, stage_);
@@ -178,6 +194,7 @@ class PipelineMembershipTagger : public IRMutator {
  private:
   int32_t group_;
   int32_t stage_;
+  bool loop_double_buffers_c_;
 };
 
 std::pair<StmtPtr, std::vector<ExprPtr>> SplitBodyYield(const StmtPtr& body) {
@@ -334,8 +351,11 @@ class LowerPipelineMutator : public IRMutator {
           << "Internal error: loop body must yield " << op->iter_args_.size() << " values for iter_args, got "
           << cloned_yields.size();
       // Tag this clone's tile definitions with (group, stage=k) so MemoryReuse
-      // keeps the F clones' buffers apart (explicit ping-pong constraint).
-      PipelineMembershipTagger tagger(group, static_cast<int32_t>(k));
+      // keeps the F clones' buffers apart (explicit ping-pong constraint). A dbC=2
+      // loop additionally tags its cube accumulator (co-live drain ping-pong); every
+      // other pipeline loop leaves cube accumulators untagged (see the tagger).
+      const bool loop_double_buffers_c = op->GetAttr<bool>(kPipelineDoubleBufferCAttr, false);
+      PipelineMembershipTagger tagger(group, static_cast<int32_t>(k), loop_double_buffers_c);
       cloned_stmts = tagger.VisitStmt(cloned_stmts);
       clones.push_back(cloned_stmts);
       prev_yields = std::move(cloned_yields);
