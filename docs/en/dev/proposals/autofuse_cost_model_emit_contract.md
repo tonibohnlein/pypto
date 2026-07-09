@@ -350,9 +350,15 @@ declines (bare-`col_sum`-only, `:1630`). Bounded, unmeasured; left as-is pending
 
 ### Minor / doc-completeness
 
-- **Granule-padding feasibility fiction:** emit allocates `AlignUp(sh,g)×AlignUp(sw,g)` tiles
-  (`:1359`); cost uses unpadded `min(cfg,dim)` (`:1256`) → emitted UB can exceed the costed peak
-  on the reduction row axis (`grid_gran_h_ = 1`). Secondary but real.
+- **Granule-padding feasibility fiction — FIXED (2026-07-09, BUG-G1THRESH).** The emit allocates
+  `AlignUp(sh,g)×AlignUp(sw,g)` tiles (`g = vec_dma_align_bytes / group_min_dtype_bytes`); the cost
+  model's `vector_peak_ub::tile_bytes` used unpadded `min(cfg,dim)`, so a thin free axis (M-tile
+  3→8, ~2.7×) was under-counted → an over-UB group looked materializable → the emit overflowed
+  `AllocateMemoryAddr` (softmax/layernorm N=4096/8192). Both `vector_peak_ub` AND the emit's own
+  materialize-vs-stream trigger now count the padded footprint (via `Problem::vec_dma_align_bytes`,
+  sourced from `BackendHandler::GetVectorDmaAlignmentBytes`), so model and emit agree: width always
+  padded, height padded for reductions (col-major). This also makes the streamed-chunk sizing
+  granule-faithful — closing most of R3.
 - `dfs_order_` is a greedy topo-tie-break heuristic, not a provably-minimal pebbling.
 - §1's pointwise compute omits the `+16` count-mode floor charged when `width % epr != 0` (`:90`).
 
