@@ -684,7 +684,16 @@ std::vector<StmtPtr> BuildTileMatmul(const ExprPtr& a, const ExprPtr& b, const E
       {"a_trans", false}, {"b_trans", false}, {"c_matrix_nz", false}, {"out_dtype", dtype}};
   const std::vector<std::pair<std::string, std::any>> acc_kw = {{"a_trans", false}, {"b_trans", false}};
 
-  if (k <= 0 || K % k != 0 || K / k < 2) {
+  const int64_t num_full = (k > 0) ? K / k : 0;         // full k-strips
+  const int64_t tail = (k > 0) ? K - num_full * k : K;  // ragged remainder (0 if k | K)
+  const bool peel = (tail > 0);
+
+  // No k-pipeline when: no k tile, fewer than 2 full strips, or a ragged tail that is not
+  // a 16-fractal. We do NOT build a masked fractional-K matmul (matching AutoTileMatmulL0
+  // PH-AT-007); a single matmul over the full K handles those (AutoTileMatmulL0 declines it
+  // if K itself is not 16-aligned). Since the solver's k is 16-aligned, tail = K mod k is
+  // 16-aligned EXACTLY when K is, so tail % 16 == 0 is the "K 16-aligned" peel gate.
+  if (k <= 0 || num_full < 2 || (peel && tail % 16 != 0)) {
     // No k-pipeline (one strip): a single matmul over the full K for this tile.
     auto at = reg.Create("tensor.slice", {a, MakeIndexTuple({h, K}, sp), MakeTuple2(mi, MakeIndex(0, sp), sp)}, sp);
     auto av = std::make_shared<Var>(base + "_a_t", at->GetType(), sp);
@@ -731,10 +740,27 @@ std::vector<StmtPtr> BuildTileMatmul(const ExprPtr& a, const ExprPtr& b, const E
   StmtPtr body = SeqStmts::Flatten(std::vector<StmtPtr>{a_k_assign, b_k_assign, if_stmt, body_yield}, sp);
 
   std::vector<std::pair<std::string, std::any>> loop_attrs = {{kPipelineStagesAttr, /*stages=*/2}};
-  auto for_stmt = std::make_shared<ForStmt>(ko, MakeIndex(0, sp), MakeIndex(K, sp), MakeIndex(k, sp),
-                                            std::vector<IterArgPtr>{c_iter}, body, std::vector<VarPtr>{out_var},
+  // The pipeline runs over the num_full FULL strips [0, num_full*k). When K divides (tail==0)
+  // the loop binds out_var directly — byte-identical to the pre-peel emit. When K is ragged
+  // (tail>0), the loop binds an intermediate and a matmul_acc tail folds the last
+  // [h,tail]@[tail,w] partial into it, producing out_var.
+  const VarPtr loop_out = peel ? std::make_shared<Var>(base + "_kloop", then_call->GetType(), sp) : out_var;
+  auto for_stmt = std::make_shared<ForStmt>(ko, MakeIndex(0, sp), MakeIndex(num_full * k, sp), MakeIndex(k, sp),
+                                            std::vector<IterArgPtr>{c_iter}, body, std::vector<VarPtr>{loop_out},
                                             sp, ForKind::Pipeline, std::move(loop_attrs));
-  return {acc_assign, for_stmt};
+  if (!peel) return {acc_assign, for_stmt};
+
+  // Ragged-K tail: matmul_acc the final [h,tail]@[tail,w] partial (at K-offset num_full*k)
+  // into the pipeline result. tail is 16-aligned (gated above), so this is a valid fractal
+  // matmul, not a masked fractional-K one.
+  const int64_t k_tail = num_full * k;  // element offset of the tail strip
+  auto at = reg.Create("tensor.slice", {a, MakeIndexTuple({h, tail}, sp), MakeTuple2(mi, MakeIndex(k_tail, sp), sp)}, sp);
+  auto av = std::make_shared<Var>(base + "_a_tl", at->GetType(), sp);
+  auto bt = reg.Create("tensor.slice", {b, MakeIndexTuple({tail, w}, sp), MakeTuple2(MakeIndex(k_tail, sp), ni, sp)}, sp);
+  auto bv = std::make_shared<Var>(base + "_b_tl", bt->GetType(), sp);
+  auto tail_mm = reg.Create("tensor.matmul_acc", {ExprPtr(loop_out), av, bv}, acc_kw, sp);
+  return {acc_assign, for_stmt, std::make_shared<AssignStmt>(av, at, sp),
+          std::make_shared<AssignStmt>(bv, bt, sp), std::make_shared<AssignStmt>(out_var, tail_mm, sp)};
 }
 
 // Distribute a per-tile `body` across the AI cores via SPMD. Replaces the retired
