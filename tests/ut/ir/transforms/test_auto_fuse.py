@@ -202,16 +202,19 @@ class TestAutoFuse:
         cube_mlir = codegen.PTOCodegen().generate(ir.Program([cube], cube.name, cube.span))
         assert "cube" in cube_mlir and "atomic_add" in cube_mlir  # split-K merge
 
-    def test_nonuniform_matmul_declines_to_untiled_incore(self, ascend_backend):
-        """A matmul whose solver tile does NOT divide the output declines to a single
-        untiled InCore scope (the "matmul-tiling gap").
+    def test_nonuniform_matmul_tiles_via_ceil_clamp_grid(self, ascend_backend):
+        """A matmul whose solver tile does NOT divide the output tiles via a ceil+clamp
+        SPMD grid (the G-A fix for the "matmul-tiling gap").
 
         Pinned to Ascend910B: for ``[272,272]`` the grounded solver picks a non-uniform
-        ``80x144`` spatial grid (``272 % 80 != 0``), which the v1 emitter cannot realize
-        with an exact-division grid, so ``TileMatmul`` declines and the matmul falls back
-        to ONE untiled ``CORE_GROUP`` InCore scope — correct values, but the solver's
-        parallel grid is dropped (no ``pl.spmd`` tiling, no per-tile slice). This pins
-        TODAY's fallback; the ceil+clamp grid decode (next increment) tiles it instead.
+        ``80x144`` spatial grid (``272 % 80 != 0``, ``272 % 144 != 0``, parts 2x4). Instead
+        of declining to one untiled InCore scope (the old fallback), the emitter realizes a
+        ``ceil(272/144) x ceil(272/80) = 2x4 = 8``-block ``pl.spmd(8)`` grid whose per-block
+        offsets are CLAMPED in-bounds (``pl.min(mt*144, 128)`` / ``pl.min(nt*80, 192)``). Every
+        block reads a full ``[144,80]`` tile; the ragged blocks OVERLAP the previous, and the
+        NON-atomic spatial assemble recomputes the overlap identically (idempotent), so the
+        result is exact. This mirrors the vector ``emit_strip`` ceil+clamp. split=1 here, so no
+        zero-seed and no ``atomic`` merge (split-K stays divisor-only).
         """
 
         @pl.program
@@ -226,12 +229,59 @@ class TestAutoFuse:
                 return c
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "mm").as_python()
-        # Non-uniform grid -> untiled: one plain InCore (CORE_GROUP) scope, no SPMD tiling,
-        # no per-tile K/output slicing. The lone matmul runs whole in one core.
-        assert "pl.spmd(" not in body
-        assert "pl.at(level=pl.Level.CORE_GROUP" in body
-        assert body.count("pl.tensor.matmul(") == 1
-        assert "pl.tensor.slice(" not in body
+        # Ceil+clamp grid: a single flat 8-block SPMD loop (2x4), NOT an untiled CORE_GROUP scope.
+        assert "pl.spmd(8" in body and body.count("pl.spmd(") == 1
+        assert "pl.at(level=pl.Level.CORE_GROUP" not in body
+        # Per-block: sliced [144,80] operands, one tile matmul, clamped offsets (pl.min),
+        # non-atomic assemble (split=1 -> no split-K seed, no atomic merge).
+        assert "pl.tensor.slice(" in body and body.count("pl.tensor.matmul(") == 1
+        assert "pl.min(" in body  # in-bounds offset clamp for the ragged (ceil) blocks
+        assert "AtomicType" not in body and "pl.tensor.full(" not in body
+
+        # Lowers end-to-end to a single cube (AIC) kernel — the clamped offsets survive the
+        # full pipeline (the ragged-grid emit is not just structurally present but lowerable).
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
+        assert str(incores[0].func_type) == "FunctionType.AIC"
+
+    def test_nonuniform_matmul_ceil_clamp_is_numerically_correct(self, ascend_backend):
+        """The ceil+clamp non-uniform grid computes the same result as a plain matmul.
+
+        ``torch_codegen(..., run_all_spmd_blocks=True)`` runs all blocks of the ragged grid
+        serially into the shared (non-atomic) output; the overlapping ceil blocks recompute
+        their region identically, so the whole ``[272,272]`` result must match ``torch.matmul``
+        to fp32 tolerance. Verifies the tiling, clamped slicing, and idempotent overlap are
+        numerically faithful, not just structurally present. A second non-square shape
+        (``[272,272]@[272,240]``) exercises an independent M/N clamp.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        def _check(M: int, K: int, N: int) -> None:
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mm(
+                    self,
+                    a: pl.Tensor[[M, K], pl.FP32],
+                    b: pl.Tensor[[K, N], pl.FP32],
+                ) -> pl.Tensor[[M, N], pl.FP32]:
+                    c: pl.Tensor[[M, N], pl.FP32] = pl.matmul(a, b)
+                    return c
+
+            namespace: dict = {}
+            exec(torch_codegen(passes.auto_fuse()(Prog), run_all_spmd_blocks=True), namespace)  # noqa: S102
+            torch.manual_seed(0)
+            a = torch.randn(M, K, dtype=torch.float32)
+            b = torch.randn(K, N, dtype=torch.float32)
+            out = namespace["mm"](a, b)
+            assert torch.allclose(out, a @ b, rtol=1e-4, atol=1e-4), (
+                f"[{M},{K}]@[{K},{N}]: max abs diff {(out - a @ b).abs().max().item():.3e}"
+            )
+
+        _check(272, 272, 272)  # square non-divisor: 2x4 ceil grid, clamp on both axes
+        _check(272, 272, 240)  # non-square non-divisor: independent M/N clamp
 
     def test_single_pointwise_tiles_across_vector_cores(self, ascend_backend):
         """A large pointwise op is tiled into the solver's `[w,h]` regions and
