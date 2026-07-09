@@ -1964,9 +1964,10 @@ std::optional<std::vector<StmtPtr>> EmitLoneMatmulGeneric(const AssignStmtPtr& a
 // `C_tile = T_band @ D[:, ni:ni+w]` ([h,w]). MM1 keeps the DDR<->L1 k-pipeline
 // (its operands stream from DDR); MM2 is a single matmul (its left operand T_band
 // is already on-chip). Returns nullopt if the pair is not a default-orientation
-// static-shape chain or the tile does not divide the output. Constraint: the
-// per-tile T_band (MM1's output) must fit L0c — larger intermediates need the
-// AutoTileMatmulL0 M/N-tiling work. TODO: share the wrapper with TileMatmul.
+// static-shape chain or the tile does not divide the output. When the per-tile
+// T_band [h,K2] exceeds L0c, DEEP-T (G-B) tiles the shared K2 into panels so MM2
+// becomes a matmul_acc chain and only [h,k2p] is on-chip at a time (declines if no
+// 16-aligned divisor panel fits L0c). TODO: share the wrapper with TileMatmul.
 std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1,
                                                       const AssignStmtPtr& mm2, SolverTile tile,
                                                       const std::string& name) {
@@ -2008,18 +2009,70 @@ std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1,
   const std::string base = c_var->name_hint_;
   auto& reg = OpRegistry::GetInstance();
 
+  // Deep-T (G-B): the per-tile intermediate T_band [h,K2] (MM1's output) must fit L0c.
+  // When it exceeds L0c, tile the SHARED dimension K2 into panels of `k2p` (each T_panel
+  // [h,k2p] fits L0c): MM1 computes T_panel = A[mi:mi+h,:] @ B[:, k2o:k2o+k2p]; MM2
+  // ACCUMULATES T_panel @ D[k2o:k2o+k2p, ni:ni+w] into the output tile via matmul_acc, so
+  // T never fully materializes (only [h,k2p] is on-chip at a time). k2p is the largest
+  // 16-aligned DIVISOR of K2 that fits L0c; if none fits, decline (the whole-output fused
+  // scope still computes correctly with T on-chip — the current fallback).
+  const int64_t dtb = std::max<int64_t>(1, static_cast<int64_t>(dtype.GetBit()) / 8);
+  const int64_t l0c = ReadHwParams().cube_capacity;
+  const bool deep_t = (h * K2 * dtb > l0c);
+  int64_t k2p = K2;
+  if (deep_t) {
+    const int64_t max_p = l0c / std::max<int64_t>(1, h * dtb);  // widest panel fitting L0c
+    k2p = 0;
+    for (int64_t p = (max_p / 16) * 16; p >= 16; p -= 16)
+      if (K2 % p == 0) { k2p = p; break; }
+    if (k2p == 0) return std::nullopt;  // no 16-aligned divisor panel fits L0c -> flush handles it
+  }
+  const std::vector<std::pair<std::string, std::any>> mm2_kw = {
+      {"a_trans", false}, {"b_trans", false}, {"c_matrix_nz", false}, {"out_dtype", dtype}};
+  const std::vector<std::pair<std::string, std::any>> acc2_kw = {{"a_trans", false}, {"b_trans", false}};
+
   // Inner serial chain for one output tile at element offset [mi,ni]:
   //   T_band = A[mi:mi+h, :] @ B            -> [h,K2]  (k-pipelined: A streams from DDR)
   //   out_tile = T_band @ D[:, ni:ni+w]     -> [h,w]   (single: T_band is on-chip)
+  // Deep-T variant (T_band exceeds L0c): panel over K2 so MM2 is a matmul_acc chain.
   auto build_chain = [&](const ExprPtr& mi, const ExprPtr& ni, const VarPtr& out_tile) {
     std::vector<StmtPtr> stmts;
-    auto tband_type =
-        std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(K2, sp)}, dtype);
-    auto tband = std::make_shared<Var>(base + "_tband", tband_type, sp);
-    auto s1 = BuildTileMatmul(A, B, mi, MakeIndex(0, sp), h, K2, K1, tile.k, dtype, tband, base + "_t", sp);
-    auto s2 = BuildTileMatmul(tband, D, MakeIndex(0, sp), ni, h, w, K2, /*k=*/0, dtype, out_tile, base + "_c", sp);
-    for (auto& s : s1) stmts.push_back(std::move(s));
-    for (auto& s : s2) stmts.push_back(std::move(s));
+    if (!deep_t) {
+      auto tband_type =
+          std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(K2, sp)}, dtype);
+      auto tband = std::make_shared<Var>(base + "_tband", tband_type, sp);
+      auto s1 = BuildTileMatmul(A, B, mi, MakeIndex(0, sp), h, K2, K1, tile.k, dtype, tband, base + "_t", sp);
+      auto s2 = BuildTileMatmul(tband, D, MakeIndex(0, sp), ni, h, w, K2, /*k=*/0, dtype, out_tile, base + "_c", sp);
+      for (auto& s : s1) stmts.push_back(std::move(s));
+      for (auto& s : s2) stmts.push_back(std::move(s));
+      return stmts;
+    }
+    // Deep-T: for each K2-panel [k2o, k2o+k2p), compute T_panel = A[mi:mi+h,:] @ B[:, panel]
+    // (k-pipelined over K1) and fold T_panel @ D[panel, ni:ni+w] into the output accumulator.
+    // The last panel binds out_tile; the first MM2 is a plain matmul, the rest matmul_acc.
+    const int64_t num_p = K2 / k2p;
+    auto out_ty = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
+    VarPtr acc_var;
+    for (int64_t p = 0; p < num_p; ++p) {
+      const std::string pb = base + "_p" + std::to_string(p);
+      const ExprPtr k2o = MakeIndex(p * k2p, sp);
+      // MM1: T_panel[h,k2p] = A[mi:mi+h, :] @ B[:, k2o:k2o+k2p]  (BuildTileMatmul's ni=k2o, w=k2p).
+      auto tp_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(k2p, sp)}, dtype);
+      auto tpanel = std::make_shared<Var>(pb + "_tp", tp_type, sp);
+      for (auto& s : BuildTileMatmul(A, B, mi, k2o, h, k2p, K1, tile.k, dtype, tpanel, pb + "_t", sp))
+        stmts.push_back(std::move(s));
+      // D panel: D[k2o:k2o+k2p, ni:ni+w] -> [k2p, w].
+      auto dslice = reg.Create("tensor.slice", {D, MakeIndexTuple({k2p, w}, sp), MakeTuple2(k2o, ni, sp)}, sp);
+      auto dpv = std::make_shared<Var>(pb + "_d", dslice->GetType(), sp);
+      stmts.push_back(std::make_shared<AssignStmt>(dpv, dslice, sp));
+      // MM2: p==0 -> matmul; else matmul_acc(acc, T_panel, D_panel). Last panel binds out_tile.
+      const VarPtr res = (p == num_p - 1) ? out_tile : std::make_shared<Var>(pb + "_ac", out_ty, sp);
+      ExprPtr mm2c = (p == 0)
+                         ? reg.Create("tensor.matmul", {ExprPtr(tpanel), ExprPtr(dpv)}, mm2_kw, sp)
+                         : reg.Create("tensor.matmul_acc", {ExprPtr(acc_var), ExprPtr(tpanel), ExprPtr(dpv)}, acc2_kw, sp);
+      stmts.push_back(std::make_shared<AssignStmt>(res, mm2c, sp));
+      acc_var = res;
+    }
     return stmts;
   };
 

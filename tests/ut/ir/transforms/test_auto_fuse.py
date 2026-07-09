@@ -484,6 +484,55 @@ class TestAutoFuse:
         assert sink_inputs[0] == intermediate, (sink_inputs, intermediate)
         assert len(sink_inputs) == 2 and sink_inputs[1] != intermediate
 
+    def test_chained_matmul_deep_t_tiles_shared_dim(self, ascend_backend):
+        """When a fused chain's per-tile intermediate T_band [h,K2] exceeds L0c, the shared
+        dimension K2 is tiled so MM2 becomes a matmul_acc over panels (deep-T / G-B).
+
+        Pinned to Ascend910B (L0c/Acc = 128 KB): for ``(A@B)@D`` with M=N=256, K1=256,
+        K2=512 the solver tiles C's output into ``[128,256]`` regions, so the naive per-tile
+        T_band would be ``[128,512]`` fp32 = 256 KB > 128 KB L0c. Deep-T tiles K2 into
+        ``512/256 = 2`` panels: each MM1 produces a ``[128,256]`` T_panel (128 KB, fits L0c)
+        and MM2 folds ``T_panel @ D[panel]`` into the output tile via ``tensor.matmul_acc`` —
+        so the full ``[128,512]`` intermediate never materializes. Verified numerically via
+        ``torch_codegen`` (the tensor-level interpreter); the full cube LOWERING of a fused
+        chain remains xfail on #1908, so this does NOT run the Default pipeline.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def ch(
+                self,
+                a: pl.Tensor[[256, 256], pl.FP32],
+                b: pl.Tensor[[256, 512], pl.FP32],
+                d: pl.Tensor[[512, 256], pl.FP32],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                t: pl.Tensor[[256, 512], pl.FP32] = pl.matmul(a, b)
+                c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(t, d)
+                return c
+
+        after = passes.auto_fuse()(Prog)
+        body = next(f for _, f in after.functions.items() if f.name == "ch").as_python()
+        # Deep-T fired: spatially tiled (not the whole-output CORE_GROUP fallback), MM2 folds
+        # panels via matmul_acc, and the full [128,512] T_band never materializes (K2 is tiled
+        # into [128,256] panels that each fit L0c).
+        assert "pl.at(level=pl.Level.CORE_GROUP" not in body and "pl.spmd(" in body
+        assert "pl.tensor.matmul_acc(" in body
+        assert "[128, 512]" not in body  # T is panelled; the full [h,K2] intermediate is gone
+
+        # Numeric faithfulness of the panelled matmul_acc chain (tensor-level interpreter).
+        namespace: dict = {}
+        exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        a = torch.randn(256, 256, dtype=torch.float32) * 0.03
+        b = torch.randn(256, 512, dtype=torch.float32) * 0.03
+        d = torch.randn(512, 256, dtype=torch.float32) * 0.03
+        out = namespace["ch"](a, b, d)
+        ref = (a @ b) @ d
+        assert torch.allclose(out, ref, rtol=1e-3, atol=1e-3), f"max abs diff {(out - ref).abs().max().item():.3e}"
+
     def test_chained_pointwise_fuses_into_one_tiled_kernel(self, ascend_backend):
         """Two chained pointwise ops the solver groups fuse into one tiled vector
         kernel, with the intermediate staying on-chip.
