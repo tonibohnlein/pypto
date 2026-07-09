@@ -649,6 +649,65 @@ class TestAutoFuse:
         xs = (torch.arange(256 * 128, dtype=torch.float32).reshape(256, 128) % 13) * 0.1 - 0.6
         _numeric(SmallSoftmax, "sm", xs, torch.softmax(xs, dim=1))
 
+    def test_multi_reduction_g1_threshold_no_overflow(self, ascend_backend, monkeypatch):
+        """BUG-G1THRESH regression. Feasibility (vector_peak_ub) and the emit's materialize-vs-stream
+        trigger both used UNPADDED tile bytes, while the emit allocates DMA-block-padded tiles. A thin
+        free axis (softmax/layernorm M-tile of 3 -> 8 for fp32, ~2.7x) was under-counted, so the mid
+        sizes N=4096/8192 looked UB-materializable, fused into one multi-reduction group, and
+        overflowed AllocateMemoryAddr. Both sites now count the padded footprint (Problem.
+        vec_dma_align_bytes), so the group is correctly detected as over-UB -> G1 cuts it. Guards the
+        two sizes that slipped between the fused-small (N<=2048) and streamed-large (N=16384) cases.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        def softmax(n):
+            @pl.program
+            class P:
+                @pl.function(attrs={"auto_fuse": True})
+                def sm(self, x: pl.Tensor[[128, n], pl.FP32]) -> pl.Tensor[[128, n], pl.FP32]:
+                    m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
+                    s: pl.Tensor[[128, n], pl.FP32] = pl.sub(x, m)
+                    e: pl.Tensor[[128, n], pl.FP32] = pl.exp(s)
+                    d: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(e)
+                    return pl.div(e, d)
+
+            return P
+
+        def layernorm(n):
+            @pl.program
+            class P:
+                @pl.function(attrs={"auto_fuse": True})
+                def ln(self, x: pl.Tensor[[128, n], pl.FP32]) -> pl.Tensor[[128, n], pl.FP32]:
+                    sx: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(x)
+                    mu: pl.Tensor[[128, 1], pl.FP32] = pl.mul(sx, 1.0 / n)
+                    xc: pl.Tensor[[128, n], pl.FP32] = pl.sub(x, mu)
+                    sq: pl.Tensor[[128, n], pl.FP32] = pl.mul(xc, xc)
+                    sv: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(sq)
+                    var: pl.Tensor[[128, 1], pl.FP32] = pl.mul(sv, 1.0 / n)
+                    ve: pl.Tensor[[128, 1], pl.FP32] = pl.add(var, 1e-5)
+                    iv: pl.Tensor[[128, 1], pl.FP32] = pl.rsqrt(ve)
+                    return pl.mul(xc, iv)
+
+            return P
+
+        # Compile each threshold size: G1 must cut into >=2 kernels (was AllocateMemoryAddr overflow).
+        for n in (4096, 8192):
+            for mk, name in ((softmax, f"softmax[128,{n}]"), (layernorm, f"layernorm[128,{n}]")):
+                out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(mk(n))
+                incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+                assert len(incores) >= 2, f"{name}: expected G1 cut into >=2 kernels, got {incores}"
+
+        # And the streamed result at the threshold is numerically exact.
+        x = (torch.arange(128 * 4096, dtype=torch.float32).reshape(128, 4096) % 13) * 0.1 - 0.6
+        ns: dict = {}
+        exec(torch_codegen(passes.auto_fuse()(softmax(4096)), run_all_spmd_blocks=True), ns)  # noqa: S102
+        got = ns["sm"](x)
+        ref = torch.softmax(x, dim=1)
+        assert torch.allclose(got, ref, rtol=1e-3, atol=1e-3), f"diff {(got - ref).abs().max().item():.3e}"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
