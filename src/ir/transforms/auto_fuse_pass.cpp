@@ -1222,9 +1222,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     }
   }
 
-  // Operand map is IDENTITY over the iteration space: every operand is an intermediate,
-  // an [IM,IN] external input (sliced), or a scalar. A differently-shaped 2D external
-  // operand (broadcast) is not identity -> out of scope (a Broadcast rule is TODO).
+  // Operand map over the iteration space: every operand is an intermediate, an [IM,IN] external
+  // input (sliced), a BROADCAST external input (each axis is either the full extent OR 1 — the
+  // FIXED_1 read-in-full role, §3/A3: `[1,IN]` M-broadcast bias, `[IM,1]` N-broadcast scale / a
+  // reduced-axis stat), or a scalar. Any OTHER 2D shape is not a clean broadcast -> out of scope.
   for (const auto& a : ops)
     for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
       auto v = AsVarLike(arg);
@@ -1238,8 +1239,12 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         if (As<TensorType>(arg->GetType()) != nullptr) return std::nullopt;
         continue;                               // true scalar -> kept as-is
       }
-      if (aM == IM && aN == IN) continue;       // full external input -> sliced
-      return std::nullopt;                      // other 2D shape (broadcast) -> TODO
+      if (aM == IM && aN == IN) continue;       // full external input -> sliced [sh,sw]
+      // Broadcast operand: each axis is full (follows the tile) or 1 (read whole, broadcast).
+      // emit_strip slices it [aM==1?1:sh, aN==1?1:sw] at [aM==1?0:smi, aN==1?0:sni]; the op replay
+      // re-infers the broadcast result. Excludes [IM,IN] (handled above) and any ragged 2D shape.
+      if ((aM == 1 || aM == IM) && (aN == 1 || aN == IN)) continue;  // broadcast -> sliced per-axis
+      return std::nullopt;                      // other 2D shape -> out of scope
     }
 
   // Grid: single shared parallel tile space; pure elementwise has NO pinned axis, so we
@@ -1452,28 +1457,36 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           if (it != onchip.end()) { targs.push_back(it->second); continue; }  // intermediate on-chip
         }
         const auto [aM, aN] = Static2DShape(arg->GetType());
-        if (aM == IM && aN == IN) {  // full external input -> identity [sh,w] slice (cached per input var)
-          if (v != nullptr) {
-            auto sit = input_cache.find(v.get());
-            if (sit != input_cache.end()) { targs.push_back(sit->second); continue; }
-          }
-          // Pad the ALLOCATED slice to the granule ([sh_al,w_al]) with a ragged VALID extent
-          // ([sh,w], the 4th arg); aligned axes -> 3-arg slice (byte-identical). tile.load/store
-          // and elementwise/reduction type-inference honor valid.
-          ExprPtr sl = strip_ragged
-                           ? reg.Create("tensor.slice",
-                                        {arg, MakeIndexTuple({sh_al, sw_al}, sp), MakeTuple2(smi, sni, sp),
-                                         MakeIndexTuple({sh, sw}, sp)},
-                                        sp)
-                           : reg.Create("tensor.slice", {arg, MakeIndexTuple({sh, sw}, sp), MakeTuple2(smi, sni, sp)}, sp);
-          // Unique name per distinct external input; a name-based consumer must not collapse >1 input.
-          auto sv = std::make_shared<Var>(base + "_in" + std::to_string(input_cache.size()), sl->GetType(), sp);
-          out.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
-          if (v != nullptr) input_cache[v.get()] = sv;
-          targs.push_back(sv);
-        } else {
+        if (aM < 0) {
           targs.push_back(arg);  // scalar / non-2D -> as-is
+          continue;
         }
+        // 2D external input (full [IM,IN] or a broadcast [1,IN]/[IM,1], validated at the group top).
+        // Slice per-axis: a FULL axis follows the tile (offset + granule-padded alloc + ragged valid);
+        // a size-1 (broadcast, FIXED_1) axis stays [1] at offset 0 (read whole, broadcast in the op).
+        // Cached per input var. For a full [IM,IN] input this is byte-identical to the prior form.
+        if (v != nullptr) {
+          auto sit = input_cache.find(v.get());
+          if (sit != input_cache.end()) { targs.push_back(sit->second); continue; }
+        }
+        const bool bcast_m = (aM == 1), bcast_n = (aN == 1);
+        const int64_t rext = bcast_m ? 1 : sh, rext_al = bcast_m ? 1 : sh_al;
+        const int64_t cext = bcast_n ? 1 : sw, cext_al = bcast_n ? 1 : sw_al;
+        const ExprPtr roff = bcast_m ? MakeIndex(0, sp) : smi;
+        const ExprPtr coff = bcast_n ? MakeIndex(0, sp) : sni;
+        const bool sl_ragged = (rext_al != rext) || (cext_al != cext);
+        ExprPtr sl = sl_ragged
+                         ? reg.Create("tensor.slice",
+                                      {arg, MakeIndexTuple({rext_al, cext_al}, sp), MakeTuple2(roff, coff, sp),
+                                       MakeIndexTuple({rext, cext}, sp)},
+                                      sp)
+                         : reg.Create("tensor.slice", {arg, MakeIndexTuple({rext, cext}, sp),
+                                                       MakeTuple2(roff, coff, sp)}, sp);
+        // Unique name per distinct external input; a name-based consumer must not collapse >1 input.
+        auto sv = std::make_shared<Var>(base + "_in" + std::to_string(input_cache.size()), sl->GetType(), sp);
+        out.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
+        if (v != nullptr) input_cache[v.get()] = sv;
+        targs.push_back(sv);
       }
       auto pw = reg.Create(c->op_->name_, targs, c->kwargs_, sp);
       // Unique name per intermediate (a multi-consumer intermediate must keep a distinct name).

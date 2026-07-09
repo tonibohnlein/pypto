@@ -709,6 +709,70 @@ class TestAutoFuse:
         ref = torch.softmax(x, dim=1)
         assert torch.allclose(got, ref, rtol=1e-3, atol=1e-3), f"diff {(got - ref).abs().max().item():.3e}"
 
+    def test_broadcast_operand_fuses_and_is_correct(self, ascend_backend, monkeypatch):
+        """G4: a BROADCAST external operand — one axis is the full extent, the other is 1 (the FIXED_1
+        read-in-full role, contract §3/A3) — now fuses instead of declining to the legacy tiler. Covers
+        the M-broadcast `[1,N]` (bias-add, ubiquitous in FFN/attention), the N-broadcast `[M,1]`
+        (per-row scale), a fused chain mixing both, and a P2 reduction group that takes an external
+        `[M,1]` stat (the shape a G1/G3 softmax cut produces — this is what unblocks G3's buildable path).
+        emit_strip slices a broadcast operand `[aM==1?1:sh, aN==1?1:sw]` at `[aM==1?0:smi, aN==1?0:sni]`
+        and the op replay re-infers the broadcast.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        m_, n_ = 128, 512
+
+        def _check(program, entry, args, ref, want_incores=1):
+            out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
+            incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+            assert len(incores) == want_incores, f"{entry}: expected {want_incores} incore(s), got {incores}"
+            ns: dict = {}
+            exec(torch_codegen(passes.auto_fuse()(program), run_all_spmd_blocks=True), ns)  # noqa: S102
+            got = ns[entry](*args)
+            diff = (got - ref).abs().max().item()
+            assert torch.allclose(got, ref, rtol=1e-3, atol=1e-3), f"{entry}: max abs diff {diff:.3e}"
+
+        @pl.program
+        class BiasAdd:  # M-broadcast [1,N]
+            @pl.function(attrs={"auto_fuse": True})
+            def ba(self, x: pl.Tensor[[m_, n_], pl.FP32], b: pl.Tensor[[1, n_], pl.FP32]) -> pl.Tensor[[m_, n_], pl.FP32]:
+                return pl.add(x, b)
+
+        @pl.program
+        class RowScale:  # N-broadcast [M,1]
+            @pl.function(attrs={"auto_fuse": True})
+            def rs(self, x: pl.Tensor[[m_, n_], pl.FP32], s: pl.Tensor[[m_, 1], pl.FP32]) -> pl.Tensor[[m_, n_], pl.FP32]:
+                return pl.mul(x, s)
+
+        @pl.program
+        class Chain:  # both broadcasts fused + a unary
+            @pl.function(attrs={"auto_fuse": True})
+            def ch(self, x: pl.Tensor[[m_, n_], pl.FP32], b: pl.Tensor[[1, n_], pl.FP32], s: pl.Tensor[[m_, 1], pl.FP32]) -> pl.Tensor[[m_, n_], pl.FP32]:
+                t: pl.Tensor[[m_, n_], pl.FP32] = pl.add(x, b)
+                u: pl.Tensor[[m_, n_], pl.FP32] = pl.mul(t, s)
+                return pl.exp(u)
+
+        @pl.program
+        class P2Bcast:  # reduction group taking an external [M,1] stat (a G1/G3 softmax cut piece)
+            @pl.function(attrs={"auto_fuse": True})
+            def sm2(self, x: pl.Tensor[[m_, n_], pl.FP32], mstat: pl.Tensor[[m_, 1], pl.FP32]) -> pl.Tensor[[m_, n_], pl.FP32]:
+                s: pl.Tensor[[m_, n_], pl.FP32] = pl.sub(x, mstat)
+                e: pl.Tensor[[m_, n_], pl.FP32] = pl.exp(s)
+                d: pl.Tensor[[m_, 1], pl.FP32] = pl.row_sum(e)
+                return pl.div(e, d)
+
+        x = torch.randn(m_, n_)
+        b = torch.randn(1, n_)
+        s = torch.randn(m_, 1)
+        _check(BiasAdd, "ba", (x, b), x + b)
+        _check(RowScale, "rs", (x, s), x * s)
+        _check(Chain, "ch", (x, b, s), torch.exp((x + b) * s))
+        mstat = torch.randn(m_, 1)
+        e = torch.exp(x - mstat)
+        _check(P2Bcast, "sm2", (x, mstat), e / e.sum(dim=1, keepdim=True))
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
