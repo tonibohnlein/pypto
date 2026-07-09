@@ -283,6 +283,59 @@ class TestAutoFuse:
         _check(272, 272, 272)  # square non-divisor: 2x4 ceil grid, clamp on both axes
         _check(272, 272, 240)  # non-square non-divisor: independent M/N clamp
 
+    def test_ragged_k_pipeline_peel_is_numerically_correct(self, ascend_backend):
+        """A matmul whose per-core contraction slice does NOT divide evenly by the solver's
+        k-tile pipelines the full k-strips + one matmul_acc tail (ragged-K peel).
+
+        ``BuildTileMatmul`` streams the contraction K in ``k``-strips with a stage-2 pipeline.
+        When ``k`` does not divide the (per-split) contraction, it runs ``floor(K/k)`` full
+        strips and folds the ragged remainder in as ONE extra ``matmul_acc`` tail (width
+        ``K - floor(K/k)*k``, which is 16-aligned since the solver's ``k`` is). Pinned to
+        Ascend910B: ``[64,5040]@[5040,256]`` splits K into 7 slices of 720; the solver's
+        ``k=336`` peels each into ``2*336 + 48``. ``[64,4096]@[4096,256]`` is the exact-division
+        control (slice 512, ``k=256`` -> ``2*256``, no tail). Both must match ``torch.matmul``;
+        the ragged path must be numerically exact, not silently dropping the tail contribution.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        def _fuse_body(M: int, K: int, N: int):
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mm(
+                    self,
+                    a: pl.Tensor[[M, K], pl.FP32],
+                    b: pl.Tensor[[K, N], pl.FP32],
+                ) -> pl.Tensor[[M, N], pl.FP32]:
+                    c: pl.Tensor[[M, N], pl.FP32] = pl.matmul(a, b)
+                    return c
+
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "mm").as_python()
+            namespace: dict = {}
+            exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)  # noqa: S102
+            torch.manual_seed(0)
+            a = torch.randn(M, K, dtype=torch.float32) * 0.05
+            b = torch.randn(K, N, dtype=torch.float32) * 0.05
+            out = namespace["mm"](a, b)
+            assert torch.allclose(out, a @ b, rtol=1e-3, atol=1e-3), (
+                f"[{M},{K}]@[{K},{N}]: max abs diff {(out - a @ b).abs().max().item():.3e}"
+            )
+            return body
+
+        # Ragged peel: per-split contraction 720, k=336 -> 2 full strips (pipeline bound 672)
+        # + a 48-wide matmul_acc tail (720 - 2*336, 16-aligned). Pins the current solver plan.
+        peel_body = _fuse_body(64, 5040, 256)
+        assert "pl.pipeline(0, 672, 336" in peel_body  # 2 full k-strips (bound < slice 720)
+        assert "pl.tensor.matmul_acc(" in peel_body  # loop accumulate + the peel tail fold
+        assert "[64, 48]" in peel_body  # the ragged K-tail slice (720 - 2*336 = 48)
+
+        # Exact-division control: k-pipeline with no tail (slice 512, k=256 -> bound 512).
+        div_body = _fuse_body(64, 4096, 256)
+        assert "pl.pipeline(0, 512, 256" in div_body  # 2 full strips, no ragged tail
+        assert "[64, 48]" not in div_body  # no peel tail for the dividing case
+
     def test_single_pointwise_tiles_across_vector_cores(self, ascend_backend):
         """A large pointwise op is tiled into the solver's `[w,h]` regions and
         distributed across the vector cores, lowering to a vector (AIV) kernel.
