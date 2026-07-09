@@ -202,6 +202,37 @@ class TestAutoFuse:
         cube_mlir = codegen.PTOCodegen().generate(ir.Program([cube], cube.name, cube.span))
         assert "cube" in cube_mlir and "atomic_add" in cube_mlir  # split-K merge
 
+    def test_nonuniform_matmul_declines_to_untiled_incore(self, ascend_backend):
+        """A matmul whose solver tile does NOT divide the output declines to a single
+        untiled InCore scope (the "matmul-tiling gap").
+
+        Pinned to Ascend910B: for ``[272,272]`` the grounded solver picks a non-uniform
+        ``80x144`` spatial grid (``272 % 80 != 0``), which the v1 emitter cannot realize
+        with an exact-division grid, so ``TileMatmul`` declines and the matmul falls back
+        to ONE untiled ``CORE_GROUP`` InCore scope — correct values, but the solver's
+        parallel grid is dropped (no ``pl.spmd`` tiling, no per-tile slice). This pins
+        TODAY's fallback; the ceil+clamp grid decode (next increment) tiles it instead.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mm(
+                self,
+                a: pl.Tensor[[272, 272], pl.FP32],
+                b: pl.Tensor[[272, 272], pl.FP32],
+            ) -> pl.Tensor[[272, 272], pl.FP32]:
+                c: pl.Tensor[[272, 272], pl.FP32] = pl.matmul(a, b)
+                return c
+
+        body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "mm").as_python()
+        # Non-uniform grid -> untiled: one plain InCore (CORE_GROUP) scope, no SPMD tiling,
+        # no per-tile K/output slicing. The lone matmul runs whole in one core.
+        assert "pl.spmd(" not in body
+        assert "pl.at(level=pl.Level.CORE_GROUP" in body
+        assert body.count("pl.tensor.matmul(") == 1
+        assert "pl.tensor.slice(" not in body
+
     def test_single_pointwise_tiles_across_vector_cores(self, ascend_backend):
         """A large pointwise op is tiled into the solver's `[w,h]` regions and
         distributed across the vector cores, lowering to a vector (AIV) kernel.

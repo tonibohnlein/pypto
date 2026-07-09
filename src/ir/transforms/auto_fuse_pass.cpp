@@ -789,6 +789,15 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   int64_t h = (tile.h > 0 && tile.h < M) ? tile.h : M;
   int64_t w = (tile.w > 0 && tile.w < N) ? tile.w : N;
   if (M % h != 0 || N % w != 0) {
+    // Non-uniform spatial grid (the "matmul-tiling gap"): the solver's balanced
+    // parts_m x parts_n partition has ragged regions, so w/h (the MAX region extent)
+    // does not divide the output. v1 declines -> a single UNTILED InCore scope (correct
+    // values, but the solver's parallel grid is dropped). Instrumented log-only so its
+    // frequency is visible during the bake; the ceil+clamp grid decode replaces it next.
+    LOG_INFO << "AutoFuse[matmul]: non-uniform spatial grid decline — output [" << M << "," << N
+             << "] not divisible by tile [" << h << "," << w << "] (parts_m=" << tile.parts_m
+             << ",parts_n=" << tile.parts_n << ",split=" << tile.split
+             << "); runs untiled InCore (uniform-grid only in v1, ceil+clamp decode deferred)";
     return std::nullopt;
   }
   const int64_t num_m = M / h;
