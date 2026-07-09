@@ -567,6 +567,88 @@ class TestAutoFuse:
         x_rms = (torch.arange(128 * 16384, dtype=torch.float32).reshape(128, 16384) % 13) * 0.1 + 0.05
         _numeric(RmsLike, "rms", x_rms, x_rms * (x_rms * x_rms).sum(dim=1, keepdim=True))
 
+    def test_inline_return_multi_reduction_lowers_and_is_correct(self, ascend_backend, monkeypatch):
+        """A multi-reduction group (softmax = row_max + row_sum; layernorm = two row_sums) written
+        with a DIRECT ``return pl.op(...)`` — the idiomatic form. Two guards on one path:
+
+        1. Inline-return hoisting: the returned op has no SSA name, so the solver-graph builder used
+           to MISS it (it registers only ``var = <call>`` ops). Its operands then looked group-
+           internal and the emit dropped them, leaving the raw return referencing an unexposed
+           intermediate (``return pl.mul(xc, iv)`` where ``xc`` is a fused-group intermediate ->
+           dangling ``xc``). AutoFuse now hoists ``return <call>`` to ``_ret = <call>; return _ret``
+           so every op is visible to the partitioner (BUG-LN-2 regression).
+        2. G1 cut of the un-streamable multi-reduction group into >=2 buildable kernels, and the
+           cross-group intermediate threaded correctly end-to-end (numerically exact).
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        eps = 1e-5
+
+        @pl.program
+        class Softmax:  # row_max + row_sum, direct return of the final div
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[128, 16384], pl.FP32]) -> pl.Tensor[[128, 16384], pl.FP32]:
+                m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
+                s: pl.Tensor[[128, 16384], pl.FP32] = pl.sub(x, m)
+                e: pl.Tensor[[128, 16384], pl.FP32] = pl.exp(s)
+                d: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(e)
+                return pl.div(e, d)
+
+        @pl.program
+        class LayerNorm:  # two row_sums; final `mul(xc, iv)` returned inline consumes intermediate xc
+            @pl.function(attrs={"auto_fuse": True})
+            def ln(self, x: pl.Tensor[[128, 16384], pl.FP32]) -> pl.Tensor[[128, 16384], pl.FP32]:
+                sx: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(x)
+                mu: pl.Tensor[[128, 1], pl.FP32] = pl.mul(sx, 1.0 / 16384)
+                xc: pl.Tensor[[128, 16384], pl.FP32] = pl.sub(x, mu)
+                sq: pl.Tensor[[128, 16384], pl.FP32] = pl.mul(xc, xc)
+                sv: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(sq)
+                var: pl.Tensor[[128, 1], pl.FP32] = pl.mul(sv, 1.0 / 16384)
+                ve: pl.Tensor[[128, 1], pl.FP32] = pl.add(var, eps)
+                iv: pl.Tensor[[128, 1], pl.FP32] = pl.rsqrt(ve)
+                return pl.mul(xc, iv)
+
+        # (1) Structural: G1 cuts each un-streamable multi-reduction group into >=2 buildable
+        # kernels (was a hard AllocateMemoryAddr overflow before G1; a dangling xc before hoisting).
+        for prog, name in ((Softmax, "sm"), (LayerNorm, "ln")):
+            out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(prog)
+            incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+            assert len(incores) >= 2, f"{name}: expected G1 to cut into >=2 kernels, got {incores}"
+
+        # (2) Numerical: the inline-returned op is emitted (not dangling) and the cross-group
+        # intermediate is threaded correctly. Bounded data keeps exp() in range.
+        def _numeric(program, entry, x, ref):
+            ns: dict = {}
+            exec(torch_codegen(passes.auto_fuse()(program), run_all_spmd_blocks=True), ns)  # noqa: S102
+            got = ns[entry](x)
+            diff = (got - ref).abs().max().item()
+            assert torch.allclose(got, ref, rtol=1e-3, atol=1e-3), f"{entry}: max abs diff {diff:.3e}"
+
+        x = (torch.arange(128 * 16384, dtype=torch.float32).reshape(128, 16384) % 13) * 0.1 - 0.6
+        _numeric(Softmax, "sm", x, torch.softmax(x, dim=1))
+        mu = x.mean(-1, keepdim=True)
+        xc = x - mu
+        _numeric(LayerNorm, "ln", x, xc * torch.rsqrt(xc.pow(2).mean(-1, keepdim=True) + eps))
+
+        # Control: a small multi-reduction (reduced axis fits UB) stays FUSED into ONE kernel.
+        @pl.program
+        class SmallSoftmax:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[256, 128], pl.FP32]) -> pl.Tensor[[256, 128], pl.FP32]:
+                m: pl.Tensor[[256, 1], pl.FP32] = pl.row_max(x)
+                s: pl.Tensor[[256, 128], pl.FP32] = pl.sub(x, m)
+                e: pl.Tensor[[256, 128], pl.FP32] = pl.exp(s)
+                d: pl.Tensor[[256, 1], pl.FP32] = pl.row_sum(e)
+                return pl.div(e, d)
+
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SmallSoftmax)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        assert len(incores) == 1, f"small softmax should stay fused into one kernel, got {incores}"
+        xs = (torch.arange(256 * 128, dtype=torch.float32).reshape(256, 128) % 13) * 0.1 - 0.6
+        _numeric(SmallSoftmax, "sm", xs, torch.softmax(xs, dim=1))
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

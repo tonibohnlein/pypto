@@ -193,6 +193,57 @@ bool IsComputeOp(const StmtPtr& stmt, CallPtr* out_call) {
   return true;
 }
 
+// Hoist an inline compute expression in a ReturnStmt into a named binding so EVERY compute op is
+// visible to the solver-graph builder (ProblemBuilder registers only `var = <call>` AssignStmts).
+// The DSL allows `return pl.mul(a, b)` — an inline Call with no SSA name. That op never enters the
+// solver graph, so the partitioner treats its operands as group-INTERNAL intermediates (not live-
+// outs) and the emit drops them, leaving the raw inline return referencing an unexposed var. The
+// bite is `return pl.mul(xc, iv)` where `xc` is a fused-group intermediate (layernorm/softmax
+// written with a direct return): `xc` is buried in a group, unexposed, and the return dangles
+// (BUG-LN-2). Rewrite `return <call>` to `_ret = <call>; return _ret`. Applied to the marked body
+// BEFORE both ProblemBuilder::Build and EmitFusedScopes so the two walks stay consistent — and it
+// gives the partitioner the true graph (a strictly better, cheaper partition). Returns nullopt when
+// no return value is an inline compute call (a bare `return var` is already named). At this stage
+// the body is a flat DAG (no control flow), so the ReturnStmt lives in the top-level SeqStmts.
+std::optional<StmtPtr> HoistInlineReturnComputeExprs(const StmtPtr& body) {
+  std::vector<StmtPtr> stmts;
+  if (auto seq = As<SeqStmts>(body)) {
+    stmts = seq->stmts_;
+  } else {
+    stmts.push_back(body);
+  }
+  std::vector<StmtPtr> out;
+  out.reserve(stmts.size() + 2);
+  bool changed = false;
+  size_t hoist_idx = 0;
+  for (const StmtPtr& s : stmts) {
+    auto ret = As<ReturnStmt>(s);
+    if (ret == nullptr) {
+      out.push_back(s);
+      continue;
+    }
+    std::vector<ExprPtr> new_vals;
+    new_vals.reserve(ret->value_.size());
+    for (const ExprPtr& v : ret->value_) {
+      auto call = As<Call>(v);
+      if (call != nullptr && !IsAllocCall(call)) {
+        auto rv = std::make_shared<Var>("autofuse_ret" + std::to_string(hoist_idx++), v->GetType(),
+                                        s->span_);
+        out.push_back(std::make_shared<AssignStmt>(rv, v, s->span_));
+        new_vals.push_back(ExprPtr(rv));
+        changed = true;
+      } else {
+        new_vals.push_back(v);
+      }
+    }
+    out.push_back(std::make_shared<ReturnStmt>(std::move(new_vals), s->span_));
+  }
+  if (!changed) {
+    return std::nullopt;
+  }
+  return SeqStmts::Flatten(std::move(out), body->span_);
+}
+
 // Map a PyPTO op/kernel name to a tiling cost category. Broadcast folds into
 // Pointwise (its FIXED operand is shape-inferred from the size-1 dim). Memory /
 // cross-core / sync ops are not graph nodes, so they never reach this point.
@@ -2555,8 +2606,17 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       new_functions.emplace(gvar, func);
       continue;
     }
+    // Normalize inline-returned compute exprs into named bindings so the solver graph and the emit
+    // both see EVERY op (a bare `return pl.op(...)` is otherwise invisible to ProblemBuilder — its
+    // operands look group-internal and get dropped, BUG-LN-2). No-op for already-named returns.
+    FunctionPtr wfunc = func;
+    if (auto hoisted = HoistInlineReturnComputeExprs(func->body_)) {
+      auto mut = MutableCopy(func);
+      mut->body_ = *hoisted;
+      wfunc = mut;
+    }
     ProblemBuilder builder;
-    builder.Build(func, prog);
+    builder.Build(wfunc, prog);
     // Empty problem (no compute ops) or out-of-scope (non-tensor output / dynamic shape)
     // -> leave the function untouched for legacy lowering.
     if (builder.declined() || builder.problem.ops.empty()) {
@@ -2700,8 +2760,8 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
         stmt_exec[builder.op_stmts[exec[pos]]] = pos;
       }
     }
-    auto new_func = MutableCopy(func);
-    new_func->body_ = EmitFusedScopes(func->body_, stmt_group, stmt_tile, stmt_exec);
+    auto new_func = MutableCopy(wfunc);
+    new_func->body_ = EmitFusedScopes(wfunc->body_, stmt_group, stmt_tile, stmt_exec);
     // Wire the return-based fused function to a named Out param so orchestration
     // codegen emits an add_output write-back (device / ST harness bind output by
     // param position, not by return value). No-op for functions that already
