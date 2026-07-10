@@ -911,6 +911,56 @@ class TestAutoFuse:
         x_rms = (torch.arange(128 * 16384, dtype=torch.float32).reshape(128, 16384) % 13) * 0.1 + 0.05
         _numeric(RmsLike, "rms", x_rms, x_rms * (x_rms * x_rms).sum(dim=1, keepdim=True))
 
+    def test_p4_online_softmax_fuses_into_one_streamed_kernel(self, ascend_backend, monkeypatch):
+        """P4: a softmax over a UB-overflowing reduced axis FUSES into ONE streamed online-flash
+        kernel (behind PYPTO_AUTOFUSE_P4), instead of the G1 cut into row_max + apply pieces.
+
+        The emit maintains the coupled running `(m, l)` stats with the exact `exp(m_old - m_new)`
+        rescale in a single streamed pass 0 (one x-slice DMA per chunk → the reduction result IS
+        the finalized max/sum), then a pass-1 apply re-streams the reduced axis substituting the
+        finalized `(M, L)`: `exp(x - M)/L`. Both passes are Sequential in v1 (pipelining deferred).
+        The solver ranks the fused plan cheaper than the cut (~34% here), so it fires with no force.
+        (NOTE: the DAG must be FULLY NAMED — a nested-argument call like `exp(row_expand_sub(x,m))`
+        drops the inner op from the solver graph and misses P4; see KNOWN_ISSUES.)
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[128, 8192], pl.FP32]) -> pl.Tensor[[128, 8192], pl.FP32]:
+                m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
+                sh: pl.Tensor[[128, 8192], pl.FP32] = pl.row_expand_sub(x, m)
+                e: pl.Tensor[[128, 8192], pl.FP32] = pl.exp(sh)
+                s: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(e)
+                out: pl.Tensor[[128, 8192], pl.FP32] = pl.row_expand_div(e, s)
+                return out
+
+        fused = passes.auto_fuse()(Prog)
+        body = next(f for _, f in fused.functions.items() if f.name == "sm").as_python()
+        # ONE fused streamed kernel (not the 2-group G1 cut), carrying the online (m,l) stats.
+        assert body.count("pl.spmd(") == 1, body
+        assert "_m_it" in body and "_l_it" in body  # the coupled running-stats loop carries
+        assert "pl.tensor.maximum(" in body  # the online running-max merge
+
+        # Lowers through the full pipeline (streamed, fits UB).
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+
+        # ...and is numerically exact vs torch softmax (the flash rescale is exact).
+        code = torch_codegen(fused, run_all_spmd_blocks=True)
+        namespace: dict = {}
+        exec(code, namespace)  # noqa: S102
+        torch.manual_seed(0)
+        x = torch.randn(128, 8192, dtype=torch.float32)
+        out = namespace["sm"](x)
+        assert torch.allclose(out, torch.softmax(x, dim=1), rtol=1e-4, atol=1e-4), (
+            f"max abs diff {(out - torch.softmax(x, dim=1)).abs().max().item():.3e}"
+        )
+
     def test_inline_return_multi_reduction_lowers_and_is_correct(self, ascend_backend, monkeypatch):
         """A multi-reduction group (softmax = row_max + row_sum; layernorm = two row_sums) written
         with a DIRECT ``return pl.op(...)`` — the idiomatic form. Two guards on one path:

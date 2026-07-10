@@ -337,6 +337,12 @@ double VecOpFixed(const CallPtr& call) {
 // plans is active).
 static bool GenericEmitEnabled();
 
+// Defined below; forward-declared so ProblemBuilder can gate the cost-side
+// allow_model_ahead_multi_reduction_stream flag on the fused online-softmax (P4) emit — when P4
+// is on the emit CAN stream a 2-reduction softmax as one kernel, so the model must keep it
+// feasible instead of forcing the partitioner to cut it (the G1 behaviour when P4 is off).
+static bool P4Enabled();
+
 // Build the MLSys solver `Problem` (op+tensor DAG) from a function, reusing
 // `BuildStmtDependencyGraph` for sound op-dependency edges.
 class ProblemBuilder {
@@ -396,13 +402,22 @@ class ProblemBuilder {
     problem.vec_slope_pw = kVecSlopePw;
     problem.vec_slope_reduce = kVecSlopeReduce;
     // BUILDABLE mode: a streamed MULTI-reduction group (softmax/layernorm: >1 reduction over
-    // the streamed axis) is not yet emittable — the emit streams only a single reduction (P1/P2),
-    // and the online multi-reduction path (P4) is not built. Mark such groups infeasible so the
-    // partitioner cuts them into single-reduction (streamable) + pointwise pieces (an unfused
-    // softmax IS buildable) rather than fusing a group the emit can only lower to an over-UB tile
-    // (G1: was a hard AllocateMemoryAddr failure). (split-K stays model-ahead: its emit declines
-    // an unrealizable split gracefully to serial; multi-reduction streaming has no such fallback.)
-    problem.allow_model_ahead_multi_reduction_stream = false;
+    // the streamed axis) is only emittable when the fused online path (P4) is ON. With P4 OFF the
+    // emit streams a single reduction only (P1/P2), so such a group is marked infeasible and the
+    // partitioner cuts it into single-reduction (streamable) + pointwise pieces (an unfused softmax
+    // IS buildable) — the G1 behaviour that avoided a hard AllocateMemoryAddr failure. With P4 ON
+    // the emit streams the 2-reduction SOFTMAX as ONE kernel (online (m,l) stats), so keep the fused
+    // group feasible (the ascend910b_cost :1801 gate honours this flag).
+    //
+    // Precision (P4 increment 1 = softmax only): the :1801 gate is TYPE-AGNOSTIC (`reductions > 1`),
+    // so flipping this flag on would ALSO let the solver fuse a layernorm (two row_sums) — which the
+    // emit's classify_p4 declines (not a max+sum softmax) and then over-UB-declines to legacy ->
+    // AllocateMemoryAddr overflow. So only enable it when the function's reductions are exclusively
+    // softmax-shaped (all row_max/row_sum with #row_sum <= #row_max — every sum pairs with a max). A
+    // pure layernorm keeps the flag FALSE -> the solver cuts it (the safe G1 path), even under P4.
+    // Set below (after the op scan). Realizes the intent of "keep the fused softmax feasible" without
+    // an mlsys26 change; a type-aware cost gate that fuses layernorm too is the layernorm increment.
+    int p4_row_max = 0, p4_row_sum = 0, p4_reductions = 0;
 
     // 1. In AND InOut params are graph-input tensors: both are READ by the body. An InOut param
     //    is also written, but its updated value is a SEPARATE SSA tensor produced by a compute op
@@ -446,6 +461,11 @@ class ProblemBuilder {
       const CallPtr& call = entry.second;
       ::Op sop;
       sop.type = ClassifyOp(call);
+      if (sop.type == ::OpType::Reduction) {
+        ++p4_reductions;
+        if (IsOp(call, "tensor.row_max")) ++p4_row_max;
+        else if (IsOp(call, "tensor.row_sum")) ++p4_row_sum;
+      }
       sop.vec_slope = VecOpSlope(call);  // vdiv=4 / vrsqrt=1 override the elementwise default
       sop.vec_fixed = VecOpFixed(call);  // per-op head+tail (vadd 24 / vexp 31 / vdiv 30 / ...)
       // Inputs in OPERAND ORDER (call->args_). The solver derives M/N/K
@@ -477,6 +497,14 @@ class ProblemBuilder {
       op_labels.push_back(call->op_->name_);
       op_stmts.push_back(stmt);
     }
+
+    // Enable the multi-reduction-stream feasibility ONLY for a P4-buildable softmax shape (see the
+    // comment where p4_row_* are declared): all reductions row_max/row_sum, at least one row_max, and
+    // #row_sum <= #row_max so every sum pairs with a max. Keeps a layernorm (row_sums, no row_max)
+    // cut under P4 instead of fusing a group the emit cannot build.
+    const bool p4_softmax_shaped = P4Enabled() && p4_row_max >= 1 && p4_row_sum <= p4_row_max &&
+                                   (p4_row_max + p4_row_sum) == p4_reductions;
+    problem.allow_model_ahead_multi_reduction_stream = p4_softmax_shaped;
   }
 
  private:
@@ -1176,6 +1204,14 @@ static bool GenericEmitEnabled() {
   return v != nullptr && v[0] != '\0' && std::string(v) != "0";
 }
 
+// P4 (fused online-softmax / flash-stats) emit + cost gate. Re-read per call, mirroring
+// GenericEmitEnabled(): a test can toggle it in-process. True unless unset/empty/"0". Off by
+// default, so production and the P4-off differential net are byte-for-byte unchanged.
+static bool P4Enabled() {
+  const char* v = std::getenv("PYPTO_AUTOFUSE_P4");
+  return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+}
+
 // Strict mode turns Tier-B declines (below) into hard failures. OFF in production
 // (Tier-B just warns + falls back to legacy); ON in CI/tests so the bake window
 // SURFACES illegal-plan conditions instead of silently masking them behind the
@@ -1405,10 +1441,77 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   const bool stream_p1 = stream_ok && sink_is_reduction;
   const bool stream_p2 = stream_ok && !sink_is_reduction;
 
+  // P4 (fused online softmax — the flash algorithm applied to a DDR-resident reduction). A softmax
+  // over a UB-overflowing reduced axis has TWO coupled reductions (row_max -> sub -> exp -> row_sum),
+  // so the single-reduction stream gate (stream_ok, p1_nreds==1) declines it; with P4 OFF the cost
+  // side then CUTS it into a bare-max P1 + a P2 apply (two kernels, x read 3x). With P4 ON we stream
+  // both stats in ONE pass carrying the running (m, l) with the exact exp(m_old - m_new) rescale, then
+  // a second apply pass (x read 2x — matches A7 stream_passes=2). classify_p4 is READ-ONLY (returns
+  // the kind; emits no IR). Increment 1 = softmax only (exactly one row_max + one row_sum, coupled);
+  // MultiSum / layernorm (Welford) and col-softmax are later increments -> None (falls to the G1 cut).
+  enum class P4Kind { None, SoftmaxFlash };
+  auto classify_p4 = [&]() -> P4Kind {
+    if (!P4Enabled()) return P4Kind::None;
+    if (sinks.size() != 1 || !has_reduction || pin_m == pin_n) return P4Kind::None;
+    if (p1_nreds != 2) return P4Kind::None;  // increment 1: softmax reduces exactly twice
+    // Identify the max + sum reductions. Increment 1 admits ONLY row_max + row_sum (softmax reduces
+    // N -> pin_n; the pass-0 body's tensor.sub broadcasts the [free_tile,1] stat via row_expand_sub,
+    // which is a ROW broadcast — col-softmax's [1,free_tile] stat is not handled here). The
+    // foldability gate (§5.1): sum/max/min are fixed-size associative running states; an order
+    // statistic (median/quantile/top-k) cannot flash -> any other reduction family declines to None.
+    AssignStmtPtr mx, sm;
+    for (const auto& a : ops) {
+      auto rcall = As<Call>(a->value_);
+      if (ClassifyOp(rcall) != ::OpType::Reduction) continue;
+      if (IsOp(rcall, "tensor.row_max")) mx = a;
+      else if (IsOp(rcall, "tensor.row_sum")) sm = a;
+      else return P4Kind::None;  // col reduction / non-foldable order statistic -> not increment 1
+    }
+    if (mx == nullptr || sm == nullptr) return P4Kind::None;  // not exactly one-max + one-sum
+    // Coupling: the sum's backward input cone must reach the max's output var (the
+    // max -> sub -> exp -> sum softmax structure). DFS over group-internal operands only (O(N)).
+    std::unordered_map<const Var*, AssignStmtPtr> defmap;
+    for (const auto& a : ops) defmap.emplace(a->var_.get(), a);
+    std::vector<const Var*> stack;
+    std::unordered_set<const Var*> seen;
+    auto push_operands = [&](const AssignStmtPtr& a) {
+      for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
+        auto v = AsVarLike(arg);
+        if (v != nullptr && defined.count(v.get()) != 0) stack.push_back(v.get());
+      }
+    };
+    push_operands(sm);
+    bool coupled = false;
+    while (!stack.empty()) {
+      const Var* v = stack.back();
+      stack.pop_back();
+      if (!seen.insert(v).second) continue;
+      if (v == mx->var_.get()) { coupled = true; break; }
+      auto it = defmap.find(v);
+      if (it != defmap.end()) push_operands(it->second);
+    }
+    if (!coupled) return P4Kind::None;
+    // Increment 1 scope: the max reduces a DIRECT external full-[IM,IN] input (no pre-reduction
+    // pointwise cone). The online pass-0 body recomputes x's slice per chunk; a scale-then-softmax
+    // (pre-reduction cone) is a later increment. A pre-reduction op would make max's input a group
+    // intermediate -> declines to None.
+    auto mxin = AsVarLike(As<Call>(mx->value_)->args_[0]);
+    if (mxin != nullptr && defined.count(mxin.get()) != 0) return P4Kind::None;  // not external
+    const auto [xM, xN] = Static2DShape(As<Call>(mx->value_)->args_[0]->GetType());
+    if (xM != IM || xN != IN) return P4Kind::None;  // not the full working shape
+    return P4Kind::SoftmaxFlash;
+  };
+  // stream_p4 gate (task spec): a softmax whose full pinned tile overflows UB (same test as P1/P2)
+  // and matches the coupled-2-reduction structure -> stream it as one fused online kernel below.
+  const bool stream_p4 = classify_p4() == P4Kind::SoftmaxFlash && has_reduction &&
+                         (pin_m != pin_n) && sinks.size() == 1 && p1_nreds >= 2 &&
+                         (2 * AlignUp(h, g) * AlignUp(w, g) * p1_dtb > p1_ub);
+
   // A single spatial tile is left to the legacy tiler — UNLESS the solver split the reduced axis
-  // (tile.split>1) or the reduced axis must be STREAMED (P1/P2): both still need to run below (the
+  // (tile.split>1) or the reduced axis must be STREAMED (P1/P2/P4): both still need to run below (the
   // split fills cores; streaming is what makes a too-large reduced axis fit UB at all).
-  if (num_m == 1 && num_n == 1 && tile.split <= 1 && !stream_p1 && !stream_p2) return std::nullopt;
+  if (num_m == 1 && num_n == 1 && tile.split <= 1 && !stream_p1 && !stream_p2 && !stream_p4)
+    return std::nullopt;
 
   // A4 (reduction rule): the reduced axis must be PINNED FULL in the tile, else a
   // per-tile reduction would cover only part of the axis (partial reduction = wrong
@@ -1475,6 +1578,37 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   const int64_t h_al = AlignUp(h, g), w_al = AlignUp(w, g);
   const bool tile_ragged = (h_al != h) || (w_al != w);
 
+  // slice_input: slice ONE 2D external input `arg` to a [sh, sw] VALID region at (smi, sni),
+  // granule-padding the ALLOCATED extent (the row axis padded only for a reduction/col-major tile —
+  // see the layout note in emit_strip). A broadcast axis (extent 1 in `arg`) stays [1] at offset 0
+  // (read whole, broadcast in the op). Pushes the slice assign to `out` (named base+"_in"+slot so
+  // distinct inputs never collapse) and returns its Var. Factored out of emit_strip so the P4 pass-0
+  // online-stats body can DMA a chunk's x-slice EXACTLY ONCE — the io_in*=2 (A7 stream_passes=2)
+  // pricing depends on each chunk being read once per pass. For a full [IM,IN] input with an aligned
+  // region this is byte-identical to emit_strip's prior inline slice.
+  auto slice_input = [&](const ExprPtr& arg, int64_t sh, int64_t sw, const ExprPtr& smi,
+                         const ExprPtr& sni, std::vector<StmtPtr>& out, int slot) -> VarPtr {
+    const auto [aM, aN] = Static2DShape(arg->GetType());
+    const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
+    const int64_t sw_al = AlignUp(sw, g);
+    const bool bcast_m = (aM == 1), bcast_n = (aN == 1);
+    const int64_t rext = bcast_m ? 1 : sh, rext_al = bcast_m ? 1 : sh_al;
+    const int64_t cext = bcast_n ? 1 : sw, cext_al = bcast_n ? 1 : sw_al;
+    const ExprPtr roff = bcast_m ? MakeIndex(0, sp) : smi;
+    const ExprPtr coff = bcast_n ? MakeIndex(0, sp) : sni;
+    const bool sl_ragged = (rext_al != rext) || (cext_al != cext);
+    ExprPtr sl = sl_ragged
+                     ? reg.Create("tensor.slice",
+                                  {arg, MakeIndexTuple({rext_al, cext_al}, sp), MakeTuple2(roff, coff, sp),
+                                   MakeIndexTuple({rext, cext}, sp)},
+                                  sp)
+                     : reg.Create("tensor.slice", {arg, MakeIndexTuple({rext, cext}, sp),
+                                                   MakeTuple2(roff, coff, sp)}, sp);
+    auto sv = std::make_shared<Var>(base + "_in" + std::to_string(slot), sl->GetType(), sp);
+    out.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
+    return sv;
+  };
+
   // Driver loop: walk the group in order; per op apply the ELEMENTWISE rule — slice each
   // [M,N] input to [h,w] (identity map), read intermediates from on-chip scratch, then
   // reg.Create the op at tile shape (its type-deduction re-infers the tile result), and
@@ -1512,9 +1646,6 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // overflows UB. `has_reduction` is an interim proxy for the tile layout, which is not
     // decided until InferTileMemorySpace; the layout-exact version belongs in a post-layout
     // padding pass (which also fixes the legacy tilers — KNOWN_ISSUES).
-    const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
-    const int64_t sw_al = AlignUp(sw, g);
-    const bool strip_ragged = (sh_al != sh) || (sw_al != sw);
     onchip.clear();                                      // fresh per replay
     std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [sh,w] slice
     VarPtr tv;
@@ -1548,22 +1679,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           auto sit = input_cache.find(v.get());
           if (sit != input_cache.end()) { targs.push_back(sit->second); continue; }
         }
-        const bool bcast_m = (aM == 1), bcast_n = (aN == 1);
-        const int64_t rext = bcast_m ? 1 : sh, rext_al = bcast_m ? 1 : sh_al;
-        const int64_t cext = bcast_n ? 1 : sw, cext_al = bcast_n ? 1 : sw_al;
-        const ExprPtr roff = bcast_m ? MakeIndex(0, sp) : smi;
-        const ExprPtr coff = bcast_n ? MakeIndex(0, sp) : sni;
-        const bool sl_ragged = (rext_al != rext) || (cext_al != cext);
-        ExprPtr sl = sl_ragged
-                         ? reg.Create("tensor.slice",
-                                      {arg, MakeIndexTuple({rext_al, cext_al}, sp), MakeTuple2(roff, coff, sp),
-                                       MakeIndexTuple({rext, cext}, sp)},
-                                      sp)
-                         : reg.Create("tensor.slice", {arg, MakeIndexTuple({rext, cext}, sp),
-                                                       MakeTuple2(roff, coff, sp)}, sp);
         // Unique name per distinct external input; a name-based consumer must not collapse >1 input.
-        auto sv = std::make_shared<Var>(base + "_in" + std::to_string(input_cache.size()), sl->GetType(), sp);
-        out.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
+        VarPtr sv = slice_input(arg, sh, sw, smi, sni, out, static_cast<int>(input_cache.size()));
         if (v != nullptr) input_cache[v.get()] = sv;
         targs.push_back(sv);
       }
@@ -1590,7 +1707,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // overlap: a reduction overlap would double-count), ragged tail via `valid`. The accumulator loop
   // is a Sequential ForStmt whose iter_arg is the accumulator — lowering-proven (the §11.3 spike:
   // MemoryReuse aliases the carry in place). Single pass (level-0 reduction); P2/P3 add recompute.
-  if (stream_p1 || stream_p2) {
+  if (stream_p1 || stream_p2 || stream_p4) {
     const int64_t red_ext = pin_m ? IM : IN;    // pinned/reduced axis extent
     const int64_t free_ext = pin_m ? IN : IM;   // free axis extent
     // Free-axis tile, GRANULE-ALIGNED. The reduced accumulator ([1,w] col-reduce / [h,1] row-reduce)
@@ -1610,8 +1727,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // output can be a live [chunk]-extent band, plus the input slice and accumulator/alignment
     // slack. P2's APPLY pass re-reads the input, recomputes the full cone, AND holds the output
     // chunk being assembled (device: ~5 bands for a 2-op group) — so it needs more headroom than
-    // P1's accumulate pass. Size against the heavier pass (v3 §1d).
-    const int64_t n_bands = static_cast<int64_t>(ops.size()) + (stream_p2 ? 5 : 2);
+    // P1's accumulate pass. P4's online pass-0 holds the widest live set (x-slice + sub + exp +
+    // the [chunk] p, plus the [free_tile,1] m/l/cmax/cl/corr stats), so it gets +6. Size against
+    // the heavier pass (v3 §1d).
+    const int64_t n_bands = static_cast<int64_t>(ops.size()) + (stream_p4 ? 6 : (stream_p2 ? 5 : 2));
     int64_t rc = p1_ub / std::max<int64_t>(1, n_bands * free_tile * p1_dtb);
     rc = std::max<int64_t>(g, (rc / g) * g);    // align down to the DMA granule, >= one granule
     rc = std::min(rc, red_ext);
@@ -1638,6 +1757,155 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       return pin_m ? emit_strip(chunk_ext, free_tile, red_off, foff, out, oc, stop, subs)   // chunk M rows, free_tile N
                    : emit_strip(free_tile, chunk_ext, foff, red_off, out, oc, stop, subs);  // free_tile M, chunk N
     };
+
+    // ========================= P4 — FUSED ONLINE SOFTMAX (flash) =========================
+    // The softmax's TWO coupled reductions (row_max -> sub -> exp -> row_sum) stream in ONE online
+    // pass carrying the running stats (m = running row-max, l = running sum-exp) with the exact
+    // rescale l_new = l_old*exp(m_old - m_new) + chunk_sumexp; then a second APPLY pass re-streams R
+    // substituting the finalized (M_final, L_final). x is read 2x total (A7 stream_passes=2): one DMA
+    // per chunk per pass (slice_input). pin_n only (softmax reduces N) — the [free_tile,1] column-vector
+    // stats broadcast over the chunk via tensor.sub -> tile.row_expand_sub. Both loops Sequential in v1.
+    if (stream_p4) {
+      AssignStmtPtr max_stmt, sum_stmt;
+      for (const auto& a : ops) {
+        auto rcall = As<Call>(a->value_);
+        if (ClassifyOp(rcall) != ::OpType::Reduction) continue;
+        if (IsOp(rcall, "tensor.row_max")) max_stmt = a;
+        else if (IsOp(rcall, "tensor.row_sum")) sum_stmt = a;
+      }
+      INTERNAL_CHECK_SPAN(max_stmt != nullptr && sum_stmt != nullptr, sp)
+          << "Internal error: P4 softmax classified but its row_max/row_sum reductions were not found";
+      auto max_call = As<Call>(max_stmt->value_);
+      auto sum_call = As<Call>(sum_stmt->value_);
+      const ExprPtr x_input = max_call->args_[0];  // full [IM,IN] external input (classifier-checked)
+
+      // Emit one reduced-axis chunk's online-stats update over the [free_tile, chunk_ext] slice at
+      // red_off. DMA x's slice ONCE (slice_input), then:
+      //   cmax  = row_max(x);            m_new = m_in? maximum(m_in,cmax) : cmax
+      //   p     = exp(sub(x, m_new));    cl    = row_sum(p)
+      //   corr  = m_in? exp(sub(m_in,m_new)) : 1;   l_new = l_in? add(mul(l_in,corr), cl) : cl
+      // ORDER MATTERS: compute m_new BEFORE sub/corr; l_new uses OLD l_in*corr + NEW cl. `m_in`/`l_in`
+      // null => the init chunk (m=cmax, l=cl, corr=1). Returns the new ([free_tile,1]) stats.
+      auto p4_chunk = [&](int64_t chunk_ext, const ExprPtr& red_off, VarPtr m_in, VarPtr l_in,
+                          std::vector<StmtPtr>& out, int tag) -> std::pair<VarPtr, VarPtr> {
+        const std::string tg = std::to_string(tag);
+        VarPtr xs = pin_m ? slice_input(x_input, chunk_ext, free_tile, red_off, foff, out, tag)
+                          : slice_input(x_input, free_tile, chunk_ext, foff, red_off, out, tag);
+        auto cmax_c = reg.Create(max_call->op_->name_, {ExprPtr(xs)}, max_call->kwargs_, sp);
+        auto cmax = std::make_shared<Var>(base + "_cmax" + tg, cmax_c->GetType(), sp);
+        out.push_back(std::make_shared<AssignStmt>(cmax, cmax_c, sp));
+        VarPtr m_new;
+        if (m_in == nullptr) {
+          m_new = cmax;
+        } else {
+          auto mn_c = reg.Create("tensor.maximum", {ExprPtr(m_in), ExprPtr(cmax)}, sp);
+          m_new = std::make_shared<Var>(base + "_mnew" + tg, mn_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(m_new, mn_c, sp));
+        }
+        auto sh_c = reg.Create("tensor.sub", {ExprPtr(xs), ExprPtr(m_new)}, sp);  // -> row_expand_sub
+        auto shv = std::make_shared<Var>(base + "_sh" + tg, sh_c->GetType(), sp);
+        out.push_back(std::make_shared<AssignStmt>(shv, sh_c, sp));
+        auto p_c = reg.Create("tensor.exp", {ExprPtr(shv)}, sp);
+        auto pv = std::make_shared<Var>(base + "_p" + tg, p_c->GetType(), sp);
+        out.push_back(std::make_shared<AssignStmt>(pv, p_c, sp));
+        auto cl_c = reg.Create(sum_call->op_->name_, {ExprPtr(pv)}, sum_call->kwargs_, sp);
+        auto cl = std::make_shared<Var>(base + "_cl" + tg, cl_c->GetType(), sp);
+        out.push_back(std::make_shared<AssignStmt>(cl, cl_c, sp));
+        VarPtr l_new;
+        if (l_in == nullptr) {
+          l_new = cl;
+        } else {
+          auto dm_c = reg.Create("tensor.sub", {ExprPtr(m_in), ExprPtr(m_new)}, sp);
+          auto dm = std::make_shared<Var>(base + "_dm" + tg, dm_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(dm, dm_c, sp));
+          auto corr_c = reg.Create("tensor.exp", {ExprPtr(dm)}, sp);
+          auto corr = std::make_shared<Var>(base + "_corr" + tg, corr_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(corr, corr_c, sp));
+          auto lc_c = reg.Create("tensor.mul", {ExprPtr(l_in), ExprPtr(corr)}, sp);
+          auto lc = std::make_shared<Var>(base + "_lc" + tg, lc_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(lc, lc_c, sp));
+          auto ln_c = reg.Create("tensor.add", {ExprPtr(lc), ExprPtr(cl)}, sp);
+          l_new = std::make_shared<Var>(base + "_lnew" + tg, ln_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(l_new, ln_c, sp));
+        }
+        return {m_new, l_new};
+      };
+
+      std::vector<StmtPtr> body;
+      // PASS 0 — online stats. Chunk 0 inits (m=row_max(x0), l=row_sum(exp(x0-m)), corr=1); chunks
+      // 1..num_full merge in a Sequential loop threading {m_it, l_it}; the ragged tail merges after.
+      // Chunks are DISJOINT (a reduction overlap double-counts). Do NOT pipeline in v1.
+      auto [m_cur, l_cur] = p4_chunk(rc, MakeIndex(0, sp), nullptr, nullptr, body, 0);
+      if (num_full >= 2) {
+        auto k = std::make_shared<Var>(base + "_k", index_type, sp);
+        auto m_it = std::make_shared<IterArg>(base + "_m_it", m_cur->GetType(), ExprPtr(m_cur), sp);
+        auto l_it = std::make_shared<IterArg>(base + "_l_it", l_cur->GetType(), ExprPtr(l_cur), sp);
+        std::vector<StmtPtr> lbody;
+        auto [m_new, l_new] = p4_chunk(rc, MakeMul(k, MakeIndex(rc, sp), sp), m_it, l_it, lbody, 1);
+        lbody.push_back(
+            std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(m_new), ExprPtr(l_new)}, sp));
+        auto m_out = std::make_shared<Var>(base + "_m", m_cur->GetType(), sp);
+        auto l_out = std::make_shared<Var>(base + "_l", l_cur->GetType(), sp);
+        body.push_back(std::make_shared<ForStmt>(
+            k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp),
+            std::vector<IterArgPtr>{m_it, l_it}, SeqStmts::Flatten(std::move(lbody), sp),
+            std::vector<VarPtr>{m_out, l_out}, sp, ForKind::Sequential));
+        m_cur = m_out;
+        l_cur = l_out;
+      }
+      if (rem > 0) {
+        auto [m_new, l_new] = p4_chunk(rem, MakeIndex(num_full * rc, sp), m_cur, l_cur, body, 2);
+        m_cur = m_new;
+        l_cur = l_new;
+      }
+      const VarPtr m_final = m_cur, l_final = l_cur;  // finalized [free_tile,1] stats
+
+      // PASS 1 — apply. Re-stream R; per chunk recompute the sink cone substituting BOTH finalized
+      // stats (M_final for row_max, L_final for row_sum) and assemble the [free_tile,chunk] result into
+      // the full-shape [IM,IN] output. emit_strip replays sub(x,M_final)->exp->div(e,L_final) — row_max
+      // and row_sum are substituted, so x is DMA'd once here too. Output threaded as an iter_arg ->
+      // in-place stores (RewriteReturnedAssembleLoopToStore). Sequential in v1.
+      const std::unordered_map<const Var*, VarPtr> subs = {
+          {max_stmt->var_.get(), m_final}, {sum_stmt->var_.get(), l_final}};
+      auto asm_at = [&](const ExprPtr& coff) -> ExprPtr {
+        return pin_m ? MakeTuple2(coff, foff, sp)    // reduce M: [rc, free_tile] at [coff, foff]
+                     : MakeTuple2(foff, coff, sp);   // reduce N: [free_tile, rc] at [foff, coff]
+      };
+      VarPtr out_cur = c_init;
+      {
+        auto s = std::make_shared<Var>(base + "_ps", index_type, sp);
+        auto out_it = std::make_shared<IterArg>(base + "_oit", c_init->GetType(), ExprPtr(c_init), sp);
+        ExprPtr coff = MakeMul(s, MakeIndex(rc, sp), sp);
+        std::vector<StmtPtr> lbody;
+        std::unordered_map<const Var*, VarPtr> ocp;
+        VarPtr och = strip_at(rc, coff, lbody, ocp, nullptr, &subs);
+        auto asm_c = reg.Create("tensor.assemble", {ExprPtr(out_it), ExprPtr(och), asm_at(coff)}, sp);
+        auto on = std::make_shared<Var>(base + "_on", asm_c->GetType(), sp);
+        lbody.push_back(std::make_shared<AssignStmt>(on, asm_c, sp));
+        lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(on)}, sp));
+        auto ofin =
+            std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
+        body.push_back(std::make_shared<ForStmt>(
+            s, MakeIndex(0, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{out_it},
+            SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{rem > 0 ? ofin : c_var}, sp,
+            ForKind::Sequential));
+        out_cur = rem > 0 ? ofin : c_var;
+      }
+      if (rem > 0) {  // ragged tail apply chunk
+        std::unordered_map<const Var*, VarPtr> oct;
+        ExprPtr coff = MakeIndex(num_full * rc, sp);
+        VarPtr och = strip_at(rem, coff, body, oct, nullptr, &subs);
+        auto asm_c = reg.Create("tensor.assemble", {ExprPtr(out_cur), ExprPtr(och), asm_at(coff)}, sp);
+        body.push_back(std::make_shared<AssignStmt>(c_var, asm_c, sp));
+      }
+
+      auto scope = SpmdWrap(t, std::move(body), MakeIndex(num_free, sp), name, sp);
+      LOG_INFO << "AutoFuse[generic]: STREAMED fused online softmax (P4) '" << name << "' ("
+               << ops.size() << " ops, reduce " << (pin_m ? "M" : "N") << " ext=" << red_ext << " chunk="
+               << rc << "x" << num_full << (rem ? "+tail" : "") << ", free grid " << num_free
+               << ", online (m,l) stats)";
+      return std::vector<StmtPtr>{c_init_assign, scope};
+    }
 
     std::vector<StmtPtr> body;
     // PASS 0 — accumulate the reduction over disjoint reduced-axis chunks (stop at the reduction op).
@@ -1868,7 +2136,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // for an analytic plan that slips through — decline to the legacy tiler rather than emit an
   // over-UB tile that fails downstream at AllocateMemoryAddr. Small multi-reduction groups (the
   // thinnest tile fits) and single-reduction streamed groups (returned above) are unaffected.
-  if (has_reduction && p1_nreds > 1 && (pin_m || pin_n)) {
+  if (has_reduction && p1_nreds > 1 && (pin_m || pin_n) && !stream_p4) {
     const int64_t g1_red = pin_m ? IM : IN;  // pinned reduced axis (full)
     if (static_cast<int64_t>(ops.size()) * g1_red * p1_dtb > p1_ub)
       return GenericDeclineB("streamed multi-reduction (softmax/layernorm) over a reduced axis too "
