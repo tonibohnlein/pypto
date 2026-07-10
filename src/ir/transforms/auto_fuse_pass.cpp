@@ -878,11 +878,25 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
     auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
     auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
     auto zero = std::make_shared<ConstFloat>(0.0, dtype, sp);
+    // The per-tile seed [h,w] can ITSELF exceed UB (C3's larger tiles: a [256,256] fp32 seed = 256KB >
+    // the 188KB UB). Zero [M,N] in UB-FITTING [seed_h, w] tiles instead: cap the row extent so one seed
+    // tile fits (a constant fill needs one live band). seed_h == h when [h,w] already fits, so aligned
+    // small tiles emit the same grid as before. The grid covers [M,N] disjointly with a ragged-M clamp
+    // — idempotent for the non-atomic zero fill (the matmul's atomic-add partials then land on 0).
+    const auto* seed_pctx = PassContext::Current();
+    const auto* seed_handler = seed_pctx ? seed_pctx->GetBackendHandler()
+                                         : pypto::backend::GetBackend()->GetHandler();
+    const int64_t seed_dtb = std::max<int64_t>(1, static_cast<int64_t>(dtype.GetBit()) / 8);
+    const int64_t seed_ub = static_cast<int64_t>(seed_handler->GetVectorBufferCapacityBytes());
+    const int64_t seed_h = std::min(h, std::max<int64_t>(1, seed_ub / std::max<int64_t>(1, w * seed_dtb)));
+    const int64_t num_seed_m = (M + seed_h - 1) / seed_h;  // ceil over the M axis
+    const int64_t num_seed_tiles = num_seed_m * num_n;
     // Per-seed-block tile offsets from its block index (SpmdWrap prepends st = get_block_idx()).
     auto st = std::make_shared<Var>(base + "_st", index_type, sp);
-    auto s_mi = MakeMul(MakeFloorDiv(st, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
+    ExprPtr s_mi = MakeMul(MakeFloorDiv(st, MakeIndex(num_n, sp), sp), MakeIndex(seed_h, sp), sp);
+    if (M % seed_h != 0) s_mi = MakeMin(s_mi, MakeIndex(M - seed_h, sp), sp);  // ragged last M strip clamp
     auto s_ni = MakeMul(MakeFloorMod(st, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
-    auto z_call = reg.Create("tensor.full", {MakeIndexTuple({h, w}, sp), zero}, {{"dtype", dtype}}, sp);
+    auto z_call = reg.Create("tensor.full", {MakeIndexTuple({seed_h, w}, sp), zero}, {{"dtype", dtype}}, sp);
     auto z = std::make_shared<Var>(base + "_z", z_call->GetType(), sp);
     auto seed_asm = reg.Create("tensor.assemble", {c_init, z, MakeTuple2(s_mi, s_ni, sp)}, sp);
     auto c_seeded = std::make_shared<Var>(base + "_seeded", seed_asm->GetType(), sp);
@@ -890,7 +904,7 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
         st,
         std::vector<StmtPtr>{std::make_shared<AssignStmt>(z, z_call, sp),
                              std::make_shared<AssignStmt>(c_seeded, seed_asm, sp)},
-        MakeIndex(num_tiles, sp), name + "_seed", sp);
+        MakeIndex(num_seed_tiles, sp), name + "_seed", sp);
 
     // t in [0, num_tiles*S): ks = t % S (k-slice), sp_idx = t / S (spatial tile) ->
     // mt = sp_idx / num_n, nt = sp_idx % num_n; offsets mi/ni and k_base = ks*ksz.
@@ -1885,22 +1899,42 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // chunks its FREE (row) axis — its reduced axis is pinned full and reaches here only when it already
   // fits UB (over-UB single/multi reductions were streamed/declined above) — so this bump only fires for
   // pointwise, but strip_fits is layout-correct (col-major reduction rows padded to g) for both.
-  // Live UB footprint per strip = STAGE_COUNT bands of the strip tile. The stage-2 pipeline holds two
-  // strips in flight (load the next while computing the current), and MemoryReuse aliases the fused op
-  // chain's intermediates INTO those two ping-pong buffers — so the peak is ~2 strip tiles REGARDLESS of
-  // chain length, NOT (ops+1). Empirically confirmed on Ascend910B: a 1-op [512,64] strip peaks at
-  // exactly 262144 = 2 x [512,64] (crashes AllocateMemoryAddr > 188416 UB), while a 6-op chain at the
-  // same [256,64] strip fits (2 x [256,64] = 131072 <= UB) — the 6 intermediates added NO bands. (A
-  // group with a wide live antichain / fan-out could exceed this; such groups are not the target here
-  // and would overflow the legacy tiler too — the cost model's vector_peak_ub is the authoritative
-  // feasibility for them.)
-  const int64_t kPipelineStages = 2;  // matches kPipelineStagesAttr below (the ping-pong depth)
+  // Live UB footprint per strip = `pipe_bands` bands of the strip tile. This is the PEAK number of
+  // simultaneously-live tiles over the op chain (what MemoryReuse actually allocates), + 1 for the
+  // stage-2 pipeline's prefetch band. A LINEAR chain frees each input right after its op, so the peak
+  // is small (a→c→d: {a,c} then {c,d} = 2); but a chain that REUSES an input keeps it live across the
+  // chain: (a+b)*b holds b through both ops → peak {a,b,c} / {b,c,d} = 3. A fixed constant (the old
+  // "2") UNDER-counted reuse — on device a wide `(a+b)*b` [64,4096] tile's [.,4096] strip needed 4
+  // bands (196608 B) but was sized for 2 (98304) and overflowed AllocateMemoryAddr. Compute the real
+  // peak so the strip is bounded for reused-input / fan-out chains too (the row-stream then chunks a
+  // wide tile down to [1..few, w], which fits). O(ops^2), ops is a small fused chain.
+  int64_t peak_live = 0;
+  {
+    std::unordered_map<const Var*, std::pair<int, int>> life;  // var -> [first_step, last_step]
+    for (int s = 0; s < static_cast<int>(ops.size()); ++s) {
+      life[ops[s]->var_.get()] = {s, s};  // this op's output tile, produced at s
+      for (const ExprPtr& arg : As<Call>(ops[s]->value_)->args_) {
+        auto v = AsVarLike(arg);
+        if (v == nullptr) continue;
+        auto it = life.find(v.get());
+        if (it == life.end()) life[v.get()] = {s, s};  // external input, first use
+        else it->second.second = s;                    // extend last-use (op output or reused input)
+      }
+    }
+    for (int s = 0; s < static_cast<int>(ops.size()); ++s) {
+      int64_t live = 0;
+      for (const auto& [v, iv] : life)
+        if (iv.first <= s && s <= iv.second) ++live;
+      peak_live = std::max(peak_live, live);
+    }
+  }
+  const int64_t pipe_bands = std::max<int64_t>(2, peak_live + 1);  // +1 = stage-2 prefetch band
   const int64_t w_al_bytes = AlignUp(w, g) * p1_dtb;
   // Does a strip of `sh` rows fit UB under the stage-2 ping-pong? Rows are the FREE (unpadded) axis for
   // pointwise; padded to g for a col-major reduction tile. Width is always granule-padded.
   auto strip_fits = [&](int64_t sh) -> bool {
     const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
-    return kPipelineStages * sh_al * w_al_bytes <= p1_ub;
+    return pipe_bands * sh_al * w_al_bytes <= p1_ub;
   };
   int64_t num_strips = 1;
   if (!has_col_reduction) {
