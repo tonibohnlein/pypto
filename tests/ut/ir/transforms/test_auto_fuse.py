@@ -344,7 +344,9 @@ class TestAutoFuse:
         Pinned to Ascend910B (48 vector cores): for `[4096,384]` the grounded solver picks
         a `[512,64]` tile, so the output tiles into 8x6 = 48 disjoint regions — one per AIV
         core — emitted as a single flat `pl.spmd(48)` loop. No split-K (pointwise has no
-        contraction), so no zero-seed and a plain (non-atomic) per-tile `assemble`.
+        contraction), so no zero-seed and a plain (non-atomic) per-tile `assemble`. (This is
+        the legacy tiler; the C3 per-task-overhead term that prefers fewer tiles is gated on
+        the generic emit — see test_c3_per_task_overhead_prefers_fewer_tiles.)
         """
 
         @pl.program
@@ -615,6 +617,34 @@ class TestAutoFuse:
         assert torch.allclose(out, ref, rtol=1e-4, atol=1e-4), (
             f"max abs diff {(out - ref).abs().max().item():.3e}"
         )
+
+    def test_c3_per_task_overhead_prefers_fewer_tiles(self, ascend_backend, monkeypatch):
+        """The C3 per-task launch-overhead term steers the solver toward FEWER, larger tiles.
+
+        A DDR-bound pointwise kernel's per-wave fill cost is flat for num_tiles <= cores, so the
+        pre-C3 model tied 48 `[512,64]` tiles with 12 `[2048,64]` tiles; a device sweep found the
+        12-tile plan faster (fewer host launches). C3 adds `num_tiles*split*c_task`, so best_cost
+        separates them toward the 12-tile plan. It is GATED on the generic emit — only the
+        streaming emit can build the larger `[2048,64]` tile (it UB-streams it into pipeline
+        strips; the legacy tiler materializes the whole tile and overflows UB), so pricing
+        fewer-tile plans for the legacy path would pick tiles it cannot realize. Hence with
+        ``PYPTO_AUTOFUSE_GENERIC_EMIT=1``: `[4096,384]` tiles to `pl.spmd(12)` (not the legacy
+        48 — see test_single_pointwise_tiles_across_vector_cores) and lowers end-to-end.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw(self, a: pl.Tensor[[4096, 384], pl.FP32]) -> pl.Tensor[[4096, 384], pl.FP32]:
+                c: pl.Tensor[[4096, 384], pl.FP32] = pl.add(a, 1.0)
+                return c
+
+        body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw").as_python()
+        # C3 prefers fewer tiles: [2048,64] -> 2x6 = 12 tasks, not the pre-C3 [512,64] -> 48.
+        assert "pl.spmd(12" in body and body.count("pl.spmd(") == 1
+        # The larger tile lowers (row-streamed to fit UB, not materialized -> no AllocateMemoryAddr).
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
 
     def test_inout_param_is_a_solver_input(self, ascend_backend):
         """An InOut param is READ by a fused op, so the solver must register it as a graph
