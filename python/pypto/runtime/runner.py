@@ -395,7 +395,7 @@ class RunResult:
         return msg + time_str
 
 
-def compile_program(
+def compile_program(  # noqa: PLR0913
     program: Any,
     work_dir: Path,
     *,
