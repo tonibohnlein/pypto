@@ -962,6 +962,105 @@ class TestAutoFuse:
             f"max abs diff {(out - torch.softmax(x, dim=1)).abs().max().item():.3e}"
         )
 
+    def test_p4_layernorm_dualsum_fuses_into_one_streamed_kernel(self, ascend_backend, monkeypatch):
+        """P4 increment 2: a DUAL-SUM layernorm over a UB-overflowing reduced axis FUSES into ONE
+        streamed online kernel (behind PYPTO_AUTOFUSE_P4), instead of the G1 cut into row_sum pieces.
+
+        Dual-sum = TWO INDEPENDENT reductions Sx=row_sum(x) and Sxsq=row_sum(x^2), both derived
+        directly from x (NOT the chained row_sum((x-mu)^2), which depends on the finalized mean). The
+        emit streams both sums in ONE pass 0 carrying a two-accumulator loop ({s0, s1} merged by add,
+        no rescale), then a pass-1 apply re-streams R substituting the finalized (S0, S1) to compute
+        mean/var/inv and the spanning (x-mean)*inv. Both passes Sequential in v1.
+
+        The DAG must be FULLY NAMED (a nested-argument call drops the inner op from the solver graph
+        and misses P4; see KNOWN_ISSUES). var=E[x^2]-E[x]^2 is checked for a non-zero-mean input too
+        (the dual-sum cancellation risk); it stays exact in fp32 here.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+        n = 8192
+        eps = 1e-5
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def ln(self, x: pl.Tensor[[128, n], pl.FP32]) -> pl.Tensor[[128, n], pl.FP32]:
+                sx: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(x)  # Sx  (reduction 1)
+                xsq: pl.Tensor[[128, n], pl.FP32] = pl.mul(x, x)
+                sxsq: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(xsq)  # Sx^2 (reduction 2, independent)
+                mean: pl.Tensor[[128, 1], pl.FP32] = pl.mul(sx, 1.0 / n)
+                msq: pl.Tensor[[128, 1], pl.FP32] = pl.mul(sxsq, 1.0 / n)
+                m2: pl.Tensor[[128, 1], pl.FP32] = pl.mul(mean, mean)
+                var: pl.Tensor[[128, 1], pl.FP32] = pl.sub(msq, m2)  # E[x^2] - E[x]^2
+                veps: pl.Tensor[[128, 1], pl.FP32] = pl.add(var, eps)
+                inv: pl.Tensor[[128, 1], pl.FP32] = pl.rsqrt(veps)
+                xc: pl.Tensor[[128, n], pl.FP32] = pl.row_expand_sub(x, mean)  # x - mean (spanning)
+                out: pl.Tensor[[128, n], pl.FP32] = pl.row_expand_mul(xc, inv)  # * inv   (spanning)
+                return out
+
+        fused = passes.auto_fuse()(Prog)
+        body = next(f for _, f in fused.functions.items() if f.name == "ln").as_python()
+        # ONE fused streamed kernel (not the G1 cut), carrying TWO independent online sums.
+        assert body.count("pl.spmd(") == 1, body
+        assert "_s0_it" in body and "_s1_it" in body  # the two-accumulator running-sums loop carries
+        # Each accumulator merges its per-chunk partial by a plain add (no rescale — sums associate).
+        assert body.count("pl.tensor.add(") >= 2, body
+
+        # Lowers through the full pipeline (streamed, fits UB — no AllocateMemoryAddr overflow).
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+
+        # Numerically matches a torch layernorm reference. torch_codegen runs fp32 on CPU (torch.rsqrt
+        # is exact), so the algorithm itself is validated tight; the 1e-2 tol only budgets the silicon
+        # HW-rsqrt approximation. Checked for a zero-mean AND a non-zero-mean (mean~5) input — the
+        # dual-sum var = E[x^2] - E[x]^2 cancellation stays acceptable in fp32.
+        code = torch_codegen(fused, run_all_spmd_blocks=True)
+        namespace: dict = {}
+        exec(code, namespace)  # noqa: S102
+
+        def _ref(x):
+            return (x - x.mean(-1, keepdim=True)) / torch.sqrt(
+                x.var(-1, keepdim=True, unbiased=False) + eps
+            )
+
+        torch.manual_seed(0)
+        for x in (torch.randn(128, n, dtype=torch.float32),
+                  torch.randn(128, n, dtype=torch.float32) * 2 + 5):  # non-zero-mean case
+            out = namespace["ln"](x)
+            ref = _ref(x)
+            assert torch.allclose(out, ref, rtol=1e-2, atol=1e-2), (
+                f"max abs diff {(out - ref).abs().max().item():.3e}"
+            )
+
+        # A CHAINED layernorm — row_sum((x-mu)^2) depends on the finalized mean, so the two sums are
+        # NOT independent — must DECLINE P4 (classify_p4 -> None) and be CUT by the solver, NOT fused
+        # into the two-accumulator dual-sum kernel. This is the dual-sum-vs-Welford boundary.
+        @pl.program
+        class Chained:
+            @pl.function(attrs={"auto_fuse": True})
+            def ln(self, x: pl.Tensor[[128, n], pl.FP32]) -> pl.Tensor[[128, n], pl.FP32]:
+                sx: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(x)
+                mu: pl.Tensor[[128, 1], pl.FP32] = pl.mul(sx, 1.0 / n)
+                xc: pl.Tensor[[128, n], pl.FP32] = pl.sub(x, mu)
+                sq: pl.Tensor[[128, n], pl.FP32] = pl.mul(xc, xc)
+                sv: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(sq)  # depends on mu -> sx (CHAINED)
+                var: pl.Tensor[[128, 1], pl.FP32] = pl.mul(sv, 1.0 / n)
+                ve: pl.Tensor[[128, 1], pl.FP32] = pl.add(var, eps)
+                inv: pl.Tensor[[128, 1], pl.FP32] = pl.rsqrt(ve)
+                out: pl.Tensor[[128, n], pl.FP32] = pl.mul(xc, inv)
+                return out
+
+        chained = passes.auto_fuse()(Chained)
+        cbody = next(f for _, f in chained.functions.items() if f.name == "ln").as_python()
+        # Declined: the group is CUT (>= 2 streamed spmd scopes), NOT the single dual-sum kernel — no
+        # two-accumulator loop marker is emitted.
+        assert "_s0_it" not in cbody and "_s1_it" not in cbody, cbody
+        assert cbody.count("pl.spmd(") >= 2, cbody
+        # And the chained cut still lowers cleanly (no overflow) through the full pipeline.
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Chained)
+
     def test_inline_return_multi_reduction_lowers_and_is_correct(self, ascend_backend, monkeypatch):
         """A multi-reduction group (softmax = row_max + row_sum; layernorm = two row_sums) written
         with a DIRECT ``return pl.op(...)`` — the idiomatic form. Two guards on one path:
