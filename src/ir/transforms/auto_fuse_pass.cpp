@@ -1656,9 +1656,18 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       lbody.push_back(std::make_shared<AssignStmt>(acc_n, m_call, sp));
       lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{acc_n}, sp));
       auto acc_out = std::make_shared<Var>(base + "_acc", acc->GetType(), sp);
+      // A5 (G2): PIPELINE the accumulate pass. The running accumulator `acc_it` is a TRUE loop carry
+      // (acc_n = merge(acc_it, part_k)), so it stays single-buffered/persistent; only the per-chunk
+      // load+reduce (`part`) double-buffers — stage=2 overlaps chunk k+1's load with chunk k's
+      // reduce+merge, hiding the DDR-bound input read behind compute (this is the P1/P2 FIRST pass).
+      // Pipeline only when the trip (num_full-1) is >= 2; else nothing to overlap.
+      const bool pipe_acc = (num_full - 1) >= 2;
+      std::vector<std::pair<std::string, std::any>> acc_attrs;
+      if (pipe_acc) acc_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
       body.push_back(std::make_shared<ForStmt>(
           k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{acc_it},
-          SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{acc_out}, sp, ForKind::Sequential));
+          SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{acc_out}, sp,
+          pipe_acc ? ForKind::Pipeline : ForKind::Sequential, std::move(acc_attrs)));
       acc = acc_out;
     }
     if (rem > 0) {
@@ -1700,10 +1709,19 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{on}, sp));
         // No ragged tail -> the loop output IS the sink; else an intermediate the tail assembles into.
         auto ofin = std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
+        // A5 (G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT reduced-axis
+        // chunk (out_it is only the assemble target — the pointwise-strip pattern, lowered to an in-place
+        // store by RewriteReturnedAssembleLoopToStore), so a stage=2 loop overlaps chunk s+1's load with
+        // chunk s's apply: the DDR-bound re-read (this is the P2/softmax/layernorm SECOND pass) hides
+        // behind compute, realizing the model's max(compute,ddr). The finalized stat `acc` is a
+        // loop-invariant broadcast operand (single-buffered, read each iter). Serial for a 1-chunk loop.
+        const bool pipe_apply = num_full >= 2;
+        std::vector<std::pair<std::string, std::any>> apply_attrs;
+        if (pipe_apply) apply_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
         body.push_back(std::make_shared<ForStmt>(
             s, MakeIndex(0, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{out_it},
             SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{rem > 0 ? ofin : c_var}, sp,
-            ForKind::Sequential));
+            pipe_apply ? ForKind::Pipeline : ForKind::Sequential, std::move(apply_attrs)));
         out_cur = rem > 0 ? ofin : c_var;
       }
       if (rem > 0) {  // ragged tail apply chunk
