@@ -21,6 +21,7 @@ one kernel. The Outline/Convert/Tile pipeline then lowers each scope to a cube
 """
 
 import json
+import re
 
 import pypto.language as pl
 import pytest
@@ -564,6 +565,56 @@ class TestAutoFuse:
         # The fused chain is ONE vector kernel, not two.
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
         assert str(incores[0].func_type) == "FunctionType.AIV"
+
+    def test_tall_pointwise_streams_within_ub(self, ascend_backend, monkeypatch):
+        """A tall pointwise tile is row-STREAMED into enough pipeline strips to fit UB.
+
+        Each vector core's tile is realized as a stage-2 pipeline over row strips. The strip
+        count was a fixed heuristic (h/8) with NO UB bound, so a tall tile overflowed the
+        vector buffer: at h/8 a ``[262144,64]`` problem tiles to ~``[5461,64]`` per core, whose
+        ``[682,64]`` strip double-buffers to 682*64*4*2 = 698368 bytes >> the 188416-byte UB,
+        and lowering crashed at ``AllocateMemoryAddr``. The emit now BOUNDS the strip by UB: it
+        doubles the strip count past the {8,4,2} heuristic until the stage-2 ping-pong of a
+        strip (2 bands — MemoryReuse aliases a fused chain's intermediates into the two
+        pipeline buffers, so the peak is chain-length-independent) fits UB. So the tall tile
+        streams (>8 strips) and lowers. Rows are the free axis (no col-major granule pad), and
+        the ragged last strip is clamped in-bounds — an idempotent overlap for the non-atomic
+        assemble, so every row is written exactly once in effect (checked numerically).
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw(self, a: pl.Tensor[[262144, 64], pl.FP32]) -> pl.Tensor[[262144, 64], pl.FP32]:
+                b: pl.Tensor[[262144, 64], pl.FP32] = pl.add(a, 1.0)
+                c: pl.Tensor[[262144, 64], pl.FP32] = pl.mul(b, 2.0)
+                return c
+
+        fused = passes.auto_fuse()(Prog)
+        body = next(f for _, f in fused.functions.items() if f.name == "pw").as_python()
+        # The UB bump fired: more strips than the {8,4,2} heuristic max of 8.
+        strips = [int(n) for n in re.findall(r"pl\.pipeline\((\d+)", body)]
+        assert strips and strips[0] > 8, f"expected UB-bumped strip count > 8, got {strips}"
+
+        # Lowers through the full pipeline WITHOUT overflowing UB (the AllocateMemoryAddr crash
+        # this fix prevents). run_passes raises on the overflow, so reaching here is the assertion.
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+
+        # ...and is numerically exact — the streamed strips + ragged clamp write every row.
+        code = torch_codegen(fused, run_all_spmd_blocks=True)
+        namespace: dict = {}
+        exec(code, namespace)  # noqa: S102
+        torch.manual_seed(0)
+        a = torch.randn(262144, 64, dtype=torch.float32)
+        out = namespace["pw"](a)
+        ref = (a + 1.0) * 2.0
+        assert torch.allclose(out, ref, rtol=1e-4, atol=1e-4), (
+            f"max abs diff {(out - ref).abs().max().item():.3e}"
+        )
 
     def test_inout_param_is_a_solver_input(self, ascend_backend):
         """An InOut param is READ by a fused op, so the solver must register it as a graph

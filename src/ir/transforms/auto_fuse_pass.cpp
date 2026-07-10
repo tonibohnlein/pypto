@@ -1852,6 +1852,34 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // Require granule-multiple strips there (zero per-strip padding); if none exists, stay serial —
   // the cost model prices that as compute+ddr, which is honest for a tile too short to pipeline at
   // granule granularity. Pointwise tiles (rows free, unpadded) pipeline at any strip height.
+  // Row-strip count. Two concerns: (a) PERF — chunk h into equal strips for a steady-state stage-2
+  // pipeline; (b) UB — each strip's live-band footprint must fit UB. The old {8,4,2} heuristic sized
+  // strip_h = h/8 with NO UB bound, so a tall pointwise tile overflowed AllocateMemoryAddr (a [512,64]
+  // strip peaked at 262144 > 188416 UB). Fix: after the perf heuristic, force MORE strips (double from
+  // the heuristic) until a strip fits UB. Streams the ROW axis — exact parity with the cost model's
+  // vector_stream, which streams the LARGER axis == rows for a tall tile == the C3 case (a wide w>h tile
+  // also streams rows here, which fits UB but is a minor roofline-fidelity gap vs the model's width
+  // stream — a follow-up width-stream closes it; see KNOWN_ISSUES). A materialized reduction only ever
+  // chunks its FREE (row) axis — its reduced axis is pinned full and reaches here only when it already
+  // fits UB (over-UB single/multi reductions were streamed/declined above) — so this bump only fires for
+  // pointwise, but strip_fits is layout-correct (col-major reduction rows padded to g) for both.
+  // Live UB footprint per strip = STAGE_COUNT bands of the strip tile. The stage-2 pipeline holds two
+  // strips in flight (load the next while computing the current), and MemoryReuse aliases the fused op
+  // chain's intermediates INTO those two ping-pong buffers — so the peak is ~2 strip tiles REGARDLESS of
+  // chain length, NOT (ops+1). Empirically confirmed on Ascend910B: a 1-op [512,64] strip peaks at
+  // exactly 262144 = 2 x [512,64] (crashes AllocateMemoryAddr > 188416 UB), while a 6-op chain at the
+  // same [256,64] strip fits (2 x [256,64] = 131072 <= UB) — the 6 intermediates added NO bands. (A
+  // group with a wide live antichain / fan-out could exceed this; such groups are not the target here
+  // and would overflow the legacy tiler too — the cost model's vector_peak_ub is the authoritative
+  // feasibility for them.)
+  const int64_t kPipelineStages = 2;  // matches kPipelineStagesAttr below (the ping-pong depth)
+  const int64_t w_al_bytes = AlignUp(w, g) * p1_dtb;
+  // Does a strip of `sh` rows fit UB under the stage-2 ping-pong? Rows are the FREE (unpadded) axis for
+  // pointwise; padded to g for a col-major reduction tile. Width is always granule-padded.
+  auto strip_fits = [&](int64_t sh) -> bool {
+    const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
+    return kPipelineStages * sh_al * w_al_bytes <= p1_ub;
+  };
   int64_t num_strips = 1;
   if (!has_col_reduction) {
     for (int64_t ns : {8, 4, 2}) {
@@ -1860,11 +1888,22 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       num_strips = ns;
       break;
     }
+    // UB guarantee: bump the strip count until the double-buffered strip fits UB. Strips become
+    // ceil(h/num_strips) (uniform); the ragged last strip is clamped in-bounds below (idempotent
+    // overlap for a non-atomic pointwise assemble). Doubling keeps a clean pipeline trip count; the
+    // final chunk is >= UB-fitting. Cap at h (strip_h==1); a single row still over UB -> decline.
+    while (num_strips < h && !strip_fits((h + num_strips - 1) / num_strips))
+      num_strips = std::min<int64_t>(num_strips * 2, h);
+    if (!strip_fits((h + num_strips - 1) / num_strips))
+      return GenericDeclineB("pointwise tile row too wide to stream within UB (a single-row double "
+                             "buffer exceeds UB) — declining to the legacy tiler",
+                             out_stmt->span_);
   }
 
   std::vector<StmtPtr> body_stmts;
   if (num_strips < 2) {
-    // Serial (matches the cost model's db=false): the whole tile is one strip.
+    // Serial (matches the cost model's db=false): the whole tile is one strip. Only reached when the
+    // whole [h,w] tile fits UB — an over-UB tile bumped num_strips >= 2 above.
     std::unordered_map<const Var*, VarPtr> oc_serial;
     VarPtr tv = emit_strip(h, w, mi, ni, body_stmts, oc_serial);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tv, MakeTuple2(mi, ni, sp)}, sp);
@@ -1872,14 +1911,21 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   } else {
     // Pipelined: for s in pipeline(0, num_strips, stage=2) iter_args=[out <- c_init]:
     //   strip at (mi + s*strip_h, ni); replay ops -> strip tile; out = assemble(out, strip, off); yield.
-    // The output iter_arg is used ONLY as the assemble target (source/offset reference s & t, not the
-    // iter_arg), so ConvertTensorToTileOps::RewriteReturnedAssembleLoopToStore lowers it to an in-place
-    // tile.store while preserving kind==Pipeline + pipeline_stages.
-    const int64_t strip_h = h / num_strips;
+    // Strips are UNIFORM height strip_h = ceil(h/num_strips); the last (ragged) strip's row offset is
+    // clamped in-bounds — an overlapping re-compute, idempotent for the non-atomic pointwise assemble
+    // (same clamp trick as the SPMD grid mi/ni and the reduction free axis). For a dividing num_strips
+    // (the pre-UB {8,4,2} case) ceil == h/num_strips and the clamp is a no-op -> emit byte-identical to
+    // before. The output iter_arg is used ONLY as the assemble target (source/offset reference s & t,
+    // not the iter_arg), so ConvertTensorToTileOps::RewriteReturnedAssembleLoopToStore lowers it to an
+    // in-place tile.store while preserving kind==Pipeline + pipeline_stages.
+    const int64_t strip_h = (h + num_strips - 1) / num_strips;  // ceil, uniform
+    const bool strip_ragged = strip_h * num_strips > h;         // last strip overruns h -> clamp
     auto index_ty = std::make_shared<ScalarType>(DataType::INDEX);
     auto s = std::make_shared<Var>(base + "_s", index_ty, sp);
     auto out_iter = std::make_shared<IterArg>(base + "_out_it", c_init->GetType(), ExprPtr(c_init), sp);
-    ExprPtr smi = MakeAdd(mi, MakeMul(s, MakeIndex(strip_h, sp), sp), sp);
+    ExprPtr srow = MakeMul(s, MakeIndex(strip_h, sp), sp);
+    if (strip_ragged) srow = MakeMin(srow, MakeIndex(h - strip_h, sp), sp);
+    ExprPtr smi = MakeAdd(mi, srow, sp);
     std::vector<StmtPtr> loop_body;
     std::unordered_map<const Var*, VarPtr> oc_pipe;
     VarPtr tv = emit_strip(strip_h, w, smi, ni, loop_body, oc_pipe);
