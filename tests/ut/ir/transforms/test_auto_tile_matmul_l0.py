@@ -1512,6 +1512,57 @@ class TestAutoTileMatmulL0MNTiling:
                 f"dbC=1 (PyPTO) must interleave matmul,store (one accumulator), got: {pypto_seq}"
             )
 
+    def test_mat_scratch_producer_gated_to_dbc1(self):
+        """The Mat-scratch (Acc->Mat ``tile.assemble``) chained producer is gated to
+        dbC=1 even under PTOAS (where the chooser would otherwise enable dbC=2 for this
+        256x64x256 grid): its ``pto.mte_l0c_l1`` (TINSERT) co-live reuse-WAR fence is
+        emitted by ptoas but ineffective at runtime for the L0C->L1 writeback
+        (device-confirmed wrong on every ptoas x runtime pin, while the identical Acc->GM
+        ``tile.store`` drain is correct), so ``TryFoldMatScratch`` forces
+        ``double_buffer_c=false``. Guards against an accidental re-enable: the Mat-scratch
+        producer must tile into a grid (>= 2 Acc->Mat assembles) yet carry NO
+        ``pipeline_double_buffer_c`` attr. Direct-store dbC=2 is unaffected (see the
+        golden co-live test above)."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 64], pl.BF16],
+                b: pl.Tensor[[64, 256], pl.BF16],
+                e: pl.Tensor[[256, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [256, 256] > L0c -> Mat scratch
+                cb = pl.cast(c, pl.BF16, mode="rint")
+                d = pl.matmul(cb, e, out_dtype=pl.FP32)
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        # PTOAS enables the dbC=2 design point in the chooser; the Mat-scratch emit
+        # (TryFoldMatScratch) must gate it back off. auto_tile attaches the dbC attr
+        # (before LowerPipelineLoops consumes it), so its absence here proves the gate.
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(After)
+
+        # The Mat-scratch (Acc->Mat assemble) path must fire on this chained matmul (a
+        # Mat create + a nested full-K pipeline grid drained via tile.assemble) — this is
+        # the device-confirmed dbC=2 shape (see _DbcMatScratch in the device s-test).
+        assert "tile.create" in printed and "Mem.Mat" in printed and "pl.tile.assemble(" in printed, (
+            "expected the Mat-scratch (Acc->Mat assemble) path to fire:\n" + printed
+        )
+        # ... but the moving loop must NOT carry the dbC attr: BuildFullKPipelined attaches
+        # kPipelineDoubleBufferCAttr only when t.double_buffer_c, which TryFoldMatScratch
+        # forces false for the assemble drain. Its absence proves the gate held.
+        assert "pipeline_double_buffer_c" not in printed, (
+            "Mat-scratch producer must be gated to dbC=1 (no pipeline_double_buffer_c attr): "
+            "its tile.assemble (mte_l0c_l1/TINSERT) co-live reuse-WAR fence is ineffective at runtime"
+        )
+
     @pytest.mark.parametrize(
         ("M", "N"),
         [

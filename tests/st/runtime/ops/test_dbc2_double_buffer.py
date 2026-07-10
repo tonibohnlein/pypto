@@ -111,9 +111,16 @@ class _DbcDirectStore(PTOTestCase):
 
 class _DbcMatScratch(PTOTestCase):
     """Chained ``(a @ b) @ e``: the oversized [256, 256] bf16 producer is assembled
-    into an L1/Mat scratch (Acc->Mat ``tile.assemble``) and consumed on-chip.  Under
-    PTOAS the full-K producer is a dbC=2 128x128 grid whose assemble drains are floated
-    to keep the two accumulators co-live."""
+    into an L1/Mat scratch (Acc->Mat ``tile.assemble``) and consumed on-chip.
+
+    dbC=2 is **gated off** for the Mat-scratch (Acc->Mat) drain: its ``tile.assemble``
+    (``pto.mte_l0c_l1`` / TINSERT) co-live reuse-WAR fence is emitted by ptoas but
+    ineffective at runtime for the L0C->L1 writeback (device-confirmed wrong on every
+    ptoas x runtime pin, while the identical Acc->GM ``tile.store`` drain is correct) —
+    a hardware/ptoas FIXPIPE-completion gap. So this producer falls back to dbC=1
+    (drain-before-next, no L0C reuse). This case therefore verifies that the gated
+    dbC=1 Mat-scratch chain is numerically correct; re-enable dbC=2 here once ptoas
+    gains a TINSERT completion fence (see KNOWN_ISSUES)."""
 
     __test__ = False
 

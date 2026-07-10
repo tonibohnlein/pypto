@@ -1321,14 +1321,26 @@ std::optional<std::pair<std::vector<StmtPtr>, VarPtr>> TryFoldMatScratch(const M
   // the K-loop + peel (BuildSplitKGrid), so dispatch on k == K rather than the
   // integer-division proxy K/k < 2 — which would mis-route a split-K tile to the
   // full-K [m,K]/[K,n] emitter and blow the L0A/L0B budget.
-  // dbC=2 works on the Mat-scratch path too: the Acc->Mat drain is `tile.assemble`,
-  // which CanonicalizeIOOrder floats above the compute tier under the dbC attr (same
-  // as tile.store for the direct-store path), keeping the two accumulators co-live.
-  // BuildFullKPipelined attaches the attr when t.double_buffer_c; the split-K grid
-  // never carries it.  (The Acc->Mat drain is cheaper than Acc->GM, so the hiding
-  // upside is smaller here, but the mechanism is the same.)
-  const bool full_k = t.k == t.K;
-  auto [stmts, scratch] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
+  // dbC=2 is DISABLED on the Mat-scratch path (force dbC=1 here). The Acc->Mat drain
+  // is `tile.assemble` (lowers to `pto.mte_l0c_l1`, aka TINSERT); its co-live
+  // reuse-WAR fence — the next tile's MAD must wait for this tile's FIXPIPE drain to
+  // finish reading the shared L0C accumulator — is emitted correctly by ptoas
+  // (the same `set_flag(PIPE_FIX->PIPE_M)…wait_flag` pair as the direct-store path)
+  // but is INEFFECTIVE at runtime for the L0C->L1 writeback: device-confirmed wrong
+  // (~99% mismatch) on every ptoas x runtime pin (ptoas 0.45 & 0.49, two runtimes),
+  // while the identical dbC=2 emit with the Acc->GM `tile.store` drain
+  // (`pto.mte_l0c_gm`) is correct. So the FIXPIPE completion signal does not cover
+  // the L0C read for the L1 destination the way it does for GM — a hardware/ptoas
+  // gap the ISA contract (which treats mte_l0c_l1 and mte_l0c_gm symmetrically) does
+  // not expose, and nothing pypto emits can force (a heavy-enough fence, PIPE_ALL,
+  // just serializes the ping-pong = dbC=1). Fall back to the co-live-free dbC=1
+  // (drain-before-next, no L0C reuse) until ptoas gains a TINSERT completion fence,
+  // at which point this gate can be lifted. Direct-store (Acc->GM) dbC=2 is
+  // unaffected. See KNOWN_ISSUES + the mat-scratch dbC=2 device confirmation.
+  MatmulTiling t_dbc1 = t;
+  t_dbc1.double_buffer_c = false;
+  const bool full_k = t_dbc1.k == t_dbc1.K;
+  auto [stmts, scratch] = full_k ? BuildFullKPipelined(t_dbc1, placer) : BuildSplitKGrid(t_dbc1, placer);
   return std::make_pair(std::move(stmts), scratch);
 }
 
