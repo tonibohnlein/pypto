@@ -92,7 +92,7 @@ class Ascend950Handler : public BackendHandler {
     // defect).
     // ⚠ bw_drain=30 carries a known ~4x SIM-vs-DEVICE gap (a2a3-sim drain is likewise ~4x
     // a2a3-device's 118), so it OVER-predicts absolute a5 walls ~34%. But this does NOT
-    // mis-pick: the a5-sim VALIDATION (a5_validate_picks.py + reconstructed multi-tile walls)
+    // mis-pick: the a5-sim VALIDATION (full candidate sweep + reconstructed multi-tile walls)
     // showed the chooser's tile is the sim's #2-#3, within ~1-2% of the measured-lane best on
     // all tested shapes -- the over-prediction is uniform enough to preserve the ranking.
     // Making dbC=2 the a5 DEFAULT does NOT fix it and was REFUTED (Exp B): dbC=2's full-K

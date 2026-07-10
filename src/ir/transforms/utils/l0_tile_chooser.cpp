@@ -181,7 +181,7 @@ int64_t PaddedComputeVolume(int m, int n, int k, const L0TileConfig& cfg) {
 // k this reduces exactly to (K/k)*ceil(k/kt) -- unchanged.
 int64_t MadCycles(int m, int n, int k, const L0TileConfig& cfg) {
   const int64_t kt = std::max<int64_t>(1, cfg.mad_k_fractal_bytes / static_cast<int64_t>(cfg.bytes_a));
-  const int64_t cpr = (cfg.bytes_a == 4) ? static_cast<int64_t>(cfg.mad_fp32_passes)
+  const int64_t cpr = (cfg.bytes_a == 4) ? std::max<int64_t>(1, static_cast<int64_t>(cfg.mad_fp32_passes))
                                          : std::max<int64_t>(1, static_cast<int64_t>(cfg.bytes_a) / 2);
   const int64_t num_full = cfg.K / k;                        // full k-wide K-blocks
   const int64_t k_tail = cfg.K - num_full * k;               // peel tail width (0 if k | K)
