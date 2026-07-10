@@ -339,6 +339,10 @@ class LowerPipelineMutator : public IRMutator {
     std::vector<StmtPtr> clones;
     clones.reserve(static_cast<size_t>(n_clones));
     std::vector<ExprPtr> prev_yields;
+    // Loop-invariant across clones: a dbC=2 emit's moving loop tags its cube accumulator
+    // (co-live drain ping-pong); every other pipeline loop leaves cube accumulators
+    // untagged (see the tagger). Read the attr once, not per clone.
+    const bool loop_double_buffers_c = op->GetAttr<bool>(kPipelineDoubleBufferCAttr, false);
     for (int64_t k = 0; k < n_clones; ++k) {
       std::unordered_map<const Var*, ExprPtr> sub_map;
       sub_map[op->loop_var_.get()] = OffsetIndex(base, k * step, sp);
@@ -351,10 +355,7 @@ class LowerPipelineMutator : public IRMutator {
           << "Internal error: loop body must yield " << op->iter_args_.size() << " values for iter_args, got "
           << cloned_yields.size();
       // Tag this clone's tile definitions with (group, stage=k) so MemoryReuse
-      // keeps the F clones' buffers apart (explicit ping-pong constraint). A dbC=2
-      // loop additionally tags its cube accumulator (co-live drain ping-pong); every
-      // other pipeline loop leaves cube accumulators untagged (see the tagger).
-      const bool loop_double_buffers_c = op->GetAttr<bool>(kPipelineDoubleBufferCAttr, false);
+      // keeps the F clones' buffers apart (explicit ping-pong constraint).
       PipelineMembershipTagger tagger(group, static_cast<int32_t>(k), loop_double_buffers_c);
       cloned_stmts = tagger.VisitStmt(cloned_stmts);
       clones.push_back(cloned_stmts);
