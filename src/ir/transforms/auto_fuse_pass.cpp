@@ -343,6 +343,9 @@ static bool GenericEmitEnabled();
 // feasible instead of forcing the partitioner to cut it (the G1 behaviour when P4 is off).
 static bool P4Enabled();
 
+// Defined below (~line 788); forward-declared so ProblemBuilder's A1 gate can read a 2D tensor shape.
+std::pair<int64_t, int64_t> Static2DShape(const TypePtr& type);
+
 // Build the MLSys solver `Problem` (op+tensor DAG) from a function, reusing
 // `BuildStmtDependencyGraph` for sound op-dependency edges.
 class ProblemBuilder {
@@ -544,8 +547,72 @@ class ProblemBuilder {
         if (is_red) red_outs.insert(self);
       }
     }
+    // A1: mirror the emit's classify_p4 SoftmaxFlash cone check HERE. p4_softmax_shaped is a LOOSE
+    // count gate (#row_sum <= #row_max); the emit's classify_p4 (in EmitFusedGroupGeneric) additionally
+    // requires the EXACT coupled cone — exactly 1 row_max + 1 row_sum, sum <- exp <- (row_expand_)sub(x,m)
+    // with x == the max's input, and the max reducing a full-working-shape function PARAMETER (external,
+    // NOT produced by a compute op). A temperature (exp((x-m)*t)) or scaled (max over a mul(x,x)) softmax
+    // passes the count gate but classify_p4 DECLINES it. If this flag stayed set the solver would fuse
+    // such a group, the emit's classify_p4 would return None, and lowering would overflow
+    // AllocateMemoryAddr (the over-UB G1 defense declines to the legacy tiler). So verify the same cone
+    // here; only then keep the fused softmax feasible. (This duplicates classify_p4's cone logic — keep
+    // the two textually PARALLEL; a shared helper is a noted follow-up.)
+    bool p4_softmax_valid = false;
+    if (p4_softmax_shaped && p4_row_max == 1 && p4_row_sum == 1 && p4_reductions == 2) {
+      std::unordered_map<const Var*, CallPtr> defmap;  // produced var -> its compute Call
+      std::unordered_set<const Var*> produced;         // vars written by a compute op (external = NOT here)
+      CallPtr mx_call, sm_call;
+      const Var* mx_out = nullptr;
+      const Var* sm_out = nullptr;
+      int64_t IM = 0, IN = 0;  // full working shape (max 2D extent over ops' operands/outputs, like the emit)
+      for (const StmtPtr& stmt : dep.stmts) {
+        CallPtr c;
+        if (!IsComputeOp(stmt, &c)) continue;
+        auto assign = As<AssignStmt>(stmt);
+        defmap.emplace(assign->var_.get(), c);
+        produced.insert(assign->var_.get());
+        const auto [oM, oN] = Static2DShape(assign->var_->GetType());
+        IM = std::max(IM, oM);
+        IN = std::max(IN, oN);
+        for (const ExprPtr& arg : c->args_) {
+          const auto [aM, aN] = Static2DShape(arg->GetType());
+          IM = std::max(IM, aM);
+          IN = std::max(IN, aN);
+        }
+        if (IsOp(c, "tensor.row_max")) {
+          mx_call = c;
+          mx_out = assign->var_.get();
+        } else if (IsOp(c, "tensor.row_sum")) {
+          sm_call = c;
+          sm_out = assign->var_.get();
+        }
+      }
+      (void)sm_out;
+      if (mx_call != nullptr && sm_call != nullptr && !mx_call->args_.empty() && !sm_call->args_.empty()) {
+        // sum's input must be exp( (row_expand_)sub(x, m) ), x == the max's input, m == the max output.
+        auto exp_v = AsVarLike(sm_call->args_[0]);
+        auto exp_it = exp_v != nullptr ? defmap.find(exp_v.get()) : defmap.end();
+        if (exp_it != defmap.end() && IsOp(exp_it->second, "tensor.exp") && !exp_it->second->args_.empty()) {
+          auto sub_v = AsVarLike(exp_it->second->args_[0]);
+          auto sub_it = sub_v != nullptr ? defmap.find(sub_v.get()) : defmap.end();
+          if (sub_it != defmap.end() &&
+              (IsOp(sub_it->second, "tensor.row_expand_sub") || IsOp(sub_it->second, "tensor.sub")) &&
+              sub_it->second->args_.size() >= 2) {
+            auto sub_x = AsVarLike(sub_it->second->args_[0]);
+            auto sub_m = AsVarLike(sub_it->second->args_[1]);
+            auto mx_x = AsVarLike(mx_call->args_[0]);
+            const auto [xM, xN] = Static2DShape(mx_call->args_[0]->GetType());
+            const bool mx_external = mx_x != nullptr && produced.count(mx_x.get()) == 0;  // a parameter
+            const bool full_shape = (xM == IM && xN == IN);
+            if (sub_m != nullptr && sub_m.get() == mx_out && sub_x != nullptr && mx_x != nullptr &&
+                sub_x.get() == mx_x.get() && mx_external && full_shape)
+              p4_softmax_valid = true;
+          }
+        }
+      }
+    }
     problem.allow_model_ahead_multi_reduction_stream =
-        p4_softmax_shaped || (p4_layernorm_shaped && p4_sums_independent);
+        (p4_softmax_shaped && p4_softmax_valid) || (p4_layernorm_shaped && p4_sums_independent);
   }
 
  private:
@@ -1558,6 +1625,30 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       if (mxin != nullptr && defined.count(mxin.get()) != 0) return P4Kind::None;  // not external
       const auto [xM, xN] = Static2DShape(As<Call>(mx->value_)->args_[0]->GetType());
       if (xM != IM || xN != IN) return P4Kind::None;  // not the full working shape
+      // The pass-0 body HARDCODES the stats cone as l += row_sum(exp(sub(x, m_new))), and the flash
+      // rescale exp(m_old - m_new) is math-specific to exp(x - m). If the ACTUAL max->sum cone differs
+      // (a temperature scale exp((x-m)*invT), an extra op, a different sub input), pass 0 accumulates
+      // the WRONG running sum L while pass 1 replays the real cone against it -> a SILENTLY wrong kernel
+      // that lowers clean (no verifier catches it). So require the cone to be EXACTLY
+      //   sum = row_sum( exp( (row_expand_)sub(x, m) ) ),  x == the max's input, m == the max's output.
+      // Anything else -> None -> the correct P1/P2 cut (which REPLAYS the real cone, so it stays right).
+      auto exp_v = AsVarLike(As<Call>(sm->value_)->args_[0]);       // the sum's input
+      auto exp_it = exp_v != nullptr ? defmap.find(exp_v.get()) : defmap.end();
+      if (exp_it == defmap.end() || !IsOp(As<Call>(exp_it->second->value_), "tensor.exp"))
+        return P4Kind::None;                                        // sum's input is not exp(...)
+      auto sub_v = AsVarLike(As<Call>(exp_it->second->value_)->args_[0]);  // the exp's input
+      auto sub_it = sub_v != nullptr ? defmap.find(sub_v.get()) : defmap.end();
+      if (sub_it == defmap.end()) return P4Kind::None;
+      auto sub_call = As<Call>(sub_it->second->value_);
+      if ((!IsOp(sub_call, "tensor.row_expand_sub") && !IsOp(sub_call, "tensor.sub")) ||
+          sub_call->args_.size() < 2)
+        return P4Kind::None;                                        // exp's input is not a (row_expand_)sub
+      auto sub_x = AsVarLike(sub_call->args_[0]);
+      auto sub_m = AsVarLike(sub_call->args_[1]);
+      auto mx_x = AsVarLike(As<Call>(mx->value_)->args_[0]);
+      if (sub_m == nullptr || sub_m.get() != mx->var_.get()) return P4Kind::None;  // 2nd arg = the max output
+      if (sub_x == nullptr || mx_x == nullptr || sub_x.get() != mx_x.get())
+        return P4Kind::None;                                        // sub subtracts the SAME x the max reduced
       return P4Kind::SoftmaxFlash;
     }
 
@@ -1940,10 +2031,19 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(on)}, sp));
         auto ofin =
             std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
+        // P4-serial (mirror G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT
+        // reduced-axis chunk (out_it is only the assemble target — the pointwise-strip pattern, lowered
+        // to an in-place store by RewriteReturnedAssembleLoopToStore), so a stage=2 loop overlaps chunk
+        // s+1's x-slice load with chunk s's apply: the DDR-bound re-read (P4 SECOND pass) hides behind
+        // compute, realizing the model's max(compute,ddr). The finalized stats (M/L or the S_i) are
+        // loop-invariant broadcast operands (single-buffered, read each iter). Serial for a 1-chunk loop.
+        const bool pipe_apply = num_full >= 2;
+        std::vector<std::pair<std::string, std::any>> apply_attrs;
+        if (pipe_apply) apply_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
         body.push_back(std::make_shared<ForStmt>(
             s, MakeIndex(0, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{out_it},
             SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{rem > 0 ? ofin : c_var}, sp,
-            ForKind::Sequential));
+            pipe_apply ? ForKind::Pipeline : ForKind::Sequential, std::move(apply_attrs)));
         out_cur = rem > 0 ? ofin : c_var;
       }
       if (rem > 0) {  // ragged tail apply chunk
@@ -2089,10 +2189,19 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(on)}, sp));
         auto ofin =
             std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
+        // P4-serial (mirror G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT
+        // reduced-axis chunk (out_it is only the assemble target — the pointwise-strip pattern, lowered
+        // to an in-place store by RewriteReturnedAssembleLoopToStore), so a stage=2 loop overlaps chunk
+        // s+1's x-slice load with chunk s's apply: the DDR-bound re-read (P4 SECOND pass) hides behind
+        // compute, realizing the model's max(compute,ddr). The finalized stats (M/L or the S_i) are
+        // loop-invariant broadcast operands (single-buffered, read each iter). Serial for a 1-chunk loop.
+        const bool pipe_apply = num_full >= 2;
+        std::vector<std::pair<std::string, std::any>> apply_attrs;
+        if (pipe_apply) apply_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
         body.push_back(std::make_shared<ForStmt>(
             s, MakeIndex(0, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{out_it},
             SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{rem > 0 ? ofin : c_var}, sp,
-            ForKind::Sequential));
+            pipe_apply ? ForKind::Pipeline : ForKind::Sequential, std::move(apply_attrs)));
         out_cur = rem > 0 ? ofin : c_var;
       }
       if (rem > 0) {  // ragged tail apply chunk
@@ -2419,14 +2528,15 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     }
   }
   const int64_t pipe_bands = std::max<int64_t>(2, peak_live + 1);  // +1 = stage-2 prefetch band
-  const int64_t w_al_bytes = AlignUp(w, g) * p1_dtb;
-  // Does a strip of `sh` rows fit UB under the stage-2 ping-pong? Rows are the FREE (unpadded) axis for
-  // pointwise; padded to g for a col-major reduction tile. Width is always granule-padded.
-  auto strip_fits = [&](int64_t sh) -> bool {
+  // Does a [sh, sw] strip fit UB under the stage-2 ping-pong? Rows are the FREE (unpadded) axis for
+  // pointwise (padded to g for a col-major reduction tile); the contiguous WIDTH is always granule-padded.
+  auto strip_fits = [&](int64_t sh, int64_t sw) -> bool {
     const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
-    return pipe_bands * sh_al * w_al_bytes <= p1_ub;
+    return pipe_bands * sh_al * AlignUp(sw, g) * p1_dtb <= p1_ub;
   };
-  int64_t num_strips = 1;
+  int64_t num_strips = 1;   // row (free/height) strips
+  int64_t num_wstrips = 1;  // contiguous-width strips (>1 only when the finest row strip is still too wide)
+  int64_t strip_w = w;      // per-strip contiguous width (granule-aligned when the width is chunked, C2)
   if (!has_col_reduction) {
     for (int64_t ns : {8, 4, 2}) {
       if (ns > h || h % ns != 0) continue;
@@ -2434,54 +2544,94 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       num_strips = ns;
       break;
     }
-    // UB guarantee: bump the strip count until the double-buffered strip fits UB. Strips become
-    // ceil(h/num_strips) (uniform); the ragged last strip is clamped in-bounds below (idempotent
-    // overlap for a non-atomic pointwise assemble). Doubling keeps a clean pipeline trip count; the
-    // final chunk is >= UB-fitting. Cap at h (strip_h==1); a single row still over UB -> decline.
-    while (num_strips < h && !strip_fits((h + num_strips - 1) / num_strips))
+    // UB guarantee: bump the row-strip count until the double-buffered [ceil(h/ns), w] strip fits UB.
+    // Strips become ceil(h/num_strips) (uniform); the ragged last strip is clamped in-bounds below
+    // (idempotent overlap for a non-atomic pointwise assemble). Doubling keeps a clean pipeline trip
+    // count; the final chunk is >= UB-fitting. Cap at h (strip_h==1).
+    while (num_strips < h && !strip_fits((h + num_strips - 1) / num_strips, w))
       num_strips = std::min<int64_t>(num_strips * 2, h);
-    if (!strip_fits((h + num_strips - 1) / num_strips))
-      return GenericDeclineB("pointwise tile row too wide to stream within UB (a single-row double "
-                             "buffer exceeds UB) — declining to the legacy tiler",
-                             out_stmt->span_);
+    const int64_t strip_h = (h + num_strips - 1) / num_strips;  // finest row strip (== 1 for a fully-bumped
+                                                                // pointwise tile)
+    if (!strip_fits(strip_h, w)) {
+      // C2 — even the finest row strip is too WIDE to stream within UB (a wide, high-peak-liveness
+      // pointwise chain: e.g. [16,8192] reusing 4 inputs needs ~10 live bands, and 10*1*8192*4 > UB).
+      // The row axis is exhausted (strip_h == 1 for pointwise); chunk the CONTIGUOUS WIDTH too so the
+      // emit still STREAMS instead of declining to the legacy TilePointwiseGroup (which materializes
+      // the whole [h,w] tile with NO UB guard -> AllocateMemoryAddr overflow). Width chunking is sound
+      // ONLY for a pure-pointwise tile: a row reduction pins the width (its reduced axis) and must not
+      // be split — but an over-UB reduction was already streamed (P1/P2/P4) or declined (G1) above, so
+      // a reduction tile reaching here already fits UB. Keep the (now-unreachable) reduction decline as
+      // a guard. The width chunk is granule-aligned (contiguous axis) so a padded strip read never runs
+      // past the tile; the ceil grid + in-bounds clamp on the ragged last width strip is an idempotent
+      // recompute for the non-atomic pointwise assemble (same trick as the rows / SPMD grid).
+      if (has_reduction)
+        return GenericDeclineB("reduction tile too wide to stream a single reduced-axis-pinned strip "
+                               "within UB — declining to the legacy tiler",
+                               out_stmt->span_);
+      const int64_t w_cap = p1_ub / std::max<int64_t>(1, pipe_bands * strip_h * p1_dtb);  // max width (elems)
+      strip_w = std::max<int64_t>(g, (w_cap / g) * g);      // largest g-multiple width that fits
+      strip_w = std::min<int64_t>(strip_w, AlignUp(w, g));  // never exceed the padded tile width
+      num_wstrips = (w + strip_w - 1) / strip_w;            // ceil grid over the width
+      if (!strip_fits(strip_h, strip_w))
+        return GenericDeclineB("pointwise tile too wide to stream even a 1-row x 1-granule block within "
+                               "UB — declining to the legacy tiler",
+                               out_stmt->span_);
+    }
   }
 
   std::vector<StmtPtr> body_stmts;
-  if (num_strips < 2) {
+  if (num_strips < 2 && num_wstrips < 2) {
     // Serial (matches the cost model's db=false): the whole tile is one strip. Only reached when the
-    // whole [h,w] tile fits UB — an over-UB tile bumped num_strips >= 2 above.
+    // whole [h,w] tile fits UB — an over-UB tile bumped num_strips/num_wstrips >= 2 above.
     std::unordered_map<const Var*, VarPtr> oc_serial;
     VarPtr tv = emit_strip(h, w, mi, ni, body_stmts, oc_serial);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tv, MakeTuple2(mi, ni, sp)}, sp);
     body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
   } else {
-    // Pipelined: for s in pipeline(0, num_strips, stage=2) iter_args=[out <- c_init]:
-    //   strip at (mi + s*strip_h, ni); replay ops -> strip tile; out = assemble(out, strip, off); yield.
-    // Strips are UNIFORM height strip_h = ceil(h/num_strips); the last (ragged) strip's row offset is
-    // clamped in-bounds — an overlapping re-compute, idempotent for the non-atomic pointwise assemble
-    // (same clamp trick as the SPMD grid mi/ni and the reduction free axis). For a dividing num_strips
-    // (the pre-UB {8,4,2} case) ceil == h/num_strips and the clamp is a no-op -> emit byte-identical to
-    // before. The output iter_arg is used ONLY as the assemble target (source/offset reference s & t,
+    // Pipelined stream: flatten the row strips x width strips into ONE stage-2 pipeline threading the
+    // output through one iter_arg. For s in pipeline(0, num_strips*num_wstrips, stage=2):
+    //   strip at (mi + srow, ni + scol); replay ops -> [strip_h, emit_w] tile; out = assemble(out,
+    //   strip, off); yield.
+    // num_wstrips == 1 is the common ROW-only case: srow = s*strip_h over the full width w, byte-
+    // identical to the pre-C2 emit (sni == ni, emit_w == w). num_wstrips >= 2 (C2) additionally chunks
+    // the contiguous width so a too-wide tile still streams. Strips are UNIFORM (ceil height/width); the
+    // ragged last row/col strip's offset is clamped in-bounds — an overlapping re-compute, idempotent
+    // for the non-atomic pointwise assemble (same clamp trick as the SPMD grid mi/ni and the reduction
+    // free axis). The output iter_arg is used ONLY as the assemble target (source/offset reference s,
     // not the iter_arg), so ConvertTensorToTileOps::RewriteReturnedAssembleLoopToStore lowers it to an
     // in-place tile.store while preserving kind==Pipeline + pipeline_stages.
     const int64_t strip_h = (h + num_strips - 1) / num_strips;  // ceil, uniform
-    const bool strip_ragged = strip_h * num_strips > h;         // last strip overruns h -> clamp
+    const bool strip_ragged = strip_h * num_strips > h;         // last row strip overruns h -> clamp
+    const bool wstrip_ragged = strip_w * num_wstrips > w;       // last width strip overruns w -> clamp
+    const int64_t total_strips = num_strips * num_wstrips;
     auto index_ty = std::make_shared<ScalarType>(DataType::INDEX);
     auto s = std::make_shared<Var>(base + "_s", index_ty, sp);
     auto out_iter = std::make_shared<IterArg>(base + "_out_it", c_init->GetType(), ExprPtr(c_init), sp);
-    ExprPtr srow = MakeMul(s, MakeIndex(strip_h, sp), sp);
+    // Decode the flat strip index into (row strip, width strip). num_wstrips == 1 keeps the row-only
+    // decode (srow_idx == s, full width) so the pre-C2 emit is reproduced exactly.
+    ExprPtr srow_idx = s;
+    if (num_wstrips > 1) srow_idx = MakeFloorDiv(s, MakeIndex(num_wstrips, sp), sp);
+    ExprPtr srow = MakeMul(srow_idx, MakeIndex(strip_h, sp), sp);
     if (strip_ragged) srow = MakeMin(srow, MakeIndex(h - strip_h, sp), sp);
     ExprPtr smi = MakeAdd(mi, srow, sp);
+    ExprPtr sni = ni;
+    int64_t emit_w = w;
+    if (num_wstrips > 1) {
+      ExprPtr scol = MakeMul(MakeFloorMod(s, MakeIndex(num_wstrips, sp), sp), MakeIndex(strip_w, sp), sp);
+      if (wstrip_ragged) scol = MakeMin(scol, MakeIndex(w - strip_w, sp), sp);
+      sni = MakeAdd(ni, scol, sp);
+      emit_w = strip_w;
+    }
     std::vector<StmtPtr> loop_body;
     std::unordered_map<const Var*, VarPtr> oc_pipe;
-    VarPtr tv = emit_strip(strip_h, w, smi, ni, loop_body, oc_pipe);
-    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_iter), tv, MakeTuple2(smi, ni, sp)}, sp);
+    VarPtr tv = emit_strip(strip_h, emit_w, smi, sni, loop_body, oc_pipe);
+    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_iter), tv, MakeTuple2(smi, sni, sp)}, sp);
     auto out_next = std::make_shared<Var>(base + "_out_n", asm_call->GetType(), sp);
     loop_body.push_back(std::make_shared<AssignStmt>(out_next, asm_call, sp));
     loop_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{out_next}, sp));
     StmtPtr body = SeqStmts::Flatten(std::move(loop_body), sp);
     std::vector<std::pair<std::string, std::any>> loop_attrs = {{kPipelineStagesAttr, /*stages=*/2}};
-    auto for_stmt = std::make_shared<ForStmt>(s, MakeIndex(0, sp), MakeIndex(num_strips, sp), MakeIndex(1, sp),
+    auto for_stmt = std::make_shared<ForStmt>(s, MakeIndex(0, sp), MakeIndex(total_strips, sp), MakeIndex(1, sp),
                                               std::vector<IterArgPtr>{out_iter}, body, std::vector<VarPtr>{c_var},
                                               sp, ForKind::Pipeline, std::move(loop_attrs));
     body_stmts.push_back(for_stmt);
@@ -2491,7 +2641,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   LOG_INFO << "AutoFuse[generic]: " << (has_reduction ? "elementwise+reduction" : "elementwise")
            << " group '" << name << "' tiled by the generic driver (" << ops.size() << " ops, grid "
            << num_m << "x" << num_n << " = " << (num_m * num_n) << " tiles, "
-           << (num_strips >= 2 ? num_strips : 1) << " pipeline strips)";
+           << (num_strips * num_wstrips) << " pipeline strips"
+           << (num_wstrips > 1 ? " [width-chunked]" : "") << ")";
   // Grid fidelity (cost-vs-latency experiment): the emit realizes a ceil(IM/h) x ceil(IN/w) grid,
   // whose MAX region extent is h/w -> its critical-path latency matches the solver's balanced
   // parts_m x parts_n partition (which also has max extent h/w). But the region COUNT can differ
