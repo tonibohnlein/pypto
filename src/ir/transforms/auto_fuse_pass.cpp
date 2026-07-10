@@ -83,6 +83,17 @@ constexpr int64_t kCubeCapacity = 128 * 1024;   // per-cube L0c accumulator
 constexpr int64_t kVecCapacity = 192 * 1024;    // per-vector UB
 constexpr int64_t kCubeComputeCost = 1;         // grounded per-repeat multiplier (cyc applies fp32 2x)
 constexpr int64_t kKernelFillCost = 10000;      // per-kernel pipeline fill (cycles)
+// Per-TASK host launch overhead, in the MODEL's cost-cycle scale (C3). The device grounded the
+// launch term at ~0.2 us/task (compute-flat pointwise control). It must be added at the model's
+// scale, NOT wall us: model cost under-represents wall by the calibration factor (~6.5x — e.g.
+// rms[256,512] model 13011 cyc ~ 7 us nominal vs ~46 us wall), so 0.2 us_wall ~ 0.2us/6.5 ~ 57
+// cycles. Empirically the window that ranks the three device-swept sizes correctly is (29, 115):
+// below ~29 it can't flip rms[256,512] off its device-slowest argmin; above ~115 it over-corrects
+// rms[512,1024] (picks fewer-but-slower tiles, overriding the makespan's parallelism preference).
+// 64 sits mid-window and matches the calibrated 0.2 us. Verified: rms[256,512]->h=32 (device-fastest,
+// was h=6/slowest), rms[512,1024]->h=32, pointwise[4096,64]->near-flat; solver suite unchanged.
+// Refinable with a tighter op-sim-vs-wall clock-anchored calibration.
+constexpr int64_t kPerTaskOverheadCycles = 64;
 
 // Grounded pto-isa machine model (Ascend 910B / A2A3). Costs are in CORE CYCLES;
 // bandwidths are GiB/s per direction (pto-isa arch_config.hpp). See the solver's
@@ -321,6 +332,11 @@ double VecOpFixed(const CallPtr& call) {
   return ::DType::FP32;  // FP32 + anything wider/unmapped
 }
 
+// Defined below (~the generic-emit dispatch); forward-declared so ProblemBuilder can gate the
+// C3 per-task overhead on it (charge it only when the streaming emit that realizes fewer-tile
+// plans is active).
+static bool GenericEmitEnabled();
+
 // Build the MLSys solver `Problem` (op+tensor DAG) from a function, reusing
 // `BuildStmtDependencyGraph` for sound op-dependency edges.
 class ProblemBuilder {
@@ -348,6 +364,12 @@ class ProblemBuilder {
     // Cost-model calibration (not in the SoC).
     problem.cube_compute_cost = kCubeComputeCost;
     problem.kernel_fill_cost = kKernelFillCost;
+    // C3 per-task launch overhead. GATED on the generic emit: it steers the solver toward FEWER,
+    // larger tiles, which ONLY the generic emit can build (its stage-2 pipeline UB-streams a large
+    // tile; the legacy TilePointwiseGroup materializes the whole tile and would overflow UB). Pricing
+    // per-task overhead for the legacy path would pick tiles that path cannot realize (a §0 contract
+    // violation — price what you build), so charge it only when the streaming emit is active.
+    problem.per_task_overhead_cycles = GenericEmitEnabled() ? kPerTaskOverheadCycles : 0;
     // Grounded pto-isa machine model (cycles + per-direction GiB/s bandwidths +
     // hierarchical L1<->L0 cube work). Activates the grounded cost path.
     problem.cube_freq_hz = kCubeFreqHz;
