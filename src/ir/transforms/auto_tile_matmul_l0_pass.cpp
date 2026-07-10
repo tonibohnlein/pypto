@@ -522,7 +522,8 @@ KLoopRewrite MakeKLoop(const MatmulTiling& t, ExprPtr mi, ExprPtr ni, int64_t m_
 /// otherwise nullopt and (when useful) appends a PerfHint.  The caller
 /// dispatches K-only vs M/N tiling on ``MatmulTiling::needs_mn_tiling()``.
 std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vector<Diagnostic>& hints,
-                                          bool force_output_stationary = false) {
+                                          bool force_output_stationary = false,
+                                          bool disallow_double_buffer_c = false) {
   auto call = As<Call>(assign->value_);
   if (!call || !call->op_) return std::nullopt;
 
@@ -664,8 +665,12 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   // no-coalesce Acc-buffer-pair IR property set once at emit and honoured by BOTH
   // planners (also the natural carrier for the PyPTO-planner path via #1949). Tracked
   // as a follow-up; acceptable only for this ptoas-path-only / experimental feature.
+  // The Mat-scratch (Acc->Mat tile.assemble) fold re-runs AnalyzeMatmul with
+  // disallow_double_buffer_c=true: the assemble drain's co-live reuse fence is
+  // ineffective on device (see TryFoldMatScratch), so that path must choose a real
+  // dbC=1 tile (full-L0C budget), not merely drop the attr from a dbC=2 tile.
   const bool ptoas_planner = ctx && ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS;
-  cfg.allow_double_buffer_c = ptoas_planner;
+  cfg.allow_double_buffer_c = ptoas_planner && !disallow_double_buffer_c;
   // tile.matmul_acc threads the caller's accumulator into the K-loop's
   // iter-arg, so each invocation reads C from L1 at start and writes back at
   // end (gamma_c = 2 in the chooser's traffic model).  Plain tile.matmul
@@ -1321,26 +1326,28 @@ std::optional<std::pair<std::vector<StmtPtr>, VarPtr>> TryFoldMatScratch(const M
   // the K-loop + peel (BuildSplitKGrid), so dispatch on k == K rather than the
   // integer-division proxy K/k < 2 — which would mis-route a split-K tile to the
   // full-K [m,K]/[K,n] emitter and blow the L0A/L0B budget.
-  // dbC=2 is DISABLED on the Mat-scratch path (force dbC=1 here). The Acc->Mat drain
-  // is `tile.assemble` (lowers to `pto.mte_l0c_l1`, aka TINSERT); its co-live
-  // reuse-WAR fence — the next tile's MAD must wait for this tile's FIXPIPE drain to
-  // finish reading the shared L0C accumulator — is emitted correctly by ptoas
-  // (the same `set_flag(PIPE_FIX->PIPE_M)…wait_flag` pair as the direct-store path)
-  // but is INEFFECTIVE at runtime for the L0C->L1 writeback: device-confirmed wrong
-  // (~99% mismatch) on every ptoas x runtime pin (ptoas 0.45 & 0.49, two runtimes),
-  // while the identical dbC=2 emit with the Acc->GM `tile.store` drain
-  // (`pto.mte_l0c_gm`) is correct. So the FIXPIPE completion signal does not cover
-  // the L0C read for the L1 destination the way it does for GM — a hardware/ptoas
-  // gap the ISA contract (which treats mte_l0c_l1 and mte_l0c_gm symmetrically) does
-  // not expose, and nothing pypto emits can force (a heavy-enough fence, PIPE_ALL,
-  // just serializes the ping-pong = dbC=1). Fall back to the co-live-free dbC=1
-  // (drain-before-next, no L0C reuse) until ptoas gains a TINSERT completion fence,
-  // at which point this gate can be lifted. Direct-store (Acc->GM) dbC=2 is
-  // unaffected. See KNOWN_ISSUES + the mat-scratch dbC=2 device confirmation.
-  MatmulTiling t_dbc1 = t;
-  t_dbc1.double_buffer_c = false;
-  const bool full_k = t_dbc1.k == t_dbc1.K;
-  auto [stmts, scratch] = full_k ? BuildFullKPipelined(t_dbc1, placer) : BuildSplitKGrid(t_dbc1, placer);
+  // dbC=2 must be OFF on the Mat-scratch path. The Acc->Mat drain is `tile.assemble`
+  // (lowers to `pto.mte_l0c_l1`, aka TINSERT); its co-live reuse-WAR fence — the next
+  // tile's MAD must wait for this tile's FIXPIPE drain to finish reading the shared
+  // L0C accumulator — is emitted correctly by ptoas (the same
+  // `set_flag(PIPE_FIX->PIPE_M)…wait_flag` pair as the direct-store path) but is
+  // INEFFECTIVE at runtime for the L0C->L1 writeback: device-confirmed wrong (~99%
+  // mismatch) on every ptoas x runtime pin (ptoas 0.45 & 0.49, two runtimes), while
+  // the identical dbC=2 emit with the Acc->GM `tile.store` drain (`pto.mte_l0c_gm`) is
+  // correct. So the FIXPIPE completion signal does not cover the L0C read for the L1
+  // destination the way it does for GM — a hardware/ptoas gap the ISA contract (which
+  // treats mte_l0c_l1 and mte_l0c_gm symmetrically) does not expose, and nothing pypto
+  // emits can force (a heavy-enough fence, PIPE_ALL, just serializes the ping-pong =
+  // dbC=1). The caller re-runs AnalyzeMatmul with disallow_double_buffer_c=true for
+  // this fold, so `t` already carries a real dbC=1 tile (full-L0C budget, not merely a
+  // dbC=2 tile with the attr dropped); assert that invariant here. Lift the gate in
+  // AnalyzeMatmul once ptoas gains a TINSERT completion fence. Direct-store (Acc->GM)
+  // dbC=2 is unaffected.
+  INTERNAL_CHECK_SPAN(!t.double_buffer_c, sp)
+      << "Internal error: Mat-scratch fold must be dbC=1 (the caller re-chooses with "
+         "disallow_double_buffer_c=true); tile.assemble co-live drain is device-broken";
+  const bool full_k = t.k == t.K;
+  auto [stmts, scratch] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
   return std::make_pair(std::move(stmts), scratch);
 }
 
@@ -1553,20 +1560,30 @@ class AutoTileMutator : public IRMutator {
           // matmul result (or its downcast) to it.  Emitted at the matmul site
           // (like the K-only rewrite), with no store to defer.  Checked before the
           // direct-store fold so its hints stay clean.
-          // #1908 guard: a chained Mat-scratch producer must stay output-stationary.
-          // The Mat-scratch offset-packing path cannot yet pack an A/B-stationary
-          // producer (its held operand is a monolithic single-buffered [m,K]/[K,n]
-          // panel in the full L0 buffer) against the consumer matmul's double-buffered
-          // operands, so an A/B-stationary chained producer overflows at
-          // AllocateMemoryAddr. OS is always a legal tile and the oversized producer
-          // must be tiled (deferring would overflow L0c), so re-choose OS-only for the
-          // fold rather than defer. Remove once offset packing lands.
+          // The Mat-scratch fold needs a re-chosen tile in two cases:
+          //   #1908 (output-stationary): the offset-packing path cannot yet pack an
+          //     A/B-stationary producer (its held operand is a monolithic
+          //     single-buffered [m,K]/[K,n] panel in the full L0 buffer) against the
+          //     consumer matmul's double-buffered operands, so an A/B-stationary chained
+          //     producer overflows at AllocateMemoryAddr. OS is always a legal tile and
+          //     the oversized producer must be tiled (deferring would overflow L0c), so
+          //     re-choose OS-only. Remove once offset packing lands.
+          //   dbC=2: the Acc->Mat `tile.assemble` (pto.mte_l0c_l1 / TINSERT) co-live
+          //     reuse-WAR fence is emitted by ptoas but ineffective at runtime for the
+          //     L0C->L1 writeback (device-confirmed wrong on every ptoas/runtime pin,
+          //     while the identical Acc->GM store drain is correct), so the Mat-scratch
+          //     producer must run dbC=1. Clearing only the attr from a dbC=2 tile keeps
+          //     the L0C/2 budget and emits extra Acc->Mat drains — so re-choose with dbC
+          //     disabled to get the real (full-L0C) dbC=1 tile. Lift once ptoas gains a
+          //     TINSERT completion fence.
+          // Direct-store (Acc->GM) dbC=2 below is unaffected — it uses `*tiling`.
           const MatmulTiling* fold_tiling = &*tiling;
-          std::optional<MatmulTiling> os_tiling;
-          if (tiling->stationarity != utils::Stationarity::kOutputStationary) {
+          std::optional<MatmulTiling> refold_tiling;
+          if (tiling->stationarity != utils::Stationarity::kOutputStationary || tiling->double_buffer_c) {
             std::vector<Diagnostic> discard;  // the first AnalyzeMatmul already emitted the hints
-            os_tiling = AnalyzeMatmul(assign, discard, /*force_output_stationary=*/true);
-            if (os_tiling) fold_tiling = &*os_tiling;
+            refold_tiling = AnalyzeMatmul(assign, discard, /*force_output_stationary=*/true,
+                                          /*disallow_double_buffer_c=*/true);
+            if (refold_tiling) fold_tiling = &*refold_tiling;
           }
           if (auto ms = TryFoldMatScratch(*fold_tiling, result_uses, operand_uses, scratch_dtype, hints)) {
             for (auto& s : ms->first) out.push_back(std::move(s));

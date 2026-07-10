@@ -1518,11 +1518,11 @@ class TestAutoTileMatmulL0MNTiling:
         256x64x256 grid): its ``pto.mte_l0c_l1`` (TINSERT) co-live reuse-WAR fence is
         emitted by ptoas but ineffective at runtime for the L0C->L1 writeback
         (device-confirmed wrong on every ptoas x runtime pin, while the identical Acc->GM
-        ``tile.store`` drain is correct), so ``TryFoldMatScratch`` forces
-        ``double_buffer_c=false``. Guards against an accidental re-enable: the Mat-scratch
-        producer must tile into a grid (>= 2 Acc->Mat assembles) yet carry NO
-        ``pipeline_double_buffer_c`` attr. Direct-store dbC=2 is unaffected (see the
-        golden co-live test above)."""
+        ``tile.store`` drain is correct), so the Mat-scratch fold re-runs ``AnalyzeMatmul``
+        with ``disallow_double_buffer_c=true`` (a real dbC=1 tile, not a dbC=2 tile with the
+        attr dropped). Guards against an accidental re-enable: the Mat-scratch producer must
+        tile into a grid (>= 2 Acc->Mat assembles) yet carry NO ``pipeline_double_buffer_c``
+        attr. Direct-store dbC=2 is unaffected (see the golden co-live test above)."""
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
 

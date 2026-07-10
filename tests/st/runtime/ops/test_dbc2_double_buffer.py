@@ -120,7 +120,7 @@ class _DbcMatScratch(PTOTestCase):
     a hardware/ptoas FIXPIPE-completion gap. So this producer falls back to dbC=1
     (drain-before-next, no L0C reuse). This case therefore verifies that the gated
     dbC=1 Mat-scratch chain is numerically correct; re-enable dbC=2 here once ptoas
-    gains a TINSERT completion fence (see KNOWN_ISSUES)."""
+    gains a TINSERT (`pto.mte_l0c_l1`) fixpipe-completion fence."""
 
     __test__ = False
 
@@ -209,7 +209,7 @@ class TestDbc2DoubleBuffer:
             # MemoryReuse coalesces these to the 2-buffer ping-pong; ptoas does not do its own
             # operand-liveness coalescing. Not dbC-specific (reproduces at dbC=1) and not the
             # cost model. Re-enable once operand coalescing runs under PTOAS (or InitMemRef
-            # ping-pongs the streamed operand). See KNOWN_ISSUES.
+            # ping-pongs the streamed operand).
             (256, 512),  # 128x128 tile, 2x4 ->  8 tiles
             (512, 512),  # 128x128 tile, 4x4 -> 16 tiles  (deepest WAR stress)
         ],
@@ -220,18 +220,16 @@ class TestDbc2DoubleBuffer:
         result = test_runner.run(_DbcDirectStore(m, n, platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
-    @pytest.mark.xfail(
-        run=False,
-        reason=(
-            "dbc2_mat_scratch_256x64x256 is broken: it hangs on device, and in the runs that do "
-            "complete it fails golden validation (16185/16384 elements mismatched). Marked "
-            "run=False rather than plain xfail so a hang cannot wedge the suite. The Acc->Mat "
-            "assemble drain path under dbC=2 needs a fix before this is re-enabled."
-        ),
-    )
     @pytest.mark.parametrize("platform", PLATFORMS_DBC)
     def test_mat_scratch_dbc(self, test_runner, platform):
-        """Mat-scratch (Acc->Mat, tile.assemble) dbC=2: the L1 drain path."""
+        """Mat-scratch (Acc->Mat, tile.assemble) chained producer, now gated to dbC=1.
+
+        dbC=2 is disabled for this producer (AutoTileMatmulL0 re-tiles the fold with dbC
+        off): its ``tile.assemble`` (``pto.mte_l0c_l1`` / TINSERT) co-live reuse-WAR fence
+        is emitted by ptoas but ineffective at runtime for the L0C->L1 writeback — it
+        hung / computed ~99% wrong on device, which is why this was previously
+        ``xfail(run=False)``. With the gate it runs the device-correct dbC=1 fallback;
+        re-enable dbC=2 here once ptoas gains a TINSERT completion fence."""
         result = test_runner.run(_DbcMatScratch(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
