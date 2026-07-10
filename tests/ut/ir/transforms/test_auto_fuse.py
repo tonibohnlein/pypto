@@ -966,15 +966,18 @@ class TestAutoFuse:
         """P4 increment 2: a DUAL-SUM layernorm over a UB-overflowing reduced axis FUSES into ONE
         streamed online kernel (behind PYPTO_AUTOFUSE_P4), instead of the G1 cut into row_sum pieces.
 
-        Dual-sum = TWO INDEPENDENT reductions Sx=row_sum(x) and Sxsq=row_sum(x^2), both derived
-        directly from x (NOT the chained row_sum((x-mu)^2), which depends on the finalized mean). The
-        emit streams both sums in ONE pass 0 carrying a two-accumulator loop ({s0, s1} merged by add,
-        no rescale), then a pass-1 apply re-streams R substituting the finalized (S0, S1) to compute
-        mean/var/inv and the spanning (x-mean)*inv. Both passes Sequential in v1.
+        classify_p4 DETECTS the dual-sum shape (TWO INDEPENDENT reductions Sx=row_sum(x) and
+        Sxsq=row_sum(x^2), both derived directly from x, NOT the chained row_sum((x-mu)^2)). But
+        var = E[x^2] - E[x]^2 computed from those raw sums CATASTROPHICALLY CANCELS for a large input
+        mean (NaN at mean >~2000). So the EMIT streams a numerically-STABLE Welford instead: pass 0
+        carries a running (mean, M2, count) merged per chunk by Chan's parallel formula (chunk M2 via
+        the stable row_sum((x-mean_a)^2) form), and pass 1 substitutes the FINALIZED stable mean and
+        var = M2/N directly into the cone (bypassing the sx/sxsq -> var path). Both passes Sequential.
 
         The DAG must be FULLY NAMED (a nested-argument call drops the inner op from the solver graph
-        and misses P4; see KNOWN_ISSUES). var=E[x^2]-E[x]^2 is checked for a non-zero-mean input too
-        (the dual-sum cancellation risk); it stays exact in fp32 here.
+        and misses P4; see KNOWN_ISSUES). Numerics are checked across a wide range of input means
+        (randn, +100, +1000, +2000) — the +2000 case NaNs under the old dual-sum emit and is the whole
+        reason for the Welford accumulation; Welford stays within tolerance and never NaNs.
         """
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
@@ -1003,19 +1006,24 @@ class TestAutoFuse:
 
         fused = passes.auto_fuse()(Prog)
         body = next(f for _, f in fused.functions.items() if f.name == "ln").as_python()
-        # ONE fused streamed kernel (not the G1 cut), carrying TWO independent online sums.
+        # ONE fused streamed kernel (not the G1 cut), carrying the running Welford (mean, M2, count).
         assert body.count("pl.spmd(") == 1, body
-        assert "_s0_it" in body and "_s1_it" in body  # the two-accumulator running-sums loop carries
-        # Each accumulator merges its per-chunk partial by a plain add (no rescale — sums associate).
-        assert body.count("pl.tensor.add(") >= 2, body
+        # Welford iter-arg carries (re-pointed from the old dual-sum {_s0_it, _s1_it} markers, which the
+        # unstable sum-accumulator emit no longer produces).
+        assert "_wmean_it" in body and "_wM2_it" in body and "_wcnt_it" in body, body
+        assert "_s0_it" not in body and "_s1_it" not in body, body
+        # Welford's parallel merge divides by the running count (n_new) — a tensor.div the dual-sum emit
+        # (pure adds) never had. Its presence proves the stable accumulation is what got emitted.
+        assert "pl.tensor.div(" in body, body
 
         # Lowers through the full pipeline (streamed, fits UB — no AllocateMemoryAddr overflow).
         PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
 
         # Numerically matches a torch layernorm reference. torch_codegen runs fp32 on CPU (torch.rsqrt
         # is exact), so the algorithm itself is validated tight; the 1e-2 tol only budgets the silicon
-        # HW-rsqrt approximation. Checked for a zero-mean AND a non-zero-mean (mean~5) input — the
-        # dual-sum var = E[x^2] - E[x]^2 cancellation stays acceptable in fp32.
+        # HW-rsqrt approximation. Checked across a WIDE range of input means: the +1000/+2000 cases are
+        # exactly where the old dual-sum var = E[x^2] - E[x]^2 loses all precision (NaN at +2000);
+        # Welford stays within tolerance and never NaNs.
         code = torch_codegen(fused, run_all_spmd_blocks=True)
         namespace: dict = {}
         exec(code, namespace)  # noqa: S102
@@ -1026,12 +1034,13 @@ class TestAutoFuse:
             )
 
         torch.manual_seed(0)
-        for x in (torch.randn(128, n, dtype=torch.float32),
-                  torch.randn(128, n, dtype=torch.float32) * 2 + 5):  # non-zero-mean case
+        for shift in (0.0, 100.0, 1000.0, 2000.0):
+            x = torch.randn(128, n, dtype=torch.float32) + shift
             out = namespace["ln"](x)
             ref = _ref(x)
+            assert not bool(torch.isnan(out).any()), f"NaN at mean+{shift} (dual-sum cancellation)"
             assert torch.allclose(out, ref, rtol=1e-2, atol=1e-2), (
-                f"max abs diff {(out - ref).abs().max().item():.3e}"
+                f"mean+{shift}: max abs diff {(out - ref).abs().max().item():.3e}"
             )
 
         # A CHAINED layernorm — row_sum((x-mu)^2) depends on the finalized mean, so the two sums are

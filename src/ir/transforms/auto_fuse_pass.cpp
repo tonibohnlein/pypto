@@ -1927,17 +1927,20 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
                    : emit_strip(free_tile, chunk_ext, foff, red_off, out, oc, stop, subs);  // free_tile M, chunk N
     };
 
-    // ===================== P4 — FUSED ONLINE LAYERNORM (dual-sum) =====================
-    // A layernorm streams like softmax but its stats are TWO INDEPENDENT running sums (Sx = row_sum(x),
-    // Sxsq = row_sum(x^2)), both derived directly from x (NOT the chained row_sum((x-mu)^2), which
-    // depends on the finalized mean — declined by classify_p4). Pass 0 accumulates BOTH sums in ONE
-    // streamed pass carrying the accumulator tuple {s0, s1, ...}, each merged by a plain tensor.add
-    // (no rescale — sums are exactly associative). Pass 1 re-streams R substituting the finalized sums:
-    // emit_strip replays mean/msq/m2/var/veps/inv (small [.,1]) + the spanning xc, out. Reuses
-    // emit_strip/strip_at (the apply subs machinery is shared with softmax). Both loops Sequential in v1.
+    // ===================== P4 — FUSED ONLINE LAYERNORM (Welford) =====================
+    // A layernorm streams like softmax but its stats are the mean and variance of x over the reduced
+    // axis. classify_p4 detects the DUAL-SUM form (>= 2 INDEPENDENT row_sums: Sx=row_sum(x) and
+    // Sxsq=row_sum(x^2)), but computing var = E[x^2] - E[x]^2 from those raw sums CATASTROPHICALLY
+    // CANCELS for a large input mean (both terms ~mean^2; in fp32 the difference is lost -> NaN at
+    // mean >~2000). So the EMIT streams a numerically-STABLE Welford (running count, mean, M2) instead:
+    // pass 0 folds each disjoint chunk into (mean, M2, count) via Chan's parallel merge (chunk M2 taken
+    // as the stable row_sum((x-mean_a)^2) form), then pass 1 substitutes the FINALIZED stable mean and
+    // var = M2/N directly into the user cone (bypassing the sx/sxsq -> var path). The DETECTION stays
+    // the dual-sum shape (classify_p4 unchanged); only the accumulation and the substitution change.
+    // x is read 2x total (A7 stream_passes=2): one DMA per chunk per pass. Both loops Sequential in v1.
     if (stream_p4 && p4_kind == P4Kind::MultiSum) {
-      // The row_sum reductions in group order; the LAST one (in ops order) is the pass-0 stop point,
-      // so strip_at fills every sum's [free_tile,1] partial into `oc` before it breaks.
+      // The row_sum reductions in group order; the LAST one (in ops order) is the pass-0 stop point for
+      // the legacy dual-sum FALLBACK (strip_at fills every sum's [free_tile,1] partial into `oc`).
       std::vector<AssignStmtPtr> sum_stmts;
       const Stmt* last_red = nullptr;
       for (const auto& a : ops) {
@@ -1949,70 +1952,236 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           << "Internal error: P4 dual-sum classified but < 2 row_sum reductions were found";
       const size_t nsum = sum_stmts.size();
 
-      // Emit one reduced-axis chunk's dual-sum update over the [free_tile, chunk_ext] slice at red_off.
-      // strip_at replays the cone up to AND including the last reduction (filling `oc` with each sum's
-      // [free_tile,1] partial); then each partial merges into its accumulator via tensor.add. `acc_in`
-      // empty => the init chunk (acc = partial). Returns the nsum new accumulators.
-      auto multisum_chunk = [&](int64_t chunk_ext, const ExprPtr& red_off,
-                                const std::vector<VarPtr>& acc_in, std::vector<StmtPtr>& out,
-                                int tag) -> std::vector<VarPtr> {
-        const std::string tg = std::to_string(tag);
-        std::unordered_map<const Var*, VarPtr> oc;
-        strip_at(chunk_ext, red_off, out, oc, last_red, nullptr);
-        std::vector<VarPtr> res;
-        res.reserve(nsum);
-        for (size_t i = 0; i < nsum; ++i) {
-          auto pit = oc.find(sum_stmts[i]->var_.get());
-          INTERNAL_CHECK_SPAN(pit != oc.end(), sp)
-              << "Internal error: P4 dual-sum partial missing for sum " << i;
-          VarPtr partial = pit->second;  // [free_tile,1]
-          if (acc_in.empty()) {
-            res.push_back(partial);  // init chunk seeds the accumulator
-          } else {
-            auto add_c = reg.Create("tensor.add", {ExprPtr(acc_in[i]), ExprPtr(partial)}, sp);
-            auto acc_n =
-                std::make_shared<Var>(base + "_s" + std::to_string(i) + "_" + tg, add_c->GetType(), sp);
-            out.push_back(std::make_shared<AssignStmt>(acc_n, add_c, sp));
-            res.push_back(acc_n);
+      // ---- Identify the layernorm mean/var vars for the STABLE substitution (standard layernorm cone):
+      //   user_mean = the [.,1] column operand of the spanning row_expand_sub(x, mean);
+      //   user_var  = the (add-of-eps-stripped) input of the rsqrt;
+      //   x_input   = the spanning sub's arg[0] (the external full-[IM,IN] input reduced by the sums).
+      // Substituting at the mean/var level (not the sum level) is the whole point — it bypasses the
+      // unstable E[x^2] - E[x]^2 reconstruction. If the cone does not match (non-standard dual-sum),
+      // fall back to the legacy sum-substitution path so nothing regresses.
+      std::unordered_map<const Var*, AssignStmtPtr> defmap;
+      for (const auto& a : ops) defmap.emplace(a->var_.get(), a);
+      VarPtr user_mean, user_var;
+      ExprPtr x_input;
+      for (const auto& a : ops) {  // spanning sub -> user_mean + x_input
+        auto c = As<Call>(a->value_);
+        if (!IsOp(c, "tensor.row_expand_sub") && !IsOp(c, "tensor.sub")) continue;
+        if (c->args_.size() < 2) continue;
+        const auto [aM, aN] = Static2DShape(c->args_[0]->GetType());
+        const auto [bM, bN] = Static2DShape(c->args_[1]->GetType());
+        if (aM != IM || aN != IN) continue;               // arg0 spans the full working shape (x)
+        if (!(bM == IM && bN == 1)) continue;             // arg1 is a [.,1] row-reduction column
+        auto mv = AsVarLike(c->args_[1]);
+        if (mv == nullptr || defined.count(mv.get()) == 0) continue;  // arg1 group-internal (a stat)
+        user_mean = mv;
+        x_input = c->args_[0];
+        break;
+      }
+      for (const auto& a : ops) {  // rsqrt -> user_var (strip an optional add-of-eps)
+        auto c = As<Call>(a->value_);
+        if (!IsOp(c, "tensor.rsqrt") || c->args_.empty()) continue;
+        auto rin = AsVarLike(c->args_[0]);
+        if (rin == nullptr) break;
+        auto vit = defmap.find(rin.get());
+        if (vit != defmap.end() && (IsOp(As<Call>(vit->second->value_), "tensor.adds") ||
+                                    IsOp(As<Call>(vit->second->value_), "tensor.add"))) {
+          // veps = add(var, eps): var is the group-internal [.,1] operand (eps is a const / non-var).
+          for (const ExprPtr& e : As<Call>(vit->second->value_)->args_) {
+            auto vv = AsVarLike(e);
+            if (vv != nullptr && defined.count(vv.get()) != 0) { user_var = vv; break; }
           }
+        } else {
+          user_var = rin;  // rsqrt applied directly to var (no eps add)
         }
-        return res;
-      };
+        break;
+      }
+      const bool welford = (user_mean != nullptr && user_var != nullptr && x_input != nullptr);
 
       std::vector<StmtPtr> body;
-      // PASS 0 — online sums. Chunk 0 inits each accumulator; chunks 1..num_full merge in a Sequential
-      // loop threading the nsum accumulators; the ragged tail merges after. Chunks DISJOINT (a
-      // reduction overlap double-counts). Do NOT pipeline in v1.
-      std::vector<VarPtr> acc = multisum_chunk(rc, MakeIndex(0, sp), {}, body, 0);
-      if (num_full >= 2) {
-        auto k = std::make_shared<Var>(base + "_k", index_type, sp);
-        std::vector<IterArgPtr> its;
-        its.reserve(nsum);
-        for (size_t i = 0; i < nsum; ++i)
-          its.push_back(std::make_shared<IterArg>(base + "_s" + std::to_string(i) + "_it",
-                                                  acc[i]->GetType(), ExprPtr(acc[i]), sp));
-        std::vector<StmtPtr> lbody;
-        std::vector<VarPtr> its_as_vars(its.begin(), its.end());
-        std::vector<VarPtr> acc_new =
-            multisum_chunk(rc, MakeMul(k, MakeIndex(rc, sp), sp), its_as_vars, lbody, 1);
-        std::vector<ExprPtr> yields(acc_new.begin(), acc_new.end());
-        lbody.push_back(std::make_shared<YieldStmt>(std::move(yields), sp));
-        std::vector<VarPtr> outs;
-        outs.reserve(nsum);
-        for (size_t i = 0; i < nsum; ++i)
-          outs.push_back(std::make_shared<Var>(base + "_s" + std::to_string(i), acc[i]->GetType(), sp));
-        body.push_back(std::make_shared<ForStmt>(
-            k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), its,
-            SeqStmts::Flatten(std::move(lbody), sp), outs, sp, ForKind::Sequential));
-        acc = outs;
-      }
-      if (rem > 0) acc = multisum_chunk(rem, MakeIndex(num_full * rc, sp), acc, body, 2);
-
-      // PASS 1 — apply. Substitute the finalized sums {S_i} and re-stream R, assembling the spanning
-      // sink into the full-shape [IM,IN] output. emit_strip replays the small [.,1] stats cone (mean,
-      // var, inv, ...) plus the spanning xc/out; each sum is substituted, so x is DMA'd once here too.
       std::unordered_map<const Var*, VarPtr> subs;
-      for (size_t i = 0; i < nsum; ++i) subs.emplace(sum_stmts[i]->var_.get(), acc[i]);
+
+      if (welford) {
+        // ---- WELFORD streaming (numerically STABLE). Running (mean, M2, count) as [free_tile,1] tile
+        // iter_args. Count is carried as a small tile (NOT folded to a compile-time constant): the merge
+        // weights cnt_a/n_new depend on the RUNTIME chunk index k in the rolled loop, so carrying count
+        // keeps every merge op tile-valued (robust) instead of needing runtime-scalar operands.
+        auto CFloat = [&](double v) { return std::make_shared<ConstFloat>(v, dtype, sp); };
+        // welford_chunk: fold one [free_tile, chunk_ext] slice at red_off into (mean_in, M2_in, cnt_in).
+        // nullptrs => the init chunk (mean=mean_a, M2=M2_a, cnt=chunk_ext). Returns (mean, M2, cnt).
+        auto welford_chunk = [&](int64_t chunk_ext, const ExprPtr& red_off, VarPtr mean_in, VarPtr M2_in,
+                                 VarPtr cnt_in, std::vector<StmtPtr>& out,
+                                 int tag) -> std::tuple<VarPtr, VarPtr, VarPtr> {
+          const std::string tg = std::to_string(tag);
+          VarPtr xs = pin_m ? slice_input(x_input, chunk_ext, free_tile, red_off, foff, out, tag)
+                            : slice_input(x_input, free_tile, chunk_ext, foff, red_off, out, tag);
+          // chunk mean: mean_a = row_sum(x) / chunk_ext
+          auto s_c = reg.Create("tensor.row_sum", {ExprPtr(xs)}, sp);
+          auto s = std::make_shared<Var>(base + "_wsum" + tg, s_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(s, s_c, sp));
+          auto ma_c = reg.Create("tensor.muls", {ExprPtr(s), CFloat(1.0 / static_cast<double>(chunk_ext))}, sp);
+          auto mean_a = std::make_shared<Var>(base + "_wmeana" + tg, ma_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(mean_a, ma_c, sp));
+          // chunk M2: M2_a = row_sum((x - mean_a)^2)  [stable — deviations are O(std), no cancellation]
+          auto dev_c = reg.Create("tensor.row_expand_sub", {ExprPtr(xs), ExprPtr(mean_a)}, sp);
+          auto dev = std::make_shared<Var>(base + "_wdev" + tg, dev_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(dev, dev_c, sp));
+          auto dsq_c = reg.Create("tensor.mul", {ExprPtr(dev), ExprPtr(dev)}, sp);
+          auto dsq = std::make_shared<Var>(base + "_wdsq" + tg, dsq_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(dsq, dsq_c, sp));
+          auto M2a_c = reg.Create("tensor.row_sum", {ExprPtr(dsq)}, sp);
+          auto M2_a = std::make_shared<Var>(base + "_wM2a" + tg, M2a_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(M2_a, M2a_c, sp));
+          if (mean_in == nullptr) {  // init chunk seeds (mean, M2, count=chunk_ext)
+            // Count column of value chunk_ext, derived from the reduction output `s` (NOT tensor.full):
+            // s is a col_major reduction column; muls*0 + adds keeps the count column col_major, matching
+            // the other stats. A fresh tile.full is row_major, which trips ResolveBackendOpLayouts'
+            // col-vector layout repair (padded [free_tile,1] does not round-trip) — so avoid it.
+            auto z_c = reg.Create("tensor.muls", {ExprPtr(s), CFloat(0.0)}, sp);
+            auto z = std::make_shared<Var>(base + "_wz" + tg, z_c->GetType(), sp);
+            out.push_back(std::make_shared<AssignStmt>(z, z_c, sp));
+            auto cnt_c = reg.Create("tensor.adds", {ExprPtr(z), CFloat(static_cast<double>(chunk_ext))}, sp);
+            auto cnt = std::make_shared<Var>(base + "_wcnt" + tg, cnt_c->GetType(), sp);
+            out.push_back(std::make_shared<AssignStmt>(cnt, cnt_c, sp));
+            return {mean_a, M2_a, cnt};
+          }
+          // Chan's parallel merge into the running (mean_in, M2_in, cnt_in):
+          //   delta = mean_a - mean_in;  n_new = cnt_in + chunk_ext
+          //   mean  = mean_in + delta*chunk_ext / n_new
+          //   M2    = M2_in + M2_a + delta^2 * chunk_ext * cnt_in / n_new
+          auto delta_c = reg.Create("tensor.sub", {ExprPtr(mean_a), ExprPtr(mean_in)}, sp);
+          auto delta = std::make_shared<Var>(base + "_wdelta" + tg, delta_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(delta, delta_c, sp));
+          auto nnew_c = reg.Create("tensor.adds", {ExprPtr(cnt_in), CFloat(static_cast<double>(chunk_ext))}, sp);
+          auto n_new = std::make_shared<Var>(base + "_wnnew" + tg, nnew_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(n_new, nnew_c, sp));
+          auto dm_c = reg.Create("tensor.muls", {ExprPtr(delta), CFloat(static_cast<double>(chunk_ext))}, sp);
+          auto dm = std::make_shared<Var>(base + "_wdm" + tg, dm_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(dm, dm_c, sp));
+          auto dmo_c = reg.Create("tensor.div", {ExprPtr(dm), ExprPtr(n_new)}, sp);
+          auto dmo = std::make_shared<Var>(base + "_wdmo" + tg, dmo_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(dmo, dmo_c, sp));
+          auto mean_c = reg.Create("tensor.add", {ExprPtr(mean_in), ExprPtr(dmo)}, sp);
+          auto mean_new = std::make_shared<Var>(base + "_wmeann" + tg, mean_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(mean_new, mean_c, sp));
+          auto d2_c = reg.Create("tensor.mul", {ExprPtr(delta), ExprPtr(delta)}, sp);
+          auto d2 = std::make_shared<Var>(base + "_wd2" + tg, d2_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(d2, d2_c, sp));
+          auto d2c_c = reg.Create("tensor.muls", {ExprPtr(d2), CFloat(static_cast<double>(chunk_ext))}, sp);
+          auto d2c = std::make_shared<Var>(base + "_wd2c" + tg, d2c_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(d2c, d2c_c, sp));
+          auto num_c = reg.Create("tensor.mul", {ExprPtr(d2c), ExprPtr(cnt_in)}, sp);
+          auto num = std::make_shared<Var>(base + "_wnum" + tg, num_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(num, num_c, sp));
+          auto term_c = reg.Create("tensor.div", {ExprPtr(num), ExprPtr(n_new)}, sp);
+          auto term = std::make_shared<Var>(base + "_wterm" + tg, term_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(term, term_c, sp));
+          auto m2s_c = reg.Create("tensor.add", {ExprPtr(M2_in), ExprPtr(M2_a)}, sp);
+          auto m2s = std::make_shared<Var>(base + "_wM2s" + tg, m2s_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(m2s, m2s_c, sp));
+          auto M2n_c = reg.Create("tensor.add", {ExprPtr(m2s), ExprPtr(term)}, sp);
+          auto M2_new = std::make_shared<Var>(base + "_wM2n" + tg, M2n_c->GetType(), sp);
+          out.push_back(std::make_shared<AssignStmt>(M2_new, M2n_c, sp));
+          return {mean_new, M2_new, n_new};
+        };
+
+        // PASS 0 — chunk 0 inits (mean, M2, count); chunks 1..num_full merge in a Sequential loop
+        // threading {mean_it, M2_it, cnt_it}; the ragged tail merges after. Chunks DISJOINT.
+        auto [mean_cur, M2_cur, cnt_cur] =
+            welford_chunk(rc, MakeIndex(0, sp), nullptr, nullptr, nullptr, body, 0);
+        if (num_full >= 2) {
+          auto k = std::make_shared<Var>(base + "_k", index_type, sp);
+          auto mean_it = std::make_shared<IterArg>(base + "_wmean_it", mean_cur->GetType(), ExprPtr(mean_cur), sp);
+          auto M2_it = std::make_shared<IterArg>(base + "_wM2_it", M2_cur->GetType(), ExprPtr(M2_cur), sp);
+          auto cnt_it = std::make_shared<IterArg>(base + "_wcnt_it", cnt_cur->GetType(), ExprPtr(cnt_cur), sp);
+          std::vector<StmtPtr> lbody;
+          auto [mn, m2n, cn] =
+              welford_chunk(rc, MakeMul(k, MakeIndex(rc, sp), sp), mean_it, M2_it, cnt_it, lbody, 1);
+          lbody.push_back(std::make_shared<YieldStmt>(
+              std::vector<ExprPtr>{ExprPtr(mn), ExprPtr(m2n), ExprPtr(cn)}, sp));
+          auto mean_out = std::make_shared<Var>(base + "_wmean", mean_cur->GetType(), sp);
+          auto M2_out = std::make_shared<Var>(base + "_wM2", M2_cur->GetType(), sp);
+          auto cnt_out = std::make_shared<Var>(base + "_wcnt", cnt_cur->GetType(), sp);
+          body.push_back(std::make_shared<ForStmt>(
+              k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp),
+              std::vector<IterArgPtr>{mean_it, M2_it, cnt_it}, SeqStmts::Flatten(std::move(lbody), sp),
+              std::vector<VarPtr>{mean_out, M2_out, cnt_out}, sp, ForKind::Sequential));
+          mean_cur = mean_out;
+          M2_cur = M2_out;
+          cnt_cur = cnt_out;
+        }
+        if (rem > 0) {
+          auto [mn, m2n, cn] =
+              welford_chunk(rem, MakeIndex(num_full * rc, sp), mean_cur, M2_cur, cnt_cur, body, 2);
+          mean_cur = mn;
+          M2_cur = m2n;
+          cnt_cur = cn;
+        }
+        // Finalize: mean_final = running mean; var_final = M2 / N (population variance, matching torch
+        // var(unbiased=False)). Substitute BOTH stable stats into the apply cone (mean/var level).
+        auto var_c = reg.Create("tensor.muls", {ExprPtr(M2_cur), CFloat(1.0 / static_cast<double>(red_ext))}, sp);
+        auto var_final = std::make_shared<Var>(base + "_wvar", var_c->GetType(), sp);
+        body.push_back(std::make_shared<AssignStmt>(var_final, var_c, sp));
+        subs.emplace(user_mean.get(), mean_cur);
+        subs.emplace(user_var.get(), var_final);
+      } else {
+        // ---- LEGACY dual-sum FALLBACK (non-standard cone whose mean/var can't be pinned). Streams the
+        // raw sums S_i and substitutes them; the apply reconstructs mean/var from the user cone (the
+        // UNSTABLE path — retained only for cones the Welford identification declines).
+        auto multisum_chunk = [&](int64_t chunk_ext, const ExprPtr& red_off,
+                                  const std::vector<VarPtr>& acc_in, std::vector<StmtPtr>& out,
+                                  int tag) -> std::vector<VarPtr> {
+          const std::string tg = std::to_string(tag);
+          std::unordered_map<const Var*, VarPtr> oc;
+          strip_at(chunk_ext, red_off, out, oc, last_red, nullptr);
+          std::vector<VarPtr> res;
+          res.reserve(nsum);
+          for (size_t i = 0; i < nsum; ++i) {
+            auto pit = oc.find(sum_stmts[i]->var_.get());
+            INTERNAL_CHECK_SPAN(pit != oc.end(), sp)
+                << "Internal error: P4 dual-sum partial missing for sum " << i;
+            VarPtr partial = pit->second;  // [free_tile,1]
+            if (acc_in.empty()) {
+              res.push_back(partial);
+            } else {
+              auto add_c = reg.Create("tensor.add", {ExprPtr(acc_in[i]), ExprPtr(partial)}, sp);
+              auto acc_n =
+                  std::make_shared<Var>(base + "_s" + std::to_string(i) + "_" + tg, add_c->GetType(), sp);
+              out.push_back(std::make_shared<AssignStmt>(acc_n, add_c, sp));
+              res.push_back(acc_n);
+            }
+          }
+          return res;
+        };
+        std::vector<VarPtr> acc = multisum_chunk(rc, MakeIndex(0, sp), {}, body, 0);
+        if (num_full >= 2) {
+          auto k = std::make_shared<Var>(base + "_k", index_type, sp);
+          std::vector<IterArgPtr> its;
+          its.reserve(nsum);
+          for (size_t i = 0; i < nsum; ++i)
+            its.push_back(std::make_shared<IterArg>(base + "_s" + std::to_string(i) + "_it",
+                                                    acc[i]->GetType(), ExprPtr(acc[i]), sp));
+          std::vector<StmtPtr> lbody;
+          std::vector<VarPtr> its_as_vars(its.begin(), its.end());
+          std::vector<VarPtr> acc_new =
+              multisum_chunk(rc, MakeMul(k, MakeIndex(rc, sp), sp), its_as_vars, lbody, 1);
+          std::vector<ExprPtr> yields(acc_new.begin(), acc_new.end());
+          lbody.push_back(std::make_shared<YieldStmt>(std::move(yields), sp));
+          std::vector<VarPtr> outs;
+          outs.reserve(nsum);
+          for (size_t i = 0; i < nsum; ++i)
+            outs.push_back(std::make_shared<Var>(base + "_s" + std::to_string(i), acc[i]->GetType(), sp));
+          body.push_back(std::make_shared<ForStmt>(
+              k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), its,
+              SeqStmts::Flatten(std::move(lbody), sp), outs, sp, ForKind::Sequential));
+          acc = outs;
+        }
+        if (rem > 0) acc = multisum_chunk(rem, MakeIndex(num_full * rc, sp), acc, body, 2);
+        for (size_t i = 0; i < nsum; ++i) subs.emplace(sum_stmts[i]->var_.get(), acc[i]);
+      }
+
+      // PASS 1 — apply (shared). Re-stream R substituting the finalized stats (Welford: mean/var;
+      // fallback: the raw sums), assembling the spanning sink into the full-shape [IM,IN] output.
+      // emit_strip replays the small [.,1] stats cone plus the spanning xc/out; x is DMA'd once here.
       auto asm_at = [&](const ExprPtr& coff) -> ExprPtr {
         return pin_m ? MakeTuple2(coff, foff, sp)    // reduce M: [rc, free_tile] at [coff, foff]
                      : MakeTuple2(foff, coff, sp);   // reduce N: [free_tile, rc] at [foff, coff]
@@ -2058,7 +2227,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       LOG_INFO << "AutoFuse[generic]: STREAMED fused online layernorm (P4) '" << name << "' ("
                << ops.size() << " ops, reduce " << (pin_m ? "M" : "N") << " ext=" << red_ext
                << " chunk=" << rc << "x" << num_full << (rem ? "+tail" : "") << ", free grid "
-               << num_free << ", " << nsum << " online sums)";
+               << num_free << ", " << (welford ? "stable Welford (mean,M2,count)" : "dual-sum fallback")
+               << ")";
       return std::vector<StmtPtr>{c_init_assign, scope};
     }
 
