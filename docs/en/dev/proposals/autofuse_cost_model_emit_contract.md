@@ -159,7 +159,7 @@ its back-propagated operand tile shapes.
 | A2 | ephemeral intermediates cost **0 DDR** (fusion win) | keep intermediates **on-chip** (UB scratch), never round-trip them through DDR | ✅ honored |
 | A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to `[h,w]`; read `FIXED_1` operands in full (broadcast / reduced-axis) — `emit_strip` | ✅ honored (G4 done, 2026-07-09). `emit_strip` slices any 2D operand per-axis: a full axis follows the tile `[sh/sw]` at `[smi/sni]`, a size-1 (broadcast/`FIXED_1`) axis stays `[1]` at offset 0; the op replay re-infers the broadcast. Covers `[1,N]` bias-add, `[M,1]` scale / reduced-axis stat, `[1,1]`. Other 2D shapes still decline. |
 | A4 | UB feasibility = peak live bands over the **pebbling order** | replay ops in `dfs_order_`; let MemoryReuse alloc/free UB per the emitted liveness | ✅ honored (order matched) |
-| A5 | roofline `max(compute, DDR)` (load k+1 overlaps compute k) | emit the per-core loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) | ⚠️ **only for non-streamed loops** — pointwise strip `:1740` is Pipeline; **streamed P1/P2 loops are `Sequential` `:1489/:1533` → serial → real latency = compute+DDR** |
+| A5 | roofline `max(compute, DDR)` (load k+1 overlaps compute k) | emit the per-core loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) | ✅ honored (G2 done, 2026-07-10). Pointwise strip AND the streamed P1/P2 loops are `ForKind::Pipeline` stage=2: the accumulate pass 0 (running-accumulator IterArg stays single-buffered persistent; only the per-chunk load double-buffers) and the apply pass 1 (assembles disjoint reduced-axis chunks → in-place store) both overlap the DDR-bound read with compute. `LowerPipelineLoops` lowers the loop-carried accumulator correctly; numerically exact (rmsnorm/col_sum streamed). |
 | A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a bare **sum col-reduction** sink `:1630`; else fall back to serial | ⚠️ partial — model must NOT price `S` where the emit declines it (see C2) |
 | A7 | a streamed reduction reads each input band **`stream_passes`** times (§5.1): **1** if every output folds into a reduction, **2** if any output spans the reduced axis | stream with running stats; **1 pass** when output-folded, **2 passes** (flash-stats + apply) when an output spans R; fold multi-stat reductions **online** (never naive multipass) | ⚠️ model prices a flat **read-once** (too optimistic for spanning outputs — softmax/layernorm are 2 reads); emit: P1 1-pass ✓, softmax/layernorm online (P4) NOT built; neither loop pipelined (A5) |
 
@@ -321,14 +321,16 @@ Emit defense-in-depth: `GenericDeclineB` if such a group still reaches the mater
 its thinnest tile overflows. **Still open:** the FUSED single-kernel capability (P4 — online
 multi-reduction) that would let these stream as one kernel instead of being cut.
 
-### 🔴 Roofline
+### Roofline
 
-**G2 — A5 — streamed loops not pipelined.** P1/P2 emit `ForKind::Sequential`
-(`auto_fuse_pass.cpp:1489,1533`); `LowerPipelineLoops` skips them (`lower_pipeline_loops_pass.cpp:208`
-requires `ForKind::Pipeline`) → serial → real = `compute+DDR`, model prices `max` (`:1798`).
-**Fix:** emit `ForKind::Pipeline` + stages=2 (mirror the pointwise strip `:1740`); reconcile the
-in-place accumulator IterArg with MemoryReuse stage separation + the pipeline verifiers (only
-the chunk buffers double-buffer; the accumulator stays single-buffered persistent).
+**G2 — A5 — streamed loops pipelined — FIXED (2026-07-10).** Both streamed passes now emit
+`ForKind::Pipeline` + stages=2 (mirroring the pointwise strip): the accumulate pass 0 (the
+running-accumulator IterArg — `acc_n = merge(acc_it, part_k)`) and the apply pass 1 (assembles
+disjoint reduced-axis chunks, lowered to in-place stores by `RewriteReturnedAssembleLoopToStore`).
+`LowerPipelineLoops` double-buffers only the per-chunk load while keeping the accumulator
+single-buffered/persistent — verified numerically exact (streamed rmsnorm / col_sum / x−row_max).
+So the model's `max(compute, DDR)` pricing for streamed reductions is now realized, not fictional.
+Pipelined only when the chunk trip ≥ 2 (nothing to overlap otherwise).
 
 ### ⚠️ Cost fidelity
 

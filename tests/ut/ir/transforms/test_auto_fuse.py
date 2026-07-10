@@ -871,6 +871,12 @@ class TestAutoFuse:
                 m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
                 return pl.sub(x, m)
 
+        # A5 (G2): both streamed passes — the accumulate (pass 0) and the apply re-stream (pass 1) —
+        # are ForKind::Pipeline (stage=2), not Sequential, so the DDR-bound reduced-axis reads overlap
+        # compute (max(compute,ddr) roofline). Pre-G2 they were serial `pl.range` loops.
+        big_body = next(f for _, f in passes.auto_fuse()(Big).functions.items() if f.name == "sm").as_python()
+        assert big_body.count("pl.pipeline(") == 2, big_body  # accumulate + apply, both pipelined
+
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Big)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
