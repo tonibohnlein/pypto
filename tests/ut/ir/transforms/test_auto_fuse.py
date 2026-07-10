@@ -646,6 +646,80 @@ class TestAutoFuse:
         # The larger tile lowers (row-streamed to fit UB, not materialized -> no AllocateMemoryAddr).
         PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
 
+    def test_reused_input_wide_pointwise_streams_within_ub(self, ascend_backend, monkeypatch):
+        """A fused chain that REUSES an input needs MORE strip UB bands than a linear chain.
+
+        `(a+b)*b` holds `b` live across BOTH ops (peak 3 simultaneously-live tiles vs 2 for a
+        linear chain), so a strip's UB footprint is higher. On a WIDE tile — which C3's
+        fewer/larger-tile bias prefers here (`[.,4096]`) — sizing the strip against a fixed 2
+        bands under-counted, and the `[.,4096]` strip overflowed UB (196608 > 188416) at
+        `AllocateMemoryAddr` (found on device). The emit now sizes strips by the REAL peak
+        liveness (+1 prefetch band), so the wide reused-input tile streams and lowers.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw(self, a: pl.Tensor[[64, 4096], pl.FP32], b: pl.Tensor[[64, 4096], pl.FP32]) -> pl.Tensor[[64, 4096], pl.FP32]:
+                c: pl.Tensor[[64, 4096], pl.FP32] = pl.add(a, b)
+                d: pl.Tensor[[64, 4096], pl.FP32] = pl.mul(c, b)  # b reused -> live across both ops
+                return d
+
+        fused = passes.auto_fuse()(Prog)
+        # Lowers without a Vec-buffer overflow (the wide reused-input strip now fits UB).
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        # ...and is numerically exact.
+        code = torch_codegen(fused, run_all_spmd_blocks=True)
+        namespace: dict = {}
+        exec(code, namespace)  # noqa: S102
+        torch.manual_seed(0)
+        a = torch.randn(64, 4096, dtype=torch.float32)
+        b = torch.randn(64, 4096, dtype=torch.float32)
+        out = namespace["pw"](a, b)
+        assert torch.allclose(out, (a + b) * b, rtol=1e-4, atol=1e-4), (
+            f"max abs diff {(out - (a + b) * b).abs().max().item():.3e}"
+        )
+
+    def test_split_k_matmul_seed_tiles_within_ub(self, ascend_backend, monkeypatch):
+        """The split-K zero-seed tiles the [M,N] output into UB-FITTING pieces.
+
+        A large output TILE — which C3 prefers (`[512,512]` → a `[256,256]` tile) — makes the
+        per-tile seed `tensor.full([h,w])` ITSELF exceed UB (a `[256,256]` fp32 fill = 256 KB >
+        188 KB) → `AllocateMemoryAddr` crash (found on device). The seed now zeroes `[M,N]` in
+        `[seed_h, w]` tiles capped to fit UB, so a large-tile split-K matmul lowers, and the
+        split-K partials atomic-add onto the tiled zero-seed correctly.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mm(self, a: pl.Tensor[[512, 512], pl.FP32], b: pl.Tensor[[512, 512], pl.FP32]) -> pl.Tensor[[512, 512], pl.FP32]:
+                c: pl.Tensor[[512, 512], pl.FP32] = pl.matmul(a, b)
+                return c
+
+        fused = passes.auto_fuse()(Prog)
+        # Lowers without a seed Vec-buffer overflow (the seed tile is capped to fit UB).
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        # ...and is numerically exact (split-K atomic-add merge onto the tiled zero-seed).
+        code = torch_codegen(fused, run_all_spmd_blocks=True)
+        namespace: dict = {}
+        exec(code, namespace)  # noqa: S102
+        torch.manual_seed(0)
+        a = torch.randn(512, 512, dtype=torch.float32)
+        b = torch.randn(512, 512, dtype=torch.float32)
+        out = namespace["mm"](a, b)
+        assert torch.allclose(out, a @ b, rtol=1e-3, atol=1e-3), (
+            f"max abs diff {(out - a @ b).abs().max().item():.3e}"
+        )
+
     def test_inout_param_is_a_solver_input(self, ascend_backend):
         """An InOut param is READ by a fused op, so the solver must register it as a graph
         input (like an In param). Before, only In params were registered, so ``add(T, x)`` was
