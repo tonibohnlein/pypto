@@ -159,9 +159,9 @@ its back-propagated operand tile shapes.
 | A2 | ephemeral intermediates cost **0 DDR** (fusion win) | keep intermediates **on-chip** (UB scratch), never round-trip them through DDR | ✅ honored |
 | A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to `[h,w]`; read `FIXED_1` operands in full (broadcast / reduced-axis) — `emit_strip` | ✅ honored (G4 done, 2026-07-09). `emit_strip` slices any 2D operand per-axis: a full axis follows the tile `[sh/sw]` at `[smi/sni]`, a size-1 (broadcast/`FIXED_1`) axis stays `[1]` at offset 0; the op replay re-infers the broadcast. Covers `[1,N]` bias-add, `[M,1]` scale / reduced-axis stat, `[1,1]`. Other 2D shapes still decline. |
 | A4 | UB feasibility = peak live bands over the **pebbling order** | replay ops in `dfs_order_`; let MemoryReuse alloc/free UB per the emitted liveness | ✅ honored (order matched) |
-| A5 | roofline `max(compute, DDR)` (load k+1 overlaps compute k) | emit the per-core loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) | ✅ honored (G2 done, 2026-07-10). Pointwise strip AND the streamed P1/P2 loops are `ForKind::Pipeline` stage=2: the accumulate pass 0 (running-accumulator IterArg stays single-buffered persistent; only the per-chunk load double-buffers) and the apply pass 1 (assembles disjoint reduced-axis chunks → in-place store) both overlap the DDR-bound read with compute. `LowerPipelineLoops` lowers the loop-carried accumulator correctly; numerically exact (rmsnorm/col_sum streamed). |
+| A5 | roofline `max(compute, DDR)` (load k+1 overlaps compute k) | emit the per-core loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) | ⚠️ Pointwise and all P1/P2/P4 full-chunk stats/apply loops use stage 2 when their rolled trip count is at least 2; loop-carried stats stay persistent while input chunks ping-pong. Remaining edge: the model grants `max` from tile bytes alone and does not yet encode that trip-count guard, so short loops must be priced as `compute + DDR`. |
 | A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a bare **sum col-reduction** sink `:1630`; else fall back to serial | ⚠️ partial — model must NOT price `S` where the emit declines it (see C2) |
-| A7 | a streamed reduction reads each input band **`stream_passes`** times (§5.1): **1** if every output folds into a reduction, **2** if any output spans the reduced axis | stream with running stats; **1 pass** when output-folded, **2 passes** (flash-stats + apply) when an output spans R; fold multi-stat reductions **online** (never naive multipass) | ⚠️ model prices a flat **read-once** (too optimistic for spanning outputs — softmax/layernorm are 2 reads); emit: P1 1-pass ✓, softmax/layernorm online (P4) NOT built; neither loop pipelined (A5) |
+| A7 | a streamed reduction reads each input band **`stream_passes`** times (§5.1): **1** if every output folds into a reduction, **2** if any output spans the reduced axis | stream with running stats; **1 pass** when output-folded, **2 passes** (flash-stats + apply) when an output spans R; fold multi-stat reductions **online** (never naive multipass) | ✅ G3 prices `io_in×2` for spanning outputs; exact P4 softmax/Welford emit two passes. Remaining refinement: derive multiplicity per boundary input rather than doubling apply-only operands. |
 
 ---
 
@@ -180,7 +180,8 @@ matmul's scores.
 - maintain running stats (max `m`, sum `l`); per block rescale the accumulator by
   `exp(m_old − m_new)` and add the block's contribution;
 - persist only the small `[·,1]`/`[1,·]` stats — never the full row;
-- **reads the data once** (matches A7).
+- **reads the data once during the stats pass**; a spanning output still requires the second apply
+  read described by A7.
 
 ### The P-ladder
 
@@ -188,15 +189,16 @@ matmul's scores.
 |---|---|---|---|
 | **P1** | bare reduction (sum / max) | online but trivial — sum associative, running max; no rescale | built, device-confirmed (col reductions) |
 | **P2** | reduction → pointwise | accumulate, then re-stream to apply (2 passes) | built |
-| **P3** | multipass softmax/layernorm (>1 reduction) | one stream per statistic pass (2–3 reads) | designed, not built |
-| **P4** | online-stats | the **true flash**: single streaming pass, running (max,sum) + rescale | designed, not built |
+| **P3** | multipass softmax/layernorm (>1 reduction) | one stream per statistic pass (2–3 reads) | retired |
+| **P4** | online-stats | one stats pass with softmax `(m,l)` rescale or layernorm Welford, then apply | built for exact canonical row-softmax/layernorm behind `PYPTO_AUTOFUSE_P4` |
 
 ### Why P4, not P3
 
-A7 prices **read-once**. P3 (multipass) reads the input 2–3× from DDR — and streamed
-reductions are DDR-bound, so a multipass emit runs materially slower than priced. To keep
-the model honest for streamed softmax/layernorm, the emit must be **P4 (online/flash)**, not
-P3. And by A5 it must also be **pipelined**. Both requirements are on the same streamed loop.
+A7 prices **two reads** for a spanning result: one online-stats read and one apply read. P3 would
+add extra statistic reads and run materially slower than priced, so streamed softmax/layernorm must
+use **P4 (online/flash)**. By A5 each phase receives overlap credit only if its loop is actually
+pipelined. Both P4 phases now pipeline when their rolled trip count is at least 2; the remaining
+cost-model refinement is to withhold overlap for shorter loops.
 
 ### Scope caveat
 
@@ -255,32 +257,30 @@ The saving is one DDR read, not single-pass.
 
 ## 5.2 Making the cost model aware
 
-Today the model prices a flat "read once" for every streamed reduction (`:1759`), which is
-correct only for the output-folded case. Add:
+The model now derives `spans` and prices `io_in×2` for a spanning streamed output. Remaining work:
 
 - derive `foldable` (all R-reductions in the log-sum-exp/moments family) and
   `spans = (any live-out extent along R > 1)`;
-- `stream_passes = spans ? 2 : 1` (general: `1 + depth`);
-- when streaming, **scale the streamed input read `io_in` by `stream_passes`** (the output
-  write stays ×1) and scale the applied-cone **compute** by the apply pass;
+- refine the flat boundary-input multiplier into per-input pass multiplicity;
+- scale the applied-cone **compute** by the apply pass and price the online merge operations;
 - if `streams && !foldable` → **infeasible** (`cost = inf`) so the partitioner never picks a
   group it cannot emit correctly.
 
-This sits exactly between today's flat `×1` (too optimistic — undercounts softmax/layernorm by
-one full input read) and the retired `#reductions+1` (too pessimistic — charged 3 for softmax;
-the truth with flash is 2).
+The resulting traffic stays between the old flat `×1` (too optimistic) and the retired
+`#reductions+1` (too pessimistic); the truth for canonical spanning softmax/layernorm is 2.
 
 ## 5.3 Emit design (per case)
 
 - **output-folded, 1 pass** (P1): as today — SPMD over the free axis, inner chunk-accumulate the
   single stat, assemble the `[·,1]`/`[1,·]` output.
-- **spanning, single stat** (P2): as today — pass 0 accumulate the stat, pass 1 apply over R
-  chunks; **both loops must become `ForKind::Pipeline`** (A5).
-- **spanning, multi-stat foldable** (softmax / layernorm — **P4, to build**): pass 0 = ONE
+- **spanning, single stat** (P2): pass 0 accumulate the stat, pass 1 apply over R chunks; both
+  full-chunk loops use `ForKind::Pipeline` when their rolled trip count is at least 2 (A5).
+- **spanning, multi-stat foldable** (softmax / layernorm — **P4, built for exact canonical cones**): pass 0 = ONE
   online streamed pass maintaining the running stats with the exact rescale (softmax `(m,l)`
   with `exp(m−M)`; layernorm Welford `(count,mean,M2)`); pass 1 = re-stream R, apply the
-  finalized stats per element, assemble. Both loops `ForKind::Pipeline`. This replaces the
-  naive 3-pass P3.
+  finalized stats per element, assemble. Both full-chunk loops use `ForKind::Pipeline` when their
+  rolled trip count is at least 2; multi-carry pipeline lowering is validated by the P4 end-to-end
+  tests. This replaces the naive 3-pass P3.
 - **non-foldable over a streamed axis**: decline (matches the `cost = inf` gate).
 
 ---
@@ -293,23 +293,15 @@ role back-prop rules (§3), ephemeral = 0 DDR (A2, both sides), the emit replayi
 tensor tracking, the C2 split gate, and the S2 emit predicate. The gaps below are ranked;
 several refined the ⚠️ rows above.
 
-### Root cost-model gap — fix FIRST (everything streaming depends on it)
+### Root streaming signal — fixed
 
-**R0 — streaming is not detected for a bare reduction sink.** The C2 `reduced_extent_` coupling
-lives ONLY in `reduction_materializes()` (the split gate, `ascend910b_cost.cpp:1826`). The
-feasibility gate (`vector_stream`'s materialize pre-check, `:1319`) and the compute
-streaming-detection (`:1761`) both call `vector_peak_ub(cfg)` with the RAW grid cfg — whose
-reduced axis is collapsed to the thin output extent (`out_H_/out_W_ = 1`). So a bare `col_sum`/
-`row_sum` sink is under-counted by its full reduced extent and priced as a MATERIALIZED tile
-that fits UB, even though the emit streams it (P1). Contradicts the `vector_peak_ub` header
-contract (`ascend910b_cost.h:124`). **Fix:** couple the reduced axis at the feasibility +
-compute sites too — then A5/A7/P4 have a correct streaming signal. (Softmax works today only
-because its wide pointwise SINK keeps `cfg.w` large, so `vector_peak_ub` sees the overflow;
-bare reductions have a thin sink and slip through.)
+**R0 — reduced-axis coupling. [FIXED.]** `vector_peak_ub` now sizes a reduction input from the
+tensor's full reduced extent even when the sink output is thin. Feasibility, compute, and split
+gates therefore agree on materialized versus streamed execution.
 
 ### 🔴 Correctness
 
-**G1 — large softmax/layernorm silently overflow UB (no decline). [CRASH FIXED — P4 capability still open.]**
+**G1 — large softmax/layernorm silently overflow UB. [FIXED; exact P4 capability built.]**
 The stream gate requires `p1_nreds == 1` (`auto_fuse_pass.cpp:1231`), so a 2-reduction group
 cannot stream; it used to fall through to a full-reduced-axis materialized tile that overflowed
 (hard `AllocateMemoryAddr` failure). **Fixed** (mlsys26 `603ec35`, pypto `69d7f508`): a new
@@ -317,20 +309,21 @@ cannot stream; it used to fall through to a full-reduced-axis materialized tile 
 (buildable), so a streamed >1-reduction group is **infeasible** and the partitioner **cuts** it
 into single-reduction (streamable) + pointwise pieces. An **unfused softmax IS buildable**, so
 large softmax/layernorm now **compile** (verified: `softmax[128,16384]` builds, was a crash).
-Emit defense-in-depth: `GenericDeclineB` if such a group still reaches the materialized path and
-its thinnest tile overflows. **Still open:** the FUSED single-kernel capability (P4 — online
-multi-reduction) that would let these stream as one kernel instead of being cut.
+Emit defense-in-depth remains. With P4 enabled, one shared exact semantic analysis records complete
+canonical softmax/layernorm op sets; the model admits only an exactly equal candidate and the emitter
+consumes the same descriptor. Temperature/scaled softmax, weighted moments, chained norms, and
+multi-sink escapes cut rather than being reinterpreted.
 
 ### Roofline
 
-**G2 — A5 — streamed loops pipelined — FIXED (2026-07-10).** Both streamed passes now emit
+**G2 — A5 — streamed loops pipelined — FIXED (P1/P2 2026-07-10; P4 stats 2026-07-11).** Both streamed passes emit
 `ForKind::Pipeline` + stages=2 (mirroring the pointwise strip): the accumulate pass 0 (the
-running-accumulator IterArg — `acc_n = merge(acc_it, part_k)`) and the apply pass 1 (assembles
-disjoint reduced-axis chunks, lowered to in-place stores by `RewriteReturnedAssembleLoopToStore`).
-`LowerPipelineLoops` double-buffers only the per-chunk load while keeping the accumulator
-single-buffered/persistent — verified numerically exact (streamed rmsnorm / col_sum / x−row_max).
-So the model's `max(compute, DDR)` pricing for streamed reductions is now realized, not fictional.
-Pipelined only when the chunk trip ≥ 2 (nothing to overlap otherwise).
+running accumulator or P4 `(m,l)` / Welford `(mean,M2,count)` IterArgs) and the apply pass 1
+(assembles disjoint reduced-axis chunks, lowered to in-place stores by
+`RewriteReturnedAssembleLoopToStore`). `LowerPipelineLoops` double-buffers only the per-chunk load
+while keeping loop-carried state single-buffered/persistent. Pipelined only when the rolled chunk trip
+is at least 2 (nothing to overlap otherwise). The remaining A5 edge is cost-side: `db` checks only
+`tile_bytes >= 2*vec_reg_bytes`, not the emitted phase's rolled trip count.
 
 ### ⚠️ Cost fidelity
 

@@ -118,14 +118,15 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
 ## 4. Architecture (files, emit paths, flags, commands)
 
 - **Emit** — `src/ir/transforms/auto_fuse_pass.cpp`:
-  - `ProblemBuilder::Build` (~:337) — DAG → solver `Problem`; the **adapter gates** live here
-    (`allow_model_ahead_multi_reduction_stream`, C3 `per_task_overhead_cycles`, the P4
-    `p4_softmax_valid` / `p4_layernorm_shaped` / `p4_sums_independent` structural checks). Registers
-    only **top-level** `var = <call>` ops → a nested-arg call drops the inner op (a known landmine).
+  - `AnalyzeP4Patterns` + `ProblemBuilder::Build` — DAG → solver `Problem`; one exact semantic
+    analysis recognizes canonical softmax / dual-sum layernorm, records each complete op set in
+    `Problem::p4_patterns`, and retains the same `P4Match` handles for emission. The analytic
+    multi-reduction override stays false in AutoFuse, so other candidate groups cut. Registers only
+    **top-level** `var = <call>` ops → a nested-arg call drops the inner op (a known landmine).
   - `EmitFusedGroupGeneric` (~:1296) — the **vector** emit. Sub-paths: pointwise (UB-streamed strips,
     `strip_fits`, width-chunk `num_wstrips`), streamed reductions P1/P2 (`stream_p1/p2`,
-    `emit_strip`/`strip_at`/`slice_input`), **P4** (`classify_p4` → `{None, SoftmaxFlash, MultiSum}`;
-    softmax `p4_chunk` custom `(m,l)` body; layernorm Welford), multi-sink, S2 split-K, broadcast (G4).
+    `emit_strip`/`strip_at`/`slice_input`), **P4** (consumes the shared exact `P4Match`; softmax
+    `p4_chunk` custom `(m,l)` body; exact layernorm → Welford), multi-sink, S2 split-K, broadcast (G4).
   - `TileMatmul` (~:813) / `BuildTileMatmul` (k-pipeline) / `EmitLoneMatmulGeneric` — the **cube** emit.
   - Flag helpers `GenericEmitEnabled()`, `P4Enabled()` (re-read env per call).
 - **Cost model** — `3rdparty/mlsys26/src/core/ascend910b_cost.cpp` (+ `types.h`, `dag.h`), branch
@@ -136,8 +137,8 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
 - **Build (MAX 2 cores):** `cmake --build build --parallel 2`;
   `cmake --build 3rdparty/mlsys26/build --target solver_lib -j2`.
 - **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 4`
-  (25 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
-  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (306 pass / 7 fail baseline). Numeric:
+  (26 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
+  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (308 pass / 7 fail baseline). Numeric:
   `pypto.debug.torch_codegen(passes.auto_fuse()(Prog), run_all_spmd_blocks=True)` — write P4 DSL FULLY
   NAMED (nested args drop ops from the solver graph → miss P4).
 
@@ -152,18 +153,23 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
   (A5/G2)** — accumulator persists, loads double-buffer; numerically exact.
 - Broadcast operands (G4), multi-sink, S2 cross-core split-K.
 - **P4 softmax** — fused online flash `(m,l)` with `exp(m_old−m_new)` rescale; the cone is verified
-  EXACT (only `row_max→sub(x,m)→exp→row_sum`); apply pass pipelined; ~34% cheaper than the cut so it
-  fires unforced. torch-exact ~3e-9.
+  EXACT by the shared descriptor (only `row_max→sub(x,m)→exp→row_sum→div`); stats and apply passes
+  stage-2 pipelined when their rolled trip count is at least 2; ~34% cheaper than the cut so it fires
+  unforced. torch-exact ~3e-9.
 - **P4 layernorm** — stable streaming **Welford** (running count/mean/M2, Chan's parallel merge),
-  substituting stable `mean`/`var` into the apply. ≤ the cut's accuracy at input mean 0/100/1000/2000,
-  **no NaN at +2000** (the dual-sum form NaN'd there).
+  reached only after proving the exact `sum(x)` / `sum(x*x)` / mean / variance / rsqrt / centered-apply
+  algebra, then substituting stable `mean`/`var` into that cone. Its three-carry stats and apply passes
+  are stage-2 pipelined under the same trip-count guard. ≤ the cut's accuracy at input mean
+  0/100/1000/2000, **no NaN at +2000** (the dual-sum form NaN'd there). Temperature softmax,
+  weighted-second-moment graphs, and patterns with an escaping internal stat cut and preserve semantics.
 
 **Cube emit:** G-A ceil+clamp grid (non-uniform lone matmul tiles across cores — **device-validated**:
 `[272,272]`→spmd(8), torch-exact; forcing an untiled 1×1 crashes, so G-A is load-bearing), ragged-K
 peel, deep-T chained (tensor-level; #1908-xfail at lowering). k-loop is `ForKind::Pipeline`.
 
 **Cost model:** C3 per-task overhead (device-validated no-regret), G3 `io_in×2`, R0 reduced-axis
-coupling, granule-padded feasibility.
+coupling, granule-padded feasibility, and candidate-local P4 feasibility: a streamed
+multi-reduction is buildable only when its complete op set equals an exact adapter-supplied pattern.
 
 **Device-validated on 910B2:** tall pointwise streaming, C3 no-regret, cube G-A + ragged-K (all
 correct). Two device-found crashes (reused-input pointwise, split-K seed) fixed.
@@ -189,21 +195,25 @@ and split-K-seed fixes hold); the *bugs* were all in P4 and masked by P4-off def
 - **C2 (crash):** a wide high-reuse pointwise declined to the legacy tiler (no UB guard) → overflow. →
   width-chunk instead of declining. (`e566ecbe`)
 - **A5 (perf):** P4 loops were serial while priced pipelined and the cut is pipelined → fused could be
-  device-slower. → apply pass pipelined. (`e566ecbe`)
+  device-slower. → apply pass pipelined in `e566ecbe`; softmax `(m,l)` and Welford
+  `(mean,M2,count)` stats loops now pipeline too when they have at least two rolled iterations.
 - **C3 (accuracy):** dual-sum layernorm less accurate than the cut, NaN at high mean → **Welford**
   (`d8f650e4`).
+- **C4 (silent-wrong):** any independent pair of row sums could enter the Welford path; a graph using
+  `sum(x)` and `sum(2*x*x)` was silently reinterpreted as layernorm. → one exact `P4Match` analysis is
+  shared by model and emit; only the canonical layernorm algebra reaches Welford, every near miss cuts.
 
-**Architectural debt noted** (not yet done): the cost-gate ↔ emit-classifier predicate is duplicated
-(adapter DP vs emit DFS) — a shared helper is the right fix; the apply/accumulate loop is triplicated
-(P2 / softmax / multisum) — extract one shared pipelined helper.
+**Architectural debt:** the duplicated cost-gate ↔ emit-classifier predicate is now removed. The
+apply/accumulate loop remains triplicated (P2 / softmax / Welford) — extract one shared pipelined helper.
 
 ---
 
 ## 7. What remains (ordered)
 
-1. **Finish pipelining the softmax accumulate `{m,l}` loop** — the only P4-serial remnant (apply is
-   already pipelined). Try the 2-tuple carry (G2 proved a 1-tuple carry lowers); fall back to
-   Sequential if it won't. Ideally via a shared apply/accumulate helper (pays down the triplication).
+1. **Reconcile the short-loop A5 edge:** the emit correctly falls back to sequential when a streamed
+   phase has fewer than two rolled iterations, while the cost model's `db` predicate currently uses
+   tile bytes alone. Make the phase-aware cost use `compute + DDR` for that case. Then extract the
+   shared pipelined stats/apply-loop builder (P2 / softmax / Welford) to pay down triplication.
 2. **Push** the batch (`5e7c76b6..HEAD`) via port 443, submodule first.
 3. **Device verification** (`autofuse_device_verify_g2_p4.md`, held until now): T1 the crash fixes, T2
    G2 perf, T3 P4 softmax+layernorm fuse + numeric + **wall-vs-cut** (with `P4=1`). Add the review's

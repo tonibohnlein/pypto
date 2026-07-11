@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <set>
 #include <string>
 #include <tuple>
@@ -337,14 +338,245 @@ double VecOpFixed(const CallPtr& call) {
 // plans is active).
 static bool GenericEmitEnabled();
 
-// Defined below; forward-declared so ProblemBuilder can gate the cost-side
-// allow_model_ahead_multi_reduction_stream flag on the fused online-softmax (P4) emit — when P4
-// is on the emit CAN stream a 2-reduction softmax as one kernel, so the model must keep it
-// feasible instead of forcing the partitioner to cut it (the G1 behaviour when P4 is off).
+// Defined below; forward-declared so ProblemBuilder registers exact P4 algorithm descriptors only
+// when the corresponding online emitter is active.
 static bool P4Enabled();
 
 // Defined below (~line 788); forward-declared so ProblemBuilder's A1 gate can read a 2D tensor shape.
 std::pair<int64_t, int64_t> Static2DShape(const TypePtr& type);
+
+// One semantic analysis feeds both sides of the P4 fidelity contract. The solver receives the exact
+// matched op set through Problem::p4_patterns; the emitter receives the corresponding handles below.
+// Neither side is allowed to rediscover a looser "looks like softmax/layernorm" shape.
+struct P4Match {
+  ::P4PatternKind kind = ::P4PatternKind::None;
+  std::vector<AssignStmtPtr> ops;
+  AssignStmtPtr sink;
+  AssignStmtPtr max_stmt;
+  AssignStmtPtr sum_stmt;
+  std::vector<AssignStmtPtr> layernorm_sums;  // {sum(x), sum(x*x)}
+  ExprPtr x_input;
+  VarPtr user_mean;
+  VarPtr user_var;
+};
+
+// Match only the algorithms the current P4 emit actually implements:
+//
+//   softmax:  m=max(x); sh=x-m; e=exp(sh); s=sum(e); out=e/s
+//   layernorm: sx=sum(x); sxx=sum(x*x); mean=sx/N; var=sxx/N-mean*mean;
+//              inv=rsqrt(var+eps); out=(x-mean)*inv
+//
+// This is deliberately exact. A temperature-scaled softmax, weighted second moment, affine tail, or
+// any other near miss is a different algorithm and must be cut until it has its own proven descriptor.
+// The scan is O(N): every candidate sink follows only a fixed-depth canonical chain.
+std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
+  std::vector<AssignStmtPtr> ops;
+  std::unordered_map<const Var*, AssignStmtPtr> defmap;
+  for (const StmtPtr& stmt : stmts) {
+    CallPtr call;
+    if (!IsComputeOp(stmt, &call)) continue;
+    auto assign = As<AssignStmt>(stmt);
+    ops.push_back(assign);
+    defmap.emplace(assign->var_.get(), assign);
+  }
+  std::unordered_map<const Var*, std::vector<const Stmt*>> consumers;
+  for (const AssignStmtPtr& op : ops) {
+    for (const ExprPtr& arg : As<Call>(op->value_)->args_) {
+      auto var = AsVarLike(arg);
+      if (var != nullptr && defmap.count(var.get()) != 0) consumers[var.get()].push_back(op.get());
+    }
+  }
+
+  auto def_of = [&](const ExprPtr& expr) -> AssignStmtPtr {
+    auto var = AsVarLike(expr);
+    if (var == nullptr) return nullptr;
+    auto it = defmap.find(var.get());
+    return it == defmap.end() ? nullptr : it->second;
+  };
+  auto call_of = [](const AssignStmtPtr& stmt) -> CallPtr {
+    return stmt == nullptr ? nullptr : As<Call>(stmt->value_);
+  };
+  auto same_var = [](const ExprPtr& lhs, const ExprPtr& rhs) -> bool {
+    auto lv = AsVarLike(lhs);
+    auto rv = AsVarLike(rhs);
+    return lv != nullptr && rv != nullptr && lv.get() == rv.get();
+  };
+  auto is_scalar_const = [](const ExprPtr& expr) -> bool {
+    return As<ConstFloat>(expr) != nullptr || As<ConstInt>(expr) != nullptr;
+  };
+  auto scaled_from = [&](const AssignStmtPtr& stmt, const ExprPtr& input, double scale) -> bool {
+    auto call = call_of(stmt);
+    if (call == nullptr || call->args_.size() != 2) return false;
+    if (IsOp(call, "tensor.muls"))
+      return same_var(call->args_[0], input) && IsConstValue(call->args_[1], scale);
+    if (!IsOp(call, "tensor.mul")) return false;
+    return (same_var(call->args_[0], input) && IsConstValue(call->args_[1], scale)) ||
+           (same_var(call->args_[1], input) && IsConstValue(call->args_[0], scale));
+  };
+
+  auto match_softmax = [&](const AssignStmtPtr& sink) -> std::optional<P4Match> {
+    auto div = call_of(sink);
+    if (div == nullptr || div->args_.size() != 2 ||
+        (!IsOp(div, "tensor.row_expand_div") && !IsOp(div, "tensor.div")))
+      return std::nullopt;
+    auto exp_stmt = def_of(div->args_[0]);
+    auto sum_stmt = def_of(div->args_[1]);
+    auto exp = call_of(exp_stmt);
+    auto sum = call_of(sum_stmt);
+    if (exp == nullptr || sum == nullptr || exp->args_.size() != 1 || sum->args_.size() != 1 ||
+        !IsOp(exp, "tensor.exp") || !IsOp(sum, "tensor.row_sum") ||
+        !same_var(sum->args_[0], ExprPtr(exp_stmt->var_)))
+      return std::nullopt;
+    auto sub_stmt = def_of(exp->args_[0]);
+    auto sub = call_of(sub_stmt);
+    if (sub == nullptr || sub->args_.size() != 2 ||
+        (!IsOp(sub, "tensor.row_expand_sub") && !IsOp(sub, "tensor.sub")))
+      return std::nullopt;
+    auto max_stmt = def_of(sub->args_[1]);
+    auto max = call_of(max_stmt);
+    if (max == nullptr || max->args_.size() != 1 || !IsOp(max, "tensor.row_max") ||
+        !same_var(sub->args_[0], max->args_[0]) || def_of(max->args_[0]) != nullptr)
+      return std::nullopt;  // increment 1: max reduces a direct external x
+    const auto [xM, xN] = Static2DShape(max->args_[0]->GetType());
+    const auto [oM, oN] = Static2DShape(sink->var_->GetType());
+    const auto [mM, mN] = Static2DShape(max_stmt->var_->GetType());
+    const auto [sM, sN] = Static2DShape(sum_stmt->var_->GetType());
+    if (xM <= 0 || xN <= 1 || oM != xM || oN != xN || mM != xM || mN != 1 || sM != xM || sN != 1)
+      return std::nullopt;
+    return P4Match{::P4PatternKind::SoftmaxFlash,
+                   {max_stmt, sub_stmt, exp_stmt, sum_stmt, sink},
+                   sink,
+                   max_stmt,
+                   sum_stmt,
+                   {},
+                   max->args_[0],
+                   nullptr,
+                   nullptr};
+  };
+
+  auto match_layernorm = [&](const AssignStmtPtr& sink) -> std::optional<P4Match> {
+    auto mul_out = call_of(sink);
+    if (mul_out == nullptr || mul_out->args_.size() != 2 ||
+        (!IsOp(mul_out, "tensor.row_expand_mul") && !IsOp(mul_out, "tensor.mul")))
+      return std::nullopt;
+
+    ExprPtr centered_expr = mul_out->args_[0];
+    ExprPtr inv_expr = mul_out->args_[1];
+    auto centered_stmt = def_of(centered_expr);
+    auto inv_stmt = def_of(inv_expr);
+    auto centered = call_of(centered_stmt);
+    auto inv = call_of(inv_stmt);
+    // tensor.mul is commutative; accept the inverse/centered operands in either order.
+    if (IsOp(mul_out, "tensor.mul") && (centered == nullptr || (!IsOp(centered, "tensor.row_expand_sub") &&
+                                                                !IsOp(centered, "tensor.sub")))) {
+      std::swap(centered_expr, inv_expr);
+      std::swap(centered_stmt, inv_stmt);
+      centered = call_of(centered_stmt);
+      inv = call_of(inv_stmt);
+    }
+    if (centered == nullptr || centered->args_.size() != 2 ||
+        (!IsOp(centered, "tensor.row_expand_sub") && !IsOp(centered, "tensor.sub")) || inv == nullptr ||
+        inv->args_.size() != 1 || !IsOp(inv, "tensor.rsqrt"))
+      return std::nullopt;
+
+    auto mean_stmt = def_of(centered->args_[1]);
+    if (mean_stmt == nullptr) return std::nullopt;
+    ExprPtr var_expr = inv->args_[0];
+    AssignStmtPtr eps_stmt;
+    if (auto maybe_eps = def_of(var_expr)) {
+      auto eps = call_of(maybe_eps);
+      if (eps != nullptr && eps->args_.size() == 2 && (IsOp(eps, "tensor.adds") || IsOp(eps, "tensor.add"))) {
+        if (is_scalar_const(eps->args_[1])) {
+          var_expr = eps->args_[0];
+          eps_stmt = maybe_eps;
+        } else if (IsOp(eps, "tensor.add") && is_scalar_const(eps->args_[0])) {
+          var_expr = eps->args_[1];
+          eps_stmt = maybe_eps;
+        }
+      }
+    }
+    auto var_stmt = def_of(var_expr);
+    auto var = call_of(var_stmt);
+    if (var == nullptr || var->args_.size() != 2 || !IsOp(var, "tensor.sub")) return std::nullopt;
+    auto msq_stmt = def_of(var->args_[0]);
+    auto mean_sq_stmt = def_of(var->args_[1]);
+    auto mean_sq = call_of(mean_sq_stmt);
+    if (mean_sq == nullptr || mean_sq->args_.size() != 2 || !IsOp(mean_sq, "tensor.mul") ||
+        !same_var(mean_sq->args_[0], ExprPtr(mean_stmt->var_)) ||
+        !same_var(mean_sq->args_[1], ExprPtr(mean_stmt->var_)))
+      return std::nullopt;
+
+    const ExprPtr x = centered->args_[0];
+    const auto [xM, xN] = Static2DShape(x->GetType());
+    const auto [oM, oN] = Static2DShape(sink->var_->GetType());
+    if (xM <= 0 || xN <= 1 || oM != xM || oN != xN || def_of(x) != nullptr)
+      return std::nullopt;  // increment 2: both sums reduce the direct external x
+    const double inv_n = 1.0 / static_cast<double>(xN);
+
+    auto sx_stmt = def_of(call_of(mean_stmt) != nullptr && !call_of(mean_stmt)->args_.empty()
+                              ? call_of(mean_stmt)->args_[0]
+                              : nullptr);
+    auto sxx_stmt =
+        def_of(call_of(msq_stmt) != nullptr && !call_of(msq_stmt)->args_.empty() ? call_of(msq_stmt)->args_[0]
+                                                                                 : nullptr);
+    if (!scaled_from(mean_stmt, sx_stmt != nullptr ? ExprPtr(sx_stmt->var_) : nullptr, inv_n) ||
+        !scaled_from(msq_stmt, sxx_stmt != nullptr ? ExprPtr(sxx_stmt->var_) : nullptr, inv_n))
+      return std::nullopt;
+    auto sx = call_of(sx_stmt);
+    auto sxx = call_of(sxx_stmt);
+    if (sx == nullptr || sxx == nullptr || sx->args_.size() != 1 || sxx->args_.size() != 1 ||
+        !IsOp(sx, "tensor.row_sum") || !IsOp(sxx, "tensor.row_sum") || !same_var(sx->args_[0], x))
+      return std::nullopt;
+    auto square_stmt = def_of(sxx->args_[0]);
+    auto square = call_of(square_stmt);
+    if (square == nullptr || square->args_.size() != 2 || !IsOp(square, "tensor.mul") ||
+        !same_var(square->args_[0], x) || !same_var(square->args_[1], x))
+      return std::nullopt;
+    const auto [meanM, meanN] = Static2DShape(mean_stmt->var_->GetType());
+    const auto [varM, varN] = Static2DShape(var_stmt->var_->GetType());
+    if (meanM != xM || meanN != 1 || varM != xM || varN != 1) return std::nullopt;
+
+    std::vector<AssignStmtPtr> matched = {sx_stmt,  square_stmt,  sxx_stmt, mean_stmt,
+                                          msq_stmt, mean_sq_stmt, var_stmt};
+    if (eps_stmt != nullptr) matched.push_back(eps_stmt);
+    matched.insert(matched.end(), {inv_stmt, centered_stmt, sink});
+    return P4Match{::P4PatternKind::LayerNormWelford,
+                   std::move(matched),
+                   sink,
+                   nullptr,
+                   nullptr,
+                   {sx_stmt, sxx_stmt},
+                   x,
+                   mean_stmt->var_,
+                   var_stmt->var_};
+  };
+
+  // The online kernel has one live-out. If an internal statistic/cone value also feeds an op outside
+  // the exact pattern, this candidate would be multi-sink even though its op set still matches.
+  auto has_single_live_out = [&](const P4Match& match) -> bool {
+    std::unordered_set<const Stmt*> members;
+    for (const AssignStmtPtr& op : match.ops) members.insert(op.get());
+    for (const AssignStmtPtr& op : match.ops) {
+      if (op == match.sink) continue;
+      auto it = consumers.find(op->var_.get());
+      if (it == consumers.end()) continue;
+      for (const Stmt* consumer : it->second)
+        if (members.count(consumer) == 0) return false;
+    }
+    return true;
+  };
+
+  std::vector<P4Match> matches;
+  for (const AssignStmtPtr& sink : ops) {
+    if (auto softmax = match_softmax(sink)) {
+      if (has_single_live_out(*softmax)) matches.push_back(std::move(*softmax));
+      continue;
+    }
+    if (auto layernorm = match_layernorm(sink); layernorm && has_single_live_out(*layernorm))
+      matches.push_back(std::move(*layernorm));
+  }
+  return matches;
+}
 
 // Build the MLSys solver `Problem` (op+tensor DAG) from a function, reusing
 // `BuildStmtDependencyGraph` for sound op-dependency edges.
@@ -353,6 +585,7 @@ class ProblemBuilder {
   ::Problem problem;
   std::vector<std::string> op_labels;     // per-op kernel/op name, for readable logging
   std::vector<const Stmt*> op_stmts;      // per-op source AssignStmt (op index -> Stmt), for the emit
+  std::vector<P4Match> p4_matches;        // exact semantic matches shared by model + emit
 
   // The function is OUT OF SCOPE for AutoFuse v0 (a non-tensor compute output or a
   // dynamic/symbolic tensor shape) — the caller must leave it for legacy lowering. This
@@ -404,25 +637,10 @@ class ProblemBuilder {
     problem.vec_op_tail = kVecOpTail;
     problem.vec_slope_pw = kVecSlopePw;
     problem.vec_slope_reduce = kVecSlopeReduce;
-    // BUILDABLE mode: a streamed MULTI-reduction group (softmax/layernorm: >1 reduction over
-    // the streamed axis) is only emittable when the fused online path (P4) is ON. With P4 OFF the
-    // emit streams a single reduction only (P1/P2), so such a group is marked infeasible and the
-    // partitioner cuts it into single-reduction (streamable) + pointwise pieces (an unfused softmax
-    // IS buildable) — the G1 behaviour that avoided a hard AllocateMemoryAddr failure. With P4 ON
-    // the emit streams the multi-reduction SOFTMAX (online (m,l) stats) or LAYERNORM dual-sum (two
-    // independent online sums) as ONE kernel, so keep the fused group feasible (the ascend910b_cost
-    // :1801 gate honours this flag).
-    //
-    // Precision: the :1801 gate is TYPE-AGNOSTIC (`reductions > 1`), so flipping this flag on for a
-    // shape the emit CANNOT stream (e.g. an order-statistic reduction, or a CHAINED Welford layernorm
-    // that classify_p4 declines) would let the solver fuse a group the emit over-UB-declines to legacy
-    // -> AllocateMemoryAddr overflow. So enable it only for the two emittable P4 families: softmax
-    // (all row_max/row_sum, #row_sum <= #row_max — every sum pairs with a max) OR dual-sum layernorm
-    // (all row_sum, >= 2). Any other mix keeps the flag FALSE -> the solver cuts it (the safe G1 path).
-    // The dual-sum vs chained-Welford INDEPENDENCE distinction is enforced structurally in the emit's
-    // classify_p4 (this coarse family gate only admits the all-row_sum shape). Set below (after the op
-    // scan) — realizes "keep the fused softmax/layernorm feasible" without an mlsys26 change.
-    int p4_row_max = 0, p4_row_sum = 0, p4_reductions = 0;
+    // BUILDABLE mode. The analytic override stays false; exact P4 op sets discovered by the single
+    // semantic analysis below are registered in problem.p4_patterns. Thus the cost model can admit
+    // only the same complete algorithm descriptor the emitter will consume.
+    problem.allow_model_ahead_multi_reduction_stream = false;
 
     // 1. In AND InOut params are graph-input tensors: both are READ by the body. An InOut param
     //    is also written, but its updated value is a SEPARATE SSA tensor produced by a compute op
@@ -466,11 +684,6 @@ class ProblemBuilder {
       const CallPtr& call = entry.second;
       ::Op sop;
       sop.type = ClassifyOp(call);
-      if (sop.type == ::OpType::Reduction) {
-        ++p4_reductions;
-        if (IsOp(call, "tensor.row_max")) ++p4_row_max;
-        else if (IsOp(call, "tensor.row_sum")) ++p4_row_sum;
-      }
       sop.vec_slope = VecOpSlope(call);  // vdiv=4 / vrsqrt=1 override the elementwise default
       sop.vec_fixed = VecOpFixed(call);  // per-op head+tail (vadd 24 / vexp 31 / vdiv 30 / ...)
       // Inputs in OPERAND ORDER (call->args_). The solver derives M/N/K
@@ -503,116 +716,25 @@ class ProblemBuilder {
       op_stmts.push_back(stmt);
     }
 
-    // Enable the multi-reduction-stream feasibility for the two P4-buildable shapes (see the comment
-    // where p4_row_* are declared). The :1801 cost gate is TYPE-AGNOSTIC (`reductions > 1`), so this
-    // flag must be set ONLY when the emit's classify_p4 can actually stream the group — else the
-    // solver fuses a group the emit declines and lowering overflows AllocateMemoryAddr.
-    //   * softmax shape: all reductions row_max/row_sum, >= 1 row_max, #row_sum <= #row_max (every sum
-    //     pairs with a max) -> the coupled online (m,l) flash.
-    //   * layernorm dual-sum shape: NO row_max, >= 2 row_sum, all reductions are row_sum -> the
-    //     independent multi-sum flash. (Independence — dual-sum vs the chained Welford form — is the
-    //     emit's classify_p4 job; here we only gate on the ALL-row_sum family, which both admit.)
-    // Any other reduction mix keeps the flag FALSE -> the solver cuts it (the safe G1 path).
-    const bool p4_softmax_shaped = P4Enabled() && p4_row_max >= 1 && p4_row_sum <= p4_row_max &&
-                                   (p4_row_max + p4_row_sum) == p4_reductions;
-    const bool p4_layernorm_shaped = P4Enabled() && p4_row_max == 0 && p4_row_sum >= 2 &&
-                                     (p4_row_max + p4_row_sum) == p4_reductions;
-    // Dual-sum vs chained-Welford: the emit's classify_p4 only streams INDEPENDENT sums (no sum's
-    // input cone reaches another reduction's output). Enable the layernorm feasibility ONLY when that
-    // independence holds — else the solver would fuse a chained layernorm the emit declines, and the
-    // G1 emit-defense (an over-UB fused reduction) declines to the legacy tiler -> AllocateMemoryAddr
-    // overflow. A single forward pass in region (topological, SSA def-before-use) order computes, per
-    // op, whether its input cone reaches a reduction output — O(N). A reduction whose cone reaches
-    // another reduction is chained (the second sum depends on the finalized mean).
-    bool p4_sums_independent = true;
-    if (p4_layernorm_shaped) {
-      std::unordered_map<const Var*, bool> cone_hits_red;  // op output -> its input cone hits a reduction
-      std::unordered_set<const Var*> red_outs;
-      for (const StmtPtr& stmt : dep.stmts) {
-        CallPtr c;
-        if (!IsComputeOp(stmt, &c)) continue;
-        auto assign = As<AssignStmt>(stmt);
-        const Var* self = assign->var_.get();
-        const bool is_red = ClassifyOp(c) == ::OpType::Reduction;
-        bool hits = false;
-        for (const ExprPtr& arg : c->args_) {
-          auto v = AsVarLike(arg);
-          if (v == nullptr) continue;
-          if (red_outs.count(v.get()) != 0) hits = true;  // an operand IS a reduction output
-          auto it = cone_hits_red.find(v.get());
-          if (it != cone_hits_red.end() && it->second) hits = true;  // ... or its cone reached one
-        }
-        if (is_red && hits) { p4_sums_independent = false; break; }  // chained -> not independent
-        cone_hits_red[self] = hits;
-        if (is_red) red_outs.insert(self);
-      }
-    }
-    // A1: mirror the emit's classify_p4 SoftmaxFlash cone check HERE. p4_softmax_shaped is a LOOSE
-    // count gate (#row_sum <= #row_max); the emit's classify_p4 (in EmitFusedGroupGeneric) additionally
-    // requires the EXACT coupled cone — exactly 1 row_max + 1 row_sum, sum <- exp <- (row_expand_)sub(x,m)
-    // with x == the max's input, and the max reducing a full-working-shape function PARAMETER (external,
-    // NOT produced by a compute op). A temperature (exp((x-m)*t)) or scaled (max over a mul(x,x)) softmax
-    // passes the count gate but classify_p4 DECLINES it. If this flag stayed set the solver would fuse
-    // such a group, the emit's classify_p4 would return None, and lowering would overflow
-    // AllocateMemoryAddr (the over-UB G1 defense declines to the legacy tiler). So verify the same cone
-    // here; only then keep the fused softmax feasible. (This duplicates classify_p4's cone logic — keep
-    // the two textually PARALLEL; a shared helper is a noted follow-up.)
-    bool p4_softmax_valid = false;
-    if (p4_softmax_shaped && p4_row_max == 1 && p4_row_sum == 1 && p4_reductions == 2) {
-      std::unordered_map<const Var*, CallPtr> defmap;  // produced var -> its compute Call
-      std::unordered_set<const Var*> produced;         // vars written by a compute op (external = NOT here)
-      CallPtr mx_call, sm_call;
-      const Var* mx_out = nullptr;
-      const Var* sm_out = nullptr;
-      int64_t IM = 0, IN = 0;  // full working shape (max 2D extent over ops' operands/outputs, like the emit)
-      for (const StmtPtr& stmt : dep.stmts) {
-        CallPtr c;
-        if (!IsComputeOp(stmt, &c)) continue;
-        auto assign = As<AssignStmt>(stmt);
-        defmap.emplace(assign->var_.get(), c);
-        produced.insert(assign->var_.get());
-        const auto [oM, oN] = Static2DShape(assign->var_->GetType());
-        IM = std::max(IM, oM);
-        IN = std::max(IN, oN);
-        for (const ExprPtr& arg : c->args_) {
-          const auto [aM, aN] = Static2DShape(arg->GetType());
-          IM = std::max(IM, aM);
-          IN = std::max(IN, aN);
-        }
-        if (IsOp(c, "tensor.row_max")) {
-          mx_call = c;
-          mx_out = assign->var_.get();
-        } else if (IsOp(c, "tensor.row_sum")) {
-          sm_call = c;
-          sm_out = assign->var_.get();
-        }
-      }
-      (void)sm_out;
-      if (mx_call != nullptr && sm_call != nullptr && !mx_call->args_.empty() && !sm_call->args_.empty()) {
-        // sum's input must be exp( (row_expand_)sub(x, m) ), x == the max's input, m == the max output.
-        auto exp_v = AsVarLike(sm_call->args_[0]);
-        auto exp_it = exp_v != nullptr ? defmap.find(exp_v.get()) : defmap.end();
-        if (exp_it != defmap.end() && IsOp(exp_it->second, "tensor.exp") && !exp_it->second->args_.empty()) {
-          auto sub_v = AsVarLike(exp_it->second->args_[0]);
-          auto sub_it = sub_v != nullptr ? defmap.find(sub_v.get()) : defmap.end();
-          if (sub_it != defmap.end() &&
-              (IsOp(sub_it->second, "tensor.row_expand_sub") || IsOp(sub_it->second, "tensor.sub")) &&
-              sub_it->second->args_.size() >= 2) {
-            auto sub_x = AsVarLike(sub_it->second->args_[0]);
-            auto sub_m = AsVarLike(sub_it->second->args_[1]);
-            auto mx_x = AsVarLike(mx_call->args_[0]);
-            const auto [xM, xN] = Static2DShape(mx_call->args_[0]->GetType());
-            const bool mx_external = mx_x != nullptr && produced.count(mx_x.get()) == 0;  // a parameter
-            const bool full_shape = (xM == IM && xN == IN);
-            if (sub_m != nullptr && sub_m.get() == mx_out && sub_x != nullptr && mx_x != nullptr &&
-                sub_x.get() == mx_x.get() && mx_external && full_shape)
-              p4_softmax_valid = true;
+    if (GenericEmitEnabled() && P4Enabled()) {
+      std::unordered_map<const Stmt*, size_t> op_index;
+      for (size_t i = 0; i < op_stmts.size(); ++i) op_index.emplace(op_stmts[i], i);
+      for (P4Match& match : AnalyzeP4Patterns(dep.stmts)) {
+        FlatSet<size_t> matched_ops;
+        bool complete = true;
+        for (const AssignStmtPtr& stmt : match.ops) {
+          auto it = op_index.find(stmt.get());
+          if (it == op_index.end()) {
+            complete = false;
+            break;
           }
+          matched_ops.insert(it->second);
         }
+        if (!complete || matched_ops.size() != match.ops.size()) continue;
+        problem.p4_patterns.push_back(::P4Pattern{match.kind, std::move(matched_ops)});
+        p4_matches.push_back(std::move(match));
       }
     }
-    problem.allow_model_ahead_multi_reduction_stream =
-        (p4_softmax_shaped && p4_softmax_valid) || (p4_layernorm_shaped && p4_sums_independent);
   }
 
  private:
@@ -1361,7 +1483,8 @@ static std::nullopt_t GenericDeclineB(const std::string& reason, const Span& spa
 }
 
 std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<StmtPtr>& run,
-                                                          SolverTile tile, const std::string& name) {
+                                                          SolverTile tile, const std::string& name,
+                                                          const P4Match* p4_match) {
   auto& reg = OpRegistry::GetInstance();
 
   // A1 (classify allowlist). Increments 1-2 support ELEMENTWISE + REDUCTION. A MatMul
@@ -1549,130 +1672,12 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   const bool stream_p1 = stream_ok && sink_is_reduction;
   const bool stream_p2 = stream_ok && !sink_is_reduction;
 
-  // P4 (fused online statistics — the flash algorithm applied to a DDR-resident reduction). A group
-  // with >1 reduction over a UB-overflowing reduced axis cannot stream via the single-reduction gate
-  // (stream_ok, p1_nreds==1); with P4 OFF the cost side CUTS it into single-reduction pieces (the G1
-  // path). With P4 ON we stream ALL the statistics in ONE pass, then a second apply pass re-streams R
-  // substituting the finalized stats (x read 2x — matches A7 stream_passes=2). classify_p4 is
-  // READ-ONLY (returns the kind; emits no IR). Two flash structures are built:
-  //   * SoftmaxFlash — exactly one row_max + one row_sum, COUPLED (max -> sub -> exp -> sum): pass 0
-  //     carries the running (m, l) with the exact exp(m_old - m_new) rescale.
-  //   * MultiSum (layernorm dual-sum) — >= 2 row_sum, INDEPENDENT (no sum's backward input cone
-  //     reaches another sum's output): pass 0 carries one running accumulator per sum, merged by add.
-  // A CHAINED layernorm (row_sum((x-mu)^2), where the second sum depends on the finalized mean) is NOT
-  // independent -> declines to None (a Welford / follow-up increment). Col-softmax likewise -> None.
-  enum class P4Kind { None, SoftmaxFlash, MultiSum };
-  auto classify_p4 = [&]() -> P4Kind {
-    if (!P4Enabled()) return P4Kind::None;
-    if (sinks.size() != 1 || !has_reduction || pin_m == pin_n) return P4Kind::None;
-    if (p1_nreds < 2) return P4Kind::None;  // both flash structures reduce >= 2 times
-    // Collect the reductions and count families. Both structures admit ONLY row reductions (they
-    // reduce N -> pin_n; the pass-0/apply bodies broadcast the [free_tile,1] stat via row_expand_*,
-    // a ROW broadcast — a col reduction's [1,free_tile] stat is not handled here). The foldability
-    // gate (§5.1): sum/max are fixed-size associative running states; any other reduction family
-    // (col reduction / order statistic like median/quantile/top-k) declines to None.
-    std::vector<AssignStmtPtr> reds;
-    int n_row_max = 0, n_row_sum = 0;
-    for (const auto& a : ops) {
-      auto rcall = As<Call>(a->value_);
-      if (ClassifyOp(rcall) != ::OpType::Reduction) continue;
-      reds.push_back(a);
-      if (IsOp(rcall, "tensor.row_max")) ++n_row_max;
-      else if (IsOp(rcall, "tensor.row_sum")) ++n_row_sum;
-      else return P4Kind::None;  // col reduction / non-foldable order statistic -> not P4
-    }
-    // Backward DFS over group-internal operands (O(N)): does `start`'s input cone reach any var in
-    // `targets`? Shared by the softmax coupling test (reaches the max) and the multi-sum independence
-    // test (must NOT reach another sum). `start`'s own operands are the DFS roots (not `start`).
-    std::unordered_map<const Var*, AssignStmtPtr> defmap;
-    for (const auto& a : ops) defmap.emplace(a->var_.get(), a);
-    auto backward_reaches = [&](const AssignStmtPtr& start,
-                                const std::unordered_set<const Var*>& targets) -> bool {
-      std::vector<const Var*> stack;
-      std::unordered_set<const Var*> seen;
-      auto push_operands = [&](const AssignStmtPtr& a) {
-        for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
-          auto v = AsVarLike(arg);
-          if (v != nullptr && defined.count(v.get()) != 0) stack.push_back(v.get());
-        }
-      };
-      push_operands(start);
-      while (!stack.empty()) {
-        const Var* v = stack.back();
-        stack.pop_back();
-        if (!seen.insert(v).second) continue;
-        if (targets.count(v) != 0) return true;
-        auto it = defmap.find(v);
-        if (it != defmap.end()) push_operands(it->second);
-      }
-      return false;
-    };
-
-    // SOFTMAX (coupled) — exactly one row_max + one row_sum, the sum coupled to the max.
-    if (p1_nreds == 2 && n_row_max == 1 && n_row_sum == 1) {
-      AssignStmtPtr mx, sm;
-      for (const auto& a : reds) {
-        if (IsOp(As<Call>(a->value_), "tensor.row_max")) mx = a;
-        else sm = a;
-      }
-      // Coupling: the sum's backward input cone must reach the max's output var (the
-      // max -> sub -> exp -> sum softmax structure).
-      if (!backward_reaches(sm, {mx->var_.get()})) return P4Kind::None;
-      // Increment 1 scope: the max reduces a DIRECT external full-[IM,IN] input (no pre-reduction
-      // pointwise cone). The online pass-0 body recomputes x's slice per chunk; a scale-then-softmax
-      // (pre-reduction cone) is a later increment -> declines to None.
-      auto mxin = AsVarLike(As<Call>(mx->value_)->args_[0]);
-      if (mxin != nullptr && defined.count(mxin.get()) != 0) return P4Kind::None;  // not external
-      const auto [xM, xN] = Static2DShape(As<Call>(mx->value_)->args_[0]->GetType());
-      if (xM != IM || xN != IN) return P4Kind::None;  // not the full working shape
-      // The pass-0 body HARDCODES the stats cone as l += row_sum(exp(sub(x, m_new))), and the flash
-      // rescale exp(m_old - m_new) is math-specific to exp(x - m). If the ACTUAL max->sum cone differs
-      // (a temperature scale exp((x-m)*invT), an extra op, a different sub input), pass 0 accumulates
-      // the WRONG running sum L while pass 1 replays the real cone against it -> a SILENTLY wrong kernel
-      // that lowers clean (no verifier catches it). So require the cone to be EXACTLY
-      //   sum = row_sum( exp( (row_expand_)sub(x, m) ) ),  x == the max's input, m == the max's output.
-      // Anything else -> None -> the correct P1/P2 cut (which REPLAYS the real cone, so it stays right).
-      auto exp_v = AsVarLike(As<Call>(sm->value_)->args_[0]);       // the sum's input
-      auto exp_it = exp_v != nullptr ? defmap.find(exp_v.get()) : defmap.end();
-      if (exp_it == defmap.end() || !IsOp(As<Call>(exp_it->second->value_), "tensor.exp"))
-        return P4Kind::None;                                        // sum's input is not exp(...)
-      auto sub_v = AsVarLike(As<Call>(exp_it->second->value_)->args_[0]);  // the exp's input
-      auto sub_it = sub_v != nullptr ? defmap.find(sub_v.get()) : defmap.end();
-      if (sub_it == defmap.end()) return P4Kind::None;
-      auto sub_call = As<Call>(sub_it->second->value_);
-      if ((!IsOp(sub_call, "tensor.row_expand_sub") && !IsOp(sub_call, "tensor.sub")) ||
-          sub_call->args_.size() < 2)
-        return P4Kind::None;                                        // exp's input is not a (row_expand_)sub
-      auto sub_x = AsVarLike(sub_call->args_[0]);
-      auto sub_m = AsVarLike(sub_call->args_[1]);
-      auto mx_x = AsVarLike(As<Call>(mx->value_)->args_[0]);
-      if (sub_m == nullptr || sub_m.get() != mx->var_.get()) return P4Kind::None;  // 2nd arg = the max output
-      if (sub_x == nullptr || mx_x == nullptr || sub_x.get() != mx_x.get())
-        return P4Kind::None;                                        // sub subtracts the SAME x the max reduced
-      return P4Kind::SoftmaxFlash;
-    }
-
-    // MULTISUM (layernorm dual-sum) — >= 2 reductions, ALL row_sum, INDEPENDENT. Independence: no
-    // sum's backward input cone reaches ANOTHER sum's output. The chained form row_sum((x-mu)^2) has
-    // the second sum's cone pass through the finalized-mean sum -> NOT independent -> None (Welford,
-    // a later increment). Each sum reduces the full [IM,IN] working shape (via a pointwise cone of the
-    // external x; a partial-shape reduction is out of scope). Increment 2 = the DUAL-sum layernorm.
-    if (n_row_sum == p1_nreds && n_row_sum >= 2) {
-      std::unordered_set<const Var*> red_outs;
-      for (const auto& a : reds) red_outs.insert(a->var_.get());
-      for (const auto& a : reds) {
-        if (backward_reaches(a, red_outs)) return P4Kind::None;  // chained -> not independent
-        const auto [rM, rN] = Static2DShape(As<Call>(a->value_)->args_[0]->GetType());
-        if (rM != IM || rN != IN) return P4Kind::None;  // not the full working shape
-      }
-      return P4Kind::MultiSum;
-    }
-    return P4Kind::None;
-  };
-  const P4Kind p4_kind = classify_p4();
+  // P4 is admitted only when this solver group exactly equals a semantic match produced once by
+  // AnalyzeP4Patterns. No family/count heuristic is repeated in the emitter.
+  const ::P4PatternKind p4_kind = p4_match != nullptr ? p4_match->kind : ::P4PatternKind::None;
   // stream_p4 gate (task spec): a P4-shaped group whose full pinned tile overflows UB (same test as
-  // P1/P2) -> stream it as one fused online kernel below (softmax flash-stats or layernorm dual-sum).
-  const bool stream_p4 = p4_kind != P4Kind::None && has_reduction &&
+  // P1/P2) -> stream it as one fused online kernel below.
+  const bool stream_p4 = P4Enabled() && p4_kind != ::P4PatternKind::None && has_reduction &&
                          (pin_m != pin_n) && sinks.size() == 1 && p1_nreds >= 2 &&
                          (2 * AlignUp(h, g) * AlignUp(w, g) * p1_dtb > p1_ub);
 
@@ -1874,8 +1879,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // [.,chunk] slices are transient per iteration). Accumulation is ON-CORE (ordinary tile add/max,
   // NOT the cross-core atomic), so it is exact for sum AND max. Chunks are DISJOINT (no clamp-
   // overlap: a reduction overlap would double-count), ragged tail via `valid`. The accumulator loop
-  // is a Sequential ForStmt whose iter_arg is the accumulator — lowering-proven (the §11.3 spike:
-  // MemoryReuse aliases the carry in place). Single pass (level-0 reduction); P2/P3 add recompute.
+  // uses an iter_arg for the persistent accumulator — lowering-proven (the §11.3 spike: MemoryReuse
+  // aliases the carry in place) — and pipelines its full-chunk loop when there are two rolled
+  // iterations to overlap. Single pass (level-0 reduction); P2/P4 add an apply re-stream.
   if (stream_p1 || stream_p2 || stream_p4) {
     const int64_t red_ext = pin_m ? IM : IN;    // pinned/reduced axis extent
     const int64_t free_ext = pin_m ? IN : IM;   // free axis extent
@@ -1928,79 +1934,23 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     };
 
     // ===================== P4 — FUSED ONLINE LAYERNORM (Welford) =====================
-    // A layernorm streams like softmax but its stats are the mean and variance of x over the reduced
-    // axis. classify_p4 detects the DUAL-SUM form (>= 2 INDEPENDENT row_sums: Sx=row_sum(x) and
-    // Sxsq=row_sum(x^2)), but computing var = E[x^2] - E[x]^2 from those raw sums CATASTROPHICALLY
-    // CANCELS for a large input mean (both terms ~mean^2; in fp32 the difference is lost -> NaN at
-    // mean >~2000). So the EMIT streams a numerically-STABLE Welford (running count, mean, M2) instead:
-    // pass 0 folds each disjoint chunk into (mean, M2, count) via Chan's parallel merge (chunk M2 taken
-    // as the stable row_sum((x-mean_a)^2) form), then pass 1 substitutes the FINALIZED stable mean and
-    // var = M2/N directly into the user cone (bypassing the sx/sxsq -> var path). The DETECTION stays
-    // the dual-sum shape (classify_p4 unchanged); only the accumulation and the substitution change.
-    // x is read 2x total (A7 stream_passes=2): one DMA per chunk per pass. Both loops Sequential in v1.
-    if (stream_p4 && p4_kind == P4Kind::MultiSum) {
-      // The row_sum reductions in group order; the LAST one (in ops order) is the pass-0 stop point for
-      // the legacy dual-sum FALLBACK (strip_at fills every sum's [free_tile,1] partial into `oc`).
-      std::vector<AssignStmtPtr> sum_stmts;
-      const Stmt* last_red = nullptr;
-      for (const auto& a : ops) {
-        if (ClassifyOp(As<Call>(a->value_)) != ::OpType::Reduction) continue;
-        sum_stmts.push_back(a);
-        last_red = a.get();
-      }
-      INTERNAL_CHECK_SPAN(sum_stmts.size() >= 2 && last_red != nullptr, sp)
-          << "Internal error: P4 dual-sum classified but < 2 row_sum reductions were found";
-      const size_t nsum = sum_stmts.size();
-
-      // ---- Identify the layernorm mean/var vars for the STABLE substitution (standard layernorm cone):
-      //   user_mean = the [.,1] column operand of the spanning row_expand_sub(x, mean);
-      //   user_var  = the (add-of-eps-stripped) input of the rsqrt;
-      //   x_input   = the spanning sub's arg[0] (the external full-[IM,IN] input reduced by the sums).
-      // Substituting at the mean/var level (not the sum level) is the whole point — it bypasses the
-      // unstable E[x^2] - E[x]^2 reconstruction. If the cone does not match (non-standard dual-sum),
-      // fall back to the legacy sum-substitution path so nothing regresses.
-      std::unordered_map<const Var*, AssignStmtPtr> defmap;
-      for (const auto& a : ops) defmap.emplace(a->var_.get(), a);
-      VarPtr user_mean, user_var;
-      ExprPtr x_input;
-      for (const auto& a : ops) {  // spanning sub -> user_mean + x_input
-        auto c = As<Call>(a->value_);
-        if (!IsOp(c, "tensor.row_expand_sub") && !IsOp(c, "tensor.sub")) continue;
-        if (c->args_.size() < 2) continue;
-        const auto [aM, aN] = Static2DShape(c->args_[0]->GetType());
-        const auto [bM, bN] = Static2DShape(c->args_[1]->GetType());
-        if (aM != IM || aN != IN) continue;               // arg0 spans the full working shape (x)
-        if (!(bM == IM && bN == 1)) continue;             // arg1 is a [.,1] row-reduction column
-        auto mv = AsVarLike(c->args_[1]);
-        if (mv == nullptr || defined.count(mv.get()) == 0) continue;  // arg1 group-internal (a stat)
-        user_mean = mv;
-        x_input = c->args_[0];
-        break;
-      }
-      for (const auto& a : ops) {  // rsqrt -> user_var (strip an optional add-of-eps)
-        auto c = As<Call>(a->value_);
-        if (!IsOp(c, "tensor.rsqrt") || c->args_.empty()) continue;
-        auto rin = AsVarLike(c->args_[0]);
-        if (rin == nullptr) break;
-        auto vit = defmap.find(rin.get());
-        if (vit != defmap.end() && (IsOp(As<Call>(vit->second->value_), "tensor.adds") ||
-                                    IsOp(As<Call>(vit->second->value_), "tensor.add"))) {
-          // veps = add(var, eps): var is the group-internal [.,1] operand (eps is a const / non-var).
-          for (const ExprPtr& e : As<Call>(vit->second->value_)->args_) {
-            auto vv = AsVarLike(e);
-            if (vv != nullptr && defined.count(vv.get()) != 0) { user_var = vv; break; }
-          }
-        } else {
-          user_var = rin;  // rsqrt applied directly to var (no eps add)
-        }
-        break;
-      }
-      const bool welford = (user_mean != nullptr && user_var != nullptr && x_input != nullptr);
+    // The shared descriptor has already proven the exact dual-sum layernorm algebra. The emitted stats
+    // pass uses numerically stable Welford/Chan and substitutes the finalized mean and variance into
+    // that exact cone. No generic independent-sum graph is allowed to reach this path.
+    if (stream_p4 && p4_kind == ::P4PatternKind::LayerNormWelford) {
+      INTERNAL_CHECK_SPAN(p4_match != nullptr && p4_match->layernorm_sums.size() == 2 &&
+                              p4_match->user_mean != nullptr && p4_match->user_var != nullptr &&
+                              p4_match->x_input != nullptr,
+                          sp)
+          << "Internal error: exact layernorm P4 group has an incomplete semantic descriptor";
+      const VarPtr user_mean = p4_match->user_mean;
+      const VarPtr user_var = p4_match->user_var;
+      const ExprPtr x_input = p4_match->x_input;
 
       std::vector<StmtPtr> body;
       std::unordered_map<const Var*, VarPtr> subs;
 
-      if (welford) {
+      {
         // ---- WELFORD streaming (numerically STABLE). Running (mean, M2, count) as [free_tile,1] tile
         // iter_args. Count is carried as a small tile (NOT folded to a compile-time constant): the merge
         // weights cnt_a/n_new depend on the RUNTIME chunk index k in the rolled loop, so carrying count
@@ -2084,8 +2034,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           return {mean_new, M2_new, n_new};
         };
 
-        // PASS 0 — chunk 0 inits (mean, M2, count); chunks 1..num_full merge in a Sequential loop
-        // threading {mean_it, M2_it, cnt_it}; the ragged tail merges after. Chunks DISJOINT.
+        // PASS 0 — chunk 0 inits (mean, M2, count); chunks 1..num_full merge while threading
+        // {mean_it, M2_it, cnt_it}; the ragged tail merges after. Chunks DISJOINT.
         auto [mean_cur, M2_cur, cnt_cur] =
             welford_chunk(rc, MakeIndex(0, sp), nullptr, nullptr, nullptr, body, 0);
         if (num_full >= 2) {
@@ -2101,10 +2051,18 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           auto mean_out = std::make_shared<Var>(base + "_wmean", mean_cur->GetType(), sp);
           auto M2_out = std::make_shared<Var>(base + "_wM2", M2_cur->GetType(), sp);
           auto cnt_out = std::make_shared<Var>(base + "_wcnt", cnt_cur->GetType(), sp);
+          // A5: the Welford tuple is true loop-carried state and remains persistent. Stage=2
+          // double-buffers only the next disjoint input chunk, overlapping its load with the current
+          // chunk's Welford reduction/merge. Chunk 0 is emitted before this loop, so the rolled trip
+          // count is num_full-1 and needs to be at least two to have anything to overlap.
+          const bool pipe_stats = (num_full - 1) >= 2;
+          std::vector<std::pair<std::string, std::any>> stats_attrs;
+          if (pipe_stats) stats_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
           body.push_back(std::make_shared<ForStmt>(
               k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp),
               std::vector<IterArgPtr>{mean_it, M2_it, cnt_it}, SeqStmts::Flatten(std::move(lbody), sp),
-              std::vector<VarPtr>{mean_out, M2_out, cnt_out}, sp, ForKind::Sequential));
+              std::vector<VarPtr>{mean_out, M2_out, cnt_out}, sp,
+              pipe_stats ? ForKind::Pipeline : ForKind::Sequential, std::move(stats_attrs)));
           mean_cur = mean_out;
           M2_cur = M2_out;
           cnt_cur = cnt_out;
@@ -2123,64 +2081,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         body.push_back(std::make_shared<AssignStmt>(var_final, var_c, sp));
         subs.emplace(user_mean.get(), mean_cur);
         subs.emplace(user_var.get(), var_final);
-      } else {
-        // ---- LEGACY dual-sum FALLBACK (non-standard cone whose mean/var can't be pinned). Streams the
-        // raw sums S_i and substitutes them; the apply reconstructs mean/var from the user cone (the
-        // UNSTABLE path — retained only for cones the Welford identification declines).
-        auto multisum_chunk = [&](int64_t chunk_ext, const ExprPtr& red_off,
-                                  const std::vector<VarPtr>& acc_in, std::vector<StmtPtr>& out,
-                                  int tag) -> std::vector<VarPtr> {
-          const std::string tg = std::to_string(tag);
-          std::unordered_map<const Var*, VarPtr> oc;
-          strip_at(chunk_ext, red_off, out, oc, last_red, nullptr);
-          std::vector<VarPtr> res;
-          res.reserve(nsum);
-          for (size_t i = 0; i < nsum; ++i) {
-            auto pit = oc.find(sum_stmts[i]->var_.get());
-            INTERNAL_CHECK_SPAN(pit != oc.end(), sp)
-                << "Internal error: P4 dual-sum partial missing for sum " << i;
-            VarPtr partial = pit->second;  // [free_tile,1]
-            if (acc_in.empty()) {
-              res.push_back(partial);
-            } else {
-              auto add_c = reg.Create("tensor.add", {ExprPtr(acc_in[i]), ExprPtr(partial)}, sp);
-              auto acc_n =
-                  std::make_shared<Var>(base + "_s" + std::to_string(i) + "_" + tg, add_c->GetType(), sp);
-              out.push_back(std::make_shared<AssignStmt>(acc_n, add_c, sp));
-              res.push_back(acc_n);
-            }
-          }
-          return res;
-        };
-        std::vector<VarPtr> acc = multisum_chunk(rc, MakeIndex(0, sp), {}, body, 0);
-        if (num_full >= 2) {
-          auto k = std::make_shared<Var>(base + "_k", index_type, sp);
-          std::vector<IterArgPtr> its;
-          its.reserve(nsum);
-          for (size_t i = 0; i < nsum; ++i)
-            its.push_back(std::make_shared<IterArg>(base + "_s" + std::to_string(i) + "_it",
-                                                    acc[i]->GetType(), ExprPtr(acc[i]), sp));
-          std::vector<StmtPtr> lbody;
-          std::vector<VarPtr> its_as_vars(its.begin(), its.end());
-          std::vector<VarPtr> acc_new =
-              multisum_chunk(rc, MakeMul(k, MakeIndex(rc, sp), sp), its_as_vars, lbody, 1);
-          std::vector<ExprPtr> yields(acc_new.begin(), acc_new.end());
-          lbody.push_back(std::make_shared<YieldStmt>(std::move(yields), sp));
-          std::vector<VarPtr> outs;
-          outs.reserve(nsum);
-          for (size_t i = 0; i < nsum; ++i)
-            outs.push_back(std::make_shared<Var>(base + "_s" + std::to_string(i), acc[i]->GetType(), sp));
-          body.push_back(std::make_shared<ForStmt>(
-              k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), its,
-              SeqStmts::Flatten(std::move(lbody), sp), outs, sp, ForKind::Sequential));
-          acc = outs;
-        }
-        if (rem > 0) acc = multisum_chunk(rem, MakeIndex(num_full * rc, sp), acc, body, 2);
-        for (size_t i = 0; i < nsum; ++i) subs.emplace(sum_stmts[i]->var_.get(), acc[i]);
       }
 
-      // PASS 1 — apply (shared). Re-stream R substituting the finalized stats (Welford: mean/var;
-      // fallback: the raw sums), assembling the spanning sink into the full-shape [IM,IN] output.
+      // PASS 1 — apply. Re-stream R substituting the finalized Welford mean/variance and assemble the
+      // spanning sink into the full-shape [IM,IN] output.
       // emit_strip replays the small [.,1] stats cone plus the spanning xc/out; x is DMA'd once here.
       auto asm_at = [&](const ExprPtr& coff) -> ExprPtr {
         return pin_m ? MakeTuple2(coff, foff, sp)    // reduce M: [rc, free_tile] at [coff, foff]
@@ -2200,7 +2104,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(on)}, sp));
         auto ofin =
             std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
-        // P4-serial (mirror G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT
+        // A5 (mirror G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT
         // reduced-axis chunk (out_it is only the assemble target — the pointwise-strip pattern, lowered
         // to an in-place store by RewriteReturnedAssembleLoopToStore), so a stage=2 loop overlaps chunk
         // s+1's x-slice load with chunk s's apply: the DDR-bound re-read (P4 SECOND pass) hides behind
@@ -2227,8 +2131,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       LOG_INFO << "AutoFuse[generic]: STREAMED fused online layernorm (P4) '" << name << "' ("
                << ops.size() << " ops, reduce " << (pin_m ? "M" : "N") << " ext=" << red_ext
                << " chunk=" << rc << "x" << num_full << (rem ? "+tail" : "") << ", free grid "
-               << num_free << ", " << (welford ? "stable Welford (mean,M2,count)" : "dual-sum fallback")
-               << ")";
+               << num_free << ", stable Welford (mean,M2,count))";
       return std::vector<StmtPtr>{c_init_assign, scope};
     }
 
@@ -2238,20 +2141,18 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // rescale l_new = l_old*exp(m_old - m_new) + chunk_sumexp; then a second APPLY pass re-streams R
     // substituting the finalized (M_final, L_final). x is read 2x total (A7 stream_passes=2): one DMA
     // per chunk per pass (slice_input). pin_n only (softmax reduces N) — the [free_tile,1] column-vector
-    // stats broadcast over the chunk via tensor.sub -> tile.row_expand_sub. Both loops Sequential in v1.
-    if (stream_p4 && p4_kind == P4Kind::SoftmaxFlash) {
-      AssignStmtPtr max_stmt, sum_stmt;
-      for (const auto& a : ops) {
-        auto rcall = As<Call>(a->value_);
-        if (ClassifyOp(rcall) != ::OpType::Reduction) continue;
-        if (IsOp(rcall, "tensor.row_max")) max_stmt = a;
-        else if (IsOp(rcall, "tensor.row_sum")) sum_stmt = a;
-      }
-      INTERNAL_CHECK_SPAN(max_stmt != nullptr && sum_stmt != nullptr, sp)
-          << "Internal error: P4 softmax classified but its row_max/row_sum reductions were not found";
-      auto max_call = As<Call>(max_stmt->value_);
-      auto sum_call = As<Call>(sum_stmt->value_);
-      const ExprPtr x_input = max_call->args_[0];  // full [IM,IN] external input (classifier-checked)
+    // stats broadcast over the chunk via tensor.sub -> tile.row_expand_sub. Both streamed loops are
+    // stage-2 pipelines when they have at least two rolled iterations.
+    if (stream_p4 && p4_kind == ::P4PatternKind::SoftmaxFlash) {
+      INTERNAL_CHECK_SPAN(p4_match != nullptr && p4_match->max_stmt != nullptr &&
+                              p4_match->sum_stmt != nullptr && p4_match->x_input != nullptr,
+                          sp)
+          << "Internal error: exact softmax P4 group has an incomplete semantic descriptor";
+      const AssignStmtPtr max_stmt = p4_match->max_stmt;
+      const AssignStmtPtr sum_stmt = p4_match->sum_stmt;
+      const ExprPtr x_input = p4_match->x_input;
+      const CallPtr max_call = As<Call>(max_stmt->value_);
+      const CallPtr sum_call = As<Call>(sum_stmt->value_);
 
       // Emit one reduced-axis chunk's online-stats update over the [free_tile, chunk_ext] slice at
       // red_off. DMA x's slice ONCE (slice_input), then:
@@ -2307,8 +2208,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
 
       std::vector<StmtPtr> body;
       // PASS 0 — online stats. Chunk 0 inits (m=row_max(x0), l=row_sum(exp(x0-m)), corr=1); chunks
-      // 1..num_full merge in a Sequential loop threading {m_it, l_it}; the ragged tail merges after.
-      // Chunks are DISJOINT (a reduction overlap double-counts). Do NOT pipeline in v1.
+      // 1..num_full merge while threading {m_it, l_it}; the ragged tail merges after. Chunks are
+      // DISJOINT (overlapping the chunk bounds themselves would double-count the reduction).
       auto [m_cur, l_cur] = p4_chunk(rc, MakeIndex(0, sp), nullptr, nullptr, body, 0);
       if (num_full >= 2) {
         auto k = std::make_shared<Var>(base + "_k", index_type, sp);
@@ -2320,10 +2221,17 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
             std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(m_new), ExprPtr(l_new)}, sp));
         auto m_out = std::make_shared<Var>(base + "_m", m_cur->GetType(), sp);
         auto l_out = std::make_shared<Var>(base + "_l", l_cur->GetType(), sp);
+        // A5: (m,l) is true loop-carried state and remains persistent. Stage=2 double-buffers only
+        // the next disjoint input chunk, overlapping its load with the current chunk's online
+        // reduction/merge. Chunk 0 is emitted before this loop, so require two rolled iterations.
+        const bool pipe_stats = (num_full - 1) >= 2;
+        std::vector<std::pair<std::string, std::any>> stats_attrs;
+        if (pipe_stats) stats_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
         body.push_back(std::make_shared<ForStmt>(
             k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp),
             std::vector<IterArgPtr>{m_it, l_it}, SeqStmts::Flatten(std::move(lbody), sp),
-            std::vector<VarPtr>{m_out, l_out}, sp, ForKind::Sequential));
+            std::vector<VarPtr>{m_out, l_out}, sp,
+            pipe_stats ? ForKind::Pipeline : ForKind::Sequential, std::move(stats_attrs)));
         m_cur = m_out;
         l_cur = l_out;
       }
@@ -2338,7 +2246,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       // stats (M_final for row_max, L_final for row_sum) and assemble the [free_tile,chunk] result into
       // the full-shape [IM,IN] output. emit_strip replays sub(x,M_final)->exp->div(e,L_final) — row_max
       // and row_sum are substituted, so x is DMA'd once here too. Output threaded as an iter_arg ->
-      // in-place stores (RewriteReturnedAssembleLoopToStore). Sequential in v1.
+      // in-place stores (RewriteReturnedAssembleLoopToStore).
       const std::unordered_map<const Var*, VarPtr> subs = {
           {max_stmt->var_.get(), m_final}, {sum_stmt->var_.get(), l_final}};
       auto asm_at = [&](const ExprPtr& coff) -> ExprPtr {
@@ -2359,7 +2267,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(on)}, sp));
         auto ofin =
             std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
-        // P4-serial (mirror G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT
+        // A5 (mirror G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT
         // reduced-axis chunk (out_it is only the assemble target — the pointwise-strip pattern, lowered
         // to an in-place store by RewriteReturnedAssembleLoopToStore), so a stage=2 loop overlaps chunk
         // s+1's x-slice load with chunk s's apply: the DDR-bound re-read (P4 SECOND pass) hides behind
@@ -2393,7 +2301,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     std::vector<StmtPtr> body;
     // PASS 0 — accumulate the reduction over disjoint reduced-axis chunks (stop at the reduction op).
     // The accumulator is the small reduced [.,1]/[1,.]; chunk 0 inits it, chunks 1.. merge in a
-    // Sequential loop (acc iter_arg, spike-proven), the ragged tail merges after.
+    // carried loop (acc iter_arg, spike-proven), the ragged tail merges after.
     std::unordered_map<const Var*, VarPtr> oc0;
     VarPtr acc = strip_at(rc, MakeIndex(0, sp), body, oc0, red_stmt.get(), nullptr);
     if (num_full >= 2) {
@@ -2447,7 +2355,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
                      : MakeTuple2(foff, coff, sp);   // reduce N: [h, rc] at [m, coff]
       };
       VarPtr out_cur = c_init;
-      {  // Sequential loop over the num_full full chunks; s -> reduced-axis offset s*rc.
+      {  // Full-chunk loop; s -> reduced-axis offset s*rc.
         auto s = std::make_shared<Var>(base + "_ps", index_type, sp);
         auto out_it = std::make_shared<IterArg>(base + "_oit", c_init->GetType(), ExprPtr(c_init), sp);
         ExprPtr coff = MakeMul(s, MakeIndex(rc, sp), sp);
@@ -3162,7 +3070,9 @@ std::vector<StmtPtr> ReorderBodyByGroup(const std::vector<StmtPtr>& body,
 StmtPtr EmitFusedScopes(const StmtPtr& body,
                         const std::unordered_map<const Stmt*, size_t>& stmt_group,
                         const std::unordered_map<const Stmt*, SolverTile>& stmt_tile,
-                        const std::unordered_map<const Stmt*, size_t>& stmt_exec) {
+                        const std::unordered_map<const Stmt*, size_t>& stmt_exec,
+                        const std::unordered_map<size_t, size_t>& group_p4_match,
+                        const std::vector<P4Match>& p4_matches) {
   std::vector<StmtPtr> body_stmts;
   if (auto seq = As<SeqStmts>(body)) {
     body_stmts = seq->stmts_;
@@ -3251,7 +3161,11 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
       // only what its implemented rules cover (increment 1: elementwise) and returns
       // nullopt otherwise, so we fall through to the legacy tiler. Flag off => never called.
       if (GenericEmitEnabled()) {
-        if (auto generic = EmitFusedGroupGeneric(run, tit->second, nm)) {
+        const P4Match* p4_match = nullptr;
+        auto pit = group_p4_match.find(static_cast<size_t>(run_group));
+        if (pit != group_p4_match.end() && pit->second < p4_matches.size())
+          p4_match = &p4_matches[pit->second];
+        if (auto generic = EmitFusedGroupGeneric(run, tit->second, nm, p4_match)) {
           for (auto& s : *generic) {
             top.push_back(std::move(s));
           }
@@ -3744,6 +3658,10 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     std::unordered_map<const Stmt*, size_t> stmt_group;
     std::unordered_map<const Stmt*, SolverTile> stmt_tile;  // group's [w,h,k] tile, for matmul tiling
     std::unordered_map<const Stmt*, size_t> stmt_exec;      // solver's per-group pebbling order
+    std::unordered_map<size_t, size_t> group_p4_match;      // solver group -> shared semantic descriptor
+    std::map<FlatSet<size_t>, size_t> p4_match_by_ops;
+    for (size_t i = 0; i < builder.problem.p4_patterns.size(); ++i)
+      p4_match_by_ops.emplace(builder.problem.p4_patterns[i].ops, i);
     for (size_t s = 0; s < sol.num_steps(); ++s) {
       const ::TileConfig& cfg = sol.step(s).config;
       SolverTile tile{cfg.w, cfg.h, cfg.k, sol.step_cost(s).parallel_split, cfg.parts_m, cfg.parts_n};
@@ -3777,6 +3695,13 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
         stmt_group[stmt] = s;
         stmt_tile[stmt] = tile;
       }
+      const FlatSet<size_t> group_ops(sol.step(s).subgraph.ops().begin(), sol.step(s).subgraph.ops().end());
+      auto p4_it = p4_match_by_ops.find(group_ops);
+      if (p4_it != p4_match_by_ops.end()) {
+        INTERNAL_CHECK(p4_it->second < builder.p4_matches.size())
+            << "Internal error: P4 solver pattern has no matching IR descriptor";
+        group_p4_match.emplace(s, p4_it->second);
+      }
       // The solver's execution_order() is the depth-first pebbling order it costed the
       // working-set peak along — the order the emit MUST replay to stay within UB.
       const std::vector<size_t>& exec = sol.step(s).subgraph.execution_order();
@@ -3785,7 +3710,8 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       }
     }
     auto new_func = MutableCopy(wfunc);
-    new_func->body_ = EmitFusedScopes(wfunc->body_, stmt_group, stmt_tile, stmt_exec);
+    new_func->body_ =
+        EmitFusedScopes(wfunc->body_, stmt_group, stmt_tile, stmt_exec, group_p4_match, builder.p4_matches);
     // Wire the return-based fused function to a named Out param so orchestration
     // codegen emits an add_output write-back (device / ST harness bind output by
     // param position, not by return value). No-op for functions that already
