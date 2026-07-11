@@ -535,7 +535,9 @@ class TestAutoFuse:
         d = torch.randn(512, 256, dtype=torch.float32) * 0.03
         out = namespace["ch"](a, b, d)
         ref = (a @ b) @ d
-        assert torch.allclose(out, ref, rtol=1e-3, atol=1e-3), f"max abs diff {(out - ref).abs().max().item():.3e}"
+        assert torch.allclose(out, ref, rtol=1e-3, atol=1e-3), (
+            f"max abs diff {(out - ref).abs().max().item():.3e}"
+        )
 
     def test_chained_pointwise_fuses_into_one_tiled_kernel(self, ascend_backend):
         """Two chained pointwise ops the solver groups fuse into one tiled vector
@@ -560,7 +562,8 @@ class TestAutoFuse:
         # One fused flat 48-block SPMD loop -> 48 cross-core task submissions of one kernel.
         assert "pl.spmd(48" in body and body.count("pl.spmd(") == 1
         assert "pl.tensor.adds(" in body and "pl.tensor.muls(" in body  # both ops in the per-block body
-        assert body.count("pl.tensor.assemble(") == 1  # only the output is assembled; the intermediate stays on-chip
+        # Only the output is assembled; the intermediate stays on-chip.
+        assert body.count("pl.tensor.assemble(") == 1
 
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
@@ -664,7 +667,11 @@ class TestAutoFuse:
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def pw(self, a: pl.Tensor[[64, 4096], pl.FP32], b: pl.Tensor[[64, 4096], pl.FP32]) -> pl.Tensor[[64, 4096], pl.FP32]:
+            def pw(
+                self,
+                a: pl.Tensor[[64, 4096], pl.FP32],
+                b: pl.Tensor[[64, 4096], pl.FP32],
+            ) -> pl.Tensor[[64, 4096], pl.FP32]:
                 c: pl.Tensor[[64, 4096], pl.FP32] = pl.add(a, b)
                 d: pl.Tensor[[64, 4096], pl.FP32] = pl.mul(c, b)  # b reused -> live across both ops
                 return d
@@ -701,7 +708,11 @@ class TestAutoFuse:
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def mm(self, a: pl.Tensor[[512, 512], pl.FP32], b: pl.Tensor[[512, 512], pl.FP32]) -> pl.Tensor[[512, 512], pl.FP32]:
+            def mm(
+                self,
+                a: pl.Tensor[[512, 512], pl.FP32],
+                b: pl.Tensor[[512, 512], pl.FP32],
+            ) -> pl.Tensor[[512, 512], pl.FP32]:
                 c: pl.Tensor[[512, 512], pl.FP32] = pl.matmul(a, b)
                 return c
 
@@ -919,7 +930,8 @@ class TestAutoFuse:
         The emit maintains the coupled running `(m, l)` stats with the exact `exp(m_old - m_new)`
         rescale in a single streamed pass 0 (one x-slice DMA per chunk → the reduction result IS
         the finalized max/sum), then a pass-1 apply re-streams the reduced axis substituting the
-        finalized `(M, L)`: `exp(x - M)/L`. Both passes are Sequential in v1 (pipelining deferred).
+        finalized `(M, L)`: `exp(x - M)/L`. Both streamed passes are stage-2 pipelined when their
+        rolled loops have at least two iterations.
         The solver ranks the fused plan cheaper than the cut (~34% here), so it fires with no force.
         (NOTE: the DAG must be FULLY NAMED — a nested-argument call like `exp(row_expand_sub(x,m))`
         drops the inner op from the solver graph and misses P4; see KNOWN_ISSUES.)
@@ -947,6 +959,7 @@ class TestAutoFuse:
         assert body.count("pl.spmd(") == 1, body
         assert "_m_it" in body and "_l_it" in body  # the coupled running-stats loop carries
         assert "pl.tensor.maximum(" in body  # the online running-max merge
+        assert body.count("pl.pipeline(") == 2, body  # online stats + apply, both stage-2 pipelined
 
         # Lowers through the full pipeline (streamed, fits UB).
         PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
@@ -966,13 +979,14 @@ class TestAutoFuse:
         """P4 increment 2: a DUAL-SUM layernorm over a UB-overflowing reduced axis FUSES into ONE
         streamed online kernel (behind PYPTO_AUTOFUSE_P4), instead of the G1 cut into row_sum pieces.
 
-        classify_p4 DETECTS the dual-sum shape (TWO INDEPENDENT reductions Sx=row_sum(x) and
-        Sxsq=row_sum(x^2), both derived directly from x, NOT the chained row_sum((x-mu)^2)). But
+        The shared P4 analysis proves the exact dual-sum layernorm shape: Sx=row_sum(x) and
+        Sxsq=row_sum(x^2), both derived directly from x, NOT the chained row_sum((x-mu)^2). But
         var = E[x^2] - E[x]^2 computed from those raw sums CATASTROPHICALLY CANCELS for a large input
         mean (NaN at mean >~2000). So the EMIT streams a numerically-STABLE Welford instead: pass 0
         carries a running (mean, M2, count) merged per chunk by Chan's parallel formula (chunk M2 via
         the stable row_sum((x-mean_a)^2) form), and pass 1 substitutes the FINALIZED stable mean and
-        var = M2/N directly into the cone (bypassing the sx/sxsq -> var path). Both passes Sequential.
+        var = M2/N directly into the cone (bypassing the sx/sxsq -> var path). Both streamed passes
+        are stage-2 pipelined when their rolled loops have at least two iterations.
 
         The DAG must be FULLY NAMED (a nested-argument call drops the inner op from the solver graph
         and misses P4; see KNOWN_ISSUES). Numerics are checked across a wide range of input means
@@ -1015,6 +1029,7 @@ class TestAutoFuse:
         # Welford's parallel merge divides by the running count (n_new) — a tensor.div the dual-sum emit
         # (pure adds) never had. Its presence proves the stable accumulation is what got emitted.
         assert "pl.tensor.div(" in body, body
+        assert body.count("pl.pipeline(") == 2, body  # Welford stats + apply, both stage-2 pipelined
 
         # Lowers through the full pipeline (streamed, fits UB — no AllocateMemoryAddr overflow).
         PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
@@ -1044,7 +1059,7 @@ class TestAutoFuse:
             )
 
         # A CHAINED layernorm — row_sum((x-mu)^2) depends on the finalized mean, so the two sums are
-        # NOT independent — must DECLINE P4 (classify_p4 -> None) and be CUT by the solver, NOT fused
+        # NOT the exact descriptor — must DECLINE P4 and be CUT by the solver, NOT fused
         # into the two-accumulator dual-sum kernel. This is the dual-sum-vs-Welford boundary.
         @pl.program
         class Chained:
@@ -1069,6 +1084,101 @@ class TestAutoFuse:
         assert cbody.count("pl.spmd(") >= 2, cbody
         # And the chained cut still lowers cleanly (no overflow) through the full pipeline.
         PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Chained)
+
+    def test_p4_exact_matcher_rejects_near_miss_algorithms(self, ascend_backend, monkeypatch):
+        """P4 feasibility and emission consume one exact semantic descriptor.
+
+        A temperature-scaled softmax and an independent two-sum graph with a weighted second moment
+        are not the algorithms implemented by the online softmax/Welford emit. They must be cut into
+        ordinary P1/P2 groups, lower cleanly, and preserve their original mathematics.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+        n = 8192
+        eps = 1e-5
+
+        @pl.program
+        class TemperatureSoftmax:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[128, n], pl.FP32]) -> pl.Tensor[[128, n], pl.FP32]:
+                m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
+                shifted: pl.Tensor[[128, n], pl.FP32] = pl.row_expand_sub(x, m)
+                scaled: pl.Tensor[[128, n], pl.FP32] = pl.mul(shifted, 0.5)
+                e: pl.Tensor[[128, n], pl.FP32] = pl.exp(scaled)
+                s: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(e)
+                out: pl.Tensor[[128, n], pl.FP32] = pl.row_expand_div(e, s)
+                return out
+
+        scaled = passes.auto_fuse()(TemperatureSoftmax)
+        scaled_body = next(f for _, f in scaled.functions.items() if f.name == "sm").as_python()
+        assert "_m_it" not in scaled_body and "_l_it" not in scaled_body, scaled_body
+        assert scaled_body.count("pl.spmd(") >= 2, scaled_body
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(TemperatureSoftmax)
+
+        @pl.program
+        class BranchedSoftmax:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[128, n], pl.FP32]) -> pl.Tensor[[128, n], pl.FP32]:
+                m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
+                shifted: pl.Tensor[[128, n], pl.FP32] = pl.row_expand_sub(x, m)
+                e: pl.Tensor[[128, n], pl.FP32] = pl.exp(shifted)
+                s: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(e)
+                softmax: pl.Tensor[[128, n], pl.FP32] = pl.row_expand_div(e, s)
+                out: pl.Tensor[[128, n], pl.FP32] = pl.add(softmax, m)  # m escapes the P4 cone
+                return out
+
+        branched = passes.auto_fuse()(BranchedSoftmax)
+        branched_body = next(f for _, f in branched.functions.items() if f.name == "sm").as_python()
+        assert "_m_it" not in branched_body and "_l_it" not in branched_body, branched_body
+        assert branched_body.count("pl.spmd(") >= 2, branched_body
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(BranchedSoftmax)
+
+        @pl.program
+        class WeightedSecondMoment:
+            @pl.function(attrs={"auto_fuse": True})
+            def norm(self, x: pl.Tensor[[128, n], pl.FP32]) -> pl.Tensor[[128, n], pl.FP32]:
+                sx: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(x)
+                xsq: pl.Tensor[[128, n], pl.FP32] = pl.mul(x, x)
+                weighted_xsq: pl.Tensor[[128, n], pl.FP32] = pl.mul(xsq, 2.0)
+                s2: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(weighted_xsq)
+                mean: pl.Tensor[[128, 1], pl.FP32] = pl.mul(sx, 1.0 / n)
+                second: pl.Tensor[[128, 1], pl.FP32] = pl.mul(s2, 1.0 / n)
+                veps: pl.Tensor[[128, 1], pl.FP32] = pl.add(second, eps)
+                inv: pl.Tensor[[128, 1], pl.FP32] = pl.rsqrt(veps)
+                centered: pl.Tensor[[128, n], pl.FP32] = pl.row_expand_sub(x, mean)
+                out: pl.Tensor[[128, n], pl.FP32] = pl.row_expand_mul(centered, inv)
+                return out
+
+        weighted = passes.auto_fuse()(WeightedSecondMoment)
+        weighted_body = next(f for _, f in weighted.functions.items() if f.name == "norm").as_python()
+        assert "_wmean_it" not in weighted_body and "_wM2_it" not in weighted_body, weighted_body
+        assert weighted_body.count("pl.spmd(") >= 2, weighted_body
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(WeightedSecondMoment)
+
+        def _numeric(program, entry, x, ref):
+            namespace: dict = {}
+            exec(torch_codegen(program, run_all_spmd_blocks=True), namespace)  # noqa: S102
+            got = namespace[entry](x)
+            assert torch.allclose(got, ref, rtol=1e-4, atol=1e-4), (
+                f"{entry} changed semantics: max abs diff {(got - ref).abs().max().item():.3e}"
+            )
+
+        torch.manual_seed(0)
+        x = torch.randn(128, n, dtype=torch.float32)
+        _numeric(scaled, "sm", x, torch.softmax(0.5 * x, dim=1))
+        _numeric(
+            branched,
+            "sm",
+            x,
+            torch.softmax(x, dim=1) + x.max(dim=1, keepdim=True).values,
+        )
+        weighted_ref = (x - x.mean(dim=1, keepdim=True)) * torch.rsqrt(
+            2.0 * (x * x).mean(dim=1, keepdim=True) + eps
+        )
+        _numeric(weighted, "norm", x, weighted_ref)
 
     def test_inline_return_multi_reduction_lowers_and_is_correct(self, ascend_backend, monkeypatch):
         """A multi-reduction group (softmax = row_max + row_sum; layernorm = two row_sums) written
@@ -1239,19 +1349,32 @@ class TestAutoFuse:
         @pl.program
         class BiasAdd:  # M-broadcast [1,N]
             @pl.function(attrs={"auto_fuse": True})
-            def ba(self, x: pl.Tensor[[m_, n_], pl.FP32], b: pl.Tensor[[1, n_], pl.FP32]) -> pl.Tensor[[m_, n_], pl.FP32]:
+            def ba(
+                self,
+                x: pl.Tensor[[m_, n_], pl.FP32],
+                b: pl.Tensor[[1, n_], pl.FP32],
+            ) -> pl.Tensor[[m_, n_], pl.FP32]:
                 return pl.add(x, b)
 
         @pl.program
         class RowScale:  # N-broadcast [M,1]
             @pl.function(attrs={"auto_fuse": True})
-            def rs(self, x: pl.Tensor[[m_, n_], pl.FP32], s: pl.Tensor[[m_, 1], pl.FP32]) -> pl.Tensor[[m_, n_], pl.FP32]:
+            def rs(
+                self,
+                x: pl.Tensor[[m_, n_], pl.FP32],
+                s: pl.Tensor[[m_, 1], pl.FP32],
+            ) -> pl.Tensor[[m_, n_], pl.FP32]:
                 return pl.mul(x, s)
 
         @pl.program
         class Chain:  # both broadcasts fused + a unary
             @pl.function(attrs={"auto_fuse": True})
-            def ch(self, x: pl.Tensor[[m_, n_], pl.FP32], b: pl.Tensor[[1, n_], pl.FP32], s: pl.Tensor[[m_, 1], pl.FP32]) -> pl.Tensor[[m_, n_], pl.FP32]:
+            def ch(
+                self,
+                x: pl.Tensor[[m_, n_], pl.FP32],
+                b: pl.Tensor[[1, n_], pl.FP32],
+                s: pl.Tensor[[m_, 1], pl.FP32],
+            ) -> pl.Tensor[[m_, n_], pl.FP32]:
                 t: pl.Tensor[[m_, n_], pl.FP32] = pl.add(x, b)
                 u: pl.Tensor[[m_, n_], pl.FP32] = pl.mul(t, s)
                 return pl.exp(u)
@@ -1259,7 +1382,11 @@ class TestAutoFuse:
         @pl.program
         class P2Bcast:  # reduction group taking an external [M,1] stat (a G1/G3 softmax cut piece)
             @pl.function(attrs={"auto_fuse": True})
-            def sm2(self, x: pl.Tensor[[m_, n_], pl.FP32], mstat: pl.Tensor[[m_, 1], pl.FP32]) -> pl.Tensor[[m_, n_], pl.FP32]:
+            def sm2(
+                self,
+                x: pl.Tensor[[m_, n_], pl.FP32],
+                mstat: pl.Tensor[[m_, 1], pl.FP32],
+            ) -> pl.Tensor[[m_, n_], pl.FP32]:
                 s: pl.Tensor[[m_, n_], pl.FP32] = pl.sub(x, mstat)
                 e: pl.Tensor[[m_, n_], pl.FP32] = pl.exp(s)
                 d: pl.Tensor[[m_, 1], pl.FP32] = pl.row_sum(e)
