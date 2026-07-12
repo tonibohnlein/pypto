@@ -159,9 +159,9 @@ its back-propagated operand tile shapes.
 | A2 | ephemeral intermediates cost **0 DDR** (fusion win) | keep intermediates **on-chip** (UB scratch), never round-trip them through DDR | ✅ honored |
 | A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to `[h,w]`; read `FIXED_1` operands in full (broadcast / reduced-axis) — `emit_strip` | ✅ honored (G4 done, 2026-07-09). `emit_strip` slices any 2D operand per-axis: a full axis follows the tile `[sh/sw]` at `[smi/sni]`, a size-1 (broadcast/`FIXED_1`) axis stays `[1]` at offset 0; the op replay re-infers the broadcast. Covers `[1,N]` bias-add, `[M,1]` scale / reduced-axis stat, `[1,1]`. Other 2D shapes still decline. |
 | A4 | UB feasibility = peak live bands over the **pebbling order** | replay ops in `dfs_order_`; let MemoryReuse alloc/free UB per the emitted liveness | ✅ honored (order matched) |
-| A5 | roofline `max(compute, DDR)` (load k+1 overlaps compute k) | emit the per-core loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) | ⚠️ Pointwise and all P1/P2/P4 full-chunk stats/apply loops use stage 2 when their rolled trip count is at least 2; loop-carried stats stay persistent while input chunks ping-pong. Remaining edge: the model grants `max` from tile bytes alone and does not yet encode that trip-count guard, so short loops must be priced as `compute + DDR`. |
+| A5 | roofline `max(compute, DDR)` (load k+1 overlaps compute k) | emit the per-core loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) | ⚠️ P1/P2/P4 consume the solver-owned chunk/loop plan; the model withholds overlap unless every streamed data-moving phase is stage-2. Remaining: split the global roofline into a sum of per-phase rooflines, and make materialized/pointwise strip scheduling solver-owned. |
 | A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a bare **sum col-reduction** sink `:1630`; else fall back to serial | ⚠️ partial — model must NOT price `S` where the emit declines it (see C2) |
-| A7 | a streamed reduction reads each input band **`stream_passes`** times (§5.1): **1** if every output folds into a reduction, **2** if any output spans the reduced axis | stream with running stats; **1 pass** when output-folded, **2 passes** (flash-stats + apply) when an output spans R; fold multi-stat reductions **online** (never naive multipass) | ✅ G3 prices `io_in×2` for spanning outputs; exact P4 softmax/Welford emit two passes. Remaining refinement: derive multiplicity per boundary input rather than doubling apply-only operands. |
+| A7 | a streamed reduction reads each input band **`stream_passes`** times (§5.1): **1** if every output folds into a reduction, **2** if any output spans the reduced axis | stream with running stats; **1 pass** for a bare reduction or thin folded finalize, **2 passes** (flash-stats + apply) when an output spans R; fold multi-stat reductions **online** (never naive multipass) | ✅ G3 prices `io_in×2` for spanning outputs; exact P4 softmax/Welford emit two passes. Remaining refinement: derive multiplicity per boundary input rather than doubling apply-only operands. |
 
 ---
 
@@ -316,20 +316,23 @@ multi-sink escapes cut rather than being reinterpreted.
 
 ### Roofline
 
-**G2 — A5 — streamed loops pipelined — FIXED (P1/P2 2026-07-10; P4 stats 2026-07-11).** Both streamed passes emit
+**G2 — A5 — streamed loops pipelined — FIXED (emit 2026-07-11; plan/cost 2026-07-12).** Both streamed passes emit
 `ForKind::Pipeline` + stages=2 (mirroring the pointwise strip): the accumulate pass 0 (the
 running accumulator or P4 `(m,l)` / Welford `(mean,M2,count)` IterArgs) and the apply pass 1
 (assembles disjoint reduced-axis chunks, lowered to in-place stores by
 `RewriteReturnedAssembleLoopToStore`). `LowerPipelineLoops` double-buffers only the per-chunk load
 while keeping loop-carried state single-buffered/persistent. Pipelined only when the rolled chunk trip
-is at least 2 (nothing to overlap otherwise). The remaining A5 edge is cost-side: `db` checks only
-`tile_bytes >= 2*vec_reg_bytes`, not the emitted phase's rolled trip count.
+is at least 2 (nothing to overlap otherwise). `VectorStreamPlan` now owns the reduction chunk and
+trip counts, the emitter consumes it, and `compute_cost` grants overlap only when every streamed
+data-moving phase is stage-2. Remaining A5 work is per-phase roofline summing plus the
+materialized/pointwise strip plan.
 
 ### ⚠️ Cost fidelity
 
-**G3 — A7 — `io_in` not scaled by `stream_passes`.** The streaming surcharge (`:1767`) adds only
-a thin compute term; io stays ×1. Spanning-output reductions (P2 / softmax / layernorm) read the
-input twice. Fix per §5.2 — but it needs R0 first (the model must detect streaming to price it).
+**G3 — A7 — streamed input multiplicity — FIXED at group level.** `VectorStreamPlan::stream_passes`
+is 1 for a folded output and 2 for a spanning P2/P4 output; `compute_cost` scales boundary-input
+traffic by that value. Remaining refinement: assign multiplicity per boundary input so apply-only
+scale/bias operands are not charged for the stats pass.
 
 **G4 — A3 — broadcast priced-fusible but emit-declined — FIXED (2026-07-09).** The emit now
 builds a broadcast operand (one axis full, the other 1): `emit_strip` slices per-axis (full axis
