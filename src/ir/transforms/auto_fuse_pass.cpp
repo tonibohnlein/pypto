@@ -23,24 +23,28 @@
 // grouping; the IR rewrite (emit InCoreScopeStmt) is the next increment.
 
 #include <algorithm>
+#include <any>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
-#include "pypto/backend/common/backend_handler.h"
-#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/soc.h"
-#include "pypto/core/error.h"
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -52,7 +56,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
-#include "pypto/ir/transforms/pass_properties.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
@@ -61,6 +65,7 @@
 
 // MLSys graph-scheduling solver (3rdparty/mlsys26), linked as `solver_lib`.
 #include "core/dag.h"
+#include "core/flat_set.h"
 #include "core/subgraph.h"
 #include "core/types.h"
 #include "partition/partition.h"
@@ -407,8 +412,9 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
   auto scaled_from = [&](const AssignStmtPtr& stmt, const ExprPtr& input, double scale) -> bool {
     auto call = call_of(stmt);
     if (call == nullptr || call->args_.size() != 2) return false;
-    if (IsOp(call, "tensor.muls"))
+    if (IsOp(call, "tensor.muls")) {
       return same_var(call->args_[0], input) && IsConstValue(call->args_[1], scale);
+    }
     if (!IsOp(call, "tensor.mul")) return false;
     return (same_var(call->args_[0], input) && IsConstValue(call->args_[1], scale)) ||
            (same_var(call->args_[1], input) && IsConstValue(call->args_[0], scale));
@@ -417,48 +423,53 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
   auto match_softmax = [&](const AssignStmtPtr& sink) -> std::optional<P4Match> {
     auto div = call_of(sink);
     if (div == nullptr || div->args_.size() != 2 ||
-        (!IsOp(div, "tensor.row_expand_div") && !IsOp(div, "tensor.div")))
+        (!IsOp(div, "tensor.row_expand_div") && !IsOp(div, "tensor.div"))) {
       return std::nullopt;
+    }
     auto exp_stmt = def_of(div->args_[0]);
     auto sum_stmt = def_of(div->args_[1]);
     auto exp = call_of(exp_stmt);
     auto sum = call_of(sum_stmt);
     if (exp == nullptr || sum == nullptr || exp->args_.size() != 1 || sum->args_.size() != 1 ||
         !IsOp(exp, "tensor.exp") || !IsOp(sum, "tensor.row_sum") ||
-        !same_var(sum->args_[0], ExprPtr(exp_stmt->var_)))
+        !same_var(sum->args_[0], ExprPtr(exp_stmt->var_))) {
       return std::nullopt;
+    }
     auto sub_stmt = def_of(exp->args_[0]);
     auto sub = call_of(sub_stmt);
     if (sub == nullptr || sub->args_.size() != 2 ||
-        (!IsOp(sub, "tensor.row_expand_sub") && !IsOp(sub, "tensor.sub")))
+        (!IsOp(sub, "tensor.row_expand_sub") && !IsOp(sub, "tensor.sub"))) {
       return std::nullopt;
+    }
     auto max_stmt = def_of(sub->args_[1]);
     auto max = call_of(max_stmt);
     if (max == nullptr || max->args_.size() != 1 || !IsOp(max, "tensor.row_max") ||
-        !same_var(sub->args_[0], max->args_[0]) || def_of(max->args_[0]) != nullptr)
+        !same_var(sub->args_[0], max->args_[0]) || def_of(max->args_[0]) != nullptr) {
       return std::nullopt;  // increment 1: max reduces a direct external x
+    }
     const auto [xM, xN] = Static2DShape(max->args_[0]->GetType());
     const auto [oM, oN] = Static2DShape(sink->var_->GetType());
     const auto [mM, mN] = Static2DShape(max_stmt->var_->GetType());
     const auto [sM, sN] = Static2DShape(sum_stmt->var_->GetType());
-    if (xM <= 0 || xN <= 1 || oM != xM || oN != xN || mM != xM || mN != 1 || sM != xM || sN != 1)
+    if (xM <= 0 || xN <= 1 || oM != xM || oN != xN || mM != xM || mN != 1 || sM != xM || sN != 1) {
       return std::nullopt;
-    return P4Match{::P4PatternKind::SoftmaxFlash,
-                   {max_stmt, sub_stmt, exp_stmt, sum_stmt, sink},
-                   sink,
-                   max_stmt,
-                   sum_stmt,
-                   {},
-                   max->args_[0],
-                   nullptr,
-                   nullptr};
+    }
+    P4Match match;
+    match.kind = ::P4PatternKind::SoftmaxFlash;
+    match.ops = {max_stmt, sub_stmt, exp_stmt, sum_stmt, sink};
+    match.sink = sink;
+    match.max_stmt = max_stmt;
+    match.sum_stmt = sum_stmt;
+    match.x_input = max->args_[0];
+    return match;
   };
 
   auto match_layernorm = [&](const AssignStmtPtr& sink) -> std::optional<P4Match> {
     auto mul_out = call_of(sink);
     if (mul_out == nullptr || mul_out->args_.size() != 2 ||
-        (!IsOp(mul_out, "tensor.row_expand_mul") && !IsOp(mul_out, "tensor.mul")))
+        (!IsOp(mul_out, "tensor.row_expand_mul") && !IsOp(mul_out, "tensor.mul"))) {
       return std::nullopt;
+    }
 
     ExprPtr centered_expr = mul_out->args_[0];
     ExprPtr inv_expr = mul_out->args_[1];
@@ -476,11 +487,14 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
     }
     if (centered == nullptr || centered->args_.size() != 2 ||
         (!IsOp(centered, "tensor.row_expand_sub") && !IsOp(centered, "tensor.sub")) || inv == nullptr ||
-        inv->args_.size() != 1 || !IsOp(inv, "tensor.rsqrt"))
+        inv->args_.size() != 1 || !IsOp(inv, "tensor.rsqrt")) {
       return std::nullopt;
+    }
 
     auto mean_stmt = def_of(centered->args_[1]);
-    if (mean_stmt == nullptr) return std::nullopt;
+    if (mean_stmt == nullptr) {
+      return std::nullopt;
+    }
     ExprPtr var_expr = inv->args_[0];
     AssignStmtPtr eps_stmt;
     if (auto maybe_eps = def_of(var_expr)) {
@@ -497,20 +511,24 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
     }
     auto var_stmt = def_of(var_expr);
     auto var = call_of(var_stmt);
-    if (var == nullptr || var->args_.size() != 2 || !IsOp(var, "tensor.sub")) return std::nullopt;
+    if (var == nullptr || var->args_.size() != 2 || !IsOp(var, "tensor.sub")) {
+      return std::nullopt;
+    }
     auto msq_stmt = def_of(var->args_[0]);
     auto mean_sq_stmt = def_of(var->args_[1]);
     auto mean_sq = call_of(mean_sq_stmt);
     if (mean_sq == nullptr || mean_sq->args_.size() != 2 || !IsOp(mean_sq, "tensor.mul") ||
         !same_var(mean_sq->args_[0], ExprPtr(mean_stmt->var_)) ||
-        !same_var(mean_sq->args_[1], ExprPtr(mean_stmt->var_)))
+        !same_var(mean_sq->args_[1], ExprPtr(mean_stmt->var_))) {
       return std::nullopt;
+    }
 
     const ExprPtr x = centered->args_[0];
     const auto [xM, xN] = Static2DShape(x->GetType());
     const auto [oM, oN] = Static2DShape(sink->var_->GetType());
-    if (xM <= 0 || xN <= 1 || oM != xM || oN != xN || def_of(x) != nullptr)
+    if (xM <= 0 || xN <= 1 || oM != xM || oN != xN || def_of(x) != nullptr) {
       return std::nullopt;  // increment 2: both sums reduce the direct external x
+    }
     const double inv_n = 1.0 / static_cast<double>(xN);
 
     auto sx_stmt = def_of(call_of(mean_stmt) != nullptr && !call_of(mean_stmt)->args_.empty()
@@ -520,35 +538,40 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
         def_of(call_of(msq_stmt) != nullptr && !call_of(msq_stmt)->args_.empty() ? call_of(msq_stmt)->args_[0]
                                                                                  : nullptr);
     if (!scaled_from(mean_stmt, sx_stmt != nullptr ? ExprPtr(sx_stmt->var_) : nullptr, inv_n) ||
-        !scaled_from(msq_stmt, sxx_stmt != nullptr ? ExprPtr(sxx_stmt->var_) : nullptr, inv_n))
+        !scaled_from(msq_stmt, sxx_stmt != nullptr ? ExprPtr(sxx_stmt->var_) : nullptr, inv_n)) {
       return std::nullopt;
+    }
     auto sx = call_of(sx_stmt);
     auto sxx = call_of(sxx_stmt);
     if (sx == nullptr || sxx == nullptr || sx->args_.size() != 1 || sxx->args_.size() != 1 ||
-        !IsOp(sx, "tensor.row_sum") || !IsOp(sxx, "tensor.row_sum") || !same_var(sx->args_[0], x))
+        !IsOp(sx, "tensor.row_sum") || !IsOp(sxx, "tensor.row_sum") || !same_var(sx->args_[0], x)) {
       return std::nullopt;
+    }
     auto square_stmt = def_of(sxx->args_[0]);
     auto square = call_of(square_stmt);
     if (square == nullptr || square->args_.size() != 2 || !IsOp(square, "tensor.mul") ||
-        !same_var(square->args_[0], x) || !same_var(square->args_[1], x))
+        !same_var(square->args_[0], x) || !same_var(square->args_[1], x)) {
       return std::nullopt;
+    }
     const auto [meanM, meanN] = Static2DShape(mean_stmt->var_->GetType());
     const auto [varM, varN] = Static2DShape(var_stmt->var_->GetType());
-    if (meanM != xM || meanN != 1 || varM != xM || varN != 1) return std::nullopt;
+    if (meanM != xM || meanN != 1 || varM != xM || varN != 1) {
+      return std::nullopt;
+    }
 
     std::vector<AssignStmtPtr> matched = {sx_stmt,  square_stmt,  sxx_stmt, mean_stmt,
                                           msq_stmt, mean_sq_stmt, var_stmt};
     if (eps_stmt != nullptr) matched.push_back(eps_stmt);
     matched.insert(matched.end(), {inv_stmt, centered_stmt, sink});
-    return P4Match{::P4PatternKind::LayerNormWelford,
-                   std::move(matched),
-                   sink,
-                   nullptr,
-                   nullptr,
-                   {sx_stmt, sxx_stmt},
-                   x,
-                   mean_stmt->var_,
-                   var_stmt->var_};
+    P4Match match;
+    match.kind = ::P4PatternKind::LayerNormWelford;
+    match.ops = std::move(matched);
+    match.sink = sink;
+    match.layernorm_sums = {sx_stmt, sxx_stmt};
+    match.x_input = x;
+    match.user_mean = mean_stmt->var_;
+    match.user_var = var_stmt->var_;
+    return match;
   };
 
   // The online kernel has one live-out. If an internal statistic/cone value also feeds an op outside
@@ -560,8 +583,11 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
       if (op == match.sink) continue;
       auto it = consumers.find(op->var_.get());
       if (it == consumers.end()) continue;
-      for (const Stmt* consumer : it->second)
-        if (members.count(consumer) == 0) return false;
+      for (const Stmt* consumer : it->second) {
+        if (members.count(consumer) == 0) {
+          return false;
+        }
+      }
     }
     return true;
   };
@@ -572,8 +598,9 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
       if (has_single_live_out(*softmax)) matches.push_back(std::move(*softmax));
       continue;
     }
-    if (auto layernorm = match_layernorm(sink); layernorm && has_single_live_out(*layernorm))
+    if (auto layernorm = match_layernorm(sink); layernorm && has_single_live_out(*layernorm)) {
       matches.push_back(std::move(*layernorm));
+    }
   }
   return matches;
 }
@@ -731,7 +758,27 @@ class ProblemBuilder {
           matched_ops.insert(it->second);
         }
         if (!complete || matched_ops.size() != match.ops.size()) continue;
-        problem.p4_patterns.push_back(::P4Pattern{match.kind, std::move(matched_ops)});
+        FlatSet<size_t> apply_substitutions;
+        auto add_substitution = [&](const AssignStmtPtr& stmt) {
+          if (stmt == nullptr) return;
+          auto it = op_index.find(stmt.get());
+          if (it != op_index.end()) apply_substitutions.insert(it->second);
+        };
+        if (match.kind == ::P4PatternKind::SoftmaxFlash) {
+          add_substitution(match.max_stmt);
+          add_substitution(match.sum_stmt);
+        } else if (match.kind == ::P4PatternKind::LayerNormWelford) {
+          for (const AssignStmtPtr& stmt : match.ops) {
+            if (stmt->var_.get() == match.user_mean.get() || stmt->var_.get() == match.user_var.get()) {
+              add_substitution(stmt);
+            }
+          }
+        }
+        ::P4Pattern pattern;
+        pattern.kind = match.kind;
+        pattern.ops = std::move(matched_ops);
+        pattern.apply_substitutions = std::move(apply_substitutions);
+        problem.p4_patterns.push_back(std::move(pattern));
         p4_matches.push_back(std::move(match));
       }
     }
@@ -756,8 +803,12 @@ class ProblemBuilder {
     // function declined rather than CHECK-crashing. A placeholder tensor still gets registered
     // so tensor indices stay consistent for the remainder of the (now-discarded) build.
     if (tt == nullptr || !ShapeWH(tt, &w, &h)) declined_ = true;
+    DataType dtype = DataType::FP32;
+    if (tt != nullptr) {
+      dtype = tt->dtype_;
+    }
     const size_t idx = problem.tensors.size();
-    problem.tensors.push_back(::Tensor{w, h, MapSolverDType(tt != nullptr ? tt->dtype_ : DataType::FP32)});
+    problem.tensors.push_back(::Tensor{w, h, MapSolverDType(dtype)});
     tensor_index_[raw] = idx;
     return idx;
   }
@@ -1539,7 +1590,11 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // A7 (single sink): the group output is the single run-var not consumed within the run
   // (a fused group keeps its intermediates on-chip). >1 live-out = multi-output -> S5.
   std::unordered_set<const Var*> defined;
-  for (const auto& a : ops) defined.insert(a->var_.get());
+  std::unordered_map<const Var*, AssignStmtPtr> def_by_var;
+  for (const auto& a : ops) {
+    defined.insert(a->var_.get());
+    def_by_var.emplace(a->var_.get(), a);
+  }
   std::unordered_set<const Var*> used_within;
   for (const auto& a : ops)
     for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
@@ -1717,12 +1772,6 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
                            out_stmt->span_);
   }
 
-  // A single spatial tile is left to the legacy tiler — UNLESS the solver split the reduced axis
-  // (tile.split>1) or the reduced axis must be STREAMED (P1/P2/P4): both still need to run below (the
-  // split fills cores; streaming is what makes a too-large reduced axis fit UB at all).
-  if (num_m == 1 && num_n == 1 && tile.split <= 1 && !stream_p1 && !stream_p2 && !stream_p4)
-    return std::nullopt;
-
   // A4 (reduction rule): the reduced axis must be PINNED FULL in the tile, else a
   // per-tile reduction would cover only part of the axis (partial reduction = wrong
   // result). Derive each reduction's reduced axis from its input->output collapse and
@@ -1845,6 +1894,32 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
                         const Stmt* stop_at = nullptr,
                         const std::unordered_map<const Var*, VarPtr>* subs = nullptr) -> VarPtr {
     const Stmt* sink_op = stop_at != nullptr ? stop_at : out_stmt.get();
+    // Emit exactly the dependency cone of this phase.  A substituted statistic
+    // is a leaf: bind its supplied tile, but do not replay its producer cone.
+    // Multi-sink replay deliberately keeps all ops because every sink is read
+    // from `onchip` by its caller.
+    std::unordered_set<const Stmt*> needed;
+    const bool prune_to_sink = sinks.size() == 1 || stop_at != nullptr || subs != nullptr;
+    if (prune_to_sink) {
+      std::vector<AssignStmtPtr> stack;
+      for (const auto& candidate : ops)
+        if (candidate.get() == sink_op) {
+          stack.push_back(candidate);
+          break;
+        }
+      while (!stack.empty()) {
+        AssignStmtPtr current = stack.back();
+        stack.pop_back();
+        if (!needed.insert(current.get()).second) continue;
+        if (subs != nullptr && subs->count(current->var_.get()) != 0) continue;
+        for (const ExprPtr& arg : As<Call>(current->value_)->args_) {
+          auto var = AsVarLike(arg);
+          if (var == nullptr) continue;
+          auto producer = def_by_var.find(var.get());
+          if (producer != def_by_var.end()) stack.push_back(producer->second);
+        }
+      }
+    }
     // The 32B DMA granule is on the CONTIGUOUS axis only; the other (free) axis has
     // granule 1 (see ascend910b_cost.cpp: "free row axis tiles at 1 element, the
     // contiguous width axis at the 32-byte DMA block"). So pad the row axis ONLY when
@@ -1860,6 +1935,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [sh,w] slice
     VarPtr tv;
     for (const auto& a : ops) {
+      if (prune_to_sink && needed.count(a.get()) == 0) continue;
       if (subs != nullptr) {  // finalized accumulator from an earlier pass -> substitute, don't replay
         auto sit = subs->find(a->var_.get());
         if (sit != subs->end()) {
@@ -1925,7 +2001,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // is padded to the DMA granule; a non-aligned free tile leaves a PARTIAL valid_shape (h=3 -> alloc
     // 8, valid 3), which ResolveBackendOpLayouts' reshape of the [h,1] col-vector does not round-trip.
     // Aligning the free tile makes the accumulator full-valid (coarser spatial grid, still correct).
-    int64_t free_tile = std::min(AlignUp(pin_m ? w : h, g), free_ext);
+    const int64_t expected_free_tile = std::min(AlignUp(pin_m ? w : h, g), free_ext);
+    const int64_t free_tile = solver_stream.free_tile;
     // The single reduction op (nreds==1): P1 -> every live-out stays folded; P2 -> a non-sink
     // reduction consumed by a spanning pointwise sink. Its family fixes the merge op
     // (sum->add, max->maximum).
@@ -1956,35 +2033,39 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
                                : ::VectorStreamKind::ReductionFolded);
     const int emitted_axis = pin_m ? 2 : 1;
     const int64_t stats_trips = std::max<int64_t>(0, num_full - 1);
-    const int stats_stages = stats_trips >= 2 ? 2 : 1;
-    const int apply_stages = num_full >= 2 ? 2 : 1;
     const int expected_passes = (stream_p2 || stream_p4) ? 2 : 1;
+    const bool expected_finalize = stream_p1 || p4_kind == ::P4PatternKind::LayerNormWelford;
     const bool stream_plan_matches =
         solver_stream.feasible && solver_stream.streamed() && solver_stream.kind == emitted_kind &&
         solver_stream.axis == emitted_axis && solver_stream.extent == red_ext &&
-        solver_stream.free_tile == free_tile && solver_stream.chunk == rc &&
+        solver_stream.free_tile == expected_free_tile && solver_stream.chunk == rc &&
         solver_stream.full_chunks == num_full && solver_stream.tail == rem &&
-        solver_stream.stream_passes == expected_passes && solver_stream.stats.first_chunk == 1 &&
-        solver_stream.stats.trip_count == stats_trips &&
-        solver_stream.stats.pipeline_stages == stats_stages &&
+        solver_stream.stats_init.present && solver_stream.stats_init.chunk_index == 0 &&
+        solver_stream.stats_init.extent == rc && solver_stream.stream_passes == expected_passes &&
+        solver_stream.stats.first_chunk == 1 && solver_stream.stats.trip_count == stats_trips &&
+        solver_stream.stats_tail.present == (rem > 0) &&
+        (!solver_stream.stats_tail.present ||
+         (solver_stream.stats_tail.chunk_index == num_full && solver_stream.stats_tail.extent == rem)) &&
+        solver_stream.finalize.present == expected_finalize &&
         (expected_passes == 1 ||
          (solver_stream.apply.first_chunk == 0 && solver_stream.apply.trip_count == num_full &&
-          solver_stream.apply.pipeline_stages == apply_stages));
+          solver_stream.apply_tail.present == (rem > 0) &&
+          (!solver_stream.apply_tail.present ||
+           (solver_stream.apply_tail.chunk_index == num_full && solver_stream.apply_tail.extent == rem))));
     INTERNAL_CHECK_SPAN(stream_plan_matches, sp)
         << "Internal error: emitted vector loop does not match solver plan for group '" << name << "'";
     LOG_INFO << "AutoFuse[generic]: vector-plan MATCH group='" << name
              << "' solver={kind=" << VectorStreamKindName(solver_stream.kind)
              << ",axis=" << solver_stream.axis << ",extent=" << solver_stream.extent
              << ",free=" << solver_stream.free_tile << ",chunk=" << solver_stream.chunk << "x"
-             << solver_stream.full_chunks
-             << (solver_stream.tail ? "+tail" : "") << ",stats=" << solver_stream.stats.trip_count << "/s"
-             << solver_stream.stats.pipeline_stages << ",apply=" << solver_stream.apply.trip_count << "/s"
-             << solver_stream.apply.pipeline_stages << "} emit={kind=" << VectorStreamKindName(emitted_kind)
-             << ",axis=" << emitted_axis << ",extent=" << red_ext << ",free=" << free_tile
-             << ",chunk=" << rc << "x" << num_full
-             << (rem ? "+tail" : "") << ",stats=" << stats_trips << "/s" << stats_stages
-             << ",apply=" << (expected_passes == 2 ? num_full : 0) << "/s"
-             << (expected_passes == 2 ? apply_stages : 1) << "}";
+             << solver_stream.full_chunks << (solver_stream.tail ? "+tail" : "")
+             << ",stats=" << solver_stream.stats.trip_count << "/s" << solver_stream.stats.pipeline_stages
+             << ",apply=" << solver_stream.apply.trip_count << "/s" << solver_stream.apply.pipeline_stages
+             << "} emit={kind=" << VectorStreamKindName(emitted_kind) << ",axis=" << emitted_axis
+             << ",extent=" << red_ext << ",free=" << free_tile << ",chunk=" << rc << "x" << num_full
+             << (rem ? "+tail" : "") << ",stats=" << stats_trips << "/s"
+             << solver_stream.stats.pipeline_stages << ",apply=" << (expected_passes == 2 ? num_full : 0)
+             << "/s" << (expected_passes == 2 ? solver_stream.apply.pipeline_stages : 1) << "}";
 
     auto t = std::make_shared<Var>(base + "_t", index_type, sp);
     // Free-axis offset for this core, clamped in-bounds for a ragged free tail. The free axis is
@@ -2004,6 +2085,64 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       // clamped in-bounds, so the wider slice never runs past the tensor.
       return pin_m ? emit_strip(chunk_ext, free_tile, red_off, foff, out, oc, stop, subs)   // chunk M rows, free_tile N
                    : emit_strip(free_tile, chunk_ext, foff, red_off, out, oc, stop, subs);  // free_tile M, chunk N
+    };
+
+    // One construction for every loop-carried P2/P4 phase.  Algorithm-specific
+    // code builds the carried values and YieldStmt; this helper alone translates
+    // the solver's loop descriptor into Sequential vs stage-2 Pipeline IR.
+    auto append_planned_loop = [&](std::vector<StmtPtr>& outer, const VarPtr& index,
+                                   const ::VectorLoopPlan& loop, std::vector<IterArgPtr> iter_args,
+                                   std::vector<StmtPtr> loop_body, std::vector<VarPtr> results) {
+      INTERNAL_CHECK_SPAN(loop.trip_count > 0, sp)
+          << "Internal error: attempted to emit an empty vector phase loop";
+      const bool pipelined = loop.pipeline_stages == 2;
+      std::vector<std::pair<std::string, std::any>> attrs;
+      if (pipelined) {
+        attrs.emplace_back(kPipelineStagesAttr, /*stages=*/2);
+      }
+      outer.push_back(std::make_shared<ForStmt>(
+          index, MakeIndex(loop.first_chunk, sp), MakeIndex(loop.first_chunk + loop.trip_count, sp),
+          MakeIndex(1, sp), std::move(iter_args), SeqStmts::Flatten(std::move(loop_body), sp),
+          std::move(results), sp, pipelined ? ForKind::Pipeline : ForKind::Sequential, std::move(attrs)));
+    };
+
+    // P2, softmax, and Welford have the same barrier-separated apply algorithm:
+    // replay one reduced-axis chunk with finalized statistics substituted, then
+    // assemble it into the output carry.  Only the substitution map differs.
+    auto emit_spanning_apply = [&](std::vector<StmtPtr>& body,
+                                   const std::unordered_map<const Var*, VarPtr>& subs) {
+      auto asm_at = [&](const ExprPtr& offset) -> ExprPtr {
+        return pin_m ? MakeTuple2(offset, foff, sp) : MakeTuple2(foff, offset, sp);
+      };
+      VarPtr out_cur = c_init;
+      if (solver_stream.apply.trip_count > 0) {
+        auto s = std::make_shared<Var>(base + "_ps", index_type, sp);
+        auto out_it = std::make_shared<IterArg>(base + "_oit", c_init->GetType(), ExprPtr(c_init), sp);
+        ExprPtr offset = MakeMul(s, MakeIndex(rc, sp), sp);
+        std::vector<StmtPtr> loop_body;
+        std::unordered_map<const Var*, VarPtr> onchip_apply;
+        VarPtr chunk_tile = strip_at(rc, offset, loop_body, onchip_apply, nullptr, &subs);
+        auto assemble =
+            reg.Create("tensor.assemble", {ExprPtr(out_it), ExprPtr(chunk_tile), asm_at(offset)}, sp);
+        auto out_next = std::make_shared<Var>(base + "_on", assemble->GetType(), sp);
+        loop_body.push_back(std::make_shared<AssignStmt>(out_next, assemble, sp));
+        loop_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(out_next)}, sp));
+        auto loop_result = std::make_shared<Var>(
+            solver_stream.apply_tail.present ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
+        append_planned_loop(body, s, solver_stream.apply, std::vector<IterArgPtr>{out_it},
+                            std::move(loop_body),
+                            std::vector<VarPtr>{solver_stream.apply_tail.present ? loop_result : c_var});
+        out_cur = solver_stream.apply_tail.present ? loop_result : c_var;
+      }
+      if (solver_stream.apply_tail.present) {
+        std::unordered_map<const Var*, VarPtr> onchip_tail;
+        ExprPtr offset = MakeIndex(solver_stream.apply_tail.chunk_index * rc, sp);
+        VarPtr chunk_tile =
+            strip_at(solver_stream.apply_tail.extent, offset, body, onchip_tail, nullptr, &subs);
+        auto assemble =
+            reg.Create("tensor.assemble", {ExprPtr(out_cur), ExprPtr(chunk_tile), asm_at(offset)}, sp);
+        body.push_back(std::make_shared<AssignStmt>(c_var, assemble, sp));
+      }
     };
 
     // ===================== P4 — FUSED ONLINE LAYERNORM (Welford) =====================
@@ -2031,8 +2170,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         auto CFloat = [&](double v) { return std::make_shared<ConstFloat>(v, dtype, sp); };
         // welford_chunk: fold one [free_tile, chunk_ext] slice at red_off into (mean_in, M2_in, cnt_in).
         // nullptrs => the init chunk (mean=mean_a, M2=M2_a, cnt=chunk_ext). Returns (mean, M2, cnt).
-        auto welford_chunk = [&](int64_t chunk_ext, const ExprPtr& red_off, VarPtr mean_in, VarPtr M2_in,
-                                 VarPtr cnt_in, std::vector<StmtPtr>& out,
+        auto welford_chunk = [&](int64_t chunk_ext, const ExprPtr& red_off, const VarPtr& mean_in,
+                                 const VarPtr& M2_in, const VarPtr& cnt_in, std::vector<StmtPtr>& out,
                                  int tag) -> std::tuple<VarPtr, VarPtr, VarPtr> {
           const std::string tg = std::to_string(tag);
           VarPtr xs = pin_m ? slice_input(x_input, chunk_ext, free_tile, red_off, foff, out, tag)
@@ -2109,9 +2248,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
 
         // PASS 0 — chunk 0 inits (mean, M2, count); chunks 1..num_full merge while threading
         // {mean_it, M2_it, cnt_it}; the ragged tail merges after. Chunks DISJOINT.
-        auto [mean_cur, M2_cur, cnt_cur] =
-            welford_chunk(rc, MakeIndex(0, sp), nullptr, nullptr, nullptr, body, 0);
-        if (num_full >= 2) {
+        auto [mean_cur, M2_cur, cnt_cur] = welford_chunk(
+            solver_stream.stats_init.extent, MakeIndex(solver_stream.stats_init.chunk_index * rc, sp),
+            nullptr, nullptr, nullptr, body, 0);
+        if (solver_stream.stats.trip_count > 0) {
           auto k = std::make_shared<Var>(base + "_k", index_type, sp);
           auto mean_it = std::make_shared<IterArg>(base + "_wmean_it", mean_cur->GetType(), ExprPtr(mean_cur), sp);
           auto M2_it = std::make_shared<IterArg>(base + "_wM2_it", M2_cur->GetType(), ExprPtr(M2_cur), sp);
@@ -2128,21 +2268,16 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           // double-buffers only the next disjoint input chunk, overlapping its load with the current
           // chunk's Welford reduction/merge. Chunk 0 is emitted before this loop, so the rolled trip
           // count is num_full-1 and needs to be at least two to have anything to overlap.
-          const bool pipe_stats = solver_stream.stats.pipeline_stages == 2;
-          std::vector<std::pair<std::string, std::any>> stats_attrs;
-          if (pipe_stats) stats_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
-          body.push_back(std::make_shared<ForStmt>(
-              k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp),
-              std::vector<IterArgPtr>{mean_it, M2_it, cnt_it}, SeqStmts::Flatten(std::move(lbody), sp),
-              std::vector<VarPtr>{mean_out, M2_out, cnt_out}, sp,
-              pipe_stats ? ForKind::Pipeline : ForKind::Sequential, std::move(stats_attrs)));
+          append_planned_loop(body, k, solver_stream.stats, std::vector<IterArgPtr>{mean_it, M2_it, cnt_it},
+                              std::move(lbody), std::vector<VarPtr>{mean_out, M2_out, cnt_out});
           mean_cur = mean_out;
           M2_cur = M2_out;
           cnt_cur = cnt_out;
         }
-        if (rem > 0) {
-          auto [mn, m2n, cn] =
-              welford_chunk(rem, MakeIndex(num_full * rc, sp), mean_cur, M2_cur, cnt_cur, body, 2);
+        if (solver_stream.stats_tail.present) {
+          auto [mn, m2n, cn] = welford_chunk(solver_stream.stats_tail.extent,
+                                             MakeIndex(solver_stream.stats_tail.chunk_index * rc, sp),
+                                             mean_cur, M2_cur, cnt_cur, body, 2);
           mean_cur = mn;
           M2_cur = m2n;
           cnt_cur = cn;
@@ -2156,49 +2291,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         subs.emplace(user_var.get(), var_final);
       }
 
-      // PASS 1 — apply. Re-stream R substituting the finalized Welford mean/variance and assemble the
-      // spanning sink into the full-shape [IM,IN] output.
-      // emit_strip replays the small [.,1] stats cone plus the spanning xc/out; x is DMA'd once here.
-      auto asm_at = [&](const ExprPtr& coff) -> ExprPtr {
-        return pin_m ? MakeTuple2(coff, foff, sp)    // reduce M: [rc, free_tile] at [coff, foff]
-                     : MakeTuple2(foff, coff, sp);   // reduce N: [free_tile, rc] at [foff, coff]
-      };
-      VarPtr out_cur = c_init;
-      {
-        auto s = std::make_shared<Var>(base + "_ps", index_type, sp);
-        auto out_it = std::make_shared<IterArg>(base + "_oit", c_init->GetType(), ExprPtr(c_init), sp);
-        ExprPtr coff = MakeMul(s, MakeIndex(rc, sp), sp);
-        std::vector<StmtPtr> lbody;
-        std::unordered_map<const Var*, VarPtr> ocp;
-        VarPtr och = strip_at(rc, coff, lbody, ocp, nullptr, &subs);
-        auto asm_c = reg.Create("tensor.assemble", {ExprPtr(out_it), ExprPtr(och), asm_at(coff)}, sp);
-        auto on = std::make_shared<Var>(base + "_on", asm_c->GetType(), sp);
-        lbody.push_back(std::make_shared<AssignStmt>(on, asm_c, sp));
-        lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(on)}, sp));
-        auto ofin =
-            std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
-        // A5 (mirror G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT
-        // reduced-axis chunk (out_it is only the assemble target — the pointwise-strip pattern, lowered
-        // to an in-place store by RewriteReturnedAssembleLoopToStore), so a stage=2 loop overlaps chunk
-        // s+1's x-slice load with chunk s's apply: the DDR-bound re-read (P4 SECOND pass) hides behind
-        // compute, realizing the model's max(compute,ddr). The finalized stats (M/L or the S_i) are
-        // loop-invariant broadcast operands (single-buffered, read each iter). Serial for a 1-chunk loop.
-        const bool pipe_apply = solver_stream.apply.pipeline_stages == 2;
-        std::vector<std::pair<std::string, std::any>> apply_attrs;
-        if (pipe_apply) apply_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
-        body.push_back(std::make_shared<ForStmt>(
-            s, MakeIndex(0, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{out_it},
-            SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{rem > 0 ? ofin : c_var}, sp,
-            pipe_apply ? ForKind::Pipeline : ForKind::Sequential, std::move(apply_attrs)));
-        out_cur = rem > 0 ? ofin : c_var;
-      }
-      if (rem > 0) {  // ragged tail apply chunk
-        std::unordered_map<const Var*, VarPtr> oct;
-        ExprPtr coff = MakeIndex(num_full * rc, sp);
-        VarPtr och = strip_at(rem, coff, body, oct, nullptr, &subs);
-        auto asm_c = reg.Create("tensor.assemble", {ExprPtr(out_cur), ExprPtr(och), asm_at(coff)}, sp);
-        body.push_back(std::make_shared<AssignStmt>(c_var, asm_c, sp));
-      }
+      emit_spanning_apply(body, subs);
 
       auto scope = SpmdWrap(t, std::move(body), MakeIndex(num_free, sp), name, sp);
       LOG_INFO << "AutoFuse[generic]: STREAMED fused online layernorm (P4) '" << name << "' ("
@@ -2234,7 +2327,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       //   corr  = m_in? exp(sub(m_in,m_new)) : 1;   l_new = l_in? add(mul(l_in,corr), cl) : cl
       // ORDER MATTERS: compute m_new BEFORE sub/corr; l_new uses OLD l_in*corr + NEW cl. `m_in`/`l_in`
       // null => the init chunk (m=cmax, l=cl, corr=1). Returns the new ([free_tile,1]) stats.
-      auto p4_chunk = [&](int64_t chunk_ext, const ExprPtr& red_off, VarPtr m_in, VarPtr l_in,
+      auto p4_chunk = [&](int64_t chunk_ext, const ExprPtr& red_off, const VarPtr& m_in, const VarPtr& l_in,
                           std::vector<StmtPtr>& out, int tag) -> std::pair<VarPtr, VarPtr> {
         const std::string tg = std::to_string(tag);
         VarPtr xs = pin_m ? slice_input(x_input, chunk_ext, free_tile, red_off, foff, out, tag)
@@ -2283,8 +2376,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       // PASS 0 — online stats. Chunk 0 inits (m=row_max(x0), l=row_sum(exp(x0-m)), corr=1); chunks
       // 1..num_full merge while threading {m_it, l_it}; the ragged tail merges after. Chunks are
       // DISJOINT (overlapping the chunk bounds themselves would double-count the reduction).
-      auto [m_cur, l_cur] = p4_chunk(rc, MakeIndex(0, sp), nullptr, nullptr, body, 0);
-      if (num_full >= 2) {
+      auto [m_cur, l_cur] =
+          p4_chunk(solver_stream.stats_init.extent, MakeIndex(solver_stream.stats_init.chunk_index * rc, sp),
+                   nullptr, nullptr, body, 0);
+      if (solver_stream.stats.trip_count > 0) {
         auto k = std::make_shared<Var>(base + "_k", index_type, sp);
         auto m_it = std::make_shared<IterArg>(base + "_m_it", m_cur->GetType(), ExprPtr(m_cur), sp);
         auto l_it = std::make_shared<IterArg>(base + "_l_it", l_cur->GetType(), ExprPtr(l_cur), sp);
@@ -2297,19 +2392,15 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         // A5: (m,l) is true loop-carried state and remains persistent. Stage=2 double-buffers only
         // the next disjoint input chunk, overlapping its load with the current chunk's online
         // reduction/merge. Chunk 0 is emitted before this loop, so require two rolled iterations.
-        const bool pipe_stats = solver_stream.stats.pipeline_stages == 2;
-        std::vector<std::pair<std::string, std::any>> stats_attrs;
-        if (pipe_stats) stats_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
-        body.push_back(std::make_shared<ForStmt>(
-            k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp),
-            std::vector<IterArgPtr>{m_it, l_it}, SeqStmts::Flatten(std::move(lbody), sp),
-            std::vector<VarPtr>{m_out, l_out}, sp,
-            pipe_stats ? ForKind::Pipeline : ForKind::Sequential, std::move(stats_attrs)));
+        append_planned_loop(body, k, solver_stream.stats, std::vector<IterArgPtr>{m_it, l_it},
+                            std::move(lbody), std::vector<VarPtr>{m_out, l_out});
         m_cur = m_out;
         l_cur = l_out;
       }
-      if (rem > 0) {
-        auto [m_new, l_new] = p4_chunk(rem, MakeIndex(num_full * rc, sp), m_cur, l_cur, body, 2);
+      if (solver_stream.stats_tail.present) {
+        auto [m_new, l_new] =
+            p4_chunk(solver_stream.stats_tail.extent,
+                     MakeIndex(solver_stream.stats_tail.chunk_index * rc, sp), m_cur, l_cur, body, 2);
         m_cur = m_new;
         l_cur = l_new;
       }
@@ -2322,46 +2413,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       // in-place stores (RewriteReturnedAssembleLoopToStore).
       const std::unordered_map<const Var*, VarPtr> subs = {
           {max_stmt->var_.get(), m_final}, {sum_stmt->var_.get(), l_final}};
-      auto asm_at = [&](const ExprPtr& coff) -> ExprPtr {
-        return pin_m ? MakeTuple2(coff, foff, sp)    // reduce M: [rc, free_tile] at [coff, foff]
-                     : MakeTuple2(foff, coff, sp);   // reduce N: [free_tile, rc] at [foff, coff]
-      };
-      VarPtr out_cur = c_init;
-      {
-        auto s = std::make_shared<Var>(base + "_ps", index_type, sp);
-        auto out_it = std::make_shared<IterArg>(base + "_oit", c_init->GetType(), ExprPtr(c_init), sp);
-        ExprPtr coff = MakeMul(s, MakeIndex(rc, sp), sp);
-        std::vector<StmtPtr> lbody;
-        std::unordered_map<const Var*, VarPtr> ocp;
-        VarPtr och = strip_at(rc, coff, lbody, ocp, nullptr, &subs);
-        auto asm_c = reg.Create("tensor.assemble", {ExprPtr(out_it), ExprPtr(och), asm_at(coff)}, sp);
-        auto on = std::make_shared<Var>(base + "_on", asm_c->GetType(), sp);
-        lbody.push_back(std::make_shared<AssignStmt>(on, asm_c, sp));
-        lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(on)}, sp));
-        auto ofin =
-            std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
-        // A5 (mirror G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT
-        // reduced-axis chunk (out_it is only the assemble target — the pointwise-strip pattern, lowered
-        // to an in-place store by RewriteReturnedAssembleLoopToStore), so a stage=2 loop overlaps chunk
-        // s+1's x-slice load with chunk s's apply: the DDR-bound re-read (P4 SECOND pass) hides behind
-        // compute, realizing the model's max(compute,ddr). The finalized stats (M/L or the S_i) are
-        // loop-invariant broadcast operands (single-buffered, read each iter). Serial for a 1-chunk loop.
-        const bool pipe_apply = solver_stream.apply.pipeline_stages == 2;
-        std::vector<std::pair<std::string, std::any>> apply_attrs;
-        if (pipe_apply) apply_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
-        body.push_back(std::make_shared<ForStmt>(
-            s, MakeIndex(0, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{out_it},
-            SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{rem > 0 ? ofin : c_var}, sp,
-            pipe_apply ? ForKind::Pipeline : ForKind::Sequential, std::move(apply_attrs)));
-        out_cur = rem > 0 ? ofin : c_var;
-      }
-      if (rem > 0) {  // ragged tail apply chunk
-        std::unordered_map<const Var*, VarPtr> oct;
-        ExprPtr coff = MakeIndex(num_full * rc, sp);
-        VarPtr och = strip_at(rem, coff, body, oct, nullptr, &subs);
-        auto asm_c = reg.Create("tensor.assemble", {ExprPtr(out_cur), ExprPtr(och), asm_at(coff)}, sp);
-        body.push_back(std::make_shared<AssignStmt>(c_var, asm_c, sp));
-      }
+      emit_spanning_apply(body, subs);
 
       auto scope = SpmdWrap(t, std::move(body), MakeIndex(num_free, sp), name, sp);
       LOG_INFO << "AutoFuse[generic]: STREAMED fused online softmax (P4) '" << name << "' ("
@@ -2376,8 +2428,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // The accumulator is the small reduced [.,1]/[1,.]; chunk 0 inits it, chunks 1.. merge in a
     // carried loop (acc iter_arg, spike-proven), the ragged tail merges after.
     std::unordered_map<const Var*, VarPtr> oc0;
-    VarPtr acc = strip_at(rc, MakeIndex(0, sp), body, oc0, red_stmt.get(), nullptr);
-    if (num_full >= 2) {
+    VarPtr acc =
+        strip_at(solver_stream.stats_init.extent, MakeIndex(solver_stream.stats_init.chunk_index * rc, sp),
+                 body, oc0, red_stmt.get(), nullptr);
+    if (solver_stream.stats.trip_count > 0) {
       auto k = std::make_shared<Var>(base + "_k", index_type, sp);
       auto acc_it = std::make_shared<IterArg>(base + "_acc_it", acc->GetType(), ExprPtr(acc), sp);
       std::vector<StmtPtr> lbody;
@@ -2393,18 +2447,15 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       // load+reduce (`part`) double-buffers — stage=2 overlaps chunk k+1's load with chunk k's
       // reduce+merge, hiding the DDR-bound input read behind compute (this is the P1/P2 FIRST pass).
       // Pipeline only when the trip (num_full-1) is >= 2; else nothing to overlap.
-      const bool pipe_acc = solver_stream.stats.pipeline_stages == 2;
-      std::vector<std::pair<std::string, std::any>> acc_attrs;
-      if (pipe_acc) acc_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
-      body.push_back(std::make_shared<ForStmt>(
-          k, MakeIndex(1, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{acc_it},
-          SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{acc_out}, sp,
-          pipe_acc ? ForKind::Pipeline : ForKind::Sequential, std::move(acc_attrs)));
+      append_planned_loop(body, k, solver_stream.stats, std::vector<IterArgPtr>{acc_it}, std::move(lbody),
+                          std::vector<VarPtr>{acc_out});
       acc = acc_out;
     }
-    if (rem > 0) {
+    if (solver_stream.stats_tail.present) {
       std::unordered_map<const Var*, VarPtr> oct;
-      VarPtr tpart = strip_at(rem, MakeIndex(num_full * rc, sp), body, oct, red_stmt.get(), nullptr);
+      VarPtr tpart =
+          strip_at(solver_stream.stats_tail.extent, MakeIndex(solver_stream.stats_tail.chunk_index * rc, sp),
+                   body, oct, red_stmt.get(), nullptr);
       auto m_call = reg.Create(merge_op, {ExprPtr(acc), ExprPtr(tpart)}, sp);
       auto acc_t = std::make_shared<Var>(base + "_acc_t", m_call->GetType(), sp);
       body.push_back(std::make_shared<AssignStmt>(acc_t, m_call, sp));
@@ -2429,50 +2480,11 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       body.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
     } else {
       // P2 PASS 1 — final apply. The output spans the reduced axis, so re-stream it: for each chunk,
-      // recompute the FULL pointwise cone (subs the finalized reduction `acc`) over the [free_tile,
+      // recompute the sink dependency cone (subs the finalized reduction `acc`) over the [free_tile,
       // chunk] slice and assemble it into the full-shape sink at the chunk's reduced-axis offset.
       // Output threaded as an iter_arg (assemble-into-output -> in-place stores, like the pipeline).
       const std::unordered_map<const Var*, VarPtr> subs = {{red_stmt->var_.get(), acc}};
-      auto asm_at = [&](const ExprPtr& coff, VarPtr chunk_tile) -> ExprPtr {
-        return pin_m ? MakeTuple2(coff, foff, sp)    // reduce M: [rc, w] at [coff, n]
-                     : MakeTuple2(foff, coff, sp);   // reduce N: [h, rc] at [m, coff]
-      };
-      VarPtr out_cur = c_init;
-      {  // Full-chunk loop; s -> reduced-axis offset s*rc.
-        auto s = std::make_shared<Var>(base + "_ps", index_type, sp);
-        auto out_it = std::make_shared<IterArg>(base + "_oit", c_init->GetType(), ExprPtr(c_init), sp);
-        ExprPtr coff = MakeMul(s, MakeIndex(rc, sp), sp);
-        std::vector<StmtPtr> lbody;
-        std::unordered_map<const Var*, VarPtr> ocp;
-        VarPtr och = strip_at(rc, coff, lbody, ocp, nullptr, &subs);
-        auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_it), ExprPtr(och), asm_at(coff, och)}, sp);
-        auto on = std::make_shared<Var>(base + "_on", asm_call->GetType(), sp);
-        lbody.push_back(std::make_shared<AssignStmt>(on, asm_call, sp));
-        lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{on}, sp));
-        // No ragged tail -> the loop output IS the sink; else an intermediate the tail assembles into.
-        auto ofin = std::make_shared<Var>(rem > 0 ? (base + "_ofin") : c_var->name_hint_, c_init->GetType(), sp);
-        // A5 (G2): PIPELINE the apply re-stream. Each iteration assembles into a DISJOINT reduced-axis
-        // chunk (out_it is only the assemble target — the pointwise-strip pattern, lowered to an in-place
-        // store by RewriteReturnedAssembleLoopToStore), so a stage=2 loop overlaps chunk s+1's load with
-        // chunk s's apply: the DDR-bound re-read (this is the P2/softmax/layernorm SECOND pass) hides
-        // behind compute, realizing the model's max(compute,ddr). The finalized stat `acc` is a
-        // loop-invariant broadcast operand (single-buffered, read each iter). Serial for a 1-chunk loop.
-        const bool pipe_apply = solver_stream.apply.pipeline_stages == 2;
-        std::vector<std::pair<std::string, std::any>> apply_attrs;
-        if (pipe_apply) apply_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
-        body.push_back(std::make_shared<ForStmt>(
-            s, MakeIndex(0, sp), MakeIndex(num_full, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{out_it},
-            SeqStmts::Flatten(std::move(lbody), sp), std::vector<VarPtr>{rem > 0 ? ofin : c_var}, sp,
-            pipe_apply ? ForKind::Pipeline : ForKind::Sequential, std::move(apply_attrs)));
-        out_cur = rem > 0 ? ofin : c_var;
-      }
-      if (rem > 0) {  // ragged tail apply chunk
-        std::unordered_map<const Var*, VarPtr> oct;
-        ExprPtr coff = MakeIndex(num_full * rc, sp);
-        VarPtr och = strip_at(rem, coff, body, oct, nullptr, &subs);
-        auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_cur), ExprPtr(och), asm_at(coff, och)}, sp);
-        body.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
-      }
+      emit_spanning_apply(body, subs);
     }
 
     auto scope = SpmdWrap(t, std::move(body), MakeIndex(num_free, sp), name, sp);
@@ -2618,127 +2630,24 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
                              "declining to the legacy tiler", out_stmt->span_);
   }
 
-  // Software-pipelining: chunk the FREE axis into strips and emit a ForKind::Pipeline loop threading
-  // the output through ONE iter_arg, so LowerPipelineLoops (unroll+tag) + CanonicalizeIOOrder (cluster
-  // loads) + MemoryReuse (per-stage ping-pong load buffers) realize the max(compute,ddr) roofline the
-  // cost model prices (db_roofline). A reduction pins its reduced axis full, so we chunk the NON-PINNED
-  // axis: h (rows) for row-reduction/pointwise. A COL reduction pins h (=M); chunking it would split
-  // the reduction -> keep the SERIAL body there (deferred), which the model's db=false path prices as
-  // compute+ddr anyway.
-  bool has_col_reduction = false;
-  if (has_reduction) {
-    for (const auto& a : ops) {
-      auto c = As<Call>(a->value_);
-      if (ClassifyOp(c) != ::OpType::Reduction || c->args_.empty()) continue;
-      const auto [ciM, ciN] = Static2DShape(c->args_[0]->GetType());
-      const auto [coM, coN] = Static2DShape(a->var_->GetType());
-      if (ciM > 1 && coM == 1) has_col_reduction = true;  // reduces height -> pins h
-    }
-  }
-  // Strip count: the largest divisor of h in {8,4,2} (prefer more strips for a steady-state pipeline,
-  // trip >= 2*stage) giving EQUAL strips (h % num_strips == 0 -> no ragged-strip clamp; tile-level
-  // ragged M is already handled by the mi clamp). Fall back to serial (1 strip) when h can't be
-  // chunked >=2 ways or the group has a col reduction.
-  //
-  // For a REDUCTION group the row axis is padded to the DMA granule g (col-major tile), so a
-  // SUB-GRANULE strip (strip_h = h/ns not a multiple of g) pads EACH strip up to g -> DMA
-  // over-fetch, and the pipeline's stage=2 ping-pong then double-buffers those padded strips ->
-  // the working set overflows UB on wide tiles (e.g. rmsnorm[256,2048]: h=6 -> strip_h=3 padded
-  // to 8, x2 ping-pong x wide w blows past UB, though the un-chunked [8,2048] serial tile fits).
-  // Require granule-multiple strips there (zero per-strip padding); if none exists, stay serial —
-  // the cost model prices that as compute+ddr, which is honest for a tile too short to pipeline at
-  // granule granularity. Pointwise tiles (rows free, unpadded) pipeline at any strip height.
-  // Row-strip count. Two concerns: (a) PERF — chunk h into equal strips for a steady-state stage-2
-  // pipeline; (b) UB — each strip's live-band footprint must fit UB. The old {8,4,2} heuristic sized
-  // strip_h = h/8 with NO UB bound, so a tall pointwise tile overflowed AllocateMemoryAddr (a [512,64]
-  // strip peaked at 262144 > 188416 UB). Fix: after the perf heuristic, force MORE strips (double from
-  // the heuristic) until a strip fits UB. Streams the ROW axis — exact parity with the cost model's
-  // vector_stream, which streams the LARGER axis == rows for a tall tile == the C3 case (a wide w>h tile
-  // also streams rows here, which fits UB but is a minor roofline-fidelity gap vs the model's width
-  // stream — a follow-up width-stream closes it; see KNOWN_ISSUES). A materialized reduction only ever
-  // chunks its FREE (row) axis — its reduced axis is pinned full and reaches here only when it already
-  // fits UB (over-UB single/multi reductions were streamed/declined above) — so this bump only fires for
-  // pointwise, but strip_fits is layout-correct (col-major reduction rows padded to g) for both.
-  // Live UB footprint per strip = `pipe_bands` bands of the strip tile. This is the PEAK number of
-  // simultaneously-live tiles over the op chain (what MemoryReuse actually allocates), + 1 for the
-  // stage-2 pipeline's prefetch band. A LINEAR chain frees each input right after its op, so the peak
-  // is small (a→c→d: {a,c} then {c,d} = 2); but a chain that REUSES an input keeps it live across the
-  // chain: (a+b)*b holds b through both ops → peak {a,b,c} / {b,c,d} = 3. A fixed constant (the old
-  // "2") UNDER-counted reuse — on device a wide `(a+b)*b` [64,4096] tile's [.,4096] strip needed 4
-  // bands (196608 B) but was sized for 2 (98304) and overflowed AllocateMemoryAddr. Compute the real
-  // peak so the strip is bounded for reused-input / fan-out chains too (the row-stream then chunks a
-  // wide tile down to [1..few, w], which fits). O(ops^2), ops is a small fused chain.
-  int64_t peak_live = 0;
-  {
-    std::unordered_map<const Var*, std::pair<int, int>> life;  // var -> [first_step, last_step]
-    for (int s = 0; s < static_cast<int>(ops.size()); ++s) {
-      life[ops[s]->var_.get()] = {s, s};  // this op's output tile, produced at s
-      for (const ExprPtr& arg : As<Call>(ops[s]->value_)->args_) {
-        auto v = AsVarLike(arg);
-        if (v == nullptr) continue;
-        auto it = life.find(v.get());
-        if (it == life.end()) life[v.get()] = {s, s};  // external input, first use
-        else it->second.second = s;                    // extend last-use (op output or reused input)
-      }
-    }
-    for (int s = 0; s < static_cast<int>(ops.size()); ++s) {
-      int64_t live = 0;
-      for (const auto& [v, iv] : life)
-        if (iv.first <= s && s <= iv.second) ++live;
-      peak_live = std::max(peak_live, live);
-    }
-  }
-  const int64_t pipe_bands = std::max<int64_t>(2, peak_live + 1);  // +1 = stage-2 prefetch band
-  // Does a [sh, sw] strip fit UB under the stage-2 ping-pong? Rows are the FREE (unpadded) axis for
-  // pointwise (padded to g for a col-major reduction tile); the contiguous WIDTH is always granule-padded.
-  auto strip_fits = [&](int64_t sh, int64_t sw) -> bool {
-    const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
-    return pipe_bands * sh_al * AlignUp(sw, g) * p1_dtb <= p1_ub;
-  };
-  int64_t num_strips = 1;   // row (free/height) strips
-  int64_t num_wstrips = 1;  // contiguous-width strips (>1 only when the finest row strip is still too wide)
-  int64_t strip_w = w;      // per-strip contiguous width (granule-aligned when the width is chunked, C2)
-  if (!has_col_reduction) {
-    for (int64_t ns : {8, 4, 2}) {
-      if (ns > h || h % ns != 0) continue;
-      if (has_reduction && (h / ns) % g != 0) continue;  // no sub-granule reduction strips
-      num_strips = ns;
-      break;
-    }
-    // UB guarantee: bump the row-strip count until the double-buffered [ceil(h/ns), w] strip fits UB.
-    // Strips become ceil(h/num_strips) (uniform); the ragged last strip is clamped in-bounds below
-    // (idempotent overlap for a non-atomic pointwise assemble). Doubling keeps a clean pipeline trip
-    // count; the final chunk is >= UB-fitting. Cap at h (strip_h==1).
-    while (num_strips < h && !strip_fits((h + num_strips - 1) / num_strips, w))
-      num_strips = std::min<int64_t>(num_strips * 2, h);
-    const int64_t strip_h = (h + num_strips - 1) / num_strips;  // finest row strip (== 1 for a fully-bumped
-                                                                // pointwise tile)
-    if (!strip_fits(strip_h, w)) {
-      // C2 — even the finest row strip is too WIDE to stream within UB (a wide, high-peak-liveness
-      // pointwise chain: e.g. [16,8192] reusing 4 inputs needs ~10 live bands, and 10*1*8192*4 > UB).
-      // The row axis is exhausted (strip_h == 1 for pointwise); chunk the CONTIGUOUS WIDTH too so the
-      // emit still STREAMS instead of declining to the legacy TilePointwiseGroup (which materializes
-      // the whole [h,w] tile with NO UB guard -> AllocateMemoryAddr overflow). Width chunking is sound
-      // ONLY for a pure-pointwise tile: a row reduction pins the width (its reduced axis) and must not
-      // be split — but an over-UB reduction was already streamed (P1/P2/P4) or declined (G1) above, so
-      // a reduction tile reaching here already fits UB. Keep the (now-unreachable) reduction decline as
-      // a guard. The width chunk is granule-aligned (contiguous axis) so a padded strip read never runs
-      // past the tile; the ceil grid + in-bounds clamp on the ragged last width strip is an idempotent
-      // recompute for the non-atomic pointwise assemble (same trick as the rows / SPMD grid).
-      if (has_reduction)
-        return GenericDeclineB("reduction tile too wide to stream a single reduced-axis-pinned strip "
-                               "within UB — declining to the legacy tiler",
-                               out_stmt->span_);
-      const int64_t w_cap = p1_ub / std::max<int64_t>(1, pipe_bands * strip_h * p1_dtb);  // max width (elems)
-      strip_w = std::max<int64_t>(g, (w_cap / g) * g);      // largest g-multiple width that fits
-      strip_w = std::min<int64_t>(strip_w, AlignUp(w, g));  // never exceed the padded tile width
-      num_wstrips = (w + strip_w - 1) / strip_w;            // ceil grid over the width
-      if (!strip_fits(strip_h, strip_w))
-        return GenericDeclineB("pointwise tile too wide to stream even a 1-row x 1-granule block within "
-                               "UB — declining to the legacy tiler",
-                               out_stmt->span_);
-    }
-  }
+  // Materialized and pointwise strip scheduling is solver-owned.  The plan was
+  // derived while costing this exact configuration from the same DFS liveness
+  // order; emission only validates and realizes it.
+  const ::VectorStreamKind expected_body_kind =
+      solver_stream.streamed() ? ::VectorStreamKind::Pointwise : ::VectorStreamKind::Materialized;
+  const bool body_plan_matches =
+      solver_stream.feasible && solver_stream.kind == expected_body_kind && solver_stream.tile_h == h &&
+      solver_stream.tile_w == w && solver_stream.row_strips >= 1 && solver_stream.width_strips >= 1 &&
+      solver_stream.strip_h == (h + solver_stream.row_strips - 1) / solver_stream.row_strips &&
+      solver_stream.strip_w > 0 && solver_stream.strip_w <= AlignUp(w, g) &&
+      solver_stream.body.first_chunk == 0 &&
+      solver_stream.body.trip_count == solver_stream.row_strips * solver_stream.width_strips;
+  INTERNAL_CHECK_SPAN(body_plan_matches, sp)
+      << "Internal error: materialized/pointwise emit does not match solver vector plan for group '" << name
+      << "'";
+  const int64_t num_strips = solver_stream.row_strips;
+  const int64_t num_wstrips = solver_stream.width_strips;
+  const int64_t strip_w = solver_stream.strip_w;
 
   std::vector<StmtPtr> body_stmts;
   if (num_strips < 2 && num_wstrips < 2) {
@@ -2749,8 +2658,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tv, MakeTuple2(mi, ni, sp)}, sp);
     body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
   } else {
-    // Pipelined stream: flatten the row strips x width strips into ONE stage-2 pipeline threading the
-    // output through one iter_arg. For s in pipeline(0, num_strips*num_wstrips, stage=2):
+    // Flatten the solver-owned row strips x width strips into one carried loop.
+    // The plan chooses Sequential when the strip is below the double-buffer
+    // floor, otherwise Pipeline(stage=2).
     //   strip at (mi + srow, ni + scol); replay ops -> [strip_h, emit_w] tile; out = assemble(out,
     //   strip, off); yield.
     // num_wstrips == 1 is the common ROW-only case: srow = s*strip_h over the full width w, byte-
@@ -2791,18 +2701,23 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     loop_body.push_back(std::make_shared<AssignStmt>(out_next, asm_call, sp));
     loop_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{out_next}, sp));
     StmtPtr body = SeqStmts::Flatten(std::move(loop_body), sp);
-    std::vector<std::pair<std::string, std::any>> loop_attrs = {{kPipelineStagesAttr, /*stages=*/2}};
-    auto for_stmt = std::make_shared<ForStmt>(s, MakeIndex(0, sp), MakeIndex(total_strips, sp), MakeIndex(1, sp),
-                                              std::vector<IterArgPtr>{out_iter}, body, std::vector<VarPtr>{c_var},
-                                              sp, ForKind::Pipeline, std::move(loop_attrs));
+    const bool pipelined = solver_stream.body.pipeline_stages == 2;
+    std::vector<std::pair<std::string, std::any>> loop_attrs;
+    if (pipelined) {
+      loop_attrs.emplace_back(kPipelineStagesAttr, /*stages=*/2);
+    }
+    auto for_stmt =
+        std::make_shared<ForStmt>(s, MakeIndex(0, sp), MakeIndex(total_strips, sp), MakeIndex(1, sp),
+                                  std::vector<IterArgPtr>{out_iter}, body, std::vector<VarPtr>{c_var}, sp,
+                                  pipelined ? ForKind::Pipeline : ForKind::Sequential, std::move(loop_attrs));
     body_stmts.push_back(for_stmt);
   }
 
   auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
-  LOG_INFO << "AutoFuse[generic]: " << (has_reduction ? "elementwise+reduction" : "elementwise")
-           << " group '" << name << "' tiled by the generic driver (" << ops.size() << " ops, grid "
-           << num_m << "x" << num_n << " = " << (num_m * num_n) << " tiles, "
-           << (num_strips * num_wstrips) << " pipeline strips"
+  LOG_INFO << "AutoFuse[generic]: " << (has_reduction ? "elementwise+reduction" : "elementwise") << " group '"
+           << name << "' tiled by the generic driver (" << ops.size() << " ops, grid " << num_m << "x"
+           << num_n << " = " << (num_m * num_n) << " tiles, " << (num_strips * num_wstrips)
+           << " planned strips (stage=" << solver_stream.body.pipeline_stages << ")"
            << (num_wstrips > 1 ? " [width-chunked]" : "") << ")";
   // Grid fidelity (cost-vs-latency experiment): the emit realizes a ceil(IM/h) x ceil(IN/w) grid,
   // whose MAX region extent is h/w -> its critical-path latency matches the solver's balanced
@@ -3246,8 +3161,9 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
       if (GenericEmitEnabled()) {
         const P4Match* p4_match = nullptr;
         auto pit = group_p4_match.find(static_cast<size_t>(run_group));
-        if (pit != group_p4_match.end() && pit->second < p4_matches.size())
+        if (pit != group_p4_match.end() && pit->second < p4_matches.size()) {
           p4_match = &p4_matches[pit->second];
+        }
         if (auto generic = EmitFusedGroupGeneric(run, tit->second, nm, p4_match)) {
           for (auto& s : *generic) {
             top.push_back(std::move(s));
@@ -3743,8 +3659,9 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     std::unordered_map<const Stmt*, size_t> stmt_exec;      // solver's per-group pebbling order
     std::unordered_map<size_t, size_t> group_p4_match;      // solver group -> shared semantic descriptor
     std::map<FlatSet<size_t>, size_t> p4_match_by_ops;
-    for (size_t i = 0; i < builder.problem.p4_patterns.size(); ++i)
+    for (size_t i = 0; i < builder.problem.p4_patterns.size(); ++i) {
       p4_match_by_ops.emplace(builder.problem.p4_patterns[i].ops, i);
+    }
     for (size_t s = 0; s < sol.num_steps(); ++s) {
       const ::TileConfig& cfg = sol.step(s).config;
       const ::CostResult& selected_cost = sol.step_cost(s);
