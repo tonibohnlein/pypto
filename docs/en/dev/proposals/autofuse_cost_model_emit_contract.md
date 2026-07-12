@@ -70,11 +70,18 @@ Two distinct walks over the DAG matter (within a group):
 
 ## 1. The roofline (what the model computes)
 
-For one fused vector group at a fixed tile, over `C` AIV cores (910B: 48):
+For one fused vector group at a fixed tile, over `C` AIV cores (910B: 48), the emitted
+barriers define the costing phases:
 
 ```
-latency = max(compute_mk, ddr)      [if the tile double-buffers; else compute_mk + ddr]
+latency = Σphase roofline(phase)
+roofline(p) = max(compute_mk[p], ddr[p])   [only for a stage-2 rolled loop]
+              compute_mk[p] + ddr[p]      [serial body / peeled init / tail / finalize]
 ```
+
+For a streamed reduction the ordered phases are `stats_init` (serial), rolled `stats`,
+`stats_tail` (serial), an optional serial finalize, rolled `apply`, and `apply_tail` (serial).
+No phase may hide work across a barrier.
 
 ### Compute (`VecOpCompute :63`, `WaveComputeCycles :153`)
 
@@ -82,16 +89,18 @@ latency = max(compute_mk, ddr)      [if the tile double-buffers; else compute_mk
   `repeat = ceil(elems / epr)`, `epr = vec_reg_bytes / dtype_bytes` (fp32: 256/4 = 64).
   Reduction = its **tree**: row-reduce ≈ `45·(W/epr − 1) + 51` (linear in W, rows-independent);
   col-reduce ≈ `16·(H−1) + 30·log2(H)` (log-depth).
-- **Tiling-invariant**: summed over the FULL element count (each element touched once).
-  The tile does NOT change the raw cycle count.
+- Base op work is summed over the full element count. An op present in both phase cones
+  (softmax's `sub`/`exp`) is charged in both because the apply pass recomputes it.
 - head+tail is paid **once per back-to-back pointwise run** (only the stream-start op).
 - Spread over the grid: `compute_mk = WaveComputeCycles(total, U, C) = total·ceil(U/C)/U`,
   `U = num_tiles = parts_m·parts_n`. Filling toward `C` lowers it; past `C` costs extra waves.
 
 ### DDR (`:1744`, `dma_pen :1779`)
 
-- Counts **only boundary tensors**: external reads (`io_in`) + boundary writes (`io_out`),
-  over the FULL tensor bytes (tiling-invariant: read each input once, write each output once).
+- Counts **only boundary tensors**: external reads (`io_in`) + boundary writes (`io_out`).
+  Each input has a phase mask derived from the DAG: stats+apply inputs read twice, stats-only
+  and apply-only inputs once. Size-1 broadcast axes are re-read per emitted chunk; uniform
+  clamp-overlap strips are charged at the actual planned strip geometry.
 - **Ephemeral intermediates contribute ZERO DDR** — they stay in UB. *This is the entire
   fusion win.*
 - Tile enters only via the **DMA-shape penalty** `dma_pen = max(1, vec_reg_bytes/(w·dtype))`
@@ -105,10 +114,11 @@ latency = max(compute_mk, ddr)      [if the tile double-buffers; else compute_mk
 - `compute_mk = total_compute · ceil(U/48) / U`, `U ≈ (H/h)·(W/w)`.
 - `io_in = H·W·4·ub_in`, `io_out = H·W·4·ub_out`, `t1 = 0` (ephemeral, on-chip).
 - `ddr = io_in·dma_pen/par + io_out·dma_pen/par`.
-- `latency = max(compute_mk, ddr)`.
+- This pointwise example has one planned body phase, so its latency is that phase's
+  `max(compute_mk, ddr)` when the body loop is stage-2, otherwise their sum.
 
-The tile size changes **occupancy** (`U` → compute divisor) and **DMA efficiency / pipe
-count** (`dma_pen`, `active` → DDR divisor) — never the raw cycles or byte counts.
+The tile size changes occupancy, DMA efficiency, and the exact emitted strip traffic
+(ragged clamp overlap and repeated broadcasts); phase membership changes recomputation.
 
 ---
 
@@ -119,6 +129,7 @@ bands over the pebbling order** (`vector_peak_ub :1241`):
 
 - an ephemeral tensor `t` occupies a UB band across `[producer, last consumer]` in `dfs_order_`;
 - at each step, peak = live bands + transient input/output tiles;
+- a reduction materialization includes both its source tile and tensor-lowering work/layout tile;
 - feasible ⟺ `max over steps ≤ UB`.
 - `dfs_order_` (post-order DFS from sinks) is chosen to **minimize** that peak — finish a
   branch (and free its bands) before starting a sibling. This is the pebble game.
@@ -159,9 +170,9 @@ its back-propagated operand tile shapes.
 | A2 | ephemeral intermediates cost **0 DDR** (fusion win) | keep intermediates **on-chip** (UB scratch), never round-trip them through DDR | ✅ honored |
 | A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to `[h,w]`; read `FIXED_1` operands in full (broadcast / reduced-axis) — `emit_strip` | ✅ honored (G4 done, 2026-07-09). `emit_strip` slices any 2D operand per-axis: a full axis follows the tile `[sh/sw]` at `[smi/sni]`, a size-1 (broadcast/`FIXED_1`) axis stays `[1]` at offset 0; the op replay re-infers the broadcast. Covers `[1,N]` bias-add, `[M,1]` scale / reduced-axis stat, `[1,1]`. Other 2D shapes still decline. |
 | A4 | UB feasibility = peak live bands over the **pebbling order** | replay ops in `dfs_order_`; let MemoryReuse alloc/free UB per the emitted liveness | ✅ honored (order matched) |
-| A5 | roofline `max(compute, DDR)` (load k+1 overlaps compute k) | emit the per-core loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) | ⚠️ P1/P2/P4 consume the solver-owned chunk/loop plan; the model withholds overlap unless every streamed data-moving phase is stage-2. Remaining: split the global roofline into a sum of per-phase rooflines, and make materialized/pointwise strip scheduling solver-owned. |
+| A5 | roofline `max(compute, DDR)` only within a loop that overlaps load k+1 with compute k | emit that exact loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) and keep barriers serial | ✅ `VectorStreamPlan` owns materialized/pointwise row+width strips and P1/P2/P4 init/rolled/tail/finalize phases. Cost is `Σphase roofline`; peeled phases use `compute+DDR`, and sub-register or short rolled loops stay sequential. |
 | A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a bare **sum col-reduction** sink `:1630`; else fall back to serial | ⚠️ partial — model must NOT price `S` where the emit declines it (see C2) |
-| A7 | a streamed reduction reads each input band **`stream_passes`** times (§5.1): **1** if every output folds into a reduction, **2** if any output spans the reduced axis | stream with running stats; **1 pass** for a bare reduction or thin folded finalize, **2 passes** (flash-stats + apply) when an output spans R; fold multi-stat reductions **online** (never naive multipass) | ✅ G3 prices `io_in×2` for spanning outputs; exact P4 softmax/Welford emit two passes. Remaining refinement: derive multiplicity per boundary input rather than doubling apply-only operands. |
+| A7 | streamed input reads are phase-specific: an operand may be stats-only, apply-only, or both | stream with running stats; derive each phase's dependency cone and read only its inputs | ✅ G3 uses per-input phase masks. `x` in P2/P4 is normally read in stats+apply; an apply-only scale/bias is charged and emitted once. |
 
 ---
 
@@ -197,8 +208,8 @@ matmul's scores.
 A7 prices **two reads** for a spanning result: one online-stats read and one apply read. P3 would
 add extra statistic reads and run materially slower than priced, so streamed softmax/layernorm must
 use **P4 (online/flash)**. By A5 each phase receives overlap credit only if its loop is actually
-pipelined. Both P4 phases now pipeline when their rolled trip count is at least 2; the remaining
-cost-model refinement is to withhold overlap for shorter loops.
+pipelined. Both P4 rolled loops pipeline only when their trip count and strip size satisfy the
+double-buffer floor; peeled init/tail/finalize work remains serial and separately costed.
 
 ### Scope caveat
 
@@ -257,12 +268,11 @@ The saving is one DDR read, not single-pass.
 
 ## 5.2 Making the cost model aware
 
-The model now derives `spans` and prices `io_in×2` for a spanning streamed output. Remaining work:
+The model derives and costs the emitted phase graph:
 
-- derive `foldable` (all R-reductions in the log-sum-exp/moments family) and
-  `spans = (any live-out extent along R > 1)`;
-- refine the flat boundary-input multiplier into per-input pass multiplicity;
-- scale the applied-cone **compute** by the apply pass and price the online merge operations;
+- exact P4 descriptors establish `foldable`; `spans = any live-out extent along R > 1`;
+- per-input phase masks price stats-only, apply-only, and shared traffic;
+- shared ops in the apply cone are recomputed and charged again; online chunk merge/startup is priced;
 - if `streams && !foldable` → **infeasible** (`cost = inf`) so the partitioner never picks a
   group it cannot emit correctly.
 
@@ -316,23 +326,27 @@ multi-sink escapes cut rather than being reinterpreted.
 
 ### Roofline
 
-**G2 — A5 — streamed loops pipelined — FIXED (emit 2026-07-11; plan/cost 2026-07-12).** Both streamed passes emit
+**G2 — A5 — phase rooflines and solver-owned loops — FIXED (2026-07-12).** Both streamed passes emit
 `ForKind::Pipeline` + stages=2 (mirroring the pointwise strip): the accumulate pass 0 (the
 running accumulator or P4 `(m,l)` / Welford `(mean,M2,count)` IterArgs) and the apply pass 1
 (assembles disjoint reduced-axis chunks, lowered to in-place stores by
 `RewriteReturnedAssembleLoopToStore`). `LowerPipelineLoops` double-buffers only the per-chunk load
 while keeping loop-carried state single-buffered/persistent. Pipelined only when the rolled chunk trip
 is at least 2 (nothing to overlap otherwise). `VectorStreamPlan` now owns the reduction chunk and
-trip counts; `compute_cost` uses it as a stack-local derivation and the emitter re-derives the same
-plan for the winning config. Overlap is granted only when every streamed data-moving phase is
-stage-2. Remaining A5 work is per-phase roofline summing plus the materialized/pointwise strip plan.
+trip counts; stage-2 chunk sizing duplicates source-DAG transient bands while leaving carried state
+single-buffered. `compute_cost` uses the plan as a stack-local derivation and the emitter re-derives the same
+plan for the winning config. Materialized/pointwise row+width strips use that same plan; the old
+quadratic emitter-side liveness/scheduling scan is gone. Costing sums barrier-separated phase
+rooflines: init/tail/finalize serialize, while each eligible rolled loop independently receives
+`max(compute,DDR)`. The shared P2/softmax/Welford carried-loop and spanning-apply builders consume
+the plan's stage count directly.
 
 ### ⚠️ Cost fidelity
 
-**G3 — A7 — streamed input multiplicity — FIXED at group level.** `VectorStreamPlan::stream_passes`
-is 1 for a folded output and 2 for a spanning P2/P4 output; `compute_cost` scales boundary-input
-traffic by that value. Remaining refinement: assign multiplicity per boundary input so apply-only
-scale/bias operands are not charged for the stats pass.
+**G3 — A7 — streamed input multiplicity — FIXED per input.** Candidate-invariant DAG cones assign
+each boundary input to stats, apply, finalize, or body. Costing charges the exact emitted chunks for
+those phases; a stats+apply `x` reads twice, while an apply-only scale/bias reads once. The emitter
+replays the same dependency cone and treats substituted online statistics as leaves.
 
 **G4 — A3 — broadcast priced-fusible but emit-declined — FIXED (2026-07-09).** The emit now
 builds a broadcast operand (one axis full, the other 1): `emit_strip` slices per-axis (full axis
@@ -360,6 +374,9 @@ declines (bare-`col_sum`-only, `:1630`). Bounded, unmeasured; left as-is pending
   sourced from `BackendHandler::GetVectorDmaAlignmentBytes`), so model and emit agree: width always
   padded, height padded for reductions (col-major). This also makes the streamed-chunk sizing
   granule-faithful — closing most of R3.
+- **Reduction source/work materialization floor — FIXED (2026-07-12).** Tensor reduction lowering
+  allocates a work/layout tile alongside the source tile. `vector_peak_ub` now counts both bands, so
+  a reduction that needs more than UB streams instead of reaching `AllocateMemoryAddr` and failing.
 - `dfs_order_` is a greedy topo-tie-break heuristic, not a provably-minimal pebbling.
 - §1's pointwise compute omits the `+16` count-mode floor charged when `width % epr != 0` (`:90`).
 

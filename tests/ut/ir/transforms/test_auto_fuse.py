@@ -570,6 +570,28 @@ class TestAutoFuse:
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
         assert str(incores[0].func_type) == "FunctionType.AIV"
 
+    def test_materialized_single_tile_uses_solver_body_plan(self, ascend_backend, monkeypatch):
+        """A one-task materialized vector group still uses the generic planned body.
+
+        Falling back to the legacy plain InCore scope for a single spatial tile would
+        violate A5 whenever ``VectorStreamPlan`` selected body strips. This minimal
+        case has one serial strip and must therefore emit the generic ``spmd(1)`` body
+        without a pipeline.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def pw(self, a: pl.Tensor[[1, 1], pl.FP32]) -> pl.Tensor[[1, 1], pl.FP32]:
+                c: pl.Tensor[[1, 1], pl.FP32] = pl.add(a, 1.0)
+                return c
+
+        body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "pw").as_python()
+        assert "pl.spmd(1" in body
+        assert "pl.pipeline(" not in body
+        assert "pl.tensor.slice(" in body and "pl.tensor.adds(" in body
+
     def test_tall_pointwise_streams_within_ub(self, ascend_backend, monkeypatch):
         """A tall pointwise tile is row-STREAMED into enough pipeline strips to fit UB.
 
@@ -577,10 +599,9 @@ class TestAutoFuse:
         count was a fixed heuristic (h/8) with NO UB bound, so a tall tile overflowed the
         vector buffer: at h/8 a ``[262144,64]`` problem tiles to ~``[5461,64]`` per core, whose
         ``[682,64]`` strip double-buffers to 682*64*4*2 = 698368 bytes >> the 188416-byte UB,
-        and lowering crashed at ``AllocateMemoryAddr``. The emit now BOUNDS the strip by UB: it
-        doubles the strip count past the {8,4,2} heuristic until the stage-2 ping-pong of a
-        strip (2 bands — MemoryReuse aliases a fused chain's intermediates into the two
-        pipeline buffers, so the peak is chain-length-independent) fits UB. So the tall tile
+        and lowering crashed at ``AllocateMemoryAddr``. ``VectorStreamPlan`` now bounds and owns
+        the emitted strip: it doubles the strip count past the {8,4,2} heuristic until the
+        real DFS-liveness peak plus one prefetch band fits UB. So the tall tile
         streams (>8 strips) and lowers. Rows are the free axis (no col-major granule pad), and
         the ragged last strip is clamped in-bounds — an idempotent overlap for the non-atomic
         assemble, so every row is written exactly once in effect (checked numerically).
@@ -600,7 +621,7 @@ class TestAutoFuse:
 
         fused = passes.auto_fuse()(Prog)
         body = next(f for _, f in fused.functions.items() if f.name == "pw").as_python()
-        # The UB bump fired: more strips than the {8,4,2} heuristic max of 8.
+        # The solver-owned UB bump fired: more strips than the {8,4,2} heuristic max of 8.
         strips = [int(n) for n in re.findall(r"pl\.pipeline\((\d+)", body)]
         assert strips and strips[0] > 8, f"expected UB-bumped strip count > 8, got {strips}"
 
@@ -627,8 +648,8 @@ class TestAutoFuse:
         pre-C3 model tied 48 `[512,64]` tiles with 12 `[2048,64]` tiles; a device sweep found the
         12-tile plan faster (fewer host launches). C3 adds `num_tiles*split*c_task`, so best_cost
         separates them toward the 12-tile plan. It is GATED on the generic emit — only the
-        streaming emit can build the larger `[2048,64]` tile (it UB-streams it into pipeline
-        strips; the legacy tiler materializes the whole tile and overflows UB), so pricing
+        streaming emit can build the larger `[2048,64]` tile (the winning plan UB-streams it
+        into pipeline strips; the legacy tiler materializes the whole tile and overflows UB), so pricing
         fewer-tile plans for the legacy path would pick tiles it cannot realize. Hence with
         ``PYPTO_AUTOFUSE_GENERIC_EMIT=1``: `[4096,384]` tiles to `pl.spmd(12)` (not the legacy
         48 — see test_single_pointwise_tiles_across_vector_cores) and lowers end-to-end.
@@ -656,7 +677,8 @@ class TestAutoFuse:
         fewer/larger-tile bias prefers here (`[.,4096]`) — sizing the strip against a fixed 2
         bands under-counted, and the `[.,4096]` strip overflowed UB (196608 > 188416) at
         `AllocateMemoryAddr` (found on device). The emit now sizes strips by the REAL peak
-        liveness (+1 prefetch band), so the wide reused-input tile streams and lowers.
+        liveness (+1 prefetch band) in `VectorStreamPlan`, so the wide reused-input tile streams
+        and lowers.
         """
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
@@ -867,7 +889,7 @@ class TestAutoFuse:
         the reduced axis, recomputes the pointwise cone with the finalized reduction substituted, and
         assembles each output chunk — the final apply CHUNKS the reduced axis (else the full-shape
         output re-overflows UB, review R3 #2). Asserts a huge case lowers and two shapes are exact
-        (incl. a pre-reduction pointwise x*x recomputed per chunk).
+        (incl. a pre-reduction pointwise x*x streamed per stats chunk and pruned from apply).
         """
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
@@ -910,7 +932,7 @@ class TestAutoFuse:
                 return pl.sub(x, m)
 
         @pl.program
-        class RmsLike:  # pre-reduction pointwise (x*x) recomputed per chunk + reduction -> pointwise
+        class RmsLike:  # x*x runs per stats chunk; dependency-pruned apply needs only x and final ms
             @pl.function(attrs={"auto_fuse": True})
             def rms(self, x: pl.Tensor[[128, 16384], pl.FP32]) -> pl.Tensor[[128, 16384], pl.FP32]:
                 sq: pl.Tensor[[128, 16384], pl.FP32] = pl.mul(x, x)
@@ -1043,9 +1065,7 @@ class TestAutoFuse:
         exec(code, namespace)  # noqa: S102
 
         def _ref(x):
-            return (x - x.mean(-1, keepdim=True)) / torch.sqrt(
-                x.var(-1, keepdim=True, unbiased=False) + eps
-            )
+            return (x - x.mean(-1, keepdim=True)) / torch.sqrt(x.var(-1, keepdim=True, unbiased=False) + eps)
 
         torch.manual_seed(0)
         for shift in (0.0, 100.0, 1000.0, 2000.0):

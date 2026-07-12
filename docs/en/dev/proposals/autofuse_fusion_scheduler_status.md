@@ -45,9 +45,9 @@ model assumes** and **what the emit must therefore build** (obligations A1–A7)
 | A2 | ephemeral intermediates cost **0 DDR** (the fusion win) | keep intermediates on-chip (UB), never round-trip them |
 | A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to the tile; read `FIXED_1`/broadcast in full |
 | A4 | UB feasibility = peak live bands over the **pebbling order** | replay ops in `dfs_order_`; MemoryReuse frees bands per liveness |
-| A5 | roofline `max(compute, DDR)` (load k+1 overlaps compute k) | emit the per-core loop **software-pipelined** (`ForKind::Pipeline`, stage 2) |
+| A5 | roofline overlap is phase-local | emit only eligible rolled loops **software-pipelined**; keep init/tail/finalize serial |
 | A6 | reduced-axis split `S` = S cores reduce + **atomic-add** merge | build seed + atomic-add, or don't price a split the emit declines |
-| A7 | a streamed spanning reduction reads each input **twice** | stream with running stats (flash); price `io_in×2` |
+| A7 | streamed input multiplicity follows phase use | stream with running stats and price stats/apply traffic per input |
 
 **The rule of thumb** (contract §6): *before trusting a cost, ask — what algorithm does this number
 assume, and does the emit build exactly that, with the same operand tile shapes (A3), the same band
@@ -93,7 +93,7 @@ row/column can't be materialized; you must **stream it in blocks carrying runnin
 online/flash algorithm. This yielded the **P-ladder**: P1 (bare reduction, trivial online), P2
 (reduction → spanning pointwise apply, 2 passes), P3 (naive multipass, retired), **P4 (online
 multi-stat: softmax `(m,l)` flash rescale, layernorm running moments)**. A7 prices the read count
-(`io_in×2` for a spanning output); the correctness gate declines non-foldable reductions (order
+(`x` is normally read twice for a spanning output; apply-only inputs once); the correctness gate declines non-foldable reductions (order
 statistics can't flash).
 
 **(f) Device grounding (the model is a validated decision oracle).** The model's *ranking* was
@@ -105,7 +105,8 @@ cheapest plan (free-tile ρ≈0.9, zero regret). Two grounding refinements came 
   device-measured 0.2 µs/task (calibrated by the ~6.5× model↔wall factor). Device-confirmed **no
   regret**. Gated on the generic streaming emit (only it can build the fewer/larger-tile plans C3
   prefers — pricing them for the legacy tiler would pick tiles it can't realize).
-- **G3 — spanning streamed reductions read input twice.** Device-confirmed 2.00× MTE2 → `io_in×2`.
+- **G3 — spanning streamed reductions re-read shared input.** Device-confirmed 2.00× MTE2 for `x`;
+  phase masks avoid doubling apply-only operands.
 - **R0 — couple the reduced axis to its full extent in `vector_peak_ub`**, else a bare reduction sink
   (thin `[·,1]` output) looks materialized and streaming is never detected.
 
@@ -119,18 +120,21 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
 
 - **Emit** — `src/ir/transforms/auto_fuse_pass.cpp`:
   - `AnalyzeP4Patterns` + `ProblemBuilder::Build` — DAG → solver `Problem`; one exact semantic
-    analysis recognizes canonical softmax / dual-sum layernorm, records each complete op set in
-    `Problem::p4_patterns`, and retains the same `P4Match` handles for emission. The analytic
+    analysis recognizes canonical softmax / dual-sum layernorm, records each complete op set plus
+    its apply substitutions in `Problem::p4_patterns`, and retains the same `P4Match` handles for
+    emission. The analytic
     multi-reduction override stays false in AutoFuse, so other candidate groups cut. Registers only
     **top-level** `var = <call>` ops → a nested-arg call drops the inner op (a known landmine).
-  - `EmitFusedGroupGeneric` (~:1296) — the **vector** emit. Sub-paths: pointwise (UB-streamed strips,
-    `strip_fits`, width-chunk `num_wstrips`), streamed reductions P1/P2 (`stream_p1/p2`,
+  - `EmitFusedGroupGeneric` (~:1296) — the **vector** emit. Sub-paths: solver-planned pointwise /
+    materialized row+width strips, streamed reductions P1/P2 (`stream_p1/p2`,
     `emit_strip`/`strip_at`/`slice_input`), **P4** (consumes the shared exact `P4Match`; softmax
     `p4_chunk` custom `(m,l)` body; exact layernorm → Welford), multi-sink, S2 split-K, broadcast (G4).
     Folded P1 may finish with a thin pointwise cone once, without a spanning second input pass.
-    P1/P2/P4 materialize-vs-stream, chunk/tail, and loop stages are re-derived for the winning config
+    P1/P2/P4 materialize-vs-stream, chunk/tail, serial phases, and loop stages are re-derived for the
+    winning config
     with the same `vector_stream_plan` helper used during pricing; an internal check verifies the
-    local loop construction matches it. Emit descriptors are not retained in the local-search cache.
+    local loop construction matches it. Shared carried-loop and spanning-apply builders serve P2,
+    softmax, and Welford. Emit descriptors are not retained in the local-search cache.
   - `TileMatmul` (~:813) / `BuildTileMatmul` (k-pipeline) / `EmitLoneMatmulGeneric` — the **cube** emit.
   - Flag helpers `GenericEmitEnabled()`, `P4Enabled()` (re-read env per call).
 - **Cost model** — `3rdparty/mlsys26/src/core/ascend910b_cost.cpp` (+ `types.h`, `dag.h`), branch
@@ -142,8 +146,8 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
 - **Build (MAX 2 cores):** `cmake --build build --parallel 2`;
   `cmake --build 3rdparty/mlsys26/build --target solver_lib -j2`.
 - **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 4`
-  (26 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
-  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (332 pass / 7 documented baseline failures). Numeric:
+  (27 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
+  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (338 pass / 7 documented baseline failures). Numeric:
   `pypto.debug.torch_codegen(passes.auto_fuse()(Prog), run_all_spmd_blocks=True)` — write P4 DSL FULLY
   NAMED (nested args drop ops from the solver graph → miss P4).
 
@@ -152,8 +156,9 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
 ## 5. What is implemented and validated
 
 **Vector emit** (behind `GENERIC_EMIT`):
-- Pointwise: fused chains, UB-streamed strips sized by **real peak-liveness** (`strip_fits`, +1 prefetch
-  band), **width-chunking** for wide tiles. Tall / wide / reused-input all handled within UB.
+- Pointwise: fused chains, UB-streamed row+width strips sized by **real peak-liveness** (+1 prefetch
+  band) in `VectorStreamPlan`; the emitter consumes that geometry. Tall / wide / reused-input all
+  handled within UB.
 - Reductions: P1 (bare) + P2 (spanning apply), streamed over the reduced axis, **both passes pipelined
   (A5/G2)** — accumulator persists, loads double-buffer; numerically exact.
 - Broadcast operands (G4), multi-sink, S2 cross-core split-K.
@@ -172,10 +177,13 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
 `[272,272]`→spmd(8), torch-exact; forcing an untiled 1×1 crashes, so G-A is load-bearing), ragged-K
 peel, deep-T chained (tensor-level; #1908-xfail at lowering). k-loop is `ForKind::Pipeline`.
 
-**Cost model:** C3 per-task overhead (device-validated no-regret), G3 `io_in×2`, R0 reduced-axis
-coupling, granule-padded feasibility, and candidate-local P4 feasibility. The stack-local
-`VectorStreamPlan` records the pebble/scratch peaks, owns streamed-reduction chunk geometry, and gates
-A5 overlap on actual stats/apply stages; AutoFuse re-derives it for the winning config. `CostResult`
+**Cost model:** C3 per-task overhead (device-validated no-regret), per-input G3 phase traffic, R0
+reduced-axis coupling, granule-padded feasibility, the reduction source/work two-band floor, and
+candidate-local P4 feasibility. The stack-local
+`VectorStreamPlan` records pebble/scratch peaks; owns materialized/pointwise strips and streamed-reduction
+init/rolled/tail/finalize phases; and gates each phase's A5 overlap on its actual loop stage. Cost is
+the sum of phase rooflines, so barriers never hide work across phases. AutoFuse re-derives the plan for
+the winning config. `CostResult`
 stays at its pre-refactor 112-byte footprint (guarded at ≤128 bytes) for the local-search cache.
 
 **Device-validated on 910B2:** tall pointwise streaming, C3 no-regret, cube G-A + ragged-K (all
@@ -210,31 +218,27 @@ and split-K-seed fixes hold); the *bugs* were all in P4 and masked by P4-off def
   `sum(x)` and `sum(2*x*x)` was silently reinterpreted as layernorm. → one exact `P4Match` analysis is
   shared by model and emit; only the canonical layernorm algebra reaches Welford, every near miss cuts.
 
-**Architectural debt:** the duplicated cost-gate ↔ emit-classifier predicate is now removed. The
-apply/accumulate loop remains triplicated (P2 / softmax / Welford) — extract one shared pipelined helper.
+**Architectural debt paid down:** the duplicated cost-gate ↔ emit-classifier predicate is removed;
+P2/softmax/Welford share one planned carried-loop constructor and one spanning-apply builder. Their
+statistics update math remains deliberately algorithm-specific.
 
 ---
 
 ## 7. What remains (ordered)
 
-1. **Finish A5 phase fidelity:** short streamed-reduction loops now use `compute + DDR`. Split the
-   remaining global roofline into `Σphase roofline(phase)` so stats compute cannot overlap apply DDR
-   across their barrier; then make materialized/pointwise strip scheduling solver-owned. Extract the
-   shared pipelined stats/apply-loop builder (P2 / softmax / Welford) while doing that.
-2. **Push** the batch (`5e7c76b6..HEAD`) via port 443, submodule first.
-3. **Device verification** (`autofuse_device_verify_g2_p4.md`, held until now): T1 the crash fixes, T2
+1. **Push** the batch (`5e7c76b6..HEAD`) via port 443, submodule first.
+2. **Device verification** (`autofuse_device_verify_g2_p4.md`, held until now): T1 the crash fixes, T2
    G2 perf, T3 P4 softmax+layernorm fuse + numeric + **wall-vs-cut** (with `P4=1`). Add the review's
    must-checks: temperature/scaled softmax must CUT (not crash) on device; layernorm accuracy at
    non-zero mean. Decisive question: is fused P4 faster-or-tied vs the cut on silicon (softmax may be
    compute-bound → the accumulate pipelining matters)?
-4. **P4 increment 3 — flip to default** (retire `PYPTO_AUTOFUSE_P4`) — only after device sign-off; will
+3. **P4 increment 3 — flip to default** (retire `PYPTO_AUTOFUSE_P4`) — only after device sign-off; will
    need to re-point 2 tests that assert the pre-P4 cut.
-5. **P4 increment 4 — cost fidelity:** scale the apply-cone recomputed compute (common-mode with the
-   cut, so low priority); price the split-K seed; reconcile G5 grid divergence.
+4. **P4 increment 4 — remaining cost fidelity:** price the split-K seed and reconcile G5 grid divergence.
 
 **Deferred (all decline *gracefully* today — correctness intact, not fused):** the ProblemBuilder
-nested-arg gap (hoist nested compute-call args to SSA temps); the stream-trigger 2-band count (#20);
-P4 col-softmax / scale-then-softmax / chained layernorm; wide-pointwise width-stream fidelity; the cube
+nested-arg gap (hoist nested compute-call args to SSA temps); P4 col-softmax / scale-then-softmax /
+chained layernorm; the cube
 ragged-K peel lowering test + deep-T decline logging; mixed cube+vector (a separate charter).
 
 ---
