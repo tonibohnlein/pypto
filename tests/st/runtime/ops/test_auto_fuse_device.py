@@ -28,6 +28,7 @@ TWO parts:
     ``PYPTO_AUTOFUSE_GENERIC_EMIT=1``, numerically verified against a torch reference on hardware.
     The wide P4 cases enable ``PYPTO_AUTOFUSE_P4=1`` in the test itself and cover online softmax,
     Welford layernorm, and a scaled-softmax near miss that must take the ordinary cut path.
+    A wide P2 case has an apply-only bias input, giving the profiler a direct phase-traffic check.
     The return->named-output wiring is handled by the compiler (AutoFuse lifts the returned buffer
     into an appended Out param -> orchestration codegen emits the add_output write-back), so these
     return-based programs bind their output by position ([x, out]) in the harness.
@@ -555,6 +556,45 @@ class AutoFuseP4ScaledSoftmaxWideCase(PTOTestCase):
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         tensors["out"][:] = torch.softmax(tensors["x"] * 0.125, dim=-1)
+
+
+class AutoFuseP2ApplyInputWideCase(PTOTestCase):
+    """Wide P2 with x read in both phases and bias read only by the apply phase."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_p2_apply_input_128x8192"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [P4_M, P4_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("bias", [P4_M, P4_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [P4_M, P4_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def submax_bias(
+                self,
+                x: pl.Tensor[[P4_M, P4_N], pl.FP32],
+                bias: pl.Tensor[[P4_M, P4_N], pl.FP32],
+            ) -> pl.Tensor[[P4_M, P4_N], pl.FP32]:
+                maximum: pl.Tensor[[P4_M, 1], pl.FP32] = pl.row_max(x)
+                centered: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.row_expand_sub(x, maximum)
+                out: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.add(centered, bias)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        tensors["out"][:] = x - x.amax(dim=-1, keepdim=True) + tensors["bias"]
 
 
 class AutoFusePwWideShortCase(PTOTestCase):
@@ -1375,6 +1415,12 @@ class TestAutoFuseDevice:
         monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
         result = test_runner.run(AutoFuseP4ScaledSoftmaxWideCase(platform=platform))
         assert result.passed, f"Scaled-softmax P4 near miss [128,8192] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_p2_apply_input_wide(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFuseP2ApplyInputWideCase(platform=platform))
+        assert result.passed, f"P2 apply-only input [128,8192] mismatch on device: {result.error}"
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_autofuse_pw_wide_short(self, test_runner, platform):
