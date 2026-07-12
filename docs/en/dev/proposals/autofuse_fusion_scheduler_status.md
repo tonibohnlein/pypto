@@ -128,13 +128,14 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
     `emit_strip`/`strip_at`/`slice_input`), **P4** (consumes the shared exact `P4Match`; softmax
     `p4_chunk` custom `(m,l)` body; exact layernorm → Welford), multi-sink, S2 split-K, broadcast (G4).
     Folded P1 may finish with a thin pointwise cone once, without a spanning second input pass.
-    P1/P2/P4 materialize-vs-stream, chunk/tail, and loop stages come from the winning
-    `CostResult::vector_stream`; an internal check verifies the local loop construction matches it.
+    P1/P2/P4 materialize-vs-stream, chunk/tail, and loop stages are re-derived for the winning config
+    with the same `vector_stream_plan` helper used during pricing; an internal check verifies the
+    local loop construction matches it. Emit descriptors are not retained in the local-search cache.
   - `TileMatmul` (~:813) / `BuildTileMatmul` (k-pipeline) / `EmitLoneMatmulGeneric` — the **cube** emit.
   - Flag helpers `GenericEmitEnabled()`, `P4Enabled()` (re-read env per call).
 - **Cost model** — `3rdparty/mlsys26/src/core/ascend910b_cost.cpp` (+ `types.h`, `dag.h`), branch
-  `ascend-910b-vector-stream-plan`, linked as `solver_lib`. `VectorStreamPlan` is derived once per
-  candidate, carried by `CostResult`, and consumed by AutoFuse for streamed reductions.
+  `ascend-910b-vector-stream-plan`, linked as `solver_lib`. `VectorStreamPlan` is stack-local while
+  pricing candidates and re-derived only for final/forced configs consumed by AutoFuse.
 - **Flags:** `PYPTO_AUTOFUSE_GENERIC_EMIT`, `PYPTO_AUTOFUSE_P4`, `PYPTO_AUTOFUSE_FORCE_PLAN`
   (`"[g<N>:]w,h,split[,pm,pn]"`, **static-cached per process** → one force per fresh subprocess),
   `PYPTO_AUTOFUSE_FORCE_MERGE=none|all`, `PYPTO_AUTOFUSE_DUMP_PLANS`, `PYPTO_AUTOFUSE_STRICT`.
@@ -142,7 +143,7 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
   `cmake --build 3rdparty/mlsys26/build --target solver_lib -j2`.
 - **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 4`
   (26 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
-  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (325 pass / 7 documented baseline failures). Numeric:
+  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (332 pass / 7 documented baseline failures). Numeric:
   `pypto.debug.torch_codegen(passes.auto_fuse()(Prog), run_all_spmd_blocks=True)` — write P4 DSL FULLY
   NAMED (nested args drop ops from the solver graph → miss P4).
 
@@ -172,9 +173,10 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
 peel, deep-T chained (tensor-level; #1908-xfail at lowering). k-loop is `ForKind::Pipeline`.
 
 **Cost model:** C3 per-task overhead (device-validated no-regret), G3 `io_in×2`, R0 reduced-axis
-coupling, granule-padded feasibility, and candidate-local P4 feasibility. `VectorStreamPlan` caches
-the pebble peak and emitted scratch-band peak, owns streamed-reduction chunk geometry, and gates A5
-overlap on the actual stats/apply pipeline stages; AutoFuse consumes that winning plan.
+coupling, granule-padded feasibility, and candidate-local P4 feasibility. The stack-local
+`VectorStreamPlan` records the pebble/scratch peaks, owns streamed-reduction chunk geometry, and gates
+A5 overlap on actual stats/apply stages; AutoFuse re-derives it for the winning config. `CostResult`
+stays at its pre-refactor 112-byte footprint (guarded at ≤128 bytes) for the local-search cache.
 
 **Device-validated on 910B2:** tall pointwise streaming, C3 no-regret, cube G-A + ragged-K (all
 correct). Two device-found crashes (reused-input pointwise, split-K seed) fixed.
