@@ -323,9 +323,9 @@ running accumulator or P4 `(m,l)` / Welford `(mean,M2,count)` IterArgs) and the 
 `RewriteReturnedAssembleLoopToStore`). `LowerPipelineLoops` double-buffers only the per-chunk load
 while keeping loop-carried state single-buffered/persistent. Pipelined only when the rolled chunk trip
 is at least 2 (nothing to overlap otherwise). `VectorStreamPlan` now owns the reduction chunk and
-trip counts, the emitter consumes it, and `compute_cost` grants overlap only when every streamed
-data-moving phase is stage-2. Remaining A5 work is per-phase roofline summing plus the
-materialized/pointwise strip plan.
+trip counts; `compute_cost` uses it as a stack-local derivation and the emitter re-derives the same
+plan for the winning config. Overlap is granted only when every streamed data-moving phase is
+stage-2. Remaining A5 work is per-phase roofline summing plus the materialized/pointwise strip plan.
 
 ### ⚠️ Cost fidelity
 

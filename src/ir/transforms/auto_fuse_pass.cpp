@@ -3748,8 +3748,16 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     for (size_t s = 0; s < sol.num_steps(); ++s) {
       const ::TileConfig& cfg = sol.step(s).config;
       const ::CostResult& selected_cost = sol.step_cost(s);
+      // CostResult is the hot local-search cache value and deliberately carries
+      // no emit descriptor. Reconstruct the stream algorithm only for this final
+      // winning configuration, using the same helper candidate pricing used.
+      const ::VectorStreamPlan selected_stream =
+          !sol.step(s).subgraph.has_matmul()
+              ? sol.step(s).subgraph.vector_stream_plan(
+                    cfg, sol.retained_entering(s), sol.step(s).retain_these)
+              : ::VectorStreamPlan{};
       SolverTile tile{cfg.w, cfg.h, cfg.k, selected_cost.parallel_split, cfg.parts_m, cfg.parts_n,
-                      selected_cost.vector_stream};
+                      selected_stream};
       if (dump_plans || force_env != nullptr) {
         bool forced_here = false;
         std::set<std::tuple<int64_t, int64_t, size_t, int64_t, int64_t>> seen_plans;  // dedup identical keys
@@ -3763,8 +3771,12 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
               (fw < 0 || pc.w == fw) && (fh < 0 || pc.h == fh) &&
               (fs < 0 || static_cast<long>(pr.parallel_split) == fs) &&
               (fpm < 0 || pc.parts_m == fpm) && (fpn < 0 || pc.parts_n == fpn)) {
+            const ::VectorStreamPlan forced_stream =
+                !sol.step(s).subgraph.has_matmul()
+                    ? sol.step(s).subgraph.vector_stream_plan(pc)
+                    : ::VectorStreamPlan{};
             tile = SolverTile{pc.w, pc.h, pc.k, pr.parallel_split, pc.parts_m, pc.parts_n,
-                              pr.vector_stream};
+                              forced_stream};
             forced_here = true;
             LOG_INFO << "AutoFuse[" << func->name_ << "]: FORCED group=" << s << " w=" << pc.w << " h="
                      << pc.h << " split=" << pr.parallel_split << " parts_m=" << pc.parts_m
