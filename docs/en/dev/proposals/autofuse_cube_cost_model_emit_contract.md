@@ -4,98 +4,133 @@
 
 This contract covers homogeneous AIC groups containing only `tensor.matmul` operations. Mixed
 cube/vector kernels remain a separate charter. Unlike vector reductions, a cube group needs no
-online softmax/Welford algorithm: every operation is a matrix contraction. The hard part is still
-algorithmic fidelity—spatial ownership, recursive operand regions, L1-resident intermediates,
-per-operation K streams, and split-K must describe the same kernel in the model and emitter.
+online softmax/Welford algorithm: every operation is a matrix contraction. Its fidelity problem is
+nevertheless non-trivial—spatial ownership, recursive operand regions, L1-resident intermediates,
+per-operation K streams, L0 subdivision, and split-K must describe the same kernel in the model and
+emitter.
 
-A `CubeSchedulePlan` is the solver-owned specification for one fixed `TileConfig` and selected
-parallel split. Candidate evaluation keeps only the compact cost result plus the lightweight
-peak/per-op-K derivation it needs. The full plan is rediscovered once for a winning or forced
-configuration; it is deliberately absent from `CostResult`.
+A solver-owned `CubeSchedulePlan` specifies one fixed `TileConfig` and selected parallel split. The
+candidate-invariant request DAG is built once in `Ascend910BCost::create()`. Candidate evaluation
+uses that compact topology plus an O(nodes) window/peak derivation; it does **not** put a complete
+plan into `CostResult` or the local-search cache. AutoFuse re-derives the full plan only for a winning
+or explicitly forced configuration.
 
-The kernel is discovered from each sink backwards, because a consumer determines the exact region
-it needs from each producer. Execution is nevertheless producer-before-consumer in the solver's
-`execution_order()`. A producer is memoized by `(tensor, requested region)` within one work unit;
-shared producers are not recomputed unless the cost explicitly includes that recomputation.
+Each sink request is discovered backwards because a consumer determines the exact region it needs
+from each producer. Plan replay is producer-before-consumer. A producer is memoized by
+`(tensor, height binding, width binding)` within one work unit. Identical requests are shared by the
+model; distinct fan-out roles become distinct schedule instances and are explicitly recomputed.
 
 ## 2. Obligations
 
-| # | The model assumes | The emitter must build |
-|---|---|---|
-| C1 | `parts_m × parts_n × split_k` independent work units | The exact disjoint spatial partitions and K shares, with one SPMD body per work unit |
-| C2 | Only boundary operands and boundary outputs touch DDR | Every ephemeral matmul result remains in L1/Acc and never round-trips GM |
-| C3 | A consumer back-propagates an exact row/column region to each operand | LHS gets the consumer's output rows plus K; RHS gets K plus the consumer's output columns, including producers on either input |
-| C4 | Peak L1 is the live-band pebble peak in `execution_order()` | Emit in that order, materialize each requested intermediate once, and release it at its priced last use |
-| C5 | Each matmul has its own L1 window and GM→L1 K stream | Use that operation's planned load chunk, rolled-loop stage, and serial tail; never reuse the sink K for every operation |
-| C6 | A large solver region is subdivided into pto-isa L0 accumulator tiles | Explicitly compute L0c-fitting subtiles when a tensor-level `matmul_acc` would otherwise materialize the full region |
-| C7 | A stage-2 roofline hides GM traffic only behind a real rolled loop | Grant `max(compute, DDR)` only to a loop with two simultaneously fitting load buffers and enough rolled iterations; price serial init/tail separately |
-| C8 | Sink split-K writes `S` partials with atomic add | Emit a zero seed/barrier and exactly `S` disjoint K shares per spatial region, or price/choose `S=1` |
-| C9 | Ragged regions and K tails perform specified extra work | Use the planned balanced region geometry and an explicit serial, 16-aligned K tail; include both in cost |
+| Ref | The model assumes | The emitter must build |
+| --- | ----------------- | ---------------------- |
+| C1 | `parts_m × parts_n × split_k` independent work units | The same spatial regions and K shares, with one SPMD body per work unit |
+| C2 | Only boundary operands and boundary outputs touch GM | Keep every ephemeral result in L1/Acc; never use GM as an implicit chain buffer |
+| C3 | Consumers back-propagate exact row/column requests | Slice LHS as `[requested rows,K]` and RHS as `[K,requested cols]`, including produced operands on either side |
+| C4 | Peak L1 is the live-region pebble peak in request order | Replay producer-before-consumer, retain regions through their priced last use, and allocate no unpriced live scratch |
+| C5 | Every matmul owns an L1 window and K loop | Use that instance's contraction, chunk, rolled-loop stage, and serial tail; never reuse the sink K loop globally |
+| C6 | A requested region is subdivided into grounded L0 accumulator tiles | Use the plan's L0 M/N sizes and explicitly assemble every L0 result into its planned L1 or boundary destination |
+| C7 | GM traffic overlaps compute only behind a real stage-2 rolled loop | Grant `max(compute,DDR)` only when every contributing boundary-load phase can ping-pong; serialize init and tail work |
+| C8 | Sink split-K writes `S` partials with atomic add | Emit a zero seed and exactly `S` disjoint K shares per spatial region, or choose/price `S=1` |
+| C9 | Reload counts include the actual loop nest and reuse | Charge every GM→L1 load induced by L0 subdivision, while crediting reuse only when the emitter retains that panel |
 
-## 3. General matmul-DAG region propagation
+## 3. General matmul-DAG request propagation
 
 For a requested output region `O[rows, cols]` of `O = A @ B`:
 
 - request `A[rows, K]` from the left input;
 - request `B[K, cols]` from the right input;
-- stream boundary portions along K using this operation's K-loop plan;
-- recursively produce an internal operand at that requested orientation.
+- recursively produce an internal operand at exactly that requested orientation;
+- stream boundary portions along this operation's own K-loop plan.
 
-This rule naturally supports deep trees, a produced RHS, and a sink whose two operands are both
-produced. It also exposes why the historical full-width M-band formula is not general: that formula
-is correct for an intermediate used as a left operand, but a produced right operand needs a
-full-K/N-band instead. Fan-out can yield multiple requested regions for one tensor. Identical
-requests are shared; different requests are either separately priced computations or make the
-candidate unsupported until a materialization strategy is modeled.
+This rule supports deep chains and trees, a produced RHS, both inputs produced, non-square internal
+shapes, fan-out, and multiple sinks. It replaces the historical shared-M/full-N shortcut: an
+intermediate used as a left operand needs a row band, while one used as a right operand needs a
+column band. A tensor used in both roles can therefore have two producer instances. Identical
+requests may instead share one instance and remain live until their last consumer.
 
-Parallel split-K applies only to the selected boundary sink. An internal producer feeding that
-sink may be recomputed per K-share only if the compute term includes it. Otherwise the plan must
-produce the exact K subregion needed by the sink. Multiple boundary sinks require one seed and
-atomic target per sink and must not be represented by one implicit split coordinate.
+With one sink, its contraction can bind to `ParallelK`: each work unit requests only its K share
+from either boundary or produced operands. All internal contractions remain independent sequential
+K streams. Multiple sinks currently force `split_k=1`, because a single solver split coordinate
+cannot identify multiple atomic targets.
 
-## 4. Current implementation status
+## 4. Implemented state (2026-07-12)
 
-Implemented in the first `CubeSchedulePlan` increment:
+The solver now provides:
 
-- final/forced-plan reconstruction in `mlsys26`, including exact grid counts, split, execution
-  order, peak L1, per-op resident window, actual load chunk, loop stage, and ragged tail;
-- solution JSON serialization and direct AutoFuse handoff without enlarging `CostResult`;
-- cost-path removal of the previous duplicate `derive_exec` call;
-- lone-matmul emission consumes the planned K loop;
-- solver regions larger than L0c are explicitly subdivided within the 128×256 bounds used by the
-  grounded Phase-D model, with exact disjoint ragged edge tiles, so K accumulation no longer
-  allocates one oversized Acc/UB tensor or requires divisor-shaped tiles;
-- split-K seed/atomic emission remains active, with numeric tests for exact and ragged K streams;
-- characterization marks a produced RHS as `emit_compatible=false`; strict validation fails loudly
-  before the legacy pair matcher can consume it, while production uses dependency-ordered
-  standalone matmuls as a correctness fallback.
+- a candidate-invariant recursive request DAG, memoized by tensor and axis bindings;
+- role-aware feasibility, live-region peak L1, boundary reload, cube MAC/extract work, and
+  recomputation for arbitrary pure-matmul DAGs; MAC/extract precision follows operand dtype rather
+  than the often-FP32 accumulator/output dtype;
+- one `CubeMatmulSchedule` per request instance with producer dependencies, concrete regions,
+  contraction/share, L1 window, pipelined K chunk, full trips, tail, and L0 M/N tile sizes;
+- producer-before-consumer execution order, roots, split/work-unit counts, seed requirement, and
+  overlap/buildability bits in the reconstructed `CubeSchedulePlan`;
+- a conservative overlap gate: a global cube roofline receives `max(compute,DDR)` only when every
+  boundary-loading request instance reconstructs a real stage-2 rolled K loop. The former scalar
+  `K/S >= 32` test could grant overlap to a one-trip loop and is retired;
+- a buildability gate used by AutoFuse that enumerates only uniform M/N grids for multi-matmul
+  groups. Analytic solver use remains unrestricted, and lone matmuls retain their established
+  balanced-grid search space.
 
-The extraction is cost-preserving. In particular, it has not yet replaced the historical
-`K/S ≥ 32` roofline gate. A characterized 64×64 matmul reaches per-core K=32: the model grants
-overlap, while the concrete plan has only a serial matmul (`model_overlap_granted=true`,
-`overlap_implementable=false`). Keeping both bits makes the gap explicit without changing solver
-argmins in the descriptor commit.
+The generic AutoFuse emitter now consumes that plan for buildable multi-matmul groups. It:
 
-Known gaps before general-DAG emission is trustworthy:
+- replays schedule instances in producer-before-consumer order and uses exact plan bindings for
+  spatial offsets, K-share offsets, produced LHS/RHS values, and deep trees;
+- recomputes a shared producer for distinct fan-out roles exactly when the plan has distinct
+  instances, while materializing an identical request once;
+- keeps small intermediates local and assembles an intermediate spanning several L0 tiles into an
+  explicit L1 tensor for its consumer;
+- emits each planned K rolled loop as stage-2 pipeline plus a serial tail;
+- emits one seed SPMD scope plus atomic root stores for split-K, and direct stores for `S=1`;
+- handles multiple roots at `S=1` and lowers a large-L1-intermediate chain through the default pass
+  stack.
 
-- the plan still records the historical shared-M/full-N internal-band algorithm; role-aware
-  recursive regions are the next solver increment;
-- `TileChainedMatmul` does not yet consume every per-op plan field and still has an emitter-owned
-  deep-intermediate panel choice;
-- balanced disjoint non-uniform regions are not yet emitted exactly for atomic split-K;
-- the global cube roofline must be replaced with phase-local serial init/tail plus rolled-loop
-  rooflines; the correction must be a separate, measured cost-model change;
-- split seed/barrier cost is not represented;
-- mixed cube/vector cost and emission are outside this contract.
+If exact replay is unavailable, strict mode fails with the rejected contract condition. Production
+mode falls back to dependency-ordered standalone matmuls rather than silently emitting a different
+fused algorithm.
 
-## 5. Validation ladder
+## 5. Remaining fidelity work
 
-1. Solver characterization: fixed costs, L1 peak, execution order, per-op windows, produced-LHS,
-   produced-RHS, both-input-produced, fan-out, deep chains, multi-sink, and compact cache size.
-2. Host numeric/codegen: lone and deep DAGs, exact/ragged K, non-uniform M/N, split/no-split,
-   produced operands on both sides, shared producers, and lowering through the default pass stack.
-3. Forced-plan device correctness: output versus Torch and confirmation that no intermediate
-   appears in GM traffic.
-4. Device performance/model validation: grid occupancy, per-op MTE2/Matrix overlap, split seed
-   overhead, ragged tails, and forced-plan ranking/regret. Compare model cycles to wall time only
-   through the established calibration; do not fit the model to one shape.
+These gaps prevent calling the cube path complete or using it as a device-ranking oracle:
+
+1. **L0-subtile reload multiplicity (C9).** `cube_request_reload()` charges each logical boundary
+   request once per work unit. The current emitter nests a complete K stream inside every L0 output
+   subtile. If an output region has three L0-N subtiles, for example, its LHS panel is loaded three
+   times. `CubeExtractCycles` prices the corresponding L1→L0 reuse, but GM→L1 currently assumes a
+   stronger retained-panel algorithm. Either the cost must multiply traffic by the emitted M/N
+   subtile loop, or the emitter must use a K-outer retained-panel algorithm and price its partial
+   accumulator/L1 traffic.
+2. **Phase-local cube rooflines (C7).** The serial-loop fiction is closed conservatively, but the
+   cost still applies one global `max` or `sum` to all request instances. It must become a sum of
+   per-node init/rolled/tail/store phases so serial tails are never hidden by unrelated work.
+3. **Non-uniform grids (C1).** A multi-op plan with unequal balanced region shapes is filtered by
+   the AutoFuse buildability gate. The legacy lone-matmul ceil+clamp emitter is numerically
+   idempotent but can execute more max-size work than the balanced-grid cost. Exact non-uniform
+   static-shape emission or matching cost remains open.
+4. **Shared boundary-panel lifetime (C4/C9).** The model deduplicates identical boundary requests.
+   Until an explicit shared L1 panel and its lifetime are represented, the plan emitter declines
+   such a group instead of emitting duplicate unpriced loads.
+5. **Seed and launch cost (C8).** The vector zero-seed/barrier and per-task launch overhead are not
+   yet included in the cube candidate cost.
+6. **Low-precision final outputs.** Floating K carries accumulate in FP32. Until the plan represents
+   a final FIXPIPE narrowing phase, a streamed/split cube plan whose root is FP16/BF16 declines to
+   the original standalone matmul rather than building an ill-typed low-precision accumulator.
+7. **Device grounding.** Host tests validate structure, numerics, and lowering; they do not validate
+   wall time, MTE2/Matrix overlap, traffic multiplicity, atomic behavior, or plan ranking on 910B2.
+
+Mixed cube/vector fusion is outside this contract.
+
+## 6. Validation ladder
+
+1. Solver unit tests: fixed lone-matmul anchors; exact regions and L1 peak for produced-LHS,
+   produced-RHS, both-input-produced, fan-out role switches, deep chains, multi-sink; compact cache;
+   and a one-trip loop that must not receive overlap.
+2. Host numeric/codegen: lone and recursive DAGs, exact/ragged K, split/no-split, non-square produced
+   operands, fan-out, multiple outputs, large L1 intermediates, strict rejection, and lowering
+   through the default pass stack.
+3. Forced-plan device correctness: compare every output with Torch and inspect traces to confirm
+   that intermediates do not touch GM unexpectedly.
+4. Device performance/model validation: measure per-op MTE2/Matrix overlap, L0-subtile input reloads,
+   split seed/atomic overhead, ragged tails, grid occupancy, and forced-plan ranking/regret. Compare
+   model cycles to wall time only through the established calibration; do not fit to one shape.
