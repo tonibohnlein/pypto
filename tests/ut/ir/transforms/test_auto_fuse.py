@@ -21,11 +21,15 @@ one kernel. The Outline/Convert/Tile pipeline then lowers each scope to a cube
 """
 
 import json
+import os
 import re
+import subprocess
+import sys
+import textwrap
 
 import pypto.language as pl
 import pytest
-from pypto import codegen, ir, passes
+from pypto import InternalError, codegen, ir, passes
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 # These tests were rewritten against the grounded SPMD emit: the pre-grounding cost model
@@ -202,6 +206,65 @@ class TestAutoFuse:
         cube_mlir = codegen.PTOCodegen().generate(ir.Program([cube], cube.name, cube.span))
         assert "cube" in cube_mlir and "atomic_add" in cube_mlir  # split-K merge
 
+    def test_ragged_cube_region_subdivides_l0c_exactly(self):
+        """A ragged solver work unit larger than L0c uses exact, non-overlapping subtiles.
+
+        ``PYPTO_AUTOFUSE_FORCE_PLAN`` is cached on first use, so this experiment must run
+        in a fresh process. The forced 144x272 solver tile clamps to the full 130x260
+        output. That region is just over L0c capacity, so it must split into one 128x256
+        base accumulator plus exact ragged edge tiles (down to 2x4), instead of crashing,
+        overlapping atomic regions, or degenerating to one-element tiles. Numeric execution
+        verifies complete coverage.
+        """
+        script = textwrap.dedent(
+            """
+            import torch
+
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mm(
+                    self,
+                    a: pl.Tensor[[130, 64], pl.FP32],
+                    b: pl.Tensor[[64, 260], pl.FP32],
+                ) -> pl.Tensor[[130, 260], pl.FP32]:
+                    c: pl.Tensor[[130, 260], pl.FP32] = pl.matmul(a, b)
+                    return c
+
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "mm").as_python()
+            assert body.count("pl.tensor.matmul(") == 4
+            assert "[128, 256]" in body
+            assert "[2, 4]" in body
+
+            namespace = {}
+            exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            a = torch.randn(130, 64, dtype=torch.float32)
+            b = torch.randn(64, 260, dtype=torch.float32)
+            out = namespace["mm"](a, b)
+            assert torch.allclose(out, a @ b, rtol=1e-4, atol=1e-4)
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "272,144,1,1,1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
     def test_nonuniform_matmul_tiles_via_ceil_clamp_grid(self, ascend_backend):
         """A matmul whose solver tile does NOT divide the output tiles via a ceil+clamp
         SPMD grid (the G-A fix for the "matmul-tiling gap").
@@ -287,14 +350,14 @@ class TestAutoFuse:
         """A matmul whose per-core contraction slice does NOT divide evenly by the solver's
         k-tile pipelines the full k-strips + one matmul_acc tail (ragged-K peel).
 
-        ``BuildTileMatmul`` streams the contraction K in ``k``-strips with a stage-2 pipeline.
-        When ``k`` does not divide the (per-split) contraction, it runs ``floor(K/k)`` full
-        strips and folds the ragged remainder in as ONE extra ``matmul_acc`` tail (width
-        ``K - floor(K/k)*k``, which is 16-aligned since the solver's ``k`` is). Pinned to
-        Ascend910B: ``[64,5040]@[5040,256]`` splits K into 7 slices of 720; the solver's
-        ``k=336`` peels each into ``2*336 + 48``. ``[64,4096]@[4096,256]`` is the exact-division
-        control (slice 512, ``k=256`` -> ``2*256``, no tail). Both must match ``torch.matmul``;
-        the ragged path must be numerically exact, not silently dropping the tail contribution.
+        ``CubeSchedulePlan`` separates the L1-resident window from the actual per-load chunk:
+        two chunks must fit together, and a serial first matmul initializes the carry before a
+        stage-2 rolled loop. When the load chunk does not divide the per-split contraction, one
+        serial ``matmul_acc`` tail folds in the remainder. Pinned to Ascend910B:
+        ``[64,5040]@[5040,256]`` splits K into 7 slices of 720; its 336-wide L1 window selects a
+        160-wide load, emitted as serial first 160 + pipeline ``[160,640)`` + tail 80.
+        ``[64,4096]@[4096,256]`` is the exact-division control (slice 512, load 128). Both must
+        match ``torch.matmul``; the ragged path must not silently drop the tail contribution.
         """
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
@@ -324,17 +387,19 @@ class TestAutoFuse:
             )
             return body
 
-        # Ragged peel: per-split contraction 720, k=336 -> 2 full strips (pipeline bound 672)
-        # + a 48-wide matmul_acc tail (720 - 2*336, 16-aligned). Pins the current solver plan.
+        # Ragged peel: window 336, actual load 160 -> first 160 + three rolled strips through
+        # 640 + an 80-wide tail. The carry is initialized by a real matmul, not a full-tile
+        # tensor.create in UB.
         peel_body = _fuse_body(64, 5040, 256)
-        assert "pl.pipeline(0, 672, 336" in peel_body  # 2 full k-strips (bound < slice 720)
+        assert "pl.pipeline(160, 640, 160" in peel_body
         assert "pl.tensor.matmul_acc(" in peel_body  # loop accumulate + the peel tail fold
-        assert "[64, 48]" in peel_body  # the ragged K-tail slice (720 - 2*336 = 48)
+        assert "[64, 80]" in peel_body  # the ragged K-tail slice (720 - 4*160 = 80)
+        assert "tensor.create" not in peel_body
 
-        # Exact-division control: k-pipeline with no tail (slice 512, k=256 -> bound 512).
+        # Exact-division control: first 128 + three rolled strips, no tail.
         div_body = _fuse_body(64, 4096, 256)
-        assert "pl.pipeline(0, 512, 256" in div_body  # 2 full strips, no ragged tail
-        assert "[64, 48]" not in div_body  # no peel tail for the dividing case
+        assert "pl.pipeline(128, 512, 128" in div_body
+        assert "_a_tl" not in div_body and "_b_tl" not in div_body
 
     def test_single_pointwise_tiles_across_vector_cores(self, ascend_backend):
         """A large pointwise op is tiled into the solver's `[w,h]` regions and
@@ -407,6 +472,49 @@ class TestAutoFuse:
         # output is unwritten). So exactly one assemble, and the return is wired to an Out param.
         assert body.count("pl.tensor.assemble(") == 1
         assert "pl.Out[" in body
+
+    def test_produced_rhs_cube_plan_fails_loudly_in_strict_mode(self, ascend_backend, monkeypatch):
+        """A both-input-produced root cannot enter the legacy left-chain emitter.
+
+        The historical cube model represents every ephemeral as an M-band, while the
+        root's RHS needs a K/N band. ``CubeSchedulePlan`` marks that role incompatible.
+        Production can materialize the three matmuls as a correctness fallback, but strict
+        model/emit validation must reject pairing that fallback with the fused model cost.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def tree(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                c: pl.Tensor[[64, 64], pl.FP32],
+                d: pl.Tensor[[64, 64], pl.FP32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                lhs: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                rhs: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(c, d)
+                out: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(lhs, rhs)
+                return out
+
+        fallback = passes.auto_fuse()(Prog)
+        body = next(f for _, f in fallback.functions.items() if f.name == "tree").as_python()
+        assert body.count("pl.tensor.matmul(") == 3
+        namespace: dict = {}
+        exec(torch_codegen(fallback, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        a, b, c, d = (torch.randn(64, 64, dtype=torch.float32) for _ in range(4))
+        out = namespace["tree"](a, b, c, d)
+        assert torch.allclose(out, (a @ b) @ (c @ d), rtol=1e-3, atol=1e-3)
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        with pytest.raises(InternalError, match="produced RHS/band role"):
+            passes.auto_fuse()(Prog)
 
     @pytest.mark.xfail(
         reason="chained-matmul lowering blocked on hw-native-sys/pypto#1908: AllocateMemoryAddr "

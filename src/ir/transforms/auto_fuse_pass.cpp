@@ -44,6 +44,7 @@
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/soc.h"
+#include "pypto/core/common.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -997,6 +998,20 @@ struct SolverTile {
   // It is authoritative for reduction materialize-vs-stream, chunk geometry,
   // pass count, and loop kinds.
   ::VectorStreamPlan vector_stream;
+  // Solver-owned cube grid, resident-band, and per-op K-loop algorithm for the
+  // final/forced configuration. Candidate costs keep this out of CostResult and
+  // re-derive it once here, exactly like VectorStreamPlan.
+  ::CubeSchedulePlan cube_schedule;
+
+  SolverTile() = default;
+  SolverTile(int64_t w, int64_t h, int64_t k, size_t split,
+             int64_t parts_m, int64_t parts_n,
+             const ::VectorStreamPlan& vector_stream,
+             ::CubeSchedulePlan cube_schedule)
+      : w(w), h(h), k(k), split(static_cast<int64_t>(split)),
+        parts_m(parts_m), parts_n(parts_n),
+        vector_stream(vector_stream),
+        cube_schedule(std::move(cube_schedule)) {}
 };
 
 static const char* VectorStreamKindName(::VectorStreamKind kind) {
@@ -1033,7 +1048,8 @@ ExprPtr MakeTuple2(ExprPtr a, ExprPtr b, const Span& sp) {
 std::vector<StmtPtr> BuildTileMatmul(const ExprPtr& a, const ExprPtr& b, const ExprPtr& mi,
                                      const ExprPtr& ni, int64_t h, int64_t w, int64_t K, int64_t k,
                                      const DataType& dtype, const VarPtr& out_var,
-                                     const std::string& base, const Span& sp) {
+                                     const std::string& base, const Span& sp,
+                                     int pipeline_stages = -1) {
   auto& reg = OpRegistry::GetInstance();
   const std::vector<std::pair<std::string, std::any>> mm_kw = {
       {"a_trans", false}, {"b_trans", false}, {"c_matrix_nz", false}, {"out_dtype", dtype}};
@@ -1059,12 +1075,111 @@ std::vector<StmtPtr> BuildTileMatmul(const ExprPtr& a, const ExprPtr& b, const E
             std::make_shared<AssignStmt>(out_var, mm, sp)};
   }
 
-  // acc accumulates over the K-strips; double-buffered via stage=2.
-  auto acc_call = reg.Create("tensor.create", {MakeIndexTuple({h, w}, sp)}, {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
-  auto acc_var = std::make_shared<Var>(base + "_acc_init", acc_call->GetType(), sp);
-  auto acc_assign = std::make_shared<AssignStmt>(acc_var, acc_call, sp);
+  // Legacy callers (currently the chained-matmul emitter) do not yet consume a
+  // CubeSchedulePlan. Preserve their pre-plan loop exactly until the recursive
+  // chain emitter is plan-driven as well. A non-negative stage count means the
+  // caller supplied the concrete loop chosen by CubeSchedulePlan.
+  if (pipeline_stages < 0) {
+    auto acc_call = reg.Create(
+        "tensor.create", {MakeIndexTuple({h, w}, sp)},
+        {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
+    auto acc_var = std::make_shared<Var>(base + "_acc_init", acc_call->GetType(), sp);
+    auto acc_assign = std::make_shared<AssignStmt>(acc_var, acc_call, sp);
+    auto ko = std::make_shared<Var>(
+        base + "_ko", std::make_shared<ScalarType>(DataType::INDEX), sp);
+    auto c_iter = std::make_shared<IterArg>(base + "_c", acc_var->GetType(), acc_var, sp);
+
+    auto a_k_call = reg.Create(
+        "tensor.slice",
+        {a, MakeIndexTuple({h, k}, sp), MakeTuple2(mi, ko, sp)}, sp);
+    auto a_k = std::make_shared<Var>(base + "_a_k", a_k_call->GetType(), sp);
+    auto a_k_assign = std::make_shared<AssignStmt>(a_k, a_k_call, sp);
+    auto b_k_call = reg.Create(
+        "tensor.slice",
+        {b, MakeIndexTuple({k, w}, sp), MakeTuple2(ko, ni, sp)}, sp);
+    auto b_k = std::make_shared<Var>(base + "_b_k", b_k_call->GetType(), sp);
+    auto b_k_assign = std::make_shared<AssignStmt>(b_k, b_k_call, sp);
+
+    auto then_call = reg.Create("tensor.matmul", {a_k, b_k}, mm_kw, sp);
+    auto then_var = std::make_shared<Var>(base + "_mm", then_call->GetType(), sp);
+    auto then_assign = std::make_shared<AssignStmt>(then_var, then_call, sp);
+    auto then_yield =
+        std::make_shared<YieldStmt>(std::vector<ExprPtr>{then_var}, sp);
+    StmtPtr then_body = SeqStmts::Flatten(
+        std::vector<StmtPtr>{then_assign, then_yield}, sp);
+
+    auto else_call =
+        reg.Create("tensor.matmul_acc", {ExprPtr(c_iter), a_k, b_k}, acc_kw, sp);
+    auto else_var =
+        std::make_shared<Var>(base + "_mm_acc", else_call->GetType(), sp);
+    auto else_assign = std::make_shared<AssignStmt>(else_var, else_call, sp);
+    auto else_yield =
+        std::make_shared<YieldStmt>(std::vector<ExprPtr>{else_var}, sp);
+    StmtPtr else_body = SeqStmts::Flatten(
+        std::vector<StmtPtr>{else_assign, else_yield}, sp);
+
+    auto phi = std::make_shared<Var>(base + "_phi", then_call->GetType(), sp);
+    auto if_stmt = std::make_shared<IfStmt>(
+        MakeEq(ko, MakeIndex(0, sp), sp), then_body,
+        std::optional<StmtPtr>(else_body), std::vector<VarPtr>{phi}, sp);
+    auto body_yield =
+        std::make_shared<YieldStmt>(std::vector<ExprPtr>{phi}, sp);
+    StmtPtr body = SeqStmts::Flatten(
+        std::vector<StmtPtr>{a_k_assign, b_k_assign, if_stmt, body_yield}, sp);
+
+    std::vector<std::pair<std::string, std::any>> loop_attrs = {
+        {kPipelineStagesAttr, /*stages=*/2}};
+    const VarPtr loop_out = peel
+                                ? std::make_shared<Var>(
+                                      base + "_kloop", then_call->GetType(), sp)
+                                : out_var;
+    auto for_stmt = std::make_shared<ForStmt>(
+        ko, MakeIndex(0, sp), MakeIndex(num_full * k, sp), MakeIndex(k, sp),
+        std::vector<IterArgPtr>{c_iter}, body, std::vector<VarPtr>{loop_out}, sp,
+        ForKind::Pipeline, std::move(loop_attrs));
+    if (!peel) return {acc_assign, for_stmt};
+
+    const int64_t k_tail = num_full * k;
+    auto at = reg.Create(
+        "tensor.slice",
+        {a, MakeIndexTuple({h, tail}, sp),
+         MakeTuple2(mi, MakeIndex(k_tail, sp), sp)},
+        sp);
+    auto av = std::make_shared<Var>(base + "_a_tl", at->GetType(), sp);
+    auto bt = reg.Create(
+        "tensor.slice",
+        {b, MakeIndexTuple({tail, w}, sp),
+         MakeTuple2(MakeIndex(k_tail, sp), ni, sp)},
+        sp);
+    auto bv = std::make_shared<Var>(base + "_b_tl", bt->GetType(), sp);
+    auto tail_mm =
+        reg.Create("tensor.matmul_acc", {ExprPtr(loop_out), av, bv}, acc_kw, sp);
+    return {acc_assign, for_stmt, std::make_shared<AssignStmt>(av, at, sp),
+            std::make_shared<AssignStmt>(bv, bt, sp),
+            std::make_shared<AssignStmt>(out_var, tail_mm, sp)};
+  }
+
+  // Seed the carry with the first real matmul instead of tensor.create([h,w]).
+  // tensor.create lowers to a UB allocation, but a solver cube tile may exceed
+  // UB/L0c and is subsequently sub-tiled. The real algorithm is: serial first
+  // chunk, rolled matmul_acc loop, serial tail.
+  auto a0_call = reg.Create(
+      "tensor.slice",
+      {a, MakeIndexTuple({h, k}, sp), MakeTuple2(mi, MakeIndex(0, sp), sp)}, sp);
+  auto a0 = std::make_shared<Var>(base + "_a_k0", a0_call->GetType(), sp);
+  auto b0_call = reg.Create(
+      "tensor.slice",
+      {b, MakeIndexTuple({k, w}, sp), MakeTuple2(MakeIndex(0, sp), ni, sp)}, sp);
+  auto b0 = std::make_shared<Var>(base + "_b_k0", b0_call->GetType(), sp);
+  auto first_call = reg.Create("tensor.matmul", {a0, b0}, mm_kw, sp);
+  auto first_var = std::make_shared<Var>(base + "_first", first_call->GetType(), sp);
+  std::vector<StmtPtr> result{
+      std::make_shared<AssignStmt>(a0, a0_call, sp),
+      std::make_shared<AssignStmt>(b0, b0_call, sp),
+      std::make_shared<AssignStmt>(first_var, first_call, sp)};
+
   auto ko = std::make_shared<Var>(base + "_ko", std::make_shared<ScalarType>(DataType::INDEX), sp);
-  auto c_iter = std::make_shared<IterArg>(base + "_c", acc_var->GetType(), acc_var, sp);
+  auto c_iter = std::make_shared<IterArg>(base + "_c", first_var->GetType(), first_var, sp);
 
   // Per-iteration k-strip slices: a[mi:mi+h, ko:ko+k], b[ko:ko+k, ni:ni+w].
   auto a_k_call = reg.Create("tensor.slice", {a, MakeIndexTuple({h, k}, sp), MakeTuple2(mi, ko, sp)}, sp);
@@ -1074,36 +1189,29 @@ std::vector<StmtPtr> BuildTileMatmul(const ExprPtr& a, const ExprPtr& b, const E
   auto b_k = std::make_shared<Var>(base + "_b_k", b_k_call->GetType(), sp);
   auto b_k_assign = std::make_shared<AssignStmt>(b_k, b_k_call, sp);
 
-  // if (ko == 0): out = matmul(a_k, b_k)  else  out = matmul_acc(c_iter, a_k, b_k).
-  auto then_call = reg.Create("tensor.matmul", {a_k, b_k}, mm_kw, sp);
-  auto then_var = std::make_shared<Var>(base + "_mm", then_call->GetType(), sp);
-  auto then_assign = std::make_shared<AssignStmt>(then_var, then_call, sp);
-  auto then_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{then_var}, sp);
-  StmtPtr then_body = SeqStmts::Flatten(std::vector<StmtPtr>{then_assign, then_yield}, sp);
+  auto acc_call = reg.Create("tensor.matmul_acc", {ExprPtr(c_iter), a_k, b_k}, acc_kw, sp);
+  auto acc_var = std::make_shared<Var>(base + "_mm_acc", acc_call->GetType(), sp);
+  auto acc_assign = std::make_shared<AssignStmt>(acc_var, acc_call, sp);
+  auto body_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{acc_var}, sp);
+  StmtPtr body =
+      SeqStmts::Flatten(std::vector<StmtPtr>{a_k_assign, b_k_assign, acc_assign, body_yield}, sp);
 
-  auto else_call = reg.Create("tensor.matmul_acc", {ExprPtr(c_iter), a_k, b_k}, acc_kw, sp);
-  auto else_var = std::make_shared<Var>(base + "_mm_acc", else_call->GetType(), sp);
-  auto else_assign = std::make_shared<AssignStmt>(else_var, else_call, sp);
-  auto else_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{else_var}, sp);
-  StmtPtr else_body = SeqStmts::Flatten(std::vector<StmtPtr>{else_assign, else_yield}, sp);
-
-  auto phi = std::make_shared<Var>(base + "_phi", then_call->GetType(), sp);
-  auto cond = MakeEq(ko, MakeIndex(0, sp), sp);
-  auto if_stmt = std::make_shared<IfStmt>(cond, then_body, std::optional<StmtPtr>(else_body),
-                                          std::vector<VarPtr>{phi}, sp);
-  auto body_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{phi}, sp);
-  StmtPtr body = SeqStmts::Flatten(std::vector<StmtPtr>{a_k_assign, b_k_assign, if_stmt, body_yield}, sp);
-
-  std::vector<std::pair<std::string, std::any>> loop_attrs = {{kPipelineStagesAttr, /*stages=*/2}};
-  // The pipeline runs over the num_full FULL strips [0, num_full*k). When K divides (tail==0)
-  // the loop binds out_var directly — byte-identical to the pre-peel emit. When K is ragged
-  // (tail>0), the loop binds an intermediate and a matmul_acc tail folds the last
+  const int64_t rolled_chunks = num_full - 1;
+  const bool pipeline = pipeline_stages >= 2 && rolled_chunks >= 2;
+  std::vector<std::pair<std::string, std::any>> loop_attrs;
+  if (pipeline) loop_attrs.emplace_back(kPipelineStagesAttr, /*stages=*/2);
+  // The rolled loop runs over the remaining FULL strips [k, num_full*k). When K
+  // divides (tail==0) it binds out_var directly. When K is ragged (tail>0), the
+  // loop binds an intermediate and a serial matmul_acc tail folds the last
   // [h,tail]@[tail,w] partial into it, producing out_var.
-  const VarPtr loop_out = peel ? std::make_shared<Var>(base + "_kloop", then_call->GetType(), sp) : out_var;
-  auto for_stmt = std::make_shared<ForStmt>(ko, MakeIndex(0, sp), MakeIndex(num_full * k, sp), MakeIndex(k, sp),
+  const VarPtr loop_out =
+      peel ? std::make_shared<Var>(base + "_kloop", first_call->GetType(), sp) : out_var;
+  auto for_stmt = std::make_shared<ForStmt>(ko, MakeIndex(k, sp), MakeIndex(num_full * k, sp), MakeIndex(k, sp),
                                             std::vector<IterArgPtr>{c_iter}, body, std::vector<VarPtr>{loop_out},
-                                            sp, ForKind::Pipeline, std::move(loop_attrs));
-  if (!peel) return {acc_assign, for_stmt};
+                                            sp, pipeline ? ForKind::Pipeline : ForKind::Sequential,
+                                            std::move(loop_attrs));
+  result.push_back(for_stmt);
+  if (!peel) return result;
 
   // Ragged-K tail: matmul_acc the final [h,tail]@[tail,w] partial (at K-offset num_full*k)
   // into the pipeline result. tail is 16-aligned (gated above), so this is a valid fractal
@@ -1114,8 +1222,10 @@ std::vector<StmtPtr> BuildTileMatmul(const ExprPtr& a, const ExprPtr& b, const E
   auto bt = reg.Create("tensor.slice", {b, MakeIndexTuple({tail, w}, sp), MakeTuple2(MakeIndex(k_tail, sp), ni, sp)}, sp);
   auto bv = std::make_shared<Var>(base + "_b_tl", bt->GetType(), sp);
   auto tail_mm = reg.Create("tensor.matmul_acc", {ExprPtr(loop_out), av, bv}, acc_kw, sp);
-  return {acc_assign, for_stmt, std::make_shared<AssignStmt>(av, at, sp),
-          std::make_shared<AssignStmt>(bv, bt, sp), std::make_shared<AssignStmt>(out_var, tail_mm, sp)};
+  result.push_back(std::make_shared<AssignStmt>(av, at, sp));
+  result.push_back(std::make_shared<AssignStmt>(bv, bt, sp));
+  result.push_back(std::make_shared<AssignStmt>(out_var, tail_mm, sp));
+  return result;
 }
 
 // Distribute a per-tile `body` across the AI cores via SPMD. Replaces the retired
@@ -1143,7 +1253,8 @@ static StmtPtr SpmdWrap(const VarPtr& t, std::vector<StmtPtr> body, const ExprPt
 // matmul is not eligible (non-default orientation / non-static shapes / tile not
 // dividing the output). v0 emits Sequential output-tile loops; cross-core
 // Parallel distribution of those tiles is the next increment.
-std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, SolverTile tile,
+std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign,
+                                              const SolverTile& tile,
                                               const std::string& name) {
   auto call = As<Call>(assign->value_);
   if (call == nullptr || !IsOp(call, "tensor.matmul") || call->args_.size() != 2) {
@@ -1165,12 +1276,58 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   if (M < 0 || lM != M || rN != N || rK != K) {
     return std::nullopt;
   }
+  int64_t k_chunk = tile.k;
+  int k_pipeline_stages = -1;
+  if (tile.cube_schedule.feasible && tile.cube_schedule.matmuls.size() == 1) {
+    const auto& loop = tile.cube_schedule.matmuls.front().k_loop;
+    k_chunk = loop.chunk;
+    k_pipeline_stages = loop.pipeline_stages;
+  }
 
   // Clamp the output tile to the output. The grid need NOT divide the output: the
   // non-split path below tiles ceil(M/h) x ceil(N/w) with clamped (overlapping,
   // idempotent) offsets — only the split-K path requires exact division.
   int64_t h = (tile.h > 0 && tile.h < M) ? tile.h : M;
   int64_t w = (tile.w > 0 && tile.w < N) ? tile.w : N;
+
+  // The solver tile is an L1/core work unit, not necessarily one L0c
+  // accumulator. Realize the model's implicit L0 subdivision explicitly when
+  // a K-streamed matmul_acc would otherwise hold the whole [h,w] region in Acc.
+  // Inner accumulator tiles form a disjoint base-tile grid, which is required
+  // when split-K atomically adds partials. The final row/column may be ragged;
+  // emit it at its exact shape rather than requiring a divisor (which can
+  // degenerate to O(h*w) one-element tiles for prime dimensions). Downstream
+  // matmul lowering pads those ragged M/N edge shapes to cube fractals.
+  const int64_t dtb = std::max<int64_t>(1, static_cast<int64_t>(dtype.GetBit()) / 8);
+  const int64_t acc_capacity =
+      std::max<int64_t>(16LL * 16 * dtb, ReadHwParams().cube_capacity);
+  int64_t acc_h = h;
+  int64_t acc_w = w;
+  if (h * w * dtb > acc_capacity) {
+    int64_t best_area = 0;
+    bool best_aligned = false;
+    for (int64_t ah = 1; ah <= std::min<int64_t>(h, kL0TileM); ++ah) {
+      for (int64_t aw = 1; aw <= std::min<int64_t>(w, kL0TileN); ++aw) {
+        if (ah * aw * dtb > acc_capacity) continue;
+        const int64_t area = ah * aw;
+        const bool aligned = ah % 16 == 0 && aw % 16 == 0;
+        if (area > best_area ||
+            (area == best_area && aligned && !best_aligned) ||
+            (area == best_area && aligned == best_aligned && ah > acc_h)) {
+          best_area = area;
+          best_aligned = aligned;
+          acc_h = ah;
+          acc_w = aw;
+        }
+      }
+    }
+    INTERNAL_CHECK(best_area > 0)
+        << "AutoFuse cube accumulator has no L0c base tile for region ["
+        << h << "," << w << "]";
+  }
+  const int64_t num_acc_m = CeilDiv(h, acc_h);
+  const int64_t num_acc_n = CeilDiv(w, acc_w);
+  const int64_t num_acc_tiles = num_acc_m * num_acc_n;
 
   const Span sp = assign->span_;
   const std::string base = c_var->name_hint_;
@@ -1253,18 +1410,41 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
     auto a_ks_v = std::make_shared<Var>(base + "_aks", a_ks->GetType(), sp);
     auto b_ks = reg.Create("tensor.slice", {b, MakeIndexTuple({ksz, N}, sp), MakeTuple2(k_base, MakeIndex(0, sp), sp)}, sp);
     auto b_ks_v = std::make_shared<Var>(base + "_bks", b_ks->GetType(), sp);
-    auto part_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
-    auto part = std::make_shared<Var>(base + "_part", part_type, sp);
     std::vector<StmtPtr> body{std::make_shared<AssignStmt>(a_ks_v, a_ks, sp),
                               std::make_shared<AssignStmt>(b_ks_v, b_ks, sp)};
-    for (auto& s : BuildTileMatmul(a_ks_v, b_ks_v, mi, ni, h, w, ksz, tile.k, dtype, part, base, sp))
-      body.push_back(std::move(s));
+    ExprPtr assembled = c_seeded;
+    int64_t acc_idx = 0;
+    for (int64_t am = 0; am < num_acc_m; ++am) {
+      const int64_t mo = am * acc_h;
+      for (int64_t an = 0; an < num_acc_n; ++an, ++acc_idx) {
+        const int64_t no = an * acc_w;
+        const int64_t emit_h = std::min(acc_h, h - mo);
+        const int64_t emit_w = std::min(acc_w, w - no);
+        const ExprPtr ami = mo == 0 ? mi : MakeAdd(mi, MakeIndex(mo, sp), sp);
+        const ExprPtr ani = no == 0 ? ni : MakeAdd(ni, MakeIndex(no, sp), sp);
+        auto part_type = std::make_shared<TensorType>(
+            std::vector<ExprPtr>{MakeIndex(emit_h, sp), MakeIndex(emit_w, sp)}, dtype);
+        auto part = std::make_shared<Var>(base + "_part" + std::to_string(acc_idx), part_type, sp);
+        for (auto& stmt : BuildTileMatmul(a_ks_v, b_ks_v, ami, ani, emit_h, emit_w,
+                                          ksz, k_chunk, dtype, part,
+                                          base + "_l0_" + std::to_string(acc_idx), sp,
+                                          k_pipeline_stages)) {
+          body.push_back(std::move(stmt));
+        }
 
-    // Atomic-add the partial into the shared output tile -- the S partials per tile merge
-    // across SPMD cores. Each core runs ONE (tile, k-slice) selected by get_block_idx; binds c_var.
-    auto asm_call =
-        reg.Create("tensor.assemble", {ExprPtr(c_seeded), part, MakeTuple2(mi, ni, sp)}, {{"atomic", 1}}, sp);
-    body.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+        auto asm_call = reg.Create("tensor.assemble",
+                                   {assembled, part, MakeTuple2(ami, ani, sp)},
+                                   {{"atomic", 1}}, sp);
+        const bool last = acc_idx + 1 == num_acc_tiles;
+        auto assembled_var = last
+                                 ? c_var
+                                 : std::make_shared<Var>(base + "_partial_out" +
+                                                             std::to_string(acc_idx),
+                                                         asm_call->GetType(), sp);
+        body.push_back(std::make_shared<AssignStmt>(assembled_var, asm_call, sp));
+        assembled = assembled_var;
+      }
+    }
 
     auto scope = SpmdWrap(t, std::move(body), MakeIndex(num_tiles * S, sp), name, sp);
     return std::vector<StmtPtr>{c_init_assign, seed_scope, scope};
@@ -1288,8 +1468,9 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
 
   // The solver's tile is the whole output: no output loop — just the k-pipeline
   // (writing directly into the original output var), wrapped in one InCore kernel.
-  if (num_m == 1 && num_n == 1) {
-    auto stmts = BuildTileMatmul(a, b, MakeIndex(0, sp), MakeIndex(0, sp), M, N, K, tile.k, dtype, c_var, base, sp);
+  if (num_m == 1 && num_n == 1 && num_acc_tiles == 1) {
+    auto stmts = BuildTileMatmul(a, b, MakeIndex(0, sp), MakeIndex(0, sp), M, N, K,
+                                 k_chunk, dtype, c_var, base, sp, k_pipeline_stages);
     return std::vector<StmtPtr>{
         std::make_shared<InCoreScopeStmt>(std::nullopt, name, SeqStmts::Flatten(std::move(stmts), sp), sp)};
   }
@@ -1331,11 +1512,39 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
   // Per-tile body: compute the [h,w] tile (k-pipeline) and assemble it into the shared
   // output. Each SPMD core runs ONE tile (selected by get_block_idx, prepended by SpmdWrap)
   // and writes its disjoint [h,w] region, binding c_var (no IterArg/Yield -- data-parallel).
-  auto tile_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, dtype);
-  auto tile_var = std::make_shared<Var>(base + "_tile", tile_type, sp);
-  std::vector<StmtPtr> body_stmts = BuildTileMatmul(a, b, mi, ni, h, w, K, tile.k, dtype, tile_var, base, sp);
-  auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tile_var, MakeTuple2(mi, ni, sp)}, sp);
-  body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
+  std::vector<StmtPtr> body_stmts;
+  ExprPtr assembled = c_init;
+  int64_t acc_idx = 0;
+  for (int64_t am = 0; am < num_acc_m; ++am) {
+    const int64_t mo = am * acc_h;
+    for (int64_t an = 0; an < num_acc_n; ++an, ++acc_idx) {
+      const int64_t no = an * acc_w;
+      const int64_t emit_h = std::min(acc_h, h - mo);
+      const int64_t emit_w = std::min(acc_w, w - no);
+      const ExprPtr ami = mo == 0 ? mi : MakeAdd(mi, MakeIndex(mo, sp), sp);
+      const ExprPtr ani = no == 0 ? ni : MakeAdd(ni, MakeIndex(no, sp), sp);
+      auto tile_type = std::make_shared<TensorType>(
+          std::vector<ExprPtr>{MakeIndex(emit_h, sp), MakeIndex(emit_w, sp)}, dtype);
+      auto tile_var =
+          std::make_shared<Var>(base + "_tile" + std::to_string(acc_idx), tile_type, sp);
+      for (auto& stmt : BuildTileMatmul(a, b, ami, ani, emit_h, emit_w, K, k_chunk,
+                                        dtype, tile_var,
+                                        base + "_l0_" + std::to_string(acc_idx), sp,
+                                        k_pipeline_stages)) {
+        body_stmts.push_back(std::move(stmt));
+      }
+      auto asm_call = reg.Create("tensor.assemble",
+                                 {assembled, tile_var, MakeTuple2(ami, ani, sp)}, sp);
+      const bool last = acc_idx + 1 == num_acc_tiles;
+      auto assembled_var = last
+                               ? c_var
+                               : std::make_shared<Var>(base + "_assembled" +
+                                                           std::to_string(acc_idx),
+                                                       asm_call->GetType(), sp);
+      body_stmts.push_back(std::make_shared<AssignStmt>(assembled_var, asm_call, sp));
+      assembled = assembled_var;
+    }
+  }
 
   auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
   return std::vector<StmtPtr>{c_init_assign, scope};
@@ -1352,8 +1561,9 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, Solv
 // non-[M,N]/non-scalar operand (e.g. broadcast), or the whole output being one
 // tile (the plain InCore scope handles that). TODO: share the chunked-parallel
 // wrapper with TileMatmul.
-std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr>& run, SolverTile tile,
-                                                       const std::string& name) {
+std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr>& run,
+                                                      const SolverTile& tile,
+                                                      const std::string& name) {
   // 1. Every stmt must be `var = <pointwise call>`.
   std::vector<AssignStmtPtr> ops;
   ops.reserve(run.size());
@@ -1558,7 +1768,8 @@ static std::nullopt_t GenericDeclineB(const std::string& reason, const Span& spa
 }
 
 std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<StmtPtr>& run,
-                                                          SolverTile tile, const std::string& name,
+                                                          const SolverTile& tile,
+                                                          const std::string& name,
                                                           const P4Match* p4_match) {
   auto& reg = OpRegistry::GetInstance();
 
@@ -2738,7 +2949,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
 // unifies dispatch behind the flag. The tiling body is REUSED for now; absorbing it so
 // the legacy TileMatmul dispatch can retire is the parity-prep step.
 std::optional<std::vector<StmtPtr>> EmitLoneMatmulGeneric(const AssignStmtPtr& assign,
-                                                          SolverTile tile, const std::string& name) {
+                                                          const SolverTile& tile,
+                                                          const std::string& name) {
   auto call = As<Call>(assign->value_);
   if (call == nullptr || call->op_ == nullptr || ClassifyOp(call) != ::OpType::MatMul ||
       call->args_.size() != 2) {
@@ -2788,7 +3000,8 @@ std::optional<std::vector<StmtPtr>> EmitLoneMatmulGeneric(const AssignStmtPtr& a
 // becomes a matmul_acc chain and only [h,k2p] is on-chip at a time (declines if no
 // 16-aligned divisor panel fits L0c). TODO: share the wrapper with TileMatmul.
 std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1,
-                                                      const AssignStmtPtr& mm2, SolverTile tile,
+                                                      const AssignStmtPtr& mm2,
+                                                      const SolverTile& tile,
                                                       const std::string& name) {
   auto c1 = As<Call>(mm1->value_);  // T = matmul(A, B)
   auto c2 = As<Call>(mm2->value_);  // C = matmul(T, D)
@@ -3115,6 +3328,39 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
     if (stmt_group.at(it->second) != git->second) continue;        // must be the same fused group
     chain_head[it->second] = As<AssignStmt>(stmt);
   }
+
+  // The first CubeSchedulePlan increment deliberately exposes cube groups whose
+  // historical shared-M/full-N algorithm cannot be emitted by the current
+  // lone/exact-two-left-chain paths. Gate them once per group before the legacy
+  // pair matcher can consume a root whose RHS producer has not executed yet.
+  // Production falls back to dependency-ordered standalone matmuls (correct but
+  // materialized); strict validation fails loudly so the fused model cost is
+  // never mistaken for the fallback kernel's algorithm.
+  std::unordered_map<size_t, size_t> chain_pairs_per_group;
+  for (const StmtPtr& stmt : body_stmts) {
+    if (chain_head.find(stmt.get()) == chain_head.end()) continue;
+    auto git = stmt_group.find(stmt.get());
+    if (git != stmt_group.end()) ++chain_pairs_per_group[git->second];
+  }
+  std::unordered_set<size_t> cube_fallback_groups;
+  for (const StmtPtr& stmt : body_stmts) {
+    auto git = stmt_group.find(stmt.get());
+    auto tit = stmt_tile.find(stmt.get());
+    if (git == stmt_group.end() || tit == stmt_tile.end()) continue;
+    const ::CubeSchedulePlan& plan = tit->second.cube_schedule;
+    if (!plan.feasible || plan.matmuls.empty()) continue;
+    const size_t pairs = chain_pairs_per_group[git->second];
+    const bool supported_topology =
+        plan.matmuls.size() == 1 || (plan.matmuls.size() == 2 && pairs == 1);
+    if (plan.emit_compatible && supported_topology) continue;
+    if (!cube_fallback_groups.insert(git->second).second) continue;
+    const std::string reason =
+        !plan.emit_compatible
+            ? "cube plan contains a produced RHS/band role the current emitter cannot realize"
+            : "cube plan topology is not a lone matmul or exact two-matmul left chain";
+    GenericDeclineB(reason + "; falling back to dependency-ordered standalone matmuls",
+                    stmt->span_);
+  }
   std::unordered_set<const Stmt*> chain_done;  // chain tails already emitted with their head
   std::vector<StmtPtr> top;
   std::vector<StmtPtr> run;
@@ -3202,7 +3448,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body,
     // fused kernel — the parallel-outer output tiling with the inner serial chain
     // and the intermediate on-chip (see TileChainedMatmul).
     auto hit = chain_head.find(stmt.get());
-    if (hit != chain_head.end()) {
+    if (hit != chain_head.end() && cube_fallback_groups.count(static_cast<size_t>(g)) == 0) {
       auto tit = stmt_tile.find(stmt.get());
       const SolverTile tile = (tit != stmt_tile.end()) ? tit->second : SolverTile{};
       if (auto chained = TileChainedMatmul(As<AssignStmt>(stmt), hit->second, tile, "fused_" + std::to_string(g))) {
@@ -3673,8 +3919,16 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
               ? sol.step(s).subgraph.vector_stream_plan(
                     cfg, sol.retained_entering(s), sol.step(s).retain_these)
               : ::VectorStreamPlan{};
-      SolverTile tile{cfg.w, cfg.h, cfg.k, selected_cost.parallel_split, cfg.parts_m, cfg.parts_n,
-                      selected_stream};
+      const ::CubeSchedulePlan selected_cube =
+          sol.step(s).subgraph.has_matmul()
+              ? sol.step(s).subgraph.cube_schedule_plan(
+                    cfg, sol.retained_entering(s), sol.step(s).retain_these,
+                    selected_cost.parallel_split)
+              : ::CubeSchedulePlan{};
+      SolverTile tile(cfg.w, cfg.h,
+                      selected_cube.feasible ? selected_cube.config.k : cfg.k,
+                      selected_cost.parallel_split, cfg.parts_m, cfg.parts_n,
+                      selected_stream, selected_cube);
       if (dump_plans || force_env != nullptr) {
         bool forced_here = false;
         std::set<std::tuple<int64_t, int64_t, size_t, int64_t, int64_t>> seen_plans;  // dedup identical keys
@@ -3692,8 +3946,15 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                 !sol.step(s).subgraph.has_matmul()
                     ? sol.step(s).subgraph.vector_stream_plan(pc)
                     : ::VectorStreamPlan{};
-            tile = SolverTile{pc.w, pc.h, pc.k, pr.parallel_split, pc.parts_m, pc.parts_n,
-                              forced_stream};
+            const ::CubeSchedulePlan forced_cube =
+                sol.step(s).subgraph.has_matmul()
+                    ? sol.step(s).subgraph.cube_schedule_plan(
+                          pc, {}, {}, pr.parallel_split)
+                    : ::CubeSchedulePlan{};
+            tile = SolverTile(pc.w, pc.h,
+                              forced_cube.feasible ? forced_cube.config.k : pc.k,
+                              pr.parallel_split, pc.parts_m, pc.parts_n,
+                              forced_stream, forced_cube);
             forced_here = true;
             LOG_INFO << "AutoFuse[" << func->name_ << "]: FORCED group=" << s << " w=" << pc.w << " h="
                      << pc.h << " split=" << pr.parallel_split << " parts_m=" << pc.parts_m

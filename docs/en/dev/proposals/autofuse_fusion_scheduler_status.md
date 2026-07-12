@@ -263,8 +263,9 @@ statistics update math remains deliberately algorithm-specific.
    need to re-point 2 tests that assert the pre-P4 cut.
 4. **Remaining vector fidelity:** reconcile G5 grid-count divergence and gate or emit the G6
    materialized max/row-reduction split families. The split-K seed is a cube-side cost term.
-5. **Start the cube-only plan extraction:** introduce a compact solver-owned `CubeSchedulePlan`
-   using the staged charter in §8; keep mixed cube+vector outside this work.
+5. **Continue the cube-only plan work:** the first `CubeSchedulePlan`, lone-matmul K-loop handoff,
+   and explicit L0c subdivision are implemented. Next make internal tensor regions role-aware and
+   replace the two-matmul special case with the general DAG emitter described in §8.
 
 **Deferred (all decline *gracefully* today — correctness intact, not fused):** the ProblemBuilder
 nested-arg gap (hoist nested compute-call args to SSA temps); P4 col-softmax / scale-then-softmax /
@@ -301,31 +302,58 @@ places where costing and emission independently reconstruct different algorithms
   wave count. A non-uniform split-K grid is worse: the emitter declines it because atomic overlap
   would double-count.
 
-**Proposed `CubeSchedulePlan` (owned by `mlsys26`).** For one candidate it should contain:
+**`CubeSchedulePlan` (owned by `mlsys26`).** The first increment now contains:
 
-- topology kind (`LoneMatmul`, an exact supported chain kind, or unsupported);
 - exact spatial region/grid policy and work-unit count;
 - sink split-K and the seed/atomic-merge schedule;
 - per-op output role, L1-resident bands, derived `seq_k`, full-trip count, ragged tail, and loop stage;
 - the pebbling/execution order and peak L1 bytes;
-- explicit serial and stage-2 phases used by cube costing.
+- explicit model-overlap versus emit-implementability diagnostics.
 
-As with vectors, candidate pricing derives this plan on the stack because feasibility and latency
-need it; `CostResult` must remain compact. AutoFuse re-derives the plan only for the winning or
-forced configuration and emits it with a fail-loud plan/emit equality check.
+The hot candidate path runs the shared lightweight L1/per-op-K derivation once; it does not allocate
+or cache the full descriptor. AutoFuse re-derives the plan only for the winning or forced
+configuration, just as it does for `VectorStreamPlan`. `CostResult` remains at most 128 bytes.
 
-**Safe implementation order.** Start on separate parent/solver branches from the vector checkpoint:
+The plan also records a crucial distinction the old `seq_k` field hid: `l1_window_k` is the total
+resident operand window, while `chunk` is one actual load. Two chunks must fit together for a
+stage-2 loop. AutoFuse now consumes this load chunk for lone matmuls. Because a solver L1 region can
+be larger than L0c, the emit explicitly subdivides it into L0c-fitting tiles using the same
+128×256 pto-isa bounds the model uses, with exact disjoint ragged edge tiles; this fixed the
+oversized Acc/UB allocation exposed by activating the real K stream without requiring shape
+divisors or generating one-element tiles.
 
-1. Write the cube-only fidelity contract and characterization tests. Extract a plan for a **lone
-   matmul only**, with exact pre-refactor fixed-cost preservation tests. Do not change costs yet.
-2. Make lone-matmul emission consume exact grid/split/`seq_k`/tail/stage fields. Then replace its
-   global roofline with emitted phases and price the split seed; keep extraction and cost correction
-   in separate commits.
-3. Add an exact two-matmul-chain descriptor. Until its per-op K loops, split policy, intermediate
-   mode, and grid are faithfully emitted—and #1908 lowering is resolved—gate unsupported chain
-   schedules instead of pricing them as buildable fusion.
-4. Run FORCE_PLAN ranking and profiler validation for lone matmul before expanding the supported
-   cube topology. Keep mixed cube+vector and `AutoTileMatmulL0`'s L0 sub-tiling outside this charter.
+This descriptor increment is cost-preserving: the fixed-cost anchors and solver argmins are
+unchanged. Consequently it also exposes, but does not yet repair, the old roofline gap. A selected
+per-core `K=32` plan is `model_overlap_granted=true` under the historical `K/S ≥ 32` test but has no
+rolled stage-2 loop (`overlap_implementable=false`). The phase-roofline correction is the next,
+separate model change; folding it into extraction changed several argmins and was intentionally
+backed out.
+
+The first generality test is intentionally a gate: a graph where a matmul produces the later
+matmul's RHS is structurally accepted by the historical solver, but the old L1 formula still treats
+that value as a shared-M/full-N band. `CubeSchedulePlan::emit_compatible` is false for that case. The
+current emitter refuses the legacy pair path: strict validation fails loudly, while production
+falls back to dependency-ordered standalone matmuls (correct but not paired with the fused model
+cost). The next increment must propagate exact requested regions recursively; it must not grow an
+enum of hard-coded chain shapes.
+
+**Implementation order on the original `fusion-scheduler` / `ascend-910b-model` branches:**
+
+1. Land the cost-preserving plan extraction and characterization separately from cost corrections.
+2. Finish phase-local cube rooflines: serial accumulator initialization/tail, real stage-2 rolled
+   loops, per-op traffic, and the split seed/barrier.
+3. Back-propagate a requested `(row binding, column binding, extent)` from every sink. Traverse
+   recursively from sinks for discovery, then emit producer-before-consumer in `execution_order()`.
+   Memoize by `(tensor, requested region)` so shared producers are computed exactly as often as the
+   cost prices them.
+4. Replace `TileChainedMatmul` with that general emitter. Cover deep left chains, produced RHS,
+   both-input-produced trees, fan-out, and multiple sinks; decline any topology whose requests or
+   atomic targets are not represented in the plan.
+5. Run FORCE_PLAN ranking and profiler validation for lone matmul before enabling each larger DAG
+   family. Keep mixed cube+vector outside this charter.
+
+The authoritative details are in
+`docs/en/dev/proposals/autofuse_cube_cost_model_emit_contract.md`.
 
 ## 9. Operational gotchas (don't relearn these)
 
