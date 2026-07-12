@@ -7,6 +7,7 @@ It records the GOAL, the **cost-model ↔ emit fidelity contract**,
 validated, and what remains. Read this to pick up the work cold.
 
 Companion documents:
+
 - `docs/en/dev/proposals/autofuse_cost_model_emit_contract.md` — **the fidelity contract** (A1–A7,
   the P-ladder, §6 fidelity status). This status doc summarizes it; that doc is the authority.
 - Device verification tasks (operational, outside the repo): `/home/toni/work/pypto3/autofuse_device_*.md`.
@@ -47,8 +48,8 @@ fused online softmax/layernorm path.
 This is §0 of `autofuse_cost_model_emit_contract.md`. The contract enumerates, per cost term, **what the
 model assumes** and **what the emit must therefore build** (obligations A1–A7):
 
-| # | the model assumes… | the emit must… |
-|---|---|---|
+| Ref | the model assumes… | the emit must… |
+| --- | ------------------ | -------------- |
 | A1 | compute spreads over `U = parts_m·parts_n` wave invocations | launch one per-tile body over the grid (`SpmdScopeStmt` + `get_block_idx`) |
 | A2 | ephemeral intermediates cost **0 DDR** (the fusion win) | keep intermediates on-chip (UB), never round-trip them |
 | A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to the tile; read `FIXED_1`/broadcast in full |
@@ -107,6 +108,7 @@ statistics can't flash).
 **(f) Device grounding (the model is a validated decision oracle).** The model's *ranking* was
 validated on 910B2 via a FORCE_PLAN A/B experiment: the natural argmin's wall-time tracked the model's
 cheapest plan (free-tile ρ≈0.9, zero regret). Two grounding refinements came from device data:
+
 - **C3 — per-task launch overhead.** `kernel_fill` is per-WAVE (flat for `num_tiles ≤ cores`), so the
   model *tied* plans the device ranks by task count and its argmin landed on the most-tasks / slowest
   plan. Added `+ num_tiles·split·c_task` to the vector latency; `c_task = 64` model-cycles ≈ the
@@ -164,6 +166,7 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
 ## 5. What is implemented and validated
 
 **Vector emit** (behind `GENERIC_EMIT`):
+
 - Pointwise: fused chains, UB-streamed row+width strips sized by **real peak-liveness** (+1 prefetch
   band) in `VectorStreamPlan`; the emitter consumes that geometry. Tall / wide / reused-input all
   handled within UB.
@@ -263,9 +266,9 @@ statistics update math remains deliberately algorithm-specific.
    need to re-point 2 tests that assert the pre-P4 cut.
 4. **Remaining vector fidelity:** reconcile G5 grid-count divergence and gate or emit the G6
    materialized max/row-reduction split families. The split-K seed is a cube-side cost term.
-5. **Continue the cube-only plan work:** the first `CubeSchedulePlan`, lone-matmul K-loop handoff,
-   and explicit L0c subdivision are implemented. Next make internal tensor regions role-aware and
-   replace the two-matmul special case with the general DAG emitter described in §8.
+5. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan` and recursive uniform-grid
+   emitter are implemented (§8). Next reconcile GM reload with the emitted L0-subtile loop, then
+   introduce per-node cube phase rooflines, price split seed/tasks, and close non-uniform grids.
 
 **Deferred (all decline *gracefully* today — correctness intact, not fused):** the ProblemBuilder
 nested-arg gap (hoist nested compute-call args to SSA temps); P4 col-softmax / scale-then-softmax /
@@ -274,85 +277,68 @@ ragged-K peel lowering test + deep-T decline logging; mixed cube+vector (a separ
 
 ---
 
-## 8. Cube-only audit and next charter
+## 8. Cube-only plan and current fidelity boundary
 
-The cube path should adopt the same **solver-owned, stack-local plan** architecture, but not as one
-large rewrite. A cube schedule has different decisions from a vector stream: exact spatial regions,
-sink split-K, per-op sequential K strips, split seed/atomic merge, and intermediate residency. The
-right solver-owned descriptor is therefore a `CubeSchedulePlan`, not an extension of
-`VectorStreamPlan`.
+The cube path now follows the same solver-owned-plan architecture as the vector path, with a
+separate `CubeSchedulePlan` for cube-specific decisions: requested tensor regions, per-instance K
+streams, L1 residency, L0 subdivision, spatial ownership, and split-K. The candidate-invariant
+request topology is built once in `Ascend910BCost::create()`; candidate evaluation performs only an
+O(nodes) stack-local derivation. The complete descriptor is reconstructed for the winning/forced
+configuration and is not stored in `CostResult` or the local-search cache.
 
-**Why a plan is justified.** The lone-matmul path is close to faithful, but the audit found concrete
-places where costing and emission independently reconstruct different algorithms:
+**General request model.** For `O=A@B`, a consumer request `O[rows,cols]` recursively requests
+`A[rows,K]` and `B[K,cols]`. Requests are memoized by tensor plus symbolic height/width bindings.
+Identical requests share one producer; different fan-out roles become different instances and pay
+recomputation. The resulting postorder supports produced RHS, both inputs produced, non-square
+trees, deep chains, fan-out, and multiple roots. One root can bind its contraction to `ParallelK`;
+multiple roots force `S=1` because one split coordinate cannot identify several atomic targets.
 
-- A current two-matmul test is priced as `tile=96×64×32, split=4, cores=24`; the emitter then logs
-  non-uniform split-K declines for both matmuls and emits the original untiled fused scope.
-- A deep-intermediate chain is priced with `split=8, cores=16`, while `TileChainedMatmul` ignores
-  `tile.split`; the solver's parallel algorithm is not emitted.
-- `derive_exec` derives a distinct L1-fitting `seq_k` for every matmul, and solution JSON exposes it,
-  but AutoFuse passes only the sink `config.k` to every statement. An internal matmul can therefore
-  run a different K loop from the one that made the group feasible and determined its cost.
-- Cube DDR overlap is granted when `K/S ≥ 32`, but `BuildTileMatmul` emits stage 2 only when its
-  chosen `k` produces at least two full loop iterations. For example, a per-core `K=32, k=32` path
-  is one serial matmul while the model grants `max(compute,DDR)`.
-- A ragged-K peel is a serial tail after the rolled K loop, but the current cube cost uses one global
-  roofline. The split-K zero seed is a separate AIV kernel and barrier that is not priced.
-- The model's balanced, disjoint `AxisPartition` regions and the non-split emitter's max-tile
-  ceil+clamp overlap have the same largest region but not necessarily the same total work, bytes, or
-  wave count. A non-uniform split-K grid is worse: the emitter declines it because atomic overlap
-  would double-count.
+**Plan contents.** Every `CubeMatmulSchedule` records its request-instance ID, producer-instance
+dependencies, exact output/LHS/RHS bindings and extents, contraction/share, L1 window, actual load
+chunk, rolled trip count, serial tail, and loop stage. The group records the exact partitions,
+split/work units, peak L1, L0 M/N tile dimensions, roots, seed requirement, and overlap bits.
+Feasibility, recursive cube MAC/extract work, boundary traffic, and plan reconstruction consume this
+same request DAG.
 
-**`CubeSchedulePlan` (owned by `mlsys26`).** The first increment now contains:
+**Generic emitter.** For uniform multi-matmul grids, AutoFuse replays the plan
+producer-before-consumer. Produced operands stay local; an intermediate spanning several L0 tiles is
+assembled in an explicit L1 tensor. Each node uses its own planned K loop. Distinct fan-out roles
+are recomputed as priced. Sink split-K emits a tiled zero seed and atomic stores; `S=1` stores
+directly. Multiple roots at `S=1` are supported. Strict mode reports a contract rejection; normal
+mode falls back to dependency-ordered standalone matmuls rather than silently emitting another
+algorithm. FP16/BF16 inputs with FP32 accumulation are priced from operand precision. A
+low-precision final output that would need a K carry declines until FIXPIPE narrowing is explicit.
 
-- exact spatial region/grid policy and work-unit count;
-- sink split-K and the seed/atomic-merge schedule;
-- per-op output role, L1-resident bands, derived `seq_k`, full-trip count, ragged tail, and loop stage;
-- the pebbling/execution order and peak L1 bytes;
-- explicit model-overlap versus emit-implementability diagnostics.
+**Serial-overlap fix.** The old scalar `K/S ≥ 32` gate is removed for pure cube. The cost now grants
+its global `max(compute,DDR)` only if every request that loads a boundary operand reconstructs a
+real stage-2 rolled loop. A one-trip loop therefore serializes and can change the natural argmin;
+this is a deliberate fidelity correction, not a descriptor-only refactor.
 
-The hot candidate path runs the shared lightweight L1/per-op-K derivation once; it does not allocate
-or cache the full descriptor. AutoFuse re-derives the plan only for the winning or forced
-configuration, just as it does for `VectorStreamPlan`. `CostResult` remains at most 128 bytes.
+**Host validation.** Solver tests cover exact role regions/peaks, non-square both-produced trees,
+fan-out role switches, multi-sink, plan L0 dimensions, compact cache behavior, and the one-trip
+no-overlap case. AutoFuse tests cover forced recursive plans, split/no-split, ragged K, fan-out,
+multiple outputs, Torch numerics, strict fallback, and default lowering of a chain whose
+intermediate spans multiple L0 tiles.
 
-The plan also records a crucial distinction the old `seq_k` field hid: `l1_window_k` is the total
-resident operand window, while `chunk` is one actual load. Two chunks must fit together for a
-stage-2 loop. AutoFuse now consumes this load chunk for lone matmuls. Because a solver L1 region can
-be larger than L0c, the emit explicitly subdivides it into L0c-fitting tiles using the same
-128×256 pto-isa bounds the model uses, with exact disjoint ragged edge tiles; this fixed the
-oversized Acc/UB allocation exposed by activating the real K stream without requiring shape
-divisors or generating one-element tiles.
+**Remaining gaps, in implementation order:**
 
-This descriptor increment is cost-preserving: the fixed-cost anchors and solver argmins are
-unchanged. Consequently it also exposes, but does not yet repair, the old roofline gap. A selected
-per-core `K=32` plan is `model_overlap_granted=true` under the historical `K/S ≥ 32` test but has no
-rolled stage-2 loop (`overlap_implementable=false`). The phase-roofline correction is the next,
-separate model change; folding it into extraction changed several argmins and was intentionally
-backed out.
+1. Reconcile GM→L1 reload with L0 subdivision. The model charges each logical boundary request once
+   per work unit, but the current emitter nests a full K stream inside each L0 output subtile. Either
+   multiply traffic by that loop or retain input panels with explicitly priced L1/accumulator state.
+2. Replace the remaining subgraph-wide cube roofline with per-node init/rolled/tail/store phases.
+   Only each concrete rolled phase may receive overlap; serial tails cannot hide behind another
+   node's work.
+3. Price the split zero-seed/barrier and per-task launch overhead.
+4. Close spatial fidelity. AutoFuse currently filters unequal multi-op grids. The lone-matmul
+   ceil+clamp path is numerically idempotent but can execute more max-size work than balanced LPT
+   prices; implement exact non-uniform shapes or price the actual overlap.
+5. Represent a shared boundary panel and its lifetime before emitting a request that the model
+   deduplicates. The current plan emitter declines that family.
+6. Add a planned final FIXPIPE phase for streamed/split FP16/BF16 outputs; today they fall back.
+7. Run forced-plan correctness, trace traffic/overlap, wall-versus-model, and regret validation on
+   910B2. Keep mixed cube+vector outside this charter.
 
-The first generality test is intentionally a gate: a graph where a matmul produces the later
-matmul's RHS is structurally accepted by the historical solver, but the old L1 formula still treats
-that value as a shared-M/full-N band. `CubeSchedulePlan::emit_compatible` is false for that case. The
-current emitter refuses the legacy pair path: strict validation fails loudly, while production
-falls back to dependency-ordered standalone matmuls (correct but not paired with the fused model
-cost). The next increment must propagate exact requested regions recursively; it must not grow an
-enum of hard-coded chain shapes.
-
-**Implementation order on the original `fusion-scheduler` / `ascend-910b-model` branches:**
-
-1. Land the cost-preserving plan extraction and characterization separately from cost corrections.
-2. Finish phase-local cube rooflines: serial accumulator initialization/tail, real stage-2 rolled
-   loops, per-op traffic, and the split seed/barrier.
-3. Back-propagate a requested `(row binding, column binding, extent)` from every sink. Traverse
-   recursively from sinks for discovery, then emit producer-before-consumer in `execution_order()`.
-   Memoize by `(tensor, requested region)` so shared producers are computed exactly as often as the
-   cost prices them.
-4. Replace `TileChainedMatmul` with that general emitter. Cover deep left chains, produced RHS,
-   both-input-produced trees, fan-out, and multiple sinks; decline any topology whose requests or
-   atomic targets are not represented in the plan.
-5. Run FORCE_PLAN ranking and profiler validation for lone matmul before enabling each larger DAG
-   family. Keep mixed cube+vector outside this charter.
-
-The authoritative details are in
+The authoritative obligation table and validation ladder are in
 `docs/en/dev/proposals/autofuse_cube_cost_model_emit_contract.md`.
 
 ## 9. Operational gotchas (don't relearn these)

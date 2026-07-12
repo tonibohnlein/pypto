@@ -29,13 +29,13 @@ import textwrap
 
 import pypto.language as pl
 import pytest
-from pypto import InternalError, codegen, ir, passes
+from pypto import codegen, ir, passes
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 # These tests were rewritten against the grounded SPMD emit: the pre-grounding cost model
-# plus the #1895 auto_chunk removal changed the solver's decisions (small matmuls now
-# split-K) and migrated the emit onto SPMD (pl.spmd + a tiled zero-seed + atomic-add
-# merge), so the old pl.auto_chunk / pl.pipeline(stage=2) / matmul_acc assertions were
+# plus the #1895 auto_chunk removal changed the solver's decisions and migrated the emit
+# onto SPMD. Plans with split-K use a tiled zero-seed + atomic-add merge; plans without it
+# write their spatial tiles directly. The old pl.auto_chunk / matmul_acc assertions were
 # stale. All cases are now re-derived and live. The one exception is the chained-matmul
 # LOWERING, which is xfail on hw-native-sys/pypto#1908 (an AllocateMemoryAddr bump-allocator
 # limitation that can't pack the chain's L0A buffers — NOT an AutoFuse emit bug).
@@ -44,23 +44,14 @@ from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 class TestAutoFuse:
     """AutoFuse solver-driven fusion + emit."""
 
-    def test_single_matmul_emits_spmd_tiled_split_k_kernel(self, ascend_backend):
-        """A lone 64x64 matmul becomes the grounded solver's SPMD output tiling with split-K.
+    def test_single_matmul_emits_spmd_tiled_kernel(self, ascend_backend):
+        """A lone 64x64 matmul becomes the grounded solver's SPMD output tiling.
 
         Pinned to Ascend910B (``ascend_backend``): the solver's tile/split decision is
-        backend-specific — the grounded 910B model (24 cube cores) tiles the 64x64 output
-        into 32x32 regions (tile=32x32x32) and splits the K axis in 2 to fill more cores —
-        4 output tiles x 2 K-partials = 8 SPMD blocks. (Under this directory's default
-        Ascend950 the solver instead picks tile=32x32x64, split=1 — a different emit.)
-        AutoFuse emits TWO flat SPMD loops:
-
-          - a 4-block ``pl.spmd(4)`` zero-seed — one ``[32,32]`` ``pl.tensor.full`` tile per
-            output tile — so the split-K partials accumulate onto a zeroed output WITHOUT
-            any core materializing the full ``[64,64]`` (which would overflow UB at scale);
-          - an 8-block ``pl.spmd(8)`` matmul (one block = one cross-core task submission)
-            whose body slices the K-strip and output tile (``pl.tensor.slice``), runs the
-            32x32x32 tile matmul, and scatters the partial back with
-            ``atomic=pl.AtomicType.Add`` — the split-K merge.
+        backend-specific. The overlap-fidelity gate rejects a one-iteration K pipeline, so
+        the grounded 910B model now selects tile=32x32x64, split=1. Its balanced 2x3 spatial
+        grid is emitted as one six-block SPMD loop. With no cross-core K merge there is no
+        zero-seed kernel and each block stores its complete output tile directly.
         """
 
         @pl.program
@@ -76,27 +67,22 @@ class TestAutoFuse:
 
         After = passes.auto_fuse()(Before)
         body = next(f for _, f in After.functions.items() if f.name == "mm").as_python()
-        # Two flat SPMD loops: the tiled zero-seed (4 output tiles) and the matmul (4 tiles
-        # x 2 K-split = 8 blocks). Both flat (not nested 2D, which would collide in the
-        # orchestration codegen's variable naming).
-        assert "pl.spmd(4" in body  # tiled zero-seed, one [32,32] tile per output tile
-        assert "pl.spmd(8" in body  # split-K matmul
-        assert body.count("pl.spmd(") == 2
-        # The seed zeroes per-tile (pl.tensor.full on a [32,32] tile, never the full output).
-        assert "pl.tensor.full(" in body
-        # Per-block matmul body: K-strip + output-tile slices, the 32x32x32 tile matmul, atomic merge.
+        # One flat SPMD loop: six spatial tasks, each with the full K contraction.
+        assert "pl.spmd(6" in body
+        assert body.count("pl.spmd(") == 1
+        assert "pl.tensor.full(" not in body
+        # Per-block body: operand slices, a tiled matmul, and a direct non-atomic store.
         assert "pl.tensor.slice(" in body
         assert "pl.tensor.matmul(" in body
-        assert "atomic=pl.AtomicType.Add" in body
+        assert "atomic=pl.AtomicType.Add" not in body
 
     def test_single_matmul_emit_is_numerically_correct(self, ascend_backend):
-        """The SPMD-tiled + split-K emit computes the same result as a plain matmul.
+        """The SPMD-tiled emit computes the same result as a plain matmul.
 
-        ``torch_codegen(..., run_all_spmd_blocks=True)`` runs all 8 SPMD blocks serially
-        into the shared atomic-seeded output, so the generated function reproduces the
-        FULL 64x64 result (not just block 0). It must match ``torch.matmul`` to fp32
-        tolerance — verifying the tiling, K-strip slicing, and split-K atomic merge are
-        numerically faithful, not only structurally present.
+        ``torch_codegen(..., run_all_spmd_blocks=True)`` runs all spatial blocks serially,
+        so the generated function reproduces the FULL 64x64 result (not just block 0). It
+        must match ``torch.matmul`` to fp32 tolerance, verifying that slicing and stores
+        are numerically faithful, not only structurally present.
         """
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
@@ -128,12 +114,9 @@ class TestAutoFuse:
     def test_single_matmul_lowers_to_cube_kernel(self, ascend_backend):
         """The emitted scope lowers through the full pipeline to a cube PTO kernel.
 
-        Under the grounded 910B split-K decision (split=2), the 64x64 matmul lowers to
-        TWO in-core kernels: a vector (AIV) kernel that zero-seeds the output, and the
-        cube (AIC) matmul kernel whose SPMD blocks accumulate their 32x32 tile into that
-        seed via atomic-add — the K partials merge across blocks in DDR. (The pre-grounding
-        emit was a single non-split kernel with a k-pipeline ping-pong / ``tmatmul.acc``;
-        that shape no longer applies.)
+        The overlap-fidelity gate selects split=1 for this small contraction, so the
+        function lowers to one cube (AIC) kernel. No vector zero-seed kernel or cross-core
+        atomic merge is needed.
         """
 
         @pl.program
@@ -149,24 +132,23 @@ class TestAutoFuse:
 
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
 
-        # split-K outlines into a cube (AIC) matmul kernel + a vector (AIV) zero-seed kernel;
-        # the host `mm` becomes an Orchestration function driving the SPMD dispatch.
+        # The host `mm` becomes an Orchestration function driving one AIC SPMD kernel.
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
         by_type: dict[str, list] = {}
         for f in incores:
             by_type.setdefault(str(f.func_type), []).append(f)
         assert len(by_type.get("FunctionType.AIC", [])) == 1, [f.name for f in incores]
-        assert len(by_type.get("FunctionType.AIV", [])) == 1, [f.name for f in incores]
+        assert len(by_type.get("FunctionType.AIV", [])) == 0, [f.name for f in incores]
 
         cube = by_type["FunctionType.AIC"][0]
         mlir = codegen.PTOCodegen().generate(ir.Program([cube], cube.name, cube.span))
         assert "pto.kernel_kind" in mlir
         assert "cube" in mlir  # a pure matmul lowers to a cube kernel
         assert "pto.tload" in mlir and "pto.tmatmul" in mlir
-        # SPMD-distributed split-K: each block indexes off spmd_block_idx and merges its
-        # partial into the seeded output via atomic-add (not a per-tile tmatmul.acc).
+        # SPMD-distributed spatial tiling: each block indexes off spmd_block_idx and writes
+        # a complete tile. A split-K atomic merge would violate the selected split=1 plan.
         assert "spmd_block_idx" in mlir
-        assert "atomic_add" in mlir
+        assert "atomic_add" not in mlir
 
     def test_large_matmul_tiled_seed_avoids_ub_overflow(self, ascend_backend):
         """A large matmul's split-K zero-seed is TILED so it never overflows UB.
@@ -274,10 +256,11 @@ class TestAutoFuse:
         of declining to one untiled InCore scope (the old fallback), the emitter realizes a
         ``ceil(272/144) x ceil(272/80) = 2x4 = 8``-block ``pl.spmd(8)`` grid whose per-block
         offsets are CLAMPED in-bounds (``pl.min(mt*144, 128)`` / ``pl.min(nt*80, 192)``). Every
-        block reads a full ``[144,80]`` tile; the ragged blocks OVERLAP the previous, and the
-        NON-atomic spatial assemble recomputes the overlap identically (idempotent), so the
-        result is exact. This mirrors the vector ``emit_strip`` ceil+clamp. split=1 here, so no
-        zero-seed and no ``atomic`` merge (split-K stays divisor-only).
+        block owns a ``[144,80]`` L1 region, explicitly subdivided at the grounded L0-M
+        bound into ``[128,80]`` and ``[16,80]`` accumulators. Ragged spatial blocks OVERLAP
+        the previous block, and the NON-atomic stores recompute the overlap identically
+        (idempotent), so the result is exact. split=1 here, so there is no zero-seed or
+        ``atomic`` merge (split-K stays divisor-only).
         """
 
         @pl.program
@@ -295,9 +278,10 @@ class TestAutoFuse:
         # Ceil+clamp grid: a single flat 8-block SPMD loop (2x4), NOT an untiled CORE_GROUP scope.
         assert "pl.spmd(8" in body and body.count("pl.spmd(") == 1
         assert "pl.at(level=pl.Level.CORE_GROUP" not in body
-        # Per-block: sliced [144,80] operands, one tile matmul, clamped offsets (pl.min),
-        # non-atomic assemble (split=1 -> no split-K seed, no atomic merge).
-        assert "pl.tensor.slice(" in body and body.count("pl.tensor.matmul(") == 1
+        # Per block: the [144,80] region is two grounded L0-M subtiles, with clamped
+        # spatial offsets (pl.min) and non-atomic stores.
+        assert "pl.tensor.slice(" in body and body.count("pl.tensor.matmul(") == 2
+        assert body.count("pl.tensor.assemble(") == 2
         assert "pl.min(" in body  # in-bounds offset clamp for the ragged (ceil) blocks
         assert "AtomicType" not in body and "pl.tensor.full(" not in body
 
@@ -434,18 +418,16 @@ class TestAutoFuse:
         assert len(incores) == 1  # no split-K seed kernel -> just the vector kernel
         assert str(incores[0].func_type) == "FunctionType.AIV"  # pointwise -> vector kernel
 
-    def test_chained_matmul_fuses_to_one_kernel(self, ascend_backend):
-        """Two back-to-back matmuls the solver groups together fuse into ONE kernel,
-        with the intermediate staying on-chip.
+    def test_chained_matmul_fuses_to_one_kernel(self, ascend_backend, monkeypatch):
+        """The natural buildable cube plan fuses a two-matmul chain across AIC cores.
 
-        For ``C = (A@B)@D`` the solver fuses both matmuls into one group; AutoFuse emits a
-        single CORE_GROUP scope holding both ``tensor.matmul``s, with the intermediate ``t``
-        as a scope-local consumed by the second matmul — never assembled out to DDR. That is
-        the fusion this checks (one kernel, not two round-tripping ``t``). NB: the solver's
-        96x64 tile does not divide the 128x256 output, so the emit uses the whole-output
-        fused scope rather than a spatial SPMD tiling; the lowering of this scope is exercised
-        separately (test_chained_matmul_lowers_to_cube_kernel, xfail on #1908).
+        Buildable mode filters unequal multi-op region shapes, so the natural plan is
+        an exact ``2 M x 1 N x 2 K`` grid. One AIV seed initializes the atomic target;
+        one four-work-unit AIC kernel recursively produces the requested ``A@B`` K
+        share and immediately consumes it in the sink. The intermediate never reaches
+        a boundary ``assemble`` or a standalone kernel.
         """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
 
         @pl.program
         class Prog:
@@ -461,60 +443,188 @@ class TestAutoFuse:
                 return c
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "chain").as_python()
-        # Both matmuls fused into ONE CORE_GROUP scope; the intermediate t stays on-chip
-        # (consumed by the second matmul), never assembled to DDR -> one kernel, not two.
-        assert "pl.at(level=pl.Level.CORE_GROUP" in body
+        assert "pl.at(level=pl.Level.CORE_GROUP" not in body
+        assert "pl.spmd(4" in body and "pl.spmd(2" in body
+        assert body.count("pl.spmd(") == 2  # seed plus one fused cube kernel
         assert body.count("pl.tensor.matmul(") == 2
-        # The intermediate t is a scope-local consumed inside the CORE_GROUP scope (never
-        # assembled). The ONLY assemble is the output-wiring copy of the returned result `c` into
-        # the appended `c_out` param — a matmul-produced return has no create to lift, so it is
-        # copied into an Out param (device/harness binds outputs by position; without it the
-        # output is unwritten). So exactly one assemble, and the return is wired to an Out param.
-        assert body.count("pl.tensor.assemble(") == 1
+        assert body.count("pl.tensor.assemble(") == 2  # zero seed and root atomic store
+        assert body.count("AtomicType.Add") == 1
         assert "pl.Out[" in body
 
-    def test_produced_rhs_cube_plan_fails_loudly_in_strict_mode(self, ascend_backend, monkeypatch):
-        """A both-input-produced root cannot enter the legacy left-chain emitter.
+    def test_produced_rhs_cube_plan_emits_recursive_tree(self):
+        """A non-square both-input-produced root replays one role-aware cube plan.
 
-        The historical cube model represents every ephemeral as an M-band, while the
-        root's RHS needs a K/N band. ``CubeSchedulePlan`` marks that role incompatible.
-        Production can materialize the three matmuls as a correctness fallback, but strict
-        model/emit validation must reject pairing that fallback with the fused model cost.
+        The fixed plan uses four spatial regions and five root-K shares. Its left
+        producer materializes ``SpatialM x ParallelK`` regions while its right
+        producer materializes ``ParallelK x SpatialN`` regions. Strict mode proves
+        the plan does not fall through to dependency-ordered standalone matmuls.
+
+        ``PYPTO_AUTOFUSE_FORCE_PLAN`` is process-cached, so run in a fresh process.
         """
-        torch = pytest.importorskip("torch")
-        from pypto.debug import torch_codegen  # noqa: PLC0415
+        script = textwrap.dedent(
+            """
+            import torch
 
-        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
-        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
 
-        @pl.program
-        class Prog:
-            @pl.function(attrs={"auto_fuse": True})
-            def tree(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP32],
-                b: pl.Tensor[[64, 64], pl.FP32],
-                c: pl.Tensor[[64, 64], pl.FP32],
-                d: pl.Tensor[[64, 64], pl.FP32],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                lhs: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
-                rhs: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(c, d)
-                out: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(lhs, rhs)
-                return out
+            backend.set_backend_type(BackendType.Ascend910B)
 
-        fallback = passes.auto_fuse()(Prog)
-        body = next(f for _, f in fallback.functions.items() if f.name == "tree").as_python()
-        assert body.count("pl.tensor.matmul(") == 3
-        namespace: dict = {}
-        exec(torch_codegen(fallback, run_all_spmd_blocks=True), namespace)  # noqa: S102
-        torch.manual_seed(0)
-        a, b, c, d = (torch.randn(64, 64, dtype=torch.float32) for _ in range(4))
-        out = namespace["tree"](a, b, c, d)
-        assert torch.allclose(out, (a @ b) @ (c @ d), rtol=1e-3, atol=1e-3)
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def tree(
+                    self,
+                    a: pl.Tensor[[32, 48], pl.FP32],
+                    b: pl.Tensor[[48, 80], pl.FP32],
+                    c: pl.Tensor[[80, 64], pl.FP32],
+                    d: pl.Tensor[[64, 96], pl.FP32],
+                ) -> pl.Tensor[[32, 96], pl.FP32]:
+                    lhs: pl.Tensor[[32, 80], pl.FP32] = pl.matmul(a, b)
+                    rhs: pl.Tensor[[80, 96], pl.FP32] = pl.matmul(c, d)
+                    out: pl.Tensor[[32, 96], pl.FP32] = pl.matmul(lhs, rhs)
+                    return out
 
-        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
-        with pytest.raises(InternalError, match="produced RHS/band role"):
-            passes.auto_fuse()(Prog)
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "tree").as_python()
+            assert "pl.spmd(20" in body  # 2 M regions * 2 N regions * 5 K shares
+            assert "pl.spmd(4" in body   # one disjoint zero seed per spatial region
+            assert body.count("pl.tensor.matmul(") == 3
+            assert body.count("pl.tensor.matmul_acc(") >= 2
+            assert "pl.at(level=pl.Level.CORE_GROUP" not in body
+
+            namespace = {}
+            exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            a = torch.randn(32, 48, dtype=torch.float32) * 0.05
+            b = torch.randn(48, 80, dtype=torch.float32) * 0.05
+            c = torch.randn(80, 64, dtype=torch.float32) * 0.05
+            d = torch.randn(64, 96, dtype=torch.float32) * 0.05
+            expected = (a @ b) @ (c @ d)
+            actual = namespace["tree"](a, b, c, d)
+            assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-3), (
+                actual - expected
+            ).abs().max().item()
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "48,16,5,2,2"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_cube_plan_recomputes_fanout_for_distinct_roles(self):
+        """A fan-out producer is shared by identity and recomputed by requested role.
+
+        ``T`` feeds one root as its LHS and another as its RHS. For a 2x2 spatial
+        grid, those consumers need different regions: ``[32,64]`` row bands and
+        ``[64,32]`` column bands. The plan therefore contains two instances of
+        ``T = A@B`` and two boundary roots in one four-work-unit SPMD kernel.
+        """
+        script = textwrap.dedent(
+            """
+            import torch
+
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def fanout(
+                    self,
+                    a: pl.Tensor[[64, 64], pl.FP32],
+                    b: pl.Tensor[[64, 64], pl.FP32],
+                    c: pl.Tensor[[64, 64], pl.FP32],
+                    d: pl.Tensor[[64, 64], pl.FP32],
+                ) -> tuple[
+                    pl.Tensor[[64, 64], pl.FP32],
+                    pl.Tensor[[64, 64], pl.FP32],
+                ]:
+                    shared: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                    left: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(shared, c)
+                    right: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(d, shared)
+                    return left, right
+
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "fanout").as_python()
+            assert body.count("pl.spmd(") == 1 and "pl.spmd(4" in body
+            assert body.count("pl.tensor.matmul(") == 4
+            assert body.count("pl.Out[") == 2
+
+            namespace = {}
+            exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(1)
+            a, b, c, d = (
+                torch.randn(64, 64, dtype=torch.float32) * 0.05 for _ in range(4)
+            )
+            shared = a @ b
+            actual_left, actual_right = namespace["fanout"](a, b, c, d)
+            assert torch.allclose(actual_left, shared @ c, rtol=1e-3, atol=1e-3)
+            assert torch.allclose(actual_right, d @ shared, rtol=1e-3, atol=1e-3)
+
+            @pl.program
+            class DeepProg:
+                @pl.function(attrs={"auto_fuse": True})
+                def deep(
+                    self,
+                    a: pl.Tensor[[64, 64], pl.FP32],
+                    b: pl.Tensor[[64, 64], pl.FP32],
+                    c: pl.Tensor[[64, 64], pl.FP32],
+                    d: pl.Tensor[[64, 64], pl.FP32],
+                    e: pl.Tensor[[64, 64], pl.FP32],
+                ) -> pl.Tensor[[64, 64], pl.FP32]:
+                    t0: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                    t1: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(t0, c)
+                    t2: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(t1, d)
+                    out: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(t2, e)
+                    return out
+
+            deep_after = passes.auto_fuse()(DeepProg)
+            deep_body = next(
+                f for _, f in deep_after.functions.items() if f.name == "deep"
+            ).as_python()
+            assert deep_body.count("pl.spmd(") == 1 and "pl.spmd(4" in deep_body
+            assert deep_body.count("pl.tensor.matmul(") == 4
+
+            deep_namespace = {}
+            exec(torch_codegen(deep_after, run_all_spmd_blocks=True), deep_namespace)
+            torch.manual_seed(2)
+            values = [torch.randn(64, 64, dtype=torch.float32) * 0.05 for _ in range(5)]
+            expected = (((values[0] @ values[1]) @ values[2]) @ values[3]) @ values[4]
+            actual = deep_namespace["deep"](*values)
+            assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-3)
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "32,32,1,2,2"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
 
     @pytest.mark.xfail(
         reason="chained-matmul lowering blocked on hw-native-sys/pypto#1908: AllocateMemoryAddr "
@@ -595,56 +705,181 @@ class TestAutoFuse:
         assert sink_inputs[0] == intermediate, (sink_inputs, intermediate)
         assert len(sink_inputs) == 2 and sink_inputs[1] != intermediate
 
-    def test_chained_matmul_deep_t_tiles_shared_dim(self, ascend_backend):
-        """When a fused chain's per-tile intermediate T_band [h,K2] exceeds L0c, the shared
-        dimension K2 is tiled so MM2 becomes a matmul_acc over panels (deep-T / G-B).
+    def test_cube_plan_materializes_large_intermediate_in_l1(self):
+        """A multi-L0 intermediate is assembled into the L1 band priced by the plan.
 
-        Pinned to Ascend910B (L0c/Acc = 128 KB): for ``(A@B)@D`` with M=N=256, K1=256,
-        K2=512 the solver tiles C's output into ``[128,256]`` regions, so the naive per-tile
-        T_band would be ``[128,512]`` fp32 = 256 KB > 128 KB L0c. Deep-T tiles K2 into
-        ``512/256 = 2`` panels: each MM1 produces a ``[128,256]`` T_panel (128 KB, fits L0c)
-        and MM2 folds ``T_panel @ D[panel]`` into the output tile via ``tensor.matmul_acc`` —
-        so the full ``[128,512]`` intermediate never materializes. Verified numerically via
-        ``torch_codegen`` (the tensor-level interpreter); the full cube LOWERING of a fused
-        chain remains xfail on #1908, so this does NOT run the Default pipeline.
+        The forced work unit requests a ``[64,768]`` fp32 intermediate (192 KiB):
+        larger than L0c but within the solver's L1 pebble budget. The producer emits
+        three ``[64,256]`` accumulator tiles into ``tensor.create_l1``; the consumer
+        then reads that resident band. Numeric execution and the Default lowering
+        both validate the tensor-level algorithm and Mat/L1 placement.
         """
-        torch = pytest.importorskip("torch")
-        from pypto.debug import torch_codegen  # noqa: PLC0415
+        script = textwrap.dedent(
+            """
+            import torch
+
+            import pypto.language as pl
+            from pypto import backend, ir, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def ch(
+                    self,
+                    a: pl.Tensor[[128, 256], pl.FP32],
+                    b: pl.Tensor[[256, 768], pl.FP32],
+                    d: pl.Tensor[[768, 64], pl.FP32],
+                ) -> pl.Tensor[[128, 64], pl.FP32]:
+                    t: pl.Tensor[[128, 768], pl.FP32] = pl.matmul(a, b)
+                    out: pl.Tensor[[128, 64], pl.FP32] = pl.matmul(t, d)
+                    return out
+
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "ch").as_python()
+            assert "pl.spmd(2" in body and body.count("pl.spmd(") == 1
+            assert "pl.tensor.create_l1([64, 768]" in body
+            assert body.count("pl.tensor.matmul(") == 4  # three producer subtiles + sink
+            assert body.count("pl.tensor.assemble(") == 4  # three into L1 + one boundary store
+
+            namespace = {}
+            exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            a = torch.randn(128, 256, dtype=torch.float32) * 0.03
+            b = torch.randn(256, 768, dtype=torch.float32) * 0.03
+            d = torch.randn(768, 64, dtype=torch.float32) * 0.03
+            actual = namespace["ch"](a, b, d)
+            expected = (a @ b) @ d
+            assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-3), (
+                actual - expected
+            ).abs().max().item()
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            incores = [
+                f for _, f in lowered.functions.items() if ir.is_incore_type(f.func_type)
+            ]
+            assert len(incores) == 1
+            assert str(incores[0].func_type) == "FunctionType.AIC"
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "64,64,1,2,1"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_lone_cube_plan_honors_l0_dimension_bounds(self):
+        """L0 M/N bounds apply even when the full region fits by Acc bytes.
+
+        A ``[32,512]`` fp32 output is only 64 KiB, below the 128 KiB Acc capacity,
+        but the grounded plan's L0-N base is 256. The emitter must therefore build
+        two ``[32,256]`` accumulator subtiles. Treating capacity as the only limit
+        would emit one unplanned 512-column L0 tile and diverge from Phase D.
+        """
+        script = textwrap.dedent(
+            """
+            import torch
+
+            import pypto.language as pl
+            from pypto import backend, ir, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mm(
+                    self,
+                    a: pl.Tensor[[32, 64], pl.FP32],
+                    b: pl.Tensor[[64, 512], pl.FP32],
+                ) -> pl.Tensor[[32, 512], pl.FP32]:
+                    out: pl.Tensor[[32, 512], pl.FP32] = pl.matmul(a, b)
+                    return out
+
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "mm").as_python()
+            assert "pl.spmd(1" in body and body.count("pl.spmd(") == 1
+            assert body.count("pl.tensor.matmul(") == 2
+            assert body.count("pl.tensor.assemble(") == 2
+
+            namespace = {}
+            exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            a = torch.randn(32, 64, dtype=torch.float32) * 0.05
+            b = torch.randn(64, 512, dtype=torch.float32) * 0.05
+            actual = namespace["mm"](a, b)
+            expected = a @ b
+            assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-4)
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            incores = [
+                f for _, f in lowered.functions.items() if ir.is_incore_type(f.func_type)
+            ]
+            assert len(incores) == 1
+            assert str(incores[0].func_type) == "FunctionType.AIC"
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "512,32,1,1,1"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_low_precision_cube_accumulator_declines_gracefully(self, ascend_backend, monkeypatch):
+        """A low-precision output never receives an ill-typed planned K carry.
+
+        Cube contractions accumulate floating inputs in FP32. Until the cube plan
+        represents final FIXPIPE narrowing explicitly, a FP16 output cannot carry a
+        streamed or cross-core K accumulation in its output tensor. Generic emission
+        must decline to the original single matmul instead of constructing FP16
+        ``tensor.matmul_acc`` (which fails type deduction).
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
 
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def ch(
+            def mm(
                 self,
-                a: pl.Tensor[[256, 256], pl.FP32],
-                b: pl.Tensor[[256, 512], pl.FP32],
-                d: pl.Tensor[[512, 256], pl.FP32],
-            ) -> pl.Tensor[[256, 256], pl.FP32]:
-                t: pl.Tensor[[256, 512], pl.FP32] = pl.matmul(a, b)
-                c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(t, d)
-                return c
+                a: pl.Tensor[[64, 64], pl.FP16],
+                b: pl.Tensor[[64, 64], pl.FP16],
+            ) -> pl.Tensor[[64, 64], pl.FP16]:
+                out: pl.Tensor[[64, 64], pl.FP16] = pl.matmul(a, b)
+                return out
 
         after = passes.auto_fuse()(Prog)
-        body = next(f for _, f in after.functions.items() if f.name == "ch").as_python()
-        # Deep-T fired: spatially tiled (not the whole-output CORE_GROUP fallback), MM2 folds
-        # panels via matmul_acc, and the full [128,512] T_band never materializes (K2 is tiled
-        # into [128,256] panels that each fit L0c).
-        assert "pl.at(level=pl.Level.CORE_GROUP" not in body and "pl.spmd(" in body
-        assert "pl.tensor.matmul_acc(" in body
-        assert "[128, 512]" not in body  # T is panelled; the full [h,K2] intermediate is gone
+        body = next(f for _, f in after.functions.items() if f.name == "mm").as_python()
+        assert "pl.tensor.matmul_acc(" not in body
+        assert body.count("pl.tensor.matmul(") == 1
 
-        # Numeric faithfulness of the panelled matmul_acc chain (tensor-level interpreter).
-        namespace: dict = {}
-        exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)  # noqa: S102
-        torch.manual_seed(0)
-        a = torch.randn(256, 256, dtype=torch.float32) * 0.03
-        b = torch.randn(256, 512, dtype=torch.float32) * 0.03
-        d = torch.randn(512, 256, dtype=torch.float32) * 0.03
-        out = namespace["ch"](a, b, d)
-        ref = (a @ b) @ d
-        assert torch.allclose(out, ref, rtol=1e-3, atol=1e-3), (
-            f"max abs diff {(out - ref).abs().max().item():.3e}"
-        )
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        incores = [f for _, f in lowered.functions.items() if ir.is_incore_type(f.func_type)]
+        assert len(incores) == 1
+        assert str(incores[0].func_type) == "FunctionType.AIC"
 
     def test_chained_pointwise_fuses_into_one_tiled_kernel(self, ascend_backend):
         """Two chained pointwise ops the solver groups fuse into one tiled vector
