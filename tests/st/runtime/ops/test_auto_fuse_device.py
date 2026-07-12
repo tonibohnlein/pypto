@@ -26,6 +26,8 @@ TWO parts:
   Part B — AutoFuse end-to-end on device.  Realistic fused-vector kernels (ragged pointwise,
     softmax, RMSNorm, LayerNorm) compiled with ``attrs={"auto_fuse": True}`` and
     ``PYPTO_AUTOFUSE_GENERIC_EMIT=1``, numerically verified against a torch reference on hardware.
+    The wide P4 cases enable ``PYPTO_AUTOFUSE_P4=1`` in the test itself and cover online softmax,
+    Welford layernorm, and a scaled-softmax near miss that must take the ordinary cut path.
     The return->named-output wiring is handled by the compiler (AutoFuse lifts the returned buffer
     into an appended Out param -> orchestration codegen emits the add_output write-back), so these
     return-based programs bind their output by position ([x, out]) in the harness.
@@ -270,6 +272,8 @@ RRB_M, RRB_N = 256, 128     # row-reduce + broadcast (reduction intermediate, no
 F16_M, F16_N = 256, 128     # FP16 softmax (granule g=16)
 CS_M, CS_N = 128, 256       # bare col_sum sink -> S2 split-reduction (atomic-add merge)
 FK_M, FK_N = 256, 256       # multi-sink fork: two live-outs sharing an input
+P4_M, P4_N = 128, 8192      # reduced axis exceeds UB: exact P4 must stream online
+P4_LN_SHIFT = 2000.0        # dual-sum variance cancels here; Welford must remain finite
 
 # --- Part C: model-fragment experiments (realistic transformer components) ---
 MRMS_M, MRMS_N = 256, 1024   # wider RMSNorm: exercises the sub-granule reduction-strip cap
@@ -280,6 +284,11 @@ SWG_M, SWG_N = 256, 1024     # SwiGLU FFN gating: silu(gate)*up (two inputs)
 SSM_M, SSM_N = 256, 512      # scaled softmax (attention scores * 1/sqrt(d))
 TWIN_M, TWIN_N = 256, 512    # two interleaved independent chains (group-reorder fix)
 ATT_S, ATT_D = 128, 64       # attention block: q@k -> scaled softmax -> p@v
+
+
+def _p4_shifted_layernorm_input() -> torch.Tensor:
+    """High-mean input that exposes cancellation in a raw dual-sum variance."""
+    return torch.randn(P4_M, P4_N, dtype=torch.float32) + P4_LN_SHIFT
 
 
 class AutoFuseRaggedPointwiseCase(PTOTestCase):
@@ -433,6 +442,121 @@ class AutoFuseLayerNormCase(PTOTestCase):
         tensors["out"][:] = xc * torch.rsqrt(xc.pow(2).mean(-1, keepdim=True) + NORM_EPS)
 
 
+class AutoFuseP4SoftmaxWideCase(PTOTestCase):
+    """Exact online softmax [128,8192], whose reduced axis cannot materialize in UB."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_p4_softmax_128x8192"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [P4_M, P4_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [P4_M, P4_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[P4_M, P4_N], pl.FP32]) -> pl.Tensor[[P4_M, P4_N], pl.FP32]:
+                m: pl.Tensor[[P4_M, 1], pl.FP32] = pl.row_max(x)
+                shifted: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.row_expand_sub(x, m)
+                exp: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.exp(shifted)
+                total: pl.Tensor[[P4_M, 1], pl.FP32] = pl.row_sum(exp)
+                out: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.row_expand_div(exp, total)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = torch.softmax(tensors["x"], dim=-1)
+
+
+class AutoFuseP4LayerNormWideCase(PTOTestCase):
+    """Canonical dual-sum layernorm [128,8192], emitted as stable online Welford."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_p4_layernorm_128x8192_shift2000"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [P4_M, P4_N], DataType.FP32, init_value=_p4_shifted_layernorm_input),
+            TensorSpec("out", [P4_M, P4_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def ln(self, x: pl.Tensor[[P4_M, P4_N], pl.FP32]) -> pl.Tensor[[P4_M, P4_N], pl.FP32]:
+                sx: pl.Tensor[[P4_M, 1], pl.FP32] = pl.row_sum(x)
+                xsq: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.mul(x, x)
+                sxsq: pl.Tensor[[P4_M, 1], pl.FP32] = pl.row_sum(xsq)
+                mean: pl.Tensor[[P4_M, 1], pl.FP32] = pl.mul(sx, 1.0 / P4_N)
+                mean_square: pl.Tensor[[P4_M, 1], pl.FP32] = pl.mul(sxsq, 1.0 / P4_N)
+                square_mean: pl.Tensor[[P4_M, 1], pl.FP32] = pl.mul(mean, mean)
+                variance: pl.Tensor[[P4_M, 1], pl.FP32] = pl.sub(mean_square, square_mean)
+                variance_eps: pl.Tensor[[P4_M, 1], pl.FP32] = pl.add(variance, NORM_EPS)
+                inv_std: pl.Tensor[[P4_M, 1], pl.FP32] = pl.rsqrt(variance_eps)
+                centered: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.row_expand_sub(x, mean)
+                out: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.row_expand_mul(centered, inv_std)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"]
+        mean = x.mean(dim=-1, keepdim=True)
+        variance = x.var(dim=-1, keepdim=True, unbiased=False)
+        tensors["out"][:] = (x - mean) * torch.rsqrt(variance + NORM_EPS)
+
+
+class AutoFuseP4ScaledSoftmaxWideCase(PTOTestCase):
+    """Scaled softmax [128,8192]: a deliberate P4 near miss that must cut safely."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_p4_scaled_softmax_cut_128x8192"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [P4_M, P4_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [P4_M, P4_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[P4_M, P4_N], pl.FP32]) -> pl.Tensor[[P4_M, P4_N], pl.FP32]:
+                scaled: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.mul(x, 0.125)
+                m: pl.Tensor[[P4_M, 1], pl.FP32] = pl.row_max(scaled)
+                shifted: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.row_expand_sub(scaled, m)
+                exp: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.exp(shifted)
+                total: pl.Tensor[[P4_M, 1], pl.FP32] = pl.row_sum(exp)
+                out: pl.Tensor[[P4_M, P4_N], pl.FP32] = pl.row_expand_div(exp, total)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = torch.softmax(tensors["x"] * 0.125, dim=-1)
+
+
 class AutoFusePwWideShortCase(PTOTestCase):
     """Wide-short pointwise [64,4096]: the free-axis over-pad case. Rows are the FREE
     (row-major) axis → must NOT be granule-padded; before the fix this overflowed UB."""
@@ -456,7 +580,9 @@ class AutoFusePwWideShortCase(PTOTestCase):
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def pw(self, a: pl.Tensor[[WS_M, WS_N], pl.FP32], b: pl.Tensor[[WS_M, WS_N], pl.FP32]) -> pl.Tensor[[WS_M, WS_N], pl.FP32]:
+            def pw(
+                self, a: pl.Tensor[[WS_M, WS_N], pl.FP32], b: pl.Tensor[[WS_M, WS_N], pl.FP32]
+            ) -> pl.Tensor[[WS_M, WS_N], pl.FP32]:
                 c: pl.Tensor[[WS_M, WS_N], pl.FP32] = pl.add(a, b)
                 d: pl.Tensor[[WS_M, WS_N], pl.FP32] = pl.mul(c, b)
                 return d
@@ -489,7 +615,9 @@ class AutoFusePwTallCase(PTOTestCase):
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def pw(self, a: pl.Tensor[[TL_M, TL_N], pl.FP32], b: pl.Tensor[[TL_M, TL_N], pl.FP32]) -> pl.Tensor[[TL_M, TL_N], pl.FP32]:
+            def pw(
+                self, a: pl.Tensor[[TL_M, TL_N], pl.FP32], b: pl.Tensor[[TL_M, TL_N], pl.FP32]
+            ) -> pl.Tensor[[TL_M, TL_N], pl.FP32]:
                 c: pl.Tensor[[TL_M, TL_N], pl.FP32] = pl.add(a, b)
                 d: pl.Tensor[[TL_M, TL_N], pl.FP32] = pl.mul(c, b)
                 return d
@@ -1014,7 +1142,8 @@ class ModelAttentionCase(PTOTestCase):
 # dtypes, to stress the emit where fixed cases can't: ragged widths (66/130 -> padding +
 # count-mode floor), wide tiles (1024 -> sub-granule strip cap), tall tiles (4096 rows -> many
 # strips), the wide-short over-pad case (64x4096), and the fp32/fp16 granule (64 vs 128 elems/
-# repeat). Widths stay <= 1024 for reductions (>= 2048 fused reductions need streaming, not built).
+# repeat). The generic sweep stays <= 1024 for reductions; dedicated P4 cases above cover the
+# online-streaming regime at N=8192 with exact softmax/layernorm and a deliberate near miss.
 # FP16 covers only the scalar-free reduction kernels (a fp16 tensor + a fp32 scalar const promotes
 # to fp32 in the DSL, so fp16 pointwise-with-scalar is skipped — an authoring limitation, not emit).
 SWEEP_GRID = [
@@ -1227,6 +1356,27 @@ class TestAutoFuseDevice:
         assert result.passed, f"AutoFuse LayerNorm [256,512] mismatch on device: {result.error}"
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_p4_softmax_wide(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+        result = test_runner.run(AutoFuseP4SoftmaxWideCase(platform=platform))
+        assert result.passed, f"P4 softmax [128,8192] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_p4_layernorm_wide(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+        result = test_runner.run(AutoFuseP4LayerNormWideCase(platform=platform, config=_RSQRT_TOL))
+        assert result.passed, f"P4 layernorm [128,8192] at mean+2000 mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_autofuse_p4_scaled_softmax_wide_cuts(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+        result = test_runner.run(AutoFuseP4ScaledSoftmaxWideCase(platform=platform))
+        assert result.passed, f"Scaled-softmax P4 near miss [128,8192] mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_autofuse_pw_wide_short(self, test_runner, platform):
         result = test_runner.run(AutoFusePwWideShortCase(platform=platform))
         assert result.passed, f"AutoFuse wide-short pointwise [64,4096] mismatch on device: {result.error}"
@@ -1321,7 +1471,9 @@ class TestAutoFuseDevice:
     def test_model_attention_sweep(self, test_runner, platform, S, D):
         # matmul reassociation -> the rsqrt-level tolerance; watch for actual==0.0 (the wiring fix).
         result = test_runner.run(ModelAttentionSweepCase(S, D, platform=platform, config=_RSQRT_TOL))
-        assert result.passed, f"AutoFuse attention [{S},{D}] mismatch on device (any actual=0.0?): {result.error}"
+        assert result.passed, (
+            f"AutoFuse attention [{S},{D}] mismatch on device (any actual=0.0?): {result.error}"
+        )
 
 
 if __name__ == "__main__":
