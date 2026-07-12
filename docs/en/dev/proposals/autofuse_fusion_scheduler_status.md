@@ -1,7 +1,8 @@
 # AutoFuse fusion-scheduler — design, cost-model journey, status & handoff
 
 **Purpose.** A self-contained handoff for the AutoFuse solver-driven fusion + tiling work
-(branch `fusion-scheduler`). It records the GOAL, the **cost-model ↔ emit fidelity contract**,
+(current development branch `fusion-scheduler-vector-stream-plan`, based on `fusion-scheduler`).
+It records the GOAL, the **cost-model ↔ emit fidelity contract**,
 **how the cost model was designed** (the reasoning, not just the code), what is implemented and
 validated, and what remains. Read this to pick up the work cold.
 
@@ -9,6 +10,13 @@ Companion documents:
 - `docs/en/dev/proposals/autofuse_cost_model_emit_contract.md` — **the fidelity contract** (A1–A7,
   the P-ladder, §6 fidelity status). This status doc summarizes it; that doc is the authority.
 - Device verification tasks (operational, outside the repo): `/home/toni/work/pypto3/autofuse_device_*.md`.
+
+**Current vector checkpoint (2026-07-12).** PyPTO `2e81d8ff` pins solver `4ca1026`. The
+vector-only model now derives a stack-local `VectorStreamPlan` for every candidate, costs the
+emitted init/rolled/tail/finalize phases, and re-derives that plan only for a winning or forced
+configuration. The emitter consumes the same materialized/pointwise strip geometry and reduction
+phase schedule. Host validation is complete; the 910B2 device closure is running from
+`/home/toni/work/pypto3/autofuse_device_verify_vector_stream_plan.md`.
 
 ---
 
@@ -186,13 +194,30 @@ the sum of phase rooflines, so barriers never hide work across phases. AutoFuse 
 the winning config. `CostResult`
 stays at its pre-refactor 112-byte footprint (guarded at ≤128 bytes) for the local-search cache.
 
+**Vector refactor preservation audit.** The plan extraction was separated from the subsequent
+model corrections so structural movement could be checked independently. Solver `10f8f8b`
+(pre-plan) and `1fc542d` (plan authoritative and absent from `CostResult`, before phase pricing)
+produce the same fixed-cost anchors: fused/separate pointwise `11003.7/22007.4`, fused/cut softmax
+`30073.8/88186.9`, few-row reduction `10563`, and long streamed reduction `101566`. Current
+`4ca1026` deliberately changes the phase-sensitive anchors to softmax `22153.9/88309.8`, few-row
+reduction `10093.3`, and long streamed reduction `59469.3`; pointwise remains
+`11003.7/22007.4`. These are intended consequences of phase-local compute/traffic, serial edge
+phases, and the reduction source/work floor—not drift from moving schedule derivation into a plan.
+
+**Current host gates.** AutoFuse UT is 27 passed / 1 expected xfail; the solver suite is 338 passed /
+7 documented baseline failures. The device file collects 51 A2/A3 cases. Four new persistent cases
+cover exact P4 softmax `[128,8192]`, Welford layernorm at input mean `+2000`, a scaled-softmax near
+miss that must cut, and a P2 apply-only bias input whose expected MTE2 payload is `2×x + 1×bias`.
+
 **Device-validated on 910B2:** tall pointwise streaming, C3 no-regret, cube G-A + ragged-K (all
 correct). Two device-found crashes (reused-input pointwise, split-K seed) fixed.
 
-**Commit arc** (branch `fusion-scheduler`; newest first): `d8f650e4` P4 layernorm Welford ·
-`e566ecbe` P4 hardening (C1/A1/C2/apply-pipe) · `5e7c76b6` P4 layernorm dual-sum · `807fb391` P4
-softmax · `10aa6fd0` G2 · `94f5c731` pointwise band-count + seed · `bbd46b4b` C3 · `4113f006`
-pointwise UB streaming · `38d51d7d`/`e1fd53fd`/`45d1b129`/`f8a0920c` the cube-emit loop.
+**Current commit arc** (newest first): PyPTO `2e81d8ff` phase-traffic device case · `8e3d8731` wide
+P4 device cases · `11ff2a36` consume phase-priced schedules · `e307e15c` rebuild plans only for
+winners · `8922552e` consume solver-owned vector plans · `727c6310` shared P4 detection + pipelined
+stats. Solver `4ca1026` phase rooflines · `1fc542d` compact search cache · `0e34918` authoritative
+plans · `975570a` expose vector plans. Earlier P4/cost arc: `d8f650e4` Welford · `e566ecbe` P4
+hardening · `807fb391` softmax · `10aa6fd0` G2 · `bbd46b4b` C3.
 
 ---
 
@@ -226,15 +251,20 @@ statistics update math remains deliberately algorithm-specific.
 
 ## 7. What remains (ordered)
 
-1. **Push** the batch (`5e7c76b6..HEAD`) via port 443, submodule first.
-2. **Device verification** (`autofuse_device_verify_g2_p4.md`, held until now): T1 the crash fixes, T2
-   G2 perf, T3 P4 softmax+layernorm fuse + numeric + **wall-vs-cut** (with `P4=1`). Add the review's
-   must-checks: temperature/scaled softmax must CUT (not crash) on device; layernorm accuracy at
-   non-zero mean. Decisive question: is fused P4 faster-or-tied vs the cut on silicon (softmax may be
-   compute-bound → the accumulate pipelining matters)?
+1. **Complete the running device closure**
+   (`/home/toni/work/pypto3/autofuse_device_verify_vector_stream_plan.md`) at the exact
+   `2e81d8ff` / `4ca1026` fingerprints. Required evidence: 51/51 correctness; exact P4 fuse versus
+   scaled-softmax cut; non-zero-mean Welford accuracy; P4 wall versus cut; phase-local MTE2/Vector
+   overlap; `2×x + 1×bias` traffic; and forced-plan ranking/regret.
+2. **Re-audit the grounded vector terms against pto-isa** after the device report. Reconcile the
+   measured pipeline and traffic evidence with `grounded_cost_model.md`; do not refit constants from
+   one shape or compare model cycles directly to microseconds without the established conversion.
 3. **P4 increment 3 — flip to default** (retire `PYPTO_AUTOFUSE_P4`) — only after device sign-off; will
    need to re-point 2 tests that assert the pre-P4 cut.
-4. **P4 increment 4 — remaining cost fidelity:** price the split-K seed and reconcile G5 grid divergence.
+4. **Remaining vector fidelity:** reconcile G5 grid-count divergence and gate or emit the G6
+   materialized max/row-reduction split families. The split-K seed is a cube-side cost term.
+5. **Start the cube-only plan extraction:** introduce a compact solver-owned `CubeSchedulePlan`
+   using the staged charter in §8; keep mixed cube+vector outside this work.
 
 **Deferred (all decline *gracefully* today — correctness intact, not fused):** the ProblemBuilder
 nested-arg gap (hoist nested compute-call args to SSA temps); P4 col-softmax / scale-then-softmax /
@@ -243,7 +273,61 @@ ragged-K peel lowering test + deep-T decline logging; mixed cube+vector (a separ
 
 ---
 
-## 8. Operational gotchas (don't relearn these)
+## 8. Cube-only audit and next charter
+
+The cube path should adopt the same **solver-owned, stack-local plan** architecture, but not as one
+large rewrite. A cube schedule has different decisions from a vector stream: exact spatial regions,
+sink split-K, per-op sequential K strips, split seed/atomic merge, and intermediate residency. The
+right solver-owned descriptor is therefore a `CubeSchedulePlan`, not an extension of
+`VectorStreamPlan`.
+
+**Why a plan is justified.** The lone-matmul path is close to faithful, but the audit found concrete
+places where costing and emission independently reconstruct different algorithms:
+
+- A current two-matmul test is priced as `tile=96×64×32, split=4, cores=24`; the emitter then logs
+  non-uniform split-K declines for both matmuls and emits the original untiled fused scope.
+- A deep-intermediate chain is priced with `split=8, cores=16`, while `TileChainedMatmul` ignores
+  `tile.split`; the solver's parallel algorithm is not emitted.
+- `derive_exec` derives a distinct L1-fitting `seq_k` for every matmul, and solution JSON exposes it,
+  but AutoFuse passes only the sink `config.k` to every statement. An internal matmul can therefore
+  run a different K loop from the one that made the group feasible and determined its cost.
+- Cube DDR overlap is granted when `K/S ≥ 32`, but `BuildTileMatmul` emits stage 2 only when its
+  chosen `k` produces at least two full loop iterations. For example, a per-core `K=32, k=32` path
+  is one serial matmul while the model grants `max(compute,DDR)`.
+- A ragged-K peel is a serial tail after the rolled K loop, but the current cube cost uses one global
+  roofline. The split-K zero seed is a separate AIV kernel and barrier that is not priced.
+- The model's balanced, disjoint `AxisPartition` regions and the non-split emitter's max-tile
+  ceil+clamp overlap have the same largest region but not necessarily the same total work, bytes, or
+  wave count. A non-uniform split-K grid is worse: the emitter declines it because atomic overlap
+  would double-count.
+
+**Proposed `CubeSchedulePlan` (owned by `mlsys26`).** For one candidate it should contain:
+
+- topology kind (`LoneMatmul`, an exact supported chain kind, or unsupported);
+- exact spatial region/grid policy and work-unit count;
+- sink split-K and the seed/atomic-merge schedule;
+- per-op output role, L1-resident bands, derived `seq_k`, full-trip count, ragged tail, and loop stage;
+- the pebbling/execution order and peak L1 bytes;
+- explicit serial and stage-2 phases used by cube costing.
+
+As with vectors, candidate pricing derives this plan on the stack because feasibility and latency
+need it; `CostResult` must remain compact. AutoFuse re-derives the plan only for the winning or
+forced configuration and emits it with a fail-loud plan/emit equality check.
+
+**Safe implementation order.** Start on separate parent/solver branches from the vector checkpoint:
+
+1. Write the cube-only fidelity contract and characterization tests. Extract a plan for a **lone
+   matmul only**, with exact pre-refactor fixed-cost preservation tests. Do not change costs yet.
+2. Make lone-matmul emission consume exact grid/split/`seq_k`/tail/stage fields. Then replace its
+   global roofline with emitted phases and price the split seed; keep extraction and cost correction
+   in separate commits.
+3. Add an exact two-matmul-chain descriptor. Until its per-op K loops, split policy, intermediate
+   mode, and grid are faithfully emitted—and #1908 lowering is resolved—gate unsupported chain
+   schedules instead of pricing them as buildable fusion.
+4. Run FORCE_PLAN ranking and profiler validation for lone matmul before expanding the supported
+   cube topology. Keep mixed cube+vector and `AutoTileMatmulL0`'s L0 sub-tiling outside this charter.
+
+## 9. Operational gotchas (don't relearn these)
 
 - **Build MAX 2 cores.** Use absolute build paths (a `cd 3rdparty/mlsys26` persists across shell calls
   and mis-targets the build).
@@ -254,9 +338,11 @@ ragged-K peel lowering test + deep-T decline logging; mixed cube+vector (a separ
   mis-costs. Write NAMED temps.
 - **Welford count column** must be derived from a reduction output (col-major), NOT `tensor.full`
   (row-major → trips `ResolveBackendOpLayouts`' col-vector reshape → lowering crash).
-- **Push:** SSH:22 is blocked → port 443, submodule first. `origin` is the tonibohnlein fork (= the
-  device's `fork` remote). NEVER push / open PRs without explicit order; NEVER add AI co-author lines;
-  never hack test expectations (fix the code or flag the test).
-- **Device runs:** a separate agent pulls `fork/fusion-scheduler`, builds, runs on 910B2 with a working
+- **Remote access:** SSH is currently blocked; use HTTPS, submodule first when publishing code.
+  `.gitmodules` still contains an SSH URL for `mlsys26`, so device checkouts must locally override
+  `submodule.3rdparty/mlsys26.url` with `https://github.com/tonibohnlein/mlsys26.git`. NEVER push /
+  open PRs without explicit order; NEVER add AI co-author lines; never hack test expectations.
+- **Device runs:** a separate agent checks out `fusion-scheduler-vector-stream-plan`, builds, and runs
+  on 910B2 with a working
   `device_wall effective_us` STRACE path; `benchmark()` hits error 507018 (avoid). Fingerprint-gate on
   HEAD + mlsys26 hash first.
