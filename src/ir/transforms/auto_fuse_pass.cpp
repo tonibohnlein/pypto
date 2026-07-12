@@ -942,7 +942,31 @@ struct SolverTile {
   // vector rule's ceil+clamp overlap stays numerically correct (idempotent, D3).
   int64_t parts_m = 0;
   int64_t parts_n = 0;
+  // Solver-owned per-core vector streaming algorithm for this exact candidate.
+  // It is authoritative for reduction materialize-vs-stream, chunk geometry,
+  // pass count, and loop kinds.
+  ::VectorStreamPlan vector_stream;
 };
+
+static const char* VectorStreamKindName(::VectorStreamKind kind) {
+  switch (kind) {
+    case ::VectorStreamKind::Materialized:
+      return "materialized";
+    case ::VectorStreamKind::Pointwise:
+      return "pointwise";
+    case ::VectorStreamKind::ReductionFolded:
+      return "reduction_folded";
+    case ::VectorStreamKind::ReductionSpanning:
+      return "reduction_spanning";
+    case ::VectorStreamKind::SoftmaxFlash:
+      return "softmax_flash";
+    case ::VectorStreamKind::LayerNormWelford:
+      return "layernorm_welford";
+    case ::VectorStreamKind::ModelAheadMultiReduction:
+      return "model_ahead_multi_reduction";
+  }
+  return "unknown";
+}
 
 ExprPtr MakeTuple2(ExprPtr a, ExprPtr b, const Span& sp) {
   return std::make_shared<MakeTuple>(std::vector<ExprPtr>{std::move(a), std::move(b)}, sp);
@@ -1660,26 +1684,38 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     }
   auto p1_sink = As<Call>(out_stmt->value_);
   const bool sink_is_reduction = p1_sink != nullptr && ClassifyOp(p1_sink) == ::OpType::Reduction;
-  // Common gate: exactly one reduced axis, one sum/max reduction (single level). P1 = the reduction
-  // IS the sink (bare reduction). P2 = a pointwise sink CONSUMES the reduction (rmsnorm / x-row_max);
-  // its output spans the reduced axis, so the final apply chunks it. >1 reduction / level>=2 = P3.
-  // Materialize-vs-stream: does the pinned reduced-axis tile fit UB? Count the GRANULE-PADDED
-  // allocation (AlignUp(h,g) x AlignUp(w,g)) — the emit's real footprint, matching the cost model.
-  // The unpadded 2*h*w under-counts a thin free axis (M-tile 3, ~2.7x) and would materialize an
-  // over-UB tile (BUG-G1THRESH). Reductions pad both axes (col-major tile).
-  const bool stream_ok = has_reduction && (pin_m != pin_n) && sinks.size() == 1 && p1_nreds == 1 &&
-                         p1_red_sum_or_max && (2 * AlignUp(h, g) * AlignUp(w, g) * p1_dtb > p1_ub);
-  const bool stream_p1 = stream_ok && sink_is_reduction;
-  const bool stream_p2 = stream_ok && !sink_is_reduction;
-
+  // Common gate: exactly one reduced axis, one sum/max reduction (single level). P1 = every live-out
+  // stays folded on that axis (a bare reduction or a thin pointwise finalize). P2 = a pointwise sink
+  // consumes the reduction and spans the reduced axis (rmsnorm / x-row_max), so the final apply
+  // chunks it. More than one reduction / level >= 2 requires an exact P4 pattern.
+  // Materialize-vs-stream and the GRANULE-PADDED scratch peak are solver-owned. The structural
+  // predicates below are defense-in-depth checks that this group can realize the selected plan.
   // P4 is admitted only when this solver group exactly equals a semantic match produced once by
   // AnalyzeP4Patterns. No family/count heuristic is repeated in the emitter.
   const ::P4PatternKind p4_kind = p4_match != nullptr ? p4_match->kind : ::P4PatternKind::None;
-  // stream_p4 gate (task spec): a P4-shaped group whose full pinned tile overflows UB (same test as
-  // P1/P2) -> stream it as one fused online kernel below.
-  const bool stream_p4 = P4Enabled() && p4_kind != ::P4PatternKind::None && has_reduction &&
-                         (pin_m != pin_n) && sinks.size() == 1 && p1_nreds >= 2 &&
-                         (2 * AlignUp(h, g) * AlignUp(w, g) * p1_dtb > p1_ub);
+  // The solver plan is authoritative for materialize-vs-stream. The old emitter made this decision
+  // from a local two-band estimate, which could disagree with the model's pebbling peak (and then
+  // realize a different split/roofline). Structural checks remain as defense in depth.
+  const ::VectorStreamPlan& solver_stream = tile.vector_stream;
+  const bool plan_streams = solver_stream.feasible && solver_stream.streamed();
+  const bool single_reduction_streamable =
+      has_reduction && (pin_m != pin_n) && sinks.size() == 1 && p1_nreds == 1 && p1_red_sum_or_max;
+  const bool stream_p1 = plan_streams && solver_stream.kind == ::VectorStreamKind::ReductionFolded &&
+                         single_reduction_streamable;
+  const bool stream_p2 = plan_streams && solver_stream.kind == ::VectorStreamKind::ReductionSpanning &&
+                         single_reduction_streamable && !sink_is_reduction;
+  const bool stream_p4 =
+      plan_streams && P4Enabled() && p4_kind != ::P4PatternKind::None && has_reduction &&
+      (pin_m != pin_n) && sinks.size() == 1 && p1_nreds >= 2 &&
+      ((p4_kind == ::P4PatternKind::SoftmaxFlash &&
+        solver_stream.kind == ::VectorStreamKind::SoftmaxFlash) ||
+       (p4_kind == ::P4PatternKind::LayerNormWelford &&
+        solver_stream.kind == ::VectorStreamKind::LayerNormWelford));
+  if (has_reduction && plan_streams && !stream_p1 && !stream_p2 && !stream_p4) {
+    return GenericDeclineB("solver selected an unsupported vector stream algorithm ('" +
+                               std::string(VectorStreamKindName(solver_stream.kind)) + "')",
+                           out_stmt->span_);
+  }
 
   // A single spatial tile is left to the legacy tiler — UNLESS the solver split the reduced axis
   // (tile.split>1) or the reduced axis must be STREAMED (P1/P2/P4): both still need to run below (the
@@ -1890,28 +1926,65 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // 8, valid 3), which ResolveBackendOpLayouts' reshape of the [h,1] col-vector does not round-trip.
     // Aligning the free tile makes the accumulator full-valid (coarser spatial grid, still correct).
     int64_t free_tile = std::min(AlignUp(pin_m ? w : h, g), free_ext);
-    // The single reduction op (nreds==1): P1 -> it IS the sink; P2 -> a non-sink reduction consumed
-    // by the pointwise sink. Its family fixes the merge op (sum->add, max->maximum).
+    // The single reduction op (nreds==1): P1 -> every live-out stays folded; P2 -> a non-sink
+    // reduction consumed by a spanning pointwise sink. Its family fixes the merge op
+    // (sum->add, max->maximum).
     auto red_stmt = out_stmt;  // AssignStmtPtr (same element type as ops)
     for (const auto& a : ops)
       if (ClassifyOp(As<Call>(a->value_)) == ::OpType::Reduction) red_stmt = a;
     auto red_call = As<Call>(red_stmt->value_);
     const bool is_max = IsOp(red_call, "tensor.col_max") || IsOp(red_call, "tensor.row_max");
     const std::string merge_op = is_max ? "tensor.maximum" : "tensor.add";
-    // Largest granule-aligned chunk whose live set fits UB. Conservative band count: each op's
-    // output can be a live [chunk]-extent band, plus the input slice and accumulator/alignment
-    // slack. P2's APPLY pass re-reads the input, recomputes the full cone, AND holds the output
-    // chunk being assembled (device: ~5 bands for a 2-op group) — so it needs more headroom than
-    // P1's accumulate pass. P4's online pass-0 holds the widest live set (x-slice + sub + exp +
-    // the [chunk] p, plus the [free_tile,1] m/l/cmax/cl/corr stats), so it gets +6. Size against
-    // the heavier pass (v3 §1d).
-    const int64_t n_bands = static_cast<int64_t>(ops.size()) + (stream_p4 ? 6 : (stream_p2 ? 5 : 2));
-    int64_t rc = p1_ub / std::max<int64_t>(1, n_bands * free_tile * p1_dtb);
-    rc = std::max<int64_t>(g, (rc / g) * g);    // align down to the DMA granule, >= one granule
-    rc = std::min(rc, red_ext);
+    // Chunk geometry comes from the winning solver plan. Its conservative stream-band peak includes
+    // the emitted accumulator/P2/P4 scratch that is absent from the original tensor DAG, and it has
+    // already proved the selected chunk fits UB. Do not independently resize it here.
+    const int64_t rc = solver_stream.chunk;
+    INTERNAL_CHECK_SPAN(rc > 0 && rc <= red_ext && solver_stream.axis == (pin_m ? 2 : 1), sp)
+        << "Internal error: invalid solver vector stream plan for group '" << name << "': axis="
+        << solver_stream.axis << " chunk=" << rc << " reduced extent=" << red_ext;
     const int64_t num_full = red_ext / rc;                 // full disjoint chunks
     const int64_t rem = red_ext - num_full * rc;           // ragged tail extent (0 if divides)
     const int64_t num_free = (free_ext + free_tile - 1) / free_tile;  // ceil grid over the free axis
+
+    // Verify that the local IR construction realizes every field of the authoritative plan.
+    // Geometry, algorithm kind, and the trip-count pipeline guard must all agree.
+    const ::VectorStreamKind emitted_kind =
+        stream_p4 ? (p4_kind == ::P4PatternKind::SoftmaxFlash
+                         ? ::VectorStreamKind::SoftmaxFlash
+                         : ::VectorStreamKind::LayerNormWelford)
+                  : (stream_p2 ? ::VectorStreamKind::ReductionSpanning
+                               : ::VectorStreamKind::ReductionFolded);
+    const int emitted_axis = pin_m ? 2 : 1;
+    const int64_t stats_trips = std::max<int64_t>(0, num_full - 1);
+    const int stats_stages = stats_trips >= 2 ? 2 : 1;
+    const int apply_stages = num_full >= 2 ? 2 : 1;
+    const int expected_passes = (stream_p2 || stream_p4) ? 2 : 1;
+    const bool stream_plan_matches =
+        solver_stream.feasible && solver_stream.streamed() && solver_stream.kind == emitted_kind &&
+        solver_stream.axis == emitted_axis && solver_stream.extent == red_ext &&
+        solver_stream.free_tile == free_tile && solver_stream.chunk == rc &&
+        solver_stream.full_chunks == num_full && solver_stream.tail == rem &&
+        solver_stream.stream_passes == expected_passes && solver_stream.stats.first_chunk == 1 &&
+        solver_stream.stats.trip_count == stats_trips &&
+        solver_stream.stats.pipeline_stages == stats_stages &&
+        (expected_passes == 1 ||
+         (solver_stream.apply.first_chunk == 0 && solver_stream.apply.trip_count == num_full &&
+          solver_stream.apply.pipeline_stages == apply_stages));
+    INTERNAL_CHECK_SPAN(stream_plan_matches, sp)
+        << "Internal error: emitted vector loop does not match solver plan for group '" << name << "'";
+    LOG_INFO << "AutoFuse[generic]: vector-plan MATCH group='" << name
+             << "' solver={kind=" << VectorStreamKindName(solver_stream.kind)
+             << ",axis=" << solver_stream.axis << ",extent=" << solver_stream.extent
+             << ",free=" << solver_stream.free_tile << ",chunk=" << solver_stream.chunk << "x"
+             << solver_stream.full_chunks
+             << (solver_stream.tail ? "+tail" : "") << ",stats=" << solver_stream.stats.trip_count << "/s"
+             << solver_stream.stats.pipeline_stages << ",apply=" << solver_stream.apply.trip_count << "/s"
+             << solver_stream.apply.pipeline_stages << "} emit={kind=" << VectorStreamKindName(emitted_kind)
+             << ",axis=" << emitted_axis << ",extent=" << red_ext << ",free=" << free_tile
+             << ",chunk=" << rc << "x" << num_full
+             << (rem ? "+tail" : "") << ",stats=" << stats_trips << "/s" << stats_stages
+             << ",apply=" << (expected_passes == 2 ? num_full : 0) << "/s"
+             << (expected_passes == 2 ? apply_stages : 1) << "}";
 
     auto t = std::make_shared<Var>(base + "_t", index_type, sp);
     // Free-axis offset for this core, clamped in-bounds for a ragged free tail. The free axis is
@@ -2055,7 +2128,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           // double-buffers only the next disjoint input chunk, overlapping its load with the current
           // chunk's Welford reduction/merge. Chunk 0 is emitted before this loop, so the rolled trip
           // count is num_full-1 and needs to be at least two to have anything to overlap.
-          const bool pipe_stats = (num_full - 1) >= 2;
+          const bool pipe_stats = solver_stream.stats.pipeline_stages == 2;
           std::vector<std::pair<std::string, std::any>> stats_attrs;
           if (pipe_stats) stats_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
           body.push_back(std::make_shared<ForStmt>(
@@ -2110,7 +2183,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         // s+1's x-slice load with chunk s's apply: the DDR-bound re-read (P4 SECOND pass) hides behind
         // compute, realizing the model's max(compute,ddr). The finalized stats (M/L or the S_i) are
         // loop-invariant broadcast operands (single-buffered, read each iter). Serial for a 1-chunk loop.
-        const bool pipe_apply = num_full >= 2;
+        const bool pipe_apply = solver_stream.apply.pipeline_stages == 2;
         std::vector<std::pair<std::string, std::any>> apply_attrs;
         if (pipe_apply) apply_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
         body.push_back(std::make_shared<ForStmt>(
@@ -2224,7 +2297,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         // A5: (m,l) is true loop-carried state and remains persistent. Stage=2 double-buffers only
         // the next disjoint input chunk, overlapping its load with the current chunk's online
         // reduction/merge. Chunk 0 is emitted before this loop, so require two rolled iterations.
-        const bool pipe_stats = (num_full - 1) >= 2;
+        const bool pipe_stats = solver_stream.stats.pipeline_stages == 2;
         std::vector<std::pair<std::string, std::any>> stats_attrs;
         if (pipe_stats) stats_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
         body.push_back(std::make_shared<ForStmt>(
@@ -2273,7 +2346,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         // s+1's x-slice load with chunk s's apply: the DDR-bound re-read (P4 SECOND pass) hides behind
         // compute, realizing the model's max(compute,ddr). The finalized stats (M/L or the S_i) are
         // loop-invariant broadcast operands (single-buffered, read each iter). Serial for a 1-chunk loop.
-        const bool pipe_apply = num_full >= 2;
+        const bool pipe_apply = solver_stream.apply.pipeline_stages == 2;
         std::vector<std::pair<std::string, std::any>> apply_attrs;
         if (pipe_apply) apply_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
         body.push_back(std::make_shared<ForStmt>(
@@ -2320,7 +2393,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       // load+reduce (`part`) double-buffers — stage=2 overlaps chunk k+1's load with chunk k's
       // reduce+merge, hiding the DDR-bound input read behind compute (this is the P1/P2 FIRST pass).
       // Pipeline only when the trip (num_full-1) is >= 2; else nothing to overlap.
-      const bool pipe_acc = (num_full - 1) >= 2;
+      const bool pipe_acc = solver_stream.stats.pipeline_stages == 2;
       std::vector<std::pair<std::string, std::any>> acc_attrs;
       if (pipe_acc) acc_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
       body.push_back(std::make_shared<ForStmt>(
@@ -2339,10 +2412,20 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     }
 
     if (stream_p1) {
-      // P1: the sink IS the reduction — assemble the finalized accumulator into the reduced output.
+      // P1: every live-out remains folded along the reduced axis. A bare reduction assembles the
+      // accumulator directly. If thin pointwise finalization follows the reduction (for example
+      // row_sum -> muls), replay that reduced-shape cone ONCE with the finalized accumulator
+      // substituted; it does not require P2's full reduced-axis apply re-stream.
+      VarPtr folded_out = acc;
+      if (!sink_is_reduction) {
+        const std::unordered_map<const Var*, VarPtr> subs = {{red_stmt->var_.get(), acc}};
+        std::unordered_map<const Var*, VarPtr> oc_folded;
+        folded_out = strip_at(1, MakeIndex(0, sp), body, oc_folded, nullptr, &subs);
+      }
       ExprPtr asm_off = pin_m ? MakeTuple2(MakeIndex(0, sp), foff, sp)   // [1,w] at [0, n]
                               : MakeTuple2(foff, MakeIndex(0, sp), sp);  // [h,1] at [m, 0]
-      auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), ExprPtr(acc), asm_off}, sp);
+      auto asm_call =
+          reg.Create("tensor.assemble", {ExprPtr(c_init), ExprPtr(folded_out), asm_off}, sp);
       body.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
     } else {
       // P2 PASS 1 — final apply. The output spans the reduced axis, so re-stream it: for each chunk,
@@ -2374,7 +2457,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         // chunk s's apply: the DDR-bound re-read (this is the P2/softmax/layernorm SECOND pass) hides
         // behind compute, realizing the model's max(compute,ddr). The finalized stat `acc` is a
         // loop-invariant broadcast operand (single-buffered, read each iter). Serial for a 1-chunk loop.
-        const bool pipe_apply = num_full >= 2;
+        const bool pipe_apply = solver_stream.apply.pipeline_stages == 2;
         std::vector<std::pair<std::string, std::any>> apply_attrs;
         if (pipe_apply) apply_attrs.push_back({kPipelineStagesAttr, /*stages=*/2});
         body.push_back(std::make_shared<ForStmt>(
@@ -3664,7 +3747,9 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       p4_match_by_ops.emplace(builder.problem.p4_patterns[i].ops, i);
     for (size_t s = 0; s < sol.num_steps(); ++s) {
       const ::TileConfig& cfg = sol.step(s).config;
-      SolverTile tile{cfg.w, cfg.h, cfg.k, sol.step_cost(s).parallel_split, cfg.parts_m, cfg.parts_n};
+      const ::CostResult& selected_cost = sol.step_cost(s);
+      SolverTile tile{cfg.w, cfg.h, cfg.k, selected_cost.parallel_split, cfg.parts_m, cfg.parts_n,
+                      selected_cost.vector_stream};
       if (dump_plans || force_env != nullptr) {
         bool forced_here = false;
         std::set<std::tuple<int64_t, int64_t, size_t, int64_t, int64_t>> seen_plans;  // dedup identical keys
@@ -3678,7 +3763,8 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
               (fw < 0 || pc.w == fw) && (fh < 0 || pc.h == fh) &&
               (fs < 0 || static_cast<long>(pr.parallel_split) == fs) &&
               (fpm < 0 || pc.parts_m == fpm) && (fpn < 0 || pc.parts_n == fpn)) {
-            tile = SolverTile{pc.w, pc.h, pc.k, pr.parallel_split, pc.parts_m, pc.parts_n};
+            tile = SolverTile{pc.w, pc.h, pc.k, pr.parallel_split, pc.parts_m, pc.parts_n,
+                              pr.vector_stream};
             forced_here = true;
             LOG_INFO << "AutoFuse[" << func->name_ << "]: FORCED group=" << s << " w=" << pc.w << " h="
                      << pc.h << " split=" << pr.parallel_split << " parts_m=" << pc.parts_m

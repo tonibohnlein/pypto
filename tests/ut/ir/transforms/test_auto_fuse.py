@@ -792,9 +792,9 @@ class TestAutoFuse:
         over the FREE axis + an inner chunk-accumulation loop over the pinned axis, persisting only
         the small [.,1]/[1,.] accumulator (the big [.,chunk] slices are transient). Without streaming
         the [IM,w] / [h,IN] pinned tile overflows UB. Asserts (a) a huge-axis reduction lowers
-        through AllocateMemoryAddr without a Vec overflow (streaming fired), and (b) a smaller
-        streamed reduction is NUMERICALLY exact for BOTH merges — add (col_sum) and max on SIGNED
-        data (row_max) — via torch_codegen. On-core accumulation, so exact (no reassociation).
+        through AllocateMemoryAddr without a Vec overflow (streaming fired), and (b) smaller
+        reductions are NUMERICALLY exact across the solver-selected materialize/split/stream
+        schedules — add (col_sum) and max on SIGNED data (row_max) — via torch_codegen.
         (Behind the generic-emit flag, where streaming lives.)
         """
         torch = pytest.importorskip("torch")
@@ -814,7 +814,7 @@ class TestAutoFuse:
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
 
-        # (b) numerical exactness of the streamed emit (executes the actual streamed IR on CPU).
+        # (b) numerical exactness of the selected reduction emit (executes the emitted IR on CPU).
         def _numeric(program, entry, x, ref):
             ns: dict = {}
             exec(torch_codegen(passes.auto_fuse()(program), run_all_spmd_blocks=True), ns)  # noqa: S102
@@ -823,7 +823,7 @@ class TestAutoFuse:
             assert torch.allclose(got, ref, rtol=1e-4, atol=1e-4), f"{entry}: max abs diff {diff:.3e}"
 
         @pl.program
-        class ColSum:  # reduce M, add-merge; [256,128] streams (2*256*128*4 = 256 KB > 184 KB)
+        class ColSum:  # reduce M, add-merge; the exact pebble peak fits and the solver selects S2
             @pl.function(attrs={"auto_fuse": True})
             def cs(self, a: pl.Tensor[[256, 128], pl.FP32]) -> pl.Tensor[[1, 128], pl.FP32]:
                 c: pl.Tensor[[1, 128], pl.FP32] = pl.col_sum(a)
@@ -837,7 +837,7 @@ class TestAutoFuse:
                 return c
 
         @pl.program
-        class ColMax:  # reduce M, MAX-merge on SIGNED data; [256,128] streams — guards merge-op
+        class ColMax:  # reduce M; split-max is unsupported, so the materialized fallback is serial
             @pl.function(attrs={"auto_fuse": True})
             def cm(self, a: pl.Tensor[[256, 128], pl.FP32]) -> pl.Tensor[[1, 128], pl.FP32]:
                 c: pl.Tensor[[1, 128], pl.FP32] = pl.col_max(a)

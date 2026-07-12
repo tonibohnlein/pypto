@@ -127,10 +127,14 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
     `strip_fits`, width-chunk `num_wstrips`), streamed reductions P1/P2 (`stream_p1/p2`,
     `emit_strip`/`strip_at`/`slice_input`), **P4** (consumes the shared exact `P4Match`; softmax
     `p4_chunk` custom `(m,l)` body; exact layernorm → Welford), multi-sink, S2 split-K, broadcast (G4).
+    Folded P1 may finish with a thin pointwise cone once, without a spanning second input pass.
+    P1/P2/P4 materialize-vs-stream, chunk/tail, and loop stages come from the winning
+    `CostResult::vector_stream`; an internal check verifies the local loop construction matches it.
   - `TileMatmul` (~:813) / `BuildTileMatmul` (k-pipeline) / `EmitLoneMatmulGeneric` — the **cube** emit.
   - Flag helpers `GenericEmitEnabled()`, `P4Enabled()` (re-read env per call).
 - **Cost model** — `3rdparty/mlsys26/src/core/ascend910b_cost.cpp` (+ `types.h`, `dag.h`), branch
-  `ascend-910b-model`, linked as `solver_lib`.
+  `ascend-910b-vector-stream-plan`, linked as `solver_lib`. `VectorStreamPlan` is derived once per
+  candidate, carried by `CostResult`, and consumed by AutoFuse for streamed reductions.
 - **Flags:** `PYPTO_AUTOFUSE_GENERIC_EMIT`, `PYPTO_AUTOFUSE_P4`, `PYPTO_AUTOFUSE_FORCE_PLAN`
   (`"[g<N>:]w,h,split[,pm,pn]"`, **static-cached per process** → one force per fresh subprocess),
   `PYPTO_AUTOFUSE_FORCE_MERGE=none|all`, `PYPTO_AUTOFUSE_DUMP_PLANS`, `PYPTO_AUTOFUSE_STRICT`.
@@ -138,7 +142,7 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
   `cmake --build 3rdparty/mlsys26/build --target solver_lib -j2`.
 - **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 4`
   (26 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
-  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (308 pass / 7 fail baseline). Numeric:
+  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (325 pass / 7 documented baseline failures). Numeric:
   `pypto.debug.torch_codegen(passes.auto_fuse()(Prog), run_all_spmd_blocks=True)` — write P4 DSL FULLY
   NAMED (nested args drop ops from the solver graph → miss P4).
 
@@ -168,8 +172,9 @@ G4 broadcast, R0, granule padding) or documented them (G5 grid divergence, G6 de
 peel, deep-T chained (tensor-level; #1908-xfail at lowering). k-loop is `ForKind::Pipeline`.
 
 **Cost model:** C3 per-task overhead (device-validated no-regret), G3 `io_in×2`, R0 reduced-axis
-coupling, granule-padded feasibility, and candidate-local P4 feasibility: a streamed
-multi-reduction is buildable only when its complete op set equals an exact adapter-supplied pattern.
+coupling, granule-padded feasibility, and candidate-local P4 feasibility. `VectorStreamPlan` caches
+the pebble peak and emitted scratch-band peak, owns streamed-reduction chunk geometry, and gates A5
+overlap on the actual stats/apply pipeline stages; AutoFuse consumes that winning plan.
 
 **Device-validated on 910B2:** tall pointwise streaming, C3 no-regret, cube G-A + ragged-K (all
 correct). Two device-found crashes (reused-input pointwise, split-K seed) fixed.
@@ -210,10 +215,10 @@ apply/accumulate loop remains triplicated (P2 / softmax / Welford) — extract o
 
 ## 7. What remains (ordered)
 
-1. **Reconcile the short-loop A5 edge:** the emit correctly falls back to sequential when a streamed
-   phase has fewer than two rolled iterations, while the cost model's `db` predicate currently uses
-   tile bytes alone. Make the phase-aware cost use `compute + DDR` for that case. Then extract the
-   shared pipelined stats/apply-loop builder (P2 / softmax / Welford) to pay down triplication.
+1. **Finish A5 phase fidelity:** short streamed-reduction loops now use `compute + DDR`. Split the
+   remaining global roofline into `Σphase roofline(phase)` so stats compute cannot overlap apply DDR
+   across their barrier; then make materialized/pointwise strip scheduling solver-owned. Extract the
+   shared pipelined stats/apply-loop builder (P2 / softmax / Welford) while doing that.
 2. **Push** the batch (`5e7c76b6..HEAD`) via port 443, submodule first.
 3. **Device verification** (`autofuse_device_verify_g2_p4.md`, held until now): T1 the crash fixes, T2
    G2 perf, T3 P4 softmax+layernorm fuse + numeric + **wall-vs-cut** (with `P4=1`). Add the review's
