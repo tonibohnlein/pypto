@@ -178,12 +178,12 @@ its back-propagated operand tile shapes.
 
 | Ref | The model assumes… | So the emit MUST… | Status |
 | --- | ------------------ | ----------------- | ------ |
-| A1 | compute spreads over `U = parts_m·parts_n` invocations (wave makespan) | emit ONE per-logical-region kernel body and launch it over the exact solver grid (`SpmdScopeStmt` + `get_block_idx` → offset) | ✅ host-fixed, device follow-up pending. `VectorStreamPlan` owns element-balanced M/N partitions and `work_units`; cost, diagnostics, and emit consume that count. DMA padding is recorded separately and cannot change the launch grid. |
-| A2 | ephemeral intermediates cost **0 DDR** (fusion win) | keep intermediates **on-chip** (UB scratch), never round-trip them through DDR | ✅ honored |
+| A1 | compute spreads over `U = parts_m·parts_n` invocations (wave makespan) | emit ONE per-logical-region kernel body and launch it over the exact solver grid (`SpmdScopeStmt` + `get_block_idx` → offset) | ✅ device-confirmed. `VectorStreamPlan` owns element-balanced M/N partitions and `work_units`; cost, diagnostics, and emit consume that count. DMA padding is recorded separately and cannot change the launch grid. |
+| A2 | ephemeral intermediates cost **0 DDR** (fusion win), except an explicitly returned value is also a boundary output | keep ordinary intermediates **on-chip**; for a returned-and-consumed SSA value, retain its UB lifetime and also assemble its required DDR live-out | ✅ returned live-outs are explicit in `Problem`; P4 rejects escaped stats. |
 | A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to `[h,w]`; read `FIXED_1` operands in full (broadcast / reduced-axis) — `emit_strip` | ✅ honored (G4 done, 2026-07-09). `emit_strip` slices any 2D operand per-axis: a full axis follows the tile `[sh/sw]` at `[smi/sni]`, a size-1 (broadcast/`FIXED_1`) axis stays `[1]` at offset 0; the op replay re-infers the broadcast. Covers `[1,N]` bias-add, `[M,1]` scale / reduced-axis stat, `[1,1]`. Other 2D shapes still decline. |
-| A4 | UB feasibility = peak live bands over the **pebbling order** | replay ops in `dfs_order_`; let MemoryReuse alloc/free UB per the emitted liveness | ✅ honored (order matched) |
+| A4 | UB feasibility = peak live bands over the **pebbling order**, actual tensor dtypes, generated scratch, and pipeline copies | replay ops in `dfs_order_`; let MemoryReuse alloc/free UB per the emitted liveness | ✅ source lifetimes are byte-weighted per tensor; planned prefetch/generated scratch are explicit. Mixed-width lowering regression-covered. |
 | A5 | roofline `max(compute, DDR)` only within a loop that overlaps load k+1 with compute k | emit that exact loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) and keep barriers serial | ✅ `VectorStreamPlan` owns materialized/pointwise row+width strips and P1/P2/P4 init/rolled/tail/finalize phases. Cost is `Σphase roofline`; peeled phases use `compute+DDR`, and sub-register or short rolled loops stay sequential. |
-| A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a bare **sum col-reduction** sink `:1630`; else fall back to serial | ⚠️ partial — model must NOT price `S` where the emit declines it (see C2) |
+| A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a terminal **sum col-reduction** sink; else stay serial | ✅ exact admission, seed cost, `work_units*S` fill waves, and 32-byte seed-row buildability gate. |
 | A7 | streamed input reads are phase-specific: an operand may be stats-only, apply-only, or both | stream with running stats; derive each phase's dependency cone and read only its inputs | ✅ G3 uses per-input phase masks. `x` in P2/P4 is normally read in stats+apply; an apply-only scale/bias is charged and emitted once. |
 
 “Wave” in A1 is an analytical makespan, not an emitted runtime construct. The runtime receives `U`
@@ -384,9 +384,10 @@ streamed free tile and emission to 8 blocks. The fix deliberately keeps the user
 the inner stream inside each logical task. Costing uses the same logical count for waves, active GM
 pipes, per-task overhead, `CostResult`, and traffic replay; emission uses it for `pl.spmd(12)` and
 reconstructs the balanced offsets. On 910B2 every forced grid matched `pl.spmd(N)`; the padded
-`h=11` plan loaded only 11 valid rows per task, and the repaired natural `[128,8192]` argmin became
-the device-best `h=8`, 16-task plan. Cost traffic now sums the exact logical 11/10 partition rather
-than multiplying all tasks by the maximum region extent.
+`h=11` plan retained 12 logical regions, and the repaired natural `[128,8192]` argmin became the
+device-best `h=8`, 16-task plan. Host traffic now follows the emitter's uniform maximum-shape body:
+ragged blocks clamp their base and replay overlap, so a 48×3 grid prices 144 row-equivalents rather
+than the 128-row logical union. The device follow-up must verify that static-body interpretation.
 
 **G6 — A6 — materialized reduction split admission and seed — HOST-CLOSED.** The 910B backend lowers
 only atomic add, and slicing a reduction cone preserves semantics only for one terminal `col_sum`
@@ -405,6 +406,12 @@ future `S>1` plan without the descriptor is a Tier-B contract failure instead of
 the serial body. Solver tests cover all rejected families and ragged grids; the strict AutoFuse test
 checks both bare and pointwise-cone atomic protocols plus numeric results. The seed is deliberately
 serial and cannot hide under the atomic body's roofline.
+
+The 910B2 closure exposed a backend constraint absent from the first host contract: PTOAS rejects a
+row-major FP32 seed row narrower than one 32-byte DMA block. Admission now proves
+`tile_w*dtype_bytes >= vec_dma_align_bytes`; `[2048,4]→[1,4]` therefore stays `S=1`, while the aligned
+`[2048,8]→[1,8]` control retains the split. Kernel fill counts `work_units*S` main-body tasks plus the
+separately ordered seed launch, rather than charging only the spatial grid.
 
 **G7 — P4 algorithm-specific compute — SILICON-CLOSED (2026-07-13).** Phase masks
 price the source DAG, but P4 stats emission builds a different online algorithm. Welford emits chunk
@@ -464,22 +471,38 @@ with 4.2% regret and preserved the gross forced-plan order (Spearman 0.70). The 
 case over-splits mildly (7.1% versus the clean 16-task grid), a bounded ranking refinement rather
 than a model/emit mismatch.
 
-**G10 — column-reduction grounding — HOST-CLOSED.** Exact FP32/FP16 `TCOLSUM` and `TCOLMAX` now use
+**G10 — column-reduction grounding — SILICON-CLOSED (2026-07-13).** Exact FP32/FP16 `TCOLSUM` and `TCOLMAX` now use
 the PTO A2/A3 fit tables rather than the legacy structural tree. Exact anchors include FP32
 `[64,64]` sum/max = `1263/1137` cycles and FP16 `[64,128]` = `1263/1137`; intermediate shapes
 interpolate adjacent table anchors and remain monotone in valid rows. Unsupported dtypes retain the
-named structural fallback. A device sweep is a decision-oracle validation task, not missing model
-coverage.
+named structural fallback. The device sweep reproduced every anchor byte-exact and confirmed the
+column decision ordering.
 
-**G11 — source primitive coverage — HOST-CLOSED.** The adapter and plan now name every audited
+**G11 — source primitive coverage — SILICON-CLOSED (2026-07-13).** The adapter and plan now name every audited
 one-instruction vector lowering used by the supported emit surface: abs, sqrt, neg, scalar max/min,
 and exact part add/mul/max/min join the existing arithmetic, transcendental, broadcast, and reduction
-families. High-precision rsqrt and other composite/alias-sensitive forms remain `Generic` because
-their scratch, barriers, or multiple instructions are not yet represented. Problem-dump tests guard
-that boundary so future lowering changes cannot silently inherit a cheaper primitive.
+families. The device run matched the emitted family/geometry descriptors and numeric output across
+square, ragged, and multi-strip shapes. High-precision rsqrt remains `Generic` in research input;
+production AutoFuse now separately capability-gates every op so an unknown or unsupported lowering
+cannot inherit pointwise strip semantics merely because it lacks a descriptor.
+
+**Post-review live-out/capability/UB closure — HOST-CLOSED.** `Problem::required_outputs` makes a
+returned-and-consumed value both a boundary output and a live UB interval; the emitter assembles it,
+the shared P4 consumer analysis treats `ReturnStmt` as an escaping use, and partition/solution gap
+checks preserve that materialized value across group boundaries. `VectorOpCapability`
+separates cost family from implemented scheduling algorithm: elementwise and sum/max reductions are
+admitted, while prod/arg/min/full and position/shape-changing operations decline. Strip feasibility
+replays byte-weighted tensor lifetimes and a dtype-exact prefetch copy; streamed reductions add their
+explicit generated scratch. The FP32→INT8 forced-plan regression now lowers without UB overflow.
 
 ### Minor / doc-completeness
 
+- **Concurrent cost cache and creation complexity — FIXED (2026-07-13).** Cache slots publish
+  through `Empty→Writing→Ready`, so an acquiring reader cannot observe a partially copied
+  `CostResult`; a concurrent stress test covers the protocol. The default base table uses 131072
+  slots instead of one million, and the equally sized retention tier is allocated only if used.
+  Duplicate candidate validation is removed, and prologue reachability
+  is one reverse-topological `O(N+E)` DP rather than a BFS from every pointwise op.
 - **Candidate-hot replay — FIXED (2026-07-13).** Subgraph creation now materializes only
   candidate-invariant UB lifetime/transient metadata and phase-ordered op/input lists. Tile
   candidates still derive their complete shape-dependent plan and cost, while winners are

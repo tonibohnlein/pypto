@@ -736,7 +736,49 @@ class TestAutoFuse:
         dag = json.loads((tmp_path / "vector_semantics.dag.json").read_text())
         assert dag["vector_primitive_families"] == ["add", "exp", "scalar_mul", "row_sum"]
         assert dag["vector_op_geometries"] == ["row_expand", "flat", "flat", "flat"]
+        assert dag["vector_op_capabilities"] == [
+            "elementwise",
+            "elementwise",
+            "elementwise",
+            "reduction_sum",
+        ]
         assert dag["per_task_overhead_cycles"] == 64
+
+    def test_vector_capabilities_decline_unimplemented_reduction_algorithms(
+        self, tmp_path, monkeypatch
+    ):
+        """Prod/arg/min never enter the generic strip/stream emitter.
+
+        These operations need algorithms that are not equivalent to the
+        implemented sum/max accumulator. Shape-producing operations such as
+        ``full`` use the same unsupported capability in the adapter.
+        Their explicit capability is therefore ``unsupported`` and their op
+        category is an opaque partition barrier.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class Reductions:
+            @pl.function(attrs={"auto_fuse": True})
+            def unsupported(
+                self, x: pl.Tensor[[8, 8192], pl.FP32]
+            ) -> tuple[
+                pl.Tensor[[8, 1], pl.FP32],
+                pl.Tensor[[8, 1], pl.FP32],
+                pl.Tensor[[8, 1], pl.INT32],
+            ]:
+                minimum: pl.Tensor[[8, 1], pl.FP32] = pl.row_min(x)
+                product: pl.Tensor[[8, 1], pl.FP32] = pl.row_prod(x)
+                argmax: pl.Tensor[[8, 1], pl.INT32] = pl.row_argmax(x)
+                return minimum, product, argmax
+
+        reduced = passes.auto_fuse()(Reductions)
+        body = next(f for _, f in reduced.functions.items() if f.name == "unsupported").as_python()
+        assert "pl.pipeline(" not in body
+        dag = json.loads((tmp_path / "unsupported.dag.json").read_text())
+        assert dag["op_types"] == ["Opaque"] * 3
+        assert dag["vector_op_capabilities"] == ["unsupported"] * 3
 
     def test_vector_problem_dump_covers_grounded_unary_scalar_and_column_ops(
         self, tmp_path, monkeypatch
@@ -1019,6 +1061,43 @@ class TestAutoFuse:
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
         assert str(incores[0].func_type) == "FunctionType.AIV"
 
+    def test_returned_consumed_intermediate_is_materialized_live_out(
+        self, ascend_backend, monkeypatch
+    ):
+        """A returned SSA value remains observable when fusion also consumes it."""
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def live_out(
+                self, x: pl.Tensor[[64, 256], pl.FP32]
+            ) -> tuple[
+                pl.Tensor[[64, 256], pl.FP32],
+                pl.Tensor[[64, 256], pl.FP32],
+            ]:
+                intermediate: pl.Tensor[[64, 256], pl.FP32] = pl.exp(x)
+                out: pl.Tensor[[64, 256], pl.FP32] = pl.add(intermediate, 1.0)
+                return intermediate, out
+
+        fused = passes.auto_fuse()(Prog)
+        body = next(f for _, f in fused.functions.items() if f.name == "live_out").as_python()
+        assert "__FREE_VAR" not in body
+        assert body.count("pl.tensor.assemble(") == 2
+
+        namespace: dict = {}
+        exec(torch_codegen(fused, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        x = torch.randn(64, 256, dtype=torch.float32)
+        intermediate, out = namespace["live_out"](x)
+        expected = torch.exp(x)
+        assert torch.allclose(intermediate, expected, rtol=1e-4, atol=1e-4)
+        assert torch.allclose(out, expected + 1.0, rtol=1e-4, atol=1e-4)
+
     def test_materialized_single_tile_uses_solver_body_plan(self, ascend_backend, monkeypatch):
         """A one-task materialized vector group still uses the generic planned body.
 
@@ -1161,6 +1240,47 @@ class TestAutoFuse:
             f"max abs diff {(out - (a + b) * b).abs().max().item():.3e}"
         )
 
+    def test_mixed_dtype_pointwise_strip_uses_per_tensor_ub_bytes(self):
+        """FP32 intermediates are not sized as the narrower INT8 live-out."""
+        script = textwrap.dedent(
+            """
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mixed(self, x: pl.Tensor[[128, 8192], pl.FP32]) -> pl.Tensor[[128, 8192], pl.INT8]:
+                    wide: pl.Tensor[[128, 8192], pl.FP32] = pl.exp(x)
+                    out: pl.Tensor[[128, 8192], pl.INT8] = pl.cast(wide, pl.INT8)
+                    return out
+
+            fused = passes.auto_fuse()(Prog)
+            body = next(f for _, f in fused.functions.items() if f.name == "mixed").as_python()
+            assert "pl.pipeline(" in body, body
+            assert "pl.spmd(4" in body, body
+            PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "2048,128,1,1,4"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
     def test_split_k_matmul_seed_tiles_within_ub(self, ascend_backend, monkeypatch):
         """The split-K zero-seed tiles the [M,N] output into UB-FITTING pieces.
 
@@ -1297,16 +1417,16 @@ class TestAutoFuse:
         @pl.program
         class ColSum:  # reduce M, add-merge; the exact pebble peak fits and the solver selects S2
             @pl.function(attrs={"auto_fuse": True})
-            def cs(self, a: pl.Tensor[[2048, 4], pl.FP32]) -> pl.Tensor[[1, 4], pl.FP32]:
-                c: pl.Tensor[[1, 4], pl.FP32] = pl.col_sum(a)
+            def cs(self, a: pl.Tensor[[2048, 8], pl.FP32]) -> pl.Tensor[[1, 8], pl.FP32]:
+                c: pl.Tensor[[1, 8], pl.FP32] = pl.col_sum(a)
                 return c
 
         @pl.program
         class PointwiseColSum:  # the pointwise producer is replayed inside each reduced-axis slice
             @pl.function(attrs={"auto_fuse": True})
-            def pcs(self, a: pl.Tensor[[1024, 4], pl.FP32]) -> pl.Tensor[[1, 4], pl.FP32]:
-                doubled: pl.Tensor[[1024, 4], pl.FP32] = pl.add(a, a)
-                c: pl.Tensor[[1, 4], pl.FP32] = pl.col_sum(doubled)
+            def pcs(self, a: pl.Tensor[[1024, 8], pl.FP32]) -> pl.Tensor[[1, 8], pl.FP32]:
+                doubled: pl.Tensor[[1024, 8], pl.FP32] = pl.add(a, a)
+                c: pl.Tensor[[1, 8], pl.FP32] = pl.col_sum(doubled)
                 return c
 
         @pl.program
@@ -1341,9 +1461,9 @@ class TestAutoFuse:
         for program, entry in [(RowMax, "rm"), (ColMax, "cm"), (RowSum, "rs")]:
             assert "atomic=pl.AtomicType.Add" not in _body(program, entry)
 
-        x_cs = torch.arange(2048 * 4, dtype=torch.float32).reshape(2048, 4) * 0.01
+        x_cs = torch.arange(2048 * 8, dtype=torch.float32).reshape(2048, 8) * 0.01
         _numeric(ColSum, "cs", x_cs, x_cs.sum(dim=0, keepdim=True))
-        x_pcs = torch.arange(1024 * 4, dtype=torch.float32).reshape(1024, 4) * 0.01
+        x_pcs = torch.arange(1024 * 8, dtype=torch.float32).reshape(1024, 8) * 0.01
         _numeric(PointwiseColSum, "pcs", x_pcs, (x_pcs + x_pcs).sum(dim=0, keepdim=True))
         x_rm = (torch.arange(4 * 2048, dtype=torch.float32).reshape(4, 2048) % 97) - 48.0
         _numeric(RowMax, "rm", x_rm, x_rm.max(dim=1, keepdim=True).values)
@@ -1384,6 +1504,27 @@ class TestAutoFuse:
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Big)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
+
+        # The streamed stats/apply peak must retain the FP32 source and
+        # intermediate widths even when the boundary output is narrower.
+        @pl.program
+        class MixedDtype:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[128, 16384], pl.FP32]) -> pl.Tensor[[128, 16384], pl.FP16]:
+                m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
+                centered: pl.Tensor[[128, 16384], pl.FP32] = pl.sub(x, m)
+                out: pl.Tensor[[128, 16384], pl.FP16] = pl.cast(centered, pl.FP16)
+                return out
+
+        mixed_body = next(
+            f for _, f in passes.auto_fuse()(MixedDtype).functions.items() if f.name == "sm"
+        ).as_python()
+        assert mixed_body.count("pl.pipeline(") == 2, mixed_body
+        mixed_out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(MixedDtype)
+        mixed_incores = [
+            f for _, f in mixed_out.functions.items() if ir.is_incore_type(f.func_type)
+        ]
+        assert len(mixed_incores) == 1, [f.name for f in mixed_incores]
 
         def _numeric(program, entry, x, ref):
             ns: dict = {}
@@ -1474,6 +1615,47 @@ class TestAutoFuse:
         cut_body = next(f for _, f in cut.functions.items() if f.name == "sm").as_python()
         assert "_m_it" not in cut_body and "_l_it" not in cut_body, cut_body
         assert cut_body.count("pl.spmd(") >= 2, cut_body
+
+    def test_p4_declines_when_internal_statistic_is_returned(
+        self, ascend_backend, monkeypatch
+    ):
+        """Returning row_max makes it a second live-out, so flash P4 must cut."""
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm_with_max(
+                self, x: pl.Tensor[[32, 8192], pl.FP32]
+            ) -> tuple[
+                pl.Tensor[[32, 1], pl.FP32],
+                pl.Tensor[[32, 8192], pl.FP32],
+            ]:
+                maximum: pl.Tensor[[32, 1], pl.FP32] = pl.row_max(x)
+                shifted: pl.Tensor[[32, 8192], pl.FP32] = pl.row_expand_sub(x, maximum)
+                exponent: pl.Tensor[[32, 8192], pl.FP32] = pl.exp(shifted)
+                total: pl.Tensor[[32, 1], pl.FP32] = pl.row_sum(exponent)
+                out: pl.Tensor[[32, 8192], pl.FP32] = pl.row_expand_div(exponent, total)
+                return maximum, out
+
+        fused = passes.auto_fuse()(Prog)
+        body = next(f for _, f in fused.functions.items() if f.name == "sm_with_max").as_python()
+        assert "_m_it" not in body and "_l_it" not in body
+        assert "__FREE_VAR" not in body
+
+        namespace: dict = {}
+        exec(torch_codegen(fused, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        x = torch.randn(32, 8192, dtype=torch.float32)
+        maximum, out = namespace["sm_with_max"](x)
+        expected_max = x.max(dim=1, keepdim=True).values
+        assert torch.allclose(maximum, expected_max, rtol=1e-4, atol=1e-4)
+        assert torch.allclose(out, torch.softmax(x, dim=1), rtol=1e-4, atol=1e-4)
 
     def test_g9_tall_softmax_uses_full_vector_wave(self, ascend_backend, monkeypatch):
         """Row-aware reduction work prevents a tall P4 kernel from under-filling AIVs.
