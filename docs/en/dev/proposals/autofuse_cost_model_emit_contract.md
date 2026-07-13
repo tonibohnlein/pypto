@@ -16,7 +16,7 @@ Code references are `3rdparty/mlsys26/src/core/ascend910b_cost.cpp` (cost) and
 
 ## 0. The core principle
 
-```
+```text
                          ┌─ group 1 ─▶ kernel 1 ─▶ launched over its grid (1 invocation / output tile)
 tensor DAG ─▶ PARTITION ─┼─ group 2 ─▶ kernel 2 ─▶ launched over its grid ...
    (one global           └─ group N ─▶ kernel N ─▶ ...
@@ -62,7 +62,7 @@ invocations (compute divided by occupancy; DDR divided across the launched cores
 Two distinct walks over the DAG matter (within a group):
 
 | walk | direction | produces | governs |
-|---|---|---|---|
+| ---- | --------- | -------- | ------- |
 | **role back-prop** | reverse-topo (sinks→inputs) | each tensor's tile shape / role | *what* each op computes per tile — the algorithm |
 | **pebbling order** | forward-topo | execution sequence + band liveness | *when* + feasibility (peak UB) + emit replay + MemoryReuse |
 
@@ -73,7 +73,7 @@ Two distinct walks over the DAG matter (within a group):
 For one fused vector group at a fixed tile, over `C` AIV cores (910B: 48), the emitted
 barriers define the costing phases:
 
-```
+```text
 latency = Σphase roofline(phase)
 roofline(p) = max(compute_mk[p], ddr[p])   [only for a stage-2 rolled loop]
               compute_mk[p] + ddr[p]      [serial body / peeled init / tail / finalize]
@@ -164,15 +164,21 @@ its back-propagated operand tile shapes.
 
 ## 4. Assumptions ↔ emit obligations (the contract)
 
-| # | The model assumes… | So the emit MUST… | Status |
-|---|---|---|---|
-| A1 | compute spreads over `U = parts_m·parts_n` invocations (wave makespan) | emit ONE per-tile kernel body and launch it over the grid (`SpmdScopeStmt` + `get_block_idx` → offset), one invocation per output tile | ⚠️ mechanism honored, but the emit launches **`ceil(IM/h)·ceil(IN/w)`** invocations, NOT the priced `parts_m·parts_n` — equal for uniform grids, **divergent (fictional occupancy) for non-uniform/ragged grids** (logged not reconciled, `auto_fuse_pass.cpp:1758`) |
+| Ref | The model assumes… | So the emit MUST… | Status |
+| --- | ------------------ | ----------------- | ------ |
+| A1 | compute spreads over `U = parts_m·parts_n` invocations (wave makespan) | emit ONE per-logical-region kernel body and launch it over the exact solver grid (`SpmdScopeStmt` + `get_block_idx` → offset) | ✅ host-fixed, device follow-up pending. `VectorStreamPlan` owns element-balanced M/N partitions and `work_units`; cost, diagnostics, and emit consume that count. DMA padding is recorded separately and cannot change the launch grid. |
 | A2 | ephemeral intermediates cost **0 DDR** (fusion win) | keep intermediates **on-chip** (UB scratch), never round-trip them through DDR | ✅ honored |
 | A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to `[h,w]`; read `FIXED_1` operands in full (broadcast / reduced-axis) — `emit_strip` | ✅ honored (G4 done, 2026-07-09). `emit_strip` slices any 2D operand per-axis: a full axis follows the tile `[sh/sw]` at `[smi/sni]`, a size-1 (broadcast/`FIXED_1`) axis stays `[1]` at offset 0; the op replay re-infers the broadcast. Covers `[1,N]` bias-add, `[M,1]` scale / reduced-axis stat, `[1,1]`. Other 2D shapes still decline. |
 | A4 | UB feasibility = peak live bands over the **pebbling order** | replay ops in `dfs_order_`; let MemoryReuse alloc/free UB per the emitted liveness | ✅ honored (order matched) |
 | A5 | roofline `max(compute, DDR)` only within a loop that overlaps load k+1 with compute k | emit that exact loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) and keep barriers serial | ✅ `VectorStreamPlan` owns materialized/pointwise row+width strips and P1/P2/P4 init/rolled/tail/finalize phases. Cost is `Σphase roofline`; peeled phases use `compute+DDR`, and sub-register or short rolled loops stay sequential. |
 | A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a bare **sum col-reduction** sink `:1630`; else fall back to serial | ⚠️ partial — model must NOT price `S` where the emit declines it (see C2) |
 | A7 | streamed input reads are phase-specific: an operand may be stats-only, apply-only, or both | stream with running stats; derive each phase's dependency cone and read only its inputs | ✅ G3 uses per-input phase masks. `x` in P2/P4 is normally read in stats+apply; an apply-only scale/bias is charged and emitted once. |
+
+“Wave” in A1 is an analytical makespan, not an emitted runtime construct. The runtime receives `U`
+ready SPMD tasks and schedules them without affinity controls. A logical region therefore stays one
+task; its UB-resident pointwise strips or reduced-axis chunks execute inside that task on the same
+core. For `U > C`, `ceil(U/C)` describes the queue-completion bound and the model also charges every
+task plus every kernel-fill round; the emitter does not try to assign explicit wave identities.
 
 ---
 
@@ -197,7 +203,7 @@ matmul's scores.
 ### The P-ladder
 
 | tier | shape | flash content | status |
-|---|---|---|---|
+| ---- | ----- | ------------- | ------ |
 | **P1** | bare reduction (sum / max) | online but trivial — sum associative, running max; no rescale | built, device-confirmed (col reductions) |
 | **P2** | reduction → pointwise | accumulate, then re-stream to apply (2 passes) | built |
 | **P3** | multipass softmax/layernorm (>1 reduction) | one stream per statistic pass (2–3 reads) | retired |
@@ -230,12 +236,14 @@ Foldable = the reduction is a **fixed-size associative running state** (§2 abst
 the log-sum-exp family (sum, max, min, prod, softmax-`(m,l)`) and moments (mean/var via
 Welford). NOT foldable = order statistics (median, quantile, top-k, sort) — no fixed-size
 exact summary.
+
 - **Not foldable** → the reduced axis *cannot* be streamed correctly. Either it must
   materialize (fit UB) or the group is **declined**. *(correctness gate — never fold an
   order-statistic.)*
 - **Foldable** → the stats can be gathered in ONE online pass (flash), exactly. Continue to Test 2.
 
 **Test 2 — does ANY group output SPAN R?** (a live-out whose extent along R is > 1)
+
 - **No (output-folded)** → the reduction result *is* the output, or is consumed only by
   further R-reductions that fold into the running state. **`stream_passes = 1` — read once.**
   (P1; attention.)
@@ -249,7 +257,7 @@ number of *finalize-reduce → per-element-apply → feed-another-reduce* stages
 norms/softmax have `depth = 1` → 2 passes. `depth ≥ 2` (a reduction consuming the applied
 output of an earlier spanning stage) is where >2 reloads come from — not in our current op set.
 
-```
+```text
 reduced axis fits UB?
 ├─ yes → materialize (one tile, no streaming)                         [non-streamed path]
 └─ no  → all R-reductions foldable?
@@ -356,12 +364,26 @@ unblocked **G3** (its accurate pricing routes a cross-group `[M,1]` stat that th
 take), so G3's 2× read is applied unconditionally (was gated on the model-ahead flag until G4).
 Other (ragged) 2D operand shapes still decline.
 
-**G5 — A1 — grid-count divergence.** Emit launches `ceil(IM/h)·ceil(IN/w)`, model prices
-`parts_m·parts_n` (`:1465`); fictional occupancy for non-uniform/ragged grids (logged not
-reconciled, `:1758`).
+**G5 — A1 — logical-region identity — HOST-FIXED; DEVICE FOLLOW-UP PENDING.** Device work exposed
+the old mismatch: forced `8192,11,1,12,1` was costed as 12 tasks but DMA alignment changed the
+streamed free tile and emission to 8 blocks. The fix deliberately keeps the user's solver choice:
+`work_units = parts_m·parts_n = 12`, with an element-balanced 11/10-row ownership partition.
+`free_tile_alloc=16` records the FP32 UB/DMA allocation independently; reduced-axis `chunk` remains
+the inner stream inside each logical task. Costing uses the same logical count for waves, active GM
+pipes, per-task overhead, `CostResult`, and traffic replay; emission uses it for `pl.spmd(12)` and
+reconstructs the balanced offsets. A focused numeric regression forces this plan, and a cost
+regression verifies that the padded `h=11` candidate no longer outranks the device-best uniform
+`h=8`, 16-task plan. Silicon must confirm the repaired ranking before G5 is closed.
 
 **G6 — A6 residual (C2 DONE).** Split still priced for materialized max/row reductions the emit
 declines (bare-`col_sum`-only, `:1630`). Bounded, unmeasured; left as-is pending a probe.
+
+**G7 — P4 algorithm-specific compute — DEVICE-CONFIRMED.** Phase masks price the source DAG, but P4
+stats emission builds a different online algorithm. Welford emits chunk mean, centered M2, and Chan
+merge operations; softmax emits `(m,l)` rescale/correction operations. These are not represented by
+the original dual-sum/softmax cones. On 910B2 the correct Welford kernel was 102.1 us versus a
+76.4 us zero-mean cut, a 33.6% regression the model did not predict. Represent the emitted operators
+in init/rolled/tail/finalize phase work using grounded per-op costs; do not add a fitted surcharge.
 
 ### Minor / doc-completeness
 
