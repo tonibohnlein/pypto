@@ -1199,6 +1199,7 @@ class TestAutoFuse:
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
 
         # (a) huge reduced axis lowers via streaming — col_sum[16384,128] = 8 MB >> 184 KB UB.
         @pl.program
@@ -1223,40 +1224,61 @@ class TestAutoFuse:
         @pl.program
         class ColSum:  # reduce M, add-merge; the exact pebble peak fits and the solver selects S2
             @pl.function(attrs={"auto_fuse": True})
-            def cs(self, a: pl.Tensor[[256, 128], pl.FP32]) -> pl.Tensor[[1, 128], pl.FP32]:
-                c: pl.Tensor[[1, 128], pl.FP32] = pl.col_sum(a)
+            def cs(self, a: pl.Tensor[[2048, 4], pl.FP32]) -> pl.Tensor[[1, 4], pl.FP32]:
+                c: pl.Tensor[[1, 4], pl.FP32] = pl.col_sum(a)
+                return c
+
+        @pl.program
+        class PointwiseColSum:  # the pointwise producer is replayed inside each reduced-axis slice
+            @pl.function(attrs={"auto_fuse": True})
+            def pcs(self, a: pl.Tensor[[1024, 4], pl.FP32]) -> pl.Tensor[[1, 4], pl.FP32]:
+                doubled: pl.Tensor[[1024, 4], pl.FP32] = pl.add(a, a)
+                c: pl.Tensor[[1, 4], pl.FP32] = pl.col_sum(doubled)
                 return c
 
         @pl.program
         class RowMax:  # reduce N, max-merge on SIGNED data (proves mask != zero-fill)
             @pl.function(attrs={"auto_fuse": True})
-            def rm(self, a: pl.Tensor[[128, 256], pl.FP32]) -> pl.Tensor[[128, 1], pl.FP32]:
-                c: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(a)
+            def rm(self, a: pl.Tensor[[4, 2048], pl.FP32]) -> pl.Tensor[[4, 1], pl.FP32]:
+                c: pl.Tensor[[4, 1], pl.FP32] = pl.row_max(a)
                 return c
 
         @pl.program
         class ColMax:  # reduce M; split-max is unsupported, so the materialized fallback is serial
             @pl.function(attrs={"auto_fuse": True})
-            def cm(self, a: pl.Tensor[[256, 128], pl.FP32]) -> pl.Tensor[[1, 128], pl.FP32]:
-                c: pl.Tensor[[1, 128], pl.FP32] = pl.col_max(a)
+            def cm(self, a: pl.Tensor[[2048, 4], pl.FP32]) -> pl.Tensor[[1, 4], pl.FP32]:
+                c: pl.Tensor[[1, 4], pl.FP32] = pl.col_max(a)
                 return c
 
         @pl.program
         class RowSum:  # reduce N, add-merge; bare row reduction — guards the reduced AXIS
             @pl.function(attrs={"auto_fuse": True})
-            def rs(self, a: pl.Tensor[[128, 256], pl.FP32]) -> pl.Tensor[[128, 1], pl.FP32]:
-                c: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(a)
+            def rs(self, a: pl.Tensor[[4, 2048], pl.FP32]) -> pl.Tensor[[4, 1], pl.FP32]:
+                c: pl.Tensor[[4, 1], pl.FP32] = pl.row_sum(a)
                 return c
 
-        x_cs = torch.arange(256 * 128, dtype=torch.float32).reshape(256, 128) * 0.01
+        def _body(program, entry):
+            return next(
+                f for _, f in passes.auto_fuse()(program).functions.items() if f.name == entry
+            ).as_python()
+
+        # G6: the selected algorithm, not merely the numeric result, must match the cost.
+        assert "atomic=pl.AtomicType.Add" in _body(ColSum, "cs")
+        assert "atomic=pl.AtomicType.Add" in _body(PointwiseColSum, "pcs")
+        for program, entry in [(RowMax, "rm"), (ColMax, "cm"), (RowSum, "rs")]:
+            assert "atomic=pl.AtomicType.Add" not in _body(program, entry)
+
+        x_cs = torch.arange(2048 * 4, dtype=torch.float32).reshape(2048, 4) * 0.01
         _numeric(ColSum, "cs", x_cs, x_cs.sum(dim=0, keepdim=True))
-        x_rm = (torch.arange(128 * 256, dtype=torch.float32).reshape(128, 256) % 97) - 48.0
+        x_pcs = torch.arange(1024 * 4, dtype=torch.float32).reshape(1024, 4) * 0.01
+        _numeric(PointwiseColSum, "pcs", x_pcs, (x_pcs + x_pcs).sum(dim=0, keepdim=True))
+        x_rm = (torch.arange(4 * 2048, dtype=torch.float32).reshape(4, 2048) % 97) - 48.0
         _numeric(RowMax, "rm", x_rm, x_rm.max(dim=1, keepdim=True).values)
         # col_max: MAX-merge (not add) on signed data — a sum would flip the sign of the answer.
-        x_cm = (torch.arange(256 * 128, dtype=torch.float32).reshape(256, 128) % 97) - 48.0
+        x_cm = (torch.arange(2048 * 4, dtype=torch.float32).reshape(2048, 4) % 97) - 48.0
         _numeric(ColMax, "cm", x_cm, x_cm.max(dim=0, keepdim=True).values)
-        # bare row_sum: reduces N (width), not M — a wrong-axis reduction gives [128,1] of Σ over M.
-        x_rs = torch.arange(128 * 256, dtype=torch.float32).reshape(128, 256) * 0.01
+        # bare row_sum: reduces N (width), not M — a wrong-axis reduction gives [4,1] of Σ over M.
+        x_rs = torch.arange(4 * 2048, dtype=torch.float32).reshape(4, 2048) * 0.01
         _numeric(RowSum, "rs", x_rs, x_rs.sum(dim=1, keepdim=True))
 
     def test_streamed_reduction_apply_p2(self, ascend_backend, monkeypatch):
