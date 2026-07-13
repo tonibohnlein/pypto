@@ -83,15 +83,26 @@ For a streamed reduction the ordered phases are `stats_init` (serial), rolled `s
 `stats_tail` (serial), an optional serial finalize, rolled `apply`, and `apply_tail` (serial).
 No phase may hide work across a barrier.
 
-### Compute (`VecOpCompute :63`, `WaveComputeCycles :153`)
+### Compute (`GroundedVectorOpCompute`, `WaveComputeCycles`)
 
-- Per op, grounded cycles: pointwise = `slope·repeat + (stream_start ? head+tail : 0)`,
-  `repeat = ceil(elems / epr)`, `epr = vec_reg_bytes / dtype_bytes` (fp32: 256/4 = 64).
-  Reduction = its **tree**: row-reduce ≈ `45·(W/epr − 1) + 51` (linear in W, rows-independent);
-  col-reduce ≈ `16·(H−1) + 30·log2(H)` (log-depth).
-- Base op work is summed over the full element count. An op present in both phase cones
-  (softmax's `sub`/`exp`) is charged in both because the apply pass recomputes it.
-- head+tail is paid **once per back-to-back pointwise run** (only the stream-start op).
+- The adapter records the pto-isa primitive family and emitted geometry for grounded source ops:
+  add/sub/max/min, mul, div, exp, log, rsqrt, scalar add/sub/mul, and their row/column
+  broadcast forms, plus the supported row/column reductions. Their coefficients come from the same table as generated P4 work. Unsupported
+  source ops retain the historical `vec_slope`/`vec_fixed` fallback rather than being assigned a
+  guessed primitive.
+- Candidate costing replays each grounded op at the exact valid frame of one emitted materialized
+  strip or streamed-reduction chunk, then multiplies by that phase's loop iterations and logical
+  tasks. `repeat = ceil(elems/epr)` for flat ops; row/column broadcasts use their strided
+  `rows·ceil(cols/epr)` geometry. A row-expand binary in a reduction-layout group additionally pays
+  the emitted `vbrcb` and `PIPE_V` barrier needed for its col-major statistic; the pure-pointwise
+  row-major form does not. Count-mode floors are applied per invocation.
+- Reduction work is replayed at the same frame: row-reduce ≈
+  `45·(ceil(W/epr)−1)+51` (rows-independent), while col-reduce ≈
+  `16·(H−1)+30·log2(H)`. P1/P2 also price the thin add/max merge emitted after every non-initial
+  statistics chunk; that merge is generated code and is absent from the source DAG.
+- Head+tail is paid **once per back-to-back pointwise run in every emitted invocation**. A
+  barrier-bearing row expansion starts a new run. An op in both phase cones (softmax's
+  `sub`/`exp`) is charged in both because the apply pass recomputes it.
 - Spread over the grid: `compute_mk = WaveComputeCycles(total, U, C) = total·ceil(U/C)/U`,
   `U = num_tiles = parts_m·parts_n`. Filling toward `C` lowers it; past `C` costs extra waves.
 
@@ -398,6 +409,24 @@ the fused `[128,8192]` candidate below its modeled cut; its selected grid also c
 closes the representational/model↔emit gap on host, not the decision-oracle validation: re-run the
 natural and forced fused/cut plans on silicon before enabling layernorm P4 by default.
 
+**G8 — source-DAG strip/chunk compute — HOST-FIXED; SILICON RANKING FOLLOW-UP REQUIRED.** The old
+source-op path first cost a full tensor and then fractionally scaled it into a phase. That preserved
+the slope term but paid a fixed startup only once (or even fractionally), despite the emitter replaying
+the op once per materialized strip, P2/P4 chunk, and logical task. It also treated scalar `adds/muls`
+as ordinary binary add/mul and priced a row broadcast as a flat binary instruction. The adapter now
+attaches a compact `(primitive family, emitted geometry)` descriptor to each supported source op.
+`VectorStreamPlan` costing consumes the descriptor at its strip/chunk frame, including per-invocation
+startup, count-mode floors, row-expand `vbrcb+barrier`, exact scalar coefficients, source reduction
+trees, and the generated P1/P2 accumulator merge. The row-expand composite overhead is gated by the
+candidate's reduction layout, matching the emitter's current layout decision. The descriptor is candidate-invariant `Op`
+metadata; it is not cached in `CostResult`, whose local-search footprint remains unchanged. Dumped
+problems serialize the descriptor so offline replay takes the same path. Descriptor-free benchmark
+problems retain their old scalar anchors intentionally; real PyPTO P2/P4 rankings can change and need
+the next silicon rerun. Unsupported primitives remain explicit `Generic` fallbacks, so this closes the
+canonical softmax/layernorm apply cones without claiming that every PyPTO vector op is grounded.
+The explicit reduction descriptor also selects this path for a bare P1 kernel, so its per-chunk
+reduction tree and generated add/max merge are not lost merely because the graph has no pointwise op.
+
 ### Minor / doc-completeness
 
 - **Granule-padding feasibility fiction — FIXED (2026-07-09, BUG-G1THRESH).** The emit allocates
@@ -413,7 +442,6 @@ natural and forced fused/cut plans on silicon before enabling layernorm P4 by de
   allocates a work/layout tile alongside the source tile. `vector_peak_ub` now counts both bands, so
   a reduction that needs more than UB streams instead of reaching `AllocateMemoryAddr` and failing.
 - `dfs_order_` is a greedy topo-tie-break heuristic, not a provably-minimal pebbling.
-- §1's pointwise compute omits the `+16` count-mode floor charged when `width % epr != 0` (`:90`).
 
 ### The rule of thumb
 

@@ -22,9 +22,13 @@ phase schedule. The 910B2 closure passed 51/51 correctness and confirmed phase t
 found two decision-fidelity gaps: logical free-grid work units (G5) and P4 online-algorithm compute
 (G7). Both are now host-fixed: G5 makes logical regions authoritative while keeping DMA allocation
 separate; G7 puts the emitted softmax/Welford primitive work in the solver-owned plan and prices it
-per phase. G5 silicon revalidation is in flight; the new G7 costs and selected grids still require a
-follow-up fused-versus-cut run. The current targeted rerun is the operational task
-`/home/toni/work/pypto3/autofuse_device_followup_vector_fidelity.md` (outside the repository).
+per phase. A subsequent host audit found G8: ordinary source ops were fractionally scaled from a
+full-tensor estimate instead of replayed once per emitted strip/chunk. The adapter now supplies
+grounded primitive/geometry descriptors and phase costing replays them exactly for P1 and the
+canonical P2/P4 cones. G5 silicon revalidation is in flight; G7/G8 costs and selected grids still require a
+follow-up fused-versus-cut run. The currently running operational task
+`/home/toni/work/pypto3/autofuse_device_followup_vector_fidelity.md` predates G8 and therefore closes
+only the fingerprints it names.
 
 **Mixed host checkpoint (2026-07-13).** The solver now builds one immutable same-engine stage DAG
 and cube/vector transfer graph per mixed candidate subgraph. A stack-local `MixedSchedulePlan`
@@ -227,7 +231,10 @@ init/rolled/tail/finalize phases; and gates each phase's A5 overlap on its actua
 the sum of phase rooflines, so barriers never hide work across phases. AutoFuse re-derives the plan for
 the winning config. It now also owns element-balanced M/N logical partitions and their exact
 `work_units`; `free_tile_alloc` carries DMA padding separately, so alignment cannot change the SPMD
-count. `CostResult`
+count. Grounded source-DAG add/mul/div/exp/log/rsqrt, scalar/broadcast variants, and supported
+row/column reductions carry a compact primitive/geometry descriptor. Costing replays that descriptor per planned strip/chunk/task,
+including count-mode, reduction-layout row-expand barriers, reduction trees, and generated P1/P2 merges; unsupported
+ops remain on the explicit legacy fallback. `CostResult`
 stays at its pre-refactor 112-byte footprint (guarded at ≤128 bytes) for the local-search cache.
 
 **Vector refactor preservation audit.** The plan extraction was separated from the subsequent
@@ -243,8 +250,12 @@ then moves only the affected vector anchors to softmax `22208.7/88371.3`, few-ro
 phases, the reduction source/work floor, and making the cost replay the exact emitted task grid—not
 drift from moving schedule derivation into a plan.
 
-**Current host gates.** After the logical-region regression, AutoFuse UT is 33 passed / 1 expected
-xfail; the solver suite retains its 7 documented baseline failures. The vector checkpoint's device file
+The G8 descriptor path deliberately does not change those descriptor-free C++ benchmark anchors.
+Real PyPTO problems now carry lowering semantics, so their source-op startup/count-mode work may
+change; this separates an intended fidelity correction from the plan-refactor preservation control.
+
+**Current host gates.** AutoFuse UT is 34 passed / 1 expected xfail; the solver suite is 405 passed
+with the same 7 documented baseline failures. The vector checkpoint's device file
 collects 51 A2/A3 cases. Four persistent cases
 cover exact P4 softmax `[128,8192]`, Welford layernorm at input mean `+2000`, a scaled-softmax near
 miss that must cut, and a P2 apply-only bias input whose expected MTE2 payload is `2×x + 1×bias`.
@@ -302,20 +313,27 @@ statistics update math remains deliberately algorithm-specific.
    per-op costs. Re-run natural and forced fused/cut plans because the selected grids changed; do not
    add a fitted surcharge if the remaining wall ranking disagrees—first identify the missing phase or
    hardware serialization.
-3. **Finish the current targeted vector follow-up** from the operational task outside the repository:
+3. **Device-close G8 source-op replay.** Re-run natural and forced P2, softmax, and Welford plans at
+   the new fingerprints. Confirm the dump descriptors, selected strip/chunk/grid, model costs, and
+   fused-versus-cut wall ranking. In particular, verify that row-expand startup/barrier work repeats
+   once per emitted apply chunk. Extend the descriptor table only from a known emitted PTO primitive;
+   leave unsupported vector ops on `Generic` rather than guessing.
+4. **Finish the current targeted vector follow-up** from the operational task outside the repository:
    `/home/toni/work/pypto3/autofuse_device_followup_vector_fidelity.md`. Repeat work-unit identity, forced-plan ranking,
-   softmax fusion, and Welford fusion-versus-cut decisions. Keep P4 flagged until this closes.
-4. **Resolve the Release-only cube assertions.** The vector checkpoint's clean Release build reported
+   softmax fusion, and Welford fusion-versus-cut decisions. Treat it as G5/G7 evidence only because its
+   supplied fingerprints predate G8. Keep P4 flagged until the post-G8 rerun closes.
+5. **Resolve the Release-only cube assertions.** The vector checkpoint's clean Release build reported
    five exact-geometry cube test failures. Capture the actual winner/cost deltas and determine code
    versus test error; do not infer harmlessness from unrelated device cases or edit expectations
    without approval.
-5. **Remaining vector fidelity:** gate or emit the G6 materialized max/row-reduction split families.
-   Only after the G5 rerun and G7 may exact softmax be considered separately for default-on;
+6. **Remaining vector fidelity:** gate or emit the G6 materialized max/row-reduction split families,
+   then ground the source primitives that still use the explicit `Generic` fallback. Only after the
+   G5/G7/G8 reruns may exact softmax be considered separately for default-on;
    layernorm must remain off while Welford is materially slower than the cut.
-6. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan` and recursive uniform-grid
+7. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan` and recursive uniform-grid
    emitter are implemented (§8). Next reconcile GM reload with the emitted L0-subtile loop, then
    introduce per-node cube phase rooflines, price split seed/tasks, and close non-uniform grids.
-7. **Complete mixed fidelity:** make the plan choose a real pipeline-item axis and active-group
+8. **Complete mixed fidelity:** make the plan choose a real pipeline-item axis and active-group
    count, replace global-tile overlap with serial-versus-realizable phase costs, then implement the
    one-way and single-round-trip emit through `ExpandMixedKernel` → `InjectGMPipeBuffer` →
    `SkewCrossCorePipeline`. Full flash attention follows only after whole-FIFO multi-round-trip skew.

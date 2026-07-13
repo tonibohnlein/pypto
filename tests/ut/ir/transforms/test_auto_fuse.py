@@ -705,6 +705,37 @@ class TestAutoFuse:
         assert sink_inputs[0] == intermediate, (sink_inputs, intermediate)
         assert len(sink_inputs) == 2 and sink_inputs[1] != intermediate
 
+    def test_vector_problem_dump_records_emitted_primitive_geometry(self, tmp_path, monkeypatch):
+        """The adapter describes the tile ops replayed by VectorStreamPlan.
+
+        A generic tensor subtraction with an ``[M,1]`` operand lowers to
+        ``tile.row_expand_sub``; the following exp is flat; multiplying by a
+        scalar lowers to ``tile.muls``; and the final row sum marks a grounded
+        reduction. Costing must see those exact primitive families and
+        geometries without inspecting PyPTO names in the solver.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def vector_semantics(
+                self,
+                x: pl.Tensor[[8, 512], pl.FP32],
+                stat: pl.Tensor[[8, 1], pl.FP32],
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                shifted: pl.Tensor[[8, 512], pl.FP32] = pl.sub(x, stat)
+                exponent: pl.Tensor[[8, 512], pl.FP32] = pl.exp(shifted)
+                scaled: pl.Tensor[[8, 512], pl.FP32] = pl.mul(exponent, 0.5)
+                total: pl.Tensor[[8, 1], pl.FP32] = pl.row_sum(scaled)
+                return total
+
+        passes.auto_fuse()(Prog)
+
+        dag = json.loads((tmp_path / "vector_semantics.dag.json").read_text())
+        assert dag["vector_primitive_families"] == ["add", "exp", "scalar_mul", "reduction"]
+        assert dag["vector_op_geometries"] == ["row_expand", "flat", "flat", "flat"]
+
     def test_cube_plan_materializes_large_intermediate_in_l1(self):
         """A multi-L0 intermediate is assembled into the L1 band priced by the plan.
 
