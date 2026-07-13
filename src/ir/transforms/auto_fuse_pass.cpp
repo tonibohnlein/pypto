@@ -2038,9 +2038,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // S2 (reduction-sink split): the solver may gang S cores per spatial tile, each reducing
   // a SLICE of the reduced axis, the S partials atomic-merged. Realized below for a SUM
   // col-reduction sink (the only lowered AtomicType is kAdd, and emit_strip slices rows =
-  // the reduced axis of a col reduction). Any other split>1 (max/min reduction, row-
-  // reduction split, reduction-feeds-pointwise) falls through to the NON-split body, which
-  // computes the correct values at split=1 — correct, just without the costed parallelism.
+  // the reduced axis of a col reduction). The solver-owned VectorStreamPlan admits only
+  // that exact protocol; any other split>1 is a Tier-B contract failure rather than a
+  // silent serial fallback.
 
   const VarPtr c_var = out_stmt->var_;
   auto ct = As<TensorType>(c_var->GetType());
@@ -3015,10 +3015,22 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     const auto [coM, coN] = Static2DShape(a->var_->GetType());
     if (ciM > 1 && coM == 1) cone_reduces_m_upstream = true;  // an upstream col (M) reduction
   }
-  if (tile.split > 1 && pin_m && !cone_reduces_m_upstream && As<Call>(out_stmt->value_) &&
-      IsOp(As<Call>(out_stmt->value_), "tensor.col_sum") && IM % (tile.split * g) == 0 && IN % w == 0) {
-    const int64_t S = tile.split;               // emit exactly the costed split (no rounding)
-    const int64_t rsz = IM / S;                 // disjoint granule-aligned reduced slice (IM % (S*g) == 0)
+  const bool has_split_plan =
+      solver_stream.reduction_split_kind == ::VectorReductionSplitKind::ColSumAtomicAdd;
+  if (has_split_plan) {
+    // The solver-owned plan is the admission decision. Re-check only the IR and
+    // arithmetic invariants needed to build it; a mismatch is a Tier-B contract
+    // failure, never a reason to pair an S>1 cost with a serial kernel.
+    auto split_sink = As<Call>(out_stmt->value_);
+    const int64_t S = solver_stream.reduction_split_factor;
+    const int64_t rsz = solver_stream.reduction_partial_extent;
+    if (!pin_m || cone_reduces_m_upstream || split_sink == nullptr ||
+        !IsOp(split_sink, "tensor.col_sum") || S != tile.split || S <= 1 ||
+        rsz <= 0 || rsz * S != IM || rsz % g != 0 || IN % w != 0) {
+      return GenericDeclineB(
+          "solver col_sum atomic split descriptor disagrees with emitted IR/geometry (G6/S2)",
+          out_stmt->span_);
+    }
     auto index_ty = std::make_shared<ScalarType>(DataType::INDEX);
     // Seed: zero each [1,w] output tile (disjoint + non-overlapping since IN % w == 0), tiled over
     // the num_n free tiles, so a large [1,N] output never materializes in one core's UB.
@@ -3050,14 +3062,14 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
              << " ways over the reduced axis (S2, atomic-add merge)";
     return std::vector<StmtPtr>{c_init_assign, seed_scope, scope};
   }
-  // The solver costed split>1 but S2 could not realize it (not a bare col_sum sink, ragged, upstream
-  // M-reduction, or row-reduction split): the body below emits it SERIAL (split=1). Numerically
-  // correct, but NOT the plan the solver priced — surface it so the cost-vs-wall-time experiment
-  // does not pair an S>1 model cost with an S=1 measured latency, and so a lost-parallelism decline
-  // is visible (the split families the emit does not yet realize: max/min, row-reduction, non-bare).
-  if (tile.split > 1)
-    LOG_INFO << "AutoFuse[generic]: group '" << name << "' costed split=" << tile.split
-             << " NOT realized (only a bare col_sum sink splits) -> emitting SERIAL (split=1)";
+  // A selected S>1 vector plan without the exact solver descriptor is illegal.
+  // Production falls back safely; strict mode makes the model/emit regression
+  // loud. The normal solver no longer enumerates such a candidate.
+  if (tile.split > 1) {
+    return GenericDeclineB(
+        "vector reduction split has no realizable solver descriptor (G6/S2)",
+        out_stmt->span_);
+  }
 
   // G1 (emit defense): a MULTI-reduction group (softmax/layernorm: >1 reduction over the reduced
   // axis) that reached the materialized path pins its reduced axis FULL. If even the thinnest tile

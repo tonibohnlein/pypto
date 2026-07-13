@@ -150,8 +150,8 @@ cheapest plan (free-tile ρ≈0.9, zero regret). Two grounding refinements came 
 
 **(g) The contract emerged from systematically checking (b)–(f) against the emit.** Each ⚠️ in contract
 §6 is a place the model priced an algorithm the emit didn't build; we closed them on host (G2
-pipelining, G3, G4 broadcast, G5 logical-region identity, R0, granule padding) or documented them
-(G6 declined splits). G5 is silicon-closed; G7/G8/G9 still need their current-fingerprint rerun.
+pipelining, G3, G4 broadcast, G5 logical-region identity, G6 split admission, R0, and granule
+padding). G5 is silicon-closed; G7/G8/G9 still need their current-fingerprint rerun.
 
 ---
 
@@ -177,7 +177,7 @@ pipelining, G3, G4 broadcast, G5 logical-region identity, R0, granule padding) o
   - `TileMatmul` (~:813) / `BuildTileMatmul` (k-pipeline) / `EmitLoneMatmulGeneric` — the **cube** emit.
   - Flag helpers `GenericEmitEnabled()`, `P4Enabled()` (re-read env per call).
 - **Cost model** — `3rdparty/mlsys26/src/core/ascend910b_cost.cpp` (+ `types.h`, `dag.h`), branch
-  `ascend-910b-vector-stream-plan`, linked as `solver_lib`. `VectorStreamPlan` is stack-local while
+  `ascend-910b-model`, linked as `solver_lib`. `VectorStreamPlan` is stack-local while
   pricing candidates and re-derived only for final/forced configs consumed by AutoFuse.
 - **Flags:** `PYPTO_AUTOFUSE_GENERIC_EMIT`, `PYPTO_AUTOFUSE_P4`, `PYPTO_AUTOFUSE_FORCE_PLAN`
   (`"[g<N>:]w,h,split[,pm,pn]"`, **static-cached per process** → one force per fresh subprocess),
@@ -185,8 +185,8 @@ pipelining, G3, G4 broadcast, G5 logical-region identity, R0, granule padding) o
 - **Build (MAX 2 cores):** `cmake --build build --parallel 2`;
   `cmake --build 3rdparty/mlsys26/build --target solver_lib -j2`.
 - **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 4`
-  (27 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
-  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (338 pass / 7 documented baseline failures). Numeric:
+  (35 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
+  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (418 pass / 7 documented baseline failures). Numeric:
   `pypto.debug.torch_codegen(passes.auto_fuse()(Prog), run_all_spmd_blocks=True)` — write P4 DSL FULLY
   NAMED (nested args drop ops from the solver graph → miss P4).
 
@@ -201,7 +201,8 @@ pipelining, G3, G4 broadcast, G5 logical-region identity, R0, granule padding) o
   handled within UB.
 - Reductions: P1 (bare) + P2 (spanning apply), streamed over the reduced axis, **both passes pipelined
   (A5/G2)** — accumulator persists, loads double-buffer; numerically exact.
-- Broadcast operands (G4), multi-sink, S2 cross-core split-K.
+- Broadcast operands (G4), multi-sink, and S2 terminal-`col_sum` cross-core split with tiled zero
+  seed plus atomic-add merge. Unsupported row/max/min/internal/ragged split families stay at `S=1`.
 - **P4 softmax** — fused online flash `(m,l)` with `exp(m_old−m_new)` rescale; the cone is verified
   EXACT by the shared descriptor (only `row_max→sub(x,m)→exp→row_sum→div`); stats and apply passes
   stage-2 pipelined when their rolled trip count is at least 2. It was numerically correct and 13.6%
@@ -221,7 +222,9 @@ peel, deep-T chained (tensor-level; #1908-xfail at lowering). k-loop is `ForKind
 
 **Cost model:** C3 per-task overhead (device-validated no-regret), per-input G3 phase traffic, R0
 reduced-axis coupling, granule-padded feasibility, the reduction source/work two-band floor, and
-candidate-local P4 feasibility. The stack-local
+candidate-local P4 feasibility. Materialized cross-core reduction candidates carry an exact
+`ColSumAtomicAdd` descriptor only after semantic, UB, and partition checks; upstream pointwise
+ephemerals are validated and replayed at the emitted partial geometry. The stack-local
 `VectorStreamPlan` records pebble/scratch peaks; owns materialized/pointwise strips and streamed-reduction
 init/rolled/tail/finalize phases; and gates each phase's A5 overlap on its actual loop stage. Cost is
 the sum of phase rooflines, so barriers never hide work across phases. AutoFuse re-derives the plan for
@@ -248,7 +251,7 @@ The G8 descriptor path deliberately does not change those descriptor-free C++ be
 Real PyPTO problems now carry lowering semantics, so their source-op startup/count-mode work may
 change; this separates an intended fidelity correction from the plan-refactor preservation control.
 
-**Current host gates.** AutoFuse UT is 35 passed / 1 expected xfail; the solver suite is 414 passed
+**Current host gates.** AutoFuse UT is 35 passed / 1 expected xfail; the solver suite is 418 passed
 with the same 7 documented baseline failures. The vector checkpoint's device file
 collects 51 A2/A3 cases. Four persistent cases
 cover exact P4 softmax `[128,8192]`, Welford layernorm at input mean `+2000`, a scaled-softmax near
@@ -260,9 +263,10 @@ its cut; high-mean Welford correct and 18.8% faster after the grid repair. The s
 tall row-work gap now fixed by G9, and predates G7/G8, so current cost decisions are not closed.
 Cube G-A/ragged-K and recursive-plan correctness are also device-validated.
 
-**Current commit arc** (newest first): G9 row-aware reductions (this change) · PyPTO `45785941` G8
-source-op replay · `ff706a94` G7 phase-work contract · `e3acf3bc` mixed plans + G5 grids ·
-`a7b2fff6` recursive cube schedules. Solver: `e566674` G9 fit formulas · `45c82f0` G8
+**Current commit arc** (newest first): G6 exact split admission (this change) · `d8ca8a8f` G9
+row-aware reductions · PyPTO `45785941` G8 source-op replay · `ff706a94` G7 phase-work contract ·
+`e3acf3bc` mixed plans + G5 grids. Solver: `f71bd70` G6 exact split admission · `e566674` G9
+fit formulas · `45c82f0` G8
 source primitives · `0fff7d9` G7 P4 work · `e4616f3` mixed plans + G5 work units · `f4e76e4`
 recursive cube plans. Earlier vector-plan roots are `4ca1026` phase rooflines, `1fc542d` compact
 search cache, and `0e34918` authoritative plans.
@@ -310,9 +314,9 @@ statistics update math remains deliberately algorithm-specific.
 3. **Decide P4 defaults only from the new run.** Exact softmax may advance separately if it remains
    correct and faster than its cut. Keep layernorm flagged until the post-G7/G8/G9 Welford-vs-cut
    result and high-mean accuracy both pass.
-4. **Remaining vector fidelity:** gate or emit G6 materialized reduction splits; ground column
-   sum/extrema from PTO's fit backend; then extend source primitive descriptors only for known emitted
-   PTO instructions. Unsupported operations remain explicit `Generic` fallbacks.
+4. **Remaining vector fidelity:** ground the separate S2 zero-seed fill/launch phase and column
+   sum/extrema from PTO's fit backend; then extend source primitive descriptors only for known
+   emitted PTO instructions. Unsupported operations remain explicit `Generic` fallbacks.
 5. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan` and recursive uniform-grid
    emitter are implemented (§8). Next reconcile GM reload with the emitted L0-subtile loop, then
    introduce per-node cube phase rooflines, price split seed/tasks, and close non-uniform grids.

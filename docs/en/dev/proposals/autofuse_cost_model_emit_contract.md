@@ -388,8 +388,22 @@ reconstructs the balanced offsets. On 910B2 every forced grid matched `pl.spmd(N
 the device-best `h=8`, 16-task plan. Cost traffic now sums the exact logical 11/10 partition rather
 than multiplying all tasks by the maximum region extent.
 
-**G6 — A6 residual (C2 DONE).** Split still priced for materialized max/row reductions the emit
-declines (bare-`col_sum`-only, `:1630`). Bounded, unmeasured; left as-is pending a probe.
+**G6 — A6 — materialized reduction split admission — HOST-CLOSED.** The 910B backend lowers only
+atomic add, and slicing a reduction cone preserves semantics only for one terminal `col_sum` whose
+upstream cone is pointwise. The solver now derives that exact capability from the source primitive,
+axis, sink count, and reduction count; every row sum, max/min, internal reduction, multi-sink, and
+descriptor-free reduction enumerates only `S=1`. A fixed `S>1` candidate additionally proves a
+materialized source/work tile, a granule-aligned exact reduced-axis partition, and a non-overlapping
+free-axis partition. Its ephemeral-granule check also evaluates an upstream pointwise cone at the
+actual `M/S` partial rather than the sink's size-one M axis. `VectorStreamPlan` records
+`ColSumAtomicAdd`, the factor, and partial extent; costing replays every source primitive at the
+emitted `[M/S,free]` partial geometry, and the emitter consumes the descriptor to build the tiled
+zero seed plus atomic-add partial grid. Any
+future `S>1` plan without the descriptor is a Tier-B contract failure instead of silently emitting
+the serial body. Solver tests cover all rejected families and ragged grids; the strict AutoFuse test
+checks both bare and pointwise-cone atomic protocols plus numeric results. Precisely grounding the
+separate zero-seed phase's fill/launch cost remains a decision-fidelity refinement; it does not change
+split admission.
 
 **G7 — P4 algorithm-specific compute — HOST-FIXED; SILICON RANKING FOLLOW-UP REQUIRED.** Phase masks
 price the source DAG, but P4 stats emission builds a different online algorithm. Welford emits chunk
