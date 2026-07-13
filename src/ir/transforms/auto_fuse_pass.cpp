@@ -2355,6 +2355,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     const int64_t stats_trips = std::max<int64_t>(0, num_full - 1);
     const int expected_passes = (stream_p2 || stream_p4) ? 2 : 1;
     const bool expected_finalize = stream_p1 || p4_kind == ::P4PatternKind::LayerNormWelford;
+    const ::VectorP4WorkPlan expected_p4_work = ::make_vector_p4_work_plan(p4_kind);
+    const bool p4_work_matches =
+        stream_p4 ? solver_stream.p4_work == expected_p4_work : !solver_stream.p4_work.generated;
     const bool stream_plan_matches =
         solver_stream.feasible && solver_stream.streamed() && solver_stream.kind == emitted_kind &&
         solver_stream.axis == emitted_axis && solver_stream.extent == red_ext &&
@@ -2368,7 +2371,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         solver_stream.stats_tail.present == (rem > 0) &&
         (!solver_stream.stats_tail.present ||
          (solver_stream.stats_tail.chunk_index == num_full && solver_stream.stats_tail.extent == rem)) &&
-        solver_stream.finalize.present == expected_finalize &&
+        solver_stream.finalize.present == expected_finalize && p4_work_matches &&
         (expected_passes == 1 ||
          (solver_stream.apply.first_chunk == 0 && solver_stream.apply.trip_count == num_full &&
           solver_stream.apply_tail.present == (rem > 0) &&
