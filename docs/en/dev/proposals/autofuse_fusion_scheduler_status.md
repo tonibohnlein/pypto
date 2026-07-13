@@ -20,8 +20,10 @@ emitted init/rolled/tail/finalize phases, and re-derives that plan only for a wi
 configuration. The emitter consumes the same materialized/pointwise strip geometry and reduction
 phase schedule. The 910B2 closure passed 51/51 correctness and confirmed phase traffic/overlap, but
 found two decision-fidelity gaps: logical free-grid work units (G5) and P4 online-algorithm compute
-(G7). G5 is now host-fixed by making logical regions authoritative while keeping DMA allocation
-separate; silicon revalidation and G7 remain. The targeted rerun is the operational task
+(G7). Both are now host-fixed: G5 makes logical regions authoritative while keeping DMA allocation
+separate; G7 puts the emitted softmax/Welford primitive work in the solver-owned plan and prices it
+per phase. G5 silicon revalidation is in flight; the new G7 costs and selected grids still require a
+follow-up fused-versus-cut run. The current targeted rerun is the operational task
 `/home/toni/work/pypto3/autofuse_device_followup_vector_fidelity.md` (outside the repository).
 
 **Mixed host checkpoint (2026-07-13).** The solver now builds one immutable same-engine stage DAG
@@ -203,7 +205,8 @@ pipelining, G3, G4 broadcast, G5 logical-region identity, R0, granule padding) o
 - **P4 softmax** — fused online flash `(m,l)` with `exp(m_old−m_new)` rescale; the cone is verified
   EXACT by the shared descriptor (only `row_max→sub(x,m)→exp→row_sum→div`); stats and apply passes
   stage-2 pipelined when their rolled trip count is at least 2. It was numerically correct and 4.6%
-  faster than its two-kernel cut on 910B2, but remains flagged until G5 is revalidated and G7 is fixed.
+  faster than its two-kernel cut on 910B2, but remains flagged until G5 and the new G7 ranking are
+  revalidated.
 - **P4 layernorm** — stable streaming **Welford** (running count/mean/M2, Chan's parallel merge),
   reached only after proving the exact `sum(x)` / `sum(x*x)` / mean / variance / rsqrt / centered-apply
   algebra, then substituting stable `mean`/`var` into that cone. Its three-carry stats and apply passes
@@ -294,10 +297,12 @@ statistics update math remains deliberately algorithm-specific.
 1. **Device-close G5 logical-region identity.** Re-run the forced `h=11` and `h=8` plans. Confirm
    `pl.spmd(12)` versus `pl.spmd(16)`, numeric correctness, per-plan traffic, and that the repaired
    natural argmin is the device-best `h=8` plan rather than refitting pto-isa constants.
-2. **Price P4's emitted algorithms.** Represent softmax `(m,l)` correction and Welford chunk/Chan
-   operations in their exact init/rolled/tail/finalize phases using grounded per-op costs. The source
-   DAG is not an adequate compute descriptor for substituted online statistics.
-3. **Run the targeted vector follow-up** from the operational task outside the repository:
+2. **Device-close G7 algorithm work.** The host now represents softmax `(m,l)` correction and
+   Welford chunk/Chan operations in exact init/rolled/tail/finalize work tallies, using grounded
+   per-op costs. Re-run natural and forced fused/cut plans because the selected grids changed; do not
+   add a fitted surcharge if the remaining wall ranking disagrees—first identify the missing phase or
+   hardware serialization.
+3. **Finish the current targeted vector follow-up** from the operational task outside the repository:
    `/home/toni/work/pypto3/autofuse_device_followup_vector_fidelity.md`. Repeat work-unit identity, forced-plan ranking,
    softmax fusion, and Welford fusion-versus-cut decisions. Keep P4 flagged until this closes.
 4. **Resolve the Release-only cube assertions.** The vector checkpoint's clean Release build reported

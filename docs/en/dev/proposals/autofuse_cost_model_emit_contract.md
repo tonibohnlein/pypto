@@ -378,12 +378,25 @@ regression verifies that the padded `h=11` candidate no longer outranks the devi
 **G6 — A6 residual (C2 DONE).** Split still priced for materialized max/row reductions the emit
 declines (bare-`col_sum`-only, `:1630`). Bounded, unmeasured; left as-is pending a probe.
 
-**G7 — P4 algorithm-specific compute — DEVICE-CONFIRMED.** Phase masks price the source DAG, but P4
-stats emission builds a different online algorithm. Welford emits chunk mean, centered M2, and Chan
-merge operations; softmax emits `(m,l)` rescale/correction operations. These are not represented by
-the original dual-sum/softmax cones. On 910B2 the correct Welford kernel was 102.1 us versus a
-76.4 us zero-mean cut, a 33.6% regression the model did not predict. Represent the emitted operators
-in init/rolled/tail/finalize phase work using grounded per-op costs; do not add a fitted surcharge.
+**G7 — P4 algorithm-specific compute — HOST-FIXED; SILICON RANKING FOLLOW-UP REQUIRED.** Phase masks
+price the source DAG, but P4 stats emission builds a different online algorithm. Welford emits chunk
+mean, centered M2, and Chan merge operations; softmax emits `(m,l)` rescale/correction operations.
+These are not represented by the original dual-sum/softmax cones. `VectorStreamPlan` now carries a
+compact, fixed-size primitive tally for stats init, one repeated stats update (also used by a ragged
+tail), and finalize. Candidate costing consumes that tally directly: wide `[free,chunk]` and thin
+`[free,1]` work use the grounded pto-isa add/mul/div/exp/scalar coefficients and count-mode floors.
+The wide broadcast subtraction is represented separately as the composite `TROWEXPANDSUB` cost
+(`vbrcb + barrier + vsub`, including its row-strided repeat geometry), rather than as a plain add;
+each logical task pays its own barrier-separated reduction trees before the normal wave makespan is
+applied. The apply cone remains a source-DAG replay with the online stats substituted. The emitter
+re-derives the shared descriptor for the winning P4 kind and rejects a mismatch. No fitted surcharge
+was added, and `CostResult` remains unchanged.
+
+The previous 910B2 run found the correct Welford kernel at 102.1 us versus a 76.4 us zero-mean cut
+(33.6% slower). With exact G7 work, the host model materially raises Welford compute but still ranks
+the fused `[128,8192]` candidate below its modeled cut; its selected grid also changes. Therefore G7
+closes the representational/model↔emit gap on host, not the decision-oracle validation: re-run the
+natural and forced fused/cut plans on silicon before enabling layernorm P4 by default.
 
 ### Minor / doc-completeness
 

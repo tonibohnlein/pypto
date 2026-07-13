@@ -1403,9 +1403,9 @@ class TestAutoFuse:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
-    def test_p4_layernorm_dualsum_fuses_into_one_streamed_kernel(self, ascend_backend, monkeypatch):
-        """P4 increment 2: a DUAL-SUM layernorm over a UB-overflowing reduced axis FUSES into ONE
-        streamed online kernel (behind PYPTO_AUTOFUSE_P4), instead of the G1 cut into row_sum pieces.
+    def test_p4_layernorm_welford_forced_emit_is_stable(self, ascend_backend, monkeypatch):
+        """P4 increment 2: a DUAL-SUM layernorm over a UB-overflowing reduced axis can emit ONE
+        streamed online Welford kernel (behind PYPTO_AUTOFUSE_P4).
 
         The shared P4 analysis proves the exact dual-sum layernorm shape: Sx=row_sum(x) and
         Sxsq=row_sum(x^2), both derived directly from x, NOT the chained row_sum((x-mu)^2). But
@@ -1419,13 +1419,16 @@ class TestAutoFuse:
         The DAG must be FULLY NAMED (a nested-argument call drops the inner op from the solver graph
         and misses P4; see KNOWN_ISSUES). Numerics are checked across a wide range of input means
         (randn, +100, +1000, +2000) — the +2000 case NaNs under the old dual-sum emit and is the whole
-        reason for the Welford accumulation; Welford stays within tolerance and never NaNs.
+        reason for the Welford accumulation; Welford stays within tolerance and never NaNs. This
+        correctness/emit test forces the exact P4 group so a later cost-model decision to prefer the
+        cut does not silently remove coverage of the Welford implementation.
         """
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
         monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
         n = 8192
         eps = 1e-5
 
@@ -1448,7 +1451,7 @@ class TestAutoFuse:
 
         fused = passes.auto_fuse()(Prog)
         body = next(f for _, f in fused.functions.items() if f.name == "ln").as_python()
-        # ONE fused streamed kernel (not the G1 cut), carrying the running Welford (mean, M2, count).
+        # The forced exact group emits one streamed kernel carrying running Welford (mean, M2, count).
         assert body.count("pl.spmd(") == 1, body
         # Welford iter-arg carries (re-pointed from the old dual-sum {_s0_it, _s1_it} markers, which the
         # unstable sum-accumulator emit no longer produces).
@@ -1483,6 +1486,9 @@ class TestAutoFuse:
             assert torch.allclose(out, ref, rtol=1e-2, atol=1e-2), (
                 f"mean+{shift}: max abs diff {(out - ref).abs().max().item():.3e}"
             )
+
+        # Return to the natural solver decision for the structural near-miss below.
+        monkeypatch.delenv("PYPTO_AUTOFUSE_FORCE_MERGE")
 
         # A CHAINED layernorm — row_sum((x-mu)^2) depends on the finalized mean, so the two sums are
         # NOT the exact descriptor — must DECLINE P4 and be CUT by the solver, NOT fused
