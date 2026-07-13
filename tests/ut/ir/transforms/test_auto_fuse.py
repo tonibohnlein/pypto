@@ -715,6 +715,7 @@ class TestAutoFuse:
         geometries without inspecting PyPTO names in the solver.
         """
         monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
 
         @pl.program
         class Prog:
@@ -733,8 +734,9 @@ class TestAutoFuse:
         passes.auto_fuse()(Prog)
 
         dag = json.loads((tmp_path / "vector_semantics.dag.json").read_text())
-        assert dag["vector_primitive_families"] == ["add", "exp", "scalar_mul", "reduction"]
+        assert dag["vector_primitive_families"] == ["add", "exp", "scalar_mul", "row_sum"]
         assert dag["vector_op_geometries"] == ["row_expand", "flat", "flat", "flat"]
+        assert dag["per_task_overhead_cycles"] == 64
 
     def test_cube_plan_materializes_large_intermediate_in_l1(self):
         """A multi-L0 intermediate is assembled into the L1 band priced by the plan.
@@ -1369,6 +1371,32 @@ class TestAutoFuse:
         assert torch.allclose(out, torch.softmax(x, dim=1), rtol=1e-4, atol=1e-4), (
             f"max abs diff {(out - torch.softmax(x, dim=1)).abs().max().item():.3e}"
         )
+
+    def test_g9_tall_softmax_uses_full_vector_wave(self, ascend_backend, monkeypatch):
+        """Row-aware reduction work prevents a tall P4 kernel from under-filling AIVs.
+
+        The 910B2 sweep scales strongly from 12 through 48 logical tasks. PTO's
+        row-aware TROWSUM/TROWMAX formulas reproduce that mechanism without
+        changing the queue-wave equation, so the natural host plan must reach
+        the full 48-task first wave and the emitter must realize that grid.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def sm(self, x: pl.Tensor[[768, 8192], pl.FP32]) -> pl.Tensor[[768, 8192], pl.FP32]:
+                m: pl.Tensor[[768, 1], pl.FP32] = pl.row_max(x)
+                shifted: pl.Tensor[[768, 8192], pl.FP32] = pl.row_expand_sub(x, m)
+                exponent: pl.Tensor[[768, 8192], pl.FP32] = pl.exp(shifted)
+                total: pl.Tensor[[768, 1], pl.FP32] = pl.row_sum(exponent)
+                out: pl.Tensor[[768, 8192], pl.FP32] = pl.row_expand_div(exponent, total)
+                return out
+
+        fused = passes.auto_fuse()(Prog)
+        body = next(f for _, f in fused.functions.items() if f.name == "sm").as_python()
+        assert "pl.spmd(48" in body and body.count("pl.spmd(") == 1, body
 
     def test_p4_nonuniform_region_count_matches_forced_solver_grid(self):
         """DMA padding must not replace the solver's logical P4 task grid.

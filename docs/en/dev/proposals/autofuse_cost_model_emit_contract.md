@@ -96,10 +96,11 @@ No phase may hide work across a barrier.
   `rows·ceil(cols/epr)` geometry. A row-expand binary in a reduction-layout group additionally pays
   the emitted `vbrcb` and `PIPE_V` barrier needed for its col-major statistic; the pure-pointwise
   row-major form does not. Count-mode floors are applied per invocation.
-- Reduction work is replayed at the same frame: row-reduce ≈
-  `45·(ceil(W/epr)−1)+51` (rows-independent), while col-reduce ≈
-  `16·(H−1)+30·log2(H)`. P1/P2 also price the thin add/max merge emitted after every non-initial
-  statistics chunk; that merge is generated code and is absent from the source DAG.
+- Reduction work is replayed at the same frame. FP32/FP16 row sum/extrema use PTO-ISA's fit formula
+  `round(slope(W)·valid_rows·W+bias(W))`; exact table widths reproduce PTO and other emitted widths
+  interpolate adjacent anchors. Column reductions and unsupported dtypes retain the explicit
+  structural fallback pending their own grounding audit. P1/P2 also price the thin add/max merge
+  emitted after every non-initial statistics chunk; that merge is absent from the source DAG.
 - Head+tail is paid **once per back-to-back pointwise run in every emitted invocation**. A
   barrier-bearing row expansion starts a new run. An op in both phase cones (softmax's
   `sub`/`exp`) is charged in both because the apply pass recomputes it.
@@ -375,16 +376,17 @@ unblocked **G3** (its accurate pricing routes a cross-group `[M,1]` stat that th
 take), so G3's 2× read is applied unconditionally (was gated on the model-ahead flag until G4).
 Other (ragged) 2D operand shapes still decline.
 
-**G5 — A1 — logical-region identity — HOST-FIXED; DEVICE FOLLOW-UP PENDING.** Device work exposed
+**G5 — A1 — logical-region identity — DEVICE-CLOSED (2026-07-13).** Device work exposed
 the old mismatch: forced `8192,11,1,12,1` was costed as 12 tasks but DMA alignment changed the
 streamed free tile and emission to 8 blocks. The fix deliberately keeps the user's solver choice:
 `work_units = parts_m·parts_n = 12`, with an element-balanced 11/10-row ownership partition.
 `free_tile_alloc=16` records the FP32 UB/DMA allocation independently; reduced-axis `chunk` remains
 the inner stream inside each logical task. Costing uses the same logical count for waves, active GM
 pipes, per-task overhead, `CostResult`, and traffic replay; emission uses it for `pl.spmd(12)` and
-reconstructs the balanced offsets. A focused numeric regression forces this plan, and a cost
-regression verifies that the padded `h=11` candidate no longer outranks the device-best uniform
-`h=8`, 16-task plan. Silicon must confirm the repaired ranking before G5 is closed.
+reconstructs the balanced offsets. On 910B2 every forced grid matched `pl.spmd(N)`; the padded
+`h=11` plan loaded only 11 valid rows per task, and the repaired natural `[128,8192]` argmin became
+the device-best `h=8`, 16-task plan. Cost traffic now sums the exact logical 11/10 partition rather
+than multiplying all tasks by the maximum region extent.
 
 **G6 — A6 residual (C2 DONE).** Split still priced for materialized max/row reductions the emit
 declines (bare-`col_sum`-only, `:1630`). Bounded, unmeasured; left as-is pending a probe.
@@ -403,11 +405,11 @@ applied. The apply cone remains a source-DAG replay with the online stats substi
 re-derives the shared descriptor for the winning P4 kind and rejects a mismatch. No fitted surcharge
 was added, and `CostResult` remains unchanged.
 
-The previous 910B2 run found the correct Welford kernel at 102.1 us versus a 76.4 us zero-mean cut
-(33.6% slower). With exact G7 work, the host model materially raises Welford compute but still ranks
-the fused `[128,8192]` candidate below its modeled cut; its selected grid also changes. Therefore G7
-closes the representational/model↔emit gap on host, not the decision-oracle validation: re-run the
-natural and forced fused/cut plans on silicon before enabling layernorm P4 by default.
+The first 910B2 run found the correct Welford kernel 33.6% slower than its zero-mean cut; after G5
+repaired the grid, the same comparison became 18.8% faster while retaining high-mean accuracy. That
+second fingerprint predates exact G7/G8/G9 compute. Therefore G7 closes the representational
+model↔emit gap on host, not the decision-oracle validation: re-run natural and forced fused/cut plans
+on silicon before enabling layernorm P4 by default.
 
 **G8 — source-DAG strip/chunk compute — HOST-FIXED; SILICON RANKING FOLLOW-UP REQUIRED.** The old
 source-op path first cost a full tensor and then fractionally scaled it into a phase. That preserved
@@ -427,8 +429,29 @@ canonical softmax/layernorm apply cones without claiming that every PyPTO vector
 The explicit reduction descriptor also selects this path for a bare P1 kernel, so its per-chunk
 reduction tree and generated add/max merge are not lost merely because the graph has no pointwise op.
 
+**G9 — row-aware reduction work — HOST-FIXED; SILICON FORMULA FOLLOW-UP REQUIRED.** The original
+`45·(ceil(cols/epr)-1)+51` row-reduction tree came from PTO-ISA's stub perf simulator. Its count-mode
+implementation intentionally drops repeat work and is rows-independent; PTO-ISA's documentation
+warns that real hardware is not. The A2/A3 fit backend instead grounds `TROWSUM` and `TROWMAX` as
+`round(slope(cols)·valid_rows·valid_cols+bias(cols))`, with fit tests against cycle profiling. G9
+ports those FP32/FP16 formula anchors, distinguishes sum from max/min in both source-op descriptors
+and generated P4 work, and replays each reduction at the plan's valid `[free_tile,chunk]` shape.
+Exact tabulated widths reproduce PTO-ISA exactly; legal AutoFuse-only widths interpolate adjacent
+total-cycle anchors, and widths beyond the table continue proportionally from the last anchor.
+Unsupported dtypes and legacy descriptor-free research inputs retain the old structural tree
+explicitly. No scheduler constant was fitted, `CostResult` is unchanged, and the existing
+`WaveComputeCycles(total,U,C)` equation remains intact: 96 eight-row tasks are two waves of half the
+per-task row work, not twice the wall of 48 sixteen-row tasks. The host `[768,8192]` softmax sweep now
+ranks U48 below U32 and chooses 48 tasks naturally (U12/U32/U48/U96 =
+344722/163497/159365/173609 model-cycles). Device work must validate the interpolated emitted chunk
+widths and the post-G7/G8/G9 natural/forced ranking. Column sum/extrema are now classified exactly,
+but still use the legacy column-tree cost pending their own PTO fit audit.
+
 ### Minor / doc-completeness
 
+- **Offline task-cost replay — FIXED (2026-07-13).** Problem JSON now serializes and reloads
+  `per_task_overhead_cycles`; a dumped generic-emitter problem therefore retains C3's 64-cycle
+  per-logical-task term instead of silently re-ranking grids offline.
 - **Granule-padding feasibility fiction — FIXED (2026-07-09, BUG-G1THRESH).** The emit allocates
   `AlignUp(sh,g)×AlignUp(sw,g)` tiles (`g = vec_dma_align_bytes / group_min_dtype_bytes`); the cost
   model's `vector_peak_ub::tile_bytes` used unpadded `min(cfg,dim)`, so a thin free axis (M-tile
