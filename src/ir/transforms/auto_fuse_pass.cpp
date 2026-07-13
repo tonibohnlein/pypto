@@ -335,11 +335,12 @@ std::pair<::VectorPrimitiveFamily, ::VectorOpGeometry> ClassifyVectorOpSemantics
   using Family = ::VectorPrimitiveFamily;
   using Geometry = ::VectorOpGeometry;
 
-  if (IsOp(call, "tensor.row_sum") || IsOp(call, "tensor.row_max") ||
-      IsOp(call, "tensor.row_min") || IsOp(call, "tensor.col_sum") ||
-      IsOp(call, "tensor.col_max") || IsOp(call, "tensor.col_min")) {
-    return {Family::Reduction, Geometry::Flat};
-  }
+  if (IsOp(call, "tensor.row_sum")) return {Family::RowSum, Geometry::Flat};
+  if (IsOp(call, "tensor.row_max") || IsOp(call, "tensor.row_min"))
+    return {Family::RowExtrema, Geometry::Flat};
+  if (IsOp(call, "tensor.col_sum")) return {Family::ColSum, Geometry::Flat};
+  if (IsOp(call, "tensor.col_max") || IsOp(call, "tensor.col_min"))
+    return {Family::ColExtrema, Geometry::Flat};
 
   Family family = Family::Generic;
   if (IsOp(call, "tensor.add") || IsOp(call, "tensor.sub") ||
@@ -1008,6 +1009,10 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
       case ::VectorPrimitiveFamily::Rsqrt: return "rsqrt";
       case ::VectorPrimitiveFamily::ScalarAdd: return "scalar_add";
       case ::VectorPrimitiveFamily::ScalarMul: return "scalar_mul";
+      case ::VectorPrimitiveFamily::RowSum: return "row_sum";
+      case ::VectorPrimitiveFamily::RowExtrema: return "row_extrema";
+      case ::VectorPrimitiveFamily::ColSum: return "col_sum";
+      case ::VectorPrimitiveFamily::ColExtrema: return "col_extrema";
       case ::VectorPrimitiveFamily::Reduction: return "reduction";
     }
     return "generic";
@@ -1042,7 +1047,9 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     << (p.allow_model_ahead_mixed_multi_roundtrip ? "true" : "false")
     << ",\n  \"cube_capacity\": " << p.cube_capacity << ",\n  \"vec_capacity\": " << p.vec_capacity
     << ",\n  \"l1_capacity\": " << p.l1_capacity << ",\n  \"cube_compute_cost\": " << p.cube_compute_cost
-    << ",\n  \"kernel_fill_cost\": " << p.kernel_fill_cost << ",\n  \"cube_freq_hz\": " << p.cube_freq_hz
+    << ",\n  \"kernel_fill_cost\": " << p.kernel_fill_cost
+    << ",\n  \"per_task_overhead_cycles\": " << p.per_task_overhead_cycles
+    << ",\n  \"cube_freq_hz\": " << p.cube_freq_hz
     << ",\n  \"bw_gm_l1\": " << p.bw_gm_l1 << ",\n  \"bw_l0c_gm\": " << p.bw_l0c_gm
     << ",\n  \"bw_l1_l0a\": " << p.bw_l1_l0a << ",\n  \"bw_l1_l0b\": " << p.bw_l1_l0b
     << ",\n  \"bw_gm_ub\": " << p.bw_gm_ub << ",\n  \"bw_ub_gm\": " << p.bw_ub_gm
