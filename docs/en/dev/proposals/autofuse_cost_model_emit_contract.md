@@ -86,21 +86,21 @@ No phase may hide work across a barrier.
 ### Compute (`GroundedVectorOpCompute`, `WaveComputeCycles`)
 
 - The adapter records the pto-isa primitive family and emitted geometry for grounded source ops:
-  add/sub/max/min, mul, div, exp, log, rsqrt, scalar add/sub/mul, and their row/column
-  broadcast forms, plus the supported row/column reductions. Their coefficients come from the same table as generated P4 work. Unsupported
-  source ops retain the historical `vec_slope`/`vec_fixed` fallback rather than being assigned a
-  guessed primitive.
+  add/sub/max/min, mul, div, exp, log, rsqrt, abs, sqrt, neg, scalar add/sub/mul/max/min, exact
+  part add/mul/max/min, their row/column broadcast forms, and supported row/column reductions. Their
+  coefficients come from the same tables as generated P4 work. Composite or alias-sensitive source
+  ops retain the explicit `Generic` fallback rather than being assigned a guessed primitive.
 - Candidate costing replays each grounded op at the exact valid frame of one emitted materialized
   strip or streamed-reduction chunk, then multiplies by that phase's loop iterations and logical
   tasks. `repeat = ceil(elems/epr)` for flat ops; row/column broadcasts use their strided
   `rows·ceil(cols/epr)` geometry. A row-expand binary in a reduction-layout group additionally pays
   the emitted `vbrcb` and `PIPE_V` barrier needed for its col-major statistic; the pure-pointwise
   row-major form does not. Count-mode floors are applied per invocation.
-- Reduction work is replayed at the same frame. FP32/FP16 row sum/extrema use PTO-ISA's fit formula
-  `round(slope(W)·valid_rows·W+bias(W))`; exact table widths reproduce PTO and other emitted widths
-  interpolate adjacent anchors. Column reductions and unsupported dtypes retain the explicit
-  structural fallback pending their own grounding audit. P1/P2 also price the thin add/max merge
-  emitted after every non-initial statistics chunk; that merge is absent from the source DAG.
+- Reduction work is replayed at the same frame. FP32/FP16 row and column sum/extrema use PTO-ISA's
+  A2/A3 fit tables; exact table shapes reproduce PTO and other emitted shapes interpolate adjacent
+  anchors. Unsupported dtypes retain the explicit structural fallback. P1/P2 also price the thin
+  add/max merge emitted after every non-initial statistics chunk; that merge is absent from the
+  source DAG.
 - Head+tail is paid **once per back-to-back pointwise run in every emitted invocation**. A
   barrier-bearing row expansion starts a new run. An op in both phase cones (softmax's
   `sub`/`exp`) is charged in both because the apply pass recomputes it.
@@ -219,7 +219,7 @@ matmul's scores.
 | **P1** | bare reduction (sum / max) | online but trivial — sum associative, running max; no rescale | built, device-confirmed (col reductions) |
 | **P2** | reduction → pointwise | accumulate, then re-stream to apply (2 passes) | built |
 | **P3** | multipass softmax/layernorm (>1 reduction) | one stream per statistic pass (2–3 reads) | retired |
-| **P4** | online-stats | one stats pass with softmax `(m,l)` rescale or layernorm Welford, then apply | built for exact canonical row-softmax/layernorm behind `PYPTO_AUTOFUSE_P4` |
+| **P4** | online-stats | one stats pass with softmax `(m,l)` rescale or layernorm Welford, then apply | exact row-softmax default-on; Welford opt-in with `PYPTO_AUTOFUSE_P4=1`; `0` disables both |
 
 ### Why P4, not P3
 
@@ -388,24 +388,25 @@ reconstructs the balanced offsets. On 910B2 every forced grid matched `pl.spmd(N
 the device-best `h=8`, 16-task plan. Cost traffic now sums the exact logical 11/10 partition rather
 than multiplying all tasks by the maximum region extent.
 
-**G6 — A6 — materialized reduction split admission — HOST-CLOSED.** The 910B backend lowers only
-atomic add, and slicing a reduction cone preserves semantics only for one terminal `col_sum` whose
-upstream cone is pointwise. The solver now derives that exact capability from the source primitive,
-axis, sink count, and reduction count; every row sum, max/min, internal reduction, multi-sink, and
-descriptor-free reduction enumerates only `S=1`. A fixed `S>1` candidate additionally proves a
+**G6 — A6 — materialized reduction split admission and seed — HOST-CLOSED.** The 910B backend lowers
+only atomic add, and slicing a reduction cone preserves semantics only for one terminal `col_sum`
+whose upstream cone is pointwise. The solver now derives that exact capability from the source
+primitive, axis, sink count, and reduction count; every row sum, max/min, internal reduction,
+multi-sink, and descriptor-free reduction enumerates only `S=1`. A fixed `S>1` candidate proves a
 materialized source/work tile, a granule-aligned exact reduced-axis partition, and a non-overlapping
 free-axis partition. Its ephemeral-granule check also evaluates an upstream pointwise cone at the
 actual `M/S` partial rather than the sink's size-one M axis. `VectorStreamPlan` records
 `ColSumAtomicAdd`, the factor, and partial extent; costing replays every source primitive at the
-emitted `[M/S,free]` partial geometry, and the emitter consumes the descriptor to build the tiled
-zero seed plus atomic-add partial grid. Any
+emitted `[M/S,free]` partial geometry. It also records a separate `VectorReductionSeedPlan`: the
+zero-fill launch is ordered before the atomic body and pays grounded `TEXPANDS` fill work (24 cycles
+for a nonempty tile), UB→GM store, its own task overhead, and its own kernel-fill wave. The emitter
+consumes and verifies both descriptors to build the tiled zero seed plus atomic-add partial grid. Any
 future `S>1` plan without the descriptor is a Tier-B contract failure instead of silently emitting
 the serial body. Solver tests cover all rejected families and ragged grids; the strict AutoFuse test
-checks both bare and pointwise-cone atomic protocols plus numeric results. Precisely grounding the
-separate zero-seed phase's fill/launch cost remains a decision-fidelity refinement; it does not change
-split admission.
+checks both bare and pointwise-cone atomic protocols plus numeric results. The seed is deliberately
+serial and cannot hide under the atomic body's roofline.
 
-**G7 — P4 algorithm-specific compute — HOST-FIXED; SILICON RANKING FOLLOW-UP REQUIRED.** Phase masks
+**G7 — P4 algorithm-specific compute — SILICON-CLOSED (2026-07-13).** Phase masks
 price the source DAG, but P4 stats emission builds a different online algorithm. Welford emits chunk
 mean, centered M2, and Chan merge operations; softmax emits `(m,l)` rescale/correction operations.
 These are not represented by the original dual-sum/softmax cones. `VectorStreamPlan` now carries a
@@ -419,13 +420,13 @@ applied. The apply cone remains a source-DAG replay with the online stats substi
 re-derives the shared descriptor for the winning P4 kind and rejects a mismatch. No fitted surcharge
 was added, and `CostResult` remains unchanged.
 
-The first 910B2 run found the correct Welford kernel 33.6% slower than its zero-mean cut; after G5
-repaired the grid, the same comparison became 18.8% faster while retaining high-mean accuracy. That
-second fingerprint predates exact G7/G8/G9 compute. Therefore G7 closes the representational
-model↔emit gap on host, not the decision-oracle validation: re-run natural and forced fused/cut plans
-on silicon before enabling layernorm P4 by default.
+At the G7/G8/G9 fingerprint, exact softmax was correct and 25.5% faster than its two-kernel cut;
+Welford was 24.7% faster at zero mean and remained correct at mean `+2000`, where the dual-sum cut
+failed. The emitted stats/apply loops and serial init/tail/finalize phases matched the descriptor.
+Exact softmax is therefore default-on. Welford remains opt-in only for the independent extreme-shift
+accuracy gate, not because of a remaining cost/emit representation gap.
 
-**G8 — source-DAG strip/chunk compute — HOST-FIXED; SILICON RANKING FOLLOW-UP REQUIRED.** The old
+**G8 — source-DAG strip/chunk compute — SILICON-CLOSED (2026-07-13).** The old
 source-op path first cost a full tensor and then fractionally scaled it into a phase. That preserved
 the slope term but paid a fixed startup only once (or even fractionally), despite the emitter replaying
 the op once per materialized strip, P2/P4 chunk, and logical task. It also treated scalar `adds/muls`
@@ -437,13 +438,14 @@ trees, and the generated P1/P2 accumulator merge. The row-expand composite overh
 candidate's reduction layout, matching the emitter's current layout decision. The descriptor is candidate-invariant `Op`
 metadata; it is not cached in `CostResult`, whose local-search footprint remains unchanged. Dumped
 problems serialize the descriptor so offline replay takes the same path. Descriptor-free benchmark
-problems retain their old scalar anchors intentionally; real PyPTO P2/P4 rankings can change and need
-the next silicon rerun. Unsupported primitives remain explicit `Generic` fallbacks, so this closes the
+problems retain their old scalar anchors intentionally. The silicon run confirmed the emitted P2/P4
+phase descriptors, exact `3:1`/`2:1` GM traffic, and fused-versus-cut decisions. Unsupported
+primitives remain explicit `Generic` fallbacks, so this closes the
 canonical softmax/layernorm apply cones without claiming that every PyPTO vector op is grounded.
 The explicit reduction descriptor also selects this path for a bare P1 kernel, so its per-chunk
 reduction tree and generated add/max merge are not lost merely because the graph has no pointwise op.
 
-**G9 — row-aware reduction work — HOST-FIXED; SILICON FORMULA FOLLOW-UP REQUIRED.** The original
+**G9 — row-aware reduction work — SILICON-CLOSED (2026-07-13).** The original
 `45·(ceil(cols/epr)-1)+51` row-reduction tree came from PTO-ISA's stub perf simulator. Its count-mode
 implementation intentionally drops repeat work and is rows-independent; PTO-ISA's documentation
 warns that real hardware is not. The A2/A3 fit backend instead grounds `TROWSUM` and `TROWMAX` as
@@ -457,12 +459,32 @@ explicitly. No scheduler constant was fitted, `CostResult` is unchanged, and the
 `WaveComputeCycles(total,U,C)` equation remains intact: 96 eight-row tasks are two waves of half the
 per-task row work, not twice the wall of 48 sixteen-row tasks. The host `[768,8192]` softmax sweep now
 ranks U48 below U32 and chooses 48 tasks naturally (U12/U32/U48/U96 =
-344722/163497/159365/173609 model-cycles). Device work must validate the interpolated emitted chunk
-widths and the post-G7/G8/G9 natural/forced ranking. Column sum/extrema are now classified exactly,
-but still use the legacy column-tree cost pending their own PTO fit audit.
+344722/163497/159365/173609 model-cycles). The 910B2 sweep put natural U48 in the device-best cluster
+with 4.2% regret and preserved the gross forced-plan order (Spearman 0.70). The short `[128,8192]`
+case over-splits mildly (7.1% versus the clean 16-task grid), a bounded ranking refinement rather
+than a model/emit mismatch.
+
+**G10 — column-reduction grounding — HOST-CLOSED.** Exact FP32/FP16 `TCOLSUM` and `TCOLMAX` now use
+the PTO A2/A3 fit tables rather than the legacy structural tree. Exact anchors include FP32
+`[64,64]` sum/max = `1263/1137` cycles and FP16 `[64,128]` = `1263/1137`; intermediate shapes
+interpolate adjacent table anchors and remain monotone in valid rows. Unsupported dtypes retain the
+named structural fallback. A device sweep is a decision-oracle validation task, not missing model
+coverage.
+
+**G11 — source primitive coverage — HOST-CLOSED.** The adapter and plan now name every audited
+one-instruction vector lowering used by the supported emit surface: abs, sqrt, neg, scalar max/min,
+and exact part add/mul/max/min join the existing arithmetic, transcendental, broadcast, and reduction
+families. High-precision rsqrt and other composite/alias-sensitive forms remain `Generic` because
+their scratch, barriers, or multiple instructions are not yet represented. Problem-dump tests guard
+that boundary so future lowering changes cannot silently inherit a cheaper primitive.
 
 ### Minor / doc-completeness
 
+- **Candidate-hot replay — FIXED (2026-07-13).** Subgraph creation now materializes only
+  candidate-invariant UB lifetime/transient metadata and phase-ordered op/input lists. Tile
+  candidates still derive their complete shape-dependent plan and cost, while winners are
+  independently re-derived for emission. `CostResult` remains plan-free; P4 adds constant phases,
+  not a nested configuration search.
 - **Offline task-cost replay — FIXED (2026-07-13).** Problem JSON now serializes and reloads
   `per_task_overhead_cycles`; a dumped generic-emitter problem therefore retains C3's 64-cycle
   per-logical-task term instead of silently re-ranking grids offline.

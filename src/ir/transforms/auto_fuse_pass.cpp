@@ -344,13 +344,15 @@ std::pair<::VectorPrimitiveFamily, ::VectorOpGeometry> ClassifyVectorOpSemantics
 
   Family family = Family::Generic;
   if (IsOp(call, "tensor.add") || IsOp(call, "tensor.sub") ||
-      IsOp(call, "tensor.maximum") || IsOp(call, "tensor.minimum") ||
+      IsOp(call, "tensor.part_add") || IsOp(call, "tensor.part_max") ||
+      IsOp(call, "tensor.part_min") ||
       IsOp(call, "tensor.row_expand_add") || IsOp(call, "tensor.row_expand_sub") ||
       IsOp(call, "tensor.row_expand_max") || IsOp(call, "tensor.row_expand_min") ||
       IsOp(call, "tensor.col_expand_add") || IsOp(call, "tensor.col_expand_sub") ||
       IsOp(call, "tensor.col_expand_max") || IsOp(call, "tensor.col_expand_min")) {
     family = Family::Add;
-  } else if (IsOp(call, "tensor.mul") || IsOp(call, "tensor.row_expand_mul") ||
+  } else if (IsOp(call, "tensor.mul") || IsOp(call, "tensor.part_mul") ||
+             IsOp(call, "tensor.row_expand_mul") ||
              IsOp(call, "tensor.col_expand_mul")) {
     family = Family::Mul;
   } else if (IsOp(call, "tensor.div") || IsOp(call, "tensor.row_expand_div") ||
@@ -360,12 +362,26 @@ std::pair<::VectorPrimitiveFamily, ::VectorOpGeometry> ClassifyVectorOpSemantics
     family = Family::Exp;
   } else if (IsOp(call, "tensor.log")) {
     family = Family::Log;
+  } else if (IsOp(call, "tensor.abs")) {
+    family = Family::Abs;
+  } else if (IsOp(call, "tensor.sqrt")) {
+    family = Family::Sqrt;
   } else if (IsOp(call, "tensor.rsqrt")) {
-    family = Family::Rsqrt;
+    family = call->GetKwarg<bool>("high_precision", false) ? Family::Generic
+                                                           : Family::Rsqrt;
   } else if (IsOp(call, "tensor.adds") || IsOp(call, "tensor.subs")) {
     family = Family::ScalarAdd;
-  } else if (IsOp(call, "tensor.muls")) {
+  } else if (IsOp(call, "tensor.muls") || IsOp(call, "tensor.neg")) {
     family = Family::ScalarMul;
+  } else if (IsOp(call, "tensor.maximum") || IsOp(call, "tensor.minimum")) {
+    const bool scalar_rhs = call->args_.size() == 2 &&
+                            As<ScalarType>(call->args_[1]->GetType()) != nullptr;
+    if (!scalar_rhs) {
+      family = Family::Add;  // tensor vmax/vmin share vadd's grounded class
+    } else {
+      family = IsOp(call, "tensor.maximum") ? Family::ScalarMax
+                                             : Family::ScalarMin;
+    }
   }
   if (family == Family::Generic) {
     return {Family::Generic, Geometry::Generic};
@@ -426,7 +442,7 @@ static bool GenericEmitEnabled();
 
 // Defined below; forward-declared so ProblemBuilder registers exact P4 algorithm descriptors only
 // when the corresponding online emitter is active.
-static bool P4Enabled();
+static bool P4Enabled(::P4PatternKind kind);
 
 // Defined below (~line 788); forward-declared so ProblemBuilder's A1 gate can read a 2D tensor shape.
 std::pair<int64_t, int64_t> Static2DShape(const TypePtr& type);
@@ -842,10 +858,11 @@ class ProblemBuilder {
       op_stmts.push_back(stmt);
     }
 
-    if (GenericEmitEnabled() && P4Enabled()) {
+    if (GenericEmitEnabled()) {
       std::unordered_map<const Stmt*, size_t> op_index;
       for (size_t i = 0; i < op_stmts.size(); ++i) op_index.emplace(op_stmts[i], i);
       for (P4Match& match : AnalyzeP4Patterns(dep.stmts)) {
+        if (!P4Enabled(match.kind)) continue;
         FlatSet<size_t> matched_ops;
         bool complete = true;
         for (const AssignStmtPtr& stmt : match.ops) {
@@ -1006,9 +1023,13 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
       case ::VectorPrimitiveFamily::Div: return "div";
       case ::VectorPrimitiveFamily::Exp: return "exp";
       case ::VectorPrimitiveFamily::Log: return "log";
+      case ::VectorPrimitiveFamily::Abs: return "abs";
+      case ::VectorPrimitiveFamily::Sqrt: return "sqrt";
       case ::VectorPrimitiveFamily::Rsqrt: return "rsqrt";
       case ::VectorPrimitiveFamily::ScalarAdd: return "scalar_add";
       case ::VectorPrimitiveFamily::ScalarMul: return "scalar_mul";
+      case ::VectorPrimitiveFamily::ScalarMax: return "scalar_max";
+      case ::VectorPrimitiveFamily::ScalarMin: return "scalar_min";
       case ::VectorPrimitiveFamily::RowSum: return "row_sum";
       case ::VectorPrimitiveFamily::RowExtrema: return "row_extrema";
       case ::VectorPrimitiveFamily::ColSum: return "col_sum";
@@ -1927,12 +1948,15 @@ static bool GenericEmitEnabled() {
   return v != nullptr && v[0] != '\0' && std::string(v) != "0";
 }
 
-// P4 (fused online-softmax / flash-stats) emit + cost gate. Re-read per call, mirroring
-// GenericEmitEnabled(): a test can toggle it in-process. True unless unset/empty/"0". Off by
-// default, so production and the P4-off differential net are byte-for-byte unchanged.
-static bool P4Enabled() {
+// P4 emit + cost gate. Exact online softmax is silicon-closed and therefore on
+// by default. Welford remains opt-in until the extreme-shift device envelope is
+// closed. An explicit legacy flag still controls both for differential/device
+// runs: 0 disables all P4, while any non-empty non-zero value enables both.
+// Re-read per call so tests can toggle it in-process.
+static bool P4Enabled(::P4PatternKind kind) {
   const char* v = std::getenv("PYPTO_AUTOFUSE_P4");
-  return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+  if (v != nullptr) return v[0] != '\0' && std::string(v) != "0";
+  return kind == ::P4PatternKind::SoftmaxFlash;
 }
 
 // Strict mode turns Tier-B declines (below) into hard failures. OFF in production
@@ -2187,7 +2211,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   const bool stream_p2 = plan_streams && solver_stream.kind == ::VectorStreamKind::ReductionSpanning &&
                          single_reduction_streamable && !sink_is_reduction;
   const bool stream_p4 =
-      plan_streams && P4Enabled() && p4_kind != ::P4PatternKind::None && has_reduction &&
+      plan_streams && P4Enabled(p4_kind) && p4_kind != ::P4PatternKind::None && has_reduction &&
       (pin_m != pin_n) && sinks.size() == 1 && p1_nreds >= 2 &&
       ((p4_kind == ::P4PatternKind::SoftmaxFlash &&
         solver_stream.kind == ::VectorStreamKind::SoftmaxFlash) ||
@@ -3024,9 +3048,12 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     auto split_sink = As<Call>(out_stmt->value_);
     const int64_t S = solver_stream.reduction_split_factor;
     const int64_t rsz = solver_stream.reduction_partial_extent;
+    const ::VectorReductionSeedPlan& seed = solver_stream.reduction_seed;
     if (!pin_m || cone_reduces_m_upstream || split_sink == nullptr ||
         !IsOp(split_sink, "tensor.col_sum") || S != tile.split || S <= 1 ||
-        rsz <= 0 || rsz * S != IM || rsz % g != 0 || IN % w != 0) {
+        rsz <= 0 || rsz * S != IM || rsz % g != 0 || IN % w != 0 ||
+        !seed.present || seed.work_units != num_n || seed.valid_rows != M ||
+        seed.valid_cols != w) {
       return GenericDeclineB(
           "solver col_sum atomic split descriptor disagrees with emitted IR/geometry (G6/S2)",
           out_stmt->span_);

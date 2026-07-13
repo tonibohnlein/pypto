@@ -14,16 +14,16 @@ Companion documents:
   cube/vector stage, GM-FIFO, loop-axis, and cross-core overlap contract.
 - Operational device verification tasks live outside the repository in `/home/toni/work/pypto3/`.
 
-**Vector device checkpoint (2026-07-13).** The latest completed 910B2 run at PyPTO `e3acf3bc` /
-solver `e4616f3` passed 51/51 vector cases and device-closed G5: every forced logical grid equaled
-`pl.spmd(N)`, padding changed UB allocation but not GM traffic, and the `[128,8192]` natural softmax
-argmin moved to the device-best 16-task grid. At `[768,8192]`, forced U12/U24/U32/U48/U96 walls
-scaled with the critical rows per wave; U96 was close to U48, not twice its wall. The remaining
-under-parallel natural plan exposed G9: the old PTO stub reduction tree was rows-independent.
-Host G7/G8 commits after that fingerprint already represent exact generated P4 work and replay
-source ops per emitted phase. G9 now uses PTO-ISA's row-aware FP32/FP16 `TROWSUM`/`TROWMAX` fit
-formulas, keeps the wave equation unchanged, and naturally selects U48 for the tall softmax. Thus
-G5 is closed; G7/G8/G9 and fused-versus-cut decisions require one new fingerprinted device run.
+**Vector device checkpoint (2026-07-13).** The completed 910B2 run at PyPTO `d8ca8a8f` / solver
+`e566674` passed 51/51 vector cases and silicon-closed G5/G7/G8/G9. Exact phase structure and traffic
+remained intact (`2×x` for P4, `2×x+1×bias` for P2); the PTO row-reduction anchors reproduced
+byte-for-byte; and `[768,8192]` naturally selected 48 tasks in the device-best cluster (4.2% regret,
+versus the pre-G9 4.2× miss). Exact softmax was 25.5% faster than its cut and Welford was 24.7%
+faster at zero mean while remaining correct at `+2000`. Exact softmax is therefore default-on;
+Welford remains explicitly gated pending a clean extreme-shift sweep. The subsequent host closure
+adds the separately ordered G6 zero seed, PTO A2/A3 column-reduction fits (G10), and exact source
+descriptors for the remaining one-instruction vector operations (G11); none changes the validated
+P4 phase algorithm.
 
 **Mixed host checkpoint (2026-07-13).** The solver now builds one immutable same-engine stage DAG
 and cube/vector transfer graph per mixed candidate subgraph. A stack-local `MixedSchedulePlan`
@@ -51,8 +51,9 @@ kernels on the Ascend 910B AIV cores and cube (matmul) kernels on the AIC cores 
 
 such that **every cost-model term prices the algorithm the emit actually builds**. This last clause is
 the whole game (see §2). The pass is `src/ir/transforms/auto_fuse_pass.cpp`; it runs behind
-`PYPTO_AUTOFUSE_GENERIC_EMIT=1` (the generic emit) with an additional `PYPTO_AUTOFUSE_P4=1` for the
-fused online softmax/layernorm path.
+`PYPTO_AUTOFUSE_GENERIC_EMIT=1` (the generic emit). Exact canonical softmax P4 is default-on;
+`PYPTO_AUTOFUSE_P4=0` selects the cut fallback and `PYPTO_AUTOFUSE_P4=1` additionally enables the
+still-gated Welford layernorm path.
 
 ---
 
@@ -91,8 +92,8 @@ The Ascend 910B cost model (`3rdparty/mlsys26/src/core/ascend910b_cost.cpp`, `As
 built bottom-up from the hardware rather than fitted to AutoFuse wall times. The design steps:
 
 **(a) Grounded, not AutoFuse-wall regressed.** Every term is derived from the **pto-isa** machine
-model — grounded per-op cycles (`VecOpCompute`: `slope·repeat + head/tail`; FP32/FP16 row reductions
-use PTO's profiled fit formula, while column/unsupported reductions retain the structural tree),
+model — grounded per-op cycles (`VecOpCompute`: `slope·repeat + head/tail`; FP32/FP16 row and column
+reductions use PTO's profiled fit formulas, while unsupported dtypes retain the structural tree),
 grounded per-direction bandwidths (`bw_gm_ub`,
 `bw_ub_gm`, `bw_gm_l1`, `bw_l0c_gm`), and grounded cube L1↔L0 hierarchy. pto-isa is the reference GEMM
 oracle (see the ecosystem note). No coefficient is fitted to AutoFuse wall measurements: PTO's own
@@ -141,17 +142,17 @@ cheapest plan (free-tile ρ≈0.9, zero regret). Two grounding refinements came 
   phase masks avoid doubling apply-only operands.
 - **R0 — couple the reduced axis to its full extent in `vector_peak_ub`**, else a bare reduction sink
   (thin `[·,1]` output) looks materialized and streaming is never detected.
-- **Vector closure — correctness/traffic/G5 passed; current costs pending.** All 51 device cases
-  passed. The op simulator measured exact P2 `2×x + 1×bias` and P4 `2×x` traffic plus 1.3–1.5×
-  phase-local overlap. After G5, softmax P4 was 13.6% faster than its cut and Welford flipped from a
-  grid-induced regression to 18.8% faster while remaining correct at mean `+2000`. The tall sweep
-  then showed real row work scaling through 48 tasks and exposed the stub's rows-independent
-  reduction formula. G9 fixes that on host; G7/G8/G9 decisions now need one combined rerun.
+- **Vector silicon closure — G5/G7/G8/G9 passed.** All 51 device cases passed. The op simulator
+  measured exact P2 `2×x + 1×bias` and P4 `2×x` traffic; phase-local overlap and serial edge phases
+  matched the plan. Grounded row work moved the tall natural grid to 48 tasks and cut argmin regret
+  to 4.2%. Exact softmax beat its cut by 25.5%; Welford beat the zero-mean cut by 24.7% and was the
+  only numerically sound path at mean `+2000`.
 
 **(g) The contract emerged from systematically checking (b)–(f) against the emit.** Each ⚠️ in contract
 §6 is a place the model priced an algorithm the emit didn't build; we closed them on host (G2
 pipelining, G3, G4 broadcast, G5 logical-region identity, G6 split admission, R0, and granule
-padding). G5 is silicon-closed; G7/G8/G9 still need their current-fingerprint rerun.
+padding). G5/G7/G8/G9 are silicon-closed. G6 seed work, G10 column fits, and G11 exact primitive
+coverage close the remaining representational gaps on host without fitting AutoFuse wall time.
 
 ---
 
@@ -170,23 +171,25 @@ padding). G5 is silicon-closed; G7/G8/G9 still need their current-fingerprint re
     `p4_chunk` custom `(m,l)` body; exact layernorm → Welford), multi-sink, S2 split-K, broadcast (G4).
     Folded P1 may finish with a thin pointwise cone once, without a spanning second input pass.
     P1/P2/P4 materialize-vs-stream, chunk/tail, serial phases, and loop stages are re-derived for the
-    winning config
-    with the same `vector_stream_plan` helper used during pricing; an internal check verifies the
-    local loop construction matches it. Shared carried-loop and spanning-apply builders serve P2,
+    winning config with the same `vector_stream_plan` helper used during pricing; an internal check
+    verifies the local loop construction matches it. Shared carried-loop and spanning-apply builders serve P2,
     softmax, and Welford. Emit descriptors are not retained in the local-search cache.
   - `TileMatmul` (~:813) / `BuildTileMatmul` (k-pipeline) / `EmitLoneMatmulGeneric` — the **cube** emit.
-  - Flag helpers `GenericEmitEnabled()`, `P4Enabled()` (re-read env per call).
+  - Flag helpers `GenericEmitEnabled()`, `P4Enabled(P4PatternKind)` (re-read env per call). With the
+    P4 variable unset, exact softmax is enabled and Welford is not; `0` disables both and a nonzero
+    value enables both.
 - **Cost model** — `3rdparty/mlsys26/src/core/ascend910b_cost.cpp` (+ `types.h`, `dag.h`), branch
   `ascend-910b-model`, linked as `solver_lib`. `VectorStreamPlan` is stack-local while
   pricing candidates and re-derived only for final/forced configs consumed by AutoFuse.
-- **Flags:** `PYPTO_AUTOFUSE_GENERIC_EMIT`, `PYPTO_AUTOFUSE_P4`, `PYPTO_AUTOFUSE_FORCE_PLAN`
+- **Flags:** `PYPTO_AUTOFUSE_GENERIC_EMIT`, `PYPTO_AUTOFUSE_P4` (unset = exact softmax only,
+  `0` = neither, nonzero = exact softmax + Welford), `PYPTO_AUTOFUSE_FORCE_PLAN`
   (`"[g<N>:]w,h,split[,pm,pn]"`, **static-cached per process** → one force per fresh subprocess),
   `PYPTO_AUTOFUSE_FORCE_MERGE=none|all`, `PYPTO_AUTOFUSE_DUMP_PLANS`, `PYPTO_AUTOFUSE_STRICT`.
 - **Build (MAX 2 cores):** `cmake --build build --parallel 2`;
   `cmake --build 3rdparty/mlsys26/build --target solver_lib -j2`.
 - **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 4`
-  (35 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
-  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (418 pass / 7 documented baseline failures). Numeric:
+  (36 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
+  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (436 pass / 7 documented baseline failures). Numeric:
   `pypto.debug.torch_codegen(passes.auto_fuse()(Prog), run_all_spmd_blocks=True)` — write P4 DSL FULLY
   NAMED (nested args drop ops from the solver graph → miss P4).
 
@@ -202,18 +205,20 @@ padding). G5 is silicon-closed; G7/G8/G9 still need their current-fingerprint re
 - Reductions: P1 (bare) + P2 (spanning apply), streamed over the reduced axis, **both passes pipelined
   (A5/G2)** — accumulator persists, loads double-buffer; numerically exact.
 - Broadcast operands (G4), multi-sink, and S2 terminal-`col_sum` cross-core split with tiled zero
-  seed plus atomic-add merge. Unsupported row/max/min/internal/ragged split families stay at `S=1`.
+  seed plus atomic-add merge. The seed is an explicit serial `TEXPANDS`-grounded fill/store phase
+  with its own task and kernel-fill terms. Unsupported row/max/min/internal/ragged split families
+  stay at `S=1`.
 - **P4 softmax** — fused online flash `(m,l)` with `exp(m_old−m_new)` rescale; the cone is verified
   EXACT by the shared descriptor (only `row_max→sub(x,m)→exp→row_sum→div`); stats and apply passes
-  stage-2 pipelined when their rolled trip count is at least 2. It was numerically correct and 13.6%
-  faster than its two-kernel cut in the G5 device run, but remains flagged until the
-  post-G7/G8/G9 ranking is revalidated.
+  stage-2 pipelined when their rolled trip count is at least 2. The G7/G8/G9 device run found it
+  numerically correct and 25.5% faster than its two-kernel cut, so exact softmax is default-on.
 - **P4 layernorm** — stable streaming **Welford** (running count/mean/M2, Chan's parallel merge),
   reached only after proving the exact `sum(x)` / `sum(x*x)` / mean / variance / rsqrt / centered-apply
   algebra, then substituting stable `mean`/`var` into that cone. Its three-carry stats and apply passes
   are stage-2 pipelined under the same trip-count guard. ≤ the cut's accuracy at input mean
-  0/100/1000/2000, **no NaN at +2000** (the dual-sum form NaN'd there). It was 18.8% faster than
-  the cut after G5 repaired the grid, but that run predates G7/G8/G9 costing. Temperature softmax,
+  0/100/1000/2000, **no NaN at +2000** (the dual-sum form NaN'd there). It was 24.7% faster than
+  the zero-mean cut after G7/G8/G9 and remained correct at `+2000`; it stays opt-in until the
+  extreme-shift envelope is measured cleanly. Temperature softmax,
   weighted-second-moment graphs, and patterns with an escaping internal stat cut and preserve semantics.
 
 **Cube emit:** G-A ceil+clamp grid (non-uniform lone matmul tiles across cores — **device-validated**:
@@ -224,17 +229,25 @@ peel, deep-T chained (tensor-level; #1908-xfail at lowering). k-loop is `ForKind
 reduced-axis coupling, granule-padded feasibility, the reduction source/work two-band floor, and
 candidate-local P4 feasibility. Materialized cross-core reduction candidates carry an exact
 `ColSumAtomicAdd` descriptor only after semantic, UB, and partition checks; upstream pointwise
-ephemerals are validated and replayed at the emitted partial geometry. The stack-local
+ephemerals are validated and replayed at the emitted partial geometry. Their separate zero seed is
+an ordered serial plan phase with grounded fill, store, task, and kernel-launch costs. The stack-local
 `VectorStreamPlan` records pebble/scratch peaks; owns materialized/pointwise strips and streamed-reduction
 init/rolled/tail/finalize phases; and gates each phase's A5 overlap on its actual loop stage. Cost is
 the sum of phase rooflines, so barriers never hide work across phases. AutoFuse re-derives the plan for
 the winning config. It now also owns element-balanced M/N logical partitions and their exact
 `work_units`; `free_tile_alloc` carries DMA padding separately, so alignment cannot change the SPMD
-count. Grounded source-DAG add/mul/div/exp/log/rsqrt, scalar/broadcast variants, and supported
-row/column reductions carry a compact primitive/geometry descriptor. Costing replays that descriptor per planned strip/chunk/task,
-including count-mode, reduction-layout row-expand barriers, row fit formulas, and generated P1/P2 merges; unsupported
-ops remain on the explicit legacy fallback. `CostResult`
+count. Grounded source-DAG add/mul/div/exp/log/rsqrt/abs/sqrt/neg, scalar and broadcast variants,
+part add/mul/max/min, and supported row/column reductions carry a compact primitive/geometry
+descriptor. Costing replays that descriptor per planned strip/chunk/task, including count-mode,
+reduction-layout row-expand barriers, PTO row/column fit formulas, and generated P1/P2 merges.
+Composite and alias-sensitive operations remain on the explicit `Generic` fallback. `CostResult`
 stays at its pre-refactor 112-byte footprint (guarded at ≤128 bytes) for the local-search cache.
+`create()` precomputes UB band intervals, flattened transient references, and phase-ordered op/input
+lists once per subgraph. Each tile candidate therefore performs only shape-dependent arithmetic and
+one linear replay; P1/P2/P4 add a constant number of phases, not another combinatorial search. A
+Release A/B microbenchmark of the 11-config tall-softmax sweep retained the identical aggregate cost
+and reduced candidate evaluation by about 7.5%. Whole-suite profiling is dominated by partition
+search and allocation, not this vector evaluator.
 
 **Vector refactor preservation audit.** The plan extraction was separated from the subsequent
 model corrections so structural movement could be checked independently. Solver `10f8f8b`
@@ -251,19 +264,21 @@ The G8 descriptor path deliberately does not change those descriptor-free C++ be
 Real PyPTO problems now carry lowering semantics, so their source-op startup/count-mode work may
 change; this separates an intended fidelity correction from the plan-refactor preservation control.
 
-**Current host gates.** AutoFuse UT is 35 passed / 1 expected xfail; the solver suite is 418 passed
+**Current host gates.** AutoFuse UT is 36 passed / 1 expected xfail; the solver suite is 436 passed
 with the same 7 documented baseline failures. The vector checkpoint's device file
 collects 51 A2/A3 cases. Four persistent cases
 cover exact P4 softmax `[128,8192]`, Welford layernorm at input mean `+2000`, a scaled-softmax near
 miss that must cut, and a P2 apply-only bias input whose expected MTE2 payload is `2×x + 1×bias`.
 
 **Device-validated on 910B2:** vector correctness 51/51; exact P2/P4 phase traffic; phase-local
-overlap; G5 logical-grid identity and zero-regret `[128,8192]` argmin; softmax P4 13.6% faster than
-its cut; high-mean Welford correct and 18.8% faster after the grid repair. The same run exposed the
-tall row-work gap now fixed by G9, and predates G7/G8, so current cost decisions are not closed.
+overlap; G5 logical-grid identity; G7/G8 algorithm/source replay; and G9 row-grounded task ranking.
+The tall natural softmax is in the device-best cluster; exact softmax is 25.5% faster than its cut;
+high-mean Welford is correct and the zero-mean path is 24.7% faster than its cut.
 Cube G-A/ragged-K and recursive-plan correctness are also device-validated.
 
-**Current commit arc** (newest first): G6 exact split admission (this change) · `d8ca8a8f` G9
+**Current commit arc** (newest first): current host batch = explicit G6 seed cost + G10 column fits +
+G11 source coverage + exact-softmax default + candidate-hot metadata · G6 exact split admission ·
+`d8ca8a8f` G9
 row-aware reductions · PyPTO `45785941` G8 source-op replay · `ff706a94` G7 phase-work contract ·
 `e3acf3bc` mixed plans + G5 grids. Solver: `f71bd70` G6 exact split admission · `e566674` G9
 fit formulas · `45c82f0` G8
@@ -303,24 +318,20 @@ statistics update math remains deliberately algorithm-specific.
 
 ## 7. What remains (ordered)
 
-1. **Device-close G7/G8 algorithm work.** The host now represents softmax `(m,l)` correction and
-   Welford chunk/Chan operations in exact init/rolled/tail/finalize work tallies, using grounded
-   per-op costs. Re-run natural and forced P2/softmax/Welford fused/cut plans at the new fingerprints;
-   confirm the dumped descriptors and repeated row-expand startup/barrier work.
-2. **Device-close G9 row-reduction grounding.** Sweep the actual emitted FP32/FP16 chunk widths and
-   free rows, then repeat `[768,8192]` U12/U24/U32/U48/U96 plus the natural plan. Confirm U48 is the
-   host argmin, U48/U96 walls remain close, and any residual is an identified formula/phase gap—not
-   absorbed into a task-count fit.
-3. **Decide P4 defaults only from the new run.** Exact softmax may advance separately if it remains
-   correct and faster than its cut. Keep layernorm flagged until the post-G7/G8/G9 Welford-vs-cut
-   result and high-mean accuracy both pass.
-4. **Remaining vector fidelity:** ground the separate S2 zero-seed fill/launch phase and column
-   sum/extrema from PTO's fit backend; then extend source primitive descriptors only for known
-   emitted PTO instructions. Unsupported operations remain explicit `Generic` fallbacks.
-5. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan` and recursive uniform-grid
+1. **Device-close the final host-only vector refinements.** Fingerprint and sweep G6 split candidates
+   after the explicit seed phase, plus FP32/FP16 G10 column sum/extrema tiles. Confirm that their PTO
+   anchors and model ordering transfer to silicon; do not fit an AutoFuse task-count constant.
+2. **Close Welford's opt-in gate.** Run one harness-faithful extreme-shift/scale accuracy sweep and
+   fused-versus-cut walls. Exact softmax is already default-on independently; `P4=0` preserves its
+   fallback test surface.
+3. **Profile broader solver search before more vector micro-optimization.** Candidate-invariant UB
+   topology and phase ordering are now precomputed, the 11-config P4 sweep is only a few microseconds,
+   and `CostResult` still caches only scalar/config data. The end-to-end profile points to partition
+   search/allocation; do not cache complete stream plans unless a new profile overturns that result.
+4. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan` and recursive uniform-grid
    emitter are implemented (§8). Next reconcile GM reload with the emitted L0-subtile loop, then
    introduce per-node cube phase rooflines, price split seed/tasks, and close non-uniform grids.
-6. **Complete mixed fidelity:** make the plan choose a real pipeline-item axis and active-group
+5. **Complete mixed fidelity:** make the plan choose a real pipeline-item axis and active-group
    count, replace global-tile overlap with serial-versus-realizable phase costs, then implement the
    one-way and single-round-trip emit through `ExpandMixedKernel` → `InjectGMPipeBuffer` →
    `SkewCrossCorePipeline`. Full flash attention follows only after whole-FIFO multi-round-trip skew.

@@ -738,6 +738,79 @@ class TestAutoFuse:
         assert dag["vector_op_geometries"] == ["row_expand", "flat", "flat", "flat"]
         assert dag["per_task_overhead_cycles"] == 64
 
+    def test_vector_problem_dump_covers_grounded_unary_scalar_and_column_ops(
+        self, tmp_path, monkeypatch
+    ):
+        """Known one-instruction PTO lowerings have exact source descriptors.
+
+        Composite high-precision rsqrt deliberately stays generic: it lowers to
+        scratch fill + sqrt + barrier + divide, not the basic TRSQRT primitive.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class UnaryScalar:
+            @pl.function(attrs={"auto_fuse": True})
+            def grounded(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP32],
+                y: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                a: pl.Tensor[[16, 64], pl.FP32] = pl.abs(x)
+                s: pl.Tensor[[16, 64], pl.FP32] = pl.sqrt(a)
+                n: pl.Tensor[[16, 64], pl.FP32] = pl.neg(s)
+                hi: pl.Tensor[[16, 64], pl.FP32] = pl.maximum(n, 0.0)
+                lo: pl.Tensor[[16, 64], pl.FP32] = pl.minimum(hi, 1.0)
+                pa: pl.Tensor[[16, 64], pl.FP32] = pl.part_add(lo, y)
+                pm: pl.Tensor[[16, 64], pl.FP32] = pl.part_mul(pa, y)
+                px: pl.Tensor[[16, 64], pl.FP32] = pl.part_max(pm, y)
+                out: pl.Tensor[[16, 64], pl.FP32] = pl.part_min(px, y)
+                return out
+
+        passes.auto_fuse()(UnaryScalar)
+        unary = json.loads((tmp_path / "grounded.dag.json").read_text())
+        assert unary["vector_primitive_families"] == [
+            "abs",
+            "sqrt",
+            "scalar_mul",
+            "scalar_max",
+            "scalar_min",
+            "add",
+            "mul",
+            "add",
+            "add",
+        ]
+        assert unary["vector_op_geometries"] == ["flat"] * 9
+
+        @pl.program
+        class Columns:
+            @pl.function(attrs={"auto_fuse": True})
+            def columns(
+                self, x: pl.Tensor[[64, 64], pl.FP32]
+            ) -> tuple[pl.Tensor[[1, 64], pl.FP32], pl.Tensor[[1, 64], pl.FP32]]:
+                total: pl.Tensor[[1, 64], pl.FP32] = pl.col_sum(x)
+                maximum: pl.Tensor[[1, 64], pl.FP32] = pl.col_max(x)
+                return total, maximum
+
+        passes.auto_fuse()(Columns)
+        columns = json.loads((tmp_path / "columns.dag.json").read_text())
+        assert columns["vector_primitive_families"] == ["col_sum", "col_extrema"]
+
+        @pl.program
+        class HighPrecision:
+            @pl.function(attrs={"auto_fuse": True})
+            def high_precision(
+                self, x: pl.Tensor[[16, 64], pl.FP32]
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                out: pl.Tensor[[16, 64], pl.FP32] = pl.rsqrt(x, high_precision=True)
+                return out
+
+        passes.auto_fuse()(HighPrecision)
+        hp = json.loads((tmp_path / "high_precision.dag.json").read_text())
+        assert hp["vector_primitive_families"] == ["generic"]
+        assert hp["vector_op_geometries"] == ["generic"]
+
     def test_cube_plan_materializes_large_intermediate_in_l1(self):
         """A multi-L0 intermediate is assembled into the L1 band priced by the plan.
 
@@ -1344,7 +1417,7 @@ class TestAutoFuse:
 
     def test_p4_online_softmax_fuses_into_one_streamed_kernel(self, ascend_backend, monkeypatch):
         """P4: a softmax over a UB-overflowing reduced axis FUSES into ONE streamed online-flash
-        kernel (behind PYPTO_AUTOFUSE_P4), instead of the G1 cut into row_max + apply pieces.
+        kernel (default-on after silicon closure), instead of the G1 cut into row_max + apply pieces.
 
         The emit maintains the coupled running `(m, l)` stats with the exact `exp(m_old - m_new)`
         rescale in a single streamed pass 0 (one x-slice DMA per chunk → the reduction result IS
@@ -1359,7 +1432,7 @@ class TestAutoFuse:
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
-        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "1")
+        monkeypatch.delenv("PYPTO_AUTOFUSE_P4", raising=False)
 
         @pl.program
         class Prog:
@@ -1393,6 +1466,14 @@ class TestAutoFuse:
         assert torch.allclose(out, torch.softmax(x, dim=1), rtol=1e-4, atol=1e-4), (
             f"max abs diff {(out - torch.softmax(x, dim=1)).abs().max().item():.3e}"
         )
+
+        # The explicit differential opt-out remains available even though
+        # exact softmax is now the default.
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "0")
+        cut = passes.auto_fuse()(Prog)
+        cut_body = next(f for _, f in cut.functions.items() if f.name == "sm").as_python()
+        assert "_m_it" not in cut_body and "_l_it" not in cut_body, cut_body
+        assert cut_body.count("pl.spmd(") >= 2, cut_body
 
     def test_g9_tall_softmax_uses_full_vector_wave(self, ascend_backend, monkeypatch):
         """Row-aware reduction work prevents a tall P4 kernel from under-filling AIVs.
@@ -1710,6 +1791,10 @@ class TestAutoFuse:
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        # This is the explicit non-P4 fallback contract.  Exact softmax is
+        # default-on; disabling P4 here keeps the test focused on G1 cutting
+        # and inline-return wiring rather than the online-softmax fast path.
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "0")
         eps = 1e-5
 
         @pl.program
@@ -1788,6 +1873,9 @@ class TestAutoFuse:
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        # Exercise the guarded G1 fallback explicitly.  With the default P4
+        # policy, the exact-softmax cases below are intentionally streamable.
+        monkeypatch.setenv("PYPTO_AUTOFUSE_P4", "0")
 
         def softmax(n):
             @pl.program
