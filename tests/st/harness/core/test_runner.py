@@ -311,6 +311,7 @@ def _compile_for_cache(
         dump_passes=dump_passes,
         analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
         memory_planner=test_case.get_memory_planner(),
+        enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer(),
     )
     # External kernels are referenced in the manifest at their original path
     # (not copied into the artifact), so accept them even when no kernel .cpp is
@@ -1323,6 +1324,7 @@ class TestRunner:
                 dump_passes=self.config.dump_passes,
                 analyze_auto_scopes_for_deps=self.config.analyze_auto_scopes_for_deps,
                 memory_planner=test_case.get_memory_planner(),
+                enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer(),
             )
 
             # External kernels are referenced in the manifest at their original
