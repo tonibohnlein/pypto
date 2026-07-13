@@ -1339,6 +1339,70 @@ class TestAutoFuse:
             f"max abs diff {(out - torch.softmax(x, dim=1)).abs().max().item():.3e}"
         )
 
+    def test_p4_nonuniform_region_count_matches_forced_solver_grid(self):
+        """DMA padding must not replace the solver's logical P4 task grid.
+
+        The 128-row axis split into 12 regions has eight 11-row and four
+        10-row logical regions. FP32 reduction tiles allocate 16 padded rows,
+        but the emitted kernel must still launch exactly 12 blocks. The final
+        max-shape body overlaps one row idempotently and computes every output.
+
+        ``PYPTO_AUTOFUSE_FORCE_PLAN`` is process-cached, so run in a fresh
+        interpreter.
+        """
+        script = textwrap.dedent(
+            """
+            import torch
+
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def sm(self, x: pl.Tensor[[128, 8192], pl.FP32]) -> pl.Tensor[[128, 8192], pl.FP32]:
+                    m: pl.Tensor[[128, 1], pl.FP32] = pl.row_max(x)
+                    sh: pl.Tensor[[128, 8192], pl.FP32] = pl.row_expand_sub(x, m)
+                    e: pl.Tensor[[128, 8192], pl.FP32] = pl.exp(sh)
+                    s: pl.Tensor[[128, 1], pl.FP32] = pl.row_sum(e)
+                    out: pl.Tensor[[128, 8192], pl.FP32] = pl.row_expand_div(e, s)
+                    return out
+
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "sm").as_python()
+            assert "pl.spmd(12" in body and body.count("pl.spmd(") == 1, body
+
+            namespace = {}
+            exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            x = torch.randn(128, 8192, dtype=torch.float32)
+            actual = namespace["sm"](x)
+            expected = torch.softmax(x, dim=1)
+            assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-4), (
+                actual - expected
+            ).abs().max().item()
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_P4"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "8192,11,1,12,1"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
     def test_p4_layernorm_dualsum_fuses_into_one_streamed_kernel(self, ascend_backend, monkeypatch):
         """P4 increment 2: a DUAL-SUM layernorm over a UB-overflowing reduced axis FUSES into ONE
         streamed online kernel (behind PYPTO_AUTOFUSE_P4), instead of the G1 cut into row_sum pieces.

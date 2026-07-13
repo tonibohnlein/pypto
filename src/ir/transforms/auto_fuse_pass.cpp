@@ -403,6 +403,13 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
   auto call_of = [](const AssignStmtPtr& stmt) -> CallPtr {
     return stmt == nullptr ? nullptr : As<Call>(stmt->value_);
   };
+  // A vector-only P4 cone may consume either a graph boundary or the result of
+  // the immediately preceding cube stage.  The online algorithm is identical
+  // in both cases; the latter is the mixed QK -> softmax building block.
+  auto is_boundary_or_matmul_source = [&](const ExprPtr& expr) {
+    const AssignStmtPtr producer = def_of(expr);
+    return producer == nullptr || ClassifyOp(call_of(producer)) == ::OpType::MatMul;
+  };
   auto same_var = [](const ExprPtr& lhs, const ExprPtr& rhs) -> bool {
     auto lv = AsVarLike(lhs);
     auto rv = AsVarLike(rhs);
@@ -446,8 +453,8 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
     auto max_stmt = def_of(sub->args_[1]);
     auto max = call_of(max_stmt);
     if (max == nullptr || max->args_.size() != 1 || !IsOp(max, "tensor.row_max") ||
-        !same_var(sub->args_[0], max->args_[0]) || def_of(max->args_[0]) != nullptr) {
-      return std::nullopt;  // increment 1: max reduces a direct external x
+        !same_var(sub->args_[0], max->args_[0]) || !is_boundary_or_matmul_source(max->args_[0])) {
+      return std::nullopt;  // direct boundary x, or a direct MatMul-produced mixed-stage x
     }
     const auto [xM, xN] = Static2DShape(max->args_[0]->GetType());
     const auto [oM, oN] = Static2DShape(sink->var_->GetType());
@@ -528,8 +535,8 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
     const ExprPtr x = centered->args_[0];
     const auto [xM, xN] = Static2DShape(x->GetType());
     const auto [oM, oN] = Static2DShape(sink->var_->GetType());
-    if (xM <= 0 || xN <= 1 || oM != xM || oN != xN || def_of(x) != nullptr) {
-      return std::nullopt;  // increment 2: both sums reduce the direct external x
+    if (xM <= 0 || xN <= 1 || oM != xM || oN != xN || !is_boundary_or_matmul_source(x)) {
+      return std::nullopt;  // both sums reduce a boundary or direct MatMul-produced x
     }
     const double inv_n = 1.0 / static_cast<double>(xN);
 
@@ -670,6 +677,10 @@ class ProblemBuilder {
     // semantic analysis below are registered in problem.p4_patterns. Thus the cost model can admit
     // only the same complete algorithm descriptor the emitter will consume.
     problem.allow_model_ahead_multi_reduction_stream = false;
+    // The current cross-core skew pass supports at most one cube<->vector
+    // round trip. Keep deeper mixed pipelines analytic-only until their FIFO
+    // schedule and emit are implemented.
+    problem.allow_model_ahead_mixed_multi_roundtrip = false;
     // Multi-matmul CubeSchedulePlan emission currently requires one static
     // region shape per SPMD body. Keep analytic solver users unrestricted, but
     // do not let the compiler select a balanced non-uniform DAG grid that it
@@ -894,12 +905,25 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     f << (i ? "," : "") << "\"" << s << "\"";
   }
   f << "],\n  \"op_types\": [";
-  for (size_t i = 0; i < no; ++i)
-    f << (i ? "," : "") << (p.ops[i].type == ::OpType::MatMul ? "\"MatMul\"" : "\"Pointwise\"");
+  const auto op_type_name = [](::OpType type) -> const char* {
+    switch (type) {
+      case ::OpType::MatMul: return "MatMul";
+      case ::OpType::Pointwise: return "Pointwise";
+      case ::OpType::Reduction: return "Reduction";
+      case ::OpType::Opaque: return "Opaque";
+    }
+    return "Opaque";
+  };
+  for (size_t i = 0; i < no; ++i) {
+    f << (i ? "," : "") << "\"" << op_type_name(p.ops[i].type) << "\"";
+  }
   f << "],\n  \"fast_memory_capacity\": " << p.fast_memory_capacity;
   // 910B topology + grounded pto-isa machine model — emit so a dumped instance
   // re-loads (io.cpp) into the SAME grounded cost path the pass solved with.
   f << ",\n  \"num_cube_cores\": " << p.num_cube_cores << ",\n  \"num_vector_cores\": " << p.num_vector_cores
+    << ",\n  \"fuse_cube_vector\": " << (p.fuse_cube_vector ? "true" : "false")
+    << ",\n  \"allow_model_ahead_mixed_multi_roundtrip\": "
+    << (p.allow_model_ahead_mixed_multi_roundtrip ? "true" : "false")
     << ",\n  \"cube_capacity\": " << p.cube_capacity << ",\n  \"vec_capacity\": " << p.vec_capacity
     << ",\n  \"l1_capacity\": " << p.l1_capacity << ",\n  \"cube_compute_cost\": " << p.cube_compute_cost
     << ",\n  \"kernel_fill_cost\": " << p.kernel_fill_cost << ",\n  \"cube_freq_hz\": " << p.cube_freq_hz
@@ -999,16 +1023,22 @@ struct SolverTile {
   // final/forced configuration. Candidate costs keep this out of CostResult and
   // re-derive it once here, exactly like VectorStreamPlan.
   ::CubeSchedulePlan cube_schedule;
+  // Solver-owned cross-engine stage/FIFO/loop descriptor. It is reconstructed
+  // only for the selected or forced candidate; the local-search CostResult
+  // remains scalar and compact.
+  ::MixedSchedulePlan mixed_schedule;
 
   SolverTile() = default;
   SolverTile(int64_t w, int64_t h, int64_t k, size_t split,
              int64_t parts_m, int64_t parts_n,
              const ::VectorStreamPlan& vector_stream,
-             ::CubeSchedulePlan cube_schedule)
+             ::CubeSchedulePlan cube_schedule,
+             ::MixedSchedulePlan mixed_schedule = {})
       : w(w), h(h), k(k), split(static_cast<int64_t>(split)),
         parts_m(parts_m), parts_n(parts_n),
         vector_stream(vector_stream),
-        cube_schedule(std::move(cube_schedule)) {}
+        cube_schedule(std::move(cube_schedule)),
+        mixed_schedule(std::move(mixed_schedule)) {}
 };
 
 static const char* VectorStreamKindName(::VectorStreamKind kind) {
@@ -1961,9 +1991,18 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       if (riM > 1 && roM == 1) pin_m = true;  // col reduction -> M pinned
     }
   }
-  int64_t h = pin_m ? IM : ((tile.h > 0 && tile.h < IM) ? tile.h : IM);
-  int64_t w = pin_n ? IN : ((tile.w > 0 && tile.w < IN) ? tile.w : IN);
-  const int64_t num_m = (IM + h - 1) / h, num_n = (IN + w - 1) / w;  // ceil
+  const ::VectorStreamPlan& solver_stream = tile.vector_stream;
+  const bool has_planned_grid = solver_stream.feasible && solver_stream.work_units > 0;
+  int64_t h = pin_m ? IM
+                    : (has_planned_grid ? solver_stream.tile_h
+                                        : ((tile.h > 0 && tile.h < IM) ? tile.h : IM));
+  int64_t w = pin_n ? IN
+                    : (has_planned_grid ? solver_stream.tile_w
+                                        : ((tile.w > 0 && tile.w < IN) ? tile.w : IN));
+  const int64_t num_m =
+      has_planned_grid ? solver_stream.m_partition.parts : (IM + h - 1) / h;
+  const int64_t num_n =
+      has_planned_grid ? solver_stream.n_partition.parts : (IN + w - 1) / w;
 
   // P1 STREAMED REDUCTION — decide whether the pinned reduced-axis tile overflows UB. When it does,
   // the reduced axis cannot be materialized in one tile; stream it (SPMD over the FREE axis, inner
@@ -2017,7 +2056,6 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // The solver plan is authoritative for materialize-vs-stream. The old emitter made this decision
   // from a local two-band estimate, which could disagree with the model's pebbling peak (and then
   // realize a different split/roofline). Structural checks remain as defense in depth.
-  const ::VectorStreamPlan& solver_stream = tile.vector_stream;
   const bool plan_streams = solver_stream.feasible && solver_stream.streamed();
   const bool single_reduction_streamable =
       has_reduction && (pin_m != pin_n) && sinks.size() == 1 && p1_nreds == 1 && p1_red_sum_or_max;
@@ -2076,16 +2114,33 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   auto c_init = std::make_shared<Var>(base + "_out", c_init_call->GetType(), sp);
   auto c_init_assign = std::make_shared<AssignStmt>(c_init, c_init_call, sp);
 
-  // Flat SPMD grid over the num_m*num_n free-axis tiles; block -> (mi,ni). Elementwise
-  // never split-Ks, so this decode is spatial-only (the MatMul rule adds the k_slice).
-  // On a ragged axis, clamp the offset to <= extent-tile so the last (ceil) block stays
-  // in-bounds (overlapping, idempotent per above). Divisible axes get no clamp, so their
-  // emit is byte-identical to before.
+  // Flat SPMD grid over the solver's logical regions; block -> (mi,ni).
+  // `partition_offset` reconstructs the balanced ownership chosen by the model.
+  // Every block still compiles the maximum region shape, so the final smaller
+  // region clamps back by at most one granule and idempotently overlaps its
+  // predecessor. UB/DMA padding is handled below and never changes the grid.
   auto t = std::make_shared<Var>(base + "_t", index_type, sp);
-  ExprPtr mi = MakeMul(MakeFloorDiv(t, MakeIndex(num_n, sp), sp), MakeIndex(h, sp), sp);
-  ExprPtr ni = MakeMul(MakeFloorMod(t, MakeIndex(num_n, sp), sp), MakeIndex(w, sp), sp);
-  if (IM % h != 0) mi = MakeMin(mi, MakeIndex(IM - h, sp), sp);
-  if (IN % w != 0) ni = MakeMin(ni, MakeIndex(IN - w, sp), sp);
+  auto partition_offset = [&](const ExprPtr& index, const ::AxisPartition& partition) {
+    ExprPtr offset = MakeMul(index, MakeIndex(partition.small, sp), sp);
+    const int64_t extra = partition.big - partition.small;
+    if (extra > 0 && partition.num_big > 0) {
+      offset = MakeAdd(offset,
+                       MakeMul(MakeMin(index, MakeIndex(partition.num_big, sp)),
+                               MakeIndex(extra, sp), sp),
+                       sp);
+    }
+    return offset;
+  };
+  const ExprPtr m_index = MakeFloorDiv(t, MakeIndex(num_n, sp), sp);
+  const ExprPtr n_index = MakeFloorMod(t, MakeIndex(num_n, sp), sp);
+  ExprPtr mi = has_planned_grid
+                   ? partition_offset(m_index, solver_stream.m_partition)
+                   : MakeMul(m_index, MakeIndex(h, sp), sp);
+  ExprPtr ni = has_planned_grid
+                   ? partition_offset(n_index, solver_stream.n_partition)
+                   : MakeMul(n_index, MakeIndex(w, sp), sp);
+  if (num_m * h > IM) mi = MakeMin(mi, MakeIndex(IM - h, sp), sp);
+  if (num_n * w > IN) ni = MakeMin(ni, MakeIndex(IN - w, sp), sp);
 
   // Vector DMA-block granule `g` (elements) is computed above (before the stream trigger) so the
   // materialize-vs-stream decision counts the padded tile. Reduced-axis padding is now ALLOWED. The original §4.4 concern — a reduction over a ragged
@@ -2262,12 +2317,11 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // iterations to overlap. Single pass (level-0 reduction); P2/P4 add an apply re-stream.
   if (stream_p1 || stream_p2 || stream_p4) {
     const int64_t red_ext = pin_m ? IM : IN;    // pinned/reduced axis extent
-    const int64_t free_ext = pin_m ? IN : IM;   // free axis extent
-    // Free-axis tile, GRANULE-ALIGNED. The reduced accumulator ([1,w] col-reduce / [h,1] row-reduce)
-    // is padded to the DMA granule; a non-aligned free tile leaves a PARTIAL valid_shape (h=3 -> alloc
-    // 8, valid 3), which ResolveBackendOpLayouts' reshape of the [h,1] col-vector does not round-trip.
-    // Aligning the free tile makes the accumulator full-valid (coarser spatial grid, still correct).
-    const int64_t expected_free_tile = std::min(AlignUp(pin_m ? w : h, g), free_ext);
+    // The free tile is the maximum LOGICAL region extent. Its UB allocation is
+    // independently DMA-padded; alignment must not coarsen the logical launch
+    // grid. This is the model/emit distinction that preserves parts_m/parts_n.
+    const int64_t expected_free_tile = pin_m ? w : h;
+    const int64_t expected_free_alloc = AlignUp(expected_free_tile, g);
     const int64_t free_tile = solver_stream.free_tile;
     // The single reduction op (nreds==1): P1 -> every live-out stays folded; P2 -> a non-sink
     // reduction consumed by a spanning pointwise sink. Its family fixes the merge op
@@ -2287,7 +2341,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         << solver_stream.axis << " chunk=" << rc << " reduced extent=" << red_ext;
     const int64_t num_full = red_ext / rc;                 // full disjoint chunks
     const int64_t rem = red_ext - num_full * rc;           // ragged tail extent (0 if divides)
-    const int64_t num_free = (free_ext + free_tile - 1) / free_tile;  // ceil grid over the free axis
+    const int64_t num_free = pin_m ? num_n : num_m;
 
     // Verify that the local IR construction realizes every field of the authoritative plan.
     // Geometry, algorithm kind, and the trip-count pipeline guard must all agree.
@@ -2304,7 +2358,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     const bool stream_plan_matches =
         solver_stream.feasible && solver_stream.streamed() && solver_stream.kind == emitted_kind &&
         solver_stream.axis == emitted_axis && solver_stream.extent == red_ext &&
-        solver_stream.free_tile == expected_free_tile && solver_stream.chunk == rc &&
+        solver_stream.free_tile == expected_free_tile &&
+        solver_stream.free_tile_alloc == expected_free_alloc &&
+        solver_stream.work_units == num_free && solver_stream.chunk == rc &&
         solver_stream.full_chunks == num_full && solver_stream.tail == rem &&
         solver_stream.stats_init.present && solver_stream.stats_init.chunk_index == 0 &&
         solver_stream.stats_init.extent == rc && solver_stream.stream_passes == expected_passes &&
@@ -2323,32 +2379,30 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     LOG_INFO << "AutoFuse[generic]: vector-plan MATCH group='" << name
              << "' solver={kind=" << VectorStreamKindName(solver_stream.kind)
              << ",axis=" << solver_stream.axis << ",extent=" << solver_stream.extent
-             << ",free=" << solver_stream.free_tile << ",chunk=" << solver_stream.chunk << "x"
+             << ",regions=" << solver_stream.work_units << ",free=" << solver_stream.free_tile
+             << "/alloc=" << solver_stream.free_tile_alloc << ",chunk=" << solver_stream.chunk << "x"
              << solver_stream.full_chunks << (solver_stream.tail ? "+tail" : "")
              << ",stats=" << solver_stream.stats.trip_count << "/s" << solver_stream.stats.pipeline_stages
              << ",apply=" << solver_stream.apply.trip_count << "/s" << solver_stream.apply.pipeline_stages
              << "} emit={kind=" << VectorStreamKindName(emitted_kind) << ",axis=" << emitted_axis
-             << ",extent=" << red_ext << ",free=" << free_tile << ",chunk=" << rc << "x" << num_full
+             << ",extent=" << red_ext << ",regions=" << num_free << ",free=" << free_tile
+             << "/alloc=" << expected_free_alloc << ",chunk=" << rc << "x" << num_full
              << (rem ? "+tail" : "") << ",stats=" << stats_trips << "/s"
              << solver_stream.stats.pipeline_stages << ",apply=" << (expected_passes == 2 ? num_full : 0)
              << "/s" << (expected_passes == 2 ? solver_stream.apply.pipeline_stages : 1) << "}";
 
-    auto t = std::make_shared<Var>(base + "_t", index_type, sp);
-    // Free-axis offset for this core, clamped in-bounds for a ragged free tail. The free axis is
-    // NOT reduced, so a clamp-overlap recomputes identically (idempotent) — same trick as pointwise.
-    ExprPtr foff = MakeMul(t, MakeIndex(free_tile, sp), sp);
-    if (free_ext % free_tile != 0) foff = MakeMin(foff, MakeIndex(free_ext - free_tile, sp), sp);
+    // Reuse the solver partition's balanced coordinate. The final smaller
+    // logical region executes the maximum-shape body at the clamped offset;
+    // this only overlaps idempotent free-axis work and remains in bounds.
+    ExprPtr foff = pin_m ? ni : mi;
     // Slice the [chunk_ext along the reduced axis, free_tile] region at `red_off` and replay the
     // cone up to `stop` (nullptr = the group sink), substituting finalized accumulators from `subs`.
     auto strip_at = [&](int64_t chunk_ext, const ExprPtr& red_off, std::vector<StmtPtr>& out,
                         std::unordered_map<const Var*, VarPtr>& oc, const Stmt* stop,
                         const std::unordered_map<const Var*, VarPtr>* subs) -> VarPtr {
-      // Free extent = free_tile (the GRANULE-ALIGNED block), NOT the solver's raw h/w. The grid
-      // strides by free_tile (foff = t*free_tile, num_free = ceil(free_ext/free_tile)); slicing only
-      // h/w here when free_tile = AlignUp(h/w, g) > h/w left the top (free_tile - h/w) rows of every
-      // block UNWRITTEN — a softmax/layernorm whose solver free tile is not g-aligned (e.g. h=3 ->
-      // free_tile=8) wrote 3 of every 8 rows (BUG-LN). free_tile is clamped to free_ext + foff is
-      // clamped in-bounds, so the wider slice never runs past the tensor.
+      // `free_tile` is the logical valid extent. `slice_input` pads the
+      // allocated tile to `free_tile_alloc`, so the full region is written
+      // without changing its ownership or SPMD count.
       return pin_m ? emit_strip(chunk_ext, free_tile, red_off, foff, out, oc, stop, subs)   // chunk M rows, free_tile N
                    : emit_strip(free_tile, chunk_ext, foff, red_off, out, oc, stop, subs);  // free_tile M, chunk N
     };
@@ -2904,6 +2958,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   const bool body_plan_matches =
       solver_stream.feasible && solver_stream.kind == expected_body_kind && solver_stream.tile_h == h &&
       solver_stream.tile_w == w && solver_stream.row_strips >= 1 && solver_stream.width_strips >= 1 &&
+      solver_stream.work_units == num_m * num_n &&
       solver_stream.strip_h == (h + solver_stream.row_strips - 1) / solver_stream.row_strips &&
       solver_stream.strip_w > 0 && solver_stream.strip_w <= AlignUp(w, g) &&
       solver_stream.body.first_chunk == 0 &&
@@ -2979,22 +3034,13 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     body_stmts.push_back(for_stmt);
   }
 
-  auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(num_m * num_n, sp), name, sp);
+  auto scope = SpmdWrap(t, std::move(body_stmts), MakeIndex(solver_stream.work_units, sp), name, sp);
   LOG_INFO << "AutoFuse[generic]: " << (has_reduction ? "elementwise+reduction" : "elementwise") << " group '"
            << name << "' tiled by the generic driver (" << ops.size() << " ops, grid " << num_m << "x"
-           << num_n << " = " << (num_m * num_n) << " tiles, " << (num_strips * num_wstrips)
+           << num_n << " = " << solver_stream.work_units << " logical regions, "
+           << (num_strips * num_wstrips)
            << " planned strips (stage=" << solver_stream.body.pipeline_stages << ")"
            << (num_wstrips > 1 ? " [width-chunked]" : "") << ")";
-  // Grid fidelity (cost-vs-latency experiment): the emit realizes a ceil(IM/h) x ceil(IN/w) grid,
-  // whose MAX region extent is h/w -> its critical-path latency matches the solver's balanced
-  // parts_m x parts_n partition (which also has max extent h/w). But the region COUNT can differ
-  // (ceil(M/h) <= parts_m), perturbing core occupancy (a >C-core / multi-wave effect). Surface any
-  // mismatch so a forced-plan measurement can record it -- the cost is the parts grid's, the wall
-  // time is the emitted grid's; they diverge only when the counts do.
-  if ((tile.parts_m > 0 && tile.parts_m != num_m) || (tile.parts_n > 0 && tile.parts_n != num_n))
-    LOG_INFO << "AutoFuse[generic]: group '" << name << "' emitted grid " << num_m << "x" << num_n
-             << " != solver parts " << tile.parts_m << "x" << tile.parts_n
-             << " (same max-extent h/w -> same critical path; region count differs -> occupancy only)";
   return std::vector<StmtPtr>{c_init_assign, scope};
 }
 
@@ -4321,13 +4367,12 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       DumpSolutionJson(sol, base + ".sol.json");
     }
 
-    // Tier-B (A2 homogeneity): the generic emitter assumes each group is single-engine.
-    // The base solver enforces that (allow_mixed off, ascend910b_cost.cpp:241), so a MIXED
-    // cube+vector step can only appear under a PYPTO_FUSE_CUBE_VECTOR build. The emitter
-    // would then SPLIT it across dispatch paths (matmul standalone, vector standalone) with
-    // the intermediate through DDR — correct output, but NOT the on-chip-fused kernel the
-    // solver costed. Surface it (S1 move-insertion is the real fix, not relaxing A2). Only
-    // checked under the flag; legacy already splits mixed groups as existing behavior.
+    // Tier-B (A2 homogeneity): mixed admission remains off in the production
+    // adapter until a MixedSchedulePlan emitter inserts the explicit GM FIFO
+    // crossings and invokes the cross-core pipeline passes. A research build or
+    // future runtime opt-in can still return a mixed group; retain its solver
+    // descriptor below, but surface that today's emitter would split it across
+    // dispatch paths and therefore would not realize the priced pipeline.
     if (GenericEmitEnabled()) {
       for (size_t s = 0; s < sol.num_steps(); ++s) {
         bool has_cube = false, has_vector = false;
@@ -4389,15 +4434,21 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                     cfg, sol.retained_entering(s), sol.step(s).retain_these)
               : ::VectorStreamPlan{};
       const ::CubeSchedulePlan selected_cube =
-          sol.step(s).subgraph.has_matmul()
+          sol.step(s).subgraph.has_matmul() && !sol.step(s).subgraph.has_vector()
               ? sol.step(s).subgraph.cube_schedule_plan(
                     cfg, sol.retained_entering(s), sol.step(s).retain_these,
                     selected_cost.parallel_split)
               : ::CubeSchedulePlan{};
+      const ::MixedSchedulePlan selected_mixed =
+          sol.step(s).subgraph.is_mixed()
+              ? sol.step(s).subgraph.mixed_schedule_plan(
+                    cfg, sol.retained_entering(s), sol.step(s).retain_these,
+                    selected_cost.parallel_split)
+              : ::MixedSchedulePlan{};
       SolverTile tile(cfg.w, cfg.h,
                       selected_cube.feasible ? selected_cube.config.k : cfg.k,
                       selected_cost.parallel_split, cfg.parts_m, cfg.parts_n,
-                      selected_stream, selected_cube);
+                      selected_stream, selected_cube, selected_mixed);
       if (dump_plans || force_env != nullptr) {
         bool forced_here = false;
         std::set<std::tuple<int64_t, int64_t, size_t, int64_t, int64_t>> seen_plans;  // dedup identical keys
@@ -4416,14 +4467,19 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                     ? sol.step(s).subgraph.vector_stream_plan(pc)
                     : ::VectorStreamPlan{};
             const ::CubeSchedulePlan forced_cube =
-                sol.step(s).subgraph.has_matmul()
+                sol.step(s).subgraph.has_matmul() && !sol.step(s).subgraph.has_vector()
                     ? sol.step(s).subgraph.cube_schedule_plan(
                           pc, {}, {}, pr.parallel_split)
                     : ::CubeSchedulePlan{};
+            const ::MixedSchedulePlan forced_mixed =
+                sol.step(s).subgraph.is_mixed()
+                    ? sol.step(s).subgraph.mixed_schedule_plan(
+                          pc, {}, {}, pr.parallel_split)
+                    : ::MixedSchedulePlan{};
             tile = SolverTile(pc.w, pc.h,
                               forced_cube.feasible ? forced_cube.config.k : pc.k,
                               pr.parallel_split, pc.parts_m, pc.parts_n,
-                              forced_stream, forced_cube);
+                              forced_stream, forced_cube, forced_mixed);
             forced_here = true;
             LOG_INFO << "AutoFuse[" << func->name_ << "]: FORCED group=" << s << " w=" << pc.w << " h="
                      << pc.h << " split=" << pr.parallel_split << " parts_m=" << pc.parts_m
