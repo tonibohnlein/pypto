@@ -25,6 +25,14 @@ adds the separately ordered G6 zero seed, PTO A2/A3 column-reduction fits (G10),
 descriptors for the remaining one-instruction vector operations (G11); none changes the validated
 P4 phase algorithm.
 
+The follow-up at PyPTO `95e24c32` / solver `f7bea24b` passed the same 51/51 device surface and
+silicon-closed G10/G11 plus the aligned G6 seed protocol. It also established Welford's FP32
+accuracy envelope (roughly `mean/std <= 5–6e4`) and found one real buildability hole: a row-major
+FP32 split seed narrower than 32 bytes (`N<8`) cannot lower. The current host batch gates that case
+to `S=1`, keeps aligned seeds split-capable, and adds exact returned-live-out, capability, UB,
+ragged-traffic, fill-wave, and cache-publication contracts. These host refinements await their own
+fingerprinted device follow-up.
+
 **Mixed host checkpoint (2026-07-13).** The solver now builds one immutable same-engine stage DAG
 and cube/vector transfer graph per mixed candidate subgraph. A stack-local `MixedSchedulePlan`
 derives grid, 24-group mapping, loop trips, skew mode, and separate model-granted versus
@@ -199,15 +207,24 @@ coverage close the remaining representational gaps on host without fitting AutoF
 
 **Vector emit** (behind `GENERIC_EMIT`):
 
-- Pointwise: fused chains, UB-streamed row+width strips sized by **real peak-liveness** (+1 prefetch
-  band) in `VectorStreamPlan`; the emitter consumes that geometry. Tall / wide / reused-input all
-  handled within UB.
+- Pointwise: fused chains, UB-streamed row+width strips sized by **real peak-liveness** plus an
+  explicit prefetch copy, with every tensor's actual dtype in `VectorStreamPlan`; the emitter
+  consumes that geometry. Tall / wide / reused-input and mixed-width
+  FP32-intermediate→INT8-output chains all fit UB.
 - Reductions: P1 (bare) + P2 (spanning apply), streamed over the reduced axis, **both passes pipelined
   (A5/G2)** — accumulator persists, loads double-buffer; numerically exact.
 - Broadcast operands (G4), multi-sink, and S2 terminal-`col_sum` cross-core split with tiled zero
   seed plus atomic-add merge. The seed is an explicit serial `TEXPANDS`-grounded fill/store phase
-  with its own task and kernel-fill terms. Unsupported row/max/min/internal/ragged split families
-  stay at `S=1`.
+  with its own task and kernel-fill terms. A seed row must span one DMA block, so thin FP32 outputs
+  (`N<8`) stay at `S=1`. Unsupported row/max/min/internal/ragged split families also stay at `S=1`.
+- Every adapter op carries an explicit vector buildability capability. Elementwise replay and
+  row/column sum/max reductions enter the generic scheduler; `prod`, arg reductions, min reductions,
+  shape-generating `full`, and other unsupported transforms are partition barriers until their
+  distinct algorithms exist.
+- Function returns are explicit solver live-outs. A returned-and-consumed SSA value is both a UB
+  lifetime and a DDR boundary output; P4 rejects an escaping statistic and multi-sink emission
+  assembles every returned value. Partition/group-DAG and solution ephemeral-gap checks likewise
+  treat that producing group as a slow-memory source for consumers in later groups.
 - **P4 softmax** — fused online flash `(m,l)` with `exp(m_old−m_new)` rescale; the cone is verified
   EXACT by the shared descriptor (only `row_max→sub(x,m)→exp→row_sum→div`); stats and apply passes
   stage-2 pipelined when their rolled trip count is at least 2. The G7/G8/G9 device run found it
@@ -240,22 +257,33 @@ count. Grounded source-DAG add/mul/div/exp/log/rsqrt/abs/sqrt/neg, scalar and br
 part add/mul/max/min, and supported row/column reductions carry a compact primitive/geometry
 descriptor. Costing replays that descriptor per planned strip/chunk/task, including count-mode,
 reduction-layout row-expand barriers, PTO row/column fit formulas, and generated P1/P2 merges.
-Composite and alias-sensitive operations remain on the explicit `Generic` fallback. `CostResult`
+Composite research instances may retain the explicit `Generic` fallback; production PyPTO admission
+is capability-gated. `CostResult`
 stays at its pre-refactor 112-byte footprint (guarded at ≤128 bytes) for the local-search cache.
 `create()` precomputes UB band intervals, flattened transient references, and phase-ordered op/input
-lists once per subgraph. Each tile candidate therefore performs only shape-dependent arithmetic and
-one linear replay; P1/P2/P4 add a constant number of phases, not another combinatorial search. A
+lists once per subgraph. A materialized tile performs one linear replay; an overflowing strip/chunk
+uses a logarithmic fit search over the same byte-weighted lifetime metadata. P1/P2/P4 add a constant
+number of phases, not another combinatorial search. A
 Release A/B microbenchmark of the 11-config tall-softmax sweep retained the identical aggregate cost
 and reduced candidate evaluation by about 7.5%. Whole-suite profiling is dominated by partition
 search and allocation, not this vector evaluator.
+
+The candidate cache now release-publishes immutable entries through an explicit
+`Empty→Writing→Ready` state, with a concurrent publication stress test. Its two default tables were
+reduced from one million to 131072 slots, while the retention table is allocated lazily only when
+retention-aware evaluation is used. Candidate evaluation no longer validates tilings
+twice, and pointwise→matmul prologue constraints use one reverse-topological `O(N+E)` DP instead of
+one downstream BFS per pointwise op.
 
 **Vector refactor preservation audit.** The plan extraction was separated from the subsequent
 model corrections so structural movement could be checked independently. Solver `10f8f8b`
 (pre-plan) and `1fc542d` (plan authoritative and absent from `CostResult`, before phase pricing)
 produce the same fixed-cost anchors: fused/separate pointwise `11003.7/22007.4`, fused/cut softmax
 `30073.8/88186.9`, few-row reduction `10563`, and long streamed reduction `101566`. Current
-`4ca1026` deliberately changed the phase-sensitive anchors. After logical-region identity and exact
-ragged-partition traffic, current descriptor-free controls are softmax `22153.9/88309.8`, few-row
+`4ca1026` deliberately changed the phase-sensitive anchors. After logical-region identity,
+per-source-tensor dtype/lifetime-exact UB planning (plus explicit conservative generated scratch),
+and emitted-static-body ragged traffic, current descriptor-free
+controls are softmax `22208.7/88373.3`, few-row
 reduction `10097.6`, and pointwise `11003.7/22007.4`. These are intended consequences of phase-local
 compute/traffic, serial edge phases, the reduction source/work floor, and exact task-grid replay—not
 drift from moving schedule derivation into a plan.
@@ -264,7 +292,7 @@ The G8 descriptor path deliberately does not change those descriptor-free C++ be
 Real PyPTO problems now carry lowering semantics, so their source-op startup/count-mode work may
 change; this separates an intended fidelity correction from the plan-refactor preservation control.
 
-**Current host gates.** AutoFuse UT is 36 passed / 1 expected xfail; the solver suite is 436 passed
+**Current host gates.** AutoFuse UT is 40 passed / 1 expected xfail; the solver suite is 450 passed
 with the same 7 documented baseline failures. The vector checkpoint's device file
 collects 51 A2/A3 cases. Four persistent cases
 cover exact P4 softmax `[128,8192]`, Welford layernorm at input mean `+2000`, a scaled-softmax near
@@ -276,8 +304,10 @@ The tall natural softmax is in the device-best cluster; exact softmax is 25.5% f
 high-mean Welford is correct and the zero-mean path is 24.7% faster than its cut.
 Cube G-A/ragged-K and recursive-plan correctness are also device-validated.
 
-**Current commit arc** (newest first): current host batch = explicit G6 seed cost + G10 column fits +
-G11 source coverage + exact-softmax default + candidate-hot metadata · G6 exact split admission ·
+**Current commit arc** (newest first): current uncommitted host batch = returned live-outs + explicit
+capabilities + dtype/lifetime UB + emitted ragged traffic + split fill waves + cache/search fixes ·
+`95e24c32`/`f7bea24b` explicit G6 seed cost + G10 column fits + G11 source coverage + exact-softmax
+default + candidate-hot metadata · G6 exact split admission ·
 `d8ca8a8f` G9
 row-aware reductions · PyPTO `45785941` G8 source-op replay · `ff706a94` G7 phase-work contract ·
 `e3acf3bc` mixed plans + G5 grids. Solver: `f71bd70` G6 exact split admission · `e566674` G9
@@ -318,12 +348,14 @@ statistics update math remains deliberately algorithm-specific.
 
 ## 7. What remains (ordered)
 
-1. **Device-close the final host-only vector refinements.** Fingerprint and sweep G6 split candidates
-   after the explicit seed phase, plus FP32/FP16 G10 column sum/extrema tiles. Confirm that their PTO
-   anchors and model ordering transfer to silicon; do not fit an AutoFuse task-count constant.
-2. **Close Welford's opt-in gate.** Run one harness-faithful extreme-shift/scale accuracy sweep and
-   fused-versus-cut walls. Exact softmax is already default-on independently; `P4=0` preserves its
-   fallback test surface.
+1. **Device-close the final host-only vector refinements.** Verify returned live-outs, capability
+   declines, mixed-dtype UB, thin-seed `S=1`, aligned G6 fill waves, and the emitted ragged traffic
+   equation. In the same run decide whether a stage-2 vector phase overlaps MTE2 and MTE3 as
+   independent ports (`max(compute,in,out)`) or as the current summed DDR term
+   (`max(compute,in+out)`). Do not change that roofline without silicon evidence.
+2. **Keep Welford opt-in and document its numeric domain.** The device sweep places its FP32 ceiling
+   near `mean/std = 5–6e4`; exact softmax remains default-on independently and `P4=0` preserves its
+   fallback surface.
 3. **Profile broader solver search before more vector micro-optimization.** Candidate-invariant UB
    topology and phase ordering are now precomputed, the 11-config P4 sweep is only a few microseconds,
    and `CostResult` still caches only scalar/config data. The end-to-end profile points to partition

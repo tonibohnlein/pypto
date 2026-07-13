@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
@@ -263,30 +264,68 @@ std::optional<StmtPtr> HoistInlineReturnComputeExprs(const StmtPtr& body) {
   return SeqStmts::Flatten(std::move(out), body->span_);
 }
 
-// Map a PyPTO op/kernel name to a tiling cost category. Broadcast folds into
-// Pointwise (its FIXED operand is shape-inferred from the size-1 dim). Memory /
-// cross-core / sync ops are not graph nodes, so they never reach this point.
-// (For orchestration kernel calls the name is the kernel's — matmul kernels must
-// be named *matmul*; body inspection is a TODO.)
-::OpType ClassifyOp(const CallPtr& call) {
+// One adapter-owned capability descriptor feeds solver admission and generic
+// emission. Cost class alone is insufficient: product and arg reductions need
+// different streaming state, while tensor.full has no strip-rewritable source
+// operand. Until those algorithms exist they are explicit barriers, never
+// accidental Pointwise fallbacks.
+struct VectorOpDescriptor {
+  VectorOpDescriptor(::OpType op_type, ::VectorOpCapability op_capability)
+      : type(op_type), capability(op_capability) {}
+
+  ::OpType type;
+  ::VectorOpCapability capability;
+};
+
+VectorOpDescriptor DescribeVectorOp(const CallPtr& call) {
   const std::string& n = call->op_->name_;
   auto has = [&](const char* s) { return n.find(s) != std::string::npos; };
-  auto ends = [&](const char* s) {
-    const size_t l = std::char_traits<char>::length(s);
-    return n.size() >= l && n.compare(n.size() - l, l, s) == 0;
+  auto any = [&](std::initializer_list<const char*> names) {
+    for (const char* name : names) {
+      if (IsOp(call, name)) return true;
+    }
+    return false;
   };
   if (has("matmul") || has("gemv")) {
-    return ::OpType::MatMul;
+    return VectorOpDescriptor(::OpType::MatMul, ::VectorOpCapability::Unsupported);
   }
-  if (ends(".sum") || ends(".max") || ends(".min") || has("row_sum") ||
-      has("row_max") || has("row_min") || has("col_sum") || has("col_max") || has("col_min")) {
-    return ::OpType::Reduction;
+  if (any({"tensor.row_sum", "tensor.col_sum"})) {
+    return VectorOpDescriptor(::OpType::Reduction, ::VectorOpCapability::ReductionSum);
+  }
+  if (any({"tensor.row_max", "tensor.col_max"})) {
+    return VectorOpDescriptor(::OpType::Reduction, ::VectorOpCapability::ReductionMax);
+  }
+  if (any({"tensor.row_min", "tensor.col_min", "tensor.row_prod", "tensor.col_prod",
+           "tensor.row_argmax", "tensor.row_argmin", "tensor.col_argmax",
+           "tensor.col_argmin"})) {
+    return VectorOpDescriptor(::OpType::Opaque, ::VectorOpCapability::Unsupported);
   }
   if (has("gather") || has("scatter") || has("sort") || has("transpose") || has("reshape") ||
-      has("concat") || has("assemble")) {
-    return ::OpType::Opaque;  // data-dependent / relayout — un-fusable barrier
+      has("concat") || has("assemble") ||
+      any({"tensor.full", "tensor.random", "tensor.ci", "tensor.create", "tensor.slice",
+           "tensor.fillpad", "tensor.fillpad_expand", "tensor.set_validshape",
+           "tensor.as_layout", "tensor.row_expand", "tensor.col_expand",
+           "tensor.expands", "tensor.expand_clone"})) {
+    return VectorOpDescriptor(::OpType::Opaque, ::VectorOpCapability::Unsupported);
   }
-  return ::OpType::Pointwise;  // elementwise / unary / cast / expand(broadcast)
+  if (any({"tensor.add", "tensor.adds", "tensor.sub", "tensor.subs", "tensor.mul",
+           "tensor.muls", "tensor.div", "tensor.divs", "tensor.fmod", "tensor.fmods",
+           "tensor.maximum", "tensor.minimum", "tensor.cmp", "tensor.part_add",
+           "tensor.part_mul", "tensor.part_max", "tensor.part_min", "tensor.abs",
+           "tensor.cast", "tensor.cos", "tensor.exp", "tensor.log", "tensor.neg",
+           "tensor.recip", "tensor.rsqrt", "tensor.sin", "tensor.sqrt",
+           "tensor.row_expand_add", "tensor.row_expand_sub", "tensor.row_expand_mul",
+           "tensor.row_expand_div", "tensor.row_expand_max", "tensor.row_expand_min",
+           "tensor.row_expand_expdif", "tensor.col_expand_add", "tensor.col_expand_sub",
+           "tensor.col_expand_mul", "tensor.col_expand_div", "tensor.col_expand_max",
+           "tensor.col_expand_min", "tensor.col_expand_expdif"})) {
+    return VectorOpDescriptor(::OpType::Pointwise, ::VectorOpCapability::Elementwise);
+  }
+  return VectorOpDescriptor(::OpType::Opaque, ::VectorOpCapability::Unsupported);
+}
+
+::OpType ClassifyOp(const CallPtr& call) {
+  return DescribeVectorOp(call).type;
 }
 
 // Per-op VECTOR compute slope (cycles per SIMD repeat) when it differs from the elementwise
@@ -336,11 +375,13 @@ std::pair<::VectorPrimitiveFamily, ::VectorOpGeometry> ClassifyVectorOpSemantics
   using Geometry = ::VectorOpGeometry;
 
   if (IsOp(call, "tensor.row_sum")) return {Family::RowSum, Geometry::Flat};
-  if (IsOp(call, "tensor.row_max") || IsOp(call, "tensor.row_min"))
+  if (IsOp(call, "tensor.row_max")) {
     return {Family::RowExtrema, Geometry::Flat};
+  }
   if (IsOp(call, "tensor.col_sum")) return {Family::ColSum, Geometry::Flat};
-  if (IsOp(call, "tensor.col_max") || IsOp(call, "tensor.col_min"))
+  if (IsOp(call, "tensor.col_max")) {
     return {Family::ColExtrema, Geometry::Flat};
+  }
 
   Family family = Family::Generic;
   if (IsOp(call, "tensor.add") || IsOp(call, "tensor.sub") ||
@@ -486,6 +527,16 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
     for (const ExprPtr& arg : As<Call>(op->value_)->args_) {
       auto var = AsVarLike(arg);
       if (var != nullptr && defmap.count(var.get()) != 0) consumers[var.get()].push_back(op.get());
+    }
+  }
+  for (const StmtPtr& stmt : stmts) {
+    auto ret = As<ReturnStmt>(stmt);
+    if (ret == nullptr) continue;
+    for (const ExprPtr& value : ret->value_) {
+      auto var = AsVarLike(value);
+      if (var != nullptr && defmap.count(var.get()) != 0) {
+        consumers[var.get()].push_back(ret.get());
+      }
     }
   }
 
@@ -816,6 +867,20 @@ class ProblemBuilder {
       ops.emplace_back(stmt.get(), call);
     }
 
+    // Function results are observable graph boundaries even when another op
+    // consumes the same SSA value. Record them before subgraph construction so
+    // costing, liveness, P4 escape checks, and emission share that fact.
+    for (const StmtPtr& stmt : dep.stmts) {
+      auto ret = As<ReturnStmt>(stmt);
+      if (ret == nullptr) continue;
+      for (const ExprPtr& value : ret->value_) {
+        auto var = AsVarLike(value);
+        if (var == nullptr) continue;
+        auto it = tensor_index_.find(var.get());
+        if (it != tensor_index_.end()) problem.required_outputs.insert(it->second);
+      }
+    }
+
     // 4. Second pass: emit ops. Inputs = predecessor-op outputs (from the
     //    dependency graph) + In-param args. Out-buffers/allocs fall out because
     //    they are never registered as tensors.
@@ -823,7 +888,9 @@ class ProblemBuilder {
       const Stmt* stmt = entry.first;
       const CallPtr& call = entry.second;
       ::Op sop;
-      sop.type = ClassifyOp(call);
+      const VectorOpDescriptor descriptor = DescribeVectorOp(call);
+      sop.type = descriptor.type;
+      sop.vector_capability = descriptor.capability;
       sop.vec_slope = VecOpSlope(call);  // vdiv=4 / vrsqrt=1 override the elementwise default
       sop.vec_fixed = VecOpFixed(call);  // per-op head+tail (vadd 24 / vexp 31 / vdiv 30 / ...)
       // Inputs in OPERAND ORDER (call->args_). The solver derives M/N/K
@@ -1047,6 +1114,16 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     }
     return "generic";
   };
+  const auto capability_name = [](::VectorOpCapability capability) -> const char* {
+    switch (capability) {
+      case ::VectorOpCapability::Generic: return "generic";
+      case ::VectorOpCapability::Elementwise: return "elementwise";
+      case ::VectorOpCapability::ReductionSum: return "reduction_sum";
+      case ::VectorOpCapability::ReductionMax: return "reduction_max";
+      case ::VectorOpCapability::Unsupported: return "unsupported";
+    }
+    return "unsupported";
+  };
   f << "],\n  \"vec_slopes\": [";
   for (size_t i = 0; i < no; ++i) f << (i ? "," : "") << p.ops[i].vec_slope;
   f << "],\n  \"vec_fixed_costs\": [";
@@ -1058,6 +1135,16 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
   f << "],\n  \"vector_op_geometries\": [";
   for (size_t i = 0; i < no; ++i) {
     f << (i ? "," : "") << "\"" << geometry_name(p.ops[i].vector_geometry) << "\"";
+  }
+  f << "],\n  \"vector_op_capabilities\": [";
+  for (size_t i = 0; i < no; ++i) {
+    f << (i ? "," : "") << "\"" << capability_name(p.ops[i].vector_capability) << "\"";
+  }
+  f << "],\n  \"required_outputs\": [";
+  bool first_required = true;
+  for (size_t tensor : p.required_outputs) {
+    f << (first_required ? "" : ",") << tensor;
+    first_required = false;
   }
   f << "],\n  \"fast_memory_capacity\": " << p.fast_memory_capacity;
   // 910B topology + grounded pto-isa machine model — emit so a dumped instance
@@ -2002,7 +2089,9 @@ static std::nullopt_t GenericDeclineB(const std::string& reason, const Span& spa
 std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<StmtPtr>& run,
                                                           const SolverTile& tile,
                                                           const std::string& name,
-                                                          const P4Match* p4_match) {
+                                                          const P4Match* p4_match,
+                                                          const std::unordered_set<const Var*>&
+                                                              required_live_outs) {
   auto& reg = OpRegistry::GetInstance();
 
   // A1 (classify allowlist). Increments 1-2 support ELEMENTWISE + REDUCTION. A MatMul
@@ -2017,14 +2106,17 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     if (a == nullptr) return std::nullopt;                          // Tier-A: non-assign in run (capability)
     auto c = As<Call>(a->value_);
     if (c == nullptr || c->op_ == nullptr) return std::nullopt;     // Tier-A: non-call value (capability)
-    const ::OpType cls = ClassifyOp(c);
+    const VectorOpDescriptor descriptor = DescribeVectorOp(c);
+    const ::OpType cls = descriptor.type;
     // Tier-A: a non-{Pointwise,Reduction} op in the run -> fall back. NB a MatMul can land
     // here legitimately — a lone matmul the tiler declined (e.g. a non-uniform grid it runs
     // untiled) is pushed into `run` and reaches flush(); that is NOT a cross-engine group,
     // so it must NOT Tier-B here. Real mixed-group detection is the engine-homogeneity guard
     // at the import boundary (A2/S1), which classifies the solver's group members directly.
-    if (cls != ::OpType::Pointwise && cls != ::OpType::Reduction)
+    if (descriptor.capability == ::VectorOpCapability::Unsupported ||
+        (cls != ::OpType::Pointwise && cls != ::OpType::Reduction)) {
       return std::nullopt;
+    }
     if (cls == ::OpType::Reduction) has_reduction = true;
     ops.push_back(a);
   }
@@ -2039,23 +2131,28 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     def_by_var.emplace(a->var_.get(), a);
   }
   std::unordered_set<const Var*> used_within;
-  for (const auto& a : ops)
+  for (const auto& a : ops) {
     for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
       auto v = AsVarLike(arg);
       if (v != nullptr && defined.count(v.get()) != 0) used_within.insert(v.get());
     }
+  }
   // Sinks = the group's live-outs (the solver's boundary outputs), in execution order.
   // A fused group MAY have >1 sink (the solver merges sinks that share input data — the
   // point of the fusion). We assemble each into its own output buffer; the shared-input
   // serialization falls out of replaying the ops in the solver's execution order.
   std::vector<AssignStmtPtr> sinks;
-  for (const auto& a : ops)
-    if (used_within.count(a->var_.get()) == 0) sinks.push_back(a);
+  for (const auto& a : ops) {
+    if (used_within.count(a->var_.get()) == 0 || required_live_outs.count(a->var_.get()) != 0) {
+      sinks.push_back(a);
+    }
+  }
   // Tier-B: a group with NO live-out is structurally impossible in SSA (every group has
   // an output; a cycle among run ops cannot exist). If it happens the run/group mapping
   // is corrupt -> surface it.
-  if (sinks.empty())
+  if (sinks.empty()) {
     return GenericDeclineB("group has no live-out (corrupt run/group mapping)", ops.front()->span_);
+  }
   AssignStmtPtr out_stmt = sinks.back();  // primary sink (last in exec order): shape/base for
                                           // the single-sink pipeline/split/serial paths
 
@@ -3969,6 +4066,16 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
     body_stmts.push_back(body);
   }
 
+  std::unordered_set<const Var*> required_live_outs;
+  for (const StmtPtr& stmt : body_stmts) {
+    auto ret = As<ReturnStmt>(stmt);
+    if (ret == nullptr) continue;
+    for (const ExprPtr& value : ret->value_) {
+      auto var = AsVarLike(value);
+      if (var != nullptr) required_live_outs.insert(var.get());
+    }
+  }
+
   // Cluster each solver group into a contiguous run (dependency-preserving) so a group whose
   // members are interleaved with another group's in SSA order still emits as ONE fused scope.
   body_stmts = ReorderBodyByGroup(body_stmts, stmt_group);
@@ -4064,7 +4171,8 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
         if (pit != group_p4_match.end() && pit->second < p4_matches.size()) {
           p4_match = &p4_matches[pit->second];
         }
-        if (auto generic = EmitFusedGroupGeneric(run, tit->second, nm, p4_match)) {
+        if (auto generic =
+                EmitFusedGroupGeneric(run, tit->second, nm, p4_match, required_live_outs)) {
           for (auto& s : *generic) {
             top.push_back(std::move(s));
           }
