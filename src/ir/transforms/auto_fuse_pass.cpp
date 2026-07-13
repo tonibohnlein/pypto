@@ -326,6 +326,84 @@ double VecOpFixed(const CallPtr& call) {
   return 0.0;                                             // -> vec_op_head + vec_op_tail
 }
 
+// Attach the exact pto-isa primitive and tile geometry that tensor-to-tile
+// lowering will emit.  This classification happens once in the adapter after
+// operand/output tensor ids are known; the solver then replays the descriptor
+// at each VectorStreamPlan strip/chunk without inspecting PyPTO op names.
+std::pair<::VectorPrimitiveFamily, ::VectorOpGeometry> ClassifyVectorOpSemantics(
+    const CallPtr& call, const ::Op& op, const ::Problem& problem) {
+  using Family = ::VectorPrimitiveFamily;
+  using Geometry = ::VectorOpGeometry;
+
+  if (IsOp(call, "tensor.row_sum") || IsOp(call, "tensor.row_max") ||
+      IsOp(call, "tensor.row_min") || IsOp(call, "tensor.col_sum") ||
+      IsOp(call, "tensor.col_max") || IsOp(call, "tensor.col_min")) {
+    return {Family::Reduction, Geometry::Flat};
+  }
+
+  Family family = Family::Generic;
+  if (IsOp(call, "tensor.add") || IsOp(call, "tensor.sub") ||
+      IsOp(call, "tensor.maximum") || IsOp(call, "tensor.minimum") ||
+      IsOp(call, "tensor.row_expand_add") || IsOp(call, "tensor.row_expand_sub") ||
+      IsOp(call, "tensor.row_expand_max") || IsOp(call, "tensor.row_expand_min") ||
+      IsOp(call, "tensor.col_expand_add") || IsOp(call, "tensor.col_expand_sub") ||
+      IsOp(call, "tensor.col_expand_max") || IsOp(call, "tensor.col_expand_min")) {
+    family = Family::Add;
+  } else if (IsOp(call, "tensor.mul") || IsOp(call, "tensor.row_expand_mul") ||
+             IsOp(call, "tensor.col_expand_mul")) {
+    family = Family::Mul;
+  } else if (IsOp(call, "tensor.div") || IsOp(call, "tensor.row_expand_div") ||
+             IsOp(call, "tensor.col_expand_div")) {
+    family = Family::Div;
+  } else if (IsOp(call, "tensor.exp")) {
+    family = Family::Exp;
+  } else if (IsOp(call, "tensor.log")) {
+    family = Family::Log;
+  } else if (IsOp(call, "tensor.rsqrt")) {
+    family = Family::Rsqrt;
+  } else if (IsOp(call, "tensor.adds") || IsOp(call, "tensor.subs")) {
+    family = Family::ScalarAdd;
+  } else if (IsOp(call, "tensor.muls")) {
+    family = Family::ScalarMul;
+  }
+  if (family == Family::Generic) {
+    return {Family::Generic, Geometry::Generic};
+  }
+
+  if (IsOp(call, "tensor.row_expand_add") || IsOp(call, "tensor.row_expand_sub") ||
+      IsOp(call, "tensor.row_expand_mul") || IsOp(call, "tensor.row_expand_div") ||
+      IsOp(call, "tensor.row_expand_max") || IsOp(call, "tensor.row_expand_min")) {
+    return {family, Geometry::RowExpand};
+  }
+  if (IsOp(call, "tensor.col_expand_add") || IsOp(call, "tensor.col_expand_sub") ||
+      IsOp(call, "tensor.col_expand_mul") || IsOp(call, "tensor.col_expand_div") ||
+      IsOp(call, "tensor.col_expand_max") || IsOp(call, "tensor.col_expand_min")) {
+    return {family, Geometry::ColExpand};
+  }
+
+  // Generic tensor.add/sub/mul/div are converted to a row/column expansion
+  // when exactly one operand has the corresponding size-one axis.  A [1,1]
+  // tensor broadcast is ambiguous, so retain the legacy descriptor instead of
+  // claiming a particular lowering geometry.
+  bool row_expand = false;
+  bool col_expand = false;
+  if (!op.outputs.empty()) {
+    const ::Tensor& output = problem.tensors[op.output()];
+    for (size_t input_id : op.inputs) {
+      const ::Tensor& input = problem.tensors[input_id];
+      row_expand |= input.width == 1 && output.width > 1 && input.height == output.height;
+      col_expand |= input.height == 1 && output.height > 1 && input.width == output.width;
+    }
+  }
+  if (row_expand != col_expand) {
+    return {family, row_expand ? Geometry::RowExpand : Geometry::ColExpand};
+  }
+  if (row_expand) {
+    return {Family::Generic, Geometry::Generic};
+  }
+  return {family, Geometry::Flat};
+}
+
 // Map a PyPTO DataType to the solver's byte-aware DType. The grounded cube cost
 // is dtype-sensitive (fp32 is 4x fp16: kF halves AND cyc_per_repeat doubles), so
 // the precision must survive into the cost model. Unmapped types fall back to
@@ -756,6 +834,8 @@ class ProblemBuilder {
       sop.inputs = std::move(inputs);
       const size_t out = stmt_output_.at(stmt);
       sop.outputs.push_back(out);
+      std::tie(sop.vector_primitive, sop.vector_geometry) =
+          ClassifyVectorOpSemantics(call, sop, problem);
       problem.ops.push_back(std::move(sop));
       op_labels.push_back(call->op_->name_);
       op_stmts.push_back(stmt);
@@ -916,6 +996,42 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
   };
   for (size_t i = 0; i < no; ++i) {
     f << (i ? "," : "") << "\"" << op_type_name(p.ops[i].type) << "\"";
+  }
+  const auto primitive_name = [](::VectorPrimitiveFamily family) -> const char* {
+    switch (family) {
+      case ::VectorPrimitiveFamily::Generic: return "generic";
+      case ::VectorPrimitiveFamily::Add: return "add";
+      case ::VectorPrimitiveFamily::Mul: return "mul";
+      case ::VectorPrimitiveFamily::Div: return "div";
+      case ::VectorPrimitiveFamily::Exp: return "exp";
+      case ::VectorPrimitiveFamily::Log: return "log";
+      case ::VectorPrimitiveFamily::Rsqrt: return "rsqrt";
+      case ::VectorPrimitiveFamily::ScalarAdd: return "scalar_add";
+      case ::VectorPrimitiveFamily::ScalarMul: return "scalar_mul";
+      case ::VectorPrimitiveFamily::Reduction: return "reduction";
+    }
+    return "generic";
+  };
+  const auto geometry_name = [](::VectorOpGeometry geometry) -> const char* {
+    switch (geometry) {
+      case ::VectorOpGeometry::Generic: return "generic";
+      case ::VectorOpGeometry::Flat: return "flat";
+      case ::VectorOpGeometry::RowExpand: return "row_expand";
+      case ::VectorOpGeometry::ColExpand: return "col_expand";
+    }
+    return "generic";
+  };
+  f << "],\n  \"vec_slopes\": [";
+  for (size_t i = 0; i < no; ++i) f << (i ? "," : "") << p.ops[i].vec_slope;
+  f << "],\n  \"vec_fixed_costs\": [";
+  for (size_t i = 0; i < no; ++i) f << (i ? "," : "") << p.ops[i].vec_fixed;
+  f << "],\n  \"vector_primitive_families\": [";
+  for (size_t i = 0; i < no; ++i) {
+    f << (i ? "," : "") << "\"" << primitive_name(p.ops[i].vector_primitive) << "\"";
+  }
+  f << "],\n  \"vector_op_geometries\": [";
+  for (size_t i = 0; i < no; ++i) {
+    f << (i ? "," : "") << "\"" << geometry_name(p.ops[i].vector_geometry) << "\"";
   }
   f << "],\n  \"fast_memory_capacity\": " << p.fast_memory_capacity;
   // 910B topology + grounded pto-isa machine model — emit so a dumped instance
