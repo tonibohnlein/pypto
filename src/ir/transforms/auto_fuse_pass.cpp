@@ -4614,6 +4614,28 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                << ot.width << "x" << ot.height << "]";
     }
 
+    // Opaque/unsupported operations are partition barriers, but the current
+    // solver requires every source op to belong to a costed group. A singleton
+    // opaque group has no vector/cube iteration frame; letting it enter tile
+    // enumeration therefore creates a fictional 0x0 schedule. Until AutoFuse
+    // can solve supported DAG segments around an opaque barrier, decline the
+    // whole function and leave every source operation to the existing lowering.
+    const bool has_unsupported_ops =
+        std::any_of(p.ops.begin(), p.ops.end(), [](const ::Op& op) {
+          return op.type == ::OpType::Opaque &&
+                 op.vector_capability == ::VectorOpCapability::Unsupported;
+        });
+    if (has_unsupported_ops) {
+      LOG_INFO << "AutoFuse[" << func->name_
+               << "]: unsupported opaque operation present -> leaving function unchanged";
+      if (const char* dump_dir = std::getenv("PYPTO_AUTOFUSE_DUMP")) {
+        DumpProblemJson(builder.problem,
+                        std::string(dump_dir) + "/" + func->name_ + ".dag.json");
+      }
+      new_functions.emplace(gvar, func);
+      continue;
+    }
+
     // Solve, then print the fusion decision: each group's member ops + chosen tile.
     ::DAG dag = ::DAG::build(builder.problem);
     ::Solution sol = SolveWithMergeOverride(builder.problem, dag, func->name_);

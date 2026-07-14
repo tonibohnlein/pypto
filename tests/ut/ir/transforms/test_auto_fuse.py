@@ -780,6 +780,58 @@ class TestAutoFuse:
         assert dag["op_types"] == ["Opaque"] * 3
         assert dag["vector_op_capabilities"] == ["unsupported"] * 3
 
+    def test_bare_terminal_unsupported_reduction_declines_whole_function(
+        self, tmp_path, monkeypatch
+    ):
+        """A singleton opaque sink never reaches solver tile enumeration."""
+        monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class BareMinimum:
+            @pl.function(attrs={"auto_fuse": True})
+            def minimum(
+                self, x: pl.Tensor[[8, 8192], pl.FP32]
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                result: pl.Tensor[[8, 1], pl.FP32] = pl.row_min(x)
+                return result
+
+        after = passes.auto_fuse()(BareMinimum)
+
+        ir.assert_structural_equal(after, BareMinimum)
+        dag = json.loads((tmp_path / "minimum.dag.json").read_text())
+        assert dag["op_types"] == ["Opaque"]
+        assert dag["vector_op_capabilities"] == ["unsupported"]
+
+    def test_supported_cone_around_unsupported_reduction_declines_whole_function(
+        self, tmp_path, monkeypatch
+    ):
+        """Supported consumers do not pull an opaque barrier into the solver."""
+        monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class MinimumConsumer:
+            @pl.function(attrs={"auto_fuse": True})
+            def normalize(
+                self, x: pl.Tensor[[8, 8192], pl.FP32]
+            ) -> pl.Tensor[[8, 8192], pl.FP32]:
+                minimum: pl.Tensor[[8, 1], pl.FP32] = pl.row_min(x)
+                shifted: pl.Tensor[[8, 8192], pl.FP32] = pl.row_expand_sub(x, minimum)
+                result: pl.Tensor[[8, 8192], pl.FP32] = pl.exp(shifted)
+                return result
+
+        after = passes.auto_fuse()(MinimumConsumer)
+
+        ir.assert_structural_equal(after, MinimumConsumer)
+        dag = json.loads((tmp_path / "normalize.dag.json").read_text())
+        assert dag["op_types"] == ["Opaque", "Pointwise", "Pointwise"]
+        assert dag["vector_op_capabilities"] == [
+            "unsupported",
+            "elementwise",
+            "elementwise",
+        ]
+
     def test_vector_problem_dump_covers_grounded_unary_scalar_and_column_ops(
         self, tmp_path, monkeypatch
     ):
