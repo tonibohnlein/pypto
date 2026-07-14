@@ -9,7 +9,7 @@ This document enumerates, for the **vector** path (pointwise + reduction on the 
 910B AIV cores), **what the model assumes** and **what the emit must therefore produce**.
 It is the fidelity contract. Scope: vector kernels only (no cube / no mixed cube+vector).
 
-Code references are `3rdparty/mlsys26/src/core/ascend910b_cost.cpp` (cost) and
+Code references are `3rdparty/pto-fusebox/src/core/ascend910b_cost.cpp` (cost) and
 `src/ir/transforms/auto_fuse_pass.cpp` (emit) unless noted.
 
 ---
@@ -334,7 +334,7 @@ gates therefore agree on materialized versus streamed execution.
 **G1 — large softmax/layernorm silently overflow UB. [FIXED; exact P4 capability built.]**
 The stream gate requires `p1_nreds == 1` (`auto_fuse_pass.cpp:1231`), so a 2-reduction group
 cannot stream; it used to fall through to a full-reduced-axis materialized tile that overflowed
-(hard `AllocateMemoryAddr` failure). **Fixed** (mlsys26 `603ec35`, pypto `69d7f508`): a new
+(hard `AllocateMemoryAddr` failure). **Fixed** (PTO Fusebox `603ec35`, PyPTO `69d7f508`): a new
 `Problem::allow_model_ahead_multi_reduction_stream` flag — the AutoFuse adapter sets it false
 (buildable), so a streamed >1-reduction group is **infeasible** and the partitioner **cuts** it
 into single-reduction (streamable) + pointwise pieces. An **unfused softmax IS buildable**, so

@@ -465,7 +465,7 @@ def auto_fuse() -> Pass:
     """Create the AutoFuse pass: automatic operator fusion + tile-size selection.
 
     For each function marked with the ``auto_fuse`` attribute, extracts the
-    tensor-op DAG and runs the MLSys graph-scheduling solver to choose a
+    tensor-op DAG and runs PTO Fusebox to choose a
     memory-reuse partition (fusion groups) and tile granularity.
     """
 

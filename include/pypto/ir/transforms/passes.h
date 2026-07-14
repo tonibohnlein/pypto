@@ -465,8 +465,8 @@ Pass AutoTileMatmulL0();
  * @brief Create the AutoFuse pass — automatic operator fusion + tile sizing.
  *
  * For each function carrying the ``auto_fuse`` attribute, extracts the
- * tensor-op DAG and uses the MLSys graph-scheduling solver (linked from
- * 3rdparty/mlsys26) to choose a memory-reuse partition (fusion groups) and tile
+ * tensor-op DAG and uses PTO Fusebox (linked from 3rdparty/pto-fusebox) to
+ * choose a memory-reuse partition (fusion groups) and tile
  * granularity. v0 builds the problem and solves it; the IR rewrite that emits
  * InCoreScopeStmt regions from the schedule is the next increment.
  */

@@ -16,7 +16,7 @@ kernel* and *what tile* — are exactly what AutoFuse automates.
 
 This file expresses the matmul as a pure tensor-op graph (``c = pl.matmul(a, b)`` — no
 ``pl.incore``, no tile shapes) and marks it ``attrs={"auto_fuse": True}``. Compiling it runs
-the AutoFuse pass: it extracts the op+tensor DAG, runs the MLSys solver to choose the fusion
+the AutoFuse pass: it extracts the op+tensor DAG, runs PTO Fusebox to choose the fusion
 partition + tile, and rewrites the body to realize that decision for the rest of the pipeline
 (Outline -> ConvertTensorToTileOps -> AutoTileMatmulL0 -> ... -> codegen) to lower into a cube
 kernel.

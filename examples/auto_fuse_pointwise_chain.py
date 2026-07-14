@@ -10,7 +10,7 @@
 """Auto-fused pointwise chain — two elementwise ops fused into one tiled vector kernel.
 
 ``c = (a + 1.0) * 2.0`` over a large ``[4096, 384]`` tensor marked
-``attrs={"auto_fuse": True}``. The MLSys solver fuses both ops into one group (the
+``attrs={"auto_fuse": True}``. PTO Fusebox fuses both ops into one group (the
 intermediate ``t = a + 1.0`` is ephemeral), and AutoFuse realizes it as the
 solver's ``[w, h]`` output tiling distributed across the vector cores — for this
 shape, 48 tiles, one per AIV core. Each tile's body replays the *whole chain* on a

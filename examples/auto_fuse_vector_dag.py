@@ -16,7 +16,7 @@ a ``[128,128]`` tile (the *tiling*). Those are exactly the two decisions AutoFus
 This file expresses the *same* diamond as a pure tensor-op graph — no ``pl.incore``, no
 ``pl.load``/tile shapes — and marks it ``attrs={"auto_fuse": True}``. The AutoFuse pass
 (now wired into the pass manager just after the normalize passes, before the Outline
-passes) extracts that raw op+tensor DAG, runs the MLSys solver, and prints the grouping +
+passes) extracts that raw op+tensor DAG, runs PTO Fusebox, and prints the grouping +
 tile sizes it picks — i.e. the auto equivalent of the hand-written kernel split.
 
 Run (repo root, extension built):

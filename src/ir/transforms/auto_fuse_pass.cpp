@@ -11,14 +11,14 @@
 
 // AutoFuse: automatic operator fusion + tile-size selection.
 //
-// The extractor builds the MLSys solver's op+tensor DAG (`Problem`) from an
+// The extractor builds PTO Fusebox's op+tensor DAG (`Problem`) from an
 // `auto_fuse`-marked function by reusing PyPTO's own dependency analysis
 // (`BuildStmtDependencyGraph`), which is Out/InOut/SSA-correct. This handles
 // both forms uniformly:
 //   * a flat tensor-level function (each AssignStmt is a tensor op), and
 //   * an orchestration kernel-call DAG (`c_v1 = self.kernel_add(a, b, c)`),
 //     where `tensor.create` allocations and Out-buffer args are skipped.
-// The DAG is handed to the linked MLSys solver (`3rdparty/mlsys26`) to choose a
+// The DAG is handed to the linked PTO Fusebox solver (`3rdparty/pto-fusebox`) to choose a
 // memory-reuse fusion partition. v0 computes + logs (and optionally dumps) the
 // grouping; the IR rewrite (emit InCoreScopeStmt) is the next increment.
 
@@ -66,7 +66,7 @@
 #include "pypto/ir/transforms/utils/stmt_dependency_analysis.h"
 #include "pypto/ir/type.h"
 
-// MLSys graph-scheduling solver (3rdparty/mlsys26), linked as `solver_lib`.
+// PTO Fusebox graph scheduler (3rdparty/pto-fusebox), linked as `solver_lib`.
 #include "core/dag.h"
 #include "core/flat_set.h"
 #include "core/subgraph.h"
@@ -81,7 +81,7 @@ namespace pass {
 namespace {
 
 // Hardware parameters. v0 hardcodes the Ascend 910B machine model (mirrors
-// `set_910b` in 3rdparty/mlsys26/test/ascend_910b_test.cpp); the solver derives
+// `set_910b` in 3rdparty/pto-fusebox/test/ascend_910b_test.cpp); the solver derives
 // per-op compute from tile geometry (the grounded pto-isa fractal/vector model).
 // TODO(cost-model): read these from BackendHandler instead of hardcoding 910B.
 constexpr int64_t kFastMemoryCapacity = 1LL << 30;  // single-pool capacity hint
@@ -764,7 +764,7 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
   return matches;
 }
 
-// Build the MLSys solver `Problem` (op+tensor DAG) from a function, reusing
+// Build the PTO Fusebox `Problem` (op+tensor DAG) from a function, reusing
 // `BuildStmtDependencyGraph` for sound op-dependency edges.
 class ProblemBuilder {
  public:
@@ -1035,7 +1035,7 @@ class ProblemBuilder {
 };
 
 // Dump the extracted DAG as a competition-format JSON instance (for
-// visualization via 3rdparty/mlsys26/scripts/visualize.py). Hand-rolled JSON.
+// visualization via 3rdparty/pto-fusebox/scripts/visualize.py). Hand-rolled JSON.
 void DumpProblemJson(const ::Problem& p, const std::string& path) {
   std::ofstream f(path);
   if (!f) {
@@ -1174,7 +1174,7 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
 }
 
 // Dump the solver's DECISION (fusion groups + per-group tile/latency/retain) as
-// JSON for `3rdparty/mlsys26/scripts/visualize.py solution <dag.json> <sol.json>`.
+// JSON for `3rdparty/pto-fusebox/scripts/visualize.py solution <dag.json> <sol.json>`.
 void DumpSolutionJson(const ::Solution& sol, const std::string& path) {
   std::ofstream f(path);
   if (!f) {
@@ -3120,7 +3120,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // The costed split is trusted EXACTLY (never rounded to a nearby divisor — that would enlarge
   // each slice and break the solver's UB-fit proof). The solver only costs a realizable S: it
   // draws vector S from divisors of the reduced FRACTAL count (reduced_extent/16) when that axis
-  // is 16-aligned (mlsys26 ascend910b_cost.cpp:886, mirroring the matmul kfrac gate id.:870), so
+  // is 16-aligned (PTO Fusebox ascend910b_cost.cpp:886, mirroring the matmul kfrac gate id.:870), so
   // IM/S is 16-aligned and this gate holds. The gate is kept as DEFENSE-IN-DEPTH: a non-conforming
   // S from any other cost model declines to the CORRECT non-split body rather than emitting an OOB
   // read. Everything else (max/min, row-reduction split, reduction-feeds-pointwise) also declines.
