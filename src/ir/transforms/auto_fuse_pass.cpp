@@ -282,7 +282,11 @@ VectorOpDescriptor DescribeVectorOp(const CallPtr& call) {
   auto has = [&](const char* s) { return n.find(s) != std::string::npos; };
   auto any = [&](std::initializer_list<const char*> names) {
     for (const char* name : names) {
-      if (IsOp(call, name)) return true;
+      // Capability admission deliberately includes retired and backend-specific
+      // names so they remain explicit barriers if encountered in serialized IR.
+      // Do not look those names up in OpRegistry: current main rightfully throws
+      // for an unregistered legacy op (for example tensor.as_layout).
+      if (n == name) return true;
     }
     return false;
   };
