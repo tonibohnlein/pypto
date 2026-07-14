@@ -10,7 +10,7 @@
 """Auto-fused pointwise op — a single elementwise op tiled across the vector cores.
 
 A lone ``c = a + 1.0`` over a large ``[4096, 384]`` tensor marked
-``attrs={"auto_fuse": True}``. The MLSys solver tiles the output into ``[w, h]``
+``attrs={"auto_fuse": True}``. PTO Fusebox tiles the output into ``[w, h]``
 regions sized for the vector unit; for this shape it picks 48 tiles — one per AIV
 (vector) core. AutoFuse emits the chunked-parallel ``AutoInCore`` form (the twin
 of the matmul ``examples/auto_fuse_matmul.py``, but the per-tile body is the

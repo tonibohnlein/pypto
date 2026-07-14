@@ -62,7 +62,7 @@ target_include_directories(${LIBRARY_NAME} PRIVATE
     ${LIBBACKTRACE_INSTALL_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/runtime/src/common
-    ${CMAKE_SOURCE_DIR}/3rdparty/mlsys26/src
+    ${CMAKE_SOURCE_DIR}/3rdparty/pto-fusebox/src
 )
 target_link_libraries(${LIBRARY_NAME} PRIVATE
     libbacktrace
@@ -70,7 +70,7 @@ target_link_libraries(${LIBRARY_NAME} PRIVATE
     solver_lib
 )
 
-# auto_fuse_pass.cpp includes the MLSys solver headers (C++20). Compile just that
+# auto_fuse_pass.cpp includes the PTO Fusebox headers (C++20). Compile just that
 # one translation unit at C++20 while the rest of pypto stays C++17.
 set_source_files_properties(
     ${CMAKE_SOURCE_DIR}/src/ir/transforms/auto_fuse_pass.cpp

@@ -9,7 +9,7 @@
 
 """Auto-fused chained matmul — two back-to-back matmuls fused into one kernel.
 
-``C = (A @ B) @ D`` marked ``attrs={"auto_fuse": True}``. The MLSys solver decides
+``C = (A @ B) @ D`` marked ``attrs={"auto_fuse": True}``. PTO Fusebox decides
 to *fuse* the two matmuls into a single group (the intermediate ``T = A @ B`` is
 ephemeral), and picks an output tile. AutoFuse realizes the fusion as an inner
 serial matmul chain inside a parallel-outer tiling:

@@ -52,7 +52,7 @@ skew and the second loop axis exist. Analytic mode retains the four-stage topolo
 Build a pass that turns a function's **tensor-op DAG** into **fused, tiled SPMD kernels** — vector
 kernels on the Ascend 910B AIV cores and cube (matmul) kernels on the AIC cores — by:
 
-1. running the **MLSys solver** (`3rdparty/mlsys26/`, linked as `solver_lib`) to **partition** the DAG
+1. running **PTO Fusebox** (`3rdparty/pto-fusebox/`, linked as `solver_lib`) to **partition** the DAG
    into convex groups (each group → one kernel) and choose each group's **tile / grid / split /
    materialize-vs-stream**, and
 2. **emitting** each group as the tiled kernel the solver priced,
@@ -96,7 +96,7 @@ fixed them.
 
 ## 3. How the cost model was designed (the reasoning)
 
-The Ascend 910B cost model (`3rdparty/mlsys26/src/core/ascend910b_cost.cpp`, `Ascend910BCost`) was
+The Ascend 910B cost model (`3rdparty/pto-fusebox/src/core/ascend910b_cost.cpp`, `Ascend910BCost`) was
 built bottom-up from the hardware rather than fitted to AutoFuse wall times. The design steps:
 
 **(a) Grounded, not AutoFuse-wall regressed.** Every term is derived from the **pto-isa** machine
@@ -186,18 +186,18 @@ coverage close the remaining representational gaps on host without fitting AutoF
   - Flag helpers `GenericEmitEnabled()`, `P4Enabled(P4PatternKind)` (re-read env per call). With the
     P4 variable unset, exact softmax is enabled and Welford is not; `0` disables both and a nonzero
     value enables both.
-- **Cost model** — `3rdparty/mlsys26/src/core/ascend910b_cost.cpp` (+ `types.h`, `dag.h`), branch
-  `ascend-910b-model`, linked as `solver_lib`. `VectorStreamPlan` is stack-local while
+- **Cost model** — `3rdparty/pto-fusebox/src/core/ascend910b_cost.cpp` (+ `types.h`, `dag.h`),
+  published from `pto-fusebox/main` and linked as `solver_lib`. `VectorStreamPlan` is stack-local while
   pricing candidates and re-derived only for final/forced configs consumed by AutoFuse.
 - **Flags:** `PYPTO_AUTOFUSE_GENERIC_EMIT`, `PYPTO_AUTOFUSE_P4` (unset = exact softmax only,
   `0` = neither, nonzero = exact softmax + Welford), `PYPTO_AUTOFUSE_FORCE_PLAN`
   (`"[g<N>:]w,h,split[,pm,pn]"`, **static-cached per process** → one force per fresh subprocess),
   `PYPTO_AUTOFUSE_FORCE_MERGE=none|all`, `PYPTO_AUTOFUSE_DUMP_PLANS`, `PYPTO_AUTOFUSE_STRICT`.
 - **Build (MAX 2 cores):** `cmake --build build --parallel 2`;
-  `cmake --build 3rdparty/mlsys26/build --target solver_lib -j2`.
+  `cmake --build 3rdparty/pto-fusebox/build --target solver_lib -j2`.
 - **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 4`
-  (36 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
-  `./3rdparty/mlsys26/build/tests/ascend_910b_test` (436 pass / 7 documented baseline failures). Numeric:
+  (42 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
+  `./3rdparty/pto-fusebox/build/tests/ascend_910b_test` (450 pass / 7 documented baseline failures). Numeric:
   `pypto.debug.torch_codegen(passes.auto_fuse()(Prog), run_all_spmd_blocks=True)` — write P4 DSL FULLY
   NAMED (nested args drop ops from the solver graph → miss P4).
 
@@ -441,7 +441,7 @@ The authoritative obligation table and validation ladder are in
 
 ## 9. Operational gotchas (don't relearn these)
 
-- **Build MAX 2 cores.** Use absolute build paths (a `cd 3rdparty/mlsys26` persists across shell calls
+- **Build MAX 2 cores.** Use absolute build paths (a `cd 3rdparty/pto-fusebox` persists across shell calls
   and mis-targets the build).
 - **FORCE_PLAN is static-cached per process** → one force per fresh subprocess; the `group[0]` solver
   log is misleading under force (prints the argmin, not the forced tile) — trust the emitted
@@ -450,11 +450,10 @@ The authoritative obligation table and validation ladder are in
   mis-costs. Write NAMED temps.
 - **Welford count column** must be derived from a reduction output (col-major), NOT `tensor.full`
   (row-major → trips `ResolveBackendOpLayouts`' col-vector reshape → lowering crash).
-- **Remote access:** SSH is currently blocked; use HTTPS, submodule first when publishing code.
-  `.gitmodules` still contains an SSH URL for `mlsys26`, so device checkouts must locally override
-  `submodule.3rdparty/mlsys26.url` with `https://github.com/tonibohnlein/mlsys26.git`. NEVER push /
-  open PRs without explicit order; NEVER add AI co-author lines; never hack test expectations.
+- **Remote access:** SSH is currently blocked; use the public HTTPS PTO Fusebox submodule and publish
+  it before the parent when both repositories change. NEVER push / open PRs without explicit order;
+  NEVER add AI co-author lines; never hack test expectations.
 - **Device runs:** a separate agent checks out `fusion-scheduler-vector-stream-plan`, builds, and runs
   on 910B2 with a working
   `device_wall effective_us` STRACE path; `benchmark()` hits error 507018 (avoid). Fingerprint-gate on
-  HEAD + mlsys26 hash first.
+  HEAD + PTO Fusebox hash first.

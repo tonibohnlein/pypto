@@ -7,10 +7,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Unit tests for the AutoFuse pass (MLSys-solver-driven fusion + IR emit).
+"""Unit tests for the AutoFuse pass (PTO-Fusebox-driven fusion + IR emit).
 
 AutoFuse intercepts the raw tensor-op DAG of a function marked
-``attrs={"auto_fuse": True}``, runs the MLSys solver to choose a fusion
+``attrs={"auto_fuse": True}``, runs PTO Fusebox to choose a fusion
 partition + tile, and rewrites the body to realize that decision: a matmul or a
 run of fused pointwise ops becomes the solver's ``[w,h]`` output tiling distributed
 across cores (chunked-parallel ``AutoInCore`` scopes — k-pipelined per tile for
