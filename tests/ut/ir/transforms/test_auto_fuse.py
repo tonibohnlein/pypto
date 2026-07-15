@@ -175,6 +175,15 @@ class TestAutoFuse:
                 c: pl.Tensor[[272, 272], pl.FP32] = pl.matmul(a, b)
                 return c
 
+        planned = passes.auto_fuse()(Prog)
+        planned_body = next(
+            f for _, f in planned.functions.items() if f.name == "mm"
+        ).as_python()
+        assert "pl.spmd(" in planned_body
+        assert "pl.min(" in planned_body
+        assert "__autofuse_l0_matmul_plan" in planned_body
+        assert "AtomicType" not in planned_body and "pl.tensor.full(" not in planned_body
+
         # Must lower end-to-end as one cube kernel without inventing a split seed.
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]

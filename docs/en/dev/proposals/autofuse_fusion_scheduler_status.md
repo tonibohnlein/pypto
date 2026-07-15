@@ -360,9 +360,10 @@ statistics update math remains deliberately algorithm-specific.
    topology and phase ordering are now precomputed, the 11-config P4 sweep is only a few microseconds,
    and `CostResult` still caches only scalar/config data. The end-to-end profile points to partition
    search/allocation; do not cache complete stream plans unless a new profile overturns that result.
-4. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan` and recursive uniform-grid
-   emitter are implemented (§8). Next reconcile GM reload with the emitted L0-subtile loop, then
-   introduce per-node cube phase rooflines, price split seed/tasks, and close non-uniform grids.
+4. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan`, recursive uniform-grid emit,
+   phase-local K-window cost, split seed/tasks, emitted reload multiplicity, and lone clamped-overlap
+   grids are implemented (§8). Next device-compare analytic versus exact winners, validate nested
+   pipe/FIXPIPE behavior, then consider retained panels and variable-shape multi-op grids.
 5. **Complete mixed fidelity:** make the plan choose a real pipeline-item axis and active-group
    count, replace global-tile overlap with serial-versus-realizable phase costs, then implement the
    one-way and single-round-trip emit through `ExpandMixedKernel` → `InjectGMPipeBuffer` →
@@ -410,17 +411,23 @@ BF16/FP16 Mat, matching PTO's fused-chain kernel; roots narrow/store to their de
 Same-type FP32 internal L1 handoff is not an A2/A3 instruction, so an explicitly FP32 chain is
 partitioned into standalone kernels. Direct Mat→GM store is legal and no longer detours through Vec.
 
-**Host validation.** PTO Fusebox reports 461 passing checks with the same seven documented baseline
-failures; the full AutoFuse file reports 47 passing tests. Compiler coverage includes
+**Host validation.** PTO Fusebox reports 479 passing checks with the same six documented baseline
+failures; the full AutoFuse file reports 53 passing tests. Compiler coverage includes
 natural/forced lone matmuls, BF16 recursive trees/fan-out/deep
 chains, FP32-chain decline, split seed, ragged K, multi-window output residency, a 192 KiB internal
 region, descriptor consumption, Torch numerics, and PTOAS-backed full lowering. The former strict
 chained-matmul xfail now passes.
 
+**Silicon isolation.** The forced pure-cube `[192,64]@[64,256]` four-window schedule now passes on
+910B2 with 48 logical AIC blocks. The same producer followed by a separate AIV bias epilogue still
+fails, even at 12 blocks and with a single K window. DFX proves the shared allocation and covered
+AIC→AIV dependency are present, so that residual is a mixed/orchestration FIXPIPE-visibility issue,
+not a cube-only schedule blocker. Cube-only correctness and ranking work proceeds independently.
+
 **Remaining gaps:**
 
-1. Non-uniform buildable cost/emission: lone split=1 still uses legacy ceil-and-clamp; ragged
-   split-K and unequal multi-op grids decline.
+1. Non-uniform buildable cost/emission: lone split=1 now uses an explicit `ClampedOverlap` plan and
+   prices every maximum-shape task; ragged split-K and unequal multi-op grids decline.
 2. Optional retained boundary panels: the current model faithfully charges reload per output tile;
    introducing reuse requires an explicit lifetime and matching emitter.
 3. Ground a per-baseK synchronization/event term before allowing phase composition to change the

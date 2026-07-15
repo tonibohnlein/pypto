@@ -887,10 +887,10 @@ class ProblemBuilder {
     problem.allow_model_ahead_mixed_multi_roundtrip = false;
     problem.fuse_cube_vector = GenericEmitEnabled() && MixedEmitEnabled();
     problem.require_buildable_mixed = problem.fuse_cube_vector;
-    // Multi-matmul CubeSchedulePlan emission currently requires one static
-    // region shape per SPMD body. Keep analytic solver users unrestricted, but
-    // do not let the compiler select a balanced non-uniform DAG grid that it
-    // would have to materialize as standalone fallback kernels.
+    // CubeSchedulePlan buildability: multi-matmul groups require a uniform
+    // static region; a ragged lone matmul uses one split=1 clamped-overlap
+    // region. In particular, do not price a ragged split-K grid whose atomic
+    // edge regions would have multiple spatial owners.
     problem.require_uniform_cube_dag_grid = GenericEmitEnabled();
     problem.use_hierarchical_cube_cost = ExactL0CostEnabled();
 
@@ -1383,11 +1383,10 @@ struct SolverTile {
   // w/h are exact divisors (the legacy uniform-tile path). >0 => the solver chose a
   // parts_m x parts_n grid whose region extents differ by <=1 fractal per axis, and
   // w/h then carry the MAX (physical) region extent (types.h:180-194, partition_axis).
-  // Threaded so the emitter can DETECT a non-uniform grid: PyPTO reconstructs a
-  // ceil(M/h) x ceil(N/w) grid, which diverges from the solver's balanced partition
-  // when the axis is non-uniform. The generic matmul rule floors that grid (under-
-  // covers the tail => wrong result) so it Tier-B-declines a non-uniform grid; the
-  // vector rule's ceil+clamp overlap stays numerically correct (idempotent, D3).
+  // Threaded so a non-uniform final plan can preserve the solver's logical grid.
+  // For a lone split=1 matmul, CubeSchedulePlan makes the realizable algorithm
+  // explicit: every task owns the maximum shape and clamps a ragged edge
+  // backward, making the duplicated non-atomic writes idempotent.
   int64_t parts_m = 0;
   int64_t parts_n = 0;
   // Solver-owned per-core vector streaming algorithm for this exact candidate.
@@ -3812,16 +3811,25 @@ ExprPtr ScaleIndex(const ExprPtr& index, int64_t extent, const Span& sp) {
   return MakeMul(index, MakeIndex(extent, sp), sp);
 }
 
-ExprPtr CubeRegionAxisOffset(::CubeAxisBinding binding, int64_t extent, const ExprPtr& m_index,
-                             const ExprPtr& n_index, const ExprPtr& split_index, const Span& sp) {
+ExprPtr CubeRegionAxisOffset(::CubeAxisBinding binding, int64_t extent, int64_t full_extent,
+                             bool clamp_overlap, const ExprPtr& m_index, const ExprPtr& n_index,
+                             const ExprPtr& split_index, const Span& sp) {
   switch (binding) {
     case ::CubeAxisBinding::Full:
     case ::CubeAxisBinding::SequentialK:
       return MakeIndex(0, sp);
-    case ::CubeAxisBinding::SpatialM:
-      return ScaleIndex(m_index, extent, sp);
-    case ::CubeAxisBinding::SpatialN:
-      return ScaleIndex(n_index, extent, sp);
+    case ::CubeAxisBinding::SpatialM: {
+      ExprPtr offset = ScaleIndex(m_index, extent, sp);
+      return clamp_overlap && full_extent > extent
+                 ? MakeMin(offset, MakeIndex(full_extent - extent, sp), sp)
+                 : offset;
+    }
+    case ::CubeAxisBinding::SpatialN: {
+      ExprPtr offset = ScaleIndex(n_index, extent, sp);
+      return clamp_overlap && full_extent > extent
+                 ? MakeMin(offset, MakeIndex(full_extent - extent, sp), sp)
+                 : offset;
+    }
     case ::CubeAxisBinding::ParallelK:
       return ScaleIndex(split_index, extent, sp);
   }
@@ -3834,6 +3842,7 @@ struct ValidatedCubeGroup {
   int64_t parts_n = 0;
   int64_t region_h = 0;
   int64_t region_w = 0;
+  bool clamped_overlap = false;
 };
 
 std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
@@ -3865,10 +3874,28 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
 
   validated.parts_m = plan.m_partition.parts;
   validated.parts_n = plan.n_partition.parts;
-  validated.region_h = plan.m_partition.big;
-  validated.region_w = plan.n_partition.big;
+  const ::CubeMatmulSchedule* root_schedule = nullptr;
+  for (const ::CubeMatmulSchedule& mm : plan.matmuls) {
+    if (mm.is_sink) {
+      root_schedule = &mm;
+      break;
+    }
+  }
+  if (root_schedule == nullptr) {
+    return fail("cube plan has no boundary root");
+  }
+  // AxisPartition::big is a physical fractal-rounded maximum and may exceed a
+  // sub-fractal whole output. The request descriptor carries the actual static
+  // tensor region that the emitter must slice and assemble.
+  validated.region_h = root_schedule->output.height;
+  validated.region_w = root_schedule->output.width;
+  validated.clamped_overlap = plan.spatial_policy == ::CubeSpatialPolicy::ClampedOverlap;
+  const bool uniform_grid = plan.m_partition.num_big == 0 && plan.n_partition.num_big == 0;
+  const bool spatial_policy_valid =
+      (plan.spatial_policy == ::CubeSpatialPolicy::Uniform && uniform_grid) ||
+      (validated.clamped_overlap && !uniform_grid && plan.matmuls.size() == 1 && plan.split_k == 1);
   if (validated.parts_m <= 0 || validated.parts_n <= 0 || validated.region_h <= 0 ||
-      validated.region_w <= 0 || plan.m_partition.num_big != 0 || plan.n_partition.num_big != 0 ||
+      validated.region_w <= 0 || !spatial_policy_valid ||
       plan.spatial_tiles != validated.parts_m * validated.parts_n || plan.split_k != tile.split ||
       plan.seed_required != (plan.split_k > 1) || plan.seed.present != plan.seed_required ||
       (plan.seed.present && (plan.seed.work_units <= 0 || plan.seed.valid_rows <= 0 ||
@@ -3969,11 +3996,16 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
     }
     if (mm.is_sink) {
       ++root_count;
+      const bool root_grid_matches =
+          validated.clamped_overlap
+              ? (plan.split_k == 1 && validated.parts_m >= CeilDiv(output_m, validated.region_h) &&
+                 validated.parts_n >= CeilDiv(output_n, validated.region_w))
+              : (validated.parts_m * validated.region_h == output_m &&
+                 validated.parts_n * validated.region_w == output_n);
       if (mm.output.height_binding != ::CubeAxisBinding::SpatialM ||
           mm.output.width_binding != ::CubeAxisBinding::SpatialN || mm.output.height != validated.region_h ||
-          mm.output.width != validated.region_w || validated.parts_m * validated.region_h != output_m ||
-          validated.parts_n * validated.region_w != output_n) {
-        return fail("root output does not exactly match the uniform spatial partition");
+          mm.output.width != validated.region_w || !root_grid_matches) {
+        return fail("root output does not match the planned spatial policy");
       }
       if (root_m < 0) {
         root_m = output_m;
@@ -4064,6 +4096,14 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
   auto lhs_source_type = AsTensorTypeLike(source_call->args_[0]->GetType());
   if (lhs_source_type == nullptr) return fail("matmul LHS is not tensor-like");
   const DataType accumulator_dtype = CubeAccumulatorDType(lhs_source_type->dtype_);
+  const auto [lhs_full_h, lhs_full_w] = Static2DShape(source_call->args_[0]->GetType());
+  const auto [rhs_full_h, rhs_full_w] = Static2DShape(source_call->args_[1]->GetType());
+  const auto [output_full_h, output_full_w] = Static2DShape(source_assign->var_->GetType());
+  if (lhs_full_h <= 0 || lhs_full_w <= 0 || rhs_full_h <= 0 || rhs_full_w <= 0 ||
+      output_full_h <= 0 || output_full_w <= 0) {
+    return fail("planned matmul requires static two-dimensional tensor shapes");
+  }
+  const bool clamp_overlap = plan.spatial_policy == ::CubeSpatialPolicy::ClampedOverlap;
 
   ExprPtr lhs = source_call->args_[0];
   ExprPtr rhs = source_call->args_[1];
@@ -4093,21 +4133,22 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
   }
 
   ExprPtr lhs_row = mm.lhs_producer >= 0 ? MakeIndex(0, sp)
-                                         : CubeRegionAxisOffset(mm.lhs.height_binding, mm.lhs.height, m_index,
-                                                                n_index, split_index, sp);
+                                         : CubeRegionAxisOffset(mm.lhs.height_binding, mm.lhs.height,
+                                                                lhs_full_h, clamp_overlap, m_index, n_index,
+                                                                split_index, sp);
   ExprPtr lhs_k = mm.lhs_producer >= 0 ? MakeIndex(0, sp)
-                                       : CubeRegionAxisOffset(mm.lhs.width_binding, mm.lhs.width, m_index,
-                                                              n_index, split_index, sp);
+                                       : CubeRegionAxisOffset(mm.lhs.width_binding, mm.lhs.width, lhs_full_w,
+                                                              clamp_overlap, m_index, n_index, split_index, sp);
   ExprPtr rhs_k = mm.rhs_producer >= 0 ? MakeIndex(0, sp)
-                                       : CubeRegionAxisOffset(mm.rhs.height_binding, mm.rhs.height, m_index,
-                                                              n_index, split_index, sp);
+                                       : CubeRegionAxisOffset(mm.rhs.height_binding, mm.rhs.height, rhs_full_h,
+                                                              clamp_overlap, m_index, n_index, split_index, sp);
   ExprPtr rhs_col = mm.rhs_producer >= 0 ? MakeIndex(0, sp)
-                                         : CubeRegionAxisOffset(mm.rhs.width_binding, mm.rhs.width, m_index,
-                                                                n_index, split_index, sp);
-  const ExprPtr output_row =
-      CubeRegionAxisOffset(mm.output.height_binding, mm.output.height, m_index, n_index, split_index, sp);
-  const ExprPtr output_col =
-      CubeRegionAxisOffset(mm.output.width_binding, mm.output.width, m_index, n_index, split_index, sp);
+                                         : CubeRegionAxisOffset(mm.rhs.width_binding, mm.rhs.width, rhs_full_w,
+                                                                clamp_overlap, m_index, n_index, split_index, sp);
+  const ExprPtr output_row = CubeRegionAxisOffset(mm.output.height_binding, mm.output.height, output_full_h,
+                                                  clamp_overlap, m_index, n_index, split_index, sp);
+  const ExprPtr output_col = CubeRegionAxisOffset(mm.output.width_binding, mm.output.width, output_full_w,
+                                                  clamp_overlap, m_index, n_index, split_index, sp);
 
   auto find_variant = [&](int64_t h, int64_t w) -> const ::CubeOutputTileVariant* {
     for (const ::CubeOutputTileVariant& variant : mm.output_variants) {

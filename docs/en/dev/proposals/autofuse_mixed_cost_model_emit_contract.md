@@ -1,7 +1,8 @@
 # AutoFuse mixed cube/vector schedule contract
 
 **Status:** first buildable `C->V` increment implemented behind
-`PYPTO_AUTOFUSE_MIXED=1`; silicon validation pending.
+`PYPTO_AUTOFUSE_MIXED=1`; silicon validation is blocked by a downstream cube→vector visibility
+defect, while the isolated pure-cube producer is correct.
 The homogeneous vector and cube contracts remain authoritative for work inside each engine.
 This document defines the additional contract at cube/vector boundaries.
 
@@ -177,6 +178,15 @@ The remaining model/emit gaps are:
   cuts it; the current unified spatial grid also cannot express its key-chunk loop.
 
 These are explicit migration gaps, not permission for the emitter to approximate the plan.
+
+Latest 910B2 isolation at PyPTO `8a97865a` establishes that the homogeneous four-window cube
+producer is numerically correct, but the separate AIV epilogue is not. The failure persists with
+12, 24, or 48 AIC blocks and with one or four K windows. Runtime DFX records one shared `mm`
+allocation, an AIC `INOUT`, an AIV `INPUT`, and a covered tensormap edge from the AIC task to the
+AIV task. Therefore task discovery, tensor identity, dependency creation, tag selection, K-window
+staging, and AIC wave count are not the remaining discriminants. The next bounded mixed-only probe
+is whether task completion waits for the final Acc→GM FIXPIPE drain to become globally visible.
+Until that is closed, mixed correctness/performance results are not valid and the flag remains off.
 
 ## 7. Implementation sequence
 
