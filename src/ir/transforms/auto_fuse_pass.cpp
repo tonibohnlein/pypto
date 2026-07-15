@@ -1668,26 +1668,25 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
             std::make_shared<AssignStmt>(out_var, tail_mm, sp)};
   }
 
-  // Seed the carry with the first real matmul instead of tensor.create([h,w]).
-  // tensor.create lowers to a UB allocation, but a solver cube tile may exceed
-  // UB/L0c and is subsequently sub-tiled. The real algorithm is: serial first
-  // chunk, rolled matmul_acc loop, serial tail.
-  auto a0_call =
-      reg.Create("tensor.slice", {a, MakeIndexTuple({h, k}, sp), MakeTuple2(a_row_base, a_k_base, sp)}, sp);
-  auto a0 = std::make_shared<Var>(base + "_a_k0", a0_call->GetType(), sp);
-  auto b0_call =
-      reg.Create("tensor.slice", {b, MakeIndexTuple({k, w}, sp), MakeTuple2(b_k_base, b_col_base, sp)}, sp);
-  auto b0 = std::make_shared<Var>(base + "_b_k0", b0_call->GetType(), sp);
-  auto first_call = AttachL0MatmulPlan(reg.Create("tensor.matmul", {a0, b0}, mm_kw, sp), l0_init, h, w, k, a0,
-                                       b0, dtype, /*accumulator_read=*/false);
-  auto first_var = std::make_shared<Var>(base + "_first", first_call->GetType(), sp);
-  std::vector<StmtPtr> result{
-      std::make_shared<AssignStmt>(a0, a0_call, sp),
-      std::make_shared<AssignStmt>(b0, b0_call, sp),
-      std::make_shared<AssignStmt>(first_var, first_call, sp)};
-
+  // Keep every full GM->L1 K window -- including K=0 -- in one physical
+  // stage ring.  This is the same fill/steady-state/drain structure used by
+  // AutoTileMatmulL0 and by the grounded PTO-ISA GEMM: stage 0 owns chunks
+  // 0,2,... and stage 1 owns chunks 1,3,... for the whole loop.  Peeling the
+  // first matmul outside the loop is not equivalent: after
+  // LowerPipelineLoops the peeled L1/L0A/L0B operands have no stage identity,
+  // so either memory planner may alias them with the first rolled prefetch
+  // while the asynchronous MAD still consumes them.
+  //
+  // CubeSchedulePlan already fixed the output tile to the common L0C-feasible
+  // shape of l0_init/l0_rolled/l0_tail.  The placeholder is therefore only
+  // the loop-carried Acc identity; InferTileMemorySpace and
+  // MaterializeSemanticAliases retarget it to the accumulator buffer.  It is
+  // not a materialized GM/UB intermediate.
+  auto acc_init_call = reg.Create("tensor.create", {MakeIndexTuple({h, w}, sp)},
+                                  {{"dtype", dtype}, {"layout", TensorLayout::ND}}, sp);
+  auto acc_init = std::make_shared<Var>(base + "_acc_init", acc_init_call->GetType(), sp);
   auto ko = std::make_shared<Var>(base + "_ko", std::make_shared<ScalarType>(DataType::INDEX), sp);
-  auto c_iter = std::make_shared<IterArg>(base + "_c", first_var->GetType(), first_var, sp);
+  auto c_iter = std::make_shared<IterArg>(base + "_c", acc_init->GetType(), acc_init, sp);
 
   // Per-iteration k-strip slices: a[mi:mi+h, ko:ko+k], b[ko:ko+k, ni:ni+w].
   auto a_k_call = reg.Create(
@@ -1701,17 +1700,31 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
   auto b_k = std::make_shared<Var>(base + "_b_k", b_k_call->GetType(), sp);
   auto b_k_assign = std::make_shared<AssignStmt>(b_k, b_k_call, sp);
 
-  auto acc_call = AttachL0MatmulPlan(reg.Create("tensor.matmul_acc", {ExprPtr(c_iter), a_k, b_k}, acc_kw, sp),
-                                     l0_rolled, h, w, k, a_k, b_k, dtype,
-                                     /*accumulator_read=*/true);
+  auto first_call = AttachL0MatmulPlan(reg.Create("tensor.matmul", {a_k, b_k}, mm_kw, sp), l0_init, h, w, k,
+                                       a_k, b_k, dtype, /*accumulator_read=*/false);
+  auto first_var = std::make_shared<Var>(base + "_mm", first_call->GetType(), sp);
+  auto first_assign = std::make_shared<AssignStmt>(first_var, first_call, sp);
+  auto first_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{first_var}, sp);
+  StmtPtr first_body =
+      SeqStmts::Flatten(std::vector<StmtPtr>{first_assign, first_yield}, sp);
+
+  auto acc_call = AttachL0MatmulPlan(
+      reg.Create("tensor.matmul_acc", {ExprPtr(c_iter), a_k, b_k}, acc_kw, sp), l0_rolled, h, w, k, a_k, b_k,
+      dtype, /*accumulator_read=*/true);
   auto acc_var = std::make_shared<Var>(base + "_mm_acc", acc_call->GetType(), sp);
   auto acc_assign = std::make_shared<AssignStmt>(acc_var, acc_call, sp);
-  auto body_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{acc_var}, sp);
-  StmtPtr body =
-      SeqStmts::Flatten(std::vector<StmtPtr>{a_k_assign, b_k_assign, acc_assign, body_yield}, sp);
+  auto acc_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{acc_var}, sp);
+  StmtPtr acc_body = SeqStmts::Flatten(std::vector<StmtPtr>{acc_assign, acc_yield}, sp);
 
-  const int64_t rolled_chunks = num_full - 1;
-  const bool pipeline = pipeline_stages >= 2 && rolled_chunks >= 2;
+  auto phi = std::make_shared<Var>(base + "_phi", first_call->GetType(), sp);
+  auto first_or_acc = std::make_shared<IfStmt>(MakeEq(ko, MakeIndex(0, sp), sp), first_body,
+                                               std::optional<StmtPtr>(acc_body),
+                                               std::vector<VarPtr>{phi}, sp);
+  auto body_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{phi}, sp);
+  StmtPtr body = SeqStmts::Flatten(
+      std::vector<StmtPtr>{a_k_assign, b_k_assign, first_or_acc, body_yield}, sp);
+
+  const bool pipeline = pipeline_stages >= 2 && num_full >= 2;
   std::vector<std::pair<std::string, std::any>> loop_attrs;
   if (pipeline) {
     loop_attrs.emplace_back(kPipelineStagesAttr, /*stages=*/2);
@@ -1720,17 +1733,17 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
     // not be multiplied by this enclosing stage count.
     loop_attrs.emplace_back(kPipelineGmToL1OnlyAttr, true);
   }
-  // The rolled loop runs over the remaining FULL strips [k, num_full*k). When K
+  // The physical stage ring runs over every FULL strip [0, num_full*k). When K
   // divides (tail==0) it binds out_var directly. When K is ragged (tail>0), the
   // loop binds an intermediate and a serial matmul_acc tail folds the last
   // [h,tail]@[tail,w] partial into it, producing out_var.
   const VarPtr loop_out =
       peel ? std::make_shared<Var>(base + "_kloop", first_call->GetType(), sp) : out_var;
-  auto for_stmt = std::make_shared<ForStmt>(ko, MakeIndex(k, sp), MakeIndex(num_full * k, sp), MakeIndex(k, sp),
+  auto for_stmt = std::make_shared<ForStmt>(ko, MakeIndex(0, sp), MakeIndex(num_full * k, sp), MakeIndex(k, sp),
                                             std::vector<IterArgPtr>{c_iter}, body, std::vector<VarPtr>{loop_out},
                                             sp, pipeline ? ForKind::Pipeline : ForKind::Sequential,
                                             std::move(loop_attrs));
-  result.push_back(for_stmt);
+  std::vector<StmtPtr> result{std::make_shared<AssignStmt>(acc_init, acc_init_call, sp), for_stmt};
   if (!peel) return result;
 
   // Ragged-K tail: matmul_acc the final [h,tail]@[tail,w] partial (at K-offset num_full*k)

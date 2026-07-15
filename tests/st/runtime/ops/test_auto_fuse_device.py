@@ -70,6 +70,7 @@ from pypto.runtime.runner import RunConfig
 # accumulated rsqrt rounding). FP32 softmax has no rsqrt and stays tight (default).
 _RSQRT_TOL = RunConfig(rtol=1e-2, atol=1e-2)   # fp32 norms calling HW rsqrt (accumulated ~5e-3)
 _FP16_TOL = RunConfig(rtol=1e-2, atol=1e-2)    # end-to-end fp16 (rounding floor)
+_CUBE_TOL = RunConfig(rtol=1e-4, atol=1e-4)  # fp32 MAD reassociation across K windows
 
 # Physical 8x72 tile: 72 FP32 cols = 288 bytes (32-aligned, assembles). Valid cols = 66 (264
 # bytes, NOT 32-aligned) — exactly the ragged reduced axis the emitter would pad. Poison the
@@ -1285,6 +1286,83 @@ class AutoFuseSweepCase(PTOTestCase):
 # param). Each is a full single-head attention block.
 ATTN_GRID = [(128, 64), (64, 64), (256, 64), (128, 32)]
 
+CUBE_M, CUBE_K, CUBE_N = 192, 64, 256
+
+
+class AutoFuseCubeMatmulKRingCase(PTOTestCase):
+    """Pure-cube control for the four-window GM->L1 stage ring."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_cube_matmul_k_ring_192x64x256"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [CUBE_M, CUBE_K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b", [CUBE_K, CUBE_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [CUBE_M, CUBE_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mm(
+                self,
+                a: pl.Tensor[[CUBE_M, CUBE_K], pl.FP32],
+                b: pl.Tensor[[CUBE_K, CUBE_N], pl.FP32],
+            ) -> pl.Tensor[[CUBE_M, CUBE_N], pl.FP32]:
+                out: pl.Tensor[[CUBE_M, CUBE_N], pl.FP32] = pl.matmul(a, b)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = tensors["a"] @ tensors["b"]
+
+
+class AutoFuseCubeEpilogueKRingCase(PTOTestCase):
+    """The silicon reproducer: four-window cube followed by a cut vector epilogue."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_cube_epilogue_k_ring_192x64x256"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [CUBE_M, CUBE_K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b", [CUBE_K, CUBE_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("bias", [1, CUBE_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [CUBE_M, CUBE_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def epilogue(
+                self,
+                a: pl.Tensor[[CUBE_M, CUBE_K], pl.FP32],
+                b: pl.Tensor[[CUBE_K, CUBE_N], pl.FP32],
+                bias: pl.Tensor[[1, CUBE_N], pl.FP32],
+            ) -> pl.Tensor[[CUBE_M, CUBE_N], pl.FP32]:
+                mm: pl.Tensor[[CUBE_M, CUBE_N], pl.FP32] = pl.matmul(a, b)
+                out: pl.Tensor[[CUBE_M, CUBE_N], pl.FP32] = pl.add(mm, bias)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = tensors["a"] @ tensors["b"] + tensors["bias"]
+
 
 class ModelAttentionSweepCase(PTOTestCase):
     """One attention block at (seq=S, head_dim=D). Exercises the matmul-ending output wiring
@@ -1520,6 +1598,28 @@ class TestAutoFuseDevice:
         assert result.passed, (
             f"AutoFuse attention [{S},{D}] mismatch on device (any actual=0.0?): {result.error}"
         )
+
+    # Keep the forced cube tests last: FORCE_PLAN is process-cached by design.
+    # Device closure runs this file with --forked, so every test still gets a
+    # fresh process; the two cases deliberately share the same exact force.
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_zz_autofuse_cube_matmul_k_ring(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "0")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_PLAN", "32,32,1,6,8")
+        result = test_runner.run(AutoFuseCubeMatmulKRingCase(platform=platform, config=_CUBE_TOL))
+        assert result.passed, f"AutoFuse forced cube K-ring mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    def test_zz_autofuse_cube_epilogue_k_ring(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "0")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_PLAN", "32,32,1,6,8")
+        result = test_runner.run(AutoFuseCubeEpilogueKRingCase(platform=platform, config=_CUBE_TOL))
+        assert result.passed, f"AutoFuse forced cube epilogue K-ring mismatch on device: {result.error}"
 
 
 if __name__ == "__main__":

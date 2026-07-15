@@ -397,8 +397,9 @@ accumulator survives the complete GM→L1 and L1→L0 K stream, then drains once
 but no Mat→Acc. AutoFuse now emits exactly this order. The outer loop is tagged GM→L1-only so its
 stage depth does not multiply the child L0 ping/pong buffers.
 
-**Exact-mode phase cost.** Uniform candidates sum serial first windows, rolled stage-2
-rooflines, serial K tails, exact ragged output variants, and one final drain. Boundary requests are
+**Exact-mode phase cost.** Uniform candidates put every full K window, including K=0, in one
+stage-2 ring and price its fill/steady-state/drain, followed by serial K tails, exact ragged output
+variants, and one final drain. Boundary requests are
 charged once per emitted output tile, including the known LHS reload across N subtiles. Split seed
 fill/store/tasks and its kernel-fill wave are explicit. The child L0 plan has the same phase
 decomposition. Its already-grounded geometry ordering is retained until a per-iteration PTO event

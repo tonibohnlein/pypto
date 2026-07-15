@@ -151,9 +151,10 @@ including one stream startup per item. It applies role-aware boundary-input mult
 overlap cube work, then the crossing write adds; the vector crossing read, pointwise chain, and
 final store add. Only complete successor items receive the two-stage cross-engine wavefront.
 Cube GM-to-L1 feed overlaps MAD only when the derived K window produces the emitted three-or-more
-chunk loop. Its cost is `serial init + rolled stage-2 roofline + serial ragged tail + blocking
-crossing push`; one- and two-window schedules therefore serialize load and compute exactly as the
-emitter does, even when K contains several fractals.
+chunk loop. All full chunks, including K=0, share that ring; its cost is `first feed + steady-state
+roofline + last child + serial ragged tail + blocking crossing push`. One- and two-window schedules
+therefore serialize load and compute exactly as the emitter does, even when K contains several
+fractals.
 
 The remaining model/emit gaps are:
 
