@@ -56,7 +56,7 @@ extracts, cube operations, and low-level drains; in exact mode it also fails on 
 | C5 | Every request owns its GM→L1 K loop | Use that request's contraction, chunk, rolled stage, and serial tail |
 | C6 | One complete output tile remains in L0C across all K windows | Nest output tiles outside the K-window loop; never spill a partial to Mat and reload it into Acc |
 | C7 | Exact mode prices a concrete shared-backend L0 plan; analytic mode prices the grounded surrogate | Always attach the output-residency intent; attach and validate detailed geometry only in exact mode; let `AutoTileMatmulL0` realize both |
-| C8 | Overlap is local to a concrete rolled loop | Pipeline only eligible rolled work; add init, tail, and final drain serially |
+| C8 | Overlap is local to one concrete full-window loop | Put K=0 and every rolled full window in the same eligible stage ring; add only its fill/drain, the ragged tail, and final output drain serially |
 | C9 | GM traffic follows the emitted output-tile loop | Charge repeated boundary-panel loads when another output tile reloads them; credit reuse only when represented |
 | C10 | Split-K writes `S` atomic partials | Emit one ordered, tiled zero seed and `S` disjoint K shares, or select `S=1` |
 | C11 | Cube accumulation dtype differs from storage dtype | Accumulate float inputs in FP32, then narrow once at the planned BF16/FP16 or GM drain |
@@ -119,8 +119,8 @@ In **exact mode**, the buildable uniform-grid cost is the sum of the emitted pha
 variant:
 
 ```text
-first GM window = GM feed + child L0 wall
-rolled windows  = serial fill/drain + (R-1) * max(GM feed, child L0 wall)
+full K windows  = first feed + max(first child, next feed)
+                  + (Q-2) * max(rolled child, next feed) + last child
 K tail          = GM feed + child L0 wall
 final drain     = Acc->Mat or Acc->GM
 ```
@@ -139,7 +139,8 @@ The emitter replays the same algorithm:
 
 - one SPMD body per uniform spatial/split work unit;
 - output/L0C tile outer, GM K-window inner;
-- serial first matmul, stage-2 rolled `matmul_acc`, serial K tail;
+- one stage-2 full-window ring whose K=0 arm is `matmul` and later arms are
+  `matmul_acc`, followed by a serial K tail;
 - FP32/INT32 tensor-level accumulator values, followed by one narrowing/store drain;
 - one L1 scratch per supported internal request and direct GM root assembly;
 - one tiled vector seed before split-K atomic root stores.

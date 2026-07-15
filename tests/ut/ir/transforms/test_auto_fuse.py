@@ -409,11 +409,12 @@ class TestAutoFuse:
         k-tile pipelines the full k-strips + one matmul_acc tail (ragged-K peel).
 
         ``CubeSchedulePlan`` separates the L1-resident window from the actual per-load chunk:
-        two chunks must fit together, and a serial first matmul initializes the carry before a
-        stage-2 rolled loop. When the load chunk does not divide the per-split contraction, one
-        serial ``matmul_acc`` tail folds in the remainder. Pinned to Ascend910B:
+        two chunks must fit together, and all full chunks share one stage-2 ring. The K=0
+        iteration initializes the carry with ``matmul``; later iterations use ``matmul_acc``.
+        When the load chunk does not divide the per-split contraction, one serial
+        ``matmul_acc`` tail folds in the remainder. Pinned to Ascend910B:
         ``[64,5040]@[5040,256]`` splits K into 7 slices of 720; its 336-wide L1 window selects a
-        160-wide load, emitted as serial first 160 + pipeline ``[160,640)`` + tail 80.
+        160-wide load, emitted as pipeline ``[0,640)`` + tail 80.
         ``[64,4096]@[4096,256]`` is the exact-division control (slice 512, load 128). Both must
         match ``torch.matmul``; the ragged path must not silently drop the tail contribution.
         """
@@ -445,18 +446,18 @@ class TestAutoFuse:
             )
             return body
 
-        # Ragged peel: window 336, actual load 160 -> first 160 + three rolled strips through
-        # 640 + an 80-wide tail. The carry is initialized by a real matmul, not a full-tile
-        # tensor.create in UB.
+        # Ragged peel: window 336, actual load 160 -> four full strips in one stage ring through
+        # 640 + an 80-wide tail. The loop-carried create is only an accumulator identity; K=0
+        # initializes it with a real matmul before any matmul_acc can observe it.
         peel_body = _fuse_body(64, 5040, 256)
-        assert "pl.pipeline(160, 640, 160" in peel_body
+        assert "pl.pipeline(0, 640, 160" in peel_body
         assert "pl.tensor.matmul_acc(" in peel_body  # loop accumulate + the peel tail fold
         assert "[64, 80]" in peel_body  # the ragged K-tail slice (720 - 4*160 = 80)
-        assert "tensor.create" not in peel_body
+        assert "_acc_init" in peel_body
 
-        # Exact-division control: first 128 + three rolled strips, no tail.
+        # Exact-division control: all four 128-wide strips share the ring, no tail.
         div_body = _fuse_body(64, 4096, 256)
-        assert "pl.pipeline(128, 512, 128" in div_body
+        assert "pl.pipeline(0, 512, 128" in div_body
         assert "_a_tl" not in div_body and "_b_tl" not in div_body
 
     def test_single_pointwise_tiles_across_vector_cores(self, ascend_backend):
@@ -2570,7 +2571,7 @@ class TestAutoFuse:
         script = textwrap.dedent(
             """
             import pypto.language as pl
-            from pypto import backend, ir
+            from pypto import backend, passes
             from pypto.backend import BackendType
             from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
@@ -2588,6 +2589,11 @@ class TestAutoFuse:
                     mm: pl.Tensor[[192, 256], pl.FP32] = pl.matmul(a, b)
                     out: pl.Tensor[[192, 256], pl.FP32] = pl.add(mm, bias)
                     return out
+
+            planned = passes.auto_fuse()(Prog)
+            planned_body = next(f for _, f in planned.functions.items() if f.name == "epilogue").as_python()
+            assert "pl.pipeline(0, 64, 16" in planned_body, planned_body
+            assert "_a_k0" not in planned_body and "_b_k0" not in planned_body, planned_body
 
             lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
             aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
