@@ -49,7 +49,7 @@ extracts, cube operations, and low-level drains; in exact mode it also fails on 
 
 | Ref | The model assumes | The emitter must build |
 | --- | ----------------- | ---------------------- |
-| C1 | `parts_m × parts_n × split_k` independent work units | Launch exactly that SPMD grid and preserve one owner per output element |
+| C1 | `parts_m × parts_n × split_k` independent work units | Launch exactly that SPMD grid; use disjoint ownership, except for the explicit split=1 idempotent clamped-overlap policy |
 | C2 | Only boundary tensors touch GM | Keep every supported intermediate in L1; never use GM as an implicit fused-chain buffer |
 | C3 | Consumers back-propagate exact row/column requests | Slice LHS as `[requested rows,K]` and RHS as `[K,requested cols]`, including produced operands on either side |
 | C4 | Peak L1 is the request-order pebble peak | Replay producer-before-consumer, retain through the priced last use, and allocate no unpriced scratch |
@@ -150,11 +150,12 @@ an unnecessary Mat→Vec move.
 
 ## 6. Current fidelity boundary
 
-The uniform buildable subset now has one model/plan/emit algorithm. Remaining work is:
+The buildable subset now has one model/plan/emit algorithm. Remaining work is:
 
-1. **Non-uniform grids.** A lone split=1 matmul retains the legacy ceil-and-clamp path. Ragged
-   split-K is rejected because overlapping edge regions would have multiple atomic owners.
-   Multi-matmul groups remain uniform-only. The legacy lone path still uses the older analytic cost.
+1. **Non-uniform grids.** A lone split=1 matmul has an explicit `ClampedOverlap` plan: every task
+   computes the maximum static region, clamps a ragged edge backward, and charges its repeated
+   reads, MADs, and drain. Ragged split-K is rejected because overlapping edge regions would have
+   multiple atomic owners. Multi-matmul groups remain uniform-only.
 2. **Shared boundary panels.** The current output-tile-outer emitter may reload a shared LHS for each
    N output tile (or RHS for each M tile). The hierarchical cost charges that multiplicity. Explicit
    panel retention can be added later only with a matching lifetime and traffic change.
@@ -180,6 +181,14 @@ mode partitions or falls back to standalone matmuls rather than silently emittin
 algorithm.
 
 Mixed cube/vector fusion is outside this contract.
+
+The latest silicon isolation preserves that boundary. At PyPTO `8a97865a`, the forced pure-cube
+`[192,64]@[64,256]` kernel (`32,32,1,6,8`: 48 logical AIC blocks and four GM→L1 K windows) is
+numerically correct on 910B2. Adding a separately launched AIV bias epilogue still corrupts the
+result, including with 12 AIC blocks or a single K window. Runtime DFX proves that the two tasks use
+the same allocation and that the covered AIC→AIV tensor dependency is present with the expected
+`INOUT`/`INPUT` tags. That residual is tracked as a cross-engine final FIXPIPE/GM-visibility issue;
+it does not block cube-only cost, schedule, or ranking validation.
 
 ## 7. Validation ladder
 
