@@ -411,8 +411,8 @@ BF16/FP16 Mat, matching PTO's fused-chain kernel; roots narrow/store to their de
 Same-type FP32 internal L1 handoff is not an A2/A3 instruction, so an explicitly FP32 chain is
 partitioned into standalone kernels. Direct Mat→GM store is legal and no longer detours through Vec.
 
-**Host validation.** PTO Fusebox reports 479 passing checks with the same six documented baseline
-failures; the full AutoFuse file reports 53 passing tests. Compiler coverage includes
+**Host validation.** PTO Fusebox reports 483 passing checks with the same six documented baseline
+failures; the full AutoFuse file reports 54 passing tests. Compiler coverage includes
 natural/forced lone matmuls, BF16 recursive trees/fan-out/deep
 chains, FP32-chain decline, split seed, ragged K, multi-window output residency, a 192 KiB internal
 region, descriptor consumption, Torch numerics, and PTOAS-backed full lowering. The former strict
@@ -427,7 +427,8 @@ not a cube-only schedule blocker. Cube-only correctness and ranking work proceed
 **Remaining gaps:**
 
 1. Non-uniform buildable cost/emission: lone split=1 now uses an explicit `ClampedOverlap` plan and
-   prices every maximum-shape task; ragged split-K and unequal multi-op grids decline.
+   prices every maximum-shape task; ragged split-K, sub-fractal valid M/N edges, and unequal
+   multi-op grids decline. Analytic and exact compiler modes share that buildability gate.
 2. Optional retained boundary panels: the current model faithfully charges reload per output tile;
    introducing reuse requires an explicit lifetime and matching emitter.
 3. Ground a per-baseK synchronization/event term before allowing phase composition to change the

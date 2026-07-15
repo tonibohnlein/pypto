@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <any>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -3836,6 +3837,16 @@ ExprPtr CubeRegionAxisOffset(::CubeAxisBinding binding, int64_t extent, int64_t 
   INTERNAL_UNREACHABLE << "Internal error: unknown CubeAxisBinding";
 }
 
+const char* CubeSpatialPolicyName(::CubeSpatialPolicy policy) {
+  switch (policy) {
+    case ::CubeSpatialPolicy::Uniform:
+      return "uniform";
+    case ::CubeSpatialPolicy::ClampedOverlap:
+      return "clamped_overlap";
+  }
+  INTERNAL_UNREACHABLE << "Internal error: unknown cube spatial policy";
+}
+
 struct ValidatedCubeGroup {
   std::unordered_map<size_t, AssignStmtPtr> op_assigns;
   int64_t parts_m = 0;
@@ -3890,10 +3901,9 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
   validated.region_h = root_schedule->output.height;
   validated.region_w = root_schedule->output.width;
   validated.clamped_overlap = plan.spatial_policy == ::CubeSpatialPolicy::ClampedOverlap;
-  const bool uniform_grid = plan.m_partition.num_big == 0 && plan.n_partition.num_big == 0;
   const bool spatial_policy_valid =
-      (plan.spatial_policy == ::CubeSpatialPolicy::Uniform && uniform_grid) ||
-      (validated.clamped_overlap && !uniform_grid && plan.matmuls.size() == 1 && plan.split_k == 1);
+      plan.spatial_policy == ::CubeSpatialPolicy::Uniform ||
+      (validated.clamped_overlap && plan.matmuls.size() == 1 && plan.split_k == 1);
   if (validated.parts_m <= 0 || validated.parts_n <= 0 || validated.region_h <= 0 ||
       validated.region_w <= 0 || !spatial_policy_valid ||
       plan.spatial_tiles != validated.parts_m * validated.parts_n || plan.split_k != tile.split ||
@@ -4298,7 +4308,8 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
 
   result.push_back(SpmdWrap(work_index, std::move(body), MakeIndex(plan.work_units, sp), name, sp));
   LOG_INFO << "AutoFuse[cube-plan]: group '" << name << "' emitted " << plan.matmuls.size()
-           << " request instance(s), grid=" << parts_m << "x" << parts_n << "x" << plan.split_k;
+           << " request instance(s), grid=" << parts_m << "x" << parts_n << "x" << plan.split_k
+           << " spatial_policy=" << CubeSpatialPolicyName(plan.spatial_policy);
   return result;
 }
 
@@ -5433,12 +5444,15 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
         bool forced_here = false;
         std::set<std::tuple<int64_t, int64_t, size_t, int64_t, int64_t>> seen_plans;  // dedup identical keys
         for (const auto& [pc, pr] : sol.step(s).subgraph.enumerate_plans()) {
-          if (dump_plans &&
-              seen_plans.emplace(pc.w, pc.h, pr.parallel_split, pc.parts_m, pc.parts_n).second)
+          const bool candidate_feasible = pr.feasible && std::isfinite(pr.latency);
+          if (dump_plans && candidate_feasible &&
+              seen_plans.emplace(pc.w, pc.h, pr.parallel_split, pc.parts_m, pc.parts_n).second) {
             LOG_INFO << "AutoFuse[" << func->name_ << "]: PLAN group=" << s << " w=" << pc.w << " h="
                      << pc.h << " split=" << pr.parallel_split << " parts_m=" << pc.parts_m
                      << " parts_n=" << pc.parts_n << " cost=" << pr.latency;
-          if (force_env != nullptr && !forced_here && (fg < 0 || static_cast<long>(s) == fg) &&
+          }
+          if (force_env != nullptr && candidate_feasible && !forced_here &&
+              (fg < 0 || static_cast<long>(s) == fg) &&
               (fw < 0 || pc.w == fw) && (fh < 0 || pc.h == fh) &&
               (fs < 0 || static_cast<long>(pr.parallel_split) == fs) &&
               (fpm < 0 || pc.parts_m == fpm) && (fpn < 0 || pc.parts_n == fpn)) {
@@ -5463,9 +5477,14 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                               pr.parallel_split, pc.parts_m, pc.parts_n,
                               forced_stream, forced_cube, forced_mixed);
             forced_here = true;
+            const std::string cube_policy =
+                forced_cube.feasible
+                    ? " spatial_policy=" +
+                          std::string(CubeSpatialPolicyName(forced_cube.spatial_policy))
+                    : "";
             LOG_INFO << "AutoFuse[" << func->name_ << "]: FORCED group=" << s << " w=" << pc.w << " h="
                      << pc.h << " split=" << pr.parallel_split << " parts_m=" << pc.parts_m
-                     << " parts_n=" << pc.parts_n << " cost=" << pr.latency;
+                     << " parts_n=" << pc.parts_n << " cost=" << pr.latency << cube_policy;
           }
         }
         if (force_env != nullptr && !forced_here && (fg < 0 || static_cast<long>(s) == fg))
