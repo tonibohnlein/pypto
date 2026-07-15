@@ -13,6 +13,7 @@
 #define PYPTO_IR_TRANSFORMS_UTILS_L0_TILE_CHOOSER_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace pypto {
@@ -35,6 +36,8 @@ namespace utils {
  *     (dbB = 1), A streams (dbA = 2).
  */
 enum class Stationarity { kOutputStationary, kAStationary, kBStationary };
+
+enum class L0PlanOutputTarget { kAcc = 0, kGM = 1, kL1 = 2 };
 
 /**
  * @brief Inputs to ChooseL0Tile.
@@ -91,6 +94,11 @@ struct L0TileConfig {
   // Whether the matmul reads its accumulator (C = beta * C + A @ B). When
   // true, C traffic doubles in the cost estimate.
   bool c_read = false;
+
+  // A planned child of a GM->L1 K-window loop uses kAcc: its accumulator
+  // remains in L0C and a separate final drain follows the loop. Standalone
+  // matmuls keep the kGM default.
+  L0PlanOutputTarget output_target = L0PlanOutputTarget::kGM;
 
   // Cost-model parameters (filled from
   // BackendHandler::GetL0CostModel). Bandwidths are in BYTES PER CYCLE so the
@@ -204,6 +212,61 @@ struct L0TileResult {
   // tile but landed on a legal fallback (e.g., M < min_m so we padded up).
   std::string perf_hint;
 };
+
+/**
+ * @brief Versioned compiler-internal handoff from AutoFuse to AutoTileMatmulL0.
+ *
+ * In exact/co-optimized mode AutoFuse owns the GM->L1 schedule and records one
+ * of these on every concrete tensor.matmul/tensor.matmul_acc phase.
+ * ConvertTensorToTileOps preserves the record on the corresponding tile call.
+ * AutoTileMatmulL0 re-runs ChooseL0Tile against the active backend, verifies
+ * the result byte-for-byte, and is the sole pass that realizes the L0 loops.
+ * Analytic mode records only kL0MatmulOutputTargetAttr below.
+ *
+ * The record is encoded as a string in Call::attrs_: string is already a
+ * first-class structurally-hashed/equal IR attribute type, so this metadata
+ * remains stable through ordinary IR cloning without extending std::any's
+ * reflection surface.
+ */
+inline constexpr const char* kL0MatmulPlanAttr = "__autofuse_l0_matmul_plan";
+
+// Minimal hierarchy handoff used by both cube-cost modes. AutoFuse owns the
+// outer GM->L1 K-window loop, so it must tell AutoTileMatmulL0 whether one
+// child keeps its result in Acc, publishes it to L1, or drains it to GM. This
+// is a semantic residency requirement, not an L0 tiling decision. The detailed
+// kL0MatmulPlanAttr above is added only by exact/co-optimized costing.
+inline constexpr const char* kL0MatmulOutputTargetAttr = "__autofuse_l0_output_target";
+
+struct L0MatmulPlanRecord {
+  static constexpr int64_t kVersion = 3;
+
+  int64_t source_m = 0;
+  int64_t source_n = 0;
+  int64_t source_k = 0;
+  int64_t bytes_a = 0;
+  int64_t bytes_b = 0;
+  int64_t bytes_c = 0;
+  bool accumulator_read = false;
+  L0PlanOutputTarget output_target = L0PlanOutputTarget::kGM;
+
+  int64_t tile_m = 0;
+  int64_t tile_n = 0;
+  int64_t tile_k = 0;
+  Stationarity stationarity = Stationarity::kOutputStationary;
+  bool output_stationary_holds_a = true;
+  int64_t buffer_depth_a = 2;
+  int64_t buffer_depth_b = 2;
+  int64_t buffer_depth_c = 1;
+  int64_t k_full_chunks = 0;
+  int64_t k_tail = 0;
+  int64_t k_pipeline_stages = 1;
+  int64_t estimated_traffic_bytes = 0;
+  int64_t estimated_cost_cycles = 0;
+  int64_t padded_compute_volume = 0;
+};
+
+std::string EncodeL0MatmulPlanRecord(const L0MatmulPlanRecord& record);
+std::optional<L0MatmulPlanRecord> DecodeL0MatmulPlanRecord(const std::string& encoded);
 
 /**
  * @brief Pick the minimum-wall L0 GEMM design point under the roofline model.

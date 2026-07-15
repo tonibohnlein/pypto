@@ -826,7 +826,7 @@ REGISTER_OP("tile.load")
 
 REGISTER_OP("tile.store")
     .set_op_category("TileOp")
-    .set_description("Copy data from unified buffer (tile) to tensor")
+    .set_description("Copy data from an on-chip tile to tensor")
     .add_argument("tile", "Source tile (TileType)")
     .add_argument("offsets", "Offsets in each dimension (TupleType of ScalarType)")
     .add_argument("output_tensor", "Output tensor (TensorType)")
@@ -834,7 +834,11 @@ REGISTER_OP("tile.store")
                   "Optional ND partition shape (TupleType). "
                   "Injected by FlattenTileNdTo2D for ND tensors.")
     .set_attr<int>("atomic")
-    .set_input_memory(0, {MemorySpace::Vec, MemorySpace::Acc})
+    // PTO TSTORE has direct Vec->GM, Acc->GM, and Mat(L1)->GM routes.  Keeping
+    // Mat here is important for hierarchical cube schedules: a multi-window
+    // matmul may carry its accumulator in L1 and drain it without involving an
+    // AIV core or an artificial Mat->Vec move.
+    .set_input_memory(0, {MemorySpace::Vec, MemorySpace::Acc, MemorySpace::Mat})
     .set_output_reuses_input(2)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {

@@ -652,6 +652,85 @@ class TestAccumulatorMembership:
             f"pipelined operands must carry distinct-stage membership, got {stages}"
         )
 
+    def test_gm_l1_pipeline_does_not_multiply_nested_l0_buffers(self):
+        """The AutoFuse GM->L1 pipeline and AutoTile L1->L0 pipeline are
+        independent two-slot rings, not a Cartesian four-slot L0 ring.
+
+        ``pipeline_gm_to_l1_only`` keeps the outer membership on Mat loads but
+        deliberately does not append it to nested Left/Right/Acc/Bias tiles.
+        The nested L0 operand moves therefore carry exactly one membership
+        pair (their own stage), while the cube accumulator remains untagged.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore, strict_ssa=True)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 32], pl.BF16],
+                b: pl.Tensor[[32, 32], pl.BF16],
+                out: pl.Out[pl.Tensor[[64, 32], pl.FP32]],
+            ) -> pl.Tensor[[64, 32], pl.FP32]:
+                for ko in pl.pipeline(
+                    0,
+                    64,
+                    32,
+                    stage=2,
+                    attrs={"pipeline_gm_to_l1_only": True},
+                ):
+                    am: pl.Tile[[32, 32], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                        a, [ko, 0], [32, 32], target_memory=pl.Mem.Mat
+                    )
+                    bm: pl.Tile[[32, 32], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                        b, [0, 0], [32, 32], target_memory=pl.Mem.Mat
+                    )
+                    for _ki in pl.pipeline(0, 2, 1, stage=2):
+                        lft: pl.Tile[[32, 32], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                            am, target_memory=pl.Mem.Left
+                        )
+                        rgt: pl.Tile[[32, 32], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                            bm, target_memory=pl.Mem.Right
+                        )
+                        _c: pl.Tile[[32, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lft, rgt)
+                return out
+
+        After = passes.lower_pipeline_loops()(Before)
+        lines = ir.python_print(After).splitlines()
+
+        mat_loads = [ln for ln in lines if "Mem.Mat" in ln and "tile.load" in ln]
+        assert len(mat_loads) == 4, f"expected 2 operands x 2 outer stages, got {mat_loads}"
+        mat_memberships = [
+            m.group(1)
+            for ln in mat_loads
+            if (m := re.search(r'pipeline_membership":\s*"([^"]*)"', ln))
+        ]
+        assert len(mat_memberships) == len(mat_loads)
+        assert all(";" not in membership for membership in mat_memberships)
+        outer_groups = {membership.split(":", 1)[0] for membership in mat_memberships}
+        assert len(outer_groups) == 1, f"Mat loads must share one outer pipeline group: {mat_memberships}"
+
+        l0_moves = [ln for ln in lines if "tile.move" in ln and ("Mem.Left" in ln or "Mem.Right" in ln)]
+        assert len(l0_moves) == 8, f"expected 2 operands x 2 inner x 2 outer clones, got {l0_moves}"
+        l0_memberships = [
+            m.group(1)
+            for ln in l0_moves
+            if (m := re.search(r'pipeline_membership":\s*"([^"]*)"', ln))
+        ]
+        assert len(l0_memberships) == len(l0_moves)
+        assert all(";" not in membership for membership in l0_memberships), (
+            "outer GM->L1 membership must not multiply the nested L0 ring: "
+            f"{l0_memberships}"
+        )
+        l0_groups = {membership.split(":", 1)[0] for membership in l0_memberships}
+        assert len(l0_groups) == 1, f"L0 moves must share one nested pipeline group: {l0_memberships}"
+        assert l0_groups.isdisjoint(outer_groups), (
+            f"GM/L1 and L1/L0 must be independent pipeline groups: outer={outer_groups}, inner={l0_groups}"
+        )
+
+        acc_matmuls = [ln for ln in lines if "Mem.Acc" in ln and "tile.matmul" in ln]
+        assert len(acc_matmuls) == 4, f"expected one MAD per inner/outer stage pair, got {acc_matmuls}"
+        assert all("pipeline_membership" not in ln for ln in acc_matmuls)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

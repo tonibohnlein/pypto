@@ -117,13 +117,8 @@ class TestInferTileMemorySpaceKwargOps:
                 x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
                     x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
                 )
-                x_tile_V: pl.Tile[
-                    [16, 128],
-                    pl.BF16,
-                    pl.MemorySpace.Vec,
-                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
-                ] = pl.move(x_tile, target_memory=pl.MemorySpace.Vec)
-                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(x_tile_V, [0, 0], out_0)
+                # PTO TSTORE accepts Mat directly; no Mat->Vec copy is needed.
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(x_tile, [0, 0], out_0)
                 return out_0
 
             @pl.function
@@ -971,14 +966,8 @@ class TestInferTileMemorySpaceInheritOps:
                 # Mat-implicit reshape result (col_major / row_major) — printer elides.
                 reshaped: pl.Tile[[2048], pl.BF16, pl.MemorySpace.Mat] = pl.tile.reshape(x_tile, [2048])
                 flat: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.tile.reshape(reshaped, [16, 128])
-                # Move preserves Mat layout into Vec — non-Vec-implicit, so surfaced.
-                flat_V: pl.Tile[
-                    [16, 128],
-                    pl.BF16,
-                    pl.MemorySpace.Vec,
-                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
-                ] = pl.move(flat, target_memory=pl.MemorySpace.Vec)
-                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(flat_V, [0, 0], out_0)
+                # PTO TSTORE accepts the inherited Mat value directly.
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(flat, [0, 0], out_0)
                 return out_0
 
             @pl.function
@@ -1031,16 +1020,8 @@ class TestInferTileMemorySpaceInheritOps:
                 sliced: pl.Tile[[16, 64], pl.BF16, pl.MemorySpace.Mat] = pl.tile.slice(
                     x_tile, [16, 64], [0, 0]
                 )
-                # The move into Vec preserves the slice's Mat-style layout
-                # (col_major / row_major) on the destination buffer; the printer
-                # surfaces this because it differs from the Vec-implicit defaults.
-                sliced_V: pl.Tile[
-                    [16, 64],
-                    pl.BF16,
-                    pl.MemorySpace.Vec,
-                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
-                ] = pl.move(sliced, target_memory=pl.MemorySpace.Vec)
-                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.store(sliced_V, [0, 0], out_0)
+                # PTO TSTORE accepts the inherited Mat slice directly.
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.store(sliced, [0, 0], out_0)
                 return out_0
 
             @pl.function
@@ -1093,14 +1074,8 @@ class TestInferTileMemorySpaceInheritOps:
                     x_tile, [16, 64], [0, 0]
                 )
                 reshaped: pl.Tile[[1024], pl.BF16, pl.MemorySpace.Mat] = pl.tile.reshape(sliced, [1024])
-                # Move preserves Mat layout into Vec — non-Vec-implicit, so surfaced.
-                reshaped_V: pl.Tile[
-                    [1024],
-                    pl.BF16,
-                    pl.MemorySpace.Vec,
-                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
-                ] = pl.move(reshaped, target_memory=pl.MemorySpace.Vec)
-                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.store(reshaped_V, [0, 0], out_0)
+                # PTO TSTORE accepts the inherited Mat view directly.
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.store(reshaped, [0, 0], out_0)
                 return out_0
 
             @pl.function
@@ -1565,6 +1540,52 @@ class TestAutoMoveInsertion:
 
         After = passes.infer_tile_memory_space()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_store_no_move_for_mat(self):
+        """tile.store uses the direct PTO Mat/L1-to-GM path."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                x_mat: pl.Tile[[64, 128], pl.FP32] = pl.load(
+                    x, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat
+                )
+                out_0: pl.Tensor[[64, 128], pl.FP32] = pl.store(x_mat, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64, 128], pl.FP32]) -> pl.Tensor[[64, 128], pl.FP32]:
+                out_0: pl.Tensor[[64, 128], pl.FP32] = pl.create_tensor([64, 128], dtype=pl.FP32)
+                y: pl.Tensor[[64, 128], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                x_mat: pl.Tile[[64, 128], pl.FP32, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat
+                )
+                out_0: pl.Tensor[[64, 128], pl.FP32] = pl.store(x_mat, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64, 128], pl.FP32]) -> pl.Tensor[[64, 128], pl.FP32]:
+                out_0: pl.Tensor[[64, 128], pl.FP32] = pl.create_tensor([64, 128], dtype=pl.FP32)
+                y: pl.Tensor[[64, 128], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        after = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(after, Expected)
 
 
 class TestInferTileMemorySpaceSSAAlias:

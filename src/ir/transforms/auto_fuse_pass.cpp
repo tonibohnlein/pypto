@@ -62,6 +62,7 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/l0_tile_chooser.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/stmt_dependency_analysis.h"
 #include "pypto/ir/type.h"
@@ -69,6 +70,7 @@
 // PTO Fusebox graph scheduler (3rdparty/pto-fusebox), linked as `solver_lib`.
 #include "core/dag.h"
 #include "core/flat_set.h"
+#include "core/l0_matmul_plan.h"
 #include "core/subgraph.h"
 #include "core/types.h"
 #include "partition/partition.h"
@@ -87,9 +89,9 @@ namespace {
 constexpr int64_t kFastMemoryCapacity = 1LL << 30;  // single-pool capacity hint
 constexpr int kNumCubeCores = 24;               // AIC cores (matmul)
 constexpr int kNumVectorCores = 48;             // AIV cores (pointwise / reduction)
-constexpr int64_t kL1Capacity = 512 * 1024;     // per-cube L1/Mat operand pool
-constexpr int64_t kCubeCapacity = 128 * 1024;   // per-cube L0c accumulator
-constexpr int64_t kVecCapacity = 192 * 1024;    // per-vector UB
+constexpr int64_t kL1Capacity = 512LL * 1024;     // per-cube L1/Mat operand pool
+constexpr int64_t kCubeCapacity = 128LL * 1024;   // per-cube L0c accumulator
+constexpr int64_t kVecCapacity = 192LL * 1024;    // per-vector UB
 constexpr int64_t kCubeComputeCost = 1;         // grounded per-repeat multiplier (cyc applies fp32 2x)
 constexpr int64_t kKernelFillCost = 10000;      // per-kernel pipeline fill (cycles)
 // Per-TASK host launch overhead, in the MODEL's cost-cycle scale (C3). The device grounded the
@@ -110,6 +112,7 @@ constexpr int64_t kPerTaskOverheadCycles = 64;
 constexpr double kCubeFreqHz = 1.85e9;          // core clock (A2A3)
 constexpr double kBwGmL1   = 135.0;             // GM->L1 operand reload
 constexpr double kBwL0cGm  = 70.0;              // L0C->GM output store
+constexpr double kBwL0cL1 = 128.0;              // L0C->L1 on-chip FIXPIPE drain
 constexpr double kBwL1L0a  = 441.0;             // L1->L0A lhs extract
 constexpr double kBwL1L0b  = 220.5;             // L1->L0B rhs extract
 constexpr double kBwGmUb   = 100.9;             // GM->UB vector load
@@ -364,8 +367,9 @@ double VecOpFixed(const CallPtr& call) {
   if (ends(".mul") || ends(".muls")) return 25.0;        // vmul / vmuls
   if (ends(".rsqrt") || ends(".sqrt")) return 24.0;      // vrsqrt / vsqrt
   if (ends(".add") || ends(".adds") || ends(".sub") || ends(".subs") || ends(".neg") ||
-      ends(".max") || ends(".min") || ends(".maximum") || ends(".minimum"))
+      ends(".max") || ends(".min") || ends(".maximum") || ends(".minimum")) {
     return 24.0;                                          // vadd / vsub / vmax / vmin family
+  }
   return 0.0;                                             // -> vec_op_head + vec_op_tail
 }
 
@@ -484,6 +488,17 @@ std::pair<::VectorPrimitiveFamily, ::VectorOpGeometry> ClassifyVectorOpSemantics
 // C3 per-task overhead on it (charge it only when the streaming emit that realizes fewer-tile
 // plans is active).
 static bool GenericEmitEnabled();
+
+// Mixed cube/vector fusion is a separate bake gate.  It requires the generic
+// tensor scheduler but remains opt-in until the C->V FIFO path is closed on
+// silicon.
+static bool MixedEmitEnabled();
+
+// Exact nested L0 costing is deliberately independent of generic GM/L1
+// emission. The analytic mode remains the default; exact mode is an opt-in
+// compile-time/experimentation policy until its silicon benefit justifies the
+// additional candidate-evaluation cost.
+static bool ExactL0CostEnabled();
 
 // Defined below; forward-declared so ProblemBuilder registers exact P4 algorithm descriptors only
 // when the corresponding online emitter is active.
@@ -810,6 +825,45 @@ class ProblemBuilder {
     problem.hbm_aggregate_gibps = kHbmAggregateGiBps;
     problem.l0_tile_m = kL0TileM;
     problem.l0_tile_n = kL0TileN;
+    // The cube scheduler and AutoTileMatmulL0 share one lower-level planner.
+    // Only backend/memory-planner facts live here; each cube request supplies
+    // its concrete M/N/K, operand widths, accumulator-read flag, and output
+    // target when deriving its child L0MatmulPlan.
+    {
+      const auto* pctx = PassContext::Current();
+      const auto* handler = pctx ? pctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+      INTERNAL_CHECK(handler)
+          << "Internal error: BackendHandler is null while configuring AutoFuse L0 planner";
+      auto& l0 = problem.l0_matmul_config;
+      l0.l0a_bytes = handler->GetL0aCapacityBytes();
+      l0.l0b_bytes = handler->GetL0bCapacityBytes();
+      l0.l0c_bytes = handler->GetL0cCapacityBytes();
+      l0.align_m = handler->GetL0FractalAlignment();
+      l0.align_n = handler->GetL0FractalAlignment();
+      l0.align_k = handler->GetL0FractalAlignment();
+      l0.min_m = handler->GetMinL0TileDim();
+      l0.min_n = handler->GetMinL0TileDim();
+      l0.min_k = handler->GetMinL0TileDim();
+      const auto cost_model = handler->GetL0CostModel();
+      l0.bw_l0a = cost_model.bw_l0a;
+      l0.bw_l0b = cost_model.bw_l0b;
+      l0.bw_drain = cost_model.bw_drain;
+      l0.bw_l0c_l1 = kBwL0cL1 * static_cast<double>(1ULL << 30) / kCubeFreqHz;
+      l0.drain_fixed_cycles = cost_model.drain_fixed_cycles;
+      l0.drain_row_cycles = cost_model.drain_row_cycles;
+      l0.drain_penalty_cycles = cost_model.drain_penalty_cycles;
+      l0.drain_c0_bytes = cost_model.drain_c0_bytes;
+      l0.mad_head_cycles = cost_model.mad_head_cycles;
+      l0.mad_k_fractal_bytes = cost_model.mad_k_fractal_bytes;
+      l0.allow_a_stationary = true;
+      l0.allow_b_stationary = true;
+      l0.allow_double_buffer_c =
+          pctx &&
+          (pctx->GetMemoryPlanner() == MemoryPlanner::PtoAS ||
+           (pctx->GetMemoryPlanner() == MemoryPlanner::PyPTO && pctx->GetEnablePyptoL0cDoubleBuffer()));
+      l0.allow_padding = false;
+      l0.allow_k_boundary = true;
+    }
     problem.vec_reg_bytes = kVecRegBytes;
     // DMA-block granule (bytes) from the backend handler — keeps the cost model's tile-footprint
     // padding (vector_peak_ub) in lockstep with the emit's AlignUp tile allocation so a thin free
@@ -831,11 +885,14 @@ class ProblemBuilder {
     // round trip. Keep deeper mixed pipelines analytic-only until their FIFO
     // schedule and emit are implemented.
     problem.allow_model_ahead_mixed_multi_roundtrip = false;
+    problem.fuse_cube_vector = GenericEmitEnabled() && MixedEmitEnabled();
+    problem.require_buildable_mixed = problem.fuse_cube_vector;
     // Multi-matmul CubeSchedulePlan emission currently requires one static
     // region shape per SPMD body. Keep analytic solver users unrestricted, but
     // do not let the compiler select a balanced non-uniform DAG grid that it
     // would have to materialize as standalone fallback kernels.
     problem.require_uniform_cube_dag_grid = GenericEmitEnabled();
+    problem.use_hierarchical_cube_cost = ExactL0CostEnabled();
 
     // 1. In AND InOut params are graph-input tensors: both are READ by the body. An InOut param
     //    is also written, but its updated value is a SEPARATE SSA tensor produced by a compute op
@@ -888,6 +945,17 @@ class ProblemBuilder {
     // 4. Second pass: emit ops. Inputs = predecessor-op outputs (from the
     //    dependency graph) + In-param args. Out-buffers/allocs fall out because
     //    they are never registered as tensors.
+    bool has_matmul_call = false;
+    bool has_vector_call = false;
+    for (const auto& [unused_stmt, candidate] : ops) {
+      (void)unused_stmt;
+      if (DescribeVectorOp(candidate).type == ::OpType::MatMul) {
+        has_matmul_call = true;
+      } else {
+        has_vector_call = true;
+      }
+    }
+    const bool mixed_function = MixedEmitEnabled() && has_matmul_call && has_vector_call;
     for (const auto& entry : ops) {
       const Stmt* stmt = entry.first;
       const CallPtr& call = entry.second;
@@ -895,6 +963,37 @@ class ProblemBuilder {
       const VectorOpDescriptor descriptor = DescribeVectorOp(call);
       sop.type = descriptor.type;
       sop.vector_capability = descriptor.capability;
+      if (sop.type == ::OpType::MatMul) {
+        const bool default_semantics =
+            !call->GetKwarg<bool>("a_trans", false) &&
+            !call->GetKwarg<bool>("b_trans", false) &&
+            !call->GetKwarg<bool>("c_matrix_nz", false);
+        const auto lhs_type = call->args_.empty()
+                                  ? nullptr
+                                  : AsTensorTypeLike(call->args_[0]->GetType());
+        const auto rhs_type = call->args_.size() < 2
+                                  ? nullptr
+                                  : AsTensorTypeLike(call->args_[1]->GetType());
+        const bool same_operands = lhs_type && rhs_type &&
+                                   lhs_type->dtype_ == rhs_type->dtype_;
+        const bool pto_cube_dtype = same_operands &&
+                                    (lhs_type->dtype_ == DataType::FP32 ||
+                                     lhs_type->dtype_ == DataType::FP16 ||
+                                     lhs_type->dtype_ == DataType::BF16 ||
+                                     lhs_type->dtype_ == DataType::INT8);
+        const bool compiler_mixed_dtype = same_operands &&
+                                          (lhs_type->dtype_ == DataType::FP32 ||
+                                           lhs_type->dtype_ == DataType::FP16 ||
+                                           lhs_type->dtype_ == DataType::BF16);
+        sop.mixed_emit_compatible = default_semantics && compiler_mixed_dtype;
+        // The existing homogeneous tiler also assumes default orientation.
+        // Its tile lowering also requires equal PTO-supported operand dtypes.
+        // While mixed emission is explicitly requested, leave an unsafe source
+        // function wholly untouched rather than rejecting the mixed group and
+        // then crashing in the standalone fallback. INT8 is fallback-safe but
+        // still not admitted to mixed v0 (no integer vector-family table yet).
+        if (mixed_function && (!default_semantics || !pto_cube_dtype)) declined_ = true;
+      }
       sop.vec_slope = VecOpSlope(call);  // vdiv=4 / vrsqrt=1 override the elementwise default
       sop.vec_fixed = VecOpFixed(call);  // per-op head+tail (vadd 24 / vexp 31 / vdiv 30 / ...)
       // Inputs in OPERAND ORDER (call->args_). The solver derives M/N/K
@@ -924,6 +1023,17 @@ class ProblemBuilder {
       sop.outputs.push_back(out);
       std::tie(sop.vector_primitive, sop.vector_geometry) =
           ClassifyVectorOpSemantics(call, sop, problem);
+      if (mixed_function && sop.type == ::OpType::Pointwise &&
+          sop.vector_capability == ::VectorOpCapability::Elementwise) {
+        const ::DType output_dtype = problem.tensors[out].dtype;
+        for (size_t input : sop.inputs) {
+          if (problem.tensors[input].dtype != output_dtype) {
+            // The emitted PTO primitive has no implicit tensor promotion. A
+            // cut would reach the same tile op, so fail closed at the source.
+            declined_ = true;
+          }
+        }
+      }
       problem.ops.push_back(std::move(sop));
       op_labels.push_back(call->op_->name_);
       op_stmts.push_back(stmt);
@@ -995,7 +1105,11 @@ class ProblemBuilder {
       dtype = tt->dtype_;
     }
     const size_t idx = problem.tensors.size();
-    problem.tensors.push_back(::Tensor{w, h, MapSolverDType(dtype)});
+    ::Tensor tensor;
+    tensor.width = w;
+    tensor.height = h;
+    tensor.dtype = MapSolverDType(dtype);
+    problem.tensors.push_back(tensor);
     tensor_index_[raw] = idx;
     return idx;
   }
@@ -1061,7 +1175,7 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
   }
   f << "],\n  \"dtypes\": [";
   for (size_t i = 0; i < nt; ++i) {
-    const char* s = "FP32";
+    const char* s = nullptr;
     switch (p.tensors[i].dtype) {
       case ::DType::FP16:  s = "FP16";  break;
       case ::DType::BF16:  s = "BF16";  break;
@@ -1155,21 +1269,47 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
   // re-loads (io.cpp) into the SAME grounded cost path the pass solved with.
   f << ",\n  \"num_cube_cores\": " << p.num_cube_cores << ",\n  \"num_vector_cores\": " << p.num_vector_cores
     << ",\n  \"fuse_cube_vector\": " << (p.fuse_cube_vector ? "true" : "false")
+    << ",\n  \"require_buildable_mixed\": "
+    << (p.require_buildable_mixed ? "true" : "false")
     << ",\n  \"allow_model_ahead_mixed_multi_roundtrip\": "
     << (p.allow_model_ahead_mixed_multi_roundtrip ? "true" : "false")
     << ",\n  \"cube_capacity\": " << p.cube_capacity << ",\n  \"vec_capacity\": " << p.vec_capacity
     << ",\n  \"l1_capacity\": " << p.l1_capacity << ",\n  \"cube_compute_cost\": " << p.cube_compute_cost
     << ",\n  \"kernel_fill_cost\": " << p.kernel_fill_cost
     << ",\n  \"per_task_overhead_cycles\": " << p.per_task_overhead_cycles
-    << ",\n  \"cube_freq_hz\": " << p.cube_freq_hz
-    << ",\n  \"bw_gm_l1\": " << p.bw_gm_l1 << ",\n  \"bw_l0c_gm\": " << p.bw_l0c_gm
-    << ",\n  \"bw_l1_l0a\": " << p.bw_l1_l0a << ",\n  \"bw_l1_l0b\": " << p.bw_l1_l0b
-    << ",\n  \"bw_gm_ub\": " << p.bw_gm_ub << ",\n  \"bw_ub_gm\": " << p.bw_ub_gm
-    << ",\n  \"hbm_aggregate_gibps\": " << p.hbm_aggregate_gibps << ",\n  \"l0_tile_m\": " << p.l0_tile_m
-    << ",\n  \"l0_tile_n\": " << p.l0_tile_n << ",\n  \"vec_reg_bytes\": " << p.vec_reg_bytes
-    << ",\n  \"vec_op_head\": " << p.vec_op_head << ",\n  \"vec_op_tail\": " << p.vec_op_tail
-    << ",\n  \"vec_slope_pw\": " << p.vec_slope_pw << ",\n  \"vec_slope_reduce\": " << p.vec_slope_reduce
+    << ",\n  \"cube_freq_hz\": " << p.cube_freq_hz << ",\n  \"bw_gm_l1\": " << p.bw_gm_l1
+    << ",\n  \"bw_l0c_gm\": " << p.bw_l0c_gm << ",\n  \"bw_l1_l0a\": " << p.bw_l1_l0a
+    << ",\n  \"bw_l1_l0b\": " << p.bw_l1_l0b << ",\n  \"bw_gm_ub\": " << p.bw_gm_ub
+    << ",\n  \"bw_ub_gm\": " << p.bw_ub_gm << ",\n  \"hbm_aggregate_gibps\": " << p.hbm_aggregate_gibps
+    << ",\n  \"l0_tile_m\": " << p.l0_tile_m << ",\n  \"l0_tile_n\": " << p.l0_tile_n
+    << ",\n  \"vec_reg_bytes\": " << p.vec_reg_bytes << ",\n  \"vec_op_head\": " << p.vec_op_head
+    << ",\n  \"vec_op_tail\": " << p.vec_op_tail << ",\n  \"vec_slope_pw\": " << p.vec_slope_pw
+    << ",\n  \"vec_slope_reduce\": " << p.vec_slope_reduce << ",\n  \"l0_matmul_config\": {"
+    << "\n    \"l0a_bytes\": " << p.l0_matmul_config.l0a_bytes
+    << ",\n    \"l0b_bytes\": " << p.l0_matmul_config.l0b_bytes
+    << ",\n    \"l0c_bytes\": " << p.l0_matmul_config.l0c_bytes
+    << ",\n    \"min_m\": " << p.l0_matmul_config.min_m << ",\n    \"min_n\": " << p.l0_matmul_config.min_n
+    << ",\n    \"min_k\": " << p.l0_matmul_config.min_k
+    << ",\n    \"align_m\": " << p.l0_matmul_config.align_m
+    << ",\n    \"align_n\": " << p.l0_matmul_config.align_n
+    << ",\n    \"align_k\": " << p.l0_matmul_config.align_k
+    << ",\n    \"allow_a_stationary\": " << (p.l0_matmul_config.allow_a_stationary ? "true" : "false")
+    << ",\n    \"allow_b_stationary\": " << (p.l0_matmul_config.allow_b_stationary ? "true" : "false")
+    << ",\n    \"allow_double_buffer_c\": " << (p.l0_matmul_config.allow_double_buffer_c ? "true" : "false")
+    << ",\n    \"allow_padding\": " << (p.l0_matmul_config.allow_padding ? "true" : "false")
+    << ",\n    \"allow_k_boundary\": " << (p.l0_matmul_config.allow_k_boundary ? "true" : "false")
+    << ",\n    \"bw_l0a\": " << p.l0_matmul_config.bw_l0a
+    << ",\n    \"bw_l0b\": " << p.l0_matmul_config.bw_l0b
+    << ",\n    \"bw_drain\": " << p.l0_matmul_config.bw_drain
+    << ",\n    \"bw_l0c_l1\": " << p.l0_matmul_config.bw_l0c_l1
+    << ",\n    \"drain_fixed_cycles\": " << p.l0_matmul_config.drain_fixed_cycles
+    << ",\n    \"drain_row_cycles\": " << p.l0_matmul_config.drain_row_cycles
+    << ",\n    \"drain_penalty_cycles\": " << p.l0_matmul_config.drain_penalty_cycles
+    << ",\n    \"drain_c0_bytes\": " << p.l0_matmul_config.drain_c0_bytes
+    << ",\n    \"mad_head_cycles\": " << p.l0_matmul_config.mad_head_cycles
+    << ",\n    \"mad_k_fractal_bytes\": " << p.l0_matmul_config.mad_k_fractal_bytes << "\n  }"
     << ",\n  \"require_uniform_cube_dag_grid\": " << (p.require_uniform_cube_dag_grid ? "true" : "false")
+    << ",\n  \"use_hierarchical_cube_cost\": " << (p.use_hierarchical_cube_cost ? "true" : "false")
     << "\n}\n";
 }
 
@@ -1310,9 +1450,100 @@ DataType CubeAccumulatorDType(const DataType& input_dtype) {
   return input_dtype.IsFloat() ? DataType::FP32 : DataType::INT32;
 }
 
+bool MixedCubeOperandDTypeSupported(const DataType& dtype) {
+  return dtype == DataType::FP32 || dtype == DataType::FP16 ||
+         dtype == DataType::BF16;
+}
+
 bool CubeOutputCanCarryKLoop(const ExprPtr& lhs, const DataType& output_dtype) {
   auto lhs_type = AsTensorTypeLike(lhs->GetType());
   return lhs_type != nullptr && CubeAccumulatorDType(lhs_type->dtype_) == output_dtype;
+}
+
+utils::Stationarity FromFuseboxL0Stationarity(::L0Stationarity stationarity) {
+  switch (stationarity) {
+    case ::L0Stationarity::Output:
+      return utils::Stationarity::kOutputStationary;
+    case ::L0Stationarity::A:
+      return utils::Stationarity::kAStationary;
+    case ::L0Stationarity::B:
+      return utils::Stationarity::kBStationary;
+  }
+  INTERNAL_UNREACHABLE << "AutoFuse: unknown PTO Fusebox L0 stationarity";
+}
+
+utils::L0PlanOutputTarget FromFuseboxL0OutputTarget(::L0OutputTarget target) {
+  switch (target) {
+    case ::L0OutputTarget::Acc:
+      return utils::L0PlanOutputTarget::kAcc;
+    case ::L0OutputTarget::GM:
+      return utils::L0PlanOutputTarget::kGM;
+    case ::L0OutputTarget::L1:
+      return utils::L0PlanOutputTarget::kL1;
+  }
+  INTERNAL_UNREACHABLE << "AutoFuse: unknown PTO Fusebox L0 output target";
+}
+
+int64_t ExprDTypeBytes(const ExprPtr& expr) {
+  auto type = AsTensorTypeLike(expr->GetType());
+  INTERNAL_CHECK(type) << "AutoFuse: L0-plan matmul operand is not tensor-like";
+  return std::max<int64_t>(1, static_cast<int64_t>(type->dtype_.GetBit()) / 8);
+}
+
+ExprPtr AttachL0MatmulPlan(const ExprPtr& expr, const ::L0MatmulPlan* plan, int64_t source_m,
+                           int64_t source_n, int64_t source_k, const ExprPtr& lhs, const ExprPtr& rhs,
+                           const DataType& output_dtype, bool accumulator_read) {
+  if (plan == nullptr) return expr;
+  INTERNAL_CHECK(plan->feasible) << "AutoFuse: cannot attach an infeasible L0 matmul child plan";
+  auto call = As<Call>(expr);
+  INTERNAL_CHECK(call && (IsOp(call, "tensor.matmul") || IsOp(call, "tensor.matmul_acc")))
+      << "AutoFuse: L0 child plan must annotate tensor.matmul or tensor.matmul_acc";
+
+  auto attrs = call->attrs_;
+  attrs.erase(std::remove_if(attrs.begin(), attrs.end(), [](const auto& item) {
+                return item.first == utils::kL0MatmulPlanAttr ||
+                       item.first == utils::kL0MatmulOutputTargetAttr;
+              }),
+              attrs.end());
+  attrs.emplace_back(utils::kL0MatmulOutputTargetAttr,
+                     static_cast<int>(FromFuseboxL0OutputTarget(plan->output_target)));
+
+  // Analytic mode delegates the detailed L0 optimization to AutoTileMatmulL0.
+  // The shared chooser is still used once while reconstructing the winning
+  // GM/L1 schedule, to select a legal Acc-resident output micro-tile, but its
+  // geometry is not part of the outer solver decision and is not pinned here.
+  if (!ExactL0CostEnabled()) {
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, std::move(attrs),
+                                  call->GetType(), call->span_);
+  }
+
+  utils::L0MatmulPlanRecord record;
+  record.source_m = source_m;
+  record.source_n = source_n;
+  record.source_k = source_k;
+  record.bytes_a = ExprDTypeBytes(lhs);
+  record.bytes_b = ExprDTypeBytes(rhs);
+  record.bytes_c = std::max<int64_t>(1, static_cast<int64_t>(output_dtype.GetBit()) / 8);
+  record.accumulator_read = accumulator_read;
+  record.output_target = FromFuseboxL0OutputTarget(plan->output_target);
+  record.tile_m = plan->m;
+  record.tile_n = plan->n;
+  record.tile_k = plan->k;
+  record.stationarity = FromFuseboxL0Stationarity(plan->stationarity);
+  record.output_stationary_holds_a = plan->output_stationary_holds_a;
+  record.buffer_depth_a = plan->buffer_depth_a;
+  record.buffer_depth_b = plan->buffer_depth_b;
+  record.buffer_depth_c = plan->buffer_depth_c;
+  record.k_full_chunks = plan->k_loop.full_chunks;
+  record.k_tail = plan->k_loop.tail;
+  record.k_pipeline_stages = plan->k_loop.pipeline_stages;
+  record.estimated_traffic_bytes = plan->estimated_traffic_bytes;
+  record.estimated_cost_cycles = plan->estimated_cost_cycles;
+  record.padded_compute_volume = plan->padded_compute_volume;
+
+  attrs.emplace_back(utils::kL0MatmulPlanAttr, utils::EncodeL0MatmulPlanRecord(record));
+  return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, std::move(attrs), call->GetType(),
+                                call->span_);
 }
 
 // Build the compute for ONE [h,w] output tile: `out = a[mi:mi+h, :] @ b[:, ni:ni+w]`,
@@ -1326,7 +1557,10 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
                                        const ExprPtr& a_k_base, const ExprPtr& b_k_base,
                                        const ExprPtr& b_col_base, int64_t h, int64_t w, int64_t K, int64_t k,
                                        const DataType& dtype, const VarPtr& out_var, const std::string& base,
-                                       const Span& sp, int pipeline_stages = -1) {
+                                       const Span& sp, int pipeline_stages = -1,
+                                       const ::L0MatmulPlan* l0_init = nullptr,
+                                       const ::L0MatmulPlan* l0_rolled = nullptr,
+                                       const ::L0MatmulPlan* l0_tail = nullptr) {
   auto& reg = OpRegistry::GetInstance();
   const std::vector<std::pair<std::string, std::any>> mm_kw = {
       {"a_trans", false}, {"b_trans", false}, {"c_matrix_nz", false}, {"out_dtype", dtype}};
@@ -1350,7 +1584,8 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
     auto bt =
         reg.Create("tensor.slice", {b, MakeIndexTuple({K, w}, sp), MakeTuple2(b_k_base, b_col_base, sp)}, sp);
     auto bv = std::make_shared<Var>(base + "_b_t", bt->GetType(), sp);
-    auto mm = reg.Create("tensor.matmul", {av, bv}, mm_kw, sp);
+    auto mm = AttachL0MatmulPlan(reg.Create("tensor.matmul", {av, bv}, mm_kw, sp), l0_init, h, w, K, av, bv,
+                                 dtype, /*accumulator_read=*/false);
     return {std::make_shared<AssignStmt>(av, at, sp), std::make_shared<AssignStmt>(bv, bt, sp),
             std::make_shared<AssignStmt>(out_var, mm, sp)};
   }
@@ -1443,7 +1678,8 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
   auto b0_call =
       reg.Create("tensor.slice", {b, MakeIndexTuple({k, w}, sp), MakeTuple2(b_k_base, b_col_base, sp)}, sp);
   auto b0 = std::make_shared<Var>(base + "_b_k0", b0_call->GetType(), sp);
-  auto first_call = reg.Create("tensor.matmul", {a0, b0}, mm_kw, sp);
+  auto first_call = AttachL0MatmulPlan(reg.Create("tensor.matmul", {a0, b0}, mm_kw, sp), l0_init, h, w, k, a0,
+                                       b0, dtype, /*accumulator_read=*/false);
   auto first_var = std::make_shared<Var>(base + "_first", first_call->GetType(), sp);
   std::vector<StmtPtr> result{
       std::make_shared<AssignStmt>(a0, a0_call, sp),
@@ -1465,7 +1701,9 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
   auto b_k = std::make_shared<Var>(base + "_b_k", b_k_call->GetType(), sp);
   auto b_k_assign = std::make_shared<AssignStmt>(b_k, b_k_call, sp);
 
-  auto acc_call = reg.Create("tensor.matmul_acc", {ExprPtr(c_iter), a_k, b_k}, acc_kw, sp);
+  auto acc_call = AttachL0MatmulPlan(reg.Create("tensor.matmul_acc", {ExprPtr(c_iter), a_k, b_k}, acc_kw, sp),
+                                     l0_rolled, h, w, k, a_k, b_k, dtype,
+                                     /*accumulator_read=*/true);
   auto acc_var = std::make_shared<Var>(base + "_mm_acc", acc_call->GetType(), sp);
   auto acc_assign = std::make_shared<AssignStmt>(acc_var, acc_call, sp);
   auto body_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{acc_var}, sp);
@@ -1475,7 +1713,13 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
   const int64_t rolled_chunks = num_full - 1;
   const bool pipeline = pipeline_stages >= 2 && rolled_chunks >= 2;
   std::vector<std::pair<std::string, std::any>> loop_attrs;
-  if (pipeline) loop_attrs.emplace_back(kPipelineStagesAttr, /*stages=*/2);
+  if (pipeline) {
+    loop_attrs.emplace_back(kPipelineStagesAttr, /*stages=*/2);
+    // CubeSchedulePlan pipelines GM->L1 K windows. AutoTileMatmulL0 later adds
+    // the child L1->L0 pipeline from the attached L0MatmulPlan; its buffers must
+    // not be multiplied by this enclosing stage count.
+    loop_attrs.emplace_back(kPipelineGmToL1OnlyAttr, true);
+  }
   // The rolled loop runs over the remaining FULL strips [k, num_full*k). When K
   // divides (tail==0) it binds out_var directly. When K is ragged (tail>0), the
   // loop binds an intermediate and a serial matmul_acc tail folds the last
@@ -1503,7 +1747,9 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
                         MakeTuple2(AddIndexOffset(b_k_base, MakeIndex(k_tail, sp), sp), b_col_base, sp)},
                        sp);
   auto bv = std::make_shared<Var>(base + "_b_tl", bt->GetType(), sp);
-  auto tail_mm = reg.Create("tensor.matmul_acc", {ExprPtr(loop_out), av, bv}, acc_kw, sp);
+  auto tail_mm = AttachL0MatmulPlan(reg.Create("tensor.matmul_acc", {ExprPtr(loop_out), av, bv}, acc_kw, sp),
+                                    l0_tail, h, w, tail, av, bv, dtype,
+                                    /*accumulator_read=*/true);
   result.push_back(std::make_shared<AssignStmt>(av, at, sp));
   result.push_back(std::make_shared<AssignStmt>(bv, bt, sp));
   result.push_back(std::make_shared<AssignStmt>(out_var, tail_mm, sp));
@@ -1579,7 +1825,12 @@ CubeAccumulatorGrid DeriveCubeAccumulatorGrid(int64_t h, int64_t w, const DataTy
         << "Internal error: AutoFuse cube accumulator has no L0c base tile for region [" << h << "," << w
         << "]";
   }
-  return {tile_h, tile_w, CeilDiv(h, tile_h), CeilDiv(w, tile_w)};
+  CubeAccumulatorGrid grid;
+  grid.tile_h = tile_h;
+  grid.tile_w = tile_w;
+  grid.num_m = CeilDiv(h, tile_h);
+  grid.num_n = CeilDiv(w, tile_w);
+  return grid;
 }
 
 // Realize the solver's tile for a `c = tensor.matmul(a, b)`: tile the output
@@ -1640,8 +1891,12 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign,
   // emit it at its exact shape rather than requiring a divisor (which can
   // degenerate to O(h*w) one-element tiles for prime dimensions). Downstream
   // matmul lowering pads those ragged M/N edge shapes to cube fractals.
-  const int64_t plan_l0_m = tile.cube_schedule.feasible ? tile.cube_schedule.l0_tile_m : kL0TileM;
-  const int64_t plan_l0_n = tile.cube_schedule.feasible ? tile.cube_schedule.l0_tile_n : kL0TileN;
+  // Transitional legacy fallback only. CubeSchedulePlan deliberately owns no
+  // L0 geometry; exact plan replay delegates it to the child L0MatmulPlan and
+  // AutoTileMatmulL0. Keep the pre-plan constants only for unsupported groups
+  // until this fallback is retired.
+  const int64_t plan_l0_m = kL0TileM;
+  const int64_t plan_l0_n = kL0TileN;
   const CubeAccumulatorGrid acc_grid = DeriveCubeAccumulatorGrid(h, w, dtype, plan_l0_m, plan_l0_n);
   const int64_t acc_h = acc_grid.tile_h;
   const int64_t acc_w = acc_grid.tile_w;
@@ -2039,6 +2294,20 @@ static bool GenericEmitEnabled() {
   return v != nullptr && v[0] != '\0' && std::string(v) != "0";
 }
 
+static bool MixedEmitEnabled() {
+  const char* v = std::getenv("PYPTO_AUTOFUSE_MIXED");
+  return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+}
+
+static bool ExactL0CostEnabled() {
+  // This is the temporary policy surface for the two optimization modes. PyPTO
+  // does not yet expose a general -O2/-O3 pass-context level; once it does,
+  // this flag maps naturally to that setting. Re-read per compilation just like
+  // the other AutoFuse differential-testing gates.
+  const char* v = std::getenv("PYPTO_AUTOFUSE_EXACT_L0_COST");
+  return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+}
+
 // P4 emit + cost gate. Exact online softmax is silicon-closed and therefore on
 // by default. Welford remains opt-in until the extreme-shift device envelope is
 // closed. An explicit legacy flag still controls both for differential/device
@@ -2272,15 +2541,22 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // PADDED tile — the same footprint the cost model's vector_peak_ub prices. Without it a thin free
   // axis (an M-tile of 3 -> 8, ~2.7x) is under-counted, materializes an over-UB tile, and overflows
   // AllocateMemoryAddr (BUG-G1THRESH). See ascend910b_cost.cpp vector_peak_ub for the model side.
-  int64_t min_dtype_bits = static_cast<int64_t>(dtype.GetBit());
+  int64_t min_dtype_bits = std::max<int64_t>(1, static_cast<int64_t>(dtype.GetBit()));
   for (const auto& a : ops) {
-    if (auto tt = As<TensorType>(a->var_->GetType()))
-      min_dtype_bits = std::min(min_dtype_bits, static_cast<int64_t>(tt->dtype_.GetBit()));
-    for (const ExprPtr& arg : As<Call>(a->value_)->args_)
-      if (auto att = As<TensorType>(arg->GetType()))
-        min_dtype_bits = std::min(min_dtype_bits, static_cast<int64_t>(att->dtype_.GetBit()));
+    if (auto tt = As<TensorType>(a->var_->GetType())) {
+      min_dtype_bits =
+          std::min(min_dtype_bits, std::max<int64_t>(1, static_cast<int64_t>(tt->dtype_.GetBit())));
+    }
+    for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
+      if (auto att = As<TensorType>(arg->GetType())) {
+        min_dtype_bits =
+            std::min(min_dtype_bits, std::max<int64_t>(1, static_cast<int64_t>(att->dtype_.GetBit())));
+      }
+    }
   }
-  const int64_t g = std::max<int64_t>(1, handler->GetVectorDmaAlignmentBytes() / ((min_dtype_bits + 7) / 8));
+  const int64_t min_dtype_bytes = std::max<int64_t>(1, (min_dtype_bits + 7) / 8);
+  const int64_t g =
+      std::max<int64_t>(1, handler->GetVectorDmaAlignmentBytes() / min_dtype_bytes);
   int p1_nreds = 0;
   bool p1_red_sum_or_max = false;  // the single reduction's family (sum/max = the on-core merges)
   for (const auto& a : ops)
@@ -2404,8 +2680,6 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // Padded ALLOCATED tile extent; valid stays [h,w]. Padding is a no-op on already-aligned
   // axes (AlignUp(x,g)==x), so aligned shapes emit the 3-arg slice byte-identically to before.
   const int64_t h_al = AlignUp(h, g), w_al = AlignUp(w, g);
-  const bool tile_ragged = (h_al != h) || (w_al != w);
-
   // slice_input: slice ONE 2D external input `arg` to a [sh, sw] VALID region at (smi, sni),
   // granule-padding the ALLOCATED extent (the row axis padded only for a reduction/col-major tile —
   // see the layout note in emit_strip). A broadcast axis (extent 1 in `arg`) stays [1] at offset 0
@@ -3583,7 +3857,9 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
   if (validated.parts_m <= 0 || validated.parts_n <= 0 || validated.region_h <= 0 ||
       validated.region_w <= 0 || plan.m_partition.num_big != 0 || plan.n_partition.num_big != 0 ||
       plan.spatial_tiles != validated.parts_m * validated.parts_n || plan.split_k != tile.split ||
-      plan.l0_tile_m <= 0 || plan.l0_tile_n <= 0 || plan.seed_required != (plan.split_k > 1) ||
+      plan.seed_required != (plan.split_k > 1) || plan.seed.present != plan.seed_required ||
+      (plan.seed.present && (plan.seed.work_units <= 0 || plan.seed.valid_rows <= 0 ||
+                             plan.seed.valid_cols != validated.region_w || plan.seed.bytes <= 0)) ||
       plan.work_units != plan.spatial_tiles * plan.split_k) {
     return fail("non-uniform or inconsistent spatial/split geometry");
   }
@@ -3609,6 +3885,12 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
     auto call = As<Call>(assign_it->second->value_);
     auto output_type = As<TensorType>(assign_it->second->var_->GetType());
     if (output_type == nullptr) return fail("matmul output is not a TensorType");
+    auto lhs_type = AsTensorTypeLike(call->args_[0]->GetType());
+    if (lhs_type == nullptr ||
+        mm.accumulator_dtype != MapSolverDType(CubeAccumulatorDType(lhs_type->dtype_)) ||
+        mm.storage_dtype != MapSolverDType(output_type->dtype_)) {
+      return fail("matmul accumulator/storage dtype descriptor does not match the source IR");
+    }
     const auto [output_m, output_n] = Static2DShape(assign_it->second->var_->GetType());
     const auto [lhs_m, lhs_k] = Static2DShape(call->args_[0]->GetType());
     const auto [rhs_k, rhs_n] = Static2DShape(call->args_[1]->GetType());
@@ -3624,9 +3906,53 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
     if (mm.k_loop.pipeline_stages >= 2 && mm.k_loop.full_chunks < 3) {
       return fail("stage-2 K loop has no two-iteration rolled steady state");
     }
-    if ((plan.split_k > 1 || mm.k_loop.full_chunks >= 2) &&
-        !CubeOutputCanCarryKLoop(call->args_[0], output_type->dtype_)) {
-      return fail("planned K carry requires FP32/INT32 accumulation before final output narrowing");
+    const bool has_chunked_carry = mm.k_loop.full_chunks >= 2;
+    if (mm.output_tile_m <= 0 || mm.output_tile_n <= 0 ||
+        mm.output_tiles_m != CeilDiv(mm.output.height, mm.output_tile_m) ||
+        mm.output_tiles_n != CeilDiv(mm.output.width, mm.output_tile_n) || mm.output_variants.empty()) {
+      return fail("output/L0C tile grid is missing or inconsistent");
+    }
+    int64_t variant_tiles = 0;
+    for (const ::CubeOutputTileVariant& variant : mm.output_variants) {
+      const int64_t init_k = has_chunked_carry ? mm.k_loop.chunk : mm.effective_contraction;
+      auto l0_loop_matches = [](const ::L0MatmulPlan& child, int64_t extent) {
+        return child.k_loop.chunk == child.k && child.k_loop.full_chunks >= 0 && child.k_loop.tail >= 0 &&
+               child.k_loop.full_chunks * child.k_loop.chunk + child.k_loop.tail == extent &&
+               child.k_loop.pipeline_stages == (child.k_loop.full_chunks >= 2 ? 2 : 1) &&
+               child.phases.wall_cycles == child.phases.init_cycles + child.phases.rolled_cycles +
+                                               child.phases.tail_cycles + child.phases.drain_cycles;
+      };
+      variant_tiles += variant.count;
+      if (variant.height <= 0 || variant.width <= 0 || variant.count <= 0 || !variant.l0_init.feasible ||
+          variant.l0_init.m != variant.height || variant.l0_init.n != variant.width ||
+          variant.l0_init.output_target != ::L0OutputTarget::Acc ||
+          !l0_loop_matches(variant.l0_init, init_k) || variant.l0_rolled.feasible != has_chunked_carry ||
+          (variant.l0_rolled.feasible &&
+           (variant.l0_rolled.m != variant.height || variant.l0_rolled.n != variant.width ||
+            variant.l0_rolled.output_target != ::L0OutputTarget::Acc ||
+            !l0_loop_matches(variant.l0_rolled, mm.k_loop.chunk))) ||
+          variant.l0_tail.feasible != (mm.k_loop.tail > 0) ||
+          (variant.l0_tail.feasible &&
+           (variant.l0_tail.m != variant.height || variant.l0_tail.n != variant.width ||
+            variant.l0_tail.output_target != ::L0OutputTarget::Acc ||
+            !l0_loop_matches(variant.l0_tail, mm.k_loop.tail)))) {
+        return fail("shared-backend L0 child phase does not keep one complete output tile in L0C");
+      }
+    }
+    const int64_t expected_drain_bytes =
+        mm.output.height * mm.output.width *
+        std::max<int64_t>(1, static_cast<int64_t>(output_type->dtype_.GetBit()) / 8);
+    if (!mm.final_drain.required || mm.final_drain.target_l1 != !mm.is_sink ||
+        mm.final_drain.atomic != (mm.is_sink && plan.split_k > 1) ||
+        mm.final_drain.valid_rows != mm.output_tile_m || mm.final_drain.valid_cols != mm.output_tile_n ||
+        mm.final_drain.tile_count != variant_tiles ||
+        variant_tiles != mm.output_tiles_m * mm.output_tiles_n ||
+        mm.final_drain.bytes != expected_drain_bytes || mm.final_drain.cycles <= 0.0) {
+      return fail("post-K-loop Acc drain descriptor is inconsistent");
+    }
+    if (mm.final_drain.target_l1 && output_type->dtype_ != DataType::BF16 &&
+        output_type->dtype_ != DataType::FP16) {
+      return fail("A2/A3 internal Acc-to-Mat drain requires BF16/FP16 storage");
     }
     if (mm.is_sink) {
       ++root_count;
@@ -3667,21 +3993,20 @@ struct CubeSplitSeed {
 };
 
 CubeSplitSeed BuildCubeSplitSeed(const AssignStmtPtr& root_assign, const ExprPtr& initial_output,
-                                 int64_t region_h, int64_t region_w, int64_t parts_n, const std::string& name,
+                                 const ::CubeSplitSeedPlan& seed, int64_t parts_n, const std::string& name,
                                  const Span& sp) {
   auto& registry = OpRegistry::GetInstance();
   auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
   const auto [output_m, output_n] = Static2DShape(root_assign->var_->GetType());
   auto output_type = As<TensorType>(root_assign->var_->GetType());
   const DataType dtype = output_type->dtype_;
-  const auto* pass_context = PassContext::Current();
-  const auto* handler = pass_context != nullptr ? pass_context->GetBackendHandler()
-                                                : pypto::backend::GetBackend()->GetHandler();
   const int64_t dtype_bytes = std::max<int64_t>(1, static_cast<int64_t>(dtype.GetBit()) / 8);
-  const int64_t ub_bytes = static_cast<int64_t>(handler->GetVectorBufferCapacityBytes());
-  const int64_t seed_h =
-      std::min(region_h, std::max<int64_t>(1, ub_bytes / std::max<int64_t>(1, region_w * dtype_bytes)));
+  const int64_t seed_h = seed.valid_rows;
+  const int64_t region_w = seed.valid_cols;
   const int64_t seed_m_parts = CeilDiv(output_m, seed_h);
+  INTERNAL_CHECK(seed.present && seed.work_units == seed_m_parts * parts_n &&
+                 seed.bytes == seed.work_units * seed_h * region_w * dtype_bytes)
+      << "AutoFuse cube split seed does not match CubeSchedulePlan";
   auto seed_index = std::make_shared<Var>(root_assign->var_->name_hint_ + "_seed_index", index_type, sp);
   ExprPtr seed_m = ScaleIndex(MakeFloorDiv(seed_index, MakeIndex(parts_n, sp), sp), seed_h, sp);
   if (seed_m_parts * seed_h > output_m) {
@@ -3698,8 +4023,11 @@ CubeSplitSeed BuildCubeSplitSeed(const AssignStmtPtr& root_assign, const ExprPtr
   auto scope = SpmdWrap(
       seed_index,
       {std::make_shared<AssignStmt>(fill_var, fill, sp), std::make_shared<AssignStmt>(seeded, assemble, sp)},
-      MakeIndex(seed_m_parts * parts_n, sp), name + "_seed", sp);
-  return {scope, seeded};
+      MakeIndex(seed.work_units, sp), name + "_seed", sp);
+  CubeSplitSeed result;
+  result.scope = scope;
+  result.output = seeded;
+  return result;
 }
 
 bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
@@ -3712,11 +4040,17 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
   const AssignStmtPtr& source_assign = op_assigns.at(mm.op);
   auto source_call = As<Call>(source_assign->value_);
   auto output_type = As<TensorType>(source_assign->var_->GetType());
-  const DataType dtype = output_type->dtype_;
   auto fail = [&](std::string message) {
     *reason = std::move(message);
     return false;
   };
+  if (source_call == nullptr || output_type == nullptr || source_call->args_.size() != 2) {
+    return fail("planned matmul source is malformed");
+  }
+  const DataType storage_dtype = output_type->dtype_;
+  auto lhs_source_type = AsTensorTypeLike(source_call->args_[0]->GetType());
+  if (lhs_source_type == nullptr) return fail("matmul LHS is not tensor-like");
+  const DataType accumulator_dtype = CubeAccumulatorDType(lhs_source_type->dtype_);
 
   ExprPtr lhs = source_call->args_[0];
   ExprPtr rhs = source_call->args_[1];
@@ -3762,80 +4096,76 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
   const ExprPtr output_col =
       CubeRegionAxisOffset(mm.output.width_binding, mm.output.width, m_index, n_index, split_index, sp);
 
-  auto& registry = OpRegistry::GetInstance();
-  const CubeAccumulatorGrid accumulator =
-      DeriveCubeAccumulatorGrid(mm.output.height, mm.output.width, dtype, plan.l0_tile_m, plan.l0_tile_n);
-  const int64_t accumulator_count = accumulator.num_m * accumulator.num_n;
-  ExprPtr local_state;
-  if (mm.output_ephemeral && accumulator_count > 1) {
-    auto create =
-        registry.Create("tensor.create_l1", {MakeIndexTuple({mm.output.height, mm.output.width}, sp)},
-                        {{"dtype", dtype}, {"transpose", false}}, sp);
+  auto find_variant = [&](int64_t h, int64_t w) -> const ::CubeOutputTileVariant* {
+    for (const ::CubeOutputTileVariant& variant : mm.output_variants) {
+      if (variant.height == h && variant.width == w) return &variant;
+    }
+    return nullptr;
+  };
+
+  // The legal PTO hierarchy is output/L0C tile outer, GM->L1 K-window inner.
+  // A2/A3 cannot reload a Mat partial into Acc, so every child K loop keeps its
+  // one [h,w] accumulator resident in L0C and drains exactly once afterwards.
+  ExprPtr internal_state;
+  if (!mm.is_sink) {
+    auto scratch_call = OpRegistry::GetInstance().Create(
+        "tensor.create_l1", {MakeIndexTuple({mm.output.height, mm.output.width}, sp)},
+        {{"dtype", storage_dtype}, {"transpose", false}}, sp);
     auto scratch =
-        std::make_shared<Var>(name + "_i" + std::to_string(instance) + "_scratch", create->GetType(), sp);
-    body->push_back(std::make_shared<AssignStmt>(scratch, create, sp));
-    local_state = scratch;
+        std::make_shared<Var>(name + "_i" + std::to_string(instance) + "_l1", scratch_call->GetType(), sp);
+    body->push_back(std::make_shared<AssignStmt>(scratch, scratch_call, sp));
+    internal_state = scratch;
   }
 
-  ExprPtr local_value;
-  int64_t accumulator_index = 0;
-  for (int64_t m_part = 0; m_part < accumulator.num_m; ++m_part) {
-    const int64_t local_m = m_part * accumulator.tile_h;
-    for (int64_t n_part = 0; n_part < accumulator.num_n; ++n_part, ++accumulator_index) {
-      const int64_t local_n = n_part * accumulator.tile_w;
-      const int64_t emit_h = std::min(accumulator.tile_h, mm.output.height - local_m);
-      const int64_t emit_w = std::min(accumulator.tile_w, mm.output.width - local_n);
-      auto part_type = std::make_shared<TensorType>(
-          std::vector<ExprPtr>{MakeIndex(emit_h, sp), MakeIndex(emit_w, sp)}, dtype);
-      auto part = std::make_shared<Var>(
-          name + "_i" + std::to_string(instance) + "_l0_" + std::to_string(accumulator_index), part_type, sp);
-      const ExprPtr part_lhs_row = AddIndexOffset(lhs_row, MakeIndex(local_m, sp), sp);
-      const ExprPtr part_rhs_col = AddIndexOffset(rhs_col, MakeIndex(local_n, sp), sp);
-      for (StmtPtr& stmt : BuildTileMatmulAt(
-               lhs, rhs, part_lhs_row, lhs_k, rhs_k, part_rhs_col, emit_h, emit_w, mm.effective_contraction,
-               mm.k_loop.chunk, dtype, part,
-               name + "_i" + std::to_string(instance) + "_k" + std::to_string(accumulator_index), sp,
-               mm.k_loop.pipeline_stages)) {
+  const int64_t tile_count = mm.output_tiles_m * mm.output_tiles_n;
+  int64_t tile_index = 0;
+  for (int64_t mj = 0; mj < mm.output_tiles_m; ++mj) {
+    const int64_t mi = mj * mm.output_tile_m;
+    const int64_t h = std::min(mm.output_tile_m, mm.output.height - mi);
+    for (int64_t nj = 0; nj < mm.output_tiles_n; ++nj, ++tile_index) {
+      const int64_t ni = nj * mm.output_tile_n;
+      const int64_t w = std::min(mm.output_tile_n, mm.output.width - ni);
+      const ::CubeOutputTileVariant* variant = find_variant(h, w);
+      if (variant == nullptr) return fail("missing child L0 plan for an output boundary tile");
+
+      const std::string tile_base =
+          name + "_i" + std::to_string(instance) + "_t" + std::to_string(tile_index);
+      auto tile_type = std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)},
+                                                    accumulator_dtype);
+      auto tile_value = std::make_shared<Var>(tile_base + "_acc", tile_type, sp);
+      for (StmtPtr& stmt : BuildTileMatmulAt(lhs, rhs, AddIndexOffset(lhs_row, MakeIndex(mi, sp), sp), lhs_k,
+                                             rhs_k, AddIndexOffset(rhs_col, MakeIndex(ni, sp), sp), h, w,
+                                             mm.effective_contraction, mm.k_loop.chunk, accumulator_dtype,
+                                             tile_value, tile_base, sp, mm.k_loop.pipeline_stages,
+                                             &variant->l0_init, &variant->l0_rolled, &variant->l0_tail)) {
         body->push_back(std::move(stmt));
       }
 
-      if (mm.output_ephemeral) {
-        if (accumulator_count == 1) {
-          local_value = part;
-        } else {
-          auto assemble = registry.Create("tensor.assemble",
-                                          {local_state, part, MakeIndexTuple({local_m, local_n}, sp)}, sp);
-          auto assembled = std::make_shared<Var>(
-              name + "_i" + std::to_string(instance) + "_resident_" + std::to_string(accumulator_index),
-              assemble->GetType(), sp);
-          body->push_back(std::make_shared<AssignStmt>(assembled, assemble, sp));
-          local_state = assembled;
-          local_value = assembled;
-        }
-      }
-
       if (mm.is_sink) {
-        const ExprPtr store_row = AddIndexOffset(output_row, MakeIndex(local_m, sp), sp);
-        const ExprPtr store_col = AddIndexOffset(output_col, MakeIndex(local_n, sp), sp);
         std::vector<std::pair<std::string, std::any>> kwargs;
         if (plan.split_k > 1) kwargs.emplace_back("atomic", 1);
-        auto assemble = registry.Create(
-            "tensor.assemble", {(*root_states)[instance], part, MakeTuple2(store_row, store_col, sp)}, kwargs,
-            sp);
-        const bool last = accumulator_index + 1 == accumulator_count;
-        VarPtr assembled = last ? source_assign->var_
-                                : std::make_shared<Var>(name + "_root" + std::to_string(instance) + "_" +
-                                                            std::to_string(accumulator_index),
-                                                        assemble->GetType(), sp);
-        body->push_back(std::make_shared<AssignStmt>(assembled, assemble, sp));
-        (*root_states)[instance] = assembled;
+        auto assemble = OpRegistry::GetInstance().Create(
+            "tensor.assemble",
+            {(*root_states)[instance], tile_value,
+             MakeTuple2(AddIndexOffset(output_row, MakeIndex(mi, sp), sp),
+                        AddIndexOffset(output_col, MakeIndex(ni, sp), sp), sp)},
+            kwargs, sp);
+        const bool last = tile_index + 1 == tile_count;
+        auto next =
+            last ? source_assign->var_ : std::make_shared<Var>(tile_base + "_gm", assemble->GetType(), sp);
+        body->push_back(std::make_shared<AssignStmt>(next, assemble, sp));
+        (*root_states)[instance] = next;
+      } else {
+        auto assemble = OpRegistry::GetInstance().Create(
+            "tensor.assemble", {internal_state, tile_value, MakeIndexTuple({mi, ni}, sp)}, sp);
+        auto next = std::make_shared<Var>(tile_base + "_l1", assemble->GetType(), sp);
+        body->push_back(std::make_shared<AssignStmt>(next, assemble, sp));
+        internal_state = next;
       }
     }
   }
-  if (mm.output_ephemeral) {
-    if (!local_value) return fail("ephemeral request produced no resident value");
-    (*instance_values)[instance] = local_value;
-  }
+
+  if (!mm.is_sink) (*instance_values)[instance] = internal_state;
   return true;
 }
 
@@ -3859,8 +4189,6 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
   const auto& op_assigns = validated->op_assigns;
   const int64_t parts_m = validated->parts_m;
   const int64_t parts_n = validated->parts_n;
-  const int64_t region_h = validated->region_h;
-  const int64_t region_w = validated->region_w;
 
   const Span sp = members.front()->span_;
   auto& registry = OpRegistry::GetInstance();
@@ -3869,8 +4197,8 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
   std::vector<ExprPtr> root_initial(plan.matmuls.size());
 
   // Boundary outputs are the only cube values allocated outside the AIC body.
-  // Internal request regions are allocated below, inside the body, only when
-  // L0 subdivision requires an L1 scratch.
+  // Internal request regions stay inside the AIC body. Their eventual L1
+  // scratch and L0 subdivision are exclusively owned by AutoTileMatmulL0.
   for (size_t instance = 0; instance < plan.matmuls.size(); ++instance) {
     const ::CubeMatmulSchedule& mm = plan.matmuls[instance];
     if (!mm.is_sink) continue;
@@ -3890,7 +4218,7 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
     size_t root = 0;
     while (root < plan.matmuls.size() && !plan.matmuls[root].is_sink) ++root;
     CubeSplitSeed seed = BuildCubeSplitSeed(op_assigns.at(plan.matmuls[root].op), root_initial[root],
-                                            region_h, region_w, parts_n, name, sp);
+                                            plan.seed, parts_n, name, sp);
     result.push_back(std::move(seed.scope));
     root_initial[root] = std::move(seed.output);
   }
@@ -3918,6 +4246,267 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
   LOG_INFO << "AutoFuse[cube-plan]: group '" << name << "' emitted " << plan.matmuls.size()
            << " request instance(s), grid=" << parts_m << "x" << parts_n << "x" << plan.split_k;
   return result;
+}
+
+// Replay the first buildable mixed schedule: one standard matmul followed by a
+// linear elementwise epilogue.  The outer launch owns `active_groups` physical
+// 910B clusters; every cluster runs a fixed inner loop over its successor
+// spatial regions.  The function-level UP_DOWN split is intentionally attached
+// here: LowerAutoVectorSplit turns the cube result into an AIV shard and halves
+// only the vector sub-region, so the model's two-lane division is realized by
+// the emitted IR rather than inferred from hardware topology.
+std::optional<std::vector<StmtPtr>> EmitMixedScheduleGroup(
+    const std::vector<StmtPtr>& members,
+    const std::unordered_map<const Stmt*, size_t>& stmt_op,
+    const std::unordered_set<const Var*>& required_live_outs,
+    const SolverTile& tile, const std::string& name) {
+  const ::MixedSchedulePlan& plan = tile.mixed_schedule;
+  auto decline = [&](const std::string& reason) {
+    LOG_INFO << "AutoFuse[mixed-plan]: group '" << name << "' decline — " << reason;
+    return std::optional<std::vector<StmtPtr>>{};
+  };
+  if (!plan.feasible || !plan.emit_compatible || !plan.topology ||
+      plan.mode != ::MixedPipelineMode::OneWay ||
+      plan.topology->stages.size() != 2 || plan.topology->transfers.size() != 1 ||
+      plan.topology->stages[0].engine != ::MixedEngine::Cube ||
+      plan.topology->stages[1].engine != ::MixedEngine::Vector ||
+      plan.topology->stages[0].ops.size() != 1) {
+    return decline("not the buildable one-way C->V topology");
+  }
+  if (plan.split_k != 1 || plan.vector_split != ::MixedVectorSplit::Rows ||
+      plan.vector_lanes != 2 || plan.fifos.size() != 1 ||
+      plan.fifos[0].direction != ::MixedTransferDirection::CubeToVector ||
+      plan.fifos[0].slot_count != 8 ||
+      plan.fifos[0].reserved_bytes !=
+          plan.fifos[0].slot_bytes * plan.fifos[0].slot_count ||
+      plan.fifos[0].reserved_bytes > ReadHwParams().vec_capacity) {
+    return decline("split/lane/FIFO descriptor is not the emitted C->V protocol");
+  }
+  if (plan.cube_window_k <= 0 || tile.k != plan.cube_window_k ||
+      plan.vector_stage_kind != ::VectorStreamKind::Materialized ||
+      plan.vector_stage_peak_ub_bytes <= 0 ||
+      plan.vector_stage_peak_ub_bytes + plan.fifos[0].reserved_bytes >
+          ReadHwParams().vec_capacity) {
+    return decline("stage-local cube/vector plan is not materializable as described");
+  }
+  if (plan.model_overlap_granted != plan.overlap_implementable ||
+      plan.loop.axis != ::MixedPipelineAxis::SpatialRegion ||
+      plan.loop.items_per_spatial_tile != 1 || plan.loop.work_items != plan.spatial_tiles ||
+      plan.loop.active_groups <= 0 || plan.loop.max_trips_per_group <= 0 ||
+      plan.loop.min_trips_per_group != plan.loop.max_trips_per_group ||
+      plan.loop.work_items != plan.loop.active_groups * plan.loop.max_trips_per_group) {
+    return decline("logical work items do not form one fixed per-group loop");
+  }
+  if (plan.m_partition.num_big != 0 || plan.n_partition.num_big != 0 ||
+      plan.m_partition.parts <= 0 || plan.n_partition.parts <= 0 ||
+      plan.m_partition.big <= 0 || plan.n_partition.big <= 0 ||
+      plan.m_partition.big % 2 != 0 ||
+      plan.spatial_tiles != plan.m_partition.parts * plan.n_partition.parts) {
+    return decline("mixed v0 requires one exact uniform even-row spatial grid");
+  }
+
+  std::unordered_map<size_t, AssignStmtPtr> by_op;
+  for (const StmtPtr& stmt : members) {
+    auto op = stmt_op.find(stmt.get());
+    auto assign = As<AssignStmt>(stmt);
+    if (op == stmt_op.end() || assign == nullptr || As<Call>(assign->value_) == nullptr) {
+      return decline("group contains a non-call assignment");
+    }
+    by_op.emplace(op->second, assign);
+  }
+
+  const size_t matmul_op = plan.topology->stages[0].ops.front();
+  auto matmul_it = by_op.find(matmul_op);
+  if (matmul_it == by_op.end()) return decline("planned matmul has no source statement");
+  const AssignStmtPtr& matmul_assign = matmul_it->second;
+  auto matmul = As<Call>(matmul_assign->value_);
+  if (matmul == nullptr || !IsOp(matmul, "tensor.matmul") || matmul->args_.size() != 2) {
+    return decline("cube stage is not a standard binary tensor.matmul");
+  }
+  if (matmul->GetKwarg<bool>("a_trans", false) ||
+      matmul->GetKwarg<bool>("b_trans", false) ||
+      matmul->GetKwarg<bool>("c_matrix_nz", false)) {
+    return decline("non-default matmul semantics are not in mixed v0");
+  }
+  const auto [M, K] = Static2DShape(matmul->args_[0]->GetType());
+  const auto [rhs_k, N] = Static2DShape(matmul->args_[1]->GetType());
+  const auto [out_m, out_n] = Static2DShape(matmul_assign->var_->GetType());
+  auto lhs_type = AsTensorTypeLike(matmul->args_[0]->GetType());
+  auto rhs_type = AsTensorTypeLike(matmul->args_[1]->GetType());
+  auto matmul_type = As<TensorType>(matmul_assign->var_->GetType());
+  if (M <= 0 || N <= 0 || K <= 0 || rhs_k != K || out_m != M || out_n != N ||
+      M != plan.m_partition.parts * plan.m_partition.big ||
+      N != plan.n_partition.parts * plan.n_partition.big) {
+    return decline("matmul shape does not match the mixed spatial plan");
+  }
+  if (!lhs_type || !rhs_type || lhs_type->dtype_ != rhs_type->dtype_ ||
+      !MixedCubeOperandDTypeSupported(lhs_type->dtype_) || !matmul_type ||
+      !CubeOutputCanCarryKLoop(matmul->args_[0], matmul_type->dtype_)) {
+    return decline("mixed v0 requires same supported operand dtype and accumulator result dtype");
+  }
+
+  std::vector<AssignStmtPtr> vector_ops;
+  vector_ops.reserve(plan.topology->stages[1].ops.size());
+  const Var* previous = matmul_assign->var_.get();
+  for (size_t op : plan.topology->stages[1].ops) {
+    auto it = by_op.find(op);
+    if (it == by_op.end()) return decline("planned vector op has no source statement");
+    auto call = As<Call>(it->second->value_);
+    if (call == nullptr || DescribeVectorOp(call).capability != ::VectorOpCapability::Elementwise) {
+      return decline("vector stage contains a non-elementwise operation");
+    }
+    const auto output_type = AsTensorTypeLike(it->second->var_->GetType());
+    int previous_uses = 0;
+    for (const ExprPtr& arg : call->args_) {
+      auto var = AsVarLike(arg);
+      if (var && var.get() == previous) ++previous_uses;
+      const auto input_type = AsTensorTypeLike(arg->GetType());
+      if (input_type && (!output_type || input_type->dtype_ != output_type->dtype_ ||
+                         input_type->dtype_ != matmul_type->dtype_)) {
+        return decline("vector tensor operands require an unmodeled dtype conversion");
+      }
+      const auto [arg_m, arg_n] = Static2DShape(arg->GetType());
+      if (arg_m >= 0 && !((arg_m == 1 || arg_m == M) &&
+                          (arg_n == 1 || arg_n == N))) {
+        return decline("vector operand is not a scalar/full tile/broadcast tile");
+      }
+    }
+    const auto [vec_m, vec_n] = Static2DShape(it->second->var_->GetType());
+    if (previous_uses < 1 || vec_m != M || vec_n != N ||
+        required_live_outs.count(previous) != 0) {
+      return decline("vector epilogue is not a linear single-live-out chain");
+    }
+    vector_ops.push_back(it->second);
+    previous = it->second->var_.get();
+  }
+  if (vector_ops.empty()) return decline("empty vector epilogue");
+  const AssignStmtPtr& sink = vector_ops.back();
+
+  const int64_t h = plan.m_partition.big;
+  const int64_t w = plan.n_partition.big;
+  auto sink_type = As<TensorType>(sink->var_->GetType());
+  if (!matmul_type || !sink_type ||
+      plan.fifos[0].valid_rows != h || plan.fifos[0].valid_cols != w ||
+      plan.fifos[0].slot_bytes !=
+          h * w * std::max<int64_t>(1, static_cast<int64_t>(matmul_type->dtype_.GetBit()) / 8)) {
+    return decline("FIFO slot does not match the full cube result tile");
+  }
+
+  const Span sp = members.front()->span_;
+  auto& registry = OpRegistry::GetInstance();
+  auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
+  auto create = registry.Create("tensor.create", {MakeIndexTuple({M, N}, sp)},
+                                {{"dtype", sink_type->dtype_}, {"layout", TensorLayout::ND}}, sp);
+  auto initial = std::make_shared<Var>(sink->var_->name_hint_ + "_mixed_out", create->GetType(), sp);
+  auto initial_assign = std::make_shared<AssignStmt>(initial, create, sp);
+
+  auto block = std::make_shared<Var>(name + "_group", index_type, sp);
+  auto trip = std::make_shared<Var>(name + "_trip", index_type, sp);
+  const int64_t trips = plan.loop.max_trips_per_group;
+  ExprPtr item = MakeAdd(MakeMul(block, MakeIndex(trips, sp), sp), trip, sp);
+  ExprPtr mi = MakeMul(MakeFloorDiv(item, MakeIndex(plan.n_partition.parts, sp), sp),
+                           MakeIndex(h, sp), sp);
+  ExprPtr ni = MakeMul(MakeFloorMod(item, MakeIndex(plan.n_partition.parts, sp), sp),
+                           MakeIndex(w, sp), sp);
+
+  auto output_iter = std::make_shared<IterArg>(sink->var_->name_hint_ + "_mixed_state",
+                                                initial->GetType(), initial, sp);
+  auto cube_tile_type = std::make_shared<TensorType>(
+      std::vector<ExprPtr>{MakeIndex(h, sp), MakeIndex(w, sp)}, matmul_type->dtype_);
+  auto cube_tile = std::make_shared<Var>(matmul_assign->var_->name_hint_ + "_mixed_tile",
+                                         cube_tile_type, sp);
+  std::vector<StmtPtr> loop_body;
+  const int64_t k_chunk = tile.k > 0 ? tile.k : K;
+  const int pipeline_stages = K / std::max<int64_t>(1, k_chunk) >= 3 ? 2 : 1;
+  for (StmtPtr& stmt : BuildTileMatmul(matmul->args_[0], matmul->args_[1], mi, ni, h, w, K,
+                                       k_chunk, matmul_type->dtype_, cube_tile,
+                                       matmul_assign->var_->name_hint_ + "_mixed", sp,
+                                       pipeline_stages)) {
+    loop_body.push_back(std::move(stmt));
+  }
+
+  std::unordered_map<const Var*, VarPtr> values;
+  values.emplace(matmul_assign->var_.get(), cube_tile);
+  std::unordered_map<const Var*, VarPtr> slices;
+  VarPtr vector_tile;
+  for (const AssignStmtPtr& source : vector_ops) {
+    auto call = As<Call>(source->value_);
+    std::vector<ExprPtr> args;
+    args.reserve(call->args_.size());
+    for (const ExprPtr& arg : call->args_) {
+      auto var = AsVarLike(arg);
+      if (var) {
+        auto value = values.find(var.get());
+        if (value != values.end()) {
+          args.push_back(value->second);
+          continue;
+        }
+      }
+      const auto [arg_m, arg_n] = Static2DShape(arg->GetType());
+      if (arg_m < 0) {
+        args.push_back(arg);
+        continue;
+      }
+      if (var) {
+        auto cached = slices.find(var.get());
+        if (cached != slices.end()) {
+          args.push_back(cached->second);
+          continue;
+        }
+      }
+      const int64_t slice_h = arg_m == 1 ? 1 : h;
+      const int64_t slice_w = arg_n == 1 ? 1 : w;
+      ExprPtr row = arg_m == 1 ? MakeIndex(0, sp) : mi;
+      ExprPtr col = arg_n == 1 ? MakeIndex(0, sp) : ni;
+      auto slice = registry.Create("tensor.slice",
+                                   {arg, MakeIndexTuple({slice_h, slice_w}, sp),
+                                    MakeTuple2(row, col, sp)}, sp);
+      auto sliced = std::make_shared<Var>(source->var_->name_hint_ + "_mixed_in",
+                                          slice->GetType(), sp);
+      loop_body.push_back(std::make_shared<AssignStmt>(sliced, slice, sp));
+      if (var) slices.emplace(var.get(), sliced);
+      args.push_back(sliced);
+    }
+    auto replay = registry.Create(call->op_->name_, args, call->kwargs_, sp);
+    vector_tile = std::make_shared<Var>(source->var_->name_hint_ + "_mixed_tile",
+                                        replay->GetType(), sp);
+    loop_body.push_back(std::make_shared<AssignStmt>(vector_tile, replay, sp));
+    values.emplace(source->var_.get(), vector_tile);
+  }
+
+  auto assemble = registry.Create("tensor.assemble",
+                                  {ExprPtr(output_iter), vector_tile, MakeTuple2(mi, ni, sp)}, sp);
+  auto next = std::make_shared<Var>(sink->var_->name_hint_ + "_mixed_next",
+                                    assemble->GetType(), sp);
+  loop_body.push_back(std::make_shared<AssignStmt>(next, assemble, sp));
+  loop_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{next}, sp));
+
+  auto item_loop = std::make_shared<ForStmt>(
+      trip, MakeIndex(0, sp), MakeIndex(trips, sp), MakeIndex(1, sp),
+      std::vector<IterArgPtr>{output_iter}, SeqStmts::Flatten(std::move(loop_body), sp),
+      std::vector<VarPtr>{sink->var_}, sp,
+      ForKind::Sequential, std::vector<std::pair<std::string, std::any>>{});
+
+  std::vector<StmtPtr> kernel_body{
+      std::make_shared<AssignStmt>(
+          block, registry.Create("tile.get_block_idx", {}, sp), sp),
+      item_loop};
+  auto kernel = std::make_shared<InCoreScopeStmt>(
+      std::optional<SplitMode>{SplitMode::UpDown}, name,
+      SeqStmts::Flatten(std::move(kernel_body), sp), sp,
+      std::vector<std::string>{},
+      std::vector<std::pair<std::string, std::any>>{
+          {"slot_num", static_cast<int>(plan.fifos[0].slot_count)}});
+  INTERNAL_CHECK(kernel->HasAttr("slot_num")) << "mixed InCore lost slot_num at construction";
+  auto scope = std::make_shared<SpmdScopeStmt>(
+      MakeIndex(plan.loop.active_groups, sp), /*sync_start=*/false,
+      name + "_spmd", kernel, sp);
+  LOG_INFO << "AutoFuse[mixed-plan]: group '" << name << "' emitted C->V grid="
+           << plan.m_partition.parts << "x" << plan.n_partition.parts
+           << " groups=" << plan.loop.active_groups << " trips=" << trips
+           << " lanes=" << plan.vector_lanes << " fifo_bytes=" << plan.fifos[0].slot_bytes
+           << (plan.model_overlap_granted ? " fifo-overlap" : " serial");
+  return std::vector<StmtPtr>{initial_assign, scope};
 }
 
 // Collect the Vars a flat tensor-op stmt READS. Covers the pre-emit auto_fuse body shapes:
@@ -4062,7 +4651,8 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
                         const std::unordered_map<const Stmt*, size_t>& stmt_op,
                         const std::unordered_map<const Stmt*, size_t>& stmt_exec,
                         const std::unordered_map<size_t, size_t>& group_p4_match,
-                        const std::vector<P4Match>& p4_matches) {
+                        const std::vector<P4Match>& p4_matches,
+                        bool* mixed_emit_failed) {
   std::vector<StmtPtr> body_stmts;
   if (auto seq = As<SeqStmts>(body)) {
     body_stmts = seq->stmts_;
@@ -4126,6 +4716,8 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
   std::unordered_set<size_t> cube_fallback_groups;
   std::unordered_set<size_t> cube_plan_attempted;
   std::unordered_set<size_t> cube_plan_emitted;
+  std::unordered_set<size_t> mixed_plan_attempted;
+  std::unordered_set<size_t> mixed_plan_emitted;
   std::unordered_set<const Stmt*> chain_done;  // chain tails already emitted with their head
   std::vector<StmtPtr> top;
   std::vector<StmtPtr> run;
@@ -4211,8 +4803,31 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
     }
     const long g = static_cast<long>(git->second);
     auto tile_it = stmt_tile.find(stmt.get());
+    if (GenericEmitEnabled() && MixedEmitEnabled() && tile_it != stmt_tile.end() &&
+        tile_it->second.mixed_schedule.feasible) {
+      const size_t mixed_group = static_cast<size_t>(g);
+      if (mixed_plan_emitted.count(mixed_group) != 0) continue;
+      if (mixed_plan_attempted.insert(mixed_group).second) {
+        flush();
+        auto members = group_members.find(mixed_group);
+        if (members != group_members.end()) {
+          if (auto emitted = EmitMixedScheduleGroup(
+                  members->second, stmt_op, required_live_outs, tile_it->second,
+                  "fused_" + std::to_string(g))) {
+            for (StmtPtr& emitted_stmt : *emitted) top.push_back(std::move(emitted_stmt));
+            mixed_plan_emitted.insert(mixed_group);
+            continue;
+          }
+        }
+        GenericDeclineB(
+            "MixedSchedulePlan cannot be replayed exactly; leaving the function unchanged",
+            stmt->span_);
+        if (mixed_emit_failed != nullptr) *mixed_emit_failed = true;
+        return body;
+      }
+    }
     if (GenericEmitEnabled() && tile_it != stmt_tile.end() && tile_it->second.cube_schedule.feasible &&
-        tile_it->second.cube_schedule.matmuls.size() > 1) {
+        !tile_it->second.cube_schedule.matmuls.empty()) {
       const size_t cube_group = static_cast<size_t>(g);
       if (cube_plan_emitted.count(cube_group) != 0) continue;
       if (cube_plan_attempted.insert(cube_group).second) {
@@ -4276,6 +4891,18 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
       for (auto& s : *tiled) {
         top.push_back(std::move(s));
       }
+    } else if (cube_fallback_groups.count(static_cast<size_t>(g)) != 0) {
+      // A declined CubeSchedulePlan must become genuinely standalone kernels.
+      // Keeping several fallback matmuls in one InCore scope would forward a
+      // tile.matmul's FP32 L0C result directly to the next BF16/FP16 matmul,
+      // bypassing the tensor-level store/narrow + reload boundary that makes
+      // the fallback legal.  One scope per source op preserves its declared
+      // tensor dtype and makes the materialization explicit.
+      flush();
+      const auto op_it = stmt_op.find(stmt.get());
+      const std::string fallback_name = "fused_" + std::to_string(g) + "_fallback_" +
+                                        std::to_string(op_it != stmt_op.end() ? op_it->second : 0);
+      top.push_back(std::make_shared<InCoreScopeStmt>(std::nullopt, fallback_name, stmt, stmt->span_));
     } else {  // other compute op: accumulate into the scoped run
       if (run_group != -1 && run_group != g) {
         flush();
@@ -4602,7 +5229,8 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     LOG_INFO << "AutoFuse[" << func->name_ << "]: backend "
              << (backend::BackendConfig::IsConfigured() ? "SoC" : "default(910B)") << " — cube_cores="
              << p.num_cube_cores << " vector_cores=" << p.num_vector_cores << " L1=" << p.l1_capacity
-             << " Acc=" << p.cube_capacity << " UB=" << p.vec_capacity;
+             << " Acc=" << p.cube_capacity << " UB=" << p.vec_capacity << " cube_l0_cost="
+             << (p.use_hierarchical_cube_cost ? "exact" : "analytic");
     LOG_INFO << "AutoFuse[" << func->name_ << "]: intercepted tensor graph — " << p.ops.size()
              << " ops, " << p.tensors.size() << " tensors";
     for (size_t i = 0; i < p.ops.size(); ++i) {
@@ -4666,13 +5294,10 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       DumpSolutionJson(sol, base + ".sol.json");
     }
 
-    // Tier-B (A2 homogeneity): mixed admission remains off in the production
-    // adapter until a MixedSchedulePlan emitter inserts the explicit GM FIFO
-    // crossings and invokes the cross-core pipeline passes. A research build or
-    // future runtime opt-in can still return a mixed group; retain its solver
-    // descriptor below, but surface that today's emitter would split it across
-    // dispatch paths and therefore would not realize the priced pipeline.
-    if (GenericEmitEnabled()) {
+    // A mixed group may only appear when the dedicated gate admitted the exact
+    // C->V compiler subset.  Keep this as a Tier-B backstop against a solver
+    // policy regression while the gate is off.
+    if (GenericEmitEnabled() && !MixedEmitEnabled()) {
       for (size_t s = 0; s < sol.num_steps(); ++s) {
         bool has_cube = false, has_vector = false;
         const auto& gops = sol.step(s).subgraph.ops();
@@ -4683,7 +5308,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
         }
         if (has_cube && has_vector)
           GenericDeclineB("mixed cube+vector group " + std::to_string(s) +
-                              " (cross-engine, A2/S1) — realized as split kernels, not fused",
+                              " appeared while PYPTO_AUTOFUSE_MIXED is disabled",
                           builder.op_stmts[gops.front()]->span_);
       }
     }
@@ -4745,7 +5370,9 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                     selected_cost.parallel_split)
               : ::MixedSchedulePlan{};
       SolverTile tile(cfg.w, cfg.h,
-                      selected_cube.feasible ? selected_cube.config.k : cfg.k,
+                      selected_cube.feasible
+                          ? selected_cube.config.k
+                          : (selected_mixed.feasible ? selected_mixed.config.k : cfg.k),
                       selected_cost.parallel_split, cfg.parts_m, cfg.parts_n,
                       selected_stream, selected_cube, selected_mixed);
       if (dump_plans || force_env != nullptr) {
@@ -4776,7 +5403,9 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                           pc, {}, {}, pr.parallel_split)
                     : ::MixedSchedulePlan{};
             tile = SolverTile(pc.w, pc.h,
-                              forced_cube.feasible ? forced_cube.config.k : pc.k,
+                              forced_cube.feasible
+                                  ? forced_cube.config.k
+                                  : (forced_mixed.feasible ? forced_mixed.config.k : pr.config.k),
                               pr.parallel_split, pc.parts_m, pc.parts_n,
                               forced_stream, forced_cube, forced_mixed);
             forced_here = true;
@@ -4811,8 +5440,14 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       }
     }
     auto new_func = MutableCopy(wfunc);
-    new_func->body_ = EmitFusedScopes(wfunc->body_, stmt_group, stmt_tile, stmt_op, stmt_exec, group_p4_match,
-                                      builder.p4_matches);
+    bool mixed_emit_failed = false;
+    new_func->body_ = EmitFusedScopes(wfunc->body_, stmt_group, stmt_tile, stmt_op, stmt_exec,
+                                      group_p4_match, builder.p4_matches,
+                                      &mixed_emit_failed);
+    if (mixed_emit_failed) {
+      new_functions.emplace(gvar, func);
+      continue;
+    }
     // Wire the return-based fused function to a named Out param so orchestration
     // codegen emits an add_output write-back (device / ST harness bind output by
     // param position, not by return value). No-op for functions that already

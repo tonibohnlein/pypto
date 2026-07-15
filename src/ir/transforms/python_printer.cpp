@@ -53,6 +53,7 @@
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/l0_tile_chooser.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 
@@ -941,14 +942,16 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
 
   // Serialize ONLY op-call attrs that genuinely need to survive print -> parse,
   // via an explicit allowlist. Most attrs are re-derived by the parser or have
-  // bespoke syntax. ``pipeline_membership`` and the compiler-generated
-  // Tensor-to-Mat bridge provenance have neither and must survive until their
-  // downstream passes consume them. Keep this helper available to special call
-  // forms below so an early return cannot silently drop either attr.
+  // bespoke syntax. ``pipeline_membership``, the compiler-generated
+  // Tensor-to-Mat bridge provenance, and AutoFuse's L0 plan contract have none
+  // and must survive until their downstream passes consume them. Keep this
+  // helper available to special call forms below so an early return cannot
+  // silently drop any of them.
   auto print_serialized_attrs = [&](bool need_comma) {
     std::vector<const std::pair<std::string, std::any>*> serialized_attrs;
     for (const auto& kv : op->attrs_) {
-      if (kv.first == kPipelineMembershipAttr || kv.first == kCompilerTensorToTileMatBridgeAttr) {
+      if (kv.first == kPipelineMembershipAttr || kv.first == kCompilerTensorToTileMatBridgeAttr ||
+          kv.first == utils::kL0MatmulPlanAttr || kv.first == utils::kL0MatmulOutputTargetAttr) {
         serialized_attrs.push_back(&kv);
       }
     }

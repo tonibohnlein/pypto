@@ -146,8 +146,11 @@ VarPtr MakeFreshVar(const VarPtr& original, const std::string& suffix) {
 /// two accumulators. See `loop_double_buffers_c_` in the tagger.
 class PipelineMembershipTagger : public IRMutator {
  public:
-  PipelineMembershipTagger(int32_t group, int32_t stage, bool loop_double_buffers_c)
-      : group_(group), stage_(stage), loop_double_buffers_c_(loop_double_buffers_c) {}
+  PipelineMembershipTagger(int32_t group, int32_t stage, bool loop_double_buffers_c, bool gm_to_l1_only)
+      : group_(group),
+        stage_(stage),
+        loop_double_buffers_c_(loop_double_buffers_c),
+        gm_to_l1_only_(gm_to_l1_only) {}
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     // Recurse first so nested control flow (e.g. an inner lowered pipeline) is
@@ -160,6 +163,17 @@ class PipelineMembershipTagger : public IRMutator {
     if (!tile_type) return visited;
     auto call = std::dynamic_pointer_cast<const Call>(assign->value_);
     if (!call) return visited;
+
+    // The enclosing AutoFuse loop overlaps GM->L1 K-window loads with the
+    // current window's cube work. Nested Left/Right/Acc/Bias tiles belong to
+    // the child L0MatmulPlan and are consumed serially by that cube work; keep
+    // only their inner L1->L0 membership instead of forming a 2x2 stage-depth
+    // product with the outer pipeline.
+    const auto memory = tile_type->GetMemorySpace();
+    if (gm_to_l1_only_ && (memory == MemorySpace::Left || memory == MemorySpace::Right ||
+                           memory == MemorySpace::Acc || memory == MemorySpace::Bias)) {
+      return visited;
+    }
 
     // Cube accumulators are written by the serialized cube, never co-live across a
     // pipeline stage — skip them so MemoryReuse coalesces them onto the single L0C
@@ -195,6 +209,7 @@ class PipelineMembershipTagger : public IRMutator {
   int32_t group_;
   int32_t stage_;
   bool loop_double_buffers_c_;
+  bool gm_to_l1_only_;
 };
 
 std::pair<StmtPtr, std::vector<ExprPtr>> SplitBodyYield(const StmtPtr& body) {
@@ -343,6 +358,7 @@ class LowerPipelineMutator : public IRMutator {
     // (co-live drain ping-pong); every other pipeline loop leaves cube accumulators
     // untagged (see the tagger). Read the attr once, not per clone.
     const bool loop_double_buffers_c = op->GetAttr<bool>(kPipelineDoubleBufferCAttr, false);
+    const bool gm_to_l1_only = op->GetAttr<bool>(kPipelineGmToL1OnlyAttr, false);
     for (int64_t k = 0; k < n_clones; ++k) {
       std::unordered_map<const Var*, ExprPtr> sub_map;
       sub_map[op->loop_var_.get()] = OffsetIndex(base, k * step, sp);
@@ -356,7 +372,7 @@ class LowerPipelineMutator : public IRMutator {
           << cloned_yields.size();
       // Tag this clone's tile definitions with (group, stage=k) so MemoryReuse
       // keeps the F clones' buffers apart (explicit ping-pong constraint).
-      PipelineMembershipTagger tagger(group, static_cast<int32_t>(k), loop_double_buffers_c);
+      PipelineMembershipTagger tagger(group, static_cast<int32_t>(k), loop_double_buffers_c, gm_to_l1_only);
       cloned_stmts = tagger.VisitStmt(cloned_stmts);
       clones.push_back(cloned_stmts);
       prev_yields = std::move(cloned_yields);

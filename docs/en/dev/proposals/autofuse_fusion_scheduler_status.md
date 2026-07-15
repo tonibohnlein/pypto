@@ -292,7 +292,7 @@ The G8 descriptor path deliberately does not change those descriptor-free C++ be
 Real PyPTO problems now carry lowering semantics, so their source-op startup/count-mode work may
 change; this separates an intended fidelity correction from the plan-refactor preservation control.
 
-**Current host gates.** AutoFuse UT is 40 passed / 1 expected xfail; the solver suite is 450 passed
+**Current host gates.** AutoFuse UT is 46 passed with no xfail; the solver suite is 461 passed
 with the same 7 documented baseline failures. The vector checkpoint's device file
 collects 51 A2/A3 cases. Four persistent cases
 cover exact P4 softmax `[128,8192]`, Welford layernorm at input mean `+2000`, a scaled-softmax near
@@ -377,64 +377,60 @@ ragged-K peel lowering test + deep-T decline logging; mixed cube+vector (a separ
 
 ## 8. Cube-only plan and current fidelity boundary
 
-The cube path now follows the same solver-owned-plan architecture as the vector path, with a
-separate `CubeSchedulePlan` for cube-specific decisions: requested tensor regions, per-instance K
-streams, L1 residency, L0 subdivision, spatial ownership, and split-K. The candidate-invariant
-request topology is built once in `Ascend910BCost::create()`; candidate evaluation performs only an
-O(nodes) stack-local derivation. The complete descriptor is reconstructed for the winning/forced
-configuration and is not stored in `CostResult` or the local-search cache.
+The cube path now has the same solver-owned-plan discipline as the vector path, split across two
+hardware levels.
 
-**General request model.** For `O=A@B`, a consumer request `O[rows,cols]` recursively requests
-`A[rows,K]` and `B[K,cols]`. Requests are memoized by tensor plus symbolic height/width bindings.
-Identical requests share one producer; different fan-out roles become different instances and pay
-recomputation. The resulting postorder supports produced RHS, both inputs produced, non-square
-trees, deep chains, fan-out, and multiple roots. One root can bind its contraction to `ParallelK`;
-multiple roots force `S=1` because one split coordinate cannot identify several atomic targets.
+**`CubeSchedulePlan` (cross-core and GM/L1).** The plan records exact spatial/split work units,
+recursive producer requests, L1 pebble lifetimes, per-request GM K windows, output/L0C variants,
+final drains, and the split seed. The request topology is built once in `create()`; the full plan is
+reconstructed for a winning/forced configuration and is not stored in `CostResult`.
 
-**Plan contents.** Every `CubeMatmulSchedule` records its request-instance ID, producer-instance
-dependencies, exact output/LHS/RHS bindings and extents, contraction/share, L1 window, actual load
-chunk, rolled trip count, serial tail, and loop stage. The group records the exact partitions,
-split/work units, peak L1, L0 M/N tile dimensions, roots, seed requirement, and overlap bits.
-Feasibility, recursive cube MAC/extract work, boundary traffic, and plan reconstruction consume this
-same request DAG.
+**`L0MatmulPlan` (L1/L0).** Cube costing now has two modes. The default analytic mode ranks outer
+plans with the grounded fixed-base-tile cube/MTE1 surrogate and attaches only the semantic
+Acc/L1/GM residency intent; `AutoTileMatmulL0` independently chooses detailed L0 geometry. Setting
+`PYPTO_AUTOFUSE_EXACT_L0_COST=1` enables the prospective `-O3` mode: every candidate is priced with
+the shared L0 chooser and the winning tensor phases carry a detailed record that AutoTile re-derives
+and validates before creating Left/Right/Acc IR.
 
-**Generic emitter.** For uniform multi-matmul grids, AutoFuse replays the plan
-producer-before-consumer. Produced operands stay local; an intermediate spanning several L0 tiles is
-assembled in an explicit L1 tensor. Each node uses its own planned K loop. Distinct fan-out roles
-are recomputed as priced. Sink split-K emits a tiled zero seed and atomic stores; `S=1` stores
-directly. Multiple roots at `S=1` are supported. Strict mode reports a contract rejection; normal
-mode falls back to dependency-ordered standalone matmuls rather than silently emitting another
-algorithm. FP16/BF16 inputs with FP32 accumulation are priced from operand precision. A
-low-precision final output that would need a K carry declines until FIXPIPE narrowing is explicit.
+**Grounded nesting.** PTO's manual and automode A2/A3 GEMMs put the output tile outside K. One L0C
+accumulator survives the complete GM→L1 and L1→L0 K stream, then drains once. A2/A3 has Acc→Mat/GM
+but no Mat→Acc. AutoFuse now emits exactly this order. The outer loop is tagged GM→L1-only so its
+stage depth does not multiply the child L0 ping/pong buffers.
 
-**Serial-overlap fix.** The old scalar `K/S ≥ 32` gate is removed for pure cube. The cost now grants
-its global `max(compute,DDR)` only if every request that loads a boundary operand reconstructs a
-real stage-2 rolled loop. A one-trip loop therefore serializes and can change the natural argmin;
-this is a deliberate fidelity correction, not a descriptor-only refactor.
+**Exact-mode phase cost.** Uniform candidates sum serial first windows, rolled stage-2
+rooflines, serial K tails, exact ragged output variants, and one final drain. Boundary requests are
+charged once per emitted output tile, including the known LHS reload across N subtiles. Split seed
+fill/store/tasks and its kernel-fill wave are explicit. The child L0 plan has the same phase
+decomposition. Its already-grounded geometry ordering is retained until a per-iteration PTO event
+term is measured; using phase granularity alone would falsely prefer baseK=16.
 
-**Host validation.** Solver tests cover exact role regions/peaks, non-square both-produced trees,
-fan-out role switches, multi-sink, plan L0 dimensions, compact cache behavior, and the one-trip
-no-overlap case. AutoFuse tests cover forced recursive plans, split/no-split, ragged K, fan-out,
-multiple outputs, Torch numerics, strict fallback, and default lowering of a chain whose
-intermediate spans multiple L0 tiles.
+**Dtype contract.** BF16/FP16 operands accumulate in FP32 L0C. An internal producer narrows once to
+BF16/FP16 Mat, matching PTO's fused-chain kernel; roots narrow/store to their declared output.
+Same-type FP32 internal L1 handoff is not an A2/A3 instruction, so an explicitly FP32 chain is
+partitioned into standalone kernels. Direct Mat→GM store is legal and no longer detours through Vec.
 
-**Remaining gaps, in implementation order:**
+**Host validation.** PTO Fusebox reports 461 passing checks with the same seven documented baseline
+failures; the full AutoFuse file reports 47 passing tests. Compiler coverage includes
+natural/forced lone matmuls, BF16 recursive trees/fan-out/deep
+chains, FP32-chain decline, split seed, ragged K, multi-window output residency, a 192 KiB internal
+region, descriptor consumption, Torch numerics, and PTOAS-backed full lowering. The former strict
+chained-matmul xfail now passes.
 
-1. Reconcile GM→L1 reload with L0 subdivision. The model charges each logical boundary request once
-   per work unit, but the current emitter nests a full K stream inside each L0 output subtile. Either
-   multiply traffic by that loop or retain input panels with explicitly priced L1/accumulator state.
-2. Replace the remaining subgraph-wide cube roofline with per-node init/rolled/tail/store phases.
-   Only each concrete rolled phase may receive overlap; serial tails cannot hide behind another
-   node's work.
-3. Price the split zero-seed/barrier and per-task launch overhead.
-4. Close spatial fidelity. AutoFuse currently filters unequal multi-op grids. The lone-matmul
-   ceil+clamp path is numerically idempotent but can execute more max-size work than balanced LPT
-   prices; implement exact non-uniform shapes or price the actual overlap.
-5. Represent a shared boundary panel and its lifetime before emitting a request that the model
-   deduplicates. The current plan emitter declines that family.
-6. Add a planned final FIXPIPE phase for streamed/split FP16/BF16 outputs; today they fall back.
-7. Run forced-plan correctness, trace traffic/overlap, wall-versus-model, and regret validation on
-   910B2. Keep mixed cube+vector outside this charter.
+**Remaining gaps:**
+
+1. Non-uniform buildable cost/emission: lone split=1 still uses legacy ceil-and-clamp; ragged
+   split-K and unequal multi-op grids decline.
+2. Optional retained boundary panels: the current model faithfully charges reload per output tile;
+   introducing reuse requires an explicit lifetime and matching emitter.
+3. Ground a per-baseK synchronization/event term before allowing phase composition to change the
+   shared chooser's geometry ranking.
+4. Expand the Acc→Mat capability table beyond BF16/FP16 only when PTO supports the exact conversion.
+5. Improve the analytic reload/extract surrogate, remove full plan construction from the exact
+   candidate hot path, and run forced analytic-winner versus exact-winner silicon regret plus compile-
+   time comparisons before mapping exact mode to `-O3`.
+5. Device-validate nested MTE2/MTE1/Matrix/FIXPIPE overlap, bytes, narrowing, split atomics, and
+   forced-plan regret on 910B2 with the latest PTOAS.
+6. Profile and optimize buildable cube candidate evaluation after fidelity closure.
 
 The authoritative obligation table and validation ladder are in
 `docs/en/dev/proposals/autofuse_cube_cost_model_emit_contract.md`.

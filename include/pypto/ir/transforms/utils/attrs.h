@@ -85,6 +85,19 @@ inline constexpr const char* kPipelineOverlapStoresAttr = "pipeline_overlap_stor
 /// ``CanonicalizeIOOrder`` alongside ``pipeline_stages`` and ``pipeline_overlap_stores``.
 inline constexpr const char* kPipelineDoubleBufferCAttr = "pipeline_double_buffer_c";
 
+/// Optional ``bool`` policy attr on a GM->L1 ``ForKind::Pipeline`` loop emitted
+/// by AutoFuse. When true, the loop's stage replication double-buffers only the
+/// GM/L1 boundary. Tile definitions in the nested matmul-managed L0 spaces
+/// (Left/Right/Acc/Bias) retain memberships from their own L1->L0 pipeline, but
+/// do not acquire an additional membership from this enclosing loop.
+///
+/// A CubeSchedulePlan owns the GM->L1 K-window pipeline, while the shared
+/// L0MatmulPlan owns the nested L1->L0 pipeline. Multiplying their buffer depths
+/// would request the Cartesian product of both stage counts even though the
+/// serialized cube consumes one outer stage's L0 panels at a time. The marker is
+/// consumed with the other pipeline policy attrs by ``CanonicalizeIOOrder``.
+inline constexpr const char* kPipelineGmToL1OnlyAttr = "pipeline_gm_to_l1_only";
+
 /// Attribute key marking a tile-producing ``Call`` with the pipeline-stage
 /// membership(s) of the tile it defines. ``LowerPipelineLoops`` sets it when it
 /// replicates a ``pl.pipeline`` body: every clone of a replicated region is one

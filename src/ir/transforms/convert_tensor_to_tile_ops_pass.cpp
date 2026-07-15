@@ -38,6 +38,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/l0_tile_chooser.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -604,9 +605,35 @@ class TensorToTileMutator : public TypePropagatingMutator {
       stmts.push_back(VisitStmt(prologue_stmt));
     }
 
+    // Preserve AutoFuse's solver-owned child L0 plan on the corresponding tile
+    // matmul. Converters intentionally do not receive compiler attrs, so this
+    // explicit handoff is the one place where the tensor-level schedule crosses
+    // into AutoTileMatmulL0's tile-level realization.
+    ExprPtr converted_result = conv_result.result;
+    if (call->HasAttr(utils::kL0MatmulPlanAttr) ||
+        call->HasAttr(utils::kL0MatmulOutputTargetAttr)) {
+      auto converted_call = As<Call>(converted_result);
+      INTERNAL_CHECK_SPAN(
+          converted_call && (IsOp(converted_call, "tile.matmul") || IsOp(converted_call, "tile.matmul_acc")),
+          call->span_)
+          << "ConvertTensorToTileOps: an AutoFuse L0 handoff must lower to tile.matmul or tile.matmul_acc";
+      auto attrs = converted_call->attrs_;
+      if (call->HasAttr(utils::kL0MatmulOutputTargetAttr)) {
+        attrs.emplace_back(utils::kL0MatmulOutputTargetAttr,
+                           call->GetAttr<int>(utils::kL0MatmulOutputTargetAttr));
+      }
+      if (call->HasAttr(utils::kL0MatmulPlanAttr)) {
+        attrs.emplace_back(utils::kL0MatmulPlanAttr,
+                           call->GetAttr<std::string>(utils::kL0MatmulPlanAttr));
+      }
+      converted_result =
+          std::make_shared<Call>(converted_call->op_, converted_call->args_, converted_call->kwargs_,
+                                 std::move(attrs), converted_call->GetType(), converted_call->span_);
+    }
+
     // Revisit result after mutating prologue — prologue conversions may have
     // remapped vars that the result expression references.
-    auto new_result = VisitExpr(conv_result.result);
+    auto new_result = VisitExpr(converted_result);
 
     auto tile_name = MakeTileValueName(op->var_->name_hint_);
     auto tile_var = std::make_shared<Var>(tile_name, new_result->GetType(), op->var_->span_);

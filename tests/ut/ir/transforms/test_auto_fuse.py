@@ -36,9 +36,10 @@ from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 # plus the #1895 auto_chunk removal changed the solver's decisions and migrated the emit
 # onto SPMD. Plans with split-K use a tiled zero-seed + atomic-add merge; plans without it
 # write their spatial tiles directly. The old pl.auto_chunk / matmul_acc assertions were
-# stale. All cases are now re-derived and live. The one exception is the chained-matmul
-# LOWERING, which is xfail on hw-native-sys/pypto#1908 (an AllocateMemoryAddr bump-allocator
-# limitation that can't pack the chain's L0A buffers — NOT an AutoFuse emit bug).
+# stale. All cases are now re-derived and live. The shared L0 planner and
+# output-tile-outer replay also remove the former chained-matmul packing xfail:
+# producer and consumer child plans are lowered sequentially instead of keeping
+# both sets of L0 ping-pong buffers live at once.
 
 
 class TestAutoFuse:
@@ -150,43 +151,115 @@ class TestAutoFuse:
         assert "spmd_block_idx" in mlir
         assert "atomic_add" not in mlir
 
-    def test_large_matmul_tiled_seed_avoids_ub_overflow(self, ascend_backend):
-        """A large matmul's split-K zero-seed is TILED so it never overflows UB.
+    def test_large_matmul_ragged_grid_avoids_fictional_split_seed(self, ascend_backend, monkeypatch):
+        """A ragged cube grid cannot be combined with split-K atomic ownership.
 
-        The grounded 910B solver splits-K on a 256x256 matmul (tile=128x128/split=4). The
-        zero-seed must NOT materialize the full 256x256 output (262144 B > the 188416 B UB
-        budget) on one core — AutoFuse tiles it across SPMD blocks (one [128,128] zero tile
-        each), so the whole thing lowers end-to-end. Regression for the seed-overflow bug.
-        (The old L0c-overflow framing is obsolete: fitting Acc is AutoTileMatmulL0's job.)
+        Ceil-and-clamp spatial tiles overlap at the output edge.  They are valid for a
+        split=1 lone matmul because the overlapping writes are idempotent, but atomic
+        split-K would assign those edge elements to multiple spatial regions.  The
+        buildable model must therefore choose a split=1 plan and emit no vector seed.
+        The separate 512x512 regression below covers a legal uniform split-K seed.
         """
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
 
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
             def mm(
                 self,
-                a: pl.Tensor[[256, 256], pl.FP32],
-                b: pl.Tensor[[256, 256], pl.FP32],
-            ) -> pl.Tensor[[256, 256], pl.FP32]:
-                c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b)
+                a: pl.Tensor[[272, 272], pl.FP32],
+                b: pl.Tensor[[272, 272], pl.FP32],
+            ) -> pl.Tensor[[272, 272], pl.FP32]:
+                c: pl.Tensor[[272, 272], pl.FP32] = pl.matmul(a, b)
                 return c
 
-        # Must lower end-to-end without a UB-overflow VerificationError on the seed kernel.
+        # Must lower end-to-end as one cube kernel without inventing a split seed.
         out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
         by_type: dict[str, list] = {}
         for f in incores:
             by_type.setdefault(str(f.func_type), []).append(f)
         assert len(by_type.get("FunctionType.AIC", [])) == 1, [f.name for f in incores]
-        assert len(by_type.get("FunctionType.AIV", [])) == 1, [f.name for f in incores]
+        assert len(by_type.get("FunctionType.AIV", [])) == 0, [f.name for f in incores]
 
-        # The seed kernel is SPMD-tiled (block-indexed), not a single full-output alloc.
-        seed = by_type["FunctionType.AIV"][0]
-        seed_mlir = codegen.PTOCodegen().generate(ir.Program([seed], seed.name, seed.span))
-        assert "spmd_block_idx" in seed_mlir
         cube = by_type["FunctionType.AIC"][0]
         cube_mlir = codegen.PTOCodegen().generate(ir.Program([cube], cube.name, cube.span))
-        assert "cube" in cube_mlir and "atomic_add" in cube_mlir  # split-K merge
+        assert "cube" in cube_mlir and "spmd_block_idx" in cube_mlir
+        assert "atomic_add" not in cube_mlir
+
+    def test_cube_l0_cost_modes_separate_residency_intent_from_exact_plan(self):
+        """Analytic costing delegates L0 geometry; exact costing pins it.
+
+        Both modes need the semantic Acc/L1/GM handoff because AutoFuse owns
+        the outer GM-to-L1 window loop. Only exact/co-optimized costing may
+        serialize the detailed L0 geometry that AutoTileMatmulL0 must replay.
+        """
+        script = textwrap.dedent(
+            """
+            import os
+
+            import pypto.language as pl
+            from pypto import backend, ir, passes
+            from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+            os.environ["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+            os.environ["PYPTO_AUTOFUSE_FORCE_PLAN"] = "64,64,1,1,1"
+            os.environ.pop("PYPTO_AUTOFUSE_EXACT_L0_COST", None)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mm(
+                    self,
+                    a: pl.Tensor[[64, 64], pl.FP32],
+                    b: pl.Tensor[[64, 64], pl.FP32],
+                ) -> pl.Tensor[[64, 64], pl.FP32]:
+                    c: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                    return c
+
+            analytic = passes.auto_fuse()(Prog)
+            analytic_body = next(
+                f for _, f in analytic.functions.items() if f.name == "mm"
+            ).as_python()
+            assert "__autofuse_l0_output_target" in analytic_body
+            assert "__autofuse_l0_matmul_plan" not in analytic_body
+
+            lowered = PassManager.get_strategy(
+                OptimizationStrategy.Default
+            ).run_passes(Prog)
+            aic = [
+                f for _, f in lowered.functions.items()
+                if str(f.func_type) == "FunctionType.AIC"
+            ]
+            assert len(aic) == 1
+            lowered_body = aic[0].as_python()
+            assert "__autofuse_l0_output_target" not in lowered_body
+            assert "__autofuse_l0_matmul_plan" not in lowered_body
+
+            os.environ["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
+            exact = passes.auto_fuse()(Prog)
+            exact_body = next(
+                f for _, f in exact.functions.items() if f.name == "mm"
+            ).as_python()
+            assert "__autofuse_l0_output_target" in exact_body
+            assert "__autofuse_l0_matmul_plan" in exact_body
+            """
+        )
+        env = os.environ.copy()
+        env.pop("PYPTO_AUTOFUSE_EXACT_L0_COST", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
 
     def test_ragged_cube_region_subdivides_l0c_exactly(self):
         """A ragged solver work unit larger than L0c uses exact, non-overlapping subtiles.
@@ -205,6 +278,7 @@ class TestAutoFuse:
             import pypto.language as pl
             from pypto import backend, passes
             from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
             from pypto.debug import torch_codegen
 
             backend.set_backend_type(BackendType.Ascend910B)
@@ -421,34 +495,34 @@ class TestAutoFuse:
     def test_chained_matmul_fuses_to_one_kernel(self, ascend_backend, monkeypatch):
         """The natural buildable cube plan fuses a two-matmul chain across AIC cores.
 
-        Buildable mode filters unequal multi-op region shapes, so the natural plan is
-        an exact ``2 M x 1 N x 2 K`` grid. One AIV seed initializes the atomic target;
-        one four-work-unit AIC kernel recursively produces the requested ``A@B`` K
-        share and immediately consumes it in the sink. The intermediate never reaches
-        a boundary ``assemble`` or a standalone kernel.
+        One AIC SPMD kernel recursively produces the requested ``A@B`` regions into an
+        L1 scratch and immediately consumes them in the sink.  Each output subtile stays
+        in L0C across its complete K-window sequence and drains once.  No intermediate
+        reaches GM and a split=1 winner needs neither a vector seed nor atomic stores.
         """
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
 
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
             def chain(
                 self,
-                a: pl.Tensor[[128, 256], pl.FP32],
-                b: pl.Tensor[[256, 128], pl.FP32],
-                d: pl.Tensor[[128, 256], pl.FP32],
-            ) -> pl.Tensor[[128, 256], pl.FP32]:
-                t: pl.Tensor[[128, 128], pl.FP32] = pl.matmul(a, b)
-                c: pl.Tensor[[128, 256], pl.FP32] = pl.matmul(t, d)
+                a: pl.Tensor[[128, 256], pl.BF16],
+                b: pl.Tensor[[256, 128], pl.BF16],
+                d: pl.Tensor[[128, 256], pl.BF16],
+            ) -> pl.Tensor[[128, 256], pl.BF16]:
+                t: pl.Tensor[[128, 128], pl.BF16] = pl.matmul(a, b)
+                c: pl.Tensor[[128, 256], pl.BF16] = pl.matmul(t, d)
                 return c
 
         body = next(f for _, f in passes.auto_fuse()(Prog).functions.items() if f.name == "chain").as_python()
         assert "pl.at(level=pl.Level.CORE_GROUP" not in body
-        assert "pl.spmd(4" in body and "pl.spmd(2" in body
-        assert body.count("pl.spmd(") == 2  # seed plus one fused cube kernel
-        assert body.count("pl.tensor.matmul(") == 2
-        assert body.count("pl.tensor.assemble(") == 2  # zero seed and root atomic store
-        assert body.count("AtomicType.Add") == 1
+        assert body.count("pl.spmd(") == 1
+        assert body.count("pl.tensor.matmul(") >= 2
+        assert "pl.tensor.create_l1(" in body
+        assert body.count("pl.tensor.assemble(") >= 2  # internal L1 plus root GM drains
+        assert "AtomicType.Add" not in body
         assert "pl.Out[" in body
 
     def test_produced_rhs_cube_plan_emits_recursive_tree(self):
@@ -477,14 +551,14 @@ class TestAutoFuse:
                 @pl.function(attrs={"auto_fuse": True})
                 def tree(
                     self,
-                    a: pl.Tensor[[32, 48], pl.FP32],
-                    b: pl.Tensor[[48, 80], pl.FP32],
-                    c: pl.Tensor[[80, 64], pl.FP32],
-                    d: pl.Tensor[[64, 96], pl.FP32],
-                ) -> pl.Tensor[[32, 96], pl.FP32]:
-                    lhs: pl.Tensor[[32, 80], pl.FP32] = pl.matmul(a, b)
-                    rhs: pl.Tensor[[80, 96], pl.FP32] = pl.matmul(c, d)
-                    out: pl.Tensor[[32, 96], pl.FP32] = pl.matmul(lhs, rhs)
+                    a: pl.Tensor[[32, 48], pl.BF16],
+                    b: pl.Tensor[[48, 80], pl.BF16],
+                    c: pl.Tensor[[80, 64], pl.BF16],
+                    d: pl.Tensor[[64, 96], pl.BF16],
+                ) -> pl.Tensor[[32, 96], pl.BF16]:
+                    lhs: pl.Tensor[[32, 80], pl.BF16] = pl.matmul(a, b)
+                    rhs: pl.Tensor[[80, 96], pl.BF16] = pl.matmul(c, d)
+                    out: pl.Tensor[[32, 96], pl.BF16] = pl.matmul(lhs, rhs)
                     return out
 
             after = passes.auto_fuse()(Prog)
@@ -498,10 +572,10 @@ class TestAutoFuse:
             namespace = {}
             exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
             torch.manual_seed(0)
-            a = torch.randn(32, 48, dtype=torch.float32) * 0.05
-            b = torch.randn(48, 80, dtype=torch.float32) * 0.05
-            c = torch.randn(80, 64, dtype=torch.float32) * 0.05
-            d = torch.randn(64, 96, dtype=torch.float32) * 0.05
+            a = torch.randn(32, 48, dtype=torch.bfloat16) * 0.05
+            b = torch.randn(48, 80, dtype=torch.bfloat16) * 0.05
+            c = torch.randn(80, 64, dtype=torch.bfloat16) * 0.05
+            d = torch.randn(64, 96, dtype=torch.bfloat16) * 0.05
             expected = (a @ b) @ (c @ d)
             actual = namespace["tree"](a, b, c, d)
             assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-3), (
@@ -511,6 +585,7 @@ class TestAutoFuse:
         )
         env = os.environ.copy()
         env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
         env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
         env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "48,16,5,2,2"
         env["PYPTO_AUTOFUSE_STRICT"] = "1"
@@ -548,17 +623,17 @@ class TestAutoFuse:
                 @pl.function(attrs={"auto_fuse": True})
                 def fanout(
                     self,
-                    a: pl.Tensor[[64, 64], pl.FP32],
-                    b: pl.Tensor[[64, 64], pl.FP32],
-                    c: pl.Tensor[[64, 64], pl.FP32],
-                    d: pl.Tensor[[64, 64], pl.FP32],
+                    a: pl.Tensor[[64, 64], pl.BF16],
+                    b: pl.Tensor[[64, 64], pl.BF16],
+                    c: pl.Tensor[[64, 64], pl.BF16],
+                    d: pl.Tensor[[64, 64], pl.BF16],
                 ) -> tuple[
-                    pl.Tensor[[64, 64], pl.FP32],
-                    pl.Tensor[[64, 64], pl.FP32],
+                    pl.Tensor[[64, 64], pl.BF16],
+                    pl.Tensor[[64, 64], pl.BF16],
                 ]:
-                    shared: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
-                    left: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(shared, c)
-                    right: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(d, shared)
+                    shared: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(a, b)
+                    left: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(shared, c)
+                    right: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(d, shared)
                     return left, right
 
             after = passes.auto_fuse()(Prog)
@@ -571,7 +646,7 @@ class TestAutoFuse:
             exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
             torch.manual_seed(1)
             a, b, c, d = (
-                torch.randn(64, 64, dtype=torch.float32) * 0.05 for _ in range(4)
+                torch.randn(64, 64, dtype=torch.bfloat16) * 0.05 for _ in range(4)
             )
             shared = a @ b
             actual_left, actual_right = namespace["fanout"](a, b, c, d)
@@ -583,16 +658,16 @@ class TestAutoFuse:
                 @pl.function(attrs={"auto_fuse": True})
                 def deep(
                     self,
-                    a: pl.Tensor[[64, 64], pl.FP32],
-                    b: pl.Tensor[[64, 64], pl.FP32],
-                    c: pl.Tensor[[64, 64], pl.FP32],
-                    d: pl.Tensor[[64, 64], pl.FP32],
-                    e: pl.Tensor[[64, 64], pl.FP32],
-                ) -> pl.Tensor[[64, 64], pl.FP32]:
-                    t0: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
-                    t1: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(t0, c)
-                    t2: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(t1, d)
-                    out: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(t2, e)
+                    a: pl.Tensor[[64, 64], pl.BF16],
+                    b: pl.Tensor[[64, 64], pl.BF16],
+                    c: pl.Tensor[[64, 64], pl.BF16],
+                    d: pl.Tensor[[64, 64], pl.BF16],
+                    e: pl.Tensor[[64, 64], pl.BF16],
+                ) -> pl.Tensor[[64, 64], pl.BF16]:
+                    t0: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(a, b)
+                    t1: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(t0, c)
+                    t2: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(t1, d)
+                    out: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(t2, e)
                     return out
 
             deep_after = passes.auto_fuse()(DeepProg)
@@ -605,7 +680,7 @@ class TestAutoFuse:
             deep_namespace = {}
             exec(torch_codegen(deep_after, run_all_spmd_blocks=True), deep_namespace)
             torch.manual_seed(2)
-            values = [torch.randn(64, 64, dtype=torch.float32) * 0.05 for _ in range(5)]
+            values = [torch.randn(64, 64, dtype=torch.bfloat16) * 0.05 for _ in range(5)]
             expected = (((values[0] @ values[1]) @ values[2]) @ values[3]) @ values[4]
             actual = deep_namespace["deep"](*values)
             assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-3)
@@ -613,6 +688,7 @@ class TestAutoFuse:
         )
         env = os.environ.copy()
         env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
         env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
         env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "32,32,1,2,2"
         env["PYPTO_AUTOFUSE_STRICT"] = "1"
@@ -626,20 +702,48 @@ class TestAutoFuse:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
-    @pytest.mark.xfail(
-        reason="chained-matmul lowering blocked on hw-native-sys/pypto#1908: AllocateMemoryAddr "
-        "(bump allocator) can't pack the chain's A-stationary producer (64KB L0A) + "
-        "double-buffered consumer (2x32KB) -> 'Left buffer usage 98304 > 65536'. Not an "
-        "AutoFuse emit bug. Remove this marker when #1908's offset-packing lands.",
-        strict=True,
-    )
-    def test_chained_matmul_lowers_to_cube_kernel(self, ascend_backend):
+    def test_chained_matmul_lowers_to_cube_kernel(self, ascend_backend, monkeypatch):
         """The fused chain lowers through the Default pipeline to a single cube kernel.
 
-        XFAIL(#1908): the Default pipeline currently raises an AllocateMemoryAddr L0A
-        overflow on the chained kernel. When #1908 lands this XPASSes (strict) -> drop the
-        marker.
+        Output-tile-outer replay keeps only one shared-planner child live in L0 at a
+        time.  This removes the former #1908 false overflow from simultaneously packing
+        producer and consumer ping-pong buffers while retaining one fused AIC kernel.
         """
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def chain(
+                self,
+                a: pl.Tensor[[128, 256], pl.BF16],
+                b: pl.Tensor[[256, 128], pl.BF16],
+                d: pl.Tensor[[128, 256], pl.BF16],
+            ) -> pl.Tensor[[128, 256], pl.BF16]:
+                t: pl.Tensor[[128, 128], pl.BF16] = pl.matmul(a, b)
+                c: pl.Tensor[[128, 256], pl.BF16] = pl.matmul(t, d)
+                return c
+
+        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
+        # The fused chain is ONE cube kernel, not two separate matmul kernels.
+        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
+        assert str(incores[0].func_type) == "FunctionType.AIC"
+        mlir = codegen.PTOCodegen().generate(ir.Program([incores[0]], incores[0].name, incores[0].span))
+        assert "cube" in mlir and mlir.count("pto.tmatmul") >= 2  # both matmuls fused in
+
+    def test_fp32_chained_matmul_declines_unsupported_l1_handoff(self, ascend_backend, monkeypatch):
+        """A2/A3 cannot keep a same-type FP32 matmul result in L1 for a consumer.
+
+        The hardware fused-chain path is FP32 Acc -> BF16/FP16 Mat. There is no
+        FP32 Acc -> FP32 Mat handoff and no Mat -> Acc reload, so preserving an
+        explicitly FP32 intermediate requires two standalone cube kernels and a
+        GM boundary. The solver must split instead of pricing fictional fusion.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
 
         @pl.program
         class Prog:
@@ -654,13 +758,40 @@ class TestAutoFuse:
                 c: pl.Tensor[[128, 256], pl.FP32] = pl.matmul(t, d)
                 return c
 
-        out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
-        incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
-        # The fused chain is ONE cube kernel, not two separate matmul kernels.
-        assert len(incores) == 1, [f.name for _, f in out.functions.items()]
-        assert str(incores[0].func_type) == "FunctionType.AIC"
-        mlir = codegen.PTOCodegen().generate(ir.Program([incores[0]], incores[0].name, incores[0].span))
-        assert "cube" in mlir and mlir.count("pto.tmatmul") >= 2  # both matmuls fused in
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
+        assert len(aic) == 2, [f.name for _, f in lowered.functions.items()]
+
+    def test_declined_cube_plan_materializes_each_fallback_matmul(self, ascend_backend, monkeypatch):
+        """A plan replay decline cannot leave several matmuls in one AIC scope.
+
+        The two roots request the same boundary RHS in the same role.  Until a
+        shared-panel lifetime is represented, the exact cube-plan emitter
+        declines that group.  Each fallback matmul must then be a separate
+        kernel so the BF16 intermediate is stored/narrowed and reloaded; directly
+        forwarding its FP32 L0C result to a BF16 consumer is ill-typed.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def chain(
+                self,
+                a: pl.Tensor[[64, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                d: pl.Tensor[[64, 64], pl.BF16],
+            ) -> tuple[pl.Tensor[[64, 64], pl.BF16], pl.Tensor[[64, 64], pl.BF16]]:
+                t: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(a, b)
+                c: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(t, d)
+                e: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(t, d)
+                return c, e
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
+        assert len(aic) == 3, [f.name for _, f in lowered.functions.items()]
 
     def test_chained_matmul_preserves_operand_input_order(self, tmp_path, monkeypatch):
         """Regression: the solver Problem must list each matmul's inputs in OPERAND
@@ -744,9 +875,7 @@ class TestAutoFuse:
         ]
         assert dag["per_task_overhead_cycles"] == 64
 
-    def test_vector_capabilities_decline_unimplemented_reduction_algorithms(
-        self, tmp_path, monkeypatch
-    ):
+    def test_vector_capabilities_decline_unimplemented_reduction_algorithms(self, tmp_path, monkeypatch):
         """Prod/arg/min never enter the generic strip/stream emitter.
 
         These operations need algorithms that are not equivalent to the
@@ -780,9 +909,7 @@ class TestAutoFuse:
         assert dag["op_types"] == ["Opaque"] * 3
         assert dag["vector_op_capabilities"] == ["unsupported"] * 3
 
-    def test_bare_terminal_unsupported_reduction_declines_whole_function(
-        self, tmp_path, monkeypatch
-    ):
+    def test_bare_terminal_unsupported_reduction_declines_whole_function(self, tmp_path, monkeypatch):
         """A singleton opaque sink never reaches solver tile enumeration."""
         monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
@@ -790,9 +917,7 @@ class TestAutoFuse:
         @pl.program
         class BareMinimum:
             @pl.function(attrs={"auto_fuse": True})
-            def minimum(
-                self, x: pl.Tensor[[8, 8192], pl.FP32]
-            ) -> pl.Tensor[[8, 1], pl.FP32]:
+            def minimum(self, x: pl.Tensor[[8, 8192], pl.FP32]) -> pl.Tensor[[8, 1], pl.FP32]:
                 result: pl.Tensor[[8, 1], pl.FP32] = pl.row_min(x)
                 return result
 
@@ -803,9 +928,7 @@ class TestAutoFuse:
         assert dag["op_types"] == ["Opaque"]
         assert dag["vector_op_capabilities"] == ["unsupported"]
 
-    def test_supported_cone_around_unsupported_reduction_declines_whole_function(
-        self, tmp_path, monkeypatch
-    ):
+    def test_supported_cone_around_unsupported_reduction_declines_whole_function(self, tmp_path, monkeypatch):
         """Supported consumers do not pull an opaque barrier into the solver."""
         monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
@@ -813,9 +936,7 @@ class TestAutoFuse:
         @pl.program
         class MinimumConsumer:
             @pl.function(attrs={"auto_fuse": True})
-            def normalize(
-                self, x: pl.Tensor[[8, 8192], pl.FP32]
-            ) -> pl.Tensor[[8, 8192], pl.FP32]:
+            def normalize(self, x: pl.Tensor[[8, 8192], pl.FP32]) -> pl.Tensor[[8, 8192], pl.FP32]:
                 minimum: pl.Tensor[[8, 1], pl.FP32] = pl.row_min(x)
                 shifted: pl.Tensor[[8, 8192], pl.FP32] = pl.row_expand_sub(x, minimum)
                 result: pl.Tensor[[8, 8192], pl.FP32] = pl.exp(shifted)
@@ -832,9 +953,7 @@ class TestAutoFuse:
             "elementwise",
         ]
 
-    def test_vector_problem_dump_covers_grounded_unary_scalar_and_column_ops(
-        self, tmp_path, monkeypatch
-    ):
+    def test_vector_problem_dump_covers_grounded_unary_scalar_and_column_ops(self, tmp_path, monkeypatch):
         """Known one-instruction PTO lowerings have exact source descriptors.
 
         Composite high-precision rsqrt deliberately stays generic: it lowers to
@@ -894,9 +1013,7 @@ class TestAutoFuse:
         @pl.program
         class HighPrecision:
             @pl.function(attrs={"auto_fuse": True})
-            def high_precision(
-                self, x: pl.Tensor[[16, 64], pl.FP32]
-            ) -> pl.Tensor[[16, 64], pl.FP32]:
+            def high_precision(self, x: pl.Tensor[[16, 64], pl.FP32]) -> pl.Tensor[[16, 64], pl.FP32]:
                 out: pl.Tensor[[16, 64], pl.FP32] = pl.rsqrt(x, high_precision=True)
                 return out
 
@@ -905,14 +1022,14 @@ class TestAutoFuse:
         assert hp["vector_primitive_families"] == ["generic"]
         assert hp["vector_op_geometries"] == ["generic"]
 
-    def test_cube_plan_materializes_large_intermediate_in_l1(self):
-        """A multi-L0 intermediate is assembled into the L1 band priced by the plan.
+    def test_cube_plan_delegates_large_intermediate_l0_tiling(self):
+        """A multi-L0 intermediate uses one planned L1 scratch and shared L0 children.
 
-        The forced work unit requests a ``[64,768]`` fp32 intermediate (192 KiB):
-        larger than L0c but within the solver's L1 pebble budget. The producer emits
-        three ``[64,256]`` accumulator tiles into ``tensor.create_l1``; the consumer
-        then reads that resident band. Numeric execution and the Default lowering
-        both validate the tensor-level algorithm and Mat/L1 placement.
+        The forced work unit requests a ``[64,1536]`` bf16 intermediate (192 KiB):
+        larger than L0C but within the solver's L1 pebble budget.  AutoFuse realizes
+        the CubeSchedulePlan's GM/L1 lifetime as one L1 scratch and replays output-tile
+        calls carrying child plans from the shared L0 chooser. AutoTileMatmulL0 consumes
+        those records and alone lowers each call to Left/Right/Acc/FIXPIPE operations.
         """
         script = textwrap.dedent(
             """
@@ -931,43 +1048,58 @@ class TestAutoFuse:
                 @pl.function(attrs={"auto_fuse": True})
                 def ch(
                     self,
-                    a: pl.Tensor[[128, 256], pl.FP32],
-                    b: pl.Tensor[[256, 768], pl.FP32],
-                    d: pl.Tensor[[768, 64], pl.FP32],
-                ) -> pl.Tensor[[128, 64], pl.FP32]:
-                    t: pl.Tensor[[128, 768], pl.FP32] = pl.matmul(a, b)
-                    out: pl.Tensor[[128, 64], pl.FP32] = pl.matmul(t, d)
+                    a: pl.Tensor[[128, 256], pl.BF16],
+                    b: pl.Tensor[[256, 1536], pl.BF16],
+                    d: pl.Tensor[[1536, 64], pl.BF16],
+                ) -> pl.Tensor[[128, 64], pl.BF16]:
+                    t: pl.Tensor[[128, 1536], pl.BF16] = pl.matmul(a, b)
+                    out: pl.Tensor[[128, 64], pl.BF16] = pl.matmul(t, d)
                     return out
 
             after = passes.auto_fuse()(Prog)
             body = next(f for _, f in after.functions.items() if f.name == "ch").as_python()
             assert "pl.spmd(2" in body and body.count("pl.spmd(") == 1
-            assert "pl.tensor.create_l1([64, 768]" in body
-            assert body.count("pl.tensor.matmul(") == 4  # three producer subtiles + sink
-            assert body.count("pl.tensor.assemble(") == 4  # three into L1 + one boundary store
+            assert body.count("pl.tensor.create_l1(") == 1
+            assert body.count("pl.tensor.matmul(") >= 2
+            assert body.count("pl.tensor.assemble(") >= 2  # internal L1 and boundary drains
+            assert "AtomicType.Add" not in body
 
             namespace = {}
             exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
             torch.manual_seed(0)
-            a = torch.randn(128, 256, dtype=torch.float32) * 0.03
-            b = torch.randn(256, 768, dtype=torch.float32) * 0.03
-            d = torch.randn(768, 64, dtype=torch.float32) * 0.03
+            a = torch.randn(128, 256, dtype=torch.bfloat16) * 0.03
+            b = torch.randn(256, 1536, dtype=torch.bfloat16) * 0.03
+            d = torch.randn(1536, 64, dtype=torch.bfloat16) * 0.03
             actual = namespace["ch"](a, b, d)
             expected = (a @ b) @ d
             assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-3), (
                 actual - expected
             ).abs().max().item()
 
-            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            # The production cube path uses PTOAS for interval/sub-offset L0
+            # placement. The legacy PyPTO planner cannot pack two 32 KiB
+            # ping-pong children into a later 64 KiB allocation even though the
+            # phase lifetimes are disjoint, so it is not the allocator contract
+            # this handoff test is intended to exercise.
+            with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+                lowered = PassManager.get_strategy(
+                    OptimizationStrategy.Default
+                ).run_passes(Prog)
             incores = [
                 f for _, f in lowered.functions.items() if ir.is_incore_type(f.func_type)
             ]
             assert len(incores) == 1
             assert str(incores[0].func_type) == "FunctionType.AIC"
+            lowered_body = incores[0].as_python()
+            assert "__autofuse_l0_matmul_plan" not in lowered_body
+            assert "pl.tile.extract(" in lowered_body
+            assert "target_memory=pl.Mem.Left" in lowered_body
+            assert "target_memory=pl.Mem.Right" in lowered_body
             """
         )
         env = os.environ.copy()
         env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
         env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
         env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "64,64,1,2,1"
         env["PYPTO_AUTOFUSE_STRICT"] = "1"
@@ -981,13 +1113,14 @@ class TestAutoFuse:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
-    def test_lone_cube_plan_honors_l0_dimension_bounds(self):
-        """L0 M/N bounds apply even when the full region fits by Acc bytes.
+    def test_lone_cube_plan_delegates_l0_dimension_bounds(self):
+        """L0 M/N bounds are delegated even when the full region fits by Acc bytes.
 
         A ``[32,512]`` fp32 output is only 64 KiB, below the 128 KiB Acc capacity,
-        but the grounded plan's L0-N base is 256. The emitter must therefore build
-        two ``[32,256]`` accumulator subtiles. Treating capacity as the only limit
-        would emit one unplanned 512-column L0 tile and diverge from Phase D.
+        while the backend chooser may still impose a smaller L0-N tile. AutoFuse
+        must keep the requested GM/L1 region whole; AutoTileMatmulL0 then consumes
+        and realizes the attached backend-specific plan. Exact tile geometry is
+        covered by the shared chooser tests rather than duplicated here.
         """
         script = textwrap.dedent(
             """
@@ -1015,8 +1148,8 @@ class TestAutoFuse:
             after = passes.auto_fuse()(Prog)
             body = next(f for _, f in after.functions.items() if f.name == "mm").as_python()
             assert "pl.spmd(1" in body and body.count("pl.spmd(") == 1
-            assert body.count("pl.tensor.matmul(") == 2
-            assert body.count("pl.tensor.assemble(") == 2
+            assert body.count("pl.tensor.matmul(") == 1
+            assert body.count("pl.tensor.assemble(") == 1
 
             namespace = {}
             exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
@@ -1027,16 +1160,25 @@ class TestAutoFuse:
             expected = a @ b
             assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-4)
 
-            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+                lowered = PassManager.get_strategy(
+                    OptimizationStrategy.Default
+                ).run_passes(Prog)
             incores = [
                 f for _, f in lowered.functions.items() if ir.is_incore_type(f.func_type)
             ]
             assert len(incores) == 1
             assert str(incores[0].func_type) == "FunctionType.AIC"
+            lowered_body = incores[0].as_python()
+            assert "__autofuse_l0_matmul_plan" not in lowered_body
+            assert "pl.tile.matmul(" in lowered_body
+            assert "target_memory=pl.Mem.Left" in lowered_body
+            assert "target_memory=pl.Mem.Right" in lowered_body
             """
         )
         env = os.environ.copy()
         env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
         env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "512,32,1,1,1"
         env["PYPTO_AUTOFUSE_STRICT"] = "1"
         proc = subprocess.run(
@@ -1049,37 +1191,129 @@ class TestAutoFuse:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
-    def test_low_precision_cube_accumulator_declines_gracefully(self, ascend_backend, monkeypatch):
-        """A low-precision output never receives an ill-typed planned K carry.
+    def test_multi_window_root_keeps_each_output_tile_in_l0c_then_drains(self):
+        """An oversized root nests output/L0C tiles outside GM K windows.
 
-        Cube contractions accumulate floating inputs in FP32. Until the cube plan
-        represents final FIXPIPE narrowing explicitly, a FP16 output cannot carry a
-        streamed or cross-core K accumulation in its output tensor. Generic emission
-        must decline to the original single matmul instead of constructing FP16
-        ``tensor.matmul_acc`` (which fails type deduction).
+        A2/A3 has no Mat-to-Acc reload. The requested 256x256 FP32 region is
+        therefore split into L0C-resident output tiles; each tile runs its own
+        stage-2 GM-to-L1 K loop, keeps the accumulator in Acc throughout, and
+        drains directly to GM once. AutoTileMatmulL0 alone realizes the nested
+        L1-to-L0 schedule and PTOAS must not multiply the two pipeline depths.
         """
-        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        script = textwrap.dedent(
+            """
+            import pypto.language as pl
+            from pypto import backend, ir, passes
+            from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
-        @pl.program
-        class Prog:
-            @pl.function(attrs={"auto_fuse": True})
-            def mm(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP16],
-                b: pl.Tensor[[64, 64], pl.FP16],
-            ) -> pl.Tensor[[64, 64], pl.FP16]:
-                out: pl.Tensor[[64, 64], pl.FP16] = pl.matmul(a, b)
-                return out
+            backend.set_backend_type(BackendType.Ascend910B)
 
-        after = passes.auto_fuse()(Prog)
-        body = next(f for _, f in after.functions.items() if f.name == "mm").as_python()
-        assert "pl.tensor.matmul_acc(" not in body
-        assert body.count("pl.tensor.matmul(") == 1
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mm(
+                    self,
+                    a: pl.Tensor[[256, 512], pl.FP32],
+                    b: pl.Tensor[[512, 256], pl.FP32],
+                ) -> pl.Tensor[[256, 256], pl.FP32]:
+                    out: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b)
+                    return out
 
-        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
-        incores = [f for _, f in lowered.functions.items() if ir.is_incore_type(f.func_type)]
-        assert len(incores) == 1
-        assert str(incores[0].func_type) == "FunctionType.AIC"
+            fused = passes.auto_fuse()(Prog)
+            body = next(f for _, f in fused.functions.items() if f.name == "mm").as_python()
+            assert body.count("pl.spmd(") == 1, body
+            assert "pl.pipeline(" in body, body
+            assert "pl.tensor.matmul_acc(" in body, body
+            assert body.count("pl.tensor.assemble(") >= 2, body
+            assert body.count("__autofuse_l0_matmul_plan") >= 2, body
+
+            with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+                lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
+            assert len(aic) == 1, [f.name for _, f in lowered.functions.items()]
+            lowered_body = aic[0].as_python()
+            assert "__autofuse_l0_matmul_plan" not in lowered_body, lowered_body
+            assert "pl.tile.matmul_acc(" in lowered_body, lowered_body
+            assert "target_memory=pl.Mem.Mat" in lowered_body, lowered_body
+            assert lowered_body.count("pl.tile.store(") >= 2, lowered_body
+            assert "pl.tile.tpush_to_aiv(" not in lowered_body, lowered_body
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "256,256,1,1,1"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_low_precision_cube_uses_fp32_accumulator_and_final_narrowing(self):
+        """A low-precision result computes in FP32 Acc and narrows only at drain.
+
+        This is the PTO A2/A3 GEMM contract: BF16/FP16 operands feed an FP32 L0C
+        accumulator, and FIXPIPE converts that completed tile to the requested output
+        dtype. The tensor-level child must therefore be FP32 even though the function
+        output is FP16; no FP16 ``matmul_acc`` carry may be constructed.
+        """
+        script = textwrap.dedent(
+            """
+            import pypto.language as pl
+            from pypto import backend, ir, passes
+            from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mm(
+                    self,
+                    a: pl.Tensor[[64, 64], pl.FP16],
+                    b: pl.Tensor[[64, 64], pl.FP16],
+                ) -> pl.Tensor[[64, 64], pl.FP16]:
+                    out: pl.Tensor[[64, 64], pl.FP16] = pl.matmul(a, b)
+                    return out
+
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "mm").as_python()
+            assert "pl.spmd(4" in body, body
+            assert "pl.pipeline(" in body, body
+            assert "pl.tensor.matmul_acc(" in body, body
+            assert body.count("pl.tensor.matmul(") == 1, body
+            assert "pl.Tensor[[32, 32], pl.FP32]" in body, body
+            assert "__autofuse_l0_matmul_plan" in body, body
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            incores = [
+                f for _, f in lowered.functions.items() if ir.is_incore_type(f.func_type)
+            ]
+            assert len(incores) == 1
+            assert str(incores[0].func_type) == "FunctionType.AIC"
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "32,32,1,2,2"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
 
     def test_chained_pointwise_fuses_into_one_tiled_kernel(self, ascend_backend):
         """Two chained pointwise ops the solver groups fuse into one tiled vector
@@ -1113,9 +1347,7 @@ class TestAutoFuse:
         assert len(incores) == 1, [f.name for _, f in out.functions.items()]
         assert str(incores[0].func_type) == "FunctionType.AIV"
 
-    def test_returned_consumed_intermediate_is_materialized_live_out(
-        self, ascend_backend, monkeypatch
-    ):
+    def test_returned_consumed_intermediate_is_materialized_live_out(self, ascend_backend, monkeypatch):
         """A returned SSA value remains observable when fusion also consumes it."""
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
@@ -1346,6 +1578,7 @@ class TestAutoFuse:
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
 
         @pl.program
         class Prog:
@@ -1359,8 +1592,12 @@ class TestAutoFuse:
                 return c
 
         fused = passes.auto_fuse()(Prog)
-        # Lowers without a seed Vec-buffer overflow (the seed tile is capped to fit UB).
-        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        # Lowers without a seed Vec-buffer overflow (the seed tile is capped to
+        # fit UB). The plan-driven cube path uses PTOAS for the nested GM/L1 and
+        # L1/L0 lifetimes; the legacy host allocator cannot interval-pack this
+        # split-K accumulator schedule even though the seed itself is legal.
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         # ...and is numerically exact (split-K atomic-add merge onto the tiled zero-seed).
         code = torch_codegen(fused, run_all_spmd_blocks=True)
         namespace: dict = {}
@@ -1573,9 +1810,7 @@ class TestAutoFuse:
         ).as_python()
         assert mixed_body.count("pl.pipeline(") == 2, mixed_body
         mixed_out = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(MixedDtype)
-        mixed_incores = [
-            f for _, f in mixed_out.functions.items() if ir.is_incore_type(f.func_type)
-        ]
+        mixed_incores = [f for _, f in mixed_out.functions.items() if ir.is_incore_type(f.func_type)]
         assert len(mixed_incores) == 1, [f.name for f in mixed_incores]
 
         def _numeric(program, entry, x, ref):
@@ -1668,9 +1903,7 @@ class TestAutoFuse:
         assert "_m_it" not in cut_body and "_l_it" not in cut_body, cut_body
         assert cut_body.count("pl.spmd(") >= 2, cut_body
 
-    def test_p4_declines_when_internal_statistic_is_returned(
-        self, ascend_backend, monkeypatch
-    ):
+    def test_p4_declines_when_internal_statistic_is_returned(self, ascend_backend, monkeypatch):
         """Returning row_max makes it a second live-out, so flash P4 must cut."""
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
@@ -2237,6 +2470,377 @@ class TestAutoFuse:
         e = torch.exp(x - mstat)
         _check(P2Bcast, "sm2", (x, mstat), e / e.sum(dim=1, keepdim=True))
 
+    def test_mixed_c2v_plan_emits_two_lane_fifo_pipeline(self):
+        """The buildable mixed plan survives the complete lowering pipeline.
+
+        FORCE_PLAN is process-cached, so the fixed 6x8 experiment runs in a
+        fresh interpreter.  Forty-eight logical regions become 24 mixed group
+        launches with two successor items per group.  The emitted UP_DOWN split
+        gives both AIV lanes real half-row work; ExpandMixedKernel owns the
+        C->V FIFO decouples the two sequential per-engine item loops.  The
+        outer loop must not be tagged as a generic software pipeline because
+        that would multiply the nested AutoTileL0 buffers.
+        """
+        script = textwrap.dedent(
+            """
+            import torch
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def epilogue(
+                    self,
+                    a: pl.Tensor[[192, 64], pl.FP32],
+                    b: pl.Tensor[[64, 256], pl.FP32],
+                    bias: pl.Tensor[[1, 256], pl.FP32],
+                ) -> pl.Tensor[[192, 256], pl.FP32]:
+                    mm: pl.Tensor[[192, 256], pl.FP32] = pl.matmul(a, b)
+                    out: pl.Tensor[[192, 256], pl.FP32] = pl.add(mm, bias)
+                    return out
+
+            planned = passes.auto_fuse()(Prog)
+            planned_text = next(
+                f for _, f in planned.functions.items() if f.name == "epilogue"
+            ).as_python()
+            assert "pl.spmd(24" in planned_text, planned_text
+            assert "pl.range(2" in planned_text, planned_text
+            assert "pl.pipeline(2, stage=2" not in planned_text, planned_text
+            assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=8)" in planned_text, planned_text
+            assert planned_text.count("pl.tensor.matmul(") == 1, planned_text
+            assert planned_text.count("pl.tensor.add(") == 1, planned_text
+
+            namespace = {}
+            exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            a = torch.randn(192, 64)
+            b = torch.randn(64, 256)
+            bias = torch.randn(1, 256)
+            got = namespace["epilogue"](a, b, bias)
+            expected = a @ b + bias
+            assert torch.allclose(got, expected, rtol=1e-4, atol=1e-4), (got - expected).abs().max()
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            text = lowered.as_python()
+            assert "type=pl.FunctionType.Group" in text, text
+            assert "type=pl.FunctionType.AIC" in text, text
+            assert "type=pl.FunctionType.AIV" in text, text
+            assert 'attrs={"core_num": 24}' in text, text
+            assert text.count("pl.tile.tpush_to_aiv(") == 1, text
+            assert text.count("pl.tile.tpop_from_aic(") == 1, text
+            assert text.count("pl.system.tfree_to_aic(") == 1, text
+            assert text.count("slot_size=4096") == 2, text
+            assert text.count("slot_num=8") >= 2, text
+            assert "pl.tile.get_subblock_idx()" in text, text
+            assert "subblock_idx * 16" in text, text
+            assert "__gm_pipe_buffer" in text, text
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "32,32,1,6,8"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+    def test_mixed_declines_transposed_matmul_before_solving(self):
+        """Mixed v0 must not rebuild a transposed matmul as default-orientation."""
+        script = textwrap.dedent(
+            """
+            import torch
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def epilogue(
+                    self,
+                    a: pl.Tensor[[64, 64], pl.FP32],
+                    b: pl.Tensor[[64, 64], pl.FP32],
+                    bias: pl.Tensor[[1, 64], pl.FP32],
+                ) -> pl.Tensor[[64, 64], pl.FP32]:
+                    mm: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b, a_trans=True)
+                    out: pl.Tensor[[64, 64], pl.FP32] = pl.add(mm, bias)
+                    return out
+
+            planned = passes.auto_fuse()(Prog)
+            text = next(f for _, f in planned.functions.items() if f.name == "epilogue").as_python()
+            assert "a_trans=True" in text, text
+            assert "pl.split(pl.SplitMode.UP_DOWN)" not in text, text
+
+            namespace = {}
+            exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            a = torch.randn(64, 64)
+            b = torch.randn(64, 64)
+            bias = torch.randn(1, 64)
+            got = namespace["epilogue"](a, b, bias)
+            expected = a.T @ b + bias
+            assert torch.allclose(got, expected, rtol=1e-4, atol=1e-4), (got - expected).abs().max()
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+    def test_mixed_declines_low_precision_accumulator_handoff(self):
+        """FP16 C->V waits for an explicit FP32 K carry and final narrow."""
+        script = textwrap.dedent(
+            """
+            import os
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def epilogue(
+                    self,
+                    a: pl.Tensor[[64, 8192], pl.FP16],
+                    b: pl.Tensor[[8192, 64], pl.FP16],
+                    bias: pl.Tensor[[1, 64], pl.FP16],
+                ) -> pl.Tensor[[64, 64], pl.FP16]:
+                    mm: pl.Tensor[[64, 64], pl.FP16] = pl.matmul(a, b)
+                    out: pl.Tensor[[64, 64], pl.FP16] = pl.add(mm, bias)
+                    return out
+
+            planned = passes.auto_fuse()(Prog)
+            text = next(f for _, f in planned.functions.items() if f.name == "epilogue").as_python()
+            assert "pl.split(pl.SplitMode.UP_DOWN" not in text, text
+            assert "pl.tensor.matmul(" in text, text
+            assert "pl.tensor.add(" in text, text
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            lowered_text = lowered.as_python()
+            assert "pl.tile.tpush_to_aiv(" not in lowered_text, lowered_text
+
+            @pl.program
+            class HeteroProg:
+                @pl.function(attrs={"auto_fuse": True})
+                def epilogue(
+                    self,
+                    a: pl.Tensor[[64, 64], pl.FP16],
+                    b: pl.Tensor[[64, 64], pl.FP32],
+                    bias: pl.Tensor[[1, 64], pl.FP32],
+                ) -> pl.Tensor[[64, 64], pl.FP32]:
+                    mm: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                    out: pl.Tensor[[64, 64], pl.FP32] = pl.add(mm, bias)
+                    return out
+
+            hetero = passes.auto_fuse()(HeteroProg)
+            hetero_text = next(
+                f for _, f in hetero.functions.items() if f.name == "epilogue"
+            ).as_python()
+            assert "pl.split(pl.SplitMode.UP_DOWN" not in hetero_text, hetero_text
+
+            @pl.program
+            class PromotedBiasProg:
+                @pl.function(attrs={"auto_fuse": True})
+                def epilogue(
+                    self,
+                    a: pl.Tensor[[64, 64], pl.FP32],
+                    b: pl.Tensor[[64, 64], pl.FP32],
+                    bias: pl.Tensor[[1, 64], pl.FP16],
+                ) -> pl.Tensor[[64, 64], pl.FP32]:
+                    mm: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                    out: pl.Tensor[[64, 64], pl.FP32] = pl.add(mm, bias)
+                    return out
+
+            promoted = passes.auto_fuse()(PromotedBiasProg)
+            promoted_text = next(
+                f for _, f in promoted.functions.items() if f.name == "epilogue"
+            ).as_python()
+            assert "pl.split(pl.SplitMode.UP_DOWN" not in promoted_text, promoted_text
+
+            @pl.program
+            class SupportedFp16Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def epilogue(
+                    self,
+                    a: pl.Tensor[[64, 8192], pl.FP16],
+                    b: pl.Tensor[[8192, 64], pl.FP16],
+                    bias: pl.Tensor[[1, 64], pl.FP32],
+                ) -> pl.Tensor[[64, 64], pl.FP32]:
+                    mm: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(
+                        a, b, out_dtype=pl.FP32
+                    )
+                    out: pl.Tensor[[64, 64], pl.FP32] = pl.add(mm, bias)
+                    return out
+
+            os.environ["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+            supported = passes.auto_fuse()(SupportedFp16Prog)
+            supported_text = next(
+                f for _, f in supported.functions.items() if f.name == "epilogue"
+            ).as_python()
+            assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=8)" in supported_text, supported_text
+            assert "pl.tensor.matmul_acc(" in supported_text, supported_text
+            supported_lowered = PassManager.get_strategy(
+                OptimizationStrategy.Default
+            ).run_passes(SupportedFp16Prog)
+            supported_lowered_text = supported_lowered.as_python()
+            assert "pl.tile.tpush_to_aiv(" in supported_lowered_text, supported_lowered_text
+            assert "pl.tile.tpop_from_aic(" in supported_lowered_text, supported_lowered_text
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "1"
+        env.pop("PYPTO_AUTOFUSE_FORCE_MERGE", None)
+        env.pop("PYPTO_AUTOFUSE_FORCE_PLAN", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+    def test_mixed_natural_grid_accounts_for_fifo_reservation(self):
+        """The former natural 192x48 plan must not overflow Vec after FIFO expansion."""
+        script = textwrap.dedent(
+            """
+            import re
+            import pypto.language as pl
+            from pypto import backend
+            from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def epilogue(
+                    self,
+                    a: pl.Tensor[[192, 64], pl.FP32],
+                    b: pl.Tensor[[64, 384], pl.FP32],
+                    bias: pl.Tensor[[192, 384], pl.FP32],
+                ) -> pl.Tensor[[192, 384], pl.FP32]:
+                    mm: pl.Tensor[[192, 384], pl.FP32] = pl.matmul(a, b)
+                    out: pl.Tensor[[192, 384], pl.FP32] = pl.add(mm, bias)
+                    return out
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            text = lowered.as_python()
+            sizes = [int(x) for x in re.findall(r"reserve_buffer\\([^\\n]*size=(\\d+)", text)]
+            assert sizes, text
+            assert max(sizes) <= 188416, (sizes, text)
+            assert "pl.tile.tpush_to_aiv(" in text, text
+            assert "pl.tile.tpop_from_aic(" in text, text
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+    def test_mixed_replays_repeated_cube_value_operand(self):
+        """add(mm, mm) is one internal dependency with two semantic operand uses."""
+        script = textwrap.dedent(
+            """
+            import torch
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def epilogue(
+                    self,
+                    a: pl.Tensor[[64, 64], pl.FP32],
+                    b: pl.Tensor[[64, 64], pl.FP32],
+                ) -> pl.Tensor[[64, 64], pl.FP32]:
+                    mm: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                    out: pl.Tensor[[64, 64], pl.FP32] = pl.add(mm, mm)
+                    return out
+
+            planned = passes.auto_fuse()(Prog)
+            text = next(f for _, f in planned.functions.items() if f.name == "epilogue").as_python()
+            assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=8)" in text, text
+            assert "pl.tensor.add(mm_mixed_tile, mm_mixed_tile)" in text, text
+
+            namespace = {}
+            exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            a = torch.randn(64, 64)
+            b = torch.randn(64, 64)
+            got = namespace["epilogue"](a, b)
+            expected = 2 * (a @ b)
+            assert torch.allclose(got, expected, rtol=1e-4, atol=1e-4), (got - expected).abs().max()
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            lowered_text = lowered.as_python()
+            assert "pl.tile.tpush_to_aiv(" in lowered_text, lowered_text
+            assert "pl.tile.tpop_from_aic(" in lowered_text, lowered_text
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
