@@ -1010,14 +1010,19 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       } else {
         // Re-create tile ops via OpRegistry for proper type deduction with 2D args;
         // non-tile ops keep the original type.
-        CallPtr new_call;
-        if (op_name.substr(0, 5) == "tile.") {
-          auto deduced = op_registry.Create(op_name, new_args, call->kwargs_, span);
-          new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
-                                            WithCarriedMemRef(deduced->GetType(), assign), deduced->span_);
-        } else {
-          new_call = std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->GetType(), call->span_);
-        }
+        ExprPtr recreated = (op_name.substr(0, 5) == "tile.")
+                                ? op_registry.Create(op_name, new_args, call->kwargs_, span)
+                                : std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->attrs_,
+                                                         call->GetType(), call->span_);
+        auto recreated_call = As<Call>(recreated);
+        INTERNAL_CHECK_SPAN(recreated_call, span)
+            << "FlattenTileNdTo2D: recreated operation is not a Call";
+        const auto& recreated_attrs =
+            call->attrs_.empty() ? recreated_call->attrs_ : call->attrs_;
+        auto new_call = std::make_shared<Call>(
+            recreated_call->op_, recreated_call->args_, recreated_call->kwargs_,
+            recreated_attrs, WithCarriedMemRef(recreated_call->GetType(), assign),
+            recreated_call->span_);
 
         auto new_var =
             std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);

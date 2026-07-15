@@ -786,6 +786,26 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   const bool is_bias = kind == MatmulKind::kBias;
   const std::string& op_name = call->op_->name_;
 
+  std::optional<utils::L0MatmulPlanRecord> recorded_plan;
+  if (call->HasAttr(utils::kL0MatmulPlanAttr)) {
+    recorded_plan = utils::DecodeL0MatmulPlanRecord(call->GetAttr<std::string>(utils::kL0MatmulPlanAttr));
+    INTERNAL_CHECK_SPAN(recorded_plan.has_value(), call->span_)
+        << "AutoTileMatmulL0: malformed AutoFuse L0 plan attribute";
+  }
+  std::optional<utils::L0PlanOutputTarget> requested_output_target;
+  if (call->HasAttr(utils::kL0MatmulOutputTargetAttr)) {
+    const int encoded = call->GetAttr<int>(utils::kL0MatmulOutputTargetAttr);
+    INTERNAL_CHECK_SPAN(encoded >= static_cast<int>(utils::L0PlanOutputTarget::kAcc) &&
+                            encoded <= static_cast<int>(utils::L0PlanOutputTarget::kL1),
+                        call->span_)
+        << "AutoTileMatmulL0: malformed AutoFuse L0 output-target attribute";
+    requested_output_target = static_cast<utils::L0PlanOutputTarget>(encoded);
+  }
+  if (recorded_plan && requested_output_target) {
+    INTERNAL_CHECK_SPAN(recorded_plan->output_target == *requested_output_target, call->span_)
+        << "AutoTileMatmulL0: detailed L0 plan disagrees with the semantic output-target handoff";
+  }
+
   // Operand layout: (lhs, rhs) for matmul; (acc, lhs, rhs) for matmul_acc;
   // (lhs, rhs, bias) for matmul_bias.
   // Use ``AsVarLike`` for the operands so IterArg (Var subclass) is accepted —
@@ -1070,6 +1090,11 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   // end (gamma_c = 2 in the chooser's traffic model).  Plain tile.matmul
   // starts from a fresh Acc placeholder so C is write-only (gamma_c = 1).
   cfg.c_read = is_acc;
+  if (requested_output_target) {
+    cfg.output_target = *requested_output_target;
+  } else if (recorded_plan) {
+    cfg.output_target = recorded_plan->output_target;
+  }
   cfg.allow_padding = false;
   // Permit a non-divisor final K block: the chooser may return a k that does not
   // divide K, and BuildKLoopRewrite peels the partial last K iteration.  The peel
@@ -1098,7 +1123,42 @@ std::optional<MatmulTiling> AnalyzeMatmul(
     return std::nullopt;
   }
 
-  // Already L0-sized — nothing to do.
+  if (recorded_plan) {
+    const auto& expected = *recorded_plan;
+    const int64_t depth_a = res.stationarity == utils::Stationarity::kAStationary ? 1 : 2;
+    const int64_t depth_b = res.stationarity == utils::Stationarity::kBStationary ? 1 : 2;
+    const int64_t depth_c = res.double_buffer_c ? 2 : 1;
+    const int64_t k_full_chunks = K / res.k;
+    const int64_t k_tail = K - k_full_chunks * res.k;
+    const int64_t k_pipeline_stages = k_full_chunks >= 2 ? 2 : 1;
+    INTERNAL_CHECK_SPAN(expected.source_m == M && expected.source_n == N && expected.source_k == K,
+                        assign->span_)
+        << "AutoTileMatmulL0: AutoFuse L0 plan source shape [" << expected.source_m << ", "
+        << expected.source_n << ", " << expected.source_k << "] does not match tile.matmul [" << M << ", "
+        << N << ", " << K << "]";
+    INTERNAL_CHECK_SPAN(expected.bytes_a == bytes_a && expected.bytes_b == bytes_b &&
+                            expected.bytes_c == bytes_c && expected.accumulator_read == is_matmul_acc,
+                        assign->span_)
+        << "AutoTileMatmulL0: AutoFuse L0 plan dtype/accumulator contract does not match the tile call";
+    INTERNAL_CHECK_SPAN(expected.tile_m == res.m && expected.tile_n == res.n && expected.tile_k == res.k &&
+                            expected.stationarity == res.stationarity &&
+                            expected.output_stationary_holds_a == res.os_holds_a &&
+                            expected.buffer_depth_a == depth_a && expected.buffer_depth_b == depth_b &&
+                            expected.buffer_depth_c == depth_c && expected.k_full_chunks == k_full_chunks &&
+                            expected.k_tail == k_tail && expected.k_pipeline_stages == k_pipeline_stages &&
+                            expected.estimated_traffic_bytes == res.estimated_traffic_bytes &&
+                            expected.estimated_cost_cycles == res.estimated_cost_cycles &&
+                            expected.padded_compute_volume == res.padded_compute_volume,
+                        assign->span_)
+        << "AutoTileMatmulL0: active backend re-derived a different L0 plan than PTO Fusebox recorded "
+           "(recorded tile="
+        << expected.tile_m << "x" << expected.tile_n << "x" << expected.tile_k << ", re-derived=" << res.m
+        << "x" << res.n << "x" << res.k << ")";
+  }
+
+  // Already L0-sized — nothing to do. CubeSchedulePlan publishes a completed
+  // output tile with an explicit tensor.assemble after the full K-window loop;
+  // an individual child never owns that L0C->L1/GM drain.
   if (res.m == M && res.n == N && res.k == K) return std::nullopt;
 
   // A Bias-resident vector can be reused for K-tiling or M-only tiling, but the
@@ -2887,6 +2947,32 @@ class AutoTileMutator : public IRMutator {
         auto current_call = As<Call>(current_assign->value_);
         if (def != direct_defs.end() && current_call && IsOp(current_call, "tile.load")) {
           def->second = current_assign;
+        }
+      }
+
+      // View-like ops (tile.slice/reshape/assemble/...) inherit the first tile
+      // input's memory space. A running remap can move that input from Acc to
+      // a completed producer's Mat scratch, while generic SSA substitution
+      // deliberately preserves the old Call/result types. Re-deduce just these
+      // registered inherit-input calls and carry the fresh result through later
+      // users; otherwise the next matmul would incorrectly see an Acc operand
+      // and decline its attached L0MatmulPlan.
+      if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(current)) {
+        auto call = As<Call>(assign->value_);
+        auto& registry = OpRegistry::GetInstance();
+        if (call && call->op_ && registry.GetEntry(call->op_->name_).OutputMemoryInheritsInput()) {
+          auto deduced = registry.Create(call->op_->name_, call->args_, call->kwargs_, call->span_);
+          auto old_tile = As<TileType>(assign->var_->GetType());
+          auto new_tile = As<TileType>(deduced->GetType());
+          if (old_tile && new_tile && old_tile->GetMemorySpace() != new_tile->GetMemorySpace()) {
+            auto fresh_var =
+                std::make_shared<Var>(assign->var_->name_hint_, deduced->GetType(), assign->var_->span_);
+            auto fresh_call = std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_,
+                                                     deduced->GetType(), call->span_);
+            remap[assign->var_.get()] = fresh_var;
+            current = std::make_shared<AssignStmt>(fresh_var, fresh_call, assign->span_);
+            changed = true;
+          }
         }
       }
 
