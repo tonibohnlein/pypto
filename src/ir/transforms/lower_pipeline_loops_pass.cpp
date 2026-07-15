@@ -165,14 +165,19 @@ class PipelineMembershipTagger : public IRMutator {
     if (!call) return visited;
 
     // The enclosing AutoFuse loop overlaps GM->L1 K-window loads with the
-    // current window's cube work. Nested Left/Right/Acc/Bias tiles belong to
-    // the child L0MatmulPlan and are consumed serially by that cube work; keep
-    // only their inner L1->L0 membership instead of forming a 2x2 stage-depth
-    // product with the outer pipeline.
+    // current window's cube work. When AutoTileMatmulL0 introduced an inner
+    // L1->L0 pipeline, its Left/Right/Bias tiles already carry that inner
+    // membership; keep it instead of forming a 2x2 stage-depth product with
+    // the outer pipeline. A child that fits in one L0 tile has no inner
+    // membership, however. Its operand move is still live across adjacent
+    // outer stages and therefore MUST inherit the outer membership (otherwise
+    // MemoryReuse aliases both stages onto one L0A/L0B buffer and the next
+    // move can overwrite operands still consumed by the current MAD).
     const auto memory = tile_type->GetMemorySpace();
     if (gm_to_l1_only_ && (memory == MemorySpace::Left || memory == MemorySpace::Right ||
                            memory == MemorySpace::Acc || memory == MemorySpace::Bias)) {
-      return visited;
+      const bool has_inner_membership = call->HasAttr(kPipelineMembershipAttr);
+      if (memory == MemorySpace::Acc || has_inner_membership) return visited;
     }
 
     // Cube accumulators are written by the serialized cube, never co-live across a
