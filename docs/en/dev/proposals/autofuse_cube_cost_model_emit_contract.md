@@ -155,7 +155,9 @@ The buildable subset now has one model/plan/emit algorithm. Remaining work is:
 1. **Non-uniform grids.** A lone split=1 matmul has an explicit `ClampedOverlap` plan: every task
    computes the maximum static region, clamps a ragged edge backward, and charges its repeated
    reads, MADs, and drain. Ragged split-K is rejected because overlapping edge regions would have
-   multiple atomic owners. Multi-matmul groups remain uniform-only.
+   multiple atomic owners. A valid M/N region with a sub-fractal edge is also rejected consistently
+   by analytic and exact compiler modes until the shared L0 plan separates physical padding from
+   valid extents. Multi-matmul groups remain uniform-only.
 2. **Shared boundary panels.** The current output-tile-outer emitter may reload a shared LHS for each
    N output tile (or RHS for each M tile). The hierarchical cost charges that multiplicity. Explicit
    panel retention can be added later only with a matching lifetime and traffic change.

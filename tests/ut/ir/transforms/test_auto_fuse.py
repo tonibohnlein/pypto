@@ -330,6 +330,65 @@ class TestAutoFuse:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
+    def test_generic_cube_rejects_subfractal_oversized_region(self):
+        """Analytic and exact modes reject the same unbuildable L0 edge.
+
+        The forced outer region is logically ``130x260`` but its aligned
+        ``144x272`` request would leave ``2x4`` L0 edge variants. The shared L0
+        plan cannot yet distinguish their physical 16x16 allocation from valid
+        extents, so compiler-mode costing must not expose the forced candidate.
+        Both modes fall back to their buildable natural clamped-overlap plan.
+        """
+
+        script = textwrap.dedent(
+            """
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mm(
+                    self,
+                    a: pl.Tensor[[130, 64], pl.FP32],
+                    b: pl.Tensor[[64, 260], pl.FP32],
+                ) -> pl.Tensor[[130, 260], pl.FP32]:
+                    c: pl.Tensor[[130, 260], pl.FP32] = pl.matmul(a, b)
+                    return c
+
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "mm").as_python()
+            assert "pl.spmd(" in body
+            """
+        )
+        for exact in (False, True):
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(os.path.abspath("python"))
+            env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+            env["PYPTO_AUTOFUSE_MIXED"] = "0"
+            env["PYPTO_AUTOFUSE_STRICT"] = "1"
+            env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "272,144,1,1,1"
+            env["PYPTO_LOG_LEVEL"] = "info"
+            if exact:
+                env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
+            else:
+                env.pop("PYPTO_AUTOFUSE_EXACT_L0_COST", None)
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=os.getcwd(),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            output = proc.stdout + "\n" + proc.stderr
+            assert proc.returncode == 0, output
+            assert "matched NO feasible candidate" in output
+            assert "spatial_policy=clamped_overlap" in output
+
     def test_nonuniform_matmul_tiles_via_ceil_clamp_grid(self, ascend_backend):
         """A matmul whose solver tile does NOT divide the output tiles via a ceil+clamp
         SPMD grid (the G-A fix for the "matmul-tiling gap").
