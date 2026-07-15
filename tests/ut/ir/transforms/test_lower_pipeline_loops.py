@@ -731,6 +731,61 @@ class TestAccumulatorMembership:
         assert len(acc_matmuls) == 4, f"expected one MAD per inner/outer stage pair, got {acc_matmuls}"
         assert all("pipeline_membership" not in ln for ln in acc_matmuls)
 
+    def test_gm_l1_pipeline_owns_l0_operands_when_no_inner_pipeline_exists(self):
+        """A one-L0-tile child has no inner membership to preserve.
+
+        The outer GM->L1 stage must then separate its Left/Right operand moves;
+        otherwise MemoryReuse aliases both stage clones onto one L0A/L0B address
+        even though the next move may overlap the current MAD. The accumulator
+        remains single-buffered because the cube MADs themselves serialize.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore, strict_ssa=True)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 32], pl.BF16],
+                b: pl.Tensor[[32, 32], pl.BF16],
+                out: pl.Out[pl.Tensor[[64, 32], pl.FP32]],
+            ) -> pl.Tensor[[64, 32], pl.FP32]:
+                for ko in pl.pipeline(
+                    0,
+                    64,
+                    32,
+                    stage=2,
+                    attrs={"pipeline_gm_to_l1_only": True},
+                ):
+                    am: pl.Tile[[32, 32], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                        a, [ko, 0], [32, 32], target_memory=pl.Mem.Mat
+                    )
+                    bm: pl.Tile[[32, 32], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                        b, [0, 0], [32, 32], target_memory=pl.Mem.Mat
+                    )
+                    lft: pl.Tile[[32, 32], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                        am, target_memory=pl.Mem.Left
+                    )
+                    rgt: pl.Tile[[32, 32], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                        bm, target_memory=pl.Mem.Right
+                    )
+                    _c: pl.Tile[[32, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lft, rgt)
+                return out
+
+        After = passes.lower_pipeline_loops()(Before)
+        lines = ir.python_print(After).splitlines()
+
+        operand_moves = [ln for ln in lines if "tile.move" in ln]
+        memberships = [
+            m.group(1)
+            for ln in operand_moves
+            if (m := re.search(r'pipeline_membership":\s*"([^"]*)"', ln))
+        ]
+        assert memberships == ["0:0", "0:0", "0:1", "0:1"], memberships
+
+        acc_matmuls = [ln for ln in lines if "Mem.Acc" in ln and "tile.matmul" in ln]
+        assert len(acc_matmuls) == 2
+        assert all("pipeline_membership" not in ln for ln in acc_matmuls)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -87,8 +87,10 @@ same-type FP32 Acc→Mat handoff. Consequently:
   matmuls rather than changing precision or emitting an impossible reload.
 
 The outer GM→L1 pipeline carries `pipeline_gm_to_l1_only`. `LowerPipelineLoops` therefore does not
-multiply its stage count into the child L0A/L0B ping/pong allocation. This represents hierarchical
-double buffering, not four copies of every lower-level operand.
+multiply its stage count into an existing child L0A/L0B ping/pong allocation. When the child fits
+one L0 tile and has no inner pipeline membership, the outer loop itself owns the necessary two-bank
+L0 operand lifetime. This represents hierarchical double buffering, not four copies of every
+lower-level operand, while still preventing adjacent outer stages from aliasing one live L0 address.
 
 ## 5. Implemented schedule and cost
 

@@ -2558,6 +2558,61 @@ class TestAutoFuse:
         )
         assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
 
+    def test_cube_k_window_keeps_l0_operand_stages_disjoint(self):
+        """A one-L0-tile child still needs outer-stage L0A/L0B ping-pong.
+
+        This is the homogeneous half of the silicon M1 reproducer. The
+        CubeSchedulePlan streams four 16-wide K windows through a stage-2
+        GM->L1 loop, while each child already fits L0. With no inner L0 loop,
+        the outer membership must own two Left/Right banks; aliasing both
+        stages onto one address lets the next move overwrite a live MAD input.
+        """
+        script = textwrap.dedent(
+            """
+            import pypto.language as pl
+            from pypto import backend, ir
+            from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def epilogue(
+                    self,
+                    a: pl.Tensor[[192, 64], pl.FP32],
+                    b: pl.Tensor[[64, 256], pl.FP32],
+                    bias: pl.Tensor[[1, 256], pl.FP32],
+                ) -> pl.Tensor[[192, 256], pl.FP32]:
+                    mm: pl.Tensor[[192, 256], pl.FP32] = pl.matmul(a, b)
+                    out: pl.Tensor[[192, 256], pl.FP32] = pl.add(mm, bias)
+                    return out
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
+            assert len(aic) == 1, [f.name for _, f in lowered.functions.items()]
+            body = aic[0].as_python()
+            assert body.count("pl.tile.alloc(pl.Mem.Left") == 2, body
+            assert body.count("pl.tile.alloc(pl.Mem.Right") == 2, body
+            assert body.count("pl.tile.alloc(pl.Mem.Acc") == 1, body
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "0"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "32,32,1,6,8"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
     def test_mixed_declines_transposed_matmul_before_solving(self):
         """Mixed v0 must not rebuild a transposed matmul as default-orientation."""
         script = textwrap.dedent(
