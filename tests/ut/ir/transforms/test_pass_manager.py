@@ -50,6 +50,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "LowerPipelineToSlots",
     "LowerPipelineLoops",
     "CanonicalizeIOOrder",
+    "Simplify",
     "MaterializeTensorStrides",
     "InitMemRef",
     "MaterializeSemanticAliases",
@@ -70,7 +71,6 @@ TENSOR_OPTIMIZATION_PASSES = [
     "InsertCommFence",
     "MaterializeValidShapeSymbols",
 ]
-
 
 class TestOptimizationStrategy:
     """Test OptimizationStrategy enum."""

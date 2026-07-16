@@ -164,6 +164,12 @@ class PipelineMembershipTagger : public IRMutator {
     auto call = std::dynamic_pointer_cast<const Call>(assign->value_);
     if (!call) return visited;
 
+    // A serial init/tail phase nested under an enclosing pipeline must keep
+    // program-order lifetime. In particular, an L0 K-tail reuses one of the
+    // rolled phase's Left/Right buffers after the rolled phase completes; an
+    // enclosing GM→L1 stage must neither retag nor prefetch it.
+    if (call->GetAttr<bool>(kPipelineSerialPhaseAttr, false)) return visited;
+
     // The enclosing AutoFuse loop overlaps GM->L1 K-window loads with the
     // current window's cube work. When AutoTileMatmulL0 introduced an inner
     // L1->L0 pipeline, its Left/Right/Bias tiles already carry that inner

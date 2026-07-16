@@ -2,7 +2,9 @@
 
 将程序中所有 `TensorType` / `DistributedTensorType` 上的 `view.has_value() && view.stride.empty()` 槽位按对应 layout 的 packed canonical 公式填入显式 stride（参考 RFC #1300 §2.4）。Pass 运行后即满足 codegen 入口契约：每个存在的 `TensorView` 都带显式 stride 与其 layout / shape 一致，严格模式 `TensorViewCanonical` verifier 也会通过。
 
-> **状态**：本 Pass 已注册（`passes.materialize_tensor_strides()`）、有单测覆盖，并自 RFC #1300 P6 起接入默认 tile/PTO pipeline，位置在 `CanonicalizeIOOrder` 与 `InitMemRef` 之间。
+> **状态**：本 Pass 已注册（`passes.materialize_tensor_strides()`）、有单测覆盖，并自
+> RFC #1300 P6 起接入默认 tile/PTO pipeline，位置在 `CanonicalizeIOOrder` 之后的
+> post-pipeline 清理与 `InitMemRef` 之间。
 
 ## 概述
 
@@ -21,7 +23,12 @@ PyPTO IR 上 `TensorType.tensor_view_` 当前可以处于两种等价形态：
 
 - `TensorViewCanonical` —— `PassPipeline` 在 Pass 之后自动用 registry 中的**严格模式** verifier 校验（拒绝 `view.has_value() && stride.empty()` —— 正是本 Pass 负责消除的状态）
 
-**默认 pipeline 中的位置**（自 RFC #1300 P6 起激活）：[`CanonicalizeIOOrder`](29-canonicalize_io_order.md) 与 [`InitMemRef`](31-init_memref.md) 之间。这是 codegen-prep 边界 —— 所有 layout-mutating pass（`ResolveBackendOpLayouts` / `ExpandMixedKernel` / `SplitVectorKernel`）已结束，`InitMemRef` 是第一个依赖显式 stride 的消费者。
+**默认 pipeline 中的位置**（自 RFC #1300 P6 起激活）：位于
+[`CanonicalizeIOOrder`](29-canonicalize_io_order.md) 及其 post-pipeline
+[`Simplify`](05-simplify.md) 之后、[`InitMemRef`](31-init_memref.md) 之前。这是
+codegen-prep 边界 —— 所有 layout-mutating pass（`ResolveBackendOpLayouts` /
+`ExpandMixedKernel` / `SplitVectorKernel`）已结束，静态 pipeline stage 控制流已折叠，
+而 `InitMemRef` 是第一个依赖显式 stride 的消费者。
 
 ## API
 
@@ -116,7 +123,8 @@ verifier 是配对复核，而不是唯一的强制点。验证本身可配置�
 
 ## 相关
 
-- [`CanonicalizeIOOrder`](29-canonicalize_io_order.md) —— 紧邻其前；产生本 Pass 消费的程序状态
+- [`CanonicalizeIOOrder`](29-canonicalize_io_order.md) —— 在清理前塑造 pipeline IO 顺序
+- [`Simplify`](05-simplify.md) —— 紧邻 stride 物化之前折叠静态 stage 控制流
 - [`InitMemRef`](31-init_memref.md) —— 第一个依赖显式 stride 的下游消费者
 - [`tensor_view_semantics.h`](../../../../include/pypto/ir/transforms/utils/tensor_view_semantics.h) —— 工具函数（`BuildLogicalStridesFromLayout` / `CheckCanonicalView` / `CanonicalizeView`）
 - RFC [#1300](https://github.com/hw-native-sys/pypto/issues/1300) —— IR Tensor Layout 自洽表示方案

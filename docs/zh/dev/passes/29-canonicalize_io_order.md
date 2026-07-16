@@ -23,7 +23,12 @@
 
 **前置条件**: SSAForm、SplitIncoreOrch、IncoreTileOps、TileOps2D、TileMemoryInferred、NormalizedStmtStructure。
 
-**流水线位置**: 位于 `LowerPipelineLoops` 之后、`InitMemRef` 之前（slot 20.6）。在 `InitMemRef` 之前运行可保留 SSAForm，依赖分析正常工作。该 Pass 在退出时会把外层流水线循环的 `kind_` 从 `ForKind::Pipeline` 降级为 `ForKind::Sequential`，并清除残留的 `pipeline_stages` attr —— `ForKind::Pipeline` 是一个过渡标记，不得穿过本 Pass。
+**流水线位置**：位于 `LowerPipelineLoops` 之后、post-pipeline
+[`Simplify`](05-simplify.md) 与 `InitMemRef` 之前。在 `InitMemRef` 前运行可保持
+SSAForm，以供依赖分析使用；清理步骤会在内存物化前折叠复制产生的静态 stage
+控制流。退出时，本 Pass 会把外层 pipeline 循环的 `kind_` 从
+`ForKind::Pipeline` 降为 `ForKind::Sequential`，并移除陈旧的
+`pipeline_stages` 属性；`ForKind::Pipeline` 是不能存活到后续阶段的临时标记。
 
 ## API
 
@@ -128,6 +133,7 @@ for i in pl.range(0, 8, 4):
 ## 相关
 
 - [`LowerPipelineLoops`](28-lower_pipeline_loops.md) —— 上游复制区域生成者；保留 `ForKind::Pipeline` 标记供本 Pass 识别
-- [`MaterializeTensorStrides`](30-materialize_tensor_strides.md) —— 接入默认流水线后紧随本 Pass 运行；在 `InitMemRef` 消费前补全隐式 `TensorView` stride
+- [`Simplify`](05-simplify.md) —— 紧随本 Pass，折叠静态 stage 控制流
+- [`MaterializeTensorStrides`](30-materialize_tensor_strides.md) —— 在上述清理后、`InitMemRef` 消费前补全隐式 `TensorView` stride
 - [`MemoryReuse`](33-memory_reuse.md) —— 在本 Pass 之后运行；经 `pipeline_membership` 显式强制 stage 缓冲分离（本 pass 只塑造调度顺序）
 - RFC #1026 / PR #1029 —— InOut-use 规约 + 依赖分析工具

@@ -475,24 +475,25 @@ The PTO-oriented tile stage of `Default` is:
 16. [`LowerPipelineToSlots`](27-lower_pipeline_to_slots.md) (rotates an eligible `pl.pipeline` body through the slots of one allocation instead of replicating it; self-gated on `memory_planner=PTOAS`, and every loop it declines is left for `LowerPipelineLoops`)
 17. [`LowerPipelineLoops`](28-lower_pipeline_loops.md)
 18. [`CanonicalizeIOOrder`](29-canonicalize_io_order.md)
-19. [`MaterializeTensorStrides`](30-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
-20. `InitMemRef`
-21. [`MaterializeSemanticAliases`](32-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
-22. `MemoryReuse`
-23. `AllocateMemoryAddr`
-24. [`FoldNoOpReshape`](35-fold_no_op_reshape.md)
-25. [`FuseCreateAssembleToSlice`](36-fuse_create_assemble_to_slice.md)
-26. [`DeriveCallDirections`](37-derive_call_directions.md)
-27. [`AutoDeriveTaskDependencies`](38-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
-28. [`ExpandManualPhaseFence`](39-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
-29. [`SynthesizeAllReduceSignals`](40-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
-30. [`MaterializeCommDomainScopes`](41-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
-31. [`LowerHostTensorCollectives`](42-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
-32. [`MaterializeDistTensorCtx`](43-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
-33. `Simplify`
-34. [`MaterializeRuntimeScopes`](44-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
-35. [`ClassifyIterArgCarry`](45-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
-36. [`InsertCommFence`](46-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs dead last so the inserted ops stay adjacent to their notify through codegen)
+19. [`Simplify`](05-simplify.md) (post-pipeline cleanup: folds static stage control flow before memory materialization)
+20. [`MaterializeTensorStrides`](30-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
+21. `InitMemRef`
+22. [`MaterializeSemanticAliases`](32-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
+23. `MemoryReuse`
+24. `AllocateMemoryAddr`
+25. [`FoldNoOpReshape`](35-fold_no_op_reshape.md)
+26. [`FuseCreateAssembleToSlice`](36-fuse_create_assemble_to_slice.md)
+27. [`DeriveCallDirections`](37-derive_call_directions.md)
+28. [`AutoDeriveTaskDependencies`](38-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
+29. [`ExpandManualPhaseFence`](39-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
+30. [`SynthesizeAllReduceSignals`](40-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
+31. [`MaterializeCommDomainScopes`](41-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
+32. [`LowerHostTensorCollectives`](42-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
+33. [`MaterializeDistTensorCtx`](43-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
+34. `Simplify`
+35. [`MaterializeRuntimeScopes`](44-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
+36. [`ClassifyIterArgCarry`](45-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
+37. [`InsertCommFence`](46-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs dead last so the inserted ops stay adjacent to their notify through codegen)
 
 [`ResolveBackendOpLayouts`](19-resolve_backend_op_layouts.md) repairs
 backend-constrained elementwise tile ops using registered layout metadata.

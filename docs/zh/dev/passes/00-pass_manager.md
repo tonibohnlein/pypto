@@ -474,24 +474,25 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 16. [`LowerPipelineToSlots`](27-lower_pipeline_to_slots.md)（把合格的 `pl.pipeline` 循环体改为轮转一个分配的多个 slot，而不是复制；自门控于 `memory_planner=PTOAS`，未处理的循环原样留给 `LowerPipelineLoops`）
 17. [`LowerPipelineLoops`](28-lower_pipeline_loops.md)
 18. [`CanonicalizeIOOrder`](29-canonicalize_io_order.md)
-19. [`MaterializeTensorStrides`](30-materialize_tensor_strides.md) —— 自 RFC #1300 P6 起接入默认 pipeline
-20. `InitMemRef`
-21. [`MaterializeSemanticAliases`](32-materialize_semantic_aliases.md)（语义强制别名：循环 carry / 原地；总是运行）
-22. `MemoryReuse`
-23. `AllocateMemoryAddr`
-24. [`FoldNoOpReshape`](35-fold_no_op_reshape.md)
-25. [`FuseCreateAssembleToSlice`](36-fuse_create_assemble_to_slice.md)
-26. [`DeriveCallDirections`](37-derive_call_directions.md)
-27. [`AutoDeriveTaskDependencies`](38-auto_derive_task_dependencies.md)（runtime scope 编译器依赖；AUTO-scope 分析需要显式开启）
-28. [`ExpandManualPhaseFence`](39-expand_manual_phase_fence.md)（manual-scope phase-fence TaskId 依赖压缩）
-29. [`SynthesizeAllReduceSignals`](40-synthesize_allreduce_signals.md)（分布式：host allreduce optional signal -> explicit internal signal IR）
-30. [`MaterializeCommDomainScopes`](41-materialize_comm_domain_scopes.md)（分布式：构造 WindowBuffer 并写 CommDomainScopeStmt wrappers in each host_orch body；无通信程序为 no-op）
-31. [`LowerHostTensorCollectives`](42-lower_host_tensor_collectives.md)（host-level tensor collectives -> internal builtin chip dispatches）
-32. [`MaterializeDistTensorCtx`](43-materialize_dist_tensor_ctx.md)（为 DistributedTensor 参数显式物化 CommCtx 参数/实参）
-33. `Simplify`
-34. [`MaterializeRuntimeScopes`](44-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit PTO2_SCOPE）
-35. [`ClassifyIterArgCarry`](45-classify_iter_arg_carry.md)（把每个 ForStmt iter_arg 标注为平凡别名 / 重绑定 carry，并为 manual-scope TaskId fence 数组定尺）
-36. [`InsertCommFence`](46-insert_comm_fence.md)（在每个发布性写入与释放它的 pld.system.notify 之间插入整张 tensor 的 system.cacheinvalid + GM system.fence；跑在最后，使插入的 op 一路到 codegen 都紧邻其 notify）
+19. [`Simplify`](05-simplify.md) (post-pipeline cleanup: folds static stage control flow before memory materialization)
+20. [`MaterializeTensorStrides`](30-materialize_tensor_strides.md) —— 自 RFC #1300 P6 起接入默认 pipeline
+21. `InitMemRef`
+22. [`MaterializeSemanticAliases`](32-materialize_semantic_aliases.md)（语义强制别名：循环 carry / 原地；总是运行）
+23. `MemoryReuse`
+24. `AllocateMemoryAddr`
+25. [`FoldNoOpReshape`](35-fold_no_op_reshape.md)
+26. [`FuseCreateAssembleToSlice`](36-fuse_create_assemble_to_slice.md)
+27. [`DeriveCallDirections`](37-derive_call_directions.md)
+28. [`AutoDeriveTaskDependencies`](38-auto_derive_task_dependencies.md)（runtime scope 编译器依赖；AUTO-scope 分析需要显式开启）
+29. [`ExpandManualPhaseFence`](39-expand_manual_phase_fence.md)（manual-scope phase-fence TaskId 依赖压缩）
+30. [`SynthesizeAllReduceSignals`](40-synthesize_allreduce_signals.md)（分布式：host allreduce optional signal -> explicit internal signal IR）
+31. [`MaterializeCommDomainScopes`](41-materialize_comm_domain_scopes.md)（分布式：构造 WindowBuffer 并写 CommDomainScopeStmt wrappers in each host_orch body；无通信程序为 no-op）
+32. [`LowerHostTensorCollectives`](42-lower_host_tensor_collectives.md)（host-level tensor collectives -> internal builtin chip dispatches）
+33. [`MaterializeDistTensorCtx`](43-materialize_dist_tensor_ctx.md)（为 DistributedTensor 参数显式物化 CommCtx 参数/实参）
+34. `Simplify`
+35. [`MaterializeRuntimeScopes`](44-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit PTO2_SCOPE）
+36. [`ClassifyIterArgCarry`](45-classify_iter_arg_carry.md)（把每个 ForStmt iter_arg 标注为平凡别名 / 重绑定 carry，并为 manual-scope TaskId fence 数组定尺）
+37. [`InsertCommFence`](46-insert_comm_fence.md)（在每个发布性写入与释放它的 pld.system.notify 之间插入整张 tensor 的 system.cacheinvalid + GM system.fence；跑在最后，使插入的 op 一路到 codegen 都紧邻其 notify）
 
 [`ResolveBackendOpLayouts`](19-resolve_backend_op_layouts.md) 会根据
 backend 注册的 layout 元数据修复受约束的逐元素 tile 操作。对于当前 PTO

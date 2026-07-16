@@ -176,9 +176,7 @@ class TestAutoFuse:
                 return c
 
         planned = passes.auto_fuse()(Prog)
-        planned_body = next(
-            f for _, f in planned.functions.items() if f.name == "mm"
-        ).as_python()
+        planned_body = next(f for _, f in planned.functions.items() if f.name == "mm").as_python()
         assert "pl.spmd(" in planned_body
         assert "pl.min(" in planned_body
         assert "__autofuse_l0_matmul_plan" in planned_body
@@ -2707,6 +2705,97 @@ class TestAutoFuse:
         )
         assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
 
+    @pytest.mark.parametrize(
+        ("size", "force", "expected_left", "expected_right"),
+        [
+            pytest.param(272, "144,144,1,2,2", None, None, id="persistent-l0c"),
+            pytest.param(512, "128,128,1,4,4", 2, 2, id="serial-k-tail"),
+        ],
+    )
+    def test_cube_exact_plan_preserves_l0_phase_lifetimes(
+        self,
+        size,
+        force,
+        expected_left,
+        expected_right,
+    ):
+        """Exact cube plans allocate the hierarchy priced by their child L0 plan.
+
+        The 272 case used to retain both constant branches produced by pipeline
+        peeling and allocate two full L0C accumulators.  The 512 case has a
+        ``64 + 64 + 32`` child K decomposition: the final 32-wide tail is a
+        serial phase that must reuse one of the two rolled Left/Right slots,
+        rather than being hoisted into the enclosing GM-to-L1 pipeline and
+        allocating a third operand panel.
+
+        ``PYPTO_AUTOFUSE_FORCE_PLAN`` is process-cached, so each parameter runs
+        in a fresh interpreter.  Reaching the final AIC function also exercises
+        ``AllocateMemoryAddr`` and proves the selected finite-cost plan is
+        physically buildable.
+        """
+        script = textwrap.dedent(
+            f"""
+            import re
+
+            import pypto.language as pl
+            from pypto import backend
+            from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={{"auto_fuse": True}})
+                def mm(
+                    self,
+                    a: pl.Tensor[[{size}, {size}], pl.FP32],
+                    b: pl.Tensor[[{size}, {size}], pl.FP32],
+                ) -> pl.Tensor[[{size}, {size}], pl.FP32]:
+                    out: pl.Tensor[[{size}, {size}], pl.FP32] = pl.matmul(a, b)
+                    return out
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
+            aiv = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIV"]
+            assert len(aic) == 1, [f.name for _, f in lowered.functions.items()]
+            assert not aiv, [f.name for _, f in lowered.functions.items()]
+
+            body = aic[0].as_python()
+            assert body.count("pl.tile.alloc(pl.Mem.Acc") == 1, body
+            assert re.search(
+                r"pl\\.tile\\.move\\([^)]*target_memory=pl\\.Mem\\.Acc",
+                body,
+                re.DOTALL,
+            ) is None, body
+            assert "pipeline_serial_phase" not in body, body
+            """
+        )
+        if expected_left is not None:
+            script += textwrap.dedent(
+                f"""
+                assert body.count("pl.tile.alloc(pl.Mem.Left") == {expected_left}, body
+                assert body.count("pl.tile.alloc(pl.Mem.Right") == {expected_right}, body
+                """
+            )
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "0"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = force
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
     def test_mixed_declines_transposed_matmul_before_solving(self):
         """Mixed v0 must not rebuild a transposed matmul as default-orientation."""
         script = textwrap.dedent(
@@ -2990,6 +3079,7 @@ class TestAutoFuse:
             check=False,
         )
         assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
