@@ -98,6 +98,24 @@ inline constexpr const char* kPipelineDoubleBufferCAttr = "pipeline_double_buffe
 /// consumed with the other pipeline policy attrs by ``CanonicalizeIOOrder``.
 inline constexpr const char* kPipelineGmToL1OnlyAttr = "pipeline_gm_to_l1_only";
 
+/// Transient ``bool`` attr on a tile-producing ``Call`` that belongs to a
+/// serial init/tail phase nested inside an enclosing software pipeline.
+///
+/// The call must stay in program order even when an ancestor
+/// ``ForKind::Pipeline`` is canonicalized.  The motivating case is an L0
+/// matmul K-tail: the shared L0 plan prices it after the rolled L1→L0/Matrix
+/// phase, and its smaller operand panels reuse one of that phase's buffers.
+/// Hoisting those extracts into the enclosing GM→L1 prefetch tier both invents
+/// overlap the model did not price and keeps an extra Left/Right allocation
+/// live across the rolled phase.
+///
+/// ``AutoTileMatmulL0`` attaches the marker to serial L0 operand extracts.
+/// ``LowerPipelineLoops`` does not add an enclosing stage membership to such a
+/// call, ``CanonicalizeIOOrder`` leaves it in the compute tier, and
+/// ``MemoryReuse`` strips the marker with ``pipeline_membership`` after using
+/// the resulting lifetimes.
+inline constexpr const char* kPipelineSerialPhaseAttr = "pipeline_serial_phase";
+
 /// Attribute key marking a tile-producing ``Call`` with the pipeline-stage
 /// membership(s) of the tile it defines. ``LowerPipelineLoops`` sets it when it
 /// replicates a ``pl.pipeline`` body: every clone of a replicated region is one

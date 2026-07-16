@@ -74,6 +74,23 @@ bool ShouldOverrideDemand(MemorySpace existing, MemorySpace incoming) {
   return existing == MemorySpace::Vec && incoming != MemorySpace::Vec;
 }
 
+/// Preserve compiler metadata when this pass re-creates a Call through the op
+/// registry to refresh its inferred type. Registry construction may attach its
+/// own derived attrs; the original call's attrs win on duplicate keys because
+/// they describe the already-selected compiler schedule.
+std::vector<std::pair<std::string, std::any>> PreserveCallAttrs(
+    std::vector<std::pair<std::string, std::any>> derived,
+    const std::vector<std::pair<std::string, std::any>>& original) {
+  for (const auto& attr : original) {
+    const auto& key = attr.first;
+    derived.erase(
+        std::remove_if(derived.begin(), derived.end(), [&](const auto& item) { return item.first == key; }),
+        derived.end());
+    derived.push_back(attr);
+  }
+  return derived;
+}
+
 // ============================================================================
 // Phase 0: Backward demand collection
 //
@@ -594,7 +611,8 @@ class TileMemorySpaceMutator : public IRMutator {
                                     op->GetType(), op->span_);
     }
     auto deduced = registry.Create(op->op_->name_, new_args, op->kwargs_, op->span_);
-    return std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, std::move(new_attrs),
+    auto merged_attrs = PreserveCallAttrs(deduced->attrs_, new_attrs);
+    return std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, std::move(merged_attrs),
                                   deduced->GetType(), deduced->span_);
   }
 

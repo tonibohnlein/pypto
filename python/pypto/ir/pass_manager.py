@@ -201,6 +201,13 @@ class PassManager:
             passes.skew_cross_core_pipeline,
             passes.lower_pipeline_loops,
             passes.canonicalize_io_order,
+            # Pipeline replication substitutes static stage offsets into cloned
+            # bodies. Fold the resulting dead control flow before MemRef
+            # materialization: a peeled cube K-stage otherwise keeps both the
+            # impossible fresh-matmul branch and the live matmul_acc branch,
+            # forcing two L0C accumulator allocations for an algorithm that
+            # owns one persistent C tile.
+            passes.simplify,
             # MaterializeTensorStrides fills empty stride slots on every
             # TensorView with packed canonical strides (RFC #1300 §2.4).
             passes.materialize_tensor_strides,

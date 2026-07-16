@@ -23,7 +23,12 @@ Cross-core (cube/vector) pipeline loops are software-pipelined by [`SkewCrossCor
 
 **Requires**: SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure.
 
-**Pipeline position**: After `LowerPipelineLoops`, before `InitMemRef` (slot 20.6). Running before `InitMemRef` keeps SSAForm intact for the dependency analysis. On exit the pass demotes the outer pipeline loop's `kind_` from `ForKind::Pipeline` → `ForKind::Sequential` and strips any stale `pipeline_stages` attr — `ForKind::Pipeline` is a transient marker that must not survive past this pass.
+**Pipeline position**: After `LowerPipelineLoops`, before a post-pipeline
+[`Simplify`](05-simplify.md) and `InitMemRef`. Running before `InitMemRef` keeps SSAForm intact for
+the dependency analysis. The cleanup folds static stage conditions exposed by replication before
+memory materialization. On exit this pass demotes the outer pipeline loop's `kind_` from
+`ForKind::Pipeline` → `ForKind::Sequential` and strips any stale `pipeline_stages` attr —
+`ForKind::Pipeline` is a transient marker that must not survive past this pass.
 
 ## API
 
@@ -126,6 +131,7 @@ All four `off_k` lift first to unblock the loads, which then cluster (prefetch o
 ## Related
 
 - [`LowerPipelineLoops`](25-lower_pipeline_loops.md) — upstream producer of replicated regions that benefit from this pass; leaves `ForKind::Pipeline` as the scope marker this pass consumes
-- [`MaterializeTensorStrides`](27-materialize_tensor_strides.md) — runs immediately after this pass (when inserted into the default pipeline); fills implicit `TensorView` strides before `InitMemRef` consumes them
+- [`Simplify`](05-simplify.md) — runs immediately after this pass to fold static stage control flow
+- [`MaterializeTensorStrides`](27-materialize_tensor_strides.md) — fills implicit `TensorView` strides after that cleanup and before `InitMemRef` consumes them
 - [`MemoryReuse`](30-memory_reuse.md) — runs after this pass; enforces stage buffer separation explicitly via `pipeline_membership` (this pass only shapes the schedule)
 - RFC #1026 / PR #1029 — InOut-use discipline + dependency analysis utility

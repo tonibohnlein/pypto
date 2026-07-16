@@ -92,6 +92,12 @@ one L0 tile and has no inner pipeline membership, the outer loop itself owns the
 L0 operand lifetime. This represents hierarchical double buffering, not four copies of every
 lower-level operand, while still preventing adjacent outer stages from aliasing one live L0 address.
 
+Child init and ragged-K tail extracts carry a transient `pipeline_serial_phase` marker. They remain
+after the rolled L1→L0/Matrix phase and reuse one of its operand banks; an enclosing GM→L1 pipeline
+must not hoist them into its prefetch tier. Pipeline lowering is simplified before memory
+materialization so constant-dead peeled branches cannot create a second L0C accumulator. These are
+compiler schedule invariants, not additional model feasibility terms.
+
 ## 5. Implemented schedule and cost
 
 For a requested `O[rows,cols] = A @ B`, reverse request propagation produces
@@ -161,11 +167,13 @@ The buildable subset now has one model/plan/emit algorithm. Remaining work is:
 2. **Shared boundary panels.** The current output-tile-outer emitter may reload a shared LHS for each
    N output tile (or RHS for each M tile). The hierarchical cost charges that multiplicity. Explicit
    panel retention can be added later only with a matching lifetime and traffic change.
-3. **Runtime work-unit dispatch.** A8/E12 pipe tracing confirms the nested cube phase equation and
-   the existing final `PIPE_ALL` barrier. The remaining outer-ranking gap is AICPU scheduling, not a
-   cube pipe: two devices measured roughly 1.6 us per dispatched work unit at 8 and 12 tasks. Ground
-   a separate AIC coefficient over more task counts before adding it to both cost modes; the vector
-   C3 coefficient describes a different runtime path and must not be reused silently.
+3. **Runtime scheduling boundary.** A8/E12 pipe tracing confirms the nested cube phase equation and
+   the existing final `PIPE_ALL` barrier. A wider two-shape sweep then falsified a scalar
+   per-work-unit correction: scheduler time was U-shaped with task count for `[272,272]`, but fell
+   from 127 us to 33 us as fixed-shape `[512,512]` work was divided over more cores. The earlier
+   1.6 us/task slope was local to two adjacent points. Do not add a scalar dispatch term or reuse
+   vector C3. The next experiment must hold each task's tile/K algorithm constant while varying only
+   region count, so runtime dispatch/occupancy is separated from per-core kernel work.
 4. **Low-precision and integer envelope.** BF16/FP16 on-chip handoff is represented. Same-type FP32
    internal storage declines. Other Acc→Mat conversion families require explicit PTO capability
    descriptors before admission.
@@ -185,15 +193,25 @@ If exact replay is unavailable, strict mode fails with the rejected contract con
 mode partitions or falls back to standalone matmuls rather than silently emitting another
 algorithm.
 
-The first clamped-grid silicon ranking isolates a system-cost term. For
+The first clamped-grid silicon ranking exposed a system-boundary mismatch. For
 `[272,272]@[272,272]`, analytic selects A8 (`144x80`, 8 tasks), exact selects E12 (`80x96`, 12
 tasks), and a fixed grid lowers to the same binary in both modes. A8 is 7.3% faster under the
 runtime's scheduler/orchestration execution span even though exact ranks E12 lower. Per-task traces
 match the planned byte multiplicities and favor E12; the kernel already executes `PIPE_ALL` after
 the final TSTORE, its barrier cycles equal FIXPIPE, and a redundant barrier adds no work. The full
-device difference is instead the scheduler phase, approximately 1.6 us per work unit in this
-two-count experiment. Add no pipe correction. The next gate is a multi-count/multi-shape AIC
-dispatch sweep, followed by one shared additive outer-cost term if the slope remains stable.
+device difference is in the scheduler phase, not a cube pipe. However, the follow-up sweep found no
+shape-stable per-work-unit slope: the two tested shape families moved in opposite directions because
+per-core kernel work still dominated the measured span. Add neither a pipe correction nor a scalar
+dispatch correction. Analytic remains default and exact remains opt-in; the next gate is a
+constant-tile, constant-K, variable-region-count sweep.
+
+The same sweep exposed several finite exact candidates that failed memory allocation. They were not
+true capacity misses. Pipeline peeling retained a constant-dead branch and duplicated the persistent
+L0C accumulator; separately, a serial partial-K child was hoisted into the rolled phase and kept a
+third Left/Right panel live. Early simplification, explicit serial-phase ordering, and preservation
+of compiler call metadata now make the reported A4, B16/B24/B48, and split-K S16/S32 plans lower
+with exactly the priced accumulator and operand-bank lifetimes. Device confirmation remains
+pending.
 
 Mixed cube/vector fusion is outside this contract.
 

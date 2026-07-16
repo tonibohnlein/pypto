@@ -2,7 +2,9 @@
 
 Fills every `view.has_value() && view.stride.empty()` slot on every `TensorType` / `DistributedTensorType` reachable from the program with the packed canonical stride for the carried layout (per RFC #1300 §2.4). After this pass runs, the codegen-entry contract holds: every `TensorView` that exists has explicit stride matching its layout / shape, and the strict-mode `TensorViewCanonical` verifier accepts the IR.
 
-> **Status**: this pass is registered (`passes.materialize_tensor_strides()`), covered by unit tests, and wired into the default tile/PTO pipeline between `CanonicalizeIOOrder` and `InitMemRef` starting from RFC #1300 P6.
+> **Status**: this pass is registered (`passes.materialize_tensor_strides()`), covered by unit tests,
+> and wired into the default tile/PTO pipeline after the post-`CanonicalizeIOOrder` cleanup and
+> before `InitMemRef`, starting from RFC #1300 P6.
 
 ## Overview
 
@@ -21,7 +23,12 @@ Codegen needs one machine-readable contract, so `MaterializeTensorStrides` walks
 
 - `TensorViewCanonical` — `PassPipeline` auto-verifies after the pass using the registry's **strict-mode** verifier (empty stride on a present `TensorView` is rejected — that is the state this pass is responsible for eliminating)
 
-**Position in the default pipeline** (active since RFC #1300 P6): between [`CanonicalizeIOOrder`](26-canonicalize_io_order.md) and [`InitMemRef`](28-init_memref.md). This is the codegen-prep boundary — every layout-mutating pass (`ResolveBackendOpLayouts`, `ExpandMixedKernel`, `SplitVectorKernel`) has finished, and `InitMemRef` is the first consumer that needs explicit stride.
+**Position in the default pipeline** (active since RFC #1300 P6): after
+[`CanonicalizeIOOrder`](26-canonicalize_io_order.md) and its post-pipeline
+[`Simplify`](05-simplify.md), before [`InitMemRef`](28-init_memref.md). This is the codegen-prep
+boundary — every layout-mutating pass (`ResolveBackendOpLayouts`, `ExpandMixedKernel`,
+`SplitVectorKernel`) has finished, and `InitMemRef` is the first consumer that needs explicit
+stride.
 
 ## API
 
@@ -110,7 +117,8 @@ Because the pass declares `produced = {... ∪ TensorViewCanonical}`, `PassPipel
 
 ## Related
 
-- [`CanonicalizeIOOrder`](26-canonicalize_io_order.md) — runs immediately before; produces the program state the materialization consumes
+- [`CanonicalizeIOOrder`](26-canonicalize_io_order.md) — shapes pipeline IO before the intervening static-control cleanup
+- [`Simplify`](05-simplify.md) — runs immediately before and folds static stage control flow
 - [`InitMemRef`](28-init_memref.md) — first downstream consumer that depends on explicit stride
 - [`tensor_view_semantics.h`](../../../../include/pypto/ir/transforms/utils/tensor_view_semantics.h) — the helpers (`BuildLogicalStridesFromLayout`, `CheckCanonicalView`, `CanonicalizeView`)
 - RFC [#1300](https://github.com/hw-native-sys/pypto/issues/1300) — Self-consistent IR TensorType layout representation

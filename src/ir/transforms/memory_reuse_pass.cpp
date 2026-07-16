@@ -2734,8 +2734,10 @@ class StripPipelineMembershipMutator : public IRMutator {
   ExprPtr VisitExpr_(const CallPtr& op) override {
     auto visited = IRMutator::VisitExpr_(op);
     auto call = As<Call>(visited);
-    if (!call || !call->HasAttr(kPipelineMembershipAttr)) return visited;
-    auto new_attrs = StripAttr(call->attrs_, kPipelineMembershipAttr);
+    if (!call || (!call->HasAttr(kPipelineMembershipAttr) && !call->HasAttr(kPipelineSerialPhaseAttr))) {
+      return visited;
+    }
+    auto new_attrs = StripAttr(StripAttr(call->attrs_, kPipelineMembershipAttr), kPipelineSerialPhaseAttr);
     return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, std::move(new_attrs),
                                   call->GetType(), call->span_);
   }

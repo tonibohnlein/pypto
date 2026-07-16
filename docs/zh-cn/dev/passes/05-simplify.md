@@ -10,9 +10,12 @@
 2. **类型重建**：重新遍历 `TensorType`、`TileType`、`TupleType` 中嵌入的 shape 表达式，使内存中的 IR 与重新解析得到的结果一致。
 3. **标量绑定以辅助折叠 + DCE**：仅被赋值一次的标量 `Var` 会注册到分析器。在函数体顶层赋的常量会被完整绑定，其字面量向所有下游使用处传播；符号值，或循环/分支内部的常量，只贡献一个 `ConstIntBound`——足以折叠 `if expr == 0` 这类恒死的分支守卫，而不会把标量内联到使用点。残留的死绑定随后由保守的标量 DCE 删除。
 
-在 `pass_manager.py` 的 `Default` 策略中本 Pass 运行**两次**：
+在 `pass_manager.py` 的 `Default` 策略中本 Pass 运行**三次**：
 
 - **SSA 后**（在 `ConvertToSSA` 之后、`FlattenCallExpr` 之前）：将闭包捕获的常量（如 `CHUNK_K: Scalar[INDEX] = 512`）传播进 shape 表达式与类型，使后续的 tile lowering Pass 看到的是字面量而不是变量。
+- **pipeline 后**（在 `CanonicalizeIOOrder` 之后、内存物化之前）：折叠 pipeline 复制暴露的静态
+  stage 条件与单次控制流。这样恒死的 matmul 分支不会获得第二块 L0C 分配，存活的串行
+  init/tail phase 会直接进入生命周期分析。
 - **tile pipeline 末尾**（在 `DeriveCallDirections` 之后）：清理由内存空间推断、layout 解析等晚期 lowering 暴露出来的可折叠表达式。
 
 **需要 (Requires)**：无。
@@ -26,6 +29,7 @@
 ## 使用时机
 
 - 在 SSA 转换之后、tile pipeline 检查类型/shape 之前，把标量常量传播进去。
+- 在 pipeline 复制与 IO 排序之后、内存物化之前，删除静态 stage 控制流。
 - 在 tile pipeline 末尾作为清理 Pass，确保下游产物（打印的 IR、codegen）不会残留 `K + 0` 或 `idx * 1` 这类痕迹。
 - 任何会产生新表达式的 Pass 之后；Simplify 代价低且幂等，可以放心地防御性地插入。
 

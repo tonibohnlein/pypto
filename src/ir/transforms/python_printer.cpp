@@ -950,8 +950,9 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   auto print_serialized_attrs = [&](bool need_comma) {
     std::vector<const std::pair<std::string, std::any>*> serialized_attrs;
     for (const auto& kv : op->attrs_) {
-      if (kv.first == kPipelineMembershipAttr || kv.first == kCompilerTensorToTileMatBridgeAttr ||
-          kv.first == utils::kL0MatmulPlanAttr || kv.first == utils::kL0MatmulOutputTargetAttr) {
+      if (kv.first == kPipelineMembershipAttr || kv.first == kPipelineSerialPhaseAttr ||
+          kv.first == kCompilerTensorToTileMatBridgeAttr || kv.first == utils::kL0MatmulPlanAttr ||
+          kv.first == utils::kL0MatmulOutputTargetAttr) {
         serialized_attrs.push_back(&kv);
       }
     }

@@ -54,9 +54,11 @@ fixed grid produced a byte-identical executable in both modes. Analytic therefor
 default and exact remains opt-in. Pipe tracing closed the apparent inversion: E12 is cheaper per
 task in the op simulator, the generated kernel already executes `PIPE_ALL` after its final TSTORE,
 and a redundant second barrier costs zero. The entire 6.6–6.7 us device gap is the AICPU scheduler,
-which measured approximately `65.6 us + 1.6 us * work_units` at the two sampled task counts. The
-hierarchical cube equation is faithful but lacks a per-AIC-work-unit dispatch term. Ground that term
-over more than two task counts before selecting a constant; do not retune MTE2, Matrix, or FIXPIPE.
+but the follow-up multi-count sweep falsified a scalar per-work-unit correction: scheduler time was
+U-shaped for the 272 family and fell as the 512 family was divided over more cores. The prior
+`1.6 us/task` slope was local to A8/E12, where task count and per-core work changed together. Add no
+dispatch or pipe constant. Analytic remains default and exact remains opt-in; next hold tile/K work
+constant while varying only the number of output regions.
 
 ---
 
@@ -427,11 +429,18 @@ Same-type FP32 internal L1 handoff is not an A2/A3 instruction, so an explicitly
 partitioned into standalone kernels. Direct Mat→GM store is legal and no longer detours through Vec.
 
 **Host validation.** PTO Fusebox reports 489 passing checks with the same six documented baseline
-failures; the full AutoFuse file reports 54 passing tests. Compiler coverage includes
+failures; the full AutoFuse file reports 56 passing tests. Compiler coverage includes
 natural/forced lone matmuls, BF16 recursive trees/fan-out/deep
 chains, FP32-chain decline, split seed, ragged K, multi-window output residency, a 192 KiB internal
 region, descriptor consumption, Torch numerics, and PTOAS-backed full lowering. The former strict
 chained-matmul xfail now passes.
+
+The latest host closure fixes two compiler-side lifetime mismatches without changing cube costs.
+Pipeline peeling is simplified before memory materialization so a constant-dead branch cannot
+allocate a second persistent L0C accumulator. Serial child init/tail extracts retain program order
+and reuse a rolled Left/Right bank instead of being hoisted into an enclosing GM→L1 prefetch tier.
+The formerly failing exact A4, B16/B24/B48, and split-K S16/S32 candidates now reach final allocation
+with one accumulator and the planned two-bank operand ring.
 
 **Silicon isolation.** The forced pure-cube `[192,64]@[64,256]` four-window schedule now passes on
 910B2 with 48 logical AIC blocks. The same producer followed by a separate AIV bias epilogue still
@@ -444,10 +453,11 @@ faster under the measured scheduler/orchestration execution span, while exact se
 modes emit a byte-identical binary for a fixed outer grid, so the difference is entirely the cost
 decision. MTE2 is the critical per-task pipe, but E12's simulated task is 24% shorter; the final
 TSTORE is already followed by `PIPE_ALL`, whose cycles match FIXPIPE, and a second barrier is free.
-The measured difference instead comes from roughly 1.6 us of AICPU scheduling per work unit: four
-extra E12 tasks account for the complete gap. Exact is therefore incomplete at the system boundary,
-not wrong about the cube algorithm. A shared additive dispatch term must apply to analytic and exact
-outer plans after a multi-count grounding sweep.
+The measured A8/E12 difference is contained in the AICPU scheduler span, but it does not generalize
+to a per-work-unit constant. Across a wider sweep the 272 family was U-shaped, while the 512 family
+became faster as work was divided over more tasks; per-core kernel work and occupancy were still
+confounded. Exact remains incomplete at the system boundary, not wrong about the cube algorithm,
+but no scalar correction is supported.
 
 **Remaining gaps:**
 
@@ -456,8 +466,9 @@ outer plans after a multi-count grounding sweep.
    multi-op grids decline. Analytic and exact compiler modes share that buildability gate.
 2. Optional retained boundary panels: the current model faithfully charges reload per output tile;
    introducing reuse requires an explicit lifetime and matching emitter.
-3. Ground a separate per-AIC-work-unit dispatch term over several task counts and shapes, then add
-   it to both analytic and exact cube outer costs. Keep the existing vector C3 coefficient separate.
+3. Run a constant-tile, constant-K, variable-region-count sweep to separate runtime
+   dispatch/occupancy from per-core work. Add no scalar term unless it is stable below and above 24
+   AIC tasks and across repeated devices. Keep the existing vector C3 coefficient separate.
 4. Expand the Acc→Mat capability table beyond BF16/FP16 only when PTO supports the exact conversion.
 5. Improve the analytic reload/extract surrogate and remove full plan construction from the exact
    candidate hot path after dispatch grounding; exact added about 1 ms to the full compiler pipeline.

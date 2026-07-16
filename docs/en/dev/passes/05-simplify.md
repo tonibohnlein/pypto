@@ -10,9 +10,13 @@ Folds arithmetic expressions, type-embedded shape expressions, and scalar consta
 2. **Type rebuild** — re-walks shape expressions embedded in `TensorType`, `TileType`, and `TupleType` so the in-memory IR matches what a fresh parse would produce.
 3. **Scalar binding for folding + DCE** — a scalar `Var` assigned once is registered with the analyzer. A constant assigned at function-body top level is bound fully so its literal propagates into every downstream use; a symbolic value, or a constant inside a loop/branch, contributes only a `ConstIntBound` — enough to fold dead branch guards like `if expr == 0` without inlining the scalar. Bindings left dead are dropped by a conservative scalar DCE.
 
-The pass runs **twice** in the `Default` strategy of `pass_manager.py`:
+The pass runs **three times** in the `Default` strategy of `pass_manager.py`:
 
 - **Post-SSA** (after `ConvertToSSA`, before `FlattenCallExpr`): propagates closure-captured constants such as `CHUNK_K: Scalar[INDEX] = 512` into shape expressions and types so subsequent tile-lowering passes see literals instead of variables.
+- **Post-pipeline** (after `CanonicalizeIOOrder`, before memory materialization): folds static
+  stage conditions and single-trip control flow exposed by pipeline replication. This prevents a
+  dead matmul branch from acquiring a second L0C allocation and lets the surviving serial init/tail
+  phases enter lifetime analysis directly.
 - **End of tile pipeline** (after `DeriveCallDirections`): final cleanup of folds exposed by memory-space inference, layout resolution, and other late lowering.
 
 **Requires**: nothing.
@@ -26,6 +30,8 @@ The empty `PassProperties` contract (`kSimplifyProperties` in `include/pypto/ir/
 ## When to Use
 
 - After SSA conversion to propagate scalar constants into types/shapes before the tile pipeline inspects them.
+- After pipeline replication and IO ordering to remove static stage control flow before memory
+  materialization.
 - At the end of the tile pipeline as a cleanup pass so that downstream artifacts (printed IR, codegen) are not littered with `K + 0` or `idx * 1` residue.
 - Anywhere else a pass produces fresh expressions that may be foldable; Simplify is cheap and idempotent so it is safe to insert defensively.
 
