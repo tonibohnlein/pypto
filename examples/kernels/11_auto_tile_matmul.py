@@ -80,8 +80,9 @@ def mat_split_k(a: pl.Tensor, b: pl.Tensor, e: pl.Tensor, out: pl.Out[pl.Tensor]
     intermediate (> L0c) is consumed on-chip by the second matmul, so it is M/N-tiled
     into an L1/Mat scratch instead of spilling to DDR. ``K=192`` makes both planners
     choose the output-stationary ``k=64`` split-K producer, so its L0 buffers pack
-    against the consumer's. A K where the producer becomes A/B-stationary hits the
-    #1908 offset-packing gap (``Left buffer usage exceeds``).
+    against the consumer's. Without the pass's output-stationary re-choice, a K where
+    the producer initially becomes A/B-stationary would hit the #1908 offset-packing
+    gap (``Left buffer usage exceeds``).
 
     The intermediate is **bf16** — the cube accumulates in f32 (L0C) and the FIXPIPE
     writeback to L1 downcasts to bf16/f16 (the only offset Acc->Mat path on A2/A3), which
