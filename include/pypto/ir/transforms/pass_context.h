@@ -271,6 +271,8 @@ class PassContext {
    *        accumulators and MemoryReuse's capacity gate allocates the ping-pong.
    * @param dsa_export_dir Optional directory for deterministic schema-v1
    *        ``pypto_structured`` problems emitted by MemoryPlanner::Dsa.
+   * @param dsa_solution_dir Optional directory containing versioned DSA
+   *        solution artifacts to replay instead of invoking a solver.
    */
   explicit PassContext(std::vector<PassInstrumentPtr> instruments,
                        VerificationLevel verification_level = VerificationLevel::Basic,
@@ -278,7 +280,8 @@ class PassContext {
                        DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
                        MemoryPlanner memory_planner = MemoryPlanner::PyPTO,
                        bool enable_pypto_l0c_double_buffer = false,
-                       std::optional<std::string> dsa_export_dir = std::nullopt);
+                       std::optional<std::string> dsa_export_dir = std::nullopt,
+                       std::optional<std::string> dsa_solution_dir = std::nullopt);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -348,6 +351,11 @@ class PassContext {
   [[nodiscard]] const std::optional<std::string>& GetDsaExportDir() const;
 
   /**
+   * @brief Get the optional standalone DSA placement replay directory
+   */
+  [[nodiscard]] const std::optional<std::string>& GetDsaSolutionDir() const;
+
+  /**
    * @brief Get the currently active context (top of thread-local stack)
    * @return Pointer to current context, or nullptr if none
    */
@@ -374,6 +382,7 @@ class PassContext {
   MemoryPlanner memory_planner_;
   bool enable_pypto_l0c_double_buffer_;
   std::optional<std::string> dsa_export_dir_;
+  std::optional<std::string> dsa_solution_dir_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;
