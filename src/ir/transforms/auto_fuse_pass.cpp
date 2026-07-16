@@ -74,6 +74,7 @@
 #include "core/l0_matmul_plan.h"
 #include "core/subgraph.h"
 #include "core/types.h"
+#include "io/io.h"
 #include "partition/partition.h"
 #include "pipeline/solver.h"
 #include "solution/solution.h"
@@ -1321,29 +1322,7 @@ void DumpSolutionJson(const ::Solution& sol, const std::string& path) {
   if (!f) {
     return;
   }
-  const size_t ns = sol.num_steps();
-  f << "{\n  \"subgraphs\": [";
-  for (size_t s = 0; s < ns; ++s) {
-    const std::vector<size_t>& ops = sol.step(s).subgraph.ops();
-    f << (s ? "," : "") << "[";
-    for (size_t j = 0; j < ops.size(); ++j) f << (j ? "," : "") << ops[j];
-    f << "]";
-  }
-  f << "],\n  \"granularities\": [";  // per-group [w,h,k] — the tiling decision
-  for (size_t s = 0; s < ns; ++s) {
-    const ::TileConfig& c = sol.step(s).config;
-    f << (s ? "," : "") << "[" << c.w << "," << c.h << "," << c.k << "]";
-  }
-  f << "],\n  \"subgraph_latencies\": [";
-  for (size_t s = 0; s < ns; ++s) f << (s ? "," : "") << sol.step_latency(s);
-  f << "],\n  \"tensors_to_retain\": [";
-  for (size_t s = 0; s < ns; ++s) {
-    const std::vector<size_t>& rt = sol.step(s).retain_these.underlying();
-    f << (s ? "," : "") << "[";
-    for (size_t j = 0; j < rt.size(); ++j) f << (j ? "," : "") << rt[j];
-    f << "]";
-  }
-  f << "]\n}\n";
+  f << ::solution_json(sol);
 }
 
 ExprPtr MakeIndex(int64_t v, const Span& span) {
