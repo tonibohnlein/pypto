@@ -26,6 +26,7 @@ Cube evaluation has two deliberate optimization modes:
 
 - spatial regions and split-K work units;
 - recursive producer requests and their L1 lifetimes;
+- optional boundary panels retained in L1 across one request's output-tile loop;
 - each matmul's GM→L1 K window, chunk, init, rolled loop, and tail;
 - the L0C-resident output-tile grid;
 - internal Acc→Mat and root Acc→GM drains;
@@ -57,17 +58,20 @@ extracts, cube operations, and low-level drains; in exact mode it also fails on 
 | C6 | One complete output tile remains in L0C across all K windows | Nest output tiles outside the K-window loop; never spill a partial to Mat and reload it into Acc |
 | C7 | Exact mode prices a concrete shared-backend L0 plan; analytic mode prices the grounded surrogate | Always attach the output-residency intent; attach and validate detailed geometry only in exact mode; let `AutoTileMatmulL0` realize both |
 | C8 | Overlap is local to one concrete full-window loop | Put K=0 and every rolled full window in the same eligible stage ring; add only its fill/drain, the ragged tail, and final output drain serially |
-| C9 | GM traffic follows the emitted output-tile loop | Charge repeated boundary-panel loads when another output tile reloads them; credit reuse only when represented |
+| C9 | GM traffic follows the emitted output-tile loop | Charge repeated boundary-panel loads by default; when the plan selects retention, add one serial GM→L1 preload, keep that panel live, and remove only its represented per-tile feeds |
 | C10 | Split-K writes `S` atomic partials | Emit one ordered, tiled zero seed and `S` disjoint K shares, or select `S=1` |
 | C11 | Cube accumulation dtype differs from storage dtype | Accumulate float inputs in FP32, then narrow once at the planned BF16/FP16 or GM drain |
 
 ## 4. Grounded loop structure
 
-The PTO A2/A3 performance GEMM uses this hierarchy:
+The PTO A2/A3 performance GEMM uses this hierarchy. An exact/co-optimized plan may first retain a
+complete reusable boundary panel in L1:
 
 ```text
+optional: load reusable A[rows,K] and/or B[K,cols] GM -> L1 once
 for output tile (m, n):
     for K window loaded GM -> L1:       # L1 ping/pong
+        # a retained operand is locally sliced instead of loaded again
         for base-K block L1 -> L0A/B:   # L0A/L0B ping/pong
             TMATMUL / TMATMUL_ACC       # one L0C accumulator
     TSTORE completed accumulator        # exactly one final drain
@@ -111,6 +115,7 @@ For every request, the plan records:
 - concrete input/output regions and symbolic axis bindings;
 - producer-instance dependencies and storage/accumulator dtypes;
 - the GM→L1 K-loop descriptor;
+- an optional retained-LHS/retained-RHS descriptor with exact L1 bytes;
 - up to four L0 output variants: full/full, tail/full, full/tail, and tail/tail;
 - init/rolled/tail child `L0MatmulPlan`s for each variant;
 - one final L0C→L1 or L0C→GM drain with exact tile count, bytes, and atomic mode.
@@ -125,6 +130,7 @@ In **exact mode**, the buildable uniform-grid cost is the sum of the emitted pha
 variant:
 
 ```text
+retained panels = one serial full-panel GM->L1 preload per selected side
 full K windows  = first feed + max(first child, next feed)
                   + (Q-2) * max(rolled child, next feed) + last child
 K tail          = GM feed + child L0 wall
@@ -133,7 +139,10 @@ final drain     = Acc->Mat or Acc->GM
 
 Variant cost is multiplied by its exact count, then by ready-queue waves. Internal drains use the
 grounded L0C→L1 pipe; roots use the grounded L0C→GM/FIXPIPE model. A split seed is an explicit serial
-vector fill/store/task phase and contributes its own kernel-fill wave.
+vector fill/store/task phase and contributes its own kernel-fill wave. For each request the planner
+compares no retention, LHS retention, RHS retention, and both. A choice is admitted only when the
+complete panel lifetime plus the other operand's rolling window fits L1. Its preload is added
+serially before the output-tile loop; subsequent K-window feeds omit exactly that retained side.
 
 The child L0 wall similarly records serial first-block fill, rolled L1→L0/Cube overlap, serial
 partial-K tail, and drain. The existing device-grounded chooser ordering is deliberately retained:
@@ -144,6 +153,7 @@ phase wall is used when composing the hierarchical cube candidate cost.
 The emitter replays the same algorithm:
 
 - one SPMD body per uniform spatial/split work unit;
+- selected boundary panels loaded once to L1 before the request's output-tile loop;
 - output/L0C tile outer, GM K-window inner;
 - one stage-2 full-window ring whose K=0 arm is `matmul` and later arms are
   `matmul_acc`, followed by a serial K tail;
@@ -164,16 +174,20 @@ The buildable subset now has one model/plan/emit algorithm. Remaining work is:
    multiple atomic owners. A valid M/N region with a sub-fractal edge is also rejected consistently
    by analytic and exact compiler modes until the shared L0 plan separates physical padding from
    valid extents. Multi-matmul groups remain uniform-only.
-2. **Shared boundary panels.** The current output-tile-outer emitter may reload a shared LHS for each
-   N output tile (or RHS for each M tile). The hierarchical cost charges that multiplicity. Explicit
-   panel retention can be added later only with a matching lifetime and traffic change.
+2. **Retained boundary panels.** Exact/co-optimized mode now compares the four bounded retention
+   choices per request. A selected LHS or RHS is loaded once into L1, remains live through the
+   output-tile loop, and is locally extracted for each child; cost and emit use the same lifetime and
+   traffic. Analytic mode deliberately retains the prior repeated-load surrogate and emits no
+   retained panel. Device validation must confirm the predicted MTE2 reduction and silicon win
+   before retention is considered for the analytic default.
 3. **Runtime scheduling boundary.** A8/E12 pipe tracing confirms the nested cube phase equation and
    the existing final `PIPE_ALL` barrier. A wider two-shape sweep then falsified a scalar
    per-work-unit correction: scheduler time was U-shaped with task count for `[272,272]`, but fell
-   from 127 us to 33 us as fixed-shape `[512,512]` work was divided over more cores. The earlier
-   1.6 us/task slope was local to two adjacent points. Do not add a scalar dispatch term or reuse
-   vector C3. The next experiment must hold each task's tile/K algorithm constant while varying only
-   region count, so runtime dispatch/occupancy is separated from per-core kernel work.
+   from 127 us to 33 us as fixed-shape `[512,512]` work was divided over more cores. A later
+   constant-tile/constant-K sweep made per-task PTO byte-identical across 1, 2, 4, 8, 12, 16, 24,
+   and 48 work units. Its linear per-task slope was approximately zero; silicon showed a small-count
+   launch region, a flat 4–24 plateau, and a step at the second 24-core wave. Keep the current
+   `ceil(work_units/24)` wave shape and add neither a scalar dispatch term nor vector C3.
 4. **Low-precision and integer envelope.** BF16/FP16 on-chip handoff is represented. Same-type FP32
    internal storage declines. Other Acc→Mat conversion families require explicit PTO capability
    descriptors before admission.
@@ -210,8 +224,9 @@ true capacity misses. Pipeline peeling retained a constant-dead branch and dupli
 L0C accumulator; separately, a serial partial-K child was hoisted into the rolled phase and kept a
 third Left/Right panel live. Early simplification, explicit serial-phase ordering, and preservation
 of compiler call metadata now make the reported A4, B16/B24/B48, and split-K S16/S32 plans lower
-with exactly the priced accumulator and operand-bank lifetimes. Device confirmation remains
-pending.
+with exactly the priced accumulator and operand-bank lifetimes. Device validation confirmed the
+former overflow cases now build deterministically; A4 and B16/B24/B48 pass the existing cube
+tolerance, while long-K S16/S32 retain the separately tracked FP32 reduction-order tolerance issue.
 
 Mixed cube/vector fusion is outside this contract.
 

@@ -379,8 +379,10 @@ statistics update math remains deliberately algorithm-specific.
    search/allocation; do not cache complete stream plans unless a new profile overturns that result.
 4. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan`, recursive uniform-grid emit,
    phase-local K-window cost, split seed/tasks, emitted reload multiplicity, and lone clamped-overlap
-   grids are implemented (§8). Next device-compare analytic versus exact winners, validate nested
-   pipe/FIXPIPE behavior, then consider retained panels and variable-shape multi-op grids.
+   grids are implemented (§8). Nested pipe/FIXPIPE behavior and the 24-core wave shape are
+   device-grounded. Exact mode now models and emits retained boundary panels; device-ground their
+   MTE2 reduction and ranking before considering analytic-default retention or variable-shape
+   multi-op grids.
 5. **Complete mixed fidelity:** make the plan choose a real pipeline-item axis and active-group
    count, replace global-tile overlap with serial-versus-realizable phase costs, then implement the
    one-way and single-round-trip emit through `ExpandMixedKernel` → `InjectGMPipeBuffer` →
@@ -464,11 +466,13 @@ but no scalar correction is supported.
 1. Non-uniform buildable cost/emission: lone split=1 now uses an explicit `ClampedOverlap` plan and
    prices every maximum-shape task; ragged split-K, sub-fractal valid M/N edges, and unequal
    multi-op grids decline. Analytic and exact compiler modes share that buildability gate.
-2. Optional retained boundary panels: the current model faithfully charges reload per output tile;
-   introducing reuse requires an explicit lifetime and matching emitter.
-3. Run a constant-tile, constant-K, variable-region-count sweep to separate runtime
-   dispatch/occupancy from per-core work. Add no scalar term unless it is stable below and above 24
-   AIC tasks and across repeated devices. Keep the existing vector C3 coefficient separate.
+2. Retained boundary panels: exact mode compares none/LHS/RHS/both, adds the selected full-panel
+   preload as a serial phase, keeps it live in L1 across the output-tile loop, and emits local
+   extracts instead of repeated GM loads. Device-check MTE2 bytes and retained-vs-baseline ranking;
+   analytic mode intentionally remains unchanged.
+3. The constant-tile, constant-K sweep found no scalar per-task term. Keep the existing
+   `ceil(work_units/24)` wave shape; the remaining small-count/within-wave queue effects are too
+   small and nonlinear to fit, and vector C3 remains separate.
 4. Expand the Acc→Mat capability table beyond BF16/FP16 only when PTO supports the exact conversion.
 5. Improve the analytic reload/extract surrogate and remove full plan construction from the exact
    candidate hot path after dispatch grounding; exact added about 1 ms to the full compiler pipeline.

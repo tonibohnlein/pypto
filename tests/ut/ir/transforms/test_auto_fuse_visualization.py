@@ -288,10 +288,10 @@ def test_cube_algorithm_shows_tile_flow_and_recursive_lifetime(cube_problem, cub
     assert "MATMUL REQUEST 1 · Op 1" in dot
     assert "OUTPUT-TILE LOOP" in dot
     assert "one iteration shown: C [32×32]" in dot
-    assert "K-slice tiles for this C tile" in dot
-    assert "K0 panels" in dot
+    assert "Panels available to this C tile" in dot
+    assert "K0 · LHS + RHS K panel: GM → L1" in dot
     assert "K0: L1 → L0 → Matrix" in dot
-    assert "K1: GM → L1 slot 1" in dot
+    assert "K1: LHS + RHS K panel: GM → L1" in dot
     assert "repeat ×2" in dot
     assert "no next prefetch" in dot
     assert "C tile in L0C" in dot
@@ -334,11 +334,27 @@ def test_serial_cube_k_loop_does_not_claim_pipeline_overlap(cube_problem, cube_s
 
     dot = visualize.build_algorithm_dot(cube_problem, cube_solution, 0)
 
-    assert "K0 panels" in dot
+    assert "K0 · LHS + RHS K panel: GM → L1" in dot
     assert "after feed completes" in dot
     assert "R0_Load0:s -> R0_Load0_C:n" not in dot
     assert "R0_Work0:s -> R0_Work0_C:n" in dot
-    assert "K1: GM → L1 slot 1" not in dot
+    assert "K1: LHS + RHS K panel: GM → L1" not in dot
+
+
+def test_cube_retained_panel_is_shown_as_one_preload(cube_problem, cube_solution):
+    cube_solution["cube_schedule"][0]["matmuls"][0]["retained_panels"] = {
+        "lhs": True,
+        "rhs": False,
+        "lhs_bytes": 16384,
+        "rhs_bytes": 0,
+    }
+
+    dot = visualize.build_algorithm_dot(cube_problem, cube_solution, 0)
+
+    assert "LHS: GM T0 [64×64] → retained L1 once (16384 B)" in dot
+    assert "K0 · RHS K panel: GM → L1" in dot
+    assert "K1: RHS K panel: GM → L1" in dot
+    assert "K1: LHS + RHS K panel: GM → L1" not in dot
 
 
 def test_algorithm_requires_a_current_plan_descriptor(vector_problem, vector_solution):

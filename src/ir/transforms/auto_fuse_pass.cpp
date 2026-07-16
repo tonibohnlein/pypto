@@ -3935,6 +3935,31 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
     if (mm.k_loop.pipeline_stages >= 2 && mm.k_loop.full_chunks < 3) {
       return fail("stage-2 K loop has no two-iteration rolled steady state");
     }
+    const int64_t lhs_dtype_bytes =
+        std::max<int64_t>(1, static_cast<int64_t>(lhs_type->dtype_.GetBit()) / 8);
+    auto rhs_type = AsTensorTypeLike(call->args_[1]->GetType());
+    if (rhs_type == nullptr) return fail("matmul RHS is not tensor-like");
+    const int64_t rhs_dtype_bytes =
+        std::max<int64_t>(1, static_cast<int64_t>(rhs_type->dtype_.GetBit()) / 8);
+    const int64_t expected_lhs_retained_bytes =
+        mm.retained_panels.lhs ? mm.lhs.height * mm.lhs.width * lhs_dtype_bytes : 0;
+    const int64_t expected_rhs_retained_bytes =
+        mm.retained_panels.rhs ? mm.rhs.height * mm.rhs.width * rhs_dtype_bytes : 0;
+    if ((mm.retained_panels.lhs &&
+         (mm.lhs_producer >= 0 || mm.output_tiles_n <= 1)) ||
+        (mm.retained_panels.rhs &&
+         (mm.rhs_producer >= 0 || mm.output_tiles_m <= 1)) ||
+        mm.retained_panels.lhs_bytes != expected_lhs_retained_bytes ||
+        mm.retained_panels.rhs_bytes != expected_rhs_retained_bytes ||
+        mm.retained_panels.bytes() > plan.peak_l1_bytes) {
+      return fail("retained boundary-panel lifetime is inconsistent");
+    }
+    const bool streams_boundary =
+        (mm.lhs_producer < 0 && !mm.retained_panels.lhs) ||
+        (mm.rhs_producer < 0 && !mm.retained_panels.rhs);
+    if (!streams_boundary && mm.k_loop.pipeline_stages != 1) {
+      return fail("fully retained operands leave a fictional GM-to-L1 pipeline");
+    }
     const bool has_chunked_carry = mm.k_loop.full_chunks >= 2;
     if (mm.output_tile_m <= 0 || mm.output_tile_n <= 0 ||
         mm.output_tiles_m != CeilDiv(mm.output.height, mm.output_tile_m) ||
@@ -4139,6 +4164,45 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
   const ExprPtr output_col = CubeRegionAxisOffset(mm.output.width_binding, mm.output.width, output_full_w,
                                                   clamp_overlap, m_index, n_index, split_index, sp);
 
+  // A retained boundary panel is one GM->L1 load per work unit, outside the
+  // output/L0C-tile loop. Nested tensor.slice ops inherit the Mat requirement
+  // from tensor.matmul, so ConvertTensorToTileOps lowers this outer slice to a
+  // tile.load(Mat) and all inner slices to local L1 views.
+  if (mm.retained_panels.lhs) {
+    if (mm.lhs_ephemeral || mm.lhs_producer >= 0) {
+      return fail("retained LHS panel is not a boundary input");
+    }
+    auto retained_call = OpRegistry::GetInstance().Create(
+        "tensor.slice",
+        {lhs, MakeIndexTuple({mm.lhs.height, mm.lhs.width}, sp),
+         MakeTuple2(lhs_row, lhs_k, sp)},
+        sp);
+    auto retained = std::make_shared<Var>(
+        name + "_i" + std::to_string(instance) + "_lhs_l1",
+        retained_call->GetType(), sp);
+    body->push_back(std::make_shared<AssignStmt>(retained, retained_call, sp));
+    lhs = retained;
+    lhs_row = MakeIndex(0, sp);
+    lhs_k = MakeIndex(0, sp);
+  }
+  if (mm.retained_panels.rhs) {
+    if (mm.rhs_ephemeral || mm.rhs_producer >= 0) {
+      return fail("retained RHS panel is not a boundary input");
+    }
+    auto retained_call = OpRegistry::GetInstance().Create(
+        "tensor.slice",
+        {rhs, MakeIndexTuple({mm.rhs.height, mm.rhs.width}, sp),
+         MakeTuple2(rhs_k, rhs_col, sp)},
+        sp);
+    auto retained = std::make_shared<Var>(
+        name + "_i" + std::to_string(instance) + "_rhs_l1",
+        retained_call->GetType(), sp);
+    body->push_back(std::make_shared<AssignStmt>(retained, retained_call, sp));
+    rhs = retained;
+    rhs_k = MakeIndex(0, sp);
+    rhs_col = MakeIndex(0, sp);
+  }
+
   auto find_variant = [&](int64_t h, int64_t w) -> const ::CubeOutputTileVariant* {
     for (const ::CubeOutputTileVariant& variant : mm.output_variants) {
       if (variant.height == h && variant.width == w) return &variant;
@@ -4286,9 +4350,18 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
   }
 
   result.push_back(SpmdWrap(work_index, std::move(body), MakeIndex(plan.work_units, sp), name, sp));
+  int64_t retained_panel_bytes = 0;
+  int64_t retained_panel_count = 0;
+  for (const ::CubeMatmulSchedule& mm : plan.matmuls) {
+    retained_panel_bytes += mm.retained_panels.bytes();
+    retained_panel_count += static_cast<int64_t>(mm.retained_panels.lhs) +
+                            static_cast<int64_t>(mm.retained_panels.rhs);
+  }
   LOG_INFO << "AutoFuse[cube-plan]: group '" << name << "' emitted " << plan.matmuls.size()
            << " request instance(s), grid=" << parts_m << "x" << parts_n << "x" << plan.split_k
-           << " spatial_policy=" << CubeSpatialPolicyName(plan.spatial_policy);
+           << " spatial_policy=" << CubeSpatialPolicyName(plan.spatial_policy)
+           << " retained_panels=" << retained_panel_count
+           << " retained_l1_bytes=" << retained_panel_bytes;
   return result;
 }
 
