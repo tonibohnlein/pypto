@@ -1413,32 +1413,34 @@ class TestAutoTileMatmulL0MNTiling:
         _assert_ssa_valid(After, f"test_system_k_split_{planner}_{M}_{K}_{N}")
 
     @pytest.mark.parametrize(
-        ("planner", "M", "K", "N", "outer_loop", "inner_loop", "double_buffer_c"),
+        ("planner", "M", "K", "N", "held_m", "outer_loop", "inner_loop", "double_buffer_c"),
         [
             (
                 passes.MemoryPlanner.PYPTO,
                 256,
                 128,
                 544,
+                256,
                 "pl.range(0, 256, 256,",
                 "pl.pipeline(0, 512, 128,",
                 False,
             ),
             (
                 passes.MemoryPlanner.PTOAS,
-                416,
-                80,
-                96,
-                "pl.range(0, 416, 208,",
-                "pl.pipeline(0, 64, 64,",
+                384,
+                256,
+                128,
+                128,
+                "pl.range(0, 384, 128,",
+                "pl.pipeline(0, 128, 64,",
                 True,
             ),
         ],
     )
     def test_system_a_stationary_shapes_emit_held_a(
-        self, planner, M, K, N, outer_loop, inner_loop, double_buffer_c
+        self, planner, M, K, N, held_m, outer_loop, inner_loop, double_buffer_c
     ):
-        """Planner-specific A-stationary system shapes keep A in the outer loop."""
+        """Planner-specific A-stationary shapes reuse held A across the moving loop."""
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
 
@@ -1468,7 +1470,14 @@ class TestAutoTileMatmulL0MNTiling:
         assert printed.count("pl.pipeline(") == 1
         assert outer_loop in printed
         assert inner_loop in printed
-        assert f"[{M if planner == passes.MemoryPlanner.PYPTO else 208}, {K}]" in printed
+        lines = printed.splitlines()
+        outer_i = next(i for i, line in enumerate(lines) if outer_loop in line)
+        inner_i = next(i for i, line in enumerate(lines) if inner_loop in line)
+        assert outer_i < inner_i
+        held_region = "\n".join(lines[outer_i + 1 : inner_i])
+        assert "pl.tile.extract(" in held_region
+        assert f"[{held_m}, {K}]" in held_region
+        assert "target_memory=pl.Mem.Left" in held_region
         assert ("pipeline_double_buffer_c" in printed) == double_buffer_c
         _assert_ssa_valid(After, f"test_system_a_stationary_{planner}")
 

@@ -1487,11 +1487,12 @@ class TestMatmulOperations:
             f"matmul_acc_64 failed: max diff = {(c - expected).abs().max().item()}"
         )
 
+    @pytest.mark.platforms("a2a3", "a2a3sim")
     @pytest.mark.parametrize("platform", PLATFORMS)
     @pytest.mark.parametrize("planner", _AUTOL0_PLANNERS)
     @pytest.mark.parametrize("m,k,n,l0_k", _AUTOL0_K_SPLIT_SHAPES)
     def test_matmul_autol0(self, test_runner, platform, planner, m, k, n, l0_k):
-        """Mat-resident FP32 operands — genuine K-only AutoTile split under both planners."""
+        """910B FP32 operands — genuine K-only AutoTile split under both planners."""
         choice = _choose_a2a3_l0(m, k, n, planner=planner, bytes_a=4, bytes_b=4)
         assert (choice.m, choice.n, choice.k) == (m, n, l0_k), (
             f"expected K-only tile {(m, n, l0_k)} under {planner}, got {(choice.m, choice.n, choice.k)}"
@@ -1548,12 +1549,13 @@ class TestMatmulOperations:
         )
         assert result.passed, f"Test failed: {result.error}"
 
+    @pytest.mark.platforms("a2a3", "a2a3sim")
     @pytest.mark.parametrize("platform", PLATFORMS)
     @pytest.mark.parametrize(
         "planner,m,k,n,expected_tile",
         [
             pytest.param(MemoryPlanner.PYPTO, 256, 128, 544, (256, 128, 128), id="pypto"),
-            pytest.param(MemoryPlanner.PTOAS, 416, 80, 96, (208, 64, 80), id="ptoas"),
+            pytest.param(MemoryPlanner.PTOAS, 384, 256, 128, (128, 64, 256), id="ptoas"),
         ],
     )
     def test_matmul_autol0_a_stationary(self, test_runner, platform, planner, m, k, n, expected_tile):
@@ -1593,6 +1595,7 @@ class TestMatmulOperations:
         )
         assert result.passed, f"Test failed: {result.error}"
 
+    @pytest.mark.platforms("a2a3", "a2a3sim")
     @pytest.mark.parametrize("platform", PLATFORMS)
     @pytest.mark.parametrize(
         "planner,m,k,n,expected_tile",
