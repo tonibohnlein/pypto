@@ -23,6 +23,9 @@ import pytest
 import torch
 from examples.kernels.matmul import matmul_acc_64
 from harness.core.harness import PLATFORMS, DataType, PTOTestCase, TensorSpec
+from pypto import backend as _backend
+from pypto import ir, passes
+from pypto.backend import BackendType
 from pypto.pypto_core import passes as _core_passes
 from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime.runner import RunConfig
@@ -63,6 +66,32 @@ def _choose_a2a3_l0(
     cfg.allow_double_buffer_c = planner == MemoryPlanner.PTOAS
     cfg.allow_k_boundary = True
     return _core_passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+
+def _printed_through_auto_tile(program: Any, planner: MemoryPlanner) -> str:
+    """Run the production tensor-to-tile prefix through AutoTile for structural checks."""
+    _backend.reset_for_testing()
+    _backend.set_backend_type(BackendType.Ascend910B)
+    with passes.PassContext([], memory_planner=planner):
+        for make_pass in (
+            passes.inline_functions,
+            passes.unroll_loops,
+            passes.ctrl_flow_transform,
+            passes.convert_to_ssa,
+            passes.simplify,
+            passes.normalize_stmt_structure,
+            passes.flatten_call_expr,
+            passes.outline_hierarchy_scopes,
+            passes.outline_incore_scopes,
+            passes.outline_cluster_scopes,
+            passes.convert_tensor_to_tile_ops,
+            passes.optimize_orch_tensors,
+            passes.lower_composite_ops,
+            passes.flatten_tile_nd_to_2d,
+            passes.auto_tile_matmul_l0,
+        ):
+            program = make_pass()(program)
+    return ir.python_print(program)
 
 
 class TestMatmul(PTOTestCase):
@@ -1662,13 +1691,33 @@ class TestMatmulOperations:
         previously skipped for a device hang; run it under both planners to guard
         the loop-carried accumulator and nested-pipeline fixes."""
         cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
-        result = test_runner.run(
-            TestMatmulOuterPipelinedBF16(
-                memory_planner=planner,
-                platform=platform,
-                config=cfg,
-            )
+        case = TestMatmulOuterPipelinedBF16(
+            memory_planner=planner,
+            platform=platform,
+            config=cfg,
         )
+        choice = _choose_a2a3_l0(
+            case.M,
+            case.K_CHUNK,
+            case.N,
+            planner=planner,
+            bytes_a=2,
+            bytes_b=2,
+        )
+        assert choice.k < case.K_CHUNK, "the inner per-chunk matmul must be K-tiled"
+        printed = _printed_through_auto_tile(case.get_program(), planner)
+        outer_pipeline = f"pl.pipeline({case.NUM_CHUNKS}, stage=2"
+        inner_pipeline = f"pl.pipeline(0, {case.K_CHUNK}, {choice.k},"
+        assert printed.count(outer_pipeline) == 1
+        assert printed.count(inner_pipeline) == 2, "both outer if/else branches need an inner K pipeline"
+        lines = printed.splitlines()
+        outer_i = next(i for i, line in enumerate(lines) if outer_pipeline in line)
+        inner_indices = [i for i, line in enumerate(lines) if inner_pipeline in line]
+        outer_indent = len(lines[outer_i]) - len(lines[outer_i].lstrip())
+        assert all(
+            i > outer_i and len(lines[i]) - len(lines[i].lstrip()) > outer_indent for i in inner_indices
+        )
+        result = test_runner.run(case)
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)

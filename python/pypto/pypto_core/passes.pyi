@@ -472,10 +472,13 @@ def auto_tile_matmul_l0() -> Pass:
     f32-to-bf16/f16 ``rint`` casts fold into the FIXPIPE writeback.
 
     Full-K grids support output-, A-, and B-stationary schedules. dbC=2 is
-    enabled under PTOAS and available as a PyPTO planner opt-in.
-    Already-L0-sized and unsupported regimes are left untouched; useful
-    deferred cases emit ``PerfHint`` diagnostics. ``tile.matmul_bias`` is
-    deferred.
+    enabled under PTOAS and available as a PyPTO planner opt-in. Eligible calls
+    require static 2D operands with B in Mat and A in Mat or Vec. When the
+    chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is needed,
+    although a chained result may still be remapped to Mat by the compatible
+    cast-fold placement above. Other unsupported regimes are left untouched;
+    useful deferred cases emit ``PerfHint`` diagnostics. ``tile.matmul_bias``
+    is deferred.
     """
 
 def canonicalize_tile_slice() -> Pass:

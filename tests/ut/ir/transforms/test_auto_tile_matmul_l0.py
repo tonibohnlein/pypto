@@ -1482,12 +1482,13 @@ class TestAutoTileMatmulL0MNTiling:
         _assert_ssa_valid(After, f"test_system_a_stationary_{planner}")
 
     @pytest.mark.parametrize(
-        ("planner", "M", "K", "N", "outer_loop", "inner_loop", "double_buffer_c"),
+        ("planner", "M", "K", "N", "held_n", "outer_loop", "inner_loop", "double_buffer_c"),
         [
             (
                 passes.MemoryPlanner.PYPTO,
                 192,
                 64,
+                512,
                 512,
                 "pl.range(0, 512, 512,",
                 "pl.pipeline(0, 192, 64,",
@@ -1498,6 +1499,7 @@ class TestAutoTileMatmulL0MNTiling:
                 64,
                 80,
                 288,
+                256,
                 "pl.range(0, 256, 256,",
                 "pl.pipeline(0, 64, 32,",
                 True,
@@ -1505,7 +1507,7 @@ class TestAutoTileMatmulL0MNTiling:
         ],
     )
     def test_system_b_stationary_shapes_emit_held_b(
-        self, planner, M, K, N, outer_loop, inner_loop, double_buffer_c
+        self, planner, M, K, N, held_n, outer_loop, inner_loop, double_buffer_c
     ):
         """Planner-specific B-stationary system shapes keep B in the outer loop."""
         _backend.reset_for_testing()
@@ -1537,7 +1539,14 @@ class TestAutoTileMatmulL0MNTiling:
         assert printed.count("pl.pipeline(") == 1
         assert outer_loop in printed
         assert inner_loop in printed
-        assert f"[{K}, {512 if planner == passes.MemoryPlanner.PYPTO else 256}]" in printed
+        lines = printed.splitlines()
+        outer_i = next(i for i, line in enumerate(lines) if outer_loop in line)
+        inner_i = next(i for i, line in enumerate(lines) if inner_loop in line)
+        assert outer_i < inner_i
+        held_region = "\n".join(lines[outer_i + 1 : inner_i])
+        assert "pl.tile.extract(" in held_region
+        assert f"[{K}, {held_n}]" in held_region
+        assert "target_memory=pl.Mem.Right" in held_region
         assert ("pipeline_double_buffer_c" in printed) == double_buffer_c
         _assert_ssa_valid(After, f"test_system_b_stationary_{planner}")
 
@@ -2212,19 +2221,35 @@ class TestAutoTileMatmulL0MatScratch:
         partial N boundary. This exact shape previously exposed a printer/parser
         mismatch in an if/else tail variable.
         """
+        import re  # noqa: PLC0415
+
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
+        M, K, N = 128, 64, 272
+
+        cfg = passes.l0_tile_chooser.L0TileConfig()
+        cfg.M, cfg.K, cfg.N = M, K, N
+        cfg.l0a_bytes = cfg.l0b_bytes = 64 * 1024
+        cfg.l0c_bytes = 128 * 1024
+        cfg.bytes_a = cfg.bytes_b = 2
+        cfg.bytes_c = 4
+        cfg.allow_a_stationary = True
+        cfg.allow_b_stationary = True
+        cfg.allow_k_boundary = True
+        choice = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert choice.stationarity == passes.l0_tile_chooser.Stationarity.OutputStationary
+        assert N % choice.n != 0, f"expected a partial-N tail, but tile n={choice.n} divides N={N}"
 
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                a: pl.Tensor[[128, 64], pl.BF16],
-                b: pl.Tensor[[64, 272], pl.BF16],
-                e: pl.Tensor[[272, 64], pl.BF16],
-                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
-            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                e: pl.Tensor[[N, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, 64], pl.FP32]],
+            ) -> pl.Tensor[[M, 64], pl.FP32]:
                 c = pl.matmul(a, b, out_dtype=pl.FP32)
                 cb = pl.cast(c, pl.BF16, mode="rint")
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)
@@ -2237,6 +2262,24 @@ class TestAutoTileMatmulL0MatScratch:
 
         printed = ir.python_print(After)
         assert printed.count("pl.tile.assemble(") >= 2, "expected a multi-tile Mat-scratch placement"
+        tail_offset = N - N % choice.n
+        tail_match = re.search(
+            rf"(?P<tail>[A-Za-z_]\w*):[^\n]*=\s*pl\.tile\.assemble\([^\n]*\[0, {tail_offset}\]\)",
+            printed,
+        )
+        assert tail_match, "expected the partial-N Mat-scratch assemble at the boundary offset"
+        tail_var = tail_match.group("tail")
+        tail_extract = re.search(
+            rf"pl\.tile\.extract\(\s*{re.escape(tail_var)},.*?target_memory=pl\.Mem\.Left",
+            printed,
+            re.DOTALL,
+        )
+        assert tail_extract, "the consumer K-loop must read the completed partial-N scratch variable"
+        if_pos = printed.find("if ", tail_extract.end())
+        else_pos = printed.find("else:", if_pos)
+        assert tail_extract.end() < if_pos < else_pos, (
+            "expected the partial-N scratch variable to feed the consumer's if/else K-loop"
+        )
         assert "pl.tile.cast(" not in printed, "the bf16 downcast must be folded into the Mat scratch"
         _assert_ssa_valid(After, "test_misaligned_n_mat_scratch_roundtrip")
 

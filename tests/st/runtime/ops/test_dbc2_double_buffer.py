@@ -42,24 +42,52 @@ import pypto.language as pl
 import pytest
 import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
+from pypto import backend as _backend
+from pypto import ir, passes
+from pypto.backend import BackendType
 from pypto.pypto_core import passes as _core_passes
 from pypto.pypto_core.passes import MemoryPlanner
 
 PLATFORMS_DBC = ["a2a3", "a2a3sim"]
 
 
-def _choose_a2a3_fp32_dbc(m: int, n: int):
-    """Return the calibrated 910B FP32 dbC=2 design point used by this suite."""
+def _choose_a2a3_dbc(m: int, k: int, n: int, *, bytes_a: int, bytes_b: int):
+    """Return a calibrated 910B dbC=2 design point used by this suite."""
     cfg = _core_passes.l0_tile_chooser.L0TileConfig()
-    cfg.M, cfg.K, cfg.N = m, 64, n
+    cfg.M, cfg.K, cfg.N = m, k, n
     cfg.l0a_bytes = cfg.l0b_bytes = 64 * 1024
     cfg.l0c_bytes = 128 * 1024
-    cfg.bytes_a = cfg.bytes_b = cfg.bytes_c = 4
+    cfg.bytes_a, cfg.bytes_b, cfg.bytes_c = bytes_a, bytes_b, 4
     cfg.allow_a_stationary = True
     cfg.allow_b_stationary = True
     cfg.allow_double_buffer_c = True
     cfg.allow_k_boundary = True
     return _core_passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+
+def _choose_a2a3_fp32_dbc(m: int, n: int):
+    return _choose_a2a3_dbc(m, 64, n, bytes_a=4, bytes_b=4)
+
+
+def _printed_after_auto_tile(test_case: PTOTestCase, planner: MemoryPlanner) -> str:
+    """Lower a device case through AutoTile so structural dbC assertions match compilation."""
+    _backend.reset_for_testing()
+    _backend.set_backend_type(BackendType.Ascend910B)
+    program = test_case.get_program()
+    with passes.PassContext(
+        [],
+        memory_planner=planner,
+        enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer() or False,
+    ):
+        for make_pass in (
+            passes.convert_to_ssa,
+            passes.convert_tensor_to_tile_ops,
+            passes.lower_composite_ops,
+            passes.flatten_tile_nd_to_2d,
+            passes.auto_tile_matmul_l0,
+        ):
+            program = make_pass()(program)
+    return ir.python_print(program)
 
 
 class _DbcDirectStore(PTOTestCase):
@@ -280,7 +308,13 @@ class TestDbc2DoubleBuffer:
     )
     def test_mat_scratch_dbc(self, test_runner, platform, planner):
         """Mat-scratch dbC=2 L1 drain; regression for #1995's PTOAS accumulator-handle fix."""
-        result = test_runner.run(_DbcMatScratch(planner=planner, platform=platform))
+        choice = _choose_a2a3_dbc(256, 64, 256, bytes_a=2, bytes_b=2)
+        assert (choice.m, choice.n, choice.k) == (128, 128, 64)
+        assert choice.double_buffer_c
+        case = _DbcMatScratch(planner=planner, platform=platform)
+        printed = _printed_after_auto_tile(case, planner)
+        assert printed.count('"pipeline_double_buffer_c": True') == 1
+        result = test_runner.run(case)
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS_DBC)
@@ -294,7 +328,13 @@ class TestDbc2DoubleBuffer:
     def test_non_divisible_tail_dbc(self, test_runner, platform, planner):
         """Non-divisible M/N (320x320): the peeled L-shaped tail is emitted straight-line
         (its drains are not floated), so this exercises dbC interior + exposed tail."""
-        result = test_runner.run(_DbcDirectStore(320, 320, planner=planner, platform=platform))
+        choice = _choose_a2a3_fp32_dbc(320, 320)
+        assert (choice.m, choice.n, choice.k) == (64, 128, 64)
+        assert choice.double_buffer_c
+        case = _DbcDirectStore(320, 320, planner=planner, platform=platform)
+        printed = _printed_after_auto_tile(case, planner)
+        assert printed.count('"pipeline_double_buffer_c": True') == 1
+        result = test_runner.run(case)
         assert result.passed, f"Test failed: {result.error}"
 
 

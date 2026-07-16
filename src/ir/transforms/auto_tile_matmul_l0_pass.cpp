@@ -102,8 +102,10 @@
 ///     ``K - (K/k)*k``; with K and k both 16-aligned the tail is itself 16-aligned
 ///     -- an ordinary matmul_acc block (ptoas requires 16-aligned tile cols).
 ///
-/// Already-L0-sized matmuls (chooser returns ``(M, N, K)``) are left
-/// untouched.
+/// When the chooser returns ``(M, N, K)``, the matmul itself needs no tiling
+/// rewrite.  Its result may still participate in the fits-L0c chained
+/// cast-fold, which remaps the compatible downcast to a full-window Mat
+/// scratch.
 
 #include <algorithm>
 #include <any>
@@ -1481,8 +1483,9 @@ class AutoTileMutator : public IRMutator {
         if (auto tiling = AnalyzeMatmul(assign, hints)) {
           if (!tiling->needs_mn_tiling()) {
             // Whole output fits L0c — tile K only.  k < K here (k == K with
-            // m == M, n == N would be already-L0-sized and skipped above); the
-            // chooser may return a non-divisor k that BuildKLoopRewrite peels.
+            // m == M, n == N needs no matmul tiling and was skipped by
+            // AnalyzeMatmul); the chooser may return a non-divisor k that
+            // BuildKLoopRewrite peels.
             INTERNAL_CHECK_SPAN(tiling->k < tiling->K, tiling->assign->span_)
                 << "Internal error: K-only tiling expects k < K (K=" << tiling->K << ", k=" << tiling->k
                 << ")";

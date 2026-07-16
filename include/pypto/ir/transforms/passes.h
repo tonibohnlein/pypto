@@ -448,9 +448,13 @@ Pass FlattenTileNdTo2D();
  * opt-in.  Chained Mat-scratch producers remain output-stationary to avoid the
  * allocator offset-packing limitation tracked by issue #1908.
  *
- * Already-L0-sized matmuls and unsupported regimes are left untouched; useful
- * deferred cases emit ``PerfHint`` diagnostics.  ``tile.matmul_bias`` remains
- * unsupported because its bias must be applied only after the final K block.
+ * Eligible calls require static 2D operands with B in Mat and A in Mat or Vec.
+ * When the chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is
+ * needed, although a chained result may still be remapped to Mat by the
+ * compatible cast-fold placement above.  Other unsupported regimes are left
+ * untouched; useful deferred cases emit ``PerfHint`` diagnostics.
+ * ``tile.matmul_bias`` remains unsupported because its bias must be applied
+ * only after the final K block.
  *
  * Requirements:
  * - Input IR must have static 2D tile ops (run FlattenTileNdTo2D first)
