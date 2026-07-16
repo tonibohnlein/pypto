@@ -1278,6 +1278,91 @@ class TestAutoFuse:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
+    def test_exact_cube_plan_retains_boundary_lhs_across_l0_n_tiles(self):
+        """One GM→L1 LHS panel feeds every L0-N output tile in the region.
+
+        The exact CubeSchedulePlan chooses this algorithm only after pricing
+        the serial full-panel preload against the repeated pipelined feeds.
+        Emission must therefore hoist one boundary slice outside all eight
+        output-tile K loops, while each loop takes local L1 extracts from it.
+        """
+        script = textwrap.dedent(
+            """
+            import torch
+
+            import pypto.language as pl
+            from pypto import backend, ir, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mm(
+                    self,
+                    a: pl.Tensor[[256, 64], pl.FP32],
+                    b: pl.Tensor[[64, 1024], pl.FP32],
+                ) -> pl.Tensor[[256, 1024], pl.FP32]:
+                    out: pl.Tensor[[256, 1024], pl.FP32] = pl.matmul(a, b)
+                    return out
+
+            after = passes.auto_fuse()(Prog)
+            body = next(f for _, f in after.functions.items() if f.name == "mm").as_python()
+            assert body.count("pl.tensor.slice(a, [256, 64]") == 1
+            assert body.count("pl.tensor.slice(fused_0_i0_lhs_l1") == 8
+            assert body.count("pl.tensor.slice(b, [16, 128]") == 8
+            assert body.count("pl.pipeline(0, 64, 16, stage=2") == 8
+
+            namespace = {}
+            exec(torch_codegen(after, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            a = torch.randn(256, 64, dtype=torch.float32) * 0.05
+            b = torch.randn(64, 1024, dtype=torch.float32) * 0.05
+            actual = namespace["mm"](a, b)
+            expected = a @ b
+            assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-4)
+
+            with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+                lowered = PassManager.get_strategy(
+                    OptimizationStrategy.Default
+                ).run_passes(Prog)
+            incores = [
+                f for _, f in lowered.functions.items() if ir.is_incore_type(f.func_type)
+            ]
+            assert len(incores) == 1
+            assert str(incores[0].func_type) == "FunctionType.AIC"
+            lowered_body = incores[0].as_python()
+            assert lowered_body.count("fused_0_i0_lhs_l1__tile:") == 1
+            assert (
+                "fused_0_i0_lhs_l1__tile" in lowered_body
+                and "target_memory=pl.Mem.Mat" in lowered_body
+            )
+            assert (
+                lowered_body.count(
+                    "pl.tile.extract(fused_0_i0_lhs_l1__tile"
+                )
+                >= 8
+            )
+            """
+        )
+        env = os.environ.copy()
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "1024,256,1,1,1"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
     def test_multi_window_root_keeps_each_output_tile_in_l0c_then_drains(self):
         """An oversized root nests output/L0C tiles outside GM K windows.
 
