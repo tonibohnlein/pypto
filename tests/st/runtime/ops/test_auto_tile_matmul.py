@@ -13,7 +13,8 @@ Validates on device the cases from examples/kernels/11_auto_tile_matmul.py:
 
   - **Oversized 2x2 matrix** -- an oversized ``[256, 256]`` FP32 output (> L0c) tiled and
     placed either to **DDR** (direct-store) or an **L1/Mat scratch** (consumed on-chip by a
-    second matmul), each with **full-K** (K=32, k == K) or **split-K** (K=128) reduction.
+    second matmul), each with **full-K** (K=32, k == K) or **split-K** reduction (K=128
+    for direct-store, K=192 for the common cross-planner Mat-scratch split).
   - **Fits-L0c cast-fold** -- a chained ``(a @ b) @ e`` whose ``[128, 128]`` intermediate
     *fits* L0c (no M/N tiling); the ``pl.cast`` is folded into a single full-window Acc->Mat
     ``pto.tinsert``, so the bf16 downcast stays on the cube. full-K (K=64) and split-K (K=512).
@@ -74,22 +75,21 @@ class TestAutoTileMatmulL0:
         )
 
     @pytest.mark.parametrize("planner", _PLANNERS)
-    @pytest.mark.parametrize("kernel, K", [(mat_split_k, 64), (mat_full_k, 32)])
+    @pytest.mark.parametrize("kernel, K", [(mat_split_k, 192), (mat_full_k, 32)])
     def test_mat_scratch(self, test_config, kernel, K, planner):
         """``(a @ b) @ e`` with a bf16 ``[256, 256]`` intermediate kept on-chip in an
-        L1/Mat scratch (Acc->Mat ``pto.tinsert``); K=64 and K=32.
+        L1/Mat scratch (Acc->Mat ``pto.tinsert``); split-K K=192 and full-K K=32.
 
         Run under both planners.  The PTOAS variants provide regression coverage
         for #1995: the chained consumer's K-reduction accumulator if-phi must reuse
         the dominating accumulator handle so all partial sums land in one L0C buffer.
 
-        K is chosen so the chained producer and consumer pick the **same
-        (output-stationary) algorithm**, so their L0 buffers have matching shapes and
-        pack under `AllocateMemoryAddr`. A K where the roofline chooser makes the
-        producer A/B-stationary (e.g. K=128 -> ``(256,128,128)A``) pins a monolithic
-        full-L0A buffer the consumer's double-buffers cannot pack against -> `Left
-        buffer usage exceeds` — the offset-packing gap tracked in #1908. Both matmuls
-        here are also full-K (no K-loop peel), so this does not depend on #1924.
+        K=192 is the common cross-planner split point: both planners choose an
+        output-stationary producer with k=64, so its L0 buffers pack against the
+        consumer's. K=128 is planner-dependent (PyPTO splits while PTOAS can keep full K)
+        and can select a monolithic A/B-stationary buffer that the consumer's two
+        half-size buffers cannot pack against. The pass deliberately avoids that
+        issue-1908 regime by forcing chained Mat-scratch producers output-stationary.
 
         Operands are bf16 and the on-chip intermediate is bf16 — the cube's FIXPIPE
         writeback to L1 downcasts the f32 accumulator, which is also the cube's native

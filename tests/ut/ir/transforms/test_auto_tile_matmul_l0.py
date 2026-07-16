@@ -1845,8 +1845,8 @@ class TestAutoTileMatmulL0MatScratch:
     When an oversized ``[M, N]`` matmul result is consumed *only* as a matmul operand
     (a chained matmul), the pass tiles the output into a ``tile.create(target=Mat)``
     scratch via per-sub-tile ``tile.assemble`` (Acc→Mat) and keeps it on-chip for the
-    consumer, instead of the direct-GM store path.  K-split only for now — the
-    constant-offset grid satisfies ``tile.assemble``'s literal-offset requirement."""
+    consumer, instead of the direct-GM store path. Split-K uses a constant-offset
+    grid; full-K uses pipelined loop-variable offsets."""
 
     def test_chained_matmul_uses_mat_scratch(self):
         """An oversized producer feeding a matmul: the pass assembles the result into an
@@ -1973,6 +1973,42 @@ class TestAutoTileMatmulL0MatScratch:
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         assert PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before) is not None
+
+    def test_misaligned_n_mat_scratch_roundtrips(self):
+        """A misaligned-N Mat-scratch boundary tail survives print -> parse.
+
+        The 128x272 producer exceeds L0c and is consumed only by the second
+        matmul, so AutoTile emits an output-stationary Mat-scratch grid with a
+        partial N boundary. This exact shape previously exposed a printer/parser
+        mismatch in an if/else tail variable.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 64], pl.BF16],
+                b: pl.Tensor[[64, 272], pl.BF16],
+                e: pl.Tensor[[272, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                c = pl.matmul(a, b, out_dtype=pl.FP32)
+                cb = pl.cast(c, pl.BF16, mode="rint")
+                d = pl.matmul(cb, e, out_dtype=pl.FP32)
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        lowered = _lower_to_tile_ops(Before)
+        with passes.PassContext([ir.make_roundtrip_instrument()]):
+            After = passes.auto_tile_matmul_l0()(lowered)
+
+        printed = ir.python_print(After)
+        assert printed.count("pl.tile.assemble(") >= 2, "expected a multi-tile Mat-scratch placement"
+        assert "pl.tile.cast(" not in printed, "the bf16 downcast must be folded into the Mat scratch"
+        _assert_ssa_valid(After, "test_misaligned_n_mat_scratch_roundtrip")
 
     def test_chained_matmul_exceeding_mat_capacity_deferred(self):
         """The conservative Mat-capacity gate: a bf16 chained matmul whose result is
