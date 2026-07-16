@@ -62,12 +62,12 @@ edges are drawn before nodes so arrows do not cover operation labels.
 
 ## Per-kernel algorithm view
 
-Each row is one ordered algorithm event. The left column is the action; the right column is the
-on-chip state immediately after that action. The action colors are stable: loads are blue, compute
-is green, pipelines/loops are purple, carries are yellow, drains/stores are orange, and releases are
-gray.
+The vector and cube views use different layouts because they describe different algorithm
+structures. DOT remains the interchange format. The cube renderer uses Graphviz for a tile-centric
+flow rather than treating pipeline phases as an operation-dependency DAG.
 
-Vector timelines are derived from `VectorStreamPlan` and show:
+Vector timelines remain ordered event/liveness views. Each row contains an action and the on-chip
+state immediately after it. They are derived from `VectorStreamPlan` and show:
 
 - one logical region and its physical UB allocation;
 - the strip driver or streamed statistics/apply phases;
@@ -76,15 +76,24 @@ Vector timelines are derived from `VectorStreamPlan` and show:
 - source operations in the solver's pebbling/topological order;
 - boundary loads, intermediate last-use releases, and GM stores.
 
-Cube timelines are derived from `CubeSchedulePlan` plus its shared `L0MatmulPlan` children and show:
+Cube schedules are tile-centric flows derived from `CubeSchedulePlan` plus its shared
+`L0MatmulPlan` children. Each matmul request shows one representative iteration of the output-tile
+loop:
 
-- one spatial/split-K work unit and optional zero-seed prologue;
-- every recursive matmul request in execution order;
-- output/L0C tile variants;
-- GM→L1 K-window init, rolled overlap, and ragged tail;
-- nested L1→L0A/L0B loads and `TMATMUL`/`TMATMUL_ACC` work;
-- the single final FIXPIPE drain to L1 or GM;
-- L1 intermediate retention through its priced last consumer and its release.
+- the outer output-tile loop and all full/tail tile variants;
+- an upper flow of K-slice operand tiles through fill, first overlap, repeated steady state, and
+  pipeline drain;
+- a lower flow representing the **same output tile** remaining in L0C while Matrix operations
+  accumulate successive K slices into it;
+- dashed Matrix-update arrows only where a K slice changes the output tile; a feed-only fill stage
+  deliberately has no such arrow;
+- the child L0 schedule summarized in the request header and executed by each Matrix update;
+- a serial ragged-K tail outside the stage-2 ring when present;
+- the single final FIXPIPE drain after the tile becomes complete;
+- recursive L1 result retention and last-use release between matmul requests.
+
+The optional split-K zero seed is shown as a separate AIV prologue. Its work-unit count is the number
+of UB-safe seed stores, not the number of cube spatial regions.
 
 The solution serializer reconstructs these descriptors only for final selected steps. They remain
 absent from the local-search `CostResult` cache. Old `.sol.json` files without `vector_stream` or

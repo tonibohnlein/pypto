@@ -280,18 +280,65 @@ def test_vector_algorithm_shows_phase_local_pipeline_and_liveness(vector_problem
     assert "UB → GM" in dot
 
 
-def test_cube_algorithm_shows_nested_stream_and_recursive_lifetime(cube_problem, cube_solution):
+def test_cube_algorithm_shows_tile_flow_and_recursive_lifetime(cube_problem, cube_solution):
     dot = visualize.build_algorithm_dot(cube_problem, cube_solution, 0)
 
     assert "CubeSchedulePlan: uniform" in dot
-    assert "matmul instance 0 · Op 0" in dot
-    assert "matmul instance 1 · Op 1" in dot
-    assert "GM→L1(k+1) overlaps child L1→L0/MAD(k)" in dot
-    assert "TMATMUL_ACC updates the same resident L0C tile" in dot
-    assert "FIXPIPE L0C → L1 Mat" in dot
-    assert "FIXPIPE L0C → GM" in dot
-    assert "release L1 result: instance 0 after its priced last use" in dot
-    assert dot.index("matmul instance 0 · Op 0") < dot.index("matmul instance 1 · Op 1")
+    assert "MATMUL REQUEST 0 · Op 0" in dot
+    assert "MATMUL REQUEST 1 · Op 1" in dot
+    assert "OUTPUT-TILE LOOP" in dot
+    assert "one iteration shown: C [32×32]" in dot
+    assert "K-slice tiles for this C tile" in dot
+    assert "K0 panels" in dot
+    assert "K0: L1 → L0 → Matrix" in dot
+    assert "K1: GM → L1 slot 1" in dot
+    assert "repeat ×2" in dot
+    assert "no next prefetch" in dot
+    assert "C tile in L0C" in dot
+    assert "Σ K0…K2" in dot
+    assert "FIXPIPE" in dot
+    assert "C tile → L1 Mat" in dot
+    assert "C tile → GM" in dot
+    assert "LHS: L1 result from request 0 · release after load" in dot
+    assert "R0_Fill:s -> R0_Fill_C:n" not in dot
+    assert "R0_First:s -> R0_First_C:n" in dot
+    assert "· COMPUTE</B>" not in dot
+    assert dot.index("MATMUL REQUEST 0 · Op 0") < dot.index("MATMUL REQUEST 1 · Op 1")
+
+
+def test_cube_split_seed_is_not_labeled_as_a_spatial_region(cube_problem, cube_solution):
+    cube_solution["cube_schedule"][0]["seed"] = {
+        "present": True,
+        "work_units": 7,
+        "valid_rows": 8,
+        "valid_cols": 64,
+    }
+
+    dot = visualize.build_algorithm_dot(cube_problem, cube_solution, 0)
+
+    assert "separate AIV split-K seed" in dot
+    assert "7 UB-safe zero stores" in dot
+    assert "not part of the cube tile pipeline" in dot
+    assert "seed 7 spatial regions" not in dot
+
+
+def test_serial_cube_k_loop_does_not_claim_pipeline_overlap(cube_problem, cube_solution):
+    for matmul in cube_solution["cube_schedule"][0]["matmuls"]:
+        matmul["k_loop"] = {
+            "l1_window_k": 64,
+            "chunk": 64,
+            "full_chunks": 1,
+            "tail": 0,
+            "pipeline_stages": 1,
+        }
+
+    dot = visualize.build_algorithm_dot(cube_problem, cube_solution, 0)
+
+    assert "K0 panels" in dot
+    assert "after feed completes" in dot
+    assert "R0_Load0:s -> R0_Load0_C:n" not in dot
+    assert "R0_Work0:s -> R0_Work0_C:n" in dot
+    assert "K1: GM → L1 slot 1" not in dot
 
 
 def test_algorithm_requires_a_current_plan_descriptor(vector_problem, vector_solution):
