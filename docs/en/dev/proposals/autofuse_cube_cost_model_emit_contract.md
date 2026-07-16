@@ -161,15 +161,18 @@ The buildable subset now has one model/plan/emit algorithm. Remaining work is:
 2. **Shared boundary panels.** The current output-tile-outer emitter may reload a shared LHS for each
    N output tile (or RHS for each M tile). The hierarchical cost charges that multiplicity. Explicit
    panel retention can be added later only with a matching lifetime and traffic change.
-3. **L0 synchronization grounding.** Geometry selection remains on the validated aggregate PTO
-   oracle. The phase composer needs device/op-simulator validation before a per-baseK event cost is
-   introduced or geometry selection is changed.
+3. **Runtime work-unit dispatch.** A8/E12 pipe tracing confirms the nested cube phase equation and
+   the existing final `PIPE_ALL` barrier. The remaining outer-ranking gap is AICPU scheduling, not a
+   cube pipe: two devices measured roughly 1.6 us per dispatched work unit at 8 and 12 tasks. Ground
+   a separate AIC coefficient over more task counts before adding it to both cost modes; the vector
+   C3 coefficient describes a different runtime path and must not be reused silently.
 4. **Low-precision and integer envelope.** BF16/FP16 on-chip handoff is represented. Same-type FP32
    internal storage declines. Other Acc→Mat conversion families require explicit PTO capability
    descriptors before admission.
-5. **Device grounding.** Validate descriptor consumption, nested MTE2/MTE1/Matrix/FIXPIPE overlap,
-   exact GM/L1 traffic, internal narrowing, split seed/atomic behavior, and forced-plan ranking on
-   Ascend 910B2 with the latest PTOAS.
+5. **Device grounding.** A8/E12 validates descriptor consumption, exact per-task operand/FIXPIPE
+   bytes, nested MTE2/MTE1/Matrix/FIXPIPE execution, final-drain completion, and forced-grid ranking.
+   Extend the same evidence to internal narrowing, split seed/atomic behavior, retained panels, and
+   variable-shape schedules.
 6. **Evaluation cost and mode comparison.** An ephemeral L0-request memo reduced direct Release
    exact `best_cost()` measurements from roughly 13–54 ms to 2.2–9.4 ms on the sampled lone
    matmuls, and from roughly 22 ms to 2.3 ms on the sampled two-matmul chain. Analytic evaluation was
@@ -181,6 +184,16 @@ The buildable subset now has one model/plan/emit algorithm. Remaining work is:
 If exact replay is unavailable, strict mode fails with the rejected contract condition. Production
 mode partitions or falls back to standalone matmuls rather than silently emitting another
 algorithm.
+
+The first clamped-grid silicon ranking isolates a system-cost term. For
+`[272,272]@[272,272]`, analytic selects A8 (`144x80`, 8 tasks), exact selects E12 (`80x96`, 12
+tasks), and a fixed grid lowers to the same binary in both modes. A8 is 7.3% faster under the
+runtime's scheduler/orchestration execution span even though exact ranks E12 lower. Per-task traces
+match the planned byte multiplicities and favor E12; the kernel already executes `PIPE_ALL` after
+the final TSTORE, its barrier cycles equal FIXPIPE, and a redundant barrier adds no work. The full
+device difference is instead the scheduler phase, approximately 1.6 us per work unit in this
+two-count experiment. Add no pipe correction. The next gate is a multi-count/multi-shape AIC
+dispatch sweep, followed by one shared additive outer-cost term if the slope remains stable.
 
 Mixed cube/vector fusion is outside this contract.
 

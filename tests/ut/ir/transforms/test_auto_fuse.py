@@ -905,6 +905,13 @@ class TestAutoFuse:
         assert sink_inputs[0] == intermediate, (sink_inputs, intermediate)
         assert len(sink_inputs) == 2 and sink_inputs[1] != intermediate
 
+        solution = json.loads((tmp_path / "chain.sol.json").read_text())
+        assert len(solution["cube_schedule"]) == len(solution["subgraphs"])
+        cube_plans = [plan for plan in solution["cube_schedule"] if plan is not None]
+        assert cube_plans
+        assert all(plan["work_units"] >= 1 and plan["matmuls"] for plan in cube_plans)
+        assert all(plan["matmuls"][0]["output_variants"] for plan in cube_plans)
+
     def test_vector_problem_dump_records_emitted_primitive_geometry(self, tmp_path, monkeypatch):
         """The adapter describes the tile ops replayed by VectorStreamPlan.
 
@@ -943,6 +950,19 @@ class TestAutoFuse:
             "reduction_sum",
         ]
         assert dag["per_task_overhead_cycles"] == 64
+
+        solution = json.loads((tmp_path / "vector_semantics.sol.json").read_text())
+        vector_plan = next(plan for plan in solution["vector_stream"] if plan is not None)
+        assert vector_plan["work_units"] >= 1
+        assert vector_plan["m_partition"]["parts"] >= 1
+        assert vector_plan["n_partition"]["parts"] >= 1
+        assert vector_plan["free_tile_alloc"] >= vector_plan["free_tile"]
+        assert set(vector_plan["serial_phases"]) == {
+            "stats_init",
+            "stats_tail",
+            "apply_tail",
+            "finalize",
+        }
 
     def test_vector_capabilities_decline_unimplemented_reduction_algorithms(self, tmp_path, monkeypatch):
         """Prod/arg/min never enter the generic strip/stream emitter.

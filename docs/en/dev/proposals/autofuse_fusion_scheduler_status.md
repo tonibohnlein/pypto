@@ -45,6 +45,19 @@ reuse the exact P4 vector-stage descriptor, but full `C→V→C→V` attention r
 in compiler mode—and its key-chunk loop remains unrepresentable—until whole-FIFO multi-round-trip
 skew and the second loop axis exist. Analytic mode retains the four-stage topology at a serial cost.
 
+**Cube device checkpoint (2026-07-16).** Pure-cube schedules that reached silicon passed 75/75
+runs across clamped overlap, multi-window/ragged K, split-K, and a low-precision recursive chain.
+The former oversized sub-fractal `1x1` candidate is now absent from both cost modes. On
+`[272,272]@[272,272]`, the default analytic winner A8 (`144x80`, 8 tasks) was 7.3% faster than the
+exact winner E12 (`80x96`, 12 tasks) under the scheduler/orchestration execution metric; forcing a
+fixed grid produced a byte-identical executable in both modes. Analytic therefore remains the
+default and exact remains opt-in. Pipe tracing closed the apparent inversion: E12 is cheaper per
+task in the op simulator, the generated kernel already executes `PIPE_ALL` after its final TSTORE,
+and a redundant second barrier costs zero. The entire 6.6–6.7 us device gap is the AICPU scheduler,
+which measured approximately `65.6 us + 1.6 us * work_units` at the two sampled task counts. The
+hierarchical cube equation is faithful but lacks a per-AIC-work-unit dispatch term. Ground that term
+over more than two task counts before selecting a constant; do not retune MTE2, Matrix, or FIXPIPE.
+
 ---
 
 ## 1. Goal
@@ -193,6 +206,8 @@ coverage close the remaining representational gaps on host without fitting AutoF
   `0` = neither, nonzero = exact softmax + Welford), `PYPTO_AUTOFUSE_FORCE_PLAN`
   (`"[g<N>:]w,h,split[,pm,pn]"`, **static-cached per process** → one force per fresh subprocess),
   `PYPTO_AUTOFUSE_FORCE_MERGE=none|all`, `PYPTO_AUTOFUSE_DUMP_PLANS`, `PYPTO_AUTOFUSE_STRICT`.
+- **Visualization:** `PYPTO_AUTOFUSE_DUMP=<dir>` plus the partition and per-kernel algorithm views
+  described in [autofuse_schedule_visualization.md](autofuse_schedule_visualization.md).
 - **Build (MAX 2 cores):** `cmake --build build --parallel 2`;
   `cmake --build 3rdparty/pto-fusebox/build --target solver_lib -j2`.
 - **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 4`
@@ -411,7 +426,7 @@ BF16/FP16 Mat, matching PTO's fused-chain kernel; roots narrow/store to their de
 Same-type FP32 internal L1 handoff is not an A2/A3 instruction, so an explicitly FP32 chain is
 partitioned into standalone kernels. Direct Mat→GM store is legal and no longer detours through Vec.
 
-**Host validation.** PTO Fusebox reports 483 passing checks with the same six documented baseline
+**Host validation.** PTO Fusebox reports 489 passing checks with the same six documented baseline
 failures; the full AutoFuse file reports 54 passing tests. Compiler coverage includes
 natural/forced lone matmuls, BF16 recursive trees/fan-out/deep
 chains, FP32-chain decline, split seed, ragged K, multi-window output residency, a 192 KiB internal
@@ -424,6 +439,16 @@ fails, even at 12 blocks and with a single K window. DFX proves the shared alloc
 AIC→AIV dependency are present, so that residual is a mixed/orchestration FIXPIPE-visibility issue,
 not a cube-only schedule blocker. Cube-only correctness and ranking work proceeds independently.
 
+**Silicon ranking.** The clamped A8/E12 comparison keeps analytic as the default: A8 is 7.3%
+faster under the measured scheduler/orchestration execution span, while exact selects E12. Both
+modes emit a byte-identical binary for a fixed outer grid, so the difference is entirely the cost
+decision. MTE2 is the critical per-task pipe, but E12's simulated task is 24% shorter; the final
+TSTORE is already followed by `PIPE_ALL`, whose cycles match FIXPIPE, and a second barrier is free.
+The measured difference instead comes from roughly 1.6 us of AICPU scheduling per work unit: four
+extra E12 tasks account for the complete gap. Exact is therefore incomplete at the system boundary,
+not wrong about the cube algorithm. A shared additive dispatch term must apply to analytic and exact
+outer plans after a multi-count grounding sweep.
+
 **Remaining gaps:**
 
 1. Non-uniform buildable cost/emission: lone split=1 now uses an explicit `ClampedOverlap` plan and
@@ -431,15 +456,14 @@ not a cube-only schedule blocker. Cube-only correctness and ranking work proceed
    multi-op grids decline. Analytic and exact compiler modes share that buildability gate.
 2. Optional retained boundary panels: the current model faithfully charges reload per output tile;
    introducing reuse requires an explicit lifetime and matching emitter.
-3. Ground a per-baseK synchronization/event term before allowing phase composition to change the
-   shared chooser's geometry ranking.
+3. Ground a separate per-AIC-work-unit dispatch term over several task counts and shapes, then add
+   it to both analytic and exact cube outer costs. Keep the existing vector C3 coefficient separate.
 4. Expand the Acc→Mat capability table beyond BF16/FP16 only when PTO supports the exact conversion.
-5. Improve the analytic reload/extract surrogate, remove full plan construction from the exact
-   candidate hot path, and run forced analytic-winner versus exact-winner silicon regret plus compile-
-   time comparisons before mapping exact mode to `-O3`.
-5. Device-validate nested MTE2/MTE1/Matrix/FIXPIPE overlap, bytes, narrowing, split atomics, and
-   forced-plan regret on 910B2 with the latest PTOAS.
-6. Profile and optimize buildable cube candidate evaluation after fidelity closure.
+5. Improve the analytic reload/extract surrogate and remove full plan construction from the exact
+   candidate hot path after dispatch grounding; exact added about 1 ms to the full compiler pipeline.
+6. Extend the closed A8/E12 pipe trace to retained-panel, variable-shape, narrowing, and split-atomic
+   candidates on 910B2 with the latest PTOAS.
+7. Profile and optimize buildable cube candidate evaluation after fidelity closure.
 
 The authoritative obligation table and validation ladder are in
 `docs/en/dev/proposals/autofuse_cube_cost_model_emit_contract.md`.
