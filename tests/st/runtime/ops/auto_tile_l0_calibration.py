@@ -7,16 +7,27 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Device calibration sweep for AutoTileMatmulL0 issue/setup costs.
+"""L2 device calibration and L0 trace setup for AutoTileMatmulL0 costs.
 
 This is an opt-in device tool, not a pytest test. It requires the calibration
 hook carried by the issue-2079 working branch. Each measured sample runs in a
-fresh child process because the swimlane collector is not safely reusable.
+fresh child process because the L2 swimlane collector is not safely reusable.
+The measured value is the sole task's structured ``duration_us`` from
+``l2_swimlane_records.json``; converter console summaries are diagnostic only.
+
+``--build-one`` creates a persistent PTOAS build for the repository's
+``incore-profiling`` skill. Use those cycle-accurate L0 traces to explain the
+MTE1/CUBE/FIXPIPE terms, while the L2 sweep remains the real-device wall-time
+calibration target.
 
 Examples:
     python tests/st/runtime/ops/auto_tile_l0_calibration.py --suite primary --list
+    python tests/st/runtime/ops/auto_tile_l0_calibration.py --check-runtime
+    python tests/st/runtime/ops/auto_tile_l0_calibration.py --suite broad --validate
     python tests/st/runtime/ops/auto_tile_l0_calibration.py --suite primary --samples 5 -d 0
     python tests/st/runtime/ops/auto_tile_l0_calibration.py --suite broad --samples 3 -d 0 --resume
+    python tests/st/runtime/ops/auto_tile_l0_calibration.py --suite primary \
+        --build-one issue2079_16x512x128_bf16_bt_current
 """
 
 import argparse
@@ -205,6 +216,13 @@ def _suite(name: str) -> list[CalibrationCase]:
 
 _PL_DTYPE = {"bf16": pl.BF16, "fp32": pl.FP32}
 _DATA_TYPE = {"bf16": DataType.BF16, "fp32": DataType.FP32}
+_RUNTIME_SETUP = (
+    "python3 -m venv --system-site-packages .venv && source .venv/bin/activate && "
+    "export CMAKE_BUILD_PARALLEL_LEVEL=2 && "
+    "pip install scikit-build-core nanobind cmake ninja && "
+    "pip install --no-build-isolation .[dev] && "
+    "pip install --no-build-isolation ./runtime"
+)
 
 
 class GemmCase(PTOTestCase):
@@ -229,33 +247,60 @@ class GemmCase(PTOTestCase):
     def get_program(self):
         c = self.case
         M, N, K, dtype = c.M, c.N, c.K, _PL_DTYPE[c.dtype]
-        b_shape = [N, K] if c.transpose_b else [K, N]
-        transpose_b = c.transpose_b
+
+        # The DSL parser intentionally does not constant-fold captured Python
+        # booleans and does not support IfExp. Select one complete DSL body at
+        # construction time so each parsed program has a single static B layout.
+        if c.transpose_b:
+
+            @pl.program
+            class TransposedBGemmProgram:
+                @pl.function(type=pl.FunctionType.InCore)
+                def gemm(
+                    self,
+                    a: pl.Tensor[[M, K], dtype],
+                    b: pl.Tensor[[N, K], dtype],
+                    out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+                ) -> pl.Tensor[[M, N], pl.FP32]:
+                    tile_a = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
+                    tile_b_raw = pl.load(b, offsets=[0, 0], shapes=[N, K], target_memory=pl.MemorySpace.Mat)
+                    tile_b = pl.tile.transpose_view(tile_b_raw)
+                    return pl.store(pl.matmul(tile_a, tile_b), offsets=[0, 0], output_tensor=out)
+
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def orch(
+                    self,
+                    a: pl.Tensor[[M, K], dtype],
+                    b: pl.Tensor[[N, K], dtype],
+                    out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+                ) -> pl.Tensor[[M, N], pl.FP32]:
+                    return self.gemm(a, b, out)
+
+            return TransposedBGemmProgram
 
         @pl.program
-        class GemmProgram:
+        class PlainBGemmProgram:
             @pl.function(type=pl.FunctionType.InCore)
             def gemm(
                 self,
                 a: pl.Tensor[[M, K], dtype],
-                b: pl.Tensor[b_shape, dtype],
+                b: pl.Tensor[[K, N], dtype],
                 out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
             ) -> pl.Tensor[[M, N], pl.FP32]:
                 tile_a = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
-                tile_b_raw = pl.load(b, offsets=[0, 0], shapes=b_shape, target_memory=pl.MemorySpace.Mat)
-                tile_b = pl.tile.transpose_view(tile_b_raw) if transpose_b else tile_b_raw
+                tile_b = pl.load(b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat)
                 return pl.store(pl.matmul(tile_a, tile_b), offsets=[0, 0], output_tensor=out)
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def orch(
                 self,
                 a: pl.Tensor[[M, K], dtype],
-                b: pl.Tensor[b_shape, dtype],
+                b: pl.Tensor[[K, N], dtype],
                 out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
             ) -> pl.Tensor[[M, N], pl.FP32]:
                 return self.gemm(a, b, out)
 
-        return GemmProgram
+        return PlainBGemmProgram
 
     def compute_expected(self, tensors, params=None):
         a = tensors["a"].to(torch.float32)
@@ -263,22 +308,21 @@ class GemmCase(PTOTestCase):
         tensors["out"][:] = a @ (b.T if self.case.transpose_b else b)
 
 
-def _capture_stdout(fn) -> str:
+def _capture_stdout(fn):
     saved = os.dup(1)
-    temp = tempfile.TemporaryFile(mode="w+")
     try:
-        os.dup2(temp.fileno(), 1)
-        try:
-            fn()
-        finally:
-            os.dup2(saved, 1)
+        with tempfile.TemporaryFile(mode="w+") as temp:
+            try:
+                os.dup2(temp.fileno(), 1)
+                result = fn()
+            finally:
+                os.dup2(saved, 1)
+            temp.seek(0)
+            return result, temp.read()
     finally:
         os.close(saved)
-    temp.seek(0)
-    return temp.read()
 
 
-_TOTAL_RE = re.compile(r"^TOTAL\s+(\d+)\s+([\d.]+)\s+([\d.]+)", re.MULTILINE)
 _TERM_RE = re.compile(
     r"load=(?P<load>\d+) mad=(?P<mad>\d+) drain=(?P<drain>\d+) wall=(?P<wall>\d+).*"
     r"a_bytes=(?P<a_bytes>\d+) b_bytes=(?P<b_bytes>\d+) a_extracts=(?P<a_extracts>\d+) "
@@ -307,6 +351,100 @@ def _model_terms(case: CalibrationCase) -> dict[str, int]:
     return {name: int(value) for name, value in match.groupdict().items()}
 
 
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _runtime_preflight() -> tuple[Path, Path]:
+    """Require the active venv to own a runtime compatible with this checkout."""
+    expected_pin = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "ls-tree", "HEAD", "runtime"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[2]
+    runtime_head = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT / "runtime"), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if runtime_head != expected_pin:
+        raise RuntimeError(
+            f"runtime submodule is at {runtime_head}, but this PyPTO commit pins {expected_pin}; "
+            "run `git submodule update --init --recursive` before calibration"
+        )
+
+    try:
+        import _task_interface  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        import simpler  # noqa: PLC0415
+        from simpler.task_interface import CallConfig  # noqa: PLC0415
+    except ImportError as error:
+        raise RuntimeError(
+            f"the pinned Simpler runtime is not importable ({error}); create the worktree-local "
+            f"environment with `{_RUNTIME_SETUP}`"
+        ) from error
+
+    config = CallConfig()
+    required_fields = (
+        "enable_l2_swimlane",
+        "enable_dump_args",
+        "enable_pmu",
+        "enable_dep_gen",
+        "enable_scope_stats",
+        "output_prefix",
+    )
+    missing = [field for field in required_fields if not hasattr(config, field)]
+    simpler_path = Path(simpler.__file__).resolve()
+    extension_path = Path(_task_interface.__file__).resolve()
+    allowed_python_roots = (Path(sys.prefix).resolve(), (_REPO_ROOT / "runtime").resolve())
+    if missing or not any(_path_within(simpler_path, root) for root in allowed_python_roots):
+        detail = (
+            f"missing CallConfig fields {missing}" if missing else f"simpler imported from {simpler_path}"
+        )
+        raise RuntimeError(
+            f"incompatible Simpler runtime ({detail}). Use a worktree-local venv and install this checkout: "
+            f"`{_RUNTIME_SETUP}`"
+        )
+    if not _path_within(extension_path, Path(sys.prefix).resolve()):
+        raise RuntimeError(
+            f"_task_interface imported from {extension_path}, outside the active environment {sys.prefix}; "
+            "install `./runtime` in the worktree-local venv before calibration"
+        )
+    return simpler_path, extension_path
+
+
+def _single_task_duration_us(work_dir: Path) -> tuple[float, int]:
+    """Read the sole L2 task's real-device execution duration."""
+    from simpler_setup.tools.swimlane_converter import read_perf_data  # noqa: PLC0415
+
+    records_path = work_dir / "dfx_outputs" / "l2_swimlane_records.json"
+    if not records_path.is_file():
+        raise RuntimeError(f"L2 timing records not found: {records_path}")
+    data = read_perf_data(str(records_path))
+    tasks = data.get("tasks", [])
+    if len(tasks) != 1:
+        shapes = [
+            {
+                "task_id": task.get("task_id"),
+                "func_id": task.get("func_id"),
+                "duration_us": task.get("duration_us"),
+            }
+            for task in tasks
+        ]
+        raise RuntimeError(
+            f"expected exactly one dispatched L2 task in {records_path}, got {len(tasks)}: {shapes}"
+        )
+    duration_us = float(tasks[0].get("duration_us", 0.0))
+    if duration_us <= 0.0:
+        raise RuntimeError(f"invalid L2 task duration {duration_us} in {records_path}")
+    return duration_us, int(tasks[0]["func_id"])
+
+
 _FIELDS = [
     "case_id",
     "sample",
@@ -320,6 +458,8 @@ _FIELDS = [
     "force",
     "exec_us",
     "count",
+    "timing_source",
+    "func_id",
     "model_load",
     "model_mad",
     "model_drain",
@@ -333,26 +473,33 @@ _FIELDS = [
 
 
 def _run_one(case: CalibrationCase, sample: int, args) -> dict[str, str | int | float]:
+    _runtime_preflight()
     os.environ["PYPTO_FORCE_L0_TILE"] = case.force
     torch.manual_seed(0)
     terms = _model_terms(case)
     correctness = RunConfig(platform=args.platform, device_id=args.device, rtol=2e-2, atol=2e-2)
     warm_runner = TestRunner(RunConfig(platform=args.platform, device_id=args.device))
+    sample_root = Path(args.artifacts).resolve() / case.case_id / f"sample_{sample}"
     measured_runner = TestRunner(
         RunConfig(
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=True,
             save_kernels=True,
-            save_kernels_dir=str(Path(args.artifacts) / case.case_id / f"sample_{sample}"),
+            save_kernels_dir=str(sample_root),
         )
     )
-    for _ in range(args.warmup):
-        _capture_stdout(lambda: warm_runner.run(GemmCase(case, config=correctness)))
-    output = _capture_stdout(lambda: measured_runner.run(GemmCase(case, config=correctness)))
-    total = _TOTAL_RE.search(output)
-    if not total:
-        raise RuntimeError(f"No TOTAL timing row for {case.case_id}; output tail:\n{output[-2000:]}")
+    for warmup_index in range(args.warmup):
+        result, output = _capture_stdout(lambda: warm_runner.run(GemmCase(case, config=correctness)))
+        if not result.passed:
+            raise RuntimeError(
+                f"warmup {warmup_index} failed for {case.case_id}: {result.error}\n{output[-2000:]}"
+            )
+    result, output = _capture_stdout(lambda: measured_runner.run(GemmCase(case, config=correctness)))
+    if not result.passed:
+        raise RuntimeError(f"measured run failed for {case.case_id}: {result.error}\n{output[-2000:]}")
+    work_dir = sample_root / case.case_id
+    exec_us, func_id = _single_task_duration_us(work_dir)
     return {
         "case_id": case.case_id,
         "sample": sample,
@@ -364,8 +511,10 @@ def _run_one(case: CalibrationCase, sample: int, args) -> dict[str, str | int | 
         "dtype": case.dtype,
         "layout": "bt" if case.transpose_b else "plain",
         "force": case.force,
-        "exec_us": float(total.group(2)),
-        "count": int(total.group(1)),
+        "exec_us": exec_us,
+        "count": 1,
+        "timing_source": "l2_task_duration_us",
+        "func_id": func_id,
         **{
             f"model_{key}" if key in {"load", "mad", "drain", "wall"} else key: value
             for key, value in terms.items()
@@ -377,7 +526,44 @@ def _completed(path: Path) -> set[tuple[str, int]]:
     if not path.exists():
         return set()
     with path.open(newline="", encoding="utf-8") as stream:
-        return {(row["case_id"], int(row["sample"])) for row in csv.DictReader(stream)}
+        reader = csv.DictReader(stream)
+        if reader.fieldnames != _FIELDS:
+            raise RuntimeError(
+                f"cannot resume {path}: CSV schema is {reader.fieldnames}, expected {_FIELDS}; "
+                "write the structured-L2 sweep to a new output file"
+            )
+        return {(row["case_id"], int(row["sample"])) for row in reader}
+
+
+def _find_case(cases: list[CalibrationCase], case_id: str) -> CalibrationCase:
+    case = next((item for item in cases if item.case_id == case_id), None)
+    if case is None:
+        available = ", ".join(item.case_id for item in cases)
+        raise ValueError(f"unknown case {case_id!r}; available cases: {available}")
+    return case
+
+
+def _build_one(case: CalibrationCase, args) -> Path:
+    """Create a persistent PTOAS artifact for the incore-profiling skill."""
+    os.environ["PYPTO_FORCE_L0_TILE"] = case.force
+    output_root = Path(args.artifacts).resolve() / "l0_inputs"
+    runner = TestRunner(
+        RunConfig(
+            platform=args.platform,
+            codegen_only=True,
+            save_kernels=True,
+            save_kernels_dir=str(output_root),
+        )
+    )
+    config = RunConfig(platform=args.platform, rtol=2e-2, atol=2e-2)
+    result, output = _capture_stdout(lambda: runner.run(GemmCase(case, config=config)))
+    if not result.passed:
+        raise RuntimeError(f"L0 input build failed for {case.case_id}: {result.error}\n{output[-2000:]}")
+    work_dir = output_root / case.case_id
+    pto_files = list((work_dir / "ptoas").glob("*.pto"))
+    if not pto_files:
+        raise RuntimeError(f"L0 input build produced no PTOAS units under {work_dir / 'ptoas'}")
+    return work_dir
 
 
 def _run_parent(cases: list[CalibrationCase], args) -> None:
@@ -436,17 +622,30 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-p", "--platform", default="a2a3")
-    parser.add_argument("--output", default="autotile_l0_calibration.csv")
-    parser.add_argument("--artifacts", default="autotile_l0_calibration_artifacts")
+    parser.add_argument("--output", default="build_output/auto_tile_l0_calibration.csv")
+    parser.add_argument("--artifacts", default="build_output/auto_tile_l0_calibration")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--check-runtime", action="store_true")
     parser.add_argument(
-        "--validate", action="store_true", help="check every forced point without a device run"
+        "--validate",
+        action="store_true",
+        help="check every forced point and construct both DSL layout variants without a device run",
+    )
+    parser.add_argument(
+        "--build-one",
+        metavar="CASE_ID",
+        help="build one persistent PTOAS artifact for the incore-profiling skill",
     )
     parser.add_argument("--run-one", default="", help=argparse.SUPPRESS)
     parser.add_argument("--sample", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
     cases = _suite(args.suite)
+    if args.check_runtime:
+        simpler_path, extension_path = _runtime_preflight()
+        print(f"runtime preflight OK: simpler={simpler_path}")
+        print(f"runtime preflight OK: _task_interface={extension_path}")
+        return
     if args.list:
         for case in cases:
             print(f"{case.case_id:70} {case.force}")
@@ -455,14 +654,28 @@ def main() -> None:
     if args.validate:
         for case in cases:
             _model_terms(case)
-        print(f"validated {len(cases)} forced configurations")
+            GemmCase(case).get_program()
+        print(f"validated {len(cases)} forced configurations and DSL programs")
+        return
+    if args.build_one:
+        try:
+            case = _find_case(cases, args.build_one)
+        except ValueError as error:
+            parser.error(str(error))
+        work_dir = _build_one(case, args)
+        target = "a5" if args.platform.startswith("a5") else "a2a3"
+        profiler = _REPO_ROOT / ".claude" / "skills" / "incore-profiling" / "incore_profile.py"
+        print(f"BUILD_DIR={work_dir}")
+        print(f"python {profiler} --build-dir {work_dir} --target {target} --list-funcs")
+        print(f"python {profiler} --build-dir {work_dir} --target {target}")
         return
     if args.samples < 1 or args.warmup < 0:
         parser.error("--samples must be positive and --warmup non-negative")
     if args.run_one:
-        case = next((item for item in cases if item.case_id == args.run_one), None)
-        if case is None:
-            parser.error(f"unknown --run-one case: {args.run_one}")
+        try:
+            case = _find_case(cases, args.run_one)
+        except ValueError as error:
+            parser.error(str(error))
         writer = csv.DictWriter(sys.stdout, fieldnames=_FIELDS)
         writer.writerow(_run_one(case, args.sample, args))
         return

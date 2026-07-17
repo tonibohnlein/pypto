@@ -53,6 +53,15 @@ def _read_points(path: Path) -> list[Point]:
     samples: dict[str, list[dict[str, str]]] = {}
     with path.open(newline="", encoding="utf-8") as stream:
         for row in csv.DictReader(stream):
+            if int(row.get("count", "0")) != 1:
+                raise ValueError(
+                    f"{row.get('case_id', '<unknown>')}: expected one L2 task, got count={row.get('count')}"
+                )
+            if row.get("timing_source") != "l2_task_duration_us":
+                raise ValueError(
+                    f"{row.get('case_id', '<unknown>')}: unsupported timing source "
+                    f"{row.get('timing_source')!r}; rerun with structured L2 timing"
+                )
             samples.setdefault(row["case_id"], []).append(row)
     points = []
     for case_id, rows in samples.items():
