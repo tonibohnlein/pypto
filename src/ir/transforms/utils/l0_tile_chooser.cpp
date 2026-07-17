@@ -12,10 +12,14 @@
 #include "pypto/ir/transforms/utils/l0_tile_chooser.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <sstream>
+#include <string>
+#include <system_error>
 #include <vector>
 
 #include "pypto/core/logging.h"
@@ -179,7 +183,13 @@ int64_t PaddedComputeVolume(int m, int n, int k, const L0TileConfig& cfg) {
 // up to k. MAD is the primary ranking key, so charging the peel tail as a full
 // k-block would over-price non-divisor candidates and mis-rank them. For a divisor
 // k this reduces exactly to (K/k)*ceil(k/kt) -- unchanged.
-int64_t MadCycles(int m, int n, int k, const L0TileConfig& cfg) {
+int64_t MadAccContinuations(int m, int n, int k, const L0TileConfig& cfg) {
+  const int64_t independent_heads = cfg.c_read ? 0 : 1;
+  const int64_t continuations = std::max<int64_t>(0, CeilDiv(cfg.K, k) - independent_heads);
+  return CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n) * continuations;
+}
+
+double MadCycles(int m, int n, int k, const L0TileConfig& cfg) {
   const int64_t kt = std::max<int64_t>(1, cfg.mad_k_fractal_bytes / static_cast<int64_t>(cfg.bytes_a));
   const int64_t cpr = (cfg.bytes_a == 4) ? std::max<int64_t>(1, static_cast<int64_t>(cfg.mad_fp32_passes))
                                          : std::max<int64_t>(1, static_cast<int64_t>(cfg.bytes_a) / 2);
@@ -187,31 +197,68 @@ int64_t MadCycles(int m, int n, int k, const L0TileConfig& cfg) {
   const int64_t k_tail = cfg.K - num_full * k;               // peel tail width (0 if k | K)
   const int64_t k_blocks = num_full + (k_tail > 0 ? 1 : 0);  // == CeilDiv(K, k)
   const int64_t k_fractals = num_full * CeilDiv(k, kt) + (k_tail > 0 ? CeilDiv(k_tail, kt) : 0);
+  const int64_t output_tiles = CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n);
   const int64_t per_mn =
       k_blocks * cfg.mad_head + cpr * CeilDiv(m, cfg.align_m) * k_fractals * CeilDiv(n, cfg.align_n);
-  return CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n) * per_mn;
+  // A plain k-blocked matmul has one independent TMATMUL followed by serial
+  // TMATMUL_ACC continuations. An input matmul_acc has no independent head: all
+  // k-blocks depend on the caller's accumulator. The existing mad_head prices
+  // issuing every call; this separate term captures only dependency-chain cost.
+  const int64_t acc_continuations = MadAccContinuations(m, n, k, cfg);
+  return static_cast<double>(output_tiles * per_mn) +
+         cfg.mad_acc_dependency_cycles * static_cast<double>(acc_continuations);
 }
 
-// Bandwidth-weighted held-A vs held-B interior load cycles for a full-K OS tile
-// (see LoadCycles below for the two expressions). Returns true when hoisting A
-// (rows outer) is at least as cheap as hoisting B. This is the SINGLE definition
-// of the OS hoist: LoadCycles routes its k==K cost through it, and ChooseL0Tile
-// records the result into L0TileResult::os_holds_a so BuildFullKPipelined emits
-// the SAME hoist the wall was scored under. (Previously the emit re-derived the
-// hoist from raw byte traffic, which disagrees with this cycle-weighted min under
-// the ~200:132 L0A:L0B bandwidth ratio -- latent because the final tile pick was
-// unaffected, but it made estimated_cost_cycles wrong and the emitted loop order
-// diverge from the scored one on asymmetric shapes.) Tie -> hold A (rows outer),
-// matching the Stationarity enum / ascending-aspect order.
+struct LoadWork {
+  int64_t a_bytes = 0;
+  int64_t b_bytes = 0;
+  int64_t a_extracts = 0;
+  int64_t b_extracts = 0;
+};
+
+LoadWork HeldAWork(int m, int n, const L0TileConfig& cfg) {
+  const int64_t m_blocks = CeilDiv(cfg.M, m);
+  const int64_t n_blocks = CeilDiv(cfg.N, n);
+  return {/*a_bytes=*/static_cast<int64_t>(cfg.bytes_a) * cfg.M * cfg.K,
+          /*b_bytes=*/static_cast<int64_t>(cfg.bytes_b) * cfg.K * cfg.N * m_blocks,
+          /*a_extracts=*/m_blocks,
+          /*b_extracts=*/m_blocks * n_blocks};
+}
+
+LoadWork HeldBWork(int m, int n, const L0TileConfig& cfg) {
+  const int64_t m_blocks = CeilDiv(cfg.M, m);
+  const int64_t n_blocks = CeilDiv(cfg.N, n);
+  return {/*a_bytes=*/static_cast<int64_t>(cfg.bytes_a) * cfg.M * cfg.K * n_blocks,
+          /*b_bytes=*/static_cast<int64_t>(cfg.bytes_b) * cfg.K * cfg.N,
+          /*a_extracts=*/m_blocks * n_blocks,
+          /*b_extracts=*/n_blocks};
+}
+
+double LoadWorkCycles(const LoadWork& work, const L0TileConfig& cfg) {
+  return static_cast<double>(work.a_bytes) / cfg.bw_a + static_cast<double>(work.b_bytes) / cfg.bw_b +
+         static_cast<double>(work.a_extracts) * cfg.load_a_issue_cycles +
+         static_cast<double>(work.b_extracts) * cfg.load_b_issue_cycles;
+}
+
+// Bandwidth- and issue-weighted held-A vs held-B choice for a full-K OS tile.
+// This remains the single definition used by both scoring and emission.
 bool OSHoldsHoldA(int m, int n, const L0TileConfig& cfg) {
-  const double M = cfg.M, N = cfg.N, K = cfg.K;
-  const double ceil_n = static_cast<double>(CeilDiv(cfg.N, n));
-  const double ceil_m = static_cast<double>(CeilDiv(cfg.M, m));
-  const double ba = static_cast<double>(cfg.bytes_a);
-  const double bb = static_cast<double>(cfg.bytes_b);
-  const double held_a = (ba * M * K) / cfg.bw_a + (bb * K * N * ceil_m) / cfg.bw_b;  // hold A, stream B
-  const double held_b = (ba * M * K * ceil_n) / cfg.bw_a + (bb * K * N) / cfg.bw_b;  // hold B, stream A
-  return held_a <= held_b;
+  return LoadWorkCycles(HeldAWork(m, n, cfg), cfg) <= LoadWorkCycles(HeldBWork(m, n, cfg), cfg);
+}
+
+LoadWork GetLoadWork(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
+  if (r.stat == Stationarity::kAStationary) return HeldAWork(m, n, cfg);
+  if (r.stat == Stationarity::kBStationary) return HeldBWork(m, n, cfg);
+  if (k >= cfg.K) return OSHoldsHoldA(m, n, cfg) ? HeldAWork(m, n, cfg) : HeldBWork(m, n, cfg);
+
+  const int64_t m_blocks = CeilDiv(cfg.M, m);
+  const int64_t n_blocks = CeilDiv(cfg.N, n);
+  const int64_t k_blocks = CeilDiv(cfg.K, k);
+  const int64_t extracts = m_blocks * n_blocks * k_blocks;
+  return {/*a_bytes=*/static_cast<int64_t>(cfg.bytes_a) * cfg.M * cfg.K * n_blocks,
+          /*b_bytes=*/static_cast<int64_t>(cfg.bytes_b) * cfg.K * cfg.N * m_blocks,
+          /*a_extracts=*/extracts,
+          /*b_extracts=*/extracts};
 }
 
 // L1->L0 load cost (cycles). The MTE1 pipe is shared, so A and B loads serialize;
@@ -230,28 +277,7 @@ bool OSHoldsHoldA(int m, int n, const L0TileConfig& cfg) {
 //   OS, k==K      : min(held-A, held-B) route (the emit hoists the cheaper)
 //   OS, k<K       : both re-streamed (A M*K*ceil_n, B K*N*ceil_m)
 double LoadCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
-  const double M = cfg.M, N = cfg.N, K = cfg.K;
-  const double ceil_n = static_cast<double>(CeilDiv(cfg.N, n));
-  const double ceil_m = static_cast<double>(CeilDiv(cfg.M, m));
-  const double ba = static_cast<double>(cfg.bytes_a);
-  const double bb = static_cast<double>(cfg.bytes_b);
-  const double held_a = (ba * M * K) / cfg.bw_a + (bb * K * N * ceil_m) / cfg.bw_b;  // hold A, stream B
-  const double held_b = (ba * M * K * ceil_n) / cfg.bw_a + (bb * K * N) / cfg.bw_b;  // hold B, stream A
-  switch (r.stat) {
-    case Stationarity::kAStationary:
-      return held_a;  // A held (requires k == K)
-    case Stationarity::kBStationary:
-      return held_b;  // B held (requires k == K)
-    case Stationarity::kOutputStationary:
-      if (k >= static_cast<int>(K)) {
-        // Route through the shared hoist decision so the scored cost matches the
-        // operand BuildFullKPipelined actually hoists (recorded in os_holds_a).
-        return OSHoldsHoldA(m, n, cfg) ? held_a : held_b;
-      }
-      // split-K: BuildSplitKGrid re-streams both operands across the K blocks.
-      return (ba * M * K * ceil_n) / cfg.bw_a + (bb * K * N * ceil_m) / cfg.bw_b;
-  }
-  return std::min(held_a, held_b);
+  return LoadWorkCycles(GetLoadWork(m, n, k, cfg, r), cfg);
 }
 
 // The odd part of x: x divided by its largest power-of-2 factor (odd(8)=1,
@@ -318,7 +344,7 @@ double DrainCycles(int m, int n, const L0TileConfig& cfg) {
 // exposed tile is smaller, so this is a slight -- and safe (conservative) --
 // over-correction. Tail-accurate pricing is a follow-up (see docs).
 int64_t WallCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
-  const double compute = std::max(LoadCycles(m, n, k, cfg, r), static_cast<double>(MadCycles(m, n, k, cfg)));
+  const double compute = std::max(LoadCycles(m, n, k, cfg, r), MadCycles(m, n, k, cfg));
   const double drain = DrainCycles(m, n, cfg);
   double wall;
   if (r.dbc) {
@@ -431,6 +457,14 @@ int64_t L0cBudget(const L0TileConfig& cfg, const Regime& r) {
   return static_cast<int64_t>(cfg.l0c_bytes) / (static_cast<int64_t>(cfg.bytes_c) * (r.dbc ? 2 : 1));
 }
 
+int ParseCalibrationInt(const std::string& text, const char* field) {
+  int value = 0;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  CHECK(error == std::errc{} && end == text.data() + text.size())
+      << "PYPTO_FORCE_L0_TILE: " << field << " must be an integer, got '" << text << "'";
+  return value;
+}
+
 }  // namespace
 
 L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
@@ -454,6 +488,88 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
       << cfg.drain_c0_bytes << ", drain_row_cycles=" << cfg.drain_row_cycles
       << ", drain_penalty_cycles=" << cfg.drain_penalty_cycles
       << ", drain_fixed_cycles=" << cfg.drain_fixed_cycles << ").";
+  CHECK(cfg.load_a_issue_cycles >= 0.0 && cfg.load_b_issue_cycles >= 0.0 &&
+        cfg.mad_acc_dependency_cycles >= 0.0)
+      << "ChooseL0Tile: issue/dependency costs must be non-negative (got load_a_issue_cycles="
+      << cfg.load_a_issue_cycles << ", load_b_issue_cycles=" << cfg.load_b_issue_cycles
+      << ", mad_acc_dependency_cycles=" << cfg.mad_acc_dependency_cycles << ").";
+
+  // Calibration-only override for #2079. This working branch intentionally
+  // carries the hook so a device agent can measure arbitrary legal design
+  // points without changing the DSL program. Remove it from the production fix.
+  //
+  //   PYPTO_FORCE_L0_TILE="m,n,k,stat,dbc", stat in {OS,A,B}, dbc in {0,1}
+  if (const char* force = std::getenv("PYPTO_FORCE_L0_TILE")) {
+    std::stringstream stream(force);
+    std::string token;
+    std::vector<std::string> parts;
+    while (std::getline(stream, token, ',')) parts.push_back(token);
+    CHECK(parts.size() == 5) << "PYPTO_FORCE_L0_TILE must be 'm,n,k,stat,dbc', got '" << force << "'";
+
+    const int fm = ParseCalibrationInt(parts[0], "m");
+    const int fn = ParseCalibrationInt(parts[1], "n");
+    const int fk = ParseCalibrationInt(parts[2], "k");
+    CHECK(fm > 0 && fn > 0 && fk > 0)
+        << "PYPTO_FORCE_L0_TILE: m, n, k must be positive, got (" << fm << "," << fn << "," << fk << ")";
+    CHECK(parts[3] == "OS" || parts[3] == "A" || parts[3] == "B")
+        << "PYPTO_FORCE_L0_TILE: stat must be one of OS, A, B, got '" << parts[3] << "'";
+    CHECK(parts[4] == "0" || parts[4] == "1")
+        << "PYPTO_FORCE_L0_TILE: dbc must be 0 or 1, got '" << parts[4] << "'";
+
+    const Stationarity stat = parts[3] == "A"   ? Stationarity::kAStationary
+                              : parts[3] == "B" ? Stationarity::kBStationary
+                                                : Stationarity::kOutputStationary;
+    const Regime regime{stat, /*dbc=*/parts[4] == "1"};
+    CHECK(stat != Stationarity::kAStationary || cfg.allow_a_stationary)
+        << "PYPTO_FORCE_L0_TILE: A-stationary is disabled for this matmul";
+    CHECK(stat != Stationarity::kBStationary || cfg.allow_b_stationary)
+        << "PYPTO_FORCE_L0_TILE: B-stationary is disabled for this matmul";
+    CHECK(!regime.dbc || cfg.allow_double_buffer_c)
+        << "PYPTO_FORCE_L0_TILE: L0C double-buffering is disabled for this matmul";
+    CHECK(fm % cfg.align_m == 0 && fn % cfg.align_n == 0 && fk % cfg.align_k == 0)
+        << "PYPTO_FORCE_L0_TILE: tile must respect alignments (m,n,k)=(" << cfg.align_m << "," << cfg.align_n
+        << "," << cfg.align_k << "), got (" << fm << "," << fn << "," << fk << ")";
+    CHECK(stat == Stationarity::kOutputStationary || fk == cfg.K)
+        << "PYPTO_FORCE_L0_TILE: operand-stationary A/B requires k==K, got k=" << fk << ", K=" << cfg.K;
+    CHECK(!regime.dbc || fk == cfg.K)
+        << "PYPTO_FORCE_L0_TILE: dbc=1 requires k==K, got k=" << fk << ", K=" << cfg.K;
+    CHECK(!regime.dbc || (CeilDiv(cfg.M, fm) >= 2 && CeilDiv(cfg.N, fn) >= 2))
+        << "PYPTO_FORCE_L0_TILE: dbc=1 requires at least a 2x2 output grid";
+
+    const OperandDB operand_db = DeriveOperandDB(stat);
+    const int64_t a0 = L0aBudget(cfg, operand_db);
+    const int64_t b0 = L0bBudget(cfg, operand_db);
+    const int64_t c0 = L0cBudget(cfg, regime);
+    const auto legal_ks = EnumerateLegalKs(fm, fn, cfg, a0, b0);
+    CHECK(std::find(legal_ks.begin(), legal_ks.end(), fk) != legal_ks.end())
+        << "PYPTO_FORCE_L0_TILE: k=" << fk << " is illegal for (m,n)=(" << fm << "," << fn
+        << ") under the selected operand-buffer depths";
+    auto candidate = MakeCandidate(fm, fn, fk, cfg, c0, regime);
+    CHECK(candidate) << "PYPTO_FORCE_L0_TILE: forced design point is outside problem or L0C bounds";
+
+    const LoadWork load_work = GetLoadWork(fm, fn, fk, cfg, regime);
+    L0TileResult result;
+    result.m = fm;
+    result.n = fn;
+    result.k = fk;
+    result.estimated_traffic_bytes = candidate->traffic;
+    result.estimated_cost_cycles = candidate->cost_cycles;
+    result.padded_compute_volume = candidate->padded_compute;
+    result.stationarity = stat;
+    result.os_holds_a = OSHoldsHoldA(fm, fn, cfg);
+    result.double_buffer_c = regime.dbc;
+    std::stringstream hint;
+    hint << "FORCE_L0[M=" << cfg.M << ",N=" << cfg.N << ",K=" << cfg.K << "][m=" << fm << ",n=" << fn
+         << ",k=" << fk << ",stat=" << parts[3] << ",dbc=" << (regime.dbc ? 1 : 0) << "]"
+         << " load=" << std::llround(LoadCycles(fm, fn, fk, cfg, regime))
+         << " mad=" << std::llround(MadCycles(fm, fn, fk, cfg))
+         << " drain=" << std::llround(DrainCycles(fm, fn, cfg)) << " wall=" << result.estimated_cost_cycles
+         << " a_bytes=" << load_work.a_bytes << " b_bytes=" << load_work.b_bytes
+         << " a_extracts=" << load_work.a_extracts << " b_extracts=" << load_work.b_extracts
+         << " acc_continuations=" << MadAccContinuations(fm, fn, fk, cfg) << " -- calibration override";
+    result.perf_hint = hint.str();
+    return result;
+  }
 
   // Without padding, the problem dimensions themselves must already meet the
   // cube minimum. Callers (the pass) should pre-screen and skip with a

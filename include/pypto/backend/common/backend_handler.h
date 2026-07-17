@@ -74,6 +74,10 @@ struct L0CostModel {
   double bw_l0a = 129.7;  ///< L1->L0A bytes/cycle (a2a3 on-device MTE1 sweep, R^2 0.993; was op-sim 200).
   double bw_l0b =
       85.4;  ///< L1->L0B bytes/cycle (a2a3 on-device MTE1 sweep; ~1.52:1 vs L0A, same ratio as before).
+  double load_l0a_issue_cycles =
+      0.0;  ///< Per-L1->L0A extract setup cost. Zero until #2079 device calibration.
+  double load_l0b_issue_cycles =
+      0.0;  ///< Per-L1->L0B extract setup cost. Zero until #2079 device calibration.
   double bw_drain =
       118.0;  ///< FIXPIPE per-row byte throughput, L0C bytes/cycle (a2a3 sweep; dominates wide N).
   double drain_fixed_cycles = 164.0;  ///< Per-FIXPIPE-drain fixed issue overhead, m-independent (a2a3 sweep).
@@ -84,12 +88,14 @@ struct L0CostModel {
       2.6;                  ///< Misalignment cost: FIXPIPE cycles per L0C M-row per extra
                             ///< serial burst pass, charged (odd(N1)-1) times (a2a3 on-device sweep).
   int drain_c0_bytes = 32;  ///< NZ fractal C0 constant in bytes (N0 = C0 / bytes_c; 8 for fp32, 16 for bf16).
-  int mad_head_cycles = 21;      ///< Fixed per-TMATMUL issue overhead, per K-block (a2a3 op-sim fit,
-                                 ///< device-confirmed within ~2%; was 6, +15/tile clean on device).
-                                 ///< Enters C_mad as `k_blocks*mad_head + cpr*ceil(m/16)*k_fractals*
-                                 ///< ceil(n/16)` (see MadCycles) -- NOT `mad_head + 16*K`.
-                                 ///< Backend-specific: a new backend should shallow-K device-spot-check
-                                 ///< it (it competes with the drain floor on shallow-K/small tiles).
+  int mad_head_cycles = 21;  ///< Fixed per-TMATMUL issue overhead, per K-block (a2a3 op-sim fit,
+                             ///< device-confirmed within ~2%; was 6, +15/tile clean on device).
+                             ///< Enters C_mad as `k_blocks*mad_head + cpr*ceil(m/16)*k_fractals*
+                             ///< ceil(n/16)` (see MadCycles) -- NOT `mad_head + 16*K`.
+                             ///< Backend-specific: a new backend should shallow-K device-spot-check
+                             ///< it (it competes with the drain floor on shallow-K/small tiles).
+  double mad_acc_dependency_cycles =
+      0.0;  ///< Extra cost per serial TMATMUL_ACC continuation. Zero until #2079 device calibration.
   int mad_k_fractal_bytes = 32;  ///< Cube K-fractal width in bytes (kt = this / bytes_a).
   int mad_fp32_passes = 2;       ///< Cube passes per K-fractal for FULL fp32 MMAD (the fp32
                                  ///< mantissa is decomposed into partial products). ARCH-SPECIFIC:

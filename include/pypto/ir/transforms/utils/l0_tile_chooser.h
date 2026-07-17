@@ -98,18 +98,23 @@ struct L0TileConfig {
   // chooser scores wall-clock directly: wall ~= max(C_load, C_mad) + C_drain.
   // Defaults are Ascend a2a3 (910B) for the common BF16 x BF16 -> FP32 GEMM, so
   // standalone callers (tests) get a sane model without wiring a backend.
-  double bw_a = 129.7;                // L1->L0A bytes/cycle (on-device MTE1 sweep, R^2 0.993).
-  double bw_b = 85.4;                 // L1->L0B bytes/cycle (on-device MTE1 sweep; ~1.52:1 vs L0A).
-  double bw_drain = 118.0;            // FIXPIPE per-row byte throughput, L0C bytes/cycle (dominates wide N).
+  double bw_a = 129.7;  // L1->L0A bytes/cycle (on-device MTE1 sweep, R^2 0.993).
+  double bw_b = 85.4;   // L1->L0B bytes/cycle (on-device MTE1 sweep; ~1.52:1 vs L0A).
+  double load_a_issue_cycles =
+      0.0;  // Per-dynamic L1->L0A extract setup; calibrated separately from bytes/BW.
+  double load_b_issue_cycles =
+      0.0;                  // Per-dynamic L1->L0B extract setup; calibrated separately from bytes/BW.
+  double bw_drain = 118.0;  // FIXPIPE per-row byte throughput, L0C bytes/cycle (dominates wide N).
   double drain_fixed_cycles = 164.0;  // Per-FIXPIPE-drain fixed issue overhead, m-independent (sweep).
   double drain_row_cycles =
       4.45;  // Per-M-row FLOOR (burst-issue setup); per-row = max(floor, bytes_c*n/bw_drain).
   double drain_penalty_cycles =
-      2.6;                       // Misalignment: cycles per M-row per extra serial burst pass (odd(N1)-1).
-  int drain_c0_bytes = 32;       // NZ fractal C0 in bytes (N0 = C0 / bytes_c; 8 fp32).
-  int mad_head = 21;             // Fixed per-TMATMUL issue overhead.
-  int mad_k_fractal_bytes = 32;  // Cube K-fractal width (kt = this / bytes_a).
-  int mad_fp32_passes = 2;       // Cube passes/K-fractal for full fp32 MMAD (arch-specific; a2a3=2, a5=8).
+      2.6;                  // Misalignment: cycles per M-row per extra serial burst pass (odd(N1)-1).
+  int drain_c0_bytes = 32;  // NZ fractal C0 in bytes (N0 = C0 / bytes_c; 8 fp32).
+  int mad_head = 21;        // Fixed per-TMATMUL issue overhead.
+  double mad_acc_dependency_cycles = 0.0;  // Extra cost per serial TMATMUL_ACC continuation.
+  int mad_k_fractal_bytes = 32;            // Cube K-fractal width (kt = this / bytes_a).
+  int mad_fp32_passes = 2;  // Cube passes/K-fractal for full fp32 MMAD (arch-specific; a2a3=2, a5=8).
 
   // Whether the chooser may pick a tile dimension larger than the problem
   // dimension (i.e. pad M / N / K up to reach `min_m` / `min_n` / `min_k`).
@@ -227,6 +232,7 @@ struct L0TileResult {
  *   3. Score each tile by wall (cycles):
  *        C_mad  = ceil(M/m)*ceil(N/n) *
  *                 (ceil(K/k)*mad_head + cpr*ceil(m/16)*Kfrac*ceil(n/16))
+ *                 + acc_continuations*mad_acc_dependency
  *          Kfrac = floor(K/k)*ceil(k/kt) + ceil((K - floor(K/k)*k)/kt)
  *                  (the K-peel tail is scored at its own width, not rounded to k)
  *        C_drain = ceil(M/m)*ceil(N/n) *
@@ -242,6 +248,8 @@ struct L0TileResult {
  *          OS split-K: ba*M*K*ceil(N/n)/BW_A + bb*K*N*ceil(M/m)/BW_B  (both re-streamed)
  *          A-stat    : ba*M*K/BW_A           + bb*K*N*ceil(M/m)/BW_B   (k==K, held-A)
  *          B-stat    : ba*M*K*ceil(N/n)/BW_A + bb*K*N/BW_B             (k==K, held-B)
+ *          plus extracts_A*load_a_issue + extracts_B*load_b_issue, where
+ *          extract counts follow the emitted loop nest (not merely byte traffic).
  *        wall   = max(C_load, C_mad) + C_drain        (dbC == 1, drain exposed)
  *               = max(C_load, C_mad, C_drain)         (dbC == 2, drain hidden)
  *      with kt = mad_k_fractal_bytes/bytes_a, cpr = bytes_a/2. Ties break by lex

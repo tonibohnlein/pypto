@@ -797,12 +797,15 @@ class l0_tile_chooser:
         c_read: bool
         bw_a: float
         bw_b: float
+        load_a_issue_cycles: float
+        load_b_issue_cycles: float
         bw_drain: float
         drain_fixed_cycles: float
         drain_row_cycles: float
         drain_penalty_cycles: float
         drain_c0_bytes: int
         mad_head: int
+        mad_acc_dependency_cycles: float
         mad_k_fractal_bytes: int
         mad_fp32_passes: int
         allow_padding: bool

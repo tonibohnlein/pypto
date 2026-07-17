@@ -613,12 +613,15 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   const auto cost_model = handler->GetL0CostModel();
   cfg.bw_a = cost_model.bw_l0a;
   cfg.bw_b = cost_model.bw_l0b;
+  cfg.load_a_issue_cycles = cost_model.load_l0a_issue_cycles;
+  cfg.load_b_issue_cycles = cost_model.load_l0b_issue_cycles;
   cfg.bw_drain = cost_model.bw_drain;
   cfg.drain_fixed_cycles = cost_model.drain_fixed_cycles;
   cfg.drain_row_cycles = cost_model.drain_row_cycles;
   cfg.drain_penalty_cycles = cost_model.drain_penalty_cycles;
   cfg.drain_c0_bytes = cost_model.drain_c0_bytes;
   cfg.mad_head = cost_model.mad_head_cycles;
+  cfg.mad_acc_dependency_cycles = cost_model.mad_acc_dependency_cycles;
   cfg.mad_k_fractal_bytes = cost_model.mad_k_fractal_bytes;
   cfg.mad_fp32_passes = cost_model.mad_fp32_passes;
   cfg.bytes_a = bytes_a;

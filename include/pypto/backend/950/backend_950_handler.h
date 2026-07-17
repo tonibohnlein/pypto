@@ -86,6 +86,10 @@ class Ascend950Handler : public BackendHandler {
     // a2a3 (bw_l0a 129.7->206, bw_l0b 85.4->224 -- note a5 L0B is not the slower port).
     m.bw_l0a = 206.3;  // a5-sim MTE1 (LOAD_2Dv2), analytic-bytes fit (a2a3: 129.7)
     m.bw_l0b = 223.8;  // a5-sim MTE1 (a2a3: 85.4)
+    // Keep the #2079 candidate terms disabled on a5 until they are calibrated
+    // independently; a2a3 device coefficients must not leak across architectures.
+    m.load_l0a_issue_cycles = 0.0;
+    m.load_l0b_issue_cycles = 0.0;
     // Drain (FIX_L0C_TO_DST work-cycles): fits the a5-sim FIXP sweep to <1%. a5 drain is
     // ~4x costlier than a2a3 (118) -> the FIXP lane dominates a5 GEMM (Exp-C trace: FIXP
     // 44-52% of the wall, cube util below pto-isa's >50% target -- drain-bound, not an emit
@@ -107,9 +111,10 @@ class Ascend950Handler : public BackendHandler {
     m.mad_k_fractal_bytes = 32;     // ISA cube K-fractal; a5-invariant
     // Cube: a5-sim MEASURED (the primary, highest-confidence calibration).
     m.mad_head_cycles = 25;  // a5-sim: intercept of fp32 AND bf16 k-sweeps (a2a3: 21)
-    m.mad_fp32_passes = 8;   // a5-sim CONFIRMED: full fp32 MMAD ~4x a2a3/fractal (a2a3=2;
-                             // mmad = 25 + 8*fractals, R^2=1). bf16 stays 1 pass -- the 8x
-                             // is fp32-only, as intended.
+    m.mad_acc_dependency_cycles = 0.0;
+    m.mad_fp32_passes = 8;  // a5-sim CONFIRMED: full fp32 MMAD ~4x a2a3/fractal (a2a3=2;
+                            // mmad = 25 + 8*fractals, R^2=1). bf16 stays 1 pass -- the 8x
+                            // is fp32-only, as intended.
     return m;
   }
 

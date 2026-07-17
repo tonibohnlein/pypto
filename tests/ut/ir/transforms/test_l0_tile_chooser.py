@@ -149,6 +149,46 @@ class TestL0TilingDocExamples:
 
 
 # ---------------------------------------------------------------------------
+# Issue/setup calibration terms (#2079)
+# ---------------------------------------------------------------------------
+
+
+class TestL0TilingIssueCosts:
+    def test_extract_setup_cost_can_prefer_single_pass_k(self):
+        """A per-extract floor distinguishes equal-byte schedules without a K heuristic."""
+        cfg = _default_config(M=16, N=512, K=128)
+        baseline = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert (baseline.m, baseline.n, baseline.k) == (16, 512, 32)
+
+        cfg.load_a_issue_cycles = 200.0
+        revised = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert (revised.m, revised.n, revised.k) == (16, 128, 128)
+
+    def test_extract_setup_cost_preserves_known_k_blocked_counterexample(self):
+        """The model term must not collapse into an unconditional single-pass-K preference."""
+        cfg = _default_config(M=16, N=256, K=512)
+        cfg.load_a_issue_cycles = 200.0
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert (result.m, result.n, result.k) == (16, 256, 64)
+
+    def test_calibration_override_reports_dynamic_operation_counts(self, monkeypatch):
+        cfg = _default_config(M=16, N=512, K=128)
+        monkeypatch.setenv("PYPTO_FORCE_L0_TILE", "16,128,128,OS,0")
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert (result.m, result.n, result.k) == (16, 128, 128)
+        assert "a_extracts=1" in result.perf_hint
+        assert "b_extracts=4" in result.perf_hint
+        assert "acc_continuations=0" in result.perf_hint
+
+    def test_matmul_acc_counts_the_input_accumulator_dependency(self, monkeypatch):
+        cfg = _default_config(M=16, N=512, K=128)
+        cfg.c_read = True
+        monkeypatch.setenv("PYPTO_FORCE_L0_TILE", "16,512,32,OS,0")
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert "acc_continuations=4" in result.perf_hint
+
+
+# ---------------------------------------------------------------------------
 # Capacity / boundary edge cases
 # ---------------------------------------------------------------------------
 
@@ -325,8 +365,17 @@ def _load_cycles(m: int, n: int, k: int, cfg, stat: str) -> float:
     # split-K (k < K) re-streams both. Mirrors C++ LoadCycles.
     M, N, K = cfg.M, cfg.N, cfg.K
     cn, cm = _cdiv(N, n), _cdiv(M, m)
-    held_a = (cfg.bytes_a * M * K) / cfg.bw_a + (cfg.bytes_b * K * N * cm) / cfg.bw_b  # hold A
-    held_b = (cfg.bytes_a * M * K * cn) / cfg.bw_a + (cfg.bytes_b * K * N) / cfg.bw_b  # hold B
+
+    def score(a_bytes: int, b_bytes: int, a_extracts: int, b_extracts: int) -> float:
+        return (
+            a_bytes / cfg.bw_a
+            + b_bytes / cfg.bw_b
+            + a_extracts * cfg.load_a_issue_cycles
+            + b_extracts * cfg.load_b_issue_cycles
+        )
+
+    held_a = score(cfg.bytes_a * M * K, cfg.bytes_b * K * N * cm, cm, cm * cn)
+    held_b = score(cfg.bytes_a * M * K * cn, cfg.bytes_b * K * N, cm * cn, cn)
     if stat == _AS:
         return held_a
     if stat == _BS:
@@ -334,7 +383,8 @@ def _load_cycles(m: int, n: int, k: int, cfg, stat: str) -> float:
     if k >= K:  # OS, full-K: hoist the cheaper operand
         return min(held_a, held_b)
     # OS, split-K: both re-streamed
-    return (cfg.bytes_a * M * K * cn) / cfg.bw_a + (cfg.bytes_b * K * N * cm) / cfg.bw_b
+    extracts = cm * cn * _cdiv(K, k)
+    return score(cfg.bytes_a * M * K * cn, cfg.bytes_b * K * N * cm, extracts, extracts)
 
 
 def _wall_key(m: int, n: int, k: int, cfg, stat: str, dbc: bool) -> tuple:
@@ -352,7 +402,12 @@ def _wall_key(m: int, n: int, k: int, cfg, stat: str, dbc: bool) -> tuple:
     k_blocks = num_full + (1 if k_tail > 0 else 0)  # == ceil(K/k)
     k_fractals = num_full * _cdiv(k, kt) + (_cdiv(k_tail, kt) if k_tail > 0 else 0)
     per_mn = k_blocks * cfg.mad_head + cpr * _cdiv(m, cfg.align_m) * k_fractals * _cdiv(n, cfg.align_n)
-    mad = _cdiv(M, m) * _cdiv(N, n) * per_mn
+    output_tiles = _cdiv(M, m) * _cdiv(N, n)
+    independent_heads = 0 if cfg.c_read else 1
+    mad = (
+        output_tiles * per_mn
+        + output_tiles * max(0, k_blocks - independent_heads) * cfg.mad_acc_dependency_cycles
+    )
     # Tile-dependent FIXPIPE drain (mirrors C++ DrainCycles): one drain per (m, n)
     # output block = m-independent fixed issue overhead + a PER-M-ROW cost. FIXPIPE
     # addresses one M-row of the N1 M1 M0 N0 accumulator at a time; the per-row cost is
