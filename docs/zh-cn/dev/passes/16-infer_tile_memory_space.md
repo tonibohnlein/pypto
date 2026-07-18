@@ -96,11 +96,11 @@ program_inferred = infer_pass(program)
 
 ### 阶段 4 — 循环不变量 Mat 驻留（`loop_invariant_mat_residency`）
 
-所有 space 显式化后，一个独立的内部 transform 会识别形如 `tile.load(GM → Mat) → tile.transpose_view* → tile.move/tile.extract(Mat → Left/Right)` 的不变量前缀，并把该前缀移到循环 preheader。该链必须只有一个终止 `Left` / `Right` 值，并且只在一个 `tile.matmul`、`tile.matmul_bias` 或 `tile.matmul_acc` 的对应操作数位置使用。这样可将优化严格限定为驻留 matmul 操作数，而不是通用 tile LICM。对于这一受支持的单一使用形态，tensor-level matmul 的驻留操作数只加载一次，而依赖循环变量的另一操作数仍留在循环内正常流式加载。
+所有 space 显式化后，一个独立的内部 transform 会识别形如 `tile.load(GM → Mat) → tile.transpose_view* → tile.move/tile.extract(Mat → Left/Right)` 的不变量前缀。对于精确的单一使用链，它会把整个不变前缀移到循环 preheader。它也会识别由编译器生成的 Mat panel：该 panel 的完整只读使用图可经过 `transpose_view` 和一个或多个 `move` / `extract` 分支到 matmul 的匹配操作数位置。在这种情况下，只会移动整个 panel 的 GM→Mat load；依赖 K 的 Left/Right 分级仍保留在原始循环或 pipeline 中。这样可将优化严格限定为驻留 matmul 操作数，而不是通用 tile LICM。因此静止 tensor-level 操作数只从 GM 加载一次，而依赖循环的对端操作数仍正常流式加载。
 
-这是 issue #2077 所要求的更广泛驻留行为中的保守首个子集，并不是通用的 tensor-level residency contract。直接进入或由程序外部进入的 InCore 函数没有可分析的调用者证据，因此会拒绝该优化。不同的外部 tensor 参数同样会被拒绝：PyPTO 没有运行时 `noalias` 契约来保证其底层分配互不重叠。当前只有 root orchestration IR 内由 `tensor.create` 创建的存储能够提供正向调用者 provenance。若要覆盖外部操作数，必须增加可强制执行的 no-alias 契约或带非提升回退路径的运行时检查；本 transform 不会自行假设这一点。当 `AutoTileMatmulL0` 将一个 Mat panel 展开为多个依赖 K 的 L0 extract 时，当前要求单一使用的链识别器同样会拒绝；此时整个 panel 的 GM→Mat load 仍位于外层用户循环内，而依赖 K 的 extract 会正确保留在内层 K 循环中。支持这种情况需要把 GM→Mat panel 驻留与可选的 Mat→L0 前缀移动分开分析。
+这是 issue #2077 所要求的更广泛驻留行为中的保守首个子集，并不是通用的 tensor-level residency contract。直接进入或由程序外部进入的 InCore 函数没有可分析的调用者证据，因此会拒绝该优化。不同的外部 tensor 参数同样会被拒绝：PyPTO 没有运行时 `noalias` 契约来保证其底层分配互不重叠。当前只有 root orchestration IR 内由 `tensor.create` 创建的存储能够提供正向调用者 provenance。若要覆盖外部操作数，必须增加可强制执行的 no-alias 契约或带非提升回退路径的运行时检查；本 transform 不会自行假设这一点。`AutoTileMatmulL0` 的分支已可在不移动其 K-dependent L0 extract 的前提下支持：panel 驻留与可选的 Mat→L0 前缀移动会独立分析。
 
-候选资格首先依赖编译器私有的 provenance。`ConvertTensorToTileOps` 会标记其生成的所有 `GM → Mat` bridge load；该标记经过打印、flatten 和 L0 自动分块后一直保留到本阶段。阶段 4 随后证明带标记的 load 符合上文所述的精确静止 matmul 操作数链。用户手写的 `tile.load(..., target_memory=Mat)` 不带此标记，因此本优化绝不会提升它，从而保证显式 tile 程序仍由用户控制。
+候选资格首先依赖编译器私有的 provenance。`ConvertTensorToTileOps` 会标记其生成的所有 `GM → Mat` bridge load；该标记经过打印、flatten 和 L0 自动分块后一直保留到本阶段。阶段 4 随后证明带标记的 load 符合上文所述的精确静止前缀或只读 matmul panel 分支。用户手写的 `tile.load(..., target_memory=Mat)` 不带此标记，因此本优化绝不会提升它，从而保证显式 tile 程序仍由用户控制。
 
 首版合法性规则有意保持严格：
 
@@ -111,7 +111,7 @@ program_inferred = infer_pass(program)
 - 在每个此类调用点，候选 `Tensor In` 实参必须解析到由 `tensor.create` 创建、归编译器所有的分配；普通别名以及 `tensor.slice` / `tensor.assemble` / `tensor.view` 别名会规范化到该存储 root，所有可写 `Tensor Out` / `Tensor InOut` root 都必须已知且均不得与候选 root 重叠；InCore 函数自身也不能写入该 root，而无关 scalar 和其他只读 `Tensor In` root 不参与此过滤；
 - offset、shape 以及整个被移动的依赖前缀都必须是循环不变量；
 - 循环头（边界或 loop-carried 初始值）或循环体子树内出现任何函数调用、任务提交、跨核操作、同步、缓存维护或未知 builtin 时都会拒绝驻留，因为移动到 preheader 可能使 load 在迭代之间越过未知或隐藏的顺序效应；其他直接控制流或有副作用语句若出现在 candidate 之前，则会关闭可提升前缀；
-- 链中每个值只能有预期的单一语法使用；普通 SSA 别名、`Submit` 实参、嵌套表达式、循环初始值、yield、return 以及额外的 call 实参都计为使用，因此会使候选失效；
+- 精确可移动前缀中的每个值只能有预期的单一语法使用；驻留 panel load 可以有多条完整计数的直接只读路径，但每条路径只能由 Mat `transpose_view` 别名以及后续 Left/Right `move` / `extract` 组成，并且每个生成的 L0 值只能用在 matmul-family call 的匹配操作数位置；普通 SSA 别名、`Submit` 实参、嵌套表达式、循环初始值、yield、return 以及不支持或额外的消费者都会使候选失效；
 - 被移动的结果不能是 loop-carried 值或 yield 值；
 - 函数中所有实际拥有分配的 `Mat`、`Left`、`Right` tile 都必须具有静态大小，且按分配器对齐后的全函数上界不得超过后端容量；
 - 函数中不得存在尚未表示为 tile 分配、因而无法计入容量的显式保留缓冲区区域。

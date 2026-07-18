@@ -63,15 +63,17 @@ namespace {
 //
 //   tile.load(GM -> Mat) -> transpose_view* -> tile.move/extract(Mat -> L0)
 //
-// chain and move the invariant prefix to the loop preheader. The rewrite is
-// intentionally conservative: only read-only function parameters, direct
-// top-level statements in a statically non-empty sequential loop, and static
-// capacity-safe Mat/Left/Right footprints are accepted. Each loop is analyzed
-// exactly once against its original direct body. Nested loops are rewritten
-// independently, so a chain moves across at most one lexical loop per pass
-// invocation instead of being repeatedly rescanned and bubbled through every
-// enclosing loop. Together with the one-time inventory and complete-use map,
-// the rewrite is O(N).
+// chain and move the invariant prefix to the loop preheader. When L0 tiling
+// fans one Mat panel into multiple loop-dependent extracts, only the GM->Mat
+// load moves; the L0 staging remains where AutoTileMatmulL0 placed it. The
+// rewrite is intentionally conservative: only read-only function parameters,
+// direct top-level statements in a statically non-empty sequential loop, and
+// static capacity-safe Mat/Left/Right footprints are accepted. Each loop is
+// analyzed exactly once against its original direct body. Nested loops are
+// rewritten independently, so a chain moves across at most one lexical loop
+// per pass invocation instead of being repeatedly rescanned and bubbled
+// through every enclosing loop. Together with the one-time inventory and
+// complete-use map, the rewrite is O(N).
 
 class VarUseCollector : public IRVisitor {
  public:
@@ -221,6 +223,10 @@ class LoopResidencyInventory : public IRVisitor {
     return residency_chain_vars_.count(var) != 0;
   }
 
+  [[nodiscard]] bool IsHoistableResidencyVar(const Expr* var) const {
+    return IsResidencyChainVar(var) || resident_panel_load_vars_.count(var) != 0;
+  }
+
   [[nodiscard]] bool HasUnresolvedPipelineExpansion(MemorySpace space) const {
     return pipeline_expansion_spaces_.count(space) != 0;
   }
@@ -331,8 +337,10 @@ class LoopResidencyInventory : public IRVisitor {
     CallPtr call;
   };
   std::unordered_map<const Expr*, CallDefinition> definitions_;
+  std::unordered_map<const Call*, VarPtr> call_results_;
   std::unordered_map<const Expr*, std::vector<DirectCallUse>> direct_call_uses_;
   std::unordered_set<const Expr*> residency_chain_vars_;
+  std::unordered_set<const Expr*> resident_panel_load_vars_;
   CompleteVarUseCollector complete_uses_;
   bool has_explicit_reservation_{false};
   const ForStmt* current_loop_{nullptr};
@@ -376,6 +384,12 @@ class LoopResidencyInventory : public IRVisitor {
     auto call = As<Call>(op->value_);
     if (!call) return;
     definitions_[op->var_.get()] = {op->var_, call};
+    auto [result_it, inserted] = call_results_.try_emplace(call.get(), op->var_);
+    if (!inserted && result_it->second.get() != op->var_.get()) {
+      // Shared Call nodes are not expected after normalization, but treating
+      // their result as ambiguous keeps the local fanout proof fail-closed.
+      result_it->second = nullptr;
+    }
   }
 
   void RecordDirectCallUses(const CallPtr& call) {
@@ -396,26 +410,90 @@ class LoopResidencyInventory : public IRVisitor {
     return std::nullopt;
   }
 
-  [[nodiscard]] bool IsMatchingMatmulUse(const VarPtr& var) const {
+  [[nodiscard]] static bool IsMatchingMatmulOperandUse(const DirectCallUse& use, MemorySpace space) {
+    const auto operand_indices = MatmulOperandIndices(use.call);
+    if (!operand_indices.has_value()) return false;
+    if (space == MemorySpace::Left) return use.arg_index == operand_indices->first;
+    if (space == MemorySpace::Right) return use.arg_index == operand_indices->second;
+    return false;
+  }
+
+  [[nodiscard]] bool HasOnlyMatchingMatmulUses(const VarPtr& var) const {
     auto tile = var ? As<TileType>(var->GetType()) : nullptr;
     if (!tile || !tile->memory_space_.has_value()) return false;
     auto use_it = direct_call_uses_.find(var.get());
-    if (complete_uses_.GetUseCount(var.get()) != 1 || use_it == direct_call_uses_.end() ||
-        use_it->second.size() != 1) {
+    if (use_it == direct_call_uses_.end() || use_it->second.empty() ||
+        complete_uses_.GetUseCount(var.get()) != use_it->second.size()) {
       return false;
     }
-    const auto& use = use_it->second.front();
-    const auto operand_indices = MatmulOperandIndices(use.call);
-    if (!operand_indices.has_value()) return false;
-    if (*tile->memory_space_ == MemorySpace::Left) return use.arg_index == operand_indices->first;
-    if (*tile->memory_space_ == MemorySpace::Right) return use.arg_index == operand_indices->second;
-    return false;
+    return std::all_of(use_it->second.begin(), use_it->second.end(), [&](const DirectCallUse& use) {
+      return IsMatchingMatmulOperandUse(use, *tile->memory_space_);
+    });
+  }
+
+  [[nodiscard]] bool IsMatchingMatmulUse(const VarPtr& var) const {
+    return complete_uses_.GetUseCount(var.get()) == 1 && HasOnlyMatchingMatmulUses(var);
   }
 
   [[nodiscard]] bool HasOnlyUseBy(const VarPtr& var, const CallPtr& consumer) const {
     auto it = direct_call_uses_.find(var.get());
     return complete_uses_.GetUseCount(var.get()) == 1 && it != direct_call_uses_.end() &&
            it->second.size() == 1 && it->second.front().call.get() == consumer.get();
+  }
+
+  [[nodiscard]] VarPtr GetCallResult(const CallPtr& call) const {
+    auto it = call ? call_results_.find(call.get()) : call_results_.end();
+    return it == call_results_.end() ? nullptr : it->second;
+  }
+
+  [[nodiscard]] bool HasSupportedMatmulPanelFanout(const VarPtr& panel,
+                                                   std::unordered_set<const Expr*>& visiting,
+                                                   std::unordered_map<const Expr*, bool>& memo) const {
+    if (!panel) return false;
+    auto memo_it = memo.find(panel.get());
+    if (memo_it != memo.end()) return memo_it->second;
+    if (!visiting.insert(panel.get()).second) return false;
+    auto use_it = direct_call_uses_.find(panel.get());
+    if (use_it == direct_call_uses_.end() || use_it->second.empty() ||
+        complete_uses_.GetUseCount(panel.get()) != use_it->second.size()) {
+      visiting.erase(panel.get());
+      memo[panel.get()] = false;
+      return false;
+    }
+
+    bool valid = true;
+    for (const auto& use : use_it->second) {
+      if (use.arg_index != 0) {
+        valid = false;
+        break;
+      }
+      auto result = GetCallResult(use.call);
+      if (!result) {
+        valid = false;
+        break;
+      }
+      if (IsOp(use.call, "tile.move") || IsOp(use.call, "tile.extract")) {
+        if (!HasOnlyMatchingMatmulUses(result)) {
+          valid = false;
+          break;
+        }
+        continue;
+      }
+      if (IsOp(use.call, "tile.transpose_view")) {
+        auto tile = As<TileType>(result->GetType());
+        if (!tile || tile->GetMemorySpace() != MemorySpace::Mat ||
+            !HasSupportedMatmulPanelFanout(result, visiting, memo)) {
+          valid = false;
+          break;
+        }
+        continue;
+      }
+      valid = false;
+      break;
+    }
+    visiting.erase(panel.get());
+    memo[panel.get()] = valid;
+    return valid;
   }
 
   void BuildResidencyChains() {
@@ -449,6 +527,25 @@ class LoopResidencyInventory : public IRVisitor {
         source = AsVarLike(definition.call->args_[0]);
       }
       if (found_load) residency_chain_vars_.insert(chain.begin(), chain.end());
+    }
+
+    // L0 tiling may fan one invariant Mat panel into several K-dependent
+    // Left/Right extracts, and the same extracted tile may feed the first
+    // tile.matmul and the tile.matmul_acc branch. The L0 values must remain
+    // loop-local, but the compiler-generated GM->Mat panel load can still be
+    // resident when every transitive use is a read-only matmul operand path.
+    std::unordered_map<const Expr*, bool> panel_fanout_memo;
+    for (const auto& [_, definition] : definitions_) {
+      if (!IsOp(definition.call, "tile.load") ||
+          !definition.call->HasAttr(kCompilerTensorToTileMatBridgeAttr)) {
+        continue;
+      }
+      auto tile = As<TileType>(definition.var->GetType());
+      if (!tile || tile->GetMemorySpace() != MemorySpace::Mat) continue;
+      std::unordered_set<const Expr*> visiting;
+      if (HasSupportedMatmulPanelFanout(definition.var, visiting, panel_fanout_memo)) {
+        resident_panel_load_vars_.insert(definition.var.get());
+      }
     }
   }
 
@@ -813,7 +910,7 @@ class LoopInvariantTileLoadHoister : public IRMutator {
       // the remainder of the iteration (for example, `continue`). Stop at
       // that boundary rather than speculating a later load into the preheader.
       if (!assign) break;
-      if (!assign->var_ || !inventory_.IsResidencyChainVar(assign->var_.get()) ||
+      if (!assign->var_ || !inventory_.IsHoistableResidencyVar(assign->var_.get()) ||
           inventory_.IsYieldedFromLoopSubtree(op, assign->var_.get())) {
         // An assigned store, cross-core synchronization op, Submit, or call to
         // another function is still an effect boundary. Do not move a later
@@ -830,7 +927,7 @@ class LoopInvariantTileLoadHoister : public IRMutator {
       bool eligible = false;
       if (IsOp(call, "tile.load")) {
         eligible = IsReadOnlyMatLoad(call, assign->var_) && UsesAreLoopInvariant(call, op, invariant_chain);
-      } else if (IsResidencyChainOp(call)) {
+      } else if (inventory_.IsResidencyChainVar(assign->var_.get()) && IsResidencyChainOp(call)) {
         auto source = call->args_.empty() ? nullptr : AsVarLike(call->args_[0]);
         eligible = source && invariant_chain.count(source.get()) != 0 && IsResidencySpace(assign->var_) &&
                    UsesAreLoopInvariant(call, op, invariant_chain);

@@ -287,7 +287,7 @@ def test_stationary_matmul_loop_allocates_with_one_lhs_load(planner):
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
 def test_nested_autotile_pipeline_allocates_safely(planner):
-    """Future ping/pong expansion remains allocation-safe under either planner."""
+    """Resident Mat panel plus loop-local ping/pong allocates under either planner."""
     optimized, _ = _run_pipeline(planner, StationaryMatmulPipelinedK)
     printed = ir.python_print(optimized)
     lines = printed.splitlines()
@@ -298,7 +298,7 @@ def test_nested_autotile_pipeline_allocates_safely(planner):
     user_loop = next(i for i, line in enumerate(lines) if "for n__idx" in line)
     k_loop = next(i for i, line in enumerate(lines) if "for c_n__tile_l0_ko" in line)
     lhs_extracts = [i for i, line in enumerate(lines) if "c_n__tile_l0_a" in line and "tile.extract" in line]
-    assert user_loop < lhs_loads[0] < k_loop
+    assert lhs_loads[0] < user_loop < k_loop
     assert len(lhs_extracts) == 2
     assert all(index > k_loop for index in lhs_extracts)
 

@@ -2401,6 +2401,56 @@ class MarkerOnlyScalarCall:
         assert rhs_load > loop
         assert "__compiler_tensor_to_tile_mat_bridge" not in printed
 
+    def test_tensor_matmul_k_tiled_lhs_panel_loads_once(self):
+        """A stationary GM->Mat panel survives AutoTile's K-pipeline fanout.
+
+        AutoTileMatmulL0 emits a K-dependent Left extract whose result feeds
+        both the initial matmul and the accumulating matmul_acc branch. Only
+        the whole-panel GM->Mat load is invariant; the L0 staging remains in
+        the inner pipeline.
+        """
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 256], pl.BF16],
+                rhs: pl.Tensor[[256, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n = pl.slice(rhs, [256, 128], [0, n])
+                    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    acc_next = pl.assemble(acc, c_n, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                rhs: pl.Tensor[[256, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                fresh_lhs = pl.create_tensor([256, 256], dtype=pl.BF16)
+                result = self.kernel(fresh_lhs, rhs, out)
+                return result
+
+        printed = ir.python_print(self._run_tensor_infer(Before))
+        loop = self._line_index(printed, "for n")
+        lhs_loads = self._line_indices(printed, "lhs__ssa_v0_mat", "tile.load")
+        lhs_extracts = self._line_indices(printed, "c_n__tile_l0_a", "tile.extract")
+        rhs_load = self._line_index(printed, "rhs_n__tile", "tile.load")
+        assert len(lhs_loads) == 1
+        assert len(lhs_extracts) == 1, "fixture must exercise K-dependent L0 staging"
+        assert len(self._line_indices(printed, "tile.matmul(")) == 1
+        assert len(self._line_indices(printed, "tile.matmul_acc(")) == 1
+        assert lhs_loads[0] < loop
+        assert all(index > loop for index in lhs_extracts)
+        assert rhs_load > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
     def test_direct_incore_entry_declines_residency(self):
         """An uncalled InCore function has no analyzable alias evidence."""
 
@@ -3336,6 +3386,100 @@ out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
         assert self._line_index(printed, "tile.load(lhs") > loop
         assert self._line_index(printed, "tile.load(rhs") < loop
         assert self._line_index(printed, "rhs_right", "tile.move") < loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_mat_panel_fanout_hoists_only_load(self):
+        """Multiple matching L0 extracts retain their shared Mat panel."""
+        params = """
+lhs: pl.Tensor[[16, 128], pl.BF16],
+rhs: pl.Tensor[[64, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+    lhs_k0 = pl.tile.extract(lhs_mat, 0, 0, [16, 64], target_memory=pl.Mem.Left)
+    lhs_k1 = pl.tile.extract(lhs_mat, 0, 64, [16, 64], target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c0 = pl.tile.matmul(lhs_k0, rhs_right)
+    c1 = pl.tile.matmul(lhs_k1, rhs_right)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") < loop
+        assert self._line_index(printed, "lhs_k0", "tile.extract") > loop
+        assert self._line_index(printed, "lhs_k1", "tile.extract") > loop
+        assert self._line_index(printed, "tile.load(rhs") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_transposed_mat_panel_fanout_hoists_only_load(self):
+        """A transposed Mat view may fan out while its staging stays local."""
+        params = """
+lhs: pl.Tensor[[128, 16], pl.BF16],
+rhs: pl.Tensor[[64, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [128, 16], target_memory=pl.Mem.Mat)
+    lhs_t = pl.tile.transpose_view(lhs_mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+    lhs_k0 = pl.tile.extract(lhs_t, 0, 0, [16, 64], target_memory=pl.Mem.Left)
+    lhs_k1 = pl.tile.extract(lhs_t, 0, 64, [16, 64], target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c0 = pl.tile.matmul(lhs_k0, rhs_right)
+    c1 = pl.tile.matmul(lhs_k1, rhs_right)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([128, 16], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") < loop
+        assert self._line_index(printed, "transpose_view") > loop
+        assert self._line_index(printed, "lhs_k0", "tile.extract") > loop
+        assert self._line_index(printed, "lhs_k1", "tile.extract") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_mat_panel_with_unsupported_l0_use_declines(self):
+        """A non-matmul use of one staged tile rejects panel residency."""
+        params = """
+lhs: pl.Tensor[[16, 128], pl.BF16],
+rhs: pl.Tensor[[64, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+sink: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
+"""
+        body = """
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+    lhs_k0 = pl.tile.extract(lhs_mat, 0, 0, [16, 64], target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c = pl.tile.matmul(lhs_k0, rhs_right)
+    stored = pl.tile.store(lhs_k0, [0, 0], sink)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out, sink",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
         assert "__compiler_tensor_to_tile_mat_bridge" not in printed
 
     def test_marked_transpose_prefix_positive_control(self):
