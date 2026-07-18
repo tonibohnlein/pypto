@@ -3035,6 +3035,53 @@ out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
         assert self._line_index(printed, "lhs_left", "tile.move") < loop
         assert "__compiler_tensor_to_tile_mat_bridge" not in printed
 
+    def test_marked_stationary_rhs_positive_control(self):
+        """The exact single-use recognizer also supports a resident RHS panel."""
+        body = "for n in pl.range(0, 2, 1):\n" + textwrap.indent(self._marked_matmul_chain(), "    ")
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="rhs",
+            fresh_expr="pl.create_tensor([128, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "tile.load(rhs") < loop
+        assert self._line_index(printed, "rhs_right", "tile.move") < loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_transpose_prefix_positive_control(self):
+        """A single-use transpose view remains part of the resident prefix."""
+        params = """
+lhs: pl.Tensor[[128, 16], pl.BF16],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [128, 16], target_memory=pl.Mem.Mat)
+    lhs_t = pl.tile.transpose_view(lhs_mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+    lhs_left = pl.tile.move(lhs_t, target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c = pl.tile.matmul(lhs_left, rhs_right)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([128, 16], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") < loop
+        assert self._line_index(printed, "transpose_view") < loop
+        assert self._line_index(printed, "lhs_left", "tile.move") < loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
     @pytest.mark.parametrize(
         ("name", "body", "control_needle"),
         [
