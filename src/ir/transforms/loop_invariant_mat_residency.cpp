@@ -137,10 +137,22 @@ class CompleteVarUseCollector : public IRVisitor {
   std::unordered_map<const Expr*, size_t> use_counts_;
 };
 
+bool IsLoopOrderingBoundaryCall(const CallPtr& call) {
+  if (!call || !call->op_) return false;
+  const auto& op_name = call->op_->name_;
+  // Interprocedural effect summaries are not available here. A function call
+  // may hide a fence, so moving a load across iterations of that call would be
+  // speculative even when its declared writable roots are disjoint.
+  if (!op_predicates::IsBuiltinOp(op_name)) return true;
+  const auto& registry = OpRegistry::GetInstance();
+  return !registry.IsRegistered(op_name) || registry.GetEntry(op_name).GetOpCategory() == "SyncOp";
+}
+
 struct LoopResidencyInfo {
   uint64_t preorder{0};
   uint64_t postorder{0};
   std::unordered_set<const Expr*> yielded_values;
+  bool has_ordering_boundary{false};
 };
 
 std::optional<uint64_t> StaticTileBytes(const TileTypePtr& tile) {
@@ -222,6 +234,9 @@ class LoopResidencyInventory : public IRVisitor {
   }
 
   void VisitExpr_(const CallPtr& op) override {
+    if (current_loop_ && IsLoopOrderingBoundaryCall(op)) {
+      loop_info_[current_loop_].has_ordering_boundary = true;
+    }
     RecordDirectCallUses(op);
     IRVisitor::VisitExpr_(op);
   }
@@ -414,6 +429,7 @@ class LoopResidencyInventory : public IRVisitor {
 
   static void MergeIntoParent(const LoopResidencyInfo& child, LoopResidencyInfo& parent) {
     parent.yielded_values.insert(child.yielded_values.begin(), child.yielded_values.end());
+    parent.has_ordering_boundary = parent.has_ordering_boundary || child.has_ordering_boundary;
   }
 };
 
@@ -435,8 +451,9 @@ const Var* ResolveCanonicalRoot(const std::unordered_map<const Var*, const Var*>
 }
 
 /// Refine BufferRootCollector's dependency-region roots into storage roots for
-/// the small set needed by residency.  In particular, tensor.slice is a view:
-/// it has its own dependency region but still aliases its source allocation.
+/// the small set needed by residency.  In particular, tensor.slice and
+/// tensor.view have their own dependency/metadata values but still alias their
+/// source allocation, while tensor.assemble returns its target allocation.
 /// Only tensor.create is treated as a trusted fresh external-disjoint
 /// allocation; all other unknown producers remain untrusted.
 class CallerStorageProvenanceCollector : public IRVisitor {
@@ -457,7 +474,9 @@ class CallerStorageProvenanceCollector : public IRVisitor {
         if (IsOp(call, "tensor.create")) {
           storage_roots_[op->var_.get()] = op->var_.get();
           fresh_roots_.insert(op->var_.get());
-        } else if ((IsOp(call, "tensor.slice") || IsOp(call, "tensor.assemble")) && !call->args_.empty()) {
+        } else if ((IsOp(call, "tensor.slice") || IsOp(call, "tensor.assemble") ||
+                    IsOp(call, "tensor.view")) &&
+                   !call->args_.empty()) {
           SetAliasedRoot(op->var_.get(), call->args_[0]);
         }
       } else if (auto source = AsVarLike(op->value_)) {
@@ -741,14 +760,7 @@ class LoopInvariantTileLoadHoister : public IRMutator {
     if (dce::IsSideEffectOp(stmt)) return true;
     if (!call || !call->op_) return false;
 
-    const auto& op_name = call->op_->name_;
-    if (!op_predicates::IsBuiltinOp(op_name)) return true;
-
-    const auto& registry = OpRegistry::GetInstance();
-    // An unregistered builtin has no purity contract. Fail closed just as for
-    // an unknown function call; registered synchronization operations are
-    // explicit ordering boundaries even when their result is assigned.
-    return !registry.IsRegistered(op_name) || registry.GetEntry(op_name).GetOpCategory() == "SyncOp";
+    return IsLoopOrderingBoundaryCall(call);
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
@@ -759,7 +771,11 @@ class LoopInvariantTileLoadHoister : public IRMutator {
     // hoist their own original direct chain by one lexical level.
     if (!IsStaticNonEmptySequential(op)) return IRMutator::VisitStmt_(op);
     const auto* loop_info = inventory_.GetLoopInfo(op);
-    if (!loop_info || !handler_) return IRMutator::VisitStmt_(op);
+    // A load moved to the preheader would cross an ordering operation from
+    // every preceding iteration even when that operation is textually after
+    // the load. Reject any known or potentially hidden boundary in the loop
+    // subtree.
+    if (!loop_info || !handler_ || loop_info->has_ordering_boundary) return IRMutator::VisitStmt_(op);
 
     auto stmts = DirectStatements(op->body_);
     std::vector<bool> hoist(stmts.size(), false);

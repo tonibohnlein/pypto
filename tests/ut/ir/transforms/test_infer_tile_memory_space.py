@@ -2777,6 +2777,82 @@ class MarkedAssignedSyncResidency:
         assert loop < fence < lhs_load
         assert "__compiler_tensor_to_tile_mat_bridge" not in printed
 
+    @pytest.mark.parametrize(
+        "following_sync",
+        [
+            "    fence = pl.system.fence()\n",
+            "    if n < 1:\n        fence = pl.system.fence()\n",
+        ],
+        ids=["direct", "conditional"],
+    )
+    def test_following_sync_keeps_residency_chain_inside_loop(self, following_sync):
+        """Residency cannot cross a later iteration's synchronization point."""
+        body = (
+            "for n in pl.range(0, 2, 1):\n"
+            + textwrap.indent(self._marked_matmul_chain(), "    ")
+            + following_sync
+        )
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_following_helper_call_keeps_residency_chain_inside_loop(self):
+        """A helper may hide synchronization and is an ordering boundary."""
+        before = pl.parse_program(
+            """
+@pl.program
+class MarkedHelperSyncResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def barrier(
+        self,
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fence = pl.system.fence()
+        return out
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+            out = self.barrier(out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        result = self.worker(fresh_lhs, rhs, out)
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
     def test_multiple_proven_safe_call_sites_allow_residency(self):
         """Every caller may use different roots as long as each is provably disjoint."""
 
@@ -2982,6 +3058,26 @@ out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
         before = self._parse_marked_program(
             params,
             "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_write_through_tensor_view_stays_inside_loop(self):
+        """A zero-copy tensor.view write aliases the candidate source storage."""
+        body = (
+            "lhs_view = pl.tensor.view(lhs, [16, 128])\n"
+            "for n in pl.range(0, 2, 1):\n"
+            + textwrap.indent(self._marked_matmul_chain(), "    ")
+            + "    zero = pl.tile.create([16, 128], dtype=pl.BF16, target_memory=pl.Mem.Vec)\n"
+            + "    updated_lhs = pl.tile.store(zero, [0, 0], lhs_view)\n"
+        )
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
             body,
             fresh_param="lhs",
             fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
