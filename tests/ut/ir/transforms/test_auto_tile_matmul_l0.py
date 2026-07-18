@@ -1453,6 +1453,18 @@ class TestAutoTileMatmulL0MNTiling:
                 seq.append("store")
         return seq
 
+    def _acc_buffer_count(self, program) -> int:
+        """Count distinct L0C buffers after the full Default pipeline."""
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+        prog = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
+        bases = {
+            line.strip().split(":")[0]
+            for line in ir.python_print(prog).splitlines()
+            if "tile.alloc(pl.Mem.Acc" in line
+        }
+        return len(bases)
+
     def test_dbc2_ptoas_co_lives_two_l0c_accumulators(self):
         """Golden co-live check for dbC=2 (companion to the dbC=1 test above).
 
@@ -1512,6 +1524,41 @@ class TestAutoTileMatmulL0MNTiling:
                 f"dbC=1 (PyPTO) must interleave matmul,store (one accumulator), got: {pypto_seq}"
             )
 
+    def test_dbc2_ptoas_co_lives_on_one_by_four_inner_grid(self):
+        """A single stationary M tile does not prevent N-axis L0C ping-pong.
+
+        Issue #2079's 16x512x128 QK matmul holds A outside a four-iteration
+        moving-N loop. dbC belongs to that inner loop, so the PTOAS planner must
+        emit the same ``matmul, matmul, store, store`` window as a 2-D grid.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[16, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            seq = self._colive_seq(Before)
+        assert any(seq[i : i + 4] == ["matmul", "matmul", "store", "store"] for i in range(len(seq) - 3)), (
+            f"1x4 dbC=2 must float two N-stage stores below two matmuls, got: {seq}"
+        )
+
     def test_dbc2_pypto_flag_allocates_ping_pong(self):
         """The experimental ``enable_pypto_l0c_double_buffer`` opt-in makes the PyPTO
         memory planner allocate the dbC=2 ping-pong: the pipeline-membership tagger gives
@@ -1519,7 +1566,6 @@ class TestAutoTileMatmulL0MNTiling:
         the two co-live L0C accumulators in distinct buffers. Default off: the same shape
         coalesces to a single accumulator. Pins the opt-in gate + the end-to-end
         allocation (the golden test above only pins the emit ordering)."""
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         @pl.program
         class Before:
@@ -1540,28 +1586,51 @@ class TestAutoTileMatmulL0MNTiling:
                 out = pl.store(c, [0, 0], out)
                 return out
 
-        def acc_buffer_count() -> int:
-            """Distinct L0C (Acc) buffers after the full Default pipeline."""
-            prog = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
-            bases = {
-                line.strip().split(":")[0]
-                for line in ir.python_print(prog).splitlines()
-                if "tile.alloc(pl.Mem.Acc" in line
-            }
-            return len(bases)
-
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
         with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
-            assert acc_buffer_count() == 1, "PyPTO default must keep a single L0C accumulator (dbC=1)"
+            assert self._acc_buffer_count(Before) == 1, (
+                "PyPTO default must keep a single L0C accumulator (dbC=1)"
+            )
 
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
         with passes.PassContext(
             [], memory_planner=passes.MemoryPlanner.PYPTO, enable_pypto_l0c_double_buffer=True
         ):
-            assert acc_buffer_count() == 2, (
+            assert self._acc_buffer_count(Before) == 2, (
                 "PyPTO + opt-in flag must allocate the dbC=2 ping-pong (two co-live L0C accumulators)"
+            )
+
+    def test_dbc2_pypto_flag_allocates_one_by_four_ping_pong(self):
+        """The single-trip outer loop preserves two inner-stage Acc buffers."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[16, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        with passes.PassContext(
+            [], memory_planner=passes.MemoryPlanner.PYPTO, enable_pypto_l0c_double_buffer=True
+        ):
+            assert self._acc_buffer_count(Before) == 2, (
+                "PyPTO 1x4 dbC=2 must preserve the two moving-inner L0C buffers"
             )
 
     @pytest.mark.parametrize(

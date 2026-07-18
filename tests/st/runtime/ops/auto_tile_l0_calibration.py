@@ -88,6 +88,7 @@ def _primary_cases() -> list[CalibrationCase]:
         _case("issue2079", "current", shape, "16,512,32,OS,0"),
         _case("issue2079", "intermediate", shape, "16,256,64,OS,0"),
         _case("issue2079", "single_k_os", shape, "16,128,128,OS,0"),
+        _case("issue2079", "single_k_os_dbc", shape, "16,128,128,OS,1"),
         _case("issue2079", "single_k_a", shape, "16,128,128,A,0"),
         _case("issue2079", "single_k_b", shape, "16,256,128,B,0"),
     ]
@@ -577,8 +578,11 @@ def _run_parent(cases: list[CalibrationCase], args) -> None:
         writer = csv.DictWriter(stream, fieldnames=_FIELDS)
         if write_header:
             writer.writeheader()
-        for case in cases:
-            for sample in range(args.samples):
+        # Interleave configurations by sample so thermal or frequency drift does
+        # not systematically favor one design point. Each child still owns a
+        # fresh L2 collector because the collector is not safely reusable.
+        for sample in range(args.samples):
+            for case in cases:
                 if (case.case_id, sample) in done:
                     continue
                 command = [
