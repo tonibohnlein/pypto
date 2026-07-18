@@ -303,6 +303,113 @@ class TestInferTileMemorySpaceCubeOps:
         After = passes.infer_tile_memory_space()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_inserted_matmul_move_remaps_dump_vars_attr(self):
+        """Var-valued Call attrs follow an operand replaced by tile.move."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile = pl.load(x, [0, 0], [16, 128])
+                y_tile = pl.load(y, [0, 0], [128, 128])
+                z_tile = pl.matmul(x_tile, y_tile)
+                result = pl.store(z_tile, [0, 0], out)
+                return result
+
+        class _MarkMatmulDump(ir.IRMutator):
+            def visit_call(self, op):
+                expr = super().visit_call(op)
+                call = expr if isinstance(expr, ir.Call) else op
+                if call.op.name != "tile.matmul":
+                    return expr
+                attrs = dict(call.attrs)
+                attrs["dump_vars"] = [call.args[0]]
+                return ir.Call(
+                    call.op,
+                    list(call.args),
+                    dict(call.kwargs),
+                    attrs,
+                    call.type,
+                    call.span,
+                )
+
+        marked = _MarkMatmulDump().visit_program(Before)
+        # Builtin-call dump attrs are compiler-internal and have no DSL
+        # print/parse surface, so inspect the transformed IR directly.
+        with passes.PassContext([]):
+            after = passes.infer_tile_memory_space()(marked)
+        matmuls = []
+
+        class _CollectMatmul(ir.IRVisitor):
+            def visit_call(self, op):
+                if op.op.name == "tile.matmul":
+                    matmuls.append(op)
+                super().visit_call(op)
+
+        _CollectMatmul().visit_program(after)
+        assert len(matmuls) == 1
+        matmul = matmuls[0]
+        assert list(matmul.attrs["dump_vars"]) == [matmul.args[0]]
+        assert matmul.args[0].type.memory_space == pl.MemorySpace.Left
+
+    def test_distinct_inserted_moves_expand_dump_vars_attr(self):
+        """One dumped source used in both matmul slots follows both moves."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                x_tile = pl.load(x, [0, 0], [128, 128])
+                z_tile = pl.matmul(x_tile, x_tile)
+                result = pl.store(z_tile, [0, 0], out)
+                return result
+
+        class _MarkMatmulDump(ir.IRMutator):
+            def visit_call(self, op):
+                expr = super().visit_call(op)
+                call = expr if isinstance(expr, ir.Call) else op
+                if call.op.name != "tile.matmul":
+                    return expr
+                attrs = dict(call.attrs)
+                attrs["dump_vars"] = [call.args[0]]
+                return ir.Call(
+                    call.op,
+                    list(call.args),
+                    dict(call.kwargs),
+                    attrs,
+                    call.type,
+                    call.span,
+                )
+
+        marked = _MarkMatmulDump().visit_program(Before)
+        with passes.PassContext([]):
+            after = passes.infer_tile_memory_space()(marked)
+        matmuls = []
+
+        class _CollectMatmul(ir.IRVisitor):
+            def visit_call(self, op):
+                if op.op.name == "tile.matmul":
+                    matmuls.append(op)
+                super().visit_call(op)
+
+        _CollectMatmul().visit_program(after)
+        assert len(matmuls) == 1
+        matmul = matmuls[0]
+        assert list(matmul.attrs["dump_vars"]) == list(matmul.args[:2])
+        assert [arg.type.memory_space for arg in matmul.args[:2]] == [
+            pl.MemorySpace.Left,
+            pl.MemorySpace.Right,
+        ]
+
     def test_matmul_full_pipeline(self):
         """Full matmul pipeline: load->Mat, move->Left/Right, matmul->Acc."""
 

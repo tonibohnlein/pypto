@@ -512,13 +512,14 @@ def infer_tile_memory_space() -> Pass:
     """Infer TileType memory spaces and safe stationary matmul residency.
 
     Besides assigning ``Vec``/``Mat``/``Left``/``Right``/``Acc`` and inserting
-    required moves, the pass runs a focused internal transform for a
-    conservative single-use subset of compiler-generated invariant GM→Mat
-    matmul operand chains. The candidate caller storage must be created by
-    ``tensor.create`` in root orchestration IR. External inputs, Submit sites,
-    direct/external InCore entries, and Mat panels fanned out by K tiling
-    currently decline. User-authored tile loads are never moved, and internal
-    bridge provenance is consumed before the pass returns.
+    required moves, the pass runs a focused internal transform for
+    compiler-generated invariant GM→Mat matmul operand paths. The candidate
+    caller storage must be created by ``tensor.create`` in root orchestration
+    IR. K-tiled fanout may retain the whole GM→Mat panel while leaving
+    K-dependent Left/Right staging inside its original pipeline. External
+    inputs, Submit sites, and direct/external InCore entries decline.
+    User-authored tile loads are never moved, and internal bridge provenance is
+    consumed before the pass returns.
     """
 
 def materialize_tensor_strides() -> Pass:

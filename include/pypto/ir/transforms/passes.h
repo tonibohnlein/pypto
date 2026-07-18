@@ -506,13 +506,14 @@ Pass CanonicalizeTileSlice();
  * - tile.reshape: inherit from first tile-typed input
  * - Other tile ops: Vec (default)
  *
- * The pass also runs a focused internal transform that hoists a conservative
- * single-use subset of compiler-generated, loop-invariant GM->Mat matmul
- * operand chains across statically non-empty sequential loops.  The rewrite
+ * The pass also runs a focused internal transform that hoists
+ * compiler-generated, loop-invariant GM->Mat matmul operand paths across
+ * statically non-empty sequential loops.  The rewrite
  * requires a direct root-orchestration Call whose candidate storage was
  * created by tensor.create, plus a capacity-safe whole-function
- * Mat/Left/Right footprint.  External inputs, Submit sites, direct/external
- * InCore entries, and Mat panels fanned out by K tiling currently decline.
+ * Mat/Left/Right footprint.  K-tiled fanout may retain the whole GM->Mat panel
+ * while leaving K-dependent Left/Right staging inside its original pipeline.
+ * External inputs, Submit sites, and direct/external InCore entries decline.
  * Private bridge provenance is consumed before the pass returns.
  *
  * Requirements:
