@@ -138,6 +138,7 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     memory_planner: "MemoryPlanner | None" = None,
     enable_pypto_l0c_double_buffer: bool = False,
     dsa_solution_dir: str | None = None,
+    dsa_reuse_penalty_recognizer: Any = None,
     ptoas_sync_summary_dir: str | None = None,
 ) -> CacheKey:
     """Build a cache key for a JIT call site.
@@ -183,8 +184,9 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
             MemoryReuse output; without it a kernel first compiled with it off
             would reuse that artifact when later called with it on (and vice versa).
         dsa_solution_dir: Optional fingerprinted DSA placement directory.
-            Included because different replay artifacts can produce different
-            physical addresses for the same kernel.
+        dsa_reuse_penalty_recognizer: Effective experimental DSA edge recognizer.
+            Included because recognized edges can change the selected physical
+            addresses for the same kernel.
         ptoas_sync_summary_dir: Optional PTOAS InsertSync summary directory.
             Included because requesting a fresh summary must force PTOAS to run
             instead of returning an artifact compiled without instrumentation.
@@ -214,6 +216,10 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         ("memory_planner", None if memory_planner is None else str(memory_planner)),
         ("enable_pypto_l0c_double_buffer", enable_pypto_l0c_double_buffer),
         ("dsa_solution_dir", dsa_solution_dir),
+        (
+            "dsa_reuse_penalty_recognizer",
+            None if dsa_reuse_penalty_recognizer is None else str(dsa_reuse_penalty_recognizer),
+        ),
         ("ptoas_sync_summary_dir", ptoas_sync_summary_dir),
     )
     return (
