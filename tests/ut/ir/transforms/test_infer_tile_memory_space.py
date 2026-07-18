@@ -2853,6 +2853,87 @@ class MarkedHelperSyncResidency:
         assert self._line_index(printed, "lhs_left", "tile.move") > loop
         assert "__compiler_tensor_to_tile_mat_bridge" not in printed
 
+    def test_following_submit_keeps_residency_chain_inside_loop(self):
+        """Submit is a loop-wide ordering boundary distinct from Call."""
+
+        def build_program(following: str):
+            program = pl.parse_program(
+                f"""
+@pl.program
+class MarkedFollowingSubmitResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def task(
+        self,
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+{textwrap.indent(textwrap.dedent(following).strip(), "            ")}
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        result = self.worker(fresh_lhs, rhs, out)
+        return result
+"""
+            )
+
+            # Submit is valid only in orchestration syntax. Retype this
+            # deliberately constructed function after parsing so this pass's
+            # first-class Submit handling is covered even though residency
+            # currently rewrites only InCore functions.
+            functions = []
+            for function in program.functions.values():
+                if function.name != "worker":
+                    functions.append(function)
+                    continue
+                params = list(zip(function.params, function.param_directions, strict=True))
+                functions.append(
+                    ir.Function(
+                        function.name,
+                        params,
+                        function.return_types,
+                        function.body,
+                        function.span,
+                        ir.FunctionType.InCore,
+                    )
+                )
+            return self._stamp_mat_bridge_loads(ir.Program(functions, program.name, program.span))
+
+        control = build_program("")
+        control_printed = ir.python_print(self._run_infer(control))
+        assert self._line_index(control_printed, "tile.load(lhs") < self._line_index(control_printed, "for n")
+
+        before = build_program(
+            """
+with pl.manual_scope():
+    _result, _tid = pl.submit(self.task, out)
+"""
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
     def test_multiple_proven_safe_call_sites_allow_residency(self):
         """Every caller may use different roots as long as each is provably disjoint."""
 

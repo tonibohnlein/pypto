@@ -241,6 +241,18 @@ class LoopResidencyInventory : public IRVisitor {
     IRVisitor::VisitExpr_(op);
   }
 
+  void VisitExpr_(const SubmitPtr& op) override {
+    // Submit is asynchronous and may carry explicit dependency edges.  It is
+    // a sibling IR kind of Call, so the Call visitor above never sees it.
+    // Conservatively keep resident loads inside any loop subtree that
+    // launches a task: otherwise a preheader load could move across a Submit
+    // from the preceding iteration.
+    if (current_loop_) {
+      loop_info_[current_loop_].has_ordering_boundary = true;
+    }
+    IRVisitor::VisitExpr_(op);
+  }
+
   void VisitStmt_(const EvalStmtPtr& op) override {
     if (auto call = As<Call>(op->expr_); call && IsOp(call, "system.reserve_buffer")) {
       has_explicit_reservation_ = true;
