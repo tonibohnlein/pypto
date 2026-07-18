@@ -229,6 +229,26 @@ def _find_first_call_to(func: ir.Function, op_name: str) -> ir.Call | None:
     return finder.found
 
 
+class _AllCallsFinder(ir.IRVisitor):
+    """Collect all ``Call`` nodes whose callee has the requested name."""
+
+    def __init__(self, op_name: str) -> None:
+        super().__init__()
+        self.op_name = op_name
+        self.found: list[ir.Call] = []
+
+    def visit_call(self, op: ir.Call) -> None:
+        if op.op.name == self.op_name:
+            self.found.append(op)
+        super().visit_call(op)
+
+
+def _find_calls_to(func: ir.Function, op_name: str) -> list[ir.Call]:
+    finder = _AllCallsFinder(op_name)
+    finder.visit_stmt(func.body)
+    return finder.found
+
+
 class _CallCounter(ir.IRVisitor):
     """Count Calls whose callee ``Op`` name appears in ``op_names``."""
 
@@ -2513,6 +2533,55 @@ class TestSliceMatmulConversion:
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_slice_reshape_then_matmul_routes_load_to_mat(self):
+        """tensor.slice → tensor.reshape → tensor.matmul emits tile.load(Mat).
+
+        A singleton leading dimension is common when selecting one attention
+        work item from a stacked rank-3 tensor.  The reshape is a zero-copy view,
+        so the matmul's Mat demand must reach the rank-3 slice.  Otherwise the
+        slice lowers to Vec and the compiler inserts an unnecessary AIV→AIC
+        transfer for the entire operand.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                query: pl.Tensor[[128, 16, 128], pl.BF16],
+                key: pl.Tensor[[128, 512, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                query_3d = pl.slice(query, [1, 16, 128], [0, 0, 0])
+                query_2d = pl.reshape(query_3d, [16, 128])
+                key_3d = pl.slice(key, [1, 512, 128], [0, 0, 0])
+                key_2d = pl.reshape(key_3d, [512, 128])
+                scores = pl.matmul(query_2d, key_2d, b_trans=True, out_dtype=pl.FP32)
+                out = pl.assemble(out, scores, [0, 0])
+                return out
+
+            @pl.function
+            def main(
+                self,
+                query: pl.Tensor[[128, 16, 128], pl.BF16],
+                key: pl.Tensor[[128, 512, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                return self.main_incore_0(query, key, out)
+
+        after = passes.convert_tensor_to_tile_ops()(Before)
+        incore = after.get_function("main_incore_0")
+        assert incore is not None
+
+        loads = _find_calls_to(incore, "tile.load")
+        assert len(loads) == 2
+        for load in loads:
+            result_type = load.type
+            assert isinstance(result_type, ir.TileType)
+            assert result_type.memory_space == pl.Mem.Mat
+
+        assert _count_calls(incore, {"tile.move"})["tile.move"] == 0
 
     def test_slice_chain_of_aliases_then_matmul(self):
         """Demand propagates through a chain of SSA aliases, not just one hop.
