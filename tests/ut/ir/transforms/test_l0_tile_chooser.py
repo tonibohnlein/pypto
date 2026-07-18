@@ -180,6 +180,23 @@ class TestL0TilingIssueCosts:
         assert "b_extracts=4" in result.perf_hint
         assert "acc_continuations=0" in result.perf_hint
 
+    def test_dbc_supports_issue2079_one_by_four_grid(self):
+        """The moving N loop can ping-pong L0C even when M has one tile."""
+        cfg = _default_config(M=16, N=512, K=128)
+        cfg.allow_double_buffer_c = True
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert (result.m, result.n, result.k) == (16, 128, 128)
+        assert result.os_holds_a is True
+        assert result.double_buffer_c is True
+
+    def test_dbc_does_not_count_peeled_tail_as_inner_stage(self, monkeypatch):
+        """A partial boundary is emitted outside the pipeline and cannot ping-pong."""
+        cfg = _default_config(M=16, N=192, K=128)
+        cfg.allow_double_buffer_c = True
+        monkeypatch.setenv("PYPTO_FORCE_L0_TILE", "16,128,128,OS,1")
+        with pytest.raises(ValueError, match="at least two full tiles on the moving inner N axis, got 1"):
+            passes.l0_tile_chooser.choose_l0_tile(cfg)
+
     def test_matmul_acc_counts_the_input_accumulator_dependency(self, monkeypatch):
         cfg = _default_config(M=16, N=512, K=128)
         cfg.c_read = True
@@ -359,10 +376,8 @@ def _derive_db(stat: str) -> tuple[bool, bool]:
     return (True, True)
 
 
-def _load_cycles(m: int, n: int, k: int, cfg, stat: str) -> float:
-    # The full-K emitter hoists one operand (loaded once, reused across the inner
-    # sweep); OS at k == K picks the cheaper hoist -- NOT "both re-streamed". Only
-    # split-K (k < K) re-streams both. Mirrors C++ LoadCycles.
+def _held_load_cycles(m: int, n: int, cfg) -> tuple[float, float]:
+    """Return the held-A and held-B full-K load costs."""
     M, N, K = cfg.M, cfg.N, cfg.K
     cn, cm = _cdiv(N, n), _cdiv(M, m)
 
@@ -376,6 +391,35 @@ def _load_cycles(m: int, n: int, k: int, cfg, stat: str) -> float:
 
     held_a = score(cfg.bytes_a * M * K, cfg.bytes_b * K * N * cm, cm, cm * cn)
     held_b = score(cfg.bytes_a * M * K * cn, cfg.bytes_b * K * N, cm * cn, cn)
+    return held_a, held_b
+
+
+def _row_outer(m: int, n: int, cfg, stat: str) -> bool:
+    """Mirror BuildFullKPipelined's stationary-outer loop choice."""
+    if stat == _AS:
+        return True
+    if stat == _BS:
+        return False
+    held_a, held_b = _held_load_cycles(m, n, cfg)
+    return held_a <= held_b
+
+
+def _load_cycles(m: int, n: int, k: int, cfg, stat: str) -> float:
+    # The full-K emitter hoists one operand (loaded once, reused across the inner
+    # sweep); OS at k == K picks the cheaper hoist -- NOT "both re-streamed". Only
+    # split-K (k < K) re-streams both. Mirrors C++ LoadCycles.
+    M, N, K = cfg.M, cfg.N, cfg.K
+    cn, cm = _cdiv(N, n), _cdiv(M, m)
+    held_a, held_b = _held_load_cycles(m, n, cfg)
+
+    def score(a_bytes: int, b_bytes: int, a_extracts: int, b_extracts: int) -> float:
+        return (
+            a_bytes / cfg.bw_a
+            + b_bytes / cfg.bw_b
+            + a_extracts * cfg.load_a_issue_cycles
+            + b_extracts * cfg.load_b_issue_cycles
+        )
+
     if stat == _AS:
         return held_a
     if stat == _BS:
@@ -459,7 +503,7 @@ def _legal_ks(m: int, n: int, cfg, a0: int, b0: int) -> list[int]:
     return ks
 
 
-def _enumerate_best(cfg, stat: str, dbc: bool, require_2d: bool, require_full_k: bool):
+def _enumerate_best(cfg, stat: str, dbc: bool, require_inner_pair: bool, require_full_k: bool):
     """Exhaustively score the legal aligned (m, n, k) grid for one regime; best
     (key, tile). Every legal k per (m, n) is scored (not a largest-k shortcut)."""
     dba, dbb = _derive_db(stat)
@@ -469,17 +513,17 @@ def _enumerate_best(cfg, stat: str, dbc: bool, require_2d: bool, require_full_k:
     best = None
     m = cfg.min_m
     while m <= cfg.M and m * cfg.min_n <= c0:
-        if not (require_2d and _cdiv(cfg.M, m) < 2):
-            n = cfg.min_n
-            while n <= min(cfg.N, c0 // m):
-                if not (require_2d and _cdiv(cfg.N, n) < 2):
-                    for k in _legal_ks(m, n, cfg, a0, b0):
-                        if require_full_k and k != cfg.K:
-                            continue
-                        key = _wall_key(m, n, k, cfg, stat, dbc)
-                        if best is None or key < best[0]:
-                            best = (key, (m, n, k))
-                n += cfg.align_n
+        n = cfg.min_n
+        while n <= min(cfg.N, c0 // m):
+            inner_full_tiles = cfg.N // n if _row_outer(m, n, cfg, stat) else cfg.M // m
+            if not require_inner_pair or inner_full_tiles >= 2:
+                for k in _legal_ks(m, n, cfg, a0, b0):
+                    if require_full_k and k != cfg.K:
+                        continue
+                    key = _wall_key(m, n, k, cfg, stat, dbc)
+                    if best is None or key < best[0]:
+                        best = (key, (m, n, k))
+            n += cfg.align_n
         m += cfg.align_m
     return best
 
@@ -489,7 +533,7 @@ def _brute_optimum(cfg) -> tuple:
 
     Returns (tile, stationarity, double_buffer_c, wall).
     """
-    base = _enumerate_best(cfg, _OS, False, require_2d=False, require_full_k=False)
+    base = _enumerate_best(cfg, _OS, False, require_inner_pair=False, require_full_k=False)
     assert base is not None
     best_key, best = base[0], (base[1], _OS, False)
     # Explore the rest of the space only when the baseline already tiles.
@@ -509,7 +553,9 @@ def _brute_optimum(cfg) -> tuple:
             c0 = cfg.l0c_bytes // (cfg.bytes_c * (2 if dbc else 1))
             if c0 < cfg.min_m * cfg.min_n:
                 continue
-            cand = _enumerate_best(cfg, stat, dbc, require_2d=dbc, require_full_k=(stat != _OS or dbc))
+            cand = _enumerate_best(
+                cfg, stat, dbc, require_inner_pair=dbc, require_full_k=(stat != _OS or dbc)
+            )
             if cand is not None and cand[0][0] < best_key[0]:  # strictly lower wall
                 best_key, best = cand[0], (cand[1], stat, dbc)
     tile, stat, dbc = best
@@ -584,14 +630,16 @@ class TestL0TilingRooflineOptimum:
 
         512x512x64: the L0C drain (~M*N) dominates the shallow-K compute, so
         hiding it behind the next tile beats a single big accumulator. The chosen
-        tile must fit the halved L0C budget and form a >= 2x2 grid.
+        tile must fit the halved L0C budget and provide at least two full tiles
+        on the moving inner axis.
         """
         cfg = _default_config(M=512, N=512, K=64)
         cfg.allow_double_buffer_c = True
         result = passes.l0_tile_chooser.choose_l0_tile(cfg)
         assert result.double_buffer_c is True
         assert result.k == 64, f"dbC=2 requires a full-K tile; got k={result.k}"
-        assert _cdiv(512, result.m) >= 2 and _cdiv(512, result.n) >= 2, "dbC=2 needs a >= 2x2 grid"
+        inner_full_tiles = 512 // result.n if _row_outer(result.m, result.n, cfg, _OS) else 512 // result.m
+        assert inner_full_tiles >= 2, "dbC=2 needs at least two full moving-inner tiles"
         assert _capacities_ok(result.m, result.n, result.k, cfg, dbc=True)
         # The single-L0C path must NOT pick dbC=2 (gate respected).
         cfg.allow_double_buffer_c = False
