@@ -737,6 +737,20 @@ class LoopInvariantTileLoadHoister : public IRMutator {
   }
 
  protected:
+  static bool IsHoistPrefixEffectBoundary(const StmtPtr& stmt, const CallPtr& call) {
+    if (dce::IsSideEffectOp(stmt)) return true;
+    if (!call || !call->op_) return false;
+
+    const auto& op_name = call->op_->name_;
+    if (!op_predicates::IsBuiltinOp(op_name)) return true;
+
+    const auto& registry = OpRegistry::GetInstance();
+    // An unregistered builtin has no purity contract. Fail closed just as for
+    // an unknown function call; registered synchronization operations are
+    // explicit ordering boundaries even when their result is assigned.
+    return !registry.IsRegistered(op_name) || registry.GetEntry(op_name).GetOpCategory() == "SyncOp";
+  }
+
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     // Decide from the original direct body before recursively rewriting child
     // loops. This prevents a preheader produced for an inner loop from being
@@ -764,8 +778,7 @@ class LoopInvariantTileLoadHoister : public IRMutator {
         // another function is still an effect boundary. Do not move a later
         // load ahead of it merely because its result is assigned to a Var.
         auto preceding_call = assign->value_ ? As<Call>(assign->value_) : nullptr;
-        if (dce::IsSideEffectOp(stmts[i]) || (preceding_call && preceding_call->op_ &&
-                                              !op_predicates::IsBuiltinOp(preceding_call->op_->name_))) {
+        if (IsHoistPrefixEffectBoundary(stmts[i], preceding_call)) {
           break;
         }
         continue;
