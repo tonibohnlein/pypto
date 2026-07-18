@@ -72,6 +72,7 @@ def compile(  # noqa: PLR0912, PLR0913
     analyze_auto_scopes_for_deps: bool = False,
     dsa_export_dir: str | None = None,
     dsa_solution_dir: str | None = None,
+    dsa_reuse_penalty_recognizer: _passes.DsaReusePenaltyRecognizer | None = None,
     ptoas_sync_summary_dir: str | None = None,
 ) -> "CompiledProgram | DistributedCompiledProgram":
     """Compile a Program through passes and codegen.
@@ -126,6 +127,9 @@ def compile(  # noqa: PLR0912, PLR0913
         dsa_solution_dir: Optional directory containing fingerprinted DSA
             solution artifacts. When set, ``MemoryPlanner.DSA`` validates and
             replays the recorded placement instead of invoking a solver.
+        dsa_reuse_penalty_recognizer: Experimental soft-edge recognizer used
+            with ``MemoryPlanner.DSA``. ``LINEAR`` considers adjacent handoffs;
+            ``QUADRATIC`` is a research reference over compatible pairs.
         ptoas_sync_summary_dir: Optional directory for one machine-readable
             InsertSync JSONL summary per PTOAS codegen unit. This is
             instrumentation only and does not change placement or codegen.
@@ -207,6 +211,11 @@ def compile(  # noqa: PLR0912, PLR0913
             "compile() was called with dsa_solution_dir while a PassContext is already active. "
             "Set the DSA solution directory on the existing PassContext instead."
         )
+    if dsa_reuse_penalty_recognizer is not None and outer is not None:
+        raise RuntimeError(
+            "compile() was called with dsa_reuse_penalty_recognizer while a PassContext is already active. "
+            "Set the recognizer on the existing PassContext instead."
+        )
 
     # --- Compile profiling ---------------------------------------------------
     prof = get_active_profiler()
@@ -240,6 +249,11 @@ def compile(  # noqa: PLR0912, PLR0913
         )
         export_dir = dsa_export_dir if dsa_export_dir is not None else outer.get_dsa_export_dir()
         solution_dir = dsa_solution_dir if dsa_solution_dir is not None else outer.get_dsa_solution_dir()
+        reuse_recognizer = (
+            dsa_reuse_penalty_recognizer
+            if dsa_reuse_penalty_recognizer is not None
+            else outer.get_dsa_reuse_penalty_recognizer()
+        )
     else:
         vlevel = (
             verification_level if verification_level is not None else _passes.get_default_verification_level()
@@ -250,10 +264,17 @@ def compile(  # noqa: PLR0912, PLR0913
         dbc_flag = enable_pypto_l0c_double_buffer if enable_pypto_l0c_double_buffer is not None else False
         export_dir = dsa_export_dir
         solution_dir = dsa_solution_dir
+        reuse_recognizer = (
+            dsa_reuse_penalty_recognizer
+            if dsa_reuse_penalty_recognizer is not None
+            else _passes.DsaReusePenaltyRecognizer.DISABLED
+        )
     if export_dir is not None and mplan != _passes.MemoryPlanner.DSA:
         raise ValueError("dsa_export_dir requires memory_planner=MemoryPlanner.DSA")
     if solution_dir is not None and mplan != _passes.MemoryPlanner.DSA:
         raise ValueError("dsa_solution_dir requires memory_planner=MemoryPlanner.DSA")
+    if reuse_recognizer != _passes.DsaReusePenaltyRecognizer.DISABLED and mplan != _passes.MemoryPlanner.DSA:
+        raise ValueError("dsa_reuse_penalty_recognizer requires memory_planner=MemoryPlanner.DSA")
     if ptoas_sync_summary_dir is not None and skip_ptoas:
         raise ValueError("ptoas_sync_summary_dir requires PTOAS code generation (skip_ptoas=False)")
     ctx = _passes.PassContext(
@@ -265,6 +286,7 @@ def compile(  # noqa: PLR0912, PLR0913
         dbc_flag,
         export_dir,
         solution_dir,
+        reuse_recognizer,
     )
 
     if mplan == _passes.MemoryPlanner.PTOAS:
