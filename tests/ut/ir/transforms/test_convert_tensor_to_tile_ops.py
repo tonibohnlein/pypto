@@ -235,7 +235,7 @@ class _AllCallsFinder(ir.IRVisitor):
 
     def __init__(self, op_name: str) -> None:
         super().__init__()
-        self.op_name = op_name
+        self.op_name = ir.get_op(op_name).name
         self.found: list[ir.Call] = []
 
     def visit_call(self, op: ir.Call) -> None:
@@ -2635,7 +2635,14 @@ class TestSliceMatmulConversion:
             assert isinstance(result_type, ir.TileType)
             assert result_type.memory_space == pl.Mem.Mat
 
-        assert _count_calls(incore, {"tile.move"})["tile.move"] == 0
+        reshapes = _find_calls_to(incore, "tile.reshape")
+        assert len(reshapes) == 2
+        for reshape in reshapes:
+            result_type = reshape.type
+            assert isinstance(result_type, ir.TileType)
+            assert result_type.memory_space == pl.Mem.Mat
+
+        assert not _find_calls_to(incore, "tile.move")
 
     def test_slice_chain_of_aliases_then_matmul(self):
         """Demand propagates through a chain of SSA aliases, not just one hop.
