@@ -265,9 +265,10 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    split seeds/atomics, serial K tails, and former allocation-overflow plans have targeted silicon
    evidence. Promote representative cases into the persistent device surface and broaden the dtype,
    shape, and multi-root matrix before enabling the generic cube emitter without its current guard.
-   The current `496 passed / 6 failed` PTO Fusebox baseline still contains cube `2MM`, `REUSE` (two),
-   and `FDM` failures. Replace them with descriptor-matched emit-compatible assertions or explicit
-   buildability-decline checks; do not treat them as harmless closure noise.
+   After replacing two obsolete serial-vector DDR-floor checks, PTO Fusebox reports
+   `498 passed / 4 failed`: cube `2MM`, `REUSE` (two), and `FDM`. Replace those with
+   descriptor-matched emit-compatible assertions or explicit buildability-decline checks; do not
+   treat them as harmless closure noise.
 
 If exact replay is unavailable, strict mode fails with the rejected contract condition. Production
 mode partitions or falls back to standalone matmuls rather than silently emitting another
