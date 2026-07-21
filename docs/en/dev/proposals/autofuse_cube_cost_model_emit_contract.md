@@ -166,21 +166,63 @@ an unnecessary Mat→Vec move.
 
 ## 6. Current fidelity boundary
 
-The buildable subset now has one model/plan/emit algorithm. Remaining work is:
+The admitted exact/co-optimized subset has one model/plan/emit algorithm. The default analytic
+path is still a ranking surrogate and has several concrete fidelity gaps; it must not be described
+as an exact replay of the reconstructed winner. Remaining work, in priority order, is:
 
-1. **Non-uniform grids.** A lone split=1 matmul has an explicit `ClampedOverlap` plan: every task
+1. **Operation and handoff capability.** Pure-cube admission must use one candidate-invariant
+   capability descriptor shared by problem construction, both cost modes, and emit validation.
+   Today the adapter records non-default `a_trans`/`b_trans`/`c_matrix_nz` semantics but declines
+   them only for mixed groups, while cube replay hard-codes all three flags to false. A square
+   transposed matmul can therefore pass shape checks and silently change meaning. Operand dtype,
+   accumulator/storage dtype, and internal Acc->Mat conversion support are also checked too late:
+   analytic mode can rank an FP32 internal handoff that emission rejects. Decline every unsupported
+   case before solving, revalidate it at emission, and add pure-cube square transpose/layout,
+   analytic FP32-chain, and unsupported-dtype regressions. Split-K integer roots additionally need
+   a typed integer zero seed rather than `ConstFloat`.
+
+2. **Default analytic phase fidelity.** Replace the group-global
+   `max(sum(compute), sum(DDR))` with a sum of request-local phase roofs. Only each concrete rolled
+   K-window ring may overlap its next GM->L1 feed; request init, ragged tail, final drain, and the
+   next sequential matmul remain additive. Count boundary feeds and MTE1 extracts with the emitted
+   output/L0C-tile multiplicities and charge the split-K vector seed (fill, store, tasks, and wave).
+   Add opposite-bottleneck two-request, sub-base-tile traffic, serial-tail/drain, and analytic
+   split-versus-no-split regressions.
+
+3. **Cross-request boundary reuse.** Analytic `cube_request_reload()` currently deduplicates the
+   same boundary tensor/role across independent or fan-out matmul requests, but no group-level L1
+   lifetime exists and compiler validation declines the reconstructed group. Exact mode charges
+   repeated requests but reaches the same late validator. The immediate safe policy is to reject
+   that topology in PTO Fusebox before ranking and price repeated loads consistently. A future
+   optimization may add an explicit group-level shared-panel plan with preload position, consumers,
+   last use, bytes, and peak-L1 contribution; never deduplicate traffic without that descriptor.
+
+4. **Exact feasibility and objective scope.** Initial exact feasibility sizes boundary strips at
+   the whole requested M/N region before the smaller emitted output/L0C tile is chosen, so it can
+   conservatively reject legal low-task-count schedules. Solve output-tile and K-window feasibility
+   to a fixed point or use a safe child-tile strip for initial admission. Exact mode faithfully
+   replays the selected backend plan, but does not yet globally optimize every child L0 geometry,
+   K-window, and retention combination; keep it opt-in and describe it as exact replay rather than
+   a globally optimal emitted objective.
+
+5. **Non-uniform grids.** A lone split=1 matmul has an explicit `ClampedOverlap` plan: every task
    computes the maximum static region, clamps a ragged edge backward, and charges its repeated
    reads, MADs, and drain. Ragged split-K is rejected because overlapping edge regions would have
    multiple atomic owners. A valid M/N region with a sub-fractal edge is also rejected consistently
    by analytic and exact compiler modes until the shared L0 plan separates physical padding from
    valid extents. Multi-matmul groups remain uniform-only.
-2. **Retained boundary panels.** Exact/co-optimized mode now compares the four bounded retention
-   choices per request. A selected LHS or RHS is loaded once into L1, remains live through the
-   output-tile loop, and is locally extracted for each child; cost and emit use the same lifetime and
-   traffic. Analytic mode deliberately retains the prior repeated-load surrogate and emits no
-   retained panel. Device validation must confirm the predicted MTE2 reduction and silicon win
-   before retention is considered for the analytic default.
-3. **Runtime scheduling boundary.** A8/E12 pipe tracing confirms the nested cube phase equation and
+6. **Retained boundary panels.** Exact/co-optimized mode compares the four bounded retention choices
+   per request. A selected LHS or RHS is loaded once into L1, remains live through the output-tile
+   loop, and is locally extracted for each child; cost and emit use the same lifetime and traffic.
+   Descriptor-matched device validation confirmed the emitted request count and a 58.3% MTE2-byte
+   reduction (`786432 -> 327680`) with unchanged Matrix/FIXPIPE work, producing an approximately
+   17% execution-span win in the forced reuse-heavy case. A later bounded natural-plan study found
+   exact-mode retention on narrow/wide shapes and confirmed that the selected retained plans beat
+   their repeated-load controls. The remaining question is policy, not implementation correctness:
+   profile the exact evaluator and candidate hit rate, then either keep retention as the opt-in exact
+   mode or introduce a cheap analytic surrogate derived from the same child-tile reuse and L1
+   capacity conditions. Do not add a blanket reuse bonus.
+7. **Runtime scheduling boundary.** A8/E12 pipe tracing confirms the nested cube phase equation and
    the existing final `PIPE_ALL` barrier. A wider two-shape sweep then falsified a scalar
    per-work-unit correction: scheduler time was U-shaped with task count for `[272,272]`, but fell
    from 127 us to 33 us as fixed-shape `[512,512]` work was divided over more cores. A later
@@ -188,20 +230,44 @@ The buildable subset now has one model/plan/emit algorithm. Remaining work is:
    and 48 work units. Its linear per-task slope was approximately zero; silicon showed a small-count
    launch region, a flat 4–24 plateau, and a step at the second 24-core wave. Keep the current
    `ceil(work_units/24)` wave shape and add neither a scalar dispatch term nor vector C3.
-4. **Low-precision and integer envelope.** BF16/FP16 on-chip handoff is represented. Same-type FP32
-   internal storage declines. Other Acc→Mat conversion families require explicit PTO capability
-   descriptors before admission.
-5. **Device grounding.** A8/E12 validates descriptor consumption, exact per-task operand/FIXPIPE
-   bytes, nested MTE2/MTE1/Matrix/FIXPIPE execution, final-drain completion, and forced-grid ranking.
-   Extend the same evidence to internal narrowing, split seed/atomic behavior, retained panels, and
-   variable-shape schedules.
-6. **Evaluation cost and mode comparison.** An ephemeral L0-request memo reduced direct Release
+8. **Low-precision and integer envelope.** BF16/FP16 on-chip handoff is represented. Exact mode
+   declines same-type FP32 internal storage; the analytic pre-ranking gate is item 1. Other Acc→Mat
+   conversion families require explicit PTO capability descriptors before admission.
+9. **GM->L1 absolute pricing.** The flat 135 GiB/s term is not an accurate request-level transfer
+   law. Device microbenchmarks confirm a real ND->NZ inner-width effect, but the tested two-bandwidth
+   and shared-head descriptor models miss direct requests by 26--29% and fail their 10% transfer
+   gate. A corrected replay through the actual per-output-tile/K-window phase equation, with dynamic
+   request multiplicities, preserves the current B16 decision for every tested fixed-K problem.
+   Keep the flat term as the current ranking surrogate; revisit it only with a direct-request model
+   that passes held-out geometry/K tests and improves decisions among candidates for the *same*
+   matmul problem. Never pool different K problems into one argmin.
+10. **Evaluation cost and mode comparison.** An ephemeral L0-request memo reduced direct Release
    exact `best_cost()` measurements from roughly 13–54 ms to 2.2–9.4 ms on the sampled lone
    matmuls, and from roughly 22 ms to 2.3 ms on the sampled two-matmul chain. Analytic evaluation was
    roughly 0.1–3.8 ms. The memo lives only for one enumeration and never enters `CostResult` or the
    global search cache. Exact mode still constructs schedule descriptors in its candidate path;
    replace those with smaller scalar summaries if full-solver profiling shows they matter. Device
    A/B must measure whether lower outer-plan regret justifies the remaining prospective `-O3` cost.
+   Profile candidate count, derivation time, L0-memo hit rate, and cube-cost share in a full solver
+   run before optimizing isolated `best_cost()`. Emission also statically expands every output tile's
+   K loop even though cost compresses them into four counted variants; add PTOAS code-size and
+   compile-time gates, then use a runtime tile loop or explicit expansion limit if growth is material.
+
+11. **Ragged recursive grids.** Different M/N/K shapes, deep chains, produced operands on either
+   side, fan-out role changes, and multiple roots are already represented by the recursive request
+   DAG; they are not a missing "variable-shape" feature. The narrower unsupported case is a
+   non-uniform spatial grid for a multi-matmul group. Supporting it would require distinct valid and
+   physical edge regions to be propagated through every producer request, with matching L1
+   lifetimes and single-owner output semantics. Keep the current uniform-only admission unless
+   workloads demonstrate enough value to justify that additional plan and emit complexity.
+
+12. **Device/default closure.** Retained panels, clamped lone matmuls, recursive BF16/FP16 DAGs,
+   split seeds/atomics, serial K tails, and former allocation-overflow plans have targeted silicon
+   evidence. Promote representative cases into the persistent device surface and broaden the dtype,
+   shape, and multi-root matrix before enabling the generic cube emitter without its current guard.
+   The current `496 passed / 6 failed` PTO Fusebox baseline still contains cube `2MM`, `REUSE` (two),
+   and `FDM` failures. Replace them with descriptor-matched emit-compatible assertions or explicit
+   buildability-decline checks; do not treat them as harmless closure noise.
 
 If exact replay is unavailable, strict mode fails with the rejected contract condition. Production
 mode partitions or falls back to standalone matmuls rather than silently emitting another

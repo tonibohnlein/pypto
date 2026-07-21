@@ -321,18 +321,6 @@ The tall natural softmax is in the device-best cluster; exact softmax is 25.5% f
 high-mean Welford is correct and the zero-mean path is 24.7% faster than its cut.
 Cube G-A/ragged-K and recursive-plan correctness are also device-validated.
 
-**Current commit arc** (newest first): current uncommitted host batch = returned live-outs + explicit
-capabilities + dtype/lifetime UB + emitted ragged traffic + split fill waves + cache/search fixes ·
-`95e24c32`/`f7bea24b` explicit G6 seed cost + G10 column fits + G11 source coverage + exact-softmax
-default + candidate-hot metadata · G6 exact split admission ·
-`d8ca8a8f` G9
-row-aware reductions · PyPTO `45785941` G8 source-op replay · `ff706a94` G7 phase-work contract ·
-`e3acf3bc` mixed plans + G5 grids. Solver: `f71bd70` G6 exact split admission · `e566674` G9
-fit formulas · `45c82f0` G8
-source primitives · `0fff7d9` G7 P4 work · `e4616f3` mixed plans + G5 work units · `f4e76e4`
-recursive cube plans. Earlier vector-plan roots are `4ca1026` phase rooflines, `1fc542d` compact
-search cache, and `0e34918` authoritative plans.
-
 ---
 
 ## 6. The 4-review cycle (what it found and how we responded)
@@ -377,12 +365,14 @@ statistics update math remains deliberately algorithm-specific.
    topology and phase ordering are now precomputed, the 11-config P4 sweep is only a few microseconds,
    and `CostResult` still caches only scalar/config data. The end-to-end profile points to partition
    search/allocation; do not cache complete stream plans unless a new profile overturns that result.
-4. **Complete cube-only fidelity:** the role-aware `CubeSchedulePlan`, recursive uniform-grid emit,
-   phase-local K-window cost, split seed/tasks, emitted reload multiplicity, and lone clamped-overlap
-   grids are implemented (§8). Nested pipe/FIXPIPE behavior and the 24-core wave shape are
-   device-grounded. Exact mode now models and emits retained boundary panels; device-ground their
-   MTE2 reduction and ranking before considering analytic-default retention or variable-shape
-   multi-op grids.
+4. **Close cube-only rollout policy:** the role-aware `CubeSchedulePlan`, heterogeneous recursive
+   uniform-grid emit, exact phase-local K-window/seed cost, emitted reload multiplicity, lone
+   clamped-overlap grids, and exact retained panels are implemented (§8). Nested pipe/FIXPIPE
+   behavior, the 24-core wave shape, and retained-panel traffic/profitability are device-grounded.
+   Before rollout, close pure-cube semantic/dtype admission, duplicate boundary-request feasibility,
+   and the analytic global-roofline/seed/tile-multiplicity gaps. Then profile exact search cost and
+   retention hit rate. Keep ragged recursive multi-op grids uniform-only unless workloads justify
+   edge-specific request propagation.
 5. **Complete mixed fidelity:** make the plan choose a real pipeline-item axis and active-group
    count, replace global-tile overlap with serial-versus-realizable phase costs, then implement the
    one-way and single-round-trip emit through `ExpandMixedKernel` → `InjectGMPipeBuffer` →
@@ -427,58 +417,64 @@ term is measured; using phase granularity alone would falsely prefer baseK=16.
 
 **Dtype contract.** BF16/FP16 operands accumulate in FP32 L0C. An internal producer narrows once to
 BF16/FP16 Mat, matching PTO's fused-chain kernel; roots narrow/store to their declared output.
-Same-type FP32 internal L1 handoff is not an A2/A3 instruction, so an explicitly FP32 chain is
-partitioned into standalone kernels. Direct Mat→GM store is legal and no longer detours through Vec.
+Same-type FP32 internal L1 handoff is not an A2/A3 instruction. Exact mode declines it; analytic
+currently ranks then falls back, which is a TODO below. Direct Mat→GM store is legal.
 
-**Host validation.** PTO Fusebox reports 489 passing checks with the same six documented baseline
+**Host validation.** PTO Fusebox reports 496 passing checks with the same six documented baseline
 failures; the full AutoFuse file reports 56 passing tests. Compiler coverage includes
-natural/forced lone matmuls, BF16 recursive trees/fan-out/deep
-chains, FP32-chain decline, split seed, ragged K, multi-window output residency, a 192 KiB internal
-region, descriptor consumption, Torch numerics, and PTOAS-backed full lowering. The former strict
-chained-matmul xfail now passes.
+natural/forced lone matmuls, BF16 recursive trees/fan-out/deep chains, FP32-chain decline, split seed,
+ragged K, multi-window output residency, a 192 KiB internal region, descriptor consumption, Torch
+numerics, and PTOAS-backed full lowering. The former strict chained-matmul xfail now passes.
 
 The latest host closure fixes two compiler-side lifetime mismatches without changing cube costs.
-Pipeline peeling is simplified before memory materialization so a constant-dead branch cannot
-allocate a second persistent L0C accumulator. Serial child init/tail extracts retain program order
-and reuse a rolled Left/Right bank instead of being hoisted into an enclosing GM→L1 prefetch tier.
+Early simplification prevents a dead branch from allocating another persistent L0C accumulator;
+serial child init/tail extracts keep order and reuse a rolled Left/Right bank instead of entering
+an enclosing GM→L1 prefetch tier.
 The formerly failing exact A4, B16/B24/B48, and split-K S16/S32 candidates now reach final allocation
 with one accumulator and the planned two-bank operand ring.
 
 **Silicon isolation.** The forced pure-cube `[192,64]@[64,256]` four-window schedule now passes on
 910B2 with 48 logical AIC blocks. The same producer followed by a separate AIV bias epilogue still
-fails, even at 12 blocks and with a single K window. DFX proves the shared allocation and covered
-AIC→AIV dependency are present, so that residual is a mixed/orchestration FIXPIPE-visibility issue,
-not a cube-only schedule blocker. Cube-only correctness and ranking work proceeds independently.
+fails at 12 blocks and one K window. DFX proves the allocation and covered AIC→AIV dependency, so
+that residual is a mixed/orchestration FIXPIPE-visibility issue, not a cube-only schedule blocker.
 
-**Silicon ranking.** The clamped A8/E12 comparison keeps analytic as the default: A8 is 7.3%
-faster under the measured scheduler/orchestration execution span, while exact selects E12. Both
-modes emit a byte-identical binary for a fixed outer grid, so the difference is entirely the cost
-decision. MTE2 is the critical per-task pipe, but E12's simulated task is 24% shorter; the final
-TSTORE is already followed by `PIPE_ALL`, whose cycles match FIXPIPE, and a second barrier is free.
-The measured A8/E12 difference is contained in the AICPU scheduler span, but it does not generalize
-to a per-work-unit constant. Across a wider sweep the 272 family was U-shaped, while the 512 family
-became faster as work was divided over more tasks; per-core kernel work and occupancy were still
-confounded. Exact remains incomplete at the system boundary, not wrong about the cube algorithm,
-but no scalar correction is supported.
+**Silicon ranking.** For clamped A8/E12, analytic selects device-best A8 while exact selects E12,
+which is 7.3% slower. A fixed grid emits a byte-identical binary in both modes. MTE2 is the critical
+per-task pipe and the final TSTORE already has a complete `PIPE_ALL` drain; the difference appears
+in the runtime scheduler span. Wider sweeps found no transferable per-task correction: one family
+was U-shaped while another improved with more tasks. Exact remains incomplete at this system
+boundary, but no scalar correction is supported.
 
 **Remaining gaps:**
 
-1. Non-uniform buildable cost/emission: lone split=1 now uses an explicit `ClampedOverlap` plan and
-   prices every maximum-shape task; ragged split-K, sub-fractal valid M/N edges, and unequal
-   multi-op grids decline. Analytic and exact compiler modes share that buildability gate.
-2. Retained boundary panels: exact mode compares none/LHS/RHS/both, adds the selected full-panel
-   preload as a serial phase, keeps it live in L1 across the output-tile loop, and emits local
-   extracts instead of repeated GM loads. Device-check MTE2 bytes and retained-vs-baseline ranking;
-   analytic mode intentionally remains unchanged.
-3. The constant-tile, constant-K sweep found no scalar per-task term. Keep the existing
+1. Add one candidate-invariant homogeneous cube capability descriptor. Reject unsupported
+   transpose/layout, operand dtype, and Acc→Mat cases before solving and recheck at emit; use a typed
+   integer zero for an INT8→INT32 split seed.
+2. Make analytic cost follow emission: sum request-local phase roofs, add serial init/tail/drains and
+   the split seed, and count GM→L1/MTE1 at emitted output-tile multiplicity. Do not deduplicate a
+   boundary request across matmuls without a group-level shared-L1 lifetime; otherwise reject it
+   before ranking.
+3. Exact initial L1 feasibility uses whole-request M/N before output subtiles are known, so couple
+   child-tile and K-window feasibility before pursuing broader exact-mode ranking.
+4. Non-uniform buildable cost/emission: lone split=1 has `ClampedOverlap`; ragged split-K,
+   sub-fractal valid M/N edges, and unequal multi-op grids decline consistently.
+5. Exact retention compares none/LHS/RHS/both, serially preloads the panel, keeps it live across the
+   output-tile loop, and emits local extracts. Device evidence confirms byte-exact traffic and a
+   resolved reuse win, including bounded natural plans. Profile evaluation cost and hit rate before
+   keeping it exact-only or adding a cheap analytic surrogate; analytic remains unchanged today.
+6. The constant-tile, constant-K sweep found no scalar per-task term. Keep the existing
    `ceil(work_units/24)` wave shape; the remaining small-count/within-wave queue effects are too
    small and nonlinear to fit, and vector C3 remains separate.
-4. Expand the Acc→Mat capability table beyond BF16/FP16 only when PTO supports the exact conversion.
-5. Improve the analytic reload/extract surrogate and remove full plan construction from the exact
-   candidate hot path after dispatch grounding; exact added about 1 ms to the full compiler pipeline.
-6. Extend the closed A8/E12 pipe trace to retained-panel, variable-shape, narrowing, and split-atomic
-   candidates on 910B2 with the latest PTOAS.
-7. Profile and optimize buildable cube candidate evaluation after fidelity closure.
+7. Keep the flat GM->L1 bandwidth term as a ranking surrogate, not a request-accurate transfer law.
+   The measured 256-byte class is real, but the tested compact replacements fail direct prediction;
+   a faithful dynamic phase replay changes none of the tested fixed-K B16 decisions. Revisit only
+   with a direct model that generalizes and improves within-problem ranking.
+8. Different M/N/K shapes and recursive roles are supported. Ragged multi-matmul grids would need
+   edge-specific valid/physical regions and lifetimes propagated through the request DAG.
+9. Remove full plan construction from the exact candidate hot path only if full-solver profiling
+   shows it matters; exact added about 1 ms to the measured full compiler pipeline. Promote
+   retained, narrowing, split-atomic, and heterogeneous recursive cases into the persistent 910B2
+   device surface before relaxing the generic cube-emitter guard.
 
 The authoritative obligation table and validation ladder are in
 `docs/en/dev/proposals/autofuse_cube_cost_model_emit_contract.md`.
