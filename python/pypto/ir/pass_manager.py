@@ -510,6 +510,10 @@ class PassManager:
         reuse_recognizer = (
             ctx.get_dsa_reuse_penalty_recognizer() if ctx else passes.DsaReusePenaltyRecognizer.DISABLED
         )
+        reference_placement = (
+            ctx.get_dsa_reference_placement() if ctx else passes.DsaReferencePlacement.DEFAULT
+        )
+        reference_target = ctx.get_dsa_reference_target() if ctx else None
         if outer_phase == passes.DiagnosticPhase.POST_PASS:
             inner_phase = passes.DiagnosticPhase.PRE_PIPELINE
         else:
@@ -525,6 +529,8 @@ class PassManager:
             dsa_export_dir,
             dsa_solution_dir,
             reuse_recognizer,
+            reference_placement,
+            reference_target,
         ):
             try:
                 return self._pipeline.run(input_ir)
@@ -566,6 +572,10 @@ class PassManager:
         reuse_recognizer = (
             ctx.get_dsa_reuse_penalty_recognizer() if ctx else passes.DsaReusePenaltyRecognizer.DISABLED
         )
+        reference_placement = (
+            ctx.get_dsa_reference_placement() if ctx else passes.DsaReferencePlacement.DEFAULT
+        )
+        reference_target = ctx.get_dsa_reference_target() if ctx else None
         if ctx:
             disabled = ctx.get_disabled_diagnostics()
         else:
@@ -582,6 +592,8 @@ class PassManager:
             dsa_export_dir,
             dsa_solution_dir,
             reuse_recognizer,
+            reference_placement,
+            reference_target,
         ):
             try:
                 return self._pipeline.run(input_ir)
