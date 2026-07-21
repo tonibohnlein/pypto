@@ -420,8 +420,8 @@ BF16/FP16 Mat, matching PTO's fused-chain kernel; roots narrow/store to their de
 Same-type FP32 internal L1 handoff is not an A2/A3 instruction. Exact mode declines it; analytic
 currently ranks then falls back, which is a TODO below. Direct Mat→GM store is legal.
 
-**Host validation.** PTO Fusebox reports 496 passing checks with the same six documented baseline
-failures; the full AutoFuse file reports 56 passing tests. Compiler coverage includes
+**Host validation.** PTO Fusebox reports 498 passing checks with four cube review failures; the full
+AutoFuse file reports 56 passing tests. Compiler coverage includes
 natural/forced lone matmuls, BF16 recursive trees/fan-out/deep chains, FP32-chain decline, split seed,
 ragged K, multi-window output residency, a 192 KiB internal region, descriptor consumption, Torch
 numerics, and PTOAS-backed full lowering. The former strict chained-matmul xfail now passes.
