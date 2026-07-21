@@ -460,6 +460,44 @@ class TestSpmdForLoop:
         walk(spmd.body)
         assert not found_incore, "with-form should not insert an implicit InCoreScopeStmt"
 
+    def test_with_spmd_outlined_multi_result_dispatch_round_trips(self):
+        """A call plus direct tuple unpack remains a direct SPMD dispatch."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out0: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[512, 128], pl.FP32], pl.Tensor[[512, 128], pl.FP32]]:
+                i = pl.tile.get_block_idx()
+                tile = pl.load(a, [i * 128, 0], [128, 128])
+                out0 = pl.store(tile, [i * 128, 0], out0)
+                out1 = pl.store(pl.add(tile, tile), [i * 128, 0], out1)
+                return out0, out1
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out0: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[512, 128], pl.FP32], pl.Tensor[[512, 128], pl.FP32]]:
+                with pl.spmd(4):
+                    result = self.kernel(a, out0, out1)
+                    out0 = result[0]
+                    out1 = result[1]
+                return out0, out1
+
+        main_func = Prog.functions[list(Prog.functions.keys())[-1]]
+        spmd = self._unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        assert not any(isinstance(stmt, ir.InCoreScopeStmt) for stmt in spmd.body.stmts)
+
+        Reparsed = pl.parse_program(Prog.as_python())
+        ir.assert_structural_equal(Prog, Reparsed)
+
     def test_for_spmd_rejects_tuple_target(self):
         """A tuple target on for-spmd is rejected (single loop var only)."""
         with pytest.raises(ParserSyntaxError, match="single loop variable"):

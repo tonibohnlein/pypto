@@ -212,6 +212,27 @@ class TestOutlineIncoreScopes:
 
         ir.assert_structural_equal(After, Expected)
 
+    def test_outlined_spmd_multiple_outputs_round_trip(self):
+        """Outlined call-plus-unpack SPMD bodies remain printable and parseable."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32]
+            ) -> tuple[pl.Tensor[[64], pl.FP32], pl.Tensor[[64], pl.FP32]]:
+                with pl.spmd(4):
+                    _ = pl.tile.get_block_idx()
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                    z: pl.Tensor[[64], pl.FP32] = pl.mul(x, x)
+                return y, z
+
+        before_ssa = passes.convert_to_ssa()(Before)
+        after = passes.outline_incore_scopes()(before_ssa)
+        reparsed = pl.parse_program(after.as_python())
+
+        ir.assert_structural_equal(after, reparsed)
+
     def test_nested_incore_scopes_rejected_by_verifier(self):
         """Nested InCore scopes are rejected by the NoNestedInCore structural verifier."""
 

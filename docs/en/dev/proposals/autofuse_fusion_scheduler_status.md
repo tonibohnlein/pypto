@@ -390,10 +390,12 @@ ragged-K peel lowering test + deep-T decline logging; mixed cube+vector (a separ
 The cube path now has the same solver-owned-plan discipline as the vector path, split across two
 hardware levels.
 
-**`CubeSchedulePlan` (cross-core and GM/L1).** The plan records exact spatial/split work units,
-recursive producer requests, L1 pebble lifetimes, per-request GM K windows, output/L0C variants,
-final drains, and the split seed. The request topology is built once in `create()`; the full plan is
-reconstructed for a winning/forced configuration and is not stored in `CostResult`.
+**`CubeSchedulePlan` (cross-core and GM/L1).** It records spatial/split work units, recursive
+requests, produced/boundary-input L1 lifetimes, K windows, output variants, drains, and split seed.
+Repeated inputs have first/last-use residency; role keeps `A @ A` LHS/RHS separate. Topology is built once in `create()` and the full plan is reconstructed only for a winner/force, never in `CostResult`.
+
+**Ordering policy.** Source and cube role-expanded DAGs use one `PebblingOrderStrategy` interface.
+DFS is current; always-retain declines over-capacity candidates. Reuse-distance/Gorder-like policies, reload alternatives, and vector replay remain future work.
 
 **`L0MatmulPlan` (L1/L0).** Cube costing now has two modes. The default analytic mode ranks outer
 plans with the grounded fixed-base-tile cube/MTE1 surrogate and attaches only the semantic
@@ -420,11 +422,9 @@ BF16/FP16 Mat, matching PTO's fused-chain kernel; roots narrow/store to their de
 Same-type FP32 internal L1 handoff is not an A2/A3 instruction. Exact mode declines it; analytic
 currently ranks then falls back, which is a TODO below. Direct Mat→GM store is legal.
 
-**Host validation.** PTO Fusebox reports 498 passing checks with four cube review failures; the full
-AutoFuse file reports 56 passing tests. Compiler coverage includes
-natural/forced lone matmuls, BF16 recursive trees/fan-out/deep chains, FP32-chain decline, split seed,
-ragged K, multi-window output residency, a 192 KiB internal region, descriptor consumption, Torch
-numerics, and PTOAS-backed full lowering. The former strict chained-matmul xfail now passes.
+**Host validation.** PTO Fusebox reports 507 passing checks with one `FDM` analytic-ranking failure;
+AutoFuse reports 58. Coverage includes recursive BF16 DAGs, split/ragged K, multi-window and shared-
+boundary residency, multi-role `A @ A`, Torch numerics, and PTOAS lowering. Parser/outliner reports 126, including multi-output SPMD round-trip.
 
 The latest host closure fixes two compiler-side lifetime mismatches without changing cube costs.
 Early simplification prevents a dead branch from allocating another persistent L0C accumulator;
@@ -451,9 +451,9 @@ boundary, but no scalar correction is supported.
    transpose/layout, operand dtype, and Acc→Mat cases before solving and recheck at emit; use a typed
    integer zero for an INT8→INT32 split seed.
 2. Make analytic cost follow emission: sum request-local phase roofs, add serial init/tail/drains and
-   the split seed, and count GM→L1/MTE1 at emitted output-tile multiplicity. Do not deduplicate a
-   boundary request across matmuls without a group-level shared-L1 lifetime; otherwise reject it
-   before ranking.
+   the split seed, and count GM→L1/MTE1 at emitted output-tile multiplicity. Shared boundary inputs
+   now have an explicit first/last-use L1 plan and one emitted preload; keep that descriptor and
+   traffic identical when replacing the global analytic roofline.
 3. Exact initial L1 feasibility uses whole-request M/N before output subtiles are known, so couple
    child-tile and K-window feasibility before pursuing broader exact-mode ranking.
 4. Non-uniform buildable cost/emission: lone split=1 has `ClampedOverlap`; ragged split-K,
@@ -471,7 +471,8 @@ boundary, but no scalar correction is supported.
    with a direct model that generalizes and improves within-problem ranking.
 8. Different M/N/K shapes and recursive roles are supported. Ragged multi-matmul grids would need
    edge-specific valid/physical regions and lifetimes propagated through the request DAG.
-9. Remove full plan construction from the exact candidate hot path only if full-solver profiling
+9. Compare always-retain with reload alternatives, add reuse-distance/Gorder-like ordering, and apply the common lifetime abstraction to vector as a separate tested increment.
+10. Remove full plan construction from the exact candidate hot path only if full-solver profiling
    shows it matters; exact added about 1 ms to the measured full compiler pipeline. Promote
    retained, narrowing, split-atomic, and heterogeneous recursive cases into the persistent 910B2
    device surface before relaxing the generic cube-emitter guard.

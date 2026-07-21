@@ -3861,6 +3861,56 @@ class ASTParser:
                         return True
         return False
 
+    @staticmethod
+    def _spmd_body_is_call_unpack(body: "list[ast.stmt]") -> bool:
+        """Recognize the canonical outlined multi-result dispatch body.
+
+        ``OutlineIncoreScopes`` represents a multi-result call as one temporary
+        followed only by direct ``tmp[i]`` assignments.  The callee owns the
+        block-index-dependent work, just as in the historical single-call form;
+        the trailing statements merely unpack its result and must not cause the
+        parser to wrap the dispatch in another InCore scope.
+        """
+        if len(body) < 2:
+            return False
+
+        first = body[0]
+        if isinstance(first, ast.Assign):
+            if len(first.targets) != 1 or not isinstance(first.targets[0], ast.Name):
+                return False
+            result_name = first.targets[0].id
+            first_value = first.value
+        elif isinstance(first, ast.AnnAssign):
+            if not isinstance(first.target, ast.Name):
+                return False
+            result_name = first.target.id
+            first_value = first.value
+        else:
+            return False
+        if not isinstance(first_value, ast.Call):
+            return False
+
+        for unpack in body[1:]:
+            if isinstance(unpack, ast.Assign):
+                if len(unpack.targets) != 1 or not isinstance(unpack.targets[0], ast.Name):
+                    return False
+                value = unpack.value
+            elif isinstance(unpack, ast.AnnAssign):
+                if not isinstance(unpack.target, ast.Name):
+                    return False
+                value = unpack.value
+            else:
+                return False
+            if not (
+                isinstance(value, ast.Subscript)
+                and isinstance(value.value, ast.Name)
+                and value.value.id == result_name
+                and isinstance(value.slice, ast.Constant)
+                and isinstance(value.slice.value, int)
+            ):
+                return False
+        return True
+
     def _emit_spmd_body(  # noqa: PLR0913 — args map 1:1 to the SpmdScopeStmt fields
         self,
         stmt: ast.With,
@@ -3878,12 +3928,11 @@ class ASTParser:
         The two forms differ only in ``scope_attrs`` (the ``as tid`` form adds
         ``task_id_var`` / ``manual_dep_edges``); the body dispatch is identical:
 
-        * single call + no split → ``SpmdScopeStmt(body=Call)`` with no inner InCore
-          wrapper — the historical direct-dispatch shape (the callee is a pre-defined
-          kernel that reads the block index internally). This is also the shape
-          ``OutlineIncoreScopes`` leaves behind once an inline body is outlined, so
-          the IR round-trips identically across passes.
-        * inline multi-statement body, or single-call + split → wrap in
+        * direct dispatch + no split → no inner InCore wrapper. This includes the
+          historical single-call shape and the canonical outlined multi-result
+          shape (one call followed only by direct tuple-element assignments); the
+          pre-defined callee reads the block index internally.
+        * other inline multi-statement bodies, or direct dispatch + split → wrap in
           ``InCoreScopeStmt(split, <body>)`` for ``OutlineIncoreScopes`` to outline
           into a synthetic per-block kernel, exactly like ``for i in pl.spmd(n):``.
           Such an inline body must read the per-block index (see below).
@@ -3895,11 +3944,12 @@ class ASTParser:
         is_single_call = isinstance(body_stmt, (ast.Assign, ast.AnnAssign, ast.Expr)) and isinstance(
             body_stmt.value, ast.Call
         )
-        # An inline (auto-outlined) body must read the per-block index — the
-        # single-call dispatch is exempt (its callee reads it internally). Unlike
-        # the for-form, the with-forms do not bind the index for you, so require an
-        # explicit ``pl.tile.get_block_idx()`` somewhere in the body.
-        if not is_single_call and not self._spmd_body_reads_block_idx(stmt.body):
+        is_direct_dispatch = is_single_call or self._spmd_body_is_call_unpack(stmt.body)
+        # An inline (auto-outlined) body must read the per-block index. Canonical
+        # direct dispatch is exempt because the callee reads it internally.
+        # Unlike the for-form, the with-forms do not bind the index for you, so
+        # require an explicit ``pl.tile.get_block_idx()`` somewhere in the body.
+        if not is_direct_dispatch and not self._spmd_body_reads_block_idx(stmt.body):
             raise ParserSyntaxError(
                 "inline `with pl.spmd(...)` body must read the per-block index via "
                 "`pl.tile.get_block_idx()`; without it every block runs identical work.",
@@ -3907,8 +3957,8 @@ class ASTParser:
                 hint="Add `i = pl.tile.get_block_idx()` inside the scope, or use "
                 "`for i in pl.spmd(n):` to bind the block index automatically.",
             )
-        if is_single_call and split_mode is None:
-            # Historical no-InCore-wrapper shape. Any ``scope_attrs``
+        if is_direct_dispatch and split_mode is None:
+            # Canonical no-InCore-wrapper shape. Any ``scope_attrs``
             # (allow_early_resolve, and for the ``as tid`` form task_id_var /
             # manual_dep_edges) ride on the SpmdScopeStmt.
             self._parse_scope_body(

@@ -26,6 +26,7 @@ Cube evaluation has two deliberate optimization modes:
 
 - spatial regions and split-K work units;
 - recursive producer requests and their L1 lifetimes;
+- boundary inputs resident from their first request through their last compatible consumer;
 - optional boundary panels retained in L1 across one request's output-tile loop;
 - each matmul's GM→L1 K window, chunk, init, rolled loop, and tail;
 - the L0C-resident output-tile grid;
@@ -53,12 +54,12 @@ extracts, cube operations, and low-level drains; in exact mode it also fails on 
 | C1 | `parts_m × parts_n × split_k` independent work units | Launch exactly that SPMD grid; use disjoint ownership, except for the explicit split=1 idempotent clamped-overlap policy |
 | C2 | Only boundary tensors touch GM | Keep every supported intermediate in L1; never use GM as an implicit fused-chain buffer |
 | C3 | Consumers back-propagate exact row/column requests | Slice LHS as `[requested rows,K]` and RHS as `[K,requested cols]`, including produced operands on either side |
-| C4 | Peak L1 is the request-order pebble peak | Replay producer-before-consumer, retain through the priced last use, and allocate no unpriced scratch |
+| C4 | Peak L1 is the request-order pebble peak for produced values and boundary inputs | Replay producer-before-consumer, preload repeated compatible inputs at first use, retain every value through its priced last use, and allocate no unpriced scratch |
 | C5 | Every request owns its GM→L1 K loop | Use that request's contraction, chunk, rolled stage, and serial tail |
 | C6 | One complete output tile remains in L0C across all K windows | Nest output tiles outside the K-window loop; never spill a partial to Mat and reload it into Acc |
 | C7 | Exact mode prices a concrete shared-backend L0 plan; analytic mode prices the grounded surrogate | Always attach the output-residency intent; attach and validate detailed geometry only in exact mode; let `AutoTileMatmulL0` realize both |
 | C8 | Overlap is local to one concrete full-window loop | Put K=0 and every rolled full window in the same eligible stage ring; add only its fill/drain, the ragged tail, and final output drain serially |
-| C9 | GM traffic follows the emitted output-tile loop | Charge repeated boundary-panel loads by default; when the plan selects retention, add one serial GM→L1 preload, keep that panel live, and remove only its represented per-tile feeds |
+| C9 | GM traffic follows the emitted request and output-tile loops | Give a repeated compatible boundary value one serial group preload; otherwise charge repeated per-tile feeds, except for an explicitly selected request-local retained panel |
 | C10 | Split-K writes `S` atomic partials | Emit one ordered, tiled zero seed and `S` disjoint K shares, or select `S=1` |
 | C11 | Cube accumulation dtype differs from storage dtype | Accumulate float inputs in FP32, then narrow once at the planned BF16/FP16 or GM drain |
 
@@ -110,10 +111,22 @@ both inputs produced, fan-out role changes, and multiple roots. Distinct request
 distinct producer instances and pay recomputation; identical instances are shared in the request
 DAG.
 
+Request ordering goes through the common `PebblingOrderStrategy` interface. The current strategy is
+deterministic DFS postorder for both the source-op DAG and cube's role-expanded request DAG. This
+keeps ordering policy separate from lifetime accounting so a reuse-distance or Gorder-like strategy
+can be evaluated later without changing cost or emit semantics.
+
+Boundary-input identity is `(source tensor, requested region, dtype, memory pool, operand role)`.
+The role is load-bearing: two matmuls requesting the same LHS slice may share it, while `A @ A`
+produces distinct LHS and RHS values because they require different L1 representations. Repeated
+compatible inputs receive an always-retained lifetime from first to last request. Produced values
+use the same first-use/last-use pebbling principle. Both contribute to one request-order L1 peak.
+
 For every request, the plan records:
 
 - concrete input/output regions and symbolic axis bindings;
 - producer-instance dependencies and storage/accumulator dtypes;
+- group-resident boundary descriptors with role, first/last use, use count, region, and exact bytes;
 - the GM→L1 K-loop descriptor;
 - an optional retained-LHS/retained-RHS descriptor with exact L1 bytes;
 - up to four L0 output variants: full/full, tail/full, full/tail, and tail/tail;
@@ -130,7 +143,8 @@ In **exact mode**, the buildable uniform-grid cost is the sum of the emitted pha
 variant:
 
 ```text
-retained panels = one serial full-panel GM->L1 preload per selected side
+group residents = one serial GM->L1 preload at first use, live through last use
+retained panels = one serial full-panel GM->L1 preload per request-local selected side
 full K windows  = first feed + max(first child, next feed)
                   + (Q-2) * max(rolled child, next feed) + last child
 K tail          = GM feed + child L0 wall
@@ -153,7 +167,9 @@ phase wall is used when composing the hierarchical cube candidate cost.
 The emitter replays the same algorithm:
 
 - one SPMD body per uniform spatial/split work unit;
-- selected boundary panels loaded once to L1 before the request's output-tile loop;
+- repeated compatible boundary values loaded once at their planned first use and reused by every
+  request through their planned last use;
+- request-local retained panels loaded once before that request's output-tile loop;
 - output/L0C tile outer, GM K-window inner;
 - one stage-2 full-window ring whose K=0 arm is `matmul` and later arms are
   `matmul_acc`, followed by a serial K tail;
@@ -189,13 +205,16 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    Add opposite-bottleneck two-request, sub-base-tile traffic, serial-tail/drain, and analytic
    split-versus-no-split regressions.
 
-3. **Cross-request boundary reuse.** Analytic `cube_request_reload()` currently deduplicates the
-   same boundary tensor/role across independent or fan-out matmul requests, but no group-level L1
-   lifetime exists and compiler validation declines the reconstructed group. Exact mode charges
-   repeated requests but reaches the same late validator. The immediate safe policy is to reject
-   that topology in PTO Fusebox before ranking and price repeated loads consistently. A future
-   optimization may add an explicit group-level shared-panel plan with preload position, consumers,
-   last use, bytes, and peak-L1 contribution; never deduplicate traffic without that descriptor.
+3. **Requested-value pebbling policy.** Cross-request boundary reuse now has an explicit
+   `CubeResidentBoundaryPlan`: compatible repeated inputs are preloaded at first use, retained until
+   last use, included in peak L1, omitted from later GM feeds, and replayed by emission. Canonical
+   identity includes operand role, so `A @ A` cannot alias its LHS and RHS representations. The
+   initial policy always retains a repeated compatible value and declines the candidate if the
+   combined produced/input lifetime peak does not fit. A later optimization may compare spill/reload
+   alternatives. The shared order interface currently uses DFS; add and silicon-compare a
+   reuse-distance/Gorder-like policy before changing it. The common ordering/lifetime abstraction
+   is available to vector and cube scheduling, but group-resident replay is implemented only for
+   cube today; vector integration remains a separate tested increment.
 
 4. **Exact feasibility and objective scope.** Initial exact feasibility sizes boundary strips at
    the whole requested M/N region before the smaller emitted output/L0C tile is chosen, so it can
@@ -265,10 +284,10 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    split seeds/atomics, serial K tails, and former allocation-overflow plans have targeted silicon
    evidence. Promote representative cases into the persistent device surface and broaden the dtype,
    shape, and multi-root matrix before enabling the generic cube emitter without its current guard.
-   After replacing two obsolete serial-vector DDR-floor checks, PTO Fusebox reports
-   `498 passed / 4 failed`: cube `2MM`, `REUSE` (two), and `FDM`. Replace those with
-   descriptor-matched emit-compatible assertions or explicit buildability-decline checks; do not
-   treat them as harmless closure noise.
+   PTO Fusebox now reports `507 passed / 1 failed`. The stale `2MM`/`REUSE` assertions were replaced
+   by descriptor-level `[CUBERES]` checks for one request, exact lifetime/bytes, role separation,
+   and capacity decline. The remaining `FDM` failure is a real analytic ranking gap for a wide
+   intermediate, not shared-boundary model/emit debt.
 
 If exact replay is unavailable, strict mode fails with the rejected contract condition. Production
 mode partitions or falls back to standalone matmuls rather than silently emitting another

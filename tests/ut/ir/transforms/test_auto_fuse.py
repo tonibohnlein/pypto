@@ -829,18 +829,20 @@ class TestAutoFuse:
         aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
         assert len(aic) == 2, [f.name for _, f in lowered.functions.items()]
 
-    def test_declined_cube_plan_materializes_each_fallback_matmul(self, ascend_backend, monkeypatch):
-        """A plan replay decline cannot leave several matmuls in one AIC scope.
+    def test_cube_plan_reuses_shared_boundary_across_requests(self, ascend_backend, monkeypatch):
+        """A shared boundary region is loaded once and lives through its last use.
 
-        The two roots request the same boundary RHS in the same role.  Until a
-        shared-panel lifetime is represented, the exact cube-plan emitter
-        declines that group.  Each fallback matmul must then be a separate
-        kernel so the BF16 intermediate is stored/narrowed and reloaded; directly
-        forwarding its FP32 L0C result to a BF16 consumer is ill-typed.
+        Both roots consume the same produced ``t`` and the same boundary RHS
+        ``d``.  The role-expanded pebbling plan keeps one canonical RHS Mat
+        value across the two consumer requests; the emitter replays all three
+        matmuls in one AIC kernel instead of silently reloading ``d`` or cutting
+        the group.
         """
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
         monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
         monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
 
         @pl.program
         class Prog:
@@ -856,9 +858,77 @@ class TestAutoFuse:
                 e: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(t, d)
                 return c, e
 
+        planned = passes.auto_fuse()(Prog)
+        body = next(f for _, f in planned.functions.items() if f.name == "chain").as_python()
+        assert body.count("pl.spmd(") == 1, body
+        assert body.count("pl.tensor.matmul(") == 3, body
+        resident_defs = [
+            line
+            for line in body.splitlines()
+            if "_resident_" in line.partition(":")[0] and "pl.tensor.slice" in line
+        ]
+        assert len(resident_defs) == 1 and "_rhs_l1" in resident_defs[0], body
+
+        namespace = {}
+        exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        a = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        b = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        d = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        t = a @ b
+        actual_c, actual_e = namespace["chain"](a, b, d)
+        expected = t @ d
+        assert torch.allclose(actual_c, expected, rtol=1e-3, atol=1e-3)
+        assert torch.allclose(actual_e, expected, rtol=1e-3, atol=1e-3)
+
         lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
-        assert len(aic) == 3, [f.name for _, f in lowered.functions.items()]
+        assert len(aic) == 1, [f.name for _, f in lowered.functions.items()]
+
+    def test_cube_plan_keeps_lhs_rhs_boundary_roles_distinct(self, ascend_backend, monkeypatch, tmp_path):
+        """The two representations of a boundary used by ``A @ A`` do not alias."""
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def square(
+                self, a: pl.Tensor[[64, 64], pl.BF16]
+            ) -> tuple[pl.Tensor[[64, 64], pl.BF16], pl.Tensor[[64, 64], pl.BF16]]:
+                c: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(a, a)
+                d: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(a, a)
+                return c, d
+
+        planned = passes.auto_fuse()(Prog)
+        dag = json.loads((tmp_path / "square.dag.json").read_text())
+        assert all(len(inputs) == 2 and inputs[0] == inputs[1] for inputs in dag["inputs"]), dag
+        body = next(f for _, f in planned.functions.items() if f.name == "square").as_python()
+        resident_defs = [
+            line
+            for line in body.splitlines()
+            if "_resident_" in line.partition(":")[0] and "pl.tensor.slice" in line
+        ]
+        assert len(resident_defs) == 2, body
+        assert any("_lhs_l1" in line for line in resident_defs), body
+        assert any("_rhs_l1" in line for line in resident_defs), body
+
+        namespace = {}
+        exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        a = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        actual_c, actual_d = namespace["square"](a)
+        expected = a @ a
+        assert torch.allclose(actual_c, expected, rtol=1e-3, atol=1e-3)
+        assert torch.allclose(actual_d, expected, rtol=1e-3, atol=1e-3)
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
+        assert len(aic) == 1, [f.name for _, f in lowered.functions.items()]
 
     def test_chained_matmul_preserves_operand_input_order(self, tmp_path, monkeypatch):
         """Regression: the solver Problem must list each matmul's inputs in OPERAND

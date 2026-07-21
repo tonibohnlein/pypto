@@ -1000,9 +1000,13 @@ class ProblemBuilder {
       sop.vec_fixed = VecOpFixed(call);  // per-op head+tail (vadd 24 / vexp 31 / vdiv 30 / ...)
       // Inputs in OPERAND ORDER (call->args_). The solver derives M/N/K
       // positionally (inputs[0]=LHS [K,M], inputs[1]=RHS [N,K]), so the order is
-      // load-bearing. Both in-params and predecessor-op outputs are registered
+      // load-bearing, including duplicate matmul operands: A@A needs two
+      // incompatible LHS/RHS request roles even though both reference one
+      // source tensor. Both in-params and predecessor-op outputs are registered
       // in tensor_index_ (steps 1 and 3 above), so one ordered pass over args
-      // covers both sources. A std::set would re-sort by tensor index
+      // covers both sources. Vector inputs retain same-representation
+      // deduplication so x+x loads one canonical tile. A std::set would re-sort
+      // by tensor index
       // (in-params, registered first, before intermediates), silently swapping a
       // chained matmul's operands (e.g. (A@B)@D's sink [T,D] -> [D,T]).
       std::vector<size_t> inputs;
@@ -1016,7 +1020,7 @@ class ProblemBuilder {
         if (it == tensor_index_.end()) {
           continue;  // alloc / scalar / Out buffer — not a tracked input tensor
         }
-        if (seen.insert(it->second).second) {
+        if (sop.type == ::OpType::MatMul || seen.insert(it->second).second) {
           inputs.push_back(it->second);
         }
       }
@@ -3896,7 +3900,11 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
   size_t root_count = 0;
   int64_t root_m = -1;
   int64_t root_n = -1;
-  std::set<std::tuple<size_t, int, int, int>> boundary_requests;
+  std::map<std::tuple<size_t, int, int, int>, int64_t> boundary_requests;
+  std::vector<size_t> resident_use_count(plan.resident_boundaries.size(), 0);
+  std::vector<size_t> resident_first_use(
+      plan.resident_boundaries.size(), std::numeric_limits<size_t>::max());
+  std::vector<size_t> resident_last_use(plan.resident_boundaries.size(), 0);
   for (size_t instance = 0; instance < plan.matmuls.size(); ++instance) {
     if (instance > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
       return fail("cube request-instance index exceeds the signed dependency range");
@@ -3941,22 +3949,60 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
     if (rhs_type == nullptr) return fail("matmul RHS is not tensor-like");
     const int64_t rhs_dtype_bytes =
         std::max<int64_t>(1, static_cast<int64_t>(rhs_type->dtype_.GetBit()) / 8);
+    auto validate_resident = [&](int64_t resident_index,
+                                 ::CubeOperandRole expected_role,
+                                 const ::CubeTensorRegionPlan& region,
+                                 int64_t producer,
+                                 int64_t dtype_bytes) {
+      if (resident_index < 0) return true;
+      if (producer >= 0 ||
+          static_cast<size_t>(resident_index) >=
+              plan.resident_boundaries.size()) {
+        return false;
+      }
+      const ::CubeResidentBoundaryPlan& resident =
+          plan.resident_boundaries[static_cast<size_t>(resident_index)];
+      if (resident.role != expected_role ||
+          resident.region.tensor != region.tensor ||
+          resident.region.height_binding != region.height_binding ||
+          resident.region.width_binding != region.width_binding ||
+          resident.region.height != region.height ||
+          resident.region.width != region.width ||
+          resident.bytes != region.height * region.width * dtype_bytes) {
+        return false;
+      }
+      const size_t index = static_cast<size_t>(resident_index);
+      ++resident_use_count[index];
+      resident_first_use[index] = std::min(resident_first_use[index], instance);
+      resident_last_use[index] = std::max(resident_last_use[index], instance);
+      return true;
+    };
+    if (!validate_resident(mm.lhs_resident_boundary, ::CubeOperandRole::Lhs,
+                           mm.lhs, mm.lhs_producer, lhs_dtype_bytes) ||
+        !validate_resident(mm.rhs_resident_boundary, ::CubeOperandRole::Rhs,
+                           mm.rhs, mm.rhs_producer, rhs_dtype_bytes)) {
+      return fail("cross-request resident boundary descriptor is inconsistent");
+    }
     const int64_t expected_lhs_retained_bytes =
         mm.retained_panels.lhs ? mm.lhs.height * mm.lhs.width * lhs_dtype_bytes : 0;
     const int64_t expected_rhs_retained_bytes =
         mm.retained_panels.rhs ? mm.rhs.height * mm.rhs.width * rhs_dtype_bytes : 0;
     if ((mm.retained_panels.lhs &&
-         (mm.lhs_producer >= 0 || mm.output_tiles_n <= 1)) ||
+         (mm.lhs_producer >= 0 || mm.lhs_resident_boundary >= 0 ||
+          mm.output_tiles_n <= 1)) ||
         (mm.retained_panels.rhs &&
-         (mm.rhs_producer >= 0 || mm.output_tiles_m <= 1)) ||
+         (mm.rhs_producer >= 0 || mm.rhs_resident_boundary >= 0 ||
+          mm.output_tiles_m <= 1)) ||
         mm.retained_panels.lhs_bytes != expected_lhs_retained_bytes ||
         mm.retained_panels.rhs_bytes != expected_rhs_retained_bytes ||
         mm.retained_panels.bytes() > plan.peak_l1_bytes) {
       return fail("retained boundary-panel lifetime is inconsistent");
     }
     const bool streams_boundary =
-        (mm.lhs_producer < 0 && !mm.retained_panels.lhs) ||
-        (mm.rhs_producer < 0 && !mm.retained_panels.rhs);
+        (mm.lhs_producer < 0 && mm.lhs_resident_boundary < 0 &&
+         !mm.retained_panels.lhs) ||
+        (mm.rhs_producer < 0 && mm.rhs_resident_boundary < 0 &&
+         !mm.retained_panels.rhs);
     if (!streams_boundary && mm.k_loop.pipeline_stages != 1) {
       return fail("fully retained operands leave a fictional GM-to-L1 pipeline");
     }
@@ -4029,15 +4075,32 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
       }
     }
 
-    auto record_boundary = [&](const ::CubeTensorRegionPlan& region, int port, int64_t producer) {
+    auto record_boundary = [&](const ::CubeTensorRegionPlan& region, int port,
+                               int64_t producer, int64_t resident) {
       if (producer >= 0) return true;
-      return boundary_requests
-          .emplace(region.tensor, port, static_cast<int>(region.height_binding),
-                   static_cast<int>(region.width_binding))
-          .second;
+      const auto key = std::make_tuple(
+          region.tensor, port, static_cast<int>(region.height_binding),
+          static_cast<int>(region.width_binding));
+      auto [it, inserted] = boundary_requests.emplace(key, resident);
+      return inserted || (resident >= 0 && it->second == resident);
     };
-    if (!record_boundary(mm.lhs, 0, mm.lhs_producer) || !record_boundary(mm.rhs, 1, mm.rhs_producer)) {
+    if (!record_boundary(mm.lhs, 0, mm.lhs_producer,
+                         mm.lhs_resident_boundary) ||
+        !record_boundary(mm.rhs, 1, mm.rhs_producer,
+                         mm.rhs_resident_boundary)) {
       return fail("cost-deduplicated boundary request needs an explicit shared L1 lifetime");
+    }
+  }
+  for (size_t index = 0; index < plan.resident_boundaries.size(); ++index) {
+    const ::CubeResidentBoundaryPlan& resident =
+        plan.resident_boundaries[index];
+    if (resident.id == std::numeric_limits<size_t>::max() ||
+        resident.use_count < 2 || resident.first_use >= resident.last_use ||
+        resident.last_use >= plan.matmuls.size() || resident.bytes <= 0 ||
+        resident_use_count[index] != resident.use_count ||
+        resident_first_use[index] != resident.first_use ||
+        resident_last_use[index] != resident.last_use) {
+      return fail("cross-request resident boundary lifetime is inconsistent");
     }
   }
   if (root_count == 0 || (plan.split_k > 1 && root_count != 1)) {
@@ -4094,6 +4157,7 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
                             const ExprPtr& m_index, const ExprPtr& n_index, const ExprPtr& split_index,
                             const std::string& name, const Span& sp, std::vector<StmtPtr>* body,
                             std::vector<ExprPtr>* instance_values, std::vector<ExprPtr>* root_states,
+                            std::vector<ExprPtr>* resident_values,
                             std::string* reason) {
   const ::CubeMatmulSchedule& mm = plan.matmuls[instance];
   const AssignStmtPtr& source_assign = op_assigns.at(mm.op);
@@ -4163,6 +4227,53 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
                                                   clamp_overlap, m_index, n_index, split_index, sp);
   const ExprPtr output_col = CubeRegionAxisOffset(mm.output.width_binding, mm.output.width, output_full_w,
                                                   clamp_overlap, m_index, n_index, split_index, sp);
+
+  // A cross-request resident boundary is materialized exactly at its first
+  // scheduled use. Later matmul instances reuse the same SSA value; ordinary
+  // liveness therefore releases its Mat allocation immediately after the
+  // descriptor's last use without an explicit lifetime intrinsic.
+  auto get_resident = [&](int64_t resident_index, const ExprPtr& source,
+                          const ExprPtr& row, const ExprPtr& col,
+                          const ::CubeTensorRegionPlan& region,
+                          const char* suffix) -> ExprPtr {
+    if (resident_index < 0 ||
+        static_cast<size_t>(resident_index) >= resident_values->size()) {
+      return nullptr;
+    }
+    const size_t index = static_cast<size_t>(resident_index);
+    const ::CubeResidentBoundaryPlan& resident =
+        plan.resident_boundaries[index];
+    if (!(*resident_values)[index]) {
+      if (resident.first_use != instance) return nullptr;
+      auto slice = OpRegistry::GetInstance().Create(
+          "tensor.slice",
+          {source, MakeIndexTuple({region.height, region.width}, sp),
+           MakeTuple2(row, col, sp)},
+          sp);
+      auto value = std::make_shared<Var>(
+          name + "_resident_" + std::to_string(index) + "_" + suffix,
+          slice->GetType(), sp);
+      body->push_back(std::make_shared<AssignStmt>(value, slice, sp));
+      (*resident_values)[index] = value;
+    }
+    return (*resident_values)[index];
+  };
+  if (mm.lhs_resident_boundary >= 0) {
+    ExprPtr resident = get_resident(mm.lhs_resident_boundary, lhs, lhs_row,
+                                    lhs_k, mm.lhs, "lhs_l1");
+    if (!resident) return fail("missing planned resident LHS boundary value");
+    lhs = resident;
+    lhs_row = MakeIndex(0, sp);
+    lhs_k = MakeIndex(0, sp);
+  }
+  if (mm.rhs_resident_boundary >= 0) {
+    ExprPtr resident = get_resident(mm.rhs_resident_boundary, rhs, rhs_k,
+                                    rhs_col, mm.rhs, "rhs_l1");
+    if (!resident) return fail("missing planned resident RHS boundary value");
+    rhs = resident;
+    rhs_k = MakeIndex(0, sp);
+    rhs_col = MakeIndex(0, sp);
+  }
 
   // A retained boundary panel is one GM->L1 load per work unit, outside the
   // output/L0C-tile loop. Nested tensor.slice ops inherit the Mat requirement
@@ -4341,17 +4452,28 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
   std::vector<StmtPtr> body;
   std::vector<ExprPtr> instance_values(plan.matmuls.size());
   std::vector<ExprPtr> root_states = root_initial;
+  std::vector<ExprPtr> resident_values(plan.resident_boundaries.size());
   for (size_t instance = 0; instance < plan.matmuls.size(); ++instance) {
     std::string emit_error;
     if (!EmitCubeMatmulInstance(plan, instance, op_assigns, m_index, n_index, split_index, name, sp, &body,
-                                &instance_values, &root_states, &emit_error)) {
+                                &instance_values, &root_states,
+                                &resident_values, &emit_error)) {
       return decline(emit_error);
     }
+  }
+  if (std::any_of(resident_values.begin(), resident_values.end(),
+                  [](const ExprPtr& value) { return !value; })) {
+    return decline("planned resident boundary was never materialized");
   }
 
   result.push_back(SpmdWrap(work_index, std::move(body), MakeIndex(plan.work_units, sp), name, sp));
   int64_t retained_panel_bytes = 0;
   int64_t retained_panel_count = 0;
+  int64_t resident_boundary_bytes = 0;
+  for (const ::CubeResidentBoundaryPlan& resident :
+       plan.resident_boundaries) {
+    resident_boundary_bytes += resident.bytes;
+  }
   for (const ::CubeMatmulSchedule& mm : plan.matmuls) {
     retained_panel_bytes += mm.retained_panels.bytes();
     retained_panel_count += static_cast<int64_t>(mm.retained_panels.lhs) +
@@ -4361,7 +4483,9 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
            << " request instance(s), grid=" << parts_m << "x" << parts_n << "x" << plan.split_k
            << " spatial_policy=" << CubeSpatialPolicyName(plan.spatial_policy)
            << " retained_panels=" << retained_panel_count
-           << " retained_l1_bytes=" << retained_panel_bytes;
+           << " retained_l1_bytes="
+           << retained_panel_bytes + resident_boundary_bytes
+           << " shared_boundaries=" << plan.resident_boundaries.size();
   return result;
 }
 
