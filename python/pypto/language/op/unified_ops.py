@@ -797,14 +797,18 @@ def matmul_acc(
 def row_max(input: T, tmp_tile: Tile | None = None) -> T:
     """Row-wise max reduction, dispatched by input type.
 
-    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tile inputs, ``tmp_tile`` is required and must have the same dtype and
+    rank as the input, with every dimension at least as large as the input dimension.
     For Tensor inputs, tmp_tile is ignored.
     """
     if isinstance(input, Tensor):
         return _tensor.row_max(input)
     if isinstance(input, Tile):
         if tmp_tile is None:
-            raise ValueError("row_max on Tile requires tmp_tile argument")
+            raise ValueError(
+                "row_max on Tile requires tmp_tile with the same dtype and rank and every dimension "
+                "at least as large as the input"
+            )
         return _tile.row_max(input, tmp_tile)
     raise TypeError(f"pl.row_max: expected Tensor or Tile, got {type(input).__name__}")
 
@@ -812,14 +816,18 @@ def row_max(input: T, tmp_tile: Tile | None = None) -> T:
 def row_sum(input: T, tmp_tile: Tile | None = None) -> T:
     """Row-wise sum reduction, dispatched by input type.
 
-    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tile inputs, ``tmp_tile`` is required and must have the same dtype and
+    rank as the input, with every dimension at least as large as the input dimension.
     For Tensor inputs, tmp_tile is ignored.
     """
     if isinstance(input, Tensor):
         return _tensor.row_sum(input)
     if isinstance(input, Tile):
         if tmp_tile is None:
-            raise ValueError("row_sum on Tile requires tmp_tile argument")
+            raise ValueError(
+                "row_sum on Tile requires tmp_tile with the same dtype and rank and every dimension "
+                "at least as large as the input"
+            )
         return _tile.row_sum(input, tmp_tile)
     raise TypeError(f"pl.row_sum: expected Tensor or Tile, got {type(input).__name__}")
 
@@ -827,14 +835,18 @@ def row_sum(input: T, tmp_tile: Tile | None = None) -> T:
 def row_min(input: T, tmp_tile: Tile | None = None) -> T:
     """Row-wise min reduction, dispatched by input type.
 
-    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tile inputs, ``tmp_tile`` is required and must have the same dtype and
+    rank as the input, with every dimension at least as large as the input dimension.
     For Tensor inputs, tmp_tile is ignored.
     """
     if isinstance(input, Tensor):
         return _tensor.row_min(input)
     if isinstance(input, Tile):
         if tmp_tile is None:
-            raise ValueError("row_min on Tile requires tmp_tile argument")
+            raise ValueError(
+                "row_min on Tile requires tmp_tile with the same dtype and rank and every dimension "
+                "at least as large as the input"
+            )
         return _tile.row_min(input, tmp_tile)
     raise TypeError(f"pl.row_min: expected Tensor or Tile, got {type(input).__name__}")
 
@@ -842,14 +854,18 @@ def row_min(input: T, tmp_tile: Tile | None = None) -> T:
 def row_prod(input: T, tmp_tile: Tile | None = None) -> T:
     """Row-wise product reduction, dispatched by input type.
 
-    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tile inputs, ``tmp_tile`` is required and must have the same dtype and
+    rank as the input, with every dimension at least as large as the input dimension.
     For Tensor inputs, tmp_tile is ignored.
     """
     if isinstance(input, Tensor):
         return _tensor.row_prod(input)
     if isinstance(input, Tile):
         if tmp_tile is None:
-            raise ValueError("row_prod on Tile requires tmp_tile argument")
+            raise ValueError(
+                "row_prod on Tile requires tmp_tile with the same dtype and rank and every dimension "
+                "at least as large as the input"
+            )
         return _tile.row_prod(input, tmp_tile)
     raise TypeError(f"pl.row_prod: expected Tensor or Tile, got {type(input).__name__}")
 
@@ -907,14 +923,16 @@ def col_prod(input: T) -> T:
 def row_argmax(input: T, tmp_tile: Tile | None = None) -> T:
     """Row-wise argmax (per-row max index, int32), dispatched by input type.
 
-    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tile inputs, tmp_tile is required with exactly the same shape and dtype.
     For Tensor inputs, tmp_tile is ignored.
     """
     if isinstance(input, Tensor):
         return _tensor.row_argmax(input)
     if isinstance(input, Tile):
         if tmp_tile is None:
-            raise ValueError("row_argmax on Tile requires tmp_tile argument")
+            raise ValueError(
+                "row_argmax on Tile requires tmp_tile with exactly the same shape and dtype as the input"
+            )
         return _tile.row_argmax(input, tmp_tile)
     raise TypeError(f"pl.row_argmax: expected Tensor or Tile, got {type(input).__name__}")
 
@@ -922,14 +940,16 @@ def row_argmax(input: T, tmp_tile: Tile | None = None) -> T:
 def row_argmin(input: T, tmp_tile: Tile | None = None) -> T:
     """Row-wise argmin (per-row min index, int32), dispatched by input type.
 
-    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tile inputs, tmp_tile is required with exactly the same shape and dtype.
     For Tensor inputs, tmp_tile is ignored.
     """
     if isinstance(input, Tensor):
         return _tensor.row_argmin(input)
     if isinstance(input, Tile):
         if tmp_tile is None:
-            raise ValueError("row_argmin on Tile requires tmp_tile argument")
+            raise ValueError(
+                "row_argmin on Tile requires tmp_tile with exactly the same shape and dtype as the input"
+            )
         return _tile.row_argmin(input, tmp_tile)
     raise TypeError(f"pl.row_argmin: expected Tensor or Tile, got {type(input).__name__}")
 
