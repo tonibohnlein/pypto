@@ -930,6 +930,71 @@ class TestAutoFuse:
         aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
         assert len(aic) == 1, [f.name for _, f in lowered.functions.items()]
 
+    def test_cube_plan_composes_fanout_roles_residency_and_liveouts(self, ascend_backend, monkeypatch):
+        """One request DAG composes role-switch replay with compatible residency.
+
+        ``t`` is produced twice because its LHS and RHS consumers request
+        incompatible regions.  Boundary ``d`` is nevertheless loaded once in
+        its repeated RHS role across the ``left`` and ``out`` roots.  All three
+        roots are returned live-outs.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def composed(
+                self,
+                a: pl.Tensor[[64, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                d: pl.Tensor[[64, 64], pl.BF16],
+                e: pl.Tensor[[64, 64], pl.BF16],
+                f: pl.Tensor[[64, 64], pl.BF16],
+            ) -> tuple[
+                pl.Tensor[[64, 64], pl.BF16],
+                pl.Tensor[[64, 64], pl.BF16],
+                pl.Tensor[[64, 64], pl.BF16],
+            ]:
+                t: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(a, b)
+                left: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(t, d)
+                right: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(e, t)
+                out: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(f, d)
+                return left, right, out
+
+        planned = passes.auto_fuse()(Prog)
+        body = next(f for _, f in planned.functions.items() if f.name == "composed").as_python()
+        assert body.count("pl.spmd(") == 1, body
+        assert body.count("pl.tensor.matmul(") == 5, body
+        assert body.count("pl.Out[") == 3, body
+        resident_defs = [
+            line
+            for line in body.splitlines()
+            if "_resident_" in line.partition(":")[0] and "pl.tensor.slice" in line
+        ]
+        assert len(resident_defs) == 1 and "_rhs_l1" in resident_defs[0], body
+
+        namespace: dict = {}
+        exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        a = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        b = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        d = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        e = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        f = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        t = a @ b
+        actual_left, actual_right, actual_out = namespace["composed"](a, b, d, e, f)
+        assert torch.allclose(actual_left, t @ d, rtol=1e-3, atol=1e-3)
+        assert torch.allclose(actual_right, e @ t, rtol=1e-3, atol=1e-3)
+        assert torch.allclose(actual_out, f @ d, rtol=1e-3, atol=1e-3)
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
+        assert len(aic) == 1, [f.name for _, f in lowered.functions.items()]
+
     def test_chained_matmul_preserves_operand_input_order(self, tmp_path, monkeypatch):
         """Regression: the solver Problem must list each matmul's inputs in OPERAND
         order — inputs[0]=LHS, inputs[1]=RHS — because the cost model derives
@@ -1624,6 +1689,103 @@ class TestAutoFuse:
         assert torch.allclose(intermediate, expected, rtol=1e-4, atol=1e-4)
         assert torch.allclose(out, expected + 1.0, rtol=1e-4, atol=1e-4)
 
+    def test_vector_plan_reuses_shared_boundary_input_per_strip(self, ascend_backend, monkeypatch):
+        """A vector boundary tile is loaded once and lives to its last consumer.
+
+        ``x`` is used before and after an intervening produced value, while
+        ``bias`` is a broadcast input used only in the middle. The phase-local
+        lifetime plan therefore emits exactly two input slices, not a second
+        load of ``x`` at its final consumer.
+        """
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def shared_input(
+                self,
+                x: pl.Tensor[[64, 256], pl.FP32],
+                bias: pl.Tensor[[1, 256], pl.FP32],
+            ) -> pl.Tensor[[64, 256], pl.FP32]:
+                first: pl.Tensor[[64, 256], pl.FP32] = pl.exp(x)
+                middle: pl.Tensor[[64, 256], pl.FP32] = pl.add(first, bias)
+                out: pl.Tensor[[64, 256], pl.FP32] = pl.mul(middle, x)
+                return out
+
+        fused = passes.auto_fuse()(Prog)
+        body = next(f for _, f in fused.functions.items() if f.name == "shared_input").as_python()
+        assert body.count("pl.spmd(") == 1, body
+        assert body.count("pl.tensor.slice(") == 2, body
+
+        namespace: dict = {}
+        exec(torch_codegen(fused, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        x = torch.randn(64, 256, dtype=torch.float32)
+        bias = torch.randn(1, 256, dtype=torch.float32)
+        actual = namespace["shared_input"](x, bias)
+        expected = (torch.exp(x) + bias) * x
+        assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-4)
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        aiv = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIV"]
+        assert len(aiv) == 1, [f.name for _, f in lowered.functions.items()]
+
+    def test_vector_plan_composes_overlapping_inputs_fanout_and_liveouts(self, ascend_backend, monkeypatch):
+        """A vector diamond keeps two inputs and one produced fanout faithful.
+
+        ``x`` and ``y`` have overlapping first-to-last-use intervals, ``a``
+        fans out, and ``c`` is both consumed and returned.  The emitted replay
+        must slice each boundary input once and store both live-outs once.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def diamond(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                y: pl.Tensor[[64, 64], pl.FP32],
+            ) -> tuple[pl.Tensor[[64, 64], pl.FP32], pl.Tensor[[64, 64], pl.FP32]]:
+                a: pl.Tensor[[64, 64], pl.FP32] = pl.exp(x)
+                b: pl.Tensor[[64, 64], pl.FP32] = pl.add(a, y)
+                c: pl.Tensor[[64, 64], pl.FP32] = pl.mul(a, x)
+                d: pl.Tensor[[64, 64], pl.FP32] = pl.add(b, c)
+                out: pl.Tensor[[64, 64], pl.FP32] = pl.mul(d, y)
+                return c, out
+
+        planned = passes.auto_fuse()(Prog)
+        body = next(f for _, f in planned.functions.items() if f.name == "diamond").as_python()
+        assert body.count("pl.spmd(") == 1, body
+        assert body.count("pl.tensor.slice(") == 2, body
+        assert body.count("pl.tensor.assemble(") == 2, body
+        assert body.count("pl.tensor.exp(") == 1, body
+        assert body.count("pl.tensor.add(") == 2, body
+        assert body.count("pl.tensor.mul(") == 2, body
+
+        namespace: dict = {}
+        exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, dtype=torch.float32)
+        y = torch.randn(64, 64, dtype=torch.float32)
+        a = torch.exp(x)
+        c = a * x
+        expected = (a + y + c) * y
+        actual_c, actual = namespace["diamond"](x, y)
+        assert torch.allclose(actual_c, c, rtol=1e-4, atol=1e-4)
+        assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-4)
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        aiv = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIV"]
+        assert len(aiv) == 1, [f.name for _, f in lowered.functions.items()]
+
     def test_materialized_single_tile_uses_solver_body_plan(self, ascend_backend, monkeypatch):
         """A one-task materialized vector group still uses the generic planned body.
 
@@ -1752,6 +1914,12 @@ class TestAutoFuse:
                 return d
 
         fused = passes.auto_fuse()(Prog)
+        body = next(f for _, f in fused.functions.items() if f.name == "pw").as_python()
+        # The memory-fitting strip loop is itself the stage-2 pipeline; there
+        # is no second hidden streaming layer.  Both boundary operands are
+        # sliced once per strip, and reused b is consumed from that one slice.
+        assert body.count("pl.pipeline(") == 1, body
+        assert body.count("pl.tensor.slice(") == 2, body
         # Lowers without a Vec-buffer overflow (the wide reused-input strip now fits UB).
         PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         # ...and is numerically exact.

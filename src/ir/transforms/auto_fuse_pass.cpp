@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -2355,12 +2356,10 @@ static std::nullopt_t GenericDeclineB(const std::string& reason, const Span& spa
   return std::nullopt;
 }
 
-std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<StmtPtr>& run,
-                                                          const SolverTile& tile,
-                                                          const std::string& name,
-                                                          const P4Match* p4_match,
-                                                          const std::unordered_set<const Var*>&
-                                                              required_live_outs) {
+std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
+    const std::vector<StmtPtr>& run, const SolverTile& tile, const std::string& name, const P4Match* p4_match,
+    const std::unordered_map<const Stmt*, size_t>& stmt_op,
+    const std::unordered_set<const Var*>& required_live_outs) {
   auto& reg = OpRegistry::GetInstance();
 
   // A1 (classify allowlist). Increments 1-2 support ELEMENTWISE + REDUCTION. A MatMul
@@ -2390,6 +2389,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     ops.push_back(a);
   }
   if (ops.empty()) return std::nullopt;
+  const ::VectorStreamPlan& solver_stream = tile.vector_stream;
+  if (!solver_stream.input_lifetimes) {
+    return GenericDeclineB("solver vector plan has no boundary-input lifetime topology", ops.front()->span_);
+  }
 
   // A7 (single sink): the group output is the single run-var not consumed within the run
   // (a fused group keeps its intermediates on-chip). >1 live-out = multi-output -> S5.
@@ -2398,6 +2401,64 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   for (const auto& a : ops) {
     defined.insert(a->var_.get());
     def_by_var.emplace(a->var_.get(), a);
+  }
+
+  // Resolve the solver's tensor-id lifetime descriptors back to the exact IR
+  // boundary Vars. `Problem::Op::inputs` contains tensor operands only, while
+  // a source Call may interleave scalar arguments, so use tensor-argument
+  // ordinal rather than raw Call index. Every planned use of one tensor must
+  // resolve to the same SSA value; vector has no LHS/RHS representation split.
+  std::unordered_map<size_t, AssignStmtPtr> assign_by_op;
+  for (const AssignStmtPtr& a : ops) {
+    auto found = stmt_op.find(a.get());
+    if (found == stmt_op.end() || !assign_by_op.emplace(found->second, a).second) {
+      return GenericDeclineB("vector input lifetime cannot map source op identity", a->span_);
+    }
+  }
+  std::array<std::unordered_map<const Var*, const ::VectorInputLifetimePlan*>, 4> planned_inputs;
+  std::array<std::unordered_map<const Var*, std::unordered_set<size_t>>, 4> planned_input_use_ops;
+  for (size_t phase_index = 0; phase_index < solver_stream.input_lifetimes->phases.size(); ++phase_index) {
+    for (const ::VectorInputLifetimePlan& input : solver_stream.input_lifetimes->phases[phase_index]) {
+      if (::vector_replay_phase_index(input.phase) != phase_index || input.uses.size() != input.use_count ||
+          input.uses.empty()) {
+        return GenericDeclineB("vector input lifetime descriptor is inconsistent", ops.front()->span_);
+      }
+      const Var* source_var = nullptr;
+      for (const ::VectorInputUsePlan& use : input.uses) {
+        auto op_found = assign_by_op.find(use.op);
+        if (op_found == assign_by_op.end()) {
+          return GenericDeclineB("vector input lifetime references a missing source op", ops.front()->span_);
+        }
+        const CallPtr call = As<Call>(op_found->second->value_);
+        ExprPtr tensor_arg;
+        size_t tensor_ordinal = 0;
+        for (const ExprPtr& arg : call->args_) {
+          if (As<TensorType>(arg->GetType()) == nullptr) continue;
+          if (tensor_ordinal++ == use.arg) {
+            tensor_arg = arg;
+            break;
+          }
+        }
+        auto var = AsVarLike(tensor_arg);
+        if (var == nullptr || defined.count(var.get()) != 0 ||
+            (source_var != nullptr && source_var != var.get())) {
+          return GenericDeclineB("vector input lifetime does not identify one boundary SSA value",
+                                 op_found->second->span_);
+        }
+        source_var = var.get();
+      }
+      if (source_var == nullptr || !planned_inputs[phase_index].emplace(source_var, &input).second) {
+        return GenericDeclineB("vector input lifetime aliases another planned value", ops.front()->span_);
+      }
+      auto& use_ops = planned_input_use_ops[phase_index][source_var];
+      for (const ::VectorInputUsePlan& use : input.uses) {
+        use_ops.insert(use.op);
+      }
+      if (use_ops.size() != input.use_count) {
+        return GenericDeclineB("vector input lifetime does not identify distinct source-op uses",
+                               ops.front()->span_);
+      }
+    }
   }
   std::unordered_set<const Var*> used_within;
   for (const auto& a : ops) {
@@ -2504,7 +2565,6 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       if (riM > 1 && roM == 1) pin_m = true;  // col reduction -> M pinned
     }
   }
-  const ::VectorStreamPlan& solver_stream = tile.vector_stream;
   const bool has_planned_grid = solver_stream.feasible && solver_stream.work_units > 0;
   int64_t h = pin_m ? IM
                     : (has_planned_grid ? solver_stream.tile_h
@@ -2728,9 +2788,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
   // `subs` (op-var -> finalized-accumulator tile): when an op's OUTPUT is in `subs`, do NOT replay
   //   it — bind the substitute tile (P2 pass 1 uses the finalized reduction result instead of
   //   recomputing a partial). This is the value-level "substitute reductions at level < k" rule.
-  auto emit_strip = [&](int64_t sh, int64_t sw, const ExprPtr& smi, const ExprPtr& sni,
-                        std::vector<StmtPtr>& out, std::unordered_map<const Var*, VarPtr>& onchip,
-                        const Stmt* stop_at = nullptr,
+  auto emit_strip = [&](::VectorReplayPhase phase, int64_t sh, int64_t sw, const ExprPtr& smi,
+                        const ExprPtr& sni, std::vector<StmtPtr>& out,
+                        std::unordered_map<const Var*, VarPtr>& onchip, const Stmt* stop_at = nullptr,
                         const std::unordered_map<const Var*, VarPtr>* subs = nullptr) -> VarPtr {
     const Stmt* sink_op = stop_at != nullptr ? stop_at : out_stmt.get();
     // Emit exactly the dependency cone of this phase.  A substituted statistic
@@ -2772,6 +2832,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // padding pass (which also fixes the legacy tilers — KNOWN_ISSUES).
     onchip.clear();                                      // fresh per replay
     std::unordered_map<const Var*, VarPtr> input_cache;  // external input -> its [sh,w] slice
+    std::unordered_map<const Var*, std::unordered_set<size_t>> observed_input_use_ops;
+    const auto& expected_inputs = planned_inputs[::vector_replay_phase_index(phase)];
+    const auto& expected_input_use_ops = planned_input_use_ops[::vector_replay_phase_index(phase)];
     VarPtr tv;
     for (const auto& a : ops) {
       if (prune_to_sink && needed.count(a.get()) == 0) continue;
@@ -2796,6 +2859,14 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
           targs.push_back(arg);  // scalar / non-2D -> as-is
           continue;
         }
+        auto source_op = stmt_op.find(a.get());
+        auto expected_use =
+            v == nullptr ? expected_input_use_ops.end() : expected_input_use_ops.find(v.get());
+        INTERNAL_CHECK_SPAN(source_op != stmt_op.end() && expected_use != expected_input_use_ops.end() &&
+                                expected_use->second.count(source_op->second) != 0,
+                            a->span_)
+            << "Internal error: emitted vector phase uses an unplanned boundary input";
+        observed_input_use_ops[v.get()].insert(source_op->second);
         // 2D external input (full [IM,IN] or a broadcast [1,IN]/[IM,1], validated at the group top).
         // Slice per-axis: a FULL axis follows the tile (offset + granule-padded alloc + ragged valid);
         // a size-1 (broadcast, FIXED_1) axis stays [1] at offset 0 (read whole, broadcast in the op).
@@ -2820,6 +2891,12 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         tv = res;
         if (stop_at != nullptr) break;  // stop after the designated sink (P1/P2); else replay all
       }
+    }
+    for (const auto& [input_var, descriptor] : expected_inputs) {
+      INTERNAL_CHECK_SPAN(observed_input_use_ops[input_var] == expected_input_use_ops.at(input_var) &&
+                              observed_input_use_ops[input_var].size() == descriptor->use_count,
+                          out_stmt->span_)
+          << "Internal error: emitted vector phase does not replay the planned boundary-input uses";
     }
     return tv;
   };
@@ -2918,14 +2995,16 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     ExprPtr foff = pin_m ? ni : mi;
     // Slice the [chunk_ext along the reduced axis, free_tile] region at `red_off` and replay the
     // cone up to `stop` (nullptr = the group sink), substituting finalized accumulators from `subs`.
-    auto strip_at = [&](int64_t chunk_ext, const ExprPtr& red_off, std::vector<StmtPtr>& out,
-                        std::unordered_map<const Var*, VarPtr>& oc, const Stmt* stop,
-                        const std::unordered_map<const Var*, VarPtr>* subs) -> VarPtr {
+    auto strip_at = [&](::VectorReplayPhase phase, int64_t chunk_ext, const ExprPtr& red_off,
+                        std::vector<StmtPtr>& out, std::unordered_map<const Var*, VarPtr>& oc,
+                        const Stmt* stop, const std::unordered_map<const Var*, VarPtr>* subs) -> VarPtr {
       // `free_tile` is the logical valid extent. `slice_input` pads the
       // allocated tile to `free_tile_alloc`, so the full region is written
       // without changing its ownership or SPMD count.
-      return pin_m ? emit_strip(chunk_ext, free_tile, red_off, foff, out, oc, stop, subs)   // chunk M rows, free_tile N
-                   : emit_strip(free_tile, chunk_ext, foff, red_off, out, oc, stop, subs);  // free_tile M, chunk N
+      return pin_m ? emit_strip(phase, chunk_ext, free_tile, red_off, foff, out, oc, stop,
+                                subs)  // chunk M rows, free_tile N
+                   : emit_strip(phase, free_tile, chunk_ext, foff, red_off, out, oc, stop,
+                                subs);  // free_tile M, chunk N
     };
 
     // One construction for every loop-carried P2/P4 phase.  Algorithm-specific
@@ -2962,7 +3041,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
         ExprPtr offset = MakeMul(s, MakeIndex(rc, sp), sp);
         std::vector<StmtPtr> loop_body;
         std::unordered_map<const Var*, VarPtr> onchip_apply;
-        VarPtr chunk_tile = strip_at(rc, offset, loop_body, onchip_apply, nullptr, &subs);
+        VarPtr chunk_tile =
+            strip_at(::VectorReplayPhase::Apply, rc, offset, loop_body, onchip_apply, nullptr, &subs);
         auto assemble =
             reg.Create("tensor.assemble", {ExprPtr(out_it), ExprPtr(chunk_tile), asm_at(offset)}, sp);
         auto out_next = std::make_shared<Var>(base + "_on", assemble->GetType(), sp);
@@ -2978,8 +3058,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       if (solver_stream.apply_tail.present) {
         std::unordered_map<const Var*, VarPtr> onchip_tail;
         ExprPtr offset = MakeIndex(solver_stream.apply_tail.chunk_index * rc, sp);
-        VarPtr chunk_tile =
-            strip_at(solver_stream.apply_tail.extent, offset, body, onchip_tail, nullptr, &subs);
+        VarPtr chunk_tile = strip_at(::VectorReplayPhase::Apply, solver_stream.apply_tail.extent, offset,
+                                     body, onchip_tail, nullptr, &subs);
         auto assemble =
             reg.Create("tensor.assemble", {ExprPtr(out_cur), ExprPtr(chunk_tile), asm_at(offset)}, sp);
         body.push_back(std::make_shared<AssignStmt>(c_var, assemble, sp));
@@ -2999,6 +3079,11 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       const VarPtr user_mean = p4_match->user_mean;
       const VarPtr user_var = p4_match->user_var;
       const ExprPtr x_input = p4_match->x_input;
+      auto x_var = AsVarLike(x_input);
+      const auto& stats_inputs = planned_inputs[::vector_replay_phase_index(::VectorReplayPhase::Stats)];
+      INTERNAL_CHECK_SPAN(
+          x_var != nullptr && stats_inputs.size() == 1 && stats_inputs.count(x_var.get()) == 1, sp)
+          << "Internal error: Welford stats input does not match the solver lifetime plan";
 
       std::vector<StmtPtr> body;
       std::unordered_map<const Var*, VarPtr> subs;
@@ -3158,6 +3243,11 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       const AssignStmtPtr max_stmt = p4_match->max_stmt;
       const AssignStmtPtr sum_stmt = p4_match->sum_stmt;
       const ExprPtr x_input = p4_match->x_input;
+      auto x_var = AsVarLike(x_input);
+      const auto& stats_inputs = planned_inputs[::vector_replay_phase_index(::VectorReplayPhase::Stats)];
+      INTERNAL_CHECK_SPAN(
+          x_var != nullptr && stats_inputs.size() == 1 && stats_inputs.count(x_var.get()) == 1, sp)
+          << "Internal error: softmax stats input does not match the solver lifetime plan";
       const CallPtr max_call = As<Call>(max_stmt->value_);
       const CallPtr sum_call = As<Call>(sum_stmt->value_);
 
@@ -3269,15 +3359,16 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // The accumulator is the small reduced [.,1]/[1,.]; chunk 0 inits it, chunks 1.. merge in a
     // carried loop (acc iter_arg, spike-proven), the ragged tail merges after.
     std::unordered_map<const Var*, VarPtr> oc0;
-    VarPtr acc =
-        strip_at(solver_stream.stats_init.extent, MakeIndex(solver_stream.stats_init.chunk_index * rc, sp),
-                 body, oc0, red_stmt.get(), nullptr);
+    VarPtr acc = strip_at(::VectorReplayPhase::Stats, solver_stream.stats_init.extent,
+                          MakeIndex(solver_stream.stats_init.chunk_index * rc, sp), body, oc0, red_stmt.get(),
+                          nullptr);
     if (solver_stream.stats.trip_count > 0) {
       auto k = std::make_shared<Var>(base + "_k", index_type, sp);
       auto acc_it = std::make_shared<IterArg>(base + "_acc_it", acc->GetType(), ExprPtr(acc), sp);
       std::vector<StmtPtr> lbody;
       std::unordered_map<const Var*, VarPtr> ock;
-      VarPtr part = strip_at(rc, MakeMul(k, MakeIndex(rc, sp), sp), lbody, ock, red_stmt.get(), nullptr);
+      VarPtr part = strip_at(::VectorReplayPhase::Stats, rc, MakeMul(k, MakeIndex(rc, sp), sp), lbody, ock,
+                             red_stmt.get(), nullptr);
       auto m_call = reg.Create(merge_op, {ExprPtr(acc_it), ExprPtr(part)}, sp);
       auto acc_n = std::make_shared<Var>(base + "_acc_n", m_call->GetType(), sp);
       lbody.push_back(std::make_shared<AssignStmt>(acc_n, m_call, sp));
@@ -3294,9 +3385,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     }
     if (solver_stream.stats_tail.present) {
       std::unordered_map<const Var*, VarPtr> oct;
-      VarPtr tpart =
-          strip_at(solver_stream.stats_tail.extent, MakeIndex(solver_stream.stats_tail.chunk_index * rc, sp),
-                   body, oct, red_stmt.get(), nullptr);
+      VarPtr tpart = strip_at(::VectorReplayPhase::Stats, solver_stream.stats_tail.extent,
+                              MakeIndex(solver_stream.stats_tail.chunk_index * rc, sp), body, oct,
+                              red_stmt.get(), nullptr);
       auto m_call = reg.Create(merge_op, {ExprPtr(acc), ExprPtr(tpart)}, sp);
       auto acc_t = std::make_shared<Var>(base + "_acc_t", m_call->GetType(), sp);
       body.push_back(std::make_shared<AssignStmt>(acc_t, m_call, sp));
@@ -3312,7 +3403,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
       if (!sink_is_reduction) {
         const std::unordered_map<const Var*, VarPtr> subs = {{red_stmt->var_.get(), acc}};
         std::unordered_map<const Var*, VarPtr> oc_folded;
-        folded_out = strip_at(1, MakeIndex(0, sp), body, oc_folded, nullptr, &subs);
+        folded_out =
+            strip_at(::VectorReplayPhase::Finalize, 1, MakeIndex(0, sp), body, oc_folded, nullptr, &subs);
       }
       ExprPtr asm_off = pin_m ? MakeTuple2(MakeIndex(0, sp), foff, sp)   // [1,w] at [0, n]
                               : MakeTuple2(foff, MakeIndex(0, sp), sp);  // [h,1] at [m, 0]
@@ -3345,7 +3437,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     std::vector<StmtPtr> prologue;  // one tensor.create per sink
     std::vector<StmtPtr> mbody;
     std::unordered_map<const Var*, VarPtr> onchip;
-    emit_strip(h, w, mi, ni, mbody, onchip);  // replay all ops; onchip[var] = every op's tile
+    emit_strip(::VectorReplayPhase::Body, h, w, mi, ni, mbody,
+               onchip);  // replay all ops; onchip[var] = every op's tile
     for (const auto& sink : sinks) {
       auto stt = As<TensorType>(sink->var_->GetType());
       if (stt == nullptr) return std::nullopt;  // non-tensor sink -> out of scope
@@ -3447,13 +3540,15 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     auto t2 = std::make_shared<Var>(base + "_t", index_ty, sp);
     auto ks = MakeFloorMod(t2, MakeIndex(S, sp), sp);
     auto fidx = MakeFloorDiv(t2, MakeIndex(S, sp), sp);
-    ExprPtr r_mi = MakeMul(ks, MakeIndex(rsz, sp), sp);   // disjoint reduced-M slice offset
-    ExprPtr sni = MakeMul(fidx, MakeIndex(w, sp), sp);    // free-N tile offset (exact, no overlap)
+    ExprPtr r_mi = MakeMul(ks, MakeIndex(rsz, sp), sp);  // disjoint reduced-M slice offset
+    ExprPtr sni = MakeMul(fidx, MakeIndex(w, sp), sp);   // free-N tile offset (exact, no overlap)
     std::vector<StmtPtr> sbody;
     std::unordered_map<const Var*, VarPtr> oc_split;
-    VarPtr part = emit_strip(rsz, w, r_mi, sni, sbody, oc_split);  // [1,w] partial col_sum over the M-slice
-    auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_seeded), part, MakeTuple2(MakeIndex(0, sp), sni, sp)},
-                               {{"atomic", 1}}, sp);
+    VarPtr part = emit_strip(::VectorReplayPhase::Body, rsz, w, r_mi, sni, sbody,
+                             oc_split);  // [1,w] partial col_sum over the M-slice
+    auto asm_call =
+        reg.Create("tensor.assemble", {ExprPtr(c_seeded), part, MakeTuple2(MakeIndex(0, sp), sni, sp)},
+                   {{"atomic", 1}}, sp);
     sbody.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
     auto scope = SpmdWrap(t2, std::move(sbody), MakeIndex(num_n * S, sp), name, sp);
     LOG_INFO << "AutoFuse[generic]: SUM col-reduction group '" << name << "' split " << S
@@ -3511,7 +3606,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     // Serial (matches the cost model's db=false): the whole tile is one strip. Only reached when the
     // whole [h,w] tile fits UB — an over-UB tile bumped num_strips/num_wstrips >= 2 above.
     std::unordered_map<const Var*, VarPtr> oc_serial;
-    VarPtr tv = emit_strip(h, w, mi, ni, body_stmts, oc_serial);
+    VarPtr tv = emit_strip(::VectorReplayPhase::Body, h, w, mi, ni, body_stmts, oc_serial);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(c_init), tv, MakeTuple2(mi, ni, sp)}, sp);
     body_stmts.push_back(std::make_shared<AssignStmt>(c_var, asm_call, sp));
   } else {
@@ -3552,7 +3647,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(const std::vector<Stmt
     }
     std::vector<StmtPtr> loop_body;
     std::unordered_map<const Var*, VarPtr> oc_pipe;
-    VarPtr tv = emit_strip(strip_h, emit_w, smi, sni, loop_body, oc_pipe);
+    VarPtr tv = emit_strip(::VectorReplayPhase::Body, strip_h, emit_w, smi, sni, loop_body, oc_pipe);
     auto asm_call = reg.Create("tensor.assemble", {ExprPtr(out_iter), tv, MakeTuple2(smi, sni, sp)}, sp);
     auto out_next = std::make_shared<Var>(base + "_out_n", asm_call->GetType(), sp);
     loop_body.push_back(std::make_shared<AssignStmt>(out_next, asm_call, sp));
@@ -5009,7 +5104,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
           p4_match = &p4_matches[pit->second];
         }
         if (auto generic =
-                EmitFusedGroupGeneric(run, tit->second, nm, p4_match, required_live_outs)) {
+                EmitFusedGroupGeneric(run, tit->second, nm, p4_match, stmt_op, required_live_outs)) {
           for (auto& s : *generic) {
             top.push_back(std::move(s));
           }

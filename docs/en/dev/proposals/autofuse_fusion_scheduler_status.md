@@ -395,7 +395,7 @@ requests, produced/boundary-input L1 lifetimes, K windows, output variants, drai
 Repeated inputs have first/last-use residency; role keeps `A @ A` LHS/RHS separate. Topology is built once in `create()` and the full plan is reconstructed only for a winner/force, never in `CostResult`.
 
 **Ordering policy.** Source and cube role-expanded DAGs use one `PebblingOrderStrategy` interface.
-DFS is current; always-retain declines over-capacity candidates. Reuse-distance/Gorder-like policies, reload alternatives, and vector replay remain future work.
+DFS remains default; `-DPTO_FUSEBOX_GORDER=ON` selects dependency-constrained Gorder at compile time. Gorder is not generally `O(V+E)`: shared-neighbor/value updates retain high-fan-out quadratic terms, although ordering runs once per subgraph rather than per candidate. Always-retain declines over-capacity candidates; Gorder silicon comparison and reload alternatives remain future work. Vector phase-local boundary lifetimes now use the same ordering abstraction.
 
 **`L0MatmulPlan` (L1/L0).** Cube costing now has two modes. The default analytic mode ranks outer
 plans with the grounded fixed-base-tile cube/MTE1 surrogate and attaches only the semantic
@@ -423,7 +423,7 @@ Same-type FP32 internal L1 handoff is not an A2/A3 instruction. Exact mode decli
 currently ranks then falls back, which is a TODO below. Direct Mat→GM store is legal.
 
 **Host validation.** PTO Fusebox reports 507 passing checks with one `FDM` analytic-ranking failure;
-AutoFuse reports 58. Coverage includes recursive BF16 DAGs, split/ragged K, multi-window and shared-
+AutoFuse reports 59. Coverage includes recursive BF16 DAGs, split/ragged K, multi-window and shared-
 boundary residency, multi-role `A @ A`, Torch numerics, and PTOAS lowering. Parser/outliner reports 126, including multi-output SPMD round-trip.
 
 The latest host closure fixes two compiler-side lifetime mismatches without changing cube costs.
@@ -471,7 +471,7 @@ boundary, but no scalar correction is supported.
    with a direct model that generalizes and improves within-problem ranking.
 8. Different M/N/K shapes and recursive roles are supported. Ragged multi-matmul grids would need
    edge-specific valid/physical regions and lifetimes propagated through the request DAG.
-9. Compare always-retain with reload alternatives, add reuse-distance/Gorder-like ordering, and apply the common lifetime abstraction to vector as a separate tested increment.
+9. Silicon-compare DFS with dependency-constrained Gorder and compare always-retain with reload alternatives. Defer any separate greedy reuse-distance strategy until a literature review of dependency-constrained locality, register-pressure-aware DAG scheduling, and pebbling. Vector phase-lifetime integration is host-closed; its device follow-up should confirm shared-input traffic under both orders.
 10. Remove full plan construction from the exact candidate hot path only if full-solver profiling
    shows it matters; exact added about 1 ms to the measured full compiler pipeline. Promote
    retained, narrowing, split-atomic, and heterogeneous recursive cases into the persistent 910B2
