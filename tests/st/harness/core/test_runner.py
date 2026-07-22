@@ -38,7 +38,7 @@ from typing import Any
 
 import pytest
 from pypto.backend import BackendType, reset_for_testing, set_backend_type
-from pypto.pypto_core.passes import DsaReusePenaltyRecognizer, MemoryPlanner
+from pypto.pypto_core.passes import DsaReferencePlacement, DsaReusePenaltyRecognizer, MemoryPlanner
 from pypto.runtime import compile_program
 from pypto.runtime.golden_writer import (
     _data_dir_has_files,
@@ -317,6 +317,8 @@ def _compile_for_cache(
         dsa_export_dir=test_case.get_dsa_export_dir(),
         dsa_solution_dir=test_case.get_dsa_solution_dir(),
         dsa_reuse_penalty_recognizer=test_case.get_dsa_reuse_penalty_recognizer(),
+        dsa_reference_placement=test_case.get_dsa_reference_placement(),
+        dsa_reference_target=test_case.get_dsa_reference_target(),
         ptoas_sync_summary_dir=test_case.get_ptoas_sync_summary_dir(),
         skip_ptoas=codegen_only,
     )
@@ -965,6 +967,8 @@ def start_pipeline(  # noqa: PLR0913
     dsa_export_dir: str | None = None,
     dsa_solution_dir: str | None = None,
     dsa_reuse_penalty_recognizer: DsaReusePenaltyRecognizer | None = None,
+    dsa_reference_placement: DsaReferencePlacement | None = None,
+    dsa_reference_target: str | None = None,
     ptoas_sync_summary_dir: str | None = None,
     analyze_auto_scopes_for_deps: bool = False,
     enable_l2_swimlane: bool = False,
@@ -1051,6 +1055,8 @@ def start_pipeline(  # noqa: PLR0913
             dsa_export_dir,
             dsa_solution_dir,
             dsa_reuse_penalty_recognizer,
+            dsa_reference_placement,
+            dsa_reference_target,
             ptoas_sync_summary_dir,
         )
         groups.setdefault(tc.get_backend_type(), []).append(tc)
@@ -1213,6 +1219,8 @@ class TestRunner:
             self.config.dsa_export_dir,
             self.config.dsa_solution_dir,
             self.config.dsa_reuse_penalty_recognizer,
+            self.config.dsa_reference_placement,
+            self.config.dsa_reference_target,
             self.config.ptoas_sync_summary_dir,
         )
         resolved_platform = _resolve_platform(self.config.platform, test_case)
@@ -1347,6 +1355,8 @@ class TestRunner:
                 dsa_export_dir=test_case.get_dsa_export_dir(),
                 dsa_solution_dir=test_case.get_dsa_solution_dir(),
                 dsa_reuse_penalty_recognizer=test_case.get_dsa_reuse_penalty_recognizer(),
+                dsa_reference_placement=test_case.get_dsa_reference_placement(),
+                dsa_reference_target=test_case.get_dsa_reference_target(),
                 ptoas_sync_summary_dir=test_case.get_ptoas_sync_summary_dir(),
                 skip_ptoas=self.config.codegen_only,
             )
