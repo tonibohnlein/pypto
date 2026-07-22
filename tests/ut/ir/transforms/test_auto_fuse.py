@@ -841,6 +841,7 @@ class TestAutoFuse:
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
         monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
         monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
@@ -990,6 +991,70 @@ class TestAutoFuse:
         assert torch.allclose(actual_left, t @ d, rtol=1e-3, atol=1e-3)
         assert torch.allclose(actual_right, e @ t, rtol=1e-3, atol=1e-3)
         assert torch.allclose(actual_out, f @ d, rtol=1e-3, atol=1e-3)
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
+        assert len(aic) == 1, [f.name for _, f in lowered.functions.items()]
+
+    def test_cube_plan_keeps_two_compatible_boundary_values_resident(self, ascend_backend, monkeypatch):
+        """Overlapping LHS and RHS boundary lifetimes share one cube kernel.
+
+        ``a`` is the repeated LHS of the first two roots while ``b`` is the
+        repeated RHS of the first and third roots.  Their lifetimes overlap at
+        the first matmul, so this covers two simultaneously resident boundary
+        panels rather than two independent one-value examples.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def two_resident(
+                self,
+                a: pl.Tensor[[64, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                c: pl.Tensor[[64, 64], pl.BF16],
+                d: pl.Tensor[[64, 64], pl.BF16],
+            ) -> tuple[
+                pl.Tensor[[64, 64], pl.BF16],
+                pl.Tensor[[64, 64], pl.BF16],
+                pl.Tensor[[64, 64], pl.BF16],
+            ]:
+                ab: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(a, b)
+                ac: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(a, c)
+                db: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(d, b)
+                return ab, ac, db
+
+        planned = passes.auto_fuse()(Prog)
+        body = next(f for _, f in planned.functions.items() if f.name == "two_resident").as_python()
+        assert body.count("pl.spmd(") == 1, body
+        assert body.count("pl.tensor.matmul(") == 3, body
+        assert body.count("pl.Out[") == 3, body
+        resident_defs = [
+            line
+            for line in body.splitlines()
+            if "_resident_" in line.partition(":")[0] and "pl.tensor.slice" in line
+        ]
+        assert len(resident_defs) == 2, body
+        assert sum("_lhs_l1" in line for line in resident_defs) == 1, body
+        assert sum("_rhs_l1" in line for line in resident_defs) == 1, body
+
+        namespace: dict = {}
+        exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        a = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        b = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        c = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        d = torch.randn(64, 64, dtype=torch.bfloat16) * 0.05
+        actual_ab, actual_ac, actual_db = namespace["two_resident"](a, b, c, d)
+        assert torch.allclose(actual_ab, a @ b, rtol=1e-3, atol=1e-3)
+        assert torch.allclose(actual_ac, a @ c, rtol=1e-3, atol=1e-3)
+        assert torch.allclose(actual_db, d @ b, rtol=1e-3, atol=1e-3)
 
         lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
@@ -1661,6 +1726,7 @@ class TestAutoFuse:
 
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
         monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
 
         @pl.program
         class Prog:
@@ -1781,6 +1847,55 @@ class TestAutoFuse:
         actual_c, actual = namespace["diamond"](x, y)
         assert torch.allclose(actual_c, c, rtol=1e-4, atol=1e-4)
         assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-4)
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        aiv = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIV"]
+        assert len(aiv) == 1, [f.name for _, f in lowered.functions.items()]
+
+    def test_vector_plan_counts_repeated_operand_and_later_reuse(self, ascend_backend, monkeypatch):
+        """One boundary value may occupy two operand slots in one source op.
+
+        The lifetime descriptor records operand occurrences, while emission
+        loads the boundary tile once and reuses that tile for both ``mul``
+        arguments and for a later consumer.  Returning the first product also
+        combines this with a produced live-out.
+        """
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def repeated_operand(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                y: pl.Tensor[[64, 64], pl.FP32],
+            ) -> tuple[pl.Tensor[[64, 64], pl.FP32], pl.Tensor[[64, 64], pl.FP32]]:
+                squared: pl.Tensor[[64, 64], pl.FP32] = pl.mul(x, x)
+                shifted: pl.Tensor[[64, 64], pl.FP32] = pl.add(squared, y)
+                out: pl.Tensor[[64, 64], pl.FP32] = pl.mul(shifted, x)
+                return squared, out
+
+        planned = passes.auto_fuse()(Prog)
+        body = next(f for _, f in planned.functions.items() if f.name == "repeated_operand").as_python()
+        assert body.count("pl.spmd(") == 1, body
+        assert body.count("pl.tensor.slice(") == 2, body
+        assert body.count("pl.tensor.assemble(") == 2, body
+        assert body.count("pl.tensor.mul(") == 2, body
+        assert body.count("pl.tensor.add(") == 1, body
+
+        namespace: dict = {}
+        exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)  # noqa: S102
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, dtype=torch.float32)
+        y = torch.randn(64, 64, dtype=torch.float32)
+        squared = x * x
+        actual_squared, actual = namespace["repeated_operand"](x, y)
+        assert torch.allclose(actual_squared, squared, rtol=1e-4, atol=1e-4)
+        assert torch.allclose(actual, (squared + y) * x, rtol=1e-4, atol=1e-4)
 
         lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         aiv = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIV"]
