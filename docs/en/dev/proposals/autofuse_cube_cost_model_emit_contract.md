@@ -111,10 +111,22 @@ both inputs produced, fan-out role changes, and multiple roots. Distinct request
 distinct producer instances and pay recomputation; identical instances are shared in the request
 DAG.
 
-Request ordering goes through the common `PebblingOrderStrategy` interface. The current strategy is
-deterministic DFS postorder for both the source-op DAG and cube's role-expanded request DAG. This
-keeps ordering policy separate from lifetime accounting so a reuse-distance or Gorder-like strategy
-can be evaluated later without changing cost or emit semantics.
+Request ordering goes through the common `PebblingOrderStrategy` interface. Deterministic DFS
+postorder remains the compile-time default for both the source-op DAG and cube's role-expanded
+request DAG. A dependency-constrained implementation of the
+[Gorder locality objective](https://dl.acm.org/doi/10.1145/2882903.2915220) is also available: it
+greedily maximizes direct-neighbor plus common-predecessor/request-value score in a five-node sliding
+window, but selects only ready nodes so producers still precede consumers. Boundary locality uses
+the exact role-expanded value identity below. Its incremental ready-set update runs once in
+`create()`, not for every tile candidate. Build with `-DPTO_FUSEBOX_GORDER=ON` for controlled
+comparison; DFS stays default until model and device evidence justify changing it.
+
+Gorder is not generally an `O(V+E)` algorithm. With a fixed-size window, direct-edge updates are
+linear, but common-predecessor updates can cost `sum(out_degree(u)^2)`; the role-expanded extension
+has the analogous `sum(users(value)^2)` term for shared boundary values, plus ready-set logarithmic
+factors. It is close to linear on bounded-fan-out DAGs and avoids an `O(V^2)` materialized score
+table, but high-fan-out graphs retain a superlinear worst case. This ordering is computed once per
+subgraph, never once per tiling candidate.
 
 Boundary-input identity is `(source tensor, requested region, dtype, memory pool, operand role)`.
 The role is load-bearing: two matmuls requesting the same LHS slice may share it, while `A @ A`
@@ -211,10 +223,14 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    identity includes operand role, so `A @ A` cannot alias its LHS and RHS representations. The
    initial policy always retains a repeated compatible value and declines the candidate if the
    combined produced/input lifetime peak does not fit. A later optimization may compare spill/reload
-   alternatives. The shared order interface currently uses DFS; add and silicon-compare a
-   reuse-distance/Gorder-like policy before changing it. The common ordering/lifetime abstraction
-   is available to vector and cube scheduling, but group-resident replay is implemented only for
-   cube today; vector integration remains a separate tested increment.
+   alternatives. The shared interface now implements deterministic DFS and dependency-constrained
+   Gorder; silicon-compare them before changing the DFS default. The common ordering/lifetime
+   abstraction now also covers vector boundary inputs. Vector identity is `(tensor, replay phase)`
+   rather than cube `(tensor, operand role)`: one UB slice is reused through its last consumer in a
+   phase, while a stats/apply barrier creates two reads. A separate greedy reuse-distance strategy
+   is intentionally deferred until a literature review of
+   dependency-constrained locality ordering, register-pressure-aware DAG scheduling, and pebbling;
+   do not add an ad hoc heuristic before its objective and complexity are compared with Gorder.
 
 4. **Exact feasibility and objective scope.** Initial exact feasibility sizes boundary strips at
    the whole requested M/N region before the smaller emitted output/L0C tile is chosen, so it can

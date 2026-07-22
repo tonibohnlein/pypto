@@ -139,12 +139,15 @@ The tile size changes occupancy, DMA efficiency, and the exact emitted strip tra
 The model does not check "does the whole group fit UB." It checks **peak simultaneously-live
 bands over the pebbling order** (`vector_peak_ub :1241`):
 
-- an ephemeral tensor `t` occupies a UB band across `[producer, last consumer]` in `dfs_order_`;
+- an ephemeral tensor `t` occupies a UB band across `[producer, last consumer]` in the selected order;
+- a boundary input occupies one UB band from first through last use in each replay phase. Vector
+  identity is `(tensor, phase)`: operand position does not split the UB representation, while the
+  barrier between stats and apply deliberately creates two lifetimes and two GM→UB reads;
 - at each step, peak = live bands + transient input/output tiles;
 - a reduction materialization includes both its source tile and tensor-lowering work/layout tile;
 - feasible ⟺ `max over steps ≤ UB`.
-- `dfs_order_` (post-order DFS from sinks) is chosen to **minimize** that peak — finish a
-  branch (and free its bands) before starting a sibling. This is the pebble game.
+- `dfs_order_` is the legacy name for the selected order. Post-order DFS remains the default and
+  finishes one branch before a sibling; dependency-constrained Gorder is available for comparison.
 
 An intermediate that is **free in DDR (fused) still costs a pebble in UB.** The order is what
 keeps that affordable, and it is part of the Solution.
@@ -160,8 +163,8 @@ every tensor a per-axis **role**:
   extent 1 on a tiled axis is a **broadcast** → `FIXED_1` (read whole, reused across tiles).
 - **Reduction** → the input is `FIXED_1` on the **reduced** axis (read full) and follows the
   output on the free axis. `[H,W]→[1,W]` (col reduce): input role `{tiled-w, FIXED_1-on-H}`.
-- **Matmul** → LHS/RHS take the contraction role (`FROM_NK`) on K; a non-sink matmul reads
-  `FIXED_1` on its non-shared axis.
+- A vector tensor has no cube-like LHS/RHS representation split. Within one phase, all consumers
+  reuse the same shape/dtype UB tile; only shape propagation and the replay phase affect identity.
 
 `FROM_NT*` = "slice to the tile"; `FIXED_1` = "read in full / broadcast / reduced-axis".
 **Combining the two walks gives the algorithm:** for each op in `dfs_order_`, execute it at
@@ -181,10 +184,10 @@ its back-propagated operand tile shapes.
 | A1 | compute spreads over `U = parts_m·parts_n` invocations (wave makespan) | emit ONE per-logical-region kernel body and launch it over the exact solver grid (`SpmdScopeStmt` + `get_block_idx` → offset) | ✅ device-confirmed. `VectorStreamPlan` owns element-balanced M/N partitions and `work_units`; cost, diagnostics, and emit consume that count. DMA padding is recorded separately and cannot change the launch grid. |
 | A2 | ephemeral intermediates cost **0 DDR** (fusion win), except an explicitly returned value is also a boundary output | keep ordinary intermediates **on-chip**; for a returned-and-consumed SSA value, retain its UB lifetime and also assemble its required DDR live-out | ✅ returned live-outs are explicit in `Problem`; P4 rejects escaped stats. |
 | A3 | each op runs at its **back-propagated role** shape | slice `FROM_NT*` operands to `[h,w]`; read `FIXED_1` operands in full (broadcast / reduced-axis) — `emit_strip` | ✅ honored (G4 done, 2026-07-09). `emit_strip` slices any 2D operand per-axis: a full axis follows the tile `[sh/sw]` at `[smi/sni]`, a size-1 (broadcast/`FIXED_1`) axis stays `[1]` at offset 0; the op replay re-infers the broadcast. Covers `[1,N]` bias-add, `[M,1]` scale / reduced-axis stat, `[1,1]`. Other 2D shapes still decline. |
-| A4 | UB feasibility = peak live bands over the **pebbling order**, actual tensor dtypes, generated scratch, and pipeline copies | replay ops in `dfs_order_`; let MemoryReuse alloc/free UB per the emitted liveness | ✅ source lifetimes are byte-weighted per tensor; planned prefetch/generated scratch are explicit. Mixed-width lowering regression-covered. |
+| A4 | UB feasibility = peak live bands over the **pebbling order**, actual tensor dtypes, generated scratch, and pipeline copies | replay the selected order; load a boundary tile once per phase/strip, keep it through its last use, and let MemoryReuse realize that liveness | ✅ produced and boundary-input lifetimes are byte-weighted; the winning emit validates the exact tensor/use-op descriptor before caching the slice. Planned prefetch/generated scratch remain explicit. |
 | A5 | roofline `max(compute, DDR)` only within a loop that overlaps load k+1 with compute k | emit that exact loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) and keep barriers serial | ✅ `VectorStreamPlan` owns materialized/pointwise row+width strips and P1/P2/P4 init/rolled/tail/finalize phases. Cost is `Σphase roofline`; peeled phases use `compute+DDR`, and sub-register or short rolled loops stay sequential. |
 | A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a terminal **sum col-reduction** sink; else stay serial | ✅ exact admission, seed cost, `work_units*S` fill waves, and 32-byte seed-row buildability gate. |
-| A7 | streamed input reads are phase-specific: an operand may be stats-only, apply-only, or both | stream with running stats; derive each phase's dependency cone and read only its inputs | ✅ G3 uses per-input phase masks. `x` in P2/P4 is normally read in stats+apply; an apply-only scale/bias is charged and emitted once. |
+| A7 | streamed input reads are phase-specific: an operand may be stats-only, apply-only, or both | consume the shared `VectorInputLifetimeTopology`; read each tensor once per emitted phase/chunk and reuse it for all source-op consumers | ✅ `x` in P2/P4 has separate stats/apply lifetimes; an apply-only scale/bias is absent from stats. Repeated operands such as `mul(x,x)` remain one transfer/use-op. |
 
 “Wave” in A1 is an analytical makespan, not an emitted runtime construct. The runtime receives `U`
 ready SPMD tasks and schedules them without affinity controls. A logical region therefore stays one
@@ -331,42 +334,27 @@ gates therefore agree on materialized versus streamed execution.
 
 ### 🔴 Correctness
 
-**G1 — large softmax/layernorm silently overflow UB. [FIXED; exact P4 capability built.]**
-The stream gate requires `p1_nreds == 1` (`auto_fuse_pass.cpp:1231`), so a 2-reduction group
-cannot stream; it used to fall through to a full-reduced-axis materialized tile that overflowed
-(hard `AllocateMemoryAddr` failure). **Fixed** (PTO Fusebox `603ec35`, PyPTO `69d7f508`): a new
-`Problem::allow_model_ahead_multi_reduction_stream` flag — the AutoFuse adapter sets it false
-(buildable), so a streamed >1-reduction group is **infeasible** and the partitioner **cuts** it
-into single-reduction (streamable) + pointwise pieces. An **unfused softmax IS buildable**, so
-large softmax/layernorm now **compile** (verified: `softmax[128,16384]` builds, was a crash).
-Emit defense-in-depth remains. With P4 enabled, one shared exact semantic analysis records complete
-canonical softmax/layernorm op sets; the model admits only an exactly equal candidate and the emitter
-consumes the same descriptor. Temperature/scaled softmax, weighted moments, chained norms, and
-multi-sink escapes cut rather than being reinterpreted.
+**G1 — large softmax/layernorm silently overflow UB. [FIXED; exact P4 capability built.]** A
+multi-reduction group that lacks an implemented online algorithm is infeasible and is cut into
+streamable pieces instead of reaching `AllocateMemoryAddr`. P4 shares one exact canonical
+softmax/layernorm descriptor between admission and emission; temperature/scaled softmax, weighted
+moments, chained norms, and multi-sink escapes still cut rather than being reinterpreted.
 
 ### Roofline
 
-**G2 — A5 — phase rooflines and solver-owned loops — FIXED (2026-07-12).** Both streamed passes emit
-`ForKind::Pipeline` + stages=2 (mirroring the pointwise strip): the accumulate pass 0 (the
-running accumulator or P4 `(m,l)` / Welford `(mean,M2,count)` IterArgs) and the apply pass 1
-(assembles disjoint reduced-axis chunks, lowered to in-place stores by
-`RewriteReturnedAssembleLoopToStore`). `LowerPipelineLoops` double-buffers only the per-chunk load
-while keeping loop-carried state single-buffered/persistent. Pipelined only when the rolled chunk trip
-is at least 2 (nothing to overlap otherwise). `VectorStreamPlan` now owns the reduction chunk and
-trip counts; stage-2 chunk sizing duplicates source-DAG transient bands while leaving carried state
-single-buffered. `compute_cost` uses the plan as a stack-local derivation and the emitter re-derives the same
-plan for the winning config. Materialized/pointwise row+width strips use that same plan; the old
-quadratic emitter-side liveness/scheduling scan is gone. Costing sums barrier-separated phase
-rooflines: init/tail/finalize serialize, while each eligible rolled loop independently receives
-`max(compute,DDR)`. The shared P2/softmax/Welford carried-loop and spanning-apply builders consume
-the plan's stage count directly.
+**G2 — A5 — phase rooflines and solver-owned loops — FIXED (2026-07-12).** Stats and apply rolled
+loops emit `ForKind::Pipeline` with stage 2 only when at least two chunks can overlap; init, tail,
+finalize, and loop-carried statistics stay serial/persistent. `VectorStreamPlan` owns the chunks,
+trips, stages, and materialized/pointwise strips. Costing sums barrier-separated phase rooflines,
+and the shared P2/softmax/Welford builders consume those fields directly.
 
 ### ⚠️ Cost fidelity
 
-**G3 — A7 — streamed input multiplicity — FIXED per input.** Candidate-invariant DAG cones assign
-each boundary input to stats, apply, finalize, or body. Costing charges the exact emitted chunks for
-those phases; a stats+apply `x` reads twice, while an apply-only scale/bias reads once. The emitter
-replays the same dependency cone and treats substituted online statistics as leaves.
+**G3 — A7 — streamed input multiplicity/lifetime — HOST-CLOSED.** Candidate-invariant phase cones
+produce `VectorInputLifetimeTopology`: every boundary tensor records first/last step, distinct
+source-op uses, and phase. UB feasibility retains it to last use, traffic charges once per
+tensor/phase/chunk, and emission resolves the descriptor back to one SSA value and caches one slice.
+Thus stats+apply `x` reads twice across the barrier, while apply-only bias reads once.
 
 **G4 — A3 — broadcast priced-fusible but emit-declined — FIXED (2026-07-09).** The emit now
 builds a broadcast operand (one axis full, the other 1): `emit_strip` slices per-axis (full axis
@@ -381,37 +369,20 @@ the old mismatch: forced `8192,11,1,12,1` was costed as 12 tasks but DMA alignme
 streamed free tile and emission to 8 blocks. The fix deliberately keeps the user's solver choice:
 `work_units = parts_m·parts_n = 12`, with an element-balanced 11/10-row ownership partition.
 `free_tile_alloc=16` records the FP32 UB/DMA allocation independently; reduced-axis `chunk` remains
-the inner stream inside each logical task. Costing uses the same logical count for waves, active GM
-pipes, per-task overhead, `CostResult`, and traffic replay; emission uses it for `pl.spmd(12)` and
-reconstructs the balanced offsets. On 910B2 every forced grid matched `pl.spmd(N)`; the padded
-`h=11` plan retained 12 logical regions, and the repaired natural `[128,8192]` argmin became the
-device-best `h=8`, 16-task plan. Host traffic now follows the emitter's uniform maximum-shape body:
-ragged blocks clamp their base and replay overlap, so a 48×3 grid prices 144 row-equivalents rather
-than the 128-row logical union. The device follow-up must verify that static-body interpretation.
+the inner stream inside each task. Cost and emit use the same count for waves, active GM pipes,
+overhead, traffic, and `pl.spmd`. On 910B2 every forced grid matched `pl.spmd(N)` and the repaired
+natural `[128,8192]` argmin became the device-best 16-task plan. Ragged blocks price the emitter's
+clamped maximum-shape body rather than the logical union.
 
 **G6 — A6 — materialized reduction split admission and seed — HOST-CLOSED.** The 910B backend lowers
 only atomic add, and slicing a reduction cone preserves semantics only for one terminal `col_sum`
 whose upstream cone is pointwise. The solver now derives that exact capability from the source
-primitive, axis, sink count, and reduction count; every row sum, max/min, internal reduction,
-multi-sink, and descriptor-free reduction enumerates only `S=1`. A fixed `S>1` candidate proves a
-materialized source/work tile, a granule-aligned exact reduced-axis partition, and a non-overlapping
-free-axis partition. Its ephemeral-granule check also evaluates an upstream pointwise cone at the
-actual `M/S` partial rather than the sink's size-one M axis. `VectorStreamPlan` records
-`ColSumAtomicAdd`, the factor, and partial extent; costing replays every source primitive at the
-emitted `[M/S,free]` partial geometry. It also records a separate `VectorReductionSeedPlan`: the
-zero-fill launch is ordered before the atomic body and pays grounded `TEXPANDS` fill work (24 cycles
-for a nonempty tile), UB→GM store, its own task overhead, and its own kernel-fill wave. The emitter
-consumes and verifies both descriptors to build the tiled zero seed plus atomic-add partial grid. Any
-future `S>1` plan without the descriptor is a Tier-B contract failure instead of silently emitting
-the serial body. Solver tests cover all rejected families and ragged grids; the strict AutoFuse test
-checks both bare and pointwise-cone atomic protocols plus numeric results. The seed is deliberately
-serial and cannot hide under the atomic body's roofline.
-
-The 910B2 closure exposed a backend constraint absent from the first host contract: PTOAS rejects a
-row-major FP32 seed row narrower than one 32-byte DMA block. Admission now proves
-`tile_w*dtype_bytes >= vec_dma_align_bytes`; `[2048,4]→[1,4]` therefore stays `S=1`, while the aligned
-`[2048,8]→[1,8]` control retains the split. Kernel fill counts `work_units*S` main-body tasks plus the
-separately ordered seed launch, rather than charging only the spatial grid.
+primitive, axis, sinks, and reductions; unsupported cases enumerate only `S=1`. An `S>1` candidate
+proves materialized work, exact granule-aligned partitions, and replays its cone at emitted
+`[M/S,free]` geometry. `VectorStreamPlan` records the atomic body and a separate ordered
+`VectorReductionSeedPlan`; cost and emit include seed fill/store/tasks/wave. Admission also requires
+a 32-byte-buildable seed row, so `[2048,4]` stays serial while aligned `[2048,8]` retains the split.
+Missing or mismatched descriptors fail the contract rather than falling back.
 
 **G7 — P4 algorithm-specific compute — SILICON-CLOSED (2026-07-13).** Phase masks
 price the source DAG, but P4 stats emission builds a different online algorithm. Welford emits chunk
@@ -501,16 +472,11 @@ explicit generated scratch. The FP32→INT8 forced-plan regression now lowers wi
   through `Empty→Writing→Ready`, so an acquiring reader cannot observe a partially copied
   `CostResult`; a concurrent stress test covers the protocol. The default base table uses 131072
   slots instead of one million, and the equally sized retention tier is allocated only if used.
-  Duplicate candidate validation is removed, and prologue reachability
-  is one reverse-topological `O(N+E)` DP rather than a BFS from every pointwise op.
-- **Candidate-hot replay — FIXED (2026-07-13).** Subgraph creation now materializes only
-  candidate-invariant UB lifetime/transient metadata and phase-ordered op/input lists. Tile
-  candidates still derive their complete shape-dependent plan and cost, while winners are
-  independently re-derived for emission. `CostResult` remains plan-free; P4 adds constant phases,
-  not a nested configuration search.
+  Duplicate validation is removed; prologue reachability is one reverse-topological `O(N+E)` DP.
+- **Candidate-hot replay — FIXED (2026-07-13).** Creation stores candidate-invariant UB metadata,
+  input lifetimes, and phase op lists; candidates derive plans/costs and `CostResult` stays plan-free.
 - **Offline task-cost replay — FIXED (2026-07-13).** Problem JSON now serializes and reloads
-  `per_task_overhead_cycles`; a dumped generic-emitter problem therefore retains C3's 64-cycle
-  per-logical-task term instead of silently re-ranking grids offline.
+  `per_task_overhead_cycles`, preserving C3's 64-cycle term in dumped generic-emitter problems.
 - **Granule-padding feasibility fiction — FIXED (2026-07-09, BUG-G1THRESH).** The emit allocates
   `AlignUp(sh,g)×AlignUp(sw,g)` tiles (`g = vec_dma_align_bytes / group_min_dtype_bytes`); the cost
   model's `vector_peak_ub::tile_bytes` used unpadded `min(cfg,dim)`, so a thin free axis (M-tile
@@ -523,7 +489,7 @@ explicit generated scratch. The FP32→INT8 forced-plan regression now lowers wi
 - **Reduction source/work materialization floor — FIXED (2026-07-12).** Tensor reduction lowering
   allocates a work/layout tile alongside the source tile. `vector_peak_ub` now counts both bands, so
   a reduction that needs more than UB streams instead of reaching `AllocateMemoryAddr` and failing.
-- `dfs_order_` is a greedy topo-tie-break heuristic, not a provably-minimal pebbling.
+- `dfs_order_` is the legacy storage name for the selected pebbling order. DFS remains default; dependency-constrained Gorder is implemented for controlled comparison, not claimed optimal.
 
 ### The rule of thumb
 
