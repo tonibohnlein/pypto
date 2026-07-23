@@ -245,8 +245,8 @@ def cube_solution() -> dict:
                 "split_k": 1,
                 "work_units": 1,
                 "peak_l1_bytes": 65536,
-                "seed_required": False,
-                "seed": {"present": False},
+                "split_merge_policy": "none",
+                "first_partial_then_atomic": {"present": False},
                 "model_overlap_granted": True,
                 "overlap_implementable": True,
                 "matmuls": [
@@ -306,20 +306,22 @@ def test_cube_algorithm_shows_tile_flow_and_recursive_lifetime(cube_problem, cub
     assert dot.index("MATMUL REQUEST 0 · Op 0") < dot.index("MATMUL REQUEST 1 · Op 1")
 
 
-def test_cube_split_seed_is_not_labeled_as_a_spatial_region(cube_problem, cube_solution):
-    cube_solution["cube_schedule"][0]["seed"] = {
+def test_cube_split_merge_is_shown_as_ordered_aic_phases(cube_problem, cube_solution):
+    cube_solution["cube_schedule"][0]["split_merge_policy"] = "first_partial_then_atomic"
+    cube_solution["cube_schedule"][0]["first_partial_then_atomic"] = {
         "present": True,
-        "work_units": 7,
-        "valid_rows": 8,
-        "valid_cols": 64,
+        "first_work_units": 4,
+        "atomic_work_units": 16,
+        "synchronization_cycles": 0,
     }
 
     dot = visualize.build_algorithm_dot(cube_problem, cube_solution, 0)
 
-    assert "separate AIV split-K seed" in dot
-    assert "7 UB-safe zero stores" in dot
-    assert "not part of the cube tile pipeline" in dot
-    assert "seed 7 spatial regions" not in dot
+    assert "ordered split-K merge" in dot
+    assert "phase 1 · 4 AIC tasks · share 0 → normal store" in dot
+    assert "dependency boundary · 0 modeled cycles" in dot
+    assert "phase 2 · 16 AIC tasks · remaining shares → atomic add" in dot
+    assert "AIV" not in dot
 
 
 def test_serial_cube_k_loop_does_not_claim_pipeline_overlap(cube_problem, cube_solution):

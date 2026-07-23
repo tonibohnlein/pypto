@@ -101,7 +101,7 @@ class TestAutoFuseEmitGolden:
     must pass every case here.
     """
 
-    # ---- TileMatmul (single matmul: split-K seed + atomic merge) ----
+    # ---- TileMatmul (single matmul: ordered split-K partial merge) ----
 
     def test_matmul_square(self, ascend_backend):
         torch = pytest.importorskip("torch")
@@ -135,7 +135,7 @@ class TestAutoFuseEmitGolden:
     def test_matmul_split_k(self, ascend_backend):
         """Force split-K explicitly: a small output (few spatial tiles) with a deep K, so
         the solver splits the contraction across cores to fill them — exercising the
-        riskiest new path (tiled zero-seed + DDR atomic-add merge + the flat-index decode).
+        ordered first-partial + atomic-rest merge and the flat-index decode.
         Looser tolerance because atomic-add reassociates the K partials vs. the unfused
         matmul (see ``_emit_matches_reference``)."""
         torch = pytest.importorskip("torch")
