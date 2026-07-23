@@ -92,8 +92,10 @@ loop:
 - the single final FIXPIPE drain after the tile becomes complete;
 - recursive L1 result retention and last-use release between matmul requests.
 
-The optional split-K zero seed is shown as a separate AIV prologue. Its work-unit count is the number
-of UB-safe seed stores, not the number of cube spatial regions.
+The optional split-K merge is shown as two ordered AIC phases. Phase one assigns K share zero to one
+task per spatial region and uses normal stores. The dependency boundary then releases the remaining
+shares, which atomic-add into the initialized GM output. The diagram reports both launch sizes and
+the explicit synchronization-cost hook; there is no AIV zero-fill prologue.
 
 The solution serializer reconstructs these descriptors only for final selected steps. They remain
 absent from the local-search `CostResult` cache. Old `.sol.json` files without `vector_stream` or

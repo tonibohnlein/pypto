@@ -391,7 +391,8 @@ The cube path now has the same solver-owned-plan discipline as the vector path, 
 hardware levels.
 
 **`CubeSchedulePlan` (cross-core and GM/L1).** It records spatial/split work units, recursive
-requests, produced/boundary-input L1 lifetimes, K windows, output variants, drains, and split seed.
+requests, produced/boundary-input L1 lifetimes, K windows, output variants, drains, and
+`FirstPartialThenAtomic` split ownership.
 Repeated inputs have first/last-use residency; role keeps `A @ A` LHS/RHS separate. Topology is built once in `create()` and the full plan is reconstructed only for a winner/force, never in `CostResult`.
 
 **Ordering policy.** Source and cube role-expanded DAGs use one `PebblingOrderStrategy` interface.
@@ -411,22 +412,22 @@ stage depth does not multiply the child L0 ping/pong buffers.
 
 **Exact-mode phase cost.** Uniform candidates put every full K window, including K=0, in one
 stage-2 ring and price its fill/steady-state/drain, followed by serial K tails, exact ragged output
-variants, and one final drain. Boundary requests are
-charged once per emitted output tile, including the known LHS reload across N subtiles. Split seed
-fill/store/tasks and its kernel-fill wave are explicit. The child L0 plan has the same phase
-decomposition. Its already-grounded geometry ordering is retained until a per-iteration PTO event
-term is measured; using phase granularity alone would falsely prefer baseK=16.
+variants, one final drain, and boundary requests charged once per emitted output tile. The former
+split seed is replaced by two ordered AIC phases: share zero writes normally, then the remaining shares
+atomic-add. Both launch walls and their kernel-fill waves are explicit. The child L0 plan has the
+same phase decomposition. Its already-grounded geometry ordering is retained until a per-iteration
+PTO event term is measured; using phase granularity alone would falsely prefer baseK=16.
 
 **Dtype contract.** BF16/FP16 operands accumulate in FP32 L0C. An internal producer narrows once to
 BF16/FP16 Mat, matching PTO's fused-chain kernel; roots narrow/store to their declared output.
 Same-type FP32 internal L1 handoff is not an A2/A3 instruction. Exact mode declines it; analytic
 currently ranks then falls back, which is a TODO below. Direct Mat→GM store is legal.
 
-**Host validation.** PTO Fusebox reports 507 passing checks with one `FDM` analytic-ranking failure;
-AutoFuse reports 59. Coverage includes recursive BF16 DAGs, split/ragged K, multi-window and shared-
-boundary residency, multi-role `A @ A`, Torch numerics, and PTOAS lowering. Parser/outliner reports 126, including multi-output SPMD round-trip.
+**Host validation.** PTO Fusebox reports 523 passing checks with no failure; AutoFuse reports 63.
+Coverage includes recursive BF16 DAGs, split/ragged K, multi-window and shared-boundary residency,
+multi-role `A @ A`, Torch numerics, and PTOAS lowering. Parser/outliner reports 126, including multi-output SPMD round-trip.
 
-The latest host closure fixes two compiler-side lifetime mismatches without changing cube costs.
+The prior host closure fixes two compiler-side lifetime mismatches without changing cube costs.
 Early simplification prevents a dead branch from allocating another persistent L0C accumulator;
 serial child init/tail extracts keep order and reuse a rolled Left/Right bank instead of entering
 an enclosing GM→L1 prefetch tier.
@@ -445,15 +446,16 @@ in the runtime scheduler span. Wider sweeps found no transferable per-task corre
 was U-shaped while another improved with more tasks. Exact remains incomplete at this system
 boundary, but no scalar correction is supported.
 
-**Remaining gaps:**
+**Status and remaining gaps:**
 
 1. Add one candidate-invariant homogeneous cube capability descriptor. Reject unsupported
-   transpose/layout, operand dtype, and Acc→Mat cases before solving and recheck at emit; use a typed
-   integer zero for an INT8→INT32 split seed.
-2. Make analytic cost follow emission: sum request-local phase roofs, add serial init/tail/drains and
-   the split seed, and count GM→L1/MTE1 at emitted output-tile multiplicity. Shared boundary inputs
-   now have an explicit first/last-use L1 plan and one emitted preload; keep that descriptor and
-   traffic identical when replacing the global analytic roofline.
+   transpose/layout, operand dtype, and Acc→Mat cases before solving and recheck at emit. Split-K
+   roots must publish the hardware accumulator dtype.
+2. Analytic multi-request cost now follows the serial emitter: it sums request-local phase roofs,
+   serial drains, group preloads, and repeated boundary traffic instead of globally overlapping
+   dependent matmuls. Split-K adds the serialized first-partial and atomic-rest phase walls;
+   `cube_split_sync_cycles` stays zero until independently grounded. A future panelized back-to-back
+   schedule is a new model/emit algorithm with co-live producer/consumer stages, not a roofline tweak.
 3. Exact initial L1 feasibility uses whole-request M/N before output subtiles are known, so couple
    child-tile and K-window feasibility before pursuing broader exact-mode ranking.
 4. Non-uniform buildable cost/emission: lone split=1 has `ClampedOverlap`; ragged split-K,
@@ -482,8 +484,8 @@ The authoritative obligation table and validation ladder are in
 
 ## 9. Operational gotchas (don't relearn these)
 
-- **Build MAX 2 cores.** Use absolute build paths (a `cd 3rdparty/pto-fusebox` persists across shell calls
-  and mis-targets the build).
+- **Build MAX 2 cores.** Use absolute build paths; a persistent `cd 3rdparty/pto-fusebox`
+  can mis-target the build.
 - **FORCE_PLAN is static-cached per process** → one force per fresh subprocess; the `group[0]` solver
   log is misleading under force (prints the argmin, not the forced tile) — trust the emitted
   `pl.spmd(N)` count.
@@ -494,7 +496,5 @@ The authoritative obligation table and validation ladder are in
 - **Remote access:** SSH is currently blocked; use the public HTTPS PTO Fusebox submodule and publish
   it before the parent when both repositories change. NEVER push / open PRs without explicit order;
   NEVER add AI co-author lines; never hack test expectations.
-- **Device runs:** a separate agent checks out `fusion-scheduler-vector-stream-plan`, builds, and runs
-  on 910B2 with a working
-  `device_wall effective_us` STRACE path; `benchmark()` hits error 507018 (avoid). Fingerprint-gate on
-  HEAD + PTO Fusebox hash first.
+- **Device runs:** use the 910B2 `device_wall effective_us` STRACE path; `benchmark()` hits error
+  507018. Fingerprint-gate on HEAD + PTO Fusebox hash first.

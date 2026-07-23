@@ -31,7 +31,7 @@ Cube evaluation has two deliberate optimization modes:
 - each matmul's GM→L1 K window, chunk, init, rolled loop, and tail;
 - the L0C-resident output-tile grid;
 - internal Acc→Mat and root Acc→GM drains;
-- split-K seed and atomic ownership.
+- split-K first-partial and atomic-rest ownership.
 
 The shared `L0MatmulPlan`, selected by the same PTO Fusebox chooser used by
 `AutoTileMatmulL0`, owns:
@@ -60,7 +60,7 @@ extracts, cube operations, and low-level drains; in exact mode it also fails on 
 | C7 | Exact mode prices a concrete shared-backend L0 plan; analytic mode prices the grounded surrogate | Always attach the output-residency intent; attach and validate detailed geometry only in exact mode; let `AutoTileMatmulL0` realize both |
 | C8 | Overlap is local to one concrete full-window loop | Put K=0 and every rolled full window in the same eligible stage ring; add only its fill/drain, the ragged tail, and final output drain serially |
 | C9 | GM traffic follows the emitted request and output-tile loops | Give a repeated compatible boundary value one serial group preload; otherwise charge repeated per-tile feeds, except for an explicitly selected request-local retained panel |
-| C10 | Split-K writes `S` atomic partials | Emit one ordered, tiled zero seed and `S` disjoint K shares, or select `S=1` |
+| C10 | Split-K has one initializing share and `S-1` merge shares | Emit an ordered normal-store AIC phase for share zero, then an atomic-add AIC phase for shares `1..S-1`, or select `S=1` |
 | C11 | Cube accumulation dtype differs from storage dtype | Accumulate float inputs in FP32, then narrow once at the planned BF16/FP16 or GM drain |
 
 ## 4. Grounded loop structure
@@ -102,6 +102,80 @@ after the rolled L1→L0/Matrix phase and reuse one of its operand banks; an enc
 must not hoist them into its prefetch tier. Pipeline lowering is simplified before memory
 materialization so constant-dead peeled branches cannot create a second L0C accumulator. These are
 compiler schedule invariants, not additional model feasibility terms.
+
+### 4.1 Serial request composition is the current contract
+
+A homogeneous cube DAG is currently replayed as a serial sequence of complete matmul requests. For
+`T = A @ B; Y = T @ D`, one work unit executes:
+
+```text
+preload group-resident boundary values
+run all output tiles and K windows of A @ B
+drain the completed T region to L1/Mat
+run all output tiles and K windows of T @ D
+drain the completed Y region to GM
+```
+
+Each matmul may independently use its emitted stage-2 K-window ring. The dependency between the two
+requests is nevertheless serial: the second request does not start consuming a panel while the
+first request is still producing later panels. The cost must therefore be:
+
+```text
+T_group = T_resident_preloads
+        + sum(T_request_init
+              + T_request_rolled_roofline
+              + T_request_tail
+              + T_request_drain)
+        + T_first_partial_phase
+        + T_split_sync
+        + T_atomic_rest_phase
+
+T_request_rolled_roofline = max(MTE2, MTE1/Matrix)
+                            only for that request's emitted stage-2 loop
+```
+
+It must not use `max(sum(request compute), sum(request traffic))`: that expression overlaps work
+across a producer/consumer boundary that the emitter does not pipeline. The request-order pebbling
+model is the matching memory contract. Produced regions and compatible repeated boundary inputs
+remain live from first use through last use; only the currently executing request contributes its
+transient GM→L1 window. No cross-request ping/pong buffers are assumed.
+
+Vector fusion does not have the same mismatch. A vector phase emits one strip/chunk loop whose body
+replays all pointwise operations in that phase. Summing those operations before applying the phase
+roofline is valid because they are work in one concrete loop iteration, and iteration `i+1` is
+actually prefetched while iteration `i` computes. Stats, apply, init, tail, and finalize are distinct
+barrier-separated phases; their rooflines are added. `VectorStreamPlan` also charges the second copy
+of pipelined source-DAG bands and the next iteration's boundary inputs in UB. The vector model never
+uses one roofline to hide work across the stats/apply barrier.
+
+### 4.2 Deferred extension: panelized back-to-back matmul
+
+A later cube revision may add a different algorithm for compatible chains:
+
+```text
+Y_acc = 0
+for panel j of the shared N axis:
+    T_j = A @ B[:, j]
+    Y_acc += T_j @ D[j, :]
+store Y_acc
+```
+
+This can avoid materializing the full intermediate and permit GM/L1 work for a neighboring request
+to overlap. It is not an alternative cost equation for the current plan; it is a new schedule and
+must have a new solver-owned descriptor and emitter. A future `PanelizedB2BPlan` must record:
+
+- the shared panel axis, panel extent, warmup, steady state, and tail;
+- the intermediate Mat/L1 ring depth;
+- the persistent consumer accumulator and temporary producer accumulator, which are simultaneously
+  live in L0C;
+- co-live producer and consumer GM→L1 windows and any retained panels;
+- the L0A/L0B banks that can be reused between sequential Matrix instructions;
+- exact per-memory-space peaks derived from stage lifetimes.
+
+The steady-state Matrix term is `Matrix_MM1 + Matrix_MM2`, never their maximum, because both use the
+same Matrix pipe. A combined phase roofline is legal only after emission replays this combined
+schedule. Until then, serial request composition is the only admitted cube contract and the existing
+pebbling model remains unchanged.
 
 ## 5. Implemented schedule and cost
 
@@ -164,8 +238,11 @@ final drain     = Acc->Mat or Acc->GM
 ```
 
 Variant cost is multiplied by its exact count, then by ready-queue waves. Internal drains use the
-grounded L0C→L1 pipe; roots use the grounded L0C→GM/FIXPIPE model. A split seed is an explicit serial
-vector fill/store/task phase and contributes its own kernel-fill wave. For each request the planner
+grounded L0C→L1 pipe; roots use the grounded L0C→GM/FIXPIPE model. Split-K uses
+`FirstPartialThenAtomic`: one serialized AIC launch computes share zero for every spatial region with
+normal stores, then a second AIC launch computes the remaining shares with atomic-add stores. The
+cost is the sum of both phase walls plus an explicit, zero-default synchronization term. Each launch
+contributes its own kernel-fill waves. For each request the planner
 compares no retention, LHS retention, RHS retention, and both. A choice is admitted only when the
 complete panel lifetime plus the other operand's rolling window fits L1. Its preload is added
 serially before the output-tile loop; subsequent K-window feeds omit exactly that retained side.
@@ -187,7 +264,7 @@ The emitter replays the same algorithm:
   `matmul_acc`, followed by a serial K tail;
 - FP32/INT32 tensor-level accumulator values, followed by one narrowing/store drain;
 - one L1 scratch per supported internal request and direct GM root assembly;
-- one tiled vector seed before split-K atomic root stores.
+- one normal-store first-partial launch before the split-K atomic-rest launch.
 
 Direct `Mat`→GM `tile.store` is legal PTO `TSTORE`; memory-space inference therefore does not insert
 an unnecessary Mat→Vec move.
@@ -206,16 +283,20 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    accumulator/storage dtype, and internal Acc->Mat conversion support are also checked too late:
    analytic mode can rank an FP32 internal handoff that emission rejects. Decline every unsupported
    case before solving, revalidate it at emission, and add pure-cube square transpose/layout,
-   analytic FP32-chain, and unsupported-dtype regressions. Split-K integer roots additionally need
-   a typed integer zero seed rather than `ConstFloat`.
+   analytic FP32-chain, and unsupported-dtype regressions. Split-K roots must store the hardware
+   accumulator dtype because both normal and atomic phases publish partial accumulators directly.
 
-2. **Default analytic phase fidelity.** Replace the group-global
-   `max(sum(compute), sum(DDR))` with a sum of request-local phase roofs. Only each concrete rolled
-   K-window ring may overlap its next GM->L1 feed; request init, ragged tail, final drain, and the
-   next sequential matmul remain additive. Count boundary feeds and MTE1 extracts with the emitted
-   output/L0C-tile multiplicities and charge the split-K vector seed (fill, store, tasks, and wave).
-   Add opposite-bottleneck two-request, sub-base-tile traffic, serial-tail/drain, and analytic
-   split-versus-no-split regressions.
+2. **Default analytic serial phase fidelity — host-closed.** The analytic path now composes a
+   multi-request group from serial request-local phase roofs. Each request derives its own K-window
+   init/rolled/tail structure from the existing L1 pebble headroom; only its emitted rolled loop may
+   overlap GM->L1 feed with the analytic MTE1/Matrix surrogate. Internal Acc->Mat drains, root
+   Acc->GM drains, repeated boundary-feed multiplicity across the surrogate L0 output grid, and
+   group-resident preloads are additive at their emitted boundaries. A lone matmul retains the
+   equivalent single-request equation. Fixed-grid two-request and fusion-decision regressions prevent
+   the former `max(sum(compute), sum(DDR))` from returning. Split-K now serializes its
+   first-partial and atomic-rest phase walls in both modes. `cube_split_sync_cycles` is a separate
+   zero-default boundary term; it must remain zero until silicon isolates synchronization from the
+   already charged launch fills.
 
 3. **Requested-value pebbling policy.** Cross-request boundary reuse now has an explicit
    `CubeResidentBoundaryPlan`: compatible repeated inputs are preloaded at first use, retained until
@@ -297,7 +378,7 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    workloads demonstrate enough value to justify that additional plan and emit complexity.
 
 12. **Device/default closure.** Retained panels, clamped lone matmuls, recursive BF16/FP16 DAGs,
-   split seeds/atomics, serial K tails, and former allocation-overflow plans have targeted silicon
+   the former zero-seed split protocol, serial K tails, and former allocation-overflow plans have targeted silicon
    evidence. Promote representative cases into the persistent device surface and broaden the dtype,
    shape, and multi-root matrix before enabling the generic cube emitter without its current guard.
    PTO Fusebox now reports `507 passed / 1 failed`. The stale `2MM`/`REUSE` assertions were replaced
@@ -343,7 +424,7 @@ it does not block cube-only cost, schedule, or ranking validation.
 ## 7. Validation ladder
 
 1. PTO Fusebox tests: recursive request geometry and L1 peak, dtype handoff capability, exact output
-   variants, phase equations, split seed/fill, compact cache, and no overlap for serial loops.
+   variants, phase equations, first-partial/atomic-rest split ownership, compact cache, and no overlap for serial loops.
 2. Host compiler tests: forced/natural plans, BF16 recursive DAGs, FP32-chain decline, ragged K,
    split/no-split, output-tile nesting, child descriptor consumption, Torch numerics, and full
    PTOAS-backed lowering.
