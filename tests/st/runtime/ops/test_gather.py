@@ -1016,15 +1016,14 @@ class TestGatherIndex:
         result = test_runner.run(GatherTileInputSourceUnchangedTestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
-    @pytest.mark.platforms("a5", "a5sim")
-    @pytest.mark.parametrize("platform", PLATFORMS)
+    @pytest.mark.platforms("a5")
+    @pytest.mark.parametrize("platform", [pytest.param("a5", id="a5")])
     def test_gather_a5_int16_index(self, test_runner, platform):
-        """A5 index-form gather with INT16 indices (A5-native; A2/A3 rejects it).
+        """A5 index-form gather with INT16 indices (A5-native; a5sim unsupported).
 
-        INT16 indices are accepted by the relaxed ``tile.gather`` type deduction
-        and by the A5 (Ascend950) PTOAS verifier, then executed on hardware and
-        checked against ``torch.gather``. A2/A3 only permits i32 indices, so this
-        case is pinned to A5 via ``@pytest.mark.platforms``.
+        INT16 indices are accepted by A5 hardware / PTOAS but the a5sim CPU stub
+        still requires b32 indices (pto-isa ``TGather``), so this case is
+        on-board A5 only.
         """
         result = test_runner.run(GatherA5INT16IndexTestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
@@ -1044,8 +1043,10 @@ class TestGatherMask:
         result = test_runner.run(GatherMaskP0101TopLevelTestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
-    @pytest.mark.parametrize("platform", PLATFORMS)
+    @pytest.mark.platforms("a2a3", "a5")
+    @pytest.mark.parametrize("platform", [pytest.param("a2a3", id="a2a3"), pytest.param("a5", id="a5")])
     def test_gather_mask_output_dtype_uint32(self, test_runner, platform):
+        """Mask gather + UINT32 bit-reinterpret — onboard only (CPU sim stubs value-cast)."""
         result = test_runner.run(GatherMaskOutputDtypeTestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
