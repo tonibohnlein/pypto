@@ -25,13 +25,13 @@ adds the separately ordered G6 zero seed, PTO A2/A3 column-reduction fits (G10),
 descriptors for the remaining one-instruction vector operations (G11); none changes the validated
 P4 phase algorithm.
 
-The follow-up at PyPTO `95e24c32` / solver `f7bea24b` passed the same 51/51 device surface and
-silicon-closed G10/G11 plus the aligned G6 seed protocol. It also established Welford's FP32
-accuracy envelope (roughly `mean/std <= 5–6e4`) and found one real buildability hole: a row-major
-FP32 split seed narrower than 32 bytes (`N<8`) cannot lower. The current host batch gates that case
-to `S=1`, keeps aligned seeds split-capable, and adds exact returned-live-out, capability, UB,
-ragged-traffic, fill-wave, and cache-publication contracts. These host refinements await their own
-fingerprinted device follow-up.
+The follow-up at PyPTO `95e24c32` / solver `f7bea24b` closed G10/G11 and the aligned G6 seed
+protocol, and placed Welford's FP32 envelope near `mean/std <= 5–6e4`. At the current
+`97136d97` / `789e9fdd` checkpoint, all 51 persistent vector device cases pass and both DFS and
+Gorder pass the same lifetime/traffic assertions. Shared boundary reuse, duplicate operands, and
+phase-local identities are therefore host/order-closed. Their dedicated five-seed DFS/Gorder
+device cases, descriptor-matched MTE2 traces, and timing pair were not collected; direct
+model→emit byte-multiplicity closure remains open.
 
 **Mixed host checkpoint (2026-07-13).** The solver now builds one immutable same-engine stage DAG
 and cube/vector transfer graph per mixed candidate subgraph. A stack-local `MixedSchedulePlan`
@@ -45,20 +45,17 @@ reuse the exact P4 vector-stage descriptor, but full `C→V→C→V` attention r
 in compiler mode—and its key-chunk loop remains unrepresentable—until whole-FIFO multi-round-trip
 skew and the second loop axis exist. Analytic mode retains the four-stage topology at a serial cost.
 
-**Cube device checkpoint (2026-07-16).** Pure-cube schedules that reached silicon passed 75/75
-runs across clamped overlap, multi-window/ragged K, split-K, and a low-precision recursive chain.
-The former oversized sub-fractal `1x1` candidate is now absent from both cost modes. On
-`[272,272]@[272,272]`, the default analytic winner A8 (`144x80`, 8 tasks) was 7.3% faster than the
-exact winner E12 (`80x96`, 12 tasks) under the scheduler/orchestration execution metric; forcing a
-fixed grid produced a byte-identical executable in both modes. Analytic therefore remains the
-default and exact remains opt-in. Pipe tracing closed the apparent inversion: E12 is cheaper per
-task in the op simulator, the generated kernel already executes `PIPE_ALL` after its final TSTORE,
-and a redundant second barrier costs zero. The entire 6.6–6.7 us device gap is the AICPU scheduler,
-but the follow-up multi-count sweep falsified a scalar per-work-unit correction: scheduler time was
-U-shaped for the 272 family and fell as the 512 family was divided over more cores. The prior
-`1.6 us/task` slope was local to A8/E12, where task count and per-core work changed together. Add no
-dispatch or pipe constant. Analytic remains default and exact remains opt-in; next hold tile/K work
-constant while varying only the number of output regions.
+**Cube device checkpoint (2026-07-24).** Earlier pure-cube sweeps validated clamped overlap,
+multi-window/ragged K, split-K, retained panels, and low-precision recursive chains. A8 remains
+7.3% faster than exact-mode E12 on `[272,272]`; fixed-grid binaries match, and pipe/constant-work
+sweeps support neither a pipe correction nor a scalar dispatch term. Analytic remains default and
+exact opt-in. At `97136d97` / `789e9fdd`, forced FP32 split-K emits the new two-AIC
+`FirstPartialThenAtomic` protocol—normal share-zero store, then atomic rest, no AIV seed—and one
+device run matched Torch. Both order builds pass 523 cost checks and 63 pebbling checks. This is a
+successful silicon smoke, not full closure: the requested two-device seed sweep, DFX drain/order
+proof, forced split ranking, recursive BF16 case, resident-boundary traffic matrix, and serial
+multi-request timing were not run. Keep `cube_split_sync_cycles=0`; no transferable residual was
+measured.
 
 ---
 
@@ -423,7 +420,7 @@ BF16/FP16 Mat, matching PTO's fused-chain kernel; roots narrow/store to their de
 Same-type FP32 internal L1 handoff is not an A2/A3 instruction. Exact mode declines it; analytic
 currently ranks then falls back, which is a TODO below. Direct Mat→GM store is legal.
 
-**Host validation.** PTO Fusebox reports 523 passing checks with no failure; AutoFuse reports 63.
+**Host validation.** PTO Fusebox reports 523 passing checks under DFS and Gorder; AutoFuse reports 63.
 Coverage includes recursive BF16 DAGs, split/ragged K, multi-window and shared-boundary residency,
 multi-role `A @ A`, Torch numerics, and PTOAS lowering. Parser/outliner reports 126, including multi-output SPMD round-trip.
 
@@ -473,7 +470,10 @@ boundary, but no scalar correction is supported.
    with a direct model that generalizes and improves within-problem ranking.
 8. Different M/N/K shapes and recursive roles are supported. Ragged multi-matmul grids would need
    edge-specific valid/physical regions and lifetimes propagated through the request DAG.
-9. Silicon-compare DFS with dependency-constrained Gorder and compare always-retain with reload alternatives. Defer any separate greedy reuse-distance strategy until a literature review of dependency-constrained locality, register-pressure-aware DAG scheduling, and pebbling. Vector phase-lifetime integration is host-closed; its device follow-up should confirm shared-input traffic under both orders.
+9. Silicon-compare DFS with dependency-constrained Gorder and compare always-retain with reload
+   alternatives. Defer a separate greedy reuse-distance strategy until a literature review of
+   dependency-constrained locality, register-pressure-aware DAG scheduling, and pebbling. Host
+   order invariance is closed; direct shared-input traffic under both orders is not.
 10. Remove full plan construction from the exact candidate hot path only if full-solver profiling
    shows it matters; exact added about 1 ms to the measured full compiler pipeline. Promote
    retained, narrowing, split-atomic, and heterogeneous recursive cases into the persistent 910B2

@@ -312,6 +312,9 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    is intentionally deferred until a literature review of
    dependency-constrained locality ordering, register-pressure-aware DAG scheduling, and pebbling;
    do not add an ad hoc heuristic before its objective and complexity are compared with Gorder.
+   At `97136d97` / `789e9fdd`, DFS and Gorder pass identical model suites, but the dedicated
+   multi-seed device graphs and exact emitted MTE2/allocation comparison were not run. Treat this
+   as host/order closure, not silicon closure of the reuse policy.
 
 4. **Exact feasibility and objective scope.** Initial exact feasibility sizes boundary strips at
    the whole requested M/N region before the smaller emitted output/L0C tile is chosen, so it can
@@ -348,7 +351,9 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    `ceil(work_units/24)` wave shape and add neither a scalar dispatch term nor vector C3.
 8. **Low-precision and integer envelope.** BF16/FP16 on-chip handoff is represented. Exact mode
    declines same-type FP32 internal storage; the analytic pre-ranking gate is item 1. Other Acc→Mat
-   conversion families require explicit PTO capability descriptors before admission.
+   conversion families require explicit PTO capability descriptors before admission. The v1
+   emitter also declines BF16-output split-K (FP32 accumulate-then-narrow is missing) and exact
+   replay of `A @ A` with `b_trans`; both belong to the capability/emit boundary, not pebbling.
 9. **GM->L1 absolute pricing.** The flat 135 GiB/s term is not an accurate request-level transfer
    law. Device microbenchmarks confirm a real ND->NZ inner-width effect, but the tested two-bandwidth
    and shared-head descriptor models miss direct requests by 26--29% and fail their 10% transfer
@@ -378,13 +383,13 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    workloads demonstrate enough value to justify that additional plan and emit complexity.
 
 12. **Device/default closure.** Retained panels, clamped lone matmuls, recursive BF16/FP16 DAGs,
-   the former zero-seed split protocol, serial K tails, and former allocation-overflow plans have targeted silicon
-   evidence. Promote representative cases into the persistent device surface and broaden the dtype,
-   shape, and multi-root matrix before enabling the generic cube emitter without its current guard.
-   PTO Fusebox now reports `507 passed / 1 failed`. The stale `2MM`/`REUSE` assertions were replaced
-   by descriptor-level `[CUBERES]` checks for one request, exact lifetime/bytes, role separation,
-   and capacity decline. The remaining `FDM` failure is a real analytic ranking gap for a wide
-   intermediate, not shared-boundary model/emit debt.
+   serial K tails, and former allocation-overflow plans have targeted silicon evidence. The new
+   `FirstPartialThenAtomic` path has one successful forced FP32 device smoke with the expected two
+   AIC kernels and no AIV seed; PTO Fusebox reports `523 passed / 0 failed` under both DFS and
+   Gorder. Full closure still requires the pre-registered two-device deterministic split sweep,
+   DFX dependency/drain evidence, recursive BF16 force, resident-boundary request bytes, and serial
+   multi-request ranking. Promote those representatives into the persistent 910B2 surface before
+   relaxing the generic cube-emitter guard.
 
 If exact replay is unavailable, strict mode fails with the rejected contract condition. Production
 mode partitions or falls back to standalone matmuls rather than silently emitting another
