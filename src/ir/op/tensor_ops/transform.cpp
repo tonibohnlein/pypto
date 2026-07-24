@@ -576,6 +576,9 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
                                       std::make_optional(std::move(new_view)));
 }
 
+// Reshape is a zero-copy view.  Marking that relationship also lets
+// ConvertTensorToTileOps propagate a consumer's memory-space requirement back
+// through reshape to a load-like producer such as tensor.slice.
 REGISTER_OP("tensor.reshape")
     .set_op_category("TensorOp")
     .set_description("Reshape tensor to new shape")
@@ -584,6 +587,7 @@ REGISTER_OP("tensor.reshape")
     .add_argument("valid_shape",
                   "Optional logical valid shape (MakeTuple, same rank as `shape`) carried onto the "
                   "result TensorView; present only in the 3-arg form")
+    .set_output_memory_inherit_input()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorReshapeType(args, kwargs);
