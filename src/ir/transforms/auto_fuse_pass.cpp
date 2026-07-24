@@ -90,13 +90,13 @@ namespace {
 // per-op compute from tile geometry (the grounded pto-isa fractal/vector model).
 // TODO(cost-model): read these from BackendHandler instead of hardcoding 910B.
 constexpr int64_t kFastMemoryCapacity = 1LL << 30;  // single-pool capacity hint
-constexpr int kNumCubeCores = 24;               // AIC cores (matmul)
-constexpr int kNumVectorCores = 48;             // AIV cores (pointwise / reduction)
-constexpr int64_t kL1Capacity = 512LL * 1024;     // per-cube L1/Mat operand pool
-constexpr int64_t kCubeCapacity = 128LL * 1024;   // per-cube L0c accumulator
-constexpr int64_t kVecCapacity = 192LL * 1024;    // per-vector UB
-constexpr int64_t kCubeComputeCost = 1;         // grounded per-repeat multiplier (cyc applies fp32 2x)
-constexpr int64_t kKernelFillCost = 10000;      // per-kernel pipeline fill (cycles)
+constexpr int kNumCubeCores = 24;                   // AIC cores (matmul)
+constexpr int kNumVectorCores = 48;                 // AIV cores (pointwise / reduction)
+constexpr int64_t kL1Capacity = 512LL * 1024;       // per-cube L1/Mat operand pool
+constexpr int64_t kCubeCapacity = 128LL * 1024;     // per-cube L0c accumulator
+constexpr int64_t kVecCapacity = 192LL * 1024;      // per-vector UB
+constexpr int64_t kCubeComputeCost = 1;             // grounded per-repeat multiplier (cyc applies fp32 2x)
+constexpr int64_t kKernelFillCost = 10000;          // per-kernel pipeline fill (cycles)
 // FirstPartialThenAtomic serializes two AIC launches. Their ordinary launch
 // fills are already charged by kKernelFillCost; keep any additional dependency
 // synchronization explicit but zero until silicon isolates it.
@@ -116,14 +116,14 @@ constexpr int64_t kPerTaskOverheadCycles = 64;
 // Grounded pto-isa machine model (Ascend 910B / A2A3). Costs are in CORE CYCLES;
 // bandwidths are GiB/s per direction (pto-isa arch_config.hpp). See the solver's
 // types.h Problem::cube_freq_hz block for the exact formulas.
-constexpr double kCubeFreqHz = 1.85e9;          // core clock (A2A3)
-constexpr double kBwGmL1   = 135.0;             // GM->L1 operand reload
-constexpr double kBwL0cGm  = 70.0;              // L0C->GM output store
-constexpr double kBwL0cL1 = 128.0;              // L0C->L1 on-chip FIXPIPE drain
-constexpr double kBwL1L0a  = 441.0;             // L1->L0A lhs extract
-constexpr double kBwL1L0b  = 220.5;             // L1->L0B rhs extract
-constexpr double kBwGmUb   = 100.9;             // GM->UB vector load
-constexpr double kBwUbGm   = 188.46;            // UB->GM vector store
+constexpr double kCubeFreqHz = 1.85e9;  // core clock (A2A3)
+constexpr double kBwGmL1 = 135.0;       // GM->L1 operand reload
+constexpr double kBwL0cGm = 70.0;       // L0C->GM output store
+constexpr double kBwL0cL1 = 128.0;      // L0C->L1 on-chip FIXPIPE drain
+constexpr double kBwL1L0a = 441.0;      // L1->L0A lhs extract
+constexpr double kBwL1L0b = 220.5;      // L1->L0B rhs extract
+constexpr double kBwGmUb = 100.9;       // GM->UB vector load
+constexpr double kBwUbGm = 188.46;      // UB->GM vector store
 // Aggregate HBM bandwidth (GiB/s) shared by all cores — caps the sum of the
 // per-core GM pipes (DDR divides across cores up to here). Realistic A3 aggregate
 // (~900 GiB/s): par() binds at ~900/135 = 6.7 cores, so reload-bound matmuls
@@ -131,8 +131,8 @@ constexpr double kBwUbGm   = 188.46;            // UB->GM vector store
 // saturation regime (pto-isa gml1_multicore: per-core bw = min(135, 900/B) to
 // <=0.4%). The exact aggregate is DEVICE-EVAL-PENDING; 900 is the perf-sim estimate.
 constexpr double kHbmAggregateGiBps = 900.0;
-constexpr int64_t kL0TileM = 128;               // L0 GEMM base M (pto-isa oracle)
-constexpr int64_t kL0TileN = 256;               // L0 GEMM base N (pto-isa oracle)
+constexpr int64_t kL0TileM = 128;  // L0 GEMM base M (pto-isa oracle)
+constexpr int64_t kL0TileN = 256;  // L0 GEMM base N (pto-isa oracle)
 // Grounded vector (AIV) cost: per op = slope*repeat + head+tail (once per chain), repeat =
 // ceil(elems / (vec_reg_bytes/dtype_bytes)). pto-isa A2A3 cce_costmodel_vector_compute.hpp,
 // 910B3-calibrated (`标定`, dav-2201, R^2~1.0): 256-byte vreg (64 fp32 / 128 fp16 per repeat);
@@ -140,11 +140,11 @@ constexpr int64_t kL0TileN = 256;               // L0 GEMM base N (pto-isa oracl
 // 1 for vrsqrt/vrelu/vmuls. Per-op slope overrides are set per Op via VecOpSlope; the +16
 // count-mode floor for unaligned width lives in the solver's VecOpCompute. The head/tail SPLIT
 // is an unmeasured assumption upstream (only the ~32 SUM is used, charged once per chain).
-constexpr int64_t kVecRegBytes = 256;           // vector register size (bytes)
-constexpr double kVecOpHead = 14.0;             // per-op pipeline startup (head+tail sum is what matters)
-constexpr double kVecOpTail = 18.0;             // per-op drain
-constexpr double kVecSlopePw = 2.0;             // default elementwise cycles/repeat (vadd/vmul/vexp)
-constexpr double kVecSlopeReduce = 14.0;        // DEPRECATED: solver uses the reduction TREE, not this
+constexpr int64_t kVecRegBytes = 256;     // vector register size (bytes)
+constexpr double kVecOpHead = 14.0;       // per-op pipeline startup (head+tail sum is what matters)
+constexpr double kVecOpTail = 18.0;       // per-op drain
+constexpr double kVecSlopePw = 2.0;       // default elementwise cycles/repeat (vadd/vmul/vexp)
+constexpr double kVecSlopeReduce = 14.0;  // DEPRECATED: solver uses the reduction TREE, not this
 
 // Core counts + on-chip capacities. Defaults are the 910B values above; the
 // real ones are read from the configured backend's SoC (so the safe-UB cap and
@@ -379,9 +379,9 @@ double VecOpSlope(const CallPtr& call) {
     const size_t l = std::char_traits<char>::length(s);
     return n.size() >= l && n.compare(n.size() - l, l, s) == 0;
   };
-  if (ends("div")) return 4.0;      // vdiv
-  if (ends(".rsqrt")) return 1.0;   // vrsqrt (also vrelu/vmuls family, but rsqrt is the one in norms)
-  return 0.0;                        // -> vec_slope_pw
+  if (ends("div")) return 4.0;     // vdiv
+  if (ends(".rsqrt")) return 1.0;  // vrsqrt (also vrelu/vmuls family, but rsqrt is the one in norms)
+  return 0.0;                      // -> vec_slope_pw
 }
 
 // Per-op VECTOR fixed (head+tail) cycles, device-calibrated (pto-isa cce_costmodel_vector_compute):
@@ -394,15 +394,15 @@ double VecOpFixed(const CallPtr& call) {
     const size_t l = std::char_traits<char>::length(s);
     return n.size() >= l && n.compare(n.size() - l, l, s) == 0;
   };
-  if (ends("div")) return 30.0;                          // vdiv
-  if (ends(".exp") || ends(".ln")) return 31.0;          // vexp / vln
-  if (ends(".mul") || ends(".muls")) return 25.0;        // vmul / vmuls
-  if (ends(".rsqrt") || ends(".sqrt")) return 24.0;      // vrsqrt / vsqrt
+  if (ends("div")) return 30.0;                      // vdiv
+  if (ends(".exp") || ends(".ln")) return 31.0;      // vexp / vln
+  if (ends(".mul") || ends(".muls")) return 25.0;    // vmul / vmuls
+  if (ends(".rsqrt") || ends(".sqrt")) return 24.0;  // vrsqrt / vsqrt
   if (ends(".add") || ends(".adds") || ends(".sub") || ends(".subs") || ends(".neg") || ends(".max") ||
       ends(".min") || ends(".maximum") || ends(".minimum")) {
-    return 24.0;                                          // vadd / vsub / vmax / vmin family
+    return 24.0;  // vadd / vsub / vmax / vmin family
   }
-  return 0.0;                                             // -> vec_op_head + vec_op_tail
+  return 0.0;  // -> vec_op_head + vec_op_tail
 }
 
 // Attach the exact pto-isa primitive and tile geometry that tensor-to-tile
@@ -812,9 +812,9 @@ std::vector<P4Match> AnalyzeP4Patterns(const std::vector<StmtPtr>& stmts) {
 class ProblemBuilder {
  public:
   ::Problem problem;
-  std::vector<std::string> op_labels;     // per-op kernel/op name, for readable logging
-  std::vector<const Stmt*> op_stmts;      // per-op source AssignStmt (op index -> Stmt), for the emit
-  std::vector<P4Match> p4_matches;        // exact semantic matches shared by model + emit
+  std::vector<std::string> op_labels;  // per-op kernel/op name, for readable logging
+  std::vector<const Stmt*> op_stmts;   // per-op source AssignStmt (op index -> Stmt), for the emit
+  std::vector<P4Match> p4_matches;     // exact semantic matches shared by model + emit
 
   // The function is OUT OF SCOPE for AutoFuse v0 (a non-tensor compute output or a
   // dynamic/symbolic tensor shape) — the caller must leave it for legacy lowering. This
@@ -994,8 +994,8 @@ class ProblemBuilder {
       sop.vector_capability = descriptor.capability;
       if (sop.type == ::OpType::MatMul) {
         const bool default_semantics = !call->GetKwarg<bool>("a_trans", false) &&
-            !call->GetKwarg<bool>("b_trans", false) &&
-            !call->GetKwarg<bool>("c_matrix_nz", false);
+                                       !call->GetKwarg<bool>("b_trans", false) &&
+                                       !call->GetKwarg<bool>("c_matrix_nz", false);
         const auto lhs_type = call->args_.empty() ? nullptr : AsTensorTypeLike(call->args_[0]->GetType());
         const auto rhs_type = call->args_.size() < 2 ? nullptr : AsTensorTypeLike(call->args_[1]->GetType());
         const bool same_operands = lhs_type && rhs_type && lhs_type->dtype_ == rhs_type->dtype_;
@@ -1004,7 +1004,7 @@ class ProblemBuilder {
                               lhs_type->dtype_ == DataType::BF16 || lhs_type->dtype_ == DataType::INT8);
         const bool compiler_mixed_dtype =
             same_operands && (lhs_type->dtype_ == DataType::FP32 || lhs_type->dtype_ == DataType::FP16 ||
-                                           lhs_type->dtype_ == DataType::BF16);
+                              lhs_type->dtype_ == DataType::BF16);
         sop.mixed_emit_compatible = default_semantics && compiler_mixed_dtype;
         // The existing homogeneous tiler also assumes default orientation.
         // Its tile lowering also requires equal PTO-supported operand dtypes.
@@ -1548,9 +1548,9 @@ ExprPtr AttachL0MatmulPlan(const ExprPtr& expr, const ::L0MatmulPlan* plan, int6
   auto attrs = call->attrs_;
   attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
                              [](const auto& item) {
-                return item.first == utils::kL0MatmulPlanAttr ||
-                       item.first == utils::kL0MatmulOutputTargetAttr;
-              }),
+                               return item.first == utils::kL0MatmulPlanAttr ||
+                                      item.first == utils::kL0MatmulOutputTargetAttr;
+                             }),
               attrs.end());
   attrs.emplace_back(utils::kL0MatmulOutputTargetAttr,
                      static_cast<int>(FromFuseboxL0OutputTarget(plan->output_target)));
@@ -1674,7 +1674,7 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
 
     auto phi = std::make_shared<Var>(base + "_phi", then_call->GetType(), sp);
     auto if_stmt = std::make_shared<IfStmt>(MakeEq(ko, MakeIndex(0, sp), sp), then_body,
-        std::optional<StmtPtr>(else_body), std::vector<VarPtr>{phi}, sp);
+                                            std::optional<StmtPtr>(else_body), std::vector<VarPtr>{phi}, sp);
     auto body_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{phi}, sp);
     StmtPtr body = SeqStmts::Flatten(std::vector<StmtPtr>{a_k_assign, b_k_assign, if_stmt, body_yield}, sp);
 
@@ -1750,7 +1750,7 @@ std::vector<StmtPtr> BuildTileMatmulAt(const ExprPtr& a, const ExprPtr& b, const
   auto phi = std::make_shared<Var>(base + "_phi", first_call->GetType(), sp);
   auto first_or_acc =
       std::make_shared<IfStmt>(MakeEq(ko, MakeIndex(0, sp), sp), first_body, std::optional<StmtPtr>(acc_body),
-                                               std::vector<VarPtr>{phi}, sp);
+                               std::vector<VarPtr>{phi}, sp);
   auto body_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{phi}, sp);
   StmtPtr body =
       SeqStmts::Flatten(std::vector<StmtPtr>{a_k_assign, b_k_assign, first_or_acc, body_yield}, sp);
@@ -1884,7 +1884,7 @@ CubeAccumulatorGrid DeriveCubeAccumulatorGrid(int64_t h, int64_t w, const DataTy
 // dividing the output). v0 emits Sequential output-tile loops; cross-core
 // Parallel distribution of those tiles is the next increment.
 std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, const SolverTile& tile,
-                                              const std::string& name) {
+                                               const std::string& name) {
   auto call = As<Call>(assign->value_);
   if (call == nullptr || !IsOp(call, "tensor.matmul") || call->args_.size() != 2) {
     return std::nullopt;
@@ -2011,9 +2011,9 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, cons
     auto seed_asm = reg.Create("tensor.assemble", {c_init, z, MakeTuple2(s_mi, s_ni, sp)}, sp);
     auto c_seeded = std::make_shared<Var>(base + "_seeded", seed_asm->GetType(), sp);
     auto seed_scope = SpmdWrap(st,
-        std::vector<StmtPtr>{std::make_shared<AssignStmt>(z, z_call, sp),
-                             std::make_shared<AssignStmt>(c_seeded, seed_asm, sp)},
-        MakeIndex(num_seed_tiles, sp), name + "_seed", sp);
+                               std::vector<StmtPtr>{std::make_shared<AssignStmt>(z, z_call, sp),
+                                                    std::make_shared<AssignStmt>(c_seeded, seed_asm, sp)},
+                               MakeIndex(num_seed_tiles, sp), name + "_seed", sp);
 
     // t in [0, num_tiles*S): ks = t % S (k-slice), sp_idx = t / S (spatial tile) ->
     // mt = sp_idx / num_n, nt = sp_idx % num_n; offsets mi/ni and k_base = ks*ksz.
@@ -2056,7 +2056,7 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, cons
         const bool last = acc_idx + 1 == num_acc_tiles;
         auto assembled_var = last ? c_var
                                   : std::make_shared<Var>(base + "_partial_out" + std::to_string(acc_idx),
-                                                         asm_call->GetType(), sp);
+                                                          asm_call->GetType(), sp);
         body.push_back(std::make_shared<AssignStmt>(assembled_var, asm_call, sp));
         assembled = assembled_var;
       }
@@ -2151,7 +2151,7 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, cons
       const bool last = acc_idx + 1 == num_acc_tiles;
       auto assembled_var = last ? c_var
                                 : std::make_shared<Var>(base + "_assembled" + std::to_string(acc_idx),
-                                                       asm_call->GetType(), sp);
+                                                        asm_call->GetType(), sp);
       body_stmts.push_back(std::make_shared<AssignStmt>(assembled_var, asm_call, sp));
       assembled = assembled_var;
     }
@@ -2221,9 +2221,9 @@ std::optional<std::vector<StmtPtr>> TilePointwiseGroup(const std::vector<StmtPtr
       auto v = AsVarLike(arg);
       if (v != nullptr && defined.count(v.get()) != 0) continue;  // intermediate
       const auto [aM, aN] = Static2DShape(arg->GetType());
-      if (aM < 0) continue;                       // scalar / non-2D -> kept as-is
-      if (aM == M && aN == N) continue;           // [M,N] external input -> sliced
-      return std::nullopt;                        // other 2D shape -> not tileable here
+      if (aM < 0) continue;              // scalar / non-2D -> kept as-is
+      if (aM == M && aN == N) continue;  // [M,N] external input -> sliced
+      return std::nullopt;               // other 2D shape -> not tileable here
     }
   }
 
@@ -2388,8 +2388,8 @@ static std::nullopt_t GenericDeclineB(const std::string& reason, const Span& spa
   LOG_WARN << "AutoFuse[generic] TIER-B decline (suspected illegal plan): " << reason;
   if (GenericStrict()) {
     INTERNAL_CHECK_SPAN(false, span) << "AutoFuse generic emit TIER-B: " << reason
-        << " — the solver produced a plan the v1 emitter contract forbids "
-           "(PYPTO_AUTOFUSE_STRICT is on).";
+                                     << " — the solver produced a plan the v1 emitter contract forbids "
+                                        "(PYPTO_AUTOFUSE_STRICT is on).";
   }
   return std::nullopt;
 }
@@ -2409,9 +2409,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   bool has_reduction = false;
   for (const StmtPtr& s : run) {
     auto a = As<AssignStmt>(s);
-    if (a == nullptr) return std::nullopt;                          // Tier-A: non-assign in run (capability)
+    if (a == nullptr) return std::nullopt;  // Tier-A: non-assign in run (capability)
     auto c = As<Call>(a->value_);
-    if (c == nullptr || c->op_ == nullptr) return std::nullopt;     // Tier-A: non-call value (capability)
+    if (c == nullptr || c->op_ == nullptr) return std::nullopt;  // Tier-A: non-call value (capability)
     const VectorOpDescriptor descriptor = DescribeVectorOp(c);
     const ::OpType cls = descriptor.type;
     // Tier-A: a non-{Pointwise,Reduction} op in the run -> fall back. NB a MatMul can land
@@ -2570,14 +2570,14 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
         // carried through as-is; a rank!=2 or symbolic tensor is out of scope for the 2D emit,
         // so DECLINE rather than misclassify it as a scalar and slice it as [IM,IN].
         if (As<TensorType>(arg->GetType()) != nullptr) return std::nullopt;
-        continue;                               // true scalar -> kept as-is
+        continue;  // true scalar -> kept as-is
       }
-      if (aM == IM && aN == IN) continue;       // full external input -> sliced [sh,sw]
+      if (aM == IM && aN == IN) continue;  // full external input -> sliced [sh,sw]
       // Broadcast operand: each axis is full (follows the tile) or 1 (read whole, broadcast).
       // emit_strip slices it [aM==1?1:sh, aN==1?1:sw] at [aM==1?0:smi, aN==1?0:sni]; the op replay
       // re-infers the broadcast result. Excludes [IM,IN] (handled above) and any ragged 2D shape.
       if ((aM == 1 || aM == IM) && (aN == 1 || aN == IN)) continue;  // broadcast -> sliced per-axis
-      return std::nullopt;                      // other 2D shape -> out of scope
+      return std::nullopt;                                           // other 2D shape -> out of scope
     }
 
   // Grid: single shared parallel tile space; pure elementwise has NO pinned axis, so we
@@ -2701,9 +2701,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
       if (ClassifyOp(c) != ::OpType::Reduction || c->args_.empty()) continue;
       const auto [iM, iN] = Static2DShape(c->args_[0]->GetType());
       const auto [oM, oN] = Static2DShape(a->var_->GetType());
-      if (iM < 0 || oM < 0) return std::nullopt;  // Tier-A: dynamic shape (capability)
-      const bool reduces_N = (iN > 1 && oN == 1);   // row reduction [M,N] -> [M,1]
-      const bool reduces_M = (iM > 1 && oM == 1);   // col reduction [M,N] -> [1,N]
+      if (iM < 0 || oM < 0) return std::nullopt;   // Tier-A: dynamic shape (capability)
+      const bool reduces_N = (iN > 1 && oN == 1);  // row reduction [M,N] -> [M,1]
+      const bool reduces_M = (iM > 1 && oM == 1);  // col reduction [M,N] -> [1,N]
       // Tier-B (A4): the reduced axis is NOT pinned full -> a per-tile reduction covers
       // only part of the axis = a partial (wrong) reduction. The solver pins it (grid
       // num=1 on the reduced axis); a plan that does not is illegal for v1.
@@ -2747,9 +2747,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   const ExprPtr m_index = MakeFloorDiv(t, MakeIndex(num_n, sp), sp);
   const ExprPtr n_index = MakeFloorMod(t, MakeIndex(num_n, sp), sp);
   ExprPtr mi = has_planned_grid ? partition_offset(m_index, solver_stream.m_partition)
-                   : MakeMul(m_index, MakeIndex(h, sp), sp);
+                                : MakeMul(m_index, MakeIndex(h, sp), sp);
   ExprPtr ni = has_planned_grid ? partition_offset(n_index, solver_stream.n_partition)
-                   : MakeMul(n_index, MakeIndex(w, sp), sp);
+                                : MakeMul(n_index, MakeIndex(w, sp), sp);
   if (num_m * h > IM) mi = MakeMin(mi, MakeIndex(IM - h, sp), sp);
   if (num_n * w > IN) ni = MakeMin(ni, MakeIndex(IN - w, sp), sp);
 
@@ -2951,7 +2951,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   // aliases the carry in place) — and pipelines its full-chunk loop when there are two rolled
   // iterations to overlap. Single pass (level-0 reduction); P2/P4 add an apply re-stream.
   if (stream_p1 || stream_p2 || stream_p4) {
-    const int64_t red_ext = pin_m ? IM : IN;    // pinned/reduced axis extent
+    const int64_t red_ext = pin_m ? IM : IN;  // pinned/reduced axis extent
     // The free tile is the maximum LOGICAL region extent. Its UB allocation is
     // independently DMA-padded; alignment must not coarsen the logical launch
     // grid. This is the model/emit distinction that preserves parts_m/parts_n.
@@ -2974,15 +2974,15 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
     INTERNAL_CHECK_SPAN(rc > 0 && rc <= red_ext && solver_stream.axis == (pin_m ? 2 : 1), sp)
         << "Internal error: invalid solver vector stream plan for group '" << name
         << "': axis=" << solver_stream.axis << " chunk=" << rc << " reduced extent=" << red_ext;
-    const int64_t num_full = red_ext / rc;                 // full disjoint chunks
-    const int64_t rem = red_ext - num_full * rc;           // ragged tail extent (0 if divides)
+    const int64_t num_full = red_ext / rc;        // full disjoint chunks
+    const int64_t rem = red_ext - num_full * rc;  // ragged tail extent (0 if divides)
     const int64_t num_free = pin_m ? num_n : num_m;
 
     // Verify that the local IR construction realizes every field of the authoritative plan.
     // Geometry, algorithm kind, and the trip-count pipeline guard must all agree.
     const ::VectorStreamKind emitted_kind =
         stream_p4 ? (p4_kind == ::P4PatternKind::SoftmaxFlash ? ::VectorStreamKind::SoftmaxFlash
-                         : ::VectorStreamKind::LayerNormWelford)
+                                                              : ::VectorStreamKind::LayerNormWelford)
                   : (stream_p2 ? ::VectorStreamKind::ReductionSpanning : ::VectorStreamKind::ReductionFolded);
     const int emitted_axis = pin_m ? 2 : 1;
     const int64_t stats_trips = std::max<int64_t>(0, num_full - 1);
@@ -3061,6 +3061,29 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
           index, MakeIndex(loop.first_chunk, sp), MakeIndex(loop.first_chunk + loop.trip_count, sp),
           MakeIndex(1, sp), std::move(iter_args), SeqStmts::Flatten(std::move(loop_body), sp),
           std::move(results), sp, pipelined ? ForKind::Pipeline : ForKind::Sequential, std::move(attrs)));
+    };
+
+    // A streamed reduction may allocate a DMA-aligned physical tile while
+    // carrying a smaller logical valid region (for example 11 FP32 rows in a
+    // 16-row allocation).  Reductions and unary ops preserve that validity,
+    // but tensor elementwise inference does not yet do so.  Re-attach the
+    // carried value's valid shape after an elementwise merge so the ForStmt
+    // iter_arg, yield, and result keep one exact type.  This is metadata-only;
+    // the padded allocation and the emitted arithmetic remain unchanged.
+    auto preserve_carried_valid_shape = [&](const VarPtr& value, const TypePtr& carried_type,
+                                            std::vector<StmtPtr>& out, const std::string& suffix) -> VarPtr {
+      auto carried_tensor = As<TensorType>(carried_type);
+      if (carried_tensor == nullptr || !carried_tensor->tensor_view_.has_value() ||
+          carried_tensor->tensor_view_->valid_shape.empty()) {
+        return value;
+      }
+      const auto& valid = carried_tensor->tensor_view_->valid_shape;
+      INTERNAL_CHECK_SPAN(valid.size() == 2, sp)
+          << "Internal error: streamed vector carry must have a rank-2 valid shape";
+      auto set_valid = reg.Create("tensor.set_validshape", {ExprPtr(value), valid[0], valid[1]}, sp);
+      auto constrained = std::make_shared<Var>(base + suffix, set_valid->GetType(), sp);
+      out.push_back(std::make_shared<AssignStmt>(constrained, set_valid, sp));
+      return constrained;
     };
 
     // P2, softmax, and Welford have the same barrier-separated apply algorithm:
@@ -3226,6 +3249,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
           std::vector<StmtPtr> lbody;
           auto [mn, m2n, cn] =
               welford_chunk(rc, MakeMul(k, MakeIndex(rc, sp), sp), mean_it, M2_it, cnt_it, lbody, 1);
+          mn = preserve_carried_valid_shape(mn, mean_it->GetType(), lbody, "_wmean_valid");
+          m2n = preserve_carried_valid_shape(m2n, M2_it->GetType(), lbody, "_wM2_valid");
+          cn = preserve_carried_valid_shape(cn, cnt_it->GetType(), lbody, "_wcnt_valid");
           lbody.push_back(
               std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(mn), ExprPtr(m2n), ExprPtr(cn)}, sp));
           auto mean_out = std::make_shared<Var>(base + "_wmean", mean_cur->GetType(), sp);
@@ -3245,9 +3271,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
           auto [mn, m2n, cn] = welford_chunk(solver_stream.stats_tail.extent,
                                              MakeIndex(solver_stream.stats_tail.chunk_index * rc, sp),
                                              mean_cur, M2_cur, cnt_cur, body, 2);
-          mean_cur = mn;
-          M2_cur = m2n;
-          cnt_cur = cn;
+          mean_cur = preserve_carried_valid_shape(mn, mean_cur->GetType(), body, "_wmean_tail_valid");
+          M2_cur = preserve_carried_valid_shape(m2n, M2_cur->GetType(), body, "_wM2_tail_valid");
+          cnt_cur = preserve_carried_valid_shape(cn, cnt_cur->GetType(), body, "_wcnt_tail_valid");
         }
         // Finalize: mean_final = running mean; var_final = M2 / N (population variance, matching torch
         // var(unbiased=False)). Substitute BOTH stable stats into the apply cone (mean/var level).
@@ -3358,6 +3384,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
         auto l_it = std::make_shared<IterArg>(base + "_l_it", l_cur->GetType(), ExprPtr(l_cur), sp);
         std::vector<StmtPtr> lbody;
         auto [m_new, l_new] = p4_chunk(rc, MakeMul(k, MakeIndex(rc, sp), sp), m_it, l_it, lbody, 1);
+        m_new = preserve_carried_valid_shape(m_new, m_it->GetType(), lbody, "_m_valid");
+        l_new = preserve_carried_valid_shape(l_new, l_it->GetType(), lbody, "_l_valid");
         lbody.push_back(
             std::make_shared<YieldStmt>(std::vector<ExprPtr>{ExprPtr(m_new), ExprPtr(l_new)}, sp));
         auto m_out = std::make_shared<Var>(base + "_m", m_cur->GetType(), sp);
@@ -3374,8 +3402,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
         auto [m_new, l_new] =
             p4_chunk(solver_stream.stats_tail.extent,
                      MakeIndex(solver_stream.stats_tail.chunk_index * rc, sp), m_cur, l_cur, body, 2);
-        m_cur = m_new;
-        l_cur = l_new;
+        m_cur = preserve_carried_valid_shape(m_new, m_cur->GetType(), body, "_m_tail_valid");
+        l_cur = preserve_carried_valid_shape(l_new, l_cur->GetType(), body, "_l_tail_valid");
       }
       const VarPtr m_final = m_cur, l_final = l_cur;  // finalized [free_tile,1] stats
 
@@ -3413,7 +3441,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
       auto m_call = reg.Create(merge_op, {ExprPtr(acc_it), ExprPtr(part)}, sp);
       auto acc_n = std::make_shared<Var>(base + "_acc_n", m_call->GetType(), sp);
       lbody.push_back(std::make_shared<AssignStmt>(acc_n, m_call, sp));
-      lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{acc_n}, sp));
+      auto acc_valid = preserve_carried_valid_shape(acc_n, acc_it->GetType(), lbody, "_acc_valid");
+      lbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{acc_valid}, sp));
       auto acc_out = std::make_shared<Var>(base + "_acc", acc->GetType(), sp);
       // A5 (G2): PIPELINE the accumulate pass. The running accumulator `acc_it` is a TRUE loop carry
       // (acc_n = merge(acc_it, part_k)), so it stays single-buffered/persistent; only the per-chunk
@@ -3432,7 +3461,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
       auto m_call = reg.Create(merge_op, {ExprPtr(acc), ExprPtr(tpart)}, sp);
       auto acc_t = std::make_shared<Var>(base + "_acc_t", m_call->GetType(), sp);
       body.push_back(std::make_shared<AssignStmt>(acc_t, m_call, sp));
-      acc = acc_t;
+      acc = preserve_carried_valid_shape(acc_t, acc->GetType(), body, "_acc_tail_valid");
     }
 
     if (stream_p1) {
@@ -3599,7 +3628,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   // loud. The normal solver no longer enumerates such a candidate.
   if (tile.split > 1) {
     return GenericDeclineB("vector reduction split has no realizable solver descriptor (G6/S2)",
-        out_stmt->span_);
+                           out_stmt->span_);
   }
 
   // G1 (emit defense): a MULTI-reduction group (softmax/layernorm: >1 reduction over the reduced
@@ -3616,7 +3645,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
     if (static_cast<int64_t>(ops.size()) * g1_red * p1_dtb > p1_ub)
       return GenericDeclineB(
           "streamed multi-reduction (softmax/layernorm) over a reduced axis too "
-                             "large for UB — the online multi-reduction path (P4) is not yet built; "
+          "large for UB — the online multi-reduction path (P4) is not yet built; "
           "declining to the legacy tiler",
           out_stmt->span_);
   }
@@ -3945,12 +3974,12 @@ ExprPtr CubeRegionAxisOffset(::CubeAxisBinding binding, int64_t extent, int64_t 
     case ::CubeAxisBinding::SpatialM: {
       ExprPtr offset = ScaleIndex(m_index, extent, sp);
       return clamp_overlap && full_extent > extent ? MakeMin(offset, MakeIndex(full_extent - extent, sp), sp)
-                 : offset;
+                                                   : offset;
     }
     case ::CubeAxisBinding::SpatialN: {
       ExprPtr offset = ScaleIndex(n_index, extent, sp);
       return clamp_overlap && full_extent > extent ? MakeMin(offset, MakeIndex(full_extent - extent, sp), sp)
-                 : offset;
+                                                   : offset;
     }
     case ::CubeAxisBinding::ParallelK:
       return ScaleIndex(split_index, extent, sp);
@@ -4223,7 +4252,7 @@ std::optional<ValidatedCubeGroup> ValidateCubeScheduleGroup(
                                int64_t resident) {
       if (producer >= 0) return true;
       const auto key = std::make_tuple(region.tensor, port, static_cast<int>(region.height_binding),
-          static_cast<int>(region.width_binding));
+                                       static_cast<int>(region.width_binding));
       auto [it, inserted] = boundary_requests.emplace(key, resident);
       return inserted || (resident >= 0 && it->second == resident);
     };
@@ -4308,7 +4337,7 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
   ExprPtr lhs_row = mm.lhs_producer >= 0
                         ? MakeIndex(0, sp)
                         : CubeRegionAxisOffset(mm.lhs.height_binding, mm.lhs.height, lhs_full_h,
-                                                                clamp_overlap, m_index, n_index, split_index, sp);
+                                               clamp_overlap, m_index, n_index, split_index, sp);
   ExprPtr lhs_k = mm.lhs_producer >= 0
                       ? MakeIndex(0, sp)
                       : CubeRegionAxisOffset(mm.lhs.width_binding, mm.lhs.width, lhs_full_w, clamp_overlap,
@@ -4344,7 +4373,7 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
           "tensor.slice",
           {source, MakeIndexTuple({region.height, region.width}, sp), MakeTuple2(row, col, sp)}, sp);
       auto value = std::make_shared<Var>(name + "_resident_" + std::to_string(index) + "_" + suffix,
-          slice->GetType(), sp);
+                                         slice->GetType(), sp);
       body->push_back(std::make_shared<AssignStmt>(value, slice, sp));
       (*resident_values)[index] = value;
     }
@@ -4377,7 +4406,7 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
         "tensor.slice",
         {lhs, MakeIndexTuple({mm.lhs.height, mm.lhs.width}, sp), MakeTuple2(lhs_row, lhs_k, sp)}, sp);
     auto retained = std::make_shared<Var>(name + "_i" + std::to_string(instance) + "_lhs_l1",
-        retained_call->GetType(), sp);
+                                          retained_call->GetType(), sp);
     body->push_back(std::make_shared<AssignStmt>(retained, retained_call, sp));
     lhs = retained;
     lhs_row = MakeIndex(0, sp);
@@ -4391,7 +4420,7 @@ bool EmitCubeMatmulInstance(const ::CubeSchedulePlan& plan, size_t instance,
         "tensor.slice",
         {rhs, MakeIndexTuple({mm.rhs.height, mm.rhs.width}, sp), MakeTuple2(rhs_k, rhs_col, sp)}, sp);
     auto retained = std::make_shared<Var>(name + "_i" + std::to_string(instance) + "_rhs_l1",
-        retained_call->GetType(), sp);
+                                          retained_call->GetType(), sp);
     body->push_back(std::make_shared<AssignStmt>(retained, retained_call, sp));
     rhs = retained;
     rhs_k = MakeIndex(0, sp);
@@ -4534,28 +4563,28 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
       split_index = AddIndexOffset(MakeFloorMod(work_index, MakeIndex(split_count, sp), sp),
                                    MakeIndex(split_offset, sp), sp);
       spatial_index = MakeFloorDiv(work_index, MakeIndex(split_count, sp), sp);
-  }
-  ExprPtr m_index = MakeFloorDiv(spatial_index, MakeIndex(parts_n, sp), sp);
-  ExprPtr n_index = MakeFloorMod(spatial_index, MakeIndex(parts_n, sp), sp);
+    }
+    ExprPtr m_index = MakeFloorDiv(spatial_index, MakeIndex(parts_n, sp), sp);
+    ExprPtr n_index = MakeFloorMod(spatial_index, MakeIndex(parts_n, sp), sp);
 
-  std::vector<StmtPtr> body;
-  std::vector<ExprPtr> instance_values(plan.matmuls.size());
+    std::vector<StmtPtr> body;
+    std::vector<ExprPtr> instance_values(plan.matmuls.size());
     std::vector<ExprPtr> root_states = initial_roots;
-  std::vector<ExprPtr> resident_values(plan.resident_boundaries.size());
-  for (size_t instance = 0; instance < plan.matmuls.size(); ++instance) {
-    std::string emit_error;
+    std::vector<ExprPtr> resident_values(plan.resident_boundaries.size());
+    for (size_t instance = 0; instance < plan.matmuls.size(); ++instance) {
+      std::string emit_error;
       if (!EmitCubeMatmulInstance(plan, instance, op_assigns, m_index, n_index, split_index,
                                   atomic_root_store, bind_source_outputs, phase_name, sp, &body,
                                   &instance_values, &root_states, &resident_values, &emit_error)) {
         validation_error = std::move(emit_error);
         return std::nullopt;
+      }
     }
-  }
-  if (std::any_of(resident_values.begin(), resident_values.end(),
-                  [](const ExprPtr& value) { return !value; })) {
+    if (std::any_of(resident_values.begin(), resident_values.end(),
+                    [](const ExprPtr& value) { return !value; })) {
       validation_error = "planned resident boundary was never materialized";
       return std::nullopt;
-  }
+    }
     result.push_back(SpmdWrap(work_index, std::move(body), MakeIndex(work_units, sp), phase_name, sp));
     return root_states;
   };
@@ -4825,7 +4854,7 @@ std::optional<std::vector<StmtPtr>> EmitMixedScheduleGroup(
           {"slot_num", static_cast<int>(plan.fifos[0].slot_count)}});
   INTERNAL_CHECK(kernel->HasAttr("slot_num")) << "mixed InCore lost slot_num at construction";
   auto scope = std::make_shared<SpmdScopeStmt>(MakeIndex(plan.loop.active_groups, sp), /*sync_start=*/false,
-      name + "_spmd", kernel, sp);
+                                               name + "_spmd", kernel, sp);
   LOG_INFO << "AutoFuse[mixed-plan]: group '" << name << "' emitted C->V grid=" << plan.m_partition.parts
            << "x" << plan.n_partition.parts << " groups=" << plan.loop.active_groups << " trips=" << trips
            << " lanes=" << plan.vector_lanes << " fifo_bytes=" << plan.fifos[0].slot_bytes
@@ -4898,7 +4927,7 @@ std::vector<StmtPtr> ReorderBodyByGroup(const std::vector<StmtPtr>& body,
 
   // Assign dense unit ids in first-appearance (SSA) order: grouped stmts share their group's unit.
   std::unordered_map<size_t, size_t> unit_index;  // raw key -> dense id
-  std::vector<std::vector<size_t>> unit_stmts;     // dense id -> body indices (in SSA order)
+  std::vector<std::vector<size_t>> unit_stmts;    // dense id -> body indices (in SSA order)
   std::vector<size_t> unit_of_stmt(n);
   std::unordered_map<const Var*, size_t> def_unit;  // defined Var -> its unit
   for (size_t i = 0; i < n; ++i) {
@@ -5142,7 +5171,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
           }
         }
         GenericDeclineB("MixedSchedulePlan cannot be replayed exactly; leaving the function unchanged",
-            stmt->span_);
+                        stmt->span_);
         if (mixed_emit_failed != nullptr) *mixed_emit_failed = true;
         return body;
       }
@@ -5400,10 +5429,10 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
   for (const StmtPtr& s : seq->stmts_) top_level.insert(s.get());
   auto& reg = OpRegistry::GetInstance();
   const Span rsp = idx.ret->span_;
-  std::vector<VarPtr> out_params;             // Out-param Var per return, in return order
-  std::unordered_set<const Stmt*> drop_set;   // traceable creates to remove (their Var -> param)
-  std::vector<StmtPtr> synth_copies;          // synthesized assemble-copies, inserted before return
-  std::vector<ExprPtr> new_ret;               // rewritten return values
+  std::vector<VarPtr> out_params;            // Out-param Var per return, in return order
+  std::unordered_set<const Stmt*> drop_set;  // traceable creates to remove (their Var -> param)
+  std::vector<StmtPtr> synth_copies;         // synthesized assemble-copies, inserted before return
+  std::vector<ExprPtr> new_ret;              // rewritten return values
   for (const ExprPtr& rv : idx.ret->value_) {
     auto ret_var = AsVarLike(rv);
     if (!ret_var) return;
@@ -5588,7 +5617,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     // whole function and leave every source operation to the existing lowering.
     const bool has_unsupported_ops = std::any_of(p.ops.begin(), p.ops.end(), [](const ::Op& op) {
       return op.type == ::OpType::Opaque && op.vector_capability == ::VectorOpCapability::Unsupported;
-        });
+    });
     if (has_unsupported_ops) {
       LOG_INFO << "AutoFuse[" << func->name_
                << "]: unsupported opaque operation present -> leaving function unchanged";
@@ -5665,7 +5694,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     long fw = -1, fh = -1, fs = -1, fpm = -1, fpn = -1, fg = -1;
     if (force_env != nullptr) {
       const char* spec = force_env;
-      if (spec[0] == 'g') std::sscanf(spec, "g%ld:", &fg);        // optional group selector
+      if (spec[0] == 'g') std::sscanf(spec, "g%ld:", &fg);  // optional group selector
       if (const char* colon = std::strchr(spec, ':')) spec = colon + 1;
       std::sscanf(spec, "%ld,%ld,%ld,%ld,%ld", &fw, &fh, &fs, &fpm, &fpn);
     }
@@ -5687,8 +5716,8 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       // winning configuration, using the same helper candidate pricing used.
       const ::VectorStreamPlan selected_stream =
           !sol.step(s).subgraph.has_matmul() ? sol.step(s).subgraph.vector_stream_plan(
-                    cfg, sol.retained_entering(s), sol.step(s).retain_these)
-              : ::VectorStreamPlan{};
+                                                   cfg, sol.retained_entering(s), sol.step(s).retain_these)
+                                             : ::VectorStreamPlan{};
       const ::CubeSchedulePlan selected_cube =
           sol.step(s).subgraph.has_matmul() && !sol.step(s).subgraph.has_vector()
               ? sol.step(s).subgraph.cube_schedule_plan(
@@ -5701,7 +5730,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
               : ::MixedSchedulePlan{};
       SolverTile tile(cfg.w, cfg.h,
                       selected_cube.feasible ? selected_cube.config.k
-                          : (selected_mixed.feasible ? selected_mixed.config.k : cfg.k),
+                                             : (selected_mixed.feasible ? selected_mixed.config.k : cfg.k),
                       selected_cost.parallel_split, cfg.parts_m, cfg.parts_n, selected_stream, selected_cube,
                       selected_mixed);
       if (dump_plans || force_env != nullptr) {
@@ -5720,8 +5749,8 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
               (fs < 0 || static_cast<long>(pr.parallel_split) == fs) && (fpm < 0 || pc.parts_m == fpm) &&
               (fpn < 0 || pc.parts_n == fpn)) {
             const ::VectorStreamPlan forced_stream = !sol.step(s).subgraph.has_matmul()
-                    ? sol.step(s).subgraph.vector_stream_plan(pc)
-                    : ::VectorStreamPlan{};
+                                                         ? sol.step(s).subgraph.vector_stream_plan(pc)
+                                                         : ::VectorStreamPlan{};
             const ::CubeSchedulePlan forced_cube =
                 sol.step(s).subgraph.has_matmul() && !sol.step(s).subgraph.has_vector()
                     ? sol.step(s).subgraph.cube_schedule_plan(pc, {}, {}, pr.parallel_split)
@@ -5733,7 +5762,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
             tile = SolverTile(
                 pc.w, pc.h,
                 forced_cube.feasible ? forced_cube.config.k
-                                  : (forced_mixed.feasible ? forced_mixed.config.k : pr.config.k),
+                                     : (forced_mixed.feasible ? forced_mixed.config.k : pr.config.k),
                 pr.parallel_split, pc.parts_m, pc.parts_n, forced_stream, forced_cube, forced_mixed);
             forced_here = true;
             const std::string cube_policy =
@@ -5786,8 +5815,8 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     // Drop the marker once fused: the body is now an InCore-scoped kernel graph,
     // not a flat tensor-op DAG, so the pass is idempotent (a second run no-ops).
     new_func->attrs_.erase(std::remove_if(new_func->attrs_.begin(), new_func->attrs_.end(),
-                       [](const auto& kv) { return kv.first == "auto_fuse"; }),
-        new_func->attrs_.end());
+                                          [](const auto& kv) { return kv.first == "auto_fuse"; }),
+                           new_func->attrs_.end());
     new_functions.emplace(gvar, new_func);
     any_change = true;
   }

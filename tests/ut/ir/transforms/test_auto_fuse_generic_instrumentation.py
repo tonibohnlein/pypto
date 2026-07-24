@@ -15,11 +15,11 @@ case the generic path *owned* from one it silently *declined* (the generic
 function returns ``std::nullopt`` and the legacy tiler quietly produced the same
 correct output). CI would stay green either way, hiding a driver that never runs.
 
-This file closes that gap by asserting on the driver's own log markers with the
-flag ON:
+This file closes that gap by asserting on the current emitters' log markers
+with the flag ON:
 
-- generic OWNS the vector + uniform-matmul surface  ("tiled by the generic driver")
-- generic DECLINES non-uniform grids LOUDLY, not silently ("CAPABILITY decline")
+- the generic vector driver owns pointwise groups;
+- ``CubeSchedulePlan`` owns uniform and clamped-overlap matmul grids.
 
 Together with the strict-mode golden run (``PYPTO_AUTOFUSE_STRICT=1`` — Tier-B
 illegal-plan conditions abort), this makes both halves observable: the driver
@@ -67,8 +67,8 @@ class TestGenericDriverEngages:
             "generic Elementwise rule did not own the pointwise group (silent legacy fallback?)\n" + log
         )
 
-    def test_generic_owns_uniform_matmul(self, ascend_backend, capfd, monkeypatch):
-        """A square (uniform-grid) matmul routes through the generic MatMul rule."""
+    def test_cube_plan_owns_uniform_matmul(self, ascend_backend, capfd, monkeypatch):
+        """A square matmul routes through CubeSchedulePlan with a uniform grid."""
 
         @pl.program
         class Prog:
@@ -80,31 +80,25 @@ class TestGenericDriverEngages:
                 return c
 
         log = _autofuse_log(Prog, capfd, monkeypatch)
-        assert "matmul group" in log and "tiled by the generic driver" in log, (
-            "generic MatMul rule did not own the uniform matmul (silent legacy fallback?)\n" + log
+        assert "AutoFuse[cube-plan]" in log and "spatial_policy=uniform" in log, (
+            "CubeSchedulePlan did not own the uniform matmul\n" + log
         )
 
-    def test_generic_declines_nonuniform_grid_loudly(self, ascend_backend, capfd, monkeypatch):
-        """A non-uniform (parts_m/parts_n) grid is a LOGGED capability decline, not silent.
-
-        The solver picks a non-uniform grid for a rectangular shape (e.g. parts_n=3 on
-        N=256); the v1 emitter only tiles uniform grids, so it runs untiled — correctly,
-        but at lower fidelity. That decline MUST be visible (so the bake window can
-        measure it), never a silent nullopt.
-        """
+    def test_cube_plan_owns_clamped_overlap_grid(self, ascend_backend, capfd, monkeypatch):
+        """A non-divisor matmul grid is emitted with explicit clamped ownership."""
 
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
             def mm(
-                self, a: pl.Tensor[[128, 192], pl.FP32], b: pl.Tensor[[192, 256], pl.FP32]
-            ) -> pl.Tensor[[128, 256], pl.FP32]:
-                c: pl.Tensor[[128, 256], pl.FP32] = pl.matmul(a, b)
+                self, a: pl.Tensor[[272, 272], pl.FP32], b: pl.Tensor[[272, 272], pl.FP32]
+            ) -> pl.Tensor[[272, 272], pl.FP32]:
+                c: pl.Tensor[[272, 272], pl.FP32] = pl.matmul(a, b)
                 return c
 
         log = _autofuse_log(Prog, capfd, monkeypatch)
-        assert "CAPABILITY decline" in log and "non-uniform spatial grid" in log, (
-            "non-uniform grid decline was not logged (silent fallback masks the fidelity gap)\n" + log
+        assert "AutoFuse[cube-plan]" in log and "spatial_policy=clamped_overlap" in log, (
+            "CubeSchedulePlan did not expose clamped-overlap ownership\n" + log
         )
 
     def test_generic_owns_multi_sink_fork(self, ascend_backend, capfd, monkeypatch):
@@ -147,10 +141,8 @@ class TestVectorPipelining:
                 return d
 
         log = _autofuse_log(Prog, capfd, monkeypatch)
-        m = re.search(r"(\d+) pipeline strips", log)
-        assert m and int(m.group(1)) >= 2, (
-            f"vector group not pipelined (expected >=2 strips)\n{log}"
-        )
+        m = re.search(r"(\d+) planned strips \(stage=2\)", log)
+        assert m and int(m.group(1)) >= 2, f"vector group not pipelined (expected >=2 strips)\n{log}"
 
     def test_vector_pipeline_realizes_overlap(self, ascend_backend, tmp_path, monkeypatch):
         """The LOWERED vector kernel loads each input per-strip into distinct ping-pong buffers

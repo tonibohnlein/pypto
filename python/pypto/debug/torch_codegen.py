@@ -123,6 +123,15 @@ def _prop_valid(result, *srcs):
     return result
 
 
+def _set_valid_shape(tensor, valid_rows, valid_cols):
+    # tensor/tile.set_validshape is metadata-only in PyPTO. Preserve the
+    # same tensor object while updating the region consumed by later
+    # reductions and stores.
+    tensor._pypto_valid_shape = (int(valid_rows), int(valid_cols))
+    tensor._pypto_full_shape = tuple(int(s) for s in tensor.shape)
+    return tensor
+
+
 def _reduce_valid(t, op, dim):
     # Reduce ONLY the valid extent along `dim` (the reduced axis), as the Ascend hardware
     # reductions do (pto.trowsum/tcolsum bound the sum by valid, device-verified) — the padded
@@ -1014,6 +1023,7 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tensor.create_l1"] = _handle_create
     m["tensor.full"] = _handle_full
     m["tensor.slice"] = _handle_slice
+    m["tensor.set_validshape"] = lambda a, _kw: f"_set_valid_shape({a[0]}, {a[1]}, {a[2]})"
     m["tensor.read"] = lambda a, _kw: f"{a[0]}[{a[1]}]"
     m["tensor.write"] = lambda a, _kw: f"_write_and_return({a[0]}, {a[1]}, {a[2]})"
 
@@ -1026,6 +1036,7 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tile.move"] = _identity()
     m["tile.slice"] = _handle_slice
     m["tile.extract"] = _handle_tile_extract
+    m["tile.set_validshape"] = lambda a, _kw: f"_set_valid_shape({a[0]}, {a[1]}, {a[2]})"
     m["tile.read"] = lambda a, _kw: f"{a[0]}[{a[1]}]"
     m["tile.write"] = lambda a, _kw: f"_write_and_return({a[0]}, {a[1]}, {a[2]})"
     m["tile.get_block_idx"] = lambda _a, _kw: "0"

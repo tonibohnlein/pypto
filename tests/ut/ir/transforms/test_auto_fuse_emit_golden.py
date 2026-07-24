@@ -9,19 +9,16 @@
 
 """Numerical GOLDEN / differential-test harness for the AutoFuse emit.
 
-This is the migration safety net for replacing the three per-shape tilers
-(``TileMatmul``, ``TileChainedMatmul``, ``TilePointwiseGroup`` in
-``src/ir/transforms/auto_fuse_pass.cpp``) with a single generic tile-and-fuse
-driver. Every case asserts that the EMIT — the post-AutoFuse tensor IR, with ALL
+This is the numerical safety net for the current generic vector and
+``CubeSchedulePlan`` emitters. Every case asserts that the EMIT — the
+post-AutoFuse tensor IR, with ALL
 SPMD blocks executed and tile-stitched via
 ``torch_codegen(..., run_all_spmd_blocks=True)`` — reproduces the UNFUSED
 reference computation to fp tolerance.
 
-Why numerical, not IR-structural: the refactor changes the emitted IR shape *by
-design*, so an IR snapshot would churn. A tile-stitch-vs-reference check is
-invariant to how the tiling is expressed, so the CURRENT legacy tilers and the
-FUTURE generic driver must both pass this file identically — flip the driver
-behind a flag and diff numerically, not by IR shape.
+Why numerical, not IR-structural: a tile-stitch-vs-reference check is invariant
+to how the tiling is expressed, while structural plan/emit contracts live in
+``test_auto_fuse.py``.
 
 Coverage = the surface the three tilers handle today, one representative shape
 per tiler plus a multi-user DAG (the diamond, which stresses on-chip
@@ -40,29 +37,11 @@ import pytest
 from pypto import passes
 
 
-@pytest.fixture(params=["legacy", "generic"], autouse=True)
-def emit_path(request, monkeypatch):
-    """Run EVERY golden case both ways — flag OFF (legacy per-shape tilers) and flag ON
-    (the generic tile-and-fuse driver) — so this file is a true DIFFERENTIAL net: both
-    paths must reproduce the unfused reference. This is the migration guard that lets the
-    driver be promoted / the legacy tilers retired with CI confidence, not just manual
-    checks. The C++ flag re-reads the env var per compile, so monkeypatch toggles it
-    in-process (see GenericEmitEnabled in auto_fuse_pass.cpp)."""
-    if request.param == "generic":
-        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
-        # STRICT mode turns every Tier-B decline (a plan the emitter contract forbids —
-        # mis-pinned reduction, split ∤ K/16, mixed cube+vector, multi-sink) into a hard
-        # failure instead of a silent legacy fallback. Enabling it on the generic golden
-        # run makes CI ENFORCE the tier invariant "no Tier-B fires on the v1 surface" —
-        # otherwise a future golden case (or a solver change) that trips a Tier-B would
-        # pass green via the legacy fallback, masking exactly the bug the tiers exist to
-        # surface. Capability declines (non-uniform grid, vector split>1) do NOT abort
-        # under strict, so legitimate deferred-fidelity cases stay green.
-        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
-    else:
-        monkeypatch.delenv("PYPTO_AUTOFUSE_GENERIC_EMIT", raising=False)
-        monkeypatch.delenv("PYPTO_AUTOFUSE_STRICT", raising=False)
-    return request.param
+@pytest.fixture(autouse=True)
+def emit_path(monkeypatch):
+    """Exercise the current generic emit and fail loudly on model/emit drift."""
+    monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+    monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
 
 
 def _emit_matches_reference(program, entry, inputs, ref, *, rtol=1e-4, atol=1e-4):
@@ -97,8 +76,7 @@ def _emit_matches_reference(program, entry, inputs, ref, *, rtol=1e-4, atol=1e-4
 class TestAutoFuseEmitGolden:
     """Emit == unfused reference, across the three tilers' surface.
 
-    Both the legacy per-shape tilers and the future generic tile-and-fuse driver
-    must pass every case here.
+    The current vector and cube emitters must pass every admitted case here.
     """
 
     # ---- TileMatmul (single matmul: ordered split-K partial merge) ----
@@ -109,7 +87,9 @@ class TestAutoFuseEmitGolden:
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def mm(self, a: pl.Tensor[[64, 64], pl.FP32], b: pl.Tensor[[64, 64], pl.FP32]) -> pl.Tensor[[64, 64], pl.FP32]:
+            def mm(
+                self, a: pl.Tensor[[64, 64], pl.FP32], b: pl.Tensor[[64, 64], pl.FP32]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
                 c: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
                 return c
 
@@ -124,7 +104,9 @@ class TestAutoFuseEmitGolden:
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def mm(self, a: pl.Tensor[[128, 192], pl.FP32], b: pl.Tensor[[192, 256], pl.FP32]) -> pl.Tensor[[128, 256], pl.FP32]:
+            def mm(
+                self, a: pl.Tensor[[128, 192], pl.FP32], b: pl.Tensor[[192, 256], pl.FP32]
+            ) -> pl.Tensor[[128, 256], pl.FP32]:
                 c: pl.Tensor[[128, 256], pl.FP32] = pl.matmul(a, b)
                 return c
 
@@ -143,7 +125,9 @@ class TestAutoFuseEmitGolden:
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def mm(self, a: pl.Tensor[[64, 512], pl.FP32], b: pl.Tensor[[512, 64], pl.FP32]) -> pl.Tensor[[64, 64], pl.FP32]:
+            def mm(
+                self, a: pl.Tensor[[64, 512], pl.FP32], b: pl.Tensor[[512, 64], pl.FP32]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
                 c: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
                 return c
 
@@ -161,7 +145,9 @@ class TestAutoFuseEmitGolden:
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def mm(self, a: pl.Tensor[[48, 96], pl.FP32], b: pl.Tensor[[96, 112], pl.FP32]) -> pl.Tensor[[48, 112], pl.FP32]:
+            def mm(
+                self, a: pl.Tensor[[48, 96], pl.FP32], b: pl.Tensor[[96, 112], pl.FP32]
+            ) -> pl.Tensor[[48, 112], pl.FP32]:
                 c: pl.Tensor[[48, 112], pl.FP32] = pl.matmul(a, b)
                 return c
 
@@ -171,25 +157,33 @@ class TestAutoFuseEmitGolden:
 
     # ---- TileChainedMatmul (fused chain; emit only — lowering is #1908-blocked) ----
 
-    def test_chained_matmul(self, ascend_backend):
+    def test_chained_matmul(self, ascend_backend, monkeypatch):
+        """Use the supported A2/A3 recursive handoff: FP32 Acc narrows to BF16 Mat.
+
+        Same-type FP32 Acc-to-Mat is intentionally rejected and is covered by
+        ``test_fp32_chained_matmul_declines_unsupported_l1_handoff``.
+        """
         torch = pytest.importorskip("torch")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
 
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
             def chain(
                 self,
-                a: pl.Tensor[[128, 256], pl.FP32],
-                b: pl.Tensor[[256, 128], pl.FP32],
-                d: pl.Tensor[[128, 256], pl.FP32],
-            ) -> pl.Tensor[[128, 256], pl.FP32]:
-                t: pl.Tensor[[128, 128], pl.FP32] = pl.matmul(a, b)
-                c: pl.Tensor[[128, 256], pl.FP32] = pl.matmul(t, d)
+                a: pl.Tensor[[128, 256], pl.BF16],
+                b: pl.Tensor[[256, 128], pl.BF16],
+                d: pl.Tensor[[128, 256], pl.BF16],
+            ) -> pl.Tensor[[128, 256], pl.BF16]:
+                t: pl.Tensor[[128, 128], pl.BF16] = pl.matmul(a, b)
+                c: pl.Tensor[[128, 256], pl.BF16] = pl.matmul(t, d)
                 return c
 
         torch.manual_seed(2)
-        a, b, d = torch.randn(128, 256), torch.randn(256, 128), torch.randn(128, 256)
-        _emit_matches_reference(Prog, "chain", (a, b, d), (a @ b) @ d)
+        a = torch.randn(128, 256, dtype=torch.bfloat16) * 0.05
+        b = torch.randn(256, 128, dtype=torch.bfloat16) * 0.05
+        d = torch.randn(128, 256, dtype=torch.bfloat16) * 0.05
+        _emit_matches_reference(Prog, "chain", (a, b, d), (a @ b) @ d, rtol=1e-3, atol=1e-3)
 
     # ---- TilePointwiseGroup (single + chained pointwise, and the multi-user diamond) ----
 
@@ -231,7 +225,9 @@ class TestAutoFuseEmitGolden:
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def dag(self, a: pl.Tensor[[128, 128], pl.FP32], b: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[128, 128], pl.FP32]:
+            def dag(
+                self, a: pl.Tensor[[128, 128], pl.FP32], b: pl.Tensor[[128, 128], pl.FP32]
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
                 c: pl.Tensor[[128, 128], pl.FP32] = pl.add(a, b)
                 d: pl.Tensor[[128, 128], pl.FP32] = pl.add(c, 1.0)
                 e: pl.Tensor[[128, 128], pl.FP32] = pl.add(c, 2.0)
@@ -440,7 +436,9 @@ class TestAutoFuseEmitGolden:
         @pl.program
         class Prog:
             @pl.function(attrs={"auto_fuse": True})
-            def scaled(self, a: pl.Tensor[[64, 64], pl.FP32], s: pl.Scalar[pl.FP32]) -> pl.Tensor[[64, 64], pl.FP32]:
+            def scaled(
+                self, a: pl.Tensor[[64, 64], pl.FP32], s: pl.Scalar[pl.FP32]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
                 c: pl.Tensor[[64, 64], pl.FP32] = pl.mul(a, s)
                 return c
 
