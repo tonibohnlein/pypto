@@ -56,6 +56,51 @@ def _memory_summary(path: Path) -> dict[str, tuple[str, int]]:
     return result
 
 
+def _strip_cpp_comments(text: str) -> str:
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", text, flags=re.DOTALL)
+
+
+def _parse_ptoas_acc_addresses(text: str, path: Path) -> list[int]:
+    text = _strip_cpp_comments(text)
+    constants = {
+        name: int(value) for name, value in re.findall(r"const int64_t\s+(\w+)\s*=\s*(-?\d+)\s*;", text)
+    }
+    assignments = re.findall(
+        r"Tile<TileType::Acc,[^;]+>\s+(\w+)\s*=.*?;\s*"
+        r"uint64_t\s+(\w+)\s*=\s*\(uint64_t\)\s*(\w+|\d+)\s*;\s*"
+        r"TASSIGN\(\1,\s*\2\);",
+        text,
+        flags=re.DOTALL,
+    )
+    assert assignments, f"No PTOAS Acc TASSIGN sequences found in {path}"
+    addresses = []
+    for _, _, token in assignments:
+        addresses.append(int(token) if token.isdigit() else constants[token])
+    return sorted(set(addresses))
+
+
+def _parse_ptoas_compute_order(text: str, path: Path) -> list[str]:
+    text = _strip_cpp_comments(text)
+    tokens = re.findall(r"\b(TMATMUL(?:_ACC)?|TSTORE)\s*\(", text)
+    assert tokens, f"No PTOAS matmul/store sequence found in {path}"
+    assert "TMATMUL_ACC" not in tokens, f"Unexpected split-K accumulator in {path}: {tokens}"
+    return ["matmul" if token == "TMATMUL" else "store" for token in tokens]
+
+
+def _ptoas_artifacts(case_dir: Path) -> tuple[list[int], list[str]] | None:
+    candidates = []
+    ptoas_dir = case_dir / "ptoas"
+    for path in ptoas_dir.rglob("*.cpp") if ptoas_dir.is_dir() else ():
+        text = path.read_text()
+        if "Tile<TileType::Acc" in text:
+            candidates.append((path, text))
+    if not candidates:
+        return None
+    assert len(candidates) == 1, f"Expected one PTOAS AIC C++ file, got {[path for path, _ in candidates]}"
+    path, text = candidates[0]
+    return _parse_ptoas_acc_addresses(text, path), _parse_ptoas_compute_order(text, path)
+
+
 def _validate_case(result_path: Path) -> dict[str, object]:
     result = json.loads(result_path.read_text())
     case_dir = result_path.parent
@@ -116,7 +161,28 @@ def _validate_case(result_path: Path) -> dict[str, object]:
         summary["acc_addresses"] = acc_addresses
         summary["placement_status"] = "VERIFIED"
     else:
-        summary["placement_status"] = "PENDING_PTOAS_FINAL_PLACEMENT_INSPECTION"
+        ptoas_artifacts = _ptoas_artifacts(case_dir)
+        if ptoas_artifacts is None:
+            summary["placement_status"] = "PENDING_PTOAS_FINAL_PLACEMENT_INSPECTION"
+        else:
+            acc_addresses, final_order = ptoas_artifacts
+            expected_count = 1 if variant == "baseline" else 2
+            assert len(acc_addresses) == expected_count, (case_dir, acc_addresses)
+            assert all(0 <= address and address + 8192 <= 128 * 1024 for address in acc_addresses), (
+                case_dir,
+                acc_addresses,
+            )
+            if variant == "dbc":
+                assert acc_addresses[1] - acc_addresses[0] >= 8192, (case_dir, acc_addresses)
+            expected_final_order = (
+                ["matmul", "store", "matmul", "store"] * 2
+                if variant == "baseline"
+                else ["matmul", "matmul", "store", "store"] * 2
+            )
+            assert final_order == expected_final_order, (case_dir, final_order)
+            summary["acc_addresses"] = acc_addresses
+            summary["final_cpp_order"] = final_order
+            summary["placement_status"] = "VERIFIED"
     return summary
 
 
@@ -138,10 +204,11 @@ def main() -> None:
         ("ptoas", "dbc"),
     }
     assert set(cases_by_key) == expected, (set(cases_by_key), expected)
+    placement_pending = any(case["placement_status"] != "VERIFIED" for case in cases_by_key.values())
     print(
         json.dumps(
             {
-                "status": "PASS_WITH_PTOAS_PLACEMENT_PENDING",
+                "status": "PASS_WITH_PTOAS_PLACEMENT_PENDING" if placement_pending else "PASS",
                 "cases": list(cases_by_key.values()),
             },
             indent=2,

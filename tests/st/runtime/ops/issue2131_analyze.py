@@ -17,14 +17,17 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-EXPECTED_REPLICATES = {1, 2, 3}
+EXPECTED_REPLICATES = set(range(1, 11))
+EXPECTED_CORRECTNESS_SEEDS = {2040, 2041, 2042}
 PLANNERS = ("pypto", "ptoas")
 VARIANTS = ("baseline", "dbc")
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("results_root", type=Path)
+    parser.add_argument("results_root", type=Path, nargs="?")
+    parser.add_argument("--correctness-root", type=Path, required=True)
+    parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--bootstrap", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=2131)
     parser.add_argument("--output", type=Path)
@@ -105,6 +108,70 @@ def _index_rows(rows: list[dict[str, Any]]) -> dict[tuple[str, int, str], dict[s
             f"Timing samples must be finite and positive: {row['_path']}"
         )
     return indexed
+
+
+def _validate_correctness(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    indexed: dict[tuple[int, str, str], dict[str, Any]] = {}
+    for row in rows:
+        path = row["_path"]
+        assert row.get("passed"), f"Failed run in correctness root: {path}"
+        assert not row.get("compile_only"), f"Compile-only run in correctness root: {path}"
+        assert row.get("bench_enabled") == "", f"PYPTO_BENCH must be unset: {path}"
+        assert not row.get("benchmark"), f"Benchmark data in correctness root: {path}"
+        assert row.get("planner") in PLANNERS, f"Unexpected planner: {path}"
+        assert row.get("variant") in VARIANTS, f"Unexpected variant: {path}"
+        assert row.get("seed") in EXPECTED_CORRECTNESS_SEEDS, f"Unexpected seed: {path}"
+        assert row.get("replicate") == 0, f"Correctness replicate must be zero: {path}"
+        assert row.get("platform") == "a2a3", f"Correctness platform must be a2a3: {path}"
+        assert row.get("enable_l2_swimlane") is False, f"L2 swimlane must be disabled: {path}"
+        key = (row["seed"], row["planner"], row["variant"])
+        assert key not in indexed, f"Duplicate correctness row {key}: {path}"
+        indexed[key] = row
+
+    expected = {
+        (seed, planner, variant)
+        for seed in EXPECTED_CORRECTNESS_SEEDS
+        for planner in PLANNERS
+        for variant in VARIANTS
+    }
+    assert set(indexed) == expected, f"Incomplete correctness matrix: missing={expected - set(indexed)}"
+    devices = {row["device"] for row in indexed.values()}
+    assert len(devices) == 1, f"Correctness device mismatch: {devices}"
+
+    golden_data_by_seed: dict[int, str] = {}
+    for seed in sorted(EXPECTED_CORRECTNESS_SEEDS):
+        baseline = indexed[(seed, "pypto", "baseline")]
+        assert baseline.get("golden_data") is None, f"Baseline must generate golden data: {baseline['_path']}"
+        expected_golden = str((Path(baseline["work_dir"]) / "data").resolve())
+        golden_data_by_seed[seed] = expected_golden
+        for planner, variant in (("pypto", "dbc"), ("ptoas", "baseline"), ("ptoas", "dbc")):
+            row = indexed[(seed, planner, variant)]
+            assert row.get("golden_data") == expected_golden, (
+                f"Golden-data mismatch for {(seed, planner, variant)}: {row['_path']}"
+            )
+
+    return {
+        "status": "PASS",
+        "runs": len(indexed),
+        "seeds": sorted(EXPECTED_CORRECTNESS_SEEDS),
+        "device": next(iter(devices)),
+        "golden_data": golden_data_by_seed,
+    }
+
+
+def _validate_timing_provenance(
+    rows: list[dict[str, Any]],
+    correctness: dict[str, Any],
+) -> None:
+    expected_golden = correctness["golden_data"][2040]
+    expected_device = correctness["device"]
+    for row in rows:
+        assert row.get("golden_data") == expected_golden, (
+            f"Timing must replay validated seed-2040 golden data: {row['_path']}"
+        )
+        assert row.get("device") == expected_device, (
+            f"Timing must use the correctness device {expected_device}: {row['_path']}"
+        )
 
 
 def _direction(deltas: list[float]) -> str:
@@ -188,8 +255,16 @@ def _summarize(rows: list[dict[str, Any]], bootstrap: int, seed: int) -> dict[st
 
 def main() -> None:
     args = _parse_args()
-    rows = _load(args.results_root)
-    summary = _summarize(rows, args.bootstrap, args.seed)
+    correctness = _validate_correctness(_load(args.correctness_root))
+    if args.correctness_only:
+        print(json.dumps({"correctness": correctness}, indent=2, sort_keys=True))
+        return
+    if args.results_root is None:
+        raise ValueError("results_root is required unless --correctness-only is set")
+    timing_rows = _load(args.results_root)
+    _validate_timing_provenance(timing_rows, correctness)
+    summary = _summarize(timing_rows, args.bootstrap, args.seed)
+    summary["correctness"] = correctness
     rendered = json.dumps(summary, indent=2, sort_keys=True)
     print(rendered)
     if args.output is not None:
