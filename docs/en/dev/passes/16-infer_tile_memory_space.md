@@ -1,6 +1,6 @@
 # InferTileMemorySpace Pass
 
-Infers the on-chip `MemorySpace` for every `TileType` variable inside InCore functions and inserts `tile.move` ops to legalize residual mismatches between producers and consumer constraints.
+Infers the on-chip `MemorySpace` for every `TileType` variable inside InCore functions, inserts `tile.move` ops to legalize residual mismatches between producers and consumer constraints, and keeps provably loop-invariant Mat operands resident across sequential loops.
 
 ## Overview
 
@@ -36,7 +36,7 @@ The pass only rewrites functions whose `func_type_ == FunctionType::InCore`. Orc
 
 ## Algorithm
 
-Each InCore function is processed in four phases. All phases run as IR visitors / mutators with O(N log N) complexity in the size of the function body (lookups go through ordered maps).
+Each InCore function is processed in five phases implemented as IR visitors / mutators. Phase 4 builds one bottom-up loop inventory and one complete syntactic-use map. It analyzes each loop's original direct body exactly once, so nested loops are rewritten independently and the phase remains O(N). A chain moves across at most one lexical loop per pass invocation rather than repeatedly bubbling through newly created preheaders.
 
 ### Phase 0 — Backward demand collection (`DemandCollector`)
 
@@ -94,7 +94,56 @@ A full `IRMutator` rewrite that produces the new function body:
 4. **Retargetable producer kwarg rewrite (`VisitStmt_(AssignStmt)`)** — for ops registered with `HasRetargetableMemoryKwarg()`, if Phase 1 resolved the output to a different space than the kwarg said (or the kwarg was absent), rewrite the `Call`'s `target_memory` kwarg and the result `TileType` to match. This keeps codegen and the assigned `Var` annotation in sync, and is necessary because Phase 1 may have resolved the producer using backward demand that the kwarg never saw.
 5. **LHS / RHS type sync** — when `VisitExpr_(Call)` rebuilds a `Call` via `OpRegistry` after argument substitution, the deduced result type may differ from the LHS `Var`'s original type (the rebuilt call sees inputs with new layouts). The mutator syncs the LHS Var's `TileType` to the rebuilt call's shape / dtype / memref / view while preserving the `memory_space_` chosen by Var rewrite, so roundtrip equality is preserved.
 
-## Example
+### Phase 4 — Loop-invariant Mat residency (`loop_invariant_mat_residency`)
+
+After all spaces are explicit, a focused internal transform recognizes an invariant prefix of the form `tile.load(GM → Mat) → tile.transpose_view* → tile.move/tile.extract(Mat → Left/Right)`. For an exact single-use chain, it moves the entire invariant prefix to the loop preheader. It also recognizes a compiler-generated Mat panel whose complete read-only use graph fans through `transpose_view` and one or more `move` / `extract` operations into matching matmul operand slots. In that case only the whole-panel GM→Mat load moves; K-dependent Left/Right staging remains in its original loop or pipeline. This keeps the optimization specific to stationary matmul operands rather than turning it into general tile LICM. A stationary tensor-level operand is therefore loaded from GM once while its loop-dependent peer continues to stream normally.
+
+This is a conservative first subset of the broader residency behavior requested by issue #2077, not a general tensor-level residency contract. A direct or externally entered InCore function has no caller evidence and therefore declines. Distinct external tensor parameters also decline: PyPTO has no runtime `noalias` contract that makes their backing allocations disjoint. Positive caller provenance is currently limited to storage allocated by `tensor.create` inside root orchestration IR. Extending coverage to external operands requires an enforced no-alias contract or a checked fallback; it is not assumed by this transform. `AutoTileMatmulL0` fanout is supported without moving its K-dependent L0 extracts: panel residency and optional Mat→L0 prefix motion are analyzed independently.
+
+Eligibility begins with private compiler provenance. `ConvertTensorToTileOps` marks every generated `GM → Mat` bridge load; the marker survives printing, flattening, and L0 auto-tiling until this phase consumes it. Phase 4 then proves that a marked load participates in either the exact stationary prefix or the read-only matmul panel fanout described above. A user-authored `tile.load(..., target_memory=Mat)` is not marked and is never hoisted by this optimization. This boundary keeps explicit tile programs under user control.
+
+The initial legality rules are intentionally strict:
+
+- the loop is `Sequential`, has constant bounds, positive step, and at least one iteration;
+- every moved assignment is an unconditional top-level loop-body statement;
+- the GM source is a direct `ParamDirection::In` tensor parameter on a compiler-marked Mat bridge load;
+- the InCore function has at least one direct `Call` site in a root orchestration function (an orchestration function with no in-program caller), and every call site to that InCore function is such a direct root-orchestration `Call`; a `Submit` site always poisons the candidate because asynchronous submission is not positive alias evidence;
+- at every such call site, the candidate `Tensor In` actual resolves to a compiler-owned allocation created by `tensor.create`; plain aliases and `tensor.slice` / `tensor.assemble` / `tensor.view` aliases are canonicalized to that storage root, every writable `Tensor Out` / `Tensor InOut` root is known, and none aliases the candidate root; the InCore function also does not write that root locally, while unrelated scalars and peer read-only `Tensor In` roots do not participate in this filter;
+- offsets, shapes, and the complete moved dependency prefix are loop invariant;
+- any function call, task submission, cross-core operation, synchronization, cache-maintenance, or unknown builtin in the loop header (bounds or loop-carried initializers) or body subtree declines residency because preheader motion could cross an unknown or hidden ordering effect between iterations; other direct control-flow or effect statements before the candidate close the hoistable prefix;
+- every value in an exact movable prefix has exactly its expected single syntactic use; a retained-panel load may instead have multiple fully accounted direct read paths, but every path must consist only of Mat `transpose_view` aliases followed by Left/Right `move` / `extract`, and every resulting L0 value may be used only in its matching operand slot of a matmul-family call; plain SSA aliases, `Submit` arguments, nested expressions, loop initializers, yields, returns, and unsupported or additional consumers decline the candidate;
+- no moved result is loop-carried or yielded;
+- all allocation-owning `Mat`, `Left`, and `Right` tiles in the function have static sizes, with their allocator-aligned whole-function upper bound no larger than the backend capacity; and
+- the function has no explicit reserved-buffer region whose capacity contribution is not represented as a tile allocation.
+
+`InOut` / `Out` sources, external input allocations, manual tile loads, direct or externally-entered InCore functions, `Submit` sites, calls through InCore wrappers or called orchestration helpers, unknown candidate or writable call-site roots, candidate/write aliases, extra syntactic uses, conditional loads, dynamic or zero-trip loops, capacity-unknown cases, yielded or loop-carried results, and loop-dependent extracts decline without changing the IR. One unsafe or non-root call site invalidates the candidate even when other calls are safe. Wrapper evidence is deliberately not propagated in this initial implementation: syntactically distinct wrapper parameters may alias at the wrapper's own caller. The capacity test counts allocation owners rather than zero-copy views or SSA aliases, uses the same byte sizing and address alignment as `InitMemRef` / `AllocateMemoryAddr`, and includes allocations already live outside the loop. A memory space containing allocations that later pipeline lowering may replicate is also declined unless the moved prefix stays in an unaffected space. This whole-function bound is deliberately stronger than either planner's lifetime reuse, so a residency rewrite cannot introduce a later capacity failure under the PyPTO or PTOAS planner. Nested loops are processed independently; a chain moves only to its immediate lexical preheader in one pass invocation. This phase does not globally remap parameters and does not move K-dependent L0 extracts out of `AutoTileMatmulL0` pipeline loops.
+
+#### Residency example
+
+For a tensor program whose root orchestration function creates fresh LHS storage before calling the InCore kernel, the stationary LHS bridge moves before the user loop, while the N-dependent RHS remains streamed:
+
+```python
+# Tensor source
+for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+    rhs_n = pl.slice(rhs, [128, 128], [0, n])
+    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+    result = pl.yield_(pl.assemble(acc, c_n, [0, n]))
+```
+
+```python
+# After conversion, L0 auto-tiling, and InferTileMemorySpace
+lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+    rhs_mat = pl.tile.load(rhs, [0, n], [128, 128], target_memory=pl.Mem.Mat)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c_n = pl.tile.matmul(lhs_left, rhs_right)
+    result = pl.yield_(pl.tile.store(c_n, [0, n], acc))
+```
+
+The internal provenance attribute and root orchestration call are omitted above for readability. The caller creates `fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)` and passes it as `lhs`; the compiler can therefore prove that its allocation is distinct from the external writable `out`. Merely passing distinct external `lhs` and `out` parameters is not sufficient. The peer read-only `rhs` root is irrelevant to the write-alias filter. Without the required trusted storage provenance, the original loop-local placement is retained.
+
+## General memory-space inference example
 
 Source: `tests/ut/ir/transforms/test_infer_tile_memory_space.py::test_matmul_gets_acc`.
 
