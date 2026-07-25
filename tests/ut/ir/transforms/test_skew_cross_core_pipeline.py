@@ -12,13 +12,14 @@
 The pass runs immediately before LowerPipelineLoops and rewrites mixed cube/vector
 ``pl.pipeline`` loops whose body has both a cross-core ``tile.tpush_*`` and
 ``tile.tpop_*``:
-  - single round-trip, PRODUCE-first (one tpush before its tpop, the tpush's
+  - single round-trip, PRODUCE-first (an ordered bundle of one or more tpush
+    operations before its one reverse-direction tpop; the bundle's
     backward slice does not feed the body) -> SKEW (producer one iteration ahead:
     produce(start) prologue + Sequential steady ``pl.range(start+step, start+trip*step)``
     whose loop var k indexes the produce and pairs produce(k)/consume(k-step) +
     consume(last) epilogue). Core-agnostic: holds for a cube ``tpush_to_aiv`` loop
     AND a vector ``tpush_to_aic`` loop.
-  - CONSUME-first, multi-round-trip, or otherwise non-skewable -> demote to a plain
+  - CONSUME-first, interleaved multi-round-trip, or otherwise non-skewable -> demote to a plain
     Sequential loop (body unchanged).
 Non-cross-core pipeline loops are left intact (for LowerPipelineLoops to unroll).
 """
@@ -165,6 +166,88 @@ class TestSkewCrossCorePipeline:
                 e3: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aic(split=0)
                 oi3: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(e3, e3)
                 pl.tile.store(oi3, [pl.const(3, pl.INDEX) * pl.const(16, pl.INDEX), 0], out)
+
+        ir.assert_structural_equal(_skew(Before), Expected)
+
+    def test_ordered_two_push_bundle_skews_together(self):
+        """Gate/up-style ``push, push, pop`` is one round trip. Both pushes and
+        their dependency slices advance together; the pass must never emit
+        ``gate[k+1], up[k]`` or otherwise split the bundle."""
+
+        @pl.program
+        class Before:
+            @pl.function(strict_ssa=True)
+            def main(
+                self,
+                q: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Tensor[[64, 64], pl.FP32],
+            ):
+                for i in pl.pipeline(0, 4, 1, stage=2):
+                    qi: pl.Tile[[16, 64], pl.FP32] = pl.tile.load(q, [i * 16, 0], [16, 64])
+                    gate: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(qi, qi)
+                    up: pl.Tile[[16, 64], pl.FP32] = pl.tile.mul(qi, qi)
+                    pl.tile.tpush_to_aiv(gate, split=0)
+                    pl.tile.tpush_to_aiv(up, split=0)
+                    act: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0)
+                    result: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(act, act)
+                    pl.tile.store(result, [i * 16, 0], out)
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(
+                self,
+                q: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Tensor[[64, 64], pl.FP32],
+            ):
+                # prologue: produce both values for iterations 0 and 1
+                qi0: pl.Tile[[16, 64], pl.FP32] = pl.tile.load(
+                    q, [pl.const(0, pl.INDEX) * pl.const(16, pl.INDEX), 0], [16, 64]
+                )
+                gate0: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(qi0, qi0)
+                up0: pl.Tile[[16, 64], pl.FP32] = pl.tile.mul(qi0, qi0)
+                pl.tile.tpush_to_aiv(gate0, split=0)
+                pl.tile.tpush_to_aiv(up0, split=0)
+                qi1: pl.Tile[[16, 64], pl.FP32] = pl.tile.load(
+                    q, [pl.const(1, pl.INDEX) * pl.const(16, pl.INDEX), 0], [16, 64]
+                )
+                gate1: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(qi1, qi1)
+                up1: pl.Tile[[16, 64], pl.FP32] = pl.tile.mul(qi1, qi1)
+                pl.tile.tpush_to_aiv(gate1, split=0)
+                pl.tile.tpush_to_aiv(up1, split=0)
+                # steady: each produce clone keeps gate/up adjacent, then consumes two replies
+                for i in pl.range(2, 4, 2):
+                    qi2: pl.Tile[[16, 64], pl.FP32] = pl.tile.load(q, [i * 16, 0], [16, 64])
+                    gate2: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(qi2, qi2)
+                    up2: pl.Tile[[16, 64], pl.FP32] = pl.tile.mul(qi2, qi2)
+                    pl.tile.tpush_to_aiv(gate2, split=0)
+                    pl.tile.tpush_to_aiv(up2, split=0)
+                    qi3: pl.Tile[[16, 64], pl.FP32] = pl.tile.load(q, [(i + 1) * 16, 0], [16, 64])
+                    gate3: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(qi3, qi3)
+                    up3: pl.Tile[[16, 64], pl.FP32] = pl.tile.mul(qi3, qi3)
+                    pl.tile.tpush_to_aiv(gate3, split=0)
+                    pl.tile.tpush_to_aiv(up3, split=0)
+                    act0: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0)
+                    result0: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(act0, act0)
+                    pl.tile.store(result0, [(i - 2) * 16, 0], out)
+                    act1: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0)
+                    result1: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(act1, act1)
+                    pl.tile.store(result1, [(i - 1) * 16, 0], out)
+                # epilogue: consume replies for iterations 2 and 3
+                act2: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0)
+                result2: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(act2, act2)
+                pl.tile.store(
+                    result2,
+                    [pl.const(2, pl.INDEX) * pl.const(16, pl.INDEX), 0],
+                    out,
+                )
+                act3: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0)
+                result3: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(act3, act3)
+                pl.tile.store(
+                    result3,
+                    [pl.const(3, pl.INDEX) * pl.const(16, pl.INDEX), 0],
+                    out,
+                )
 
         ir.assert_structural_equal(_skew(Before), Expected)
 

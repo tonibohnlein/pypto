@@ -28,10 +28,9 @@ P4 phase algorithm.
 The follow-up at PyPTO `95e24c32` / solver `f7bea24b` closed G10/G11 and the aligned G6 seed
 protocol, and placed Welford's FP32 envelope near `mean/std <= 5–6e4`. At the current
 `97136d97` / `789e9fdd` checkpoint, all 51 persistent vector device cases pass and both DFS and
-Gorder pass the same lifetime/traffic assertions. Shared boundary reuse, duplicate operands, and
-phase-local identities are therefore host/order-closed. Their dedicated five-seed DFS/Gorder
-device cases, descriptor-matched MTE2 traces, and timing pair were not collected; direct
-model→emit byte-multiplicity closure remains open.
+Gorder preserve lifetime/traffic. Silicon confirms one load for shared boundaries, one cached value
+for `mul(x,x)`, normal transient lifetimes, safe topology declines, and P2/P4 correctness. Only the
+summed-versus-independent MTE2/MTE3 roof remains inconclusive; keep the conservative summed term.
 
 **Mixed host checkpoint (2026-07-13).** The solver now builds one immutable same-engine stage DAG
 and cube/vector transfer graph per mixed candidate subgraph. A stack-local `MixedSchedulePlan`
@@ -50,12 +49,10 @@ multi-window/ragged K, split-K, retained panels, and low-precision recursive cha
 7.3% faster than exact-mode E12 on `[272,272]`; fixed-grid binaries match, and pipe/constant-work
 sweeps support neither a pipe correction nor a scalar dispatch term. Analytic remains default and
 exact opt-in. At `97136d97` / `789e9fdd`, forced FP32 split-K emits the new two-AIC
-`FirstPartialThenAtomic` protocol—normal share-zero store, then atomic rest, no AIV seed—and one
-device run matched Torch. Both order builds pass 523 cost checks and 63 pebbling checks. This is a
-successful silicon smoke, not full closure: the requested two-device seed sweep, DFX drain/order
-proof, forced split ranking, recursive BF16 case, resident-boundary traffic matrix, and serial
-multi-request timing were not run. Keep `cube_split_sync_cycles=0`; no transferable residual was
-measured.
+`FirstPartialThenAtomic` protocol—normal share-zero store, then atomic rest, no AIV seed. Silicon
+closes FP32 and BF16-input/FP32-output split plans, build-invariant boundary reuse, and distinct
+`A @ A` roles. No transferable split synchronization residual exists, so
+`cube_split_sync_cycles=0`; BF16-output narrowing and exact `b_trans` replay remain capability gaps.
 
 ---
 
@@ -423,6 +420,9 @@ currently ranks then falls back, which is a TODO below. Direct Mat→GM store is
 **Host validation.** PTO Fusebox reports 523 passing checks under DFS and Gorder; AutoFuse reports 63.
 Coverage includes recursive BF16 DAGs, split/ragged K, multi-window and shared-boundary residency,
 multi-role `A @ A`, Torch numerics, and PTOAS lowering. Parser/outliner reports 126, including multi-output SPMD round-trip.
+
+The full infrastructure/reference audit and gaps are in
+[`autofuse_reference_kernel_parity.md`](autofuse_reference_kernel_parity.md) (host 9/9; device collection 62/124; silicon pending).
 
 The prior host closure fixes two compiler-side lifetime mismatches without changing cube costs.
 Early simplification prevents a dead branch from allocating another persistent L0C accumulator;

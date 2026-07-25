@@ -68,9 +68,10 @@ from pypto.runtime.runner import RunConfig
 # an end-to-end norm lands at ~5-6e-3 on silicon (device run 2026-07-07: rmsnorm 4.8e-3, layernorm
 # 5.8e-3) — 1e-3 was ~5x too tight. Set 1e-2 (still catches a real compute break; only masks the
 # accumulated rsqrt rounding). FP32 softmax has no rsqrt and stays tight (default).
-_RSQRT_TOL = RunConfig(rtol=1e-2, atol=1e-2)   # fp32 norms calling HW rsqrt (accumulated ~5e-3)
-_FP16_TOL = RunConfig(rtol=1e-2, atol=1e-2)    # end-to-end fp16 (rounding floor)
+_RSQRT_TOL = RunConfig(rtol=1e-2, atol=1e-2)  # fp32 norms calling HW rsqrt (accumulated ~5e-3)
+_FP16_TOL = RunConfig(rtol=1e-2, atol=1e-2)  # end-to-end fp16 (rounding floor)
 _CUBE_TOL = RunConfig(rtol=1e-4, atol=1e-4)  # fp32 MAD reassociation across K windows
+_BF16_CUBE_TOL = RunConfig(rtol=2e-2, atol=2e-2)  # chained BF16 drains + MAD reassociation
 
 # Physical 8x72 tile: 72 FP32 cols = 288 bytes (32-aligned, assembles). Valid cols = 66 (264
 # bytes, NOT 32-aligned) — exactly the ragged reduced axis the emitter would pad. Poison the
@@ -262,30 +263,32 @@ class RowMaxValidProbeCase(PTOTestCase):
 
 # ---- Part B: AutoFuse free-axis padding on device (needs PYPTO_AUTOFUSE_GENERIC_EMIT=1) ----
 
-RPW_M, RPW_N = 130, 66      # ragged pointwise: N=66 free axis padded 66->72
-SM_M, SM_N = 256, 128       # softmax: ragged M=256 (h tile padded); reduced N=128 aligned
-RMS_M, RMS_N = 256, 512     # RMSNorm: aligned; one reduction (row_sum of squares) + broadcast
-LN_M, LN_N = 256, 512       # LayerNorm: aligned; two reductions (mean + variance) + broadcast
+RPW_M, RPW_N = 130, 66  # ragged pointwise: N=66 free axis padded 66->72
+SM_M, SM_N = 256, 128  # softmax: ragged M=256 (h tile padded); reduced N=128 aligned
+RMS_M, RMS_N = 256, 512  # RMSNorm: aligned; one reduction (row_sum of squares) + broadcast
+LN_M, LN_N = 256, 512  # LayerNorm: aligned; two reductions (mean + variance) + broadcast
 NORM_EPS = 1.0e-6
-WS_M, WS_N = 64, 4096       # wide-short pointwise: the free-axis over-pad overflow case
-TL_M, TL_N = 4096, 64       # tall pointwise: many free-axis strips
-SMR_M, SMR_N = 256, 66      # softmax ragged reduced N (padded reduced axis)
-RRB_M, RRB_N = 256, 128     # row-reduce + broadcast (reduction intermediate, no div)
-F16_M, F16_N = 256, 128     # FP16 softmax (granule g=16)
-CS_M, CS_N = 128, 256       # bare col_sum sink -> S2 split-reduction (atomic-add merge)
-FK_M, FK_N = 256, 256       # multi-sink fork: two live-outs sharing an input
-P4_M, P4_N = 128, 8192      # reduced axis exceeds UB: exact P4 must stream online
-P4_LN_SHIFT = 2000.0        # dual-sum variance cancels here; Welford must remain finite
+WS_M, WS_N = 64, 4096  # wide-short pointwise: the free-axis over-pad overflow case
+TL_M, TL_N = 4096, 64  # tall pointwise: many free-axis strips
+SMR_M, SMR_N = 256, 66  # softmax ragged reduced N (padded reduced axis)
+RRB_M, RRB_N = 256, 128  # row-reduce + broadcast (reduction intermediate, no div)
+F16_M, F16_N = 256, 128  # FP16 softmax (granule g=16)
+CS_M, CS_N = 128, 256  # bare col_sum sink -> S2 split-reduction (atomic-add merge)
+FK_M, FK_N = 256, 256  # multi-sink fork: two live-outs sharing an input
+P4_M, P4_N = 128, 8192  # reduced axis exceeds UB: exact P4 must stream online
+P4_LN_SHIFT = 2000.0  # dual-sum variance cancels here; Welford must remain finite
 
 # --- Part C: model-fragment experiments (realistic transformer components) ---
-MRMS_M, MRMS_N = 256, 1024   # wider RMSNorm: exercises the sub-granule reduction-strip cap
-MLN_M, MLN_N = 256, 1024     # wider LayerNorm (two reductions)
-RES_M, RES_N = 256, 1024     # residual add + RMSNorm (a pre-norm block head)
-SILU_M, SILU_N = 256, 1024   # SiLU/Swish activation: x*sigmoid(x) = x/(1+exp(-x))
-SWG_M, SWG_N = 256, 1024     # SwiGLU FFN gating: silu(gate)*up (two inputs)
-SSM_M, SSM_N = 256, 512      # scaled softmax (attention scores * 1/sqrt(d))
-TWIN_M, TWIN_N = 256, 512    # two interleaved independent chains (group-reorder fix)
-ATT_S, ATT_D = 128, 64       # attention block: q@k -> scaled softmax -> p@v
+MRMS_M, MRMS_N = 256, 1024  # wider RMSNorm: exercises the sub-granule reduction-strip cap
+MLN_M, MLN_N = 256, 1024  # wider LayerNorm (two reductions)
+RES_M, RES_N = 256, 1024  # residual add + RMSNorm (a pre-norm block head)
+SILU_M, SILU_N = 256, 1024  # SiLU/Swish activation: x*sigmoid(x) = x/(1+exp(-x))
+SWG_M, SWG_N = 256, 1024  # SwiGLU FFN gating: silu(gate)*up (two inputs)
+MIXED_SWG_M, MIXED_SWG_K = 32, 64
+MIXED_SWG_F, MIXED_SWG_N = 128, 64  # gate/up GEMMs -> vector SwiGLU -> down GEMM
+SSM_M, SSM_N = 256, 512  # scaled softmax (attention scores * 1/sqrt(d))
+TWIN_M, TWIN_N = 256, 512  # two interleaved independent chains (group-reorder fix)
+ATT_S, ATT_D = 128, 64  # attention block: q@k -> scaled softmax -> p@v
 
 
 def _p4_shifted_layernorm_input() -> torch.Tensor:
@@ -1050,6 +1053,77 @@ class ModelSwiGluCase(PTOTestCase):
         tensors["out"][:] = (gate * torch.sigmoid(gate)) * up
 
 
+class AutoFuseMixedDenseSwiGluCase(PTOTestCase):
+    """Dense FFN round trip: two AIC projections -> AIV SwiGLU -> AIC down projection."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_mixed_dense_swiglu_32x64x128x64"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec(
+                "x",
+                [MIXED_SWG_M, MIXED_SWG_K],
+                DataType.BF16,
+                init_value=lambda: (torch.randn(MIXED_SWG_M, MIXED_SWG_K) * 0.1).to(torch.bfloat16),
+            ),
+            TensorSpec(
+                "w_gate",
+                [MIXED_SWG_K, MIXED_SWG_F],
+                DataType.BF16,
+                init_value=lambda: (torch.randn(MIXED_SWG_K, MIXED_SWG_F) * 0.1).to(torch.bfloat16),
+            ),
+            TensorSpec(
+                "w_up",
+                [MIXED_SWG_K, MIXED_SWG_F],
+                DataType.BF16,
+                init_value=lambda: (torch.randn(MIXED_SWG_K, MIXED_SWG_F) * 0.1).to(torch.bfloat16),
+            ),
+            TensorSpec(
+                "w_down",
+                [MIXED_SWG_F, MIXED_SWG_N],
+                DataType.BF16,
+                init_value=lambda: (torch.randn(MIXED_SWG_F, MIXED_SWG_N) * 0.1).to(torch.bfloat16),
+            ),
+            TensorSpec("out", [MIXED_SWG_M, MIXED_SWG_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mlp(
+                self,
+                x: pl.Tensor[[MIXED_SWG_M, MIXED_SWG_K], pl.BF16],
+                w_gate: pl.Tensor[[MIXED_SWG_K, MIXED_SWG_F], pl.BF16],
+                w_up: pl.Tensor[[MIXED_SWG_K, MIXED_SWG_F], pl.BF16],
+                w_down: pl.Tensor[[MIXED_SWG_F, MIXED_SWG_N], pl.BF16],
+            ) -> pl.Tensor[[MIXED_SWG_M, MIXED_SWG_N], pl.FP32]:
+                gate = pl.matmul(x, w_gate, out_dtype=pl.FP32)
+                up = pl.matmul(x, w_up, out_dtype=pl.FP32)
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
+                activation = pl.cast(
+                    pl.mul(pl.mul(gate, sigmoid), up),
+                    target_type=pl.BF16,
+                )
+                return pl.matmul(activation, w_down, out_dtype=pl.FP32)
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        # tensor.matmul(out_dtype=FP32) widens the BF16 matmul result, matching
+        # torch_codegen and the emitted cube operation.
+        gate = (tensors["x"] @ tensors["w_gate"]).float()
+        up = (tensors["x"] @ tensors["w_up"]).float()
+        activation = ((gate * torch.sigmoid(gate)) * up).to(torch.bfloat16)
+        tensors["out"][:] = (activation @ tensors["w_down"]).float()
+
+
 class ModelScaledSoftmaxCase(PTOTestCase):
     """Attention-score softmax: out = softmax(scores / sqrt(d)) — a scale then the numerically
     stable softmax (row_max, sub, exp, row_sum, div). The pre-scale is the attention 1/sqrt(d)."""
@@ -1188,14 +1262,27 @@ class ModelAttentionCase(PTOTestCase):
 # FP16 covers only the scalar-free reduction kernels (a fp16 tensor + a fp32 scalar const promotes
 # to fp32 in the DSL, so fp16 pointwise-with-scalar is skipped — an authoring limitation, not emit).
 SWEEP_GRID = [
-    ("pw", 64, 64, "fp32"), ("pw", 130, 66, "fp32"), ("pw", 256, 512, "fp32"),
-    ("pw", 512, 1024, "fp32"), ("pw", 4096, 64, "fp32"), ("pw", 64, 4096, "fp32"),
-    ("softmax", 256, 128, "fp32"), ("softmax", 256, 66, "fp32"), ("softmax", 128, 512, "fp32"),
-    ("softmax", 512, 1024, "fp32"), ("softmax", 64, 256, "fp32"),
-    ("rms", 256, 512, "fp32"), ("rms", 256, 1024, "fp32"), ("rms", 128, 256, "fp32"),
+    ("pw", 64, 64, "fp32"),
+    ("pw", 130, 66, "fp32"),
+    ("pw", 256, 512, "fp32"),
+    ("pw", 512, 1024, "fp32"),
+    ("pw", 4096, 64, "fp32"),
+    ("pw", 64, 4096, "fp32"),
+    ("softmax", 256, 128, "fp32"),
+    ("softmax", 256, 66, "fp32"),
+    ("softmax", 128, 512, "fp32"),
+    ("softmax", 512, 1024, "fp32"),
+    ("softmax", 64, 256, "fp32"),
+    ("rms", 256, 512, "fp32"),
+    ("rms", 256, 1024, "fp32"),
+    ("rms", 128, 256, "fp32"),
     ("rms", 130, 128, "fp32"),
-    ("softmax", 256, 128, "fp16"), ("softmax", 256, 512, "fp16"), ("softmax", 128, 256, "fp16"),
-    ("rms", 256, 512, "fp16"), ("rms", 256, 1024, "fp16"), ("rms", 128, 128, "fp16"),
+    ("softmax", 256, 128, "fp16"),
+    ("softmax", 256, 512, "fp16"),
+    ("softmax", 128, 256, "fp16"),
+    ("rms", 256, 512, "fp16"),
+    ("rms", 256, 1024, "fp16"),
+    ("rms", 128, 128, "fp16"),
 ]
 
 
@@ -1289,6 +1376,461 @@ ATTN_GRID = [(128, 64), (64, 64), (256, 64), (128, 32)]
 CUBE_M, CUBE_K, CUBE_N = 192, 64, 256
 
 
+class AutoFusePtoIsaVectorFusionCase(PTOTestCase):
+    """PTO-ISA fused_add_relu_mul analogue, expressed in tensor AutoFuse.
+
+    PTO-ISA uses the dedicated TRELU instruction.  The tensor DSL expresses the
+    same operation as maximum(x, 0), which lowers to TMAXS.  The host structural
+    test verifies that this remains one pipelined AIV kernel with no intermediate
+    GM round-trip; this device test verifies the equivalent algorithm numerically.
+    """
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pto_isa_fused_add_relu_mul_512x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [512, 1024], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [512, 1024], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def fused(self, x: pl.Tensor[[512, 1024], pl.FP32]) -> pl.Tensor[[512, 1024], pl.FP32]:
+                biased: pl.Tensor[[512, 1024], pl.FP32] = pl.add(x, 1.0)
+                relu: pl.Tensor[[512, 1024], pl.FP32] = pl.maximum(biased, 0.0)
+                out: pl.Tensor[[512, 1024], pl.FP32] = pl.mul(relu, 0.5)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = torch.relu(tensors["x"] + 1.0) * 0.5
+
+
+class AutoFusePtoKernelsAbsCase(PTOTestCase):
+    """PTO-Kernels ``kernel_abs.cpp`` analogue: one streamed TABS."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pto_kernels_abs_512x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [512, 1024], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [512, 1024], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def absolute(self, x: pl.Tensor[[512, 1024], pl.FP32]) -> pl.Tensor[[512, 1024], pl.FP32]:
+                out: pl.Tensor[[512, 1024], pl.FP32] = pl.abs(x)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = torch.abs(tensors["x"])
+
+
+class AutoFusePtoKernelsSiluCase(PTOTestCase):
+    """PTO-Kernels FP16 JIT SiLU analogue."""
+
+    __test__ = False
+
+    M = 256
+    N = 1024
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pto_kernels_silu_fp16_256x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec(
+                "x",
+                [self.M, self.N],
+                DataType.FP16,
+                init_value=lambda: torch.randn(self.M, self.N, dtype=torch.float16) * 0.5,
+            ),
+            TensorSpec("out", [self.M, self.N], DataType.FP16, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        m, n = self.M, self.N
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def silu(self, x: pl.Tensor[[m, n], pl.FP16]) -> pl.Tensor[[m, n], pl.FP16]:
+                neg: pl.Tensor[[m, n], pl.FP16] = pl.neg(x)
+                exp: pl.Tensor[[m, n], pl.FP16] = pl.exp(neg)
+                one: pl.Scalar[pl.FP16] = pl.cast(1.0, pl.FP16)
+                denom: pl.Tensor[[m, n], pl.FP16] = pl.add(exp, one)
+                out: pl.Tensor[[m, n], pl.FP16] = pl.div(x, denom)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"].float()
+        tensors["out"][:] = (x * torch.sigmoid(x)).half()
+
+
+class AutoFusePtoKernelsSwiGluCase(PTOTestCase):
+    """PTO-Kernels FP16 SwiGLU analogue."""
+
+    __test__ = False
+
+    M = 256
+    N = 1024
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pto_kernels_swiglu_fp16_256x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        shape = [self.M, self.N]
+        return [
+            TensorSpec(
+                "gate",
+                shape,
+                DataType.FP16,
+                init_value=lambda: torch.randn(self.M, self.N, dtype=torch.float16) * 0.5,
+            ),
+            TensorSpec(
+                "up",
+                shape,
+                DataType.FP16,
+                init_value=lambda: torch.randn(self.M, self.N, dtype=torch.float16) * 0.5,
+            ),
+            TensorSpec("out", shape, DataType.FP16, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        m, n = self.M, self.N
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def swiglu(
+                self,
+                gate: pl.Tensor[[m, n], pl.FP16],
+                up: pl.Tensor[[m, n], pl.FP16],
+            ) -> pl.Tensor[[m, n], pl.FP16]:
+                neg: pl.Tensor[[m, n], pl.FP16] = pl.neg(gate)
+                exp: pl.Tensor[[m, n], pl.FP16] = pl.exp(neg)
+                one: pl.Scalar[pl.FP16] = pl.cast(1.0, pl.FP16)
+                denom: pl.Tensor[[m, n], pl.FP16] = pl.add(exp, one)
+                silu: pl.Tensor[[m, n], pl.FP16] = pl.div(gate, denom)
+                out: pl.Tensor[[m, n], pl.FP16] = pl.mul(silu, up)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        gate = tensors["gate"].float()
+        up = tensors["up"].float()
+        tensors["out"][:] = ((gate * torch.sigmoid(gate)) * up).half()
+
+
+class AutoFusePtoKernelsLayerNormCase(PTOTestCase):
+    """PTO-Kernels FP16 affine LayerNorm semantics.
+
+    The host reference comparison records that AutoFuse currently emits two
+    AIV kernels, whereas the hand-written PTO-Kernels implementation overlays
+    the mean and variance/apply phases in one kernel.
+    """
+
+    __test__ = False
+
+    M = 32
+    N = 1024
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pto_kernels_layernorm_fp16_32x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [self.M, self.N], DataType.FP16, init_value=torch.randn),
+            TensorSpec("gamma", [1, self.N], DataType.FP16, init_value=torch.randn),
+            TensorSpec("beta", [1, self.N], DataType.FP16, init_value=torch.randn),
+            TensorSpec("out", [self.M, self.N], DataType.FP16, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        m, n = self.M, self.N
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def layernorm(
+                self,
+                x: pl.Tensor[[m, n], pl.FP16],
+                gamma: pl.Tensor[[1, n], pl.FP16],
+                beta: pl.Tensor[[1, n], pl.FP16],
+            ) -> pl.Tensor[[m, n], pl.FP16]:
+                x32: pl.Tensor[[m, n], pl.FP32] = pl.cast(x, pl.FP32)
+                sum_x: pl.Tensor[[m, 1], pl.FP32] = pl.row_sum(x32)
+                mean: pl.Tensor[[m, 1], pl.FP32] = pl.mul(sum_x, 1.0 / n)
+                centered: pl.Tensor[[m, n], pl.FP32] = pl.row_expand_sub(x32, mean)
+                square: pl.Tensor[[m, n], pl.FP32] = pl.mul(centered, centered)
+                sum_square: pl.Tensor[[m, 1], pl.FP32] = pl.row_sum(square)
+                variance: pl.Tensor[[m, 1], pl.FP32] = pl.mul(sum_square, 1.0 / n)
+                variance_eps: pl.Tensor[[m, 1], pl.FP32] = pl.add(variance, 1.0e-5)
+                inv_std: pl.Tensor[[m, 1], pl.FP32] = pl.rsqrt(variance_eps)
+                normalized: pl.Tensor[[m, n], pl.FP32] = pl.row_expand_mul(centered, inv_std)
+                gamma32: pl.Tensor[[1, n], pl.FP32] = pl.cast(gamma, pl.FP32)
+                beta32: pl.Tensor[[1, n], pl.FP32] = pl.cast(beta, pl.FP32)
+                scaled: pl.Tensor[[m, n], pl.FP32] = pl.mul(normalized, gamma32)
+                shifted: pl.Tensor[[m, n], pl.FP32] = pl.add(scaled, beta32)
+                out: pl.Tensor[[m, n], pl.FP16] = pl.cast(shifted, pl.FP16)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        x = tensors["x"].float()
+        gamma = tensors["gamma"].float()
+        beta = tensors["beta"].float()
+        centered = x - x.mean(dim=-1, keepdim=True)
+        normalized = centered * torch.rsqrt(centered.pow(2).mean(dim=-1, keepdim=True) + 1.0e-5)
+        tensors["out"][:] = (normalized * gamma + beta).half()
+
+
+class AutoFusePtoasFfnActivationCase(PTOTestCase):
+    """PTOAS ``FFN/ffn_act.pto`` clipped-cubic activation stage."""
+
+    __test__ = False
+
+    M = 32
+    N = 32
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_ptoas_ffn_activation_fp32_32x32"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        shape = [self.M, self.N]
+        return [
+            TensorSpec("h1", shape, DataType.FP32, init_value=torch.randn),
+            TensorSpec("h2", shape, DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", shape, DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        m, n = self.M, self.N
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def activate(
+                self,
+                h1: pl.Tensor[[m, n], pl.FP32],
+                h2: pl.Tensor[[m, n], pl.FP32],
+            ) -> pl.Tensor[[m, n], pl.FP32]:
+                low: pl.Tensor[[m, n], pl.FP32] = pl.maximum(h1, -4.0001)
+                clipped: pl.Tensor[[m, n], pl.FP32] = pl.minimum(low, 4.0001)
+                square: pl.Tensor[[m, n], pl.FP32] = pl.mul(clipped, clipped)
+                cube: pl.Tensor[[m, n], pl.FP32] = pl.mul(square, clipped)
+                cubic: pl.Tensor[[m, n], pl.FP32] = pl.mul(cube, -1.0 / 48.0)
+                linear: pl.Tensor[[m, n], pl.FP32] = pl.mul(clipped, 0.25)
+                shifted: pl.Tensor[[m, n], pl.FP32] = pl.add(linear, 0.5)
+                gate: pl.Tensor[[m, n], pl.FP32] = pl.add(shifted, cubic)
+                out: pl.Tensor[[m, n], pl.FP32] = pl.mul(gate, h2)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        clipped = torch.clamp(tensors["h1"], min=-4.0001, max=4.0001)
+        gate = 0.5 + 0.25 * clipped - clipped.pow(3) / 48.0
+        tensors["out"][:] = gate * tensors["h2"]
+
+
+class AutoFusePtoDslGeGluCase(PTOTestCase):
+    """PTO-DSL tanh-based GEGLU analogue, statically shaped for AutoFuse."""
+
+    __test__ = False
+
+    M = 256
+    N = 1024
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pto_dsl_geglu_fp16_256x1024"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        shape = [self.M, self.N]
+        return [
+            TensorSpec(
+                "gate",
+                shape,
+                DataType.FP16,
+                init_value=lambda: torch.randn(self.M, self.N, dtype=torch.float16) * 0.25,
+            ),
+            TensorSpec(
+                "up",
+                shape,
+                DataType.FP16,
+                init_value=lambda: torch.randn(self.M, self.N, dtype=torch.float16) * 0.25,
+            ),
+            TensorSpec("out", shape, DataType.FP16, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        m, n = self.M, self.N
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def geglu(
+                self,
+                gate: pl.Tensor[[m, n], pl.FP16],
+                up: pl.Tensor[[m, n], pl.FP16],
+            ) -> pl.Tensor[[m, n], pl.FP16]:
+                zero: pl.Tensor[[m, n], pl.FP16] = pl.sub(gate, gate)
+                ones: pl.Tensor[[m, n], pl.FP16] = pl.exp(zero)
+                twice: pl.Tensor[[m, n], pl.FP16] = pl.add(gate, gate)
+                exp_twice: pl.Tensor[[m, n], pl.FP16] = pl.exp(twice)
+                numerator: pl.Tensor[[m, n], pl.FP16] = pl.sub(exp_twice, ones)
+                denominator: pl.Tensor[[m, n], pl.FP16] = pl.add(exp_twice, ones)
+                tanh_gate: pl.Tensor[[m, n], pl.FP16] = pl.div(numerator, denominator)
+                one_plus_tanh: pl.Tensor[[m, n], pl.FP16] = pl.add(tanh_gate, ones)
+                gated: pl.Tensor[[m, n], pl.FP16] = pl.mul(gate, one_plus_tanh)
+                twos: pl.Tensor[[m, n], pl.FP16] = pl.add(ones, ones)
+                gelu: pl.Tensor[[m, n], pl.FP16] = pl.div(gated, twos)
+                out: pl.Tensor[[m, n], pl.FP16] = pl.mul(gelu, up)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        gate, up = tensors["gate"], tensors["up"]
+        exp_twice = torch.exp(gate + gate)
+        tanh_gate = (exp_twice - 1.0) / (exp_twice + 1.0)
+        tensors["out"][:] = (0.5 * gate * (1.0 + tanh_gate)) * up
+
+
+class AutoFusePtoIsaGemmCase(PTOTestCase):
+    """1536^3 FP16->FP32 GEMM from the PTO-ISA performance table."""
+
+    __test__ = False
+
+    M = 1536
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pto_isa_gemm_fp16_fp32_1536"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [self.M, self.M], DataType.FP16, init_value=torch.randn),
+            TensorSpec("b", [self.M, self.M], DataType.FP16, init_value=torch.randn),
+            TensorSpec("out", [self.M, self.M], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        m = self.M
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mm(
+                self,
+                a: pl.Tensor[[m, m], pl.FP16],
+                b: pl.Tensor[[m, m], pl.FP16],
+            ) -> pl.Tensor[[m, m], pl.FP32]:
+                out: pl.Tensor[[m, m], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = tensors["a"].float() @ tensors["b"].float()
+
+
+class AutoFusePtoIsaChainGemmCase(PTOTestCase):
+    """PTO-ISA fused GEMM-chain analogue with an L1-resident BF16 intermediate."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "autofuse_pto_isa_chain_gemm_bf16"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec(
+                "a",
+                [128, 256],
+                DataType.BF16,
+                init_value=lambda: torch.randn(128, 256, dtype=torch.bfloat16) * 0.05,
+            ),
+            TensorSpec(
+                "b",
+                [256, 128],
+                DataType.BF16,
+                init_value=lambda: torch.randn(256, 128, dtype=torch.bfloat16) * 0.05,
+            ),
+            TensorSpec(
+                "d",
+                [128, 256],
+                DataType.BF16,
+                init_value=lambda: torch.randn(128, 256, dtype=torch.bfloat16) * 0.05,
+            ),
+            TensorSpec("out", [128, 256], DataType.BF16, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def chain(
+                self,
+                a: pl.Tensor[[128, 256], pl.BF16],
+                b: pl.Tensor[[256, 128], pl.BF16],
+                d: pl.Tensor[[128, 256], pl.BF16],
+            ) -> pl.Tensor[[128, 256], pl.BF16]:
+                intermediate: pl.Tensor[[128, 128], pl.BF16] = pl.matmul(a, b)
+                out: pl.Tensor[[128, 256], pl.BF16] = pl.matmul(intermediate, d)
+                return out
+
+        return Prog
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        intermediate = tensors["a"] @ tensors["b"]
+        tensors["out"][:] = intermediate @ tensors["d"]
+
+
 class AutoFuseCubeMatmulKRingCase(PTOTestCase):
     """Pure-cube control for the four-window GM->L1 stage ring."""
 
@@ -1362,6 +1904,15 @@ class AutoFuseCubeEpilogueKRingCase(PTOTestCase):
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         tensors["out"][:] = tensors["a"] @ tensors["b"] + tensors["bias"]
+
+
+class AutoFuseMixedC2VEpilogueCase(AutoFuseCubeEpilogueKRingCase):
+    """Same graph as the cut reproducer, forced through the one-way C->V FIFO."""
+
+    __test__ = False
+
+    def get_name(self) -> str:
+        return "autofuse_mixed_c2v_epilogue_192x64x256"
 
 
 class ModelAttentionSweepCase(PTOTestCase):
@@ -1599,9 +2150,110 @@ class TestAutoFuseDevice:
             f"AutoFuse attention [{S},{D}] mismatch on device (any actual=0.0?): {result.error}"
         )
 
-    # Keep the forced cube tests last: FORCE_PLAN is process-cached by design.
+    # -- Part E: pure-engine PTO-ISA reference analogues --
+    #
+    # Host tests compare the lowered instruction dataflow.  These cases retain
+    # the analogous algorithms as persistent device correctness/performance
+    # controls, so codegen improvements can be compared to the public PTO-ISA
+    # kernels rather than only to another AutoFuse revision.
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autofuse_pto_isa_vector_fusion(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFusePtoIsaVectorFusionCase(platform=platform))
+        assert result.passed, f"PTO-ISA add/ReLU/mul analogue mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autofuse_pto_kernels_abs(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFusePtoKernelsAbsCase(platform=platform))
+        assert result.passed, f"PTO-Kernels abs analogue mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autofuse_pto_kernels_silu(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFusePtoKernelsSiluCase(platform=platform, config=_FP16_TOL))
+        assert result.passed, f"PTO-Kernels FP16 SiLU analogue mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autofuse_pto_kernels_swiglu(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFusePtoKernelsSwiGluCase(platform=platform, config=_FP16_TOL))
+        assert result.passed, f"PTO-Kernels FP16 SwiGLU analogue mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autofuse_pto_kernels_layernorm(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFusePtoKernelsLayerNormCase(platform=platform, config=_FP16_TOL))
+        assert result.passed, f"PTO-Kernels FP16 affine LayerNorm analogue mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autofuse_ptoas_ffn_activation(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFusePtoasFfnActivationCase(platform=platform))
+        assert result.passed, (
+            f"PTOAS clipped-cubic FFN activation analogue mismatch on device: {result.error}"
+        )
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autofuse_pto_dsl_geglu(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFusePtoDslGeGluCase(platform=platform, config=_FP16_TOL))
+        assert result.passed, f"PTO-DSL GEGLU analogue mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autofuse_pto_isa_gemm(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "0")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        result = test_runner.run(AutoFusePtoIsaGemmCase(platform=platform, config=_FP16_TOL))
+        assert result.passed, f"PTO-ISA FP16->FP32 GEMM analogue mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autofuse_pto_isa_chain_gemm(self, test_runner, platform, monkeypatch):
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "0")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        result = test_runner.run(AutoFusePtoIsaChainGemmCase(platform=platform, config=_BF16_CUBE_TOL))
+        assert result.passed, f"PTO-ISA fused GEMM-chain analogue mismatch on device: {result.error}"
+
+    # Keep forced mixed/cube tests last: FORCE_PLAN is process-cached by design.
     # Device closure runs this file with --forked, so every test still gets a
-    # fresh process; the two cases deliberately share the same exact force.
+    # fresh process.
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_zx_autofuse_mixed_c2v_epilogue(self, test_runner, platform, monkeypatch):
+        """Exercise the generic one-way C->V FIFO with two logical items per group."""
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_PLAN", "32,32,1,6,8")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        result = test_runner.run(AutoFuseMixedC2VEpilogueCase(platform=platform, config=_CUBE_TOL))
+        assert result.passed, f"AutoFuse mixed C->V epilogue mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_zy_autofuse_mixed_dense_swiglu(self, test_runner, platform, monkeypatch):
+        """Exercise the exact C,C->V->C FIFO bundle and persistent down accumulator."""
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_PLAN", "64,16,1,2,1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        result = test_runner.run(AutoFuseMixedDenseSwiGluCase(platform=platform, config=_BF16_CUBE_TOL))
+        assert result.passed, f"AutoFuse mixed dense SwiGLU mismatch on device: {result.error}"
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_zz_autofuse_cube_matmul_k_ring(self, test_runner, platform, monkeypatch):

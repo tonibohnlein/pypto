@@ -365,6 +365,22 @@ VectorOpDescriptor DescribeVectorOp(const CallPtr& call) {
   return VectorOpDescriptor(::OpType::Opaque, ::VectorOpCapability::Unsupported);
 }
 
+::MixedVectorSemantic DescribeMixedVectorSemantic(const CallPtr& call) {
+  if (IsOp(call, "tensor.neg")) return ::MixedVectorSemantic::Neg;
+  if (IsOp(call, "tensor.exp")) return ::MixedVectorSemantic::Exp;
+  if (IsOp(call, "tensor.adds") && call->args_.size() == 2) {
+    const auto value_float = As<ConstFloat>(call->args_[1]);
+    const auto value_int = As<ConstInt>(call->args_[1]);
+    if ((value_float && value_float->value_ == 1.0) || (value_int && value_int->value_ == 1)) {
+      return ::MixedVectorSemantic::ScalarAdd;
+    }
+  }
+  if (IsOp(call, "tensor.recip")) return ::MixedVectorSemantic::Recip;
+  if (IsOp(call, "tensor.mul")) return ::MixedVectorSemantic::Mul;
+  if (IsOp(call, "tensor.cast")) return ::MixedVectorSemantic::Cast;
+  return ::MixedVectorSemantic::None;
+}
+
 ::OpType ClassifyOp(const CallPtr& call) { return DescribeVectorOp(call).type; }
 
 // Per-op VECTOR compute slope (cycles per SIMD repeat) when it differs from the elementwise
@@ -992,6 +1008,7 @@ class ProblemBuilder {
       const VectorOpDescriptor descriptor = DescribeVectorOp(call);
       sop.type = descriptor.type;
       sop.vector_capability = descriptor.capability;
+      sop.mixed_vector_semantic = DescribeMixedVectorSemantic(call);
       if (sop.type == ::OpType::MatMul) {
         const bool default_semantics = !call->GetKwarg<bool>("a_trans", false) &&
                                        !call->GetKwarg<bool>("b_trans", false) &&
@@ -1047,7 +1064,7 @@ class ProblemBuilder {
       sop.outputs.push_back(out);
       std::tie(sop.vector_primitive, sop.vector_geometry) = ClassifyVectorOpSemantics(call, sop, problem);
       if (mixed_function && sop.type == ::OpType::Pointwise &&
-          sop.vector_capability == ::VectorOpCapability::Elementwise) {
+          sop.vector_capability == ::VectorOpCapability::Elementwise && !IsOp(call, "tensor.cast")) {
         const ::DType output_dtype = problem.tensors[out].dtype;
         for (size_t input : sop.inputs) {
           if (problem.tensors[input].dtype != output_dtype) {
@@ -1310,6 +1327,25 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     }
     return "unsupported";
   };
+  const auto mixed_semantic_name = [](::MixedVectorSemantic semantic) -> const char* {
+    switch (semantic) {
+      case ::MixedVectorSemantic::None:
+        return "none";
+      case ::MixedVectorSemantic::Neg:
+        return "neg";
+      case ::MixedVectorSemantic::Exp:
+        return "exp";
+      case ::MixedVectorSemantic::ScalarAdd:
+        return "scalar_add";
+      case ::MixedVectorSemantic::Recip:
+        return "recip";
+      case ::MixedVectorSemantic::Mul:
+        return "mul";
+      case ::MixedVectorSemantic::Cast:
+        return "cast";
+    }
+    return "none";
+  };
   f << "],\n  \"vec_slopes\": [";
   for (size_t i = 0; i < no; ++i) f << (i ? "," : "") << p.ops[i].vec_slope;
   f << "],\n  \"vec_fixed_costs\": [";
@@ -1325,6 +1361,10 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
   f << "],\n  \"vector_op_capabilities\": [";
   for (size_t i = 0; i < no; ++i) {
     f << (i ? "," : "") << "\"" << capability_name(p.ops[i].vector_capability) << "\"";
+  }
+  f << "],\n  \"mixed_vector_semantics\": [";
+  for (size_t i = 0; i < no; ++i) {
+    f << (i ? "," : "") << "\"" << mixed_semantic_name(p.ops[i].mixed_vector_semantic) << "\"";
   }
   f << "],\n  \"required_outputs\": [";
   bool first_required = true;
@@ -4628,6 +4668,273 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
   return result;
 }
 
+// Replay the first round-trip mixed schedule using only ordinary tensor
+// matmuls/vector ops inside the standard UP_DOWN mixed scope. ExpandMixedKernel
+// inserts the cross-core transfers; SkewCrossCorePipeline later advances the
+// ordered gate/up push bundle ahead of the activation reply. AutoTileMatmulL0
+// remains the owner of child L0 tiling.
+std::optional<std::vector<StmtPtr>> EmitDenseSwiGluMlpGroup(
+    const std::vector<StmtPtr>& members, const std::unordered_map<const Stmt*, size_t>& stmt_op,
+    const std::unordered_set<const Var*>& required_live_outs, const SolverTile& tile,
+    const std::string& name) {
+  const ::MixedSchedulePlan& plan = tile.mixed_schedule;
+  auto decline = [&](const std::string& reason) {
+    LOG_INFO << "AutoFuse[mixed-mlp-plan]: group '" << name << "' decline — " << reason;
+    return std::optional<std::vector<StmtPtr>>{};
+  };
+  if (!plan.feasible || !plan.emit_compatible || !plan.topology ||
+      plan.algorithm != ::MixedAlgorithmKind::DenseSwiGluMlp || !plan.dense_mlp.present ||
+      plan.protocol != ::MixedCrossCoreProtocol::SingleRoundTripBundle ||
+      plan.mode != ::MixedPipelineMode::SingleRoundTripSkew ||
+      !plan.topology->protocol.skew_pass_compatible ||
+      plan.topology->protocol.producer_bundle_transfers.size() != 2 ||
+      plan.topology->protocol.reply_bundle_transfers.size() != 1 || plan.topology->stages.size() != 4 ||
+      plan.topology->transfers.size() != 3 || plan.topology->stages[0].engine != ::MixedEngine::Cube ||
+      plan.topology->stages[1].engine != ::MixedEngine::Cube ||
+      plan.topology->stages[2].engine != ::MixedEngine::Vector ||
+      plan.topology->stages[3].engine != ::MixedEngine::Cube || plan.topology->stages[0].ops.size() != 1 ||
+      plan.topology->stages[1].ops.size() != 1 || plan.topology->stages[3].ops.size() != 1) {
+    return decline("not the exact C,C->V->C dense SwiGLU topology");
+  }
+  if (plan.split_k != 1 || plan.vector_split != ::MixedVectorSplit::Rows || plan.vector_lanes != 2 ||
+      plan.fifos.size() != 3 || plan.loop.axis != ::MixedPipelineAxis::IntermediateFeatureChunk ||
+      plan.loop.chunk != plan.dense_mlp.intermediate_chunk ||
+      plan.loop.extent != plan.dense_mlp.intermediate_extent ||
+      plan.loop.items_per_spatial_tile != plan.dense_mlp.intermediate_chunks ||
+      plan.loop.active_groups != plan.spatial_tiles || plan.loop.pipeline_stages < 2 ||
+      !plan.overlap_implementable || plan.model_overlap_granted != plan.overlap_implementable) {
+    return decline("feature loop/lane descriptor is not the emitted protocol");
+  }
+  for (size_t index = 0; index < plan.fifos.size(); ++index) {
+    const ::MixedFifoPlan& fifo = plan.fifos[index];
+    const ::MixedTransferDirection expected =
+        index < 2 ? ::MixedTransferDirection::CubeToVector : ::MixedTransferDirection::VectorToCube;
+    if (fifo.direction != expected || fifo.pipe_id != static_cast<int>(index) || fifo.slot_count != 4 ||
+        fifo.slot_bytes <= 0 || fifo.reserved_bytes != fifo.slot_bytes * fifo.slot_count ||
+        fifo.valid_rows != plan.m_partition.big || fifo.valid_cols != plan.dense_mlp.intermediate_chunk) {
+      return decline("FIFO bundle does not match gate/up/activation tiles");
+    }
+  }
+  if (plan.fifos[0].bundle != 0 || plan.fifos[1].bundle != 0 || plan.fifos[2].bundle != 1 ||
+      plan.m_partition.num_big != 0 || plan.n_partition.num_big != 0 || plan.m_partition.parts <= 0 ||
+      plan.n_partition.parts <= 0 || plan.m_partition.big <= 0 || plan.m_partition.big % 2 != 0 ||
+      plan.n_partition.big <= 0 || plan.spatial_tiles != plan.m_partition.parts * plan.n_partition.parts ||
+      plan.spatial_tiles > plan.group_capacity) {
+    return decline("mixed MLP requires one uniform 24-group spatial grid");
+  }
+
+  std::unordered_map<size_t, AssignStmtPtr> by_op;
+  for (const StmtPtr& stmt : members) {
+    auto op = stmt_op.find(stmt.get());
+    auto assign = As<AssignStmt>(stmt);
+    if (op == stmt_op.end() || assign == nullptr || As<Call>(assign->value_) == nullptr) {
+      return decline("group contains a non-call assignment");
+    }
+    by_op.emplace(op->second, assign);
+  }
+  const ::MixedDenseMlpTopology& mlp = plan.topology->dense_mlp;
+  auto source_assign = [&](size_t op) -> AssignStmtPtr {
+    const auto it = by_op.find(op);
+    return it == by_op.end() ? nullptr : it->second;
+  };
+  const AssignStmtPtr gate_assign = source_assign(mlp.gate_matmul);
+  const AssignStmtPtr up_assign = source_assign(mlp.up_matmul);
+  const AssignStmtPtr down_assign = source_assign(mlp.down_matmul);
+  if (!gate_assign || !up_assign || !down_assign) {
+    return decline("planned projection has no source statement");
+  }
+  const CallPtr gate = As<Call>(gate_assign->value_);
+  const CallPtr up = As<Call>(up_assign->value_);
+  const CallPtr down = As<Call>(down_assign->value_);
+  auto default_matmul = [](const CallPtr& call) {
+    return call && IsOp(call, "tensor.matmul") && call->args_.size() == 2 &&
+           !call->GetKwarg<bool>("a_trans", false) && !call->GetKwarg<bool>("b_trans", false) &&
+           !call->GetKwarg<bool>("c_matrix_nz", false);
+  };
+  if (!default_matmul(gate) || !default_matmul(up) || !default_matmul(down) ||
+      gate->args_[0].get() != up->args_[0].get()) {
+    return decline("projection calls do not match the default shared-input form");
+  }
+
+  const auto [M, D] = Static2DShape(gate->args_[0]->GetType());
+  const auto [gate_d, H] = Static2DShape(gate->args_[1]->GetType());
+  const auto [up_d, up_h] = Static2DShape(up->args_[1]->GetType());
+  const auto [down_h, N] = Static2DShape(down->args_[1]->GetType());
+  const auto [out_m, out_n] = Static2DShape(down_assign->var_->GetType());
+  auto lhs_type = AsTensorTypeLike(gate->args_[0]->GetType());
+  auto gate_weight_type = AsTensorTypeLike(gate->args_[1]->GetType());
+  auto up_weight_type = AsTensorTypeLike(up->args_[1]->GetType());
+  auto down_weight_type = AsTensorTypeLike(down->args_[1]->GetType());
+  auto gate_type = As<TensorType>(gate_assign->var_->GetType());
+  auto up_type = As<TensorType>(up_assign->var_->GetType());
+  auto down_type = As<TensorType>(down_assign->var_->GetType());
+  if (M <= 0 || D <= 0 || H <= 0 || N <= 0 || gate_d != D || up_d != D || up_h != H || down_h != H ||
+      out_m != M || out_n != N || M != plan.m_partition.parts * plan.m_partition.big ||
+      N != plan.n_partition.parts * plan.n_partition.big || D != plan.dense_mlp.input_extent ||
+      H != plan.dense_mlp.intermediate_extent || N != plan.dense_mlp.output_extent || !lhs_type ||
+      !gate_weight_type || !up_weight_type || !down_weight_type ||
+      lhs_type->dtype_ != gate_weight_type->dtype_ || lhs_type->dtype_ != up_weight_type->dtype_ ||
+      lhs_type->dtype_ != down_weight_type->dtype_ ||
+      !(lhs_type->dtype_ == DataType::BF16 || lhs_type->dtype_ == DataType::FP16) || !gate_type || !up_type ||
+      !down_type || gate_type->dtype_ != DataType::FP32 || up_type->dtype_ != DataType::FP32 ||
+      down_type->dtype_ != DataType::FP32) {
+    return decline("projection shapes/dtypes do not match the mixed plan");
+  }
+
+  std::vector<AssignStmtPtr> vector_ops;
+  vector_ops.reserve(mlp.vector_ops.size());
+  for (size_t op : mlp.vector_ops) {
+    const AssignStmtPtr source = source_assign(op);
+    if (!source) return decline("planned vector op has no source statement");
+    const CallPtr call = As<Call>(source->value_);
+    if (!call || DescribeVectorOp(call).capability != ::VectorOpCapability::Elementwise) {
+      return decline("SwiGLU stage contains a non-elementwise operation");
+    }
+    if (required_live_outs.count(source->var_.get()) != 0) {
+      return decline("an intermediate SwiGLU value escapes the fused group");
+    }
+    vector_ops.push_back(source);
+  }
+  if (vector_ops.size() != 7 || vector_ops.back()->var_.get() != AsVarLike(down->args_[0]).get()) {
+    return decline("SwiGLU chain/down input does not match the plan");
+  }
+  for (const AssignStmtPtr& source : {gate_assign, up_assign}) {
+    if (required_live_outs.count(source->var_.get()) != 0) {
+      return decline("a projection result escapes the mixed kernel");
+    }
+  }
+
+  const Span sp = members.front()->span_;
+  auto& registry = OpRegistry::GetInstance();
+  auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
+  auto output_create = registry.Create("tensor.create", {MakeIndexTuple({M, N}, sp)},
+                                       {{"dtype", DataType::FP32}, {"layout", TensorLayout::ND}}, sp);
+  auto output =
+      std::make_shared<Var>(down_assign->var_->name_hint_ + "_mixed_out", output_create->GetType(), sp);
+  auto output_assign = std::make_shared<AssignStmt>(output, output_create, sp);
+
+  const int64_t rows = plan.m_partition.big;
+  const int64_t cols = plan.n_partition.big;
+  const int64_t feature_chunk = plan.dense_mlp.intermediate_chunk;
+  auto block = std::make_shared<Var>(name + "_group", index_type, sp);
+  ExprPtr mi =
+      MakeMul(MakeFloorDiv(block, MakeIndex(plan.n_partition.parts, sp), sp), MakeIndex(rows, sp), sp);
+  ExprPtr ni =
+      MakeMul(MakeFloorMod(block, MakeIndex(plan.n_partition.parts, sp), sp), MakeIndex(cols, sp), sp);
+  auto feature = std::make_shared<Var>(name + "_feature", index_type, sp);
+
+  auto acc_create = registry.Create("tensor.create", {MakeIndexTuple({rows, cols}, sp)},
+                                    {{"dtype", DataType::FP32}, {"layout", TensorLayout::ND}}, sp);
+  auto acc_init =
+      std::make_shared<Var>(down_assign->var_->name_hint_ + "_acc_init", acc_create->GetType(), sp);
+  auto acc_iter =
+      std::make_shared<IterArg>(down_assign->var_->name_hint_ + "_acc", acc_init->GetType(), acc_init, sp);
+
+  auto gate_tile = std::make_shared<Var>(
+      gate_assign->var_->name_hint_ + "_mixed_tile",
+      std::make_shared<TensorType>(std::vector<ExprPtr>{MakeIndex(rows, sp), MakeIndex(feature_chunk, sp)},
+                                   DataType::FP32),
+      sp);
+  auto up_tile = std::make_shared<Var>(up_assign->var_->name_hint_ + "_mixed_tile", gate_tile->GetType(), sp);
+  std::vector<StmtPtr> loop_body;
+  const int gate_stages = D / std::max<int64_t>(1, plan.dense_mlp.gate_window_k) >= 2 ? 2 : 1;
+  for (StmtPtr& stmt :
+       BuildTileMatmulAt(gate->args_[0], gate->args_[1], mi, MakeIndex(0, sp), MakeIndex(0, sp), feature,
+                         rows, feature_chunk, D, plan.dense_mlp.gate_window_k, DataType::FP32, gate_tile,
+                         name + "_gate", sp, gate_stages)) {
+    loop_body.push_back(std::move(stmt));
+  }
+  const int up_stages = D / std::max<int64_t>(1, plan.dense_mlp.up_window_k) >= 2 ? 2 : 1;
+  for (StmtPtr& stmt : BuildTileMatmulAt(up->args_[0], up->args_[1], mi, MakeIndex(0, sp), MakeIndex(0, sp),
+                                         feature, rows, feature_chunk, D, plan.dense_mlp.up_window_k,
+                                         DataType::FP32, up_tile, name + "_up", sp, up_stages)) {
+    loop_body.push_back(std::move(stmt));
+  }
+
+  std::unordered_map<const Var*, VarPtr> values;
+  values.emplace(gate_assign->var_.get(), gate_tile);
+  values.emplace(up_assign->var_.get(), up_tile);
+  VarPtr activation;
+  for (const AssignStmtPtr& source : vector_ops) {
+    const CallPtr call = As<Call>(source->value_);
+    std::vector<ExprPtr> args;
+    args.reserve(call->args_.size());
+    for (const ExprPtr& arg : call->args_) {
+      auto var = AsVarLike(arg);
+      if (var) {
+        const auto it = values.find(var.get());
+        if (it != values.end()) {
+          args.push_back(it->second);
+          continue;
+        }
+      }
+      if (AsTensorTypeLike(arg->GetType())) {
+        return decline("SwiGLU has an unplanned tensor input");
+      }
+      args.push_back(arg);
+    }
+    auto replay = registry.Create(call->op_->name_, args, call->kwargs_, sp);
+    activation = std::make_shared<Var>(source->var_->name_hint_ + "_mixed_tile", replay->GetType(), sp);
+    loop_body.push_back(std::make_shared<AssignStmt>(activation, replay, sp));
+    values.emplace(source->var_.get(), activation);
+  }
+  if (!activation) return decline("empty activation stage");
+
+  auto down_weight_call = registry.Create(
+      "tensor.slice",
+      {down->args_[1], MakeIndexTuple({feature_chunk, cols}, sp), MakeTuple2(feature, ni, sp)}, sp);
+  auto down_weight =
+      std::make_shared<Var>(down_assign->var_->name_hint_ + "_weight_tile", down_weight_call->GetType(), sp);
+  loop_body.push_back(std::make_shared<AssignStmt>(down_weight, down_weight_call, sp));
+
+  const std::vector<std::pair<std::string, std::any>> mm_kw = {
+      {"a_trans", false}, {"b_trans", false}, {"c_matrix_nz", false}, {"out_dtype", DataType::FP32}};
+  const std::vector<std::pair<std::string, std::any>> acc_kw = {{"a_trans", false}, {"b_trans", false}};
+  auto first_call = registry.Create("tensor.matmul", {activation, down_weight}, mm_kw, sp);
+  auto first_var = std::make_shared<Var>(down_assign->var_->name_hint_ + "_first", first_call->GetType(), sp);
+  StmtPtr first_body = SeqStmts::Flatten({std::make_shared<AssignStmt>(first_var, first_call, sp),
+                                          std::make_shared<YieldStmt>(std::vector<ExprPtr>{first_var}, sp)},
+                                         sp);
+  auto later_call =
+      registry.Create("tensor.matmul_acc", {ExprPtr(acc_iter), activation, down_weight}, acc_kw, sp);
+  auto later_var = std::make_shared<Var>(down_assign->var_->name_hint_ + "_later", later_call->GetType(), sp);
+  StmtPtr later_body = SeqStmts::Flatten({std::make_shared<AssignStmt>(later_var, later_call, sp),
+                                          std::make_shared<YieldStmt>(std::vector<ExprPtr>{later_var}, sp)},
+                                         sp);
+  auto next_acc =
+      std::make_shared<Var>(down_assign->var_->name_hint_ + "_feature_acc", first_call->GetType(), sp);
+  loop_body.push_back(std::make_shared<IfStmt>(MakeEq(feature, MakeIndex(0, sp), sp), first_body,
+                                               std::optional<StmtPtr>(later_body),
+                                               std::vector<VarPtr>{next_acc}, sp));
+  loop_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{next_acc}, sp));
+
+  auto down_tile =
+      std::make_shared<Var>(down_assign->var_->name_hint_ + "_mixed_tile", first_call->GetType(), sp);
+  auto feature_loop = std::make_shared<ForStmt>(
+      feature, MakeIndex(0, sp), MakeIndex(H, sp), MakeIndex(feature_chunk, sp),
+      std::vector<IterArgPtr>{acc_iter}, SeqStmts::Flatten(std::move(loop_body), sp),
+      std::vector<VarPtr>{down_tile}, sp, ForKind::Pipeline,
+      std::vector<std::pair<std::string, std::any>>{{kPipelineStagesAttr, plan.loop.pipeline_stages}});
+  auto assemble = registry.Create("tensor.assemble", {output, down_tile, MakeTuple2(mi, ni, sp)}, sp);
+  auto sink_assign = std::make_shared<AssignStmt>(down_assign->var_, assemble, sp);
+  std::vector<StmtPtr> kernel_body{
+      std::make_shared<AssignStmt>(block, registry.Create("tile.get_block_idx", {}, sp), sp),
+      std::make_shared<AssignStmt>(acc_init, acc_create, sp), feature_loop, sink_assign};
+  auto kernel = std::make_shared<InCoreScopeStmt>(
+      std::optional<SplitMode>{SplitMode::UpDown}, name, SeqStmts::Flatten(std::move(kernel_body), sp), sp,
+      std::vector<std::string>{},
+      std::vector<std::pair<std::string, std::any>>{
+          {"slot_num", static_cast<int>(plan.fifos.front().slot_count)}});
+  auto scope = std::make_shared<SpmdScopeStmt>(MakeIndex(plan.loop.active_groups, sp), /*sync_start=*/false,
+                                               name + "_spmd", kernel, sp);
+  LOG_INFO << "AutoFuse[mixed-mlp-plan]: group '" << name
+           << "' emitted C,C->V->C grid=" << plan.m_partition.parts << "x" << plan.n_partition.parts
+           << " groups=" << plan.loop.active_groups
+           << " feature_chunks=" << plan.dense_mlp.intermediate_chunks
+           << " fifo_slots=" << plan.fifos.front().slot_count;
+  return std::vector<StmtPtr>{output_assign, scope};
+}
+
 // Replay the first buildable mixed schedule: one standard matmul followed by a
 // linear elementwise epilogue.  The outer launch owns `active_groups` physical
 // 910B clusters; every cluster runs a fixed inner loop over its successor
@@ -4644,6 +4951,9 @@ std::optional<std::vector<StmtPtr>> EmitMixedScheduleGroup(
     LOG_INFO << "AutoFuse[mixed-plan]: group '" << name << "' decline — " << reason;
     return std::optional<std::vector<StmtPtr>>{};
   };
+  if (plan.algorithm == ::MixedAlgorithmKind::DenseSwiGluMlp) {
+    return EmitDenseSwiGluMlpGroup(members, stmt_op, required_live_outs, tile, name);
+  }
   if (!plan.feasible || !plan.emit_compatible || !plan.topology || plan.mode != ::MixedPipelineMode::OneWay ||
       plan.topology->stages.size() != 2 || plan.topology->transfers.size() != 1 ||
       plan.topology->stages[0].engine != ::MixedEngine::Cube ||

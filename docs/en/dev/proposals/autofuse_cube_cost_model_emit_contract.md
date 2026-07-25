@@ -313,8 +313,10 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
    dependency-constrained locality ordering, register-pressure-aware DAG scheduling, and pebbling;
    do not add an ad hoc heuristic before its objective and complexity are compared with Gorder.
    At `97136d97` / `789e9fdd`, DFS and Gorder pass identical model suites, but the dedicated
-   multi-seed device graphs and exact emitted MTE2/allocation comparison were not run. Treat this
-   as host/order closure, not silicon closure of the reuse policy.
+   device follow-up also confirmed build-invariant shared-boundary traffic, duplicate-operand reuse,
+   single-use transient lifetimes, and distinct `A @ A` operand roles. The always-retain policy is
+   silicon-closed for the admitted compatible surface; comparing it with spill/reload alternatives
+   remains a future optimization rather than a correctness gap.
 
 4. **Exact feasibility and objective scope.** Initial exact feasibility sizes boundary strips at
    the whole requested M/N region before the smaller emitted output/L0C tile is chosen, so it can
@@ -384,12 +386,13 @@ as an exact replay of the reconstructed winner. Remaining work, in priority orde
 
 12. **Device/default closure.** Retained panels, clamped lone matmuls, recursive BF16/FP16 DAGs,
    serial K tails, and former allocation-overflow plans have targeted silicon evidence. The new
-   `FirstPartialThenAtomic` path has one successful forced FP32 device smoke with the expected two
-   AIC kernels and no AIV seed; PTO Fusebox reports `523 passed / 0 failed` under both DFS and
-   Gorder. Full closure still requires the pre-registered two-device deterministic split sweep,
-   DFX dependency/drain evidence, recursive BF16 force, resident-boundary request bytes, and serial
-   multi-request ranking. Promote those representatives into the persistent 910B2 surface before
-   relaxing the generic cube-emitter guard.
+   `FirstPartialThenAtomic` path now has silicon confirmation for FP32 and BF16-input/FP32-output
+   roots with the expected two AIC kernels and no AIV seed; PTO Fusebox reports
+   `523 passed / 0 failed` under both DFS and Gorder. Remaining device/default work is performance
+   policy rather than the admitted split/residency contract: compare natural analytic/exact plans
+   against public reference schedules, retain `cube_split_sync_cycles=0`, and promote the
+   reference-labelled representatives into the persistent 910B2 surface. BF16-output split-K and
+   exact transposed replay remain explicit capability gaps and must continue to decline.
 
 If exact replay is unavailable, strict mode fails with the rejected contract condition. Production
 mode partitions or falls back to standalone matmuls rather than silently emitting another

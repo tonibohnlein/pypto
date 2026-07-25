@@ -1,8 +1,12 @@
 # AutoFuse mixed cube/vector schedule contract
 
-**Status:** first buildable `C->V` increment implemented behind
-`PYPTO_AUTOFUSE_MIXED=1`; silicon validation is blocked by a downstream cube→vector visibility
-defect, while the isolated pure-cube producer is correct.
+**Status:** the buildable `C->V` increment and the first exact
+`C,C->V->C` dense-SwiGLU increment are implemented behind
+`PYPTO_AUTOFUSE_MIXED=1`. The dense increment is host-validation only until its
+standard cross-core lowering is closed on 910B silicon. Host tests already
+close tensor-level equivalence and the full
+`ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` structure. A separate historical
+cube→vector visibility defect remains outside the homogeneous cube contract.
 The homogeneous vector and cube contracts remain authoritative for work inside each engine.
 This document defines the additional contract at cube/vector boundaries.
 
@@ -59,18 +63,23 @@ local-search cache compact. It is re-derived once for a winning or forced config
 
 The current plan contains:
 
+- an algorithm kind; the generic stage DAG remains available, while exact
+  algorithms may add topology-specific loop and carry facts;
 - maximal same-engine stages and their op membership;
 - every cube/vector tensor transfer, its direction, and its producer/consumer stages;
 - balanced spatial partitions, active group count, and split-K factor;
-- the derived cube GM-to-L1 K window and the materialized vector-stage kind/peak UB;
+- stage-local homogeneous views: cube GM-to-L1 K windows and vector
+  `VectorStreamPlan` descriptors;
 - pipeline axis, chunk extent, item count, per-group trips, stage count, and skew depth;
-- GM FIFO tensor, direction, valid tile shape, slot bytes, slot count, and total reserved bytes;
+- GM FIFO tensor, direction, pipe ID, bundle ID, valid tile shape, slot bytes,
+  slot count, and total reserved bytes;
 - the explicit AIV row/column split and number of compute lanes;
 - `model_overlap_granted` and independently derived `overlap_implementable` bits.
 
-Stage-local `CubeSchedulePlan` and `VectorStreamPlan` views remain the next
-model increment; they are a required part of the complete contract, not fields
-that exist in the first implementation.
+The dense-SwiGLU algorithm additionally records the input, intermediate, and
+output extents; the feature-chunk loop; the two projection K windows; the down
+feed window; and the persistent FP32 down accumulator. These are mixed
+composition facts, not a second implementation of homogeneous tiling.
 
 The last two fields intentionally fail loud during migration. A cost may use `max` only when the
 emitter can construct the recorded loop and PyPTO's lowering passes can realize its skew.
@@ -84,9 +93,33 @@ emitter can construct the recorded loop and PyPTO's lowering passes can realize 
 | single-round-trip skew | `C->V->C` or `V->C->V` | `SkewCrossCorePipeline` | max only when its structural skew predicate succeeds |
 | multi-round-trip | e.g. full `C->V->C->V` attention | future whole-FIFO wavefront | serial until that transform exists |
 
-Today `SkewCrossCorePipeline` safely skews exactly one push and one pop on the producer role. It
-demotes multi-round-trip loops to sequential to preserve FIFO order. The solver must mirror that
-predicate; structural alternation depth alone is insufficient.
+Today `SkewCrossCorePipeline` safely skews one ordered producer push bundle
+followed by one reply pop. The bundle may contain multiple pushes, such as the
+gate and up projections of SwiGLU, but every push must precede the first pop.
+Any push after a pop is a second round trip and is demoted to sequential to
+preserve FIFO order. The solver mirrors that predicate; structural alternation
+depth alone is insufficient.
+
+`V` and `C` name maximal homogeneous stages, not individual operations or
+physical cores. Consequently, a connected `C->V->V->C` source graph is a
+three-stage `C->V->C` protocol: both vector operations remain in one vector
+stage. The two physical AIV cores in a 910B group are represented separately
+by `MixedVectorSplit` and execute spatial shards of that one logical stage.
+Conversely, two independent vector branches that return two distinct tensors
+to a matmul are two logical vector stages. They require a two-reply bundle,
+which the current skew pass does not admit, so production AutoFuse partitions
+that graph.
+
+The candidate-invariant topology carries an explicit
+`MixedCrossCoreProtocol`: `OneWay`, `SingleRoundTripBundle`, or `Unsupported`.
+The bundled protocol records producer stages, the peer stage, sink stage, and
+the exact transfer indices in the producer and reply bundles. The model grants
+single-round-trip overlap only when this descriptor is compatible with
+`SkewCrossCorePipeline`; the emitter rechecks the same descriptor before
+building the mixed scope. Protocol recognition alone is not cost admission:
+generic costing currently accepts one producer and one reply, while a larger
+bundle requires an exact algorithm such as dense SwiGLU to provide every
+stage-local cost and cross-stage lifetime.
 
 ## 5. Fidelity obligations
 
@@ -107,7 +140,11 @@ predicate; structural alternation depth alone is insufficient.
 
 `Ascend910BMixed` already models four GM port directions, the shared-HBM cap, the 1:2 resource
 ratio, cube/vector stage balance, and single-round-trip fill behavior. Pure groups delegate to the
-homogeneous models.
+homogeneous models. Mixed algorithms use the same grounded homogeneous
+primitives for their stage work: cube MAC/extract/GM-to-L1 terms and vector
+primitive/traffic terms are not refitted inside the mixed model. The mixed
+wrapper adds only crossing traffic, FIFO capacity, the cross-engine wavefront,
+and state whose lifetime crosses a stage boundary.
 
 `Subgraph::create` builds immutable same-engine stages and explicit crossing transfers once; each
 winning or forced configuration re-derives a lightweight `MixedSchedulePlan`, while `CostResult`
@@ -145,6 +182,39 @@ and both AIV row shards. Tensor-level numeric replay matches the unfused matmul 
 transposed/NZ matmuls cleanly decline before solving. Current candidate enumeration exposes at most
 two trips per group; deeper FIFO backpressure is therefore not part of the buildable surface yet.
 
+The exact dense-SwiGLU surface is:
+
+```text
+gate = matmul(x, w_gate)       C
+up   = matmul(x, w_up)         C
+act  = swiglu(gate, up)        V
+out  = matmul(act, w_down)     C
+```
+
+The admitted activation is the exact source chain
+`neg -> exp -> scalar_add(1) -> recip -> mul -> mul -> cast`, with BF16/FP16
+cube inputs, FP32 gate/up results, a low-precision activation tile, and an FP32
+down result. Intermediate projection values may not escape. The spatial grid
+partitions final output M/N tiles among at most 24 groups. Inside each group an
+intermediate-feature loop:
+
+1. computes ordinary tensor-matmul gate and up tiles with the planned
+   homogeneous cube K windows;
+2. sends both tiles as one ordered two-push bundle;
+3. evaluates the materialized homogeneous vector plan on the two AIV lanes;
+4. returns one activation tile; and
+5. initializes or accumulates the down matmul into one FP32 tile that remains
+   live until the last feature chunk.
+
+The emitter produces only tensor-level matmul/vector operations inside an
+`UP_DOWN` mixed scope. `ExpandMixedKernel` creates `tpush`/`tpop`/`tfree`,
+`SkewCrossCorePipeline` realizes the one-round-trip wavefront, and
+`AutoTileMatmulL0` chooses all L0 M/N/K tiles and buffers. AutoFuse neither
+emits raw cross-core instructions nor attaches an L0 plan. The persistent down
+accumulator is the one topology-specific cube wrapper: replaying an independent
+homogeneous `CubeSchedulePlan` per feature chunk would incorrectly drain it to
+GM after every chunk.
+
 The buildable cost now prices the exact grounded primitive chain on each valid AIV half tile,
 including one stream startup per item. It applies role-aware boundary-input multiplicities
 (`[M,N]`: 1, `[M,1]`: `parts_n`, `[1,N]`: `2*parts_m`, scalar:
@@ -161,21 +231,25 @@ The remaining model/emit gaps are:
 
 - active groups are still a deterministic mapping (`min(spatial tiles, 24)`), not a separately
   enumerated choice between more serial groups and fewer pipelined groups;
-- the current materialized pointwise subset is exact, but a stage-local `VectorStreamPlan` is still
-  required before mixed pointwise strip streaming or P2/P4 can be admitted;
+- the current materialized pointwise subset is exact; mixed pointwise strip
+  streaming and P2/P4 still require algorithm-specific state and loop admission;
 - low-precision floating matmul outputs require an explicit FP32 K-window carry plus final FIXPIPE
   narrow; compiler mode declines them instead of silently rebuilding a full-K matmul;
 - promoted/mixed-dtype vector operands and `INT8->INT32` epilogues remain cut until their cast or
   integer primitive semantics are represented and priced;
 - a direct QK matmul plus an exact softmax cone can now reuse the P4 vector-stage descriptor, but
   mixed costing does not yet replay its phase-local compute and traffic;
-- stage-local cube request topology is constructed only for homogeneous cube groups;
+- the dense stage views reuse homogeneous primitive equations but do not yet
+  embed an independently enumerable full `CubeSchedulePlan` for each
+  projection; doing so must preserve the feature-loop accumulator contract;
 - FIFO depth eight is explicit and faithful, but smaller depths have not been device-compared and
   are not yet a scheduling dimension;
 - the cross-engine wavefront and mixed launch overhead still need latest-PTOAS silicon grounding;
   host lowering proves ordering and capacity, not AIC item `k+1` overlap with AIV item `k`;
 - analytic `C->V->C->V` topology is retained and receives a serial stage sum, while compiler mode
   cuts it; the current unified spatial grid also cannot express its key-chunk loop.
+- the dense surface still needs latest-PTOAS 910B correctness, traffic,
+  overlap, and ranking validation.
 
 These are explicit migration gaps, not permission for the emitter to approximate the plan.
 
@@ -198,15 +272,20 @@ Until that is closed, mixed correctness/performance results are not valid and th
    matmul epilogue; include FIFO reservation, blocking crossing traffic, exact per-lane vector work,
    broadcast multiplicity, live-out, and matmul-semantic gates. Unsupported mixed topologies remain
    partition boundaries.
-4. Enumerate or analytically choose between more serial groups and fewer pipelined groups. Price
+4. **Done (host implementation and structural validation; silicon pending):** add the exact
+   `C,C->V->C` dense-SwiGLU algorithm. Reuse homogeneous stage costs, carry the
+   down accumulator across feature chunks, and extend skew to one ordered
+   multi-push bundle followed by one reply.
+5. Enumerate or analytically choose between more serial groups and fewer pipelined groups. Price
    dependent init, steady, tail, and drain phases separately.
-5. Build stage-local `CubeSchedulePlan` and `VectorStreamPlan` views for mixed components and use
-   their exact compute, traffic, liveness, and double-buffer decisions.
-6. Add the symmetric `V->C` and exact single-round-trip emitters. Mirror the complete skew
+6. Generalize the current stage-local homogeneous views without duplicating
+   the homogeneous search. Preserve mixed-only lifetime facts such as the
+   feature-loop accumulator.
+7. Add the symmetric `V->C` emitter. Mirror the complete skew
    capability predicate before granting overlap.
-7. Reuse the implemented embedded P4 stage descriptor in stage-local mixed compute and traffic;
+8. Reuse the implemented embedded P4 stage descriptor in stage-local mixed compute and traffic;
    continue rejecting any extra vector prefix or tail outside that exact cone.
-8. Add whole-FIFO multi-round-trip skew, then implement full flash attention with the key-chunk
+9. Add whole-FIFO multi-round-trip skew, then implement full flash attention with the key-chunk
    loop and running `(m,l,O)` state.
 
 Default mixed fusion remains off until plan/emit structural tests and 910B correctness and

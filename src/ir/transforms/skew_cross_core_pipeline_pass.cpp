@@ -140,7 +140,8 @@ std::pair<StmtPtr, std::vector<ExprPtr>> SplitBodyYield(const StmtPtr& body) {
 // consumes the peer's reply via tile.tpop_*) leaves this pass as
 // ForKind::Sequential, so no cross-core loop ever reaches LowerPipelineLoops or
 // CanonicalizeIOOrder as a Pipeline loop:
-//  - SINGLE round-trip, producer role (exactly one tpush + one tpop): run the
+//  - SINGLE round-trip, producer role (one ordered bundle of tpush operations
+//    followed by exactly one reverse-direction tpop): run the
 //    producer D = max(2, F-1) iterations AHEAD (cross-core defaults to DEPTH-2; a
 //    higher `pl.pipeline(stage=F)` asks for the standard F-1 once that exceeds 2).
 //    Emit a produce(start..start+(D-1)*step) prologue, a KEPT Sequential steady
@@ -154,8 +155,8 @@ std::pair<StmtPtr, std::vector<ExprPtr>> SplitBodyYield(const StmtPtr& body) {
 //    A cross-half SSA carry is OK iff it is a RECOMPUTABLE ADDRESS SCALAR (pure
 //    function of the loop var + loop-invariants, e.g. K/V cache_row) — duplicated
 //    into each consume clone and re-derived at its index rather than blocking the skew.
-//  - GENUINE carry (a tile/tensor, incl. the consumer role's popped tile, or a
-//    tpop-derived value), MULTI round-trip, or not statically skewable: demote to a
+//  - GENUINE carry (a tile/tensor, incl. the consumer role's popped tile), an
+//    interleaved/multi-round-trip protocol, or not statically skewable: demote to a
 //    plain Sequential loop — order-preserving; overlap comes from the peer core's
 //    producer skew.
 // ---------------------------------------------------------------------------
@@ -253,7 +254,8 @@ StmtPtr TagPipelineStage(const StmtPtr& body, int32_t group, int32_t stage) {
  *        == F`, `F > 1`); runs immediately before `LowerPipelineLoops`.
  *
  * For a loop whose body has BOTH a cross-core `tile.tpush_*` and a `tile.tpop_*`:
- * a statically-skewable single-round-trip producer loop is rewritten to a prologue
+ * a statically-skewable single-round-trip producer loop (one or more ordered
+ * pushes followed by one reply pop) is rewritten to a prologue
  * + Sequential steady ForStmt + epilogue, with the producer running D = max(2, F-1)
  * iterations ahead (each steady iteration emits D produces then D consumes; D>=2 needs trip % D
  * == 0 and trip >= 2*D, else the largest feasible D' is used). A cross-half SSA carry
@@ -401,19 +403,31 @@ class SkewCrossCoreMutator : public IRMutator {
         << "SkewCrossCorePipeline: ForStmt return_vars and iter_args size mismatch";
     INTERNAL_CHECK_SPAN(op->iter_args_.empty() || body_yields.size() == op->iter_args_.size(), op->span_)
         << "SkewCrossCorePipeline: loop body must yield one value per iter_arg";
-    // Lead = backward slice of the FIRST cross-core op in program order (tpush
-    // OR tpop). For the producer-role core (AIC) that is the tpush (the QK chain
-    // feeding the peer); for the consumer-role core (AIV) that is the tpop (the
-    // prefetch of the peer's tile). Picking the lead by program order — not
-    // "every tpush" — is what lets one algorithm skew both cores.
+    // The only producer-ahead protocol admitted here is:
+    //
+    //   push_0, push_1, ... push_N, pop_reply
+    //
+    // All same-direction messages form one ordered bundle and advance
+    // together.  A pop-first body is the consumer role and is demoted; a push
+    // after the first pop is a second round trip and is likewise demoted.
+    // This generalizes the original one-push/one-pop case without reordering
+    // any FIFO.  Dense SwiGLU uses two projection pushes in this bundle.
     int lead_idx = -1;
     int num_tpush = 0, num_tpop = 0;
+    bool seen_pop = false;
+    bool push_after_pop = false;
+    std::vector<int> bundled_pushes;
     for (int i = 0; i < static_cast<int>(stmts.size()); ++i) {
       bool push = IsTpushStmt(stmts[i]);
       bool pop = IsTpopStmt(stmts[i]);
       if ((push || pop) && lead_idx < 0) {
         lead_idx = i;
       }
+      if (push) {
+        push_after_pop |= seen_pop;
+        if (!seen_pop) bundled_pushes.push_back(i);
+      }
+      seen_pop |= pop;
       num_tpush += push;
       num_tpop += pop;
     }
@@ -421,6 +435,10 @@ class SkewCrossCoreMutator : public IRMutator {
     // head loop). One-directional pipes fall back to uniform replication.
     if (lead_idx < 0 || num_tpush == 0 || num_tpop == 0) {
       return nullptr;
+    }
+    if (IsTpopStmt(stmts[lead_idx]) || push_after_pop || num_tpop != 1 ||
+        bundled_pushes.size() != static_cast<size_t>(num_tpush)) {
+      return DemoteToSequential(op, op->start_, op->stop_, op->step_, body);
     }
 
     // Producer half = backward slice of every tpush (the QK chain feeding the
@@ -454,7 +472,7 @@ class SkewCrossCoreMutator : public IRMutator {
       }
     }
     std::set<int> produce_set;
-    std::vector<int> work = {lead_idx};
+    std::vector<int> work = bundled_pushes;
     while (!work.empty()) {
       int i = work.back();
       work.pop_back();
@@ -564,21 +582,14 @@ class SkewCrossCoreMutator : public IRMutator {
       }
     }
 
-    // The producer-ahead skew advances ONLY the lead's message one iteration. Two
-    // shapes cannot be handled that way and fall back to a plain Sequential demote
+    // The producer-ahead skew advances the complete ordered push bundle one
+    // iteration. Two shapes cannot be handled that way and fall back to a plain Sequential demote
     // (order-preserving, off the unroll style; cross-core overlap then comes from
     // the PEER core's producer skew putting each tile in the FIFO a step early).
     //
-    //  - MULTI-ROUND-TRIP (num_tpush != 1 || num_tpop != 1): more than one message
-    //    per iteration on a cross-core FIFO direction. Advancing only the lead
-    //    REORDERS the in-order FIFO (e.g. push p0[k+1] before p1[k]) — the peer
-    //    pops the wrong tile, a SILENT wrong-data bug (verifiers don't model FIFO
-    //    order).
-    // TODO(crosscore-skew): skew multi-round-trip loops (e.g. C->V->C->V) by
-    // advancing every same-direction message one round-trip together.
-    if (num_tpush != 1 || num_tpop != 1) {
-      return DemoteToSequential(op, op->start_, op->stop_, op->step_, body);
-    }
+    //  - MULTI-ROUND-TRIP: any push after the first pop. Advancing it would
+    //    cross a protocol dependency and silently reorder FIFO data. This was
+    //    rejected above, before computing the producer slice.
 
     //  - A genuine cross-half SSA carry (`carried`): a produce-defined value the
     //    consume half reads. A TILE/TENSOR carry (the AIV's popped scores, or a
@@ -600,8 +611,8 @@ class SkewCrossCoreMutator : public IRMutator {
       }
     }
 
-    // Producer-role single-round-trip cross-core loop (the AIC: exactly one tpush
-    // + one tpop, lead = tpush, FIFO-decoupled from the body -> `carried` empty).
+    // Producer-role single-round-trip cross-core loop (the AIC: one ordered
+    // tpush bundle + one tpop reply, FIFO-decoupled from the body).
     // Clone the producer / consumer halves with
     // loop_var -> `lv_sub` and iter_args -> `iter_subs`. The two halves are cloned
     // with DIFFERENT loop_var substitutes (k vs k-step) — they are SSA-independent

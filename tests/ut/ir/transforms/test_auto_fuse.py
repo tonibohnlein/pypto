@@ -3062,7 +3062,7 @@ class TestAutoFuse:
             """
             import torch
             import pypto.language as pl
-            from pypto import backend, passes
+            from pypto import backend, ir, passes
             from pypto.backend import BackendType
             from pypto.debug import torch_codegen
             from pypto.ir.pass_manager import OptimizationStrategy, PassManager
@@ -3134,6 +3134,314 @@ class TestAutoFuse:
             check=False,
         )
         assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+    def test_mixed_dense_swiglu_mlp_uses_standard_roundtrip_pipeline(self):
+        """Gate/up, SwiGLU, and down compose the existing homogeneous IR.
+
+        AutoFuse owns only the final spatial grid, the intermediate-feature
+        loop, FIFO bundle, and persistent down accumulator. ExpandMixedKernel
+        must derive the transfers; no raw cross-core operation is emitted by
+        AutoFuse itself.
+        """
+        script = textwrap.dedent(
+            """
+            import torch
+            import pypto.language as pl
+            from pypto import backend, ir, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def mlp(
+                    self,
+                    x: pl.Tensor[[32, 64], pl.BF16],
+                    w_gate: pl.Tensor[[64, 128], pl.BF16],
+                    w_up: pl.Tensor[[64, 128], pl.BF16],
+                    w_down: pl.Tensor[[128, 64], pl.BF16],
+                ) -> pl.Tensor[[32, 64], pl.FP32]:
+                    gate: pl.Tensor[[32, 128], pl.FP32] = pl.matmul(
+                        x, w_gate, out_dtype=pl.FP32
+                    )
+                    up: pl.Tensor[[32, 128], pl.FP32] = pl.matmul(
+                        x, w_up, out_dtype=pl.FP32
+                    )
+                    neg_gate = pl.neg(gate)
+                    exp_gate = pl.exp(neg_gate)
+                    denom = pl.add(exp_gate, 1.0)
+                    sigmoid = pl.recip(denom)
+                    silu = pl.mul(gate, sigmoid)
+                    fused = pl.mul(silu, up)
+                    activation = pl.cast(fused, target_type=pl.BF16)
+                    out: pl.Tensor[[32, 64], pl.FP32] = pl.matmul(
+                        activation, w_down, out_dtype=pl.FP32
+                    )
+                    return out
+
+            @pl.program
+            class Expected:
+                @pl.function
+                def mlp(
+                    self,
+                    x: pl.Tensor[[32, 64], pl.BF16],
+                    w_gate: pl.Tensor[[64, 128], pl.BF16],
+                    w_up: pl.Tensor[[64, 128], pl.BF16],
+                    w_down: pl.Tensor[[128, 64], pl.BF16],
+                    out_mixed_out: pl.Out[pl.Tensor[[32, 64], pl.FP32]],
+                ) -> pl.Tensor[[32, 64], pl.FP32]:
+                    for fused_0_group in pl.spmd(
+                        2,
+                        name_hint="fused_0_spmd",
+                        optimizations=[pl.split(pl.SplitMode.UP_DOWN, slot_num=4)],
+                    ):
+                        out_acc_init: pl.Tensor[[16, 64], pl.FP32] = pl.tensor.create(
+                            [16, 64], dtype=pl.FP32, layout=pl.TensorLayout.ND
+                        )
+                        for fused_0_feature, (out_acc,) in pl.pipeline(
+                            0,
+                            128,
+                            16,
+                            stage=3,
+                            init_values=(out_acc_init,),
+                        ):
+                            fused_0_gate_a_t: pl.Tensor[[16, 64], pl.BF16] = pl.tensor.slice(
+                                x, [16, 64], [fused_0_group // 1 * 16, 0]
+                            )
+                            fused_0_gate_b_t: pl.Tensor[[64, 16], pl.BF16] = pl.tensor.slice(
+                                w_gate, [64, 16], [0, fused_0_feature]
+                            )
+                            gate_mixed_tile: pl.Tensor[[16, 16], pl.FP32] = pl.tensor.matmul(
+                                fused_0_gate_a_t,
+                                fused_0_gate_b_t,
+                                a_trans=False,
+                                b_trans=False,
+                                c_matrix_nz=False,
+                                out_dtype=pl.FP32,
+                            )
+                            fused_0_up_a_t: pl.Tensor[[16, 64], pl.BF16] = pl.tensor.slice(
+                                x, [16, 64], [fused_0_group // 1 * 16, 0]
+                            )
+                            fused_0_up_b_t: pl.Tensor[[64, 16], pl.BF16] = pl.tensor.slice(
+                                w_up, [64, 16], [0, fused_0_feature]
+                            )
+                            up_mixed_tile: pl.Tensor[[16, 16], pl.FP32] = pl.tensor.matmul(
+                                fused_0_up_a_t,
+                                fused_0_up_b_t,
+                                a_trans=False,
+                                b_trans=False,
+                                c_matrix_nz=False,
+                                out_dtype=pl.FP32,
+                            )
+                            neg_gate_mixed_tile: pl.Tensor[[16, 16], pl.FP32] = pl.tensor.neg(
+                                gate_mixed_tile
+                            )
+                            exp_gate_mixed_tile: pl.Tensor[[16, 16], pl.FP32] = pl.tensor.exp(
+                                neg_gate_mixed_tile
+                            )
+                            denom_mixed_tile: pl.Tensor[[16, 16], pl.FP32] = pl.tensor.adds(
+                                exp_gate_mixed_tile, 1.0
+                            )
+                            sigmoid_mixed_tile: pl.Tensor[[16, 16], pl.FP32] = pl.tensor.recip(
+                                denom_mixed_tile
+                            )
+                            silu_mixed_tile: pl.Tensor[[16, 16], pl.FP32] = pl.tensor.mul(
+                                gate_mixed_tile, sigmoid_mixed_tile
+                            )
+                            fused_mixed_tile: pl.Tensor[[16, 16], pl.FP32] = pl.tensor.mul(
+                                silu_mixed_tile, up_mixed_tile
+                            )
+                            activation_mixed_tile: pl.Tensor[[16, 16], pl.BF16] = pl.tensor.cast(
+                                fused_mixed_tile,
+                                target_type=pl.BF16,
+                                mode="round",
+                            )
+                            out_weight_tile: pl.Tensor[[16, 64], pl.BF16] = pl.tensor.slice(
+                                w_down,
+                                [16, 64],
+                                [fused_0_feature, fused_0_group % 1 * 64],
+                            )
+                            if fused_0_feature == 0:
+                                out_first: pl.Tensor[[16, 64], pl.FP32] = pl.tensor.matmul(
+                                    activation_mixed_tile,
+                                    out_weight_tile,
+                                    a_trans=False,
+                                    b_trans=False,
+                                    c_matrix_nz=False,
+                                    out_dtype=pl.FP32,
+                                )
+                                out_feature_acc: pl.Tensor[[16, 64], pl.FP32] = pl.yield_(
+                                    out_first
+                                )
+                            else:
+                                out_later: pl.Tensor[[16, 64], pl.FP32] = pl.tensor.matmul_acc(
+                                    out_acc,
+                                    activation_mixed_tile,
+                                    out_weight_tile,
+                                    a_trans=False,
+                                    b_trans=False,
+                                )
+                                out_feature_acc: pl.Tensor[[16, 64], pl.FP32] = pl.yield_(
+                                    out_later
+                                )
+                            out_mixed_tile: pl.Tensor[[16, 64], pl.FP32] = pl.yield_(
+                                out_feature_acc
+                            )
+                        out: pl.Tensor[[32, 64], pl.FP32] = pl.tensor.assemble(
+                            out_mixed_out,
+                            out_mixed_tile,
+                            [fused_0_group // 1 * 16, fused_0_group % 1 * 64],
+                        )
+                    return out
+
+            source_namespace = {}
+            exec(
+                torch_codegen(Prog, run_all_spmd_blocks=True),
+                source_namespace,
+            )
+            planned = passes.auto_fuse()(Prog)
+            ir.assert_structural_equal(planned, Expected)
+
+            namespace = {}
+            exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)
+            torch.manual_seed(0)
+            x = (torch.randn(32, 64) * 0.1).to(torch.bfloat16)
+            w_gate = (torch.randn(64, 128) * 0.1).to(torch.bfloat16)
+            w_up = (torch.randn(64, 128) * 0.1).to(torch.bfloat16)
+            w_down = (torch.randn(128, 64) * 0.1).to(torch.bfloat16)
+            expected = source_namespace["mlp"](x, w_gate, w_up, w_down)
+            got = namespace["mlp"](x, w_gate, w_up, w_down)
+            assert torch.allclose(got, expected, rtol=2e-2, atol=2e-2), (
+                got - expected
+            ).abs().max()
+
+            lowered = PassManager.get_strategy(
+                OptimizationStrategy.Default
+            ).run_passes(Prog)
+            lowered_text = lowered.as_python()
+            assert "type=pl.FunctionType.Group" in lowered_text, lowered_text
+            assert "type=pl.FunctionType.AIC" in lowered_text, lowered_text
+            assert "type=pl.FunctionType.AIV" in lowered_text, lowered_text
+            assert lowered_text.count("pl.tile.tpush_to_aiv(") >= 2, lowered_text
+            assert lowered_text.count("pl.tile.tpop_from_aic(") >= 2, lowered_text
+            assert "pl.system.tfree_to_aic(" in lowered_text, lowered_text
+            assert "pl.tile.tpush_to_aic(" in lowered_text, lowered_text
+            assert "pl.tile.tpop_from_aiv(" in lowered_text, lowered_text
+            assert "pl.system.tfree_to_aiv(" in lowered_text, lowered_text
+            assert "pl.tile.matmul(" in lowered_text, lowered_text
+            assert "slot_num=4" in lowered_text, lowered_text
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "64,16,1,2,1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+    def test_mixed_dense_swiglu_declines_escaped_projection(self, monkeypatch):
+        """A gate result returned beside the MLP output cannot be hidden by the
+        feature-streaming algorithm."""
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mlp(
+                self,
+                x: pl.Tensor[[32, 64], pl.BF16],
+                w_gate: pl.Tensor[[64, 128], pl.BF16],
+                w_up: pl.Tensor[[64, 128], pl.BF16],
+                w_down: pl.Tensor[[128, 64], pl.BF16],
+            ):
+                gate = pl.matmul(x, w_gate, out_dtype=pl.FP32)
+                up = pl.matmul(x, w_up, out_dtype=pl.FP32)
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
+                activation = pl.cast(pl.mul(pl.mul(gate, sigmoid), up), target_type=pl.BF16)
+                out = pl.matmul(activation, w_down, out_dtype=pl.FP32)
+                return gate, out
+
+        planned = passes.auto_fuse()(Prog)
+        text = next(f for _, f in planned.functions.items() if f.name == "mlp").as_python()
+        assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=4)" not in text
+
+    def test_mixed_dense_swiglu_declines_non_sigmoid_scalar(self, monkeypatch):
+        """The dense algorithm descriptor admits ``exp(-x) + 1`` exactly.
+
+        A different scalar is still a valid pointwise graph, but is not the
+        modeled SwiGLU algorithm and must remain partitioned.
+        """
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mlp(
+                self,
+                x: pl.Tensor[[32, 64], pl.BF16],
+                w_gate: pl.Tensor[[64, 128], pl.BF16],
+                w_up: pl.Tensor[[64, 128], pl.BF16],
+                w_down: pl.Tensor[[128, 64], pl.BF16],
+            ) -> pl.Tensor[[32, 64], pl.FP32]:
+                gate = pl.matmul(x, w_gate, out_dtype=pl.FP32)
+                up = pl.matmul(x, w_up, out_dtype=pl.FP32)
+                sigmoid_like = pl.recip(pl.add(pl.exp(pl.neg(gate)), 2.0))
+                activation = pl.cast(
+                    pl.mul(pl.mul(gate, sigmoid_like), up),
+                    target_type=pl.BF16,
+                )
+                return pl.matmul(activation, w_down, out_dtype=pl.FP32)
+
+        planned = passes.auto_fuse()(Prog)
+        text = next(f for _, f in planned.functions.items() if f.name == "mlp").as_python()
+        assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=4)" not in text
+
+    def test_mixed_dense_swiglu_declines_miswired_activation(self, monkeypatch):
+        """The dense descriptor must match SwiGLU dataflow, not just op kinds."""
+
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True})
+            def mlp(
+                self,
+                x: pl.Tensor[[32, 64], pl.BF16],
+                w_gate: pl.Tensor[[64, 128], pl.BF16],
+                w_up: pl.Tensor[[64, 128], pl.BF16],
+                w_down: pl.Tensor[[128, 64], pl.BF16],
+            ) -> pl.Tensor[[32, 64], pl.FP32]:
+                gate = pl.matmul(x, w_gate, out_dtype=pl.FP32)
+                up = pl.matmul(x, w_up, out_dtype=pl.FP32)
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
+                up_sigmoid = pl.mul(up, sigmoid)
+                up_squared_sigmoid = pl.mul(up_sigmoid, up)
+                activation = pl.cast(up_squared_sigmoid, target_type=pl.BF16)
+                return pl.matmul(activation, w_down, out_dtype=pl.FP32)
+
+        planned = passes.auto_fuse()(Prog)
+        text = next(f for _, f in planned.functions.items() if f.name == "mlp").as_python()
+        assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=4)" not in text
 
     def test_cube_k_window_keeps_l0_operand_stages_disjoint(self):
         """A one-L0-tile child still needs outer-stage L0A/L0B ping-pong.
