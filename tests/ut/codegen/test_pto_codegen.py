@@ -184,7 +184,6 @@ AICORE void split_vec(__gm__ float* v2, int32_t v3) {
 }
 """
 
-
 def _split_ptoas_output_for(
     func_name: str,
     *,
@@ -207,7 +206,6 @@ __global__ AICORE void {func_name}({params}) {{
   return;
 }}
 """
-
 
 def _make_func(name, params_spec):
     """Build a Function from parameter specs.
@@ -1786,7 +1784,7 @@ class TestGenerateKernelWrapper:
         assert "v3.prod.setEntryOffset" not in wrapper
         assert "int32_t __pypto_spmd_subblock_idx = get_sub_block_id(args);" in wrapper
 
-    def test_no_split_dual_dispatch_wrapper_uses_runtime_subblock_bridge_on_a2a3(self):
+    def test_no_split_dual_dispatch_needs_no_pipe_lane_offset_on_a2a3(self):
         @pl.program
         class NoSplitDualDispatchProgram:
             @pl.function(type=pl.FunctionType.AIV, attrs={"dual_aiv_dispatch": True})
@@ -1924,6 +1922,84 @@ __global__ AICORE void split_vec() {
         assert f"activation_pipe.prod.setEntryOffset({lane} * 256);" in wrapper
         assert "gate_pipe.prod.setEntryOffset" not in wrapper
         assert "activation_pipe.cons.setEntryOffset" not in wrapper
+    def test_left_right_split_uses_one_lane_row_width_as_fifo_offset(self):
+        @pl.program
+        class LeftRightSplitProgram:
+            @pl.function(type=pl.FunctionType.AIV, attrs={"split": pl.SplitMode.LEFT_RIGHT})
+            def split_vec(
+                self,
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pipe_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=pipe_buf)
+                popped: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=2
+                )
+                pl.tfree_to_aic(popped)
+                updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(popped, [0, 0], out)
+                return updated
+
+        transformed = _run_default_passes(LeftRightSplitProgram)
+        func = transformed.get_function("split_vec")
+        assert func is not None
+
+        wrapper = _generate_kernel_wrapper(func, _split_ptoas_output_for(func.name))
+        # SplitVectorKernel halves [16, 16] into a [16, 8] FP32 lane.
+        # LEFT_RIGHT lane 1 begins after 8 FP32 columns in row 0, not
+        # after all 16 rows of the lane tile.
+        assert "v3.cons.setEntryOffset(static_cast<int>(v2) * 32);" in wrapper
+
+    def test_split_aiv_wrapper_fails_closed_when_ptoas_pipe_is_not_identifiable(self):
+        @pl.program
+        class SplitWrapperProgram:
+            @pl.function(type=pl.FunctionType.AIV, attrs={"split": pl.SplitMode.UP_DOWN})
+            def split_vec(
+                self,
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pipe_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=pipe_buf)
+                popped: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1
+                )
+                pl.tfree_to_aic(popped)
+                updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(popped, [0, 0], out)
+                return updated
+
+        transformed = _run_default_passes(SplitWrapperProgram)
+        func = transformed.get_function("split_vec")
+        assert func is not None
+
+        with pytest.raises(RuntimeError, match="PTOAS TPipe descriptors do not match"):
+            _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
+
+    def test_split_aiv_wrapper_fails_closed_without_trailing_runtime_lane_param(self):
+        @pl.program
+        class SplitWrapperProgram:
+            @pl.function(type=pl.FunctionType.AIV, attrs={"split": pl.SplitMode.UP_DOWN})
+            def split_vec(
+                self,
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pipe_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=pipe_buf)
+                popped: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1
+                )
+                pl.tfree_to_aic(popped)
+                updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(popped, [0, 0], out)
+                return updated
+
+        transformed = _run_default_passes(SplitWrapperProgram)
+        func = transformed.get_function("split_vec")
+        assert func is not None
+
+        ptoas_without_lane_param = _split_ptoas_output_for(
+            func.name,
+            runtime_lane_param=False,
+        )
+        with pytest.raises(RuntimeError, match="missing its trailing runtime subblock parameter"):
+            _generate_kernel_wrapper(func, ptoas_without_lane_param)
 
     def test_split_aiv_wrapper_uses_runtime_subblock_bridge_in_group_output_on_a2a3(
         self, tmp_path, monkeypatch
@@ -2047,9 +2123,9 @@ __global__ AICORE void split_vec() {
     def test_subblock_wrapper_reads_runtime_lane_and_appends_subblock_arg(self):
         # tile.get_subblock_idx now flows through the synthetic-param channel:
         # the wrapper reads the runtime lane id via get_sub_block_id(args) and
-        # appends it as a trailing call arg — independent of (and in addition
-        # to) the get_subblockid() macro bridge used for ptoas-internal pipe
-        # slot offsets.
+        # appends it as a trailing call arg. A2A3 split pipes use that same
+        # parameter for explicit setEntryOffset calls; there is no file-scope
+        # get_subblockid() macro bridge.
         @pl.program
         class SubblockWrapperProgram:
             @pl.function(type=pl.FunctionType.AIV, attrs={"dual_aiv_dispatch": True})

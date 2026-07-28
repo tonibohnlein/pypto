@@ -701,7 +701,7 @@ def _function_uses_ops(func: _ir_core.Function, op_names: frozenset[str]) -> boo
 def _uses_dynamic_subblock_id(func: _ir_core.Function) -> bool:
     """Return whether the function reads subblock id from the runtime lane context.
 
-    Drives both the runtime-subblock macro bridge and the synthetic
+    Drives both the A2A3 explicit FIFO-offset workaround and the synthetic
     ``%__pypto_spmd_subblock_idx`` param forwarded by the kernel wrapper, so it
     must detect ``tile.get_subblock_idx`` wherever it appears (including nested
     in larger expressions) to stay consistent with the C++ signature emission.
@@ -733,7 +733,8 @@ def _uses_spmd_block_ops(func: _ir_core.Function) -> bool:
     These ops compile to ccec built-ins that return physical core indices.
     In the tensormap_and_ringbuffer runtime the logical block index must be
     read from the dispatch payload via ``get_block_idx(args)`` / ``get_block_num(args)``
-    (defined in ``intrinsic.h``), so the wrapper needs a macro bridge.
+    (defined in ``intrinsic.h``), so the wrapper needs explicit identity
+    parameters.
     """
     return _function_uses_ops(func, _SPMD_BLOCK_OPS)
 
@@ -1111,6 +1112,176 @@ def _inject_runtime_lane_pipe_offsets(
         parameter = f"{separator}int32_t {subblock_param}"
         rewritten = rewritten[:params_end] + parameter + rewritten[params_end:]
     return rewritten, True
+
+
+def _static_split_lane_offset_bytes(
+    tile_type: _ir_core.Type,
+    split: int,
+    *,
+    context: str,
+) -> int:
+    """Return the explicit FIFO offset between AIV lanes.
+
+    The A2A3 runtime workaround is deliberately narrower than PTO-ISA's native
+    ``get_subblockid()`` implementation: it is valid only for full, static 2-D
+    lane tiles.  Declining dynamic/ragged cases is preferable to silently
+    installing an offset that disagrees with TPUSH/TPOP address arithmetic.
+
+    PTO-ISA stores UP_DOWN halves consecutively, so their offset is one full
+    lane tile. LEFT_RIGHT halves share each row, so lane 1 starts after one
+    lane's columns in row 0 rather than after the full 2-D tile.
+    """
+    if split not in (1, 2):
+        raise RuntimeError(f"{context} requires UP_DOWN or LEFT_RIGHT split, got {split}")
+    if not isinstance(tile_type, _ir_core.TileType) or len(tile_type.shape) != 2:
+        raise RuntimeError(f"{context} requires a static rank-2 TileType")
+
+    dims: list[int] = []
+    for dim in tile_type.shape:
+        if not isinstance(dim, _ir_core.ConstInt) or dim.value <= 0:
+            raise RuntimeError(f"{context} requires positive static tile dimensions")
+        dims.append(dim.value)
+
+    view = tile_type.get_effective_tile_view()
+    if len(view.valid_shape) != 2:
+        raise RuntimeError(f"{context} requires a rank-2 effective valid shape")
+    for valid_dim, extent in zip(view.valid_shape, dims, strict=True):
+        if not isinstance(valid_dim, _ir_core.ConstInt) or valid_dim.value != extent:
+            raise RuntimeError(f"{context} requires a full static valid shape")
+
+    lane_elements = dims[0] * dims[1] if split == 1 else dims[1]
+    return lane_elements * tile_type.dtype.get_byte()
+
+
+def _get_runtime_lane_pipe_offsets(func: _ir_core.Function) -> tuple[int | None, int | None]:
+    """Return ``(consumer_bytes, producer_bytes)`` for one split AIV pipe.
+
+    ``consumer_bytes`` is the C2V tile consumed by ``tpop_from_aic``;
+    ``producer_bytes`` is the V2C tile produced by ``tpush_to_aic``.  The
+    automatic mixed-kernel path currently owns one pipe.  Multiple differently
+    sized transfers in one direction are rejected because one persistent
+    ``TPipe::{cons,prod}.entryOffset`` cannot represent them faithfully.
+    """
+    if not _needs_runtime_subblock_bridge(func):
+        return None, None
+
+    consumer_sizes: set[int] = set()
+    producer_sizes: set[int] = set()
+    initialize_count = 0
+
+    class _PipeFinder(_ir_core.IRVisitor):
+        def visit_call(self, op: _ir_core.Call) -> None:
+            nonlocal initialize_count
+            ir_op = getattr(op, "op", None)
+            name = ir_op.name if isinstance(ir_op, _ir_core.Op) else ""
+            if name == "system.aiv_initialize_pipe":
+                initialize_count += 1
+            elif name == "tile.tpop_from_aic" and (split := op.kwargs.get("split", 0)) != 0:
+                consumer_sizes.add(
+                    _static_split_lane_offset_bytes(
+                        op.type,
+                        split,
+                        context=f"{func.name}: split tpop_from_aic",
+                    )
+                )
+            elif name == "tile.tpush_to_aic" and (split := op.kwargs.get("split", 0)) != 0:
+                if not op.args:
+                    raise RuntimeError(f"{func.name}: split tpush_to_aic has no tile operand")
+                producer_sizes.add(
+                    _static_split_lane_offset_bytes(
+                        op.args[0].type,
+                        split,
+                        context=f"{func.name}: split tpush_to_aic",
+                    )
+                )
+            super().visit_call(op)
+
+    finder = _PipeFinder()
+    finder.visit_stmt(func.body)
+
+    if not consumer_sizes and not producer_sizes:
+        return None, None
+    if initialize_count != 1:
+        raise RuntimeError(
+            f"{func.name}: runtime AIV lane offsets require exactly one initialize_pipe, "
+            f"got {initialize_count}"
+        )
+    if len(consumer_sizes) > 1 or len(producer_sizes) > 1:
+        raise RuntimeError(
+            f"{func.name}: runtime AIV lane offsets require one tile size per direction, "
+            f"got consumer={sorted(consumer_sizes)}, producer={sorted(producer_sizes)}"
+        )
+
+    consumer = next(iter(consumer_sizes), None)
+    producer = next(iter(producer_sizes), None)
+    return consumer, producer
+
+
+def _inject_runtime_lane_pipe_offsets(func: _ir_core.Function, ptoas_code: str) -> str:
+    """Patch one PTOAS-emitted AIV ``TPipe`` with explicit runtime lane offsets.
+
+    Under simpler's A2A3 MIX dispatch, the native CCE ``get_subblockid()``
+    register is stale zero for both AIV lanes. PTO-ISA's split implementation
+    therefore cannot supply its automatic second-lane offset.
+    The runtime-provided synthetic subblock parameter is correct, so install
+    the documented ``setEntryOffset`` workaround directly on the emitted pipe.
+
+    Keep the workaround out of CPU simulation, where ``get_subblockid()`` is
+    already correct and an additional entry offset would double the split.
+    """
+    consumer_bytes, producer_bytes = _get_runtime_lane_pipe_offsets(func)
+    if consumer_bytes is None and producer_bytes is None:
+        return ptoas_code
+
+    pipe_matches = list(re.finditer(r"\bauto\s+([A-Za-z_]\w*)\s*=\s*TPipe\s*<", ptoas_code))
+    if len(pipe_matches) != 1:
+        raise RuntimeError(
+            f"{func.name}: expected exactly one PTOAS TPipe declaration for runtime lane "
+            f"offset injection, got {len(pipe_matches)}"
+        )
+    pipe_match = pipe_matches[0]
+    pipe_name = pipe_match.group(1)
+
+    signature_start = ptoas_code.rfind("static __aicore__ void", 0, pipe_match.start())
+    if signature_start < 0:
+        raise RuntimeError(f"{func.name}: could not locate PTOAS function signature before TPipe")
+    body_start = ptoas_code.find("{", signature_start, pipe_match.start())
+    if body_start < 0:
+        raise RuntimeError(f"{func.name}: malformed PTOAS function signature before TPipe")
+    signature = ptoas_code[signature_start:body_start]
+    params_start = signature.find("(")
+    params_end = signature.rfind(")")
+    if params_start < 0 or params_end < params_start:
+        raise RuntimeError(f"{func.name}: malformed PTOAS function parameter list")
+    trailing_param = re.search(
+        r"(?:^|,)\s*int32_t\s+([A-Za-z_]\w*)\s*$",
+        signature[params_start + 1 : params_end],
+    )
+    if trailing_param is None:
+        raise RuntimeError(f"{func.name}: PTOAS function is missing its trailing runtime subblock parameter")
+    subblock_param = trailing_param.group(1)
+
+    declaration_end = ptoas_code.find(";", pipe_match.end())
+    if declaration_end < 0:
+        raise RuntimeError(f"{func.name}: unterminated PTOAS TPipe declaration")
+
+    lines = [
+        "",
+        "#if !defined(__CPU_SIM)",
+        "    // simpler A2A3 MIX leaves native get_subblockid() at zero on both AIV lanes.",
+        "    // Use the runtime lane parameter for PTO-ISA FIFO entry separation.",
+    ]
+    if consumer_bytes is not None:
+        lines.append(
+            f"    {pipe_name}.cons.setEntryOffset(static_cast<int>({subblock_param}) * {consumer_bytes});"
+        )
+    if producer_bytes is not None:
+        lines.append(
+            f"    {pipe_name}.prod.setEntryOffset(static_cast<int>({subblock_param}) * {producer_bytes});"
+        )
+    lines.extend(["#endif", ""])
+    injection = "\n".join(lines)
+    return ptoas_code[: declaration_end + 1] + injection + ptoas_code[declaration_end + 1 :]
 
 
 def _generate_kernel_header(

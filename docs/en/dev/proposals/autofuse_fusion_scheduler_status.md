@@ -367,10 +367,15 @@ statistics update math remains deliberately algorithm-specific.
    and the analytic global-roofline/seed/tile-multiplicity gaps. Then profile exact search cost and
    retention hit rate. Keep ragged recursive multi-op grids uniform-only unless workloads justify
    edge-specific request propagation.
-5. **Complete mixed fidelity:** make the plan choose a real pipeline-item axis and active-group
-   count, replace global-tile overlap with serial-versus-realizable phase costs, then implement the
-   one-way and single-round-trip emit through `ExpandMixedKernel` → `InjectGMPipeBuffer` →
-   `SkewCrossCorePipeline`. Full flash attention follows only after whole-FIFO multi-round-trip skew.
+5. **Silicon-close mixed v1:** one-way `C->V` and exact dense
+   `C,C->V->C` now have real pipeline-item descriptors and standard
+   `ExpandMixedKernel` → `InjectGMPipeBuffer` → `SkewCrossCorePipeline` emit.
+   Their first device run exposed both AIV lanes aliasing FIFO lane 0 because
+   PTO-ISA reads the stale native `get_subblockid()` under simpler MIX
+   dispatch. The backend now emits explicit runtime-lane `setEntryOffset`
+   calls for the supported static one-pipe surface. Rerun both positive cases,
+   then close traffic/overlap/ranking only after numeric correctness passes.
+   Full flash attention still waits for whole-FIFO multi-round-trip skew.
 
 **Deferred (all decline *gracefully* today — correctness intact, not fused):** the ProblemBuilder
 nested-arg gap (hoist nested compute-call args to SSA temps); P4 col-softmax / scale-then-softmax /

@@ -2,9 +2,15 @@
 
 **Status:** the buildable `C->V` increment and the first exact
 `C,C->V->C` dense-SwiGLU increment are implemented behind
-`PYPTO_AUTOFUSE_MIXED=1`. The dense increment is host-validation only until its
-standard cross-core lowering is closed on 910B silicon. Host tests already
-close tensor-level equivalence and the full
+`PYPTO_AUTOFUSE_MIXED=1`. Their first 910B run exposed a shared dual-AIV FIFO
+lane-addressing defect: simpler supplies the correct lane through
+`get_sub_block_id(args)`, while PTO-ISA's split FIFO reads the stale native
+`get_subblockid()` value and makes both lanes use lane 0. The backend now
+installs the documented explicit `TPipe::cons/prod.setEntryOffset` workaround
+for static, full-tile, one-pipe functions and fails closed otherwise. Both
+increments remain host-closed but require a silicon rerun at the fix revision
+before mixed mode is numerically closed. Host tests already close tensor-level
+equivalence and the full
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` structure. A separate historical
 cube→vector visibility defect remains outside the homogeneous cube contract.
 The homogeneous vector and cube contracts remain authoritative for work inside each engine.
@@ -174,7 +180,10 @@ spmd(active_groups)
 
 `LowerAutoVectorSplit` converts the UP_DOWN contract into real half-row AIV work;
 `ExpandMixedKernel` constructs the GM-backed push/pop FIFO; `InjectGMPipeBuffer` supplies its
-workspace. The outer mixed loop deliberately is not `ForKind::Pipeline`: a generic pipeline tag
+workspace. A2A3 codegen explicitly separates each AIV lane's FIFO entry using
+the runtime subblock parameter because the native hardware subblock register is
+not programmed by simpler MIX dispatch. The outer mixed loop deliberately is
+not `ForKind::Pipeline`: a generic pipeline tag
 would multiply nested AutoTileL0 buffers. The independently running AIC/AIV functions and FIFO
 backpressure form the cross-engine wavefront. A complete host structural test verifies 48 logical
 regions -> 24 group launches x 2 trips, one push/pop/free in each physical loop, 4096-byte slots,
@@ -237,6 +246,10 @@ The remaining model/emit gaps are:
   narrow; compiler mode declines them instead of silently rebuilding a full-K matmul;
 - promoted/mixed-dtype vector operands and `INT8->INT32` epilogues remain cut until their cast or
   integer primitive semantics are represented and priced;
+- the explicit A2A3 FIFO lane-offset workaround currently admits one pipe with
+  one full static tile size per direction; dynamic/ragged transfers and
+  multiple sizes fail closed until PTO-ISA or the launch path supplies a
+  correct native `get_subblockid()`;
 - a direct QK matmul plus an exact softmax cone can now reuse the P4 vector-stage descriptor, but
   mixed costing does not yet replay its phase-local compute and traffic;
 - the dense stage views reuse homogeneous primitive equations but do not yet

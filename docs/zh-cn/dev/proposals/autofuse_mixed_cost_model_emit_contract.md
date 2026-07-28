@@ -2,8 +2,13 @@
 
 **状态：** 可构建的 `C->V` 增量以及第一个精确的
 `C,C->V->C` dense-SwiGLU 增量已在 `PYPTO_AUTOFUSE_MIXED=1` 后实现。
-dense 增量在标准跨核降级通过 910B 芯片验证前仍属于主机验证阶段。主机测试已
-验证 tensor 级等价性以及完整的
+首次 910B 运行暴露了二者共有的 dual-AIV FIFO lane 寻址缺陷：simpler 通过
+`get_sub_block_id(args)` 提供正确 lane，而 PTO-ISA 的 split FIFO 读取过期的
+native `get_subblockid()`，导致两个 lane 都访问 lane 0。backend 现在为静态、
+完整 tile、单 pipe 函数安装文档规定的
+`TPipe::cons/prod.setEntryOffset` 显式 workaround，其他情况 fail closed。
+两个增量已通过主机闭环，但必须在修复 revision 上重新运行 silicon，mixed mode
+才能完成数值闭环。主机测试已验证 tensor 级等价性以及完整的
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` 结构。各引擎内部
 的工作继续以同构 vector/cube 契约为准；本文只定义引擎边界处新增的契约。
 
@@ -104,6 +109,12 @@ AutoFuse 只在 `UP_DOWN` mixed scope 中发射 tensor 级 matmul/vector IR。
 `ExpandMixedKernel` 创建 `tpush`/`tpop`/`tfree`，`SkewCrossCorePipeline` 实现单次
 往返 wavefront，`AutoTileMatmulL0` 独占所有 L0 M/N/K tile 与 buffer 选择。
 AutoFuse 不发射原始跨核指令，也不附加 L0 plan。
+
+A2A3 codegen 使用 runtime subblock 参数显式分离两个 AIV lane 的 FIFO entry，
+因为 simpler MIX dispatch 不会设置 native hardware subblock register。当前
+workaround 只接受每个方向一种完整静态 tile size 的单 pipe 函数；dynamic/ragged
+transfer 或同一方向多种 size 会 fail closed，直到 PTO-ISA 或 launch path 提供
+正确的 native `get_subblockid()`。
 
 down accumulator 是唯一的拓扑专用 cube 包装：若对每个 feature chunk 独立重放
 完整 `CubeSchedulePlan`，会错误地在每个 chunk 后 drain 到 GM。
