@@ -3123,6 +3123,8 @@ class TestAutoFuse:
             assert text.count("pl.tile.tpush_to_aiv(") == 1, text
             assert text.count("pl.tile.tpop_from_aic(") == 1, text
             assert text.count("pl.system.tfree_to_aic(") == 1, text
+            assert text.count("pl.tile.col_expand_add(") == 1, text
+            assert "pl.tile.add(" not in text, text
             assert text.count("slot_size=4096") == 2, text
             assert text.count("slot_num=8") >= 2, text
             assert "pl.tile.get_subblock_idx()" in text, text
@@ -3140,7 +3142,7 @@ class TestAutoFuse:
             )
             add_out = next(
                 line for line in text.splitlines()
-                if "out__tile_1:" in line and "= pl.tile.add(" in line
+                if "out__tile_1:" in line and "= pl.tile.col_expand_add(" in line
             )
             bias_base = re.search(r"pl.MemRef\\((mem_vec_\\d+),", bias_load)
             add_base = re.search(r"pl.MemRef\\((mem_vec_\\d+),", add_out)

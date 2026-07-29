@@ -68,7 +68,7 @@ bool IsA5TargetArch() {
   return backend::BackendConfig::GetBackend()->GetHandler()->GetPtoTargetArch() == "a5";
 }
 
-// Detect row-broadcast pattern: [M, N] op [M, 1] or [M, 1] op [M, N]
+// Detect row-broadcast pattern: [M, N] op [M, 1] or [M, 1] op [M, N].
 // Returns {wider_arg_idx, narrower_arg_idx} if broadcast detected, empty otherwise
 std::pair<int, int> DetectRowBroadcast(const std::vector<ExprPtr>& args) {
   auto type0 = As<TileType>(args[0]->GetType());
@@ -100,6 +100,23 @@ VarPtr AppendScratchTile(std::vector<StmtPtr>* prologue, const std::shared_ptr<c
   auto tmp_var = std::make_shared<Var>(name, create_call->GetType(), span);
   prologue->push_back(std::make_shared<AssignStmt>(tmp_var, create_call, span));
   return tmp_var;
+}
+
+// Detect column-broadcast pattern: [M, N] op [1, N] or [1, N] op [M, N].
+// PTO's col-expand instructions materialize this broadcast over the output
+// rows; a plain tile binary instruction does not.
+std::pair<int, int> DetectColBroadcast(const std::vector<ExprPtr>& args) {
+  auto type0 = As<TileType>(args[0]->GetType());
+  auto type1 = As<TileType>(args[1]->GetType());
+  if (!type0 || !type1) return {-1, -1};
+  if (type0->shape_.size() != 2 || type1->shape_.size() != 2) return {-1, -1};
+
+  bool rhs_is_row_vec = IsConstOne(type1->shape_[0]) && !IsConstOne(type0->shape_[0]);
+  bool lhs_is_row_vec = IsConstOne(type0->shape_[0]) && !IsConstOne(type1->shape_[0]);
+
+  if (rhs_is_row_vec) return {0, 1};
+  if (lhs_is_row_vec) return {1, 0};
+  return {-1, -1};
 }
 
 }  // namespace
@@ -283,12 +300,14 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
 //
 // When both operands have the same shape → tile.{op}
 // When one operand is [M,1] (column vector) → tile.row_expand_{op}
+// When one operand is [1,N] (row vector) → tile.col_expand_{op}
 // ============================================================================
 
 void OpConversionRegistry::RegisterElementwiseBinaryOps() {
   auto MakeBroadcastBinaryConv = [](const std::string& tile_op, const std::string& row_expand_op,
+                                    const std::string& col_expand_op, bool commutative = false,
                                     bool enforce_tdiv_contract = false) -> ConversionFunc {
-    return [tile_op, row_expand_op, enforce_tdiv_contract](
+    return [tile_op, row_expand_op, col_expand_op, commutative, enforce_tdiv_contract](
                const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
                const Span& span) -> ConversionResult {
       auto& op_reg = OpRegistry::GetInstance();
@@ -358,10 +377,22 @@ void OpConversionRegistry::RegisterElementwiseBinaryOps() {
               << "tensor.div row broadcasting requires the divisor's first column to be valid, but got "
                  "valid_shape "
               << FormatShape(row_valid_shape);
+        } else {
+          INTERNAL_CHECK_SPAN(commutative || wider == 0, span)
+              << tile_op << " cannot lower a [M,1] lhs broadcast without reversing operand semantics";
         }
         auto row_expand_call =
             op_reg.Create(row_expand_op, {converted_args[wider], converted_args[narrower]}, span);
         return ConversionResult{std::move(prologue), row_expand_call};
+      }
+
+      auto [col_wider, col_narrower] = DetectColBroadcast(converted_args);
+      if (col_wider >= 0 && !col_expand_op.empty()) {
+        INTERNAL_CHECK_SPAN(commutative || col_wider == 0, span)
+            << tile_op << " cannot lower a [1,N] lhs broadcast without reversing operand semantics";
+        auto col_expand_call =
+            op_reg.Create(col_expand_op, {converted_args[col_wider], converted_args[col_narrower]}, span);
+        return ConversionResult{std::move(prologue), col_expand_call};
       }
 
       if (enforce_tdiv_contract) {
@@ -377,10 +408,13 @@ void OpConversionRegistry::RegisterElementwiseBinaryOps() {
     };
   };
 
-  RegisterCustom("tensor.add", MakeBroadcastBinaryConv("tile.add", "tile.row_expand_add"));
-  RegisterCustom("tensor.sub", MakeBroadcastBinaryConv("tile.sub", "tile.row_expand_sub"));
-  RegisterCustom("tensor.mul", MakeBroadcastBinaryConv("tile.mul", "tile.row_expand_mul"));
-  RegisterCustom("tensor.div", MakeBroadcastBinaryConv("tile.div", "tile.row_expand_div", true));
+  RegisterCustom("tensor.add",
+                 MakeBroadcastBinaryConv("tile.add", "tile.row_expand_add", "tile.col_expand_add", true));
+  RegisterCustom("tensor.sub",
+                 MakeBroadcastBinaryConv("tile.sub", "tile.row_expand_sub", "tile.col_expand_sub"));
+  RegisterCustom("tensor.mul",
+                 MakeBroadcastBinaryConv("tile.mul", "tile.row_expand_mul", "tile.col_expand_mul", true));
+  RegisterCustom("tensor.div", MakeBroadcastBinaryConv("tile.div", "tile.row_expand_div", "", false, true));
   // tensor.maximum/minimum dispatch by rhs type:
   //   tensor rhs → tile.maximum/minimum
   //   scalar rhs → tile.maximums/minimums

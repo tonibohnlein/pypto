@@ -2,19 +2,18 @@
 
 **Status:** the buildable `C->V` increment and first exact `C,C->V->C`
 dense-SwiGLU increment are implemented behind `PYPTO_AUTOFUSE_MIXED=1`.
-The explicit A2A3 dual-AIV FIFO lane bridge is now function-scoped and
-byte-exact: it rewrites only the selected AIV function and gives pipe-only AIV
-functions a private runtime lane parameter. Silicon at PyPTO `74997b29`
-confirmed those code-generation fixes, but exposed two independent downstream
-violations. C2V still allowed a vector writer consuming a MemRef-less
-`tpop_from_aic` value to reuse its `tile.load` buffer; dense SwiGLU failed to
-recognize a reply pop inside the first-matmul/`matmul_acc` conditional, then
-unrolled and reordered replies before projection pushes. MemoryReuse now tracks
-MemRef-less FIFO provenance and applies the 910B guard with or without an active
-`PassContext`; `SkewCrossCorePipeline` now treats identical branch-local
-protocols as one logical event and demotes path-dependent protocols. Full
-AutoFuse regressions close both final-IR contracts. A silicon rerun is still
-required before either positive is numerically closed.
+The explicit A2A3 dual-AIV FIFO lane bridge is function-scoped and byte-exact:
+it rewrites only the selected AIV function and gives pipe-only AIV functions a
+private runtime lane parameter. Silicon at PyPTO `0c0e567e` confirms the later
+MemoryReuse and FIFO-order repairs: the C2V load and result allocations are
+disjoint, and dense SwiGLU now runs to completion with balanced pushes, pops,
+and frees. Neither positive is numerically closed yet. The C2V artifact exposed
+another model/emit violation: generic `[M,N] + [1,N]` reached a plain
+`tile.add`, although the model priced column expansion and PTO requires
+`tile.col_expand_add`. `ConvertTensorToTileOps` now materializes this generic
+column broadcast and the complete AutoFuse regression requires it in the final
+AIV IR. This fix still needs a silicon sentinel. Dense SwiGLU's completed but
+numerically divergent result remains a separate, unisolated round-trip defect.
 
 Host tests also close tensor-level equivalence and the full
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` structure.
@@ -283,14 +282,17 @@ The remaining model/emit gaps are:
 
 These are explicit migration gaps, not permission for the emitter to approximate the plan.
 
-Latest 910B2 isolation at PyPTO `74997b29` proves the runtime lane offsets are
-correct but does not numerically close the kernels: C2V first diverges at row
-one with a run-dependent mismatch count, while dense SwiGLU aborts with AICPU
-21008. Final IR maps those signatures to the two host violations above:
-load/TPOP in-place reuse in C2V and a circular pop-first FIFO order in SwiGLU.
-The new regressions prove the repaired buffer and protocol structure, not
-silicon correctness. Mixed performance results remain invalid and the flag
-remains off until the sentinel rerun passes.
+Latest 910B2 isolation at PyPTO `0c0e567e` proves that runtime lane offsets,
+C2V allocation separation, and SwiGLU FIFO ordering are correct. C2V still
+first diverges at global row one. Its final AIV IR applies a plain binary add
+to a `[16,32]` pop and a `[1,32]` bias; only one row is validly represented by
+that instruction. Across 96 AIV shards this predicts 3,072 correct elements,
+within two elements of the observed count and matching its boundary. The host lowering
+now selects `tile.col_expand_add`; silicon must confirm the diagnosis. SwiGLU
+no longer aborts but all outputs diverge, so its remaining defect must be
+isolated independently with descriptor-matched C2V-only, V2C-only, and
+round-trip controls. Mixed performance results remain invalid and the flag
+remains off until both sentinels pass.
 
 ## 7. Implementation sequence
 
@@ -301,11 +303,13 @@ remains off until the sentinel rerun passes.
 3. **Done (host-ready, device rerun pending):** emit and fully lower the exact materialized `C->V`
    matmul epilogue; include FIFO reservation, blocking crossing traffic, exact per-lane vector work,
    broadcast multiplicity, live-out, matmul-semantic gates, and the 910B
-   MemRef-less load/TPOP no-alias guard. Unsupported mixed topologies remain partition boundaries.
-4. **Done (host implementation and structural validation; silicon rerun pending):** add the exact
+   MemRef-less load/TPOP no-alias guard. Generic `[M,N] + [1,N]` is now required
+   to materialize as `tile.col_expand_add`. Unsupported mixed topologies remain partition boundaries.
+4. **Done (host implementation and structural validation; silicon diagnosis pending):** add the exact
    `C,C->V->C` dense-SwiGLU algorithm. Reuse homogeneous stage costs, carry the
    down accumulator across feature chunks, and extend skew to one ordered
-   multi-push bundle followed by one path-invariant reply.
+   multi-push bundle followed by one path-invariant reply. Its ordering is
+   silicon-safe, but the remaining numerical round-trip defect is not closed.
 5. Enumerate or analytically choose between more serial groups and fewer pipelined groups. Price
    dependent init, steady, tail, and drain phases separately.
 6. Generalize the current stage-local homogeneous views without duplicating

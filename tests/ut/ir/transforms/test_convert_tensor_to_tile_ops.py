@@ -406,6 +406,74 @@ class TestConvertTensorToTileOps:
         _assert_convert_equal(before, expected)
 
     @pytest.mark.parametrize(
+        ("tensor_op", "tile_op"),
+        [
+            (tensor_ops.add, tile_ops.col_expand_add),
+            (tensor_ops.sub, tile_ops.col_expand_sub),
+            (tensor_ops.mul, tile_ops.col_expand_mul),
+        ],
+    )
+    def test_generic_column_broadcast_uses_col_expand(self, tensor_op, tile_op):
+        """A generic ``[M,N] op [1,N]`` must use the materializing PTO col-expand form.
+
+        Plain tile binary instructions accept the broadcast shape in IR type
+        inference but do not repeat the row-vector over all hardware rows.
+        """
+        before, expected = _make_pair(
+            in_specs=[
+                ("matrix", [16, 32], DataType.FP32),
+                ("row", [1, 32], DataType.FP32),
+            ],
+            out_shape=[16, 32],
+            out_dtype=DataType.FP32,
+            tensor_op=lambda ins: tensor_op(ins[0], ins[1]),
+            tile_op=lambda tiles: tile_op(tiles[0], tiles[1]),
+        )
+        _assert_convert_equal(before, expected)
+
+    @pytest.mark.parametrize(
+        ("tensor_op", "tile_op"),
+        [
+            (tensor_ops.add, tile_ops.col_expand_add),
+            (tensor_ops.mul, tile_ops.col_expand_mul),
+        ],
+    )
+    def test_commutative_column_broadcast_reorders_row_vector(self, tensor_op, tile_op):
+        """Commutative generic ops also materialize a ``[1,N]`` lhs broadcast."""
+        before, expected = _make_pair(
+            in_specs=[
+                ("row", [1, 32], DataType.FP32),
+                ("matrix", [16, 32], DataType.FP32),
+            ],
+            out_shape=[16, 32],
+            out_dtype=DataType.FP32,
+            tensor_op=lambda ins: tensor_op(ins[0], ins[1]),
+            tile_op=lambda tiles: tile_op(tiles[1], tiles[0]),
+        )
+        _assert_convert_equal(before, expected)
+
+    @pytest.mark.parametrize(
+        ("narrow_shape", "message"),
+        [
+            ([16, 1], r"\[M,1\]"),
+            ([1, 32], r"\[1,N\]"),
+        ],
+    )
+    def test_sub_rejects_narrow_lhs_broadcast(self, narrow_shape, message):
+        """Expand subtraction cannot reverse a narrow lhs without changing semantics."""
+        before = _make_before(
+            in_specs=[
+                ("narrow", narrow_shape, DataType.FP32),
+                ("matrix", [16, 32], DataType.FP32),
+            ],
+            out_shape=[16, 32],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("result", tensor_ops.sub(ins[0], ins[1])),
+        )
+        with pytest.raises(InternalError, match=rf"cannot lower a {message} lhs broadcast"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    @pytest.mark.parametrize(
         ("rhs_kind", "tensor_factory", "tile_factory"),
         [
             (

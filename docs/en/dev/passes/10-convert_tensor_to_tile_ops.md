@@ -137,6 +137,26 @@ When `tensor.slice` feeds into `tensor.matmul` or `tensor.matmul_acc`, the slice
 
 The demand is propagated **through** zero-copy metadata ops that declare `set_output_memory_inherit_input()` — `tensor.slice`, `tensor.view`, `tensor.reshape`, `tensor.reinterpret_view`, `tensor.set_validshape`. So an operand written as `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` still loads straight to Mat. An op that aliases its input's storage but omits that declaration breaks the chain: the operand materializes in Vec and needs a `tile.move` to Mat, which is a vector→cube boundary that flips an otherwise pure-CUBE InCore scope to `MIXED` and makes [`ExpandMixedKernel`](21-expand_mixed_kernel.md) split it into an AIC/AIV pair.
 
+## Binary Broadcast Lowering
+
+PTO's plain tile binary instructions do not materialize tensor broadcasting,
+even though tile type inference can represent the broadcast result shape.
+`ConvertTensorToTileOps` therefore selects the corresponding hardware
+broadcast primitive for generic `add`, `sub`, and `mul` tensor operations:
+
+| Tensor operand shapes | Tile lowering |
+| --- | --- |
+| `[M,N] op [M,N]` | `tile.{op}` |
+| `[M,N] op [M,1]` | `tile.row_expand_{op}` |
+| `[M,N] op [1,N]` | `tile.col_expand_{op}` |
+
+For commutative `add` and `mul`, a narrow left operand is reordered before
+lowering. Noncommutative operations decline a narrow-left form when the PTO
+primitive can only represent `matrix op broadcast_vector`; reversing operands
+would silently change semantics. This distinction is important at mixed
+cube/vector boundaries: a cube-produced `[M,N]` tile plus an external `[1,N]`
+bias must become `pto.tcolexpandadd`, not a plain `pto.tadd`.
+
 ## Transpose Lowering
 
 `tensor.transpose` lowers to a plain 3-arg **`tile.transpose(input, axis1, axis2)`**. The PTO `pto.ttrans` instruction needs a scratch workspace tile (same shape/dtype as the source), but that scratch is a pure codegen detail — not a semantic operand. [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) is the **sole owner** of scratch materialization: it emits the codegen-ready 4-arg form (`tile.create` + `tile.transpose(..., tmp)`) for both 2D and per-page >2D transposes, still before the memory allocator runs (so the scratch gets a real UB address). Keeping scratch out of the high-level op means `tensor.transpose` and the DSL `pl.tile.transpose(tile, axis1, axis2)` stay 1:1 with the semantic operation.

@@ -2,17 +2,16 @@
 
 **状态：** 可构建的 `C->V` 增量以及第一个精确的
 `C,C->V->C` dense-SwiGLU 增量已在 `PYPTO_AUTOFUSE_MIXED=1` 后实现。
-显式 dual-AIV FIFO lane bridge 现在按函数限定作用域并且字节精确：只改写目标
-AIV 函数，并给仅使用 pipe 的 AIV 函数增加私有 runtime lane 参数。PyPTO
-`74997b29` 的 silicon 运行确认了这两个 codegen 修复，但又暴露出两个独立的下游
-违约：C2V 允许读取 MemRef-less `tpop_from_aic` 的 writer 原地复用
-`tile.load` buffer；dense SwiGLU 未识别首个 matmul/后续 `matmul_acc`
-conditional 内的 reply pop，随后 unroll 将 pop 排到 projection push 之前。
-MemoryReuse 现在独立于 MemRef 跟踪 FIFO provenance，并在有无 `PassContext` 时
-一致应用 910B guard；`SkewCrossCorePipeline` 将两个 branch 中完全相同的协议视为
-一个逻辑 event，并将 path-dependent 协议降级为串行。完整 AutoFuse regression
-已闭合最终 IR 契约，但仍需 silicon 重跑后才能完成数值闭环。主机测试还验证了
-tensor 级等价性以及完整的
+显式 dual-AIV FIFO lane bridge 按函数限定作用域并且字节精确：只改写目标 AIV
+函数，并给仅使用 pipe 的 AIV 函数增加私有 runtime lane 参数。PyPTO `0c0e567e`
+的 silicon 运行确认了后续 MemoryReuse 与 FIFO 顺序修复：C2V 的 load/result
+分配互不重叠，dense SwiGLU 也以平衡的 push/pop/free 完整执行。不过两个正例尚未
+完成数值闭环。C2V artifact 暴露了另一个 model/emit 违约：通用
+`[M,N] + [1,N]` 被下沉为普通 `tile.add`，而模型计价的是 column expand，PTO
+也要求 `tile.col_expand_add`。`ConvertTensorToTileOps` 现在会物化该通用 column
+broadcast，完整 AutoFuse regression 也要求最终 AIV IR 使用该操作；仍需 silicon
+sentinel 验证。dense SwiGLU 虽不再 abort，但数值仍全部偏离，属于另一个尚未隔离的
+round-trip 缺陷。主机测试还验证了 tensor 级等价性以及完整的
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` 结构。各引擎内部
 的工作继续以同构 vector/cube 契约为准；本文只定义引擎边界处新增的契约。
 
@@ -139,6 +138,8 @@ down accumulator 是唯一的拓扑专用 cube 包装：若对每个 feature chu
 - 支持对称 `V->C`；
 - 支持完整多次往返 skew，并实现具有 key-chunk 循环和 `(m,l,O)` 状态的
   FlashAttention；
-- 在上述两个最终 IR 修复上重跑 910B 数值 sentinel，再完成流量、重叠和排序验证。
+- 在 C2V column-broadcast 修复上重跑 910B 数值 sentinel；
+- 用匹配 descriptor 的 C2V-only、V2C-only 与 round-trip control 隔离 dense
+  SwiGLU 的剩余数值缺陷，再完成流量、重叠和排序验证。
 
 mixed fusion 在 M1-M10 的计划/发射结构测试和芯片验证完成前默认保持关闭。

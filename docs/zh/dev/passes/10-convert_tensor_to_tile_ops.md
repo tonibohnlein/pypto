@@ -126,6 +126,24 @@ InCore、Spmd、Group 函数在本阶段被跳过 —— 它们已在阶段一 /
 
 该需求会**穿过**声明了 `set_output_memory_inherit_input()` 的零拷贝元数据 op 继续向上传播 —— `tensor.slice`、`tensor.view`、`tensor.reshape`、`tensor.reinterpret_view`、`tensor.set_validshape`。因此 `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` 这样的操作数仍然直接加载到 Mat。若某个别名输入存储的 op 漏掉该声明，传播链就会断开：操作数被物化到 Vec，再通过 `tile.move` 桥接到 Mat，而这是一个 vector→cube 边界，会把本应是纯 CUBE 的 InCore scope 判定为 `MIXED`，导致 [`ExpandMixedKernel`](21-expand_mixed_kernel.md) 将其拆分为 AIC/AIV 两个函数。
 
+## 二元广播下沉
+
+普通 PTO tile 二元指令不会物化 tensor 广播；即使 tile 类型推导能够表示广播后的
+结果 shape，也不能直接依赖普通指令。因此，`ConvertTensorToTileOps` 会为通用
+tensor `add`、`sub`、`mul` 操作选择对应的硬件广播原语：
+
+| Tensor 操作数 shape | Tile 下沉 |
+| --- | --- |
+| `[M,N] op [M,N]` | `tile.{op}` |
+| `[M,N] op [M,1]` | `tile.row_expand_{op}` |
+| `[M,N] op [1,N]` | `tile.col_expand_{op}` |
+
+对于可交换的 `add` 和 `mul`，若窄操作数位于左侧，下沉前会交换操作数。对于不可
+交换操作，若 PTO 原语只能表示 `matrix op broadcast_vector`，则拒绝窄左操作数；
+交换它们会静默改变语义。该区别在 cube/vector 混合边界尤其重要：cube 生成的
+`[M,N]` tile 与外部 `[1,N]` bias 相加时，必须生成 `pto.tcolexpandadd`，不能使用
+普通 `pto.tadd`。
+
 ## Transpose 下沉
 
 `tensor.transpose` 下沉为一个 3-arg 的 **`tile.transpose(input, axis1, axis2)`**。PTO 后端的 `pto.ttrans` 指令需要一个 scratch 工作 tile（与源 tile 同 shape/同 dtype），但该 scratch 纯属 codegen 细节，并非语义操作数。[`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) 是 scratch 物化的**唯一归属**：它为 2D 以及逐页 >2D 的 transpose 统一产出 codegen-ready 的 4-arg 形态（`tile.create` + `tile.transpose(..., tmp)`），且仍在内存分配器之前（scratch 仍能拿到真实 UB 地址）。把 scratch 从高层 op 中移除后，`tensor.transpose` 与 DSL `pl.tile.transpose(tile, axis1, axis2)` 都与语义操作保持 1:1。
