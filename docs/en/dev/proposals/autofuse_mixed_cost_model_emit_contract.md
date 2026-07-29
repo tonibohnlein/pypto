@@ -7,10 +7,14 @@ lane-addressing defect: simpler supplies the correct lane through
 `get_sub_block_id(args)`, while PTO-ISA's split FIFO reads the stale native
 `get_subblockid()` value and makes both lanes use lane 0. The backend now
 installs the documented explicit `TPipe::cons/prod.setEntryOffset` workaround
-for static, full-tile, one-pipe functions and fails closed otherwise. Both
-increments remain host-closed but require a silicon rerun at the fix revision
-before mixed mode is numerically closed. Host tests already close tensor-level
-equivalence and the full
+for static, full-tile, one-pipe functions and fails closed otherwise. The
+first workaround revision did not reach silicon: grouped C2V output counted
+both its AIC and AIV pipes, while dense SwiGLU had no explicit subblock-index
+op and therefore skipped the bridge. Injection is now scoped to the selected
+AIV function, and pipe-only AIV functions receive a private trailing runtime
+lane parameter. Both increments remain host-closed but require a silicon rerun
+at the corrected revision before mixed mode is numerically closed. Host tests
+already close tensor-level equivalence and the full
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` structure. A separate historical
 cube→vector visibility defect remains outside the homogeneous cube contract.
 The homogeneous vector and cube contracts remain authoritative for work inside each engine.
@@ -182,8 +186,12 @@ spmd(active_groups)
 `ExpandMixedKernel` constructs the GM-backed push/pop FIFO; `InjectGMPipeBuffer` supplies its
 workspace. A2A3 codegen explicitly separates each AIV lane's FIFO entry using
 the runtime subblock parameter because the native hardware subblock register is
-not programmed by simpler MIX dispatch. The outer mixed loop deliberately is
-not `ForKind::Pipeline`: a generic pipeline tag
+not programmed by simpler MIX dispatch. The bridge is derived from split FIFO
+operations, not from tensor indexing: it reuses the subblock parameter when
+one already exists and otherwise adds a wrapper-private parameter to the
+selected AIV PTOAS function. In grouped output, the sibling AIC pipe is outside
+that function-scoped rewrite. The outer mixed loop deliberately is not
+`ForKind::Pipeline`: a generic pipeline tag
 would multiply nested AutoTileL0 buffers. The independently running AIC/AIV functions and FIFO
 backpressure form the cross-engine wavefront. A complete host structural test verifies 48 logical
 regions -> 24 group launches x 2 trips, one push/pop/free in each physical loop, 4096-byte slots,

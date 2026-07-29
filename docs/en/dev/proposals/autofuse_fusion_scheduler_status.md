@@ -372,9 +372,12 @@ statistics update math remains deliberately algorithm-specific.
    `ExpandMixedKernel` → `InjectGMPipeBuffer` → `SkewCrossCorePipeline` emit.
    Their first device run exposed both AIV lanes aliasing FIFO lane 0 because
    PTO-ISA reads the stale native `get_subblockid()` under simpler MIX
-   dispatch. The backend now emits explicit runtime-lane `setEntryOffset`
-   calls for the supported static one-pipe surface. Rerun both positive cases,
-   then close traffic/overlap/ranking only after numeric correctness passes.
+   dispatch. A follow-up run showed that the first bridge revision either
+   counted both pipes in grouped AIC/AIV output or skipped pipe-only AIV code
+   without `tile.get_subblock_idx()`. The backend now scopes runtime-lane
+   `setEntryOffset` injection to the selected AIV function and adds a private
+   trailing lane parameter when needed. Rerun both positive cases, then close
+   traffic/overlap/ranking only after numeric correctness passes.
    Full flash attention still waits for whole-FIFO multi-round-trip skew.
 
 **Deferred (all decline *gracefully* today — correctness intact, not fused):** the ProblemBuilder

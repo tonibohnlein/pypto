@@ -7,8 +7,11 @@
 native `get_subblockid()`，导致两个 lane 都访问 lane 0。backend 现在为静态、
 完整 tile、单 pipe 函数安装文档规定的
 `TPipe::cons/prod.setEntryOffset` 显式 workaround，其他情况 fail closed。
-两个增量已通过主机闭环，但必须在修复 revision 上重新运行 silicon，mixed mode
-才能完成数值闭环。主机测试已验证 tensor 级等价性以及完整的
+第一版 workaround 未能到达 silicon：分组 C2V 输出同时统计 AIC 与 AIV 两个
+pipe，而 dense SwiGLU 没有显式 subblock-index op，因此跳过 bridge。现在注入按
+目标 AIV 函数限定作用域；仅使用 FIFO 的 AIV 函数会获得私有的尾部 runtime
+lane 参数。两个增量已通过主机闭环，但必须在修正 revision 上重新运行 silicon，
+mixed mode 才能完成数值闭环。主机测试已验证 tensor 级等价性以及完整的
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` 结构。各引擎内部
 的工作继续以同构 vector/cube 契约为准；本文只定义引擎边界处新增的契约。
 
@@ -112,9 +115,11 @@ AutoFuse 不发射原始跨核指令，也不附加 L0 plan。
 
 A2A3 codegen 使用 runtime subblock 参数显式分离两个 AIV lane 的 FIFO entry，
 因为 simpler MIX dispatch 不会设置 native hardware subblock register。当前
-workaround 只接受每个方向一种完整静态 tile size 的单 pipe 函数；dynamic/ragged
-transfer 或同一方向多种 size 会 fail closed，直到 PTO-ISA 或 launch path 提供
-正确的 native `get_subblockid()`。
+bridge 由 split FIFO op 驱动，而不是由 tensor 索引驱动：已有 subblock 参数时
+直接复用，否则只给选中的 AIV PTOAS 函数增加 wrapper 私有参数；分组输出中的
+AIC sibling pipe 不参与该重写。当前 workaround 只接受每个方向一种完整静态
+tile size 的单 pipe 函数；dynamic/ragged transfer 或同一方向多种 size 会 fail
+closed，直到 PTO-ISA 或 launch path 提供正确的 native `get_subblockid()`。
 
 down accumulator 是唯一的拓扑专用 cube 包装：若对每个 feature chunk 独立重放
 完整 `CubeSchedulePlan`，会错误地在每个 chunk 后 drain 到 GM。
