@@ -3089,7 +3089,8 @@ class TestAutoFuse:
             assert "pl.spmd(24" in planned_text, planned_text
             assert "pl.range(2" in planned_text, planned_text
             assert "pl.pipeline(2, stage=2" not in planned_text, planned_text
-            assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=8)" in planned_text, planned_text
+            assert "pl.split(pl.SplitMode.UP_DOWN)" in planned_text, planned_text
+            assert "pl.cross_core_slot(slot_num=8)" in planned_text, planned_text
             assert planned_text.count("pl.tensor.matmul(") == 1, planned_text
             assert planned_text.count("pl.tensor.add(") == 1, planned_text
 
@@ -3743,7 +3744,8 @@ class TestAutoFuse:
             supported_text = next(
                 f for _, f in supported.functions.items() if f.name == "epilogue"
             ).as_python()
-            assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=8)" in supported_text, supported_text
+            assert "pl.split(pl.SplitMode.UP_DOWN)" in supported_text, supported_text
+            assert "pl.cross_core_slot(slot_num=8)" in supported_text, supported_text
             assert "pl.tensor.matmul_acc(" in supported_text, supported_text
             supported_lowered = PassManager.get_strategy(
                 OptimizationStrategy.Default
@@ -3845,7 +3847,8 @@ class TestAutoFuse:
 
             planned = passes.auto_fuse()(Prog)
             text = next(f for _, f in planned.functions.items() if f.name == "epilogue").as_python()
-            assert "pl.split(pl.SplitMode.UP_DOWN, slot_num=8)" in text, text
+            assert "pl.split(pl.SplitMode.UP_DOWN)" in text, text
+            assert "pl.cross_core_slot(slot_num=8)" in text, text
             assert "pl.tensor.add(mm_mixed_tile, mm_mixed_tile)" in text, text
 
             namespace = {}

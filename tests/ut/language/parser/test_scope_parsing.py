@@ -512,7 +512,7 @@ class TestSpmdForLoop:
                 return out0, out1
 
         main_func = Prog.functions[list(Prog.functions.keys())[-1]]
-        spmd = self._unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        spmd = _unique_descendant(main_func.body, ir.SpmdScopeStmt)
         assert not any(isinstance(stmt, ir.InCoreScopeStmt) for stmt in spmd.body.stmts)
 
         Reparsed = pl.parse_program(Prog.as_python())
