@@ -8,7 +8,7 @@ On A2/A3 a fused cube+vector kernel (e.g. flash-decode `qk_pv`) round-trips thro
 
 The old approach unrolled these loops (`pl.pipeline(stage=F)`) and let `CanonicalizeIOOrder` cluster the cross-core ops — which produced *back-to-back* `tpop`s that serialised the consumer. `SkewCrossCorePipeline` instead software-pipelines the loop:
 
-- **Single round-trip, producer role** — exactly one `tpush` and one `tpop`, and the `tpush`'s backward slice does not feed the body via an SSA edge (the cube: `QK → tpush`, `tpop → SV`). The two halves are linked only by the in-order cross-core FIFO, so the producer runs **`D = max(2, stage-1)` iterations ahead** (cross-core defaults to depth-2): a `produce(start … start+(D-1)·step)` prologue, a `ForKind::Sequential` steady loop whose loop var `k` leads each group and pairs the group's `D` produces `produce(k+i·step)` with the trailing `D` consumes `consume(k-(D-i)·step)`, stepping `k` by `D·step` over `[start+D·step, start+trip·step)`, and a `consume(last D)` epilogue. The cube issues group k's `D` `QK`s while the vector runs group (k-D)'s `D` softmaxes. See [Skew depth](#skew-depth-stage) for `D` selection and the buffer-separation it buys.
+- **Single round trip, producer role** — one ordered `tpush` bundle and one logical `tpop`, and the push bundle's backward slice does not feed the body via an SSA edge (the cube: `QK → tpush`, `tpop → SV`). The logical pop may be top-level or appear identically in both arms of a top-level `IfStmt` (for example first `matmul` versus later `matmul_acc`). The two halves are linked only by the in-order cross-core FIFO, so the producer runs **`D = max(2, stage-1)` iterations ahead** (cross-core defaults to depth-2): a `produce(start … start+(D-1)·step)` prologue, a `ForKind::Sequential` steady loop whose loop var `k` leads each group and pairs the group's `D` produces `produce(k+i·step)` with the trailing `D` consumes `consume(k-(D-i)·step)`, stepping `k` by `D·step` over `[start+D·step, start+trip·step)`, and a `consume(last D)` epilogue. The cube issues group k's `D` `QK`s while the vector runs group (k-D)'s `D` softmaxes. See [Skew depth](#skew-depth-stage) for `D` selection and the buffer-separation it buys.
 - **Consumer role, or multi-round-trip** — the lead op feeds the body via SSA (the vector: the popped scores feed softmax), or there is more than one message per FIFO direction. The loop is **demoted to a plain `ForKind::Sequential` loop** (body unchanged). This drops the unroll's back-to-back `tpop` while preserving the in-order FIFO; cross-core overlap then comes from the *peer* core's producer skew putting each tile in the FIFO a step early, so the in-order `tpop` never blocks.
 
 Every **non-cross-core** pipeline loop (same-core GM→L1, L1→L0, nested matmul stage loops — no `tpush`/`tpop`) is left untouched for `LowerPipelineLoops` to replicate.
@@ -32,7 +32,7 @@ For a `ForStmt(kind=Pipeline, attrs={"pipeline_stages": F})` with `F > 1`:
 
 1. **Non-cross-core** — body lacks a `tpush`/`tpop` pair → left intact as `ForKind::Pipeline` for `LowerPipelineLoops` to replicate.
 2. **Cross-core** — body has both a `tpush` and a `tpop`. Find the lead (first cross-core op in program order), backward-slice it into the producer half, and classify:
-   - one `tpush` + one `tpop`, `carried` (lead-defined vars used by the body) empty, statically skewable → **producer skew** (prologue / Sequential steady loop / epilogue).
+   - one ordered push bundle + one logical `tpop`, `carried` (lead-defined vars used by the body) empty, statically skewable → **producer skew** (prologue / Sequential steady loop / epilogue). A top-level conditional counts as one logical event only when both branches have the same cross-core protocol.
    - otherwise — `carried` non-empty (consumer role), more than one `tpush`/`tpop` (multi-round-trip; skewing one message would reorder the in-order FIFO — a silent wrong-data bug the verifiers don't catch), dynamic bounds, or trip < 2 → **`DemoteToSequential`**.
 
 Either way a cross-core loop **always** leaves this pass as `ForKind::Sequential` with no `pipeline_stages` marker, so it never reaches `LowerPipelineLoops` or `CanonicalizeIOOrder` as a Pipeline body.
@@ -59,6 +59,7 @@ The **effective** depth needs `trip % D == 0` and `trip >= 2·D`; when the reque
 ## Constraints
 
 - Static bounds only for the skew (`start`, `stop`, `step` compile-time). Dynamic-bound cross-core loops are demoted to `ForKind::Sequential`.
+- Conditional cross-core traffic must be path-invariant. Identical branch traces are one logical event; a missing, additional, or differently ordered push/pop on any branch demotes the complete loop.
 - The producer-skew steady region is **kept as a loop** (not fully unrolled) so the matmul `Acc` double-buffering assigned by `AllocateMemoryAddr` still has a loop to alternate over.
 - A true consumer-side prefetch is intentionally **not** done: it would break codegen's `tpop → tfree` FIFO-slot tracking (keyed on SSA var identity, cannot cross an iter_arg) and a blocking `tpop` issued a full iteration early would simply stall.
 

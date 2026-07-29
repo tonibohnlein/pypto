@@ -1568,14 +1568,25 @@ using HazardInputs = AllocationHazardInputs;
 class HazardInputCollector : public IRVisitor {
  public:
   void VisitStmt_(const AssignStmtPtr& op) override {
-    if (GetTileTypeWithMemRef(op->var_->GetType())) {
-      if (auto call = As<Call>(op->value_)) {
-        std::vector<const Var*> input_vars;
-        for (const auto& arg : call->args_) {
-          if (auto v = As<Var>(arg)) input_vars.push_back(v.get());
-        }
-        // load_derived closure: defs precede uses in program order, so a view's
-        // source is already classified by the time we reach the view.
+    // Cross-core tpop results intentionally have no general-pool MemRef: the
+    // FIFO owns their storage.  Do not gate tpop provenance on
+    // GetTileTypeWithMemRef(), or the production split-AIV form becomes
+    // invisible here and MemoryReuse may coalesce a writer onto its tile.load
+    // input (the exact 910B load+tpop hazard this analysis prevents).
+    if (!As<TileType>(op->var_->GetType())) {
+      IRVisitor::VisitStmt_(op);
+      return;
+    }
+    if (auto call = As<Call>(op->value_)) {
+      std::vector<const Var*> input_vars;
+      for (const auto& arg : call->args_) {
+        if (auto v = As<Var>(arg)) input_vars.push_back(v.get());
+      }
+
+      // load_derived closure: defs precede uses in program order, so a view's
+      // source is already classified by the time we reach the view.  A load or
+      // its legal view descendants own/alias a MemRef, unlike a tpop value.
+      if (GetTileTypeWithMemRef(op->var_->GetType())) {
         if (IsOp(call, "tile.load")) {
           inputs_.load_derived.insert(op->var_.get());
         } else if (IsLegalTileViewOp(call->op_)) {
@@ -1586,12 +1597,26 @@ class HazardInputCollector : public IRVisitor {
             }
           }
         }
-        if (IsOp(call, "tile.tpop_from_aic")) tpop_vars_.insert(op->var_.get());
+      }
+
+      // Track the MemRef-less tpop value, plus any legal views of it, through
+      // to the first writer.  Only writer outputs with a real MemRef can
+      // participate in reuse, but recognizing the whole value chain here keeps
+      // this safety proof independent of how the split boundary is shaped.
+      if (IsOp(call, "tile.tpop_from_aic")) {
+        tpop_derived_.insert(op->var_.get());
+      } else if (IsLegalTileViewOp(call->op_)) {
         for (const Var* in : input_vars) {
-          if (tpop_vars_.count(in) != 0) {
-            inputs_.reads_tpop.insert(op->var_.get());
+          if (tpop_derived_.count(in) != 0) {
+            tpop_derived_.insert(op->var_.get());
             break;
           }
+        }
+      }
+      for (const Var* in : input_vars) {
+        if (tpop_derived_.count(in) != 0) {
+          inputs_.reads_tpop.insert(op->var_.get());
+          break;
         }
       }
     }
@@ -1602,7 +1627,7 @@ class HazardInputCollector : public IRVisitor {
 
  private:
   HazardInputs inputs_;
-  std::unordered_set<const Var*> tpop_vars_;
+  std::unordered_set<const Var*> tpop_derived_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1734,14 +1759,16 @@ class ForbidAliasCollector : public IRVisitor {
 
 /// True only for Ascend910B AIV split-mode functions, which need the load +
 /// tpop_from_aic in-place hazard guard.  All other backends / function kinds
-/// reuse buffers freely.  Defensive against unit-test contexts that run
-/// MemoryReuse without a configured backend.
+/// reuse buffers freely.  PassPipeline is also valid without an active
+/// PassContext, so backend dispatch must fall back to the configured Backend
+/// instead of changing the reuse result when IR dumping happens to add a
+/// context.
 bool NeedsLoadTpopHazardGuard(const FunctionPtr& func) {
   if (func->func_type_ != FunctionType::AIV) return false;
   if (!backend::BackendConfig::IsConfigured()) return false;
   const auto* ctx = PassContext::Current();
-  if (ctx == nullptr) return false;
-  if (!ctx->GetBackendHandler()->RequiresSplitLoadTpopWorkaround()) return false;
+  const auto* handler = ctx ? ctx->GetBackendHandler() : backend::BackendConfig::GetBackend()->GetHandler();
+  if (!handler->RequiresSplitLoadTpopWorkaround()) return false;
   // A split AIV function needs the guard. The split may be signalled either as a
   // function-level mode (single-mode / standalone kernels carry ``split``) or
   // ONLY as the mode-agnostic ``split_aiv`` marker — multi-mode explicit

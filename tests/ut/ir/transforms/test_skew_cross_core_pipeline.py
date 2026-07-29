@@ -251,6 +251,79 @@ class TestSkewCrossCorePipeline:
 
         ir.assert_structural_equal(_skew(Before), Expected)
 
+    def test_ordered_push_bundle_with_path_invariant_conditional_reply_skews(self):
+        """A reply pop in both arms of one IfStmt is one dynamic FIFO event.
+
+        Dense SwiGLU uses exactly this form to select the first ``matmul`` from
+        later ``matmul_acc`` updates.  Missing the nested pop misclassifies the
+        loop as same-core, lets LowerPipelineLoops unroll it, and can reorder
+        the replies ahead of the projection pushes.  Both branch protocols are
+        identical here, so the ordered two-push bundle remains skewable.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(strict_ssa=True)
+            def main(
+                self,
+                q: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Tensor[[64, 64], pl.FP32],
+            ):
+                for i in pl.pipeline(0, 4, 1, stage=2):
+                    qi: pl.Tile[[16, 64], pl.FP32] = pl.tile.load(q, [i * 16, 0], [16, 64])
+                    gate: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(qi, qi)
+                    up: pl.Tile[[16, 64], pl.FP32] = pl.tile.mul(qi, qi)
+                    pl.tile.tpush_to_aiv(gate, split=0)
+                    pl.tile.tpush_to_aiv(up, split=0)
+                    if i == 0:
+                        act0: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0)
+                        result0: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(act0, act0)
+                        pl.tile.store(result0, [i * 16, 0], out)
+                    else:
+                        act1: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0)
+                        result1: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(act1, act1)
+                        pl.tile.store(result1, [i * 16, 0], out)
+
+        text = ir.python_print(passes.skew_cross_core_pipeline()(Before))
+        assert "pl.pipeline(" not in text, text
+        steady = "for i in pl.range(2, 4, 2):"
+        assert steady in text, text
+        prologue = text[: text.index(steady)]
+        assert prologue.count("pl.tile.tpush_to_aiv(") == 4, prologue
+        assert "pl.tile.tpop_from_aiv(" not in prologue, prologue
+        assert text.index("pl.tile.tpush_to_aiv(") < text.index("pl.tile.tpop_from_aiv("), text
+
+    def test_path_dependent_conditional_reply_demotes(self):
+        """A conditional FIFO protocol must be identical on every path.
+
+        A pop in only one branch cannot be counted as one per iteration.  The
+        pass must preserve the body in a sequential loop rather than skewing
+        the push ahead and changing how many replies each iteration consumes.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(strict_ssa=True)
+            def main(
+                self,
+                q: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Tensor[[64, 64], pl.FP32],
+            ):
+                for i in pl.pipeline(0, 4, 1, stage=2):
+                    qi: pl.Tile[[16, 64], pl.FP32] = pl.tile.load(q, [i * 16, 0], [16, 64])
+                    pl.tile.tpush_to_aiv(qi, split=0)
+                    if i == 0:
+                        reply: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0)
+                        pl.tile.store(reply, [i * 16, 0], out)
+                    else:
+                        pl.tile.store(qi, [i * 16, 0], out)
+
+        text = ir.python_print(passes.skew_cross_core_pipeline()(Before))
+        assert "pl.pipeline(" not in text, text
+        assert "for i in pl.range(4):" in text, text
+        assert text.count("pl.tile.tpush_to_aiv(") == 1, text
+        assert text.count("pl.tile.tpop_from_aiv(") == 1, text
+
     def test_recomputable_scalar_carry_skews(self):
         """Producer loop whose produce half defines an ADDRESS SCALAR (``off``) that
         the consume half re-uses (K-load and V-load share the offset, like fa_fused's

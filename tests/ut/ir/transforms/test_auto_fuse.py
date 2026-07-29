@@ -3060,6 +3060,7 @@ class TestAutoFuse:
         """
         script = textwrap.dedent(
             """
+            import re
             import torch
             import pypto.language as pl
             from pypto import backend, ir, passes
@@ -3104,7 +3105,16 @@ class TestAutoFuse:
             expected = a @ b + bias
             assert torch.allclose(got, expected, rtol=1e-4, atol=1e-4), (got - expected).abs().max()
 
-            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            manager = PassManager.get_strategy(OptimizationStrategy.Default)
+            lowered = manager.run_passes(Prog)
+            # PassContext instruments (including IR dumping) must be
+            # observational only.  The production compile path may run this
+            # pipeline without an active context, while dump_ir creates one.
+            # In particular, the 910B load+TPOP safety guard must dispatch
+            # through the configured backend in both cases.
+            with passes.PassContext([]):
+                lowered_with_context = manager.run_passes(Prog)
+            ir.assert_structural_equal(lowered, lowered_with_context)
             text = lowered.as_python()
             assert "type=pl.FunctionType.Group" in text, text
             assert "type=pl.FunctionType.AIC" in text, text
@@ -3118,6 +3128,24 @@ class TestAutoFuse:
             assert "pl.tile.get_subblock_idx()" in text, text
             assert "subblock_idx * 16" in text, text
             assert "__gm_pipe_buffer" in text, text
+
+            # Ascend910B forbids a split-AIV writer that consumes both a
+            # tile.load result and a MemRef-less tpop_from_aic value from
+            # reusing the load buffer in-place.  This is the production form
+            # of the load+TPOP hazard, so guard the complete AutoFuse pipeline
+            # rather than only the hand-built MemoryReuse unit.
+            bias_load = next(
+                line for line in text.splitlines()
+                if "out__tile:" in line and "= pl.tile.load(" in line
+            )
+            add_out = next(
+                line for line in text.splitlines()
+                if "out__tile_1:" in line and "= pl.tile.add(" in line
+            )
+            bias_base = re.search(r"pl.MemRef\\((mem_vec_\\d+),", bias_load)
+            add_base = re.search(r"pl.MemRef\\((mem_vec_\\d+),", add_out)
+            assert bias_base and add_base, (bias_load, add_out)
+            assert bias_base.group(1) != add_base.group(1), (bias_load, add_out)
             """
         )
         env = os.environ.copy()
@@ -3334,6 +3362,30 @@ class TestAutoFuse:
             assert "pl.system.tfree_to_aiv(" in lowered_text, lowered_text
             assert "pl.tile.matmul(" in lowered_text, lowered_text
             assert "slot_num=4" in lowered_text, lowered_text
+
+            # The AIC reply pop sits under the first-matmul/matmul_acc branch.
+            # SkewCrossCorePipeline must still recognize the ordered
+            # push(gate), push(up), conditional-pop protocol.  If it misses the
+            # nested pop, LowerPipelineLoops unrolls the cross-core loop and
+            # CanonicalizeIOOrder moves all reply pops ahead of the pushes,
+            # making both lanes enter with a blocking pop (device deadlock).
+            aic_begin = lowered_text.index("def fused_0_aic(")
+            aiv_begin = lowered_text.index("def fused_0_aiv(")
+            aic_text = lowered_text[aic_begin:aiv_begin]
+            aiv_text = lowered_text[aiv_begin:]
+            assert "pl.pipeline(" not in aic_text, aic_text
+            steady_begin = aic_text.index("pl.range(32, 128, 32")
+            aic_prologue = aic_text[:steady_begin]
+            assert aic_prologue.count("pl.tile.tpush_to_aiv(") == 4, aic_prologue
+            assert "pl.tile.tpop_from_aiv(" not in aic_prologue, aic_prologue
+            assert aic_text.index("pl.tile.tpush_to_aiv(") < aic_text.index(
+                "pl.tile.tpop_from_aiv("
+            ), aic_text
+            assert "pl.pipeline(" not in aiv_text, aiv_text
+            assert "pl.range(0, 128, 16" in aiv_text, aiv_text
+            assert aiv_text.index("pl.tile.tpop_from_aic(") < aiv_text.index(
+                "pl.tile.tpush_to_aic("
+            ), aiv_text
             """
         )
         env = os.environ.copy()

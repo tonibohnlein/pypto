@@ -32,7 +32,7 @@ Gorder preserve lifetime/traffic. Silicon confirms one load for shared boundarie
 for `mul(x,x)`, normal transient lifetimes, safe topology declines, and P2/P4 correctness. Only the
 summed-versus-independent MTE2/MTE3 roof remains inconclusive; keep the conservative summed term.
 
-**Mixed host checkpoint (2026-07-13).** The solver now builds one immutable same-engine stage DAG
+**Mixed host checkpoint (2026-07-29).** The solver builds one immutable same-engine stage DAG
 and cube/vector transfer graph per mixed candidate subgraph. A stack-local `MixedSchedulePlan`
 derives grid, 24-group mapping, loop trips, skew mode, and separate model-granted versus
 implementable-overlap bits without entering `CostResult`; winning/forced plans are reconstructed
@@ -42,7 +42,10 @@ non-skewable topologies receive a serial sum. Tests expose the main roofline gap
 assigned one-per-group do not create a two-item loop on either group. Direct QK-to-softmax can
 reuse the exact P4 vector-stage descriptor, but full `C→V→C→V` attention remains serial/inadmissible
 in compiler mode—and its key-chunk loop remains unrepresentable—until whole-FIFO multi-round-trip
-skew and the second loop axis exist. Analytic mode retains the four-stage topology at a serial cost.
+skew and the second loop axis exist. C2V and dense SwiGLU now have full host emit regressions for
+function-scoped FIFO lane offsets, MemRef-less load/TPOP buffer separation, and path-invariant
+conditional replies. The `74997b29` silicon failures predate the latter two fixes; mixed remains
+default-off until their device sentinel passes.
 
 **Cube device checkpoint (2026-07-24).** Earlier pure-cube sweeps validated clamped overlap,
 multi-window/ragged K, split-K, retained panels, and low-precision recursive chains. A8 remains
@@ -53,8 +56,6 @@ exact opt-in. At `97136d97` / `789e9fdd`, forced FP32 split-K emits the new two-
 closes FP32 and BF16-input/FP32-output split plans, build-invariant boundary reuse, and distinct
 `A @ A` roles. No transferable split synchronization residual exists, so
 `cube_split_sync_cycles=0`; BF16-output narrowing and exact `b_trans` replay remain capability gaps.
-
----
 
 ## 1. Goal
 
@@ -370,14 +371,12 @@ statistics update math remains deliberately algorithm-specific.
 5. **Silicon-close mixed v1:** one-way `C->V` and exact dense
    `C,C->V->C` now have real pipeline-item descriptors and standard
    `ExpandMixedKernel` → `InjectGMPipeBuffer` → `SkewCrossCorePipeline` emit.
-   Their first device run exposed both AIV lanes aliasing FIFO lane 0 because
-   PTO-ISA reads the stale native `get_subblockid()` under simpler MIX
-   dispatch. A follow-up run showed that the first bridge revision either
-   counted both pipes in grouped AIC/AIV output or skipped pipe-only AIV code
-   without `tile.get_subblock_idx()`. The backend now scopes runtime-lane
-   `setEntryOffset` injection to the selected AIV function and adds a private
-   trailing lane parameter when needed. Rerun both positive cases, then close
-   traffic/overlap/ranking only after numeric correctness passes.
+   Function-scoped, byte-exact runtime lane offsets are confirmed in generated
+   code. The latest host revision additionally keeps C2V's loaded bias separate
+   from its MemRef-less TPOP writer and recognizes SwiGLU's conditional reply
+   before pipeline unrolling can reorder it ahead of the projection pushes.
+   Rerun both positive sentinels, then close traffic/overlap/ranking only after
+   numeric correctness passes.
    Full flash attention still waits for whole-FIFO multi-round-trip skew.
 
 **Deferred (all decline *gracefully* today — correctness intact, not fused):** the ProblemBuilder
@@ -492,17 +491,9 @@ The authoritative obligation table and validation ladder are in
 
 ## 9. Operational gotchas (don't relearn these)
 
-- **Build MAX 2 cores.** Use absolute build paths; a persistent `cd 3rdparty/pto-fusebox`
-  can mis-target the build.
-- **FORCE_PLAN is static-cached per process** → one force per fresh subprocess; the `group[0]` solver
-  log is misleading under force (prints the argmin, not the forced tile) — trust the emitted
-  `pl.spmd(N)` count.
-- **Nested-arg DSL** (`exp(sub(x,m))`) silently drops the inner op from the solver graph → misses P4 +
-  mis-costs. Write NAMED temps.
-- **Welford count column** must be derived from a reduction output (col-major), NOT `tensor.full`
-  (row-major → trips `ResolveBackendOpLayouts`' col-vector reshape → lowering crash).
-- **Remote access:** SSH is currently blocked; use the public HTTPS PTO Fusebox submodule and publish
-  it before the parent when both repositories change. NEVER push / open PRs without explicit order;
-  NEVER add AI co-author lines; never hack test expectations.
-- **Device runs:** use the 910B2 `device_wall effective_us` STRACE path; `benchmark()` hits error
-  507018. Fingerprint-gate on HEAD + PTO Fusebox hash first.
+- **Build MAX 2 cores.** Use absolute build paths; a persistent `cd 3rdparty/pto-fusebox` can mis-target the build.
+- **FORCE_PLAN is process-cached:** one force per fresh subprocess; trust emitted `pl.spmd(N)`, not the argmin `group[0]` log.
+- **Nested-arg DSL:** name inner temps; `exp(sub(x,m))` can drop the inner op from the solver graph.
+- **Welford count:** derive it from a col-major reduction output, not row-major `tensor.full`.
+- **Remote access:** use public HTTPS and publish Fusebox before its parent gitlink; never add AI co-authors or hack expectations.
+- **Device runs:** use 910B2 `device_wall effective_us`; `benchmark()` hits 507018. Fingerprint-gate parent and Fusebox first.

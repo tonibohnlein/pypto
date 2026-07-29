@@ -3928,9 +3928,10 @@ class TestAscend910BLoadTpopHazard:
     def _build_program():
         """down_next = tile.add(down_prev=tile.load, pipe_chunk=tile.tpop_from_aic).
 
-        Each tile starts in its own buffer (pre-MemoryReuse state).  ``down_prev``
-        and ``pipe_chunk`` are both last-used at the ``tile.add``, so without the
-        hazard guard MemoryReuse would in-place-reuse ``down_prev``'s buffer for
+        ``down_prev`` and ``down_next`` start in distinct general-pool buffers,
+        while the cross-core ``pipe_chunk`` is intentionally MemRef-less.
+        Both inputs are last-used at the ``tile.add``, so without the hazard
+        guard MemoryReuse would in-place-reuse ``down_prev``'s buffer for
         ``down_next``.
         """
 
@@ -3940,14 +3941,15 @@ class TestAscend910BLoadTpopHazard:
             def main(self, down: pl.InOut[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
                 mem_vec_0: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 mem_vec_1: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
-                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 down_prev: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_0, 0, 4096), pl.Mem.Vec] = (
                     pl.tile.load(down, [0, 0], [8, 128], [8, 128], target_memory=pl.Mem.Vec)
                 )
-                pipe_chunk: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_1, 0, 4096), pl.Mem.Vec] = (
-                    pl.tile.tpop_from_aic(split=1)
-                )
-                down_next: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_2, 0, 4096), pl.Mem.Vec] = (
+                # Cross-core tpop results intentionally own no general-pool
+                # MemRef.  The production mixed-kernel path has this exact
+                # shape; the hazard collector must still trace the value into
+                # the writer below.
+                pipe_chunk: pl.Tile[[8, 128], pl.FP32, pl.Mem.Vec] = pl.tile.tpop_from_aic(split=1)
+                down_next: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_1, 0, 4096), pl.Mem.Vec] = (
                     pl.tile.add(down_prev, pipe_chunk)
                 )
                 result: pl.Tensor[[16, 128], pl.FP32] = pl.tile.store(down_next, [0, 0], down)

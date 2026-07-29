@@ -2,16 +2,17 @@
 
 **状态：** 可构建的 `C->V` 增量以及第一个精确的
 `C,C->V->C` dense-SwiGLU 增量已在 `PYPTO_AUTOFUSE_MIXED=1` 后实现。
-首次 910B 运行暴露了二者共有的 dual-AIV FIFO lane 寻址缺陷：simpler 通过
-`get_sub_block_id(args)` 提供正确 lane，而 PTO-ISA 的 split FIFO 读取过期的
-native `get_subblockid()`，导致两个 lane 都访问 lane 0。backend 现在为静态、
-完整 tile、单 pipe 函数安装文档规定的
-`TPipe::cons/prod.setEntryOffset` 显式 workaround，其他情况 fail closed。
-第一版 workaround 未能到达 silicon：分组 C2V 输出同时统计 AIC 与 AIV 两个
-pipe，而 dense SwiGLU 没有显式 subblock-index op，因此跳过 bridge。现在注入按
-目标 AIV 函数限定作用域；仅使用 FIFO 的 AIV 函数会获得私有的尾部 runtime
-lane 参数。两个增量已通过主机闭环，但必须在修正 revision 上重新运行 silicon，
-mixed mode 才能完成数值闭环。主机测试已验证 tensor 级等价性以及完整的
+显式 dual-AIV FIFO lane bridge 现在按函数限定作用域并且字节精确：只改写目标
+AIV 函数，并给仅使用 pipe 的 AIV 函数增加私有 runtime lane 参数。PyPTO
+`74997b29` 的 silicon 运行确认了这两个 codegen 修复，但又暴露出两个独立的下游
+违约：C2V 允许读取 MemRef-less `tpop_from_aic` 的 writer 原地复用
+`tile.load` buffer；dense SwiGLU 未识别首个 matmul/后续 `matmul_acc`
+conditional 内的 reply pop，随后 unroll 将 pop 排到 projection push 之前。
+MemoryReuse 现在独立于 MemRef 跟踪 FIFO provenance，并在有无 `PassContext` 时
+一致应用 910B guard；`SkewCrossCorePipeline` 将两个 branch 中完全相同的协议视为
+一个逻辑 event，并将 path-dependent 协议降级为串行。完整 AutoFuse regression
+已闭合最终 IR 契约，但仍需 silicon 重跑后才能完成数值闭环。主机测试还验证了
+tensor 级等价性以及完整的
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` 结构。各引擎内部
 的工作继续以同构 vector/cube 契约为准；本文只定义引擎边界处新增的契约。
 
@@ -52,6 +53,9 @@ window、down feed window，以及跨 feature chunk 存活的 FP32 down accumula
 当前安全 skew 支持“一个有序 push bundle 后接一个回复 pop”。bundle 可以包含
 SwiGLU 的 gate/up 两个 push，但所有 push 必须位于第一个 pop 之前。pop 后再次
 push 表示第二次往返，必须降级为串行，防止改变 FIFO 顺序。
+若 reply 位于 conditional 内，两个 branch 必须具有完全相同的 FIFO 协议；
+首个 matmul/后续 `matmul_acc` 因而算作一个逻辑 pop。任何 path-dependent
+conditional 协议都降级为串行。
 
 `V` 与 `C` 表示最大同构 stage，而不是单个算子或物理 core。因此相连的
 `C->V->V->C` 源图会折叠为三 stage 的 `C->V->C` 协议；两个 vector 算子仍属于
@@ -120,6 +124,9 @@ bridge 由 split FIFO op 驱动，而不是由 tensor 索引驱动：已有 subb
 AIC sibling pipe 不参与该重写。当前 workaround 只接受每个方向一种完整静态
 tile size 的单 pipe 函数；dynamic/ragged transfer 或同一方向多种 size 会 fail
 closed，直到 PTO-ISA 或 launch path 提供正确的 native `get_subblockid()`。
+在 910B 上，如果 vector writer 同时消费 MemRef-less `tpop_from_aic`，MemoryReuse
+还必须让其输出与加载的 broadcast tile 使用不同 buffer；该决定不能随 IR dump
+是否创建 `PassContext` 而变化。
 
 down accumulator 是唯一的拓扑专用 cube 包装：若对每个 feature chunk 独立重放
 完整 `CubeSchedulePlan`，会错误地在每个 chunk 后 drain 到 GM。
@@ -132,6 +139,6 @@ down accumulator 是唯一的拓扑专用 cube 包装：若对每个 feature chu
 - 支持对称 `V->C`；
 - 支持完整多次往返 skew，并实现具有 key-chunk 循环和 `(m,l,O)` 状态的
   FlashAttention；
-- 使用最新 PTOAS 完成 dense 路径的 910B 正确性、流量、重叠和排序验证。
+- 在上述两个最终 IR 修复上重跑 910B 数值 sentinel，再完成流量、重叠和排序验证。
 
 mixed fusion 在 M1-M10 的计划/发射结构测试和芯片验证完成前默认保持关闭。

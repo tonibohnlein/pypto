@@ -155,6 +155,11 @@ MemoryReuse 掌管所有 buffer 合并决策，因此它从源头上阻止这种
 - writer 的定义 op 消费了 `tile.tpop_from_aic` 的值，**且**
 - 它将要原地复用的那个 buffer 成员（其 last use 正是该 writer 的定义语句）是 load 派生的。
 
+生产环境中的 `tile.tpop_from_aic` 结果有意不带 MemRef，因为其存储由跨核 FIFO
+管理。因此 provenance 遍历必须独立于通用 buffer 的 MemRef 所有权来跟踪 Tile
+SSA 值，然后只对真正参与复用的 writer/load 值应用 guard。无论是否存在活跃的
+`PassContext`，backend 分派结果都必须相同；开启 IR dump 不能改变 buffer 选择。
+
 该 guard 由 `BackendHandler::RequiresSplitLoadTpopWorkaround()`（仅 Ascend910B 为 true）以及函数为 split-AIV 这两个条件门控；在其他任何 backend / 函数类型下输入集合为空，复用行为不变。writer 仍可自由复用任何**非** load buffer —— 只有 load + tpop 的原地组合会被拒绝。（该 guard 此前由独立的 `LegalizePTOBufferReuse` pass 在事后拆分 buffer 来实现，现已并入 MemoryReuse。）
 
 ## 示例

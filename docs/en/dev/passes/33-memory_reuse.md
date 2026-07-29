@@ -169,6 +169,12 @@ MemoryReuse owns every buffer-coalescing decision, so it prevents the hazardous 
 - the writer's defining op consumes a `tile.tpop_from_aic` value, **and**
 - the buffer member it would reuse in place (whose last use is the writer's def statement) is load-derived.
 
+Production `tile.tpop_from_aic` results are intentionally MemRef-less because the cross-core FIFO owns
+their storage. The provenance walk therefore follows Tile SSA values independently of general-pool
+MemRef ownership, then applies the guard only to writer/load values that can actually participate in
+reuse. Backend dispatch is identical with or without an active `PassContext`; enabling IR dumping
+must never change the chosen buffers.
+
 The guard is gated by `BackendHandler::RequiresSplitLoadTpopWorkaround()` (true only for Ascend910B) and the function being split-AIV; on every other backend / function kind the inputs are empty and reuse behaviour is unchanged. The writer is still free to reuse any **non**-load buffer — only the load + tpop in-place combination is rejected. (This guard previously lived in a dedicated `LegalizePTOBufferReuse` pass that split the buffer after the fact; it now folds into MemoryReuse.)
 
 ## Example

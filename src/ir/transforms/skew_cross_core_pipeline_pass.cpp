@@ -187,15 +187,81 @@ class VarUseCollector : public IRVisitor {
   }
 };
 
+enum class CrossCoreEvent : uint8_t { Push, Pop };
+
+struct CrossCoreProtocolTrace {
+  bool valid = true;
+  std::vector<CrossCoreEvent> events;
+};
+
+/// Raw recursive presence collector.  This deliberately sees cross-core ops
+/// nested under an IfStmt: a loop with a branch-local reply is still a
+/// cross-core loop and must never fall through to LowerPipelineLoops.
+class CrossCorePresenceCollector : public IRVisitor {
+ public:
+  bool has_push = false;
+  bool has_pop = false;
+
+ protected:
+  void VisitExpr_(const CallPtr& op) override {
+    has_push |= IsOp(op, "tile.tpush_to_aiv") || IsOp(op, "tile.tpush_to_aic");
+    has_pop |= IsOp(op, "tile.tpop_from_aiv") || IsOp(op, "tile.tpop_from_aic");
+    IRVisitor::VisitExpr_(op);
+  }
+};
+
+/**
+ * @brief Recover the path-invariant cross-core protocol of one statement.
+ *
+ * A top-level IfStmt may contain one reply pop in each mutually-exclusive
+ * branch (the first-matmul vs matmul_acc update used by a loop-carried cube
+ * accumulator).  Syntactically that is two tpop calls, but every dynamic
+ * iteration performs exactly one.  Treat it as one logical Pop iff both branch
+ * traces are valid and identical.  Any path-dependent protocol, a nested loop
+ * carrying cross-core traffic, or more complicated compound statement is
+ * rejected; the enclosing pipeline is then demoted to Sequential rather than
+ * skewed.
+ */
+CrossCoreProtocolTrace TraceCrossCoreProtocol(const StmtPtr& stmt) {
+  if (IsTpushStmt(stmt)) return CrossCoreProtocolTrace{true, {CrossCoreEvent::Push}};
+  if (IsTpopStmt(stmt)) return CrossCoreProtocolTrace{true, {CrossCoreEvent::Pop}};
+
+  if (auto seq = As<SeqStmts>(stmt)) {
+    CrossCoreProtocolTrace result;
+    for (const auto& child : seq->stmts_) {
+      auto child_trace = TraceCrossCoreProtocol(child);
+      if (!child_trace.valid) return CrossCoreProtocolTrace{false, {}};
+      result.events.insert(result.events.end(), child_trace.events.begin(), child_trace.events.end());
+    }
+    return result;
+  }
+
+  if (auto iff = As<IfStmt>(stmt)) {
+    auto then_trace = TraceCrossCoreProtocol(iff->then_body_);
+    CrossCoreProtocolTrace else_trace;
+    if (iff->else_body_.has_value()) {
+      else_trace = TraceCrossCoreProtocol(*iff->else_body_);
+    }
+    if (!then_trace.valid || !else_trace.valid || then_trace.events != else_trace.events) {
+      return CrossCoreProtocolTrace{false, {}};
+    }
+    return then_trace;
+  }
+
+  // Cross-core traffic hidden under any other compound statement cannot be
+  // split safely into the producer/consumer halves this pass clones.
+  CrossCorePresenceCollector presence;
+  presence.VisitStmt(stmt);
+  if (presence.has_push || presence.has_pop) return CrossCoreProtocolTrace{false, {}};
+  return {};
+}
+
 /// True when @p body (after stripping any trailing yield) contains BOTH a
 /// cross-core tpush and a tpop — i.e. a bidirectional cross-core loop body.
 bool BodyHasCrossCorePair(const StmtPtr& body) {
-  bool has_push = false, has_pop = false;
-  for (const auto& s : FlattenToStmts(SplitBodyYield(body).first)) {
-    has_push |= IsTpushStmt(s);
-    has_pop |= IsTpopStmt(s);
-  }
-  return has_push && has_pop;
+  CrossCorePresenceCollector presence;
+  presence.VisitStmt(SplitBodyYield(body).first);
+  return presence.has_push && presence.has_pop;
 }
 
 /// Tag every tile-producing `Call` in @p body with one `(group, stage)`
@@ -418,8 +484,15 @@ class SkewCrossCoreMutator : public IRMutator {
     bool push_after_pop = false;
     std::vector<int> bundled_pushes;
     for (int i = 0; i < static_cast<int>(stmts.size()); ++i) {
-      bool push = IsTpushStmt(stmts[i]);
-      bool pop = IsTpopStmt(stmts[i]);
+      auto trace = TraceCrossCoreProtocol(stmts[i]);
+      // A compound statement whose dynamic paths do not share one protocol
+      // cannot be split into a producer or consumer half.  Demote before the
+      // ordinary pipeline unroller can reorder its FIFO operations.
+      if (!trace.valid || trace.events.size() > 1) {
+        return DemoteToSequential(op, op->start_, op->stop_, op->step_, body);
+      }
+      bool push = !trace.events.empty() && trace.events[0] == CrossCoreEvent::Push;
+      bool pop = !trace.events.empty() && trace.events[0] == CrossCoreEvent::Pop;
       if ((push || pop) && lead_idx < 0) {
         lead_idx = i;
       }
