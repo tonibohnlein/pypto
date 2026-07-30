@@ -504,9 +504,11 @@ void BindPass(nb::module_& m) {
              "becomes INT32→FP32→FP16). Already-native casts are left untouched.");
   passes.def("auto_fuse", &pass::AutoFuse,
              "Create the AutoFuse pass: automatic operator fusion + tile-size selection.\n\n"
-             "For each function marked with the `auto_fuse` attribute, extracts the\n"
-             "tensor-op DAG and runs PTO Fusebox to choose a\n"
-             "memory-reuse partition (fusion groups) and tile granularity.");
+             "`attrs={\"auto_fuse\": True}` lets PTO Fusebox partition the tensor-op\n"
+             "DAG and tile each group. `attrs={\"auto_tile\": True}` instead requires\n"
+             "one feasible, exactly replayable whole-function group and otherwise leaves\n"
+             "the function unchanged. The two true attributes are mutually exclusive; false values\n"
+             "are no-ops.");
   passes.def("auto_tile_matmul_l0", &pass::AutoTileMatmulL0,
              "Create a pass that auto-tiles static 2D tile.matmul family calls for L0\n\n"
              "The active backend's roofline chooser selects (m,n,k,stationarity,dbC). K-split\n"

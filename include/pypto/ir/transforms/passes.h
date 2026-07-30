@@ -593,11 +593,11 @@ Pass AutoTileMatmulL0();
 /**
  * @brief Create the AutoFuse pass — automatic operator fusion + tile sizing.
  *
- * For each function carrying the ``auto_fuse`` attribute, extracts the
- * tensor-op DAG and uses PTO Fusebox (linked from 3rdparty/pto-fusebox) to
- * choose a memory-reuse partition (fusion groups) and tile
- * granularity. v0 builds the problem and solves it; the IR rewrite that emits
- * InCoreScopeStmt regions from the schedule is the next increment.
+ * A true ``auto_fuse`` function attribute lets PTO Fusebox choose both the
+ * memory-reuse partition and each group's tile schedule. A true ``auto_tile``
+ * attribute instead requires the complete tensor-op DAG to form one feasible,
+ * exactly replayable group; otherwise the function is left unchanged. The two
+ * true attributes are mutually exclusive, and false values are no-ops.
  */
 Pass AutoFuse();
 

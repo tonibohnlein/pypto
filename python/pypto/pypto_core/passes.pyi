@@ -519,9 +519,11 @@ def legalize_tile_cast() -> Pass:
 def auto_fuse() -> Pass:
     """Create the AutoFuse pass: automatic operator fusion + tile-size selection.
 
-    For each function marked with the ``auto_fuse`` attribute, extracts the
-    tensor-op DAG and runs PTO Fusebox to choose a
-    memory-reuse partition (fusion groups) and tile granularity.
+    ``attrs={"auto_fuse": True}`` lets PTO Fusebox partition the tensor-op DAG
+    and tile each group. ``attrs={"auto_tile": True}`` instead requires one
+    feasible, exactly replayable whole-function group and otherwise leaves the
+    function unchanged. The two true attributes are mutually exclusive; false
+    values are no-ops.
     """
 
 def auto_tile_matmul_l0() -> Pass:

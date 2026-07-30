@@ -9,15 +9,16 @@
 
 """Unit tests for the AutoFuse pass (PTO-Fusebox-driven fusion + IR emit).
 
-AutoFuse intercepts the raw tensor-op DAG of a function marked
-``attrs={"auto_fuse": True}``, runs PTO Fusebox to choose a fusion
-partition + tile, and rewrites the body to realize that decision: a matmul or a
-run of fused pointwise ops becomes the solver's ``[w,h]`` output tiling distributed
-across cores (chunked-parallel ``AutoInCore`` scopes — k-pipelined per tile for
-matmul, the whole op chain replayed per tile with intermediates on-chip for
-pointwise), and two chained matmuls the solver groups together likewise fuse into
-one kernel. The Outline/Convert/Tile pipeline then lowers each scope to a cube
-(AIC) or vector (AIV) kernel.
+AutoFuse intercepts the raw tensor-op DAG of a function marked with either
+``attrs={"auto_fuse": True}`` or ``attrs={"auto_tile": True}``. ``auto_fuse``
+lets PTO Fusebox choose a fusion partition and tile, while ``auto_tile`` requires
+one feasible whole-function group. The pass rewrites the body to realize that
+decision: a matmul or a run of fused pointwise ops becomes the solver's ``[w,h]``
+output tiling distributed across cores (chunked-parallel ``AutoInCore`` scopes —
+k-pipelined per tile for matmul, the whole op chain replayed per tile with
+intermediates on-chip for pointwise), and two chained matmuls the solver groups
+together likewise fuse into one kernel. The Outline/Convert/Tile pipeline then
+lowers each scope to a cube (AIC) or vector (AIV) kernel.
 """
 
 import json
@@ -45,6 +46,113 @@ from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 class TestAutoFuse:
     """AutoFuse solver-driven fusion + emit."""
+
+    def test_false_schedule_attributes_are_noops(self):
+        """Explicit False attributes do not opt a function into scheduling."""
+
+        @pl.program
+        class Before:
+            @pl.function(attrs={"auto_fuse": False})
+            def fuse_false(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                y: pl.Tensor[[16, 64], pl.FP32] = pl.exp(x)
+                return y
+
+            @pl.function(attrs={"auto_tile": False})
+            def tile_false(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                y: pl.Tensor[[16, 64], pl.FP32] = pl.exp(x)
+                return y
+
+        ir.assert_structural_equal(passes.auto_fuse()(Before), Before)
+
+    def test_schedule_attributes_are_mutually_exclusive(self):
+        """A function cannot request partitioning and whole-function tiling together."""
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": True, "auto_tile": True})
+            def conflict(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                y: pl.Tensor[[16, 64], pl.FP32] = pl.exp(x)
+                return y
+
+        with pytest.raises(ValueError, match="enables both auto_fuse and auto_tile"):
+            passes.auto_fuse()(Prog)
+
+    def test_auto_tile_uses_one_whole_function_group(self, monkeypatch):
+        """auto_tile ignores partition overrides and emits one plan-driven group."""
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "none")
+        monkeypatch.delenv("PYPTO_AUTOFUSE_GENERIC_EMIT", raising=False)
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_tile": True})
+            def pointwise(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                a: pl.Tensor[[16, 64], pl.FP32] = pl.exp(x)
+                b: pl.Tensor[[16, 64], pl.FP32] = pl.add(a, x)
+                c: pl.Tensor[[16, 64], pl.FP32] = pl.mul(b, a)
+                return c
+
+        planned = passes.auto_fuse()(Prog)
+        func = next(f for _, f in planned.functions.items() if f.name == "pointwise")
+        body = func.as_python()
+        assert body.count("pl.spmd(") == 1, body
+        assert "pl.tensor.exp(" in body
+        assert "pl.tensor.add(" in body
+        assert "pl.tensor.mul(" in body
+        assert "auto_tile" not in func.attrs
+
+    def test_auto_tile_emits_one_cube_group(self, ascend_backend, monkeypatch):
+        """A whole-function matmul uses the plan-driven cube emitter."""
+        monkeypatch.delenv("PYPTO_AUTOFUSE_GENERIC_EMIT", raising=False)
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_tile": True})
+            def matmul(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                out: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                return out
+
+        planned = passes.auto_fuse()(Prog)
+        func = next(f for _, f in planned.functions.items() if f.name == "matmul")
+        body = func.as_python()
+        assert body.count("pl.spmd(") == 1, body
+        assert "pl.tensor.matmul(" in body
+        assert "auto_tile" not in func.attrs
+
+    def test_auto_tile_declines_when_whole_graph_is_not_plannable(self, monkeypatch):
+        """A graph that only admits a cube/vector cut remains unchanged."""
+        monkeypatch.delenv("PYPTO_AUTOFUSE_MIXED", raising=False)
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "none")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_tile": True})
+            def matmul_epilogue(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                bias: pl.Tensor[[1, 64], pl.FP32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mm: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
+                out: pl.Tensor[[64, 64], pl.FP32] = pl.add(mm, bias)
+                return out
+
+        ir.assert_structural_equal(passes.auto_fuse()(Prog), Prog)
 
     def test_single_matmul_emits_spmd_tiled_kernel(self, ascend_backend):
         """A lone 64x64 matmul becomes the grounded solver's SPMD output tiling.

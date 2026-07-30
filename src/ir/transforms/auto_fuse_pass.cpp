@@ -12,9 +12,10 @@
 // AutoFuse: automatic operator fusion + tile-size selection.
 //
 // The extractor builds PTO Fusebox's op+tensor DAG (`Problem`) from an
-// `auto_fuse`-marked function by reusing PyPTO's own dependency analysis
-// (`BuildStmtDependencyGraph`), which is Out/InOut/SSA-correct. This handles
-// both forms uniformly:
+// explicitly enabled function by reusing PyPTO's own dependency analysis
+// (`BuildStmtDependencyGraph`), which is Out/InOut/SSA-correct. `auto_fuse`
+// lets the solver partition the DAG, while `auto_tile` requires one feasible,
+// exactly replayable whole-function group. This handles both forms uniformly:
 //   * a flat tensor-level function (each AssignStmt is a tensor op), and
 //   * an orchestration kernel-call DAG (`c_v1 = self.kernel_add(a, b, c)`),
 //     where `tensor.create` allocations and Out-buffer args are skipped.
@@ -548,6 +549,36 @@ static bool ExactL0CostEnabled();
 // when the corresponding online emitter is active.
 static bool P4Enabled(::P4PatternKind kind);
 
+enum class AutoScheduleMode {
+  Disabled,
+  Fuse,
+  Tile,
+};
+
+AutoScheduleMode GetAutoScheduleMode(const FunctionPtr& func) {
+  const bool auto_fuse = func->GetAttr<bool>("auto_fuse", false);
+  const bool auto_tile = func->GetAttr<bool>("auto_tile", false);
+  CHECK_SPAN(!(auto_fuse && auto_tile), func->span_)
+      << "Function '" << func->name_
+      << "' enables both auto_fuse and auto_tile; choose auto_fuse for solver-selected "
+         "partitioning or auto_tile for one all-or-nothing whole-function group";
+  if (auto_tile) return AutoScheduleMode::Tile;
+  if (auto_fuse) return AutoScheduleMode::Fuse;
+  return AutoScheduleMode::Disabled;
+}
+
+const char* AutoScheduleModeName(AutoScheduleMode mode) {
+  switch (mode) {
+    case AutoScheduleMode::Disabled:
+      return "disabled";
+    case AutoScheduleMode::Fuse:
+      return "auto_fuse";
+    case AutoScheduleMode::Tile:
+      return "auto_tile";
+  }
+  INTERNAL_UNREACHABLE << "Internal error: unknown AutoScheduleMode";
+}
+
 // Defined below (~line 788); forward-declared so ProblemBuilder's A1 gate can read a 2D tensor shape.
 std::pair<int64_t, int64_t> Static2DShape(const TypePtr& type);
 
@@ -838,7 +869,7 @@ class ProblemBuilder {
   // CHECK: an auto_fuse-marked function with a symbolic dim must still compile.
   bool declined() const { return declined_; }
 
-  void Build(const FunctionPtr& func, const ProgramPtr& prog) {
+  void Build(const FunctionPtr& func, const ProgramPtr& prog, bool plan_driven_emit) {
     problem.fast_memory_capacity = kFastMemoryCapacity;
     // Topology + on-chip capacities from the configured backend's SoC (the safe
     // UB cap and 950 specs are picked up automatically; 910B defaults if none).
@@ -857,7 +888,7 @@ class ProblemBuilder {
     // tile; the legacy TilePointwiseGroup materializes the whole tile and would overflow UB). Pricing
     // per-task overhead for the legacy path would pick tiles that path cannot realize (a §0 contract
     // violation — price what you build), so charge it only when the streaming emit is active.
-    problem.per_task_overhead_cycles = GenericEmitEnabled() ? kPerTaskOverheadCycles : 0;
+    problem.per_task_overhead_cycles = plan_driven_emit ? kPerTaskOverheadCycles : 0;
     // Grounded pto-isa machine model (cycles + per-direction GiB/s bandwidths +
     // hierarchical L1<->L0 cube work). Activates the grounded cost path.
     problem.cube_freq_hz = kCubeFreqHz;
@@ -930,13 +961,13 @@ class ProblemBuilder {
     // round trip. Keep deeper mixed pipelines analytic-only until their FIFO
     // schedule and emit are implemented.
     problem.allow_model_ahead_mixed_multi_roundtrip = false;
-    problem.fuse_cube_vector = GenericEmitEnabled() && MixedEmitEnabled();
+    problem.fuse_cube_vector = plan_driven_emit && MixedEmitEnabled();
     problem.require_buildable_mixed = problem.fuse_cube_vector;
     // CubeSchedulePlan buildability: multi-matmul groups require a uniform
     // static region; a ragged lone matmul uses one split=1 clamped-overlap
     // region. In particular, do not price a ragged split-K grid whose atomic
     // edge regions would have multiple spatial owners.
-    problem.require_uniform_cube_dag_grid = GenericEmitEnabled();
+    problem.require_uniform_cube_dag_grid = plan_driven_emit;
     problem.use_hierarchical_cube_cost = ExactL0CostEnabled();
 
     // 1. In AND InOut params are graph-input tensors: both are READ by the body. An InOut param
@@ -1079,7 +1110,7 @@ class ProblemBuilder {
       op_stmts.push_back(stmt);
     }
 
-    if (GenericEmitEnabled()) {
+    if (plan_driven_emit) {
       std::unordered_map<const Stmt*, size_t> op_index;
       for (size_t i = 0; i < op_stmts.size(); ++i) op_index.emplace(op_stmts[i], i);
       for (P4Match& match : AnalyzeP4Patterns(dep.stmts)) {
@@ -1502,6 +1533,16 @@ struct SolverTile {
         cube_schedule(std::move(cube_schedule)),
         mixed_schedule(std::move(mixed_schedule)) {}
 };
+
+bool HasExactEmitContract(const ::Subgraph& subgraph, const SolverTile& tile) {
+  if (subgraph.is_mixed()) {
+    return tile.mixed_schedule.feasible && tile.mixed_schedule.emit_compatible;
+  }
+  if (subgraph.has_matmul()) {
+    return tile.cube_schedule.feasible && tile.cube_schedule.emit_compatible;
+  }
+  return tile.vector_stream.feasible;
+}
 
 static const char* VectorStreamKindName(::VectorStreamKind kind) {
   switch (kind) {
@@ -5314,7 +5355,8 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
                         const std::unordered_map<const Stmt*, size_t>& stmt_op,
                         const std::unordered_map<const Stmt*, size_t>& stmt_exec,
                         const std::unordered_map<size_t, size_t>& group_p4_match,
-                        const std::vector<P4Match>& p4_matches, bool* mixed_emit_failed) {
+                        const std::vector<P4Match>& p4_matches, bool plan_driven_emit,
+                        bool require_exact_group_emit, bool* emit_failed) {
   std::vector<StmtPtr> body_stmts;
   if (auto seq = As<SeqStmts>(body)) {
     body_stmts = seq->stmts_;
@@ -5400,6 +5442,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
     if (run_group >= 0 && !flushed_groups.insert(run_group).second) {
       LOG_INFO << "AutoFuse[generic]: WARNING group " << run_group
                << " emitted as multiple scopes (non-convex grouping -> reorder fell back; fidelity loss)";
+      if (require_exact_group_emit && emit_failed != nullptr) *emit_failed = true;
     }
     // Replay the group in the solver's EXECUTION ORDER (its depth-first pebbling order),
     // NOT the SSA/body order. That order is what the cost model evaluated the working-set
@@ -5423,7 +5466,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
       // Behind the flag, the generic tile-and-fuse driver gets first refusal; it handles
       // only what its implemented rules cover (increment 1: elementwise) and returns
       // nullopt otherwise, so we fall through to the legacy tiler. Flag off => never called.
-      if (GenericEmitEnabled()) {
+      if (plan_driven_emit) {
         const P4Match* p4_match = nullptr;
         auto pit = group_p4_match.find(static_cast<size_t>(run_group));
         if (pit != group_p4_match.end() && pit->second < p4_matches.size()) {
@@ -5434,6 +5477,14 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
           for (auto& s : *generic) {
             top.push_back(std::move(s));
           }
+          run.clear();
+          run_group = -1;
+          return;
+        }
+        if (require_exact_group_emit) {
+          LOG_INFO << "AutoTile[generic]: whole-function vector plan cannot be replayed exactly "
+                      "-> leaving function unchanged";
+          if (emit_failed != nullptr) *emit_failed = true;
           run.clear();
           run_group = -1;
           return;
@@ -5465,7 +5516,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
     }
     const long g = static_cast<long>(git->second);
     auto tile_it = stmt_tile.find(stmt.get());
-    if (GenericEmitEnabled() && MixedEmitEnabled() && tile_it != stmt_tile.end() &&
+    if (plan_driven_emit && MixedEmitEnabled() && tile_it != stmt_tile.end() &&
         tile_it->second.mixed_schedule.feasible) {
       const size_t mixed_group = static_cast<size_t>(g);
       if (mixed_plan_emitted.count(mixed_group) != 0) continue;
@@ -5480,13 +5531,18 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
             continue;
           }
         }
-        GenericDeclineB("MixedSchedulePlan cannot be replayed exactly; leaving the function unchanged",
-                        stmt->span_);
-        if (mixed_emit_failed != nullptr) *mixed_emit_failed = true;
+        if (require_exact_group_emit) {
+          LOG_INFO << "AutoTile[generic]: MixedSchedulePlan cannot be replayed exactly "
+                      "-> leaving function unchanged";
+        } else {
+          GenericDeclineB("MixedSchedulePlan cannot be replayed exactly; leaving the function unchanged",
+                          stmt->span_);
+        }
+        if (emit_failed != nullptr) *emit_failed = true;
         return body;
       }
     }
-    if (GenericEmitEnabled() && tile_it != stmt_tile.end() && tile_it->second.cube_schedule.feasible &&
+    if (plan_driven_emit && tile_it != stmt_tile.end() && tile_it->second.cube_schedule.feasible &&
         !tile_it->second.cube_schedule.matmuls.empty()) {
       const size_t cube_group = static_cast<size_t>(g);
       if (cube_plan_emitted.count(cube_group) != 0) continue;
@@ -5502,6 +5558,12 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
             cube_plan_emitted.insert(cube_group);
             continue;
           }
+        }
+        if (require_exact_group_emit) {
+          LOG_INFO << "AutoTile[generic]: CubeSchedulePlan cannot be replayed exactly "
+                      "-> leaving function unchanged";
+          if (emit_failed != nullptr) *emit_failed = true;
+          return body;
         }
         cube_fallback_groups.insert(cube_group);
         GenericDeclineB(
@@ -5539,7 +5601,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
         // Behind the flag, the generic MatMul rule gets first refusal (adds the A3/SR7
         // asserts); it returns nullopt if it can't own the group, so we fall back to the
         // legacy tiler. Flag off => never called.
-        if (GenericEmitEnabled()) {
+        if (plan_driven_emit) {
           tiled = EmitLoneMatmulGeneric(assign, tit->second, nm);
         }
         if (!tiled) {
@@ -5573,6 +5635,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
     }
   }
   flush();
+  if (emit_failed != nullptr && *emit_failed) return body;
   return SeqStmts::Flatten(std::move(top), body->span_);
 }
 
@@ -5841,6 +5904,41 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
   return sol;
 }
 
+std::optional<::Solution> SolveWholeFunction(const ::Problem& prob, const ::DAG& dag, const std::string& fn) {
+  std::vector<size_t> all_ops(prob.num_ops());
+  for (size_t i = 0; i < prob.num_ops(); ++i) all_ops[i] = i;
+
+  std::optional<::Subgraph> subgraph = ::Subgraph::create(prob, dag, all_ops);
+  if (!subgraph) {
+    LOG_INFO << "AutoTile[" << fn
+             << "]: whole tensor-op DAG is not one legal subgraph -> leaving function unchanged";
+    return std::nullopt;
+  }
+
+  const ::CostResult cost = subgraph->best_cost();
+  if (!cost.feasible || !std::isfinite(cost.latency)) {
+    LOG_INFO << "AutoTile[" << fn
+             << "]: whole tensor-op DAG has no feasible schedule -> leaving function unchanged";
+    return std::nullopt;
+  }
+
+  std::vector<::ScheduleStep> steps;
+  steps.push_back({std::move(*subgraph), cost.config, {}});
+  ::Solution solution(prob, dag, std::move(steps));
+  const ::Solution::ValidationResult validation = solution.validate();
+  if (!validation.valid || solution.num_steps() != 1 || !solution.step_cost(0).feasible ||
+      !std::isfinite(solution.total_latency())) {
+    LOG_INFO << "AutoTile[" << fn << "]: whole-function schedule failed validation"
+             << (validation.error.empty() ? std::string() : ": " + validation.error)
+             << " -> leaving function unchanged";
+    return std::nullopt;
+  }
+
+  LOG_INFO << "AutoTile[" << fn << "]: accepted one whole-function group, total latency "
+           << solution.total_latency();
+  return solution;
+}
+
 ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
   std::map<GlobalVarPtr, FunctionPtr, GlobalVarPtrLess> new_functions;
   bool any_change = false;
@@ -5872,14 +5970,14 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     }
   }
   for (const auto& [gvar, func] : prog->functions_) {
-    // v0 gate: only functions explicitly marked for auto-fusion. attrs_ is an
-    // ordered vector of (key, value) pairs, not a map.
-    const bool marked = std::any_of(func->attrs_.begin(), func->attrs_.end(),
-                                    [](const auto& kv) { return kv.first == "auto_fuse"; });
-    if (!marked) {
+    const AutoScheduleMode mode = GetAutoScheduleMode(func);
+    if (mode == AutoScheduleMode::Disabled) {
       new_functions.emplace(gvar, func);
       continue;
     }
+    // `auto_tile` is an explicit request for the plan-driven emitter. `auto_fuse`
+    // preserves the existing environment-controlled rollout policy.
+    const bool plan_driven_emit = mode == AutoScheduleMode::Tile || GenericEmitEnabled();
     // Normalize inline-returned compute exprs into named bindings so the solver graph and the emit
     // both see EVERY op (a bare `return pl.op(...)` is otherwise invisible to ProblemBuilder — its
     // operands look group-internal and get dropped, BUG-LN-2). No-op for already-named returns.
@@ -5890,7 +5988,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       wfunc = mut;
     }
     ProblemBuilder builder;
-    builder.Build(wfunc, prog);
+    builder.Build(wfunc, prog, plan_driven_emit);
     // Empty problem (no compute ops) or out-of-scope (non-tensor output / dynamic shape)
     // -> leave the function untouched for legacy lowering.
     if (builder.declined() || builder.problem.ops.empty()) {
@@ -5940,7 +6038,15 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
 
     // Solve, then print the fusion decision: each group's member ops + chosen tile.
     ::DAG dag = ::DAG::build(builder.problem);
-    ::Solution sol = SolveWithMergeOverride(builder.problem, dag, func->name_);
+    std::optional<::Solution> maybe_solution =
+        mode == AutoScheduleMode::Tile
+            ? SolveWholeFunction(builder.problem, dag, func->name_)
+            : std::optional<::Solution>(SolveWithMergeOverride(builder.problem, dag, func->name_));
+    if (!maybe_solution) {
+      new_functions.emplace(gvar, func);
+      continue;
+    }
+    ::Solution& sol = *maybe_solution;
     LOG_INFO << "AutoFuse[" << func->name_ << "]: solver -> " << sol.num_steps()
              << " fused group(s), total latency " << sol.total_latency();
     for (size_t s = 0; s < sol.num_steps(); ++s) {
@@ -5967,7 +6073,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     // A mixed group may only appear when the dedicated gate admitted the exact
     // C->V compiler subset.  Keep this as a Tier-B backstop against a solver
     // policy regression while the gate is off.
-    if (GenericEmitEnabled() && !MixedEmitEnabled()) {
+    if (plan_driven_emit && !MixedEmitEnabled()) {
       for (size_t s = 0; s < sol.num_steps(); ++s) {
         bool has_cube = false, has_vector = false;
         const auto& gops = sol.step(s).subgraph.ops();
@@ -6015,6 +6121,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     std::unordered_map<const Stmt*, size_t> stmt_exec;      // solver's per-group pebbling order
     std::unordered_map<size_t, size_t> group_p4_match;      // solver group -> shared semantic descriptor
     std::map<FlatSet<size_t>, size_t> p4_match_by_ops;
+    bool plan_replay_failed = false;
     for (size_t i = 0; i < builder.problem.p4_patterns.size(); ++i) {
       p4_match_by_ops.emplace(builder.problem.p4_patterns[i].ops, i);
     }
@@ -6089,6 +6196,15 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                    << "' matched NO feasible candidate for group=" << s
                    << " -> using the solver argmin (experiment plan is NOT the one you forced)";
       }
+      if (mode == AutoScheduleMode::Tile) {
+        if (!HasExactEmitContract(sol.step(s).subgraph, tile)) {
+          LOG_INFO << "AutoTile[" << func->name_
+                   << "]: whole-function schedule has no exact emit contract "
+                      "-> leaving function unchanged";
+          plan_replay_failed = true;
+          break;
+        }
+      }
       for (size_t op_idx : sol.step(s).subgraph.ops()) {
         const Stmt* stmt = builder.op_stmts[op_idx];
         stmt_group[stmt] = s;
@@ -6109,11 +6225,16 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
         stmt_exec[builder.op_stmts[exec[pos]]] = pos;
       }
     }
+    if (plan_replay_failed) {
+      new_functions.emplace(gvar, func);
+      continue;
+    }
     auto new_func = MutableCopy(wfunc);
-    bool mixed_emit_failed = false;
-    new_func->body_ = EmitFusedScopes(wfunc->body_, stmt_group, stmt_tile, stmt_op, stmt_exec, group_p4_match,
-                                      builder.p4_matches, &mixed_emit_failed);
-    if (mixed_emit_failed) {
+    bool emit_failed = false;
+    new_func->body_ =
+        EmitFusedScopes(wfunc->body_, stmt_group, stmt_tile, stmt_op, stmt_exec, group_p4_match,
+                        builder.p4_matches, plan_driven_emit, mode == AutoScheduleMode::Tile, &emit_failed);
+    if (emit_failed) {
       new_functions.emplace(gvar, func);
       continue;
     }
@@ -6122,10 +6243,11 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     // param position, not by return value). No-op for functions that already
     // have an Out param or are called internally.
     MaybeLiftReturnToOutParam(new_func, called_funcs);
-    // Drop the marker once fused: the body is now an InCore-scoped kernel graph,
+    // Drop the active marker once scheduled: the body is now an InCore-scoped kernel graph,
     // not a flat tensor-op DAG, so the pass is idempotent (a second run no-ops).
+    const std::string active_marker = AutoScheduleModeName(mode);
     new_func->attrs_.erase(std::remove_if(new_func->attrs_.begin(), new_func->attrs_.end(),
-                                          [](const auto& kv) { return kv.first == "auto_fuse"; }),
+                                          [&](const auto& kv) { return kv.first == active_marker; }),
                            new_func->attrs_.end());
     new_functions.emplace(gvar, new_func);
     any_change = true;

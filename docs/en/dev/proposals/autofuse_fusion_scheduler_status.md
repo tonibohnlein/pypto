@@ -59,17 +59,18 @@ closes FP32 and BF16-input/FP32-output split plans, build-invariant boundary reu
 
 ## 1. Goal
 
-Build a pass that turns a function's **tensor-op DAG** into **fused, tiled SPMD kernels** — vector
-kernels on the Ascend 910B AIV cores and cube (matmul) kernels on the AIC cores — by:
+Turn a function's **tensor-op DAG** into tiled SPMD kernels on AIV vector and AIC cube cores. A true
+function attribute selects one mutually-exclusive policy:
 
-1. running **PTO Fusebox** (`3rdparty/pto-fusebox/`, linked as `solver_lib`) to **partition** the DAG
-   into convex groups (each group → one kernel) and choose each group's **tile / grid / split /
-   materialize-vs-stream**, and
-2. **emitting** each group as the tiled kernel the solver priced,
+1. `auto_fuse=True` lets **PTO Fusebox** partition the DAG into convex groups and schedule each;
+2. `auto_tile=True` (distinct from `AutoTileMatmulL0`) requires the complete DAG to be one feasible,
+   exactly replayable group and declines rather than inserting a partition or per-op fallback.
 
-such that **every cost-model term prices the algorithm the emit actually builds**. This last clause is
-the whole game (see §2). The pass is `src/ir/transforms/auto_fuse_pass.cpp`; it runs behind
-`PYPTO_AUTOFUSE_GENERIC_EMIT=1` (the generic emit). Exact canonical softmax P4 is default-on;
+Both policies emit the tile/grid/split/materialize-vs-stream algorithm the model priced. One group may
+still contain required protocol phases such as split-K first-partial and atomic-rest launches. False
+attributes are no-ops. The pass is `src/ir/transforms/auto_fuse_pass.cpp`; `auto_fuse`'s generic emit
+uses `PYPTO_AUTOFUSE_GENERIC_EMIT=1`, while explicit `auto_tile` requires that path directly. Exact
+canonical softmax P4 is default-on;
 `PYPTO_AUTOFUSE_P4=0` selects the cut fallback and `PYPTO_AUTOFUSE_P4=1` additionally enables the
 still-gated Welford layernorm path.
 
@@ -207,9 +208,9 @@ coverage close the remaining representational gaps on host without fitting AutoF
   described in [autofuse_schedule_visualization.md](autofuse_schedule_visualization.md).
 - **Build (MAX 2 cores):** `cmake --build build --parallel 2`;
   `cmake --build 3rdparty/pto-fusebox/build --target solver_lib -j2`.
-- **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 4`
-  (42 passed / 1 xfail — the xfail is #1908 chained-matmul lowering). Solver suite
-  `./3rdparty/pto-fusebox/build/tests/ascend_910b_test` (450 pass / 7 documented baseline failures). Numeric:
+- **Test:** `PYTHONPATH=$(pwd)/python python -m pytest tests/ut/ir/transforms/test_auto_fuse.py -q -n 2`
+  (72 passed). Solver suite
+  `./3rdparty/pto-fusebox/build/tests/ascend_910b_test` (533 passed / 0 failed). Numeric:
   `pypto.debug.torch_codegen(passes.auto_fuse()(Prog), run_all_spmd_blocks=True)` — write P4 DSL FULLY
   NAMED (nested args drop ops from the solver graph → miss P4).
 
