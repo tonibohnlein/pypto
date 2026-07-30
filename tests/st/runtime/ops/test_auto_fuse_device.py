@@ -23,9 +23,11 @@ TWO parts:
     reduction's *reduced* axis (currently guarded/declined in EmitFusedGroupGeneric).  These
     kernels do NOT use AutoFuse — they isolate the hardware-op semantics.
 
-  Part B — AutoFuse end-to-end on device.  Realistic fused-vector kernels (ragged pointwise,
-    softmax, RMSNorm, LayerNorm) compiled with ``attrs={"auto_fuse": True}`` and
-    ``PYPTO_AUTOFUSE_GENERIC_EMIT=1``, numerically verified against a torch reference on hardware.
+  Part B — AutoFuse and whole-function AutoTile end-to-end on device. Realistic fused-vector
+    kernels (ragged pointwise, softmax, RMSNorm, LayerNorm) compile with
+    ``attrs={"auto_fuse": True}``. AutoTile controls use ``attrs={"auto_tile": True}`` with
+    ``PYPTO_AUTOFUSE_GENERIC_EMIT`` unset and require the entire tensor DAG to lower as one group.
+    Both are numerically verified against a torch reference on hardware.
     The wide P4 cases enable ``PYPTO_AUTOFUSE_P4=1`` in the test itself and cover online softmax,
     Welford layernorm, and a scaled-softmax near miss that must take the ordinary cut path.
     A wide P2 case has an apply-only bias input, giving the profiler a direct phase-traffic check.
@@ -55,6 +57,9 @@ import pypto.language as pl
 import pytest
 import torch
 from harness.core.harness import ONBOARD_PLATFORMS, DataType, PTOTestCase, TensorSpec
+from pypto import backend as _backend
+from pypto import passes
+from pypto.backend import BackendType
 from pypto.runtime.runner import RunConfig
 
 # Silicon-appropriate tolerances. The device-free gate (torch_codegen) checks against EXACT fp32
@@ -296,6 +301,25 @@ def _p4_shifted_layernorm_input() -> torch.Tensor:
     return torch.randn(P4_M, P4_N, dtype=torch.float32) + P4_LN_SHIFT
 
 
+def _planned_autotile_entry(program: Any, entry_name: str) -> Any:
+    """Return one entry after the standalone whole-function AutoTile transform."""
+    _backend.reset_for_testing()
+    _backend.set_backend_type(BackendType.Ascend910B)
+    try:
+        planned = passes.auto_fuse()(program)
+    finally:
+        _backend.reset_for_testing()
+    return next(func for _, func in planned.functions.items() if func.name == entry_name)
+
+
+def _assert_one_autotile_group(case: PTOTestCase, entry_name: str) -> None:
+    """Assert that the system-test program uses one exact AutoTile SPMD group."""
+    func = _planned_autotile_entry(case.get_program(), entry_name)
+    body = func.as_python()
+    assert body.count("pl.spmd(") == 1, body
+    assert "auto_tile" not in func.attrs
+
+
 class AutoFuseRaggedPointwiseCase(PTOTestCase):
     """AutoFuse ragged pointwise [130,66]: c=a+1; d=c*2. Free-axis N padding, on device."""
 
@@ -364,6 +388,27 @@ class AutoFuseSoftmaxCase(PTOTestCase):
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         tensors["out"][:] = torch.softmax(tensors["x"], dim=1)
+
+
+class AutoTileSoftmaxCase(AutoFuseSoftmaxCase):
+    """Whole-function AutoTile softmax; all five tensor ops must remain one group."""
+
+    def get_name(self) -> str:
+        return "autotile_whole_softmax_256x128"
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_fuse": False, "auto_tile": True})
+            def sm(self, x: pl.Tensor[[SM_M, SM_N], pl.FP32]) -> pl.Tensor[[SM_M, SM_N], pl.FP32]:
+                m: pl.Tensor[[SM_M, 1], pl.FP32] = pl.row_max(x)
+                s: pl.Tensor[[SM_M, SM_N], pl.FP32] = pl.sub(x, m)
+                e: pl.Tensor[[SM_M, SM_N], pl.FP32] = pl.exp(s)
+                d: pl.Tensor[[SM_M, 1], pl.FP32] = pl.row_sum(e)
+                o: pl.Tensor[[SM_M, SM_N], pl.FP32] = pl.div(e, d)
+                return o
+
+        return Prog
 
 
 class AutoFuseRmsNormCase(PTOTestCase):
@@ -1415,6 +1460,25 @@ class AutoFusePtoIsaVectorFusionCase(PTOTestCase):
         tensors["out"][:] = torch.relu(tensors["x"] + 1.0) * 0.5
 
 
+class AutoTileVectorFusionCase(AutoFusePtoIsaVectorFusionCase):
+    """Whole-function AutoTile pointwise chain with no generic-emitter environment gate."""
+
+    def get_name(self) -> str:
+        return "autotile_whole_add_relu_mul_512x1024"
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_tile": True})
+            def fused(self, x: pl.Tensor[[512, 1024], pl.FP32]) -> pl.Tensor[[512, 1024], pl.FP32]:
+                biased: pl.Tensor[[512, 1024], pl.FP32] = pl.add(x, 1.0)
+                relu: pl.Tensor[[512, 1024], pl.FP32] = pl.maximum(biased, 0.0)
+                out: pl.Tensor[[512, 1024], pl.FP32] = pl.mul(relu, 0.5)
+                return out
+
+        return Prog
+
+
 class AutoFusePtoKernelsAbsCase(PTOTestCase):
     """PTO-Kernels ``kernel_abs.cpp`` analogue: one streamed TABS."""
 
@@ -1831,6 +1895,29 @@ class AutoFusePtoIsaChainGemmCase(PTOTestCase):
         tensors["out"][:] = intermediate @ tensors["d"]
 
 
+class AutoTileChainGemmCase(AutoFusePtoIsaChainGemmCase):
+    """Whole-function AutoTile cube chain with an L1-resident BF16 intermediate."""
+
+    def get_name(self) -> str:
+        return "autotile_whole_chain_gemm_bf16"
+
+    def get_program(self) -> Any:
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_tile": True})
+            def chain(
+                self,
+                a: pl.Tensor[[128, 256], pl.BF16],
+                b: pl.Tensor[[256, 128], pl.BF16],
+                d: pl.Tensor[[128, 256], pl.BF16],
+            ) -> pl.Tensor[[128, 256], pl.BF16]:
+                intermediate: pl.Tensor[[128, 128], pl.BF16] = pl.matmul(a, b)
+                out: pl.Tensor[[128, 256], pl.BF16] = pl.matmul(intermediate, d)
+                return out
+
+        return Prog
+
+
 class AutoFuseCubeMatmulKRingCase(PTOTestCase):
     """Pure-cube control for the four-window GM->L1 stage ring."""
 
@@ -2087,6 +2174,46 @@ class TestAutoFuseDevice:
     def test_autofuse_fork(self, test_runner, platform):
         result = test_runner.run(AutoFuseForkCase(platform=platform))
         assert result.passed, f"AutoFuse multi-sink fork [256,256] mismatch on device: {result.error}"
+
+    # -- Part B2: whole-function AutoTile end-to-end --
+    #
+    # FORCE_MERGE=none is deliberately hostile: AutoTile must ignore the
+    # partition override, form one exact group, and engage the plan-driven
+    # emitter even though PYPTO_AUTOFUSE_GENERIC_EMIT is absent.
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autotile_whole_vector_chain(self, test_runner, platform, monkeypatch):
+        monkeypatch.delenv("PYPTO_AUTOFUSE_GENERIC_EMIT", raising=False)
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "none")
+        case = AutoTileVectorFusionCase(platform=platform)
+        _assert_one_autotile_group(case, "fused")
+        result = test_runner.run(case)
+        assert result.passed, f"AutoTile whole vector chain mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autotile_whole_softmax(self, test_runner, platform, monkeypatch):
+        monkeypatch.delenv("PYPTO_AUTOFUSE_GENERIC_EMIT", raising=False)
+        monkeypatch.delenv("PYPTO_AUTOFUSE_P4", raising=False)
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "none")
+        case = AutoTileSoftmaxCase(platform=platform)
+        _assert_one_autotile_group(case, "sm")
+        result = test_runner.run(case)
+        assert result.passed, f"AutoTile whole softmax mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.platforms("a2a3")
+    def test_autotile_whole_cube_chain(self, test_runner, platform, monkeypatch):
+        monkeypatch.delenv("PYPTO_AUTOFUSE_GENERIC_EMIT", raising=False)
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "none")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_MIXED", "0")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_EXACT_L0_COST", "1")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_STRICT", "1")
+        case = AutoTileChainGemmCase(platform=platform, config=_BF16_CUBE_TOL)
+        _assert_one_autotile_group(case, "chain")
+        result = test_runner.run(case)
+        assert result.passed, f"AutoTile whole cube chain mismatch on device: {result.error}"
 
     # -- Part C: model-fragment experiments (transformer components) --
 
