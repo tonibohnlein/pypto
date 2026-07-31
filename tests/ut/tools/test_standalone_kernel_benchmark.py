@@ -176,6 +176,58 @@ GlobalTensor<
     assert result.pointers["v0"].required_elements == 8
 
 
+def test_physical_extent_analysis_resolves_ptoas_dynamic_shape_and_stride(generator: ModuleType):
+    cpp = """\
+int64_t rows = row_count;
+int64_t columns = column_count;
+int64_t outer_stride = rows * row_stride;
+pto::Shape<1, 1, 1, -1, -1> v42 =
+    pto::Shape<1, 1, 1, -1, -1>(rows, columns);
+pto::Stride<-1, -1, -1, -1, 1> v43 =
+    pto::Stride<-1, -1, -1, -1, 1>(outer_stride, outer_stride, outer_stride, row_stride);
+GlobalTensor<
+    float,
+    pto::Shape<1, 1, 1, -1, -1>,
+    pto::Stride<-1, -1, -1, -1, 1>,
+    pto::Layout::ND> view = GlobalTensor<
+        float,
+        pto::Shape<1, 1, 1, -1, -1>,
+        pto::Stride<-1, -1, -1, -1, 1>,
+        pto::Layout::ND>(v0 + base_offset, v42, v43);
+"""
+
+    result = generator.analyze_pointer_extents(
+        cpp,
+        {"v0"},
+        {"row_count": 16, "column_count": 640, "row_stride": 5120, "base_offset": 128},
+    )
+
+    assert result.unresolved == ()
+    extent = result.pointers["v0"]
+    assert extent.required_elements == 77_568
+    assert extent.max_base_offset == 128
+    assert extent.shape == (1, 1, 1, 16, 640)
+    assert extent.stride == (81_920, 81_920, 81_920, 5120, 1)
+    assert extent.view_count == 1
+
+
+def test_physical_extent_analysis_rejects_unresolved_dynamic_shape(generator: ModuleType):
+    cpp = """\
+GlobalTensor<
+    float,
+    pto::Shape<1, 1, 1, -1, -1>,
+    pto::Stride<64, 64, 64, 8, 1>,
+    pto::Layout::ND> view = GlobalTensor<
+        float,
+        pto::Shape<1, 1, 1, -1, -1>,
+        pto::Stride<64, 64, 64, 8, 1>,
+        pto::Layout::ND>(v0, missing_shape, static_stride);
+"""
+
+    with pytest.raises(ValueError, match="missing runtime Shape object 'missing_shape'"):
+        generator.analyze_pointer_extents(cpp, {"v0"}, {})
+
+
 def test_physical_extent_analysis_bounds_nonmonotone_offsets(generator: ModuleType):
     cpp = """\
 for (int64_t i = 0; i < 10; i += 1) {

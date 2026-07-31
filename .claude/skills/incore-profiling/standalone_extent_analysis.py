@@ -22,7 +22,13 @@ _FOR_RE = re.compile(
 _VIEW_RE = re.compile(
     r"GlobalTensor<\s*(?P<ctype>[\w:]+)\s*,\s*pto::Shape<(?P<shape>[^>]*)>\s*,\s*"
     r"pto::Stride<(?P<stride>[^>]*)>[^>]*>\s+[A-Za-z_]\w*\s*=\s*"
-    r"GlobalTensor<[^(]*\(\s*(?P<base>.*?)\s*,",
+    r"GlobalTensor<[^(]*\(\s*(?P<base>.*?)\s*,\s*(?P<shape_object>[A-Za-z_]\w*)\s*,\s*"
+    r"(?P<stride_object>[A-Za-z_]\w*)\s*\)\s*;",
+    re.S,
+)
+_SHAPE_STRIDE_OBJECT_RE = re.compile(
+    r"pto::(?P<kind>Shape|Stride)<(?P<template>[^>]*)>\s+(?P<name>[A-Za-z_]\w*)\s*=\s*"
+    r"pto::(?P=kind)<[^>]*>\s*\((?P<arguments>[^;]*)\)\s*;",
     re.S,
 )
 _CPP_INTEGER_ATOM = r"(?:[A-Za-z_]\w*|-?\d+)"
@@ -225,15 +231,139 @@ def _bound_environment(
     return values
 
 
-def _parse_shape(raw: str) -> tuple[int, ...]:
-    dimensions = tuple(int(value.strip()) for value in raw.split(","))
+def _split_arguments(raw: str) -> tuple[str, ...]:
+    """Split the simple, possibly parenthesized C++ expressions in a constructor."""
+    if not raw.strip():
+        return ()
+    arguments = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(raw):
+        if character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth -= 1
+            if depth < 0:
+                raise ValueError(f"unbalanced constructor arguments: {raw!r}")
+        elif character == "," and depth == 0:
+            arguments.append(raw[start:index].strip())
+            start = index + 1
+    if depth != 0:
+        raise ValueError(f"unbalanced constructor arguments: {raw!r}")
+    arguments.append(raw[start:].strip())
+    if any(not argument for argument in arguments):
+        raise ValueError(f"empty constructor argument: {raw!r}")
+    return tuple(arguments)
+
+
+ShapeStrideObject = tuple[int, str, tuple[str, ...]]
+
+
+def _shape_stride_objects(cpp_text: str) -> dict[tuple[str, str], list[ShapeStrideObject]]:
+    objects: dict[tuple[str, str], list[ShapeStrideObject]] = {}
+    for match in _SHAPE_STRIDE_OBJECT_RE.finditer(cpp_text):
+        key = match.group("kind"), match.group("name")
+        objects.setdefault(key, []).append(
+            (match.start(), match.group("template"), _split_arguments(match.group("arguments")))
+        )
+    return objects
+
+
+def _resolve_dynamic_template(
+    raw: str,
+    *,
+    kind: str,
+    object_name: str,
+    objects: dict[tuple[str, str], list[ShapeStrideObject]],
+    view_position: int,
+    values: dict[str, Bound],
+) -> tuple[int, ...]:
+    template = tuple(int(value.strip()) for value in raw.split(","))
+    dynamic_positions = [index for index, value in enumerate(template) if value == -1]
+    if not dynamic_positions:
+        return template
+
+    declaration = next(
+        (
+            declaration
+            for declaration in reversed(objects.get((kind, object_name), []))
+            if declaration[0] < view_position
+        ),
+        None,
+    )
+    if declaration is None:
+        # Historical static code uses -1 as a sentinel stride for singleton
+        # dimensions. Preserve that representation; dynamic shapes, however,
+        # must always have a runtime Shape object that resolves every -1.
+        if kind == "Stride":
+            return template
+        raise ValueError(f"missing runtime {kind} object {object_name!r} for {raw!r}")
+
+    _, declared_template, arguments = declaration
+    if tuple(int(value.strip()) for value in declared_template.split(",")) != template:
+        raise ValueError(
+            f"GlobalTensor {kind} template disagrees with object {object_name!r}: "
+            f"{raw!r} vs {declared_template!r}"
+        )
+    if not arguments and kind == "Stride":
+        return template
+    if len(arguments) != len(dynamic_positions):
+        raise ValueError(
+            f"runtime {kind} object {object_name!r} has {len(arguments)} arguments for "
+            f"{len(dynamic_positions)} dynamic dimensions"
+        )
+
+    resolved = list(template)
+    for position, expression in zip(dynamic_positions, arguments):
+        lower, upper = _bounds(expression, values)
+        if lower <= 0:
+            raise ValueError(
+                f"runtime {kind} dimension may be non-positive in {object_name!r}: "
+                f"{expression!r} -> [{lower}, {upper}]"
+            )
+        # Taking each upper bound independently may over-allocate when runtime
+        # dimensions are correlated, but it cannot under-allocate the backing
+        # buffer used by the standalone correctness and timing harness.
+        resolved[position] = upper
+    return tuple(resolved)
+
+
+def _parse_shape(
+    raw: str,
+    object_name: str,
+    objects: dict[tuple[str, str], list[ShapeStrideObject]],
+    view_position: int,
+    values: dict[str, Bound],
+) -> tuple[int, ...]:
+    dimensions = _resolve_dynamic_template(
+        raw,
+        kind="Shape",
+        object_name=object_name,
+        objects=objects,
+        view_position=view_position,
+        values=values,
+    )
     if not dimensions or any(value <= 0 for value in dimensions):
         raise ValueError(f"invalid GlobalTensor shape: {raw!r}")
     return dimensions
 
 
-def _parse_stride(raw: str, shape: tuple[int, ...]) -> tuple[int, ...]:
-    stride = tuple(int(value.strip()) for value in raw.split(","))
+def _parse_stride(
+    raw: str,
+    shape: tuple[int, ...],
+    object_name: str,
+    objects: dict[tuple[str, str], list[ShapeStrideObject]],
+    view_position: int,
+    values: dict[str, Bound],
+) -> tuple[int, ...]:
+    stride = _resolve_dynamic_template(
+        raw,
+        kind="Stride",
+        object_name=object_name,
+        objects=objects,
+        view_position=view_position,
+        values=values,
+    )
     if len(stride) != len(shape):
         raise ValueError(f"GlobalTensor shape/stride rank mismatch: {shape} vs {stride}")
     invalid = [(dimension, step) for dimension, step in zip(shape, stride) if dimension > 1 and step <= 0]
@@ -261,12 +391,29 @@ def analyze_pointer_extents(
         Per-pointer physical spans and any unresolved base expressions.
     """
     values = _bound_environment(cpp_text, scalar_values, spmd_block_index)
+    objects = _shape_stride_objects(cpp_text)
     records: dict[str, PointerExtent] = {}
     unresolved: list[str] = []
 
     for match in _VIEW_RE.finditer(cpp_text):
-        shape = _parse_shape(match.group("shape"))
-        stride = _parse_stride(match.group("stride"), shape)
+        # EmitC SSA names may be reused in different functions. Use the latest
+        # matching declaration preceding this view so a later function's shape
+        # object cannot overwrite the matching local declaration.
+        shape = _parse_shape(
+            match.group("shape"),
+            match.group("shape_object"),
+            objects,
+            match.start(),
+            values,
+        )
+        stride = _parse_stride(
+            match.group("stride"),
+            shape,
+            match.group("stride_object"),
+            objects,
+            match.start(),
+            values,
+        )
         base = _clean_expression(match.group("base"))
         pointer_match = re.match(r"([A-Za-z_]\w*)\s*(?:\+\s*(.*))?$", base, re.S)
         if pointer_match is None or pointer_match.group(1) not in pointer_names:
