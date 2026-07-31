@@ -211,6 +211,77 @@ GlobalTensor<
     assert extent.view_count == 1
 
 
+def test_physical_extent_analysis_resolves_full_rank_ptoas_constructor_arguments(generator: ModuleType):
+    cpp = """\
+const int64_t one = 1;
+const int64_t rows = 16;
+const int64_t columns = 640;
+const int64_t row_stride = 5120;
+const int64_t outer_stride = 81920;
+pto::Shape<1, 1, 1, -1, -1> v42 =
+    pto::Shape<1, 1, 1, -1, -1>(one, one, one, rows, columns);
+pto::Stride<-1, -1, -1, -1, 1> v43 =
+    pto::Stride<-1, -1, -1, -1, 1>(outer_stride, outer_stride, outer_stride, row_stride, one);
+GlobalTensor<
+    float,
+    pto::Shape<1, 1, 1, -1, -1>,
+    pto::Stride<-1, -1, -1, -1, 1>,
+    pto::Layout::ND> view = GlobalTensor<
+        float,
+        pto::Shape<1, 1, 1, -1, -1>,
+        pto::Stride<-1, -1, -1, -1, 1>,
+        pto::Layout::ND>(v0 + base_offset, v42, v43);
+"""
+
+    result = generator.analyze_pointer_extents(cpp, {"v0"}, {"base_offset": 128})
+
+    assert result.unresolved == ()
+    extent = result.pointers["v0"]
+    assert extent.required_elements == 77_568
+    assert extent.shape == (1, 1, 1, 16, 640)
+    assert extent.stride == (81_920, 81_920, 81_920, 5120, 1)
+
+
+def test_physical_extent_analysis_validates_full_rank_static_constructor(generator: ModuleType):
+    cpp = """\
+const int64_t one = 1;
+const int64_t eight = 8;
+pto::Shape<1, 1, 1, 8, 1> v42 = pto::Shape<1, 1, 1, 8, 1>(one, one, one, eight, one);
+pto::Stride<8, 8, 8, 1, 1> v43 = pto::Stride<8, 8, 8, 1, 1>(eight, eight, eight, one, one);
+GlobalTensor<float, pto::Shape<1, 1, 1, 8, 1>, pto::Stride<8, 8, 8, 1, 1>, pto::Layout::ND> view =
+    GlobalTensor<float, pto::Shape<1, 1, 1, 8, 1>, pto::Stride<8, 8, 8, 1, 1>, pto::Layout::ND>(
+        v0, v42, v43);
+"""
+
+    result = generator.analyze_pointer_extents(cpp, {"v0"}, {})
+
+    assert result.unresolved == ()
+    assert result.pointers["v0"].required_elements == 8
+
+
+@pytest.mark.parametrize(
+    ("shape_argument", "message"),
+    [
+        ("two", "disagrees with static template"),
+        ("unknown", "cannot resolve runtime Shape argument"),
+    ],
+)
+def test_physical_extent_analysis_rejects_invalid_full_rank_static_argument(
+    generator: ModuleType, shape_argument: str, message: str
+):
+    cpp = f"""\
+const int64_t one = 1;
+const int64_t two = 2;
+pto::Shape<1, 1> v42 = pto::Shape<1, 1>(one, {shape_argument});
+pto::Stride<1, 1> v43 = pto::Stride<1, 1>(one, one);
+GlobalTensor<float, pto::Shape<1, 1>, pto::Stride<1, 1>, pto::Layout::ND> view =
+    GlobalTensor<float, pto::Shape<1, 1>, pto::Stride<1, 1>, pto::Layout::ND>(v0, v42, v43);
+"""
+
+    with pytest.raises(ValueError, match=message):
+        generator.analyze_pointer_extents(cpp, {"v0"}, {})
+
+
 def test_physical_extent_analysis_rejects_unresolved_dynamic_shape(generator: ModuleType):
     cpp = """\
 GlobalTensor<

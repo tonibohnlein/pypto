@@ -280,8 +280,6 @@ def _resolve_dynamic_template(
 ) -> tuple[int, ...]:
     template = tuple(int(value.strip()) for value in raw.split(","))
     dynamic_positions = [index for index, value in enumerate(template) if value == -1]
-    if not dynamic_positions:
-        return template
 
     declaration = next(
         (
@@ -292,6 +290,8 @@ def _resolve_dynamic_template(
         None,
     )
     if declaration is None:
+        if not dynamic_positions:
+            return template
         # Historical static code uses -1 as a sentinel stride for singleton
         # dimensions. Preserve that representation; dynamic shapes, however,
         # must always have a runtime Shape object that resolves every -1.
@@ -305,17 +305,40 @@ def _resolve_dynamic_template(
             f"GlobalTensor {kind} template disagrees with object {object_name!r}: "
             f"{raw!r} vs {declared_template!r}"
         )
+    if not arguments and not dynamic_positions:
+        return template
     if not arguments and kind == "Stride":
         return template
-    if len(arguments) != len(dynamic_positions):
+    if len(arguments) == len(template):
+        positioned_arguments = tuple(enumerate(arguments))
+    elif len(arguments) == len(dynamic_positions):
+        # Older hand-written fixtures and PTOAS revisions supplied only the
+        # dynamic operands. Keep accepting that unambiguous representation.
+        positioned_arguments = tuple(zip(dynamic_positions, arguments))
+    else:
         raise ValueError(
-            f"runtime {kind} object {object_name!r} has {len(arguments)} arguments for "
-            f"{len(dynamic_positions)} dynamic dimensions"
+            f"runtime {kind} object {object_name!r} has {len(arguments)} arguments; expected "
+            f"either rank {len(template)} or {len(dynamic_positions)} dynamic dimensions"
         )
 
     resolved = list(template)
-    for position, expression in zip(dynamic_positions, arguments):
-        lower, upper = _bounds(expression, values)
+    for position, expression in positioned_arguments:
+        try:
+            lower, upper = _bounds(expression, values)
+        except (KeyError, SyntaxError, ValueError) as error:
+            raise ValueError(
+                f"cannot resolve runtime {kind} argument {position} in {object_name!r}: "
+                f"{expression!r} ({error})"
+            ) from error
+        template_value = template[position]
+        if template_value != -1:
+            if (lower, upper) != (template_value, template_value):
+                raise ValueError(
+                    f"runtime {kind} argument {position} disagrees with static template in "
+                    f"{object_name!r}: {expression!r} -> [{lower}, {upper}], "
+                    f"expected {template_value}"
+                )
+            continue
         if lower <= 0:
             raise ValueError(
                 f"runtime {kind} dimension may be non-positive in {object_name!r}: "
