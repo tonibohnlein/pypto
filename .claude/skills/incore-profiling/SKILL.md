@@ -139,6 +139,25 @@ For a small workload where exact model values matter, use
 `--synthetic-inputs`. Import rejects mixed AIC/AIV, incomplete, non-contiguous,
 ambiguous, or truncated captures.
 
+For large workloads, capture exact dispatch scalars without copying tensor
+payloads. Run the parent once with `RunConfig.enable_dump_args=3` (or the
+equivalent harness `--dump-args 3`), then combine the resulting JSON-only
+manifest with bounded synthetic pointer inputs:
+
+```bash
+python .claude/skills/incore-profiling/gen_profiling_case.py \
+  --input <kernel.cpp> --testcase <name> --output-root <out> \
+  --run-mode npu --synthetic-inputs \
+  --dispatch-dump <args_dump.json> --func-id <id> --task-id <id>
+```
+
+Level 3 records every task's tensor metadata and scalar values, but emits no
+`args.bin`, so it does not reproduce the full-dump collector runaway on large
+models. The recovered values are the actual kernel ABI scalars after
+orchestration has evaluated loop indices and tensor reads. Pointer contents
+remain synthetic unless supplied separately; use `pointer_fills` or file inputs
+when data-dependent control tensors affect the path being measured.
+
 The driver verifies ABI, launch metadata, inputs, and captured outputs. It
 restores inputs per launch, times with `aclrtEventElapsedTime`, runs serial ABBA
 quartets, and writes `samples.tsv` plus `report.json`.

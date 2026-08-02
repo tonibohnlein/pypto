@@ -143,6 +143,7 @@ class DumpSelection:
     func_id: int
     task_id: str | None = None
     task_occurrence: int | None = None
+    include_tensor_payloads: bool = True
 
 
 @dataclass(frozen=True)
@@ -1242,7 +1243,8 @@ def _validate_input_source(
 ) -> None:
     """Validate the mutually-exclusive standalone input modes."""
     synthetic_inputs = synthetic_seed is not None
-    input_sources = sum((input_dir is not None, dump_selection is not None, synthetic_inputs))
+    dump_supplies_inputs = dump_selection is not None and dump_selection.include_tensor_payloads
+    input_sources = sum((input_dir is not None, dump_supplies_inputs, synthetic_inputs))
     if input_sources > 1:
         raise ValueError("input_dir, args_dump, and synthetic_inputs are mutually exclusive")
     if synthetic_inputs and run_mode != "npu":
@@ -1375,23 +1377,47 @@ def _extract_dump_scalar(task_entries: list[dict], param: Param, arg_index: int)
     raise ValueError(f"scalar ABI arg {arg_index} ({param.name}) has non-numeric value {value!r}")
 
 
+def _extract_dump_tensor_metadata(
+    task_entries: list[dict],
+    param: Param,
+    arg_index: int,
+    task_id: str,
+) -> str:
+    """Validate one metadata-only tensor record and return its ABI role."""
+    before = _dump_entry(task_entries, arg_index, kind="tensor", stage="before_dispatch")
+    after = _dump_entry(task_entries, arg_index, kind="tensor", stage="after_completion")
+    record = before or after
+    if record is None:
+        raise ValueError(f"dispatch dump is missing tensor ABI arg {arg_index} ({param.name})")
+    context = f"task {task_id} tensor arg {arg_index} ({param.name})"
+    _usable_dump_entry(record, context=context)
+    role = str(record.get("role"))
+    if role not in {"input", "output", "inout"}:
+        raise ValueError(f"{context} has invalid role {role!r}")
+    if role in {"input", "inout"} and before is None:
+        raise ValueError(f"{context} has no before_dispatch metadata")
+    if role in {"output", "inout"} and after is None:
+        raise ValueError(f"{context} has no after_completion metadata")
+    return role
+
+
 def _extract_dump_invocation(
     selection: DumpSelection,
     out_dir: Path,
     params: list[Param],
     counts: dict[str, int],
 ) -> tuple[dict[str, str], dict]:
-    """Materialize one exact pure-kernel invocation from a level-2 args dump."""
+    """Recover one pure-kernel invocation from a level-2 or level-3 dump."""
     manifest_path = selection.manifest
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     entries = manifest.get("args")
     bin_name = manifest.get("bin_file")
     if not isinstance(entries, list) or not entries:
         raise ValueError(f"args dump has no entries: {manifest_path}")
-    if not isinstance(bin_name, str) or not bin_name:
+    if selection.include_tensor_payloads and (not isinstance(bin_name, str) or not bin_name):
         raise ValueError("args dump has no payload file; capture with enable_dump_args=2")
-    bin_path = manifest_path.parent / bin_name
-    if not bin_path.is_file():
+    bin_path = manifest_path.parent / bin_name if isinstance(bin_name, str) else None
+    if selection.include_tensor_payloads and (bin_path is None or not bin_path.is_file()):
         raise FileNotFoundError(f"args-dump payload does not exist: {bin_path}")
 
     selected_task, task_entries = _select_dump_task(
@@ -1400,25 +1426,34 @@ def _extract_dump_invocation(
         task_id=selection.task_id,
         task_occurrence=selection.task_occurrence,
     )
-    payload = bin_path.read_bytes()
+    payload = bin_path.read_bytes() if bin_path is not None else b""
     scalar_values: dict[str, str] = {}
     roles: dict[str, str] = {}
 
     for arg_index, param in enumerate(params):
         if param.is_ptr:
-            counts[param.name], role = _extract_dump_tensor(
-                task_entries,
-                payload,
-                out_dir,
-                param,
-                arg_index,
-                selected_task,
-            )
+            if selection.include_tensor_payloads:
+                counts[param.name], role = _extract_dump_tensor(
+                    task_entries,
+                    payload,
+                    out_dir,
+                    param,
+                    arg_index,
+                    selected_task,
+                )
+            else:
+                role = _extract_dump_tensor_metadata(
+                    task_entries,
+                    param,
+                    arg_index,
+                    selected_task,
+                )
             roles[param.name] = role
         else:
             scalar_values[param.name] = _extract_dump_scalar(task_entries, param, arg_index)
 
     capture = {
+        "kind": "full" if selection.include_tensor_payloads else "metadata_only",
         "task_id": selected_task,
         "func_id": selection.func_id,
         "roles": roles,
@@ -1513,7 +1548,8 @@ def generate(  # noqa: PLR0912, PLR0913
             f"missing: {missing_scalars}"
         )
     extent_analysis: ExtentAnalysis | None = None
-    if run_mode == "npu" and not is_mixed and dump_selection is None:
+    dump_has_tensor_payloads = dump_selection is not None and dump_selection.include_tensor_payloads
+    if run_mode == "npu" and not is_mixed and not dump_has_tensor_payloads:
         extent_analysis = _infer_physical_extents(
             cpp_text,
             pto_text,
@@ -1672,7 +1708,19 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="args_dump.json from an enable_dump_args=2 run (small workloads only)",
     )
-    ap.add_argument("--func-id", type=int, help="kernel func_id to extract from --args-dump")
+    ap.add_argument(
+        "--dispatch-dump",
+        type=Path,
+        help=(
+            "metadata-only args_dump.json from enable_dump_args=3; recover exact dispatch "
+            "scalars while sourcing pointer inputs separately"
+        ),
+    )
+    ap.add_argument(
+        "--func-id",
+        type=int,
+        help="kernel func_id to extract from --args-dump or --dispatch-dump",
+    )
     ap.add_argument("--task-id", help="exact task dispatch ID to extract from --args-dump")
     ap.add_argument(
         "--task-occurrence",
@@ -1695,6 +1743,8 @@ def main(argv: list[str] | None = None) -> int:
             conflicting.append("--scalar")
         if args.args_dump is not None:
             conflicting.append("--args-dump")
+        if args.dispatch_dump is not None:
+            conflicting.append("--dispatch-dump")
         if args.block_dim != 1:
             conflicting.append("--block-dim")
         if conflicting:
@@ -1712,15 +1762,19 @@ def main(argv: list[str] | None = None) -> int:
         synthetic_seed = args.synthetic_seed if args.synthetic_inputs else None
         pointer_fills = {}
         recommended_outputs = []
+    if args.args_dump is not None and args.dispatch_dump is not None:
+        ap.error("--args-dump and --dispatch-dump are mutually exclusive")
     dump_selection = None
-    if args.args_dump is not None:
+    dump_manifest = args.args_dump or args.dispatch_dump
+    if dump_manifest is not None:
         if args.func_id is None:
-            ap.error("--func-id is required with --args-dump")
+            ap.error("--func-id is required with --args-dump or --dispatch-dump")
         dump_selection = DumpSelection(
-            args.args_dump,
+            dump_manifest,
             args.func_id,
             task_id=args.task_id,
             task_occurrence=args.task_occurrence,
+            include_tensor_payloads=args.args_dump is not None,
         )
     out_dir = generate(
         Path(args.input),

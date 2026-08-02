@@ -853,6 +853,7 @@ def test_generate_npu_case_from_exact_args_dump(
     manifest = json.loads((case / "standalone_manifest.json").read_text(encoding="utf-8"))
     assert manifest["capture"] == {
         "func_id": 4,
+        "kind": "full",
         "recommended_outputs": ["v0"],
         "roles": {"v0": "inout"},
         "task_id": "0x0000000100000007",
@@ -875,6 +876,118 @@ def test_generate_npu_case_from_exact_args_dump(
         expected_dir=case / "captured_expected",
     )
     assert len(set(hashes["v0"].values())) == 1
+
+
+def test_generate_npu_case_from_metadata_only_dispatch_dump(generator: ModuleType, tmp_path: Path):
+    kernel = _write_kernel(tmp_path)
+    dump_dir = tmp_path / "dispatch_dump"
+    dump_dir.mkdir()
+
+    def tensor(stage: str) -> dict:
+        return {
+            "task_id": "0x0000000100000007",
+            "func_id": [4],
+            "arg_index": 0,
+            "role": "inout",
+            "stage": stage,
+            "kind": "tensor",
+            "dtype": "float32",
+            "is_contiguous": True,
+            "shape": [8],
+            "strides": [1],
+            "start_offset": 0,
+            "bin_offset": 0,
+            "bin_size": 0,
+            "truncated": False,
+            "overwritten": False,
+        }
+
+    dump = {
+        "bin_file": None,
+        "args": [
+            tensor("before_dispatch"),
+            tensor("after_completion"),
+            {
+                "task_id": "0x0000000100000007",
+                "func_id": [4],
+                "arg_index": 1,
+                "role": "input",
+                "stage": "before_dispatch",
+                "kind": "scalar",
+                "value": 8,
+            },
+        ],
+    }
+    manifest_path = dump_dir / "args_dump.json"
+    manifest_path.write_text(json.dumps(dump), encoding="utf-8")
+
+    case = generator.generate(
+        kernel,
+        "metadata_sample",
+        tmp_path / "output",
+        "dav-c220",
+        run_mode="npu",
+        block_dim=8,
+        dump_selection=generator.DumpSelection(
+            manifest_path,
+            4,
+            include_tensor_payloads=False,
+        ),
+        synthetic_seed=19,
+    )
+
+    manifest = json.loads((case / "standalone_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["capture"] == {
+        "func_id": 4,
+        "kind": "metadata_only",
+        "recommended_outputs": ["v0"],
+        "roles": {"v0": "inout"},
+        "task_id": "0x0000000100000007",
+    }
+    assert manifest["input_source"] == {"kind": "synthetic", "seed": 19}
+    assert manifest["parameters"][0]["elements"] == 8
+    assert manifest["parameters"][1]["value"] == "8"
+    assert (case / "v0.bin").stat().st_size == 32
+
+
+def test_metadata_only_dispatch_dump_still_requires_pointer_inputs(generator: ModuleType, tmp_path: Path):
+    kernel = _write_kernel(tmp_path)
+    dump_dir = tmp_path / "dispatch_dump"
+    dump_dir.mkdir()
+    manifest_path = dump_dir / "args_dump.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "bin_file": None,
+                "args": [
+                    {
+                        "task_id": "0x7",
+                        "func_id": [4],
+                        "arg_index": 1,
+                        "role": "input",
+                        "stage": "before_dispatch",
+                        "kind": "scalar",
+                        "value": 8,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="require one input source"):
+        generator.generate(
+            kernel,
+            "metadata_without_inputs",
+            tmp_path / "output",
+            "dav-c220",
+            run_mode="npu",
+            dump_selection=generator.DumpSelection(
+                manifest_path,
+                4,
+                include_tensor_payloads=False,
+            ),
+        )
 
 
 def test_args_dump_requires_unambiguous_dispatch(generator: ModuleType, tmp_path: Path):
