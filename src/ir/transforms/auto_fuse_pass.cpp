@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <any>
 #include <array>
+#include <cinttypes>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -60,11 +61,14 @@
 #include "pypto/ir/pipe.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/core_affinity.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/l0_tile_chooser.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/stmt_dependency_analysis.h"
@@ -85,6 +89,40 @@ namespace pypto {
 namespace ir {
 namespace pass {
 namespace {
+
+std::string EncodeMixedFifoContract(const ::MixedSchedulePlan& plan, const Span& span) {
+  std::vector<cross_core_pipe::PlannedCrossCorePipe> pipes;
+  pipes.reserve(plan.fifos.size());
+  for (size_t index = 0; index < plan.fifos.size(); ++index) {
+    const auto& fifo = plan.fifos[index];
+    INTERNAL_CHECK_SPAN(fifo.slot_bytes > 0 && fifo.slot_count > 0, span)
+        << "AutoFuse mixed FIFO slot size and count must be positive";
+    INTERNAL_CHECK_SPAN(fifo.slot_bytes <= std::numeric_limits<int64_t>::max() / fifo.slot_count, span)
+        << "AutoFuse mixed FIFO reservation overflows int64: " << fifo.slot_bytes << " * " << fifo.slot_count;
+    INTERNAL_CHECK_SPAN(fifo.reserved_bytes == fifo.slot_bytes * fifo.slot_count, span)
+        << "AutoFuse mixed FIFO reservation disagrees with the physical ring: " << fifo.reserved_bytes
+        << " versus " << fifo.slot_bytes * fifo.slot_count;
+    INTERNAL_CHECK_SPAN(fifo.tensor <= static_cast<size_t>(std::numeric_limits<int64_t>::max()), span)
+        << "AutoFuse mixed FIFO tensor id is out of range: " << fifo.tensor;
+    INTERNAL_CHECK_SPAN(fifo.slot_count <= std::numeric_limits<int>::max(), span)
+        << "AutoFuse mixed FIFO slot count is out of range: " << fifo.slot_count;
+    INTERNAL_CHECK_SPAN(index <= static_cast<size_t>(std::numeric_limits<int>::max()), span)
+        << "AutoFuse mixed FIFO index is out of range: " << index;
+    const auto direction = fifo.direction == ::MixedTransferDirection::CubeToVector
+                               ? core_affinity::PipeDirection::C2V
+                               : core_affinity::PipeDirection::V2C;
+    // Dense mixed plans already carry stable identities.  The earlier single-
+    // boundary plan predates those fields; normalize it at this versioned
+    // compiler boundary so downstream passes never infer identity from a
+    // direction or collapse independent queues.
+    const int fallback_id = static_cast<int>(index);
+    const int pipe_id = fifo.pipe_id >= 0 ? fifo.pipe_id : fallback_id;
+    const int bundle = fifo.bundle >= 0 ? fifo.bundle : fallback_id;
+    pipes.push_back({static_cast<int64_t>(fifo.tensor), direction, fifo.valid_rows, fifo.valid_cols,
+                     fifo.slot_bytes, static_cast<int>(fifo.slot_count), pipe_id, bundle});
+  }
+  return cross_core_pipe::EncodePlannedCrossCorePipes(pipes, span);
+}
 
 // Hardware parameters. v0 hardcodes the Ascend 910B machine model (mirrors
 // `set_910b` in 3rdparty/pto-fusebox/test/ascend_910b_test.cpp); the solver derives
@@ -1569,8 +1607,12 @@ ExprPtr MakeTuple2(ExprPtr a, ExprPtr b, const Span& sp) {
 }
 
 ExprPtr AddIndexOffset(const ExprPtr& base, const ExprPtr& delta, const Span& sp) {
-  if (auto value = As<ConstInt>(base); value != nullptr && value->value_ == 0) return delta;
-  if (auto value = As<ConstInt>(delta); value != nullptr && value->value_ == 0) return base;
+  if (auto value = As<ConstInt>(base); value != nullptr && value->value_ == 0) {
+    return delta;
+  }
+  if (auto value = As<ConstInt>(delta); value != nullptr && value->value_ == 0) {
+    return base;
+  }
   return MakeAdd(base, delta, sp);
 }
 
@@ -1904,7 +1946,7 @@ static StmtPtr SpmdWrap(const VarPtr& t, std::vector<StmtPtr> body, const ExprPt
   // _split_spmd_for_loop_name_hints): the InCore kernel keeps the base name, the Spmd
   // wrapper gets the `_spmd` suffix -- so the print/parse round-trip stays structurally stable.
   auto kernel =
-      std::make_shared<InCoreScopeStmt>(std::nullopt, name, SeqStmts::Flatten(std::move(body), sp), sp);
+      std::make_shared<InCoreScopeStmt>(SplitMode::None, name, SeqStmts::Flatten(std::move(body), sp), sp);
   return std::make_shared<SpmdScopeStmt>(count, /*sync_start=*/false, name + "_spmd", kernel, sp);
 }
 
@@ -2168,8 +2210,8 @@ std::optional<std::vector<StmtPtr>> TileMatmul(const AssignStmtPtr& assign, cons
   if (num_m == 1 && num_n == 1 && num_acc_tiles == 1) {
     auto stmts = BuildTileMatmul(a, b, MakeIndex(0, sp), MakeIndex(0, sp), M, N, K, k_chunk, dtype, c_var,
                                  base, sp, k_pipeline_stages);
-    return std::vector<StmtPtr>{
-        std::make_shared<InCoreScopeStmt>(std::nullopt, name, SeqStmts::Flatten(std::move(stmts), sp), sp)};
+    return std::vector<StmtPtr>{std::make_shared<InCoreScopeStmt>(
+        SplitMode::None, name, SeqStmts::Flatten(std::move(stmts), sp), sp)};
   }
 
   // Output spatial tiling distributed ACROSS CORES via the standard chunk path:
@@ -4005,8 +4047,8 @@ std::optional<std::vector<StmtPtr>> TileChainedMatmul(const AssignStmtPtr& mm1, 
   // Whole output is one tile: the fused chain in one InCore kernel (T on-chip).
   if (num_m == 1 && num_n == 1) {
     auto stmts = build_chain(MakeIndex(0, sp), MakeIndex(0, sp), c_var);
-    return std::vector<StmtPtr>{
-        std::make_shared<InCoreScopeStmt>(std::nullopt, name, SeqStmts::Flatten(std::move(stmts), sp), sp)};
+    return std::vector<StmtPtr>{std::make_shared<InCoreScopeStmt>(
+        SplitMode::None, name, SeqStmts::Flatten(std::move(stmts), sp), sp)};
   }
 
   // Spatial output tiling distributed across cores (same chunked-parallel wrapper
@@ -4750,7 +4792,8 @@ std::optional<std::vector<StmtPtr>> EmitDenseSwiGluMlpGroup(
     const ::MixedFifoPlan& fifo = plan.fifos[index];
     const ::MixedTransferDirection expected =
         index < 2 ? ::MixedTransferDirection::CubeToVector : ::MixedTransferDirection::VectorToCube;
-    if (fifo.direction != expected || fifo.pipe_id != static_cast<int>(index) || fifo.slot_count != 4 ||
+    const auto expected_pipe_id = static_cast<decltype(fifo.pipe_id)>(index);
+    if (fifo.direction != expected || fifo.pipe_id != expected_pipe_id || fifo.slot_count != 4 ||
         fifo.slot_bytes <= 0 || fifo.reserved_bytes != fifo.slot_bytes * fifo.slot_count ||
         fifo.valid_rows != plan.m_partition.big || fifo.valid_cols != plan.dense_mlp.intermediate_chunk) {
       return decline("FIFO bundle does not match gate/up/activation tiles");
@@ -4962,10 +5005,10 @@ std::optional<std::vector<StmtPtr>> EmitDenseSwiGluMlpGroup(
       std::make_shared<AssignStmt>(block, registry.Create("tile.get_block_idx", {}, sp), sp),
       std::make_shared<AssignStmt>(acc_init, acc_create, sp), feature_loop, sink_assign};
   auto kernel = std::make_shared<InCoreScopeStmt>(
-      std::optional<SplitMode>{SplitMode::UpDown}, name, SeqStmts::Flatten(std::move(kernel_body), sp), sp,
-      std::vector<std::string>{},
+      SplitMode::UpDown, name, SeqStmts::Flatten(std::move(kernel_body), sp), sp, std::vector<std::string>{},
       std::vector<std::pair<std::string, std::any>>{
-          {"slot_num", static_cast<int>(plan.fifos.front().slot_count)}});
+          {"slot_num", static_cast<int>(plan.fifos.front().slot_count)},
+          {kAutoFuseMixedFifoPlanAttr, EncodeMixedFifoContract(plan, sp)}});
   auto scope = std::make_shared<SpmdScopeStmt>(MakeIndex(plan.loop.active_groups, sp), /*sync_start=*/false,
                                                name + "_spmd", kernel, sp);
   LOG_INFO << "AutoFuse[mixed-mlp-plan]: group '" << name
@@ -5199,11 +5242,13 @@ std::optional<std::vector<StmtPtr>> EmitMixedScheduleGroup(
   std::vector<StmtPtr> kernel_body{
       std::make_shared<AssignStmt>(block, registry.Create("tile.get_block_idx", {}, sp), sp), item_loop};
   auto kernel = std::make_shared<InCoreScopeStmt>(
-      std::optional<SplitMode>{SplitMode::UpDown}, name, SeqStmts::Flatten(std::move(kernel_body), sp), sp,
-      std::vector<std::string>{},
+      SplitMode::UpDown, name, SeqStmts::Flatten(std::move(kernel_body), sp), sp, std::vector<std::string>{},
       std::vector<std::pair<std::string, std::any>>{
-          {"slot_num", static_cast<int>(plan.fifos[0].slot_count)}});
+          {"slot_num", static_cast<int>(plan.fifos[0].slot_count)},
+          {kAutoFuseMixedFifoPlanAttr, EncodeMixedFifoContract(plan, sp)}});
   INTERNAL_CHECK(kernel->HasAttr("slot_num")) << "mixed InCore lost slot_num at construction";
+  INTERNAL_CHECK(kernel->HasAttr(kAutoFuseMixedFifoPlanAttr))
+      << "mixed InCore lost the solver-owned FIFO contract at construction";
   auto scope = std::make_shared<SpmdScopeStmt>(MakeIndex(plan.loop.active_groups, sp), /*sync_start=*/false,
                                                name + "_spmd", kernel, sp);
   LOG_INFO << "AutoFuse[mixed-plan]: group '" << name << "' emitted C->V grid=" << plan.m_partition.parts
@@ -5425,8 +5470,8 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
   std::unordered_set<const Stmt*> chain_done;  // chain tails already emitted with their head
   std::vector<StmtPtr> top;
   std::vector<StmtPtr> run;
-  long run_group = -1;
-  std::unordered_set<long> flushed_groups;  // DIAGNOSTIC: detect a group emitted as >1 scope
+  int64_t run_group = -1;
+  std::unordered_set<int64_t> flushed_groups;  // DIAGNOSTIC: detect a group emitted as >1 scope
   // Flush the accumulated run. A lone pointwise op gets the solver's [w,h]
   // cross-core tiling (TilePointwise); everything else is wrapped in one InCore
   // scope (multi-op groups, reductions, or pointwise that needs no tiling).
@@ -5499,8 +5544,8 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
         return;
       }
     }
-    top.push_back(
-        std::make_shared<InCoreScopeStmt>(std::nullopt, nm, SeqStmts::Flatten(run, scope_span), scope_span));
+    top.push_back(std::make_shared<InCoreScopeStmt>(SplitMode::None, nm, SeqStmts::Flatten(run, scope_span),
+                                                    scope_span));
     run.clear();
     run_group = -1;
   };
@@ -5514,7 +5559,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
       top.push_back(stmt);
       continue;
     }
-    const long g = static_cast<long>(git->second);
+    const int64_t g = static_cast<int64_t>(git->second);
     auto tile_it = stmt_tile.find(stmt.get());
     if (plan_driven_emit && MixedEmitEnabled() && tile_it != stmt_tile.end() &&
         tile_it->second.mixed_schedule.feasible) {
@@ -5625,7 +5670,7 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
       const auto op_it = stmt_op.find(stmt.get());
       const std::string fallback_name = "fused_" + std::to_string(g) + "_fallback_" +
                                         std::to_string(op_it != stmt_op.end() ? op_it->second : 0);
-      top.push_back(std::make_shared<InCoreScopeStmt>(std::nullopt, fallback_name, stmt, stmt->span_));
+      top.push_back(std::make_shared<InCoreScopeStmt>(SplitMode::None, fallback_name, stmt, stmt->span_));
     } else {  // other compute op: accumulate into the scoped run
       if (run_group != -1 && run_group != g) {
         flush();
@@ -6107,13 +6152,16 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     //       multi-group kernel with "g1:16,32,2"). The plan must be a feasible candidate.
     static const bool dump_plans = std::getenv("PYPTO_AUTOFUSE_DUMP_PLANS") != nullptr;
     static const char* force_env = std::getenv("PYPTO_AUTOFUSE_FORCE_PLAN");
-    long fw = -1, fh = -1, fs = -1, fpm = -1, fpn = -1, fg = -1;
+    int64_t fw = -1, fh = -1, fs = -1, fpm = -1, fpn = -1, fg = -1;
     if (force_env != nullptr) {
       const char* spec = force_env;
-      if (spec[0] == 'g') std::sscanf(spec, "g%ld:", &fg);  // optional group selector
+      if (spec[0] == 'g') std::sscanf(spec, "g%" SCNd64 ":", &fg);  // optional group selector
       if (const char* colon = std::strchr(spec, ':')) spec = colon + 1;
-      std::sscanf(spec, "%ld,%ld,%ld,%ld,%ld", &fw, &fh, &fs, &fpm, &fpn);
+      std::sscanf(spec, "%" SCNd64 ",%" SCNd64 ",%" SCNd64 ",%" SCNd64 ",%" SCNd64, &fw, &fh, &fs, &fpm,
+                  &fpn);
     }
+    const std::optional<size_t> forced_group =
+        fg < 0 ? std::nullopt : std::optional<size_t>(static_cast<size_t>(fg));
 
     std::unordered_map<const Stmt*, size_t> stmt_group;
     std::unordered_map<const Stmt*, SolverTile> stmt_tile;  // group's [w,h,k] tile, for matmul tiling
@@ -6152,6 +6200,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                       selected_mixed);
       if (dump_plans || force_env != nullptr) {
         bool forced_here = false;
+        const bool force_group_matches = !forced_group.has_value() || forced_group.value() == s;
         std::set<std::tuple<int64_t, int64_t, size_t, int64_t, int64_t>> seen_plans;  // dedup identical keys
         for (const auto& [pc, pr] : sol.step(s).subgraph.enumerate_plans()) {
           const bool candidate_feasible = pr.feasible && std::isfinite(pr.latency);
@@ -6161,9 +6210,9 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                      << " split=" << pr.parallel_split << " parts_m=" << pc.parts_m
                      << " parts_n=" << pc.parts_n << " cost=" << pr.latency;
           }
-          if (force_env != nullptr && candidate_feasible && !forced_here &&
-              (fg < 0 || static_cast<long>(s) == fg) && (fw < 0 || pc.w == fw) && (fh < 0 || pc.h == fh) &&
-              (fs < 0 || static_cast<long>(pr.parallel_split) == fs) && (fpm < 0 || pc.parts_m == fpm) &&
+          if (force_env != nullptr && candidate_feasible && !forced_here && force_group_matches &&
+              (fw < 0 || pc.w == fw) && (fh < 0 || pc.h == fh) &&
+              (fs < 0 || static_cast<int64_t>(pr.parallel_split) == fs) && (fpm < 0 || pc.parts_m == fpm) &&
               (fpn < 0 || pc.parts_n == fpn)) {
             const ::VectorStreamPlan forced_stream = !sol.step(s).subgraph.has_matmul()
                                                          ? sol.step(s).subgraph.vector_stream_plan(pc)
@@ -6191,10 +6240,11 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
                      << " parts_n=" << pc.parts_n << " cost=" << pr.latency << cube_policy;
           }
         }
-        if (force_env != nullptr && !forced_here && (fg < 0 || static_cast<long>(s) == fg))
+        if (force_env != nullptr && !forced_here && force_group_matches) {
           LOG_WARN << "AutoFuse[" << func->name_ << "]: FORCE_PLAN '" << force_env
                    << "' matched NO feasible candidate for group=" << s
                    << " -> using the solver argmin (experiment plan is NOT the one you forced)";
+        }
       }
       if (mode == AutoScheduleMode::Tile) {
         if (!HasExactEmitContract(sol.step(s).subgraph, tile)) {

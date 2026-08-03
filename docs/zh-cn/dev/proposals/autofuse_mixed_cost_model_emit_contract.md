@@ -2,16 +2,19 @@
 
 **状态：** 可构建的 `C->V` 增量以及第一个精确的
 `C,C->V->C` dense-SwiGLU 增量已在 `PYPTO_AUTOFUSE_MIXED=1` 后实现。
-显式 dual-AIV FIFO lane bridge 按函数限定作用域并且字节精确：只改写目标 AIV
-函数，并给仅使用 pipe 的 AIV 函数增加私有 runtime lane 参数。PyPTO `0c0e567e`
-的 silicon 运行确认了后续 MemoryReuse 与 FIFO 顺序修复：C2V 的 load/result
-分配互不重叠，dense SwiGLU 也以平衡的 push/pop/free 完整执行。不过两个正例尚未
-完成数值闭环。C2V artifact 暴露了另一个 model/emit 违约：通用
-`[M,N] + [1,N]` 被下沉为普通 `tile.add`，而模型计价的是 column expand，PTO
-也要求 `tile.col_expand_add`。`ConvertTensorToTileOps` 现在会物化该通用 column
-broadcast，完整 AutoFuse regression 也要求最终 AIV IR 使用该操作；仍需 silicon
-sentinel 验证。dense SwiGLU 虽不再 abort，但数值仍全部偏离，属于另一个尚未隔离的
-round-trip 缺陷。主机测试还验证了 tensor 级等价性以及完整的
+显式 dual-AIV FIFO lane bridge 按函数限定作用域、感知 pipe ID，并且字节精确：
+它只改写目标 AIV 函数，给仅使用 pipe 的 AIV 函数增加一个私有 runtime lane
+参数，并根据每个 pipe 端点自身的 tile 形状和 dtype 派生 entry offset。
+
+通用 `[M,N] + [1,N]` 修正为 `tile.col_expand_add` 后，silicon 已完成单向 C2V
+epilogue 闭环（连续 50/50 次通过，无漂移）。dense SwiGLU 尚未完成 silicon
+闭环：旧 lowering 把两个 C2V projection channel 和一个 V2C activation reply
+合并成单个双向 FIFO，而 primitive 诊断表明该合并协议下的 split-lane completion
+不安全。当前 host revision 修复了这一 model/emit 违约：版本化 solver descriptor
+会一直传递到 `ExpandMixedKernel`，并生成三个独立 physical pipe，保留精确 ID、
+字节宽度、slot 数、workspace 范围和 runtime lane offset。host 结构与 tensor
+replay 测试均通过，但三 pipe 协议仍需新的 910B sentinel。主机测试还验证了
+tensor 级等价性以及完整的
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` 结构。各引擎内部
 的工作继续以同构 vector/cube 契约为准；本文只定义引擎边界处新增的契约。
 
@@ -47,12 +50,20 @@ dense-SwiGLU 计划还记录输入、中间和输出维度，feature-chunk 循�
 window、down feed window，以及跨 feature chunk 存活的 FP32 down accumulator。
 这些是 mixed 组合事实，不是对同构 tiling 的第二份实现。
 
+获胜计划通过私有、版本化 FIFO descriptor 跨越 tensor-to-tile 边界。每个逻辑
+crossing 对应一个 record 和一个独立单向 physical queue。`ExpandMixedKernel`
+先校验方向、形状、字节数与顺序，再把该 record 的 ID 写到
+`tpush`/`tpop`/`tfree`。first-matmul 与 accumulate 两个互斥 branch 对同一
+activation 的重复使用共享 reply ID；gate/up 这类形状相同但 SSA source 不同的
+张量不会合并。expansion 完成后会删除该私有 descriptor。
+
 ## 3. 流水模式与忠实性
 
 当前安全 skew 支持“一个有序 push bundle 后接一个回复 pop”。bundle 可以包含
-SwiGLU 的 gate/up 两个 push，但所有 push 必须位于第一个 pop 之前。pop 后再次
+SwiGLU 的 gate/up 两个独立 pipe ID，但所有 push 必须位于第一个 pop 之前，
+且 op 顺序与 ID 都属于协议。pop 后再次
 push 表示第二次往返，必须降级为串行，防止改变 FIFO 顺序。
-若 reply 位于 conditional 内，两个 branch 必须具有完全相同的 FIFO 协议；
+若 reply 位于 conditional 内，两个 branch 必须具有完全相同的 FIFO op 与 ID；
 首个 matmul/后续 `matmul_acc` 因而算作一个逻辑 pop。任何 path-dependent
 conditional 协议都降级为串行。
 
@@ -119,10 +130,11 @@ AutoFuse 不发射原始跨核指令，也不附加 L0 plan。
 A2A3 codegen 使用 runtime subblock 参数显式分离两个 AIV lane 的 FIFO entry，
 因为 simpler MIX dispatch 不会设置 native hardware subblock register。当前
 bridge 由 split FIFO op 驱动，而不是由 tensor 索引驱动：已有 subblock 参数时
-直接复用，否则只给选中的 AIV PTOAS 函数增加 wrapper 私有参数；分组输出中的
-AIC sibling pipe 不参与该重写。当前 workaround 只接受每个方向一种完整静态
-tile size 的单 pipe 函数；dynamic/ragged transfer 或同一方向多种 size 会 fail
-closed，直到 PTO-ISA 或 launch path 提供正确的 native `get_subblockid()`。
+直接复用，否则只给选中的 AIV PTOAS 函数增加 wrapper 私有参数。每个 physical
+pipe ID 都与自身的 PTOAS `TPipe` declaration 匹配，并根据该端点自身 dtype 获得
+独立 consumer/producer offset；分组输出中的 AIC sibling 函数不参与该重写。
+planned path 支持多个不同静态 size/dtype 的 pipe；dynamic/ragged transfer 仍会
+fail closed，直到 launch path 提供等价的 native subblock ID 与动态端点契约。
 在 910B 上，如果 vector writer 同时消费 MemRef-less `tpop_from_aic`，MemoryReuse
 还必须让其输出与加载的 broadcast tile 使用不同 buffer；该决定不能随 IR dump
 是否创建 `PassContext` 而变化。
@@ -138,8 +150,7 @@ down accumulator 是唯一的拓扑专用 cube 包装：若对每个 feature chu
 - 支持对称 `V->C`；
 - 支持完整多次往返 skew，并实现具有 key-chunk 循环和 `(m,l,O)` 状态的
   FlashAttention；
-- 在 C2V column-broadcast 修复上重跑 910B 数值 sentinel；
-- 用匹配 descriptor 的 C2V-only、V2C-only 与 round-trip control 隔离 dense
-  SwiGLU 的剩余数值缺陷，再完成流量、重叠和排序验证。
+- 在新的三 independent-pipe dense SwiGLU lowering 上重跑 910B 数值 sentinel，
+  通过后再完成流量、重叠和排序验证。
 
 mixed fusion 在 M1-M10 的计划/发射结构测试和芯片验证完成前默认保持关闭。

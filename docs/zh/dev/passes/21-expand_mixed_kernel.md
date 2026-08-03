@@ -129,16 +129,10 @@ pipe（`pl.reserve_buffer`、`pl.{aic,aiv}_initialize_pipe` 与 `pl.tpush_to_aic
 
 仅对 **Cube→Vector** 方向（cube `tile.store` → vector `tile.load`）插入栅栏。AIC 侧的 `tpush` 直接发送被存储的 tile（与常规边界 C2V 推送在两种后端上的行为一致），AIV 侧 `tpop` 落在 `Vec`。反向的 Vector→Cube 方向需要 `tile.move` 边界路径在 `tpush_to_aic` 前所做的 V→C fractal 布局适配；在该方向发送未经适配的原始 tile 会破坏跨核传输契约，因此 V2C 的 GM 交换保持不加栅栏。
 
-当拆分后的内核包含跨核 `tpush`/`tpop` 时，该 Pass 还会自动在函数前缀补齐前端 pipe setup：
+对于包含跨核流量的拆分内核，Pass 会在消费侧插入 `reserve_buffer`、在生产侧插入
+`import_peer_buffer`，并在两侧插入匹配的 `initialize_pipe`。每条消费侧 `tpop` 链后还会补齐对应的 `tfree`。
 
-- 消费侧插入 `system.reserve_buffer(...)`
-- 生产侧插入 `system.import_peer_buffer(...)`
-- 两侧分别插入 `system.aic_initialize_pipe(...)` / `system.aiv_initialize_pipe(...)`
-
-此外，Pass 还会在每条消费侧 `tpop` 链后插入
-`system.tfree_to_aic(...)` / `system.tfree_to_aiv(...)`。
-
-这些 setup 参数由拆分后的函数体自动推导：
+对于普通用户编写的 mixed kernel，这些 setup 参数仍按旧行为由拆分后的函数体推导：
 
 - `dir_mask`：`C2V=1`、`V2C=2`、双向=`3`
 - `id`：自动生成 setup 时省略，因此 PTOAS 使用默认 frontend pipe id `0`
@@ -148,7 +142,17 @@ pipe（`pl.reserve_buffer`、`pl.{aic,aiv}_initialize_pipe` 与 `pl.tpush_to_aic
 - buffer 名称：`<func>_c2v_slot_buffer` / `<func>_v2c_slot_buffer`
 - reserve-buffer 的 `base`：插入时统一使用 `AUTO`，随后由 `AllocateMemoryAddr` 解析成显式地址
 
-当跨核方向使用了不同大小的 tile 时，Pass 会取所有观察到的 tile 字节大小的最大值作为 `initialize_pipe` 的公共 `slot_size`。较小 tile 写入时不会填满整个槽位，但不影响硬件正确性。用户手写程序仍然可以通过给 `initialize_pipe` 以及匹配的 `tpush` / `tpop` / `tfree` 传入不同 `id` 来创建多条独立 pipe。
+不同方向使用不同 tile 大小时，该路径以最大 tile 字节数作为公共 slot。手写程序仍可通过匹配的 ID 创建独立 pipe。
+
+### Solver 规划的 AutoFuse pipe
+
+AutoFuse 会附加私有、版本化 descriptor，记录每个 crossing 的 tensor、方向、有效形状、
+slot 布局、physical ID 与 bundle。Expansion 消费并删除该属性，为每条记录创建精确的独立
+单向 FIFO，并把 ID 传播到 setup、push/pop/free、workspace 与 lane offset。
+
+若 descriptor 损坏、存在未规划 source、几何不匹配或额外 fence，匹配会 fail closed。
+不同 SSA source 不会因类型相同而合并；互斥分支对同一 source 的使用共享 reply pipe。
+Verifier 检查 ID、方向、free 配对及 AIC/AIV descriptor map 是否一致。
 
 ### 覆盖槽位数（`slot_num`）
 
@@ -177,7 +181,8 @@ with pl.at(level=pl.Level.CORE_GROUP,
 必须为正数，且与拆分**正交**——它只决定数据通道的大小，不划分计算。它对 scope 实际
 使用的方向都生效（cube->vector、vector->cube 或双向），并适用于任何驱动 pipe 的
 scope：完全没有 split 的内核同样会驱动一条（a2a3 上通过双 AIV 派发——见下文）。
-仅当被 outline 的 scope 最终没有跨核操作时才会被忽略。
+仅当被 outline 的 scope 最终没有跨核操作时才会被忽略。solver 规划的每条 pipe 已携带
+slot 数，且必须与此处的 scope 值一致；不会替换为旧默认值。
 
 **已废弃：** `pl.split(MODE, slot_num=N)` 仍接受该槽位数，但会发出
 `DeprecationWarning`。该写法迫使作者写出并不需要的 split 模式——即
@@ -541,4 +546,5 @@ class After:
 | 两阶段拆分后循环状态修复 | 先保证 loop-carried state 合法，再在 DCE 移除死共享别名后重新裁剪 iter_arg，最后再跑一次 DCE 清理暴露出的 init-value 链 |
 | 自动生成 pipe setup | tensor 级 mixed kernel 无需手写 `reserve_buffer` / `import_peer_buffer` / `initialize_pipe`；Pass 会根据跨核 tile 操作自动推导 |
 | 自动生成 tfree 链 | 消费侧拆分内核会补齐缺失的 `tfree`、将其改写为释放 canonical 的 popped tile，并在需要时把明显过早的 free 延后到同一个 block 内更靠后的位置；但不会重排彼此独立的 `tpop` 链顺序 |
-| Max-slot-size 策略 | 取所有 tile 字节大小的最大值作为单一 `initialize_pipe.slot_size`，对齐后端自动生成 setup 的假设，并保留旧有双向 `dir_mask=3` 行为 |
+| 旧有 max-slot-size 策略 | 无 solver descriptor 时使用单一最大 slot，并保留旧有双向 `dir_mask=3` 行为 |
+| Solver 规划的 physical pipe | 每个 crossing 保留一条精确单向队列及匹配的 AIC/AIV descriptor；不会合并同形状 tensor |

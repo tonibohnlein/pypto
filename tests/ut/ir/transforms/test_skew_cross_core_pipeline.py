@@ -324,6 +324,34 @@ class TestSkewCrossCorePipeline:
         assert text.count("pl.tile.tpush_to_aiv(") == 1, text
         assert text.count("pl.tile.tpop_from_aiv(") == 1, text
 
+    def test_path_dependent_pipe_id_demotes(self):
+        """Equal push/pop kinds on both paths are insufficient when FIFO IDs differ."""
+
+        @pl.program
+        class Before:
+            @pl.function(strict_ssa=True)
+            def main(
+                self,
+                q: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Tensor[[64, 64], pl.FP32],
+            ):
+                for i in pl.pipeline(0, 4, 1, stage=2):
+                    qi: pl.Tile[[16, 64], pl.FP32] = pl.tile.load(q, [i * 16, 0], [16, 64])
+                    pl.tile.tpush_to_aiv(qi, split=0, id=0)
+                    if i == 0:
+                        reply0: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0, id=2)
+                        pl.tile.store(reply0, [i * 16, 0], out)
+                    else:
+                        reply1: pl.Tile[[16, 64], pl.FP32] = pl.tile.tpop_from_aiv(split=0, id=3)
+                        pl.tile.store(reply1, [i * 16, 0], out)
+
+        text = ir.python_print(passes.skew_cross_core_pipeline()(Before))
+        assert "pl.pipeline(" not in text, text
+        assert "for i in pl.range(4):" in text, text
+        assert text.count("pl.tile.tpush_to_aiv(") == 1, text
+        assert text.count("pl.tile.tpop_from_aiv(") == 2, text
+        assert "id=2" in text and "id=3" in text, text
+
     def test_recomputable_scalar_carry_skews(self):
         """Producer loop whose produce half defines an ADDRESS SCALAR (``off``) that
         the consume half re-uses (K-load and V-load share the offset, like fa_fused's

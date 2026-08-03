@@ -55,6 +55,24 @@ struct AutomaticPipeSetup {
   std::vector<StmtPtr> aiv_stmts;
 };
 
+/// One physical FIFO selected and priced by AutoFuse's mixed scheduler.
+/// ``bundle`` preserves the scheduler's protocol grouping for diagnostics and
+/// future protocol validation; pipe setup remains one independent
+/// unidirectional queue per record.  The current skew validator reasons from
+/// the concrete pipe IDs and lexical push/pop sequence.
+struct PlannedCrossCorePipe {
+  int64_t tensor_id = -1;
+  core_affinity::PipeDirection direction = core_affinity::PipeDirection::C2V;
+  int64_t valid_rows = 0;
+  int64_t valid_cols = 0;
+  int64_t slot_size_bytes = 0;
+  int slot_num = 0;
+  int pipe_id = -1;
+  int bundle = -1;
+};
+
+inline constexpr int kPlannedCrossCorePipeVersion = 1;
+
 constexpr int kAutoBufferBase = -1;
 
 /// Ring depth an automatically built cross-core pipe gets when the enclosing scope carries no
@@ -78,8 +96,15 @@ int BuildDirMask(const CrossCorePipeMetadata& metadata);
 /// only hand-written `pl.system.{aic,aiv}_initialize_pipe` still reaches that path, since automatic
 /// pipes always emit an explicit `slot_num`.
 int GetPtoasImplicitSlotNum(int dir_mask);
+/// Resolve an explicit depth or PTOAS's implicit depth for hand-written pipe setup.
+int GetEffectiveSlotNumForDirMask(int dir_mask, std::optional<int> slot_num);
 std::optional<int64_t> GetCommonSlotSizeBytes(const CrossCorePipeMetadata& metadata);
 std::string BuildPipeBufferName(const std::string& func_name, core_affinity::PipeDirection direction);
+std::string BuildPipeBufferName(const std::string& func_name, core_affinity::PipeDirection direction,
+                                int pipe_id);
+
+std::string EncodePlannedCrossCorePipes(const std::vector<PlannedCrossCorePipe>& pipes, const Span& span);
+std::optional<std::vector<PlannedCrossCorePipe>> DecodePlannedCrossCorePipes(const std::string& encoded);
 
 CallPtr CreateSystemOpCall(const std::string& op_name,
                            const std::vector<std::pair<std::string, std::any>>& kwargs, const Span& span);
@@ -91,8 +116,8 @@ CallPtr CreateImportPeerBuffer(const std::string& buffer_name, const std::string
 // `slot_num` is the ring depth emitted on the initialize_pipe op. It is always emitted, so PTOAS
 // never falls back to its own `dir_mask` derivation for a pipe pypto built.
 CallPtr CreateInitializePipe(core_affinity::CoreSide side, int dir_mask, int slot_size_bytes,
-                             const ExprPtr& c2v_consumer_buf, const ExprPtr& v2c_consumer_buf, int slot_num,
-                             const Span& span);
+                             const ExprPtr& c2v_consumer_buf, const ExprPtr& v2c_consumer_buf,
+                             std::optional<int> pipe_id, std::optional<int> slot_num, const Span& span);
 
 void CollectCrossCorePipeMetadata(const std::vector<StmtPtr>& stmts, CrossCorePipeMetadata& metadata);
 CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtPtr>& stmts);
@@ -100,10 +125,11 @@ CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtP
 // `slot_num_override` (from pl.cross_core_slot(slot_num=N)) overrides the ring depth used to size
 // the reserved buffer and the emitted initialize_pipe `slot_num` attribute. nullopt selects
 // `kDefaultAutoPipeSlotNum`; either way the attribute is emitted.
-AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const std::string& aic_name,
-                                           const std::string& aiv_name, const std::vector<StmtPtr>& aic_stmts,
-                                           const std::vector<StmtPtr>& aiv_stmts,
-                                           std::optional<int> slot_num_override, const Span& span);
+AutomaticPipeSetup BuildAutomaticPipeSetup(
+    const std::string& func_name, const std::string& aic_name, const std::string& aiv_name,
+    const std::vector<StmtPtr>& aic_stmts, const std::vector<StmtPtr>& aiv_stmts,
+    std::optional<int> slot_num_override,
+    const std::optional<std::vector<PlannedCrossCorePipe>>& planned_pipes, const Span& span);
 
 std::vector<StmtPtr> PrependPipeSetup(const std::vector<StmtPtr>& prologue, const std::vector<StmtPtr>& body);
 

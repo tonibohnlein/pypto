@@ -187,7 +187,17 @@ class VarUseCollector : public IRVisitor {
   }
 };
 
-enum class CrossCoreEvent : uint8_t { Push, Pop };
+enum class CrossCoreEventKind : uint8_t { Push, Pop };
+
+struct CrossCoreEvent {
+  CrossCoreEventKind kind;
+  int pipe_id;
+
+  bool operator==(const CrossCoreEvent& other) const {
+    return kind == other.kind && pipe_id == other.pipe_id;
+  }
+  bool operator!=(const CrossCoreEvent& other) const { return !(*this == other); }
+};
 
 struct CrossCoreProtocolTrace {
   bool valid = true;
@@ -223,8 +233,14 @@ class CrossCorePresenceCollector : public IRVisitor {
  * skewed.
  */
 CrossCoreProtocolTrace TraceCrossCoreProtocol(const StmtPtr& stmt) {
-  if (IsTpushStmt(stmt)) return CrossCoreProtocolTrace{true, {CrossCoreEvent::Push}};
-  if (IsTpopStmt(stmt)) return CrossCoreProtocolTrace{true, {CrossCoreEvent::Pop}};
+  if (IsTpushStmt(stmt)) {
+    auto call = GetCallFromStmt(stmt);
+    return CrossCoreProtocolTrace{true, {{CrossCoreEventKind::Push, call->GetKwarg<int>("id", 0)}}};
+  }
+  if (IsTpopStmt(stmt)) {
+    auto call = GetCallFromStmt(stmt);
+    return CrossCoreProtocolTrace{true, {{CrossCoreEventKind::Pop, call->GetKwarg<int>("id", 0)}}};
+  }
 
   if (auto seq = As<SeqStmts>(stmt)) {
     CrossCoreProtocolTrace result;
@@ -491,8 +507,8 @@ class SkewCrossCoreMutator : public IRMutator {
       if (!trace.valid || trace.events.size() > 1) {
         return DemoteToSequential(op, op->start_, op->stop_, op->step_, body);
       }
-      bool push = !trace.events.empty() && trace.events[0] == CrossCoreEvent::Push;
-      bool pop = !trace.events.empty() && trace.events[0] == CrossCoreEvent::Pop;
+      bool push = !trace.events.empty() && trace.events[0].kind == CrossCoreEventKind::Push;
+      bool pop = !trace.events.empty() && trace.events[0].kind == CrossCoreEventKind::Pop;
       if ((push || pop) && lead_idx < 0) {
         lead_idx = i;
       }

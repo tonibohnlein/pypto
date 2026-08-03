@@ -8,7 +8,7 @@
 
 旧方案对这些循环做 unroll（`pl.pipeline(stage=F)`）并由 `CanonicalizeIOOrder` 聚类跨核算子 —— 这会产生**背靠背的 `tpop`**，把消费者串行化。`SkewCrossCorePipeline` 改为对循环做软流水：
 
-- **单次往返、生产者角色** —— 一个有序 `tpush` bundle 和一个逻辑 `tpop`，且 push bundle 的反向切片不通过 SSA 边喂给 body（cube：`QK → tpush`，`tpop → SV`）。逻辑 pop 可以位于顶层，也可以完全相同地出现在顶层 `IfStmt` 的两个分支内（例如首个 `matmul` 与后续 `matmul_acc`）。两半仅通过有序的跨核 FIFO 关联，于是让生产者**提前 `D = max(2, stage-1)` 个迭代**运行（跨核默认 depth-2）：`produce(start … start+(D-1)·step)` 序言（prologue）、一个 `ForKind::Sequential` 稳态循环（其循环变量 `k` 作为每组的首个 produce 索引，把该组的 `D` 个 produce `produce(k+i·step)` 与滞后的 `D` 个 consume `consume(k-(D-i)·step)` 配对，`k` 以 `D·step` 为步长取值 `[start+D·step, start+trip·step)`）、以及 `consume(最后 D 个)` 尾声（epilogue）。cube 发出第 k 组的 `D` 个 `QK` 时，vector 正在跑第 k-D 组的 `D` 个 softmax。详见 [skew 深度](#skew-深度stage)。
+- **单次往返、生产者角色** —— 一个有序 `tpush` bundle 和一个逻辑 `tpop`，且 push bundle 的反向切片不通过 SSA 边喂给 body（cube：`QK → tpush`，`tpop → SV`）。一个 bundle 可以包含多条独立 pipe ID；顺序和 ID 都属于协议。逻辑 pop 可以位于顶层，也可以完全相同地出现在顶层 `IfStmt` 的两个分支内（例如首个 `matmul` 与后续 `matmul_acc`）。两半仅通过有序的跨核 FIFO 关联，于是让生产者**提前 `D = max(2, stage-1)` 个迭代**运行（跨核默认 depth-2）：`produce(start … start+(D-1)·step)` 序言（prologue）、一个 `ForKind::Sequential` 稳态循环（其循环变量 `k` 作为每组的首个 produce 索引，把该组的 `D` 个 produce `produce(k+i·step)` 与滞后的 `D` 个 consume `consume(k-(D-i)·step)` 配对，`k` 以 `D·step` 为步长取值 `[start+D·step, start+trip·step)`）、以及 `consume(最后 D 个)` 尾声（epilogue）。cube 发出第 k 组的 `D` 个 `QK` 时，vector 正在跑第 k-D 组的 `D` 个 softmax。详见 [skew 深度](#skew-深度stage)。
 - **消费者角色，或多次往返** —— lead 算子通过 SSA 喂给 body（vector：弹出的 scores 喂给 softmax），或某个 FIFO 方向上有多于一条消息。此时**降级为普通的 `ForKind::Sequential` 循环**（body 不变）。这消除了 unroll 的背靠背 `tpop`，同时保持 FIFO 的有序性；跨核重叠则来自**对端**核的生产者 skew —— 它提前一步把每个 tile 放入 FIFO，使本核有序的 `tpop` 不再 block。
 
 每个**非跨核**的 pipeline 循环（同核 GM→L1、L1→L0、嵌套 matmul stage 循环 —— 没有 `tpush`/`tpop`）保持不变，交给 `LowerPipelineLoops` 复制。
@@ -32,7 +32,7 @@ p = passes.skew_cross_core_pipeline()
 
 1. **非跨核** —— body 不含 `tpush`/`tpop` 对 → 保持为 `ForKind::Pipeline`，交给 `LowerPipelineLoops` 复制。
 2. **跨核** —— body 同时含 `tpush` 和 `tpop`。找 lead（程序顺序第一个跨核算子），反向切片成生产者半，并分类：
-   - 一个有序 push bundle + 一个逻辑 `tpop`、`carried`（被 body 使用的 lead 定义变量）为空、且静态可 skew → **生产者 skew**（prologue / Sequential 稳态循环 / epilogue）。仅当顶层 conditional 的两个分支具有相同跨核协议时，它才算一个逻辑事件。
+   - 一个有序 push bundle + 一个逻辑 `tpop`、`carried`（被 body 使用的 lead 定义变量）为空、且静态可 skew → **生产者 skew**（prologue / Sequential 稳态循环 / epilogue）。仅当顶层 conditional 的两个分支具有相同跨核 op 顺序和 pipe ID 时，它才算一个逻辑事件。
    - 否则 —— `carried` 非空（消费者角色）、多于一个 `tpush`/`tpop`（多次往返；只 skew 一条消息会打乱有序 FIFO —— verifier 抓不到的静默数据错误）、动态边界、或 trip < 2 → **`DemoteToSequential`**。
 
 无论哪种，跨核循环**总是**以 `ForKind::Sequential`（无 `pipeline_stages` 标记）离开本 pass，因此永远不会以 Pipeline body 的形式到达 `LowerPipelineLoops` 或 `CanonicalizeIOOrder`。
@@ -59,7 +59,7 @@ D = max(2, stage - 1)
 ## 约束
 
 - skew 仅支持静态边界（`start`、`stop`、`step` 为编译期常量）。动态边界的跨核循环降级为 `ForKind::Sequential`。
-- conditional 内的跨核流量必须与路径无关。两个分支的 trace 完全相同时算一个逻辑事件；任一分支缺少、增加或改变 push/pop 顺序时，整个循环降级。
+- conditional 内的跨核流量必须与路径无关。两个分支的 trace 完全相同时算一个逻辑事件；任一分支缺少、增加、改变 push/pop 顺序或改变 ID 时，整个循环降级。
 - 生产者 skew 的稳态区**保留为循环**（不完全展开），使 `AllocateMemoryAddr` 分配的 matmul `Acc` 双缓冲仍有循环可交替。
 - 有意**不**做消费者侧预取：它会破坏 codegen 的 `tpop → tfree` FIFO 槽位追踪（以 SSA 变量身份为键，无法跨 iter_arg），且提前整整一个迭代发出阻塞式 `tpop` 只会 stall。
 
@@ -68,7 +68,7 @@ D = max(2, stage - 1)
 - **多次往返循环目前不做 skew（TODO）。** 某个 FIFO 方向上有多于一条消息的循环
   （例如 `C→V→C→V` = `tpush, tpop, tpush, tpop`）当前**降级为 `ForKind::Sequential`**，
   而非软流水。只 skew lead 那一条消息会打乱有序的跨核 FIFO，静默地把错误的 tile
-  喂给对端核（property verifier 不建模 FIFO 顺序），因此保守地降级是正确的，但损失了
+  喂给对端核（property verifier 检查 ID 与方向，但不证明 FIFO 时间顺序），因此保守地降级是正确的，但损失了
   重叠收益。未来应将整个 FIFO 组一起 skew（让每条消息都提前一个往返），使多次往返的
   生产者也能重叠。
 

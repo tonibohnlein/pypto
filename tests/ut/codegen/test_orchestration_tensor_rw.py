@@ -956,15 +956,23 @@ class TestTensorReadWriteOffsetCodegen:
             def large_cube(self):
                 buf0 = pl.reserve_buffer(name="large_v2c_slot_buffer_0", size=8192, base=pl.AUTO)
                 buf1 = pl.reserve_buffer(name="large_v2c_slot_buffer_1", size=16384, base=pl.AUTO)
-                pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf0, dir_mask=2, slot_size=1024, id=0)
-                pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf1, dir_mask=2, slot_size=2048, id=1)
+                pl.aic_initialize_pipe(
+                    pl.const(0, pl.INT32), buf0, dir_mask=2, slot_size=1024, slot_num=3, id=0
+                )
+                pl.aic_initialize_pipe(
+                    pl.const(0, pl.INT32), buf1, dir_mask=2, slot_size=2048, slot_num=5, id=1
+                )
 
             @pl.function(type=pl.FunctionType.AIV)
             def large_vector(self):
                 peer0 = pl.import_peer_buffer(name="large_v2c_slot_buffer_0", peer_func="large_cube")
                 peer1 = pl.import_peer_buffer(name="large_v2c_slot_buffer_1", peer_func="large_cube")
-                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer0, dir_mask=2, slot_size=1024, id=0)
-                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer1, dir_mask=2, slot_size=2048, id=1)
+                pl.aiv_initialize_pipe(
+                    pl.const(0, pl.INT32), peer0, dir_mask=2, slot_size=1024, slot_num=3, id=0
+                )
+                pl.aiv_initialize_pipe(
+                    pl.const(0, pl.INT32), peer1, dir_mask=2, slot_size=2048, slot_num=5, id=1
+                )
 
             @pl.function(type=pl.FunctionType.Group)
             def large_group(self):
@@ -982,9 +990,9 @@ class TestTensorReadWriteOffsetCodegen:
 
         code = _generate_orch_code(transformed)
         shape_values = re.findall(r"gm_pipe_buffer_\d+_ci_shapes\[1\]\s*=\s*\{(\d+)\};", code)
-        assert shape_values == ["1024", "6144"], (
+        assert shape_values == ["1024", "3328"], (
             "Expected per-callee GM workspace shapes (small=512*8*1 side / f32, "
-            f"large=(1024*8+2048*8) / f32), got {shape_values}. Generated code:\n{code}"
+            f"large=(1024*3+2048*5) / f32), got {shape_values}. Generated code:\n{code}"
         )
 
     def test_gm_pipe_buffer_bidirectional_reserves_two_rings(self):

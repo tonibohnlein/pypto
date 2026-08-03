@@ -167,16 +167,11 @@ To stay deadlock-free, a handshake is emitted only when (1) the GM origin tensor
 
 Only the **Cube→Vector** direction (cube `tile.store` → vector `tile.load`) is fenced. The AIC `tpush` sends the stored tile raw, exactly as the normal boundary C2V push does on both backends, and the AIV `tpop` lands in `Vec`. The reverse Vector→Cube direction would require the V→C fractal-layout adaptation that the `tile.move` boundary path applies before `tpush_to_aic`; emitting a raw-tile sync there would violate the cross-core transport contract, so V2C GM exchanges are left unfenced.
 
-When split kernels contain cross-core `tpush`/`tpop`, the pass also prepends the required frontend pipe setup automatically:
+For split kernels with cross-core traffic, the pass prepends `reserve_buffer` on the consumer,
+`import_peer_buffer` on the producer, and matching AIC/AIV `initialize_pipe` calls. It also inserts
+the appropriate `tfree` after every consumer-side `tpop` chain.
 
-- `system.reserve_buffer(...)` on the consumer side
-- `system.import_peer_buffer(...)` on the producer side
-- `system.aic_initialize_pipe(...)` / `system.aiv_initialize_pipe(...)` on both sides
-
-In addition, the pass inserts `system.tfree_to_aic(...)` / `system.tfree_to_aiv(...)`
-after every consumer-side `tpop` chain.
-
-Setup is derived from the split bodies:
+For ordinary user-authored mixed kernels, setup is derived from the split bodies and preserves the historical single-pipe behavior:
 
 - `dir_mask`: `C2V=1`, `V2C=2`, bidirectional=`3`
 - `id`: omitted for automatic setup, so PTOAS uses the default frontend pipe id `0`
@@ -186,7 +181,18 @@ Setup is derived from the split bodies:
 - buffer names: `<func>_c2v_slot_buffer` / `<func>_v2c_slot_buffer`
 - reserve-buffer base: `AUTO` on insertion, then resolved to an explicit address by `AllocateMemoryAddr`
 
-When cross-core directions use different tile sizes, the pass picks `max(all observed tile byte sizes)` as the common `slot_size` for `initialize_pipe`. Smaller tiles leave unused bytes in each slot but hardware correctness is preserved. Explicit user-authored programs can still create multiple independent pipes by supplying different `id` values to `initialize_pipe` and matching `tpush` / `tpop` / `tfree` ops.
+When directions use different tile sizes, this path uses `max(all observed tile byte sizes)` as the
+common slot. Explicit programs may instead create independent IDs with matching push/pop/free ops.
+
+### Solver-planned AutoFuse pipes
+
+AutoFuse attaches a private, versioned descriptor with every crossing's tensor, direction, valid
+shape, slot layout, physical ID, and bundle. Expansion consumes and strips it, creates one exact
+unidirectional FIFO per record, and stamps that ID on setup, push/pop/free, workspace, and lane offsets.
+
+Matching fails closed on malformed records, unplanned sources, mismatched geometry, or extra fences.
+Distinct sources remain distinct; mutually exclusive uses of one SSA source share one reply pipe.
+Verification checks IDs, directions, free pairing, and identical AIC/AIV maps; see the [mixed plan/emit contract](../proposals/autofuse_mixed_cost_model_emit_contract.md).
 
 ### Overriding the slot count (`slot_num`)
 
@@ -220,7 +226,8 @@ channel, it does not partition work. It applies in whichever directions the
 scope actually uses (cube->vector, vector->cube, or both), and to any scope that
 drives a pipe: a kernel with no split at all still drives one (on a2a3 via
 dual-AIV dispatch — see below). It is ignored only when the outlined scope ends
-up with no cross-core ops.
+up with no cross-core ops. A solver-planned per-pipe count must agree with this value; no legacy
+default is substituted.
 
 **Deprecated:** `pl.split(MODE, slot_num=N)` still accepts the slot count and
 emits a `DeprecationWarning`. That spelling forced authors to name a split mode
@@ -581,4 +588,5 @@ true last use of that tile.
 | Two-stage post-split loop-state repair | First makes loop-carried state valid, then re-strips iter_args after DCE removes dead shared aliases, with a final DCE to clean up exposed init-value chains |
 | Auto-generated pipe setup | Tensor-level mixed kernels do not need handwritten `reserve_buffer` / `import_peer_buffer` / `initialize_pipe`; the pass derives them from cross-core tile ops |
 | Auto-generated tfree chains | Consumer-side split kernels insert missing `tfree` calls, rewrite them to free the canonical popped tile value, and delay obviously early frees within the same block without reordering independent `tpop` chains |
-| Max-slot-size policy | Uses `max(all tile byte sizes)` as the single `initialize_pipe.slot_size`, matching the backend assumption of one automatic reserve/import buffer per direction while preserving legacy bidirectional `dir_mask=3` behavior |
+| Legacy max-slot-size policy | Without a solver descriptor, uses `max(all tile byte sizes)` as one `initialize_pipe.slot_size`, preserving legacy bidirectional `dir_mask=3` behavior |
+| Solver-planned physical pipes | Preserves one exact unidirectional queue per crossing and matching AIC/AIV descriptors; same-shaped tensors are not merged |

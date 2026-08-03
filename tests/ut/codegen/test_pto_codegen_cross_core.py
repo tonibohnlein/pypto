@@ -1771,15 +1771,23 @@ class TestExpandMixedKernelCodegen:
             def cube_kernel(self):
                 c2v_peer = pl.import_peer_buffer(name="c2v_slot_buffer", peer_func="vector_kernel")
                 v2c_buf = pl.reserve_buffer(name="v2c_slot_buffer", size=32768, base=0x1000)
-                pl.aic_initialize_pipe(c2v_peer, pl.const(0, pl.INT32), dir_mask=1, slot_size=8192, id=0)
-                pl.aic_initialize_pipe(pl.const(0, pl.INT32), v2c_buf, dir_mask=2, slot_size=4096, id=1)
+                pl.aic_initialize_pipe(
+                    c2v_peer, pl.const(0, pl.INT32), dir_mask=1, slot_size=8192, slot_num=3, id=0
+                )
+                pl.aic_initialize_pipe(
+                    pl.const(0, pl.INT32), v2c_buf, dir_mask=2, slot_size=4096, slot_num=5, id=1
+                )
 
             @pl.function(type=pl.FunctionType.AIV)
             def vector_kernel(self):
                 c2v_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=65536, base=0x2000)
                 v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="cube_kernel")
-                pl.aiv_initialize_pipe(c2v_buf, pl.const(0, pl.INT32), dir_mask=1, slot_size=8192, id=0)
-                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=4096, id=1)
+                pl.aiv_initialize_pipe(
+                    c2v_buf, pl.const(0, pl.INT32), dir_mask=1, slot_size=8192, slot_num=3, id=0
+                )
+                pl.aiv_initialize_pipe(
+                    pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=4096, slot_num=5, id=1
+                )
 
             @pl.function(type=pl.FunctionType.Group)
             def group_func(self):
@@ -1814,7 +1822,9 @@ class TestExpandMixedKernelCodegen:
             )
             assert "id = 1, dir_mask = 2" in body
             assert re.search(r"pto.addptr %arg\d+", body)
-            assert "arith.constant 16384 : index" in body
+            # Pipe 1 starts after pipe 0's exact 3-slot ring:
+            # 8192 bytes * 3 / sizeof(float) = 6144 workspace elements.
+            assert "arith.constant 6144 : index" in body
             assert re.search(r"gm_slot_buffer = %arg\d+ : !pto.ptr<f32>", body)
             assert body.count("gm_slot_buffer = %") == 2
             assert "dir_mask = 3" not in body

@@ -3227,10 +3227,15 @@ class TestAutoFuse:
             assert "type=pl.FunctionType.Group" in text, text
             assert "type=pl.FunctionType.AIC" in text, text
             assert "type=pl.FunctionType.AIV" in text, text
-            assert 'attrs={"core_num": 24}' in text, text
+            # Launch metadata is attached to the SPMD call after launch-spec
+            # normalization; its placement is not part of the mixed contract.
+            assert '"core_num": 24' in text, text
             assert text.count("pl.tile.tpush_to_aiv(") == 1, text
             assert text.count("pl.tile.tpop_from_aic(") == 1, text
             assert text.count("pl.system.tfree_to_aic(") == 1, text
+            assert text.count("pl.system.aic_initialize_pipe(") == 1, text
+            assert text.count("pl.system.aiv_initialize_pipe(") == 1, text
+            assert text.count("id=0") >= 4, text
             assert text.count("pl.tile.col_expand_add(") == 1, text
             assert "pl.tile.add(" not in text, text
             assert text.count("slot_size=4096") == 2, text
@@ -3238,6 +3243,7 @@ class TestAutoFuse:
             assert "pl.tile.get_subblock_idx()" in text, text
             assert "subblock_idx * 16" in text, text
             assert "__gm_pipe_buffer" in text, text
+            assert "__autofuse_mixed_fifo_plan" not in text, text
 
             # Ascend910B forbids a split-AIV writer that consumes both a
             # tile.load result and a MemRef-less tpop_from_aic value from
@@ -3442,7 +3448,13 @@ class TestAutoFuse:
                 source_namespace,
             )
             planned = passes.auto_fuse()(Prog)
-            ir.assert_structural_equal(planned, Expected)
+            # AutoFuse also carries a private, versioned FIFO descriptor on the
+            # intermediate InCore scope. It is intentionally absent from the
+            # public printer and stripped by ExpandMixedKernel, so compare the
+            # complete public IR surface here and inspect the realized IDs below.
+            assert planned.get_function("mlp").as_python() == Expected.get_function(
+                "mlp"
+            ).as_python()
 
             namespace = {}
             exec(torch_codegen(planned, run_all_spmd_blocks=True), namespace)
@@ -3472,6 +3484,17 @@ class TestAutoFuse:
             assert "pl.system.tfree_to_aiv(" in lowered_text, lowered_text
             assert "pl.tile.matmul(" in lowered_text, lowered_text
             assert "slot_num=4" in lowered_text, lowered_text
+            assert lowered_text.count("pl.system.aic_initialize_pipe(") == 3, lowered_text
+            assert lowered_text.count("pl.system.aiv_initialize_pipe(") == 3, lowered_text
+            assert lowered_text.count("pl.system.reserve_buffer(") == 3, lowered_text
+            assert lowered_text.count("pl.system.import_peer_buffer(") == 3, lowered_text
+            assert lowered_text.count("slot_size=1024") == 4, lowered_text
+            assert lowered_text.count("slot_size=512") == 2, lowered_text
+            assert lowered_text.count("size=4096") == 2, lowered_text
+            assert lowered_text.count("size=2048") == 1, lowered_text
+            for pipe_id in (0, 1, 2):
+                assert lowered_text.count(f"id={pipe_id}") >= 2, lowered_text
+            assert "__autofuse_mixed_fifo_plan" not in lowered_text, lowered_text
 
             # The AIC reply pop sits under the first-matmul/matmul_acc branch.
             # SkewCrossCorePipeline must still recognize the ordered

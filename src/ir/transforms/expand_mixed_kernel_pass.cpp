@@ -74,6 +74,7 @@ using core_affinity::CoreSide;
 using core_affinity::CVBoundaryMove;
 using core_affinity::CVDirection;
 using cross_core_pipe::BuildAutomaticPipeSetup;
+using cross_core_pipe::PlannedCrossCorePipe;
 using cross_core_pipe::PrependPipeSetup;
 using loop_repair::BuildDefMap;
 using loop_repair::FinalizeSplitCoreBody;
@@ -350,7 +351,7 @@ CoreAffinity AnalyzeStmtAffinity(const StmtPtr& stmt, std::unordered_map<const S
 /// (e.g., split) can be propagated to the replacement tpop.
 void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
                             std::map<const Stmt*, CVBoundaryMove>& boundary_moves,
-                            const TpopDefs& tpop_defs) {
+                            std::vector<const Stmt*>& boundary_order, const TpopDefs& tpop_defs) {
   for (const auto& stmt : stmts) {
     if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
       auto call = std::dynamic_pointer_cast<const Call>(assign->value_);
@@ -369,6 +370,7 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
                                                     /*op_driven=*/true,
                                                     call->GetKwarg<int>("split", 0),
                                                     call->GetKwarg<int>("lane_stride", 0)};
+        boundary_order.push_back(stmt.get());
       } else if (call) {
         auto dir = ClassifyMoveDirection(call);
         if (dir != CVDirection::NONE) {
@@ -382,21 +384,22 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
             if (tpop_defs.count(source_var.get()) > 0) continue;
           }
           boundary_moves[stmt.get()] = CVBoundaryMove{dir, assign->var_, call->args_[0], call->GetType()};
+          boundary_order.push_back(stmt.get());
         }
       }
     }
 
     // Recurse into compound statements
     if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
-      CollectCVBoundaryMoves(FlattenBody(for_stmt->body_), boundary_moves, tpop_defs);
+      CollectCVBoundaryMoves(FlattenBody(for_stmt->body_), boundary_moves, boundary_order, tpop_defs);
     } else if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
-      CollectCVBoundaryMoves(FlattenBody(if_stmt->then_body_), boundary_moves, tpop_defs);
+      CollectCVBoundaryMoves(FlattenBody(if_stmt->then_body_), boundary_moves, boundary_order, tpop_defs);
       const auto& else_body = if_stmt->else_body_;
       if (else_body.has_value()) {
-        CollectCVBoundaryMoves(FlattenBody(*else_body), boundary_moves, tpop_defs);
+        CollectCVBoundaryMoves(FlattenBody(*else_body), boundary_moves, boundary_order, tpop_defs);
       }
     } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
-      CollectCVBoundaryMoves(FlattenBody(while_stmt->body_), boundary_moves, tpop_defs);
+      CollectCVBoundaryMoves(FlattenBody(while_stmt->body_), boundary_moves, boundary_order, tpop_defs);
     }
   }
 }
@@ -405,7 +408,8 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
 // TPUSH / TPOP creation helpers
 // ============================================================================
 
-std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(int split = 0, int lane_stride = 0) {
+std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(
+    int split = 0, int lane_stride = 0, std::optional<int> pipe_id = std::nullopt) {
   std::vector<std::pair<std::string, std::any>> kwargs{{"split", std::any(split)}};
   // The partition stride only rides along when a ragged boundary was rebalanced
   // (see split_axis::ResolveLaneStride). PTO codegen ignores it — it prints only
@@ -413,6 +417,9 @@ std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(int split = 0, int
   // where the compiler did.
   if (lane_stride > 0) {
     kwargs.emplace_back("lane_stride", std::any(lane_stride));
+  }
+  if (pipe_id.has_value()) {
+    kwargs.emplace_back("id", std::any(*pipe_id));
   }
   return kwargs;
 }
@@ -441,15 +448,113 @@ int BoundaryTransportSplitCode(const CVBoundaryMove& bm, const Span& span) {
 }
 
 CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0,
-                    int lane_stride = 0) {
-  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride), span);
+                    int lane_stride = 0, std::optional<int> pipe_id = std::nullopt) {
+  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride, pipe_id), span);
+}
+
+std::vector<std::pair<std::string, std::any>> SetPipeId(
+    const std::vector<std::pair<std::string, std::any>>& kwargs, std::optional<int> pipe_id) {
+  if (!pipe_id.has_value()) return kwargs;
+  std::vector<std::pair<std::string, std::any>> updated;
+  updated.reserve(kwargs.size() + 1);
+  for (const auto& item : kwargs) {
+    if (item.first != "id") updated.push_back(item);
+  }
+  updated.emplace_back("id", std::any(*pipe_id));
+  return updated;
 }
 
 CallPtr CreateTpop(const std::string& op_name, const TypePtr& result_type, const Span& span,
-                   const std::vector<std::pair<std::string, std::any>>& kwargs = {}) {
+                   const std::vector<std::pair<std::string, std::any>>& kwargs = {},
+                   std::optional<int> pipe_id = std::nullopt) {
   auto op = OpRegistry::GetInstance().GetOp(op_name);
   auto effective_kwargs = kwargs.empty() ? MakeSplitKwargs() : kwargs;
+  effective_kwargs = SetPipeId(effective_kwargs, pipe_id);
   return std::make_shared<Call>(op, std::vector<ExprPtr>{}, std::move(effective_kwargs), result_type, span);
+}
+
+using PlannedBoundaryPipes = std::unordered_map<const Stmt*, PlannedCrossCorePipe>;
+
+std::pair<int64_t, int64_t> GetStaticBoundaryShape(const TypePtr& type, const Span& span) {
+  auto tile = std::dynamic_pointer_cast<const TileType>(type);
+  INTERNAL_CHECK_SPAN(tile && tile->shape_.size() == 2, span)
+      << "AutoFuse planned cross-core boundary requires a rank-2 TileType";
+  auto rows = cross_core_pipe::TryGetConstIntValue(tile->shape_[0]);
+  auto cols = cross_core_pipe::TryGetConstIntValue(tile->shape_[1]);
+  INTERNAL_CHECK_SPAN(rows.has_value() && cols.has_value(), span)
+      << "AutoFuse planned cross-core boundary requires a static tile shape";
+  return {*rows, *cols};
+}
+
+PlannedBoundaryPipes MatchPlannedPipesToBoundaries(
+    const std::vector<PlannedCrossCorePipe>& pipes, const std::vector<const Stmt*>& boundary_order,
+    const std::map<const Stmt*, CVBoundaryMove>& boundary_moves, const Span& span) {
+  INTERNAL_CHECK_SPAN(pipes.empty() == boundary_order.empty(), span)
+      << "AutoFuse mixed FIFO contract and emitted cross-core boundaries disagree";
+
+  PlannedBoundaryPipes matched;
+  matched.reserve(boundary_order.size());
+  size_t pipe_index = 0;
+  const Expr* logical_source = nullptr;
+  CVDirection logical_direction = CVDirection::NONE;
+  for (size_t boundary_index = 0; boundary_index < boundary_order.size(); ++boundary_index) {
+    const Stmt* stmt = boundary_order[boundary_index];
+    auto boundary_it = boundary_moves.find(stmt);
+    INTERNAL_CHECK_SPAN(boundary_it != boundary_moves.end(), span)
+        << "AutoFuse mixed FIFO boundary order contains an unknown statement";
+    const auto& boundary = boundary_it->second;
+
+    // One logical solver boundary can appear more than once in the lowered IR.
+    // In particular, the first-matmul and matmul_acc arms of a feature loop each
+    // gather the same activation SSA value.  They are mutually exclusive uses of
+    // one physical FIFO, not two pipes.  Consecutive occurrences with the same
+    // source and direction therefore share the current descriptor.  A distinct
+    // source advances the descriptor even when shape/dtype are identical (the
+    // gate and up projections are the canonical example).
+    const Expr* source = boundary.source_tile.get();
+    if (logical_source != nullptr && (source != logical_source || boundary.direction != logical_direction)) {
+      ++pipe_index;
+      logical_source = nullptr;
+    }
+    INTERNAL_CHECK_SPAN(pipe_index < pipes.size(), span)
+        << "AutoFuse mixed FIFO contract has " << pipes.size()
+        << " logical pipes but lowering found an additional cross-core source at boundary " << boundary_index;
+    if (logical_source == nullptr) {
+      logical_source = source;
+      logical_direction = boundary.direction;
+    }
+
+    const auto& pipe = pipes[pipe_index];
+    const auto expected_direction = boundary.direction == CVDirection::CUBE_TO_VECTOR
+                                        ? core_affinity::PipeDirection::C2V
+                                        : core_affinity::PipeDirection::V2C;
+    INTERNAL_CHECK_SPAN(pipe.direction == expected_direction, span)
+        << "AutoFuse mixed FIFO " << pipe.pipe_id << " direction disagrees with boundary " << boundary_index;
+
+    const TypePtr destination_type = boundary.op_driven ? boundary.result_type : boundary.dest_var->GetType();
+    const auto source_shape = GetStaticBoundaryShape(boundary.source_tile->GetType(), span);
+    const auto destination_shape = GetStaticBoundaryShape(destination_type, span);
+    const int64_t full_rows = std::max(source_shape.first, destination_shape.first);
+    const int64_t full_cols = std::max(source_shape.second, destination_shape.second);
+    INTERNAL_CHECK_SPAN(pipe.valid_rows == full_rows && pipe.valid_cols == full_cols, span)
+        << "AutoFuse mixed FIFO " << pipe.pipe_id << " planned valid shape " << pipe.valid_rows << "x"
+        << pipe.valid_cols << " disagrees with emitted boundary " << full_rows << "x" << full_cols;
+
+    auto source_bytes = cross_core_pipe::TryGetTileSlotSizeBytes(boundary.source_tile->GetType());
+    auto destination_bytes = cross_core_pipe::TryGetTileSlotSizeBytes(destination_type);
+    INTERNAL_CHECK_SPAN(source_bytes.has_value() && destination_bytes.has_value(), span)
+        << "AutoFuse mixed FIFO boundary has a dynamic slot size";
+    const int64_t full_bytes = std::max(*source_bytes, *destination_bytes);
+    INTERNAL_CHECK_SPAN(pipe.slot_size_bytes == full_bytes, span)
+        << "AutoFuse mixed FIFO " << pipe.pipe_id << " planned slot size " << pipe.slot_size_bytes
+        << " disagrees with emitted boundary size " << full_bytes;
+    matched.emplace(stmt, pipe);
+  }
+  const size_t logical_boundary_count = boundary_order.empty() ? 0 : pipe_index + 1;
+  INTERNAL_CHECK_SPAN(logical_boundary_count == pipes.size(), span)
+      << "AutoFuse mixed FIFO contract has " << pipes.size() << " logical pipes but lowering found "
+      << logical_boundary_count << " distinct cross-core sources";
+  return matched;
 }
 
 CallPtr CreateMove(const ExprPtr& tile, MemorySpace target_memory, const TypePtr& result_type,
@@ -835,6 +940,7 @@ void CollectGmCrossLaneSyncs(const std::vector<StmtPtr>& stmts,
 std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& stmts,
                                    const std::unordered_map<const Stmt*, CoreAffinity>& stmt_map,
                                    const std::map<const Stmt*, CVBoundaryMove>& boundary_moves,
+                                   const PlannedBoundaryPipes& planned_boundary_pipes,
                                    std::unordered_map<const Var*, VarPtr>& tpop_var_remap,
                                    std::unordered_set<const Var*>& superseded_tpop_vars,
                                    const std::map<const Stmt*, GmSyncPush>& gm_sync_pushes,
@@ -864,6 +970,10 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
     if (bm_it != boundary_moves.end()) {
       {
         const auto& bm = bm_it->second;
+        auto planned_it = planned_boundary_pipes.find(stmt.get());
+        const std::optional<int> pipe_id = planned_it == planned_boundary_pipes.end()
+                                               ? std::nullopt
+                                               : std::optional<int>(planned_it->second.pipe_id);
         // The cross-core transfer memory FOR THIS SIDE: AIC drains into Mat,
         // AIV into Vec. An op-driven boundary (aiv_shard / aic_gather) declares
         // only its CONSUMING lane's space (Vec / Mat respectively, see
@@ -927,7 +1037,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             push_source = tmov_var;
           }
           result.push_back(std::make_shared<EvalStmt>(
-              CreateTpush(push_op, push_source, stmt->span_, op_split, op_lane_stride), stmt->span_));
+              CreateTpush(push_op, push_source, stmt->span_, op_split, op_lane_stride, pipe_id),
+              stmt->span_));
         } else {
           // Op-driven pop: the half/full shape comes from the op result type and
           // the memory from this side's transfer memory; the explicit follow-on
@@ -988,7 +1099,7 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
           auto pop_kwargs = bm.op_driven ? MakeSplitKwargs(op_split, op_lane_stride)
                                          : std::vector<std::pair<std::string, std::any>>{};
           result.push_back(std::make_shared<AssignStmt>(
-              tpop_var, CreateTpop(pop_op, tpop_result_type, stmt->span_, pop_kwargs), stmt->span_));
+              tpop_var, CreateTpop(pop_op, tpop_result_type, stmt->span_, pop_kwargs, pipe_id), stmt->span_));
           if (needs_post_move) {
             auto target_memory = shape_tt->memory_space_;
             INTERNAL_CHECK_SPAN(target_memory.has_value(), stmt->span_)
@@ -1038,19 +1149,21 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
       // Recurse into compound statements, building pruned copies
       if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
         auto new_body = BuildCoreBody(side, FlattenBody(for_stmt->body_), stmt_map, boundary_moves,
-                                      tpop_var_remap, superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
+                                      planned_boundary_pipes, tpop_var_remap, superseded_tpop_vars,
+                                      gm_sync_pushes, gm_sync_pops);
         auto new_for = MutableCopy(for_stmt);
         new_for->body_ = MakeBody(new_body, for_stmt->span_);
         result.push_back(new_for);
       } else if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
         auto new_then = BuildCoreBody(side, FlattenBody(if_stmt->then_body_), stmt_map, boundary_moves,
-                                      tpop_var_remap, superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
+                                      planned_boundary_pipes, tpop_var_remap, superseded_tpop_vars,
+                                      gm_sync_pushes, gm_sync_pops);
         std::optional<StmtPtr> new_else;
         const auto& else_body = if_stmt->else_body_;
         if (else_body.has_value()) {
           auto new_else_stmts =
-              BuildCoreBody(side, FlattenBody(*else_body), stmt_map, boundary_moves, tpop_var_remap,
-                            superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
+              BuildCoreBody(side, FlattenBody(*else_body), stmt_map, boundary_moves, planned_boundary_pipes,
+                            tpop_var_remap, superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
           new_else = MakeBody(new_else_stmts, if_stmt->span_);
         }
         auto new_if = MutableCopy(if_stmt);
@@ -1059,7 +1172,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
         result.push_back(new_if);
       } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
         auto new_body = BuildCoreBody(side, FlattenBody(while_stmt->body_), stmt_map, boundary_moves,
-                                      tpop_var_remap, superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
+                                      planned_boundary_pipes, tpop_var_remap, superseded_tpop_vars,
+                                      gm_sync_pushes, gm_sync_pops);
         auto new_while = MutableCopy(while_stmt);
         new_while->body_ = MakeBody(new_body, while_stmt->span_);
         result.push_back(new_while);
@@ -1305,13 +1419,36 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs);
 
   std::map<const Stmt*, CVBoundaryMove> boundary_moves;
-  CollectCVBoundaryMoves(stmts, boundary_moves, tpop_defs);
+  std::vector<const Stmt*> boundary_order;
+  CollectCVBoundaryMoves(stmts, boundary_moves, boundary_order, tpop_defs);
+
+  std::optional<std::vector<PlannedCrossCorePipe>> planned_pipes;
+  PlannedBoundaryPipes planned_boundary_pipes;
+  if (func->HasAttr(kAutoFuseMixedFifoPlanAttr)) {
+    const std::string encoded = func->GetAttr<std::string>(kAutoFuseMixedFifoPlanAttr);
+    planned_pipes = cross_core_pipe::DecodePlannedCrossCorePipes(encoded);
+    INTERNAL_CHECK_SPAN(planned_pipes.has_value(), func->span_)
+        << "AutoFuse mixed FIFO contract is malformed or uses an unsupported version";
+    if (func->HasAttr("slot_num")) {
+      const int scope_slot_num = func->GetAttr<int>("slot_num", 0);
+      for (const auto& pipe : *planned_pipes) {
+        INTERNAL_CHECK_SPAN(pipe.slot_num == scope_slot_num, func->span_)
+            << "AutoFuse mixed FIFO " << pipe.pipe_id << " slot count " << pipe.slot_num
+            << " disagrees with outlined cross_core_slot " << scope_slot_num;
+      }
+    }
+    planned_boundary_pipes =
+        MatchPlannedPipesToBoundaries(*planned_pipes, boundary_order, boundary_moves, func->span_);
+  }
 
   // Detect GM-mediated cross-lane store/load dependencies (issue #1433) that
   // CollectCVBoundaryMoves misses, and schedule a tpush/tpop fence for each.
   std::map<const Stmt*, GmSyncPush> gm_sync_pushes;
   std::map<const Stmt*, std::vector<GmSyncPop>> gm_sync_pops;
   CollectGmCrossLaneSyncs(stmts, stmt_map, gm_sync_pushes, gm_sync_pops);
+  INTERNAL_CHECK_SPAN(!planned_pipes.has_value() || (gm_sync_pushes.empty() && gm_sync_pops.empty()),
+                      func->span_)
+      << "AutoFuse mixed FIFO contract does not price an additional GM-mediated cross-lane fence";
 
   // Build definition map from original body for init value fixup (#533)
   std::unordered_map<const Var*, StmtPtr> original_def_map;
@@ -1326,8 +1463,8 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
 
   // Build AIC body (recursive — handles MIXED compound stmts)
   std::unordered_map<const Var*, VarPtr> aic_tpop_remap;
-  auto aic_stmts = BuildCoreBody(CoreSide::AIC, stmts, stmt_map, boundary_moves, aic_tpop_remap,
-                                 superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
+  auto aic_stmts = BuildCoreBody(CoreSide::AIC, stmts, stmt_map, boundary_moves, planned_boundary_pipes,
+                                 aic_tpop_remap, superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
 
   // Remove ReturnStmt from AIC (AIC doesn't return values)
   std::vector<StmtPtr> aic_stmts_no_return;
@@ -1354,8 +1491,8 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
 
   // Build AIV body (recursive — handles MIXED compound stmts)
   std::unordered_map<const Var*, VarPtr> aiv_tpop_remap;
-  auto aiv_stmts = BuildCoreBody(CoreSide::AIV, stmts, stmt_map, boundary_moves, aiv_tpop_remap,
-                                 superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
+  auto aiv_stmts = BuildCoreBody(CoreSide::AIV, stmts, stmt_map, boundary_moves, planned_boundary_pipes,
+                                 aiv_tpop_remap, superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
   auto aiv_final =
       FinalizeTpopTfrees(FinalizeSplitCoreBody(aiv_stmts, original_def_map, remap_keys(aiv_tpop_remap)),
                          CoreSide::AIV, aiv_tpop_remap);
@@ -1373,7 +1510,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   std::optional<int> slot_num_override =
       func->HasAttr("slot_num") ? std::optional<int>(func->GetAttr<int>("slot_num", 0)) : std::nullopt;
   auto automatic_pipe_setup = BuildAutomaticPipeSetup(func->name_, aic_name, aiv_name, aic_final, aiv_final,
-                                                      slot_num_override, func->span_);
+                                                      slot_num_override, planned_pipes, func->span_);
   aic_final = PrependPipeSetup(automatic_pipe_setup.aic_stmts, aic_final);
   // Keep a leading get_subblock_idx binding (injected by the auto pl.split
   // LowerAutoVectorSplit path) above the pipe setup, matching the standalone
@@ -1425,9 +1562,10 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   RemapDanglingGmRefsToParam(aic_body_stmt, aic_map, gm_origin_map, func);
   auto [aic_cloned_body, aic_clone_map_unused] = DeepClone(aic_body_stmt, aic_map);
   (void)aic_clone_map_unused;
+  const auto emitted_attrs = StripAttr(func->attrs_, kAutoFuseMixedFifoPlanAttr);
   auto aic_func = std::make_shared<Function>(aic_name, aic_params, func->param_directions_,
                                              std::vector<TypePtr>{}, aic_cloned_body, func->span_,
-                                             FunctionType::AIC, std::nullopt, std::nullopt, func->attrs_);
+                                             FunctionType::AIC, std::nullopt, std::nullopt, emitted_attrs);
 
   // Create AIV function with deep clone (fresh Vars for all params and locals,
   // ensuring no shared Var pointers with AIC for structural equality)
@@ -1481,7 +1619,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
 
   auto [aiv_cloned_body, aiv_clone_map_unused] = DeepClone(MakeBody(aiv_final, func->span_), aiv_map);
   (void)aiv_clone_map_unused;
-  auto aiv_attrs = func->attrs_;
+  auto aiv_attrs = emitted_attrs;
   if (needs_dual_aiv_dispatch) {
     aiv_attrs.erase(std::remove_if(aiv_attrs.begin(), aiv_attrs.end(),
                                    [](const auto& kv) { return kv.first == kAttrDualAivDispatch; }),
@@ -1562,9 +1700,9 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   }
 
   auto group_body = SeqStmts::Flatten(std::move(group_stmts), func->span_);
-  auto group_func = std::make_shared<Function>(group_name, group_params, func->param_directions_,
-                                               func->return_types_, group_body, func->span_,
-                                               FunctionType::Group, std::nullopt, std::nullopt, func->attrs_);
+  auto group_func = std::make_shared<Function>(
+      group_name, group_params, func->param_directions_, func->return_types_, group_body, func->span_,
+      FunctionType::Group, std::nullopt, std::nullopt, emitted_attrs);
 
   return {aic_func, aiv_func, group_func};
 }

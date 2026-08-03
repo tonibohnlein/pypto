@@ -31,6 +31,12 @@ namespace ir {
 /// deliberately do not carry it.
 inline constexpr const char* kCompilerTensorToTileMatBridgeAttr = "__compiler_tensor_to_tile_mat_bridge";
 
+/// Versioned compiler-internal handoff from AutoFuse's mixed scheduler to
+/// ExpandMixedKernel. The packed string records every solver-owned physical
+/// cross-core FIFO independently; it is consumed when the mixed InCore
+/// function is split and must never reach backend codegen.
+inline constexpr const char* kAutoFuseMixedFifoPlanAttr = "__autofuse_mixed_fifo_plan";
+
 /// Attribute key for ``pl.pipeline(N, stage=F)`` — appears on ``ForStmt.attrs_``
 /// if and only if ``ForStmt.kind_ == ForKind::Pipeline`` (bidirectional invariant
 /// enforced by the structural verifier ``PipelineLoopValid``).

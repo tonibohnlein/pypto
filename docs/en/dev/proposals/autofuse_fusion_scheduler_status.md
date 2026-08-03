@@ -32,7 +32,7 @@ Gorder preserve lifetime/traffic. Silicon confirms one load for shared boundarie
 for `mul(x,x)`, normal transient lifetimes, safe topology declines, and P2/P4 correctness. Only the
 summed-versus-independent MTE2/MTE3 roof remains inconclusive; keep the conservative summed term.
 
-**Mixed host checkpoint (2026-07-29).** The solver builds one immutable same-engine stage DAG
+**Mixed host checkpoint (2026-08-03).** The solver builds one immutable same-engine stage DAG
 and cube/vector transfer graph per mixed candidate subgraph. A stack-local `MixedSchedulePlan`
 derives grid, 24-group mapping, loop trips, skew mode, and separate model-granted versus
 implementable-overlap bits without entering `CostResult`; winning/forced plans are reconstructed
@@ -42,10 +42,10 @@ non-skewable topologies receive a serial sum. Tests expose the main roofline gap
 assigned one-per-group do not create a two-item loop on either group. Direct QK-to-softmax can
 reuse the exact P4 vector-stage descriptor, but full `C→V→C→V` attention remains serial/inadmissible
 in compiler mode—and its key-chunk loop remains unrepresentable—until whole-FIFO multi-round-trip
-skew and the second loop axis exist. C2V and dense SwiGLU now have full host emit regressions for
-function-scoped FIFO lane offsets, MemRef-less load/TPOP buffer separation, and path-invariant
-conditional replies. The `74997b29` silicon failures predate the latter two fixes; mixed remains
-default-off until their device sentinel passes.
+skew and the second loop axis exist. C2V is silicon-closed after column-broadcast
+lowering was corrected to `tile.col_expand_add` (50/50 sequential launches).
+Dense SwiGLU now has separate gate/up C2V IDs and one V2C reply ID shared by mutually exclusive
+branches. Exact-ID expansion removes the merged-pipe mismatch but remains host-only; mixed stays off.
 
 **Cube device checkpoint (2026-07-24).** Earlier pure-cube sweeps validated clamped overlap,
 multi-window/ragged K, split-K, retained panels, and low-precision recursive chains. A8 remains
@@ -369,15 +369,15 @@ statistics update math remains deliberately algorithm-specific.
    and the analytic global-roofline/seed/tile-multiplicity gaps. Then profile exact search cost and
    retention hit rate. Keep ragged recursive multi-op grids uniform-only unless workloads justify
    edge-specific request propagation.
-5. **Silicon-close mixed v1:** one-way `C->V` and exact dense
+5. **Silicon-close the revised dense mixed v1:** one-way `C->V` is closed, and exact dense
    `C,C->V->C` now have real pipeline-item descriptors and standard
    `ExpandMixedKernel` → `InjectGMPipeBuffer` → `SkewCrossCorePipeline` emit.
    Function-scoped, byte-exact runtime lane offsets are confirmed in generated
-   code. The latest host revision additionally keeps C2V's loaded bias separate
-   from its MemRef-less TPOP writer and recognizes SwiGLU's conditional reply
-   before pipeline unrolling can reorder it ahead of the projection pushes.
-   Rerun both positive sentinels, then close traffic/overlap/ranking only after
-   numeric correctness passes.
+   code for every physical ID. The latest host revision keeps C2V's loaded bias
+   separate from its MemRef-less TPOP writer, recognizes SwiGLU's conditional
+   reply before pipeline unrolling, and no longer merges its three logical
+   channels. Rerun the dense sentinel, then close traffic/overlap/ranking only
+   after numeric correctness passes.
    Full flash attention still waits for whole-FIFO multi-round-trip skew.
 
 **Deferred (all decline *gracefully* today — correctness intact, not fused):** the ProblemBuilder

@@ -2120,6 +2120,81 @@ class TestPropertyVerification:
         ):
             passes.verify_properties(prop_set, BadProgram, "test")
 
+    def test_verifier_rejects_tfree_with_different_pipe_id(self):
+        """A slot must be released through the same physical FIFO it was popped from."""
+
+        @pl.program
+        class BadProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def bad_aiv(self):
+                pipe_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=pipe_buf, id=3)
+                popped: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=0, id=3
+                )
+                pl.tfree_to_aic(popped, id=4)
+
+        prop_set = passes.IRPropertySet()
+        prop_set.insert(passes.IRProperty.MixedKernelExpanded)
+
+        with pytest.raises(pypto.Error, match=re.escape("must free tpop pipe id 3 with the same id, got 4")):
+            passes.verify_properties(prop_set, BadProgram, "test")
+
+    def test_verifier_rejects_pipe_id_initialized_for_wrong_direction(self):
+        """A pipe ID cannot be used in a direction its own initializer disables."""
+
+        @pl.program
+        class BadProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def bad_aiv(self):
+                pipe_buf = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="bad_aic")
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), pipe_buf, dir_mask=2, slot_size=512, id=3)
+                popped: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=0, id=3
+                )
+                pl.tfree_to_aic(popped, id=3)
+
+        prop_set = passes.IRPropertySet()
+        prop_set.insert(passes.IRProperty.MixedKernelExpanded)
+
+        with pytest.raises(pypto.Error, match=re.escape("in a direction its initialize_pipe disables")):
+            passes.verify_properties(prop_set, BadProgram, "test")
+
+    def test_verifier_rejects_different_descriptors_on_split_siblings(self):
+        """The AIC and AIV halves must agree on every physical FIFO descriptor."""
+
+        @pl.program
+        class BadProgram:
+            @pl.function(type=pl.FunctionType.AIC)
+            def pair_aic(self):
+                c2v_peer = pl.import_peer_buffer(name="pair_c2v", peer_func="pair_aiv")
+                pl.aic_initialize_pipe(
+                    c2v_peer,
+                    pl.const(0, pl.INT32),
+                    dir_mask=1,
+                    slot_size=512,
+                    slot_num=4,
+                    id=0,
+                )
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def pair_aiv(self):
+                c2v_buffer = pl.reserve_buffer(name="pair_c2v", size=4096)
+                pl.aiv_initialize_pipe(
+                    c2v_buffer,
+                    pl.const(0, pl.INT32),
+                    dir_mask=1,
+                    slot_size=1024,
+                    slot_num=4,
+                    id=0,
+                )
+
+        prop_set = passes.IRPropertySet()
+        prop_set.insert(passes.IRProperty.MixedKernelExpanded)
+
+        with pytest.raises(pypto.Error, match=re.escape("has different pipe id/direction/slot descriptors")):
+            passes.verify_properties(prop_set, BadProgram, "test")
+
     def test_verifier_rejects_late_pipe_setup(self):
         """Pipe setup must appear before the first cross-core op."""
 
@@ -2148,6 +2223,58 @@ class TestPropertyVerification:
 
 class TestAutoPipeSetup:
     """Test auto-generated reserve/import/initialize_pipe setup."""
+
+    def test_planned_pipe_contract_rejects_unsupported_version(self):
+        """A private solver contract with an unknown version must fail closed."""
+
+        @pl.program
+        class Before:
+            @pl.function(
+                type=pl.FunctionType.InCore,
+                attrs={"__autofuse_mixed_fifo_plan": "2;0,1,16,128,8192,4,0,0"},
+            )
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+                x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+                y_mat = pl.load(y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+                y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+                product = pl.matmul(x_left, y_right)
+                product_vec = pl.move(product, target_memory=pl.MemorySpace.Vec)
+                return pl.store(product_vec, [0, 0], out)
+
+        with pytest.raises(pypto.InternalError, match="mixed FIFO contract is malformed"):
+            _expand_raw(Before)
+
+    def test_planned_pipe_contract_rejects_boundary_shape_mismatch(self):
+        """The solver descriptor cannot be replayed onto a differently shaped boundary."""
+
+        @pl.program
+        class Before:
+            @pl.function(
+                type=pl.FunctionType.InCore,
+                attrs={"__autofuse_mixed_fifo_plan": "1;0,1,8,128,4096,4,0,0"},
+            )
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+                x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+                y_mat = pl.load(y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+                y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+                product = pl.matmul(x_left, y_right)
+                product_vec = pl.move(product, target_memory=pl.MemorySpace.Vec)
+                return pl.store(product_vec, [0, 0], out)
+
+        with pytest.raises(pypto.InternalError, match="planned valid shape 8x128 disagrees"):
+            _expand_raw(Before)
 
     def test_bidirectional_different_slot_sizes_uses_max(self):
         """Bidirectional kernels with different per-direction tile sizes use max as slot_size."""
@@ -2419,8 +2546,8 @@ class TestAutoPipeSetup:
 
         _assert_function_equal(After, Expected, "main_incore_0_aiv")
 
-    def test_alias_tfree_preserves_explicit_pipe_id(self):
-        """Canonicalizing a tfree alias must keep its original pipe id kwarg."""
+    def test_alias_tfree_preserves_matching_explicit_pipe_id(self):
+        """Canonicalizing a tfree alias keeps its valid explicit pipe id."""
 
         @pl.program
         class Before:
@@ -2428,7 +2555,7 @@ class TestAutoPipeSetup:
             def main_incore_0(self):
                 received: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(
                     split=0,
-                    id=1,
+                    id=0,
                 )
                 alias: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = received
                 pl.tfree_to_aiv(alias, id=0)
