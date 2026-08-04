@@ -32,7 +32,7 @@ Gorder preserve lifetime/traffic. Silicon confirms one load for shared boundarie
 for `mul(x,x)`, normal transient lifetimes, safe topology declines, and P2/P4 correctness. Only the
 summed-versus-independent MTE2/MTE3 roof remains inconclusive; keep the conservative summed term.
 
-**Mixed host checkpoint (2026-08-04).** The solver builds one immutable same-engine stage DAG
+**Mixed silicon checkpoint (2026-08-04).** The solver builds one immutable same-engine stage DAG
 and cube/vector transfer graph per mixed candidate subgraph. A stack-local `MixedSchedulePlan`
 derives grid, 24-group mapping, loop trips, skew mode, and separate model-granted versus
 implementable-overlap bits without entering `CostResult`; winning/forced plans are reconstructed
@@ -48,7 +48,11 @@ Dense SwiGLU now has separate gate/up C2V IDs and one V2C reply ID shared by mut
 branches. The first PTOAS v0.55 sentinel exposed a downstream numbering mismatch: logical IDs
 `0/1/2` became physical `TPipe` IDs `0/2/4`. The wrapper now binds those declarations through
 direction/slot descriptors instead of numeric identity and fails closed on ambiguity. This repair
-remains host-only; mixed stays off pending a fresh sentinel.
+is now silicon-closed at PyPTO `67df6fb6`: the production dense-SwiGLU kernel passed more than
+200 launches across two 910B2 devices, including 50/50 sequential launches per device at F=128
+and the formerly intermittent F=112/F=144 natural plans. The independent tagged three-pipe
+primitive remains structurally verified only. Mixed stays default-off pending traffic, overlap,
+and ranking grounding.
 
 **Cube device checkpoint (2026-07-24).** Earlier pure-cube sweeps validated clamped overlap,
 multi-window/ragged K, split-K, retained panels, and low-precision recursive chains. A8 remains

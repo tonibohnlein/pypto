@@ -9,16 +9,16 @@ logical ID 用于验证 IR 连线；PTOAS 可以重编号生成的 `TPipe` templ
 backend 根据保留的方向和 slot 几何进行绑定，而不假设数值相等。
 
 通用 `[M,N] + [1,N]` 修正为 `tile.col_expand_add` 后，silicon 已完成单向 C2V
-epilogue 闭环（连续 50/50 次通过，无漂移）。dense SwiGLU 尚未完成 silicon
-闭环：旧 lowering 把两个 C2V projection channel 和一个 V2C activation reply
-合并成单个双向 FIFO，而 primitive 诊断表明该合并协议下的 split-lane completion
-不安全。当前 host revision 修复了这一 model/emit 违约：版本化 solver descriptor
-会一直传递到 `ExpandMixedKernel`，并生成三个独立 logical pipe，保留精确
-frontend ID、字节宽度、slot 数、workspace 范围和 runtime lane offset。PTOAS
-v0.55 在首次 sentinel 中把 C++ template ID 从 `0/1/2` 重编号为 `0/2/4`；backend
-现在按方向和 slot 几何匹配 physical declaration，同一 descriptor 若需要不同
-offset 则 fail closed。host 结构与 tensor replay 测试均通过，但修复后的三 pipe
-协议仍需新的 910B sentinel。主机测试还验证了
+epilogue 闭环（连续 50/50 次通过，无漂移）。dense SwiGLU 也已在 PyPTO
+`67df6fb6` 与 PTOAS v0.55 上完成 silicon 闭环。旧 lowering 把两个 C2V projection
+channel 和一个 V2C activation reply 合并成单个双向 FIFO；修复后的协议保留三个
+独立 logical pipe 及其精确字节宽度、slot 数、workspace 范围和 runtime lane offset。
+PTOAS 把 C++ template ID 从 `0/1/2` 重编号为 `0/2/4`，因此 backend 按方向和 slot
+几何绑定 physical declaration，而不依赖数值相等。生产 kernel 在两台 910B2 上
+累计通过 200 多次 launch，包括每台设备 F=128 强制 descriptor 的连续 50/50 次，
+以及此前间歇失败的 F=112/F=144 natural plan。独立 tagged 三 pipe primitive 已完成
+结构验证，但尚未在 device 上执行。mixed mode 继续默认关闭，等待流量、重叠和排序
+grounding，而不是等待正确性修复。主机测试还验证了
 tensor 级等价性以及完整的
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` 结构。各引擎内部
 的工作继续以同构 vector/cube 契约为准；本文只定义引擎边界处新增的契约。
@@ -157,8 +157,7 @@ down accumulator 是唯一的拓扑专用 cube 包装：若对每个 feature chu
 - 支持对称 `V->C`；
 - 支持完整多次往返 skew，并实现具有 key-chunk 循环和 `(m,l,O)` 状态的
   FlashAttention；
-- 在完成 PTOAS physical-ID descriptor binding 的三 independent-pipe dense SwiGLU
-  lowering 上重跑 910B 数值 sentinel，
-  通过后再完成流量、重叠和排序验证。
+- 完成三 independent-pipe dense SwiGLU 的流量、重叠和排序验证；其生产 kernel
+  数值契约已经 silicon-closed，独立 tagged primitive 仍只有结构证据。
 
 mixed fusion 在 M1-M10 的计划/发射结构测试和芯片验证完成前默认保持关闭。

@@ -12,18 +12,19 @@ slot geometry rather than numeric equality.
 
 Silicon closes the one-way C2V epilogue after generic `[M,N] + [1,N]` was fixed
 to materialize `tile.col_expand_add` (50/50 sequential launches, no drift).
-Dense SwiGLU is not silicon-closed. Earlier lowering collapsed its two C2V
-projection channels and one V2C activation reply into one bidirectional FIFO;
-primitive diagnostics show that split-lane completion on that merged protocol
-is unsafe. The current host revision removes that model/emit violation: the
-versioned solver descriptor survives to `ExpandMixedKernel`, which emits three
-independent logical pipes with exact frontend IDs, byte widths, slot counts,
-workspace ranges, and runtime lane offsets. PTOAS v0.55 renumbers their C++
-template IDs (`0/1/2` became `0/2/4` in the first sentinel); the backend now
-matches those physical declarations by direction and slot geometry and fails
-closed if an identical descriptor would require different offsets. Host
-structural and tensor-replay tests pass; the repaired three-pipe protocol still
-requires a fresh 910B sentinel.
+Dense SwiGLU is also silicon-closed at PyPTO `67df6fb6` with PTOAS v0.55.
+Earlier lowering collapsed its two C2V projection channels and one V2C
+activation reply into one bidirectional FIFO; the repaired protocol instead
+preserves three independent logical pipes with exact byte widths, slot counts,
+workspace ranges, and runtime lane offsets. PTOAS renumbers their C++ template
+IDs (`0/1/2` becomes `0/2/4`), so the backend binds physical declarations by
+direction and slot geometry rather than numeric identity. The production
+kernel passed more than 200 launches across two 910B2 devices, including 50/50
+sequential launches per device at the forced F=128 descriptor and the formerly
+intermittent F=112/F=144 natural plans. An independent tagged three-pipe
+primitive verifies descriptor binding structurally but has not yet run on
+device. Mixed mode remains default-off pending traffic, overlap, and ranking
+grounding rather than correctness repair.
 
 Host tests also close tensor-level equivalence and the full
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` structure.
@@ -299,20 +300,20 @@ The remaining model/emit gaps are:
   host lowering proves ordering and capacity, not AIC item `k+1` overlap with AIV item `k`;
 - analytic `C->V->C->V` topology is retained and receives a serial stage sum, while compiler mode
   cuts it; the current unified spatial grid also cannot express its key-chunk loop.
-- the dense surface still needs latest-PTOAS 910B correctness, traffic,
-  overlap, and ranking validation.
+- the dense surface still needs latest-PTOAS 910B traffic, overlap, and ranking
+  validation; its three-pipe numerical contract is silicon-closed.
 
 These are explicit migration gaps, not permission for the emitter to approximate the plan.
 
 Latest 910B2 isolation closes the C2V sentinel: the final AIV uses
 `tile.col_expand_add`, preserves disjoint load/result allocations, and passes
-50/50 sequential launches. The first independent three-pipe dense-SwiGLU
-sentinel then stopped at code generation: its IR correctly carried logical IDs
-`0/1/2`, but PTOAS v0.55 emitted physical template IDs `0/2/4` and the wrapper
-incorrectly assumed numeric identity. Descriptor-based binding removes that
-downstream ABI assumption without changing the model or expanded IR. This is
-host-validated only; no mixed performance result is valid until the repaired
-three-pipe device sentinel passes. The flag therefore remains off.
+50/50 sequential launches. The three-pipe dense-SwiGLU sentinel initially
+stopped at code generation because its IR logical IDs `0/1/2` became PTOAS
+physical template IDs `0/2/4`. Descriptor-based binding removes that downstream
+ABI assumption without changing the model or expanded IR. The repaired
+production kernel now passes more than 200 launches across two devices with no
+NaN, hang, AICPU exception, or numerical mismatch. This closes correctness;
+the flag remains off until mixed performance and overlap are grounded.
 
 ## 7. Implementation sequence
 
@@ -325,13 +326,14 @@ three-pipe device sentinel passes. The flag therefore remains off.
    broadcast multiplicity, live-out, matmul-semantic gates, and the 910B
    MemRef-less load/TPOP no-alias guard. Generic `[M,N] + [1,N]` is now required
    to materialize as `tile.col_expand_add`. Unsupported mixed topologies remain partition boundaries.
-4. **Done (host implementation and structural validation; repaired silicon sentinel pending):** add the exact
+4. **Done (silicon-closed):** add the exact
    `C,C->V->C` dense-SwiGLU algorithm. Reuse homogeneous stage costs, carry the
    down accumulator across feature chunks, and extend skew to one ordered
    multi-push bundle followed by one path-invariant reply. Preserve its two C2V
    projections and V2C reply as three independently sized logical FIFOs;
    descriptor-bind their PTOAS-renumbered physical declarations before adding
-   lane offsets. The protocol is not yet device-closed.
+   lane offsets. The production protocol passes more than 200 launches across
+   two 910B2 devices; the independent tagged primitive remains structural-only.
 5. Enumerate or analytically choose between more serial groups and fewer pipelined groups. Price
    dependent init, steady, tail, and drain phases separately.
 6. Generalize the current stage-local homogeneous views without duplicating
