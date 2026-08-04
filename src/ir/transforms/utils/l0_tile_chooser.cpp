@@ -795,6 +795,9 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
   shared.align_m = cfg.align_m;
   shared.align_n = cfg.align_n;
   shared.align_k = cfg.align_k;
+  shared.l0c_align_m = cfg.l0c_align_m;
+  shared.box_align_m = cfg.box_align_m;
+  shared.box_align_n = cfg.box_align_n;
   shared.allow_a_stationary = cfg.allow_a_stationary;
   shared.allow_b_stationary = cfg.allow_b_stationary;
   shared.allow_double_buffer_c = cfg.allow_double_buffer_c;
@@ -821,6 +824,7 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
   shared.drain_c0_bytes = cfg.drain_c0_bytes;
   shared.mad_head_cycles = cfg.mad_head;
   shared.mad_k_fractal_bytes = cfg.mad_k_fractal_bytes;
+  shared.mad_fp32_passes = cfg.mad_fp32_passes;
 
   const L0MatmulPlan plan = choose_l0_matmul_plan(shared);
   CHECK(plan.feasible) << "ChooseL0Tile: " << plan.diagnostic;
