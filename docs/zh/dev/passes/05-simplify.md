@@ -8,7 +8,7 @@
 
 1. **算术折叠**：在每个表达式叶子上执行（例如 `x + 0 → x`、`x * 1 → x`、`min(a, a) → a`，以及分析器能判定的比较）。
 2. **类型重建**：重新遍历 `TensorType`、`TileType`、`TupleType` 中嵌入的 shape 表达式，使内存中的 IR 与重新解析得到的结果一致。
-3. **标量绑定以辅助折叠 + DCE**：仅被赋值一次的标量 `Var` 会注册到分析器。在函数体顶层赋的常量会被完整绑定，其字面量向所有下游使用处传播；符号值，或循环/分支内部的常量，只贡献一个 `ConstIntBound`——足以折叠 `if expr == 0` 这类恒死的分支守卫，而不会把标量内联到使用点。残留的死绑定随后由保守的标量 DCE 删除。
+3. **标量绑定以辅助折叠 + 窄范围 DCE**：仅被赋值一次的标量 `Var` 会注册到分析器。在函数体顶层赋的常量会被完整绑定，其字面量向所有下游使用处传播；符号值，或循环/分支内部的常量，只贡献一个 `ConstIntBound`——足以折叠 `if expr == 0` 这类恒死的分支守卫，而不会把标量内联到使用点。残留的死绑定由保守 DCE 删除；已知纯的 `tile.create` 如果未被使用，也会被删除。
 
 在 `pass_manager.py` 的 `Default` 策略中本 Pass 运行**三次**：
 
@@ -24,7 +24,7 @@
 
 **失效 (Invalidates)**：无。
 
-`PassProperties` 为空（`include/pypto/ir/transforms/pass_properties.h` 中的 `kSimplifyProperties`）是有意为之：Simplify 足够保守，会保留调用方此前可能已经建立的所有属性（`SSAForm`、`NormalizedStmtStructure`、`IncoreTileOps` 等）——它只重写表达式、删除标量绑定，从不改变语句结构。
+`PassProperties` 为空（`include/pypto/ir/transforms/pass_properties.h` 中的 `kSimplifyProperties`）是有意为之：Simplify 足够保守，会保留调用方此前可能已经建立的所有属性（`SSAForm`、`NormalizedStmtStructure`、`IncoreTileOps` 等）——它重写表达式、折叠可证明的控制流，并且只删除死标量绑定或未使用的 `tile.create` 占位值，不改变剩余程序的语义。
 
 ## 使用时机
 
@@ -68,7 +68,7 @@ program_simplified = simplify_pass(program)
    - `IfStmt`：进入 `Analyzer::GetConstraintContext(cond)` 处理 then 分支，进入 `Not(cond)` 处理 else 分支；每个分支内绑定的标量会在该分支结束后解绑，以免泄漏到另一分支或越过 `IfStmt`。可由分析器证明的条件也会被折叠 —— 见下文「控制流折叠」。
    - `WhileStmt` / `SpmdScopeStmt`：以同样的区域化标量解绑方式访问循环体；`SpmdScopeStmt` 还会折叠 `core_num_`（如 `MAX // TILE` 这样的闭包算术，可能需要 SSA 之后再化简一次）。
 3. **类型重建**：`SimplifyType` 递归地处理 `TensorType`、`TileType`、`TupleType`，对每一个嵌入的表达式（shape、stride、valid_shape、start_offset、view 字段）调用 `SimplifyExpr`。当无变化时保留原对象，使往返一致性检查仍然便宜。
-4. **标量 DCE**：mutator 完成后，`dce::EliminateDeadScalarAssignments` 在展平的函数体上运行，删除所有「全部使用都被折掉了」的标量 `AssignStmt`。该 DCE 是保守的：永远不会删除 Call 支撑的赋值，因为 IR 目前还没有纯度标注，`Call` 可能存在可观察的副作用。
+4. **窄范围 DCE**：mutator 完成后，`dce::EliminateDeadScalarAndTileCreateAssignments` 在展平的函数体上运行，删除所有「全部使用都被折掉了」的标量 `AssignStmt`。它还会删除未使用的 `tile.create`：该操作只声明未初始化的局部 tile，没有可观察效果。其他 Call 支撑的赋值仍保守地保留，因为 IR 目前还没有通用纯度标注，`Call` 可能存在可观察的副作用。当静态首次迭代 matmul 分支被折叠后，这条规则可防止循环携带的占位 tile 残留为第二块 L0C 分配。
 5. **循环状态修复**：如果 DCE 删除了任何语句，由 `loop_repair::MakeBody` 重新组装函数体，确保循环携带元信息（yield/return 映射）保持一致。
 
 ### 控制流折叠

@@ -822,15 +822,38 @@ class TestScalarConstantPropagation:
 
 
 # ============================================================================
-# Scalar dead-code elimination (conservative — preserves Call-RHS assigns)
+# Scalar and known-pure tile.create dead-code elimination
 # ============================================================================
 
 
+def test_drops_unused_pure_tile_create_but_keeps_live_tile_create():
+    """Simplify removes a dead local placeholder without broad Call DCE."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self) -> pl.Tile[[16, 16], pl.FP32, pl.Mem.Acc]:
+            _dead: pl.Tile[[16, 16], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                [16, 16], dtype=pl.FP32, target_memory=pl.Mem.Acc
+            )
+            live: pl.Tile[[16, 16], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                [16, 16], dtype=pl.FP32, target_memory=pl.Mem.Acc
+            )
+            return live
+
+    after = passes.simplify()(Before)
+    printed = ir.python_print(after)
+
+    assert "_dead:" not in printed
+    assert printed.count("pl.tile.create(") == 1
+    assert "return live" in printed
+
+
 class TestScalarDCE:
-    """The final step of Simplify is a conservative scalar DCE. It removes
-    AssignStmts whose LHS is scalar and whose RHS is not a Call, provided
-    the LHS has no remaining uses. Call-backed and tensor-typed assigns
-    are always preserved — the IR has no purity annotation yet."""
+    """The final step of Simplify is a conservative DCE. It removes scalar
+    AssignStmts whose RHS is not a Call and removes unused, known-pure
+    ``tile.create`` values. Other Call-backed and non-scalar assignments stay
+    preserved because the IR has no general purity annotation yet."""
 
     def test_removes_unused_scalar_const(self):
         """A scalar constant with no uses is removed."""

@@ -57,6 +57,14 @@ std::vector<StmtPtr> EliminateDeadCode(const std::vector<StmtPtr>& stmts);
 /// bindings (`a = 5; b = a + 1; c = b + 1` with `c` unused) collapse fully.
 std::vector<StmtPtr> EliminateDeadScalarAssignments(const std::vector<StmtPtr>& stmts);
 
+/// Conservative scalar + unused tile.create DCE.
+///
+/// Extends ``EliminateDeadScalarAssignments`` with one compiler-known pure
+/// Call: ``tile.create``. An unused tile.create only declares an uninitialized
+/// local tile; it performs no transfer or externally observable action. Other
+/// Call-backed assignments remain preserved conservatively.
+std::vector<StmtPtr> EliminateDeadScalarAndTileCreateAssignments(const std::vector<StmtPtr>& stmts);
+
 /// Drop `IfStmt::return_vars_` entries whose Var has no use anywhere in the
 /// surrounding statement list, and the matching slot from each branch's
 /// trailing `YieldStmt`. Recurses into nested control-flow and scope bodies,

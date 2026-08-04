@@ -803,9 +803,9 @@ FunctionPtr TransformSimplify(const FunctionPtr& func) {
   // shield: the spec rides the dispatch in this function and IRVisitor walks
   // the Call's Expr-valued attrs, so it is an ordinary use.
   auto flat = transform_utils::FlattenToStmts(new_body);
-  auto pre_pruned = dce::EliminateDeadScalarAssignments(flat);
+  auto pre_pruned = dce::EliminateDeadScalarAndTileCreateAssignments(flat);
   auto phi_pruned = dce::EliminateDeadIfReturnVars(pre_pruned);
-  auto pruned = dce::EliminateDeadScalarAssignments(phi_pruned);
+  auto pruned = dce::EliminateDeadScalarAndTileCreateAssignments(phi_pruned);
   bool dce_changed = pruned.size() != flat.size() ||
                      !std::equal(pruned.begin(), pruned.end(), flat.begin(),
                                  [](const StmtPtr& a, const StmtPtr& b) { return a.get() == b.get(); });

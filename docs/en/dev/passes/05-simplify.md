@@ -8,7 +8,7 @@ Folds arithmetic expressions, type-embedded shape expressions, and scalar consta
 
 1. **Arithmetic folding** at every expression leaf (e.g. `x + 0 → x`, `x * 1 → x`, `min(a, a) → a`, comparisons that the analyzer can decide).
 2. **Type rebuild** — re-walks shape expressions embedded in `TensorType`, `TileType`, and `TupleType` so the in-memory IR matches what a fresh parse would produce.
-3. **Scalar binding for folding + DCE** — a scalar `Var` assigned once is registered with the analyzer. A constant assigned at function-body top level is bound fully so its literal propagates into every downstream use; a symbolic value, or a constant inside a loop/branch, contributes only a `ConstIntBound` — enough to fold dead branch guards like `if expr == 0` without inlining the scalar. Bindings left dead are dropped by a conservative scalar DCE.
+3. **Scalar binding for folding + narrow DCE** — a scalar `Var` assigned once is registered with the analyzer. A constant assigned at function-body top level is bound fully so its literal propagates into every downstream use; a symbolic value, or a constant inside a loop/branch, contributes only a `ConstIntBound` — enough to fold dead branch guards like `if expr == 0` without inlining the scalar. Bindings left dead are dropped by a conservative DCE, which also removes unused `tile.create` placeholders because that operation is compiler-known pure.
 
 The pass runs **three times** in the `Default` strategy of `pass_manager.py`:
 
@@ -25,7 +25,7 @@ The pass runs **three times** in the `Default` strategy of `pass_manager.py`:
 
 **Invalidates**: nothing.
 
-The empty `PassProperties` contract (`kSimplifyProperties` in `include/pypto/ir/transforms/pass_properties.h`) is intentional: Simplify is conservative enough to preserve every property its callers may have established (`SSAForm`, `NormalizedStmtStructure`, `IncoreTileOps`, ...) — it only rewrites expressions and prunes scalar bindings, never restructures statements.
+The empty `PassProperties` contract (`kSimplifyProperties` in `include/pypto/ir/transforms/pass_properties.h`) is intentional: Simplify is conservative enough to preserve every property its callers may have established (`SSAForm`, `NormalizedStmtStructure`, `IncoreTileOps`, ...) — it rewrites expressions, folds proven control flow, and prunes dead scalar bindings or unused `tile.create` placeholders without changing the remaining program's semantics.
 
 ## When to Use
 
@@ -70,7 +70,7 @@ Implemented by `TransformSimplify` in `src/ir/transforms/simplify_pass.cpp` in f
    - `IfStmt`: enter `Analyzer::GetConstraintContext(cond)` for the then branch and `Not(cond)` for the else branch; scalars bound inside each branch are unbound after that branch so they do not leak into the other branch or past the `IfStmt`. Conditions the analyzer can prove are also folded — see "Control-flow folding" below.
    - `WhileStmt` / `SpmdScopeStmt`: visit the body with the same scoped scalar unbinding; `SpmdScopeStmt` additionally folds `core_num_` (closure arithmetic such as `MAX // TILE` may need one pass of simplification after SSA conversion).
 3. **Type rebuild** — `SimplifyType` recurses through `TensorType`, `TileType`, and `TupleType`, calling `SimplifyExpr` on every embedded expression (shape, stride, valid_shape, start_offset, view fields). Identity is preserved when nothing changes so the round-trip identity check stays cheap.
-4. **Scalar DCE** — after the mutator finishes, `dce::EliminateDeadScalarAssignments` walks the flattened body and drops scalar `AssignStmt`s whose only uses were folded away. The DCE is conservative: it never removes call-backed assignments because the IR has no purity annotations yet and a `Call` may have observable side effects.
+4. **Narrow DCE** — after the mutator finishes, `dce::EliminateDeadScalarAndTileCreateAssignments` walks the flattened body and drops scalar `AssignStmt`s whose only uses were folded away. It also drops unused `tile.create` assignments: they only declare uninitialized local tiles and have no observable effect. Every other call-backed assignment remains preserved because the IR has no general purity annotations yet and a `Call` may have observable side effects. The `tile.create` case matters after a static first-iteration matmul branch folds away: its loop-carried placeholder must not survive as a second L0C allocation.
 5. **Loop-state repair** — if DCE removed any statements, `loop_repair::MakeBody` reassembles the function body so loop-carried metadata (yield/return mappings) stays consistent.
 
 ### Control-flow folding

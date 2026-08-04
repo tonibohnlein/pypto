@@ -467,6 +467,15 @@ bool IsRemovableScalarAssign(const StmtPtr& stmt) {
   return true;
 }
 
+/// Predicate for the Simplify pass's narrow extension of scalar DCE. Keep the
+/// existing conservative Call rule except for tile.create, whose result is an
+/// uninitialized local value and whose removal has no observable side effect.
+bool IsRemovableScalarOrTileCreateAssign(const StmtPtr& stmt) {
+  if (IsRemovableScalarAssign(stmt)) return true;
+  auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt);
+  return assign && GetStmtOpName(stmt) == "tile.create";
+}
+
 // ============================================================================
 // EliminateDeadIfReturnVars — drop IfStmt phi return_vars with no Var* user.
 // ============================================================================
@@ -634,6 +643,10 @@ std::vector<StmtPtr> EliminateDeadCode(const std::vector<StmtPtr>& stmts) {
 
 std::vector<StmtPtr> EliminateDeadScalarAssignments(const std::vector<StmtPtr>& stmts) {
   return EliminateDeadCodeCore(stmts, IsRemovableScalarAssign);
+}
+
+std::vector<StmtPtr> EliminateDeadScalarAndTileCreateAssignments(const std::vector<StmtPtr>& stmts) {
+  return EliminateDeadCodeCore(stmts, IsRemovableScalarOrTileCreateAssign);
 }
 
 std::vector<StmtPtr> EliminateDeadIfReturnVars(const std::vector<StmtPtr>& stmts) {
