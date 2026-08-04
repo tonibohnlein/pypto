@@ -32,7 +32,7 @@ Gorder preserve lifetime/traffic. Silicon confirms one load for shared boundarie
 for `mul(x,x)`, normal transient lifetimes, safe topology declines, and P2/P4 correctness. Only the
 summed-versus-independent MTE2/MTE3 roof remains inconclusive; keep the conservative summed term.
 
-**Mixed host checkpoint (2026-08-03).** The solver builds one immutable same-engine stage DAG
+**Mixed host checkpoint (2026-08-04).** The solver builds one immutable same-engine stage DAG
 and cube/vector transfer graph per mixed candidate subgraph. A stack-local `MixedSchedulePlan`
 derives grid, 24-group mapping, loop trips, skew mode, and separate model-granted versus
 implementable-overlap bits without entering `CostResult`; winning/forced plans are reconstructed
@@ -45,7 +45,10 @@ in compiler mode—and its key-chunk loop remains unrepresentable—until whole-
 skew and the second loop axis exist. C2V is silicon-closed after column-broadcast
 lowering was corrected to `tile.col_expand_add` (50/50 sequential launches).
 Dense SwiGLU now has separate gate/up C2V IDs and one V2C reply ID shared by mutually exclusive
-branches. Exact-ID expansion removes the merged-pipe mismatch but remains host-only; mixed stays off.
+branches. The first PTOAS v0.55 sentinel exposed a downstream numbering mismatch: logical IDs
+`0/1/2` became physical `TPipe` IDs `0/2/4`. The wrapper now binds those declarations through
+direction/slot descriptors instead of numeric identity and fails closed on ambiguity. This repair
+remains host-only; mixed stays off pending a fresh sentinel.
 
 **Cube device checkpoint (2026-07-24).** Earlier pure-cube sweeps validated clamped overlap,
 multi-window/ragged K, split-K, retained panels, and low-precision recursive chains. A8 remains
@@ -373,7 +376,8 @@ statistics update math remains deliberately algorithm-specific.
    `C,C->V->C` now have real pipeline-item descriptors and standard
    `ExpandMixedKernel` → `InjectGMPipeBuffer` → `SkewCrossCorePipeline` emit.
    Function-scoped, byte-exact runtime lane offsets are confirmed in generated
-   code for every physical ID. The latest host revision keeps C2V's loaded bias
+   code after descriptor-binding every PTOAS-renumbered physical declaration.
+   The latest host revision keeps C2V's loaded bias
    separate from its MemRef-less TPOP writer, recognizes SwiGLU's conditional
    reply before pipeline unrolling, and no longer merges its three logical
    channels. Rerun the dense sentinel, then close traffic/overlap/ranking only

@@ -2,10 +2,13 @@
 
 **Status:** the buildable `C->V` increment and first exact `C,C->V->C`
 dense-SwiGLU increment are implemented behind `PYPTO_AUTOFUSE_MIXED=1`.
-The explicit A2A3 dual-AIV FIFO lane bridge is function-scoped, pipe-ID-aware,
-and byte-exact: it rewrites only the selected AIV function, gives pipe-only AIV
-functions one private runtime lane parameter, and derives each pipe endpoint's
-entry offset from that pipe's own tile shape and dtype.
+The explicit A2A3 dual-AIV FIFO lane bridge is function-scoped,
+pipe-descriptor-aware, and byte-exact: it rewrites only the selected AIV
+function, gives pipe-only AIV functions one private runtime lane parameter,
+and derives each pipe endpoint's entry offset from that pipe's own tile shape
+and dtype. Frontend logical IDs validate IR wiring; generated PTOAS `TPipe`
+template IDs may be renumbered and are bound through preserved direction and
+slot geometry rather than numeric equality.
 
 Silicon closes the one-way C2V epilogue after generic `[M,N] + [1,N]` was fixed
 to materialize `tile.col_expand_add` (50/50 sequential launches, no drift).
@@ -14,9 +17,13 @@ projection channels and one V2C activation reply into one bidirectional FIFO;
 primitive diagnostics show that split-lane completion on that merged protocol
 is unsafe. The current host revision removes that model/emit violation: the
 versioned solver descriptor survives to `ExpandMixedKernel`, which emits three
-independent physical pipes with exact IDs, byte widths, slot counts, workspace
-ranges, and runtime lane offsets. Host structural and tensor-replay tests pass;
-the three-pipe protocol still requires a fresh 910B sentinel.
+independent logical pipes with exact frontend IDs, byte widths, slot counts,
+workspace ranges, and runtime lane offsets. PTOAS v0.55 renumbers their C++
+template IDs (`0/1/2` became `0/2/4` in the first sentinel); the backend now
+matches those physical declarations by direction and slot geometry and fails
+closed if an identical descriptor would require different offsets. Host
+structural and tensor-replay tests pass; the repaired three-pipe protocol still
+requires a fresh 910B sentinel.
 
 Host tests also close tensor-level equivalence and the full
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` structure.
@@ -204,9 +211,11 @@ the runtime subblock parameter because the native hardware subblock register is
 not programmed by simpler MIX dispatch. The bridge is derived from split FIFO
 operations, not from tensor indexing: it reuses the subblock parameter when
 one already exists and otherwise adds a wrapper-private parameter to the
-selected AIV PTOAS function. Every physical pipe ID is matched to its own PTOAS
-`TPipe` declaration and receives an independent consumer/producer offset; the
-sibling AIC function is outside that function-scoped rewrite. The outer mixed loop deliberately is not
+selected AIV PTOAS function. Frontend IDs validate endpoint wiring, while each
+renumbered physical `TPipe` is matched by `(direction, slot_size, slot_num)` and
+receives the descriptor's independent consumer/producer offset. Duplicate
+descriptors are accepted only when their offsets are identical; ambiguous
+bindings fail closed. The sibling AIC function is outside that function-scoped rewrite. The outer mixed loop deliberately is not
 `ForKind::Pipeline`: a generic pipeline tag
 would multiply nested AutoTileL0 buffers. The independently running AIC/AIV functions and FIFO
 backpressure form the cross-engine wavefront. A complete host structural test verifies 48 logical
@@ -297,13 +306,13 @@ These are explicit migration gaps, not permission for the emitter to approximate
 
 Latest 910B2 isolation closes the C2V sentinel: the final AIV uses
 `tile.col_expand_add`, preserves disjoint load/result allocations, and passes
-50/50 sequential launches. Dense SwiGLU still fails on the earlier merged
-bidirectional protocol. Its homogeneous arithmetic stages and dynamic
-push/pop counts are balanced, but split-lane primitive controls expose unsafe
-completion/aggregation when multiple logical tensors share that protocol. The
-new independent-ID lowering directly addresses this plan/emit mismatch, but
-no mixed performance result is valid until the three-pipe device sentinel
-passes. The flag therefore remains off.
+50/50 sequential launches. The first independent three-pipe dense-SwiGLU
+sentinel then stopped at code generation: its IR correctly carried logical IDs
+`0/1/2`, but PTOAS v0.55 emitted physical template IDs `0/2/4` and the wrapper
+incorrectly assumed numeric identity. Descriptor-based binding removes that
+downstream ABI assumption without changing the model or expanded IR. This is
+host-validated only; no mixed performance result is valid until the repaired
+three-pipe device sentinel passes. The flag therefore remains off.
 
 ## 7. Implementation sequence
 
@@ -316,12 +325,13 @@ passes. The flag therefore remains off.
    broadcast multiplicity, live-out, matmul-semantic gates, and the 910B
    MemRef-less load/TPOP no-alias guard. Generic `[M,N] + [1,N]` is now required
    to materialize as `tile.col_expand_add`. Unsupported mixed topologies remain partition boundaries.
-4. **Done (host implementation and structural validation; new silicon sentinel pending):** add the exact
+4. **Done (host implementation and structural validation; repaired silicon sentinel pending):** add the exact
    `C,C->V->C` dense-SwiGLU algorithm. Reuse homogeneous stage costs, carry the
    down accumulator across feature chunks, and extend skew to one ordered
    multi-push bundle followed by one path-invariant reply. Preserve its two C2V
-   projections and V2C reply as three independently sized physical FIFO IDs;
-   the previous merged-protocol numerical defect is not yet device-closed.
+   projections and V2C reply as three independently sized logical FIFOs;
+   descriptor-bind their PTOAS-renumbered physical declarations before adding
+   lane offsets. The protocol is not yet device-closed.
 5. Enumerate or analytically choose between more serial groups and fewer pipelined groups. Price
    dependent init, steady, tail, and drain phases separately.
 6. Generalize the current stage-local homogeneous views without duplicating
