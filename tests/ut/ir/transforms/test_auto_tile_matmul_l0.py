@@ -586,6 +586,20 @@ def _assert_ssa_valid(after, label):
     passes.verify_properties(props, after, label)
 
 
+def _run_default_pipeline_and_codegen(program):
+    """Run the production pass pipeline and return all generated PTO text."""
+    from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+    from pypto.pypto_core import codegen as _codegen_core  # noqa: PLC0415
+    from pypto.pypto_core import ir as _ir_core  # noqa: PLC0415
+
+    lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
+    return "\n".join(
+        _codegen_core.PTOCodegen().generate(_ir_core.Program([func], func.name, lowered.span))
+        for func in lowered.functions.values()
+        if ir.is_incore_type(func.func_type)
+    )
+
+
 def _assert_pipelined_full_k(after, n_pipeline_levels=2):
     """Assert the full-K M/N path emitted its nested pipelined **interior**:
     ``n_pipeline_levels`` ``pl.pipeline`` loops (the straight-line boundary tail,
@@ -1867,6 +1881,513 @@ class TestAutoTileMatmulL0MNTiling:
             if "pto." in mlir or "func.func" in mlir:
                 generated = True
         assert generated, "direct-store full-K must generate valid PTO MLIR"
+
+    def test_mn_tiling_vec_left_stages_once(self):
+        """An oversized PV-style matmul stages its logical Vec operand into Mat
+        once before expanding the output grid. The grid must not repeat the
+        cross-core move for every output tile."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                lhs_vec: pl.Tile[[256, 64], pl.BF16, pl.Mem.Vec] = pl.tile.load(lhs, [0, 0], [256, 64])
+                rhs_mat: pl.Tile[[64, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 256], target_memory=pl.Mem.Mat
+                )
+                c = pl.tile.matmul(lhs_vec, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(after)
+        assert printed.count("pl.tile.move(lhs_vec, target_memory=pl.Mem.Mat)") == 1
+        assert "pl.tile.matmul(lhs_vec, rhs_mat)" not in printed
+        assert printed.count("pl.pipeline(") >= 2, "the oversized output must use an M/N grid"
+        assert "pl.tile.store(" in printed, "the grid body must place each output sub-tile"
+        _assert_ssa_valid(after, "test_mn_tiling_vec_left_stages_once")
+        assert "pto.tmatmul" in _run_default_pipeline_and_codegen(Before)
+
+    def test_mn_tiling_vec_left_mat_scratch_stages_once(self):
+        """The one-time Vec staging also composes with compiler-created Mat
+        output materialization for a chained matmul."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 256], pl.BF16],
+                e: pl.Tensor[[256, 16], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 16], pl.FP32]],
+            ) -> pl.Tensor[[256, 16], pl.FP32]:
+                lhs_vec = pl.tile.load(lhs, [0, 0], [256, 64], target_memory=pl.Mem.Vec)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [64, 256], target_memory=pl.Mem.Mat)
+                e_mat = pl.tile.load(e, [0, 0], [256, 16], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul(lhs_vec, rhs_mat)
+                cb = pl.tile.cast(c, pl.BF16, mode="rint")
+                d = pl.tile.matmul(cb, e_mat)
+                out = pl.store(d, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(after)
+        assert printed.count("pl.tile.move(lhs_vec, target_memory=pl.Mem.Mat)") == 1
+        assert "pl.tile.cast(" not in printed
+        assert "target_memory=pl.Mem.Mat" in printed and "pl.tile.assemble(" in printed
+        _assert_ssa_valid(after, "test_mn_tiling_vec_left_mat_scratch")
+        assert "pto.tmatmul" in _run_default_pipeline_and_codegen(Before)
+
+    def test_mn_tiling_vec_left_staging_over_capacity_is_deferred(self):
+        """M/N tiling must not create a full Vec->Mat staging allocation whose
+        physical footprint alone exceeds the backend Mat capacity."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[1024, 512], pl.BF16],
+                rhs: pl.Tensor[[512, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[1024, 256], pl.FP32]],
+            ) -> pl.Tensor[[1024, 256], pl.FP32]:
+                lhs_vec = pl.tile.load(lhs, [0, 0], [1024, 512], target_memory=pl.Mem.Vec)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [512, 256], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul(lhs_vec, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        assert after is Before, "a rejected Vec staging must leave the original program untouched"
+
+    def test_matmul_bias_k_split_applies_bias_once(self):
+        """K tiling initializes the reduction with matmul_bias exactly once;
+        subsequent K blocks accumulate with plain matmul_acc."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 2048], pl.BF16],
+                rhs: pl.Tensor[[2048, 64], pl.BF16],
+                bias: pl.Tensor[[1, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [16, 2048], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [2048, 64], target_memory=pl.Mem.Mat)
+                bias_mat = pl.tile.load(bias, [0, 0], [1, 64], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul_bias(lhs_mat, rhs_mat, bias_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(after)
+        assert printed.count("pl.tile.matmul_bias(") == 1
+        assert "pl.tile.matmul_acc(" in printed
+        _assert_ssa_valid(after, "test_matmul_bias_k_split_applies_bias_once")
+
+    def test_matmul_bias_mn_tiling_slices_bias_by_output_column(self):
+        """M/N tiling broadcasts one Bias-buffer slice over every M tile and
+        extracts a distinct [1,n] window for each N tile."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 512], pl.BF16],
+                bias: pl.Tensor[[1, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 512], pl.FP32]],
+            ) -> pl.Tensor[[256, 512], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [64, 512], target_memory=pl.Mem.Mat)
+                bias_mat = pl.tile.load(bias, [0, 0], [1, 512], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul_bias(lhs_mat, rhs_mat, bias_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(after)
+        assert printed.count("pl.tile.matmul_bias(") == 1
+        assert printed.count("pl.pipeline(") >= 2, "the bias matmul must use an M/N output grid"
+        assert "target_memory=pl.Mem.Bias" in printed and "pl.tile.extract(" in printed
+        assert "pl.tile.matmul_bias(lhs_mat, rhs_mat, bias_mat)" not in printed
+        _assert_ssa_valid(after, "test_matmul_bias_mn_tiling")
+        assert "pto.tmatmul.bias" in _run_default_pipeline_and_codegen(Before)
+
+    def test_matmul_bias_n_tiling_with_bias_resident_source_is_deferred(self):
+        """An already-Bias-resident full vector cannot be sub-windowed with
+        TEXTRACT. Normal pre-inference Mat bias sources are supported; this
+        unusual explicit placement fails closed instead of emitting Bias→Bias."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 512], pl.BF16],
+                bias: pl.Tensor[[1, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 512], pl.FP32]],
+            ) -> pl.Tensor[[256, 512], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [64, 512], target_memory=pl.Mem.Mat)
+                bias_mat = pl.tile.load(bias, [0, 0], [1, 512], target_memory=pl.Mem.Mat)
+                bias_l0 = pl.tile.move(bias_mat, target_memory=pl.Mem.Bias)
+                c = pl.tile.matmul_bias(lhs_mat, rhs_mat, bias_l0)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        assert after is Before, "unsupported Bias-to-Bias sub-windowing must leave the program untouched"
+
+    def test_matmul_bias_mn_and_k_tiling_numerically_correct(self):
+        """Bias is applied once per output sub-tile even when that sub-tile
+        also needs a K reduction. The transformed reference must preserve the
+        logical ``a @ b + bias`` result."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        M, K, N = 256, 256, 256
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.BF16],
+                rhs: pl.Tensor[[K, N], pl.BF16],
+                bias: pl.Tensor[[1, N], pl.FP32],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat)
+                bias_mat = pl.tile.load(bias, [0, 0], [1, N], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul_bias(lhs_mat, rhs_mat, bias_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(after)
+        assert "pl.tile.matmul_bias(lhs_mat, rhs_mat, bias_mat)" not in printed
+        assert "pl.tile.matmul_bias(" in printed and "pl.tile.matmul_acc(" in printed
+        _assert_ssa_valid(after, "test_matmul_bias_mn_and_k_tiling")
+
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        lhs = torch.randn(M, K, dtype=torch.bfloat16)
+        rhs = torch.randn(K, N, dtype=torch.bfloat16)
+        bias = torch.randn(1, N)
+        out = torch.zeros(M, N)
+        ns: dict = {}
+        exec(torch_codegen(after), ns)  # noqa: S102 -- executing generated reference code is the point
+        ns["kernel"](lhs, rhs, bias, out)
+        expected = lhs.float() @ rhs.float() + bias
+        rel_err = ((out - expected).norm() / expected.norm()).item()
+        assert rel_err < 5e-2, f"M/N+K-tiled matmul_bias rel_err {rel_err:.3e} exceeds 5e-2"
+
+        generated = _run_default_pipeline_and_codegen(Before)
+        assert "pto.tmatmul.bias" in generated, "the tiled first-K block must reach PTO bias codegen"
+
+    def test_stored_and_reused_result_gets_composite_gm_mat_materialization(self):
+        """The source expresses an ordinary GM store plus a later matmul use.
+        AutoTile creates its own low-precision Mat scratch and fills both sinks
+        per Acc sub-tile; no source-level tile.assemble contract is required."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 256], pl.BF16],
+                b: pl.Tensor[[256, 256], pl.BF16],
+                e: pl.Tensor[[256, 64], pl.BF16],
+                saved: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> tuple[pl.Tensor[[256, 256], pl.FP32], pl.Tensor[[256, 64], pl.FP32]]:
+                c = pl.matmul(a, b, out_dtype=pl.FP32)
+                cb = pl.cast(c, pl.BF16, mode="rint")
+                saved = pl.assemble(saved, c, [0, 0])
+                d = pl.matmul(cb, e, out_dtype=pl.FP32)
+                out = pl.assemble(out, d, [0, 0])
+                return saved, out
+
+        after = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        printed = ir.python_print(after)
+        assert "pl.tile.cast(" not in printed, "the rint downcast must be absorbed by Acc->Mat writeback"
+        assert "target_memory=pl.Mem.Mat" in printed
+        assert printed.count("pl.tile.assemble(") >= 2, "the compiler must assemble the internal Mat scratch"
+        assert printed.count("pl.tile.store(") >= 3, "saved GM and the consumer output must both remain"
+        _assert_ssa_valid(after, "test_stored_and_reused_composite_materialization")
+        assert "pto.tmatmul" in _run_default_pipeline_and_codegen(Before)
+
+    def test_stored_and_reused_consumer_before_store_is_atomic_noop(self):
+        """A composite destination is emitted at the existing GM store. If an
+        on-chip consumer precedes that point, the producer/cast must remain
+        intact rather than exposing a scratch before it is defined."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[256, 64], pl.BF16],
+                b: pl.Tensor[[64, 256], pl.BF16],
+                e: pl.Tensor[[256, 16], pl.BF16],
+                saved: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+                out: pl.Out[pl.Tensor[[256, 16], pl.FP32]],
+            ) -> tuple[pl.Tensor[[256, 256], pl.FP32], pl.Tensor[[256, 16], pl.FP32]]:
+                a_mat = pl.tile.load(a, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                b_mat = pl.tile.load(b, [0, 0], [64, 256], target_memory=pl.Mem.Mat)
+                e_mat = pl.tile.load(e, [0, 0], [256, 16], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul(a_mat, b_mat)
+                cb = pl.tile.cast(c, pl.BF16, mode="rint")
+                d = pl.tile.matmul(cb, e_mat)
+                saved = pl.store(c, [0, 0], saved)
+                out = pl.store(d, [0, 0], out)
+                return saved, out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(after)
+        assert "pl.tile.matmul(a_mat, b_mat)" in printed
+        assert "pl.tile.cast(c," in printed and 'mode="rint"' in printed
+        assert "c_mat" not in printed, "no compiler scratch may be exposed before its materialization"
+        _assert_ssa_valid(after, "test_stored_and_reused_consumer_before_store")
+
+    def test_linear_matmul_acc_chain_tiles_as_one_logical_gemm(self):
+        """A fresh matmul followed by a linear matmul_acc stage is tiled at
+        chain scope. Each output sub-tile completes both reductions before it
+        is stored, so neither full [M,N] Acc intermediate is materialized."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a0: pl.Tensor[[256, 64], pl.BF16],
+                b0: pl.Tensor[[64, 256], pl.BF16],
+                a1: pl.Tensor[[256, 64], pl.BF16],
+                b1: pl.Tensor[[64, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                a0m = pl.tile.load(a0, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                b0m = pl.tile.load(b0, [0, 0], [64, 256], target_memory=pl.Mem.Mat)
+                a1m = pl.tile.load(a1, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                b1m = pl.tile.load(b1, [0, 0], [64, 256], target_memory=pl.Mem.Mat)
+                c0 = pl.tile.matmul(a0m, b0m)
+                c1 = pl.tile.matmul_acc(c0, a1m, b1m)
+                out = pl.store(c1, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(after)
+        assert "pl.tile.matmul(a0m, b0m)" not in printed
+        assert "pl.tile.matmul_acc(c0, a1m, b1m)" not in printed
+        assert printed.count("pl.tile.matmul_acc(") >= 2
+        assert printed.count("pl.tile.store(") >= 2
+        _assert_ssa_valid(after, "test_linear_matmul_acc_chain")
+        assert "pto.tmatmul" in _run_default_pipeline_and_codegen(Before)
+
+    def test_linear_matmul_acc_chain_numerically_correct(self):
+        """Chain-scope tiling preserves ``a0 @ b0 + a1 @ b1`` while avoiding
+        either full oversized accumulator."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        M, K, N = 384, 64, 384
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a0: pl.Tensor[[M, K], pl.FP32],
+                b0: pl.Tensor[[K, N], pl.FP32],
+                a1: pl.Tensor[[M, K], pl.FP32],
+                b1: pl.Tensor[[K, N], pl.FP32],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                a0m = pl.tile.load(a0, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+                b0m = pl.tile.load(b0, [0, 0], [K, N], target_memory=pl.Mem.Mat)
+                a1m = pl.tile.load(a1, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+                b1m = pl.tile.load(b1, [0, 0], [K, N], target_memory=pl.Mem.Mat)
+                c0 = pl.tile.matmul(a0m, b0m)
+                c1 = pl.tile.matmul_acc(c0, a1m, b1m)
+                out = pl.store(c1, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        _assert_ssa_valid(after, "test_linear_matmul_acc_chain_numeric")
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(0)
+        args = [torch.randn(M, K), torch.randn(K, N), torch.randn(M, K), torch.randn(K, N)]
+        out = torch.zeros(M, N)
+        ns: dict = {}
+        exec(torch_codegen(after), ns)  # noqa: S102 -- executing generated reference code is the point
+        ns["kernel"](*args, out)
+        expected = args[0] @ args[1] + args[2] @ args[3]
+        assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
+            f"linear matmul_acc chain mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
+        )
+
+    def test_linear_matmul_acc_chain_split_k_reuses_one_accumulator(self):
+        """A split-K root must not leave a fresh-vs-acc if-phi between the
+        root and its continuation. That conservative join used to allocate two
+        128 KiB Acc buffers and overflow L0C; the emitted chain is uniformly
+        in-place after one explicit fresh block."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        M, K, N = 256, 192, 256
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a0: pl.Tensor[[M, K], pl.BF16],
+                b0: pl.Tensor[[K, N], pl.BF16],
+                a1: pl.Tensor[[M, K], pl.BF16],
+                b1: pl.Tensor[[K, N], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                a0m = pl.tile.load(a0, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+                b0m = pl.tile.load(b0, [0, 0], [K, N], target_memory=pl.Mem.Mat)
+                a1m = pl.tile.load(a1, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+                b1m = pl.tile.load(b1, [0, 0], [K, N], target_memory=pl.Mem.Mat)
+                c0 = pl.tile.matmul(a0m, b0m)
+                c1 = pl.tile.matmul_acc(c0, a1m, b1m)
+                out = pl.store(c1, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        _assert_ssa_valid(after, "test_linear_matmul_acc_chain_split_k")
+        torch = pytest.importorskip("torch")
+        from pypto.debug import torch_codegen  # noqa: PLC0415
+
+        torch.manual_seed(1)
+        args = [
+            torch.randn(M, K, dtype=torch.bfloat16),
+            torch.randn(K, N, dtype=torch.bfloat16),
+            torch.randn(M, K, dtype=torch.bfloat16),
+            torch.randn(K, N, dtype=torch.bfloat16),
+        ]
+        out = torch.zeros(M, N)
+        ns: dict = {}
+        exec(torch_codegen(after), ns)  # noqa: S102 -- executing generated reference code is the point
+        ns["kernel"](*args, out)
+        expected = args[0].float() @ args[1].float() + args[2].float() @ args[3].float()
+        rel_err = ((out - expected).norm() / expected.norm()).item()
+        assert rel_err < 2e-2, f"split-K linear chain rel_err {rel_err:.3e} exceeds 2e-2"
+
+        generated = _run_default_pipeline_and_codegen(Before)
+        assert "pto.tmatmul" in generated and "pto.tmatmul.acc" in generated
+        acc_addresses = set(re.findall(r"pto\.alloc_tile addr = ([^ ]+).*loc=acc", generated))
+        assert len(acc_addresses) == 1, (
+            f"the split-K chain must reuse one physical L0C address, got {sorted(acc_addresses)}"
+        )
+
+    def test_mat_scratch_chain_emits_after_late_stage_operands(self):
+        """A Mat-only chain may define the continuation operands after the
+        root matmul. Emit the replacement at the terminal stage, not at the
+        root, so those operand definitions continue to dominate every use."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a0: pl.Tensor[[256, 64], pl.BF16],
+                b0: pl.Tensor[[64, 256], pl.BF16],
+                a1: pl.Tensor[[256, 64], pl.BF16],
+                b1: pl.Tensor[[64, 256], pl.BF16],
+                e: pl.Tensor[[256, 16], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 16], pl.FP32]],
+            ) -> pl.Tensor[[256, 16], pl.FP32]:
+                a0m = pl.tile.load(a0, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                b0m = pl.tile.load(b0, [0, 0], [64, 256], target_memory=pl.Mem.Mat)
+                c0 = pl.tile.matmul(a0m, b0m)
+                a1m = pl.tile.load(a1, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                b1m = pl.tile.load(b1, [0, 0], [64, 256], target_memory=pl.Mem.Mat)
+                c1 = pl.tile.matmul_acc(c0, a1m, b1m)
+                cb = pl.tile.cast(c1, pl.BF16, mode="rint")
+                e_mat = pl.tile.load(e, [0, 0], [256, 16], target_memory=pl.Mem.Mat)
+                d = pl.tile.matmul(cb, e_mat)
+                out = pl.store(d, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(after)
+        assert "pl.tile.matmul(a0m, b0m)" not in printed
+        assert "pl.tile.matmul_acc(c0, a1m, b1m)" not in printed
+        assert "pl.tile.cast(" not in printed
+        _assert_ssa_valid(after, "test_mat_scratch_chain_late_operands")
+        assert "pto.tmatmul" in _run_default_pipeline_and_codegen(Before)
+
+    def test_forked_matmul_acc_chain_is_atomic_noop(self):
+        """A forked accumulator graph is not linear. The pass must not tile
+        only its root and leave either caller-owned continuation dangling."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a0: pl.Tensor[[256, 64], pl.BF16],
+                b0: pl.Tensor[[64, 256], pl.BF16],
+                a1: pl.Tensor[[256, 64], pl.BF16],
+                b1: pl.Tensor[[64, 256], pl.BF16],
+                a2: pl.Tensor[[256, 64], pl.BF16],
+                b2: pl.Tensor[[64, 256], pl.BF16],
+                out1: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+                out2: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> tuple[pl.Tensor[[256, 256], pl.FP32], pl.Tensor[[256, 256], pl.FP32]]:
+                a0m = pl.tile.load(a0, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                b0m = pl.tile.load(b0, [0, 0], [64, 256], target_memory=pl.Mem.Mat)
+                a1m = pl.tile.load(a1, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                b1m = pl.tile.load(b1, [0, 0], [64, 256], target_memory=pl.Mem.Mat)
+                a2m = pl.tile.load(a2, [0, 0], [256, 64], target_memory=pl.Mem.Mat)
+                b2m = pl.tile.load(b2, [0, 0], [64, 256], target_memory=pl.Mem.Mat)
+                root = pl.tile.matmul(a0m, b0m)
+                c1 = pl.tile.matmul_acc(root, a1m, b1m)
+                c2 = pl.tile.matmul_acc(root, a2m, b2m)
+                out1 = pl.store(c1, [0, 0], out1)
+                out2 = pl.store(c2, [0, 0], out2)
+                return out1, out2
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        assert after is Before, "a forked accumulator graph must be rejected atomically"
 
 
 class TestAutoTileMatmulL0ExistingPipelineDbC:

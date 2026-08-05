@@ -449,7 +449,7 @@ Pass FlattenTileNdTo2D();
 Pass LegalizeTileCast();
 
 /**
- * @brief Auto-tile static 2D matmul / matmul_acc calls for the backend's L0
+ * @brief Auto-tile static 2D matmul-family calls for the backend's L0
  *
  * Queries ``utils::ChooseL0Tile`` for an ``(m, n, k, stationarity, dbC)``
  * design point and rewrites Mat-resident operands into aligned Left/Right
@@ -460,19 +460,27 @@ Pass LegalizeTileCast();
  * L0C legality uses the backend's physical accumulator-row alignment, which
  * may be stricter than the logical cube shape (for example, an INT32 M=16
  * result occupies 32 rows on Ascend910B).  When that physical ``[M, N]``
- * footprint exceeds L0c, plain ``tile.matmul`` is M/N-tiled.  A result consumed
- * by one output store uses direct-to-GM placement; a result consumed entirely
- * as a later matmul operand is assembled into an on-chip Mat scratch.  The
- * Mat-scratch route also folds a compatible f32-to-bf16/f16
- * ``tile.cast(mode="rint")`` into the FIXPIPE writeback.
+ * footprint exceeds L0c, a fresh ``tile.matmul`` or ``tile.matmul_bias`` is
+ * M/N-tiled. A result consumed by one output store uses direct-to-GM placement;
+ * a result consumed entirely as a later matmul operand is assembled into an
+ * on-chip Mat scratch. If the source both stores and reuses the result, each
+ * legal Acc sub-tile is placed into both destinations. The Mat-scratch routes
+ * also fold a compatible f32-to-bf16/f16 ``tile.cast(mode="rint")`` into the
+ * FIXPIPE writeback. A Vec-resident left operand is staged into Mat once before
+ * expanding the output grid, subject to the backend's physical Mat capacity.
+ * For ``tile.matmul_bias``, an N-slice of the bias is applied exactly once on
+ * the first K block of every output sub-tile.
  *
  * The canonical frontend split-K form -- a full-output accumulator placeholder,
  * a pipeline carrying it through ``tile.matmul`` / ``tile.matmul_acc``, then
  * one store -- is M/N-tiled at the enclosing-loop level.  Each output sub-tile
  * completes the whole source K reduction before the next sub-tile starts, so
- * an oversized full Acc is never materialized.  Arbitrary standalone
- * ``tile.matmul_acc`` calls with caller-owned accumulators remain deferred with
- * ``PH-AT-006``.
+ * an oversized full Acc is never materialized. A linear fresh-matmul ->
+ * ``tile.matmul_acc`` SSA chain is handled atomically at chain scope: every
+ * output sub-tile completes every K
+ * reduction stage before placement, so no oversized intermediate Acc exists.
+ * Standalone ``tile.matmul_acc`` calls with opaque caller-owned accumulators
+ * remain deferred.
  *
  * Full-K M/N grids may use output-, A-, or B-stationary loop orders.  L0C
  * double-buffering is enabled under PTOAS and is available as a PyPTO planner
@@ -500,9 +508,9 @@ Pass LegalizeTileCast();
  * When the chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is
  * needed, although a chained result may still be remapped to Mat by the
  * compatible cast-fold placement above.  Other unsupported regimes are left
- * untouched; useful deferred cases emit ``PerfHint`` diagnostics.
- * ``tile.matmul_bias`` remains unsupported because its bias must be applied
- * only after the final K block.
+ * untouched; useful deferred cases emit ``PerfHint`` diagnostics. In
+ * particular, mixed or non-matmul on-chip consumers such as an Acc-to-Vec move
+ * are not synthesized into a new cross-core dataflow.
  *
  * Requirements:
  * - Input IR must have static 2D tile ops (run FlattenTileNdTo2D first)

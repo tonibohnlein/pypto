@@ -73,12 +73,14 @@
 /// When ``ChooseL0Tile`` returns ``m < M`` or ``n < N`` the ``[M, N]`` output
 /// Acc's physical footprint overflows L0c.  Capacity uses the backend's
 /// accumulator-row alignment, which may be stricter than the logical M shape
-/// (Ascend910B INT32 M=16 occupies 32 physical rows).  The operands are already
-/// Mat-resident, so only the output overflows. For plain ``tile.matmul``, the pass emits a
+/// (Ascend910B INT32 M=16 occupies 32 physical rows). For a fresh
+/// ``tile.matmul`` / ``tile.matmul_bias``, the pass emits a
 /// ``ceil(M/m) x ceil(N/n)`` grid and hands each ``[m_eff, n_eff]`` Acc result to
-/// a placement strategy: either direct-store to the sole 2D
-/// ``tile.store(c, base, out)`` consumer, or assembly into an on-chip Mat scratch
-/// when every use is a later matmul operand. Each sub-tile uses the pipelined
+/// one or more placement strategies: direct-store to a 2D
+/// ``tile.store(c, base, out)`` consumer, assembly into an on-chip Mat scratch
+/// when every on-chip use is a later matmul operand, or both for a stored-and-
+/// reused value. A Vec-resident left operand is staged into Mat once before the
+/// grid. Each sub-tile uses the pipelined
 /// K-loop above when K spans >= 2 L0 blocks, or — when ``k == K`` (the full K
 /// fits L0a/L0b at once) — a single straight-line ``tile.matmul`` emitted inside
 /// **nested pipelined loops** over the divisible interior so
@@ -87,19 +89,22 @@
 /// straight-line tail, so ``m`` / ``n`` need not divide ``M`` / ``N``.
 ///
 /// Supported today:
-///   * ``tile.matmul`` and ``tile.matmul_acc``.  ``tile.matmul_bias`` is
-///     deferred — bias add only after the final iteration needs extra
-///     rewriting that is not yet implemented.
+///   * ``tile.matmul``, ``tile.matmul_acc``, and ``tile.matmul_bias``. Bias is
+///     sliced along N and applied exactly once on the first K block of each
+///     output sub-tile.
 ///   * K tiling (``m == M and n == N``) for ``tile.matmul`` and
-///     ``tile.matmul_acc``; M/N tiling for plain ``tile.matmul`` with either a
-///     direct-store or Mat-scratch placement, with a pipelined K-loop or a
-///     straight-line single-K-block (``k == K``) per sub-tile.
+///     ``tile.matmul_acc``; M/N tiling for fresh ``tile.matmul`` /
+///     ``tile.matmul_bias`` with direct-store, Mat-scratch, or composite
+///     placement, with a pipelined K-loop or a straight-line single-K-block
+///     (``k == K``) per sub-tile.
 ///     The canonical frontend split-K create/pipeline/store form is M/N-tiled
 ///     outside its K loop: each output sub-tile completes the whole source K
-///     reduction before the next one starts. Arbitrary standalone
+///     reduction before the next one starts. A linear fresh-matmul ->
+///     ``tile.matmul_acc`` chain is likewise rewritten at chain scope.
+///     Arbitrary standalone
 ///     ``tile.matmul_acc`` (which would need slices of a caller-owned
-///     accumulator), a Vec left operand, or a mixed/non-matmul on-chip consumer
-///     is deferred with a ``PerfHint``.
+///     accumulator) and mixed/non-matmul on-chip consumers are deferred with a
+///     ``PerfHint``.
 ///   * A compatible f32-to-bf16/f16 ``tile.cast(mode="rint")`` feeding only
 ///     matmul operands is folded into the Acc-to-Mat FIXPIPE writeback.
 ///   * Any 16-aligned K.  When the chosen ``k`` does not divide ``K``
@@ -117,6 +122,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -320,6 +326,7 @@ struct KLoopRewrite {
   AssignStmtPtr original;
   VarPtr lhs_src;                 ///< [M, K] left operand — Mat- or Vec-resident
   VarPtr rhs_src;                 ///< [K, N] right operand — Mat-resident
+  VarPtr bias_src;                ///< optional [1, N] bias — Mat- or Bias-resident
   bool stage_lhs_to_mat = false;  ///< lhs is Vec-resident: stage Vec→Mat before the K-loop
   VarPtr acc_init = nullptr;      ///< Caller-provided accumulator for matmul_acc;
                                   ///< nullptr for plain matmul (Vec placeholder is built instead).
@@ -329,6 +336,10 @@ struct KLoopRewrite {
   int64_t m = 0;
   int64_t n = 0;
   int64_t k = 0;
+  /// Static K origin within the full source operands. Ordinary rewrites use
+  /// zero. A linear chain's fresh root may emit its first block explicitly,
+  /// then run a uniform matmul_acc loop over the remaining K range.
+  int64_t k_base = 0;
   /// Logical output window carried by the loop accumulator. These may be
   /// smaller than m/n when a boxed boundary operand is physically padded.
   ExprPtr valid_m = nullptr;
@@ -356,11 +367,13 @@ struct RewriteResult {
 /// The ``IfStmt`` materializes a phi return_var that the outer yield carries
 /// back to the iter-arg.
 StmtPtr BuildMatmulBody(const VarPtr& ko_var, const IterArgPtr& c_iter, const AssignStmtPtr& sa,
-                        const AssignStmtPtr& sb, const std::string& base, const Span& sp) {
+                        const AssignStmtPtr& sb, const VarPtr& bias, const std::string& base,
+                        const Span& sp) {
   auto& reg = OpRegistry::GetInstance();
 
   // Then-branch: fresh Acc tile from tile.matmul.
-  auto c_then_call = reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
+  auto c_then_call = bias ? reg.Create("tile.matmul_bias", {sa->var_, sb->var_, bias}, sp)
+                          : reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
   auto c_then_var = std::make_shared<Var>(base + "_l0_c_first", c_then_call->GetType(), sp);
   auto c_then_assign = std::make_shared<AssignStmt>(c_then_var, c_then_call, sp);
   auto then_yield = std::make_shared<YieldStmt>(std::vector<ExprPtr>{c_then_var}, sp);
@@ -456,17 +469,42 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
   ExprPtr mi_off = r.mi ? r.mi : MakeIndex(0, sp);
   ExprPtr ni_off = r.ni ? r.ni : MakeIndex(0, sp);
 
+  // Bias is applied exactly once, on the fresh first K block. A full Bias-
+  // resident vector can be reused directly; an N sub-window (or a Mat-resident
+  // source awaiting memory inference) is extracted into the architectural Bias
+  // buffer once outside the K loop.
+  VarPtr bias_operand;
+  if (r.bias_src) {
+    auto bias_ty = As<TileType>(r.bias_src->GetType());
+    const bool already_full_bias = bias_ty && bias_ty->GetMemorySpace() == MemorySpace::Bias && r.n == r.N &&
+                                   (!r.ni || (As<ConstInt>(r.ni) && As<ConstInt>(r.ni)->value_ == 0));
+    if (already_full_bias) {
+      bias_operand = r.bias_src;
+    } else {
+      auto bias = BuildExtract(r.bias_src, {1, r.n}, MakeIndex(0, sp), ni_off, MemorySpace::Bias,
+                               base + "_l0_bias", sp);
+      out.push_back(bias);
+      bias_operand = bias->var_;
+    }
+  }
+
   // Emit one straight-line K block ``[m, kb] x [kb, n]`` at static K-offset
   // ``ko``, accumulating into ``acc_in`` (``tile.matmul_acc``) or starting fresh
   // (``tile.matmul`` when ``acc_in`` is null).  Used for the single-full-block
   // (num_full == 1) and partial-tail cases; the multi-block case pipelines below.
   auto emit_block = [&](int64_t ko, int64_t kb, const ExprPtr& acc_in, const std::string& tag) -> VarPtr {
-    auto sa = BuildExtract(lhs_extract_src, {r.m, kb}, mi_off, MakeIndex(ko, sp), MemorySpace::Left,
-                           base + "_l0_a" + tag, sp);
-    auto sb = BuildExtract(r.rhs_src, {kb, r.n}, MakeIndex(ko, sp), ni_off, MemorySpace::Right,
+    auto sa = BuildExtract(lhs_extract_src, {r.m, kb}, mi_off, MakeIndex(r.k_base + ko, sp),
+                           MemorySpace::Left, base + "_l0_a" + tag, sp);
+    auto sb = BuildExtract(r.rhs_src, {kb, r.n}, MakeIndex(r.k_base + ko, sp), ni_off, MemorySpace::Right,
                            base + "_l0_b" + tag, sp);
-    ExprPtr call = acc_in ? reg.Create("tile.matmul_acc", {acc_in, sa->var_, sb->var_}, sp)
-                          : reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
+    ExprPtr call;
+    if (acc_in) {
+      call = reg.Create("tile.matmul_acc", {acc_in, sa->var_, sb->var_}, sp);
+    } else if (bias_operand) {
+      call = reg.Create("tile.matmul_bias", {sa->var_, sb->var_, bias_operand}, sp);
+    } else {
+      call = reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
+    }
     auto cvar = std::make_shared<Var>(base + "_l0_c" + tag, call->GetType(), sp);
     out.push_back(sa);
     out.push_back(sb);
@@ -480,11 +518,12 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
   if (num_full >= 2) {
     auto ko_var = std::make_shared<Var>(base + "_l0_ko", std::make_shared<ScalarType>(DataType::INDEX), sp);
     auto c_iter = std::make_shared<IterArg>(base + "_l0_c", loop_iter_type, loop_init, sp);
+    ExprPtr ko_offset = r.k_base == 0 ? ExprPtr(ko_var) : MakeAdd(ko_var, MakeIndex(r.k_base, sp), sp);
     auto sa =
-        BuildExtract(lhs_extract_src, {r.m, r.k}, mi_off, ko_var, MemorySpace::Left, base + "_l0_a", sp);
-    auto sb = BuildExtract(r.rhs_src, {r.k, r.n}, ko_var, ni_off, MemorySpace::Right, base + "_l0_b", sp);
+        BuildExtract(lhs_extract_src, {r.m, r.k}, mi_off, ko_offset, MemorySpace::Left, base + "_l0_a", sp);
+    auto sb = BuildExtract(r.rhs_src, {r.k, r.n}, ko_offset, ni_off, MemorySpace::Right, base + "_l0_b", sp);
     StmtPtr body = is_acc ? BuildMatmulAccBody(c_iter, sa, sb, base, sp)
-                          : BuildMatmulBody(ko_var, c_iter, sa, sb, base, sp);
+                          : BuildMatmulBody(ko_var, c_iter, sa, sb, bias_operand, base, sp);
     std::vector<std::pair<std::string, std::any>> attrs = {{kPipelineStagesAttr, /*pipeline_stages=*/2}};
     // Loop return var: an intermediate when a partial tail follows (named
     // distinctly so round-trip names stay unique), else the final result.
@@ -518,6 +557,7 @@ struct MatmulTiling {
   AssignStmtPtr assign;
   VarPtr lhs;       ///< [M, K] left operand — Mat (or Vec for the PV pattern; see stage_lhs_to_mat)
   VarPtr rhs;       ///< [K, N] right operand — Mat
+  VarPtr bias;      ///< optional [1, N] bias for tile.matmul_bias
   VarPtr acc_init;  ///< caller-provided accumulator for matmul_acc; null for plain matmul
   bool stage_lhs_to_mat = false;
   int64_t M = 0, N = 0, K = 0;
@@ -562,6 +602,7 @@ KLoopRewrite MakeKLoop(const MatmulTiling& t, ExprPtr mi, ExprPtr ni, int64_t m_
   r.original = t.assign;
   r.lhs_src = t.lhs;
   r.rhs_src = t.rhs;
+  r.bias_src = t.bias;
   r.stage_lhs_to_mat = t.stage_lhs_to_mat;
   r.acc_init = t.acc_init;
   r.M = t.M;
@@ -617,19 +658,19 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   auto call = As<Call>(assign->value_);
   if (!call || !call->op_) return std::nullopt;
 
-  // ``tile.matmul`` and ``tile.matmul_acc`` are rewritten by this pass.
-  // ``tile.matmul_bias`` is deferred — bias add inside a tiled K-loop needs
-  // bias-add only after the final iteration, which is extra rewriting.
+  // Plain, accumulating, and bias matmuls share the same L0 tile chooser. Bias
+  // is applied on the first K block only, then later blocks use matmul_acc.
   const bool is_matmul = IsOp(call, "tile.matmul");
   const bool is_matmul_acc = IsOp(call, "tile.matmul_acc");
-  if (!is_matmul && !is_matmul_acc) return std::nullopt;
+  const bool is_matmul_bias = IsOp(call, "tile.matmul_bias");
+  if (!is_matmul && !is_matmul_acc && !is_matmul_bias) return std::nullopt;
 
   // Operand layout: (lhs, rhs) for matmul; (acc, lhs, rhs) for matmul_acc.
   // Use ``AsVarLike`` for the operands so IterArg (Var subclass) is accepted —
   // this is the common case for the accumulator inside a pipelined K-loop.
   const size_t expected_arity = is_matmul ? 2u : 3u;
   if (call->args_.size() != expected_arity) return std::nullopt;
-  const size_t lhs_idx = is_matmul ? 0u : 1u;
+  const size_t lhs_idx = is_matmul_acc ? 1u : 0u;
   auto lhs = AsVarLike(call->args_[lhs_idx]);
   auto rhs = AsVarLike(call->args_[lhs_idx + 1u]);
   if (!lhs || !rhs) return std::nullopt;
@@ -651,6 +692,19 @@ std::optional<MatmulTiling> AnalyzeMatmul(
     if (!acc_tile || acc_tile->shape_.size() != 2) return std::nullopt;
   }
 
+  VarPtr bias_var;
+  int64_t bias_n = 0;
+  if (is_matmul_bias) {
+    bias_var = AsVarLike(call->args_[2]);
+    if (!bias_var) return std::nullopt;
+    auto bias_tile = As<TileType>(bias_var->GetType());
+    int64_t bias_m = 0;
+    if (!IsStatic2DInSpaces(bias_tile, {MemorySpace::Mat, MemorySpace::Bias}, bias_m, bias_n) ||
+        bias_m != 1) {
+      return std::nullopt;
+    }
+  }
+
   // Operand source residency, with static 2D shapes.  The right (B) operand
   // must be Mat — it is loaded from DDR into L1 and fed into L0B.  The left (A)
   // operand may be Mat (the QK pattern) or Vec (the fused-attention PV /
@@ -666,6 +720,8 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   // upstream.  Treat as an internal invariant.
   INTERNAL_CHECK(K_lhs == K_rhs) << "tile.matmul: K dimensions don't match (lhs K=" << K_lhs
                                  << ", rhs K=" << K_rhs << ")";
+  INTERNAL_CHECK_SPAN(!is_matmul_bias || bias_n == N, assign->span_)
+      << "Internal error: tile.matmul_bias bias N does not match rhs N";
   const int64_t K = K_lhs;
 
   uint32_t bytes_a = DTypeBytes(lhs_tile->dtype_);
@@ -823,6 +879,7 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   t.assign = assign;
   t.lhs = lhs;
   t.rhs = rhs;
+  t.bias = bias_var;
   // A Vec-resident left operand is staged into Mat before the K-loop (see
   // BuildMoveToMat); Mat-resident left operands extract directly.  The right
   // operand is always Mat (checked above), so it never needs staging.
@@ -884,15 +941,17 @@ ExprPtr AddOffset(const ExprPtr& base, const ExprPtr& delta, const Span& sp) {
 /// ``VisitVarLike_`` covers both Var and IterArg (.claude/rules/ir-kind-traits.md).
 class SiblingUseCounter : public IRVisitor {
  public:
-  std::unordered_map<const Var*, int> counts;               ///< all reads
-  std::unordered_map<const Var*, int> matmul_operand_uses;  ///< reads at a matmul-operand position
-  std::unordered_map<const Var*, VarPtr> vars;              ///< owning pointers for type inspection
+  std::unordered_map<const Var*, int> counts;                   ///< all reads
+  std::unordered_map<const Var*, int> matmul_operand_uses;      ///< reads at a matmul-operand position
+  std::unordered_map<const Var*, int> matmul_accumulator_uses;  ///< reads as tile.matmul_acc arg 0
+  std::unordered_map<const Var*, VarPtr> vars;                  ///< owning pointers for type inspection
 
  protected:
   void VisitVarLike_(const VarPtr& op) override {
     vars.emplace(op.get(), op);
     ++counts[op.get()];
     if (in_matmul_operand_) ++matmul_operand_uses[op.get()];
+    if (in_matmul_accumulator_) ++matmul_accumulator_uses[op.get()];
   }
   // Skip the LHS (a def); count only reads in the RHS value.
   void VisitStmt_(const AssignStmtPtr& op) override { VisitExpr(op->value_); }
@@ -905,56 +964,139 @@ class SiblingUseCounter : public IRVisitor {
   void VisitExpr_(const CallPtr& op) override {
     const bool is_mm = IsOp(op, "tile.matmul");
     const bool is_acc = IsOp(op, "tile.matmul_acc");
+    const bool is_bias = IsOp(op, "tile.matmul_bias");
     for (size_t i = 0; i < op->args_.size(); ++i) {
-      const bool operand_pos = (is_mm && (i == 0 || i == 1)) || (is_acc && (i == 1 || i == 2));
+      const bool operand_pos = ((is_mm || is_bias) && (i == 0 || i == 1)) || (is_acc && (i == 1 || i == 2));
       const bool prev = in_matmul_operand_;
+      const bool prev_acc = in_matmul_accumulator_;
       in_matmul_operand_ = operand_pos && (AsVarLike(op->args_[i]) != nullptr);
+      in_matmul_accumulator_ = is_acc && i == 0 && (AsVarLike(op->args_[i]) != nullptr);
       VisitExpr(op->args_[i]);
       in_matmul_operand_ = prev;
+      in_matmul_accumulator_ = prev_acc;
     }
   }
 
  private:
   bool in_matmul_operand_ = false;
+  bool in_matmul_accumulator_ = false;
 };
 
 /// One-shot index over a SeqStmts' children, built lazily on the first
 /// oversized matmul and reused for the rest so M/N folding stays O(N):
 ///   * ``use_counts[v]`` — number of reads of ``v`` (excluding defs).
-///   * ``store_of[v]`` — the top-level 2D ``tile.store`` whose source operand
-///     is ``v`` (its sole direct consumer when ``use_counts[v] == 1``).
+///   * ``stores_of[v]`` — top-level 2D ``tile.store`` consumers of ``v``.
+///   * ``matmul_operand_positions[v]`` — sibling indices of Mat-safe reads,
+///     used to prove a stored-and-reused scratch is defined before every read.
 /// Counts/sites reflect the original (pre-rewrite) siblings, which is what the
 /// foldability check needs (a matmul result is freshly defined; its uses do
 /// not change until we rewrite it).
 struct SiblingIndex {
   std::unordered_map<const Var*, int> use_counts;
   std::unordered_map<const Var*, int> matmul_operand_uses;  ///< reads at a matmul-operand position
-  std::unordered_map<const Var*, const AssignStmt*> store_of;
+  std::unordered_map<const Var*, int> matmul_accumulator_uses;
+  std::unordered_map<const Var*, std::vector<AssignStmtPtr>> accumulator_users;
+  std::unordered_map<const Var*, std::vector<const AssignStmt*>> stores_of;
+  std::unordered_map<const Var*, std::vector<size_t>> matmul_operand_positions;
+  std::unordered_map<const Stmt*, size_t> positions;
+  std::unordered_map<const Var*, size_t> def_positions;
   std::unordered_map<const Var*, const AssignStmt*> cast_of;  ///< ``cb = tile.cast(v, dtype)`` by source
 };
 
 SiblingIndex BuildSiblingIndex(const std::vector<StmtPtr>& stmts) {
   SiblingIndex idx;
-  SiblingUseCounter counter;
-  for (const auto& s : stmts) {
+  for (size_t position = 0; position < stmts.size(); ++position) {
+    const auto& s = stmts[position];
+    idx.positions.emplace(s.get(), position);
+    SiblingUseCounter counter;
     counter.VisitStmt(s);
+    for (const auto& [var, count] : counter.counts) idx.use_counts[var] += count;
+    for (const auto& [var, count] : counter.matmul_operand_uses) {
+      idx.matmul_operand_uses[var] += count;
+      auto& positions = idx.matmul_operand_positions[var];
+      positions.insert(positions.end(), static_cast<size_t>(count), position);
+    }
+    for (const auto& [var, count] : counter.matmul_accumulator_uses) {
+      idx.matmul_accumulator_uses[var] += count;
+    }
     auto as = std::dynamic_pointer_cast<const AssignStmt>(s);
     if (!as) continue;
+    idx.def_positions.emplace(as->var_.get(), position);
     auto call = As<Call>(as->value_);
     if (!call || !call->op_) continue;
     // Record top-level 2D ``tile.store(src, offsets, out)`` by source operand.
     if (IsOp(call, "tile.store") && call->args_.size() == 3) {
-      if (auto src = AsVarLike(call->args_[0])) idx.store_of.emplace(src.get(), as.get());
+      if (auto src = AsVarLike(call->args_[0])) idx.stores_of[src.get()].push_back(as.get());
     } else if (IsOp(call, "tile.cast") && !call->args_.empty()) {
       // Record ``cb = tile.cast(src, dtype)`` by source: a chained matmul whose
       // result is downcast (Acc f32 -> bf16/f16) before the consumer matmul is
       // foldable into a low-precision Mat scratch (the cast = FIXPIPE writeback).
       if (auto src = AsVarLike(call->args_[0])) idx.cast_of.emplace(src.get(), as.get());
+    } else if (IsOp(call, "tile.matmul_acc") && call->args_.size() == 3) {
+      if (auto acc = AsVarLike(call->args_[0])) idx.accumulator_users[acc.get()].push_back(as);
     }
   }
-  idx.use_counts = std::move(counter.counts);
-  idx.matmul_operand_uses = std::move(counter.matmul_operand_uses);
   return idx;
+}
+
+struct LinearMatmulChain {
+  std::vector<MatmulTiling> stages;  ///< root matmul[/bias], then one or more matmul_acc stages
+  std::vector<const Var*> continuation_defs;
+  const Var* terminal = nullptr;
+};
+
+/// Follow a linear accumulator SSA chain rooted at a fresh matmul. Every
+/// intermediate must be used exactly once, as argument 0 of one top-level
+/// tile.matmul_acc. A common M/N grid is the component-wise minimum of all
+/// stages' legal tiles; each stage keeps its independently chosen K blocking.
+std::optional<LinearMatmulChain> AnalyzeLinearMatmulChain(const MatmulTiling& root, const SiblingIndex& index,
+                                                          std::vector<Diagnostic>& hints) {
+  if (root.is_acc()) return std::nullopt;
+  LinearMatmulChain chain{{root}, {}, root.assign->var_.get()};
+  const Var* current = root.assign->var_.get();
+  auto root_position = index.def_positions.find(root.assign->var_.get());
+  if (root_position == index.def_positions.end()) return std::nullopt;
+  size_t previous_position = root_position->second;
+
+  while (true) {
+    auto users_it = index.accumulator_users.find(current);
+    if (users_it == index.accumulator_users.end()) break;
+    auto uses_it = index.use_counts.find(current);
+    auto acc_uses_it = index.matmul_accumulator_uses.find(current);
+    const int uses = uses_it == index.use_counts.end() ? 0 : uses_it->second;
+    const int acc_uses = acc_uses_it == index.matmul_accumulator_uses.end() ? 0 : acc_uses_it->second;
+    if (users_it->second.size() != 1 || uses != 1 || acc_uses != 1) return std::nullopt;
+
+    const AssignStmtPtr& next_assign = users_it->second.front();
+    auto position_it = index.positions.find(next_assign.get());
+    if (position_it == index.positions.end() || position_it->second <= previous_position) return std::nullopt;
+    auto next = AnalyzeMatmul(next_assign, hints, /*force_output_stationary=*/true);
+    if (!next || !next->is_acc() || next->acc_init.get() != current || next->M != root.M ||
+        next->N != root.N) {
+      return std::nullopt;
+    }
+    next->double_buffer_c = false;  // the chain grid serializes its accumulation stages
+    chain.stages.push_back(std::move(*next));
+    chain.continuation_defs.push_back(next_assign->var_.get());
+    current = next_assign->var_.get();
+    chain.terminal = current;
+    previous_position = position_it->second;
+  }
+
+  if (chain.stages.size() < 2) return std::nullopt;
+  int64_t common_m = root.m;
+  int64_t common_n = root.n;
+  for (const auto& stage : chain.stages) {
+    common_m = std::min(common_m, stage.m);
+    common_n = std::min(common_n, stage.n);
+  }
+  for (auto& stage : chain.stages) {
+    stage.m = common_m;
+    stage.n = common_n;
+    stage.stationarity = utils::Stationarity::kOutputStationary;
+    stage.double_buffer_c = false;
+  }
+  return chain;
 }
 
 /// One folded M/N rewrite: the unrolled per-sub-tile K-loops + stores that
@@ -966,7 +1108,13 @@ struct MNFold {
   std::vector<StmtPtr> stmts;         ///< pipelined interior + tail / K-loops + per-sub-tile placement
   VarPtr return_var;                  ///< final output tensor value (replaces the store's result downstream)
   VarPtr store_result_var;            ///< the consumer store's LHS (remapped to return_var)
-  const AssignStmt* store = nullptr;  ///< consumer store to drop from the SeqStmts
+  const AssignStmt* store = nullptr;  ///< consumer/anchor statement to replace in the SeqStmts
+  /// Optional on-chip materialization installed for downstream consumers when
+  /// the logical result is both stored and reused.
+  const Var* materialized_old_var = nullptr;
+  VarPtr materialized_new_var = nullptr;
+  /// Optional cast definition made redundant by a low-precision Mat scratch.
+  const Var* dropped_def = nullptr;
 };
 
 /// Where each computed ``[m_eff, n_eff]`` Acc sub-tile is placed.  The M/N grid
@@ -974,22 +1122,27 @@ struct MNFold {
 /// grid) are placement-agnostic: they compute each sub-tile's Acc result and
 /// hand it to a ``SubtilePlacer``. ``DirectGmPlacer`` stores to a DDR output;
 /// ``MatScratchPlacer`` assembles into an on-chip Mat scratch for a chained
-/// matmul consumer. Each placer threads its chained output Var in traversal
-/// order and yields the final Var via ``PlaceAt``.
+/// matmul consumer. A placer threads one or more chained output Vars in
+/// traversal order and yields the final state via ``PlaceAt``. Multiple state
+/// elements let one logical matmul result be materialized to more than one
+/// destination (for example GM plus an internal Mat scratch) without ever
+/// constructing the oversized Acc value.
+using PlacementState = std::vector<VarPtr>;
+
 class SubtilePlacer {
  public:
   virtual ~SubtilePlacer() = default;
-  /// Emit any prologue and return the initial chained Var: the raw output
-  /// tensor for DirectGM.  The grid threads this Var through each ``PlaceAt``
-  /// and returns the final one.
-  [[nodiscard]] virtual VarPtr Init(std::vector<StmtPtr>& stmts) = 0;
+  /// Emit any prologue and return the initial chained state. The grid threads
+  /// every state element through each ``PlaceAt`` and returns the final state.
+  [[nodiscard]] virtual PlacementState Init(std::vector<StmtPtr>& stmts) = 0;
   /// Place ``sub`` (an ``[m, n]`` Acc result) into ``chain_in`` at output offsets
   /// ``(row_off, col_off)`` — both Exprs (static ConstInt in the unrolled grid,
   /// loop variables in the pipelined emitter).  Append the placement stmt and
   /// return the new chained Var.  Stateless so it works inside a loop body where
   /// the chain is a loop iter-arg.
-  [[nodiscard]] virtual VarPtr PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub, const ExprPtr& row_off,
-                                       const ExprPtr& col_off, const VarPtr& chain_in, int step) = 0;
+  [[nodiscard]] virtual PlacementState PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub,
+                                               const ExprPtr& row_off, const ExprPtr& col_off,
+                                               const PlacementState& chain_in, int step) = 0;
 };
 
 CallPtr PreserveCallAttrs(const std::vector<std::pair<std::string, std::any>>& attrs,
@@ -1018,18 +1171,21 @@ class DirectGmPlacer : public SubtilePlacer {
         attrs_(std::move(store_attrs)),
         sp_(std::move(span)) {}
 
-  [[nodiscard]] VarPtr Init(std::vector<StmtPtr>& /*stmts*/) override { return out_in_; }
+  [[nodiscard]] PlacementState Init(std::vector<StmtPtr>& /*stmts*/) override { return {out_in_}; }
 
-  [[nodiscard]] VarPtr PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub, const ExprPtr& row_off,
-                               const ExprPtr& col_off, const VarPtr& chain_in, int step) override {
+  [[nodiscard]] PlacementState PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub, const ExprPtr& row_off,
+                                       const ExprPtr& col_off, const PlacementState& chain_in,
+                                       int step) override {
+    INTERNAL_CHECK_SPAN(chain_in.size() == 1, sp_)
+        << "Internal error: DirectGmPlacer expects exactly one chained output";
     auto& reg = OpRegistry::GetInstance();
     auto offs = std::make_shared<MakeTuple>(
         std::vector<ExprPtr>{AddOffset(base_r_, row_off, sp_), AddOffset(base_c_, col_off, sp_)}, sp_);
-    auto deduced = reg.Create("tile.store", {sub, offs, chain_in}, kwargs_, sp_);
+    auto deduced = reg.Create("tile.store", {sub, offs, chain_in.front()}, kwargs_, sp_);
     auto scall = PreserveCallAttrs(attrs_, deduced);
     auto sv = std::make_shared<Var>(out_base_ + "_t" + std::to_string(step), scall->GetType(), sp_);
     stmts.push_back(std::make_shared<AssignStmt>(sv, scall, sp_));
-    return sv;
+    return {sv};
   }
 
  private:
@@ -1061,30 +1217,87 @@ class MatScratchPlacer : public SubtilePlacer {
   MatScratchPlacer(int64_t big_m, int64_t big_n, DataType dtype, std::string base, Span span)
       : m_(big_m), n_(big_n), dtype_(dtype), base_(std::move(base)), sp_(std::move(span)) {}
 
-  [[nodiscard]] VarPtr Init(std::vector<StmtPtr>& stmts) override {
+  [[nodiscard]] PlacementState Init(std::vector<StmtPtr>& stmts) override {
     auto& reg = OpRegistry::GetInstance();
     std::vector<std::pair<std::string, std::any>> kwargs = {{"dtype", dtype_},
                                                             {"target_memory", MemorySpace::Mat}};
     auto call = reg.Create("tile.create", {MakeIndexTuple({m_, n_}, sp_)}, kwargs, sp_);
     auto scratch = std::make_shared<Var>(base_, call->GetType(), sp_);
     stmts.push_back(std::make_shared<AssignStmt>(scratch, call, sp_));
-    return scratch;
+    return {scratch};
   }
 
-  [[nodiscard]] VarPtr PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub, const ExprPtr& row_off,
-                               const ExprPtr& col_off, const VarPtr& chain_in, int step) override {
+  [[nodiscard]] PlacementState PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub, const ExprPtr& row_off,
+                                       const ExprPtr& col_off, const PlacementState& chain_in,
+                                       int step) override {
+    INTERNAL_CHECK_SPAN(chain_in.size() == 1, sp_)
+        << "Internal error: MatScratchPlacer expects exactly one chained scratch";
     auto& reg = OpRegistry::GetInstance();
     auto offs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{row_off, col_off}, sp_);
-    auto call = reg.Create("tile.assemble", {chain_in, sub, offs}, sp_);
+    auto call = reg.Create("tile.assemble", {chain_in.front(), sub, offs}, sp_);
     auto sv = std::make_shared<Var>(base_ + "_t" + std::to_string(step), call->GetType(), sp_);
     stmts.push_back(std::make_shared<AssignStmt>(sv, call, sp_));
-    return sv;
+    return {sv};
   }
 
  private:
   int64_t m_, n_;
   DataType dtype_;
   std::string base_;
+  Span sp_;
+};
+
+/// Fan one computed Acc sub-tile out to several independent materializers.
+/// Each child owns a disjoint slice of the loop-carried state. Current leaves
+/// each own one element, but retaining widths makes nesting well-defined and
+/// keeps the grid builders independent of destination count.
+class CompositeSubtilePlacer : public SubtilePlacer {
+ public:
+  explicit CompositeSubtilePlacer(std::vector<std::unique_ptr<SubtilePlacer>> children, Span span)
+      : children_(std::move(children)), sp_(std::move(span)) {}
+
+  [[nodiscard]] PlacementState Init(std::vector<StmtPtr>& stmts) override {
+    INTERNAL_CHECK_SPAN(!children_.empty(), sp_)
+        << "Internal error: CompositeSubtilePlacer requires at least one destination";
+    widths_.clear();
+    PlacementState state;
+    for (auto& child : children_) {
+      auto child_state = child->Init(stmts);
+      INTERNAL_CHECK_SPAN(!child_state.empty(), sp_)
+          << "Internal error: a composite placement child returned empty state";
+      widths_.push_back(child_state.size());
+      state.insert(state.end(), child_state.begin(), child_state.end());
+    }
+    return state;
+  }
+
+  [[nodiscard]] PlacementState PlaceAt(std::vector<StmtPtr>& stmts, const VarPtr& sub, const ExprPtr& row_off,
+                                       const ExprPtr& col_off, const PlacementState& chain_in,
+                                       int step) override {
+    INTERNAL_CHECK_SPAN(widths_.size() == children_.size(), sp_)
+        << "Internal error: CompositeSubtilePlacer::Init must run before PlaceAt";
+    PlacementState next;
+    size_t begin = 0;
+    for (size_t i = 0; i < children_.size(); ++i) {
+      const size_t end = begin + widths_[i];
+      INTERNAL_CHECK_SPAN(end <= chain_in.size(), sp_)
+          << "Internal error: composite placement state is shorter than its child layout";
+      PlacementState child_in(chain_in.begin() + static_cast<std::ptrdiff_t>(begin),
+                              chain_in.begin() + static_cast<std::ptrdiff_t>(end));
+      auto child_out = children_[i]->PlaceAt(stmts, sub, row_off, col_off, child_in, step);
+      INTERNAL_CHECK_SPAN(child_out.size() == widths_[i], sp_)
+          << "Internal error: composite placement child changed its state width";
+      next.insert(next.end(), child_out.begin(), child_out.end());
+      begin = end;
+    }
+    INTERNAL_CHECK_SPAN(begin == chain_in.size(), sp_)
+        << "Internal error: composite placement state has unowned elements";
+    return next;
+  }
+
+ private:
+  std::vector<std::unique_ptr<SubtilePlacer>> children_;
+  std::vector<size_t> widths_;
   Span sp_;
 };
 
@@ -1476,7 +1689,9 @@ std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSpli
   DirectGmPlacer placer(offsets->elements_[0], offsets->elements_[1], out_in, store_call->kwargs_,
                         store_call->attrs_, match.store->span_);
   std::vector<StmtPtr> stmts;
-  VarPtr chain = placer.Init(stmts);
+  PlacementState chain = placer.Init(stmts);
+  INTERNAL_CHECK_SPAN(chain.size() == 1, match.store->span_)
+      << "Internal error: canonical split-K direct store must have one placement result";
   auto out_ty = As<TileType>(match.matmul->var_->GetType());
   INTERNAL_CHECK_SPAN(out_ty, match.matmul->span_)
       << "Internal error: canonical split-K matmul result lost its TileType";
@@ -1515,7 +1730,7 @@ std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSpli
       ++step;
     }
   }
-  return CanonicalSplitKFold{std::move(stmts), chain, match.store->var_};
+  return CanonicalSplitKFold{std::move(stmts), chain.front(), match.store->var_};
 }
 
 /// Rewrite every canonical create/loop/store triplet in one SeqStmts scan.
@@ -1601,9 +1816,9 @@ FunctionPtr RewriteCanonicalSplitKAcc(const FunctionPtr& func, std::vector<Diagn
 /// partial (< m / < n) remainder — this is the boundary-tile emitter for the
 /// full-K grid's L-shaped tail (the divisible interior is pipelined instead).
 /// Returns the chain after placement.
-VarPtr EmitFullKTile(std::vector<StmtPtr>& stmts, const MatmulTiling& t, SubtilePlacer& placer,
-                     const VarPtr& chain, int64_t mi, int64_t ni, int64_t m_eff, int64_t n_eff,
-                     const std::string& base, int step) {
+PlacementState EmitFullKTile(std::vector<StmtPtr>& stmts, const MatmulTiling& t, SubtilePlacer& placer,
+                             const PlacementState& chain, int64_t mi, int64_t ni, int64_t m_eff,
+                             int64_t n_eff, const std::string& base, int step) {
   const Span sp = t.assign->span_;
   auto& reg = OpRegistry::GetInstance();
   auto sa = BuildExtract(t.lhs, {m_eff, t.K}, MakeIndex(mi, sp), MakeIndex(0, sp), MemorySpace::Left,
@@ -1612,7 +1827,20 @@ VarPtr EmitFullKTile(std::vector<StmtPtr>& stmts, const MatmulTiling& t, Subtile
                          base + "_tb" + std::to_string(step), sp);
   stmts.push_back(sa);
   stmts.push_back(sb);
-  auto c_call = reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
+  VarPtr bias_operand;
+  if (t.bias) {
+    auto bias_ty = As<TileType>(t.bias->GetType());
+    if (bias_ty && bias_ty->GetMemorySpace() == MemorySpace::Bias && ni == 0 && n_eff == t.N) {
+      bias_operand = t.bias;
+    } else {
+      auto bias = BuildExtract(t.bias, {1, n_eff}, MakeIndex(0, sp), MakeIndex(ni, sp), MemorySpace::Bias,
+                               base + "_tbias" + std::to_string(step), sp);
+      stmts.push_back(bias);
+      bias_operand = bias->var_;
+    }
+  }
+  auto c_call = bias_operand ? reg.Create("tile.matmul_bias", {sa->var_, sb->var_, bias_operand}, sp)
+                             : reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
   auto c_var = std::make_shared<Var>(base + "_tc" + std::to_string(step), c_call->GetType(), sp);
   stmts.push_back(std::make_shared<AssignStmt>(c_var, c_call, sp));
   return placer.PlaceAt(stmts, c_var, MakeIndex(mi, sp), MakeIndex(ni, sp), chain, step);
@@ -1644,7 +1872,8 @@ VarPtr EmitFullKTile(std::vector<StmtPtr>& stmts, const MatmulTiling& t, Subtile
 /// stationary operand is re-extracted once per outer step.  Drives the same
 /// ``SubtilePlacer`` as the split-K grid, so the direct-store placement comes
 /// out double-buffered.
-std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& t, SubtilePlacer& placer) {
+std::pair<std::vector<StmtPtr>, PlacementState> BuildFullKPipelined(const MatmulTiling& t,
+                                                                    SubtilePlacer& placer) {
   const Span sp = t.assign->span_;
   auto& reg = OpRegistry::GetInstance();
   const std::string base = t.assign->var_->name_hint_;
@@ -1675,7 +1904,8 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& 
   const int64_t full_n = (t.N / t.n) * t.n;
 
   std::vector<StmtPtr> stmts;
-  VarPtr chain = placer.Init(stmts);
+  PlacementState chain = placer.Init(stmts);
+  INTERNAL_CHECK_SPAN(!chain.empty(), sp) << "Internal error: M/N placement state must not be empty";
 
   // --- Interior: nested pipelined loops over [0, full_m) x [0, full_n) ---
   {
@@ -1683,25 +1913,54 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& 
     const int64_t outer_step = row_outer ? t.m : t.n;
     const int64_t inner_extent = row_outer ? full_n : full_m;
     const int64_t inner_step = row_outer ? t.n : t.m;
-    const TypePtr out_type = chain->GetType();
     auto idx_type = std::make_shared<ScalarType>(DataType::INDEX);
     auto outer_var = std::make_shared<Var>(base + "_o", idx_type, sp);
     auto inner_var = std::make_shared<Var>(base + "_i", idx_type, sp);
     ExprPtr mi = row_outer ? ExprPtr(outer_var) : ExprPtr(inner_var);
     ExprPtr ni = row_outer ? ExprPtr(inner_var) : ExprPtr(outer_var);
-    // The output/scratch chain threads through both loops as an iter-arg; the
-    // inner iter-arg is initialised from the outer iter-arg.
-    auto out_outer = std::make_shared<IterArg>(base + "_oc", out_type, chain, sp);
-    auto out_inner = std::make_shared<IterArg>(base + "_ic", out_type, out_outer, sp);
+    // Every output/scratch chain threads through both loops as an iter-arg; each
+    // inner iter-arg is initialised from its matching outer iter-arg.
+    std::vector<IterArgPtr> out_outer;
+    std::vector<IterArgPtr> out_inner;
+    PlacementState inner_state;
+    out_outer.reserve(chain.size());
+    out_inner.reserve(chain.size());
+    inner_state.reserve(chain.size());
+    for (size_t state_i = 0; state_i < chain.size(); ++state_i) {
+      const std::string suffix = chain.size() == 1 ? "" : "_" + std::to_string(state_i);
+      auto outer_arg =
+          std::make_shared<IterArg>(base + "_oc" + suffix, chain[state_i]->GetType(), chain[state_i], sp);
+      auto inner_arg =
+          std::make_shared<IterArg>(base + "_ic" + suffix, chain[state_i]->GetType(), outer_arg, sp);
+      out_outer.push_back(outer_arg);
+      out_inner.push_back(inner_arg);
+      inner_state.push_back(inner_arg);
+    }
     auto sa = BuildExtract(t.lhs, {t.m, t.K}, mi, MakeIndex(0, sp), MemorySpace::Left, base + "_a", sp);
     auto sb = BuildExtract(t.rhs, {t.K, t.n}, MakeIndex(0, sp), ni, MemorySpace::Right, base + "_b", sp);
     const AssignStmtPtr& outer_extract = row_outer ? sa : sb;  // stationary panel
     const AssignStmtPtr& inner_extract = row_outer ? sb : sa;  // moving panel
-    auto c_call = reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
+    AssignStmtPtr bias_extract;
+    VarPtr bias_operand;
+    if (t.bias) {
+      auto bias_ty = As<TileType>(t.bias->GetType());
+      if (bias_ty && bias_ty->GetMemorySpace() == MemorySpace::Bias && t.n == t.N) {
+        bias_operand = t.bias;
+      } else {
+        bias_extract =
+            BuildExtract(t.bias, {1, t.n}, MakeIndex(0, sp), ni, MemorySpace::Bias, base + "_bias", sp);
+        bias_operand = bias_extract->var_;
+      }
+    }
+    auto c_call = bias_operand ? reg.Create("tile.matmul_bias", {sa->var_, sb->var_, bias_operand}, sp)
+                               : reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
     auto c_var = std::make_shared<Var>(base + "_c", c_call->GetType(), sp);
-    std::vector<StmtPtr> inner_body{inner_extract, std::make_shared<AssignStmt>(c_var, c_call, sp)};
-    VarPtr inner_chain = placer.PlaceAt(inner_body, c_var, mi, ni, out_inner, /*step=*/0);
-    inner_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{inner_chain}, sp));
+    std::vector<StmtPtr> inner_body{inner_extract};
+    if (bias_extract) inner_body.push_back(bias_extract);
+    inner_body.push_back(std::make_shared<AssignStmt>(c_var, c_call, sp));
+    PlacementState inner_chain = placer.PlaceAt(inner_body, c_var, mi, ni, inner_state, /*step=*/0);
+    std::vector<ExprPtr> inner_yields(inner_chain.begin(), inner_chain.end());
+    inner_body.push_back(std::make_shared<YieldStmt>(std::move(inner_yields), sp));
     // overlap_stores stays false: the one-accumulator schedule
     // (matmul_i, store_i, matmul_{i+1}, store_{i+1}) drains each L0C result before
     // the next matmul overwrites it.  dbC=2 (double_buffer_c) instead sets the
@@ -1719,13 +1978,19 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& 
     // unchanged.  It lifts the moving-loop stores above both matmuls in
     // CanonicalizeIOOrder to keep the two L0C accumulators co-live.
     if (t.double_buffer_c) inner_attrs.emplace_back(kPipelineDoubleBufferCAttr, true);
-    auto inner_rv = std::make_shared<Var>(base + "_irv", out_type, sp);
-    auto inner_for = std::make_shared<ForStmt>(
-        inner_var, MakeIndex(0, sp), MakeIndex(inner_extent, sp), MakeIndex(inner_step, sp),
-        std::vector<IterArgPtr>{out_inner}, SeqStmts::Flatten(std::move(inner_body), sp),
-        std::vector<VarPtr>{inner_rv}, sp, ForKind::Pipeline, std::move(inner_attrs));
+    std::vector<VarPtr> inner_rvs;
+    inner_rvs.reserve(chain.size());
+    for (size_t state_i = 0; state_i < chain.size(); ++state_i) {
+      const std::string suffix = chain.size() == 1 ? "" : "_" + std::to_string(state_i);
+      inner_rvs.push_back(std::make_shared<Var>(base + "_irv" + suffix, chain[state_i]->GetType(), sp));
+    }
+    auto inner_for = std::make_shared<ForStmt>(inner_var, MakeIndex(0, sp), MakeIndex(inner_extent, sp),
+                                               MakeIndex(inner_step, sp), out_inner,
+                                               SeqStmts::Flatten(std::move(inner_body), sp), inner_rvs, sp,
+                                               ForKind::Pipeline, std::move(inner_attrs));
+    std::vector<ExprPtr> outer_yields(inner_rvs.begin(), inner_rvs.end());
     std::vector<StmtPtr> outer_body{outer_extract, inner_for,
-                                    std::make_shared<YieldStmt>(std::vector<ExprPtr>{inner_rv}, sp)};
+                                    std::make_shared<YieldStmt>(std::move(outer_yields), sp)};
     // Operand-stationary: the outer loop carries the SINGLE-buffered stationary
     // panel, so it is Sequential — a Pipeline stage=2 outer would double-buffer the
     // held operand (2x its full-L0 budget -> overflow). The inner (moving) loop
@@ -1735,13 +2000,17 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& 
     if (!stationary_single_buffered) {
       outer_attrs = {{kPipelineStagesAttr, /*pipeline_stages=*/2}, {kPipelineOverlapStoresAttr, false}};
     }
-    auto outer_rv = std::make_shared<Var>(base + "_orv", out_type, sp);
+    PlacementState outer_rvs;
+    outer_rvs.reserve(chain.size());
+    for (size_t state_i = 0; state_i < chain.size(); ++state_i) {
+      const std::string suffix = chain.size() == 1 ? "" : "_" + std::to_string(state_i);
+      outer_rvs.push_back(std::make_shared<Var>(base + "_orv" + suffix, chain[state_i]->GetType(), sp));
+    }
     auto outer_for = std::make_shared<ForStmt>(
-        outer_var, MakeIndex(0, sp), MakeIndex(outer_extent, sp), MakeIndex(outer_step, sp),
-        std::vector<IterArgPtr>{out_outer}, SeqStmts::Flatten(std::move(outer_body), sp),
-        std::vector<VarPtr>{outer_rv}, sp, outer_kind, std::move(outer_attrs));
+        outer_var, MakeIndex(0, sp), MakeIndex(outer_extent, sp), MakeIndex(outer_step, sp), out_outer,
+        SeqStmts::Flatten(std::move(outer_body), sp), outer_rvs, sp, outer_kind, std::move(outer_attrs));
     stmts.push_back(outer_for);
-    chain = outer_rv;
+    chain = std::move(outer_rvs);
   }
 
   // --- Tail: straight-line partial tiles for the L-shaped boundary ---
@@ -1765,14 +2034,15 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildFullKPipelined(const MatmulTiling& 
 /// operand panel does not fit L0 and cannot stay resident across sub-tiles
 /// (unlike the full-K pipelined path).  N-major traversal preserves the
 /// historical sub-tile ordering / naming.
-std::pair<std::vector<StmtPtr>, VarPtr> BuildSplitKGrid(const MatmulTiling& t, SubtilePlacer& placer) {
+std::pair<std::vector<StmtPtr>, PlacementState> BuildSplitKGrid(const MatmulTiling& t,
+                                                                SubtilePlacer& placer) {
   const Span sp = t.assign->span_;
   const std::string base = t.assign->var_->name_hint_;
   const int64_t num_m = (t.M + t.m - 1) / t.m;
   const int64_t num_n = (t.N + t.n - 1) / t.n;
 
   std::vector<StmtPtr> stmts;
-  VarPtr chain = placer.Init(stmts);
+  PlacementState chain = placer.Init(stmts);
   int step = 0;
   for (int64_t nj = 0; nj < num_n; ++nj) {
     const int64_t ni = nj * t.n;
@@ -1791,6 +2061,224 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildSplitKGrid(const MatmulTiling& t, S
   return {std::move(stmts), chain};
 }
 
+struct PreparedMNTiling {
+  MatmulTiling tiling;
+  std::vector<StmtPtr> prologue;
+};
+
+bool ValidateBiasMNTiling(const MatmulTiling& t, std::vector<Diagnostic>& hints) {
+  if (!t.bias || t.n == t.N) return true;
+  auto bias_ty = As<TileType>(t.bias->GetType());
+  if (!bias_ty || bias_ty->GetMemorySpace() != MemorySpace::Bias) return true;
+  hints.emplace_back(
+      DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
+      "tile.matmul_bias needs N tiling, but its source is already resident in the architectural Bias "
+      "buffer; forming an N sub-window would require an unsupported Bias-to-Bias extract, so the call is "
+      "left untouched (keep the pre-inference bias source in Mat)",
+      t.assign->span_);
+  return false;
+}
+
+/// Stage a Vec-resident left operand into one full Mat tile before expanding
+/// the M/N grid. Building the move in each output sub-tile would repeat the
+/// cross-core transfer and create a different logical operand per grid cell;
+/// the original value is one logical matrix and is staged exactly once.
+/// `other_mat_bytes` accounts for a compiler-created output scratch that must
+/// coexist with the staged operand. Unknown footprints fail closed.
+std::optional<PreparedMNTiling> PrepareMNTilingOperands(const MatmulTiling& t, uint64_t other_mat_bytes,
+                                                        std::vector<Diagnostic>& hints) {
+  if (!ValidateBiasMNTiling(t, hints)) return std::nullopt;
+  PreparedMNTiling prepared{t, {}};
+  if (!t.stage_lhs_to_mat) return prepared;
+
+  const Span sp = t.assign->span_;
+  auto lhs_mat = BuildMoveToMat(t.lhs, t.assign->var_->name_hint_ + "_l0_lmat", sp);
+  auto lhs_mat_ty = As<TileType>(lhs_mat->var_->GetType());
+  const auto* ctx = PassContext::Current();
+  const auto* handler = ctx ? ctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+  INTERNAL_CHECK_SPAN(handler, sp) << "Internal error: BackendHandler is null";
+  auto lhs_bytes = utils::StaticPhysicalAllocationBytes(lhs_mat_ty, MemorySpace::Mat, handler);
+  const uint64_t mat_capacity = handler->GetMatCapacityBytes();
+  const bool addition_overflows =
+      lhs_bytes && *lhs_bytes > std::numeric_limits<uint64_t>::max() - other_mat_bytes;
+  if (!lhs_bytes || addition_overflows || *lhs_bytes + other_mat_bytes > mat_capacity) {
+    hints.emplace_back(
+        DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
+        "tile.matmul with a Vec left operand needs M/N tiling, but staging the complete logical left "
+        "operand in Mat together with its compiler-created output materialization cannot be proven to fit "
+        "the backend Mat capacity; left untouched",
+        sp);
+    return std::nullopt;
+  }
+
+  prepared.tiling.lhs = lhs_mat->var_;
+  prepared.tiling.stage_lhs_to_mat = false;
+  prepared.prologue.push_back(lhs_mat);
+  return prepared;
+}
+
+struct PreparedLinearChain {
+  LinearMatmulChain chain;
+  std::vector<StmtPtr> prologue;
+};
+
+std::optional<PreparedLinearChain> PrepareLinearChainOperands(const LinearMatmulChain& chain,
+                                                              uint64_t other_mat_bytes,
+                                                              std::vector<Diagnostic>& hints) {
+  INTERNAL_CHECK(!chain.stages.empty()) << "Internal error: cannot prepare an empty matmul chain";
+  PreparedLinearChain prepared{chain, {}};
+  const Span sp = chain.stages.front().assign->span_;
+  const auto* ctx = PassContext::Current();
+  const auto* handler = ctx ? ctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+  INTERNAL_CHECK_SPAN(handler, sp) << "Internal error: BackendHandler is null";
+  const uint64_t mat_capacity = handler->GetMatCapacityBytes();
+  uint64_t required = other_mat_bytes;
+  std::unordered_map<const Var*, VarPtr> staged;
+
+  for (size_t i = 0; i < prepared.chain.stages.size(); ++i) {
+    auto& stage = prepared.chain.stages[i];
+    if (!ValidateBiasMNTiling(stage, hints)) return std::nullopt;
+    if (!stage.stage_lhs_to_mat) continue;
+    if (auto it = staged.find(stage.lhs.get()); it != staged.end()) {
+      stage.lhs = it->second;
+      stage.stage_lhs_to_mat = false;
+      continue;
+    }
+    auto lhs_mat = BuildMoveToMat(stage.lhs, stage.assign->var_->name_hint_ + "_l0_lmat", sp);
+    auto lhs_mat_ty = As<TileType>(lhs_mat->var_->GetType());
+    auto bytes = utils::StaticPhysicalAllocationBytes(lhs_mat_ty, MemorySpace::Mat, handler);
+    if (!bytes || required > std::numeric_limits<uint64_t>::max() - *bytes ||
+        required + *bytes > mat_capacity) {
+      hints.emplace_back(
+          DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
+          "linear matmul/matmul_acc chain needs M/N tiling, but its complete Vec operands and output "
+          "materialization cannot be proven to fit Mat capacity; left untouched",
+          sp);
+      return std::nullopt;
+    }
+    required += *bytes;
+    staged.emplace(stage.lhs.get(), lhs_mat->var_);
+    stage.lhs = lhs_mat->var_;
+    stage.stage_lhs_to_mat = false;
+    prepared.prologue.push_back(lhs_mat);
+  }
+  return prepared;
+}
+
+/// Emit one static K block for a linear accumulator chain. ``acc == nullptr``
+/// starts the chain with matmul[/bias]; otherwise the block accumulates in
+/// place. The explicit K window lets a split-K root start with one fresh block
+/// and feed a uniform matmul_acc loop, avoiding a fresh-vs-acc if-phi whose
+/// conservative MemRef join would otherwise reserve a second full L0C buffer.
+VarPtr EmitLinearChainKBlock(std::vector<StmtPtr>& stmts, const MatmulTiling& t, const VarPtr& acc,
+                             int64_t mi, int64_t ni, int64_t m_eff, int64_t n_eff, int64_t k_offset,
+                             int64_t k_extent, const std::string& base) {
+  const Span sp = t.assign->span_;
+  INTERNAL_CHECK_SPAN(!t.stage_lhs_to_mat, sp)
+      << "Internal error: linear-chain Vec operands must be staged before grid expansion";
+  INTERNAL_CHECK_SPAN(k_offset >= 0 && k_extent > 0 && k_offset <= t.K - k_extent, sp)
+      << "Internal error: linear-chain K block [" << k_offset << ", " << k_offset + k_extent
+      << ") is outside K=" << t.K;
+  auto sa = BuildExtract(t.lhs, {m_eff, k_extent}, MakeIndex(mi, sp), MakeIndex(k_offset, sp),
+                         MemorySpace::Left, base + "_a", sp);
+  auto sb = BuildExtract(t.rhs, {k_extent, n_eff}, MakeIndex(k_offset, sp), MakeIndex(ni, sp),
+                         MemorySpace::Right, base + "_b", sp);
+  stmts.push_back(sa);
+  stmts.push_back(sb);
+
+  VarPtr bias_operand;
+  if (t.bias) {
+    auto bias_ty = As<TileType>(t.bias->GetType());
+    if (bias_ty && bias_ty->GetMemorySpace() == MemorySpace::Bias && ni == 0 && n_eff == t.N) {
+      bias_operand = t.bias;
+    } else {
+      auto bias = BuildExtract(t.bias, {1, n_eff}, MakeIndex(0, sp), MakeIndex(ni, sp), MemorySpace::Bias,
+                               base + "_bias", sp);
+      stmts.push_back(bias);
+      bias_operand = bias->var_;
+    }
+  }
+
+  auto& reg = OpRegistry::GetInstance();
+  ExprPtr call;
+  if (acc) {
+    call = reg.Create("tile.matmul_acc", {acc, sa->var_, sb->var_}, sp);
+  } else if (bias_operand) {
+    call = reg.Create("tile.matmul_bias", {sa->var_, sb->var_, bias_operand}, sp);
+  } else {
+    call = reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
+  }
+  auto result = std::make_shared<Var>(base + "_c", call->GetType(), sp);
+  stmts.push_back(std::make_shared<AssignStmt>(result, call, sp));
+  return result;
+}
+
+std::pair<std::vector<StmtPtr>, PlacementState> BuildLinearChainGrid(const PreparedLinearChain& prepared,
+                                                                     SubtilePlacer& placer) {
+  const auto& chain = prepared.chain;
+  INTERNAL_CHECK(!chain.stages.empty()) << "Internal error: cannot emit an empty matmul chain";
+  const MatmulTiling& root = chain.stages.front();
+  const Span sp = root.assign->span_;
+  const int64_t num_m = (root.M + root.m - 1) / root.m;
+  const int64_t num_n = (root.N + root.n - 1) / root.n;
+  std::vector<StmtPtr> stmts = prepared.prologue;
+  PlacementState state = placer.Init(stmts);
+  int step = 0;
+  for (int64_t nj = 0; nj < num_n; ++nj) {
+    const int64_t ni = nj * root.n;
+    const int64_t n_eff = std::min<int64_t>(root.n, root.N - ni);
+    for (int64_t mj = 0; mj < num_m; ++mj) {
+      const int64_t mi = mj * root.m;
+      const int64_t m_eff = std::min<int64_t>(root.m, root.M - mi);
+      VarPtr acc;
+      for (size_t stage_i = 0; stage_i < chain.stages.size(); ++stage_i) {
+        MatmulTiling stage = chain.stages[stage_i];
+        stage.acc_init = acc;
+        const std::string base =
+            root.assign->var_->name_hint_ + "_t" + std::to_string(step) + "_s" + std::to_string(stage_i);
+        if (stage.k < stage.K && !acc) {
+          // A fresh split-K root starts outside the loop. The remainder is a
+          // pure matmul_acc reduction pinned to that first result, so both the
+          // PyPTO and PTOAS planners see one physical accumulator rather than
+          // a conservative fresh/acc if-phi join plus its continuation.
+          acc = EmitLinearChainKBlock(stmts, stage, nullptr, mi, ni, m_eff, n_eff,
+                                      /*k_offset=*/0, /*k_extent=*/stage.k, base + "_first");
+          const int64_t remaining_k = stage.K - stage.k;
+          if (remaining_k <= stage.k) {
+            acc = EmitLinearChainKBlock(stmts, stage, acc, mi, ni, m_eff, n_eff,
+                                        /*k_offset=*/stage.k, /*k_extent=*/remaining_k, base + "_rest");
+          } else {
+            MatmulTiling remainder = stage;
+            remainder.K = remaining_k;
+            remainder.acc_init = acc;
+            remainder.bias = nullptr;  // bias was applied by the fresh first block
+            auto loop =
+                MakeKLoop(remainder, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, base + "_rest");
+            loop.k_base = stage.k;
+            auto rewrite = BuildKLoopRewrite(loop);
+            stmts.insert(stmts.end(), std::make_move_iterator(rewrite.stmts.begin()),
+                         std::make_move_iterator(rewrite.stmts.end()));
+            acc = rewrite.return_var;
+          }
+        } else if (stage.k < stage.K) {
+          auto rewrite =
+              BuildKLoopRewrite(MakeKLoop(stage, MakeIndex(mi, sp), MakeIndex(ni, sp), m_eff, n_eff, base));
+          stmts.insert(stmts.end(), std::make_move_iterator(rewrite.stmts.begin()),
+                       std::make_move_iterator(rewrite.stmts.end()));
+          acc = rewrite.return_var;
+        } else {
+          acc = EmitLinearChainKBlock(stmts, stage, acc, mi, ni, m_eff, n_eff,
+                                      /*k_offset=*/0, /*k_extent=*/stage.K, base);
+        }
+      }
+      INTERNAL_CHECK_SPAN(acc, sp) << "Internal error: linear matmul chain produced no Acc result";
+      state = placer.PlaceAt(stmts, acc, MakeIndex(mi, sp), MakeIndex(ni, sp), state, step);
+      ++step;
+    }
+  }
+  return {std::move(stmts), std::move(state)};
+}
+
 /// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
 /// L0c into a ``ceil(M/m) x ceil(N/n)`` grid of sub-tile matmuls, each computing
 /// an ``[m, n]`` (partial on the boundary) Acc result.  Operands are already
@@ -1805,8 +2293,9 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildSplitKGrid(const MatmulTiling& t, S
 /// The Mat-scratch alternative is handled earlier by ``TryFoldMatScratch``.
 /// ``result_uses`` / ``store_stmt`` come from the precomputed SiblingIndex.
 /// Returns nullopt (with a PerfHint) when neither placement applies — an
-/// arbitrary ``matmul_acc`` with a caller-supplied [M, N] accumulator, a Vec
-/// left operand, and mixed/non-matmul on-chip consumers are deferred. The
+/// arbitrary ``matmul_acc`` with a caller-supplied [M, N] accumulator and
+/// mixed/non-matmul on-chip consumers are deferred. A Vec left operand is
+/// staged into Mat once before this grid. The
 /// canonical frontend split-K create/pipeline/store form is handled earlier at
 /// the enclosing-loop level.
 std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, const AssignStmt* store_stmt,
@@ -1822,10 +2311,6 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
         "oversized tile.matmul_acc does not match the canonical create -> split-K pipeline -> store "
         "form handled by loop-level M/N tiling; slicing this caller-owned [M, N] accumulator is "
         "unsupported, so the call is left untouched");
-  }
-  if (t.stage_lhs_to_mat) {
-    return skip(
-        "tile.matmul with a Vec left operand needs M/N tiling — the PV path is deferred; left untouched");
   }
   // K spans >= 2 L0 blocks → pipelined K-loop per sub-tile (BuildSplitKGrid);
   // k == K (full K fits L0a/L0b) → pipelined interior + straight-line partial
@@ -1857,8 +2342,15 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
     }
     DirectGmPlacer placer(offs->elements_[0], offs->elements_[1], out_in, store_call->kwargs_,
                           store_call->attrs_, sp);
-    auto [stmts, last_out] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
-    return MNFold{std::move(stmts), last_out, store_stmt->var_, store_stmt};
+    auto prepared = PrepareMNTilingOperands(t, /*other_mat_bytes=*/0, hints);
+    if (!prepared) return std::nullopt;
+    auto [grid, last_out] =
+        full_k ? BuildFullKPipelined(prepared->tiling, placer) : BuildSplitKGrid(prepared->tiling, placer);
+    std::vector<StmtPtr> stmts = std::move(prepared->prologue);
+    stmts.insert(stmts.end(), std::make_move_iterator(grid.begin()), std::make_move_iterator(grid.end()));
+    INTERNAL_CHECK_SPAN(last_out.size() == 1, sp)
+        << "Internal error: direct-store M/N placement must return one tensor";
+    return MNFold{std::move(stmts), last_out.front(), store_stmt->var_, store_stmt};
   }
 
   return skip(
@@ -1892,6 +2384,64 @@ bool CastFoldableToFixpipeMat(const CallPtr& cast, const TileTypePtr& src_ty, Da
   return mode == kRoundRint;
 }
 
+struct PreparedMatScratch {
+  PreparedMNTiling operands;
+  uint64_t physical_bytes = 0;
+};
+
+std::optional<uint64_t> ValidateMatScratch(const MatmulTiling& t, DataType scratch_dtype,
+                                           std::vector<Diagnostic>& hints) {
+  const Span sp = t.assign->span_;
+  const auto* ctx = PassContext::Current();
+  const auto* handler = ctx ? ctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+  INTERNAL_CHECK_SPAN(handler, sp) << "Internal error: BackendHandler is null";
+
+  if (handler->RequiresLowPrecisionMatScratch() && scratch_dtype != DataType::BF16 &&
+      scratch_dtype != DataType::FP16) {
+    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-009",
+                       "chained-matmul [" + std::to_string(t.M) + ", " + std::to_string(t.N) +
+                           "] intermediate is " + scratch_dtype.ToString() +
+                           "; this backend's oversized on-chip Mat scratch needs a bf16/f16 "
+                           "intermediate (cast the matmul result to bf16 before the consumer "
+                           "matmul, the cube's native operand precision) — left on the deferred path",
+                       sp);
+    return std::nullopt;
+  }
+
+  auto scratch_call =
+      OpRegistry::GetInstance().Create("tile.create", {MakeIndexTuple({t.M, t.N}, sp)},
+                                       {{"dtype", scratch_dtype}, {"target_memory", MemorySpace::Mat}}, sp);
+  auto scratch_ty = As<TileType>(scratch_call->GetType());
+  auto scratch_bytes = utils::StaticPhysicalAllocationBytes(scratch_ty, MemorySpace::Mat, handler);
+  const uint64_t mat_capacity = handler->GetMatCapacityBytes();
+  if (!scratch_bytes || *scratch_bytes > mat_capacity) {
+    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
+                       "chained-matmul [" + std::to_string(t.M) + ", " + std::to_string(t.N) +
+                           "] physical Mat scratch footprint " +
+                           (scratch_bytes ? "(" + std::to_string(*scratch_bytes) + " bytes) exceeds"
+                                          : "cannot be proven within") +
+                           " Mat capacity (" + std::to_string(mat_capacity) +
+                           " bytes); left on the deferred path",
+                       sp);
+    return std::nullopt;
+  }
+
+  return scratch_bytes;
+}
+
+/// Validate the backend's Acc->Mat path and physical Mat capacity, then prepare
+/// any one-time Vec->Mat operand staging that must coexist with the scratch.
+/// This is shared by Mat-only and GM+Mat composite materialization so their
+/// legality contract cannot drift.
+std::optional<PreparedMatScratch> PrepareMatScratch(const MatmulTiling& t, DataType scratch_dtype,
+                                                    std::vector<Diagnostic>& hints) {
+  auto scratch_bytes = ValidateMatScratch(t, scratch_dtype, hints);
+  if (!scratch_bytes) return std::nullopt;
+  auto operands = PrepareMNTilingOperands(t, *scratch_bytes, hints);
+  if (!operands) return std::nullopt;
+  return PreparedMatScratch{std::move(*operands), *scratch_bytes};
+}
+
 /// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
 /// L0c into a Mat-scratch grid when the result is consumed *entirely* at
 /// matmul-operand positions (a chained matmul reads it on-chip).  Each sub-tile is
@@ -1902,57 +2452,22 @@ bool CastFoldableToFixpipeMat(const CallPtr& cast, const TileTypePtr& src_ty, Da
 /// Both K-split (unrolled, constant offsets) and full-K (pipelined, loop-variable
 /// offsets) are supported: ``tile.assemble`` only needs a literal ``MakeTuple``
 /// offset whose *elements* may be loop variables (`ValidateIndexTupleElements`
-/// requires index-typed elements, not constants). Arbitrary ``matmul_acc`` and
-/// Vec-left stay deferred; the canonical split-K form is handled before this
-/// local call-level fold.
+/// requires index-typed elements, not constants). Arbitrary ``matmul_acc``
+/// stays deferred; a Vec left operand is staged once before the grid. The
+/// canonical split-K form is handled before this local call-level fold.
 std::optional<std::pair<std::vector<StmtPtr>, VarPtr>> TryFoldMatScratch(const MatmulTiling& t,
                                                                          int result_uses, int operand_uses,
                                                                          DataType scratch_dtype,
                                                                          std::vector<Diagnostic>& hints) {
   const Span sp = t.assign->span_;
-  // Arbitrary matmul_acc / Vec-left are deferred (the direct-store path already
-  // hinted these). Canonical split-K is rewritten at the enclosing-loop level.
-  if (t.is_acc() || t.stage_lhs_to_mat) return std::nullopt;
+  // Arbitrary matmul_acc is deferred (the direct-store path emits its hint).
+  // Canonical split-K is rewritten at the enclosing-loop level.
+  if (t.is_acc()) return std::nullopt;
   // Every use must be a matmul operand: a non-operand use (store, elementwise,
   // matmul_acc accumulator) means substituting an upstream Mat scratch is illegal.
   if (result_uses < 1 || operand_uses != result_uses) return std::nullopt;
-  // On backends whose only offset Acc->Mat path is the FIXPIPE writeback
-  // (`pto.tinsert`), that path downcasts f32 -> bf16/f16 and cannot keep f32 — a
-  // same-dtype f32 Acc->Mat assemble lowers to subview+tmov, which the assembler
-  // rejects for a partial window. So an oversized chained-matmul scratch must be
-  // bf16/f16 there (the dtype comes from a `tile.cast(result, bf16/f16)` fused
-  // into the assemble, the cube's native operand precision); without it, defer
-  // (left whole) rather than emit an unassemblable f32 Mat scratch. A5's tinsert
-  // accepts dst=f32, so its handler returns false and an f32 scratch is kept.
-  const auto* ctx = PassContext::Current();
-  const auto* handler = ctx ? ctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
-  const bool requires_low_precision = handler && handler->RequiresLowPrecisionMatScratch();
-  if (requires_low_precision && scratch_dtype != DataType::BF16 && scratch_dtype != DataType::FP16) {
-    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-009",
-                       "chained-matmul [" + std::to_string(t.M) + ", " + std::to_string(t.N) +
-                           "] intermediate is " + scratch_dtype.ToString() +
-                           "; this backend's oversized on-chip Mat scratch needs a bf16/f16 "
-                           "intermediate (cast the matmul result to bf16 before the consumer "
-                           "matmul, the cube's native operand precision) — left on the deferred path",
-                       sp);
-    return std::nullopt;
-  }
-  auto result_ty = As<TileType>(t.assign->var_->GetType());
-  INTERNAL_CHECK_SPAN(result_ty, sp) << "Internal error: matmul result is not a TileType";
-  // Necessary capacity gate: the Mat scratch alone must fit. The allocator still
-  // performs the full live-range/packing check later.
-  const uint64_t mat_capacity = handler ? handler->GetMatCapacityBytes() : 0;
-  const uint64_t scratch_bytes =
-      static_cast<uint64_t>(t.M) * static_cast<uint64_t>(t.N) * DTypeBytes(scratch_dtype);
-  if (mat_capacity > 0 && scratch_bytes > mat_capacity) {
-    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
-                       "chained-matmul [" + std::to_string(t.M) + ", " + std::to_string(t.N) +
-                           "] Mat scratch (" + std::to_string(scratch_bytes) +
-                           " bytes) exceeds Mat capacity (" + std::to_string(mat_capacity) +
-                           " bytes); left on the deferred path",
-                       sp);
-    return std::nullopt;
-  }
+  auto prepared = PrepareMatScratch(t, scratch_dtype, hints);
+  if (!prepared) return std::nullopt;
   const std::string base = t.assign->var_->name_hint_ + "_mat";
   MatScratchPlacer placer(t.M, t.N, scratch_dtype, base, sp);
   // K-split (K spans >= 2 L0 blocks) → unrolled per-sub-tile K-loop grid; full-K →
@@ -1969,8 +2484,233 @@ std::optional<std::pair<std::vector<StmtPtr>, VarPtr>> TryFoldMatScratch(const M
   // never carries it.  (The Acc->Mat drain is cheaper than Acc->GM, so the hiding
   // upside is smaller here, but the mechanism is the same.)
   const bool full_k = t.k == t.K;
-  auto [stmts, scratch] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
-  return std::make_pair(std::move(stmts), scratch);
+  auto [grid, scratch] = full_k ? BuildFullKPipelined(prepared->operands.tiling, placer)
+                                : BuildSplitKGrid(prepared->operands.tiling, placer);
+  std::vector<StmtPtr> stmts = std::move(prepared->operands.prologue);
+  stmts.insert(stmts.end(), std::make_move_iterator(grid.begin()), std::make_move_iterator(grid.end()));
+  INTERNAL_CHECK_SPAN(scratch.size() == 1, sp)
+      << "Internal error: Mat-scratch M/N placement must return one scratch";
+  return std::make_pair(std::move(stmts), scratch.front());
+}
+
+/// Materialize one oversized logical matmul result to both of the destinations
+/// already expressed by the source program: a GM store and downstream Mat-safe
+/// matmul operand reads. The compiler creates the Mat scratch and fans each
+/// legal Acc sub-tile out to both sinks; the source program never needs to know
+/// that M/N tiling or `tile.assemble` exists.
+std::optional<MNFold> TryFoldStoredAndReused(const MatmulTiling& t, const AssignStmt* store_stmt,
+                                             const Var* materialized_old_var, DataType scratch_dtype,
+                                             const Var* dropped_def, const SiblingIndex& index,
+                                             std::vector<Diagnostic>& hints) {
+  if (t.is_acc() || !store_stmt || !materialized_old_var) return std::nullopt;
+  const Span sp = t.assign->span_;
+
+  auto uses_it = index.use_counts.find(materialized_old_var);
+  auto operands_it = index.matmul_operand_uses.find(materialized_old_var);
+  const int uses = uses_it == index.use_counts.end() ? 0 : uses_it->second;
+  const int operand_uses = operands_it == index.matmul_operand_uses.end() ? 0 : operands_it->second;
+  if (uses < 1 || uses != operand_uses) return std::nullopt;
+
+  auto store_pos_it = index.positions.find(store_stmt);
+  auto consumer_pos_it = index.matmul_operand_positions.find(materialized_old_var);
+  INTERNAL_CHECK_SPAN(store_pos_it != index.positions.end(), sp)
+      << "Internal error: stored-and-reused store is absent from its sibling index";
+  INTERNAL_CHECK_SPAN(consumer_pos_it != index.matmul_operand_positions.end(), sp)
+      << "Internal error: Mat-safe consumer positions are absent from their sibling index";
+  for (size_t consumer_pos : consumer_pos_it->second) {
+    if (consumer_pos <= store_pos_it->second) {
+      hints.emplace_back(
+          DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
+          "tile.matmul output exceeds L0c and is both stored and reused on-chip, but an on-chip consumer "
+          "precedes the store where the composite GM/Mat materialization would be emitted; left untouched",
+          sp);
+      return std::nullopt;
+    }
+  }
+
+  auto store_call = As<Call>(store_stmt->value_);
+  INTERNAL_CHECK_SPAN(store_call && IsOp(store_call, "tile.store") && store_call->args_.size() == 3,
+                      store_stmt->span_)
+      << "Internal error: stored-and-reused placement received a non-store consumer";
+  auto offsets = As<MakeTuple>(store_call->args_[1]);
+  auto out_in = AsVarLike(store_call->args_[2]);
+  if (!offsets || offsets->elements_.size() != 2 || !out_in) {
+    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
+                       "stored-and-reused tile.matmul needs a 2D tile.store with a simple tensor target; "
+                       "left untouched",
+                       sp);
+    return std::nullopt;
+  }
+
+  auto prepared = PrepareMatScratch(t, scratch_dtype, hints);
+  if (!prepared) return std::nullopt;
+
+  std::vector<std::unique_ptr<SubtilePlacer>> children;
+  children.push_back(std::make_unique<DirectGmPlacer>(offsets->elements_[0], offsets->elements_[1], out_in,
+                                                      store_call->kwargs_, store_call->attrs_, sp));
+  children.push_back(
+      std::make_unique<MatScratchPlacer>(t.M, t.N, scratch_dtype, t.assign->var_->name_hint_ + "_mat", sp));
+  CompositeSubtilePlacer placer(std::move(children), sp);
+
+  const bool full_k = t.k == t.K;
+  auto [grid, state] = full_k ? BuildFullKPipelined(prepared->operands.tiling, placer)
+                              : BuildSplitKGrid(prepared->operands.tiling, placer);
+  INTERNAL_CHECK_SPAN(state.size() == 2, sp)
+      << "Internal error: GM+Mat materialization must return one state value per destination";
+  std::vector<StmtPtr> stmts = std::move(prepared->operands.prologue);
+  stmts.insert(stmts.end(), std::make_move_iterator(grid.begin()), std::make_move_iterator(grid.end()));
+  return MNFold{std::move(stmts),     state[0], store_stmt->var_, store_stmt,
+                materialized_old_var, state[1], dropped_def};
+}
+
+struct LinearChainFold {
+  std::vector<StmtPtr> stmts;
+  const AssignStmt* store = nullptr;
+  VarPtr old_store_result;
+  VarPtr new_store_result;
+  const Var* materialized_old_var = nullptr;
+  VarPtr materialized_new_var;
+  const Var* dropped_def = nullptr;
+};
+
+std::optional<LinearChainFold> TryFoldLinearMatmulChain(const LinearMatmulChain& chain,
+                                                        const SiblingIndex& index,
+                                                        std::vector<Diagnostic>& hints) {
+  INTERNAL_CHECK(!chain.stages.empty() && chain.terminal) << "Internal error: invalid linear matmul chain";
+  const MatmulTiling& root = chain.stages.front();
+  const Var* terminal = chain.terminal;
+  auto terminal_ty = As<TileType>(terminal->GetType());
+  INTERNAL_CHECK_SPAN(terminal_ty, root.assign->span_)
+      << "Internal error: linear matmul chain terminal is not a tile";
+
+  const int terminal_uses = index.use_counts.count(terminal) ? index.use_counts.at(terminal) : 0;
+  const int terminal_operand_uses =
+      index.matmul_operand_uses.count(terminal) ? index.matmul_operand_uses.at(terminal) : 0;
+  auto stores_it = index.stores_of.find(terminal);
+  const AssignStmt* store = stores_it != index.stores_of.end() && stores_it->second.size() == 1
+                                ? stores_it->second.front()
+                                : nullptr;
+
+  const Var* cast_result = nullptr;
+  const Var* dropped_cast = nullptr;
+  DataType cast_dtype = terminal_ty->dtype_;
+  int cast_uses = 0;
+  int cast_operand_uses = 0;
+  if (auto cast_it = index.cast_of.find(terminal); cast_it != index.cast_of.end()) {
+    const Var* cb = cast_it->second->var_.get();
+    auto cb_ty = As<TileType>(cb->GetType());
+    auto cast_call = As<Call>(cast_it->second->value_);
+    if (cb_ty && CastFoldableToFixpipeMat(cast_call, terminal_ty, cb_ty->dtype_)) {
+      cast_result = cb;
+      dropped_cast = cb;
+      cast_dtype = cb_ty->dtype_;
+      cast_uses = index.use_counts.count(cb) ? index.use_counts.at(cb) : 0;
+      cast_operand_uses = index.matmul_operand_uses.count(cb) ? index.matmul_operand_uses.at(cb) : 0;
+    }
+  }
+
+  enum class Destination { kDirect, kMat, kComposite };
+  std::optional<Destination> destination;
+  const Var* materialized_old = nullptr;
+  const Var* drop = nullptr;
+  DataType scratch_dtype = terminal_ty->dtype_;
+  if (store && terminal_uses == 1) {
+    destination = Destination::kDirect;
+  } else if (!store && terminal_uses >= 1 && terminal_uses == terminal_operand_uses) {
+    destination = Destination::kMat;
+    materialized_old = terminal;
+  } else if (!store && cast_result && terminal_uses == 1 && cast_uses >= 1 &&
+             cast_uses == cast_operand_uses) {
+    destination = Destination::kMat;
+    materialized_old = cast_result;
+    drop = dropped_cast;
+    scratch_dtype = cast_dtype;
+  } else if (store && terminal_operand_uses >= 1 && terminal_uses == terminal_operand_uses + 1) {
+    destination = Destination::kComposite;
+    materialized_old = terminal;
+  } else if (store && cast_result && terminal_uses == 2 && terminal_operand_uses == 0 && cast_uses >= 1 &&
+             cast_uses == cast_operand_uses) {
+    destination = Destination::kComposite;
+    materialized_old = cast_result;
+    drop = dropped_cast;
+    scratch_dtype = cast_dtype;
+  }
+  if (!destination) return std::nullopt;
+
+  CallPtr store_call;
+  MakeTuplePtr offsets;
+  VarPtr out_in;
+  if (store) {
+    store_call = As<Call>(store->value_);
+    offsets = store_call && store_call->args_.size() == 3 ? As<MakeTuple>(store_call->args_[1]) : nullptr;
+    out_in = store_call && store_call->args_.size() == 3 ? AsVarLike(store_call->args_[2]) : nullptr;
+    if (!store_call || !IsOp(store_call, "tile.store") || !offsets || offsets->elements_.size() != 2 ||
+        !out_in) {
+      return std::nullopt;
+    }
+  }
+
+  uint64_t scratch_bytes = 0;
+  if (*destination != Destination::kDirect) {
+    auto validated = ValidateMatScratch(root, scratch_dtype, hints);
+    if (!validated) return std::nullopt;
+    scratch_bytes = *validated;
+  }
+  if (*destination == Destination::kComposite) {
+    auto store_pos = index.positions.at(store);
+    auto consumer_positions = index.matmul_operand_positions.find(materialized_old);
+    if (consumer_positions == index.matmul_operand_positions.end()) return std::nullopt;
+    for (size_t consumer_pos : consumer_positions->second) {
+      if (consumer_pos <= store_pos) {
+        hints.emplace_back(
+            DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
+            "linear matmul/matmul_acc chain is stored and reused, but an on-chip consumer precedes its "
+            "GM/Mat materialization point; left untouched",
+            root.assign->span_);
+        return std::nullopt;
+      }
+    }
+  }
+
+  auto prepared = PrepareLinearChainOperands(chain, scratch_bytes, hints);
+  if (!prepared) return std::nullopt;
+  std::unique_ptr<SubtilePlacer> placer;
+  if (*destination == Destination::kDirect) {
+    placer = std::make_unique<DirectGmPlacer>(offsets->elements_[0], offsets->elements_[1], out_in,
+                                              store_call->kwargs_, store_call->attrs_, root.assign->span_);
+  } else if (*destination == Destination::kMat) {
+    placer = std::make_unique<MatScratchPlacer>(root.M, root.N, scratch_dtype,
+                                                root.assign->var_->name_hint_ + "_mat", root.assign->span_);
+  } else {
+    std::vector<std::unique_ptr<SubtilePlacer>> children;
+    children.push_back(std::make_unique<DirectGmPlacer>(offsets->elements_[0], offsets->elements_[1], out_in,
+                                                        store_call->kwargs_, store_call->attrs_,
+                                                        root.assign->span_));
+    children.push_back(std::make_unique<MatScratchPlacer>(
+        root.M, root.N, scratch_dtype, root.assign->var_->name_hint_ + "_mat", root.assign->span_));
+    placer = std::make_unique<CompositeSubtilePlacer>(std::move(children), root.assign->span_);
+  }
+
+  auto [stmts, state] = BuildLinearChainGrid(*prepared, *placer);
+  const size_t expected_state = *destination == Destination::kComposite ? 2 : 1;
+  INTERNAL_CHECK_SPAN(state.size() == expected_state, root.assign->span_)
+      << "Internal error: linear-chain placement returned the wrong state width";
+  LinearChainFold fold;
+  fold.stmts = std::move(stmts);
+  fold.store = store;
+  if (store) {
+    fold.old_store_result = store->var_;
+    fold.new_store_result = state.front();
+  }
+  if (*destination == Destination::kMat) {
+    fold.materialized_old_var = materialized_old;
+    fold.materialized_new_var = state.front();
+  } else if (*destination == Destination::kComposite) {
+    fold.materialized_old_var = materialized_old;
+    fold.materialized_new_var = state[1];
+  }
+  fold.dropped_def = drop;
+  return fold;
 }
 
 /// Static physical footprint of a tile, rounded exactly as the active memory
@@ -2460,10 +3200,12 @@ class AutoTileMutator : public IRMutator {
     // folded into a low-precision Mat scratch — the scratch already holds the
     // bf16 intermediate, so the now same-dtype cast is a dead no-op to remove.
     std::unordered_set<const Var*> dropped;
-    // M/N tiling folds the matmul's consumer store into the per-sub-tile
-    // rewrite.  We drop the matmul at its own position and emit the sub-tile
-    // stmts where the store was (preserving the order of any statements between
-    // them), keyed by the store statement's identity.
+    // M/N tiling folds a later consumer/anchor into the per-sub-tile rewrite.
+    // We drop the matmul at its own position and emit the sub-tile stmts where
+    // that anchor was (preserving the order of any statements between them),
+    // keyed by the anchor statement's identity. Usually this is a store; a
+    // Mat-only linear accumulator chain uses its terminal matmul_acc so every
+    // later-stage operand remains defined before the replacement.
     std::unordered_map<const Stmt*, MNFold> pending_folds;
     // Use counts + store-consumer sites across this SeqStmts, built lazily on
     // the first oversized matmul and reused — O(N) total, no rescan per matmul.
@@ -2474,8 +3216,8 @@ class AutoTileMutator : public IRMutator {
     for (size_t i = 0; i < op->stmts_.size(); ++i) {
       const StmtPtr& child = op->stmts_[i];
 
-      // A consumer store folded into a prior M/N rewrite: emit the sub-tile
-      // stmts in the store's original position and drop the store itself.
+      // A consumer/anchor folded into a prior M/N rewrite: emit the sub-tile
+      // stmts in the anchor's original position and drop the anchor itself.
       // Apply the now-current remap so the folded stores' output-tensor chain
       // start (and any other operands) reflect rewrites installed between the
       // matmul and this store — in particular a prior fold that redefined the
@@ -2489,7 +3231,8 @@ class AutoTileMutator : public IRMutator {
       // SSA var, so applying that one entry would rewrite the chain start onto
       // the fold's final output — a self-referential use-before-def.
       if (auto it = pending_folds.find(child.get()); it != pending_folds.end()) {
-        auto self = remap.extract(it->second.store_result_var.get());
+        decltype(remap)::node_type self;
+        if (it->second.store_result_var) self = remap.extract(it->second.store_result_var.get());
         for (auto& s : it->second.stmts) {
           out.push_back(remap.empty() ? s : transform_utils::Substitute(s, remap));
         }
@@ -2557,10 +3300,12 @@ class AutoTileMutator : public IRMutator {
               if (fixpipe_castable) {
                 MatScratchPlacer placer(m_ci->value_, n_ci->value_, cb_ty->dtype_, src->name_hint_ + "_mat",
                                         cast_as->span_);
-                VarPtr scratch = placer.Init(out);
-                VarPtr cmat = placer.PlaceAt(out, src, MakeIndex(0, cast_as->span_),
-                                             MakeIndex(0, cast_as->span_), scratch, /*step=*/0);
-                remap[cb] = cmat;  // the consumer matmul now reads the Mat scratch
+                PlacementState scratch = placer.Init(out);
+                PlacementState cmat = placer.PlaceAt(out, src, MakeIndex(0, cast_as->span_),
+                                                     MakeIndex(0, cast_as->span_), scratch, /*step=*/0);
+                INTERNAL_CHECK_SPAN(cmat.size() == 1, cast_as->span_)
+                    << "Internal error: fits-L0c Mat-scratch fold must return one scratch";
+                remap[cb] = cmat.front();  // the consumer matmul now reads the Mat scratch
                 changed = true;
                 continue;  // drop the dead tile.cast
               }
@@ -2609,11 +3354,44 @@ class AutoTileMutator : public IRMutator {
           // freshly defined here, so its use count / store site are never
           // affected by the running remap.
           if (!sibling_index) sibling_index = BuildSiblingIndex(op->stmts_);
+
+          // A fresh root may feed a linear sequence of tile.matmul_acc calls.
+          // Rewrite the whole logical reduction atomically so no oversized
+          // caller-owned intermediate Acc survives between stages.
+          if (!tiling->is_acc()) {
+            if (auto chain = AnalyzeLinearMatmulChain(*tiling, *sibling_index, hints)) {
+              if (auto chain_fold = TryFoldLinearMatmulChain(*chain, *sibling_index, hints)) {
+                for (const Var* continuation : chain->continuation_defs) dropped.insert(continuation);
+                if (chain_fold->dropped_def) dropped.insert(chain_fold->dropped_def);
+                if (chain_fold->materialized_old_var) {
+                  remap[chain_fold->materialized_old_var] = chain_fold->materialized_new_var;
+                }
+                if (chain_fold->store) {
+                  remap[chain_fold->old_store_result.get()] = chain_fold->new_store_result;
+                  MNFold pending{std::move(chain_fold->stmts), chain_fold->new_store_result,
+                                 chain_fold->old_store_result, chain_fold->store};
+                  pending_folds.emplace(static_cast<const Stmt*>(chain_fold->store), std::move(pending));
+                } else {
+                  const AssignStmt* terminal = chain->stages.back().assign.get();
+                  MNFold pending{std::move(chain_fold->stmts), nullptr, nullptr, terminal};
+                  pending_folds.emplace(static_cast<const Stmt*>(terminal), std::move(pending));
+                }
+                changed = true;
+                continue;
+              }
+            }
+          }
+
           const Var* result = assign->var_.get();
           auto uc_it = sibling_index->use_counts.find(result);
-          int result_uses = uc_it == sibling_index->use_counts.end() ? 0 : uc_it->second;
+          const int source_result_uses = uc_it == sibling_index->use_counts.end() ? 0 : uc_it->second;
           auto mo_it = sibling_index->matmul_operand_uses.find(result);
-          int operand_uses = mo_it == sibling_index->matmul_operand_uses.end() ? 0 : mo_it->second;
+          const int source_operand_uses =
+              mo_it == sibling_index->matmul_operand_uses.end() ? 0 : mo_it->second;
+          const auto stores_it = sibling_index->stores_of.find(result);
+          const bool has_one_store =
+              stores_it != sibling_index->stores_of.end() && stores_it->second.size() == 1;
+          const AssignStmt* store_stmt = has_one_store ? stores_it->second.front() : nullptr;
           // Mat-scratch dtype + remap target. Default: the matmul result itself at
           // its own dtype. Chained-matmul-with-downcast — `c -> tile.cast(c,
           // bf16/f16) -> matmul` — fuses the cast (the cube FIXPIPE writeback,
@@ -2625,6 +3403,11 @@ class AutoTileMutator : public IRMutator {
           DataType scratch_dtype = result_tile_ty->dtype_;
           const Var* remap_target = result;
           const Var* extra_remap = nullptr;
+          const Var* cast_result = nullptr;
+          const Var* foldable_cast_def = nullptr;
+          DataType cast_scratch_dtype = scratch_dtype;
+          int cast_uses = 0;
+          int cast_operand_uses = 0;
           if (auto cast_it = sibling_index->cast_of.find(result); cast_it != sibling_index->cast_of.end()) {
             const Var* cb = cast_it->second->var_.get();
             auto cb_ty = As<TileType>(cb->GetType());
@@ -2638,14 +3421,17 @@ class AutoTileMutator : public IRMutator {
               auto cb_mo = sibling_index->matmul_operand_uses.find(cb);
               const int cb_uses = cb_uc == sibling_index->use_counts.end() ? 0 : cb_uc->second;
               const int cb_mm = cb_mo == sibling_index->matmul_operand_uses.end() ? 0 : cb_mo->second;
+              cast_result = cb;
+              foldable_cast_def = cb;
+              cast_scratch_dtype = cb_ty->dtype_;
+              cast_uses = cb_uses;
+              cast_operand_uses = cb_mm;
               // `c`'s sole use is the cast, whose result is consumed entirely as
               // matmul operands — fold the matmul+cast into a low-precision scratch.
-              if (result_uses == 1 && cb_uses >= 1 && cb_uses == cb_mm) {
+              if (source_result_uses == 1 && cb_uses >= 1 && cb_uses == cb_mm) {
                 scratch_dtype = cb_ty->dtype_;
                 remap_target = cb;     // consumer matmul reads the scratch
                 extra_remap = result;  // c -> scratch too; the cast op goes dead
-                result_uses = cb_uses;
-                operand_uses = cb_mm;
               }
             }
           }
@@ -2669,7 +3455,38 @@ class AutoTileMutator : public IRMutator {
             os_tiling = AnalyzeMatmul(assign, discard, /*force_output_stationary=*/true);
             if (os_tiling) fold_tiling = &*os_tiling;
           }
-          if (auto ms = TryFoldMatScratch(*fold_tiling, result_uses, operand_uses, scratch_dtype, hints)) {
+
+          // Stored-and-reused: preserve the programmer's ordinary GM store and
+          // on-chip matmul dataflow by materializing each legal Acc sub-tile to
+          // both destinations. A foldable cast is absorbed into the Mat writeback.
+          const Var* composite_target = nullptr;
+          const Var* composite_drop = nullptr;
+          DataType composite_dtype = result_tile_ty->dtype_;
+          if (has_one_store && cast_result && source_result_uses == 2 && source_operand_uses == 0 &&
+              cast_uses >= 1 && cast_uses == cast_operand_uses) {
+            composite_target = cast_result;
+            composite_drop = foldable_cast_def;
+            composite_dtype = cast_scratch_dtype;
+          } else if (has_one_store && source_operand_uses >= 1 &&
+                     source_result_uses == source_operand_uses + 1) {
+            composite_target = result;
+          }
+          if (composite_target) {
+            if (auto fold = TryFoldStoredAndReused(*fold_tiling, store_stmt, composite_target,
+                                                   composite_dtype, composite_drop, *sibling_index, hints)) {
+              remap[fold->store_result_var.get()] = fold->return_var;
+              remap[fold->materialized_old_var] = fold->materialized_new_var;
+              if (fold->dropped_def) dropped.insert(fold->dropped_def);
+              pending_folds.emplace(static_cast<const Stmt*>(fold->store), std::move(*fold));
+              changed = true;
+              continue;
+            }
+          }
+
+          const int scratch_uses = extra_remap ? cast_uses : source_result_uses;
+          const int scratch_operand_uses = extra_remap ? cast_operand_uses : source_operand_uses;
+          if (auto ms =
+                  TryFoldMatScratch(*fold_tiling, scratch_uses, scratch_operand_uses, scratch_dtype, hints)) {
             for (auto& s : ms->first) out.push_back(std::move(s));
             remap[remap_target] = ms->second;
             if (extra_remap) {
@@ -2679,10 +3496,7 @@ class AutoTileMutator : public IRMutator {
             changed = true;
             continue;
           }
-          auto store_it = sibling_index->store_of.find(result);
-          const AssignStmt* store_stmt =
-              store_it == sibling_index->store_of.end() ? nullptr : store_it->second;
-          if (auto fold = TryFoldMNTiling(*tiling, result_uses, store_stmt, hints)) {
+          if (auto fold = TryFoldMNTiling(*tiling, source_result_uses, store_stmt, hints)) {
             remap[fold->store_result_var.get()] = fold->return_var;
             pending_folds.emplace(static_cast<const Stmt*>(fold->store), std::move(*fold));
             changed = true;

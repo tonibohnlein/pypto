@@ -460,17 +460,19 @@ void BindPass(nb::module_& m) {
              "Prefer same byte-width→float then adjust width (e.g. A5 INT32→FP16\n"
              "becomes INT32→FP32→FP16). Already-native casts are left untouched.");
   passes.def("auto_tile_matmul_l0", &pass::AutoTileMatmulL0,
-             "Create a pass that auto-tiles static 2D tile.matmul / tile.matmul_acc for L0\n\n"
+             "Create a pass that auto-tiles static 2D matmul-family ops for L0\n\n"
              "The active backend's roofline chooser selects (m,n,k,stationarity,dbC). K-split\n"
              "reductions use a 2-stage pipelined loop and peel a supported non-divisor aligned\n"
-             "tail. Plain tile.matmul may also use an M/N grid with direct-GM placement or an\n"
-             "on-chip Mat scratch for chained matmul consumers; compatible f32->bf16/f16 rint\n"
-             "casts fold into the FIXPIPE writeback. Full-K grids support output-, A-, and\n"
+             "tail. Fresh tile.matmul / tile.matmul_bias roots and linear accumulator chains\n"
+             "may use an M/N grid with direct-GM placement, an on-chip Mat scratch, or both;\n"
+             "compatible f32->bf16/f16 rint casts fold into the FIXPIPE writeback. A Vec left\n"
+             "operand is staged once before the grid, and bias is applied once per output tile.\n"
+             "Full-K grids support output-, A-, and\n"
              "B-stationary schedules. dbC=2 is enabled under PTOAS and available as a PyPTO\n"
              "planner opt-in. Under PyPTO, a canonical already-L0 stationary-panel pipeline\n"
              "may automatically use two L0C slots when its post-lowering Acc footprint fits.\n"
              "Other already-L0-sized and unsupported regimes are left untouched;\n"
-             "useful deferred cases emit PerfHint diagnostics. tile.matmul_bias is deferred.");
+             "useful deferred cases emit PerfHint diagnostics.");
   passes.def("canonicalize_tile_slice", &pass::CanonicalizeTileSlice,
              "Create a pass that lowers Mat-resident tile.slice into tile.extract\n\n"
              "A tile.slice whose result tile is Mem.Mat (e.g. a batch-page slice emitted by\n"

@@ -461,14 +461,19 @@ def legalize_tile_cast() -> Pass:
     """
 
 def auto_tile_matmul_l0() -> Pass:
-    """Create a pass that auto-tiles static 2D ``tile.matmul`` / ``tile.matmul_acc`` for L0.
+    """Create a pass that auto-tiles static 2D matmul-family ops for L0.
 
     The active backend's roofline chooser selects
     ``(m, n, k, stationarity, dbC)``. K-split reductions use a 2-stage
     pipelined loop and peel a supported non-divisor aligned tail. Plain
-    ``tile.matmul`` may also use an M/N grid with direct-GM placement or an
-    on-chip Mat scratch for chained matmul consumers; compatible
-    f32-to-bf16/f16 ``rint`` casts fold into the FIXPIPE writeback.
+    A fresh ``tile.matmul`` or ``tile.matmul_bias`` may also use an M/N grid
+    with direct-GM placement, an on-chip Mat scratch for chained matmul
+    consumers, or both when the result is stored and reused; compatible
+    f32-to-bf16/f16 ``rint`` casts fold into the FIXPIPE writeback. A
+    Vec-resident left operand is staged into Mat once before the grid. Bias is
+    sliced along N and applied once on the first K block of each output tile.
+    Linear fresh-matmul -> ``tile.matmul_acc`` chains are tiled atomically so
+    no oversized intermediate accumulator is materialized.
 
     Full-K grids support output-, A-, and B-stationary schedules. dbC=2 is
     enabled under PTOAS and available as a PyPTO planner opt-in. Eligible calls
@@ -476,8 +481,9 @@ def auto_tile_matmul_l0() -> Pass:
     chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is needed,
     although a chained result may still be remapped to Mat by the compatible
     cast-fold placement above. Other unsupported regimes are left untouched;
-    useful deferred cases emit ``PerfHint`` diagnostics. ``tile.matmul_bias``
-    is deferred.
+    useful deferred cases emit ``PerfHint`` diagnostics. Standalone oversized
+    ``tile.matmul_acc`` with a caller-owned accumulator and non-matmul on-chip
+    consumers remain deferred.
 
     Under the PyPTO planner, a canonical static already-L0 pipeline containing
     one stationary-panel ``tile.matmul`` and one direct store or assemble drain

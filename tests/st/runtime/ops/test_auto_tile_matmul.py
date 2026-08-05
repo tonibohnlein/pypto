@@ -23,6 +23,10 @@ Validates on device the cases from examples/kernels/11_auto_tile_matmul.py:
     must place an output grid outside the source K loop rather than materialize the full Acc;
     a second non-issue shape exercises simultaneous M and N boundary tiles, and a larger
     source panel composes those boundaries with AutoTile's ordinary inner-K rewrite.
+  - **Transparent M/N placement extensions** -- a Vec-resident left operand is staged to
+    Mat once; ``tile.matmul_bias`` combines M/N and K tiling while applying bias once per
+    output tile; a stored-and-reused result is materialized to both GM and compiler-owned
+    Mat scratch; and a linear ``matmul``→``matmul_acc`` chain is tiled as one reduction.
 
 Golden: torch. This is the on-device validation the unit / codegen / pto-verify checks cannot
 give (actual execution). Ascend910B (``a2a3``): the Mat-scratch / fits-L0c Acc->Mat lowering is
@@ -63,6 +67,12 @@ _BOUNDARY_K_TILE = 128
 
 _COMPOSE_K = 768
 _COMPOSE_K_TILE = 384
+
+_EXT_M = 256
+_EXT_N = 256
+_EXT_K = 64
+_BIAS_K = 256
+_CHAIN_K = 192
 
 
 @pl.jit
@@ -129,6 +139,72 @@ def matmul_acc_n_boundary_retiles_k(
     return c
 
 
+@pl.jit
+def vec_lhs_mn_tiled(
+    a: pl.Tensor[[_EXT_M, _EXT_K], pl.BF16],
+    b: pl.Tensor[[_EXT_K, _EXT_N], pl.BF16],
+    out: pl.Out[pl.Tensor[[_EXT_M, _EXT_N], pl.FP32]],
+):
+    """An oversized tile matmul whose left operand starts in Vec."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="vec_lhs_mn_tiled"):
+        a_vec = pl.load(a, [0, 0], [_EXT_M, _EXT_K], target_memory=pl.Mem.Vec)
+        b_mat = pl.load(b, [0, 0], [_EXT_K, _EXT_N], target_memory=pl.Mem.Mat)
+        c = pl.tile.matmul(a_vec, b_mat)
+        out = pl.store(c, [0, 0], out)
+    return out
+
+
+@pl.jit
+def matmul_bias_mn_k_tiled(
+    a: pl.Tensor[[_EXT_M, _BIAS_K], pl.BF16],
+    b: pl.Tensor[[_BIAS_K, _EXT_N], pl.BF16],
+    bias: pl.Tensor[[1, _EXT_N], pl.FP32],
+    out: pl.Out[pl.Tensor[[_EXT_M, _EXT_N], pl.FP32]],
+):
+    """Oversized biased matmul requiring output-grid and K tiling."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="matmul_bias_mn_k_tiled"):
+        a_mat = pl.load(a, [0, 0], [_EXT_M, _BIAS_K], target_memory=pl.Mem.Mat)
+        b_mat = pl.load(b, [0, 0], [_BIAS_K, _EXT_N], target_memory=pl.Mem.Mat)
+        bias_mat = pl.load(bias, [0, 0], [1, _EXT_N], target_memory=pl.Mem.Mat)
+        c = pl.tile.matmul_bias(a_mat, b_mat, bias_mat)
+        out = pl.store(c, [0, 0], out)
+    return out
+
+
+@pl.jit
+def stored_and_reused_mn_tiled(
+    a: pl.Tensor[[_EXT_M, _EXT_K], pl.BF16],
+    b: pl.Tensor[[_EXT_K, _EXT_N], pl.BF16],
+    e: pl.Tensor[[_EXT_N, _EXT_K], pl.BF16],
+    saved: pl.Out[pl.Tensor[[_EXT_M, _EXT_N], pl.FP32]],
+    out: pl.Out[pl.Tensor[[_EXT_M, _EXT_K], pl.FP32]],
+):
+    """The same oversized result is stored to GM and reused by a matmul."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="stored_and_reused_mn_tiled"):
+        c = pl.matmul(a, b, out_dtype=pl.FP32)
+        cb = pl.cast(c, pl.BF16, mode="rint")
+        saved = pl.assemble(saved, c, [0, 0])
+        d = pl.matmul(cb, e, out_dtype=pl.FP32)
+        out = pl.assemble(out, d, [0, 0])
+    return saved, out
+
+
+@pl.jit
+def linear_matmul_acc_mn_tiled(
+    a0: pl.Tensor[[_EXT_M, _CHAIN_K], pl.BF16],
+    b0: pl.Tensor[[_CHAIN_K, _EXT_N], pl.BF16],
+    a1: pl.Tensor[[_EXT_M, _CHAIN_K], pl.BF16],
+    b1: pl.Tensor[[_CHAIN_K, _EXT_N], pl.BF16],
+    out: pl.Out[pl.Tensor[[_EXT_M, _EXT_N], pl.FP32]],
+):
+    """A fresh matmul plus one linear accumulator stage shares one output grid."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="linear_matmul_acc_mn_tiled"):
+        c0 = pl.matmul(a0, b0, out_dtype=pl.FP32)
+        c1 = pl.matmul_acc(c0, a1, b1)
+        out = pl.assemble(out, c1, [0, 0])
+    return out
+
+
 def _cfg(test_config, planner):
     """Base session config, overridden to a specific memory planner (None = PyPTO default)."""
     return test_config if planner is None else dataclasses.replace(test_config, memory_planner=planner)
@@ -157,6 +233,74 @@ class TestAutoTileMatmulL0:
         assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
             f"{kernel.__name__} (DDR direct-store) max abs diff = {(out - expected).abs().max().item():.3e}"
         )
+
+    @pytest.mark.parametrize("planner", _PLANNERS)
+    def test_vec_lhs_mn_tiling(self, test_config, planner):
+        """AutoTile stages a Vec left operand once and transparently places the output grid."""
+        vec_lhs_mn_tiled._cache.clear()
+        torch.manual_seed(10)
+        a = torch.randn(_EXT_M, _EXT_K, dtype=torch.bfloat16)
+        b = torch.randn(_EXT_K, _EXT_N, dtype=torch.bfloat16)
+        out = torch.zeros((_EXT_M, _EXT_N), dtype=torch.float32)
+
+        vec_lhs_mn_tiled(a, b, out, config=_cfg(test_config, planner))
+
+        expected = a.float() @ b.float()
+        rel_err = ((out - expected).norm() / expected.norm()).item()
+        assert rel_err < 2e-2, f"Vec-left M/N tiling rel_err {rel_err:.3e} exceeds 2e-2"
+
+    @pytest.mark.parametrize("planner", _PLANNERS)
+    def test_matmul_bias_mn_and_k_tiling(self, test_config, planner):
+        """Bias is applied once per output tile when both output and K need tiling."""
+        matmul_bias_mn_k_tiled._cache.clear()
+        torch.manual_seed(11)
+        a = torch.randn(_EXT_M, _BIAS_K, dtype=torch.bfloat16)
+        b = torch.randn(_BIAS_K, _EXT_N, dtype=torch.bfloat16)
+        bias = torch.randn((1, _EXT_N), dtype=torch.float32)
+        out = torch.zeros((_EXT_M, _EXT_N), dtype=torch.float32)
+
+        matmul_bias_mn_k_tiled(a, b, bias, out, config=_cfg(test_config, planner))
+
+        expected = a.float() @ b.float() + bias
+        rel_err = ((out - expected).norm() / expected.norm()).item()
+        assert rel_err < 2e-2, f"M/N+K-tiled matmul_bias rel_err {rel_err:.3e} exceeds 2e-2"
+
+    @pytest.mark.parametrize("planner", _PLANNERS)
+    def test_stored_and_reused_mn_tiling(self, test_config, planner):
+        """Every output sub-tile reaches both its ordinary GM store and on-chip consumer."""
+        stored_and_reused_mn_tiled._cache.clear()
+        torch.manual_seed(12)
+        a = torch.randn(_EXT_M, _EXT_K, dtype=torch.bfloat16)
+        b = torch.randn(_EXT_K, _EXT_N, dtype=torch.bfloat16)
+        e = torch.randn(_EXT_N, _EXT_K, dtype=torch.bfloat16)
+        saved = torch.zeros((_EXT_M, _EXT_N), dtype=torch.float32)
+        out = torch.zeros((_EXT_M, _EXT_K), dtype=torch.float32)
+
+        stored_and_reused_mn_tiled(a, b, e, saved, out, config=_cfg(test_config, planner))
+
+        expected_saved = a.float() @ b.float()
+        expected_out = expected_saved.to(torch.bfloat16).float() @ e.float()
+        saved_rel_err = ((saved - expected_saved).norm() / expected_saved.norm()).item()
+        out_rel_err = ((out - expected_out).norm() / expected_out.norm()).item()
+        assert saved_rel_err < 2e-2, f"stored result rel_err {saved_rel_err:.3e} exceeds 2e-2"
+        assert out_rel_err < 2e-2, f"reused result rel_err {out_rel_err:.3e} exceeds 2e-2"
+
+    @pytest.mark.parametrize("planner", _PLANNERS)
+    def test_linear_matmul_acc_chain_mn_tiling(self, test_config, planner):
+        """Each output tile completes the full linear accumulator chain before its store."""
+        linear_matmul_acc_mn_tiled._cache.clear()
+        torch.manual_seed(13)
+        a0 = torch.randn(_EXT_M, _CHAIN_K, dtype=torch.bfloat16)
+        b0 = torch.randn(_CHAIN_K, _EXT_N, dtype=torch.bfloat16)
+        a1 = torch.randn(_EXT_M, _CHAIN_K, dtype=torch.bfloat16)
+        b1 = torch.randn(_CHAIN_K, _EXT_N, dtype=torch.bfloat16)
+        out = torch.zeros((_EXT_M, _EXT_N), dtype=torch.float32)
+
+        linear_matmul_acc_mn_tiled(a0, b0, a1, b1, out, config=_cfg(test_config, planner))
+
+        expected = a0.float() @ b0.float() + a1.float() @ b1.float()
+        rel_err = ((out - expected).norm() / expected.norm()).item()
+        assert rel_err < 2e-2, f"linear matmul_acc chain rel_err {rel_err:.3e} exceeds 2e-2"
 
     @pytest.mark.parametrize("planner", _PLANNERS)
     def test_loop_carried_matmul_acc_mn_tiling(self, test_config, planner):
