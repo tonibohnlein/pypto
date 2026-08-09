@@ -12,8 +12,10 @@
 #ifndef SRC_IR_TRANSFORMS_AUTO_TILE_CUBE_GRAPH_H_
 #define SRC_IR_TRANSFORMS_AUTO_TILE_CUBE_GRAPH_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -28,9 +30,32 @@ namespace ir {
 namespace pass {
 namespace auto_tile {
 
-/** One admitted tensor-level matmul and its whole-function output contract. */
+/** One admitted tensor-level matmul in source topological order. */
+struct CubeMatmulNode {
+  AssignStmtPtr stmt;
+  CallPtr call;
+  VarPtr lhs;
+  VarPtr rhs;
+  VarPtr output;
+  int64_t lhs_producer = -1;
+  int64_t rhs_producer = -1;
+  int64_t m = 0;
+  int64_t n = 0;
+  int64_t k = 0;
+  DataType operand_dtype = DataType::FP32;
+  DataType accumulator_dtype = DataType::FP32;
+  DataType storage_dtype = DataType::FP32;
+  bool is_sink = false;
+};
+
+/** Admitted homogeneous tensor-level matmul DAG and output contract. */
 struct CubeGraph {
   FunctionPtr function;
+  std::vector<CubeMatmulNode> matmuls;
+  size_t sink = std::numeric_limits<size_t>::max();
+
+  // Sink aliases retained for the single-request planner and emitter. They are
+  // populated from ``matmuls[sink]`` after admission.
   AssignStmtPtr matmul_stmt;
   CallPtr matmul_call;
   VarPtr lhs;
@@ -57,10 +82,11 @@ struct CubeAdmissionResult {
 [[nodiscard]] bool ContainsCubeOperation(const FunctionPtr& function);
 
 /**
- * Admit the first standalone cube surface.
+ * Admit a homogeneous cube-only tensor DAG.
  *
- * The entire marked function must be one static rank-2, non-transposed
- * ``tensor.matmul``. Unsupported functions are not partially scheduled.
+ * Every compute statement must be a static rank-2, non-transposed
+ * ``tensor.matmul``. The returned sink and every transitive producer are
+ * scheduled as one kernel; unsupported functions are not partially tiled.
  */
 [[nodiscard]] CubeAdmissionResult AdmitCubeGraph(const FunctionPtr& function, const ProgramPtr& program);
 

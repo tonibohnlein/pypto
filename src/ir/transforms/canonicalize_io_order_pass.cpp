@@ -130,6 +130,7 @@ struct IOCategoryOps {
   /// disturb compute orderings the dependency graph already constrains.
   [[nodiscard]] bool IsL1ToL0ExtractCall(const Call& call) const {
     if (call.op_ != tile_extract) return false;
+    if (call.GetAttr<bool>(kPipelineSerialPhaseAttr, false)) return false;
     if (call.args_.empty()) return false;
     auto src_tile = std::dynamic_pointer_cast<const TileType>(call.args_[0]->GetType());
     if (!src_tile) return false;
@@ -261,9 +262,10 @@ class CanonicalizeIOOrderMutator : public IRMutator {
     demoted->kind_ = ForKind::Sequential;
     // Strip both pipeline markers — they have served their purpose (gated this
     // reorder) and must not survive past this pass.
-    demoted->attrs_ =
+    demoted->attrs_ = StripAttr(
         StripAttr(StripAttr(StripAttr(demoted->attrs_, kPipelineStagesAttr), kPipelineOverlapStoresAttr),
-                  kPipelineDoubleBufferCAttr);
+                  kPipelineDoubleBufferCAttr),
+        kPipelineGmToL1OnlyAttr);
     return demoted;
   }
 

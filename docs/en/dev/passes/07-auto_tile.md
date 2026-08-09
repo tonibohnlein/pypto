@@ -1,14 +1,16 @@
 # AutoTile
 
 `AutoTile` turns one explicitly marked tensor function into one complete
-Ascend 910B homogeneous kernel. The user fixes the operation graph; the pass
-chooses a Vector schedule or a Cube spatial schedule, including the core grid,
-tile or stream shape, on-chip lifetimes, and stores.
+Ascend 910B homogeneous schedule. The user fixes the operation graph; the pass
+chooses a Vector schedule or a Cube schedule, including the core grid, tile or
+stream shape, on-chip lifetimes, implementation phases, and stores.
 
 This is deliberately different from graph fusion. `AutoTile` never partitions
-the marked function and never falls back to several kernels. A marked function
-either has one exact, capacity-safe schedule or compilation fails. Unmarked
-functions are unchanged.
+the marked operation DAG and never falls back to independently planned
+subgraphs. A schedule may contain multiple ordered implementation phases, such
+as the two AIC phases of split-K, but they still implement one admitted graph
+under one plan. A marked function either has one exact, capacity-safe schedule
+or compilation fails. Unmarked functions are unchanged.
 
 ## Placement and API
 
@@ -73,12 +75,14 @@ The initial implementation supports the following closed surface:
   reduction live-outs; and
 - row and column reductions that fit one non-atomic kernel schedule.
 
-The first Cube surface additionally supports one non-transposed, static rank-2
-`tensor.matmul` with equal FP16, BF16, or FP32 operand dtypes and FP16, BF16,
-or FP32 result storage. The complete function becomes one AIC SPMD kernel. A
-uniform grid owns disjoint output regions; a ragged grid uses static,
-fractal-aligned regions whose final offsets clamp backward. The latter may
-recompute an identical overlap, but never uses atomic stores.
+The Cube surface additionally supports a straight-line DAG of non-transposed,
+static rank-2 `tensor.matmul` operations. Each matmul has equal FP16, BF16, or
+FP32 operand dtypes and FP16, BF16, or FP32 result storage. A single matmul may
+use a uniform spatial grid, a backward-clamped ragged grid, or split-K. A
+serial multi-matmul DAG uses one uniform AIC SPMD kernel and keeps its internal
+handoffs in Mat/L1. Internal results must use FP16 or BF16 storage because the
+Ascend 910B A2/A3 handoff narrows the FP32 accumulator before a later matmul
+consumes it.
 
 Unified binary operations are normalized to explicit row- or column-expand
 operations before emission. Ambiguous `[1,1]` tensor broadcasts and a
@@ -108,10 +112,12 @@ result back into the full iteration frame before casting remains supported.
 The pass rejects dynamic or non-rank-2 shapes, control flow, side-effecting
 statements, `full`/shape construction, minimum/product/argument reductions,
 unsupported Cube operations, mixed kernels, Welford, unsupported dtypes, and
-any graph that would require more than one kernel. A Cube function with more
-than one matmul, transpose flags, a non-fractal K extent, or a full-K operand
-pair that cannot fit in L1 is outside the current surface. These are
-user-facing admission or planning errors, not requests to another planner.
+any graph that cannot be represented by one homogeneous schedule. Cube
+transpose flags, non-fractal K extents, or a plan whose streamed and persistent
+L1 lifetimes exceed capacity are outside the current surface. Split-K is
+currently a single-matmul schedule. Multi-matmul schedules currently require a
+uniform outer grid and `split_k = 1`. These are user-facing admission or
+planning errors, not requests to another planner.
 
 ## Vector planning model
 
@@ -165,38 +171,91 @@ changes ownership of planning and emission, not those measurements.
 ## Cube planning model
 
 Cube admission constructs a typed `CubeGraph` from the complete marked
-function. The current graph has one request: `[M,K] @ [K,N] -> [M,N]`. The
-planner enumerates bounded, 16-element-aligned static M/N regions and at most
-two 24-core waves. A candidate is feasible only when its LHS and RHS region
-panels fit together in the per-core Mat/L1 capacity.
+function. Every matmul records its two producer edges, operand role, static
+`M/N/K`, accumulator dtype, and storage dtype. The returned matmul is the one
+sink, and every admitted matmul must be a transitive producer of that sink.
+Source statement order is already topological; request expansion recursively
+visits producers and emits them before consumers.
+
+The outer planner enumerates bounded, 16-element-aligned static M/N regions and
+at most two 24-core waves. A single-matmul candidate may use backward-clamped
+edge regions. Such regions recompute the overlapping edge deterministically;
+they do not use atomics. A multi-matmul candidate currently requires exact
+uniform regions so every internal request has one statically reusable shape.
+
+For a multi-matmul graph, the sink region is expanded backward into a
+role-aware request DAG. Requesting an output region `[H,W]` from
+`[M,K] @ [K,N]` requests `[H,K]` from the LHS producer and `[K,W]` from the RHS
+producer. Identical producer-region requests are memoized. LHS and RHS roles
+remain distinct even when they refer to the same logical tensor: `A @ A`, for
+example, requires different physical requests and is not treated as one
+reusable panel. The same rule applies when an internal producer feeds both
+roles; its request is replayed separately for each role.
+
+The planner applies a black-pebbling-style L1 lifetime simulation to this
+request order. An internal result is allocated before its producing request,
+remains live through its last consumer, and is then released. A boundary panel
+with the same tensor, role, requested region, and axis binding at multiple
+request sites is always loaded once and kept from first through last use. The
+alternative of evicting and reloading a compatible resident boundary is not
+enumerated yet. Separately, one matmul request may retain its LHS or RHS panel
+across several serial output-child tiles when that removes repeated GM-to-L1
+loads and the complete lifetime fits.
 
 For every feasible outer candidate, `ChooseL0Tile` evaluates the existing
 Ascend 910B L1-to-L0/Matrix/FIXPIPE model. Cube AutoTile does not copy or
-replace that lower-level planner. Its first outer equation is deliberately
-serial because that is the algorithm emitted today:
+replace that lower-level planner. It converges on child dimensions that the L0
+chooser accepts unchanged for the initializing K window, accumulated windows,
+and any serial tail. This fixed-point check is the model-to-emitter contract:
+the descriptor priced by the outer planner is the descriptor replayed later by
+`AutoTileMatmulL0`.
+
+One matmul request is modeled as:
 
 ```text
-per_task = GM_to_L1(lhs_region + rhs_region) + L0_matmul
-wall     = ceil(work_units / 24) * per_task
+request = retained_preload
+        + output_children * (
+              first_GM_to_L1 + first_L0_work
+            + rolled_K_window_pipeline
+            + serial_K_tail
+            + final_FIXPIPE_drain)
+
+serial_DAG_task = sum(requests in producer-before-consumer order)
+serial_DAG_wall = ceil(spatial_work_units / 24) * serial_DAG_task
 ```
 
-The GM-to-L1 term uses the PTO-ISA-grounded 910B request bandwidth. No
-GM-to-L1/Matrix overlap is granted because this initial emitter does not yet
-create an outer K-window pipeline. The selected `CubeSchedulePlan` records the
-spatial policy, static region, work units, exact L1 peak, total GM-to-L1 bytes,
-the chosen child L0 descriptor, and the component/model cycles. The emitter
-validates coverage and replays that descriptor as one SPMD AIC body containing
-two operand slices, one tensor matmul, and one output assemble.
+The first K window initializes one persistent L0C accumulator. When at least
+two rolled full windows remain, their GM-to-L1 operand feed and L0/Matrix work
+use a two-stage pipeline; the first window and a ragged fractal-aligned tail
+remain serial. The model grants overlap only for that explicitly emitted
+rolled phase. Every output child drains exactly once after its final K window.
+The GM-to-L1 term uses the PTO-ISA-grounded 910B request bandwidth.
+
+For a single matmul, split-K uses `FirstPartialThenAtomic`. One ordered AIC
+phase writes K share zero non-atomically; a second AIC phase computes shares
+one through `split_k - 1` and atomically adds them into the same output. This
+avoids a separate AIV zero-fill kernel. The model prices the two phase wave
+counts separately and exposes an explicit synchronization term, currently
+zero because device evidence did not support a transferable nonzero
+coefficient.
+
+The selected `CubeSchedulePlan` records the spatial policy, static regions,
+request DAG and execution order, persistent and transient L1 lifetimes,
+retained panels, exact GM-to-L1 bytes, K-window phases, child L0 descriptors,
+split merge policy, drain work, and component/model cycles. The emitter
+validates coverage and identities before replaying that descriptor. A serial
+DAG allocates each internal FP16/BF16 result with `tensor.create_l1`, assembles
+the producer's accumulator into it, and passes it directly to later requests;
+only the sink is stored to GM.
 
 After tensor-to-tile conversion, `AutoTileMatmulL0` remains the sole owner of
 L1-to-L0 tiling and its local software pipelines. This separation prevents the
 outer model and emitter from silently choosing conflicting L0 algorithms.
 
-Outer K-window streaming, FirstPartialThenAtomic split-K, serial multi-matmul
-DAGs with role-aware resident inputs/intermediates, and retained boundary
-panels are planned extensions. Until their complete plan/memory/traffic
-descriptors and matching emitters are ported, AutoTile rejects those cases
-instead of pricing work it cannot emit.
+Mixed AIC/AIV graphs remain outside this contract. Multi-matmul split-K,
+non-uniform internal request grids, transpose variants, and an explicit
+resident-versus-reload search are later Cube extensions. AutoTile rejects these
+cases rather than pricing an algorithm it cannot emit.
 
 ## Schedule reports
 

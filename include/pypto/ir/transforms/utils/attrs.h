@@ -93,6 +93,25 @@ inline constexpr const char* kPipelineOverlapStoresAttr = "pipeline_overlap_stor
 /// ``pipeline_overlap_stores``.
 inline constexpr const char* kPipelineDoubleBufferCAttr = "pipeline_double_buffer_c";
 
+/// Optional ``bool`` policy attr on a GM->L1 ``ForKind::Pipeline`` loop emitted
+/// by AutoTile. When true, the enclosing stage replication double-buffers only
+/// Mat/L1 boundary values. Nested Left/Right/Acc/Bias tiles remain owned by the
+/// child L1->L0 schedule and do not acquire a second, Cartesian stage identity.
+/// Consumed by ``CanonicalizeIOOrder`` with the other pipeline policy attrs.
+inline constexpr const char* kPipelineGmToL1OnlyAttr = "pipeline_gm_to_l1_only";
+
+/// Transient ``bool`` attr on a tile-producing call in a serial init or tail
+/// phase nested below an enclosing pipeline. Such a call remains in program
+/// order and does not acquire the enclosing pipeline's stage membership.
+/// ``MemoryReuse`` strips this marker after using the resulting lifetimes.
+inline constexpr const char* kPipelineSerialPhaseAttr = "pipeline_serial_phase";
+
+/// Private contract from cube AutoTile to AutoTileMatmulL0. The outer cube
+/// planner prices an output-stationary child request and sets this on its
+/// generated tensor.matmul/matmul_acc calls. AutoTileMatmulL0 consumes it when
+/// replaying the L0 chooser, then strips it before codegen.
+inline constexpr const char* kCubeForceOutputStationaryAttr = "__cube_force_output_stationary";
+
 /// Attribute key marking a tile-producing ``Call`` with the pipeline-stage
 /// membership(s) of the tile it defines. ``LowerPipelineLoops`` sets it when it
 /// replicates a ``pl.pipeline`` body: every clone of a replicated region is one

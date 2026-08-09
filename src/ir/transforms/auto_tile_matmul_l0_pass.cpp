@@ -239,11 +239,19 @@ uint32_t DTypeBytes(const DataType& dt) {
 /// ``BuildMoveToMat`` (see ``BuildKLoopRewrite``).
 AssignStmtPtr BuildExtract(const VarPtr& source, const std::vector<int64_t>& shape, const ExprPtr& index_row,
                            const ExprPtr& index_col, MemorySpace target, const std::string& name_hint,
-                           const Span& span) {
+                           const Span& span, bool serial_phase = false) {
   auto& reg = OpRegistry::GetInstance();
   std::vector<ExprPtr> args = {source, index_row, index_col, MakeIndexTuple(shape, span)};
   std::vector<std::pair<std::string, std::any>> kwargs = {{"target_memory", target}};
   auto call = reg.Create("tile.extract", args, kwargs, span);
+  if (serial_phase) {
+    auto call_node = As<Call>(call);
+    INTERNAL_CHECK_SPAN(call_node, span) << "Internal error: tile.extract registry result is not a Call";
+    auto attrs = call_node->attrs_;
+    attrs.emplace_back(kPipelineSerialPhaseAttr, true);
+    call = std::make_shared<Call>(call_node->op_, call_node->args_, call_node->kwargs_, std::move(attrs),
+                                  call_node->GetType(), call_node->span_);
+  }
   auto var = std::make_shared<Var>(name_hint, call->GetType(), span);
   return std::make_shared<AssignStmt>(var, call, span);
 }
@@ -460,11 +468,12 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
   // ``ko``, accumulating into ``acc_in`` (``tile.matmul_acc``) or starting fresh
   // (``tile.matmul`` when ``acc_in`` is null).  Used for the single-full-block
   // (num_full == 1) and partial-tail cases; the multi-block case pipelines below.
-  auto emit_block = [&](int64_t ko, int64_t kb, const ExprPtr& acc_in, const std::string& tag) -> VarPtr {
+  auto emit_block = [&](int64_t ko, int64_t kb, const ExprPtr& acc_in, const std::string& tag,
+                        bool serial_phase) -> VarPtr {
     auto sa = BuildExtract(lhs_extract_src, {r.m, kb}, mi_off, MakeIndex(ko, sp), MemorySpace::Left,
-                           base + "_l0_a" + tag, sp);
+                           base + "_l0_a" + tag, sp, serial_phase);
     auto sb = BuildExtract(r.rhs_src, {kb, r.n}, MakeIndex(ko, sp), ni_off, MemorySpace::Right,
-                           base + "_l0_b" + tag, sp);
+                           base + "_l0_b" + tag, sp, serial_phase);
     ExprPtr call = acc_in ? reg.Create("tile.matmul_acc", {acc_in, sa->var_, sb->var_}, sp)
                           : reg.Create("tile.matmul", {sa->var_, sb->var_}, sp);
     auto cvar = std::make_shared<Var>(base + "_l0_c" + tag, call->GetType(), sp);
@@ -502,12 +511,14 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
     // dominated (2x the MAD ceil-step of a divisor, and it loses the min-padding
     // tie-break), so num_full is >= 2 in practice.  Kept so the emitter stays
     // correct (no degenerate 1-trip pipeline) if the cost model ever changes.
-    main_var = emit_block(/*ko=*/0, /*kb=*/r.k, is_acc ? ExprPtr(r.acc_init) : nullptr, "0");
+    main_var =
+        emit_block(/*ko=*/0, /*kb=*/r.k, is_acc ? ExprPtr(r.acc_init) : nullptr, "0", /*serial_phase=*/true);
   }
 
   // --- Partial tail: matmul_acc the [m, k_eff] x [k_eff, n] block onto the
   //     full-blocks accumulator (no-op when k divides K). ---
-  VarPtr result_var = has_tail ? emit_block(k_full, k_eff, ExprPtr(main_var), "t") : main_var;
+  VarPtr result_var =
+      has_tail ? emit_block(k_full, k_eff, ExprPtr(main_var), "t", /*serial_phase=*/true) : main_var;
   return RewriteResult{std::move(out), result_var};
 }
 
@@ -624,6 +635,8 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   const bool is_matmul = IsOp(call, "tile.matmul");
   const bool is_matmul_acc = IsOp(call, "tile.matmul_acc");
   if (!is_matmul && !is_matmul_acc) return std::nullopt;
+  force_output_stationary =
+      force_output_stationary || call->GetAttr<bool>(kCubeForceOutputStationaryAttr, false);
 
   // Operand layout: (lhs, rhs) for matmul; (acc, lhs, rhs) for matmul_acc.
   // Use ``AsVarLike`` for the operands so IterArg (Var subclass) is accepted —
@@ -2703,6 +2716,18 @@ class AutoTileMutator : public IRMutator {
   std::unordered_set<const ForStmt*> pipeline_dbc_plan_;
 };
 
+class StripCubePlanAttr final : public IRMutator {
+ public:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto visited = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(visited);
+    if (!call || !call->HasAttr(kCubeForceOutputStationaryAttr)) return visited;
+    auto attrs = StripAttr(call->attrs_, kCubeForceOutputStationaryAttr);
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, std::move(attrs), call->GetType(),
+                                  call->span_);
+  }
+};
+
 FunctionPtr TransformFunction(const FunctionPtr& func, std::vector<Diagnostic>& hints) {
   if (!func || !func->body_) return func;
   if (!IsInCoreType(func->func_type_)) return func;
@@ -2712,6 +2737,7 @@ FunctionPtr TransformFunction(const FunctionPtr& func, std::vector<Diagnostic>& 
   auto canonical = RewriteCanonicalSplitKAcc(func, hints);
   AutoTileMutator mutator(BuildPipelineDbCPlan(canonical));
   auto new_body = mutator.VisitStmt(canonical->body_);
+  new_body = StripCubePlanAttr().VisitStmt(new_body);
   for (auto& d : mutator.hints) hints.push_back(std::move(d));
   if (new_body == canonical->body_) return canonical;
   auto new_func = MutableCopy(canonical);

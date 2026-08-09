@@ -993,6 +993,11 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tensor.matmul_acc"] = _handle_tensor_matmul_acc
     m["tensor.dim"] = lambda a, _kw: f"{a[0]}.shape[{a[1]}]"
     m["tensor.create"] = _handle_create
+    # ``tensor.create_l1`` differs from ``tensor.create`` only in placement.
+    # The Torch interpreter models values, not memory spaces, so both have the
+    # same zero-initialized tensor semantics.  Serial cube AutoTile DAGs use
+    # create_l1 for an Acc-to-Mat intermediate that remains on chip.
+    m["tensor.create_l1"] = _handle_create
     m["tensor.full"] = _handle_full
     m["tensor.slice"] = _handle_slice
     m["tensor.read"] = lambda a, _kw: f"{a[0]}[{a[1]}]"

@@ -10,7 +10,9 @@
  */
 
 #include <cstdint>
+#include <exception>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -18,10 +20,14 @@
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
-#include "pypto/core/error.h"
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/memory_space.h"
+#include "pypto/ir/pipe.h"
 #include "pypto/ir/program.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
@@ -31,6 +37,7 @@
 #include "src/ir/transforms/auto_tile/cube_graph.h"
 #include "src/ir/transforms/auto_tile/cube_plan.h"
 #include "src/ir/transforms/auto_tile/vector_emit.h"
+#include "src/ir/transforms/auto_tile/vector_graph.h"
 #include "src/ir/transforms/auto_tile/vector_plan.h"
 #include "src/ir/transforms/auto_tile/vector_report.h"
 
@@ -47,14 +54,16 @@ class CalledFunctionCollector : public IRVisitor {
 
  protected:
   void VisitExpr_(const CallPtr& call) override {
-    if (call != nullptr && call->op_ != nullptr && program_->GetFunction(call->op_->name_) != nullptr)
+    if (call != nullptr && call->op_ != nullptr && program_->GetFunction(call->op_->name_) != nullptr) {
       called_.insert(call->op_->name_);
+    }
     IRVisitor::VisitExpr_(call);
   }
 
   void VisitExpr_(const SubmitPtr& submit) override {
-    if (submit != nullptr && submit->op_ != nullptr && program_->GetFunction(submit->op_->name_) != nullptr)
+    if (submit != nullptr && submit->op_ != nullptr && program_->GetFunction(submit->op_->name_) != nullptr) {
       called_.insert(submit->op_->name_);
+    }
     IRVisitor::VisitExpr_(submit);
   }
 
@@ -160,14 +169,45 @@ ProgramPtr TransformAutoTile(const ProgramPtr& program) {
       CHECK_SPAN(plan.feasible, function->span_)
           << "AutoTile cannot realize the entire marked function as one capacity-safe Ascend910B cube kernel";
       emitted = auto_tile::EmitCubeSchedule(graph, plan, calls.called());
-      LOG_INFO << "AutoTile[" << function->name_ << "]: cube schedule=serial_matmul"
-               << " grid=" << plan.parts_m << "x" << plan.parts_n << " work_units=" << plan.work_units
-               << " region=" << plan.region_m << "x" << plan.region_n
+      int64_t retained_panel_count = static_cast<int64_t>(plan.resident_boundaries.size());
+      int64_t retained_l1_bytes = 0;
+      for (const auto_tile::CubeResidentBoundaryPlan& resident : plan.resident_boundaries) {
+        retained_l1_bytes += resident.bytes;
+      }
+      if (plan.matmuls.empty()) {
+        retained_panel_count += static_cast<int64_t>(plan.retain_lhs) + static_cast<int64_t>(plan.retain_rhs);
+        retained_l1_bytes += plan.retained_lhs_bytes + plan.retained_rhs_bytes;
+      } else {
+        for (const auto_tile::CubeMatmulSchedule& request : plan.matmuls) {
+          retained_panel_count +=
+              static_cast<int64_t>(request.retain_lhs) + static_cast<int64_t>(request.retain_rhs);
+          retained_l1_bytes += request.retained_lhs_bytes + request.retained_rhs_bytes;
+        }
+      }
+      LOG_INFO << "AutoTile[" << function->name_ << "]: cube schedule="
+               << (plan.serial_dag()
+                       ? "serial_dag"
+                       : (plan.k_loop.pipeline_stages >= 2 ? "k_window_pipeline" : "serial_matmul"))
+               << " grid=" << plan.parts_m << "x" << plan.parts_n << "x" << plan.split_k
+               << " requests=" << (plan.matmuls.empty() ? 1 : plan.matmuls.size())
+               << " work_units=" << plan.work_units << " spatial_work_units=" << plan.spatial_work_units
+               << " region=" << plan.region_m << "x" << plan.region_n << " output_tile=" << plan.output_tile_m
+               << "x" << plan.output_tile_n << " output_tiles=" << plan.output_tiles_m << "x"
+               << plan.output_tiles_n
                << " spatial_policy=" << auto_tile::CubeSpatialPolicyName(plan.spatial_policy)
+               << " split_merge=" << (plan.first_partial_then_atomic() ? "first_partial_then_atomic" : "none")
+               << " split_phases=" << plan.first_partial_work_units << "+" << plan.atomic_rest_work_units
+               << " retained_panels=" << retained_panel_count << " retained_l1=" << retained_l1_bytes
                << " peak_l1=" << plan.peak_l1_bytes << " gm_to_l1_bytes=" << plan.gm_to_l1_bytes_total
-               << " l0_tile=" << plan.l0_plan.m << "x" << plan.l0_plan.n << "x" << plan.l0_plan.k
+               << " k_window=" << plan.k_loop.l1_window_k << " chunk=" << plan.k_loop.chunk
+               << " chunks=" << plan.k_loop.full_chunks << "+" << plan.k_loop.tail
+               << " stages=" << plan.k_loop.pipeline_stages << " l0_tile=" << plan.l0_init.m << "x"
+               << plan.l0_init.n << "x" << plan.l0_init.k
                << " gm_to_l1_cycles=" << plan.modeled_gm_to_l1_cycles
-               << " l0_cycles=" << plan.modeled_l0_cycles << " modeled_cycles=" << plan.modeled_cycles;
+               << " l0_cycles=" << plan.modeled_l0_cycles
+               << " final_drain_cycles=" << plan.modeled_final_drain_cycles
+               << " split_sync_cycles=" << plan.modeled_split_sync_cycles
+               << " modeled_cycles=" << plan.modeled_cycles;
     } else {
       const VectorTargetContext target = ReadVectorTarget(function->span_);
       auto_tile::VectorAdmissionResult admission =

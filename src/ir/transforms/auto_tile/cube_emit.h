@@ -24,7 +24,7 @@ namespace ir {
 namespace pass {
 namespace auto_tile {
 
-/** Replay one validated cube plan as exactly one AIC SPMD kernel. */
+/** Replay one validated cube plan as one AIC phase, or two ordered split-K AIC phases. */
 [[nodiscard]] FunctionPtr EmitCubeSchedule(const CubeGraph& graph, const CubeSchedulePlan& plan,
                                            const std::unordered_set<std::string>& called_functions);
 
