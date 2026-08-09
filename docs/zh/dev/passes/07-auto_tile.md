@@ -1,8 +1,8 @@
 # AutoTile
 
 `AutoTile` 将一个显式标记的 tensor 函数转换为一个完整的 Ascend 910B
-Vector kernel。用户固定运算图；该 pass 选择核网格、tile 或流式形状、归约阶段、
-片上生命周期以及存储方式。
+同构 kernel。用户固定运算图；该 pass 选择 Vector 调度或 Cube 空间调度，包括核网格、
+tile 或流式形状、片上生命周期以及存储方式。
 
 它与图融合（graph fusion）有意区分。`AutoTile` 不会拆分被标记的函数，也不会回退为
 多个 kernel。一个被标记的函数要么存在一个精确且容量安全的调度，要么编译失败。
@@ -67,6 +67,12 @@ no-op。
 - 多个 pointwise 返回值，以及容量允许时物化的 reduction live-out；
 - 能由一个非原子 kernel 调度容纳的行、列归约。
 
+首个 Cube 范围还支持一个非转置、静态 rank-2 的 `tensor.matmul`：两个操作数 dtype
+相同且为 FP16、BF16 或 FP32，结果存储为 FP16、BF16 或 FP32。整个函数转换为一个
+AIC SPMD kernel。uniform 网格拥有互不重叠的输出 region；ragged 网格使用静态、
+fractal 对齐的 region，并把最后一个 offset 向后 clamp。后者可能重复计算完全相同的
+重叠区域，但不会使用 atomic store。
+
 统一二元操作在发射前会规范化为显式 row-expand 或 col-expand 操作。含 `[1,1]`
 tensor 的歧义 broadcast，以及非交换减法或除法中位于左侧的 broadcast 操作数会被
 拒绝。broadcast 除法支持 FP16 和 FP32；其高精度形式不在本契约中。
@@ -87,11 +93,12 @@ BF16 仍可作为存储 tensor，以及原生 cast 链的源或目标。AutoTile
 仍属于支持范围。
 
 该 pass 会拒绝动态或非 rank-2 shape、控制流、有副作用的语句、`full`/shape 构造、
-minimum/product/argument reduction、matmul 和其他 Cube 工作、mixed kernel、Welford、
-不支持的 dtype，以及任何需要多个 kernel 的图。这些是面向用户的准入错误，不是转交
-给另一个 planner 的请求。
+minimum/product/argument reduction、不支持的 Cube 运算、mixed kernel、Welford、
+不支持的 dtype，以及任何需要多个 kernel 的图。包含多个 matmul、transpose flag、
+非 fractal K extent，或 full-K 操作数对无法同时放入 L1 的 Cube 函数不在当前范围。
+这些是面向用户的准入或规划错误，不是转交给另一个 planner 的请求。
 
-## 规划模型
+## Vector 规划模型
 
 planner 首先构造带类型的 Vector 图。Tensor 节点记录静态 shape、dtype、是否为边界
 值以及是否必须存活到 return。Operation 节点记录 primitive 与几何类型。原始 SSA
@@ -129,9 +136,39 @@ generic 或 cast proxy。Ascend 910B 系数从
 经 silicon 验证的 scheduler model 原样移植而来，没有重新拟合；AutoTile 改变的是规划
 与发射的归属，而不是这些测量数据。
 
+## Cube 规划模型
+
+Cube 准入从完整的标记函数构造带类型的 `CubeGraph`。当前图只有一个 request：
+`[M,K] @ [K,N] -> [M,N]`。planner 枚举有界的、16 元素对齐的静态 M/N region，
+且最多覆盖两个 24-core wave。只有当 LHS 和 RHS region panel 能同时放入每核 Mat/L1
+容量时，候选才可行。
+
+对每个可行外层候选，`ChooseL0Tile` 评估现有 Ascend 910B
+L1-to-L0/Matrix/FIXPIPE 模型。Cube AutoTile 不复制或替换该低层 planner。首个外层方程
+有意采用串行形式，因为当前 emitter 发射的正是该算法：
+
+```text
+per_task = GM_to_L1(lhs_region + rhs_region) + L0_matmul
+wall     = ceil(work_units / 24) * per_task
+```
+
+GM-to-L1 项使用由 PTO-ISA 实测支撑的 910B request 带宽。由于初始 emitter 尚未构造
+外层 K-window pipeline，因此不会假定 GM-to-L1/Matrix overlap。选中的
+`CubeSchedulePlan` 记录空间策略、静态 region、work unit、精确 L1 峰值、GM-to-L1
+总字节数、child L0 descriptor 和分项/model cycle。emitter 验证覆盖关系，并将 descriptor
+重放为一个 SPMD AIC body：两个操作数 slice、一个 tensor matmul 和一个输出 assemble。
+
+tensor-to-tile 转换之后，`AutoTileMatmulL0` 仍是 L1-to-L0 tiling 及其局部软件 pipeline
+的唯一所有者。该分层避免外层模型与 emitter 静默选择互相冲突的 L0 算法。
+
+外层 K-window streaming、FirstPartialThenAtomic split-K、带 role-aware resident 输入/中间值
+的串行多 matmul DAG，以及 retained boundary panel 都是后续扩展。在完整的
+plan/memory/traffic descriptor 及匹配 emitter 被移植之前，AutoTile 会拒绝这些情况，而不是
+为无法发射的工作计价。
+
 ## 调度报告
 
-每个成功编译 AutoTile function 的 `ir.compile()` 还会写出两个小型、确定性的 artifact：
+每个成功编译 Vector AutoTile function 的 `ir.compile()` 还会写出两个小型、确定性的 artifact：
 
 ```text
 <output_dir>/report/auto_tile/<function>.json
@@ -148,6 +185,9 @@ SPMD work unit，而不是绘制所有 core。例如 online-softmax 报告会分
 两阶段 statistics loop、存在时的串行 ragged tail，以及两阶段 apply/store loop；ping/pong
 slot 和持久 running statistic 都会显式显示。`lifetime ends: x(t0)` 这样的行表示逻辑上的
 最后使用点，并不意味着 IR 中存在显式 free 指令。
+
+Cube 调度当前使用确定性的 `AutoTile[name]` INFO 行；带版本的 Cube JSON/伪代码报告属于
+下一步 descriptor 扩展。
 
 直接调用 `passes.auto_tile()` 时没有编译 artifact 目录，因此仍只输出简洁的 `INFO`
 日志。调度报告可与 [IR Lowering Trace](../07-ir-lower-trace.md) 配合检查 transformation，
@@ -241,11 +281,12 @@ cast hop 使用显式保守 proxy 系数：generic proxy 不是针对具体运�
 有效。多个 live-out 始终拥有不同 store。已有的显式 `Out` 参数按位置复用；直接调用与
 `Submit` site 都保持该声明签名。
 
-成功发射包含一个 `pl.spmd` scope 和一个非 split 的 Vector InCore body。因此后续层次
-outline 会为该 marked tensor DAG 生成一个 AIV kernel。
+成功发射包含一个 `pl.spmd` scope 和一个非 split 的 InCore body。因此后续层次
+outline 会为 Vector DAG 生成一个 AIV kernel，或为受支持的 Cube matmul 生成一个
+AIC kernel。
 
 ## 与其他 tiler 的关系
 
-本 pass 负责从 GM 到 UB 的 tensor 级 Vector 调度。它不替代
-[`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md)；后者在更晚阶段处理单个 Cube matmul
-的 L0 几何。Cube、mixed-kernel 和图拆分支持有意排除在首个 AutoTile 契约之外。
+本 pass 负责从 GM 到 UB 的 tensor 级 Vector 调度，以及受支持 Cube matmul 的外层
+GM-to-L1 空间调度。它不替代 [`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md)；后者在
+更晚阶段处理 Cube 的 L0 几何。mixed-kernel 和图拆分支持仍不属于 AutoTile 契约。

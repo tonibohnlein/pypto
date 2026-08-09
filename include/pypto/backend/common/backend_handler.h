@@ -43,6 +43,13 @@ struct VectorAutoTile910BTarget {
   uint32_t vector_register_bytes = 0;
 };
 
+/** Ascend 910B facts required to admit and tile one tensor-level cube graph. */
+struct CubeAutoTile910BTarget {
+  std::string model_name;
+  double core_frequency_hz = 0.0;
+  double gm_to_l1_bandwidth_gib_per_s = 0.0;
+};
+
 /**
  * @brief Closed-form GEMM cost-model parameters consumed by ChooseL0Tile.
  *
@@ -416,6 +423,17 @@ class BackendHandler {
    *        backend cannot use the 910B-specific whole-function vector model.
    */
   [[nodiscard]] virtual std::optional<VectorAutoTile910BTarget> GetVectorAutoTile910BTarget() const {
+    return std::nullopt;
+  }
+
+  /**
+   * @brief Return the hardware facts for standalone 910B cube AutoTile.
+   *
+   * A backend returns ``std::nullopt`` when the cube outer model has not been
+   * grounded for that target. L0 capacities and costs remain exposed through
+   * the existing backend-handler methods below.
+   */
+  [[nodiscard]] virtual std::optional<CubeAutoTile910BTarget> GetCubeAutoTile910BTarget() const {
     return std::nullopt;
   }
 };

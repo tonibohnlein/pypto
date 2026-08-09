@@ -1654,21 +1654,9 @@ def test_marked_graph_requires_an_explicit_supported_backend():
         _run_auto_tile(PointwiseProgram)
 
 
-@pytest.mark.parametrize("kind", ["matmul", "row_min", "row_prod", "full", "rank3"])
+@pytest.mark.parametrize("kind", ["row_min", "row_prod", "full", "rank3"])
 def test_explicit_marker_fails_when_whole_graph_is_unsupported(kind: str):
-    if kind == "matmul":
-
-        @pl.program
-        class Program:
-            @pl.function(attrs={"auto_tile": True})
-            def unsupported(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP32],
-                b: pl.Tensor[[64, 64], pl.FP32],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                out: pl.Tensor[[64, 64], pl.FP32] = pl.matmul(a, b)
-                return out
-    elif kind == "row_min":
+    if kind == "row_min":
 
         @pl.program
         class Program:

@@ -62,6 +62,13 @@ class Ascend910BHandler : public BackendHandler {
     return VectorAutoTile910BTarget{"ascend910b", 32, 256};
   }
 
+  [[nodiscard]] std::optional<CubeAutoTile910BTarget> GetCubeAutoTile910BTarget() const override {
+    // The GM->L1 figure is the same PTO-ISA-grounded value used by the
+    // fusion-scheduler cube study. It is a per-core request rate; aggregate
+    // saturation is intentionally outside the first standalone cube surface.
+    return CubeAutoTile910BTarget{"ascend910b", 1.85e9, 135.0};
+  }
+
   [[nodiscard]] uint32_t GetGmAccessGranularityBytes() const override { return 512; }
   [[nodiscard]] uint32_t GetL2CacheLineBytes() const override { return 512; }
   [[nodiscard]] uint32_t GetRecommendedInnermostDimBytes() const override { return 512; }

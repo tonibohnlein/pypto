@@ -27,6 +27,9 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "src/ir/transforms/auto_tile/cube_emit.h"
+#include "src/ir/transforms/auto_tile/cube_graph.h"
+#include "src/ir/transforms/auto_tile/cube_plan.h"
 #include "src/ir/transforms/auto_tile/vector_emit.h"
 #include "src/ir/transforms/auto_tile/vector_plan.h"
 #include "src/ir/transforms/auto_tile/vector_report.h"
@@ -65,7 +68,11 @@ struct VectorTargetContext {
   const backend::BackendHandler* handler = nullptr;
 };
 
-VectorTargetContext ReadVectorTarget(const Span& span) {
+struct CubeTargetContext {
+  auto_tile::CubeHardware hardware;
+};
+
+const backend::BackendHandler* ReadBackendHandler(const Span& span) {
   CHECK_SPAN(backend::BackendConfig::IsConfigured(), span)
       << "AutoTile requires an explicitly configured backend";
   const backend::Backend* backend = backend::GetBackend();
@@ -73,6 +80,12 @@ VectorTargetContext ReadVectorTarget(const Span& span) {
   const backend::BackendHandler* handler =
       context != nullptr ? context->GetBackendHandler() : backend->GetHandler();
   CHECK_SPAN(handler != nullptr, span) << "AutoTile could not obtain the active backend handler";
+  return handler;
+}
+
+VectorTargetContext ReadVectorTarget(const Span& span) {
+  const backend::BackendHandler* handler = ReadBackendHandler(span);
+  const backend::Backend* backend = backend::GetBackend();
   const std::optional<backend::VectorAutoTile910BTarget> target = handler->GetVectorAutoTile910BTarget();
   CHECK_SPAN(target.has_value(), span) << "AutoTile vector scheduling currently supports Ascend910B only";
   VectorTargetContext result;
@@ -88,7 +101,38 @@ VectorTargetContext ReadVectorTarget(const Span& span) {
   return result;
 }
 
-ProgramPtr TransformAutoTileVector(const ProgramPtr& program) {
+CubeTargetContext ReadCubeTarget(const Span& span, const DataType& accumulator_dtype) {
+  const backend::BackendHandler* handler = ReadBackendHandler(span);
+  const backend::Backend* backend = backend::GetBackend();
+  const std::optional<backend::CubeAutoTile910BTarget> target = handler->GetCubeAutoTile910BTarget();
+  CHECK_SPAN(target.has_value(), span) << "AutoTile cube scheduling currently supports Ascend910B only";
+  CubeTargetContext result;
+  result.hardware.cube_cores = backend->GetCoreCount(CoreType::CUBE);
+  result.hardware.l1_bytes = static_cast<int64_t>(handler->GetMatCapacityBytes());
+  result.hardware.fractal = handler->GetL0FractalAlignment();
+  result.hardware.min_l0_tile = handler->GetMinL0TileDim();
+  result.hardware.l0c_m_alignment = handler->GetL0cMAlignment(accumulator_dtype);
+  result.hardware.l0a_bytes = handler->GetL0aCapacityBytes();
+  result.hardware.l0b_bytes = handler->GetL0bCapacityBytes();
+  result.hardware.l0c_bytes = handler->GetL0cCapacityBytes();
+  result.hardware.core_frequency_hz = target->core_frequency_hz;
+  result.hardware.gm_to_l1_bandwidth_gib_per_s = target->gm_to_l1_bandwidth_gib_per_s;
+  const PassContext* context = PassContext::Current();
+  result.hardware.allow_double_buffer_c =
+      context != nullptr &&
+      (context->GetMemoryPlanner() == MemoryPlanner::PtoAS || context->GetEnablePyptoL0cDoubleBuffer());
+  result.hardware.l0_cost = handler->GetL0CostModel();
+  CHECK_SPAN(result.hardware.cube_cores > 0 && result.hardware.l1_bytes > 0 && result.hardware.fractal > 0 &&
+                 result.hardware.min_l0_tile > 0 && result.hardware.l0a_bytes > 0 &&
+                 result.hardware.l0b_bytes > 0 && result.hardware.l0c_bytes > 0 &&
+                 result.hardware.core_frequency_hz > 0.0 &&
+                 result.hardware.gm_to_l1_bandwidth_gib_per_s > 0.0,
+             span)
+      << "AutoTile could not derive the " << target->model_name << " cube topology";
+  return result;
+}
+
+ProgramPtr TransformAutoTile(const ProgramPtr& program) {
   if (program == nullptr) return program;
   CalledFunctionCollector calls(program.get());
   for (const auto& [unused, function] : program->functions_) {
@@ -105,47 +149,68 @@ ProgramPtr TransformAutoTileVector(const ProgramPtr& program) {
     }
     CHECK_SPAN(function->func_type_ == FunctionType::Opaque, function->span_)
         << "AutoTile must run on a tensor-level Opaque function before scope outlining";
-    const VectorTargetContext target = ReadVectorTarget(function->span_);
-    auto_tile::VectorAdmissionResult admission =
-        auto_tile::AdmitVectorGraph(function, program, target.handler->GetTcvtAdjacency());
-    if (!admission.supported && admission.failure != nullptr) std::rethrow_exception(admission.failure);
-    CHECK_SPAN(admission.supported, function->span_) << "AutoTile cannot admit the entire marked function";
-    const auto_tile::VectorGraph& graph = admission.graph;
-    const auto_tile::VectorSchedulePlan plan = auto_tile::VectorPlanner910B(target.hardware).Plan(graph);
-    CHECK_SPAN(plan.feasible, function->span_)
-        << "AutoTile cannot realize the entire marked function as one capacity-safe Ascend910B vector kernel";
-    FunctionPtr emitted = auto_tile::EmitVectorSchedule(graph, plan, calls.called());
-    const std::optional<std::string> report_path = auto_tile::WriteVectorScheduleReport(graph, plan);
-    LOG_INFO << "AutoTile[" << function->name_
-             << "]: vector schedule=" << auto_tile::ScheduleKindName(plan.kind)
-             << " grid=" << plan.m_partition.parts << "x" << plan.n_partition.parts
-             << " work_units=" << plan.work_units << " tile=" << plan.tile_h << "x" << plan.tile_w
-             << " strip=" << plan.strip_h << "x" << plan.strip_w << " chunks=" << plan.full_chunks << "x"
-             << plan.chunk << "+" << plan.tail << " largest_feasible_chunk=" << plan.largest_feasible_chunk
-             << " feasible_chunks=" << plan.feasible_chunk_candidates
-             << " stages=" << plan.phases[auto_tile::PhaseIndex(auto_tile::VectorPhase::Body)].pipeline_stages
-             << "/" << plan.phases[auto_tile::PhaseIndex(auto_tile::VectorPhase::Stats)].pipeline_stages
-             << "/" << plan.phases[auto_tile::PhaseIndex(auto_tile::VectorPhase::Apply)].pipeline_stages
-             << " peak_ub=" << plan.chunk_peak_ub_bytes << " full_peak_ub=" << plan.full_peak_ub_bytes
-             << " compute_cycles=" << plan.modeled_compute_cycles
-             << " transfer_cycles=" << plan.modeled_transfer_cycles << " phase_compute=["
-             << plan.modeled_phase_compute_cycles[0] << "," << plan.modeled_phase_compute_cycles[1] << ","
-             << plan.modeled_phase_compute_cycles[2] << "," << plan.modeled_phase_compute_cycles[3] << "]"
-             << " phase_transfer=[" << plan.modeled_phase_transfer_cycles[0] << ","
-             << plan.modeled_phase_transfer_cycles[1] << "," << plan.modeled_phase_transfer_cycles[2] << ","
-             << plan.modeled_phase_transfer_cycles[3] << "]"
-             << " phase_input_bytes=[" << static_cast<int64_t>(plan.modeled_phase_input_bytes[0]) << ","
-             << static_cast<int64_t>(plan.modeled_phase_input_bytes[1]) << ","
-             << static_cast<int64_t>(plan.modeled_phase_input_bytes[2]) << ","
-             << static_cast<int64_t>(plan.modeled_phase_input_bytes[3]) << "]"
-             << " phase_output_bytes=[" << static_cast<int64_t>(plan.modeled_phase_output_bytes[0]) << ","
-             << static_cast<int64_t>(plan.modeled_phase_output_bytes[1]) << ","
-             << static_cast<int64_t>(plan.modeled_phase_output_bytes[2]) << ","
-             << static_cast<int64_t>(plan.modeled_phase_output_bytes[3]) << "]"
-             << " reduction_model=" << (plan.used_reduction_fallback ? "legacy_fallback" : "grounded")
-             << " pointwise_model=" << auto_tile::PointwiseCostModelName(plan)
-             << " modeled_cycles=" << plan.modeled_cycles
-             << (report_path.has_value() ? " report=" + *report_path : "");
+    FunctionPtr emitted;
+    if (auto_tile::ContainsCubeOperation(function)) {
+      auto_tile::CubeAdmissionResult admission = auto_tile::AdmitCubeGraph(function, program);
+      if (!admission.supported && admission.failure != nullptr) std::rethrow_exception(admission.failure);
+      CHECK_SPAN(admission.supported, function->span_) << "AutoTile cannot admit the entire marked function";
+      const auto_tile::CubeGraph& graph = admission.graph;
+      const CubeTargetContext target = ReadCubeTarget(function->span_, graph.accumulator_dtype);
+      const auto_tile::CubeSchedulePlan plan = auto_tile::CubePlanner910B(target.hardware).Plan(graph);
+      CHECK_SPAN(plan.feasible, function->span_)
+          << "AutoTile cannot realize the entire marked function as one capacity-safe Ascend910B cube kernel";
+      emitted = auto_tile::EmitCubeSchedule(graph, plan, calls.called());
+      LOG_INFO << "AutoTile[" << function->name_ << "]: cube schedule=serial_matmul"
+               << " grid=" << plan.parts_m << "x" << plan.parts_n << " work_units=" << plan.work_units
+               << " region=" << plan.region_m << "x" << plan.region_n
+               << " spatial_policy=" << auto_tile::CubeSpatialPolicyName(plan.spatial_policy)
+               << " peak_l1=" << plan.peak_l1_bytes << " gm_to_l1_bytes=" << plan.gm_to_l1_bytes_total
+               << " l0_tile=" << plan.l0_plan.m << "x" << plan.l0_plan.n << "x" << plan.l0_plan.k
+               << " gm_to_l1_cycles=" << plan.modeled_gm_to_l1_cycles
+               << " l0_cycles=" << plan.modeled_l0_cycles << " modeled_cycles=" << plan.modeled_cycles;
+    } else {
+      const VectorTargetContext target = ReadVectorTarget(function->span_);
+      auto_tile::VectorAdmissionResult admission =
+          auto_tile::AdmitVectorGraph(function, program, target.handler->GetTcvtAdjacency());
+      if (!admission.supported && admission.failure != nullptr) std::rethrow_exception(admission.failure);
+      CHECK_SPAN(admission.supported, function->span_) << "AutoTile cannot admit the entire marked function";
+      const auto_tile::VectorGraph& graph = admission.graph;
+      const auto_tile::VectorSchedulePlan plan = auto_tile::VectorPlanner910B(target.hardware).Plan(graph);
+      CHECK_SPAN(plan.feasible, function->span_) << "AutoTile cannot realize the entire marked function as "
+                                                    "one capacity-safe Ascend910B vector kernel";
+      emitted = auto_tile::EmitVectorSchedule(graph, plan, calls.called());
+      const std::optional<std::string> report_path = auto_tile::WriteVectorScheduleReport(graph, plan);
+      LOG_INFO << "AutoTile[" << function->name_
+               << "]: vector schedule=" << auto_tile::ScheduleKindName(plan.kind)
+               << " grid=" << plan.m_partition.parts << "x" << plan.n_partition.parts
+               << " work_units=" << plan.work_units << " tile=" << plan.tile_h << "x" << plan.tile_w
+               << " strip=" << plan.strip_h << "x" << plan.strip_w << " chunks=" << plan.full_chunks << "x"
+               << plan.chunk << "+" << plan.tail << " largest_feasible_chunk=" << plan.largest_feasible_chunk
+               << " feasible_chunks=" << plan.feasible_chunk_candidates << " stages="
+               << plan.phases[auto_tile::PhaseIndex(auto_tile::VectorPhase::Body)].pipeline_stages << "/"
+               << plan.phases[auto_tile::PhaseIndex(auto_tile::VectorPhase::Stats)].pipeline_stages << "/"
+               << plan.phases[auto_tile::PhaseIndex(auto_tile::VectorPhase::Apply)].pipeline_stages
+               << " peak_ub=" << plan.chunk_peak_ub_bytes << " full_peak_ub=" << plan.full_peak_ub_bytes
+               << " compute_cycles=" << plan.modeled_compute_cycles
+               << " transfer_cycles=" << plan.modeled_transfer_cycles << " phase_compute=["
+               << plan.modeled_phase_compute_cycles[0] << "," << plan.modeled_phase_compute_cycles[1] << ","
+               << plan.modeled_phase_compute_cycles[2] << "," << plan.modeled_phase_compute_cycles[3] << "]"
+               << " phase_transfer=[" << plan.modeled_phase_transfer_cycles[0] << ","
+               << plan.modeled_phase_transfer_cycles[1] << "," << plan.modeled_phase_transfer_cycles[2] << ","
+               << plan.modeled_phase_transfer_cycles[3] << "]"
+               << " phase_input_bytes=[" << static_cast<int64_t>(plan.modeled_phase_input_bytes[0]) << ","
+               << static_cast<int64_t>(plan.modeled_phase_input_bytes[1]) << ","
+               << static_cast<int64_t>(plan.modeled_phase_input_bytes[2]) << ","
+               << static_cast<int64_t>(plan.modeled_phase_input_bytes[3]) << "]"
+               << " phase_output_bytes=[" << static_cast<int64_t>(plan.modeled_phase_output_bytes[0]) << ","
+               << static_cast<int64_t>(plan.modeled_phase_output_bytes[1]) << ","
+               << static_cast<int64_t>(plan.modeled_phase_output_bytes[2]) << ","
+               << static_cast<int64_t>(plan.modeled_phase_output_bytes[3]) << "]"
+               << " reduction_model=" << (plan.used_reduction_fallback ? "legacy_fallback" : "grounded")
+               << " pointwise_model=" << auto_tile::PointwiseCostModelName(plan)
+               << " modeled_cycles=" << plan.modeled_cycles
+               << (report_path.has_value() ? " report=" + *report_path : "");
+    }
     functions.emplace(global, emitted);
     changed = true;
   }
@@ -157,7 +222,7 @@ ProgramPtr TransformAutoTileVector(const ProgramPtr& program) {
 
 }  // namespace
 
-Pass AutoTile() { return CreateProgramPass(TransformAutoTileVector, "AutoTile", kAutoTileProperties); }
+Pass AutoTile() { return CreateProgramPass(TransformAutoTile, "AutoTile", kAutoTileProperties); }
 
 }  // namespace pass
 }  // namespace ir

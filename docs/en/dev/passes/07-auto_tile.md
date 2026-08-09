@@ -1,9 +1,9 @@
 # AutoTile
 
 `AutoTile` turns one explicitly marked tensor function into one complete
-Ascend 910B vector kernel. The user fixes the operation graph; the pass chooses
-the core grid, tile or stream shape, reduction phases, on-chip lifetimes, and
-stores.
+Ascend 910B homogeneous kernel. The user fixes the operation graph; the pass
+chooses a Vector schedule or a Cube spatial schedule, including the core grid,
+tile or stream shape, on-chip lifetimes, and stores.
 
 This is deliberately different from graph fusion. `AutoTile` never partitions
 the marked function and never falls back to several kernels. A marked function
@@ -73,6 +73,13 @@ The initial implementation supports the following closed surface:
   reduction live-outs; and
 - row and column reductions that fit one non-atomic kernel schedule.
 
+The first Cube surface additionally supports one non-transposed, static rank-2
+`tensor.matmul` with equal FP16, BF16, or FP32 operand dtypes and FP16, BF16,
+or FP32 result storage. The complete function becomes one AIC SPMD kernel. A
+uniform grid owns disjoint output regions; a ragged grid uses static,
+fractal-aligned regions whose final offsets clamp backward. The latter may
+recompute an identical overlap, but never uses atomic stores.
+
 Unified binary operations are normalized to explicit row- or column-expand
 operations before emission. Ambiguous `[1,1]` tensor broadcasts and a
 broadcasted left operand of non-commutative subtraction or division are rejected.
@@ -100,11 +107,13 @@ result back into the full iteration frame before casting remains supported.
 
 The pass rejects dynamic or non-rank-2 shapes, control flow, side-effecting
 statements, `full`/shape construction, minimum/product/argument reductions,
-matmul and other Cube work, mixed kernels, Welford, unsupported dtypes, and any
-graph that would require more than one kernel. These are user-facing admission
-errors, not requests to another planner.
+unsupported Cube operations, mixed kernels, Welford, unsupported dtypes, and
+any graph that would require more than one kernel. A Cube function with more
+than one matmul, transpose flags, a non-fractal K extent, or a full-K operand
+pair that cannot fit in L1 is outside the current surface. These are
+user-facing admission or planning errors, not requests to another planner.
 
-## Planning model
+## Vector planning model
 
 The planner first constructs a typed vector graph. Tensor nodes record static
 shape, dtype, boundary status, and whether the value must survive to a return.
@@ -153,9 +162,45 @@ use a generic or cast proxy. The Ascend 910B coefficients are
 ported without refitting from the silicon-grounded scheduler model; AutoTile
 changes ownership of planning and emission, not those measurements.
 
+## Cube planning model
+
+Cube admission constructs a typed `CubeGraph` from the complete marked
+function. The current graph has one request: `[M,K] @ [K,N] -> [M,N]`. The
+planner enumerates bounded, 16-element-aligned static M/N regions and at most
+two 24-core waves. A candidate is feasible only when its LHS and RHS region
+panels fit together in the per-core Mat/L1 capacity.
+
+For every feasible outer candidate, `ChooseL0Tile` evaluates the existing
+Ascend 910B L1-to-L0/Matrix/FIXPIPE model. Cube AutoTile does not copy or
+replace that lower-level planner. Its first outer equation is deliberately
+serial because that is the algorithm emitted today:
+
+```text
+per_task = GM_to_L1(lhs_region + rhs_region) + L0_matmul
+wall     = ceil(work_units / 24) * per_task
+```
+
+The GM-to-L1 term uses the PTO-ISA-grounded 910B request bandwidth. No
+GM-to-L1/Matrix overlap is granted because this initial emitter does not yet
+create an outer K-window pipeline. The selected `CubeSchedulePlan` records the
+spatial policy, static region, work units, exact L1 peak, total GM-to-L1 bytes,
+the chosen child L0 descriptor, and the component/model cycles. The emitter
+validates coverage and replays that descriptor as one SPMD AIC body containing
+two operand slices, one tensor matmul, and one output assemble.
+
+After tensor-to-tile conversion, `AutoTileMatmulL0` remains the sole owner of
+L1-to-L0 tiling and its local software pipelines. This separation prevents the
+outer model and emitter from silently choosing conflicting L0 algorithms.
+
+Outer K-window streaming, FirstPartialThenAtomic split-K, serial multi-matmul
+DAGs with role-aware resident inputs/intermediates, and retained boundary
+panels are planned extensions. Until their complete plan/memory/traffic
+descriptors and matching emitters are ported, AutoTile rejects those cases
+instead of pricing work it cannot emit.
+
 ## Schedule reports
 
-Every successful `ir.compile()` of an AutoTile function also writes two small,
+Every successful Vector `ir.compile()` of an AutoTile function also writes two small,
 deterministic artifacts:
 
 ```text
@@ -177,6 +222,10 @@ two-stage apply/store loop. Ping/pong slots and persistent running statistics
 are explicit. A line such as `lifetime ends: x(t0)` describes the logical
 last-use point; it does not imply that the IR contains an explicit free
 instruction.
+
+Cube schedules currently use the deterministic `AutoTile[name]` INFO line;
+the versioned Cube JSON/pseudocode report is part of the next descriptor
+extension.
 
 Bare calls to `passes.auto_tile()` have no compilation artifact directory and
 therefore keep the concise `INFO` log only. Use the schedule report together
@@ -293,13 +342,14 @@ helper so its call signature remains valid. Multiple live-outs always receive
 distinct stores. Existing explicit `Out` parameters are reused positionally;
 direct calls and `Submit` sites keep that declared signature.
 
-Successful emission contains one `pl.spmd` scope and one non-split Vector
-InCore body. Later hierarchy outlining therefore produces one AIV kernel for
-the marked tensor DAG.
+Successful emission contains one `pl.spmd` scope and one non-split InCore body.
+Later hierarchy outlining therefore produces one AIV kernel for a Vector DAG
+or one AIC kernel for the supported Cube matmul.
 
 ## Relationship to other tilers
 
-This pass owns tensor-level Vector scheduling from GM through UB. It does not
-replace [`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md), which works later on a
-single Cube matmul's L0 geometry. Cube, mixed-kernel, and graph-partitioning
-support are intentionally outside this first AutoTile contract.
+This pass owns tensor-level Vector scheduling from GM through UB and the
+supported Cube matmul's outer GM-to-L1 spatial schedule. It does not replace
+[`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md), which works later on Cube L0
+geometry. Mixed-kernel and graph-partitioning support remain outside the
+AutoTile contract.
