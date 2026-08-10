@@ -89,7 +89,8 @@ PreparedProblem BuildProblem(const FunctionPtr& func, const AllocationPlan& allo
     const MemRefPtr memref = GetDefinedMemRef(tile_type);
 
     const uint64_t alignment = std::max<uint64_t>(1, policy.AlignAddress(1, lifetime.memory_space));
-    const DsaExecutionLifetime execution_lifetime = ConvertToDsaExecutionLifetime(lifetime);
+    const DsaExecutionLifetime execution_lifetime =
+        ConvertToDsaExecutionLifetime(lifetime, allocation_plan.read_before_write_inputs.count(index) != 0);
     prepared.strict_problem.buffers.push_back({id,
                                                lifetime.size,
                                                alignment,
@@ -152,6 +153,23 @@ PreparedProblem BuildProblem(const FunctionPtr& func, const AllocationPlan& allo
         !first.lifetime.Overlaps(second.lifetime)) {
       prepared.pipeline_pairs.push_back({pair.first, pair.second});
     }
+  }
+
+  std::set<BufferPair> exact_or_disjoint;
+  for (const AllocationNoPartialOverlap& relation : allocation_plan.no_partial_overlaps) {
+    INTERNAL_CHECK(relation.first < buffer_by_interval.size() && relation.second < buffer_by_interval.size())
+        << "DSA-RP exact-or-disjoint relation references an out-of-range interval";
+    if (!buffer_by_interval[relation.first] || !buffer_by_interval[relation.second]) continue;
+    const BufferPair pair =
+        CanonicalPair(*buffer_by_interval[relation.first], *buffer_by_interval[relation.second]);
+    if (prepared.strict_problem.buffers[pair.first].pool !=
+        prepared.strict_problem.buffers[pair.second].pool) {
+      continue;
+    }
+    exact_or_disjoint.insert(pair);
+  }
+  for (const BufferPair& pair : exact_or_disjoint) {
+    prepared.strict_problem.no_partial_overlaps.push_back({pair.first, pair.second});
   }
 
   std::map<BufferPair, uint64_t> penalty_weights;

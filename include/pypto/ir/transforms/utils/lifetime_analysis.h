@@ -89,6 +89,11 @@ struct AllocationSeparation {
   std::vector<AllocationSeparationReason> reasons;
 };
 
+struct AllocationNoPartialOverlap {
+  size_t first;
+  size_t second;
+};
+
 struct PipelineAllocationMember {
   size_t interval_index;
   int32_t stage;
@@ -133,6 +138,8 @@ struct PipelineAllocationGroup {
 struct AllocationPlan {
   std::vector<LifetimeInterval> intervals;
   std::vector<AllocationSeparation> separations;
+  std::vector<AllocationNoPartialOverlap> no_partial_overlaps;
+  std::set<size_t> read_before_write_inputs;
   std::vector<PipelineAllocationGroup> pipeline_groups;
   /// Full byte extent of each author-declared allocation. This can exceed any
   /// member MemRef when the declaration contains multiple runtime-selected

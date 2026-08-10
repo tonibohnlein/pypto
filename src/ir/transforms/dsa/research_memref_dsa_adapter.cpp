@@ -148,8 +148,8 @@ ExportedProblem BuildStructuredProblem(const FunctionPtr& func, const Allocation
     buffer.name = memref->base_->name_hint_;
     buffer.size = lifetime.size;
     buffer.alignment = std::max<uint64_t>(1, policy.AlignAddress(1, lifetime.memory_space));
-    const dsa_adapter::DsaExecutionLifetime execution_lifetime =
-        dsa_adapter::ConvertToDsaExecutionLifetime(lifetime);
+    const dsa_adapter::DsaExecutionLifetime execution_lifetime = dsa_adapter::ConvertToDsaExecutionLifetime(
+        lifetime, allocation_plan.read_before_write_inputs.count(index) != 0);
     buffer.live_intervals = {{execution_lifetime.begin, execution_lifetime.end}};
     buffer.allowed_pools = {ToPoolId(lifetime.memory_space)};
     exported.document.problem.buffers.push_back(std::move(buffer));
@@ -229,6 +229,23 @@ ExportedProblem BuildStructuredProblem(const FunctionPtr& func, const Allocation
     separation.second = pair.second;
     separation.reasons.assign(reasons.begin(), reasons.end());
     exported.document.problem.separations.push_back(std::move(separation));
+  }
+
+  std::set<BufferPair> no_partial_overlaps;
+  for (const AllocationNoPartialOverlap& constraint : allocation_plan.no_partial_overlaps) {
+    INTERNAL_CHECK(constraint.first < buffer_id_by_interval.size() &&
+                   constraint.second < buffer_id_by_interval.size())
+        << "DSA no-partial-overlap constraint references an out-of-range lifetime index";
+    const auto& first_buffer = buffer_id_by_interval[constraint.first];
+    const auto& second_buffer = buffer_id_by_interval[constraint.second];
+    if (!first_buffer.has_value() || !second_buffer.has_value()) continue;
+    auto first = first_buffer.value();
+    auto second = second_buffer.value();
+    if (second < first) std::swap(first, second);
+    if (first != second) no_partial_overlaps.emplace(first, second);
+  }
+  for (const auto& [first, second] : no_partial_overlaps) {
+    exported.document.problem.no_partial_overlaps.push_back({first, second});
   }
 
   ReusePenaltyRecognition recognition =

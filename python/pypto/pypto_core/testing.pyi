@@ -70,6 +70,9 @@ def recognize_dsa_reuse_penalties(function: Function) -> list[DsaReusePenaltyEdg
 def get_dsa_allocation_lifetimes(function: Function) -> list[DsaAllocationLifetime]:
     """Return normalized product DSA allocation lifetimes."""
 
+def get_dsa_exact_or_disjoint_pairs(function: Function) -> list[tuple[str, str]]:
+    """Return normalized product DSA in-place candidate pairs."""
+
 def try_infer_pipe(call: Call) -> int | None:
     """Return the exact backend pipe for a Call, or None."""
 
