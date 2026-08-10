@@ -215,6 +215,12 @@ def _resolve_case_memory_planner(
     return session_memory_planner
 
 
+def _optional_case_value(test_case: PTOTestCase, getter_name: str) -> Any:
+    """Read a research-only test-case setting without breaking legacy mocks."""
+    getter = getattr(test_case, getter_name, None)
+    return getter() if getter is not None else None
+
+
 def _default_work_dir(test_name: str) -> Path:
     """Return the default output path for a saved test: build_output/{testName}_{timestamp}."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -317,6 +323,7 @@ def _compile_for_cache(
     dump_passes: bool,
     analyze_auto_scopes_for_deps: bool,
     session_memory_planner: MemoryPlanner | None = None,
+    codegen_only: bool = False,
 ) -> None:
     """Compile one test case into *work_dir* (called from thread pool).
 
@@ -400,6 +407,7 @@ def _fused_compile_task(
             dump_passes,
             analyze_auto_scopes_for_deps,
             session_memory_planner,
+            bool(_pipeline_ctx.get("codegen_only")),
         )
         # Codegen-only runs skip assembly: the .so is never loaded by the
         # execute task (see _fused_execute_task) and assembling here would
@@ -1002,7 +1010,6 @@ def start_pipeline(  # noqa: PLR0913
     task_queue_timeout: int = 1800,
     task_submit_device: str = "auto",
     execute_batch_size: int = 64,
-    memory_planner: MemoryPlanner | None = None,
 ) -> None:
     """Spin up the compile pipeline and populate :data:`_compile_futures`.
 

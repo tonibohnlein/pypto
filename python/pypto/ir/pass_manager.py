@@ -337,7 +337,7 @@ class PassManager:
         skipped_mem_planning_passes: tuple[str, ...]
         if self._construction_planner == passes.MemoryPlanner.PTOAS:
             skipped_mem_planning_passes = ("MemoryReuse", "AllocateMemoryAddr")
-        elif self._construction_planner == passes.MemoryPlanner.DSA_RP:
+        elif self._construction_planner in (passes.MemoryPlanner.DSA_RP, passes.MemoryPlanner.DSA):
             skipped_mem_planning_passes = ("MemoryReuse",)
         else:
             skipped_mem_planning_passes = ()

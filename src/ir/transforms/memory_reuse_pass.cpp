@@ -3094,8 +3094,8 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
     new_body = applier.VisitStmt(new_body);
   }
 
-  // Under memory_planner=PtoAS or DsaRP the whole MemoryReuse pass is skipped.
-  // DsaRP must therefore run the correctness normalizations from MemoryReuse
+  // Under memory_planner=PtoAS, DsaRP, or Dsa the whole MemoryReuse pass is skipped.
+  // Explicit-address DSA planners must therefore run the correctness normalizations from MemoryReuse
   // Steps 3.75 through 4.5 in the same order. They are not optimizations: when a
   // peeled accumulator if-phi or
   // loop yields a value living in a different buffer than its iter_arg/return_var,
@@ -3114,7 +3114,8 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
   // then materialize both IfStmt and ForStmt fixups, and finally repair bare-Var
   // identity copies before lifetime analysis and placement.
   const auto* ctx = PassContext::Current();
-  if (ctx != nullptr && ctx->GetMemoryPlanner() == MemoryPlanner::DsaRP) {
+  if (ctx != nullptr &&
+      (ctx->GetMemoryPlanner() == MemoryPlanner::DsaRP || ctx->GetMemoryPlanner() == MemoryPlanner::Dsa)) {
     TopDownRetargeter acc_coalescer;
     auto acc_rewrites = acc_coalescer.CoalesceAccumulatorIfPhis(new_body);
     if (!acc_rewrites.empty()) {
@@ -3269,7 +3270,7 @@ AllocationConstraintAnalysis AnalyzeAllocationConstraints(const FunctionPtr& fun
 
   ForbidAliasCollector forbid_collector(lifetimes.var_sharing_groups);
   forbid_collector.VisitStmt(func->body_);
-  result.forbid_alias = forbid_collector.Take();
+  result.forbid_alias = forbid_collector.TakeForbidden();
   return result;
 }
 
@@ -3280,6 +3281,188 @@ LifetimeAnalysisResult AnalyzeAllocationLifetimes(const StmtPtr& func_body) {
 LifetimeAnalysisResult AnalyzeAllocationLifetimes(const FunctionPtr& func) {
   INTERNAL_CHECK(func != nullptr) << "Cannot analyze allocation lifetimes for a null function";
   return AnalyzeAllocationLifetimesImpl(func->body_, func->params_);
+}
+
+// Shared entry point (see utils/lifetime_analysis.h): the DSA adapter reuses the
+// exact per-allocation intervals + pipeline-clone separations this pass computes,
+// so both plan from identical liveness.
+AllocationPlan ComputeAllocationPlan(const FunctionPtr& func) {
+  auto analysis = AnalyzeAllocationLifetimes(func);
+  const auto pinned_allocations = CollectPinnedAllocSizes(func->body_, func->span_, "DSA");
+  std::set<const Var*> pinned_bases;
+  for (const auto& [base, size] : pinned_allocations) {
+    static_cast<void>(size);
+    pinned_bases.insert(base);
+  }
+  ValidateDeclaredAllocs(func->body_, pinned_bases, analysis.var_liveness);
+  AllocationPlan plan;
+  plan.intervals = std::move(analysis.lifetimes);
+  plan.declared_allocation_sizes = pinned_allocations;
+  for (LifetimeInterval& interval : plan.intervals) {
+    auto memref = GetTypeMemRef(interval.variable->GetType());
+    if (!memref.has_value() || !memref.value()) continue;
+    const auto declared = pinned_allocations.find(memref.value()->base_.get());
+    if (declared != pinned_allocations.end()) interval.size = std::max(interval.size, declared->second);
+  }
+  const auto& intervals = plan.intervals;
+
+  // The portable schema represents hard exclusions as explicit index pairs.
+  // Build them through indices so the analysis is output-sensitive:
+  // O(N log N + E log E), where E is the number of pairs emitted.
+  std::map<std::pair<size_t, size_t>, std::set<AllocationSeparationReason>> separation_reasons;
+  auto add_separation = [&separation_reasons](size_t first, size_t second,
+                                              AllocationSeparationReason reason) {
+    if (first == second) return;
+    if (second < first) std::swap(first, second);
+    separation_reasons[{first, second}].insert(reason);
+  };
+
+  // Allocation base_ Ptr -> interval index, for resolving forbid-alias operands.
+  std::unordered_map<const Var*, size_t> base_to_index;
+  std::vector<size_t> pinned_intervals;
+  for (size_t i = 0; i < intervals.size(); ++i) {
+    auto mr = GetTypeMemRef(intervals[i].variable->GetType());
+    if (mr.has_value() && mr.value()) {
+      base_to_index[mr.value()->base_.get()] = i;
+      if (pinned_bases.count(mr.value()->base_.get()) != 0) {
+        pinned_intervals.push_back(i);
+      }
+    }
+  }
+
+  // A declared allocation is closed: only values explicitly bound to its base
+  // may occupy it. DSA skips MemoryReuse, so encode that contract as hard
+  // typed separations from every other allocation in the same memory space.
+  for (size_t pinned : pinned_intervals) {
+    for (size_t other = 0; other < intervals.size(); ++other) {
+      if (other != pinned && intervals[other].memory_space == intervals[pinned].memory_space) {
+        add_separation(pinned, other, AllocationSeparationReason::DeclaredAllocation);
+      }
+    }
+  }
+
+  HazardInputs hazard;
+  if (NeedsLoadTpopHazardGuard(func)) {
+    HazardInputCollector collector;
+    collector.VisitStmt(func->body_);
+    hazard = collector.Take();
+  }
+  ForbidAliasCollector forbid_collector(analysis.var_sharing_groups);
+  forbid_collector.VisitStmt(func->body_);
+  const ForbidAliasMap forbid_alias = forbid_collector.TakeForbidden();
+  // (1) Pipeline double-buffer separations. Export the full requested pipeline
+  // intent first: every distinct source stage gets its own residue and remains
+  // hard-separated from every other stage in the group. Capacity pressure is
+  // handled by an explicit second solve that relaxes only these typed edges.
+  const auto& pm = analysis.pipeline_membership;
+  {
+    using GroupKey = std::pair<MemorySpace, int32_t>;
+    std::map<GroupKey, uint64_t> group_slot;  // (space, group) -> max member size
+    // (space, group) -> stage -> interval indices. Bucketing by stage/residue
+    // avoids scanning unrelated allocations or same-residue pairs.
+    std::map<GroupKey, std::map<int32_t, std::vector<size_t>>> group_members;
+    for (size_t index = 0; index < intervals.size(); ++index) {
+      const LifetimeInterval& iv = intervals[index];
+      auto it = pm.find(iv.variable.get());
+      if (it == pm.end()) continue;
+      for (const auto& [g, st] : it->second) {
+        const GroupKey key{iv.memory_space, g};
+        group_slot[key] = std::max(group_slot[key], iv.size);
+        group_members[key][st].push_back(index);
+      }
+    }
+
+    for (const auto& [key, members_by_stage] : group_members) {
+      INTERNAL_CHECK(members_by_stage.size() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()))
+          << "Pipeline group has too many distinct stages for DSA export";
+      const int32_t depth = static_cast<int32_t>(members_by_stage.size());
+      const uint64_t slot = group_slot[key];
+
+      std::map<int32_t, std::vector<size_t>> members_by_residue;
+      PipelineAllocationGroup exported_group;
+      exported_group.memory_space = key.first;
+      exported_group.group = key.second;
+      exported_group.slot_size = slot;
+      exported_group.depth = static_cast<uint32_t>(depth);
+      exported_group.effective_depth = static_cast<uint32_t>(depth);
+      int32_t ord = 0;
+      for (const auto& [stage, members] : members_by_stage) {
+        const int32_t residue = ord++;
+        auto& bucket = members_by_residue[residue];
+        bucket.insert(bucket.end(), members.begin(), members.end());
+        for (size_t index : members) {
+          exported_group.members.push_back({index, stage, static_cast<uint32_t>(residue)});
+        }
+      }
+      plan.pipeline_groups.push_back(std::move(exported_group));
+
+      for (auto first_bucket = members_by_residue.begin(); first_bucket != members_by_residue.end();
+           ++first_bucket) {
+        auto second_bucket = first_bucket;
+        ++second_bucket;
+        for (; second_bucket != members_by_residue.end(); ++second_bucket) {
+          for (size_t first : first_bucket->second) {
+            for (size_t second : second_bucket->second) {
+              add_separation(first, second, AllocationSeparationReason::PipelineStage);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // (2) Ascend910B split-AIV load + tpop_from_aic in-place hazard (backend-gated;
+  // empty off-910B). Directional: a writer whose def coincides with a load-derived
+  // input's last use, and which consumes a tpop value, must not reuse that input.
+  if (NeedsLoadTpopHazardGuard(func)) {
+    std::map<int, std::vector<size_t>> writers_by_def;
+    std::map<int, std::vector<size_t>> inputs_by_last_use;
+    for (size_t i = 0; i < intervals.size(); ++i) {
+      const LifetimeInterval& interval = intervals[i];
+      if (hazard.reads_tpop.count(interval.variable.get()) != 0) {
+        writers_by_def[interval.def_point].push_back(i);
+      }
+      if (hazard.load_derived.count(interval.variable.get()) != 0) {
+        inputs_by_last_use[interval.last_use_point].push_back(i);
+      }
+    }
+    for (const auto& [point, writers] : writers_by_def) {
+      auto inputs = inputs_by_last_use.find(point);
+      if (inputs == inputs_by_last_use.end()) continue;
+      for (size_t writer : writers) {
+        for (size_t input : inputs->second) {
+          add_separation(writer, input, AllocationSeparationReason::TargetHazard);
+        }
+      }
+    }
+  }
+
+  // (3) Op-semantic forbid-alias (e.g. tile.sel mask/tmp vs output). The collector
+  // maps a writer's representative to the operand Vars its buffer must avoid; each
+  // operand resolves (via base_ identity — no reuse chain exists pre-solve) to an
+  // allocation, which is kept apart from the writer.
+  for (size_t i = 0; i < intervals.size(); ++i) {
+    auto fa = forbid_alias.find(intervals[i].variable.get());
+    if (fa == forbid_alias.end()) continue;
+    for (const VarPtr& operand : fa->second) {
+      auto mr = GetTypeMemRef(operand->GetType());
+      if (!mr.has_value() || !mr.value()) continue;
+      auto bit = base_to_index.find(mr.value()->base_.get());
+      if (bit != base_to_index.end()) {
+        add_separation(i, bit->second, AllocationSeparationReason::SemanticNoAlias);
+      }
+    }
+  }
+
+  plan.separations.reserve(separation_reasons.size());
+  for (const auto& [indices, reasons] : separation_reasons) {
+    AllocationSeparation separation;
+    separation.first = indices.first;
+    separation.second = indices.second;
+    separation.reasons.assign(reasons.begin(), reasons.end());
+    plan.separations.push_back(std::move(separation));
+  }
+  return plan;
 }
 
 namespace pass {

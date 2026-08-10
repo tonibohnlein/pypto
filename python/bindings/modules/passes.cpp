@@ -171,6 +171,8 @@ void BindPass(nb::module_& m) {
   nb::enum_<MemoryPlanner>(passes, "MemoryPlanner", "Selects who plans on-chip buffer memory")
       .value("PYPTO", MemoryPlanner::PyPTO,
              "PyPTO's AllocateMemoryAddr bakes physical addresses (ptoas --pto-level=level3)")
+      .value("DSA", MemoryPlanner::Dsa,
+             "External research DSA solver with export and replay controls (level3)")
       .value("DSA_RP", MemoryPlanner::DsaRP,
              "PyPTO's in-tree DSA planner minimizes recognized reuse penalties within capacity")
       .value("PTOAS", MemoryPlanner::PtoAS,

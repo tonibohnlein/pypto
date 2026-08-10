@@ -173,6 +173,12 @@ def _run_pass_pipeline(  # noqa: PLR0913
             "Ascend910B load + tpop_from_aic in-place hazard guard and reserve-buffer base "
             "resolution are deferred to ptoas — verify on-device."
         )
+    elif mplan in (_passes.MemoryPlanner.DSA, _passes.MemoryPlanner.DSA_RP):
+        logger.info(
+            "memory_planner=%s: skipping opportunistic MemoryReuse; the selected DSA planner "
+            "jointly chooses reuse and offsets, then PyPTO validates and writes them back.",
+            mplan.name,
+        )
 
     prof = get_active_profiler()
     passes_stage = prof.stage("passes") if prof is not None else nullcontext()

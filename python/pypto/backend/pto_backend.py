@@ -1145,10 +1145,11 @@ def _get_ptoas_flags(
 ) -> list[str]:
     """Build the common ptoas flag list for kernel compilation.
 
-    ``MemoryPlanner.PYPTO`` and ``MemoryPlanner.DSA_RP`` bake physical
-    addresses in PyPTO and trust them (``--pto-level=level3``);
-    ``MemoryPlanner.PTOAS`` emits no addresses and lets the ptoas PlanMemory
-    pass allocate (``--pto-level=level2``). When ``passes_dump_dir`` is set,
+    ``MemoryPlanner.PYPTO``, ``MemoryPlanner.DSA_RP``, and
+    ``MemoryPlanner.DSA`` bake physical addresses in PyPTO and trust them
+    (``--pto-level=level3``);
+    ``MemoryPlanner.PTOAS`` emits no addresses and lets ptoas PlanMemory
+    allocate (``--pto-level=level2``). When ``passes_dump_dir`` is set,
     request full-module IR snapshots after every ptoas pass.
     """
     level = "level2" if memory_planner == _passes.MemoryPlanner.PTOAS else "level3"

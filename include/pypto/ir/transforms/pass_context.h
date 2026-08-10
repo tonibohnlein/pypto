@@ -233,6 +233,7 @@ enum class MemoryPlanner {
   PyPTO = 0,  ///< Legacy PyPTO coalescing + address allocation (ptoas level 3).
   PtoAS = 1,  ///< ptoas PlanMemory allocates (ptoas level 2).
   DsaRP = 2,  ///< In-tree DSA with automatically recognized reuse penalties.
+  Dsa = 3,    ///< External research planner with export, replay, and solver controls.
 };
 
 /**
