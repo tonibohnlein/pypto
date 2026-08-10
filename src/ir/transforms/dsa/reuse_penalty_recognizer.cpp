@@ -499,10 +499,16 @@ std::vector<RecognizedReusePenalty> RecognizeReusePenalties(const FunctionPtr& f
 
   std::vector<RecognizedReusePenalty> penalties;
   std::unordered_set<PairKey, PairKeyHash> recognized;
-  auto emit = [&](size_t first, size_t second) {
+  auto emit = [&](size_t first, size_t second, bool loop_carried) {
     if (first == second) return;
     const PairKey pair = NormalizePair(first, second);
-    if (separated.count(pair) != 0 || same_operation.count(pair) != 0 || !recognized.insert(pair).second) {
+    // An exact-or-disjoint pair's distance-zero frontier includes access
+    // endpoints from the operation that created the relation. Those are
+    // governed by the operation's alias contract, not synchronization. Do not
+    // suppress an independent distance-one handoff on the same logical pair:
+    // its previous-iteration store can still gate the next iteration's load.
+    if (separated.count(pair) != 0 || (!loop_carried && same_operation.count(pair) != 0) ||
+        !recognized.insert(pair).second) {
       return;
     }
     penalties.push_back({pair.first, pair.second, 1});
@@ -552,7 +558,9 @@ std::vector<RecognizedReusePenalty> RecognizeReusePenalties(const FunctionPtr& f
         for (size_t prior : buckets.terminal[terminal_resource]) {
           if (prior == current || !compact_summaries[prior]) continue;
           const AccessEndpoint& terminal = *compact_summaries[prior]->terminal_by_resource[terminal_resource];
-          if (terminal.global_order <= current_summary.initial_write.global_order) emit(prior, current);
+          if (terminal.global_order <= current_summary.initial_write.global_order) {
+            emit(prior, current, false);
+          }
         }
       }
 
@@ -570,7 +578,7 @@ std::vector<RecognizedReusePenalty> RecognizeReusePenalties(const FunctionPtr& f
           for (size_t prior : buckets.initial[prior_initial_resource]) {
             if (prior == current || !compact_summaries[prior]) continue;
             const AccessEndpoint& initial = compact_summaries[prior]->initial_write;
-            if (terminal->global_order > initial.global_order) emit(prior, current);
+            if (terminal->global_order > initial.global_order) emit(prior, current, true);
           }
         }
       }
