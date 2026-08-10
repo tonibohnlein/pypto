@@ -54,8 +54,8 @@ struct PreparedProblem {
 /**
  * @brief Translate PyPTO allocation facts into the narrow in-tree DSA-RP model.
  *
- * Buffer lifetimes use ``ConvertToDsaExecutionLifetime``, the same conservative
- * read/write event convention as the standalone research adapter.
+ * Buffer lifetimes use ``ConvertToDsaExecutionLifetime`` and the same optional
+ * exact-in-place candidate relations as the standalone research adapter.
  */
 [[nodiscard]] PreparedProblem BuildProblem(
     const FunctionPtr& func, const AllocationPlan& allocation_plan, const MemoryAllocatorPolicy& policy,

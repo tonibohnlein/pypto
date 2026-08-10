@@ -35,12 +35,14 @@ namespace pypto {
 namespace ir {
 namespace dsa_adapter {
 
-DsaExecutionLifetime ConvertToDsaExecutionLifetime(const LifetimeInterval& lifetime) {
+DsaExecutionLifetime ConvertToDsaExecutionLifetime(const LifetimeInterval& lifetime,
+                                                   bool allow_read_before_write_reuse) {
   INTERNAL_CHECK(lifetime.def_point >= 0 && lifetime.last_use_point >= lifetime.def_point)
       << "Invalid allocation lifetime [" << lifetime.def_point << ", " << lifetime.last_use_point << "]";
 
   const int64_t begin = 2 * static_cast<int64_t>(lifetime.def_point) + 1;
-  const int64_t final_read_end = 2 * static_cast<int64_t>(lifetime.last_use_point) + 2;
+  const int64_t final_read_end =
+      2 * static_cast<int64_t>(lifetime.last_use_point) + (allow_read_before_write_reuse ? 1 : 2);
   return {begin, std::max(begin + 1, final_read_end)};
 }
 
@@ -176,10 +178,64 @@ AllocationPlan BuildDsaAllocationPlan(const FunctionPtr& func) {
     }
   }
 
+  // In-place capability is optional, not a mandatory alias. At a producer /
+  // final-consumer boundary, let the input die at the read event only when the
+  // registry says that exact in-place execution is supported. The geometric
+  // relation below then permits byte-identical ranges or disjoint ranges, but
+  // rejects staggered overlap. Finalize these candidates only after every
+  // semantic separation is known, so an explicit no-alias rule wins.
+  std::set<std::pair<size_t, size_t>> exact_or_disjoint_pairs;
+  for (size_t output = 0; output < intervals.size(); ++output) {
+    const auto candidates = constraints.exact_or_disjoint_alias.find(intervals[output].variable.get());
+    if (candidates == constraints.exact_or_disjoint_alias.end()) continue;
+    for (const VarPtr& operand : candidates->second) {
+      const auto memref = GetTypeMemRef(operand->GetType());
+      if (!memref.has_value() || !memref.value()) continue;
+      const auto input = base_to_index.find(memref.value()->base_.get());
+      if (input == base_to_index.end() || input->second == output) continue;
+      if (intervals[input->second].memory_space != intervals[output].memory_space ||
+          intervals[input->second].last_use_point != intervals[output].def_point) {
+        continue;
+      }
+      size_t first = input->second;
+      size_t second = output;
+      if (second < first) std::swap(first, second);
+      if (separation_reasons.count({first, second}) != 0) continue;
+      exact_or_disjoint_pairs.emplace(first, second);
+      plan.read_before_write_inputs.insert(input->second);
+    }
+  }
+
+  // Shortening one input's execution lifetime exposes the same write boundary
+  // to every result born there. Only registry-supported candidate results may
+  // use it; all siblings stay hard-separated from the input.
+  using BirthKey = std::pair<MemorySpace, int>;
+  std::map<BirthKey, std::vector<size_t>> births;
+  for (size_t index = 0; index < intervals.size(); ++index) {
+    births[{intervals[index].memory_space, intervals[index].def_point}].push_back(index);
+  }
+  for (size_t input : plan.read_before_write_inputs) {
+    const auto born = births.find({intervals[input].memory_space, intervals[input].last_use_point});
+    INTERNAL_CHECK(born != births.end()) << "Missing DSA birth bucket for in-place boundary";
+    for (size_t output : born->second) {
+      if (output == input) continue;
+      size_t first = input;
+      size_t second = output;
+      if (second < first) std::swap(first, second);
+      if (exact_or_disjoint_pairs.count({first, second}) == 0) {
+        add_separation(first, second, AllocationSeparationReason::SemanticNoAlias);
+      }
+    }
+  }
+
   plan.separations.reserve(separation_reasons.size());
   for (const auto& [indices, reasons] : separation_reasons) {
     plan.separations.push_back({indices.first, indices.second,
                                 std::vector<AllocationSeparationReason>(reasons.begin(), reasons.end())});
+  }
+  plan.no_partial_overlaps.reserve(exact_or_disjoint_pairs.size());
+  for (const auto& [first, second] : exact_or_disjoint_pairs) {
+    plan.no_partial_overlaps.push_back({first, second});
   }
   return plan;
 }

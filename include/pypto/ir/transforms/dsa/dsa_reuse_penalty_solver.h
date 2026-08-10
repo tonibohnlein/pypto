@@ -78,6 +78,18 @@ struct Separation {
   BufferId second = 0;
 };
 
+/**
+ * @brief Allow two buffers to use exactly the same byte range or disjoint ranges.
+ *
+ * This represents an operation-supported in-place choice. Staggered or
+ * containment overlap is forbidden because it would overwrite only part of an
+ * operand while the same instruction is still reading it.
+ */
+struct NoPartialOverlap {
+  BufferId first = 0;
+  BufferId second = 0;
+};
+
 struct ReusePenalty {
   BufferId first = 0;
   BufferId second = 0;
@@ -88,6 +100,7 @@ struct DsaProblem {
   std::vector<Pool> pools;
   std::vector<Buffer> buffers;
   std::vector<Separation> separations;
+  std::vector<NoPartialOverlap> no_partial_overlaps;
   std::vector<ReusePenalty> reuse_penalties;
 };
 

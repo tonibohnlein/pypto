@@ -182,15 +182,27 @@ nb::list GetDsaAllocationLifetimesForTesting(const ir::FunctionPtr& func) {
   const ir::dsa_adapter::AllocationPlan plan = ir::dsa_adapter::BuildDsaAllocationPlan(func);
 
   nb::list result;
-  for (const ir::LifetimeInterval& interval : plan.intervals) {
-    const ir::dsa_adapter::DsaExecutionLifetime lifetime =
-        ir::dsa_adapter::ConvertToDsaExecutionLifetime(interval);
+  for (size_t index = 0; index < plan.intervals.size(); ++index) {
+    const ir::LifetimeInterval& interval = plan.intervals[index];
+    const ir::dsa_adapter::DsaExecutionLifetime lifetime = ir::dsa_adapter::ConvertToDsaExecutionLifetime(
+        interval, plan.read_before_write_inputs.count(index) != 0);
     nb::dict record;
     record["name"] = interval.variable->name_hint_;
     record["size"] = interval.size;
     record["begin"] = lifetime.begin;
     record["end"] = lifetime.end;
     result.append(std::move(record));
+  }
+  return result;
+}
+
+nb::list GetDsaExactOrDisjointPairsForTesting(const ir::FunctionPtr& func) {
+  const ir::dsa_adapter::AllocationPlan plan = ir::dsa_adapter::BuildDsaAllocationPlan(func);
+  nb::list result;
+  for (const ir::dsa_adapter::AllocationNoPartialOverlap& relation : plan.no_partial_overlaps) {
+    INTERNAL_CHECK(relation.first < plan.intervals.size() && relation.second < plan.intervals.size());
+    result.append(nb::make_tuple(plan.intervals[relation.first].variable->name_hint_,
+                                 plan.intervals[relation.second].variable->name_hint_));
   }
   return result;
 }
@@ -324,6 +336,8 @@ void BindTesting(nb::module_& m) {
 
   testing.def("get_dsa_allocation_lifetimes", &GetDsaAllocationLifetimesForTesting, nb::arg("function"),
               "Return normalized product DSA allocation lifetimes");
+  testing.def("get_dsa_exact_or_disjoint_pairs", &GetDsaExactOrDisjointPairsForTesting, nb::arg("function"),
+              "Return normalized product DSA in-place candidate pairs");
 
   testing.def("try_infer_pipe", &TryInferPipeForTesting, nb::arg("call"),
               "Return the exact backend pipe for a Call, or None");
