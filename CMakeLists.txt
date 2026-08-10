@@ -361,6 +361,12 @@ set(PYPTO_SOURCES
     src/backend/common/soc.cpp
 )
 
+if(PYPTO_ENABLE_DSA_SOLVER)
+    list(APPEND PYPTO_SOURCES
+        src/ir/transforms/dsa/research_memref_dsa_adapter.cpp
+        src/ir/transforms/dsa/research_reuse_penalty_recognizer.cpp)
+endif()
+
 # Include Python bindings
 add_subdirectory(python/bindings)
 
