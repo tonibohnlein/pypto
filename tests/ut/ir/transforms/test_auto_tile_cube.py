@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 
 import pypto.language as pl
@@ -73,6 +74,46 @@ def _structure(program: ir.Program) -> _Structure:
     result = _Structure()
     result.visit_program(program)
     return result
+
+
+def _tile_memref_bases(program: ir.Program, memory_space: ir.MemorySpace) -> set[str]:
+    """Collect physical buffer identities assigned in one tile memory space."""
+    bases: set[str] = set()
+
+    class _Collector(ir.IRVisitor):
+        def visit_assign_stmt(self, stmt: ir.AssignStmt) -> None:
+            tile = stmt.var.type
+            if (
+                isinstance(tile, ir.TileType)
+                and tile.memory_space == memory_space
+                and tile.memref is not None
+            ):
+                bases.add(tile.memref.base_.name_hint)
+            super().visit_assign_stmt(stmt)
+
+    _Collector().visit_program(program)
+    return bases
+
+
+def _tile_memory_high_water(program: ir.Program, memory_space: ir.MemorySpace) -> int:
+    """Return the highest addressed byte of one allocated tile space."""
+    high_water = 0
+
+    class _Collector(ir.IRVisitor):
+        def visit_assign_stmt(self, stmt: ir.AssignStmt) -> None:
+            nonlocal high_water
+            tile = stmt.var.type
+            if (
+                isinstance(tile, ir.TileType)
+                and tile.memory_space == memory_space
+                and tile.memref is not None
+                and isinstance(tile.memref.byte_offset_, ir.ConstInt)
+            ):
+                high_water = max(high_water, int(tile.memref.byte_offset_.value) + tile.memref.size_)
+            super().visit_assign_stmt(stmt)
+
+    _Collector().visit_program(program)
+    return high_water
 
 
 @pl.program
@@ -273,6 +314,16 @@ def test_outer_k_window_pipeline_carries_one_accumulator_and_peels_tail():
     assert body.index("matmul_tile_body_lhs_tail") < body.index("pl.tensor.assemble")
 
 
+def test_outer_k_window_pipeline_uses_one_physical_accumulator():
+    """The full lowering must not split one K reduction over two L0C buffers."""
+    after = _run_default(RaggedKMatmulProgram)
+    acc_bases = _tile_memref_bases(after, ir.MemorySpace.Acc)
+    assert len(acc_bases) == 1, (
+        "outer K-window init, rolled windows, tail, and drain must share one "
+        f"physical accumulator, got {sorted(acc_bases)}\n{ir.python_print(after)}"
+    )
+
+
 def test_split_k_uses_first_partial_then_atomic_without_zero_seed(
     capfd: pytest.CaptureFixture[str],
 ):
@@ -404,6 +455,25 @@ def test_multi_role_boundary_keeps_lhs_and_rhs_representations_distinct():
     # deliberately prevents one Mat-layout residency value from serving both.
     assert counter.count >= 2
     assert "resident_" not in function.as_python()
+
+
+def test_serial_dag_peak_l1_covers_emitted_physical_high_water(
+    capfd: pytest.CaptureFixture[str],
+):
+    """The cube plan must not price below the buffers emitted for its request DAG."""
+    set_log_level(LogLevel.INFO)
+    try:
+        lowered = _run_default(MultiRoleBoundaryProgram)
+        line = next(line for line in capfd.readouterr().err.splitlines() if "AutoTile[tree]" in line)
+    finally:
+        set_log_level(LogLevel.INFO)
+    match = re.search(r"\bpeak_l1=(\d+)\b", line)
+    assert match is not None
+    planned_peak = int(match.group(1))
+    emitted_high_water = _tile_memory_high_water(lowered, ir.MemorySpace.Mat)
+    assert planned_peak >= emitted_high_water, (
+        f"serial cube plan prices {planned_peak} L1 bytes but lowering addresses {emitted_high_water} bytes"
+    )
 
 
 def test_produced_value_used_in_both_roles_expands_to_two_physical_requests(

@@ -138,33 +138,82 @@ generic 或 cast proxy。Ascend 910B 系数从
 
 ## Cube 规划模型
 
-Cube 准入从完整的标记函数构造带类型的 `CubeGraph`。当前图只有一个 request：
-`[M,K] @ [K,N] -> [M,N]`。planner 枚举有界的、16 元素对齐的静态 M/N region，
-且最多覆盖两个 24-core wave。只有当 LHS 和 RHS region panel 能同时放入每核 Mat/L1
-容量时，候选才可行。
+Cube 准入从完整的标记函数构造带类型的 `CubeGraph`。每个 matmul 记录两个 producer edge、
+operand role、静态 `M/N/K`、accumulator dtype 和 storage dtype。被返回的 matmul 是唯一 sink，
+而且每个被准入的 matmul 都必须是该 sink 的传递 producer。源 statement 顺序已经是拓扑序；
+request expansion 递归访问 producer，并在 consumer 前发射它们。
 
-对每个可行外层候选，`ChooseL0Tile` 评估现有 Ascend 910B
-L1-to-L0/Matrix/FIXPIPE 模型。Cube AutoTile 不复制或替换该低层 planner。首个外层方程
-有意采用串行形式，因为当前 emitter 发射的正是该算法：
+外层 planner 枚举有界、16 元素对齐的静态 M/N region，且最多覆盖两个 24-core wave。
+单 matmul 候选可使用向后 clamp 的 edge region；这些 region 会确定性地重算重叠边缘，
+而不使用 atomic。多 matmul 候选当前要求精确 uniform region，使每个内部 request 都有一个
+静态可复用 shape。
+
+对于多 matmul 图，sink region 会向后展开成 role-aware request DAG。从
+`[M,K] @ [K,N]` 请求输出 region `[H,W]`，会从 LHS producer 请求 `[H,K]`，从 RHS
+producer 请求 `[K,W]`。完全相同的 producer-region request 会被 memoize。即使 LHS 与
+RHS role 引用同一个逻辑 tensor，它们也保持不同：例如 `A @ A` 需要两个不同的物理
+request，不能当成一个可复用 panel。内部 producer 同时用于两个 role 时也遵循同一规则，
+其 request 会按 role 分别 replay。
+
+planner 对该 request 顺序执行 black-pebbling 风格的 L1 lifetime simulation。内部结果在
+producer request 前分配，存活到最后一个 consumer，然后释放。在多个 request site 上
+具有相同 tensor、role、请求 region 和 axis binding 的 boundary panel 总是只 load 一次，
+并从首次使用保留到最后使用。当前尚不枚举“驱逐后重载”兼容 resident boundary 的方案。
+另外，当完整 lifetime 可放入 L1 且能消除重复 GM-to-L1 load 时，一个 matmul request 可在
+多个串行 output-child tile 间保留其 LHS 或 RHS panel。
+
+对每个可行的外层候选，`ChooseL0Tile` 评估现有 Ascend 910B
+L1-to-L0/Matrix/FIXPIPE 模型。Cube AutoTile 不复制或替换该低层 planner。它收敛到
+L0 chooser 对初始化 K window、累加 window 和串行 tail 都原样接受的 child dimension。
+这个 fixed-point check 是 model-to-emitter 契约：外层 planner 计价的 descriptor 会在之后
+由 `AutoTileMatmulL0` 原样 replay。
+
+一个 matmul request 的模型为：
 
 ```text
-per_task = GM_to_L1(lhs_region + rhs_region) + L0_matmul
-wall     = ceil(work_units / 24) * per_task
+request = retained_preload
+        + output_children * (
+              first_GM_to_L1 + first_L0_work
+            + rolled_K_window_pipeline
+            + serial_K_tail
+            + final_FIXPIPE_drain)
+
+serial_DAG_task = sum(requests in producer-before-consumer order)
+serial_DAG_wall = ceil(spatial_work_units / 24) * serial_DAG_task
 ```
 
-GM-to-L1 项使用由 PTO-ISA 实测支撑的 910B request 带宽。由于初始 emitter 尚未构造
-外层 K-window pipeline，因此不会假定 GM-to-L1/Matrix overlap。选中的
-`CubeSchedulePlan` 记录空间策略、静态 region、work unit、精确 L1 峰值、GM-to-L1
-总字节数、child L0 descriptor 和分项/model cycle。emitter 验证覆盖关系，并将 descriptor
-重放为一个 SPMD AIC body：两个操作数 slice、一个 tensor matmul 和一个输出 assemble。
+第一个 K window 初始化一个持久 L0C accumulator。当至少还存在两个 rolled full window 时，
+它们的 GM-to-L1 operand feed 与 L0/Matrix 工作采用两阶段 pipeline；第一个 window 与
+fractal-aligned ragged tail 保持串行。模型只对这个显式发射的 rolled phase 给予 overlap。
+每个 output child 仅在最后一个 K window 后 drain 一次。GM-to-L1 项使用由 PTO-ISA 实测
+支撑的 910B request 带宽。
+
+对一个串行 DAG request，L1 容量会保留独立发射的第一个 window，以及 rolled pipeline
+所有同时存活的 slot。当前两阶段 pipeline 因而最多需要三个 streamed-operand 物理 buffer。
+当具体 lifetime 允许时，`MemoryReuse` 可在之后把 prologue buffer 与一个 rolled slot 合并；
+但 feasibility 与 peak-L1 计价不依赖这个可选的 allocation 优化。反过来，一个 output tile
+的所有初始化、累加和 tail Matrix contribution 都是同一个持久 L0C accumulator 的语义 alias。
+该 alias family 在物理 lifetime reuse 前建立，因此 packing 不会把一个 K reduction 拆到多个
+独立 accumulator 上。
+
+对单 matmul，split-K 使用 `FirstPartialThenAtomic`。一个有序 AIC phase 非 atomic 地写入
+K share 0；第二个 AIC phase 计算 share 1 到 `split_k - 1`，并 atomic-add 到相同输出。
+因此不需要独立的 AIV zero-fill kernel。模型分别计价两个 phase 的 wave 数，并暴露一个
+显式 synchronization 项；当前该项为零，因为 device evidence 不支持可迁移的非零系数。
+
+选中的 `CubeSchedulePlan` 记录 spatial policy、静态 region、request DAG 与执行顺序、
+persistent/transient L1 lifetime、retained panel、精确 GM-to-L1 字节、K-window phase、
+child L0 descriptor、split merge policy、drain 工作和分项/model cycle。emitter 会在 replay
+该 descriptor 前验证覆盖与 identity。串行 DAG 用 `tensor.create_l1` 为每个内部 FP16/BF16
+结果分配空间，将 producer 的 accumulator assemble 到其中，并直接传给后续 request；
+只有 sink 被 store 到 GM。
 
 tensor-to-tile 转换之后，`AutoTileMatmulL0` 仍是 L1-to-L0 tiling 及其局部软件 pipeline
 的唯一所有者。该分层避免外层模型与 emitter 静默选择互相冲突的 L0 算法。
 
-外层 K-window streaming、FirstPartialThenAtomic split-K、带 role-aware resident 输入/中间值
-的串行多 matmul DAG，以及 retained boundary panel 都是后续扩展。在完整的
-plan/memory/traffic descriptor 及匹配 emitter 被移植之前，AutoTile 会拒绝这些情况，而不是
-为无法发射的工作计价。
+Mixed AIC/AIV 图仍不属于该契约。多 matmul split-K、非 uniform 内部 request grid、
+transpose variant，以及显式 resident-versus-reload 搜索属于后续 Cube 扩展。AutoTile 会
+拒绝这些情况，而不是为无法发射的算法计价。
 
 ## 调度报告
 

@@ -231,6 +231,17 @@ remain serial. The model grants overlap only for that explicitly emitted
 rolled phase. Every output child drains exactly once after its final K window.
 The GM-to-L1 term uses the PTO-ISA-grounded 910B request bandwidth.
 
+For a serial-DAG request, L1 capacity reserves the separately emitted first
+window plus every simultaneously live slot of the rolled pipeline. With the
+current two-stage pipeline this is at most three physical streamed-operand
+buffers. `MemoryReuse` may later coalesce the prologue buffer with a rolled
+slot when their concrete lifetimes permit it, but feasibility and peak-L1
+pricing do not depend on that optional allocation optimization. Conversely,
+all initializing, accumulated, and tail Matrix contributions to one output
+tile are semantic aliases of one persistent L0C accumulator. This alias family
+is established before physical lifetime reuse, so packing cannot split one K
+reduction across independent accumulators.
+
 For a single matmul, split-K uses `FirstPartialThenAtomic`. One ordered AIC
 phase writes K share zero non-atomically; a second AIC phase computes shares
 one through `split_k - 1` and atomically adds them into the same output. This

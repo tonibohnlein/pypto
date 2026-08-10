@@ -3196,9 +3196,29 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
     new_body = applier.VisitStmt(new_body);
   }
 
+  // A peeled accumulator IfStmt is also a semantic must-alias boundary. Run
+  // this before lifetime analysis for every planner, so its mutually-exclusive
+  // branch producers, phi result, and downstream loop init enter reuse planning
+  // as one allocation family. Deferring the first coalescing until after
+  // opportunistic reuse lets the packer observe two independent L0C intervals;
+  // a later rewrite can then fix the definitions while stale, already-retyped
+  // uses keep the second buffer (outer K-window matmul_acc corruption).
+  //
+  // The legacy MemoryReuse path repeats this after packing because packing can
+  // introduce fresh carry/phi mismatches. The pre-pass establishes the input
+  // contract; the post-pass is the defensive repair.
+  {
+    TopDownRetargeter acc_coalescer;
+    auto acc_rewrites = acc_coalescer.CoalesceAccumulatorIfPhis(new_body);
+    if (!acc_rewrites.empty()) {
+      RetypeApplier applier(std::move(acc_rewrites));
+      new_body = applier.VisitStmt(new_body);
+    }
+  }
+
   // Under memory_planner=PtoAS or DsaRP the whole MemoryReuse pass is skipped.
-  // DsaRP must therefore run the correctness normalizations from MemoryReuse
-  // Steps 3.75 through 4.5 in the same order. They are not optimizations: when a
+  // DsaRP must therefore run the remaining correctness normalizations from
+  // MemoryReuse Steps 4 through 4.5 in the same order. They are not optimizations: when a
   // peeled accumulator if-phi or
   // loop yields a value living in a different buffer than its iter_arg/return_var,
   // it inserts the `tile.move` that writes the result back into the carry. Without
@@ -3212,18 +3232,11 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
   //
   // PTOAS needs only the ForStmt YieldFixup half: addr-less codegen already
   // re-points a branch-local producer at the if-phi handle. DSA-RP emits
-  // explicit addresses, so it must first coalesce peeled accumulator if-phis,
-  // then materialize both IfStmt and ForStmt fixups, and finally repair bare-Var
+  // explicit addresses, so after the common accumulator-phi coalescing above it
+  // materializes both IfStmt and ForStmt fixups and finally repairs bare-Var
   // identity copies before lifetime analysis and placement.
   const auto* ctx = PassContext::Current();
   if (ctx != nullptr && ctx->GetMemoryPlanner() == MemoryPlanner::DsaRP) {
-    TopDownRetargeter acc_coalescer;
-    auto acc_rewrites = acc_coalescer.CoalesceAccumulatorIfPhis(new_body);
-    if (!acc_rewrites.empty()) {
-      RetypeApplier applier(std::move(acc_rewrites));
-      new_body = applier.VisitStmt(new_body);
-    }
-
     YieldFixupMutator yield_fixup(/*fixup_if_stmts=*/true);
     new_body = yield_fixup.VisitStmt(new_body);
     new_body = NormalizeIdentityCopyBuffersMutator().VisitStmt(new_body);

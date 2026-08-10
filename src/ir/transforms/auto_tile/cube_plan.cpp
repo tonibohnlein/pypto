@@ -102,9 +102,11 @@ utils::L0TileConfig MakeL0Config(const CubeGraph& graph, const CubeHardware& har
   return config;
 }
 
-int64_t PipelinedChunk(int64_t extent, int64_t l1_window, int64_t fractal) {
+int64_t PipelinedChunk(int64_t extent, int64_t l1_window, int64_t fractal,
+                       int64_t physical_stream_buffers = 2) {
   if (extent < 3 * fractal || l1_window < 2 * fractal) return 0;
-  const int64_t limit = std::min(l1_window / 2, extent / 3);
+  if (physical_stream_buffers <= 0) return 0;
+  const int64_t limit = std::min(l1_window / physical_stream_buffers, extent / 3);
   const int64_t aligned = (limit / fractal) * fractal;
   return aligned >= fractal ? aligned : 0;
 }
@@ -345,8 +347,13 @@ std::optional<CubeMatmulSchedule> PlanFixedRequest(const CubeGraph& graph,
     if (l1_window < hardware.fractal) continue;
 
     candidate.k_loop.l1_window_k = l1_window;
+    // A serial-DAG request emits a prologue load for the first K window and a
+    // two-slot rolled pipeline. Lifetime reuse may fold the prologue into one
+    // rolled slot, but that is an optional allocator optimization rather than
+    // an emitter contract. Size the chunk for all three physical buffers so a
+    // feasible plan remains feasible under the actual lowered allocation.
     const int64_t pipelined_chunk =
-        streamed_elements > 0 ? PipelinedChunk(node.k, l1_window, hardware.fractal) : 0;
+        streamed_elements > 0 ? PipelinedChunk(node.k, l1_window, hardware.fractal, 3) : 0;
     if (pipelined_chunk > 0) {
       candidate.k_loop.chunk = pipelined_chunk;
       candidate.k_loop.pipeline_stages = 2;
@@ -475,8 +482,16 @@ std::optional<CubeMatmulSchedule> PlanFixedRequest(const CubeGraph& graph,
 
     const int64_t child_streamed_elements =
         (lhs_cached ? 0 : candidate.output_tile_m) + (rhs_cached ? 0 : candidate.output_tile_n);
-    candidate.peak_transient_l1_bytes = retained_bytes + child_streamed_elements * candidate.k_loop.chunk *
-                                                             operand_bytes * candidate.k_loop.pipeline_stages;
+    // The first K window is emitted outside the rolled software pipeline. A
+    // multi-window request therefore owns one prologue buffer plus one buffer
+    // per live rolled stage. Do not assume MemoryReuse happens to coalesce the
+    // prologue with a stage: that choice depends on the surrounding serial DAG
+    // and previously made lifetime-sharing decisions.
+    const int64_t rolled_chunks = candidate.k_loop.full_chunks - 1;
+    const int64_t stream_buffers =
+        1 + std::min<int64_t>(candidate.k_loop.pipeline_stages, std::max<int64_t>(0, rolled_chunks));
+    candidate.peak_transient_l1_bytes =
+        retained_bytes + child_streamed_elements * candidate.k_loop.chunk * operand_bytes * stream_buffers;
     if (persistent_l1_bytes + candidate.peak_transient_l1_bytes > hardware.l1_bytes) {
       continue;
     }
@@ -492,7 +507,6 @@ std::optional<CubeMatmulSchedule> PlanFixedRequest(const CubeGraph& graph,
                              : L0WorkCycles(view, hardware, candidate.l0_rolled, candidate.output_tile_m,
                                             candidate.output_tile_n, candidate.k_loop.chunk);
     double child_wall = feed_cycles + init_work;
-    const int64_t rolled_chunks = candidate.k_loop.full_chunks - 1;
     if (rolled_chunks > 0) {
       child_wall += KWindowStreamWall(rolled_chunks, candidate.k_loop.pipeline_stages, feed_cycles,
                                       rolled_work, feed_cycles, rolled_work);
