@@ -1557,17 +1557,21 @@ class HazardInputCollector : public IRVisitor {
   }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
-    if (GetTileTypeWithMemRef(op->var_->GetType())) {
-      if (auto call = As<Call>(op->value_)) {
-        // AsVarLike, not As<Var>: an operand may be an enclosing loop's IterArg
-        // — the loop-carry shape of `tile.add(x, c_iter)` / `tile.matmul_acc(
-        // c_iter, ...)`.  IterArg has its own ObjectKind, so As<Var> returns
-        // null there and would drop the operand, and with it the load / tpop
-        // taint the carry brings into the body.
-        std::vector<VarPtr> input_vars;
-        for (const auto& arg : call->args_) {
-          if (auto v = AsVarLike(arg)) input_vars.push_back(v);
-        }
+    if (auto call = As<Call>(op->value_)) {
+      // AsVarLike, not As<Var>: an operand may be an enclosing loop's IterArg
+      // — the loop-carry shape of `tile.add(x, c_iter)` / `tile.matmul_acc(
+      // c_iter, ...)`.  IterArg has its own ObjectKind, so As<Var> returns
+      // null there and would drop the operand, and with it the load / tpop
+      // taint the carry brings into the body.
+      std::vector<VarPtr> input_vars;
+      for (const auto& arg : call->args_) {
+        if (auto v = AsVarLike(arg)) input_vars.push_back(v);
+      }
+      // A cross-core tpop value has a memory space but no locally allocated
+      // MemRef after InitMemRef. Track its SSA identity regardless; the local
+      // writer that consumes it is the allocation the guard constrains.
+      if (IsOp(call, "tile.tpop_from_aic")) MarkTpop(op->var_);
+      if (GetTileTypeWithMemRef(op->var_->GetType())) {
         // load_derived closure: within one traversal defs precede uses, so a
         // view's source is already classified by the time we reach the view;
         // a source that only becomes tainted across a loop back edge is picked
@@ -1582,7 +1586,6 @@ class HazardInputCollector : public IRVisitor {
             }
           }
         }
-        if (IsOp(call, "tile.tpop_from_aic")) MarkTpop(op->var_);
         for (const VarPtr& in : input_vars) {
           if (IsTpop(in)) {
             inputs_.reads_tpop.insert(op->var_.get());
@@ -1667,6 +1670,7 @@ class HazardInputCollector : public IRVisitor {
 // the *physical buffer* it ends up on (following both reuse-map reassignment and
 // VIEW inheritance) and blocks the output from landing there — see the use site.
 using ForbidAliasMap = AllocationForbidAliasMap;
+using ExactOrDisjointAliasMap = AllocationExactOrDisjointMap;
 
 class ForbidAliasCollector : public IRVisitor {
  public:
@@ -1692,7 +1696,13 @@ class ForbidAliasCollector : public IRVisitor {
     if (const auto get_item = As<TupleGetItemExpr>(op->value_)) {
       if (const VarPtr tuple = AsVarLike(get_item->tuple_)) {
         const auto pending = tuple_forbidden_.find(tuple.get());
-        if (pending != tuple_forbidden_.end()) RecordForOutput(op->var_, pending->second);
+        if (pending != tuple_forbidden_.end()) {
+          RecordForOutput(op->var_, pending->second, &forbidden_, &tuple_forbidden_);
+        }
+        const auto exact = tuple_exact_or_disjoint_.find(tuple.get());
+        if (exact != tuple_exact_or_disjoint_.end()) {
+          RecordForOutput(op->var_, exact->second, &exact_or_disjoint_, &tuple_exact_or_disjoint_);
+        }
       }
     }
 
@@ -1701,7 +1711,9 @@ class ForbidAliasCollector : public IRVisitor {
       if (reg.IsRegistered(call->op_->name_)) {
         const auto& entry = reg.GetEntry(call->op_->name_);
         std::vector<VarPtr> forbidden_inputs;
+        std::set<size_t> forbidden_indices;
         auto forbid_arg = [&](size_t i) {
+          forbidden_indices.insert(i);
           if (i < call->args_.size()) {
             if (auto v = AsVarLike(call->args_[i])) forbidden_inputs.push_back(v);
           }
@@ -1726,7 +1738,18 @@ class ForbidAliasCollector : public IRVisitor {
           auto in_t = As<TileType>(call->args_[0]->GetType());
           if (out_t && in_t && out_t->dtype_.GetBit() > in_t->dtype_.GetBit()) forbid_arg(0);
         }
-        RecordForOutput(op->var_, forbidden_inputs);
+        std::vector<VarPtr> exact_or_disjoint_inputs;
+        if (entry.IsInplaceSafe() &&
+            entry.GetExecutionMemoryAccessEvidence() == ExecutionMemoryAccessEvidence::Functional) {
+          for (size_t i = 0; i < call->args_.size(); ++i) {
+            if (forbidden_indices.count(i) != 0) continue;
+            if (auto input = AsVarLike(call->args_[i]); input && As<TileType>(input->GetType())) {
+              exact_or_disjoint_inputs.push_back(std::move(input));
+            }
+          }
+        }
+        RecordForOutput(op->var_, forbidden_inputs, &forbidden_, &tuple_forbidden_);
+        RecordForOutput(op->var_, exact_or_disjoint_inputs, &exact_or_disjoint_, &tuple_exact_or_disjoint_);
         // tile.transpose is registered not_inplace_safe(), so its output is
         // already forbidden from aliasing any input above (pto.ttrans writes
         // dst directly from src on the scalar path — dst == src corrupts).
@@ -1735,24 +1758,29 @@ class ForbidAliasCollector : public IRVisitor {
     IRVisitor::VisitStmt_(op);
   }
 
-  ForbidAliasMap Take() { return std::move(forbidden_); }
+  ForbidAliasMap TakeForbidden() { return std::move(forbidden_); }
+  ExactOrDisjointAliasMap TakeExactOrDisjoint() { return std::move(exact_or_disjoint_); }
 
  private:
-  void RecordForOutput(const VarPtr& output, const std::vector<VarPtr>& forbidden_inputs) {
-    if (!output || forbidden_inputs.empty()) return;
+  void RecordForOutput(const VarPtr& output, const std::vector<VarPtr>& inputs,
+                       std::map<const Var*, std::vector<VarPtr>>* recorded_by_output,
+                       std::map<const Var*, std::vector<VarPtr>>* pending_by_tuple) {
+    if (!output || inputs.empty()) return;
     if (As<TupleType>(output->GetType())) {
-      tuple_forbidden_[output.get()] = forbidden_inputs;
+      (*pending_by_tuple)[output.get()] = inputs;
       return;
     }
     if (!As<TileType>(output->GetType())) return;
     const auto rep_it = member_to_rep_.find(output.get());
     const Var* out_key = rep_it != member_to_rep_.end() ? rep_it->second : output.get();
-    auto& recorded = forbidden_[out_key];
-    recorded.insert(recorded.end(), forbidden_inputs.begin(), forbidden_inputs.end());
+    auto& recorded = (*recorded_by_output)[out_key];
+    recorded.insert(recorded.end(), inputs.begin(), inputs.end());
   }
 
   ForbidAliasMap forbidden_;
+  ExactOrDisjointAliasMap exact_or_disjoint_;
   std::map<const Var*, std::vector<VarPtr>> tuple_forbidden_;
+  std::map<const Var*, std::vector<VarPtr>> tuple_exact_or_disjoint_;
   std::map<const Var*, const Var*> member_to_rep_;  ///< sharing-group member -> representative
 };
 
@@ -3905,6 +3933,7 @@ AllocationConstraintAnalysis AnalyzeAllocationConstraints(const FunctionPtr& fun
   ForbidAliasCollector forbid_collector(lifetimes.var_sharing_groups);
   forbid_collector.VisitStmt(func->body_);
   result.forbid_alias = forbid_collector.TakeForbidden();
+  result.exact_or_disjoint_alias = forbid_collector.TakeExactOrDisjoint();
   return result;
 }
 
@@ -3984,6 +4013,7 @@ AllocationPlan ComputeAllocationPlan(const FunctionPtr& func) {
   ForbidAliasCollector forbid_collector(analysis.var_sharing_groups);
   forbid_collector.VisitStmt(func->body_);
   const ForbidAliasMap forbid_alias = forbid_collector.TakeForbidden();
+  const ExactOrDisjointAliasMap exact_or_disjoint_alias = forbid_collector.TakeExactOrDisjoint();
   // (1) Pipeline double-buffer separations. Export the full requested pipeline
   // intent first: every distinct source stage gets its own residue and remains
   // hard-separated from every other stage in the group. Capacity pressure is
@@ -4088,6 +4118,50 @@ AllocationPlan ComputeAllocationPlan(const FunctionPtr& func) {
     }
   }
 
+  // An in-place-safe operation may reuse a final input exactly, but may not
+  // stagger or contain only part of that input. Keep read/write events separate
+  // for every other same-statement pair.
+  std::set<std::pair<size_t, size_t>> exact_or_disjoint_pairs;
+  for (size_t output = 0; output < intervals.size(); ++output) {
+    const auto candidates = exact_or_disjoint_alias.find(intervals[output].variable.get());
+    if (candidates == exact_or_disjoint_alias.end()) continue;
+    for (const VarPtr& operand : candidates->second) {
+      const auto memref = GetTypeMemRef(operand->GetType());
+      if (!memref.has_value() || !memref.value()) continue;
+      const auto input = base_to_index.find(memref.value()->base_.get());
+      if (input == base_to_index.end() || input->second == output) continue;
+      if (intervals[input->second].memory_space != intervals[output].memory_space ||
+          intervals[input->second].last_use_point != intervals[output].def_point) {
+        continue;
+      }
+      size_t first = input->second;
+      size_t second = output;
+      if (second < first) std::swap(first, second);
+      if (separation_reasons.count({first, second}) != 0) continue;
+      exact_or_disjoint_pairs.emplace(first, second);
+      plan.read_before_write_inputs.insert(input->second);
+    }
+  }
+
+  using BirthKey = std::pair<MemorySpace, int>;
+  std::map<BirthKey, std::vector<size_t>> births;
+  for (size_t index = 0; index < intervals.size(); ++index) {
+    births[{intervals[index].memory_space, intervals[index].def_point}].push_back(index);
+  }
+  for (size_t input : plan.read_before_write_inputs) {
+    const auto born = births.find({intervals[input].memory_space, intervals[input].last_use_point});
+    INTERNAL_CHECK(born != births.end()) << "Missing DSA birth bucket for in-place boundary";
+    for (size_t output : born->second) {
+      if (output == input) continue;
+      size_t first = input;
+      size_t second = output;
+      if (second < first) std::swap(first, second);
+      if (exact_or_disjoint_pairs.count({first, second}) == 0) {
+        add_separation(first, second, AllocationSeparationReason::SemanticNoAlias);
+      }
+    }
+  }
+
   plan.separations.reserve(separation_reasons.size());
   for (const auto& [indices, reasons] : separation_reasons) {
     AllocationSeparation separation;
@@ -4095,6 +4169,10 @@ AllocationPlan ComputeAllocationPlan(const FunctionPtr& func) {
     separation.second = indices.second;
     separation.reasons.assign(reasons.begin(), reasons.end());
     plan.separations.push_back(std::move(separation));
+  }
+  plan.no_partial_overlaps.reserve(exact_or_disjoint_pairs.size());
+  for (const auto& [first, second] : exact_or_disjoint_pairs) {
+    plan.no_partial_overlaps.push_back({first, second});
   }
   return plan;
 }

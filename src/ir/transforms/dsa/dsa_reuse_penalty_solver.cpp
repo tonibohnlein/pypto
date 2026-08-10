@@ -49,6 +49,7 @@ struct SearchSpace {
   std::vector<SearchNode> nodes;
   std::unordered_map<BufferId, size_t> node_by_buffer;
   std::vector<std::set<size_t>> hard_neighbors;
+  std::vector<std::set<size_t>> exact_or_disjoint_neighbors;
   std::map<NodePair, uint64_t> soft_weights;
   std::vector<std::vector<std::pair<size_t, uint64_t>>> soft_neighbors;
 };
@@ -119,6 +120,7 @@ struct WeightedBoundary {
 
   const size_t count = search.nodes.size();
   search.hard_neighbors.resize(count);
+  search.exact_or_disjoint_neighbors.resize(count);
   search.soft_neighbors.resize(count);
 
   for (size_t first = 0; first < count; ++first) {
@@ -136,6 +138,13 @@ struct WeightedBoundary {
     const size_t second = search.node_by_buffer.at(separation.second);
     search.hard_neighbors[first].insert(second);
     search.hard_neighbors[second].insert(first);
+  }
+
+  for (const NoPartialOverlap& relation : problem.no_partial_overlaps) {
+    const size_t first = search.node_by_buffer.at(relation.first);
+    const size_t second = search.node_by_buffer.at(relation.second);
+    search.exact_or_disjoint_neighbors[first].insert(second);
+    search.exact_or_disjoint_neighbors[second].insert(first);
   }
 
   for (const ReusePenalty& penalty : problem.reuse_penalties) {
@@ -228,26 +237,6 @@ struct WeightedBoundary {
   return blocked;
 }
 
-[[nodiscard]] std::optional<uint64_t> LowestFit(uint64_t size, uint64_t alignment,
-                                                std::vector<AddressRange> blocked_ranges) {
-  std::sort(blocked_ranges.begin(), blocked_ranges.end(),
-            [](const AddressRange& first, const AddressRange& second) {
-              return std::tie(first.begin, first.end) < std::tie(second.begin, second.end);
-            });
-
-  std::optional<uint64_t> candidate = AlignUp(0, alignment);
-  if (!candidate) return std::nullopt;
-  for (const AddressRange& blocked : blocked_ranges) {
-    if (blocked.end <= *candidate) continue;
-    if (AddOverflows(*candidate, size)) return std::nullopt;
-    if (blocked.begin >= *candidate + size) break;
-    candidate = AlignUp(blocked.end, alignment);
-    if (!candidate) return std::nullopt;
-  }
-  if (AddOverflows(*candidate, size)) return std::nullopt;
-  return candidate;
-}
-
 [[nodiscard]] std::vector<AddressRange> MergeBlockingRanges(std::vector<AddressRange> ranges) {
   std::sort(ranges.begin(), ranges.end(), [](const AddressRange& first, const AddressRange& second) {
     return std::tie(first.begin, first.end) < std::tie(second.begin, second.end);
@@ -303,6 +292,13 @@ struct WeightedBoundary {
       candidates.insert(offsets[other] + search.nodes[other].size);
     }
   }
+  for (size_t other : search.exact_or_disjoint_neighbors[current]) {
+    if (placed[other] && search.nodes[other].pool == node.pool &&
+        !AddOverflows(offsets[other], search.nodes[other].size)) {
+      candidates.insert(offsets[other]);
+      candidates.insert(offsets[other] + search.nodes[other].size);
+    }
+  }
   for (const auto& [other, weight] : search.soft_neighbors[current]) {
     static_cast<void>(weight);
     if (placed[other] && search.nodes[other].pool == node.pool &&
@@ -317,6 +313,19 @@ struct WeightedBoundary {
     if (offset) aligned.insert(*offset);
   }
   return aligned;
+}
+
+[[nodiscard]] bool RespectsExactOrDisjoint(const SearchSpace& search, const std::vector<bool>& placed,
+                                           const std::vector<uint64_t>& offsets, size_t current,
+                                           uint64_t offset) {
+  const SearchNode& node = search.nodes[current];
+  for (size_t other : search.exact_or_disjoint_neighbors[current]) {
+    if (!placed[other] || search.nodes[other].pool != node.pool) continue;
+    const SearchNode& other_node = search.nodes[other];
+    if (!RangesOverlap(offset, node.size, offsets[other], other_node.size)) continue;
+    if (offset != offsets[other] || node.size != other_node.size) return false;
+  }
+  return true;
 }
 
 [[nodiscard]] DsaSolution BuildSolution(const SearchSpace& search, const std::vector<uint64_t>& offsets) {
@@ -342,13 +351,22 @@ struct WeightedBoundary {
 
   for (size_t current : order) {
     const SearchNode& node = search.nodes[current];
-    const std::optional<uint64_t> offset =
-        LowestFit(node.size, node.alignment, BlockingRanges(problem, search, placed, offsets, current));
     const Pool* pool = pools.at(node.pool);
-    if (!offset || AddOverflows(*offset, node.size) || *offset + node.size > pool->capacity) {
-      return std::nullopt;
+    const std::vector<AddressRange> blocked =
+        MergeBlockingRanges(BlockingRanges(problem, search, placed, offsets, current));
+    std::optional<uint64_t> selected;
+    for (uint64_t offset : CandidateOffsets(problem, search, placed, offsets, current)) {
+      if (AddOverflows(offset, node.size) || offset + node.size > pool->capacity) continue;
+      const uint64_t end = offset + node.size;
+      const bool hard_conflict =
+          std::any_of(blocked.begin(), blocked.end(),
+                      [offset, end](const auto& range) { return range.begin < end && offset < range.end; });
+      if (hard_conflict || !RespectsExactOrDisjoint(search, placed, offsets, current, offset)) continue;
+      selected = offset;
+      break;
     }
-    offsets[current] = *offset;
+    if (!selected) return std::nullopt;
+    offsets[current] = *selected;
     placed[current] = true;
   }
   return BuildSolution(search, offsets);
@@ -385,6 +403,7 @@ struct WeightedBoundary {
         ++blocked_index;
       }
       if (blocked_index < blocked.size() && blocked[blocked_index].begin < candidate_end) continue;
+      if (!RespectsExactOrDisjoint(search, placed, offsets, current, offset)) continue;
 
       while (start_index < soft_starts.size() && soft_starts[start_index].position < candidate_end) {
         started_weight += soft_starts[start_index].weight;
@@ -463,6 +482,9 @@ std::vector<std::string> ValidateProblem(const DsaProblem& problem) {
   for (const Separation& separation : problem.separations) {
     validate_pair(separation.first, separation.second, "separation");
   }
+  for (const NoPartialOverlap& relation : problem.no_partial_overlaps) {
+    validate_pair(relation.first, relation.second, "exact-or-disjoint relation");
+  }
   uint64_t total_penalty_weight = 0;
   for (const ReusePenalty& penalty : problem.reuse_penalties) {
     validate_pair(penalty.first, penalty.second, "reuse penalty");
@@ -522,6 +544,10 @@ std::vector<std::string> ValidateSolution(const DsaProblem& problem, const DsaSo
   for (const Separation& separation : problem.separations) {
     separations.insert(CanonicalBufferPair(separation.first, separation.second));
   }
+  std::set<std::pair<BufferId, BufferId>> exact_or_disjoint;
+  for (const NoPartialOverlap& relation : problem.no_partial_overlaps) {
+    exact_or_disjoint.insert(CanonicalBufferPair(relation.first, relation.second));
+  }
   for (size_t first = 0; first < problem.buffers.size(); ++first) {
     for (size_t second = first + 1; second < problem.buffers.size(); ++second) {
       const Buffer& first_buffer = problem.buffers[first];
@@ -537,6 +563,20 @@ std::vector<std::string> ValidateSolution(const DsaProblem& problem, const DsaSo
         errors.push_back("hard-conflicting buffers " + std::to_string(first_buffer.id) + "," +
                          std::to_string(second_buffer.id) + " overlap in address");
       }
+    }
+  }
+  for (const auto& pair : exact_or_disjoint) {
+    const Buffer* first = buffers.at(pair.first);
+    const Buffer* second = buffers.at(pair.second);
+    const uint64_t* first_offset = solution.Find(pair.first);
+    const uint64_t* second_offset = solution.Find(pair.second);
+    if (first_offset == nullptr || second_offset == nullptr || first->pool != second->pool ||
+        !RangesOverlap(*first_offset, first->size, *second_offset, second->size)) {
+      continue;
+    }
+    if (*first_offset != *second_offset || first->size != second->size) {
+      errors.push_back("exact-or-disjoint buffers " + std::to_string(pair.first) + "," +
+                       std::to_string(pair.second) + " partially overlap in address");
     }
   }
   return errors;

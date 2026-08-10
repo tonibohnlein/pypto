@@ -93,6 +93,30 @@ void TestExplicitHardSeparation() {
           "explicit separation must prevent address reuse");
 }
 
+void TestExactOrDisjointPlacement() {
+  dsa::DsaProblem problem;
+  problem.pools = {{0, 96, {}}};
+  problem.buffers = {
+      {0, 64, 32, 0, {0, 2}},
+      {1, 64, 32, 0, {2, 4}},
+  };
+  problem.no_partial_overlaps = {{0, 1}};
+
+  const dsa::DsaResult result = dsa::CanonicalGreedySolver().Solve(problem);
+  Require(result.status == dsa::SolveStatus::kFeasible && result.solution.has_value(),
+          "exact in-place reuse must fit when disjoint placement does not");
+  const dsa::DsaSolution& solution = RequireSolution(result, "expected solution");
+  Require(OffsetOf(solution, 0) == OffsetOf(solution, 1),
+          "exact-or-disjoint relation must permit identical ranges");
+  Require(dsa::ValidateSolution(problem, solution).empty(),
+          "exact in-place placement must pass independent validation");
+
+  dsa::DsaSolution corrupted = solution;
+  corrupted.offsets[1] = 32;
+  Require(!dsa::ValidateSolution(problem, corrupted).empty(),
+          "independent validation must reject staggered overlap");
+}
+
 void TestWeightedPenaltyAvoidance() {
   dsa::DsaProblem problem;
   problem.pools = {{0, 128, {}}};
@@ -320,6 +344,7 @@ int main() {
     TestFeasiblePackingAndTemporalConflict();
     TestNoFitDoesNotProveInfeasibility();
     TestExplicitHardSeparation();
+    TestExactOrDisjointPlacement();
     TestWeightedPenaltyAvoidance();
     TestCapacityNoFit();
     TestAlignmentAndReservedRanges();

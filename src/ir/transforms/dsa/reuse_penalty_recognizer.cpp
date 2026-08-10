@@ -481,8 +481,9 @@ std::vector<RecognizedReusePenalty> RecognizeReusePenalties(const FunctionPtr& f
 
   std::vector<DsaExecutionLifetime> execution_lifetimes;
   execution_lifetimes.reserve(allocation_plan.intervals.size());
-  for (const LifetimeInterval& lifetime : allocation_plan.intervals) {
-    execution_lifetimes.push_back(ConvertToDsaExecutionLifetime(lifetime));
+  for (size_t index = 0; index < allocation_plan.intervals.size(); ++index) {
+    execution_lifetimes.push_back(ConvertToDsaExecutionLifetime(
+        allocation_plan.intervals[index], allocation_plan.read_before_write_inputs.count(index) != 0));
   }
 
   std::unordered_set<PairKey, PairKeyHash> separated;
@@ -490,13 +491,20 @@ std::vector<RecognizedReusePenalty> RecognizeReusePenalties(const FunctionPtr& f
   for (const AllocationSeparation& separation : allocation_plan.separations) {
     separated.insert(NormalizePair(separation.first, separation.second));
   }
+  std::unordered_set<PairKey, PairKeyHash> same_operation;
+  same_operation.reserve(allocation_plan.no_partial_overlaps.size());
+  for (const AllocationNoPartialOverlap& relation : allocation_plan.no_partial_overlaps) {
+    same_operation.insert(NormalizePair(relation.first, relation.second));
+  }
 
   std::vector<RecognizedReusePenalty> penalties;
   std::unordered_set<PairKey, PairKeyHash> recognized;
   auto emit = [&](size_t first, size_t second) {
     if (first == second) return;
     const PairKey pair = NormalizePair(first, second);
-    if (separated.count(pair) != 0 || !recognized.insert(pair).second) return;
+    if (separated.count(pair) != 0 || same_operation.count(pair) != 0 || !recognized.insert(pair).second) {
+      return;
+    }
     penalties.push_back({pair.first, pair.second, 1});
   };
 
