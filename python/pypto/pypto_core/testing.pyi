@@ -26,6 +26,14 @@ class DsaReusePenaltyEdge(TypedDict):
     second_name: str
     cost: int
 
+class DsaAllocationLifetime(TypedDict):
+    """One normalized product DSA allocation lifetime."""
+
+    name: str
+    size: int
+    begin: int
+    end: int
+
 def raise_value_error(message: str) -> NoReturn:
     """Raise a ValueError from C++ for testing error handling"""
 
@@ -58,6 +66,9 @@ def rethrow_with_message(kind: str, original: str, replacement: str) -> NoReturn
 
 def recognize_dsa_reuse_penalties(function: Function) -> list[DsaReusePenaltyEdge]:
     """Return recognized DSA-RP edges without running placement."""
+
+def get_dsa_allocation_lifetimes(function: Function) -> list[DsaAllocationLifetime]:
+    """Return normalized product DSA allocation lifetimes."""
 
 def try_infer_pipe(call: Call) -> int | None:
     """Return the exact backend pipe for a Call, or None."""
