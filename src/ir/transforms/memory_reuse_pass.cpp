@@ -1831,30 +1831,35 @@ class LifetimeAnalyzer : public IRVisitor {
     loop_scopes_.push_back({loop_start, loop_end});
   }
 
-  /// Resolve a loop carry's init to the variable that actually owns the buffer.
+  /// Resolve a loop carry or return value to the tracked allocation root.
   ///
   /// A nested loop seeds its carry from the *enclosing* loop's IterArg, and an
   /// IterArg is an alias of its own init rather than a definition in its own
   /// right -- like return_vars, iter-args are deliberately absent from
   /// `ordered_defs_` / `var_def_order_`, so they carry no lifetime of their own.
-  /// Walking the carry chain to the first non-IterArg therefore lands on the
-  /// AssignStmt-defined tile whose buffer the whole loop nest shares, which is
-  /// the variable a use of any return_var in that nest has to keep alive.
+  /// Walking IterArg init links and previously registered return-var links lands
+  /// on the AssignStmt-defined tile whose buffer the loop chain shares. This is
+  /// needed both for nested loops and for consecutive update loops.
   ///
   /// Returns nullptr when the chain does not end at a tracked carrier; the
   /// caller then records no mapping, exactly as before.
-  [[nodiscard]] VarPtr ResolveCarryInitCarrier(const ExprPtr& init_value) const {
-    auto var = AsVarLike(init_value);
-    // An init is always defined before its own loop, so the chain is acyclic in
-    // well-formed IR; the visited set bounds it anyway rather than hanging.
+  [[nodiscard]] std::optional<VarPtr> ResolveTrackedAllocationRoot(const ExprPtr& value) const {
+    auto var = AsVarLike(value);
     std::set<const Var*> seen;
-    while (var) {
-      auto iter_arg = As<IterArg>(var);
-      if (!iter_arg) return var;
-      if (!seen.insert(var.get()).second) return nullptr;
-      var = AsVarLike(iter_arg->initValue_);
+    while (var && var_def_order_.count(var) == 0) {
+      INTERNAL_CHECK_SPAN(seen.insert(var.get()).second, var->span_)
+          << "Internal error: cycle in loop return-variable allocation provenance at '" << var->name_hint_
+          << "'";
+      if (auto iter_arg = As<IterArg>(var)) {
+        var = AsVarLike(iter_arg->initValue_);
+        continue;
+      }
+      auto mapped = return_var_to_init_var_.find(var);
+      if (mapped == return_var_to_init_var_.end()) return std::nullopt;
+      var = mapped->second;
     }
-    return nullptr;
+    if (!var || var_def_order_.count(var) == 0) return std::nullopt;
+    return var;
   }
 
   void RegisterReturnVars(const std::vector<IterArgPtr>& iter_args, const std::vector<VarPtr>& return_vars) {
@@ -1868,9 +1873,12 @@ class LifetimeAnalyzer : public IRVisitor {
       // We do NOT register return_vars in ordered_defs_ -- they must not
       // participate in sharing group computation, which would inflate
       // group lifetimes and block unrelated reuse opportunities.
-      auto init_var = ResolveCarryInitCarrier(iter_args[i]->initValue_);
-      if (init_var && var_def_order_.count(init_var)) {
-        return_var_to_init_var_[rv] = init_var;
+      if (auto root = ResolveTrackedAllocationRoot(iter_args[i]->initValue_)) {
+        // Store the canonical root, not merely the immediate loop return.  A
+        // sequence of update loops commonly feeds one loop's return_var into
+        // the next loop.  Keeping a one-hop mapping drops uses of the final
+        // return because intermediate return_vars are deliberately untracked.
+        return_var_to_init_var_[rv] = *root;
       }
     }
   }
@@ -1886,17 +1894,14 @@ class LifetimeAnalyzer : public IRVisitor {
       return;
     }
 
-    // If var is a loop return_var, redirect the use to its initValue var.
+    // If var is a loop return_var, redirect the use through any sequence of
+    // loop returns to the tracked allocation root.
     // YieldFixup will alias the return_var to the initValue's MemRef,
     // so keeping the initValue live prevents premature buffer reuse.
-    auto it = return_var_to_init_var_.find(var);
-    const VarPtr& target = (it != return_var_to_init_var_.end()) ? it->second : var;
-
-    if (!var_def_order_.count(target)) {
-      return;
-    }
+    auto target = ResolveTrackedAllocationRoot(var);
+    if (!target) return;
     // operator[] default-inserts 0 for missing keys; use_order is always >= 0.
-    var_raw_last_use_[target] = std::max(var_raw_last_use_[target], use_order);
+    var_raw_last_use_[*target] = std::max(var_raw_last_use_[*target], use_order);
   }
 
   /**
