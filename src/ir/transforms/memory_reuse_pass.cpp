@@ -1225,10 +1225,36 @@ class LifetimeAnalyzer : public IRVisitor {
       // participate in sharing group computation, which would inflate
       // group lifetimes and block unrelated reuse opportunities.
       auto init_var = As<Var>(iter_args[i]->initValue_);
-      if (init_var && var_def_order_.count(init_var)) {
-        return_var_to_init_var_[rv] = init_var;
+      if (!init_var) continue;
+      if (auto root = ResolveTrackedAllocationRoot(init_var)) {
+        // Store the canonical root, not merely the immediate loop return.  A
+        // sequence of update loops commonly feeds one loop's return_var into
+        // the next loop.  Keeping a one-hop mapping drops uses of the final
+        // return because intermediate return_vars are deliberately untracked.
+        return_var_to_init_var_[rv] = *root;
       }
     }
+  }
+
+  /// Resolve a loop-carried SSA value to the tracked allocation definition
+  /// that owns its MemRef.  Registered mappings already point directly at a
+  /// canonical root, so valid input performs at most one map lookup.  Retain
+  /// the loop for defensive handling of malformed chained entries; a cycle is
+  /// invalid SSA provenance and must fail closed rather than silently shorten
+  /// an allocation lifetime.
+  [[nodiscard]] std::optional<VarPtr> ResolveTrackedAllocationRoot(const VarPtr& var) const {
+    VarPtr current = var;
+    std::set<const Var*> seen;
+    while (current && var_def_order_.count(current) == 0) {
+      INTERNAL_CHECK_SPAN(seen.insert(current.get()).second, current->span_)
+          << "Internal error: cycle in loop return-variable allocation provenance at '" << current->name_hint_
+          << "'";
+      auto it = return_var_to_init_var_.find(current);
+      if (it == return_var_to_init_var_.end()) return std::nullopt;
+      current = it->second;
+    }
+    if (!current || var_def_order_.count(current) == 0) return std::nullopt;
+    return current;
   }
 
   void RecordRawUse(const VarPtr& var, int use_order) {
@@ -1242,17 +1268,14 @@ class LifetimeAnalyzer : public IRVisitor {
       return;
     }
 
-    // If var is a loop return_var, redirect the use to its initValue var.
+    // If var is a loop return_var, redirect the use through any sequence of
+    // loop returns to the tracked allocation root.
     // YieldFixup will alias the return_var to the initValue's MemRef,
     // so keeping the initValue live prevents premature buffer reuse.
-    auto it = return_var_to_init_var_.find(var);
-    const VarPtr& target = (it != return_var_to_init_var_.end()) ? it->second : var;
-
-    if (!var_def_order_.count(target)) {
-      return;
-    }
+    auto target = ResolveTrackedAllocationRoot(var);
+    if (!target) return;
     // operator[] default-inserts 0 for missing keys; use_order is always >= 0.
-    var_raw_last_use_[target] = std::max(var_raw_last_use_[target], use_order);
+    var_raw_last_use_[*target] = std::max(var_raw_last_use_[*target], use_order);
   }
 
   /**
