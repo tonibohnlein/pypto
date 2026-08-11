@@ -1148,7 +1148,7 @@ std::optional<MatmulTiling> AnalyzeMatmul(
         << expected.source_n << ", " << expected.source_k << "] does not match tile.matmul [" << M << ", "
         << N << ", " << K << "]";
     INTERNAL_CHECK_SPAN(expected.bytes_a == bytes_a && expected.bytes_b == bytes_b &&
-                            expected.bytes_c == bytes_c && expected.accumulator_read == is_matmul_acc,
+                            expected.bytes_c == bytes_c && expected.accumulator_read == is_acc,
                         assign->span_)
         << "AutoTileMatmulL0: AutoFuse L0 plan dtype/accumulator contract does not match the tile call";
     INTERNAL_CHECK_SPAN(expected.tile_m == res.m && expected.tile_n == res.n && expected.tile_k == res.k &&
