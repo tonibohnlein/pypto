@@ -2855,11 +2855,13 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   // input (sliced), a BROADCAST external input (each axis is either the full extent OR 1 — the
   // FIXED_1 read-in-full role, §3/A3: `[1,IN]` M-broadcast bias, `[IM,1]` N-broadcast scale / a
   // reduced-axis stat), or a scalar. Any OTHER 2D shape is not a clean broadcast -> out of scope.
+  bool has_column_broadcast = false;
   for (const auto& a : ops)
     for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
+      const auto [aM, aN] = scheduled_shape(arg->GetType());
+      if (aM >= 0 && aN == 1 && IN > 1) has_column_broadcast = true;
       auto v = AsVarLike(arg);
       if (v != nullptr && defined.count(v.get()) != 0) continue;
-      const auto [aM, aN] = scheduled_shape(arg->GetType());
       if (aM < 0) {
         // Static2DShape returns {-1,-1} for a true scalar AND for a non-2D / dynamic-shape
         // TENSOR alike. Only the former (a non-tensor operand — e.g. a broadcast scale) is
@@ -3064,10 +3066,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   // axes (AlignUp(x,g)==x), so aligned shapes emit the 3-arg slice byte-identically to before.
   const int64_t h_al = AlignUp(h, g), w_al = AlignUp(w, g);
   // slice_input: slice ONE 2D external input `arg` to a [sh, sw] VALID region at (smi, sni),
-  // granule-padding the ALLOCATED extent (the row axis padded only for a reduction/col-major tile —
-  // see the layout note in emit_strip). A singleton axis stays [1] only when it is a graph-relative
-  // broadcast or a reduction result's collapsed axis. A full-frame singleton still receives the
-  // physical DMA frame required by its layout. Pushes the slice assign to `out` (named
+  // granule-padding the ALLOCATED extent (the row axis padded for a reduction or column-broadcast
+  // col-major tile — see the layout note in emit_strip). A singleton axis stays [1] only when it is
+  // a graph-relative broadcast or a reduction result's collapsed axis. A full-frame singleton still
+  // receives the physical DMA frame required by its layout. Pushes the slice assign to `out` (named
   // base+"_in"+slot so
   // distinct inputs never collapse) and returns its Var. Factored out of emit_strip so the P4 pass-0
   // online-stats body can DMA a chunk's x-slice EXACTLY ONCE — the io_in*=2 (A7 stream_passes=2)
@@ -3076,7 +3078,6 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   auto slice_input = [&](const ExprPtr& arg, int64_t sh, int64_t sw, const ExprPtr& smi, const ExprPtr& sni,
                          std::vector<StmtPtr>& out, int slot) -> VarPtr {
     const auto [aM, aN] = scheduled_shape(arg->GetType());
-    const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
     const int64_t sw_al = AlignUp(sw, g);
     const bool bcast_m = aM == 1 && IM > 1;
     const bool bcast_n = aN == 1 && IN > 1;
@@ -3084,7 +3085,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
     const bool thin_reduction_n = aN == 1 && pin_n;
     const int64_t rext = bcast_m ? 1 : sh;
     const int64_t cext = bcast_n ? 1 : sw;
-    const int64_t rext_al = has_reduction && !bcast_m && !thin_reduction_m ? sh_al : rext;
+    const int64_t rext_al =
+        (has_reduction || has_column_broadcast) && !bcast_m && !thin_reduction_m ? AlignUp(sh, g) : rext;
     const int64_t cext_al = !bcast_n && !thin_reduction_n ? sw_al : cext;
     // Every statically singleton source starts at zero. Broadcast classification
     // controls physical padding; it need not make a provably-zero offset dynamic.

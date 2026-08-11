@@ -903,6 +903,60 @@ class AutoFuseSingletonReductionCase(PTOTestCase):
         tensors["out"][:] = torch.exp(tensors["x"]).sum(dim=dim, keepdim=True)
 
 
+class AutoFuseSingletonBroadcastCase(PTOTestCase):
+    """Keep the broadcast axis thin while aligning its orthogonal physical frame."""
+
+    __test__ = False
+
+    def __init__(self, orientation: str, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        assert orientation in {"row", "column"}
+        self.orientation = orientation
+
+    def get_name(self) -> str:
+        return f"autofuse_singleton_{self.orientation}_broadcast"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        bias_shape = [1, 256] if self.orientation == "row" else [64, 1]
+        return [
+            TensorSpec("x", [64, 256], DataType.FP32, init_value=torch.randn),
+            TensorSpec("bias", bias_shape, DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [64, 256], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        if self.orientation == "row":
+
+            @pl.program
+            class Row:
+                @pl.function(attrs={"auto_fuse": True})
+                def add(
+                    self,
+                    x: pl.Tensor[[64, 256], pl.FP32],
+                    bias: pl.Tensor[[1, 256], pl.FP32],
+                ) -> pl.Tensor[[64, 256], pl.FP32]:
+                    out: pl.Tensor[[64, 256], pl.FP32] = pl.add(x, bias)
+                    return out
+
+            return Row
+
+        @pl.program
+        class Column:
+            @pl.function(attrs={"auto_fuse": True})
+            def add(
+                self,
+                x: pl.Tensor[[64, 256], pl.FP32],
+                bias: pl.Tensor[[64, 1], pl.FP32],
+            ) -> pl.Tensor[[64, 256], pl.FP32]:
+                out: pl.Tensor[[64, 256], pl.FP32] = pl.add(x, bias)
+                return out
+
+        return Column
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = tensors["x"] + tensors["bias"]
+
+
 class AutoFuseForkCase(PTOTestCase):
     """Multi-sink fork [256,256] -> (a, b): a=(x+1)*2, b=(x+1)*3 share the intermediate c=x+1.
     Two live-outs in one fused group, each assembled to its own output; validates the
@@ -2227,6 +2281,16 @@ class TestAutoFuseDevice:
         monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
         result = test_runner.run(AutoFuseSingletonReductionCase(orientation, platform=platform))
         assert result.passed, f"AutoFuse singleton-{orientation} reduction failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.parametrize("orientation", ["row", "column"])
+    def test_autofuse_singleton_broadcast_generated_kernel(
+        self, test_runner, platform, orientation, monkeypatch
+    ):
+        """Catch PTOAS layout failures that plan-only broadcast tests cannot observe."""
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFuseSingletonBroadcastCase(orientation, platform=platform))
+        assert result.passed, f"AutoFuse singleton-{orientation} broadcast failed: {result.error}"
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_autofuse_fork(self, test_runner, platform):

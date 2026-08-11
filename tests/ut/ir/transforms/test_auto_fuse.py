@@ -2573,20 +2573,36 @@ class TestAutoFuse:
         class BiasSlice(ir.IRVisitor):
             def __init__(self):
                 super().__init__()
-                self.shapes = []
+                self.frames = []
 
             def visit_call(self, op):
                 if op.op.name == tensor_slice_op.name and isinstance(op.args[0], ir.Var):
                     source = op.args[0]
                     if source.name_hint.startswith("bias"):
-                        self.shapes.append(tuple(dim.value for dim in op.type.shape))
+                        valid_shape = (
+                            op.type.tensor_view.valid_shape
+                            if op.type.tensor_view is not None and op.type.tensor_view.valid_shape
+                            else op.type.shape
+                        )
+                        self.frames.append(
+                            (
+                                tuple(dim.value for dim in op.type.shape),
+                                tuple(dim.value for dim in valid_shape),
+                            )
+                        )
                 super().visit_call(op)
 
         slices = BiasSlice()
         slices.visit_program(planned)
-        assert slices.shapes
-        assert all(shape[singleton_axis] == 1 for shape in slices.shapes)
-        assert all(shape[1 - singleton_axis] <= bias_shape[1 - singleton_axis] for shape in slices.shapes)
+        assert slices.frames
+        assert all(
+            physical[singleton_axis] == valid[singleton_axis] == 1 for physical, valid in slices.frames
+        )
+        assert all(
+            physical[1 - singleton_axis] >= valid[1 - singleton_axis] > 0 for physical, valid in slices.frames
+        )
+        if singleton_axis == 1:
+            assert all(physical[0] % 8 == 0 for physical, _ in slices.frames)
 
     def test_vector_dtype_admission_does_not_reject_bf16_cube(self, ascend_backend):
         """BF16 arithmetic is vector-only negative; BF16 matmul remains supported."""
