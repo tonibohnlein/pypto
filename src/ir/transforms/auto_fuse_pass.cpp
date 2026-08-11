@@ -5203,6 +5203,266 @@ std::optional<std::vector<StmtPtr>> EmitDenseSwiGluMlpGroup(
   return std::vector<StmtPtr>{output_assign, scope};
 }
 
+// Replay a capability-defined C->V->C schedule from the unified mixed plan.
+// The vector stage is not recognized as attention, softmax, or another named
+// algorithm: it is the planned connected vector DAG in source topological
+// order.  Both cube stages use the propagated rectangular requests recorded by
+// MixedSchedulePlan, and the two crossing FIFOs retain those shapes verbatim.
+std::optional<std::vector<StmtPtr>> EmitGenericSingleRoundTripGroup(
+    const std::vector<StmtPtr>& members, const std::unordered_map<const Stmt*, size_t>& stmt_op,
+    const std::unordered_set<const Var*>& required_live_outs, const SolverTile& tile,
+    const std::string& name) {
+  const ::MixedSchedulePlan& plan = tile.mixed_schedule;
+  auto decline = [&](const std::string& reason) {
+    LOG_INFO << "AutoFuse[mixed-roundtrip-plan]: group '" << name << "' decline — " << reason;
+    return std::optional<std::vector<StmtPtr>>{};
+  };
+  if (!plan.feasible || !plan.emit_compatible || !plan.topology ||
+      plan.algorithm != ::MixedAlgorithmKind::Generic ||
+      plan.protocol != ::MixedCrossCoreProtocol::SingleRoundTripBundle ||
+      plan.mode != ::MixedPipelineMode::SingleRoundTripSkew ||
+      !plan.topology->protocol.skew_pass_compatible || plan.topology->stages.size() != 3 ||
+      plan.topology->transfers.size() != 2 || plan.topology->stages[0].engine != ::MixedEngine::Cube ||
+      plan.topology->stages[1].engine != ::MixedEngine::Vector ||
+      plan.topology->stages[2].engine != ::MixedEngine::Cube || plan.topology->stages[0].ops.size() != 1 ||
+      plan.topology->stages[2].ops.size() != 1 || plan.stages.size() != 3) {
+    return decline("not the generic single-round-trip C->V->C topology");
+  }
+  if (plan.split_k != 1 || plan.vector_split != ::MixedVectorSplit::Rows || plan.vector_lanes != 2 ||
+      plan.fifos.size() != 2 || plan.loop.axis != ::MixedPipelineAxis::SpatialRegion ||
+      plan.loop.items_per_spatial_tile != 1 || plan.loop.pipeline_stages != 3 ||
+      plan.loop.requested_skew_depth != 2 || plan.loop.work_items != plan.spatial_tiles ||
+      plan.loop.active_groups <= 0 || plan.loop.max_trips_per_group <= 0 ||
+      plan.loop.min_trips_per_group != plan.loop.max_trips_per_group ||
+      plan.loop.work_items != plan.loop.active_groups * plan.loop.max_trips_per_group ||
+      plan.m_partition.num_big != 0 || plan.n_partition.num_big != 0 || plan.m_partition.parts <= 0 ||
+      plan.n_partition.parts <= 0 || plan.m_partition.big <= 0 || plan.m_partition.big % 2 != 0 ||
+      plan.n_partition.big <= 0 || plan.spatial_tiles != plan.m_partition.parts * plan.n_partition.parts) {
+    return decline("round-trip grid, loop, or two-lane descriptor is inconsistent");
+  }
+  if (plan.model_overlap_granted != plan.overlap_implementable) {
+    return decline("model and emitter disagree about single-round-trip overlap");
+  }
+  for (size_t index = 0; index < plan.fifos.size(); ++index) {
+    const ::MixedFifoPlan& fifo = plan.fifos[index];
+    const ::MixedTransferDirection expected =
+        index == 0 ? ::MixedTransferDirection::CubeToVector : ::MixedTransferDirection::VectorToCube;
+    if (fifo.direction != expected || fifo.pipe_id != static_cast<int>(index) ||
+        fifo.bundle != static_cast<int>(index) || fifo.slot_count != 4 ||
+        fifo.valid_rows != plan.m_partition.big || fifo.valid_cols <= 0 || fifo.slot_bytes <= 0 ||
+        fifo.reserved_bytes != fifo.slot_bytes * fifo.slot_count) {
+      return decline("FIFO records do not preserve the propagated crossing regions");
+    }
+  }
+  if (plan.fifos[0].valid_rows != plan.fifos[1].valid_rows ||
+      plan.fifos[0].valid_cols != plan.fifos[1].valid_cols ||
+      plan.vector_stage_kind != ::VectorStreamKind::Materialized || plan.vector_stage_peak_ub_bytes <= 0 ||
+      plan.vector_stage_peak_ub_bytes + plan.fifos[0].reserved_bytes + plan.fifos[1].reserved_bytes >
+          ReadHwParams().vec_capacity) {
+    return decline("vector peer is not one materialized propagated crossing");
+  }
+
+  std::unordered_map<size_t, AssignStmtPtr> by_op;
+  for (const StmtPtr& stmt : members) {
+    auto op = stmt_op.find(stmt.get());
+    auto assign = As<AssignStmt>(stmt);
+    if (op == stmt_op.end() || !assign || !As<Call>(assign->value_)) {
+      return decline("group contains a non-call assignment");
+    }
+    by_op.emplace(op->second, assign);
+  }
+  auto source = [&](size_t op) -> AssignStmtPtr {
+    const auto it = by_op.find(op);
+    return it == by_op.end() ? nullptr : it->second;
+  };
+  const AssignStmtPtr first_assign = source(plan.topology->stages[0].ops.front());
+  const AssignStmtPtr sink_assign = source(plan.topology->stages[2].ops.front());
+  if (!first_assign || !sink_assign) return decline("planned cube stage has no source statement");
+  const CallPtr first = As<Call>(first_assign->value_);
+  const CallPtr sink = As<Call>(sink_assign->value_);
+  auto default_matmul = [](const CallPtr& call) {
+    return call && IsOp(call, "tensor.matmul") && call->args_.size() == 2 &&
+           !call->GetKwarg<bool>("a_trans", false) && !call->GetKwarg<bool>("b_trans", false) &&
+           !call->GetKwarg<bool>("c_matrix_nz", false);
+  };
+  if (!default_matmul(first) || !default_matmul(sink)) {
+    return decline("generic round trip requires two default-orientation matmuls");
+  }
+
+  const auto [M, D] = Static2DShape(first->args_[0]->GetType());
+  const auto [first_d, S] = Static2DShape(first->args_[1]->GetType());
+  const auto [score_m, score_s] = Static2DShape(first_assign->var_->GetType());
+  const auto [sink_s, N] = Static2DShape(sink->args_[1]->GetType());
+  const auto [out_m, out_n] = Static2DShape(sink_assign->var_->GetType());
+  auto first_lhs_type = AsTensorTypeLike(first->args_[0]->GetType());
+  auto first_rhs_type = AsTensorTypeLike(first->args_[1]->GetType());
+  auto score_type = As<TensorType>(first_assign->var_->GetType());
+  auto sink_rhs_type = AsTensorTypeLike(sink->args_[1]->GetType());
+  auto output_type = As<TensorType>(sink_assign->var_->GetType());
+  if (M <= 0 || D <= 0 || S <= 0 || N <= 0 || first_d != D || score_m != M || score_s != S || sink_s != S ||
+      out_m != M || out_n != N || M != plan.m_partition.parts * plan.m_partition.big ||
+      N != plan.n_partition.parts * plan.n_partition.big || !first_lhs_type || !first_rhs_type ||
+      !score_type || !sink_rhs_type || !output_type || first_lhs_type->dtype_ != DataType::FP32 ||
+      first_rhs_type->dtype_ != DataType::FP32 || score_type->dtype_ != DataType::FP32 ||
+      sink_rhs_type->dtype_ != DataType::FP32 || output_type->dtype_ != DataType::FP32 ||
+      plan.fifos[0].valid_cols != S || plan.fifos[1].valid_cols != S) {
+    return decline("cube shapes/dtypes do not match the propagated C->V->C plan");
+  }
+
+  auto sink_lhs = AsVarLike(sink->args_[0]);
+  if (!sink_lhs) return decline("sink matmul reply is not an SSA tensor");
+  std::vector<AssignStmtPtr> vector_ops;
+  vector_ops.reserve(plan.topology->stages[1].ops.size());
+  for (size_t op : plan.topology->stages[1].ops) {
+    const AssignStmtPtr assign = source(op);
+    if (!assign) return decline("planned vector op has no source statement");
+    const CallPtr call = As<Call>(assign->value_);
+    const ::VectorOpCapability capability = DescribeVectorOp(call).capability;
+    if (!call || (capability != ::VectorOpCapability::Elementwise &&
+                  capability != ::VectorOpCapability::ReductionSum &&
+                  capability != ::VectorOpCapability::ReductionMax)) {
+      return decline("vector peer contains an unsupported operation");
+    }
+    if (required_live_outs.count(assign->var_.get()) != 0 && assign->var_.get() != sink_lhs.get()) {
+      return decline("an intermediate vector value escapes the mixed group");
+    }
+    vector_ops.push_back(assign);
+  }
+  if (vector_ops.empty() || vector_ops.back()->var_.get() != sink_lhs.get()) {
+    return decline("vector peer reply does not feed the sink matmul");
+  }
+
+  const Span sp = members.front()->span_;
+  auto& registry = OpRegistry::GetInstance();
+  auto index_type = std::make_shared<ScalarType>(DataType::INDEX);
+  auto output_create = registry.Create("tensor.create", {MakeIndexTuple({M, N}, sp)},
+                                       {{"dtype", DataType::FP32}, {"layout", TensorLayout::ND}}, sp);
+  auto output =
+      std::make_shared<Var>(sink_assign->var_->name_hint_ + "_mixed_out", output_create->GetType(), sp);
+  auto output_assign = std::make_shared<AssignStmt>(output, output_create, sp);
+
+  const int64_t rows = plan.m_partition.big;
+  const int64_t cols = plan.n_partition.big;
+  const int64_t trips = plan.loop.max_trips_per_group;
+  auto block = std::make_shared<Var>(name + "_group", index_type, sp);
+  auto trip = std::make_shared<Var>(name + "_trip", index_type, sp);
+  ExprPtr item = MakeAdd(MakeMul(block, MakeIndex(trips, sp), sp), trip, sp);
+  ExprPtr mi =
+      MakeMul(MakeFloorDiv(item, MakeIndex(plan.n_partition.parts, sp), sp), MakeIndex(rows, sp), sp);
+  ExprPtr ni =
+      MakeMul(MakeFloorMod(item, MakeIndex(plan.n_partition.parts, sp), sp), MakeIndex(cols, sp), sp);
+  auto output_iter = std::make_shared<IterArg>(sink_assign->var_->name_hint_ + "_mixed_state",
+                                               output->GetType(), output, sp);
+
+  auto score_tile_type = std::make_shared<TensorType>(
+      std::vector<ExprPtr>{MakeIndex(rows, sp), MakeIndex(S, sp)}, DataType::FP32);
+  auto score_tile =
+      std::make_shared<Var>(first_assign->var_->name_hint_ + "_mixed_tile", score_tile_type, sp);
+  std::vector<StmtPtr> loop_body;
+  const int64_t first_window =
+      plan.stages[0].cube_window_k.empty() || plan.stages[0].cube_window_k.front() <= 0
+          ? D
+          : plan.stages[0].cube_window_k.front();
+  const int first_stages = D / std::max<int64_t>(1, first_window) >= 3 ? 2 : 1;
+  for (StmtPtr& stmt : BuildTileMatmulAt(first->args_[0], first->args_[1], mi, MakeIndex(0, sp),
+                                         MakeIndex(0, sp), MakeIndex(0, sp), rows, S, D, first_window,
+                                         DataType::FP32, score_tile, name + "_producer", sp, first_stages)) {
+    loop_body.push_back(std::move(stmt));
+  }
+
+  std::unordered_map<const Var*, VarPtr> values;
+  values.emplace(first_assign->var_.get(), score_tile);
+  std::unordered_map<const Var*, VarPtr> slices;
+  VarPtr reply;
+  for (const AssignStmtPtr& assign : vector_ops) {
+    const CallPtr call = As<Call>(assign->value_);
+    std::vector<ExprPtr> args;
+    args.reserve(call->args_.size());
+    for (const ExprPtr& arg : call->args_) {
+      auto var = AsVarLike(arg);
+      if (var) {
+        const auto value = values.find(var.get());
+        if (value != values.end()) {
+          args.push_back(value->second);
+          continue;
+        }
+      }
+      const auto [arg_m, arg_s] = Static2DShape(arg->GetType());
+      if (arg_m < 0) {
+        args.push_back(arg);
+        continue;
+      }
+      if (var) {
+        const auto cached = slices.find(var.get());
+        if (cached != slices.end()) {
+          args.push_back(cached->second);
+          continue;
+        }
+      }
+      if (!((arg_m == 1 || arg_m == M) && (arg_s == 1 || arg_s == S))) {
+        return decline("external vector operand does not follow the propagated score region");
+      }
+      const int64_t slice_m = arg_m == 1 ? 1 : rows;
+      const int64_t slice_s = arg_s == 1 ? 1 : S;
+      ExprPtr row = arg_m == 1 ? MakeIndex(0, sp) : mi;
+      auto slice = registry.Create(
+          "tensor.slice",
+          {arg, MakeIndexTuple({slice_m, slice_s}, sp), MakeTuple2(row, MakeIndex(0, sp), sp)}, sp);
+      auto sliced = std::make_shared<Var>(assign->var_->name_hint_ + "_mixed_in", slice->GetType(), sp);
+      loop_body.push_back(std::make_shared<AssignStmt>(sliced, slice, sp));
+      if (var) slices.emplace(var.get(), sliced);
+      args.push_back(sliced);
+    }
+    auto replay = registry.Create(call->op_->name_, args, call->kwargs_, sp);
+    reply = std::make_shared<Var>(assign->var_->name_hint_ + "_mixed_tile", replay->GetType(), sp);
+    loop_body.push_back(std::make_shared<AssignStmt>(reply, replay, sp));
+    values.emplace(assign->var_.get(), reply);
+  }
+  if (!reply || Static2DShape(reply->GetType()) != std::pair<int64_t, int64_t>{rows, S}) {
+    return decline("materialized vector reply does not preserve the sink contraction frame");
+  }
+
+  auto result_tile_type = std::make_shared<TensorType>(
+      std::vector<ExprPtr>{MakeIndex(rows, sp), MakeIndex(cols, sp)}, DataType::FP32);
+  auto result_tile =
+      std::make_shared<Var>(sink_assign->var_->name_hint_ + "_mixed_tile", result_tile_type, sp);
+  const int64_t sink_window =
+      plan.stages[2].cube_window_k.empty() || plan.stages[2].cube_window_k.front() <= 0
+          ? S
+          : plan.stages[2].cube_window_k.front();
+  const int sink_stages = S / std::max<int64_t>(1, sink_window) >= 3 ? 2 : 1;
+  for (StmtPtr& stmt : BuildTileMatmulAt(reply, sink->args_[1], MakeIndex(0, sp), MakeIndex(0, sp),
+                                         MakeIndex(0, sp), ni, rows, cols, S, sink_window, DataType::FP32,
+                                         result_tile, name + "_sink", sp, sink_stages)) {
+    loop_body.push_back(std::move(stmt));
+  }
+
+  auto assemble =
+      registry.Create("tensor.assemble", {ExprPtr(output_iter), result_tile, MakeTuple2(mi, ni, sp)}, sp);
+  auto next = std::make_shared<Var>(sink_assign->var_->name_hint_ + "_mixed_next", assemble->GetType(), sp);
+  loop_body.push_back(std::make_shared<AssignStmt>(next, assemble, sp));
+  loop_body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{next}, sp));
+
+  auto item_loop = std::make_shared<ForStmt>(
+      trip, MakeIndex(0, sp), MakeIndex(trips, sp), MakeIndex(1, sp), std::vector<IterArgPtr>{output_iter},
+      SeqStmts::Flatten(std::move(loop_body), sp), std::vector<VarPtr>{sink_assign->var_}, sp,
+      ForKind::Pipeline,
+      std::vector<std::pair<std::string, std::any>>{{kPipelineStagesAttr, plan.loop.pipeline_stages}});
+  std::vector<StmtPtr> kernel_body{
+      std::make_shared<AssignStmt>(block, registry.Create("tile.get_block_idx", {}, sp), sp), item_loop};
+  auto kernel = std::make_shared<InCoreScopeStmt>(
+      SplitMode::UpDown, name, SeqStmts::Flatten(std::move(kernel_body), sp), sp, std::vector<std::string>{},
+      std::vector<std::pair<std::string, std::any>>{
+          {"slot_num", static_cast<int>(plan.fifos.front().slot_count)},
+          {kAutoFuseMixedFifoPlanAttr, EncodeMixedFifoContract(plan, sp)}});
+  auto scope = std::make_shared<SpmdScopeStmt>(MakeIndex(plan.loop.active_groups, sp), /*sync_start=*/false,
+                                               name + "_spmd", kernel, sp);
+  LOG_INFO << "AutoFuse[mixed-roundtrip-plan]: group '" << name
+           << "' emitted generic C->V->C grid=" << plan.m_partition.parts << "x" << plan.n_partition.parts
+           << " groups=" << plan.loop.active_groups << " trips=" << trips << " crossing=" << rows << "x" << S;
+  return std::vector<StmtPtr>{output_assign, scope};
+}
+
 // Replay the first buildable mixed schedule: one standard matmul followed by a
 // linear elementwise epilogue.  The outer launch owns `active_groups` physical
 // 910B clusters; every cluster runs a fixed inner loop over its successor
@@ -5221,6 +5481,10 @@ std::optional<std::vector<StmtPtr>> EmitMixedScheduleGroup(
   };
   if (plan.algorithm == ::MixedAlgorithmKind::DenseSwiGluMlp) {
     return EmitDenseSwiGluMlpGroup(members, stmt_op, required_live_outs, tile, name);
+  }
+  if (plan.algorithm == ::MixedAlgorithmKind::Generic &&
+      plan.protocol == ::MixedCrossCoreProtocol::SingleRoundTripBundle) {
+    return EmitGenericSingleRoundTripGroup(members, stmt_op, required_live_outs, tile, name);
   }
   if (!plan.feasible || !plan.emit_compatible || !plan.topology || plan.mode != ::MixedPipelineMode::OneWay ||
       plan.topology->stages.size() != 2 || plan.topology->transfers.size() != 1 ||

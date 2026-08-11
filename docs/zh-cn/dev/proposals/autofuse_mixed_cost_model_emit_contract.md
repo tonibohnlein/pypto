@@ -1,7 +1,8 @@
 # AutoFuse 混合 Cube/Vector 调度契约
 
-**状态：** 可构建的 `C->V` 增量以及第一个精确的
-`C,C->V->C` dense-SwiGLU 增量已在 `PYPTO_AUTOFUSE_MIXED=1` 后实现。
+**状态：** 可构建的 `C->V` 增量、按能力准入的物化 `C->V->C` 增量，以及
+第一个精确的 `C,C->V->C` dense-SwiGLU 增量已在
+`PYPTO_AUTOFUSE_MIXED=1` 后实现。
 显式 dual-AIV FIFO lane bridge 按函数限定作用域、感知 pipe descriptor，并且字节精确：
 它只改写目标 AIV 函数，给仅使用 pipe 的 AIV 函数增加一个私有 runtime lane
 参数，并根据每个 pipe 端点自身的 tile 形状和 dtype 派生 entry offset。frontend
@@ -23,6 +24,10 @@ tensor 级等价性以及完整的
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` 结构。各引擎内部
 的工作继续以同构 vector/cube 契约为准；本文只定义引擎边界处新增的契约。
 
+通用单次往返增量目前只完成 host 闭环，尚未完成 silicon 闭环。首个支持面是两个
+默认方向的 FP32 matmul，中间连接按行局部、物化的 vector DAG；准入由拓扑、形状、
+dtype、容量和单次往返协议决定，不识别 QK、softmax、PV、attention 或其他命名算法。
+
 ## 1. 硬件与执行模型
 
 Ascend 910B 没有直接的 UB 到 Mat/L1 通路。AIC 与 AIV 之间的张量由生产者写
@@ -38,7 +43,29 @@ group g = AIC g + AIV 2*g, 2*g+1
 空间工作分给各组，vector 阶段的行再分给两个 AIV lane。每个 mixed 解同时描述
 组网格以及组内流水项循环；仅有多个全局 tile 并不能证明同一组存在可重叠的后继项。
 
-## 2. MixedSchedulePlan
+## 2. 一个统一的子图计划
+
+mixed planner 不会先独立规划多个同构 stage，再把这些 kernel 拼装在一起。一个
+候选是一个连通 tensor DAG 和一个统一 group schedule：
+
+1. 为 group 的边界输出选择一个共同空间网格；
+2. 从输出 region 反向传播经过 pointwise、reduction 和 matmul 边，得到每个 tensor
+   的请求 region；
+3. 按一个确定性的拓扑/pebbling 顺序执行 region DAG；
+4. 将输入与中间值的生命周期延长到最后一次使用，并检查组合后的 L1、L0 与 UB
+   工作集；
+5. 对同一 region 的计算、边界流量、crossing 流量及串行/重叠阶段计价；
+6. 发射完全相同的网格、顺序、region、生命周期、FIFO crossing 与循环。
+
+下文的最大同引擎 stage 只是统一解内部的执行元数据，用于选择同构代价公式和
+PyPTO pipeline 工具；它们不是具有独立网格、单独搜索的 kernel。stage-local
+homogeneous plan 是固定 group 候选的派生视图。
+
+例如在 `C->V->C` 中，每个最终 `[M_tile,N_tile]` 输出 region 可能需要第一个 matmul
+生成 `[M_tile,S]` crossing。若 `N` 被切分，该 crossing 的重算/重载次数与存活形状
+都由反向 region 传播决定，而不是由独立最优的 QK 或 softmax 网格决定。
+
+## 3. MixedSchedulePlan
 
 候选无关的最大同引擎 stage 与跨引擎 transfer 在子图创建时只分析一次。获胜或
 强制配置再轻量地派生 `MixedSchedulePlan`，避免把大计划存入代价缓存。计划记录：
@@ -62,12 +89,13 @@ crossing 对应一个 record 和一个独立单向 physical queue。`ExpandMixed
 activation 的重复使用共享 reply ID；gate/up 这类形状相同但 SSA source 不同的
 张量不会合并。expansion 完成后会删除该私有 descriptor。
 
-## 3. 流水模式与忠实性
+## 4. 流水模式与忠实性
 
 当前安全 skew 支持“一个有序 push bundle 后接一个回复 pop”。bundle 可以包含
 SwiGLU 的 gate/up 两个独立 pipe ID，但所有 push 必须位于第一个 pop 之前，
 且 op 顺序与 ID 都属于协议。pop 后再次
-push 表示第二次往返，必须降级为串行，防止改变 FIFO 顺序。
+push 表示第二次往返。analytic 模式可以保留串行 descriptor，但 compiler 模式会
+拒绝该 group；发射一个串行近似会违背所选统一计划并悄悄丢失目标流水。
 若 reply 位于 conditional 内，两个 branch 必须具有完全相同的 FIFO op 与 ID；
 首个 matmul/后续 `matmul_acc` 因而算作一个逻辑 pop。任何 path-dependent
 conditional 协议都降级为串行。
@@ -91,7 +119,7 @@ SwiGLU 这样的精确算法提供全部 stage-local cost 和跨 stage lifetime�
 跨引擎 `max`。串行 prologue、drain 和 ragged tail 始终加法计价。每个 crossing
 张量都支付一次 GM 写和一次 GM 读；FIFO 槽必须覆盖同时存活的项。
 
-## 4. 复用同构模型
+## 5. 复用同构模型
 
 `Ascend910BMixed` 不重新拟合 cube 或 vector 工作。各 stage 使用相同的 grounded
 同构原语：
@@ -102,7 +130,7 @@ SwiGLU 这样的精确算法提供全部 stage-local cost 和跨 stage lifetime�
 mixed 包装只增加跨界流量、FIFO 容量、跨引擎 wavefront，以及生命周期跨越
 stage 的状态。纯 cube/vector 组直接交给同构模型。
 
-## 5. Dense-SwiGLU 第一增量
+## 6. Dense-SwiGLU 第一增量
 
 精确支持的子图为：
 
@@ -149,14 +177,20 @@ fail closed，直到 launch path 提供等价的 native subblock ID 与动态端
 down accumulator 是唯一的拓扑专用 cube 包装：若对每个 feature chunk 独立重放
 完整 `CubeSchedulePlan`，会错误地在每个 chunk 后 drain 到 GM。
 
-## 6. 未完成项
+## 7. 未完成项
 
 - 对更多串行组与更少流水组进行枚举或解析选择；
 - 支持 mixed pointwise strip streaming 和带状态的 P2/P4；
-- 在不复制同构搜索的前提下泛化 stage-local plan 视图；
+- 已为物化的单次往返完成 host 实现：在不复制同构搜索的前提下泛化 stage-local
+  plan 视图；generic emitter 消费统一计划中的拓扑顺序、传播后的 transfer region、
+  生命周期、FIFO record 与 pipeline-item 循环。`C->V->C` 依据能力和协议准入，
+  而不是识别 QK、softmax、PV、attention 或其他命名算法；latest-PTOAS silicon
+  正确性与重叠 grounding 仍待完成；
+- 通用单次往返目前会物化 vector frame；嵌入式 online P4 必须先显式表示阶段局部
+  状态、流量和 pipeline-item 轴，才能忠实计价和发射；
 - 支持对称 `V->C`；
-- 支持完整多次往返 skew，并实现具有 key-chunk 循环和 `(m,l,O)` 状态的
-  FlashAttention；
+- 在准入 `C->V->C->V` 之前先支持完整多次往返 skew；之后的 attention 计划可以
+  使用 key-chunk 循环和 `(m,l,O)` 状态，但仍是普通 op-DAG 计划，而不是命名 emitter；
 - 完成三 independent-pipe dense SwiGLU 的流量、重叠和排序验证；其生产 kernel
   数值契约已经 silicon-closed，独立 tagged primitive 仍只有结构证据。
 

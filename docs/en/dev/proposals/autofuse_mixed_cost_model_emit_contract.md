@@ -1,7 +1,8 @@
 # AutoFuse mixed cube/vector schedule contract
 
-**Status:** the buildable `C->V` increment and first exact `C,C->V->C`
-dense-SwiGLU increment are implemented behind `PYPTO_AUTOFUSE_MIXED=1`.
+**Status:** the buildable `C->V` increment, a capability-defined materialized
+`C->V->C` increment, and the first exact `C,C->V->C` dense-SwiGLU increment
+are implemented behind `PYPTO_AUTOFUSE_MIXED=1`.
 The explicit A2A3 dual-AIV FIFO lane bridge is function-scoped,
 pipe-descriptor-aware, and byte-exact: it rewrites only the selected AIV
 function, gives pipe-only AIV functions one private runtime lane parameter,
@@ -25,6 +26,13 @@ intermittent F=112/F=144 natural plans. An independent tagged three-pipe
 primitive verifies descriptor binding structurally but has not yet run on
 device. Mixed mode remains default-off pending traffic, overlap, and ranking
 grounding rather than correctness repair.
+
+The generic single-round-trip increment is host-closed, not yet
+silicon-closed. It admits two default-orientation FP32 matmuls connected by a
+row-local, materialized vector DAG of grounded pointwise and row-reduction
+operators. Admission depends on topology, shapes, dtype, capacity, and the
+single-round-trip protocol; it does not recognize QK, softmax, PV, attention,
+or any other named algorithm.
 
 Host tests also close tensor-level equivalence and the full
 `ExpandMixedKernel -> SkewCrossCorePipeline -> AutoTileMatmulL0` structure.
@@ -55,7 +63,37 @@ former measures a skewed pipeline approaching `max(cube, vector) + fill`, while 
 dependency chain takes `cube + vector` or worse. The latter supplies the full-attention stage
 sequence and running-statistic algorithm.
 
-## 2. A solver solution specifies two loop axes
+## 2. One unified subgraph plan
+
+Mixed planning does not plan homogeneous stages independently and then try to
+pack their kernels together. The candidate is one connected tensor DAG and one
+group schedule:
+
+1. choose one common spatial grid for the group's boundary outputs;
+2. propagate each output region backwards through every pointwise, reduction,
+   and matmul edge to obtain the region requested from every tensor;
+3. execute the resulting region DAG in one deterministic topological/pebbling
+   order;
+4. extend boundary and intermediate lifetimes to their last use and check the
+   combined L1, L0, and UB working set;
+5. price the exact per-region compute, boundary traffic, crossing traffic, and
+   serial or overlapped phases; and
+6. emit that same grid, order, regions, lifetimes, FIFO crossings, and loop.
+
+The maximal same-engine stages described below are execution metadata inside
+this unified solution. They expose which homogeneous equations and PyPTO
+pipeline tools apply to each part of the region DAG; they are not separately
+searched kernels with independent grids. A stage-local homogeneous plan is a
+derived view of the fixed group candidate.
+
+This distinction is especially important for `C->V->C`. The first matmul may
+produce an `[M_tile,S]` crossing for every final `[M_tile,N_tile]` output
+region. The common sink grid can therefore intentionally recompute or reload
+that crossing across `N` regions. Both its traffic multiplicity and its live
+shape come from backwards region propagation, not from an independently
+optimal QK or softmax grid.
+
+## 3. A solver solution specifies two loop axes
 
 A mixed solution cannot be described by one output tile count:
 
@@ -75,7 +113,7 @@ QK matmul (C)
 Thus `num_spatial_tiles >= 2` does not prove that a group has a successor item to overlap. The
 schedule must record the actual per-group trip count.
 
-## 3. MixedSchedulePlan
+## 4. MixedSchedulePlan
 
 The cost model owns one `MixedSchedulePlan` per evaluated configuration. Candidate-invariant
 stage topology is discovered once when the subgraph is created; candidate derivation adds grid,
@@ -114,14 +152,14 @@ generated AIC/AIV/Group functions.
 The last two fields intentionally fail loud during migration. A cost may use `max` only when the
 emitter can construct the recorded loop and PyPTO's lowering passes can realize its skew.
 
-## 4. Pipeline modes
+## 5. Pipeline modes
 
 | mode | topology | PyPTO lowering | cost rule |
 | ---- | -------- | -------------- | --------- |
 | serial | no realizable successor item | sequential loop | sum stage walls |
 | one-way | `C->V` or `V->C` | sequential per-engine loops decoupled by a GM FIFO | cross-engine wavefront only with at least two equal items per active group |
 | single-round-trip skew | `C->V->C` or `V->C->V` | `SkewCrossCorePipeline` | max only when its structural skew predicate succeeds |
-| multi-round-trip | e.g. full `C->V->C->V` attention | future whole-FIFO wavefront | serial until that transform exists |
+| multi-round-trip | e.g. `C->V->C->V` | future whole-FIFO wavefront | reject in compiler mode until that transform exists |
 
 Today `SkewCrossCorePipeline` safely skews one ordered producer push bundle
 followed by one reply pop. The bundle may contain multiple pushes, such as the
@@ -129,8 +167,10 @@ gate and up projections of SwiGLU, but every push must precede the first pop.
 When the reply is branch-local, both arms must carry the identical FIFO
 protocol; the first-matmul/`matmul_acc` choice is therefore one logical pop.
 Any path-dependent conditional protocol is demoted to sequential.
-Any push after a pop is a second round trip and is demoted to sequential to
-preserve FIFO order. The solver mirrors that predicate; structural alternation
+Any push after a pop is a second round trip. Analytic experiments may retain a
+serial descriptor, but compiler mode rejects the group: emitting a sequential
+approximation would violate the selected unified plan and silently lose the
+intended pipeline. The solver mirrors that predicate; structural alternation
 depth alone is insufficient.
 
 `V` and `C` name maximal homogeneous stages, not individual operations or
@@ -154,7 +194,7 @@ generic costing currently accepts one producer and one reply, while a larger
 bundle requires an exact algorithm such as dense SwiGLU to provide every
 stage-local cost and cross-stage lifetime.
 
-## 5. Fidelity obligations
+## 6. Fidelity obligations
 
 | Ref | model assumption | emitter obligation |
 | --- | ---------------- | ------------------ |
@@ -169,7 +209,7 @@ stage-local cost and cross-stage lifetime.
 | M9 | full attention carries a running output | rescale old `O`, add the current PV partial, and finalize by the running sum |
 | M10 | stage-local double buffering is conditional | grant each cube/vector roofline only when its local plan implements it |
 
-## 6. Current implementation and audit
+## 7. Current implementation and audit
 
 `Ascend910BMixed` already models four GM port directions, the shared-HBM cap, the 1:2 resource
 ratio, cube/vector stage balance, and single-round-trip fill behavior. Pure groups delegate to the
@@ -185,7 +225,7 @@ remains compact. The plan now records actual launch groups, per-group trips, two
 FIFO slots. `model_overlap_granted` equals `overlap_implementable`: at least two equal trips must
 exist on every active group. Two global tiles on two groups are correctly serial.
 
-The compiler buildability mode admits only one default-orientation standard matmul followed by a
+The first generic compiler increment admits one default-orientation standard matmul followed by a
 linear, same-shape, PTO-grounded elementwise epilogue (`C->V`). It requires a uniform grid,
 split-K 1, no escaped intermediate, one output, and an exactly materialized per-AIV half tile.
 The two matmul operands must have the same floating PTO cube dtype (`FP16`, `BF16`, or `FP32`),
@@ -229,6 +269,17 @@ any loaded broadcast tile when the writer consumes a MemRef-less
 `tpop_from_aic`. This backend hazard is part of the physical emit contract, and
 its decision is invariant to whether a `PassContext`/IR-dump instrument is
 active.
+
+The generic materialized single-round-trip increment admits an ordinary
+`C->V->C` op DAG under one common uniform output grid. Backwards region
+propagation derives the first matmul's crossing shape, the vector frame, and
+the second matmul's requested reply. The emitted three-stage `UP_DOWN` loop
+replays the source operations in topological order, uses two independently
+sized one-way FIFOs, and delegates both matmul L0 schedules to
+`AutoTileMatmulL0`. This is capability-defined: no source-op sequence is
+interpreted as a named attention algorithm. The first surface is FP32,
+materialized, row-local, split-K one, and one round trip; unsupported shapes
+and protocols remain partition boundaries.
 
 The exact dense-SwiGLU surface is:
 
@@ -289,8 +340,9 @@ The remaining model/emit gaps are:
   different static tile sizes/dtypes, but dynamic or ragged transfer shapes
   still fail closed until the launch path supplies an equivalent native
   subblock ID and dynamic endpoint contract;
-- a direct QK matmul plus an exact softmax cone can now reuse the P4 vector-stage descriptor, but
-  mixed costing does not yet replay its phase-local compute and traffic;
+- the generic round-trip surface currently materializes its vector frame;
+  embedded online P4 needs explicit phase-local state, traffic, and a
+  pipeline-item axis before it can be priced or emitted faithfully;
 - the dense stage views reuse homogeneous primitive equations but do not yet
   embed an independently enumerable full `CubeSchedulePlan` for each
   projection; doing so must preserve the feature-loop accumulator contract;
@@ -298,8 +350,10 @@ The remaining model/emit gaps are:
   are not yet a scheduling dimension;
 - the cross-engine wavefront and mixed launch overhead still need latest-PTOAS silicon grounding;
   host lowering proves ordering and capacity, not AIC item `k+1` overlap with AIV item `k`;
-- analytic `C->V->C->V` topology is retained and receives a serial stage sum, while compiler mode
-  cuts it; the current unified spatial grid also cannot express its key-chunk loop.
+- analytic `C->V->C->V` topology is retained and receives a serial stage sum,
+  while compiler mode rejects it before emission; adding a second round trip
+  requires a PyPTO whole-FIFO transform and a plan that represents its temporal
+  axis and cross-round lifetimes.
 - the dense surface still needs latest-PTOAS 910B traffic, overlap, and ranking
   validation; its three-pipe numerical contract is silicon-closed.
 
@@ -315,7 +369,7 @@ production kernel now passes more than 200 launches across two devices with no
 NaN, hang, AICPU exception, or numerical mismatch. This closes correctness;
 the flag remains off until mixed performance and overlap are grounded.
 
-## 7. Implementation sequence
+## 8. Implementation sequence
 
 1. **Done:** add candidate-invariant stage/transfer topology and a lightweight
    `MixedSchedulePlan`; consume it without changing canonical cost anchors.
@@ -336,15 +390,22 @@ the flag remains off until mixed performance and overlap are grounded.
    two 910B2 devices; the independent tagged primitive remains structural-only.
 5. Enumerate or analytically choose between more serial groups and fewer pipelined groups. Price
    dependent init, steady, tail, and drain phases separately.
-6. Generalize the current stage-local homogeneous views without duplicating
-   the homogeneous search. Preserve mixed-only lifetime facts such as the
-   feature-loop accumulator.
+6. **Host-implemented for materialized single round trips:** generalize the
+   current stage-local homogeneous views without duplicating the homogeneous
+   search. The generic emitter consumes the unified plan's
+   topological order, propagated transfer regions, lifetimes, FIFO records, and
+   pipeline-item loop. `C->V->C` is admitted by capabilities and protocol, not
+   by recognizing QK, softmax, PV, attention, or another named algorithm.
+   Preserve mixed-only lifetime facts such as the feature-loop accumulator.
+   Latest-PTOAS silicon correctness and overlap grounding remain pending.
 7. Add the symmetric `V->C` emitter. Mirror the complete skew
    capability predicate before granting overlap.
 8. Reuse the implemented embedded P4 stage descriptor in stage-local mixed compute and traffic;
    continue rejecting any extra vector prefix or tail outside that exact cone.
-9. Add whole-FIFO multi-round-trip skew, then implement full flash attention with the key-chunk
-   loop and running `(m,l,O)` state.
+9. Add whole-FIFO multi-round-trip skew before admitting `C->V->C->V`.
+   A full-attention schedule may then use a key-chunk loop and running
+   `(m,l,O)` state, but remains an ordinary op-DAG plan rather than a named
+   attention emitter.
 
 Default mixed fusion remains off until plan/emit structural tests and 910B correctness and
 wall-time validation close M1-M10.

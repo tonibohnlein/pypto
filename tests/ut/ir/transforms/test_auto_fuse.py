@@ -2472,7 +2472,8 @@ class TestAutoFuse:
         class Column:
             @pl.function(attrs={schedule_tag: True})
             def reduce(self, x: pl.Tensor[[8192, 1], pl.FP32]) -> pl.Tensor[[1, 1], pl.FP32]:
-                out: pl.Tensor[[1, 1], pl.FP32] = pl.col_sum(x)
+                values: pl.Tensor[[8192, 1], pl.FP32] = pl.exp(x)
+                out: pl.Tensor[[1, 1], pl.FP32] = pl.col_sum(values)
                 return out
 
         planned = passes.auto_fuse()(Column)
@@ -2488,7 +2489,8 @@ class TestAutoFuse:
         class Row:
             @pl.function(attrs={schedule_tag: True})
             def reduce(self, x: pl.Tensor[[1, 8192], pl.FP32]) -> pl.Tensor[[1, 1], pl.FP32]:
-                out: pl.Tensor[[1, 1], pl.FP32] = pl.row_sum(x)
+                values: pl.Tensor[[1, 8192], pl.FP32] = pl.exp(x)
+                out: pl.Tensor[[1, 1], pl.FP32] = pl.row_sum(values)
                 return out
 
         row_body = next(
@@ -3699,6 +3701,148 @@ class TestAutoFuse:
         env["PYPTO_AUTOFUSE_MIXED"] = "1"
         env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
         env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "32,32,1,6,8"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+    def test_mixed_generic_cvc_replays_unified_region_dag(self):
+        """A capability-defined C->V->C plan replays one common grid.
+
+        The test is attention-shaped only to exercise the useful topology. The
+        admission and emitter consume ordinary matmul, reduction, expansion,
+        and pointwise descriptors; there is no QK/softmax/PV algorithm kind.
+        The final N grid intentionally differs from the intermediate S extent,
+        proving that both FIFOs carry the backwards-propagated [M_tile,S]
+        request rather than the [M_tile,N_tile] sink tile.
+        """
+        script = textwrap.dedent(
+            """
+            import torch
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+            from pypto.debug import torch_codegen
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def cvc(
+                    self,
+                    q: pl.Tensor[[96, 64], pl.FP32],
+                    k: pl.Tensor[[64, 64], pl.FP32],
+                    v: pl.Tensor[[64, 128], pl.FP32],
+                ) -> pl.Tensor[[96, 128], pl.FP32]:
+                    scores: pl.Tensor[[96, 64], pl.FP32] = pl.matmul(q, k)
+                    m: pl.Tensor[[96, 1], pl.FP32] = pl.row_max(scores)
+                    shifted: pl.Tensor[[96, 64], pl.FP32] = pl.sub(scores, m)
+                    e: pl.Tensor[[96, 64], pl.FP32] = pl.exp(shifted)
+                    l: pl.Tensor[[96, 1], pl.FP32] = pl.row_sum(e)
+                    probability: pl.Tensor[[96, 64], pl.FP32] = pl.div(e, l)
+                    out: pl.Tensor[[96, 128], pl.FP32] = pl.matmul(probability, v)
+                    return out
+
+            source_ns = {}
+            exec(torch_codegen(Prog, run_all_spmd_blocks=True), source_ns)
+            planned = passes.auto_fuse()(Prog)
+            planned_text = planned.get_function("cvc").as_python()
+            assert "pl.spmd(24" in planned_text, planned_text
+            assert "pl.pipeline(2, stage=3" in planned_text, planned_text
+            assert "pl.split(pl.SplitMode.UP_DOWN)" in planned_text, planned_text
+            assert "pl.cross_core_slot(slot_num=4)" in planned_text, planned_text
+            assert planned_text.count("pl.tensor.matmul(") >= 2, planned_text
+            assert "pl.tensor.row_max(" in planned_text, planned_text
+            assert "pl.tensor.row_sum(" in planned_text, planned_text
+
+            planned_ns = {}
+            exec(torch_codegen(planned, run_all_spmd_blocks=True), planned_ns)
+            torch.manual_seed(0)
+            q = torch.randn(96, 64) * 0.1
+            k = torch.randn(64, 64) * 0.1
+            v = torch.randn(64, 128) * 0.1
+            expected = source_ns["cvc"](q, k, v)
+            got = planned_ns["cvc"](q, k, v)
+            assert torch.allclose(got, expected, rtol=1e-4, atol=1e-4), (
+                got - expected
+            ).abs().max()
+
+            lowered = PassManager.get_strategy(
+                OptimizationStrategy.Default
+            ).run_passes(Prog)
+            lowered_text = lowered.as_python()
+            assert "type=pl.FunctionType.Group" in lowered_text, lowered_text
+            assert "type=pl.FunctionType.AIC" in lowered_text, lowered_text
+            assert "type=pl.FunctionType.AIV" in lowered_text, lowered_text
+            assert "pl.tile.tpush_to_aiv(" in lowered_text, lowered_text
+            assert "pl.tile.tpop_from_aic(" in lowered_text, lowered_text
+            assert "pl.tile.tpush_to_aic(" in lowered_text, lowered_text
+            assert "pl.tile.tpop_from_aiv(" in lowered_text, lowered_text
+            assert lowered_text.count("slot_size=4096") >= 4, lowered_text
+            assert "id=0" in lowered_text and "id=1" in lowered_text, lowered_text
+            assert "__autofuse_mixed_fifo_plan" not in lowered_text, lowered_text
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        env["PYPTO_AUTOFUSE_FORCE_PLAN"] = "16,16,1,6,8"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+    def test_mixed_cvcv_is_a_partition_boundary(self):
+        """A second round trip is rejected until PyPTO has a whole-FIFO skew."""
+        script = textwrap.dedent(
+            """
+            import pypto.language as pl
+            from pypto import backend, passes
+            from pypto.backend import BackendType
+
+            backend.set_backend_type(BackendType.Ascend910B)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def cvcv(
+                    self,
+                    q: pl.Tensor[[32, 64], pl.FP32],
+                    k: pl.Tensor[[64, 64], pl.FP32],
+                    v: pl.Tensor[[64, 64], pl.FP32],
+                ) -> pl.Tensor[[32, 64], pl.FP32]:
+                    scores = pl.matmul(q, k)
+                    e = pl.exp(scores)
+                    projected = pl.matmul(e, v)
+                    return pl.exp(projected)
+
+            planned = passes.auto_fuse()(Prog)
+            text = planned.get_function("cvcv").as_python()
+            assert "pl.split(pl.SplitMode.UP_DOWN" not in text, text
+            assert "pl.cross_core_slot(" not in text, text
+            assert text.count("pl.tensor.matmul(") == 2, text
+            assert text.count("pl.tensor.exp(") == 2, text
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "1"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
         proc = subprocess.run(
             [sys.executable, "-c", script],
             cwd=os.getcwd(),
