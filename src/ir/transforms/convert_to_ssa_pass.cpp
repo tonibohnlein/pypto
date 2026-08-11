@@ -32,9 +32,11 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 
@@ -271,6 +273,7 @@ class SSAConverter {
     // pre-SSA Var and the UseAfterDef function-attr walk reports it undefined.
     auto new_attrs = SubstCallAttrs(result->attrs_);
     if (new_attrs.has_value()) result->attrs_ = std::move(*new_attrs);
+    RecordAutoScheduleOutputLineage(func, result.get());
     return result;
   }
 
@@ -400,6 +403,62 @@ class SSAConverter {
     auto var = std::make_shared<Var>(BuildAutoNamedVersion(key->name_hint_, "ssa", v), SubstType(type), span);
     cur_[key] = var;
     return var;
+  }
+
+  /// Preserve the source-level association between returned SSA values and
+  /// explicit Out parameters for the immediately following automatic
+  /// scheduler. Parameter and assignment Vars share one identity before SSA;
+  /// after conversion their independently allocated Vars make positional or
+  /// type-based reconstruction ambiguous.
+  void RecordAutoScheduleOutputLineage(const FunctionPtr& original, Function* converted) const {
+    const bool scheduled =
+        original->GetAttr<bool>("auto_fuse", false) || original->GetAttr<bool>("auto_tile", false);
+    if (!scheduled) return;
+
+    const ReturnStmtPtr ret = return_lineage::FindFirstReturn(converted->body_);
+    if (!ret) return;
+    std::vector<int32_t> returned_out_params;
+    if (original->HasAttr(kAutoScheduleReturnedOutParamIndicesAttr)) {
+      returned_out_params =
+          original->GetAttr<std::vector<int32_t>>(kAutoScheduleReturnedOutParamIndicesAttr, {});
+      INTERNAL_CHECK_SPAN(returned_out_params.size() == ret->value_.size(), original->span_)
+          << "Internal error: automatic-scheduling output-lineage arity changed across SSA conversion";
+      std::unordered_set<int32_t> seen;
+      for (int32_t param : returned_out_params) {
+        if (param < 0) continue;
+        INTERNAL_CHECK_SPAN(static_cast<size_t>(param) < orig_params_.size() &&
+                                orig_param_directions_[param] == ParamDirection::Out,
+                            original->span_)
+            << "Internal error: automatic-scheduling output lineage references a parameter that is not Out";
+        INTERNAL_CHECK_SPAN(seen.insert(param).second, original->span_)
+            << "Internal error: automatic-scheduling output lineage targets one Out parameter more than once";
+      }
+    } else {
+      std::unordered_map<const Var*, int32_t> latest_out_to_param;
+      for (size_t i = 0; i < orig_params_.size(); ++i) {
+        if (orig_param_directions_[i] != ParamDirection::Out) continue;
+        auto latest = cur_.find(orig_params_[i].get());
+        if (latest != cur_.end()) {
+          latest_out_to_param.emplace(latest->second.get(), static_cast<int32_t>(i));
+        }
+      }
+      if (latest_out_to_param.empty()) return;
+
+      returned_out_params.reserve(ret->value_.size());
+      for (const ExprPtr& value : ret->value_) {
+        const VarPtr var = AsVarLike(value);
+        const auto found = var ? latest_out_to_param.find(var.get()) : latest_out_to_param.end();
+        returned_out_params.push_back(found == latest_out_to_param.end() ? -1 : found->second);
+      }
+    }
+
+    std::vector<std::pair<std::string, std::any>> attrs;
+    attrs.reserve(converted->attrs_.size() + 1);
+    for (const auto& attr : converted->attrs_) {
+      if (attr.first != kAutoScheduleReturnedOutParamIndicesAttr) attrs.push_back(attr);
+    }
+    attrs.emplace_back(kAutoScheduleReturnedOutParamIndicesAttr, std::move(returned_out_params));
+    converted->attrs_ = std::move(attrs);
   }
 
   /// Register pre-existing iter_args from the original loop into cur_.

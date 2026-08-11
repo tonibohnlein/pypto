@@ -24,6 +24,16 @@
 namespace pypto {
 namespace ir {
 
+/// Transient return-position -> explicit-Out-param map recorded by ConvertToSSA
+/// for functions handled by an automatic scheduler. Before SSA conversion an
+/// Out parameter and its final assigned value share one source Var identity;
+/// afterwards that association cannot be reconstructed reliably from types or
+/// return order (notably for reordered multi-output functions). AutoFuse
+/// consumes the map when wiring its compiler-generated output buffers and
+/// strips it before backend codegen.
+inline constexpr const char* kAutoScheduleReturnedOutParamIndicesAttr =
+    "__auto_schedule_returned_out_param_indices";
+
 /// Private provenance on every compiler-generated ``tile.load(GM -> Mat)``
 /// call introduced while bridging a Tensor operand to tile IR.
 /// ``InferTileMemorySpace`` consumes this evidence when deciding whether a

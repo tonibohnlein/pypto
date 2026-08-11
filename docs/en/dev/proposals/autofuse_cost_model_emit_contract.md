@@ -188,6 +188,8 @@ its back-propagated operand tile shapes.
 | A5 | roofline `max(compute, DDR)` only within a loop that overlaps load k+1 with compute k | emit that exact loop **software-pipelined / double-buffered** (`ForKind::Pipeline` + `kPipelineStagesAttr`) and keep barriers serial | ✅ `VectorStreamPlan` owns materialized/pointwise row+width strips and P1/P2/P4 init/rolled/tail/finalize phases. Cost is `Σphase roofline`; peeled phases use `compute+DDR`, and sub-register or short rolled loops stay sequential. |
 | A6 | reduced-axis split `S` = S cores reduce slices, **atomic-add** merge | build the cross-core split (seed + `SetAtomicAdd`) — realized ONLY for a terminal **sum col-reduction** sink; else stay serial | ✅ exact admission, seed cost, `work_units*S` fill waves, and 32-byte seed-row buildability gate. |
 | A7 | streamed input reads are phase-specific: an operand may be stats-only, apply-only, or both | consume the shared `VectorInputLifetimeTopology`; read each tensor once per emitted phase/chunk and reuse it for all source-op consumers | ✅ `x` in P2/P4 has separate stats/apply lifetimes; an apply-only scale/bias is absent from stats. Repeated operands such as `mul(x,x)` remain one transfer/use-op. |
+| A8 | every non-native tensor cast is the same native `tcvt` chain later seen by tile lowering | expand the tensor cast before planning, keep every intermediate as a first-class tensor with its own dtype-sized lifetime, and use one physical element granule for the complete chain | ✅ the scheduler and `LegalizeTileCast` share `FindTcvtPath`; generated cast source/destination buffers cannot alias. FP16→BF16, BF16→FP16, and FP32→INT8 are covered across plan and emit. |
+| A9 | a singleton-column reduction may use row-reduction geometry only when the complete scheduled group is coordinate-equivalent | record `singleton_column_to_row`, keep the original tensor ABI, emit a zero-copy `[N,1]→[1,N]` view, and replay column reductions/expansions as row operations | ✅ scalar reduction outputs are supported. Full-frame descendants that cannot cross the coordinate boundary safely decline, and transformed AutoFuse groups are kept whole. |
 
 “Wave” in A1 is an analytical makespan, not an emitted runtime construct. The runtime receives `U`
 ready SPMD tasks and schedules them without affinity controls. A logical region therefore stays one
@@ -465,6 +467,10 @@ separates cost family from implemented scheduling algorithm: elementwise and sum
 admitted, while prod/arg/min/full and position/shape-changing operations decline. Strip feasibility
 replays byte-weighted tensor lifetimes and a dtype-exact prefetch copy; streamed reductions add their
 explicit generated scratch. The FP32→INT8 forced-plan regression now lowers without UB overflow.
+Automatic scheduling also preserves an explicit `Out` parameter's lineage through repeated SSA
+conversion and print/parse round trips. The transient mapping is consumed while restoring direct-call
+or `Submit` output wiring and is stripped before backend lowering; equal-typed, reordered outputs do
+not fall back to positional guessing.
 
 ### Minor / doc-completeness
 

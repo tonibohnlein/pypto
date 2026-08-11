@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <any>
 #include <cctype>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -51,6 +52,7 @@
 #include "pypto/ir/transforms/op_conversion_registry.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
@@ -171,7 +173,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
       // payloads (e.g. ``manual_dep_edges=[1]``) and fail later in codegen
       // instead of raising at parse time.
       auto seq = nb::cast<nb::sequence>(item.second);
-      if (key == kAttrArgDirectionOverrides || key == kAttrAtomicInoutArgs) {
+      if (key == kAttrArgDirectionOverrides || key == kAttrAtomicInoutArgs ||
+          key == kAutoScheduleReturnedOutParamIndicesAttr) {
         std::vector<int32_t> idxs;
         for (auto elem : seq) {
           if (nb::isinstance<nb::bool_>(elem) || !nb::isinstance<nb::int_>(elem)) {

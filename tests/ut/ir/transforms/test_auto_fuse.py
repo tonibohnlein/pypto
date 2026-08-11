@@ -22,6 +22,7 @@ lowers each scope to a cube (AIC) or vector (AIV) kernel.
 """
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -680,6 +681,123 @@ class TestAutoFuse:
         incores = [f for _, f in out.functions.items() if ir.is_incore_type(f.func_type)]
         assert len(incores) == 1  # no split-K seed kernel -> just the vector kernel
         assert str(incores[0].func_type) == "FunctionType.AIV"  # pointwise -> vector kernel
+
+    @pytest.mark.parametrize("use_submit", [False, True])
+    def test_swapped_explicit_out_lineage_survives_direct_call_and_submit(self, ascend_backend, use_submit):
+        """Equal-typed reordered outputs retain their source Out association."""
+        if use_submit:
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_tile": True})
+                def kernel(
+                    self,
+                    x: pl.Tensor[[1, 64], pl.FP32],
+                    first: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+                    second: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+                ) -> tuple[pl.Tensor[[1, 64], pl.FP32], pl.Tensor[[1, 64], pl.FP32]]:
+                    first = pl.exp(x)
+                    second = pl.abs(x)
+                    return second, first
+
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def main(
+                    self,
+                    x: pl.Tensor[[1, 64], pl.FP32],
+                    first: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+                    second: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+                ) -> tuple[pl.Tensor[[1, 64], pl.FP32], pl.Tensor[[1, 64], pl.FP32]]:
+                    with pl.manual_scope():
+                        (returned_second, returned_first), _tid = pl.submit(self.kernel, x, first, second)
+                    return returned_second, returned_first
+
+        else:
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_tile": True})
+                def kernel(
+                    self,
+                    x: pl.Tensor[[1, 64], pl.FP32],
+                    first: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+                    second: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+                ) -> tuple[pl.Tensor[[1, 64], pl.FP32], pl.Tensor[[1, 64], pl.FP32]]:
+                    first = pl.exp(x)
+                    second = pl.abs(x)
+                    return second, first
+
+                @pl.function
+                def main(
+                    self,
+                    x: pl.Tensor[[1, 64], pl.FP32],
+                    first: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+                    second: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+                ) -> tuple[pl.Tensor[[1, 64], pl.FP32], pl.Tensor[[1, 64], pl.FP32]]:
+                    returned_second, returned_first = self.kernel(x, first, second)
+                    return returned_second, returned_first
+
+        prepared = passes.convert_to_ssa()(Prog)
+        kernel = next(f for _, f in prepared.functions.items() if f.name == "kernel")
+        assert kernel.attrs["__auto_schedule_returned_out_param_indices"] == [2, 1]
+        round_tripped = pl.parse_program(str(prepared))
+        prepared = passes.convert_to_ssa()(round_tripped)
+        kernel = next(f for _, f in prepared.functions.items() if f.name == "kernel")
+        assert kernel.attrs["__auto_schedule_returned_out_param_indices"] == [2, 1]
+
+        planned = passes.auto_fuse()(prepared)
+        kernel = next(f for _, f in planned.functions.items() if f.name == "kernel")
+        assert len(kernel.params) == 3
+        assert list(kernel.param_directions) == [
+            ir.ParamDirection.In,
+            ir.ParamDirection.Out,
+            ir.ParamDirection.Out,
+        ]
+        assert "__auto_schedule_returned_out_param_indices" not in kernel.attrs
+        assert "pl.tensor.create(" not in kernel.as_python()
+
+    def test_explicit_out_lineage_preserves_submit_prefix(self, ascend_backend):
+        """A runtime-allocated tail Out remains omitted from Submit arguments."""
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_tile": True})
+            def kernel(
+                self,
+                x: pl.Tensor[[1, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            ) -> pl.Tensor[[1, 64], pl.FP32]:
+                out = pl.exp(x)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[1, 64], pl.FP32]) -> pl.Tensor[[1, 64], pl.FP32]:
+                with pl.manual_scope():
+                    returned, _tid = pl.submit(self.kernel, x)
+                return returned
+
+        prepared = passes.convert_to_ssa()(Prog)
+        kernel = next(f for _, f in prepared.functions.items() if f.name == "kernel")
+        assert kernel.attrs["__auto_schedule_returned_out_param_indices"] == [1]
+
+        planned = passes.auto_fuse()(prepared)
+        kernel = next(f for _, f in planned.functions.items() if f.name == "kernel")
+        assert len(kernel.params) == 2
+        assert list(kernel.param_directions) == [ir.ParamDirection.In, ir.ParamDirection.Out]
+        assert "__auto_schedule_returned_out_param_indices" not in kernel.attrs
+        assert "pl.tensor.create(" not in kernel.as_python()
+
+        class SubmitPrefix(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.arg_counts = []
+
+            def visit_submit(self, op):
+                self.arg_counts.append(len(op.args))
+                super().visit_submit(op)
+
+        submits = SubmitPrefix()
+        submits.visit_program(planned)
+        assert submits.arg_counts == [1]
 
     def test_chained_matmul_fuses_to_one_kernel(self, ascend_backend, monkeypatch):
         """The natural buildable cube plan fuses a two-matmul chain across AIC cores.
@@ -2217,6 +2335,317 @@ class TestAutoFuse:
             check=False,
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    @pytest.mark.parametrize(
+        "cast_case",
+        [
+            (pl.FP16, pl.BF16, "pl.FP32", 16),
+            (pl.BF16, pl.FP16, "pl.FP32", 16),
+            (pl.FP32, pl.INT8, "pl.FP16", 32),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("schedule_tag", "generic_emit", "width"),
+        [("auto_tile", True, 470), ("auto_fuse", True, 470), ("auto_fuse", False, 512)],
+    )
+    @pytest.mark.parametrize(
+        "memory_planner",
+        [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP],
+    )
+    def test_native_cast_chain_is_planned_and_emitted_explicitly(
+        self,
+        ascend_backend,
+        cast_case,
+        schedule_tag,
+        generic_emit,
+        width,
+        memory_planner,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Fusebox and emission see the same two native TCVT operations."""
+        source_dtype, target_dtype, intermediate_dtype, physical_granule = cast_case
+        monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1" if generic_emit else "0")
+        monkeypatch.setenv("PYPTO_AUTOFUSE_FORCE_MERGE", "all")
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={schedule_tag: True})
+            def cast_chain(
+                self, x: pl.Tensor[[16, width], source_dtype]
+            ) -> pl.Tensor[[16, width], target_dtype]:
+                out: pl.Tensor[[16, width], target_dtype] = pl.cast(x, target_dtype)
+                return out
+
+        planned = passes.auto_fuse()(Prog)
+        body = next(f for _, f in planned.functions.items() if f.name == "cast_chain").as_python()
+        assert body.count("pl.tensor.cast(") == 2, body
+        assert intermediate_dtype in body, body
+        solution = json.loads((tmp_path / "cast_chain.sol.json").read_text())
+        vector_plan = next(plan for plan in solution["vector_stream"] if plan is not None)
+        # At either native conversion the live pair occupies 6 bytes per
+        # physical element: 2+4 for the half/bfloat hop and 4+2 for the
+        # fp32/fp16 hop. The INT8 endpoint does not inherit the FP32 size.
+        tile_h, tile_w = vector_plan["tile"]
+        physical_tile_w = math.ceil(tile_w / physical_granule) * physical_granule
+        assert vector_plan["full_peak_ub_bytes"] == tile_h * physical_tile_w * 6
+
+        with passes.PassContext([], memory_planner=memory_planner):
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+        tile_cast_op = ir.get_op("tile.cast")
+
+        class CastBuffers(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.definitions = {}
+                self.pairs = []
+
+            def visit_assign_stmt(self, op):
+                self.definitions[op.var.unique_id] = op.var
+                if isinstance(op.value, ir.Call) and op.value.op.name == tile_cast_op.name:
+                    source = op.value.args[0]
+                    assert isinstance(source, ir.Var)
+                    source_type = source.type
+                    target_type = op.var.type
+                    assert isinstance(source_type, ir.TileType)
+                    assert isinstance(target_type, ir.TileType)
+                    assert source_type.memref is not None and target_type.memref is not None
+                    source_shape = tuple(dim.value for dim in source_type.shape)
+                    target_shape = tuple(dim.value for dim in target_type.shape)
+                    self.pairs.append(
+                        (
+                            source_type.memref.base_.name_hint,
+                            source_type.memref.byte_offset_.value,
+                            source_type.memref.size_,
+                            source_shape,
+                            source_type.dtype.get_byte(),
+                            target_type.memref.base_.name_hint,
+                            target_type.memref.byte_offset_.value,
+                            target_type.memref.size_,
+                            target_shape,
+                            target_type.dtype.get_byte(),
+                        )
+                    )
+                super().visit_assign_stmt(op)
+
+        buffers = CastBuffers()
+        buffers.visit_program(lowered)
+        # A stage-2 strip pipeline contains two static copies of each native
+        # conversion, one per rolled slot; a materialized plan contains one.
+        assert len(buffers.pairs) in (2, 4)
+        physical_shapes = set()
+        for (
+            source_base,
+            source_offset,
+            source_size,
+            source_shape,
+            source_dtype_bytes,
+            target_base,
+            target_offset,
+            target_size,
+            target_shape,
+            target_dtype_bytes,
+        ) in buffers.pairs:
+            assert (source_base, source_offset) != (target_base, target_offset)
+            assert source_shape == target_shape
+            assert source_shape[1] % physical_granule == 0
+            physical_shapes.add(source_shape)
+            source_elements = math.prod(source_shape)
+            target_elements = math.prod(target_shape)
+            # Allocation reuse may assign a dead value's larger physical slot
+            # to a later narrower value. The live range itself remains
+            # dtype-sized, as proved by the exact Fusebox peak above.
+            assert source_size >= source_elements * source_dtype_bytes
+            assert target_size >= target_elements * target_dtype_bytes
+        assert len(physical_shapes) == 1
+
+    @pytest.mark.parametrize("schedule_tag", ["auto_tile", "auto_fuse"])
+    def test_singleton_column_reduction_uses_row_coordinate_view(
+        self, ascend_backend, schedule_tag, tmp_path, monkeypatch
+    ):
+        """[N,1] col_sum is planned and emitted as a zero-copy [1,N] row_sum."""
+        monkeypatch.setenv("PYPTO_AUTOFUSE_DUMP", str(tmp_path))
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+
+        @pl.program
+        class Column:
+            @pl.function(attrs={schedule_tag: True})
+            def reduce(self, x: pl.Tensor[[8192, 1], pl.FP32]) -> pl.Tensor[[1, 1], pl.FP32]:
+                out: pl.Tensor[[1, 1], pl.FP32] = pl.col_sum(x)
+                return out
+
+        planned = passes.auto_fuse()(Column)
+        body = next(f for _, f in planned.functions.items() if f.name == "reduce").as_python()
+        assert "pl.tensor.view(" in body, body
+        assert "pl.tensor.row_sum(" in body, body
+        assert "pl.tensor.col_sum(" not in body, body
+        solution = json.loads((tmp_path / "reduce.sol.json").read_text())
+        vector_plan = next(plan for plan in solution["vector_stream"] if plan is not None)
+        assert vector_plan["coordinate_transform"] == "singleton_column_to_row"
+
+        @pl.program
+        class Row:
+            @pl.function(attrs={schedule_tag: True})
+            def reduce(self, x: pl.Tensor[[1, 8192], pl.FP32]) -> pl.Tensor[[1, 1], pl.FP32]:
+                out: pl.Tensor[[1, 1], pl.FP32] = pl.row_sum(x)
+                return out
+
+        row_body = next(
+            f for _, f in passes.auto_fuse()(Row).functions.items() if f.name == "reduce"
+        ).as_python()
+        assert "pl.tensor.row_sum(" in row_body
+        assert "pl.tensor.col_sum(" not in row_body
+
+    def test_singleton_column_full_frame_descendant_declines(self, ascend_backend):
+        """The coordinate transform does not reinterpret a full-frame live-out."""
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_tile": True})
+            def normalize(self, x: pl.Tensor[[8192, 1], pl.FP32]) -> pl.Tensor[[8192, 1], pl.FP32]:
+                total: pl.Tensor[[1, 1], pl.FP32] = pl.col_sum(x)
+                out: pl.Tensor[[8192, 1], pl.FP32] = pl.col_expand_add(x, total)
+                return out
+
+        ir.assert_structural_equal(passes.auto_fuse()(Prog), Prog)
+
+    @pytest.mark.parametrize(
+        ("bias_shape", "singleton_axis"),
+        [([1, 64], 0), ([16, 1], 1)],
+    )
+    def test_vector_singleton_broadcast_axes_remain_singleton(
+        self, ascend_backend, bias_shape, singleton_axis
+    ):
+        """DMA padding never turns a broadcast axis into repeated data."""
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_tile": True})
+            def add(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP32],
+                bias: pl.Tensor[bias_shape, pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                out: pl.Tensor[[16, 64], pl.FP32] = pl.add(x, bias)
+                return out
+
+        planned = passes.auto_fuse()(Prog)
+        tensor_slice_op = ir.get_op("tensor.slice")
+
+        class BiasSlice(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.shapes = []
+
+            def visit_call(self, op):
+                if op.op.name == tensor_slice_op.name and isinstance(op.args[0], ir.Var):
+                    source = op.args[0]
+                    if source.name_hint.startswith("bias"):
+                        self.shapes.append(tuple(dim.value for dim in op.type.shape))
+                super().visit_call(op)
+
+        slices = BiasSlice()
+        slices.visit_program(planned)
+        assert slices.shapes
+        assert all(shape[singleton_axis] == 1 for shape in slices.shapes)
+        assert all(shape[1 - singleton_axis] <= bias_shape[1 - singleton_axis] for shape in slices.shapes)
+
+    def test_vector_dtype_admission_does_not_reject_bf16_cube(self, ascend_backend):
+        """BF16 arithmetic is vector-only negative; BF16 matmul remains supported."""
+
+        @pl.program
+        class Vector:
+            @pl.function(attrs={"auto_tile": True})
+            def add(
+                self,
+                x: pl.Tensor[[16, 64], pl.BF16],
+                y: pl.Tensor[[16, 64], pl.BF16],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
+                out: pl.Tensor[[16, 64], pl.BF16] = pl.add(x, y)
+                return out
+
+        ir.assert_structural_equal(passes.auto_fuse()(Vector), Vector)
+
+        @pl.program
+        class Reduction:
+            @pl.function(attrs={"auto_tile": True})
+            def row_sum(self, x: pl.Tensor[[16, 64], pl.BF16]) -> pl.Tensor[[16, 1], pl.BF16]:
+                out: pl.Tensor[[16, 1], pl.BF16] = pl.row_sum(x)
+                return out
+
+        ir.assert_structural_equal(passes.auto_fuse()(Reduction), Reduction)
+
+        @pl.program
+        class Integer:
+            @pl.function(attrs={"auto_tile": True})
+            def add(
+                self,
+                x: pl.Tensor[[16, 64], pl.INT8],
+                y: pl.Tensor[[16, 64], pl.INT8],
+            ) -> pl.Tensor[[16, 64], pl.INT8]:
+                out: pl.Tensor[[16, 64], pl.INT8] = pl.add(x, y)
+                return out
+
+        ir.assert_structural_equal(passes.auto_fuse()(Integer), Integer)
+
+        @pl.program
+        class Cube:
+            @pl.function(attrs={"auto_tile": True})
+            def matmul(
+                self,
+                x: pl.Tensor[[64, 64], pl.BF16],
+                y: pl.Tensor[[64, 64], pl.BF16],
+            ) -> pl.Tensor[[64, 64], pl.BF16]:
+                out: pl.Tensor[[64, 64], pl.BF16] = pl.matmul(x, y)
+                return out
+
+        cube_body = next(
+            f for _, f in passes.auto_fuse()(Cube).functions.items() if f.name == "matmul"
+        ).as_python()
+        assert "pl.spmd(" in cube_body
+
+    @pytest.mark.parametrize("schedule_tag", ["auto_tile", "auto_fuse"])
+    def test_mixed_dtype_vector_arithmetic_declines(self, ascend_backend, schedule_tag):
+        """Vector primitives require an explicit tensor.cast at dtype boundaries."""
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={schedule_tag: True})
+            def add(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP16],
+                y: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                out: pl.Tensor[[16, 64], pl.FP32] = pl.add(x, y)
+                return out
+
+        ir.assert_structural_equal(passes.auto_fuse()(Prog), Prog)
+
+    def test_declined_explicit_out_strips_transient_lineage(self, ascend_backend):
+        """A fallback must not expose ConvertToSSA's scheduler-private metadata."""
+
+        @pl.program
+        class Prog:
+            @pl.function(attrs={"auto_tile": True})
+            def add(
+                self,
+                x: pl.Tensor[[16, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
+                out = pl.add(x, x)
+                return out
+
+        prepared = passes.convert_to_ssa()(Prog)
+        prepared_kernel = next(f for _, f in prepared.functions.items() if f.name == "add")
+        assert prepared_kernel.attrs["__auto_schedule_returned_out_param_indices"] == [1]
+
+        declined = passes.auto_fuse()(prepared)
+        declined_kernel = next(f for _, f in declined.functions.items() if f.name == "add")
+        assert "__auto_schedule_returned_out_param_indices" not in declined_kernel.attrs
+        assert declined_kernel.attrs["auto_tile"] is True
+        assert "pl.tensor.add(" in declined_kernel.as_python()
+        assert "pl.spmd(" not in declined_kernel.as_python()
 
     def test_split_k_matmul_first_partial_then_atomic(self, ascend_backend):
         """Split-K initializes its output with cube work, not an AIV zero seed.

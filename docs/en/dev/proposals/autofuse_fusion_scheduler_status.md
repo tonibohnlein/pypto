@@ -231,6 +231,12 @@ coverage close the remaining representational gaps on host without fitting AutoF
   explicit prefetch copy, with every tensor's actual dtype in `VectorStreamPlan`; the emitter
   consumes that geometry. Tall / wide / reused-input and mixed-width
   FP32-intermediate→INT8-output chains all fit UB.
+- Non-native casts are expanded to the backend's native `tcvt` chain before Fusebox planning.
+  Planning and tile legalization share `FindTcvtPath`, every intermediate retains its own dtype-sized
+  lifetime, the whole chain uses one physical element granule, and generated cast source/destination
+  buffers are explicitly non-aliasing. On 910B, FP16/FP32 vector arithmetic is admitted; BF16 remains
+  valid for storage, cube operands, and cast endpoints, while unsupported BF16 or INT8 vector
+  arithmetic declines before PTOAS.
 - Reductions: P1 (bare) + P2 (spanning apply), streamed over the reduced axis, **both passes pipelined
   (A5/G2)** — accumulator persists, loads double-buffer; numerically exact.
 - Broadcast operands (G4), multi-sink, and S2 terminal-`col_sum` cross-core split with tiled zero
@@ -245,6 +251,12 @@ coverage close the remaining representational gaps on host without fitting AutoF
   lifetime and a DDR boundary output; P4 rejects an escaping statistic and multi-sink emission
   assembles every returned value. Partition/group-DAG and solution ephemeral-gap checks likewise
   treat that producing group as a slow-memory source for consumers in later groups.
+- Singleton-column reductions may be normalized from `[N,1]` to `[1,N]` schedule coordinates. The
+  solution records `singleton_column_to_row`; emission keeps the public tensor shape, inserts a
+  zero-copy view, and uses the corresponding row reduction/expansion operations. The transform is
+  all-or-nothing for one group and declines full-frame descendants that cannot be represented safely.
+  Explicit `Out` lineage is likewise retained across repeated SSA conversion so reordered equal-type
+  direct-call and `Submit` outputs remain wired to the correct parameters.
 - **P4 softmax** — fused online flash `(m,l)` with `exp(m_old−m_new)` rescale; the cone is verified
   EXACT by the shared descriptor (only `row_max→sub(x,m)→exp→row_sum→div`); stats and apply passes
   stage-2 pipelined when their rolled trip count is at least 2. The G7/G8/G9 device run found it

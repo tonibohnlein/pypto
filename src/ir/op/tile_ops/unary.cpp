@@ -280,6 +280,10 @@ REGISTER_OP("tile.cast")
     .set_attr<int>("mode")  // Round Mode: None(0), RINT(1), ROUND(2), FLOOR(3), CEIL(4), TRUNC(5), ODD(6)
     .set_input_memory(0, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
+    // TCVT reads and writes different element representations. Ordinary casts
+    // therefore require distinct source/destination storage; an explicit
+    // bitcast/reinterpret op is the opt-in zero-copy representation change.
+    .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileCastType(args, kwargs, "tile.cast");

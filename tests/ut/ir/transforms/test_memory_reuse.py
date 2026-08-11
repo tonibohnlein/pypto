@@ -422,8 +422,8 @@ class TestDtype:
     not_inplace_safe()/forbid_output_alias() instead.
     """
 
-    def test_cross_dtype_can_reuse(self):
-        """All tiles collapse onto one buffer regardless of FP32/BF16 dtype."""
+    def test_cross_dtype_cast_separates_source_and_destination(self):
+        """Ordinary tile.cast keeps source and destination storage distinct."""
 
         @pl.program
         class Before:
@@ -443,9 +443,9 @@ class TestDtype:
                 result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_e, [0, 0], output)
                 return result
 
-        # With the dtype gate removed, all tiles chain-reuse one buffer:
-        # tile_a/tile_b (FP32) and tile_cast/tile_d/tile_e (BF16) all share
-        # mem_vec_2 (16384 bytes — sized for the largest, FP32, occupant).
+        # Same-representation chains still reuse normally, but tile.cast is an
+        # execution-time conversion rather than a zero-copy reinterpretation.
+        # Its BF16 destination therefore starts a distinct physical chain.
         @pl.program
         class Expected:
             @pl.function
@@ -455,19 +455,20 @@ class TestDtype:
                 output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 8192)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
                     input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
                 )
-                tile_cast: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                tile_cast: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_3, 0, 8192), pl.Mem.Vec] = (
                     pl.tile.cast(tile_b, target_type=pl.BF16, mode="round")
                 )
-                tile_d: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
+                tile_d: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_3, 0, 8192), pl.Mem.Vec] = pl.tile.add(
                     tile_cast, tile_cast
                 )
-                tile_e: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
+                tile_e: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_3, 0, 8192), pl.Mem.Vec] = pl.tile.add(
                     tile_d, tile_d
                 )
                 result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(

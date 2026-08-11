@@ -50,6 +50,7 @@
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/soc.h"
+#include "pypto/backend/common/tcvt_path.h"
 #include "pypto/core/common.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
@@ -63,6 +64,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/passes.h"
@@ -174,7 +176,7 @@ constexpr int64_t kL0TileM = 128;  // L0 GEMM base M (pto-isa oracle)
 constexpr int64_t kL0TileN = 256;  // L0 GEMM base N (pto-isa oracle)
 // Grounded vector (AIV) cost: per op = slope*repeat + head+tail (once per chain), repeat =
 // ceil(elems / (vec_reg_bytes/dtype_bytes)). pto-isa A2A3 cce_costmodel_vector_compute.hpp,
-// 910B3-calibrated (`标定`, dav-2201, R^2~1.0): 256-byte vreg (64 fp32 / 128 fp16 per repeat);
+// 910B3-calibrated (dav-2201, R^2~1.0): 256-byte vreg (64 fp32 / 128 fp16 per repeat);
 // per-op fixed (head+tail) ~24 (vadd) to ~31 (vexp); slope 2 for vadd/vsub/vmul/vexp, 4 for vdiv,
 // 1 for vrsqrt/vrelu/vmuls. Per-op slope overrides are set per Op via VecOpSlope; the +16
 // count-mode floor for unaligned width lives in the solver's VecOpCompute. The head/tail SPLIT
@@ -312,6 +314,73 @@ std::optional<StmtPtr> HoistInlineReturnComputeExprs(const StmtPtr& body) {
   return SeqStmts::Flatten(std::move(out), body->span_);
 }
 
+// Expand source tensor.cast operations into the backend's native TCVT chain
+// before constructing the Fusebox problem. Every conversion and dtype-sized
+// intermediate is therefore a first-class solver op/tensor, keeping pebbling,
+// compute pricing, UB feasibility, and generic emission on one exact graph.
+class ExpandAutoScheduleTensorCasts : public IRMutator {
+ public:
+  explicit ExpandAutoScheduleTensorCasts(const backend::TcvtAdjacency& table) : table_(table) {}
+
+ protected:
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto call = As<Call>(op->value_);
+    if (!call || !IsOp(call, "tensor.cast") || call->args_.empty()) {
+      return IRMutator::VisitStmt_(op);
+    }
+    auto source = AsTensorTypeLike(call->args_[0]->GetType());
+    auto target = AsTensorTypeLike(call->GetType());
+    if (!source || !target) return IRMutator::VisitStmt_(op);
+    const std::vector<DataType> path = backend::FindTcvtPath(table_, source->dtype_, target->dtype_);
+    // An empty path is an admission error diagnosed by ProblemBuilder.
+    if (path.empty()) return IRMutator::VisitStmt_(op);
+    if (path.size() == 1) {
+      auto native = As<Call>(VisitExpr(call));
+      auto rewritten = MutableCopy(op);
+      rewritten->value_ = native;
+      return rewritten;
+    }
+
+    ExprPtr current = VisitExpr(call->args_[0]);
+    std::vector<StmtPtr> chain;
+    chain.reserve(path.size());
+    for (size_t hop = 0; hop < path.size(); ++hop) {
+      std::vector<std::pair<std::string, std::any>> kwargs = call->kwargs_;
+      for (auto& [key, value] : kwargs) {
+        if (key == "target_type") value = path[hop];
+      }
+      CallPtr native =
+          As<Call>(OpRegistry::GetInstance().Create("tensor.cast", {current}, kwargs, op->span_));
+      INTERNAL_CHECK_SPAN(native != nullptr, op->span_)
+          << "Internal error: AutoFuse failed to construct a native tensor.cast hop";
+      native = std::make_shared<Call>(native->op_, native->args_, native->kwargs_, call->attrs_,
+                                      native->GetType(), native->span_);
+      const bool final_hop = hop + 1 == path.size();
+      VarPtr result = final_hop
+                          ? op->var_
+                          : std::make_shared<Var>(op->var_->name_hint_ + "_cast_" + path[hop].ToString() +
+                                                      "_" + std::to_string(temp_counter_++),
+                                                  native->GetType(), op->span_);
+      chain.push_back(std::make_shared<AssignStmt>(result, native, op->span_));
+      current = result;
+    }
+    return SeqStmts::Flatten(std::move(chain), op->span_);
+  }
+
+ private:
+  const backend::TcvtAdjacency& table_;
+  size_t temp_counter_ = 0;
+};
+
+FunctionPtr ExpandNativeTensorCastChains(const FunctionPtr& func) {
+  const auto* context = PassContext::Current();
+  const auto* handler = context ? context->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+  if (!func || !handler || !func->body_) return func;
+  auto expanded = MutableCopy(func);
+  expanded->body_ = ExpandAutoScheduleTensorCasts(handler->GetTcvtAdjacency()).VisitStmt(func->body_);
+  return expanded;
+}
+
 // One adapter-owned capability descriptor feeds solver admission and generic
 // emission. Cost class alone is insufficient: product and arg reductions need
 // different streaming state, while tensor.full has no strip-rewritable source
@@ -421,6 +490,19 @@ VectorOpDescriptor DescribeVectorOp(const CallPtr& call) {
 }
 
 ::OpType ClassifyOp(const CallPtr& call) { return DescribeVectorOp(call).type; }
+
+std::string SingletonColumnRowEquivalentOp(const CallPtr& call) {
+  if (IsOp(call, "tensor.col_sum")) return "tensor.row_sum";
+  if (IsOp(call, "tensor.col_max")) return "tensor.row_max";
+  if (IsOp(call, "tensor.col_expand_add")) return "tensor.row_expand_add";
+  if (IsOp(call, "tensor.col_expand_sub")) return "tensor.row_expand_sub";
+  if (IsOp(call, "tensor.col_expand_mul")) return "tensor.row_expand_mul";
+  if (IsOp(call, "tensor.col_expand_div")) return "tensor.row_expand_div";
+  if (IsOp(call, "tensor.col_expand_max")) return "tensor.row_expand_max";
+  if (IsOp(call, "tensor.col_expand_min")) return "tensor.row_expand_min";
+  if (IsOp(call, "tensor.col_expand_expdif")) return "tensor.row_expand_expdif";
+  return call->op_->name_;
+}
 
 // Per-op VECTOR compute slope (cycles per SIMD repeat) when it differs from the elementwise
 // default (~2). pto-isa vec_tile_study measured: most pointwise ops are slope 2, but the div
@@ -906,6 +988,7 @@ class ProblemBuilder {
   // is NOT a user error (both are legal signatures), so it is a graceful decline, not a
   // CHECK: an auto_fuse-marked function with a symbolic dim must still compile.
   bool declined() const { return declined_; }
+  const std::string& decline_reason() const { return decline_reason_; }
 
   void Build(const FunctionPtr& func, const ProgramPtr& prog, bool plan_driven_emit) {
     problem.fast_memory_capacity = kFastMemoryCapacity;
@@ -1132,14 +1215,39 @@ class ProblemBuilder {
       const size_t out = stmt_output_.at(stmt);
       sop.outputs.push_back(out);
       std::tie(sop.vector_primitive, sop.vector_geometry) = ClassifyVectorOpSemantics(call, sop, problem);
-      if (mixed_function && sop.type == ::OpType::Pointwise &&
-          sop.vector_capability == ::VectorOpCapability::Elementwise && !IsOp(call, "tensor.cast")) {
+      if (IsOp(call, "tensor.cast")) {
+        const auto source_type = call->args_.empty() ? nullptr : AsTensorTypeLike(call->args_[0]->GetType());
+        const auto output_type = AsTensorTypeLike(call->GetType());
+        const auto* pctx = PassContext::Current();
+        const auto* handler = pctx ? pctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+        if (!source_type || !output_type || handler == nullptr) {
+          Decline("tensor.cast has no static tensor dtype or configured native TCVT table");
+        } else {
+          const std::vector<DataType> path =
+              backend::FindTcvtPath(handler->GetTcvtAdjacency(), source_type->dtype_, output_type->dtype_);
+          if (path.empty()) {
+            Decline("tensor.cast has no native conversion path on the selected backend");
+          }
+        }
+      } else if (sop.type != ::OpType::MatMul && sop.vector_capability != ::VectorOpCapability::Unsupported) {
+        auto compute_dtype_supported = [](const TypePtr& type) {
+          const auto tensor = AsTensorTypeLike(type);
+          return !tensor || tensor->dtype_ == DataType::FP16 || tensor->dtype_ == DataType::FP32;
+        };
+        bool supported = compute_dtype_supported(call->GetType());
+        for (const ExprPtr& arg : call->args_) supported &= compute_dtype_supported(arg->GetType());
+        if (!supported) {
+          Decline(
+              "Ascend910B vector arithmetic supports FP16 and FP32; BF16 remains available for "
+              "storage, cube operands, and cast endpoints");
+        }
+      }
+      if (sop.type != ::OpType::MatMul && sop.vector_capability != ::VectorOpCapability::Unsupported &&
+          !IsOp(call, "tensor.cast")) {
         const ::DType output_dtype = problem.tensors[out].dtype;
         for (size_t input : sop.inputs) {
           if (problem.tensors[input].dtype != output_dtype) {
-            // The emitted PTO primitive has no implicit tensor promotion. A
-            // cut would reach the same tile op, so fail closed at the source.
-            declined_ = true;
+            Decline("automatic vector scheduling requires explicit tensor.cast for mixed tensor dtypes");
           }
         }
       }
@@ -1147,6 +1255,8 @@ class ProblemBuilder {
       op_labels.push_back(call->op_->name_);
       op_stmts.push_back(stmt);
     }
+
+    if (plan_driven_emit) NormalizeSingletonColumnReduction();
 
     if (plan_driven_emit) {
       std::unordered_map<const Stmt*, size_t> op_index;
@@ -1195,6 +1305,57 @@ class ProblemBuilder {
   std::unordered_map<const Stmt*, size_t> stmt_output_;
   std::unordered_set<const Var*> in_params_;
   bool declined_ = false;
+  std::string decline_reason_;
+
+  void Decline(std::string reason) {
+    declined_ = true;
+    if (decline_reason_.empty()) decline_reason_ = std::move(reason);
+  }
+
+  void NormalizeSingletonColumnReduction() {
+    if (declined_ || problem.ops.empty()) return;
+    bool has_column_reduction = false;
+    bool all_vector = true;
+    int64_t iteration_width = 1;
+    for (const ::Tensor& tensor : problem.tensors) iteration_width = std::max(iteration_width, tensor.width);
+    for (const ::Op& op : problem.ops) {
+      all_vector &= op.type != ::OpType::MatMul;
+      has_column_reduction |= op.vector_primitive == ::VectorPrimitiveFamily::ColSum ||
+                              op.vector_primitive == ::VectorPrimitiveFamily::ColExtrema;
+      if (op.type == ::OpType::Reduction && op.vector_primitive != ::VectorPrimitiveFamily::ColSum &&
+          op.vector_primitive != ::VectorPrimitiveFamily::ColExtrema) {
+        return;
+      }
+    }
+    if (!all_vector || !has_column_reduction || iteration_width != 1) return;
+
+    for (size_t tensor : problem.required_outputs) {
+      const ::Tensor& output = problem.tensors[tensor];
+      if (output.height != 1 || output.width != 1) {
+        Decline("full-frame descendants of a singleton-column reduction are not yet representable");
+        return;
+      }
+    }
+    for (const ::Op& op : problem.ops) {
+      if (op.vector_geometry == ::VectorOpGeometry::RowExpand) {
+        Decline("degenerate row expansion inside a singleton-column reduction is unsupported");
+        return;
+      }
+    }
+
+    problem.vector_coordinate_transform = ::VectorCoordinateTransform::SingletonColumnToRow;
+    for (::Tensor& tensor : problem.tensors) std::swap(tensor.height, tensor.width);
+    for (::Op& op : problem.ops) {
+      if (op.vector_primitive == ::VectorPrimitiveFamily::ColSum) {
+        op.vector_primitive = ::VectorPrimitiveFamily::RowSum;
+      } else if (op.vector_primitive == ::VectorPrimitiveFamily::ColExtrema) {
+        op.vector_primitive = ::VectorPrimitiveFamily::RowExtrema;
+      }
+      if (op.vector_geometry == ::VectorOpGeometry::ColExpand) {
+        op.vector_geometry = ::VectorOpGeometry::RowExpand;
+      }
+    }
+  }
 
   size_t TensorId(const VarPtr& var) {
     const Var* raw = var.get();
@@ -1442,6 +1603,11 @@ void DumpProblemJson(const ::Problem& p, const std::string& path) {
     first_required = false;
   }
   f << "],\n  \"fast_memory_capacity\": " << p.fast_memory_capacity;
+  f << ",\n  \"vector_coordinate_transform\": \""
+    << (p.vector_coordinate_transform == ::VectorCoordinateTransform::SingletonColumnToRow
+            ? "singleton_column_to_row"
+            : "none")
+    << "\"";
   // 910B topology + grounded pto-isa machine model — emit so a dumped instance
   // re-loads (io.cpp) into the SAME grounded cost path the pass solved with.
   f << ",\n  \"num_cube_cores\": " << p.num_cube_cores << ",\n  \"num_vector_cores\": " << p.num_vector_cores
@@ -2551,6 +2717,13 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   }
   if (ops.empty()) return std::nullopt;
   const ::VectorStreamPlan& solver_stream = tile.vector_stream;
+  const bool singleton_column_to_row =
+      solver_stream.coordinate_transform == ::VectorCoordinateTransform::SingletonColumnToRow;
+  auto scheduled_shape = [&](const TypePtr& type) {
+    auto shape = Static2DShape(type);
+    if (singleton_column_to_row && shape.first >= 0) std::swap(shape.first, shape.second);
+    return shape;
+  };
   if (!solver_stream.input_lifetimes) {
     return GenericDeclineB("solver vector plan has no boundary-input lifetime topology", ops.front()->span_);
   }
@@ -2668,11 +2841,11 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   // (reduced) shape. For a plain [M,N] sink IM,IN == M,N, so this is a no-op there.
   int64_t IM = M, IN = N;
   for (const auto& a : ops) {
-    const auto [oM, oN] = Static2DShape(a->var_->GetType());
+    const auto [oM, oN] = scheduled_shape(a->var_->GetType());
     IM = std::max(IM, oM);
     IN = std::max(IN, oN);
     for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
-      const auto [aM, aN] = Static2DShape(arg->GetType());
+      const auto [aM, aN] = scheduled_shape(arg->GetType());
       IM = std::max(IM, aM);
       IN = std::max(IN, aN);
     }
@@ -2686,7 +2859,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
     for (const ExprPtr& arg : As<Call>(a->value_)->args_) {
       auto v = AsVarLike(arg);
       if (v != nullptr && defined.count(v.get()) != 0) continue;
-      const auto [aM, aN] = Static2DShape(arg->GetType());
+      const auto [aM, aN] = scheduled_shape(arg->GetType());
       if (aM < 0) {
         // Static2DShape returns {-1,-1} for a true scalar AND for a non-2D / dynamic-shape
         // TENSOR alike. Only the former (a non-tensor operand — e.g. a broadcast scale) is
@@ -2720,8 +2893,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
     for (const auto& a : ops) {
       auto rc = As<Call>(a->value_);
       if (ClassifyOp(rc) != ::OpType::Reduction || rc->args_.empty()) continue;
-      const auto [riM, riN] = Static2DShape(rc->args_[0]->GetType());
-      const auto [roM, roN] = Static2DShape(a->var_->GetType());
+      const auto [riM, riN] = scheduled_shape(rc->args_[0]->GetType());
+      const auto [roM, roN] = scheduled_shape(a->var_->GetType());
       if (riN > 1 && roN == 1) pin_n = true;  // row reduction -> N pinned
       if (riM > 1 && roM == 1) pin_m = true;  // col reduction -> M pinned
     }
@@ -2822,8 +2995,8 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
     for (const auto& a : ops) {
       auto c = As<Call>(a->value_);
       if (ClassifyOp(c) != ::OpType::Reduction || c->args_.empty()) continue;
-      const auto [iM, iN] = Static2DShape(c->args_[0]->GetType());
-      const auto [oM, oN] = Static2DShape(a->var_->GetType());
+      const auto [iM, iN] = scheduled_shape(c->args_[0]->GetType());
+      const auto [oM, oN] = scheduled_shape(a->var_->GetType());
       if (iM < 0 || oM < 0) return std::nullopt;   // Tier-A: dynamic shape (capability)
       const bool reduces_N = (iN > 1 && oN == 1);  // row reduction [M,N] -> [M,1]
       const bool reduces_M = (iM > 1 && oM == 1);  // col reduction [M,N] -> [1,N]
@@ -2900,7 +3073,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   // region this is byte-identical to emit_strip's prior inline slice.
   auto slice_input = [&](const ExprPtr& arg, int64_t sh, int64_t sw, const ExprPtr& smi, const ExprPtr& sni,
                          std::vector<StmtPtr>& out, int slot) -> VarPtr {
-    const auto [aM, aN] = Static2DShape(arg->GetType());
+    const auto [aM, aN] = scheduled_shape(arg->GetType());
     const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
     const int64_t sw_al = AlignUp(sw, g);
     const bool bcast_m = (aM == 1), bcast_n = (aN == 1);
@@ -2909,13 +3082,22 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
     const ExprPtr roff = bcast_m ? MakeIndex(0, sp) : smi;
     const ExprPtr coff = bcast_n ? MakeIndex(0, sp) : sni;
     const bool sl_ragged = (rext_al != rext) || (cext_al != cext);
+    ExprPtr source = arg;
+    const auto [source_m, source_n] = Static2DShape(arg->GetType());
+    if (singleton_column_to_row && source_m >= 0 && (source_m != aM || source_n != aN)) {
+      auto view =
+          reg.Create("tensor.view", {arg, MakeIndexTuple({aM, aN}, sp)}, {{"layout", TensorLayout::ND}}, sp);
+      auto viewed = std::make_shared<Var>(base + "_view" + std::to_string(slot), view->GetType(), sp);
+      out.push_back(std::make_shared<AssignStmt>(viewed, view, sp));
+      source = viewed;
+    }
     ExprPtr sl = sl_ragged
                      ? reg.Create("tensor.slice",
-                                  {arg, MakeIndexTuple({rext_al, cext_al}, sp), MakeTuple2(roff, coff, sp),
+                                  {source, MakeIndexTuple({rext_al, cext_al}, sp), MakeTuple2(roff, coff, sp),
                                    MakeIndexTuple({rext, cext}, sp)},
                                   sp)
                      : reg.Create("tensor.slice",
-                                  {arg, MakeIndexTuple({rext, cext}, sp), MakeTuple2(roff, coff, sp)}, sp);
+                                  {source, MakeIndexTuple({rext, cext}, sp), MakeTuple2(roff, coff, sp)}, sp);
     auto sv = std::make_shared<Var>(base + "_in" + std::to_string(slot), sl->GetType(), sp);
     out.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
     return sv;
@@ -3014,7 +3196,7 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
             continue;
           }  // intermediate on-chip
         }
-        const auto [aM, aN] = Static2DShape(arg->GetType());
+        const auto [aM, aN] = scheduled_shape(arg->GetType());
         if (aM < 0) {
           targs.push_back(arg);  // scalar / non-2D -> as-is
           continue;
@@ -3043,7 +3225,9 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
         if (v != nullptr) input_cache[v.get()] = sv;
         targs.push_back(sv);
       }
-      auto pw = reg.Create(c->op_->name_, targs, c->kwargs_, sp);
+      const std::string emission_op =
+          singleton_column_to_row ? SingletonColumnRowEquivalentOp(c) : c->op_->name_;
+      auto pw = reg.Create(emission_op, targs, c->kwargs_, sp);
       // Unique name per intermediate (a multi-consumer intermediate must keep a distinct name).
       auto res = std::make_shared<Var>(
           a == out_stmt ? (base + "_tile") : (base + "_t" + std::to_string(onchip.size())), pw->GetType(),
@@ -5687,6 +5871,18 @@ StmtPtr EmitFusedScopes(const StmtPtr& body, const std::unordered_map<const Stmt
 // ---------------------------------------------------------------------------
 // Wire a return-based fused function to a named Out param
 // ---------------------------------------------------------------------------
+void StripAutoScheduleOutputLineage(Function* func) {
+  if (func == nullptr) return;
+  func->attrs_ = StripAttr(func->attrs_, kAutoScheduleReturnedOutParamIndicesAttr);
+}
+
+FunctionPtr WithoutAutoScheduleOutputLineage(const FunctionPtr& func) {
+  if (!func || !func->HasAttr(kAutoScheduleReturnedOutParamIndicesAttr)) return func;
+  auto copy = MutableCopy(func);
+  StripAutoScheduleOutputLineage(copy.get());
+  return copy;
+}
+
 //
 // A marked auto_fuse function is return-based (`def f(a) -> Tensor: ...; return
 // d`) and the emitters realize its output as a runtime-allocated `c_init =
@@ -5717,9 +5913,6 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
     if (func->param_directions_[i] == ParamDirection::Out ||
         func->param_directions_[i] == ParamDirection::InOut)
       existing_out.insert(func->params_[i].get());
-  // Called internally: changing the signature would break its callsites.
-  if (called_funcs.count(func->name_) != 0) return;
-
   // Index the body: first ReturnStmt, per-var defining assign, and for-loop
   // carry edges (iter_arg / tensor return_var -> iter_arg init var). Mirrors
   // return_lineage's tracer so the return-buffer trace below matches codegen.
@@ -5794,15 +5987,15 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
     return nullptr;
   };
 
-  // Walk the same return lineage; TRUE if it lands on an existing Out/InOut param (already wired by
-  // codegen — leave it alone). Mirrors trace_to_create's chain (rebind / assemble arg0 /
-  // set_validshape arg0 / tile.store arg2 / for-carry).
-  auto reaches_out_param = [&](const VarPtr& ret_var) -> bool {
-    if (existing_out.empty()) return false;
+  // Walk the same return lineage and return the existing Out/InOut parameter it
+  // reaches, if any. This is also used to verify the transient SSA lineage map:
+  // a return may not silently land on a different output with the same type.
+  auto reached_out_param = [&](const VarPtr& ret_var) -> const Var* {
+    if (existing_out.empty()) return nullptr;
     const Var* cur = ret_var.get();
     std::unordered_set<const Var*> seen;
     while (cur != nullptr) {
-      if (existing_out.count(cur) != 0) return true;
+      if (existing_out.count(cur) != 0) return cur;
       if (!seen.insert(cur).second) break;
       if (auto it = idx.carry.find(cur); it != idx.carry.end()) {
         cur = it->second;
@@ -5831,7 +6024,7 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
       }
       break;
     }
-    return false;
+    return nullptr;
   };
 
   // Trace EVERY returned tensor to its output buffer's create. All-or-nothing: a partial
@@ -5845,6 +6038,82 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
   std::unordered_set<const Stmt*> top_level;
   top_level.reserve(seq->stmts_.size());
   for (const StmtPtr& s : seq->stmts_) top_level.insert(s.get());
+
+  // ConvertToSSA records return-position -> explicit-Out-param lineage before
+  // the independently versioned Vars lose that source-level association. The
+  // scheduler's emitter creates fresh output buffers, so wire each such buffer
+  // back to its proven destination before considering ABI-changing output
+  // lifting. This is safe for called functions too: their signatures remain
+  // unchanged and direct Call/Submit sites keep passing the same Out params.
+  if (func->HasAttr(kAutoScheduleReturnedOutParamIndicesAttr)) {
+    const std::vector<int32_t> lineage =
+        func->GetAttr<std::vector<int32_t>>(kAutoScheduleReturnedOutParamIndicesAttr, {});
+    INTERNAL_CHECK_SPAN(lineage.size() == idx.ret->value_.size(), func->span_)
+        << "Internal error: automatic-scheduling output-lineage arity changed before AutoFuse emission";
+
+    std::unordered_map<const Var*, VarPtr> replacements;
+    std::unordered_set<const Stmt*> lineage_drop;
+    std::unordered_set<int32_t> seen_params;
+    for (size_t i = 0; i < lineage.size(); ++i) {
+      const int32_t param_index = lineage[i];
+      if (param_index < 0) continue;
+      INTERNAL_CHECK_SPAN(static_cast<size_t>(param_index) < func->params_.size() &&
+                              static_cast<size_t>(param_index) < func->param_directions_.size() &&
+                              func->param_directions_[param_index] == ParamDirection::Out,
+                          func->span_)
+          << "Internal error: automatic-scheduling output lineage references a parameter that is not Out";
+      INTERNAL_CHECK_SPAN(seen_params.insert(param_index).second, func->span_)
+          << "Internal error: automatic-scheduling output lineage targets one Out parameter more than once";
+      auto ret_var = AsVarLike(idx.ret->value_[i]);
+      INTERNAL_CHECK_SPAN(ret_var != nullptr, idx.ret->span_)
+          << "Internal error: automatic-scheduling output lineage requires named returned values";
+      const VarPtr& destination = func->params_[static_cast<size_t>(param_index)];
+      if (const Var* reached = reached_out_param(ret_var)) {
+        INTERNAL_CHECK_SPAN(reached == destination.get(), idx.ret->span_)
+            << "Internal error: scheduled return is wired to a different explicit Out parameter";
+        continue;
+      }
+      AssignStmtPtr create = trace_to_create(ret_var);
+      INTERNAL_CHECK_SPAN(create != nullptr && top_level.count(create.get()) != 0, idx.ret->span_)
+          << "Internal error: scheduled explicit-Out return has no top-level output buffer";
+      INTERNAL_CHECK_SPAN(lineage_drop.insert(create.get()).second, idx.ret->span_)
+          << "Internal error: two scheduled returns share one output buffer";
+      replacements.emplace(create->var_.get(), destination);
+    }
+
+    StripAutoScheduleOutputLineage(func.get());
+
+    if (!replacements.empty()) {
+      class OutputBufferSubstituter : public IRMutator {
+       public:
+        explicit OutputBufferSubstituter(const std::unordered_map<const Var*, VarPtr>& replacements)
+            : replacements_(replacements) {}
+
+       protected:
+        ExprPtr VisitExpr_(const VarPtr& op) override {
+          auto found = replacements_.find(op.get());
+          return found == replacements_.end() ? op : found->second;
+        }
+
+       private:
+        const std::unordered_map<const Var*, VarPtr>& replacements_;
+      } substitute(replacements);
+
+      std::vector<StmtPtr> rewired;
+      rewired.reserve(seq->stmts_.size());
+      for (const StmtPtr& stmt : seq->stmts_) {
+        if (lineage_drop.count(stmt.get()) == 0) rewired.push_back(substitute.VisitStmt(stmt));
+      }
+      func->body_ = SeqStmts::Flatten(std::move(rewired), seq->span_);
+      MaybeLiftReturnToOutParam(func, called_funcs);
+      return;
+    }
+  }
+
+  // Called internally: after explicit Out lineage has been restored, changing
+  // the signature for any remaining return would break its callsites.
+  if (called_funcs.count(func->name_) != 0) return;
+
   auto& reg = OpRegistry::GetInstance();
   const Span rsp = idx.ret->span_;
   std::vector<VarPtr> out_params;            // Out-param Var per return, in return order
@@ -5854,7 +6123,7 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
   for (const ExprPtr& rv : idx.ret->value_) {
     auto ret_var = AsVarLike(rv);
     if (!ret_var) return;
-    if (reaches_out_param(ret_var)) {  // already an existing Out/InOut param -> codegen wires it
+    if (reached_out_param(ret_var)) {  // already an existing Out/InOut param -> codegen wires it
       new_ret.push_back(rv);
       continue;
     }
@@ -5949,20 +6218,21 @@ void MaybeLiftReturnToOutParam(const std::shared_ptr<Function>& func,
   return sol;
 }
 
-std::optional<::Solution> SolveWholeFunction(const ::Problem& prob, const ::DAG& dag, const std::string& fn) {
+std::optional<::Solution> SolveWholeFunction(const ::Problem& prob, const ::DAG& dag, const std::string& fn,
+                                             const char* request_name) {
   std::vector<size_t> all_ops(prob.num_ops());
   for (size_t i = 0; i < prob.num_ops(); ++i) all_ops[i] = i;
 
   std::optional<::Subgraph> subgraph = ::Subgraph::create(prob, dag, all_ops);
   if (!subgraph) {
-    LOG_INFO << "AutoTile[" << fn
+    LOG_INFO << request_name << "[" << fn
              << "]: whole tensor-op DAG is not one legal subgraph -> leaving function unchanged";
     return std::nullopt;
   }
 
   const ::CostResult cost = subgraph->best_cost();
   if (!cost.feasible || !std::isfinite(cost.latency)) {
-    LOG_INFO << "AutoTile[" << fn
+    LOG_INFO << request_name << "[" << fn
              << "]: whole tensor-op DAG has no feasible schedule -> leaving function unchanged";
     return std::nullopt;
   }
@@ -5973,13 +6243,13 @@ std::optional<::Solution> SolveWholeFunction(const ::Problem& prob, const ::DAG&
   const ::Solution::ValidationResult validation = solution.validate();
   if (!validation.valid || solution.num_steps() != 1 || !solution.step_cost(0).feasible ||
       !std::isfinite(solution.total_latency())) {
-    LOG_INFO << "AutoTile[" << fn << "]: whole-function schedule failed validation"
+    LOG_INFO << request_name << "[" << fn << "]: whole-function schedule failed validation"
              << (validation.error.empty() ? std::string() : ": " + validation.error)
              << " -> leaving function unchanged";
     return std::nullopt;
   }
 
-  LOG_INFO << "AutoTile[" << fn << "]: accepted one whole-function group, total latency "
+  LOG_INFO << request_name << "[" << fn << "]: accepted one whole-function group, total latency "
            << solution.total_latency();
   return solution;
 }
@@ -6020,6 +6290,11 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       new_functions.emplace(gvar, func);
       continue;
     }
+    auto keep_fallback = [&]() {
+      FunctionPtr fallback = WithoutAutoScheduleOutputLineage(func);
+      if (fallback != func) any_change = true;
+      new_functions.emplace(gvar, std::move(fallback));
+    };
     // `auto_tile` is an explicit request for the plan-driven emitter. `auto_fuse`
     // preserves the existing environment-controlled rollout policy.
     const bool plan_driven_emit = mode == AutoScheduleMode::Tile || GenericEmitEnabled();
@@ -6032,12 +6307,16 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       mut->body_ = *hoisted;
       wfunc = mut;
     }
+    wfunc = ExpandNativeTensorCastChains(wfunc);
     ProblemBuilder builder;
     builder.Build(wfunc, prog, plan_driven_emit);
     // Empty problem (no compute ops) or out-of-scope (non-tensor output / dynamic shape)
     // -> leave the function untouched for legacy lowering.
     if (builder.declined() || builder.problem.ops.empty()) {
-      new_functions.emplace(gvar, func);
+      if (builder.declined() && !builder.decline_reason().empty()) {
+        LOG_INFO << "AutoFuse[" << func->name_ << "]: admission decline — " << builder.decline_reason();
+      }
+      keep_fallback();
       continue;
     }
     // Print the intercepted tensor graph (the raw op+tensor DAG the pass sees).
@@ -6077,18 +6356,25 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       if (const char* dump_dir = std::getenv("PYPTO_AUTOFUSE_DUMP")) {
         DumpProblemJson(builder.problem, std::string(dump_dir) + "/" + func->name_ + ".dag.json");
       }
-      new_functions.emplace(gvar, func);
+      keep_fallback();
       continue;
     }
 
     // Solve, then print the fusion decision: each group's member ops + chosen tile.
     ::DAG dag = ::DAG::build(builder.problem);
+    const bool coordinate_normalized =
+        builder.problem.vector_coordinate_transform != ::VectorCoordinateTransform::None;
+    // The coordinate transform is valid only while its complete reduction cone
+    // remains one group. A cut would expose a scheduled [1,N] tensor through an
+    // original [N,1] GM boundary, so require the same all-or-nothing contract as
+    // auto_tile even when the request originated from auto_fuse.
     std::optional<::Solution> maybe_solution =
-        mode == AutoScheduleMode::Tile
-            ? SolveWholeFunction(builder.problem, dag, func->name_)
+        mode == AutoScheduleMode::Tile || coordinate_normalized
+            ? SolveWholeFunction(builder.problem, dag, func->name_,
+                                 mode == AutoScheduleMode::Tile ? "AutoTile" : "AutoFuse")
             : std::optional<::Solution>(SolveWithMergeOverride(builder.problem, dag, func->name_));
     if (!maybe_solution) {
-      new_functions.emplace(gvar, func);
+      keep_fallback();
       continue;
     }
     ::Solution& sol = *maybe_solution;
@@ -6276,7 +6562,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
       }
     }
     if (plan_replay_failed) {
-      new_functions.emplace(gvar, func);
+      keep_fallback();
       continue;
     }
     auto new_func = MutableCopy(wfunc);
@@ -6285,7 +6571,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
         EmitFusedScopes(wfunc->body_, stmt_group, stmt_tile, stmt_op, stmt_exec, group_p4_match,
                         builder.p4_matches, plan_driven_emit, mode == AutoScheduleMode::Tile, &emit_failed);
     if (emit_failed) {
-      new_functions.emplace(gvar, func);
+      keep_fallback();
       continue;
     }
     // Wire the return-based fused function to a named Out param so orchestration
@@ -6293,6 +6579,7 @@ ProgramPtr AutoFuseTransform(const ProgramPtr& prog) {
     // param position, not by return value). No-op for functions that already
     // have an Out param or are called internally.
     MaybeLiftReturnToOutParam(new_func, called_funcs);
+    StripAutoScheduleOutputLineage(new_func.get());
     // Drop the active marker once scheduled: the body is now an InCore-scoped kernel graph,
     // not a flat tensor-op DAG, so the pass is idempotent (a second run no-ops).
     const std::string active_marker = AutoScheduleModeName(mode);

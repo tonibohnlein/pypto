@@ -11,7 +11,9 @@ For each `var = tile.cast(...)`:
    knowledge of its own, so a new backend ships its own table and needs no change here.
    With no backend configured the pass is a no-op.
 2. Already native: leave unchanged (including FIXPIPE-foldable `FP32→BF16/FP16` with `mode=rint`).
-3. Non-native: BFS for a shortest path; among equal-length paths prefer "same byte-width → float, then adjust width".
+3. Non-native: call the shared `backend::FindTcvtPath` utility for a shortest path; among equal-length
+   paths prefer "same byte-width → float, then adjust width". Automatic scheduling calls the same
+   utility before planning, so its operation count and intermediate lifetimes match this pass.
 
 Typical A5 results: `INT32→FP16` → `INT32→FP32→FP16`; `FP16→BF16` → `FP16→FP32→BF16`.
 
@@ -33,6 +35,8 @@ an intermediate tile per hop (subject to the usual buffer reuse). A 3-hop chain
 is therefore roughly three times the vector work of a native cast on the same
 shape. In a vector-bound kernel that is a real cost — if a hot loop shows an
 unexpected chain, consider whether an equivalent dtype path avoids it.
+Ordinary `tile.cast` operations are not in-place-safe: each source and destination must have distinct
+live storage. Explicit bitcast/reinterpret operations remain the opt-in zero-copy mechanism.
 
 **Numerics.** A chain is bit-identical to a direct conversion when every
 intermediate represents the source values *that fall inside the destination's
