@@ -4745,7 +4745,7 @@ std::optional<std::vector<StmtPtr>> EmitCubeScheduleGroup(
            << " request instance(s), grid=" << parts_m << "x" << parts_n << "x" << plan.split_k
            << " spatial_policy=" << CubeSpatialPolicyName(plan.spatial_policy)
            << " split_merge=" << CubeSplitMergePolicyName(plan.split_merge_policy)
-           << " retained_panels=" << retained_panel_count
+           << " peak_l1_bytes=" << plan.peak_l1_bytes << " retained_panels=" << retained_panel_count
            << " retained_l1_bytes=" << retained_panel_bytes + resident_boundary_bytes
            << " shared_boundaries=" << plan.resident_boundaries.size();
   return result;

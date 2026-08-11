@@ -3722,7 +3722,7 @@ class TestAutoFuse:
             import re
 
             import pypto.language as pl
-            from pypto import backend
+            from pypto import backend, ir
             from pypto.backend import BackendType
             from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
@@ -3747,6 +3747,24 @@ class TestAutoFuse:
 
             body = aic[0].as_python()
             assert body.count("pl.tile.alloc(pl.Mem.Acc") == 1, body
+            acc_bases = set()
+
+            class AccBaseCollector(ir.IRVisitor):
+                def visit_assign_stmt(self, stmt):
+                    tile = stmt.var.type
+                    if (
+                        isinstance(tile, ir.TileType)
+                        and tile.memory_space == ir.MemorySpace.Acc
+                        and tile.memref is not None
+                    ):
+                        acc_bases.add(tile.memref.base_.name_hint)
+                    super().visit_assign_stmt(stmt)
+
+            AccBaseCollector().visit_stmt(aic[0].body)
+            assert len(acc_bases) == 1, (
+                "outer-K init, rolled windows, tail, carry, and drain must share "
+                f"one physical accumulator, got {{sorted(acc_bases)}}\\n{{body}}"
+            )
             assert re.search(
                 r"pl\\.tile\\.move\\([^)]*target_memory=pl\\.Mem\\.Acc",
                 body,
@@ -3779,6 +3797,91 @@ class TestAutoFuse:
             check=False,
         )
         assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+    def test_cube_serial_multi_role_plan_covers_emitted_l1_high_water(self):
+        """A serial multi-role plan prices every physical Mat/L1 allocation.
+
+        The graph uses one GM boundary as an LHS and an RHS in successive
+        requests. The role-expanded pebbling plan must include both physical
+        representations and any rolled request buffers in ``peak_l1_bytes``;
+        this cross-layer check compares that plan field with the final addressed
+        Mat tiles after the ordinary lowering and memory-allocation pipeline.
+        """
+        script = textwrap.dedent(
+            """
+            import pypto.language as pl
+            from pypto import LogLevel, backend, ir, set_log_level
+            from pypto.backend import BackendType
+            from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+            backend.set_backend_type(BackendType.Ascend910B)
+            set_log_level(LogLevel.INFO)
+
+            @pl.program
+            class Prog:
+                @pl.function(attrs={"auto_fuse": True})
+                def tree(
+                    self,
+                    shared: pl.Tensor[[32, 48], pl.BF16],
+                    lhs_rhs: pl.Tensor[[48, 64], pl.BF16],
+                    rhs_lhs: pl.Tensor[[64, 32], pl.BF16],
+                ) -> pl.Tensor[[32, 48], pl.BF16]:
+                    lhs: pl.Tensor[[32, 64], pl.BF16] = pl.matmul(shared, lhs_rhs)
+                    rhs: pl.Tensor[[64, 48], pl.BF16] = pl.matmul(rhs_lhs, shared)
+                    out: pl.Tensor[[32, 48], pl.BF16] = pl.matmul(lhs, rhs)
+                    return out
+
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+            aic = [f for _, f in lowered.functions.items() if str(f.func_type) == "FunctionType.AIC"]
+            assert len(aic) == 1, [f.name for _, f in lowered.functions.items()]
+
+            high_water = 0
+
+            class MatHighWaterCollector(ir.IRVisitor):
+                def visit_assign_stmt(self, stmt):
+                    global high_water
+                    tile = stmt.var.type
+                    if (
+                        isinstance(tile, ir.TileType)
+                        and tile.memory_space == ir.MemorySpace.Mat
+                        and tile.memref is not None
+                        and isinstance(tile.memref.byte_offset_, ir.ConstInt)
+                    ):
+                        high_water = max(
+                            high_water,
+                            int(tile.memref.byte_offset_.value) + tile.memref.size_,
+                        )
+                    super().visit_assign_stmt(stmt)
+
+            MatHighWaterCollector().visit_stmt(aic[0].body)
+            assert high_water > 0
+            print(f"EMITTED_L1_HIGH_WATER={high_water}")
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(os.path.abspath("python"))
+        env["PYPTO_AUTOFUSE_GENERIC_EMIT"] = "1"
+        env["PYPTO_AUTOFUSE_MIXED"] = "0"
+        env["PYPTO_AUTOFUSE_FORCE_MERGE"] = "all"
+        env["PYPTO_AUTOFUSE_STRICT"] = "1"
+        env["PYPTO_AUTOFUSE_EXACT_L0_COST"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+        planned = re.search(r"\bpeak_l1_bytes=(\d+)\b", proc.stderr)
+        emitted = re.search(r"EMITTED_L1_HIGH_WATER=(\d+)", proc.stdout)
+        assert planned is not None, proc.stderr
+        assert emitted is not None, proc.stdout
+        assert int(planned.group(1)) >= int(emitted.group(1)), (
+            f"cube plan prices {planned.group(1)} L1 bytes but final lowering "
+            f"addresses {emitted.group(1)} bytes\n{proc.stderr}"
+        )
 
     def test_mixed_declines_transposed_matmul_before_solving(self):
         """Mixed v0 must not rebuild a transposed matmul as default-orientation."""
