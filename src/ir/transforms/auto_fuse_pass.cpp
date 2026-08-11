@@ -3065,8 +3065,10 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
   const int64_t h_al = AlignUp(h, g), w_al = AlignUp(w, g);
   // slice_input: slice ONE 2D external input `arg` to a [sh, sw] VALID region at (smi, sni),
   // granule-padding the ALLOCATED extent (the row axis padded only for a reduction/col-major tile —
-  // see the layout note in emit_strip). A broadcast axis (extent 1 in `arg`) stays [1] at offset 0
-  // (read whole, broadcast in the op). Pushes the slice assign to `out` (named base+"_in"+slot so
+  // see the layout note in emit_strip). A singleton axis stays [1] only when it is a graph-relative
+  // broadcast or a reduction result's collapsed axis. A full-frame singleton still receives the
+  // physical DMA frame required by its layout. Pushes the slice assign to `out` (named
+  // base+"_in"+slot so
   // distinct inputs never collapse) and returns its Var. Factored out of emit_strip so the P4 pass-0
   // online-stats body can DMA a chunk's x-slice EXACTLY ONCE — the io_in*=2 (A7 stream_passes=2)
   // pricing depends on each chunk being read once per pass. For a full [IM,IN] input with an aligned
@@ -3076,11 +3078,18 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
     const auto [aM, aN] = scheduled_shape(arg->GetType());
     const int64_t sh_al = has_reduction ? AlignUp(sh, g) : sh;
     const int64_t sw_al = AlignUp(sw, g);
-    const bool bcast_m = (aM == 1), bcast_n = (aN == 1);
-    const int64_t rext = bcast_m ? 1 : sh, rext_al = bcast_m ? 1 : sh_al;
-    const int64_t cext = bcast_n ? 1 : sw, cext_al = bcast_n ? 1 : sw_al;
-    const ExprPtr roff = bcast_m ? MakeIndex(0, sp) : smi;
-    const ExprPtr coff = bcast_n ? MakeIndex(0, sp) : sni;
+    const bool bcast_m = aM == 1 && IM > 1;
+    const bool bcast_n = aN == 1 && IN > 1;
+    const bool thin_reduction_m = aM == 1 && pin_m;
+    const bool thin_reduction_n = aN == 1 && pin_n;
+    const int64_t rext = bcast_m ? 1 : sh;
+    const int64_t cext = bcast_n ? 1 : sw;
+    const int64_t rext_al = has_reduction && !bcast_m && !thin_reduction_m ? sh_al : rext;
+    const int64_t cext_al = !bcast_n && !thin_reduction_n ? sw_al : cext;
+    // Every statically singleton source starts at zero. Broadcast classification
+    // controls physical padding; it need not make a provably-zero offset dynamic.
+    const ExprPtr roff = aM == 1 ? MakeIndex(0, sp) : smi;
+    const ExprPtr coff = aN == 1 ? MakeIndex(0, sp) : sni;
     const bool sl_ragged = (rext_al != rext) || (cext_al != cext);
     ExprPtr source = arg;
     const auto [source_m, source_n] = Static2DShape(arg->GetType());
@@ -3101,6 +3110,34 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
     auto sv = std::make_shared<Var>(base + "_in" + std::to_string(slot), sl->GetType(), sp);
     out.push_back(std::make_shared<AssignStmt>(sv, sl, sp));
     return sv;
+  };
+
+  int valid_shape_id = 0;
+  auto ensure_valid_shape = [&](const VarPtr& value, int64_t valid_m, int64_t valid_n,
+                                std::vector<StmtPtr>& out) -> VarPtr {
+    auto type = As<TensorType>(value->GetType());
+    INTERNAL_CHECK_SPAN(type != nullptr && type->shape_.size() == 2, sp)
+        << "Internal error: AutoFuse can preserve valid shapes only on rank-2 tensors";
+    const std::vector<ExprPtr>* current_valid = nullptr;
+    if (type->tensor_view_.has_value() && !type->tensor_view_->valid_shape.empty()) {
+      INTERNAL_CHECK_SPAN(type->tensor_view_->valid_shape.size() == 2, sp)
+          << "Internal error: AutoFuse emitted a non-rank-2 valid shape";
+      current_valid = &type->tensor_view_->valid_shape;
+    }
+    auto current_dim = [&](size_t dim) -> int64_t {
+      const ExprPtr& extent = current_valid == nullptr ? type->shape_[dim] : (*current_valid)[dim];
+      auto constant = As<ConstInt>(extent);
+      INTERNAL_CHECK_SPAN(constant != nullptr, sp)
+          << "Internal error: AutoFuse emitted a dynamic valid shape";
+      return constant->value_;
+    };
+    if (current_dim(0) == valid_m && current_dim(1) == valid_n) return value;
+    auto set_valid = reg.Create("tensor.set_validshape",
+                                {ExprPtr(value), MakeIndex(valid_m, sp), MakeIndex(valid_n, sp)}, sp);
+    auto constrained =
+        std::make_shared<Var>(base + "_valid" + std::to_string(valid_shape_id++), set_valid->GetType(), sp);
+    out.push_back(std::make_shared<AssignStmt>(constrained, set_valid, sp));
+    return constrained;
   };
 
   // Driver loop: walk the group in order; per op apply the ELEMENTWISE rule — slice each
@@ -3229,10 +3266,15 @@ std::optional<std::vector<StmtPtr>> EmitFusedGroupGeneric(
           singleton_column_to_row ? SingletonColumnRowEquivalentOp(c) : c->op_->name_;
       auto pw = reg.Create(emission_op, targs, c->kwargs_, sp);
       // Unique name per intermediate (a multi-consumer intermediate must keep a distinct name).
-      auto res = std::make_shared<Var>(
+      VarPtr res = std::make_shared<Var>(
           a == out_stmt ? (base + "_tile") : (base + "_t" + std::to_string(onchip.size())), pw->GetType(),
           sp);
       out.push_back(std::make_shared<AssignStmt>(res, pw, sp));
+      const auto [output_m, output_n] = scheduled_shape(a->var_->GetType());
+      INTERNAL_CHECK_SPAN(output_m > 0 && output_n > 0, a->span_)
+          << "Internal error: AutoFuse replay produced a non-static tensor";
+      res = ensure_valid_shape(res, output_m == 1 ? 1 : std::min(output_m, sh),
+                               output_n == 1 ? 1 : std::min(output_n, sw), out);
       onchip[a->var_.get()] = res;
       if (a.get() == sink_op) {
         tv = res;

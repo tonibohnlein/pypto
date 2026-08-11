@@ -2485,6 +2485,41 @@ class TestAutoFuse:
         vector_plan = next(plan for plan in solution["vector_stream"] if plan is not None)
         assert vector_plan["coordinate_transform"] == "singleton_column_to_row"
 
+        row_sum_op = ir.get_op("tensor.row_sum")
+
+        class ReductionFrame(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.inputs = []
+                self.outputs = []
+
+            def visit_call(self, op):
+                if op.op.name == row_sum_op.name:
+                    input_type = op.args[0].type
+                    output_type = op.type
+                    self.inputs.append(
+                        (
+                            tuple(dim.value for dim in input_type.shape),
+                            tuple(dim.value for dim in input_type.tensor_view.valid_shape),
+                        )
+                    )
+                    self.outputs.append(
+                        (
+                            tuple(dim.value for dim in output_type.shape),
+                            tuple(dim.value for dim in output_type.tensor_view.valid_shape),
+                        )
+                    )
+                super().visit_call(op)
+
+        frames = ReductionFrame()
+        frames.visit_program(planned)
+        assert frames.inputs
+        assert all(
+            physical[0] == 8 and valid[0] == 1 and physical[1] >= valid[1] > 0
+            for physical, valid in frames.inputs
+        )
+        assert all(frame == ((8, 1), (1, 1)) for frame in frames.outputs)
+
         @pl.program
         class Row:
             @pl.function(attrs={schedule_tag: True})

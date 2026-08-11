@@ -855,6 +855,54 @@ class AutoFuseColSumCase(PTOTestCase):
         tensors["out"][:] = tensors["x"].sum(dim=0, keepdim=True)
 
 
+class AutoFuseSingletonReductionCase(PTOTestCase):
+    """Full-frame singleton axes need padding; collapsed reduction axes stay logically thin."""
+
+    __test__ = False
+
+    def __init__(self, orientation: str, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        assert orientation in {"row", "column"}
+        self.orientation = orientation
+
+    def get_name(self) -> str:
+        return f"autofuse_singleton_{self.orientation}_reduction"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        shape = [1, 8192] if self.orientation == "row" else [8192, 1]
+        return [
+            TensorSpec("x", shape, DataType.FP32, init_value=torch.rand),
+            TensorSpec("out", [1, 1], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        if self.orientation == "row":
+
+            @pl.program
+            class Row:
+                @pl.function(attrs={"auto_fuse": True})
+                def reduce(self, x: pl.Tensor[[1, 8192], pl.FP32]) -> pl.Tensor[[1, 1], pl.FP32]:
+                    values: pl.Tensor[[1, 8192], pl.FP32] = pl.exp(x)
+                    out: pl.Tensor[[1, 1], pl.FP32] = pl.row_sum(values)
+                    return out
+
+            return Row
+
+        @pl.program
+        class Column:
+            @pl.function(attrs={"auto_fuse": True})
+            def reduce(self, x: pl.Tensor[[8192, 1], pl.FP32]) -> pl.Tensor[[1, 1], pl.FP32]:
+                values: pl.Tensor[[8192, 1], pl.FP32] = pl.exp(x)
+                out: pl.Tensor[[1, 1], pl.FP32] = pl.col_sum(values)
+                return out
+
+        return Column
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        dim = 1 if self.orientation == "row" else 0
+        tensors["out"][:] = torch.exp(tensors["x"]).sum(dim=dim, keepdim=True)
+
+
 class AutoFuseForkCase(PTOTestCase):
     """Multi-sink fork [256,256] -> (a, b): a=(x+1)*2, b=(x+1)*3 share the intermediate c=x+1.
     Two live-outs in one fused group, each assembled to its own output; validates the
@@ -2169,6 +2217,16 @@ class TestAutoFuseDevice:
     def test_autofuse_col_sum(self, test_runner, platform):
         result = test_runner.run(AutoFuseColSumCase(platform=platform))
         assert result.passed, f"AutoFuse col_sum [128,256] (S2 split) mismatch on device: {result.error}"
+
+    @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+    @pytest.mark.parametrize("orientation", ["row", "column"])
+    def test_autofuse_singleton_reduction_generated_kernel(
+        self, test_runner, platform, orientation, monkeypatch
+    ):
+        """TestRunner reaches PTOAS, generated-kernel compilation, and silicon execution."""
+        monkeypatch.setenv("PYPTO_AUTOFUSE_GENERIC_EMIT", "1")
+        result = test_runner.run(AutoFuseSingletonReductionCase(orientation, platform=platform))
+        assert result.passed, f"AutoFuse singleton-{orientation} reduction failed: {result.error}"
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
     def test_autofuse_fork(self, test_runner, platform):
