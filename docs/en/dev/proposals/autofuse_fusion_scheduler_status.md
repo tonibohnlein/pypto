@@ -12,8 +12,8 @@ Companion documents:
   the P-ladder, §6 fidelity status). This status doc summarizes it; that doc is the authority.
 - `docs/en/dev/proposals/autofuse_mixed_cost_model_emit_contract.md` — the 24-group mixed
   cube/vector stage, GM-FIFO, loop-axis, and cross-core overlap contract.
-- `docs/en/dev/proposals/autofuse_external_frontend.md` — future Torch/FX capture, external
-  Fusebox planning, and explicit PyPTO DSL source generation.
+- `3rdparty/pto-fusebox/doc/torch_to_pypto_frontend.md` — the PTO-Fusebox-owned Torch/FX
+  frontend, external planning, PyPTO source backend, and deferred dynamic-shape taxonomy.
 - Operational device verification tasks live outside the repository in `/home/toni/work/pypto3/`.
 
 **Vector device checkpoint (2026-07-13).** The completed 910B2 run at PyPTO `d8ca8a8f` / solver
