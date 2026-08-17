@@ -164,6 +164,43 @@ def test_candidate_score_joins_access_sites_and_derives_non_negative_weight():
     assert candidate["weight_cycles"] == 20.0
     assert candidate["makespan_with_candidate_cycles"] == 40.0
     assert result["consumer_groups"][0]["combined_weight_cycles"] == 20.0
+    assert result["candidate_weight_summary"] == {
+        "positive_distance_zero_edge_count": 1,
+        "positive_loop_recurrence_edge_count": 0,
+        "distance_zero_weight_sum_cycles": 20.0,
+        "loop_recurrence_weight_sum_cycles": 0,
+        "max_distance_zero_weight_cycles": 20.0,
+        "max_loop_recurrence_weight_cycles": 0.0,
+        "max_candidate_weight_cycles": 20.0,
+        "unique_positive_edge_count": 1,
+    }
+
+
+def test_duplicate_distance_zero_candidates_do_not_inflate_group_or_summary():
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+
+    result = dsa_schedule_model.score_reuse_candidates(
+        record, [_candidate(), _candidate()], _ten_cycle_model()
+    )
+
+    assert result["distance_zero_edges"] == [
+        {
+            "source_node": 2,
+            "target_node": 1,
+            "candidate_indices": [0, 1],
+            "candidate_count": 2,
+            "weight_cycles": 20.0,
+        }
+    ]
+    assert result["consumer_groups"][0]["singleton_weight_sum_cycles"] == 20.0
+    assert result["candidate_weight_summary"]["distance_zero_weight_sum_cycles"] == 20.0
+    assert result["candidate_weight_summary"]["unique_positive_edge_count"] == 1
 
 
 def _loop_candidate_record(*, with_return_path: bool = False) -> dict:
