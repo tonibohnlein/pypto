@@ -1530,10 +1530,11 @@ def generate(
         runtime: Simpler runtime ABI to target; its wire name is written to
             ``RUNTIME_CONFIG["runtime"]`` in the generated ``kernel_config.py``.
             None uses ``RuntimeKind.TENSORMAP_AND_RINGBUFFER``.
-        emit_access_provenance: When True, wrap operation locations in a stable
-            ``pypto.access.N`` NameLoc matching DSA candidate ``sites=``
-            coordinates. None reads ``PYPTO_EMIT_DSA_ACCESS_PROVENANCE``
-            (off by default).
+        emit_access_provenance: When True, wrap operations stamped during
+            research DSA construction in a stable ``pypto.access.N`` NameLoc
+            matching candidate ``sites=`` coordinates. Unstamped operations do
+            not invent a coordinate. None reads
+            ``PYPTO_EMIT_DSA_ACCESS_PROVENANCE`` (off by default).
         ptoas_sync_summary_dir: Optional directory for one PTOAS InsertSync
             JSONL summary per codegen unit.
 

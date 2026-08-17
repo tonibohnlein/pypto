@@ -33,6 +33,7 @@ class ReuseCandidateRecord:
     dag_path: tuple[str, ...]
     prior_access_order: int
     next_access_order: int
+    loop_carried: bool
     fields: tuple[str, ...]
 
 
@@ -105,6 +106,10 @@ def parse_candidate_record(record: str) -> ReuseCandidateRecord:
     except ValueError as error:
         raise ValueError(f"invalid access sites in '{record}'") from error
 
+    distances = {field for field in fields if field in {"distance_0", "distance_1"}}
+    if len(distances) != 1:
+        raise ValueError(f"candidate record requires exactly one distance field in '{record}'")
+
     return ReuseCandidateRecord(
         first_buffer=first_buffer,
         second_buffer=second_buffer,
@@ -118,6 +123,7 @@ def parse_candidate_record(record: str) -> ReuseCandidateRecord:
         dag_path=dag_path,
         prior_access_order=prior_access_order,
         next_access_order=next_access_order,
+        loop_carried="distance_1" in distances,
         fields=fields,
     )
 

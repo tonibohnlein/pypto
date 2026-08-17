@@ -229,9 +229,11 @@ validate graph construction but cannot explain a placement-induced latency
 difference.
 
 The raw candidate and schedule coordinates are joined explicitly. With
-`PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1`, PTO codegen wraps each lowered operation
-location in a `pypto.access.N` NameLoc, where `N` is the same preorder used by
-the candidate record's `sites=prior->next` field. PTOAS copies that integer to
+`PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1`, PTO codegen wraps each stamped lowered
+operation location in a `pypto.access.N` NameLoc. `N` is attached to the source
+Call when the DSA problem is constructed and preserved through later lowering;
+it is not recomputed from lowered statement order. It therefore matches the
+candidate record's `sites=prior->next` field. PTOAS copies that integer to
 the schedule graph. The join fails closed when a site is absent or when the
 candidate route has no verified PTOAS-pipe mapping; SSA node numbers and source
 line numbers are never treated as interchangeable coordinates.
@@ -249,6 +251,23 @@ PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1 python my_export.py
 python -m pypto.tools.dsa_schedule_model score-candidates \
     schedule.jsonl problem.dsa.json --model duration-v0.json \
     -o candidate-weights.json
+```
+
+Version 0 scores only distance-zero candidates in its acyclic longest-path
+graph. A distance-one candidate is first joined to both PTOAS sites and checked
+to share a real loop, then reported as `loop_carried_not_scored_v0` with no
+weight. Treating its recurrence edge as an ordinary intra-iteration edge would
+create a cycle and is not a valid estimate; steady-state recurrence/throughput
+scoring is explicit follow-up work.
+
+For PTOAS revisions that predate the JSONL exporter, the legacy level-3 debug
+importer can recover the same stable access coordinates from the raw PTO.  The
+join requires exact executable-operation order and fails instead of guessing
+when an operation or `pypto.access.N` location is missing:
+
+```bash
+python -m pypto.tools.dsa_schedule_model import-debug insert-sync.log \
+    --function kernel --pto kernel.pto -o schedule.jsonl
 ```
 
 Version 0 has verified pipe mappings only for inbound/outbound DMA, L1-to-L0,

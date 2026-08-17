@@ -62,6 +62,7 @@ _DEBUG_SYNC_RE = re.compile(
     r"^\s*(PRE|POST)\s*:?[ ]*(\w+)\s+<(\S+)\s+->\s+(\S+)>\s+idx=(\d+)(?:\s+forEnd=(\d+))?"
 )
 _ACCESS_LOCATION_RE = re.compile(r"pypto\.access\.(\d+)")
+_PTO_OPERATION_RE = re.compile(r"(?<![!\w.])(pto\.[A-Za-z0-9_]+)\b")
 
 # This is deliberately narrower than the recognizer's route vocabulary. The
 # first structured model targets the route families already exercised by the
@@ -180,8 +181,64 @@ def load_schedule_graphs(path: str | Path) -> dict[str, dict[str, Any]]:
     return records
 
 
+def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) -> None:
+    """Join legacy SyncIR nodes to raw-PTO access locations by exact op order.
+
+    PTOAS's legacy text trace omits MLIR locations.  Raw PTO emitted with
+    ``PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1`` contains those locations, while the
+    trace preserves the same executable operation order.  Structural PTO ops
+    such as ``pto.alloc_tile`` are ignored because they do not appear among the
+    trace's operation names.  Any missing location or sequence mismatch is a
+    hard error; this bridge never guesses a coordinate.
+    """
+    operation_nodes = [node for node in nodes if node.get("kind") == "operation"]
+    expected_names = [str(node["op_name"]) for node in operation_nodes]
+    traced_names = set(expected_names)
+    pto_operations: list[tuple[str, int, str]] = []
+
+    for line_number, line in enumerate(pto_text.splitlines(), start=1):
+        names = [match.group(1) for match in _PTO_OPERATION_RE.finditer(line)]
+        names = [name for name in names if name in traced_names]
+        if not names:
+            continue
+        if len(names) != 1:
+            raise ValueError(f"raw PTO line {line_number} contains multiple traced operations: {names}")
+        locations = _ACCESS_LOCATION_RE.findall(line)
+        if len(set(locations)) != 1:
+            raise ValueError(
+                f"raw PTO operation {names[0]} on line {line_number} has no unambiguous "
+                "pypto.access.N location"
+            )
+        access_order = int(locations[0])
+        pto_operations.append((names[0], access_order, line.strip()))
+
+    actual_names = [name for name, _, _ in pto_operations]
+    if actual_names != expected_names:
+        mismatch = next(
+            (
+                index
+                for index, (expected, actual) in enumerate(zip(expected_names, actual_names, strict=False))
+                if expected != actual
+            ),
+            min(len(expected_names), len(actual_names)),
+        )
+        expected = expected_names[mismatch] if mismatch < len(expected_names) else "<end>"
+        actual = actual_names[mismatch] if mismatch < len(actual_names) else "<end>"
+        raise ValueError(
+            "raw PTO operation sequence does not match the final SyncIR trace at "
+            f"operation {mismatch}: expected {expected}, found {actual}; "
+            f"counts={len(expected_names)}->{len(actual_names)}"
+        )
+
+    for node, (_, access_order, location_line) in zip(operation_nodes, pto_operations, strict=True):
+        node["operation"] = {
+            "pypto_access_order": access_order,
+            "location": location_line,
+        }
+
+
 def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors the four debug record kinds
-    text: str, *, function: str
+    text: str, *, function: str, pto_text: str | None = None
 ) -> dict[str, Any]:
     """Convert PTOAS's legacy level-3 final SyncIR dump to schema v1.
 
@@ -283,6 +340,8 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
 
     if not any(node["kind"] == "operation" for node in nodes):
         raise ValueError("final debug phase has no operation nodes")
+    if pto_text is not None:
+        _attach_pto_access_provenance(nodes, pto_text)
 
     sync_groups: list[dict[str, Any]] = []
     sync_edges: list[dict[str, Any]] = []
@@ -328,11 +387,14 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
         "status": "analyzed",
         "node_count": len(nodes),
         "duration_model": "unestimated",
-        "export_source": "ptoas_debug_import_v0",
+        "export_source": (
+            "ptoas_debug_import_v0+pto_access_join_v1" if pto_text is not None else "ptoas_debug_import_v0"
+        ),
         "export_limitations": {
             "allocation_sizes_missing": True,
             "static_loop_bounds_missing": True,
             "barrier_dependency_nodes_missing": omitted_barriers,
+            "access_provenance_missing": pto_text is None,
         },
         "nodes": nodes,
         "stream_edges": stream_edges,
@@ -704,6 +766,11 @@ def score_reuse_candidates(
             "PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1"
         )
 
+    nodes_by_id = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and node.get("kind") == "operation" and isinstance(node.get("id"), int)
+    }
     rows: list[dict[str, Any]] = []
     grouped_edges: dict[int, set[tuple[int, int]]] = defaultdict(set)
     for index, candidate in enumerate(candidates):
@@ -730,6 +797,35 @@ def score_reuse_candidates(
             )
         source = prior_nodes[-1]
         target = next_nodes[0]
+        if candidate.loop_carried:
+            source_loops = set(nodes_by_id[source].get("loop_stack", []))
+            target_loops = set(nodes_by_id[target].get("loop_stack", []))
+            common_loops = sorted(source_loops & target_loops)
+            if not common_loops:
+                raise ValueError(
+                    f"loop-carried candidate {index} sites do not share a PTOAS loop: edge {source}->{target}"
+                )
+            rows.append(
+                {
+                    "candidate_index": index,
+                    "first_buffer": candidate.first_buffer,
+                    "second_buffer": candidate.second_buffer,
+                    "prior_buffer": candidate.prior_buffer,
+                    "next_buffer": candidate.next_buffer,
+                    "prior_access_order": candidate.prior_access_order,
+                    "next_access_order": candidate.next_access_order,
+                    "prior_pipe": prior_pipe,
+                    "next_pipe": next_pipe,
+                    "source_node": source,
+                    "target_node": target,
+                    "source_macro_nodes": prior_nodes,
+                    "target_macro_nodes": next_nodes,
+                    "common_loop_nodes": common_loops,
+                    "status": "loop_carried_not_scored_v0",
+                    "weight_cycles": None,
+                }
+            )
+            continue
         hypothetical = (source, target, model.sync_latency_cycles, "candidate_sync", index)
         try:
             with_candidate, _, _, path = _longest_path(durations, [*existing_edges, hypothetical])
@@ -797,6 +893,9 @@ def score_reuse_candidates(
         "excluded_loop_carried_sync_edges": excluded_loop_carried,
         "candidate_count": len(candidates),
         "scored_candidate_count": sum(row.get("status") == "scored" for row in rows),
+        "unscored_loop_carried_candidate_count": sum(
+            row.get("status") == "loop_carried_not_scored_v0" for row in rows
+        ),
         "candidates": rows,
         "consumer_groups": consumer_groups,
         "node_durations": {str(node): value for node, value in sorted(provenance.items())},
@@ -1189,6 +1288,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     import_parser.add_argument("log", type=Path)
     import_parser.add_argument("--function", required=True)
+    import_parser.add_argument(
+        "--pto",
+        type=Path,
+        help="raw PTO carrying pypto.access.N locations; joined fail-closed by operation order",
+    )
     import_parser.add_argument("-o", "--output", type=Path, required=True)
 
     evaluate_parser = subparsers.add_parser(
@@ -1214,7 +1318,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_json(args.output, calibrated.to_json())
             return 0
         if args.command == "import-debug":
-            record = import_insert_sync_debug(args.log.read_text(), function=args.function)
+            record = import_insert_sync_debug(
+                args.log.read_text(),
+                function=args.function,
+                pto_text=args.pto.read_text() if args.pto is not None else None,
+            )
             args.output.write_text(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
             return 0
         if args.command == "evaluate":

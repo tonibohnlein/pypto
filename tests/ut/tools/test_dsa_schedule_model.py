@@ -41,11 +41,11 @@ def _with_access(node: dict, order: int, *, explicit: bool = True) -> dict:
     return node
 
 
-def _candidate(*, prior_site: int = 3, next_site: int = 7):
+def _candidate(*, prior_site: int = 3, next_site: int = 7, distance: int = 0):
     return dsa_reuse_candidates.parse_candidate_record(
         "0,1,0->1,ub->ub@vector_compute=>external->ub@inbound_dma,arenas=Vec->Vec,"
         "write_after_read,no_logical_order,inter_operation,full_allocation,complete_access_set,"
-        f"verified_initial_write,in_loop,distance_0,sites={prior_site}->{next_site},"
+        f"verified_initial_write,in_loop,distance_{distance},sites={prior_site}->{next_site},"
         "ranges=0+640->0+640,hazard=cross_resource,dag_path=none"
     )
 
@@ -164,6 +164,24 @@ def test_candidate_score_joins_access_sites_and_derives_non_negative_weight():
     assert candidate["weight_cycles"] == 20.0
     assert candidate["makespan_with_candidate_cycles"] == 40.0
     assert result["consumer_groups"][0]["combined_weight_cycles"] == 20.0
+
+
+def test_candidate_score_reports_loop_carried_edge_without_turning_recurrence_into_dag_cycle():
+    record = _record()
+    record["nodes"] = [
+        _with_access(_operation(0, "PIPE_V", "pto.tadd", [10]), 1),
+        _with_access(_operation(1, "PIPE_MTE2", "pto.tload", [10]), 7),
+        _with_access(_operation(2, "PIPE_V", "pto.tmuls", [10]), 3),
+        _with_access(_operation(3, "PIPE_MTE2", "pto.tload", [10]), 9),
+    ]
+
+    result = dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
+
+    assert result["scored_candidate_count"] == 0
+    assert result["unscored_loop_carried_candidate_count"] == 1
+    assert result["candidates"][0]["status"] == "loop_carried_not_scored_v0"
+    assert result["candidates"][0]["weight_cycles"] is None
+    assert result["candidates"][0]["common_loop_nodes"] == [10]
 
 
 def test_candidate_score_fails_closed_without_access_provenance():
@@ -313,6 +331,44 @@ def test_import_legacy_debug_reconstructs_streams_and_event_edges():
 def test_import_legacy_debug_rejects_incomplete_log():
     with pytest.raises(ValueError, match="no final"):
         dsa_schedule_model.import_insert_sync_debug("no phases", function="kernel")
+
+
+def test_import_legacy_debug_joins_raw_pto_access_provenance():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tload [PIPE_MTE2]
+[   1] COMPOUND pto.tadd [PIPE_V]
+[   2] COMPOUND pto.tstore [PIPE_MTE3]
+// ========================================= //
+"""
+    pto = """
+%tile = pto.alloc_tile addr = %c0 : !pto.tile_buf loc("pypto.access.3")
+pto.tload ins(%arg0) outs(%tile) loc("pypto.access.3")
+pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+pto.tstore ins(%tile) outs(%arg1) loc("pypto.access.9")
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    assert record["export_source"] == "ptoas_debug_import_v0+pto_access_join_v1"
+    assert [node["operation"]["pypto_access_order"] for node in record["nodes"]] == [3, 7, 9]
+    assert record["export_limitations"]["access_provenance_missing"] is False
+
+
+def test_import_legacy_debug_rejects_raw_pto_operation_mismatch():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tload [PIPE_MTE2]
+[   1] COMPOUND pto.tadd [PIPE_V]
+// ========================================= //
+"""
+    pto = """
+pto.tload ins(%arg0) outs(%tile) loc("pypto.access.3")
+pto.tmul ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+"""
+
+    with pytest.raises(ValueError, match="operation sequence does not match"):
+        dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
 
 
 def test_evaluate_arm_manifest_scores_direction_and_rank(tmp_path):
