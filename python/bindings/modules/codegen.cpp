@@ -43,12 +43,14 @@ void BindCodegen(nb::module_& m) {
       "annotations.")
       .def(nb::init<>(), "Create a PTO code generator (backend is always PTO)")
       .def("generate", &PTOCodegen::Generate, nb::arg("program"), nb::arg("emit_tile_addr") = true,
-           nb::arg("emit_source_loc") = true,
+           nb::arg("emit_source_loc") = true, nb::arg("emit_access_provenance") = false,
            "Generate PTO assembly from PyPTO IR Program. Returns PTO assembly code string (.pto format) with "
            "instructions like tmul, tadd, FOR/ENDFOR, etc. When emit_tile_addr=False, pto.alloc_tile omits "
            "the "
            "physical addr operand so the ptoas PlanMemory pass allocates (--pto-level=level2). When "
-           "emit_source_loc=False, operations carry no trailing MLIR loc(\"file\":line:col).");
+           "emit_source_loc=False, operations carry no source FileLineColLoc. When "
+           "emit_access_provenance=True, lowered operations carry a stable pypto.access.N NameLoc for "
+           "schedule-model analysis.");
 
   // OrchestrationResult - result of orchestration code generation
   nb::class_<OrchestrationResult>(codegen_module, "OrchestrationResult",

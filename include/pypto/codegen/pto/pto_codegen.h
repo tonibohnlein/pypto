@@ -118,10 +118,13 @@ class PTOCodegen : public CodegenBase {
    *        constants section, which are deduplicated across every use so no
    *        single span fits them; and any operation whose span is unknown or
    *        carries no filename. When false, emit no locations at all.
+   * @param emit_access_provenance When true, wrap emitted operation locations
+   *        in a diagnostic ``pypto.access.N`` NameLoc whose integer matches the
+   *        DSA reuse recognizer's access-order coordinate. Disabled by default.
    * @return MLIR code as string
    */
-  std::string Generate(const ir::ProgramPtr& program, bool emit_tile_addr = true,
-                       bool emit_source_loc = true);
+  std::string Generate(const ir::ProgramPtr& program, bool emit_tile_addr = true, bool emit_source_loc = true,
+                       bool emit_access_provenance = false);
 
   // CodegenBase interface (unified API for operator codegen callbacks)
   [[nodiscard]] std::string GetCurrentResultTarget() const override;
@@ -1090,6 +1093,18 @@ class PTOCodegen : public CodegenBase {
 
   /// When false, no operation carries a trailing `loc(...)`. Set by Generate.
   bool emit_source_loc_ = true;
+
+  /// Emit a stable ``pypto.access.N`` NameLoc around operation source
+  /// locations.  This diagnostic-only provenance joins raw DSA reuse
+  /// candidates (whose ``sites=`` field uses the same traversal order) to the
+  /// PTOAS schedule graph without changing operation semantics.
+  bool emit_access_provenance_ = false;
+
+  /// Access-order state mirrors the reuse recognizer's preorder over
+  /// AssignStmt, EvalStmt, and ReturnStmt values.  Structural statements do
+  /// not consume an order number.
+  size_t next_access_order_ = 0;
+  std::optional<size_t> current_access_order_;
 
   /// Source span attached to the operations being emitted right now; null means
   /// "no location", which makes Emit() behave exactly as it did before locations

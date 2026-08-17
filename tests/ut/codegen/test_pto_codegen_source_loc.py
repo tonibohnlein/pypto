@@ -33,7 +33,7 @@ import pypto.language as pl
 import pytest
 from pypto import backend, codegen, ir
 from pypto.backend import BackendType
-from pypto.backend.pto_backend import emit_source_loc_default
+from pypto.backend.pto_backend import emit_access_provenance_default, emit_source_loc_default
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 _THIS_FILE = os.path.abspath(__file__)
@@ -44,9 +44,10 @@ with open(_THIS_FILE) as _source:
 # `loc("<path>":<line>:<col>)` at end of line; the path is greedy-free so an
 # escaped quote inside it would fail the match rather than silently pass.
 _LOC_RE = re.compile(r' loc\("((?:[^"\\]|\\.)*)":(\d+):(\d+)\)$')
+_ACCESS_LOC_RE = re.compile(r' loc\("pypto\.access\.(\d+)"\(".*":\d+:\d+\)\)$')
 
 
-def _generate(program_cls, *, emit_source_loc: bool = True) -> str:
+def _generate(program_cls, *, emit_source_loc: bool = True, emit_access_provenance: bool = False) -> str:
     """Run the Default pipeline and PTO codegen over the first function."""
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend910B)
@@ -54,7 +55,11 @@ def _generate(program_cls, *, emit_source_loc: bool = True) -> str:
     funcs = list(optimized.functions.values())
     assert funcs, "Program has no functions"
     single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
-    return codegen.PTOCodegen().generate(single, emit_source_loc=emit_source_loc)
+    return codegen.PTOCodegen().generate(
+        single,
+        emit_source_loc=emit_source_loc,
+        emit_access_provenance=emit_access_provenance,
+    )
 
 
 def _is_structural(line: str) -> bool:
@@ -212,6 +217,23 @@ class TestSourceLocDisabled:
         assert stripped == without_loc.rstrip("\n")
 
 
+class TestAccessProvenance:
+    """The opt-in NameLoc joins DSA candidate sites to PTOAS operations."""
+
+    def test_execution_ops_carry_distinct_access_orders(self):
+        mlir = _generate(ElementwiseProg, emit_access_provenance=True)
+        add_line = next(line for line in mlir.splitlines() if "pto.tadd" in line)
+        exp_line = next(line for line in mlir.splitlines() if "pto.texp" in line)
+        add_match = _ACCESS_LOC_RE.search(add_line)
+        exp_match = _ACCESS_LOC_RE.search(exp_line)
+        assert add_match is not None
+        assert exp_match is not None
+        assert add_match.group(1) != exp_match.group(1)
+
+    def test_provenance_is_disabled_by_default(self):
+        assert "pypto.access." not in _generate(ElementwiseProg)
+
+
 class TestUnknownSpan:
     """A node with no usable span emits no location rather than a bogus one."""
 
@@ -328,6 +350,14 @@ class TestEnvironmentDefault:
         else:
             monkeypatch.setenv("PYPTO_EMIT_PTO_LOC", env_value)
         assert emit_source_loc_default() is expected
+
+    @pytest.mark.parametrize(("env_value", "expected"), [(None, False), ("0", False), ("1", True)])
+    def test_access_provenance_is_opt_in(self, monkeypatch, env_value, expected):
+        if env_value is None:
+            monkeypatch.delenv("PYPTO_EMIT_DSA_ACCESS_PROVENANCE", raising=False)
+        else:
+            monkeypatch.setenv("PYPTO_EMIT_DSA_ACCESS_PROVENANCE", env_value)
+        assert emit_access_provenance_default() is expected
 
 
 if __name__ == "__main__":

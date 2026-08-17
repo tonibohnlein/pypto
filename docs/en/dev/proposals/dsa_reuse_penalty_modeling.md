@@ -182,6 +182,79 @@ mechanisms. For several candidate predecessors of one consumer, retain the
 dominant supported pair rather than summing duplicate evidence. OR groups,
 hyperedges, negative weights, and global event-budget terms remain deferred.
 
+## Critical-path model v0
+
+The next modeling layer is a schedule graph rather than another recognizer
+filter. A diagnostic PTOAS exporter records the post-InsertSync operation
+nodes, per-pipe issue-order edges, synchronization edges, loop membership,
+and known allocation sizes. `pypto.tools.dsa_schedule_model` assigns operation
+durations and evaluates two directed acyclic graphs:
+
+- a baseline containing only per-pipe stream edges; and
+- the complete graph after adding non-loop-carried synchronization edges.
+
+Version 0 reports the difference between their longest paths as
+`synchronization_exposure_cycles`. It also evaluates every synchronization
+edge against the baseline critical path. This is deliberately different from
+counting synchronization groups: an edge receives zero exposure when it is
+covered by work already on the critical path.
+
+Static loops are aggregated by their trip count. Dynamic loops use a
+multiplier of one, and loop-carried synchronization edges are excluded and
+reported. Operation durations come either from medians in cleaned simulator
+instruction metrics or from explicitly labelled, uncalibrated per-pipe
+fallbacks. Consequently, version-0 results are not cycle-accurate estimates
+unless their calibration coverage and loop limitations support that claim.
+
+Planner comparisons use paired schedule graphs and the convention
+`candidate / baseline - 1`, where a negative value predicts that the candidate
+is faster. The evaluator first requires the same operation stream in both arms,
+then reports the synchronization dependencies added and removed by the
+placement change. A comparison manifest may omit both observed latencies for a
+held-out cohort, but it may not provide a one-sided observation. The evaluator
+content-addresses the manifest, schedule inputs, and predictions so that
+held-out predictions can be frozen before device timing:
+
+```bash
+python -m pypto.tools.dsa_schedule_model calibrate \
+    instr_metrics.json -o duration-v0.json
+python -m pypto.tools.dsa_schedule_model evaluate \
+    comparisons.json --model duration-v0.json -o predictions.json
+```
+
+This model is research infrastructure, not the current `unit_v1` weight
+policy. Before it can assign DSA-RP weights, it must predict fresh arm-pair
+latency directions and rankings. In particular, a single schedule graph can
+validate graph construction but cannot explain a placement-induced latency
+difference.
+
+The raw candidate and schedule coordinates are joined explicitly. With
+`PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1`, PTO codegen wraps each lowered operation
+location in a `pypto.access.N` NameLoc, where `N` is the same preorder used by
+the candidate record's `sites=prior->next` field. PTOAS copies that integer to
+the schedule graph. The join fails closed when a site is absent or when the
+candidate route has no verified PTOAS-pipe mapping; SSA node numbers and source
+line numbers are never treated as interchangeable coordinates.
+
+The first candidate-weight prototype adds a hypothetical completion edge from
+the terminal macro phase at the prior site to the initial macro phase at the
+next site, retaining all synchronization already present in the reference
+schedule. Its non-negative weight is the increase in longest-path cycles. It
+also adds all candidate edges sharing one consumer together and reports the
+difference between the combined cost and the sum of singleton costs. This
+consumer grouping exposes release coalescence rather than double-counting it:
+
+```bash
+PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1 python my_export.py
+python -m pypto.tools.dsa_schedule_model score-candidates \
+    schedule.jsonl problem.dsa.json --model duration-v0.json \
+    -o candidate-weights.json
+```
+
+Version 0 has verified pipe mappings only for inbound/outbound DMA, L1-to-L0,
+L0-to-external, vector, matrix, and scalar resources. It rejects the remaining
+transfer-route families until their PTOAS pipeline mapping is established.
+
 ## Remaining validation
 
 The completion-frontier factorial has been run. It confirmed that several

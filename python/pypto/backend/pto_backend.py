@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 _PTOAS_RELEASE_URL = "https://github.com/zhangstevenunity/PTOAS/releases"
 
 _EMIT_SOURCE_LOC_ENV = "PYPTO_EMIT_PTO_LOC"
+_EMIT_ACCESS_PROVENANCE_ENV = "PYPTO_EMIT_DSA_ACCESS_PROVENANCE"
 _FALSY_ENV_VALUES = frozenset({"0", "false", "no", "off"})
 
 
@@ -73,6 +74,16 @@ def emit_source_loc_default() -> bool:
         True unless the environment disables source locations.
     """
     return os.environ.get(_EMIT_SOURCE_LOC_ENV, "1").strip().lower() not in _FALSY_ENV_VALUES
+
+
+def emit_access_provenance_default() -> bool:
+    """Whether PTO operations carry diagnostic DSA access-site NameLocs.
+
+    Disabled by default because this metadata exists solely to join research
+    reuse-candidate records to PTOAS schedule graphs. Read per call so a
+    profiling campaign can enable it without rebuilding PyPTO.
+    """
+    return os.environ.get(_EMIT_ACCESS_PROVENANCE_ENV, "0").strip().lower() not in _FALSY_ENV_VALUES
 
 
 class PartialCodegenError(RuntimeError):
@@ -1489,6 +1500,8 @@ def generate(
     emit_source_loc: bool | None = None,
     dump_ptoas_passes: bool = False,
     runtime: _passes.RuntimeKind | None = None,
+    emit_access_provenance: bool | None = None,
+    ptoas_sync_summary_dir: str | None = None,
 ) -> dict[str, str]:
     """Generate all PTO backend output files (kernels + orchestration + config).
 
@@ -1517,6 +1530,12 @@ def generate(
         runtime: Simpler runtime ABI to target; its wire name is written to
             ``RUNTIME_CONFIG["runtime"]`` in the generated ``kernel_config.py``.
             None uses ``RuntimeKind.TENSORMAP_AND_RINGBUFFER``.
+        emit_access_provenance: When True, wrap operation locations in a stable
+            ``pypto.access.N`` NameLoc matching DSA candidate ``sites=``
+            coordinates. None reads ``PYPTO_EMIT_DSA_ACCESS_PROVENANCE``
+            (off by default).
+        ptoas_sync_summary_dir: Optional directory for one PTOAS InsertSync
+            JSONL summary per codegen unit.
 
     Returns:
         Dict mapping relative file paths to their content.
@@ -1527,6 +1546,8 @@ def generate(
         emit_source_loc = emit_source_loc_default()
     if runtime is None:
         runtime = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
+    if emit_access_provenance is None:
+        emit_access_provenance = emit_access_provenance_default()
 
     # Check for distributed functions (level >= HOST = Linqu level 3)
     has_distributed = any(
@@ -1543,6 +1564,9 @@ def generate(
             emit_source_loc=emit_source_loc,
             dump_ptoas_passes=dump_ptoas_passes,
             runtime=runtime,
+            emit_access_provenance=emit_access_provenance,
+            ptoas_sync_summary_dir=ptoas_sync_summary_dir,
+            runtime=runtime,
         )
 
     # L2-only program with multiple Orchestrations: emit each as a
@@ -1558,6 +1582,9 @@ def generate(
             emit_source_loc=emit_source_loc,
             dump_ptoas_passes=dump_ptoas_passes,
             runtime=runtime,
+            emit_access_provenance=emit_access_provenance,
+            ptoas_sync_summary_dir=ptoas_sync_summary_dir,
+            runtime=runtime,
         )
 
     return _generate_single_chip(
@@ -1567,6 +1594,9 @@ def generate(
         memory_planner=memory_planner,
         emit_source_loc=emit_source_loc,
         dump_ptoas_passes=dump_ptoas_passes,
+        runtime=runtime,
+        emit_access_provenance=emit_access_provenance,
+        ptoas_sync_summary_dir=ptoas_sync_summary_dir,
         runtime=runtime,
     )
 
@@ -1579,6 +1609,9 @@ def _generate_with_distributed(
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     emit_source_loc: bool = True,
     dump_ptoas_passes: bool = False,
+    runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+    emit_access_provenance: bool = False,
+    ptoas_sync_summary_dir: str | None = None,
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
 ) -> dict[str, str]:
     """Generate artifacts for a distributed (L3+) program.
@@ -1613,6 +1646,9 @@ def _generate_with_distributed(
                 memory_planner=memory_planner,
                 emit_source_loc=emit_source_loc,
                 dump_ptoas_passes=dump_ptoas_passes,
+                runtime=runtime,
+                emit_access_provenance=emit_access_provenance,
+                ptoas_sync_summary_dir=chip_summary_dir,
                 runtime=runtime,
             )
             for path, content in chip_files.items():
@@ -1815,6 +1851,9 @@ def _generate_multi_chip(
     emit_source_loc: bool = True,
     dump_ptoas_passes: bool = False,
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+    emit_access_provenance: bool = False,
+    ptoas_sync_summary_dir: str | None = None,
+    runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
 ) -> dict[str, str]:
     """Generate artifacts for an L2-only program with multiple Orchestrations.
 
@@ -1840,6 +1879,9 @@ def _generate_multi_chip(
             emit_source_loc=emit_source_loc,
             dump_ptoas_passes=dump_ptoas_passes,
             runtime=runtime,
+            emit_access_provenance=emit_access_provenance,
+            ptoas_sync_summary_dir=chip_summary_dir,
+            runtime=runtime,
         )
         for path, content in chip_files.items():
             result_files[f"next_levels/{func.name}/{path}"] = content
@@ -1854,6 +1896,9 @@ def _generate_single_chip(
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     emit_source_loc: bool = True,
     dump_ptoas_passes: bool = False,
+    runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+    emit_access_provenance: bool = False,
+    ptoas_sync_summary_dir: str | None = None,
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
 ) -> dict[str, str]:
     """Generate artifacts for a single-chip (L0-L2) program.
@@ -1927,7 +1972,10 @@ def _generate_single_chip(
             stage = StageRecord(name=f"kernel_codegen:{group_name}", start=time.perf_counter())
             ir_record = StageRecord(name="ir_to_mlir", start=time.perf_counter())
             pto_code = _codegen_core.PTOCodegen().generate(
-                grouped_program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc
+                grouped_program,
+                emit_tile_addr=emit_tile_addr,
+                emit_source_loc=emit_source_loc,
+                emit_access_provenance=emit_access_provenance,
             )
             ir_record.end = time.perf_counter()
             stage.children.append(ir_record)
@@ -1953,7 +2001,10 @@ def _generate_single_chip(
             stage = StageRecord(name=f"kernel_codegen:{func.name}", start=time.perf_counter())
             ir_record = StageRecord(name="ir_to_mlir", start=time.perf_counter())
             pto_code = _codegen_core.PTOCodegen().generate(
-                single_program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc
+                single_program,
+                emit_tile_addr=emit_tile_addr,
+                emit_source_loc=emit_source_loc,
+                emit_access_provenance=emit_access_provenance,
             )
             ir_record.end = time.perf_counter()
             stage.children.append(ir_record)
