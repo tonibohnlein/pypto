@@ -121,6 +121,16 @@ inline constexpr const char* kPipelineDoubleBufferCAttr = "pipeline_double_buffe
 /// record both memberships and stay separated at every level.
 inline constexpr const char* kPipelineMembershipAttr = "pipeline_membership";
 
+/// Stable access coordinate assigned while the research DSA problem is built.
+///
+/// The reuse recognizer exports this coordinate in candidate ``sites=``
+/// records. It must travel on the original Call through later lowering passes:
+/// recomputing a statement preorder in PTO codegen is incorrect because those
+/// passes may insert, remove, or clone statements after DSA construction.
+/// PTO codegen consumes the attr only when diagnostic access provenance is
+/// explicitly enabled; it never changes generated operation semantics.
+inline constexpr const char* kDsaAccessOrderAttr = "__compiler_dsa_access_order";
+
 /// Append a ``group:stage`` membership pair to a ``pipeline_membership`` string,
 /// preserving any memberships already present (an inner-loop tag survives when
 /// an enclosing loop re-tags the same tile).

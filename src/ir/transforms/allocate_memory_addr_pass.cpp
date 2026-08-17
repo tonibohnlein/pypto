@@ -157,6 +157,84 @@ class StripPipelineMembershipMutator : public IRMutator {
   }
 };
 
+/// Stamp the recognizer's pre-lowering access coordinate onto each source Call.
+///
+/// This traversal deliberately mirrors AccessCollector in
+/// research_reuse_penalty_recognizer.cpp: AssignStmt and EvalStmt consume one
+/// coordinate, each ReturnStmt value consumes one coordinate, and structural
+/// statements consume none. The attr is attached before later passes may
+/// change statement count/order, so PTO codegen can recover the original
+/// candidate site without reconstructing it from lowered IR.
+class DsaAccessOrderStamper : public IRMutator {
+ public:
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    const auto saved = current_access_order_;
+    current_access_order_ = NextAccessOrder(op->span_);
+    StmtPtr result = IRMutator::VisitStmt_(op);
+    current_access_order_ = saved;
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    const auto saved = current_access_order_;
+    current_access_order_ = NextAccessOrder(op->span_);
+    StmtPtr result = IRMutator::VisitStmt_(op);
+    current_access_order_ = saved;
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const ReturnStmtPtr& op) override {
+    std::vector<ExprPtr> values;
+    values.reserve(op->value_.size());
+    bool changed = false;
+    for (const ExprPtr& value : op->value_) {
+      const auto saved = current_access_order_;
+      current_access_order_ = NextAccessOrder(op->span_);
+      ExprPtr stamped = IRMutator::VisitExpr(value);
+      current_access_order_ = saved;
+      changed = changed || stamped.get() != value.get();
+      values.push_back(std::move(stamped));
+    }
+    if (!changed) return op;
+    auto result = MutableCopy(op);
+    result->value_ = std::move(values);
+    return result;
+  }
+
+ private:
+  int next_access_order_ = 0;
+  std::optional<int> current_access_order_;
+
+  int NextAccessOrder(const Span& span) {
+    INTERNAL_CHECK_SPAN(next_access_order_ < std::numeric_limits<int>::max(), span)
+        << "Internal error: DSA access-order coordinate exceeds the IR attr range";
+    return next_access_order_++;
+  }
+
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    ExprPtr visited = IRMutator::VisitExpr_(op);
+    const CallPtr call = As<Call>(visited);
+    if (!call || !current_access_order_) return visited;
+
+    std::vector<std::pair<std::string, std::any>> attrs;
+    attrs.reserve(call->attrs_.size() + 1);
+    bool found = false;
+    bool matches = false;
+    for (const auto& [key, value] : call->attrs_) {
+      if (key != kDsaAccessOrderAttr) {
+        attrs.emplace_back(key, value);
+        continue;
+      }
+      found = true;
+      matches = AnyCast<int>(value, "DSA access-order attr") == *current_access_order_;
+    }
+    if (found && matches && attrs.size() + 1 == call->attrs_.size()) return visited;
+    attrs.emplace_back(kDsaAccessOrderAttr, *current_access_order_);
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, std::move(attrs), call->GetType(),
+                                  call->span_);
+  }
+};
+
 bool IsUnusedAllocStmt(const StmtPtr& stmt, const std::set<const Var*>& used_bases) {
   const auto assign = As<AssignStmt>(stmt);
   const auto call = assign ? As<Call>(assign->value_) : nullptr;
@@ -267,8 +345,8 @@ class MemRefUpdateMutator : public IRMutator {
     }
 
     if (args_changed || kwargs_changed) {
-      return std::make_shared<Call>(op->op_, std::move(new_args), std::move(new_kwargs), op->GetType(),
-                                    op->span_);
+      return std::make_shared<Call>(op->op_, std::move(new_args), std::move(new_kwargs), op->attrs_,
+                                    op->GetType(), op->span_);
     }
     return op;
   }
@@ -809,6 +887,7 @@ FunctionPtr TransformAllocateMemoryAddr(const FunctionPtr& func) {
   // Step 3: either run the legacy bump allocator on MemoryReuse's groups or
   // hand the pre-MemoryReuse allocation identities to the standalone solver.
   std::vector<std::pair<const MemRef*, MemRefPtr>> memref_pairs;
+  bool stamp_dsa_access_order = false;
   if (memory_planner == MemoryPlanner::Dsa) {
 #ifdef PYPTO_ENABLE_DSA_SOLVER
     const std::optional<std::string> export_directory =
@@ -817,6 +896,7 @@ FunctionPtr TransformAllocateMemoryAddr(const FunctionPtr& func) {
         context == nullptr ? std::nullopt : context->GetDsaSolutionDir();
     const DsaReusePenaltyRecognizer reuse_penalty_recognizer =
         context == nullptr ? DsaReusePenaltyRecognizer::Disabled : context->GetDsaReusePenaltyRecognizer();
+    stamp_dsa_access_order = reuse_penalty_recognizer != DsaReusePenaltyRecognizer::Disabled;
     const DsaReferencePlacement reference_placement =
         context == nullptr ? DsaReferencePlacement::Default : context->GetDsaReferencePlacement();
     const std::optional<std::string> reference_target =
@@ -857,6 +937,9 @@ FunctionPtr TransformAllocateMemoryAddr(const FunctionPtr& func) {
 
   auto new_body = mutator.VisitStmt(func->body_);
   if (memory_planner == MemoryPlanner::Dsa || memory_planner == MemoryPlanner::DsaRP) {
+    if (stamp_dsa_access_order) {
+      new_body = DsaAccessOrderStamper().VisitStmt(new_body);
+    }
     // DSA planning consumes transient pipeline provenance while constructing
     // strict separations. MemoryReuse strips the same attribute for PYPTO.
     new_body = StripPipelineMembershipMutator().VisitStmt(new_body);

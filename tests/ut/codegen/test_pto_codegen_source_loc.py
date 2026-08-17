@@ -220,15 +220,9 @@ class TestSourceLocDisabled:
 class TestAccessProvenance:
     """The opt-in NameLoc joins DSA candidate sites to PTOAS operations."""
 
-    def test_execution_ops_carry_distinct_access_orders(self):
+    def test_unstamped_ir_does_not_invent_access_orders(self):
         mlir = _generate(ElementwiseProg, emit_access_provenance=True)
-        add_line = next(line for line in mlir.splitlines() if "pto.tadd" in line)
-        exp_line = next(line for line in mlir.splitlines() if "pto.texp" in line)
-        add_match = _ACCESS_LOC_RE.search(add_line)
-        exp_match = _ACCESS_LOC_RE.search(exp_line)
-        assert add_match is not None
-        assert exp_match is not None
-        assert add_match.group(1) != exp_match.group(1)
+        assert _ACCESS_LOC_RE.search(mlir) is None
 
     def test_provenance_is_disabled_by_default(self):
         assert "pypto.access." not in _generate(ElementwiseProg)

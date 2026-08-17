@@ -49,8 +49,9 @@ void BindCodegen(nb::module_& m) {
            "the "
            "physical addr operand so the ptoas PlanMemory pass allocates (--pto-level=level2). When "
            "emit_source_loc=False, operations carry no source FileLineColLoc. When "
-           "emit_access_provenance=True, lowered operations carry a stable pypto.access.N NameLoc for "
-           "schedule-model analysis.");
+           "emit_access_provenance=True, operations stamped during research DSA construction carry a "
+           "stable pypto.access.N NameLoc for schedule-model analysis; unstamped operations remain "
+           "untagged.");
 
   // OrchestrationResult - result of orchestration code generation
   nb::class_<OrchestrationResult>(codegen_module, "OrchestrationResult",
