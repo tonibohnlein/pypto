@@ -37,6 +37,8 @@ def test_parse_ordered_candidate_with_dependency_witness():
     assert record.ordered_by_logical_dag
     assert record.hazard == "cross_resource"
     assert record.dag_path == ("r0s3", "r0s5", "r0s7")
+    assert record.prior_access_order == 3
+    assert record.next_access_order == 7
 
 
 def test_parse_rejects_inconsistent_ordering_evidence():
