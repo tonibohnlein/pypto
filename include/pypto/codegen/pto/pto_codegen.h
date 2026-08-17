@@ -118,9 +118,11 @@ class PTOCodegen : public CodegenBase {
    *        constants section, which are deduplicated across every use so no
    *        single span fits them; and any operation whose span is unknown or
    *        carries no filename. When false, emit no locations at all.
-   * @param emit_access_provenance When true, wrap emitted operation locations
-   *        in a diagnostic ``pypto.access.N`` NameLoc whose integer matches the
-   *        DSA reuse recognizer's access-order coordinate. Disabled by default.
+   * @param emit_access_provenance When true, wrap operations whose source Call
+   *        was stamped by research DSA construction in a diagnostic
+   *        ``pypto.access.N`` NameLoc. The integer is the recognizer's original
+   *        access-order coordinate, preserved through later lowering. Disabled
+   *        by default; unstamped operations do not invent a coordinate.
    * @return MLIR code as string
    */
   std::string Generate(const ir::ProgramPtr& program, bool emit_tile_addr = true, bool emit_source_loc = true,
@@ -1095,15 +1097,12 @@ class PTOCodegen : public CodegenBase {
   bool emit_source_loc_ = true;
 
   /// Emit a stable ``pypto.access.N`` NameLoc around operation source
-  /// locations.  This diagnostic-only provenance joins raw DSA reuse
-  /// candidates (whose ``sites=`` field uses the same traversal order) to the
+  /// locations. The access coordinate is carried by the source Call from DSA
+  /// construction; codegen never reconstructs it from post-lowering order.
+  /// This diagnostic-only provenance joins raw DSA reuse candidates to the
   /// PTOAS schedule graph without changing operation semantics.
   bool emit_access_provenance_ = false;
 
-  /// Access-order state mirrors the reuse recognizer's preorder over
-  /// AssignStmt, EvalStmt, and ReturnStmt values.  Structural statements do
-  /// not consume an order number.
-  size_t next_access_order_ = 0;
   std::optional<size_t> current_access_order_;
 
   /// Source span attached to the operations being emitted right now; null means
@@ -1138,6 +1137,22 @@ class PTOCodegen : public CodegenBase {
    private:
     PTOCodegen* codegen_;
     const ir::Span* saved_;
+  };
+
+  /// Temporarily bind an access coordinate carried by the current Call.
+  class AccessOrderScope {
+   public:
+    AccessOrderScope(PTOCodegen* codegen, std::optional<size_t> order)
+        : codegen_(codegen), saved_(codegen->current_access_order_) {
+      codegen_->current_access_order_ = order;
+    }
+    ~AccessOrderScope() { codegen_->current_access_order_ = saved_; }
+    AccessOrderScope(const AccessOrderScope&) = delete;
+    AccessOrderScope& operator=(const AccessOrderScope&) = delete;
+
+   private:
+    PTOCodegen* codegen_;
+    std::optional<size_t> saved_;
   };
 
   /**

@@ -47,6 +47,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
@@ -846,7 +847,6 @@ void PTOCodegen::EmitDeferredCompletionAdapterDeclaration() {
 void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   fs_.Reset();
   fs_.current_function = func;
-  next_access_order_ = 0;
   current_access_order_.reset();
 
   // Collect dyn-dim Vars from tensor-parameter shapes once. The same list
@@ -2070,20 +2070,7 @@ void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
   // VisitExpr_(CallPtr)). The statement span is what passes reliably preserve —
   // they frequently rebuild the Call underneath it with a coarser span.
   SpanScope stmt_loc(this, &stmt->span_);
-  const std::optional<size_t> saved_access_order = current_access_order_;
-  if (ir::As<ir::AssignStmt>(stmt) || ir::As<ir::EvalStmt>(stmt)) {
-    current_access_order_ = next_access_order_++;
-  } else if (const auto return_stmt = ir::As<ir::ReturnStmt>(stmt)) {
-    // The recognizer assigns one order number per returned expression. PTO
-    // codegen visits a multi-value return as one statement, so it cannot bind
-    // distinct per-value orders here. Leave those untagged (the downstream join
-    // then fails closed) while still advancing by the exact recognizer count.
-    current_access_order_ =
-        return_stmt->value_.size() == 1 ? std::optional<size_t>{next_access_order_} : std::optional<size_t>{};
-    next_access_order_ += return_stmt->value_.size();
-  }
   ir::IRVisitor::VisitStmt(stmt);
-  current_access_order_ = saved_access_order;
 }
 
 void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
@@ -2256,6 +2243,13 @@ void PTOCodegen::VisitExpr_(const CallPtr& op) {
   // in the enclosing statement; otherwise keep the statement span, which is the
   // trustworthy one for any Call a pass rebuilt.
   SpanScope call_loc(this, SpanContains(current_span_, op->span_) ? &op->span_ : nullptr);
+  std::optional<size_t> access_order;
+  if (emit_access_provenance_ && op->HasAttr(ir::kDsaAccessOrderAttr)) {
+    const int encoded = op->GetAttr<int>(ir::kDsaAccessOrderAttr);
+    INTERNAL_CHECK_SPAN(encoded >= 0, op->span_) << "Internal error: negative DSA access-order attr";
+    access_order = static_cast<size_t>(encoded);
+  }
+  AccessOrderScope access_scope(this, access_order);
   std::string mlir_line = op_info->codegen_func(op, *this);
   if (!mlir_line.empty()) {
     Emit(mlir_line);

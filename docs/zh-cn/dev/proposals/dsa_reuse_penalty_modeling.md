@@ -194,8 +194,9 @@ graph 可以验证 graph construction，但不能解释 placement 导致的 late
 
 原始 candidate 与 schedule 坐标通过显式标识连接。设置
 `PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1` 后，PTO codegen 会用
-`pypto.access.N` NameLoc 包裹每个 lowered operation 的位置，其中 `N` 与
-candidate record 的 `sites=prior->next` 使用同一 preorder。PTOAS 将该整数
+`pypto.access.N` NameLoc 包裹已标记的 lowered operation。`N` 在构造 DSA
+问题时写入源 Call，并在后续 lowering 中保留；它不会根据 lowered statement
+顺序重新计算。因此它与 candidate record 的 `sites=prior->next` 一致。PTOAS 将该整数
 复制到 schedule graph。若 site 缺失，或 candidate route 没有经过验证的
 PTOAS pipe mapping，连接会直接失败；不会把 SSA node number 或源码行号误当作
 同一坐标。
@@ -212,6 +213,21 @@ PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1 python my_export.py
 python -m pypto.tools.dsa_schedule_model score-candidates \
     schedule.jsonl problem.dsa.json --model duration-v0.json \
     -o candidate-weights.json
+```
+
+版本 0 的无环 longest-path graph 只对 distance-zero candidate 评分。
+distance-one candidate 会先连接到两个 PTOAS site，并验证二者确实共享 loop；随后以
+`loop_carried_not_scored_v0` 状态报告且不产生 weight。把 recurrence edge 当作普通
+intra-iteration edge 会制造 cycle，不能作为有效估计；steady-state recurrence/
+throughput 评分属于明确的后续工作。
+
+对于早于 JSONL 导出器的 PTOAS 版本，旧版 level-3 调试日志导入器可以从原始
+PTO 中恢复相同的稳定访问坐标。该连接要求可执行操作顺序完全一致；如果操作或
+`pypto.access.N` 位置缺失，它会失败而不会猜测：
+
+```bash
+python -m pypto.tools.dsa_schedule_model import-debug insert-sync.log \
+    --function kernel --pto kernel.pto -o schedule.jsonl
 ```
 
 版本 0 只为 inbound/outbound DMA、L1-to-L0、L0-to-external、vector、matrix

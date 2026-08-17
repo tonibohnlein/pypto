@@ -43,9 +43,10 @@ class PTOCodegen:
                 with an MLIR ``loc("file":line:col)`` taken from the IR ``Span``,
                 so ptoas diagnostics name the user's source instead of a line in
                 the generated ``.pto``. When False, emit no locations.
-            emit_access_provenance: When True, wrap operation locations in a
-                stable ``pypto.access.N`` NameLoc for DSA schedule-model
-                analysis. Disabled by default.
+            emit_access_provenance: When True, operations stamped during
+                research DSA construction carry a stable ``pypto.access.N``
+                NameLoc for schedule-model analysis. Unstamped operations
+                remain untagged. Disabled by default.
 
         Returns:
             PTO assembly code string (.pto format) with instructions like tmul, tadd, FOR/ENDFOR, etc.
