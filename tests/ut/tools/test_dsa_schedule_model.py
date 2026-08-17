@@ -166,22 +166,130 @@ def test_candidate_score_joins_access_sites_and_derives_non_negative_weight():
     assert result["consumer_groups"][0]["combined_weight_cycles"] == 20.0
 
 
-def test_candidate_score_reports_loop_carried_edge_without_turning_recurrence_into_dag_cycle():
+def _loop_candidate_record(*, with_return_path: bool = False) -> dict:
     record = _record()
     record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 20,
+            "static_trip_count": 4,
+        },
         _with_access(_operation(0, "PIPE_V", "pto.tadd", [10]), 1),
         _with_access(_operation(1, "PIPE_MTE2", "pto.tload", [10]), 7),
         _with_access(_operation(2, "PIPE_V", "pto.tmuls", [10]), 3),
         _with_access(_operation(3, "PIPE_MTE2", "pto.tload", [10]), 9),
     ]
+    if with_return_path:
+        record["sync_edges"] = [{"source": 1, "target": 0, "group": 7, "loop_carried": False}]
+    return record
+
+
+def test_candidate_score_reports_zero_loop_recurrence_weight_without_return_path():
+    record = _loop_candidate_record()
 
     result = dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
 
-    assert result["scored_candidate_count"] == 0
-    assert result["unscored_loop_carried_candidate_count"] == 1
-    assert result["candidates"][0]["status"] == "loop_carried_not_scored_v0"
-    assert result["candidates"][0]["weight_cycles"] is None
-    assert result["candidates"][0]["common_loop_nodes"] == [10]
+    assert result["scored_candidate_count"] == 1
+    assert result["scored_loop_carried_candidate_count"] == 1
+    candidate = result["candidates"][0]
+    assert candidate["status"] == "loop_carried_scored_v1"
+    assert candidate["weight_cycles"] == 0.0
+    assert candidate["common_loop_nodes"] == [10]
+    assert candidate["resource_ii_lower_bound_cycles"] == 20.0
+    assert candidate["candidate_recurrence_cycles"] is None
+
+
+def test_candidate_score_derives_loop_recurrence_ii_weight():
+    record = _loop_candidate_record(with_return_path=True)
+
+    result = dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
+
+    candidate = result["candidates"][0]
+    assert candidate["base_ii_lower_bound_cycles"] == 20.0
+    assert candidate["candidate_recurrence_cycles"] == 30.0
+    assert candidate["candidate_recurrence_path"] == [1, 0, 2]
+    assert candidate["with_candidate_ii_lower_bound_cycles"] == 30.0
+    assert candidate["weight_cycles"] == 10.0
+
+
+def test_inner_loop_ii_removes_static_outer_and_inner_trip_multipliers():
+    record = _loop_candidate_record(with_return_path=True)
+    record["nodes"].insert(
+        0,
+        {
+            "id": 9,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 9,
+            "end": 21,
+            "static_trip_count": 3,
+        },
+    )
+    for node in record["nodes"]:
+        if node.get("kind") == "operation":
+            node["loop_stack"] = [9, 10]
+
+    result = dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
+
+    candidate = result["candidates"][0]
+    assert candidate["loop_node"] == 10
+    assert candidate["pipe_work_cycles"] == {"PIPE_MTE2": 20.0, "PIPE_V": 20.0}
+    assert candidate["candidate_recurrence_cycles"] == 30.0
+    assert candidate["weight_cycles"] == 10.0
+
+
+def test_existing_loop_recurrence_suppresses_duplicate_candidate_weight():
+    record = _loop_candidate_record(with_return_path=True)
+    record["sync_edges"].append({"source": 2, "target": 1, "group": 8, "loop_carried": True})
+    record["sync_groups"] = [
+        {
+            "id": 8,
+            "operations": [
+                {"node": 2, "type": "set_flag", "loop_end": 20},
+                {"node": 1, "type": "wait_flag", "loop_end": 20},
+            ],
+        }
+    ]
+
+    result = dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
+
+    candidate = result["candidates"][0]
+    assert candidate["existing_recurrence_ii_lower_bound_cycles"] == 30.0
+    assert candidate["base_ii_lower_bound_cycles"] == 30.0
+    assert candidate["candidate_recurrence_cycles"] == 30.0
+    assert candidate["weight_cycles"] == 0.0
+
+
+def test_loop_candidate_fails_closed_when_existing_recurrence_has_no_loop_identity():
+    record = _loop_candidate_record(with_return_path=True)
+    record["sync_edges"].append({"source": 2, "target": 1, "group": 8, "loop_carried": True})
+
+    with pytest.raises(ValueError, match="has no loop identity"):
+        dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
+
+
+def test_duplicate_loop_candidates_collapse_to_one_scored_recurrence_edge():
+    record = _loop_candidate_record(with_return_path=True)
+
+    result = dsa_schedule_model.score_reuse_candidates(
+        record, [_candidate(distance=1), _candidate(distance=1)], _ten_cycle_model()
+    )
+
+    assert result["scored_loop_carried_candidate_count"] == 2
+    assert result["loop_recurrence_edges"] == [
+        {
+            "loop_node": 10,
+            "source_node": 2,
+            "target_node": 1,
+            "candidate_indices": [0, 1],
+            "candidate_count": 2,
+            "candidate_recurrence_cycles": 30.0,
+            "weight_cycles": 10.0,
+        }
+    ]
 
 
 def test_candidate_score_fails_closed_without_access_provenance():
@@ -224,7 +332,7 @@ def test_main_scores_candidate_problem(tmp_path):
     assert dsa_schedule_model.main(["score-candidates", str(schedule), str(problem), "-o", str(output)]) == 0
     result = json.loads(output.read_text())
     assert result["candidates"][0]["weight_cycles"] > 0
-    assert result["model_version"] == "reuse_penalty_critical_path_v0"
+    assert result["model_version"] == "reuse_penalty_critical_path_v1"
 
 
 def test_score_fails_closed_on_control_flow_branches():

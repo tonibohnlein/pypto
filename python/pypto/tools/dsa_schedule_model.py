@@ -19,11 +19,11 @@ directed acyclic graph.  It deliberately keeps three concepts separate:
 * the makespan of the complete synchronization set, which captures edge
   interactions and coalescence.
 
-Version 0 aggregates the work of statically bounded loops instead of expanding
-their recurrence graph.  Loop-carried synchronization edges are reported but
-excluded from the DAG score.  Results therefore carry an explicit
-``aggregate_static_work_v0`` policy and must not be presented as cycle-accurate
-predictions.
+Version 0 aggregates the work of statically bounded loops for whole-function
+DAG scores.  Candidate scoring additionally evaluates distance-one edges with
+a version-1 loop initiation-interval lower bound: the maximum of per-pipe work
+and every supported recurrence cycle.  This remains a structural model, not a
+cycle-accurate prediction.
 """
 
 from __future__ import annotations
@@ -616,6 +616,182 @@ def _longest_path(
     return makespan, forward, backward, path
 
 
+def _longest_path_between(
+    durations: Mapping[int, float],
+    edges: Iterable[tuple[int, int, float, str, int | None]],
+    start: int,
+    end: int,
+) -> tuple[float, list[int]] | None:
+    """Return the longest inclusive path from ``start`` to ``end`` in a DAG."""
+    successors: dict[int, list[tuple[int, float]]] = {node: [] for node in durations}
+    indegree = {node: 0 for node in durations}
+    for source, target, latency, _, _ in edges:
+        successors[source].append((target, latency))
+        indegree[target] += 1
+
+    ready = deque(sorted(node for node, degree in indegree.items() if degree == 0))
+    order: list[int] = []
+    while ready:
+        node = ready.popleft()
+        order.append(node)
+        for target, _ in sorted(successors[node]):
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                ready.append(target)
+    if len(order) != len(durations):
+        cyclic = sorted(node for node, degree in indegree.items() if degree)
+        raise ValueError(f"loop body is cyclic before recurrence edges are added: {cyclic[:8]}")
+
+    distance: dict[int, float] = {start: durations[start]}
+    parent: dict[int, int | None] = {start: None}
+    for node in order:
+        if node not in distance:
+            continue
+        for target, latency in sorted(successors[node]):
+            candidate = distance[node] + latency + durations[target]
+            if candidate > distance.get(target, -math.inf):
+                distance[target] = candidate
+                parent[target] = node
+    if end not in distance:
+        return None
+    path: list[int] = []
+    cursor: int | None = end
+    while cursor is not None:
+        path.append(cursor)
+        cursor = parent[cursor]
+    path.reverse()
+    return distance[end], path
+
+
+def _loop_recurrence_score(
+    record: Mapping[str, Any],
+    durations: Mapping[int, float],
+    existing_edges: Sequence[tuple[int, int, float, str, int | None]],
+    *,
+    loop_id: int,
+    source: int,
+    target: int,
+    candidate_latency: float,
+) -> dict[str, Any]:
+    """Score one distance-one edge with a loop-II lower-bound model.
+
+    A distance-one dependency ``source(i) -> target(i+1)`` constrains the
+    initiation interval only when the intra-iteration graph contains a path
+    back from ``target`` to ``source``.  The resulting recurrence latency is
+    the inclusive path duration plus the dependency latency.  Per-pipe work is
+    an independent resource lower bound.
+    """
+    nodes_by_id = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and node.get("kind") == "operation" and isinstance(node.get("id"), int)
+    }
+    loop_nodes = {
+        node_id
+        for node_id, node in nodes_by_id.items()
+        if loop_id in node.get("loop_stack", []) and node_id in durations
+    }
+    if source not in loop_nodes or target not in loop_nodes:
+        raise ValueError(f"candidate edge {source}->{target} is not contained in PTOAS loop {loop_id}")
+
+    loop_counts, dynamic_loops = _loop_multipliers(record)
+    trip_count = loop_counts.get(loop_id, 1)
+    iteration_durations: dict[int, float] = {}
+    for node_id in loop_nodes:
+        loop_stack = nodes_by_id[node_id].get("loop_stack", [])
+        selected_index = loop_stack.index(loop_id)
+        # Whole-function durations multiply every containing static loop. One
+        # iteration of the selected loop removes its own and all ancestor
+        # multipliers, while retaining work in nested loops.
+        divisor = math.prod(loop_counts.get(loop, 1) for loop in loop_stack[: selected_index + 1])
+        iteration_durations[node_id] = durations[node_id] / max(divisor, 1)
+    body_edges = [edge for edge in existing_edges if edge[0] in loop_nodes and edge[1] in loop_nodes]
+    # This validates the body once and gives the candidate's recurrence path.
+    candidate_path = _longest_path_between(iteration_durations, body_edges, target, source)
+
+    pipe_work: dict[str, float] = defaultdict(float)
+    for node_id, duration in iteration_durations.items():
+        pipe = nodes_by_id[node_id].get("pipe")
+        if isinstance(pipe, str):
+            pipe_work[pipe] += duration
+    resource_bound = max(pipe_work.values(), default=0.0)
+
+    loop_end = next(
+        (
+            node.get("end")
+            for node in record.get("nodes", [])
+            if isinstance(node, Mapping)
+            and node.get("kind") == "loop"
+            and node.get("loop_kind") == "LOOP_BEGIN"
+            and node.get("id") == loop_id
+        ),
+        None,
+    )
+    if not isinstance(loop_end, int):
+        raise ValueError(f"PTOAS loop {loop_id} has no integer loop-end identity")
+    groups = {
+        group.get("id"): group
+        for group in record.get("sync_groups", [])
+        if isinstance(group, Mapping) and isinstance(group.get("id"), int)
+    }
+    existing_recurrences: list[dict[str, Any]] = []
+    for edge in record.get("sync_edges", []):
+        if not isinstance(edge, Mapping) or not edge.get("loop_carried"):
+            continue
+        edge_source, edge_target = edge.get("source"), edge.get("target")
+        if edge_source not in loop_nodes or edge_target not in loop_nodes:
+            continue
+        group = groups.get(edge.get("group"))
+        operations = group.get("operations", []) if isinstance(group, Mapping) else []
+        loop_ends = {
+            operation.get("loop_end")
+            for operation in operations
+            if isinstance(operation, Mapping) and isinstance(operation.get("loop_end"), int)
+        }
+        explicit_loop_end = edge.get("loop_end")
+        if isinstance(explicit_loop_end, int):
+            loop_ends.add(explicit_loop_end)
+        if not loop_ends:
+            raise ValueError(
+                "loop-carried schedule edge has no loop identity: "
+                f"group={edge.get('group')}, edge={edge_source}->{edge_target}"
+            )
+        if loop_end not in loop_ends:
+            continue
+        recurrence_path = _longest_path_between(iteration_durations, body_edges, edge_target, edge_source)
+        if recurrence_path is None:
+            continue
+        latency, path = recurrence_path
+        existing_recurrences.append(
+            {
+                "source": edge_source,
+                "target": edge_target,
+                "group": edge.get("group"),
+                "cycles": latency + candidate_latency,
+                "path": path,
+            }
+        )
+
+    existing_recurrence_bound = max((float(item["cycles"]) for item in existing_recurrences), default=0.0)
+    base_ii = max(resource_bound, existing_recurrence_bound)
+    candidate_cycles = None if candidate_path is None else candidate_path[0] + candidate_latency
+    with_candidate_ii = max(base_ii, candidate_cycles or 0.0)
+    return {
+        "model_version": "loop_recurrence_ii_lower_bound_v1",
+        "loop_node": loop_id,
+        "static_trip_count": None if loop_id in dynamic_loops else trip_count,
+        "pipe_work_cycles": dict(sorted(pipe_work.items())),
+        "resource_ii_lower_bound_cycles": resource_bound,
+        "existing_recurrence_ii_lower_bound_cycles": existing_recurrence_bound,
+        "existing_recurrences": existing_recurrences,
+        "base_ii_lower_bound_cycles": base_ii,
+        "candidate_recurrence_cycles": candidate_cycles,
+        "candidate_recurrence_path": None if candidate_path is None else candidate_path[1],
+        "with_candidate_ii_lower_bound_cycles": with_candidate_ii,
+        "weight_cycles": max(0.0, with_candidate_ii - base_ii),
+    }
+
+
 def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str, Any]:
     """Score one PTOAS schedule graph and its synchronization exposure."""
     branch_ids = [
@@ -734,9 +910,11 @@ def score_reuse_candidates(
     dependencies remain in the graph. For each cross-resource candidate, the
     terminal macro phase at the prior access site is connected to the initial
     macro phase at the next access site. The non-negative penalty is the
-    resulting longest-path increase. Candidates sharing a consumer are also
-    scored as a union so the report exposes non-additivity/coalescence instead
-    of pretending pair weights are independent.
+    resulting longest-path increase. Distance-one candidates use a loop
+    initiation-interval lower bound instead of being inserted into the DAG.
+    Distance-zero candidates sharing a consumer are also scored as a union so
+    the report exposes non-additivity/coalescence instead of pretending pair
+    weights are independent.
 
     Access-site provenance is mandatory. A missing/ambiguous route mapping or
     missing tagged schedule node is an error, never a zero-cost result.
@@ -798,13 +976,22 @@ def score_reuse_candidates(
         source = prior_nodes[-1]
         target = next_nodes[0]
         if candidate.loop_carried:
-            source_loops = set(nodes_by_id[source].get("loop_stack", []))
+            source_loop_stack = nodes_by_id[source].get("loop_stack", [])
             target_loops = set(nodes_by_id[target].get("loop_stack", []))
-            common_loops = sorted(source_loops & target_loops)
+            common_loops = [loop for loop in source_loop_stack if loop in target_loops]
             if not common_loops:
                 raise ValueError(
                     f"loop-carried candidate {index} sites do not share a PTOAS loop: edge {source}->{target}"
                 )
+            recurrence = _loop_recurrence_score(
+                record,
+                durations,
+                existing_edges,
+                loop_id=common_loops[-1],
+                source=source,
+                target=target,
+                candidate_latency=model.sync_latency_cycles,
+            )
             rows.append(
                 {
                     "candidate_index": index,
@@ -821,8 +1008,8 @@ def score_reuse_candidates(
                     "source_macro_nodes": prior_nodes,
                     "target_macro_nodes": next_nodes,
                     "common_loop_nodes": common_loops,
-                    "status": "loop_carried_not_scored_v0",
-                    "weight_cycles": None,
+                    "status": "loop_carried_scored_v1",
+                    **recurrence,
                 }
             )
             continue
@@ -881,9 +1068,34 @@ def score_reuse_candidates(
             }
         )
 
+    loop_edge_groups: list[dict[str, Any]] = []
+    loop_rows: dict[tuple[int, int, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get("status") == "loop_carried_scored_v1":
+            loop_rows[(row["loop_node"], row["source_node"], row["target_node"])].append(row)
+    for (loop_node, source, target), duplicates in sorted(loop_rows.items()):
+        weights = {float(row["weight_cycles"]) for row in duplicates}
+        recurrence_cycles = {row["candidate_recurrence_cycles"] for row in duplicates}
+        if len(weights) != 1 or len(recurrence_cycles) != 1:
+            raise ValueError(
+                "candidate records joined to one recurrence edge but received different scores: "
+                f"loop={loop_node}, edge={source}->{target}"
+            )
+        loop_edge_groups.append(
+            {
+                "loop_node": loop_node,
+                "source_node": source,
+                "target_node": target,
+                "candidate_indices": [row["candidate_index"] for row in duplicates],
+                "candidate_count": len(duplicates),
+                "candidate_recurrence_cycles": duplicates[0]["candidate_recurrence_cycles"],
+                "weight_cycles": duplicates[0]["weight_cycles"],
+            }
+        )
+
     return {
         "schema_version": 1,
-        "model_version": "reuse_penalty_critical_path_v0",
+        "model_version": "reuse_penalty_critical_path_v1",
         "function": record.get("function", "<unknown>"),
         "duration_model_version": model.model_version,
         "calibration_status": model.calibration_status,
@@ -892,12 +1104,17 @@ def score_reuse_candidates(
         "dynamic_loop_ids": dynamic_loops,
         "excluded_loop_carried_sync_edges": excluded_loop_carried,
         "candidate_count": len(candidates),
-        "scored_candidate_count": sum(row.get("status") == "scored" for row in rows),
-        "unscored_loop_carried_candidate_count": sum(
-            row.get("status") == "loop_carried_not_scored_v0" for row in rows
+        "scored_candidate_count": sum(
+            row.get("status") in {"scored", "loop_carried_scored_v1"} for row in rows
         ),
+        "scored_distance_zero_candidate_count": sum(row.get("status") == "scored" for row in rows),
+        "scored_loop_carried_candidate_count": sum(
+            row.get("status") == "loop_carried_scored_v1" for row in rows
+        ),
+        "unscored_loop_carried_candidate_count": 0,
         "candidates": rows,
         "consumer_groups": consumer_groups,
+        "loop_recurrence_edges": loop_edge_groups,
         "node_durations": {str(node): value for node, value in sorted(provenance.items())},
     }
 

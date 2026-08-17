@@ -199,12 +199,14 @@ edge against the baseline critical path. This is deliberately different from
 counting synchronization groups: an edge receives zero exposure when it is
 covered by work already on the critical path.
 
-Static loops are aggregated by their trip count. Dynamic loops use a
-multiplier of one, and loop-carried synchronization edges are excluded and
-reported. Operation durations come either from medians in cleaned simulator
-instruction metrics or from explicitly labelled, uncalibrated per-pipe
-fallbacks. Consequently, version-0 results are not cycle-accurate estimates
-unless their calibration coverage and loop limitations support that claim.
+Static loops are aggregated by their trip count in the whole-function DAG.
+Dynamic loops use a multiplier of one. Loop-carried synchronization edges are
+excluded from that DAG and reported; candidate scoring handles them separately
+with the recurrence lower bound described below. Operation durations come
+either from medians in cleaned simulator instruction metrics or from explicitly
+labelled, uncalibrated per-pipe fallbacks. Consequently, these results are not
+cycle-accurate estimates unless their calibration coverage and loop
+limitations support that claim.
 
 Planner comparisons use paired schedule graphs and the convention
 `candidate / baseline - 1`, where a negative value predicts that the candidate
@@ -253,12 +255,22 @@ python -m pypto.tools.dsa_schedule_model score-candidates \
     -o candidate-weights.json
 ```
 
-Version 0 scores only distance-zero candidates in its acyclic longest-path
-graph. A distance-one candidate is first joined to both PTOAS sites and checked
-to share a real loop, then reported as `loop_carried_not_scored_v0` with no
-weight. Treating its recurrence edge as an ordinary intra-iteration edge would
-create a cycle and is not a valid estimate; steady-state recurrence/throughput
-scoring is explicit follow-up work.
+Version 1 retains the acyclic longest-path score for distance-zero candidates
+and adds a lower-bound score for distance-one candidates. It joins both PTOAS
+sites, checks that they share a real loop, and selects their innermost common
+loop. The base initiation-interval lower bound is the maximum of per-pipe work
+in one iteration and every already-present single-recurrence cycle. For a
+hypothetical edge `source(i) -> target(i+1)`, the model finds the longest
+intra-iteration path `target -> source`; if it exists, that path plus the edge
+latency is another recurrence bound. The non-negative weight is the increase
+in the base lower bound. If no return path exists, the edge changes phase but
+does not raise this throughput bound and receives zero.
+
+This is deliberately a lower bound, not a complete modulo-scheduling model.
+It does not yet search cycles containing several new recurrence edges.
+Multiple candidate records that join to the same `(loop, source, target)` are
+therefore collapsed in `loop_recurrence_edges` so downstream analysis does not
+sum duplicate evidence.
 
 For PTOAS revisions that predate the JSONL exporter, the legacy level-3 debug
 importer can recover the same stable access coordinates from the raw PTO.  The
