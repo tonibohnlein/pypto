@@ -169,10 +169,11 @@ synchronization edge、loop membership 与已知 allocation size。
 critical path 评估每条 synchronization edge。这与简单统计 synchronization group
 不同：如果一条 edge 的延迟已经被 critical path 上的工作覆盖，它的 exposure 为零。
 
-静态 loop 按 trip count 聚合。动态 loop 的 multiplier 为一；loop-carried
-synchronization edge 会被排除并显式报告。operation duration 来自清理后的 simulator
+在 whole-function DAG 中，静态 loop 按 trip count 聚合，动态 loop 的 multiplier 为一。
+loop-carried synchronization edge 会从该 DAG 中排除并显式报告；candidate 评分会用下文的
+recurrence lower bound 单独处理它们。operation duration 来自清理后的 simulator
 instruction metric 中位数，或带有明确“未校准”标签的 per-pipe fallback。因此，除非
-calibration coverage 与 loop 限制足以支持，否则版本 0 结果不是 cycle-accurate 估计。
+calibration coverage 与 loop 限制足以支持，否则这些结果不是 cycle-accurate 估计。
 
 planner 比较使用配对 schedule graph，并采用 `candidate / baseline - 1` 约定，负数表示
 预测 candidate 更快。evaluator 首先要求两个 arm 具有相同 operation stream，然后报告
@@ -215,11 +216,18 @@ python -m pypto.tools.dsa_schedule_model score-candidates \
     -o candidate-weights.json
 ```
 
-版本 0 的无环 longest-path graph 只对 distance-zero candidate 评分。
-distance-one candidate 会先连接到两个 PTOAS site，并验证二者确实共享 loop；随后以
-`loop_carried_not_scored_v0` 状态报告且不产生 weight。把 recurrence edge 当作普通
-intra-iteration edge 会制造 cycle，不能作为有效估计；steady-state recurrence/
-throughput 评分属于明确的后续工作。
+版本 1 保留 distance-zero candidate 的无环 longest-path 评分，并为 distance-one
+candidate 增加 lower-bound 评分。它连接两个 PTOAS site，验证二者共享真实 loop，并选择
+最内层的公共 loop。base initiation-interval lower bound 是单次迭代中每条 pipe 的工作量
+以及所有已有 single-recurrence cycle 的最大值。对假设 edge
+`source(i) -> target(i+1)`，模型寻找 intra-iteration 路径 `target -> source`；若该路径
+存在，路径时长加 edge latency 会形成新的 recurrence bound。非负 weight 是该 bound 相对
+base 的增量。若不存在返回路径，该 edge 只改变 phase，不提高此 throughput bound，因此
+weight 为零。
+
+这仍然只是 lower bound，而不是完整的 modulo-scheduling 模型；它尚未搜索包含多个新
+recurrence edge 的 cycle。多个 candidate record 若连接到同一个
+`(loop, source, target)`，会在 `loop_recurrence_edges` 中折叠，避免下游分析重复累加证据。
 
 对于早于 JSONL 导出器的 PTOAS 版本，旧版 level-3 调试日志导入器可以从原始
 PTO 中恢复相同的稳定访问坐标。该连接要求可执行操作顺序完全一致；如果操作或
