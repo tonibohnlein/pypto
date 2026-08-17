@@ -155,6 +155,69 @@ performance cost。未来经校准的 producer 应默认使用零权重，并只
 dominant pair，而不是重复求和。OR group、hyperedge、负权重和全局 event-budget
 term 继续推迟。
 
+## Critical-path model v0
+
+下一层模型使用 schedule graph，而不是再增加 recognizer filter。PTOAS diagnostic
+exporter 记录 post-InsertSync operation node、每条 pipe 的 issue-order edge、
+synchronization edge、loop membership 与已知 allocation size。
+`pypto.tools.dsa_schedule_model` 为 operation 赋予 duration，并计算两个有向无环图：
+
+- 只包含每条 pipe stream edge 的 baseline；
+- 加入非 loop-carried synchronization edge 后的完整图。
+
+版本 0 把两者最长路径之差报告为 `synchronization_exposure_cycles`，并相对 baseline
+critical path 评估每条 synchronization edge。这与简单统计 synchronization group
+不同：如果一条 edge 的延迟已经被 critical path 上的工作覆盖，它的 exposure 为零。
+
+静态 loop 按 trip count 聚合。动态 loop 的 multiplier 为一；loop-carried
+synchronization edge 会被排除并显式报告。operation duration 来自清理后的 simulator
+instruction metric 中位数，或带有明确“未校准”标签的 per-pipe fallback。因此，除非
+calibration coverage 与 loop 限制足以支持，否则版本 0 结果不是 cycle-accurate 估计。
+
+planner 比较使用配对 schedule graph，并采用 `candidate / baseline - 1` 约定，负数表示
+预测 candidate 更快。evaluator 首先要求两个 arm 具有相同 operation stream，然后报告
+placement 变化新增和移除的 synchronization dependency。held-out cohort 的 comparison
+manifest 可以同时省略两边的 observed latency，但不能只提供单边 observation。
+evaluator 会对 manifest、schedule 输入和 prediction 做 content address，从而在
+device timing 前冻结 held-out prediction：
+
+```bash
+python -m pypto.tools.dsa_schedule_model calibrate \
+    instr_metrics.json -o duration-v0.json
+python -m pypto.tools.dsa_schedule_model evaluate \
+    comparisons.json --model duration-v0.json -o predictions.json
+```
+
+该模型是研究基础设施，不是当前 `unit_v1` weight policy。在用于分配 DSA-RP weight
+之前，它必须能够预测 fresh arm pair 的 latency 方向与排序。尤其是，单个 schedule
+graph 可以验证 graph construction，但不能解释 placement 导致的 latency 差异。
+
+原始 candidate 与 schedule 坐标通过显式标识连接。设置
+`PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1` 后，PTO codegen 会用
+`pypto.access.N` NameLoc 包裹每个 lowered operation 的位置，其中 `N` 与
+candidate record 的 `sites=prior->next` 使用同一 preorder。PTOAS 将该整数
+复制到 schedule graph。若 site 缺失，或 candidate route 没有经过验证的
+PTOAS pipe mapping，连接会直接失败；不会把 SSA node number 或源码行号误当作
+同一坐标。
+
+首个 candidate-weight prototype 保留 reference schedule 中已有的全部 sync，
+并从 prior site 的 terminal macro phase 向 next site 的 initial macro phase
+加入一条 hypothetical completion edge。非负 weight 是加入该 edge 后 longest
+path cycle 的增量。它还会把共享同一 consumer 的所有 candidate edge 联合加入，
+并报告 combined cost 与 singleton cost 总和的差值，从而显式呈现 release
+coalescence，而不是重复计数：
+
+```bash
+PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1 python my_export.py
+python -m pypto.tools.dsa_schedule_model score-candidates \
+    schedule.jsonl problem.dsa.json --model duration-v0.json \
+    -o candidate-weights.json
+```
+
+版本 0 只为 inbound/outbound DMA、L1-to-L0、L0-to-external、vector、matrix
+和 scalar resource 提供经过验证的 pipe mapping。其余 transfer route 在 PTOAS
+pipe mapping 确认前会被拒绝。
+
 ## 剩余验证
 
 completion-frontier factorial 已经完成。它确认同一 consumer 的多个 active

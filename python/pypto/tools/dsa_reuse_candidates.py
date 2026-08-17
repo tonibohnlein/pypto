@@ -31,6 +31,8 @@ class ReuseCandidateRecord:
     ordered_by_logical_dag: bool
     hazard: Literal["cross_resource", "same_resource"]
     dag_path: tuple[str, ...]
+    prior_access_order: int
+    next_access_order: int
     fields: tuple[str, ...]
 
 
@@ -93,6 +95,15 @@ def parse_candidate_record(record: str) -> ReuseCandidateRecord:
         raise ValueError("logical_order candidate requires a dependency path")
     if not ordered and dag_path:
         raise ValueError("no_logical_order candidate must use dag_path=none")
+    sites_text = keyed.get("sites")
+    if sites_text is None:
+        raise ValueError(f"missing sites in '{record}'")
+    try:
+        prior_site, next_site = _split_arrow(sites_text, "->", "access sites")
+        prior_access_order = int(prior_site)
+        next_access_order = int(next_site)
+    except ValueError as error:
+        raise ValueError(f"invalid access sites in '{record}'") from error
 
     return ReuseCandidateRecord(
         first_buffer=first_buffer,
@@ -105,6 +116,8 @@ def parse_candidate_record(record: str) -> ReuseCandidateRecord:
         ordered_by_logical_dag=ordered,
         hazard=hazard,
         dag_path=dag_path,
+        prior_access_order=prior_access_order,
+        next_access_order=next_access_order,
         fields=fields,
     )
 

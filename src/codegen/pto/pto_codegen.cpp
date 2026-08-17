@@ -675,9 +675,11 @@ const backend::BackendHandler* PTOCodegen::GetBackendHandler() const { return ba
 // Generate entry and GenerateFunction
 // ========================================================================
 
-std::string PTOCodegen::Generate(const ProgramPtr& program, bool emit_tile_addr, bool emit_source_loc) {
+std::string PTOCodegen::Generate(const ProgramPtr& program, bool emit_tile_addr, bool emit_source_loc,
+                                 bool emit_access_provenance) {
   emit_tile_addr_ = emit_tile_addr;
   emit_source_loc_ = emit_source_loc;
+  emit_access_provenance_ = emit_access_provenance;
   current_span_ = nullptr;
   stream_.str("");
   stream_.clear();
@@ -854,6 +856,8 @@ void PTOCodegen::EmitDeferredCompletionAdapterDeclaration() {
 void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   fs_.Reset();
   fs_.current_function = func;
+  next_access_order_ = 0;
+  current_access_order_.reset();
 
   // Index every `<var> = <tuple>[i]` binding once. A multi-output op's Call does
   // not carry its DPS destinations in args_ — the parser desugars them into
@@ -2101,7 +2105,20 @@ void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
   // VisitExpr_(CallPtr)). The statement span is what passes reliably preserve —
   // they frequently rebuild the Call underneath it with a coarser span.
   SpanScope stmt_loc(this, &stmt->span_);
+  const std::optional<size_t> saved_access_order = current_access_order_;
+  if (ir::As<ir::AssignStmt>(stmt) || ir::As<ir::EvalStmt>(stmt)) {
+    current_access_order_ = next_access_order_++;
+  } else if (const auto return_stmt = ir::As<ir::ReturnStmt>(stmt)) {
+    // The recognizer assigns one order number per returned expression. PTO
+    // codegen visits a multi-value return as one statement, so it cannot bind
+    // distinct per-value orders here. Leave those untagged (the downstream join
+    // then fails closed) while still advancing by the exact recognizer count.
+    current_access_order_ =
+        return_stmt->value_.size() == 1 ? std::optional<size_t>{next_access_order_} : std::optional<size_t>{};
+    next_access_order_ += return_stmt->value_.size();
+  }
   ir::IRVisitor::VisitStmt(stmt);
+  current_access_order_ = saved_access_order;
 }
 
 void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
@@ -2340,17 +2357,23 @@ void PTOCodegen::Emit(const std::string& line) { stream_ << GetIndent() << line 
 void PTOCodegen::EmitStructural(const std::string& line) { stream_ << GetIndent() << line << "\n"; }
 
 std::string PTOCodegen::LocSuffix() const {
-  if (!emit_source_loc_ || current_span_ == nullptr) return "";
-  const ir::Span& span = *current_span_;
-  // Without a filename there is nothing to attribute, and MLIR's FileLineColLoc
-  // needs non-negative coordinates. Emitting nothing leaves the op exactly as it
-  // was before locations existed (ptoas then reports the .pto line) — strictly
-  // better than a misleading `loc("":0:0)`.
-  if (span.filename_.empty() || !span.is_valid()) return "";
-  // is_valid() admits an unknown column (-1); MLIR does not.
-  const int column = span.begin_column_ > 0 ? span.begin_column_ : 1;
-  return " loc(\"" + EscapeMlirString(span.filename_) + "\":" + std::to_string(span.begin_line_) + ":" +
-         std::to_string(column) + ")";
+  std::string source;
+  if (emit_source_loc_ && current_span_ != nullptr) {
+    const ir::Span& span = *current_span_;
+    // Without a filename there is nothing to attribute, and MLIR's
+    // FileLineColLoc needs non-negative coordinates.
+    if (!span.filename_.empty() && span.is_valid()) {
+      // is_valid() admits an unknown column (-1); MLIR does not.
+      const int column = span.begin_column_ > 0 ? span.begin_column_ : 1;
+      source = "\"" + EscapeMlirString(span.filename_) + "\":" + std::to_string(span.begin_line_) + ":" +
+               std::to_string(column);
+    }
+  }
+  if (emit_access_provenance_ && current_access_order_) {
+    const std::string name = "\"pypto.access." + std::to_string(*current_access_order_) + "\"";
+    return source.empty() ? " loc(" + name + ")" : " loc(" + name + "(" + source + "))";
+  }
+  return source.empty() ? "" : " loc(" + source + ")";
 }
 
 std::string PTOCodegen::GetExprAsCode(const ExprPtr& expr) {
