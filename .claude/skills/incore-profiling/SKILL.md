@@ -108,11 +108,31 @@ The exporter deduplicates only by the solver's semantic problem fingerprint and
 does not impose a buffer-count threshold. The screen tightens one memory pool at
 a time while leaving every other pool at native capacity. Its lower endpoint is
 the geometry-first-fit peak for that pool, so the conventional control remains
-feasible by construction. It compares geometry first-fit, DSA-RP canonical
-greedy, and a six-order Cypress portfolio. Cypress selection is deliberately
-blind to reuse-penalty weights and device time. `model-separation.tsv` is a
-candidate-ranking aid, not performance evidence; retain neutral and
-Cypress-favoured controls when freezing the device panel.
+feasible by construction. It compares four arms: geometry first fit, geometry
+canonical greedy, a six-order Cypress portfolio, and DSA-RP canonical greedy.
+The two canonical-greedy arms use the same seed and restart count; only their
+objectives differ. Cypress selection is deliberately blind to reuse-penalty
+weights and device time. `model-separation.tsv` is a candidate-ranking aid, not
+performance evidence; retain neutral and Cypress-favoured controls when
+freezing the device panel. Pass `--fractions 1` for a native-capacity-only
+census.
+
+For a complete standalone launchability census, retain every penalty-bearing
+invocation rather than selecting a model-positive panel:
+
+```bash
+python .claude/skills/incore-profiling/build_dsa_standalone_census.py \
+  --invocations <corpus>/invocations.tsv \
+  --unique-problems <corpus>/unique-problems.tsv \
+  --screen-root <four-arm-native-screen> --output-root <census>
+```
+
+The census preserves invocation aliases, verifies that every host-feasible arm
+has its native solution, and marks each row as needing current dispatch
+capture. It intentionally forbids parent fallback. On the device host, classify
+each invocation as `STANDALONE_KERNEL`, `COMPLETE_MIXED_GROUP`, or a specific
+terminal failure. Measure every successful row under all four arms; do not
+measure only candidates that look promising in the solver objective.
 
 Build an inclusive **screening** slate before doing current launchability
 checks. This is deliberately not the paper's frozen 20--30-kernel panel:
@@ -223,12 +243,13 @@ python .claude/skills/incore-profiling/standalone_compare.py \
 ```
 
 For three or more placements, use the balanced multi-arm driver. `--case` is
-repeatable; with three variants it runs three cyclic orders and their reverses,
+repeatable; with four variants it runs four cyclic orders and their reverses,
 so every placement occurs twice in every process position:
 
 ```bash
 python .claude/skills/incore-profiling/standalone_multi_compare.py \
-  --case geometry_ff=<case> --case cypress=<case> --case dsa_rp_cg=<case> \
+  --case geometry_ff=<case> --case geometry_cg=<case> \
+  --case cypress=<case> --case dsa_rp_cg=<case> \
   --output <real-output-abi-name> --device-id 0 \
   --correctness-repetitions 3 --warmup 10 --rounds 100 \
   --output-root <results>

@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Freeze a broad DSA device panel and solve the three device-study arms."""
+"""Freeze a broad DSA device panel and solve the four device-study arms."""
 
 from __future__ import annotations
 
@@ -22,6 +22,10 @@ from typing import Any
 SELECTION_CLASSES = {"historical_winner", "broad_inventory"}
 ARMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("geometry_ff", ("--solver", "geometry-first-fit")),
+    (
+        "geometry_cg",
+        ("--solver", "geometry-canonical-greedy", "--seed", "0", "--restarts", "8"),
+    ),
     ("cypress", ("--solver", "cypress-relaxation")),
     ("dsa_rp_cg", ("--solver", "canonical-greedy", "--seed", "0", "--restarts", "8")),
 )

@@ -40,7 +40,12 @@ def _separation(tag: str, *, better: int = 0, no_fit: int = 0) -> dict[str, str]
 def _screen_rows(tag: str, geometry_cost: int, rp_cost: int) -> list[dict[str, str]]:
     rows = []
     for capacity in ("tight", "native"):
-        for arm, cost in (("geometry_ff", geometry_cost), ("cypress", rp_cost), ("dsa_rp_cg", rp_cost)):
+        for arm, cost in (
+            ("geometry_ff", geometry_cost),
+            ("geometry_cg", geometry_cost),
+            ("cypress", rp_cost),
+            ("dsa_rp_cg", rp_cost),
+        ):
             rows.append(
                 {
                     "tag": tag,

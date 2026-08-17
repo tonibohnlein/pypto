@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 ARM_GEOMETRY = "geometry_ff"
+ARM_GEOMETRY_CG = "geometry_cg"
 ARM_CYPRESS = "cypress"
 ARM_DSA_RP = "dsa_rp_cg"
 CAPACITY_LABELS = {
@@ -64,8 +65,10 @@ class CapacityCell:
 
 def parse_fractions(text: str) -> tuple[Fraction, ...]:
     values = tuple(Fraction(item.strip()) for item in text.split(",") if item.strip())
+    if values == (Fraction(1),):
+        return values
     if not values or values[0] != 0 or values[-1] != 1:
-        raise ValueError("capacity fractions must include 0 and 1")
+        raise ValueError("capacity fractions must be native-only (1) or include 0 and 1")
     if tuple(sorted(set(values))) != values or any(value < 0 or value > 1 for value in values):
         raise ValueError("capacity fractions must be unique, increasing, and lie in [0, 1]")
     return values
@@ -328,6 +331,25 @@ def _screen_cell(
         )
     ]
 
+    geometry_cg_result, geometry_cg_solution = _run_solver(
+        config.binary,
+        derived_path,
+        cell_root / ARM_GEOMETRY_CG,
+        "geometry-canonical-greedy",
+        seed=0,
+        restarts=config.restarts,
+        timeout=config.timeout,
+    )
+    _annotate_solution_sizes(derived, geometry_cg_solution)
+    rows.append(
+        _arm_row(
+            cell,
+            arm=ARM_GEOMETRY_CG,
+            result=geometry_cg_result,
+            solution=geometry_cg_solution,
+        )
+    )
+
     canonical_result, canonical_solution = _run_solver(
         config.binary,
         derived_path,
@@ -487,6 +509,9 @@ def build_model_separation_rows(
         counts = {
             "all_arms_feasible_cells": 0,
             "rp_better_geometry_cells": 0,
+            "rp_better_geometry_cg_cells": 0,
+            "rp_equal_geometry_cg_cells": 0,
+            "rp_worse_geometry_cg_cells": 0,
             "rp_better_cypress_cells": 0,
             "rp_equal_cypress_cells": 0,
             "rp_worse_cypress_cells": 0,
@@ -498,22 +523,28 @@ def build_model_separation_rows(
         for (unused_tag, pool_id, fraction), arms in cells:
             del unused_tag
             geometry = arms.get(ARM_GEOMETRY)
+            geometry_cg = arms.get(ARM_GEOMETRY_CG)
             cypress = arms.get(ARM_CYPRESS)
             rp = arms.get(ARM_DSA_RP)
-            if rp is None or cypress is None or geometry is None:
+            if rp is None or cypress is None or geometry is None or geometry_cg is None:
                 continue
             rp_feasible = rp.get("status") == "feasible"
             cypress_feasible = cypress.get("status") == "feasible"
             geometry_feasible = geometry.get("status") == "feasible"
+            geometry_cg_feasible = geometry_cg.get("status") == "feasible"
             if rp_feasible and not cypress_feasible:
                 counts["rp_feasible_cypress_no_fit_cells"] += 1
-            if not (rp_feasible and cypress_feasible and geometry_feasible):
+            if not (rp_feasible and cypress_feasible and geometry_feasible and geometry_cg_feasible):
                 continue
             counts["all_arms_feasible_cells"] += 1
             rp_cost = int(rp["reuse_cost"])
             cypress_cost = int(cypress["reuse_cost"])
             geometry_cost = int(geometry["reuse_cost"])
+            geometry_cg_cost = int(geometry_cg["reuse_cost"])
             counts["rp_better_geometry_cells"] += rp_cost < geometry_cost
+            counts["rp_better_geometry_cg_cells"] += rp_cost < geometry_cg_cost
+            counts["rp_equal_geometry_cg_cells"] += rp_cost == geometry_cg_cost
+            counts["rp_worse_geometry_cg_cells"] += rp_cost > geometry_cg_cost
             counts["rp_better_cypress_cells"] += rp_cost < cypress_cost
             counts["rp_equal_cypress_cells"] += rp_cost == cypress_cost
             counts["rp_worse_cypress_cells"] += rp_cost > cypress_cost

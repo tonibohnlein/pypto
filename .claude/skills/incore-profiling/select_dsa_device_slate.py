@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-_ARMS = ("geometry_ff", "cypress", "dsa_rp_cg")
+_ARMS = ("geometry_ff", "geometry_cg", "cypress", "dsa_rp_cg")
 _MIXED_HALF = re.compile(r"_(?:aic|aiv)(?:_\d+)?$")
 _NUMBERED_CLONE = re.compile(r"_\d+$")
 
