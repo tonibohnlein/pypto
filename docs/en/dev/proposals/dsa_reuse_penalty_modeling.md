@@ -270,7 +270,9 @@ This is deliberately a lower bound, not a complete modulo-scheduling model.
 It does not yet search cycles containing several new recurrence edges.
 Multiple candidate records that join to the same `(loop, source, target)` are
 therefore collapsed in `loop_recurrence_edges` so downstream analysis does not
-sum duplicate evidence.
+sum duplicate evidence. Distance-zero records are likewise collapsed in
+`distance_zero_edges`; `candidate_weight_summary` reports counts, sums, and
+maxima over these unique schedule edges rather than raw buffer-pair records.
 
 For PTOAS revisions that predate the JSONL exporter, the legacy level-3 debug
 importer can recover the same stable access coordinates from the raw PTO.  The
