@@ -901,6 +901,87 @@ def _site_nodes(record: Mapping[str, Any]) -> dict[tuple[int, str], list[int]]:
     return result
 
 
+def _deduplicate_scored_candidate_edges(
+    rows: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collapse candidate records that join to the same schedule edge."""
+    distance_zero_rows: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    loop_rows: dict[tuple[int, int, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get("status") == "scored":
+            distance_zero_rows[(row["source_node"], row["target_node"])].append(row)
+        elif row.get("status") == "loop_carried_scored_v1":
+            loop_rows[(row["loop_node"], row["source_node"], row["target_node"])].append(row)
+
+    distance_zero_edges: list[dict[str, Any]] = []
+    for (source, target), duplicates in sorted(distance_zero_rows.items()):
+        weights = {float(row["weight_cycles"]) for row in duplicates}
+        if len(weights) != 1:
+            raise ValueError(
+                "candidate records joined to one distance-zero edge but received different scores: "
+                f"edge={source}->{target}"
+            )
+        distance_zero_edges.append(
+            {
+                "source_node": source,
+                "target_node": target,
+                "candidate_indices": [row["candidate_index"] for row in duplicates],
+                "candidate_count": len(duplicates),
+                "weight_cycles": duplicates[0]["weight_cycles"],
+            }
+        )
+
+    loop_edges: list[dict[str, Any]] = []
+    for (loop_node, source, target), duplicates in sorted(loop_rows.items()):
+        weights = {float(row["weight_cycles"]) for row in duplicates}
+        recurrence_cycles = {row["candidate_recurrence_cycles"] for row in duplicates}
+        if len(weights) != 1 or len(recurrence_cycles) != 1:
+            raise ValueError(
+                "candidate records joined to one recurrence edge but received different scores: "
+                f"loop={loop_node}, edge={source}->{target}"
+            )
+        loop_edges.append(
+            {
+                "loop_node": loop_node,
+                "source_node": source,
+                "target_node": target,
+                "candidate_indices": [row["candidate_index"] for row in duplicates],
+                "candidate_count": len(duplicates),
+                "candidate_recurrence_cycles": duplicates[0]["candidate_recurrence_cycles"],
+                "weight_cycles": duplicates[0]["weight_cycles"],
+            }
+        )
+    return distance_zero_edges, loop_edges
+
+
+def _summarize_candidate_weights(
+    distance_zero_edges: Sequence[Mapping[str, Any]],
+    loop_edges: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return stable unique-edge features for cohort evaluation."""
+    positive_distance_zero = [edge for edge in distance_zero_edges if edge["weight_cycles"] > 0]
+    positive_loop_recurrences = [edge for edge in loop_edges if edge["weight_cycles"] > 0]
+    result = {
+        "positive_distance_zero_edge_count": len(positive_distance_zero),
+        "positive_loop_recurrence_edge_count": len(positive_loop_recurrences),
+        "distance_zero_weight_sum_cycles": sum(edge["weight_cycles"] for edge in positive_distance_zero),
+        "loop_recurrence_weight_sum_cycles": sum(edge["weight_cycles"] for edge in positive_loop_recurrences),
+        "max_distance_zero_weight_cycles": max(
+            (edge["weight_cycles"] for edge in positive_distance_zero), default=0.0
+        ),
+        "max_loop_recurrence_weight_cycles": max(
+            (edge["weight_cycles"] for edge in positive_loop_recurrences), default=0.0
+        ),
+    }
+    result["max_candidate_weight_cycles"] = max(
+        result["max_distance_zero_weight_cycles"], result["max_loop_recurrence_weight_cycles"]
+    )
+    result["unique_positive_edge_count"] = (
+        result["positive_distance_zero_edge_count"] + result["positive_loop_recurrence_edge_count"]
+    )
+    return result
+
+
 def score_reuse_candidates(
     record: Mapping[str, Any], candidates: Sequence[ReuseCandidateRecord], model: DurationModel
 ) -> dict[str, Any]:
@@ -1051,11 +1132,12 @@ def score_reuse_candidates(
             for source, sink in sorted(edges)
         ]
         combined, _, _, path = _longest_path(durations, [*existing_edges, *additions])
-        singleton_sum = sum(
-            float(row["weight_cycles"])
+        singleton_weights = {
+            (row["source_node"], row["target_node"]): float(row["weight_cycles"])
             for row in rows
             if row.get("status") == "scored" and row.get("target_node") == target
-        )
+        }
+        singleton_sum = sum(singleton_weights.values())
         consumer_groups.append(
             {
                 "target_node": target,
@@ -1068,30 +1150,8 @@ def score_reuse_candidates(
             }
         )
 
-    loop_edge_groups: list[dict[str, Any]] = []
-    loop_rows: dict[tuple[int, int, int], list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        if row.get("status") == "loop_carried_scored_v1":
-            loop_rows[(row["loop_node"], row["source_node"], row["target_node"])].append(row)
-    for (loop_node, source, target), duplicates in sorted(loop_rows.items()):
-        weights = {float(row["weight_cycles"]) for row in duplicates}
-        recurrence_cycles = {row["candidate_recurrence_cycles"] for row in duplicates}
-        if len(weights) != 1 or len(recurrence_cycles) != 1:
-            raise ValueError(
-                "candidate records joined to one recurrence edge but received different scores: "
-                f"loop={loop_node}, edge={source}->{target}"
-            )
-        loop_edge_groups.append(
-            {
-                "loop_node": loop_node,
-                "source_node": source,
-                "target_node": target,
-                "candidate_indices": [row["candidate_index"] for row in duplicates],
-                "candidate_count": len(duplicates),
-                "candidate_recurrence_cycles": duplicates[0]["candidate_recurrence_cycles"],
-                "weight_cycles": duplicates[0]["weight_cycles"],
-            }
-        )
+    distance_zero_edges, loop_edge_groups = _deduplicate_scored_candidate_edges(rows)
+    weight_summary = _summarize_candidate_weights(distance_zero_edges, loop_edge_groups)
 
     return {
         "schema_version": 1,
@@ -1114,7 +1174,9 @@ def score_reuse_candidates(
         "unscored_loop_carried_candidate_count": 0,
         "candidates": rows,
         "consumer_groups": consumer_groups,
+        "distance_zero_edges": distance_zero_edges,
         "loop_recurrence_edges": loop_edge_groups,
+        "candidate_weight_summary": weight_summary,
         "node_durations": {str(node): value for node, value in sorted(provenance.items())},
     }
 

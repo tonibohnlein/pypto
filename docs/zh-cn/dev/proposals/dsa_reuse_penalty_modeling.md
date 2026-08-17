@@ -228,6 +228,9 @@ weight 为零。
 这仍然只是 lower bound，而不是完整的 modulo-scheduling 模型；它尚未搜索包含多个新
 recurrence edge 的 cycle。多个 candidate record 若连接到同一个
 `(loop, source, target)`，会在 `loop_recurrence_edges` 中折叠，避免下游分析重复累加证据。
+distance-zero record 同样会在 `distance_zero_edges` 中折叠；
+`candidate_weight_summary` 的 count、sum 与 max 基于这些唯一 schedule edge，而不是原始
+buffer-pair record。
 
 对于早于 JSONL 导出器的 PTOAS 版本，旧版 level-3 调试日志导入器可以从原始
 PTO 中恢复相同的稳定访问坐标。该连接要求可执行操作顺序完全一致；如果操作或
