@@ -62,6 +62,12 @@ def test_capacity_grid_uses_geometry_peak_and_native_endpoints() -> None:
     assert screen.capacity_grid(100, 200, fractions) == (100, 125, 150, 200)
 
 
+def test_native_only_capacity_screen() -> None:
+    fractions = screen.parse_fractions("1")
+    assert fractions == (Fraction(1),)
+    assert screen.capacity_grid(100, 200, fractions) == (200,)
+
+
 def test_fraction_validation_fails_closed() -> None:
     for value in ("", "1/4,1", "0,1/2", "0,1/2,1/4,1", "0,-1/2,1"):
         with pytest.raises(ValueError):
@@ -99,6 +105,70 @@ def test_cypress_selection_is_penalty_weight_blind() -> None:
     assert min([fewer_aliases, lower_reuse_cost], key=screen.cypress_portfolio_key) is fewer_aliases
 
 
+def test_screen_cell_runs_matched_geometry_and_penalty_canonical_greedy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, int]] = []
+
+    def fake_run_solver(
+        unused_binary: Path,
+        unused_problem: Path,
+        output: Path,
+        solver: str,
+        *,
+        seed: int = 0,
+        restarts: int = 0,
+        cypress_order: str | None = None,
+        timeout: int,
+    ) -> tuple[dict, dict]:
+        del unused_binary, unused_problem, seed, cypress_order, timeout
+        output.mkdir(parents=True)
+        calls.append((solver, restarts))
+        result = {
+            "status": "feasible",
+            "capacity_overflow": 0,
+            "reuse_cost": 0,
+            "total_peak": 164,
+            "peak": 164,
+            "runtime_us": 1,
+            "solver_metrics": {},
+        }
+        solution = _solution()
+        (output / "solver-result.json").write_text("{}", encoding="utf-8")
+        (output / "solution.json").write_text("{}", encoding="utf-8")
+        return result, solution
+
+    monkeypatch.setattr(screen, "_run_solver", fake_run_solver)
+    rows = screen._screen_cell(
+        _document(),
+        tmp_path,
+        screen.CapacityCell(
+            tag="case",
+            pool=_document()["problem"]["pools"][0],
+            fraction=Fraction(1),
+            capacity=200,
+            native=200,
+            first_fit_peak=92,
+            penalty_count=1,
+        ),
+        screen.ScreenConfig(
+            binary=tmp_path / "dsa-bench",
+            variants=(screen.CypressVariant("stable"),),
+            restarts=8,
+            timeout=30,
+        ),
+    )
+
+    assert {row["arm"] for row in rows} == {
+        screen.ARM_GEOMETRY,
+        screen.ARM_GEOMETRY_CG,
+        screen.ARM_CYPRESS,
+        screen.ARM_DSA_RP,
+    }
+    assert ("geometry-canonical-greedy", 8) in calls
+    assert ("canonical-greedy", 8) in calls
+
+
 def test_placement_hash_ignores_analysis_annotations() -> None:
     solution = _solution()
     annotated = _solution()
@@ -130,7 +200,14 @@ def test_model_separation_counts_only_jointly_feasible_cells() -> None:
     rows = []
     for fraction, costs in (("0", (4, 2, 3)), ("1", (4, 0, 0))):
         for arm, cost in zip(
-            (screen.ARM_GEOMETRY, screen.ARM_DSA_RP, screen.ARM_CYPRESS), costs, strict=True
+            (
+                screen.ARM_GEOMETRY,
+                screen.ARM_GEOMETRY_CG,
+                screen.ARM_DSA_RP,
+                screen.ARM_CYPRESS,
+            ),
+            (costs[0], costs[0], costs[1], costs[2]),
+            strict=True,
         ):
             rows.append(
                 {
@@ -146,6 +223,7 @@ def test_model_separation_counts_only_jointly_feasible_cells() -> None:
     summary = screen.build_model_separation_rows({"case": document}, rows)[0]
     assert summary["screened_cells"] == 2
     assert summary["rp_better_geometry_cells"] == 2
+    assert summary["rp_better_geometry_cg_cells"] == 2
     assert summary["rp_better_cypress_cells"] == 1
     assert summary["rp_equal_cypress_cells"] == 1
     assert summary["max_rp_cost_advantage_vs_cypress"] == 1

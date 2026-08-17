@@ -61,7 +61,7 @@ def test_load_panel_enforces_broad_selection_contract(tmp_path: Path):
         panel.load_panel(path)
 
 
-def test_solver_commands_freeze_three_distinct_arms(tmp_path: Path):
+def test_solver_commands_freeze_four_distinct_arms(tmp_path: Path):
     commands = {
         arm: panel.solver_command(
             tmp_path / "dsa-bench",
@@ -72,11 +72,15 @@ def test_solver_commands_freeze_three_distinct_arms(tmp_path: Path):
         )
         for arm, _ in panel.ARMS
     }
-    assert set(commands) == {"geometry_ff", "cypress", "dsa_rp_cg"}
+    assert set(commands) == {"geometry_ff", "geometry_cg", "cypress", "dsa_rp_cg"}
     assert "geometry-first-fit" in commands["geometry_ff"]
+    assert "geometry-canonical-greedy" in commands["geometry_cg"]
     assert "cypress-relaxation" in commands["cypress"]
     assert "canonical-greedy" in commands["dsa_rp_cg"]
-    assert len({tuple(command) for command in commands.values()}) == 3
+    assert len({tuple(command) for command in commands.values()}) == 4
+    for arm in ("geometry_cg", "dsa_rp_cg"):
+        assert commands[arm][commands[arm].index("--seed") + 1] == "0"
+        assert commands[arm][commands[arm].index("--restarts") + 1] == "8"
 
 
 def test_freeze_panel_records_problem_and_edge_provenance(tmp_path: Path):
