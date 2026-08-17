@@ -937,10 +937,10 @@ def test_validate_cases_and_summarize(generator: ModuleType, comparison: ModuleT
 
 
 def test_multi_comparison_balances_orders_and_summarizes(multi_comparison: ModuleType):
-    names = ["geometry_ff", "cypress", "dsa_rp_cg"]
+    names = ["geometry_ff", "geometry_cg", "cypress", "dsa_rp_cg"]
     orders = multi_comparison.balanced_orders(names)
-    assert len(orders) == 6
-    for position in range(3):
+    assert len(orders) == 8
+    for position in range(4):
         assert sorted(order[position] for order in orders) == sorted(names * 2)
 
     summary = multi_comparison.summarize_variants(
@@ -964,7 +964,7 @@ def test_multi_comparison_requires_repeated_deterministic_outputs(
     multi_comparison: ModuleType, tmp_path: Path
 ):
     dumps: dict[str, list[Path]] = {}
-    for arm in ("geometry_ff", "cypress", "dsa_rp_cg"):
+    for arm in ("geometry_ff", "geometry_cg", "cypress", "dsa_rp_cg"):
         repetitions: list[Path] = []
         for repetition in range(3):
             dump = tmp_path / arm / f"run{repetition}"
@@ -986,6 +986,7 @@ def test_panel_summary_keeps_devices_separate(panel_summary: ModuleType):
     def report(scale: float) -> dict:
         medians = {
             "geometry_ff": 10.0,
+            "geometry_cg": 9.5,
             "cypress": 9.0,
             "dsa_rp_cg": 8.0,
         }
@@ -1004,7 +1005,7 @@ def test_panel_summary_keeps_devices_separate(panel_summary: ModuleType):
         bootstrap_samples=100,
         expected_tags={"kernel_a", "kernel_b"},
     )
-    assert len(kernel_rows) == 12
+    assert len(kernel_rows) == 16
     devices = {row["device"] for row in panel_rows}
     assert devices == {"device4", "device5"}
     candidate = next(
@@ -1024,7 +1025,12 @@ def test_panel_summary_rejects_different_kernel_sets(panel_summary: ModuleType):
             "summary": {
                 "variants": {
                     arm: {"median_us": value}
-                    for arm, value in {"geometry_ff": 10.0, "cypress": 9.0, "dsa_rp_cg": 8.0}.items()
+                    for arm, value in {
+                        "geometry_ff": 10.0,
+                        "geometry_cg": 9.5,
+                        "cypress": 9.0,
+                        "dsa_rp_cg": 8.0,
+                    }.items()
                 }
             }
         }
@@ -1043,7 +1049,12 @@ def test_panel_summary_requires_frozen_panel_tags(panel_summary: ModuleType):
         "summary": {
             "variants": {
                 arm: {"median_us": value}
-                for arm, value in {"geometry_ff": 10.0, "cypress": 9.0, "dsa_rp_cg": 8.0}.items()
+                for arm, value in {
+                    "geometry_ff": 10.0,
+                    "geometry_cg": 9.5,
+                    "cypress": 9.0,
+                    "dsa_rp_cg": 8.0,
+                }.items()
             }
         }
     }
@@ -1080,6 +1091,7 @@ def test_panel_summary_rejects_mislabeled_report_device(panel_summary: ModuleTyp
                         arm: {"median_us": value}
                         for arm, value in {
                             "geometry_ff": 10.0,
+                            "geometry_cg": 9.5,
                             "cypress": 9.0,
                             "dsa_rp_cg": 8.0,
                         }.items()
@@ -1106,6 +1118,7 @@ def test_panel_summary_accepts_matching_device_alias(panel_summary: ModuleType, 
                         arm: {"median_us": value}
                         for arm, value in {
                             "geometry_ff": 10.0,
+                            "geometry_cg": 9.5,
                             "cypress": 9.0,
                             "dsa_rp_cg": 8.0,
                         }.items()

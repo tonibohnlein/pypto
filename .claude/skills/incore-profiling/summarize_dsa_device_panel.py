@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-EXPECTED_ARMS = ("geometry_ff", "cypress", "dsa_rp_cg")
+EXPECTED_ARMS = ("geometry_ff", "geometry_cg", "cypress", "dsa_rp_cg")
 
 
 def _report_argument(value: str) -> tuple[str, str, Path]:
