@@ -285,6 +285,10 @@ post-PTOAS `GlobalTensor` partition offsets across loops and SPMD blocks. It
 allocates the complete physical span and rejects unresolved expressions or file
 inputs shorter than that span. Every scalar must satisfy tensor-view bounds.
 
+Pure kernels remove PyPTO's synthetic block-index and block-count suffix from
+the captured host ABI and bind it to direct-launch hardware builtins. These
+values are runtime identities, not missing orchestration scalars.
+
 Mixed AIC/AIV inputs are launched as one co-scheduled group. They require
 `--ptoas-root`; the generator reuses PTOAS's validation-harness wrapper, which
 merges both bodies and their shared pipe objects into one global kernel. It
@@ -295,8 +299,15 @@ distinct `get_subblockid()` values rather than one host-provided scalar.
 
 For a small workload where exact model values matter, use
 `--args-dump <args_dump.json> --func-id <id> --task-id <id>` instead of
-`--synthetic-inputs`. Import rejects mixed AIC/AIV, incomplete, non-contiguous,
-ambiguous, or truncated captures.
+`--synthetic-inputs`. Exact replay requires a schema-v2 dump from the current
+runtime. It captures every tensor's pre-state, writable tensors' post-state,
+and backing-storage identity; the generator reconstructs aliases and view
+offsets instead of allocating each ABI pointer independently. Read-only inputs
+use their pre-state as the expected post-state. Byte-identical per-block records
+are collapsed. The importer streams payload slices and materializes one backing
+store at a time; it never reads the whole `args.bin` into RAM. Import rejects
+legacy, incomplete, non-contiguous, conflicting, ambiguous, or truncated
+captures.
 
 The driver verifies ABI, launch metadata, inputs, and captured outputs. It
 restores inputs per launch, times with `aclrtEventElapsedTime`, runs serial ABBA
