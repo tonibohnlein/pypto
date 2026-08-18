@@ -680,21 +680,24 @@ def test_generate_npu_requires_input_source(generator: ModuleType, tmp_path: Pat
 
 
 def test_generate_npu_case_from_exact_args_dump(
-    generator: ModuleType, comparison: ModuleType, tmp_path: Path
+    generator: ModuleType,
+    comparison: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     kernel = _write_kernel(tmp_path)
     dump_dir = tmp_path / "args_dump"
     dump_dir.mkdir()
     before = bytes(range(32))
     after = bytes(reversed(range(32)))
-    (dump_dir / "args.bin").write_bytes(before + after)
+    (dump_dir / "args.bin").write_bytes(before + after + before)
 
     def tensor(stage: str, offset: int) -> dict:
         return {
             "task_id": "0x0000000100000007",
             "func_id": [4],
             "arg_index": 0,
-            "role": "inout",
+            "role": "input",
             "stage": stage,
             "kind": "tensor",
             "dtype": "float32",
@@ -702,6 +705,7 @@ def test_generate_npu_case_from_exact_args_dump(
             "shape": [8],
             "strides": [1],
             "start_offset": 0,
+            "storage_id": "0x0000000000001234",
             "bin_offset": offset,
             "bin_size": 32,
             "truncated": False,
@@ -709,10 +713,12 @@ def test_generate_npu_case_from_exact_args_dump(
         }
 
     dump = {
+        "schema_version": 2,
+        "capture_semantics": "exact_standalone_replay",
         "bin_file": "args.bin",
         "args": [
             tensor("before_dispatch", 0),
-            tensor("after_completion", 32),
+            tensor("before_dispatch", 64),
             {
                 "task_id": "0x0000000100000007",
                 "func_id": [4],
@@ -727,6 +733,15 @@ def test_generate_npu_case_from_exact_args_dump(
     manifest_path = dump_dir / "args_dump.json"
     manifest_path.write_text(json.dumps(dump), encoding="utf-8")
 
+    original_read_bytes = Path.read_bytes
+
+    def reject_whole_payload_read(path: Path) -> bytes:
+        if path == dump_dir / "args.bin":
+            raise AssertionError("args-dump importer must stream payload slices")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_whole_payload_read)
+
     case = generator.generate(
         kernel,
         "captured_sample",
@@ -740,21 +755,30 @@ def test_generate_npu_case_from_exact_args_dump(
     manifest = json.loads((case / "standalone_manifest.json").read_text(encoding="utf-8"))
     assert manifest["capture"] == {
         "func_id": 4,
+        "pointers": {"v0": {"offset_bytes": 0, "size_bytes": 32, "storage": "capture_storage_0"}},
         "recommended_outputs": ["v0"],
-        "roles": {"v0": "inout"},
+        "roles": {"v0": "input"},
+        "storages": [{"arguments": ["v0"], "bytes": 32, "name": "capture_storage_0"}],
         "task_id": "0x0000000100000007",
     }
     assert manifest["parameters"][0]["elements"] == 8
     assert manifest["parameters"][1]["value"] == "8"
-    assert (case / "v0.bin").read_bytes() == before
-    assert (case / "captured_expected" / "v0.bin").read_bytes() == after
+    assert (case / "capture_storage_0.bin").read_bytes() == before
+    assert (case / "captured_expected" / "v0.bin").read_bytes() == before
+    main = (case / "main.cpp").read_text(encoding="utf-8")
+    assert main.count("aclrtMalloc((void **)&capture_storage_0Device") == 1
+    assert "v0Device = reinterpret_cast<float *>(capture_storage_0Device + 0);" in main
+    twin = tmp_path / "captured_sample_twin"
+    shutil.copytree(case, twin)
+    _, pointers = comparison.validate_cases(case, twin)
+    assert pointers == ["v0"]
 
     compact_dump = tmp_path / "compact_dump"
     loose_dump = tmp_path / "loose_dump"
     compact_dump.mkdir()
     loose_dump.mkdir()
-    (compact_dump / "v0.bin").write_bytes(after)
-    (loose_dump / "v0.bin").write_bytes(after)
+    (compact_dump / "v0.bin").write_bytes(before)
+    (loose_dump / "v0.bin").write_bytes(before)
     hashes = comparison._compare_outputs(
         compact_dump,
         loose_dump,
@@ -762,6 +786,130 @@ def test_generate_npu_case_from_exact_args_dump(
         expected_dir=case / "captured_expected",
     )
     assert len(set(hashes["v0"].values())) == 1
+
+
+def test_args_dump_binds_pure_spmd_identities_from_launch_builtins(generator: ModuleType, tmp_path: Path):
+    kernel = tmp_path / "spmd_kernel.cpp"
+    kernel.write_text(
+        """\
+extern "C" __global__ AICORE void sample(
+    __gm__ float* v0, int32_t block_idx, int32_t block_num) {
+  if (block_idx < block_num) v0[block_idx] = 1.0f;
+}
+""",
+        encoding="utf-8",
+    )
+    kernel.with_suffix(".pto").write_text(
+        """\
+func.func @sample(
+    %arg0: !pto.ptr<f32>,
+    %__pypto_spmd_block_idx: i32,
+    %__pypto_spmd_block_num: i32) {
+  %view = pto.make_tensor_view %arg0, shape = [%c8_index], strides = [%c1_index]
+}
+""",
+        encoding="utf-8",
+    )
+    dump_dir = tmp_path / "args_dump"
+    dump_dir.mkdir()
+    before = bytes(32)
+    after = bytes(range(32))
+    (dump_dir / "args.bin").write_bytes(before + after)
+
+    def tensor(stage: str, offset: int) -> dict:
+        return {
+            "task_id": "0x9",
+            "func_id": [3],
+            "arg_index": 0,
+            "role": "output",
+            "stage": stage,
+            "kind": "tensor",
+            "dtype": "float32",
+            "is_contiguous": True,
+            "shape": [8],
+            "strides": [1],
+            "start_offset": 0,
+            "storage_id": "0x123",
+            "bin_offset": offset,
+            "bin_size": 32,
+            "truncated": False,
+            "overwritten": False,
+        }
+
+    manifest_path = dump_dir / "args_dump.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "capture_semantics": "exact_standalone_replay",
+                "bin_file": "args.bin",
+                "args": [tensor("before_dispatch", 0), tensor("after_completion", 32)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    case = generator.generate(
+        kernel,
+        "spmd_capture",
+        tmp_path / "output",
+        "dav-c220",
+        run_mode="npu",
+        block_dim=4,
+        dump_selection=generator.DumpSelection(manifest_path, 3),
+    )
+
+    manifest = json.loads((case / "standalone_manifest.json").read_text(encoding="utf-8"))
+    assert [parameter["name"] for parameter in manifest["parameters"]] == ["v0"]
+    assert manifest["runtime_identity_bindings"] == {
+        "block_idx": "get_block_idx()",
+        "block_num": "get_block_num()",
+    }
+    emitted_kernel = (case / "spmd_capture_kernel.cpp").read_text(encoding="utf-8")
+    assert "void sample(__gm__ float* v0)" in emitted_kernel
+    assert "int32_t block_idx = static_cast<int32_t>(get_block_idx());" in emitted_kernel
+    assert "int32_t block_num = static_cast<int32_t>(get_block_num());" in emitted_kernel
+    launch = (case / "launch.cpp").read_text(encoding="utf-8")
+    assert "void sample(__gm__ float* v0);" in launch
+
+
+def test_bare_pure_kernel_binds_spmd_identities_in_generated_wrapper(generator: ModuleType, tmp_path: Path):
+    kernel = tmp_path / "bare_spmd_kernel.cpp"
+    kernel.write_text(
+        """\
+AICORE void sample(__gm__ float* v0, int32_t block_idx, int32_t block_num) {
+  if (block_idx < block_num) v0[block_idx] = 1.0f;
+}
+""",
+        encoding="utf-8",
+    )
+    kernel.with_suffix(".pto").write_text(
+        """\
+func.func @sample(
+    %arg0: !pto.ptr<f32>,
+    %__pypto_spmd_block_idx: i32,
+    %__pypto_spmd_block_num: i32) {
+  %view = pto.make_tensor_view %arg0, shape = [%c8_index], strides = [%c1_index]
+}
+""",
+        encoding="utf-8",
+    )
+
+    case = generator.generate(
+        kernel,
+        "bare_spmd_capture",
+        tmp_path / "output",
+        "dav-c220",
+        run_mode="npu",
+        block_dim=4,
+        synthetic_seed=19,
+    )
+
+    emitted_kernel = (case / "bare_spmd_capture_kernel.cpp").read_text(encoding="utf-8")
+    assert "static AICORE void sample_impl(" in emitted_kernel
+    assert "sample_impl(v0, get_block_idx(), get_block_num());" in emitted_kernel
+    launch = (case / "launch.cpp").read_text(encoding="utf-8")
+    assert "void sample(__gm__ float* v0);" in launch
 
 
 def test_args_dump_requires_unambiguous_dispatch(generator: ModuleType, tmp_path: Path):
@@ -798,7 +946,17 @@ def test_args_dump_requires_unambiguous_dispatch(generator: ModuleType, tmp_path
             ]
         )
     manifest_path = dump_dir / "args_dump.json"
-    manifest_path.write_text(json.dumps({"bin_file": "args.bin", "args": entries}), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "capture_semantics": "exact_standalone_replay",
+                "bin_file": "args.bin",
+                "args": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="select one"):
         generator.generate(
@@ -809,6 +967,111 @@ def test_args_dump_requires_unambiguous_dispatch(generator: ModuleType, tmp_path
             run_mode="npu",
             dump_selection=generator.DumpSelection(manifest_path, 4),
         )
+
+
+def test_args_dump_rejects_legacy_non_exact_capture(generator: ModuleType, tmp_path: Path):
+    kernel = _write_kernel(tmp_path)
+    manifest = tmp_path / "args_dump.json"
+    manifest.write_text(json.dumps({"bin_file": "args.bin", "args": []}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="recapture with the current runtime"):
+        generator.generate(
+            kernel,
+            "legacy_capture",
+            tmp_path / "output",
+            "dav-c220",
+            run_mode="npu",
+            dump_selection=generator.DumpSelection(manifest, 4),
+        )
+
+
+def test_args_dump_preserves_output_prestate_and_aliases(generator: ModuleType, tmp_path: Path):
+    kernel = tmp_path / "aliased_kernel.cpp"
+    kernel.write_text(
+        'extern "C" __global__ AICORE void sample(__gm__ float* v0, __gm__ float* v1) {}\n',
+        encoding="utf-8",
+    )
+    kernel.with_suffix(".pto").write_text(
+        """\
+func.func @sample(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>) {
+  %v0 = pto.make_tensor_view %arg0, shape = [%c4_index], strides = [%c1_index]
+  %v1 = pto.make_tensor_view %arg1, shape = [%c4_index], strides = [%c1_index]
+}
+""",
+        encoding="utf-8",
+    )
+    dump_dir = tmp_path / "args_dump"
+    dump_dir.mkdir()
+    before_storage = bytes(range(24))
+    after_storage = bytes(range(8)) + bytes([91] * 8) + bytes(range(16, 24))
+    payload_parts = [
+        before_storage[:16],
+        after_storage[:16],
+        before_storage[8:24],
+        after_storage[8:24],
+    ]
+    offsets = []
+    payload = bytearray()
+    for part in payload_parts:
+        offsets.append(len(payload))
+        payload.extend(part)
+    (dump_dir / "args.bin").write_bytes(payload)
+
+    def tensor(arg_index: int, role: str, stage: str, payload_offset: int, start_offset: int) -> dict:
+        return {
+            "task_id": "0x5",
+            "func_id": [7],
+            "arg_index": arg_index,
+            "role": role,
+            "stage": stage,
+            "kind": "tensor",
+            "dtype": "float32",
+            "is_contiguous": True,
+            "shape": [4],
+            "strides": [1],
+            "start_offset": start_offset,
+            "storage_id": "0xabc",
+            "bin_offset": payload_offset,
+            "bin_size": 16,
+            "truncated": False,
+            "overwritten": False,
+        }
+
+    entries = [
+        tensor(0, "output", "before_dispatch", offsets[0], 0),
+        tensor(0, "output", "after_completion", offsets[1], 0),
+        tensor(1, "inout", "before_dispatch", offsets[2], 2),
+        tensor(1, "inout", "after_completion", offsets[3], 2),
+    ]
+    manifest_path = dump_dir / "args_dump.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "capture_semantics": "exact_standalone_replay",
+                "bin_file": "args.bin",
+                "args": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    case = generator.generate(
+        kernel,
+        "aliased_capture",
+        tmp_path / "output",
+        "dav-c220",
+        run_mode="npu",
+        dump_selection=generator.DumpSelection(manifest_path, 7),
+    )
+
+    assert (case / "capture_storage_0.bin").read_bytes() == before_storage
+    assert (case / "captured_expected" / "v0.bin").read_bytes() == after_storage[:16]
+    assert (case / "captured_expected" / "v1.bin").read_bytes() == after_storage[8:24]
+    main = (case / "main.cpp").read_text(encoding="utf-8")
+    assert main.count("aclrtMalloc((void **)&capture_storage_0Device") == 1
+    assert "v0Device = reinterpret_cast<float *>(capture_storage_0Device + 0);" in main
+    assert "v1Device = reinterpret_cast<float *>(capture_storage_0Device + 8);" in main
 
 
 def test_generate_sim_case_remains_single_core(generator: ModuleType, tmp_path: Path):

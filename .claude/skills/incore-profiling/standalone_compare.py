@@ -38,16 +38,44 @@ def _abi_signature(manifest: dict[str, Any]) -> tuple[Any, ...]:
             parameter["kind"],
             parameter.get("elements"),
             parameter.get("value"),
+            parameter.get("storage"),
+            parameter.get("storage_offset_bytes"),
         )
         for parameter in manifest["parameters"]
     )
     mixed = manifest.get("mixed_runner", {})
     mixed_runner = (mixed.get("kind"), mixed.get("generator_sha256"), mixed.get("identity_source"))
-    return manifest["kernel"], manifest["aicore_arch"], manifest["block_dim"], mixed_runner, parameters
+    runtime_identities = json.dumps(manifest.get("runtime_identity_bindings", {}), sort_keys=True)
+    return (
+        manifest["kernel"],
+        manifest["aicore_arch"],
+        manifest["block_dim"],
+        mixed_runner,
+        runtime_identities,
+        parameters,
+    )
 
 
 def _pointer_names(manifest: dict[str, Any]) -> list[str]:
     return [parameter["name"] for parameter in manifest["parameters"] if parameter["kind"] == "pointer"]
+
+
+def _input_file_names(manifest: dict[str, Any]) -> list[str]:
+    """Return physical input files, deduplicating captured alias groups."""
+    capture = manifest.get("capture")
+    if not isinstance(capture, dict):
+        return [f"{name}.bin" for name in _pointer_names(manifest)]
+    storages = capture.get("storages")
+    if not isinstance(storages, list) or not storages:
+        raise ValueError("captured standalone manifest has no backing-storage inventory")
+    names: list[str] = []
+    for storage in storages:
+        if not isinstance(storage, dict) or not isinstance(storage.get("name"), str):
+            raise ValueError("captured standalone manifest has an invalid backing-storage record")
+        names.append(f"{storage['name']}.bin")
+    if len(names) != len(set(names)):
+        raise ValueError("captured standalone manifest repeats a backing-storage name")
+    return names
 
 
 def _sha256(path: Path) -> str:
@@ -78,13 +106,17 @@ def validate_cases(compact_dir: Path, loose_dir: Path) -> tuple[dict[str, Any], 
     if _abi_signature(compact) != _abi_signature(loose):
         raise ValueError("compact and loose standalone cases have different ABI or launch metadata")
     pointers = _pointer_names(compact)
-    for name in pointers:
-        compact_input = compact_dir / f"{name}.bin"
-        loose_input = loose_dir / f"{name}.bin"
+    compact_inputs = _input_file_names(compact)
+    loose_inputs = _input_file_names(loose)
+    if compact_inputs != loose_inputs:
+        raise ValueError("compact and loose standalone cases have different physical input storage")
+    for file_name in compact_inputs:
+        compact_input = compact_dir / file_name
+        loose_input = loose_dir / file_name
         if not compact_input.is_file() or not loose_input.is_file():
-            raise FileNotFoundError(f"both cases must contain the real input buffer {name}.bin")
+            raise FileNotFoundError(f"both cases must contain the real input buffer {file_name}")
         if _sha256(compact_input) != _sha256(loose_input):
-            raise ValueError(f"compact and loose inputs differ for ABI buffer {name}.bin")
+            raise ValueError(f"compact and loose inputs differ for physical buffer {file_name}")
     return compact, pointers
 
 

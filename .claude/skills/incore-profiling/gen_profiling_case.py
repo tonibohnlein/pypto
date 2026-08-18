@@ -17,9 +17,10 @@ loop bounds, and SPMD block coverage.
 
 Simulator mode sizes buffers from the sibling ``.pto`` and uses synthetic data.
 NPU mode accepts deterministic synthetic ABI inputs, caller-supplied input
-files, or one exact pure-kernel invocation reconstructed from PyPTO's level-2
-argument dump. Synthetic inputs avoid full-model DFX capture for large kernels;
-exact scalar ABI values remain mandatory.
+files, or one exact pure-kernel invocation reconstructed from PyPTO's schema-v2
+level-2 argument dump. Exact capture preserves output pre-state, backing-storage
+aliases, and view offsets. Synthetic inputs avoid full-model DFX capture for
+large kernels; exact scalar ABI values remain mandatory.
 
 It emits, at ``<output-root>/ptoas/<testcase>/``:
   - ``<testcase>_kernel.cpp`` : the input .cpp + a compat preamble (+ a merged
@@ -47,7 +48,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, BinaryIO
 
 import numpy as np
 from standalone_extent_analysis import ExtentAnalysis, analyze_pointer_extents
@@ -89,6 +90,21 @@ _CPP_BYTE_SIZES = {
     "int64_t": 8,
     "uint64_t": 8,
 }
+_CPP_CAPTURE_DTYPES = {
+    "float": "FLOAT32",
+    "half": "FLOAT16",
+    "aclFloat16": "FLOAT16",
+    "bfloat16_t": "BFLOAT16",
+    "__bf16": "BFLOAT16",
+    "int8_t": "INT8",
+    "uint8_t": "UINT8",
+    "int16_t": "INT16",
+    "uint16_t": "UINT16",
+    "int32_t": "INT32",
+    "uint32_t": "UINT32",
+    "int64_t": "INT64",
+    "uint64_t": "UINT64",
+}
 _SYNTHETIC_INTEGER_DTYPES = {
     "int8_t": np.int8,
     "uint8_t": np.uint8,
@@ -101,6 +117,7 @@ _SYNTHETIC_INTEGER_DTYPES = {
 }
 _SYNTHETIC_SEED = 19
 _SYNTHETIC_CHUNK_ELEMENTS = 1 << 20
+_CAPTURE_ADDRESS_PERIOD = 512
 
 
 def host_type(cpp_type: str) -> str:
@@ -143,6 +160,38 @@ class DumpSelection:
     func_id: int
     task_id: str | None = None
     task_occurrence: int | None = None
+
+
+@dataclass(frozen=True)
+class CapturedPointer:
+    """One kernel pointer reconstructed as a view into captured backing storage."""
+
+    storage_name: str
+    offset_bytes: int
+    size_bytes: int
+    role: str
+
+
+@dataclass(frozen=True)
+class CapturedStorageLayout:
+    """Captured backing buffers and the kernel pointers that view them."""
+
+    storages: dict[str, tuple[str, int]]
+    pointers: dict[str, CapturedPointer]
+
+
+@dataclass(frozen=True)
+class CapturedTensorRecord:
+    """Validated metadata for one captured pointer argument."""
+
+    before: dict
+    after: dict
+    offset_bytes: int
+    storage_id: str
+    size_bytes: int
+    arg_index: int
+    role: str
+    expected_stage: str
 
 
 @dataclass(frozen=True)
@@ -402,7 +451,36 @@ def _external_mixed_abi_and_identity_bindings(
     return external, bindings
 
 
-def _bind_mixed_runtime_identities(
+def _external_pure_abi_and_identity_bindings(
+    pto_text: str,
+    name: str,
+    cpp_text: str,
+) -> tuple[list[str], dict[str, str]]:
+    """Split a pure kernel's user ABI from its synthetic SPMD suffix."""
+    raw_params = _raw_function_params(cpp_text, name)
+    pto_names = _pto_function_param_names(pto_text, name)
+    if len(raw_params) != len(pto_names):
+        raise ValueError(
+            f"PTO/PTOAS parameter count differs for {name}: {len(pto_names)} != {len(raw_params)}"
+        )
+    first_identity = next(
+        (index for index, param_name in enumerate(pto_names) if param_name in _PTO_IDENTITY_BUILTINS),
+        len(pto_names),
+    )
+    suffix_names = pto_names[first_identity:]
+    unsupported = [param_name for param_name in suffix_names if param_name not in _PTO_IDENTITY_BUILTINS]
+    if unsupported:
+        raise ValueError(
+            f"runtime identity parameters must form a recognized trailing suffix in {name}: {unsupported}"
+        )
+    bindings = {
+        _parse_param(raw_param).name: _PTO_IDENTITY_BUILTINS[identity_name]
+        for raw_param, identity_name in zip(raw_params[first_identity:], suffix_names)
+    }
+    return raw_params[:first_identity], bindings
+
+
+def _bind_direct_launch_runtime_identities(
     wrapped: str,
     name: str,
     external_params: list[str],
@@ -410,7 +488,7 @@ def _bind_mixed_runtime_identities(
 ) -> str:
     """Bind PyPTO's synthetic identity suffix to direct-launch CCE builtins."""
     pattern = re.compile(
-        rf'(?P<head>extern\s+"C"\s+__global__\s+AICORE\s+void\s+{re.escape(name)})'
+        rf'(?P<head>(?:extern\s+"C"\s+)?__global__\s+AICORE\s+void\s+{re.escape(name)})'
         r"\s*\([^)]*\)\s*\{"
     )
     declarations = "".join(
@@ -448,7 +526,7 @@ def _prepare_mixed_group(
         info["aic_text"],
         info["aiv_text"],
     )
-    wrapped = _bind_mixed_runtime_identities(wrapped, name, external_params, identity_bindings)
+    wrapped = _bind_direct_launch_runtime_identities(wrapped, name, external_params, identity_bindings)
     if not re.search(rf'extern\s+"C"\s+__global__\s+AICORE\s+void\s+{re.escape(name)}\s*\(', wrapped):
         raise RuntimeError("PTOAS mixed-kernel wrapper did not emit the expected global entry")
     provenance = {
@@ -854,6 +932,7 @@ def emit_kernel_cpp(
     params: list[Param],
     *,
     mixed_group_wrapped: bool = False,
+    pure_identity_args: tuple[str, ...] = (),
 ) -> str:
     """Compat preamble + the original kernel + (mixed) a merged __global__ dispatcher.
 
@@ -864,7 +943,7 @@ def emit_kernel_cpp(
     decl = ", ".join(
         (f"__gm__ {p.cpp_type}* {p.name}" if p.is_ptr else f"{p.cpp_type} {p.name}") for p in params
     )
-    call = ", ".join(p.name for p in params)
+    call = ", ".join([*(p.name for p in params), *pure_identity_args])
 
     has_global_entry = re.search(rf"__global__\s+AICORE\s+void\s+{re.escape(name)}\s*\(", cpp_text)
     if not is_mixed and not has_global_entry:
@@ -985,6 +1064,7 @@ def emit_npu_benchmark_main_cpp(
     counts: dict[str, int],
     scalar_values: dict[str, str],
     block_dim: int,
+    captured_storage: CapturedStorageLayout | None = None,
 ) -> str:
     """Emit a real-device runner that records one device-event duration per launch."""
     launch_name = "Launch" + name[:1].upper() + name[1:]
@@ -998,41 +1078,96 @@ def emit_npu_benchmark_main_cpp(
     copy_from_device: list[str] = []
     writes: list[str] = []
     free: list[str] = []
-    for p in ptrs:
-        host = host_type(p.cpp_type)
-        name_part = p.name
-        decls.extend(
-            [
-                f"    size_t elemCount_{name_part} = {counts[name_part]};",
-                f"    size_t fileSize_{name_part} = elemCount_{name_part} * sizeof({host});",
-                f"    {host} *{name_part}Host = nullptr;",
-                f"    {host} *{name_part}Device = nullptr;",
-            ]
-        )
-        alloc.append(f"    ACL_CHECK(aclrtMallocHost((void **)(&{name_part}Host), fileSize_{name_part}));")
-        alloc.append(
-            f"    ACL_CHECK(aclrtMalloc((void **)&{name_part}Device, fileSize_{name_part}, "
-            "ACL_MEM_MALLOC_HUGE_FIRST));"
-        )
-        reads.append(
-            f'    ReadFile("./{name_part}.bin", fileSize_{name_part}, {name_part}Host, fileSize_{name_part});'
-        )
-        copy_to_device.append(
-            f"        ACL_CHECK(aclrtMemcpy({name_part}Device, fileSize_{name_part}, {name_part}Host, "
-            f"fileSize_{name_part}, ACL_MEMCPY_HOST_TO_DEVICE));"
-        )
-        copy_from_device.append(
-            f"    ACL_CHECK(aclrtMemcpy({name_part}Host, fileSize_{name_part}, {name_part}Device, "
-            f"fileSize_{name_part}, ACL_MEMCPY_DEVICE_TO_HOST));"
-        )
-        writes.append(
-            f'        if (!WriteBinary(std::string(dumpDir) + "/{name_part}.bin", '
-            f"{name_part}Host, fileSize_{name_part})) {{"
-        )
-        writes.append(f'            std::fprintf(stderr, "[ERROR] cannot write output {name_part}.bin\\n");')
-        writes.extend(["            rc = 1;", "            goto cleanup;", "        }"])
-        free.append(f"    if ({name_part}Device) aclrtFree({name_part}Device);")
-        free.append(f"    if ({name_part}Host) aclrtFreeHost({name_part}Host);")
+    if captured_storage is None:
+        for p in ptrs:
+            host = host_type(p.cpp_type)
+            name_part = p.name
+            decls.extend(
+                [
+                    f"    size_t elemCount_{name_part} = {counts[name_part]};",
+                    f"    size_t fileSize_{name_part} = elemCount_{name_part} * sizeof({host});",
+                    f"    {host} *{name_part}Host = nullptr;",
+                    f"    {host} *{name_part}Device = nullptr;",
+                ]
+            )
+            alloc.append(
+                f"    ACL_CHECK(aclrtMallocHost((void **)(&{name_part}Host), fileSize_{name_part}));"
+            )
+            alloc.append(
+                f"    ACL_CHECK(aclrtMalloc((void **)&{name_part}Device, fileSize_{name_part}, "
+                "ACL_MEM_MALLOC_HUGE_FIRST));"
+            )
+            reads.append(
+                f'    ReadFile("./{name_part}.bin", fileSize_{name_part}, '
+                f"{name_part}Host, fileSize_{name_part});"
+            )
+            copy_to_device.append(
+                f"        ACL_CHECK(aclrtMemcpy({name_part}Device, fileSize_{name_part}, {name_part}Host, "
+                f"fileSize_{name_part}, ACL_MEMCPY_HOST_TO_DEVICE));"
+            )
+            copy_from_device.append(
+                f"    ACL_CHECK(aclrtMemcpy({name_part}Host, fileSize_{name_part}, {name_part}Device, "
+                f"fileSize_{name_part}, ACL_MEMCPY_DEVICE_TO_HOST));"
+            )
+            writes.append(
+                f'        if (!WriteBinary(std::string(dumpDir) + "/{name_part}.bin", '
+                f"{name_part}Host, fileSize_{name_part})) {{"
+            )
+            writes.append(
+                f'            std::fprintf(stderr, "[ERROR] cannot write output {name_part}.bin\\n");'
+            )
+            writes.extend(["            rc = 1;", "            goto cleanup;", "        }"])
+            free.append(f"    if ({name_part}Device) aclrtFree({name_part}Device);")
+            free.append(f"    if ({name_part}Host) aclrtFreeHost({name_part}Host);")
+    else:
+        for storage_name, (file_name, storage_bytes) in captured_storage.storages.items():
+            decls.extend(
+                [
+                    f"    size_t fileSize_{storage_name} = {storage_bytes};",
+                    f"    uint8_t *{storage_name}Host = nullptr;",
+                    f"    uint8_t *{storage_name}Device = nullptr;",
+                ]
+            )
+            alloc.append(
+                f"    ACL_CHECK(aclrtMallocHost((void **)(&{storage_name}Host), fileSize_{storage_name}));"
+            )
+            alloc.append(
+                f"    ACL_CHECK(aclrtMalloc((void **)&{storage_name}Device, fileSize_{storage_name}, "
+                "ACL_MEM_MALLOC_HUGE_FIRST));"
+            )
+            reads.append(
+                f'    ReadFile("./{file_name}", fileSize_{storage_name}, {storage_name}Host, '
+                f"fileSize_{storage_name});"
+            )
+            copy_to_device.append(
+                f"        ACL_CHECK(aclrtMemcpy({storage_name}Device, fileSize_{storage_name}, "
+                f"{storage_name}Host, fileSize_{storage_name}, ACL_MEMCPY_HOST_TO_DEVICE));"
+            )
+            copy_from_device.append(
+                f"    ACL_CHECK(aclrtMemcpy({storage_name}Host, fileSize_{storage_name}, "
+                f"{storage_name}Device, fileSize_{storage_name}, ACL_MEMCPY_DEVICE_TO_HOST));"
+            )
+            free.append(f"    if ({storage_name}Device) aclrtFree({storage_name}Device);")
+            free.append(f"    if ({storage_name}Host) aclrtFreeHost({storage_name}Host);")
+        for p in ptrs:
+            pointer = captured_storage.pointers[p.name]
+            host = host_type(p.cpp_type)
+            decls.extend(
+                [
+                    f"    size_t fileSize_{p.name} = {pointer.size_bytes};",
+                    f"    {host} *{p.name}Device = nullptr;",
+                ]
+            )
+            alloc.append(
+                f"    {p.name}Device = reinterpret_cast<{host} *>("
+                f"{pointer.storage_name}Device + {pointer.offset_bytes});"
+            )
+            writes.append(
+                f'        if (!WriteBinary(std::string(dumpDir) + "/{p.name}.bin", '
+                f"{pointer.storage_name}Host + {pointer.offset_bytes}, fileSize_{p.name})) {{"
+            )
+            writes.append(f'            std::fprintf(stderr, "[ERROR] cannot write output {p.name}.bin\\n");')
+            writes.extend(["            rc = 1;", "            goto cleanup;", "        }"])
     for p in scalars:
         decls.append(f"    {p.cpp_type} {p.name} = {_scalar_literal(p, scalar_values)};")
 
@@ -1297,76 +1432,142 @@ def _usable_dump_entry(entry: dict, *, context: str) -> None:
         raise ValueError(f"{context} is non-contiguous; standalone reconstruction would change its layout")
 
 
-def _dump_entry(entries: list[dict], arg_index: int, *, kind: str, stage: str) -> dict | None:
-    matches = [
+def _dump_entries(entries: list[dict], arg_index: int, *, kind: str, stage: str) -> list[dict]:
+    return [
         entry
         for entry in entries
         if entry.get("arg_index") == arg_index and entry.get("kind") == kind and entry.get("stage") == stage
     ]
-    if len(matches) > 1:
-        raise ValueError(f"selected dispatch has duplicate {stage} {kind} records for ABI arg {arg_index}")
-    return matches[0] if matches else None
 
 
-def _payload_slice(payload: bytes, entry: dict, *, context: str, expected_size: int | None = None) -> bytes:
+def _payload_slice(
+    payload: BinaryIO,
+    payload_size: int,
+    entry: dict,
+    *,
+    context: str,
+    expected_size: int | None = None,
+) -> bytes:
     _usable_dump_entry(entry, context=context)
     begin = int(entry.get("bin_offset", -1))
     size = int(entry.get("bin_size", -1))
-    if begin < 0 or size <= 0 or begin + size > len(payload):
+    if begin < 0 or size <= 0 or begin + size > payload_size:
         raise ValueError(f"{context} references an invalid payload slice")
     if expected_size is not None and size != expected_size:
         raise ValueError(f"{context} has {size} bytes, expected {expected_size}")
-    return payload[begin : begin + size]
+    payload.seek(begin)
+    raw = payload.read(size)
+    if len(raw) != size:
+        raise ValueError(f"{context} payload ended after {len(raw)} of {size} bytes")
+    return raw
 
 
-def _extract_dump_tensor(
+def _entry_signature(entry: dict) -> tuple:
+    """Return record semantics, excluding its position in the payload file."""
+    ignored = {"bin_offset"}
+    return tuple(
+        sorted((key, json.dumps(value, sort_keys=True)) for key, value in entry.items() if key not in ignored)
+    )
+
+
+def _coalesce_dump_tensor(
     task_entries: list[dict],
-    payload: bytes,
-    out_dir: Path,
-    param: Param,
+    payload: BinaryIO,
+    payload_size: int,
     arg_index: int,
-    task_id: str,
-) -> tuple[int, str]:
-    before = _dump_entry(task_entries, arg_index, kind="tensor", stage="before_dispatch")
-    after = _dump_entry(task_entries, arg_index, kind="tensor", stage="after_completion")
-    record = before or after
-    if record is None:
-        raise ValueError(f"args dump is missing tensor ABI arg {arg_index} ({param.name})")
-    context = f"task {task_id} tensor arg {arg_index} ({param.name})"
-    _usable_dump_entry(record, context=context)
-    role = str(record.get("role"))
-    if role not in {"input", "output", "inout"}:
-        raise ValueError(f"{context} has invalid role {role!r}")
-    if role in {"input", "inout"} and before is None:
-        raise ValueError(f"{context} has no before_dispatch payload")
-    if before is None:
-        raw = bytes(int(record.get("bin_size", 0)))
-    else:
-        raw = _payload_slice(payload, before, context=context)
-    item_size = byte_size(param.cpp_type)
-    if not raw or len(raw) % item_size:
-        raise ValueError(
-            f"{context} has {len(raw)} bytes, incompatible with {param.cpp_type} ({item_size} bytes)"
+    stage: str,
+    *,
+    context: str,
+) -> tuple[dict, bytes]:
+    """Collapse per-block duplicates only when metadata and bytes are identical."""
+    matches = _dump_entries(task_entries, arg_index, kind="tensor", stage=stage)
+    if not matches:
+        raise ValueError(f"{context} has no {stage} payload")
+    first = matches[0]
+    first_raw = _payload_slice(payload, payload_size, first, context=f"{context} {stage}")
+    first_signature = _entry_signature(first)
+    for duplicate in matches[1:]:
+        duplicate_raw = _payload_slice(
+            payload,
+            payload_size,
+            duplicate,
+            context=f"{context} duplicate {stage}",
         )
-    (out_dir / f"{param.name}.bin").write_bytes(raw)
+        if _entry_signature(duplicate) != first_signature or duplicate_raw != first_raw:
+            raise ValueError(
+                f"{context} has conflicting per-block {stage} records; "
+                "capture lacks a unique task pre/post-state"
+            )
+    return first, first_raw
 
-    expected_dir = out_dir / "captured_expected"
-    expected_dir.mkdir(exist_ok=True)
-    if role == "input":
-        # A read-only ABI input must remain unchanged after the standalone call.
-        (expected_dir / f"{param.name}.bin").write_bytes(raw)
-    else:
-        if after is None:
-            raise ValueError(f"{context} has no after_completion payload for correctness checking")
-        expected = _payload_slice(payload, after, context=context, expected_size=len(raw))
-        (expected_dir / f"{param.name}.bin").write_bytes(expected)
-    return len(raw) // item_size, role
+
+def _coalesce_dump_tensor_metadata(
+    task_entries: list[dict],
+    arg_index: int,
+    stage: str,
+    *,
+    context: str,
+) -> dict:
+    """Validate duplicate record metadata without loading tensor payloads."""
+    matches = _dump_entries(task_entries, arg_index, kind="tensor", stage=stage)
+    if not matches:
+        raise ValueError(f"{context} has no {stage} payload")
+    first = matches[0]
+    _usable_dump_entry(first, context=f"{context} {stage}")
+    first_signature = _entry_signature(first)
+    for duplicate in matches[1:]:
+        _usable_dump_entry(duplicate, context=f"{context} duplicate {stage}")
+        if _entry_signature(duplicate) != first_signature:
+            raise ValueError(f"{context} has conflicting per-block {stage} metadata")
+    return first
+
+
+def _overlay_storage(
+    backing: bytearray,
+    covered: list[tuple[int, int]],
+    offset: int,
+    raw: bytes,
+    *,
+    context: str,
+) -> None:
+    """Overlay one captured view while proving overlapping records agree.
+
+    Coverage is represented as merged intervals rather than a byte-per-byte
+    bitmap, so reconstruction needs one backing-sized allocation instead of
+    two. The same backing is reused for pre- and post-state validation.
+    """
+    end = offset + len(raw)
+    if offset < 0 or end > len(backing):
+        raise ValueError(f"{context} is outside its captured backing storage")
+    for covered_begin, covered_end in covered:
+        overlap_begin = max(offset, covered_begin)
+        overlap_end = min(end, covered_end)
+        if overlap_begin >= overlap_end:
+            continue
+        raw_begin = overlap_begin - offset
+        raw_end = overlap_end - offset
+        if memoryview(backing)[overlap_begin:overlap_end] != memoryview(raw)[raw_begin:raw_end]:
+            raise ValueError(f"{context} disagrees with another aliased view at storage byte {overlap_begin}")
+    backing[offset:end] = raw
+    covered.append((offset, end))
+    covered.sort()
+    merged: list[tuple[int, int]] = []
+    for covered_begin, covered_end in covered:
+        if merged and covered_begin <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], covered_end))
+        else:
+            merged.append((covered_begin, covered_end))
+    covered[:] = merged
 
 
 def _extract_dump_scalar(task_entries: list[dict], param: Param, arg_index: int) -> str:
-    scalar = _dump_entry(task_entries, arg_index, kind="scalar", stage="before_dispatch")
-    if scalar is None or "value" not in scalar:
+    matches = _dump_entries(task_entries, arg_index, kind="scalar", stage="before_dispatch")
+    if not matches or "value" not in matches[0]:
         raise ValueError(f"args dump is missing scalar ABI arg {arg_index} ({param.name})")
+    scalar = matches[0]
+    for duplicate in matches[1:]:
+        if _entry_signature(duplicate) != _entry_signature(scalar):
+            raise ValueError(f"selected dispatch has conflicting scalar records for ABI arg {arg_index}")
     value = scalar["value"]
     if isinstance(value, bool):
         return "1" if value else "0"
@@ -1375,15 +1576,72 @@ def _extract_dump_scalar(task_entries: list[dict], param: Param, arg_index: int)
     raise ValueError(f"scalar ABI arg {arg_index} ({param.name}) has non-numeric value {value!r}")
 
 
+def _inspect_dump_tensor(
+    task_entries: list[dict],
+    param: Param,
+    arg_index: int,
+    selected_task: str,
+) -> CapturedTensorRecord:
+    """Validate pre/post metadata without materializing the tensor payload."""
+    context = f"task {selected_task} tensor arg {arg_index} ({param.name})"
+    before = _coalesce_dump_tensor_metadata(task_entries, arg_index, "before_dispatch", context=context)
+    role = str(before.get("role"))
+    if role not in {"input", "output", "inout"}:
+        raise ValueError(f"{context} has invalid role {role!r}")
+    expected_stage = "before_dispatch" if role == "input" else "after_completion"
+    after = (
+        before
+        if role == "input"
+        else _coalesce_dump_tensor_metadata(task_entries, arg_index, expected_stage, context=context)
+    )
+    stable_fields = ("role", "dtype", "shape", "strides", "start_offset", "storage_id", "bin_size")
+    changed = [field for field in stable_fields if before.get(field) != after.get(field)]
+    if changed:
+        raise ValueError(f"{context} changes capture metadata across execution: {changed}")
+    storage_id = before.get("storage_id")
+    if not isinstance(storage_id, str) or not storage_id:
+        raise ValueError(f"{context} has no backing-storage identity")
+    item_size = byte_size(param.cpp_type)
+    captured_dtype = str(before.get("dtype", "")).upper()
+    if captured_dtype != _CPP_CAPTURE_DTYPES[param.cpp_type]:
+        raise ValueError(
+            f"{context} has dtype {captured_dtype!r}, expected {_CPP_CAPTURE_DTYPES[param.cpp_type]}"
+        )
+    size_bytes = before.get("bin_size")
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes <= 0:
+        raise ValueError(f"{context} has invalid bin_size {size_bytes!r}")
+    if size_bytes % item_size:
+        raise ValueError(
+            f"{context} has {size_bytes} bytes, incompatible with {param.cpp_type} ({item_size} bytes)"
+        )
+    start_offset = before.get("start_offset")
+    if isinstance(start_offset, bool) or not isinstance(start_offset, int) or start_offset < 0:
+        raise ValueError(f"{context} has invalid start_offset {start_offset!r}")
+    return CapturedTensorRecord(
+        before=before,
+        after=after,
+        offset_bytes=start_offset * item_size,
+        storage_id=storage_id,
+        size_bytes=size_bytes,
+        arg_index=arg_index,
+        role=role,
+        expected_stage=expected_stage,
+    )
+
+
 def _extract_dump_invocation(
     selection: DumpSelection,
     out_dir: Path,
     params: list[Param],
     counts: dict[str, int],
-) -> tuple[dict[str, str], dict]:
+) -> tuple[dict[str, str], dict, CapturedStorageLayout]:
     """Materialize one exact pure-kernel invocation from a level-2 args dump."""
     manifest_path = selection.manifest
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 2 or manifest.get("capture_semantics") != "exact_standalone_replay":
+        raise ValueError(
+            "args dump does not contain exact pre/post storage metadata; recapture with the current runtime"
+        )
     entries = manifest.get("args")
     bin_name = manifest.get("bin_file")
     if not isinstance(entries, list) or not entries:
@@ -1400,31 +1658,149 @@ def _extract_dump_invocation(
         task_id=selection.task_id,
         task_occurrence=selection.task_occurrence,
     )
-    payload = bin_path.read_bytes()
+    payload_size = bin_path.stat().st_size
     scalar_values: dict[str, str] = {}
     roles: dict[str, str] = {}
+    pointer_records: dict[str, CapturedTensorRecord] = {}
+    storage_order: list[str] = []
+    storage_origins: dict[str, int] = {}
+    storage_ends: dict[str, int] = {}
 
     for arg_index, param in enumerate(params):
         if param.is_ptr:
-            counts[param.name], role = _extract_dump_tensor(
-                task_entries,
-                payload,
-                out_dir,
-                param,
-                arg_index,
-                selected_task,
+            record = _inspect_dump_tensor(task_entries, param, arg_index, selected_task)
+            if record.storage_id not in storage_origins:
+                storage_order.append(record.storage_id)
+                storage_origins[record.storage_id] = record.offset_bytes
+                storage_ends[record.storage_id] = record.offset_bytes
+            storage_origins[record.storage_id] = min(storage_origins[record.storage_id], record.offset_bytes)
+            storage_ends[record.storage_id] = max(
+                storage_ends[record.storage_id], record.offset_bytes + record.size_bytes
             )
-            roles[param.name] = role
+            counts[param.name] = record.size_bytes // byte_size(param.cpp_type)
+            roles[param.name] = record.role
+            pointer_records[param.name] = record
         else:
             scalar_values[param.name] = _extract_dump_scalar(task_entries, param, arg_index)
+
+    # Discard an unused leading prefix without changing any pointer's address
+    # modulo the 512-byte GM allocation/alignment period. Relative aliases and
+    # transfer alignment therefore remain identical to the captured launch.
+    storage_origins = {
+        storage_id: origin - origin % _CAPTURE_ADDRESS_PERIOD
+        for storage_id, origin in storage_origins.items()
+    }
+    storage_names = {storage_id: f"capture_storage_{index}" for index, storage_id in enumerate(storage_order)}
+    pointers = {
+        param.name: CapturedPointer(
+            storage_name=storage_names[pointer_records[param.name].storage_id],
+            offset_bytes=(
+                pointer_records[param.name].offset_bytes
+                - storage_origins[pointer_records[param.name].storage_id]
+            ),
+            size_bytes=pointer_records[param.name].size_bytes,
+            role=roles[param.name],
+        )
+        for param in params
+        if param.is_ptr
+    }
+    expected_dir = out_dir / "captured_expected"
+    expected_dir.mkdir(exist_ok=True)
+    storages: dict[str, tuple[str, int]] = {}
+    storage_manifest: list[dict] = []
+    with bin_path.open("rb") as payload:
+        for storage_id in storage_order:
+            storage_name = storage_names[storage_id]
+            storage_origin = storage_origins[storage_id]
+            storage_size = storage_ends[storage_id] - storage_origin
+            storage_params = [
+                param
+                for param in params
+                if param.is_ptr and pointer_records[param.name].storage_id == storage_id
+            ]
+            backing = bytearray(storage_size)
+            covered: list[tuple[int, int]] = []
+            for param in storage_params:
+                record = pointer_records[param.name]
+                current, before_raw = _coalesce_dump_tensor(
+                    task_entries,
+                    payload,
+                    payload_size,
+                    record.arg_index,
+                    "before_dispatch",
+                    context=f"task {selected_task} tensor arg {record.arg_index} ({param.name})",
+                )
+                if _entry_signature(current) != _entry_signature(record.before):
+                    raise ValueError(f"task {selected_task} pre-state metadata changed during import")
+                if len(before_raw) != record.size_bytes:
+                    raise ValueError(f"task {selected_task} pre-state size changed during import")
+                _overlay_storage(
+                    backing,
+                    covered,
+                    record.offset_bytes - storage_origin,
+                    before_raw,
+                    context=f"task {selected_task} pre-state for {param.name}",
+                )
+
+            file_name = f"{storage_name}.bin"
+            (out_dir / file_name).write_bytes(backing)
+            storages[storage_name] = (file_name, storage_size)
+
+            # Reuse the backing allocation for post-state alias validation.
+            # Expected outputs are written as logical views, so bytes outside
+            # the covered post-state ranges are deliberately irrelevant.
+            covered.clear()
+            for param in storage_params:
+                record = pointer_records[param.name]
+                current, after_raw = _coalesce_dump_tensor(
+                    task_entries,
+                    payload,
+                    payload_size,
+                    record.arg_index,
+                    record.expected_stage,
+                    context=f"task {selected_task} tensor arg {record.arg_index} ({param.name})",
+                )
+                if _entry_signature(current) != _entry_signature(record.after):
+                    raise ValueError(f"task {selected_task} expected-state metadata changed during import")
+                if len(after_raw) != record.size_bytes:
+                    raise ValueError(f"task {selected_task} expected-state size changed during import")
+                _overlay_storage(
+                    backing,
+                    covered,
+                    record.offset_bytes - storage_origin,
+                    after_raw,
+                    context=f"task {selected_task} expected-state for {param.name}",
+                )
+                (expected_dir / f"{param.name}.bin").write_bytes(after_raw)
+
+            storage_manifest.append(
+                {
+                    "name": storage_name,
+                    "bytes": storage_size,
+                    "arguments": sorted(param.name for param in storage_params),
+                }
+            )
+            del backing
 
     capture = {
         "task_id": selected_task,
         "func_id": selection.func_id,
         "roles": roles,
-        "recommended_outputs": sorted(name for name, role in roles.items() if role in {"output", "inout"}),
+        # Verify every logical ABI view. Formal inputs are expected to remain
+        # unchanged, and checking them catches undeclared writes or an
+        # incorrectly reconstructed alias just as importantly as output drift.
+        "recommended_outputs": sorted(roles),
+        "storages": storage_manifest,
+        "pointers": {
+            name: {
+                "storage": pointer.storage_name,
+                "offset_bytes": pointer.offset_bytes,
+                "size_bytes": pointer.size_bytes,
+            }
+            for name, pointer in pointers.items()
+        },
     }
-    return scalar_values, capture
+    return scalar_values, capture, CapturedStorageLayout(storages=storages, pointers=pointers)
 
 
 def generate(  # noqa: PLR0912, PLR0913
@@ -1457,8 +1833,12 @@ def generate(  # noqa: PLR0912, PLR0913
         )
     pto_text = pto_path.read_text(encoding="utf-8")
     name, is_mixed, params = parse_cpp(cpp_text)
+    extent_cpp_text = cpp_text
+    extent_params = params
     mixed_wrapper: dict[str, str] | None = None
     mixed_group_wrapped = False
+    pure_identity_args: tuple[str, ...] = ()
+    runtime_identity_bindings: dict[str, str] = {}
     if run_mode == "npu" and is_mixed:
         if ptoas_root is None:
             raise ValueError(
@@ -1467,6 +1847,21 @@ def generate(  # noqa: PLR0912, PLR0913
             )
         name, params, cpp_text, mixed_wrapper = _prepare_mixed_group(cpp_text, pto_text, ptoas_root)
         mixed_group_wrapped = True
+    elif run_mode == "npu":
+        external_params, runtime_identity_bindings = _external_pure_abi_and_identity_bindings(
+            pto_text, name, cpp_text
+        )
+        if runtime_identity_bindings:
+            params = [_parse_param(param) for param in external_params]
+            if re.search(rf"__global__\s+AICORE\s+void\s+{re.escape(name)}\s*\(", cpp_text):
+                cpp_text = _bind_direct_launch_runtime_identities(
+                    cpp_text,
+                    name,
+                    external_params,
+                    runtime_identity_bindings,
+                )
+            else:
+                pure_identity_args = tuple(runtime_identity_bindings.values())
     pto_sizes = parse_pto_sizes(pto_text)
 
     counts: dict[str, int] = {}
@@ -1483,9 +1878,10 @@ def generate(  # noqa: PLR0912, PLR0913
         synthetic_seed=synthetic_seed,
     )
     capture: dict | None = None
+    captured_storage: CapturedStorageLayout | None = None
     captured_scalars: dict[str, str] = {}
     if dump_selection is not None:
-        captured_scalars, capture = _extract_dump_invocation(
+        captured_scalars, capture, captured_storage = _extract_dump_invocation(
             dump_selection,
             out_dir,
             params,
@@ -1514,12 +1910,20 @@ def generate(  # noqa: PLR0912, PLR0913
         )
     extent_analysis: ExtentAnalysis | None = None
     if run_mode == "npu" and not is_mixed and dump_selection is None:
+        identity_scalar_values = {
+            variable: {
+                "get_block_idx()": "0",
+                "get_block_num()": str(block_dim),
+                "get_subblockid()": "0",
+            }[builtin]
+            for variable, builtin in runtime_identity_bindings.items()
+        }
         extent_analysis = _infer_physical_extents(
-            cpp_text,
+            extent_cpp_text,
             pto_text,
             name,
-            params,
-            scalar_values,
+            extent_params,
+            {**scalar_values, **identity_scalar_values},
         )
         for pointer, extent in extent_analysis.pointers.items():
             counts[pointer] = max(counts[pointer], extent.required_elements)
@@ -1547,12 +1951,20 @@ def generate(  # noqa: PLR0912, PLR0913
             is_mixed,
             params,
             mixed_group_wrapped=mixed_group_wrapped,
+            pure_identity_args=pure_identity_args,
         ),
         encoding="utf-8",
     )
     (out_dir / "launch.cpp").write_text(emit_launch_cpp(name, params), encoding="utf-8")
     main_cpp = (
-        emit_npu_benchmark_main_cpp(name, params, counts, scalar_values, block_dim)
+        emit_npu_benchmark_main_cpp(
+            name,
+            params,
+            counts,
+            scalar_values,
+            block_dim,
+            captured_storage=captured_storage,
+        )
         if run_mode == "npu"
         else emit_main_cpp(name, params, counts, scalar_values, block_dim)
     )
@@ -1576,6 +1988,7 @@ def generate(  # noqa: PLR0912, PLR0913
         "block_dim": block_dim,
         "mixed": is_mixed,
         **({"mixed_runner": mixed_wrapper} if mixed_wrapper is not None else {}),
+        **({"runtime_identity_bindings": runtime_identity_bindings} if runtime_identity_bindings else {}),
         **(
             {
                 "input_source": {
@@ -1606,7 +2019,17 @@ def generate(  # noqa: PLR0912, PLR0913
                 "cpp_type": param.cpp_type,
                 "kind": "pointer" if param.is_ptr else "scalar",
                 **(
-                    {"elements": counts[param.name]}
+                    {
+                        "elements": counts[param.name],
+                        **(
+                            {
+                                "storage": captured_storage.pointers[param.name].storage_name,
+                                "storage_offset_bytes": captured_storage.pointers[param.name].offset_bytes,
+                            }
+                            if captured_storage is not None
+                            else {}
+                        ),
+                    }
                     if param.is_ptr
                     else {"value": scalar_values.get(param.name, "1")}
                 ),

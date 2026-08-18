@@ -232,7 +232,9 @@ class RunConfig:
             * ``0`` / ``False`` — off (no dump).
             * ``1`` / ``True`` — **partial**: only the tensors marked via the
               DSL marker ``pl.dump_tag(t)`` (or ``pl.submit(..., dumps=[...])``).
-            * ``2`` — **full**: every task's tensor inputs and outputs.
+            * ``2`` — **full**: every task's tensor pre-state plus writable
+              tensor post-state, including backing-storage identity needed for
+              exact standalone replay.
 
             Full dump on a large workload can saturate the host-side dump
             collector (~42 MB/s drain rate) and get the AICPU killed by a STARS
