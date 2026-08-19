@@ -13,6 +13,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/function.h>    // NOLINT(misc-include-cleaner) -- registers std::function casters
+#include <nanobind/stl/optional.h>    // NOLINT(misc-include-cleaner) -- registers optional casters
 #include <nanobind/stl/shared_ptr.h>  // NOLINT(misc-include-cleaner) -- registers shared_ptr casters
 #include <nanobind/stl/string.h>      // NOLINT(misc-include-cleaner) -- registers std::string casters
 #include <nanobind/stl/vector.h>      // NOLINT(misc-include-cleaner) -- registers std::vector casters
