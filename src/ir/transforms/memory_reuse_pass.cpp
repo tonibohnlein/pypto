@@ -1398,7 +1398,11 @@ LifetimeAnalysisResult AnalyzeAllocationLifetimesImpl(const StmtPtr& func_body,
     INTERNAL_CHECK_SPAN(memory_space.has_value(), sharing_group[0]->span_)
         << "TileType with MemRef must have memory_space for reuse analysis";
     interval.memory_space = *memory_space;
-    interval.size = GetDefinedMemRef(representative_tile_type)->size_;
+    interval.size = max_size;
+    interval.alias_members.reserve(sharing_group.size());
+    for (const auto& group_var : sharing_group) {
+      interval.alias_members.push_back(group_var->name_hint_);
+    }
 
     lifetimes.push_back(interval);
 
