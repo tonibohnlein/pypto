@@ -71,6 +71,26 @@ def test_pass_context_runtime_is_independent_of_memory_planner():
     assert ctx.get_runtime() == GRAPH_EXECUTION_RUNTIME
 
 
+def test_pass_context_combines_runtime_and_dsa_research_controls():
+    ctx = passes.PassContext(
+        [],
+        memory_planner=passes.MemoryPlanner.DSA,
+        runtime=GRAPH_EXECUTION_RUNTIME,
+        dsa_export_dir="export",
+        dsa_solution_dir="solutions",
+        dsa_reuse_penalty_recognizer=passes.DsaReusePenaltyRecognizer.QUADRATIC,
+        dsa_reference_placement=passes.DsaReferencePlacement.LOOSE,
+        dsa_reference_target="kernel",
+    )
+    assert ctx.get_memory_planner() == passes.MemoryPlanner.DSA
+    assert ctx.get_runtime() == GRAPH_EXECUTION_RUNTIME
+    assert ctx.get_dsa_export_dir() == "export"
+    assert ctx.get_dsa_solution_dir() == "solutions"
+    assert ctx.get_dsa_reuse_penalty_recognizer() == passes.DsaReusePenaltyRecognizer.QUADRATIC
+    assert ctx.get_dsa_reference_placement() == passes.DsaReferencePlacement.LOOSE
+    assert ctx.get_dsa_reference_target() == "kernel"
+
+
 # ---------------------------------------------------------------------------
 # Validation and precedence
 # ---------------------------------------------------------------------------

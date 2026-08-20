@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -236,6 +237,19 @@ enum class MemoryPlanner {
   Dsa = 3,    ///< External research planner with export, replay, and solver controls.
 };
 
+/** @brief Experimental recognizer used to derive standalone DSA soft edges. */
+enum class DsaReusePenaltyRecognizer {
+  Disabled,
+  Quadratic,
+};
+
+/** @brief Experimental placement endpoint used by controlled DSA studies. */
+enum class DsaReferencePlacement {
+  Default,
+  Compact,
+  Loose,
+};
+
 /**
  * @brief Which Simpler runtime ABI a compilation targets.
  *
@@ -303,14 +317,23 @@ class PassContext {
    * @param runtime Which Simpler runtime ABI to target (default:
    *        TensorMapAndRingBuffer). Passes that must legalize IR for a specific
    *        runtime switch on this rather than inspecting codegen options.
+   * @param dsa_export_dir Optional standalone DSA problem export directory.
+   * @param dsa_solution_dir Optional fingerprinted placement replay directory.
+   * @param dsa_reuse_penalty_recognizer Experimental soft-edge recognizer.
+   * @param dsa_reference_placement Experimental compact/loose endpoint.
+   * @param dsa_reference_target Optional exact function selected for a loose endpoint.
    */
-  explicit PassContext(std::vector<PassInstrumentPtr> instruments,
-                       VerificationLevel verification_level = VerificationLevel::Basic,
-                       DiagnosticPhase diagnostic_phase = DiagnosticPhase::PrePipeline,
-                       DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
-                       MemoryPlanner memory_planner = MemoryPlanner::PyPTO,
-                       bool enable_pypto_l0c_double_buffer = false,
-                       RuntimeKind runtime = kDefaultRuntimeKind);
+  explicit PassContext(
+      std::vector<PassInstrumentPtr> instruments,
+      VerificationLevel verification_level = VerificationLevel::Basic,
+      DiagnosticPhase diagnostic_phase = DiagnosticPhase::PrePipeline,
+      DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
+      MemoryPlanner memory_planner = MemoryPlanner::PyPTO, bool enable_pypto_l0c_double_buffer = false,
+      RuntimeKind runtime = kDefaultRuntimeKind, std::optional<std::string> dsa_export_dir = std::nullopt,
+      std::optional<std::string> dsa_solution_dir = std::nullopt,
+      DsaReusePenaltyRecognizer dsa_reuse_penalty_recognizer = DsaReusePenaltyRecognizer::Disabled,
+      DsaReferencePlacement dsa_reference_placement = DsaReferencePlacement::Default,
+      std::optional<std::string> dsa_reference_target = std::nullopt);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -382,6 +405,12 @@ class PassContext {
    */
   [[nodiscard]] RuntimeKind GetRuntime() const;
 
+  [[nodiscard]] const std::optional<std::string>& GetDsaExportDir() const;
+  [[nodiscard]] const std::optional<std::string>& GetDsaSolutionDir() const;
+  [[nodiscard]] DsaReusePenaltyRecognizer GetDsaReusePenaltyRecognizer() const;
+  [[nodiscard]] DsaReferencePlacement GetDsaReferencePlacement() const;
+  [[nodiscard]] const std::optional<std::string>& GetDsaReferenceTarget() const;
+
   /**
    * @brief Get the currently active context (top of thread-local stack)
    * @return Pointer to current context, or nullptr if none
@@ -409,6 +438,11 @@ class PassContext {
   MemoryPlanner memory_planner_;
   bool enable_pypto_l0c_double_buffer_;
   RuntimeKind runtime_;
+  std::optional<std::string> dsa_export_dir_;
+  std::optional<std::string> dsa_solution_dir_;
+  DsaReusePenaltyRecognizer dsa_reuse_penalty_recognizer_;
+  DsaReferencePlacement dsa_reference_placement_;
+  std::optional<std::string> dsa_reference_target_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

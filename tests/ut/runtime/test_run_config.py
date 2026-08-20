@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from pypto.backend import BackendType
-from pypto.pypto_core.passes import MemoryPlanner
+from pypto.pypto_core.passes import DsaReferencePlacement, DsaReusePenaltyRecognizer, MemoryPlanner
 from pypto.runtime.runner import (
     CompileOptions,
     DfxOptions,
@@ -692,6 +692,26 @@ class TestRunConfigCompileForwarding:
         ).compile_kwargs()
 
         assert set(kwargs) <= accepted
+
+    def test_compile_kwargs_forward_dsa_research_controls(self):
+        kwargs = RunConfig(
+            platform="a2a3sim",
+            memory_planner=MemoryPlanner.DSA,
+            dsa_export_dir="export",
+            dsa_solution_dir="solutions",
+            dsa_reuse_penalty_recognizer=DsaReusePenaltyRecognizer.QUADRATIC,
+            dsa_reference_placement=DsaReferencePlacement.LOOSE,
+            dsa_reference_target="kernel",
+            ptoas_sync_summary_dir="sync",
+        ).compile_kwargs()
+
+        assert kwargs["memory_planner"] == MemoryPlanner.DSA
+        assert kwargs["dsa_export_dir"] == "export"
+        assert kwargs["dsa_solution_dir"] == "solutions"
+        assert kwargs["dsa_reuse_penalty_recognizer"] == DsaReusePenaltyRecognizer.QUADRATIC
+        assert kwargs["dsa_reference_placement"] == DsaReferencePlacement.LOOSE
+        assert kwargs["dsa_reference_target"] == "kernel"
+        assert kwargs["ptoas_sync_summary_dir"] == "sync"
 
     def test_execute_compiled_accepts_auto_scope_deps_switch(self, tmp_path, stub_device_runner):
         config = RunConfig(platform="a2a3sim", ring_heap=1024 * 1024)

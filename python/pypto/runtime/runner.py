@@ -54,7 +54,13 @@ import torch
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassDumpLevel
 from pypto.pypto_core import backend as _backend_core
-from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase, MemoryPlanner
+from pypto.pypto_core.passes import (
+    DiagnosticCheckSet,
+    DiagnosticPhase,
+    DsaReferencePlacement,
+    DsaReusePenaltyRecognizer,
+    MemoryPlanner,
+)
 
 from .device_tensor import DeviceTensor
 
@@ -398,6 +404,12 @@ class RunConfig:
             ``PassContext``, or to ``PYPTO`` when none is active.
             Forwarded to ``ir.compile()``, which rejects it when a
             ``PassContext`` is already active — set it on that context instead.
+        dsa_export_dir: Optional standalone DSA problem export directory.
+        dsa_solution_dir: Optional fingerprinted placement replay directory.
+        dsa_reuse_penalty_recognizer: Optional experimental DSA soft-edge recognizer.
+        dsa_reference_placement: Optional compact/loose research endpoint.
+        dsa_reference_target: Optional exact function selected for a loose endpoint.
+        ptoas_sync_summary_dir: Optional directory for PTOAS InsertSync JSONL summaries.
     """
 
     __test__ = False  # Not a pytest test class
@@ -437,6 +449,12 @@ class RunConfig:
     analyze_auto_scopes_for_deps: bool = False
     memory_planner: MemoryPlanner | None = None
     dump_ptoas_passes: bool = False
+    dsa_export_dir: str | None = None
+    dsa_solution_dir: str | None = None
+    dsa_reuse_penalty_recognizer: DsaReusePenaltyRecognizer | None = None
+    dsa_reference_placement: DsaReferencePlacement | None = None
+    dsa_reference_target: str | None = None
+    ptoas_sync_summary_dir: str | None = None
 
     def __post_init__(self) -> None:
         # The two axes replace what used to be a membership test on the packed
@@ -590,6 +608,12 @@ class RunConfig:
             output_dir=self.save_kernels_dir,
             memory_planner=self.memory_planner,
             distributed_config=self.distributed_config,
+            dsa_export_dir=self.dsa_export_dir,
+            dsa_solution_dir=self.dsa_solution_dir,
+            dsa_reuse_penalty_recognizer=self.dsa_reuse_penalty_recognizer,
+            dsa_reference_placement=self.dsa_reference_placement,
+            dsa_reference_target=self.dsa_reference_target,
+            ptoas_sync_summary_dir=self.ptoas_sync_summary_dir,
         )
 
     def run_options(self) -> "RunOptions":
@@ -898,6 +922,12 @@ class CompileOptions:
     output_dir: str | None = None
     memory_planner: MemoryPlanner | None = None
     distributed_config: "DistributedConfig | None" = None
+    dsa_export_dir: str | None = None
+    dsa_solution_dir: str | None = None
+    dsa_reuse_penalty_recognizer: DsaReusePenaltyRecognizer | None = None
+    dsa_reference_placement: DsaReferencePlacement | None = None
+    dsa_reference_target: str | None = None
+    ptoas_sync_summary_dir: str | None = None
 
     def as_compile_kwargs(self) -> dict[str, Any]:
         """Return these options as :func:`pypto.ir.compile` keyword arguments."""
@@ -911,7 +941,17 @@ class CompileOptions:
             "disabled_diagnostics": self.disabled_diagnostics,
             "analyze_auto_scopes_for_deps": self.analyze_auto_scopes_for_deps,
         }
-        for name in ("output_dir", "memory_planner", "distributed_config"):
+        for name in (
+            "output_dir",
+            "memory_planner",
+            "distributed_config",
+            "dsa_export_dir",
+            "dsa_solution_dir",
+            "dsa_reuse_penalty_recognizer",
+            "dsa_reference_placement",
+            "dsa_reference_target",
+            "ptoas_sync_summary_dir",
+        ):
             value = getattr(self, name)
             if value is not None:
                 kwargs[name] = value

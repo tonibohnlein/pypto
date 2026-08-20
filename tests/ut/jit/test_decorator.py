@@ -41,7 +41,7 @@ from pypto.jit.decorator import (
 )
 from pypto.jit.specializer import DynDim, Specializer, TensorMeta
 from pypto.language.parser.diagnostics.exceptions import ParserTypeError
-from pypto.pypto_core import DataType, InternalError, ir
+from pypto.pypto_core import DataType, InternalError, ir, passes
 from pypto.runtime.runner import RunConfig
 
 # ---------------------------------------------------------------------------

@@ -1744,7 +1744,6 @@ def generate(
             runtime=runtime,
             emit_access_provenance=emit_access_provenance,
             ptoas_sync_summary_dir=ptoas_sync_summary_dir,
-            runtime=runtime,
         )
 
     # L2-only program with multiple Orchestrations: emit each as a
@@ -1762,7 +1761,6 @@ def generate(
             runtime=runtime,
             emit_access_provenance=emit_access_provenance,
             ptoas_sync_summary_dir=ptoas_sync_summary_dir,
-            runtime=runtime,
         )
 
     return _generate_single_chip(
@@ -1775,7 +1773,6 @@ def generate(
         runtime=runtime,
         emit_access_provenance=emit_access_provenance,
         ptoas_sync_summary_dir=ptoas_sync_summary_dir,
-        runtime=runtime,
     )
 
 
@@ -1790,7 +1787,6 @@ def _generate_with_distributed(
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
     emit_access_provenance: bool = False,
     ptoas_sync_summary_dir: str | None = None,
-    runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
 ) -> dict[str, str]:
     """Generate artifacts for a distributed (L3+) program.
 
@@ -1817,6 +1813,11 @@ def _generate_with_distributed(
             chip_funcs = _collect_chip_task_functions(func, transformed_program)
             chip_program = _ir_core.Program(chip_funcs, func.name, transformed_program.span)
             chip_subdir = os.path.join(output_dir, "next_levels", func.name)
+            chip_summary_dir = (
+                os.path.join(ptoas_sync_summary_dir, func.name)
+                if ptoas_sync_summary_dir is not None
+                else None
+            )
             chip_files = _generate_single_chip(
                 chip_program,
                 chip_subdir,
@@ -1827,7 +1828,6 @@ def _generate_with_distributed(
                 runtime=runtime,
                 emit_access_provenance=emit_access_provenance,
                 ptoas_sync_summary_dir=chip_summary_dir,
-                runtime=runtime,
             )
             for path, content in chip_files.items():
                 result_files[f"next_levels/{func.name}/{path}"] = content
@@ -2036,7 +2036,6 @@ def _generate_multi_chip(
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
     emit_access_provenance: bool = False,
     ptoas_sync_summary_dir: str | None = None,
-    runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
 ) -> dict[str, str]:
     """Generate artifacts for an L2-only program with multiple Orchestrations.
 
@@ -2054,6 +2053,9 @@ def _generate_multi_chip(
         chip_funcs = _collect_chip_task_functions(func, transformed_program)
         chip_program = _ir_core.Program(chip_funcs, func.name, transformed_program.span)
         chip_subdir = os.path.join(output_dir, "next_levels", func.name)
+        chip_summary_dir = (
+            os.path.join(ptoas_sync_summary_dir, func.name) if ptoas_sync_summary_dir is not None else None
+        )
         chip_files = _generate_single_chip(
             chip_program,
             chip_subdir,
@@ -2064,7 +2066,6 @@ def _generate_multi_chip(
             runtime=runtime,
             emit_access_provenance=emit_access_provenance,
             ptoas_sync_summary_dir=chip_summary_dir,
-            runtime=runtime,
         )
         for path, content in chip_files.items():
             result_files[f"next_levels/{func.name}/{path}"] = content
@@ -2082,7 +2083,6 @@ def _generate_single_chip(
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
     emit_access_provenance: bool = False,
     ptoas_sync_summary_dir: str | None = None,
-    runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
 ) -> dict[str, str]:
     """Generate artifacts for a single-chip (L0-L2) program.
 
