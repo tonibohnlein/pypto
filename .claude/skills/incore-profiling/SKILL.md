@@ -112,6 +112,9 @@ python .claude/skills/incore-profiling/screen_dsa_capacity_corpus.py \
   --fractions 0,1/4,1/2,1 --workers 2 --output-root <screen>
 ```
 
+For the paper's direct-golden DSA corpus, follow the dedicated-driver protocol
+in [references/dsa-dedicated-driver-corpus.md](references/dsa-dedicated-driver-corpus.md).
+
 The exporter deduplicates only by the solver's semantic problem fingerprint and
 does not impose a buffer-count threshold. It records generated orchestration
 submit-site and kernel counts before `--prune-builds` removes each transient
