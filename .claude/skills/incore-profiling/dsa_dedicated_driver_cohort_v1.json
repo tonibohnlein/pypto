@@ -1,0 +1,347 @@
+{
+  "schema_version": 1,
+  "selection_policy": "existing_direct_golden_drivers_structural_diversity_v1",
+  "timing_blind_selection": true,
+  "pypto_lib_revision": "2cd5f828bd3a54e2d073a7950b5fcfc0806b8bae",
+  "arms": [
+    "geometry_ff",
+    "geometry_cg",
+    "cypress",
+    "dsa_rp_cg"
+  ],
+  "capacities": [
+    "native",
+    "half",
+    "q1",
+    "tight"
+  ],
+  "input_seed": 20260820,
+  "measurement_contract": {
+    "placement_scope": "all_dsa_functions_in_driver",
+    "correctness_scope": "complete_driver_torch_golden",
+    "timing_scope": "selected_runtime_task",
+    "allow_whole_driver_as_kernel_timing": false,
+    "requires_runtime_capture": false
+  },
+  "drivers": [
+    {
+      "tier": "canary",
+      "driver_id": "dspark_proj_decode",
+      "script": "models/deepseek_v4_flash_dspark/dspark_proj.py",
+      "entry": "dspark_proj_test",
+      "golden": "golden_dspark_proj",
+      "specs": "build_tensor_specs",
+      "argv": ["--mode", "decode"],
+      "targets": [
+        {
+          "instance": "rms_norm",
+          "problem_fingerprint": "41bed2aee2bb719c",
+          "pool_id": "1",
+          "operation_class": "normalization",
+          "definition_script": "models/deepseek_v4_flash_dspark/rmsnorm.py"
+        },
+        {
+          "instance": "dspark_main_proj_aic",
+          "problem_fingerprint": "5396ec0f85930a40",
+          "pool_id": "2",
+          "operation_class": "matmul",
+          "source_name_hint": "dspark_main_proj"
+        }
+      ]
+    },
+    {
+      "tier": "canary",
+      "driver_id": "dspark_hc_post_decode",
+      "script": "models/deepseek_v4_flash_dspark/hc_post.py",
+      "entry": "hc_post_test",
+      "golden": "golden_hc_post",
+      "specs": "build_tensor_specs",
+      "argv": ["--mode", "decode"],
+      "targets": [
+        {
+          "instance": "hc_post",
+          "problem_fingerprint": "e2608d1ff0a39d07",
+          "pool_id": "1",
+          "operation_class": "elementwise_reduction"
+        }
+      ]
+    },
+    {
+      "tier": "canary",
+      "driver_id": "dspark_rmsnorm_decode",
+      "script": "models/deepseek_v4_flash_dspark/rmsnorm.py",
+      "entry": "rms_norm_test",
+      "golden": "golden_rms_norm_test",
+      "specs": "build_tensor_specs",
+      "argv": ["--mode", "decode"],
+      "targets": [
+        {
+          "instance": "rms_norm",
+          "problem_fingerprint": "41bed2aee2bb719c",
+          "pool_id": "1",
+          "operation_class": "normalization"
+        }
+      ]
+    },
+    {
+      "tier": "canary",
+      "driver_id": "mtp_hc_post_decode",
+      "script": "models/deepseek_v4_flash_mtp/hc_post.py",
+      "entry": "hc_post_test",
+      "golden": "golden_hc_post",
+      "specs": "build_tensor_specs",
+      "argv": ["--mode", "decode"],
+      "targets": [
+        {
+          "instance": "hc_post",
+          "problem_fingerprint": "2ffac4650c0d9359",
+          "pool_id": "1",
+          "operation_class": "elementwise_reduction"
+        }
+      ]
+    },
+    {
+      "tier": "canary",
+      "driver_id": "mtp_prefill_cp_zigzag",
+      "script": "models/deepseek_v4_flash_mtp/prefill_cp_zigzag.py",
+      "entry": "prefill_cp_zigzag_kv_tail_exchange_test",
+      "golden": "golden_prefill_cp_zigzag_kv_tail_exchange",
+      "specs": "build_tensor_specs",
+      "argv": ["--cp", "8"],
+      "targets": [
+        {
+          "instance": "prefill_cp_zigzag_kv_tail_exchange_core",
+          "problem_fingerprint": "9d810c3ee09b461b",
+          "pool_id": "1",
+          "operation_class": "data_movement"
+        }
+      ]
+    },
+    {
+      "tier": "canary",
+      "driver_id": "mtp_rmsnorm_decode",
+      "script": "models/deepseek_v4_flash_mtp/rmsnorm.py",
+      "entry": "rms_norm_test",
+      "golden": "golden_rms_norm_test",
+      "specs": "build_tensor_specs",
+      "argv": ["--mode", "decode"],
+      "targets": [
+        {
+          "instance": "rms_norm",
+          "problem_fingerprint": "b91d87d2ffadd461",
+          "pool_id": "1",
+          "operation_class": "normalization"
+        }
+      ]
+    },
+    {
+      "tier": "canary",
+      "driver_id": "q14_greedy_sample",
+      "script": "models/qwen3_14b/greedy_sample.py",
+      "entry": "greedy_sample_fwd",
+      "golden": "golden_greedy_sample",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "greedy_sample",
+          "problem_fingerprint": "dc1175a0ed0ea0ec",
+          "pool_id": "1",
+          "operation_class": "selection"
+        }
+      ]
+    },
+    {
+      "tier": "canary_expanded",
+      "driver_id": "dspark_decode_compressor_ratio128",
+      "script": "models/deepseek_v4_flash_dspark/decode_compressor_ratio128.py",
+      "entry": "compressor_test",
+      "golden": "golden_compressor",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "kv_score_proj",
+          "problem_fingerprint": "2e99d3bfa2dbea25",
+          "pool_id": "3",
+          "operation_class": "matmul"
+        },
+        {
+          "instance": "rmsnorm_rope_cache_write",
+          "problem_fingerprint": "41b138747651160f",
+          "pool_id": "1",
+          "operation_class": "normalization_rope"
+        },
+        {
+          "instance": "rope_interleave",
+          "problem_fingerprint": "bdcc362708f3c650",
+          "pool_id": "1",
+          "operation_class": "data_transform",
+          "definition_script": "models/deepseek_v4_flash_dspark/rope_interleave.py"
+        },
+        {
+          "instance": "scatter_softmax_pool",
+          "problem_fingerprint": "ce270f7a38dc50f5",
+          "pool_id": "1",
+          "operation_class": "softmax_reduction"
+        }
+      ]
+    },
+    {
+      "tier": "canary_expanded",
+      "driver_id": "dspark_hc_head",
+      "script": "models/deepseek_v4_flash_dspark/hc_head.py",
+      "entry": "hc_head_test",
+      "golden": "golden_hc_head",
+      "specs": "build_tensor_specs",
+      "argv": ["--seed", "20260820"],
+      "targets": [
+        {
+          "instance": "hc_head_linear",
+          "problem_fingerprint": "2d4dbf9d3f77b1f7",
+          "pool_id": "3",
+          "operation_class": "matmul"
+        },
+        {
+          "instance": "hc_head_reduce",
+          "problem_fingerprint": "5a238ca6a3a3bf19",
+          "pool_id": "1",
+          "operation_class": "reduction"
+        },
+        {
+          "instance": "hc_head_linear_tail",
+          "problem_fingerprint": "997d33422b6a9eac",
+          "pool_id": "3",
+          "operation_class": "matmul"
+        },
+        {
+          "instance": "hc_head_rms",
+          "problem_fingerprint": "c85bad0445cfb99d",
+          "pool_id": "1",
+          "operation_class": "normalization"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "dspark_decode_sparse_attn_csa",
+      "script": "models/deepseek_v4_flash_dspark/decode_sparse_attn_csa.py",
+      "entry": "sparse_attn_csa_test",
+      "golden": "golden_sparse_attn",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "csa_slots_build_valid_qk_plan",
+          "problem_fingerprint": "4a31608d6afa3bf5",
+          "pool_id": "1",
+          "operation_class": "index_preparation"
+        },
+        {
+          "instance": "merge_norm",
+          "problem_fingerprint": "844be868f8078c2b",
+          "pool_id": "1",
+          "operation_class": "attention_merge"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "dspark_decode_sparse_attn_hca",
+      "script": "models/deepseek_v4_flash_dspark/decode_sparse_attn_hca.py",
+      "entry": "sparse_attn_hca_test",
+      "golden": "golden_sparse_attn",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "hca_gather_kv",
+          "problem_fingerprint": "018061ac0ed7a911",
+          "pool_id": "1",
+          "operation_class": "data_movement"
+        },
+        {
+          "instance": "merge_norm",
+          "problem_fingerprint": "1027c65ccb877a8f",
+          "pool_id": "1",
+          "operation_class": "attention_merge"
+        },
+        {
+          "instance": "build_valid",
+          "problem_fingerprint": "cfb77be7fcaa2ca5",
+          "pool_id": "1",
+          "operation_class": "index_preparation"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "dspark_decode_indexer",
+      "script": "models/deepseek_v4_flash_dspark/decode_indexer.py",
+      "entry": "indexer_test",
+      "golden": "golden_indexer",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "idx_qr_proj_dequant",
+          "problem_fingerprint": "2b7e568f46f55b78",
+          "pool_id": "1",
+          "operation_class": "dequantization"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "mtp_projection_decode",
+      "script": "models/deepseek_v4_flash_mtp/mtp_projection.py",
+      "entry": "mtp_projection_test",
+      "golden": "golden_mtp_projection",
+      "specs": "build_tensor_specs",
+      "argv": ["--mode", "decode"],
+      "targets": [
+        {
+          "instance": "mtp_dequant",
+          "problem_fingerprint": "356871ddfb3c6197",
+          "pool_id": "1",
+          "operation_class": "dequantization"
+        },
+        {
+          "instance": "mtp_hidden_norm_quant",
+          "problem_fingerprint": "af43efa160bcfddb",
+          "pool_id": "1",
+          "operation_class": "normalization_quantization"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "q14_topk_select",
+      "script": "models/qwen3_14b/topk_select.py",
+      "entry": "topk_select_fwd",
+      "golden": "golden_topk_select",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "topk_select",
+          "problem_fingerprint": "6395648f76a66b90",
+          "pool_id": "1",
+          "operation_class": "selection"
+        },
+        {
+          "instance": "topk_select_inactive",
+          "problem_fingerprint": "c3c00e954f606786",
+          "pool_id": "1",
+          "operation_class": "selection_control"
+        },
+        {
+          "instance": "greedy_select",
+          "problem_fingerprint": "d46467f51d34a50e",
+          "pool_id": "1",
+          "operation_class": "selection"
+        }
+      ]
+    }
+  ]
+}
