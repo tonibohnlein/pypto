@@ -788,6 +788,70 @@ def test_generate_npu_case_from_exact_args_dump(
     assert len(set(hashes["v0"].values())) == 1
 
 
+def test_args_dump_rejects_storage_written_by_a_sibling_task(generator: ModuleType, tmp_path: Path):
+    kernel = _write_kernel(tmp_path)
+    dump_dir = tmp_path / "args_dump"
+    dump_dir.mkdir()
+    payload = bytes(range(32))
+    (dump_dir / "args.bin").write_bytes(payload)
+
+    def tensor(task_id: str, role: str, stage: str) -> dict:
+        return {
+            "task_id": task_id,
+            "func_id": [4],
+            "arg_index": 0,
+            "role": role,
+            "stage": stage,
+            "kind": "tensor",
+            "dtype": "float32",
+            "is_contiguous": True,
+            "shape": [8],
+            "strides": [1],
+            "start_offset": 0,
+            "storage_id": "0x1234",
+            "bin_offset": 0,
+            "bin_size": 32,
+            "truncated": False,
+            "overwritten": False,
+        }
+
+    manifest_path = dump_dir / "args_dump.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "capture_semantics": "exact_standalone_replay",
+                "bin_file": "args.bin",
+                "args": [
+                    tensor("0x1", "input", "before_dispatch"),
+                    {
+                        "task_id": "0x1",
+                        "func_id": [4],
+                        "arg_index": 1,
+                        "role": "input",
+                        "stage": "before_dispatch",
+                        "kind": "scalar",
+                        "value": 8,
+                    },
+                    tensor("0x2", "output", "before_dispatch"),
+                    tensor("0x2", "output", "after_completion"),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="written by sibling task"):
+        generator.generate(
+            kernel,
+            "shared_storage",
+            tmp_path / "output",
+            "dav-c220",
+            run_mode="npu",
+            dump_selection=generator.DumpSelection(manifest_path, 4, task_id="0x1"),
+        )
+
+
 def test_args_dump_binds_pure_spmd_identities_from_launch_builtins(generator: ModuleType, tmp_path: Path):
     kernel = tmp_path / "spmd_kernel.cpp"
     kernel.write_text(
@@ -1072,6 +1136,80 @@ func.func @sample(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>) {
     assert main.count("aclrtMalloc((void **)&capture_storage_0Device") == 1
     assert "v0Device = reinterpret_cast<float *>(capture_storage_0Device + 0);" in main
     assert "v1Device = reinterpret_cast<float *>(capture_storage_0Device + 8);" in main
+
+
+def test_args_dump_derives_expected_input_view_from_aliased_writable_poststate(
+    generator: ModuleType, tmp_path: Path
+):
+    kernel = tmp_path / "input_output_alias.cpp"
+    kernel.write_text(
+        'extern "C" __global__ AICORE void sample(__gm__ float* v0, __gm__ float* v1) {}\n',
+        encoding="utf-8",
+    )
+    kernel.with_suffix(".pto").write_text(
+        """\
+func.func @sample(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>) {
+  %v0 = pto.make_tensor_view %arg0, shape = [%c4_index], strides = [%c1_index]
+  %v1 = pto.make_tensor_view %arg1, shape = [%c4_index], strides = [%c1_index]
+}
+""",
+        encoding="utf-8",
+    )
+    dump_dir = tmp_path / "args_dump"
+    dump_dir.mkdir()
+    before = bytes(range(16))
+    after = bytes([73] * 16)
+    (dump_dir / "args.bin").write_bytes(before + before + after)
+
+    def tensor(arg_index: int, role: str, stage: str, offset: int) -> dict:
+        return {
+            "task_id": "0x5",
+            "func_id": [7],
+            "arg_index": arg_index,
+            "role": role,
+            "stage": stage,
+            "kind": "tensor",
+            "dtype": "float32",
+            "is_contiguous": True,
+            "shape": [4],
+            "strides": [1],
+            "start_offset": 0,
+            "storage_id": "0xabc",
+            "bin_offset": offset,
+            "bin_size": 16,
+            "truncated": False,
+            "overwritten": False,
+        }
+
+    manifest_path = dump_dir / "args_dump.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "capture_semantics": "exact_standalone_replay",
+                "bin_file": "args.bin",
+                "args": [
+                    tensor(0, "input", "before_dispatch", 0),
+                    tensor(1, "output", "before_dispatch", 0),
+                    tensor(1, "output", "after_completion", 32),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    case = generator.generate(
+        kernel,
+        "input_output_alias",
+        tmp_path / "output",
+        "dav-c220",
+        run_mode="npu",
+        dump_selection=generator.DumpSelection(manifest_path, 7),
+    )
+
+    assert (case / "capture_storage_0.bin").read_bytes() == before
+    assert (case / "captured_expected" / "v0.bin").read_bytes() == after
+    assert (case / "captured_expected" / "v1.bin").read_bytes() == after
 
 
 def test_generate_sim_case_remains_single_core(generator: ModuleType, tmp_path: Path):

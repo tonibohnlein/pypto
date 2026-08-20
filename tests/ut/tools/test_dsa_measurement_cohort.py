@@ -26,7 +26,7 @@ def _case_rows(case_id: str, *, family: str = "family", parent: str = "parent") 
             "capacity": capacity,
             "arm": arm,
             "solve_status": "FEASIBLE",
-            "schedule_status": "STRAIGHT_LINE",
+            "schedule_status": "STATIC_SCHEDULE",
             "launch_status": "RUNNABLE",
             "correctness_status": "PASS",
             "endpoint_digest": f"{case_id}-{capacity}-{arm}",
@@ -37,14 +37,15 @@ def _case_rows(case_id: str, *, family: str = "family", parent: str = "parent") 
 
 
 def _write_preflight(path, rows, extra_columns=()):
-    columns = [*dsa_measurement_cohort.REQUIRED_COLUMNS, *extra_columns]
+    analysis_columns = ("schedule_status",) if "schedule_status" in rows[0] else ()
+    columns = [*dsa_measurement_cohort.REQUIRED_COLUMNS, *analysis_columns, *extra_columns]
     with path.open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=columns, delimiter="\t", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
 
-def test_construct_cohort_requires_all_arms_and_capacities():
+def test_construct_cohort_requires_all_arms_and_capacities_but_not_analysis_support():
     good = _case_rows("good")
     missing = _case_rows("missing")[:-1]
     branch = _case_rows("branch")
@@ -53,12 +54,28 @@ def test_construct_cohort_requires_all_arms_and_capacities():
     result = dsa_measurement_cohort.construct_cohort([*good, *missing, *branch], minimum=1, maximum=4)
 
     assert result["verdict"] == "COHORT_FROZEN"
-    assert [row["case_id"] for row in result["selected"]] == ["good"]
+    assert [row["case_id"] for row in result["selected"]] == ["branch", "good"]
     assert {row["case_id"]: row["status"] for row in result["audit"]} == {
-        "branch": "CONTROL_FLOW_EXCLUDED",
+        "branch": "ELIGIBLE",
         "good": "ELIGIBLE",
         "missing": "INCOMPLETE_FOUR_ARM_FOUR_CAPACITY_MATRIX",
     }
+
+
+def test_schedule_status_is_optional_analysis_metadata(tmp_path):
+    preflight = tmp_path / "preflight.tsv"
+    rows = _case_rows("case")
+    for row in rows:
+        row.pop("schedule_status")
+    columns = [column for column in dsa_measurement_cohort.REQUIRED_COLUMNS if column != "schedule_status"]
+    with preflight.open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=columns, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = dsa_measurement_cohort.freeze_cohort(preflight, tmp_path / "out", minimum=1)
+
+    assert result["verdict"] == "COHORT_FROZEN"
 
 
 def test_selection_balances_families_without_performance_data():

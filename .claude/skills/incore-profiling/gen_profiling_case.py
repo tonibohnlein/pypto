@@ -1629,14 +1629,30 @@ def _inspect_dump_tensor(
     )
 
 
-def _extract_dump_invocation(
-    selection: DumpSelection,
-    out_dir: Path,
-    params: list[Param],
-    counts: dict[str, int],
-) -> tuple[dict[str, str], dict, CapturedStorageLayout]:
-    """Materialize one exact pure-kernel invocation from a level-2 args dump."""
-    manifest_path = selection.manifest
+def _reject_sibling_writers(
+    entries: list[dict], selected_task: str, pointer_records: dict[str, CapturedTensorRecord]
+) -> None:
+    """Reject full-backing snapshots that include another task's writable view."""
+    selected_storage_ids = {record.storage_id for record in pointer_records.values()}
+    sibling_writers = sorted(
+        {
+            str(entry.get("task_id"))
+            for entry in entries
+            if entry.get("kind") == "tensor"
+            and entry.get("storage_id") in selected_storage_ids
+            and entry.get("role") in {"output", "inout"}
+            and str(entry.get("task_id")) != selected_task
+        }
+    )
+    if sibling_writers:
+        raise ValueError(
+            f"task {selected_task} uses backing storage written by sibling task(s) "
+            f"{', '.join(sibling_writers)}; a full-backing post-state is not an isolated kernel reference"
+        )
+
+
+def _read_exact_replay_manifest(manifest_path: Path) -> tuple[list[dict], Path]:
+    """Load and validate the level-2 manifest contract needed by this generator."""
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != 2 or manifest.get("capture_semantics") != "exact_standalone_replay":
         raise ValueError(
@@ -1651,6 +1667,18 @@ def _extract_dump_invocation(
     bin_path = manifest_path.parent / bin_name
     if not bin_path.is_file():
         raise FileNotFoundError(f"args-dump payload does not exist: {bin_path}")
+    return entries, bin_path
+
+
+def _extract_dump_invocation(
+    selection: DumpSelection,
+    out_dir: Path,
+    params: list[Param],
+    counts: dict[str, int],
+) -> tuple[dict[str, str], dict, CapturedStorageLayout]:
+    """Materialize one exact pure-kernel invocation from a level-2 args dump."""
+    manifest_path = selection.manifest
+    entries, bin_path = _read_exact_replay_manifest(manifest_path)
 
     selected_task, task_entries = _select_dump_task(
         entries,
@@ -1682,6 +1710,8 @@ def _extract_dump_invocation(
             pointer_records[param.name] = record
         else:
             scalar_values[param.name] = _extract_dump_scalar(task_entries, param, arg_index)
+
+    _reject_sibling_writers(entries, selected_task, pointer_records)
 
     # Discard an unused leading prefix without changing any pointer's address
     # modulo the 512-byte GM allocation/alignment period. Relative aliases and
@@ -1746,12 +1776,12 @@ def _extract_dump_invocation(
             (out_dir / file_name).write_bytes(backing)
             storages[storage_name] = (file_name, storage_size)
 
-            # Reuse the backing allocation for post-state alias validation.
-            # Expected outputs are written as logical views, so bytes outside
-            # the covered post-state ranges are deliberately irrelevant.
+            expected_backing = bytearray(backing)
             covered.clear()
             for param in storage_params:
                 record = pointer_records[param.name]
+                if record.role == "input":
+                    continue
                 current, after_raw = _coalesce_dump_tensor(
                     task_entries,
                     payload,
@@ -1765,13 +1795,18 @@ def _extract_dump_invocation(
                 if len(after_raw) != record.size_bytes:
                     raise ValueError(f"task {selected_task} expected-state size changed during import")
                 _overlay_storage(
-                    backing,
+                    expected_backing,
                     covered,
                     record.offset_bytes - storage_origin,
                     after_raw,
                     context=f"task {selected_task} expected-state for {param.name}",
                 )
-                (expected_dir / f"{param.name}.bin").write_bytes(after_raw)
+
+            for param in storage_params:
+                record = pointer_records[param.name]
+                begin = record.offset_bytes - storage_origin
+                end = begin + record.size_bytes
+                (expected_dir / f"{param.name}.bin").write_bytes(expected_backing[begin:end])
 
             storage_manifest.append(
                 {

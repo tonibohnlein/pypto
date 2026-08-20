@@ -175,9 +175,9 @@ recurrence lower bound 单独处理它们。operation duration 来自清理后�
 instruction metric 中位数，或带有明确“未校准”标签的 per-pipe fallback。因此，除非
 calibration coverage 与 loop 限制足以支持，否则这些结果不是 cycle-accurate 估计。
 
-首个设备校准 cohort 使用更严格的 `straight_line_v1` eligibility policy。它会排除
-所有包含 branch 或 loop node 的 schedule，即使 loop 具有静态边界也不例外。该过滤器只
-使用结构信息，不读取 solver objective 或既有设备结果。在冻结 cohort 前使用：
+首个 critical-path 校准子集使用 `static_loop_v1` eligibility policy。它接受具有已导出
+非负静态 trip count 的 loop，并排除 branch 与动态边界 loop。该过滤器只使用结构信息，
+不读取 solver objective 或既有设备结果。在冻结该分析子集前使用：
 
 ```bash
 python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \
@@ -186,9 +186,10 @@ python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \
 
 随后仅按“可测量性”冻结设备语料，而不按已观察到的性能或求解器目标筛选。一个
 用例必须在原生、half、q1 和 tight 四种容量下，对四个逻辑策略（几何 first-fit、
-几何 canonical greedy、Cypress 和 DSA-RP canonical greedy）都可行、无控制流、
-可运行且正确。语料冻结工具会拒绝包含时延、加速比、目标值或预测关键路径字段
-的输入表：
+几何 canonical greedy、Cypress 和 DSA-RP canonical greedy）都可行、可运行且正确。
+schedule eligibility 单独记录，并且只限制 critical-path prediction；branch 或动态 loop
+不会使可在设备上测量的用例失去资格。语料冻结工具会拒绝包含时延、加速比、目标值或预测
+关键路径字段的输入表：
 
 ```bash
 python -m pypto.tools.dsa_measurement_cohort preflight.tsv results/ \
