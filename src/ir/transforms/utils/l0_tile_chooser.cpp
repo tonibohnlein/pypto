@@ -12,12 +12,15 @@
 #include "pypto/ir/transforms/utils/l0_tile_chooser.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "pypto/core/logging.h"
@@ -511,6 +514,14 @@ int64_t L0cBudget(const L0TileConfig& cfg, const Regime& r) {
   return static_cast<int64_t>(cfg.l0c_bytes) / (static_cast<int64_t>(cfg.bytes_c) * (r.dbc ? 2 : 1));
 }
 
+int ParseExperimentInt(const std::string& text, const char* field) {
+  int value = 0;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  CHECK(error == std::errc{} && end == text.data() + text.size())
+      << "PYPTO_FORCE_L0_TILE: " << field << " must be an integer, got '" << text << "'";
+  return value;
+}
+
 }  // namespace
 
 L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
@@ -548,6 +559,86 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
       << cfg.drain_c0_bytes << ", drain_row_cycles=" << cfg.drain_row_cycles
       << ", drain_penalty_cycles=" << cfg.drain_penalty_cycles
       << ", drain_fixed_cycles=" << cfg.drain_fixed_cycles << ").";
+
+  // Experiment-only override for the L1-layout candidate-ranking study. It
+  // deliberately goes through the production legality helpers so an invalid
+  // forced point cannot become an invalid lowering. Do not promote this
+  // environment variable to a supported user interface.
+  //
+  //   PYPTO_FORCE_L0_TILE="m,n,k,stat,dbc", stat in {OS,A,B}, dbc in {0,1}
+  if (const char* force = std::getenv("PYPTO_FORCE_L0_TILE")) {
+    std::stringstream stream(force);
+    std::string token;
+    std::vector<std::string> parts;
+    while (std::getline(stream, token, ',')) parts.push_back(token);
+    CHECK(parts.size() == 5) << "PYPTO_FORCE_L0_TILE must be 'm,n,k,stat,dbc', got '" << force << "'";
+
+    const int fm = ParseExperimentInt(parts[0], "m");
+    const int fn = ParseExperimentInt(parts[1], "n");
+    const int fk = ParseExperimentInt(parts[2], "k");
+    CHECK(fm > 0 && fn > 0 && fk > 0)
+        << "PYPTO_FORCE_L0_TILE: m, n, k must be positive, got (" << fm << "," << fn << "," << fk << ")";
+    CHECK(parts[3] == "OS" || parts[3] == "A" || parts[3] == "B")
+        << "PYPTO_FORCE_L0_TILE: stat must be one of OS, A, B, got '" << parts[3] << "'";
+    CHECK(parts[4] == "0" || parts[4] == "1")
+        << "PYPTO_FORCE_L0_TILE: dbc must be 0 or 1, got '" << parts[4] << "'";
+
+    const Stationarity stat = parts[3] == "A"   ? Stationarity::kAStationary
+                              : parts[3] == "B" ? Stationarity::kBStationary
+                                                : Stationarity::kOutputStationary;
+    const Regime regime{stat, /*dbc=*/parts[4] == "1"};
+    CHECK(stat != Stationarity::kAStationary || cfg.allow_a_stationary)
+        << "PYPTO_FORCE_L0_TILE: A-stationary is disabled for this matmul";
+    CHECK(stat != Stationarity::kBStationary || cfg.allow_b_stationary)
+        << "PYPTO_FORCE_L0_TILE: B-stationary is disabled for this matmul";
+    CHECK(!regime.dbc || cfg.allow_double_buffer_c)
+        << "PYPTO_FORCE_L0_TILE: L0C double-buffering is disabled for this matmul";
+    CHECK(fm % cfg.align_m == 0 && fn % cfg.align_n == 0 && fk % cfg.align_k == 0)
+        << "PYPTO_FORCE_L0_TILE: tile must respect alignments (m,n,k)=(" << cfg.align_m << "," << cfg.align_n
+        << "," << cfg.align_k << "), got (" << fm << "," << fn << "," << fk << ")";
+    CHECK(stat == Stationarity::kOutputStationary || fk == cfg.K)
+        << "PYPTO_FORCE_L0_TILE: operand stationarity requires k==K, got k=" << fk << ", K=" << cfg.K;
+    CHECK(!regime.dbc || fk == cfg.K)
+        << "PYPTO_FORCE_L0_TILE: dbc=1 requires k==K, got k=" << fk << ", K=" << cfg.K;
+    if (regime.dbc) {
+      const bool rows_outer = PipelinedRowsOuter(fm, fn, cfg, stat);
+      const int64_t inner_full_tiles = PipelinedInnerFullTiles(fm, fn, cfg, stat);
+      CHECK(inner_full_tiles >= 2)
+          << "PYPTO_FORCE_L0_TILE: dbc=1 requires at least two full tiles on the moving inner "
+          << (rows_outer ? "N" : "M") << " axis, got " << inner_full_tiles;
+    }
+
+    const OperandDB operand_db = DeriveOperandDB(stat);
+    const int64_t a0 = L0aBudget(cfg, operand_db);
+    const int64_t b0 = L0bBudget(cfg, operand_db);
+    const int64_t c0 = L0cBudget(cfg, regime);
+    const auto legal_ks = EnumerateLegalKs(fm, fn, cfg, a0, b0);
+    CHECK(std::find(legal_ks.begin(), legal_ks.end(), fk) != legal_ks.end())
+        << "PYPTO_FORCE_L0_TILE: k=" << fk << " is illegal for (m,n)=(" << fm << "," << fn
+        << ") under the selected operand-buffer depths";
+    auto candidate = MakeCandidate(fm, fn, fk, cfg, c0, regime);
+    CHECK(candidate) << "PYPTO_FORCE_L0_TILE: forced design point is outside the problem or L0 bounds";
+
+    L0TileResult result;
+    result.m = fm;
+    result.n = fn;
+    result.k = fk;
+    result.estimated_traffic_bytes = candidate->traffic;
+    result.estimated_cost_cycles = candidate->cost_cycles;
+    result.padded_compute_volume = candidate->padded_compute;
+    result.stationarity = stat;
+    result.os_holds_a = OSHoldsHoldA(fm, fn, cfg);
+    result.double_buffer_c = regime.dbc;
+    std::stringstream hint;
+    hint << "FORCE_L0[M=" << cfg.M << ",N=" << cfg.N << ",K=" << cfg.K << "][m=" << fm << ",n=" << fn
+         << ",k=" << fk << ",stat=" << parts[3] << ",dbc=" << (regime.dbc ? 1 : 0) << "]"
+         << " load=" << std::llround(LoadCycles(fm, fn, fk, cfg, regime))
+         << " mad=" << std::llround(MadCycles(fm, fn, fk, cfg))
+         << " drain=" << std::llround(DrainCycles(fm, fn, cfg)) << " wall=" << result.estimated_cost_cycles
+         << " -- experiment-only candidate override";
+    result.perf_hint = hint.str();
+    return result;
+  }
 
   // Without padding, the problem dimensions themselves must already meet the
   // cube minimum. Callers (the pass) should pre-screen and skip with a

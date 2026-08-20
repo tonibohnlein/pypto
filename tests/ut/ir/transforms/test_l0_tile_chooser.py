@@ -164,6 +164,48 @@ class TestL0TilingDocExamples:
 class TestL0TilingEdgeCases:
     """Edge cases beyond the worked examples."""
 
+    def test_experiment_override_forces_a_legal_candidate(self, monkeypatch):
+        """The layout study can select a legal point without bypassing capacity checks."""
+        cfg = _default_config(M=128, N=128, K=512)
+        monkeypatch.setenv("PYPTO_FORCE_L0_TILE", "64,128,128,OS,0")
+
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+        assert (result.m, result.n, result.k) == (64, 128, 128)
+        assert result.stationarity == passes.l0_tile_chooser.Stationarity.OutputStationary
+        assert result.double_buffer_c is False
+        assert result.perf_hint.endswith("-- experiment-only candidate override")
+        assert _capacities_ok(result.m, result.n, result.k, cfg)
+
+    @pytest.mark.parametrize(
+        ("forced", "message"),
+        [
+            ("64,128,256,OS,0", "under the selected operand-buffer depths"),
+            ("128,128,64,OS", "must be 'm,n,k,stat,dbc'"),
+        ],
+    )
+    def test_experiment_override_rejects_bad_or_operand_overflow_points(self, monkeypatch, forced, message):
+        cfg = _default_config(M=128, N=128, K=512)
+        monkeypatch.setenv("PYPTO_FORCE_L0_TILE", forced)
+
+        with pytest.raises(ValueError, match=message):
+            passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+    def test_experiment_override_rejects_l0c_overflow(self, monkeypatch):
+        cfg = _default_config(M=256, N=256, K=128)
+        monkeypatch.setenv("PYPTO_FORCE_L0_TILE", "256,256,64,OS,0")
+
+        with pytest.raises(ValueError, match="outside the problem or L0 bounds"):
+            passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+    def test_experiment_override_rejects_dbc_without_full_k(self, monkeypatch):
+        cfg = _default_config(M=128, N=128, K=512)
+        cfg.allow_double_buffer_c = True
+        monkeypatch.setenv("PYPTO_FORCE_L0_TILE", "64,128,64,OS,1")
+
+        with pytest.raises(ValueError, match="dbc=1 requires k==K"):
+            passes.l0_tile_chooser.choose_l0_tile(cfg)
+
     def test_full_c_fits_but_k_too_small_falls_back(self):
         """M=16, N=4096: full N would force k < min_k, so n must shrink."""
         cfg = _default_config(M=16, N=4096, K=512)
