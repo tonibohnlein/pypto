@@ -208,6 +208,33 @@ labelled, uncalibrated per-pipe fallbacks. Consequently, these results are not
 cycle-accurate estimates unless their calibration coverage and loop
 limitations support that claim.
 
+The first device-calibration cohort uses the stricter `straight_line_v1`
+eligibility policy. It excludes every schedule containing a branch or loop
+node, regardless of whether a loop has a static bound. This is a timing-blind
+structural filter: it does not inspect solver objectives or prior device
+results. Qualify exported schedules before freezing that cohort with:
+
+```bash
+python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \
+    -o schedule-eligibility.json
+```
+
+The device corpus is then frozen by measurability, not by observed performance
+or solver objective. A case must be feasible, straight-line, runnable, and
+correct under all four logical policies (geometry first-fit, geometry canonical
+greedy, Cypress, and DSA-RP canonical greedy) at native, half, q1, and tight
+capacity. The cohort freezer rejects input tables containing timing, speedup,
+objective, or predicted-critical-path columns:
+
+```bash
+python -m pypto.tools.dsa_measurement_cohort preflight.tsv results/ \
+    --minimum 20 --maximum 40
+```
+
+When more than 40 cases qualify, selection is deterministic and round-robin
+across model family and parent program. Endpoint-identical logical policies are
+retained in the matrix but need only one physical measurement.
+
 Planner comparisons use paired schedule graphs and the convention
 `candidate / baseline - 1`, where a negative value predicts that the candidate
 is faster. The evaluator first requires the same operation stream in both arms,
