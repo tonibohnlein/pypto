@@ -44,7 +44,13 @@ import torch
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassDumpLevel
 from pypto.pypto_core import backend as _backend_core
-from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase, MemoryPlanner
+from pypto.pypto_core.passes import (
+    DiagnosticCheckSet,
+    DiagnosticPhase,
+    DsaReferencePlacement,
+    DsaReusePenaltyRecognizer,
+    MemoryPlanner,
+)
 
 from .device_tensor import DeviceTensor
 
@@ -323,6 +329,12 @@ class RunConfig:
             ``PassContext``, or to ``PYPTO`` when none is active.
             Forwarded to ``ir.compile()``, which rejects it when a
             ``PassContext`` is already active — set it on that context instead.
+        dsa_export_dir: Optional standalone DSA problem export directory.
+        dsa_solution_dir: Optional fingerprinted placement replay directory.
+        dsa_reuse_penalty_recognizer: Optional experimental DSA soft-edge recognizer.
+        dsa_reference_placement: Optional compact/loose research endpoint.
+        dsa_reference_target: Optional exact function selected for a loose endpoint.
+        ptoas_sync_summary_dir: Optional directory for PTOAS InsertSync JSONL summaries.
     """
 
     __test__ = False  # Not a pytest test class
@@ -362,6 +374,12 @@ class RunConfig:
     analyze_auto_scopes_for_deps: bool = False
     memory_planner: MemoryPlanner | None = None
     dump_ptoas_passes: bool = False
+    dsa_export_dir: str | None = None
+    dsa_solution_dir: str | None = None
+    dsa_reuse_penalty_recognizer: DsaReusePenaltyRecognizer | None = None
+    dsa_reference_placement: DsaReferencePlacement | None = None
+    dsa_reference_target: str | None = None
+    ptoas_sync_summary_dir: str | None = None
 
     def __post_init__(self) -> None:
         if self.platform not in ("a2a3sim", "a2a3", "a5sim", "a5"):
@@ -581,6 +599,13 @@ def compile_program(  # noqa: PLR0913
     analyze_auto_scopes_for_deps: bool = False,
     memory_planner: MemoryPlanner | None = None,
     enable_pypto_l0c_double_buffer: bool | None = None,
+    dsa_export_dir: str | None = None,
+    dsa_solution_dir: str | None = None,
+    dsa_reuse_penalty_recognizer: DsaReusePenaltyRecognizer | None = None,
+    dsa_reference_placement: DsaReferencePlacement | None = None,
+    dsa_reference_target: str | None = None,
+    ptoas_sync_summary_dir: str | None = None,
+    skip_ptoas: bool = False,
 ) -> None:
     """Compile *program* to *work_dir* and patch orchestration headers.
 
@@ -605,6 +630,13 @@ def compile_program(  # noqa: PLR0913
         enable_pypto_l0c_double_buffer: Opt the legacy ``PYPTO`` planner in to
             chooser-emitted dbC=2. Ignored under ``DSA_RP`` and ``PTOAS``, where
             chooser dbC is automatic.
+        dsa_export_dir: Optional standalone DSA problem export directory.
+        dsa_solution_dir: Optional fingerprinted placement replay directory.
+        dsa_reuse_penalty_recognizer: Optional experimental soft-edge recognizer.
+        dsa_reference_placement: Optional compact/loose research endpoint.
+        dsa_reference_target: Optional exact function selected for a loose endpoint.
+        ptoas_sync_summary_dir: Optional directory for PTOAS InsertSync summaries.
+        skip_ptoas: Stop after PTO source generation without assembling kernels.
     """
     from pypto import ir  # noqa: PLC0415
 
@@ -621,6 +653,13 @@ def compile_program(  # noqa: PLR0913
         analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
         memory_planner=memory_planner,
         enable_pypto_l0c_double_buffer=enable_pypto_l0c_double_buffer,
+        dsa_export_dir=dsa_export_dir,
+        dsa_solution_dir=dsa_solution_dir,
+        dsa_reuse_penalty_recognizer=dsa_reuse_penalty_recognizer,
+        dsa_reference_placement=dsa_reference_placement,
+        dsa_reference_target=dsa_reference_target,
+        ptoas_sync_summary_dir=ptoas_sync_summary_dir,
+        skip_ptoas=skip_ptoas,
     )
     _patch_orchestration_headers(work_dir)
 
@@ -674,6 +713,13 @@ def run(
         profiling=config.compile_profiling,
         analyze_auto_scopes_for_deps=config.analyze_auto_scopes_for_deps,
         memory_planner=config.memory_planner,
+        dsa_export_dir=config.dsa_export_dir,
+        dsa_solution_dir=config.dsa_solution_dir,
+        dsa_reuse_penalty_recognizer=config.dsa_reuse_penalty_recognizer,
+        dsa_reference_placement=config.dsa_reference_placement,
+        dsa_reference_target=config.dsa_reference_target,
+        ptoas_sync_summary_dir=config.ptoas_sync_summary_dir,
+        skip_ptoas=config.codegen_only,
     )
 
     if tensors and not config.codegen_only:

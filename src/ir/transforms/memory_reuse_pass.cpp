@@ -1405,6 +1405,7 @@ LifetimeAnalysisResult AnalyzeAllocationLifetimesImpl(const StmtPtr& func_body,
     // Compute MERGED lifetime for all variables in the sharing group
     int min_def_point = INT_MAX;
     int max_last_use = INT_MIN;
+    uint64_t max_size = 0;
 
     for (const auto& group_var : sharing_group) {
       int def_point = result.var_def_order.count(group_var) ? result.var_def_order.at(group_var) : 0;
@@ -1414,6 +1415,12 @@ LifetimeAnalysisResult AnalyzeAllocationLifetimesImpl(const StmtPtr& func_body,
 
       min_def_point = std::min(min_def_point, def_point);
       max_last_use = std::max(max_last_use, last_use);
+
+      auto group_tile_type = As<TileType>(group_var->GetType());
+      INTERNAL_CHECK_SPAN(group_tile_type != nullptr && group_tile_type->memref_.has_value(),
+                          group_var->span_)
+          << "Expected every allocation sharing-group member to carry a MemRef";
+      max_size = std::max(max_size, group_tile_type->memref_.value()->size_);
     }
 
     LifetimeInterval interval;

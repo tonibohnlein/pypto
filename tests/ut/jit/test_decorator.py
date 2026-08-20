@@ -41,7 +41,7 @@ from pypto.jit.decorator import (
 )
 from pypto.jit.specializer import DynDim, Specializer, TensorMeta
 from pypto.language.parser.diagnostics.exceptions import ParserTypeError
-from pypto.pypto_core import DataType, InternalError, ir
+from pypto.pypto_core import DataType, InternalError, ir, passes
 from pypto.runtime.runner import RunConfig
 
 # ---------------------------------------------------------------------------
@@ -2371,6 +2371,14 @@ class TestCompileKwargForwarding:
             compile_profiling=True,
             save_kernels_dir=str(artifacts_dir),
             analyze_auto_scopes_for_deps=True,
+            codegen_only=True,
+            memory_planner=passes.MemoryPlanner.DSA,
+            dsa_export_dir="export",
+            dsa_solution_dir="solutions",
+            dsa_reuse_penalty_recognizer=passes.DsaReusePenaltyRecognizer.QUADRATIC,
+            dsa_reference_placement=passes.DsaReferencePlacement.LOOSE,
+            dsa_reference_target="kernel",
+            ptoas_sync_summary_dir="sync",
         )
         kwargs = _run_config_compile_kwargs(cfg)
         assert kwargs["strategy"] == OptimizationStrategy.Default
@@ -2379,6 +2387,14 @@ class TestCompileKwargForwarding:
         assert kwargs["profiling"] is True  # mapped from RunConfig.compile_profiling
         assert kwargs["output_dir"] == str(artifacts_dir)  # from RunConfig.save_kernels_dir
         assert kwargs["analyze_auto_scopes_for_deps"] is True
+        assert kwargs["skip_ptoas"] is True
+        assert kwargs["memory_planner"] == passes.MemoryPlanner.DSA
+        assert kwargs["dsa_export_dir"] == "export"
+        assert kwargs["dsa_solution_dir"] == "solutions"
+        assert kwargs["dsa_reuse_penalty_recognizer"] == passes.DsaReusePenaltyRecognizer.QUADRATIC
+        assert kwargs["dsa_reference_placement"] == passes.DsaReferencePlacement.LOOSE
+        assert kwargs["dsa_reference_target"] == "kernel"
+        assert kwargs["ptoas_sync_summary_dir"] == "sync"
         assert "diagnostic_phase" in kwargs
         assert "disabled_diagnostics" in kwargs
         # backend_type is derived from `platform` by ir.compile(); not forwarded.

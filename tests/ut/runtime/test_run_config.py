@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from pypto.backend import BackendType
-from pypto.pypto_core.passes import MemoryPlanner
+from pypto.pypto_core.passes import DsaReferencePlacement, DsaReusePenaltyRecognizer, MemoryPlanner
 from pypto.runtime.runner import RunConfig, _DfxOpts, compile_program, execute_compiled, run
 
 
@@ -666,6 +666,42 @@ class TestRunConfigCompileForwarding:
         run(object(), config=RunConfig(platform="a2a3sim", memory_planner=MemoryPlanner.DSA_RP))
 
         assert captured["memory_planner"] == MemoryPlanner.DSA_RP
+
+    def test_run_forwards_dsa_research_controls(self, monkeypatch):
+        captured: dict = {}
+
+        class FakeCompiled:
+            def __call__(self, *_args, **_kwargs):
+                return None
+
+        def fake_compile(_program, **kwargs):
+            captured.update(kwargs)
+            return FakeCompiled()
+
+        import pypto.ir as ir_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(ir_mod, "compile", fake_compile)
+        run(
+            object(),
+            config=RunConfig(
+                platform="a2a3sim",
+                memory_planner=MemoryPlanner.DSA,
+                dsa_export_dir="export",
+                dsa_solution_dir="solutions",
+                dsa_reuse_penalty_recognizer=DsaReusePenaltyRecognizer.QUADRATIC,
+                dsa_reference_placement=DsaReferencePlacement.LOOSE,
+                dsa_reference_target="kernel",
+                ptoas_sync_summary_dir="sync",
+            ),
+        )
+
+        assert captured["memory_planner"] == MemoryPlanner.DSA
+        assert captured["dsa_export_dir"] == "export"
+        assert captured["dsa_solution_dir"] == "solutions"
+        assert captured["dsa_reuse_penalty_recognizer"] == DsaReusePenaltyRecognizer.QUADRATIC
+        assert captured["dsa_reference_placement"] == DsaReferencePlacement.LOOSE
+        assert captured["dsa_reference_target"] == "kernel"
+        assert captured["ptoas_sync_summary_dir"] == "sync"
 
     def test_run_forwards_ptoas_pass_dump(self, monkeypatch):
         captured: dict = {}

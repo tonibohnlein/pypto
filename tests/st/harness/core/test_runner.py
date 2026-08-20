@@ -423,13 +423,23 @@ def _compile_for_cache(
         analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
         memory_planner=_resolve_case_memory_planner(test_case, session_memory_planner),
         enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer(),
+        dsa_export_dir=_optional_case_value(test_case, "get_dsa_export_dir"),
+        dsa_solution_dir=_optional_case_value(test_case, "get_dsa_solution_dir"),
+        dsa_reuse_penalty_recognizer=_optional_case_value(test_case, "get_dsa_reuse_penalty_recognizer"),
+        dsa_reference_placement=_optional_case_value(test_case, "get_dsa_reference_placement"),
+        dsa_reference_target=_optional_case_value(test_case, "get_dsa_reference_target"),
+        ptoas_sync_summary_dir=_optional_case_value(test_case, "get_ptoas_sync_summary_dir"),
+        skip_ptoas=codegen_only,
     )
     # External kernels are referenced in the manifest at their original path
     # (not copied into the artifact), so accept them even when no kernel .cpp is
     # generated under kernels/.
     config_path = work_dir / "kernel_config.py"
     kernels_in_manifest = config_path.exists() and '"func_id"' in config_path.read_text()
-    if not list((work_dir / "kernels").rglob("*.cpp")) and not kernels_in_manifest:
+    generated_kernels = list((work_dir / "kernels").rglob("*.cpp"))
+    if codegen_only:
+        generated_kernels.extend((work_dir / "kernels").rglob("*.pto"))
+    if not generated_kernels and not kernels_in_manifest:
         raise ValueError(f"No kernels generated for {test_case.get_name()}")
     if not list((work_dir / "orchestration").glob("*.cpp")):
         raise ValueError(
@@ -1086,6 +1096,7 @@ def start_pipeline(  # noqa: PLR0913
     task_queue_timeout: int = 1800,
     task_submit_device: str = "auto",
     execute_batch_size: int = 64,
+    memory_planner: MemoryPlanner | None = None,
 ) -> None:
     """Spin up the compile pipeline and populate :data:`_compile_futures`.
 
@@ -1456,6 +1467,15 @@ class TestRunner:
                 analyze_auto_scopes_for_deps=self.config.analyze_auto_scopes_for_deps,
                 memory_planner=_resolve_case_memory_planner(test_case, self.config.memory_planner),
                 enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer(),
+                dsa_export_dir=_optional_case_value(test_case, "get_dsa_export_dir"),
+                dsa_solution_dir=_optional_case_value(test_case, "get_dsa_solution_dir"),
+                dsa_reuse_penalty_recognizer=_optional_case_value(
+                    test_case, "get_dsa_reuse_penalty_recognizer"
+                ),
+                dsa_reference_placement=_optional_case_value(test_case, "get_dsa_reference_placement"),
+                dsa_reference_target=_optional_case_value(test_case, "get_dsa_reference_target"),
+                ptoas_sync_summary_dir=_optional_case_value(test_case, "get_ptoas_sync_summary_dir"),
+                skip_ptoas=self.config.codegen_only,
             )
 
             # External kernels are referenced in the manifest at their original
@@ -1463,7 +1483,10 @@ class TestRunner:
             # kernel .cpp is generated under kernels/.
             config_path = work_dir / "kernel_config.py"
             kernels_in_manifest = config_path.exists() and '"func_id"' in config_path.read_text()
-            if not list((work_dir / "kernels").rglob("*.cpp")) and not kernels_in_manifest:
+            generated_kernels = list((work_dir / "kernels").rglob("*.cpp"))
+            if self.config.codegen_only:
+                generated_kernels.extend((work_dir / "kernels").rglob("*.pto"))
+            if not generated_kernels and not kernels_in_manifest:
                 raise ValueError(f"No kernels generated for {test_name}")
             if not list((work_dir / "orchestration").glob("*.cpp")):
                 raise ValueError(

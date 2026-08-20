@@ -74,6 +74,11 @@ def _validate_pass_context_conflicts(
     diagnostic_phase: _passes.DiagnosticPhase | None,
     memory_planner: _passes.MemoryPlanner | None,
     runtime: _passes.RuntimeKind | None = None,
+    dsa_export_dir: str | None = None,
+    dsa_solution_dir: str | None = None,
+    dsa_reuse_penalty_recognizer: _passes.DsaReusePenaltyRecognizer | None = None,
+    dsa_reference_placement: _passes.DsaReferencePlacement | None = None,
+    dsa_reference_target: str | None = None,
 ) -> _passes.PassContext | None:
     """Reject explicit pass settings that conflict with an active context."""
     outer = _passes.PassContext.current()
@@ -97,6 +102,19 @@ def _validate_pass_context_conflicts(
             f"{operation}() was called with runtime while a PassContext is already active. "
             "Set the runtime on the existing PassContext instead."
         )
+    research_settings = {
+        "dsa_export_dir": dsa_export_dir,
+        "dsa_solution_dir": dsa_solution_dir,
+        "dsa_reuse_penalty_recognizer": dsa_reuse_penalty_recognizer,
+        "dsa_reference_placement": dsa_reference_placement,
+        "dsa_reference_target": dsa_reference_target,
+    }
+    for name, value in research_settings.items():
+        if value is not None and outer is not None:
+            raise RuntimeError(
+                f"{operation}() was called with {name} while a PassContext is already active. "
+                f"Set {name} on the existing PassContext instead."
+            )
     return outer
 
 
@@ -113,6 +131,11 @@ def _run_pass_pipeline(  # noqa: PLR0913
     memory_planner: _passes.MemoryPlanner | None = None,
     enable_pypto_l0c_double_buffer: bool | None = None,
     runtime: _passes.RuntimeKind | None = None,
+    dsa_export_dir: str | None = None,
+    dsa_solution_dir: str | None = None,
+    dsa_reuse_penalty_recognizer: _passes.DsaReusePenaltyRecognizer | None = None,
+    dsa_reference_placement: _passes.DsaReferencePlacement | None = None,
+    dsa_reference_target: str | None = None,
     analyze_auto_scopes_for_deps: bool = False,
     extra_instruments: tuple[_passes.PassInstrument, ...] = (),
     inherit_outer_report_instruments: bool = True,
@@ -127,6 +150,11 @@ def _run_pass_pipeline(  # noqa: PLR0913
         diagnostic_phase=diagnostic_phase,
         memory_planner=memory_planner,
         runtime=runtime,
+        dsa_export_dir=dsa_export_dir,
+        dsa_solution_dir=dsa_solution_dir,
+        dsa_reuse_penalty_recognizer=dsa_reuse_penalty_recognizer,
+        dsa_reference_placement=dsa_reference_placement,
+        dsa_reference_target=dsa_reference_target,
     )
 
     default_disabled = _passes.DiagnosticCheckSet()
@@ -152,6 +180,21 @@ def _run_pass_pipeline(  # noqa: PLR0913
             else outer.get_enable_pypto_l0c_double_buffer()
         )
         rt = runtime if runtime is not None else outer.get_runtime()
+        export_dir = dsa_export_dir if dsa_export_dir is not None else outer.get_dsa_export_dir()
+        solution_dir = dsa_solution_dir if dsa_solution_dir is not None else outer.get_dsa_solution_dir()
+        reuse_recognizer = (
+            dsa_reuse_penalty_recognizer
+            if dsa_reuse_penalty_recognizer is not None
+            else outer.get_dsa_reuse_penalty_recognizer()
+        )
+        reference_placement = (
+            dsa_reference_placement
+            if dsa_reference_placement is not None
+            else outer.get_dsa_reference_placement()
+        )
+        reference_target = (
+            dsa_reference_target if dsa_reference_target is not None else outer.get_dsa_reference_target()
+        )
     else:
         instruments = list(extra_instruments)
         vlevel = (
@@ -162,7 +205,25 @@ def _run_pass_pipeline(  # noqa: PLR0913
         mplan = memory_planner if memory_planner is not None else _passes.MemoryPlanner.PYPTO
         dbc_flag = enable_pypto_l0c_double_buffer if enable_pypto_l0c_double_buffer is not None else False
         rt = runtime if runtime is not None else _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
-    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled, mplan, dbc_flag, rt)
+        export_dir = dsa_export_dir
+        solution_dir = dsa_solution_dir
+        reuse_recognizer = dsa_reuse_penalty_recognizer or _passes.DsaReusePenaltyRecognizer.DISABLED
+        reference_placement = dsa_reference_placement or _passes.DsaReferencePlacement.DEFAULT
+        reference_target = dsa_reference_target
+    ctx = _passes.PassContext(
+        instruments,
+        vlevel,
+        dphase,
+        disabled,
+        mplan,
+        dbc_flag,
+        rt,
+        export_dir,
+        solution_dir,
+        reuse_recognizer,
+        reference_placement,
+        reference_target,
+    )
 
     if mplan == _passes.MemoryPlanner.PTOAS:
         logger.warning(
@@ -218,6 +279,12 @@ def compile(  # noqa: PLR0913
     # Appended, not inserted: every parameter above is positional, so slotting a
     # new one in the middle would silently rebind existing positional callers.
     runtime: _passes.RuntimeKind | None = None,
+    dsa_export_dir: str | None = None,
+    dsa_solution_dir: str | None = None,
+    dsa_reuse_penalty_recognizer: _passes.DsaReusePenaltyRecognizer | None = None,
+    dsa_reference_placement: _passes.DsaReferencePlacement | None = None,
+    dsa_reference_target: str | None = None,
+    ptoas_sync_summary_dir: str | None = None,
 ) -> "CompiledProgram | DistributedCompiledProgram":
     """Compile a Program through passes and codegen.
 
@@ -303,6 +370,12 @@ def compile(  # noqa: PLR0913
             ``PassContext``. Its wire name is written to
             ``RUNTIME_CONFIG["runtime"]`` in the generated ``kernel_config.py``
             and is what a ``ChipWorker`` must match to bind the program.
+        dsa_export_dir: Optional standalone DSA problem export directory.
+        dsa_solution_dir: Optional fingerprinted placement replay directory.
+        dsa_reuse_penalty_recognizer: Optional experimental soft-edge recognizer.
+        dsa_reference_placement: Optional compact/loose research endpoint.
+        dsa_reference_target: Optional exact function selected for a loose endpoint.
+        ptoas_sync_summary_dir: Optional directory for PTOAS InsertSync JSONL summaries.
 
     Returns:
         A :class:`CompiledProgram` that wraps the output directory and can
@@ -335,6 +408,11 @@ def compile(  # noqa: PLR0913
         diagnostic_phase=diagnostic_phase,
         memory_planner=memory_planner,
         runtime=runtime,
+        dsa_export_dir=dsa_export_dir,
+        dsa_solution_dir=dsa_solution_dir,
+        dsa_reuse_penalty_recognizer=dsa_reuse_penalty_recognizer,
+        dsa_reference_placement=dsa_reference_placement,
+        dsa_reference_target=dsa_reference_target,
     )
 
     # --- Compile profiling ---------------------------------------------------
@@ -367,6 +445,11 @@ def compile(  # noqa: PLR0913
             memory_planner=memory_planner,
             enable_pypto_l0c_double_buffer=enable_pypto_l0c_double_buffer,
             runtime=runtime,
+            dsa_export_dir=dsa_export_dir,
+            dsa_solution_dir=dsa_solution_dir,
+            dsa_reuse_penalty_recognizer=dsa_reuse_penalty_recognizer,
+            dsa_reference_placement=dsa_reference_placement,
+            dsa_reference_target=dsa_reference_target,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
             extra_instruments=(report_instrument,),
             dump_passes=dump_passes,
@@ -389,6 +472,7 @@ def compile(  # noqa: PLR0913
                     emit_source_loc=emit_source_loc,
                     dump_ptoas_passes=dump_ptoas_passes,
                     runtime=effective_runtime,
+                    ptoas_sync_summary_dir=ptoas_sync_summary_dir,
                 )
         except PartialCodegenError as exc:
             _write_files(exc.files, output_dir)

@@ -17,6 +17,10 @@ from pypto.jit.cache import (
     make_cache_key,
 )
 from pypto.jit.decorator import (
+    _resolve_dsa_reference_placement,
+    _resolve_dsa_reference_target,
+    _resolve_dsa_reuse_penalty_recognizer,
+    _resolve_dsa_solution_dir,
     _resolve_enable_pypto_l0c_double_buffer,
     _resolve_memory_planner,
     _resolve_runtime,
@@ -71,6 +75,11 @@ class TestMakeCacheKey:
         tensor_layouts=None,
         dep_layouts=(),
         runtime=passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+        dsa_solution_dir=None,
+        dsa_reuse_penalty_recognizer=None,
+        dsa_reference_placement=None,
+        dsa_reference_target=None,
+        ptoas_sync_summary_dir=None,
     ):
         return make_cache_key(
             source_hash=source_hash,
@@ -88,6 +97,11 @@ class TestMakeCacheKey:
             tensor_layouts=tensor_layouts,
             dep_layouts=dep_layouts,
             runtime=runtime,
+            dsa_solution_dir=dsa_solution_dir,
+            dsa_reuse_penalty_recognizer=dsa_reuse_penalty_recognizer,
+            dsa_reference_placement=dsa_reference_placement,
+            dsa_reference_target=dsa_reference_target,
+            ptoas_sync_summary_dir=ptoas_sync_summary_dir,
         )
 
     def test_basic_key_structure(self):
@@ -113,6 +127,11 @@ class TestMakeCacheKey:
             ("dep_layouts", ()),
             ("closure_constants", ()),
             ("runtime", "tensormap_and_ringbuffer"),
+            ("dsa_solution_dir", None),
+            ("dsa_reuse_penalty_recognizer", None),
+            ("dsa_reference_placement", None),
+            ("dsa_reference_target", None),
+            ("ptoas_sync_summary_dir", None),
         )
 
     def test_tensor_shape_in_key(self):
@@ -441,6 +460,21 @@ class TestMakeCacheKey:
         key_hbg = self._make_key(**kwargs, runtime=passes.RuntimeKind.HOST_BUILD_GRAPH)
         assert key_tmrb != key_hbg, "runtime must split the cache key"
 
+    def test_dsa_research_controls_split_key(self):
+        baseline = self._make_key()
+        variants = [
+            self._make_key(dsa_solution_dir="placement-a"),
+            self._make_key(dsa_reuse_penalty_recognizer=passes.DsaReusePenaltyRecognizer.QUADRATIC),
+            self._make_key(dsa_reference_placement=passes.DsaReferencePlacement.COMPACT),
+            self._make_key(
+                dsa_reference_placement=passes.DsaReferencePlacement.LOOSE,
+                dsa_reference_target="kernel-a",
+            ),
+            self._make_key(ptoas_sync_summary_dir="sync-a"),
+        ]
+        assert all(key != baseline for key in variants)
+        assert len(set(variants)) == len(variants)
+
 
 class TestResolveRuntime:
     """The runtime the JIT keys on must match the one ``ir.compile()`` will use."""
@@ -453,6 +487,20 @@ class TestResolveRuntime:
         # context is the sole source the cache key can consult.
         with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
             assert _resolve_runtime() == passes.RuntimeKind.HOST_BUILD_GRAPH
+
+
+def test_dsa_research_controls_resolve_from_active_context():
+    with passes.PassContext(
+        [],
+        dsa_solution_dir="solutions",
+        dsa_reuse_penalty_recognizer=passes.DsaReusePenaltyRecognizer.QUADRATIC,
+        dsa_reference_placement=passes.DsaReferencePlacement.LOOSE,
+        dsa_reference_target="kernel",
+    ):
+        assert _resolve_dsa_solution_dir(None) == "solutions"
+        assert _resolve_dsa_reuse_penalty_recognizer(None) == passes.DsaReusePenaltyRecognizer.QUADRATIC
+        assert _resolve_dsa_reference_placement(None) == passes.DsaReferencePlacement.LOOSE
+        assert _resolve_dsa_reference_target(None) == "kernel"
 
 
 class TestResolveMemoryPlanner:
