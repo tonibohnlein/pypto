@@ -148,6 +148,11 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     tensor_layouts: dict[str, "TensorLayout | None"] | None = None,
     dep_layouts: tuple[tuple[str, str, str], ...] = (),
     runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+    dsa_solution_dir: str | None = None,
+    dsa_reuse_penalty_recognizer: Any = None,
+    dsa_reference_placement: Any = None,
+    dsa_reference_target: str | None = None,
+    ptoas_sync_summary_dir: str | None = None,
 ) -> CacheKey:
     """Build a cache key for a JIT call site.
 
@@ -209,6 +214,11 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
             artifact's ``kernel_config.py`` and decides which worker can bind
             the program; without it a ``host_build_graph`` call would silently
             reuse a ``tensormap_and_ringbuffer`` artifact.
+        dsa_solution_dir: Placement replay directory, if any.
+        dsa_reuse_penalty_recognizer: Experimental soft-edge recognizer.
+        dsa_reference_placement: Experimental compact/loose endpoint.
+        dsa_reference_target: Exact function selected for a loose endpoint.
+        ptoas_sync_summary_dir: InsertSync summary output directory, if any.
 
     Returns:
         Hashable CacheKey tuple.
@@ -248,6 +258,17 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         ("enable_pypto_l0c_double_buffer", effective_pypto_dbc),
         ("dep_layouts", dep_layouts),
         ("runtime", runtime_kind_to_name(runtime)),
+        ("dsa_solution_dir", dsa_solution_dir),
+        (
+            "dsa_reuse_penalty_recognizer",
+            None if dsa_reuse_penalty_recognizer is None else str(dsa_reuse_penalty_recognizer),
+        ),
+        (
+            "dsa_reference_placement",
+            None if dsa_reference_placement is None else str(dsa_reference_placement),
+        ),
+        ("dsa_reference_target", dsa_reference_target),
+        ("ptoas_sync_summary_dir", ptoas_sync_summary_dir),
     )
     return (
         source_hash,
