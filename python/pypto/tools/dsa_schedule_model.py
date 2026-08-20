@@ -1293,33 +1293,41 @@ def _resolve_schedule_record(path: Path, function: str | None) -> tuple[dict[str
     return records[function], function
 
 
-def classify_straight_line_schedule(record: Mapping[str, Any]) -> dict[str, Any]:
-    """Classify whether a schedule has no structured control-flow nodes.
-
-    The first device calibration cohort deliberately excludes every branch and
-    loop rather than approximating their execution frequency.  This predicate
-    depends only on the exported schedule structure; it never reads solver
-    objectives or device timings.
-    """
+def classify_static_schedule(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify schedules whose execution count is statically determined."""
     nodes = [node for node in record.get("nodes", []) if isinstance(node, Mapping)]
     operation_ids = [node.get("id") for node in nodes if node.get("kind") == "operation"]
     branch_ids = [node.get("id") for node in nodes if node.get("kind") == "branch"]
     loop_ids = [node.get("id") for node in nodes if node.get("kind") == "loop"]
-    control_flow_ids = [*branch_ids, *loop_ids]
+    dynamic_loop_ids = [
+        node.get("id")
+        for node in nodes
+        if node.get("kind") == "loop"
+        and node.get("loop_kind") == "LOOP_BEGIN"
+        and (type(node.get("static_trip_count")) is not int or node["static_trip_count"] < 0)
+    ]
+    if branch_ids:
+        status = "BRANCH_EXCLUDED"
+    elif dynamic_loop_ids:
+        status = "DYNAMIC_LOOP_EXCLUDED"
+    else:
+        status = "STATIC_SCHEDULE"
     return {
-        "policy": "straight_line_v1",
-        "eligible": not control_flow_ids,
-        "status": "STRAIGHT_LINE" if not control_flow_ids else "CONTROL_FLOW_EXCLUDED",
+        "policy": "static_loop_v1",
+        "eligible": status == "STATIC_SCHEDULE",
+        "status": status,
         "operation_count": len(operation_ids),
         "branch_node_count": len(branch_ids),
         "loop_node_count": len(loop_ids),
+        "dynamic_loop_node_count": len(dynamic_loop_ids),
         "branch_node_ids": branch_ids,
         "loop_node_ids": loop_ids,
+        "dynamic_loop_node_ids": dynamic_loop_ids,
     }
 
 
 def qualify_schedule_files(paths: Sequence[str | Path]) -> dict[str, Any]:
-    """Return timing-blind straight-line eligibility for schedule graphs."""
+    """Return timing-blind static-schedule eligibility for schedule graphs."""
     rows: list[dict[str, Any]] = []
     for raw_path in paths:
         path = Path(raw_path)
@@ -1330,12 +1338,12 @@ def qualify_schedule_files(paths: Sequence[str | Path]) -> dict[str, Any]:
                     "source": str(path.resolve()),
                     "source_sha256": source_sha256,
                     "function": function,
-                    **classify_straight_line_schedule(record),
+                    **classify_static_schedule(record),
                 }
             )
     return {
         "schema_version": 1,
-        "selection_policy": "straight_line_v1",
+        "selection_policy": "static_loop_v1",
         "timing_blind": True,
         "schedule_count": len(rows),
         "eligible_count": sum(row["eligible"] for row in rows),

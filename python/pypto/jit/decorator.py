@@ -2399,10 +2399,11 @@ class JITFunction:
         ``_bind_args``; reused here so ``_resolve_dep_call_metadata``
         doesn't re-walk the dep graph on every cache miss.
 
-        ``ir_compile_kwargs`` are forwarded verbatim to ``ir.compile()`` —
-        compile-side knobs (``strategy``, ``dump_passes``, ``output_dir``,
-        ``profiling``, diagnostics, ...) that the JIT caller derives from a
-        ``RunConfig`` via ``_run_config_compile_kwargs``.
+        ``ir_compile_kwargs`` are forwarded to ``ir.compile()``. The JIT caller
+        derives compile-side knobs (``strategy``, ``dump_passes``,
+        ``output_dir``, ``profiling``, diagnostics, ...) from a ``RunConfig``
+        via :func:`_run_config_compile_kwargs`; an explicit ``skip_ptoas`` in
+        that mapping overrides environment-based PTOAS discovery.
         """
         from pypto.ir.compile import compile as ir_compile  # noqa: PLC0415
 
@@ -2413,7 +2414,7 @@ class JITFunction:
         rename_map = specializer.rename_map
         try:
             parsed = pl.parse(source, filename=self._diagnostic_filename, source_map=specializer.source_map)
-            skip_ptoas = not _ptoas_available()
+            skip_ptoas = ir_compile_kwargs.pop("skip_ptoas", not _ptoas_available())
             return ir_compile(parsed, skip_ptoas=skip_ptoas, platform=platform, **ir_compile_kwargs)
         except Exception as exc:
             rewritten = _rewrite_jit_error(exc, rename_map)

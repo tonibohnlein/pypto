@@ -2568,6 +2568,40 @@ class TestCompileKwargForwarding:
         assert set(captured) == {"skip_ptoas", "platform"}
         assert captured["platform"] is None
 
+    def test_codegen_only_forwards_skip_ptoas_once(self, monkeypatch):
+        """The codegen-only JIT path supplies one authoritative skip_ptoas value."""
+        ir_compile_mod = importlib.import_module("pypto.ir.compile")
+
+        @jit
+        def codegen_only_kernel(x: pl.Tensor, out: pl.Out[pl.Tensor]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                t = pl.load(x, [0, 0], [128, 128])
+                pl.store(t, [0, 0], out)
+            return out
+
+        captured: dict = {}
+
+        def fake_compile(_program, **kwargs):
+            captured.update(kwargs)
+            return "fake"
+
+        monkeypatch.setattr(ir_compile_mod, "compile", fake_compile)
+
+        result = codegen_only_kernel._compile(
+            tensor_meta={
+                "x": TensorMeta((128, 128), DataType.FP32),
+                "out": TensorMeta((128, 128), DataType.FP32),
+            },
+            scalar_values={},
+            scalar_dtypes={},
+            per_func_dyn={id(codegen_only_kernel._func): {}},
+            pl=pl,
+            **_run_config_compile_kwargs(RunConfig(codegen_only=True)),
+        )
+
+        assert result == "fake"
+        assert captured["skip_ptoas"] is True
+
 
 # ---------------------------------------------------------------------------
 # Source provenance: diagnostics map back to the user's real .py (Issue #1612)

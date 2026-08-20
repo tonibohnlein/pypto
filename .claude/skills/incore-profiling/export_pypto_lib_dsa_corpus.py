@@ -14,6 +14,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import runpy
 import shutil
 import subprocess
@@ -52,6 +53,28 @@ def semantic_problem_fingerprint(document: dict[str, Any]) -> str:
 
 def _slug(value: str) -> str:
     return "".join(character if character.isalnum() else "_" for character in value).strip("_")
+
+
+def inspect_driver_structure(build_root: Path) -> dict[str, int | str]:
+    """Count generated orchestration submit sites and emitted kernels."""
+    orchestration_files = sorted(build_root.rglob("orchestration/*.cpp"))
+    submit_sites = sum(
+        len(re.findall(r"\brt_submit_(?:aiv|aic|mix)_task\s*\(", path.read_text(encoding="utf-8")))
+        for path in orchestration_files
+    )
+    emitted_kernels = sum(1 for _ in build_root.rglob("kernels/**/*.pto"))
+    if submit_sites == 1:
+        driver_mode = "SINGLE_SUBMIT_SITE_CANDIDATE"
+    elif submit_sites > 1:
+        driver_mode = "MULTI_SUBMIT_PARENT"
+    else:
+        driver_mode = "NO_EMITTED_SUBMIT"
+    return {
+        "orchestration_files": len(orchestration_files),
+        "submit_sites": submit_sites,
+        "emitted_kernels": emitted_kernels,
+        "driver_mode": driver_mode,
+    }
 
 
 def read_export_plan(manifest: Path, requested_platform: str) -> list[tuple[str, str]]:
@@ -116,15 +139,11 @@ def _patch_golden(
     golden.run_jit = wrap(golden.run_jit, jit=True)
 
 
-def _patch_compile_for_test(jit_decorator: Any, passes: Any, export_root: Path) -> None:
-    """Export programs compiled directly through ``JITFunction.compile_for_test``.
-
-    PyPTO-Lib has two compile-only drivers that intentionally bypass the golden
-    harness.  ``compile_for_test`` has no RunConfig argument, but it is specified
-    to inherit an ambient PassContext.  Wrapping only that entry point keeps the
-    production driver unchanged while exercising the same DSA pipeline.
-    """
-    original = jit_decorator.JITFunction.compile_for_test
+def _patch_compile_for_test(jit_decorator: Any, passes: Any, export_root: Path) -> bool:
+    """Patch the optional direct-compilation API when the loaded PyPTO exposes it."""
+    original = getattr(jit_decorator.JITFunction, "compile_for_test", None)
+    if original is None:
+        return False
     call_index = 0
 
     def compile_for_test(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -141,6 +160,7 @@ def _patch_compile_for_test(jit_decorator: Any, passes: Any, export_root: Path) 
             return original(self, *args, **kwargs)
 
     jit_decorator.JITFunction.compile_for_test = compile_for_test
+    return True
 
 
 def run_one(script: Path, export_root: Path, platform: str) -> int:
@@ -262,6 +282,18 @@ def _classify_export_status(status: str, problem_count: int) -> str:
     return status
 
 
+def _write_status_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Atomically checkpoint completed drivers so interruption loses no census data."""
+    if not rows:
+        return
+    pending = path.with_suffix(f"{path.suffix}.pending")
+    with pending.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=list(rows[0]), delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    pending.replace(path)
+
+
 def export_corpus(args: argparse.Namespace) -> int:
     args.output_root = args.output_root.resolve()
     args.pypto_lib_root = args.pypto_lib_root.resolve()
@@ -336,6 +368,7 @@ def export_corpus(args: argparse.Namespace) -> int:
         )
         count = sum(1 for _ in export_root.rglob("*.dsa.json")) if export_root.exists() else 0
         status = _classify_export_status(status, count)
+        driver_structure = inspect_driver_structure(builds / tag)
         status_rows.append(
             {
                 "script": relative,
@@ -343,14 +376,14 @@ def export_corpus(args: argparse.Namespace) -> int:
                 "launch_mode": f"final-{platform}",
                 "returncode": returncode,
                 "problems": count,
+                **driver_structure,
             }
         )
+        if args.prune_builds:
+            shutil.rmtree(builds / tag, ignore_errors=True)
+        _write_status_rows(args.output_root / "export-status.tsv", status_rows)
         print(f"[{index}/{len(plan)}] {relative}: {status} ({count} problems)", flush=True)
 
-    with (args.output_root / "export-status.tsv").open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=list(status_rows[0]), delimiter="\t")
-        writer.writeheader()
-        writer.writerows(status_rows)
     inventory_roots = {
         root: script
         for root, script in script_by_root.items()
@@ -377,6 +410,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     export.add_argument("--platform", default="a2a3sim")
     export.add_argument("--timeout", type=int, default=1800)
     export.add_argument("--limit", type=int)
+    export.add_argument("--prune-builds", action="store_true")
 
     one = subparsers.add_parser("_run-one")
     one.add_argument("--script", type=Path, required=True)

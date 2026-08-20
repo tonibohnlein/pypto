@@ -56,6 +56,14 @@ deterministic standalone ABI inputs: full `enable_dump_args=2` capture can
 overrun the DFX collector before it finalizes. Captured model inputs remain an
 optional validation path for small workloads.
 
+Exact standalone reconstruction also requires every selected backing storage
+to be free of writes from sibling runtime tasks. The generator rejects a dump
+when another task writes a selected storage: dispatch/completion snapshots are
+immediate, but a full-backing post-state may still contain concurrent sibling
+writes. Use a minimal single-submit driver or derive and validate the selected
+kernel's logical write footprint instead of treating that group state as a
+kernel reference.
+
 The input `kernel.cpp` must contain the synchronization that will execute on
 device. Prefer the `.cpp` emitted by the normal PyPTO/PTOAS compile. If starting
 from a pre-InsertSync level-3 `.pto`, regenerate the source with
@@ -96,7 +104,7 @@ wall-time data:
 python .claude/skills/incore-profiling/export_pypto_lib_dsa_corpus.py export \
   --pypto-lib-root <pypto-lib> --pypto-python <pypto>/python \
   --python <python-with-pypto-core> --manifest <export-status.tsv> \
-  --platform a2a3sim --output-root <corpus>
+  --platform a2a3sim --output-root <corpus> --prune-builds
 
 python .claude/skills/incore-profiling/screen_dsa_capacity_corpus.py \
   --problems-dir <corpus>/corpus/penalty-bearing \
@@ -105,11 +113,16 @@ python .claude/skills/incore-profiling/screen_dsa_capacity_corpus.py \
 ```
 
 The exporter deduplicates only by the solver's semantic problem fingerprint and
-does not impose a buffer-count threshold. The screen tightens one memory pool at
-a time while leaving every other pool at native capacity. Its lower endpoint is
-the geometry-first-fit peak for that pool, so the conventional control remains
-feasible by construction. It compares four arms: geometry first fit, geometry
-canonical greedy, a six-order Cypress portfolio, and DSA-RP canonical greedy.
+does not impose a buffer-count threshold. It records generated orchestration
+submit-site and kernel counts before `--prune-builds` removes each transient
+codegen tree, and atomically checkpoints `export-status.tsv` after every driver.
+`SINGLE_SUBMIT_SITE_CANDIDATE` is a compile-time structural classification, not
+proof that a host loop executes the site only once. The screen tightens one
+memory pool at a time while leaving every other pool at native capacity. Its
+lower endpoint is the geometry-first-fit peak for that pool, so the conventional
+control remains feasible by construction. It compares four arms: geometry first
+fit, geometry canonical greedy, a six-order Cypress portfolio, and DSA-RP
+canonical greedy.
 The two canonical-greedy arms use the same seed and restart count; only their
 objectives differ. Cypress selection is deliberately blind to reuse-penalty
 weights and device time. `model-separation.tsv` is a candidate-ranking aid, not
