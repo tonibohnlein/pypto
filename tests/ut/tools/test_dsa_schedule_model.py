@@ -380,6 +380,50 @@ def test_score_fails_closed_on_control_flow_branches():
         dsa_schedule_model.score_schedule(record, _ten_cycle_model())
 
 
+def test_straight_line_qualification_excludes_every_branch_and_loop():
+    straight = dsa_schedule_model.classify_straight_line_schedule(_record())
+    assert straight == {
+        "policy": "straight_line_v1",
+        "eligible": True,
+        "status": "STRAIGHT_LINE",
+        "operation_count": 4,
+        "branch_node_count": 0,
+        "loop_node_count": 0,
+        "branch_node_ids": [],
+        "loop_node_ids": [],
+    }
+
+    with_control_flow = _record()
+    with_control_flow["nodes"].extend(
+        [
+            {"id": 10, "kind": "branch", "branch_kind": "IF_BEGIN"},
+            {"id": 11, "kind": "loop", "loop_kind": "LOOP_BEGIN", "static_trip_count": 4},
+        ]
+    )
+    excluded = dsa_schedule_model.classify_straight_line_schedule(with_control_flow)
+    assert excluded["eligible"] is False
+    assert excluded["status"] == "CONTROL_FLOW_EXCLUDED"
+    assert excluded["branch_node_ids"] == [10]
+    assert excluded["loop_node_ids"] == [11]
+
+
+def test_qualify_command_is_timing_blind_and_hashes_sources(tmp_path):
+    schedule = tmp_path / "schedule.jsonl"
+    schedule.write_text(json.dumps(_record()) + "\n")
+    output = tmp_path / "qualification.json"
+
+    assert dsa_schedule_model.main(["qualify", str(schedule), "-o", str(output)]) == 0
+
+    result = json.loads(output.read_text())
+    assert result["selection_policy"] == "straight_line_v1"
+    assert result["timing_blind"] is True
+    assert result["schedule_count"] == 1
+    assert result["eligible_count"] == 1
+    assert result["schedules"][0]["function"] == "kernel"
+    assert result["schedules"][0]["status"] == "STRAIGHT_LINE"
+    assert len(result["schedules"][0]["source_sha256"]) == 64
+
+
 def test_calibrate_uses_per_operation_and_pipe_medians(tmp_path):
     metrics = tmp_path / "instr_metrics.json"
     metrics.write_text(
