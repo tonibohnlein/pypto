@@ -1293,6 +1293,56 @@ def _resolve_schedule_record(path: Path, function: str | None) -> tuple[dict[str
     return records[function], function
 
 
+def classify_straight_line_schedule(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify whether a schedule has no structured control-flow nodes.
+
+    The first device calibration cohort deliberately excludes every branch and
+    loop rather than approximating their execution frequency.  This predicate
+    depends only on the exported schedule structure; it never reads solver
+    objectives or device timings.
+    """
+    nodes = [node for node in record.get("nodes", []) if isinstance(node, Mapping)]
+    operation_ids = [node.get("id") for node in nodes if node.get("kind") == "operation"]
+    branch_ids = [node.get("id") for node in nodes if node.get("kind") == "branch"]
+    loop_ids = [node.get("id") for node in nodes if node.get("kind") == "loop"]
+    control_flow_ids = [*branch_ids, *loop_ids]
+    return {
+        "policy": "straight_line_v1",
+        "eligible": not control_flow_ids,
+        "status": "STRAIGHT_LINE" if not control_flow_ids else "CONTROL_FLOW_EXCLUDED",
+        "operation_count": len(operation_ids),
+        "branch_node_count": len(branch_ids),
+        "loop_node_count": len(loop_ids),
+        "branch_node_ids": branch_ids,
+        "loop_node_ids": loop_ids,
+    }
+
+
+def qualify_schedule_files(paths: Sequence[str | Path]) -> dict[str, Any]:
+    """Return timing-blind straight-line eligibility for schedule graphs."""
+    rows: list[dict[str, Any]] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        source_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        for function, record in sorted(load_schedule_graphs(path).items()):
+            rows.append(
+                {
+                    "source": str(path.resolve()),
+                    "source_sha256": source_sha256,
+                    "function": function,
+                    **classify_straight_line_schedule(record),
+                }
+            )
+    return {
+        "schema_version": 1,
+        "selection_policy": "straight_line_v1",
+        "timing_blind": True,
+        "schedule_count": len(rows),
+        "eligible_count": sum(row["eligible"] for row in rows),
+        "schedules": rows,
+    }
+
+
 def _effect_sign(value: float) -> int:
     if value < 0:
         return -1
@@ -1581,6 +1631,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     evaluate_parser.add_argument("--model", type=Path)
     evaluate_parser.add_argument("-o", "--output", type=Path)
 
+    qualify_parser = subparsers.add_parser(
+        "qualify", help="classify schedule graphs using timing-blind straight-line eligibility"
+    )
+    qualify_parser.add_argument("schedules", nargs="+", type=Path)
+    qualify_parser.add_argument("-o", "--output", type=Path)
+
     candidate_parser = subparsers.add_parser(
         "score-candidates", help="join raw DSA candidates to a schedule and derive critical-path weights"
     )
@@ -1607,6 +1663,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "evaluate":
             evaluated = evaluate_arm_manifest(args.manifest, _load_model(args.model))
             _write_json(args.output, evaluated)
+            return 0
+        if args.command == "qualify":
+            _write_json(args.output, qualify_schedule_files(args.schedules))
             return 0
         if args.command == "score-candidates":
             record, _ = _resolve_schedule_record(args.schedule, args.function)

@@ -175,6 +175,29 @@ recurrence lower bound 单独处理它们。operation duration 来自清理后�
 instruction metric 中位数，或带有明确“未校准”标签的 per-pipe fallback。因此，除非
 calibration coverage 与 loop 限制足以支持，否则这些结果不是 cycle-accurate 估计。
 
+首个设备校准 cohort 使用更严格的 `straight_line_v1` eligibility policy。它会排除
+所有包含 branch 或 loop node 的 schedule，即使 loop 具有静态边界也不例外。该过滤器只
+使用结构信息，不读取 solver objective 或既有设备结果。在冻结 cohort 前使用：
+
+```bash
+python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \
+    -o schedule-eligibility.json
+```
+
+随后仅按“可测量性”冻结设备语料，而不按已观察到的性能或求解器目标筛选。一个
+用例必须在原生、half、q1 和 tight 四种容量下，对四个逻辑策略（几何 first-fit、
+几何 canonical greedy、Cypress 和 DSA-RP canonical greedy）都可行、无控制流、
+可运行且正确。语料冻结工具会拒绝包含时延、加速比、目标值或预测关键路径字段
+的输入表：
+
+```bash
+python -m pypto.tools.dsa_measurement_cohort preflight.tsv results/ \
+    --minimum 20 --maximum 40
+```
+
+若合格用例超过 40 个，则按模型族和父程序进行确定性的轮询选择。代码端点相同的
+逻辑策略仍保留在矩阵中，但只需进行一次物理测量。
+
 planner 比较使用配对 schedule graph，并采用 `candidate / baseline - 1` 约定，负数表示
 预测 candidate 更快。evaluator 首先要求两个 arm 具有相同 operation stream，然后报告
 placement 变化新增和移除的 synchronization dependency。held-out cohort 的 comparison
