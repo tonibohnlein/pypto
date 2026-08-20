@@ -380,31 +380,49 @@ def test_score_fails_closed_on_control_flow_branches():
         dsa_schedule_model.score_schedule(record, _ten_cycle_model())
 
 
-def test_straight_line_qualification_excludes_every_branch_and_loop():
-    straight = dsa_schedule_model.classify_straight_line_schedule(_record())
+def test_static_loop_qualification_accepts_bounded_loops_and_excludes_branches():
+    straight = dsa_schedule_model.classify_static_schedule(_record())
     assert straight == {
-        "policy": "straight_line_v1",
+        "policy": "static_loop_v1",
         "eligible": True,
-        "status": "STRAIGHT_LINE",
+        "status": "STATIC_SCHEDULE",
         "operation_count": 4,
         "branch_node_count": 0,
         "loop_node_count": 0,
+        "dynamic_loop_node_count": 0,
         "branch_node_ids": [],
         "loop_node_ids": [],
+        "dynamic_loop_node_ids": [],
     }
 
-    with_control_flow = _record()
-    with_control_flow["nodes"].extend(
+    with_static_loop = _record()
+    with_static_loop["nodes"].extend(
         [
-            {"id": 10, "kind": "branch", "branch_kind": "IF_BEGIN"},
             {"id": 11, "kind": "loop", "loop_kind": "LOOP_BEGIN", "static_trip_count": 4},
+            {"id": 12, "kind": "loop", "loop_kind": "LOOP_END", "static_trip_count": None},
         ]
     )
-    excluded = dsa_schedule_model.classify_straight_line_schedule(with_control_flow)
-    assert excluded["eligible"] is False
-    assert excluded["status"] == "CONTROL_FLOW_EXCLUDED"
-    assert excluded["branch_node_ids"] == [10]
-    assert excluded["loop_node_ids"] == [11]
+    eligible = dsa_schedule_model.classify_static_schedule(with_static_loop)
+    assert eligible["eligible"] is True
+    assert eligible["status"] == "STATIC_SCHEDULE"
+    assert eligible["loop_node_ids"] == [11, 12]
+    assert eligible["dynamic_loop_node_ids"] == []
+
+    with_branch = _record()
+    with_branch["nodes"].append({"id": 10, "kind": "branch", "branch_kind": "IF_BEGIN"})
+    branch_excluded = dsa_schedule_model.classify_static_schedule(with_branch)
+    assert branch_excluded["eligible"] is False
+    assert branch_excluded["status"] == "BRANCH_EXCLUDED"
+    assert branch_excluded["branch_node_ids"] == [10]
+
+    with_dynamic_loop = _record()
+    with_dynamic_loop["nodes"].append(
+        {"id": 13, "kind": "loop", "loop_kind": "LOOP_BEGIN", "static_trip_count": None}
+    )
+    dynamic_excluded = dsa_schedule_model.classify_static_schedule(with_dynamic_loop)
+    assert dynamic_excluded["eligible"] is False
+    assert dynamic_excluded["status"] == "DYNAMIC_LOOP_EXCLUDED"
+    assert dynamic_excluded["dynamic_loop_node_ids"] == [13]
 
 
 def test_qualify_command_is_timing_blind_and_hashes_sources(tmp_path):
@@ -415,12 +433,12 @@ def test_qualify_command_is_timing_blind_and_hashes_sources(tmp_path):
     assert dsa_schedule_model.main(["qualify", str(schedule), "-o", str(output)]) == 0
 
     result = json.loads(output.read_text())
-    assert result["selection_policy"] == "straight_line_v1"
+    assert result["selection_policy"] == "static_loop_v1"
     assert result["timing_blind"] is True
     assert result["schedule_count"] == 1
     assert result["eligible_count"] == 1
     assert result["schedules"][0]["function"] == "kernel"
-    assert result["schedules"][0]["status"] == "STRAIGHT_LINE"
+    assert result["schedules"][0]["status"] == "STATIC_SCHEDULE"
     assert len(result["schedules"][0]["source_sha256"]) == 64
 
 

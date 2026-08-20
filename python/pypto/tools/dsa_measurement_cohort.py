@@ -30,7 +30,6 @@ REQUIRED_COLUMNS = (
     "capacity",
     "arm",
     "solve_status",
-    "schedule_status",
     "launch_status",
     "correctness_status",
     "endpoint_digest",
@@ -80,8 +79,6 @@ def _case_reason(rows: Sequence[Mapping[str, str]]) -> str:
         return "INCOMPLETE_FOUR_ARM_FOUR_CAPACITY_MATRIX"
     if any(row["solve_status"] != "FEASIBLE" for row in rows):
         return "ARM_OR_CAPACITY_INFEASIBLE"
-    if any(row["schedule_status"] != "STRAIGHT_LINE" for row in rows):
-        return "CONTROL_FLOW_EXCLUDED"
     if any(row["launch_status"] != "RUNNABLE" for row in rows):
         return "NOT_RUNNABLE"
     if any(row["correctness_status"] != "PASS" for row in rows):

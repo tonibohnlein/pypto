@@ -2213,6 +2213,8 @@ class JITFunction:
         # config there is nothing to forward and ir.compile()'s own defaults
         # apply, platform included.
         compile_kwargs = run_config.compile_kwargs() if run_config is not None else {}
+        if run_config is not None and run_config.codegen_only:
+            compile_kwargs["skip_ptoas"] = True
 
         # Build cache key. Platform and strategy are included so artifacts
         # compiled for different targets or optimization strategies never
@@ -2555,10 +2557,12 @@ class JITFunction:
         ``_bind_args``; reused here so ``_resolve_dep_call_metadata``
         doesn't re-walk the dep graph on every cache miss.
 
-        ``ir_compile_kwargs`` are forwarded verbatim to ``ir.compile()`` —
+        ``ir_compile_kwargs`` are forwarded to ``ir.compile()`` —
         compile-side knobs (``platform``, ``strategy``, ``dump_passes``,
         ``output_dir``, ``profiling``, diagnostics, ...) that the JIT caller
-        derives from a ``RunConfig`` via ``RunConfig.compile_kwargs``.
+        derives from a ``RunConfig`` via ``RunConfig.compile_kwargs``. An
+        explicit ``skip_ptoas`` supplied for ``codegen_only`` overrides
+        environment-based PTOAS discovery.
         """
         from pypto.ir.compile import compile as ir_compile  # noqa: PLC0415
 
@@ -2569,7 +2573,7 @@ class JITFunction:
         rename_map = specializer.rename_map
         try:
             parsed = pl.parse(source, filename=self._diagnostic_filename, source_map=specializer.source_map)
-            skip_ptoas = not _ptoas_available()
+            skip_ptoas = ir_compile_kwargs.pop("skip_ptoas", not _ptoas_available())
             return ir_compile(parsed, skip_ptoas=skip_ptoas, **ir_compile_kwargs)
         except Exception as exc:
             rewritten = _rewrite_jit_error(exc, rename_map)

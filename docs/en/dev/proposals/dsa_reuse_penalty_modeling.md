@@ -208,11 +208,12 @@ labelled, uncalibrated per-pipe fallbacks. Consequently, these results are not
 cycle-accurate estimates unless their calibration coverage and loop
 limitations support that claim.
 
-The first device-calibration cohort uses the stricter `straight_line_v1`
-eligibility policy. It excludes every schedule containing a branch or loop
-node, regardless of whether a loop has a static bound. This is a timing-blind
-structural filter: it does not inspect solver objectives or prior device
-results. Qualify exported schedules before freezing that cohort with:
+The first critical-path calibration subset uses the `static_loop_v1`
+eligibility policy. It accepts loops with an exported non-negative static trip
+count and excludes branches and dynamically bounded loops. This is a
+timing-blind structural filter: it does not inspect solver objectives or prior
+device results. Qualify exported schedules before freezing that analysis
+subset with:
 
 ```bash
 python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \
@@ -220,11 +221,13 @@ python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \
 ```
 
 The device corpus is then frozen by measurability, not by observed performance
-or solver objective. A case must be feasible, straight-line, runnable, and
-correct under all four logical policies (geometry first-fit, geometry canonical
-greedy, Cypress, and DSA-RP canonical greedy) at native, half, q1, and tight
-capacity. The cohort freezer rejects input tables containing timing, speedup,
-objective, or predicted-critical-path columns:
+or solver objective. A case must be feasible, runnable, and correct under all
+four logical policies (geometry first-fit, geometry canonical greedy, Cypress,
+and DSA-RP canonical greedy) at native, half, q1, and tight capacity. Schedule
+eligibility is recorded separately and gates only critical-path predictions;
+branches or dynamic loops do not make a device-measurable case ineligible. The
+cohort freezer rejects input tables containing timing, speedup, objective, or
+predicted-critical-path columns:
 
 ```bash
 python -m pypto.tools.dsa_measurement_cohort preflight.tsv results/ \

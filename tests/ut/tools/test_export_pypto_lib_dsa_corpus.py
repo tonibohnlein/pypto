@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import csv
 import importlib.util
 import json
 from pathlib import Path
@@ -131,6 +132,44 @@ def test_golden_patch_injects_compile_only_dsa_configuration(tmp_path: Path) -> 
     assert "skip_ptoas" not in jit["compile_cfg"]
     assert (tmp_path / "call-001").is_dir()
     assert (tmp_path / "call-002").is_dir()
+
+
+def test_compile_for_test_patch_is_optional_for_current_jit_api(tmp_path: Path) -> None:
+    jit_decorator = SimpleNamespace(JITFunction=type("JITFunction", (), {}))
+    passes = SimpleNamespace()
+
+    assert exporter._patch_compile_for_test(jit_decorator, passes, tmp_path) is False
+
+
+def test_driver_structure_counts_logical_submit_sites(tmp_path: Path) -> None:
+    (tmp_path / "orchestration").mkdir()
+    (tmp_path / "kernels" / "aiv").mkdir(parents=True)
+    (tmp_path / "orchestration" / "driver.cpp").write_text(
+        "rt_submit_aiv_task(0, first);\nrt_submit_mix_task(1, 2, second);\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "kernels" / "aiv" / "first.pto").write_text("func.func @first()\n", encoding="utf-8")
+
+    assert exporter.inspect_driver_structure(tmp_path) == {
+        "orchestration_files": 1,
+        "submit_sites": 2,
+        "emitted_kernels": 1,
+        "driver_mode": "MULTI_SUBMIT_PARENT",
+    }
+
+
+def test_status_checkpoint_is_replaced_with_complete_rows(tmp_path: Path) -> None:
+    path = tmp_path / "export-status.tsv"
+    first = {"script": "models/a.py", "status": "EXPORTED"}
+    second = {"script": "models/b.py", "status": "PARTIAL"}
+
+    exporter._write_status_rows(path, [first])
+    exporter._write_status_rows(path, [first, second])
+
+    with path.open(encoding="utf-8", newline="") as source:
+        assert list(csv.DictReader(source, delimiter="\t")) == [first, second]
+    assert b"\r" not in path.read_bytes()
+    assert not path.with_suffix(".tsv.pending").exists()
 
 
 def test_inventory_deduplicates_semantic_exports(tmp_path: Path) -> None:

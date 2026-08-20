@@ -2824,6 +2824,35 @@ class TestCompileKwargForwarding:
         )
         assert set(captured) == {"skip_ptoas"}
 
+    def test_codegen_only_forwards_skip_ptoas_once(self, monkeypatch):
+        """The codegen-only JIT path supplies one authoritative skip_ptoas value."""
+        torch = pytest.importorskip("torch")
+
+        @jit
+        def codegen_only_kernel(
+            x: pl.Tensor[[128, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                t = pl.load(x, [0, 0], [128, 128])
+                pl.store(t, [0, 0], out)
+            return out
+
+        captured: dict = {}
+
+        def fake_compile(*_args, **kwargs):
+            captured.update(kwargs)
+            return "fake"
+
+        monkeypatch.setattr(codegen_only_kernel, "_compile", fake_compile)
+        compiled, _args, _config = codegen_only_kernel._resolve_compiled(
+            (torch.zeros(128, 128), torch.zeros(128, 128)),
+            {"config": RunConfig(codegen_only=True)},
+        )
+
+        assert compiled == "fake"
+        assert captured["skip_ptoas"] is True
+
 
 # ---------------------------------------------------------------------------
 # Source provenance: diagnostics map back to the user's real .py (Issue #1612)
