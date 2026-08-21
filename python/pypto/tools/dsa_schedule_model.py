@@ -39,6 +39,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pypto.tools.dsa_pto_isa_duration import (
+    PtoIsaDurationProvider,
+    provider_snapshot_sha256,
+)
 from pypto.tools.dsa_reuse_candidates import ReuseCandidateRecord, load_candidate_records
 
 _PIPE_ALIASES = {
@@ -94,21 +98,10 @@ class PipeParameters:
 
 
 def _default_pipe_parameters() -> dict[str, PipeParameters]:
-    # These defaults are intentionally coarse initial values.  Every result
-    # using them is labelled uncalibrated; simulator-derived calibration can
-    # replace either exact operation medians or the pipe fallbacks.
-    return {
-        "PIPE_S": PipeParameters(4.0, math.inf, 4.0),
-        "PIPE_V": PipeParameters(12.0, 64.0, 12.0),
-        "PIPE_M": PipeParameters(32.0, 128.0, 32.0),
-        "PIPE_MTE1": PipeParameters(20.0, 96.0, 20.0),
-        "PIPE_MTE2": PipeParameters(24.0, 64.0, 24.0),
-        "PIPE_MTE3": PipeParameters(24.0, 64.0, 24.0),
-        "PIPE_FIX": PipeParameters(20.0, 64.0, 20.0),
-        "PIPE_V2": PipeParameters(12.0, 64.0, 12.0),
-        "PIPE_MTE4": PipeParameters(24.0, 64.0, 24.0),
-        "PIPE_MTE5": PipeParameters(24.0, 64.0, 24.0),
-    }
+    # Generic pipe constants silently gave every unknown operation a plausible
+    # duration.  A production prediction must instead use the pinned PTO-ISA
+    # provider or an explicit calibrated override.
+    return {}
 
 
 @dataclass
@@ -116,12 +109,13 @@ class DurationModel:
     """Duration inputs used to score a schedule graph."""
 
     schema_version: int = 1
-    model_version: str = "duration_v0"
-    calibration_status: str = "uncalibrated_defaults"
+    model_version: str = "duration_v1"
+    calibration_status: str = "unconfigured"
     sync_latency_cycles: float = 0.0
     pipe_parameters: dict[str, PipeParameters] = field(default_factory=_default_pipe_parameters)
     operation_cycles: dict[str, float] = field(default_factory=dict)
     calibration_sources: list[str] = field(default_factory=list)
+    pto_isa_provider: PtoIsaDurationProvider | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "DurationModel":
@@ -143,19 +137,28 @@ class DurationModel:
         raw_ops = value.get("operation_cycles", {})
         if not isinstance(raw_ops, Mapping):
             raise ValueError("operation_cycles must be an object")
+        raw_provider = value.get("pto_isa_provider")
+        if raw_provider is not None and not isinstance(raw_provider, Mapping):
+            raise ValueError("pto_isa_provider must be an object")
         return cls(
             schema_version=1,
-            model_version=str(value.get("model_version", "duration_v0")),
+            model_version=str(value.get("model_version", "duration_v1")),
             calibration_status=str(value.get("calibration_status", "unknown")),
             sync_latency_cycles=float(value.get("sync_latency_cycles", 0.0)),
             pipe_parameters=pipes,
             operation_cycles={str(key): float(cycles) for key, cycles in raw_ops.items()},
             calibration_sources=[str(path) for path in value.get("calibration_sources", [])],
+            pto_isa_provider=(
+                PtoIsaDurationProvider.from_json(raw_provider) if raw_provider is not None else None
+            ),
         )
 
     def to_json(self) -> dict[str, Any]:
         """Return a stable JSON-compatible representation."""
         value = asdict(self)
+        value["pto_isa_provider"] = (
+            self.pto_isa_provider.to_json() if self.pto_isa_provider is not None else None
+        )
         for parameters in value["pipe_parameters"].values():
             if math.isinf(parameters["bytes_per_cycle"]):
                 parameters["bytes_per_cycle"] = "inf"
@@ -550,15 +553,31 @@ def estimate_node_durations(
         if key in model.operation_cycles:
             base = model.operation_cycles[key]
             source = "simulator_operation_median"
+            detail = f"explicit operation override {key}"
+            fallback = False
+        elif model.pto_isa_provider is not None:
+            estimate = model.pto_isa_provider.estimate(node, work_bytes=work_bytes)
+            base = estimate.cycles
+            source = estimate.source
+            detail = estimate.detail
+            fallback = estimate.fallback
         else:
             parameters = model.pipe_parameters.get(pipe)
             if parameters is None:
-                raise ValueError(f"no duration parameters for pipe '{pipe}'")
+                raise ValueError(
+                    f"no duration estimate for {op_name} on {pipe}; configure a pinned PTO-ISA "
+                    "provider, an operation override, or an explicit legacy pipe model"
+                )
             transfer = (
                 0.0 if math.isinf(parameters.bytes_per_cycle) else work_bytes / parameters.bytes_per_cycle
             )
             base = max(parameters.minimum_cycles, parameters.startup_cycles + transfer)
-            source = "pipe_size_model"
+            source = "legacy_pipe_size_model"
+            detail = (
+                f"startup={parameters.startup_cycles}; bytes_per_cycle={parameters.bytes_per_cycle}; "
+                f"minimum={parameters.minimum_cycles}"
+            )
+            fallback = True
 
         multiplier = 1
         for loop_id in node.get("loop_stack", []):
@@ -575,6 +594,8 @@ def estimate_node_durations(
             "loop_multiplier": multiplier,
             "cycles": duration,
             "source": source,
+            "detail": detail,
+            "fallback": fallback,
         }
     return durations, provenance, dynamic_loops
 
@@ -903,7 +924,9 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
             }
         )
 
-    covered = sum(item["source"] == "simulator_operation_median" for item in provenance.values())
+    exact = sum(not item["fallback"] for item in provenance.values())
+    fallback = sum(item["fallback"] for item in provenance.values())
+    source_counts = Counter(str(item["source"]) for item in provenance.values())
     return {
         "schema_version": 1,
         "function": record.get("function", "<unknown>"),
@@ -916,8 +939,18 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "dynamic_loop_ids": dynamic_loops,
         "excluded_loop_carried_sync_edges": excluded_loop_carried,
         "operation_nodes": len(durations),
-        "calibrated_operation_nodes": covered,
-        "calibration_coverage": covered / len(durations) if durations else 0.0,
+        "exact_duration_nodes": exact,
+        "fallback_duration_nodes": fallback,
+        "exact_duration_coverage": exact / len(durations) if durations else 0.0,
+        "duration_source_counts": dict(sorted(source_counts.items())),
+        "pto_isa_provider": (
+            {
+                "revision": model.pto_isa_provider.revision,
+                "snapshot_sha256": provider_snapshot_sha256(model.pto_isa_provider),
+            }
+            if model.pto_isa_provider is not None
+            else None
+        ),
         "baseline_makespan_cycles": baseline,
         "full_makespan_cycles": full,
         "synchronization_exposure_cycles": max(0.0, full - baseline),
@@ -1544,19 +1577,58 @@ def calibrate_from_metrics(paths: Sequence[str | Path], base: DurationModel | No
     operation_cycles.update({key: statistics.median(samples) for key, samples in by_operation.items()})
     return DurationModel(
         schema_version=1,
-        model_version="duration_v0",
-        calibration_status="simulator_instruction_medians",
+        model_version="duration_v1",
+        calibration_status=(
+            "simulator_overrides+pto_isa" if model.pto_isa_provider else "simulator_instruction_medians"
+        ),
         sync_latency_cycles=model.sync_latency_cycles,
         pipe_parameters=calibrated_pipes,
         operation_cycles=operation_cycles,
         calibration_sources=sorted(used_sources),
+        pto_isa_provider=model.pto_isa_provider,
     )
 
 
-def _load_model(path: Path | None) -> DurationModel:
+def _load_model(
+    path: Path | None,
+    *,
+    pto_isa_root: Path | None = None,
+    pto_isa_revision: str | None = None,
+    unsupported_policy: str = "error",
+    fallback_cycles: float = 1.0,
+) -> DurationModel:
+    if path is not None and pto_isa_root is not None:
+        raise ValueError("choose either --model or --pto-isa-root, not both")
     if path is None:
-        return DurationModel()
+        if pto_isa_root is None:
+            raise ValueError("duration scoring requires --model or --pto-isa-root")
+        revision = pto_isa_revision or _source_checkout_pto_isa_pin()
+        provider = PtoIsaDurationProvider.from_checkout(
+            pto_isa_root,
+            expected_revision=revision,
+            unsupported_policy=unsupported_policy,
+            fallback_cycles=fallback_cycles,
+        )
+        return DurationModel(
+            model_version="duration_v1",
+            calibration_status="pto_isa_pinned",
+            pto_isa_provider=provider,
+            calibration_sources=[f"pto-isa:{provider.revision}:{provider_snapshot_sha256(provider)}"],
+        )
     return DurationModel.from_json(json.loads(path.read_text()))
+
+
+def _source_checkout_pto_isa_pin() -> str:
+    pin_path = Path(__file__).resolve().parents[3] / "runtime" / "pto_isa.pin"
+    try:
+        revision = pin_path.read_text().strip()
+    except OSError as error:
+        raise ValueError(
+            "cannot infer the PTO-ISA pin outside a PyPTO source checkout; pass --pto-isa-revision"
+        ) from error
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError(f"{pin_path}: expected one full 40-hex PTO-ISA revision")
+    return revision
 
 
 def _write_json(path: Path | None, value: Any) -> None:
@@ -1698,6 +1770,11 @@ def _summarize_comparisons(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     ]
     predicted_deltas = [float(row["predicted_relative_delta"]) for row in observed]
     observed_deltas = [float(row["observed_relative_delta"]) for row in observed]
+    duration_coverages = [
+        float(row[key])
+        for row in rows
+        for key in ("baseline_exact_duration_coverage", "candidate_exact_duration_coverage")
+    ]
     direction_correct = sum(row["direction_correct"] is True for row in directional)
     return {
         "comparison_count": len(rows),
@@ -1705,6 +1782,8 @@ def _summarize_comparisons(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "directional_comparison_count": len(directional),
         "direction_correct_count": direction_correct,
         "direction_accuracy": direction_correct / len(directional) if directional else None,
+        "minimum_exact_duration_coverage": min(duration_coverages),
+        "mean_exact_duration_coverage": statistics.mean(duration_coverages),
         "spearman_relative_delta": _pearson(
             _average_ranks(predicted_deltas), _average_ranks(observed_deltas)
         ),
@@ -1807,7 +1886,6 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
             schedule = schedule.resolve()
             record, resolved_function = _resolve_schedule_record(schedule, function)
             arm_records[role] = record
-            arm_results[role] = score_schedule(record, model)
             arm_sources[role] = {
                 "path": str(schedule),
                 "function": resolved_function,
@@ -1821,6 +1899,8 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
             raise ValueError(
                 f"{path}: comparison {label} has different operation streams across planner arms"
             )
+        for role in ("baseline", "candidate"):
+            arm_results[role] = score_schedule(arm_records[role], model)
         added_sync_edges, removed_sync_edges = _sync_edge_delta(
             arm_records["baseline"], arm_records["candidate"]
         )
@@ -1869,6 +1949,10 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
                 "removed_sync_edges": removed_sync_edges,
                 "baseline_cycles": baseline_cycles,
                 "candidate_cycles": candidate_cycles,
+                "baseline_exact_duration_coverage": arm_results["baseline"]["exact_duration_coverage"],
+                "candidate_exact_duration_coverage": arm_results["candidate"]["exact_duration_coverage"],
+                "baseline_duration_source_counts": arm_results["baseline"]["duration_source_counts"],
+                "candidate_duration_source_counts": arm_results["candidate"]["duration_source_counts"],
                 "predicted_delta_cycles": predicted_delta,
                 "predicted_relative_delta": predicted_relative_delta,
                 "predicted_direction": _effect_sign(predicted_delta),
@@ -1909,13 +1993,159 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
     }
 
 
+_PERF_SIM_EVENT_RE = re.compile(
+    r"^(?P<op>[A-Z][A-Z0-9_]*)\((?P<rows>\d+)x(?P<cols>\d+),(?P<dtype>fp16|fp32)\)"
+)
+
+
+def validate_pto_isa_formulas_against_perf_sim(
+    paths: Sequence[str | Path], provider: PtoIsaDurationProvider
+) -> dict[str, Any]:
+    """Compare supported PTO-ISA formulas with effective Perf-Sim event cycles.
+
+    Perf-Sim prefers cycles recorded by the richer CCE mock when they are
+    available, and otherwise uses the same lightweight formula API represented
+    by ``provider``.  This is therefore a deliberately strict cross-model
+    comparison, not a round-trip test of the CSV parser.  The result quantifies
+    when a lightweight analytical duration is an adequate stand-in for the
+    effective simulator duration.  Complete schedule makespans remain validated
+    separately through ``evaluate_arm_manifest`` against device observations.
+    """
+    rows: list[dict[str, Any]] = []
+    source_rows: list[dict[str, str]] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        payload = json.loads(path.read_text())
+        if not isinstance(payload, list):
+            raise ValueError(f"{path}: expected a Perf-Sim Chrome trace array")
+        source_rows.append(
+            {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        )
+        for event_index, event in enumerate(payload):
+            if not isinstance(event, Mapping) or event.get("ph") != "X":
+                continue
+            name = event.get("name")
+            observed = _as_number(event.get("dur"))
+            if not isinstance(name, str) or observed is None or observed < 0:
+                continue
+            match = _PERF_SIM_EVENT_RE.match(name)
+            if match is None:
+                continue
+            estimate = provider.estimate_formula(
+                match.group("op"),
+                match.group("dtype"),
+                int(match.group("rows")),
+                int(match.group("cols")),
+            )
+            if estimate is None:
+                continue
+            error = estimate.cycles - observed
+            rows.append(
+                {
+                    "source": str(path.resolve()),
+                    "event_index": event_index,
+                    "event_name": name,
+                    "op": match.group("op"),
+                    "dtype": match.group("dtype"),
+                    "rows": int(match.group("rows")),
+                    "cols": int(match.group("cols")),
+                    "predicted_cycles": estimate.cycles,
+                    "perf_sim_cycles": observed,
+                    "error_cycles": error,
+                    "absolute_error_cycles": abs(error),
+                    "absolute_percentage_error": abs(error) / observed if observed > 0 else None,
+                }
+            )
+    if not rows:
+        raise ValueError("Perf-Sim traces contain no events supported by the pinned formula table")
+    percentage_errors = [
+        float(row["absolute_percentage_error"])
+        for row in rows
+        if row["absolute_percentage_error"] is not None
+    ]
+    by_operation: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_operation[str(row["op"])].append(row)
+
+    def summarize(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        sample_percentage_errors = [
+            float(row["absolute_percentage_error"])
+            for row in samples
+            if row["absolute_percentage_error"] is not None
+        ]
+        return {
+            "event_count": len(samples),
+            "mean_predicted_cycles": statistics.mean(float(row["predicted_cycles"]) for row in samples),
+            "mean_perf_sim_cycles": statistics.mean(float(row["perf_sim_cycles"]) for row in samples),
+            "mean_error_cycles": statistics.mean(float(row["error_cycles"]) for row in samples),
+            "mean_absolute_error_cycles": statistics.mean(
+                float(row["absolute_error_cycles"]) for row in samples
+            ),
+            "median_absolute_error_cycles": statistics.median(
+                float(row["absolute_error_cycles"]) for row in samples
+            ),
+            "mean_absolute_percentage_error": statistics.mean(sample_percentage_errors),
+            "median_absolute_percentage_error": statistics.median(sample_percentage_errors),
+        }
+
+    return {
+        "schema_version": 1,
+        "validation_scope": "lightweight_formula_vs_perf_sim_effective_events",
+        "comparison_semantics": (
+            "Perf-Sim uses CCE-recorded cycles when available and otherwise the lightweight model"
+        ),
+        "pto_isa_revision": provider.revision,
+        "provider_snapshot_sha256": provider_snapshot_sha256(provider),
+        "sources": source_rows,
+        "event_count": len(rows),
+        "operation_count": len({row["op"] for row in rows}),
+        "mean_absolute_error_cycles": statistics.mean(float(row["absolute_error_cycles"]) for row in rows),
+        "median_absolute_error_cycles": statistics.median(
+            float(row["absolute_error_cycles"]) for row in rows
+        ),
+        "mean_absolute_percentage_error": statistics.mean(percentage_errors),
+        "median_absolute_percentage_error": statistics.median(percentage_errors),
+        "by_operation": {
+            operation: summarize(samples) for operation, samples in sorted(by_operation.items())
+        },
+        "events": rows,
+    }
+
+
+def _add_duration_arguments(parser: argparse.ArgumentParser) -> None:
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--model", type=Path, help="portable duration-model JSON")
+    source.add_argument("--pto-isa-root", type=Path, help="exact pinned PTO-ISA checkout")
+    parser.add_argument(
+        "--pto-isa-revision",
+        help="full expected revision; defaults to runtime/pto_isa.pin in a source checkout",
+    )
+    parser.add_argument(
+        "--unsupported-policy",
+        choices=("error", "fallback"),
+        default="error",
+        help="fail closed by default; fallback is explicit and reported per node",
+    )
+    parser.add_argument("--fallback-cycles", type=float, default=1.0)
+
+
+def _model_from_args(args: argparse.Namespace) -> DurationModel:
+    return _load_model(
+        args.model,
+        pto_isa_root=args.pto_isa_root,
+        pto_isa_revision=args.pto_isa_revision,
+        unsupported_policy=args.unsupported_policy,
+        fallback_cycles=args.fallback_cycles,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dsa_schedule_model")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     score_parser = subparsers.add_parser("score", help="score schedule-graph JSONL files")
     score_parser.add_argument("schedules", nargs="+", type=Path)
-    score_parser.add_argument("--model", type=Path)
+    _add_duration_arguments(score_parser)
     score_parser.add_argument("--freeze-cohort")
     score_parser.add_argument("-o", "--output", type=Path)
 
@@ -1923,6 +2153,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     calibrate_parser.add_argument("metrics", nargs="+", type=Path)
     calibrate_parser.add_argument("--base-model", type=Path)
     calibrate_parser.add_argument("-o", "--output", type=Path, required=True)
+
+    snapshot_parser = subparsers.add_parser(
+        "snapshot-duration", help="write a portable pinned duration-model snapshot"
+    )
+    _add_duration_arguments(snapshot_parser)
+    snapshot_parser.add_argument("-o", "--output", type=Path, required=True)
 
     import_parser = subparsers.add_parser(
         "import-debug", help="convert a legacy PTOAS level-3 debug log to schedule JSONL"
@@ -1940,7 +2176,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "evaluate", help="score paired planner arms and compare optional observed latencies"
     )
     evaluate_parser.add_argument("manifest", type=Path)
-    evaluate_parser.add_argument("--model", type=Path)
+    _add_duration_arguments(evaluate_parser)
     evaluate_parser.add_argument("-o", "--output", type=Path)
 
     qualify_parser = subparsers.add_parser(
@@ -1955,14 +2191,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidate_parser.add_argument("schedule", type=Path)
     candidate_parser.add_argument("problem", type=Path)
     candidate_parser.add_argument("--function")
-    candidate_parser.add_argument("--model", type=Path)
+    _add_duration_arguments(candidate_parser)
     candidate_parser.add_argument("--solution", type=Path)
     candidate_parser.add_argument("-o", "--output", type=Path)
 
+    perf_sim_parser = subparsers.add_parser(
+        "validate-perf-sim", help="compare pinned formulas with Perf-Sim trace events"
+    )
+    perf_sim_parser.add_argument("traces", nargs="+", type=Path)
+    _add_duration_arguments(perf_sim_parser)
+    perf_sim_parser.add_argument("-o", "--output", type=Path)
+
     args = parser.parse_args(argv)
     try:
+        if args.command == "snapshot-duration":
+            _write_json(args.output, _model_from_args(args).to_json())
+            return 0
         if args.command == "calibrate":
-            calibrated = calibrate_from_metrics(args.metrics, _load_model(args.base_model))
+            base = (
+                DurationModel.from_json(json.loads(args.base_model.read_text())) if args.base_model else None
+            )
+            calibrated = calibrate_from_metrics(args.metrics, base)
             _write_json(args.output, calibrated.to_json())
             return 0
         if args.command == "import-debug":
@@ -1974,7 +2223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output.write_text(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
             return 0
         if args.command == "evaluate":
-            evaluated = evaluate_arm_manifest(args.manifest, _load_model(args.model))
+            evaluated = evaluate_arm_manifest(args.manifest, _model_from_args(args))
             _write_json(args.output, evaluated)
             return 0
         if args.command == "qualify":
@@ -1985,7 +2234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = score_reuse_candidates(
                 record,
                 load_candidate_records(args.problem),
-                _load_model(args.model),
+                _model_from_args(args),
                 load_promoted_reuse_penalties(args.problem),
             )
             if args.solution is not None:
@@ -1993,7 +2242,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_json(args.output, result)
             return 0
 
-        model = _load_model(args.model)
+        if args.command == "validate-perf-sim":
+            model = _model_from_args(args)
+            if model.pto_isa_provider is None:
+                raise ValueError("Perf-Sim formula validation requires a model with PTO-ISA provenance")
+            result = validate_pto_isa_formulas_against_perf_sim(args.traces, model.pto_isa_provider)
+            _write_json(args.output, result)
+            return 0
+
+        model = _model_from_args(args)
         predictions: dict[str, Any] = {}
         for schedule_path in args.schedules:
             for function, record in load_schedule_graphs(schedule_path).items():

@@ -169,11 +169,41 @@ synchronization edge、loop membership 与已知 allocation size。
 critical path 评估每条 synchronization edge。这与简单统计 synchronization group
 不同：如果一条 edge 的延迟已经被 critical path 上的工作覆盖，它的 exposure 为零。
 
-在 whole-function DAG 中，静态 loop 按 trip count 聚合，动态 loop 的 multiplier 为一。
-loop-carried synchronization edge 会从该 DAG 中排除并显式报告；candidate 评分会用下文的
-recurrence lower bound 单独处理它们。operation duration 来自清理后的 simulator
-instruction metric 中位数，或带有明确“未校准”标签的 per-pipe fallback。因此，除非
-calibration coverage 与 loop 限制足以支持，否则这些结果不是 cycle-accurate 估计。
+在 whole-function DAG 中，静态 loop 按 trip count 聚合。由于模型没有可靠的
+multiplier，动态 loop 会直接失败。loop-carried synchronization edge 会从该 DAG 中排除
+并显式报告；candidate 评分会用下文的 recurrence lower bound 单独处理它们。operation
+duration 由 provider snapshot 提供；
+该 snapshot 从 `runtime/pto_isa.pin` 指定的精确 PTO-ISA revision 加载，并包含 A2/A3
+拟合公式、传输带宽、频率、源文件哈希和完整 revision。默认情况下，不支持的 operation
+会直接失败。探索性运行可以显式选择 `--unsupported-policy fallback`，但每个 fallback
+node 都会被标记，结果也会报告精确覆盖率与 fallback 覆盖率。simulator instruction
+中位数可以覆盖 analytical provider，同时保留 PTO-ISA provenance。
+
+```bash
+python -m pypto.tools.dsa_schedule_model snapshot-duration \
+    --pto-isa-root <exact-pto-isa-checkout> -o duration-pinned.json
+python -m pypto.tools.dsa_schedule_model score schedule.jsonl \
+    --model duration-pinned.json -o score.json
+python -m pypto.tools.dsa_schedule_model validate-perf-sim trace-*.json \
+    --model duration-pinned.json -o perf-sim-validation.json
+python -m pypto.tools.dsa_schedule_model calibrate instr_metrics.json \
+    --base-model duration-pinned.json -o duration-calibrated.json
+```
+
+该 pinned provider 删除了 PyPTO 之前静默使用的粗粒度 pipe 常数；但它本身**不会**让
+结构化 schedule graph 变成 cycle-accurate 模型。Perf-Sim 在可用时优先采用更丰富的
+CCE mock 记录 cycle，仅在没有该记录时才退回 PTO-ISA lightweight formula。在 pinned
+A2/A3 验证集的 102 个 formula-supported event 上，lightweight provider 相对有效
+Perf-Sim event 的平均绝对误差为 82 cycle，平均绝对百分比误差为 73.6%。elementwise
+`TMUL` 较接近（MAPE 11.3%），reduction 与 exponential 则不接近。
+
+配对设备验证得出同样结论。对于当前四容量开发数据集中无 branch 的 RMSNorm 用例，
+provider 精确覆盖 40% node，其余 node 都明确标记为 fallback。模型在四种容量下都预测
+三个物理 endpoint 的完整 makespan 相同；但已归档的设备结果在 native、half 和 quarter
+容量下显示 geometry 到 penalty-aware placement 约有 13% 改善。因此，该 provider 是
+可审计且固定版本的起点，但当前 critical-path model 仍不能解释已观察到的 placement
+effect。在把 cycle score 用作 DSA-RP weight 之前，必须用逐 kernel 的 Perf-Sim
+instruction trace 进行校准。
 
 首个 critical-path 校准子集使用 `static_loop_v1` eligibility policy。它接受具有已导出
 非负静态 trip count 的 loop，并排除 branch 与动态边界 loop。该过滤器只使用结构信息，

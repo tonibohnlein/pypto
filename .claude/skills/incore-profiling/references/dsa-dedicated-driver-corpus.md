@@ -59,7 +59,21 @@ Derive pairwise critical-path weights and score an actual placement with:
 python -m pypto.tools.dsa_schedule_model qualify <schedule.jsonl> -o qualification.json
 python -m pypto.tools.dsa_schedule_model score-candidates \
   <schedule.jsonl> <problem.dsa.json> --solution <solution.dsa.solution.json> \
-  --model <duration-model.json> -o placement-score.json
+  --pto-isa-root <exact-pto-isa-checkout> -o placement-score.json
+```
+
+The checkout must be at the full revision pinned by `runtime/pto_isa.pin` and
+its cost-model sources must be clean. Unsupported instructions fail closed.
+Use `--unsupported-policy fallback` only for coverage studies; fallback nodes
+and coverage are reported and must not be presented as cycle-accurate. A
+portable `--model` snapshot may replace `--pto-isa-root` after it has been
+created and, optionally, calibrated from kernel-specific Perf-Sim metrics:
+
+```bash
+python -m pypto.tools.dsa_schedule_model snapshot-duration \
+  --pto-isa-root <exact-pto-isa-checkout> -o duration-pinned.json
+python -m pypto.tools.dsa_schedule_model calibrate instr_metrics.json \
+  --base-model duration-pinned.json -o duration-calibrated.json
 ```
 
 The candidate scorer collapses access-site records into the promoted buffer
