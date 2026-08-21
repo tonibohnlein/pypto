@@ -80,6 +80,17 @@ def _ten_cycle_model() -> dsa_schedule_model.DurationModel:
     return model
 
 
+def test_complete_signature_mode_does_not_fall_back_to_family_median():
+    record = _record()
+    for index, node in enumerate(record["nodes"]):
+        record["nodes"][index] = _with_access(node, index)
+    model = _ten_cycle_model()
+    model.operation_signature_cycles = {"unrelated-complete-signature": 1.0}
+
+    with pytest.raises(ValueError, match="no exact-signature duration estimate"):
+        dsa_schedule_model.score_schedule(record, model)
+
+
 def test_score_computes_full_and_singleton_exposure():
     record = _record(sync_edges=[{"source": 2, "target": 1, "group": 7, "loop_carried": False}])
 
@@ -378,6 +389,79 @@ def test_candidate_score_fails_closed_when_site_pipe_does_not_join():
         dsa_schedule_model.score_reuse_candidates(record, [_candidate()], _ten_cycle_model())
 
 
+def test_candidate_score_records_narrow_tci_schedule_pipe_override():
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(_operation(1, "PIPE_S", "pto.tci"), 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    record["stream_edges"] = [{"source": 0, "target": 2, "pipe": "PIPE_V"}]
+    model = _ten_cycle_model()
+    model.operation_cycles["PIPE_S:TCI"] = 10.0
+    vector_target = dsa_reuse_candidates.parse_candidate_record(
+        "0,1,0->1,ub->ub@vector_compute=>ub->ub@vector_compute,arenas=Vec->Vec,"
+        "write_after_read,no_logical_order,inter_operation,full_allocation,complete_access_set,"
+        "verified_initial_write,in_loop,distance_0,sites=3->7,"
+        "ranges=0+640->0+640,hazard=cross_resource,dag_path=none"
+    )
+
+    result = dsa_schedule_model.score_reuse_candidates(record, [vector_target], model)
+
+    candidate = result["candidates"][0]
+    assert candidate["next_route_pipe"] == "PIPE_V"
+    assert candidate["next_pipe"] == "PIPE_S"
+    assert candidate["next_pipe_override"] == "ptoas_v057_tci_schedule_pipe"
+
+
+def test_candidate_score_rejects_unknown_schedule_pipe_override():
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(_operation(1, "PIPE_S", "pto.tadd"), 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    record["stream_edges"] = [{"source": 0, "target": 2, "pipe": "PIPE_V"}]
+    model = _ten_cycle_model()
+    model.operation_cycles["PIPE_S:TADD"] = 10.0
+    vector_target = dsa_reuse_candidates.parse_candidate_record(
+        "0,1,0->1,ub->ub@vector_compute=>ub->ub@vector_compute,arenas=Vec->Vec,"
+        "write_after_read,no_logical_order,inter_operation,full_allocation,complete_access_set,"
+        "verified_initial_write,in_loop,distance_0,sites=3->7,"
+        "ranges=0+640->0+640,hazard=cross_resource,dag_path=none"
+    )
+
+    with pytest.raises(ValueError, match="did not join"):
+        dsa_schedule_model.score_reuse_candidates(record, [vector_target], model)
+
+
+def test_candidate_score_records_tsetval_schedule_pipe_override():
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(_operation(1, "PIPE_S", "pto.tsetval"), 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    record["stream_edges"] = [{"source": 0, "target": 2, "pipe": "PIPE_V"}]
+    model = _ten_cycle_model()
+    model.operation_cycles["PIPE_S:TSETVAL"] = 1.0
+    vector_target = dsa_reuse_candidates.parse_candidate_record(
+        "0,1,0->1,ub->ub@vector_compute=>ub->ub@vector_compute,arenas=Vec->Vec,"
+        "write_after_read,no_logical_order,inter_operation,full_allocation,complete_access_set,"
+        "verified_initial_write,in_loop,distance_0,sites=3->7,"
+        "ranges=0+640->0+640,hazard=cross_resource,dag_path=none"
+    )
+
+    result = dsa_schedule_model.score_reuse_candidates(record, [vector_target], model)
+
+    candidate = result["candidates"][0]
+    assert candidate["next_pipe"] == "PIPE_S"
+    assert candidate["next_pipe_override"] == "ptoas_v057_tsetval_schedule_pipe"
+
+
 def test_main_scores_candidate_problem(tmp_path):
     record = _record()
     record["nodes"] = [
@@ -605,17 +689,32 @@ def test_qualify_command_is_timing_blind_and_hashes_sources(tmp_path):
     assert len(result["schedules"][0]["source_sha256"]) == 64
 
 
-def test_calibrate_uses_per_operation_and_pipe_medians(tmp_path):
+def test_calibrate_uses_complete_signatures_instead_of_family_medians(tmp_path):
     metrics = tmp_path / "instr_metrics.json"
+    small = {
+        "pipe": "PIPE_MTE2",
+        "operation": "TLOAD",
+        "dtype": "fp32",
+        "rows": 1,
+        "cols": 32,
+        "work_bytes": 128,
+        "operand_types": ["!pto.partition_tensor_view<1x32xf32>"],
+        "result_types": ["!pto.tile_buf<vec, 1x32xf32, valid=?x?>"],
+        "attributes": {},
+        "operand_constants": [None],
+    }
+    large = {**small, "rows": 16, "work_bytes": 2048}
+    large["operand_types"] = ["!pto.partition_tensor_view<16x32xf32>"]
+    large["result_types"] = ["!pto.tile_buf<vec, 16x32xf32, valid=?x?>"]
     metrics.write_text(
         json.dumps(
             {
                 "instructions": {
                     "core0": [
-                        {"pipe": "VECTOR", "name": "TADD", "cycles": 8},
-                        {"pipe": "VECTOR", "name": "TADD", "cycles": 12},
+                        {"pipe": "MTE2", "cycles": 30, "operation_signature": small},
+                        {"pipe": "MTE2", "cycles": 34, "operation_signature": small},
                     ],
-                    "core1": [{"pipe": "MTE2", "instruction": "TLOAD", "cycles": 30}],
+                    "core1": [{"pipe": "MTE2", "cycles": 1672, "operation_signature": large}],
                 }
             }
         )
@@ -623,11 +722,309 @@ def test_calibrate_uses_per_operation_and_pipe_medians(tmp_path):
 
     model = dsa_schedule_model.calibrate_from_metrics([metrics])
 
-    assert model.calibration_status == "simulator_instruction_medians"
-    assert model.operation_cycles["PIPE_V:TADD"] == 10.0
-    assert model.operation_cycles["PIPE_MTE2:TLOAD"] == 30.0
-    assert model.pipe_parameters["PIPE_V"].minimum_cycles == 10.0
+    assert model.calibration_status == "simulator_complete_signature_medians"
+    assert model.operation_cycles == {}
+    assert model.operation_signature_cycles[dsa_schedule_model._operation_signature_key(small)] == 32.0
+    assert model.operation_signature_cycles[dsa_schedule_model._operation_signature_key(large)] == 1672.0
+    assert model.pipe_parameters["PIPE_MTE2"].minimum_cycles == 34.0
     assert model.calibration_sources == [str(metrics)]
+
+
+def test_calibrate_rejects_family_only_samples(tmp_path):
+    metrics = tmp_path / "instr_metrics.json"
+    metrics.write_text(
+        json.dumps({"instructions": {"core0": [{"pipe": "MTE2", "name": "TLOAD", "cycles": 30}]}})
+    )
+
+    with pytest.raises(ValueError, match="complete-signature"):
+        dsa_schedule_model.calibrate_from_metrics([metrics])
+
+
+def test_complete_signature_preserves_modes_but_erases_ssa_names():
+    node = {
+        "id": 6,
+        "kind": "operation",
+        "pipe": "PIPE_S",
+        "op_name": "pto.tci",
+        "defs": [],
+        "uses": [],
+        "operation": {
+            "location": (
+                "pto.tci ins(%start : ui32) outs(%indices : "
+                "!pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=512, v_row=?, v_col=?, "
+                "blayout=row_major, slayout=none_box, fractal=512, pad=0>) "
+                '{descending = false} loc("pypto.access.6")'
+            ),
+            "operand_types": ["ui32"],
+            "result_types": [
+                "!pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=512, v_row=?, v_col=?, "
+                "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+            ],
+            "operand_constants": [None],
+            "attributes": {},
+            "static_work_bytes": 2048,
+        },
+    }
+
+    signature = dsa_schedule_model.operation_duration_signature(node)
+
+    assert "descending = false" in signature["semantic_operation"]
+    assert "%start" not in signature["semantic_operation"]
+    assert "%indices" not in signature["semantic_operation"]
+    assert "pypto.access" not in signature["semantic_operation"]
+
+
+def test_extract_calibration_binds_trace_to_exact_schedule_node(tmp_path):
+    schedule = tmp_path / "schedule.jsonl"
+    trace = tmp_path / "trace.json"
+    manifest = tmp_path / "manifest.json"
+    output = tmp_path / "metrics.json"
+    record = {
+        "schema_version": 1,
+        "function": "kernel",
+        "status": "analyzed",
+        "nodes": [
+            {
+                "id": 0,
+                "kind": "operation",
+                "pipe": "PIPE_V",
+                "op_name": "pto.texpands",
+                "defs": [],
+                "uses": [],
+                "operation": {
+                    "location": (
+                        "pto.texpands ins(%cst : f32) outs(%tile : "
+                        "!pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=32, v_row=?, v_col=?, "
+                        'blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc("x")'
+                    ),
+                    "operand_types": ["f32"],
+                    "result_types": [
+                        "!pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=32, v_row=?, v_col=?, "
+                        "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+                    ],
+                    "operand_constants": ["0.0 : f32"],
+                    "attributes": {},
+                    "static_work_bytes": 128,
+                },
+            }
+        ],
+        "stream_edges": [],
+        "sync_edges": [],
+    }
+    prefix = (
+        "TEXPANDS(1x32,fp32){pipe=VEC;"
+        "tiles=fp32:1x32:loc=0:storage=1x32:b=0:s=0:pad=0:compact=0;scalars=f32:0x0}"
+    )
+    schedule.write_text(json.dumps(record) + "\n")
+    trace.write_text(
+        json.dumps(
+            [
+                {"ph": "X", "name": f"{prefix}:7", "dur": 15},
+                {"ph": "X", "name": f"{prefix}:18", "dur": 17},
+            ]
+        )
+    )
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "measurements": [
+                    {
+                        "schedule": schedule.name,
+                        "function": "kernel",
+                        "node_id": 0,
+                        "trace": trace.name,
+                        "event_name_prefix": prefix,
+                    }
+                ],
+            }
+        )
+    )
+
+    assert dsa_schedule_model.main(["extract-calibration", str(manifest), "-o", str(output)]) == 0
+    metrics = json.loads(output.read_text())
+    records = next(iter(metrics["instructions"].values()))
+    assert [row["cycles"] for row in records] == [15.0, 17.0]
+    assert records[0]["operation_signature"]["operand_constants"] == ["0.0 : f32"]
+    assert records[0]["perf_sim_pipe"] == "PIPE_V"
+
+    bad_shape = prefix.replace("1x32", "1x64")
+    trace.write_text(json.dumps([{"ph": "X", "name": f"{bad_shape}:1", "dur": 2}]))
+    payload = json.loads(manifest.read_text())
+    payload["measurements"][0]["event_name_prefix"] = bad_shape
+    manifest.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="work signature differs"):
+        dsa_schedule_model.extract_signature_calibration(manifest)
+
+    bad_constant = prefix.replace("f32:0x0", "f32:0x3f800000")
+    trace.write_text(json.dumps([{"ph": "X", "name": f"{bad_constant}:1", "dur": 2}]))
+    payload["measurements"][0]["event_name_prefix"] = bad_constant
+    manifest.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="event constants differ"):
+        dsa_schedule_model.extract_signature_calibration(manifest)
+
+
+@pytest.mark.parametrize(
+    ("operand_dtype", "result_dtype", "round_mode", "round_value"),
+    [("bf16", "f32", "ROUND", 2), ("f32", "bf16", "RINT", 1)],
+)
+def test_perf_sim_header_uses_result_first_for_mixed_dtype_tcvt(
+    tmp_path, operand_dtype, result_dtype, round_mode, round_value
+):
+    def tile(dtype):
+        return (
+            f"!pto.tile_buf<loc=vec, dtype={dtype}, rows=8, cols=128, v_row=?, v_col=?, "
+            "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+        )
+
+    operand = tile(operand_dtype)
+    result = tile(result_dtype)
+    node = {
+        "id": 0,
+        "kind": "operation",
+        "pipe": "PIPE_V",
+        "op_name": "pto.tcvt",
+        "defs": [],
+        "uses": [],
+        "operation": {
+            "location": f"pto.tcvt ins(%src {{rmode = #pto<round_mode {round_mode}>}} : {operand}) "
+            f"outs(%dst : {result})",
+            "operand_types": [operand],
+            "result_types": [result],
+            "operand_constants": [None],
+            "attributes": {},
+            "static_work_bytes": 4096,
+        },
+    }
+    dtype_name = {"f32": "fp32", "bf16": "bf16"}
+    prefix = (
+        f"TCVT(8x128,{dtype_name[result_dtype]}){{pipe=VEC;"
+        f"tiles={dtype_name[result_dtype]}:8x128:loc=0:storage=8x128:b=0:s=0:pad=0:compact=0,"
+        f"{dtype_name[operand_dtype]}:8x128:loc=0:storage=8x128:b=0:s=0:pad=0:compact=0;"
+        f"scalars=enum:{round_value}}}"
+    )
+
+    event = dsa_schedule_model._parse_perf_sim_event_prefix(prefix)
+    dsa_schedule_model._validate_perf_sim_event_signature(
+        event, node, measurement_index=0, manifest=tmp_path / "manifest.json"
+    )
+
+
+@pytest.mark.parametrize("mismatch_reason", [None, "invented_reason"])
+def test_extract_calibration_rejects_unallowlisted_pipe_mismatch(tmp_path, mismatch_reason):
+    schedule = tmp_path / "schedule.jsonl"
+    trace = tmp_path / "trace.json"
+    manifest = tmp_path / "manifest.json"
+    record = {
+        "schema_version": 1,
+        "function": "kernel",
+        "status": "analyzed",
+        "nodes": [
+            {
+                "id": 0,
+                "kind": "operation",
+                "pipe": "PIPE_S",
+                "op_name": "pto.tci",
+                "defs": [],
+                "uses": [],
+                "operation": {
+                    "location": (
+                        "pto.tci ins(%start : ui32) outs(%tile : "
+                        "!pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=32, v_row=?, v_col=?, "
+                        "blayout=row_major, slayout=none_box, fractal=512, pad=0>) {descending = false}"
+                    ),
+                    "operand_types": [],
+                    "result_types": [
+                        "!pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=32, v_row=?, v_col=?, "
+                        "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+                    ],
+                    "operand_constants": [],
+                    "attributes": {},
+                    "static_work_bytes": 128,
+                },
+            }
+        ],
+        "stream_edges": [],
+        "sync_edges": [],
+    }
+    prefix = (
+        "TCI(1x32,uint32){pipe=VEC;tiles=uint32:1x32:loc=0:storage=1x32:b=0:s=0:pad=0:compact=0;scalars=u:0}"
+    )
+    schedule.write_text(json.dumps(record) + "\n")
+    trace.write_text(json.dumps([{"ph": "X", "name": f"{prefix}:1", "dur": 2}]))
+    measurement = {
+        "schedule": schedule.name,
+        "node_id": 0,
+        "trace": trace.name,
+        "event_name_prefix": prefix,
+    }
+    if mismatch_reason is not None:
+        measurement["pipe_mismatch_reason"] = mismatch_reason
+    manifest.write_text(json.dumps({"schema_version": 1, "measurements": [measurement]}))
+
+    with pytest.raises(ValueError, match="without an exact allowlisted exception"):
+        dsa_schedule_model.extract_signature_calibration(manifest)
+
+
+def test_extract_calibration_accepts_exact_tci_pipe_exception(tmp_path):
+    schedule = tmp_path / "schedule.jsonl"
+    trace = tmp_path / "trace.json"
+    manifest = tmp_path / "manifest.json"
+    tile = (
+        "!pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=32, v_row=?, v_col=?, "
+        "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+    )
+    record = {
+        "schema_version": 1,
+        "function": "kernel",
+        "status": "analyzed",
+        "nodes": [
+            {
+                "id": 0,
+                "kind": "operation",
+                "pipe": "PIPE_S",
+                "op_name": "pto.tci",
+                "defs": [],
+                "uses": [],
+                "operation": {
+                    "location": f"pto.tci ins(%start : ui32) outs(%tile : {tile}) {{descending = false}}",
+                    "operand_types": [],
+                    "result_types": [tile],
+                    "operand_constants": [],
+                    "attributes": {},
+                    "static_work_bytes": 128,
+                },
+            }
+        ],
+        "stream_edges": [],
+        "sync_edges": [],
+    }
+    prefix = (
+        "TCI(1x32,uint32){pipe=VEC;tiles=uint32:1x32:loc=0:storage=1x32:b=0:s=0:pad=0:compact=0;scalars=u:0}"
+    )
+    schedule.write_text(json.dumps(record) + "\n")
+    trace.write_text(json.dumps([{"ph": "X", "name": f"{prefix}:1", "dur": 2}]))
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "measurements": [
+                    {
+                        "schedule": schedule.name,
+                        "node_id": 0,
+                        "trace": trace.name,
+                        "event_name_prefix": prefix,
+                        "pipe_mismatch_reason": "ptoas_v057_tci_schedule_pipe",
+                    }
+                ],
+            }
+        )
+    )
+
+    result = dsa_schedule_model.extract_signature_calibration(manifest)
+    assert next(iter(result["instructions"].values()))[0]["pipe_mismatch_reason"] == (
+        "ptoas_v057_tci_schedule_pipe"
+    )
 
 
 def test_accumulating_matmul_keeps_full_calibration_key():

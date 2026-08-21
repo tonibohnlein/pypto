@@ -279,7 +279,7 @@ class PtoIsaDurationProvider:
         ):
             return self._unsupported(op_name, "missing PTOAS operand types")
         tiles = [
-            tile for item in [*operand_types, *result_types] if (tile := _parse_tile_type(item)) is not None
+            tile for item in [*operand_types, *result_types] if (tile := parse_tile_type(item)) is not None
         ]
 
         if op_name in _FORMULA_OPCODE:
@@ -439,7 +439,8 @@ def _parse_formula_parameters(path: Path) -> list[FormulaParameter]:
     return parameters
 
 
-def _parse_tile_type(value: str) -> TileType | None:
+def parse_tile_type(value: str) -> TileType | None:
+    """Parse a static PTO tile type for duration-signature construction."""
     if match := _KEYED_TILE_RE.search(value):
         dtype = _PTO_DTYPE.get(match.group("dtype").lower())
         if dtype is None:
@@ -471,7 +472,7 @@ def _parse_tile_type(value: str) -> TileType | None:
 
 def static_type_size_bytes(value: str) -> int | None:
     """Return the byte extent of one statically shaped PTO tile or partition type."""
-    if tile := _parse_tile_type(value):
+    if tile := parse_tile_type(value):
         element_bytes = _DTYPE_BYTES.get(tile.dtype)
         return tile.rows * tile.cols * element_bytes if element_bytes is not None else None
     match = _PARTITION_TYPE_RE.search(value)

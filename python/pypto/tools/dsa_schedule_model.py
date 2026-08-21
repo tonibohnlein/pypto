@@ -32,6 +32,7 @@ import json
 import math
 import re
 import statistics
+import struct
 import sys
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
@@ -41,6 +42,7 @@ from typing import Any
 
 from pypto.tools.dsa_pto_isa_duration import (
     PtoIsaDurationProvider,
+    parse_tile_type,
     provider_snapshot_sha256,
     static_type_size_bytes,
 )
@@ -96,6 +98,17 @@ _RESOURCE_PIPE = {
     "scalar_access": "PIPE_S",
 }
 
+# These exceptions describe an observed product-schedule contract, not a
+# guessed execution cost. PyPTO classifies TCI as vector work, and the A2/A3
+# Perf-Sim implementation charges it to the vector model, while PTOAS v0.57
+# places the corresponding schedule node on PIPE_S. Candidate edges must bind
+# to the pipe that InsertSync actually schedules. Keep the exception narrow so
+# every other route/pipe disagreement remains a hard error.
+_ROUTE_PIPE_JOIN_EXCEPTIONS = {
+    ("PIPE_V", "PIPE_S", "pto.tci"): "ptoas_v057_tci_schedule_pipe",
+    ("PIPE_V", "PIPE_S", "pto.tsetval"): "ptoas_v057_tsetval_schedule_pipe",
+}
+
 
 @dataclass(frozen=True)
 class PipeParameters:
@@ -123,6 +136,7 @@ class DurationModel:
     sync_latency_cycles: float = 0.0
     pipe_parameters: dict[str, PipeParameters] = field(default_factory=_default_pipe_parameters)
     operation_cycles: dict[str, float] = field(default_factory=dict)
+    operation_signature_cycles: dict[str, float] = field(default_factory=dict)
     calibration_sources: list[str] = field(default_factory=list)
     pto_isa_provider: PtoIsaDurationProvider | None = None
 
@@ -146,6 +160,9 @@ class DurationModel:
         raw_ops = value.get("operation_cycles", {})
         if not isinstance(raw_ops, Mapping):
             raise ValueError("operation_cycles must be an object")
+        raw_signatures = value.get("operation_signature_cycles", {})
+        if not isinstance(raw_signatures, Mapping):
+            raise ValueError("operation_signature_cycles must be an object")
         raw_provider = value.get("pto_isa_provider")
         if raw_provider is not None and not isinstance(raw_provider, Mapping):
             raise ValueError("pto_isa_provider must be an object")
@@ -156,6 +173,7 @@ class DurationModel:
             sync_latency_cycles=float(value.get("sync_latency_cycles", 0.0)),
             pipe_parameters=pipes,
             operation_cycles={str(key): float(cycles) for key, cycles in raw_ops.items()},
+            operation_signature_cycles={str(key): float(cycles) for key, cycles in raw_signatures.items()},
             calibration_sources=[str(path) for path in value.get("calibration_sources", [])],
             pto_isa_provider=(
                 PtoIsaDurationProvider.from_json(raw_provider) if raw_provider is not None else None
@@ -616,6 +634,22 @@ def _operation_key(pipe: str, name: str) -> str:
     return f"{pipe}:{_canonical_operation(name)}"
 
 
+def _semantic_operation_text(operation: Mapping[str, Any]) -> str | None:
+    """Return SSA-name- and location-independent operation syntax.
+
+    Operand/result types alone do not encode modes such as ``descending`` or
+    round/pad attributes. Keep the executable operation text in the complete
+    simulator signature, while erasing only unstable SSA identifiers and the
+    source location suffix.
+    """
+    location = operation.get("location")
+    if not isinstance(location, str) or not location:
+        return None
+    semantic = location.split(" loc(", maxsplit=1)[0]
+    semantic = _PTO_SSA_VALUE_RE.sub("%value", semantic)
+    return " ".join(semantic.split())
+
+
 def _memory_sizes(node: Mapping[str, Any], key: str) -> list[int]:
     entries = node.get(key, [])
     if not isinstance(entries, list):
@@ -651,6 +685,57 @@ def _work_bytes(node: Mapping[str, Any]) -> int:
             return min(def_bytes, use_bytes)
         return max(def_bytes, use_bytes)
     return max(defs + uses, default=0)
+
+
+def operation_duration_signature(node: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the complete static signature used by simulator calibration.
+
+    A family-wide median is deliberately insufficient: transfer and vector
+    costs vary materially with shape, type, route, mode, and constants.  A
+    calibration producer should copy this mapping from the schedule node it
+    measured instead of reconstructing it heuristically from an opcode name.
+    """
+    pipe = node.get("pipe")
+    op_name = node.get("op_name")
+    operation = node.get("operation")
+    if not isinstance(pipe, str) or not isinstance(op_name, str) or not isinstance(operation, Mapping):
+        raise ValueError("duration signature requires pipe, op_name, and operation metadata")
+    operand_types = operation.get("operand_types", [])
+    result_types = operation.get("result_types", [])
+    if (
+        not isinstance(operand_types, list)
+        or not all(isinstance(item, str) for item in operand_types)
+        or not isinstance(result_types, list)
+        or not all(isinstance(item, str) for item in result_types)
+    ):
+        raise ValueError("duration signature requires string operand_types and result_types")
+    tiles = [tile for item in [*operand_types, *result_types] if (tile := parse_tile_type(item)) is not None]
+    work_tile = tiles[0] if tiles else None
+    constants = operation.get("operand_constants", [])
+    attributes = operation.get("attributes", {})
+    if not isinstance(constants, list) or not isinstance(attributes, Mapping):
+        raise ValueError("duration signature has invalid constants or attributes")
+    return {
+        "pipe": pipe,
+        "operation": _canonical_operation(op_name),
+        "dtype": work_tile.dtype if work_tile is not None else None,
+        "rows": work_tile.rows if work_tile is not None else None,
+        "cols": work_tile.cols if work_tile is not None else None,
+        "work_bytes": _work_bytes(node),
+        "operand_types": operand_types,
+        "result_types": result_types,
+        "attributes": dict(sorted((str(key), value) for key, value in attributes.items())),
+        "operand_constants": constants,
+        "semantic_operation": _semantic_operation_text(operation),
+    }
+
+
+def _operation_signature_key(signature: Mapping[str, Any]) -> str:
+    required = {"pipe", "operation", "dtype", "rows", "cols", "work_bytes"}
+    if not required.issubset(signature):
+        missing = sorted(required - set(signature))
+        raise ValueError(f"operation signature is missing fields: {missing}")
+    return json.dumps(signature, sort_keys=True, separators=(",", ":"))
 
 
 def _loop_multipliers(record: Mapping[str, Any]) -> tuple[dict[int, int], list[int]]:
@@ -692,8 +777,18 @@ def estimate_node_durations(
             raise ValueError("operation node must have integer id, pipe, and op_name")
 
         key = _operation_key(pipe, op_name)
+        signature_key = (
+            _operation_signature_key(operation_duration_signature(node))
+            if model.operation_signature_cycles
+            else None
+        )
         work_bytes = _work_bytes(node)
-        if key in model.operation_cycles:
+        if signature_key is not None and signature_key in model.operation_signature_cycles:
+            base = model.operation_signature_cycles[signature_key]
+            source = "simulator_complete_signature_median"
+            detail = f"complete operation signature {signature_key}"
+            fallback = False
+        elif not model.operation_signature_cycles and key in model.operation_cycles:
             base = model.operation_cycles[key]
             source = "simulator_operation_median"
             detail = f"explicit operation override {key}"
@@ -704,6 +799,11 @@ def estimate_node_durations(
             source = estimate.source
             detail = estimate.detail
             fallback = estimate.fallback
+        elif model.operation_signature_cycles:
+            raise ValueError(
+                f"no exact-signature duration estimate for {op_name} on {pipe}; "
+                "configure the pinned PTO-ISA provider or add this complete signature"
+            )
         else:
             parameters = model.pipe_parameters.get(pipe)
             if parameters is None:
@@ -1145,6 +1245,50 @@ def _site_nodes(record: Mapping[str, Any]) -> dict[tuple[int, str], list[int]]:
     return result
 
 
+def _node_operation_name(node: Mapping[str, Any]) -> str | None:
+    operation = node.get("operation")
+    if isinstance(operation, Mapping):
+        raw_name = operation.get("raw_pto_op_name")
+        if isinstance(raw_name, str):
+            return _join_operation_name(raw_name)
+    op_name = node.get("op_name")
+    return _join_operation_name(op_name) if isinstance(op_name, str) else None
+
+
+def _resolve_candidate_site(
+    indexed_nodes: Mapping[tuple[int, str], list[int]],
+    nodes_by_id: Mapping[int, Mapping[str, Any]],
+    *,
+    access_order: int,
+    route_pipe: str,
+) -> tuple[list[int], str, str | None]:
+    """Bind one PyPTO access site to the pipe PTOAS actually schedules.
+
+    Exact route/pipe agreement is the default. A small explicit exception set
+    handles operations whose PyPTO execution-resource classification and
+    PTOAS scheduling pipe are known to differ. Ambiguous sites and all unknown
+    disagreements still fail closed.
+    """
+    exact = indexed_nodes.get((access_order, route_pipe), [])
+    if exact:
+        return exact, route_pipe, None
+
+    matches: list[tuple[list[int], str, str]] = []
+    for (site, schedule_pipe), node_ids in indexed_nodes.items():
+        if site != access_order or not node_ids:
+            continue
+        names = {_node_operation_name(nodes_by_id[node_id]) for node_id in node_ids}
+        if len(names) != 1 or None in names:
+            continue
+        operation_name = next(iter(names))
+        reason = _ROUTE_PIPE_JOIN_EXCEPTIONS.get((route_pipe, schedule_pipe, operation_name))
+        if reason is not None:
+            matches.append((node_ids, schedule_pipe, reason))
+    if len(matches) == 1:
+        return matches[0]
+    return [], route_pipe, None
+
+
 def _deduplicate_scored_candidate_edges(
     rows: Sequence[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1513,15 +1657,25 @@ def score_reuse_candidates(
                 }
             )
             continue
-        prior_pipe = _route_pipe(candidate.prior_route)
-        next_pipe = _route_pipe(candidate.next_route)
-        prior_nodes = indexed_nodes.get((candidate.prior_access_order, prior_pipe), [])
-        next_nodes = indexed_nodes.get((candidate.next_access_order, next_pipe), [])
+        prior_route_pipe = _route_pipe(candidate.prior_route)
+        next_route_pipe = _route_pipe(candidate.next_route)
+        prior_nodes, prior_pipe, prior_pipe_override = _resolve_candidate_site(
+            indexed_nodes,
+            nodes_by_id,
+            access_order=candidate.prior_access_order,
+            route_pipe=prior_route_pipe,
+        )
+        next_nodes, next_pipe, next_pipe_override = _resolve_candidate_site(
+            indexed_nodes,
+            nodes_by_id,
+            access_order=candidate.next_access_order,
+            route_pipe=next_route_pipe,
+        )
         if not prior_nodes or not next_nodes:
             raise ValueError(
                 "candidate site did not join to the expected PTOAS pipe: "
                 f"sites={candidate.prior_access_order}->{candidate.next_access_order}, "
-                f"pipes={prior_pipe}->{next_pipe}, found={prior_nodes}->{next_nodes}"
+                f"pipes={prior_route_pipe}->{next_route_pipe}, found={prior_nodes}->{next_nodes}"
             )
         source = prior_nodes[-1]
         target = next_nodes[0]
@@ -1551,8 +1705,12 @@ def score_reuse_candidates(
                     "next_buffer": candidate.next_buffer,
                     "prior_access_order": candidate.prior_access_order,
                     "next_access_order": candidate.next_access_order,
+                    "prior_route_pipe": prior_route_pipe,
+                    "next_route_pipe": next_route_pipe,
                     "prior_pipe": prior_pipe,
                     "next_pipe": next_pipe,
+                    "prior_pipe_override": prior_pipe_override,
+                    "next_pipe_override": next_pipe_override,
                     "source_node": source,
                     "target_node": target,
                     "source_macro_nodes": prior_nodes,
@@ -1581,8 +1739,12 @@ def score_reuse_candidates(
                 "next_buffer": candidate.next_buffer,
                 "prior_access_order": candidate.prior_access_order,
                 "next_access_order": candidate.next_access_order,
+                "prior_route_pipe": prior_route_pipe,
+                "next_route_pipe": next_route_pipe,
                 "prior_pipe": prior_pipe,
                 "next_pipe": next_pipe,
+                "prior_pipe_override": prior_pipe_override,
+                "next_pipe_override": next_pipe_override,
                 "source_node": source,
                 "target_node": target,
                 "source_macro_nodes": prior_nodes,
@@ -1668,9 +1830,9 @@ def _as_number(value: Any) -> float | None:
 
 
 def calibrate_from_metrics(paths: Sequence[str | Path], base: DurationModel | None = None) -> DurationModel:
-    """Calibrate operation and pipe medians from cleaned simulator metrics."""
+    """Calibrate complete operation signatures from cleaned simulator metrics."""
     model = base or DurationModel()
-    by_operation: dict[str, list[float]] = defaultdict(list)
+    by_signature: dict[str, list[float]] = defaultdict(list)
     by_pipe: dict[str, list[float]] = defaultdict(list)
     used_sources: list[str] = []
     for raw_path in paths:
@@ -1688,25 +1850,24 @@ def calibrate_from_metrics(paths: Sequence[str | Path], base: DurationModel | No
                     continue
                 cycles = _as_number(record.get("cycles"))
                 raw_pipe = record.get("pipe")
-                raw_name = next(
-                    (
-                        record.get(key)
-                        for key in ("instruction", "instruction_name", "name", "opcode", "api")
-                        if isinstance(record.get(key), str) and record.get(key)
-                    ),
-                    None,
-                )
                 if cycles is None or cycles <= 0 or not isinstance(raw_pipe, str):
                     continue
                 pipe = _PIPE_ALIASES.get(raw_pipe.upper(), raw_pipe.upper())
+                raw_signature = record.get("operation_signature")
+                if not isinstance(raw_signature, Mapping):
+                    continue
+                signature = dict(raw_signature)
+                signature["pipe"] = _PIPE_ALIASES.get(
+                    str(signature.get("pipe", "")).upper(), signature.get("pipe")
+                )
+                signature_key = _operation_signature_key(signature)
                 by_pipe[pipe].append(cycles)
-                if raw_name is not None:
-                    by_operation[_operation_key(pipe, raw_name)].append(cycles)
+                by_signature[signature_key].append(cycles)
                 source_used = True
         if source_used:
             used_sources.append(str(path))
     if not used_sources:
-        raise ValueError("no finite positive instruction cycle samples found")
+        raise ValueError("no finite positive complete-signature instruction cycle samples found")
 
     calibrated_pipes = dict(model.pipe_parameters)
     for pipe, samples in by_pipe.items():
@@ -1716,20 +1877,349 @@ def calibrate_from_metrics(paths: Sequence[str | Path], base: DurationModel | No
             bytes_per_cycle=previous.bytes_per_cycle,
             minimum_cycles=statistics.median(samples),
         )
-    operation_cycles = dict(model.operation_cycles)
-    operation_cycles.update({key: statistics.median(samples) for key, samples in by_operation.items()})
+    signature_cycles = dict(model.operation_signature_cycles)
+    signature_cycles.update({key: statistics.median(samples) for key, samples in by_signature.items()})
     return DurationModel(
         schema_version=1,
         model_version="duration_v1",
         calibration_status=(
-            "simulator_overrides+pto_isa" if model.pto_isa_provider else "simulator_instruction_medians"
+            "simulator_signature_overrides+pto_isa"
+            if model.pto_isa_provider
+            else "simulator_complete_signature_medians"
         ),
         sync_latency_cycles=model.sync_latency_cycles,
         pipe_parameters=calibrated_pipes,
-        operation_cycles=operation_cycles,
+        operation_cycles=dict(model.operation_cycles),
+        operation_signature_cycles=signature_cycles,
         calibration_sources=sorted(used_sources),
         pto_isa_provider=model.pto_isa_provider,
     )
+
+
+_PERF_SIM_PIPE_FROM_EVENT = {
+    "Scalar": "PIPE_S",
+    "VEC": "PIPE_V",
+    "MTE2_AIV": "PIPE_MTE2",
+    "MTE2_AIC": "PIPE_MTE2",
+    "MTE3": "PIPE_MTE3",
+    "MTE1": "PIPE_MTE1",
+    "FIXP": "PIPE_FIX",
+    "CUBE": "PIPE_M",
+}
+_PERF_SIM_SEQUENCE_RE = re.compile(r":\d+$")
+_PERF_SIM_SIGNATURE_EVENT_RE = re.compile(
+    r"^(?P<operation>[A-Z0-9_]+)\((?P<rows>\d+)x(?P<cols>\d+),(?P<dtype>[A-Za-z0-9_]+)\)"
+    r"\{pipe=(?P<pipe>[^;}]+)(?:;tiles=(?P<tiles>[^;}]*))?(?:;scalars=(?P<scalars>[^}]*))?\}$"
+)
+_PERF_SIM_TILE_RE = re.compile(
+    r"^(?P<dtype>[A-Za-z0-9_]+):(?P<rows>\d+)x(?P<cols>\d+)"
+    r":loc=(?P<loc>\d+):storage=(?P<storage_rows>\d+)x(?P<storage_cols>\d+)"
+    r":b=(?P<block_layout>\d+):s=(?P<storage_layout>\d+)"
+    r":pad=(?P<pad>\d+):compact=(?P<compact>\d+)$"
+)
+_PERF_SIM_DTYPE_CANONICAL = {
+    "int8": "i8",
+    "uint8": "u8",
+    "int16": "i16",
+    "uint16": "u16",
+    "int32": "i32",
+    "uint32": "u32",
+}
+_CALIBRATION_PIPE_MISMATCH_EXCEPTIONS = {
+    ("TCI", "PIPE_S", "PIPE_V", "ptoas_v057_tci_schedule_pipe"),
+}
+_PERF_SIM_SOURCE_WORK_OPERATIONS = {
+    "TROWSUM",
+    "TROWMAX",
+    "TROWMIN",
+    "TROWPROD",
+    "TCOLSUM",
+    "TCOLMAX",
+    "TCOLMIN",
+    "TCOLPROD",
+}
+_TILE_SCOPE_CODE = {
+    "vec": 0,
+    "mat": 1,
+    "left": 2,
+    "right": 3,
+    "acc": 4,
+    "bias": 5,
+    "scaling": 6,
+    "scale_left": 7,
+    "scale_right": 8,
+    "ctrl": 9,
+}
+_BLOCK_LAYOUT_CODE = {"row_major": 0, "col_major": 1}
+_STORAGE_LAYOUT_CODE = {"none_box": 0, "row_major": 1, "col_major": 2}
+_KEYED_TILE_FIELD_RE = re.compile(r"\b([a-z_]+)=([^,>]+)", re.IGNORECASE)
+
+
+def _parse_perf_sim_event_prefix(prefix: str) -> dict[str, Any]:
+    match = _PERF_SIM_SIGNATURE_EVENT_RE.fullmatch(prefix)
+    if match is None:
+        raise ValueError(f"malformed Perf-Sim event prefix: {prefix}")
+    tiles: list[dict[str, Any]] = []
+    raw_tiles = match.group("tiles")
+    if raw_tiles:
+        for raw_tile in raw_tiles.split(","):
+            tile_match = _PERF_SIM_TILE_RE.fullmatch(raw_tile)
+            if tile_match is None:
+                raise ValueError(f"malformed Perf-Sim tile signature: {raw_tile}")
+            tile = tile_match.groupdict()
+            tiles.append(
+                {
+                    "dtype": _PERF_SIM_DTYPE_CANONICAL.get(tile["dtype"], tile["dtype"]),
+                    "rows": int(tile["rows"]),
+                    "cols": int(tile["cols"]),
+                    "loc": int(tile["loc"]),
+                    "storage_rows": int(tile["storage_rows"]),
+                    "storage_cols": int(tile["storage_cols"]),
+                    "block_layout": int(tile["block_layout"]),
+                    "storage_layout": int(tile["storage_layout"]),
+                    "pad": int(tile["pad"]),
+                    "compact": int(tile["compact"]),
+                }
+            )
+    return {
+        "operation": match.group("operation"),
+        "rows": int(match.group("rows")),
+        "cols": int(match.group("cols")),
+        "dtype": _PERF_SIM_DTYPE_CANONICAL.get(match.group("dtype"), match.group("dtype")),
+        "pipe": match.group("pipe"),
+        "tiles": tiles,
+        "scalars": match.group("scalars").split(",") if match.group("scalars") else [],
+    }
+
+
+def _expected_perf_sim_tile(raw_type: str) -> dict[str, Any] | None:
+    tile = parse_tile_type(raw_type)
+    if tile is None:
+        return None
+    fields = {key.lower(): value.strip().lower() for key, value in _KEYED_TILE_FIELD_RE.findall(raw_type)}
+    required = {"loc", "blayout", "slayout", "pad"}
+    if not required.issubset(fields):
+        raise ValueError(f"calibration requires a keyed tile type with layout and pad metadata: {raw_type}")
+    try:
+        return {
+            "dtype": tile.dtype,
+            "rows": tile.rows,
+            "cols": tile.cols,
+            "loc": _TILE_SCOPE_CODE[fields["loc"]],
+            "storage_rows": tile.rows,
+            "storage_cols": tile.cols,
+            "block_layout": _BLOCK_LAYOUT_CODE[fields["blayout"]],
+            "storage_layout": _STORAGE_LAYOUT_CODE[fields["slayout"]],
+            "pad": int(fields["pad"], 0),
+            "compact": int(fields.get("compact", "0"), 0),
+        }
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"unsupported keyed tile metadata in calibration type: {raw_type}") from error
+
+
+def _expected_perf_sim_scalar(raw_constant: Any) -> str | None:
+    if not isinstance(raw_constant, str):
+        return None
+    match = re.fullmatch(r"\s*(.+?)\s*:\s*(f32|f64|i\d+|ui\d+|index)\s*", raw_constant)
+    if match is None:
+        raise ValueError(f"unsupported static calibration constant: {raw_constant}")
+    value, dtype = match.groups()
+    if dtype == "f32":
+        bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
+        return f"f32:0x{bits:x}"
+    if dtype == "f64":
+        bits = struct.unpack("<Q", struct.pack("<d", float(value)))[0]
+        return f"f64:0x{bits:x}"
+    prefix = "u" if dtype.startswith("ui") else "i"
+    return f"{prefix}:{int(value, 0)}"
+
+
+def _semantic_perf_sim_scalars(operation: Mapping[str, Any], op_name: str) -> list[str]:
+    location = operation.get("location")
+    if not isinstance(location, str):
+        return []
+    if op_name == "pto.tcvt":
+        match = re.search(r"rmode\s*=\s*#pto<round_mode\s+([A-Z_]+)>", location)
+        if match is None:
+            raise ValueError("TCVT calibration requires a static round mode")
+        round_modes = {"NONE": 0, "RINT": 1, "ROUND": 2, "FLOOR": 3, "CEIL": 4, "TRUNC": 5, "ODD": 6}
+        if match.group(1) not in round_modes:
+            raise ValueError(f"unsupported TCVT round mode in calibration: {match.group(1)}")
+        return [f"enum:{round_modes[match.group(1)]}"]
+    return []
+
+
+def _validate_perf_sim_event_signature(
+    event: Mapping[str, Any], node: Mapping[str, Any], *, measurement_index: int, manifest: Path
+) -> None:
+    signature = operation_duration_signature(node)
+    operation = node.get("operation")
+    if not isinstance(operation, Mapping):
+        raise ValueError(f"{manifest}: measurement {measurement_index} lacks operation metadata")
+    operand_types = operation.get("operand_types", [])
+    result_types = operation.get("result_types", [])
+    if not isinstance(operand_types, list) or not isinstance(result_types, list):
+        raise ValueError(f"{manifest}: measurement {measurement_index} has invalid operation types")
+    expected_tiles = [
+        tile
+        for raw_type in [*result_types, *operand_types]
+        if isinstance(raw_type, str) and (tile := _expected_perf_sim_tile(raw_type)) is not None
+    ]
+    if not expected_tiles:
+        raise ValueError(f"{manifest}: measurement {measurement_index} has no statically typed tile")
+    work_index = (
+        1 if signature["operation"] in _PERF_SIM_SOURCE_WORK_OPERATIONS and len(expected_tiles) > 1 else 0
+    )
+    work_tile = expected_tiles[work_index]
+    expected_header = {
+        "operation": signature["operation"],
+        "rows": work_tile["rows"],
+        "cols": work_tile["cols"],
+        "dtype": work_tile["dtype"],
+    }
+    actual_header = {key: event[key] for key in expected_header}
+    if actual_header != expected_header:
+        raise ValueError(
+            f"{manifest}: measurement {measurement_index} event work signature differs from schedule: "
+            f"expected={expected_header}, actual={actual_header}"
+        )
+    if event["tiles"] != expected_tiles:
+        raise ValueError(
+            f"{manifest}: measurement {measurement_index} event tile roles/layouts differ from schedule: "
+            f"expected={expected_tiles}, actual={event['tiles']}"
+        )
+
+    constants = operation.get("operand_constants", [])
+    if not isinstance(constants, list):
+        raise ValueError(f"{manifest}: measurement {measurement_index} has invalid operand constants")
+    expected_scalars = [
+        scalar for constant in constants if (scalar := _expected_perf_sim_scalar(constant)) is not None
+    ]
+    expected_scalars.extend(_semantic_perf_sim_scalars(operation, str(node.get("op_name", ""))))
+    if expected_scalars and event["scalars"][: len(expected_scalars)] != expected_scalars:
+        raise ValueError(
+            f"{manifest}: measurement {measurement_index} event constants differ from schedule: "
+            f"expected={expected_scalars}, actual={event['scalars']}"
+        )
+
+
+def extract_signature_calibration(  # noqa: PLR0912 - fail-closed manifest validation is explicit
+    manifest_path: str | Path,
+) -> dict[str, Any]:
+    """Bind Perf-Sim events to exact schedule-node signatures.
+
+    The manifest is deliberately explicit: each measurement names a schedule
+    node and the full Perf-Sim event prefix emitted by its matching
+    microkernel. This prevents an opcode-family or shape-only join from
+    silently merging different modes, constants, layouts, or operand roles.
+    """
+    path = Path(manifest_path)
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
+        raise ValueError(f"{path}: expected calibration manifest schema_version=1")
+    measurements = payload.get("measurements")
+    if not isinstance(measurements, list) or not measurements:
+        raise ValueError(f"{path}: measurements must be a non-empty array")
+
+    instructions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    sources: dict[Path, str] = {}
+    schedule_sources: dict[Path, str] = {}
+    for index, raw in enumerate(measurements):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{path}: measurement {index} must be an object")
+        raw_schedule = raw.get("schedule")
+        raw_trace = raw.get("trace")
+        function = raw.get("function")
+        node_id = raw.get("node_id")
+        event_prefix = raw.get("event_name_prefix")
+        if (
+            not isinstance(raw_schedule, str)
+            or not isinstance(raw_trace, str)
+            or (function is not None and not isinstance(function, str))
+            or not isinstance(node_id, int)
+            or not isinstance(event_prefix, str)
+            or not event_prefix
+        ):
+            raise ValueError(f"{path}: measurement {index} has invalid fields")
+
+        schedule_path = Path(raw_schedule)
+        trace_path = Path(raw_trace)
+        if not schedule_path.is_absolute():
+            schedule_path = (path.parent / schedule_path).resolve()
+        if not trace_path.is_absolute():
+            trace_path = (path.parent / trace_path).resolve()
+        record, resolved_function = _resolve_schedule_record(schedule_path, function)
+        nodes = [
+            node
+            for node in record.get("nodes", [])
+            if isinstance(node, Mapping) and node.get("id") == node_id and node.get("kind") == "operation"
+        ]
+        if len(nodes) != 1:
+            raise ValueError(f"{path}: measurement {index} does not identify one operation node {node_id}")
+        node = nodes[0]
+        expected_opcode = _canonical_operation(str(node.get("op_name", "")))
+        event_signature = _parse_perf_sim_event_prefix(event_prefix)
+        _validate_perf_sim_event_signature(event_signature, node, measurement_index=index, manifest=path)
+
+        trace = json.loads(trace_path.read_text())
+        if not isinstance(trace, list):
+            raise ValueError(f"{trace_path}: expected a Perf-Sim Chrome trace array")
+        samples: list[tuple[float, str]] = []
+        for event in trace:
+            if not isinstance(event, Mapping) or event.get("ph") != "X":
+                continue
+            name = event.get("name")
+            cycles = _as_number(event.get("dur"))
+            if not isinstance(name, str) or cycles is None or cycles <= 0:
+                continue
+            if _PERF_SIM_SEQUENCE_RE.sub("", name) == event_prefix:
+                samples.append((cycles, name))
+        if not samples:
+            raise ValueError(f"{path}: measurement {index} matched no positive Perf-Sim events")
+
+        event_pipe_name = event_signature["pipe"]
+        if event_pipe_name not in _PERF_SIM_PIPE_FROM_EVENT:
+            raise ValueError(f"{path}: measurement {index} event has no recognized pipe")
+        event_pipe = _PERF_SIM_PIPE_FROM_EVENT[event_pipe_name]
+        schedule_pipe = str(node.get("pipe"))
+        pipe_mismatch = event_pipe != schedule_pipe
+        mismatch_reason = raw.get("pipe_mismatch_reason")
+        mismatch_key = (expected_opcode, schedule_pipe, event_pipe, mismatch_reason)
+        if pipe_mismatch and mismatch_key not in _CALIBRATION_PIPE_MISMATCH_EXCEPTIONS:
+            raise ValueError(
+                f"{path}: measurement {index} event pipe {event_pipe} differs from "
+                f"schedule pipe {schedule_pipe} without an exact allowlisted exception"
+            )
+        if not pipe_mismatch and mismatch_reason is not None:
+            raise ValueError(f"{path}: measurement {index} declares a vacuous pipe mismatch")
+
+        signature = operation_duration_signature(node)
+        key = f"{schedule_path}:{resolved_function}:{node_id}"
+        for cycles, event_name in samples:
+            instructions[key].append(
+                {
+                    "pipe": schedule_pipe,
+                    "cycles": cycles,
+                    "operation_signature": signature,
+                    "schedule_node_id": node_id,
+                    "event_name": event_name,
+                    "perf_sim_pipe": event_pipe,
+                    "pipe_mismatch_reason": mismatch_reason,
+                }
+            )
+        sources[trace_path] = hashlib.sha256(trace_path.read_bytes()).hexdigest()
+        schedule_sources[schedule_path] = hashlib.sha256(schedule_path.read_bytes()).hexdigest()
+
+    return {
+        "schema_version": 1,
+        "calibration_scope": "complete_schedule_signature",
+        "manifest": {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()},
+        "sources": [{"path": str(source), "sha256": digest} for source, digest in sorted(sources.items())],
+        "schedule_sources": [
+            {"path": str(source), "sha256": digest} for source, digest in sorted(schedule_sources.items())
+        ],
+        "instructions": dict(sorted(instructions.items())),
+    }
 
 
 def _load_model(
@@ -2297,6 +2787,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     calibrate_parser.add_argument("--base-model", type=Path)
     calibrate_parser.add_argument("-o", "--output", type=Path, required=True)
 
+    extract_calibration_parser = subparsers.add_parser(
+        "extract-calibration",
+        help="bind Perf-Sim events to exact schedule-node duration signatures",
+    )
+    extract_calibration_parser.add_argument("manifest", type=Path)
+    extract_calibration_parser.add_argument("-o", "--output", type=Path, required=True)
+
     snapshot_parser = subparsers.add_parser(
         "snapshot-duration", help="write a portable pinned duration-model snapshot"
     )
@@ -2356,6 +2853,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             calibrated = calibrate_from_metrics(args.metrics, base)
             _write_json(args.output, calibrated.to_json())
+            return 0
+        if args.command == "extract-calibration":
+            _write_json(args.output, extract_signature_calibration(args.manifest))
             return 0
         if args.command == "import-debug":
             record = import_insert_sync_debug(
