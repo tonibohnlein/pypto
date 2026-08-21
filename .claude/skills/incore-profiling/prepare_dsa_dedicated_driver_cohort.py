@@ -20,8 +20,6 @@ Selection is timing-blind.  Only source contracts, problem identity, and
 four-arm/four-capacity host feasibility are consulted.
 """
 
-from __future__ import annotations
-
 import argparse
 import ast
 import csv
@@ -35,6 +33,19 @@ from typing import Any
 
 ARMS = ("geometry_ff", "geometry_cg", "cypress", "dsa_rp_cg")
 CAPACITIES = ("native", "half", "q1", "tight")
+_SCREEN_SEMANTIC_FIELDS = (
+    "tier",
+    "driver_id",
+    "instance",
+    "problem_fingerprint",
+    "pool_id",
+    "pool",
+    "capacity",
+    "capacity_bytes",
+    "arm",
+    "status",
+    "placement_sha256",
+)
 _REQUIRED_DRIVER_FIELDS = ("driver_id", "script", "entry", "golden", "specs", "argv", "targets")
 _REQUIRED_TARGET_FIELDS = ("instance", "problem_fingerprint", "pool_id", "operation_class")
 _MEASUREMENT_CONTRACT = {
@@ -50,6 +61,42 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _semantic_sha256(value: Any) -> str:
+    canonical = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _load_catalog(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    catalog = json.loads(path.read_text())
+    source_hashes = {"catalog_source_sha256": _sha256(path)}
+    base_name = catalog.pop("extends", None)
+    if base_name is None:
+        source_hashes["catalog_semantics_sha256"] = _semantic_sha256(catalog)
+        return catalog, source_hashes
+
+    base_path = path.parent / str(base_name)
+    base = json.loads(base_path.read_text())
+    if "extends" in base:
+        raise ValueError("nested catalog extensions are not supported")
+    excluded = set(catalog.pop("exclude_driver_ids", []))
+    base_driver_ids = {driver["driver_id"] for driver in base["drivers"]}
+    unknown_exclusions = excluded - base_driver_ids
+    if unknown_exclusions:
+        raise ValueError(f"catalog excludes unknown drivers: {', '.join(sorted(unknown_exclusions))}")
+    additions = catalog.pop("drivers", [])
+    merged = dict(base)
+    merged.update(catalog)
+    merged["drivers"] = [driver for driver in base["drivers"] if driver["driver_id"] not in excluded]
+    merged["drivers"].extend(additions)
+    source_hashes.update(
+        {
+            "base_catalog_source_sha256": _sha256(base_path),
+            "catalog_semantics_sha256": _semantic_sha256(merged),
+        }
+    )
+    return merged, source_hashes
+
+
 def _read_tsv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as source:
         return [dict(row) for row in csv.DictReader(source, delimiter="\t")]
@@ -60,6 +107,13 @@ def _write_tsv(path: Path, columns: Sequence[str], rows: Sequence[Mapping[str, A
         writer = csv.DictWriter(output, fieldnames=columns, delimiter="\t", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _screen_semantics_sha256(rows: Sequence[Mapping[str, Any]]) -> str:
+    semantic_rows = [{field: str(row[field]) for field in _SCREEN_SEMANTIC_FIELDS} for row in rows]
+    semantic_rows.sort(key=lambda row: tuple(row[field] for field in _SCREEN_SEMANTIC_FIELDS))
+    canonical = json.dumps(semantic_rows, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _git_head(root: Path) -> str:
@@ -194,7 +248,7 @@ def prepare_cohort(
     inventory_file = Path(problem_inventory_path)
     screen_file = Path(screen_results_path)
     output = Path(output_directory)
-    catalog = json.loads(catalog_file.read_text())
+    catalog, catalog_hashes = _load_catalog(catalog_file)
     _validate_catalog(catalog)
 
     actual_revision = _git_head(lib_root)
@@ -325,7 +379,7 @@ def prepare_cohort(
             )
 
     frozen = {
-        "schema_version": 1,
+        "schema_version": 2,
         "selection_policy": catalog["selection_policy"],
         "timing_blind_selection": True,
         "pypto_lib_revision": actual_revision,
@@ -339,9 +393,10 @@ def prepare_cohort(
         "expanded_problem_count": sum(row["tier"] in {"expanded", "canary_expanded"} for row in problem_rows),
         "operation_classes": sorted({row["operation_class"] for row in problem_rows}),
         "inputs": {
-            "catalog_sha256": _sha256(catalog_file),
+            **catalog_hashes,
             "problem_inventory_sha256": _sha256(inventory_file),
-            "screen_results_sha256": _sha256(screen_file),
+            "screen_semantics_sha256": _screen_semantics_sha256(cell_rows),
+            "screen_semantics_fields": list(_SCREEN_SEMANTIC_FIELDS),
         },
         "drivers": frozen_drivers,
     }
