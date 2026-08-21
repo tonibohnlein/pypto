@@ -82,11 +82,11 @@ struct OpMemorySpaceSpec {
 /**
  * @brief Evidence available to analyses of an operation's physical accesses.
  *
- * Unknown is deliberately the default. Functional means every tile operand is
- * read and every tile-typed SSA result is written, with no hidden tile
- * workspace or mutation; range-sensitive analyses must still prove that an
- * access covers the whole allocation. NoAccess marks declarations and
- * zero-copy metadata operations that execute no memory access.
+ * Unknown is deliberately the default. Functional means every tile access is
+ * described by the operator's ArgEffect declarations and tile-typed SSA
+ * results, with no hidden tile workspace or mutation; range-sensitive analyses
+ * must still prove that an access covers the whole allocation. NoAccess marks
+ * declarations and zero-copy metadata operations that execute no memory access.
  */
 enum class ExecutionMemoryAccessEvidence : uint8_t {
   Unknown,

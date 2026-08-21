@@ -131,6 +131,17 @@ bool SameAllocation(const VarPtr& first, const VarPtr& second) {
   return GetDefinedMemRef(first_tile)->base_.get() == GetDefinedMemRef(second_tile)->base_.get();
 }
 
+ArgEffect GetArgumentEffect(const CallPtr& call, size_t argument_index) {
+  const auto& registry = OpRegistry::GetInstance();
+  if (!call || !call->op_ || !registry.IsRegistered(call->op_->name_)) return ArgEffect::Read;
+  return registry.GetEntry(call->op_->name_).GetArgEffect(argument_index, call->kwargs_);
+}
+
+bool ResultWriteIsRepresentedByArgument(const VarPtr& result, const std::vector<VarPtr>& arguments) {
+  return result && std::any_of(arguments.begin(), arguments.end(),
+                               [&](const VarPtr& argument) { return SameAllocation(result, argument); });
+}
+
 using TupleResultElements = std::unordered_map<const Var*, std::map<int, VarPtr>>;
 
 class TupleResultCollector : public IRVisitor {
@@ -330,15 +341,25 @@ class AccessCollector : public IRVisitor {
     const std::vector<VarPtr> results = ResolveCallResults(result);
     const bool whole_assemble = IsProvablyWholeAssemble(call, results);
     std::vector<std::pair<size_t, VarPtr>> reads;
+    std::vector<std::pair<size_t, VarPtr>> writes;
+    std::vector<VarPtr> write_arguments;
     for (size_t argument_index = 0; argument_index < call->args_.size(); ++argument_index) {
+      const VarPtr var = AsVarLike(call->args_[argument_index]);
+      const auto interval = FindInterval(var);
+      if (!interval) continue;
+      const ArgEffect effect = GetArgumentEffect(call, argument_index);
       // A whole-window assemble overwrites the target. Its old contents are
       // not an input access; partial assemble remains Unknown and is poisoned.
-      if (whole_assemble && argument_index == 0) continue;
-      const VarPtr var = AsVarLike(call->args_[argument_index]);
-      if (const auto interval = FindInterval(var)) reads.emplace_back(*interval, var);
+      if (ArgEffectReads(effect) && !(whole_assemble && argument_index == 0)) {
+        reads.emplace_back(*interval, var);
+      }
+      if (ArgEffectWrites(effect)) {
+        writes.emplace_back(*interval, var);
+        write_arguments.push_back(var);
+      }
     }
-    std::vector<std::pair<size_t, VarPtr>> writes;
     for (const VarPtr& output : results) {
+      if (ResultWriteIsRepresentedByArgument(output, write_arguments)) continue;
       if (const auto interval = FindInterval(output)) writes.emplace_back(*interval, output);
     }
     if (reads.empty() && writes.empty()) return;

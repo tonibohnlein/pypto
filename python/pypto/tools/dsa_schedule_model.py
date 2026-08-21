@@ -69,6 +69,11 @@ _PTO_OPERATION_RE = re.compile(r"(?<![!\w.])(pto\.[A-Za-z0-9_]+)\b")
 _PTO_CONSTANT_RE = re.compile(
     r"^\s*(%[-A-Za-z0-9_.$]+)\s*=\s*arith\.constant\s+(-?\d+)\s*:\s*(?:index|i\d+)\s*$"
 )
+_PTO_SCALAR_CONSTANT_RE = re.compile(
+    r"^\s*(%[-A-Za-z0-9_.$]+)\s*=\s*arith\.constant\s+(.+?)\s*:\s*"
+    r"(bf16|f[A-Za-z0-9_]+|index|i\d+)\s*(?:loc\(.*\))?$"
+)
+_PTO_SSA_VALUE_RE = re.compile(r"%[-A-Za-z0-9_.$]+")
 _PTO_FOR_RE = re.compile(
     r"^\s*scf\.for\s+%\S+\s*=\s*(%[-A-Za-z0-9_.$]+|-?\d+)\s+to\s+"
     r"(%[-A-Za-z0-9_.$]+|-?\d+)\s+step\s+(%[-A-Za-z0-9_.$]+|-?\d+)\b"
@@ -236,7 +241,21 @@ def _extract_operation_region(line: str, name: str) -> str | None:
     return line[start + len(marker) : cursor - 1]
 
 
-def _operation_type_metadata(line: str) -> dict[str, Any]:
+def _operation_operand_names(line: str) -> list[str]:
+    """Return textual operands in operation order, excluding SSA results."""
+    input_region = _extract_operation_region(line, "ins")
+    if input_region is not None:
+        values, _, _ = input_region.partition(":")
+        return _PTO_SSA_VALUE_RE.findall(values)
+
+    operation_match = _PTO_OPERATION_RE.search(line)
+    if operation_match is None:
+        return []
+    operands = line[operation_match.end() :].split(":", maxsplit=1)[0]
+    return _PTO_SSA_VALUE_RE.findall(operands)
+
+
+def _operation_type_metadata(line: str, constants: Mapping[str, str]) -> dict[str, Any]:
     input_region = _extract_operation_region(line, "ins")
     output_region = _extract_operation_region(line, "outs")
     if input_region is None and output_region is None:
@@ -257,6 +276,7 @@ def _operation_type_metadata(line: str) -> dict[str, Any]:
     ]
     return {
         "operand_types": operand_types,
+        "operand_constants": [constants.get(name) for name in _operation_operand_names(line)],
         "result_types": result_types,
         "attributes": {},
         "static_work_bytes": max(static_sizes, default=0),
@@ -292,6 +312,11 @@ def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) ->
     expected_names = [str(node["op_name"]) for node in operation_nodes]
     traced_names = {_join_operation_name(name) for name in expected_names}
     pto_operations: list[tuple[str, int, str, dict[str, Any]]] = []
+    constants = {
+        match.group(1): f"{match.group(2)} : {match.group(3)}"
+        for line in pto_text.splitlines()
+        if (match := _PTO_SCALAR_CONSTANT_RE.match(line))
+    }
 
     for line_number, line in enumerate(pto_text.splitlines(), start=1):
         names = [match.group(1) for match in _PTO_OPERATION_RE.finditer(line)]
@@ -309,7 +334,7 @@ def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) ->
         access_order = int(locations[0])
         location_line = line.strip()
         pto_operations.append(
-            (names[0], access_order, location_line, _operation_type_metadata(location_line))
+            (names[0], access_order, location_line, _operation_type_metadata(location_line, constants))
         )
 
     actual_names = [name for name, _, _, _ in pto_operations]
@@ -559,7 +584,7 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
         "node_count": len(nodes),
         "duration_model": "unestimated",
         "export_source": (
-            "ptoas_debug_import_v0+pto_access_join_v2+static_loop_bounds_v1"
+            "ptoas_debug_import_v0+pto_access_join_v3+static_loop_bounds_v1"
             if pto_text is not None
             else "ptoas_debug_import_v0"
         ),

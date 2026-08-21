@@ -267,6 +267,17 @@ bool SameAllocation(const VarPtr& first, const VarPtr& second) {
   return GetDefinedMemRef(first_tile)->base_.get() == GetDefinedMemRef(second_tile)->base_.get();
 }
 
+ArgEffect GetArgumentEffect(const CallPtr& call, size_t argument_index) {
+  const auto& registry = OpRegistry::GetInstance();
+  if (!call || !call->op_ || !registry.IsRegistered(call->op_->name_)) return ArgEffect::Read;
+  return registry.GetEntry(call->op_->name_).GetArgEffect(argument_index, call->kwargs_);
+}
+
+bool ResultWriteIsRepresentedByArgument(const VarPtr& result, const std::vector<VarPtr>& arguments) {
+  return result && std::any_of(arguments.begin(), arguments.end(),
+                               [&](const VarPtr& argument) { return SameAllocation(result, argument); });
+}
+
 bool HasExecutionMemoryAccess(const CallPtr& call) {
   if (!call || !call->op_) return false;
   const auto& registry = OpRegistry::GetInstance();
@@ -297,19 +308,24 @@ std::optional<RecognizedAccessRoute> ClassifyOperationRoute(const CallPtr& call,
     CollectMemoryClasses(result ? result->GetType() : nullptr, &result_classes);
   }
   if (result_classes.empty()) CollectMemoryClasses(call->GetType(), &result_classes);
-  const std::optional<Memory> result_class =
-      result_classes.size() == 1 ? std::optional<Memory>(*result_classes.begin()) : std::nullopt;
   std::vector<std::pair<VarPtr, Memory>> inputs;
   bool has_scalar_input = false;
-  for (const ExprPtr& argument : call->args_) {
+  for (size_t argument_index = 0; argument_index < call->args_.size(); ++argument_index) {
+    const ExprPtr& argument = call->args_[argument_index];
     const VarPtr var = AsVarLike(argument);
     const auto space = GetMemorySpace(var);
-    if (space) {
+    const ArgEffect effect = GetArgumentEffect(call, argument_index);
+    if (space && ArgEffectWrites(effect)) {
+      result_classes.insert(ClassifyMemory(*space));
+    }
+    if (space && ArgEffectReads(effect)) {
       inputs.emplace_back(var, ClassifyMemory(*space));
-    } else if (var && As<ScalarType>(var->GetType())) {
+    } else if (ArgEffectReads(effect) && var && As<ScalarType>(var->GetType())) {
       has_scalar_input = true;
     }
   }
+  const std::optional<Memory> result_class =
+      result_classes.size() == 1 ? std::optional<Memory>(*result_classes.begin()) : std::nullopt;
 
   const auto scalar_result = std::find_if(results.begin(), results.end(), [](const VarPtr& result) {
     return result && As<ScalarType>(result->GetType());
@@ -657,15 +673,24 @@ class AccessCollector : public IRVisitor {
 
   void RecordCall(const CallPtr& call, const VarPtr& result, const Stmt* statement) {
     if (!call || !HasExecutionMemoryAccess(call)) return;
+    const std::vector<VarPtr> results = ResolveCallResults(result);
     std::vector<std::pair<size_t, VarPtr>> reads;
-    for (const ExprPtr& argument : call->args_) {
+    std::vector<std::pair<size_t, VarPtr>> writes;
+    std::vector<VarPtr> write_arguments;
+    for (size_t argument_index = 0; argument_index < call->args_.size(); ++argument_index) {
+      const ExprPtr& argument = call->args_[argument_index];
       const VarPtr var = AsVarLike(argument);
       const auto interval = FindInterval(var);
-      if (interval) reads.emplace_back(*interval, var);
+      if (!interval) continue;
+      const ArgEffect effect = GetArgumentEffect(call, argument_index);
+      if (ArgEffectReads(effect)) reads.emplace_back(*interval, var);
+      if (ArgEffectWrites(effect)) {
+        writes.emplace_back(*interval, var);
+        write_arguments.push_back(var);
+      }
     }
-    const std::vector<VarPtr> results = ResolveCallResults(result);
-    std::vector<std::pair<size_t, VarPtr>> writes;
     for (const VarPtr& output : results) {
+      if (ResultWriteIsRepresentedByArgument(output, write_arguments)) continue;
       if (const auto interval = FindInterval(output)) writes.emplace_back(*interval, output);
     }
     if (reads.empty() && writes.empty()) return;
