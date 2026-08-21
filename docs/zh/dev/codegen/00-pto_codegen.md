@@ -790,11 +790,18 @@ wrapper 从 `intrinsic.h::get_sub_block_id(args)`(调度器写入
 `GlobalContext.sub_block_id` 的运行时 per-core lane id)解析出值,并把
 `__pypto_spmd_subblock_idx` 追加在 block 身份实参之后。它刻意读取运行时
 lane id,而非 ccec `get_subblockid()` 寄存器 -- 后者在
-`tensormap_and_ringbuffer` 调度下返回过期值。这与 A2A3 dual-AIV wrapper 为
-ptoas **内部** pipe-slot 偏移安装的 `get_subblockid()` 宏桥接
-(`pypto_runtime_subblock_id`)相互独立、并存。与 block 身份一样,它无条件发射
-(无 `__CPU_SIM` 分叉),因为 `GlobalContext.sub_block_id` 在每个平台都由调度器
-填充。
+`tensormap_and_ringbuffer` 调度下返回过期值。同一个 runtime 值也用于分离
+A2A3 上的 split FIFO endpoint。PTOAS 原生 split 实现会读取该过期寄存器，因此
+wrapper 会根据各 endpoint 的静态 tile shape 和 dtype 注入显式的
+`TPipe::cons/prod.setEntryOffset`。即使 tensor 代码没有调用
+`tile.get_subblock_idx()`，只使用 FIFO 的 AIV 函数也会获得一个私有的尾部 lane
+参数。
+
+frontend pipe id 用于验证 IR 连线，但 PTOAS 可以重编号 C++ `TPipe` template id。
+因此 wrapper 按保留的 `(direction, slot_size, slot_num)` descriptor 绑定声明。
+descriptor 有歧义、endpoint 为 dynamic/ragged，或同一 endpoint 出现多个 size
+时都会 fail closed。offset 调用仅用于 onboard；CPU simulation 已经提供正确的
+原生 lane identity。
 
 **检测范围。** 两层各自基于函数体独立检测 SPMD usage:
 
@@ -803,7 +810,8 @@ ptoas **内部** pipe-slot 偏移安装的 `get_subblockid()` 宏桥接
   block / subblock 形参。
 - `_uses_spmd_block_ops` / `_uses_dynamic_subblock_id`(Python，位于
   `python/pypto/backend/pto_backend.py`)决定 wrapper 是否把相应局部变量追加到
-  对内函数调用末尾。
+  对内函数调用末尾。split FIFO 检查会在 pipe 分离需要时独立请求同一个 runtime
+  lane 局部变量。
 
 对于 SPMD 组内自身不调用 `tile.get_block_*` 的 sibling 函数
 (`group_uses_spmd=True` 但函数本身不用 SPMD ops)，wrapper 仍会声明这两个

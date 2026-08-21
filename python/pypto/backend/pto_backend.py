@@ -738,15 +738,379 @@ def _uses_spmd_block_ops(func: _ir_core.Function) -> bool:
     return _function_uses_ops(func, _SPMD_BLOCK_OPS)
 
 
-def _needs_runtime_subblock_bridge(func: _ir_core.Function) -> bool:
-    """Return whether A2A3 split AIV wrappers must source subblock id from runtime context."""
+def _may_need_runtime_subblock_bridge(func: _ir_core.Function) -> bool:
+    """Return whether A2A3 split AIV code may need the runtime lane-id workaround.
+
+    FIFO lane separation is required by split ``TPUSH``/``TPOP`` even when the
+    tensor program never reads ``tile.get_subblock_idx()`` itself.  The latter
+    controls PTOCodegen's synthetic subblock parameter, not whether PTO-ISA's
+    pipe endpoints need the runtime lane id.
+    """
     if not _requires_dual_aiv_dispatch(func):
         return False
     if _codegen_core.infer_function_core_type(func) != _ir_core.CoreType.VECTOR:
         return False
     if not _backend_core.get_handler().requires_runtime_subblock_bridge():
         return False
-    return _uses_dynamic_subblock_id(func)
+    return True
+
+
+def _static_split_lane_offset_bytes(
+    tile_type: _ir_core.Type,
+    split: int,
+    *,
+    context: str,
+) -> int:
+    """Return the explicit FIFO offset between AIV lanes."""
+
+    if split not in (1, 2):
+        raise RuntimeError(f"{context} requires UP_DOWN or LEFT_RIGHT split, got {split}")
+    if not isinstance(tile_type, _ir_core.TileType) or len(tile_type.shape) != 2:
+        raise RuntimeError(f"{context} requires a static rank-2 TileType")
+
+    dims: list[int] = []
+    for dim in tile_type.shape:
+        if not isinstance(dim, _ir_core.ConstInt) or dim.value <= 0:
+            raise RuntimeError(f"{context} requires positive static tile dimensions")
+        dims.append(dim.value)
+
+    view = tile_type.get_effective_tile_view()
+    if len(view.valid_shape) != 2:
+        raise RuntimeError(f"{context} requires a rank-2 effective valid shape")
+    for valid_dim, extent in zip(view.valid_shape, dims, strict=True):
+        if not isinstance(valid_dim, _ir_core.ConstInt) or valid_dim.value != extent:
+            raise RuntimeError(f"{context} requires a full static valid shape")
+
+    lane_elements = dims[0] * dims[1] if split == 1 else dims[1]
+    return lane_elements * tile_type.dtype.get_byte()
+
+
+@dataclass(frozen=True)
+class _RuntimeLanePipe:
+    """One frontend FIFO and the lane offsets required by its AIV endpoints."""
+
+    frontend_id: int
+    direction: int
+    slot_size: int
+    slot_num: int
+    consumer_bytes: int | None
+    producer_bytes: int | None
+
+    @property
+    def descriptor(self) -> tuple[int, int, int]:
+        """Return the FIFO fields preserved by PTOAS despite template-ID remapping."""
+
+        return self.direction, self.slot_size, self.slot_num
+
+
+@dataclass(frozen=True)
+class _PtoasPipe:
+    """One physical ``TPipe`` declaration parsed from generated PTOAS C++."""
+
+    name: str
+    physical_id: int
+    direction: int
+    slot_size: int
+    slot_num: int
+    declaration_start: int
+
+    @property
+    def descriptor(self) -> tuple[int, int, int]:
+        """Return the FIFO fields identifying the corresponding frontend pipe."""
+
+        return self.direction, self.slot_size, self.slot_num
+
+
+def _get_runtime_lane_pipes(func: _ir_core.Function) -> list[_RuntimeLanePipe]:
+    """Return split AIV endpoint offsets with their frontend FIFO descriptors."""
+
+    if not _may_need_runtime_subblock_bridge(func):
+        return []
+
+    consumer_sizes: dict[int, set[int]] = {}
+    producer_sizes: dict[int, set[int]] = {}
+    initialize_descriptors: dict[int, tuple[int, int, int]] = {}
+
+    def _int_kwarg(op: _ir_core.Call, name: str) -> int:
+        value = op.kwargs.get(name, 0)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RuntimeError(f"{func.name}: cross-core {name} attribute must be an integer, got {value!r}")
+        return value
+
+    class _PipeFinder(_ir_core.IRVisitor):
+        def visit_call(self, op: _ir_core.Call) -> None:
+            ir_op = getattr(op, "op", None)
+            name = ir_op.name if isinstance(ir_op, _ir_core.Op) else ""
+            if name == "system.aiv_initialize_pipe":
+                pipe_id = _int_kwarg(op, "id")
+                if pipe_id in initialize_descriptors:
+                    raise RuntimeError(f"{func.name}: duplicate AIV initialize_pipe id {pipe_id}")
+                direction = _int_kwarg(op, "dir_mask")
+                if direction not in (1, 2, 3):
+                    raise RuntimeError(
+                        f"{func.name}: AIV initialize_pipe id {pipe_id} has invalid dir_mask {direction}"
+                    )
+                slot_size = _int_kwarg(op, "slot_size")
+                if slot_size <= 0:
+                    raise RuntimeError(
+                        f"{func.name}: AIV initialize_pipe id {pipe_id} has invalid slot_size {slot_size}"
+                    )
+                slot_num = (
+                    _int_kwarg(op, "slot_num") if "slot_num" in op.kwargs else (4 if direction == 3 else 8)
+                )
+                if slot_num <= 0:
+                    raise RuntimeError(
+                        f"{func.name}: AIV initialize_pipe id {pipe_id} has invalid slot_num {slot_num}"
+                    )
+                initialize_descriptors[pipe_id] = (direction, slot_size, slot_num)
+            elif name == "tile.tpop_from_aic" and (split := _int_kwarg(op, "split")) != 0:
+                pipe_id = _int_kwarg(op, "id")
+                consumer_sizes.setdefault(pipe_id, set()).add(
+                    _static_split_lane_offset_bytes(
+                        op.type,
+                        split,
+                        context=f"{func.name}: split tpop_from_aic id {pipe_id}",
+                    )
+                )
+            elif name == "tile.tpush_to_aic" and (split := _int_kwarg(op, "split")) != 0:
+                if not op.args:
+                    raise RuntimeError(f"{func.name}: split tpush_to_aic has no tile operand")
+                pipe_id = _int_kwarg(op, "id")
+                producer_sizes.setdefault(pipe_id, set()).add(
+                    _static_split_lane_offset_bytes(
+                        op.args[0].type,
+                        split,
+                        context=f"{func.name}: split tpush_to_aic id {pipe_id}",
+                    )
+                )
+            super().visit_call(op)
+
+    finder = _PipeFinder()
+    finder.visit_stmt(func.body)
+
+    used_ids = sorted(consumer_sizes.keys() | producer_sizes.keys())
+    if not used_ids:
+        return []
+
+    offsets: dict[int, tuple[int | None, int | None]] = {}
+    for pipe_id in used_ids:
+        if pipe_id not in initialize_descriptors:
+            raise RuntimeError(f"{func.name}: split FIFO id {pipe_id} has no AIV initialize_pipe")
+        direction = initialize_descriptors[pipe_id][0]
+        if pipe_id in consumer_sizes and not direction & 1:
+            raise RuntimeError(f"{func.name}: split consumer FIFO id {pipe_id} is not initialized C2V")
+        if pipe_id in producer_sizes and not direction & 2:
+            raise RuntimeError(f"{func.name}: split producer FIFO id {pipe_id} is not initialized V2C")
+        consumers = consumer_sizes.get(pipe_id, set())
+        producers = producer_sizes.get(pipe_id, set())
+        if len(consumers) > 1 or len(producers) > 1:
+            raise RuntimeError(
+                f"{func.name}: runtime AIV lane offsets require one tile size per endpoint for pipe "
+                f"{pipe_id}, got consumer={sorted(consumers)}, producer={sorted(producers)}"
+            )
+        offsets[pipe_id] = (
+            next(iter(consumers), None),
+            next(iter(producers), None),
+        )
+
+    return [
+        _RuntimeLanePipe(
+            frontend_id=pipe_id,
+            direction=descriptor[0],
+            slot_size=descriptor[1],
+            slot_num=descriptor[2],
+            consumer_bytes=offsets.get(pipe_id, (None, None))[0],
+            producer_bytes=offsets.get(pipe_id, (None, None))[1],
+        )
+        for pipe_id, descriptor in sorted(initialize_descriptors.items())
+    ]
+
+
+_PTOAS_PIPE_DIRECTION = {"DIR_C2V": 1, "DIR_V2C": 2, "DIR_BOTH": 3}
+
+
+def _parse_ptoas_pipes(
+    ptoas_code: str,
+    body_start: int,
+    body_end: int,
+    func_name: str,
+) -> list[_PtoasPipe]:
+    """Parse physical ``TPipe`` declarations from one generated function."""
+
+    pipe_pattern = re.compile(
+        r"\bauto\s+([A-Za-z_]\w*)\s*=\s*TPipe\s*<\s*(\d+)\s*,\s*"
+        r"Direction::(DIR_C2V|DIR_V2C|DIR_BOTH)\s*,\s*(\d+)\s*,\s*(\d+)\s*,"
+    )
+    pipes: list[_PtoasPipe] = []
+    physical_ids: set[int] = set()
+    for match in pipe_pattern.finditer(ptoas_code, body_start + 1, body_end):
+        physical_id = int(match.group(2))
+        if physical_id in physical_ids:
+            raise RuntimeError(
+                f"{func_name}: duplicate PTOAS TPipe declaration for physical id {physical_id}"
+            )
+        physical_ids.add(physical_id)
+        pipes.append(
+            _PtoasPipe(
+                name=match.group(1),
+                physical_id=physical_id,
+                direction=_PTOAS_PIPE_DIRECTION[match.group(3)],
+                slot_size=int(match.group(4)),
+                slot_num=int(match.group(5)),
+                declaration_start=match.start(),
+            )
+        )
+    return pipes
+
+
+def _bind_runtime_lane_pipes(
+    func_name: str,
+    frontend_pipes: list[_RuntimeLanePipe],
+    ptoas_pipes: list[_PtoasPipe],
+) -> list[tuple[_PtoasPipe, int | None, int | None]]:
+    """Bind frontend FIFOs to renumbered PTOAS declarations, failing on ambiguity."""
+
+    frontend_by_descriptor: dict[tuple[int, int, int], list[_RuntimeLanePipe]] = {}
+    for pipe in frontend_pipes:
+        frontend_by_descriptor.setdefault(pipe.descriptor, []).append(pipe)
+    ptoas_by_descriptor: dict[tuple[int, int, int], list[_PtoasPipe]] = {}
+    for pipe in ptoas_pipes:
+        ptoas_by_descriptor.setdefault(pipe.descriptor, []).append(pipe)
+
+    frontend_counts = {descriptor: len(pipes) for descriptor, pipes in frontend_by_descriptor.items()}
+    ptoas_counts = {descriptor: len(pipes) for descriptor, pipes in ptoas_by_descriptor.items()}
+    if frontend_counts != ptoas_counts:
+        raise RuntimeError(
+            f"{func_name}: PTOAS TPipe descriptors do not match frontend initialize_pipe "
+            f"descriptors: frontend={frontend_counts}, emitted={ptoas_counts}"
+        )
+
+    bindings: list[tuple[_PtoasPipe, int | None, int | None]] = []
+    for descriptor, logical_pipes in sorted(frontend_by_descriptor.items()):
+        offsets = {(pipe.consumer_bytes, pipe.producer_bytes) for pipe in logical_pipes}
+        if len(offsets) != 1:
+            frontend_ids = sorted(pipe.frontend_id for pipe in logical_pipes)
+            raise RuntimeError(
+                f"{func_name}: ambiguous PTOAS TPipe remap for frontend ids {frontend_ids} "
+                f"sharing descriptor {descriptor} with different lane offsets "
+                f"{sorted(offsets, key=repr)}"
+            )
+        consumer_bytes, producer_bytes = next(iter(offsets))
+        for physical_pipe in ptoas_by_descriptor[descriptor]:
+            bindings.append((physical_pipe, consumer_bytes, producer_bytes))
+    return bindings
+
+
+def _find_matching_delimiter(
+    code: str,
+    start: int,
+    opening: str,
+    closing: str,
+) -> int:
+    """Return the matching delimiter index in generated PTOAS C++."""
+
+    if start < 0 or start >= len(code) or code[start] != opening:
+        return -1
+    depth = 0
+    for index in range(start, len(code)):
+        char = code[index]
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _find_ptoas_function(
+    func_name: str,
+    ptoas_code: str,
+) -> tuple[int, int, int, int]:
+    """Locate one named function in preprocessed PTOAS C++."""
+
+    pattern = re.compile(rf"\bstatic\s+__aicore__\s+void\s+{re.escape(func_name)}\s*(\()")
+    matches = list(pattern.finditer(ptoas_code))
+    if len(matches) != 1:
+        raise RuntimeError(f"{func_name}: expected exactly one PTOAS function definition, got {len(matches)}")
+
+    match = matches[0]
+    params_start = match.start(1)
+    params_end = _find_matching_delimiter(ptoas_code, params_start, "(", ")")
+    if params_end < 0:
+        raise RuntimeError(f"{func_name}: malformed PTOAS function parameter list")
+    body_start = ptoas_code.find("{", params_end)
+    if body_start < 0:
+        raise RuntimeError(f"{func_name}: malformed PTOAS function body")
+    body_end = _find_matching_delimiter(ptoas_code, body_start, "{", "}")
+    if body_end < 0:
+        raise RuntimeError(f"{func_name}: unterminated PTOAS function body")
+    return params_start, params_end, body_start, body_end
+
+
+def _inject_runtime_lane_pipe_offsets(
+    func: _ir_core.Function,
+    ptoas_code: str,
+) -> tuple[str, bool]:
+    """Patch the selected PTOAS AIV ``TPipe`` with runtime lane offsets."""
+
+    frontend_pipes = _get_runtime_lane_pipes(func)
+    if not frontend_pipes:
+        return ptoas_code, False
+
+    params_start, params_end, body_start, body_end = _find_ptoas_function(func.name, ptoas_code)
+    ptoas_pipes = _parse_ptoas_pipes(ptoas_code, body_start, body_end, func.name)
+    pipe_bindings = _bind_runtime_lane_pipes(func.name, frontend_pipes, ptoas_pipes)
+
+    add_runtime_param = not _uses_dynamic_subblock_id(func)
+    if add_runtime_param:
+        subblock_param = "__pypto_runtime_subblock_idx"
+    else:
+        trailing_param = re.search(
+            r"(?:^|,)\s*int32_t\s+([A-Za-z_]\w*)\s*$",
+            ptoas_code[params_start + 1 : params_end],
+        )
+        if trailing_param is None:
+            raise RuntimeError(
+                f"{func.name}: PTOAS function is missing its trailing runtime subblock parameter"
+            )
+        subblock_param = trailing_param.group(1)
+
+    insertions: list[tuple[int, str]] = []
+    for physical_pipe, consumer_bytes, producer_bytes in pipe_bindings:
+        declaration_end = ptoas_code.find(";", physical_pipe.declaration_start, body_end)
+        if declaration_end < 0 or declaration_end >= body_end:
+            raise RuntimeError(
+                f"{func.name}: unterminated PTOAS TPipe declaration for physical id "
+                f"{physical_pipe.physical_id}"
+            )
+        lines = [
+            "",
+            "#if !defined(__CPU_SIM)",
+            "    // simpler A2A3 MIX leaves native get_subblockid() at zero on both AIV lanes.",
+            "    // Use the runtime lane parameter for PTO-ISA FIFO entry separation.",
+        ]
+        if consumer_bytes is not None:
+            lines.append(
+                f"    {physical_pipe.name}.cons.setEntryOffset("
+                f"static_cast<int>({subblock_param}) * {consumer_bytes});"
+            )
+        if producer_bytes is not None:
+            lines.append(
+                f"    {physical_pipe.name}.prod.setEntryOffset("
+                f"static_cast<int>({subblock_param}) * {producer_bytes});"
+            )
+        lines.extend(["#endif", ""])
+        insertions.append((declaration_end + 1, "\n".join(lines)))
+
+    rewritten = ptoas_code
+    for position, injection in sorted(insertions, reverse=True):
+        rewritten = rewritten[:position] + injection + rewritten[position:]
+    if add_runtime_param:
+        separator = "" if not ptoas_code[params_start + 1 : params_end].strip() else ", "
+        parameter = f"{separator}int32_t {subblock_param}"
+        rewritten = rewritten[:params_end] + parameter + rewritten[params_end:]
+    return rewritten, True
 
 
 def _generate_kernel_header(
@@ -771,25 +1135,10 @@ def _generate_kernel_header(
 
             """
         )
-    elif _needs_runtime_subblock_bridge(func):
-        subblock_override = textwrap.dedent(
-            """\
-            #if !defined(__CPU_SIM)
-            #include "intrinsic.h"
-
-            // A2A3 mixed tasks run the same AIV kernel on two vector cores.
-            // Bridge the runtime-provided lane id into PTO-ISA get_subblockid().
-            [[block_local]] static int32_t pypto_runtime_subblock_id;
-            #define get_subblockid() pypto_runtime_subblock_id
-            #endif
-
-            """
-        )
-
     # Include intrinsic.h when the wrapper needs runtime SPMD identity or the
-    # SDMA workspace. The SPMD values flow into the kernel as trailing
-    # wrapper-passed parameters, so there is no macro shadow, no
-    # [[block_local]] static / thread_local storage, and no __CPU_SIM fork.
+    # runtime AIV lane parameter, or the SDMA workspace. Identity values flow
+    # into the kernel as trailing wrapper-passed parameters, so there is no
+    # macro shadow, [[block_local]] storage, or __CPU_SIM fork.
     if uses_spmd is None:
         uses_spmd = _uses_spmd_block_ops(func)
     if uses_subblock is None:
@@ -828,23 +1177,17 @@ def _generate_kernel_wrapper(
     func_uses_subblock = _uses_dynamic_subblock_id(func)
     func_uses_sdma = _uses_sdma_workspace(func)
     func_uses_deferred_completion = _uses_deferred_completion(func)
+    ptoas_body = _preprocess_ptoas_output(ptoas_code)
+    ptoas_body, pipe_uses_runtime_subblock = _inject_runtime_lane_pipe_offsets(func, ptoas_body)
+    wrapper_uses_subblock = func_uses_subblock or pipe_uses_runtime_subblock
     header = _generate_kernel_header(
         func,
         uses_spmd=uses_spmd,
-        uses_subblock=func_uses_subblock,
+        uses_subblock=wrapper_uses_subblock,
         uses_sdma=func_uses_sdma,
         uses_deferred_completion=func_uses_deferred_completion,
     )
-    ptoas_body = _preprocess_ptoas_output(ptoas_code)
     unpacking_code, var_names = _generate_arg_unpacking(func, uses_spmd=uses_spmd)
-    runtime_subblock_setup = ""
-    if _needs_runtime_subblock_bridge(func):
-        runtime_subblock_setup = (
-            "#if !defined(__CPU_SIM)\n"
-            "    // Read A2A3 mixed-task subblock id from runtime dispatch context\n"
-            "    pypto_runtime_subblock_id = get_sub_block_id(args);\n"
-            "#endif\n\n"
-        )
 
     # Resolve SPMD block identity once from intrinsic.h::get_block_idx(args) /
     # get_block_num(args). Locals are declared whenever any function in the
@@ -864,9 +1207,10 @@ def _generate_kernel_wrapper(
     # stale under the tensormap_and_ringbuffer dispatch (see intrinsic.h). The
     # value is valid under both onboard and __CPU_SIM (the scheduler populates
     # GlobalContext.sub_block_id on every platform), so no __CPU_SIM fork.
-    # (func_uses_subblock is computed once above, before the header call.)
+    # The pipe bridge also needs this value when split FIFO operations do not
+    # otherwise reference tile.get_subblock_idx().
     subblock_arg_setup = ""
-    if func_uses_subblock:
+    if wrapper_uses_subblock:
         subblock_arg_setup = (
             "    // Read SPMD subblock (AIV lane) id from runtime dispatch payload\n"
             "    int32_t __pypto_spmd_subblock_idx = get_sub_block_id(args);\n\n"
@@ -883,7 +1227,8 @@ def _generate_kernel_wrapper(
     # PTOCodegen appends raw dispatch args for deferred completion after
     # user-derived arguments, then the SDMA workspace and synthetic i32
     # identity params in canonical order (block_idx, block_num, subblock_idx).
-    # Mirror that exact order here.
+    # A pipe-only bridge adds its private lane param after PTOAS in that same
+    # final position. Mirror the complete order here.
     call_args_list = list(var_names)
     if func_uses_deferred_completion:
         call_args_list.append("args")
@@ -891,7 +1236,7 @@ def _generate_kernel_wrapper(
         call_args_list.append("__pypto_sdma_workspace")
     if func_uses_spmd:
         call_args_list = call_args_list + ["__pypto_spmd_block_idx", "__pypto_spmd_block_num"]
-    if func_uses_subblock:
+    if wrapper_uses_subblock:
         call_args_list = call_args_list + ["__pypto_spmd_subblock_idx"]
     call_args = ", ".join(call_args_list)
 
@@ -904,7 +1249,6 @@ def _generate_kernel_wrapper(
         "    // Reset AI Core atomic mode inherited from a prior kernel.\n"
         "    set_atomic_none();\n"
         "#endif\n\n"
-        f"{runtime_subblock_setup}"
         f"{spmd_args_setup}"
         f"{subblock_arg_setup}"
         f"{unpacking_code}\n"

@@ -823,11 +823,19 @@ scheduler stores in `GlobalContext.sub_block_id`) and appends
 `__pypto_spmd_subblock_idx` after any block-identity args. It deliberately
 reads the runtime lane id rather than the ccec `get_subblockid()` register,
 which returns a stale value under the `tensormap_and_ringbuffer` dispatch.
-This is independent of — and coexists with — the `get_subblockid()` macro
-bridge (`pypto_runtime_subblock_id`) that A2A3 dual-AIV wrappers install for
-ptoas-*internal* pipe-slot offsets. Like block identity, it is emitted
-unconditionally (no `__CPU_SIM` fork) because `GlobalContext.sub_block_id` is
-populated by the scheduler on every platform.
+The same runtime value also separates split FIFO endpoints on A2A3. PTOAS's
+native split implementation reads the stale register, so the wrapper installs
+explicit `TPipe::cons/prod.setEntryOffset` calls derived from each endpoint's
+static tile shape and dtype. A FIFO-only AIV function receives a private
+trailing lane parameter even when tensor code never calls
+`tile.get_subblock_idx()`.
+
+Frontend pipe ids validate the IR wiring, but PTOAS may renumber the C++
+`TPipe` template ids. The wrapper therefore binds declarations by their
+preserved `(direction, slot_size, slot_num)` descriptor. Ambiguous descriptors,
+dynamic/ragged endpoints, and multiple sizes on one endpoint fail closed. The
+offset calls are onboard-only; CPU simulation already supplies a correct native
+lane identity.
 
 **Detection scope.** Both layers detect SPMD usage on a per-function basis:
 
@@ -836,7 +844,8 @@ populated by the scheduler on every platform.
   block / subblock params to a given function's signature.
 - `_uses_spmd_block_ops` / `_uses_dynamic_subblock_id` (Python,
   `python/pypto/backend/pto_backend.py`) drive whether the wrapper appends the
-  matching locals to the inner call site.
+  matching locals to the inner call site. Split FIFO inspection independently
+  requests the same runtime lane local when pipe separation needs it.
 
 For non-SPMD sibling functions in an SPMD group (`group_uses_spmd=True` but
 the function itself does not call `tile.get_block_*`), the wrapper still

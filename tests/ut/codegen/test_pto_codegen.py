@@ -169,6 +169,45 @@ __global__ AICORE void test_func(__gm__ float* v1, float v2, __gm__ float* v3) {
 }
 """
 
+SAMPLE_GROUPED_SPLIT_PTOAS_OUTPUT = """\
+#include "pto/pto-inst.hpp"
+using namespace pto;
+
+AICORE void split_cube(__gm__ float* v1) {
+  auto cube_pipe = TPipe<0, Direction::DIR_C2V, 1024, 8, 2, false>(v1, 0, 0);
+  return;
+}
+
+AICORE void split_vec(__gm__ float* v2, int32_t v3) {
+  auto vec_pipe = TPipe<0, Direction::DIR_C2V, 512, 8, 2, false>(v2, 0, 0);
+  return;
+}
+"""
+
+
+def _split_ptoas_output_for(
+    func_name: str,
+    *,
+    runtime_lane_param: bool = True,
+    direction: str = "DIR_C2V",
+    slot_size: int = 512,
+    slot_num: int = 8,
+) -> str:
+    """Return a split PTOAS fixture with a function-matching signature."""
+
+    params = "__gm__ float* v1"
+    if runtime_lane_param:
+        params += ", int32_t v2"
+    return f"""\
+#include "pto/pto-inst.hpp"
+using namespace pto;
+
+__global__ AICORE void {func_name}({params}) {{
+  auto v3 = TPipe<0, Direction::{direction}, {slot_size}, {slot_num}, 2, false>(v1, 0, 0);
+  return;
+}}
+"""
+
 
 def _make_func(name, params_spec):
     """Build a Function from parameter specs.
@@ -1738,19 +1777,14 @@ class TestGenerateKernelWrapper:
         assert func is not None
         assert transformed.get_function("split_vec__aiv1") is None
 
-        wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
+        wrapper = _generate_kernel_wrapper(func, _split_ptoas_output_for(func.name))
         assert "PYPTO_FIXED_SUBBLOCK_ID" not in wrapper
-        assert wrapper.count("#if !defined(__CPU_SIM)\n") == 2
-        assert '#if !defined(__CPU_SIM)\n#include "intrinsic.h"' in wrapper
-        assert "[[block_local]] static int32_t pypto_runtime_subblock_id;" in wrapper
         assert '#include "intrinsic.h"' in wrapper
-        assert "#define get_subblockid() pypto_runtime_subblock_id" in wrapper
-        assert (
-            "#if !defined(__CPU_SIM)\n"
-            "    // Read A2A3 mixed-task subblock id from runtime dispatch context\n"
-            "    pypto_runtime_subblock_id = get_sub_block_id(args);\n"
-            "#endif"
-        ) in wrapper
+        assert "[[block_local]]" not in wrapper
+        assert "#define get_subblockid()" not in wrapper
+        assert "v3.cons.setEntryOffset(static_cast<int>(v2) * 512);" in wrapper
+        assert "v3.prod.setEntryOffset" not in wrapper
+        assert "int32_t __pypto_spmd_subblock_idx = get_sub_block_id(args);" in wrapper
 
     def test_no_split_dual_dispatch_wrapper_uses_runtime_subblock_bridge_on_a2a3(self):
         @pl.program
@@ -1771,9 +1805,125 @@ class TestGenerateKernelWrapper:
 
         wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
         assert "PYPTO_FIXED_SUBBLOCK_ID" not in wrapper
-        assert "[[block_local]] static int32_t pypto_runtime_subblock_id;" in wrapper
-        assert "#define get_subblockid() pypto_runtime_subblock_id" in wrapper
-        assert "pypto_runtime_subblock_id = get_sub_block_id(args);" in wrapper
+        assert "[[block_local]]" not in wrapper
+        assert "#define get_subblockid()" not in wrapper
+        assert ".setEntryOffset(" not in wrapper
+        assert "int32_t __pypto_spmd_subblock_idx = get_sub_block_id(args);" in wrapper
+
+    def test_split_fifo_without_subblock_op_gets_direction_specific_lane_offsets(self):
+        """Split C2V/V2C endpoints use runtime lane identity without an index op."""
+
+        @pl.program
+        class FifoOnlySplitProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def split_vec(self):
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                c2v_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=8192, base=0x1000)
+                v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="split_cube")
+                pl.aiv_initialize_pipe(
+                    c2v_buf,
+                    v2c_peer,
+                    dir_mask=3,
+                    slot_size=1024,
+                )
+                popped: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1
+                )
+                produced: pl.Tile[[8, 16], pl.BF16] = pl.tile.full([8, 16], dtype=pl.BF16, value=1.0)
+                pl.tpush_to_aic(produced, split=1)
+                pl.tfree_to_aic(popped)
+
+        func = FifoOnlySplitProgram.get_function("split_vec")
+        assert func is not None
+        assert not _uses_dynamic_subblock_id(func)
+
+        wrapper = _generate_kernel_wrapper(
+            func,
+            _split_ptoas_output_for(
+                func.name,
+                runtime_lane_param=False,
+                direction="DIR_BOTH",
+                slot_size=1024,
+                slot_num=4,
+            ),
+        )
+
+        assert (
+            "static __aicore__ void split_vec(__gm__ float* v1, int32_t __pypto_runtime_subblock_idx)"
+        ) in wrapper
+        assert ("v3.cons.setEntryOffset(static_cast<int>(__pypto_runtime_subblock_idx) * 512);") in wrapper
+        assert ("v3.prod.setEntryOffset(static_cast<int>(__pypto_runtime_subblock_idx) * 256);") in wrapper
+        assert "int32_t __pypto_spmd_subblock_idx = get_sub_block_id(args);" in wrapper
+        assert "__pypto_spmd_subblock_idx);" in wrapper
+
+    def test_split_multi_pipe_fifo_offsets_follow_ptoas_descriptor_remap(self):
+        """Logical FIFOs bind to renumbered PTOAS pipes by preserved descriptors."""
+
+        @pl.program
+        class MultiPipeSplitProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def split_vec(self):
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                c2v_0 = pl.reserve_buffer(name="c2v_0", size=2048, base=0x1000)
+                c2v_1 = pl.reserve_buffer(name="c2v_1", size=2048, base=0x2000)
+                v2c_2 = pl.import_peer_buffer(name="v2c_2", peer_func="split_cube")
+                pl.aiv_initialize_pipe(
+                    c2v_0,
+                    pl.const(0, pl.INT32),
+                    dir_mask=1,
+                    slot_size=512,
+                    slot_num=4,
+                    id=0,
+                )
+                pl.aiv_initialize_pipe(
+                    c2v_1,
+                    pl.const(0, pl.INT32),
+                    dir_mask=1,
+                    slot_size=512,
+                    slot_num=4,
+                    id=1,
+                )
+                pl.aiv_initialize_pipe(
+                    pl.const(0, pl.INT32),
+                    v2c_2,
+                    dir_mask=2,
+                    slot_size=256,
+                    slot_num=4,
+                    id=2,
+                )
+                gate: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1, id=0
+                )
+                up: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1, id=1
+                )
+                activation: pl.Tile[[8, 16], pl.BF16] = pl.tile.cast(
+                    pl.tile.mul(gate, up), target_type=pl.BF16
+                )
+                pl.tpush_to_aic(activation, split=1, id=2)
+                pl.tfree_to_aic(gate, split=1, id=0)
+                pl.tfree_to_aic(up, split=1, id=1)
+
+        func = MultiPipeSplitProgram.get_function("split_vec")
+        assert func is not None
+        fixture = """\
+#include "pto/pto-inst.hpp"
+using namespace pto;
+
+__global__ AICORE void split_vec() {
+  auto activation_pipe = TPipe<11, Direction::DIR_V2C, 256, 4, 2, false>(0, 0, 0);
+  auto gate_pipe = TPipe<7, Direction::DIR_C2V, 512, 4, 2, false>(0, 0, 0);
+  auto up_pipe = TPipe<9, Direction::DIR_C2V, 512, 4, 2, false>(0, 0, 0);
+  return;
+}
+"""
+        wrapper = _generate_kernel_wrapper(func, fixture)
+        lane = "static_cast<int>(__pypto_runtime_subblock_idx)"
+        assert f"gate_pipe.cons.setEntryOffset({lane} * 512);" in wrapper
+        assert f"up_pipe.cons.setEntryOffset({lane} * 512);" in wrapper
+        assert f"activation_pipe.prod.setEntryOffset({lane} * 256);" in wrapper
+        assert "gate_pipe.prod.setEntryOffset" not in wrapper
+        assert "activation_pipe.cons.setEntryOffset" not in wrapper
 
     def test_split_aiv_wrapper_uses_runtime_subblock_bridge_in_group_output_on_a2a3(
         self, tmp_path, monkeypatch
@@ -1814,7 +1964,9 @@ class TestGenerateKernelWrapper:
 
         monkeypatch.setattr(
             "pypto.backend.pto_backend._compile_pto_module",
-            lambda _pto_code, _module_name, _output_dir, _memory_planner=None: SAMPLE_PTOAS_OUTPUT,
+            lambda _pto_code, _module_name, _output_dir, _memory_planner=None: (
+                SAMPLE_GROUPED_SPLIT_PTOAS_OUTPUT
+            ),
         )
 
         result_files = {}
@@ -1833,12 +1985,11 @@ class TestGenerateKernelWrapper:
         split_vec_wrapper = next(
             content for path, content in result_files.items() if path.endswith("split_vec.cpp")
         )
-        assert "static __aicore__ void test_func" in split_cube_wrapper
-        assert "static __aicore__ void test_func" in split_vec_wrapper
-        assert '#if !defined(__CPU_SIM)\n#include "intrinsic.h"' in split_vec_wrapper
-        assert "[[block_local]] static int32_t pypto_runtime_subblock_id;" in split_vec_wrapper
-        assert "#define get_subblockid() pypto_runtime_subblock_id" in split_vec_wrapper
-        assert "pypto_runtime_subblock_id = get_sub_block_id(args);" in split_vec_wrapper
+        assert "static __aicore__ void split_cube" in split_cube_wrapper
+        assert "static __aicore__ void split_vec" in split_vec_wrapper
+        assert ".setEntryOffset(" not in split_cube_wrapper
+        assert "cube_pipe.cons.setEntryOffset" not in split_vec_wrapper
+        assert "vec_pipe.cons.setEntryOffset(static_cast<int>(v3) * 512);" in split_vec_wrapper
 
     def test_spmd_wrapper_drops_macro_bridge_and_appends_block_args(self):
         @pl.program
