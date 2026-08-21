@@ -178,7 +178,76 @@ def test_prepare_cohort_freezes_direct_golden_driver(tmp_path: Path):
     }
     assert len((output / "preflight-cells.tsv").read_text().splitlines()) == 17
     frozen = json.loads((output / "cohort-frozen.json").read_text())
+    assert frozen["schema_version"] == 2
+    assert "screen_results_sha256" not in frozen["inputs"]
     assert frozen["drivers"][0]["definition_source_sha256"]["models/toy/driver.py"]
+
+
+def test_cohort_identity_ignores_screen_runtime_and_row_order(tmp_path: Path):
+    catalog, lib, problems, screen = _fixture(tmp_path)
+    rows = list(csv.DictReader(screen.open(), delimiter="\t"))
+    columns = [*rows[0], "runtime_us"]
+    for index, row in enumerate(rows):
+        row["runtime_us"] = str(index + 1)
+    _write_tsv(screen, columns, rows)
+    first = cohort.prepare_cohort(catalog, lib, problems, screen, tmp_path / "first")
+
+    for index, row in enumerate(reversed(rows)):
+        row["runtime_us"] = str(10000 + index)
+    _write_tsv(screen, columns, list(reversed(rows)))
+    second = cohort.prepare_cohort(catalog, lib, problems, screen, tmp_path / "second")
+
+    assert second["cohort_sha256"] == first["cohort_sha256"]
+
+
+def test_cohort_identity_changes_with_selected_placement(tmp_path: Path):
+    catalog, lib, problems, screen = _fixture(tmp_path)
+    first = cohort.prepare_cohort(catalog, lib, problems, screen, tmp_path / "first")
+    rows = list(csv.DictReader(screen.open(), delimiter="\t"))
+    rows[0]["placement_sha256"] = "changed-placement"
+    _write_tsv(screen, list(rows[0]), rows)
+    second = cohort.prepare_cohort(catalog, lib, problems, screen, tmp_path / "second")
+
+    assert second["cohort_sha256"] != first["cohort_sha256"]
+
+
+def test_catalog_extension_excludes_and_adds_drivers(tmp_path: Path):
+    catalog, _, _, _ = _fixture(tmp_path)
+    base = json.loads(catalog.read_text())
+    base["drivers"][0]["driver_id"] = "excluded"
+    catalog.write_text(json.dumps(base))
+    overlay = tmp_path / "overlay.json"
+    replacement = dict(base["drivers"][0])
+    replacement["driver_id"] = "replacement"
+    overlay.write_text(
+        json.dumps(
+            {
+                "extends": catalog.name,
+                "selection_policy": "test_v2",
+                "exclude_driver_ids": ["excluded"],
+                "drivers": [replacement],
+            }
+        )
+    )
+
+    resolved, hashes = cohort._load_catalog(overlay)
+
+    assert resolved["selection_policy"] == "test_v2"
+    assert [driver["driver_id"] for driver in resolved["drivers"]] == ["replacement"]
+    assert set(hashes) == {
+        "catalog_source_sha256",
+        "base_catalog_source_sha256",
+        "catalog_semantics_sha256",
+    }
+
+
+def test_catalog_extension_rejects_unknown_exclusion(tmp_path: Path):
+    catalog, _, _, _ = _fixture(tmp_path)
+    overlay = tmp_path / "overlay.json"
+    overlay.write_text(json.dumps({"extends": catalog.name, "exclude_driver_ids": ["typo"]}))
+
+    with pytest.raises(ValueError, match="excludes unknown drivers: typo"):
+        cohort._load_catalog(overlay)
 
 
 def test_prepare_cohort_rejects_infeasible_cell(tmp_path: Path):
