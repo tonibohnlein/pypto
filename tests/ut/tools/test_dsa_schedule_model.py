@@ -101,7 +101,7 @@ def test_score_computes_full_and_singleton_exposure():
     assert result["full_critical_path"] == [0, 2, 1, 3]
 
 
-def test_score_aggregates_static_loop_work_and_discloses_dynamic_loops():
+def test_score_aggregates_static_loop_work():
     record = _record()
     record["nodes"] = [
         {
@@ -110,22 +110,30 @@ def test_score_aggregates_static_loop_work_and_discloses_dynamic_loops():
             "loop_kind": "LOOP_BEGIN",
             "static_trip_count": 4,
         },
-        {
-            "id": 11,
-            "kind": "loop",
-            "loop_kind": "LOOP_BEGIN",
-            "static_trip_count": None,
-        },
-        _operation(0, "PIPE_V", "pto.tadd", [10, 11]),
+        _operation(0, "PIPE_V", "pto.tadd", [10]),
     ]
     record["stream_edges"] = []
 
     result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
 
     assert result["baseline_makespan_cycles"] == 40.0
-    assert result["dynamic_loop_ids"] == [11]
+    assert result["dynamic_loop_ids"] == []
     assert result["node_durations"]["0"]["loop_multiplier"] == 4
     assert result["loop_policy"] == "aggregate_static_work_v0"
+
+
+def test_score_fails_closed_on_dynamic_loop():
+    record = _record()
+    record["nodes"].insert(
+        0,
+        {"id": 11, "kind": "loop", "loop_kind": "LOOP_BEGIN", "static_trip_count": None},
+    )
+    for node in record["nodes"]:
+        if node.get("kind") == "operation":
+            node["loop_stack"] = [11]
+
+    with pytest.raises(ValueError, match="requires statically bounded loops"):
+        dsa_schedule_model.score_schedule(record, _ten_cycle_model())
 
 
 def test_loop_carried_sync_is_excluded_and_reported():
@@ -164,6 +172,20 @@ def test_candidate_score_joins_access_sites_and_derives_non_negative_weight():
     assert candidate["weight_cycles"] == 20.0
     assert candidate["makespan_with_candidate_cycles"] == 40.0
     assert result["consumer_groups"][0]["combined_weight_cycles"] == 20.0
+    assert result["penalty_pair_weights"] == [
+        {
+            "first_buffer": 0,
+            "second_buffer": 1,
+            "promoted_to_dsa_penalty": True,
+            "unit_cost": 1.0,
+            "candidate_record_count": 1,
+            "distance_zero_schedule_edges": [[2, 1]],
+            "distance_zero_weight_cycles": 20.0,
+            "loop_ii_weight_cycles": 0,
+            "loop_total_weight_cycles": 0,
+            "critical_path_weight_cycles": 20.0,
+        }
+    ]
     assert result["candidate_weight_summary"] == {
         "positive_distance_zero_edge_count": 1,
         "positive_loop_recurrence_edge_count": 0,
@@ -250,6 +272,20 @@ def test_candidate_score_derives_loop_recurrence_ii_weight():
     assert candidate["candidate_recurrence_path"] == [1, 0, 2]
     assert candidate["with_candidate_ii_lower_bound_cycles"] == 30.0
     assert candidate["weight_cycles"] == 10.0
+    assert result["penalty_pair_weights"] == [
+        {
+            "first_buffer": 0,
+            "second_buffer": 1,
+            "promoted_to_dsa_penalty": True,
+            "unit_cost": 1.0,
+            "candidate_record_count": 1,
+            "distance_zero_schedule_edges": [],
+            "distance_zero_weight_cycles": 0.0,
+            "loop_ii_weight_cycles": 10.0,
+            "loop_total_weight_cycles": 30.0,
+            "critical_path_weight_cycles": 30.0,
+        }
+    ]
 
 
 def test_inner_loop_ii_removes_static_outer_and_inner_trip_multipliers():
@@ -361,7 +397,12 @@ def test_main_scores_candidate_problem(tmp_path):
                 "metadata": {
                     "recognized_reuse_candidates": "1",
                     "recognized_reuse_candidate_records_v4": candidate_fields,
-                }
+                },
+                "problem": {
+                    "cost_model": {
+                        "reuse_penalties": [{"first": 0, "second": 1, "cost": 1, "reason": "cross_pipe"}]
+                    }
+                },
             }
         )
     )
@@ -370,6 +411,113 @@ def test_main_scores_candidate_problem(tmp_path):
     result = json.loads(output.read_text())
     assert result["candidates"][0]["weight_cycles"] > 0
     assert result["model_version"] == "reuse_penalty_critical_path_v1"
+
+
+def test_realized_placement_scores_only_physical_reuse(tmp_path):
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    candidate_scores = dsa_schedule_model.score_reuse_candidates(
+        record,
+        [_candidate()],
+        _ten_cycle_model(),
+        {(0, 1): 3.0},
+    )
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(
+        json.dumps(
+            {
+                "problem": {
+                    "buffers": [
+                        {"id": 0, "size": 64},
+                        {"id": 1, "size": 64},
+                    ]
+                }
+            }
+        )
+    )
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 32},
+                ]
+            }
+        )
+    )
+
+    result = dsa_schedule_model.score_realized_reuse(problem, solution, candidate_scores)
+
+    assert result["realized_pair_count"] == 1
+    assert result["unit_realized_cost"] == 3.0
+    assert result["critical_path_realized_cost_cycles"] == 20.0
+    assert result["pairs"][0]["overlap_bytes"] == 32
+
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 64},
+                ]
+            }
+        )
+    )
+    disjoint = dsa_schedule_model.score_realized_reuse(problem, solution, candidate_scores)
+    assert disjoint["realized_pair_count"] == 0
+    assert disjoint["unit_realized_cost"] == 0
+    assert disjoint["critical_path_realized_cost_cycles"] == 0
+
+
+def test_realized_reuse_rejects_duplicate_placements(tmp_path):
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.json"
+    problem.write_text(
+        json.dumps(
+            {
+                "problem": {
+                    "buffers": [
+                        {"id": 0, "size": 64},
+                        {"id": 1, "size": 64},
+                    ]
+                }
+            }
+        )
+    )
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 0, "offset": 0},
+                    {"buffer": 0, "pool": 0, "offset": 64},
+                    {"buffer": 1, "pool": 0, "offset": 128},
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="duplicate solution placement"):
+        dsa_schedule_model.score_realized_reuse(
+            problem,
+            solution,
+            {
+                "penalty_pair_weights": [
+                    {
+                        "first_buffer": 0,
+                        "second_buffer": 1,
+                        "promoted_to_dsa_penalty": True,
+                        "unit_cost": 1,
+                        "critical_path_weight_cycles": 10,
+                    }
+                ]
+            },
+        )
 
 
 def test_score_fails_closed_on_control_flow_branches():
@@ -557,9 +705,59 @@ pto.tstore ins(%tile) outs(%arg1) loc("pypto.access.9")
 
     record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
 
-    assert record["export_source"] == "ptoas_debug_import_v0+pto_access_join_v1"
+    assert record["export_source"] == ("ptoas_debug_import_v0+pto_access_join_v1+static_loop_bounds_v1")
     assert [node["operation"]["pypto_access_order"] for node in record["nodes"]] == [3, 7, 9]
     assert record["export_limitations"]["access_provenance_missing"] is False
+    assert record["export_limitations"]["static_loop_bounds_missing"] == 0
+
+
+def test_import_legacy_debug_joins_static_raw_pto_loop_bounds():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] LOOP LOOP_BEGIN (begin=0, end=2)
+  [   1] COMPOUND pto.tadd [PIPE_V]
+[   2] LOOP LOOP_END (begin=0, end=2)
+// ========================================= //
+"""
+    pto = """
+%c0_index = arith.constant 0 : index
+%c2_index = arith.constant 2 : index
+%c32_index = arith.constant 32 : index
+scf.for %i = %c0_index to %c32_index step %c2_index {
+  pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+}
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    assert [node["static_trip_count"] for node in record["nodes"] if node["kind"] == "loop"] == [
+        16,
+        16,
+    ]
+    assert record["export_limitations"]["static_loop_bounds_missing"] == 0
+    assert dsa_schedule_model.classify_static_schedule(record)["status"] == "STATIC_SCHEDULE"
+
+
+def test_import_legacy_debug_preserves_genuinely_dynamic_loop():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] LOOP LOOP_BEGIN (begin=0, end=2)
+  [   1] COMPOUND pto.tadd [PIPE_V]
+[   2] LOOP LOOP_END (begin=0, end=2)
+// ========================================= //
+"""
+    pto = """
+%c0_index = arith.constant 0 : index
+%c1_index = arith.constant 1 : index
+scf.for %i = %c0_index to %arg0 step %c1_index {
+  pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+}
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    assert record["export_limitations"]["static_loop_bounds_missing"] == 1
+    assert dsa_schedule_model.classify_static_schedule(record)["status"] == "DYNAMIC_LOOP_EXCLUDED"
 
 
 def test_import_legacy_debug_rejects_raw_pto_operation_mismatch():
