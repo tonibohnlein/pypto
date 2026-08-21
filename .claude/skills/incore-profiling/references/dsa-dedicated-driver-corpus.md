@@ -13,6 +13,31 @@ python .claude/skills/incore-profiling/prepare_dsa_dedicated_driver_cohort.py \
   --screen-results <screen>/screen-results.tsv --output-root <cohort>
 ```
 
+After a four-capacity exploratory run, freeze one primary evaluation instance
+per problem without consulting device latency:
+
+```bash
+python .claude/skills/incore-profiling/select_dsa_evaluation_capacity.py \
+  --problems <cohort>/problems.tsv \
+  --screen-results <screen>/screen-results.tsv --output-root <evaluation>
+```
+
+The selector takes the least restrictive capacity where Cypress performs real
+reuse and geometry first-fit, Cypress, and DSA-RP have three distinct selected-
+pool placements. This excludes both the disjoint-address trivial regime and the
+forced-placement regime. Cases without three-way separation remain controls;
+they are not primary instances for testing policy ordering.
+
+Do not choose a capacity because its measured ordering is favorable. The
+expected paper hypothesis is `geometry > Cypress > DSA-RP` in latency, but the
+capacity is fixed exclusively from the host-side structural rule above. Device
+results that contradict the hypothesis are retained for penalty-model
+development rather than replaced by a different capacity.
+
+The first four-capacity development dataset is pinned by
+`dsa_penalty_modeling_dataset_v1.json`. It remains immutable when the corpus is
+expanded or reduced to one evaluation capacity per problem.
+
 The complete functional driver is the correctness unit and every DSA function
 inside it must use the same arm. A selected runtime task, or the complete mixed
 AIC/AIV group containing it, is the kernel timing unit. Whole-driver latency

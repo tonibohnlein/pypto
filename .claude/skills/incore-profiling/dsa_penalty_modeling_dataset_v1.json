@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "dataset_id": "dedicated-driver-four-capacity-886b52614",
+  "role": "structured_penalty_modeling_development_set",
+  "immutable": true,
+  "archive": {
+    "filename": "dsa-rp-dedicated-driver-corpus-886b52614-final.tar.gz",
+    "sha256": "9cf2cae8ec8ef2aa340eee75974260a945dc4002c3a6e92bac25ebb6eb8de64f"
+  },
+  "pypto_revision": "886b526140ab822dd35e79764f809d77e6767f5b",
+  "pypto_lib_revision": "2cd5f828bd3a54e2d073a7950b5fcfc0806b8bae",
+  "logical_arms": [
+    "geometry_ff",
+    "geometry_cg",
+    "cypress",
+    "dsa_rp_cg"
+  ],
+  "capacities": [
+    "native",
+    "half",
+    "q1",
+    "tight"
+  ],
+  "timing_summary_rows": 64,
+  "qualification": "development data; capacities were screened structurally and must not be selected using device latency",
+  "tables": {
+    "frozen/cohort/cohort-frozen.json": "dd3cd1c9c0ef0ac72988cd52ab9c6e500a15867e28be4742fb546884beae012e",
+    "results/problem-status.tsv": "027d2efae0ea4fa21a9789a3ddab9a065560f615aed99911481dd40fe9ef1e5a",
+    "results/timing-summary.tsv": "e4bb7aa4368f09d5f3de4a5acc9d00a9f8ceefae81163491b501613cce039110",
+    "results/timing-summary-confirm.tsv": "c84e9597188c081a1f683a009db474758dbc3f03669eb281f45655a06d7fb9af",
+    "results/timing-raw-dev6.tsv": "f7f965d255a7a10e83d995fad6716830b0207a50e6da074d8eeee2d172d03d34",
+    "results/timing-raw-dev7.tsv": "28a97545d8ceacbbecd41259f1de55037d23f11db9e87d41db6bd3cd43a98ce9"
+  }
+}
