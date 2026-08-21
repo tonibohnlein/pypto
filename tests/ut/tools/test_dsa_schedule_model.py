@@ -630,6 +630,10 @@ def test_calibrate_uses_per_operation_and_pipe_medians(tmp_path):
     assert model.calibration_sources == [str(metrics)]
 
 
+def test_accumulating_matmul_keeps_full_calibration_key():
+    assert dsa_schedule_model._operation_key("PIPE_M", "pto.tmatmul.acc") == "PIPE_M:TMATMUL_ACC"
+
+
 def test_load_and_freeze_predictions_are_content_addressed(tmp_path):
     schedule = tmp_path / "schedule.jsonl"
     schedule.write_text(json.dumps(_record()) + "\n")
@@ -724,19 +728,109 @@ def test_import_legacy_debug_joins_raw_pto_access_provenance():
 [   2] COMPOUND pto.tstore [PIPE_MTE3]
 // ========================================= //
 """
-    pto = """
-%tile = pto.alloc_tile addr = %c0 : !pto.tile_buf loc("pypto.access.3")
-pto.tload ins(%arg0) outs(%tile) loc("pypto.access.3")
-pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
-pto.tstore ins(%tile) outs(%arg1) loc("pypto.access.9")
-"""
+    tile_type = "!pto.tile_buf<loc=vec, dtype=f32, rows=8, cols=128>"
+    partition_type = "!pto.partition_tensor_view<8x128xf32>"
+    pto = "\n".join(
+        [
+            f"%tile = pto.alloc_tile addr = %c0 : {tile_type}",
+            f'pto.tload ins(%arg0 : {partition_type}) outs(%tile : {tile_type}) loc("pypto.access.3")',
+            f"pto.tadd ins(%tile, %tile : {tile_type}, {tile_type}) outs(%tile : {tile_type}) "
+            'loc("pypto.access.7")',
+            f'pto.tstore ins(%tile : {tile_type}) outs(%arg1 : {partition_type}) loc("pypto.access.9")',
+        ]
+    )
 
     record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
 
-    assert record["export_source"] == ("ptoas_debug_import_v0+pto_access_join_v1+static_loop_bounds_v1")
+    assert record["export_source"] == ("ptoas_debug_import_v0+pto_access_join_v2+static_loop_bounds_v1")
     assert [node["operation"]["pypto_access_order"] for node in record["nodes"]] == [3, 7, 9]
+    assert record["nodes"][0]["operation"]["operand_types"] == ["!pto.partition_tensor_view<8x128xf32>"]
+    assert record["nodes"][0]["operation"]["result_types"] == [
+        "!pto.tile_buf<loc=vec, dtype=f32, rows=8, cols=128>"
+    ]
+    assert [node["operation"]["static_work_bytes"] for node in record["nodes"]] == [
+        4096,
+        4096,
+        4096,
+    ]
     assert record["export_limitations"]["access_provenance_missing"] is False
+    assert record["export_limitations"]["operation_types_missing"] == 0
+    assert record["export_limitations"]["static_work_sizes_missing"] == 0
     assert record["export_limitations"]["static_loop_bounds_missing"] == 0
+
+
+def test_import_legacy_debug_accepts_semantic_accumulating_matmul_name():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tmatmul.acc [PIPE_M]
+// ========================================= //
+"""
+    acc_type = "!pto.tile_buf<loc=acc, dtype=f32, rows=16, cols=32>"
+    left_type = "!pto.tile_buf<loc=left, dtype=bf16, rows=16, cols=64>"
+    right_type = "!pto.tile_buf<loc=right, dtype=bf16, rows=64, cols=32>"
+    pto = (
+        f"pto.tmatmul ins(%acc, %lhs, %rhs : {acc_type}, {left_type}, {right_type}) "
+        f"outs(%acc : {acc_type}) "
+        'loc("pypto.access.4")'
+    )
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    operation = record["nodes"][0]["operation"]
+    assert record["nodes"][0]["op_name"] == "pto.tmatmul.acc"
+    assert operation["raw_pto_op_name"] == "pto.tmatmul"
+    assert operation["static_work_bytes"] == 4096
+
+
+def test_import_legacy_debug_rejects_non_accumulating_matmul_name_mismatch():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tmatmul.acc [PIPE_M]
+// ========================================= //
+"""
+    acc_type = "!pto.tile_buf<loc=acc, dtype=f32, rows=16, cols=32>"
+    left_type = "!pto.tile_buf<loc=left, dtype=bf16, rows=16, cols=64>"
+    right_type = "!pto.tile_buf<loc=right, dtype=bf16, rows=64, cols=32>"
+    pto = (
+        f"pto.tmatmul ins(%lhs, %rhs : {left_type}, {right_type}) outs(%acc : {acc_type}) "
+        'loc("pypto.access.4")'
+    )
+
+    with pytest.raises(ValueError, match="operation sequence does not match"):
+        dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+
+def test_import_legacy_debug_extracts_non_ins_outs_operation_types():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.load_scalar [PIPE_S]
+// ========================================= //
+"""
+    pto = '%value = pto.load_scalar %arg0[%index] : !pto.ptr<i32> -> i32 loc("pypto.access.5")'
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    operation = record["nodes"][0]["operation"]
+    assert operation["operand_types"] == ["!pto.ptr<i32>"]
+    assert operation["result_types"] == ["i32"]
+    assert operation["static_work_bytes"] == 0
+
+
+def test_import_legacy_debug_extracts_scalar_outs_type():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tgetval [PIPE_S]
+// ========================================= //
+"""
+    tile_type = "!pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=32>"
+    pto = f'%value = pto.tgetval ins(%tile, %index : {tile_type}, index) outs : f32 loc("pypto.access.6")'
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    operation = record["nodes"][0]["operation"]
+    assert operation["operand_types"] == [tile_type, "index"]
+    assert operation["result_types"] == ["f32"]
+    assert operation["static_work_bytes"] == 128
 
 
 def test_import_legacy_debug_joins_static_raw_pto_loop_bounds():

@@ -42,6 +42,7 @@ from typing import Any
 from pypto.tools.dsa_pto_isa_duration import (
     PtoIsaDurationProvider,
     provider_snapshot_sha256,
+    static_type_size_bytes,
 )
 from pypto.tools.dsa_reuse_candidates import ReuseCandidateRecord, load_candidate_records
 
@@ -72,6 +73,9 @@ _PTO_FOR_RE = re.compile(
     r"^\s*scf\.for\s+%\S+\s*=\s*(%[-A-Za-z0-9_.$]+|-?\d+)\s+to\s+"
     r"(%[-A-Za-z0-9_.$]+|-?\d+)\s+step\s+(%[-A-Za-z0-9_.$]+|-?\d+)\b"
 )
+_PTO_TYPE_START_RE = re.compile(r"!pto\.[A-Za-z_][A-Za-z0-9_.]*<")
+_PTO_SCALAR_TYPE_RE = re.compile(r"(?<![A-Za-z0-9_=%])(?:bf16|f16|f32|i8|i16|i32|i64|index)\b")
+_PTO_ACC_TILE_RE = re.compile(r"!pto\.tile_buf<(?:[^>]*\bloc=acc\b|\s*acc\s*,)")
 
 # This is deliberately narrower than the recognizer's route vocabulary. The
 # first structured model targets the route families already exercised by the
@@ -189,6 +193,91 @@ def load_schedule_graphs(path: str | Path) -> dict[str, dict[str, Any]]:
     return records
 
 
+def _extract_pto_types(text: str) -> list[str]:
+    """Extract PTO and scalar types in textual order without splitting nested types."""
+    types: list[tuple[int, str]] = []
+    cursor = 0
+    while match := _PTO_TYPE_START_RE.search(text, cursor):
+        depth = 1
+        end = match.end()
+        while end < len(text) and depth:
+            if text[end] == "<":
+                depth += 1
+            elif text[end] == ">":
+                depth -= 1
+            end += 1
+        if depth:
+            raise ValueError(f"unterminated PTO type in operation: {text}")
+        types.append((match.start(), text[match.start() : end]))
+        cursor = end
+
+    composite_ranges = [(offset, offset + len(value)) for offset, value in types]
+    for match in _PTO_SCALAR_TYPE_RE.finditer(text):
+        if not any(begin <= match.start() < end for begin, end in composite_ranges):
+            types.append((match.start(), match.group(0)))
+    return [value for _, value in sorted(types)]
+
+
+def _extract_operation_region(line: str, name: str) -> str | None:
+    marker = f"{name}("
+    start = line.find(marker)
+    if start < 0:
+        return None
+    cursor = start + len(marker)
+    depth = 1
+    while cursor < len(line) and depth:
+        if line[cursor] == "(":
+            depth += 1
+        elif line[cursor] == ")":
+            depth -= 1
+        cursor += 1
+    if depth:
+        raise ValueError(f"unterminated {name}(...) region in raw PTO operation: {line}")
+    return line[start + len(marker) : cursor - 1]
+
+
+def _operation_type_metadata(line: str) -> dict[str, Any]:
+    input_region = _extract_operation_region(line, "ins")
+    output_region = _extract_operation_region(line, "outs")
+    if input_region is None and output_region is None:
+        operation_text = line.split(" loc(", maxsplit=1)[0]
+        before_result, separator, after_result = operation_text.partition(" -> ")
+        operand_types = _extract_pto_types(before_result)
+        result_types = _extract_pto_types(after_result) if separator else []
+    else:
+        operand_types = _extract_pto_types(input_region or "")
+        if output_region is not None:
+            result_types = _extract_pto_types(output_region)
+        elif match := re.search(r"\bouts\s*:\s*(.*?)\s+loc\(", line):
+            result_types = _extract_pto_types(match.group(1))
+        else:
+            result_types = []
+    static_sizes = [
+        size for item in [*operand_types, *result_types] if (size := static_type_size_bytes(item)) is not None
+    ]
+    return {
+        "operand_types": operand_types,
+        "result_types": result_types,
+        "attributes": {},
+        "static_work_bytes": max(static_sizes, default=0),
+    }
+
+
+def _join_operation_name(name: str) -> str:
+    return "pto.tmatmul" if name == "pto.tmatmul.acc" else name
+
+
+def _operation_names_match(expected: str, actual: str, metadata: Mapping[str, Any]) -> bool:
+    if expected == actual:
+        return True
+    if expected != "pto.tmatmul.acc" or actual != "pto.tmatmul":
+        return False
+    operand_types = metadata.get("operand_types", [])
+    return isinstance(operand_types, list) and any(
+        isinstance(item, str) and _PTO_ACC_TILE_RE.search(item) for item in operand_types
+    )
+
+
 def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) -> None:
     """Join legacy SyncIR nodes to raw-PTO access locations by exact op order.
 
@@ -201,12 +290,12 @@ def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) ->
     """
     operation_nodes = [node for node in nodes if node.get("kind") == "operation"]
     expected_names = [str(node["op_name"]) for node in operation_nodes]
-    traced_names = set(expected_names)
-    pto_operations: list[tuple[str, int, str]] = []
+    traced_names = {_join_operation_name(name) for name in expected_names}
+    pto_operations: list[tuple[str, int, str, dict[str, Any]]] = []
 
     for line_number, line in enumerate(pto_text.splitlines(), start=1):
         names = [match.group(1) for match in _PTO_OPERATION_RE.finditer(line)]
-        names = [name for name in names if name in traced_names]
+        names = [name for name in names if _join_operation_name(name) in traced_names]
         if not names:
             continue
         if len(names) != 1:
@@ -218,16 +307,19 @@ def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) ->
                 "pypto.access.N location"
             )
         access_order = int(locations[0])
-        pto_operations.append((names[0], access_order, line.strip()))
+        location_line = line.strip()
+        pto_operations.append(
+            (names[0], access_order, location_line, _operation_type_metadata(location_line))
+        )
 
-    actual_names = [name for name, _, _ in pto_operations]
-    if actual_names != expected_names:
+    actual_names = [name for name, _, _, _ in pto_operations]
+    matches = [
+        _operation_names_match(expected, actual, metadata)
+        for expected, (actual, _, _, metadata) in zip(expected_names, pto_operations, strict=False)
+    ]
+    if len(actual_names) != len(expected_names) or not all(matches):
         mismatch = next(
-            (
-                index
-                for index, (expected, actual) in enumerate(zip(expected_names, actual_names, strict=False))
-                if expected != actual
-            ),
+            (index for index, matched in enumerate(matches) if not matched),
             min(len(expected_names), len(actual_names)),
         )
         expected = expected_names[mismatch] if mismatch < len(expected_names) else "<end>"
@@ -238,10 +330,14 @@ def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) ->
             f"counts={len(expected_names)}->{len(actual_names)}"
         )
 
-    for node, (_, access_order, location_line) in zip(operation_nodes, pto_operations, strict=True):
+    for node, (raw_name, access_order, location_line, metadata) in zip(
+        operation_nodes, pto_operations, strict=True
+    ):
         node["operation"] = {
+            **metadata,
             "pypto_access_order": access_order,
             "location": location_line,
+            "raw_pto_op_name": raw_name,
         }
 
 
@@ -306,7 +402,9 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
     This is a compatibility bridge for archived or pre-exporter runs. The
     native C++ exporter remains authoritative: the text dump omits allocation
     sizes, operation attributes, barrier dependency nodes, and static loop
-    bounds. The returned record names that limitation explicitly.
+    bounds. With raw PTO, the bridge recovers operand/result types, static
+    operation work bytes, access provenance, and provable loop trip counts.
+    The returned record names every remaining limitation explicitly.
     """
     marker = "// === [PTOInsertSync Debug] After EventId Allocation === //"
     start = text.rfind(marker)
@@ -446,6 +544,14 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
                         }
                     )
 
+    operation_nodes = [node for node in nodes if node.get("kind") == "operation"]
+    missing_operation_types = sum(
+        not (node.get("operation", {}).get("operand_types") or node.get("operation", {}).get("result_types"))
+        for node in operation_nodes
+    )
+    missing_static_work_sizes = sum(
+        not node.get("operation", {}).get("static_work_bytes") for node in operation_nodes
+    )
     return {
         "schema_version": 1,
         "function": function,
@@ -453,12 +559,14 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
         "node_count": len(nodes),
         "duration_model": "unestimated",
         "export_source": (
-            "ptoas_debug_import_v0+pto_access_join_v1+static_loop_bounds_v1"
+            "ptoas_debug_import_v0+pto_access_join_v2+static_loop_bounds_v1"
             if pto_text is not None
             else "ptoas_debug_import_v0"
         ),
         "export_limitations": {
             "allocation_sizes_missing": True,
+            "operation_types_missing": missing_operation_types,
+            "static_work_sizes_missing": missing_static_work_sizes,
             "static_loop_bounds_missing": missing_static_loop_bounds,
             "barrier_dependency_nodes_missing": omitted_barriers,
             "access_provenance_missing": pto_text is None,
@@ -471,8 +579,12 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
 
 
 def _canonical_operation(name: str) -> str:
-    value = name.rsplit(".", maxsplit=1)[-1]
-    return "".join(character for character in value.upper() if character.isalnum() or character == "_")
+    value = name.removeprefix("pto.")
+    return "".join(
+        "_" if character == "." else character
+        for character in value.upper()
+        if character.isalnum() or character in {"_", "."}
+    )
 
 
 def _operation_key(pipe: str, name: str) -> str:
@@ -498,6 +610,12 @@ def _memory_sizes(node: Mapping[str, Any], key: str) -> list[int]:
 
 def _work_bytes(node: Mapping[str, Any]) -> int:
     """Estimate the bytes governing one operation's duration."""
+    operation = node.get("operation")
+    static_work_bytes = operation.get("static_work_bytes", 0) if isinstance(operation, Mapping) else 0
+    if not isinstance(static_work_bytes, int) or static_work_bytes < 0:
+        raise ValueError(f"operation node {node.get('id')} has invalid static_work_bytes")
+    if static_work_bytes:
+        return static_work_bytes
     defs = _memory_sizes(node, "defs")
     uses = _memory_sizes(node, "uses")
     pipe = node.get("pipe")

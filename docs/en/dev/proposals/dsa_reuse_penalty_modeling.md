@@ -349,6 +349,14 @@ python -m pypto.tools.dsa_schedule_model import-debug insert-sync.log \
     --function kernel --pto kernel.pto -o schedule.jsonl
 ```
 
+The raw-PTO join also preserves operand/result types and derives
+`static_work_bytes` from statically shaped tile and partition types. This is
+enough to price transfers without inventing DSA allocation sizes: the latter
+remain marked missing because legacy SyncIR buffer identifiers do not match raw
+PTO SSA names. A trace-side `pto.tmatmul.acc` may join a raw `pto.tmatmul` only
+when the raw operation has an accumulator input; an ordinary two-input matmul
+remains distinct and fails the mismatch check.
+
 Version 0 has verified pipe mappings only for inbound/outbound DMA, L1-to-L0,
 L0-to-external, vector, matrix, and scalar resources. It rejects the remaining
 transfer-route families until their PTOAS pipeline mapping is established.

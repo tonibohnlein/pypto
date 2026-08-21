@@ -295,6 +295,13 @@ python -m pypto.tools.dsa_schedule_model import-debug insert-sync.log \
     --function kernel --pto kernel.pto -o schedule.jsonl
 ```
 
+raw-PTO join 还会保留 operand/result type，并从静态 tile 与 partition type 推导
+`static_work_bytes`。这足以为 transfer 定价，同时不会虚构 DSA allocation size：
+legacy SyncIR buffer identifier 与 raw PTO SSA name 不一致，因此 allocation size
+仍明确标记为缺失。只有当 raw operation 包含 accumulator input 时，trace 侧的
+`pto.tmatmul.acc` 才能与 raw `pto.tmatmul` 对应；普通双输入 matmul 仍保持不同，
+并触发 mismatch 检查。
+
 版本 0 只为 inbound/outbound DMA、L1-to-L0、L0-to-external、vector、matrix
 和 scalar resource 提供经过验证的 pipe mapping。其余 transfer route 在 PTOAS
 pipe mapping 确认前会被拒绝。
