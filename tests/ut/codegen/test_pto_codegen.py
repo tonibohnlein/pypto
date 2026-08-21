@@ -184,6 +184,7 @@ AICORE void split_vec(__gm__ float* v2, int32_t v3) {
 }
 """
 
+
 def _split_ptoas_output_for(
     func_name: str,
     *,
@@ -206,6 +207,7 @@ __global__ AICORE void {func_name}({params}) {{
   return;
 }}
 """
+
 
 def _make_func(name, params_spec):
     """Build a Function from parameter specs.
@@ -1922,6 +1924,7 @@ __global__ AICORE void split_vec() {
         assert f"activation_pipe.prod.setEntryOffset({lane} * 256);" in wrapper
         assert "gate_pipe.prod.setEntryOffset" not in wrapper
         assert "activation_pipe.cons.setEntryOffset" not in wrapper
+
     def test_left_right_split_uses_one_lane_row_width_as_fifo_offset(self):
         @pl.program
         class LeftRightSplitProgram:
@@ -1971,7 +1974,7 @@ __global__ AICORE void split_vec() {
         assert func is not None
 
         with pytest.raises(RuntimeError, match="PTOAS TPipe descriptors do not match"):
-            _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
+            _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT.replace("test_func", func.name))
 
     def test_split_aiv_wrapper_fails_closed_without_trailing_runtime_lane_param(self):
         @pl.program
