@@ -47,8 +47,9 @@ off by default and favors coverage over compile time.
 The recognizer:
 
 1. normalizes semantic aliases into physical allocation identities;
-2. collects execution-time reads and writes, including tuple results,
-   mutating operations, base allocations, and known byte ranges;
+2. collects execution-time reads and writes from each operator's authoritative
+   `ArgEffect` declarations and SSA results, including tuple results, mutating
+   operations, base allocations, and known byte ranges;
 3. maps each access to an abstract source/destination route and execution
    resource;
 4. constructs terminal-access and initial-write frontiers per allocation;
@@ -349,9 +350,10 @@ python -m pypto.tools.dsa_schedule_model import-debug insert-sync.log \
     --function kernel --pto kernel.pto -o schedule.jsonl
 ```
 
-The raw-PTO join also preserves operand/result types and derives
-`static_work_bytes` from statically shaped tile and partition types. This is
-enough to price transfers without inventing DSA allocation sizes: the latter
+The raw-PTO join also preserves operand/result types and scalar constant
+operands, and derives `static_work_bytes` from statically shaped tile and
+partition types. This is enough to price transfers without inventing DSA
+allocation sizes: the latter
 remain marked missing because legacy SyncIR buffer identifiers do not match raw
 PTO SSA names. A trace-side `pto.tmatmul.acc` may join a raw `pto.tmatmul` only
 when the raw operation has an accumulator input; an ordinary two-input matmul

@@ -40,8 +40,8 @@ fallback 与本文的 access-hazard recognizer 相互独立。
 recognizer：
 
 1. 把 semantic alias 规范化为物理 allocation identity；
-2. 收集执行期读写，包括 tuple result、mutating operation、base allocation 和已知
-   byte range；
+2. 根据各 operator 的权威 `ArgEffect` 声明与 SSA result 收集执行期读写，包括
+   tuple result、mutating operation、base allocation 和已知 byte range；
 3. 将 access 映射到抽象 source/destination route 与执行资源；
 4. 为每个 allocation 构造 terminal-access 和 initial-write frontier；
 5. 扫描一个 address space 内所有 lifetime-compatible buffer pair；
@@ -295,8 +295,9 @@ python -m pypto.tools.dsa_schedule_model import-debug insert-sync.log \
     --function kernel --pto kernel.pto -o schedule.jsonl
 ```
 
-raw-PTO join 还会保留 operand/result type，并从静态 tile 与 partition type 推导
-`static_work_bytes`。这足以为 transfer 定价，同时不会虚构 DSA allocation size：
+raw-PTO join 还会保留 operand/result type 与标量常量 operand，并从静态 tile 与
+partition type 推导 `static_work_bytes`。这足以为 transfer 定价，同时不会虚构
+DSA allocation size：
 legacy SyncIR buffer identifier 与 raw PTO SSA name 不一致，因此 allocation size
 仍明确标记为缺失。只有当 raw operation 包含 accumulator input 时，trace 侧的
 `pto.tmatmul.acc` 才能与 raw `pto.tmatmul` 对应；普通双输入 matmul 仍保持不同，

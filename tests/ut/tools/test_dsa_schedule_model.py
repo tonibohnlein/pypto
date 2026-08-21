@@ -724,7 +724,7 @@ def test_import_legacy_debug_joins_raw_pto_access_provenance():
     log = """
 // === [PTOInsertSync Debug] After EventId Allocation === //
 [   0] COMPOUND pto.tload [PIPE_MTE2]
-[   1] COMPOUND pto.tadd [PIPE_V]
+[   1] COMPOUND pto.tadds [PIPE_V]
 [   2] COMPOUND pto.tstore [PIPE_MTE3]
 // ========================================= //
 """
@@ -732,9 +732,10 @@ def test_import_legacy_debug_joins_raw_pto_access_provenance():
     partition_type = "!pto.partition_tensor_view<8x128xf32>"
     pto = "\n".join(
         [
+            "%scale = arith.constant 1.250000e+00 : f32",
             f"%tile = pto.alloc_tile addr = %c0 : {tile_type}",
             f'pto.tload ins(%arg0 : {partition_type}) outs(%tile : {tile_type}) loc("pypto.access.3")',
-            f"pto.tadd ins(%tile, %tile : {tile_type}, {tile_type}) outs(%tile : {tile_type}) "
+            f"pto.tadds ins(%tile, %scale : {tile_type}, f32) outs(%tile : {tile_type}) "
             'loc("pypto.access.7")',
             f'pto.tstore ins(%tile : {tile_type}) outs(%arg1 : {partition_type}) loc("pypto.access.9")',
         ]
@@ -742,12 +743,14 @@ def test_import_legacy_debug_joins_raw_pto_access_provenance():
 
     record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
 
-    assert record["export_source"] == ("ptoas_debug_import_v0+pto_access_join_v2+static_loop_bounds_v1")
+    assert record["export_source"] == ("ptoas_debug_import_v0+pto_access_join_v3+static_loop_bounds_v1")
     assert [node["operation"]["pypto_access_order"] for node in record["nodes"]] == [3, 7, 9]
     assert record["nodes"][0]["operation"]["operand_types"] == ["!pto.partition_tensor_view<8x128xf32>"]
     assert record["nodes"][0]["operation"]["result_types"] == [
         "!pto.tile_buf<loc=vec, dtype=f32, rows=8, cols=128>"
     ]
+    assert record["nodes"][0]["operation"]["operand_constants"] == [None]
+    assert record["nodes"][1]["operation"]["operand_constants"] == [None, "1.250000e+00 : f32"]
     assert [node["operation"]["static_work_bytes"] for node in record["nodes"]] == [
         4096,
         4096,
@@ -757,6 +760,29 @@ def test_import_legacy_debug_joins_raw_pto_access_provenance():
     assert record["export_limitations"]["operation_types_missing"] == 0
     assert record["export_limitations"]["static_work_sizes_missing"] == 0
     assert record["export_limitations"]["static_loop_bounds_missing"] == 0
+
+
+def test_import_legacy_debug_preserves_scalar_constant_mutations():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tadds [PIPE_V]
+// ========================================= //
+"""
+    tile_type = "!pto.tile_buf<loc=vec, dtype=f32, rows=8, cols=128>"
+
+    def import_constant(value: str) -> list[str | None]:
+        pto = "\n".join(
+            [
+                f"%scale = arith.constant {value} : f32",
+                f"pto.tadds ins(%tile, %scale : {tile_type}, f32) outs(%tile : {tile_type}) "
+                'loc("pypto.access.7")',
+            ]
+        )
+        record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+        return record["nodes"][0]["operation"]["operand_constants"]
+
+    assert import_constant("1.250000e+00") == [None, "1.250000e+00 : f32"]
+    assert import_constant("2.500000e+00") == [None, "2.500000e+00 : f32"]
 
 
 def test_import_legacy_debug_accepts_semantic_accumulating_matmul_name():

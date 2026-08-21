@@ -434,6 +434,83 @@ def test_dsa_rp_same_base_different_offset_tile_move_is_not_elided():
     assert _overlap(ranges["source"], ranges["next_value"])
 
 
+def test_dsa_rp_write_only_argument_is_not_treated_as_read(ascend_backend):
+    """ArgEffect::Write supplies a pure initial write for destination operands."""
+    span = ir.Span.unknown()
+    destination_base = ir.Var("destination_base", ir.PtrType(), span)
+    source_base = ir.Var("source_base", ir.PtrType(), span)
+    next_base = ir.Var("next_base", ir.PtrType(), span)
+    input_a_base = ir.Var("input_a_base", ir.PtrType(), span)
+    input_b_base = ir.Var("input_b_base", ir.PtrType(), span)
+
+    input_a = ir.Var(
+        "input_a",
+        ir.TensorType([32, 32], DataType.FP32, ir.MemRef(input_a_base, 0, 4096, span)),
+        span,
+    )
+    input_b = ir.Var(
+        "input_b",
+        ir.TensorType([32, 32], DataType.FP32, ir.MemRef(input_b_base, 0, 4096, span)),
+        span,
+    )
+    destination_type = ir.TileType(
+        [32, 32],
+        DataType.FP32,
+        ir.MemRef(destination_base, 0, 4096, span),
+        None,
+        ir.MemorySpace.Vec,
+    )
+    source_type = ir.TileType(
+        [32, 32],
+        DataType.FP32,
+        ir.MemRef(source_base, 0, 4096, span),
+        None,
+        ir.MemorySpace.Vec,
+    )
+    next_type = ir.TileType(
+        [32, 32],
+        DataType.FP32,
+        ir.MemRef(next_base, 0, 4096, span),
+        None,
+        ir.MemorySpace.Vec,
+    )
+    destination = ir.Var("destination", destination_type, span)
+    source = ir.Var("source", source_type, span)
+    stored = ir.Var("stored", destination_type, span)
+    next_value = ir.Var("next_value", next_type, span)
+    offsets = ir.MakeTuple([ir.ConstInt(0, DataType.INDEX, span)] * 2, span)
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(source, ir.Call(ir.Op("tile.load"), [input_a], source_type, span), span),
+            # The registered tile.store contract marks argument 2 Write. A tile
+            # destination is constructed deliberately here so the DSA test can
+            # observe that contract; normal programs use an external tensor.
+            ir.AssignStmt(
+                stored,
+                ir.Call(ir.Op("tile.store"), [source, offsets, destination], destination_type, span),
+                span,
+            ),
+            ir.AssignStmt(next_value, ir.Call(ir.Op("tile.load"), [input_b], next_type, span), span),
+            ir.ReturnStmt(span),
+        ],
+        span,
+    )
+    function = ir.Function(
+        "main",
+        [input_a, input_b, destination],
+        [],
+        body,
+        span,
+        type=ir.FunctionType.InCore,
+    )
+
+    edges = {
+        (edge["first_name"], edge["second_name"], edge["cost"])
+        for edge in testing.recognize_dsa_reuse_penalties(function)
+    }
+    assert ("destination", "next_value", 1) in edges
+
+
 def test_dsa_rp_tile_create_is_not_an_execution_write():
     """A storage declaration alone does not create a WAW penalty."""
 
