@@ -389,7 +389,9 @@ def test_main_scores_candidate_problem(tmp_path):
     schedule = tmp_path / "schedule.jsonl"
     problem = tmp_path / "problem.dsa.json"
     output = tmp_path / "weights.json"
+    model = tmp_path / "duration-model.json"
     schedule.write_text(json.dumps(record) + "\n")
+    model.write_text(json.dumps(_ten_cycle_model().to_json()))
     candidate_fields = ",".join(_candidate().fields)
     problem.write_text(
         json.dumps(
@@ -407,7 +409,20 @@ def test_main_scores_candidate_problem(tmp_path):
         )
     )
 
-    assert dsa_schedule_model.main(["score-candidates", str(schedule), str(problem), "-o", str(output)]) == 0
+    assert (
+        dsa_schedule_model.main(
+            [
+                "score-candidates",
+                str(schedule),
+                str(problem),
+                "--model",
+                str(model),
+                "-o",
+                str(output),
+            ]
+        )
+        == 0
+    )
     result = json.loads(output.read_text())
     assert result["candidates"][0]["weight_cycles"] > 0
     assert result["model_version"] == "reuse_penalty_critical_path_v1"
@@ -633,16 +648,29 @@ def test_load_and_freeze_predictions_are_content_addressed(tmp_path):
 def test_main_scores_and_writes_frozen_record(tmp_path):
     schedule = tmp_path / "schedule.jsonl"
     output = tmp_path / "frozen.json"
+    model = tmp_path / "duration-model.json"
     schedule.write_text(json.dumps(_record()) + "\n")
+    model.write_text(json.dumps(_ten_cycle_model().to_json()))
 
     assert (
-        dsa_schedule_model.main(["score", str(schedule), "--freeze-cohort", "held-out", "-o", str(output)])
+        dsa_schedule_model.main(
+            [
+                "score",
+                str(schedule),
+                "--model",
+                str(model),
+                "--freeze-cohort",
+                "held-out",
+                "-o",
+                str(output),
+            ]
+        )
         == 0
     )
     result = json.loads(output.read_text())
     assert result["cohort"] == "held-out"
     prediction = result["predictions"][f"{schedule}:kernel"]
-    assert prediction["calibration_status"] == "uncalibrated_defaults"
+    assert prediction["calibration_status"] == "test"
 
 
 def test_import_legacy_debug_reconstructs_streams_and_event_edges():
@@ -826,6 +854,9 @@ def test_evaluate_arm_manifest_scores_direction_and_rank(tmp_path):
     assert result["comparisons"][0]["predicted_relative_delta"] == 1.0
     assert result["comparisons"][0]["observed_relative_delta"] == 1.0
     assert result["comparisons"][0]["direction_correct"] is True
+    assert result["comparisons"][0]["baseline_exact_duration_coverage"] == 1.0
+    assert result["comparisons"][0]["candidate_exact_duration_coverage"] == 1.0
+    assert result["comparisons"][0]["baseline_duration_source_counts"] == {"simulator_operation_median": 4}
     assert result["comparisons"][0]["added_sync_edges"] == [
         {
             "source": 2,

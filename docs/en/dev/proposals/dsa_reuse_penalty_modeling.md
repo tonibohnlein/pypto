@@ -200,13 +200,48 @@ counting synchronization groups: an edge receives zero exposure when it is
 covered by work already on the critical path.
 
 Static loops are aggregated by their trip count in the whole-function DAG.
-Dynamic loops use a multiplier of one. Loop-carried synchronization edges are
-excluded from that DAG and reported; candidate scoring handles them separately
-with the recurrence lower bound described below. Operation durations come
-either from medians in cleaned simulator instruction metrics or from explicitly
-labelled, uncalibrated per-pipe fallbacks. Consequently, these results are not
-cycle-accurate estimates unless their calibration coverage and loop
-limitations support that claim.
+Dynamic loops fail closed because the model has no defensible multiplier.
+Loop-carried synchronization edges are excluded from that DAG and reported;
+candidate scoring handles them separately with the recurrence lower bound
+described below. Operation durations come from
+a provider snapshot loaded from the exact PTO-ISA revision in
+`runtime/pto_isa.pin`. The snapshot includes the fitted A2/A3 formula rows,
+transfer bandwidths, frequency, source hashes, and the full revision.
+Unsupported operations fail closed by default. An exploratory run may opt into
+`--unsupported-policy fallback`, but every such node is labelled and the score
+reports exact/fallback coverage. Simulator instruction medians can override
+the analytical provider without removing its provenance.
+
+```bash
+python -m pypto.tools.dsa_schedule_model snapshot-duration \
+    --pto-isa-root <exact-pto-isa-checkout> -o duration-pinned.json
+python -m pypto.tools.dsa_schedule_model score schedule.jsonl \
+    --model duration-pinned.json -o score.json
+python -m pypto.tools.dsa_schedule_model validate-perf-sim trace-*.json \
+    --model duration-pinned.json -o perf-sim-validation.json
+python -m pypto.tools.dsa_schedule_model calibrate instr_metrics.json \
+    --base-model duration-pinned.json -o duration-calibrated.json
+```
+
+The pinned provider removes PyPTO's former silent, coarse pipe constants; it
+does **not** make the structural schedule graph cycle-accurate by itself.
+Perf-Sim uses the richer CCE mock's recorded cycles when available and only
+falls back to PTO-ISA's lightweight formulas otherwise. On the pinned A2/A3
+validation set (102 formula-supported events), the lightweight provider had an
+82-cycle mean absolute error and 73.6% mean absolute percentage error against
+effective Perf-Sim events. Elementwise `TMUL` was much closer (11.3% MAPE),
+while reductions and exponentials were not.
+
+The paired device check reaches the same conclusion. On the branch-free
+RMSNorm case in the current four-capacity development dataset, the provider
+scores 40% of nodes exactly and labels the rest as fallback. It predicts equal
+full makespans for all three physical endpoints at all four capacities, while
+the archived device measurements show about a 13% geometry-to-penalty-aware
+improvement at native, half, and quarter capacity. Thus the provider is a
+pinned, auditable starting point, but the current critical-path model does not
+yet explain the observed placement effect. Per-kernel Perf-Sim instruction
+traces are required for calibration before these cycle scores can be used as
+DSA-RP weights.
 
 The first critical-path calibration subset uses the `static_loop_v1`
 eligibility policy. It accepts loops with an exported non-negative static trip
