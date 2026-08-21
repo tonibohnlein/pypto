@@ -125,6 +125,10 @@ _KEYED_TILE_RE = re.compile(
     re.IGNORECASE,
 )
 _SHAPE_DTYPE_RE = re.compile(r"(?P<shape>(?:\d+x)*\d+)x(?P<dtype>[a-z][a-z0-9]*)$")
+_PARTITION_TYPE_RE = re.compile(
+    r"!pto\.partition_tensor_view<(?P<shape>(?:\d+x)*\d+)x(?P<dtype>[a-z][a-z0-9]*)>",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -266,9 +270,17 @@ class PtoIsaDurationProvider:
         if not isinstance(operation, Mapping):
             return self._unsupported(op_name, "missing PTOAS operation metadata")
         operand_types = operation.get("operand_types")
-        if not isinstance(operand_types, list) or not all(isinstance(item, str) for item in operand_types):
+        result_types = operation.get("result_types", [])
+        if (
+            not isinstance(operand_types, list)
+            or not all(isinstance(item, str) for item in operand_types)
+            or not isinstance(result_types, list)
+            or not all(isinstance(item, str) for item in result_types)
+        ):
             return self._unsupported(op_name, "missing PTOAS operand types")
-        tiles = [tile for item in operand_types if (tile := _parse_tile_type(item)) is not None]
+        tiles = [
+            tile for item in [*operand_types, *result_types] if (tile := _parse_tile_type(item)) is not None
+        ]
 
         if op_name in _FORMULA_OPCODE:
             if not tiles:
@@ -319,16 +331,18 @@ class PtoIsaDurationProvider:
             tile_type = _TILE_TO_SCOPE.get(tile.scope)
             route = _TRANSFER_ROUTE.get((_TRANSFER_OPS[op_name], tile_type or ""))
             bandwidth = self.bandwidth_gib_per_s.get(route or "")
-            if route is None or bandwidth is None or bandwidth <= 0 or work_bytes <= 0:
+            element_bytes = _DTYPE_BYTES.get(tile.dtype)
+            transfer_bytes = tile.rows * tile.cols * element_bytes if element_bytes is not None else 0
+            if route is None or bandwidth is None or bandwidth <= 0 or transfer_bytes <= 0:
                 return self._unsupported(
                     op_name,
-                    f"unsupported transfer tile={tile_type}, bytes={work_bytes}, route={route}",
+                    f"unsupported transfer tile={tile_type}, bytes={transfer_bytes}, route={route}",
                 )
-            cycles = math.floor((work_bytes / (1024**3)) / bandwidth * self.frequency_hz)
+            cycles = math.floor((transfer_bytes / (1024**3)) / bandwidth * self.frequency_hz)
             return DurationEstimate(
                 float(cycles),
                 "pto_isa_bandwidth",
-                f"route={route}; bytes={work_bytes}; bandwidth_gib_per_s={bandwidth}; "
+                f"route={route}; bytes={transfer_bytes}; bandwidth_gib_per_s={bandwidth}; "
                 f"frequency_hz={self.frequency_hz}",
             )
 
@@ -453,6 +467,22 @@ def _parse_tile_type(value: str) -> TileType | None:
         cols=dimensions[-1],
         dtype=dtype,
     )
+
+
+def static_type_size_bytes(value: str) -> int | None:
+    """Return the byte extent of one statically shaped PTO tile or partition type."""
+    if tile := _parse_tile_type(value):
+        element_bytes = _DTYPE_BYTES.get(tile.dtype)
+        return tile.rows * tile.cols * element_bytes if element_bytes is not None else None
+    match = _PARTITION_TYPE_RE.search(value)
+    if match is None:
+        return None
+    dtype = _PTO_DTYPE.get(match.group("dtype").lower())
+    element_bytes = _DTYPE_BYTES.get(dtype or "")
+    if element_bytes is None:
+        return None
+    dimensions = [int(item) for item in match.group("shape").split("x")]
+    return math.prod(dimensions) * element_bytes
 
 
 def _round_to_cycles(value: float) -> int:
