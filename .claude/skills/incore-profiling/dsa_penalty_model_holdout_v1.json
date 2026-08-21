@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "selection_policy": "isolated_direct_golden_holdout_structural_v1",
+  "timing_blind_selection": true,
+  "pypto_lib_revision": "234e0493b5bec5ad8eb5dbcd3c1c38e3d033c398",
+  "arms": [
+    "geometry_ff",
+    "geometry_cg",
+    "cypress",
+    "dsa_rp_cg"
+  ],
+  "capacities": [
+    "native",
+    "half",
+    "q1",
+    "tight"
+  ],
+  "input_seed": 20260821,
+  "measurement_contract": {
+    "placement_scope": "all_dsa_functions_in_driver",
+    "correctness_scope": "complete_driver_torch_golden",
+    "timing_scope": "selected_runtime_task",
+    "allow_whole_driver_as_kernel_timing": false,
+    "requires_runtime_capture": false
+  },
+  "drivers": [
+    {
+      "tier": "expanded",
+      "driver_id": "dspark_idx_qr_proj_dequant_isolated",
+      "script": "models/deepseek_v4_flash_dspark/dsa_eval_idx_qr_proj_dequant.py",
+      "entry": "idx_qr_proj_dequant_test",
+      "golden": "golden_idx_qr_proj_dequant",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "idx_qr_proj_dequant",
+          "problem_fingerprint": "2b7e568f46f55b78",
+          "pool_id": "1",
+          "operation_class": "dequantization",
+          "definition_script": "models/deepseek_v4_flash_dspark/decode_indexer.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "mtp_dequant_isolated",
+      "script": "models/deepseek_v4_flash_mtp/dsa_eval_mtp_dequant.py",
+      "entry": "mtp_dequant_test",
+      "golden": "golden_mtp_dequant",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "mtp_dequant",
+          "problem_fingerprint": "356871ddfb3c6197",
+          "pool_id": "1",
+          "operation_class": "dequantization",
+          "definition_script": "models/deepseek_v4_flash_mtp/mtp_projection.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "mtp_hidden_norm_quant_isolated",
+      "script": "models/deepseek_v4_flash_mtp/dsa_eval_mtp_hidden_norm_quant.py",
+      "entry": "mtp_hidden_norm_quant_test",
+      "golden": "golden_mtp_hidden_norm_quant",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "mtp_hidden_norm_quant",
+          "problem_fingerprint": "af43efa160bcfddb",
+          "pool_id": "1",
+          "operation_class": "normalization_quantization",
+          "definition_script": "models/deepseek_v4_flash_mtp/mtp_projection.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "dspark_hca_gather_kv_isolated",
+      "script": "models/deepseek_v4_flash_dspark/dsa_eval_hca_gather_kv.py",
+      "entry": "hca_gather_kv_test",
+      "golden": "golden_hca_gather_kv",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "hca_gather_kv",
+          "problem_fingerprint": "c32ba3b0d7b0a5b3",
+          "pool_id": "1",
+          "operation_class": "data_movement",
+          "definition_script": "models/deepseek_v4_flash_dspark/decode_sparse_attn_hca.py"
+        }
+      ]
+    }
+  ]
+}

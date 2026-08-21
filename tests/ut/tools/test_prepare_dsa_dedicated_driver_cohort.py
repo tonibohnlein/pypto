@@ -27,6 +27,7 @@ _SCRIPT = (
     / "prepare_dsa_dedicated_driver_cohort.py"
 )
 _CATALOG = _SCRIPT.with_name("dsa_dedicated_driver_cohort_v1.json")
+_HOLDOUT_CATALOG = _SCRIPT.with_name("dsa_penalty_model_holdout_v1.json")
 _SPEC = importlib.util.spec_from_file_location("_test_prepare_dsa_dedicated_driver_cohort", _SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None
 cohort = importlib.util.module_from_spec(_SPEC)
@@ -308,3 +309,24 @@ def test_checked_in_catalog_has_expected_bounded_cohort():
         == 19
     )
     assert len({target["operation_class"] for driver in drivers for target in driver["targets"]}) == 14
+
+
+def test_checked_in_holdout_catalog_contains_only_new_isolated_drivers():
+    data, hashes = cohort._load_catalog(_HOLDOUT_CATALOG)
+    cohort._validate_catalog(data)
+
+    drivers = data["drivers"]
+    driver_ids = {driver["driver_id"] for driver in drivers}
+    assert data["pypto_lib_revision"] == "234e0493b5bec5ad8eb5dbcd3c1c38e3d033c398"
+    assert len(drivers) == 4
+    assert sum(len(driver["targets"]) for driver in drivers) == 4
+    assert driver_ids == {
+        "dspark_idx_qr_proj_dequant_isolated",
+        "mtp_dequant_isolated",
+        "mtp_hidden_norm_quant_isolated",
+        "dspark_hca_gather_kv_isolated",
+    }
+    assert set(hashes) == {
+        "catalog_source_sha256",
+        "catalog_semantics_sha256",
+    }
