@@ -26,8 +26,6 @@ and every supported recurrence cycle.  This remains a structural model, not a
 cycle-accurate prediction.
 """
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import json
@@ -63,6 +61,13 @@ _DEBUG_SYNC_RE = re.compile(
 )
 _ACCESS_LOCATION_RE = re.compile(r"pypto\.access\.(\d+)")
 _PTO_OPERATION_RE = re.compile(r"(?<![!\w.])(pto\.[A-Za-z0-9_]+)\b")
+_PTO_CONSTANT_RE = re.compile(
+    r"^\s*(%[-A-Za-z0-9_.$]+)\s*=\s*arith\.constant\s+(-?\d+)\s*:\s*(?:index|i\d+)\s*$"
+)
+_PTO_FOR_RE = re.compile(
+    r"^\s*scf\.for\s+%\S+\s*=\s*(%[-A-Za-z0-9_.$]+|-?\d+)\s+to\s+"
+    r"(%[-A-Za-z0-9_.$]+|-?\d+)\s+step\s+(%[-A-Za-z0-9_.$]+|-?\d+)\b"
+)
 
 # This is deliberately narrower than the recognizer's route vocabulary. The
 # first structured model targets the route families already exercised by the
@@ -119,7 +124,7 @@ class DurationModel:
     calibration_sources: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_json(cls, value: Mapping[str, Any]) -> DurationModel:
+    def from_json(cls, value: Mapping[str, Any]) -> "DurationModel":
         """Construct a model from a JSON-compatible mapping."""
         if value.get("schema_version") != 1:
             raise ValueError("duration model must have schema_version=1")
@@ -237,6 +242,59 @@ def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) ->
         }
 
 
+def _attach_pto_static_loop_bounds(nodes: list[dict[str, Any]], pto_text: str) -> int:
+    """Join statically provable raw-PTO ``scf.for`` trip counts to SyncIR loops.
+
+    The legacy PTOAS debug stream identifies loop structure but reports SyncIR
+    node ranges rather than iteration bounds. Raw PTO is the product-faithful
+    source for the original ``scf.for`` lower/upper/step operands. The loop
+    order is preserved by PTOAS; a count mismatch is therefore an ambiguous
+    bridge and fails closed.
+
+    Returns:
+        The number of loops whose bounds are genuinely dynamic or unsupported.
+    """
+    constants: dict[str, int] = {}
+    raw_loops: list[tuple[int | None, str]] = []
+
+    def resolve(operand: str) -> int | None:
+        if operand.startswith("%"):
+            return constants.get(operand)
+        return int(operand)
+
+    for line in pto_text.splitlines():
+        if match := _PTO_CONSTANT_RE.match(line):
+            constants[match.group(1)] = int(match.group(2))
+            continue
+        if not (match := _PTO_FOR_RE.match(line)):
+            continue
+        lower, upper, step = (resolve(match.group(index)) for index in range(1, 4))
+        trip_count = None
+        if lower is not None and upper is not None and step is not None and step > 0:
+            trip_count = max(0, (upper - lower + step - 1) // step)
+        raw_loops.append((trip_count, line.strip()))
+
+    loop_begins = [
+        node for node in nodes if node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_BEGIN"
+    ]
+    if len(raw_loops) != len(loop_begins):
+        raise ValueError(
+            "raw PTO loop sequence does not match the final SyncIR trace: "
+            f"counts={len(raw_loops)}->{len(loop_begins)}"
+        )
+
+    trip_count_by_begin: dict[int, int | None] = {}
+    for node, (trip_count, source_line) in zip(loop_begins, raw_loops, strict=True):
+        node["static_trip_count"] = trip_count
+        node["operation"] = {"raw_pto_loop": source_line}
+        trip_count_by_begin[int(node["id"])] = trip_count
+    for node in nodes:
+        if node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_END":
+            node["static_trip_count"] = trip_count_by_begin.get(int(node["begin"]))
+
+    return sum(trip_count is None for trip_count, _ in raw_loops)
+
+
 def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors the four debug record kinds
     text: str, *, function: str, pto_text: str | None = None
 ) -> dict[str, Any]:
@@ -340,8 +398,12 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
 
     if not any(node["kind"] == "operation" for node in nodes):
         raise ValueError("final debug phase has no operation nodes")
+    missing_static_loop_bounds = sum(
+        node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_BEGIN" for node in nodes
+    )
     if pto_text is not None:
         _attach_pto_access_provenance(nodes, pto_text)
+        missing_static_loop_bounds = _attach_pto_static_loop_bounds(nodes, pto_text)
 
     sync_groups: list[dict[str, Any]] = []
     sync_edges: list[dict[str, Any]] = []
@@ -388,11 +450,13 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
         "node_count": len(nodes),
         "duration_model": "unestimated",
         "export_source": (
-            "ptoas_debug_import_v0+pto_access_join_v1" if pto_text is not None else "ptoas_debug_import_v0"
+            "ptoas_debug_import_v0+pto_access_join_v1+static_loop_bounds_v1"
+            if pto_text is not None
+            else "ptoas_debug_import_v0"
         ),
         "export_limitations": {
             "allocation_sizes_missing": True,
-            "static_loop_bounds_missing": True,
+            "static_loop_bounds_missing": missing_static_loop_bounds,
             "barrier_dependency_nodes_missing": omitted_barriers,
             "access_provenance_missing": pto_text is None,
         },
@@ -805,6 +869,10 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
             f"branch nodes: {branch_ids[:8]}"
         )
     durations, provenance, dynamic_loops = estimate_node_durations(record, model)
+    if dynamic_loops:
+        raise ValueError(
+            f"duration_v0 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
+        )
     node_ids = set(durations)
     stream_edges, _ = _graph_edges(record, node_ids, include_sync=False)
     full_edges, excluded_loop_carried = _graph_edges(record, node_ids, include_sync=True)
@@ -982,8 +1050,229 @@ def _summarize_candidate_weights(
     return result
 
 
+def _buffer_pair(first: int, second: int) -> tuple[int, int]:
+    return min(first, second), max(first, second)
+
+
+def load_promoted_reuse_penalties(path: str | Path) -> dict[tuple[int, int], float]:
+    """Load the pairwise reuse penalties that the DSA solver actually sees."""
+    source = Path(path)
+    document = json.loads(source.read_text())
+    try:
+        raw_penalties = document["problem"]["cost_model"]["reuse_penalties"]
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"{source}: missing problem.cost_model.reuse_penalties") from error
+    if not isinstance(raw_penalties, list):
+        raise ValueError(f"{source}: reuse_penalties must be an array")
+
+    penalties: dict[tuple[int, int], float] = {}
+    for index, raw in enumerate(raw_penalties):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{source}: reuse penalty {index} must be an object")
+        first, second, cost = raw.get("first"), raw.get("second"), _as_number(raw.get("cost"))
+        if not isinstance(first, int) or not isinstance(second, int) or cost is None or cost < 0:
+            raise ValueError(f"{source}: invalid reuse penalty {index}: {raw}")
+        pair = _buffer_pair(first, second)
+        if pair in penalties:
+            raise ValueError(f"{source}: duplicate reuse penalty pair {pair}")
+        penalties[pair] = cost
+    return penalties
+
+
+def _score_penalty_pairs(
+    rows: Sequence[Mapping[str, Any]],
+    durations: Mapping[int, float],
+    existing_edges: Sequence[tuple[int, int, float, str, int | None]],
+    base_makespan: float,
+    loop_counts: Mapping[int, int],
+    sync_latency_cycles: float,
+    promoted_penalties: Mapping[tuple[int, int], float] | None,
+) -> list[dict[str, Any]]:
+    """Collapse access-site candidates into additive buffer-pair weights."""
+    by_pair: dict[tuple[int, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        first, second = row.get("first_buffer"), row.get("second_buffer")
+        if isinstance(first, int) and isinstance(second, int):
+            by_pair[_buffer_pair(first, second)].append(row)
+
+    scored: list[dict[str, Any]] = []
+    for pair, pair_rows in sorted(by_pair.items()):
+        distance_zero_edges = {
+            (int(row["source_node"]), int(row["target_node"]))
+            for row in pair_rows
+            if row.get("status") == "scored"
+        }
+        additions = [
+            (source, target, sync_latency_cycles, "candidate_sync", None)
+            for source, target in sorted(distance_zero_edges)
+        ]
+        distance_zero_weight = 0.0
+        if additions:
+            with_pair, _, _, _ = _longest_path(durations, [*existing_edges, *additions])
+            distance_zero_weight = max(0.0, with_pair - base_makespan)
+
+        loop_weights: dict[int, float] = {}
+        for row in pair_rows:
+            if row.get("status") != "loop_carried_scored_v1":
+                continue
+            loop_id = row.get("loop_node")
+            weight = _as_number(row.get("weight_cycles"))
+            if not isinstance(loop_id, int) or weight is None:
+                raise ValueError(f"invalid loop recurrence score for buffer pair {pair}")
+            loop_weights[loop_id] = max(loop_weights.get(loop_id, 0.0), weight)
+        loop_total_weight = sum(
+            weight * max(loop_counts.get(loop_id, 1) - 1, 0) for loop_id, weight in loop_weights.items()
+        )
+
+        promoted = promoted_penalties is None or pair in promoted_penalties
+        unit_cost = 1.0 if promoted_penalties is None else promoted_penalties.get(pair, 0.0)
+        scored.append(
+            {
+                "first_buffer": pair[0],
+                "second_buffer": pair[1],
+                "promoted_to_dsa_penalty": promoted,
+                "unit_cost": unit_cost,
+                "candidate_record_count": len(pair_rows),
+                "distance_zero_schedule_edges": [list(edge) for edge in sorted(distance_zero_edges)],
+                "distance_zero_weight_cycles": distance_zero_weight,
+                "loop_ii_weight_cycles": sum(loop_weights.values()),
+                "loop_total_weight_cycles": loop_total_weight,
+                "critical_path_weight_cycles": distance_zero_weight + loop_total_weight,
+            }
+        )
+
+    if promoted_penalties is not None:
+        missing = sorted(set(promoted_penalties) - set(by_pair))
+        if missing:
+            raise ValueError(f"promoted reuse penalties have no access-site candidate records: {missing[:8]}")
+    return scored
+
+
+def _index_problem_buffers(raw_buffers: Any) -> dict[int, Mapping[str, Any]]:
+    if not isinstance(raw_buffers, list):
+        raise ValueError("problem buffers must be an array")
+    buffers: dict[int, Mapping[str, Any]] = {}
+    for buffer in raw_buffers:
+        if not isinstance(buffer, Mapping) or not isinstance(buffer.get("id"), int):
+            raise ValueError(f"invalid problem buffer: {buffer!r}")
+        buffer_id = buffer["id"]
+        if buffer_id in buffers:
+            raise ValueError(f"duplicate problem buffer id {buffer_id}")
+        if not isinstance(buffer.get("size"), int) or buffer["size"] < 0:
+            raise ValueError(f"invalid size for problem buffer {buffer_id}")
+        buffers[buffer_id] = buffer
+    return buffers
+
+
+def _index_solution_placements(raw_placements: Any) -> dict[int, Mapping[str, Any]]:
+    if not isinstance(raw_placements, list):
+        raise ValueError("solution placements must be an array")
+    placements: dict[int, Mapping[str, Any]] = {}
+    for placement in raw_placements:
+        if not isinstance(placement, Mapping) or not isinstance(placement.get("buffer"), int):
+            raise ValueError(f"invalid solution placement: {placement!r}")
+        buffer_id = placement["buffer"]
+        if buffer_id in placements:
+            raise ValueError(f"duplicate solution placement for buffer {buffer_id}")
+        if (
+            not isinstance(placement.get("pool"), int)
+            or not isinstance(placement.get("offset"), int)
+            or placement["offset"] < 0
+        ):
+            raise ValueError(f"invalid solution placement for buffer {buffer_id}")
+        placements[buffer_id] = placement
+    return placements
+
+
+def score_realized_reuse(
+    problem_path: str | Path,
+    solution_path: str | Path,
+    candidate_scores: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Score the promoted reuse pairs physically realized by one placement."""
+    problem_source = Path(problem_path)
+    solution_source = Path(solution_path)
+    problem = json.loads(problem_source.read_text())
+    solution = json.loads(solution_source.read_text())
+    try:
+        raw_buffers = problem["problem"]["buffers"]
+        raw_placements = solution["placements"]
+        pair_weights = candidate_scores["penalty_pair_weights"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("problem, solution, or candidate score has an invalid schema") from error
+    buffers = _index_problem_buffers(raw_buffers)
+    placements = _index_solution_placements(raw_placements)
+
+    problem_instance = problem.get("instance")
+    solution_instance = solution.get("instance")
+    if isinstance(problem_instance, str) and solution_instance != problem_instance:
+        raise ValueError(
+            f"solution instance does not match problem: {solution_instance!r} != {problem_instance!r}"
+        )
+    expected_fingerprint = problem.get("problem_fingerprint")
+    if expected_fingerprint is None and isinstance(problem_instance, Mapping):
+        expected_fingerprint = problem_instance.get("fingerprint")
+    actual_fingerprint = solution.get("problem_fingerprint")
+    if expected_fingerprint is not None and actual_fingerprint != expected_fingerprint:
+        raise ValueError(
+            "solution problem fingerprint does not match problem: "
+            f"{actual_fingerprint!r} != {expected_fingerprint!r}"
+        )
+    if not isinstance(pair_weights, list):
+        raise ValueError("candidate score penalty_pair_weights must be an array")
+
+    rows: list[dict[str, Any]] = []
+    for pair_weight in pair_weights:
+        if not isinstance(pair_weight, Mapping) or not pair_weight.get("promoted_to_dsa_penalty"):
+            continue
+        first, second = pair_weight.get("first_buffer"), pair_weight.get("second_buffer")
+        if (
+            first not in buffers
+            or second not in buffers
+            or first not in placements
+            or second not in placements
+        ):
+            raise ValueError(f"placement is missing promoted reuse pair {first, second}")
+        first_placement, second_placement = placements[first], placements[second]
+        first_begin, second_begin = first_placement["offset"], second_placement["offset"]
+        first_end = first_begin + buffers[first]["size"]
+        second_end = second_begin + buffers[second]["size"]
+        overlap = (
+            first_placement["pool"] == second_placement["pool"]
+            and first_begin < second_end
+            and second_begin < first_end
+        )
+        rows.append(
+            {
+                **pair_weight,
+                "reuse_realized": overlap,
+                "overlap_bytes": max(0, min(first_end, second_end) - max(first_begin, second_begin))
+                if overlap
+                else 0,
+            }
+        )
+
+    realized = [row for row in rows if row["reuse_realized"]]
+    return {
+        "schema_version": 1,
+        "model_version": candidate_scores.get("model_version"),
+        "problem": str(problem_source),
+        "solution": str(solution_source),
+        "promoted_pair_count": len(rows),
+        "realized_pair_count": len(realized),
+        "unit_realized_cost": sum(float(row["unit_cost"]) for row in realized),
+        "critical_path_realized_cost_cycles": sum(
+            float(row["critical_path_weight_cycles"]) for row in realized
+        ),
+        "pairs": rows,
+    }
+
+
 def score_reuse_candidates(
-    record: Mapping[str, Any], candidates: Sequence[ReuseCandidateRecord], model: DurationModel
+    record: Mapping[str, Any],
+    candidates: Sequence[ReuseCandidateRecord],
+    model: DurationModel,
+    promoted_penalties: Mapping[tuple[int, int], float] | None = None,
 ) -> dict[str, Any]:
     """Score hypothetical synchronization induced by individual reuse pairs.
 
@@ -1011,6 +1300,10 @@ def score_reuse_candidates(
             f"branch nodes: {branch_ids[:8]}"
         )
     durations, provenance, dynamic_loops = estimate_node_durations(record, model)
+    if dynamic_loops:
+        raise ValueError(
+            f"duration_v0 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
+        )
     node_ids = set(durations)
     existing_edges, excluded_loop_carried = _graph_edges(record, node_ids, include_sync=True)
     existing_edges = [
@@ -1152,6 +1445,16 @@ def score_reuse_candidates(
 
     distance_zero_edges, loop_edge_groups = _deduplicate_scored_candidate_edges(rows)
     weight_summary = _summarize_candidate_weights(distance_zero_edges, loop_edge_groups)
+    loop_counts, _ = _loop_multipliers(record)
+    penalty_pair_weights = _score_penalty_pairs(
+        rows,
+        durations,
+        existing_edges,
+        base_makespan,
+        loop_counts,
+        model.sync_latency_cycles,
+        promoted_penalties,
+    )
 
     return {
         "schema_version": 1,
@@ -1176,6 +1479,7 @@ def score_reuse_candidates(
         "consumer_groups": consumer_groups,
         "distance_zero_edges": distance_zero_edges,
         "loop_recurrence_edges": loop_edge_groups,
+        "penalty_pair_weights": penalty_pair_weights,
         "candidate_weight_summary": weight_summary,
         "node_durations": {str(node): value for node, value in sorted(provenance.items())},
     }
@@ -1652,6 +1956,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidate_parser.add_argument("problem", type=Path)
     candidate_parser.add_argument("--function")
     candidate_parser.add_argument("--model", type=Path)
+    candidate_parser.add_argument("--solution", type=Path)
     candidate_parser.add_argument("-o", "--output", type=Path)
 
     args = parser.parse_args(argv)
@@ -1678,8 +1983,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "score-candidates":
             record, _ = _resolve_schedule_record(args.schedule, args.function)
             result = score_reuse_candidates(
-                record, load_candidate_records(args.problem), _load_model(args.model)
+                record,
+                load_candidate_records(args.problem),
+                _load_model(args.model),
+                load_promoted_reuse_penalties(args.problem),
             )
+            if args.solution is not None:
+                result["realized_placement"] = score_realized_reuse(args.problem, args.solution, result)
             _write_json(args.output, result)
             return 0
 

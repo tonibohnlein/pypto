@@ -38,6 +38,50 @@ The first four-capacity development dataset is pinned by
 `dsa_penalty_modeling_dataset_v1.json`. It remains immutable when the corpus is
 expanded or reduced to one evaluation capacity per problem.
 
+## Structured penalty model
+
+Use all four capacities of dataset v1 as development data. For each target,
+export the schedule and synchronization graph with the PTOAS version pinned by
+PyPTO, preserving `pypto.access.N` provenance. Model eligibility is separate
+from device measurability: statically bounded loops are supported, while
+branches and dynamically bounded loops are excluded only from duration-model
+v0.
+
+When the pinned PTOAS exposes only the final InsertSync debug stream, import it
+with `dsa_schedule_model import-debug --pto <raw.pto>`. The bridge joins the
+operation stream by exact order and derives each static `scf.for` trip count
+from the raw-PTO lower/upper/step operands. A loop-count mismatch or a genuinely
+dynamic bound fails closed; neither may be replaced by a guessed trip count.
+
+Derive pairwise critical-path weights and score an actual placement with:
+
+```bash
+python -m pypto.tools.dsa_schedule_model qualify <schedule.jsonl> -o qualification.json
+python -m pypto.tools.dsa_schedule_model score-candidates \
+  <schedule.jsonl> <problem.dsa.json> --solution <solution.dsa.solution.json> \
+  --model <duration-model.json> -o placement-score.json
+```
+
+The candidate scorer collapses access-site records into the promoted buffer
+pairs the DSA solver sees. Distance-zero records use the combined longest-path
+extension; statically bounded loop recurrences use their initiation-interval
+extension over the remaining iterations. The realized-placement summary
+reports both the original unit cost and the critical-path-weighted cost.
+
+Assemble one four-arm row per `(problem, capacity, device)` and compare both
+penalty models with device ordering using:
+
+```bash
+python -m pypto.tools.dsa_penalty_model_evaluation scores.tsv \
+  --split development -o development-evaluation.json
+```
+
+For a new holdout, omit every latency field and pass
+`--freeze-before-timing`. The command rejects any leaked device latency and
+content-addresses the predictions. Cypress auxiliary-edge, relaxed-edge,
+alias-pair, and packing-attempt metrics are retained as structural explanatory
+features; they are never used to choose a capacity or a holdout case.
+
 The complete functional driver is the correctness unit and every DSA function
 inside it must use the same arm. A selected runtime task, or the complete mixed
 AIC/AIV group containing it, is the kernel timing unit. Whole-driver latency
