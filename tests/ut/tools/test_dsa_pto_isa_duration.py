@@ -92,6 +92,30 @@ def test_transfer_converts_gib_per_second_to_cycles():
     assert estimate.source == "pto_isa_bandwidth"
 
 
+def test_transfer_accepts_tile_type_in_result_metadata():
+    provider = _provider()
+    node = _node("pto.tload", "PIPE_MTE2", "!pto.partition_tensor_view<8x128xf32>")
+    node["operation"]["result_types"] = [
+        "!pto.tile_buf<loc=vec, dtype=f32, rows=8, cols=128, v_row=?, v_col=?>"
+    ]
+
+    estimate = provider.estimate(node, work_bytes=0)
+
+    assert estimate.cycles == 69
+    assert estimate.source == "pto_isa_bandwidth"
+
+
+def test_static_type_size_supports_keyed_tiles_and_partition_views():
+    assert (
+        dsa_pto_isa_duration.static_type_size_bytes(
+            "!pto.tile_buf<loc=vec, dtype=bf16, rows=8, cols=128, v_row=?, v_col=?>"
+        )
+        == 2048
+    )
+    assert dsa_pto_isa_duration.static_type_size_bytes("!pto.partition_tensor_view<8x128xf32>") == 4096
+    assert dsa_pto_isa_duration.static_type_size_bytes("f32") is None
+
+
 def test_matmul_uses_pto_isa_tile_formula():
     estimate = _provider().estimate(
         _node(

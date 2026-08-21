@@ -52,6 +52,10 @@ with `dsa_schedule_model import-debug --pto <raw.pto>`. The bridge joins the
 operation stream by exact order and derives each static `scf.for` trip count
 from the raw-PTO lower/upper/step operands. A loop-count mismatch or a genuinely
 dynamic bound fails closed; neither may be replaced by a guessed trip count.
+The join preserves operand/result types and derives static operation work bytes
+from tile shapes. It does not invent allocation sizes whose legacy SyncIR names
+cannot be joined to raw PTO. `pto.tmatmul` matches trace-side
+`pto.tmatmul.acc` only when its input types prove accumulator semantics.
 
 Derive pairwise critical-path weights and score an actual placement with:
 
