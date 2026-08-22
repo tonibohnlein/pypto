@@ -73,7 +73,7 @@ _PTO_CONSTANT_RE = re.compile(
 )
 _PTO_SCALAR_CONSTANT_RE = re.compile(
     r"^\s*(%[-A-Za-z0-9_.$]+)\s*=\s*arith\.constant\s+(.+?)\s*:\s*"
-    r"(bf16|f[A-Za-z0-9_]+|index|i\d+)\s*(?:loc\(.*\))?$"
+    r"(bf16|f[A-Za-z0-9_]+|index|(?:ui|i)\d+)\s*(?:loc\(.*\))?$"
 )
 _PTO_SSA_VALUE_RE = re.compile(r"%[-A-Za-z0-9_.$]+")
 _PTO_FOR_RE = re.compile(
@@ -81,7 +81,10 @@ _PTO_FOR_RE = re.compile(
     r"(%[-A-Za-z0-9_.$]+|-?\d+)\s+step\s+(%[-A-Za-z0-9_.$]+|-?\d+)\b"
 )
 _PTO_TYPE_START_RE = re.compile(r"!pto\.[A-Za-z_][A-Za-z0-9_.]*<")
-_PTO_SCALAR_TYPE_RE = re.compile(r"(?<![A-Za-z0-9_=%])(?:bf16|f16|f32|i8|i16|i32|i64|index)\b")
+_PTO_SCALAR_TYPE_RE = re.compile(
+    r"(?<![A-Za-z0-9_=%])(?:bf16|f16|f32|ui8|ui16|ui32|ui64|i8|i16|i32|i64|index)\b"
+)
+_PTO_SCALAR_TYPE_FULL_RE = re.compile(r"(?:bf16|f\d+|(?:ui|i)\d+|index)")
 _PTO_ACC_TILE_RE = re.compile(r"!pto\.tile_buf<(?:[^>]*\bloc=acc\b|\s*acc\s*,)")
 
 # This is deliberately narrower than the recognizer's route vocabulary. The
@@ -273,6 +276,17 @@ def _operation_operand_names(line: str) -> list[str]:
     return _PTO_SSA_VALUE_RE.findall(operands)
 
 
+def _operation_attributes(line: str) -> dict[str, Any]:
+    """Extract static operation attributes that affect instruction cost."""
+    attributes: dict[str, Any] = {}
+    if match := re.search(r"\brmode\s*=\s*#pto<round_mode\s+([A-Z_]+)>", line):
+        attributes["round_mode"] = match.group(1)
+    for name in ("descending", "exhausted"):
+        if match := re.search(rf"\b{name}\s*=\s*(true|false)\b", line):
+            attributes[name] = match.group(1) == "true"
+    return attributes
+
+
 def _operation_type_metadata(line: str, constants: Mapping[str, str]) -> dict[str, Any]:
     input_region = _extract_operation_region(line, "ins")
     output_region = _extract_operation_region(line, "outs")
@@ -296,7 +310,7 @@ def _operation_type_metadata(line: str, constants: Mapping[str, str]) -> dict[st
         "operand_types": operand_types,
         "operand_constants": [constants.get(name) for name in _operation_operand_names(line)],
         "result_types": result_types,
-        "attributes": {},
+        "attributes": _operation_attributes(line),
         "static_work_bytes": max(static_sizes, default=0),
     }
 
@@ -1918,11 +1932,22 @@ _PERF_SIM_TILE_RE = re.compile(
     r":pad=(?P<pad>\d+):compact=(?P<compact>\d+)$"
 )
 _PERF_SIM_DTYPE_CANONICAL = {
+    "f16": "fp16",
+    "f32": "fp32",
+    "i8": "i8",
     "int8": "i8",
+    "ui8": "u8",
+    "u8": "u8",
     "uint8": "u8",
+    "i16": "i16",
     "int16": "i16",
+    "ui16": "u16",
+    "u16": "u16",
     "uint16": "u16",
+    "i32": "i32",
     "int32": "i32",
+    "ui32": "u32",
+    "u32": "u32",
     "uint32": "u32",
 }
 _CALIBRATION_PIPE_MISMATCH_EXCEPTIONS = {
@@ -1992,6 +2017,10 @@ def _parse_perf_sim_event_prefix(prefix: str) -> dict[str, Any]:
     }
 
 
+def _canonical_perf_sim_dtype(dtype: str) -> str:
+    return _PERF_SIM_DTYPE_CANONICAL.get(dtype.lower(), dtype.lower())
+
+
 def _expected_perf_sim_tile(raw_type: str) -> dict[str, Any] | None:
     tile = parse_tile_type(raw_type)
     if tile is None:
@@ -2002,7 +2031,7 @@ def _expected_perf_sim_tile(raw_type: str) -> dict[str, Any] | None:
         raise ValueError(f"calibration requires a keyed tile type with layout and pad metadata: {raw_type}")
     try:
         return {
-            "dtype": tile.dtype,
+            "dtype": _canonical_perf_sim_dtype(tile.dtype),
             "rows": tile.rows,
             "cols": tile.cols,
             "loc": _TILE_SCOPE_CODE[fields["loc"]],
@@ -2035,71 +2064,147 @@ def _expected_perf_sim_scalar(raw_constant: Any) -> str | None:
 
 
 def _semantic_perf_sim_scalars(operation: Mapping[str, Any], op_name: str) -> list[str]:
-    location = operation.get("location")
-    if not isinstance(location, str):
-        return []
     if op_name == "pto.tcvt":
-        match = re.search(r"rmode\s*=\s*#pto<round_mode\s+([A-Z_]+)>", location)
-        if match is None:
+        attributes = operation.get("attributes", {})
+        mode = attributes.get("round_mode") if isinstance(attributes, Mapping) else None
+        if mode is None and isinstance((location := operation.get("location")), str):
+            match = re.search(r"rmode\s*=\s*#pto<round_mode\s+([A-Z_]+)>", location)
+            mode = match.group(1) if match is not None else None
+        if not isinstance(mode, str):
             raise ValueError("TCVT calibration requires a static round mode")
         round_modes = {"NONE": 0, "RINT": 1, "ROUND": 2, "FLOOR": 3, "CEIL": 4, "TRUNC": 5, "ODD": 6}
-        if match.group(1) not in round_modes:
-            raise ValueError(f"unsupported TCVT round mode in calibration: {match.group(1)}")
-        return [f"enum:{round_modes[match.group(1)]}"]
+        if mode not in round_modes:
+            raise ValueError(f"unsupported TCVT round mode in calibration: {mode}")
+        return [f"enum:{round_modes[mode]}"]
     return []
+
+
+def _expected_perf_sim_tiles(operation: Mapping[str, Any], op_name: str) -> list[dict[str, Any]]:
+    """Return tiles in the PTO-ISA recorder's semantic argument order."""
+    operand_types = operation.get("operand_types", [])
+    result_types = operation.get("result_types", [])
+    if not isinstance(operand_types, list) or not isinstance(result_types, list):
+        raise ValueError("operation has invalid operand or result types")
+    result_tiles = [
+        tile
+        for raw_type in result_types
+        if isinstance(raw_type, str) and (tile := _expected_perf_sim_tile(raw_type)) is not None
+    ]
+    operand_tiles = [
+        tile
+        for raw_type in operand_types
+        if isinstance(raw_type, str) and (tile := _expected_perf_sim_tile(raw_type)) is not None
+    ]
+    # The multi-source TMRGSORT C++ API orders (dst, tmp, src...), whereas raw
+    # PTO orders ins(src..., tmp) and outs(dst). Canonicalize both to the API
+    # order emitted by Perf-Sim. The two-tile block-length form is unchanged.
+    if op_name == "pto.tmrgsort" and len(result_tiles) == 1 and len(operand_tiles) >= 3:
+        return [result_tiles[0], operand_tiles[-1], *operand_tiles[:-1]]
+    return [*result_tiles, *operand_tiles]
+
+
+def _dynamic_perf_sim_scalar_pattern(raw_type: str) -> str:
+    dtype = raw_type.strip().lower()
+    if dtype == "index" or re.fullmatch(r"(?:ui|i)\d+", dtype):
+        return "integer:*"
+    scalar_dtype = {"f16": "fp16", "bf16": "bf16"}.get(dtype, dtype)
+    return f"{scalar_dtype}:*"
+
+
+def _expected_perf_sim_scalar_pattern(operation: Mapping[str, Any], op_name: str) -> list[str]:
+    """Return exact static scalars and wildcards for dynamic scalar operands."""
+    operand_types = operation.get("operand_types", [])
+    constants = operation.get("operand_constants", [])
+    if not isinstance(operand_types, list) or not isinstance(constants, list):
+        raise ValueError("operation has invalid operand constants or types")
+    if len(constants) != len(operand_types):
+        raise ValueError(
+            "operation operand_constants must align with operand_types: "
+            f"{len(constants)} != {len(operand_types)}"
+        )
+
+    scalar_operands: list[tuple[str, Any]] = [
+        (raw_type, constant)
+        for raw_type, constant in zip(operand_types, constants, strict=True)
+        if isinstance(raw_type, str) and _PTO_SCALAR_TYPE_FULL_RE.fullmatch(raw_type.strip())
+    ]
+    # TSETVAL records the tile offset, not the scalar value being written. The
+    # value type remains part of operand_types in the complete schedule key.
+    if op_name == "pto.tsetval":
+        scalar_operands = scalar_operands[:1]
+    pattern = [
+        _expected_perf_sim_scalar(constant) or _dynamic_perf_sim_scalar_pattern(raw_type)
+        for raw_type, constant in scalar_operands
+    ]
+    pattern.extend(_semantic_perf_sim_scalars(operation, op_name))
+    return pattern
+
+
+def _canonical_perf_sim_scalar(value: str) -> str:
+    """Canonicalize equivalent signed/unsigned spellings when type is separate."""
+    match = re.fullmatch(r"[iu]:(-?\d+)", value)
+    return f"integer:{int(match.group(1))}" if match is not None else value
+
+
+def _perf_sim_scalars_match(actual: Sequence[str], expected: Sequence[str]) -> bool:
+    if len(actual) != len(expected):
+        return False
+    return all(
+        (
+            _canonical_perf_sim_scalar(got).startswith(f"{wanted.removesuffix(':*')}:")
+            if wanted.endswith(":*")
+            else _canonical_perf_sim_scalar(got) == _canonical_perf_sim_scalar(wanted)
+        )
+        for got, wanted in zip(actual, expected, strict=True)
+    )
+
+
+def expected_perf_sim_event_signature(node: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the exact Perf-Sim event contract for one schedule operation."""
+    signature = operation_duration_signature(node)
+    operation = node.get("operation")
+    op_name = node.get("op_name")
+    if not isinstance(operation, Mapping) or not isinstance(op_name, str):
+        raise ValueError("schedule node lacks operation metadata")
+    tiles = _expected_perf_sim_tiles(operation, op_name)
+    if not tiles:
+        raise ValueError("schedule node has no statically typed tile")
+    work_index = 1 if signature["operation"] in _PERF_SIM_SOURCE_WORK_OPERATIONS and len(tiles) > 1 else 0
+    work_tile = tiles[work_index]
+    return {
+        "operation": signature["operation"],
+        "rows": work_tile["rows"],
+        "cols": work_tile["cols"],
+        "dtype": _canonical_perf_sim_dtype(work_tile["dtype"]),
+        "tiles": tiles,
+        "scalars": _expected_perf_sim_scalar_pattern(operation, op_name),
+    }
 
 
 def _validate_perf_sim_event_signature(
     event: Mapping[str, Any], node: Mapping[str, Any], *, measurement_index: int, manifest: Path
 ) -> None:
-    signature = operation_duration_signature(node)
     operation = node.get("operation")
     if not isinstance(operation, Mapping):
         raise ValueError(f"{manifest}: measurement {measurement_index} lacks operation metadata")
-    operand_types = operation.get("operand_types", [])
-    result_types = operation.get("result_types", [])
-    if not isinstance(operand_types, list) or not isinstance(result_types, list):
-        raise ValueError(f"{manifest}: measurement {measurement_index} has invalid operation types")
-    expected_tiles = [
-        tile
-        for raw_type in [*result_types, *operand_types]
-        if isinstance(raw_type, str) and (tile := _expected_perf_sim_tile(raw_type)) is not None
-    ]
-    if not expected_tiles:
-        raise ValueError(f"{manifest}: measurement {measurement_index} has no statically typed tile")
-    work_index = (
-        1 if signature["operation"] in _PERF_SIM_SOURCE_WORK_OPERATIONS and len(expected_tiles) > 1 else 0
-    )
-    work_tile = expected_tiles[work_index]
-    expected_header = {
-        "operation": signature["operation"],
-        "rows": work_tile["rows"],
-        "cols": work_tile["cols"],
-        "dtype": work_tile["dtype"],
-    }
+    expected = expected_perf_sim_event_signature(node)
+    expected_header = {key: expected[key] for key in ("operation", "rows", "cols", "dtype")}
     actual_header = {key: event[key] for key in expected_header}
     if actual_header != expected_header:
         raise ValueError(
             f"{manifest}: measurement {measurement_index} event work signature differs from schedule: "
             f"expected={expected_header}, actual={actual_header}"
         )
-    if event["tiles"] != expected_tiles:
+    if event["tiles"] != expected["tiles"]:
         raise ValueError(
             f"{manifest}: measurement {measurement_index} event tile roles/layouts differ from schedule: "
-            f"expected={expected_tiles}, actual={event['tiles']}"
+            f"expected={expected['tiles']}, actual={event['tiles']}"
         )
 
-    constants = operation.get("operand_constants", [])
-    if not isinstance(constants, list):
-        raise ValueError(f"{manifest}: measurement {measurement_index} has invalid operand constants")
-    expected_scalars = [
-        scalar for constant in constants if (scalar := _expected_perf_sim_scalar(constant)) is not None
-    ]
-    expected_scalars.extend(_semantic_perf_sim_scalars(operation, str(node.get("op_name", ""))))
-    if expected_scalars and event["scalars"][: len(expected_scalars)] != expected_scalars:
+    if not _perf_sim_scalars_match(event["scalars"], expected["scalars"]):
         raise ValueError(
             f"{manifest}: measurement {measurement_index} event constants differ from schedule: "
-            f"expected={expected_scalars}, actual={event['scalars']}"
+            f"expected={expected['scalars']}, actual={event['scalars']}"
         )
 
 

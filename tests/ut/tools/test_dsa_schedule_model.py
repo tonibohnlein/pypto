@@ -910,6 +910,162 @@ def test_perf_sim_header_uses_result_first_for_mixed_dtype_tcvt(
     )
 
 
+def test_perf_sim_signature_tracks_inline_round_mode_and_dynamic_scalar_indices(tmp_path):
+    tile = (
+        "!pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=32, v_row=?, v_col=?, "
+        "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+    )
+    tci = {
+        "id": 0,
+        "kind": "operation",
+        "pipe": "PIPE_S",
+        "op_name": "pto.tci",
+        "defs": [],
+        "uses": [],
+        "operation": {
+            "location": f"pto.tci ins(%start : ui32) outs(%dst : {tile}) {{descending = false}}",
+            "operand_types": ["ui32"],
+            "result_types": [tile],
+            "operand_constants": [None],
+            "attributes": {"descending": False},
+            "static_work_bytes": 128,
+        },
+    }
+    event = dsa_schedule_model._parse_perf_sim_event_prefix(
+        "TCI(1x32,uint32){pipe=VEC;tiles=uint32:1x32:loc=0:storage=1x32:b=0:s=0:pad=0:compact=0;scalars=u:17}"
+    )
+
+    expected = dsa_schedule_model.expected_perf_sim_event_signature(tci)
+    assert expected["dtype"] == "u32"
+    assert expected["scalars"] == ["integer:*"]
+    dsa_schedule_model._validate_perf_sim_event_signature(
+        event, tci, measurement_index=0, manifest=tmp_path / "manifest.json"
+    )
+    wrong_scalar_type = {**event, "scalars": ["f32:0x0"]}
+    with pytest.raises(ValueError, match="event constants differ"):
+        dsa_schedule_model._validate_perf_sim_event_signature(
+            wrong_scalar_type, tci, measurement_index=0, manifest=tmp_path / "manifest.json"
+        )
+
+    tcvt = {
+        **tci,
+        "op_name": "pto.tcvt",
+        "pipe": "PIPE_V",
+        "operation": {
+            "location": (
+                "pto.tcvt ins(%src {rmode = #pto<round_mode ROUND>} : "
+                "!pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=32, v_row=?, v_col=?, "
+                "blayout=row_major, slayout=none_box, fractal=512, pad=0>) "
+                "outs(%dst : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=32, "
+                "v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>)"
+            ),
+            "operand_types": [
+                "!pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=32, v_row=?, v_col=?, "
+                "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+            ],
+            "result_types": [
+                "!pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=32, v_row=?, v_col=?, "
+                "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+            ],
+            "operand_constants": [None],
+            "attributes": {"round_mode": "ROUND"},
+            "static_work_bytes": 128,
+        },
+    }
+    assert dsa_schedule_model.expected_perf_sim_event_signature(tcvt)["scalars"] == ["enum:2"]
+
+
+def test_perf_sim_signature_records_only_tsetval_offset(tmp_path):
+    tile = (
+        "!pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=32, v_row=?, v_col=?, "
+        "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+    )
+    node = {
+        "id": 0,
+        "kind": "operation",
+        "pipe": "PIPE_S",
+        "op_name": "pto.tsetval",
+        "defs": [],
+        "uses": [],
+        "operation": {
+            "location": f"pto.tsetval ins(%offset, %value : index, f32) outs(%dst : {tile})",
+            "operand_types": ["index", "f32"],
+            "result_types": [tile],
+            "operand_constants": [None, None],
+            "attributes": {},
+            "static_work_bytes": 128,
+        },
+    }
+    event = dsa_schedule_model._parse_perf_sim_event_prefix(
+        "TSETVAL(1x32,fp32){pipe=Scalar;"
+        "tiles=fp32:1x32:loc=0:storage=1x32:b=0:s=0:pad=0:compact=0;scalars=u:9}"
+    )
+
+    assert dsa_schedule_model.expected_perf_sim_event_signature(node)["scalars"] == ["integer:*"]
+    dsa_schedule_model._validate_perf_sim_event_signature(
+        event, node, measurement_index=0, manifest=tmp_path / "manifest.json"
+    )
+
+
+def test_perf_sim_signature_reorders_multi_source_mrgsort_and_matches_integer_value(tmp_path):
+    def tile(cols):
+        return (
+            f"!pto.tile_buf<loc=vec, dtype=f32, rows=1, cols={cols}, v_row=?, v_col=?, "
+            "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+        )
+
+    node = {
+        "id": 0,
+        "kind": "operation",
+        "pipe": "PIPE_V",
+        "op_name": "pto.tmrgsort",
+        "defs": [],
+        "uses": [],
+        "operation": {
+            "location": (
+                f"pto.tmrgsort ins(%src0, %src1, %tmp : {tile(64)}, {tile(64)}, {tile(128)}) "
+                f"outs(%dst : {tile(128)}) {{exhausted = false}}"
+            ),
+            "operand_types": [tile(64), tile(64), tile(128)],
+            "result_types": [tile(128)],
+            "operand_constants": [None, None, None],
+            "attributes": {"exhausted": False},
+            "static_work_bytes": 512,
+        },
+    }
+    event = dsa_schedule_model._parse_perf_sim_event_prefix(
+        "TMRGSORT(1x128,fp32){pipe=VEC;"
+        "tiles=fp32:1x128:loc=0:storage=1x128:b=0:s=0:pad=0:compact=0,"
+        "fp32:1x128:loc=0:storage=1x128:b=0:s=0:pad=0:compact=0,"
+        "fp32:1x64:loc=0:storage=1x64:b=0:s=0:pad=0:compact=0,"
+        "fp32:1x64:loc=0:storage=1x64:b=0:s=0:pad=0:compact=0}"
+    )
+    dsa_schedule_model._validate_perf_sim_event_signature(
+        event, node, measurement_index=0, manifest=tmp_path / "manifest.json"
+    )
+
+    block_node = {
+        **node,
+        "operation": {
+            **node["operation"],
+            "location": f"pto.tmrgsort ins(%src, %len : {tile(4096)}, i32) outs(%dst : {tile(4096)})",
+            "operand_types": [tile(4096), "i32"],
+            "result_types": [tile(4096)],
+            "operand_constants": [None, "64 : i32"],
+            "attributes": {},
+            "static_work_bytes": 16384,
+        },
+    }
+    block_event = dsa_schedule_model._parse_perf_sim_event_prefix(
+        "TMRGSORT(1x4096,fp32){pipe=VEC;"
+        "tiles=fp32:1x4096:loc=0:storage=1x4096:b=0:s=0:pad=0:compact=0,"
+        "fp32:1x4096:loc=0:storage=1x4096:b=0:s=0:pad=0:compact=0;scalars=u:64}"
+    )
+    dsa_schedule_model._validate_perf_sim_event_signature(
+        block_event, block_node, measurement_index=0, manifest=tmp_path / "manifest.json"
+    )
+
+
 @pytest.mark.parametrize("mismatch_reason", [None, "invented_reason"])
 def test_extract_calibration_rejects_unallowlisted_pipe_mismatch(tmp_path, mismatch_reason):
     schedule = tmp_path / "schedule.jsonl"
@@ -933,13 +1089,13 @@ def test_extract_calibration_rejects_unallowlisted_pipe_mismatch(tmp_path, misma
                         "!pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=32, v_row=?, v_col=?, "
                         "blayout=row_major, slayout=none_box, fractal=512, pad=0>) {descending = false}"
                     ),
-                    "operand_types": [],
+                    "operand_types": ["ui32"],
                     "result_types": [
                         "!pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=32, v_row=?, v_col=?, "
                         "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
                     ],
-                    "operand_constants": [],
-                    "attributes": {},
+                    "operand_constants": [None],
+                    "attributes": {"descending": False},
                     "static_work_bytes": 128,
                 },
             }
@@ -988,10 +1144,10 @@ def test_extract_calibration_accepts_exact_tci_pipe_exception(tmp_path):
                 "uses": [],
                 "operation": {
                     "location": f"pto.tci ins(%start : ui32) outs(%tile : {tile}) {{descending = false}}",
-                    "operand_types": [],
+                    "operand_types": ["ui32"],
                     "result_types": [tile],
-                    "operand_constants": [],
-                    "attributes": {},
+                    "operand_constants": [None],
+                    "attributes": {"descending": False},
                     "static_work_bytes": 128,
                 },
             }
@@ -1180,6 +1336,34 @@ def test_import_legacy_debug_preserves_scalar_constant_mutations():
 
     assert import_constant("1.250000e+00") == [None, "1.250000e+00 : f32"]
     assert import_constant("2.500000e+00") == [None, "2.500000e+00 : f32"]
+
+
+def test_import_legacy_debug_preserves_unsigned_constants_and_inline_attributes():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tci [PIPE_S]
+[   1] COMPOUND pto.tcvt [PIPE_V]
+// ========================================= //
+"""
+    ui32_tile = "!pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=32>"
+    bf16_tile = "!pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=32>"
+    f32_tile = "!pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=32>"
+    pto = "\n".join(
+        [
+            "%start = arith.constant 0 : ui32",
+            f"pto.tci ins(%start : ui32) outs(%indices : {ui32_tile}) "
+            '{descending = false} loc("pypto.access.1")',
+            f"pto.tcvt ins(%source {{rmode = #pto<round_mode ROUND>}} : {bf16_tile}) "
+            f"outs(%result : {f32_tile}) "
+            'loc("pypto.access.2")',
+        ]
+    )
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    assert record["nodes"][0]["operation"]["operand_constants"] == ["0 : ui32"]
+    assert record["nodes"][0]["operation"]["attributes"] == {"descending": False}
+    assert record["nodes"][1]["operation"]["attributes"] == {"round_mode": "ROUND"}
 
 
 def test_import_legacy_debug_accepts_semantic_accumulating_matmul_name():
