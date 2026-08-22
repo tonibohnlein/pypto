@@ -29,7 +29,7 @@ from pypto.language.op import prefetch_ops as _dsl_prefetch
 from pypto.language.op import system_ops as _dsl_system
 from pypto.language.op import tensor_ops as _dsl_tensor
 from pypto.language.op import tile_ops as _dsl_tile
-from pypto.language.optimizations import SPLIT_SLOT_NUM_DEPRECATION
+from pypto.language.optimizations import SPLIT_SLOT_NUM_DEPRECATION, CrossCoreDirection
 from pypto.language.typing.dynamic import DynVar
 from pypto.pypto_core import DataType, ir
 from pypto.pypto_core import arith as _arith
@@ -78,6 +78,13 @@ _FUNC_ATTR_DIRECTIVE = "func_attr"
 # The ``split`` attr stores an int but is spelled (and printed) as the
 # ``pl.SplitMode.X`` enum, so it needs enum handling on both attr paths.
 _SPLIT_ATTR = "split"
+
+_CROSS_CORE_PIPE_PLAN_ATTR = "cross_core_pipe_plan"
+_CROSS_CORE_PIPE_PLAN_VERSION = 1
+_CROSS_CORE_DIRECTION_MAP: dict[str, CrossCoreDirection] = {
+    "CUBE_TO_VECTOR": CrossCoreDirection.CUBE_TO_VECTOR,
+    "VECTOR_TO_CUBE": CrossCoreDirection.VECTOR_TO_CUBE,
+}
 
 # Sentinel: a parsed attr value that must not be stored at all. ``None`` cannot
 # serve here — it is a legitimate attr value — so identity against this object
@@ -538,6 +545,10 @@ class _AtKwargState:
     # (or the deprecated ``pl.split(mode, slot_num=N)`` spelling). Stored on the
     # scope attrs and propagated to the outlined function attr.
     split_slot_num: "int | None" = None
+    # Versioned physical FIFO descriptors from ``pl.cross_core_pipe(...)``.
+    # The parser validates the typed entries and stores their deterministic
+    # packed IR carrier on the InCore scope.
+    cross_core_pipe_plan: "str | None" = None
     # Tracks the ``optimizations=`` kwarg AST so a duplicate ``optimizations=``
     # can be rejected in ``_handle_at_optimizations_kw``.
     new_optimizations_kw: "ast.keyword | None" = field(default=None)
@@ -3628,6 +3639,7 @@ class ASTParser:
         (
             state.split_mode,
             state.split_slot_num,
+            state.cross_core_pipe_plan,
         ) = self._parse_optimizations_list(kw.value)
 
     def _parse_optimizations_list(
@@ -3637,12 +3649,15 @@ class ASTParser:
         owner: str = "pl.at",
         list_hint: str | None = None,
         entry_hint: str | None = None,
-    ) -> tuple["ir.SplitMode | None", "int | None"]:
+    ) -> tuple["ir.SplitMode | None", "int | None", "str | None"]:
         """Parse ``optimizations=[...]`` for ``pl.at`` or ``pl.spmd``.
 
-        Two entries are recognised, freely combinable because they are
-        orthogonal — ``pl.split(MODE)`` sets the cross-core split mode, and
-        ``pl.cross_core_slot(slot_num=N)`` sets the cross-core pipe slot count.
+        Three entries are recognised. ``pl.split(MODE)`` sets the cross-core
+        split mode, ``pl.cross_core_slot(slot_num=N)`` sets the legacy
+        automatic-pipe slot count, and repeated ``pl.cross_core_pipe(...)``
+        entries describe the exact independent physical FIFOs selected by a
+        planner. A global slot count may coexist with explicit entries only
+        when every entry uses that count.
         The fully qualified forms (``pl.optimizations.split(MODE)`` etc.) are
         also accepted.
 
@@ -3652,12 +3667,14 @@ class ASTParser:
             entry_hint: Override hint for unsupported list entries.
 
         Returns:
-            Tuple ``(split_mode, split_slot_num)``.
+            Tuple ``(split_mode, split_slot_num, cross_core_pipe_plan)``.
         """
         if list_hint is None:
             list_hint = "Use optimizations=[pl.split(pl.SplitMode.NONE)]."
         if entry_hint is None:
-            entry_hint = "Each entry must be pl.split(pl.SplitMode.X) or pl.cross_core_slot(slot_num=N)."
+            entry_hint = (
+                "Each entry must be pl.split(...), pl.cross_core_slot(...), or pl.cross_core_pipe(...)."
+            )
         if not isinstance(value, ast.List):
             raise ParserSyntaxError(
                 f"{owner}(optimizations=...) must be a list literal",
@@ -3669,6 +3686,8 @@ class ASTParser:
         split_slot_num: int | None = None
         seen_split = False
         seen_cross_core_slot = False
+        cross_core_pipes: list[tuple[int, int, int, int, int, int, int, int]] = []
+        pipe_ids: set[int] = set()
         # Tracks whether split_slot_num came from the deprecated
         # ``pl.split(slot_num=)`` spelling, so a list carrying both sources for
         # one value is rejected instead of letting entry order decide.
@@ -3708,6 +3727,8 @@ class ASTParser:
                     )
                 seen_cross_core_slot = True
                 split_slot_num = slot_num
+            elif (pipe := self._try_parse_pl_cross_core_pipe(entry)) is not None:
+                self._append_cross_core_pipe(pipe, entry, cross_core_pipes, pipe_ids)
             else:
                 raise ParserSyntaxError(
                     f"Unsupported entry in {owner}(optimizations=[...])",
@@ -3715,18 +3736,50 @@ class ASTParser:
                     hint=entry_hint,
                 )
 
-        return split_mode, split_slot_num
+        if split_slot_num is not None:
+            disagreeing = [pipe[6] for pipe in cross_core_pipes if pipe[5] != split_slot_num]
+            if disagreeing:
+                raise ParserSyntaxError(
+                    "pl.cross_core_slot(slot_num=...) disagrees with explicit "
+                    f"pl.cross_core_pipe entries {disagreeing}",
+                    span=self.span_tracker.get_span(value),
+                    hint="Drop pl.cross_core_slot(...) or use the same slot_num on every explicit pipe.",
+                )
+        encoded = self._encode_cross_core_pipe_plan(cross_core_pipes) if cross_core_pipes else None
+        return split_mode, split_slot_num, encoded
 
-    def _parse_spmd_optimizations_list(self, value: ast.expr) -> "tuple[ir.SplitMode | None, int | None]":
-        """Parse ``pl.spmd(..., optimizations=[...])`` — ``pl.split`` only.
+    def _append_cross_core_pipe(
+        self,
+        pipe: "tuple[int, int, int, int, int, int, int, int]",
+        entry: ast.expr,
+        pipes: "list[tuple[int, int, int, int, int, int, int, int]]",
+        pipe_ids: set[int],
+    ) -> None:
+        """Append one descriptor while enforcing scope-local physical IDs."""
 
-        Returns ``(split_mode, split_slot_num)``.
+        pipe_id = pipe[6]
+        if pipe_id in pipe_ids:
+            raise ParserSyntaxError(
+                f"Duplicate pl.cross_core_pipe pipe_id={pipe_id}",
+                span=self.span_tracker.get_span(entry),
+            )
+        pipe_ids.add(pipe_id)
+        pipes.append(pipe)
+
+    def _parse_spmd_optimizations_list(
+        self, value: ast.expr
+    ) -> "tuple[ir.SplitMode | None, int | None, str | None]":
+        """Parse ``pl.spmd(..., optimizations=[...])``.
+
+        Returns ``(split_mode, split_slot_num, cross_core_pipe_plan)``.
         """
         return self._parse_optimizations_list(
             value,
             owner="pl.spmd",
             list_hint="Use optimizations=[pl.split(pl.SplitMode.NONE)].",
-            entry_hint="Each entry must be pl.split(pl.SplitMode.X) or pl.cross_core_slot(slot_num=N).",
+            entry_hint=(
+                "Each entry must be pl.split(...), pl.cross_core_slot(...), or pl.cross_core_pipe(...)."
+            ),
         )
 
     def _is_pl_optimization_call(self, node: ast.expr, name: str) -> bool:
@@ -3821,6 +3874,113 @@ class ASTParser:
                 hint=usage_hint,
             )
         return slot_num
+
+    def _try_parse_pl_cross_core_pipe(
+        self, node: ast.expr
+    ) -> "tuple[int, int, int, int, int, int, int, int] | None":
+        """Parse one explicit physical FIFO schedule entry."""
+
+        if not self._is_pl_optimization_call(node, "cross_core_pipe"):
+            return None
+        assert isinstance(node, ast.Call)
+        usage_hint = (
+            "Use pl.cross_core_pipe(tensor_id=0, "
+            "direction=pl.CrossCoreDirection.CUBE_TO_VECTOR, valid_shape=[16, 32], "
+            "slot_size_bytes=2048, slot_num=4, pipe_id=0, bundle=0)."
+        )
+        if node.args:
+            raise ParserSyntaxError(
+                f"pl.cross_core_pipe() takes no positional arguments, got {len(node.args)}",
+                span=self.span_tracker.get_span(node),
+                hint=usage_hint,
+            )
+        values: dict[str, ast.expr] = {}
+        expected = {
+            "tensor_id",
+            "direction",
+            "valid_shape",
+            "slot_size_bytes",
+            "slot_num",
+            "pipe_id",
+            "bundle",
+        }
+        for kw in node.keywords:
+            if kw.arg not in expected:
+                raise ParserSyntaxError(
+                    f"Unknown keyword argument '{kw.arg}' in pl.cross_core_pipe()",
+                    span=self.span_tracker.get_span(kw),
+                    hint=usage_hint,
+                )
+            if kw.arg in values:
+                raise ParserSyntaxError(
+                    f"pl.cross_core_pipe() got multiple values for argument '{kw.arg}'",
+                    span=self.span_tracker.get_span(kw),
+                )
+            assert kw.arg is not None
+            values[kw.arg] = kw.value
+        missing = sorted(expected - values.keys())
+        if missing:
+            raise ParserSyntaxError(
+                f"pl.cross_core_pipe() is missing required keyword arguments: {', '.join(missing)}",
+                span=self.span_tracker.get_span(node),
+                hint=usage_hint,
+            )
+
+        shape_node = values["valid_shape"]
+        if not isinstance(shape_node, (ast.List, ast.Tuple)) or len(shape_node.elts) != 2:
+            raise ParserSyntaxError(
+                "pl.cross_core_pipe(valid_shape=...) must be a two-element list or tuple literal",
+                span=self.span_tracker.get_span(shape_node),
+                hint=usage_hint,
+            )
+        rows = self._eval_pipe_int_literal(shape_node.elts[0], "valid_shape[0]", positive=True)
+        cols = self._eval_pipe_int_literal(shape_node.elts[1], "valid_shape[1]", positive=True)
+        direction = extract_enum_value(
+            values["direction"],
+            _CROSS_CORE_DIRECTION_MAP,
+            "CrossCoreDirection",
+            "pl.CrossCoreDirection",
+        )
+        return (
+            self._eval_pipe_int_literal(values["tensor_id"], "tensor_id", positive=False),
+            int(direction),
+            rows,
+            cols,
+            self._eval_pipe_int_literal(values["slot_size_bytes"], "slot_size_bytes", positive=True),
+            self._eval_pipe_int_literal(values["slot_num"], "slot_num", positive=True),
+            self._eval_pipe_int_literal(values["pipe_id"], "pipe_id", positive=False),
+            self._eval_pipe_int_literal(values["bundle"], "bundle", positive=False),
+        )
+
+    def _eval_pipe_int_literal(self, value: ast.expr, field: str, *, positive: bool) -> int:
+        """Parse one integer literal in a ``pl.cross_core_pipe`` entry."""
+
+        if (
+            not isinstance(value, ast.Constant)
+            or isinstance(value.value, bool)
+            or not isinstance(value.value, int)
+        ):
+            raise ParserSyntaxError(
+                f"pl.cross_core_pipe {field} must be an integer literal",
+                span=self.span_tracker.get_span(value),
+            )
+        minimum = 1 if positive else 0
+        if value.value < minimum:
+            requirement = "positive" if positive else "non-negative"
+            raise ParserSyntaxError(
+                f"pl.cross_core_pipe {field} must be {requirement}, got {value.value}",
+                span=self.span_tracker.get_span(value),
+            )
+        return value.value
+
+    @staticmethod
+    def _encode_cross_core_pipe_plan(
+        pipes: "list[tuple[int, int, int, int, int, int, int, int]]",
+    ) -> str:
+        """Encode validated public descriptors into the versioned IR carrier."""
+
+        records = [",".join(str(field) for field in pipe) for pipe in pipes]
+        return f"{_CROSS_CORE_PIPE_PLAN_VERSION};" + ";".join(records)
 
     def _eval_slot_num_literal(self, value: ast.expr, api: str, *, hint: str) -> int:
         """Evaluate a ``slot_num=`` argument as a positive int literal.
@@ -4148,15 +4308,23 @@ class ASTParser:
         usage_hint: str,
         allow_deps: bool = False,
     ) -> tuple[
-        "ir.Expr", bool, str, "ir.SplitMode | None", "int | None", "list[ir.Var]", bool, "ir.Expr | None"
+        "ir.Expr",
+        bool,
+        str,
+        "ir.SplitMode | None",
+        "int | None",
+        "str | None",
+        "list[ir.Var]",
+        bool,
+        "ir.Expr | None",
     ]:
         """Parse the ``pl.spmd(core_num, *, sync_start=, name_hint=, optimizations=, deps=, ...)`` arguments.
 
         Also accepts ``allow_early_resolve=`` (the speculative early-dispatch
         hint) and ``predicate=`` (the dispatch predicate). The first positional
         argument is ``core_num`` (range-like). Returns
-        ``(core_num, sync_start, name_hint, split_mode, split_slot_num, dep_vars,
-        allow_early_resolve, predicate)`` with ``sync_start`` /
+        ``(core_num, sync_start, name_hint, split_mode, split_slot_num,
+        cross_core_pipe_plan, dep_vars, allow_early_resolve, predicate)`` with ``sync_start`` /
         ``allow_early_resolve`` defaulting to ``False``, ``split_mode`` /
         ``split_slot_num`` / ``predicate`` to ``None``, and ``dep_vars`` to ``[]``.
 
@@ -4196,6 +4364,7 @@ class ASTParser:
         name_hint = ""
         split_mode: ir.SplitMode | None = None
         split_slot_num: int | None = None
+        cross_core_pipe_plan: str | None = None
         deps_kw: ast.keyword | None = None
         allow_early_resolve: bool = False
         predicate: ir.Expr | None = None
@@ -4214,7 +4383,9 @@ class ASTParser:
             elif kw.arg == "sync_start":
                 sync_start = self._parse_spmd_bool_literal_kwarg(kw, usage_hint)
             elif kw.arg == "optimizations":
-                split_mode, split_slot_num = self._parse_spmd_optimizations_list(kw.value)
+                split_mode, split_slot_num, cross_core_pipe_plan = self._parse_spmd_optimizations_list(
+                    kw.value
+                )
             elif kw.arg == "deps":
                 deps_kw = kw
             elif kw.arg == "allow_early_resolve":
@@ -4255,6 +4426,7 @@ class ASTParser:
             name_hint,
             split_mode,
             split_slot_num,
+            cross_core_pipe_plan,
             dep_vars,
             allow_early_resolve,
             predicate,
@@ -4432,6 +4604,7 @@ class ASTParser:
         name_hint: str,
         split_mode: "ir.SplitMode | None",
         split_slot_num: "int | None",
+        cross_core_pipe_plan: "str | None",
         scope_attrs: "list[tuple[str, Any]]",
     ) -> None:
         """Emit the ``SpmdScopeStmt`` body shared by the plain and ``as tid`` with-forms.
@@ -4476,7 +4649,9 @@ class ASTParser:
         # provides. Before pl.cross_core_slot existed the two were coupled:
         # slot_num could only arrive via pl.split(mode, slot_num=N), which always
         # set a mode.
-        has_optimization_entry = split_mode is not None or split_slot_num is not None
+        has_optimization_entry = (
+            split_mode is not None or split_slot_num is not None or cross_core_pipe_plan is not None
+        )
         carrier = self._explicit_incore_carrier(stmt.body)
         if carrier is not None:
             # The nested ``pl.at(CORE_GROUP)`` already is the carrier, and an
@@ -4485,7 +4660,11 @@ class ASTParser:
             # be pushed into a scope the user wrote by hand — reject both rather
             # than silently picking one or dropping it.
             if has_optimization_entry:
-                carrier_has_entry = carrier.split_mode is not None or carrier.split_slot_num is not None
+                carrier_has_entry = (
+                    carrier.split_mode is not None
+                    or carrier.split_slot_num is not None
+                    or carrier.cross_core_pipe_plan is not None
+                )
                 where = (
                     "is specified twice: on `pl.spmd(...)` and on the inner"
                     if carrier_has_entry
@@ -4553,6 +4732,7 @@ class ASTParser:
         spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
         incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
         incore_attrs = self._append_split_slot_num_attr(incore_attrs, split_slot_num)
+        incore_attrs = self._append_cross_core_pipe_plan_attr(incore_attrs, cross_core_pipe_plan)
         with self.builder.scope(
             scope_kind,
             span,
@@ -4623,6 +4803,7 @@ class ASTParser:
             name_hint,
             split_mode,
             split_slot_num,
+            cross_core_pipe_plan,
             dep_vars,
             allow_early_resolve,
             predicate,
@@ -4642,6 +4823,7 @@ class ASTParser:
                 name_hint,
                 split_mode,
                 split_slot_num,
+                cross_core_pipe_plan,
                 dep_vars,
                 allow_early_resolve,
                 predicate,
@@ -4678,6 +4860,7 @@ class ASTParser:
             name_hint,
             split_mode,
             split_slot_num,
+            cross_core_pipe_plan,
             spmd_attrs,
         )
 
@@ -4691,6 +4874,7 @@ class ASTParser:
         name_hint: str,
         split_mode: "ir.SplitMode | None",
         split_slot_num: "int | None",
+        cross_core_pipe_plan: "str | None",
         dep_vars: "list[ir.Var]",
         allow_early_resolve: bool,
         predicate: "ir.Expr | None",
@@ -4779,6 +4963,7 @@ class ASTParser:
             name_hint,
             split_mode,
             split_slot_num,
+            cross_core_pipe_plan,
             scope_attrs,
         )
         self._record_scope_producer(stmt.body, tid_var)
@@ -4864,6 +5049,7 @@ class ASTParser:
             name_hint,
             split_mode,
             split_slot_num,
+            cross_core_pipe_plan,
             _,
             allow_early_resolve,
             predicate,
@@ -4889,6 +5075,7 @@ class ASTParser:
         # (BuildWrapperReorderedParams) honours that inner call's dump_vars.
         incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
         incore_attrs = self._append_split_slot_num_attr(incore_attrs, split_slot_num)
+        incore_attrs = self._append_cross_core_pipe_plan_attr(incore_attrs, cross_core_pipe_plan)
         with self.builder.scope(
             ir.ScopeKind.Spmd,
             span,
@@ -5135,12 +5322,15 @@ class ASTParser:
                         seen.add(id(t))
                 new_attrs[i] = ("dump_vars", merged)
                 return new_attrs
-        # Insert ``dump_vars`` before ``task_id_var`` AND before the trailing
-        # ``slot_num`` so the canonical order (dump_vars ... task_id_var,
-        # slot_num) matches what a print -> reparse rebuilds via _parse_at_meta +
-        # _append_split_slot_num_attr; structural_equal compares attrs positionally.
+        # Insert ``dump_vars`` before ``task_id_var`` and the trailing
+        # cross-core attrs so print -> reparse rebuilds the same positional
+        # attr order.
         insert_at = next(
-            (i for i, (k, _) in enumerate(new_attrs) if k in {"task_id_var", "slot_num"}),
+            (
+                i
+                for i, (k, _) in enumerate(new_attrs)
+                if k in {"task_id_var", "slot_num", _CROSS_CORE_PIPE_PLAN_ATTR}
+            ),
             len(new_attrs),
         )
         new_attrs.insert(insert_at, ("dump_vars", tagged))
@@ -5201,16 +5391,20 @@ class ASTParser:
 
         is_core_group = level == ir.Level.CORE_GROUP
 
-        # Both optimizations= entries lower onto the InCore scope: pl.split(...)
-        # into split_, pl.cross_core_slot(...) into the slot_num attr. Neither
-        # has a meaning on a Hierarchy scope, so reject either at a non-CORE_GROUP
-        # level rather than silently attaching a dead attr.
-        if (split_mode is not None or state.split_slot_num is not None) and not is_core_group:
+        # All cross-core optimizations lower onto the InCore scope. None has a
+        # meaning on a Hierarchy scope, so reject them at a non-CORE_GROUP level
+        # rather than silently attaching dead metadata.
+        if (
+            split_mode is not None
+            or state.split_slot_num is not None
+            or state.cross_core_pipe_plan is not None
+        ) and not is_core_group:
             raise ParserSyntaxError(
-                "optimizations=[pl.split(...)] / optimizations=[pl.cross_core_slot(...)] are only "
-                "supported with level=pl.Level.CORE_GROUP",
+                "cross-core optimizations are only supported with level=pl.Level.CORE_GROUP",
                 span=span,
-                hint="Use pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]).",
+                hint=(
+                    "Use pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)])."
+                ),
             )
 
         if is_core_group and role is not None:
@@ -5230,6 +5424,7 @@ class ASTParser:
             deps_kw, no_dep_args_kw, dumps_kw, optional_vars, state.allow_early_resolve, span
         )
         scope_attrs = self._append_split_slot_num_attr(scope_attrs, state.split_slot_num)
+        scope_attrs = self._append_cross_core_pipe_plan_attr(scope_attrs, state.cross_core_pipe_plan)
         if state.windowize:
             scope_attrs = list(scope_attrs or [])
             scope_attrs.append(("windowize", True))
@@ -5303,6 +5498,18 @@ class ASTParser:
             return attrs
         result: list[tuple[str, Any]] = list(attrs) if attrs else []
         result.append(("slot_num", slot_num))
+        return result
+
+    @staticmethod
+    def _append_cross_core_pipe_plan_attr(
+        attrs: "list[tuple[str, Any]] | None", plan: "str | None"
+    ) -> "list[tuple[str, Any]] | None":
+        """Append the encoded explicit FIFO plan to an InCore scope."""
+
+        if plan is None:
+            return attrs
+        result: list[tuple[str, Any]] = list(attrs) if attrs else []
+        result.append((_CROSS_CORE_PIPE_PLAN_ATTR, plan))
         return result
 
     def _parse_at_meta(

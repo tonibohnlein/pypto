@@ -2247,7 +2247,7 @@ class TestAutoPipeSetup:
                 product_vec = pl.move(product, target_memory=pl.MemorySpace.Vec)
                 return pl.store(product_vec, [0, 0], out)
 
-        with pytest.raises(pypto.InternalError, match="mixed FIFO contract is malformed"):
+        with pytest.raises(pypto.InternalError, match="pipe contract is malformed"):
             _expand_raw(Before)
 
     def test_planned_pipe_contract_rejects_boundary_shape_mismatch(self):

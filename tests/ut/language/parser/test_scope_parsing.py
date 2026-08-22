@@ -966,6 +966,109 @@ class TestSpmdOptimizations:
         assert "pl.split" not in printed
         assert Prog.as_python() == parse_program(printed).as_python()
 
+    def test_at_explicit_cross_core_pipes_roundtrip_independently(self):
+        """A planner can preserve multiple unidirectional physical FIFOs."""
+
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    optimizations=[
+                        pl.split(pl.SplitMode.UP_DOWN),
+                        pl.cross_core_pipe(
+                            tensor_id=3,
+                            direction=pl.CrossCoreDirection.CUBE_TO_VECTOR,
+                            valid_shape=[16, 32],
+                            slot_size_bytes=2048,
+                            slot_num=4,
+                            pipe_id=0,
+                            bundle=0,
+                        ),
+                        pl.cross_core_pipe(
+                            tensor_id=7,
+                            direction=pl.CrossCoreDirection.VECTOR_TO_CUBE,
+                            valid_shape=[16, 32],
+                            slot_size_bytes=1024,
+                            slot_num=4,
+                            pipe_id=1,
+                            bundle=1,
+                        ),
+                    ],
+                ):
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+        main_func = list(Prog.functions.values())[0]
+        incore = _unique_descendant(main_func.body, ir.InCoreScopeStmt)
+        assert incore.attrs["cross_core_pipe_plan"] == ("1;3,1,16,32,2048,4,0,0;7,2,16,32,1024,4,1,1")
+        printed = Prog.as_python()
+        assert printed.count("pl.cross_core_pipe(") == 2
+        assert "pl.CrossCoreDirection.CUBE_TO_VECTOR" in printed
+        assert "pl.CrossCoreDirection.VECTOR_TO_CUBE" in printed
+        assert parse_program(printed).as_python() == printed
+
+    def test_explicit_cross_core_pipes_reject_duplicate_pipe_id(self):
+        """Physical FIFO identities are unique within one scope."""
+
+        source = """import pypto.language as pl
+
+@pl.program
+class Prog:
+    @pl.function
+    def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            optimizations=[
+                pl.cross_core_pipe(tensor_id=0, direction=pl.CrossCoreDirection.CUBE_TO_VECTOR,
+                                   valid_shape=[16, 32], slot_size_bytes=2048,
+                                   slot_num=4, pipe_id=0, bundle=0),
+                pl.cross_core_pipe(tensor_id=1, direction=pl.CrossCoreDirection.VECTOR_TO_CUBE,
+                                   valid_shape=[16, 32], slot_size_bytes=2048,
+                                   slot_num=4, pipe_id=0, bundle=1),
+            ],
+        ):
+            y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+        return y
+"""
+        with pytest.raises(ParserSyntaxError, match="Duplicate pl.cross_core_pipe pipe_id=0"):
+            parse_program(source)
+
+    def test_cross_core_pipe_factory_validates_the_public_descriptor(self):
+        """The normal Python API rejects invalid descriptors before parsing."""
+
+        pipe = pl.cross_core_pipe(
+            tensor_id=3,
+            direction=pl.CrossCoreDirection.CUBE_TO_VECTOR,
+            valid_shape=[16, 32],
+            slot_size_bytes=2048,
+            slot_num=4,
+            pipe_id=0,
+            bundle=0,
+        )
+        assert pipe.valid_shape == (16, 32)
+        with pytest.raises(ValueError, match="direction must be a pl.CrossCoreDirection"):
+            pl.cross_core_pipe(
+                tensor_id=3,
+                direction=1,  # type: ignore[arg-type]
+                valid_shape=[16, 32],
+                slot_size_bytes=2048,
+                slot_num=4,
+                pipe_id=0,
+                bundle=0,
+            )
+        with pytest.raises(ValueError, match="slot_num must be a positive integer"):
+            pl.cross_core_pipe(
+                tensor_id=3,
+                direction=pl.CrossCoreDirection.CUBE_TO_VECTOR,
+                valid_shape=[16, 32],
+                slot_size_bytes=2048,
+                slot_num=0,
+                pipe_id=0,
+                bundle=0,
+            )
+
     def test_cross_core_slot_must_be_positive(self):
         """A non-positive ``slot_num`` literal is rejected."""
         src = (

@@ -184,11 +184,46 @@ For ordinary user-authored mixed kernels, setup is derived from the split bodies
 When directions use different tile sizes, this path uses `max(all observed tile byte sizes)` as the
 common slot. Explicit programs may instead create independent IDs with matching push/pop/free ops.
 
-### Solver-planned AutoFuse pipes
+### Explicit planner-owned pipes
 
-AutoFuse attaches a private, versioned descriptor with every crossing's tensor, direction, valid
-shape, slot layout, physical ID, and bundle. Expansion consumes and strips it, creates one exact
-unidirectional FIFO per record, and stamps that ID on setup, push/pop/free, workspace, and lane offsets.
+A tensor-level planner can attach one public `pl.cross_core_pipe(...)` entry for
+every crossing. The entry records the logical tensor identity, direction, valid
+shape, slot layout, physical ID, and protocol bundle:
+
+```python
+for region in pl.spmd(
+    24,
+    optimizations=[
+        pl.split(pl.SplitMode.UP_DOWN),
+        pl.cross_core_pipe(
+            tensor_id=3,
+            direction=pl.CrossCoreDirection.CUBE_TO_VECTOR,
+            valid_shape=[16, 64],
+            slot_size_bytes=4096,
+            slot_num=4,
+            pipe_id=0,
+            bundle=0,
+        ),
+        pl.cross_core_pipe(
+            tensor_id=7,
+            direction=pl.CrossCoreDirection.VECTOR_TO_CUBE,
+            valid_shape=[16, 64],
+            slot_size_bytes=4096,
+            slot_num=4,
+            pipe_id=1,
+            bundle=1,
+        ),
+    ],
+):
+    ...
+```
+
+The parser stores these typed entries as a versioned InCore schedule carrier.
+`OutlineIncoreScopes` propagates it to the outlined function. Expansion consumes
+and strips it, creates one exact unidirectional FIFO per record, and stamps that
+ID on setup, push/pop/free, workspace, and lane offsets. AutoFuse is one producer
+of this public schedule contract; an external planner such as PTO-Fusebox can emit
+the same DSL without invoking AutoFuse inside PyPTO.
 
 Matching fails closed on malformed records, unplanned sources, mismatched geometry, or extra fences.
 Distinct sources remain distinct; mutually exclusive uses of one SSA source share one reply pipe.

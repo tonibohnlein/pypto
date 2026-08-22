@@ -28,12 +28,17 @@ Available entries:
                      optimizations=[pl.split(pl.SplitMode.UP_DOWN),
                                     pl.cross_core_slot(slot_num=4)]):
               ...
+
+    - ``pl.cross_core_pipe(...)`` — One solver-planned physical FIFO. Multiple
+      entries preserve independent logical crossings instead of collapsing a
+      bidirectional mixed kernel onto one shared ring.
 """
 
 from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
+from enum import IntEnum
 
 from pypto.pypto_core.ir import SplitMode
 
@@ -67,6 +72,13 @@ def _validate_slot_num(slot_num: int, api: str) -> None:
 
 class Optimization:
     """Base class for ``pl.at(..., optimizations=[...])`` entries."""
+
+
+class CrossCoreDirection(IntEnum):
+    """Direction of one physical cross-core FIFO."""
+
+    CUBE_TO_VECTOR = 1
+    VECTOR_TO_CUBE = 2
 
 
 @dataclass(frozen=True)
@@ -155,10 +167,100 @@ def cross_core_slot(*, slot_num: int) -> CrossCoreSlot:
     return CrossCoreSlot(slot_num=slot_num)
 
 
+def _validate_nonnegative_int(value: int, field: str) -> None:
+    """Validate a non-negative integer field on a pipe descriptor."""
+
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"pl.cross_core_pipe {field} must be a non-negative integer, got {value!r}")
+
+
+def _validate_positive_int(value: int, field: str) -> None:
+    """Validate a positive integer field on a pipe descriptor."""
+
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"pl.cross_core_pipe {field} must be a positive integer, got {value!r}")
+
+
+@dataclass(frozen=True)
+class CrossCorePipe(Optimization):
+    """One explicit physical FIFO in a mixed-kernel schedule.
+
+    Entries are ordered by the first occurrence of each distinct logical
+    crossing source in the scope. ``tensor_id`` is the schedule's stable
+    logical identity; PyPTO validates the emitted boundary geometry and assigns
+    ``pipe_id`` to the matching push/pop/free operations.
+    """
+
+    tensor_id: int
+    direction: CrossCoreDirection
+    valid_shape: tuple[int, int]
+    slot_size_bytes: int
+    slot_num: int
+    pipe_id: int
+    bundle: int
+
+
+def cross_core_pipe(  # noqa: PLR0913 — fields mirror the physical FIFO contract
+    *,
+    tensor_id: int,
+    direction: CrossCoreDirection,
+    valid_shape: list[int] | tuple[int, int],
+    slot_size_bytes: int,
+    slot_num: int,
+    pipe_id: int,
+    bundle: int,
+) -> CrossCorePipe:
+    """Create an explicit cross-core FIFO schedule entry.
+
+    Args:
+        tensor_id: Non-negative logical tensor identity from the schedule.
+        direction: Unidirectional producer-to-consumer direction.
+        valid_shape: Two positive logical frame extents.
+        slot_size_bytes: Physical bytes in one FIFO slot.
+        slot_num: Number of slots in the ring.
+        pipe_id: Non-negative physical FIFO identity, unique in the scope.
+        bundle: Non-negative protocol bundle identity.
+
+    Returns:
+        A descriptor for ``pl.at`` or ``pl.spmd`` ``optimizations=[...]``.
+
+    Raises:
+        ValueError: If any descriptor field is invalid.
+    """
+
+    _validate_nonnegative_int(tensor_id, "tensor_id")
+    if not isinstance(direction, CrossCoreDirection):
+        raise ValueError(f"pl.cross_core_pipe direction must be a pl.CrossCoreDirection, got {direction!r}")
+    if (
+        not isinstance(valid_shape, (list, tuple))
+        or len(valid_shape) != 2
+        or any(not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0 for dim in valid_shape)
+    ):
+        raise ValueError(
+            f"pl.cross_core_pipe valid_shape must contain two positive integers, got {valid_shape!r}"
+        )
+    _validate_positive_int(slot_size_bytes, "slot_size_bytes")
+    _validate_positive_int(slot_num, "slot_num")
+    _validate_nonnegative_int(pipe_id, "pipe_id")
+    _validate_nonnegative_int(bundle, "bundle")
+    return CrossCorePipe(
+        tensor_id=tensor_id,
+        direction=direction,
+        valid_shape=(valid_shape[0], valid_shape[1]),
+        slot_size_bytes=slot_size_bytes,
+        slot_num=slot_num,
+        pipe_id=pipe_id,
+        bundle=bundle,
+    )
+
+
 __all__ = [
+    "CrossCoreDirection",
+    "CrossCorePipe",
     "CrossCoreSlot",
     "Optimization",
     "Split",
+    "cross_core_pipe",
     "cross_core_slot",
     "split",
 ]

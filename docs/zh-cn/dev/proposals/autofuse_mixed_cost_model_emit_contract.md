@@ -82,12 +82,13 @@ dense-SwiGLU 计划还记录输入、中间和输出维度，feature-chunk 循�
 window、down feed window，以及跨 feature chunk 存活的 FP32 down accumulator。
 这些是 mixed 组合事实，不是对同构 tiling 的第二份实现。
 
-获胜计划通过私有、版本化 FIFO descriptor 跨越 tensor-to-tile 边界。每个逻辑
-crossing 对应一个 record 和一个独立单向 physical queue。`ExpandMixedKernel`
+获胜计划通过公开、类型化的 `pl.cross_core_pipe(...)` 调度项跨越 tensor-to-tile
+边界；这些调度项在 IR 中由版本化 carrier 承载。每个逻辑 crossing 对应一个
+record 和一个独立单向 physical queue。`ExpandMixedKernel`
 先校验方向、形状、字节数与顺序，再把该 record 的 ID 写到
 `tpush`/`tpop`/`tfree`。first-matmul 与 accumulate 两个互斥 branch 对同一
 activation 的重复使用共享 reply ID；gate/up 这类形状相同但 SSA source 不同的
-张量不会合并。expansion 完成后会删除该私有 descriptor。
+张量不会合并。expansion 完成后会删除该 IR carrier。
 
 ## 4. 流水模式与忠实性
 

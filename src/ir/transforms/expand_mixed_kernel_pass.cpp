@@ -408,8 +408,8 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
 // TPUSH / TPOP creation helpers
 // ============================================================================
 
-std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(
-    int split = 0, int lane_stride = 0, std::optional<int> pipe_id = std::nullopt) {
+std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(int split = 0, int lane_stride = 0,
+                                                              std::optional<int> pipe_id = std::nullopt) {
   std::vector<std::pair<std::string, std::any>> kwargs{{"split", std::any(split)}};
   // The partition stride only rides along when a ragged boundary was rebalanced
   // (see split_axis::ResolveLaneStride). PTO codegen ignores it — it prints only
@@ -449,7 +449,8 @@ int BoundaryTransportSplitCode(const CVBoundaryMove& bm, const Span& span) {
 
 CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0,
                     int lane_stride = 0, std::optional<int> pipe_id = std::nullopt) {
-  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride, pipe_id), span);
+  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride, pipe_id),
+                                          span);
 }
 
 std::vector<std::pair<std::string, std::any>> SetPipeId(
@@ -478,11 +479,11 @@ using PlannedBoundaryPipes = std::unordered_map<const Stmt*, PlannedCrossCorePip
 std::pair<int64_t, int64_t> GetStaticBoundaryShape(const TypePtr& type, const Span& span) {
   auto tile = std::dynamic_pointer_cast<const TileType>(type);
   INTERNAL_CHECK_SPAN(tile && tile->shape_.size() == 2, span)
-      << "AutoFuse planned cross-core boundary requires a rank-2 TileType";
+      << "Explicit cross-core pipe boundary requires a rank-2 TileType";
   auto rows = cross_core_pipe::TryGetConstIntValue(tile->shape_[0]);
   auto cols = cross_core_pipe::TryGetConstIntValue(tile->shape_[1]);
   INTERNAL_CHECK_SPAN(rows.has_value() && cols.has_value(), span)
-      << "AutoFuse planned cross-core boundary requires a static tile shape";
+      << "Explicit cross-core pipe boundary requires a static tile shape";
   return {*rows, *cols};
 }
 
@@ -490,7 +491,7 @@ PlannedBoundaryPipes MatchPlannedPipesToBoundaries(
     const std::vector<PlannedCrossCorePipe>& pipes, const std::vector<const Stmt*>& boundary_order,
     const std::map<const Stmt*, CVBoundaryMove>& boundary_moves, const Span& span) {
   INTERNAL_CHECK_SPAN(pipes.empty() == boundary_order.empty(), span)
-      << "AutoFuse mixed FIFO contract and emitted cross-core boundaries disagree";
+      << "Cross-core pipe contract and emitted boundaries disagree";
 
   PlannedBoundaryPipes matched;
   matched.reserve(boundary_order.size());
@@ -501,7 +502,7 @@ PlannedBoundaryPipes MatchPlannedPipesToBoundaries(
     const Stmt* stmt = boundary_order[boundary_index];
     auto boundary_it = boundary_moves.find(stmt);
     INTERNAL_CHECK_SPAN(boundary_it != boundary_moves.end(), span)
-        << "AutoFuse mixed FIFO boundary order contains an unknown statement";
+        << "Cross-core pipe boundary order contains an unknown statement";
     const auto& boundary = boundary_it->second;
 
     // One logical solver boundary can appear more than once in the lowered IR.
@@ -517,7 +518,7 @@ PlannedBoundaryPipes MatchPlannedPipesToBoundaries(
       logical_source = nullptr;
     }
     INTERNAL_CHECK_SPAN(pipe_index < pipes.size(), span)
-        << "AutoFuse mixed FIFO contract has " << pipes.size()
+        << "Cross-core pipe contract has " << pipes.size()
         << " logical pipes but lowering found an additional cross-core source at boundary " << boundary_index;
     if (logical_source == nullptr) {
       logical_source = source;
@@ -529,7 +530,7 @@ PlannedBoundaryPipes MatchPlannedPipesToBoundaries(
                                         ? core_affinity::PipeDirection::C2V
                                         : core_affinity::PipeDirection::V2C;
     INTERNAL_CHECK_SPAN(pipe.direction == expected_direction, span)
-        << "AutoFuse mixed FIFO " << pipe.pipe_id << " direction disagrees with boundary " << boundary_index;
+        << "Cross-core pipe " << pipe.pipe_id << " direction disagrees with boundary " << boundary_index;
 
     const TypePtr destination_type = boundary.op_driven ? boundary.result_type : boundary.dest_var->GetType();
     const auto source_shape = GetStaticBoundaryShape(boundary.source_tile->GetType(), span);
@@ -537,22 +538,22 @@ PlannedBoundaryPipes MatchPlannedPipesToBoundaries(
     const int64_t full_rows = std::max(source_shape.first, destination_shape.first);
     const int64_t full_cols = std::max(source_shape.second, destination_shape.second);
     INTERNAL_CHECK_SPAN(pipe.valid_rows == full_rows && pipe.valid_cols == full_cols, span)
-        << "AutoFuse mixed FIFO " << pipe.pipe_id << " planned valid shape " << pipe.valid_rows << "x"
+        << "Cross-core pipe " << pipe.pipe_id << " planned valid shape " << pipe.valid_rows << "x"
         << pipe.valid_cols << " disagrees with emitted boundary " << full_rows << "x" << full_cols;
 
     auto source_bytes = cross_core_pipe::TryGetTileSlotSizeBytes(boundary.source_tile->GetType());
     auto destination_bytes = cross_core_pipe::TryGetTileSlotSizeBytes(destination_type);
     INTERNAL_CHECK_SPAN(source_bytes.has_value() && destination_bytes.has_value(), span)
-        << "AutoFuse mixed FIFO boundary has a dynamic slot size";
+        << "Cross-core pipe boundary has a dynamic slot size";
     const int64_t full_bytes = std::max(*source_bytes, *destination_bytes);
     INTERNAL_CHECK_SPAN(pipe.slot_size_bytes == full_bytes, span)
-        << "AutoFuse mixed FIFO " << pipe.pipe_id << " planned slot size " << pipe.slot_size_bytes
+        << "Cross-core pipe " << pipe.pipe_id << " planned slot size " << pipe.slot_size_bytes
         << " disagrees with emitted boundary size " << full_bytes;
     matched.emplace(stmt, pipe);
   }
   const size_t logical_boundary_count = boundary_order.empty() ? 0 : pipe_index + 1;
   INTERNAL_CHECK_SPAN(logical_boundary_count == pipes.size(), span)
-      << "AutoFuse mixed FIFO contract has " << pipes.size() << " logical pipes but lowering found "
+      << "Cross-core pipe contract has " << pipes.size() << " logical pipes but lowering found "
       << logical_boundary_count << " distinct cross-core sources";
   return matched;
 }
@@ -1424,16 +1425,21 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
 
   std::optional<std::vector<PlannedCrossCorePipe>> planned_pipes;
   PlannedBoundaryPipes planned_boundary_pipes;
-  if (func->HasAttr(kAutoFuseMixedFifoPlanAttr)) {
-    const std::string encoded = func->GetAttr<std::string>(kAutoFuseMixedFifoPlanAttr);
+  const bool has_public_pipe_plan = func->HasAttr(kCrossCorePipePlanAttr);
+  const bool has_legacy_pipe_plan = func->HasAttr(kAutoFuseMixedFifoPlanAttr);
+  INTERNAL_CHECK_SPAN(!(has_public_pipe_plan && has_legacy_pipe_plan), func->span_)
+      << "Function carries both public and legacy cross-core pipe contracts";
+  if (has_public_pipe_plan || has_legacy_pipe_plan) {
+    const char* pipe_plan_attr = has_public_pipe_plan ? kCrossCorePipePlanAttr : kAutoFuseMixedFifoPlanAttr;
+    const std::string encoded = func->GetAttr<std::string>(pipe_plan_attr);
     planned_pipes = cross_core_pipe::DecodePlannedCrossCorePipes(encoded);
     INTERNAL_CHECK_SPAN(planned_pipes.has_value(), func->span_)
-        << "AutoFuse mixed FIFO contract is malformed or uses an unsupported version";
+        << "Cross-core pipe contract is malformed or uses an unsupported version";
     if (func->HasAttr("slot_num")) {
       const int scope_slot_num = func->GetAttr<int>("slot_num", 0);
       for (const auto& pipe : *planned_pipes) {
         INTERNAL_CHECK_SPAN(pipe.slot_num == scope_slot_num, func->span_)
-            << "AutoFuse mixed FIFO " << pipe.pipe_id << " slot count " << pipe.slot_num
+            << "Cross-core pipe " << pipe.pipe_id << " slot count " << pipe.slot_num
             << " disagrees with outlined cross_core_slot " << scope_slot_num;
       }
     }
@@ -1448,7 +1454,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   CollectGmCrossLaneSyncs(stmts, stmt_map, gm_sync_pushes, gm_sync_pops);
   INTERNAL_CHECK_SPAN(!planned_pipes.has_value() || (gm_sync_pushes.empty() && gm_sync_pops.empty()),
                       func->span_)
-      << "AutoFuse mixed FIFO contract does not price an additional GM-mediated cross-lane fence";
+      << "Explicit cross-core pipe contract does not include an additional GM-mediated cross-lane fence";
 
   // Build definition map from original body for init value fixup (#533)
   std::unordered_map<const Var*, StmtPtr> original_def_map;
@@ -1562,7 +1568,8 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   RemapDanglingGmRefsToParam(aic_body_stmt, aic_map, gm_origin_map, func);
   auto [aic_cloned_body, aic_clone_map_unused] = DeepClone(aic_body_stmt, aic_map);
   (void)aic_clone_map_unused;
-  const auto emitted_attrs = StripAttr(func->attrs_, kAutoFuseMixedFifoPlanAttr);
+  const auto emitted_attrs =
+      StripAttr(StripAttr(func->attrs_, kCrossCorePipePlanAttr), kAutoFuseMixedFifoPlanAttr);
   auto aic_func = std::make_shared<Function>(aic_name, aic_params, func->param_directions_,
                                              std::vector<TypePtr>{}, aic_cloned_body, func->span_,
                                              FunctionType::AIC, std::nullopt, std::nullopt, emitted_attrs);

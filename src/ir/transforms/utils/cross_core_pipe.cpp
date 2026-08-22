@@ -168,22 +168,23 @@ std::string BuildPipeBufferName(const std::string& func_name, core_affinity::Pip
 }
 
 std::string EncodePlannedCrossCorePipes(const std::vector<PlannedCrossCorePipe>& pipes, const Span& span) {
-  INTERNAL_CHECK_SPAN(!pipes.empty(), span) << "AutoFuse mixed FIFO contract must contain at least one pipe";
+  INTERNAL_CHECK_SPAN(!pipes.empty(), span)
+      << "Explicit cross-core pipe contract must contain at least one pipe";
   std::set<int> pipe_ids;
   std::string encoded = std::to_string(kPlannedCrossCorePipeVersion);
   for (const auto& pipe : pipes) {
     const int direction = static_cast<int>(pipe.direction);
     INTERNAL_CHECK_SPAN(pipe.tensor_id >= 0, span)
-        << "AutoFuse mixed FIFO tensor id must be non-negative: " << pipe.tensor_id;
+        << "Cross-core pipe tensor id must be non-negative: " << pipe.tensor_id;
     INTERNAL_CHECK_SPAN(direction == core_affinity::kDirMaskC2V || direction == core_affinity::kDirMaskV2C,
                         span)
-        << "AutoFuse mixed FIFO direction must be unidirectional: " << direction;
+        << "Cross-core pipe direction must be unidirectional: " << direction;
     INTERNAL_CHECK_SPAN(pipe.valid_rows > 0 && pipe.valid_cols > 0 && pipe.slot_size_bytes > 0, span)
-        << "AutoFuse mixed FIFO shape and slot size must be positive";
+        << "Cross-core pipe shape and slot size must be positive";
     INTERNAL_CHECK_SPAN(pipe.slot_num > 0 && pipe.pipe_id >= 0 && pipe.bundle >= 0, span)
-        << "AutoFuse mixed FIFO slot count, pipe id, and bundle must be valid";
+        << "Cross-core pipe slot count, pipe id, and bundle must be valid";
     INTERNAL_CHECK_SPAN(pipe_ids.insert(pipe.pipe_id).second, span)
-        << "AutoFuse mixed FIFO pipe id is duplicated: " << pipe.pipe_id;
+        << "Cross-core pipe id is duplicated: " << pipe.pipe_id;
     encoded.push_back(';');
     const std::array<int64_t, 8> fields = {
         pipe.tensor_id,       direction,     pipe.valid_rows, pipe.valid_cols,
@@ -391,7 +392,7 @@ AutomaticPipeSetup BuildAutomaticPipeSetup(
   }
   if (aic_metadata.HasAnySetup() || aiv_metadata.HasAnySetup()) {
     INTERNAL_CHECK_SPAN(!planned_pipes.has_value(), span)
-        << "AutoFuse planned cross-core pipes cannot coexist with pre-existing pipe setup";
+        << "Explicit cross-core pipes cannot coexist with pre-existing pipe setup";
     return {};
   }
 
@@ -402,19 +403,19 @@ AutomaticPipeSetup BuildAutomaticPipeSetup(
 
   if (planned_pipes.has_value()) {
     INTERNAL_CHECK_SPAN(!planned_pipes->empty(), span)
-        << "AutoFuse planned cross-core setup requires at least one pipe";
+        << "Explicit cross-core pipe setup requires at least one pipe";
     AutomaticPipeSetup setup;
     for (const auto& pipe : *planned_pipes) {
       const int dir_mask = static_cast<int>(pipe.direction);
       INTERNAL_CHECK_SPAN(dir_mask == core_affinity::kDirMaskC2V || dir_mask == core_affinity::kDirMaskV2C,
                           span)
-          << "AutoFuse planned pipe must be unidirectional: " << dir_mask;
+          << "Explicit cross-core pipe must be unidirectional: " << dir_mask;
       INTERNAL_CHECK_SPAN(pipe.slot_size_bytes > 0 &&
                               pipe.slot_size_bytes <= std::numeric_limits<int>::max() && pipe.slot_num > 0,
                           span)
-          << "AutoFuse planned pipe has invalid slot geometry";
+          << "Explicit cross-core pipe has invalid slot geometry";
       INTERNAL_CHECK_SPAN(pipe.slot_size_bytes <= std::numeric_limits<int64_t>::max() / pipe.slot_num, span)
-          << "AutoFuse planned pipe buffer size overflow for id " << pipe.pipe_id;
+          << "Explicit cross-core pipe buffer size overflow for id " << pipe.pipe_id;
 
       const int slot_size = static_cast<int>(pipe.slot_size_bytes);
       const int64_t buffer_size = pipe.slot_size_bytes * pipe.slot_num;

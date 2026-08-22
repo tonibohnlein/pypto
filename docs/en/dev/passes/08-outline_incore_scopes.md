@@ -324,13 +324,14 @@ literal the user wrote, and it rejects every mode, NONE included. This pass keep
 the check for `split_ != SplitMode::None` as the backstop for IR that never went
 through the parser (deserialized `.pto`, programmatically built scopes).
 
-The three states read distinctly:
+The annotations read distinctly:
 
 | Annotation | Meaning |
 | ---------- | ------- |
 | `optimizations=[pl.split(MODE)]` | AUTO split — the compiler partitions the vector work |
 | `for aiv_id in pl.split_aiv(2, mode=...)` | Manual split — the author partitions it per region |
 | `optimizations=[pl.cross_core_slot(slot_num=N)]` | Neither — just sizes the cross-core pipe |
+| repeated `optimizations=[pl.cross_core_pipe(...)]` entries | Explicit physical FIFO schedule — propagated unchanged to `ExpandMixedKernel` |
 
 **The function-level `split` attr has one encoding of "no split": an absent key.**
 When the outlined body holds `pl.split_aiv` regions, this pass bridges their mode

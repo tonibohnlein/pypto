@@ -41,10 +41,15 @@ inline constexpr const char* kAutoScheduleReturnedOutParamIndicesAttr =
 /// deliberately do not carry it.
 inline constexpr const char* kCompilerTensorToTileMatBridgeAttr = "__compiler_tensor_to_tile_mat_bridge";
 
-/// Versioned compiler-internal handoff from AutoFuse's mixed scheduler to
-/// ExpandMixedKernel. The packed string records every solver-owned physical
-/// cross-core FIFO independently; it is consumed when the mixed InCore
-/// function is split and must never reach backend codegen.
+/// Versioned public schedule handoff from a tensor-level planner to
+/// ExpandMixedKernel. The packed string is the IR carrier for
+/// ``pl.cross_core_pipe(...)`` entries and records every physical FIFO
+/// independently. It is consumed when the mixed InCore function is split and
+/// must never reach backend codegen.
+inline constexpr const char* kCrossCorePipePlanAttr = "cross_core_pipe_plan";
+
+/// Legacy private spelling accepted for old serialized AutoFuse IR. New
+/// producers must use ``kCrossCorePipePlanAttr``.
 inline constexpr const char* kAutoFuseMixedFifoPlanAttr = "__autofuse_mixed_fifo_plan";
 
 /// Attribute key for ``pl.pipeline(N, stage=F)`` — appears on ``ForStmt.attrs_``

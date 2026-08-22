@@ -5236,7 +5236,7 @@ std::optional<std::vector<StmtPtr>> EmitDenseSwiGluMlpGroup(
       SplitMode::UpDown, name, SeqStmts::Flatten(std::move(kernel_body), sp), sp, std::vector<std::string>{},
       std::vector<std::pair<std::string, std::any>>{
           {"slot_num", static_cast<int>(plan.fifos.front().slot_count)},
-          {kAutoFuseMixedFifoPlanAttr, EncodeMixedFifoContract(plan, sp)}});
+          {kCrossCorePipePlanAttr, EncodeMixedFifoContract(plan, sp)}});
   auto scope = std::make_shared<SpmdScopeStmt>(MakeIndex(plan.loop.active_groups, sp), /*sync_start=*/false,
                                                name + "_spmd", kernel, sp);
   LOG_INFO << "AutoFuse[mixed-mlp-plan]: group '" << name
@@ -5498,7 +5498,7 @@ std::optional<std::vector<StmtPtr>> EmitGenericSingleRoundTripGroup(
       SplitMode::UpDown, name, SeqStmts::Flatten(std::move(kernel_body), sp), sp, std::vector<std::string>{},
       std::vector<std::pair<std::string, std::any>>{
           {"slot_num", static_cast<int>(plan.fifos.front().slot_count)},
-          {kAutoFuseMixedFifoPlanAttr, EncodeMixedFifoContract(plan, sp)}});
+          {kCrossCorePipePlanAttr, EncodeMixedFifoContract(plan, sp)}});
   auto scope = std::make_shared<SpmdScopeStmt>(MakeIndex(plan.loop.active_groups, sp), /*sync_start=*/false,
                                                name + "_spmd", kernel, sp);
   LOG_INFO << "AutoFuse[mixed-roundtrip-plan]: group '" << name
@@ -5737,9 +5737,9 @@ std::optional<std::vector<StmtPtr>> EmitMixedScheduleGroup(
       SplitMode::UpDown, name, SeqStmts::Flatten(std::move(kernel_body), sp), sp, std::vector<std::string>{},
       std::vector<std::pair<std::string, std::any>>{
           {"slot_num", static_cast<int>(plan.fifos[0].slot_count)},
-          {kAutoFuseMixedFifoPlanAttr, EncodeMixedFifoContract(plan, sp)}});
+          {kCrossCorePipePlanAttr, EncodeMixedFifoContract(plan, sp)}});
   INTERNAL_CHECK(kernel->HasAttr("slot_num")) << "mixed InCore lost slot_num at construction";
-  INTERNAL_CHECK(kernel->HasAttr(kAutoFuseMixedFifoPlanAttr))
+  INTERNAL_CHECK(kernel->HasAttr(kCrossCorePipePlanAttr))
       << "mixed InCore lost the solver-owned FIFO contract at construction";
   auto scope = std::make_shared<SpmdScopeStmt>(MakeIndex(plan.loop.active_groups, sp), /*sync_start=*/false,
                                                name + "_spmd", kernel, sp);

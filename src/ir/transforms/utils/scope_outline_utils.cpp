@@ -1208,18 +1208,20 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       outlined_attrs.emplace_back("split", static_cast<int>(split));
     }
   };
-  // Propagate the optional cross-core ring depth (pl.split(mode, slot_num=N))
-  // from the scope's attrs onto the outlined function, where ExpandMixedKernel
-  // reads it to size the automatic cube->vector pipe.
+  // Propagate the optional automatic cross-core ring depth from the scope's
+  // attrs onto the outlined function, where ExpandMixedKernel reads it to size
+  // every automatically inferred direction. Explicit pipe records carry their
+  // own depths in the separate versioned plan attribute below.
   auto append_slot_num_attr = [&]() {
     if (op->HasAttr("slot_num")) {
       outlined_attrs.emplace_back("slot_num", op->GetAttr<int>("slot_num", 0));
     }
   };
-  auto append_autofuse_mixed_fifo_plan_attr = [&]() {
-    if (op->HasAttr(kAutoFuseMixedFifoPlanAttr)) {
-      outlined_attrs.emplace_back(kAutoFuseMixedFifoPlanAttr,
-                                  op->GetAttr<std::string>(kAutoFuseMixedFifoPlanAttr));
+  auto append_cross_core_pipe_plan_attr = [&]() {
+    for (const char* key : {kCrossCorePipePlanAttr, kAutoFuseMixedFifoPlanAttr}) {
+      if (op->HasAttr(key)) {
+        outlined_attrs.emplace_back(key, op->GetAttr<std::string>(key));
+      }
     }
   };
   auto append_windowize_attr = [&]() {
@@ -1296,7 +1298,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   if (auto incore = As<InCoreScopeStmt>(op)) {
     append_split_attr(incore->split_);
     append_slot_num_attr();
-    append_autofuse_mixed_fifo_plan_attr();
+    append_cross_core_pipe_plan_attr();
     append_windowize_attr();
     append_deferred_completion_waiter_attr();
     append_split_aiv_attr(incore->split_);

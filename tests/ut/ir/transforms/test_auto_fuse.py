@@ -3677,11 +3677,12 @@ class TestAutoFuse:
             planned_text = next(
                 f for _, f in planned.functions.items() if f.name == "epilogue"
             ).as_python()
-            assert "pl.spmd(24" in planned_text, planned_text
+            assert "pl.spmd(24," in "".join(planned_text.split()), planned_text
             assert "pl.range(2" in planned_text, planned_text
             assert "pl.pipeline(2, stage=2" not in planned_text, planned_text
             assert "pl.split(pl.SplitMode.UP_DOWN)" in planned_text, planned_text
             assert "pl.cross_core_slot(slot_num=8)" in planned_text, planned_text
+            assert planned_text.count("pl.cross_core_pipe(") == 1, planned_text
             assert planned_text.count("pl.tensor.matmul(") == 1, planned_text
             assert planned_text.count("pl.tensor.add(") == 1, planned_text
 
@@ -3726,6 +3727,7 @@ class TestAutoFuse:
             assert "subblock_idx * 16" in text, text
             assert "__gm_pipe_buffer" in text, text
             assert "__autofuse_mixed_fifo_plan" not in text, text
+            assert "cross_core_pipe_plan" not in text, text
 
             # Ascend910B forbids a split-AIV writer that consumes both a
             # tile.load result and a MemRef-less tpop_from_aic value from
@@ -3805,10 +3807,11 @@ class TestAutoFuse:
             exec(torch_codegen(Prog, run_all_spmd_blocks=True), source_ns)
             planned = passes.auto_fuse()(Prog)
             planned_text = planned.get_function("cvc").as_python()
-            assert "pl.spmd(24" in planned_text, planned_text
+            assert "pl.spmd(24," in "".join(planned_text.split()), planned_text
             assert "pl.pipeline(2, stage=3" in planned_text, planned_text
             assert "pl.split(pl.SplitMode.UP_DOWN)" in planned_text, planned_text
             assert "pl.cross_core_slot(slot_num=4)" in planned_text, planned_text
+            assert planned_text.count("pl.cross_core_pipe(") == 2, planned_text
             assert planned_text.count("pl.tensor.matmul(") >= 2, planned_text
             assert "pl.tensor.row_max(" in planned_text, planned_text
             assert "pl.tensor.row_sum(" in planned_text, planned_text
@@ -3839,6 +3842,7 @@ class TestAutoFuse:
             assert lowered_text.count("slot_size=4096") >= 4, lowered_text
             assert "id=0" in lowered_text and "id=1" in lowered_text, lowered_text
             assert "__autofuse_mixed_fifo_plan" not in lowered_text, lowered_text
+            assert "cross_core_pipe_plan" not in lowered_text, lowered_text
             """
         )
         env = os.environ.copy()
@@ -3914,6 +3918,8 @@ class TestAutoFuse:
         """
         script = textwrap.dedent(
             """
+            import re
+
             import torch
             import pypto.language as pl
             from pypto import backend, ir, passes
@@ -3965,7 +3971,37 @@ class TestAutoFuse:
                     for fused_0_group in pl.spmd(
                         2,
                         name_hint="fused_0_spmd",
-                        optimizations=[pl.split(pl.SplitMode.UP_DOWN, slot_num=4)],
+                        optimizations=[
+                            pl.split(pl.SplitMode.UP_DOWN),
+                            pl.cross_core_slot(slot_num=4),
+                            pl.cross_core_pipe(
+                                tensor_id=4,
+                                direction=pl.CrossCoreDirection.CUBE_TO_VECTOR,
+                                valid_shape=[16, 16],
+                                slot_size_bytes=1024,
+                                slot_num=4,
+                                pipe_id=0,
+                                bundle=0,
+                            ),
+                            pl.cross_core_pipe(
+                                tensor_id=5,
+                                direction=pl.CrossCoreDirection.CUBE_TO_VECTOR,
+                                valid_shape=[16, 16],
+                                slot_size_bytes=1024,
+                                slot_num=4,
+                                pipe_id=1,
+                                bundle=0,
+                            ),
+                            pl.cross_core_pipe(
+                                tensor_id=12,
+                                direction=pl.CrossCoreDirection.VECTOR_TO_CUBE,
+                                valid_shape=[16, 16],
+                                slot_size_bytes=512,
+                                slot_num=4,
+                                pipe_id=2,
+                                bundle=1,
+                            ),
+                        ],
                     ):
                         out_acc_init: pl.Tensor[[16, 64], pl.FP32] = pl.tensor.create(
                             [16, 64], dtype=pl.FP32, layout=pl.TensorLayout.ND
@@ -4072,10 +4108,9 @@ class TestAutoFuse:
                 source_namespace,
             )
             planned = passes.auto_fuse()(Prog)
-            # AutoFuse also carries a private, versioned FIFO descriptor on the
-            # intermediate InCore scope. It is intentionally absent from the
-            # public printer and stripped by ExpandMixedKernel, so compare the
-            # complete public IR surface here and inspect the realized IDs below.
+            # The solver-owned descriptor is public PyPTO schedule metadata, so
+            # compare it together with the tensor-level replay and inspect the
+            # realized physical IDs below.
             assert planned.get_function("mlp").as_python() == Expected.get_function(
                 "mlp"
             ).as_python()
@@ -4119,6 +4154,7 @@ class TestAutoFuse:
             for pipe_id in (0, 1, 2):
                 assert lowered_text.count(f"id={pipe_id}") >= 2, lowered_text
             assert "__autofuse_mixed_fifo_plan" not in lowered_text, lowered_text
+            assert "cross_core_pipe_plan" not in lowered_text, lowered_text
 
             # The AIC reply pop sits under the first-matmul/matmul_acc branch.
             # SkewCrossCorePipeline must still recognize the ordered
@@ -4130,6 +4166,23 @@ class TestAutoFuse:
             aiv_begin = lowered_text.index("def fused_0_aiv(")
             aic_text = lowered_text[aic_begin:aiv_begin]
             aiv_text = lowered_text[aiv_begin:]
+
+            def pipe_ids(text, operation):
+                return {
+                    int(pipe_id)
+                    for pipe_id in re.findall(
+                        rf"pl\\.(?:tile|system)\\.{operation}\\([^)]*\\bid=(\\d+)",
+                        text,
+                        re.DOTALL,
+                    )
+                }
+
+            assert pipe_ids(aic_text, "tpush_to_aiv") == {0, 1}, aic_text
+            assert pipe_ids(aiv_text, "tpop_from_aic") == {0, 1}, aiv_text
+            assert pipe_ids(aiv_text, "tfree_to_aic") == {0, 1}, aiv_text
+            assert pipe_ids(aiv_text, "tpush_to_aic") == {2}, aiv_text
+            assert pipe_ids(aic_text, "tpop_from_aiv") == {2}, aic_text
+            assert pipe_ids(aic_text, "tfree_to_aiv") == {2}, aic_text
             assert "pl.pipeline(" not in aic_text, aic_text
             steady_begin = aic_text.index("pl.range(32, 128, 32")
             aic_prologue = aic_text[:steady_begin]

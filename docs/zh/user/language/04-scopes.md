@@ -86,6 +86,34 @@ with pl.at(level=pl.Level.CORE_GROUP,
 省略 `cross_core_slot` 就保持默认环深度：每个活跃方向 2 个 slot——刚好够对这次交接做双缓冲，
 同时给 tile 本身留出片上空间。若希望生产侧核能跑得更超前，再调高它。
 
+生成的调度可以用每个跨核张量一个的显式描述符取代自动定尺。
+`pl.cross_core_pipe(...)` 构造一个 `pl.CrossCorePipe`；其 `direction` 为
+`pl.CrossCoreDirection.CUBE_TO_VECTOR` 或
+`pl.CrossCoreDirection.VECTOR_TO_CUBE`。描述符固定逻辑张量、有效 tile 形状、
+slot 字节数、环深度、物理 pipe ID 和协议 bundle：
+
+```python
+with pl.at(
+    level=pl.Level.CORE_GROUP,
+    optimizations=[
+        pl.split(pl.SplitMode.UP_DOWN),
+        pl.cross_core_pipe(
+            tensor_id=3,
+            direction=pl.CrossCoreDirection.CUBE_TO_VECTOR,
+            valid_shape=[16, 64],
+            slot_size_bytes=4096,
+            slot_num=4,
+            pipe_id=0,
+            bundle=0,
+        ),
+    ],
+):
+    ...
+```
+
+这是编译器调度接口，而不是算法层调优开关。PyPTO 会将每个描述符与实际的跨引擎张量
+边界校验，并在降低物理 FIFO 操作之前拒绝过期、重复或不匹配的合同。
+
 ### SPMD
 
 `pl.spmd(n)` 让同一个 kernel 在 `n` 个 block 上执行。两种形式，区别在于函数体是否读 block 索引：

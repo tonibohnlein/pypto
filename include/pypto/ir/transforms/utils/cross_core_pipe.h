@@ -55,7 +55,7 @@ struct AutomaticPipeSetup {
   std::vector<StmtPtr> aiv_stmts;
 };
 
-/// One physical FIFO selected and priced by AutoFuse's mixed scheduler.
+/// One physical FIFO selected and priced by an external or in-compiler planner.
 /// ``bundle`` preserves the scheduler's protocol grouping for diagnostics and
 /// future protocol validation; pipe setup remains one independent
 /// unidirectional queue per record.  The current skew validator reasons from

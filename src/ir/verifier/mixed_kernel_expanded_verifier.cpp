@@ -649,6 +649,11 @@ class MixedKernelExpandedPropertyVerifierImpl : public PropertyVerifier {
     std::map<std::string, PairDescriptors> split_pairs;
     for (const auto& [gv, func] : program->functions_) {
       if (!func || !func->body_) continue;
+      if (func->HasAttr(kCrossCorePipePlanAttr) || func->HasAttr(kAutoFuseMixedFifoPlanAttr)) {
+        diagnostics.emplace_back(
+            DiagnosticSeverity::Error, "MixedKernelExpanded", 0,
+            "Function '" + func->name_ + "' leaked a cross-core pipe plan past expansion", func->span_);
+      }
       if (func->func_type_ == FunctionType::InCore) {
         MixedKernelExpandedVerifier verifier(diagnostics, func->name_);
         verifier.VisitStmt(func->body_);
@@ -656,12 +661,6 @@ class MixedKernelExpandedPropertyVerifierImpl : public PropertyVerifier {
         continue;
       }
       if (func->func_type_ == FunctionType::AIC || func->func_type_ == FunctionType::AIV) {
-        if (func->HasAttr(kAutoFuseMixedFifoPlanAttr)) {
-          diagnostics.emplace_back(
-              DiagnosticSeverity::Error, "MixedKernelExpanded", 0,
-              "Function '" + func->name_ + "' leaked the private AutoFuse mixed FIFO plan past expansion",
-              func->span_);
-        }
         TpopMemoryVerifier verifier(diagnostics, func->name_, func->func_type_);
         verifier.VisitStmt(func->body_);
         VerifyReserveAndImportPeerBufferCoverage(func, diagnostics);

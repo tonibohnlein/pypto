@@ -99,6 +99,35 @@ Omitting `cross_core_slot` keeps the default ring depth of 2 slots per active di
 enough to double-buffer the handoff while leaving on-chip room for the tiles themselves.
 Raise it when the producing core should be able to run further ahead.
 
+Generated schedules can replace that automatic sizing with one explicit descriptor per
+cross-core tensor. `pl.cross_core_pipe(...)` constructs a `pl.CrossCorePipe`; its
+`direction` is either `pl.CrossCoreDirection.CUBE_TO_VECTOR` or
+`pl.CrossCoreDirection.VECTOR_TO_CUBE`. The descriptor fixes the logical tensor, valid
+tile shape, slot bytes, ring depth, physical pipe ID, and protocol bundle:
+
+```python
+with pl.at(
+    level=pl.Level.CORE_GROUP,
+    optimizations=[
+        pl.split(pl.SplitMode.UP_DOWN),
+        pl.cross_core_pipe(
+            tensor_id=3,
+            direction=pl.CrossCoreDirection.CUBE_TO_VECTOR,
+            valid_shape=[16, 64],
+            slot_size_bytes=4096,
+            slot_num=4,
+            pipe_id=0,
+            bundle=0,
+        ),
+    ],
+):
+    ...
+```
+
+This is a compiler-schedule interface rather than an algorithm-level tuning knob. PyPTO
+checks each descriptor against the actual cross-engine tensor boundary and rejects stale,
+duplicate, or mismatched contracts before lowering the physical FIFO operations.
+
 ### SPMD
 
 `pl.spmd(n)` runs the same kernel on `n` blocks. Two forms, differing in whether the body

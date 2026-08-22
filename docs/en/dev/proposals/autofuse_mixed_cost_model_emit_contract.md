@@ -140,13 +140,14 @@ output extents; the feature-chunk loop; the two projection K windows; the down
 feed window; and the persistent FP32 down accumulator. These are mixed
 composition facts, not a second implementation of homogeneous tiling.
 
-The winning plan is carried across the tensor-to-tile boundary as a private,
-versioned FIFO descriptor. Each logical crossing is one record and one physical
-unidirectional queue. `ExpandMixedKernel` validates direction, shape, bytes,
-and order before assigning the record's ID to `tpush`/`tpop`/`tfree`; repeated
+The winning plan is carried across the tensor-to-tile boundary through public,
+typed `pl.cross_core_pipe(...)` schedule entries backed by a versioned IR
+carrier. Each logical crossing is one record and one physical unidirectional
+queue. `ExpandMixedKernel` validates direction, shape, bytes, and order before
+assigning the record's ID to `tpush`/`tpop`/`tfree`; repeated
 uses of the same activation in the mutually exclusive first/accumulate branches
 share the reply ID. Distinct same-shaped sources such as gate and up never
-collapse. The descriptor is stripped after expansion and cannot leak into
+collapse. The IR carrier is stripped after expansion and cannot leak into
 generated AIC/AIV/Group functions.
 
 The last two fields intentionally fail loud during migration. A cost may use `max` only when the
