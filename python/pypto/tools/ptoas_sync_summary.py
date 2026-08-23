@@ -17,14 +17,25 @@ duplicates or mismatched function sets.
 """
 
 import argparse
+import hashlib
 import json
+import re
 import sys
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 _MAPPING_METRICS = ("pipe_pair_groups", "pipe_pair_event_ids")
 _IGNORED_NUMERIC_FIELDS = {"schema_version"}
+_FUNCTION_RE = re.compile(r"\bfunc\.func\s+(?:private\s+)?@([-A-Za-z0-9_.$]+)")
+_SYNC_OP_RE = re.compile(r"\bpto\.(set_flag(?:_dyn|_d)?|wait_flag(?:_dyn|_d)?)\b")
+_BARRIER_RE = re.compile(r"\bpto\.barrier\b")
+_HIGH_LEVEL_SYNC_RE = re.compile(r"\bpto\.(record_event|wait_event)\b")
+_PIPE_RE = re.compile(r"\bPIPE_[A-Z0-9_]+\b")
+_EVENT_RE = re.compile(r"\bEVENT_ID[A-Z0-9_]+\b")
+_SSA_RE = re.compile(r"%[-A-Za-z0-9_.$]+")
+_LOOP_RE = re.compile(r"\bscf\.for\b")
 
 
 def load_sync_summaries(path: str | Path) -> dict[str, dict[str, Any]]:
@@ -138,21 +149,312 @@ def diff_sync_summaries(
     return result
 
 
+def _transition_kind(before: Mapping[str, Any], after: Mapping[str, Any]) -> str:
+    before_stack = tuple(before["loop_stack"])
+    after_stack = tuple(after["loop_stack"])
+    before_type = str(before["type"])
+    after_type = str(after["type"])
+    if before_stack == after_stack:
+        if before_type.startswith("set_flag") and after_type.startswith("wait_flag"):
+            return "within_iteration"
+        return "same_scope_rearm"
+    if before_stack == after_stack[: len(before_stack)]:
+        return "loop_entry"
+    if after_stack == before_stack[: len(after_stack)]:
+        return "loop_exit"
+    return "cross_loop_boundary"
+
+
+def _summarize_lowered_function(function: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
+    by_type = Counter(str(operation["type"]) for operation in operations)
+    by_pipe_pair = Counter(
+        f"{operation['src_pipe']}->{operation['dst_pipe']}"
+        for operation in operations
+        if operation["type"] != "barrier"
+    )
+    barriers_by_pipe = Counter(
+        str(operation["src_pipe"]) for operation in operations if operation["type"] == "barrier"
+    )
+    by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for operation in operations:
+        if operation["type"] == "barrier":
+            continue
+        by_key[(operation["src_pipe"], operation["dst_pipe"], operation["event"])].append(operation)
+    transitions: list[dict[str, Any]] = []
+    for key, keyed_operations in sorted(by_key.items()):
+        for before, after in zip(keyed_operations, keyed_operations[1:]):
+            transitions.append(
+                {
+                    "src_pipe": key[0],
+                    "dst_pipe": key[1],
+                    "event": key[2],
+                    "from_line": before["line"],
+                    "to_line": after["line"],
+                    "from_type": before["type"],
+                    "to_type": after["type"],
+                    "kind": _transition_kind(before, after),
+                    "basis": "lexical_successor",
+                }
+            )
+        by_innermost_loop: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for operation in keyed_operations:
+            if operation["loop_stack"]:
+                by_innermost_loop[operation["loop_stack"][-1]].append(operation)
+        for loop_id, loop_operations in sorted(by_innermost_loop.items()):
+            first, last = loop_operations[0], loop_operations[-1]
+            if not (str(last["type"]).startswith("set_flag") and str(first["type"]).startswith("wait_flag")):
+                continue
+            transitions.append(
+                {
+                    "src_pipe": key[0],
+                    "dst_pipe": key[1],
+                    "event": key[2],
+                    "from_line": last["line"],
+                    "to_line": first["line"],
+                    "from_type": last["type"],
+                    "to_type": first["type"],
+                    "kind": "loop_carried",
+                    "basis": "inferred_loop_backedge",
+                    "loop": loop_id,
+                }
+            )
+    transition_counts = Counter(transition["kind"] for transition in transitions)
+    return {
+        "schema_version": 1,
+        "summary_kind": "actual_post_insert_sync_lowered_ir_v1",
+        "function": function,
+        "instruction_site_count": len(operations),
+        "instruction_sites_by_type": dict(sorted(by_type.items())),
+        "instruction_sites_by_pipe_pair": dict(sorted(by_pipe_pair.items())),
+        "barrier_sites_by_pipe": dict(sorted(barriers_by_pipe.items())),
+        "inside_loop_instruction_sites": sum(bool(operation["loop_stack"]) for operation in operations),
+        "outside_loop_instruction_sites": sum(not operation["loop_stack"] for operation in operations),
+        "transition_inference_version": "event_key_lexical_and_innermost_backedge_v1",
+        "inferred_transition_counts": dict(sorted(transition_counts.items())),
+        "operations": operations,
+        "inferred_event_transitions": transitions,
+    }
+
+
+def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles function, loop, and sync states
+    text: str,
+) -> dict[str, dict[str, Any]]:
+    """Summarize synchronization instructions present in lowered post-InsertSync PTO IR."""
+    functions: dict[str, list[dict[str, Any]]] = {}
+    current_function: str | None = None
+    function_opened = False
+    depth = 0
+    loop_stack: list[tuple[int, int]] = []
+    pending_loop_line: int | None = None
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        code = line.split("//", maxsplit=1)[0]
+        if current_function is None:
+            function_match = _FUNCTION_RE.search(code)
+            if function_match is None:
+                continue
+            current_function = function_match.group(1)
+            if current_function in functions:
+                raise ValueError(f"lowered PTO repeats function '{current_function}'")
+            functions[current_function] = []
+            function_opened = "{" in code
+            depth = code.count("{") - code.count("}") if function_opened else 0
+            loop_stack = []
+            pending_loop_line = None
+            continue
+
+        leading = code.lstrip()
+        leading_closes = len(leading) - len(leading.lstrip("}"))
+        if leading_closes:
+            depth -= leading_closes
+            while loop_stack and loop_stack[-1][1] > depth:
+                loop_stack.pop()
+
+        if _HIGH_LEVEL_SYNC_RE.search(code):
+            raise ValueError(
+                f"function {current_function} line {line_number}: high-level event op remains; "
+                "expected lowered post-InsertSync PTO"
+            )
+        operation_match = _SYNC_OP_RE.search(code)
+        barrier_match = _BARRIER_RE.search(code)
+        if operation_match is not None:
+            pipes = _PIPE_RE.findall(code)
+            if len(pipes) < 2:
+                raise ValueError(
+                    f"function {current_function} line {line_number}: sync op has fewer than two pipes"
+                )
+            event_match = _EVENT_RE.search(code)
+            event = event_match.group(0) if event_match else None
+            if event is None:
+                ssa_values = _SSA_RE.findall(code)
+                if not ssa_values:
+                    raise ValueError(
+                        f"function {current_function} line {line_number}: dynamic sync has no event SSA"
+                    )
+                event = ssa_values[-1]
+            functions[current_function].append(
+                {
+                    "line": line_number,
+                    "type": operation_match.group(1),
+                    "src_pipe": pipes[0],
+                    "dst_pipe": pipes[1],
+                    "event": event,
+                    "loop_stack": [loop_id for loop_id, _ in loop_stack],
+                }
+            )
+        elif barrier_match is not None:
+            pipes = _PIPE_RE.findall(code)
+            if len(pipes) != 1:
+                raise ValueError(
+                    f"function {current_function} line {line_number}: barrier must name exactly one pipe"
+                )
+            functions[current_function].append(
+                {
+                    "line": line_number,
+                    "type": "barrier",
+                    "src_pipe": pipes[0],
+                    "dst_pipe": pipes[0],
+                    "event": None,
+                    "loop_stack": [loop_id for loop_id, _ in loop_stack],
+                }
+            )
+
+        remainder = leading[leading_closes:]
+        opens = remainder.count("{")
+        closes = remainder.count("}")
+        if not function_opened and opens:
+            function_opened = True
+        if _LOOP_RE.search(code):
+            pending_loop_line = line_number
+        if pending_loop_line is not None and opens > closes:
+            loop_stack.append((pending_loop_line, depth + 1))
+            pending_loop_line = None
+        depth += opens - closes
+        if function_opened and depth <= 0:
+            current_function = None
+            function_opened = False
+            loop_stack = []
+            pending_loop_line = None
+
+    if current_function is not None:
+        raise ValueError(f"unterminated function '{current_function}' in lowered PTO")
+    if not functions:
+        raise ValueError("lowered PTO contains no functions")
+    return {
+        function: _summarize_lowered_function(function, operations)
+        for function, operations in sorted(functions.items())
+    }
+
+
+def summarize_arm_manifest(path: str | Path) -> dict[str, Any]:
+    """Collect actual post-InsertSync summaries for every declared placement arm."""
+    source = Path(path)
+    payload = json.loads(source.read_text())
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
+        raise ValueError(f"{source}: expected arm manifest schema_version=1")
+    expected_arms = payload.get("expected_arms")
+    cells = payload.get("cells")
+    if (
+        not isinstance(expected_arms, list)
+        or not expected_arms
+        or not all(isinstance(arm, str) and arm for arm in expected_arms)
+    ):
+        raise ValueError(f"{source}: expected_arms must be a non-empty string array")
+    if not isinstance(cells, list) or not cells:
+        raise ValueError(f"{source}: cells must be a non-empty array")
+
+    rows: list[dict[str, Any]] = []
+    arms_by_case: dict[tuple[str, str], set[str]] = defaultdict(set)
+    functions_by_case_arm: dict[tuple[str, str], dict[str, set[str]]] = defaultdict(dict)
+    cell_keys: set[tuple[str, str, str]] = set()
+    for index, cell in enumerate(cells):
+        if not isinstance(cell, Mapping):
+            raise ValueError(f"{source}: cell {index} must be an object")
+        case, capacity, arm = cell.get("case"), cell.get("capacity"), cell.get("arm")
+        raw_pto = cell.get("post_insert_sync_pto")
+        if not all(isinstance(value, str) and value for value in (case, capacity, arm, raw_pto)):
+            raise ValueError(f"{source}: cell {index} has incomplete identity or PTO path")
+        key = (case, capacity, arm)
+        if key in cell_keys:
+            raise ValueError(f"{source}: duplicate arm cell {key}")
+        cell_keys.add(key)
+        arms_by_case[(case, capacity)].add(arm)
+        pto_path = (source.parent / raw_pto).resolve()
+        pto_bytes = pto_path.read_bytes()
+        summaries = summarize_lowered_pto(pto_bytes.decode())
+        requested_function = cell.get("function")
+        if requested_function is not None:
+            if requested_function not in summaries:
+                raise ValueError(f"{pto_path}: function '{requested_function}' is not present")
+            summaries = {requested_function: summaries[requested_function]}
+        functions_by_case_arm[(case, capacity)][arm] = set(summaries)
+        for function, summary in sorted(summaries.items()):
+            rows.append(
+                {
+                    "case": case,
+                    "capacity": capacity,
+                    "arm": arm,
+                    "function": function,
+                    "post_insert_sync_pto": raw_pto,
+                    "post_insert_sync_pto_sha256": hashlib.sha256(pto_bytes).hexdigest(),
+                    "summary": summary,
+                }
+            )
+    required = set(expected_arms)
+    for case_key, actual in sorted(arms_by_case.items()):
+        if actual != required:
+            raise ValueError(
+                f"{source}: arm coverage mismatch for {case_key}: "
+                f"missing={sorted(required - actual)}, added={sorted(actual - required)}"
+            )
+        function_sets = functions_by_case_arm[case_key]
+        reference_arm = expected_arms[0]
+        reference_functions = function_sets[reference_arm]
+        for arm in expected_arms[1:]:
+            if function_sets[arm] != reference_functions:
+                raise ValueError(
+                    f"{source}: function-set mismatch for {case_key}: "
+                    f"{reference_arm}={sorted(reference_functions)}, "
+                    f"{arm}={sorted(function_sets[arm])}"
+                )
+    return {
+        "schema_version": 1,
+        "summary_kind": "actual_post_insert_sync_per_arm_v1",
+        "manifest": str(source),
+        "manifest_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "expected_arms": expected_arms,
+        "cell_count": len(cells),
+        "function_summary_count": len(rows),
+        "cells": rows,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ptoas_sync_summary",
         description="Compare PTOAS InsertSync JSONL summaries by function.",
     )
-    parser.add_argument("baseline", type=Path)
-    parser.add_argument("candidate", type=Path)
+    parser.add_argument("baseline", type=Path, nargs="?")
+    parser.add_argument("candidate", type=Path, nargs="?")
+    parser.add_argument(
+        "--arm-manifest",
+        type=Path,
+        help="Collect actual lowered post-InsertSync summaries for every arm in a manifest.",
+    )
     parser.add_argument("-o", "--output", type=Path, help="Write JSON to this path instead of stdout.")
     args = parser.parse_args(argv)
 
     try:
-        result = diff_sync_summaries(
-            load_sync_summaries(args.baseline),
-            load_sync_summaries(args.candidate),
-        )
+        if args.arm_manifest is not None:
+            if args.baseline is not None or args.candidate is not None:
+                raise ValueError("--arm-manifest cannot be combined with baseline/candidate paths")
+            result = summarize_arm_manifest(args.arm_manifest)
+        else:
+            if args.baseline is None or args.candidate is None:
+                raise ValueError("baseline and candidate paths are required without --arm-manifest")
+            result = diff_sync_summaries(
+                load_sync_summaries(args.baseline),
+                load_sync_summaries(args.candidate),
+            )
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

@@ -203,10 +203,11 @@ covered by work already on the critical path.
 
 Static loops are aggregated by their trip count in the whole-function DAG.
 Dynamic loops fail closed because the model has no defensible multiplier.
-Loop-carried synchronization edges and edges incident to loop markers are
-excluded from that DAG and reported; candidate scoring handles loop-carried
-edges separately with the recurrence lower bound described below. Legacy trace
-imports may also omit barrier dependency nodes. In that case
+Loop-carried synchronization edges are excluded from that acyclic DAG and
+handled separately with the recurrence lower bound described below. Valid
+loop-marker endpoints remain in the structural graph as zero-duration nodes;
+only endpoints that are genuinely absent from the imported graph are excluded
+and reported. Legacy trace imports may also omit barrier dependency nodes. In that case
 `latency_graph_complete` is false even if no excluded edge is visible in the
 imported graph.
 
@@ -218,6 +219,28 @@ separate, explicitly hypothetical `sync_endpoint_estimator_version`; its
 source-plus-target execution count is an uncoalesced pressure feature, not an
 observed instruction count. Actual post-InsertSync instruction summaries must
 be collected from lowered IR for each placement arm.
+
+Model version `loop_sync_ii_and_boundary_v1` retains zero-duration loop
+markers in the structural graph. It reports loop-entry and loop-exit
+synchronization separately and models every identified distance-one
+loop-carried dependency as a recurrence lower bound on initiation interval.
+This remains a lower bound: it does not claim a modulo schedule or account for
+finite event-slot allocation.
+
+The actual per-arm instruction collector consumes a manifest of lowered
+post-InsertSync PTO files. It fails if high-level `record_event`/`wait_event`
+operations remain, requires the declared arm and function sets for every
+case/capacity, and counts the synchronization instruction sites actually
+present in the lowered IR. It also infers candidate event-lifecycle transitions
+under the versioned `event_key_lexical_and_innermost_backedge_v1` contract.
+Those transitions are not directly emitted facts: event IDs can be recycled,
+and lowered IR does not preserve Final-SyncIR group identity. The inference
+therefore remains separate from the actual instruction-site counts.
+
+```bash
+python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \
+    -o post-sync-summary.json
+```
 
 Operation durations come from
 a provider snapshot loaded from the exact PTO-ISA revision in

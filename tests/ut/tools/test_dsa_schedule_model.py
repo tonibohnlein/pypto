@@ -121,6 +121,8 @@ def test_score_aggregates_static_loop_work():
             "id": 10,
             "kind": "loop",
             "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 11,
             "static_trip_count": 4,
         },
         _operation(0, "PIPE_V", "pto.tadd", [10]),
@@ -143,6 +145,8 @@ def test_score_reports_pre_codegen_sync_records_separately_from_latency():
             "id": 10,
             "kind": "loop",
             "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 11,
             "static_trip_count": 4,
             "loop_stack": [],
         },
@@ -152,6 +156,8 @@ def test_score_reports_pre_codegen_sync_records_separately_from_latency():
             "id": 11,
             "kind": "loop",
             "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 11,
             "static_trip_count": 4,
             "loop_stack": [],
         }
@@ -195,9 +201,12 @@ def test_score_reports_pre_codegen_sync_records_separately_from_latency():
         "active_record_sites_by_pipe_pair": {"PIPE_V->PIPE_MTE2": 2},
         "active_record_executions_by_pipe_pair": {"PIPE_V->PIPE_MTE2": 8},
     }
-    assert result["excluded_non_operation_sync_edges"] == 1
-    assert result["latency_graph_complete"] is False
-    assert result["latency_graph_limitations"] == ["excluded_non_operation_sync_edges"]
+    assert result["excluded_non_operation_sync_edges"] == 0
+    assert result["latency_graph_complete"] is True
+    assert result["latency_graph_limitations"] == []
+    assert result["loop_sync_models"][0]["loop_boundary_sync_edges"] == [
+        {"source": 11, "target": 1, "group": 8, "kind": "loop_boundary"}
+    ]
 
 
 def test_pre_codegen_sync_summary_keeps_duplicate_barrier_records_distinct():
@@ -245,14 +254,134 @@ def test_score_fails_closed_on_dynamic_loop():
         dsa_schedule_model.score_schedule(record, _ten_cycle_model())
 
 
-def test_loop_carried_sync_is_excluded_and_reported():
+def test_loop_carried_sync_without_loop_identity_fails_closed():
     record = _record(sync_edges=[{"source": 2, "target": 1, "group": 4, "loop_carried": True}])
+
+    with pytest.raises(ValueError, match="does not resolve to exactly one loop model"):
+        dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+
+def test_score_models_existing_loop_recurrence_and_boundary_edges():
+    record = _record()
+    record["nodes"] = [
+        _operation(4, "PIPE_V", "pto.tadd"),
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 11,
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
+        _operation(0, "PIPE_V", "pto.tadd", [10]),
+        _operation(1, "PIPE_MTE2", "pto.tload", [10]),
+        _operation(2, "PIPE_V", "pto.tmuls", [10]),
+        _operation(3, "PIPE_MTE2", "pto.tload", [10]),
+        {
+            "id": 11,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 11,
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
+        _operation(5, "PIPE_MTE2", "pto.tload"),
+    ]
+    record["sync_edges"] = [
+        {"source": 4, "target": 10, "group": 0, "loop_carried": False},
+        {"source": 10, "target": 1, "group": 1, "loop_carried": False},
+        {"source": 1, "target": 0, "group": 4, "loop_carried": False},
+        {"source": 2, "target": 1, "group": 2, "loop_carried": True},
+        {"source": 2, "target": 11, "group": 3, "loop_carried": False},
+        {"source": 11, "target": 5, "group": 5, "loop_carried": False},
+    ]
+    record["sync_groups"] = [
+        {
+            "id": 2,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_MTE2",
+            "operations": [
+                {"node": 2, "type": "set_flag", "loop_end": 11},
+                {"node": 1, "type": "wait_flag", "loop_end": 11},
+            ],
+        }
+    ]
 
     result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
 
+    model = result["loop_sync_models"][0]
+    assert model["static_trip_count"] == 4
+    assert model["recurrence_ii_lower_bound_cycles"] == 30.0
+    assert model["ii_lower_bound_cycles"] == 30.0
+    assert model["loop_carried_recurrences"] == [
+        {"source": 2, "target": 1, "group": 2, "cycles": 30.0, "path": [1, 0, 2]}
+    ]
+    assert model["loop_boundary_sync_edges"] == [
+        {"source": 4, "target": 10, "group": 0, "kind": "loop_entry"},
+        {"source": 10, "target": 1, "group": 1, "kind": "loop_entry"},
+        {"source": 2, "target": 11, "group": 3, "kind": "loop_exit"},
+        {"source": 11, "target": 5, "group": 5, "kind": "loop_exit"},
+    ]
     assert result["excluded_loop_carried_sync_edges"] == 1
-    assert result["full_makespan_cycles"] == result["baseline_makespan_cycles"]
-    assert result["sync_edge_exposure"] == []
+    assert result["excluded_non_operation_sync_edges"] == 0
+
+
+def test_cross_loop_end_to_begin_is_exit_then_entry():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 11,
+            "static_trip_count": 2,
+            "loop_stack": [],
+        },
+        _operation(0, "PIPE_V", "pto.tadd", [10]),
+        {
+            "id": 11,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 11,
+            "static_trip_count": 2,
+            "loop_stack": [],
+        },
+        {
+            "id": 20,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 20,
+            "end": 21,
+            "static_trip_count": 3,
+            "loop_stack": [],
+        },
+        _operation(1, "PIPE_MTE2", "pto.tload", [20]),
+        {
+            "id": 21,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 20,
+            "end": 21,
+            "static_trip_count": 3,
+            "loop_stack": [],
+        },
+    ]
+    record["stream_edges"] = []
+    record["sync_edges"] = [{"source": 11, "target": 20, "group": 7, "loop_carried": False}]
+
+    result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+    first, second = result["loop_sync_models"]
+    assert first["loop_boundary_sync_edges"] == [
+        {"source": 11, "target": 20, "group": 7, "kind": "loop_exit"}
+    ]
+    assert second["loop_boundary_sync_edges"] == [
+        {"source": 11, "target": 20, "group": 7, "kind": "loop_entry"}
+    ]
 
 
 def test_score_rejects_non_loop_cycle():
@@ -361,6 +490,40 @@ def _loop_candidate_record(*, with_return_path: bool = False) -> dict:
     if with_return_path:
         record["sync_edges"] = [{"source": 1, "target": 0, "group": 7, "loop_carried": False}]
     return record
+
+
+@pytest.mark.parametrize("defect", ["missing_group", "unmatched_loop_end", "endpoint_outside"])
+def test_existing_loop_recurrence_metadata_fails_closed(defect):
+    record = _loop_candidate_record(with_return_path=True)
+    source, target = 2, 1
+    loop_end = 20
+    if defect == "endpoint_outside":
+        record["nodes"].append(_operation(4, "PIPE_MTE2", "pto.tload"))
+        target = 4
+    record["sync_edges"].append({"source": source, "target": target, "group": 8, "loop_carried": True})
+    if defect != "missing_group":
+        record["sync_groups"] = [
+            {
+                "id": 8,
+                "src_pipe": "PIPE_V",
+                "dst_pipe": "PIPE_MTE2",
+                "operations": [
+                    {
+                        "node": source,
+                        "type": "set_flag",
+                        "loop_end": 99 if defect == "unmatched_loop_end" else loop_end,
+                    },
+                    {
+                        "node": target,
+                        "type": "wait_flag",
+                        "loop_end": 99 if defect == "unmatched_loop_end" else loop_end,
+                    },
+                ],
+            }
+        ]
+
+    with pytest.raises(ValueError, match="does not resolve to exactly one loop model"):
+        dsa_schedule_model.score_schedule(record, _ten_cycle_model())
 
 
 def test_candidate_score_reports_zero_loop_recurrence_weight_without_return_path():

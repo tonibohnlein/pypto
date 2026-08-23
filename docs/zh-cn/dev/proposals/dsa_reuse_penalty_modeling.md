@@ -171,11 +171,11 @@ critical path 评估每条 synchronization edge。这与简单统计 synchroniza
 不同：如果一条 edge 的延迟已经被 critical path 上的工作覆盖，它的 exposure 为零。
 
 在 whole-function DAG 中，静态 loop 按 trip count 聚合。由于模型没有可靠的
-multiplier，动态 loop 会直接失败。loop-carried synchronization edge 以及连接 loop
-marker 的 edge 会从该 DAG 中排除并显式报告；candidate 评分会用下文的 recurrence
-lower bound 单独处理 loop-carried edge。legacy trace import 还可能遗漏 barrier dependency
-node；此时，即使导入后的 graph 中看不到被排除的 edge，`latency_graph_complete` 也为
-false。
+multiplier，动态 loop 会直接失败。loop-carried synchronization edge 会从该无环 DAG
+中排除，并由下文的 recurrence lower bound 单独处理。有效的 loop-marker endpoint 会作为
+duration 为零的 node 保留在结构图中；只有确实未出现在导入图中的 endpoint 才会被排除并
+报告。legacy trace import 还可能遗漏 barrier dependency node；此时，即使导入后的 graph
+中看不到被排除的 edge，`latency_graph_complete` 也为 false。
 
 exporter 暴露的是 SyncCodegen lowering 之前的 active Final-SyncIR record。这些 record
 不是 synchronization instruction：codegen 可能合并相同的 set/wait operation 和相邻
@@ -183,6 +183,25 @@ barrier。因此模型将它们报告为 `pre_codegen_sync_record_summary`。can
 另一个显式标为假设量的 `sync_endpoint_estimator_version`；其中 source 加 target 的执行
 次数是未合并的 pressure feature，并非观测到的 instruction count。每个 placement arm
 实际的 post-InsertSync instruction summary 必须从 lowering 后的 IR 中采集。
+
+`loop_sync_ii_and_boundary_v1` 模型会在结构图中保留 duration 为零的 loop marker，
+分别报告 loop-entry 与 loop-exit synchronization，并把每条已识别的 distance-one
+loop-carried dependency 建模为 initiation interval 的 recurrence lower bound。它仍然只是
+lower bound：不会声称得到 modulo schedule，也不包含有限 event slot 分配的影响。
+
+实际的逐 arm instruction collector 读取由 lowering 后 post-InsertSync PTO 文件组成的
+manifest。如果仍存在高层 `record_event`/`wait_event` operation，它会直接失败；它还要求
+每个 case/capacity 都包含声明的完整 arm 与 function 集合，并统计 lowering 后 IR 中实际
+存在的 synchronization instruction site。它还会按照带版本的
+`event_key_lexical_and_innermost_backedge_v1` contract 推断候选 event lifecycle
+transition。这些 transition 并非直接 emitted fact：event ID 可以复用，而且 lowering 后
+IR 不再保留 Final-SyncIR group identity。因此推断结果与实际 instruction-site count 分开
+报告：
+
+```bash
+python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \
+    -o post-sync-summary.json
+```
 
 operation duration 由 provider snapshot 提供；
 该 snapshot 从 `runtime/pto_isa.pin` 指定的精确 PTO-ISA revision 加载，并包含 A2/A3
