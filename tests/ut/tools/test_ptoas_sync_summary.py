@@ -98,5 +98,174 @@ def test_main_writes_function_keyed_json(tmp_path):
     assert json.loads(output.read_text())["aiv"]["metrics"]["active_sync_groups"] == -1
 
 
+def _lowered_loop_pto() -> str:
+    return """
+module {
+  func.func @kernel() {
+    // pto.set_flag[<PIPE_M>, <PIPE_FIX>, <EVENT_ID7>] must not be counted.
+    pto.set_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
+    scf.for %i = %c0 to %c4 step %c1 {
+      pto.wait_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
+      pto.barrier <PIPE_V>
+      pto.set_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
+    }
+    pto.wait_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
+    return
+  }
+}
+"""
+
+
+def test_summarize_lowered_pto_models_loop_entry_carried_and_exit_transitions():
+    summary = ptoas_sync_summary.summarize_lowered_pto(_lowered_loop_pto())["kernel"]
+
+    assert summary["summary_kind"] == "actual_post_insert_sync_lowered_ir_v1"
+    assert summary["instruction_site_count"] == 5
+    assert summary["instruction_sites_by_type"] == {
+        "barrier": 1,
+        "set_flag": 2,
+        "wait_flag": 2,
+    }
+    assert summary["inside_loop_instruction_sites"] == 3
+    assert summary["outside_loop_instruction_sites"] == 2
+    assert summary["inferred_transition_counts"] == {
+        "loop_carried": 1,
+        "loop_entry": 1,
+        "loop_exit": 1,
+        "same_scope_rearm": 1,
+    }
+    loop_carried = [
+        transition
+        for transition in summary["inferred_event_transitions"]
+        if transition["kind"] == "loop_carried"
+    ]
+    assert loop_carried == [
+        {
+            "src_pipe": "PIPE_MTE2",
+            "dst_pipe": "PIPE_V",
+            "event": "EVENT_ID0",
+            "from_line": 9,
+            "to_line": 7,
+            "from_type": "set_flag",
+            "to_type": "wait_flag",
+            "kind": "loop_carried",
+            "basis": "inferred_loop_backedge",
+            "loop": 6,
+        }
+    ]
+
+
+def test_summarize_lowered_pto_rejects_unlowered_event_ops():
+    pto = """
+module {
+  func.func @kernel() {
+    pto.record_event [#pto.pipe_event_type<TLOAD>, #pto.pipe_event_type<TVEC>, #pto.event<EVENT_ID0>]
+    return
+  }
+}
+"""
+    with pytest.raises(ValueError, match="high-level event op remains"):
+        ptoas_sync_summary.summarize_lowered_pto(pto)
+
+
+def test_arm_manifest_requires_and_summarizes_every_declared_arm(tmp_path):
+    pto = tmp_path / "kernel.pto"
+    pto.write_text(_lowered_loop_pto())
+    manifest = tmp_path / "arms.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expected_arms": ["geometry_ff", "dsa_rp_cg"],
+                "cells": [
+                    {
+                        "case": "rms_norm",
+                        "capacity": "tight",
+                        "arm": arm,
+                        "post_insert_sync_pto": pto.name,
+                        "function": "kernel",
+                    }
+                    for arm in ("geometry_ff", "dsa_rp_cg")
+                ],
+            }
+        )
+    )
+
+    result = ptoas_sync_summary.summarize_arm_manifest(manifest)
+
+    assert result["summary_kind"] == "actual_post_insert_sync_per_arm_v1"
+    assert result["cell_count"] == 2
+    assert result["function_summary_count"] == 2
+    assert {row["arm"] for row in result["cells"]} == {"geometry_ff", "dsa_rp_cg"}
+
+
+def test_arm_manifest_rejects_incomplete_arm_coverage(tmp_path):
+    pto = tmp_path / "kernel.pto"
+    pto.write_text(_lowered_loop_pto())
+    manifest = tmp_path / "arms.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expected_arms": ["geometry_ff", "dsa_rp_cg"],
+                "cells": [
+                    {
+                        "case": "rms_norm",
+                        "capacity": "tight",
+                        "arm": "geometry_ff",
+                        "post_insert_sync_pto": pto.name,
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="arm coverage mismatch"):
+        ptoas_sync_summary.summarize_arm_manifest(manifest)
+
+
+def test_arm_manifest_rejects_different_function_sets(tmp_path):
+    pto = tmp_path / "kernels.pto"
+    pto.write_text(
+        _lowered_loop_pto()
+        + """
+module {
+  func.func @other() {
+    pto.barrier <PIPE_ALL>
+    return
+  }
+}
+"""
+    )
+    manifest = tmp_path / "arms.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expected_arms": ["geometry_ff", "dsa_rp_cg"],
+                "cells": [
+                    {
+                        "case": "rms_norm",
+                        "capacity": "tight",
+                        "arm": "geometry_ff",
+                        "post_insert_sync_pto": pto.name,
+                        "function": "kernel",
+                    },
+                    {
+                        "case": "rms_norm",
+                        "capacity": "tight",
+                        "arm": "dsa_rp_cg",
+                        "post_insert_sync_pto": pto.name,
+                        "function": "other",
+                    },
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="function-set mismatch"):
+        ptoas_sync_summary.summarize_arm_manifest(manifest)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

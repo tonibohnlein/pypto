@@ -993,6 +993,24 @@ def estimate_node_durations(
     return durations, provenance, dynamic_loops
 
 
+def _schedule_graph_durations(
+    record: Mapping[str, Any], operation_durations: Mapping[int, float]
+) -> dict[int, float]:
+    """Add zero-duration structural loop markers to operation durations."""
+    durations = dict(operation_durations)
+    for node in record.get("nodes", []):
+        if not isinstance(node, Mapping):
+            continue
+        node_id = node.get("id")
+        if not isinstance(node_id, int):
+            continue
+        if node_id in durations:
+            continue
+        if node.get("kind") == "loop":
+            durations[node_id] = 0.0
+    return durations
+
+
 def _graph_edges(
     record: Mapping[str, Any], node_ids: set[int], *, include_sync: bool
 ) -> tuple[list[tuple[int, int, float, str, int | None]], dict[str, int]]:
@@ -1288,6 +1306,193 @@ def _loop_recurrence_score(
     }
 
 
+def _resolve_loop_carried_sync_edges(
+    sync_edges: Sequence[Mapping[str, Any]],
+    groups: Mapping[int, Mapping[str, Any]],
+    loops: Sequence[Mapping[str, Any]],
+    operation_ids_by_loop: Mapping[int, set[int]],
+) -> dict[int, int]:
+    """Resolve every loop-carried sync edge to exactly one loop."""
+    resolved_loop_carried: dict[int, int] = {}
+    for edge_index, edge in enumerate(sync_edges):
+        if not edge.get("loop_carried"):
+            continue
+        source, target = edge.get("source"), edge.get("target")
+        if not isinstance(source, int) or not isinstance(target, int):
+            raise ValueError(f"loop-carried sync edge {edge_index} has invalid endpoints")
+        group = groups.get(edge.get("group"))
+        operations = group.get("operations", []) if isinstance(group, Mapping) else []
+        loop_ends = {
+            operation.get("loop_end")
+            for operation in operations
+            if isinstance(operation, Mapping) and isinstance(operation.get("loop_end"), int)
+        }
+        if isinstance(edge.get("loop_end"), int):
+            loop_ends.add(edge["loop_end"])
+        matching_loops = [
+            loop["id"]
+            for loop in loops
+            if loop.get("end") in loop_ends
+            and source in operation_ids_by_loop[loop["id"]]
+            and target in operation_ids_by_loop[loop["id"]]
+        ]
+        if len(matching_loops) != 1:
+            raise ValueError(
+                "loop-carried sync edge does not resolve to exactly one loop model: "
+                f"edge={source}->{target}, group={edge.get('group')}, "
+                f"loop_ends={sorted(loop_ends)}, matches={matching_loops}"
+            )
+        resolved_loop_carried[edge_index] = matching_loops[0]
+    return resolved_loop_carried
+
+
+def _loop_boundary_kind(
+    source: int,
+    target: int,
+    loop_id: int,
+    loop_end: Any,
+    nodes_by_id: Mapping[int, Mapping[str, Any]],
+) -> str | None:
+    """Classify a sync edge crossing one loop's structural boundary."""
+    source_node = nodes_by_id.get(source, {})
+    target_node = nodes_by_id.get(target, {})
+    source_inside = loop_id in source_node.get("loop_stack", [])
+    target_inside = loop_id in target_node.get("loop_stack", [])
+    source_marker = source in {loop_id, loop_end}
+    target_marker = target in {loop_id, loop_end}
+    if not (source_marker or target_marker or source_inside != target_inside):
+        return None
+    is_entry = (source == loop_id and target_inside) or (not source_inside and target == loop_id)
+    is_entry |= not source_marker and not source_inside and target_inside
+    is_exit = (source_inside and target == loop_end) or (source == loop_end and not target_inside)
+    is_exit |= not target_marker and source_inside and not target_inside
+    if is_entry and not is_exit:
+        return "loop_entry"
+    if is_exit and not is_entry:
+        return "loop_exit"
+    return "loop_boundary"
+
+
+def _existing_loop_sync_models(
+    record: Mapping[str, Any],
+    operation_durations: Mapping[int, float],
+    graph_edges: Sequence[tuple[int, int, float, str, int | None]],
+    sync_latency_cycles: float,
+) -> list[dict[str, Any]]:
+    """Model existing loop-carried recurrences and loop-boundary sync edges."""
+    nodes_by_id = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
+    }
+    operation_nodes = {
+        node_id: node
+        for node_id, node in nodes_by_id.items()
+        if node.get("kind") == "operation" and node_id in operation_durations
+    }
+    groups = {
+        group.get("id"): group
+        for group in record.get("sync_groups", [])
+        if isinstance(group, Mapping) and isinstance(group.get("id"), int)
+    }
+    loop_counts, dynamic_loops = _loop_multipliers(record)
+    loops = [
+        loop
+        for loop in record.get("nodes", [])
+        if isinstance(loop, Mapping)
+        and loop.get("kind") == "loop"
+        and loop.get("loop_kind") == "LOOP_BEGIN"
+        and isinstance(loop.get("id"), int)
+    ]
+    operation_ids_by_loop = {
+        loop["id"]: {
+            node_id for node_id, node in operation_nodes.items() if loop["id"] in node.get("loop_stack", [])
+        }
+        for loop in loops
+    }
+    sync_edges = [edge for edge in record.get("sync_edges", []) if isinstance(edge, Mapping)]
+    resolved_loop_carried = _resolve_loop_carried_sync_edges(sync_edges, groups, loops, operation_ids_by_loop)
+
+    models: list[dict[str, Any]] = []
+    for loop in loops:
+        loop_id = loop["id"]
+        loop_end = loop.get("end")
+        loop_operation_ids = operation_ids_by_loop[loop_id]
+        iteration_durations: dict[int, float] = {}
+        pipe_work: dict[str, float] = defaultdict(float)
+        for node_id in loop_operation_ids:
+            node = operation_nodes[node_id]
+            loop_stack = node.get("loop_stack", [])
+            selected_index = loop_stack.index(loop_id)
+            divisor = math.prod(
+                loop_counts.get(containing_loop, 1) for containing_loop in loop_stack[: selected_index + 1]
+            )
+            duration = operation_durations[node_id] / max(divisor, 1)
+            iteration_durations[node_id] = duration
+            pipe = node.get("pipe")
+            if isinstance(pipe, str):
+                pipe_work[pipe] += duration
+        body_edges = [
+            edge for edge in graph_edges if edge[0] in loop_operation_ids and edge[1] in loop_operation_ids
+        ]
+
+        recurrences: list[dict[str, Any]] = []
+        boundary_edges: list[dict[str, Any]] = []
+        for edge_index, edge in enumerate(sync_edges):
+            source, target = edge.get("source"), edge.get("target")
+            if not isinstance(source, int) or not isinstance(target, int):
+                continue
+            if edge.get("loop_carried"):
+                if resolved_loop_carried[edge_index] != loop_id:
+                    continue
+                recurrence_path = _longest_path_between(iteration_durations, body_edges, target, source)
+                recurrences.append(
+                    {
+                        "source": source,
+                        "target": target,
+                        "group": edge.get("group"),
+                        "cycles": (
+                            None if recurrence_path is None else recurrence_path[0] + sync_latency_cycles
+                        ),
+                        "path": None if recurrence_path is None else recurrence_path[1],
+                    }
+                )
+                continue
+
+            boundary_kind = _loop_boundary_kind(source, target, loop_id, loop_end, nodes_by_id)
+            if boundary_kind is not None:
+                boundary_edges.append(
+                    {
+                        "source": source,
+                        "target": target,
+                        "group": edge.get("group"),
+                        "kind": boundary_kind,
+                    }
+                )
+
+        recurrence_bound = max(
+            (float(item["cycles"]) for item in recurrences if item["cycles"] is not None),
+            default=0.0,
+        )
+        resource_bound = max(pipe_work.values(), default=0.0)
+        models.append(
+            {
+                "model_version": "loop_sync_ii_and_boundary_v1",
+                "loop_node": loop_id,
+                "loop_end_node": loop_end,
+                "static_trip_count": None if loop_id in dynamic_loops else loop_counts.get(loop_id, 1),
+                "operation_node_count": len(loop_operation_ids),
+                "pipe_work_cycles": dict(sorted(pipe_work.items())),
+                "resource_ii_lower_bound_cycles": resource_bound,
+                "recurrence_ii_lower_bound_cycles": recurrence_bound,
+                "ii_lower_bound_cycles": max(resource_bound, recurrence_bound),
+                "loop_carried_recurrences": recurrences,
+                "loop_boundary_sync_edges": boundary_edges,
+            }
+        )
+    return models
+
+
 def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str, Any]:
     """Score one PTOAS schedule graph and its synchronization exposure."""
     branch_ids = [
@@ -1300,11 +1505,12 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
             "duration_v0 does not model mutually exclusive control-flow branches; "
             f"branch nodes: {branch_ids[:8]}"
         )
-    durations, provenance, dynamic_loops = estimate_node_durations(record, model)
+    operation_durations, provenance, dynamic_loops = estimate_node_durations(record, model)
     if dynamic_loops:
         raise ValueError(
             f"duration_v0 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
         )
+    durations = _schedule_graph_durations(record, operation_durations)
     node_ids = set(durations)
     stream_edges, _ = _graph_edges(record, node_ids, include_sync=False)
     full_edges, edge_diagnostics = _graph_edges(record, node_ids, include_sync=True)
@@ -1312,6 +1518,9 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         (source, target, model.sync_latency_cycles if kind == "sync" else latency, kind, group)
         for source, target, latency, kind, group in full_edges
     ]
+    loop_sync_models = _existing_loop_sync_models(
+        record, operation_durations, full_edges, model.sync_latency_cycles
+    )
 
     baseline, top, bottom, baseline_path = _longest_path(durations, stream_edges)
     full, _, _, full_path = _longest_path(durations, full_edges)
@@ -1348,13 +1557,15 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "duration_model_version": model.model_version,
         "calibration_status": model.calibration_status,
         "loop_policy": "aggregate_static_work_v0",
+        "loop_sync_model_version": "loop_sync_ii_and_boundary_v1",
+        "loop_sync_models": loop_sync_models,
         "dynamic_loop_ids": dynamic_loops,
         **edge_diagnostics,
         **_latency_graph_completeness(record, edge_diagnostics),
-        "operation_nodes": len(durations),
+        "operation_nodes": len(operation_durations),
         "exact_duration_nodes": exact,
         "fallback_duration_nodes": fallback,
-        "exact_duration_coverage": exact / len(durations) if durations else 0.0,
+        "exact_duration_coverage": exact / len(operation_durations) if operation_durations else 0.0,
         "duration_source_counts": dict(sorted(source_counts.items())),
         "pto_isa_provider": (
             {
@@ -1879,11 +2090,12 @@ def score_reuse_candidates(
             "duration_v0 does not model mutually exclusive control-flow branches; "
             f"branch nodes: {branch_ids[:8]}"
         )
-    durations, provenance, dynamic_loops = estimate_node_durations(record, model)
+    operation_durations, provenance, dynamic_loops = estimate_node_durations(record, model)
     if dynamic_loops:
         raise ValueError(
             f"duration_v0 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
         )
+    durations = _schedule_graph_durations(record, operation_durations)
     node_ids = set(durations)
     existing_edges, edge_diagnostics = _graph_edges(record, node_ids, include_sync=True)
     existing_edges = [
@@ -1949,7 +2161,7 @@ def score_reuse_candidates(
                 )
             recurrence = _loop_recurrence_score(
                 record,
-                durations,
+                operation_durations,
                 existing_edges,
                 loop_id=common_loops[-1],
                 source=source,
@@ -2059,6 +2271,9 @@ def score_reuse_candidates(
             for edge in loop_edge_groups
         },
     )
+    baseline_loop_sync_models = _existing_loop_sync_models(
+        record, operation_durations, existing_edges, model.sync_latency_cycles
+    )
 
     return {
         "schema_version": 2,
@@ -2070,6 +2285,8 @@ def score_reuse_candidates(
         "base_makespan_cycles": base_makespan,
         "base_critical_path": base_path,
         "dynamic_loop_ids": dynamic_loops,
+        "loop_sync_model_version": "loop_sync_ii_and_boundary_v1",
+        "baseline_loop_sync_models": baseline_loop_sync_models,
         **edge_diagnostics,
         **_latency_graph_completeness(record, edge_diagnostics),
         "candidate_count": len(candidates),
