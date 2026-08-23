@@ -192,7 +192,8 @@ and known allocation sizes. `pypto.tools.dsa_schedule_model` assigns operation
 durations and evaluates two directed acyclic graphs:
 
 - a baseline containing only per-pipe stream edges; and
-- the complete graph after adding non-loop-carried synchronization edges.
+- the collapsed operation-only graph after adding synchronization edges whose
+  endpoints are both represented operation nodes.
 
 Version 0 reports the difference between their longest paths as
 `synchronization_exposure_cycles`. It also evaluates every synchronization
@@ -202,9 +203,23 @@ covered by work already on the critical path.
 
 Static loops are aggregated by their trip count in the whole-function DAG.
 Dynamic loops fail closed because the model has no defensible multiplier.
-Loop-carried synchronization edges are excluded from that DAG and reported;
-candidate scoring handles them separately with the recurrence lower bound
-described below. Operation durations come from
+Loop-carried synchronization edges and edges incident to loop markers are
+excluded from that DAG and reported; candidate scoring handles loop-carried
+edges separately with the recurrence lower bound described below. Legacy trace
+imports may also omit barrier dependency nodes. In that case
+`latency_graph_complete` is false even if no excluded edge is visible in the
+imported graph.
+
+The exporter exposes active Final-SyncIR records before SyncCodegen lowering.
+Those records are not synchronization instructions: codegen can coalesce
+identical set/wait operations and neighboring barriers. The model therefore
+reports them as `pre_codegen_sync_record_summary`. Candidate reuse uses a
+separate, explicitly hypothetical `sync_endpoint_estimator_version`; its
+source-plus-target execution count is an uncoalesced pressure feature, not an
+observed instruction count. Actual post-InsertSync instruction summaries must
+be collected from lowered IR for each placement arm.
+
+Operation durations come from
 a provider snapshot loaded from the exact PTO-ISA revision in
 `runtime/pto_isa.pin`. The snapshot includes the fitted A2/A3 formula rows,
 transfer bandwidths, frequency, source hashes, and the full revision.

@@ -163,16 +163,28 @@ synchronization edge、loop membership 与已知 allocation size。
 `pypto.tools.dsa_schedule_model` 为 operation 赋予 duration，并计算两个有向无环图：
 
 - 只包含每条 pipe stream edge 的 baseline；
-- 加入非 loop-carried synchronization edge 后的完整图。
+- 加入端点均为已表示 operation node 的 synchronization edge 后，得到折叠的
+  operation-only graph。
 
 版本 0 把两者最长路径之差报告为 `synchronization_exposure_cycles`，并相对 baseline
 critical path 评估每条 synchronization edge。这与简单统计 synchronization group
 不同：如果一条 edge 的延迟已经被 critical path 上的工作覆盖，它的 exposure 为零。
 
 在 whole-function DAG 中，静态 loop 按 trip count 聚合。由于模型没有可靠的
-multiplier，动态 loop 会直接失败。loop-carried synchronization edge 会从该 DAG 中排除
-并显式报告；candidate 评分会用下文的 recurrence lower bound 单独处理它们。operation
-duration 由 provider snapshot 提供；
+multiplier，动态 loop 会直接失败。loop-carried synchronization edge 以及连接 loop
+marker 的 edge 会从该 DAG 中排除并显式报告；candidate 评分会用下文的 recurrence
+lower bound 单独处理 loop-carried edge。legacy trace import 还可能遗漏 barrier dependency
+node；此时，即使导入后的 graph 中看不到被排除的 edge，`latency_graph_complete` 也为
+false。
+
+exporter 暴露的是 SyncCodegen lowering 之前的 active Final-SyncIR record。这些 record
+不是 synchronization instruction：codegen 可能合并相同的 set/wait operation 和相邻
+barrier。因此模型将它们报告为 `pre_codegen_sync_record_summary`。candidate reuse 使用
+另一个显式标为假设量的 `sync_endpoint_estimator_version`；其中 source 加 target 的执行
+次数是未合并的 pressure feature，并非观测到的 instruction count。每个 placement arm
+实际的 post-InsertSync instruction summary 必须从 lowering 后的 IR 中采集。
+
+operation duration 由 provider snapshot 提供；
 该 snapshot 从 `runtime/pto_isa.pin` 指定的精确 PTO-ISA revision 加载，并包含 A2/A3
 拟合公式、传输带宽、频率、源文件哈希和完整 revision。默认情况下，不支持的 operation
 会直接失败。探索性运行可以显式选择 `--unsupported-policy fallback`，但每个 fallback
