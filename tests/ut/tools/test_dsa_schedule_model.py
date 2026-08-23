@@ -110,6 +110,8 @@ def test_score_computes_full_and_singleton_exposure():
         }
     ]
     assert result["full_critical_path"] == [0, 2, 1, 3]
+    assert result["latency_graph_complete"] is True
+    assert result["latency_graph_limitations"] == []
 
 
 def test_score_aggregates_static_loop_work():
@@ -131,6 +133,102 @@ def test_score_aggregates_static_loop_work():
     assert result["dynamic_loop_ids"] == []
     assert result["node_durations"]["0"]["loop_multiplier"] == 4
     assert result["loop_policy"] == "aggregate_static_work_v0"
+
+
+def test_score_reports_pre_codegen_sync_records_separately_from_latency():
+    record = _record(sync_edges=[{"source": 0, "target": 1, "group": 7, "loop_carried": False}])
+    record["nodes"].insert(
+        0,
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
+    )
+    record["nodes"].append(
+        {
+            "id": 11,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "static_trip_count": 4,
+            "loop_stack": [],
+        }
+    )
+    for node in record["nodes"]:
+        if node.get("kind") == "operation":
+            node["loop_stack"] = [10]
+    record["sync_groups"] = [
+        {
+            "id": 7,
+            "operations": [
+                {
+                    "node": 0,
+                    "type": "set_flag",
+                    "src_pipe": "PIPE_V",
+                    "dst_pipe": "PIPE_MTE2",
+                },
+                {
+                    "node": 1,
+                    "type": "wait_flag",
+                    "src_pipe": "PIPE_V",
+                    "dst_pipe": "PIPE_MTE2",
+                },
+            ],
+        }
+    ]
+    record["sync_edges"].append({"source": 11, "target": 1, "group": 8, "loop_carried": False})
+
+    result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+    assert result["pre_codegen_sync_record_summary"] == {
+        "model_version": "pre_codegen_sync_record_count_v1",
+        "group_count": 1,
+        "active_group_count": 1,
+        "record_count": 2,
+        "active_record_site_count": 2,
+        "useless_record_site_count": 0,
+        "active_record_execution_count": 8,
+        "active_record_sites_by_type": {"set_flag": 1, "wait_flag": 1},
+        "active_record_executions_by_type": {"set_flag": 4, "wait_flag": 4},
+        "active_record_sites_by_pipe_pair": {"PIPE_V->PIPE_MTE2": 2},
+        "active_record_executions_by_pipe_pair": {"PIPE_V->PIPE_MTE2": 8},
+    }
+    assert result["excluded_non_operation_sync_edges"] == 1
+    assert result["latency_graph_complete"] is False
+    assert result["latency_graph_limitations"] == ["excluded_non_operation_sync_edges"]
+
+
+def test_pre_codegen_sync_summary_keeps_duplicate_barrier_records_distinct():
+    record = _record()
+    record["sync_groups"] = [
+        {
+            "id": group_id,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "operations": [{"node": 1, "type": "pipe_barrier"}],
+        }
+        for group_id in (11, 12)
+    ]
+
+    summary = dsa_schedule_model.score_schedule(record, _ten_cycle_model())["pre_codegen_sync_record_summary"]
+
+    # These are two Final-SyncIR records. SyncCodegen may merge them into one
+    # emitted barrier, which is why this summary deliberately does not claim an
+    # instruction count.
+    assert summary["group_count"] == 2
+    assert summary["active_record_site_count"] == 2
+
+
+def test_latency_graph_is_incomplete_when_export_omits_barrier_dependencies():
+    record = _record()
+    record["export_limitations"] = {"barrier_dependency_nodes_missing": 1}
+
+    result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+    assert result["latency_graph_complete"] is False
+    assert result["latency_graph_limitations"] == ["export_limitations.barrier_dependency_nodes_missing"]
 
 
 def test_score_fails_closed_on_dynamic_loop():
@@ -191,6 +289,8 @@ def test_candidate_score_joins_access_sites_and_derives_non_negative_weight():
             "unit_cost": 1.0,
             "candidate_record_count": 1,
             "distance_zero_schedule_edges": [[2, 1]],
+            "loop_carried_schedule_edges": [],
+            "estimated_sync_endpoint_executions": 2,
             "distance_zero_weight_cycles": 20.0,
             "loop_ii_weight_cycles": 0,
             "loop_total_weight_cycles": 0,
@@ -226,12 +326,18 @@ def test_duplicate_distance_zero_candidates_do_not_inflate_group_or_summary():
         {
             "source_node": 2,
             "target_node": 1,
+            "source_pipe": "PIPE_V",
+            "target_pipe": "PIPE_MTE2",
             "candidate_indices": [0, 1],
             "candidate_count": 2,
+            "source_execution_count": 1,
+            "target_execution_count": 1,
+            "estimated_sync_endpoint_executions": 2,
             "weight_cycles": 20.0,
         }
     ]
     assert result["consumer_groups"][0]["singleton_weight_sum_cycles"] == 20.0
+    assert result["penalty_pair_weights"][0]["estimated_sync_endpoint_executions"] == 2
     assert result["candidate_weight_summary"]["distance_zero_weight_sum_cycles"] == 20.0
     assert result["candidate_weight_summary"]["unique_positive_edge_count"] == 1
 
@@ -291,6 +397,8 @@ def test_candidate_score_derives_loop_recurrence_ii_weight():
             "unit_cost": 1.0,
             "candidate_record_count": 1,
             "distance_zero_schedule_edges": [],
+            "loop_carried_schedule_edges": [[10, 2, 1]],
+            "estimated_sync_endpoint_executions": 8,
             "distance_zero_weight_cycles": 0.0,
             "loop_ii_weight_cycles": 10.0,
             "loop_total_weight_cycles": 30.0,
@@ -332,8 +440,20 @@ def test_existing_loop_recurrence_suppresses_duplicate_candidate_weight():
         {
             "id": 8,
             "operations": [
-                {"node": 2, "type": "set_flag", "loop_end": 20},
-                {"node": 1, "type": "wait_flag", "loop_end": 20},
+                {
+                    "node": 2,
+                    "type": "set_flag",
+                    "loop_end": 20,
+                    "src_pipe": "PIPE_V",
+                    "dst_pipe": "PIPE_MTE2",
+                },
+                {
+                    "node": 1,
+                    "type": "wait_flag",
+                    "loop_end": 20,
+                    "src_pipe": "PIPE_V",
+                    "dst_pipe": "PIPE_MTE2",
+                },
             ],
         }
     ]
@@ -368,12 +488,18 @@ def test_duplicate_loop_candidates_collapse_to_one_scored_recurrence_edge():
             "loop_node": 10,
             "source_node": 2,
             "target_node": 1,
+            "source_pipe": "PIPE_V",
+            "target_pipe": "PIPE_MTE2",
             "candidate_indices": [0, 1],
             "candidate_count": 2,
+            "source_execution_count": 4,
+            "target_execution_count": 4,
+            "estimated_sync_endpoint_executions": 8,
             "candidate_recurrence_cycles": 30.0,
             "weight_cycles": 10.0,
         }
     ]
+    assert result["penalty_pair_weights"][0]["estimated_sync_endpoint_executions"] == 8
 
 
 def test_candidate_score_fails_closed_without_access_provenance():
@@ -554,9 +680,31 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
     result = dsa_schedule_model.score_realized_reuse(problem, solution, candidate_scores)
 
     assert result["realized_pair_count"] == 1
+    assert result["realized_pair_count_without_induced_sync_edge"] == 0
     assert result["unit_realized_cost"] == 3.0
+    assert result["unit_realized_cost_without_induced_sync_edge"] == 0
     assert result["critical_path_realized_cost_cycles"] == 20.0
+    assert result["unique_induced_sync_edge_count"] == 1
+    assert result["estimated_sync_endpoint_executions"] == 2
+    assert result["estimated_sync_endpoint_executions_by_pipe_pair"] == {"PIPE_V->PIPE_MTE2": 2}
     assert result["pairs"][0]["overlap_bytes"] == 32
+
+    no_edge_scores = {
+        **candidate_scores,
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+        "penalty_pair_weights": [
+            {
+                **candidate_scores["penalty_pair_weights"][0],
+                "distance_zero_schedule_edges": [],
+                "loop_carried_schedule_edges": [],
+                "estimated_sync_endpoint_executions": 0,
+            }
+        ],
+    }
+    no_edge_result = dsa_schedule_model.score_realized_reuse(problem, solution, no_edge_scores)
+    assert no_edge_result["realized_pair_count_without_induced_sync_edge"] == 1
+    assert no_edge_result["unit_realized_cost_without_induced_sync_edge"] == 3.0
 
     solution.write_text(
         json.dumps(
@@ -570,8 +718,11 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
     )
     disjoint = dsa_schedule_model.score_realized_reuse(problem, solution, candidate_scores)
     assert disjoint["realized_pair_count"] == 0
+    assert disjoint["realized_pair_count_without_induced_sync_edge"] == 0
     assert disjoint["unit_realized_cost"] == 0
     assert disjoint["critical_path_realized_cost_cycles"] == 0
+    assert disjoint["unique_induced_sync_edge_count"] == 0
+    assert disjoint["estimated_sync_endpoint_executions"] == 0
 
 
 def test_realized_reuse_rejects_duplicate_placements(tmp_path):
@@ -606,6 +757,7 @@ def test_realized_reuse_rejects_duplicate_placements(tmp_path):
             problem,
             solution,
             {
+                "schema_version": 2,
                 "penalty_pair_weights": [
                     {
                         "first_buffer": 0,
@@ -614,8 +766,22 @@ def test_realized_reuse_rejects_duplicate_placements(tmp_path):
                         "unit_cost": 1,
                         "critical_path_weight_cycles": 10,
                     }
-                ]
+                ],
             },
+        )
+
+
+def test_realized_reuse_rejects_legacy_candidate_schema(tmp_path):
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.json"
+    problem.write_text(json.dumps({"problem": {"buffers": []}}))
+    solution.write_text(json.dumps({"placements": []}))
+
+    with pytest.raises(ValueError, match="expected schema_version=2, got 1"):
+        dsa_schedule_model.score_realized_reuse(
+            problem,
+            solution,
+            {"schema_version": 1, "penalty_pair_weights": []},
         )
 
 
@@ -1266,6 +1432,30 @@ def test_import_legacy_debug_reconstructs_streams_and_event_edges():
             "root_buffers": [],
         }
     ]
+    assert record["sync_groups"][0]["operations"][0]["event_ids"] == [0]
+    assert record["sync_groups"][0]["operations"][0]["useless"] is False
+
+
+def test_import_legacy_debug_preserves_but_does_not_activate_useless_sync():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tload [PIPE_MTE2]
+  POST: set_flag <PIPE_MTE2 -> PIPE_V> idx=3 useless eventIds=[0,1]
+[   1] COMPOUND pto.tadd [PIPE_V]
+  PRE : wait_flag <PIPE_MTE2 -> PIPE_V> idx=3 eventIds=[0,1]
+// ========================================= //
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel")
+    group = record["sync_groups"][0]
+
+    assert group["operations"][0]["useless"] is True
+    assert group["operations"][0]["event_ids"] == [0, 1]
+    assert record["sync_edges"] == []
+    summary = dsa_schedule_model._pre_codegen_sync_record_summary(record)
+    assert summary["record_count"] == 2
+    assert summary["active_record_site_count"] == 1
+    assert summary["useless_record_site_count"] == 1
 
 
 def test_import_legacy_debug_rejects_incomplete_log():

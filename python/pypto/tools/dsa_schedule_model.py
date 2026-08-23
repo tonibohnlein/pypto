@@ -23,7 +23,12 @@ Version 0 aggregates the work of statically bounded loops for whole-function
 DAG scores.  Candidate scoring additionally evaluates distance-one edges with
 a version-1 loop initiation-interval lower bound: the maximum of per-pipe work
 and every supported recurrence cycle.  This remains a structural model, not a
-cycle-accurate prediction.
+cycle-accurate prediction.  Active Final-SyncIR records and hypothetical
+candidate synchronization endpoints are reported separately: a redundant
+precedence edge can have zero DAG extension while still creating synchronization
+pressure.  These are explicitly pre-codegen quantities, not counts of emitted
+instructions.  Scores also disclose every loop-carried, loop-marker, or omitted
+barrier dependency that the collapsed operation-only DAG cannot represent.
 """
 
 import argparse
@@ -64,8 +69,10 @@ _DEBUG_LOOP_RE = re.compile(r"^\s*\[\s*(\d+)\]\s+LOOP\s+(LOOP_BEGIN|LOOP_END)\s+
 _DEBUG_MEM_RE = re.compile(r"^\s*(def|use)=\[(.*)\]\s*$")
 _DEBUG_MEM_ITEM_RE = re.compile(r"(%[^,(\s]+)\(([^)]+)\)")
 _DEBUG_SYNC_RE = re.compile(
-    r"^\s*(PRE|POST)\s*:?[ ]*(\w+)\s+<(\S+)\s+->\s+(\S+)>\s+idx=(\d+)(?:\s+forEnd=(\d+))?"
+    r"^\s*(PRE|POST)\s*:?[ ]*(\w+)\s+<(\S+)\s+->\s+(\S+)>\s+idx=(\d+)"
+    r"(?:\s+forEnd=(\d+))?(.*)$"
 )
+_DEBUG_EVENT_IDS_RE = re.compile(r"\beventIds=\[([^]]*)\]")
 _ACCESS_LOCATION_RE = re.compile(r"pypto\.access\.(\d+)")
 _PTO_OPERATION_RE = re.compile(r"(?<![!\w.])(pto\.[A-Za-z0-9_]+)\b")
 _PTO_CONSTANT_RE = re.compile(
@@ -543,6 +550,13 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
 
         if current_node is not None and (match := _DEBUG_SYNC_RE.match(line)):
             sync_index = int(match.group(5))
+            suffix = match.group(7)
+            event_ids_match = _DEBUG_EVENT_IDS_RE.search(suffix)
+            event_ids = (
+                [int(value) for value in event_ids_match.group(1).split(",") if value]
+                if event_ids_match
+                else []
+            )
             sync_operations[sync_index].append(
                 {
                     "placement": match.group(1),
@@ -551,6 +565,8 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
                     "src_pipe": match.group(3),
                     "dst_pipe": match.group(4),
                     "loop_end": int(match.group(6)) if match.group(6) else None,
+                    "event_ids": event_ids,
+                    "useless": bool(re.search(r"\buseless\b", suffix)),
                 }
             )
 
@@ -568,11 +584,16 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
     omitted_barriers = 0
     for sync_index in sorted(sync_operations):
         operations = sync_operations[sync_index]
-        representative = operations[0]
-        loop_carried = any(operation["loop_end"] is not None for operation in operations)
-        sources = sorted({operation["node"] for operation in operations if operation["type"] == "set_flag"})
-        targets = sorted({operation["node"] for operation in operations if operation["type"] == "wait_flag"})
-        if not sources and any(operation["type"] == "pipe_barrier" for operation in operations):
+        active_operations = [operation for operation in operations if not operation["useless"]]
+        representative = active_operations[0] if active_operations else operations[0]
+        loop_carried = any(operation["loop_end"] is not None for operation in active_operations)
+        sources = sorted(
+            {operation["node"] for operation in active_operations if operation["type"] == "set_flag"}
+        )
+        targets = sorted(
+            {operation["node"] for operation in active_operations if operation["type"] == "wait_flag"}
+        )
+        if not sources and any(operation["type"] == "pipe_barrier" for operation in active_operations):
             omitted_barriers += 1
         group_id = len(sync_groups)
         sync_groups.append(
@@ -774,6 +795,121 @@ def _loop_multipliers(record: Mapping[str, Any]) -> tuple[dict[int, int], list[i
     return loop_counts, dynamic_loops
 
 
+def _node_execution_counts(record: Mapping[str, Any]) -> tuple[dict[int, int], list[int]]:
+    """Return statically determined executions for every exported schedule node."""
+    loop_counts, dynamic_loops = _loop_multipliers(record)
+    counts: dict[int, int] = {}
+    for node in record.get("nodes", []):
+        if not isinstance(node, Mapping) or not isinstance(node.get("id"), int):
+            continue
+        multiplier = 1
+        loop_stack = node.get("loop_stack", [])
+        if not isinstance(loop_stack, list) or not all(isinstance(loop, int) for loop in loop_stack):
+            raise ValueError(f"schedule node {node['id']} has an invalid loop stack")
+        for loop_id in loop_stack:
+            multiplier *= loop_counts.get(loop_id, 1)
+        counts[node["id"]] = multiplier
+    return counts, dynamic_loops
+
+
+def _pre_codegen_sync_record_summary(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Count Final-SyncIR records before SyncCodegen lowering and deduplication.
+
+    Native JSON exports already omit tombstoned records. Legacy text imports
+    preserve the ``useless`` marker and exclude those records from active
+    counts. Even active records are not emitted-instruction counts: SyncCodegen
+    can coalesce identical set/wait records and neighboring barriers.
+    """
+    execution_counts, dynamic_loops = _node_execution_counts(record)
+    if dynamic_loops:
+        raise ValueError(
+            f"static synchronization counts require bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
+        )
+
+    active_sites_by_type: Counter[str] = Counter()
+    active_executions_by_type: Counter[str] = Counter()
+    active_sites_by_pipe_pair: Counter[str] = Counter()
+    active_executions_by_pipe_pair: Counter[str] = Counter()
+    record_count = 0
+    useless_record_count = 0
+    group_count = 0
+    active_group_count = 0
+    for group in record.get("sync_groups", []):
+        if not isinstance(group, Mapping):
+            raise ValueError("schedule synchronization group must be an object")
+        operations = group.get("operations")
+        if not isinstance(operations, list):
+            raise ValueError(f"schedule synchronization group {group.get('id')} has no operations")
+        group_count += 1
+        group_active = False
+        for operation in operations:
+            if not isinstance(operation, Mapping):
+                raise ValueError(f"schedule synchronization group {group.get('id')} has an invalid operation")
+            node_id = operation.get("node")
+            kind = operation.get("type")
+            source_pipe = operation.get("src_pipe", group.get("src_pipe"))
+            target_pipe = operation.get("dst_pipe", group.get("dst_pipe"))
+            if (
+                not isinstance(node_id, int)
+                or node_id not in execution_counts
+                or not isinstance(kind, str)
+                or not isinstance(source_pipe, str)
+                or not isinstance(target_pipe, str)
+            ):
+                raise ValueError(
+                    f"schedule synchronization group {group.get('id')} has incomplete operation metadata"
+                )
+            record_count += 1
+            if operation.get("useless") is True:
+                useless_record_count += 1
+                continue
+            group_active = True
+            executions = execution_counts[node_id]
+            pipe_pair = f"{source_pipe}->{target_pipe}"
+            active_sites_by_type[kind] += 1
+            active_executions_by_type[kind] += executions
+            active_sites_by_pipe_pair[pipe_pair] += 1
+            active_executions_by_pipe_pair[pipe_pair] += executions
+        active_group_count += int(group_active)
+
+    return {
+        "model_version": "pre_codegen_sync_record_count_v1",
+        "group_count": group_count,
+        "active_group_count": active_group_count,
+        "record_count": record_count,
+        "active_record_site_count": sum(active_sites_by_type.values()),
+        "useless_record_site_count": useless_record_count,
+        "active_record_execution_count": sum(active_executions_by_type.values()),
+        "active_record_sites_by_type": dict(sorted(active_sites_by_type.items())),
+        "active_record_executions_by_type": dict(sorted(active_executions_by_type.items())),
+        "active_record_sites_by_pipe_pair": dict(sorted(active_sites_by_pipe_pair.items())),
+        "active_record_executions_by_pipe_pair": dict(sorted(active_executions_by_pipe_pair.items())),
+    }
+
+
+def _latency_graph_completeness(
+    record: Mapping[str, Any], edge_diagnostics: Mapping[str, int]
+) -> dict[str, Any]:
+    limitations = [
+        name
+        for name in (
+            "excluded_loop_carried_sync_edges",
+            "excluded_non_operation_stream_edges",
+            "excluded_non_operation_sync_edges",
+        )
+        if edge_diagnostics.get(name, 0) > 0
+    ]
+    export_limitations = record.get("export_limitations", {})
+    if isinstance(export_limitations, Mapping) and export_limitations.get(
+        "barrier_dependency_nodes_missing", 0
+    ):
+        limitations.append("export_limitations.barrier_dependency_nodes_missing")
+    return {
+        "latency_graph_complete": not limitations,
+        "latency_graph_limitations": limitations,
+    }
+
+
 def estimate_node_durations(
     record: Mapping[str, Any], model: DurationModel
 ) -> tuple[dict[int, float], dict[int, dict[str, Any]], list[int]]:
@@ -859,9 +995,10 @@ def estimate_node_durations(
 
 def _graph_edges(
     record: Mapping[str, Any], node_ids: set[int], *, include_sync: bool
-) -> tuple[list[tuple[int, int, float, str, int | None]], int]:
+) -> tuple[list[tuple[int, int, float, str, int | None]], dict[str, int]]:
     edges: list[tuple[int, int, float, str, int | None]] = []
     seen: set[tuple[int, int, str, int | None]] = set()
+    excluded_non_operation_stream_edges = 0
     for edge in record.get("stream_edges", []):
         if not isinstance(edge, Mapping):
             continue
@@ -876,8 +1013,15 @@ def _graph_edges(
         ):
             edges.append((source, target, 0.0, "stream", None))
             seen.add(key)
+        elif (
+            isinstance(source, int)
+            and isinstance(target, int)
+            and (source not in node_ids or target not in node_ids)
+        ):
+            excluded_non_operation_stream_edges += 1
 
     excluded_loop_carried = 0
+    excluded_non_operation_sync_edges = 0
     if include_sync:
         for edge in record.get("sync_edges", []):
             if not isinstance(edge, Mapping):
@@ -898,7 +1042,17 @@ def _graph_edges(
             ):
                 edges.append((source, target, 0.0, "sync", group_id))
                 seen.add(key)
-    return edges, excluded_loop_carried
+            elif (
+                isinstance(source, int)
+                and isinstance(target, int)
+                and (source not in node_ids or target not in node_ids)
+            ):
+                excluded_non_operation_sync_edges += 1
+    return edges, {
+        "excluded_loop_carried_sync_edges": excluded_loop_carried,
+        "excluded_non_operation_stream_edges": excluded_non_operation_stream_edges,
+        "excluded_non_operation_sync_edges": excluded_non_operation_sync_edges,
+    }
 
 
 def _longest_path(
@@ -1153,7 +1307,7 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         )
     node_ids = set(durations)
     stream_edges, _ = _graph_edges(record, node_ids, include_sync=False)
-    full_edges, excluded_loop_carried = _graph_edges(record, node_ids, include_sync=True)
+    full_edges, edge_diagnostics = _graph_edges(record, node_ids, include_sync=True)
     full_edges = [
         (source, target, model.sync_latency_cycles if kind == "sync" else latency, kind, group)
         for source, target, latency, kind, group in full_edges
@@ -1184,6 +1338,7 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
     exact = sum(not item["fallback"] for item in provenance.values())
     fallback = sum(item["fallback"] for item in provenance.values())
     source_counts = Counter(str(item["source"]) for item in provenance.values())
+    sync_record_summary = _pre_codegen_sync_record_summary(record)
     return {
         "schema_version": 1,
         "function": record.get("function", "<unknown>"),
@@ -1194,7 +1349,8 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "calibration_status": model.calibration_status,
         "loop_policy": "aggregate_static_work_v0",
         "dynamic_loop_ids": dynamic_loops,
-        "excluded_loop_carried_sync_edges": excluded_loop_carried,
+        **edge_diagnostics,
+        **_latency_graph_completeness(record, edge_diagnostics),
         "operation_nodes": len(durations),
         "exact_duration_nodes": exact,
         "fallback_duration_nodes": fallback,
@@ -1214,6 +1370,7 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "baseline_critical_path": baseline_path,
         "full_critical_path": full_path,
         "sync_edge_exposure": edge_exposure,
+        "pre_codegen_sync_record_summary": sync_record_summary,
         "node_durations": {str(node): value for node, value in sorted(provenance.items())},
     }
 
@@ -1304,7 +1461,7 @@ def _resolve_candidate_site(
 
 
 def _deduplicate_scored_candidate_edges(
-    rows: Sequence[dict[str, Any]],
+    rows: Sequence[dict[str, Any]], execution_counts: Mapping[int, int]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Collapse candidate records that join to the same schedule edge."""
     distance_zero_rows: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
@@ -1318,17 +1475,24 @@ def _deduplicate_scored_candidate_edges(
     distance_zero_edges: list[dict[str, Any]] = []
     for (source, target), duplicates in sorted(distance_zero_rows.items()):
         weights = {float(row["weight_cycles"]) for row in duplicates}
-        if len(weights) != 1:
+        pipe_pairs = {(row.get("prior_pipe"), row.get("next_pipe")) for row in duplicates}
+        if len(weights) != 1 or len(pipe_pairs) != 1:
             raise ValueError(
-                "candidate records joined to one distance-zero edge but received different scores: "
+                "candidate records joined to one distance-zero edge but have inconsistent metadata: "
                 f"edge={source}->{target}"
             )
+        source_pipe, target_pipe = next(iter(pipe_pairs))
         distance_zero_edges.append(
             {
                 "source_node": source,
                 "target_node": target,
+                "source_pipe": source_pipe,
+                "target_pipe": target_pipe,
                 "candidate_indices": [row["candidate_index"] for row in duplicates],
                 "candidate_count": len(duplicates),
+                "source_execution_count": execution_counts[source],
+                "target_execution_count": execution_counts[target],
+                "estimated_sync_endpoint_executions": (execution_counts[source] + execution_counts[target]),
                 "weight_cycles": duplicates[0]["weight_cycles"],
             }
         )
@@ -1337,18 +1501,25 @@ def _deduplicate_scored_candidate_edges(
     for (loop_node, source, target), duplicates in sorted(loop_rows.items()):
         weights = {float(row["weight_cycles"]) for row in duplicates}
         recurrence_cycles = {row["candidate_recurrence_cycles"] for row in duplicates}
-        if len(weights) != 1 or len(recurrence_cycles) != 1:
+        pipe_pairs = {(row.get("prior_pipe"), row.get("next_pipe")) for row in duplicates}
+        if len(weights) != 1 or len(recurrence_cycles) != 1 or len(pipe_pairs) != 1:
             raise ValueError(
-                "candidate records joined to one recurrence edge but received different scores: "
+                "candidate records joined to one recurrence edge but have inconsistent metadata: "
                 f"loop={loop_node}, edge={source}->{target}"
             )
+        source_pipe, target_pipe = next(iter(pipe_pairs))
         loop_edges.append(
             {
                 "loop_node": loop_node,
                 "source_node": source,
                 "target_node": target,
+                "source_pipe": source_pipe,
+                "target_pipe": target_pipe,
                 "candidate_indices": [row["candidate_index"] for row in duplicates],
                 "candidate_count": len(duplicates),
+                "source_execution_count": execution_counts[source],
+                "target_execution_count": execution_counts[target],
+                "estimated_sync_endpoint_executions": (execution_counts[source] + execution_counts[target]),
                 "candidate_recurrence_cycles": duplicates[0]["candidate_recurrence_cycles"],
                 "weight_cycles": duplicates[0]["weight_cycles"],
             }
@@ -1421,6 +1592,8 @@ def _score_penalty_pairs(
     loop_counts: Mapping[int, int],
     sync_latency_cycles: float,
     promoted_penalties: Mapping[tuple[int, int], float] | None,
+    distance_zero_edge_features: Mapping[tuple[int, int], Mapping[str, Any]],
+    loop_edge_features: Mapping[tuple[int, int, int], Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     """Collapse access-site candidates into additive buffer-pair weights."""
     by_pair: dict[tuple[int, int], list[Mapping[str, Any]]] = defaultdict(list)
@@ -1458,6 +1631,19 @@ def _score_penalty_pairs(
             weight * max(loop_counts.get(loop_id, 1) - 1, 0) for loop_id, weight in loop_weights.items()
         )
 
+        loop_schedule_edges = {
+            (int(row["loop_node"]), int(row["source_node"]), int(row["target_node"]))
+            for row in pair_rows
+            if row.get("status") == "loop_carried_scored_v1"
+        }
+        estimated_sync_executions = sum(
+            int(distance_zero_edge_features[edge]["estimated_sync_endpoint_executions"])
+            for edge in distance_zero_edges
+        ) + sum(
+            int(loop_edge_features[edge]["estimated_sync_endpoint_executions"])
+            for edge in loop_schedule_edges
+        )
+
         promoted = promoted_penalties is None or pair in promoted_penalties
         unit_cost = 1.0 if promoted_penalties is None else promoted_penalties.get(pair, 0.0)
         scored.append(
@@ -1468,6 +1654,8 @@ def _score_penalty_pairs(
                 "unit_cost": unit_cost,
                 "candidate_record_count": len(pair_rows),
                 "distance_zero_schedule_edges": [list(edge) for edge in sorted(distance_zero_edges)],
+                "loop_carried_schedule_edges": [list(edge) for edge in sorted(loop_schedule_edges)],
+                "estimated_sync_endpoint_executions": estimated_sync_executions,
                 "distance_zero_weight_cycles": distance_zero_weight,
                 "loop_ii_weight_cycles": sum(loop_weights.values()),
                 "loop_total_weight_cycles": loop_total_weight,
@@ -1524,6 +1712,12 @@ def score_realized_reuse(
     candidate_scores: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Score the promoted reuse pairs physically realized by one placement."""
+    schema_version = candidate_scores.get("schema_version")
+    if schema_version != 2:
+        raise ValueError(
+            "candidate score schema is incompatible with synchronization endpoint scoring: "
+            f"expected schema_version=2, got {schema_version!r}; regenerate candidate scores"
+        )
     problem_source = Path(problem_path)
     solution_source = Path(solution_path)
     problem = json.loads(problem_source.read_text())
@@ -1587,17 +1781,69 @@ def score_realized_reuse(
         )
 
     realized = [row for row in rows if row["reuse_realized"]]
+    distance_zero_catalog = {
+        (int(edge["source_node"]), int(edge["target_node"])): edge
+        for edge in candidate_scores.get("distance_zero_edges", [])
+        if isinstance(edge, Mapping)
+    }
+    loop_catalog = {
+        (int(edge["loop_node"]), int(edge["source_node"]), int(edge["target_node"])): edge
+        for edge in candidate_scores.get("loop_recurrence_edges", [])
+        if isinstance(edge, Mapping)
+    }
+    realized_distance_zero_edges = {
+        (int(source), int(target))
+        for row in realized
+        for source, target in row.get("distance_zero_schedule_edges", [])
+    }
+    realized_loop_edges = {
+        (int(loop), int(source), int(target))
+        for row in realized
+        for loop, source, target in row.get("loop_carried_schedule_edges", [])
+    }
+    missing_distance_zero = realized_distance_zero_edges - set(distance_zero_catalog)
+    missing_loop = realized_loop_edges - set(loop_catalog)
+    if missing_distance_zero or missing_loop:
+        raise ValueError(
+            "realized reuse refers to schedule edges absent from the candidate catalogs: "
+            f"distance_zero={sorted(missing_distance_zero)[:8]}, loop={sorted(missing_loop)[:8]}"
+        )
+
+    pipe_pair_executions: Counter[str] = Counter()
+    for edge_key in realized_distance_zero_edges:
+        edge = distance_zero_catalog[edge_key]
+        pipe_pair_executions[f"{edge['source_pipe']}->{edge['target_pipe']}"] += int(
+            edge["estimated_sync_endpoint_executions"]
+        )
+    for edge_key in realized_loop_edges:
+        edge = loop_catalog[edge_key]
+        pipe_pair_executions[f"{edge['source_pipe']}->{edge['target_pipe']}"] += int(
+            edge["estimated_sync_endpoint_executions"]
+        )
+    realized_without_induced_edge = [
+        row
+        for row in realized
+        if not row.get("distance_zero_schedule_edges") and not row.get("loop_carried_schedule_edges")
+    ]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_version": candidate_scores.get("model_version"),
         "problem": str(problem_source),
         "solution": str(solution_source),
         "promoted_pair_count": len(rows),
         "realized_pair_count": len(realized),
+        "realized_pair_count_without_induced_sync_edge": len(realized_without_induced_edge),
         "unit_realized_cost": sum(float(row["unit_cost"]) for row in realized),
+        "unit_realized_cost_without_induced_sync_edge": sum(
+            float(row["unit_cost"]) for row in realized_without_induced_edge
+        ),
         "critical_path_realized_cost_cycles": sum(
             float(row["critical_path_weight_cycles"]) for row in realized
         ),
+        "unique_induced_sync_edge_count": len(realized_distance_zero_edges) + len(realized_loop_edges),
+        "sync_endpoint_estimator_version": "uncoalesced_source_plus_target_static_executions_v1",
+        "estimated_sync_endpoint_executions": sum(pipe_pair_executions.values()),
+        "estimated_sync_endpoint_executions_by_pipe_pair": dict(sorted(pipe_pair_executions.items())),
         "pairs": rows,
     }
 
@@ -1639,7 +1885,7 @@ def score_reuse_candidates(
             f"duration_v0 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
         )
     node_ids = set(durations)
-    existing_edges, excluded_loop_carried = _graph_edges(record, node_ids, include_sync=True)
+    existing_edges, edge_diagnostics = _graph_edges(record, node_ids, include_sync=True)
     existing_edges = [
         (source, target, model.sync_latency_cycles if kind == "sync" else latency, kind, group)
         for source, target, latency, kind, group in existing_edges
@@ -1795,7 +2041,8 @@ def score_reuse_candidates(
             }
         )
 
-    distance_zero_edges, loop_edge_groups = _deduplicate_scored_candidate_edges(rows)
+    execution_counts, _ = _node_execution_counts(record)
+    distance_zero_edges, loop_edge_groups = _deduplicate_scored_candidate_edges(rows, execution_counts)
     weight_summary = _summarize_candidate_weights(distance_zero_edges, loop_edge_groups)
     loop_counts, _ = _loop_multipliers(record)
     penalty_pair_weights = _score_penalty_pairs(
@@ -1806,18 +2053,25 @@ def score_reuse_candidates(
         loop_counts,
         model.sync_latency_cycles,
         promoted_penalties,
+        {(int(edge["source_node"]), int(edge["target_node"])): edge for edge in distance_zero_edges},
+        {
+            (int(edge["loop_node"]), int(edge["source_node"]), int(edge["target_node"])): edge
+            for edge in loop_edge_groups
+        },
     )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_version": "reuse_penalty_critical_path_v1",
+        "sync_endpoint_estimator_version": "uncoalesced_source_plus_target_static_executions_v1",
         "function": record.get("function", "<unknown>"),
         "duration_model_version": model.model_version,
         "calibration_status": model.calibration_status,
         "base_makespan_cycles": base_makespan,
         "base_critical_path": base_path,
         "dynamic_loop_ids": dynamic_loops,
-        "excluded_loop_carried_sync_edges": excluded_loop_carried,
+        **edge_diagnostics,
+        **_latency_graph_completeness(record, edge_diagnostics),
         "candidate_count": len(candidates),
         "scored_candidate_count": sum(
             row.get("status") in {"scored", "loop_carried_scored_v1"} for row in rows
@@ -1833,6 +2087,7 @@ def score_reuse_candidates(
         "loop_recurrence_edges": loop_edge_groups,
         "penalty_pair_weights": penalty_pair_weights,
         "candidate_weight_summary": weight_summary,
+        "baseline_pre_codegen_sync_record_summary": _pre_codegen_sync_record_summary(record),
         "node_durations": {str(node): value for node, value in sorted(provenance.items())},
     }
 
