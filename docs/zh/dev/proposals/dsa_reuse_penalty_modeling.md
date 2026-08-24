@@ -98,7 +98,7 @@ suppression rule。
 最新 exact ordered-pair study 给出了对旧 v4 policy 的两个重要反例：
 
 | Pair 类型 | 结果 |
-| --- | --- |
+| --------- | ---- |
 | SSA-ordered `V -> MTE2` WAR | overlap 增加一个匹配的 PTOAS handoff |
 | unordered `M -> MTE1` WAR | overlap 删除冗余 handoff，但没有确认 latency 收益 |
 | 另外四个匹配 pair | 同步不变 |
@@ -126,7 +126,7 @@ suppression rule。
 必须区分三类 ordering：
 
 | 层次 | 问题 |
-| --- | --- |
+| ---- | ---- |
 | Logical ordering | 一个 PyPTO value-producing operation 是否可达另一个？ |
 | Completion ordering | overwrite 前，之前的异步 access 是否已经释放复用 byte？ |
 | Exposed delay | release point 延后是否改变 initiation interval 或 kernel latency？ |
@@ -196,7 +196,9 @@ manifest。如果仍存在高层 `record_event`/`wait_event` operation，它会�
 `event_key_lexical_and_innermost_backedge_v1` contract 推断候选 event lifecycle
 transition。这些 transition 并非直接 emitted fact：event ID 可以复用，而且 lowering 后
 IR 不再保留 Final-SyncIR group identity。因此推断结果与实际 instruction-site count 分开
-报告：
+报告。对于静态有界 loop，collector 还会用每个实际 site 乘以其外层 trip count，
+报告估算的动态指令执行 (dynamic instruction execution)。当 synchronization site 的外层 loop
+bound 为 dynamic 或无法解析时，该估算就标记为 incomplete，而不会猜测：
 
 ```bash
 python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \
@@ -325,6 +327,11 @@ PTO 中恢复相同的稳定访问坐标。该连接要求可执行操作顺序�
 python -m pypto.tools.dsa_schedule_model import-debug insert-sync.log \
     --function kernel --pto kernel.pto -o schedule.jsonl
 ```
+
+PTOAS 也会给某些函数级事件生命周期附加 loop-end identity。仅当每个活动的
+set/wait endpoint 都是该 loop 内的 operation 时，bridge 才会将该 group 分类为
+recurrence。prologue-to-loop-end 或 prologue-to-epilogue lifecycle 仍是 boundary
+dependency，不会被误当成 initiation-interval constraint。
 
 raw-PTO join 还会保留 operand/result type 与标量常量 operand，并从静态 tile 与
 partition type 推导 `static_work_bytes`。这足以为 transfer 定价，同时不会虚构

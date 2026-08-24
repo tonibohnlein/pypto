@@ -582,11 +582,33 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
     sync_groups: list[dict[str, Any]] = []
     sync_edges: list[dict[str, Any]] = []
     omitted_barriers = 0
+    nodes_by_id = {node["id"]: node for node in nodes}
+    loop_begin_by_end = {
+        node["end"]: node["id"]
+        for node in nodes
+        if node.get("kind") == "loop"
+        and node.get("loop_kind") == "LOOP_BEGIN"
+        and isinstance(node.get("end"), int)
+    }
     for sync_index in sorted(sync_operations):
         operations = sync_operations[sync_index]
         active_operations = [operation for operation in operations if not operation["useless"]]
         representative = active_operations[0] if active_operations else operations[0]
-        loop_carried = any(operation["loop_end"] is not None for operation in active_operations)
+        annotated_loop_ends = {
+            operation["loop_end"]
+            for operation in active_operations
+            if isinstance(operation.get("loop_end"), int)
+        }
+        endpoint_nodes = [
+            nodes_by_id.get(operation["node"], {})
+            for operation in active_operations
+            if operation["type"] in {"set_flag", "wait_flag"}
+        ]
+        loop_carried = bool(endpoint_nodes) and any(
+            all(loop_begin in node.get("loop_stack", []) for node in endpoint_nodes)
+            for loop_end in annotated_loop_ends
+            if (loop_begin := loop_begin_by_end.get(loop_end)) is not None
+        )
         sources = sorted(
             {operation["node"] for operation in active_operations if operation["type"] == "set_flag"}
         )
@@ -1021,21 +1043,13 @@ def _graph_edges(
         if not isinstance(edge, Mapping):
             continue
         source, target = edge.get("source"), edge.get("target")
+        if not isinstance(source, int) or not isinstance(target, int):
+            continue
         key = (source, target, "stream", None)
-        if (
-            isinstance(source, int)
-            and isinstance(target, int)
-            and source in node_ids
-            and target in node_ids
-            and key not in seen
-        ):
+        if source in node_ids and target in node_ids and key not in seen:
             edges.append((source, target, 0.0, "stream", None))
             seen.add(key)
-        elif (
-            isinstance(source, int)
-            and isinstance(target, int)
-            and (source not in node_ids or target not in node_ids)
-        ):
+        elif source not in node_ids or target not in node_ids:
             excluded_non_operation_stream_edges += 1
 
     excluded_loop_carried = 0
@@ -1048,23 +1062,14 @@ def _graph_edges(
                 excluded_loop_carried += 1
                 continue
             source, target, group = edge.get("source"), edge.get("target"), edge.get("group")
+            if not isinstance(source, int) or not isinstance(target, int):
+                continue
             group_id = group if isinstance(group, int) else None
             key = (source, target, "sync", group_id)
-            if (
-                isinstance(source, int)
-                and isinstance(target, int)
-                and source in node_ids
-                and target in node_ids
-                and source != target
-                and key not in seen
-            ):
+            if source in node_ids and target in node_ids and source != target and key not in seen:
                 edges.append((source, target, 0.0, "sync", group_id))
                 seen.add(key)
-            elif (
-                isinstance(source, int)
-                and isinstance(target, int)
-                and (source not in node_ids or target not in node_ids)
-            ):
+            elif source not in node_ids or target not in node_ids:
                 excluded_non_operation_sync_edges += 1
     return edges, {
         "excluded_loop_carried_sync_edges": excluded_loop_carried,
@@ -1177,6 +1182,13 @@ def _longest_path_between(
     return distance[end], path
 
 
+def _require_integer_edge_endpoints(edge: Mapping[str, Any], description: str) -> tuple[int, int]:
+    source, target = edge.get("source"), edge.get("target")
+    if not isinstance(source, int) or not isinstance(target, int):
+        raise ValueError(f"{description} has invalid endpoints")
+    return source, target
+
+
 def _loop_recurrence_score(
     record: Mapping[str, Any],
     durations: Mapping[int, float],
@@ -1243,19 +1255,22 @@ def _loop_recurrence_score(
     )
     if not isinstance(loop_end, int):
         raise ValueError(f"PTOAS loop {loop_id} has no integer loop-end identity")
-    groups = {
-        group.get("id"): group
-        for group in record.get("sync_groups", [])
-        if isinstance(group, Mapping) and isinstance(group.get("id"), int)
-    }
+    groups: dict[int, Mapping[str, Any]] = {}
+    for group in record.get("sync_groups", []):
+        if not isinstance(group, Mapping):
+            continue
+        group_id = group.get("id")
+        if isinstance(group_id, int):
+            groups[group_id] = group
     existing_recurrences: list[dict[str, Any]] = []
     for edge in record.get("sync_edges", []):
         if not isinstance(edge, Mapping) or not edge.get("loop_carried"):
             continue
-        edge_source, edge_target = edge.get("source"), edge.get("target")
+        edge_source, edge_target = _require_integer_edge_endpoints(edge, "loop-carried schedule edge")
         if edge_source not in loop_nodes or edge_target not in loop_nodes:
             continue
-        group = groups.get(edge.get("group"))
+        edge_group = edge.get("group")
+        group = groups.get(edge_group) if isinstance(edge_group, int) else None
         operations = group.get("operations", []) if isinstance(group, Mapping) else []
         loop_ends = {
             operation.get("loop_end")
@@ -1317,18 +1332,20 @@ def _resolve_loop_carried_sync_edges(
     for edge_index, edge in enumerate(sync_edges):
         if not edge.get("loop_carried"):
             continue
-        source, target = edge.get("source"), edge.get("target")
-        if not isinstance(source, int) or not isinstance(target, int):
-            raise ValueError(f"loop-carried sync edge {edge_index} has invalid endpoints")
-        group = groups.get(edge.get("group"))
+        source, target = _require_integer_edge_endpoints(edge, f"loop-carried sync edge {edge_index}")
+        edge_group = edge.get("group")
+        group = groups.get(edge_group) if isinstance(edge_group, int) else None
         operations = group.get("operations", []) if isinstance(group, Mapping) else []
-        loop_ends = {
-            operation.get("loop_end")
-            for operation in operations
-            if isinstance(operation, Mapping) and isinstance(operation.get("loop_end"), int)
-        }
-        if isinstance(edge.get("loop_end"), int):
-            loop_ends.add(edge["loop_end"])
+        loop_ends: set[int] = set()
+        for operation in operations:
+            if not isinstance(operation, Mapping):
+                continue
+            operation_loop_end = operation.get("loop_end")
+            if isinstance(operation_loop_end, int):
+                loop_ends.add(operation_loop_end)
+        explicit_loop_end = edge.get("loop_end")
+        if isinstance(explicit_loop_end, int):
+            loop_ends.add(explicit_loop_end)
         matching_loops = [
             loop["id"]
             for loop in loops
@@ -1390,11 +1407,13 @@ def _existing_loop_sync_models(
         for node_id, node in nodes_by_id.items()
         if node.get("kind") == "operation" and node_id in operation_durations
     }
-    groups = {
-        group.get("id"): group
-        for group in record.get("sync_groups", [])
-        if isinstance(group, Mapping) and isinstance(group.get("id"), int)
-    }
+    groups: dict[int, Mapping[str, Any]] = {}
+    for group in record.get("sync_groups", []):
+        if not isinstance(group, Mapping):
+            continue
+        group_id = group.get("id")
+        if isinstance(group_id, int):
+            groups[group_id] = group
     loop_counts, dynamic_loops = _loop_multipliers(record)
     loops = [
         loop
@@ -1404,12 +1423,14 @@ def _existing_loop_sync_models(
         and loop.get("loop_kind") == "LOOP_BEGIN"
         and isinstance(loop.get("id"), int)
     ]
-    operation_ids_by_loop = {
-        loop["id"]: {
-            node_id for node_id, node in operation_nodes.items() if loop["id"] in node.get("loop_stack", [])
+    operation_ids_by_loop: dict[int, set[int]] = {}
+    for loop in loops:
+        loop_id = loop.get("id")
+        if not isinstance(loop_id, int):
+            continue
+        operation_ids_by_loop[loop_id] = {
+            node_id for node_id, node in operation_nodes.items() if loop_id in node.get("loop_stack", [])
         }
-        for loop in loops
-    }
     sync_edges = [edge for edge in record.get("sync_edges", []) if isinstance(edge, Mapping)]
     resolved_loop_carried = _resolve_loop_carried_sync_edges(sync_edges, groups, loops, operation_ids_by_loop)
 
@@ -1663,6 +1684,8 @@ def _resolve_candidate_site(
         if len(names) != 1 or None in names:
             continue
         operation_name = next(iter(names))
+        if not isinstance(operation_name, str):
+            continue
         reason = _ROUTE_PIPE_JOIN_EXCEPTIONS.get((route_pipe, schedule_pipe, operation_name))
         if reason is not None:
             matches.append((node_ids, schedule_pipe, reason))
