@@ -132,6 +132,100 @@ def test_matmul_uses_pto_isa_tile_formula():
     assert estimate.source == "pto_isa_matmul_formula"
 
 
+def test_matmul_formula_accepts_a2a3_bfloat16_inputs():
+    estimate = _provider().estimate(
+        _node(
+            "pto.tmatmul",
+            "PIPE_M",
+            "!pto.tile_buf<left, 16x256xbf16, valid=?x?>",
+            "!pto.tile_buf<right, 256x64xbf16, valid=?x?>",
+        ),
+        work_bytes=8192,
+    )
+
+    assert estimate.cycles == 70
+    assert estimate.source == "pto_isa_matmul_formula"
+
+
+def test_perf_sim_default_is_pinned_nonfallback_and_uses_result_work_shape():
+    node = _node(
+        "pto.textract",
+        "PIPE_MTE1",
+        "!pto.tile_buf<mat, 16x512xbf16, valid=?x?>",
+        "index",
+        "index",
+    )
+    node["operation"]["result_types"] = ["!pto.tile_buf<left, 16x128xbf16, valid=?x?>"]
+
+    estimate = _provider().estimate(node, work_bytes=4096)
+
+    assert estimate.cycles == 66
+    assert estimate.source == "pto_isa_perf_sim_default"
+    assert estimate.fallback is False
+
+
+def test_missing_formula_signature_uses_pinned_perf_sim_default():
+    node = _node(
+        "pto.trowsum",
+        "PIPE_V",
+        "!pto.tile_buf<vec, 8x512xf32, valid=?x?>",
+        "!pto.tile_buf<vec, 8x512xf32, valid=?x?>",
+    )
+    node["operation"]["result_types"] = ["!pto.tile_buf<vec, 8x1xf32, valid=?x?>"]
+
+    estimate = _provider().estimate(node, work_bytes=16384)
+
+    assert estimate.cycles == 130
+    assert estimate.source == "pto_isa_perf_sim_default"
+    assert estimate.fallback is False
+
+
+def test_ttrans_uses_pinned_mte1_default_rule():
+    node = _node(
+        "pto.ttrans",
+        "PIPE_V",
+        "!pto.tile_buf<vec, 16x8xf32, valid=?x?>",
+        "!pto.tile_buf<vec, 16x8xf32, valid=?x?>",
+    )
+    node["operation"]["result_types"] = ["!pto.tile_buf<vec, 8x16xf32, valid=?x?>"]
+
+    estimate = _provider().estimate(node, work_bytes=512)
+
+    assert estimate.cycles == 3
+    assert estimate.source == "pto_isa_perf_sim_default"
+
+
+@pytest.mark.parametrize(
+    ("node", "expected_source"),
+    [
+        (
+            {
+                **_node("pto.load_scalar", "PIPE_S", "!pto.ptr<f32>"),
+                "operation": {
+                    "operand_types": ["!pto.ptr<f32>"],
+                    "result_types": ["f32"],
+                    "attributes": {},
+                },
+            },
+            "pto_isa_perf_sim_scalar_stage",
+        ),
+        (_node("pto.tpush", "PIPE_FIX"), "pto_isa_perf_sim_scalar_stage"),
+        (_node("pto.tpop", "PIPE_MTE2"), "pto_isa_perf_sim_scalar_stage"),
+    ],
+)
+def test_scalar_stage_operations_use_pinned_perf_sim_contract(node, expected_source):
+    estimate = _provider().estimate(node, work_bytes=0)
+
+    assert estimate.cycles == 1
+    assert estimate.source == expected_source
+    assert estimate.fallback is False
+
+
+def test_scalar_load_fails_closed_without_pointer_and_scalar_result():
+    with pytest.raises(ValueError, match="scalar load lacks one pointer and one scalar result"):
+        _provider().estimate(_node("pto.load_scalar", "PIPE_S", "i32"), work_bytes=0)
+
+
 def test_unsupported_operation_fails_closed_or_is_explicit_fallback():
     node = _node("pto.trsqrt", "PIPE_V", "!pto.tile_buf<vec, 1x8xf32>")
     with pytest.raises(ValueError, match="unsupported PTO-ISA duration for pto.trsqrt"):

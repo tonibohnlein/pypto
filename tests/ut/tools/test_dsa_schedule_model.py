@@ -325,7 +325,165 @@ def test_score_models_existing_loop_recurrence_and_boundary_edges():
         {"source": 11, "target": 5, "group": 5, "kind": "loop_exit"},
     ]
     assert result["excluded_loop_carried_sync_edges"] == 1
+    assert result["modeled_loop_carried_sync_edges"] == 1
+    assert result["unresolved_loop_carried_sync_edges"] == 0
+    assert result["latency_graph_complete"] is True
     assert result["excluded_non_operation_sync_edges"] == 0
+
+
+def test_moved_loop_sync_metadata_is_reclassified_as_ordinary_dependency():
+    record = _record()
+    record["nodes"] = [
+        _operation(0, "PIPE_V", "pto.tadd"),
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 13,
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
+        _operation(11, "PIPE_MTE2", "pto.tload", [10]),
+        _operation(12, "PIPE_V", "pto.tmuls", [10]),
+        {
+            "id": 13,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 13,
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
+    ]
+    record["stream_edges"] = [{"source": 0, "target": 12, "pipe": "PIPE_V"}]
+    record["sync_edges"] = [{"source": 0, "target": 13, "group": 4, "loop_carried": True}]
+    record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_MTE2",
+            "operations": [
+                {"node": 0, "type": "set_flag", "loop_end": 13},
+                {"node": 13, "type": "wait_flag", "loop_end": 13},
+            ],
+        }
+    ]
+
+    result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+    assert result["declared_loop_carried_sync_edges"] == 1
+    assert result["excluded_loop_carried_sync_edges"] == 0
+    assert result["reclassified_non_recurrence_sync_edges"] == 1
+    assert result["modeled_loop_carried_sync_edges"] == 0
+    assert result["latency_graph_complete"] is True
+
+
+def test_score_models_outer_recurrence_from_nested_loop_end():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 16,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 16,
+            "end": 37,
+            "static_trip_count": 3,
+            "loop_stack": [],
+        },
+        _operation(17, "PIPE_MTE2", "pto.tload", [16]),
+        {
+            "id": 21,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 21,
+            "end": 28,
+            "static_trip_count": 2,
+            "loop_stack": [16],
+        },
+        _operation(24, "PIPE_V", "pto.tmuls", [16, 21]),
+        {
+            "id": 28,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 21,
+            "end": 28,
+            "static_trip_count": 2,
+            "loop_stack": [16],
+        },
+        {
+            "id": 37,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 16,
+            "end": 37,
+            "static_trip_count": 3,
+            "loop_stack": [],
+        },
+    ]
+    record["stream_edges"] = []
+    record["sync_edges"] = [
+        {"source": 17, "target": 21, "group": 1, "loop_carried": False},
+        {"source": 21, "target": 24, "group": 2, "loop_carried": False},
+        {"source": 24, "target": 28, "group": 3, "loop_carried": False},
+        {"source": 28, "target": 17, "group": 4, "loop_carried": True},
+    ]
+    record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_M",
+            "dst_pipe": "PIPE_MTE2",
+            "operations": [
+                {"node": 28, "type": "set_flag", "loop_end": 37},
+                {"node": 17, "type": "wait_flag", "loop_end": 37},
+            ],
+        }
+    ]
+
+    result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+    outer = next(model for model in result["loop_sync_models"] if model["loop_node"] == 16)
+    assert outer["structural_node_count"] == 2
+    assert outer["loop_carried_recurrences"] == [
+        {"source": 28, "target": 17, "group": 4, "cycles": 30.0, "path": [17, 21, 24, 28]}
+    ]
+    assert result["latency_graph_complete"] is True
+
+
+def test_non_cycle_loop_carried_sync_is_resolved_without_ii_constraint():
+    record = _loop_candidate_record()
+    record["sync_edges"] = [{"source": 1, "target": 2, "group": 4, "loop_carried": True}]
+    record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_MTE2",
+            "dst_pipe": "PIPE_V",
+            "operations": [
+                {"node": 1, "type": "set_flag", "loop_end": 20},
+                {"node": 2, "type": "wait_flag", "loop_end": 20},
+            ],
+        }
+    ]
+
+    result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+    assert result["modeled_loop_carried_sync_edges"] == 1
+    assert result["non_cycle_loop_carried_sync_edges"] == 1
+    assert result["unresolved_loop_carried_sync_edges"] == 0
+    assert result["latency_graph_complete"] is True
+
+
+def test_final_tail_dependency_zero_is_a_structural_sentinel():
+    record = _record()
+    record["nodes"] = [_operation(1, "PIPE_V", "pto.tadd"), _operation(2, "PIPE_V", "pto.tmuls")]
+    record["stream_edges"] = [{"source": 1, "target": 2, "pipe": "PIPE_V"}]
+    record["sync_edges"] = [{"source": 0, "target": 2, "group": 7, "loop_carried": False}]
+
+    result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+    assert result["excluded_sentinel_sync_edges"] == 1
+    assert result["excluded_non_operation_sync_edges"] == 0
+    assert result["latency_graph_complete"] is True
 
 
 def test_cross_loop_end_to_begin_is_exit_then_entry():
@@ -492,14 +650,11 @@ def _loop_candidate_record(*, with_return_path: bool = False) -> dict:
     return record
 
 
-@pytest.mark.parametrize("defect", ["missing_group", "unmatched_loop_end", "endpoint_outside"])
+@pytest.mark.parametrize("defect", ["missing_group", "unmatched_loop_end"])
 def test_existing_loop_recurrence_metadata_fails_closed(defect):
     record = _loop_candidate_record(with_return_path=True)
     source, target = 2, 1
     loop_end = 20
-    if defect == "endpoint_outside":
-        record["nodes"].append(_operation(4, "PIPE_MTE2", "pto.tload"))
-        target = 4
     record["sync_edges"].append({"source": source, "target": target, "group": 8, "loop_carried": True})
     if defect != "missing_group":
         record["sync_groups"] = [
@@ -1103,6 +1258,19 @@ def test_complete_signature_preserves_modes_but_erases_ssa_names():
     assert "pypto.access" not in signature["semantic_operation"]
 
 
+def test_complete_signature_ignores_native_source_location():
+    node = _operation(0, "PIPE_V", "pto.tadd")
+    node["operation"] = {
+        "location": 'loc("/checkout/model.py":10:4)',
+        "operand_types": [],
+        "result_types": [],
+        "operand_constants": [],
+        "attributes": {},
+    }
+
+    assert dsa_schedule_model.operation_duration_signature(node)["semantic_operation"] is None
+
+
 def test_extract_calibration_binds_trace_to_exact_schedule_node(tmp_path):
     schedule = tmp_path / "schedule.jsonl"
     trace = tmp_path / "trace.json"
@@ -1237,6 +1405,34 @@ def test_perf_sim_header_uses_result_first_for_mixed_dtype_tcvt(
     dsa_schedule_model._validate_perf_sim_event_signature(
         event, node, measurement_index=0, manifest=tmp_path / "manifest.json"
     )
+
+
+def test_perf_sim_reciprocal_requires_exact_tdivs_by_one_lowering():
+    tile = (
+        "!pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=16, v_row=?, v_col=?, "
+        "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+    )
+    node = {
+        "id": 0,
+        "kind": "operation",
+        "pipe": "PIPE_V",
+        "op_name": "pto.trecip",
+        "defs": [],
+        "uses": [],
+        "operation": {
+            "location": f"pto.trecip ins(%src : {tile}) outs(%dst : {tile})",
+            "operand_types": [tile],
+            "result_types": [tile],
+            "operand_constants": [None],
+            "attributes": {},
+            "static_work_bytes": 64,
+        },
+    }
+
+    event = dsa_schedule_model.expected_perf_sim_event_signature(node)
+    assert event["operation"] == "TDIVS"
+    assert event["scalars"] == ["i:1"]
+    assert dsa_schedule_model.operation_duration_signature(node)["operation"] == "TRECIP"
 
 
 def test_perf_sim_signature_tracks_inline_round_mode_and_dynamic_scalar_indices(tmp_path):
@@ -1526,9 +1722,25 @@ def test_load_and_freeze_predictions_are_content_addressed(tmp_path):
 
     assert frozen["cohort"] == "holdout-v0"
     assert frozen["frozen_before_device_timing"] is True
+    assert frozen["freeze_context"] == "prospective_holdout"
     assert len(frozen["prediction_sha256"]) == 64
     assert frozen["schedule_sources"][0]["path"] == str(schedule)
     assert len(frozen["schedule_sources"][0]["sha256"]) == 64
+
+
+def test_freeze_predictions_labels_retrospective_join_honestly(tmp_path):
+    schedule = tmp_path / "schedule.jsonl"
+    schedule.write_text(json.dumps(_record()) + "\n")
+
+    frozen = dsa_schedule_model.freeze_predictions(
+        {"kernel": {"status": "MODEL_ELIGIBLE"}},
+        cohort="existing-measurements-v1",
+        source_paths=[schedule],
+        frozen_before_device_timing=False,
+    )
+
+    assert frozen["frozen_before_device_timing"] is False
+    assert frozen["freeze_context"] == "retrospective_before_timing_join"
 
 
 def test_main_scores_and_writes_frozen_record(tmp_path):
@@ -1621,6 +1833,74 @@ def test_import_legacy_debug_preserves_but_does_not_activate_useless_sync():
     assert summary["useless_record_site_count"] == 1
 
 
+def test_import_legacy_debug_exports_barrier_dependency_edge():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tadds [PIPE_V]
+[   1] COMPOUND pto.tmul [PIPE_V]
+  PRE : pipe_barrier <PIPE_V -> PIPE_V> idx=3 depNode=0
+// ========================================= //
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel")
+
+    assert record["sync_edges"] == [
+        {
+            "source": 0,
+            "target": 1,
+            "group": 0,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "loop_carried": False,
+            "root_buffers": [],
+        }
+    ]
+    assert record["sync_groups"][0]["operations"][0]["dependency_node"] == 0
+    assert record["export_limitations"]["barrier_dependency_nodes_missing"] == 0
+
+
+def test_import_legacy_debug_marks_barrier_without_dependency_incomplete():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tadds [PIPE_V]
+[   1] COMPOUND pto.tmul [PIPE_V]
+  PRE : pipe_barrier <PIPE_V -> PIPE_V> idx=3
+// ========================================= //
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel")
+
+    assert record["sync_edges"] == []
+    assert record["export_limitations"]["barrier_dependency_nodes_missing"] == 1
+
+
+def test_import_legacy_debug_classifies_loop_carried_barrier_dependency():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] LOOP LOOP_BEGIN (begin=0, end=3)
+  [   1] COMPOUND pto.tadds [PIPE_V]
+    PRE : pipe_barrier <PIPE_V -> PIPE_V> idx=3 depNode=2 forEnd=3
+  [   2] COMPOUND pto.tmul [PIPE_V]
+[   3] LOOP LOOP_END (begin=0, end=3)
+// ========================================= //
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel")
+
+    assert record["sync_groups"][0]["loop_carried"] is True
+    assert record["sync_edges"] == [
+        {
+            "source": 2,
+            "target": 1,
+            "group": 0,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "loop_carried": True,
+            "root_buffers": [],
+        }
+    ]
+
+
 def test_import_legacy_debug_does_not_treat_loop_boundary_lifecycle_as_recurrence():
     log = """
 // === [PTOInsertSync Debug] After EventId Allocation === //
@@ -1654,9 +1934,9 @@ def test_import_legacy_debug_preserves_genuine_loop_carried_recurrence():
 // === [PTOInsertSync Debug] After EventId Allocation === //
 [   0] LOOP LOOP_BEGIN (begin=0, end=3)
   [   1] COMPOUND pto.tload [PIPE_MTE2]
-    PRE : wait_flag <PIPE_V -> PIPE_MTE2> idx=3 forEnd=3 eventIds=[0]
+    PRE : wait_flag <PIPE_V -> PIPE_MTE2> idx=3 depNode=2 forEnd=3 eventIds=[0]
   [   2] COMPOUND pto.texpands [PIPE_V]
-    POST: set_flag <PIPE_V -> PIPE_MTE2> idx=3 forEnd=3 eventIds=[0]
+    POST: set_flag <PIPE_V -> PIPE_MTE2> idx=3 depNode=2 forEnd=3 eventIds=[0]
 [   3] LOOP LOOP_END (begin=0, end=3)
 // ========================================= //
 """
@@ -1798,6 +2078,31 @@ def test_import_legacy_debug_accepts_semantic_accumulating_matmul_name():
     assert operation["static_work_bytes"] == 4096
 
 
+@pytest.mark.parametrize(
+    ("trace_name", "raw_name"),
+    [
+        ("pto.tpush", "pto.tpush_to_aiv"),
+        ("pto.tpush", "pto.tpush_to_aic"),
+        ("pto.tpop", "pto.tpop_from_aiv"),
+        ("pto.tpop", "pto.tpop_from_aic"),
+    ],
+)
+def test_import_legacy_debug_accepts_mixed_kernel_operation_names(trace_name, raw_name):
+    log = f"""
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND {trace_name} [PIPE_FIX]
+// ========================================= //
+"""
+    tile_type = "!pto.tile_buf<loc=acc, dtype=f32, rows=16, cols=128>"
+    pto = f'{raw_name}(%tile : {tile_type}) loc("pypto.access.4")'
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    operation = record["nodes"][0]["operation"]
+    assert operation["raw_pto_op_name"] == raw_name
+    assert operation["pypto_access_order"] == 4
+
+
 def test_import_legacy_debug_rejects_non_accumulating_matmul_name_mismatch():
     log = """
 // === [PTOInsertSync Debug] After EventId Allocation === //
@@ -1874,6 +2179,57 @@ scf.for %i = %c0_index to %c32_index step %c2_index {
     ]
     assert record["export_limitations"]["static_loop_bounds_missing"] == 0
     assert dsa_schedule_model.classify_static_schedule(record)["status"] == "STATIC_SCHEDULE"
+
+
+def test_import_legacy_debug_joins_result_producing_static_loop_bounds():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] LOOP LOOP_BEGIN (begin=0, end=2)
+  [   1] COMPOUND pto.tadd [PIPE_V]
+[   2] LOOP LOOP_END (begin=0, end=2)
+// ========================================= //
+"""
+    pto = """
+%c0_index = arith.constant 0 : index
+%c2_index = arith.constant 2 : index
+%c32_index = arith.constant 32 : index
+%result = scf.for %i = %c0_index to %c32_index step %c2_index iter_args(%value = %initial) -> (i32) {
+  pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+}
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    assert [node["static_trip_count"] for node in record["nodes"] if node["kind"] == "loop"] == [
+        16,
+        16,
+    ]
+    assert record["export_limitations"]["static_loop_bounds_missing"] == 0
+
+
+def test_import_legacy_debug_fails_closed_when_raw_pto_contains_branch():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tadd [PIPE_V]
+// ========================================= //
+"""
+    pto = """
+func.func @kernel(%condition: i1) {
+  scf.if %condition {
+    pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+  }
+  return
+}
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    assert record["export_limitations"]["branch_nodes_missing"] == 1
+    model = dsa_schedule_model.DurationModel(calibration_status="test")
+    model.operation_cycles = {"PIPE_V:TADD": 1.0}
+    score = dsa_schedule_model.score_schedule(record, model)
+    assert score["latency_graph_complete"] is False
+    assert score["latency_graph_limitations"] == ["export_limitations.branch_nodes_missing"]
 
 
 def test_import_legacy_debug_preserves_genuinely_dynamic_loop():

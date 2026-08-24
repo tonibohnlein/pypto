@@ -25,17 +25,24 @@ _ARCH_RELATIVE_PATH = Path("include/pto/costmodel/arch_config.hpp")
 _LIGHTWEIGHT_RELATIVE_PATH = Path("include/pto/costmodel/lightweight_costmodel.hpp")
 _TRANSFER_RELATIVE_PATH = Path("include/pto/costmodel/a2a3/formula_costmodel/formula_backend_transfer.hpp")
 _COMPUTE_RELATIVE_PATH = Path("include/pto/costmodel/a2a3/formula_costmodel/formula_backend_compute.hpp")
+_PERF_SIM_PROVIDER_RELATIVE_PATH = Path("include/pto/costmodel/perf_sim/costmodel_provider.hpp")
+_PERF_SIM_LATENCY_RELATIVE_PATH = Path("include/pto/costmodel/perf_sim/latency.hpp")
 _REQUIRED_PATHS = (
     _FORMULA_RELATIVE_PATH,
     _ARCH_RELATIVE_PATH,
     _LIGHTWEIGHT_RELATIVE_PATH,
     _TRANSFER_RELATIVE_PATH,
     _COMPUTE_RELATIVE_PATH,
+    _PERF_SIM_PROVIDER_RELATIVE_PATH,
+    _PERF_SIM_LATENCY_RELATIVE_PATH,
 )
 
 _FORMULA_OPCODE = {
     "pto.tsub": "TSUB",
     "pto.tmul": "TMUL",
+    # A2/A3 lowers reciprocal to TDIVS(dst, 1, src); use the exact lowered
+    # instruction family when the pinned table carries this shape.
+    "pto.trecip": "TDIVS",
     "pto.tadds": "TADDS",
     "pto.tdivs": "TDIVS",
     "pto.tmuls": "TMULS",
@@ -51,6 +58,39 @@ _FORMULA_OPCODE = {
 _ANY_PARAMETER_OPS = {"TEXP", "TSQRT"}
 _MATMUL_OPS = {"pto.tmatmul", "pto.tmatmul.acc"}
 _TRANSFER_OPS = {"pto.tload": "TLOAD", "pto.tstore": "TSTORE", "pto.tmov": "TMOV"}
+_SCALAR_STAGE_OPS = {"pto.load_scalar", "pto.tpush", "pto.tpop"}
+_PERF_SIM_DEFAULT_OPS = {
+    "pto.tadd",
+    "pto.tadds",
+    "pto.tci",
+    "pto.tcolexpand",
+    "pto.tcolexpandexpdif",
+    "pto.tcolexpandmul",
+    "pto.tcvt",
+    "pto.texpands",
+    "pto.textract",
+    "pto.tgather",
+    "pto.tgetval",
+    "pto.tmrgsort",
+    "pto.tmuls",
+    "pto.tneg",
+    "pto.trowexpandmul",
+    "pto.trowsum",
+    "pto.tsetval",
+    "pto.tsort32",
+    "pto.tsubs",
+    "pto.ttrans",
+}
+_PERF_SIM_SOURCE_WORK_OPS = {
+    "pto.trowsum",
+    "pto.trowmax",
+    "pto.trowmin",
+    "pto.trowprod",
+    "pto.tcolsum",
+    "pto.tcolmax",
+    "pto.tcolmin",
+    "pto.tcolprod",
+}
 _DTYPE_BYTES = {
     "fp32": 4,
     "fp16": 2,
@@ -129,6 +169,7 @@ _PARTITION_TYPE_RE = re.compile(
     r"!pto\.partition_tensor_view<(?P<shape>(?:\d+x)*\d+)x(?P<dtype>[a-z][a-z0-9]*)>",
     re.IGNORECASE,
 )
+_SCALAR_TYPE_FULL_RE = re.compile(r"(?:bf16|f\d+|(?:ui|i)\d+|index)")
 
 
 @dataclass(frozen=True)
@@ -282,71 +323,132 @@ class PtoIsaDurationProvider:
             tile for item in [*operand_types, *result_types] if (tile := parse_tile_type(item)) is not None
         ]
 
+        if op_name in _SCALAR_STAGE_OPS:
+            return self._estimate_scalar_stage(node, op_name, operand_types, result_types)
         if op_name in _FORMULA_OPCODE:
-            if not tiles:
-                return self._unsupported(op_name, "formula operation has no static tile type")
-            tile = tiles[0]
-            opcode = _FORMULA_OPCODE[op_name]
-            parameter = self._lookup_formula(opcode, tile.dtype, tile.cols)
-            if parameter is None:
-                return self._unsupported(
-                    op_name,
-                    f"no PTO-ISA formula for dtype={tile.dtype}, cols={tile.cols}",
-                )
-            cycles = _round_to_cycles(parameter.slope * tile.rows * tile.cols + parameter.bias)
-            return DurationEstimate(
-                float(cycles),
-                "pto_isa_formula",
-                f"{opcode}:{tile.dtype}:{tile.rows}x{tile.cols}; "
-                f"slope={parameter.slope}; bias={parameter.bias}",
-            )
-
+            estimate = self._estimate_formula_operation(op_name, tiles)
+            if estimate is not None:
+                return estimate
         if op_name in _MATMUL_OPS:
-            lhs = next((tile for tile in tiles if tile.scope == "left"), None)
-            rhs = next((tile for tile in tiles if tile.scope == "right"), None)
-            if lhs is None or rhs is None:
-                return self._unsupported(op_name, "matmul has fewer than two static tile operands")
-            if lhs.cols != rhs.rows or lhs.dtype not in {"fp16", "fp32"}:
-                return self._unsupported(
-                    op_name,
-                    f"unsupported matmul types {lhs.rows}x{lhs.cols}x{lhs.dtype}, "
-                    f"{rhs.rows}x{rhs.cols}x{rhs.dtype}",
-                )
-            repeats = (
-                _ceil_div(lhs.rows, 16)
-                * _ceil_div(lhs.cols, 32 // _DTYPE_BYTES[lhs.dtype])
-                * _ceil_div(rhs.cols, 16)
-            )
-            cycles = 6 + (2 if lhs.dtype == "fp32" else 1) * repeats
-            return DurationEstimate(
-                float(cycles),
-                "pto_isa_matmul_formula",
-                f"m={lhs.rows}; k={lhs.cols}; n={rhs.cols}; dtype={lhs.dtype}; repeats={repeats}",
-            )
-
+            return self._estimate_matmul(op_name, tiles)
         if op_name in _TRANSFER_OPS:
-            if not tiles:
-                return self._unsupported(op_name, "transfer operation has no static tile type")
-            tile = tiles[-1] if op_name == "pto.tload" else tiles[0]
-            tile_type = _TILE_TO_SCOPE.get(tile.scope)
-            route = _TRANSFER_ROUTE.get((_TRANSFER_OPS[op_name], tile_type or ""))
-            bandwidth = self.bandwidth_gib_per_s.get(route or "")
-            element_bytes = _DTYPE_BYTES.get(tile.dtype)
-            transfer_bytes = tile.rows * tile.cols * element_bytes if element_bytes is not None else 0
-            if route is None or bandwidth is None or bandwidth <= 0 or transfer_bytes <= 0:
-                return self._unsupported(
-                    op_name,
-                    f"unsupported transfer tile={tile_type}, bytes={transfer_bytes}, route={route}",
-                )
-            cycles = math.floor((transfer_bytes / (1024**3)) / bandwidth * self.frequency_hz)
-            return DurationEstimate(
-                float(cycles),
-                "pto_isa_bandwidth",
-                f"route={route}; bytes={transfer_bytes}; bandwidth_gib_per_s={bandwidth}; "
-                f"frequency_hz={self.frequency_hz}",
-            )
-
+            return self._estimate_transfer(op_name, tiles)
+        if op_name in _PERF_SIM_DEFAULT_OPS:
+            return self._estimate_perf_sim_default(op_name, operand_types, result_types)
         return self._unsupported(op_name, "operation is not supported by PTO-ISA lightweight A2/A3 model")
+
+    def _estimate_scalar_stage(
+        self,
+        node: Mapping[str, Any],
+        op_name: str,
+        operand_types: list[str],
+        result_types: list[str],
+    ) -> DurationEstimate:
+        pipe = node.get("pipe")
+        if op_name == "pto.load_scalar":
+            pointer_types = [item for item in operand_types if item.startswith("!pto.ptr<")]
+            scalar_results = [item for item in result_types if _SCALAR_TYPE_FULL_RE.fullmatch(item)]
+            if len(pointer_types) != 1 or len(scalar_results) != 1:
+                return self._unsupported(op_name, "scalar load lacks one pointer and one scalar result")
+        elif pipe not in {"PIPE_S", "PIPE_FIX", "PIPE_MTE2"}:
+            return self._unsupported(op_name, f"unexpected mixed-kernel pipe {pipe}")
+        return DurationEstimate(
+            1.0,
+            "pto_isa_perf_sim_scalar_stage",
+            "Perf-Sim StaticPipeStageLookup classifies scalar operations and "
+            "FallbackCycles assigns one cycle",
+        )
+
+    def _estimate_formula_operation(self, op_name: str, tiles: list[TileType]) -> DurationEstimate | None:
+        if not tiles:
+            return self._unsupported(op_name, "formula operation has no static tile type")
+        tile = tiles[0]
+        opcode = _FORMULA_OPCODE[op_name]
+        parameter = self._lookup_formula(opcode, tile.dtype, tile.cols)
+        if parameter is None:
+            if op_name in _PERF_SIM_DEFAULT_OPS:
+                return None
+            return self._unsupported(
+                op_name,
+                f"no PTO-ISA formula for dtype={tile.dtype}, cols={tile.cols}",
+            )
+        cycles = _round_to_cycles(parameter.slope * tile.rows * tile.cols + parameter.bias)
+        return DurationEstimate(
+            float(cycles),
+            "pto_isa_formula",
+            f"{opcode}:{tile.dtype}:{tile.rows}x{tile.cols}; slope={parameter.slope}; bias={parameter.bias}",
+        )
+
+    def _estimate_matmul(self, op_name: str, tiles: list[TileType]) -> DurationEstimate:
+        lhs = next((tile for tile in tiles if tile.scope == "left"), None)
+        rhs = next((tile for tile in tiles if tile.scope == "right"), None)
+        if lhs is None or rhs is None:
+            return self._unsupported(op_name, "matmul has fewer than two static tile operands")
+        if lhs.cols != rhs.rows or lhs.dtype not in {"bf16", "fp16", "fp32"}:
+            return self._unsupported(
+                op_name,
+                f"unsupported matmul types {lhs.rows}x{lhs.cols}x{lhs.dtype}, "
+                f"{rhs.rows}x{rhs.cols}x{rhs.dtype}",
+            )
+        repeats = (
+            _ceil_div(lhs.rows, 16)
+            * _ceil_div(lhs.cols, 32 // _DTYPE_BYTES[lhs.dtype])
+            * _ceil_div(rhs.cols, 16)
+        )
+        cycles = 6 + (2 if lhs.dtype == "fp32" else 1) * repeats
+        return DurationEstimate(
+            float(cycles),
+            "pto_isa_matmul_formula",
+            f"m={lhs.rows}; k={lhs.cols}; n={rhs.cols}; dtype={lhs.dtype}; repeats={repeats}",
+        )
+
+    def _estimate_transfer(self, op_name: str, tiles: list[TileType]) -> DurationEstimate:
+        if not tiles:
+            return self._unsupported(op_name, "transfer operation has no static tile type")
+        tile = tiles[-1] if op_name == "pto.tload" else tiles[0]
+        tile_type = _TILE_TO_SCOPE.get(tile.scope)
+        route = _TRANSFER_ROUTE.get((_TRANSFER_OPS[op_name], tile_type or ""))
+        bandwidth = self.bandwidth_gib_per_s.get(route or "")
+        element_bytes = _DTYPE_BYTES.get(tile.dtype)
+        transfer_bytes = tile.rows * tile.cols * element_bytes if element_bytes is not None else 0
+        if route is None or bandwidth is None or bandwidth <= 0 or transfer_bytes <= 0:
+            return self._unsupported(
+                op_name,
+                f"unsupported transfer tile={tile_type}, bytes={transfer_bytes}, route={route}",
+            )
+        cycles = math.floor((transfer_bytes / (1024**3)) / bandwidth * self.frequency_hz)
+        return DurationEstimate(
+            float(cycles),
+            "pto_isa_bandwidth",
+            f"route={route}; bytes={transfer_bytes}; bandwidth_gib_per_s={bandwidth}; "
+            f"frequency_hz={self.frequency_hz}",
+        )
+
+    def _estimate_perf_sim_default(
+        self, op_name: str, operand_types: list[str], result_types: list[str]
+    ) -> DurationEstimate:
+        """Mirror pinned Perf-Sim's deterministic EstimateInstrCycles fallback."""
+        result_tiles = [tile for item in result_types if (tile := parse_tile_type(item)) is not None]
+        operand_tiles = [tile for item in operand_types if (tile := parse_tile_type(item)) is not None]
+        if op_name in _PERF_SIM_SOURCE_WORK_OPS:
+            work_tile = operand_tiles[0] if operand_tiles else None
+        else:
+            work_tile = result_tiles[0] if result_tiles else (operand_tiles[0] if operand_tiles else None)
+        if work_tile is None:
+            return self._unsupported(op_name, "Perf-Sim default operation has no static work tile")
+        elements = work_tile.rows * work_tile.cols
+        if op_name == "pto.ttrans":
+            cycles = 1 + elements // 64
+            stage = "MTE1"
+        else:
+            cycles = 2 + elements // 32
+            stage = "default"
+        return DurationEstimate(
+            float(cycles),
+            "pto_isa_perf_sim_default",
+            f"{op_name}:{work_tile.dtype}:{work_tile.rows}x{work_tile.cols}; "
+            f"stage={stage}; pinned EstimateInstrCycles fallback",
+        )
 
     def estimate_formula(self, op: str, dtype: str, rows: int, cols: int) -> DurationEstimate | None:
         """Estimate one formula opcode for direct Perf-Sim validation."""
