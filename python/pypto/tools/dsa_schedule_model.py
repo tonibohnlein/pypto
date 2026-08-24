@@ -70,9 +70,11 @@ _DEBUG_MEM_RE = re.compile(r"^\s*(def|use)=\[(.*)\]\s*$")
 _DEBUG_MEM_ITEM_RE = re.compile(r"(%[^,(\s]+)\(([^)]+)\)")
 _DEBUG_SYNC_RE = re.compile(
     r"^\s*(PRE|POST)\s*:?[ ]*(\w+)\s+<(\S+)\s+->\s+(\S+)>\s+idx=(\d+)"
-    r"(?:\s+forEnd=(\d+))?(.*)$"
+    r"(.*)$"
 )
 _DEBUG_EVENT_IDS_RE = re.compile(r"\beventIds=\[([^]]*)\]")
+_DEBUG_DEPENDENCY_NODE_RE = re.compile(r"\bdepNode=(\d+)\b")
+_DEBUG_FOR_END_RE = re.compile(r"\bforEnd=(\d+)\b")
 _ACCESS_LOCATION_RE = re.compile(r"pypto\.access\.(\d+)")
 _PTO_OPERATION_RE = re.compile(r"(?<![!\w.])(pto\.[A-Za-z0-9_]+)\b")
 _PTO_CONSTANT_RE = re.compile(
@@ -84,9 +86,11 @@ _PTO_SCALAR_CONSTANT_RE = re.compile(
 )
 _PTO_SSA_VALUE_RE = re.compile(r"%[-A-Za-z0-9_.$]+")
 _PTO_FOR_RE = re.compile(
-    r"^\s*scf\.for\s+%\S+\s*=\s*(%[-A-Za-z0-9_.$]+|-?\d+)\s+to\s+"
+    r"^\s*(?:%[-A-Za-z0-9_.$]+(?:#\d+)?\s*=\s*)?scf\.for\s+%\S+\s*=\s*"
+    r"(%[-A-Za-z0-9_.$]+|-?\d+)\s+to\s+"
     r"(%[-A-Za-z0-9_.$]+|-?\d+)\s+step\s+(%[-A-Za-z0-9_.$]+|-?\d+)\b"
 )
+_PTO_BRANCH_RE = re.compile(r"\b(?:scf\.(?:if|while|index_switch)|cf\.(?:br|cond_br|switch))\b")
 _PTO_TYPE_START_RE = re.compile(r"!pto\.[A-Za-z_][A-Za-z0-9_.]*<")
 _PTO_SCALAR_TYPE_RE = re.compile(
     r"(?<![A-Za-z0-9_=%])(?:bf16|f16|f32|ui8|ui16|ui32|ui64|i8|i16|i32|i64|index)\b"
@@ -323,11 +327,20 @@ def _operation_type_metadata(line: str, constants: Mapping[str, str]) -> dict[st
 
 
 def _join_operation_name(name: str) -> str:
-    return "pto.tmatmul" if name == "pto.tmatmul.acc" else name
+    aliases = {
+        "pto.tmatmul.acc": "pto.tmatmul",
+        "pto.tpush_to_aic": "pto.tpush",
+        "pto.tpush_to_aiv": "pto.tpush",
+        "pto.tpop_from_aic": "pto.tpop",
+        "pto.tpop_from_aiv": "pto.tpop",
+    }
+    return aliases.get(name, name)
 
 
 def _operation_names_match(expected: str, actual: str, metadata: Mapping[str, Any]) -> bool:
     if expected == actual:
+        return True
+    if expected in {"pto.tpush", "pto.tpop"} and _join_operation_name(actual) == expected:
         return True
     if expected != "pto.tmatmul.acc" or actual != "pto.tmatmul":
         return False
@@ -550,21 +563,24 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
 
         if current_node is not None and (match := _DEBUG_SYNC_RE.match(line)):
             sync_index = int(match.group(5))
-            suffix = match.group(7)
+            suffix = match.group(6)
             event_ids_match = _DEBUG_EVENT_IDS_RE.search(suffix)
             event_ids = (
                 [int(value) for value in event_ids_match.group(1).split(",") if value]
                 if event_ids_match
                 else []
             )
+            dependency_match = _DEBUG_DEPENDENCY_NODE_RE.search(suffix)
+            loop_end_match = _DEBUG_FOR_END_RE.search(suffix)
             sync_operations[sync_index].append(
                 {
                     "placement": match.group(1),
                     "type": match.group(2),
                     "node": current_node["id"],
+                    "dependency_node": (int(dependency_match.group(1)) if dependency_match else None),
                     "src_pipe": match.group(3),
                     "dst_pipe": match.group(4),
-                    "loop_end": int(match.group(6)) if match.group(6) else None,
+                    "loop_end": int(loop_end_match.group(1)) if loop_end_match else None,
                     "event_ids": event_ids,
                     "useless": bool(re.search(r"\buseless\b", suffix)),
                 }
@@ -599,11 +615,16 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
             for operation in active_operations
             if isinstance(operation.get("loop_end"), int)
         }
-        endpoint_nodes = [
-            nodes_by_id.get(operation["node"], {})
-            for operation in active_operations
-            if operation["type"] in {"set_flag", "wait_flag"}
-        ]
+        endpoint_node_ids: set[int] = set()
+        for operation in active_operations:
+            if operation["type"] in {"set_flag", "wait_flag"}:
+                endpoint_node_ids.add(operation["node"])
+            elif operation["type"].startswith("pipe_barrier"):
+                endpoint_node_ids.add(operation["node"])
+                dependency_node = operation.get("dependency_node")
+                if isinstance(dependency_node, int):
+                    endpoint_node_ids.add(dependency_node)
+        endpoint_nodes = [nodes_by_id.get(node_id, {}) for node_id in sorted(endpoint_node_ids)]
         loop_carried = bool(endpoint_nodes) and any(
             all(loop_begin in node.get("loop_stack", []) for node in endpoint_nodes)
             for loop_end in annotated_loop_ends
@@ -615,8 +636,18 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
         targets = sorted(
             {operation["node"] for operation in active_operations if operation["type"] == "wait_flag"}
         )
-        if not sources and any(operation["type"] == "pipe_barrier" for operation in active_operations):
-            omitted_barriers += 1
+        barriers = [
+            operation for operation in active_operations if operation["type"].startswith("pipe_barrier")
+        ]
+        for barrier in barriers:
+            dependency_node = barrier.get("dependency_node")
+            if isinstance(dependency_node, int):
+                sources.append(dependency_node)
+                targets.append(barrier["node"])
+            else:
+                omitted_barriers += 1
+        sources = sorted(set(sources))
+        targets = sorted(set(targets))
         group_id = len(sync_groups)
         sync_groups.append(
             {
@@ -652,6 +683,15 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
     missing_static_work_sizes = sum(
         not node.get("operation", {}).get("static_work_bytes") for node in operation_nodes
     )
+    # The legacy text dump does not print BranchInstanceElements. Without an
+    # explicit limitation, both arms appear as one serial stream and can yield
+    # a plausible but invalid latency DAG. The native schedule exporter remains
+    # the authoritative path for branch-aware records.
+    branch_nodes_missing = 0
+    if pto_text is not None:
+        branch_nodes_missing = sum(
+            bool(_PTO_BRANCH_RE.search(line.split("//", maxsplit=1)[0])) for line in pto_text.splitlines()
+        )
     return {
         "schema_version": 1,
         "function": function,
@@ -669,6 +709,7 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
             "static_work_sizes_missing": missing_static_work_sizes,
             "static_loop_bounds_missing": missing_static_loop_bounds,
             "barrier_dependency_nodes_missing": omitted_barriers,
+            "branch_nodes_missing": branch_nodes_missing,
             "access_provenance_missing": pto_text is None,
         },
         "nodes": nodes,
@@ -701,6 +742,12 @@ def _semantic_operation_text(operation: Mapping[str, Any]) -> str | None:
     """
     location = operation.get("location")
     if not isinstance(location, str) or not location:
+        return None
+    # Native PTOAS exports an MLIR source location in this field. The legacy
+    # text bridge stores the complete raw operation followed by `` loc(...)``.
+    # A bare location contains no execution semantics and must not make an
+    # otherwise portable duration signature depend on a checkout path.
+    if location.lstrip().startswith("loc("):
         return None
     semantic = location.split(" loc(", maxsplit=1)[0]
     semantic = _PTO_SSA_VALUE_RE.sub("%value", semantic)
@@ -910,25 +957,42 @@ def _pre_codegen_sync_record_summary(record: Mapping[str, Any]) -> dict[str, Any
 
 
 def _latency_graph_completeness(
-    record: Mapping[str, Any], edge_diagnostics: Mapping[str, int]
+    record: Mapping[str, Any],
+    edge_diagnostics: Mapping[str, int],
+    loop_sync_models: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    modeled_loop_carried = sum(len(model.get("loop_carried_recurrences", [])) for model in loop_sync_models)
+    non_cycle_loop_carried = sum(
+        recurrence.get("cycles") is None
+        for model in loop_sync_models
+        for recurrence in model.get("loop_carried_recurrences", [])
+        if isinstance(recurrence, Mapping)
+    )
+    excluded_loop_carried = edge_diagnostics.get("excluded_loop_carried_sync_edges", 0)
+    unresolved_loop_carried = max(0, excluded_loop_carried - modeled_loop_carried)
     limitations = [
         name
         for name in (
-            "excluded_loop_carried_sync_edges",
             "excluded_non_operation_stream_edges",
             "excluded_non_operation_sync_edges",
         )
         if edge_diagnostics.get(name, 0) > 0
     ]
+    if modeled_loop_carried != excluded_loop_carried:
+        limitations.append("unresolved_loop_carried_sync_edges")
     export_limitations = record.get("export_limitations", {})
     if isinstance(export_limitations, Mapping) and export_limitations.get(
         "barrier_dependency_nodes_missing", 0
     ):
         limitations.append("export_limitations.barrier_dependency_nodes_missing")
+    if isinstance(export_limitations, Mapping) and export_limitations.get("branch_nodes_missing", 0):
+        limitations.append("export_limitations.branch_nodes_missing")
     return {
         "latency_graph_complete": not limitations,
         "latency_graph_limitations": limitations,
+        "modeled_loop_carried_sync_edges": modeled_loop_carried,
+        "unresolved_loop_carried_sync_edges": unresolved_loop_carried,
+        "non_cycle_loop_carried_sync_edges": non_cycle_loop_carried,
     }
 
 
@@ -1033,12 +1097,12 @@ def _schedule_graph_durations(
     return durations
 
 
-def _graph_edges(
-    record: Mapping[str, Any], node_ids: set[int], *, include_sync: bool
-) -> tuple[list[tuple[int, int, float, str, int | None]], dict[str, int]]:
+def _stream_graph_edges(
+    record: Mapping[str, Any], node_ids: set[int]
+) -> tuple[list[tuple[int, int, float, str, int | None]], int]:
     edges: list[tuple[int, int, float, str, int | None]] = []
     seen: set[tuple[int, int, str, int | None]] = set()
-    excluded_non_operation_stream_edges = 0
+    excluded = 0
     for edge in record.get("stream_edges", []):
         if not isinstance(edge, Mapping):
             continue
@@ -1050,32 +1114,72 @@ def _graph_edges(
             edges.append((source, target, 0.0, "stream", None))
             seen.add(key)
         elif source not in node_ids or target not in node_ids:
-            excluded_non_operation_stream_edges += 1
+            excluded += 1
+    return edges, excluded
 
+
+def _sync_graph_edges(
+    record: Mapping[str, Any], node_ids: set[int]
+) -> tuple[list[tuple[int, int, float, str, int | None]], dict[str, int]]:
+    edges: list[tuple[int, int, float, str, int | None]] = []
+    seen: set[tuple[int, int, str, int | None]] = set()
+    resolved_loop_carried = _effective_loop_carried_edge_indices(record)
+    declared_loop_carried = 0
     excluded_loop_carried = 0
+    reclassified_non_recurrence = 0
     excluded_non_operation_sync_edges = 0
-    if include_sync:
-        for edge in record.get("sync_edges", []):
-            if not isinstance(edge, Mapping):
-                continue
-            if edge.get("loop_carried"):
-                excluded_loop_carried += 1
-                continue
-            source, target, group = edge.get("source"), edge.get("target"), edge.get("group")
-            if not isinstance(source, int) or not isinstance(target, int):
-                continue
-            group_id = group if isinstance(group, int) else None
-            key = (source, target, "sync", group_id)
-            if source in node_ids and target in node_ids and source != target and key not in seen:
-                edges.append((source, target, 0.0, "sync", group_id))
-                seen.add(key)
-            elif source not in node_ids or target not in node_ids:
+    excluded_sentinel_sync_edges = 0
+    for edge_index, edge in enumerate(record.get("sync_edges", [])):
+        if not isinstance(edge, Mapping):
+            continue
+        if edge.get("loop_carried"):
+            declared_loop_carried += 1
+        if edge_index in resolved_loop_carried:
+            excluded_loop_carried += 1
+            continue
+        if edge.get("loop_carried"):
+            reclassified_non_recurrence += 1
+        source, target, group = edge.get("source"), edge.get("target"), edge.get("group")
+        if not isinstance(source, int) or not isinstance(target, int):
+            continue
+        group_id = group if isinstance(group, int) else None
+        key = (source, target, "sync", group_id)
+        if source in node_ids and target in node_ids and source != target and key not in seen:
+            edges.append((source, target, 0.0, "sync", group_id))
+            seen.add(key)
+        elif source not in node_ids or target not in node_ids:
+            # PTOAS uses dependency node zero as the source of the final
+            # PIPE_ALL tail barrier when the function has no real node zero.
+            if (source == 0 and source not in node_ids) or (target == 0 and target not in node_ids):
+                excluded_sentinel_sync_edges += 1
+            else:
                 excluded_non_operation_sync_edges += 1
     return edges, {
         "excluded_loop_carried_sync_edges": excluded_loop_carried,
-        "excluded_non_operation_stream_edges": excluded_non_operation_stream_edges,
+        "declared_loop_carried_sync_edges": declared_loop_carried,
+        "reclassified_non_recurrence_sync_edges": reclassified_non_recurrence,
         "excluded_non_operation_sync_edges": excluded_non_operation_sync_edges,
+        "excluded_sentinel_sync_edges": excluded_sentinel_sync_edges,
     }
+
+
+def _graph_edges(
+    record: Mapping[str, Any], node_ids: set[int], *, include_sync: bool
+) -> tuple[list[tuple[int, int, float, str, int | None]], dict[str, int]]:
+    edges, excluded_stream_edges = _stream_graph_edges(record, node_ids)
+    diagnostics = {
+        "excluded_loop_carried_sync_edges": 0,
+        "declared_loop_carried_sync_edges": 0,
+        "reclassified_non_recurrence_sync_edges": 0,
+        "excluded_non_operation_stream_edges": excluded_stream_edges,
+        "excluded_non_operation_sync_edges": 0,
+        "excluded_sentinel_sync_edges": 0,
+    }
+    if include_sync:
+        sync_edges, sync_diagnostics = _sync_graph_edges(record, node_ids)
+        edges.extend(sync_edges)
+        diagnostics.update(sync_diagnostics)
+    return edges, diagnostics
 
 
 def _longest_path(
@@ -1325,9 +1429,16 @@ def _resolve_loop_carried_sync_edges(
     sync_edges: Sequence[Mapping[str, Any]],
     groups: Mapping[int, Mapping[str, Any]],
     loops: Sequence[Mapping[str, Any]],
-    operation_ids_by_loop: Mapping[int, set[int]],
+    schedule_ids_by_loop: Mapping[int, set[int]],
 ) -> dict[int, int]:
-    """Resolve every loop-carried sync edge to exactly one loop."""
+    """Resolve actual loop recurrences among edges carrying PTOAS loop metadata.
+
+    PTOAS retains ``forEnd`` on synchronization operations after later passes
+    move them outside the originating loop. Such an edge is historically
+    loop-derived, but its final placement is an ordinary DAG dependency, not
+    an iteration recurrence. Only endpoints that both remain inside exactly
+    one annotated loop are recurrence constraints.
+    """
     resolved_loop_carried: dict[int, int] = {}
     for edge_index, edge in enumerate(sync_edges):
         if not edge.get("loop_carried"):
@@ -1346,21 +1457,61 @@ def _resolve_loop_carried_sync_edges(
         explicit_loop_end = edge.get("loop_end")
         if isinstance(explicit_loop_end, int):
             loop_ends.add(explicit_loop_end)
+        if not loop_ends:
+            raise ValueError(
+                "loop-carried schedule edge has no loop identity and does not resolve to exactly "
+                "one loop model: "
+                f"edge={source}->{target}, group={edge.get('group')}, loop_ends=[], matches=[]"
+            )
         matching_loops = [
             loop["id"]
             for loop in loops
             if loop.get("end") in loop_ends
-            and source in operation_ids_by_loop[loop["id"]]
-            and target in operation_ids_by_loop[loop["id"]]
+            and source in schedule_ids_by_loop[loop["id"]]
+            and target in schedule_ids_by_loop[loop["id"]]
         ]
-        if len(matching_loops) != 1:
+        if len(matching_loops) > 1:
             raise ValueError(
-                "loop-carried sync edge does not resolve to exactly one loop model: "
+                "loop-carried sync edge resolves to multiple loop models: "
                 f"edge={source}->{target}, group={edge.get('group')}, "
                 f"loop_ends={sorted(loop_ends)}, matches={matching_loops}"
             )
-        resolved_loop_carried[edge_index] = matching_loops[0]
+        if matching_loops:
+            resolved_loop_carried[edge_index] = matching_loops[0]
+            continue
+        annotated_loop_exists = any(loop.get("end") in loop_ends for loop in loops)
+        if not annotated_loop_exists:
+            raise ValueError(
+                "loop-carried sync edge does not resolve to exactly one loop model: "
+                f"edge={source}->{target}, group={edge.get('group')}, "
+                f"loop_ends={sorted(loop_ends)}, matches=[]"
+            )
     return resolved_loop_carried
+
+
+def _effective_loop_carried_edge_indices(record: Mapping[str, Any]) -> dict[int, int]:
+    nodes = [node for node in record.get("nodes", []) if isinstance(node, Mapping)]
+    nodes_by_id = {node["id"]: node for node in nodes if isinstance(node.get("id"), int)}
+    loops = [
+        node
+        for node in nodes
+        if node.get("kind") == "loop"
+        and node.get("loop_kind") == "LOOP_BEGIN"
+        and isinstance(node.get("id"), int)
+    ]
+    schedule_ids_by_loop = {
+        loop["id"]: {
+            node_id for node_id, node in nodes_by_id.items() if loop["id"] in node.get("loop_stack", [])
+        }
+        for loop in loops
+    }
+    groups = {
+        group["id"]: group
+        for group in record.get("sync_groups", [])
+        if isinstance(group, Mapping) and isinstance(group.get("id"), int)
+    }
+    sync_edges = [edge for edge in record.get("sync_edges", []) if isinstance(edge, Mapping)]
+    return _resolve_loop_carried_sync_edges(sync_edges, groups, loops, schedule_ids_by_loop)
 
 
 def _loop_boundary_kind(
@@ -1423,38 +1574,45 @@ def _existing_loop_sync_models(
         and loop.get("loop_kind") == "LOOP_BEGIN"
         and isinstance(loop.get("id"), int)
     ]
-    operation_ids_by_loop: dict[int, set[int]] = {}
+    schedule_ids_by_loop: dict[int, set[int]] = {}
     for loop in loops:
         loop_id = loop.get("id")
         if not isinstance(loop_id, int):
             continue
-        operation_ids_by_loop[loop_id] = {
-            node_id for node_id, node in operation_nodes.items() if loop_id in node.get("loop_stack", [])
+        # Nested loop begin/end markers are real synchronization placement
+        # sites. Include them in the enclosing loop's per-iteration graph at
+        # zero duration; otherwise a recurrence from an inner loop boundary
+        # to the next outer iteration cannot be joined to its loop model.
+        schedule_ids_by_loop[loop_id] = {
+            node_id
+            for node_id, node in nodes_by_id.items()
+            if loop_id in node.get("loop_stack", [])
+            and (node.get("kind") == "loop" or node_id in operation_durations)
         }
     sync_edges = [edge for edge in record.get("sync_edges", []) if isinstance(edge, Mapping)]
-    resolved_loop_carried = _resolve_loop_carried_sync_edges(sync_edges, groups, loops, operation_ids_by_loop)
+    resolved_loop_carried = _resolve_loop_carried_sync_edges(sync_edges, groups, loops, schedule_ids_by_loop)
 
     models: list[dict[str, Any]] = []
     for loop in loops:
         loop_id = loop["id"]
         loop_end = loop.get("end")
-        loop_operation_ids = operation_ids_by_loop[loop_id]
+        loop_schedule_ids = schedule_ids_by_loop[loop_id]
         iteration_durations: dict[int, float] = {}
         pipe_work: dict[str, float] = defaultdict(float)
-        for node_id in loop_operation_ids:
-            node = operation_nodes[node_id]
+        for node_id in loop_schedule_ids:
+            node = nodes_by_id[node_id]
             loop_stack = node.get("loop_stack", [])
             selected_index = loop_stack.index(loop_id)
             divisor = math.prod(
                 loop_counts.get(containing_loop, 1) for containing_loop in loop_stack[: selected_index + 1]
             )
-            duration = operation_durations[node_id] / max(divisor, 1)
+            duration = operation_durations.get(node_id, 0.0) / max(divisor, 1)
             iteration_durations[node_id] = duration
             pipe = node.get("pipe")
-            if isinstance(pipe, str):
+            if node.get("kind") == "operation" and isinstance(pipe, str):
                 pipe_work[pipe] += duration
         body_edges = [
-            edge for edge in graph_edges if edge[0] in loop_operation_ids and edge[1] in loop_operation_ids
+            edge for edge in graph_edges if edge[0] in loop_schedule_ids and edge[1] in loop_schedule_ids
         ]
 
         recurrences: list[dict[str, Any]] = []
@@ -1463,7 +1621,7 @@ def _existing_loop_sync_models(
             source, target = edge.get("source"), edge.get("target")
             if not isinstance(source, int) or not isinstance(target, int):
                 continue
-            if edge.get("loop_carried"):
+            if edge_index in resolved_loop_carried:
                 if resolved_loop_carried[edge_index] != loop_id:
                     continue
                 recurrence_path = _longest_path_between(iteration_durations, body_edges, target, source)
@@ -1502,7 +1660,10 @@ def _existing_loop_sync_models(
                 "loop_node": loop_id,
                 "loop_end_node": loop_end,
                 "static_trip_count": None if loop_id in dynamic_loops else loop_counts.get(loop_id, 1),
-                "operation_node_count": len(loop_operation_ids),
+                "operation_node_count": sum(node_id in operation_nodes for node_id in loop_schedule_ids),
+                "structural_node_count": sum(
+                    nodes_by_id[node_id].get("kind") == "loop" for node_id in loop_schedule_ids
+                ),
                 "pipe_work_cycles": dict(sorted(pipe_work.items())),
                 "resource_ii_lower_bound_cycles": resource_bound,
                 "recurrence_ii_lower_bound_cycles": recurrence_bound,
@@ -1582,7 +1743,7 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "loop_sync_models": loop_sync_models,
         "dynamic_loop_ids": dynamic_loops,
         **edge_diagnostics,
-        **_latency_graph_completeness(record, edge_diagnostics),
+        **_latency_graph_completeness(record, edge_diagnostics, loop_sync_models),
         "operation_nodes": len(operation_durations),
         "exact_duration_nodes": exact,
         "fallback_duration_nodes": fallback,
@@ -2311,7 +2472,7 @@ def score_reuse_candidates(
         "loop_sync_model_version": "loop_sync_ii_and_boundary_v1",
         "baseline_loop_sync_models": baseline_loop_sync_models,
         **edge_diagnostics,
-        **_latency_graph_completeness(record, edge_diagnostics),
+        **_latency_graph_completeness(record, edge_diagnostics, baseline_loop_sync_models),
         "candidate_count": len(candidates),
         "scored_candidate_count": sum(
             row.get("status") in {"scored", "loop_carried_scored_v1"} for row in rows
@@ -2458,6 +2619,12 @@ _PERF_SIM_SOURCE_WORK_OPERATIONS = {
     "TCOLMIN",
     "TCOLPROD",
 }
+_PERF_SIM_LOWERED_OPERATION = {
+    # On A2/A3, PTO-ISA implements TRECIP(dst, src) as TDIVS(dst, 1, src).
+    # Keep TRECIP in the schedule-duration key, but require the exact lowered
+    # event (including the divisor below) when calibrating it from Perf-Sim.
+    "TRECIP": "TDIVS",
+}
 _TILE_SCOPE_CODE = {
     "vec": 0,
     "mat": 1,
@@ -2559,6 +2726,8 @@ def _expected_perf_sim_scalar(raw_constant: Any) -> str | None:
 
 
 def _semantic_perf_sim_scalars(operation: Mapping[str, Any], op_name: str) -> list[str]:
+    if op_name == "pto.trecip":
+        return ["i:1"]
     if op_name == "pto.tcvt":
         attributes = operation.get("attributes", {})
         mode = attributes.get("round_mode") if isinstance(attributes, Mapping) else None
@@ -2667,7 +2836,7 @@ def expected_perf_sim_event_signature(node: Mapping[str, Any]) -> dict[str, Any]
     work_index = 1 if signature["operation"] in _PERF_SIM_SOURCE_WORK_OPERATIONS and len(tiles) > 1 else 0
     work_tile = tiles[work_index]
     return {
-        "operation": signature["operation"],
+        "operation": _PERF_SIM_LOWERED_OPERATION.get(signature["operation"], signature["operation"]),
         "rows": work_tile["rows"],
         "cols": work_tile["cols"],
         "dtype": _canonical_perf_sim_dtype(work_tile["dtype"]),
@@ -2873,14 +3042,23 @@ def _write_json(path: Path | None, value: Any) -> None:
 
 
 def freeze_predictions(
-    predictions: Mapping[str, Any], *, cohort: str, source_paths: Sequence[Path]
+    predictions: Mapping[str, Any],
+    *,
+    cohort: str,
+    source_paths: Sequence[Path],
+    frozen_before_device_timing: bool = True,
+    freeze_context: str | None = None,
 ) -> dict[str, Any]:
     """Wrap predictions in a content-addressed holdout record."""
+    context = freeze_context or (
+        "prospective_holdout" if frozen_before_device_timing else "retrospective_before_timing_join"
+    )
     canonical = json.dumps(predictions, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     return {
         "schema_version": 1,
         "cohort": cohort,
-        "frozen_before_device_timing": True,
+        "frozen_before_device_timing": frozen_before_device_timing,
+        "freeze_context": context,
         "prediction_sha256": hashlib.sha256(canonical).hexdigest(),
         "schedule_sources": [
             {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
