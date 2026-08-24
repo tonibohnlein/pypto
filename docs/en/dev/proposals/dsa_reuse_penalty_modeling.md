@@ -116,7 +116,7 @@ The exact ordered-pair study added two important counterexamples to the
 previous v4 policy:
 
 | Pair class | Result |
-| --- | --- |
+| ---------- | ------ |
 | SSA-ordered `V -> MTE2` WAR | overlap added one matching PTOAS handoff |
 | unordered `M -> MTE1` WAR | overlap removed a redundant handoff, with no confirmed latency effect |
 | four other matched pairs | synchronization unchanged |
@@ -150,7 +150,7 @@ the same positive performance weight is too broad:
 Three forms of ordering must remain distinct:
 
 | Layer | Question |
-| --- | --- |
+| ----- | -------- |
 | Logical ordering | Can one PyPTO value-producing operation reach another? |
 | Completion ordering | Has the prior asynchronous access released the reused bytes before the overwrite? |
 | Exposed delay | Does extending that release point change initiation interval or kernel latency? |
@@ -236,6 +236,10 @@ under the versioned `event_key_lexical_and_innermost_backedge_v1` contract.
 Those transitions are not directly emitted facts: event IDs can be recycled,
 and lowered IR does not preserve Final-SyncIR group identity. The inference
 therefore remains separate from the actual instruction-site counts.
+For statically bounded loops, the collector also reports estimated dynamic
+instruction executions by multiplying each actual site by its enclosing trip
+counts. The estimate is labelled incomplete instead of guessing when a
+synchronization site's enclosing loop bound is dynamic or unresolved.
 
 ```bash
 python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \
@@ -387,6 +391,12 @@ when an operation or `pypto.access.N` location is missing:
 python -m pypto.tools.dsa_schedule_model import-debug insert-sync.log \
     --function kernel --pto kernel.pto -o schedule.jsonl
 ```
+
+PTOAS also attaches a loop-end identity to some function-wide event
+lifecycles. The bridge classifies a group as a recurrence only when every
+active set/wait endpoint is an operation inside the indicated loop. A
+prologue-to-loop-end or prologue-to-epilogue lifecycle remains a boundary
+dependency rather than becoming a spurious initiation-interval constraint.
 
 The raw-PTO join also preserves operand/result types and scalar constant
 operands, and derives `static_work_bytes` from statically shaped tile and

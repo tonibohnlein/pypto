@@ -1621,6 +1621,34 @@ def test_import_legacy_debug_preserves_but_does_not_activate_useless_sync():
     assert summary["useless_record_site_count"] == 1
 
 
+def test_import_legacy_debug_does_not_treat_loop_boundary_lifecycle_as_recurrence():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.texpands [PIPE_V]
+  PRE : set_flag <PIPE_V -> PIPE_MTE2> idx=3 forEnd=3 eventIds=[0]
+[   1] LOOP LOOP_BEGIN (begin=1, end=3)
+  [   2] COMPOUND pto.tload [PIPE_MTE2]
+[   3] LOOP LOOP_END (begin=1, end=3)
+  POST: wait_flag <PIPE_V -> PIPE_MTE2> idx=3 forEnd=3 eventIds=[0]
+// ========================================= //
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel")
+
+    assert record["sync_groups"][0]["loop_carried"] is False
+    assert record["sync_edges"] == [
+        {
+            "source": 0,
+            "target": 3,
+            "group": 0,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_MTE2",
+            "loop_carried": False,
+            "root_buffers": [],
+        }
+    ]
+
+
 def test_import_legacy_debug_rejects_incomplete_log():
     with pytest.raises(ValueError, match="no final"):
         dsa_schedule_model.import_insert_sync_debug("no phases", function="kernel")

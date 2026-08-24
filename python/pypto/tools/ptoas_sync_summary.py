@@ -36,6 +36,13 @@ _PIPE_RE = re.compile(r"\bPIPE_[A-Z0-9_]+\b")
 _EVENT_RE = re.compile(r"\bEVENT_ID[A-Z0-9_]+\b")
 _SSA_RE = re.compile(r"%[-A-Za-z0-9_.$]+")
 _LOOP_RE = re.compile(r"\bscf\.for\b")
+_INTEGER_CONSTANT_RE = re.compile(
+    r"^\s*(%[-A-Za-z0-9_.$]+)\s*=\s*arith\.constant\s+(-?\d+)\s*:\s*(?:index|i\d+)\b"
+)
+_FOR_RE = re.compile(
+    r"\bscf\.for\s+%\S+\s*=\s*(%[-A-Za-z0-9_.$]+|-?\d+)\s+to\s+"
+    r"(%[-A-Za-z0-9_.$]+|-?\d+)\s+step\s+(%[-A-Za-z0-9_.$]+|-?\d+)\b"
+)
 
 
 def load_sync_summaries(path: str | Path) -> dict[str, dict[str, Any]]:
@@ -165,7 +172,11 @@ def _transition_kind(before: Mapping[str, Any], after: Mapping[str, Any]) -> str
     return "cross_loop_boundary"
 
 
-def _summarize_lowered_function(function: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
+def _summarize_lowered_function(
+    function: str,
+    operations: list[dict[str, Any]],
+    loop_trip_counts: Mapping[int, int | None],
+) -> dict[str, Any]:
     by_type = Counter(str(operation["type"]) for operation in operations)
     by_pipe_pair = Counter(
         f"{operation['src_pipe']}->{operation['dst_pipe']}"
@@ -219,6 +230,38 @@ def _summarize_lowered_function(function: str, operations: list[dict[str, Any]])
                 }
             )
     transition_counts = Counter(transition["kind"] for transition in transitions)
+    execution_multipliers: list[int | None] = []
+    for operation in operations:
+        multiplier = 1
+        for loop_id in operation["loop_stack"]:
+            trip_count = loop_trip_counts.get(loop_id)
+            if trip_count is None:
+                multiplier = None
+                break
+            multiplier *= trip_count
+        execution_multipliers.append(multiplier)
+    execution_complete = all(multiplier is not None for multiplier in execution_multipliers)
+
+    def weighted_counts(key) -> dict[str, int] | None:
+        if not execution_complete:
+            return None
+        counts: Counter[str] = Counter()
+        for operation, multiplier in zip(operations, execution_multipliers, strict=True):
+            if multiplier is None:
+                raise AssertionError("complete execution multipliers must be integers")
+            label = key(operation)
+            if label is not None:
+                counts[str(label)] += multiplier
+        return dict(sorted(counts.items()))
+
+    estimated_instruction_executions = None
+    if execution_complete:
+        estimated_instruction_executions = 0
+        for multiplier in execution_multipliers:
+            if multiplier is None:
+                raise AssertionError("complete execution multipliers must be integers")
+            estimated_instruction_executions += multiplier
+
     return {
         "schema_version": 1,
         "summary_kind": "actual_post_insert_sync_lowered_ir_v1",
@@ -229,6 +272,24 @@ def _summarize_lowered_function(function: str, operations: list[dict[str, Any]])
         "barrier_sites_by_pipe": dict(sorted(barriers_by_pipe.items())),
         "inside_loop_instruction_sites": sum(bool(operation["loop_stack"]) for operation in operations),
         "outside_loop_instruction_sites": sum(not operation["loop_stack"] for operation in operations),
+        "static_loop_trip_counts": {
+            str(loop_id): trip_count for loop_id, trip_count in sorted(loop_trip_counts.items())
+        },
+        "static_execution_estimate_status": (
+            "COMPLETE" if execution_complete else "INCOMPLETE_DYNAMIC_OR_UNRESOLVED_LOOP"
+        ),
+        "static_estimated_instruction_executions": estimated_instruction_executions,
+        "static_estimated_executions_by_type": weighted_counts(lambda operation: operation["type"]),
+        "static_estimated_executions_by_pipe_pair": weighted_counts(
+            lambda operation: (
+                None
+                if operation["type"] == "barrier"
+                else f"{operation['src_pipe']}->{operation['dst_pipe']}"
+            )
+        ),
+        "static_estimated_barrier_executions_by_pipe": weighted_counts(
+            lambda operation: operation["src_pipe"] if operation["type"] == "barrier" else None
+        ),
         "transition_inference_version": "event_key_lexical_and_innermost_backedge_v1",
         "inferred_transition_counts": dict(sorted(transition_counts.items())),
         "operations": operations,
@@ -241,25 +302,30 @@ def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles funct
 ) -> dict[str, dict[str, Any]]:
     """Summarize synchronization instructions present in lowered post-InsertSync PTO IR."""
     functions: dict[str, list[dict[str, Any]]] = {}
+    loop_trip_counts_by_function: dict[str, dict[int, int | None]] = {}
     current_function: str | None = None
     function_opened = False
     depth = 0
     loop_stack: list[tuple[int, int]] = []
-    pending_loop_line: int | None = None
+    pending_loop: tuple[int, int | None] | None = None
+    integer_constants: dict[str, int] = {}
     for line_number, line in enumerate(text.splitlines(), start=1):
         code = line.split("//", maxsplit=1)[0]
         if current_function is None:
             function_match = _FUNCTION_RE.search(code)
             if function_match is None:
                 continue
-            current_function = function_match.group(1)
-            if current_function in functions:
-                raise ValueError(f"lowered PTO repeats function '{current_function}'")
-            functions[current_function] = []
+            function_name = function_match.group(1)
+            if function_name in functions:
+                raise ValueError(f"lowered PTO repeats function '{function_name}'")
+            functions[function_name] = []
+            loop_trip_counts_by_function[function_name] = {}
+            current_function = function_name
             function_opened = "{" in code
             depth = code.count("{") - code.count("}") if function_opened else 0
             loop_stack = []
-            pending_loop_line = None
+            pending_loop = None
+            integer_constants = {}
             continue
 
         leading = code.lstrip()
@@ -268,6 +334,9 @@ def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles funct
             depth -= leading_closes
             while loop_stack and loop_stack[-1][1] > depth:
                 loop_stack.pop()
+
+        if constant_match := _INTEGER_CONSTANT_RE.match(code):
+            integer_constants[constant_match.group(1)] = int(constant_match.group(2))
 
         if _HIGH_LEVEL_SYNC_RE.search(code):
             raise ValueError(
@@ -324,23 +393,34 @@ def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles funct
         if not function_opened and opens:
             function_opened = True
         if _LOOP_RE.search(code):
-            pending_loop_line = line_number
-        if pending_loop_line is not None and opens > closes:
-            loop_stack.append((pending_loop_line, depth + 1))
-            pending_loop_line = None
+            trip_count = None
+            if loop_match := _FOR_RE.search(code):
+                values = [
+                    integer_constants.get(value) if value.startswith("%") else int(value)
+                    for value in loop_match.groups()
+                ]
+                lower, upper, step = values
+                if lower is not None and upper is not None and step is not None and step > 0:
+                    trip_count = max(0, (upper - lower + step - 1) // step)
+            pending_loop = (line_number, trip_count)
+        if pending_loop is not None and opens > closes:
+            loop_line, trip_count = pending_loop
+            loop_stack.append((loop_line, depth + 1))
+            loop_trip_counts_by_function[current_function][loop_line] = trip_count
+            pending_loop = None
         depth += opens - closes
         if function_opened and depth <= 0:
             current_function = None
             function_opened = False
             loop_stack = []
-            pending_loop_line = None
+            pending_loop = None
 
     if current_function is not None:
         raise ValueError(f"unterminated function '{current_function}' in lowered PTO")
     if not functions:
         raise ValueError("lowered PTO contains no functions")
     return {
-        function: _summarize_lowered_function(function, operations)
+        function: _summarize_lowered_function(function, operations, loop_trip_counts_by_function[function])
         for function, operations in sorted(functions.items())
     }
 
@@ -371,7 +451,16 @@ def summarize_arm_manifest(path: str | Path) -> dict[str, Any]:
             raise ValueError(f"{source}: cell {index} must be an object")
         case, capacity, arm = cell.get("case"), cell.get("capacity"), cell.get("arm")
         raw_pto = cell.get("post_insert_sync_pto")
-        if not all(isinstance(value, str) and value for value in (case, capacity, arm, raw_pto)):
+        if (
+            not isinstance(case, str)
+            or not case
+            or not isinstance(capacity, str)
+            or not capacity
+            or not isinstance(arm, str)
+            or not arm
+            or not isinstance(raw_pto, str)
+            or not raw_pto
+        ):
             raise ValueError(f"{source}: cell {index} has incomplete identity or PTO path")
         key = (case, capacity, arm)
         if key in cell_keys:
@@ -383,6 +472,8 @@ def summarize_arm_manifest(path: str | Path) -> dict[str, Any]:
         summaries = summarize_lowered_pto(pto_bytes.decode())
         requested_function = cell.get("function")
         if requested_function is not None:
+            if not isinstance(requested_function, str) or not requested_function:
+                raise ValueError(f"{source}: cell {index} has invalid function identity")
             if requested_function not in summaries:
                 raise ValueError(f"{pto_path}: function '{requested_function}' is not present")
             summaries = {requested_function: summaries[requested_function]}

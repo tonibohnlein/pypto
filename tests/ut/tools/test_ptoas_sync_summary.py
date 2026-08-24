@@ -104,7 +104,7 @@ module {
   func.func @kernel() {
     // pto.set_flag[<PIPE_M>, <PIPE_FIX>, <EVENT_ID7>] must not be counted.
     pto.set_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
-    scf.for %i = %c0 to %c4 step %c1 {
+    scf.for %i = 0 to 4 step 1 {
       pto.wait_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
       pto.barrier <PIPE_V>
       pto.set_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
@@ -128,6 +128,16 @@ def test_summarize_lowered_pto_models_loop_entry_carried_and_exit_transitions():
     }
     assert summary["inside_loop_instruction_sites"] == 3
     assert summary["outside_loop_instruction_sites"] == 2
+    assert summary["static_loop_trip_counts"] == {"6": 4}
+    assert summary["static_execution_estimate_status"] == "COMPLETE"
+    assert summary["static_estimated_instruction_executions"] == 14
+    assert summary["static_estimated_executions_by_type"] == {
+        "barrier": 4,
+        "set_flag": 5,
+        "wait_flag": 5,
+    }
+    assert summary["static_estimated_executions_by_pipe_pair"] == {"PIPE_MTE2->PIPE_V": 10}
+    assert summary["static_estimated_barrier_executions_by_pipe"] == {"PIPE_V": 4}
     assert summary["inferred_transition_counts"] == {
         "loop_carried": 1,
         "loop_entry": 1,
@@ -153,6 +163,17 @@ def test_summarize_lowered_pto_models_loop_entry_carried_and_exit_transitions():
             "loop": 6,
         }
     ]
+
+
+def test_summarize_lowered_pto_marks_dynamic_loop_execution_estimate_incomplete():
+    pto = _lowered_loop_pto().replace("0 to 4 step 1", "0 to %arg0 step 1")
+
+    summary = ptoas_sync_summary.summarize_lowered_pto(pto)["kernel"]
+
+    assert summary["static_loop_trip_counts"] == {"6": None}
+    assert summary["static_execution_estimate_status"] == "INCOMPLETE_DYNAMIC_OR_UNRESOLVED_LOOP"
+    assert summary["static_estimated_instruction_executions"] is None
+    assert summary["static_estimated_executions_by_type"] is None
 
 
 def test_summarize_lowered_pto_rejects_unlowered_event_ops():
