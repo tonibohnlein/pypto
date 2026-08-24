@@ -171,9 +171,58 @@ def test_summarize_lowered_pto_marks_dynamic_loop_execution_estimate_incomplete(
     summary = ptoas_sync_summary.summarize_lowered_pto(pto)["kernel"]
 
     assert summary["static_loop_trip_counts"] == {"6": None}
-    assert summary["static_execution_estimate_status"] == "INCOMPLETE_DYNAMIC_OR_UNRESOLVED_LOOP"
+    assert summary["static_execution_estimate_status"] == "INCOMPLETE_DYNAMIC_OR_UNRESOLVED_CONTROL_FLOW"
     assert summary["static_estimated_instruction_executions"] is None
     assert summary["static_estimated_executions_by_type"] is None
+
+
+def test_summarize_lowered_pto_marks_mutually_exclusive_sync_incomplete():
+    pto = """
+module {
+  func.func @kernel(%condition: i1) {
+    scf.if %condition {
+      pto.set_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
+    } else {
+      pto.set_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID1>]
+    }
+    return
+  }
+}
+"""
+
+    summary = ptoas_sync_summary.summarize_lowered_pto(pto)["kernel"]
+
+    assert summary["instruction_site_count"] == 2
+    assert summary["unresolved_control_flow_instruction_sites"] == 2
+    assert summary["static_execution_estimate_status"] == "INCOMPLETE_DYNAMIC_OR_UNRESOLVED_CONTROL_FLOW"
+    assert summary["static_estimated_instruction_executions"] is None
+    assert summary["static_estimated_executions_by_type"] is None
+
+
+def test_summarize_lowered_pto_marks_static_loop_inside_branch_incomplete():
+    pto = """
+module {
+  func.func @kernel(%condition: i1) {
+    scf.if %condition {
+      scf.for %i = 0 to 4 step 1 {
+        pto.barrier <PIPE_V>
+      }
+    }
+    pto.barrier <PIPE_MTE2>
+    return
+  }
+}
+"""
+
+    summary = ptoas_sync_summary.summarize_lowered_pto(pto)["kernel"]
+
+    assert summary["static_loop_trip_counts"] == {"5": 4}
+    assert summary["unresolved_control_flow_instruction_sites"] == 1
+    assert summary["operations"][0]["loop_stack"] == [5]
+    assert summary["operations"][0]["unresolved_control_flow_stack"] == [4]
+    assert summary["operations"][1]["unresolved_control_flow_stack"] == []
+    assert summary["static_execution_estimate_status"] == "INCOMPLETE_DYNAMIC_OR_UNRESOLVED_CONTROL_FLOW"
+    assert summary["static_estimated_instruction_executions"] is None
 
 
 def test_summarize_lowered_pto_rejects_unlowered_event_ops():

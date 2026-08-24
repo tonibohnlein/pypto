@@ -239,7 +239,9 @@ therefore remains separate from the actual instruction-site counts.
 For statically bounded loops, the collector also reports estimated dynamic
 instruction executions by multiplying each actual site by its enclosing trip
 counts. The estimate is labelled incomplete instead of guessing when a
-synchronization site's enclosing loop bound is dynamic or unresolved.
+synchronization site's enclosing loop bound is dynamic or unresolved, or when
+the site is nested in unresolved conditional/control-flow regions. Unstructured
+control flow also makes the function-level estimate incomplete.
 
 ```bash
 python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \

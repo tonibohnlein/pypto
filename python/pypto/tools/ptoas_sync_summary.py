@@ -36,6 +36,9 @@ _PIPE_RE = re.compile(r"\bPIPE_[A-Z0-9_]+\b")
 _EVENT_RE = re.compile(r"\bEVENT_ID[A-Z0-9_]+\b")
 _SSA_RE = re.compile(r"%[-A-Za-z0-9_.$]+")
 _LOOP_RE = re.compile(r"\bscf\.for\b")
+_UNRESOLVED_STRUCTURED_CONTROL_RE = re.compile(r"\bscf\.(?:if|while|index_switch)\b")
+_UNRESOLVED_CONTROL_CONTINUATION_RE = re.compile(r"^\s*(?:else|do|case\b|default\b)")
+_UNSTRUCTURED_CONTROL_RE = re.compile(r"\bcf\.(?:br|cond_br|switch)\b")
 _INTEGER_CONSTANT_RE = re.compile(
     r"^\s*(%[-A-Za-z0-9_.$]+)\s*=\s*arith\.constant\s+(-?\d+)\s*:\s*(?:index|i\d+)\b"
 )
@@ -172,10 +175,26 @@ def _transition_kind(before: Mapping[str, Any], after: Mapping[str, Any]) -> str
     return "cross_loop_boundary"
 
 
+def _static_execution_multiplier(
+    operation: Mapping[str, Any],
+    loop_trip_counts: Mapping[int, int | None],
+) -> int | None:
+    if operation["unresolved_control_flow_stack"]:
+        return None
+    multiplier = 1
+    for loop_id in operation["loop_stack"]:
+        trip_count = loop_trip_counts.get(loop_id)
+        if trip_count is None:
+            return None
+        multiplier *= trip_count
+    return multiplier
+
+
 def _summarize_lowered_function(
     function: str,
     operations: list[dict[str, Any]],
     loop_trip_counts: Mapping[int, int | None],
+    has_unstructured_control_flow: bool,
 ) -> dict[str, Any]:
     by_type = Counter(str(operation["type"]) for operation in operations)
     by_pipe_pair = Counter(
@@ -230,17 +249,12 @@ def _summarize_lowered_function(
                 }
             )
     transition_counts = Counter(transition["kind"] for transition in transitions)
-    execution_multipliers: list[int | None] = []
-    for operation in operations:
-        multiplier = 1
-        for loop_id in operation["loop_stack"]:
-            trip_count = loop_trip_counts.get(loop_id)
-            if trip_count is None:
-                multiplier = None
-                break
-            multiplier *= trip_count
-        execution_multipliers.append(multiplier)
-    execution_complete = all(multiplier is not None for multiplier in execution_multipliers)
+    execution_multipliers = [
+        _static_execution_multiplier(operation, loop_trip_counts) for operation in operations
+    ]
+    execution_complete = not has_unstructured_control_flow and all(
+        multiplier is not None for multiplier in execution_multipliers
+    )
 
     def weighted_counts(key) -> dict[str, int] | None:
         if not execution_complete:
@@ -272,11 +286,15 @@ def _summarize_lowered_function(
         "barrier_sites_by_pipe": dict(sorted(barriers_by_pipe.items())),
         "inside_loop_instruction_sites": sum(bool(operation["loop_stack"]) for operation in operations),
         "outside_loop_instruction_sites": sum(not operation["loop_stack"] for operation in operations),
+        "unresolved_control_flow_instruction_sites": sum(
+            bool(operation["unresolved_control_flow_stack"]) for operation in operations
+        ),
+        "has_unstructured_control_flow": has_unstructured_control_flow,
         "static_loop_trip_counts": {
             str(loop_id): trip_count for loop_id, trip_count in sorted(loop_trip_counts.items())
         },
         "static_execution_estimate_status": (
-            "COMPLETE" if execution_complete else "INCOMPLETE_DYNAMIC_OR_UNRESOLVED_LOOP"
+            "COMPLETE" if execution_complete else "INCOMPLETE_DYNAMIC_OR_UNRESOLVED_CONTROL_FLOW"
         ),
         "static_estimated_instruction_executions": estimated_instruction_executions,
         "static_estimated_executions_by_type": weighted_counts(lambda operation: operation["type"]),
@@ -303,11 +321,14 @@ def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles funct
     """Summarize synchronization instructions present in lowered post-InsertSync PTO IR."""
     functions: dict[str, list[dict[str, Any]]] = {}
     loop_trip_counts_by_function: dict[str, dict[int, int | None]] = {}
+    unstructured_control_by_function: dict[str, bool] = {}
     current_function: str | None = None
     function_opened = False
     depth = 0
     loop_stack: list[tuple[int, int]] = []
+    unresolved_control_flow_stack: list[tuple[int, int]] = []
     pending_loop: tuple[int, int | None] | None = None
+    pending_unresolved_control_flow: int | None = None
     integer_constants: dict[str, int] = {}
     for line_number, line in enumerate(text.splitlines(), start=1):
         code = line.split("//", maxsplit=1)[0]
@@ -320,11 +341,14 @@ def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles funct
                 raise ValueError(f"lowered PTO repeats function '{function_name}'")
             functions[function_name] = []
             loop_trip_counts_by_function[function_name] = {}
+            unstructured_control_by_function[function_name] = False
             current_function = function_name
             function_opened = "{" in code
             depth = code.count("{") - code.count("}") if function_opened else 0
             loop_stack = []
+            unresolved_control_flow_stack = []
             pending_loop = None
+            pending_unresolved_control_flow = None
             integer_constants = {}
             continue
 
@@ -334,6 +358,11 @@ def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles funct
             depth -= leading_closes
             while loop_stack and loop_stack[-1][1] > depth:
                 loop_stack.pop()
+            while unresolved_control_flow_stack and unresolved_control_flow_stack[-1][1] > depth:
+                unresolved_control_flow_stack.pop()
+
+        if _UNSTRUCTURED_CONTROL_RE.search(code):
+            unstructured_control_by_function[current_function] = True
 
         if constant_match := _INTEGER_CONSTANT_RE.match(code):
             integer_constants[constant_match.group(1)] = int(constant_match.group(2))
@@ -368,6 +397,9 @@ def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles funct
                     "dst_pipe": pipes[1],
                     "event": event,
                     "loop_stack": [loop_id for loop_id, _ in loop_stack],
+                    "unresolved_control_flow_stack": [
+                        control_id for control_id, _ in unresolved_control_flow_stack
+                    ],
                 }
             )
         elif barrier_match is not None:
@@ -384,6 +416,9 @@ def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles funct
                     "dst_pipe": pipes[0],
                     "event": None,
                     "loop_stack": [loop_id for loop_id, _ in loop_stack],
+                    "unresolved_control_flow_stack": [
+                        control_id for control_id, _ in unresolved_control_flow_stack
+                    ],
                 }
             )
 
@@ -403,24 +438,38 @@ def summarize_lowered_pto(  # noqa: PLR0912 - textual MLIR scanner handles funct
                 if lower is not None and upper is not None and step is not None and step > 0:
                     trip_count = max(0, (upper - lower + step - 1) // step)
             pending_loop = (line_number, trip_count)
+        if _UNRESOLVED_STRUCTURED_CONTROL_RE.search(code) or (
+            leading_closes and _UNRESOLVED_CONTROL_CONTINUATION_RE.match(remainder)
+        ):
+            pending_unresolved_control_flow = line_number
         if pending_loop is not None and opens > closes:
             loop_line, trip_count = pending_loop
             loop_stack.append((loop_line, depth + 1))
             loop_trip_counts_by_function[current_function][loop_line] = trip_count
             pending_loop = None
+        if pending_unresolved_control_flow is not None and opens > closes:
+            unresolved_control_flow_stack.append((pending_unresolved_control_flow, depth + 1))
+            pending_unresolved_control_flow = None
         depth += opens - closes
         if function_opened and depth <= 0:
             current_function = None
             function_opened = False
             loop_stack = []
+            unresolved_control_flow_stack = []
             pending_loop = None
+            pending_unresolved_control_flow = None
 
     if current_function is not None:
         raise ValueError(f"unterminated function '{current_function}' in lowered PTO")
     if not functions:
         raise ValueError("lowered PTO contains no functions")
     return {
-        function: _summarize_lowered_function(function, operations, loop_trip_counts_by_function[function])
+        function: _summarize_lowered_function(
+            function,
+            operations,
+            loop_trip_counts_by_function[function],
+            unstructured_control_by_function[function],
+        )
         for function, operations in sorted(functions.items())
     }
 
