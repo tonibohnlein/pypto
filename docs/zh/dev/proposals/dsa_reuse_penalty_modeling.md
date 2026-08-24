@@ -198,7 +198,8 @@ transition。这些 transition 并非直接 emitted fact：event ID 可以复用
 IR 不再保留 Final-SyncIR group identity。因此推断结果与实际 instruction-site count 分开
 报告。对于静态有界 loop，collector 还会用每个实际 site 乘以其外层 trip count，
 报告估算的动态指令执行 (dynamic instruction execution)。当 synchronization site 的外层 loop
-bound 为 dynamic 或无法解析时，该估算就标记为 incomplete，而不会猜测：
+bound 为 dynamic 或无法解析，或者 site 位于无法解析的条件/控制流 region 中时，该估算就标记为
+incomplete，而不会猜测。unstructured control flow 同样会使 function-level 估算变为 incomplete：
 
 ```bash
 python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \
