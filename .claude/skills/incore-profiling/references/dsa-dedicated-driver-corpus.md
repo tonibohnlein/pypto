@@ -19,14 +19,19 @@ per problem without consulting device latency:
 ```bash
 python .claude/skills/incore-profiling/select_dsa_evaluation_capacity.py \
   --problems <cohort>/problems.tsv \
-  --screen-results <screen>/screen-results.tsv --output-root <evaluation>
+  --problems-dir <corpus>/penalty-bearing \
+  --problem-status <results>/problem-status.tsv \
+  --screen-results <screen>/screen-results.tsv \
+  --minimum-forced-reuse-percent 25 \
+  --output-root <evaluation>
 ```
 
-The selector takes the least restrictive capacity where Cypress performs real
-reuse and geometry first-fit, Cypress, and DSA-RP have three distinct selected-
-pool placements. This excludes both the disjoint-address trivial regime and the
-forced-placement regime. Cases without three-way separation remain controls;
-they are not primary instances for testing policy ordering.
+The selector takes the least restrictive capacity where the forced shortage is
+at least 25% of the disjoint-size lower bound, Cypress performs real reuse, and
+geometry first-fit, Cypress, and DSA-RP have three distinct selected-pool
+placements. This excludes both the disjoint-address trivial regime and barely
+constrained cases. Cases without three-way separation remain controls; they are
+not primary instances for testing policy ordering.
 
 Do not choose a capacity because its measured ordering is favorable. The
 expected paper hypothesis is `geometry > Cypress > DSA-RP` in latency, but the
