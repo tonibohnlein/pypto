@@ -288,6 +288,56 @@ def _statistics(problem: dict[str, Any], solution: dict[str, Any]) -> dict[str, 
     }
 
 
+def _swap_overlap_components(
+    problem: dict[str, Any],
+    solution: dict[str, Any],
+    swaps: list[dict[str, Any]],
+    *,
+    variant_name: str,
+) -> list[dict[str, Any]]:
+    placements = _placement_map(solution)
+    buffers = {buffer["id"]: buffer for buffer in problem["problem"]["buffers"]}
+    reports = []
+    for swap in swaps:
+        first = _overlap_component_buffers(problem, solution, set(swap["first_seed_buffers"]))
+        second = _overlap_component_buffers(problem, solution, set(swap["second_seed_buffers"]))
+        if first & second:
+            raise ValueError(f"variant {variant_name!r} tries to swap the same overlap component with itself")
+
+        def envelope(component: set[int]) -> tuple[int, int, int]:
+            pools = {placements[buffer_id]["pool"] for buffer_id in component}
+            if len(pools) != 1:
+                raise ValueError("one overlap component spans multiple pools")
+            begin = min(placements[buffer_id]["offset"] for buffer_id in component)
+            end = max(placements[buffer_id]["offset"] + buffers[buffer_id]["size"] for buffer_id in component)
+            return pools.pop(), begin, end
+
+        first_pool, first_begin, first_end = envelope(first)
+        second_pool, second_begin, second_end = envelope(second)
+        if first_pool != second_pool or first_end - first_begin != second_end - second_begin:
+            raise ValueError(
+                f"variant {variant_name!r} requires equal-span components in one pool, got "
+                f"pool {first_pool} [{first_begin},{first_end}) and "
+                f"pool {second_pool} [{second_begin},{second_end})"
+            )
+        for buffer_id in first:
+            placements[buffer_id]["offset"] += second_begin - first_begin
+        for buffer_id in second:
+            placements[buffer_id]["offset"] += first_begin - second_begin
+        reports.append(
+            {
+                "first_buffers": sorted(first),
+                "first_from": first_begin,
+                "first_to": second_begin,
+                "second_buffers": sorted(second),
+                "second_from": second_begin,
+                "second_to": first_begin,
+                "span_bytes": first_end - first_begin,
+            }
+        )
+    return reports
+
+
 def _apply_variant(
     problem: dict[str, Any],
     base_solution: dict[str, Any],
@@ -322,6 +372,13 @@ def _apply_variant(
         translated_buffers = sorted(_overlap_component_buffers(problem, result, seeds))
         for buffer_id in translated_buffers:
             placements[buffer_id]["offset"] += delta
+
+    swapped_components = _swap_overlap_components(
+        problem,
+        result,
+        variant.get("swap_overlap_components", []),
+        variant_name=variant["name"],
+    )
 
     result["metadata"] = {
         "base": variant["base"],
@@ -363,6 +420,11 @@ def _apply_variant(
     if translated_buffers:
         report["translated_buffers"] = translated_buffers
         report["translation_delta"] = control["delta"]
+    if swapped_components:
+        if before != after:
+            raise ValueError(f"variant {variant['name']!r} component swap changed physical overlap geometry")
+        report["swapped_components"] = swapped_components
+        report["swap_geometry_matches"] = True
     if "control_for" in variant:
         report["control_for"] = variant["control_for"]
     if "role" in variant:
