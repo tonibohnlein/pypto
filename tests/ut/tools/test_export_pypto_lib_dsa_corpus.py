@@ -191,6 +191,56 @@ def test_inventory_deduplicates_semantic_exports(tmp_path: Path) -> None:
     assert len(list((tmp_path / "corpus" / "penalty-bearing").glob("*.dsa.json"))) == 1
     rows = (tmp_path / "invocations.tsv").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 3
+    assert b"\r" not in (tmp_path / "invocations.tsv").read_bytes()
+    assert b"\r" not in (tmp_path / "unique-problems.tsv").read_bytes()
+
+
+def test_missing_stale_source_is_terminal_without_aborting_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = tmp_path / "pypto-lib"
+    source = library / "models" / "present.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("# present\n", encoding="utf-8")
+    pypto_python = tmp_path / "pypto-python"
+    pypto_python.mkdir()
+    manifest = tmp_path / "manifest.tsv"
+    manifest.write_text(
+        "models/missing.py\tEXPORTED\tfinal-a2a3sim\t0\t1\n"
+        "models/present.py\tEXPORTED\tfinal-a2a3sim\t0\t1\n",
+        encoding="utf-8",
+    )
+
+    def fake_export(command, **_kwargs):
+        root = Path(command[command.index("--export-root") + 1])
+        root.mkdir(parents=True)
+        (root / "kernel.dsa.json").write_text(
+            json.dumps(_problem(instance="kernel", members=["%inline1"])),
+            encoding="utf-8",
+        )
+        return "EXPORTED", 0
+
+    monkeypatch.setattr(exporter, "_run_export_subprocess", fake_export)
+    arguments = SimpleNamespace(
+        output_root=tmp_path / "output",
+        pypto_lib_root=library,
+        pypto_python=pypto_python,
+        manifest=manifest,
+        python=Path("/usr/bin/python3"),
+        platform="a2a3sim",
+        scripts=None,
+        limit=None,
+        timeout=30,
+        prune_builds=True,
+    )
+
+    assert exporter.export_corpus(arguments) == 0
+    with (tmp_path / "output" / "export-status.tsv").open(encoding="utf-8", newline="") as source_file:
+        rows = list(csv.DictReader(source_file, delimiter="\t"))
+
+    assert [row["status"] for row in rows] == ["SOURCE_MISSING", "EXPORTED"]
+    assert rows[0]["driver_mode"] == "NO_SOURCE"
+    assert len((tmp_path / "output" / "invocations.tsv").read_text().splitlines()) == 2
 
 
 if __name__ == "__main__":

@@ -236,7 +236,12 @@ def build_inventory(output_root: Path, script_by_root: dict[Path, str]) -> tuple
         if not rows:
             raise ValueError(f"cannot write an empty inventory: {name}")
         with (output_root / name).open("w", encoding="utf-8", newline="") as output:
-            writer = csv.DictWriter(output, fieldnames=list(rows[0]), delimiter="\t")
+            writer = csv.DictWriter(
+                output,
+                fieldnames=list(rows[0]),
+                delimiter="\t",
+                lineterminator="\n",
+            )
             writer.writeheader()
             writer.writerows(rows)
 
@@ -339,7 +344,22 @@ def export_corpus(args: argparse.Namespace) -> int:
     for index, (relative, platform) in enumerate(plan, start=1):
         script = args.pypto_lib_root / relative
         if not script.is_file():
-            raise FileNotFoundError(script)
+            status_rows.append(
+                {
+                    "script": relative,
+                    "status": "SOURCE_MISSING",
+                    "launch_mode": f"final-{platform}",
+                    "returncode": "",
+                    "problems": 0,
+                    "orchestration_files": 0,
+                    "submit_sites": 0,
+                    "emitted_kernels": 0,
+                    "driver_mode": "NO_SOURCE",
+                }
+            )
+            _write_status_rows(args.output_root / "export-status.tsv", status_rows)
+            print(f"[{index}/{len(plan)}] {relative}: SOURCE_MISSING (0 problems)", flush=True)
+            continue
         tag = _slug(relative.removesuffix(".py"))
         export_root = captures / tag
         script_by_root[export_root] = relative
