@@ -271,6 +271,71 @@ def test_prepare_address_control_preserves_exact_overlap_geometry(ablation: Modu
     assert control["translation_delta"] == 192
 
 
+def test_prepare_swaps_equal_overlap_components_without_geometry_change(ablation: ModuleType, tmp_path: Path):
+    problem = _problem(with_cost=True)
+    problem["problem"]["buffers"][2]["size"] = 64
+    problem["problem"]["pools"][0]["capacity"] = 256
+    problem_path = tmp_path / "problem.json"
+    solution_path = tmp_path / "solution.json"
+    spec_path = tmp_path / "spec.json"
+    _write(problem_path, problem)
+    _write(solution_path, _solution(ablation, problem))
+    _write(
+        spec_path,
+        {
+            "cases": [
+                {
+                    "instance": "sample",
+                    "name": "case",
+                    "variants": [
+                        {
+                            "base": "base",
+                            "expected": {"added_pairs": 0, "removed_pairs": 0},
+                            "hypothesis": "address-only component swap",
+                            "moves": [],
+                            "name": "swap",
+                            "role": "address_control",
+                            "swap_overlap_components": [
+                                {"first_seed_buffers": [0], "second_seed_buffers": [2]}
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "experiment": "test",
+            "schema_version": 1,
+        },
+    )
+
+    summary = ablation.prepare(
+        problem_path,
+        spec_path,
+        {"base": solution_path},
+        {"base": problem_path},
+        tmp_path / "out",
+        case_name="case",
+    )
+
+    report = summary["variants"][0]
+    solution = json.loads(
+        (tmp_path / "out" / "swap" / "pypto_sample.dsa.solution.json").read_text(encoding="utf-8")
+    )
+    offsets = {placement["buffer"]: placement["offset"] for placement in solution["placements"]}
+    assert offsets == {0: 128, 1: 128, 2: 0}
+    assert report["swap_geometry_matches"] is True
+    assert report["swapped_components"] == [
+        {
+            "first_buffers": [0, 1],
+            "first_from": 0,
+            "first_to": 128,
+            "second_buffers": [2],
+            "second_from": 128,
+            "second_to": 0,
+            "span_bytes": 64,
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
