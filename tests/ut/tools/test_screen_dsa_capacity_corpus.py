@@ -195,6 +195,29 @@ def test_capacity_labels_match_device_protocol() -> None:
     }
 
 
+def test_problem_budget_bounds_each_remaining_solver_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = screen.ScreenConfig(
+        binary=Path("dsa-bench"),
+        variants=(),
+        restarts=8,
+        timeout=30,
+        problem_timeout=5,
+    )
+    monkeypatch.setattr(screen.time, "monotonic", lambda: 10.0)
+
+    assert screen._solver_timeout(config, 12.2) == 3
+
+    monkeypatch.setattr(screen.time, "monotonic", lambda: 13.0)
+    with pytest.raises(screen.ProblemTimeBudgetExpired):
+        screen._solver_timeout(config, 12.2)
+
+
+def test_screen_summary_uses_lf_line_endings(tmp_path: Path) -> None:
+    screen._write_summary(tmp_path, [{"tag": "case", "status": "feasible"}])
+
+    assert b"\r" not in (tmp_path / "screen-results.tsv").read_bytes()
+
+
 def test_model_separation_counts_only_jointly_feasible_cells() -> None:
     document = _document()
     rows = []

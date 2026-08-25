@@ -13,9 +13,11 @@ import copy
 import csv
 import hashlib
 import json
+import math
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from fractions import Fraction
@@ -50,6 +52,7 @@ class ScreenConfig:
     variants: tuple[CypressVariant, ...]
     restarts: int
     timeout: int
+    problem_timeout: int = 0
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,19 @@ class CapacityCell:
     native: int
     first_fit_peak: int
     penalty_count: int
+
+
+class ProblemTimeBudgetExpired(RuntimeError):
+    """A complete problem exceeded its discovery wall-time budget."""
+
+
+def _solver_timeout(config: ScreenConfig, deadline: float | None) -> int:
+    if deadline is None:
+        return config.timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProblemTimeBudgetExpired
+    return min(config.timeout, max(1, math.ceil(remaining)))
 
 
 def parse_fractions(text: str) -> tuple[Fraction, ...]:
@@ -309,6 +325,7 @@ def _screen_cell(
     cell_root: Path,
     cell: CapacityCell,
     config: ScreenConfig,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     derived = with_pool_capacity(document, int(cell.pool["id"]), cell.capacity)
     derived_path = cell_root / "derived-problem.json"
@@ -319,7 +336,7 @@ def _screen_cell(
         derived_path,
         cell_root / ARM_GEOMETRY,
         "geometry-first-fit",
-        timeout=config.timeout,
+        timeout=_solver_timeout(config, deadline),
     )
     _annotate_solution_sizes(derived, geometry_solution)
     rows = [
@@ -338,7 +355,7 @@ def _screen_cell(
         "geometry-canonical-greedy",
         seed=0,
         restarts=config.restarts,
-        timeout=config.timeout,
+        timeout=_solver_timeout(config, deadline),
     )
     _annotate_solution_sizes(derived, geometry_cg_solution)
     rows.append(
@@ -357,7 +374,7 @@ def _screen_cell(
         "canonical-greedy",
         seed=0,
         restarts=config.restarts,
-        timeout=config.timeout,
+        timeout=_solver_timeout(config, deadline),
     )
     _annotate_solution_sizes(derived, canonical_solution)
     rows.append(
@@ -378,7 +395,7 @@ def _screen_cell(
             "cypress-relaxation",
             seed=variant.seed,
             cypress_order=variant.order,
-            timeout=config.timeout,
+            timeout=_solver_timeout(config, deadline),
         )
         result["cypress_order"] = variant.order
         result["cypress_seed"] = variant.seed
@@ -428,16 +445,23 @@ def _screen_problem(
             archived = incomplete_root / f"{tag}-attempt-{attempt:03d}"
         problem_root.rename(archived)
     problem_root.mkdir(parents=True)
+    deadline = time.monotonic() + config.problem_timeout if config.problem_timeout else None
     document = json.loads(problem_path.read_text(encoding="utf-8"))
     scratch = problem_root / "native-problem.json"
     scratch.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
-    baseline_result, baseline_solution = _run_solver(
-        config.binary,
-        scratch,
-        problem_root / "baseline",
-        "geometry-first-fit",
-        timeout=config.timeout,
-    )
+    try:
+        baseline_result, baseline_solution = _run_solver(
+            config.binary,
+            scratch,
+            problem_root / "baseline",
+            "geometry-first-fit",
+            timeout=_solver_timeout(config, deadline),
+        )
+    except ProblemTimeBudgetExpired:
+        rows = [{"tag": tag, "status": "problem_timeout"}]
+        completed_path.write_text(json.dumps({"rows": rows}, indent=2) + "\n", encoding="utf-8")
+        scratch.unlink(missing_ok=True)
+        return rows
     if baseline_result.get("status") != "feasible" or baseline_solution is None:
         rows = [{"tag": tag, "status": f"baseline_{baseline_result.get('status', 'tool_error')}"}]
         completed_path.write_text(json.dumps({"rows": rows}, indent=2) + "\n", encoding="utf-8")
@@ -446,6 +470,7 @@ def _screen_problem(
     penalty_counts = penalty_counts_by_pool(document, baseline_solution)
     pools = {int(pool["id"]): pool for pool in document["problem"]["pools"]}
     rows: list[dict[str, Any]] = []
+    problem_timed_out = False
     for pool_id, penalty_count in sorted(penalty_counts.items()):
         pool = pools[pool_id]
         native = pool.get("capacity")
@@ -458,22 +483,30 @@ def _screen_problem(
             label = CAPACITY_LABELS.get(fraction, str(fraction).replace("/", "_"))
             cell_root = problem_root / f"pool-{pool_id}-{pool['name']}" / label
             cell_root.mkdir(parents=True, exist_ok=False)
-            rows.extend(
-                _screen_cell(
-                    document,
-                    cell_root,
-                    CapacityCell(
-                        tag=tag,
-                        pool=pool,
-                        fraction=fraction,
-                        capacity=capacity,
-                        native=native,
-                        first_fit_peak=first_fit_peak,
-                        penalty_count=penalty_count,
-                    ),
-                    config,
+            try:
+                rows.extend(
+                    _screen_cell(
+                        document,
+                        cell_root,
+                        CapacityCell(
+                            tag=tag,
+                            pool=pool,
+                            fraction=fraction,
+                            capacity=capacity,
+                            native=native,
+                            first_fit_peak=first_fit_peak,
+                            penalty_count=penalty_count,
+                        ),
+                        config,
+                        deadline,
+                    )
                 )
-            )
+            except ProblemTimeBudgetExpired:
+                rows.append({"tag": tag, "status": "problem_timeout"})
+                problem_timed_out = True
+                break
+        if problem_timed_out:
+            break
     scratch.unlink(missing_ok=True)
     completed_path.write_text(json.dumps({"rows": rows}, indent=2) + "\n", encoding="utf-8")
     return rows
@@ -486,7 +519,13 @@ def _write_summary(output_root: Path, rows: list[dict[str, Any]]) -> None:
             if field not in fields:
                 fields.append(field)
     with (output_root / "screen-results.tsv").open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=fields, delimiter="\t", extrasaction="ignore")
+        writer = csv.DictWriter(
+            output,
+            fieldnames=fields,
+            delimiter="\t",
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -587,7 +626,12 @@ def _write_model_separation(problems_dir: Path, output_root: Path, rows: list[di
     }
     summaries = build_model_separation_rows(documents, rows)
     with (output_root / "model-separation.tsv").open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=list(summaries[0]), delimiter="\t")
+        writer = csv.DictWriter(
+            output,
+            fieldnames=list(summaries[0]),
+            delimiter="\t",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(summaries)
 
@@ -618,7 +662,12 @@ def _write_cypress_variants(output_root: Path) -> None:
     if not rows:
         return
     with (output_root / "cypress-variants.tsv").open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=list(rows[0]), delimiter="\t")
+        writer = csv.DictWriter(
+            output,
+            fieldnames=list(rows[0]),
+            delimiter="\t",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -634,6 +683,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--random-seeds", default="0,1,2")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--problem-timeout", type=int, default=0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
@@ -655,7 +705,15 @@ def main(argv: list[str] | None = None) -> int:
     variants = tuple(
         CypressVariant(order, seed) for order in orders for seed in (seeds if order == "random" else (0,))
     )
-    config = ScreenConfig(args.dsa_bench, variants, args.canonical_restarts, args.timeout)
+    if args.problem_timeout < 0:
+        raise ValueError("problem timeout must be non-negative")
+    config = ScreenConfig(
+        args.dsa_bench,
+        variants,
+        args.canonical_restarts,
+        args.timeout,
+        args.problem_timeout,
+    )
     paths = sorted(args.problems_dir.glob("*.dsa.json"))
     if args.limit is not None:
         paths = paths[: args.limit]

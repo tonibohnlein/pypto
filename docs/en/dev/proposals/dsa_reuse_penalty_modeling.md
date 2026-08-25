@@ -300,6 +300,33 @@ python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \
     -o schedule-eligibility.json
 ```
 
+Corpus discovery is driver-first. A source is considered only when static
+inspection proves a local JIT entry, tensor specifications, a direct golden,
+and an executable `run_jit` contract. DSA problems are joined only from a fresh
+export of that exact PyPTO-Lib revision. Older inventories are hints for which
+sources to re-export; they cannot make a current candidate. The discovery tool
+also records the real measurement unit instead of counting every child DSA
+problem as an independent kernel:
+
+- one DSA problem in one submit is a single-kernel driver;
+- multiple DSA problems in one submit form one complete mixed group; and
+- multiple submits form one parent-wide policy workload.
+
+```bash
+python .claude/skills/incore-profiling/discover_dsa_direct_golden_corpus.py \
+    --pypto-lib-root <pypto-lib> \
+    --invocations <fresh-export>/invocations.tsv \
+    --inventory-revision <exact-pypto-lib-sha> \
+    --export-status <fresh-export>/export-status.tsv \
+    --output-root <discovery>
+```
+
+The base problem identity is the semantic DSA fingerprint. Controlled tiling
+variants must carry a separate explicit tiling identity and remain grouped by
+base problem; they are not independent workload families. Discovery rejects
+performance fields in the current export inventory. It may annotate a prior
+terminal status, but that annotation never changes membership or ordering.
+
 The device corpus is then frozen by measurability, not by observed performance
 or solver objective. A case must be feasible, runnable, and correct under all
 four logical policies (geometry first-fit, geometry canonical greedy, Cypress,

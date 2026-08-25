@@ -248,6 +248,30 @@ python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \
     -o schedule-eligibility.json
 ```
 
+语料库发现首先从 driver 出发。只有当静态检查能够证明源码包含本地 JIT entry、tensor
+specification、direct golden 和可执行的 `run_jit` contract 时，才会考虑该源码。DSA
+problem 只能来自完全相同 PyPTO-Lib revision 的 fresh export。旧 inventory 只能提示应当
+重新导出哪些源码，不能直接形成 current candidate。发现工具还会记录真实 measurement
+unit，而不会把每个子 DSA problem 都计作独立 kernel：
+
+- 一个 submit 中只有一个 DSA problem 时，它是 single-kernel driver；
+- 一个 submit 中包含多个 DSA problem 时，整体构成一个 complete mixed group；
+- 包含多个 submit 时，它是一个 parent-wide policy workload。
+
+```bash
+python .claude/skills/incore-profiling/discover_dsa_direct_golden_corpus.py \
+    --pypto-lib-root <pypto-lib> \
+    --invocations <fresh-export>/invocations.tsv \
+    --inventory-revision <exact-pypto-lib-sha> \
+    --export-status <fresh-export>/export-status.tsv \
+    --output-root <discovery>
+```
+
+base problem identity 是 semantic DSA fingerprint。受控 tiling variant 必须具有单独的
+显式 tiling identity，并按 base problem 分组；不能把它们当作独立 workload family。
+discovery 会拒绝 current export inventory 中的性能字段。它可以附加以前的 terminal
+status，但该注释绝不影响 membership 或 ordering。
+
 随后仅按“可测量性”冻结设备语料，而不按已观察到的性能或求解器目标筛选。一个
 用例必须在原生、half、q1 和 tight 四种容量下，对四个逻辑策略（几何 first-fit、
 几何 canonical greedy、Cypress 和 DSA-RP canonical greedy）都可行、可运行且正确。
