@@ -314,6 +314,37 @@ python -m pypto.tools.dsa_measurement_cohort preflight.tsv results/ \
     --minimum 20 --maximum 40
 ```
 
+After launchability is established, select one evaluation capacity per problem
+without consulting device time. `cypress_actual_alias_pairs > 0` is not enough:
+Cypress may choose reuse even when a fully disjoint placement would fit. For the
+selected pool, the selector sums the sizes of buffers fixed to that pool. This
+is a hard lower bound on any physically disjoint placement, independent of
+alignment. It selects the least restrictive capacity for which:
+
+- capacity is strictly below that disjoint lower bound, so reuse is mandatory;
+- the forced shortage is at least 25% of the disjoint lower bound, applying the
+  same timing-blind pressure floor to every problem;
+- all four logical policies are feasible;
+- Cypress realizes at least one alias pair; and
+- geometry first-fit, Cypress, and DSA-RP have distinct physical placements.
+
+The raw-size bound is deliberately conservative: it may reject an instance
+where alignment alone forces reuse, but it cannot falsely label voluntary reuse
+as capacity-forced. The pressure floor avoids choosing a barely constrained
+capacity merely because one byte no longer fits. The selector records the lower
+bound, byte and percentage margins, and each arm's unit reuse cost. The costs
+are audit outputs and do not participate in capacity selection:
+
+```bash
+python .claude/skills/incore-profiling/select_dsa_evaluation_capacity.py \
+    --problems frozen/cohort/problems.tsv \
+    --problems-dir fresh-export/corpus/penalty-bearing \
+    --problem-status results/problem-status.tsv \
+    --screen-results inputs/screen-results.tsv \
+    --minimum-forced-reuse-percent 25 \
+    --output-root evaluation-capacities
+```
+
 When more than 40 cases qualify, selection is deterministic and round-robin
 across model family and parent program. Endpoint-identical logical policies are
 retained in the matrix but need only one physical measurement.

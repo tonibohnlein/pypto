@@ -260,6 +260,34 @@ python -m pypto.tools.dsa_measurement_cohort preflight.tsv results/ \
     --minimum 20 --maximum 40
 ```
 
+在确认 launchability 后，为每个 problem 选择一个 evaluation capacity，且不读取设备
+时间。仅有 `cypress_actual_alias_pairs > 0` 并不足够：即使完全不重叠的 placement 能够
+放下，Cypress 也可能主动选择 reuse。selector 对选中 pool 中固定属于该 pool 的 buffer
+size 求和。该和是不依赖 alignment 的物理不重叠 placement 硬下界。selector 选择满足以下
+条件的最宽松 capacity：
+
+- capacity 严格小于该不重叠下界，因此必须发生 reuse；
+- 强制短缺量至少为不重叠下界的 25%，对所有 problem 使用同一个不依赖时延的
+  pressure 下限；
+- 四个逻辑策略均可行；
+- Cypress 实际产生至少一个 alias pair；
+- geometry first-fit、Cypress 与 DSA-RP 的物理 placement 各不相同。
+
+raw-size 下界是刻意保守的：它可能拒绝仅因 alignment 而必须 reuse 的实例，但不会把
+自愿 reuse 错标为 capacity-forced。pressure 下限避免仅因为少量 byte 无法放下就选择几乎
+无压力的 capacity。selector 会记录该下界、强制 reuse 的 byte 和百分比 margin，
+以及每个 arm 的 unit reuse cost。cost 仅用于审计，不参与 capacity selection：
+
+```bash
+python .claude/skills/incore-profiling/select_dsa_evaluation_capacity.py \
+    --problems frozen/cohort/problems.tsv \
+    --problems-dir fresh-export/corpus/penalty-bearing \
+    --problem-status results/problem-status.tsv \
+    --screen-results inputs/screen-results.tsv \
+    --minimum-forced-reuse-percent 25 \
+    --output-root evaluation-capacities
+```
+
 若合格用例超过 40 个，则按模型族和父程序进行确定性的轮询选择。代码端点相同的
 逻辑策略仍保留在矩阵中，但只需进行一次物理测量。
 
