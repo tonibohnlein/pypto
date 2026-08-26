@@ -43,6 +43,30 @@ The first four-capacity development dataset is pinned by
 `dsa_penalty_modeling_dataset_v1.json`. It remains immutable when the corpus is
 expanded or reduced to one evaluation capacity per problem.
 
+For the driver-first workload corpus, apply each capacity label to every memory
+pool of every child DSA problem simultaneously. Use
+`combined_capacity_profiles()` and `with_pool_capacities()` from
+`screen_dsa_capacity_corpus.py`; the native profile must remain byte-identical
+to the exported problem. After device correctness has verified all four
+capacities, freeze one workload-level capacity with:
+
+```bash
+python .claude/skills/incore-profiling/select_dsa_workload_capacity.py \
+  --cohort <verification>/results/corpus-frozen.tsv \
+  --instances <fresh-export>/invocations.tsv \
+  --feasibility <verification>/results/full-policy-feasibility.tsv \
+  --maps <verification>/results/map-digests.tsv \
+  --workload-status <verification>/results/workload-status.tsv \
+  --corpus-root <fresh-export> --replay-root <verification> \
+  --output-root <evaluation-freeze>
+```
+
+The selector takes the tightest capacity that proves a conservative disjoint
+shortage, makes Cypress realize at least one penalized reuse relation, and gives
+Cypress and DSA-RP different complete parent maps. Workloads where those maps
+remain identical at every capacity are retained as explicit null controls.
+Selection never reads device latency.
+
 ## Structured penalty model
 
 Use all four capacities of dataset v1 as development data. For each target,
@@ -109,7 +133,9 @@ The complete functional driver is the correctness unit and every DSA function
 inside it must use the same arm. A selected runtime task, or the complete mixed
 AIC/AIV group containing it, is the kernel timing unit. Whole-driver latency
 must not be relabelled as target-kernel latency, and runtime argument capture is
-not part of this path.
+not part of this path. Before timing, use `dsa_codegen_comparability.py` to
+discover nested artifacts, join replay addresses per `func.func`, reject empty
+identity captures, and normalize only proven placement facts.
 
 The freezer verifies:
 
@@ -120,9 +146,10 @@ The freezer verifies:
 - all four algorithms at native, half, quarter, and tight capacity; and
 - host feasibility without consulting objectives or device time.
 
-On device, solve every DSA instance in one driver with the same algorithm. At a
-target's reduced capacity, only that target pool is tightened; all sibling
-instances retain native capacity but are still solved by the same algorithm.
-Require the complete Torch golden and cross-arm correctness before collecting
-per-task timings. Derive the task mapping from orchestration and
-`kernel_config.py`; never time an AIC or AIV half independently.
+On device, solve every DSA instance in one driver with the same algorithm. For
+the immutable development dataset, retain its original target-pool-only
+capacity convention. For the driver-first evaluation corpus, use the frozen
+combined capacity profile for every child and every pool. Require the complete
+Torch golden and cross-arm correctness before collecting per-task timings.
+Derive the task mapping from orchestration and `kernel_config.py`; never time an
+AIC or AIV half independently.

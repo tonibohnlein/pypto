@@ -81,6 +81,30 @@ def test_selected_pool_capacity_changes_without_touching_other_pool() -> None:
     assert [pool["capacity"] for pool in original["problem"]["pools"]] == [200, 300]
 
 
+def test_combined_capacity_profile_changes_every_pool_without_metadata_drift() -> None:
+    original = _document()
+    fractions = screen.parse_fractions("0,1/4,1/2,1")
+    profiles = screen.combined_capacity_profiles(original, _solution(), fractions)
+
+    assert profiles == (
+        {1: 92, 2: 164},
+        {1: 119, 2: 198},
+        {1: 146, 2: 232},
+        {1: 200, 2: 300},
+    )
+    tight = screen.with_pool_capacities(original, profiles[0])
+    native = screen.with_pool_capacities(original, profiles[-1])
+    assert [pool["capacity"] for pool in tight["problem"]["pools"]] == [92, 164]
+    assert native == original
+
+
+def test_combined_capacity_profile_requires_exact_pool_coverage() -> None:
+    with pytest.raises(ValueError, match=r"omits pools \[2\]"):
+        screen.with_pool_capacities(_document(), {1: 96})
+    with pytest.raises(ValueError, match=r"unknown pools \[7\]"):
+        screen.with_pool_capacities(_document(), {1: 96, 2: 160, 7: 32})
+
+
 def test_pool_peak_and_penalty_partition_follow_placements() -> None:
     document = _document()
     solution = _solution()
