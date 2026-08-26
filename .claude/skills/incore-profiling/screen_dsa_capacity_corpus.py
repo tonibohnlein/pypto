@@ -143,16 +143,59 @@ def penalty_counts_by_pool(document: dict[str, Any], solution: dict[str, Any]) -
 
 
 def with_pool_capacity(document: dict[str, Any], pool_id: int, capacity: int) -> dict[str, Any]:
-    derived = copy.deepcopy(document)
-    changed = 0
-    for pool in derived["problem"]["pools"]:
-        if int(pool["id"]) == pool_id:
-            pool["capacity"] = capacity
-            changed += 1
-    if changed != 1:
-        raise ValueError(f"expected exactly one pool {pool_id}, changed {changed}")
+    derived = with_pool_capacities(document, {pool_id: capacity}, require_all=False)
     derived.setdefault("metadata", {})["capacity_screen_override"] = f"pool={pool_id},capacity={capacity}"
     return derived
+
+
+def with_pool_capacities(
+    document: dict[str, Any],
+    capacities: dict[int, int],
+    *,
+    require_all: bool = True,
+) -> dict[str, Any]:
+    """Return a problem with an exact, optionally complete capacity profile.
+
+    Unlike :func:`with_pool_capacity`, this helper does not add metadata. A
+    native combined profile therefore remains byte-identical to the exported
+    document, which is required when the problem fingerprint participates in
+    replay validation.
+    """
+    if not capacities:
+        raise ValueError("capacity profile must contain at least one pool")
+    if any(capacity < 0 for capacity in capacities.values()):
+        raise ValueError(f"pool capacities must be non-negative, got {capacities}")
+
+    derived = copy.deepcopy(document)
+    pools = {int(pool["id"]): pool for pool in derived["problem"]["pools"]}
+    unknown = sorted(set(capacities) - set(pools))
+    if unknown:
+        raise ValueError(f"capacity profile names unknown pools {unknown}")
+    missing = sorted(set(pools) - set(capacities))
+    if require_all and missing:
+        raise ValueError(f"combined capacity profile omits pools {missing}")
+    for pool_id, capacity in capacities.items():
+        pools[pool_id]["capacity"] = capacity
+    return derived
+
+
+def combined_capacity_profiles(
+    document: dict[str, Any],
+    geometry_solution: dict[str, Any],
+    fractions: tuple[Fraction, ...],
+) -> tuple[dict[int, int], ...]:
+    """Build matched capacity profiles that tighten every pool together."""
+    profiles = [dict() for _ in fractions]
+    for pool in document["problem"]["pools"]:
+        pool_id = int(pool["id"])
+        native = pool.get("capacity")
+        if not isinstance(native, int):
+            raise ValueError(f"pool {pool_id} has no integer native capacity: {native!r}")
+        peak = pool_peak(document, geometry_solution, pool_id)
+        capacities = capacity_grid(peak, native, fractions)
+        for profile, capacity in zip(profiles, capacities, strict=True):
+            profile[pool_id] = capacity
+    return tuple(profiles)
 
 
 def cypress_portfolio_key(record: dict[str, Any]) -> tuple[Any, ...]:
