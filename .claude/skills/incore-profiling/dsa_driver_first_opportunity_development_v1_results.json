@@ -1,0 +1,19 @@
+{
+  "analysis_kind": "development_set_post_freeze_join",
+  "both_penalty_aware_beat_geometry": 4,
+  "confirmed_count": 4,
+  "freeze_sha256": "3d008b619ca920ad0e9f71dd6a9af56f00f4f2c8e402f8b72cb76b76a51b1cdf",
+  "full_geometry_cypress_dsa_rp_order_confirmed": 1,
+  "null_control_count": 3,
+  "objective_order_agrees": 3,
+  "objective_order_disagrees": 1,
+  "opportunity_count": 16,
+  "pairwise_effects_sha256": "9856cd1e828ff15d9a339f87805bd0c4ddf75fa6a5abed3548ae674d6effd535",
+  "prospective_evidence": false,
+  "schema_version": 1,
+  "selection_policy": "cypress_dsa_rp_penalty_opportunity_v1",
+  "spearman_objective_gap_vs_dsa_rp_advantage": -0.6484908994018368,
+  "spearman_penalized_disagreement_vs_dsa_rp_advantage": -0.6195733833347864,
+  "unresolved": 12,
+  "workload_count": 19
+}

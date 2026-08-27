@@ -46,7 +46,13 @@ def _problem() -> dict:
     }
 
 
-def _fixture(tmp_path: Path, *, cypress_equals_rp: bool = False) -> tuple[Path, ...]:
+def _fixture(
+    tmp_path: Path,
+    *,
+    cypress_equals_rp: bool = False,
+    cypress_costs: dict[str, int] | None = None,
+    dsa_offsets_by_capacity: dict[str, tuple[int, int, int]] | None = None,
+) -> tuple[Path, ...]:
     problem_fingerprint = "0123456789abcdef"
     cohort = tmp_path / "cohort.tsv"
     _write_tsv(
@@ -101,7 +107,7 @@ def _fixture(tmp_path: Path, *, cypress_equals_rp: bool = False) -> tuple[Path, 
                     "status": "feasible",
                     "validation": "VALID",
                     "capacity_profile": f"1={cap}",
-                    "reuse_cost": "1" if arm == "cypress" else "0",
+                    "reuse_cost": str((cypress_costs or {}).get(capacity, 1)) if arm == "cypress" else "0",
                     "runtime_us": str(capacity_index * 100),
                 }
             )
@@ -113,6 +119,8 @@ def _fixture(tmp_path: Path, *, cypress_equals_rp: bool = False) -> tuple[Path, 
                 "cypress": (0, 0, 160),
                 "dsa_rp_cg": (0, 160, 160),
             }[arm]
+            if arm == "dsa_rp_cg":
+                offsets = (dsa_offsets_by_capacity or {}).get(capacity, offsets)
             if arm == "dsa_rp_cg" and cypress_equals_rp:
                 offsets = (0, 0, 160)
             (map_dir / "pypto_kernel.dsa.solution.json").write_text(
@@ -142,31 +150,96 @@ def _fixture(tmp_path: Path, *, cypress_equals_rp: bool = False) -> tuple[Path, 
     return cohort, instances, feasibility, maps, status, corpus, replay
 
 
-def _select(tmp_path: Path, *, cypress_equals_rp: bool = False, name: str = "out") -> dict:
-    paths = _fixture(tmp_path, cypress_equals_rp=cypress_equals_rp)
-    return selector.select_workload_capacities(*paths, tmp_path / name)
+def _select(
+    tmp_path: Path,
+    *,
+    cypress_equals_rp: bool = False,
+    cypress_costs: dict[str, int] | None = None,
+    dsa_offsets_by_capacity: dict[str, tuple[int, int, int]] | None = None,
+    name: str = "out",
+    policy: str = selector.OPPORTUNITY_POLICY,
+) -> dict:
+    paths = _fixture(
+        tmp_path,
+        cypress_equals_rp=cypress_equals_rp,
+        cypress_costs=cypress_costs,
+        dsa_offsets_by_capacity=dsa_offsets_by_capacity,
+    )
+    return selector.select_workload_capacities(*paths, tmp_path / name, policy=policy)
 
 
-def test_selects_tightest_capacity_with_forced_cypress_reuse(tmp_path: Path) -> None:
+def test_opportunity_rule_uses_tighter_capacity_only_as_final_tie_breaker(tmp_path: Path) -> None:
     summary = _select(tmp_path)
     row = summary["workloads"][0]
 
-    assert row["selection_status"] == "PRIMARY_THREE_WAY"
+    assert row["selection_status"] == "OPPORTUNITY_PRIMARY"
     assert row["evaluation_capacity"] == "tight"
+    assert row["problem_fingerprints"] == "kernel=0123456789abcdef"
     assert row["forced_reuse_bytes"] == 180
     assert row["cypress_alias_pairs"] == 1
     assert row["cypress_penalized_alias_pairs"] == 1
     assert summary["uses_device_latency"] is False
 
 
+def test_opportunity_rule_maximizes_objective_gap_before_pressure(tmp_path: Path) -> None:
+    summary = _select(
+        tmp_path,
+        cypress_costs={"tight": 1, "q1": 7, "half": 3, "native": 2},
+    )
+    row = summary["workloads"][0]
+
+    assert row["evaluation_capacity"] == "q1"
+    assert row["cypress_minus_dsa_rp_reuse_cost"] == 7
+
+
+def test_opportunity_rule_uses_relation_disagreement_before_tighter_tie_break(tmp_path: Path) -> None:
+    summary = _select(
+        tmp_path,
+        dsa_offsets_by_capacity={
+            "tight": (0, 160, 320),
+            "half": (0, 160, 320),
+            "native": (0, 160, 320),
+        },
+    )
+    row = summary["workloads"][0]
+
+    assert row["evaluation_capacity"] == "q1"
+    assert row["reuse_relation_disagreement"] == 2
+
+
 def test_identical_cypress_and_dsa_rp_is_retained_as_null_control(tmp_path: Path) -> None:
     summary = _select(tmp_path, cypress_equals_rp=True)
     row = summary["workloads"][0]
 
-    assert row["selection_status"] == "NULL_CONTROL_CYPRESS_DSA_RP_IDENTICAL"
+    assert row["selection_status"] == "NULL_CONTROL_GEOMETRY_CYPRESS_DSA_RP_NOT_DISTINCT"
     assert row["evaluation_capacity"] == "tight"
     assert summary["primary_count"] == 0
     assert summary["null_control_count"] == 1
+
+
+def test_legacy_policy_still_reproduces_tightest_selection(tmp_path: Path) -> None:
+    summary = _select(
+        tmp_path,
+        cypress_costs={"tight": 1, "q1": 7, "half": 3, "native": 2},
+        policy=selector.LEGACY_TIGHTEST_POLICY,
+    )
+
+    assert summary["workloads"][0]["evaluation_capacity"] == "tight"
+    assert summary["workloads"][0]["selection_status"] == "PRIMARY_THREE_WAY"
+
+
+def test_correctness_exclusion_is_recorded_without_selecting_a_capacity(tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    reason = "stock golden is tie-sensitive"
+    summary = selector.select_workload_capacities(
+        *paths,
+        tmp_path / "out",
+        exclusions={"models/toy.py": reason},
+    )
+
+    assert summary["workload_count"] == 0
+    assert summary["excluded_count"] == 1
+    assert summary["excluded_workloads"] == [{"script": "models/toy.py", "reason": reason}]
 
 
 def test_selection_identity_ignores_solver_runtime(tmp_path: Path) -> None:
@@ -220,6 +293,33 @@ def test_checked_in_driver_first_freeze_is_timing_blind_and_complete() -> None:
     assert len({row["script"] for row in workloads}) == 20
     assert all(row["forced_reuse_bytes"] > 0 for row in workloads)
     assert all(row["cypress_penalized_alias_pairs"] > 0 for row in workloads)
+    assert not any("latency" in key or "timing" in key for row in workloads for key in row)
+
+
+def test_checked_in_opportunity_development_freeze_is_timing_blind() -> None:
+    freeze_path = (
+        Path(__file__).parents[3]
+        / ".claude"
+        / "skills"
+        / "incore-profiling"
+        / "dsa_driver_first_opportunity_development_v1.json"
+    )
+    payload = freeze_path.read_bytes()
+    freeze = json.loads(payload)
+    workloads = freeze["workloads"]
+
+    assert hashlib.sha256(payload).hexdigest() == (
+        "3d008b619ca920ad0e9f71dd6a9af56f00f4f2c8e402f8b72cb76b76a51b1cdf"
+    )
+    assert freeze["selection_policy"] == selector.OPPORTUNITY_POLICY
+    assert freeze["uses_device_latency"] is False
+    assert freeze["workload_count"] == len(workloads) == 19
+    assert freeze["primary_count"] == 16
+    assert freeze["null_control_count"] == 3
+    assert freeze["excluded_count"] == 1
+    assert freeze["capacity_counts"] == {"tight": 11, "q1": 4, "half": 2, "native": 2}
+    assert all(row["selection_status"].startswith(("OPPORTUNITY_", "NULL_CONTROL_")) for row in workloads)
+    assert all(row["problem_fingerprints"] for row in workloads)
     assert not any("latency" in key or "timing" in key for row in workloads for key in row)
 
 

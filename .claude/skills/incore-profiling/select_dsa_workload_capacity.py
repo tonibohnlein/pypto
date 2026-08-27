@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Freeze one timing-blind, reuse-pressured capacity per verified workload."""
+"""Freeze one timing-blind, reuse-opportunity capacity per verified workload."""
 
 import argparse
 import csv
@@ -21,6 +21,8 @@ ARMS = ("geometry_ff", "geometry_cg", "cypress", "dsa_rp_cg")
 PRIMARY_ARMS = ("geometry_ff", "cypress", "dsa_rp_cg")
 CAPACITIES_TIGHTEST_FIRST = ("tight", "q1", "half", "native")
 VERIFIED_STATUS = "VERIFIED_ALL_CAPACITIES"
+OPPORTUNITY_POLICY = "cypress_dsa_rp_penalty_opportunity_v1"
+LEGACY_TIGHTEST_POLICY = "tightest_reuse_pressure_v1"
 
 
 def _read_tsv(path: Path) -> list[dict[str, str]]:
@@ -133,7 +135,9 @@ def mandatory_disjoint_bytes_by_pool(problem: Mapping[str, Any]) -> dict[int, in
     return dict(lower_bounds)
 
 
-def _overlap_counts(problem: Mapping[str, Any], solution: Mapping[str, Any]) -> tuple[int, int]:
+def _overlap_relations(
+    problem: Mapping[str, Any], solution: Mapping[str, Any]
+) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
     buffers = {int(buffer["id"]): buffer for buffer in problem["buffers"]}
     roots = _colocation_roots(problem)
     placements = {
@@ -162,7 +166,7 @@ def _overlap_counts(problem: Mapping[str, Any], solution: Mapping[str, Any]) -> 
         tuple(sorted((int(penalty["first"]), int(penalty["second"]))))
         for penalty in (problem.get("cost_model") or {}).get("reuse_penalties", [])
     }
-    return len(overlaps), len(overlaps & penalty_pairs)
+    return overlaps, overlaps & penalty_pairs
 
 
 def _load_problem(path: Path, expected_sha256: str) -> dict[str, Any]:
@@ -210,8 +214,13 @@ def _capacity_facts(
     cypress_penalized_alias_pairs = 0
     cypress_reuse_cost = 0
     dsa_rp_reuse_cost = 0
+    cypress_relations: set[tuple[str, int, int]] = set()
+    dsa_rp_relations: set[tuple[str, int, int]] = set()
+    cypress_penalized_relations: set[tuple[str, int, int]] = set()
+    dsa_rp_penalized_relations: set[tuple[str, int, int]] = set()
 
     cypress_map = _resolve_map_directory(replay_root, str(map_rows["cypress"]["map_dir"]))
+    dsa_rp_map = _resolve_map_directory(replay_root, str(map_rows["dsa_rp_cg"]["map_dir"]))
     for instance in instances:
         rows = {arm: feasibility.get((script, instance["instance"], capacity, arm)) for arm in ARMS}
         if any(row is None for row in rows.values()):
@@ -233,17 +242,36 @@ def _capacity_facts(
             forced_reuse_bytes += shortage
             forced_pools += shortage > 0
 
-        solution_path = cypress_map / f"pypto_{instance['instance']}.dsa.solution.json"
-        if not solution_path.is_file():
-            raise FileNotFoundError(f"Cypress replay map omits {solution_path.name}")
-        aliases, penalized_aliases = _overlap_counts(
-            problem, json.loads(solution_path.read_text(encoding="utf-8"))
+        solution_name = f"pypto_{instance['instance']}.dsa.solution.json"
+        cypress_solution_path = cypress_map / solution_name
+        dsa_rp_solution_path = dsa_rp_map / solution_name
+        for arm, solution_path in (
+            ("Cypress", cypress_solution_path),
+            ("DSA-RP", dsa_rp_solution_path),
+        ):
+            if not solution_path.is_file():
+                raise FileNotFoundError(f"{arm} replay map omits {solution_path.name}")
+        cypress_overlaps, cypress_penalized = _overlap_relations(
+            problem, json.loads(cypress_solution_path.read_text(encoding="utf-8"))
         )
-        cypress_alias_pairs += aliases
-        cypress_penalized_alias_pairs += penalized_aliases
+        dsa_rp_overlaps, dsa_rp_penalized = _overlap_relations(
+            problem, json.loads(dsa_rp_solution_path.read_text(encoding="utf-8"))
+        )
+        instance_name = instance["instance"]
+        cypress_relations.update((instance_name, first, second) for first, second in cypress_overlaps)
+        dsa_rp_relations.update((instance_name, first, second) for first, second in dsa_rp_overlaps)
+        cypress_penalized_relations.update(
+            (instance_name, first, second) for first, second in cypress_penalized
+        )
+        dsa_rp_penalized_relations.update(
+            (instance_name, first, second) for first, second in dsa_rp_penalized
+        )
+        cypress_alias_pairs += len(cypress_overlaps)
+        cypress_penalized_alias_pairs += len(cypress_penalized)
         cypress_reuse_cost += int(rows["cypress"]["reuse_cost"])
         dsa_rp_reuse_cost += int(rows["dsa_rp_cg"]["reuse_cost"])
 
+    objective_gap = cypress_reuse_cost - dsa_rp_reuse_cost
     facts = {
         "capacity": capacity,
         "forced_reuse_bytes": forced_reuse_bytes,
@@ -252,7 +280,12 @@ def _capacity_facts(
         "cypress_penalized_alias_pairs": cypress_penalized_alias_pairs,
         "cypress_reuse_cost": cypress_reuse_cost,
         "dsa_rp_reuse_cost": dsa_rp_reuse_cost,
+        "cypress_minus_dsa_rp_reuse_cost": objective_gap,
         "dsa_rp_minus_cypress_reuse_cost": dsa_rp_reuse_cost - cypress_reuse_cost,
+        "penalized_relation_disagreement": len(
+            cypress_penalized_relations.symmetric_difference(dsa_rp_penalized_relations)
+        ),
+        "reuse_relation_disagreement": len(cypress_relations.symmetric_difference(dsa_rp_relations)),
         "distinct_primary_maps": distinct_maps,
         "cypress_vs_dsa_rp_distinct": cypress_vs_rp_distinct,
         **{f"{arm}_map_digest": digest for arm, digest in complete_map_digests.items()},
@@ -268,7 +301,41 @@ def _capacity_facts(
     return ("PRIMARY_THREE_WAY" if distinct_maps == 3 else "PRIMARY_TWO_WAY"), facts
 
 
-def select_workload_capacities(
+def _opportunity_status(availability_status: str, facts: Mapping[str, Any]) -> str:
+    if not facts:
+        return availability_status
+    if int(facts["cypress_penalized_alias_pairs"]) == 0:
+        return "CYPRESS_DOES_NOT_REALIZE_PENALIZED_REUSE"
+    if int(facts["distinct_primary_maps"]) != 3:
+        return "GEOMETRY_CYPRESS_DSA_RP_NOT_DISTINCT"
+    if int(facts["cypress_minus_dsa_rp_reuse_cost"]) <= 0:
+        return "DSA_RP_OBJECTIVE_NOT_STRICTLY_BETTER"
+    return "OPPORTUNITY_PRIMARY"
+
+
+def _opportunity_score(facts: Mapping[str, Any], capacity: str) -> tuple[int, int, int, int]:
+    """Rank eligible capacities without consulting latency; larger is better."""
+    return (
+        int(facts["cypress_minus_dsa_rp_reuse_cost"]),
+        int(facts["penalized_relation_disagreement"]),
+        int(facts["reuse_relation_disagreement"]),
+        -CAPACITIES_TIGHTEST_FIRST.index(capacity),
+    )
+
+
+def _diagnostic_score(facts: Mapping[str, Any], capacity: str) -> tuple[int, ...]:
+    """Choose a deterministic structural null when no opportunity exists."""
+    return (
+        int(facts["cypress_penalized_alias_pairs"] > 0),
+        int(facts["distinct_primary_maps"] == 3),
+        max(0, int(facts["cypress_minus_dsa_rp_reuse_cost"])),
+        int(facts["penalized_relation_disagreement"]),
+        int(facts["reuse_relation_disagreement"]),
+        -CAPACITIES_TIGHTEST_FIRST.index(capacity),
+    )
+
+
+def select_workload_capacities(  # noqa: PLR0912, PLR0913
     cohort_path: str | Path,
     instances_path: str | Path,
     feasibility_path: str | Path,
@@ -280,8 +347,13 @@ def select_workload_capacities(
     *,
     source_archive: str = "",
     source_archive_sha256: str = "",
+    policy: str = OPPORTUNITY_POLICY,
+    exclusions: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Select the tightest structurally valid capacity and freeze all workloads."""
+    """Select and freeze one structurally defined capacity per workload."""
+    if policy not in {OPPORTUNITY_POLICY, LEGACY_TIGHTEST_POLICY}:
+        raise ValueError(f"Unknown capacity-selection policy {policy!r}")
+    exclusions = dict(exclusions or {})
     cohort = _read_tsv(Path(cohort_path))
     instances = _read_tsv(Path(instances_path))
     feasibility_rows = _read_tsv(Path(feasibility_path))
@@ -296,17 +368,21 @@ def select_workload_capacities(
     maps = {(row["script"], row["capacity_label"], row["arm"]): row for row in map_rows}
 
     selection: list[dict[str, Any]] = []
+    excluded: list[dict[str, str]] = []
     for workload in sorted(cohort, key=lambda row: row["script"]):
         script = workload["script"]
+        if script in exclusions:
+            excluded.append({"script": script, "reason": exclusions[script]})
+            continue
         if statuses.get(script) != VERIFIED_STATUS:
             raise ValueError(f"Workload {script} is not verified at all capacities: {statuses.get(script)}")
         _verify_workload_problem_identity(workload, by_script[script])
         attempts: list[str] = []
         selected_status = ""
         selected_facts: dict[str, Any] = {}
-        null_control: tuple[str, dict[str, Any]] | None = None
+        candidates: list[tuple[str, str, dict[str, Any]]] = []
         for capacity in CAPACITIES_TIGHTEST_FIRST:
-            status, facts = _capacity_facts(
+            availability_status, facts = _capacity_facts(
                 script,
                 capacity,
                 by_script[script],
@@ -315,24 +391,54 @@ def select_workload_capacities(
                 Path(corpus_root),
                 Path(replay_root),
             )
+            status = (
+                _opportunity_status(availability_status, facts)
+                if policy == OPPORTUNITY_POLICY
+                else availability_status
+            )
             attempts.append(f"{capacity}:{status}")
-            if status.startswith("PRIMARY_"):
-                selected_status, selected_facts = status, facts
-                break
-            if status == "CYPRESS_DSA_RP_IDENTICAL" and null_control is None:
-                null_control = (status, facts)
-        if not selected_status:
-            if null_control is None:
-                raise ValueError(
-                    f"Workload {script} has no primary capacity or explicit null control: {attempts}"
+            if facts:
+                candidates.append((capacity, status, facts))
+
+        if policy == OPPORTUNITY_POLICY:
+            opportunities = [candidate for candidate in candidates if candidate[1] == "OPPORTUNITY_PRIMARY"]
+            if opportunities:
+                capacity, selected_status, selected_facts = max(
+                    opportunities, key=lambda candidate: _opportunity_score(candidate[2], candidate[0])
                 )
-            selected_status, selected_facts = "NULL_CONTROL_CYPRESS_DSA_RP_IDENTICAL", null_control[1]
+                assert capacity == selected_facts["capacity"]
+            elif candidates:
+                capacity, reason, selected_facts = max(
+                    candidates, key=lambda candidate: _diagnostic_score(candidate[2], candidate[0])
+                )
+                selected_status = f"NULL_CONTROL_{reason}"
+                assert capacity == selected_facts["capacity"]
+            else:
+                raise ValueError(f"Workload {script} has no complete four-arm capacity: {attempts}")
+        else:
+            null_control: tuple[str, dict[str, Any]] | None = None
+            for _capacity, status, facts in candidates:
+                if status.startswith("PRIMARY_"):
+                    selected_status, selected_facts = status, facts
+                    break
+                if status == "CYPRESS_DSA_RP_IDENTICAL" and null_control is None:
+                    null_control = (status, facts)
+            if not selected_status:
+                if null_control is None:
+                    raise ValueError(
+                        f"Workload {script} has no primary capacity or explicit null control: {attempts}"
+                    )
+                selected_status, selected_facts = (
+                    "NULL_CONTROL_CYPRESS_DSA_RP_IDENTICAL",
+                    null_control[1],
+                )
 
         selection.append(
             {
                 "script": script,
                 "measurement_unit": workload["measurement_unit"],
                 "dsa_instances": workload["dsa_instance_count"],
+                "problem_fingerprints": workload["problem_fingerprints"],
                 "selection_status": selected_status,
                 "evaluation_capacity": selected_facts["capacity"],
                 "forced_reuse_bytes": selected_facts["forced_reuse_bytes"],
@@ -341,7 +447,10 @@ def select_workload_capacities(
                 "cypress_penalized_alias_pairs": selected_facts["cypress_penalized_alias_pairs"],
                 "cypress_reuse_cost": selected_facts["cypress_reuse_cost"],
                 "dsa_rp_reuse_cost": selected_facts["dsa_rp_reuse_cost"],
+                "cypress_minus_dsa_rp_reuse_cost": selected_facts["cypress_minus_dsa_rp_reuse_cost"],
                 "dsa_rp_minus_cypress_reuse_cost": selected_facts["dsa_rp_minus_cypress_reuse_cost"],
+                "penalized_relation_disagreement": selected_facts["penalized_relation_disagreement"],
+                "reuse_relation_disagreement": selected_facts["reuse_relation_disagreement"],
                 "distinct_primary_maps": selected_facts["distinct_primary_maps"],
                 "geometry_ff_map_digest": selected_facts["geometry_ff_map_digest"],
                 "cypress_map_digest": selected_facts["cypress_map_digest"],
@@ -360,19 +469,21 @@ def select_workload_capacities(
         f"{table_sha}  evaluation-workloads.tsv\n", encoding="utf-8"
     )
     summary = {
-        "schema_version": 1,
-        "selection_policy": (
-            "tightest_combined_capacity_with_forced_reuse_cypress_penalized_reuse_"
-            "and_distinct_cypress_dsa_rp_complete_maps_v1"
-        ),
+        "schema_version": 2,
+        "selection_policy": policy,
         "uses_device_latency": False,
         "source_archive": source_archive,
         "source_archive_sha256": source_archive_sha256,
         "selection_sha256": selection_sha,
         "evaluation_workloads_tsv_sha256": table_sha,
         "workload_count": len(selection),
-        "primary_count": sum(row["selection_status"].startswith("PRIMARY_") for row in selection),
+        "primary_count": sum(
+            row["selection_status"] == "OPPORTUNITY_PRIMARY" or row["selection_status"].startswith("PRIMARY_")
+            for row in selection
+        ),
         "null_control_count": sum(row["selection_status"].startswith("NULL_CONTROL_") for row in selection),
+        "excluded_count": len(excluded),
+        "excluded_workloads": excluded,
         "capacity_counts": {
             capacity: sum(row["evaluation_capacity"] == capacity for row in selection)
             for capacity in CAPACITIES_TIGHTEST_FIRST
@@ -397,7 +508,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--source-archive", default="")
     parser.add_argument("--source-archive-sha256", default="")
+    parser.add_argument(
+        "--policy",
+        choices=(OPPORTUNITY_POLICY, LEGACY_TIGHTEST_POLICY),
+        default=OPPORTUNITY_POLICY,
+    )
+    parser.add_argument(
+        "--exclude-script",
+        action="append",
+        default=[],
+        metavar="SCRIPT=REASON",
+        help="Exclude a correctness-blocked workload, recording the reason in the freeze",
+    )
     args = parser.parse_args(argv)
+    exclusions = (
+        _named_values(";".join(args.exclude_script), field="exclude_script") if args.exclude_script else {}
+    )
     summary = select_workload_capacities(
         args.cohort,
         args.instances,
@@ -409,6 +535,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output_root,
         source_archive=args.source_archive,
         source_archive_sha256=args.source_archive_sha256,
+        policy=args.policy,
+        exclusions=exclusions,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
