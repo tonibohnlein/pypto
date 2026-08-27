@@ -341,36 +341,75 @@ python -m pypto.tools.dsa_measurement_cohort preflight.tsv results/ \
     --minimum 20 --maximum 40
 ```
 
-After launchability is established, select one evaluation capacity per problem
-without consulting device time. `cypress_actual_alias_pairs > 0` is not enough:
-Cypress may choose reuse even when a fully disjoint placement would fit. For the
-selected pool, the selector sums the sizes of buffers fixed to that pool. This
-is a hard lower bound on any physically disjoint placement, independent of
-alignment. It selects the least restrictive capacity for which:
+After launchability is established, select one evaluation capacity per workload
+without consulting device time. The purpose of this capacity is to expose the
+difference between unweighted Cypress relaxation and DSA-RP's structured
+objective, rather than merely to maximize memory pressure. A capacity is an
+**opportunity capacity** only when:
 
-- capacity is strictly below that disjoint lower bound, so reuse is mandatory;
-- the forced shortage is at least 25% of the disjoint lower bound, applying the
-  same timing-blind pressure floor to every problem;
-- all four logical policies are feasible;
-- Cypress realizes at least one alias pair; and
-- geometry first-fit, Cypress, and DSA-RP have distinct physical placements.
+- all four logical policies are feasible and independently valid;
+- Cypress realizes at least one penalized reuse relation;
+- geometry first-fit, Cypress, and DSA-RP have three distinct complete maps; and
+- DSA-RP has a strictly lower realized reuse-penalty objective than Cypress.
 
-The raw-size bound is deliberately conservative: it may reject an instance
-where alignment alone forces reuse, but it cannot falsely label voluntary reuse
-as capacity-forced. The pressure floor avoids choosing a barely constrained
-capacity merely because one byte no longer fits. The selector records the lower
-bound, byte and percentage margins, and each arm's unit reuse cost. The costs
-are audit outputs and do not participate in capacity selection:
+Among opportunity capacities, the selector maximizes, in order, the
+Cypress-minus-DSA-RP objective gap, the symmetric difference of realized
+penalized relations, and the symmetric difference of all realized reuse
+relations. Tighter capacity is only the final tie-breaker. This rule is wholly
+structural: solver runtime and device latency are rejected as inputs. A workload
+with no opportunity capacity remains an explicitly labelled null control rather
+than being silently promoted from a two-map or objective-tied cell. Mandatory
+disjoint-size shortage remains an audit field, not a selector input.
+
+The currently measured workloads are a development corpus: it is valid to join
+their structurally frozen opportunity capacities to existing timings to refine
+the model, but not to call that join prospective evidence. New workloads form a
+holdout only when their capacities are frozen with the same rule before any of
+their timing is inspected:
 
 ```bash
-python .claude/skills/incore-profiling/select_dsa_evaluation_capacity.py \
-    --problems frozen/cohort/problems.tsv \
-    --problems-dir fresh-export/corpus/penalty-bearing \
-    --problem-status results/problem-status.tsv \
-    --screen-results inputs/screen-results.tsv \
-    --minimum-forced-reuse-percent 25 \
+python .claude/skills/incore-profiling/select_dsa_workload_capacity.py \
+    --cohort inputs/results/corpus-frozen.tsv \
+    --instances fresh-export/invocations.tsv \
+    --feasibility inputs/results/full-policy-feasibility.tsv \
+    --maps inputs/results/map-digests.tsv \
+    --workload-status inputs/results/workload-status.tsv \
+    --corpus-root fresh-export --replay-root inputs \
     --output-root evaluation-capacities
+
+# Development-only, and only after evaluation-freeze.json exists:
+python .claude/skills/incore-profiling/evaluate_dsa_opportunity_freeze.py \
+    --freeze evaluation-capacities/evaluation-freeze.json \
+    --pairwise-effects prior-timing/results/pairwise-effects.tsv \
+    --output-root development-analysis
+
+# Prospective holdout, before any timing:
+python .claude/skills/incore-profiling/freeze_dsa_opportunity_holdout.py \
+    --opportunity-freeze new-candidates/evaluation-freeze.json \
+    --development-freeze \
+      .claude/skills/incore-profiling/dsa_driver_first_opportunity_development_v1.json \
+    --minimum 8 --maximum 12 --output-root prospective-holdout
 ```
+
+The holdout freezer rejects performance-bearing input fields and excludes both
+development scripts and semantic DSA problem fingerprints. This prevents a new
+wrapper filename from relabelling an already observed problem as prospective.
+It selects deterministically for source-class and model-family diversity, then
+for structural opportunity, and seals the resulting capacity rows before the
+device timing table may be opened.
+
+The first application of this rule is frozen in
+`dsa_driver_first_opportunity_development_v1.json`. After excluding one
+stock-golden-blocked gate workload, it contains 19 workloads: 16 opportunity
+cells and three structural null controls, at 11 tight, four quarter, two half,
+and two native capacities. The post-freeze development join finds four
+confirmed Cypress-versus-DSA-RP orderings: three agree with the structured
+objective and one disagrees. Only one cell confirms the complete
+geometry-first-fit > Cypress > DSA-RP latency ordering. Objective-gap magnitude
+is negatively rank-correlated with the measured DSA-RP advantage in this small
+development set, so a larger unit-cost gap must not be presented as a latency
+prediction. These observations motivate better penalty weights; they are not
+prospective validation of the selection rule.
 
 When more than 40 cases qualify, selection is deterministic and round-robin
 across model family and parent program. Endpoint-identical logical policies are

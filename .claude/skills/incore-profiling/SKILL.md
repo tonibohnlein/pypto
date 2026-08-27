@@ -128,7 +128,10 @@ fit, geometry canonical greedy, a six-order Cypress portfolio, and DSA-RP
 canonical greedy.
 The two canonical-greedy arms use the same seed and restart count; only their
 objectives differ. Cypress selection is deliberately blind to reuse-penalty
-weights and device time. `model-separation.tsv` is a candidate-ranking aid, not
+weights and device time. The paper leaves its auxiliary-edge deletion order
+unspecified, so the implementation probes the timing-blind six-variant portfolio
+documented in [the dedicated-driver reference](references/dsa-dedicated-driver-corpus.md).
+`model-separation.tsv` is a candidate-ranking aid, not
 performance evidence; retain neutral and Cypress-favoured controls when
 freezing the device panel. Pass `--fractions 1` for a native-capacity-only
 census.

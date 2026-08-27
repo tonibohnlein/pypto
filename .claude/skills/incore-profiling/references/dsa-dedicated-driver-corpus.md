@@ -50,6 +50,17 @@ pool of every child DSA problem simultaneously. Use
 to the exported problem. After device correctness has verified all four
 capacities, freeze one workload-level capacity with:
 
+The Cypress baseline follows the published relaxation outline but does not
+claim an undocumented edge-removal policy. It starts from all auxiliary
+conflict edges, retries the Knight-style packer after each removal, and probes a
+timing- and penalty-weight-blind six-variant portfolio: stable ID order, reverse
+ID order, largest potential overlap first, and seeded random orders 0, 1, and
+2. The selected variant minimizes, lexicographically, infeasibility, realized
+alias pairs, relaxed auxiliary edges, total peak, order, and seed. This makes
+the baseline reproducible and at least as strong as any one arbitrary removal
+order while preserving Cypress's lack of a structured synchronization-cost
+objective.
+
 ```bash
 python .claude/skills/incore-profiling/select_dsa_workload_capacity.py \
   --cohort <verification>/results/corpus-frozen.tsv \
@@ -61,11 +72,31 @@ python .claude/skills/incore-profiling/select_dsa_workload_capacity.py \
   --output-root <evaluation-freeze>
 ```
 
-The selector takes the tightest capacity that proves a conservative disjoint
-shortage, makes Cypress realize at least one penalized reuse relation, and gives
-Cypress and DSA-RP different complete parent maps. Workloads where those maps
-remain identical at every capacity are retained as explicit null controls.
-Selection never reads device latency.
+The opportunity selector requires Cypress to realize penalized reuse, requires
+three distinct complete maps for geometry first-fit, Cypress, and DSA-RP, and
+requires DSA-RP to have a strictly lower realized penalty objective. It then
+maximizes the Cypress-minus-DSA-RP objective gap, penalized-relation
+disagreement, and all-relation disagreement, using tighter capacity only as a
+final tie-breaker. Workloads without such a capacity are retained as explicit
+null controls. Selection never reads device latency. Use the resulting current
+workloads only as development data; a prospective holdout requires new drivers
+whose capacity is frozen before any timing is inspected.
+
+After screening a fresh candidate set, seal 8--12 opportunity workloads with:
+
+```bash
+python .claude/skills/incore-profiling/freeze_dsa_opportunity_holdout.py \
+  --opportunity-freeze <new-candidates>/evaluation-freeze.json \
+  --development-freeze \
+    .claude/skills/incore-profiling/dsa_driver_first_opportunity_development_v1.json \
+  --minimum 8 --maximum 12 --output-root <holdout-freeze>
+```
+
+The freezer rejects latency-bearing inputs, previously used scripts, and any
+DSA problem fingerprint already present in the development corpus. It then
+selects deterministically for source-class and model-family diversity before
+using the structural opportunity gap. Device timing starts only after the
+resulting holdout hash is recorded.
 
 ## Structured penalty model
 

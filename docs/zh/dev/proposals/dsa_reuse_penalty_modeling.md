@@ -284,33 +284,64 @@ python -m pypto.tools.dsa_measurement_cohort preflight.tsv results/ \
     --minimum 20 --maximum 40
 ```
 
-在确认 launchability 后，为每个 problem 选择一个 evaluation capacity，且不读取设备
-时间。仅有 `cypress_actual_alias_pairs > 0` 并不足够：即使完全不重叠的 placement 能够
-放下，Cypress 也可能主动选择 reuse。selector 对选中 pool 中固定属于该 pool 的 buffer
-size 求和。该和是不依赖 alignment 的物理不重叠 placement 硬下界。selector 选择满足以下
-条件的最宽松 capacity：
+在确认 launchability 后，为每个 workload 选择一个 evaluation capacity，且不读取设备
+时间。该 capacity 的目标是暴露无权重 Cypress relaxation 与 DSA-RP 结构化目标之间的
+差异，而不是单纯最大化内存压力。只有满足以下条件的 capacity 才是
+**opportunity capacity**：
 
-- capacity 严格小于该不重叠下界，因此必须发生 reuse；
-- 强制短缺量至少为不重叠下界的 25%，对所有 problem 使用同一个不依赖时延的
-  pressure 下限；
-- 四个逻辑策略均可行；
-- Cypress 实际产生至少一个 alias pair；
-- geometry first-fit、Cypress 与 DSA-RP 的物理 placement 各不相同。
+- 四个逻辑策略均可行，并且通过独立验证；
+- Cypress 实际产生至少一个带 penalty 的 reuse relation；
+- geometry first-fit、Cypress 与 DSA-RP 具有三个不同的完整 map；
+- DSA-RP 的实际 reuse-penalty objective 严格低于 Cypress。
 
-raw-size 下界是刻意保守的：它可能拒绝仅因 alignment 而必须 reuse 的实例，但不会把
-自愿 reuse 错标为 capacity-forced。pressure 下限避免仅因为少量 byte 无法放下就选择几乎
-无压力的 capacity。selector 会记录该下界、强制 reuse 的 byte 和百分比 margin，
-以及每个 arm 的 unit reuse cost。cost 仅用于审计，不参与 capacity selection：
+在所有 opportunity capacity 中，selector 依次最大化 Cypress 减 DSA-RP 的 objective
+gap、实际带 penalty relation 的对称差，以及全部实际 reuse relation 的对称差；只有前述
+字段全部相同时，才优先选择更紧的 capacity。该规则完全基于结构信息：solver runtime 与
+device latency 都不允许作为输入。没有 opportunity capacity 的 workload 会保留为明确
+标记的 null control，而不会把只有两个 map 或 objective 相同的 cell 静默提升为主用例。
+强制不相交 size shortage 仍作为审计字段记录，但不参与选择。
+
+当前已经测量的 workload 是开发语料：可以把其结构上冻结的 opportunity capacity 与既有
+timing 连接以改进模型，但不能把该连接称为前瞻性证据。只有在查看任何新 workload 的
+timing 之前使用同一规则冻结 capacity，它们才能构成 holdout：
 
 ```bash
-python .claude/skills/incore-profiling/select_dsa_evaluation_capacity.py \
-    --problems frozen/cohort/problems.tsv \
-    --problems-dir fresh-export/corpus/penalty-bearing \
-    --problem-status results/problem-status.tsv \
-    --screen-results inputs/screen-results.tsv \
-    --minimum-forced-reuse-percent 25 \
+python .claude/skills/incore-profiling/select_dsa_workload_capacity.py \
+    --cohort inputs/results/corpus-frozen.tsv \
+    --instances fresh-export/invocations.tsv \
+    --feasibility inputs/results/full-policy-feasibility.tsv \
+    --maps inputs/results/map-digests.tsv \
+    --workload-status inputs/results/workload-status.tsv \
+    --corpus-root fresh-export --replay-root inputs \
     --output-root evaluation-capacities
+
+# 仅用于开发分析，并且必须在 evaluation-freeze.json 已写入后运行：
+python .claude/skills/incore-profiling/evaluate_dsa_opportunity_freeze.py \
+    --freeze evaluation-capacities/evaluation-freeze.json \
+    --pairwise-effects prior-timing/results/pairwise-effects.tsv \
+    --output-root development-analysis
+
+# 前瞻性 holdout，必须在任何 timing 之前执行：
+python .claude/skills/incore-profiling/freeze_dsa_opportunity_holdout.py \
+    --opportunity-freeze new-candidates/evaluation-freeze.json \
+    --development-freeze \
+      .claude/skills/incore-profiling/dsa_driver_first_opportunity_development_v1.json \
+    --minimum 8 --maximum 12 --output-root prospective-holdout
 ```
+
+holdout freezer 会拒绝带 performance 字段的输入，同时排除开发集已经使用的脚本和语义
+DSA problem fingerprint。这样，新的 wrapper 文件名就不能把已经观察过的问题重新标记为
+prospective。该工具先按 source class 与 model family 的多样性进行确定性选择，再使用结构
+opportunity 信息，并在读取 device timing 表之前封存最终 capacity 行。
+
+该规则的第一次应用冻结在 `dsa_driver_first_opportunity_development_v1.json` 中。
+排除一个被 stock golden 阻塞的 gate workload 后，共有 19 个 workload：16 个 opportunity
+cell 和 3 个结构 null control，分别使用 11 个 tight、4 个 quarter、2 个 half 和 2 个
+native capacity。冻结后的开发集连接得到 4 个确认的 Cypress 与 DSA-RP 排序，其中 3 个
+符合结构化 objective，1 个不符合；只有一个 cell 确认完整的
+geometry-first-fit > Cypress > DSA-RP 时延排序。在这个小型开发集中，objective gap 的大小
+与实测 DSA-RP 优势呈负的 rank correlation，因此不能把更大的 unit-cost gap 当作时延预测。
+这些观察结果说明需要改进 penalty weight，但不构成对选择规则的前瞻性验证。
 
 若合格用例超过 40 个，则按模型族和父程序进行确定性的轮询选择。代码端点相同的
 逻辑策略仍保留在矩阵中，但只需进行一次物理测量。
