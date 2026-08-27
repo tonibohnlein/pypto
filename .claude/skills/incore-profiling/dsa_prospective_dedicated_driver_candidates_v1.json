@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "selection_policy": "prospective_structural_opportunity_candidates_v1",
+  "timing_blind_selection": true,
+  "pypto_lib_revision": "db6eefe00352c085d3b19199e7ced2eaa363134a",
+  "arms": [
+    "geometry_ff",
+    "geometry_cg",
+    "cypress",
+    "dsa_rp_cg"
+  ],
+  "capacities": [
+    "native",
+    "half",
+    "q1",
+    "tight"
+  ],
+  "input_seed": 20260827,
+  "measurement_contract": {
+    "placement_scope": "all_dsa_functions_in_driver",
+    "correctness_scope": "complete_driver_torch_golden",
+    "timing_scope": "selected_runtime_task",
+    "allow_whole_driver_as_kernel_timing": false,
+    "requires_runtime_capture": false
+  },
+  "drivers": [
+    {
+      "tier": "expanded",
+      "driver_id": "pro_hc_head_reduce_isolated",
+      "script": "models/deepseek_v4_pro/dsa_eval_hc_head_reduce.py",
+      "entry": "hc_head_reduce_test",
+      "golden": "golden_hc_head_reduce",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "hc_head_reduce",
+          "problem_fingerprint": "dff238c757431526",
+          "pool_id": "1",
+          "operation_class": "reduction",
+          "definition_script": "models/deepseek_v4_pro/hc_head.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "pro_split_pre_post_isolated",
+      "script": "models/deepseek_v4_pro/dsa_eval_split_pre_post.py",
+      "entry": "split_pre_post_test",
+      "golden": "golden_split_pre_post",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "split_pre_post",
+          "problem_fingerprint": "db3ce21eb462deb5",
+          "pool_id": "1",
+          "operation_class": "data_movement_split",
+          "definition_script": "models/deepseek_v4_pro/hc_pre.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "dspark_o_lora_quant_isolated",
+      "script": "models/deepseek_v4_flash_dspark/dsa_eval_o_lora_quant.py",
+      "entry": "o_lora_quant_test",
+      "golden": "golden_o_lora_quant",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "dspark_o_lora_quant",
+          "problem_fingerprint": "1653e74fe53ea879",
+          "pool_id": "1",
+          "operation_class": "quantization",
+          "definition_script": "models/deepseek_v4_flash_dspark/dspark_attention.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "dspark_kv_commit_valid_bias_isolated",
+      "script": "models/deepseek_v4_flash_dspark/dsa_eval_kv_commit_valid_bias.py",
+      "entry": "kv_commit_valid_bias_test",
+      "golden": "golden_kv_commit_valid_bias",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "dspark_kv_commit_valid_bias",
+          "problem_fingerprint": "318a97bbb8003d94",
+          "pool_id": "1",
+          "operation_class": "cache_write_and_mask",
+          "definition_script": "models/deepseek_v4_flash_dspark/dspark_attention.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "mtp_qkv_proj_rope_decode",
+      "script": "models/deepseek_v4_flash_mtp/qkv_proj_rope.py",
+      "entry": "qkv_proj_rope_test",
+      "golden": "golden_qkv_proj_rope",
+      "specs": "build_tensor_specs",
+      "argv": [
+        "--mode",
+        "decode"
+      ],
+      "targets": [
+        {
+          "instance": "kv_rms_norm_rope",
+          "problem_fingerprint": "f13ffe09c7313337",
+          "pool_id": "1",
+          "operation_class": "normalization_rope"
+        },
+        {
+          "instance": "qproj_dequant_rms_nope_rope",
+          "problem_fingerprint": "b22a99e3ca71db71",
+          "pool_id": "1",
+          "operation_class": "dequantization_normalization_rope"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "pro_decode_compressor_ratio128",
+      "script": "models/deepseek_v4_pro/decode_compressor_ratio128.py",
+      "entry": "compressor_test",
+      "golden": "golden_compressor",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "rmsnorm_rope_cache_write",
+          "problem_fingerprint": "31c94ef914dad60f",
+          "pool_id": "1",
+          "operation_class": "normalization_rope_cache_write"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "dspark_decode_indexer_compressor",
+      "script": "models/deepseek_v4_flash_dspark/decode_indexer_compressor.py",
+      "entry": "compressor_test",
+      "golden": "golden_compressor",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "rmsnorm_rope",
+          "problem_fingerprint": "9c64928ddb53b567",
+          "pool_id": "1",
+          "operation_class": "normalization_rope"
+        },
+        {
+          "instance": "kv_and_cache_write",
+          "problem_fingerprint": "a9a31a5bcc0336cd",
+          "pool_id": "1",
+          "operation_class": "cache_write"
+        }
+      ]
+    },
+    {
+      "tier": "expanded",
+      "driver_id": "dspark_gate_complete_mixed_group",
+      "script": "models/deepseek_v4_flash_dspark/gate.py",
+      "entry": "gate_test",
+      "golden": "golden_gate_core",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "gate_aiv",
+          "problem_fingerprint": "92f167b7b88ff338",
+          "pool_id": "1",
+          "operation_class": "gate_routing",
+          "source_name_hint": "gate"
+        }
+      ]
+    }
+  ]
+}
