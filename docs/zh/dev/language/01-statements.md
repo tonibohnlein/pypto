@@ -93,6 +93,7 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | `pl.at(level=pl.Level.CORE_GROUP)` | `InCore` | CORE_GROUP 级固定边界 outline |
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(MODE)])` | `InCore` | InCore + 跨核 split 提示 |
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.cross_core_slot(slot_num=N)])` | `InCore` | InCore + 跨核 pipe 槽位数 |
+| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.cross_core_pipe(...)])` | `InCore` | InCore + 显式物理 FIFO 契约 |
 | `pl.at(level=pl.Level.HOST)`（或任意非 `CORE_GROUP` 级别） | `Hierarchy` | 分布式层级作用域 |
 | `pl.cluster()` | `Cluster` | AIC+AIV 协同调度组 |
 | `pl.graph("name")` | `Graph` | 可录制的编排区域；名字必填，并成为提取函数的名字 —— 见 [OutlineGraphScopes](../passes/08-outline_graph_scopes.md) |
@@ -122,6 +123,7 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | ---- | -------- | ---- |
 | `pl.split(MODE)` | 两种均适用 | 给内层 InCore 设置 `split_` 字段（跨核数据搬运提示，由 `ExpandMixedKernel` / `MemoryReuse` 消费）。with-form 会在原 call 外多包一层 `InCoreScopeStmt` 来承载该字段。 |
 | `pl.cross_core_slot(slot_num=N)` | 两种均适用 | 给内层 InCore 设置 `slot_num` 属性——自动跨核 pipe 的槽位数（环深），由 `ExpandMixedKernel` 消费。它只决定数据通道大小，**不**划分计算，因此可与 `pl.split_aiv` 区域共存（而 `pl.split(...)` 不能）。省略时沿用默认深度：每个活跃方向 2 个槽位。 |
+| `pl.cross_core_pipe(...)` | 两种均适用 | 添加一个带版本的单向物理 FIFO 描述符。必填字段为 `tensor_id`、`direction`、`valid_shape`、`slot_size_bytes`、`slot_num`、`pipe_id` 和 `bundle`。`ExpandMixedKernel` 会用实际边界验证它，并发出独立的 pipe setup 与 ID。重复条目可描述多次往返调度。 |
 
 > `pl.split(MODE, slot_num=N)` 是该槽位数的已废弃别名，会发出警告——参见
 > [ExpandMixedKernel](../passes/24-expand_mixed_kernel.md#覆盖槽位数slot_num)。
