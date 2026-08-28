@@ -90,6 +90,25 @@ Cross-core data transfer at CV boundaries is handled by splitting explicit `tile
 | Cube→Vector (e.g. Acc→Vec) | `tpush_to_aiv(source_tile)` | `dest_var = tpop_from_aic()` |
 | Vector→Cube (e.g. Vec→Mat/Left/Right) | `dest_var = tpop_from_aiv()` | `tile.move` to adapt fractal layout, then `tpush_to_aic(adapted_tile)` |
 
+### Explicit physical FIFO contracts
+
+The default path derives one automatic pipe from the boundaries it finds. A planner may
+instead attach repeated `pl.cross_core_pipe(...)` optimization entries. The public contract
+records independent unidirectional pipe IDs, valid frames, slot geometry, and protocol bundle
+labels. Expansion matches those records to the ordered cube/vector boundaries, verifies shape
+and byte agreement, and emits one reserve/import/initialize pair per descriptor. The generated
+`tpush`, `tpop`, and `tfree` chain carries the same pipe ID on both AIC and AIV. The descriptor
+is consumed during expansion and must not survive in final functions. `tensor_id` and `bundle`
+are opaque planner labels; they do not identify IR values or replace ordered boundary matching.
+
+Descriptors are ordered by first boundary use. If source lowering repeats the protocol—for
+example, a rolled streaming loop followed by a separately emitted tail—the same ordered
+descriptor sequence is reused for the next cycle. Expansion requires every cycle to end on the
+last descriptor; a partial repetition fails closed.
+
+This interface selects transport mechanics only. It does not recognize attention, SwiGLU, or
+any other graph pattern, and it does not replace PyPTO's AIC/AIV split or pipeline passes.
+
 **Fractal TileView layout**: Cross-core transfer tile views are computed by `BuildCrossCoreTransferView` based on the destination memory space. The mapping differs between backends:
 
 Ascend950 (a5) — hardware cross-core pipe carries data in fractal layout:

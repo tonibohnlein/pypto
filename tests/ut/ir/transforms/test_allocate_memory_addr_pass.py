@@ -629,6 +629,14 @@ def test_overflow_diagnostic_attributes_the_cross_core_pipe_ring(ascend_backend)
     assert "pl.cross_core_slot(slot_num=N)" in message
 
 
+def test_overflow_diagnostic_attributes_an_explicit_indexed_pipe_ring(ascend_backend):
+    """Explicit pipe descriptors suffix the otherwise exact ring name with the pipe ID."""
+    message = _overflow_message(_overflowing_mat_program("kernel_v2c_slot_buffer_7"))
+    assert "cross-core pipe ring" in message
+    assert "slot_num=N on the matching pl.cross_core_pipe(...) descriptor" in message
+    assert "pl.cross_core_slot" not in message
+
+
 def test_overflow_diagnostic_omits_ring_knob_for_a_hand_authored_buffer(ascend_backend):
     """A reserve_buffer that is NOT the automatic pipe ring still gets its bytes
     attributed, but must not be pointed at pl.cross_core_slot — that knob cannot
@@ -649,6 +657,13 @@ def test_overflow_diagnostic_omits_ring_knob_on_a_pipe_name_collision(ascend_bac
     """
     message = _overflow_message(_overflowing_mat_program("scratch_v2c_slot_buffer"))
     assert "The first 524288 bytes of that space are reserved by system.reserve_buffer" in message
+    assert "cross-core pipe ring" not in message
+    assert "cross_core_slot" not in message
+
+
+def test_overflow_diagnostic_omits_indexed_ring_knob_on_a_name_collision(ascend_backend):
+    """A numeric suffix alone does not turn an unrelated buffer into an explicit pipe ring."""
+    message = _overflow_message(_overflowing_mat_program("scratch_v2c_slot_buffer_7"))
     assert "cross-core pipe ring" not in message
     assert "cross_core_slot" not in message
 

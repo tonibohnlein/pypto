@@ -13,12 +13,17 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -148,6 +153,96 @@ std::string BuildPipeBufferName(const std::string& func_name, core_affinity::Pip
          ((direction == core_affinity::PipeDirection::C2V) ? "_c2v_slot_buffer" : "_v2c_slot_buffer");
 }
 
+std::string BuildPipeBufferName(const std::string& func_name, core_affinity::PipeDirection direction,
+                                int pipe_id) {
+  return BuildPipeBufferName(func_name, direction) + "_" + std::to_string(pipe_id);
+}
+
+std::string EncodeExplicitCrossCorePipes(const std::vector<ExplicitCrossCorePipe>& pipes, const Span& span) {
+  INTERNAL_CHECK_SPAN(!pipes.empty(), span)
+      << "Explicit cross-core pipe contract must contain at least one pipe";
+  std::set<int> pipe_ids;
+  std::string encoded = std::to_string(kExplicitCrossCorePipeVersion);
+  for (const auto& pipe : pipes) {
+    const int direction = static_cast<int>(pipe.direction);
+    INTERNAL_CHECK_SPAN(pipe.tensor_id >= 0, span)
+        << "Cross-core pipe tensor id must be non-negative: " << pipe.tensor_id;
+    INTERNAL_CHECK_SPAN(direction == core_affinity::kDirMaskC2V || direction == core_affinity::kDirMaskV2C,
+                        span)
+        << "Cross-core pipe direction must be unidirectional: " << direction;
+    INTERNAL_CHECK_SPAN(pipe.valid_rows > 0 && pipe.valid_cols > 0 && pipe.slot_size_bytes > 0, span)
+        << "Cross-core pipe shape and slot size must be positive";
+    INTERNAL_CHECK_SPAN(pipe.slot_num > 0 && pipe.pipe_id >= 0 && pipe.bundle >= -1, span)
+        << "Cross-core pipe slot count, pipe id, and bundle must be valid";
+    INTERNAL_CHECK_SPAN(pipe_ids.insert(pipe.pipe_id).second, span)
+        << "Cross-core pipe id is duplicated: " << pipe.pipe_id;
+    encoded.push_back(';');
+    const std::array<int64_t, 8> fields = {
+        pipe.tensor_id,       direction,     pipe.valid_rows, pipe.valid_cols,
+        pipe.slot_size_bytes, pipe.slot_num, pipe.pipe_id,    pipe.bundle};
+    for (size_t i = 0; i < fields.size(); ++i) {
+      if (i != 0) encoded.push_back(',');
+      encoded += std::to_string(fields[i]);
+    }
+  }
+  return encoded;
+}
+
+std::optional<std::vector<ExplicitCrossCorePipe>> DecodeExplicitCrossCorePipes(const std::string& encoded) {
+  auto parse_integer = [](std::string_view token, int64_t* value) {
+    if (token.empty()) return false;
+    const char* begin = token.data();
+    const char* end = token.data() + token.size();
+    auto [ptr, ec] = std::from_chars(begin, end, *value);
+    return ec == std::errc() && ptr == end;
+  };
+
+  std::string_view remaining(encoded);
+  const size_t version_end = remaining.find(';');
+  int64_t version = 0;
+  if (version_end == std::string_view::npos || !parse_integer(remaining.substr(0, version_end), &version) ||
+      version != kExplicitCrossCorePipeVersion) {
+    return std::nullopt;
+  }
+  remaining.remove_prefix(version_end + 1);
+
+  std::vector<ExplicitCrossCorePipe> pipes;
+  std::set<int> pipe_ids;
+  while (!remaining.empty()) {
+    const size_t record_end = remaining.find(';');
+    std::string_view record = remaining.substr(0, record_end);
+    std::array<int64_t, 8> fields{};
+    for (size_t i = 0; i < fields.size(); ++i) {
+      const size_t comma = record.find(',');
+      const std::string_view token = record.substr(0, comma);
+      if (!parse_integer(token, &fields[i])) return std::nullopt;
+      if (i + 1 == fields.size()) {
+        if (comma != std::string_view::npos) return std::nullopt;
+      } else {
+        if (comma == std::string_view::npos) return std::nullopt;
+        record.remove_prefix(comma + 1);
+      }
+    }
+
+    if (fields[0] < 0 ||
+        (fields[1] != core_affinity::kDirMaskC2V && fields[1] != core_affinity::kDirMaskV2C) ||
+        fields[2] <= 0 || fields[3] <= 0 || fields[4] <= 0 || fields[5] <= 0 ||
+        fields[5] > std::numeric_limits<int>::max() || fields[6] < 0 ||
+        fields[6] > std::numeric_limits<int>::max() || fields[7] < -1 ||
+        fields[7] > std::numeric_limits<int>::max()) {
+      return std::nullopt;
+    }
+    const int pipe_id = static_cast<int>(fields[6]);
+    if (!pipe_ids.insert(pipe_id).second) return std::nullopt;
+    pipes.push_back({fields[0], static_cast<core_affinity::PipeDirection>(fields[1]), fields[2], fields[3],
+                     fields[4], static_cast<int>(fields[5]), pipe_id, static_cast<int>(fields[7])});
+
+    if (record_end == std::string_view::npos) break;
+    remaining.remove_prefix(record_end + 1);
+  }
+  return pipes.empty() ? std::nullopt : std::optional<std::vector<ExplicitCrossCorePipe>>(std::move(pipes));
+}
+
 CallPtr CreateSystemOpCall(const std::string& op_name,
                            const std::vector<std::pair<std::string, std::any>>& kwargs, const Span& span) {
   return CreateSystemOpCall(op_name, {}, kwargs, span);
@@ -175,8 +270,8 @@ CallPtr CreateImportPeerBuffer(const std::string& buffer_name, const std::string
 }
 
 CallPtr CreateInitializePipe(core_affinity::CoreSide side, int dir_mask, int slot_size_bytes,
-                             const ExprPtr& c2v_consumer_buf, const ExprPtr& v2c_consumer_buf, int slot_num,
-                             const Span& span) {
+                             const ExprPtr& c2v_consumer_buf, const ExprPtr& v2c_consumer_buf,
+                             std::optional<int> pipe_id, int slot_num, const Span& span) {
   INTERNAL_CHECK_SPAN(slot_size_bytes >= 0 && slot_size_bytes <= std::numeric_limits<int>::max(), span)
       << "Cross-core slot_size out of range: " << slot_size_bytes;
   INTERNAL_CHECK_SPAN(slot_num > 0, span) << "Cross-core slot_num must be positive: " << slot_num;
@@ -185,6 +280,10 @@ CallPtr CreateInitializePipe(core_affinity::CoreSide side, int dir_mask, int slo
   std::vector<std::pair<std::string, std::any>> kwargs = {{"dir_mask", std::any(dir_mask)},
                                                           {"slot_size", std::any(slot_size_bytes)},
                                                           {"slot_num", std::any(slot_num)}};
+  if (pipe_id.has_value()) {
+    INTERNAL_CHECK_SPAN(*pipe_id >= 0, span) << "Cross-core pipe id must be non-negative: " << *pipe_id;
+    kwargs.emplace_back("id", std::any(*pipe_id));
+  }
   const std::string op_name = core_side_ops::InitializePipeOp(side);
   return CreateSystemOpCall(op_name, {c2v_consumer_buf, v2c_consumer_buf}, kwargs, span);
 }
@@ -341,15 +440,86 @@ AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const s
   const ExprPtr aiv_c2v_arg = aiv_c2v_reserve_var ? var_as_expr(aiv_c2v_reserve_var) : ExprPtr(zero_i32());
   const ExprPtr aiv_v2c_arg = aiv_v2c_import_var ? var_as_expr(aiv_v2c_import_var) : ExprPtr(zero_i32());
 
-  setup.aic_stmts.push_back(
-      std::make_shared<EvalStmt>(CreateInitializePipe(core_affinity::CoreSide::AIC, dir_mask, slot_size_bytes,
-                                                      aic_c2v_arg, aic_v2c_arg, effective_slot_num, span),
-                                 span));
-  setup.aiv_stmts.push_back(
-      std::make_shared<EvalStmt>(CreateInitializePipe(core_affinity::CoreSide::AIV, dir_mask, slot_size_bytes,
-                                                      aiv_c2v_arg, aiv_v2c_arg, effective_slot_num, span),
-                                 span));
+  setup.aic_stmts.push_back(std::make_shared<EvalStmt>(
+      CreateInitializePipe(core_affinity::CoreSide::AIC, dir_mask, slot_size_bytes, aic_c2v_arg, aic_v2c_arg,
+                           std::nullopt, effective_slot_num, span),
+      span));
+  setup.aiv_stmts.push_back(std::make_shared<EvalStmt>(
+      CreateInitializePipe(core_affinity::CoreSide::AIV, dir_mask, slot_size_bytes, aiv_c2v_arg, aiv_v2c_arg,
+                           std::nullopt, effective_slot_num, span),
+      span));
 
+  return setup;
+}
+
+AutomaticPipeSetup BuildExplicitPipeSetup(const std::string& func_name, const std::string& aic_name,
+                                          const std::string& aiv_name,
+                                          const std::vector<ExplicitCrossCorePipe>& pipes,
+                                          const std::vector<StmtPtr>& aic_stmts,
+                                          const std::vector<StmtPtr>& aiv_stmts, const Span& span) {
+  INTERNAL_CHECK_SPAN(!pipes.empty(), span) << "Explicit cross-core pipe setup requires at least one pipe";
+  CrossCorePipeMetadata aic_metadata;
+  CollectCrossCorePipeMetadata(aic_stmts, aic_metadata);
+  CrossCorePipeMetadata aiv_metadata;
+  CollectCrossCorePipeMetadata(aiv_stmts, aiv_metadata);
+  INTERNAL_CHECK_SPAN(!aic_metadata.HasAnySetup() && !aiv_metadata.HasAnySetup(), span)
+      << "Explicit cross-core pipes cannot coexist with pre-existing pipe setup";
+
+  auto zero_i32 = [&]() { return std::make_shared<ConstInt>(0, DataType::INT32, span); };
+  auto var_as_expr = [](const std::shared_ptr<Var>& var) -> ExprPtr {
+    return std::static_pointer_cast<const Expr>(var);
+  };
+
+  AutomaticPipeSetup setup;
+  for (const auto& pipe : pipes) {
+    const int dir_mask = static_cast<int>(pipe.direction);
+    CHECK_SPAN(dir_mask == core_affinity::kDirMaskC2V || dir_mask == core_affinity::kDirMaskV2C, span)
+        << "pl.cross_core_pipe direction must be unidirectional, got " << dir_mask;
+    CHECK_SPAN(pipe.slot_size_bytes > 0 && pipe.slot_size_bytes <= std::numeric_limits<int>::max() &&
+                   pipe.slot_num > 0,
+               span)
+        << "pl.cross_core_pipe has invalid slot geometry for pipe_id=" << pipe.pipe_id;
+    CHECK_SPAN(pipe.slot_size_bytes <= std::numeric_limits<int>::max() / pipe.slot_num, span)
+        << "pl.cross_core_pipe slot_size_bytes * slot_num exceeds " << std::numeric_limits<int>::max()
+        << " bytes for pipe_id=" << pipe.pipe_id;
+
+    const int slot_size = static_cast<int>(pipe.slot_size_bytes);
+    const int64_t buffer_size = pipe.slot_size_bytes * pipe.slot_num;
+    const std::string buffer_name = BuildPipeBufferName(func_name, pipe.direction, pipe.pipe_id);
+    ExprPtr aic_c2v = zero_i32();
+    ExprPtr aic_v2c = zero_i32();
+    ExprPtr aiv_c2v = zero_i32();
+    ExprPtr aiv_v2c = zero_i32();
+
+    if (pipe.direction == core_affinity::PipeDirection::C2V) {
+      auto reserve = CreateReserveBuffer(buffer_name, buffer_size, span);
+      auto reserve_var = std::make_shared<Var>(buffer_name, reserve->GetType(), span);
+      setup.aiv_stmts.push_back(std::make_shared<AssignStmt>(reserve_var, reserve, span));
+      auto imported = CreateImportPeerBuffer(buffer_name, aiv_name, span);
+      auto import_var = std::make_shared<Var>(buffer_name + "_import", imported->GetType(), span);
+      setup.aic_stmts.push_back(std::make_shared<AssignStmt>(import_var, imported, span));
+      aic_c2v = var_as_expr(import_var);
+      aiv_c2v = var_as_expr(reserve_var);
+    } else {
+      auto reserve = CreateReserveBuffer(buffer_name, buffer_size, span);
+      auto reserve_var = std::make_shared<Var>(buffer_name, reserve->GetType(), span);
+      setup.aic_stmts.push_back(std::make_shared<AssignStmt>(reserve_var, reserve, span));
+      auto imported = CreateImportPeerBuffer(buffer_name, aic_name, span);
+      auto import_var = std::make_shared<Var>(buffer_name + "_import", imported->GetType(), span);
+      setup.aiv_stmts.push_back(std::make_shared<AssignStmt>(import_var, imported, span));
+      aic_v2c = var_as_expr(reserve_var);
+      aiv_v2c = var_as_expr(import_var);
+    }
+
+    setup.aic_stmts.push_back(
+        std::make_shared<EvalStmt>(CreateInitializePipe(core_affinity::CoreSide::AIC, dir_mask, slot_size,
+                                                        aic_c2v, aic_v2c, pipe.pipe_id, pipe.slot_num, span),
+                                   span));
+    setup.aiv_stmts.push_back(
+        std::make_shared<EvalStmt>(CreateInitializePipe(core_affinity::CoreSide::AIV, dir_mask, slot_size,
+                                                        aiv_c2v, aiv_v2c, pipe.pipe_id, pipe.slot_num, span),
+                                   span));
+  }
   return setup;
 }
 

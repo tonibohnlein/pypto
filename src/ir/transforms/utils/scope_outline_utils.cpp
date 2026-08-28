@@ -37,6 +37,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/deferred_wait_contract.h"
 #include "pypto/ir/transforms/utils/result_alias_utils.h"
@@ -1352,6 +1353,11 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       outlined_attrs.emplace_back("slot_num", op->GetAttr<int>("slot_num", 0));
     }
   };
+  auto append_cross_core_pipe_plan_attr = [&]() {
+    if (op->HasAttr(kCrossCorePipePlanAttr)) {
+      outlined_attrs.emplace_back(kCrossCorePipePlanAttr, op->GetAttr<std::string>(kCrossCorePipePlanAttr));
+    }
+  };
   auto append_windowize_attr = [&]() {
     if (op->GetAttr<bool>("windowize", false)) {
       outlined_attrs.emplace_back("windowize", true);
@@ -1462,6 +1468,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   if (auto incore = As<InCoreScopeStmt>(op)) {
     append_split_attr(incore->split_);
     append_slot_num_attr();
+    append_cross_core_pipe_plan_attr();
     append_windowize_attr();
     append_deferred_completion_waiter_attr();
     append_split_aiv_attr(incore->split_);
