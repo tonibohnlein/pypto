@@ -24,6 +24,12 @@
 namespace pypto {
 namespace ir {
 
+/// Versioned public schedule handoff from a tensor-level planner to
+/// ExpandMixedKernel. The packed string is the IR carrier for
+/// ``pl.cross_core_pipe(...)`` entries. ExpandMixedKernel consumes it and it
+/// must never reach backend codegen.
+inline constexpr const char* kCrossCorePipePlanAttr = "cross_core_pipe_plan";
+
 /// Private provenance on every compiler-generated ``tile.load(GM -> Mat)``
 /// call introduced while bridging a Tensor operand to tile IR.
 /// ``InferTileMemorySpace`` consumes this evidence when deciding whether a

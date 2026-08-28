@@ -72,6 +72,7 @@ torch.testing.assert_close(out, X * 2.0, rtol=1e-4, atol=1e-4)
 | ------ | ---- |
 | `optimizations=[pl.split(mode)]` | 被 outline kernel 的跨核切分模式 |
 | `optimizations=[pl.cross_core_slot(slot_num=N)]` | 自动跨核管道的环深度 |
+| `optimizations=[pl.cross_core_pipe(...)]` | 一个由规划器选定的单向物理 FIFO |
 | `name_hint="..."` | outline 出的函数名 |
 
 `optimizations=` 的条目必须在调用点内联书写 —— 解析器读的是 AST，因此用变量拼出来的列表不被接受。`pl.split` 与 `pl.cross_core_slot` 彼此正交、可自由组合：一个切分工作，一个给通道定尺寸。
@@ -85,6 +86,13 @@ with pl.at(level=pl.Level.CORE_GROUP,
 
 省略 `cross_core_slot` 就保持默认环深度：每个活跃方向 2 个 slot——刚好够对这次交接做双缓冲，
 同时给 tile 本身留出片上空间。若希望生产侧核能跑得更超前，再调高它。
+
+若调度工具已经选定物理传输契约，可改为给每个逻辑边界添加一个
+`pl.cross_core_pipe(...)` 条目。每个条目固定边界张量、方向、有效形状、slot
+字节数与数量、pipe ID 和协议 bundle（`-1` 表示未分 bundle）。`tensor_id` 和 `bundle`
+是规划器的不透明标签；描述符顺序将条目绑定到实际 crossing source。PyPTO 会用这些边界验证方向、frame 和 slot 几何，
+并继续负责 AIC/AIV outline 与流水线 lower。pipe ID 必须唯一，方向必须单向；
+这是通用调度接口，不是算子模式接口。
 
 ### SPMD
 
