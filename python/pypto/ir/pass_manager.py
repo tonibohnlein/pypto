@@ -530,13 +530,25 @@ class PassManager:
         # so callers' diagnostic intent isn't reset.
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
-        # Propagate the outer memory planner AND the legacy-PYPTO dbC=2 opt-in: a nested
-        # PassContext otherwise resets them to the binding defaults, which silently
-        # disables planner-gated pass behaviour (AutoTileMatmulL0's dbC=2 tile
-        # selection reads GetMemoryPlanner() + GetEnablePyptoL0cDoubleBuffer()
-        # *during* pass execution) whenever the pipeline dumps IR.
+        # Propagate every pass-affecting outer setting: the dump-only nested
+        # PassContext must add instruments without changing compilation. In
+        # particular, resetting DSA replay controls here makes ``dump_ir=True``
+        # silently solve a fresh placement instead of consuming the requested
+        # solution directory.
         mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
+        runtime = ctx.get_runtime() if ctx else passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
+        dsa_export_dir = ctx.get_dsa_export_dir() if ctx else None
+        dsa_solution_dir = ctx.get_dsa_solution_dir() if ctx else None
+        dsa_reuse_penalty_recognizer = (
+            ctx.get_dsa_reuse_penalty_recognizer()
+            if ctx
+            else passes.DsaReusePenaltyRecognizer.DISABLED
+        )
+        dsa_reference_placement = (
+            ctx.get_dsa_reference_placement() if ctx else passes.DsaReferencePlacement.DEFAULT
+        )
+        dsa_reference_target = ctx.get_dsa_reference_target() if ctx else None
         outer_phase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if outer_phase == passes.DiagnosticPhase.POST_PASS:
             inner_phase = passes.DiagnosticPhase.PRE_PIPELINE
@@ -544,7 +556,18 @@ class PassManager:
             inner_phase = outer_phase
 
         with passes.PassContext(
-            [*outer_instruments, *extra_instruments], level, inner_phase, disabled, mplan, dbc_flag
+            [*outer_instruments, *extra_instruments],
+            verification_level=level,
+            diagnostic_phase=inner_phase,
+            disabled_diagnostics=disabled,
+            memory_planner=mplan,
+            enable_pypto_l0c_double_buffer=dbc_flag,
+            runtime=runtime,
+            dsa_export_dir=dsa_export_dir,
+            dsa_solution_dir=dsa_solution_dir,
+            dsa_reuse_penalty_recognizer=dsa_reuse_penalty_recognizer,
+            dsa_reference_placement=dsa_reference_placement,
+            dsa_reference_target=dsa_reference_target,
         ):
             try:
                 return self._pipeline.run(input_ir)
@@ -576,10 +599,22 @@ class PassManager:
         ctx = passes.PassContext.current()
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
-        # Propagate the outer memory planner + legacy-PYPTO dbC=2 opt-in (see run_passes)
-        # so profiling doesn't silently reset them and disable planner-gated behaviour.
+        # Profiling, like dumping, adds an instrument without changing any
+        # pass-affecting setting from the outer compilation context.
         mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
+        runtime = ctx.get_runtime() if ctx else passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
+        dsa_export_dir = ctx.get_dsa_export_dir() if ctx else None
+        dsa_solution_dir = ctx.get_dsa_solution_dir() if ctx else None
+        dsa_reuse_penalty_recognizer = (
+            ctx.get_dsa_reuse_penalty_recognizer()
+            if ctx
+            else passes.DsaReusePenaltyRecognizer.DISABLED
+        )
+        dsa_reference_placement = (
+            ctx.get_dsa_reference_placement() if ctx else passes.DsaReferencePlacement.DEFAULT
+        )
+        dsa_reference_target = ctx.get_dsa_reference_target() if ctx else None
         dphase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if ctx:
             disabled = ctx.get_disabled_diagnostics()
@@ -588,7 +623,18 @@ class PassManager:
             disabled.insert(passes.DiagnosticCheck.UnusedControlFlowResult)
 
         with passes.PassContext(
-            [*outer_instruments, timing_instrument], level, dphase, disabled, mplan, dbc_flag
+            [*outer_instruments, timing_instrument],
+            verification_level=level,
+            diagnostic_phase=dphase,
+            disabled_diagnostics=disabled,
+            memory_planner=mplan,
+            enable_pypto_l0c_double_buffer=dbc_flag,
+            runtime=runtime,
+            dsa_export_dir=dsa_export_dir,
+            dsa_solution_dir=dsa_solution_dir,
+            dsa_reuse_penalty_recognizer=dsa_reuse_penalty_recognizer,
+            dsa_reference_placement=dsa_reference_placement,
+            dsa_reference_target=dsa_reference_target,
         ):
             try:
                 return self._pipeline.run(input_ir)

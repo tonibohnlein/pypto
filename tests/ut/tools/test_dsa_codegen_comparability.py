@@ -103,6 +103,63 @@ def test_per_function_join_rejects_missing_solution_and_outside_address(tmp_path
         comparability.check_build_placements(artifacts, map_root, {"kernel": {0: 64}})
 
 
+def test_late_eliminated_solution_offset_is_informational(tmp_path: Path) -> None:
+    """Final PTO may omit a replayed root eliminated after address allocation."""
+    _write_build(tmp_path)
+    map_root = tmp_path / "map"
+    map_root.mkdir()
+    (map_root / "pypto_kernel.dsa.solution.json").write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 64},
+                    {"buffer": 1, "pool": 1, "offset": 4096},
+                ]
+            }
+        )
+    )
+    checks = comparability.check_build_placements(
+        comparability.discover_codegen_artifacts(tmp_path),
+        map_root,
+        {"kernel": {0: 64, 1: 64}},
+    )
+
+    assert checks[0].matches
+    assert checks[0].uncovered_offsets == (4096,)
+
+
+def _solution(*, solver: str, offset: int = 64) -> dict:
+    return {
+        "schema_version": 1,
+        "profile": "pypto_research_v1",
+        "instance": "kernel",
+        "problem_fingerprint": "abc123",
+        "metadata": {"solver": solver},
+        "placements": [{"buffer": 0, "pool": 1, "offset": offset}],
+    }
+
+
+def test_replay_provenance_requires_exact_compiler_selected_map(tmp_path: Path) -> None:
+    requested = tmp_path / "requested"
+    selected = tmp_path / "selected"
+    requested.mkdir()
+    selected.mkdir()
+    filename = "pypto_kernel.dsa.solution.json"
+    (requested / filename).write_text(json.dumps(_solution(solver="cypress")))
+    (selected / filename).write_text(json.dumps(_solution(solver="replay")))
+
+    checks = comparability.check_replay_provenance(requested, selected, ["kernel"])
+    assert checks == (comparability.ReplayProvenanceCheck("kernel", "abc123", 1),)
+
+    (selected / filename).write_text(json.dumps(_solution(solver="replay", offset=96)))
+    with pytest.raises(ValueError, match="placements differ"):
+        comparability.check_replay_provenance(requested, selected, ["kernel"])
+
+    (selected / filename).write_text(json.dumps(_solution(solver="canonical_greedy")))
+    with pytest.raises(ValueError, match="identify kernel as replayed"):
+        comparability.check_replay_provenance(requested, selected, ["kernel"])
+
+
 def test_normalizer_masks_addresses_and_unstable_names_only() -> None:
     baseline = comparability.normalize_pre_insert_sync_pto(_pto(address=64))
     moved = comparability.normalize_pre_insert_sync_pto(

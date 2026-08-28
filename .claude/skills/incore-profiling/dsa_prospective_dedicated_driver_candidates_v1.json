@@ -2,7 +2,7 @@
   "schema_version": 1,
   "selection_policy": "prospective_structural_opportunity_candidates_v1",
   "timing_blind_selection": true,
-  "pypto_lib_revision": "db6eefe00352c085d3b19199e7ced2eaa363134a",
+  "pypto_lib_revision": "2ca9f3607e38542f442944c9c1e94499f686ef21",
   "arms": [
     "geometry_ff",
     "geometry_cg",
@@ -24,6 +24,97 @@
     "requires_runtime_capture": false
   },
   "drivers": [
+    {
+      "tier": "expanded_v2",
+      "driver_id": "dspark_qkv_rope_rows_dynamic_isolated",
+      "prospective_status": "HOST_QUALIFIED_STRUCTURAL_NULL",
+      "script": "models/deepseek_v4_flash_dspark/dsa_eval_qkv_rope_rows_dynamic.py",
+      "entry": "qkv_rope_rows_dynamic_test",
+      "golden": "golden_qkv_rope_rows_dynamic",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "qkv_rope_rows_dynamic",
+          "problem_fingerprint": "3805d6df755faa16",
+          "pool_id": "1",
+          "operation_class": "rope_table_gather",
+          "definition_script": "models/deepseek_v4_flash_dspark/qkv_proj_rope.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded_v2",
+      "driver_id": "dspark_hc_post_prefill_isolated",
+      "script": "models/deepseek_v4_flash_dspark/dsa_eval_hc_post_prefill.py",
+      "entry": "hc_post_prefill_test",
+      "golden": "golden_hc_post_prefill",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "hc_post_prefill",
+          "problem_fingerprint": "90031e1ba956800c",
+          "pool_id": "1",
+          "operation_class": "elementwise_reduction",
+          "definition_script": "models/deepseek_v4_flash_dspark/hc_post.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded_v2",
+      "driver_id": "mtp_hc_post_prefill_isolated",
+      "script": "models/deepseek_v4_flash_mtp/dsa_eval_hc_post_prefill.py",
+      "entry": "hc_post_prefill_test",
+      "golden": "golden_hc_post_prefill",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "hc_post_prefill",
+          "problem_fingerprint": "90031e1ba956800c",
+          "pool_id": "1",
+          "operation_class": "elementwise_reduction",
+          "definition_script": "models/deepseek_v4_flash_mtp/hc_post.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded_v2",
+      "driver_id": "pro_hc_post_prefill_isolated",
+      "script": "models/deepseek_v4_pro/dsa_eval_hc_post_prefill.py",
+      "entry": "hc_post_prefill_test",
+      "golden": "golden_hc_post_prefill",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "hc_post_prefill",
+          "problem_fingerprint": "d195438bdd10371f",
+          "pool_id": "1",
+          "operation_class": "elementwise_reduction",
+          "definition_script": "models/deepseek_v4_pro/hc_post.py"
+        }
+      ]
+    },
+    {
+      "tier": "expanded_v2",
+      "driver_id": "mtp_sparse_bias_isolated",
+      "script": "models/deepseek_v4_flash_mtp/dsa_eval_sparse_bias.py",
+      "entry": "sparse_bias_test",
+      "golden": "golden_sparse_bias",
+      "specs": "build_tensor_specs",
+      "argv": [],
+      "targets": [
+        {
+          "instance": "build_bias",
+          "problem_fingerprint": "b38036e3f9472312",
+          "pool_id": "1",
+          "operation_class": "mask_construction",
+          "definition_script": "models/deepseek_v4_flash_mtp/prefill_sparse_attn.py"
+        }
+      ]
+    },
     {
       "tier": "expanded",
       "driver_id": "pro_hc_head_reduce_isolated",
@@ -99,6 +190,9 @@
     {
       "tier": "expanded",
       "driver_id": "mtp_qkv_proj_rope_decode",
+      "prospective_status": "QUARANTINED_FIRST_LAUNCH_NONDETERMINISTIC",
+      "prospective_timing_eligible": false,
+      "quarantine_reason": "With identical inputs, the first physical endpoint launched in a fresh process produces a distinct q output while launches two and three converge; the effect follows launch position rather than placement arm.",
       "script": "models/deepseek_v4_flash_mtp/qkv_proj_rope.py",
       "entry": "qkv_proj_rope_test",
       "golden": "golden_qkv_proj_rope",

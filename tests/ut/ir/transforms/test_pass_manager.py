@@ -13,6 +13,7 @@ import os
 
 import pytest
 from pypto import DataType, ir, passes
+from pypto.compile_profiling import CompileProfiler
 
 TENSOR_ONLY_PASSES = [
     "OutlineHierarchyScopes",
@@ -369,6 +370,72 @@ class TestPassManagerDumpIR:
 
         # Outer instrument's before callback should have fired for each pass
         assert len(log) == len(pm.pass_names)
+
+    @staticmethod
+    def _research_context_values() -> tuple:
+        ctx = passes.PassContext.current()
+        assert ctx is not None
+        return (
+            ctx.get_memory_planner(),
+            ctx.get_runtime(),
+            ctx.get_dsa_export_dir(),
+            ctx.get_dsa_solution_dir(),
+            ctx.get_dsa_reuse_penalty_recognizer(),
+            ctx.get_dsa_reference_placement(),
+            ctx.get_dsa_reference_target(),
+        )
+
+    @staticmethod
+    def _expected_research_context_values() -> tuple:
+        return (
+            passes.MemoryPlanner.DSA,
+            passes.RuntimeKind.HOST_BUILD_GRAPH,
+            "export",
+            "solutions",
+            passes.DsaReusePenaltyRecognizer.QUADRATIC,
+            passes.DsaReferencePlacement.LOOSE,
+            "f",
+        )
+
+    def _run_with_research_context(self, *, dump_ir: bool, output_dir: str | None = None) -> list[tuple]:
+        seen: list[tuple] = []
+
+        def before_cb(_pass: passes.Pass, _program: ir.Program) -> None:
+            seen.append(self._research_context_values())
+
+        instrument = passes.CallbackInstrument(before_pass=before_cb, name="ObserveContext")
+        with passes.PassContext(
+            [instrument],
+            memory_planner=passes.MemoryPlanner.DSA,
+            runtime=passes.RuntimeKind.HOST_BUILD_GRAPH,
+            dsa_export_dir="export",
+            dsa_solution_dir="solutions",
+            dsa_reuse_penalty_recognizer=passes.DsaReusePenaltyRecognizer.QUADRATIC,
+            dsa_reference_placement=passes.DsaReferencePlacement.LOOSE,
+            dsa_reference_target="f",
+        ):
+            pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+            pm.run_passes(
+                TestPassManagerPlannerGate._trivial_program(),
+                dump_ir=dump_ir,
+                output_dir=output_dir,
+            )
+        assert seen
+        return seen
+
+    def test_dump_ir_preserves_research_context(self, tmp_path):
+        """The dump instrument must not replace DSA replay/export settings."""
+        seen = self._run_with_research_context(
+            dump_ir=True,
+            output_dir=str(tmp_path / "dump_output"),
+        )
+        assert set(seen) == {self._expected_research_context_values()}
+
+    def test_profiling_preserves_research_context(self):
+        """The profiling instrument must not replace DSA replay/export settings."""
+        with CompileProfiler():
+            seen = self._run_with_research_context(dump_ir=False)
+        assert set(seen) == {self._expected_research_context_values()}
 
     @staticmethod
     def _acc_tile_program():
