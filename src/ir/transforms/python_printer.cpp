@@ -56,6 +56,8 @@
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/core_affinity.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 
@@ -75,6 +77,16 @@ std::string SplitModeToPythonString(SplitMode mode) {
       return "LEFT_RIGHT";
   }
   throw pypto::TypeError("Unknown SplitMode");
+}
+
+std::string CrossCoreDirectionToPythonString(core_affinity::PipeDirection direction) {
+  switch (direction) {
+    case core_affinity::PipeDirection::C2V:
+      return "CUBE_TO_VECTOR";
+    case core_affinity::PipeDirection::V2C:
+      return "VECTOR_TO_CUBE";
+  }
+  throw pypto::TypeError("Unknown cross-core pipe direction");
 }
 
 /// Detects a ``tile.get_block_idx`` read anywhere in a statement subtree.
@@ -103,7 +115,7 @@ class BlockIdxReadDetector : public IRVisitor {
 bool SpmdInlineBodyRebuildsCarrier(const InCoreScopeStmtPtr& incore) {
   if (!incore) return false;
   const bool has_mode = incore->split_ != SplitMode::None;
-  if (has_mode || incore->HasAttr("slot_num")) return true;
+  if (has_mode || incore->HasAttr("slot_num") || incore->HasAttr(kCrossCorePipePlanAttr)) return true;
   BlockIdxReadDetector detector;
   detector.VisitStmt(incore->body_);
   return detector.found();
@@ -2102,14 +2114,36 @@ bool IRPythonPrinter::PrintScopeCachePolicyStmts(const ScopeStmtPtr& op) {
 void IRPythonPrinter::PrintScopeOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder) {
   const bool has_mode = split != SplitMode::None;
   const bool has_slot_num = slot_num_holder && slot_num_holder->HasAttr("slot_num");
-  if (!has_mode && !has_slot_num) return;
+  const bool has_pipe_plan = slot_num_holder && slot_num_holder->HasAttr(kCrossCorePipePlanAttr);
+  std::optional<std::vector<cross_core_pipe::ExplicitCrossCorePipe>> pipes;
+  if (has_pipe_plan) {
+    pipes = cross_core_pipe::DecodeExplicitCrossCorePipes(
+        slot_num_holder->GetAttr<std::string>(kCrossCorePipePlanAttr));
+    INTERNAL_CHECK_SPAN(pipes.has_value(), slot_num_holder->span_)
+        << "Cannot print malformed cross-core pipe contract";
+  }
+  if (!has_mode && !has_slot_num && !has_pipe_plan) return;
   stream_ << ", optimizations=[";
+  bool needs_comma = false;
   if (has_mode) {
     stream_ << prefix_ << ".split(" << prefix_ << ".SplitMode." << SplitModeToPythonString(split) << ")";
+    needs_comma = true;
   }
   if (has_slot_num) {
-    if (has_mode) stream_ << ", ";
+    if (needs_comma) stream_ << ", ";
     stream_ << prefix_ << ".cross_core_slot(slot_num=" << slot_num_holder->GetAttr<int>("slot_num", 0) << ")";
+    needs_comma = true;
+  }
+  if (pipes.has_value()) {
+    for (const auto& pipe : *pipes) {
+      if (needs_comma) stream_ << ", ";
+      stream_ << prefix_ << ".cross_core_pipe(tensor_id=" << pipe.tensor_id << ", direction=" << prefix_
+              << ".CrossCoreDirection." << CrossCoreDirectionToPythonString(pipe.direction)
+              << ", valid_shape=[" << pipe.valid_rows << ", " << pipe.valid_cols
+              << "], slot_size_bytes=" << pipe.slot_size_bytes << ", slot_num=" << pipe.slot_num
+              << ", pipe_id=" << pipe.pipe_id << ", bundle=" << pipe.bundle << ")";
+      needs_comma = true;
+    }
   }
   stream_ << "]";
 }
