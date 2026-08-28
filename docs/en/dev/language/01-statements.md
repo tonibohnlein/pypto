@@ -94,6 +94,7 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | `pl.at(level=pl.Level.CORE_GROUP)` | `InCore` | Fixed-boundary outline at CORE_GROUP |
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(MODE)])` | `InCore` | InCore + cross-core split hint |
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.cross_core_slot(slot_num=N)])` | `InCore` | InCore + cross-core pipe slot count |
+| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.cross_core_pipe(...)])` | `InCore` | InCore + explicit physical FIFO contract |
 | `pl.at(level=pl.Level.HOST)` *(or any non-`CORE_GROUP` level)* | `Hierarchy` | Distributed hierarchy scope |
 | `pl.cluster()` | `Cluster` | Co-scheduled AIC+AIV group |
 | `with pl.spmd(N)` / `for i in pl.spmd(N)` | `Spmd` (for-form wraps inner `InCore`) | SPMD multi-block dispatch — see [pl.spmd](#plspmd-multi-block-dispatch) |
@@ -124,6 +125,7 @@ in one list (e.g. `[pl.split(MODE), pl.cross_core_slot(slot_num=4)]`):
 | ----- | ---- | ------ |
 | `pl.split(MODE)` | both | Sets the inner InCore's `split_` field (cross-core transfer hint, consumed by `ExpandMixedKernel` / `MemoryReuse`). The with-form gains an inner `InCoreScopeStmt` wrapper around the call. |
 | `pl.cross_core_slot(slot_num=N)` | both | Sets the inner InCore's `slot_num` attr — the slot count (ring depth) of the automatic cross-core pipe, consumed by `ExpandMixedKernel`. Sizes a data channel only; it does **not** partition work, so it coexists with `pl.split_aiv` regions where `pl.split(...)` does not. Omit to keep the default depth of 2 per active direction. |
+| `pl.cross_core_pipe(...)` | both | Appends one versioned, unidirectional physical FIFO descriptor. Required fields are `tensor_id`, `direction`, `valid_shape`, `slot_size_bytes`, `slot_num`, `pipe_id`, and `bundle`. `ExpandMixedKernel` validates it against the actual boundary and emits independent pipe setup and IDs. Repeated entries describe multi-round-trip schedules. |
 
 > `pl.split(MODE, slot_num=N)` is a deprecated alias for the slot count and warns
 > — see [ExpandMixedKernel](../passes/22-expand_mixed_kernel.md#overriding-the-slot-count-slot_num).

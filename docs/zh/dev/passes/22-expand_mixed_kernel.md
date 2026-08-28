@@ -62,6 +62,23 @@ CV 边界的跨核心数据传输通过将显式 `tile.move` 操作拆分为 `tp
 | Cube→Vector（如 Acc→Vec） | `tpush_to_aiv(source_tile)` | `dest_var = tpop_from_aic()` |
 | Vector→Cube（如 Vec→Mat/Left/Right） | `dest_var = tpop_from_aiv()` | `tile.move` 适配 fractal 布局，然后 `tpush_to_aic(adapted_tile)` |
 
+### 显式物理 FIFO 契约
+
+默认路径会根据发现的边界推导一个自动 pipe。规划器也可添加多个
+`pl.cross_core_pipe(...)` 优化条目，显式给出相互独立的单向 pipe ID、有效 frame、
+slot 几何和协议 bundle。展开过程会按顺序将这些记录匹配到 cube/vector 边界，验证
+形状与字节数，并为每个描述符生成一对 reserve/import/initialize。生成的 `tpush`、
+`tpop` 与 `tfree` 链在 AIC 和 AIV 两侧携带同一个 pipe ID。描述符在展开中被消费，
+不得残留到最终函数。`tensor_id` 和 `bundle` 是规划器的不透明标签，不在 PyPTO
+内标识 IR 值，也不能替代有序边界匹配。
+
+描述符按边界首次出现的顺序排列。若 source lowering 重复整个协议——例如滚动流式
+循环之后另行发出 tail——下一轮会复用同一有序描述符序列。展开要求每轮都在最后一个
+描述符处结束；不完整的重复会 fail closed。
+
+该接口只选择传输机制，不识别 attention、SwiGLU 或其他图模式，也不取代 PyPTO
+现有的 AIC/AIV 拆分和流水线 pass。
+
 **Fractal TileView 布局**：跨核传输 tile 的 TileView 由 `BuildCrossCoreTransferView` 根据目标内存空间计算，不同后端的映射不同：
 
 Ascend950（a5）——硬件跨核 pipe 直接按 fractal 布局传输数据：

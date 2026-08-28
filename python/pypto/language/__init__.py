@@ -240,7 +240,7 @@ from .op.unified_ops import (
     xor,
     xors,
 )
-from .optimizations import cross_core_slot, split
+from .optimizations import CrossCoreDirection, CrossCorePipe, cross_core_pipe, cross_core_slot, split
 from .parser.decorator import InlineFunction, function, inline, program
 from .parser.text_parser import loads, loads_program, parse, parse_program
 from .scope import ScopeMode, manual_scope, scope, spmd_submit, submit
@@ -341,6 +341,9 @@ __all__ = [
     "split_aiv",
     "optimizations",
     "split",
+    "CrossCoreDirection",
+    "CrossCorePipe",
+    "cross_core_pipe",
     "cross_core_slot",
     "adir",
     "array",
