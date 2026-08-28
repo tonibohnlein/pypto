@@ -47,7 +47,21 @@ class PlacementCheck:
 
     @property
     def matches(self) -> bool:
-        return not (self.unresolved_addresses or self.outside_addresses or self.uncovered_offsets)
+        # A solution offset need not survive into final PTO: late, semantics-
+        # preserving simplification can remove an unused allocation root after
+        # AllocateMemoryAddr. Replay identity is proved separately from the
+        # compiler's selected-solution export. Here the fail-closed condition is
+        # that every address which *is* emitted belongs to that proven map.
+        return not (self.unresolved_addresses or self.outside_addresses)
+
+
+@dataclass(frozen=True)
+class ReplayProvenanceCheck:
+    """Proof that the compiler selected the requested replay solution."""
+
+    function: str
+    problem_fingerprint: str
+    placements: int
 
 
 def discover_codegen_artifacts(build_root: str | Path) -> CodegenArtifacts:
@@ -180,6 +194,59 @@ def check_build_placements(
         raise ValueError(f"Emitted functions with alloc_tile sites have no DSA problem: {orphans}")
     if not checks:
         raise ValueError("No emitted function was joined to a DSA replay solution")
+    return tuple(checks)
+
+
+def check_replay_provenance(
+    requested_solution_directory: str | Path,
+    selected_solution_directory: str | Path,
+    functions: Sequence[str],
+) -> tuple[ReplayProvenanceCheck, ...]:
+    """Require compiler-exported replay identity for every DSA function.
+
+    ``AllocateMemoryAddr`` writes the solution it actually selected when both
+    ``dsa_solution_dir`` and ``dsa_export_dir`` are configured. Comparing that
+    document to the requested map proves every placement, including roots that
+    a later simplification legitimately removes before PTO codegen.
+    """
+    requested_root = Path(requested_solution_directory)
+    selected_root = Path(selected_solution_directory)
+    checks: list[ReplayProvenanceCheck] = []
+    expected = set(functions)
+    if not expected:
+        raise ValueError("Replay provenance requires at least one DSA function")
+    for function in sorted(expected):
+        filename = f"pypto_{function}.dsa.solution.json"
+        requested_path = requested_root / filename
+        selected_path = selected_root / filename
+        if not requested_path.is_file():
+            raise ValueError(f"Requested replay map omits solution for {function}")
+        if not selected_path.is_file():
+            raise ValueError(f"Compiler did not export its selected solution for {function}")
+        requested = json.loads(requested_path.read_text(encoding="utf-8"))
+        selected = json.loads(selected_path.read_text(encoding="utf-8"))
+        if selected.get("metadata", {}).get("solver") != "replay":
+            raise ValueError(f"Compiler did not identify {function} as replayed")
+        for field in ("schema_version", "profile", "instance", "problem_fingerprint"):
+            if selected.get(field) != requested.get(field):
+                raise ValueError(f"Replay provenance for {function} changes {field}")
+        if selected.get("placements") != requested.get("placements"):
+            raise ValueError(f"Compiler-selected placements differ from requested replay for {function}")
+        checks.append(
+            ReplayProvenanceCheck(
+                function=function,
+                problem_fingerprint=str(selected["problem_fingerprint"]),
+                placements=len(selected["placements"]),
+            )
+        )
+
+    selected_functions = {
+        path.name.removeprefix("pypto_").removesuffix(".dsa.solution.json")
+        for path in selected_root.glob("pypto_*.dsa.solution.json")
+    }
+    orphans = sorted(selected_functions - expected)
+    if orphans:
+        raise ValueError(f"Compiler selected solutions for unexpected functions {orphans}")
     return tuple(checks)
 
 
