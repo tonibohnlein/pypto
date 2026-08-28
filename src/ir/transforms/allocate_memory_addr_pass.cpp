@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <any>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -70,16 +71,29 @@ using MemRefWithSpace = std::pair<MemRefPtr, MemorySpace>;
 // reserve_buffer_utils.h so AllocateMemoryAddr and MemoryReuse resolve the reserved region identically.
 
 /// Whether `resolution` holds one of the automatic cross-core pipe rings, i.e.
-/// whether `pl.cross_core_slot(slot_num=N)` can actually move these bytes.
+/// whether a cross-core pipe depth setting can actually move these bytes.
 ///
 /// Matched EXACTLY, not by suffix. BuildAutomaticPipeSetup mints the ring's name as
-/// BuildPipeBufferName(<mixed kernel name>, dir) while ExpandMixedKernel names the
-/// halves "<mixed kernel name>_aic" / "_aiv", so the expected names are
-/// reconstructible from this function's own name. That precision matters because
+/// BuildPipeBufferName(<mixed kernel name>, dir), optionally followed by the explicit
+/// pipe ID, while ExpandMixedKernel names the halves "<mixed kernel name>_aic" /
+/// "_aiv". The expected names are therefore reconstructible from this function's own
+/// name. That precision matters because
 /// `pl.reserve_buffer` takes an arbitrary name: a hand-authored
 /// "scratch_v2c_slot_buffer" would pass a suffix test and then be pointed at a knob
 /// that cannot resize it.
-bool HasCrossCorePipeRing(const ReserveBufferResolution& resolution, const std::string& func_name) {
+enum class CrossCorePipeRingKind { kNone, kAutomatic, kExplicit };
+
+CrossCorePipeRingKind GetCrossCorePipeRingKind(const ReserveBufferResolution& resolution,
+                                               const std::string& func_name) {
+  auto matches_pipe_name = [](const std::string& name, const std::string& base) {
+    if (name == base) return true;
+    const std::string indexed_prefix = base + "_";
+    if (name.compare(0, indexed_prefix.size(), indexed_prefix) != 0 || name.size() == indexed_prefix.size()) {
+      return false;
+    }
+    return std::all_of(name.begin() + static_cast<std::ptrdiff_t>(indexed_prefix.size()), name.end(),
+                       [](unsigned char ch) { return std::isdigit(ch) != 0; });
+  };
   auto strip_suffix = [&func_name](const std::string& suffix) -> std::string {
     if (func_name.size() <= suffix.size()) return "";
     if (func_name.compare(func_name.size() - suffix.size(), suffix.size(), suffix) != 0) return "";
@@ -91,13 +105,20 @@ bool HasCrossCorePipeRing(const ReserveBufferResolution& resolution, const std::
     expected.push_back(cross_core_pipe::BuildPipeBufferName(kernel, core_affinity::PipeDirection::C2V));
     expected.push_back(cross_core_pipe::BuildPipeBufferName(kernel, core_affinity::PipeDirection::V2C));
   }
-  if (expected.empty()) return false;
+  if (expected.empty()) return CrossCorePipeRingKind::kNone;
+  bool found_automatic = false;
   for (const auto& [call, base] : resolution.resolved_bases) {
     if (!call) continue;
     const auto name = call->GetKwarg<std::string>("name", "");
-    if (std::find(expected.begin(), expected.end(), name) != expected.end()) return true;
+    for (const auto& expected_name : expected) {
+      if (name == expected_name) {
+        found_automatic = true;
+      } else if (matches_pipe_name(name, expected_name)) {
+        return CrossCorePipeRingKind::kExplicit;
+      }
+    }
   }
-  return false;
+  return found_automatic ? CrossCorePipeRingKind::kAutomatic : CrossCorePipeRingKind::kNone;
 }
 
 /// The "the first N bytes ... are reserved" clause appended to a capacity-overflow
@@ -127,11 +148,15 @@ std::string ReservedBytesNote(const ReserveBufferResolution& resolution, MemoryS
   std::string note = ". The first " + std::to_string(it->second) +
                      " bytes of that space are reserved by system.reserve_buffer, so tiles are "
                      "allocated above them";
-  if (HasCrossCorePipeRing(resolution, func_name)) {
-    note +=
-        " — this is the cross-core pipe ring. Lower its depth with "
-        "optimizations=[pl.cross_core_slot(slot_num=N)] on the enclosing pl.at(...), or shrink the "
-        "tile that crosses the cube/vector boundary";
+  const auto pipe_kind = GetCrossCorePipeRingKind(resolution, func_name);
+  if (pipe_kind != CrossCorePipeRingKind::kNone) {
+    note += " — this is the cross-core pipe ring. Lower its depth with ";
+    if (pipe_kind == CrossCorePipeRingKind::kExplicit) {
+      note += "slot_num=N on the matching pl.cross_core_pipe(...) descriptor";
+    } else {
+      note += "optimizations=[pl.cross_core_slot(slot_num=N)] on the enclosing pl.at(...)";
+    }
+    note += ", or shrink the tile that crosses the cube/vector boundary";
   }
   return note;
 }

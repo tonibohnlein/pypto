@@ -82,6 +82,7 @@ Two optional keywords shape that outlined kernel:
 | ------- | ------- |
 | `optimizations=[pl.split(mode)]` | Cross-core split mode for the outlined kernel |
 | `optimizations=[pl.cross_core_slot(slot_num=N)]` | Ring depth of the automatic cross-core pipeline |
+| `optimizations=[pl.cross_core_pipe(...)]` | One planner-selected unidirectional physical FIFO |
 | `name_hint="..."` | Name for the outlined function |
 
 Entries in `optimizations=` must be written inline at the call site — the parser reads the
@@ -98,6 +99,14 @@ with pl.at(level=pl.Level.CORE_GROUP,
 Omitting `cross_core_slot` keeps the default ring depth of 2 slots per active direction —
 enough to double-buffer the handoff while leaving on-chip room for the tiles themselves.
 Raise it when the producing core should be able to run further ahead.
+
+Scheduling tools that already selected the physical transfer contract can instead add one
+`pl.cross_core_pipe(...)` entry per logical boundary. Each entry fixes the boundary tensor,
+direction, valid shape, slot bytes/count, pipe ID, and protocol bundle (`-1` means unbundled).
+`tensor_id` and `bundle` are opaque planner labels; descriptor order binds entries to the actual
+crossing sources. PyPTO validates direction, frame, and slot geometry against those boundaries and still owns AIC/AIV outlining and
+pipeline lowering. Pipe IDs must be unique and directions are always unidirectional; this is
+a generic schedule interface, not an operator-pattern API.
 
 ### SPMD
 

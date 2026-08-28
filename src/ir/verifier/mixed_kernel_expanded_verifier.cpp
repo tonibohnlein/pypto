@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <list>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -29,6 +31,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/dead_code_elimination.h"
@@ -430,6 +433,7 @@ void VerifyCrossCorePipeSetup(const FunctionPtr& func, std::vector<Diagnostic>& 
 struct OutstandingTpop {
   VarPtr var;
   std::string op_name;
+  int pipe_id;
   Span span;
 };
 
@@ -461,7 +465,9 @@ void VerifyTpopTfreeMatchingInBlock(const std::vector<StmtPtr>& stmts, const Fun
 
     VarPtr tpop_var;
     if (IsExpectedTpopAssignStmt(stmt, func->func_type_, &tpop_var)) {
-      outstanding_tpops.push_back({tpop_var, dce::GetStmtOpName(stmt), stmt->span_});
+      auto call = transform_utils::GetCallFromStmt(stmt);
+      outstanding_tpops.push_back(
+          {tpop_var, dce::GetStmtOpName(stmt), call ? call->GetKwarg<int>("id", 0) : 0, stmt->span_});
       continue;
     }
 
@@ -494,6 +500,16 @@ void VerifyTpopTfreeMatchingInBlock(const std::vector<StmtPtr>& stmts, const Fun
                                      it->op_name + " with '" + expected_tfree + "' on the same tile value",
                                  stmt->span_);
       } else {
+        auto tfree_call = transform_utils::GetCallFromStmt(stmt);
+        const int tfree_pipe_id = tfree_call ? tfree_call->GetKwarg<int>("id", 0) : 0;
+        if (tfree_pipe_id != it->pipe_id) {
+          diagnostics.emplace_back(DiagnosticSeverity::Error, "MixedKernelExpanded", 0,
+                                   ((func->func_type_ == FunctionType::AIC) ? "AIC" : "AIV") +
+                                       std::string(" function '") + func->name_ +
+                                       "' must free tpop pipe id " + std::to_string(it->pipe_id) +
+                                       " with the same id, got " + std::to_string(tfree_pipe_id),
+                                   stmt->span_);
+        }
         outstanding_tpops.erase(it);
       }
     }
@@ -512,6 +528,110 @@ void VerifyTpopTfreeMatching(const FunctionPtr& func, std::vector<Diagnostic>& d
   VerifyTpopTfreeMatchingInBlock(FlattenBody(func->body_), func, diagnostics);
 }
 
+struct InitializePipeDescriptor {
+  int dir_mask = 0;
+  int slot_size = 0;
+  int slot_num = 0;
+  Span span;
+};
+
+class PipeIdVerifier : public IRVisitor {
+ public:
+  PipeIdVerifier(std::vector<Diagnostic>& diagnostics, std::string func_name)
+      : diagnostics_(diagnostics), func_name_(std::move(func_name)) {}
+
+  void VisitExpr_(const CallPtr& call) override {
+    auto op = call ? As<Op>(call->op_) : nullptr;
+    if (!op) {
+      IRVisitor::VisitExpr_(call);
+      return;
+    }
+    const int pipe_id = call->GetKwarg<int>("id", 0);
+    if (pipe_id < 0) {
+      diagnostics_.emplace_back(
+          DiagnosticSeverity::Error, "MixedKernelExpanded", 0,
+          "Function '" + func_name_ + "' has negative cross-core pipe id " + std::to_string(pipe_id),
+          call->span_);
+    }
+
+    if (IsOp(op, "system.aic_initialize_pipe") || IsOp(op, "system.aiv_initialize_pipe")) {
+      const int dir_mask = call->GetKwarg<int>("dir_mask", 0);
+      const int slot_size = call->GetKwarg<int>("slot_size", 0);
+      const int slot_num = call->HasKwarg("slot_num") ? call->GetKwarg<int>("slot_num", 0)
+                                                      : cross_core_pipe::GetPtoasImplicitSlotNum(dir_mask);
+      auto [it, inserted] =
+          descriptors.emplace(pipe_id, InitializePipeDescriptor{dir_mask, slot_size, slot_num, call->span_});
+      if (!inserted) {
+        diagnostics_.emplace_back(DiagnosticSeverity::Error, "MixedKernelExpanded", 0,
+                                  "Function '" + func_name_ + "' initializes pipe id " +
+                                      std::to_string(pipe_id) + " more than once",
+                                  call->span_);
+      }
+    } else {
+      int required_direction = 0;
+      if (IsOp(op, "tile.tpush_to_aiv") || IsOp(op, "tile.tpop_from_aic")) {
+        required_direction = kDirMaskC2V;
+      } else if (IsOp(op, "tile.tpush_to_aic") || IsOp(op, "tile.tpop_from_aiv")) {
+        required_direction = kDirMaskV2C;
+      }
+      if (required_direction != 0) required_directions[pipe_id] |= required_direction;
+    }
+    IRVisitor::VisitExpr_(call);
+  }
+
+  void CheckResult() {
+    for (const auto& [pipe_id, required_direction] : required_directions) {
+      auto it = descriptors.find(pipe_id);
+      if (it == descriptors.end()) {
+        diagnostics_.emplace_back(DiagnosticSeverity::Error, "MixedKernelExpanded", 0,
+                                  "Function '" + func_name_ + "' uses cross-core pipe id " +
+                                      std::to_string(pipe_id) + " without a matching initialize_pipe",
+                                  Span::unknown());
+      } else if ((it->second.dir_mask & required_direction) != required_direction) {
+        diagnostics_.emplace_back(DiagnosticSeverity::Error, "MixedKernelExpanded", 0,
+                                  "Function '" + func_name_ + "' uses cross-core pipe id " +
+                                      std::to_string(pipe_id) +
+                                      " in a direction its initialize_pipe disables",
+                                  it->second.span);
+      }
+    }
+  }
+
+  std::map<int, InitializePipeDescriptor> descriptors;
+
+ private:
+  std::vector<Diagnostic>& diagnostics_;
+  std::string func_name_;
+  std::map<int, int> required_directions;
+};
+
+bool PipeDescriptorsEqual(const std::map<int, InitializePipeDescriptor>& lhs,
+                          const std::map<int, InitializePipeDescriptor>& rhs) {
+  if (lhs.size() != rhs.size()) return false;
+  for (const auto& [pipe_id, descriptor] : lhs) {
+    auto it = rhs.find(pipe_id);
+    if (it == rhs.end() || descriptor.dir_mask != it->second.dir_mask ||
+        descriptor.slot_size != it->second.slot_size || descriptor.slot_num != it->second.slot_num) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<std::pair<std::string, FunctionType>> GetSplitPairKey(const FunctionPtr& func) {
+  constexpr std::string_view kAicSuffix = "_aic";
+  constexpr std::string_view kAivSuffix = "_aiv";
+  if (func->func_type_ == FunctionType::AIC && func->name_.size() > kAicSuffix.size() &&
+      func->name_.compare(func->name_.size() - kAicSuffix.size(), kAicSuffix.size(), kAicSuffix) == 0) {
+    return std::make_pair(func->name_.substr(0, func->name_.size() - kAicSuffix.size()), func->func_type_);
+  }
+  if (func->func_type_ == FunctionType::AIV && func->name_.size() > kAivSuffix.size() &&
+      func->name_.compare(func->name_.size() - kAivSuffix.size(), kAivSuffix.size(), kAivSuffix) == 0) {
+    return std::make_pair(func->name_.substr(0, func->name_.size() - kAivSuffix.size()), func->func_type_);
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 class MixedKernelExpandedPropertyVerifierImpl : public PropertyVerifier {
@@ -520,8 +640,20 @@ class MixedKernelExpandedPropertyVerifierImpl : public PropertyVerifier {
 
   void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
     if (!program) return;
+    struct PairDescriptors {
+      std::optional<std::map<int, InitializePipeDescriptor>> aic;
+      std::optional<std::map<int, InitializePipeDescriptor>> aiv;
+      std::optional<Span> span;
+    };
+    std::map<std::string, PairDescriptors> split_pairs;
     for (const auto& [gv, func] : program->functions_) {
       if (!func || !func->body_) continue;
+      if (func->HasAttr(kCrossCorePipePlanAttr)) {
+        diagnostics.emplace_back(
+            DiagnosticSeverity::Error, "MixedKernelExpanded", 0,
+            "Function '" + func->name_ + "' still carries cross_core_pipe_plan after mixed expansion",
+            func->span_);
+      }
       if (func->func_type_ == FunctionType::InCore) {
         MixedKernelExpandedVerifier verifier(diagnostics, func->name_);
         verifier.VisitStmt(func->body_);
@@ -535,6 +667,26 @@ class MixedKernelExpandedPropertyVerifierImpl : public PropertyVerifier {
         VerifyCrossCorePipeSetup(func, diagnostics);
         VerifyInitializePipeOperands(func, diagnostics);
         VerifyTpopTfreeMatching(func, diagnostics);
+        PipeIdVerifier pipe_id_verifier(diagnostics, func->name_);
+        pipe_id_verifier.VisitStmt(func->body_);
+        pipe_id_verifier.CheckResult();
+        if (auto pair_key = GetSplitPairKey(func)) {
+          auto& pair = split_pairs[pair_key->first];
+          pair.span.emplace(func->span_);
+          if (pair_key->second == FunctionType::AIC) {
+            pair.aic = std::move(pipe_id_verifier.descriptors);
+          } else {
+            pair.aiv = std::move(pipe_id_verifier.descriptors);
+          }
+        }
+      }
+    }
+    for (const auto& [name, pair] : split_pairs) {
+      if (pair.aic.has_value() && pair.aiv.has_value() && !PipeDescriptorsEqual(*pair.aic, *pair.aiv)) {
+        diagnostics.emplace_back(DiagnosticSeverity::Error, "MixedKernelExpanded", 0,
+                                 "Expanded mixed kernel '" + name +
+                                     "' has different pipe id/direction/slot descriptors on AIC and AIV",
+                                 pair.span.value_or(Span::unknown()));
       }
     }
   }
