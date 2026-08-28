@@ -243,6 +243,25 @@ synchronization site's enclosing loop bound is dynamic or unresolved, or when
 the site is nested in unresolved conditional/control-flow regions. Unstructured
 control flow also makes the function-level estimate incomplete.
 
+The realized-placement scorer keeps five distinct levels of evidence instead
+of treating every logical buffer pair as an independent hardware event:
+
+1. `unit_realized_cost` counts the promoted logical buffer-pair weights;
+2. `canonical_physical_reuse_group_count` collapses duplicate logical pairs
+   that refer to the same unordered pair of full physical tile ranges;
+3. `unique_induced_sync_edge_count` collapses those groups again by verified
+   schedule-edge identity;
+4. `estimated_sync_endpoint_executions` applies static loop trip counts to the
+   unique source and target endpoints; and
+5. `critical_path_realized_cost_cycles` prices their modeled exposed delay.
+
+The physical-range key includes the full two placed ranges, not only their
+intersection: distinct tile layouts can share the same intersection. This
+canonicalization removes duplicate alias evidence but does not infer an
+undocumented hardware bank or interleave mapping. The penalty-model evaluator
+reports all five metrics so a device ordering can reveal the first abstraction
+level at which the arms actually separate.
+
 ```bash
 python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \
     -o post-sync-summary.json

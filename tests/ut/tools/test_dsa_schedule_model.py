@@ -998,6 +998,7 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
     result = dsa_schedule_model.score_realized_reuse(problem, solution, candidate_scores)
 
     assert result["realized_pair_count"] == 1
+    assert result["canonical_physical_reuse_group_count"] == 1
     assert result["realized_pair_count_without_induced_sync_edge"] == 0
     assert result["unit_realized_cost"] == 3.0
     assert result["unit_realized_cost_without_induced_sync_edge"] == 0
@@ -1005,6 +1006,22 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
     assert result["unique_induced_sync_edge_count"] == 1
     assert result["estimated_sync_endpoint_executions"] == 2
     assert result["estimated_sync_endpoint_executions_by_pipe_pair"] == {"PIPE_V->PIPE_MTE2": 2}
+    assert result["canonical_physical_reuse_groups"] == [
+        {
+            "id": 0,
+            "pool": 1,
+            "first_range": [0, 64],
+            "second_range": [32, 96],
+            "overlap_range": [32, 64],
+            "shared_bytes": 32,
+            "logical_pairs": [[0, 1]],
+            "logical_pair_count": 1,
+            "logical_unit_cost": 3.0,
+            "unique_induced_sync_edge_count": 1,
+            "estimated_sync_endpoint_executions": 2,
+            "estimated_sync_endpoint_executions_by_pipe_pair": {"PIPE_V->PIPE_MTE2": 2},
+        }
+    ]
     assert result["pairs"][0]["overlap_bytes"] == 32
 
     no_edge_scores = {
@@ -1036,11 +1053,121 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
     )
     disjoint = dsa_schedule_model.score_realized_reuse(problem, solution, candidate_scores)
     assert disjoint["realized_pair_count"] == 0
+    assert disjoint["canonical_physical_reuse_group_count"] == 0
     assert disjoint["realized_pair_count_without_induced_sync_edge"] == 0
     assert disjoint["unit_realized_cost"] == 0
     assert disjoint["critical_path_realized_cost_cycles"] == 0
     assert disjoint["unique_induced_sync_edge_count"] == 0
     assert disjoint["estimated_sync_endpoint_executions"] == 0
+    assert disjoint["canonical_physical_reuse_groups"] == []
+
+
+def test_realized_placement_collapses_logical_pairs_by_physical_range(tmp_path):
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(
+        json.dumps(
+            {
+                "problem": {
+                    "buffers": [
+                        {"id": 0, "size": 64},
+                        {"id": 1, "size": 64},
+                        {"id": 2, "size": 64},
+                    ]
+                }
+            }
+        )
+    )
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 0},
+                    {"buffer": 2, "pool": 1, "offset": 0},
+                ]
+            }
+        )
+    )
+    pair_template = {
+        "promoted_to_dsa_penalty": True,
+        "distance_zero_schedule_edges": [],
+        "loop_carried_schedule_edges": [],
+        "estimated_sync_endpoint_executions": 0,
+        "critical_path_weight_cycles": 0,
+    }
+    scores = {
+        "schema_version": 2,
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+        "penalty_pair_weights": [
+            {**pair_template, "first_buffer": 0, "second_buffer": 1, "unit_cost": 1},
+            {**pair_template, "first_buffer": 0, "second_buffer": 2, "unit_cost": 2},
+        ],
+    }
+
+    result = dsa_schedule_model.score_realized_reuse(problem, solution, scores)
+
+    assert result["realized_pair_count"] == 2
+    assert result["canonical_physical_reuse_group_count"] == 1
+    assert result["canonical_physical_reuse_groups"][0]["logical_pairs"] == [[0, 1], [0, 2]]
+    assert result["canonical_physical_reuse_groups"][0]["logical_unit_cost"] == 3
+
+
+def test_realized_placement_keeps_distinct_tile_pairs_with_same_intersection(tmp_path):
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(
+        json.dumps(
+            {
+                "problem": {
+                    "buffers": [
+                        {"id": 0, "size": 64},
+                        {"id": 1, "size": 64},
+                        {"id": 2, "size": 80},
+                        {"id": 3, "size": 32},
+                    ]
+                }
+            }
+        )
+    )
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 32},
+                    {"buffer": 2, "pool": 1, "offset": 0},
+                    {"buffer": 3, "pool": 1, "offset": 32},
+                ]
+            }
+        )
+    )
+    pair_template = {
+        "promoted_to_dsa_penalty": True,
+        "distance_zero_schedule_edges": [],
+        "loop_carried_schedule_edges": [],
+        "estimated_sync_endpoint_executions": 0,
+        "critical_path_weight_cycles": 0,
+        "unit_cost": 1,
+    }
+    scores = {
+        "schema_version": 2,
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+        "penalty_pair_weights": [
+            {**pair_template, "first_buffer": 0, "second_buffer": 1},
+            {**pair_template, "first_buffer": 2, "second_buffer": 3},
+        ],
+    }
+
+    result = dsa_schedule_model.score_realized_reuse(problem, solution, scores)
+
+    assert result["realized_pair_count"] == 2
+    assert result["canonical_physical_reuse_group_count"] == 2
+    assert {tuple(group["overlap_range"]) for group in result["canonical_physical_reuse_groups"]} == {
+        (32, 64)
+    }
 
 
 def test_realized_reuse_rejects_duplicate_placements(tmp_path):
