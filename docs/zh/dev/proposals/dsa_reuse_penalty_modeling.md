@@ -201,6 +201,22 @@ IR 不再保留 Final-SyncIR group identity。因此推断结果与实际 instru
 bound 为 dynamic 或无法解析，或者 site 位于无法解析的条件/控制流 region 中时，该估算就标记为
 incomplete，而不会猜测。unstructured control flow 同样会使 function-level 估算变为 incomplete：
 
+realized-placement scorer 会保留五个不同层次的证据，而不会把每个逻辑 buffer pair
+都视为独立的硬件事件：
+
+1. `unit_realized_cost` 统计被提升的逻辑 buffer-pair weight；
+2. `canonical_physical_reuse_group_count` 把引用同一对完整物理 tile range（忽略顺序）
+   的重复逻辑 pair 折叠；
+3. `unique_induced_sync_edge_count` 再按照经过验证的 schedule-edge identity 折叠；
+4. `estimated_sync_endpoint_executions` 把静态 loop trip count 应用于唯一的 source 和
+   target endpoint；
+5. `critical_path_realized_cost_cycles` 为模型中的 exposed delay 定价。
+
+物理 range key 包含两个完整的 placement range，而不只是它们的交集，因为不同 tile
+布局可能具有相同交集。该规范化会删除重复 alias 证据，但不会推断未公开的硬件 bank
+或 interleave mapping。penalty-model evaluator 会同时报告五个指标，从而可以通过设备
+排序判断各 arm 最早在哪个抽象层出现区分。
+
 ```bash
 python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \
     -o post-sync-summary.json

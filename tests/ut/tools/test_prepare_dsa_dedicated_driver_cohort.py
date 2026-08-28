@@ -28,6 +28,7 @@ _SCRIPT = (
 )
 _CATALOG = _SCRIPT.with_name("dsa_dedicated_driver_cohort_v1.json")
 _HOLDOUT_CATALOG = _SCRIPT.with_name("dsa_penalty_model_holdout_v1.json")
+_PROSPECTIVE_CATALOG = _SCRIPT.with_name("dsa_prospective_dedicated_driver_candidates_v1.json")
 _SPEC = importlib.util.spec_from_file_location("_test_prepare_dsa_dedicated_driver_cohort", _SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None
 cohort = importlib.util.module_from_spec(_SPEC)
@@ -330,3 +331,12 @@ def test_checked_in_holdout_catalog_contains_only_new_isolated_drivers():
         "catalog_source_sha256",
         "catalog_semantics_sha256",
     }
+
+
+def test_checked_in_prospective_catalog_accepts_expanded_v2_tier():
+    data = json.loads(_PROSPECTIVE_CATALOG.read_text())
+    cohort._validate_catalog(data)
+
+    expanded_v2 = [driver for driver in data["drivers"] if driver["tier"] == "expanded_v2"]
+    assert len(expanded_v2) == 5
+    assert sum(len(driver["targets"]) for driver in expanded_v2) == 5

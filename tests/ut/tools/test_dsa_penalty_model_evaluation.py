@@ -29,6 +29,9 @@ def _cell(
         "cypress": "10",
         "dsa_rp_cg": "5",
     }
+    physical_groups = {"geometry_ff": "2", "geometry_cg": "2", "cypress": "0", "dsa_rp_cg": "1"}
+    sync_edges = {"geometry_ff": "2", "geometry_cg": "2", "cypress": "0", "dsa_rp_cg": "1"}
+    sync_endpoints = {"geometry_ff": "4", "geometry_cg": "4", "cypress": "0", "dsa_rp_cg": "2"}
     latencies = latencies or {arm: "" for arm in evaluation.ARMS}
     return [
         {
@@ -38,6 +41,9 @@ def _cell(
             "arm": arm,
             "analysis_status": status,
             "unit_realized_cost": unit[arm],
+            "canonical_physical_reuse_group_count": physical_groups[arm],
+            "unique_induced_sync_edge_count": sync_edges[arm],
+            "estimated_sync_endpoint_executions": sync_endpoints[arm],
             "critical_path_realized_cost_cycles": critical_path[arm],
             "latency_us": latencies[arm],
             "cypress_auxiliary_edges": "100" if arm == "cypress" else "",

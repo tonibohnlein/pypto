@@ -144,7 +144,12 @@ The candidate scorer collapses access-site records into the promoted buffer
 pairs the DSA solver sees. Distance-zero records use the combined longest-path
 extension; statically bounded loop recurrences use their initiation-interval
 extension over the remaining iterations. The realized-placement summary
-reports both the original unit cost and the critical-path-weighted cost.
+reports the original logical unit cost, canonical physical tile-range groups,
+unique induced synchronization edges, statically estimated synchronization
+endpoint executions, and the critical-path-weighted cost. A physical group is
+keyed by the unordered pair of complete placed ranges, not only by their
+intersection, so distinct tile layouts remain distinct while duplicate logical
+aliases collapse.
 
 Assemble one four-arm row per `(problem, capacity, device)` and compare both
 penalty models with device ordering using:

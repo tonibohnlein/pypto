@@ -23,7 +23,13 @@ from pathlib import Path
 from typing import Any
 
 ARMS = ("geometry_ff", "geometry_cg", "cypress", "dsa_rp_cg")
-METRICS = ("unit_realized_cost", "critical_path_realized_cost_cycles")
+METRICS = (
+    "unit_realized_cost",
+    "canonical_physical_reuse_group_count",
+    "unique_induced_sync_edge_count",
+    "estimated_sync_endpoint_executions",
+    "critical_path_realized_cost_cycles",
+)
 REQUIRED_COLUMNS = (
     "case_id",
     "capacity",

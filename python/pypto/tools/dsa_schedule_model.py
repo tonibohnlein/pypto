@@ -2101,6 +2101,69 @@ def _index_solution_placements(raw_placements: Any) -> dict[int, Mapping[str, An
     return placements
 
 
+def _canonical_physical_reuse_groups(
+    realized: Sequence[Mapping[str, Any]],
+    distance_zero_catalog: Mapping[tuple[int, int], Mapping[str, Any]],
+    loop_catalog: Mapping[tuple[int, int, int], Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    groups_by_range: dict[tuple[int, int, int, int, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in realized:
+        pool = int(row["overlap_pool"])
+        first_range = (int(row["first_placement_begin"]), int(row["first_placement_end"]))
+        second_range = (int(row["second_placement_begin"]), int(row["second_placement_end"]))
+        low_range, high_range = sorted((first_range, second_range))
+        groups_by_range[(pool, *low_range, *high_range)].append(row)
+
+    physical_groups: list[dict[str, Any]] = []
+    for group_id, ((pool, first_begin, first_end, second_begin, second_end), group_rows) in enumerate(
+        sorted(groups_by_range.items())
+    ):
+        overlap_begin = max(first_begin, second_begin)
+        overlap_end = min(first_end, second_end)
+        distance_zero_edges = {
+            (int(source), int(target))
+            for row in group_rows
+            for source, target in row.get("distance_zero_schedule_edges", [])
+        }
+        loop_edges = {
+            (int(loop), int(source), int(target))
+            for row in group_rows
+            for loop, source, target in row.get("loop_carried_schedule_edges", [])
+        }
+        group_pipe_pair_executions: Counter[str] = Counter()
+        for edge_key in distance_zero_edges:
+            edge = distance_zero_catalog[edge_key]
+            group_pipe_pair_executions[f"{edge['source_pipe']}->{edge['target_pipe']}"] += int(
+                edge["estimated_sync_endpoint_executions"]
+            )
+        for edge_key in loop_edges:
+            edge = loop_catalog[edge_key]
+            group_pipe_pair_executions[f"{edge['source_pipe']}->{edge['target_pipe']}"] += int(
+                edge["estimated_sync_endpoint_executions"]
+            )
+        physical_groups.append(
+            {
+                "id": group_id,
+                "pool": pool,
+                "first_range": [first_begin, first_end],
+                "second_range": [second_begin, second_end],
+                "overlap_range": [overlap_begin, overlap_end],
+                "shared_bytes": overlap_end - overlap_begin,
+                "logical_pairs": sorted(
+                    [int(row["first_buffer"]), int(row["second_buffer"])] for row in group_rows
+                ),
+                "logical_pair_count": len(group_rows),
+                "logical_unit_cost": sum(float(row["unit_cost"]) for row in group_rows),
+                "unique_induced_sync_edge_count": len(distance_zero_edges) + len(loop_edges),
+                "estimated_sync_endpoint_executions": sum(group_pipe_pair_executions.values()),
+                "estimated_sync_endpoint_executions_by_pipe_pair": dict(
+                    sorted(group_pipe_pair_executions.items())
+                ),
+            }
+        )
+    return physical_groups
+
+
 def score_realized_reuse(
     problem_path: str | Path,
     solution_path: str | Path,
@@ -2165,13 +2228,20 @@ def score_realized_reuse(
             and first_begin < second_end
             and second_begin < first_end
         )
+        overlap_begin = max(first_begin, second_begin) if overlap else None
+        overlap_end = min(first_end, second_end) if overlap else None
         rows.append(
             {
                 **pair_weight,
                 "reuse_realized": overlap,
-                "overlap_bytes": max(0, min(first_end, second_end) - max(first_begin, second_begin))
-                if overlap
-                else 0,
+                "overlap_pool": int(first_placement["pool"]) if overlap else None,
+                "first_placement_begin": first_begin,
+                "first_placement_end": first_end,
+                "second_placement_begin": second_begin,
+                "second_placement_end": second_end,
+                "overlap_begin": overlap_begin,
+                "overlap_end": overlap_end,
+                "overlap_bytes": overlap_end - overlap_begin if overlap else 0,
             }
         )
 
@@ -2215,6 +2285,7 @@ def score_realized_reuse(
         pipe_pair_executions[f"{edge['source_pipe']}->{edge['target_pipe']}"] += int(
             edge["estimated_sync_endpoint_executions"]
         )
+    physical_groups = _canonical_physical_reuse_groups(realized, distance_zero_catalog, loop_catalog)
     realized_without_induced_edge = [
         row
         for row in realized
@@ -2227,6 +2298,7 @@ def score_realized_reuse(
         "solution": str(solution_source),
         "promoted_pair_count": len(rows),
         "realized_pair_count": len(realized),
+        "canonical_physical_reuse_group_count": len(physical_groups),
         "realized_pair_count_without_induced_sync_edge": len(realized_without_induced_edge),
         "unit_realized_cost": sum(float(row["unit_cost"]) for row in realized),
         "unit_realized_cost_without_induced_sync_edge": sum(
@@ -2239,6 +2311,7 @@ def score_realized_reuse(
         "sync_endpoint_estimator_version": "uncoalesced_source_plus_target_static_executions_v1",
         "estimated_sync_endpoint_executions": sum(pipe_pair_executions.values()),
         "estimated_sync_endpoint_executions_by_pipe_pair": dict(sorted(pipe_pair_executions.items())),
+        "canonical_physical_reuse_groups": physical_groups,
         "pairs": rows,
     }
 

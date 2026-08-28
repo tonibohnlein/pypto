@@ -33,6 +33,7 @@ from typing import Any
 
 ARMS = ("geometry_ff", "geometry_cg", "cypress", "dsa_rp_cg")
 CAPACITIES = ("native", "half", "q1", "tight")
+TIERS = ("canary", "expanded", "canary_expanded", "expanded_v2")
 _SCREEN_SEMANTIC_FIELDS = (
     "tier",
     "driver_id",
@@ -197,8 +198,8 @@ def _validate_driver(driver: Mapping[str, Any], ids: set[str], cases: set[tuple[
     if driver_id in ids:
         raise ValueError(f"duplicate driver_id: {driver_id}")
     ids.add(driver_id)
-    if driver.get("tier") not in {"canary", "expanded", "canary_expanded"}:
-        raise ValueError(f"{driver_id}: tier must be canary, expanded, or canary_expanded")
+    if driver.get("tier") not in TIERS:
+        raise ValueError(f"{driver_id}: tier must be one of {', '.join(TIERS)}")
     if not isinstance(driver["argv"], list) or not all(isinstance(item, str) for item in driver["argv"]):
         raise ValueError(f"{driver_id}: argv must be a list of strings")
     if not driver["targets"]:
@@ -390,7 +391,9 @@ def prepare_cohort(
         "driver_count": len(driver_rows),
         "problem_count": len(problem_rows),
         "canary_driver_count": sum(row["tier"] in {"canary", "canary_expanded"} for row in driver_rows),
-        "expanded_problem_count": sum(row["tier"] in {"expanded", "canary_expanded"} for row in problem_rows),
+        "expanded_problem_count": sum(
+            row["tier"] in {"expanded", "canary_expanded", "expanded_v2"} for row in problem_rows
+        ),
         "operation_classes": sorted({row["operation_class"] for row in problem_rows}),
         "inputs": {
             **catalog_hashes,
