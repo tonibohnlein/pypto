@@ -221,6 +221,11 @@ class PassManager:
             # MaterializeTensorStrides fills empty stride slots on every
             # TensorView with packed canonical strides (RFC #1300 §2.4).
             passes.materialize_tensor_strides,
+            # LowerPipelineLoops can leave statically dead slot branches. Remove
+            # them before InitMemRef and DSA construction so the allocation
+            # problem describes only accesses that can reach final PTO. The
+            # late Simplify remains necessary for host/distributed rewrites.
+            passes.simplify,
             passes.init_mem_ref,
             # MaterializeSemanticAliases forces loop-carried / in-place buffers to
             # share one MemRef (semantics-required aliasing). It always runs; only
@@ -541,9 +546,7 @@ class PassManager:
         dsa_export_dir = ctx.get_dsa_export_dir() if ctx else None
         dsa_solution_dir = ctx.get_dsa_solution_dir() if ctx else None
         dsa_reuse_penalty_recognizer = (
-            ctx.get_dsa_reuse_penalty_recognizer()
-            if ctx
-            else passes.DsaReusePenaltyRecognizer.DISABLED
+            ctx.get_dsa_reuse_penalty_recognizer() if ctx else passes.DsaReusePenaltyRecognizer.DISABLED
         )
         dsa_reference_placement = (
             ctx.get_dsa_reference_placement() if ctx else passes.DsaReferencePlacement.DEFAULT
@@ -607,9 +610,7 @@ class PassManager:
         dsa_export_dir = ctx.get_dsa_export_dir() if ctx else None
         dsa_solution_dir = ctx.get_dsa_solution_dir() if ctx else None
         dsa_reuse_penalty_recognizer = (
-            ctx.get_dsa_reuse_penalty_recognizer()
-            if ctx
-            else passes.DsaReusePenaltyRecognizer.DISABLED
+            ctx.get_dsa_reuse_penalty_recognizer() if ctx else passes.DsaReusePenaltyRecognizer.DISABLED
         )
         dsa_reference_placement = (
             ctx.get_dsa_reference_placement() if ctx else passes.DsaReferencePlacement.DEFAULT

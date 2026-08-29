@@ -493,24 +493,25 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 17. [`LowerPipelineLoops`](29-lower_pipeline_loops.md)
 18. [`CanonicalizeIOOrder`](30-canonicalize_io_order.md)
 19. [`MaterializeTensorStrides`](31-materialize_tensor_strides.md) —— 自 RFC #1300 P6 起接入默认 pipeline
-20. `InitMemRef`
-21. [`MaterializeSemanticAliases`](33-materialize_semantic_aliases.md)（语义强制别名：循环 carry / 原地；总是运行）
-22. `MemoryReuse`
-23. `AllocateMemoryAddr`
-24. [`FoldNoOpReshape`](36-fold_no_op_reshape.md)
-25. [`FuseCreateAssembleToSlice`](37-fuse_create_assemble_to_slice.md)
-26. [`DeriveCallDirections`](38-derive_call_directions.md)
-27. [`AutoDeriveTaskDependencies`](39-auto_derive_task_dependencies.md)（runtime scope 编译器依赖；AUTO-scope 分析需要显式开启）
-28. [`ExpandManualPhaseFence`](40-expand_manual_phase_fence.md)（manual-scope phase-fence TaskId 依赖压缩）
-29. [`SynthesizeAllReduceSignals`](41-synthesize_allreduce_signals.md)（分布式：host allreduce optional signal -> explicit internal signal IR）
-30. [`MaterializeCommDomainScopes`](42-materialize_comm_domain_scopes.md)（分布式：构造 WindowBuffer 并写 CommDomainScopeStmt wrappers in each host_orch body；无通信程序为 no-op）
-31. [`LowerHostTensorCollectives`](43-lower_host_tensor_collectives.md)（host-level tensor collectives -> internal builtin chip dispatches）
-32. [`MaterializeDistTensorCtx`](44-materialize_dist_tensor_ctx.md)（为 DistributedTensor 参数显式物化 CommCtx 参数/实参）
-33. `Simplify`
-34. [`LegalizeGraphBoundary`](45-legalize_graph_boundary.md)（把 Graph 体从边界标量派生出来的值上提到调用点，并拒绝 host_build_graph runtime 无法录制的边界；无 Graph 函数的程序为 no-op）
-35. [`MaterializeRuntimeScopes`](46-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit SIMPLER_SCOPE）
-36. [`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md)（把每个 ForStmt iter_arg 标注为平凡别名 / 重绑定 carry，并为 manual-scope TaskId fence 数组定尺）
-37. [`InsertCommFence`](48-insert_comm_fence.md)（在每个发布性写入与释放它的 pld.system.notify 之间插入整张 tensor 的 system.cacheinvalid + GM system.fence；跑在最后，使插入的 op 一路到 codegen 都紧邻其 notify）
+20. `Simplify`（在内存规划前删除静态恒死的 pipeline slot 分支）
+21. `InitMemRef`
+22. [`MaterializeSemanticAliases`](33-materialize_semantic_aliases.md)（语义强制别名：循环 carry / 原地；总是运行）
+23. `MemoryReuse`
+24. `AllocateMemoryAddr`
+25. [`FoldNoOpReshape`](36-fold_no_op_reshape.md)
+26. [`FuseCreateAssembleToSlice`](37-fuse_create_assemble_to_slice.md)
+27. [`DeriveCallDirections`](38-derive_call_directions.md)
+28. [`AutoDeriveTaskDependencies`](39-auto_derive_task_dependencies.md)（runtime scope 编译器依赖；AUTO-scope 分析需要显式开启）
+29. [`ExpandManualPhaseFence`](40-expand_manual_phase_fence.md)（manual-scope phase-fence TaskId 依赖压缩）
+30. [`SynthesizeAllReduceSignals`](41-synthesize_allreduce_signals.md)（分布式：host allreduce optional signal -> explicit internal signal IR）
+31. [`MaterializeCommDomainScopes`](42-materialize_comm_domain_scopes.md)（分布式：构造 WindowBuffer 并写 CommDomainScopeStmt wrappers in each host_orch body；无通信程序为 no-op）
+32. [`LowerHostTensorCollectives`](43-lower_host_tensor_collectives.md)（host-level tensor collectives -> internal builtin chip dispatches）
+33. [`MaterializeDistTensorCtx`](44-materialize_dist_tensor_ctx.md)（为 DistributedTensor 参数显式物化 CommCtx 参数/实参）
+34. `Simplify`
+35. [`LegalizeGraphBoundary`](45-legalize_graph_boundary.md)（把 Graph 体从边界标量派生出来的值上提到调用点，并拒绝 host_build_graph runtime 无法录制的边界；无 Graph 函数的程序为 no-op）
+36. [`MaterializeRuntimeScopes`](46-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit SIMPLER_SCOPE）
+37. [`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md)（把每个 ForStmt iter_arg 标注为平凡别名 / 重绑定 carry，并为 manual-scope TaskId fence 数组定尺）
+38. [`InsertCommFence`](48-insert_comm_fence.md)（在每个发布性写入与释放它的 pld.system.notify 之间插入整张 tensor 的 system.cacheinvalid + GM system.fence；跑在最后，使插入的 op 一路到 codegen 都紧邻其 notify）
 
 [`ResolveBackendOpLayouts`](20-resolve_backend_op_layouts.md) 会根据
 backend 注册的 layout 元数据修复受约束的逐元素 tile 操作。对于当前 PTO
@@ -533,6 +534,11 @@ backend 注册的 layout 元数据修复受约束的逐元素 tile 操作。对�
 可观察的副作用。该 DCE 步骤会递归进入
 `ForStmt`/`IfStmt`/`WhileStmt`/`ScopeStmt` 的 body，以便同时清理嵌套
 块中的死标量。
+
+其中，`InitMemRef` 前的调用是内存规划的语义边界。pipeline lowering 在 slot
+替换后可能留下 guard 静态为假的分支；在分配前将其折叠，可避免恒死的 tile access
+进入生命周期和 reuse-penalty candidate。末尾的调用仍负责清理由后续 host 与
+distributed rewrite 暴露的折叠机会。
 
 ### 直接使用 PassPipeline
 

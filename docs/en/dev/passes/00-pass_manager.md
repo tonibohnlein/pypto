@@ -495,24 +495,25 @@ The PTO-oriented tile stage of `Default` is:
 17. [`LowerPipelineLoops`](29-lower_pipeline_loops.md)
 18. [`CanonicalizeIOOrder`](30-canonicalize_io_order.md)
 19. [`MaterializeTensorStrides`](31-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
-20. `InitMemRef`
-21. [`MaterializeSemanticAliases`](33-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
-22. `MemoryReuse`
-23. `AllocateMemoryAddr`
-24. [`FoldNoOpReshape`](36-fold_no_op_reshape.md)
-25. [`FuseCreateAssembleToSlice`](37-fuse_create_assemble_to_slice.md)
-26. [`DeriveCallDirections`](38-derive_call_directions.md)
-27. [`AutoDeriveTaskDependencies`](39-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
-28. [`ExpandManualPhaseFence`](40-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
-29. [`SynthesizeAllReduceSignals`](41-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
-30. [`MaterializeCommDomainScopes`](42-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
-31. [`LowerHostTensorCollectives`](43-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
-32. [`MaterializeDistTensorCtx`](44-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
-33. `Simplify`
-34. [`LegalizeGraphBoundary`](45-legalize_graph_boundary.md) (hoists values a Graph body derives from its boundary scalars to the call sites, and rejects the boundaries the host_build_graph runtime cannot record; no-op for programs with no Graph function)
-35. [`MaterializeRuntimeScopes`](46-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits SIMPLER_SCOPE 1:1)
-36. [`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
-37. [`InsertCommFence`](48-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs dead last so the inserted ops stay adjacent to their notify through codegen)
+20. `Simplify` (removes statically dead pipeline-slot branches before memory planning)
+21. `InitMemRef`
+22. [`MaterializeSemanticAliases`](33-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
+23. `MemoryReuse`
+24. `AllocateMemoryAddr`
+25. [`FoldNoOpReshape`](36-fold_no_op_reshape.md)
+26. [`FuseCreateAssembleToSlice`](37-fuse_create_assemble_to_slice.md)
+27. [`DeriveCallDirections`](38-derive_call_directions.md)
+28. [`AutoDeriveTaskDependencies`](39-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
+29. [`ExpandManualPhaseFence`](40-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
+30. [`SynthesizeAllReduceSignals`](41-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
+31. [`MaterializeCommDomainScopes`](42-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
+32. [`LowerHostTensorCollectives`](43-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
+33. [`MaterializeDistTensorCtx`](44-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
+34. `Simplify`
+35. [`LegalizeGraphBoundary`](45-legalize_graph_boundary.md) (hoists values a Graph body derives from its boundary scalars to the call sites, and rejects the boundaries the host_build_graph runtime cannot record; no-op for programs with no Graph function)
+36. [`MaterializeRuntimeScopes`](46-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits SIMPLER_SCOPE 1:1)
+37. [`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
+38. [`InsertCommFence`](48-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs dead last so the inserted ops stay adjacent to their notify through codegen)
 
 [`ResolveBackendOpLayouts`](20-resolve_backend_op_layouts.md) repairs
 backend-constrained elementwise tile ops using registered layout metadata.
@@ -541,6 +542,13 @@ arithmetic tree — is preserved because the IR has no purity annotation yet,
 so the call might have observable side effects. The DCE step recurses into
 `ForStmt`/`IfStmt`/`WhileStmt`/`ScopeStmt` bodies so nested dead scalars
 are cleaned up as well.
+
+The pre-`InitMemRef` invocation is a semantic boundary for memory planning.
+Pipeline lowering can leave branches whose guards are statically false after
+slot substitution. Simplifying them before allocation prevents dead tile
+accesses from contributing lifetimes or reuse-penalty candidates. The final
+invocation remains necessary for folds exposed by later host and distributed
+rewrites.
 
 ### Using PassPipeline Directly
 

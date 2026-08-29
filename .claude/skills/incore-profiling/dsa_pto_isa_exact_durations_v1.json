@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "calibration_provenance": {
+    "architecture": "a2a3",
+    "device_pto_isa_revision": "cd4a3d3f7a1a27fcfe536f617e9bca3008929664",
+    "perf_sim_revision": "1216c55831fcc4ed2f096e4ca582ff75a633fbb6",
+    "source_header": "include/pto/npu/a2a3/TRowMax.hpp",
+    "source_header_sha256": "44bf298e2b22e5fa185e0737d27661d9919c2b0f972812ea753fe9c1f0abb431",
+    "compiler": "GCC 15.3.1, C++23",
+    "measurement": "median of the two AIV records from one deterministic Perf-Sim launch",
+    "note": "The integer TROWMAX implementation header is byte-identical at the device and Perf-Sim revisions."
+  },
+  "instructions": {
+    "TROWMAX": [
+      {
+        "cycles": 435.0,
+        "pipe": "PIPE_V",
+        "operation_signature": {
+          "attributes": {},
+          "cols": 8,
+          "dtype": "i32",
+          "operand_constants": [
+            null,
+            null
+          ],
+          "operand_types": [
+            "!pto.tile_buf<loc=vec, dtype=i32, rows=8, cols=8, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>",
+            "!pto.tile_buf<loc=vec, dtype=i32, rows=8, cols=128, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+          ],
+          "operation": "TROWMAX",
+          "pipe": "PIPE_V",
+          "result_types": [
+            "!pto.tile_buf<loc=vec, dtype=i32, rows=8, cols=1, v_row=?, v_col=?, blayout=col_major, slayout=none_box, fractal=512, pad=0>"
+          ],
+          "rows": 8,
+          "semantic_operation": "pto.trowmax ins(%value, %value : !pto.tile_buf<loc=vec, dtype=i32, rows=8, cols=8, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>, !pto.tile_buf<loc=vec, dtype=i32, rows=8, cols=128, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%value : !pto.tile_buf<loc=vec, dtype=i32, rows=8, cols=1, v_row=?, v_col=?, blayout=col_major, slayout=none_box, fractal=512, pad=0>)",
+          "work_bytes": 4096
+        }
+      }
+    ]
+  }
+}

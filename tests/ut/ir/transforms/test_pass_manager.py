@@ -52,6 +52,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "LowerPipelineLoops",
     "CanonicalizeIOOrder",
     "MaterializeTensorStrides",
+    "Simplify",
     "InitMemRef",
     "MaterializeSemanticAliases",
     "MemoryReuse",

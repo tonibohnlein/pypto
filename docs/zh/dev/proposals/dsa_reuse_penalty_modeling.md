@@ -385,9 +385,23 @@ graph 可以验证 graph construction，但不能解释 placement 导致的 late
 `pypto.access.N` NameLoc 包裹已标记的 lowered operation。`N` 在构造 DSA
 问题时写入源 Call，并在后续 lowering 中保留；它不会根据 lowered statement
 顺序重新计算。因此它与 candidate record 的 `sites=prior->next` 一致。PTOAS 将该整数
-复制到 schedule graph。若 site 缺失，或 candidate route 没有经过验证的
-PTOAS pipe mapping，连接会直接失败；不会把 SSA node number 或源码行号误当作
-同一坐标。
+复制到 schedule graph。现在 `InitMemRef` 前会防御性地运行一次 `Simplify`，
+在静态恒死的 pipeline slot 分支进入 DSA lifetime 或 candidate 之前将其删除。
+若 site 缺失，或 candidate route 没有经过验证的 PTOAS pipe mapping，连接会直接
+失败；不会把 SSA node number 或源码行号误当作同一坐标。
+
+在该边界引入前生成的历史 problem，可能仍包含其配对 lowered schedule 中并不存在的
+operation candidate record。只有提供显式 `--nonmaterialized-access-evidence` 文件，
+并且其中 SHA-256 与该 problem 和 schedule 精确绑定时，才允许对其评分。这些 record
+保留 logical unit penalty 以供审计，但对 executable relation、physical group、
+synchronization execution 与 critical-path predictor 的贡献均为零。该例外必须由证据
+驱动；没有该文件时连接仍然 fail closed。
+
+solver 提升的 `pipeline_serialization` penalty 属于另一种情况。它们描述被放松的
+pipeline stage separation，本身不携带 producer/consumer access record。logical
+objective 必须保留这些 penalty；但只要 placement 实现了其中一条 relation，基于
+access、synchronization 或 critical path 的 predictor 就必须报告 coverage 不完整。
+不能把它们当成已证明未 materialize 的 operation，也不能给它们赋予模型成本零。
 
 首个 candidate-weight prototype 保留 reference schedule 中已有的全部 sync，
 并从 prior site 的 terminal macro phase 向 next site 的 initial macro phase
@@ -402,6 +416,12 @@ python -m pypto.tools.dsa_schedule_model score-candidates \
     schedule.jsonl problem.dsa.json --model duration-v0.json \
     -o candidate-weights.json
 ```
+
+提供 solution 后，报告还会生成 `edge_explanations`。每一行会把一条 logical reuse
+relation 依次连接到其 canonical 物理重叠范围、lowered producer/consumer operation、
+已插入的 sync group、loop execution multiplier，以及 critical-path 或 recurrence slack。
+duration calibration 按 pinned PTO-ISA 的完整 signature 索引；不支持的 signature 会
+fail closed，而不会退化为 instruction-family median。
 
 版本 1 保留 distance-zero candidate 的无环 longest-path 评分，并为 distance-one
 candidate 增加 lower-bound 评分。它连接两个 PTOAS site，验证二者共享真实 loop，并选择

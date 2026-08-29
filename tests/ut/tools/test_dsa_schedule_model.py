@@ -9,6 +9,7 @@
 
 """Tests for duration-model v0 and schedule-graph scoring."""
 
+import hashlib
 import json
 
 import pytest
@@ -575,6 +576,10 @@ def test_candidate_score_joins_access_sites_and_derives_non_negative_weight():
             "promoted_to_dsa_penalty": True,
             "unit_cost": 1.0,
             "candidate_record_count": 1,
+            "executable_candidate_record_count": 1,
+            "not_materialized_candidate_record_count": 0,
+            "executable_in_lowered_schedule": True,
+            "model_status": "executable",
             "distance_zero_schedule_edges": [[2, 1]],
             "loop_carried_schedule_edges": [],
             "estimated_sync_endpoint_executions": 2,
@@ -714,6 +719,10 @@ def test_candidate_score_derives_loop_recurrence_ii_weight():
             "promoted_to_dsa_penalty": True,
             "unit_cost": 1.0,
             "candidate_record_count": 1,
+            "executable_candidate_record_count": 1,
+            "not_materialized_candidate_record_count": 0,
+            "executable_in_lowered_schedule": True,
+            "model_status": "executable",
             "distance_zero_schedule_edges": [],
             "loop_carried_schedule_edges": [[10, 2, 1]],
             "estimated_sync_endpoint_executions": 8,
@@ -831,6 +840,161 @@ def test_candidate_score_fails_closed_when_site_pipe_does_not_join():
 
     with pytest.raises(ValueError, match="did not join"):
         dsa_schedule_model.score_reuse_candidates(record, [_candidate()], _ten_cycle_model())
+
+
+def test_candidate_score_classifies_access_removed_before_lowered_schedule():
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        # Access 3 is intentionally absent: it was removed by a lowering pass.
+        _with_access(record["nodes"][2], 11),
+        _with_access(record["nodes"][3], 9),
+    ]
+
+    with pytest.raises(ValueError, match="without non-materialization evidence: \\[3\\]"):
+        dsa_schedule_model.score_reuse_candidates(record, [_candidate()], _ten_cycle_model())
+
+    result = dsa_schedule_model.score_reuse_candidates(
+        record,
+        [_candidate()],
+        _ten_cycle_model(),
+        known_nonmaterialized_access_orders=frozenset({3}),
+    )
+
+    assert result["scored_candidate_count"] == 0
+    assert result["not_materialized_candidate_count"] == 1
+    assert result["candidates"][0] == {
+        "candidate_index": 0,
+        "first_buffer": 0,
+        "second_buffer": 1,
+        "prior_buffer": 0,
+        "next_buffer": 1,
+        "prior_access_order": 3,
+        "next_access_order": 7,
+        "prior_route_pipe": "PIPE_V",
+        "next_route_pipe": "PIPE_MTE2",
+        "missing_access_orders": [3],
+        "status": "not_materialized_in_schedule",
+        "weight_cycles": 0.0,
+    }
+    assert result["penalty_pair_weights"] == [
+        {
+            "first_buffer": 0,
+            "second_buffer": 1,
+            "promoted_to_dsa_penalty": True,
+            "unit_cost": 1.0,
+            "candidate_record_count": 1,
+            "executable_candidate_record_count": 0,
+            "not_materialized_candidate_record_count": 1,
+            "executable_in_lowered_schedule": False,
+            "model_status": "proven_nonmaterialized",
+            "distance_zero_schedule_edges": [],
+            "loop_carried_schedule_edges": [],
+            "estimated_sync_endpoint_executions": 0,
+            "distance_zero_weight_cycles": 0.0,
+            "loop_ii_weight_cycles": 0,
+            "loop_total_weight_cycles": 0,
+            "critical_path_weight_cycles": 0.0,
+        }
+    ]
+
+
+def test_candidate_score_preserves_unmodeled_pipeline_penalty_without_access_record(tmp_path):
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+
+    penalties = {(0, 1): 1.0, (2, 3): 4.0}
+    with pytest.raises(ValueError, match="not a structured pipeline-serialization penalty"):
+        dsa_schedule_model.score_reuse_candidates(
+            record,
+            [_candidate()],
+            _ten_cycle_model(),
+            promoted_penalties=penalties,
+        )
+
+    result = dsa_schedule_model.score_reuse_candidates(
+        record,
+        [_candidate()],
+        _ten_cycle_model(),
+        promoted_penalties=penalties,
+        promoted_penalty_reasons={(0, 1): "cross_pipe", (2, 3): "pipeline_serialization"},
+    )
+
+    assert result["unmodeled_pipeline_serialization_pair_count"] == 1
+    assert result["penalty_pair_weights"][1] == {
+        "first_buffer": 2,
+        "second_buffer": 3,
+        "promoted_to_dsa_penalty": True,
+        "unit_cost": 4.0,
+        "candidate_record_count": 0,
+        "executable_candidate_record_count": 0,
+        "not_materialized_candidate_record_count": 0,
+        "executable_in_lowered_schedule": False,
+        "model_status": "unmodeled_pipeline_serialization",
+        "penalty_reason": "pipeline_serialization",
+        "distance_zero_schedule_edges": [],
+        "loop_carried_schedule_edges": [],
+        "estimated_sync_endpoint_executions": 0,
+        "distance_zero_weight_cycles": 0.0,
+        "loop_ii_weight_cycles": 0.0,
+        "loop_total_weight_cycles": 0.0,
+        "critical_path_weight_cycles": 0.0,
+    }
+
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(
+        json.dumps({"problem": {"buffers": [{"id": buffer_id, "size": 64} for buffer_id in range(4)]}})
+    )
+    solution.write_text(
+        json.dumps({"placements": [{"buffer": buffer_id, "pool": 1, "offset": 0} for buffer_id in range(4)]})
+    )
+
+    realized = dsa_schedule_model.score_realized_reuse(problem, solution, result)
+
+    assert realized["synchronization_predictor_coverage_complete"] is False
+    assert realized["unmodeled_pipeline_serialization_realized_pair_count"] == 1
+    assert realized["unmodeled_pipeline_serialization_realized_cost"] == 4.0
+    assert realized["unit_realized_cost"] == 5.0
+    assert realized["executable_unit_realized_cost"] == 1.0
+
+
+def test_nonmaterialized_access_evidence_is_bound_to_scored_inputs(tmp_path):
+    schedule = tmp_path / "schedule.jsonl"
+    problem = tmp_path / "problem.json"
+    evidence = tmp_path / "evidence.json"
+    schedule.write_text("schedule\n")
+    problem.write_text("problem\n")
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "schedule_sha256": hashlib.sha256(schedule.read_bytes()).hexdigest(),
+                "problem_sha256": hashlib.sha256(problem.read_bytes()).hexdigest(),
+                "nonmaterialized_access_orders": [3, 9],
+            }
+        )
+    )
+
+    assert dsa_schedule_model._load_nonmaterialized_access_evidence(
+        evidence,
+        schedule_path=schedule,
+        problem_path=problem,
+    ) == frozenset({3, 9})
+
+    schedule.write_text("changed\n")
+    with pytest.raises(ValueError, match="schedule_sha256 does not match"):
+        dsa_schedule_model._load_nonmaterialized_access_evidence(
+            evidence,
+            schedule_path=schedule,
+            problem_path=problem,
+        )
 
 
 def test_candidate_score_records_narrow_tci_schedule_pipe_override():
@@ -999,8 +1163,14 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
 
     assert result["realized_pair_count"] == 1
     assert result["canonical_physical_reuse_group_count"] == 1
+    assert result["executable_realized_pair_count"] == 1
+    assert result["executable_canonical_physical_reuse_group_count"] == 1
+    assert result["synchronization_predictor_coverage_complete"] is True
+    assert result["unmodeled_pipeline_serialization_realized_pair_count"] == 0
+    assert result["unmodeled_pipeline_serialization_realized_cost"] == 0
     assert result["realized_pair_count_without_induced_sync_edge"] == 0
     assert result["unit_realized_cost"] == 3.0
+    assert result["executable_unit_realized_cost"] == 3.0
     assert result["unit_realized_cost_without_induced_sync_edge"] == 0
     assert result["critical_path_realized_cost_cycles"] == 20.0
     assert result["unique_induced_sync_edge_count"] == 1
@@ -1020,6 +1190,37 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
             "unique_induced_sync_edge_count": 1,
             "estimated_sync_endpoint_executions": 2,
             "estimated_sync_endpoint_executions_by_pipe_pair": {"PIPE_V->PIPE_MTE2": 2},
+        }
+    ]
+    assert result["executable_canonical_physical_reuse_groups"] == result["canonical_physical_reuse_groups"]
+    assert result["edge_explanations"] == [
+        {
+            "first_buffer": 0,
+            "second_buffer": 1,
+            "physical_group_id": 0,
+            "physical_pool": 1,
+            "physical_first_range": [0, 64],
+            "physical_second_range": [32, 96],
+            "physical_overlap_range": [32, 64],
+            "shared_bytes": 32,
+            "candidate_index": 0,
+            "candidate_status": "scored",
+            "prior_access_order": 3,
+            "next_access_order": 7,
+            "missing_access_orders": [],
+            "lowered_source_node": 2,
+            "lowered_source_operation": "pto.tmuls",
+            "lowered_source_pipe": "PIPE_V",
+            "lowered_target_node": 1,
+            "lowered_target_operation": "pto.tload",
+            "lowered_target_pipe": "PIPE_MTE2",
+            "actual_sync_group_ids": [],
+            "source_loop_multiplier": 1,
+            "target_loop_multiplier": 1,
+            "critical_path_weight_cycles": 20.0,
+            "critical_path_slack_cycles": 0.0,
+            "loop_ii_slack_cycles": None,
+            "slack_basis": "whole_function_dag",
         }
     ]
     assert result["pairs"][0]["overlap_bytes"] == 32

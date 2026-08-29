@@ -17,7 +17,7 @@ Developers read pass docs sequentially to understand the compilation pipeline. I
 | 02 | `02-unroll_loops.md` | 2nd pass |
 | 03 | `03-ctrl_flow_transform.md` | 3rd pass |
 | 04 | `04-convert_to_ssa.md` | 4th pass |
-| 05 | `05-simplify.md` | 5th pass (also runs as the last pass of the tile pipeline) |
+| 05 | `05-simplify.md` | 5th pass (also runs before `InitMemRef` and near the end of the tile pipeline, after `MaterializeDistTensorCtx`) |
 | 06 | `06-flatten_call_expr.md` | 6th pass |
 | 07 | `07-outline_hierarchy_scopes.md` | 7th pass |
 | 08 | `08-outline_incore_scopes.md` | 8th pass |

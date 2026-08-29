@@ -606,14 +606,17 @@ class TestSlots:
         for planner, after in placements.items():
             ranges = _tile_byte_ranges(after)
             assert len(ranges) >= 4, f"{planner}: expected addressed tiles, got {ranges}"
-            # Slot 1 must sit inside its own allocation's reservation, so nothing
-            # on a different base may overlap it.
-            for name_a, base_a, start_a, end_a in ranges:
-                for name_b, base_b, start_b, end_b in ranges:
-                    if base_a >= base_b:
-                        continue
+            declared = [item for item in ranges if item[1] == "aaa"]
+            others = [item for item in ranges if item[1] != "aaa"]
+            assert len(declared) == 2, f"{planner}: expected both declared slots, got {declared}"
+
+            # The declared allocation reserves both slots. Ordinary buffers may
+            # still legally reuse each other's addresses when their lifetimes do
+            # not overlap, so only compare them against the declared slots.
+            for name_a, base_a, start_a, end_a in declared:
+                for name_b, base_b, start_b, end_b in others:
                     assert not (start_a < end_b and start_b < end_a), (
-                        f"{planner}: {name_a} [{start_a}, {end_a}) on '{base_a}' overlaps "
+                        f"{planner}: declared slot {name_a} [{start_a}, {end_a}) on '{base_a}' overlaps "
                         f"{name_b} [{start_b}, {end_b}) on '{base_b}'"
                     )
 
