@@ -1435,7 +1435,7 @@ class TestDynamicShapeEdgeCases:
         """User typos variable name — should get a clear error."""
         shape = [128, 64]  # noqa: F841 — intentionally unused; typo below
 
-        with pytest.raises(NameError, match=r"shaep|Cannot resolve|Unknown|undefined"):
+        with pytest.raises(ParserTypeError, match=r"shaep|Cannot resolve|Unknown|undefined"):
 
             @pl.function
             def func(x: pl.Tensor[shaep, pl.FP32]) -> pl.Tensor[shaep, pl.FP32]:  # noqa: F821

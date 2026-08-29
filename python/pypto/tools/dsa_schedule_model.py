@@ -1855,6 +1855,78 @@ def _resolve_candidate_site(
     return [], route_pipe, None
 
 
+def _join_candidate_access_sites(
+    candidate: ReuseCandidateRecord,
+    candidate_index: int,
+    indexed_nodes: Mapping[tuple[int, str], list[int]],
+    nodes_by_id: Mapping[int, Mapping[str, Any]],
+    materialized_access_orders: set[int],
+    known_nonmaterialized_access_orders: frozenset[int],
+) -> tuple[list[int], str, str | None, list[int], str, str | None] | dict[str, Any]:
+    """Join both candidate sites or return an evidence-backed non-materialized row."""
+    prior_route_pipe = _route_pipe(candidate.prior_route)
+    next_route_pipe = _route_pipe(candidate.next_route)
+    prior_nodes, prior_pipe, prior_pipe_override = _resolve_candidate_site(
+        indexed_nodes,
+        nodes_by_id,
+        access_order=candidate.prior_access_order,
+        route_pipe=prior_route_pipe,
+    )
+    next_nodes, next_pipe, next_pipe_override = _resolve_candidate_site(
+        indexed_nodes,
+        nodes_by_id,
+        access_order=candidate.next_access_order,
+        route_pipe=next_route_pipe,
+    )
+    for access_order, route_pipe, resolved_nodes in (
+        (candidate.prior_access_order, prior_route_pipe, prior_nodes),
+        (candidate.next_access_order, next_route_pipe, next_nodes),
+    ):
+        if access_order in materialized_access_orders and not resolved_nodes:
+            raise ValueError(
+                "candidate site did not join to the expected PTOAS pipe: "
+                f"site={access_order}, pipe={route_pipe}"
+            )
+    missing_access_orders = sorted(
+        {
+            access_order
+            for access_order in (candidate.prior_access_order, candidate.next_access_order)
+            if access_order not in materialized_access_orders
+        }
+    )
+    if missing_access_orders:
+        unproven = sorted(set(missing_access_orders) - known_nonmaterialized_access_orders)
+        if unproven:
+            raise ValueError(
+                "candidate access orders are absent from the lowered schedule without "
+                f"non-materialization evidence: {unproven}"
+            )
+        return {
+            "candidate_index": candidate_index,
+            "first_buffer": candidate.first_buffer,
+            "second_buffer": candidate.second_buffer,
+            "prior_buffer": candidate.prior_buffer,
+            "next_buffer": candidate.next_buffer,
+            "prior_access_order": candidate.prior_access_order,
+            "next_access_order": candidate.next_access_order,
+            "prior_route_pipe": prior_route_pipe,
+            "next_route_pipe": next_route_pipe,
+            "missing_access_orders": missing_access_orders,
+            "status": "not_materialized_in_schedule",
+            "weight_cycles": 0.0,
+        }
+    if not prior_nodes or not next_nodes:
+        raise ValueError("candidate access-site join produced an empty executable endpoint")
+    return (
+        prior_nodes,
+        prior_pipe,
+        prior_pipe_override,
+        next_nodes,
+        next_pipe,
+        next_pipe_override,
+    )
+
+
 def _deduplicate_scored_candidate_edges(
     rows: Sequence[dict[str, Any]], execution_counts: Mapping[int, int]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1954,8 +2026,7 @@ def _buffer_pair(first: int, second: int) -> tuple[int, int]:
     return min(first, second), max(first, second)
 
 
-def load_promoted_reuse_penalties(path: str | Path) -> dict[tuple[int, int], float]:
-    """Load the pairwise reuse penalties that the DSA solver actually sees."""
+def _load_promoted_reuse_penalty_entries(path: str | Path) -> list[Mapping[str, Any]]:
     source = Path(path)
     document = json.loads(source.read_text())
     try:
@@ -1964,6 +2035,15 @@ def load_promoted_reuse_penalties(path: str | Path) -> dict[tuple[int, int], flo
         raise ValueError(f"{source}: missing problem.cost_model.reuse_penalties") from error
     if not isinstance(raw_penalties, list):
         raise ValueError(f"{source}: reuse_penalties must be an array")
+    if not all(isinstance(raw, Mapping) for raw in raw_penalties):
+        raise ValueError(f"{source}: every reuse penalty must be an object")
+    return raw_penalties
+
+
+def load_promoted_reuse_penalties(path: str | Path) -> dict[tuple[int, int], float]:
+    """Load the pairwise reuse penalties that the DSA solver actually sees."""
+    source = Path(path)
+    raw_penalties = _load_promoted_reuse_penalty_entries(source)
 
     penalties: dict[tuple[int, int], float] = {}
     for index, raw in enumerate(raw_penalties):
@@ -1979,6 +2059,21 @@ def load_promoted_reuse_penalties(path: str | Path) -> dict[tuple[int, int], flo
     return penalties
 
 
+def load_promoted_reuse_penalty_reasons(path: str | Path) -> dict[tuple[int, int], str]:
+    """Load the structured reason attached to every promoted penalty pair."""
+    source = Path(path)
+    reasons: dict[tuple[int, int], str] = {}
+    for index, raw in enumerate(_load_promoted_reuse_penalty_entries(source)):
+        first, second, reason = raw.get("first"), raw.get("second"), raw.get("reason")
+        if not isinstance(first, int) or not isinstance(second, int) or not isinstance(reason, str):
+            raise ValueError(f"{source}: invalid reuse penalty reason at index {index}: {raw}")
+        pair = _buffer_pair(first, second)
+        if pair in reasons:
+            raise ValueError(f"{source}: duplicate reuse penalty pair {pair}")
+        reasons[pair] = reason
+    return reasons
+
+
 def _score_penalty_pairs(
     rows: Sequence[Mapping[str, Any]],
     durations: Mapping[int, float],
@@ -1987,6 +2082,7 @@ def _score_penalty_pairs(
     loop_counts: Mapping[int, int],
     sync_latency_cycles: float,
     promoted_penalties: Mapping[tuple[int, int], float] | None,
+    promoted_penalty_reasons: Mapping[tuple[int, int], str] | None,
     distance_zero_edge_features: Mapping[tuple[int, int], Mapping[str, Any]],
     loop_edge_features: Mapping[tuple[int, int, int], Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -2041,6 +2137,10 @@ def _score_penalty_pairs(
 
         promoted = promoted_penalties is None or pair in promoted_penalties
         unit_cost = 1.0 if promoted_penalties is None else promoted_penalties.get(pair, 0.0)
+        executable_rows = [
+            row for row in pair_rows if row.get("status") in {"scored", "loop_carried_scored_v1"}
+        ]
+        not_materialized_count = sum(row.get("status") == "not_materialized_in_schedule" for row in pair_rows)
         scored.append(
             {
                 "first_buffer": pair[0],
@@ -2048,6 +2148,16 @@ def _score_penalty_pairs(
                 "promoted_to_dsa_penalty": promoted,
                 "unit_cost": unit_cost,
                 "candidate_record_count": len(pair_rows),
+                "executable_candidate_record_count": len(executable_rows),
+                "not_materialized_candidate_record_count": not_materialized_count,
+                "executable_in_lowered_schedule": bool(executable_rows),
+                "model_status": (
+                    "executable_with_proven_dead_records"
+                    if executable_rows and not_materialized_count
+                    else "executable"
+                    if executable_rows
+                    else "proven_nonmaterialized"
+                ),
                 "distance_zero_schedule_edges": [list(edge) for edge in sorted(distance_zero_edges)],
                 "loop_carried_schedule_edges": [list(edge) for edge in sorted(loop_schedule_edges)],
                 "estimated_sync_endpoint_executions": estimated_sync_executions,
@@ -2059,9 +2169,39 @@ def _score_penalty_pairs(
         )
 
     if promoted_penalties is not None:
-        missing = sorted(set(promoted_penalties) - set(by_pair))
-        if missing:
-            raise ValueError(f"promoted reuse penalties have no access-site candidate records: {missing[:8]}")
+        for pair in sorted(set(promoted_penalties) - set(by_pair)):
+            reason = promoted_penalty_reasons.get(pair) if promoted_penalty_reasons is not None else None
+            if reason != "pipeline_serialization":
+                raise ValueError(
+                    "promoted reuse penalty has no access-site candidate record and is not a "
+                    f"structured pipeline-serialization penalty: pair={pair}, reason={reason!r}"
+                )
+            # Pipeline-intent relaxation creates these penalties from stage
+            # separations. They have no operation-to-operation access record,
+            # so keep them in the solver objective while reporting predictors
+            # 3--5 as incomplete rather than fabricating a zero-cost edge.
+            scored.append(
+                {
+                    "first_buffer": pair[0],
+                    "second_buffer": pair[1],
+                    "promoted_to_dsa_penalty": True,
+                    "unit_cost": promoted_penalties[pair],
+                    "candidate_record_count": 0,
+                    "executable_candidate_record_count": 0,
+                    "not_materialized_candidate_record_count": 0,
+                    "executable_in_lowered_schedule": False,
+                    "model_status": "unmodeled_pipeline_serialization",
+                    "penalty_reason": reason,
+                    "distance_zero_schedule_edges": [],
+                    "loop_carried_schedule_edges": [],
+                    "estimated_sync_endpoint_executions": 0,
+                    "distance_zero_weight_cycles": 0.0,
+                    "loop_ii_weight_cycles": 0.0,
+                    "loop_total_weight_cycles": 0.0,
+                    "critical_path_weight_cycles": 0.0,
+                }
+            )
+        scored.sort(key=lambda row: (row["first_buffer"], row["second_buffer"]))
     return scored
 
 
@@ -2162,6 +2302,98 @@ def _canonical_physical_reuse_groups(
             }
         )
     return physical_groups
+
+
+def _realized_edge_explanations(
+    realized: Sequence[Mapping[str, Any]],
+    physical_groups: Sequence[Mapping[str, Any]],
+    candidate_scores: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Join logical reuse, physical ranges, lowered sites, and sync evidence."""
+    groups_by_pair: dict[tuple[int, int], Mapping[str, Any]] = {}
+    for group in physical_groups:
+        for raw_pair in group.get("logical_pairs", []):
+            if isinstance(raw_pair, list) and len(raw_pair) == 2:
+                groups_by_pair[_buffer_pair(int(raw_pair[0]), int(raw_pair[1]))] = group
+
+    candidates_by_pair: dict[tuple[int, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for candidate in candidate_scores.get("candidates", []):
+        if not isinstance(candidate, Mapping):
+            continue
+        first, second = candidate.get("first_buffer"), candidate.get("second_buffer")
+        if isinstance(first, int) and isinstance(second, int):
+            candidates_by_pair[_buffer_pair(first, second)].append(candidate)
+
+    explanations: list[dict[str, Any]] = []
+    for pair_row in realized:
+        pair = _buffer_pair(int(pair_row["first_buffer"]), int(pair_row["second_buffer"]))
+        group = groups_by_pair.get(pair)
+        if group is None:
+            raise ValueError(f"realized reuse pair {pair} is absent from physical groups")
+        candidates = candidates_by_pair.get(pair, [])
+        if not candidates:
+            model_status = pair_row.get("model_status")
+            explanations.append(
+                {
+                    "first_buffer": pair[0],
+                    "second_buffer": pair[1],
+                    "physical_group_id": group["id"],
+                    "physical_pool": group["pool"],
+                    "physical_first_range": group["first_range"],
+                    "physical_second_range": group["second_range"],
+                    "physical_overlap_range": group["overlap_range"],
+                    "shared_bytes": group["shared_bytes"],
+                    "candidate_status": model_status,
+                    "missing_access_orders": [],
+                    "actual_sync_group_ids": [],
+                    "critical_path_weight_cycles": 0.0,
+                    "slack_basis": model_status,
+                }
+            )
+            continue
+        for candidate in candidates:
+            recurrence_cycles = candidate.get("candidate_recurrence_cycles")
+            base_ii_cycles = candidate.get("base_ii_lower_bound_cycles")
+            loop_ii_slack = (
+                max(0.0, float(base_ii_cycles) - float(recurrence_cycles))
+                if isinstance(base_ii_cycles, (int, float)) and isinstance(recurrence_cycles, (int, float))
+                else None
+            )
+            explanations.append(
+                {
+                    "first_buffer": pair[0],
+                    "second_buffer": pair[1],
+                    "physical_group_id": group["id"],
+                    "physical_pool": group["pool"],
+                    "physical_first_range": group["first_range"],
+                    "physical_second_range": group["second_range"],
+                    "physical_overlap_range": group["overlap_range"],
+                    "shared_bytes": group["shared_bytes"],
+                    "candidate_index": candidate.get("candidate_index"),
+                    "candidate_status": candidate.get("status"),
+                    "prior_access_order": candidate.get("prior_access_order"),
+                    "next_access_order": candidate.get("next_access_order"),
+                    "missing_access_orders": candidate.get("missing_access_orders", []),
+                    "lowered_source_node": candidate.get("source_node"),
+                    "lowered_source_operation": candidate.get("source_operation"),
+                    "lowered_source_pipe": candidate.get("prior_pipe"),
+                    "lowered_target_node": candidate.get("target_node"),
+                    "lowered_target_operation": candidate.get("target_operation"),
+                    "lowered_target_pipe": candidate.get("next_pipe"),
+                    "actual_sync_group_ids": candidate.get("actual_sync_group_ids", []),
+                    "source_loop_multiplier": candidate.get("source_execution_count"),
+                    "target_loop_multiplier": candidate.get("target_execution_count"),
+                    "critical_path_weight_cycles": candidate.get("weight_cycles", 0.0),
+                    "critical_path_slack_cycles": candidate.get("critical_path_slack_cycles"),
+                    "loop_ii_slack_cycles": loop_ii_slack,
+                    "slack_basis": (
+                        "loop_initiation_interval"
+                        if candidate.get("status") == "loop_carried_scored_v1"
+                        else "whole_function_dag"
+                    ),
+                }
+            )
+    return explanations
 
 
 def score_realized_reuse(
@@ -2286,6 +2518,14 @@ def score_realized_reuse(
             edge["estimated_sync_endpoint_executions"]
         )
     physical_groups = _canonical_physical_reuse_groups(realized, distance_zero_catalog, loop_catalog)
+    executable_realized = [row for row in realized if row.get("executable_in_lowered_schedule")]
+    unmodeled_pipeline_realized = [
+        row for row in realized if row.get("model_status") == "unmodeled_pipeline_serialization"
+    ]
+    executable_physical_groups = _canonical_physical_reuse_groups(
+        executable_realized, distance_zero_catalog, loop_catalog
+    )
+    edge_explanations = _realized_edge_explanations(realized, physical_groups, candidate_scores)
     realized_without_induced_edge = [
         row
         for row in realized
@@ -2299,8 +2539,16 @@ def score_realized_reuse(
         "promoted_pair_count": len(rows),
         "realized_pair_count": len(realized),
         "canonical_physical_reuse_group_count": len(physical_groups),
+        "executable_realized_pair_count": len(executable_realized),
+        "executable_canonical_physical_reuse_group_count": len(executable_physical_groups),
+        "synchronization_predictor_coverage_complete": not unmodeled_pipeline_realized,
+        "unmodeled_pipeline_serialization_realized_pair_count": len(unmodeled_pipeline_realized),
+        "unmodeled_pipeline_serialization_realized_cost": sum(
+            float(row["unit_cost"]) for row in unmodeled_pipeline_realized
+        ),
         "realized_pair_count_without_induced_sync_edge": len(realized_without_induced_edge),
         "unit_realized_cost": sum(float(row["unit_cost"]) for row in realized),
+        "executable_unit_realized_cost": sum(float(row["unit_cost"]) for row in executable_realized),
         "unit_realized_cost_without_induced_sync_edge": sum(
             float(row["unit_cost"]) for row in realized_without_induced_edge
         ),
@@ -2312,6 +2560,8 @@ def score_realized_reuse(
         "estimated_sync_endpoint_executions": sum(pipe_pair_executions.values()),
         "estimated_sync_endpoint_executions_by_pipe_pair": dict(sorted(pipe_pair_executions.items())),
         "canonical_physical_reuse_groups": physical_groups,
+        "executable_canonical_physical_reuse_groups": executable_physical_groups,
+        "edge_explanations": edge_explanations,
         "pairs": rows,
     }
 
@@ -2321,6 +2571,8 @@ def score_reuse_candidates(
     candidates: Sequence[ReuseCandidateRecord],
     model: DurationModel,
     promoted_penalties: Mapping[tuple[int, int], float] | None = None,
+    known_nonmaterialized_access_orders: frozenset[int] = frozenset(),
+    promoted_penalty_reasons: Mapping[tuple[int, int], str] | None = None,
 ) -> dict[str, Any]:
     """Score hypothetical synchronization induced by individual reuse pairs.
 
@@ -2334,8 +2586,12 @@ def score_reuse_candidates(
     the report exposes non-additivity/coalescence instead of pretending pair
     weights are independent.
 
-    Access-site provenance is mandatory. A missing/ambiguous route mapping or
-    missing tagged schedule node is an error, never a zero-cost result.
+    Access-site provenance is mandatory. An access order that survives lowering
+    but lands on an unexpected pipe is an error. An absent access order also
+    fails closed unless the caller supplies independent evidence that lowering
+    removed it. Proven non-materialized candidates cannot induce a
+    synchronization edge, but their logical unit penalty remains visible for
+    comparisons with the solver objective.
     """
     branch_ids = [
         node.get("id")
@@ -2372,7 +2628,16 @@ def score_reuse_candidates(
         for node in record.get("nodes", [])
         if isinstance(node, Mapping) and node.get("kind") == "operation" and isinstance(node.get("id"), int)
     }
+    execution_counts, _ = _node_execution_counts(record)
+    actual_sync_groups_by_edge: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for edge in record.get("sync_edges", []):
+        if not isinstance(edge, Mapping):
+            continue
+        source, target, group = edge.get("source"), edge.get("target"), edge.get("group")
+        if isinstance(source, int) and isinstance(target, int) and isinstance(group, int):
+            actual_sync_groups_by_edge[(source, target)].append(group)
     rows: list[dict[str, Any]] = []
+    materialized_access_orders = {access_order for access_order, _ in indexed_nodes}
     grouped_edges: dict[int, set[tuple[int, int]]] = defaultdict(set)
     for index, candidate in enumerate(candidates):
         if candidate.hazard != "cross_resource":
@@ -2386,26 +2651,27 @@ def score_reuse_candidates(
                 }
             )
             continue
+        joined_sites = _join_candidate_access_sites(
+            candidate,
+            index,
+            indexed_nodes,
+            nodes_by_id,
+            materialized_access_orders,
+            known_nonmaterialized_access_orders,
+        )
+        if isinstance(joined_sites, dict):
+            rows.append(joined_sites)
+            continue
+        (
+            prior_nodes,
+            prior_pipe,
+            prior_pipe_override,
+            next_nodes,
+            next_pipe,
+            next_pipe_override,
+        ) = joined_sites
         prior_route_pipe = _route_pipe(candidate.prior_route)
         next_route_pipe = _route_pipe(candidate.next_route)
-        prior_nodes, prior_pipe, prior_pipe_override = _resolve_candidate_site(
-            indexed_nodes,
-            nodes_by_id,
-            access_order=candidate.prior_access_order,
-            route_pipe=prior_route_pipe,
-        )
-        next_nodes, next_pipe, next_pipe_override = _resolve_candidate_site(
-            indexed_nodes,
-            nodes_by_id,
-            access_order=candidate.next_access_order,
-            route_pipe=next_route_pipe,
-        )
-        if not prior_nodes or not next_nodes:
-            raise ValueError(
-                "candidate site did not join to the expected PTOAS pipe: "
-                f"sites={candidate.prior_access_order}->{candidate.next_access_order}, "
-                f"pipes={prior_route_pipe}->{next_route_pipe}, found={prior_nodes}->{next_nodes}"
-            )
         source = prior_nodes[-1]
         target = next_nodes[0]
         if candidate.loop_carried:
@@ -2442,6 +2708,11 @@ def score_reuse_candidates(
                     "next_pipe_override": next_pipe_override,
                     "source_node": source,
                     "target_node": target,
+                    "source_operation": _node_operation_name(nodes_by_id[source]),
+                    "target_operation": _node_operation_name(nodes_by_id[target]),
+                    "source_execution_count": execution_counts[source],
+                    "target_execution_count": execution_counts[target],
+                    "actual_sync_group_ids": sorted(actual_sync_groups_by_edge[(source, target)]),
                     "source_macro_nodes": prior_nodes,
                     "target_macro_nodes": next_nodes,
                     "common_loop_nodes": common_loops,
@@ -2452,12 +2723,15 @@ def score_reuse_candidates(
             continue
         hypothetical = (source, target, model.sync_latency_cycles, "candidate_sync", index)
         try:
-            with_candidate, _, _, path = _longest_path(durations, [*existing_edges, hypothetical])
+            with_candidate, forward, backward, path = _longest_path(
+                durations, [*existing_edges, hypothetical]
+            )
         except ValueError as error:
             raise ValueError(
                 f"candidate {index} creates a non-loop cycle at schedule edge {source}->{target}"
             ) from error
         weight = max(0.0, with_candidate - base_makespan)
+        edge_path_cycles = forward[source] + model.sync_latency_cycles + backward[target]
         grouped_edges[target].add((source, target))
         rows.append(
             {
@@ -2476,11 +2750,18 @@ def score_reuse_candidates(
                 "next_pipe_override": next_pipe_override,
                 "source_node": source,
                 "target_node": target,
+                "source_operation": _node_operation_name(nodes_by_id[source]),
+                "target_operation": _node_operation_name(nodes_by_id[target]),
+                "source_execution_count": execution_counts[source],
+                "target_execution_count": execution_counts[target],
+                "actual_sync_group_ids": sorted(actual_sync_groups_by_edge[(source, target)]),
                 "source_macro_nodes": prior_nodes,
                 "target_macro_nodes": next_nodes,
                 "status": "scored",
                 "weight_cycles": weight,
                 "makespan_with_candidate_cycles": with_candidate,
+                "candidate_edge_path_cycles": edge_path_cycles,
+                "critical_path_slack_cycles": max(0.0, with_candidate - edge_path_cycles),
                 "critical_path_with_candidate": path,
             }
         )
@@ -2522,6 +2803,7 @@ def score_reuse_candidates(
         loop_counts,
         model.sync_latency_cycles,
         promoted_penalties,
+        promoted_penalty_reasons,
         {(int(edge["source_node"]), int(edge["target_node"])): edge for edge in distance_zero_edges},
         {
             (int(edge["loop_node"]), int(edge["source_node"]), int(edge["target_node"])): edge
@@ -2555,6 +2837,12 @@ def score_reuse_candidates(
             row.get("status") == "loop_carried_scored_v1" for row in rows
         ),
         "unscored_loop_carried_candidate_count": 0,
+        "not_materialized_candidate_count": sum(
+            row.get("status") == "not_materialized_in_schedule" for row in rows
+        ),
+        "unmodeled_pipeline_serialization_pair_count": sum(
+            row["model_status"] == "unmodeled_pipeline_serialization" for row in penalty_pair_weights
+        ),
         "candidates": rows,
         "consumer_groups": consumer_groups,
         "distance_zero_edges": distance_zero_edges,
@@ -3623,6 +3911,32 @@ def _model_from_args(args: argparse.Namespace) -> DurationModel:
     )
 
 
+def _load_nonmaterialized_access_evidence(
+    path: Path | None,
+    *,
+    schedule_path: Path,
+    problem_path: Path,
+) -> frozenset[int]:
+    if path is None:
+        return frozenset()
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
+        raise ValueError(f"{path}: expected non-materialized access evidence schema_version=1")
+    expected = {
+        "schedule_sha256": hashlib.sha256(schedule_path.read_bytes()).hexdigest(),
+        "problem_sha256": hashlib.sha256(problem_path.read_bytes()).hexdigest(),
+    }
+    for key, digest in expected.items():
+        if payload.get(key) != digest:
+            raise ValueError(f"{path}: {key} does not match the scored input")
+    orders = payload.get("nonmaterialized_access_orders")
+    if not isinstance(orders, list) or not all(isinstance(order, int) and order >= 0 for order in orders):
+        raise ValueError(f"{path}: nonmaterialized_access_orders must be non-negative integers")
+    if len(set(orders)) != len(orders):
+        raise ValueError(f"{path}: nonmaterialized_access_orders contains duplicates")
+    return frozenset(orders)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dsa_schedule_model")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3684,6 +3998,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidate_parser.add_argument("--function")
     _add_duration_arguments(candidate_parser)
     candidate_parser.add_argument("--solution", type=Path)
+    candidate_parser.add_argument(
+        "--nonmaterialized-access-evidence",
+        type=Path,
+        help="digest-bound proof for candidate accesses removed before the lowered schedule",
+    )
     candidate_parser.add_argument("-o", "--output", type=Path)
 
     perf_sim_parser = subparsers.add_parser(
@@ -3725,11 +4044,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "score-candidates":
             record, _ = _resolve_schedule_record(args.schedule, args.function)
+            nonmaterialized_access_orders = _load_nonmaterialized_access_evidence(
+                args.nonmaterialized_access_evidence,
+                schedule_path=args.schedule,
+                problem_path=args.problem,
+            )
             result = score_reuse_candidates(
                 record,
                 load_candidate_records(args.problem),
                 _model_from_args(args),
-                load_promoted_reuse_penalties(args.problem),
+                promoted_penalties=load_promoted_reuse_penalties(args.problem),
+                known_nonmaterialized_access_orders=nonmaterialized_access_orders,
+                promoted_penalty_reasons=load_promoted_reuse_penalty_reasons(args.problem),
             )
             if args.solution is not None:
                 result["realized_placement"] = score_realized_reuse(args.problem, args.solution, result)

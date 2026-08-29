@@ -17,7 +17,7 @@ Developers read pass docs sequentially to understand the compilation pipeline. I
 | 02 | `02-unroll_loops.md` | 02nd pass |
 | 03 | `03-ctrl_flow_transform.md` | 03rd pass |
 | 04 | `04-convert_to_ssa.md` | 04th pass |
-| 05 | `05-simplify.md` | 05th pass (also runs as the last pass of the tile pipeline) |
+| 05 | `05-simplify.md` | 05th pass (also runs before `InitMemRef` and near the end of the tile pipeline) |
 | 06 | `06-flatten_call_expr.md` | 06th pass |
 | 07 | `07-outline_hierarchy_scopes.md` | 07th pass |
 | 08 | `08-outline_graph_scopes.md` | Outlines `pl.graph` regions into `FunctionType::Graph` functions; runs immediately before `OutlineIncoreScopes` so the InCore scopes inside a region are outlined on the same terms as those in a hand-written `@pl.jit.graph` function |

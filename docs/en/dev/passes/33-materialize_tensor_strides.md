@@ -21,7 +21,7 @@ Codegen needs one machine-readable contract, so `MaterializeTensorStrides` walks
 
 - `TensorViewCanonical` — `PassPipeline` auto-verifies after the pass using the registry's **strict-mode** verifier (empty stride on a present `TensorView` is rejected — that is the state this pass is responsible for eliminating)
 
-**Position in the default pipeline** (active since RFC #1300 P6): between [`CanonicalizeIOOrder`](32-canonicalize_io_order.md) and [`InitMemRef`](34-init_memref.md). This is the codegen-prep boundary — every layout-mutating pass (`ResolveBackendOpLayouts`, `ExpandMixedKernel`, `SplitVectorKernel`) has finished, and `InitMemRef` is the first consumer that needs explicit stride.
+**Position in the default pipeline** (active since RFC #1300 P6): after [`CanonicalizeIOOrder`](32-canonicalize_io_order.md), immediately before the defensive [`Simplify`](05-simplify.md) and [`InitMemRef`](34-init_memref.md). This is the codegen-prep boundary — every layout-mutating pass (`ResolveBackendOpLayouts`, `ExpandMixedKernel`, `SplitVectorKernel`) has finished, and `InitMemRef` is the first consumer that needs explicit stride.
 
 ## API
 

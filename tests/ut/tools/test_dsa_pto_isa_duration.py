@@ -11,11 +11,13 @@
 
 import json
 import math
+from pathlib import Path
 
 import pytest
 from pypto.tools import dsa_pto_isa_duration, dsa_schedule_model
 
 _REVISION = "a" * 40
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _provider(*, policy: str = "error") -> dsa_pto_isa_duration.PtoIsaDurationProvider:
@@ -245,6 +247,19 @@ def test_provider_snapshot_round_trip_is_portable():
     assert dsa_pto_isa_duration.provider_snapshot_sha256(restored) == (
         dsa_pto_isa_duration.provider_snapshot_sha256(provider)
     )
+
+
+def test_checked_in_integer_trowmax_calibration_is_exact_signature_only():
+    calibration = _REPO_ROOT / ".claude/skills/incore-profiling/dsa_pto_isa_exact_durations_v1.json"
+    payload = json.loads(calibration.read_text())
+    record = payload["instructions"]["TROWMAX"][0]
+
+    model = dsa_schedule_model.calibrate_from_metrics([calibration], dsa_schedule_model.DurationModel())
+    signature_key = dsa_schedule_model._operation_signature_key(record["operation_signature"])
+
+    assert record["cycles"] == 435.0
+    assert model.operation_signature_cycles == {signature_key: 435.0}
+    assert model.calibration_sources == [str(calibration)]
 
 
 def test_snapshot_duration_command_writes_portable_model(tmp_path):

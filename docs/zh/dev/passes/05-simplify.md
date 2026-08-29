@@ -10,10 +10,13 @@
 2. **类型重建**：重新遍历 `TensorType`、`TileType`、`TupleType` 中嵌入的 shape 表达式，使内存中的 IR 与重新解析得到的结果一致。
 3. **标量绑定以辅助折叠 + DCE**：仅被赋值一次的标量 `Var` 会注册到分析器。在函数体顶层赋的常量会被完整绑定，其字面量向所有下游使用处传播；符号值，或循环/分支内部的常量，只贡献一个 `ConstIntBound`——足以折叠 `if expr == 0` 这类恒死的分支守卫，而不会把标量内联到使用点。残留的死绑定随后由保守的标量 DCE 删除。
 
-在 `pass_manager.py` 的 `Default` 策略中本 Pass 运行**两次**：
+在 `pass_manager.py` 的 `Default` 策略中本 Pass 运行**三次**：
 
 - **SSA 后**（在 `ConvertToSSA` 之后、`FlattenCallExpr` 之前）：将闭包捕获的常量（如 `CHUNK_K: Scalar[INDEX] = 512`）传播进 shape 表达式与类型，使后续的 tile lowering Pass 看到的是字面量而不是变量。
-- **tile pipeline 末尾**（在 `DeriveCallDirections` 之后）：清理由内存空间推断、layout 解析等晚期 lowering 暴露出来的可折叠表达式。
+- **内存规划前**（在 `MaterializeTensorStrides` 之后、`InitMemRef` 之前）：删除 pipeline slot 替换后留下的静态恒死分支，避免不可达 access 进入生命周期或 DSA reuse-penalty candidate。
+- **tile pipeline 末段**（在 `MaterializeDistTensorCtx` 之后、
+  `LegalizeGraphBoundary` 之前）：清理由内存空间推断、layout 解析以及后续
+  host/distributed lowering 暴露出来的可折叠表达式。
 
 **需要 (Requires)**：无。
 
@@ -26,7 +29,8 @@
 ## 使用时机
 
 - 在 SSA 转换之后、tile pipeline 检查类型/shape 之前，把标量常量传播进去。
-- 在 tile pipeline 末尾作为清理 Pass，确保下游产物（打印的 IR、codegen）不会残留 `K + 0` 或 `idx * 1` 这类痕迹。
+- 在 `InitMemRef` 之前运行，使分配分析只观察可达的 tile access。
+- 在 tile pipeline 末段作为清理 Pass，确保下游产物（打印的 IR、codegen）不会残留 `K + 0` 或 `idx * 1` 这类痕迹。
 - 任何会产生新表达式的 Pass 之后；Simplify 代价低且幂等，可以放心地防御性地插入。
 
 ## API

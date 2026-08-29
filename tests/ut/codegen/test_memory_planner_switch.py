@@ -189,6 +189,12 @@ def test_dsa_rp_pipeline_replaces_legacy_reuse_but_assigns_addresses():
     assert "MaterializeSemanticAliases" in pass_names
     assert "MemoryReuse" not in pass_names
     assert "AllocateMemoryAddr" in pass_names
+    simplify_indices = [index for index, name in enumerate(pass_names) if name == "Simplify"]
+    strides_index = pass_names.index("MaterializeTensorStrides")
+    init_index = pass_names.index("InitMemRef")
+    allocation_index = pass_names.index("AllocateMemoryAddr")
+    assert any(strides_index < index < init_index for index in simplify_indices)
+    assert any(index > allocation_index for index in simplify_indices)
 
 
 def test_ptoas_pipeline_skips_reuse_keeps_semantic_aliases():

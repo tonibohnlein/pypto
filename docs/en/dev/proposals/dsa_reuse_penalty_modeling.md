@@ -462,9 +462,28 @@ operation location in a `pypto.access.N` NameLoc. `N` is attached to the source
 Call when the DSA problem is constructed and preserved through later lowering;
 it is not recomputed from lowered statement order. It therefore matches the
 candidate record's `sites=prior->next` field. PTOAS copies that integer to
-the schedule graph. The join fails closed when a site is absent or when the
-candidate route has no verified PTOAS-pipe mapping; SSA node numbers and source
-line numbers are never treated as interchangeable coordinates.
+the schedule graph. A defensive `Simplify` now runs before `InitMemRef`: it
+removes statically dead pipeline-slot branches before they can contribute DSA
+lifetimes or candidates. The join fails closed when a site is absent or when
+the candidate route has no verified PTOAS-pipe mapping; SSA node numbers and
+source line numbers are never treated as interchangeable coordinates.
+
+Historical problems created before that boundary may still contain candidate
+records for operations that do not exist in their paired lowered schedule.
+They may be scored only with an explicit `--nonmaterialized-access-evidence`
+document whose SHA-256 fields bind it to that exact problem and schedule. Such
+records retain their logical unit penalty for auditing but contribute zero to
+the executable relation, physical-group, synchronization-execution, and
+critical-path predictors. This exception is evidence-driven; without it the
+join continues to fail closed.
+
+Solver-promoted `pipeline_serialization` penalties are a different case. They
+describe relaxed pipeline-stage separation and do not carry producer/consumer
+access records. The logical objective must retain them, but access-,
+synchronization-, and critical-path-based predictors must report incomplete
+coverage whenever a placement realizes one of these relations. They must not
+be treated as proven non-materialized operations or assigned a modeled cost of
+zero.
 
 The first candidate-weight prototype adds a hypothetical completion edge from
 the terminal macro phase at the prior site to the initial macro phase at the
@@ -480,6 +499,14 @@ python -m pypto.tools.dsa_schedule_model score-candidates \
     schedule.jsonl problem.dsa.json --model duration-v0.json \
     -o candidate-weights.json
 ```
+
+When a solution is supplied, the report also contains `edge_explanations`.
+Each row traces one logical reuse relation through its canonical overlapping
+physical range, lowered producer and consumer operations, inserted sync group,
+loop execution multiplier, and critical-path or recurrence slack. Duration
+calibration is keyed by the full pinned PTO-ISA signature; unsupported
+signatures fail closed rather than falling back to an instruction-family
+median.
 
 Version 1 retains the acyclic longest-path score for distance-zero candidates
 and adds a lower-bound score for distance-one candidates. It joins both PTOAS
