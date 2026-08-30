@@ -97,9 +97,10 @@ suppression rule。
 - route class 不足以分类，同一路由可能 harmful、neutral 或被其他 release 覆盖；
 - loop frequency 会放大暴露在 hot path 上的 handoff，但不能让已覆盖 handoff 变贵；
 - 同一 consumer 的多个 predecessor 更接近“最新 predecessor”而不是简单求和；
-- 受控 Gumbel ablation 现在支持负的 *analysis marginal*：恢复 `(2,39)` 会删除一个
-  barrier，并在两台设备上提速 2.1-2.35%。solver 应直接接受负权重，还是用另一种结构化
-  objective 表达该 relation，仍是开放问题。
+- 受控 Gumbel ablation 现在支持负的 *relation marginal*：恢复 `(2,39)` 在两台设备上
+  提速 2.1-2.35%。它同时删除一个静态 ELSE-arm barrier，但后续 branch-profiled validation
+  表明，大部分收益来自该 barrier 根本不执行的 THEN block。因此 relation effect 是因果
+  证据，barrier mechanism 还不是。
 
 最新 exact ordered-pair study 给出了对旧 v4 policy 的两个重要反例：
 
@@ -239,7 +240,8 @@ p(r | P) = L(InsertSync(P + r)) - L(InsertSync(P))
 graph 不完整时 fail closed。它目前是 analysis oracle，还不是 DSA solver 使用的稀疏近似。
 
 受控 Gumbel 实验在 operation order 与 address-translation control 不变的情况下隔离了
-四条 relation：
+四条 relation。下表的 synchronization 变化是各 relation contrast 的相关量，本身不是
+因果归因：
 
 | Relation | 最终 synchronization 变化 | 双设备 latency 结果 |
 | -------- | ------------------------- | ------------------- |
@@ -248,7 +250,7 @@ graph 不完整时 fail closed。它目前是 analysis oracle，还不是 DSA so
 | `(3,38)` | 最终增加一个 barrier | 约 `+0.4%` |
 | `(38,79)` | 增加 set/wait site，但不增加 barrier | latency null |
 
-对于 `(2,39)`，D0 包含从上一轮 `trowargmax` read 到下一轮 else-arm `tmov` write 的
+从结构上看，对于 `(2,39)`，D0 包含从上一轮 `trowargmax` read 到下一轮 else-arm `tmov` write 的
 loop-carried V-to-V WAR，因此 InsertSync 在 `tmov` 前插入 barrier。恢复 overlap 后，
 `trowargmax` scratch 与下一轮 MTE2 load destination alias，新增 V-to-MTE2 recurrence；
 已有的 MTE2-to-V load-completion handoff 随后使直接 V-to-V dependency 由传递关系蕴含。
@@ -265,10 +267,10 @@ implication，而不是 event coalescing。
 | `(38,42)` | `144 -> 153` | scalar `tgetval` -> post-loop `texpands` | 增加 S-to-V handoff `59 -> 61` 与 V barrier `52 -> 61` | loop 后执行一次 |
 | `(38,79)` | `144 -> 194/195` | scalar `tgetval` -> branch `tadd`/`tmov` | 增加 branch-lifted S-to-V handoff `59 -> 64` | loop 后执行一次 |
 
-其余 relation 将 exposed work 与结构计数区分开来。`(38,42)` 把 scalar-to-vector wait
-放在 post-loop path 上，产生可测的 exposed delay；`(3,38)` 增加一个具有较多 slack 的
-V barrier；`(38,79)` 增加 event pair，但其 delay 完全隐藏。因此，仅统计 logical reuse
-或 barrier 都不能构成可靠的 penalty model。
+其余 relation 将实测 effect 与结构计数区分开来。`(38,42)` 增加 post-loop
+synchronization，并产生可复现的正 effect；`(3,38)` 增加 V barrier，但仅慢约 0.4%；
+`(38,79)` 增加 event pair，却是 latency null。因此，仅统计 logical reuse 或 barrier
+都不能构成可靠的 penalty model。
 
 branch-aware schedule graph 为每个 `(branch-or-loop marker, pipe)` 建立一个零 duration
 control point。then/else arm 从同一 per-pipe frontier 开始，并通过取最大值汇合，绝不被
@@ -292,40 +294,41 @@ set 提升到 branch join 是 InsertSync transformation，不是简单加入一�
 
 | Relation | 预测 marginal | 既有双设备结果 | 解释 |
 | -------- | ------------- | -------------- | ---- |
-| `(2,39)` | `0` cycle | 约 `-2.1%/-2.3%` | 未捕获 beneficial barrier removal |
+| `(2,39)` | `0` cycle | 约 `-2.1%/-2.3%` | 正确显示 collapsed DAG 上没有 barrier exposure，但不能解释 placement effect |
 | `(3,38)` | `0` cycle | 约 `+0.4%` | effect 很小，按 slack 处理是合理的 |
 | `(38,42)` | `+189` cycle | 约 `+1.9%` | 符号正确，但低估幅度 |
 | `(38,79)` | `+56` cycle | null | 较小的结构性 false positive |
 
-下一步实现是 queue/event 模型
-`static_unrolled_pipe_event_branch_extremes_v2`。它显式展开静态有界 loop，保留每条
-pipe 的 FIFO issue order，把 loop-carried event 从 iteration `i` 映射到 `i + 1`，并把
-已发射 barrier 作为显式的 per-pipe pipeline break 计价。PTO-ISA 支持这一机制：barrier
-会 flush 该 pipe 的 pending tail、清空 queue，因此后续 operation 必须重新支付 startup。
-该项由 `pipe_barrier_cycles` 提供；缺失某条 pipe 的 calibration 时会报告模型不完整，
-而不是填入默认猜测。
+queue/event 模型 `static_unrolled_pipe_event_branch_extremes_v2` 显式展开静态有界 loop，
+保留每条 pipe 的 FIFO issue order，并把 loop-carried event 从 iteration `i` 映射到
+`i + 1`。前瞻设备验证独立恢复出实际 branch profile：六个 THEN 和两个 ELSE block。
+在十个 topology contrast 上，该模型消除了 unsigned reuse count 的两个符号错误，但没有
+胜过 emitted barrier-site count，并且漏掉了核心 `(2,39)` 结果：
 
-schedule export 仍不包含动态 branch outcome。因此模型报告 all-then/all-else *extreme*，
-即同一 branch 的所有动态 occurrence 采用同一选择，而不再假装 maximum arm 就是实测
-invocation。对于每轮选择不同的 mixed branch profile，这些 extreme 并不是严格 bound。
+- `(2,39)`：实际 profile 的 marginal 为 `0` cycle；既有结果为约
+  `-2.1%/-2.3%` 的 beneficial effect。
+- `(3,38)`：active 时为 `+63` cycle；既有结果为约 `+0.4%` 的小幅 regression。
+- `(38,42)`：`+192` cycle；既有结果为约 `+1.9%` 的 regression。
+- `(38,79)`：`+56` cycle；既有结果为 latency null。
 
-仅使用 PTO-ISA 固定的一 cycle barrier instruction floor 进行诊断（不是已校准的
-tail-plus-restart cost），Gumbel 回顾结果变为：
+被删除的 node-49 barrier 位于 ELSE arm。它在六个较长的 THEN block 中不会执行，但这些
+block 承担了大部分实测收益。因此，该实验**没有**证明删除 barrier 导致 `(2,39)` 提速。
+要支持该结论，必须执行 placement-by-barrier 2x2 factorial，并在 device disassembly 后加入
+same-footprint code-layout control。
 
-| Relation | branch extreme 上的 queue/event marginal | 既有结果 |
-| -------- | ----------------------------------------- | -------- |
-| `(2,39)` | `[-63, 0]` cycle | beneficial，约 `-2.1%/-2.3%` |
-| `(3,38)` | `[0, +63]` cycle | 小幅 regression，约 `+0.4%` |
-| `(38,42)` | `[+192, +1090]` cycle | regression，约 `+1.9%` |
-| `(38,79)` | `[+56, +954]` cycle | latency null |
+同一验证否定了 per-pipe constant：device-0 上 `(3,38)` 与 `(38,42)` 得到的 calibration
+相差 4.40x。PTO-ISA 解释了原因：barrier cost 包含 barrier instruction、排空 predecessor
+尚未完成的 tail work、清空 stream，以及 successor 重新支付 startup。公共 evaluator 因此
+还会报告 `queue_drain_restart_signed_marginal`，其 site cost 为：
 
-这是有用的方向性改进：没有拟合 device latency，就暴露了 beneficial barrier removal
-以及另外两条 harmful addition。但它还不是经过验证的 penalty oracle：`(38,79)` 仍是小的
-false positive，实测 invocation 使用 mixed loop-branch profile，完整的 tail/startup split
-仍需 sequence-matched calibration。PTO-ISA 定义 queue/flush/restart 机制，penalty model
-使用的参数则由真实 device measurement 验证。`evaluate` 保留旧的 scalar prediction，并额外
-报告 `queue_event_signed_marginal`，其中包含每个 scenario 的 delta；只有所有 extreme
-方向一致时才给出严格方向。
+```text
+barrier instruction + predecessor pending tail + successor stream restart
+```
+
+startup/tail split 按完整 operation signature 从固定 PTO-ISA 数据或显式 calibration 中解析；
+无法解析的 transfer 会 fail closed。node 49 的 `tmov` 正应如此：在 factorial 与 disassembly
+确认 device mechanism 前不能拟合数值。barrier dependency provenance 直接来自公共 export
+字段 `sync_groups.operations.dependency_node`，evaluator 不再需要 campaign-private 重建路径。
 
 ```bash
 python -m pypto.tools.dsa_schedule_model evaluate arm-manifest.json \

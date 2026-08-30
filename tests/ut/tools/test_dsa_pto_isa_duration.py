@@ -76,6 +76,32 @@ def test_formula_and_any_dtype_lookup_match_pto_isa_rounding():
     assert exp.cycles == 159
 
 
+def test_pipeline_estimate_uses_only_explicit_splits_and_fails_closed_on_fitted_totals():
+    provider = _provider()
+    vector = _node("pto.tmul", "PIPE_V", "!pto.tile_buf<vec, 8x128xf32, valid=?x?>")
+    transfer = _node(
+        "pto.tload",
+        "PIPE_MTE2",
+        "!pto.partition_tensor_view<1x1024xf32>",
+        "!pto.tile_buf<vec, 1x1024xf32, valid=?x?>",
+    )
+    matmul = _node(
+        "pto.tmatmul",
+        "PIPE_M",
+        "!pto.tile_buf<left, 16x512xf32, valid=?x?>",
+        "!pto.tile_buf<right, 512x16xf32, valid=?x?>",
+    )
+
+    estimate = provider.estimate_pipeline(matmul)
+
+    assert estimate is not None
+    assert estimate.startup_cycles == 6.0
+    assert estimate.pending_tail_cycles == 0.0
+    assert estimate.source == "pto_isa_matmul_head"
+    assert provider.estimate_pipeline(vector) is None
+    assert provider.estimate_pipeline(transfer) is None
+
+
 def test_transfer_converts_gib_per_second_to_cycles():
     provider = _provider()
     estimate = provider.estimate(

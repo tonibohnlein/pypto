@@ -203,6 +203,23 @@ class DurationEstimate:
     fallback: bool = False
 
 
+@dataclass(frozen=True)
+class PipelineEstimate:
+    """Incremental pipeline state used at a synchronization boundary.
+
+    ``startup_cycles`` is repaid by this operation when a barrier has emptied
+    its execution stream. ``pending_tail_cycles`` is work left behind by this
+    operation for a later barrier to drain. These are deliberately separate
+    from the inclusive operation duration: a single-operation measurement can
+    identify their sum, but not an arbitrary head/tail split.
+    """
+
+    startup_cycles: float
+    pending_tail_cycles: float
+    source: str
+    detail: str
+
+
 @dataclass
 class PtoIsaDurationProvider:
     """Portable snapshot of the A2/A3 PTO-ISA lightweight duration inputs."""
@@ -337,6 +354,67 @@ class PtoIsaDurationProvider:
             return self._estimate_perf_sim_default(op_name, operand_types, result_types)
         return self._unsupported(op_name, "operation is not supported by PTO-ISA lightweight A2/A3 model")
 
+    def estimate_pipeline(self, node: Mapping[str, Any]) -> PipelineEstimate | None:
+        """Return a pinned stream-start/tail split when PTO-ISA defines one.
+
+        This mirrors the A2/A3 CCE mock's queue contract rather than deriving a
+        per-pipe constant. The matmul model has an explicit six-cycle head, and
+        the deterministic Perf-Sim fallback has an explicit one- or two-cycle
+        head. Fitted formula bias and transfer bandwidth estimate inclusive
+        cost but do not expose a startup/pending-tail split, so both fail closed
+        here unless an exact-signature override is supplied by the caller.
+        """
+        op_name = node.get("op_name")
+        operation = node.get("operation")
+        if not isinstance(op_name, str) or not isinstance(operation, Mapping):
+            return None
+        operand_types = operation.get("operand_types")
+        result_types = operation.get("result_types", [])
+        if (
+            not isinstance(operand_types, list)
+            or not all(isinstance(item, str) for item in operand_types)
+            or not isinstance(result_types, list)
+            or not all(isinstance(item, str) for item in result_types)
+        ):
+            return None
+        tiles = [
+            tile for item in [*operand_types, *result_types] if (tile := parse_tile_type(item)) is not None
+        ]
+
+        if op_name in _MATMUL_OPS:
+            lhs = next((tile for tile in tiles if tile.scope == "left"), None)
+            rhs = next((tile for tile in tiles if tile.scope == "right"), None)
+            if lhs is not None and rhs is not None and lhs.cols == rhs.rows:
+                return PipelineEstimate(
+                    startup_cycles=6.0,
+                    pending_tail_cycles=0.0,
+                    source="pto_isa_matmul_head",
+                    detail="A2/A3 lightweight matmul model uses an explicit six-cycle head",
+                )
+        if op_name in _PERF_SIM_DEFAULT_OPS:
+            result_tiles = [tile for item in result_types if (tile := parse_tile_type(item)) is not None]
+            operand_tiles = [tile for item in operand_types if (tile := parse_tile_type(item)) is not None]
+            if op_name in _PERF_SIM_SOURCE_WORK_OPS:
+                work_tile = operand_tiles[0] if operand_tiles else None
+            else:
+                work_tile = result_tiles[0] if result_tiles else (operand_tiles[0] if operand_tiles else None)
+            if work_tile is not None:
+                startup = 1.0 if op_name == "pto.ttrans" else 2.0
+                return PipelineEstimate(
+                    startup_cycles=startup,
+                    pending_tail_cycles=0.0,
+                    source="pto_isa_perf_sim_default_head",
+                    detail=f"{op_name} deterministic fallback head={startup}; vector tail=0",
+                )
+        if op_name in _SCALAR_STAGE_OPS:
+            return PipelineEstimate(
+                startup_cycles=1.0,
+                pending_tail_cycles=0.0,
+                source="pto_isa_perf_sim_scalar_stage",
+                detail="scalar stage fallback is one cycle with no deferred tail",
+            )
+        return None
+
     def _estimate_scalar_stage(
         self,
         node: Mapping[str, Any],
@@ -463,7 +541,7 @@ class PtoIsaDurationProvider:
         )
 
     def _lookup_formula(self, op: str, dtype: str, cols: int) -> FormulaParameter | None:
-        candidates = [(dtype, cols)]
+        candidates: list[tuple[str, int | None]] = [(dtype, cols)]
         if op in _ANY_PARAMETER_OPS:
             candidates.extend(((dtype, None), ("any", cols), ("any", None)))
         for candidate_dtype, candidate_cols in candidates:
