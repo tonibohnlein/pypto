@@ -288,7 +288,7 @@ set 提升到 branch join 是 InsertSync transformation，不是简单加入一�
 
 纯主机回顾分析使用产品 PTOAS v0.57 InsertSync 实现重建了全部八个 Gumbel endpoint。
 每个 endpoint 都有 93 个 operation node、100% exact/pinned duration coverage，以及完整的
-结构化 control-flow graph。但带符号 oracle 仍不能解释实测排序：
+结构化 control-flow graph。但折叠后的 operation-only 带符号 oracle 仍不能解释实测排序：
 
 | Relation | 预测 marginal | 既有双设备结果 | 解释 |
 | -------- | ------------- | -------------- | ---- |
@@ -297,11 +297,35 @@ set 提升到 branch join 是 InsertSync transformation，不是简单加入一�
 | `(38,42)` | `+189` cycle | 约 `+1.9%` | 符号正确，但低估幅度 |
 | `(38,79)` | `+56` cycle | null | 较小的结构性 false positive |
 
-修复后的 graph 在结构上完整，但插入的 barrier/set/wait instruction 仍没有经过校准的执行
-duration。此外，另一条 recurrence 的 initiation-interval lower bound 为 5,995 cycle，
-因此当前 longest-path maximum 会掩盖被删除的 `(2,39)` barrier。不能用这四行拟合临时
-barrier 常数。下一步 calibration 必须直接建模 synchronization instruction 的执行与重叠，
-再用更多合法 ablation 检验冻结后的 oracle。
+下一步实现是 queue/event 模型
+`static_unrolled_pipe_event_branch_extremes_v2`。它显式展开静态有界 loop，保留每条
+pipe 的 FIFO issue order，把 loop-carried event 从 iteration `i` 映射到 `i + 1`，并把
+已发射 barrier 作为显式的 per-pipe pipeline break 计价。PTO-ISA 支持这一机制：barrier
+会 flush 该 pipe 的 pending tail、清空 queue，因此后续 operation 必须重新支付 startup。
+该项由 `pipe_barrier_cycles` 提供；缺失某条 pipe 的 calibration 时会报告模型不完整，
+而不是填入默认猜测。
+
+schedule export 仍不包含动态 branch outcome。因此模型报告 all-then/all-else *extreme*，
+即同一 branch 的所有动态 occurrence 采用同一选择，而不再假装 maximum arm 就是实测
+invocation。对于每轮选择不同的 mixed branch profile，这些 extreme 并不是严格 bound。
+
+仅使用 PTO-ISA 固定的一 cycle barrier instruction floor 进行诊断（不是已校准的
+tail-plus-restart cost），Gumbel 回顾结果变为：
+
+| Relation | branch extreme 上的 queue/event marginal | 既有结果 |
+| -------- | ----------------------------------------- | -------- |
+| `(2,39)` | `[-63, 0]` cycle | beneficial，约 `-2.1%/-2.3%` |
+| `(3,38)` | `[0, +63]` cycle | 小幅 regression，约 `+0.4%` |
+| `(38,42)` | `[+192, +1090]` cycle | regression，约 `+1.9%` |
+| `(38,79)` | `[+56, +954]` cycle | latency null |
+
+这是有用的方向性改进：没有拟合 device latency，就暴露了 beneficial barrier removal
+以及另外两条 harmful addition。但它还不是经过验证的 penalty oracle：`(38,79)` 仍是小的
+false positive，实测 invocation 使用 mixed loop-branch profile，完整的 tail/startup split
+仍需 sequence-matched calibration。PTO-ISA 定义 queue/flush/restart 机制，penalty model
+使用的参数则由真实 device measurement 验证。`evaluate` 保留旧的 scalar prediction，并额外
+报告 `queue_event_signed_marginal`，其中包含每个 scenario 的 delta；只有所有 extreme
+方向一致时才给出严格方向。
 
 ```bash
 python -m pypto.tools.dsa_schedule_model evaluate arm-manifest.json \
