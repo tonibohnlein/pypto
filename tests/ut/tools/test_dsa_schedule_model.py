@@ -274,6 +274,182 @@ def test_pre_codegen_sync_summary_keeps_duplicate_barrier_records_distinct():
     assert summary["active_record_site_count"] == 2
 
 
+def test_queue_event_model_prices_a_calibrated_pipe_break_once_per_site():
+    record = _record()
+    record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "operations": [{"node": 2, "type": "pipe_barrier", "dependency_node": 0}],
+        }
+    ]
+    model = _ten_cycle_model()
+    model.pipe_barrier_cycles = {"PIPE_V": 3.0}
+
+    queue = dsa_schedule_model.score_schedule(record, model)["queue_event_model"]
+
+    assert queue["pipeline_break_model_complete"] is True
+    assert queue["baseline_makespan_cycles"] == 20.0
+    assert queue["full_makespan_cycles"] == 23.0
+    assert queue["synchronization_exposure_cycles"] == 3.0
+    assert queue["scenarios"][0]["calibrated_pipe_barrier_site_count"] == 1
+
+
+def test_queue_event_model_reports_uncalibrated_pipe_breaks():
+    record = _record()
+    record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "operations": [{"node": 2, "type": "pipe_barrier", "dependency_node": 0}],
+        }
+    ]
+
+    queue = dsa_schedule_model.score_schedule(record, _ten_cycle_model())["queue_event_model"]
+
+    assert queue["pipeline_break_model_complete"] is False
+    assert queue["scenarios"][0]["uncalibrated_pipe_barrier_sites"] == [
+        {"node": 2, "pipe": "PIPE_V", "group": 4}
+    ]
+
+
+def test_duration_model_round_trip_preserves_pipe_barrier_calibration():
+    model = _ten_cycle_model()
+    model.pipe_barrier_cycles = {"PIPE_V": 3.0, "PIPE_ALL": 1.0}
+
+    restored = dsa_schedule_model.DurationModel.from_json(model.to_json())
+
+    assert restored.pipe_barrier_cycles == model.pipe_barrier_cycles
+
+
+def test_queue_event_model_reports_conditional_path_bounds():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 10,
+            "branch": 12,
+            "end": 14,
+            "branch_stack": [],
+            "loop_stack": [],
+        },
+        {**_operation(0, "PIPE_V", "pto.tadd"), "branch_stack": [10]},
+        {
+            "id": 12,
+            "kind": "branch",
+            "branch_kind": "ELSE_BEGIN",
+            "begin": 10,
+            "branch": 12,
+            "end": 14,
+            "branch_stack": [10],
+            "loop_stack": [],
+        },
+        {**_operation(2, "PIPE_V", "pto.tmuls"), "branch_stack": [12]},
+        {
+            "id": 14,
+            "kind": "branch",
+            "branch_kind": "IF_END",
+            "begin": 10,
+            "branch": 12,
+            "end": 14,
+            "branch_stack": [],
+            "loop_stack": [],
+        },
+    ]
+    record["stream_edges"] = []
+    record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "operations": [{"node": 2, "type": "pipe_barrier", "dependency_node": 0}],
+        }
+    ]
+    model = _ten_cycle_model()
+    model.pipe_barrier_cycles = {"PIPE_V": 3.0}
+
+    queue = dsa_schedule_model.score_schedule(record, model)["queue_event_model"]
+
+    assert queue["scenario_count"] == 2
+    assert queue["minimum_full_makespan_cycles"] == 10.0
+    assert queue["maximum_full_makespan_cycles"] == 13.0
+    assert queue["mixed_iteration_branch_profile_available"] is False
+
+
+def test_queue_event_model_multiplies_barrier_cost_across_static_loop():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 11,
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
+        _operation(0, "PIPE_V", "pto.tadd", [10]),
+        {
+            "id": 11,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 11,
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
+    ]
+    record["stream_edges"] = []
+    record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "operations": [{"node": 0, "type": "pipe_barrier", "dependency_node": 10}],
+        }
+    ]
+    model = _ten_cycle_model()
+    model.pipe_barrier_cycles = {"PIPE_V": 3.0}
+
+    queue = dsa_schedule_model.score_schedule(record, model)["queue_event_model"]
+
+    assert queue["baseline_makespan_cycles"] == 40.0
+    assert queue["full_makespan_cycles"] == 52.0
+
+
+def test_queue_event_model_rejects_expansion_before_allocating_large_graph():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 11,
+            "static_trip_count": 300_000,
+            "loop_stack": [],
+        },
+        _operation(0, "PIPE_V", "pto.tadd", [10]),
+        {
+            "id": 11,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 11,
+            "static_trip_count": 300_000,
+            "loop_stack": [],
+        },
+    ]
+    record["stream_edges"] = []
+
+    with pytest.raises(ValueError, match="resource-safe node budget"):
+        dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+
 def test_latency_graph_is_incomplete_when_export_omits_barrier_dependencies():
     record = _record()
     record["export_limitations"] = {"barrier_dependency_nodes_missing": 1}
@@ -2831,6 +3007,22 @@ def test_evaluate_arm_manifest_scores_direction_and_rank(tmp_path):
     assert result["summary"]["direction_accuracy"] == 1.0
     assert result["comparisons"][0]["predicted_relative_delta"] == 1.0
     assert result["comparisons"][0]["signed_marginal_sync_cost_cycles"] == 20.0
+    assert result["comparisons"][0]["queue_event_signed_marginal"] == {
+        "model_version": "static_unrolled_pipe_event_branch_extremes_v2",
+        "pipeline_break_model_complete": True,
+        "mixed_iteration_branch_profile_available": False,
+        "minimum_delta_cycles": 20.0,
+        "maximum_delta_cycles": 20.0,
+        "direction_conclusion": "HARMFUL_ALL_BRANCH_EXTREMES",
+        "scenarios": [
+            {
+                "branch_choices": {},
+                "baseline_cycles": 20.0,
+                "candidate_cycles": 40.0,
+                "delta_cycles": 20.0,
+            }
+        ],
+    }
     assert result["comparisons"][0]["observed_relative_delta"] == 1.0
     assert result["comparisons"][0]["direction_correct"] is True
     assert result["comparisons"][0]["baseline_exact_duration_coverage"] == 1.0
@@ -2885,6 +3077,88 @@ def test_evaluate_arm_manifest_preserves_negative_marginal_sync_cost(tmp_path):
     assert row["signed_marginal_sync_cost_cycles"] == -20.0
     assert row["predicted_direction"] == -1
     assert "negative values are permitted" in result["marginal_cost_metric"]
+
+
+def test_evaluate_arm_manifest_compares_matching_branch_extremes(tmp_path):
+    def branch_record(barrier_node: int) -> dict:
+        record = _record()
+        record["nodes"] = [
+            {
+                "id": 10,
+                "kind": "branch",
+                "branch_kind": "IF_BEGIN",
+                "begin": 10,
+                "branch": 12,
+                "end": 14,
+                "branch_stack": [],
+                "loop_stack": [],
+            },
+            {**_operation(0, "PIPE_V", "pto.tadd"), "branch_stack": [10]},
+            {
+                "id": 12,
+                "kind": "branch",
+                "branch_kind": "ELSE_BEGIN",
+                "begin": 10,
+                "branch": 12,
+                "end": 14,
+                "branch_stack": [10],
+                "loop_stack": [],
+            },
+            {**_operation(2, "PIPE_V", "pto.tmuls"), "branch_stack": [12]},
+            {
+                "id": 14,
+                "kind": "branch",
+                "branch_kind": "IF_END",
+                "begin": 10,
+                "branch": 12,
+                "end": 14,
+                "branch_stack": [],
+                "loop_stack": [],
+            },
+        ]
+        record["stream_edges"] = []
+        record["sync_groups"] = [
+            {
+                "id": 4,
+                "src_pipe": "PIPE_V",
+                "dst_pipe": "PIPE_V",
+                "operations": [{"node": barrier_node, "type": "pipe_barrier", "dependency_node": 10}],
+            }
+        ]
+        return record
+
+    baseline = tmp_path / "baseline.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+    baseline.write_text(json.dumps(branch_record(0)) + "\n")
+    candidate.write_text(json.dumps(branch_record(2)) + "\n")
+    manifest = tmp_path / "comparisons.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "comparisons": [
+                    {
+                        "case": "branch-specific-barrier",
+                        "split": "development",
+                        "baseline_arm": "D0",
+                        "candidate_arm": "O0",
+                        "baseline_schedule": baseline.name,
+                        "candidate_schedule": candidate.name,
+                    }
+                ],
+            }
+        )
+    )
+    model = _ten_cycle_model()
+    model.pipe_barrier_cycles = {"PIPE_V": 3.0}
+
+    result = dsa_schedule_model.evaluate_arm_manifest(manifest, model)
+
+    marginal = result["comparisons"][0]["queue_event_signed_marginal"]
+    assert marginal["minimum_delta_cycles"] == -3.0
+    assert marginal["maximum_delta_cycles"] == 3.0
+    assert marginal["direction_conclusion"] == "BRANCH_PATH_DEPENDENT"
+    assert [row["delta_cycles"] for row in marginal["scenarios"]] == [3.0, -3.0]
 
 
 def test_evaluate_arm_manifest_rejects_incomplete_latency_graph(tmp_path):

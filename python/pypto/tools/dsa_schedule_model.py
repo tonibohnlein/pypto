@@ -23,8 +23,12 @@ Version 0 aggregates the work of statically bounded loops for whole-function
 DAG scores and models structured if/else regions as mutually exclusive
 per-pipe paths. Candidate scoring additionally evaluates distance-one edges
 with a version-1 loop initiation-interval lower bound: the maximum of per-pipe
-work and every supported recurrence cycle. This remains a structural model,
-not a cycle-accurate prediction. Active Final-SyncIR records and hypothetical
+work and every supported recurrence cycle. The experimental queue/event model
+instead expands static loop occurrences, preserves per-pipe FIFO order, and
+prices calibrated pipeline breaks at emitted barriers. Because invocation
+branch outcomes are not exported, it reports all-then/all-else extremes rather
+than claiming an input-specific path. This remains a structural model, not a
+cycle-accurate prediction. Active Final-SyncIR records and hypothetical
 candidate synchronization endpoints are reported separately: a redundant
 precedence edge can have zero DAG extension while still creating synchronization
 pressure.  These are explicitly pre-codegen quantities, not counts of emitted
@@ -35,6 +39,7 @@ barrier dependency that the collapsed operation-only DAG cannot represent.
 import argparse
 import copy
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -130,6 +135,8 @@ _ROUTE_PIPE_JOIN_EXCEPTIONS = {
     ("PIPE_V", "PIPE_S", "pto.tsetval"): "ptoas_v057_tsetval_schedule_pipe",
 }
 
+_MAX_QUEUE_EVENT_EXPANDED_NODES = 250_000
+
 
 @dataclass(frozen=True)
 class PipeParameters:
@@ -155,6 +162,7 @@ class DurationModel:
     model_version: str = "duration_v1"
     calibration_status: str = "unconfigured"
     sync_latency_cycles: float = 0.0
+    pipe_barrier_cycles: dict[str, float] = field(default_factory=dict)
     pipe_parameters: dict[str, PipeParameters] = field(default_factory=_default_pipe_parameters)
     operation_cycles: dict[str, float] = field(default_factory=dict)
     operation_signature_cycles: dict[str, float] = field(default_factory=dict)
@@ -184,6 +192,12 @@ class DurationModel:
         raw_signatures = value.get("operation_signature_cycles", {})
         if not isinstance(raw_signatures, Mapping):
             raise ValueError("operation_signature_cycles must be an object")
+        raw_barriers = value.get("pipe_barrier_cycles", {})
+        if not isinstance(raw_barriers, Mapping):
+            raise ValueError("pipe_barrier_cycles must be an object")
+        barrier_cycles = {str(pipe): float(cycles) for pipe, cycles in raw_barriers.items()}
+        if any(not math.isfinite(cycles) or cycles < 0 for cycles in barrier_cycles.values()):
+            raise ValueError("pipe_barrier_cycles must contain finite non-negative values")
         raw_provider = value.get("pto_isa_provider")
         if raw_provider is not None and not isinstance(raw_provider, Mapping):
             raise ValueError("pto_isa_provider must be an object")
@@ -192,6 +206,7 @@ class DurationModel:
             model_version=str(value.get("model_version", "duration_v1")),
             calibration_status=str(value.get("calibration_status", "unknown")),
             sync_latency_cycles=float(value.get("sync_latency_cycles", 0.0)),
+            pipe_barrier_cycles=barrier_cycles,
             pipe_parameters=pipes,
             operation_cycles={str(key): float(cycles) for key, cycles in raw_ops.items()},
             operation_signature_cycles={str(key): float(cycles) for key, cycles in raw_signatures.items()},
@@ -1561,6 +1576,436 @@ def _longest_path(
     return makespan, forward, backward, path
 
 
+def _expanded_node_loop_stack(
+    node: Mapping[str, Any], original_nodes: Mapping[int, Mapping[str, Any]]
+) -> tuple[int, ...]:
+    """Return the static-loop coordinates that identify one dynamic node.
+
+    Operations and branch control points already carry their enclosing loop
+    stack.  A loop begin/end control point is executed once per iteration of
+    that loop, however, while PTOAS records the marker outside the loop's own
+    stack.  Add that final coordinate explicitly so the expanded graph can
+    connect iteration ``i`` to ``i + 1`` without guessing from node order.
+    """
+    raw_stack = node.get("loop_stack", [])
+    if not isinstance(raw_stack, list) or not all(isinstance(loop, int) for loop in raw_stack):
+        raise ValueError(f"schedule node {node.get('id')} has an invalid loop stack")
+    stack = list(raw_stack)
+    if node.get("kind") != "control_point" or node.get("control_kind") != "loop":
+        return tuple(stack)
+
+    origin = node.get("origin_node")
+    original = original_nodes.get(origin) if isinstance(origin, int) else None
+    if original is None:
+        raise ValueError(f"loop control point {node.get('id')} has no original loop marker")
+    loop_kind = node.get("control_subkind")
+    loop_id = origin if loop_kind == "LOOP_BEGIN" else original.get("begin")
+    if loop_kind not in {"LOOP_BEGIN", "LOOP_END"} or not isinstance(loop_id, int):
+        raise ValueError(f"loop control point {node.get('id')} has invalid loop identity")
+    stack.append(loop_id)
+    return tuple(stack)
+
+
+def _expanded_edge_target_context(
+    source_stack: tuple[int, ...],
+    source_context: tuple[int, ...],
+    target_stack: tuple[int, ...],
+    loop_counts: Mapping[int, int],
+    *,
+    recurrence_loop: int | None,
+) -> tuple[int, ...] | None:
+    """Map one source occurrence to the corresponding target occurrence."""
+    source_values = dict(zip(source_stack, source_context, strict=True))
+    target_values: list[int] = []
+    for loop in target_stack:
+        if loop in source_values:
+            value = source_values[loop]
+            if loop == recurrence_loop:
+                value += 1
+                if value >= loop_counts[loop]:
+                    return None
+            target_values.append(value)
+        else:
+            # Entering a nested or following loop always targets its first
+            # dynamic iteration.
+            target_values.append(0)
+
+    for loop, value in source_values.items():
+        if loop in target_stack:
+            continue
+        # An edge leaving a loop is enabled only by its final occurrence.
+        if value != loop_counts[loop] - 1:
+            return None
+    if recurrence_loop is not None and recurrence_loop not in source_values:
+        raise ValueError(f"loop-carried edge source is not inside loop {recurrence_loop}")
+    if recurrence_loop is not None and recurrence_loop not in target_stack:
+        raise ValueError(f"loop-carried edge target is not inside loop {recurrence_loop}")
+    return tuple(target_values)
+
+
+def _compact_expanded_path(
+    path: Sequence[int], clone_provenance: Mapping[int, tuple[int, tuple[int, ...]]]
+) -> dict[str, Any]:
+    """Keep an auditable but bounded representation of a dynamic path."""
+
+    def decode(clone: int) -> dict[str, Any]:
+        node, iterations = clone_provenance[clone]
+        return {"node": node, "iterations": list(iterations)}
+
+    limit = 32
+    truncated = len(path) > 2 * limit
+    return {
+        "node_count": len(path),
+        "head": [decode(clone) for clone in path[:limit]],
+        "tail": [decode(clone) for clone in path[-limit:]] if truncated else [],
+        "truncated": truncated,
+    }
+
+
+def _branch_alternatives(record: Mapping[str, Any]) -> tuple[list[int], dict[int, tuple[int, bool]]]:
+    """Return IF identities and the branch-stack marker interpretation."""
+    branch_ids: list[int] = []
+    markers: dict[int, tuple[int, bool]] = {}
+    for node in record.get("nodes", []):
+        if not isinstance(node, Mapping) or node.get("kind") != "branch":
+            continue
+        node_id = node.get("id")
+        begin = node.get("begin")
+        branch_kind = node.get("branch_kind")
+        if not isinstance(node_id, int) or not isinstance(begin, int):
+            continue
+        if branch_kind == "IF_BEGIN":
+            branch_ids.append(node_id)
+            markers[node_id] = (node_id, True)
+        elif branch_kind == "ELSE_BEGIN":
+            markers[node_id] = (begin, False)
+    return sorted(branch_ids), markers
+
+
+def _node_active_in_branch_scenario(
+    node: Mapping[str, Any], choices: Mapping[int, bool], markers: Mapping[int, tuple[int, bool]]
+) -> bool:
+    """Return whether a structured node executes under one all-iteration branch scenario."""
+    kind = node.get("kind")
+    subkind = node.get("branch_kind") if kind == "branch" else node.get("control_subkind")
+    marker_id = node.get("id") if kind == "branch" else node.get("origin_node")
+    own_else: tuple[int, bool] | None = None
+    if subkind == "ELSE_BEGIN" and isinstance(marker_id, int):
+        own_else = markers.get(marker_id)
+        if own_else is None:
+            raise ValueError(f"ELSE_BEGIN marker {marker_id} has no branch identity")
+        begin, expected = own_else
+        if choices.get(begin) != expected:
+            return False
+    stack = node.get("branch_stack", [])
+    if not isinstance(stack, list) or not all(isinstance(marker, int) for marker in stack):
+        raise ValueError(f"schedule node {node.get('id')} has an invalid branch stack")
+    for marker in stack:
+        alternative = markers.get(marker)
+        if alternative is None:
+            raise ValueError(f"schedule node {node.get('id')} references unknown branch marker {marker}")
+        begin, expected = alternative
+        if own_else is not None and begin == own_else[0]:
+            continue
+        if choices.get(begin) != expected:
+            return False
+    return True
+
+
+def _pipe_barrier_sites(record: Mapping[str, Any]) -> list[tuple[int, str, int]]:
+    """Return unique lowered barrier sites as ``(target, pipe, group)``.
+
+    Final-SyncIR may carry duplicate records that SyncCodegen coalesces at one
+    operation site.  The queue model therefore keys a physical barrier by its
+    target operation and pipe, retaining the first group only as provenance.
+    """
+    nodes = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
+    }
+    sites: dict[tuple[int, str], int] = {}
+    for group in record.get("sync_groups", []):
+        if not isinstance(group, Mapping):
+            continue
+        group_id = group.get("id")
+        for operation in group.get("operations", []):
+            if not isinstance(operation, Mapping) or not str(operation.get("type", "")).startswith(
+                "pipe_barrier"
+            ):
+                continue
+            target = operation.get("node")
+            if not isinstance(target, int) or target not in nodes:
+                continue
+            pipe = group.get("src_pipe")
+            if not isinstance(pipe, str):
+                pipe = nodes[target].get("pipe")
+            if not isinstance(pipe, str):
+                raise ValueError(f"pipe barrier at node {target} has no execution pipe")
+            sites.setdefault((target, pipe), group_id if isinstance(group_id, int) else -1)
+    return [(target, pipe, group) for (target, pipe), group in sorted(sites.items())]
+
+
+def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph expansion
+    record: Mapping[str, Any],
+    operation_durations: Mapping[int, float],
+    pipe_barrier_cycles: Mapping[str, float],
+    choices: Mapping[int, bool],
+) -> dict[str, Any]:
+    """Evaluate static loops with explicit per-pipe FIFO and sync recurrences.
+
+    This is a max-plus expansion of PTO-ISA's deterministic queue/event model.
+    Stream edges preserve issue order on each pipe. Ordinary InsertSync edges
+    bind occurrences in the same iteration; a resolved loop-carried edge binds
+    the producer in iteration ``i`` to the consumer in ``i + 1``. The direct
+    dependency is equivalent to a matched counter-valued set/wait pair for a
+    fixed schedule, without assigning latency to the synchronization opcode.
+
+    Operation durations are inclusive. A calibrated ``pipe_barrier_cycles``
+    value represents the barrier instruction plus the pending-tail flush and
+    subsequent pipeline restart that PTO-ISA charges when a stream is broken.
+    Missing pipe calibration is reported instead of acquiring a guessed cost.
+
+    One boolean choice applies to every dynamic occurrence of a branch. This
+    gives auditable all-then/all-else path extremes. An invocation-specific mixed
+    branch profile remains a separate input that the schedule exporter does
+    not currently provide.
+    """
+    loop_counts, dynamic_loops = _loop_multipliers(record)
+    if dynamic_loops:
+        raise ValueError(
+            f"queue_event_v1 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
+        )
+    prepared = _prepare_control_flow_record(record)
+    original_nodes = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
+    }
+    prepared_nodes = {
+        node["id"]: node
+        for node in prepared.get("nodes", [])
+        if isinstance(node, Mapping)
+        and isinstance(node.get("id"), int)
+        and (node.get("kind") == "operation" or node.get("kind") == "control_point")
+    }
+    stacks = {
+        node_id: _expanded_node_loop_stack(node, original_nodes) for node_id, node in prepared_nodes.items()
+    }
+    _, branch_markers = _branch_alternatives(record)
+    active_nodes = {
+        node_id: _node_active_in_branch_scenario(node, choices, branch_markers)
+        for node_id, node in prepared_nodes.items()
+    }
+
+    clone_by_context: dict[int, dict[tuple[int, ...], int]] = {}
+    clone_provenance: dict[int, tuple[int, tuple[int, ...]]] = {}
+    durations: dict[int, float] = {}
+    next_clone = 0
+    for node_id, node in prepared_nodes.items():
+        stack = stacks[node_id]
+        contexts = itertools.product(*(range(loop_counts[loop]) for loop in stack))
+        clones: dict[tuple[int, ...], int] = {}
+        if node.get("kind") == "operation":
+            divisor = math.prod(loop_counts[loop] for loop in stack)
+            base_duration = operation_durations[node_id] / max(divisor, 1) if active_nodes[node_id] else 0.0
+        else:
+            base_duration = 0.0
+        for context in contexts:
+            clone = next_clone
+            next_clone += 1
+            clones[context] = clone
+            clone_provenance[clone] = (node_id, context)
+            durations[clone] = base_duration
+        clone_by_context[node_id] = clones
+
+    edges: list[tuple[int, int, float, str, int | None]] = []
+
+    def add_expanded_edge(
+        source: int,
+        target: int,
+        *,
+        kind: str,
+        group: int | None,
+        recurrence_loop: int | None = None,
+    ) -> None:
+        if source not in clone_by_context or target not in clone_by_context:
+            return
+        if kind == "sync" and (not active_nodes[source] or not active_nodes[target]):
+            return
+        target_clones = clone_by_context[target]
+        for source_context, source_clone in clone_by_context[source].items():
+            target_context = _expanded_edge_target_context(
+                stacks[source],
+                source_context,
+                stacks[target],
+                loop_counts,
+                recurrence_loop=recurrence_loop,
+            )
+            if target_context is None:
+                continue
+            target_clone = target_clones.get(target_context)
+            if target_clone is None:
+                raise ValueError(
+                    f"expanded schedule edge {source}->{target} has no target context {target_context}"
+                )
+            edges.append((source_clone, target_clone, 0.0, kind, group))
+
+    for edge in prepared.get("stream_edges", []):
+        if not isinstance(edge, Mapping):
+            continue
+        source, target = edge.get("source"), edge.get("target")
+        if isinstance(source, int) and isinstance(target, int):
+            add_expanded_edge(source, target, kind="stream", group=None)
+
+    # The prepared graph has begin->body and body->end edges for one logical
+    # iteration. Connect each pipe's end marker to the next begin marker.
+    control_points: dict[tuple[int, str], int] = {}
+    for node_id, node in prepared_nodes.items():
+        origin, pipe = node.get("origin_node"), node.get("pipe")
+        if node.get("kind") == "control_point" and isinstance(origin, int) and isinstance(pipe, str):
+            control_points[(origin, pipe)] = node_id
+    for loop_id, count in loop_counts.items():
+        if count <= 1:
+            continue
+        loop = original_nodes.get(loop_id)
+        loop_end = loop.get("end") if isinstance(loop, Mapping) else None
+        if not isinstance(loop_end, int):
+            raise ValueError(f"static loop {loop_id} has no integer end marker")
+        pipes = sorted(
+            pipe
+            for origin, pipe in control_points
+            if origin == loop_id and (loop_end, pipe) in control_points
+        )
+        for pipe in pipes:
+            add_expanded_edge(
+                control_points[(loop_end, pipe)],
+                control_points[(loop_id, pipe)],
+                kind="pipe_iteration",
+                group=None,
+                recurrence_loop=loop_id,
+            )
+
+    resolved_loop_carried = _effective_loop_carried_edge_indices(record)
+    sync_edges = [edge for edge in prepared.get("sync_edges", []) if isinstance(edge, Mapping)]
+    # The resolver indexes the original and prepared sync arrays identically.
+    for edge_index, edge in enumerate(sync_edges):
+        source, target, group = edge.get("source"), edge.get("target"), edge.get("group")
+        if not isinstance(source, int) or not isinstance(target, int):
+            continue
+        add_expanded_edge(
+            source,
+            target,
+            kind="sync",
+            group=group if isinstance(group, int) else None,
+            recurrence_loop=resolved_loop_carried.get(edge_index),
+        )
+
+    baseline_edges = [edge for edge in edges if edge[3] != "sync"]
+    full_durations = dict(durations)
+    calibrated_barriers = 0
+    uncalibrated_barriers: list[dict[str, Any]] = []
+    for target, pipe, group in _pipe_barrier_sites(record):
+        target_node = original_nodes.get(target)
+        if target_node is None or not _node_active_in_branch_scenario(target_node, choices, branch_markers):
+            continue
+        cycles = pipe_barrier_cycles.get(pipe)
+        if cycles is None:
+            uncalibrated_barriers.append({"node": target, "pipe": pipe, "group": group})
+            continue
+        calibrated_barriers += 1
+        for clone in clone_by_context.get(target, {}).values():
+            full_durations[clone] += cycles
+
+    baseline, _, _, baseline_path = _longest_path(durations, baseline_edges)
+    full, _, _, full_path = _longest_path(full_durations, edges)
+    return {
+        "model_version": "static_unrolled_pipe_event_v2",
+        "operation_duration_policy": "inclusive_cycles",
+        "pipeline_break_policy": "calibrated_per_pipe_barrier_restart",
+        "branch_policy": "all_iteration_fixed_choice_scenario",
+        "branch_choices": {str(node): choice for node, choice in sorted(choices.items())},
+        "expanded_node_count": len(durations),
+        "expanded_stream_edge_count": len(baseline_edges),
+        "expanded_sync_edge_count": len(edges) - len(baseline_edges),
+        "calibrated_pipe_barrier_site_count": calibrated_barriers,
+        "uncalibrated_pipe_barrier_sites": uncalibrated_barriers,
+        "pipeline_break_model_complete": not uncalibrated_barriers,
+        "baseline_makespan_cycles": baseline,
+        "full_makespan_cycles": full,
+        "synchronization_exposure_cycles": full - baseline,
+        "baseline_critical_path": _compact_expanded_path(baseline_path, clone_provenance),
+        "full_critical_path": _compact_expanded_path(full_path, clone_provenance),
+    }
+
+
+def _score_static_queue_event_graph(
+    record: Mapping[str, Any],
+    operation_durations: Mapping[int, float],
+    pipe_barrier_cycles: Mapping[str, float],
+) -> dict[str, Any]:
+    """Score static queues over auditable all-then/all-else branch extremes."""
+    branch_ids, _ = _branch_alternatives(record)
+    if len(branch_ids) > 6:
+        raise ValueError(
+            "queue_event_v2 supports at most 6 conditional regions for exhaustive "
+            f"path extremes, got {len(branch_ids)}"
+        )
+    loop_counts, dynamic_loops = _loop_multipliers(record)
+    if dynamic_loops:
+        raise ValueError(
+            f"queue_event_v2 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
+        )
+    prepared = _prepare_control_flow_record(record)
+    original_nodes = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
+    }
+    nodes_per_scenario = sum(
+        math.prod(loop_counts[loop] for loop in _expanded_node_loop_stack(node, original_nodes))
+        for node in prepared.get("nodes", [])
+        if isinstance(node, Mapping)
+        and isinstance(node.get("id"), int)
+        and node.get("kind") in {"operation", "control_point"}
+    )
+    scenario_count = 2 ** len(branch_ids)
+    total_expanded_nodes = nodes_per_scenario * scenario_count
+    if total_expanded_nodes > _MAX_QUEUE_EVENT_EXPANDED_NODES:
+        raise ValueError(
+            "queue_event_v2 expansion exceeds the resource-safe node budget: "
+            f"{nodes_per_scenario} nodes/scenario * {scenario_count} scenarios = "
+            f"{total_expanded_nodes}, limit {_MAX_QUEUE_EVENT_EXPANDED_NODES}"
+        )
+    scenarios = [
+        _score_static_queue_event_scenario(
+            record,
+            operation_durations,
+            pipe_barrier_cycles,
+            dict(zip(branch_ids, values, strict=True)),
+        )
+        for values in itertools.product((False, True), repeat=len(branch_ids))
+    ]
+    full_cycles = [float(scenario["full_makespan_cycles"]) for scenario in scenarios]
+    baseline_cycles = [float(scenario["baseline_makespan_cycles"]) for scenario in scenarios]
+    complete = all(scenario["pipeline_break_model_complete"] for scenario in scenarios)
+    return {
+        "model_version": "static_unrolled_pipe_event_branch_extremes_v2",
+        "branch_policy": "all_iteration_fixed_choice_extremes",
+        "mixed_iteration_branch_profile_available": False,
+        "scenario_count": len(scenarios),
+        "expanded_node_budget": _MAX_QUEUE_EVENT_EXPANDED_NODES,
+        "total_expanded_node_count": total_expanded_nodes,
+        "pipeline_break_model_complete": complete,
+        "baseline_makespan_cycles": max(baseline_cycles),
+        "full_makespan_cycles": max(full_cycles),
+        "minimum_full_makespan_cycles": min(full_cycles),
+        "maximum_full_makespan_cycles": max(full_cycles),
+        "synchronization_exposure_cycles": max(full_cycles) - max(baseline_cycles),
+        "scenarios": scenarios,
+    }
+
+
 def _longest_path_between(
     durations: Mapping[int, float],
     edges: Iterable[tuple[int, int, float, str, int | None]],
@@ -2051,6 +2496,9 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
     loop_aware_makespan = max(
         [full, *(item["latency_lower_bound_cycles"] for item in loop_latency_lower_bounds)]
     )
+    queue_event_score = _score_static_queue_event_graph(
+        record, operation_durations, model.pipe_barrier_cycles
+    )
 
     edge_exposure: list[dict[str, Any]] = []
     for source, target, _, kind, group in full_edges:
@@ -2107,6 +2555,10 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "baseline_makespan_cycles": baseline,
         "full_makespan_cycles": full,
         "loop_aware_makespan_cycles": loop_aware_makespan,
+        "queue_event_makespan_cycles": queue_event_score["full_makespan_cycles"],
+        "queue_event_baseline_makespan_cycles": queue_event_score["baseline_makespan_cycles"],
+        "queue_event_synchronization_exposure_cycles": queue_event_score["synchronization_exposure_cycles"],
+        "queue_event_model": queue_event_score,
         "loop_latency_lower_bounds": loop_latency_lower_bounds,
         "synchronization_exposure_cycles": max(0.0, full - baseline),
         "baseline_critical_path": baseline_path,
@@ -3274,6 +3726,7 @@ def calibrate_from_metrics(paths: Sequence[str | Path], base: DurationModel | No
             else "simulator_complete_signature_medians"
         ),
         sync_latency_cycles=model.sync_latency_cycles,
+        pipe_barrier_cycles=dict(model.pipe_barrier_cycles),
         pipe_parameters=calibrated_pipes,
         operation_cycles=dict(model.operation_cycles),
         operation_signature_cycles=signature_cycles,
@@ -3969,6 +4422,66 @@ def _sync_edge_delta(
     return encode(candidate_counts - baseline_counts), encode(baseline_counts - candidate_counts)
 
 
+def _queue_event_signed_marginal(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare matching branch extremes of two queue/event scores."""
+
+    def by_choice(score: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+        scenarios = score.get("scenarios")
+        if not isinstance(scenarios, list) or not scenarios:
+            raise ValueError("queue/event score has no branch scenarios")
+        result: dict[str, Mapping[str, Any]] = {}
+        for scenario in scenarios:
+            if not isinstance(scenario, Mapping):
+                raise ValueError("queue/event branch scenario must be an object")
+            choices = scenario.get("branch_choices")
+            if not isinstance(choices, Mapping):
+                raise ValueError("queue/event branch scenario has no choices")
+            key = json.dumps(choices, sort_keys=True, separators=(",", ":"))
+            if key in result:
+                raise ValueError(f"duplicate queue/event branch scenario {key}")
+            result[key] = scenario
+        return result
+
+    baseline_scenarios = by_choice(baseline)
+    candidate_scenarios = by_choice(candidate)
+    if baseline_scenarios.keys() != candidate_scenarios.keys():
+        raise ValueError("planner arms expose different structured branch scenarios")
+    complete = bool(baseline.get("pipeline_break_model_complete")) and bool(
+        candidate.get("pipeline_break_model_complete")
+    )
+    deltas = [
+        {
+            "branch_choices": dict(baseline_scenarios[key]["branch_choices"]),
+            "baseline_cycles": float(baseline_scenarios[key]["full_makespan_cycles"]),
+            "candidate_cycles": float(candidate_scenarios[key]["full_makespan_cycles"]),
+            "delta_cycles": float(candidate_scenarios[key]["full_makespan_cycles"])
+            - float(baseline_scenarios[key]["full_makespan_cycles"]),
+        }
+        for key in sorted(baseline_scenarios)
+    ]
+    minimum = min(row["delta_cycles"] for row in deltas)
+    maximum = max(row["delta_cycles"] for row in deltas)
+    if not complete:
+        conclusion = "PIPELINE_BREAK_CALIBRATION_INCOMPLETE"
+    elif maximum < 0:
+        conclusion = "BENEFICIAL_ALL_BRANCH_EXTREMES"
+    elif minimum > 0:
+        conclusion = "HARMFUL_ALL_BRANCH_EXTREMES"
+    elif minimum == maximum == 0:
+        conclusion = "TIE_ALL_BRANCH_EXTREMES"
+    else:
+        conclusion = "BRANCH_PATH_DEPENDENT"
+    return {
+        "model_version": "static_unrolled_pipe_event_branch_extremes_v2",
+        "pipeline_break_model_complete": complete,
+        "mixed_iteration_branch_profile_available": False,
+        "minimum_delta_cycles": minimum,
+        "maximum_delta_cycles": maximum,
+        "direction_conclusion": conclusion,
+        "scenarios": deltas,
+    }
+
+
 def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> dict[str, Any]:  # noqa: PLR0912 - validation is deliberately fail-closed
     """Score paired planner arms and compare them with optional observations.
 
@@ -4039,6 +4552,10 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
 
         baseline_cycles = float(arm_results["baseline"]["loop_aware_makespan_cycles"])
         candidate_cycles = float(arm_results["candidate"]["loop_aware_makespan_cycles"])
+        queue_event_marginal = _queue_event_signed_marginal(
+            arm_results["baseline"]["queue_event_model"],
+            arm_results["candidate"]["queue_event_model"],
+        )
         if baseline_cycles <= 0:
             raise ValueError(f"{path}: comparison {label} has a non-positive baseline prediction")
         predicted_delta = candidate_cycles - baseline_cycles
@@ -4097,6 +4614,7 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
                 "candidate_pre_codegen_sync_record_summary": arm_results["candidate"][
                     "pre_codegen_sync_record_summary"
                 ],
+                "queue_event_signed_marginal": queue_event_marginal,
                 "predicted_delta_cycles": predicted_delta,
                 "signed_marginal_sync_cost_cycles": predicted_delta,
                 "predicted_relative_delta": predicted_relative_delta,

@@ -347,8 +347,8 @@ evidence and must not invent schedule sites for those orders.
 A host-only retrospective reanalysis reconstructed all eight Gumbel endpoints
 with the product PTOAS v0.57 InsertSync implementation. Every endpoint has 93
 operation nodes, 100% exact/pinned duration coverage, and a complete structured
-control-flow graph. The signed oracle nevertheless does not yet explain the
-measured ordering:
+control-flow graph. The collapsed operation-only signed oracle nevertheless
+does not explain the measured ordering:
 
 | Relation | Predicted marginal | Existing two-device result | Interpretation |
 | -------- | ------------------ | -------------------------- | -------------- |
@@ -357,13 +357,41 @@ measured ordering:
 | `(38,42)` | `+189` cycles | about `+1.9%` | correct sign, underestimated magnitude |
 | `(38,79)` | `+56` cycles | null | small structural false positive |
 
-The repaired graph is structurally complete, but inserted barrier/set/wait
-instructions still have no calibrated execution duration. In addition, another
-recurrence with a 5,995-cycle initiation-interval lower bound masks the removed
-`(2,39)` barrier in the current longest-path maximum. These four rows are not
-enough to fit an ad hoc barrier constant. The next calibration step must model
-the execution and overlap of synchronization instructions directly, then test
-the frozen oracle on additional legal ablations.
+The queue/event model `static_unrolled_pipe_event_branch_extremes_v2` is the
+next implementation step. It explicitly unrolls statically bounded loops,
+preserves each pipe's FIFO issue order, maps loop-carried events from iteration
+`i` to `i + 1`, and prices an emitted barrier as an explicit per-pipe pipeline
+break. PTO-ISA motivates that term: a barrier flushes the pipe's pending tail,
+clears its queue, and therefore makes the following operation repay startup.
+The term is supplied through `pipe_barrier_cycles`; absent pipe calibration is
+reported as incomplete rather than replaced by a default.
+
+Dynamic branch outcomes are still missing from the schedule export. The model
+therefore reports all-then/all-else *extremes*, applying one choice to all
+dynamic occurrences of a branch, instead of pretending that the maximum arm
+is the measured invocation. These are not bounds for a mixed per-iteration
+branch profile.
+
+Using only PTO-ISA's pinned one-cycle barrier-instruction floor as a diagnostic
+(not as a calibrated tail-plus-restart cost) changes the Gumbel retrospective:
+
+| Relation | Queue/event marginal across branch extremes | Existing result |
+| -------- | ------------------------------------------- | --------------- |
+| `(2,39)` | `[-63, 0]` cycles | beneficial, about `-2.1%/-2.3%` |
+| `(3,38)` | `[0, +63]` cycles | small regression, about `+0.4%` |
+| `(38,42)` | `[+192, +1090]` cycles | regression, about `+1.9%` |
+| `(38,79)` | `[+56, +954]` cycles | latency null |
+
+This is a useful directional improvement: it exposes the beneficial barrier
+removal and the two harmful additions without fitting device latency. It is
+not yet a validated penalty oracle. `(38,79)` remains a false positive,
+the measured invocation has a mixed loop-branch profile, and the full
+tail/startup split still needs sequence-matched calibration. PTO-ISA defines
+the queue/flush/restart mechanism; real-device measurements validate the
+parameter used by the penalty model.
+`evaluate` retains the previous scalar prediction and additionally reports
+`queue_event_signed_marginal`, including per-scenario deltas and a strict
+direction only when every extreme agrees.
 
 ```bash
 python -m pypto.tools.dsa_schedule_model evaluate arm-manifest.json \
