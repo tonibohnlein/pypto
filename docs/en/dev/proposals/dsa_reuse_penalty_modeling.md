@@ -10,9 +10,14 @@ document separates three concerns that must not be conflated:
 3. the evidence used to decide which recognized candidates deserve a positive
    weight.
 
-The current evidence supports keeping the optimization problem simple and
-non-negative. It does not support enabling the current promotion policy in
-production.
+The device campaigns, including blocked and superseded runs, are indexed in
+[DSA-RP Device Experiment Ledger](dsa_device_experiment_ledger.md).
+
+The evidence supports the hard-constraint part of the optimization model, but
+the latest legal ablation shows that a relation's measured marginal can be
+negative. The current non-negative solver objective can conservatively clip
+such relations to zero, but cannot actively seek the beneficial overlap. The
+evidence does not support enabling the current promotion policy in production.
 
 ## Stable optimization problem
 
@@ -109,8 +114,10 @@ change only selected physical overlaps. The accumulated results establish:
   handoff costly.
 - Several predecessors of one consumer behave approximately like the latest
   active predecessor, not like an additive count.
-- No experiment has justified a negative optimization weight. Apparent
-  synchronization removal has not produced a replicated latency benefit.
+- A controlled Gumbel ablation now justifies a negative *analysis marginal*:
+  restoring `(2,39)` removes a barrier and improves latency by 2.1-2.35% on
+  both devices. Whether the solver should accept negative weights, or represent
+  the relation through a different structured objective, remains open.
 
 The exact ordered-pair study added two important counterexamples to the
 previous v4 policy:
@@ -132,8 +139,9 @@ The experiments also show that promoting every cross-resource obligation with
 the same positive performance weight is too broad:
 
 - A positive weight for every synchronization-changing pair is unjustified.
-- The non-negative pair model itself remains viable: neutral or apparently
-  beneficial pairs can simply receive no positive edge.
+- The non-negative pair model remains a conservative approximation: neutral or
+  beneficial pairs can receive no positive edge, but that approximation cannot
+  prefer a placement whose synchronization interaction is beneficial.
 - Several whole-kernel RP placements are reproducibly faster, including UB and
   L1 cases, but the largest gains are not ranked by the number of inserted
   synchronization groups.
@@ -181,7 +189,8 @@ performance costs. A future calibrated producer should use zero as the default
 and assign a positive weight only to repeatedly demonstrated harmful
 mechanisms. For several candidate predecessors of one consumer, retain the
 dominant supported pair rather than summing duplicate evidence. OR groups,
-hyperedges, negative weights, and global event-budget terms remain deferred.
+hyperedges, the solver representation of negative marginals, and global
+event-budget terms remain deferred.
 
 ## Critical-path model v0
 
@@ -262,6 +271,105 @@ undocumented hardware bank or interleave mapping. The penalty-model evaluator
 reports all five metrics so a device ordering can reveal the first abstraction
 level at which the arms actually separate.
 
+### Signed post-InsertSync marginal cost
+
+Legal pair ablations show that a reuse relation is not necessarily a positive
+latency obligation. For a fixed surrounding placement `P` and one relation
+`r`, the analysis oracle is therefore
+
+```text
+p(r | P) = L(InsertSync(P + r)) - L(InsertSync(P))
+```
+
+where `L` is the loop/resource-aware makespan estimate of the complete
+post-InsertSync schedule. The value is deliberately signed: a negative value
+means that adding `r` removed a more expensive synchronization dependency.
+The `evaluate` command exports this value as
+`signed_marginal_sync_cost_cycles` and fails closed unless both latency graphs
+are complete. It remains an analysis oracle, not yet the sparse approximation
+used by the DSA solver.
+
+The controlled Gumbel study isolates four relations while holding operation
+order and address translation controls fixed:
+
+| Relation | Final synchronization change | Two-device latency result |
+| -------- | ---------------------------- | ------------------------- |
+| `(2,39)` | removes one V-pipe barrier | `-2.07%/-2.30%` and `-2.16%/-2.35%` |
+| `(38,42)` | adds one barrier, set, and wait | about `+1.9%` on both devices |
+| `(3,38)` | adds one final barrier | about `+0.4%` |
+| `(38,79)` | adds set/wait sites but no barrier | latency null |
+
+For `(2,39)`, D0 contains a loop-carried V-to-V WAR from the prior iteration's
+`trowargmax` read to the next iteration's else-arm `tmov` write. InsertSync
+therefore emits a barrier before that `tmov`. Restoring the overlap aliases the
+`trowargmax` scratch with the next iteration's MTE2 load destination. That adds
+a V-to-MTE2 recurrence, and the existing MTE2-to-V load-completion handoff then
+makes the direct V-to-V dependency transitively implied. The barrier disappears
+inside `InsertSyncAnalysis`; phase-by-phase dumps show it is already absent
+before `MoveSyncState`, `RemoveRedundantSync`, and event-ID allocation. This is
+dependency implication, not event coalescing.
+
+The exact logical-to-lowered trace is:
+
+| Relation | DSA access orders | Lowered operations | Post-InsertSync change | Dynamic location |
+| -------- | ----------------- | ------------------ | ---------------------- | ---------------- |
+| `(2,39)` | `139/140 -> 142` and distance-one `142 -> 99` | `tadd`/else `tmov` -> `trowargmax`, then `trowargmax` -> `tload` | removes V-pipe barrier `52 -> 49`; changes recurrence source `51 -> 52` for `-> 11` | inside the 63-trip outer loop |
+| `(3,38)` | `114 -> 139` and distance-one `144 -> 101` | `tcolexpand` -> `tadd`, then scalar `tgetval` -> `texpands` | adds V-pipe recurrence barrier `52 -> 13` | inside the 63-trip outer loop |
+| `(38,42)` | `144 -> 153` | scalar `tgetval` -> post-loop `texpands` | adds S-to-V handoff `59 -> 61` and V barrier `52 -> 61` | once after the loop |
+| `(38,79)` | `144 -> 194/195` | scalar `tgetval` -> branch `tadd`/`tmov` | adds branch-lifted S-to-V handoff `59 -> 64` | once after the loop |
+
+The other relations separate exposed work from structural counts. `(38,42)`
+places a scalar-to-vector wait on the post-loop path and is measurably exposed.
+`(3,38)` adds a V barrier with substantial slack. `(38,79)` adds an event pair
+whose delay is hidden completely. Consequently neither logical reuse count nor
+barrier count alone is a defensible penalty model.
+
+The branch-aware schedule graph uses one zero-duration control point per
+`(branch-or-loop marker, pipe)`. Then and else arms start from the same per-pipe
+frontier and merge by taking their maximum; they are never serialized. Sync
+operations attached to `IF_BEGIN`, `IF_END`, or loop markers bind to the
+corresponding pipe-specific control point. Legacy PTOAS debug imports preserve
+the printed branch skeleton and barrier dependency node when present. Missing
+barrier dependencies or branch nodes continue to make
+`latency_graph_complete=false`.
+
+This support applies to scoring a complete post-InsertSync arm. The older
+`candidate_v1` hypothetical-edge scorer still fails closed when a candidate
+endpoint is conditional, because lifting a set from one arm to the branch join
+is an InsertSync transformation rather than a plain graph-edge insertion.
+
+The archived KV endpoint predates the pre-DSA Simplify placement now used by
+the research pipeline. Its candidate access orders 98 and 103 are eliminated
+before the lowered schedule. Current exports close the join directly; analysis
+of the archived endpoint must instead supply digest-bound non-materialization
+evidence and must not invent schedule sites for those orders.
+
+A host-only retrospective reanalysis reconstructed all eight Gumbel endpoints
+with the product PTOAS v0.57 InsertSync implementation. Every endpoint has 93
+operation nodes, 100% exact/pinned duration coverage, and a complete structured
+control-flow graph. The signed oracle nevertheless does not yet explain the
+measured ordering:
+
+| Relation | Predicted marginal | Existing two-device result | Interpretation |
+| -------- | ------------------ | -------------------------- | -------------- |
+| `(2,39)` | `0` cycles | about `-2.1%/-2.3%` | misses the beneficial barrier removal |
+| `(3,38)` | `0` cycles | about `+0.4%` | negligible effect, correctly treated as slack |
+| `(38,42)` | `+189` cycles | about `+1.9%` | correct sign, underestimated magnitude |
+| `(38,79)` | `+56` cycles | null | small structural false positive |
+
+The repaired graph is structurally complete, but inserted barrier/set/wait
+instructions still have no calibrated execution duration. In addition, another
+recurrence with a 5,995-cycle initiation-interval lower bound masks the removed
+`(2,39)` barrier in the current longest-path maximum. These four rows are not
+enough to fit an ad hoc barrier constant. The next calibration step must model
+the execution and overlap of synchronization instructions directly, then test
+the frozen oracle on additional legal ablations.
+
+```bash
+python -m pypto.tools.dsa_schedule_model evaluate arm-manifest.json \
+    --model duration-model.json -o signed-marginals.json
+```
+
 ```bash
 python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \
     -o post-sync-summary.json
@@ -307,12 +415,12 @@ yet explain the observed placement effect. Per-kernel Perf-Sim instruction
 traces are required for calibration before these cycle scores can be used as
 DSA-RP weights.
 
-The first critical-path calibration subset uses the `static_loop_v1`
-eligibility policy. It accepts loops with an exported non-negative static trip
-count and excludes branches and dynamically bounded loops. This is a
-timing-blind structural filter: it does not inspect solver objectives or prior
-device results. Qualify exported schedules before freezing that analysis
-subset with:
+The current critical-path calibration subset uses the
+`structured_branch_static_loop_v2` eligibility policy. It accepts loops with
+an exported non-negative static trip count and structured if/else branches;
+only dynamically bounded loops remain excluded. This is a timing-blind
+structural filter: it does not inspect solver objectives or prior device
+results. Qualify exported schedules before freezing that analysis subset with:
 
 ```bash
 python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \

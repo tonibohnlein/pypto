@@ -92,6 +92,48 @@ def test_complete_signature_mode_does_not_fall_back_to_family_median():
         dsa_schedule_model.score_schedule(record, model)
 
 
+def test_complete_signature_accepts_equivalent_compact_tile_type_encoding():
+    compact_type = "!pto.tile_buf<vec, 8x8xi32, valid=?x?>"
+    keyed_type = (
+        "!pto.tile_buf<loc=vec, dtype=i32, rows=8, cols=8, v_row=?, v_col=?, "
+        "blayout=row_major, slayout=none_box, fractal=512, pad=0>"
+    )
+    node = _operation(0, "PIPE_V", "pto.tadd")
+    node["defs"] = []
+    node["uses"] = []
+    node["operation"] = {
+        "location": f"pto.tadd ins(%lhs, %rhs : {compact_type}, {compact_type}) outs(%out : {compact_type})",
+        "operand_types": [compact_type, compact_type],
+        "result_types": [compact_type],
+        "operand_constants": [None, None],
+        "attributes": {},
+        "static_work_bytes": 256,
+    }
+    expected_signature = {
+        **dsa_schedule_model.operation_duration_signature(node),
+        "operand_types": [keyed_type, keyed_type],
+        "result_types": [keyed_type],
+        "semantic_operation": "keyed spelling intentionally differs",
+    }
+    model = dsa_schedule_model.DurationModel(
+        calibration_status="test",
+        operation_signature_cycles={dsa_schedule_model._operation_signature_key(expected_signature): 37.0},
+    )
+    record = {
+        "schema_version": 1,
+        "function": "kernel",
+        "status": "analyzed",
+        "nodes": [node],
+        "stream_edges": [],
+        "sync_edges": [],
+    }
+
+    result = dsa_schedule_model.score_schedule(record, model)
+
+    assert result["full_makespan_cycles"] == 37.0
+    assert result["duration_source_counts"] == {"simulator_complete_signature_compatible_encoding": 1}
+
+
 def test_score_computes_full_and_singleton_exposure():
     record = _record(sync_edges=[{"source": 2, "target": 1, "group": 7, "loop_carried": False}])
 
@@ -133,6 +175,7 @@ def test_score_aggregates_static_loop_work():
     result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
 
     assert result["baseline_makespan_cycles"] == 40.0
+    assert result["loop_aware_makespan_cycles"] == 40.0
     assert result["dynamic_loop_ids"] == []
     assert result["node_durations"]["0"]["loop_multiplier"] == 4
     assert result["loop_policy"] == "aggregate_static_work_v0"
@@ -599,6 +642,19 @@ def test_candidate_score_joins_access_sites_and_derives_non_negative_weight():
         "max_candidate_weight_cycles": 20.0,
         "unique_positive_edge_count": 1,
     }
+
+
+def test_candidate_score_fails_closed_on_conditional_endpoint_lifting():
+    record = _record()
+    record["nodes"].extend(
+        [
+            {"id": 10, "kind": "branch", "branch_kind": "IF_BEGIN"},
+            {"id": 11, "kind": "branch", "branch_kind": "IF_END"},
+        ]
+    )
+
+    with pytest.raises(ValueError, match="does not lift conditional access endpoints"):
+        dsa_schedule_model.score_reuse_candidates(record, [_candidate()], _ten_cycle_model())
 
 
 def test_duplicate_distance_zero_candidates_do_not_inflate_group_or_summary():
@@ -1431,18 +1487,88 @@ def test_realized_reuse_rejects_legacy_candidate_schema(tmp_path):
         )
 
 
-def test_score_fails_closed_on_control_flow_branches():
-    record = _record()
-    record["nodes"].append({"id": 4, "kind": "branch", "branch_kind": "IF_BEGIN"})
+def test_score_uses_maximum_branch_arm_instead_of_serializing_arms():
+    record = {
+        "schema_version": 1,
+        "function": "branch_kernel",
+        "status": "analyzed",
+        "nodes": [
+            _operation(0, "PIPE_V", "pto.tadd"),
+            {"id": 1, "kind": "branch", "branch_kind": "IF_BEGIN", "begin": 1, "branch": 3, "end": 5},
+            {**_operation(2, "PIPE_V", "pto.tadd"), "branch_stack": [1]},
+            {"id": 3, "kind": "branch", "branch_kind": "ELSE_BEGIN", "begin": 1, "branch": 3, "end": 5},
+            {**_operation(4, "PIPE_V", "pto.texp"), "branch_stack": [3]},
+            {"id": 5, "kind": "branch", "branch_kind": "IF_END", "begin": 1, "branch": 3, "end": 5},
+            _operation(6, "PIPE_V", "pto.tadd"),
+        ],
+        # This is the incorrect v0.57 exporter chain. The scorer must rebuild
+        # structured issue order rather than serialize node 2 before node 4.
+        "stream_edges": [
+            {"source": 0, "target": 2, "pipe": "PIPE_V"},
+            {"source": 2, "target": 4, "pipe": "PIPE_V"},
+            {"source": 4, "target": 6, "pipe": "PIPE_V"},
+        ],
+        "sync_edges": [],
+    }
+    model = _ten_cycle_model()
+    model.operation_cycles["PIPE_V:TEXP"] = 20.0
 
-    with pytest.raises(ValueError, match="does not model mutually exclusive control-flow branches"):
-        dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+    result = dsa_schedule_model.score_schedule(record, model)
+
+    assert result["baseline_makespan_cycles"] == 40.0
+    assert result["full_makespan_cycles"] == 40.0
+    assert result["control_flow_graph_version"] == "per_pipe_structured_control_v1"
 
 
-def test_static_loop_qualification_accepts_bounded_loops_and_excludes_branches():
+def test_branch_boundary_sync_joins_source_and_target_pipes():
+    record = {
+        "schema_version": 1,
+        "function": "branch_sync_kernel",
+        "status": "analyzed",
+        "nodes": [
+            _operation(0, "PIPE_MTE2", "pto.tload"),
+            {"id": 1, "kind": "branch", "branch_kind": "IF_BEGIN", "begin": 1, "branch": 3, "end": 5},
+            {**_operation(2, "PIPE_V", "pto.tadd"), "branch_stack": [1]},
+            {"id": 3, "kind": "branch", "branch_kind": "ELSE_BEGIN", "begin": 1, "branch": 3, "end": 5},
+            {**_operation(4, "PIPE_V", "pto.texp"), "branch_stack": [3]},
+            {"id": 5, "kind": "branch", "branch_kind": "IF_END", "begin": 1, "branch": 3, "end": 5},
+            _operation(6, "PIPE_MTE2", "pto.tload"),
+        ],
+        "stream_edges": [],
+        "sync_edges": [
+            {
+                "source": 0,
+                "target": 1,
+                "group": 0,
+                "src_pipe": "PIPE_MTE2",
+                "dst_pipe": "PIPE_V",
+                "loop_carried": False,
+            },
+            {
+                "source": 5,
+                "target": 6,
+                "group": 1,
+                "src_pipe": "PIPE_V",
+                "dst_pipe": "PIPE_MTE2",
+                "loop_carried": False,
+            },
+        ],
+    }
+    model = _ten_cycle_model()
+    model.operation_cycles["PIPE_V:TEXP"] = 20.0
+
+    result = dsa_schedule_model.score_schedule(record, model)
+
+    assert result["baseline_makespan_cycles"] == 20.0
+    assert result["full_makespan_cycles"] == 40.0
+    assert result["latency_graph_complete"] is True
+    assert result["excluded_non_operation_sync_edges"] == 0
+
+
+def test_static_loop_qualification_accepts_bounded_loops_and_structured_branches():
     straight = dsa_schedule_model.classify_static_schedule(_record())
     assert straight == {
-        "policy": "static_loop_v1",
+        "policy": "structured_branch_static_loop_v2",
         "eligible": True,
         "status": "STATIC_SCHEDULE",
         "operation_count": 4,
@@ -1468,11 +1594,16 @@ def test_static_loop_qualification_accepts_bounded_loops_and_excludes_branches()
     assert eligible["dynamic_loop_node_ids"] == []
 
     with_branch = _record()
-    with_branch["nodes"].append({"id": 10, "kind": "branch", "branch_kind": "IF_BEGIN"})
-    branch_excluded = dsa_schedule_model.classify_static_schedule(with_branch)
-    assert branch_excluded["eligible"] is False
-    assert branch_excluded["status"] == "BRANCH_EXCLUDED"
-    assert branch_excluded["branch_node_ids"] == [10]
+    with_branch["nodes"].extend(
+        [
+            {"id": 10, "kind": "branch", "branch_kind": "IF_BEGIN"},
+            {"id": 11, "kind": "branch", "branch_kind": "IF_END"},
+        ]
+    )
+    branch_eligible = dsa_schedule_model.classify_static_schedule(with_branch)
+    assert branch_eligible["eligible"] is True
+    assert branch_eligible["status"] == "STATIC_BRANCH_SCHEDULE"
+    assert branch_eligible["branch_node_ids"] == [10, 11]
 
     with_dynamic_loop = _record()
     with_dynamic_loop["nodes"].append(
@@ -1492,7 +1623,7 @@ def test_qualify_command_is_timing_blind_and_hashes_sources(tmp_path):
     assert dsa_schedule_model.main(["qualify", str(schedule), "-o", str(output)]) == 0
 
     result = json.loads(output.read_text())
-    assert result["selection_policy"] == "static_loop_v1"
+    assert result["selection_policy"] == "structured_branch_static_loop_v2"
     assert result["timing_blind"] is True
     assert result["schedule_count"] == 1
     assert result["eligible_count"] == 1
@@ -2465,6 +2596,49 @@ def test_import_legacy_debug_extracts_non_ins_outs_operation_types():
     assert operation["static_work_bytes"] == 0
 
 
+def test_enrich_native_schedule_preserves_sync_graph_and_joins_legacy_pointer_type():
+    record = {
+        "schema_version": 1,
+        "function": "kernel",
+        "status": "analyzed",
+        "nodes": [
+            {
+                "id": 0,
+                "kind": "operation",
+                "op_name": "pto.load_scalar",
+                "pipe": "PIPE_S",
+                "loop_stack": [],
+                "branch_stack": [],
+                "defs": [],
+                "uses": [],
+                "operation": {"location": 'loc("kernel.pto":1:1)'},
+            }
+        ],
+        "stream_edges": [],
+        "sync_edges": [{"source": 0, "target": 0, "group": 7, "loop_carried": False}],
+        "sync_groups": [
+            {
+                "id": 7,
+                "src_pipe": "PIPE_S",
+                "dst_pipe": "PIPE_S",
+                "operations": [{"type": "pipe_barrier", "node": 0, "dependency_node": 0}],
+            }
+        ],
+    }
+    pto = "%value = pto.load_scalar %arg0[%index] : <f32, gm> -> f32"
+
+    enriched = dsa_schedule_model.enrich_native_schedule_from_pto(record, pto, pto_source="kernel.pto")
+
+    operation = enriched["nodes"][0]["operation"]
+    assert operation["operand_types"] == ["!pto.ptr<f32, gm>"]
+    assert operation["result_types"] == ["f32"]
+    assert "pypto_access_order" not in operation
+    assert enriched["sync_edges"] == record["sync_edges"]
+    assert enriched["sync_groups"] == record["sync_groups"]
+    assert enriched["raw_pto_operation_join"] == "exact_executable_order_v1"
+    assert enriched["export_limitations"]["operation_metadata_missing"] == 0
+
+
 def test_import_legacy_debug_extracts_scalar_outs_type():
     log = """
 // === [PTOInsertSync Debug] After EventId Allocation === //
@@ -2535,16 +2709,23 @@ def test_import_legacy_debug_joins_result_producing_static_loop_bounds():
     assert record["export_limitations"]["static_loop_bounds_missing"] == 0
 
 
-def test_import_legacy_debug_fails_closed_when_raw_pto_contains_branch():
+def test_import_legacy_debug_reconstructs_branch_nodes_and_arm_stacks():
     log = """
 // === [PTOInsertSync Debug] After EventId Allocation === //
-[   0] COMPOUND pto.tadd [PIPE_V]
+[   0] BRANCH IF_BEGIN (begin=0, branch=3, end=5)
+  [   1] COMPOUND pto.tadd [PIPE_V]
+  [   2] PLACE_HOLDER (parentScopeId=0)
+[   3] BRANCH ELSE_BEGIN (begin=0, branch=3, end=5)
+  [   4] COMPOUND pto.tmul [PIPE_V]
+[   5] BRANCH IF_END (begin=0, branch=3, end=5)
 // ========================================= //
 """
     pto = """
 func.func @kernel(%condition: i1) {
   scf.if %condition {
     pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+  } else {
+    pto.tmul ins(%tile, %tile) outs(%tile) loc("pypto.access.8")
   }
   return
 }
@@ -2552,12 +2733,15 @@ func.func @kernel(%condition: i1) {
 
     record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
 
-    assert record["export_limitations"]["branch_nodes_missing"] == 1
-    model = dsa_schedule_model.DurationModel(calibration_status="test")
-    model.operation_cycles = {"PIPE_V:TADD": 1.0}
-    score = dsa_schedule_model.score_schedule(record, model)
-    assert score["latency_graph_complete"] is False
-    assert score["latency_graph_limitations"] == ["export_limitations.branch_nodes_missing"]
+    assert record["export_limitations"]["branch_nodes_missing"] == 0
+    assert [node["branch_kind"] for node in record["nodes"] if node["kind"] == "branch"] == [
+        "IF_BEGIN",
+        "ELSE_BEGIN",
+        "IF_END",
+    ]
+    assert record["nodes"][1]["branch_stack"] == [0]
+    assert record["nodes"][4]["branch_stack"] == [3]
+    assert record["nodes"][5]["branch_stack"] == []
 
 
 def test_import_legacy_debug_preserves_genuinely_dynamic_loop():
@@ -2646,6 +2830,7 @@ def test_evaluate_arm_manifest_scores_direction_and_rank(tmp_path):
     assert result["summary"]["observed_comparison_count"] == 1
     assert result["summary"]["direction_accuracy"] == 1.0
     assert result["comparisons"][0]["predicted_relative_delta"] == 1.0
+    assert result["comparisons"][0]["signed_marginal_sync_cost_cycles"] == 20.0
     assert result["comparisons"][0]["observed_relative_delta"] == 1.0
     assert result["comparisons"][0]["direction_correct"] is True
     assert result["comparisons"][0]["baseline_exact_duration_coverage"] == 1.0
@@ -2664,6 +2849,70 @@ def test_evaluate_arm_manifest_scores_direction_and_rank(tmp_path):
     assert result["comparisons"][0]["removed_sync_edges"] == []
     assert result["comparisons"][1]["direction_correct"] is None
     assert len(result["prediction_sha256"]) == 64
+
+
+def test_evaluate_arm_manifest_preserves_negative_marginal_sync_cost(tmp_path):
+    baseline = tmp_path / "baseline.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+    baseline.write_text(
+        json.dumps(_record(sync_edges=[{"source": 2, "target": 1, "group": 7, "loop_carried": False}])) + "\n"
+    )
+    candidate.write_text(json.dumps(_record()) + "\n")
+    manifest = tmp_path / "comparisons.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "comparisons": [
+                    {
+                        "case": "barrier-removed",
+                        "split": "development",
+                        "baseline_arm": "D0",
+                        "candidate_arm": "O0",
+                        "baseline_schedule": baseline.name,
+                        "candidate_schedule": candidate.name,
+                    }
+                ],
+            }
+        )
+    )
+
+    result = dsa_schedule_model.evaluate_arm_manifest(manifest, _ten_cycle_model())
+
+    row = result["comparisons"][0]
+    assert row["baseline_cycles"] == 40.0
+    assert row["candidate_cycles"] == 20.0
+    assert row["signed_marginal_sync_cost_cycles"] == -20.0
+    assert row["predicted_direction"] == -1
+    assert "negative values are permitted" in result["marginal_cost_metric"]
+
+
+def test_evaluate_arm_manifest_rejects_incomplete_latency_graph(tmp_path):
+    schedule = tmp_path / "schedule.jsonl"
+    record = _record()
+    record["export_limitations"] = {"barrier_dependency_nodes_missing": 1}
+    schedule.write_text(json.dumps(record) + "\n")
+    manifest = tmp_path / "comparisons.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "comparisons": [
+                    {
+                        "case": "incomplete",
+                        "split": "development",
+                        "baseline_arm": "D0",
+                        "candidate_arm": "O0",
+                        "baseline_schedule": schedule.name,
+                        "candidate_schedule": schedule.name,
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="incomplete baseline latency graph"):
+        dsa_schedule_model.evaluate_arm_manifest(manifest, _ten_cycle_model())
 
 
 def test_evaluate_arm_manifest_rejects_one_sided_observation(tmp_path):

@@ -20,10 +20,11 @@ directed acyclic graph.  It deliberately keeps three concepts separate:
   interactions and coalescence.
 
 Version 0 aggregates the work of statically bounded loops for whole-function
-DAG scores.  Candidate scoring additionally evaluates distance-one edges with
-a version-1 loop initiation-interval lower bound: the maximum of per-pipe work
-and every supported recurrence cycle.  This remains a structural model, not a
-cycle-accurate prediction.  Active Final-SyncIR records and hypothetical
+DAG scores and models structured if/else regions as mutually exclusive
+per-pipe paths. Candidate scoring additionally evaluates distance-one edges
+with a version-1 loop initiation-interval lower bound: the maximum of per-pipe
+work and every supported recurrence cycle. This remains a structural model,
+not a cycle-accurate prediction. Active Final-SyncIR records and hypothetical
 candidate synchronization endpoints are reported separately: a redundant
 precedence edge can have zero DAG extension while still creating synchronization
 pressure.  These are explicitly pre-codegen quantities, not counts of emitted
@@ -32,6 +33,7 @@ barrier dependency that the collapsed operation-only DAG cannot represent.
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -66,6 +68,11 @@ _PIPE_ALIASES = {
 
 _DEBUG_NODE_RE = re.compile(r"^\s*\[\s*(\d+)\]\s+COMPOUND\s+(\S+)\s+\[(\S+)\]")
 _DEBUG_LOOP_RE = re.compile(r"^\s*\[\s*(\d+)\]\s+LOOP\s+(LOOP_BEGIN|LOOP_END)\s+\(begin=(\d+),\s*end=(\d+)\)")
+_DEBUG_BRANCH_RE = re.compile(
+    r"^\s*\[\s*(\d+)\]\s+BRANCH\s+(IF_BEGIN|ELSE_BEGIN|IF_END)\s+"
+    r"\(begin=(\d+),\s*branch=(\d+),\s*end=(\d+)\)"
+)
+_DEBUG_PLACEHOLDER_RE = re.compile(r"^\s*\[\s*(\d+)\]\s+PLACE_HOLDER\s+\(parentScopeId=(\d+)\)")
 _DEBUG_MEM_RE = re.compile(r"^\s*(def|use)=\[(.*)\]\s*$")
 _DEBUG_MEM_ITEM_RE = re.compile(r"(%[^,(\s]+)\(([^)]+)\)")
 _DEBUG_SYNC_RE = re.compile(
@@ -314,6 +321,11 @@ def _operation_type_metadata(line: str, constants: Mapping[str, str]) -> dict[st
             result_types = _extract_pto_types(match.group(1))
         else:
             result_types = []
+    if "pto.load_scalar" in line:
+        legacy_pointer = re.search(r":\s*<\s*([^,>]+)\s*,\s*([^>]+)>\s*->", line)
+        if legacy_pointer is not None:
+            dtype, scope = (part.strip() for part in legacy_pointer.groups())
+            operand_types = [f"!pto.ptr<{dtype}, {scope}>"]
     static_sizes = [
         size for item in [*operand_types, *result_types] if (size := static_type_size_bytes(item)) is not None
     ]
@@ -350,7 +362,9 @@ def _operation_names_match(expected: str, actual: str, metadata: Mapping[str, An
     )
 
 
-def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) -> None:
+def _attach_pto_access_provenance(
+    nodes: list[dict[str, Any]], pto_text: str, *, require_access_provenance: bool = True
+) -> None:
     """Join legacy SyncIR nodes to raw-PTO access locations by exact op order.
 
     PTOAS's legacy text trace omits MLIR locations.  Raw PTO emitted with
@@ -363,7 +377,7 @@ def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) ->
     operation_nodes = [node for node in nodes if node.get("kind") == "operation"]
     expected_names = [str(node["op_name"]) for node in operation_nodes]
     traced_names = {_join_operation_name(name) for name in expected_names}
-    pto_operations: list[tuple[str, int, str, dict[str, Any]]] = []
+    pto_operations: list[tuple[str, int | None, str, dict[str, Any]]] = []
     constants = {
         match.group(1): f"{match.group(2)} : {match.group(3)}"
         for line in pto_text.splitlines()
@@ -378,12 +392,12 @@ def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) ->
         if len(names) != 1:
             raise ValueError(f"raw PTO line {line_number} contains multiple traced operations: {names}")
         locations = _ACCESS_LOCATION_RE.findall(line)
-        if len(set(locations)) != 1:
+        if len(set(locations)) > 1 or (require_access_provenance and len(set(locations)) != 1):
             raise ValueError(
                 f"raw PTO operation {names[0]} on line {line_number} has no unambiguous "
                 "pypto.access.N location"
             )
-        access_order = int(locations[0])
+        access_order = int(locations[0]) if locations else None
         location_line = line.strip()
         pto_operations.append(
             (names[0], access_order, location_line, _operation_type_metadata(location_line, constants))
@@ -410,12 +424,14 @@ def _attach_pto_access_provenance(nodes: list[dict[str, Any]], pto_text: str) ->
     for node, (raw_name, access_order, location_line, metadata) in zip(
         operation_nodes, pto_operations, strict=True
     ):
-        node["operation"] = {
+        operation = {
             **metadata,
-            "pypto_access_order": access_order,
             "location": location_line,
             "raw_pto_op_name": raw_name,
         }
+        if access_order is not None:
+            operation["pypto_access_order"] = access_order
+        node["operation"] = operation
 
 
 def _attach_pto_static_loop_bounds(nodes: list[dict[str, Any]], pto_text: str) -> int:
@@ -471,7 +487,40 @@ def _attach_pto_static_loop_bounds(nodes: list[dict[str, Any]], pto_text: str) -
     return sum(trip_count is None for trip_count, _ in raw_loops)
 
 
-def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors the four debug record kinds
+def enrich_native_schedule_from_pto(
+    record: Mapping[str, Any], pto_text: str, *, pto_source: str = "<raw-pto>"
+) -> dict[str, Any]:
+    """Join a native PTOAS sync graph to portable raw-PTO semantics.
+
+    The v0.57 exporter is authoritative for InsertSync nodes and edges, but
+    MLIR's destination-style operation representation places ``outs`` tile
+    types among operands. Exact duration calibration is keyed by the original
+    ``ins``/``outs`` syntax. Rejoin by the complete executable operation
+    sequence, refusing any count or opcode mismatch, and preserve every native
+    synchronization field unchanged.
+    """
+    enriched = copy.deepcopy(dict(record))
+    raw_nodes = enriched.get("nodes")
+    if not isinstance(raw_nodes, list) or not all(isinstance(node, dict) for node in raw_nodes):
+        raise ValueError("native schedule must contain mutable object nodes")
+    _attach_pto_access_provenance(raw_nodes, pto_text, require_access_provenance=False)
+    unresolved_loops = _attach_pto_static_loop_bounds(raw_nodes, pto_text)
+    enriched["export_source"] = "native_schedule_graph_v1+raw_pto_semantics_v1"
+    enriched["raw_pto_source"] = pto_source
+    enriched["raw_pto_sha256"] = hashlib.sha256(pto_text.encode()).hexdigest()
+    enriched["raw_pto_operation_join"] = "exact_executable_order_v1"
+    limitations = enriched.get("export_limitations")
+    if not isinstance(limitations, Mapping):
+        limitations = {}
+    enriched["export_limitations"] = {
+        **limitations,
+        "operation_metadata_missing": 0,
+        "static_loop_bounds_missing": unresolved_loops,
+    }
+    return enriched
+
+
+def import_insert_sync_debug(  # noqa: PLR0912,PLR0915 - parser mirrors the debug record state machine
     text: str, *, function: str, pto_text: str | None = None
 ) -> dict[str, Any]:
     """Convert PTOAS's legacy level-3 final SyncIR dump to schema v1.
@@ -496,6 +545,7 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
     nodes: list[dict[str, Any]] = []
     stream_edges: list[dict[str, Any]] = []
     loop_stack: list[int] = []
+    branch_stack: list[int] = []
     previous_by_pipe: dict[str, int] = {}
     sync_operations: dict[int, list[dict[str, Any]]] = defaultdict(list)
     current_node: dict[str, Any] | None = None
@@ -511,7 +561,7 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
                 "pipe": pipe,
                 "macro_phase": -1,
                 "loop_stack": list(loop_stack),
-                "branch_stack": [],
+                "branch_stack": list(branch_stack),
                 "defs": [],
                 "uses": [],
                 "operation": {},
@@ -535,12 +585,50 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
                 "end": int(match.group(4)),
                 "static_trip_count": None,
                 "loop_stack": list(loop_stack),
-                "branch_stack": [],
+                "branch_stack": list(branch_stack),
                 "operation": {},
             }
             nodes.append(current_node)
             if kind == "LOOP_BEGIN":
                 loop_stack.append(node_id)
+            continue
+
+        if match := _DEBUG_BRANCH_RE.match(line):
+            node_id = int(match.group(1))
+            kind = match.group(2)
+            if kind == "IF_END" and branch_stack:
+                branch_stack.pop()
+            current_node = {
+                "id": node_id,
+                "kind": "branch",
+                "branch_kind": kind,
+                "begin": int(match.group(3)),
+                "branch": int(match.group(4)),
+                "end": int(match.group(5)),
+                "loop_stack": list(loop_stack),
+                "branch_stack": list(branch_stack),
+                "operation": {},
+            }
+            nodes.append(current_node)
+            if kind == "IF_BEGIN":
+                branch_stack.append(node_id)
+            elif kind == "ELSE_BEGIN":
+                if branch_stack:
+                    branch_stack.pop()
+                branch_stack.append(node_id)
+            continue
+
+        if match := _DEBUG_PLACEHOLDER_RE.match(line):
+            current_node = {
+                "id": int(match.group(1)),
+                "kind": "placeholder",
+                "parent_scope": int(match.group(2)),
+                "virtual_else": False,
+                "loop_stack": list(loop_stack),
+                "branch_stack": list(branch_stack),
+                "operation": {},
+            }
+            nodes.append(current_node)
             continue
 
         if current_node is not None and (match := _DEBUG_MEM_RE.match(line)):
@@ -683,15 +771,18 @@ def import_insert_sync_debug(  # noqa: PLR0912 - stateful line parser mirrors th
     missing_static_work_sizes = sum(
         not node.get("operation", {}).get("static_work_bytes") for node in operation_nodes
     )
-    # The legacy text dump does not print BranchInstanceElements. Without an
-    # explicit limitation, both arms appear as one serial stream and can yield
-    # a plausible but invalid latency DAG. The native schedule exporter remains
-    # the authoritative path for branch-aware records.
+    # Current and v0.57 debug dumps print BranchInstanceElements. Older dumps
+    # do not, so raw PTO remains the independent fail-closed check that the
+    # reconstructed control-flow skeleton is complete.
     branch_nodes_missing = 0
     if pto_text is not None:
-        branch_nodes_missing = sum(
+        raw_branch_count = sum(
             bool(_PTO_BRANCH_RE.search(line.split("//", maxsplit=1)[0])) for line in pto_text.splitlines()
         )
+        exported_if_count = sum(
+            node.get("kind") == "branch" and node.get("branch_kind") == "IF_BEGIN" for node in nodes
+        )
+        branch_nodes_missing = max(0, raw_branch_count - exported_if_count)
     return {
         "schema_version": 1,
         "function": function,
@@ -840,6 +931,70 @@ def _operation_signature_key(signature: Mapping[str, Any]) -> str:
         missing = sorted(required - set(signature))
         raise ValueError(f"operation signature is missing fields: {missing}")
     return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+
+def _canonical_duration_type(value: str) -> tuple[Any, ...]:
+    if tile := parse_tile_type(value):
+        return ("tile", tile.scope, tile.dtype, tile.rows, tile.cols)
+    return ("other", " ".join(value.split()))
+
+
+def _duration_signatures_compatible(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> bool:
+    """Accept only a representational ins/outs spelling difference.
+
+    Raw PTO and native v0.57 MLIR print the same tile types in compact and
+    keyed forms. Operation, pipe, shape, work, attributes, constants, and the
+    ordered canonical operand/result types must still agree exactly. The
+    semantic-operation string is intentionally omitted because it embeds the
+    same non-canonical type spelling; all modeled modes are carried separately
+    in attributes and operand constants.
+    """
+    scalar_fields = (
+        "pipe",
+        "operation",
+        "dtype",
+        "rows",
+        "cols",
+        "work_bytes",
+        "attributes",
+        "operand_constants",
+    )
+    if any(expected.get(field) != actual.get(field) for field in scalar_fields):
+        return False
+    for type_field in ("operand_types", "result_types"):
+        expected_types = expected.get(type_field)
+        actual_types = actual.get(type_field)
+        if (
+            not isinstance(expected_types, list)
+            or not all(isinstance(item, str) for item in expected_types)
+            or not isinstance(actual_types, list)
+            or not all(isinstance(item, str) for item in actual_types)
+        ):
+            return False
+        if [_canonical_duration_type(item) for item in expected_types] != [
+            _canonical_duration_type(item) for item in actual_types
+        ]:
+            return False
+    return True
+
+
+def _compatible_signature_override(
+    signature: Mapping[str, Any], overrides: Mapping[str, float]
+) -> tuple[float, str] | None:
+    matches: list[tuple[float, str]] = []
+    for key, cycles in overrides.items():
+        try:
+            candidate = json.loads(key)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, Mapping) and _duration_signatures_compatible(candidate, signature):
+            matches.append((cycles, key))
+    if not matches:
+        return None
+    distinct_cycles = {cycles for cycles, _ in matches}
+    if len(distinct_cycles) != 1:
+        raise ValueError("ambiguous compatible exact-signature duration overrides")
+    return matches[0]
 
 
 def _loop_multipliers(record: Mapping[str, Any]) -> tuple[dict[int, int], list[int]]:
@@ -1013,9 +1168,11 @@ def estimate_node_durations(
             raise ValueError("operation node must have integer id, pipe, and op_name")
 
         key = _operation_key(pipe, op_name)
-        signature_key = (
-            _operation_signature_key(operation_duration_signature(node))
-            if model.operation_signature_cycles
+        signature = operation_duration_signature(node) if model.operation_signature_cycles else None
+        signature_key = _operation_signature_key(signature) if signature is not None else None
+        compatible_override = (
+            _compatible_signature_override(signature, model.operation_signature_cycles)
+            if signature is not None and signature_key not in model.operation_signature_cycles
             else None
         )
         work_bytes = _work_bytes(node)
@@ -1023,6 +1180,11 @@ def estimate_node_durations(
             base = model.operation_signature_cycles[signature_key]
             source = "simulator_complete_signature_median"
             detail = f"complete operation signature {signature_key}"
+            fallback = False
+        elif compatible_override is not None:
+            base, matched_key = compatible_override
+            source = "simulator_complete_signature_compatible_encoding"
+            detail = f"compatible complete operation signature {matched_key}"
             fallback = False
         elif not model.operation_signature_cycles and key in model.operation_cycles:
             base = model.operation_cycles[key]
@@ -1079,10 +1241,170 @@ def estimate_node_durations(
     return durations, provenance, dynamic_loops
 
 
+def _prepare_control_flow_record(  # noqa: PLR0912 - structured marker state machine
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebuild per-pipe issue order through structured branches and loops.
+
+    PTOAS v0.57's native exporter links operations by pipe while walking the
+    linear SyncIR.  That accidentally serializes the mutually exclusive then
+    and else arms.  A control marker also belongs to every affected pipe: a
+    wait at ``IF_BEGIN`` gates both arms, while a set at ``IF_END`` depends on
+    the taken arm only.  Represent each ``(marker, pipe)`` pair by a private
+    zero-duration node so a control-flow join never creates an undocumented
+    cross-pipe dependency.
+    """
+    original_nodes = [node for node in record.get("nodes", []) if isinstance(node, Mapping)]
+    operation_pipes: set[str] = set()
+    for node in original_nodes:
+        pipe = node.get("pipe")
+        if node.get("kind") == "operation" and isinstance(pipe, str):
+            operation_pipes.add(pipe)
+    sync_pipes: set[str] = set()
+    for edge in record.get("sync_edges", []):
+        if not isinstance(edge, Mapping):
+            continue
+        for key in ("src_pipe", "dst_pipe"):
+            pipe = edge.get(key)
+            if isinstance(pipe, str):
+                sync_pipes.add(pipe)
+    pipes = sorted(operation_pipes | sync_pipes)
+    if not pipes:
+        return dict(record)
+
+    synthetic_nodes: list[dict[str, Any]] = []
+    endpoint_by_marker_pipe: dict[tuple[int, str], int] = {}
+    stream_edges: list[dict[str, Any]] = []
+    seen_stream_edges: set[tuple[int, int, str]] = set()
+    frontiers: dict[str, set[int]] = {pipe: set() for pipe in pipes}
+    branch_frames: list[dict[str, Any]] = []
+    next_synthetic_id = -1
+
+    def connect(source: int, target: int, pipe: str) -> None:
+        key = (source, target, pipe)
+        if source != target and key not in seen_stream_edges:
+            stream_edges.append({"source": source, "target": target, "pipe": pipe})
+            seen_stream_edges.add(key)
+
+    def add_marker(node: Mapping[str, Any], predecessors: Mapping[str, set[int]]) -> None:
+        nonlocal next_synthetic_id
+        node_id = node.get("id")
+        if not isinstance(node_id, int):
+            raise ValueError("schedule control-flow marker has no integer id")
+        for pipe in pipes:
+            synthetic_id = next_synthetic_id
+            next_synthetic_id -= 1
+            endpoint_by_marker_pipe[(node_id, pipe)] = synthetic_id
+            synthetic_nodes.append(
+                {
+                    "id": synthetic_id,
+                    "kind": "control_point",
+                    "control_kind": node.get("kind"),
+                    "control_subkind": node.get("branch_kind", node.get("loop_kind")),
+                    "origin_node": node_id,
+                    "pipe": pipe,
+                    "loop_stack": list(node.get("loop_stack", [])),
+                    "branch_stack": list(node.get("branch_stack", [])),
+                }
+            )
+            for predecessor in sorted(predecessors[pipe]):
+                connect(predecessor, synthetic_id, pipe)
+            frontiers[pipe] = {synthetic_id}
+
+    for node in original_nodes:
+        node_id = node.get("id")
+        if not isinstance(node_id, int):
+            continue
+        kind = node.get("kind")
+        if kind == "operation":
+            pipe = node.get("pipe")
+            if not isinstance(pipe, str) or pipe not in frontiers:
+                raise ValueError(f"schedule operation {node_id} has an invalid pipe")
+            for predecessor in sorted(frontiers[pipe]):
+                connect(predecessor, node_id, pipe)
+            frontiers[pipe] = {node_id}
+            continue
+
+        if kind == "branch":
+            branch_kind = node.get("branch_kind")
+            if branch_kind == "IF_BEGIN":
+                add_marker(node, frontiers)
+                branch_frames.append(
+                    {
+                        "begin": node_id,
+                        "entry": {pipe: set(values) for pipe, values in frontiers.items()},
+                        "then": None,
+                        "else_seen": False,
+                    }
+                )
+                continue
+            if not branch_frames:
+                raise ValueError(f"schedule branch marker {node_id} has no open IF_BEGIN")
+            frame = branch_frames[-1]
+            if node.get("begin") != frame["begin"]:
+                raise ValueError(f"schedule branch marker {node_id} does not match IF_BEGIN {frame['begin']}")
+            if branch_kind == "ELSE_BEGIN":
+                frame["then"] = {pipe: set(values) for pipe, values in frontiers.items()}
+                frame["else_seen"] = True
+                frontiers = {pipe: set(values) for pipe, values in frame["entry"].items()}
+                add_marker(node, frontiers)
+                continue
+            if branch_kind == "IF_END":
+                branch_frames.pop()
+                if frame["else_seen"]:
+                    alternatives = (frame["then"], frontiers)
+                else:
+                    alternatives = (frontiers, frame["entry"])
+                merged = {
+                    pipe: set().union(*(alternative[pipe] for alternative in alternatives)) for pipe in pipes
+                }
+                add_marker(node, merged)
+                continue
+            raise ValueError(f"schedule branch marker {node_id} has invalid kind {branch_kind!r}")
+
+        # Loop and placeholder markers are sequential control points. Static
+        # loop work is already multiplied in operation durations; the markers
+        # make entry/exit synchronization endpoints joinable without adding a
+        # recurrence to the acyclic whole-function graph.
+        add_marker(node, frontiers)
+
+    if branch_frames:
+        raise ValueError(f"schedule has unterminated IF_BEGIN {branch_frames[-1]['begin']}")
+
+    nodes_by_id = {node["id"]: node for node in original_nodes if isinstance(node.get("id"), int)}
+
+    def effective_endpoint(node_id: Any, pipe: Any) -> Any:
+        if not isinstance(node_id, int) or not isinstance(pipe, str):
+            return node_id
+        node = nodes_by_id.get(node_id)
+        if node is None or node.get("kind") == "operation":
+            return node_id
+        return endpoint_by_marker_pipe.get((node_id, pipe), node_id)
+
+    sync_edges: list[dict[str, Any]] = []
+    for edge in record.get("sync_edges", []):
+        if not isinstance(edge, Mapping):
+            continue
+        transformed = dict(edge)
+        transformed["source"] = effective_endpoint(edge.get("source"), edge.get("src_pipe"))
+        transformed["target"] = effective_endpoint(edge.get("target"), edge.get("dst_pipe"))
+        transformed["source_origin"] = edge.get("source")
+        transformed["target_origin"] = edge.get("target")
+        sync_edges.append(transformed)
+
+    prepared = dict(record)
+    prepared["nodes"] = [dict(node) for node in original_nodes] + synthetic_nodes
+    prepared["stream_edges"] = stream_edges
+    prepared["sync_edges"] = sync_edges
+    prepared["control_flow_graph_version"] = "per_pipe_structured_control_v1"
+    prepared["control_point_nodes"] = synthetic_nodes
+    return prepared
+
+
 def _schedule_graph_durations(
     record: Mapping[str, Any], operation_durations: Mapping[int, float]
 ) -> dict[int, float]:
-    """Add zero-duration structural loop markers to operation durations."""
+    """Add zero-duration structural markers to operation durations."""
     durations = dict(operation_durations)
     for node in record.get("nodes", []):
         if not isinstance(node, Mapping):
@@ -1092,7 +1414,7 @@ def _schedule_graph_durations(
             continue
         if node_id in durations:
             continue
-        if node.get("kind") == "loop":
+        if node.get("kind") in {"loop", "branch", "placeholder", "control_point"}:
             durations[node_id] = 0.0
     return durations
 
@@ -1314,7 +1636,7 @@ def _loop_recurrence_score(
     nodes_by_id = {
         node["id"]: node
         for node in record.get("nodes", [])
-        if isinstance(node, Mapping) and node.get("kind") == "operation" and isinstance(node.get("id"), int)
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
     }
     loop_nodes = {
         node_id
@@ -1341,8 +1663,9 @@ def _loop_recurrence_score(
 
     pipe_work: dict[str, float] = defaultdict(float)
     for node_id, duration in iteration_durations.items():
-        pipe = nodes_by_id[node_id].get("pipe")
-        if isinstance(pipe, str):
+        node = nodes_by_id[node_id]
+        pipe = node.get("pipe")
+        if node.get("kind") == "operation" and isinstance(pipe, str):
             pipe_work[pipe] += duration
     resource_bound = max(pipe_work.values(), default=0.0)
 
@@ -1526,13 +1849,19 @@ def _loop_boundary_kind(
     target_node = nodes_by_id.get(target, {})
     source_inside = loop_id in source_node.get("loop_stack", [])
     target_inside = loop_id in target_node.get("loop_stack", [])
-    source_marker = source in {loop_id, loop_end}
-    target_marker = target in {loop_id, loop_end}
+    source_origin = source_node.get("origin_node", source)
+    target_origin = target_node.get("origin_node", target)
+    source_marker = source_origin in {loop_id, loop_end}
+    target_marker = target_origin in {loop_id, loop_end}
     if not (source_marker or target_marker or source_inside != target_inside):
         return None
-    is_entry = (source == loop_id and target_inside) or (not source_inside and target == loop_id)
+    is_entry = (source_origin == loop_id and target_inside) or (
+        not source_inside and target_origin == loop_id
+    )
     is_entry |= not source_marker and not source_inside and target_inside
-    is_exit = (source_inside and target == loop_end) or (source == loop_end and not target_inside)
+    is_exit = (source_inside and target_origin == loop_end) or (
+        source_origin == loop_end and not target_inside
+    )
     is_exit |= not target_marker and source_inside and not target_inside
     if is_entry and not is_exit:
         return "loop_entry"
@@ -1587,7 +1916,10 @@ def _existing_loop_sync_models(
             node_id
             for node_id, node in nodes_by_id.items()
             if loop_id in node.get("loop_stack", [])
-            and (node.get("kind") == "loop" or node_id in operation_durations)
+            and (
+                node.get("kind") in {"loop", "branch", "placeholder", "control_point"}
+                or node_id in operation_durations
+            )
         }
     sync_edges = [edge for edge in record.get("sync_edges", []) if isinstance(edge, Mapping)]
     resolved_loop_carried = _resolve_loop_carried_sync_edges(sync_edges, groups, loops, schedule_ids_by_loop)
@@ -1662,7 +1994,11 @@ def _existing_loop_sync_models(
                 "static_trip_count": None if loop_id in dynamic_loops else loop_counts.get(loop_id, 1),
                 "operation_node_count": sum(node_id in operation_nodes for node_id in loop_schedule_ids),
                 "structural_node_count": sum(
-                    nodes_by_id[node_id].get("kind") == "loop" for node_id in loop_schedule_ids
+                    nodes_by_id[node_id].get("kind") in {"loop", "branch", "placeholder"}
+                    for node_id in loop_schedule_ids
+                ),
+                "control_point_node_count": sum(
+                    nodes_by_id[node_id].get("kind") == "control_point" for node_id in loop_schedule_ids
                 ),
                 "pipe_work_cycles": dict(sorted(pipe_work.items())),
                 "resource_ii_lower_bound_cycles": resource_bound,
@@ -1677,35 +2013,44 @@ def _existing_loop_sync_models(
 
 def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str, Any]:
     """Score one PTOAS schedule graph and its synchronization exposure."""
-    branch_ids = [
-        node.get("id")
-        for node in record.get("nodes", [])
-        if isinstance(node, Mapping) and node.get("kind") == "branch"
-    ]
-    if branch_ids:
-        raise ValueError(
-            "duration_v0 does not model mutually exclusive control-flow branches; "
-            f"branch nodes: {branch_ids[:8]}"
-        )
     operation_durations, provenance, dynamic_loops = estimate_node_durations(record, model)
     if dynamic_loops:
         raise ValueError(
             f"duration_v0 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
         )
-    durations = _schedule_graph_durations(record, operation_durations)
+    prepared_record = _prepare_control_flow_record(record)
+    durations = _schedule_graph_durations(prepared_record, operation_durations)
     node_ids = set(durations)
-    stream_edges, _ = _graph_edges(record, node_ids, include_sync=False)
-    full_edges, edge_diagnostics = _graph_edges(record, node_ids, include_sync=True)
+    stream_edges, _ = _graph_edges(prepared_record, node_ids, include_sync=False)
+    full_edges, edge_diagnostics = _graph_edges(prepared_record, node_ids, include_sync=True)
     full_edges = [
         (source, target, model.sync_latency_cycles if kind == "sync" else latency, kind, group)
         for source, target, latency, kind, group in full_edges
     ]
     loop_sync_models = _existing_loop_sync_models(
-        record, operation_durations, full_edges, model.sync_latency_cycles
+        prepared_record, operation_durations, full_edges, model.sync_latency_cycles
     )
 
     baseline, top, bottom, baseline_path = _longest_path(durations, stream_edges)
     full, _, _, full_path = _longest_path(durations, full_edges)
+    loop_latency_lower_bounds: list[dict[str, Any]] = []
+    for loop_model in loop_sync_models:
+        trip_count = loop_model.get("static_trip_count")
+        if not isinstance(trip_count, int):
+            continue
+        resource_ii = float(loop_model["resource_ii_lower_bound_cycles"])
+        schedule_ii = float(loop_model["ii_lower_bound_cycles"])
+        lower_bound = resource_ii + max(0, trip_count - 1) * schedule_ii
+        loop_latency_lower_bounds.append(
+            {
+                "loop_node": loop_model["loop_node"],
+                "static_trip_count": trip_count,
+                "latency_lower_bound_cycles": lower_bound,
+            }
+        )
+    loop_aware_makespan = max(
+        [full, *(item["latency_lower_bound_cycles"] for item in loop_latency_lower_bounds)]
+    )
 
     edge_exposure: list[dict[str, Any]] = []
     for source, target, _, kind, group in full_edges:
@@ -1736,6 +2081,8 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "status": record.get("status", "<unknown>"),
         "schedule_export_source": record.get("export_source", "native_schedule_graph_v1"),
         "schedule_export_limitations": record.get("export_limitations", {}),
+        "control_flow_graph_version": prepared_record.get("control_flow_graph_version"),
+        "control_point_nodes": prepared_record.get("control_point_nodes", []),
         "duration_model_version": model.model_version,
         "calibration_status": model.calibration_status,
         "loop_policy": "aggregate_static_work_v0",
@@ -1743,7 +2090,7 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "loop_sync_models": loop_sync_models,
         "dynamic_loop_ids": dynamic_loops,
         **edge_diagnostics,
-        **_latency_graph_completeness(record, edge_diagnostics, loop_sync_models),
+        **_latency_graph_completeness(prepared_record, edge_diagnostics, loop_sync_models),
         "operation_nodes": len(operation_durations),
         "exact_duration_nodes": exact,
         "fallback_duration_nodes": fallback,
@@ -1759,6 +2106,8 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         ),
         "baseline_makespan_cycles": baseline,
         "full_makespan_cycles": full,
+        "loop_aware_makespan_cycles": loop_aware_makespan,
+        "loop_latency_lower_bounds": loop_latency_lower_bounds,
         "synchronization_exposure_cycles": max(0.0, full - baseline),
         "baseline_critical_path": baseline_path,
         "full_critical_path": full_path,
@@ -2473,7 +2822,11 @@ def score_realized_reuse(
                 "second_placement_end": second_end,
                 "overlap_begin": overlap_begin,
                 "overlap_end": overlap_end,
-                "overlap_bytes": overlap_end - overlap_begin if overlap else 0,
+                "overlap_bytes": (
+                    overlap_end - overlap_begin
+                    if overlap_begin is not None and overlap_end is not None
+                    else 0
+                ),
             }
         )
 
@@ -2600,7 +2953,8 @@ def score_reuse_candidates(
     ]
     if branch_ids:
         raise ValueError(
-            "duration_v0 does not model mutually exclusive control-flow branches; "
+            "candidate_v1 does not lift conditional access endpoints to branch joins; "
+            "score complete post-InsertSync arm schedules for a signed marginal instead; "
             f"branch nodes: {branch_ids[:8]}"
         )
     operation_durations, provenance, dynamic_loops = estimate_node_durations(record, model)
@@ -2608,9 +2962,10 @@ def score_reuse_candidates(
         raise ValueError(
             f"duration_v0 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
         )
-    durations = _schedule_graph_durations(record, operation_durations)
+    prepared_record = _prepare_control_flow_record(record)
+    durations = _schedule_graph_durations(prepared_record, operation_durations)
     node_ids = set(durations)
-    existing_edges, edge_diagnostics = _graph_edges(record, node_ids, include_sync=True)
+    existing_edges, edge_diagnostics = _graph_edges(prepared_record, node_ids, include_sync=True)
     existing_edges = [
         (source, target, model.sync_latency_cycles if kind == "sync" else latency, kind, group)
         for source, target, latency, kind, group in existing_edges
@@ -2683,7 +3038,7 @@ def score_reuse_candidates(
                     f"loop-carried candidate {index} sites do not share a PTOAS loop: edge {source}->{target}"
                 )
             recurrence = _loop_recurrence_score(
-                record,
+                prepared_record,
                 operation_durations,
                 existing_edges,
                 loop_id=common_loops[-1],
@@ -2811,7 +3166,7 @@ def score_reuse_candidates(
         },
     )
     baseline_loop_sync_models = _existing_loop_sync_models(
-        record, operation_durations, existing_edges, model.sync_latency_cycles
+        prepared_record, operation_durations, existing_edges, model.sync_latency_cycles
     )
 
     return {
@@ -2827,7 +3182,7 @@ def score_reuse_candidates(
         "loop_sync_model_version": "loop_sync_ii_and_boundary_v1",
         "baseline_loop_sync_models": baseline_loop_sync_models,
         **edge_diagnostics,
-        **_latency_graph_completeness(record, edge_diagnostics, baseline_loop_sync_models),
+        **_latency_graph_completeness(prepared_record, edge_diagnostics, baseline_loop_sync_models),
         "candidate_count": len(candidates),
         "scored_candidate_count": sum(
             row.get("status") in {"scored", "loop_carried_scored_v1"} for row in rows
@@ -3442,7 +3797,7 @@ def _resolve_schedule_record(path: Path, function: str | None) -> tuple[dict[str
 
 
 def classify_static_schedule(record: Mapping[str, Any]) -> dict[str, Any]:
-    """Classify schedules whose execution count is statically determined."""
+    """Classify schedules supported by the structured control-flow model."""
     nodes = [node for node in record.get("nodes", []) if isinstance(node, Mapping)]
     operation_ids = [node.get("id") for node in nodes if node.get("kind") == "operation"]
     branch_ids = [node.get("id") for node in nodes if node.get("kind") == "branch"]
@@ -3454,15 +3809,15 @@ def classify_static_schedule(record: Mapping[str, Any]) -> dict[str, Any]:
         and node.get("loop_kind") == "LOOP_BEGIN"
         and (type(node.get("static_trip_count")) is not int or node["static_trip_count"] < 0)
     ]
-    if branch_ids:
-        status = "BRANCH_EXCLUDED"
-    elif dynamic_loop_ids:
+    if dynamic_loop_ids:
         status = "DYNAMIC_LOOP_EXCLUDED"
+    elif branch_ids:
+        status = "STATIC_BRANCH_SCHEDULE"
     else:
         status = "STATIC_SCHEDULE"
     return {
-        "policy": "static_loop_v1",
-        "eligible": status == "STATIC_SCHEDULE",
+        "policy": "structured_branch_static_loop_v2",
+        "eligible": status != "DYNAMIC_LOOP_EXCLUDED",
         "status": status,
         "operation_count": len(operation_ids),
         "branch_node_count": len(branch_ids),
@@ -3491,7 +3846,7 @@ def qualify_schedule_files(paths: Sequence[str | Path]) -> dict[str, Any]:
             )
     return {
         "schema_version": 1,
-        "selection_policy": "static_loop_v1",
+        "selection_policy": "structured_branch_static_loop_v2",
         "timing_blind": True,
         "schedule_count": len(rows),
         "eligible_count": sum(row["eligible"] for row in rows),
@@ -3673,12 +4028,17 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
             )
         for role in ("baseline", "candidate"):
             arm_results[role] = score_schedule(arm_records[role], model)
+            if not arm_results[role]["latency_graph_complete"]:
+                limitations = arm_results[role]["latency_graph_limitations"]
+                raise ValueError(
+                    f"{path}: comparison {label} has an incomplete {role} latency graph: {limitations}"
+                )
         added_sync_edges, removed_sync_edges = _sync_edge_delta(
             arm_records["baseline"], arm_records["candidate"]
         )
 
-        baseline_cycles = float(arm_results["baseline"]["full_makespan_cycles"])
-        candidate_cycles = float(arm_results["candidate"]["full_makespan_cycles"])
+        baseline_cycles = float(arm_results["baseline"]["loop_aware_makespan_cycles"])
+        candidate_cycles = float(arm_results["candidate"]["loop_aware_makespan_cycles"])
         if baseline_cycles <= 0:
             raise ValueError(f"{path}: comparison {label} has a non-positive baseline prediction")
         predicted_delta = candidate_cycles - baseline_cycles
@@ -3725,7 +4085,20 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
                 "candidate_exact_duration_coverage": arm_results["candidate"]["exact_duration_coverage"],
                 "baseline_duration_source_counts": arm_results["baseline"]["duration_source_counts"],
                 "candidate_duration_source_counts": arm_results["candidate"]["duration_source_counts"],
+                "baseline_full_critical_path": arm_results["baseline"]["full_critical_path"],
+                "candidate_full_critical_path": arm_results["candidate"]["full_critical_path"],
+                "baseline_sync_edge_exposure": arm_results["baseline"]["sync_edge_exposure"],
+                "candidate_sync_edge_exposure": arm_results["candidate"]["sync_edge_exposure"],
+                "baseline_loop_sync_models": arm_results["baseline"]["loop_sync_models"],
+                "candidate_loop_sync_models": arm_results["candidate"]["loop_sync_models"],
+                "baseline_pre_codegen_sync_record_summary": arm_results["baseline"][
+                    "pre_codegen_sync_record_summary"
+                ],
+                "candidate_pre_codegen_sync_record_summary": arm_results["candidate"][
+                    "pre_codegen_sync_record_summary"
+                ],
                 "predicted_delta_cycles": predicted_delta,
+                "signed_marginal_sync_cost_cycles": predicted_delta,
                 "predicted_relative_delta": predicted_relative_delta,
                 "predicted_direction": _effect_sign(predicted_delta),
                 "baseline_latency_us": observed_baseline,
@@ -3745,7 +4118,11 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
         "schema_version": 1,
         "model_version": model.model_version,
         "calibration_status": model.calibration_status,
-        "prediction_metric": "full_makespan_cycles",
+        "prediction_metric": "loop_aware_makespan_cycles",
+        "marginal_cost_metric": (
+            "L(InsertSync(candidate placement)) - L(InsertSync(baseline placement)); "
+            "negative values are permitted"
+        ),
         "relative_delta_convention": "candidate/baseline - 1; negative is candidate faster",
         "frozen_before_device_timing": bool(payload.get("frozen_before_device_timing", False)),
         "manifest": {
@@ -3977,6 +4354,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     import_parser.add_argument("-o", "--output", type=Path, required=True)
 
+    enrich_parser = subparsers.add_parser(
+        "enrich-native",
+        help="join a native PTOAS schedule graph to exact raw-PTO operation semantics",
+    )
+    enrich_parser.add_argument("schedule", type=Path)
+    enrich_parser.add_argument("--pto", type=Path, required=True)
+    enrich_parser.add_argument("--function")
+    enrich_parser.add_argument("-o", "--output", type=Path, required=True)
+
     evaluate_parser = subparsers.add_parser(
         "evaluate", help="score paired planner arms and compare optional observed latencies"
     )
@@ -4034,6 +4420,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pto_text=args.pto.read_text() if args.pto is not None else None,
             )
             args.output.write_text(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+            return 0
+        if args.command == "enrich-native":
+            record, _ = _resolve_schedule_record(args.schedule, args.function)
+            enriched = enrich_native_schedule_from_pto(
+                record,
+                args.pto.read_text(),
+                pto_source=str(args.pto.resolve()),
+            )
+            args.output.write_text(json.dumps(enriched, sort_keys=True, allow_nan=False) + "\n")
             return 0
         if args.command == "evaluate":
             evaluated = evaluate_arm_manifest(args.manifest, _model_from_args(args))
