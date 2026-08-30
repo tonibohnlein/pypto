@@ -8,8 +8,12 @@ PyPTO 的复用惩罚 recognizer 仍是默认关闭的实验功能。必须分�
 2. PyPTO 当前实现的 recognizer 与 promotion policy；
 3. 用于判断哪些 candidate 应获得正权重的实验依据。
 
-现有证据支持继续使用简单的非负优化模型，但不支持在生产环境中启用当前 promotion
-policy。
+所有设备 campaign（包括 blocked 与已被替代的运行）都记录在
+[DSA-RP 设备实验记录](dsa_device_experiment_ledger.md)中。
+
+现有证据支持优化模型的 hard-constraint 部分，但最新合法 ablation 表明 relation 的实测
+marginal 可以为负。当前非负 solver objective 可以保守地把这类 relation 截断为零，但
+不能主动寻找 beneficial overlap。现有证据仍不支持在生产环境中启用当前 promotion policy。
 
 ## 稳定优化问题
 
@@ -93,7 +97,9 @@ suppression rule。
 - route class 不足以分类，同一路由可能 harmful、neutral 或被其他 release 覆盖；
 - loop frequency 会放大暴露在 hot path 上的 handoff，但不能让已覆盖 handoff 变贵；
 - 同一 consumer 的多个 predecessor 更接近“最新 predecessor”而不是简单求和；
-- 尚无实验支持负优化权重；同步减少没有产生可重复的 latency 收益。
+- 受控 Gumbel ablation 现在支持负的 *analysis marginal*：恢复 `(2,39)` 会删除一个
+  barrier，并在两台设备上提速 2.1-2.35%。solver 应直接接受负权重，还是用另一种结构化
+  objective 表达该 relation，仍是开放问题。
 
 最新 exact ordered-pair study 给出了对旧 v4 policy 的两个重要反例：
 
@@ -112,7 +118,8 @@ suppression rule。
 实验也说明，给所有 cross-resource obligation 相同的正性能权重仍然过于宽泛：
 
 - 不能给所有改变同步的 pair 正权重；
-- 非负 pair model 仍然成立：neutral 或表面 beneficial 的 pair 可以不产生正 edge。
+- 非负 pair model 仍可作为保守近似：neutral 或 beneficial pair 可以不产生正 edge，
+  但该近似无法偏好具有 beneficial synchronization interaction 的 placement。
 - 多个 whole-kernel RP placement 在 UB 和 L1 case 上都能稳定提速，但插入的
   synchronization-group 数量无法对这些收益排序；
 - clean pair ablation 可以重现明显 latency 变化，但其 synchronization summary
@@ -152,8 +159,8 @@ dynamic frequency
 刻意停在这一步之前：它识别稀疏 pair obligation，但不把它们称为 production
 performance cost。未来经校准的 producer 应默认使用零权重，并只给具有重复 harmful
 证据的机制正权重。对于同一 consumer 的多个 candidate predecessor，应保留有依据的
-dominant pair，而不是重复求和。OR group、hyperedge、负权重和全局 event-budget
-term 继续推迟。
+dominant pair，而不是重复求和。OR group、hyperedge、负 marginal 的 solver 表达方式和
+全局 event-budget term 继续推迟。
 
 ## Critical-path model v0
 
@@ -217,6 +224,90 @@ realized-placement scorer 会保留五个不同层次的证据，而不会把每
 或 interleave mapping。penalty-model evaluator 会同时报告五个指标，从而可以通过设备
 排序判断各 arm 最早在哪个抽象层出现区分。
 
+### 带符号的 post-InsertSync 边际代价
+
+合法 pair ablation 表明，reuse relation 不一定产生正 latency obligation。对于固定的
+周围 placement `P` 和一条 relation `r`，分析 oracle 因此定义为：
+
+```text
+p(r | P) = L(InsertSync(P + r)) - L(InsertSync(P))
+```
+
+其中 `L` 是完整 post-InsertSync schedule 的 loop/resource-aware makespan estimate。
+该值有意保留符号：负值表示加入 `r` 后删除了更昂贵的 synchronization dependency。
+`evaluate` 命令将其导出为 `signed_marginal_sync_cost_cycles`，并在任一 latency
+graph 不完整时 fail closed。它目前是 analysis oracle，还不是 DSA solver 使用的稀疏近似。
+
+受控 Gumbel 实验在 operation order 与 address-translation control 不变的情况下隔离了
+四条 relation：
+
+| Relation | 最终 synchronization 变化 | 双设备 latency 结果 |
+| -------- | ------------------------- | ------------------- |
+| `(2,39)` | 删除一个 V-pipe barrier | `-2.07%/-2.30%` 与 `-2.16%/-2.35%` |
+| `(38,42)` | 增加一个 barrier、set 和 wait | 两台设备约 `+1.9%` |
+| `(3,38)` | 最终增加一个 barrier | 约 `+0.4%` |
+| `(38,79)` | 增加 set/wait site，但不增加 barrier | latency null |
+
+对于 `(2,39)`，D0 包含从上一轮 `trowargmax` read 到下一轮 else-arm `tmov` write 的
+loop-carried V-to-V WAR，因此 InsertSync 在 `tmov` 前插入 barrier。恢复 overlap 后，
+`trowargmax` scratch 与下一轮 MTE2 load destination alias，新增 V-to-MTE2 recurrence；
+已有的 MTE2-to-V load-completion handoff 随后使直接 V-to-V dependency 由传递关系蕴含。
+该 barrier 在 `InsertSyncAnalysis` 内部消失；逐 phase dump 证明在 `MoveSyncState`、
+`RemoveRedundantSync` 和 event-ID allocation 之前它就已不存在。因此机制是 dependency
+implication，而不是 event coalescing。
+
+精确的逻辑访问到 lowering endpoint 追踪如下：
+
+| Relation | DSA access order | Lowered operation | Post-InsertSync 变化 | 动态位置 |
+| -------- | ---------------- | ----------------- | -------------------- | -------- |
+| `(2,39)` | `139/140 -> 142` 与 distance-one `142 -> 99` | `tadd`/else `tmov` -> `trowargmax`，随后 `trowargmax` -> `tload` | 删除 V-pipe barrier `52 -> 49`；把 `-> 11` 的 recurrence source 从 `51` 改为 `52` | 63-trip outer loop 内 |
+| `(3,38)` | `114 -> 139` 与 distance-one `144 -> 101` | `tcolexpand` -> `tadd`，随后 scalar `tgetval` -> `texpands` | 增加 V-pipe recurrence barrier `52 -> 13` | 63-trip outer loop 内 |
+| `(38,42)` | `144 -> 153` | scalar `tgetval` -> post-loop `texpands` | 增加 S-to-V handoff `59 -> 61` 与 V barrier `52 -> 61` | loop 后执行一次 |
+| `(38,79)` | `144 -> 194/195` | scalar `tgetval` -> branch `tadd`/`tmov` | 增加 branch-lifted S-to-V handoff `59 -> 64` | loop 后执行一次 |
+
+其余 relation 将 exposed work 与结构计数区分开来。`(38,42)` 把 scalar-to-vector wait
+放在 post-loop path 上，产生可测的 exposed delay；`(3,38)` 增加一个具有较多 slack 的
+V barrier；`(38,79)` 增加 event pair，但其 delay 完全隐藏。因此，仅统计 logical reuse
+或 barrier 都不能构成可靠的 penalty model。
+
+branch-aware schedule graph 为每个 `(branch-or-loop marker, pipe)` 建立一个零 duration
+control point。then/else arm 从同一 per-pipe frontier 开始，并通过取最大值汇合，绝不被
+串行化。附着在 `IF_BEGIN`、`IF_END` 或 loop marker 上的 sync operation 会绑定到对应的
+pipe-specific control point。legacy PTOAS debug import 会保留已打印的 branch skeleton，
+并在存在时保留 barrier dependency node。缺失 barrier dependency 或 branch node 时，
+`latency_graph_complete` 仍为 false。
+
+该支持适用于完整 post-InsertSync arm 的评分。旧的 `candidate_v1` hypothetical-edge
+scorer 在 candidate endpoint 位于 conditional 内时仍会 fail closed，因为把某个 arm 的
+set 提升到 branch join 是 InsertSync transformation，不是简单加入一条 graph edge。
+
+归档的 KV endpoint 早于 research pipeline 当前使用的 pre-DSA Simplify placement。
+其中 candidate access order 98 与 103 在 lowered schedule 前已被删除。当前 export 会直接
+完成 join；分析旧 endpoint 时则必须提供绑定 digest 的 non-materialization evidence，
+不能为这些 order 虚构 schedule site。
+
+纯主机回顾分析使用产品 PTOAS v0.57 InsertSync 实现重建了全部八个 Gumbel endpoint。
+每个 endpoint 都有 93 个 operation node、100% exact/pinned duration coverage，以及完整的
+结构化 control-flow graph。但带符号 oracle 仍不能解释实测排序：
+
+| Relation | 预测 marginal | 既有双设备结果 | 解释 |
+| -------- | ------------- | -------------- | ---- |
+| `(2,39)` | `0` cycle | 约 `-2.1%/-2.3%` | 未捕获 beneficial barrier removal |
+| `(3,38)` | `0` cycle | 约 `+0.4%` | effect 很小，按 slack 处理是合理的 |
+| `(38,42)` | `+189` cycle | 约 `+1.9%` | 符号正确，但低估幅度 |
+| `(38,79)` | `+56` cycle | null | 较小的结构性 false positive |
+
+修复后的 graph 在结构上完整，但插入的 barrier/set/wait instruction 仍没有经过校准的执行
+duration。此外，另一条 recurrence 的 initiation-interval lower bound 为 5,995 cycle，
+因此当前 longest-path maximum 会掩盖被删除的 `(2,39)` barrier。不能用这四行拟合临时
+barrier 常数。下一步 calibration 必须直接建模 synchronization instruction 的执行与重叠，
+再用更多合法 ablation 检验冻结后的 oracle。
+
+```bash
+python -m pypto.tools.dsa_schedule_model evaluate arm-manifest.json \
+    --model duration-model.json -o signed-marginals.json
+```
+
 ```bash
 python -m pypto.tools.ptoas_sync_summary --arm-manifest post-sync-arms.json \
     -o post-sync-summary.json
@@ -255,9 +346,10 @@ provider 精确覆盖 40% node，其余 node 都明确标记为 fallback。模�
 effect。在把 cycle score 用作 DSA-RP weight 之前，必须用逐 kernel 的 Perf-Sim
 instruction trace 进行校准。
 
-首个 critical-path 校准子集使用 `static_loop_v1` eligibility policy。它接受具有已导出
-非负静态 trip count 的 loop，并排除 branch 与动态边界 loop。该过滤器只使用结构信息，
-不读取 solver objective 或既有设备结果。在冻结该分析子集前使用：
+当前 critical-path 校准子集使用 `structured_branch_static_loop_v2` eligibility policy。
+它接受具有已导出非负静态 trip count 的 loop 与结构化 if/else branch；只排除动态边界
+loop。该过滤器只使用结构信息，不读取 solver objective 或既有设备结果。在冻结该分析
+子集前使用：
 
 ```bash
 python -m pypto.tools.dsa_schedule_model qualify schedule-*.jsonl \
