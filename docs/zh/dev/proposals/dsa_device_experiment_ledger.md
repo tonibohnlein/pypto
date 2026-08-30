@@ -41,7 +41,8 @@ workload。
 | `dsa-rp-driver-first-timing-8d8e76df-final.tar.gz` | 19/20 primary workload，两种 device domain | tight selection 产生大量 physical null；仅 `dspark/rmsnorm.py` 确认 DSA-RP 比 Cypress 快约 2.6-3.6%。native-map control 证明 instrument 可解析 8-33% effect。 |
 | `dsa-rp-replay-fixed-prospective-holdout-9b05800db-final.tar.gz` | 八个 frozen workload、九个 target、13,440 sample | DSA-RP 在五个 target 上确认胜过 Cypress，且从未确认更慢；幅度约 3.2-6.1%。这是最强的 prospective policy 证据。 |
 | `dsa-rp-four-candidate-physical-penalty-aeba32c70-final.tar.gz` | 四个新 workload、6,400 sample | `kv_score_proj_c128` 确认 DSA-RP 比 Cypress 快约 2.3-2.5%，尽管 sync site 更多；Gumbel 的大 unit-cost gap 是 latency null。 |
-| `dsa-rp-kv-gumbel-legal-ablations-2bdc441b0-final.tar.gz` | 五个 relation family、address control、6,400 sample | Gumbel `(2,39)` 是 beneficial causal relation：加入 overlap 删除一个 barrier 并提速 2.1-2.35%。`(38,42)` 约 +1.9%，`(3,38)` 约 +0.4%，`(38,79)` 为 null；KV `(8,22)` 非 causal。 |
+| `dsa-rp-kv-gumbel-legal-ablations-2bdc441b0-final.tar.gz` | 五个 relation family、address control、6,400 sample | 恢复 Gumbel `(2,39)` 同时删除一个静态 ELSE-arm barrier，并提速 2.1-2.35%；这确认了 placement-relation contrast 的因果性，但没有证明 barrier 导致提速。`(38,42)` 约 +1.9%，`(3,38)` 约 +0.4%，`(38,79)` 为 null；KV `(8,22)` 非 causal。 |
+| `dsa-rp-queue-event-model-device-validation-9217dd575-final.tar.gz` | 16 个 endpoint、6,400 sample、32 个 branch-profile swimlane | 实际 6-THEN/2-ELSE profile 下，`(2,39)` 的 barrier marginal 恰为零，而实测收益主要来自较长的 THEN block。per-pipe barrier constant 因 4.40x calibration spread 被否定；barrier 因果性仍需 placement x barrier factorial 才能判断。 |
 
 ## 在有效 timing 前按规则停止的 campaign
 

@@ -318,10 +318,132 @@ def test_queue_event_model_reports_uncalibrated_pipe_breaks():
 def test_duration_model_round_trip_preserves_pipe_barrier_calibration():
     model = _ten_cycle_model()
     model.pipe_barrier_cycles = {"PIPE_V": 3.0, "PIPE_ALL": 1.0}
+    model.barrier_instruction_cycles = 2.0
+    node = _record()["nodes"][0]
+    node["operation"] = {
+        "operand_types": [],
+        "result_types": [],
+        "operand_constants": [],
+        "attributes": {},
+    }
+    signature = dsa_schedule_model._operation_signature_key(
+        dsa_schedule_model.operation_duration_signature(node)
+    )
+    model.operation_signature_pipeline = {signature: dsa_schedule_model.PipelineComponents(3.0, 4.0)}
 
     restored = dsa_schedule_model.DurationModel.from_json(model.to_json())
 
     assert restored.pipe_barrier_cycles == model.pipe_barrier_cycles
+    assert restored.barrier_instruction_cycles == 2.0
+    assert restored.operation_signature_pipeline == model.operation_signature_pipeline
+
+
+def test_queue_drain_restart_prices_changed_site_from_operations_not_pipe_constant():
+    baseline = _record()
+    baseline["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "operations": [{"node": 2, "type": "pipe_barrier", "dependency_node": 0}],
+        }
+    ]
+    candidate = _record()
+    for record in (baseline, candidate):
+        for node in record["nodes"]:
+            node["operation"] = {
+                "operand_types": [],
+                "result_types": [],
+                "operand_constants": [],
+                "attributes": {},
+            }
+    model = _ten_cycle_model()
+    predecessor_signature = dsa_schedule_model._operation_signature_key(
+        dsa_schedule_model.operation_duration_signature(baseline["nodes"][0])
+    )
+    successor_signature = dsa_schedule_model._operation_signature_key(
+        dsa_schedule_model.operation_duration_signature(baseline["nodes"][2])
+    )
+    model.barrier_instruction_cycles = 2.0
+    model.operation_signature_pipeline = {
+        predecessor_signature: dsa_schedule_model.PipelineComponents(1.0, 4.0),
+        successor_signature: dsa_schedule_model.PipelineComponents(7.0, 3.0),
+    }
+
+    before = dsa_schedule_model.score_schedule(baseline, model)["queue_drain_restart_model"]
+    after = dsa_schedule_model.score_schedule(candidate, model)["queue_drain_restart_model"]
+    marginal = dsa_schedule_model._queue_drain_restart_signed_marginal(before, after)
+
+    assert marginal["complete"] is True
+    assert marginal["minimum_delta_cycles"] == -13.0
+    assert marginal["maximum_delta_cycles"] == -13.0
+    assert marginal["direction_conclusion"] == "BENEFICIAL_ALL_BRANCH_EXTREMES"
+    removed = marginal["scenarios"][0]["removed_sites"][0]
+    assert removed["barrier_instruction_cycles"] == 2.0
+    assert removed["predecessor_pending_tail_cycles"] == 4.0
+    assert removed["successor_restart_cycles"] == 7.0
+
+
+def test_public_manifest_evaluator_reports_queue_drain_restart_marginal(tmp_path):
+    baseline_record = _record()
+    candidate_record = _record()
+    for record in (baseline_record, candidate_record):
+        for node in record["nodes"]:
+            node["operation"] = {
+                "operand_types": [],
+                "result_types": [],
+                "operand_constants": [],
+                "attributes": {},
+            }
+    baseline_record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "operations": [{"node": 2, "type": "pipe_barrier", "dependency_node": 0}],
+        }
+    ]
+    baseline = tmp_path / "baseline.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+    baseline.write_text(json.dumps(baseline_record) + "\n")
+    candidate.write_text(json.dumps(candidate_record) + "\n")
+    manifest = tmp_path / "comparisons.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "comparisons": [
+                    {
+                        "case": "barrier-factorial",
+                        "split": "development",
+                        "baseline_arm": "D+B",
+                        "candidate_arm": "D-B",
+                        "baseline_schedule": baseline.name,
+                        "candidate_schedule": candidate.name,
+                    }
+                ],
+            }
+        )
+    )
+    model = _ten_cycle_model()
+    predecessor_signature = dsa_schedule_model._operation_signature_key(
+        dsa_schedule_model.operation_duration_signature(baseline_record["nodes"][0])
+    )
+    successor_signature = dsa_schedule_model._operation_signature_key(
+        dsa_schedule_model.operation_duration_signature(baseline_record["nodes"][2])
+    )
+    model.barrier_instruction_cycles = 2.0
+    model.operation_signature_pipeline = {
+        predecessor_signature: dsa_schedule_model.PipelineComponents(1.0, 4.0),
+        successor_signature: dsa_schedule_model.PipelineComponents(7.0, 3.0),
+    }
+
+    result = dsa_schedule_model.evaluate_arm_manifest(manifest, model)
+
+    marginal = result["comparisons"][0]["queue_drain_restart_signed_marginal"]
+    assert marginal["complete"] is True
+    assert marginal["minimum_delta_cycles"] == -13.0
+    assert marginal["maximum_delta_cycles"] == -13.0
 
 
 def test_queue_event_model_reports_conditional_path_bounds():
@@ -458,6 +580,29 @@ def test_latency_graph_is_incomplete_when_export_omits_barrier_dependencies():
 
     assert result["latency_graph_complete"] is False
     assert result["latency_graph_limitations"] == ["export_limitations.barrier_dependency_nodes_missing"]
+
+
+def test_public_scorer_propagates_exported_barrier_dependency_provenance():
+    record = _record()
+    record["export_limitations"] = {"barrier_dependency_nodes_missing": 1}
+    record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_V",
+            "operations": [{"node": 2, "type": "pipe_barrier", "dependency_node": 0}],
+        }
+    ]
+
+    result = dsa_schedule_model.score_schedule(record, _ten_cycle_model())
+
+    assert result["latency_graph_complete"] is True
+    assert result["barrier_dependency_provenance"] == {
+        "source": "sync_groups.operations.dependency_node",
+        "barrier_site_count": 1,
+        "recovered_sync_edge_count": 1,
+        "missing_dependency_node_count": 0,
+    }
 
 
 def test_score_fails_closed_on_dynamic_loop():

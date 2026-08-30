@@ -114,10 +114,12 @@ change only selected physical overlaps. The accumulated results establish:
   handoff costly.
 - Several predecessors of one consumer behave approximately like the latest
   active predecessor, not like an additive count.
-- A controlled Gumbel ablation now justifies a negative *analysis marginal*:
-  restoring `(2,39)` removes a barrier and improves latency by 2.1-2.35% on
-  both devices. Whether the solver should accept negative weights, or represent
-  the relation through a different structured objective, remains open.
+- A controlled Gumbel ablation now justifies a negative *relation marginal*:
+  restoring `(2,39)` improves latency by 2.1-2.35% on both devices. It also
+  removes one static ELSE-arm barrier, but a later branch-profiled validation
+  shows that most of the benefit occurs in THEN blocks where that barrier does
+  not execute. The relation effect is causal; the barrier mechanism is not yet
+  causal evidence.
 
 The exact ordered-pair study added two important counterexamples to the
 previous v4 policy:
@@ -290,7 +292,8 @@ are complete. It remains an analysis oracle, not yet the sparse approximation
 used by the DSA solver.
 
 The controlled Gumbel study isolates four relations while holding operation
-order and address translation controls fixed:
+order and address translation controls fixed. The synchronization column is a
+correlate of each relation contrast, not by itself a causal attribution:
 
 | Relation | Final synchronization change | Two-device latency result |
 | -------- | ---------------------------- | ------------------------- |
@@ -299,10 +302,11 @@ order and address translation controls fixed:
 | `(3,38)` | adds one final barrier | about `+0.4%` |
 | `(38,79)` | adds set/wait sites but no barrier | latency null |
 
-For `(2,39)`, D0 contains a loop-carried V-to-V WAR from the prior iteration's
-`trowargmax` read to the next iteration's else-arm `tmov` write. InsertSync
-therefore emits a barrier before that `tmov`. Restoring the overlap aliases the
-`trowargmax` scratch with the next iteration's MTE2 load destination. That adds
+Structurally, for `(2,39)`, D0 contains a loop-carried V-to-V WAR from the
+prior iteration's `trowargmax` read to the next iteration's else-arm `tmov`
+write. InsertSync therefore emits a barrier before that `tmov`. Restoring the
+overlap aliases the `trowargmax` scratch with the next iteration's MTE2 load
+destination. That adds
 a V-to-MTE2 recurrence, and the existing MTE2-to-V load-completion handoff then
 makes the direct V-to-V dependency transitively implied. The barrier disappears
 inside `InsertSyncAnalysis`; phase-by-phase dumps show it is already absent
@@ -318,10 +322,10 @@ The exact logical-to-lowered trace is:
 | `(38,42)` | `144 -> 153` | scalar `tgetval` -> post-loop `texpands` | adds S-to-V handoff `59 -> 61` and V barrier `52 -> 61` | once after the loop |
 | `(38,79)` | `144 -> 194/195` | scalar `tgetval` -> branch `tadd`/`tmov` | adds branch-lifted S-to-V handoff `59 -> 64` | once after the loop |
 
-The other relations separate exposed work from structural counts. `(38,42)`
-places a scalar-to-vector wait on the post-loop path and is measurably exposed.
-`(3,38)` adds a V barrier with substantial slack. `(38,79)` adds an event pair
-whose delay is hidden completely. Consequently neither logical reuse count nor
+The other relations separate measured effects from structural counts.
+`(38,42)` adds post-loop synchronization and has a reproducible positive
+effect. `(3,38)` adds a V barrier but costs only about 0.4%. `(38,79)` adds an
+event pair and is a latency null. Consequently neither logical reuse count nor
 barrier count alone is a defensible penalty model.
 
 The branch-aware schedule graph uses one zero-duration control point per
@@ -352,46 +356,50 @@ does not explain the measured ordering:
 
 | Relation | Predicted marginal | Existing two-device result | Interpretation |
 | -------- | ------------------ | -------------------------- | -------------- |
-| `(2,39)` | `0` cycles | about `-2.1%/-2.3%` | misses the beneficial barrier removal |
+| `(2,39)` | `0` cycles | about `-2.1%/-2.3%` | correctly shows no collapsed-DAG barrier exposure, but does not explain the placement effect |
 | `(3,38)` | `0` cycles | about `+0.4%` | negligible effect, correctly treated as slack |
 | `(38,42)` | `+189` cycles | about `+1.9%` | correct sign, underestimated magnitude |
 | `(38,79)` | `+56` cycles | null | small structural false positive |
 
-The queue/event model `static_unrolled_pipe_event_branch_extremes_v2` is the
-next implementation step. It explicitly unrolls statically bounded loops,
-preserves each pipe's FIFO issue order, maps loop-carried events from iteration
-`i` to `i + 1`, and prices an emitted barrier as an explicit per-pipe pipeline
-break. PTO-ISA motivates that term: a barrier flushes the pipe's pending tail,
-clears its queue, and therefore makes the following operation repay startup.
-The term is supplied through `pipe_barrier_cycles`; absent pipe calibration is
-reported as incomplete rather than replaced by a default.
+The queue/event model `static_unrolled_pipe_event_branch_extremes_v2`
+explicitly unrolls statically bounded loops, preserves each pipe's FIFO issue
+order, and maps loop-carried events from iteration `i` to `i + 1`. A prospective
+device validation recovered the real branch profile independently as six THEN
+and two ELSE blocks. On ten topology contrasts, the model removed both sign
+errors made by unsigned reuse count, but it did not beat emitted barrier-site
+count and it missed the central `(2,39)` result:
 
-Dynamic branch outcomes are still missing from the schedule export. The model
-therefore reports all-then/all-else *extremes*, applying one choice to all
-dynamic occurrences of a branch, instead of pretending that the maximum arm
-is the measured invocation. These are not bounds for a mixed per-iteration
-branch profile.
+| Relation | Real-profile queue/event marginal | Existing result |
+| -------- | --------------------------------- | --------------- |
+| `(2,39)` | `0` cycles | beneficial, about `-2.1%/-2.3%` |
+| `(3,38)` | `+63` cycles when active | small regression, about `+0.4%` |
+| `(38,42)` | `+192` cycles | regression, about `+1.9%` |
+| `(38,79)` | `+56` cycles | latency null |
 
-Using only PTO-ISA's pinned one-cycle barrier-instruction floor as a diagnostic
-(not as a calibrated tail-plus-restart cost) changes the Gumbel retrospective:
+The removed node-49 barrier is in the ELSE arm. It does not execute in the six
+long THEN blocks, yet those blocks carry most of the measured improvement.
+Therefore the experiment does **not** establish that removing the barrier
+caused the `(2,39)` speedup. A placement-by-barrier 2x2 factorial, plus a
+same-footprint code-layout control after device disassembly, is required for
+that claim.
 
-| Relation | Queue/event marginal across branch extremes | Existing result |
-| -------- | ------------------------------------------- | --------------- |
-| `(2,39)` | `[-63, 0]` cycles | beneficial, about `-2.1%/-2.3%` |
-| `(3,38)` | `[0, +63]` cycles | small regression, about `+0.4%` |
-| `(38,42)` | `[+192, +1090]` cycles | regression, about `+1.9%` |
-| `(38,79)` | `[+56, +954]` cycles | latency null |
+The same validation rejects a per-pipe constant: device-0 calibration from
+`(3,38)` and `(38,42)` differs by 4.40x. PTO-ISA explains why. A barrier charges
+the barrier instruction, drains queued predecessor tail work, clears the
+stream, and makes the successor repay startup. The public evaluator therefore
+also reports `queue_drain_restart_signed_marginal`, whose site cost is:
 
-This is a useful directional improvement: it exposes the beneficial barrier
-removal and the two harmful additions without fitting device latency. It is
-not yet a validated penalty oracle. `(38,79)` remains a false positive,
-the measured invocation has a mixed loop-branch profile, and the full
-tail/startup split still needs sequence-matched calibration. PTO-ISA defines
-the queue/flush/restart mechanism; real-device measurements validate the
-parameter used by the penalty model.
-`evaluate` retains the previous scalar prediction and additionally reports
-`queue_event_signed_marginal`, including per-scenario deltas and a strict
-direction only when every extreme agrees.
+```text
+barrier instruction + predecessor pending tail + successor stream restart
+```
+
+The startup/tail split is resolved by complete operation signature from pinned
+PTO-ISA data or an explicit calibration. Transfers for which the split is not
+available fail closed. This is intentional for node 49's `tmov`: the factorial
+and disassembly must establish the device mechanism before a value is fitted.
+Barrier dependency provenance is read from the public exported
+`sync_groups.operations.dependency_node` field; the evaluator no longer needs
+a campaign-private reconstruction path.
 
 ```bash
 python -m pypto.tools.dsa_schedule_model evaluate arm-manifest.json \

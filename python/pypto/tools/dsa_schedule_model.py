@@ -147,6 +147,14 @@ class PipeParameters:
     minimum_cycles: float
 
 
+@dataclass(frozen=True)
+class PipelineComponents:
+    """Operation-specific synchronization-boundary pipeline state."""
+
+    startup_cycles: float
+    pending_tail_cycles: float
+
+
 def _default_pipe_parameters() -> dict[str, PipeParameters]:
     # Generic pipe constants silently gave every unknown operation a plausible
     # duration.  A production prediction must instead use the pinned PTO-ISA
@@ -162,10 +170,12 @@ class DurationModel:
     model_version: str = "duration_v1"
     calibration_status: str = "unconfigured"
     sync_latency_cycles: float = 0.0
+    barrier_instruction_cycles: float = 1.0
     pipe_barrier_cycles: dict[str, float] = field(default_factory=dict)
     pipe_parameters: dict[str, PipeParameters] = field(default_factory=_default_pipe_parameters)
     operation_cycles: dict[str, float] = field(default_factory=dict)
     operation_signature_cycles: dict[str, float] = field(default_factory=dict)
+    operation_signature_pipeline: dict[str, PipelineComponents] = field(default_factory=dict)
     calibration_sources: list[str] = field(default_factory=list)
     pto_isa_provider: PtoIsaDurationProvider | None = None
 
@@ -198,6 +208,26 @@ class DurationModel:
         barrier_cycles = {str(pipe): float(cycles) for pipe, cycles in raw_barriers.items()}
         if any(not math.isfinite(cycles) or cycles < 0 for cycles in barrier_cycles.values()):
             raise ValueError("pipe_barrier_cycles must contain finite non-negative values")
+        barrier_instruction_cycles = float(value.get("barrier_instruction_cycles", 1.0))
+        if not math.isfinite(barrier_instruction_cycles) or barrier_instruction_cycles < 0:
+            raise ValueError("barrier_instruction_cycles must be finite and non-negative")
+        raw_pipeline = value.get("operation_signature_pipeline", {})
+        if not isinstance(raw_pipeline, Mapping):
+            raise ValueError("operation_signature_pipeline must be an object")
+        pipeline: dict[str, PipelineComponents] = {}
+        for signature, raw in raw_pipeline.items():
+            if not isinstance(signature, str) or not isinstance(raw, Mapping):
+                raise ValueError("invalid operation_signature_pipeline entry")
+            components = PipelineComponents(
+                startup_cycles=float(raw["startup_cycles"]),
+                pending_tail_cycles=float(raw["pending_tail_cycles"]),
+            )
+            if any(
+                not math.isfinite(item) or item < 0
+                for item in (components.startup_cycles, components.pending_tail_cycles)
+            ):
+                raise ValueError("operation_signature_pipeline cycles must be finite and non-negative")
+            pipeline[signature] = components
         raw_provider = value.get("pto_isa_provider")
         if raw_provider is not None and not isinstance(raw_provider, Mapping):
             raise ValueError("pto_isa_provider must be an object")
@@ -206,10 +236,12 @@ class DurationModel:
             model_version=str(value.get("model_version", "duration_v1")),
             calibration_status=str(value.get("calibration_status", "unknown")),
             sync_latency_cycles=float(value.get("sync_latency_cycles", 0.0)),
+            barrier_instruction_cycles=barrier_instruction_cycles,
             pipe_barrier_cycles=barrier_cycles,
             pipe_parameters=pipes,
             operation_cycles={str(key): float(cycles) for key, cycles in raw_ops.items()},
             operation_signature_cycles={str(key): float(cycles) for key, cycles in raw_signatures.items()},
+            operation_signature_pipeline=pipeline,
             calibration_sources=[str(path) for path in value.get("calibration_sources", [])],
             pto_isa_provider=(
                 PtoIsaDurationProvider.from_json(raw_provider) if raw_provider is not None else None
@@ -1166,6 +1198,84 @@ def _latency_graph_completeness(
     }
 
 
+def _propagate_barrier_dependency_provenance(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Materialize exported barrier dependency nodes as public sync edges.
+
+    PTOAS attaches the operation drained by a barrier to the barrier operation
+    record.  Older consumers looked only at ``sync_edges`` and therefore had
+    to reach into private campaign helpers to recover this provenance.  Keep
+    the public evaluator fail-closed, but make the exported operation field the
+    authoritative source when it is present.
+    """
+    normalized = copy.deepcopy(dict(record))
+    nodes = {
+        node["id"]
+        for node in normalized.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
+    }
+    raw_edges = normalized.get("sync_edges", [])
+    if not isinstance(raw_edges, list):
+        raise ValueError("schedule sync_edges must be an array")
+    edges = [dict(edge) for edge in raw_edges if isinstance(edge, Mapping)]
+    existing = {(edge.get("source"), edge.get("target"), edge.get("group")) for edge in edges}
+    recovered = 0
+    missing = 0
+    barrier_sites = 0
+    for group in normalized.get("sync_groups", []):
+        if not isinstance(group, Mapping):
+            continue
+        group_id = group.get("id")
+        for operation in group.get("operations", []):
+            if (
+                not isinstance(operation, Mapping)
+                or operation.get("useless") is True
+                or not str(operation.get("type", "")).startswith("pipe_barrier")
+            ):
+                continue
+            barrier_sites += 1
+            source = operation.get("dependency_node")
+            target = operation.get("node")
+            if (
+                not isinstance(source, int)
+                or not isinstance(target, int)
+                or source not in nodes
+                or target not in nodes
+            ):
+                missing += 1
+                continue
+            key = (source, target, group_id)
+            if key in existing:
+                continue
+            edges.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "group": group_id,
+                    "src_pipe": operation.get("src_pipe", group.get("src_pipe")),
+                    "dst_pipe": operation.get("dst_pipe", group.get("dst_pipe")),
+                    "loop_carried": bool(group.get("loop_carried", False)),
+                    "root_buffers": list(group.get("root_buffers", [])),
+                }
+            )
+            existing.add(key)
+            recovered += 1
+    normalized["sync_edges"] = edges
+    limitations = dict(normalized.get("export_limitations", {}))
+    if barrier_sites == 0:
+        prior_missing = limitations.get("barrier_dependency_nodes_missing", 0)
+        if isinstance(prior_missing, int) and prior_missing > 0:
+            missing = prior_missing
+    limitations["barrier_dependency_nodes_missing"] = missing
+    normalized["export_limitations"] = limitations
+    normalized["barrier_dependency_provenance"] = {
+        "source": "sync_groups.operations.dependency_node",
+        "barrier_site_count": barrier_sites,
+        "recovered_sync_edge_count": recovered,
+        "missing_dependency_node_count": missing,
+    }
+    return normalized
+
+
 def estimate_node_durations(
     record: Mapping[str, Any], model: DurationModel
 ) -> tuple[dict[int, float], dict[int, dict[str, Any]], list[int]]:
@@ -1744,6 +1854,195 @@ def _pipe_barrier_sites(record: Mapping[str, Any]) -> list[tuple[int, str, int]]
                 raise ValueError(f"pipe barrier at node {target} has no execution pipe")
             sites.setdefault((target, pipe), group_id if isinstance(group_id, int) else -1)
     return [(target, pipe, group) for (target, pipe), group in sorted(sites.items())]
+
+
+def _pipeline_components_for_node(
+    node: Mapping[str, Any], model: DurationModel
+) -> tuple[PipelineComponents | None, dict[str, Any]]:
+    """Resolve the stream state charged at a barrier without a pipe constant."""
+    try:
+        signature = operation_duration_signature(node)
+        signature_key = _operation_signature_key(signature)
+    except ValueError as error:
+        return None, {"source": "unavailable", "detail": str(error)}
+    components = model.operation_signature_pipeline.get(signature_key)
+    source = "exact_signature_pipeline_override"
+    if components is None:
+        compatible: list[tuple[PipelineComponents, str]] = []
+        for key, candidate in model.operation_signature_pipeline.items():
+            try:
+                expected = json.loads(key)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(expected, Mapping) and _duration_signatures_compatible(expected, signature):
+                compatible.append((candidate, key))
+        distinct = {(item.startup_cycles, item.pending_tail_cycles) for item, _ in compatible}
+        if len(distinct) > 1:
+            raise ValueError("ambiguous compatible exact-signature pipeline overrides")
+        if compatible:
+            components = compatible[0][0]
+            source = "compatible_signature_pipeline_override"
+    if components is not None:
+        return components, {
+            "source": source,
+            "detail": "complete operation-signature stream components",
+            "signature": signature,
+        }
+    if model.pto_isa_provider is not None:
+        estimate = model.pto_isa_provider.estimate_pipeline(node)
+        if estimate is not None:
+            return (
+                PipelineComponents(
+                    startup_cycles=estimate.startup_cycles,
+                    pending_tail_cycles=estimate.pending_tail_cycles,
+                ),
+                {
+                    "source": estimate.source,
+                    "detail": estimate.detail,
+                    "signature": signature,
+                },
+            )
+    return None, {
+        "source": "unavailable",
+        "detail": "no pinned startup/pending-tail split for this complete operation signature",
+        "signature": signature,
+    }
+
+
+def _barrier_dependency_sites(record: Mapping[str, Any], model: DurationModel) -> list[dict[str, Any]]:
+    """Describe each emitted barrier as drained work plus successor restart."""
+    nodes = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
+    }
+    loop_counts, dynamic_loops = _loop_multipliers(record)
+    if dynamic_loops:
+        raise ValueError(
+            "queue_drain_restart_v1 requires statically bounded loops; "
+            f"dynamic loop nodes: {dynamic_loops[:8]}"
+        )
+    sites: dict[tuple[int, int, str], dict[str, Any]] = {}
+    for group in record.get("sync_groups", []):
+        if not isinstance(group, Mapping):
+            continue
+        for operation in group.get("operations", []):
+            if (
+                not isinstance(operation, Mapping)
+                or operation.get("useless") is True
+                or not str(operation.get("type", "")).startswith("pipe_barrier")
+            ):
+                continue
+            source = operation.get("dependency_node")
+            target = operation.get("node")
+            if (
+                not isinstance(source, int)
+                or source not in nodes
+                or not isinstance(target, int)
+                or target not in nodes
+            ):
+                continue
+            pipe = operation.get("src_pipe", group.get("src_pipe", nodes[target].get("pipe")))
+            if not isinstance(pipe, str):
+                raise ValueError(f"pipe barrier at node {target} has no execution pipe")
+            key = (source, target, pipe)
+            if key in sites:
+                continue
+            predecessor, predecessor_provenance = _pipeline_components_for_node(nodes[source], model)
+            successor, successor_provenance = _pipeline_components_for_node(nodes[target], model)
+            multiplier = math.prod(
+                loop_counts.get(loop, 1)
+                for loop in nodes[target].get("loop_stack", [])
+                if isinstance(loop, int)
+            )
+            complete = predecessor is not None and successor is not None
+            site_cycles = None
+            if predecessor is not None and successor is not None:
+                site_cycles = (
+                    model.barrier_instruction_cycles
+                    + predecessor.pending_tail_cycles
+                    + successor.startup_cycles
+                )
+            sites[key] = {
+                "source": source,
+                "target": target,
+                "pipe": pipe,
+                "group": group.get("id"),
+                "loop_multiplier": multiplier,
+                "barrier_instruction_cycles": model.barrier_instruction_cycles,
+                "predecessor_pending_tail_cycles": (
+                    predecessor.pending_tail_cycles if predecessor is not None else None
+                ),
+                "successor_restart_cycles": successor.startup_cycles if successor is not None else None,
+                "site_cycles": site_cycles,
+                "expanded_cycles": site_cycles * multiplier if site_cycles is not None else None,
+                "predecessor_provenance": predecessor_provenance,
+                "successor_provenance": successor_provenance,
+                "predecessor_complete": predecessor is not None,
+                "successor_complete": successor is not None,
+                "complete": complete,
+            }
+    return list(sites.values())
+
+
+def _score_queue_drain_restart(record: Mapping[str, Any], model: DurationModel) -> dict[str, Any]:
+    """Price barriers from queued predecessor tail and successor restart."""
+    branch_ids, markers = _branch_alternatives(record)
+    if len(branch_ids) > 6:
+        raise ValueError(f"queue_drain_restart_v1 supports at most 6 branches, got {len(branch_ids)}")
+    nodes = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
+    }
+    sites = _barrier_dependency_sites(record, model)
+    scenarios: list[dict[str, Any]] = []
+    for values in itertools.product((False, True), repeat=len(branch_ids)):
+        choices = dict(zip(branch_ids, values, strict=True))
+        active_sites: list[dict[str, Any]] = []
+        for site in sites:
+            if not _node_active_in_branch_scenario(nodes[site["target"]], choices, markers):
+                continue
+            predecessor_active = _node_active_in_branch_scenario(nodes[site["source"]], choices, markers)
+            complete = bool(site["successor_complete"]) and (
+                bool(site["predecessor_complete"]) or not predecessor_active
+            )
+            scenario_site = dict(site)
+            scenario_site["predecessor_active"] = predecessor_active
+            scenario_site["complete"] = complete
+            scenario_cycles = None
+            if complete:
+                scenario_cycles = (
+                    model.barrier_instruction_cycles
+                    + (float(site["predecessor_pending_tail_cycles"]) if predecessor_active else 0.0)
+                    + float(site["successor_restart_cycles"])
+                )
+            scenario_site["site_cycles"] = scenario_cycles
+            scenario_site["expanded_cycles"] = (
+                scenario_cycles * int(site["loop_multiplier"]) if scenario_cycles is not None else None
+            )
+            active_sites.append(scenario_site)
+        scenario_complete = all(site["complete"] for site in active_sites)
+        scenarios.append(
+            {
+                "branch_choices": {str(node): choice for node, choice in sorted(choices.items())},
+                "active_site_count": len(active_sites),
+                "complete": scenario_complete,
+                "total_cycles": (
+                    sum(float(site["expanded_cycles"]) for site in active_sites)
+                    if scenario_complete
+                    else None
+                ),
+                "active_sites": active_sites,
+            }
+        )
+    return {
+        "model_version": "queue_drain_successor_restart_v1",
+        "cost_definition": "barrier instruction + predecessor pending tail + successor stream restart",
+        "scenario_count": len(scenarios),
+        "sites": sites,
+        "scenarios": scenarios,
+    }
 
 
 def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph expansion
@@ -2458,6 +2757,7 @@ def _existing_loop_sync_models(
 
 def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str, Any]:
     """Score one PTOAS schedule graph and its synchronization exposure."""
+    record = _propagate_barrier_dependency_provenance(record)
     operation_durations, provenance, dynamic_loops = estimate_node_durations(record, model)
     if dynamic_loops:
         raise ValueError(
@@ -2499,6 +2799,7 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
     queue_event_score = _score_static_queue_event_graph(
         record, operation_durations, model.pipe_barrier_cycles
     )
+    queue_drain_restart_score = _score_queue_drain_restart(record, model)
 
     edge_exposure: list[dict[str, Any]] = []
     for source, target, _, kind, group in full_edges:
@@ -2529,6 +2830,7 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "status": record.get("status", "<unknown>"),
         "schedule_export_source": record.get("export_source", "native_schedule_graph_v1"),
         "schedule_export_limitations": record.get("export_limitations", {}),
+        "barrier_dependency_provenance": record["barrier_dependency_provenance"],
         "control_flow_graph_version": prepared_record.get("control_flow_graph_version"),
         "control_point_nodes": prepared_record.get("control_point_nodes", []),
         "duration_model_version": model.model_version,
@@ -2559,6 +2861,7 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         "queue_event_baseline_makespan_cycles": queue_event_score["baseline_makespan_cycles"],
         "queue_event_synchronization_exposure_cycles": queue_event_score["synchronization_exposure_cycles"],
         "queue_event_model": queue_event_score,
+        "queue_drain_restart_model": queue_drain_restart_score,
         "loop_latency_lower_bounds": loop_latency_lower_bounds,
         "synchronization_exposure_cycles": max(0.0, full - baseline),
         "baseline_critical_path": baseline_path,
@@ -3726,10 +4029,12 @@ def calibrate_from_metrics(paths: Sequence[str | Path], base: DurationModel | No
             else "simulator_complete_signature_medians"
         ),
         sync_latency_cycles=model.sync_latency_cycles,
+        barrier_instruction_cycles=model.barrier_instruction_cycles,
         pipe_barrier_cycles=dict(model.pipe_barrier_cycles),
         pipe_parameters=calibrated_pipes,
         operation_cycles=dict(model.operation_cycles),
         operation_signature_cycles=signature_cycles,
+        operation_signature_pipeline=dict(model.operation_signature_pipeline),
         calibration_sources=sorted(used_sources),
         pto_isa_provider=model.pto_isa_provider,
     )
@@ -4482,6 +4787,91 @@ def _queue_event_signed_marginal(baseline: Mapping[str, Any], candidate: Mapping
     }
 
 
+def _queue_drain_restart_signed_marginal(
+    baseline: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Compare only changed barrier sites, allowing a signed marginal cost."""
+
+    def scenarios_by_choice(score: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+        result: dict[str, Mapping[str, Any]] = {}
+        for scenario in score.get("scenarios", []):
+            if not isinstance(scenario, Mapping) or not isinstance(scenario.get("branch_choices"), Mapping):
+                raise ValueError("queue-drain score has an invalid branch scenario")
+            key = json.dumps(scenario["branch_choices"], sort_keys=True, separators=(",", ":"))
+            if key in result:
+                raise ValueError(f"duplicate queue-drain branch scenario {key}")
+            result[key] = scenario
+        if not result:
+            raise ValueError("queue-drain score has no branch scenarios")
+        return result
+
+    def active_sites(scenario: Mapping[str, Any]) -> dict[tuple[int, int, str], Mapping[str, Any]]:
+        result: dict[tuple[int, int, str], Mapping[str, Any]] = {}
+        for site in scenario.get("active_sites", []):
+            if not isinstance(site, Mapping):
+                raise ValueError("queue-drain active site must be an object")
+            source = site.get("source")
+            target = site.get("target")
+            pipe = site.get("pipe")
+            if not isinstance(source, int) or not isinstance(target, int) or not isinstance(pipe, str):
+                raise ValueError("queue-drain active site has invalid provenance")
+            key = (source, target, pipe)
+            result[key] = site
+        return result
+
+    baseline_scenarios = scenarios_by_choice(baseline)
+    candidate_scenarios = scenarios_by_choice(candidate)
+    if baseline_scenarios.keys() != candidate_scenarios.keys():
+        raise ValueError("planner arms expose different queue-drain branch scenarios")
+    rows: list[dict[str, Any]] = []
+    for key in sorted(baseline_scenarios):
+        before = active_sites(baseline_scenarios[key])
+        after = active_sites(candidate_scenarios[key])
+        added = [after[site] for site in sorted(after.keys() - before.keys())]
+        removed = [before[site] for site in sorted(before.keys() - after.keys())]
+        for common in before.keys() & after.keys():
+            if before[common].get("expanded_cycles") != after[common].get("expanded_cycles"):
+                raise ValueError(f"common barrier site {common} has different pipeline costs across arms")
+        complete = all(site.get("complete") is True for site in [*added, *removed])
+        delta = (
+            sum(float(site["expanded_cycles"]) for site in added)
+            - sum(float(site["expanded_cycles"]) for site in removed)
+            if complete
+            else None
+        )
+        rows.append(
+            {
+                "branch_choices": dict(baseline_scenarios[key]["branch_choices"]),
+                "complete": complete,
+                "delta_cycles": delta,
+                "added_sites": added,
+                "removed_sites": removed,
+            }
+        )
+    complete = all(row["complete"] for row in rows)
+    deltas = [float(row["delta_cycles"]) for row in rows if row["delta_cycles"] is not None]
+    minimum = min(deltas) if complete else None
+    maximum = max(deltas) if complete else None
+    if not complete:
+        conclusion = "PIPELINE_COMPONENTS_INCOMPLETE"
+    elif maximum is not None and maximum < 0:
+        conclusion = "BENEFICIAL_ALL_BRANCH_EXTREMES"
+    elif minimum is not None and minimum > 0:
+        conclusion = "HARMFUL_ALL_BRANCH_EXTREMES"
+    elif minimum == maximum == 0:
+        conclusion = "TIE_ALL_BRANCH_EXTREMES"
+    else:
+        conclusion = "BRANCH_PATH_DEPENDENT"
+    return {
+        "model_version": "queue_drain_successor_restart_signed_marginal_v1",
+        "complete": complete,
+        "minimum_delta_cycles": minimum,
+        "maximum_delta_cycles": maximum,
+        "direction_conclusion": conclusion,
+        "scenarios": rows,
+    }
+
+
 def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> dict[str, Any]:  # noqa: PLR0912 - validation is deliberately fail-closed
     """Score paired planner arms and compare them with optional observations.
 
@@ -4556,6 +4946,10 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
             arm_results["baseline"]["queue_event_model"],
             arm_results["candidate"]["queue_event_model"],
         )
+        queue_drain_restart_marginal = _queue_drain_restart_signed_marginal(
+            arm_results["baseline"]["queue_drain_restart_model"],
+            arm_results["candidate"]["queue_drain_restart_model"],
+        )
         if baseline_cycles <= 0:
             raise ValueError(f"{path}: comparison {label} has a non-positive baseline prediction")
         predicted_delta = candidate_cycles - baseline_cycles
@@ -4615,6 +5009,7 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
                     "pre_codegen_sync_record_summary"
                 ],
                 "queue_event_signed_marginal": queue_event_marginal,
+                "queue_drain_restart_signed_marginal": queue_drain_restart_marginal,
                 "predicted_delta_cycles": predicted_delta,
                 "signed_marginal_sync_cost_cycles": predicted_delta,
                 "predicted_relative_delta": predicted_relative_delta,
