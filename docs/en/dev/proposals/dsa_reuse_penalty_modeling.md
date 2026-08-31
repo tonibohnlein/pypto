@@ -327,6 +327,84 @@ dependencies. Model v2 fixes the methodological error directly: it ignores all
 InsertSync records and rebuilds the base graph from logical SSA/allocation
 roots and fixed pipe order.
 
+### Global synchronization-weight sensitivity
+
+The first host-only calibration sweep rescored the complete placement graph at
+one global synchronization-edge weight over `16, 24, 32, 48, 64, 80, 96, 128,
+160` cycles. It did not fit a per-kernel or per-edge constant. Device orderings
+cleared the evaluation threshold only when two devices agreed and each effect
+reached 2%. In the machine-readable output these rows are called
+`MULTI_DEVICE_THRESHOLD_CLEARED`: this is a deterministic two-device effect-size
+gate, not a confidence-interval claim. Below-threshold rows were retained as
+diagnostics but never used for calibration.
+
+Leave-one-workload-out calibration uses one predeclared global utility:
+`+1` for a correct strict ordering, `-1` for a wrong strict ordering, and `0`
+for silence. Ties prefer more correct and then more strict predictions. This
+prevents a selectively silent 1/1 predictor from defeating a broadly correct
+predictor merely because its reported accuracy is 100%.
+
+Coverage is the binding result. Of 17 measured problem-capacity cells with
+reconstructed graph inputs, 12 cells from only two workloads are complete under
+the current straight-line/static-loop contract. Five cells are excluded by
+conditional candidate endpoints; one of those also has an incomplete historical
+access join. None of the 12 eligible Cypress-versus-DSA-RP comparisons clears
+the 2% gate on both devices, so both leave-one-workload-out folds are
+`INSUFFICIENT_THRESHOLD_CLEARED_TRAINING_COMPARISONS` and no global weight is
+calibrated.
+
+The sensitivity sweep is mostly silent. Weights 16--24 cycles predict no strict
+Cypress-versus-DSA-RP ordering. At 32 cycles and at 48--160 cycles there is only
+one strict cell, RMSNorm at tight capacity; its direction flips between 32 and
+48 cycles. At a diagnostic 1% threshold, four cells become device-decided, but
+weights 48--160 distinguish only one of them. The apparent 1/1 accuracy is
+therefore 25% prediction coverage, not evidence for a stable global interval.
+
+The requested representative cases expose the missing model coverage and the
+remaining mechanism gap:
+
+| Case | Existing two-device evidence | Unit objective | Whole-function model status |
+| ---- | ---------------------------- | -------------- | --------------------------- |
+| `rmsnorm_rope_cache_write/half` | DSA-RP over Cypress `-7.19%/-7.43%` | `8 -> 0` | Ineligible: branches and dynamic loops. A branch-free regional diagnostic identifies a Cypress-only V-to-MTE2 hazard, but it is not a whole-function score. |
+| `kv_score_proj_c128/native` | DSA-RP over Cypress `-2.50%/-2.30%` | `64 -> 64` | Ineligible: conditional endpoints; the archived export also omitted lowered access sites. The unit tie and the speedup remain unexplained. |
+| `mtp/gate` | Cypress faster at all four capacities, approximately `1.6--4.1%` | DSA-RP ties or improves the count | Ineligible: control flow. This remains the principal counterexample to interpreting a lower unit objective as lower latency. |
+| `gumbel_argmax/q1` | DSA-RP versus Cypress `+0.22%/+0.11%`, a latency null | `14 -> 0` | Ineligible: conditional endpoints. A large structural gap can be hidden completely. |
+| `hc_post/native` | weak, sign-changing, or non-reproducing effects across campaigns | `33 -> 24` in the original cell | Ineligible: dynamic/control-flow structure and unsuitable as a calibration label. |
+
+The durable device sources are
+`dsa-rp-loop-aware-model-prospective-0820ab418-final.tar.gz`
+(`1a7e5d5ffe93a43b260012d47af98321cb5a10156ecc8486dbc37f00767374d2`)
+and `dsa-rp-four-candidate-physical-penalty-aeba32c70-final.tar.gz`
+(`a05aad5829865d196bc7d7a415b40d8c06b3e6b566d1f80fce269352c78765a0`).
+Every `score-realized-grid` result records the SHA-256 of its schedule, problem,
+solution, duration model, and optional non-materialization evidence, plus the
+selected function and fail-closed duration policy. A grid can be reproduced
+without opening latency data while scoring each frozen placement:
+
+```bash
+python -m pypto.tools.dsa_schedule_model score-realized-grid \
+  SCHEDULE.jsonl PROBLEM.dsa.json SOLUTION.dsa.solution.json \
+  --function FUNCTION --model DURATION_MODEL.json \
+  --sync-latency-grid 16,24,32,48,64,80,96,128,160 -o ARM_GRID.json
+python -m pypto.tools.dsa_penalty_model_evaluation sync-weight-grid-input.tsv \
+  --sync-weight-grid --split development --minimum-device-effect 0.02 \
+  --required-device-count 2 -o sync-weight-grid-evaluation.json
+```
+
+For the reported 2% development analysis, the joined input TSV hashes to
+`86d5dd525cc98c01e7cf48bffeab0c623b5c4ad59dcaf421faf0492141876594`
+and the evaluator output hashes to
+`a0711862d013b7a2532f73da4602026a8f08cfa6de3a45d127c94da71c1b0189`.
+The 1% diagnostic output hashes to
+`581c27397ab6cc7609b97b3412c6a996310d198043ed037f407279d79100b132`.
+
+This analysis fails the gate for an incremental critical-path planner. The
+planner has not been changed and no new device task is justified from this
+grid. The next local requirement is a complete branch-aware and dynamic-loop
+placement DAG for the representative cases, followed by the same global-weight
+evaluation on enough independent workloads to make leave-one-workload-out
+calibration meaningful.
+
 Scoring each arm's actual post-InsertSync graph gives the intended analysis
 oracle. On the same retrospective corpus, every one of 40 strict model
 orderings agrees with the measured direction; all 24 strict comparisons whose

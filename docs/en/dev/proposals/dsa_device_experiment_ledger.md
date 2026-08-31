@@ -1,6 +1,6 @@
 # DSA-RP Device Experiment Ledger
 
-Last consolidated: 2026-08-30.
+Last consolidated: 2026-08-31.
 
 ## Purpose
 
@@ -45,6 +45,7 @@ be pooled. Capacity sensitivity rows are not independent workloads.
 | `dsa-rp-four-candidate-physical-penalty-aeba32c70-final.tar.gz` | four new workloads, 6,400 samples | `kv_score_proj_c128` confirmed DSA-RP over Cypress by about 2.3-2.5% despite more sync sites; Gumbel's large unit-cost gap was a latency null. Critical-path coverage was incomplete. |
 | `dsa-rp-kv-gumbel-legal-ablations-2bdc441b0-final.tar.gz` | five relation families, address controls, 6,400 samples | Restoring Gumbel `(2,39)` both removed one static ELSE-arm barrier and improved latency by 2.1-2.35%; this established a causal placement-relation contrast, not that the barrier caused the speedup. `(38,42)` cost about 1.9%, `(3,38)` about 0.4%, and `(38,79)` was null. KV `(8,22)` was not causal; all translation controls were null. |
 | `dsa-rp-queue-event-model-device-validation-9217dd575-final.tar.gz` | 16 endpoints, 6,400 samples, 32 branch-profile swimlanes | The real 6-THEN/2-ELSE profile makes the `(2,39)` barrier marginal exactly zero, while the measured improvement is carried mainly by the long THEN blocks. A per-pipe barrier constant was rejected by a 4.40x calibration spread. The barrier-causality question remains unresolved pending a placement x barrier factorial. |
+| `dsa-rp-gumbel-barrier-factorial-ff5d8121e-final.tar.gz` | placement-by-barrier factorial, branch-profile controls, two devices | Runtime execution of the node-49 barrier is not causal: the approximately 2.1% effect persists when its branch never executes and disappears when it executes in every row. A source-level barrier toggle causes broad downstream binary differences, but no scheduling, register-allocation, layout, or encoding mechanism was isolated. The paper-safe result is a compiler-mediated non-local binary change with exact mechanism unresolved; this contrast is excluded from barrier-cost calibration. |
 
 ## Campaigns that deliberately stopped before useful timing
 

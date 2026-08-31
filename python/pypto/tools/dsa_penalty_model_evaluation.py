@@ -44,18 +44,34 @@ REQUIRED_COLUMNS = (
     "cypress_actual_alias_pairs",
     "cypress_packing_attempts",
 )
+SYNC_WEIGHT_COLUMNS = (
+    "workload_id",
+    "case_id",
+    "capacity",
+    "device",
+    "weight_cycles",
+    "analysis_status",
+    "cypress_penalty_cycles",
+    "dsa_rp_penalty_cycles",
+    "cypress_latency_us",
+    "dsa_rp_latency_us",
+)
 
 
-def _read_rows(path: Path) -> list[dict[str, str]]:
+def _read_table(path: Path, required_columns: Sequence[str]) -> list[dict[str, str]]:
     with path.open(newline="") as source:
         reader = csv.DictReader(source, delimiter="\t")
-        missing = sorted(set(REQUIRED_COLUMNS) - set(reader.fieldnames or ()))
+        missing = sorted(set(required_columns) - set(reader.fieldnames or ()))
         if missing:
             raise ValueError(f"{path}: missing columns: {', '.join(missing)}")
         rows = [dict(row) for row in reader]
     if not rows:
         raise ValueError(f"{path}: input table is empty")
     return rows
+
+
+def _read_rows(path: Path) -> list[dict[str, str]]:
+    return _read_table(path, REQUIRED_COLUMNS)
 
 
 def _number(value: str, *, field: str, allow_empty: bool = False) -> float | None:
@@ -67,6 +83,13 @@ def _number(value: str, *, field: str, allow_empty: bool = False) -> float | Non
         raise ValueError(f"{field} must be numeric, got {value!r}") from error
     if not math.isfinite(result):
         raise ValueError(f"{field} must be finite, got {value!r}")
+    return result
+
+
+def _text(value: str, *, field: str) -> str:
+    result = value.strip()
+    if not result:
+        raise ValueError(f"{field} must be non-empty")
     return result
 
 
@@ -277,19 +300,379 @@ def evaluate_rows(
     }
 
 
+def _observed_classification(
+    device_effects: Mapping[str, float], minimum_device_effect: float
+) -> tuple[str, int | None]:
+    directions = {_direction(effect) for effect in device_effects.values()}
+    if len(directions) != 1:
+        return "DEVICE_CONFLICT", None
+    direction = next(iter(directions))
+    if direction == 0:
+        return "EXACT_TIE", 0
+    if len(device_effects) >= 2 and all(
+        abs(effect) >= minimum_device_effect for effect in device_effects.values()
+    ):
+        return "MULTI_DEVICE_THRESHOLD_CLEARED", direction
+    return "SIGN_CONSISTENT_BELOW_THRESHOLD", direction
+
+
+def _weight_summary(rows: Sequence[Mapping[str, Any]], observed_class: str) -> dict[str, Any]:
+    selected = [row for row in rows if row["observed_class"] == observed_class]
+    strict = [row for row in selected if row["predicted_direction"] != 0]
+    correct = sum(row["predicted_direction"] == row["observed_direction"] for row in strict)
+    wrong = len(strict) - correct
+    calibration_utility = correct - wrong
+    return {
+        "observed_cell_count": len(selected),
+        "predicted_strict_count": len(strict),
+        "predicted_silent_count": len(selected) - len(strict),
+        "correct_count": correct,
+        "wrong_count": wrong,
+        "calibration_utility": calibration_utility,
+        "strict_accuracy": correct / len(strict) if strict else None,
+        "prediction_coverage": len(strict) / len(selected) if selected else None,
+    }
+
+
+def _best_weight_rows(
+    rows_by_weight: Mapping[float, Sequence[Mapping[str, Any]]],
+) -> tuple[list[float], dict[str, Any] | None]:
+    candidates: list[tuple[tuple[int, int, int, int], float, dict[str, Any]]] = []
+    for weight, rows in sorted(rows_by_weight.items()):
+        summary = _weight_summary(rows, "MULTI_DEVICE_THRESHOLD_CLEARED")
+        accuracy = summary["strict_accuracy"]
+        if accuracy is None:
+            continue
+        # One global utility is fixed before leave-one-workload-out calibration:
+        # correct strict ordering = +1, wrong strict ordering = -1, silence = 0.
+        # Coverage then breaks utility ties, so a selectively silent 1/1 model
+        # cannot outrank a broadly correct model merely through higher accuracy.
+        key = (
+            int(summary["calibration_utility"]),
+            int(summary["correct_count"]),
+            int(summary["predicted_strict_count"]),
+            -int(summary["wrong_count"]),
+        )
+        candidates.append((key, weight, summary))
+    if not candidates:
+        return [], None
+    best_key = max(key for key, _, _ in candidates)
+    best = [(weight, summary) for key, weight, summary in candidates if key == best_key]
+    return [weight for weight, _ in best], best[0][1]
+
+
+def _ranking_intervals(
+    weights: Sequence[float], rows_by_weight: Mapping[float, Sequence[Mapping[str, Any]]]
+) -> list[dict[str, Any]]:
+    signatures = {
+        weight: tuple(
+            (row["workload_id"], row["case_id"], row["capacity"], row["predicted_direction"])
+            for row in sorted(
+                rows_by_weight[weight],
+                key=lambda item: (item["workload_id"], item["case_id"], item["capacity"]),
+            )
+        )
+        for weight in weights
+    }
+    intervals: list[dict[str, Any]] = []
+    begin = 0
+    for index in range(1, len(weights) + 1):
+        if index < len(weights) and signatures[weights[index]] == signatures[weights[begin]]:
+            continue
+        intervals.append(
+            {
+                "minimum_weight_cycles": weights[begin],
+                "maximum_weight_cycles": weights[index - 1],
+                "grid_point_count": index - begin,
+                "strict_prediction_count": sum(
+                    direction != 0 for *_, direction in signatures[weights[begin]]
+                ),
+            }
+        )
+        begin = index
+    return intervals
+
+
+def _modeled_weight_comparison(
+    workload: str,
+    case_id: str,
+    capacity: str,
+    weight: float,
+    cell_rows: Sequence[Mapping[str, str]],
+    observed_by_device: dict[tuple[str, str, str, str], tuple[float, float]],
+    minimum_device_effect: float,
+) -> tuple[dict[str, Any], set[str]]:
+    effects: dict[str, float] = {}
+    for row in cell_rows:
+        device = row["device"]
+        cypress_latency = _number(row["cypress_latency_us"], field="cypress_latency_us")
+        dsa_latency = _number(row["dsa_rp_latency_us"], field="dsa_rp_latency_us")
+        assert cypress_latency is not None and dsa_latency is not None
+        if cypress_latency <= 0 or dsa_latency <= 0:
+            raise ValueError("device latencies must be positive")
+        effect = dsa_latency / cypress_latency - 1.0
+        observation_key = (workload, case_id, capacity, device)
+        latency_pair = (cypress_latency, dsa_latency)
+        previous = observed_by_device.setdefault(observation_key, latency_pair)
+        if previous != latency_pair:
+            raise ValueError(f"{observation_key}: exact device latencies change across weights")
+        if device in effects:
+            raise ValueError(f"{observation_key}: duplicate device row at weight {weight}")
+        effects[device] = effect
+
+    first = cell_rows[0]
+    cypress_score = _number(first["cypress_penalty_cycles"], field="cypress_penalty_cycles")
+    dsa_score = _number(first["dsa_rp_penalty_cycles"], field="dsa_rp_penalty_cycles")
+    assert cypress_score is not None and dsa_score is not None
+    if cypress_score < 0 or dsa_score < 0:
+        raise ValueError("modeled penalty cycles must be non-negative")
+    for row in cell_rows[1:]:
+        other_cypress = _number(row["cypress_penalty_cycles"], field="cypress_penalty_cycles")
+        other_dsa = _number(row["dsa_rp_penalty_cycles"], field="dsa_rp_penalty_cycles")
+        if other_cypress != cypress_score or other_dsa != dsa_score:
+            raise ValueError(f"{workload}/{case_id}/{capacity}/{weight}: model score varies by device")
+    observed_class, observed_direction = _observed_classification(effects, minimum_device_effect)
+    return (
+        {
+            "workload_id": workload,
+            "case_id": case_id,
+            "capacity": capacity,
+            "weight_cycles": weight,
+            "cypress_penalty_cycles": cypress_score,
+            "dsa_rp_penalty_cycles": dsa_score,
+            "predicted_direction": _direction(dsa_score - cypress_score),
+            "observed_class": observed_class,
+            "observed_direction": observed_direction,
+            "device_effects": dict(sorted(effects.items())),
+        },
+        set(effects),
+    )
+
+
+def _grid_cell_identity(
+    case_key: tuple[str, str, str],
+    weight: float,
+    cell_rows: Sequence[Mapping[str, str]],
+    required_device_count: int,
+) -> tuple[set[str], set[str]]:
+    devices = [row["device"] for row in cell_rows]
+    if len(devices) != len(set(devices)):
+        raise ValueError(f"{case_key}: duplicate device row at weight {weight}")
+    if len(devices) != required_device_count:
+        raise ValueError(
+            f"{case_key}: expected exactly {required_device_count} devices at weight {weight}, "
+            f"got {len(devices)}"
+        )
+    statuses = {row["analysis_status"] for row in cell_rows}
+    if len(statuses) != 1:
+        raise ValueError(f"{case_key}: analysis status varies by device at weight {weight}")
+    return set(devices), statuses
+
+
+def evaluate_sync_weight_grid(
+    rows: Sequence[Mapping[str, str]],
+    *,
+    minimum_device_effect: float = 0.02,
+    required_device_count: int = 2,
+) -> dict[str, Any]:
+    """Evaluate one global synchronization weight with leave-one-workload-out calibration.
+
+    The input contains Cypress and DSA-RP scores for every weight and repeats the
+    same frozen device observations at each weight.  A device result is treated
+    as threshold-cleared only when the required devices agree in direction and
+    every magnitude reaches ``minimum_device_effect``.  This is a deterministic
+    effect-size gate, not a confidence-interval claim.  Calibration never falls
+    back to the below-threshold rows.
+    """
+    if not math.isfinite(minimum_device_effect) or minimum_device_effect < 0:
+        raise ValueError("minimum_device_effect must be finite and non-negative")
+    if not isinstance(required_device_count, int) or required_device_count < 2:
+        raise ValueError("required_device_count must be an integer of at least two")
+
+    grouped: dict[tuple[str, str, str, float], list[Mapping[str, str]]] = defaultdict(list)
+    weights: set[float] = set()
+    for row in rows:
+        workload = _text(row["workload_id"], field="workload_id")
+        case_id = _text(row["case_id"], field="case_id")
+        capacity = _text(row["capacity"], field="capacity")
+        device = _text(row["device"], field="device")
+        status = _text(row["analysis_status"], field="analysis_status")
+        weight = _number(row["weight_cycles"], field="weight_cycles")
+        assert weight is not None
+        if weight <= 0:
+            raise ValueError("weight_cycles must be positive")
+        weights.add(weight)
+        normalized = dict(row)
+        normalized.update(
+            workload_id=workload,
+            case_id=case_id,
+            capacity=capacity,
+            device=device,
+            analysis_status=status,
+        )
+        grouped[(workload, case_id, capacity, weight)].append(normalized)
+    ordered_weights = sorted(weights)
+
+    comparisons: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    observed_by_device: dict[tuple[str, str, str, str], tuple[float, float]] = {}
+    expected_weights: dict[tuple[str, str, str], set[float]] = defaultdict(set)
+    statuses_by_case: dict[tuple[str, str, str], set[str]] = {}
+    devices_by_case: dict[tuple[str, str, str], set[str]] = {}
+    for (workload, case_id, capacity, weight), cell_rows in sorted(grouped.items()):
+        case_key = (workload, case_id, capacity)
+        expected_weights[case_key].add(weight)
+        device_set, statuses = _grid_cell_identity(case_key, weight, cell_rows, required_device_count)
+        previous_devices = devices_by_case.setdefault(case_key, device_set)
+        if device_set != previous_devices:
+            raise ValueError(f"{case_key}: device set changes across weights")
+        previous_statuses = statuses_by_case.setdefault(case_key, statuses)
+        if statuses != previous_statuses:
+            raise ValueError(f"{case_key}: analysis status changes across weights")
+        if statuses != {"MODELED"}:
+            excluded.append(
+                {
+                    "workload_id": workload,
+                    "case_id": case_id,
+                    "capacity": capacity,
+                    "weight_cycles": weight,
+                    "reason": ",".join(sorted(statuses)),
+                }
+            )
+            continue
+        comparison, modeled_devices = _modeled_weight_comparison(
+            workload,
+            case_id,
+            capacity,
+            weight,
+            cell_rows,
+            observed_by_device,
+            minimum_device_effect,
+        )
+        if modeled_devices != device_set:
+            raise ValueError(f"{case_key}: modeled device set does not match the declared cell")
+        comparisons.append(comparison)
+
+    for key, actual_weights in expected_weights.items():
+        if actual_weights != weights:
+            raise ValueError(f"{key}: incomplete weight grid")
+
+    rows_by_weight = {
+        weight: [row for row in comparisons if row["weight_cycles"] == weight] for weight in ordered_weights
+    }
+    sensitivity = [
+        {
+            "weight_cycles": weight,
+            "threshold_cleared": _weight_summary(rows_by_weight[weight], "MULTI_DEVICE_THRESHOLD_CLEARED"),
+            "sign_consistent_below_threshold": _weight_summary(
+                rows_by_weight[weight], "SIGN_CONSISTENT_BELOW_THRESHOLD"
+            ),
+        }
+        for weight in ordered_weights
+    ]
+
+    workloads = sorted({row["workload_id"] for row in comparisons})
+    folds: list[dict[str, Any]] = []
+    for held_out in workloads:
+        training = {
+            weight: [row for row in weight_rows if row["workload_id"] != held_out]
+            for weight, weight_rows in rows_by_weight.items()
+        }
+        best_weights, training_summary = _best_weight_rows(training)
+        if not best_weights:
+            folds.append(
+                {
+                    "held_out_workload": held_out,
+                    "status": "INSUFFICIENT_THRESHOLD_CLEARED_TRAINING_COMPARISONS",
+                }
+            )
+            continue
+        selected_weight = best_weights[len(best_weights) // 2]
+        held_out_rows = [row for row in rows_by_weight[selected_weight] if row["workload_id"] == held_out]
+        folds.append(
+            {
+                "held_out_workload": held_out,
+                "status": "CALIBRATED",
+                "optimal_training_weights": best_weights,
+                "selected_weight_cycles": selected_weight,
+                "training": training_summary,
+                "held_out_threshold_cleared": _weight_summary(
+                    held_out_rows, "MULTI_DEVICE_THRESHOLD_CLEARED"
+                ),
+            }
+        )
+
+    best_weights, all_data_summary = _best_weight_rows(rows_by_weight)
+    intervals = _ranking_intervals(ordered_weights, rows_by_weight) if comparisons else []
+    eligible_cases = {(row["workload_id"], row["case_id"], row["capacity"]) for row in comparisons}
+    return {
+        "schema_version": 1,
+        "model": "complete_placement_dag_global_sync_weight_grid_v1",
+        "minimum_device_effect": minimum_device_effect,
+        "required_device_count": required_device_count,
+        "calibration_objective": {
+            "correct_strict_ordering": 1,
+            "wrong_strict_ordering": -1,
+            "silent_prediction": 0,
+            "tie_break": "more correct, then more strict predictions, then fewer wrong",
+        },
+        "weights_cycles": ordered_weights,
+        "eligible_workload_count": len(workloads),
+        "declared_case_count": len(expected_weights),
+        "eligible_case_count": len(eligible_cases),
+        "excluded_case_count": len(expected_weights) - len(eligible_cases),
+        "excluded_grid_row_count": len(excluded),
+        "sensitivity": sensitivity,
+        "ranking_intervals": intervals,
+        "rankings_stable_across_full_grid": len(intervals) == 1,
+        "leave_one_workload_out": folds,
+        "all_development_data_optimal_weights": best_weights,
+        "all_development_data_summary": all_data_summary,
+        "comparisons": comparisons,
+        "excluded": excluded,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("--split", required=True)
     parser.add_argument("--freeze-before-timing", action="store_true")
+    parser.add_argument(
+        "--sync-weight-grid",
+        action="store_true",
+        help="evaluate Cypress-versus-DSA-RP rows over one global synchronization-weight grid",
+    )
+    parser.add_argument(
+        "--minimum-device-effect",
+        type=float,
+        default=0.02,
+        help="per-device relative-effect floor for a threshold-cleared ordering (default: 0.02)",
+    )
+    parser.add_argument(
+        "--required-device-count",
+        type=int,
+        default=2,
+        help="exact number of devices required in every grid cell (default: 2)",
+    )
     parser.add_argument("-o", "--output", type=Path)
     args = parser.parse_args(argv)
     try:
-        result = evaluate_rows(
-            _read_rows(args.input),
-            split=args.split,
-            freeze_before_timing=args.freeze_before_timing,
-        )
+        if args.sync_weight_grid:
+            if args.freeze_before_timing:
+                raise ValueError("a synchronization-weight grid requires observed development timing")
+            result = evaluate_sync_weight_grid(
+                _read_table(args.input, SYNC_WEIGHT_COLUMNS),
+                minimum_device_effect=args.minimum_device_effect,
+                required_device_count=args.required_device_count,
+            )
+            result["split"] = args.split
+        else:
+            result = evaluate_rows(
+                _read_rows(args.input),
+                split=args.split,
+                freeze_before_timing=args.freeze_before_timing,
+            )
         result["input"] = {
             "path": str(args.input.resolve()),
             "sha256": hashlib.sha256(args.input.read_bytes()).hexdigest(),
