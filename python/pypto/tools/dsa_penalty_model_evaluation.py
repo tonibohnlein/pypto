@@ -29,6 +29,7 @@ METRICS = (
     "unique_induced_sync_edge_count",
     "estimated_sync_endpoint_executions",
     "critical_path_realized_cost_cycles",
+    "complete_placement_critical_path_cycles",
 )
 REQUIRED_COLUMNS = (
     "case_id",

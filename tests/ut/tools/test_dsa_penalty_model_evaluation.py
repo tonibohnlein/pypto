@@ -29,6 +29,12 @@ def _cell(
         "cypress": "10",
         "dsa_rp_cg": "5",
     }
+    complete_critical_path = {
+        "geometry_ff": "18",
+        "geometry_cg": "18",
+        "cypress": "9",
+        "dsa_rp_cg": "4",
+    }
     physical_groups = {"geometry_ff": "2", "geometry_cg": "2", "cypress": "0", "dsa_rp_cg": "1"}
     sync_edges = {"geometry_ff": "2", "geometry_cg": "2", "cypress": "0", "dsa_rp_cg": "1"}
     sync_endpoints = {"geometry_ff": "4", "geometry_cg": "4", "cypress": "0", "dsa_rp_cg": "2"}
@@ -45,6 +51,7 @@ def _cell(
             "unique_induced_sync_edge_count": sync_edges[arm],
             "estimated_sync_endpoint_executions": sync_endpoints[arm],
             "critical_path_realized_cost_cycles": critical_path[arm],
+            "complete_placement_critical_path_cycles": complete_critical_path[arm],
             "latency_us": latencies[arm],
             "cypress_auxiliary_edges": "100" if arm == "cypress" else "",
             "cypress_relaxed_edges": "20" if arm == "cypress" else "",

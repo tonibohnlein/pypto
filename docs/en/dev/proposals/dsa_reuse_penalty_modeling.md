@@ -254,7 +254,7 @@ synchronization site's enclosing loop bound is dynamic or unresolved, or when
 the site is nested in unresolved conditional/control-flow regions. Unstructured
 control flow also makes the function-level estimate incomplete.
 
-The realized-placement scorer keeps five distinct levels of evidence instead
+The realized-placement scorer keeps six distinct levels of evidence instead
 of treating every logical buffer pair as an independent hardware event:
 
 1. `unit_realized_cost` counts the promoted logical buffer-pair weights;
@@ -263,15 +263,90 @@ of treating every logical buffer pair as an independent hardware event:
 3. `unique_induced_sync_edge_count` collapses those groups again by verified
    schedule-edge identity;
 4. `estimated_sync_endpoint_executions` applies static loop trip counts to the
-   unique source and target endpoints; and
-5. `critical_path_realized_cost_cycles` prices their modeled exposed delay.
+   unique source and target endpoints;
+5. `critical_path_realized_cost_cycles` sums the singleton critical-path
+   extension assigned to each realized logical relation; and
+6. `complete_placement_critical_path_cycles` inserts the union of all unique
+   realized dependency edges into one reference DAG and computes one
+   longest-path extension.
 
 The physical-range key includes the full two placed ranges, not only their
 intersection: distinct tile layouts can share the same intersection. This
 canonicalization removes duplicate alias evidence but does not infer an
 undocumented hardware bank or interleave mapping. The penalty-model evaluator
-reports all five metrics so a device ordering can reveal the first abstraction
+reports all six metrics so a device ordering can reveal the first abstraction
 level at which the arms actually separate.
+
+The sixth metric is the InsertSync-independent complete-placement score in
+model v2. It reconstructs the non-reusing base graph from two sources only:
+
+- fixed issue order on every execution pipe; and
+- logical-root RAW, WAR, and WAW dependencies derived from operation
+  `uses`/`defs` metadata.
+
+Cross-pipe dependencies already present in this base graph carry the same
+calibrated synchronization edge cost as placement-induced dependencies;
+same-pipe dependencies rely on FIFO pipe order and add no separate cost. This
+preserves the baseline synchronization slack against which a reuse edge is
+measured.
+
+Existing `sync_edges`, synchronization groups, barrier records, and physical
+addresses do not participate in the base graph. For each pair of buffers that
+the placement physically overlaps, the scorer joins the exported pre-InsertSync
+access provenance to a directed address-reuse hazard. Every unique hazard is
+inserted once with the positive calibrated `sync_latency_cycles` edge weight.
+The complete placement penalty is
+
+```text
+penalty(P) = LP(G_no_reuse + E_reuse(P)) - LP(G_no_reuse)
+```
+
+This is not the sum of pairwise penalties. One finite longest-path calculation
+captures duplicate edges, transitive ordering, shared slack, and interactions
+among all selected relations. Static loops are expanded to dynamic operation
+occurrences, so a distance-one hazard connects iteration `i` to `i + 1` and
+pays the synchronization weight on every exposed recurrence.
+
+The positive edge weight models the synchronization mechanism in addition to
+the overlap destroyed by the new precedence constraint. A zero value is only a
+dependency lower bound and is rejected as uncalibrated by model v2. The weight
+may initially be one architecture-level constant and later become pipe-pair or
+signature specific, but it must be frozen independently of the placements
+being evaluated.
+
+The scorer fails closed for dynamic loops, control-flow branches, missing
+branch nodes, unresolved access joins, incomplete synchronization-predictor
+coverage, an uncalibrated edge weight, or an oversized finite expansion. An old
+export that omitted branch nodes is therefore `INCOMPLETE`; it is never treated
+as a branch-free graph with zero placement cost.
+
+An August 2026 host-only re-export initially reported zero complete-placement
+extension because it used the geometry endpoint's post-InsertSync graph as the
+reference. That graph already contained geometry's placement-induced
+dependencies. Model v2 fixes the methodological error directly: it ignores all
+InsertSync records and rebuilds the base graph from logical SSA/allocation
+roots and fixed pipe order.
+
+Scoring each arm's actual post-InsertSync graph gives the intended analysis
+oracle. On the same retrospective corpus, every one of 40 strict model
+orderings agrees with the measured direction; all 24 strict comparisons whose
+device effect is at least 2% agree. RMSNorm geometry scores 12,736 cycles versus
+12,249 for both Cypress and DSA-RP, predicting the correct speedup direction
+but only about 3.8% versus the measured 21.6--22.7%. A one-edge graph ablation
+isolates the modeled difference: geometry adds a V-to-MTE2 dependency from the
+first loop's end to the second loop's beginning. Removing that edge changes
+12,736 to 12,249 cycles; adding it to Cypress changes 12,249 to 12,736. Thus
+the post-InsertSync latency approach is directionally useful on this corpus,
+while its magnitude model remains incomplete.
+
+The same re-export recovered product-faithful graphs and timing-blind logical
+and physical placement catalogs for the five-cell physical-penalty corpus.
+Those targets contain structured branches, so candidate model v1 still fails
+closed rather than inventing unconditional edges between mutually exclusive
+paths. The KV graph additionally lacks lowered sites for 48 of 128 raw
+candidate records. A branch-aware candidate-to-join mapping is therefore the
+next modeling requirement; the recovered catalogs preserve every branch and
+loop context needed to implement it.
 
 ### Signed post-InsertSync marginal cost
 
@@ -290,6 +365,31 @@ The `evaluate` command exports this value as
 `signed_marginal_sync_cost_cycles` and fails closed unless both latency graphs
 are complete. It remains an analysis oracle, not yet the sparse approximation
 used by the DSA solver.
+
+The evaluator also reconstructs the candidate dependency graph from the
+baseline plus the multiset delta of final InsertSync edges. Reconstruction must
+produce exactly the candidate's modeled makespan. It then scores each added or
+removed final edge independently in the baseline context:
+
+```text
+q(P' | P) = sum(e in E(P') - E(P)) delta_add(e | P)
+          + sum(e in E(P) - E(P')) delta_remove(e | P)
+```
+
+The report keeps `q` and the non-additive residual `p - q` separate. A
+deterministic sequential attribution is also emitted and must telescope to the
+exact marginal. This catches both duplicate synchronization edges and cases
+where several individually exposed dependencies cover the same critical-path
+segment.
+
+On the existing RMSNorm/top-k development slice, the final-edge approximation
+has 40 strict predictions and all 40 agree with device direction; all 24
+comparisons with a device effect of at least 2% also agree. The interaction
+residual is zero in all 72 arm/device comparisons. This is encouraging but is
+not yet a solver penalty: the approximation consumes the final InsertSync edge
+delta. The remaining compiler bridge must predict that delta from a logical
+reuse relation and its surrounding partial placement, including loop-boundary
+lifting and dependency implication.
 
 The controlled Gumbel study isolates four relations while holding operation
 order and address translation controls fixed. The synchronization column is a
