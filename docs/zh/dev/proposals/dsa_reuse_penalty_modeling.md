@@ -209,7 +209,7 @@ IR 不再保留 Final-SyncIR group identity。因此推断结果与实际 instru
 bound 为 dynamic 或无法解析，或者 site 位于无法解析的条件/控制流 region 中时，该估算就标记为
 incomplete，而不会猜测。unstructured control flow 同样会使 function-level 估算变为 incomplete：
 
-realized-placement scorer 会保留五个不同层次的证据，而不会把每个逻辑 buffer pair
+realized-placement scorer 会保留六个不同层次的证据，而不会把每个逻辑 buffer pair
 都视为独立的硬件事件：
 
 1. `unit_realized_cost` 统计被提升的逻辑 buffer-pair weight；
@@ -218,12 +218,71 @@ realized-placement scorer 会保留五个不同层次的证据，而不会把每
 3. `unique_induced_sync_edge_count` 再按照经过验证的 schedule-edge identity 折叠；
 4. `estimated_sync_endpoint_executions` 把静态 loop trip count 应用于唯一的 source 和
    target endpoint；
-5. `critical_path_realized_cost_cycles` 为模型中的 exposed delay 定价。
+5. `critical_path_realized_cost_cycles` 对每条已实现逻辑 relation 的 singleton
+   critical-path extension 求和；
+6. `complete_placement_critical_path_cycles` 把所有唯一的已实现 dependency edge
+   取并集后一次性加入 reference DAG，并计算一次 longest-path extension。
 
 物理 range key 包含两个完整的 placement range，而不只是它们的交集，因为不同 tile
 布局可能具有相同交集。该规范化会删除重复 alias 证据，但不会推断未公开的硬件 bank
-或 interleave mapping。penalty-model evaluator 会同时报告五个指标，从而可以通过设备
+或 interleave mapping。penalty-model evaluator 会同时报告六个指标，从而可以通过设备
 排序判断各 arm 最早在哪个抽象层出现区分。
+
+第六个指标是 model v2 中不依赖 InsertSync 的 complete-placement score。它只从两个来源
+重建不发生复用的 base graph：
+
+- 每条 execution pipe 上固定的 issue order；
+- 根据 operation `uses`/`defs` metadata 的 logical root 推导出的 RAW、WAR 与 WAW
+  dependency。
+
+基础图中原本存在的跨 pipe dependency 使用与布局新增 dependency 相同的已标定同步
+边代价；同一 pipe 内的 dependency 由 FIFO pipe 顺序保证，不再添加独立代价。这样可
+保留新增 reuse 边所依赖的基础同步 slack。
+
+已有的 `sync_edges`、synchronization group、barrier record 和物理地址都不会进入 base
+graph。对于 placement 中物理 overlap 的每对 buffer，scorer 会把导出的 pre-InsertSync
+access provenance join 为一条有向 address-reuse hazard。每条唯一 hazard 只插入一次，并
+使用经过校准的正 `sync_latency_cycles` edge weight。完整 placement penalty 为：
+
+```text
+penalty(P) = LP(G_no_reuse + E_reuse(P)) - LP(G_no_reuse)
+```
+
+该值不是 pairwise penalty 之和。一次有限 longest-path 计算会捕获重复 edge、传递顺序、
+共享 slack，以及所有已选 relation 之间的交互。静态 loop 会展开为动态 operation
+occurrence，因此 distance-one hazard 会把 iteration `i` 连接到 `i + 1`，并在每条 exposed
+recurrence 上计入 synchronization weight。
+
+正 edge weight 除了表示新 precedence constraint 破坏的 overlap 外，还表示
+synchronization mechanism 本身的代价。零值只是 dependency lower bound，model v2 会将
+其拒绝为未校准。初始版本可以使用一个 architecture-level constant，后续再细化为
+pipe-pair 或 signature-specific weight；但该值必须独立于待评估 placement 冻结。
+
+遇到 dynamic loop、control-flow branch、缺失 branch node、无法解析的 access join、
+不完整的 synchronization-predictor coverage、未校准 edge weight 或过大的有限展开时，
+scorer 会 fail closed。旧 exporter 遗漏 branch node 的输出因此会标记为 `INCOMPLETE`，
+绝不会被解释为 penalty 为零的 branch-free graph。
+
+2026 年 8 月的纯主机 re-export 最初报告 complete-placement extension 全部为零，因为它把
+geometry endpoint 的 post-InsertSync graph 当作 reference。该 graph 已包含 geometry
+placement 引入的 dependency。model v2 直接修复这一方法错误：它忽略全部 InsertSync
+record，并从 logical SSA/allocation root 与固定 pipe order 重建 base graph。
+
+对每个 arm 的实际 post-InsertSync graph 评分，才得到预期的 analysis oracle。在同一回顾
+corpus 上，40 个 strict model ordering 全部与实测方向一致；device effect 至少 2% 的
+24 个 strict comparison 也全部一致。RMSNorm geometry 为 12,736 cycle，Cypress 和
+DSA-RP 都为 12,249 cycle：预测的 speedup 方向正确，但幅度只有约 3.8%，而实测为
+21.6--22.7%。单 edge graph ablation 隔离了该差异：geometry 增加一条从第一个 loop 末尾
+到第二个 loop 开始处的 V-to-MTE2 dependency。删除它会把 12,736 变为 12,249 cycle；
+把它加入 Cypress 会把 12,249 变为 12,736。因此，post-InsertSync latency approach 在
+该 corpus 上具有方向区分力，但幅度模型仍不完整。
+
+同一 re-export 也为五个 cell 的 physical-penalty corpus 恢复了 product-faithful graph，
+以及不使用 timing 的逻辑 candidate 与物理 placement catalog。这些 target 包含结构化
+branch，因此 candidate model v1 仍会 fail closed，而不会在互斥路径之间虚构无条件
+edge。KV graph 还缺少 128 条 raw candidate record 中 48 条对应的 lowered site。
+因此下一项 modeling requirement 是 branch-aware candidate-to-join mapping；恢复的
+catalog 已保留实现该功能所需的全部 branch 与 loop context。
 
 ### 带符号的 post-InsertSync 边际代价
 
@@ -238,6 +297,26 @@ p(r | P) = L(InsertSync(P + r)) - L(InsertSync(P))
 该值有意保留符号：负值表示加入 `r` 后删除了更昂贵的 synchronization dependency。
 `evaluate` 命令将其导出为 `signed_marginal_sync_cost_cycles`，并在任一 latency
 graph 不完整时 fail closed。它目前是 analysis oracle，还不是 DSA solver 使用的稀疏近似。
+
+evaluator 还会从 baseline 加上最终 InsertSync edge 的 multiset delta 来重建 candidate
+dependency graph，并要求重建后的 modeled makespan 与真实 candidate 完全一致。随后，它在
+baseline context 中独立评分每条新增或删除的最终 edge：
+
+```text
+q(P' | P) = sum(e in E(P') - E(P)) delta_add(e | P)
+          + sum(e in E(P) - E(P')) delta_remove(e | P)
+```
+
+报告会分别保留 `q` 与非加性 residual `p - q`。同时导出的确定性 sequential
+attribution 必须 telescoping 到精确 marginal。这样既能发现重复 synchronization edge，
+也能发现多条单独 exposed 的 dependency 实际覆盖同一段 critical path 的情况。
+
+在现有 RMSNorm/top-k development slice 上，final-edge approximation 给出 40 个 strict
+prediction，40 个都与 device 方向一致；device effect 至少 2% 的 24 个 comparison 也全部
+一致。72 个 arm/device comparison 的 interaction residual 均为零。该结果值得继续，但它
+还不是 solver penalty：approximation 仍需读取最终 InsertSync edge delta。下一步 compiler
+bridge 必须从 logical reuse relation 及其周围 partial placement 预测该 delta，包括
+loop-boundary lifting 与 dependency implication。
 
 受控 Gumbel 实验在 operation order 与 address-translation control 不变的情况下隔离了
 四条 relation。下表的 synchronization 变化是各 relation contrast 的相关量，本身不是

@@ -42,9 +42,17 @@ def _with_access(node: dict, order: int, *, explicit: bool = True) -> dict:
     return node
 
 
-def _candidate(*, prior_site: int = 3, next_site: int = 7, distance: int = 0):
+def _candidate(
+    *,
+    prior_site: int = 3,
+    next_site: int = 7,
+    distance: int = 0,
+    first_buffer: int = 0,
+    second_buffer: int = 1,
+):
     return dsa_reuse_candidates.parse_candidate_record(
-        "0,1,0->1,ub->ub@vector_compute=>external->ub@inbound_dma,arenas=Vec->Vec,"
+        f"{first_buffer},{second_buffer},{first_buffer}->{second_buffer},"
+        "ub->ub@vector_compute=>external->ub@inbound_dma,arenas=Vec->Vec,"
         "write_after_read,no_logical_order,inter_operation,full_allocation,complete_access_set,"
         f"verified_initial_write,in_loop,distance_{distance},sites={prior_site}->{next_site},"
         "ranges=0+640->0+640,hazard=cross_resource,dag_path=none"
@@ -78,6 +86,12 @@ def _ten_cycle_model() -> dsa_schedule_model.DurationModel:
         "PIPE_V:TMULS": 10.0,
         "PIPE_MTE2:TLOAD": 10.0,
     }
+    return model
+
+
+def _weighted_sync_model(sync_latency_cycles: float = 5.0) -> dsa_schedule_model.DurationModel:
+    model = _ten_cycle_model()
+    model.sync_latency_cycles = sync_latency_cycles
     return model
 
 
@@ -1026,6 +1040,15 @@ def _loop_candidate_record(*, with_return_path: bool = False) -> dict:
         _with_access(_operation(1, "PIPE_MTE2", "pto.tload", [10]), 7),
         _with_access(_operation(2, "PIPE_V", "pto.tmuls", [10]), 3),
         _with_access(_operation(3, "PIPE_MTE2", "pto.tload", [10]), 9),
+        {
+            "id": 20,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 20,
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
     ]
     if with_return_path:
         record["sync_edges"] = [{"source": 1, "target": 0, "group": 7, "loop_carried": False}]
@@ -1638,6 +1661,280 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
     assert disjoint["unique_induced_sync_edge_count"] == 0
     assert disjoint["estimated_sync_endpoint_executions"] == 0
     assert disjoint["canonical_physical_reuse_groups"] == []
+
+
+def test_complete_placement_dag_unions_duplicate_pair_edges_once(tmp_path):
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    model = _weighted_sync_model()
+    candidates = [
+        _candidate(first_buffer=0, second_buffer=1),
+        _candidate(first_buffer=0, second_buffer=2),
+    ]
+    candidate_scores = dsa_schedule_model.score_reuse_candidates(record, candidates, model)
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(
+        json.dumps(
+            {
+                "problem": {
+                    "buffers": [
+                        {"id": 0, "size": 64},
+                        {"id": 1, "size": 64},
+                        {"id": 2, "size": 64},
+                    ]
+                }
+            }
+        )
+    )
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 0},
+                    {"buffer": 2, "pool": 1, "offset": 0},
+                ]
+            }
+        )
+    )
+
+    result = dsa_schedule_model.score_realized_reuse(
+        problem,
+        solution,
+        candidate_scores,
+        schedule_record=record,
+        model=model,
+    )
+
+    complete = result["complete_placement_dag"]
+    assert result["critical_path_realized_cost_cycles"] == 50.0
+    assert result["complete_placement_critical_path_cycles"] == 25.0
+    assert complete["status"] == "COMPLETE"
+    assert complete["base_makespan_cycles"] == 20.0
+    assert complete["placement_makespan_cycles"] == 45.0
+    assert complete["critical_path_extension_cycles"] == 25.0
+    assert complete["pairwise_additive_cost_cycles"] == 50.0
+    assert complete["nonadditive_interaction_cycles"] == -25.0
+    assert complete["reference_graph_contract"] == ("non_reusing_logical_ssa_memory_plus_fixed_pipe_order")
+    assert complete["candidate_edge_semantics"] == "pre_insert_sync_address_reuse_hazards_v1"
+    assert complete["insert_sync_policy"] == "not_consulted"
+    assert complete["synchronization_latency_cycles"] == 5.0
+    assert complete["realized_distance_zero_edge_count"] == 1
+    assert complete["realized_loop_carried_edge_count"] == 0
+    assert complete["distance_zero_edges"] == [[2, 1]]
+    assert complete["loop_carried_edges"] == []
+    assert complete["base_critical_path"] == {
+        "node_count": 2,
+        "head": [{"node": 0, "iterations": []}, {"node": 2, "iterations": []}],
+        "tail": [],
+        "truncated": False,
+    }
+    assert complete["placement_critical_path"] == {
+        "node_count": 4,
+        "head": [
+            {"node": 0, "iterations": []},
+            {"node": 2, "iterations": []},
+            {"node": 1, "iterations": []},
+            {"node": 3, "iterations": []},
+        ],
+        "tail": [],
+        "truncated": False,
+    }
+
+
+def test_complete_placement_dag_expands_loop_carried_edges_across_iterations(tmp_path):
+    record = _loop_candidate_record(with_return_path=True)
+    model = _weighted_sync_model()
+    candidate_scores = dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], model)
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(json.dumps({"problem": {"buffers": [{"id": 0, "size": 64}, {"id": 1, "size": 64}]}}))
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 0},
+                ]
+            }
+        )
+    )
+
+    result = dsa_schedule_model.score_realized_reuse(
+        problem,
+        solution,
+        candidate_scores,
+        schedule_record=record,
+        model=model,
+    )
+
+    complete = result["complete_placement_dag"]
+    assert complete["status"] == "COMPLETE"
+    assert complete["base_makespan_cycles"] == 80
+    assert complete["placement_makespan_cycles"] == 85
+    assert complete["critical_path_extension_cycles"] == 5
+    assert complete["pairwise_additive_cost_cycles"] == 60
+    assert complete["nonadditive_interaction_cycles"] == -55
+    assert complete["realized_distance_zero_edge_count"] == 0
+    assert complete["realized_loop_carried_edge_count"] == 1
+    assert complete["loop_carried_edges"] == [[10, 2, 1]]
+    assert complete["placement_critical_path"]["node_count"] == 12
+
+
+def test_complete_placement_dag_rejects_incomplete_reference_export(tmp_path):
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    model = _weighted_sync_model()
+    candidate_scores = dsa_schedule_model.score_reuse_candidates(record, [_candidate()], model)
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(json.dumps({"problem": {"buffers": [{"id": 0, "size": 64}, {"id": 1, "size": 64}]}}))
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 0},
+                ]
+            }
+        )
+    )
+    record["export_limitations"] = {
+        "barrier_dependency_nodes_missing": 0,
+        "branch_nodes_missing": 1,
+    }
+
+    result = dsa_schedule_model.score_realized_reuse(
+        problem,
+        solution,
+        candidate_scores,
+        schedule_record=record,
+        model=model,
+    )
+
+    assert result["complete_placement_critical_path_cycles"] is None
+    assert result["complete_placement_dag"] == {
+        "schema_version": 1,
+        "model_version": "complete_placement_dag_v2",
+        "status": "INCOMPLETE",
+        "limitations": ["export_limitations.branch_nodes_missing"],
+        "critical_path_extension_cycles": None,
+    }
+
+
+def test_complete_placement_dag_ignores_insert_sync_edges_and_barrier_provenance():
+    record = _record()
+    record["sync_edges"] = [{"source": 2, "target": 1, "group": 4, "loop_carried": False}]
+    record["sync_groups"] = [
+        {
+            "id": 4,
+            "src_pipe": "PIPE_V",
+            "dst_pipe": "PIPE_MTE2",
+            "operations": [
+                {
+                    "type": "pipe_barrier",
+                    "node": 1,
+                    "dependency_node": 0,
+                    "src_pipe": "PIPE_V",
+                    "dst_pipe": "PIPE_MTE2",
+                }
+            ],
+        }
+    ]
+    record["export_limitations"] = {
+        "barrier_dependency_nodes_missing": 1,
+        "branch_nodes_missing": 0,
+    }
+    candidate_scores = {
+        "schema_version": 2,
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+    }
+    realized = {
+        "pairs": [],
+        "synchronization_predictor_coverage_complete": True,
+        "critical_path_realized_cost_cycles": 0,
+    }
+
+    result = dsa_schedule_model.score_complete_placement_dag(
+        record, _weighted_sync_model(), candidate_scores, realized
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["critical_path_extension_cycles"] == 0
+    assert result["base_makespan_cycles"] == 20
+    assert result["placement_makespan_cycles"] == 20
+    assert result["insert_sync_policy"] == "not_consulted"
+
+
+def test_complete_placement_dag_rebuilds_base_dependencies_from_logical_roots():
+    record = _record(sync_edges=[{"source": 2, "target": 1, "group": 9, "loop_carried": False}])
+    record["nodes"][0]["uses"] = []
+    record["nodes"][0]["defs"] = [_memory("%shared", 640)]
+    record["nodes"][1]["uses"] = [_memory("%shared", 640)]
+    record["nodes"][1]["defs"] = [_memory("%loaded", 640)]
+    candidate_scores = {
+        "schema_version": 2,
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+    }
+    realized = {
+        "pairs": [],
+        "synchronization_predictor_coverage_complete": True,
+        "critical_path_realized_cost_cycles": 0,
+    }
+
+    result = dsa_schedule_model.score_complete_placement_dag(
+        record, _weighted_sync_model(), candidate_scores, realized
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["base_makespan_cycles"] == 35
+    assert result["placement_makespan_cycles"] == 35
+    assert result["critical_path_extension_cycles"] == 0
+    assert result["expanded_logical_memory_edge_count"] == 1
+    assert result["expanded_reuse_synchronization_edge_count"] == 0
+
+
+def test_complete_placement_dag_requires_pre_insert_sync_edges_and_positive_weight():
+    candidate_scores = {
+        "schema_version": 2,
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+    }
+    realized = {
+        "pairs": [],
+        "synchronization_predictor_coverage_complete": True,
+        "critical_path_realized_cost_cycles": 0,
+    }
+
+    result = dsa_schedule_model.score_complete_placement_dag(
+        _record(), _ten_cycle_model(), candidate_scores, realized
+    )
+
+    assert result == {
+        "schema_version": 1,
+        "model_version": "complete_placement_dag_v2",
+        "status": "INCOMPLETE",
+        "limitations": [
+            "candidate_edges_not_derived_from_pre_insert_sync_access_hazards",
+            "positive_synchronization_latency_not_calibrated",
+        ],
+        "critical_path_extension_cycles": None,
+    }
 
 
 def test_realized_placement_collapses_logical_pairs_by_physical_range(tmp_path):
@@ -3152,6 +3449,60 @@ def test_evaluate_arm_manifest_scores_direction_and_rank(tmp_path):
     assert result["summary"]["direction_accuracy"] == 1.0
     assert result["comparisons"][0]["predicted_relative_delta"] == 1.0
     assert result["comparisons"][0]["signed_marginal_sync_cost_cycles"] == 20.0
+    assert result["comparisons"][0]["final_edge_independent_sum_cycles"] == 20.0
+    assert result["comparisons"][0]["final_edge_interaction_cycles"] == 0.0
+    assert result["comparisons"][0]["post_insert_sync_signed_marginal"] == {
+        "schema_version": 1,
+        "model_version": "post_insert_sync_signed_marginal_v1",
+        "oracle_contract": "complete_legal_placements_with_actual_post_insert_sync_schedules",
+        "baseline_cycles": 20.0,
+        "candidate_cycles": 40.0,
+        "exact_signed_marginal_cycles": 20.0,
+        "exact_relative_delta": 1.0,
+        "added_final_sync_edges": [
+            {
+                "source": 2,
+                "target": 1,
+                "src_pipe": None,
+                "dst_pipe": None,
+                "loop_carried": False,
+                "root_buffers": [],
+            }
+        ],
+        "removed_final_sync_edges": [],
+        "candidate_reconstructed_from_final_edge_delta": True,
+        "final_edge_independent_signed_marginals": [
+            {
+                "effect": "add",
+                "edge": {
+                    "source": 2,
+                    "target": 1,
+                    "src_pipe": None,
+                    "dst_pipe": None,
+                    "loop_carried": False,
+                    "root_buffers": [],
+                },
+                "signed_marginal_cycles": 20.0,
+            }
+        ],
+        "final_edge_independent_sum_cycles": 20.0,
+        "final_edge_interaction_cycles": 0.0,
+        "final_edge_sequential_signed_marginals": [
+            {
+                "effect": "add",
+                "edge": {
+                    "source": 2,
+                    "target": 1,
+                    "src_pipe": None,
+                    "dst_pipe": None,
+                    "loop_carried": False,
+                    "root_buffers": [],
+                },
+                "signed_marginal_cycles": 20.0,
+            }
+        ],
+        "duration_coverage": {"baseline_exact": 1.0, "candidate_exact": 1.0},
+    }
     assert result["comparisons"][0]["queue_event_signed_marginal"] == {
         "model_version": "static_unrolled_pipe_event_branch_extremes_v2",
         "pipeline_break_model_complete": True,
@@ -3220,8 +3571,35 @@ def test_evaluate_arm_manifest_preserves_negative_marginal_sync_cost(tmp_path):
     assert row["baseline_cycles"] == 40.0
     assert row["candidate_cycles"] == 20.0
     assert row["signed_marginal_sync_cost_cycles"] == -20.0
+    assert row["final_edge_independent_sum_cycles"] == -20.0
+    assert row["final_edge_interaction_cycles"] == 0.0
     assert row["predicted_direction"] == -1
     assert "negative values are permitted" in result["marginal_cost_metric"]
+
+
+def test_post_insert_sync_marginal_reports_nonadditive_edge_interaction():
+    baseline = _record()
+    candidate = _record(
+        sync_edges=[
+            {"source": 0, "target": 1, "group": 6, "loop_carried": False},
+            {"source": 2, "target": 1, "group": 7, "loop_carried": False},
+        ]
+    )
+
+    result = dsa_schedule_model.score_post_insert_sync_marginal(baseline, candidate, _ten_cycle_model())
+
+    assert result["exact_signed_marginal_cycles"] == 20.0
+    assert result["candidate_reconstructed_from_final_edge_delta"] is True
+    assert [row["signed_marginal_cycles"] for row in result["final_edge_independent_signed_marginals"]] == [
+        10.0,
+        20.0,
+    ]
+    assert result["final_edge_independent_sum_cycles"] == 30.0
+    assert result["final_edge_interaction_cycles"] == -10.0
+    assert (
+        sum(row["signed_marginal_cycles"] for row in result["final_edge_sequential_signed_marginals"])
+        == result["exact_signed_marginal_cycles"]
+    )
 
 
 def test_evaluate_arm_manifest_compares_matching_branch_extremes(tmp_path):

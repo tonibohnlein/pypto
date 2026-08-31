@@ -34,6 +34,11 @@ precedence edge can have zero DAG extension while still creating synchronization
 pressure.  These are explicitly pre-codegen quantities, not counts of emitted
 instructions.  Scores also disclose every loop-carried, loop-marker, or omitted
 barrier dependency that the collapsed operation-only DAG cannot represent.
+
+The complete-placement model is independent of InsertSync. It rebuilds the
+non-reusing base DAG from logical-root RAW/WAR/WAW dependencies and fixed pipe
+order, adds every physical-placement reuse hazard with a calibrated positive
+synchronization latency, and scores the union with one longest-path calculation.
 """
 
 import argparse
@@ -1822,6 +1827,138 @@ def _node_active_in_branch_scenario(
     return True
 
 
+def _structured_operation_occurrences(
+    record: Mapping[str, Any],
+    clone_by_context: Mapping[int, Mapping[tuple[int, ...], int]],
+    stacks: Mapping[int, tuple[int, ...]],
+    loop_counts: Mapping[int, int],
+    active_nodes: Mapping[int, bool],
+) -> list[tuple[int, Mapping[str, Any]]]:
+    """Return operation clones in structured execution order.
+
+    This traversal expands the original, pre-InsertSync operation stream rather
+    than inferring program order from physical addresses or synchronization
+    records. It is intentionally branch-free; callers must select a concrete
+    branch scenario or fail closed before requesting the sequence.
+    """
+    nodes = [node for node in record.get("nodes", []) if isinstance(node, Mapping)]
+    positions = {node["id"]: index for index, node in enumerate(nodes) if isinstance(node.get("id"), int)}
+    occurrences: list[tuple[int, Mapping[str, Any]]] = []
+
+    def visit(start: int, stop: int, context: dict[int, int]) -> None:
+        index = start
+        while index < stop:
+            node = nodes[index]
+            node_id = node.get("id")
+            if not isinstance(node_id, int):
+                index += 1
+                continue
+            if node.get("kind") == "branch":
+                raise ValueError("non_reusing_ssa_pipe_dag_v1 requires a branch-free operation stream")
+            if node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_BEGIN":
+                end_id = node.get("end")
+                end_index = positions.get(end_id) if isinstance(end_id, int) else None
+                if end_index is None or end_index <= index or end_index >= stop:
+                    raise ValueError(f"static loop {node_id} has an invalid end marker {end_id}")
+                count = loop_counts.get(node_id)
+                if count is None:
+                    raise ValueError(f"static loop {node_id} has no resolved trip count")
+                for iteration in range(count):
+                    visit(index + 1, end_index, {**context, node_id: iteration})
+                index = end_index + 1
+                continue
+            if node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_END":
+                raise ValueError(f"unexpected loop-end marker {node_id} in structured traversal")
+            if node.get("kind") == "operation" and active_nodes.get(node_id, False):
+                stack = stacks.get(node_id)
+                if stack is None:
+                    raise ValueError(f"operation {node_id} has no expanded loop stack")
+                try:
+                    occurrence_context = tuple(context[loop] for loop in stack)
+                except KeyError as error:
+                    raise ValueError(
+                        f"operation {node_id} has an incomplete loop context for stack {stack}"
+                    ) from error
+                try:
+                    clone = clone_by_context[node_id][occurrence_context]
+                except KeyError as error:
+                    raise ValueError(
+                        f"operation {node_id} has no clone for loop context {occurrence_context}"
+                    ) from error
+                occurrences.append((clone, node))
+            index += 1
+
+    visit(0, len(nodes), {})
+    return occurrences
+
+
+def _expanded_logical_memory_edges(
+    occurrences: Sequence[tuple[int, Mapping[str, Any]]],
+    synchronization_latency_cycles: float,
+) -> list[tuple[int, int, float, str, int | None]]:
+    """Derive no-reuse RAW/WAR/WAW dependencies from logical allocation roots.
+
+    A dependency crossing execution pipes already requires synchronization in
+    the non-reusing program, so it carries the same calibrated synchronization
+    latency as a placement-induced cross-pipe dependency. Same-pipe ordering is
+    provided by the FIFO stream and therefore carries no extra edge latency.
+    """
+
+    def roots(node: Mapping[str, Any], field: str) -> set[str]:
+        accesses = node.get(field, [])
+        if not isinstance(accesses, list):
+            raise ValueError(f"schedule node {node.get('id')} has invalid {field} metadata")
+        result: set[str] = set()
+        for access in accesses:
+            if not isinstance(access, Mapping):
+                raise ValueError(f"schedule node {node.get('id')} has a non-object {field} entry")
+            root = access.get("root")
+            if not isinstance(root, str) or not root:
+                raise ValueError(f"schedule node {node.get('id')} has a {field} entry without a root")
+            result.add(root)
+        return result
+
+    last_writer: dict[str, int] = {}
+    readers_since_write: dict[str, set[int]] = defaultdict(set)
+    dependencies: set[tuple[int, int, str]] = set()
+    pipe_by_clone = {
+        clone: node.get("pipe") for clone, node in occurrences if isinstance(node.get("pipe"), str)
+    }
+    for clone, node in occurrences:
+        read_roots = roots(node, "uses")
+        write_roots = roots(node, "defs")
+        for root in read_roots:
+            writer = last_writer.get(root)
+            if writer is not None and writer != clone:
+                dependencies.add((writer, clone, "ssa_raw"))
+        for root in write_roots:
+            writer = last_writer.get(root)
+            if writer is not None and writer != clone:
+                dependencies.add((writer, clone, "ssa_waw"))
+            dependencies.update(
+                (reader, clone, "ssa_war") for reader in readers_since_write[root] if reader != clone
+            )
+        for root in write_roots:
+            last_writer[root] = clone
+            readers_since_write[root].clear()
+        for root in read_roots - write_roots:
+            readers_since_write[root].add(clone)
+    return [
+        (
+            source,
+            target,
+            (
+                synchronization_latency_cycles
+                if pipe_by_clone.get(source) != pipe_by_clone.get(target)
+                else 0.0
+            ),
+            kind,
+            None,
+        )
+        for source, target, kind in sorted(dependencies)
+    ]
+
+
 def _pipe_barrier_sites(record: Mapping[str, Any]) -> list[tuple[int, str, int]]:
     """Return unique lowered barrier sites as ``(target, pipe, group)``.
 
@@ -2050,6 +2187,11 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
     operation_durations: Mapping[int, float],
     pipe_barrier_cycles: Mapping[str, float],
     choices: Mapping[int, bool],
+    *,
+    logical_memory_dependencies: bool = False,
+    sync_edge_origin: str | None = None,
+    sync_edge_latency_cycles: float = 0.0,
+    include_barrier_sites: bool = True,
 ) -> dict[str, Any]:
     """Evaluate static loops with explicit per-pipe FIFO and sync recurrences.
 
@@ -2127,6 +2269,7 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
         kind: str,
         group: int | None,
         recurrence_loop: int | None = None,
+        latency_cycles: float = 0.0,
     ) -> None:
         if source not in clone_by_context or target not in clone_by_context:
             return
@@ -2148,7 +2291,7 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
                 raise ValueError(
                     f"expanded schedule edge {source}->{target} has no target context {target_context}"
                 )
-            edges.append((source_clone, target_clone, 0.0, kind, group))
+            edges.append((source_clone, target_clone, latency_cycles, kind, group))
 
     for edge in prepared.get("stream_edges", []):
         if not isinstance(edge, Mapping):
@@ -2185,10 +2328,22 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
                 recurrence_loop=loop_id,
             )
 
+    pipe_order_edge_count = len(edges)
+    logical_memory_edge_count = 0
+    if logical_memory_dependencies:
+        occurrences = _structured_operation_occurrences(
+            record, clone_by_context, stacks, loop_counts, active_nodes
+        )
+        memory_edges = _expanded_logical_memory_edges(occurrences, sync_edge_latency_cycles)
+        logical_memory_edge_count = len(memory_edges)
+        edges.extend(memory_edges)
+
     resolved_loop_carried = _effective_loop_carried_edge_indices(record)
     sync_edges = [edge for edge in prepared.get("sync_edges", []) if isinstance(edge, Mapping)]
     # The resolver indexes the original and prepared sync arrays identically.
     for edge_index, edge in enumerate(sync_edges):
+        if sync_edge_origin is not None and edge.get("analysis_origin") != sync_edge_origin:
+            continue
         source, target, group = edge.get("source"), edge.get("target"), edge.get("group")
         if not isinstance(source, int) or not isinstance(target, int):
             continue
@@ -2198,13 +2353,15 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
             kind="sync",
             group=group if isinstance(group, int) else None,
             recurrence_loop=resolved_loop_carried.get(edge_index),
+            latency_cycles=sync_edge_latency_cycles,
         )
 
     baseline_edges = [edge for edge in edges if edge[3] != "sync"]
     full_durations = dict(durations)
     calibrated_barriers = 0
     uncalibrated_barriers: list[dict[str, Any]] = []
-    for target, pipe, group in _pipe_barrier_sites(record):
+    barrier_sites = _pipe_barrier_sites(record) if include_barrier_sites else []
+    for target, pipe, group in barrier_sites:
         target_node = original_nodes.get(target)
         if target_node is None or not _node_active_in_branch_scenario(target_node, choices, branch_markers):
             continue
@@ -2225,7 +2382,8 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
         "branch_policy": "all_iteration_fixed_choice_scenario",
         "branch_choices": {str(node): choice for node, choice in sorted(choices.items())},
         "expanded_node_count": len(durations),
-        "expanded_stream_edge_count": len(baseline_edges),
+        "expanded_stream_edge_count": pipe_order_edge_count,
+        "expanded_logical_memory_edge_count": logical_memory_edge_count,
         "expanded_sync_edge_count": len(edges) - len(baseline_edges),
         "calibrated_pipe_barrier_site_count": calibrated_barriers,
         "uncalibrated_pipe_barrier_sites": uncalibrated_barriers,
@@ -3500,10 +3658,270 @@ def _realized_edge_explanations(
     return explanations
 
 
+def _static_dependency_makespan(
+    record: Mapping[str, Any],
+    operation_durations: Mapping[int, float],
+    synchronization_latency_cycles: float,
+) -> dict[str, Any]:
+    """Evaluate one branch-free, statically bounded no-reuse graph exactly.
+
+    Operations are cloned for every static loop occurrence. The base graph is
+    rebuilt from fixed per-pipe FIFO order and logical-root RAW/WAR/WAW
+    dependencies. Existing InsertSync edges and barrier records are ignored.
+    Only edges explicitly tagged ``realized_reuse_candidate`` are added, each
+    with the calibrated synchronization latency supplied by the duration
+    model.
+    """
+    branch_ids, _ = _branch_alternatives(record)
+    if branch_ids:
+        raise ValueError(
+            f"complete_placement_dag_v2 requires a branch-free schedule; branch nodes: {branch_ids[:8]}"
+        )
+    loop_counts, dynamic_loops = _loop_multipliers(record)
+    if dynamic_loops:
+        raise ValueError(
+            "complete_placement_dag_v2 requires statically bounded loops; "
+            f"dynamic loop nodes: {dynamic_loops[:8]}"
+        )
+    prepared = _prepare_control_flow_record(record)
+    original_nodes = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
+    }
+    expanded_nodes = sum(
+        math.prod(loop_counts[loop] for loop in _expanded_node_loop_stack(node, original_nodes))
+        for node in prepared.get("nodes", [])
+        if isinstance(node, Mapping)
+        and isinstance(node.get("id"), int)
+        and node.get("kind") in {"operation", "control_point"}
+    )
+    if expanded_nodes > _MAX_QUEUE_EVENT_EXPANDED_NODES:
+        raise ValueError(
+            "complete_placement_dag_v2 expansion exceeds the resource-safe node budget: "
+            f"{expanded_nodes}, limit {_MAX_QUEUE_EVENT_EXPANDED_NODES}"
+        )
+    return _score_static_queue_event_scenario(
+        record,
+        operation_durations,
+        {},
+        {},
+        logical_memory_dependencies=True,
+        sync_edge_origin="realized_reuse_candidate",
+        sync_edge_latency_cycles=synchronization_latency_cycles,
+        include_barrier_sites=False,
+    )
+
+
+def _schedule_with_realized_candidate_edges(
+    record: Mapping[str, Any],
+    distance_zero_edges: Sequence[Mapping[str, Any]],
+    loop_edges: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return a schedule containing the union of realized candidate edges."""
+    augmented = copy.deepcopy(record)
+    raw_sync_edges = augmented.setdefault("sync_edges", [])
+    if not isinstance(raw_sync_edges, list):
+        raise ValueError("schedule sync_edges must be an array")
+    group_ids = [
+        group.get("id")
+        for group in augmented.get("sync_groups", [])
+        if isinstance(group, Mapping) and isinstance(group.get("id"), int)
+    ]
+    next_group = max(group_ids, default=-1) + 1
+    loop_ends = {
+        node["id"]: node.get("end")
+        for node in augmented.get("nodes", [])
+        if isinstance(node, Mapping)
+        and node.get("kind") == "loop"
+        and node.get("loop_kind") == "LOOP_BEGIN"
+        and isinstance(node.get("id"), int)
+    }
+
+    for edge in distance_zero_edges:
+        raw_sync_edges.append(
+            {
+                "source": int(edge["source_node"]),
+                "target": int(edge["target_node"]),
+                "group": next_group,
+                "src_pipe": edge["source_pipe"],
+                "dst_pipe": edge["target_pipe"],
+                "loop_carried": False,
+                "root_buffers": [],
+                "analysis_origin": "realized_reuse_candidate",
+                "synchronization_latency_cycles": edge.get("synchronization_latency_cycles"),
+            }
+        )
+        next_group += 1
+    for edge in loop_edges:
+        loop_id = int(edge["loop_node"])
+        loop_end = loop_ends.get(loop_id)
+        if not isinstance(loop_end, int):
+            raise ValueError(f"realized loop candidate refers to unknown loop {loop_id}")
+        raw_sync_edges.append(
+            {
+                "source": int(edge["source_node"]),
+                "target": int(edge["target_node"]),
+                "group": next_group,
+                "src_pipe": edge["source_pipe"],
+                "dst_pipe": edge["target_pipe"],
+                "loop_carried": True,
+                "loop_end": loop_end,
+                "root_buffers": [],
+                "analysis_origin": "realized_reuse_candidate",
+                "synchronization_latency_cycles": edge.get("synchronization_latency_cycles"),
+            }
+        )
+        next_group += 1
+    return augmented
+
+
+def score_complete_placement_dag(
+    record: Mapping[str, Any],
+    model: DurationModel,
+    candidate_scores: Mapping[str, Any],
+    realized_placement: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Score the complete union of dependency edges realized by a placement.
+
+    The base graph is reconstructed independently of InsertSync from logical
+    SSA/allocation roots and fixed per-pipe order. Every unique distance-zero
+    and loop-carried edge induced by ``realized_placement`` is then added at
+    once with ``model.sync_latency_cycles``. The result is one finite,
+    statically expanded longest-path calculation rather than a sum of
+    singleton buffer-pair penalties.
+    """
+    if candidate_scores.get("schema_version") != 2:
+        raise ValueError("complete placement scoring requires candidate score schema_version=2")
+    reference_record = copy.deepcopy(dict(record))
+    export_limitations = reference_record.get("export_limitations", {})
+    incomplete_reference = []
+    if isinstance(export_limitations, Mapping):
+        if export_limitations.get("branch_nodes_missing", 0):
+            incomplete_reference.append("export_limitations.branch_nodes_missing")
+    if incomplete_reference:
+        return {
+            "schema_version": 1,
+            "model_version": "complete_placement_dag_v2",
+            "status": "INCOMPLETE",
+            "limitations": incomplete_reference,
+            "critical_path_extension_cycles": None,
+        }
+    missing_contracts = []
+    if candidate_scores.get("candidate_edge_semantics") != "pre_insert_sync_address_reuse_hazards_v1":
+        missing_contracts.append("candidate_edges_not_derived_from_pre_insert_sync_access_hazards")
+    if model.sync_latency_cycles <= 0:
+        missing_contracts.append("positive_synchronization_latency_not_calibrated")
+    if missing_contracts:
+        return {
+            "schema_version": 1,
+            "model_version": "complete_placement_dag_v2",
+            "status": "INCOMPLETE",
+            "limitations": missing_contracts,
+            "critical_path_extension_cycles": None,
+        }
+    pairs = realized_placement.get("pairs")
+    if not isinstance(pairs, list) or not all(isinstance(pair, Mapping) for pair in pairs):
+        raise ValueError("realized placement must carry an array of scored pairs")
+    if not realized_placement.get("synchronization_predictor_coverage_complete", False):
+        return {
+            "schema_version": 1,
+            "model_version": "complete_placement_dag_v2",
+            "status": "INCOMPLETE",
+            "limitations": ["unmodeled_pipeline_serialization"],
+            "critical_path_extension_cycles": None,
+        }
+
+    realized = [pair for pair in pairs if pair.get("reuse_realized")]
+    distance_zero_keys = {
+        (int(source), int(target))
+        for pair in realized
+        for source, target in pair.get("distance_zero_schedule_edges", [])
+    }
+    loop_keys = {
+        (int(loop), int(source), int(target))
+        for pair in realized
+        for loop, source, target in pair.get("loop_carried_schedule_edges", [])
+    }
+    distance_zero_catalog = {
+        (int(edge["source_node"]), int(edge["target_node"])): edge
+        for edge in candidate_scores.get("distance_zero_edges", [])
+        if isinstance(edge, Mapping)
+    }
+    loop_catalog = {
+        (int(edge["loop_node"]), int(edge["source_node"]), int(edge["target_node"])): edge
+        for edge in candidate_scores.get("loop_recurrence_edges", [])
+        if isinstance(edge, Mapping)
+    }
+    missing_distance_zero = distance_zero_keys - set(distance_zero_catalog)
+    missing_loop = loop_keys - set(loop_catalog)
+    if missing_distance_zero or missing_loop:
+        raise ValueError(
+            "complete placement refers to absent candidate edges: "
+            f"distance_zero={sorted(missing_distance_zero)[:8]}, "
+            f"loop={sorted(missing_loop)[:8]}"
+        )
+
+    operation_durations, _, dynamic_loops = estimate_node_durations(reference_record, model)
+    if dynamic_loops:
+        raise ValueError(
+            "complete_placement_dag_v2 requires statically bounded loops; "
+            f"dynamic loop nodes: {dynamic_loops[:8]}"
+        )
+    selected_distance_zero = [dict(distance_zero_catalog[key]) for key in sorted(distance_zero_keys)]
+    selected_loop = [dict(loop_catalog[key]) for key in sorted(loop_keys)]
+    for edge in selected_distance_zero:
+        edge["synchronization_latency_cycles"] = model.sync_latency_cycles
+    for edge in selected_loop:
+        edge["synchronization_latency_cycles"] = model.sync_latency_cycles
+    base = _static_dependency_makespan(reference_record, operation_durations, model.sync_latency_cycles)
+    augmented = _schedule_with_realized_candidate_edges(
+        reference_record, selected_distance_zero, selected_loop
+    )
+    complete = _static_dependency_makespan(augmented, operation_durations, model.sync_latency_cycles)
+    base_cycles = float(base["full_makespan_cycles"])
+    complete_cycles = float(complete["full_makespan_cycles"])
+    additive_cycles = float(realized_placement.get("critical_path_realized_cost_cycles", 0.0))
+    extension = max(0.0, complete_cycles - base_cycles)
+    return {
+        "schema_version": 1,
+        "model_version": "complete_placement_dag_v2",
+        "status": "COMPLETE",
+        "reference_graph_contract": "non_reusing_logical_ssa_memory_plus_fixed_pipe_order",
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+        "loop_policy": "finite_static_expansion",
+        "insert_sync_policy": "not_consulted",
+        "synchronization_latency_cycles": model.sync_latency_cycles,
+        "base_makespan_cycles": base_cycles,
+        "placement_makespan_cycles": complete_cycles,
+        "critical_path_extension_cycles": extension,
+        "pairwise_additive_cost_cycles": additive_cycles,
+        "nonadditive_interaction_cycles": extension - additive_cycles,
+        "realized_distance_zero_edge_count": len(selected_distance_zero),
+        "realized_loop_carried_edge_count": len(selected_loop),
+        "expanded_node_count": complete["expanded_node_count"],
+        "expanded_pipe_order_edge_count": base["expanded_stream_edge_count"],
+        "expanded_logical_memory_edge_count": base["expanded_logical_memory_edge_count"],
+        "expanded_reuse_synchronization_edge_count": complete["expanded_sync_edge_count"],
+        "base_critical_path": base["full_critical_path"],
+        "placement_critical_path": complete["full_critical_path"],
+        "distance_zero_edges": [
+            [int(edge["source_node"]), int(edge["target_node"])] for edge in selected_distance_zero
+        ],
+        "loop_carried_edges": [
+            [int(edge["loop_node"]), int(edge["source_node"]), int(edge["target_node"])]
+            for edge in selected_loop
+        ],
+    }
+
+
 def score_realized_reuse(
     problem_path: str | Path,
     solution_path: str | Path,
     candidate_scores: Mapping[str, Any],
+    *,
+    schedule_record: Mapping[str, Any] | None = None,
+    model: DurationModel | None = None,
 ) -> dict[str, Any]:
     """Score the promoted reuse pairs physically realized by one placement."""
     schema_version = candidate_scores.get("schema_version")
@@ -3639,7 +4057,7 @@ def score_realized_reuse(
         for row in realized
         if not row.get("distance_zero_schedule_edges") and not row.get("loop_carried_schedule_edges")
     ]
-    return {
+    result = {
         "schema_version": 2,
         "model_version": candidate_scores.get("model_version"),
         "problem": str(problem_source),
@@ -3672,6 +4090,13 @@ def score_realized_reuse(
         "edge_explanations": edge_explanations,
         "pairs": rows,
     }
+    if (schedule_record is None) != (model is None):
+        raise ValueError("complete placement scoring requires both schedule_record and model")
+    if schedule_record is not None and model is not None:
+        complete_dag = score_complete_placement_dag(schedule_record, model, candidate_scores, result)
+        result["complete_placement_dag"] = complete_dag
+        result["complete_placement_critical_path_cycles"] = complete_dag["critical_path_extension_cycles"]
+    return result
 
 
 def score_reuse_candidates(
@@ -3927,6 +4352,7 @@ def score_reuse_candidates(
     return {
         "schema_version": 2,
         "model_version": "reuse_penalty_critical_path_v1",
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
         "sync_endpoint_estimator_version": "uncoalesced_source_plus_target_static_executions_v1",
         "function": record.get("function", "<unknown>"),
         "duration_model_version": model.model_version,
@@ -4661,6 +5087,17 @@ def _summarize_comparisons(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         for key in ("baseline_exact_duration_coverage", "candidate_exact_duration_coverage")
     ]
     direction_correct = sum(row["direction_correct"] is True for row in directional)
+    final_edge_directional = [
+        row
+        for row in observed
+        if _effect_sign(float(row["final_edge_independent_sum_cycles"])) != 0
+        and row["observed_direction"] != 0
+    ]
+    final_edge_direction_correct = sum(
+        _effect_sign(float(row["final_edge_independent_sum_cycles"])) == row["observed_direction"]
+        for row in final_edge_directional
+    )
+    interactions = [abs(float(row["final_edge_interaction_cycles"])) for row in rows]
     return {
         "comparison_count": len(rows),
         "observed_comparison_count": len(observed),
@@ -4672,6 +5109,13 @@ def _summarize_comparisons(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "spearman_relative_delta": _pearson(
             _average_ranks(predicted_deltas), _average_ranks(observed_deltas)
         ),
+        "final_edge_independent_directional_comparison_count": len(final_edge_directional),
+        "final_edge_independent_direction_correct_count": final_edge_direction_correct,
+        "final_edge_independent_direction_accuracy": (
+            final_edge_direction_correct / len(final_edge_directional) if final_edge_directional else None
+        ),
+        "nonzero_final_edge_interaction_count": sum(value > 1e-9 for value in interactions),
+        "maximum_absolute_final_edge_interaction_cycles": max(interactions, default=0.0),
     }
 
 
@@ -4725,6 +5169,262 @@ def _sync_edge_delta(
         ]
 
     return encode(candidate_counts - baseline_counts), encode(baseline_counts - candidate_counts)
+
+
+def _sync_edge_objects_delta(
+    baseline: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return concrete added and removed sync-edge occurrences.
+
+    Group identifiers are deliberately excluded from edge identity: they are
+    allocation details of one InsertSync run, while source, target, pipes, and
+    loop distance define the dependency seen by the latency graph.  Concrete
+    edge objects are retained so the caller can replay the delta without
+    inventing provenance.
+    """
+
+    def difference(minuend: Mapping[str, Any], subtrahend: Mapping[str, Any]) -> list[dict[str, Any]]:
+        groups = {
+            group.get("id"): group
+            for group in minuend.get("sync_groups", [])
+            if isinstance(group, Mapping) and isinstance(group.get("id"), int)
+        }
+        remaining = Counter(
+            _sync_edge_signature(edge)
+            for edge in subtrahend.get("sync_edges", [])
+            if isinstance(edge, Mapping)
+        )
+        result: list[dict[str, Any]] = []
+        edges = [edge for edge in minuend.get("sync_edges", []) if isinstance(edge, Mapping)]
+        for edge in sorted(edges, key=lambda item: repr((_sync_edge_signature(item), item.get("group")))):
+            signature = _sync_edge_signature(edge)
+            if remaining[signature] > 0:
+                remaining[signature] -= 1
+            else:
+                copied = dict(edge)
+                if copied.get("loop_carried") and not isinstance(copied.get("loop_end"), int):
+                    group = groups.get(copied.get("group"))
+                    operations = group.get("operations", []) if isinstance(group, Mapping) else []
+                    loop_ends = {
+                        operation.get("loop_end")
+                        for operation in operations
+                        if isinstance(operation, Mapping) and isinstance(operation.get("loop_end"), int)
+                    }
+                    if len(loop_ends) == 1:
+                        copied["loop_end"] = loop_ends.pop()
+                result.append(copied)
+        return result
+
+    return difference(candidate, baseline), difference(baseline, candidate)
+
+
+def _dependency_only_schedule(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the final dependency graph while disabling provenance recovery.
+
+    The normalized sync edges already contain every dependency exported by
+    InsertSync.  Clearing ``sync_groups`` prevents a leave-one-edge-out
+    ablation from being silently undone when barrier provenance is propagated
+    again.  This representation is used only for dependency-makespan scoring;
+    instruction-count and queue-drain models continue to use the unmodified
+    schedule records.
+    """
+    normalized = _propagate_barrier_dependency_provenance(record)
+    groups: list[dict[str, Any]] = []
+    for group in normalized.get("sync_groups", []):
+        if not isinstance(group, Mapping):
+            continue
+        operations = []
+        for operation in group.get("operations", []):
+            if not isinstance(operation, Mapping):
+                continue
+            copied = dict(operation)
+            if str(copied.get("type", "")).startswith("pipe_barrier"):
+                copied["useless"] = True
+            operations.append(copied)
+        groups.append({**dict(group), "operations": operations})
+    normalized["sync_groups"] = groups
+    limitations = dict(normalized.get("export_limitations", {}))
+    limitations["barrier_dependency_nodes_missing"] = 0
+    normalized["export_limitations"] = limitations
+    return normalized
+
+
+def _score_dependency_only_schedule(
+    record: Mapping[str, Any], model: DurationModel
+) -> tuple[dict[str, Any], float]:
+    score = score_schedule(record, model)
+    if not score["latency_graph_complete"]:
+        raise ValueError(
+            f"post-InsertSync dependency graph is incomplete: {score['latency_graph_limitations']}"
+        )
+    return score, float(score["loop_aware_makespan_cycles"])
+
+
+def _schedule_with_sync_edges(
+    record: Mapping[str, Any], edges: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    changed = copy.deepcopy(dict(record))
+    changed["sync_edges"] = [dict(edge) for edge in edges]
+    return changed
+
+
+def _encoded_sync_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "source": edge.get("source"),
+        "target": edge.get("target"),
+        "src_pipe": edge.get("src_pipe"),
+        "dst_pipe": edge.get("dst_pipe"),
+        "loop_carried": bool(edge.get("loop_carried", False)),
+        "root_buffers": list(edge.get("root_buffers", [])),
+    }
+
+
+def score_post_insert_sync_marginal(
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    model: DurationModel,
+) -> dict[str, Any]:
+    """Score an exact complete-placement oracle and a sparse edge proxy.
+
+    Both inputs must be actual post-InsertSync schedules for complete legal
+    placements with the same operation stream.  The exact signed marginal is
+    ``L(candidate) - L(baseline)``.  The sparse proxy independently removes
+    or adds each changed final synchronization edge in the baseline context.
+    Its residual against the exact marginal is reported as interaction rather
+    than hidden inside an allegedly additive penalty.
+    """
+    normalized_baseline = _propagate_barrier_dependency_provenance(baseline)
+    normalized_candidate = _propagate_barrier_dependency_provenance(candidate)
+    if _operation_stream_signature(normalized_baseline) != _operation_stream_signature(normalized_candidate):
+        raise ValueError("post-InsertSync marginal requires identical operation streams")
+
+    baseline_score = score_schedule(normalized_baseline, model)
+    candidate_score = score_schedule(normalized_candidate, model)
+    for role, score in (("baseline", baseline_score), ("candidate", candidate_score)):
+        if not score["latency_graph_complete"]:
+            raise ValueError(
+                f"incomplete {role} latency graph for post-InsertSync schedule: "
+                f"{score['latency_graph_limitations']}"
+            )
+
+    dependency_baseline = _dependency_only_schedule(normalized_baseline)
+    dependency_candidate = _dependency_only_schedule(normalized_candidate)
+    _, baseline_cycles = _score_dependency_only_schedule(dependency_baseline, model)
+    _, candidate_cycles = _score_dependency_only_schedule(dependency_candidate, model)
+    added, removed = _sync_edge_objects_delta(dependency_baseline, dependency_candidate)
+
+    baseline_edges = [
+        dict(edge) for edge in dependency_baseline.get("sync_edges", []) if isinstance(edge, Mapping)
+    ]
+    reconstructed_edges = list(baseline_edges)
+    for edge in removed:
+        signature = _sync_edge_signature(edge)
+        index = next(
+            (
+                edge_index
+                for edge_index, existing in enumerate(reconstructed_edges)
+                if _sync_edge_signature(existing) == signature
+            ),
+            None,
+        )
+        if index is None:
+            raise ValueError(f"cannot remove absent final sync edge {signature}")
+        reconstructed_edges.pop(index)
+    reconstructed_edges.extend(added)
+    reconstructed = _schedule_with_sync_edges(dependency_baseline, reconstructed_edges)
+    _, reconstructed_cycles = _score_dependency_only_schedule(reconstructed, model)
+    if not math.isclose(reconstructed_cycles, candidate_cycles, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(
+            "final sync-edge delta does not reconstruct the candidate dependency makespan: "
+            f"{reconstructed_cycles} != {candidate_cycles}"
+        )
+
+    independent_rows: list[dict[str, Any]] = []
+    for effect, edge in (("remove", edge) for edge in removed):
+        signature = _sync_edge_signature(edge)
+        changed_edges = list(baseline_edges)
+        index = next(
+            edge_index
+            for edge_index, existing in enumerate(changed_edges)
+            if _sync_edge_signature(existing) == signature
+        )
+        changed_edges.pop(index)
+        _, changed_cycles = _score_dependency_only_schedule(
+            _schedule_with_sync_edges(dependency_baseline, changed_edges), model
+        )
+        independent_rows.append(
+            {
+                "effect": effect,
+                "edge": _encoded_sync_edge(edge),
+                "signed_marginal_cycles": changed_cycles - baseline_cycles,
+            }
+        )
+    for effect, edge in (("add", edge) for edge in added):
+        changed_edges = [*baseline_edges, edge]
+        _, changed_cycles = _score_dependency_only_schedule(
+            _schedule_with_sync_edges(dependency_baseline, changed_edges), model
+        )
+        independent_rows.append(
+            {
+                "effect": effect,
+                "edge": _encoded_sync_edge(edge),
+                "signed_marginal_cycles": changed_cycles - baseline_cycles,
+            }
+        )
+
+    sequential_rows: list[dict[str, Any]] = []
+    current_edges = list(baseline_edges)
+    current_cycles = baseline_cycles
+    for effect, edge in [
+        *(("remove", edge) for edge in removed),
+        *(("add", edge) for edge in added),
+    ]:
+        if effect == "remove":
+            signature = _sync_edge_signature(edge)
+            index = next(
+                edge_index
+                for edge_index, existing in enumerate(current_edges)
+                if _sync_edge_signature(existing) == signature
+            )
+            current_edges.pop(index)
+        else:
+            current_edges.append(edge)
+        _, next_cycles = _score_dependency_only_schedule(
+            _schedule_with_sync_edges(dependency_baseline, current_edges), model
+        )
+        sequential_rows.append(
+            {
+                "effect": effect,
+                "edge": _encoded_sync_edge(edge),
+                "signed_marginal_cycles": next_cycles - current_cycles,
+            }
+        )
+        current_cycles = next_cycles
+    if not math.isclose(current_cycles, candidate_cycles, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("sequential final-edge attribution does not telescope to the exact marginal")
+
+    exact_marginal = candidate_cycles - baseline_cycles
+    independent_sum = sum(float(row["signed_marginal_cycles"]) for row in independent_rows)
+    return {
+        "schema_version": 1,
+        "model_version": "post_insert_sync_signed_marginal_v1",
+        "oracle_contract": "complete_legal_placements_with_actual_post_insert_sync_schedules",
+        "baseline_cycles": baseline_cycles,
+        "candidate_cycles": candidate_cycles,
+        "exact_signed_marginal_cycles": exact_marginal,
+        "exact_relative_delta": exact_marginal / baseline_cycles if baseline_cycles else 0.0,
+        "added_final_sync_edges": [_encoded_sync_edge(edge) for edge in added],
+        "removed_final_sync_edges": [_encoded_sync_edge(edge) for edge in removed],
+        "candidate_reconstructed_from_final_edge_delta": True,
+        "final_edge_independent_signed_marginals": independent_rows,
+        "final_edge_independent_sum_cycles": independent_sum,
+        "final_edge_interaction_cycles": exact_marginal - independent_sum,
+        "final_edge_sequential_signed_marginals": sequential_rows,
+        "duration_coverage": {
+            "baseline_exact": baseline_score["exact_duration_coverage"],
+            "candidate_exact": candidate_score["exact_duration_coverage"],
+        },
+    }
 
 
 def _queue_event_signed_marginal(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -4929,19 +5629,15 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
             raise ValueError(
                 f"{path}: comparison {label} has different operation streams across planner arms"
             )
+        marginal = score_post_insert_sync_marginal(arm_records["baseline"], arm_records["candidate"], model)
         for role in ("baseline", "candidate"):
             arm_results[role] = score_schedule(arm_records[role], model)
-            if not arm_results[role]["latency_graph_complete"]:
-                limitations = arm_results[role]["latency_graph_limitations"]
-                raise ValueError(
-                    f"{path}: comparison {label} has an incomplete {role} latency graph: {limitations}"
-                )
         added_sync_edges, removed_sync_edges = _sync_edge_delta(
             arm_records["baseline"], arm_records["candidate"]
         )
 
-        baseline_cycles = float(arm_results["baseline"]["loop_aware_makespan_cycles"])
-        candidate_cycles = float(arm_results["candidate"]["loop_aware_makespan_cycles"])
+        baseline_cycles = float(marginal["baseline_cycles"])
+        candidate_cycles = float(marginal["candidate_cycles"])
         queue_event_marginal = _queue_event_signed_marginal(
             arm_results["baseline"]["queue_event_model"],
             arm_results["candidate"]["queue_event_model"],
@@ -5010,6 +5706,9 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
                 ],
                 "queue_event_signed_marginal": queue_event_marginal,
                 "queue_drain_restart_signed_marginal": queue_drain_restart_marginal,
+                "post_insert_sync_signed_marginal": marginal,
+                "final_edge_independent_sum_cycles": marginal["final_edge_independent_sum_cycles"],
+                "final_edge_interaction_cycles": marginal["final_edge_interaction_cycles"],
                 "predicted_delta_cycles": predicted_delta,
                 "signed_marginal_sync_cost_cycles": predicted_delta,
                 "predicted_relative_delta": predicted_relative_delta,
@@ -5035,6 +5734,10 @@ def evaluate_arm_manifest(manifest_path: str | Path, model: DurationModel) -> di
         "marginal_cost_metric": (
             "L(InsertSync(candidate placement)) - L(InsertSync(baseline placement)); "
             "negative values are permitted"
+        ),
+        "sparse_approximation_metric": (
+            "sum of independently scored added/removed final InsertSync dependencies in the "
+            "baseline placement context"
         ),
         "relative_delta_convention": "candidate/baseline - 1; negative is candidate faster",
         "frozen_before_device_timing": bool(payload.get("frozen_before_device_timing", False)),
@@ -5227,6 +5930,37 @@ def _load_nonmaterialized_access_evidence(
     return frozenset(orders)
 
 
+def _run_direct_model_command(args: argparse.Namespace) -> bool:
+    """Run small CLI actions kept outside the main dispatch."""
+    if args.command == "snapshot-duration":
+        _write_json(args.output, _model_from_args(args).to_json())
+        return True
+    if args.command == "qualify":
+        _write_json(args.output, qualify_schedule_files(args.schedules))
+        return True
+    if args.command == "rescore-realized":
+        record, _ = _resolve_schedule_record(args.schedule, args.function)
+        candidate_scores = json.loads(args.candidate_score.read_text())
+        if not isinstance(candidate_scores, Mapping):
+            raise ValueError("candidate score document must be an object")
+        realized_placement = candidate_scores.get("realized_placement")
+        if not isinstance(realized_placement, Mapping):
+            raise ValueError("candidate score document has no realized_placement object")
+        result = score_complete_placement_dag(
+            record,
+            _model_from_args(args),
+            candidate_scores,
+            realized_placement,
+        )
+        result["input"] = {
+            "schedule": str(args.schedule),
+            "candidate_score": str(args.candidate_score),
+        }
+        _write_json(args.output, result)
+        return True
+    return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dsa_schedule_model")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -5304,6 +6038,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     candidate_parser.add_argument("-o", "--output", type=Path)
 
+    rescore_parser = subparsers.add_parser(
+        "rescore-realized",
+        help="recompute the exact complete-placement DAG score from archived candidate evidence",
+    )
+    rescore_parser.add_argument("schedule", type=Path)
+    rescore_parser.add_argument("candidate_score", type=Path)
+    rescore_parser.add_argument("--function")
+    _add_duration_arguments(rescore_parser)
+    rescore_parser.add_argument("-o", "--output", type=Path)
+
     perf_sim_parser = subparsers.add_parser(
         "validate-perf-sim", help="compare pinned formulas with Perf-Sim trace events"
     )
@@ -5313,8 +6057,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     try:
-        if args.command == "snapshot-duration":
-            _write_json(args.output, _model_from_args(args).to_json())
+        if _run_direct_model_command(args):
             return 0
         if args.command == "calibrate":
             base = (
@@ -5347,9 +6090,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             evaluated = evaluate_arm_manifest(args.manifest, _model_from_args(args))
             _write_json(args.output, evaluated)
             return 0
-        if args.command == "qualify":
-            _write_json(args.output, qualify_schedule_files(args.schedules))
-            return 0
         if args.command == "score-candidates":
             record, _ = _resolve_schedule_record(args.schedule, args.function)
             nonmaterialized_access_orders = _load_nonmaterialized_access_evidence(
@@ -5357,19 +6097,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 schedule_path=args.schedule,
                 problem_path=args.problem,
             )
+            model = _model_from_args(args)
             result = score_reuse_candidates(
                 record,
                 load_candidate_records(args.problem),
-                _model_from_args(args),
+                model,
                 promoted_penalties=load_promoted_reuse_penalties(args.problem),
                 known_nonmaterialized_access_orders=nonmaterialized_access_orders,
                 promoted_penalty_reasons=load_promoted_reuse_penalty_reasons(args.problem),
             )
             if args.solution is not None:
-                result["realized_placement"] = score_realized_reuse(args.problem, args.solution, result)
+                result["realized_placement"] = score_realized_reuse(
+                    args.problem,
+                    args.solution,
+                    result,
+                    schedule_record=record,
+                    model=model,
+                )
             _write_json(args.output, result)
             return 0
-
         if args.command == "validate-perf-sim":
             model = _model_from_args(args)
             if model.pto_isa_provider is None:
