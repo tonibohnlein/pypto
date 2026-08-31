@@ -1748,6 +1748,183 @@ def test_complete_placement_dag_unions_duplicate_pair_edges_once(tmp_path):
     }
 
 
+def test_score_realized_grid_uses_each_positive_global_sync_weight(tmp_path):
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    model = _weighted_sync_model()
+    candidate_record = (
+        "0,1,0->1,ub->ub@vector_compute=>external->ub@inbound_dma,arenas=Vec->Vec,"
+        "write_after_read,no_logical_order,inter_operation,full_allocation,complete_access_set,"
+        "verified_initial_write,in_loop,distance_0,sites=3->7,ranges=0+640->0+640,"
+        "hazard=cross_resource,dag_path=none"
+    )
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(
+        json.dumps(
+            {
+                "problem": {
+                    "buffers": [{"id": 0, "size": 64}, {"id": 1, "size": 64}],
+                    "cost_model": {
+                        "reuse_penalties": [{"first": 0, "second": 1, "cost": 1, "reason": "cross_pipe"}]
+                    },
+                },
+                "metadata": {
+                    "recognized_reuse_candidate_records_v4": candidate_record,
+                    "recognized_reuse_candidates": "1",
+                },
+            }
+        )
+    )
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 0},
+                ]
+            }
+        )
+    )
+    schedule = tmp_path / "schedule.jsonl"
+    model_path = tmp_path / "model.json"
+    output = tmp_path / "grid.json"
+    schedule.write_text(json.dumps(record) + "\n")
+    model_path.write_text(json.dumps(model.to_json()))
+
+    assert (
+        dsa_schedule_model.main(
+            [
+                "score-realized-grid",
+                str(schedule),
+                str(problem),
+                str(solution),
+                "--function",
+                "kernel",
+                "--sync-latency-grid",
+                "8,2,8",
+                "--model",
+                str(model_path),
+                "-o",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    result = json.loads(output.read_text())
+    assert [row["sync_latency_cycles"] for row in result["results"]] == [2.0, 8.0]
+    assert all(row["score"]["status"] == "COMPLETE" for row in result["results"])
+    assert result["input"]["function"] == "kernel"
+    assert result["input"]["schedule"] == {
+        "path": str(schedule.resolve()),
+        "sha256": hashlib.sha256(schedule.read_bytes()).hexdigest(),
+    }
+    assert result["input"]["problem"]["sha256"] == hashlib.sha256(problem.read_bytes()).hexdigest()
+    assert result["input"]["solution"]["sha256"] == hashlib.sha256(solution.read_bytes()).hexdigest()
+    assert (
+        result["input"]["duration_model_source"]["sha256"]
+        == hashlib.sha256(model_path.read_bytes()).hexdigest()
+    )
+    assert result["duration_model"]["calibration_status"] == model.calibration_status
+    assert len(result["duration_model"]["semantic_sha256"]) == 64
+    assert result["duration_model"]["pto_isa_provider"] is None
+    assert result["duration_coverage"] == {
+        "operation_node_count": 4,
+        "non_fallback_node_count": 4,
+        "fallback_node_count": 0,
+        "fallback_node_ids": [],
+        "duration_sources": {"simulator_operation_median": 4},
+        "dynamic_loop_node_ids": [],
+    }
+    assert result["duration_policy"] == "fail_closed_no_fallback"
+    assert (
+        result["results"][0]["score"]["critical_path_extension_cycles"]
+        < result["results"][1]["score"]["critical_path_extension_cycles"]
+    )
+
+
+def test_score_realized_grid_rejects_fallback_duration_provider(tmp_path, monkeypatch, capsys):
+    model = _weighted_sync_model()
+    model.pto_isa_provider = dsa_schedule_model.PtoIsaDurationProvider(
+        revision="0" * 40,
+        frequency_hz=1.0,
+        bandwidth_gib_per_s={},
+        formula_parameters=[],
+        source_sha256={},
+        unsupported_policy="fallback",
+        fallback_cycles=1.0,
+    )
+    monkeypatch.setattr(dsa_schedule_model, "_model_from_args", lambda _args: model)
+    schedule = tmp_path / "schedule.jsonl"
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    schedule.write_text(json.dumps(_record()) + "\n")
+    problem.write_text(json.dumps({"problem": {"buffers": []}}))
+    solution.write_text(json.dumps({"placements": []}))
+
+    result = dsa_schedule_model.main(
+        [
+            "score-realized-grid",
+            str(schedule),
+            str(problem),
+            str(solution),
+            "--function",
+            "kernel",
+            "--sync-latency-grid",
+            "16",
+            "--model",
+            str(tmp_path / "unused.json"),
+        ]
+    )
+
+    assert result == 1
+    assert "requires fail-closed PTO-ISA durations" in capsys.readouterr().err
+
+
+def test_score_realized_grid_rejects_legacy_pipe_size_fallback(tmp_path, monkeypatch, capsys):
+    model = dsa_schedule_model.DurationModel(
+        sync_latency_cycles=1.0,
+        pipe_parameters={
+            pipe: dsa_schedule_model.PipeParameters(
+                startup_cycles=1.0, bytes_per_cycle=16.0, minimum_cycles=1.0
+            )
+            for pipe in ("PIPE_V", "PIPE_MTE2")
+        },
+    )
+    monkeypatch.setattr(dsa_schedule_model, "_model_from_args", lambda _args: model)
+    schedule = tmp_path / "schedule.jsonl"
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    schedule.write_text(json.dumps(_record()) + "\n")
+    problem.write_text(json.dumps({"problem": {"buffers": []}}))
+    solution.write_text(json.dumps({"placements": []}))
+
+    result = dsa_schedule_model.main(
+        [
+            "score-realized-grid",
+            str(schedule),
+            str(problem),
+            str(solution),
+            "--function",
+            "kernel",
+            "--sync-latency-grid",
+            "16",
+            "--model",
+            str(tmp_path / "unused.json"),
+        ]
+    )
+
+    assert result == 1
+    error = capsys.readouterr().err
+    assert "requires exact or pinned non-fallback durations" in error
+    assert "[0, 1, 2, 3]" in error
+
+
 def test_complete_placement_dag_expands_loop_carried_edges_across_iterations(tmp_path):
     record = _loop_candidate_record(with_return_path=True)
     model = _weighted_sync_model()

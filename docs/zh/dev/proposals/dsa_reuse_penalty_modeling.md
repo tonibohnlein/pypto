@@ -268,6 +268,74 @@ geometry endpoint 的 post-InsertSync graph 当作 reference。该 graph 已包�
 placement 引入的 dependency。model v2 直接修复这一方法错误：它忽略全部 InsertSync
 record，并从 logical SSA/allocation root 与固定 pipe order 重建 base graph。
 
+### 全局 synchronization weight 敏感性
+
+首次纯主机 calibration sweep 使用单一全局 synchronization-edge weight，在
+`16, 24, 32, 48, 64, 80, 96, 128, 160` cycle 上重新评分 complete placement graph。
+它没有拟合 per-kernel 或 per-edge constant。只有两台设备方向一致，且每台设备
+effect 都至少为 2% 时，device ordering 才通过 evaluation threshold。机器可读输出将
+这些 row 标记为 `MULTI_DEVICE_THRESHOLD_CLEARED`；这是确定性的双设备 effect-size gate，
+不是 confidence-interval 结论。低于阈值的 row 仅作 diagnostic，绝不用于 calibration。
+
+leave-one-workload-out calibration 使用一个预先声明的全局 utility：strict ordering
+预测正确记 `+1`，错误记 `-1`，silent 记 `0`。utility 相同时依次优先 correct 更多、
+strict prediction 更多的 weight。这样，选择性 silent 的 1/1 predictor 不会仅因 accuracy
+为 100% 而击败覆盖面更广且总体正确的 predictor。
+
+coverage 是决定性结果。在 17 个已测且有重建 graph 输入的 problem-capacity cell 中，
+当前 straight-line/static-loop contract 只能完整分析来自两个 workload 的 12 个 cell。
+5 个 cell 因 conditional candidate endpoint 被排除，其中一个还存在不完整的历史
+access join。12 个 eligible Cypress-versus-DSA-RP comparison 中没有一个在两台设备上均通过
+2% gate，因此两个 leave-one-workload-out fold 都是
+`INSUFFICIENT_THRESHOLD_CLEARED_TRAINING_COMPARISONS`，没有校准全局 weight。
+
+敏感性 sweep 在绝大多数 cell 上不产生信号。16--24 cycle 不预测任何 strict
+Cypress-versus-DSA-RP ordering。32 cycle 以及 48--160 cycle 只有一个 strict cell，即
+tight capacity 的 RMSNorm；其方向在 32 与 48 cycle 之间反转。若仅作诊断地把阈值
+降到 1%，有四个 cell 变为 device-decided，但 48--160 cycle 仍只能区分其中一个。
+表面上的 1/1 accuracy 因此只对应 25% prediction coverage，不能证明存在稳定的全局区间。
+
+指定的代表性用例直接暴露了 model coverage 与 mechanism 缺口：
+
+| 用例 | 已有双设备证据 | Unit objective | 整函数 model 状态 |
+| ---- | -------------- | -------------- | ----------------- |
+| `rmsnorm_rope_cache_write/half` | DSA-RP 对 Cypress `-7.19%/-7.43%` | `8 -> 0` | 不合格：branch 与 dynamic loop。branch-free 局部诊断识别出 Cypress 独有的 V-to-MTE2 hazard，但它不是整函数 score。 |
+| `kv_score_proj_c128/native` | DSA-RP 对 Cypress `-2.50%/-2.30%` | `64 -> 64` | 不合格：conditional endpoint；归档 export 还遗漏了 lowered access site。unit tie 与 speedup 仍无法解释。 |
+| `mtp/gate` | Cypress 在四种 capacity 都更快，约 `1.6--4.1%` | DSA-RP 的 count 相同或更优 | 不合格：control flow。这仍是“较低 unit objective 即较低 latency”的主要反例。 |
+| `gumbel_argmax/q1` | DSA-RP 对 Cypress `+0.22%/+0.11%`，为 latency null | `14 -> 0` | 不合格：conditional endpoint。巨大结构 gap 可以完全隐藏。 |
+| `hc_post/native` | 在不同 campaign 中 effect 很弱、符号反转或无法复现 | 原始 cell 为 `33 -> 24` | 不合格：dynamic/control-flow 结构，不适合作为 calibration label。 |
+
+持久化 device 数据源是
+`dsa-rp-loop-aware-model-prospective-0820ab418-final.tar.gz`
+（`1a7e5d5ffe93a43b260012d47af98321cb5a10156ecc8486dbc37f00767374d2`）和
+`dsa-rp-four-candidate-physical-penalty-aeba32c70-final.tar.gz`
+（`a05aad5829865d196bc7d7a415b40d8c06b3e6b566d1f80fce269352c78765a0`）。
+每个 `score-realized-grid` 结果都会记录 schedule、problem、solution、duration model 与可选
+non-materialization evidence 的 SHA-256，并记录所选 function 与 fail-closed duration policy。
+不打开 latency 数据即可对每个 frozen placement 重现 grid scoring：
+
+```bash
+python -m pypto.tools.dsa_schedule_model score-realized-grid \
+  SCHEDULE.jsonl PROBLEM.dsa.json SOLUTION.dsa.solution.json \
+  --function FUNCTION --model DURATION_MODEL.json \
+  --sync-latency-grid 16,24,32,48,64,80,96,128,160 -o ARM_GRID.json
+python -m pypto.tools.dsa_penalty_model_evaluation sync-weight-grid-input.tsv \
+  --sync-weight-grid --split development --minimum-device-effect 0.02 \
+  --required-device-count 2 -o sync-weight-grid-evaluation.json
+```
+
+上述 2% development analysis 的 joined input TSV hash 为
+`86d5dd525cc98c01e7cf48bffeab0c623b5c4ad59dcaf421faf0492141876594`，
+evaluator 输出 hash 为
+`a0711862d013b7a2532f73da4602026a8f08cfa6de3a45d127c94da71c1b0189`。
+1% diagnostic 输出 hash 为
+`581c27397ab6cc7609b97b3412c6a996310d198043ed037f407279d79100b132`。
+
+该分析未通过 incremental critical-path planner 的 gate。planner 没有改动，也不应根据此 grid
+启动新的 device task。下一项本地工作是为这些代表性用例完成 branch-aware 与 dynamic-loop
+placement DAG，然后在足够多独立 workload 上重复同一全局 weight 评估，使 leave-one-workload-out
+calibration 真正有意义。
+
 对每个 arm 的实际 post-InsertSync graph 评分，才得到预期的 analysis oracle。在同一回顾
 corpus 上，40 个 strict model ordering 全部与实测方向一致；device effect 至少 2% 的
 24 个 strict comparison 也全部一致。RMSNorm geometry 为 12,736 cycle，Cypress 和

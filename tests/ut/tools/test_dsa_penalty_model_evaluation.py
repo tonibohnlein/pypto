@@ -127,6 +127,190 @@ def test_duplicate_arm_row_is_rejected():
         evaluation.evaluate_rows(rows, split="development", freeze_before_timing=False)
 
 
+def _weight_grid_cell(
+    workload: str,
+    *,
+    observed_effect: float,
+    scores: dict[float, tuple[float, float]],
+    status: str = "MODELED",
+) -> list[dict[str, str]]:
+    rows = []
+    for weight, (cypress_score, dsa_score) in scores.items():
+        for device, cypress_latency in (("dev0", 10.0), ("dev1", 11.0)):
+            rows.append(
+                {
+                    "workload_id": workload,
+                    "case_id": f"{workload}-case",
+                    "capacity": "half",
+                    "device": device,
+                    "weight_cycles": str(weight),
+                    "analysis_status": status,
+                    "cypress_penalty_cycles": str(cypress_score),
+                    "dsa_rp_penalty_cycles": str(dsa_score),
+                    "cypress_latency_us": str(cypress_latency),
+                    "dsa_rp_latency_us": str(cypress_latency * (1.0 + observed_effect)),
+                }
+            )
+    return rows
+
+
+def test_sync_weight_grid_uses_one_training_weight_per_leave_one_workload_out_fold():
+    scores = {16.0: (0.0, 0.0), 64.0: (10.0, 0.0), 160.0: (0.0, 10.0)}
+    rows = [
+        row
+        for workload in ("workload-a", "workload-b", "workload-c")
+        for row in _weight_grid_cell(workload, observed_effect=-0.05, scores=scores)
+    ]
+
+    result = evaluation.evaluate_sync_weight_grid(rows)
+
+    assert result["eligible_workload_count"] == 3
+    assert result["rankings_stable_across_full_grid"] is False
+    assert result["all_development_data_optimal_weights"] == [64.0]
+    assert all(fold["status"] == "CALIBRATED" for fold in result["leave_one_workload_out"])
+    assert {fold["selected_weight_cycles"] for fold in result["leave_one_workload_out"]} == {64.0}
+    assert all(
+        fold["held_out_threshold_cleared"]["strict_accuracy"] == 1.0
+        for fold in result["leave_one_workload_out"]
+    )
+
+
+def test_sync_weight_grid_does_not_calibrate_on_below_threshold_effects():
+    scores = {16.0: (1.0, 0.0), 64.0: (2.0, 0.0)}
+    rows = [
+        row
+        for workload in ("workload-a", "workload-b")
+        for row in _weight_grid_cell(workload, observed_effect=-0.01, scores=scores)
+    ]
+
+    result = evaluation.evaluate_sync_weight_grid(rows)
+
+    assert result["all_development_data_optimal_weights"] == []
+    assert all(
+        fold["status"] == "INSUFFICIENT_THRESHOLD_CLEARED_TRAINING_COMPARISONS"
+        for fold in result["leave_one_workload_out"]
+    )
+    assert all(row["sign_consistent_below_threshold"]["correct_count"] == 2 for row in result["sensitivity"])
+
+
+def test_sync_weight_grid_rejects_exact_latency_drift_even_when_effect_is_unchanged():
+    rows = _weight_grid_cell(
+        "workload-a",
+        observed_effect=-0.05,
+        scores={16.0: (1.0, 0.0), 64.0: (2.0, 0.0)},
+    )
+    rows[-1]["cypress_latency_us"] = "22.0"
+    rows[-1]["dsa_rp_latency_us"] = str(22.0 * 0.95)
+
+    with pytest.raises(ValueError, match="exact device latencies change across weights"):
+        evaluation.evaluate_sync_weight_grid(rows)
+
+
+def test_sync_weight_grid_rejects_device_set_drift_across_weights():
+    rows = _weight_grid_cell(
+        "workload-a",
+        observed_effect=-0.05,
+        scores={16.0: (1.0, 0.0), 64.0: (2.0, 0.0)},
+    )
+    rows[-1]["device"] = "dev2"
+
+    with pytest.raises(ValueError, match="device set changes across weights"):
+        evaluation.evaluate_sync_weight_grid(rows)
+
+
+def test_sync_weight_grid_rejects_excluded_case_device_set_drift():
+    rows = _weight_grid_cell(
+        "workload-a",
+        observed_effect=0.0,
+        scores={16.0: (0.0, 0.0), 64.0: (0.0, 0.0)},
+        status="MODEL_INELIGIBLE_BRANCH_JOIN_V1",
+    )
+    rows[-1]["device"] = "dev2"
+
+    with pytest.raises(ValueError, match="device set changes across weights"):
+        evaluation.evaluate_sync_weight_grid(rows)
+
+
+def test_sync_weight_grid_rejects_analysis_status_drift_across_weights():
+    rows = _weight_grid_cell(
+        "workload-a",
+        observed_effect=-0.05,
+        scores={16.0: (1.0, 0.0), 64.0: (2.0, 0.0)},
+    )
+    for row in rows:
+        if row["weight_cycles"] == "64.0":
+            row["analysis_status"] = "MODEL_INELIGIBLE_BRANCH_JOIN_V1"
+
+    with pytest.raises(ValueError, match="analysis status changes across weights"):
+        evaluation.evaluate_sync_weight_grid(rows)
+
+
+def test_sync_weight_grid_reports_ineligible_case_coverage():
+    modeled = _weight_grid_cell(
+        "workload-a",
+        observed_effect=-0.05,
+        scores={16.0: (1.0, 0.0), 64.0: (2.0, 0.0)},
+    )
+    ineligible = _weight_grid_cell(
+        "workload-b",
+        observed_effect=0.0,
+        scores={16.0: (0.0, 0.0), 64.0: (0.0, 0.0)},
+        status="MODEL_INELIGIBLE_BRANCH_JOIN_V1",
+    )
+
+    result = evaluation.evaluate_sync_weight_grid([*modeled, *ineligible])
+
+    assert result["declared_case_count"] == 2
+    assert result["eligible_case_count"] == 1
+    assert result["excluded_case_count"] == 1
+    assert result["excluded_grid_row_count"] == 2
+
+
+def test_sync_weight_grid_global_utility_does_not_reward_selective_silence():
+    observed = "MULTI_DEVICE_THRESHOLD_CLEARED"
+    sparse = [
+        {"observed_class": observed, "predicted_direction": -1, "observed_direction": -1},
+        *[{"observed_class": observed, "predicted_direction": 0, "observed_direction": -1} for _ in range(3)],
+    ]
+    broad = [
+        *[
+            {"observed_class": observed, "predicted_direction": -1, "observed_direction": -1}
+            for _ in range(3)
+        ],
+        {"observed_class": observed, "predicted_direction": 1, "observed_direction": -1},
+    ]
+
+    weights, summary = evaluation._best_weight_rows({16.0: sparse, 64.0: broad})
+
+    assert weights == [64.0]
+    assert summary is not None
+    assert summary["calibration_utility"] == 2
+
+
+@pytest.mark.parametrize("field", ["workload_id", "case_id", "capacity", "device", "analysis_status"])
+def test_sync_weight_grid_rejects_blank_identifiers(field):
+    rows = _weight_grid_cell("workload-a", observed_effect=-0.05, scores={16.0: (1.0, 0.0)})
+    rows[0][field] = "  "
+
+    with pytest.raises(ValueError, match=f"{field} must be non-empty"):
+        evaluation.evaluate_sync_weight_grid(rows)
+
+
+def test_sync_weight_grid_rejects_negative_model_score():
+    rows = _weight_grid_cell("workload-a", observed_effect=-0.05, scores={16.0: (-1.0, 0.0)})
+
+    with pytest.raises(ValueError, match="modeled penalty cycles must be non-negative"):
+        evaluation.evaluate_sync_weight_grid(rows)
+
+
+def test_sync_weight_grid_requires_exactly_two_devices_by_default():
+    rows = _weight_grid_cell("workload-a", observed_effect=-0.05, scores={16.0: (1.0, 0.0)})
+    rows.pop()
+
+    with pytest.raises(ValueError, match="expected exactly 2 devices"):
+        evaluation.evaluate_sync_weight_grid(rows)
+
+
 def test_cli_writes_input_hash(tmp_path):
     source = tmp_path / "scores.tsv"
     output = tmp_path / "evaluation.json"

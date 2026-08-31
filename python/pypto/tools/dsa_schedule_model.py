@@ -53,7 +53,7 @@ import struct
 import sys
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -5930,6 +5930,36 @@ def _load_nonmaterialized_access_evidence(
     return frozenset(orders)
 
 
+def _hashed_input(path: Path) -> dict[str, str]:
+    return {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _duration_model_provenance(model: DurationModel) -> dict[str, Any]:
+    snapshot = model.to_json()
+    canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    provider = model.pto_isa_provider
+    return {
+        "semantic_sha256": hashlib.sha256(canonical).hexdigest(),
+        "model_version": model.model_version,
+        "calibration_status": model.calibration_status,
+        "calibration_sources": list(model.calibration_sources),
+        "pto_isa_provider": (
+            {
+                "revision": provider.revision,
+                "provider_snapshot_sha256": provider_snapshot_sha256(provider),
+                "unsupported_policy": provider.unsupported_policy,
+                "fallback_cycles": provider.fallback_cycles,
+                "source_sha256": dict(sorted(provider.source_sha256.items())),
+            }
+            if provider is not None
+            else None
+        ),
+    }
+
+
 def _run_direct_model_command(args: argparse.Namespace) -> bool:
     """Run small CLI actions kept outside the main dispatch."""
     if args.command == "snapshot-duration":
@@ -5958,7 +5988,123 @@ def _run_direct_model_command(args: argparse.Namespace) -> bool:
         }
         _write_json(args.output, result)
         return True
+    if args.command == "score-realized-grid":
+        record, function = _resolve_schedule_record(args.schedule, args.function)
+        raw_weights = [item.strip() for item in args.sync_latency_grid.split(",")]
+        try:
+            weights = sorted({float(item) for item in raw_weights if item})
+        except ValueError as error:
+            raise ValueError("sync latency grid must contain comma-separated numbers") from error
+        if not weights or any(not math.isfinite(weight) or weight <= 0 for weight in weights):
+            raise ValueError("sync latency grid must contain finite positive values")
+        nonmaterialized_access_orders = _load_nonmaterialized_access_evidence(
+            args.nonmaterialized_access_evidence,
+            schedule_path=args.schedule,
+            problem_path=args.problem,
+        )
+        base_model = _model_from_args(args)
+        if (
+            base_model.pto_isa_provider is not None
+            and base_model.pto_isa_provider.unsupported_policy != "error"
+        ):
+            raise ValueError("score-realized-grid requires fail-closed PTO-ISA durations")
+        _, duration_provenance, dynamic_loop_nodes = estimate_node_durations(record, base_model)
+        fallback_nodes = sorted(
+            node_id for node_id, provenance in duration_provenance.items() if provenance["fallback"]
+        )
+        if fallback_nodes:
+            raise ValueError(
+                "score-realized-grid requires exact or pinned non-fallback durations; "
+                f"fallback operation nodes: {fallback_nodes}"
+            )
+        duration_coverage = {
+            "operation_node_count": len(duration_provenance),
+            "non_fallback_node_count": len(duration_provenance) - len(fallback_nodes),
+            "fallback_node_count": len(fallback_nodes),
+            "fallback_node_ids": fallback_nodes,
+            "duration_sources": dict(
+                sorted(Counter(str(item["source"]) for item in duration_provenance.values()).items())
+            ),
+            "dynamic_loop_node_ids": dynamic_loop_nodes,
+        }
+        duration_model = _duration_model_provenance(base_model)
+        candidates = load_candidate_records(args.problem)
+        promoted_penalties = load_promoted_reuse_penalties(args.problem)
+        promoted_reasons = load_promoted_reuse_penalty_reasons(args.problem)
+        results = []
+        for weight in weights:
+            model = replace(base_model, sync_latency_cycles=weight)
+            candidate_scores = score_reuse_candidates(
+                record,
+                candidates,
+                model,
+                promoted_penalties=promoted_penalties,
+                known_nonmaterialized_access_orders=nonmaterialized_access_orders,
+                promoted_penalty_reasons=promoted_reasons,
+            )
+            realized = score_realized_reuse(
+                args.problem,
+                args.solution,
+                candidate_scores,
+                schedule_record=record,
+                model=model,
+            )
+            results.append(
+                {
+                    "sync_latency_cycles": weight,
+                    "unit_realized_cost": realized["unit_realized_cost"],
+                    "canonical_physical_reuse_group_count": realized["canonical_physical_reuse_group_count"],
+                    "unique_induced_sync_edge_count": realized["unique_induced_sync_edge_count"],
+                    "score": realized["complete_placement_dag"],
+                }
+            )
+        _write_json(
+            args.output,
+            {
+                "schema_version": 1,
+                "model_version": "complete_placement_dag_global_sync_weight_grid_v1",
+                "input": {
+                    "schedule": _hashed_input(args.schedule),
+                    "problem": _hashed_input(args.problem),
+                    "solution": _hashed_input(args.solution),
+                    "function": function,
+                    "nonmaterialized_access_evidence": (
+                        _hashed_input(args.nonmaterialized_access_evidence)
+                        if args.nonmaterialized_access_evidence is not None
+                        else None
+                    ),
+                    "duration_model_source": (
+                        _hashed_input(args.model)
+                        if args.model is not None
+                        else {
+                            "pto_isa_root": str(args.pto_isa_root.resolve()),
+                            "expected_revision": args.pto_isa_revision,
+                        }
+                    ),
+                },
+                "duration_model": duration_model,
+                "duration_coverage": duration_coverage,
+                "duration_policy": "fail_closed_no_fallback",
+                "results": results,
+            },
+        )
+        return True
     return False
+
+
+def _add_score_realized_grid_parser(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "score-realized-grid",
+        help="score one placement over a global synchronization-latency grid",
+    )
+    parser.add_argument("schedule", type=Path)
+    parser.add_argument("problem", type=Path)
+    parser.add_argument("solution", type=Path)
+    parser.add_argument("--function")
+    parser.add_argument("--sync-latency-grid", required=True)
+    parser.add_argument("--nonmaterialized-access-evidence", type=Path)
+    _add_duration_arguments(parser)
+    parser.add_argument("-o", "--output", type=Path)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -6047,6 +6193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     rescore_parser.add_argument("--function")
     _add_duration_arguments(rescore_parser)
     rescore_parser.add_argument("-o", "--output", type=Path)
+
+    _add_score_realized_grid_parser(subparsers)
 
     perf_sim_parser = subparsers.add_parser(
         "validate-perf-sim", help="compare pinned formulas with Perf-Sim trace events"
