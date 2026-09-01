@@ -50,17 +50,34 @@ its own fresh MemRef. This pass closes that gap:
 1. **Top-down retarget** (`TopDownRetargeter`): for each `ForStmt`, take each
    `iter_arg`'s canonical MemRef as the target and push it onto the yielded value
    and its producer chain (following in-place `output-reuses-input` ops and
-   view inputs). `IfStmt` return values are retargeted into both branch yields.
-2. **Apply retype** (`RetypeApplier`): rewrite the collected variable types in
-   place so the producer writes directly into the carried buffer.
+   view inputs). `IfStmt` return values are retargeted into both branch yields,
+   then the collected type rewrites are applied.
+2. **Normalize peeled accumulator phis**: visit nested `IfStmt` nodes in
+   post-order and recognize both direct in-place accumulator producers and
+   branch-local loops carried by an accumulator seeded outside that branch.
+   When exactly one branch is the accumulator continuation, retarget the other
+   branch's local seed, the phi result, aliases, and nested loop carry onto the
+   reused input's canonical `Acc` allocation. Both the accumulator loop and the
+   sibling seed must be local to their respective branches, and the target must
+   be dead in the remainder of the seed branch. Whether the continuation is a
+   direct `tile.matmul_acc` or a branch-local loop, its reused input and every
+   bare/metadata alias must have no independent post-`if` read; otherwise the
+   sibling branch would clobber an observable value on the path where the
+   continuation does not execute.
+3. **Normalize semantic identity chains**
+   (`NormalizeIdentityCopyBuffersMutator`): make bare SSA copies share their
+   source allocation and make every registered in-place result share its reused
+   input allocation. This closes lowering-created type drift before any memory
+   planner observes lifetimes or PTOAS emits tile handles.
 
 The pass is a no-op when there is nothing to retarget (`Compute` returns no
 rewrites), and skips `Orchestration` functions (no TileType variables).
 
 ## Relationship to codegen
 
-PTO codegen renders variables that resolve to the *same* MemRef identity
-(`base` + `byte_offset` + `size`) as a single `tile_buf` handle, so after this
+PTO codegen renders variables that resolve to the *same* physical MemRef window
+(`base` + `byte_offset` + `size` + pipeline-slot metadata) as a single
+`tile_buf` handle, so after this
 pass a loop-carried accumulator emits an in-place `pto.tadd ins(%acc, %t)
 outs(%acc)` rather than writing to a distinct `%acc_next` buffer. Under
 `memory_planner=DSA_RP`, each resulting allocation identity becomes one DSA
@@ -73,8 +90,18 @@ physical address for ptoas `PlanMemory`. See
 - Views/partial-views keep their distinct `byte_offset`/`size` metadata. Under
   `DSA_RP`, all members that share one `base` belong to one physical allocation;
   placement moves that allocation as a unit and writeback preserves each
-  member's relative offset.
+  member's relative offset. Sharing only the `base` is not enough to establish a
+  must-alias relation: disjoint byte windows and different pipeline slots remain
+  distinct until the producer is safely retargeted to the exact canonical
+  window.
 - In the default (`PYPTO`) pipeline this pass plus `MemoryReuse` compose to the
   behavior of the former single `MemoryReuse` pass.
 - `DSA_RP` and `PTOAS` both skip opportunistic MemRef coalescing here; neither
   may undo a must-alias relation established by this pass.
+- Accumulator-phi normalization runs for every memory planner before lifetime
+  planning. The legacy `PYPTO` path repeats it after opportunistic reuse because
+  reuse can introduce a fresh carry/phi mismatch.
+- The preferred spelling for new matmul accumulators is a single
+  `tile.matmul_acc(..., init_cond=...)`. Peeled `matmul`/`matmul_acc` branches
+  remain supported for existing hand-written kernels and are normalized by this
+  pass.
