@@ -401,6 +401,7 @@ def _modeled_weight_comparison(
     cell_rows: Sequence[Mapping[str, str]],
     observed_by_device: dict[tuple[str, str, str, str], tuple[float, float]],
     minimum_device_effect: float,
+    minimum_model_effect: float,
 ) -> tuple[dict[str, Any], set[str]]:
     effects: dict[str, float] = {}
     for row in cell_rows:
@@ -431,6 +432,54 @@ def _modeled_weight_comparison(
         other_dsa = _number(row["dsa_rp_penalty_cycles"], field="dsa_rp_penalty_cycles")
         if other_cypress != cypress_score or other_dsa != dsa_score:
             raise ValueError(f"{workload}/{case_id}/{capacity}/{weight}: model score varies by device")
+
+    modeled_latency_fields = ("cypress_modeled_latency_cycles", "dsa_rp_modeled_latency_cycles")
+    modeled_latency_presence = [
+        tuple(row.get(field, "") != "" for field in modeled_latency_fields) for row in cell_rows
+    ]
+    any_modeled_latency = any(any(presence) for presence in modeled_latency_presence)
+    complete_modeled_latency = all(all(presence) for presence in modeled_latency_presence)
+    if any_modeled_latency and not complete_modeled_latency:
+        raise ValueError(
+            f"{workload}/{case_id}/{capacity}/{weight}: modeled latency is incomplete across devices"
+        )
+    if complete_modeled_latency:
+        cypress_modeled_latency = _number(
+            first["cypress_modeled_latency_cycles"], field="cypress_modeled_latency_cycles"
+        )
+        dsa_modeled_latency = _number(
+            first["dsa_rp_modeled_latency_cycles"], field="dsa_rp_modeled_latency_cycles"
+        )
+        assert cypress_modeled_latency is not None and dsa_modeled_latency is not None
+        if cypress_modeled_latency <= 0 or dsa_modeled_latency <= 0:
+            raise ValueError("modeled total latency cycles must be positive")
+        for row in cell_rows[1:]:
+            if (
+                _number(
+                    row["cypress_modeled_latency_cycles"],
+                    field="cypress_modeled_latency_cycles",
+                )
+                != cypress_modeled_latency
+                or _number(
+                    row["dsa_rp_modeled_latency_cycles"],
+                    field="dsa_rp_modeled_latency_cycles",
+                )
+                != dsa_modeled_latency
+            ):
+                raise ValueError(
+                    f"{workload}/{case_id}/{capacity}/{weight}: modeled latency varies by device"
+                )
+        modeled_effect = dsa_modeled_latency / cypress_modeled_latency - 1.0
+        raw_predicted_direction = _direction(modeled_effect)
+        predicted_direction = raw_predicted_direction if abs(modeled_effect) >= minimum_model_effect else 0
+        prediction_contract = "total_modeled_latency_relative_effect_gate_v1"
+    else:
+        cypress_modeled_latency = None
+        dsa_modeled_latency = None
+        modeled_effect = None
+        raw_predicted_direction = _direction(dsa_score - cypress_score)
+        predicted_direction = raw_predicted_direction
+        prediction_contract = "legacy_penalty_cycle_strict_order_v1"
     observed_class, observed_direction = _observed_classification(effects, minimum_device_effect)
     return (
         {
@@ -440,7 +489,12 @@ def _modeled_weight_comparison(
             "weight_cycles": weight,
             "cypress_penalty_cycles": cypress_score,
             "dsa_rp_penalty_cycles": dsa_score,
-            "predicted_direction": _direction(dsa_score - cypress_score),
+            "cypress_modeled_latency_cycles": cypress_modeled_latency,
+            "dsa_rp_modeled_latency_cycles": dsa_modeled_latency,
+            "modeled_relative_effect": modeled_effect,
+            "raw_predicted_direction": raw_predicted_direction,
+            "predicted_direction": predicted_direction,
+            "prediction_contract": prediction_contract,
             "observed_class": observed_class,
             "observed_direction": observed_direction,
             "device_effects": dict(sorted(effects.items())),
@@ -473,6 +527,7 @@ def evaluate_sync_weight_grid(
     rows: Sequence[Mapping[str, str]],
     *,
     minimum_device_effect: float = 0.02,
+    minimum_model_effect: float = 0.02,
     required_device_count: int = 2,
 ) -> dict[str, Any]:
     """Evaluate one global synchronization weight with leave-one-workload-out calibration.
@@ -486,6 +541,8 @@ def evaluate_sync_weight_grid(
     """
     if not math.isfinite(minimum_device_effect) or minimum_device_effect < 0:
         raise ValueError("minimum_device_effect must be finite and non-negative")
+    if not math.isfinite(minimum_model_effect) or minimum_model_effect < 0:
+        raise ValueError("minimum_model_effect must be finite and non-negative")
     if not isinstance(required_device_count, int) or required_device_count < 2:
         raise ValueError("required_device_count must be an integer of at least two")
 
@@ -548,6 +605,7 @@ def evaluate_sync_weight_grid(
             cell_rows,
             observed_by_device,
             minimum_device_effect,
+            minimum_model_effect,
         )
         if modeled_devices != device_set:
             raise ValueError(f"{case_key}: modeled device set does not match the declared cell")
@@ -609,6 +667,7 @@ def evaluate_sync_weight_grid(
         "schema_version": 1,
         "model": "complete_placement_dag_global_sync_weight_grid_v1",
         "minimum_device_effect": minimum_device_effect,
+        "minimum_model_effect": minimum_model_effect,
         "required_device_count": required_device_count,
         "calibration_objective": {
             "correct_strict_ordering": 1,
@@ -650,6 +709,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="per-device relative-effect floor for a threshold-cleared ordering (default: 0.02)",
     )
     parser.add_argument(
+        "--minimum-model-effect",
+        type=float,
+        default=0.02,
+        help="relative modeled-latency floor for a strict prediction (default: 0.02)",
+    )
+    parser.add_argument(
         "--required-device-count",
         type=int,
         default=2,
@@ -664,6 +729,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = evaluate_sync_weight_grid(
                 _read_table(args.input, SYNC_WEIGHT_COLUMNS),
                 minimum_device_effect=args.minimum_device_effect,
+                minimum_model_effect=args.minimum_model_effect,
                 required_device_count=args.required_device_count,
             )
             result["split"] = args.split

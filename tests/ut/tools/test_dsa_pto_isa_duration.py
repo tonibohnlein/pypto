@@ -268,6 +268,17 @@ def test_ttrans_uses_pinned_mte1_default_rule():
             },
             "pto_isa_perf_sim_scalar_stage",
         ),
+        (
+            {
+                **_node("pto.store_scalar", "PIPE_S", "!pto.ptr<f32>", "f32"),
+                "operation": {
+                    "operand_types": ["!pto.ptr<f32>", "f32"],
+                    "result_types": [],
+                    "attributes": {},
+                },
+            },
+            "pto_isa_perf_sim_scalar_stage",
+        ),
         (_node("pto.tpush", "PIPE_FIX"), "pto_isa_perf_sim_scalar_stage"),
         (_node("pto.tpop", "PIPE_MTE2"), "pto_isa_perf_sim_scalar_stage"),
         (_node("pto.tfree", "PIPE_FIX"), "pto_isa_perf_sim_scalar_stage"),

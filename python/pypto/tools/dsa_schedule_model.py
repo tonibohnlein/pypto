@@ -1180,9 +1180,7 @@ def apply_runtime_branch_profile(  # noqa: PLR0912 - fail-closed external eviden
     raw_nodes = enriched.get("nodes")
     if not isinstance(raw_nodes, list) or not all(isinstance(node, dict) for node in raw_nodes):
         raise ValueError("runtime branch profile requires mutable object nodes")
-    nodes_by_id = {
-        int(node["id"]): node for node in raw_nodes if isinstance(node.get("id"), int)
-    }
+    nodes_by_id = {int(node["id"]): node for node in raw_nodes if isinstance(node.get("id"), int)}
 
     raw_trip_counts = profile.get("loop_trip_counts")
     if not isinstance(raw_trip_counts, list):
@@ -1274,8 +1272,7 @@ def apply_runtime_branch_profile(  # noqa: PLR0912 - fail-closed external eviden
                 f"runtime branch profile for IF_BEGIN {node_id} requires a SHA-256 derivation proof"
             )
         if derivation["kind"] == "captured_immutable_scalar_expression_v1" and (
-            derivation.get("immutability_proof")
-            not in {"function_argument_v1", "pre_loop_ssa_definition_v1"}
+            derivation.get("immutability_proof") not in {"function_argument_v1", "pre_loop_ssa_definition_v1"}
         ):
             raise ValueError(
                 f"runtime branch profile for IF_BEGIN {node_id} lacks a supported scalar immutability proof"
@@ -1302,9 +1299,7 @@ def apply_runtime_branch_profile(  # noqa: PLR0912 - fail-closed external eviden
             if comparable_existing["active_flat_indices"] is None:
                 comparable_existing["active_flat_indices"] = list(range(math.prod(counts)))
             if comparable_existing != comparable_runtime:
-                raise ValueError(
-                    f"runtime branch profile for IF_BEGIN {node_id} contradicts static analysis"
-                )
+                raise ValueError(f"runtime branch profile for IF_BEGIN {node_id} contradicts static analysis")
         node["predicate_iteration_profile"] = exact_profile
         node["predicate_loop_invariant"] = len(set(values)) <= 1
         profiled_branches.add(node_id)
@@ -1316,6 +1311,122 @@ def apply_runtime_branch_profile(  # noqa: PLR0912 - fail-closed external eviden
         "bindings": dict(expected_bindings),
         "profiled_loop_ids": sorted(profiled_loops),
         "profiled_if_node_ids": sorted(profiled_branches),
+    }
+    return enriched
+
+
+def apply_runtime_parallel_branch_profile(  # noqa: PLR0912 - fail-closed evidence contract
+    record: Mapping[str, Any],
+    profile: Mapping[str, Any],
+    *,
+    schedule_sha256: str,
+    problem_sha256: str,
+    input_set_sha256: str,
+    trip_metadata_sha256: str,
+) -> dict[str, Any]:
+    """Attach an exact, digest-bound branch profile for parallel instances.
+
+    A kernel dispatch may execute the same structured graph on several cores
+    or blocks with different loop-invariant branch outcomes.  The latency of
+    that dispatch is the maximum instance makespan, not the maximum placement
+    extension considered in isolation.  This profile records which complete
+    branch scenarios were actually present without pretending that their
+    captured values are compile-time facts.
+    """
+
+    if (
+        profile.get("schema_version") != 1
+        or profile.get("contract") != "exact_runtime_parallel_branch_profile_v1"
+    ):
+        raise ValueError("runtime parallel branch profile must use exact_runtime_parallel_branch_profile_v1")
+    bindings = profile.get("bindings")
+    if not isinstance(bindings, Mapping):
+        raise ValueError("runtime parallel branch profile is missing bindings")
+    expected_bindings = {
+        "schedule_sha256": schedule_sha256,
+        "problem_sha256": problem_sha256,
+        "input_set_sha256": input_set_sha256,
+        "trip_metadata_sha256": trip_metadata_sha256,
+    }
+    for key, expected in expected_bindings.items():
+        if bindings.get(key) != expected:
+            raise ValueError(f"runtime parallel branch profile {key} does not match the scored input")
+
+    derivation = profile.get("derivation")
+    if (
+        not isinstance(derivation, Mapping)
+        or derivation.get("kind") != "captured_parallel_branch_outcomes_v1"
+    ):
+        raise ValueError("runtime parallel branch profile lacks captured outcome provenance")
+    evidence_sha256 = derivation.get("evidence_sha256")
+    if not isinstance(evidence_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", evidence_sha256) is None:
+        raise ValueError("runtime parallel branch profile requires a SHA-256 derivation proof")
+
+    nodes_by_id = {
+        int(node["id"]): node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("id"), int)
+    }
+    raw_scenarios = profile.get("scenarios")
+    if not isinstance(raw_scenarios, list) or not raw_scenarios:
+        raise ValueError("runtime parallel branch profile scenarios must be a non-empty list")
+    normalized_scenarios: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[int, bool], ...]] = set()
+    for raw in raw_scenarios:
+        if not isinstance(raw, Mapping):
+            raise ValueError("runtime parallel branch profile has a malformed scenario")
+        instance_count = raw.get("instance_count")
+        raw_choices = raw.get("branch_choices")
+        if not isinstance(instance_count, int) or isinstance(instance_count, bool) or instance_count <= 0:
+            raise ValueError("parallel branch scenario instance_count must be a positive integer")
+        if not isinstance(raw_choices, list) or not raw_choices:
+            raise ValueError("parallel branch scenario branch_choices must be a non-empty list")
+        choices: dict[int, bool] = {}
+        for item in raw_choices:
+            if not isinstance(item, Mapping):
+                raise ValueError("parallel branch scenario has a malformed branch choice")
+            node_id = item.get("if_node_id")
+            value = item.get("value")
+            predicate_identity = item.get("predicate_identity")
+            if not isinstance(node_id, int) or not isinstance(value, bool) or node_id in choices:
+                raise ValueError(
+                    "parallel branch scenario requires unique integer branch ids and bool values"
+                )
+            node = nodes_by_id.get(node_id)
+            if node is None or node.get("kind") != "branch" or node.get("branch_kind") != "IF_BEGIN":
+                raise ValueError(f"parallel branch scenario references unknown IF_BEGIN {node_id}")
+            if node.get("predicate_loop_invariant") is not True:
+                raise ValueError(f"parallel branch scenario IF_BEGIN {node_id} is not proven loop-invariant")
+            if not isinstance(predicate_identity, str) or predicate_identity != node.get(
+                "predicate_identity"
+            ):
+                raise ValueError(
+                    f"parallel branch scenario predicate identity does not match IF_BEGIN {node_id}"
+                )
+            choices[node_id] = value
+        key = _branch_scenario_key(choices)
+        if key in seen:
+            raise ValueError(f"runtime parallel branch profile repeats scenario {key}")
+        seen.add(key)
+        normalized_scenarios.append(
+            {
+                "instance_count": instance_count,
+                "branch_choices": {str(node_id): value for node_id, value in key},
+            }
+        )
+
+    enriched = copy.deepcopy(dict(record))
+    canonical = json.dumps(profile, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    enriched["runtime_parallel_branch_profile"] = {
+        "contract": "exact_runtime_parallel_branch_profile_v1",
+        "semantic_sha256": hashlib.sha256(canonical).hexdigest(),
+        "bindings": dict(expected_bindings),
+        "derivation": dict(derivation),
+        "parallel_instance_count": sum(row["instance_count"] for row in normalized_scenarios),
+        "scenarios": sorted(
+            normalized_scenarios,
+            key=lambda row: _branch_scenario_key(row["branch_choices"]),
+        ),
     }
     return enriched
 
@@ -2676,9 +2787,7 @@ def _branch_value_for_context(
             )
         flat_index = flat_index * count + iteration
     if flat_index not in values:
-        raise ValueError(
-            f"structured branch {branch} is inactive in loop context {dict(context)}"
-        )
+        raise ValueError(f"structured branch {branch} is inactive in loop context {dict(context)}")
     return values[flat_index]
 
 
@@ -4845,9 +4954,7 @@ def _exact_profiled_loop_candidate_score(
         "synchronization_latency_cycles": synchronization_latency_cycles,
     }
     augmented = _schedule_with_realized_candidate_edges(record, [], [edge])
-    baseline = _static_dependency_makespan(
-        record, operation_durations, synchronization_latency_cycles
-    )
+    baseline = _static_dependency_makespan(record, operation_durations, synchronization_latency_cycles)
     with_candidate = _static_dependency_makespan(
         augmented, operation_durations, synchronization_latency_cycles
     )
@@ -4995,6 +5102,72 @@ def _scenario_extension_rows(base: Mapping[str, Any], complete: Mapping[str, Any
         }
         for key in sorted(base_spans)
     ]
+
+
+def _runtime_parallel_dispatch_score(
+    record: Mapping[str, Any], scenario_extensions: Sequence[Mapping[str, Any]]
+) -> dict[str, Any] | None:
+    """Aggregate observed parallel branch instances into one dispatch score."""
+
+    profile = record.get("runtime_parallel_branch_profile")
+    if profile is None:
+        return None
+    if not isinstance(profile, Mapping):
+        raise ValueError("runtime_parallel_branch_profile must be an object")
+    raw_scenarios = profile.get("scenarios")
+    if not isinstance(raw_scenarios, list) or not raw_scenarios:
+        raise ValueError("runtime parallel branch profile has no scenarios")
+
+    modeled: dict[tuple[tuple[int, bool], ...], Mapping[str, Any]] = {}
+    for row in scenario_extensions:
+        choices = row.get("branch_choices")
+        if not isinstance(choices, Mapping):
+            raise ValueError("modeled branch scenario has no branch choices")
+        key = _branch_scenario_key(choices)
+        if key in modeled:
+            raise ValueError(f"modeled branch scenarios repeat {key}")
+        modeled[key] = row
+
+    observed: list[dict[str, Any]] = []
+    for raw in raw_scenarios:
+        if not isinstance(raw, Mapping):
+            raise ValueError("runtime parallel branch profile has a malformed scenario")
+        choices = raw.get("branch_choices")
+        instance_count = raw.get("instance_count")
+        if not isinstance(choices, Mapping) or not isinstance(instance_count, int) or instance_count <= 0:
+            raise ValueError("runtime parallel branch profile has an invalid scenario")
+        key = _branch_scenario_key(choices)
+        row = modeled.get(key)
+        if row is None:
+            raise ValueError(f"runtime parallel branch scenario {key} is absent from the modeled graph")
+        observed.append(
+            {
+                "branch_choices": {str(branch): value for branch, value in key},
+                "instance_count": instance_count,
+                "base_makespan_cycles": float(row["base_makespan_cycles"]),
+                "placement_makespan_cycles": float(row["placement_makespan_cycles"]),
+                "critical_path_extension_cycles": float(row["critical_path_extension_cycles"]),
+            }
+        )
+
+    base_critical = max(observed, key=lambda row: row["base_makespan_cycles"])
+    placement_critical = max(observed, key=lambda row: row["placement_makespan_cycles"])
+    base_cycles = float(base_critical["base_makespan_cycles"])
+    placement_cycles = float(placement_critical["placement_makespan_cycles"])
+    extension = max(0.0, placement_cycles - base_cycles)
+    return {
+        "schema_version": 1,
+        "contract": "parallel_dispatch_max_instance_makespan_v1",
+        "profile_semantic_sha256": profile.get("semantic_sha256"),
+        "parallel_instance_count": sum(int(row["instance_count"]) for row in observed),
+        "observed_scenarios": observed,
+        "base_makespan_cycles": base_cycles,
+        "placement_makespan_cycles": placement_cycles,
+        "critical_path_extension_cycles": extension,
+        "relative_critical_path_extension": extension / base_cycles if base_cycles > 0 else None,
+        "base_critical_branch_choices": dict(base_critical["branch_choices"]),
+        "placement_critical_branch_choices": dict(placement_critical["branch_choices"]),
+    }
 
 
 def _profile_dominance(first: Sequence[Mapping[str, Any]], second: Sequence[Mapping[str, Any]]) -> int | None:
@@ -5391,6 +5564,7 @@ def score_complete_placement_dag(  # noqa: PLR0912 - explicit evidence and model
     base = _static_dependency_makespan(reference_record, operation_durations, model.sync_latency_cycles)
     complete = _static_dependency_makespan(augmented, operation_durations, model.sync_latency_cycles)
     scenario_extensions = _scenario_extension_rows(base, complete)
+    runtime_dispatch_score = _runtime_parallel_dispatch_score(reference_record, scenario_extensions)
     base_cycles = float(base["full_makespan_cycles"])
     complete_cycles = float(complete["full_makespan_cycles"])
     additive_cycles = float(realized_placement.get("critical_path_realized_cost_cycles", 0.0))
@@ -5420,6 +5594,7 @@ def score_complete_placement_dag(  # noqa: PLR0912 - explicit evidence and model
         "critical_path_extension_range_cycles": [min(extensions), max(extensions)],
         "critical_path_extension_profiles": profiles,
         "branch_scenario_extensions": scenario_extensions,
+        "runtime_parallel_dispatch_score": runtime_dispatch_score,
         "pairwise_additive_cost_cycles": additive_cycles,
         "nonadditive_interaction_cycles": (extension - additive_cycles if extension is not None else None),
         "realized_distance_zero_edge_count": len(selected_distance_zero),
@@ -6000,8 +6175,7 @@ def score_reuse_candidates(  # noqa: PLR0912, PLR0915 - explicit provenance and 
         **_latency_graph_completeness(prepared_record, edge_diagnostics, baseline_loop_sync_models),
         "candidate_count": len(candidates),
         "scored_candidate_count": sum(
-            row.get("status")
-            in {"scored", "loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}
+            row.get("status") in {"scored", "loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}
             for row in rows
         ),
         "scored_distance_zero_candidate_count": sum(row.get("status") == "scored" for row in rows),
@@ -7607,6 +7781,11 @@ def _add_runtime_branch_profile_arguments(parser: argparse.ArgumentParser) -> No
         help="exact digest-bound per-occurrence branch profile",
     )
     parser.add_argument(
+        "--runtime-parallel-branch-profile",
+        type=Path,
+        help="exact digest-bound branch scenarios across parallel dispatch instances",
+    )
+    parser.add_argument(
         "--runtime-input-manifest",
         type=Path,
         help="captured input manifest bound by --runtime-branch-profile",
@@ -7626,27 +7805,36 @@ def _apply_runtime_profile_from_args(
     problem_path: Path,
 ) -> dict[str, Any]:
     profile_path = getattr(args, "runtime_branch_profile", None)
+    parallel_profile_path = getattr(args, "runtime_parallel_branch_profile", None)
     input_manifest = getattr(args, "runtime_input_manifest", None)
     trip_metadata = getattr(args, "runtime_trip_metadata", None)
-    supplied = [profile_path is not None, input_manifest is not None, trip_metadata is not None]
-    if not any(supplied):
+    if profile_path is None and parallel_profile_path is None:
+        if input_manifest is not None or trip_metadata is not None:
+            raise ValueError("runtime input metadata requires a runtime branch profile")
         return dict(record)
-    if not all(supplied):
+    if input_manifest is None or trip_metadata is None:
         raise ValueError(
-            "runtime branch specialization requires --runtime-branch-profile, "
+            "runtime branch specialization requires a branch profile, "
             "--runtime-input-manifest, and --runtime-trip-metadata together"
         )
-    payload = json.loads(profile_path.read_text())
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"{profile_path}: runtime branch profile must be an object")
-    return apply_runtime_branch_profile(
-        record,
-        payload,
-        schedule_sha256=hashlib.sha256(schedule_path.read_bytes()).hexdigest(),
-        problem_sha256=hashlib.sha256(problem_path.read_bytes()).hexdigest(),
-        input_set_sha256=hashlib.sha256(input_manifest.read_bytes()).hexdigest(),
-        trip_metadata_sha256=hashlib.sha256(trip_metadata.read_bytes()).hexdigest(),
-    )
+    digests = {
+        "schedule_sha256": hashlib.sha256(schedule_path.read_bytes()).hexdigest(),
+        "problem_sha256": hashlib.sha256(problem_path.read_bytes()).hexdigest(),
+        "input_set_sha256": hashlib.sha256(input_manifest.read_bytes()).hexdigest(),
+        "trip_metadata_sha256": hashlib.sha256(trip_metadata.read_bytes()).hexdigest(),
+    }
+    enriched = dict(record)
+    if profile_path is not None:
+        payload = json.loads(profile_path.read_text())
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"{profile_path}: runtime branch profile must be an object")
+        enriched = apply_runtime_branch_profile(enriched, payload, **digests)
+    if parallel_profile_path is not None:
+        payload = json.loads(parallel_profile_path.read_text())
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"{parallel_profile_path}: runtime parallel branch profile must be an object")
+        enriched = apply_runtime_parallel_branch_profile(enriched, payload, **digests)
+    return enriched
 
 
 def _duration_model_provenance(model: DurationModel) -> dict[str, Any]:
@@ -7806,6 +7994,11 @@ def _run_direct_model_command(args: argparse.Namespace) -> bool:
                         if args.runtime_branch_profile is not None
                         else None
                     ),
+                    "runtime_parallel_branch_profile": (
+                        _hashed_input(args.runtime_parallel_branch_profile)
+                        if args.runtime_parallel_branch_profile is not None
+                        else None
+                    ),
                     "runtime_input_manifest": (
                         _hashed_input(args.runtime_input_manifest)
                         if args.runtime_input_manifest is not None
@@ -7851,7 +8044,7 @@ def _add_score_realized_grid_parser(subparsers: Any) -> None:
     parser.add_argument("-o", "--output", type=Path)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0912,PLR0915 - explicit CLI dispatch
     parser = argparse.ArgumentParser(prog="dsa_schedule_model")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -8007,6 +8200,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if isinstance(record.get("runtime_branch_profile"), Mapping):
                 result["runtime_branch_profile"] = dict(record["runtime_branch_profile"])
+            if isinstance(record.get("runtime_parallel_branch_profile"), Mapping):
+                result["runtime_parallel_branch_profile"] = dict(record["runtime_parallel_branch_profile"])
             if args.solution is not None:
                 result["realized_placement"] = score_realized_reuse(
                     args.problem,

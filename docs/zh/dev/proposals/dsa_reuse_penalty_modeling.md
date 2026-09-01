@@ -321,6 +321,12 @@ schedule、problem、捕获 tensor/scalar 以及 loop-trip metadata 的 hash，�
 branch occurrence，绝不会把捕获值提升为 compile-time fact。嵌套 branch 还会记录 active
 flattened occurrence index。
 
+并行 kernel instance 需要不同的聚合 contract。`exact_runtime_parallel_branch_profile_v1`
+会记录每个观测 scenario 的 branch choice 与 instance multiplicity。dispatch score 是
+`max(instance placement makespan) - max(instance base makespan)`，而不是每个 scenario
+extension 的最大值。这一区别对 Gumbel 很关键：两个较短 ELSE instance 暴露较大的局部
+extension，但 placement 前后，六个较长 THEN instance 都仍是 dispatch bottleneck。
+
 使用归档的确定性输入后，`rmsnorm_rope_cache_write/half` 现在完整。它的两个
 runtime-loaded predicate 使用实际被测 dispatch 的精确 mixed branch profile。相同 contract
 也可以表达 `softmax_pool_c128/native`，但该 case 尚未使用捕获 profile 重新评分，因此这里
@@ -334,18 +340,26 @@ score 在冻结 weight grid 上给 Cypress 分别增加
 `408, 560, 1200, 1840, 2480, 3120` cycle，而 DSA-RP 始终为零。这在不读取 InsertSync 的
 情况下正确预测了已测 DSA-RP 胜出。
 
-Gate 已在冻结 compiler revision 上完成 product-faithful re-export。新的 source-loop marker
-可以穿过 PTO codegen，使 `gate_aic` 把多个 lowered loop 重新关联到原始 source loop；
-`gate_aic` 和 `x_norm_quant` 现在都完整。Pinned PTO-ISA estimate 还覆盖了 Gate 的
-`tmul(fp32, 1x4096)`、`tfree` 和 `tfillpad`，没有引入本地拟合常量。但 parent aggregate
-score 仍 fail closed：`ffn_norm`、`gate_aiv` 和 `route_sort` 分别需要尚未支持的
-`trecip`/`tabs`、`tmaxs` 和 `trowexpanddiv` signature。因此不能从两个完整 child 推断
-parent-wide Gate ordering。
+Gate 剩余 duration signature 现在都有 pinned PTO-ISA 或串行 Perf-Sim 证据，包括
+`trecip`、`tabs`、`tmax`、`tmaxs`、`trowmax`、`trowexpanddiv`、`tlog`、`tmins`
+以及 scalar store。因此 `ffn_norm`、`gate_aiv`、`route_sort` 和 `x_norm_quant` 在四种
+capacity、两个 arm 上都可评分。`gate_aic` 仍 fail closed，因为实测 compiler revision
+没有保留原始 source-loop identity。current re-export 虽带 marker，但 operation stream 多出
+一个 `tmatmul`；把 marker 移植到冻结 endpoint 会混合 compiler revision，而不是修复
+provenance。因此不能从四个完整 child 推断 parent-wide Gate ordering。
 
-全局 calibration 仍无法辨识。确认的 KV 和 RMS 胜出现在整个冻结 weight grid 上都可解释，
-但 Gate 的确认 Cypress ordering 没有完整 parent score。此外，完整的 Gumbel model 在所有
-符号 branch scenario 中都预测 DSA-RP 更优，而 q1 上两台设备测得 latency null。因此可用于
-leave-one-workload-out 的确认且 model-complete 的方向 label 仍太少，不选择任何 weight。
+修正后的回顾 grid 包含 19 个已测非 Gate cell：16 个 model-eligible，三个因缺失
+source-loop 或 runtime-branch provenance 而 fail closed。确认的 KV 胜出在每个 weight 上都
+被预测；确认的 RMS 胜出在 `64--160` cycle 上越过预声明的 2% modeled-effect floor。在这四个
+weight 上，model 对 threshold-cleared 双设备 ordering 为 2/2，但只有两个方向 workload，
+不足以支持有意义的 leave-one-workload-out calibration。Gate 的确认 Cypress ordering 仍没有
+完整 parent score。
+
+Gumbel 的 false confidence 已被修复，而不是用 calibration 掩盖。采用上述 parallel-dispatch
+聚合后，Cypress 只给 `383859--421011` cycle 的 dispatch 增加 41 cycle，即
+`0.0097--0.0107%`；evaluator 因而在所有 weight 上预测 tie，与 q1 device null 一致。此前
+严格预测 DSA-RP 胜出，是因为错误采用最大局部 branch extension，并把任何非零差异都当成
+方向预测。
 
 指定的代表性用例直接暴露了 model coverage 与 mechanism 缺口：
 
@@ -353,8 +367,8 @@ leave-one-workload-out 的确认且 model-complete 的方向 label 仍太少，�
 | ---- | -------------- | -------------- | ----------------- |
 | `rmsnorm_rope_cache_write/half` | DSA-RP 对 Cypress `-7.19%/-7.43%` | `8 -> 0` | 使用精确且 digest-bound 的 runtime profile 后完整。在 `16--160` weight 上，Cypress 增加 `62, 97, 161, 354, 610, 761` cycle，DSA-RP 增加零。 |
 | `kv_score_proj_c128/native` | DSA-RP 对 Cypress `-2.50%/-2.30%` | `64 -> 64` | 完整。pipeline-serialization provenance 与修复后的 lowered-access join 在每个测试 weight 上都给 Cypress 正 critical-path extension、给 DSA-RP 零。 |
-| `mtp/gate` | Cypress 在四种 capacity 都更快，约 `1.6--4.1%` | DSA-RP 的 count 相同或更优 | 已 re-export 但 parent 不完整：source-loop identity 已修复，两个 child 完整，三个因不支持的 duration signature 而 fail closed。 |
-| `gumbel_argmax/q1` | DSA-RP 对 Cypress `+0.22%/+0.11%`，为 latency null | `14 -> 0` | 完整，但在每个 weight 上都 false-confident。将同一 predicate 的三个重复测试关联起来可删除不可能路径，却不能解释该 null。 |
+| `mtp/gate` | Cypress 在四种 capacity 都更快，约 `1.6--4.1%` | DSA-RP 的 count 相同或更优 | duration 完整但 parent 不完整：四个 child 可评分；冻结 `gate_aic` 缺少 source-loop provenance，而 current export 改变了 operation stream。 |
+| `gumbel_argmax/q1` | DSA-RP 对 Cypress `+0.22%/+0.11%`，为 latency null | `14 -> 0` | 采用 max-instance dispatch 聚合与 2% modeled-effect gate 后，在每个 weight 上都完整且正确预测 tie。 |
 | `hc_post/native` | 在不同 campaign 中 effect 很弱、符号反转或无法复现 | 原始 cell 为 `33 -> 24` | 在一个 correlated dynamic-loop parameter 下为 `PARAMETRIC_ASSUMPTION`；预测 DSA-RP 不更差，但 extrapolated score 与 device label 都不能用于 validation。 |
 
 持久化 device 数据源是
@@ -373,15 +387,17 @@ python -m pypto.tools.dsa_schedule_model score-realized-grid \
   --sync-latency-grid 16,32,64,96,128,160 -o ARM_GRID.json
 python -m pypto.tools.dsa_penalty_model_evaluation sync-weight-grid-input.tsv \
   --sync-weight-grid --split development --minimum-device-effect 0.02 \
+  --minimum-model-effect 0.02 \
   --required-device-count 2 -o sync-weight-grid-evaluation.json
 ```
 
 该分析未通过 incremental critical-path planner 的 gate。planner 没有改动，也不应根据此
-grid 启动新的 device task。static 与精确 runtime mixed-iteration branch、source-loop
-identity、KV pipeline provenance 与 KV access join 已完成。但预先声明的 scientific gate
-仍失败：Gate 的 duration 不完整，Gumbel 在每个测试 weight 上都是 false-confident
-prediction。因此刻意没有实现 incremental greedy planner。下一项本地工作是解决这两个失败，
-并增加足够多确认且 model-complete 的独立方向用例，以支持有意义的
+grid 启动新的 device task。static 与精确 runtime mixed-iteration branch、parallel-dispatch
+聚合、KV pipeline provenance 与 KV access join 已完成。RMS、KV 和 Gumbel 现在通过各自的
+代表性 gate。但预声明的 scientific gate 仍失败，因为冻结 Gate 缺少 source-loop
+provenance，而且 model-complete 的确认方向 workload 只有两个。因此刻意没有实现
+incremental greedy planner。下一项本地工作是获得符合实测 compiler contract 的
+product-faithful Gate graph，再增加足够多确认且 model-complete 的独立方向用例，以支持有意义的
 leave-one-workload-out calibration。
 
 对每个 arm 的实际 post-InsertSync graph 评分，才得到预期的 analysis oracle。在同一回顾

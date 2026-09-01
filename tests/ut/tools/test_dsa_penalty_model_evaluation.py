@@ -132,6 +132,7 @@ def _weight_grid_cell(
     *,
     observed_effect: float,
     scores: dict[float, tuple[float, float]],
+    modeled_latencies: dict[float, tuple[float, float]] | None = None,
     status: str = "MODELED",
 ) -> list[dict[str, str]]:
     rows = []
@@ -149,6 +150,14 @@ def _weight_grid_cell(
                     "dsa_rp_penalty_cycles": str(dsa_score),
                     "cypress_latency_us": str(cypress_latency),
                     "dsa_rp_latency_us": str(cypress_latency * (1.0 + observed_effect)),
+                    **(
+                        {
+                            "cypress_modeled_latency_cycles": str(modeled_latencies[weight][0]),
+                            "dsa_rp_modeled_latency_cycles": str(modeled_latencies[weight][1]),
+                        }
+                        if modeled_latencies is not None
+                        else {}
+                    ),
                 }
             )
     return rows
@@ -191,6 +200,36 @@ def test_sync_weight_grid_does_not_calibrate_on_below_threshold_effects():
         for fold in result["leave_one_workload_out"]
     )
     assert all(row["sign_consistent_below_threshold"]["correct_count"] == 2 for row in result["sensitivity"])
+
+
+def test_sync_weight_grid_treats_subthreshold_modeled_latency_effect_as_tie():
+    rows = _weight_grid_cell(
+        "workload-a",
+        observed_effect=0.001,
+        scores={64.0: (1000.0, 0.0)},
+        modeled_latencies={64.0: (400000.0, 400041.0)},
+    )
+
+    result = evaluation.evaluate_sync_weight_grid(rows)
+    comparison = result["comparisons"][0]
+
+    assert comparison["prediction_contract"] == "total_modeled_latency_relative_effect_gate_v1"
+    assert comparison["raw_predicted_direction"] == 1
+    assert comparison["predicted_direction"] == 0
+    assert comparison["modeled_relative_effect"] == pytest.approx(41.0 / 400000.0)
+
+
+def test_sync_weight_grid_rejects_partial_modeled_latency_pair():
+    rows = _weight_grid_cell(
+        "workload-a",
+        observed_effect=0.001,
+        scores={64.0: (1000.0, 0.0)},
+    )
+    for row in rows:
+        row["cypress_modeled_latency_cycles"] = "400000"
+
+    with pytest.raises(ValueError, match="modeled latency is incomplete"):
+        evaluation.evaluate_sync_weight_grid(rows)
 
 
 def test_sync_weight_grid_rejects_exact_latency_drift_even_when_effect_is_unchanged():
