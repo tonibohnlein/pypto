@@ -1307,9 +1307,7 @@ def test_loop_candidate_maps_mixed_iteration_then_to_else_handoff_by_occurrence(
     ]
     record["stream_edges"] = []
 
-    result = dsa_schedule_model.score_reuse_candidates(
-        record, [_candidate(distance=1)], _ten_cycle_model()
-    )
+    result = dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
 
     candidate = result["candidates"][0]
     assert candidate["status"] == "loop_carried_occurrence_profiled_v2"
@@ -1359,9 +1357,7 @@ def test_nested_loop_candidate_uses_original_source_loop_identity():
         if node.get("kind") == "operation":
             node["loop_stack"] = [9, 10]
 
-    result = dsa_schedule_model.score_reuse_candidates(
-        record, [_candidate(distance=1)], _ten_cycle_model()
-    )
+    result = dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
 
     assert result["candidates"][0]["resolved_recurrence_loop_node"] == 10
 
@@ -4534,6 +4530,134 @@ def test_runtime_branch_profile_supports_exact_nested_active_occurrences():
     assert dsa_schedule_model._branch_value_for_context(12, {}, profiles, {10: 3}) is False
     with pytest.raises(ValueError, match="inactive in loop context"):
         dsa_schedule_model._branch_value_for_context(12, {}, profiles, {10: 0})
+
+
+def test_parallel_branch_profile_aggregates_dispatch_by_instance_makespan():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 11,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [],
+            "branch_stack": [],
+            "predicate_identity": "expr:shared-runtime-flag",
+            "predicate_loop_invariant": True,
+        }
+    ]
+    digests = {
+        "schedule_sha256": "a" * 64,
+        "problem_sha256": "b" * 64,
+        "input_set_sha256": "c" * 64,
+        "trip_metadata_sha256": "d" * 64,
+    }
+    profile = {
+        "schema_version": 1,
+        "contract": "exact_runtime_parallel_branch_profile_v1",
+        "bindings": digests,
+        "derivation": {
+            "kind": "captured_parallel_branch_outcomes_v1",
+            "evidence_sha256": "e" * 64,
+        },
+        "scenarios": [
+            {
+                "instance_count": 2,
+                "branch_choices": [
+                    {
+                        "if_node_id": 11,
+                        "predicate_identity": "expr:shared-runtime-flag",
+                        "value": False,
+                    }
+                ],
+            },
+            {
+                "instance_count": 6,
+                "branch_choices": [
+                    {
+                        "if_node_id": 11,
+                        "predicate_identity": "expr:shared-runtime-flag",
+                        "value": True,
+                    }
+                ],
+            },
+        ],
+    }
+
+    enriched = dsa_schedule_model.apply_runtime_parallel_branch_profile(record, profile, **digests)
+    score = dsa_schedule_model._runtime_parallel_dispatch_score(
+        enriched,
+        [
+            {
+                "branch_choices": {"11": False},
+                "base_makespan_cycles": 100.0,
+                "placement_makespan_cycles": 130.0,
+                "critical_path_extension_cycles": 30.0,
+            },
+            {
+                "branch_choices": {"11": True},
+                "base_makespan_cycles": 200.0,
+                "placement_makespan_cycles": 205.0,
+                "critical_path_extension_cycles": 5.0,
+            },
+        ],
+    )
+
+    assert score is not None
+    assert score["parallel_instance_count"] == 8
+    assert score["base_makespan_cycles"] == 200.0
+    assert score["placement_makespan_cycles"] == 205.0
+    assert score["critical_path_extension_cycles"] == 5.0
+    assert score["relative_critical_path_extension"] == 0.025
+    with pytest.raises(ValueError, match="problem_sha256 does not match"):
+        dsa_schedule_model.apply_runtime_parallel_branch_profile(
+            record, profile, **{**digests, "problem_sha256": "f" * 64}
+        )
+
+
+def test_parallel_branch_profile_rejects_loop_variant_predicate():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 11,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "predicate_identity": "expr:loop-varying",
+            "predicate_loop_invariant": False,
+        }
+    ]
+    digests = {
+        "schedule_sha256": "a" * 64,
+        "problem_sha256": "b" * 64,
+        "input_set_sha256": "c" * 64,
+        "trip_metadata_sha256": "d" * 64,
+    }
+    profile = {
+        "schema_version": 1,
+        "contract": "exact_runtime_parallel_branch_profile_v1",
+        "bindings": digests,
+        "derivation": {
+            "kind": "captured_parallel_branch_outcomes_v1",
+            "evidence_sha256": "e" * 64,
+        },
+        "scenarios": [
+            {
+                "instance_count": 1,
+                "branch_choices": [
+                    {
+                        "if_node_id": 11,
+                        "predicate_identity": "expr:loop-varying",
+                        "value": True,
+                    }
+                ],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="not proven loop-invariant"):
+        dsa_schedule_model.apply_runtime_parallel_branch_profile(record, profile, **digests)
 
 
 def test_complete_placement_dag_rejects_unproven_loop_variant_branch():

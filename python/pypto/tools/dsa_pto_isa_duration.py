@@ -58,7 +58,7 @@ _FORMULA_OPCODE = {
 _ANY_PARAMETER_OPS = {"TEXP", "TSQRT"}
 _MATMUL_OPS = {"pto.tmatmul", "pto.tmatmul.acc"}
 _TRANSFER_OPS = {"pto.tload": "TLOAD", "pto.tstore": "TSTORE", "pto.tmov": "TMOV"}
-_SCALAR_STAGE_OPS = {"pto.load_scalar", "pto.tpush", "pto.tpop", "pto.tfree"}
+_SCALAR_STAGE_OPS = {"pto.load_scalar", "pto.store_scalar", "pto.tpush", "pto.tpop", "pto.tfree"}
 _PERF_SIM_DEFAULT_OPS = {
     "pto.tadd",
     "pto.tadds",
@@ -435,11 +435,20 @@ class PtoIsaDurationProvider:
         result_types: list[str],
     ) -> DurationEstimate:
         pipe = node.get("pipe")
-        if op_name == "pto.load_scalar":
+        if op_name in {"pto.load_scalar", "pto.store_scalar"}:
             pointer_types = [item for item in operand_types if item.startswith("!pto.ptr<")]
-            scalar_results = [item for item in result_types if _SCALAR_TYPE_FULL_RE.fullmatch(item)]
-            if len(pointer_types) != 1 or len(scalar_results) != 1:
-                return self._unsupported(op_name, "scalar load lacks one pointer and one scalar result")
+            scalar_types = (
+                [item for item in result_types if _SCALAR_TYPE_FULL_RE.fullmatch(item)]
+                if op_name == "pto.load_scalar"
+                else [item for item in operand_types if _SCALAR_TYPE_FULL_RE.fullmatch(item)]
+            )
+            if len(pointer_types) != 1 or len(scalar_types) != 1:
+                contract = (
+                    "scalar load lacks one pointer and one scalar result"
+                    if op_name == "pto.load_scalar"
+                    else "scalar store lacks one pointer and one scalar operand"
+                )
+                return self._unsupported(op_name, contract)
         elif pipe not in {"PIPE_S", "PIPE_FIX", "PIPE_MTE2"}:
             return self._unsupported(op_name, f"unexpected mixed-kernel pipe {pipe}")
         return DurationEstimate(
