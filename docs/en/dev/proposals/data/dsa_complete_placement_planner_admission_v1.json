@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "contract": "complete_placement_planner_admission_v1",
+  "minimum_directional_workloads": 6,
+  "minimum_dsa_rp_wins": 1,
+  "minimum_cypress_wins": 1,
+  "minimum_correct_directional_workloads": 6,
+  "maximum_wrong_directional_workloads": 0,
+  "minimum_calibration_utility": 6,
+  "representatives": [
+    {
+      "name": "RMS",
+      "workload_id": "rmsnorm_rope_cache_write",
+      "case_id": "rmsnorm_rope_cache_write",
+      "capacity": "half",
+      "expected_ordering": "dsa_rp_faster"
+    },
+    {
+      "name": "KV",
+      "workload_id": "kv_score_proj_c128",
+      "case_id": "kv_score_proj_c128",
+      "capacity": "native",
+      "expected_ordering": "dsa_rp_faster"
+    },
+    {
+      "name": "Gate",
+      "workload_id": "mtp_gate",
+      "case_id": "mtp_gate",
+      "capacity": "native",
+      "expected_ordering": "cypress_faster"
+    },
+    {
+      "name": "Gumbel",
+      "workload_id": "gumbel_argmax",
+      "case_id": "gumbel_argmax",
+      "capacity": "q1",
+      "expected_ordering": "tie"
+    }
+  ]
+}

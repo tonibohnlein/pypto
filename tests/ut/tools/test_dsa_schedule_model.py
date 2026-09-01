@@ -2160,6 +2160,248 @@ def test_score_realized_grid_rejects_legacy_pipe_size_fallback(tmp_path, monkeyp
     assert "[0, 1, 2, 3]" in error
 
 
+def _write_dispatch_grid(
+    path,
+    function: str,
+    rows: list[tuple[float, float, float]],
+    *,
+    runtime_profile: bool = False,
+    duration_model_sha256: str = "a" * 64,
+    duration_policy: str = "fail_closed_no_fallback",
+    fallback_node_ids: list[int] | None = None,
+):
+    results = []
+    for weight, base, placement in rows:
+        score = {
+            "status": "COMPLETE",
+            "base_makespan_cycles": base,
+            "placement_makespan_cycles": placement,
+            "synchronization_latency_cycles": weight,
+        }
+        if runtime_profile:
+            score["runtime_parallel_dispatch_score"] = {
+                "base_makespan_cycles": base + 1,
+                "placement_makespan_cycles": placement + 1,
+            }
+        results.append({"sync_latency_cycles": weight, "score": score})
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "model_version": "complete_placement_dag_global_sync_weight_grid_v1",
+                "input": {"function": function},
+                "duration_model": {"semantic_sha256": duration_model_sha256},
+                "duration_policy": duration_policy,
+                "duration_coverage": {
+                    "fallback_node_count": len(fallback_node_ids or []),
+                    "fallback_node_ids": fallback_node_ids or [],
+                },
+                "results": results,
+            }
+        )
+    )
+
+
+def test_aggregate_static_dispatch_grid_uses_task_max_and_dispatch_longest_path(tmp_path):
+    _write_dispatch_grid(tmp_path / "cube.json", "cube", [(16, 10, 12), (64, 10, 14)])
+    _write_dispatch_grid(tmp_path / "vector.json", "vector", [(16, 20, 22), (64, 20, 24)])
+    _write_dispatch_grid(tmp_path / "store.json", "store", [(16, 5, 7), (64, 5, 8)])
+    manifest = tmp_path / "dispatch.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "contract": "static_dispatch_graph_v1",
+                "functions": {
+                    "cube": "cube.json",
+                    "vector": "vector.json",
+                    "store": "store.json",
+                },
+                "tasks": [
+                    {"id": "mixed", "functions": ["cube", "vector"], "aggregation": "max"},
+                    {"id": "writeback", "functions": ["store"]},
+                ],
+                "edges": [["mixed", "writeback"]],
+            }
+        )
+    )
+
+    result = dsa_schedule_model.aggregate_static_dispatch_grid(manifest)
+
+    assert result["model_version"] == "static_dispatch_complete_placement_grid_v1"
+    assert [row["critical_path_extension_cycles"] for row in result["results"]] == [4, 7]
+    assert result["results"][0]["base_makespan_cycles"] == 25
+    assert result["results"][0]["placement_makespan_cycles"] == 29
+    assert result["results"][0]["base_critical_task_path"] == ["mixed", "writeback"]
+    assert result["results"][0]["planner_eligible_static"] is True
+    assert result["duration_contract"] == {
+        "semantic_sha256": "a" * 64,
+        "duration_policy": "fail_closed_no_fallback",
+    }
+
+
+def test_aggregate_static_dispatch_grid_marks_runtime_profile_analysis_only(tmp_path):
+    _write_dispatch_grid(
+        tmp_path / "kernel.json",
+        "kernel",
+        [(16, 10, 12)],
+        runtime_profile=True,
+    )
+    manifest = tmp_path / "dispatch.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "contract": "static_dispatch_graph_v1",
+                "functions": {"kernel": "kernel.json"},
+                "tasks": [{"id": "task", "functions": ["kernel"]}],
+                "edges": [],
+            }
+        )
+    )
+
+    row = dsa_schedule_model.aggregate_static_dispatch_grid(manifest)["results"][0]
+
+    assert row["base_makespan_cycles"] == 11
+    assert row["placement_makespan_cycles"] == 13
+    assert row["planner_eligible_static"] is False
+    assert row["analysis_only_runtime_profile_used"] is True
+
+
+def test_aggregate_static_dispatch_grid_rejects_mismatched_weight_grids(tmp_path):
+    _write_dispatch_grid(tmp_path / "first.json", "first", [(16, 10, 12)])
+    _write_dispatch_grid(tmp_path / "second.json", "second", [(64, 10, 12)])
+    manifest = tmp_path / "dispatch.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "contract": "static_dispatch_graph_v1",
+                "functions": {"first": "first.json", "second": "second.json"},
+                "tasks": [{"id": "task", "functions": ["first", "second"]}],
+                "edges": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="weight grid differs"):
+        dsa_schedule_model.aggregate_static_dispatch_grid(manifest)
+
+
+def test_aggregate_static_dispatch_grid_rejects_mismatched_duration_models(tmp_path):
+    _write_dispatch_grid(tmp_path / "first.json", "first", [(16, 10, 12)])
+    _write_dispatch_grid(
+        tmp_path / "second.json",
+        "second",
+        [(16, 10, 12)],
+        duration_model_sha256="b" * 64,
+    )
+    manifest = tmp_path / "dispatch.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "contract": "static_dispatch_graph_v1",
+                "functions": {"first": "first.json", "second": "second.json"},
+                "tasks": [{"id": "task", "functions": ["first", "second"]}],
+                "edges": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="duration-model contract differs"):
+        dsa_schedule_model.aggregate_static_dispatch_grid(manifest)
+
+
+def test_aggregate_static_dispatch_grid_rejects_inner_weight_mismatch(tmp_path):
+    path = tmp_path / "kernel.json"
+    _write_dispatch_grid(path, "kernel", [(16, 10, 12)])
+    document = json.loads(path.read_text())
+    document["results"][0]["score"]["synchronization_latency_cycles"] = 64
+    path.write_text(json.dumps(document))
+    manifest = tmp_path / "dispatch.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "contract": "static_dispatch_graph_v1",
+                "functions": {"kernel": "kernel.json"},
+                "tasks": [{"id": "task", "functions": ["kernel"]}],
+                "edges": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="inner synchronization weight"):
+        dsa_schedule_model.aggregate_static_dispatch_grid(manifest)
+
+
+def test_aggregate_static_dispatch_grid_rejects_nonpositive_weight(tmp_path):
+    _write_dispatch_grid(tmp_path / "kernel.json", "kernel", [(0, 10, 12)])
+    manifest = tmp_path / "dispatch.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "contract": "static_dispatch_graph_v1",
+                "functions": {"kernel": "kernel.json"},
+                "tasks": [{"id": "task", "functions": ["kernel"]}],
+                "edges": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        dsa_schedule_model.aggregate_static_dispatch_grid(manifest)
+
+
+def test_aggregate_static_dispatch_grid_rejects_fallback_duration_nodes(tmp_path):
+    _write_dispatch_grid(
+        tmp_path / "kernel.json",
+        "kernel",
+        [(16, 10, 12)],
+        fallback_node_ids=[7],
+    )
+    manifest = tmp_path / "dispatch.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "contract": "static_dispatch_graph_v1",
+                "functions": {"kernel": "kernel.json"},
+                "tasks": [{"id": "task", "functions": ["kernel"]}],
+                "edges": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="forbids fallback duration nodes"):
+        dsa_schedule_model.aggregate_static_dispatch_grid(manifest)
+
+
+def test_aggregate_static_dispatch_grid_rejects_task_cycle(tmp_path):
+    _write_dispatch_grid(tmp_path / "first.json", "first", [(16, 10, 12)])
+    _write_dispatch_grid(tmp_path / "second.json", "second", [(16, 10, 12)])
+    manifest = tmp_path / "dispatch.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "contract": "static_dispatch_graph_v1",
+                "functions": {"first": "first.json", "second": "second.json"},
+                "tasks": [
+                    {"id": "first-task", "functions": ["first"]},
+                    {"id": "second-task", "functions": ["second"]},
+                ],
+                "edges": [["first-task", "second-task"], ["second-task", "first-task"]],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="contains a cycle"):
+        dsa_schedule_model.aggregate_static_dispatch_grid(manifest)
+
+
 def test_complete_placement_dag_expands_loop_carried_edges_across_iterations(tmp_path):
     record = _loop_candidate_record(with_return_path=True)
     model = _weighted_sync_model()

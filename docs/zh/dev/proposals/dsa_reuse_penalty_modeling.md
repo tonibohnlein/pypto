@@ -327,6 +327,15 @@ flattened occurrence index。
 extension 的最大值。这一区别对 Gumbel 很关键：两个较短 ELSE instance 暴露较大的局部
 extension，但 placement 前后，六个较长 THEN instance 都仍是 dispatch bottleneck。
 
+多函数 driver 还需要一层静态聚合。`aggregate-dispatch-grid` 读取
+`static_dispatch_graph_v1` manifest：同一个 runtime task 中 co-scheduled 的函数按 `max`
+合并，显式 task dependency 按 node-weighted longest path 合并。每个函数必须恰好属于一个
+task；所有 function grid 必须具有相同的 synchronization-weight grid、duration-model semantic
+hash 与 fail-closed/no-fallback policy；inner score 也必须绑定同一个 weight。task cycle、
+incomplete score 或不一致 provenance 都会 fail closed。runtime-profile aggregation 仅能用于
+retrospective analysis，并标记为 `planner_eligible_static=false`；planner admission 只接受静态
+branch envelope 与静态 task structure。
+
 使用归档的确定性输入后，`rmsnorm_rope_cache_write/half` 现在完整。它的两个
 runtime-loaded predicate 使用实际被测 dispatch 的精确 mixed branch profile。相同 contract
 也可以表达 `softmax_pool_c128/native`，但该 case 尚未使用捕获 profile 重新评分，因此这里
@@ -365,10 +374,10 @@ Gumbel 的 false confidence 已被修复，而不是用 calibration 掩盖。采
 
 | 用例 | 已有双设备证据 | Unit objective | 整函数 model 状态 |
 | ---- | -------------- | -------------- | ----------------- |
-| `rmsnorm_rope_cache_write/half` | DSA-RP 对 Cypress `-7.19%/-7.43%` | `8 -> 0` | 使用精确且 digest-bound 的 runtime profile 后完整。在 `16--160` weight 上，Cypress 增加 `62, 97, 161, 354, 610, 761` cycle，DSA-RP 增加零。 |
+| `rmsnorm_rope_cache_write/half` | DSA-RP 对 Cypress `-7.19%/-7.43%` | `8 -> 0` | 使用精确且 digest-bound 的 runtime profile 后 analysis-complete，但不具备 planner eligibility。在 `16--160` weight 上，Cypress 增加 `62, 97, 161, 354, 610, 761` cycle，DSA-RP 增加零。 |
 | `kv_score_proj_c128/native` | DSA-RP 对 Cypress `-2.50%/-2.30%` | `64 -> 64` | 完整。pipeline-serialization provenance 与修复后的 lowered-access join 在每个测试 weight 上都给 Cypress 正 critical-path extension、给 DSA-RP 零。 |
 | `mtp/gate` | Cypress 在四种 capacity 都更快，约 `1.6--4.1%` | DSA-RP 的 count 相同或更优 | duration 完整但 parent 不完整：四个 child 可评分；冻结 `gate_aic` 缺少 source-loop provenance，而 current export 改变了 operation stream。 |
-| `gumbel_argmax/q1` | DSA-RP 对 Cypress `+0.22%/+0.11%`，为 latency null | `14 -> 0` | 采用 max-instance dispatch 聚合与 2% modeled-effect gate 后，在每个 weight 上都完整且正确预测 tie。 |
+| `gumbel_argmax/q1` | DSA-RP 对 Cypress `+0.22%/+0.11%`，为 latency null | `14 -> 0` | runtime max-instance 聚合后 analysis-complete 且正确预测 tie，但不具备 planner eligibility。 |
 | `hc_post/native` | 在不同 campaign 中 effect 很弱、符号反转或无法复现 | 原始 cell 为 `33 -> 24` | 在一个 correlated dynamic-loop parameter 下为 `PARAMETRIC_ASSUMPTION`；预测 DSA-RP 不更差，但 extrapolated score 与 device label 都不能用于 validation。 |
 
 持久化 device 数据源是
@@ -385,20 +394,37 @@ python -m pypto.tools.dsa_schedule_model score-realized-grid \
   SCHEDULE.jsonl PROBLEM.dsa.json SOLUTION.dsa.solution.json \
   --function FUNCTION --model DURATION_MODEL.json \
   --sync-latency-grid 16,32,64,96,128,160 -o ARM_GRID.json
+python -m pypto.tools.dsa_schedule_model aggregate-dispatch-grid \
+  STATIC_DISPATCH_MANIFEST.json -o ARM_DISPATCH_GRID.json
 python -m pypto.tools.dsa_penalty_model_evaluation sync-weight-grid-input.tsv \
   --sync-weight-grid --split development --minimum-device-effect 0.02 \
   --minimum-model-effect 0.02 \
-  --required-device-count 2 -o sync-weight-grid-evaluation.json
+  --required-device-count 2 \
+  --planner-admission planner-admission.json \
+  -o sync-weight-grid-evaluation.json
 ```
 
-该分析未通过 incremental critical-path planner 的 gate。planner 没有改动，也不应根据此
-grid 启动新的 device task。static 与精确 runtime mixed-iteration branch、parallel-dispatch
-聚合、KV pipeline provenance 与 KV access join 已完成。RMS、KV 和 Gumbel 现在通过各自的
-代表性 gate。但预声明的 scientific gate 仍失败，因为冻结 Gate 缺少 source-loop
-provenance，而且 model-complete 的确认方向 workload 只有两个。因此刻意没有实现
-incremental greedy planner。下一项本地工作是获得符合实测 compiler contract 的
-product-faithful Gate graph，再增加足够多确认且 model-complete 的独立方向用例，以支持有意义的
-leave-one-workload-out calibration。
+weight selection 要求该 weight 同时属于 full development set 与每个
+leave-one-workload-out training fold 的 optimal set；交集为空即阻止 planner。持久化 gate 位于
+[`data/dsa_complete_placement_planner_admission_v1.json`](../../../en/dev/proposals/data/dsa_complete_placement_planner_admission_v1.json)：
+至少六个 threshold-cleared directional workload、DSA-RP 与 Cypress 都有胜出、至少六个正确
+预测、零错误预测，并且 RMS/KV/Gate/Gumbel 的 observation 与 prediction 都满足预声明结果。
+只有所有设备均低于 threshold 才能作为 null；一个设备越过 threshold 的 mixed result 不能按
+tie 处理。runtime branch profile 仍是 analysis-only，不能通过 planner gate。
+
+exact-pin host reconstruction 记录在
+[`data/dsa_replay_fixed_host_reconstruction_v1.json`](../../../en/dev/proposals/data/dsa_replay_fixed_host_reconstruction_v1.json)：
+36 个 invocation、33 个 semantic problem、29 个 penalty-bearing problem，以及 208 个 rebuilt
+map；其 table hash 与 archive 完全一致。九个 timing target 中仅一个 statically
+model-complete，其余因 duration 或 source-loop identity 缺失而 fail closed。
+reconstruction 与 admission 文件的 SHA-256 分别为
+`6dd9116deca0a2d27676424d318632a55f2ed3c28ed99684045d23f0668404b8` 和
+`179500f23c08a39d772b351f45b9623a92abcda330e52371c0b6291e3d8a3c8d`。
+
+因此该分析仍未通过 incremental critical-path planner 的 gate。runtime-profile RMS 与 Gumbel
+结果可以用于 retrospective explanation，但不具备 planner eligibility；frozen Gate 的 parent
+score 不完整；正确预测的 directional workload 也不足，且没有 model-complete Cypress win。
+所以没有实现 incremental planner，也不应启动新的 device task。
 
 对每个 arm 的实际 post-InsertSync graph 评分，才得到预期的 analysis oracle。在同一回顾
 corpus 上，40 个 strict model ordering 全部与实测方向一致；device effect 至少 2% 的

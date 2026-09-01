@@ -1,6 +1,6 @@
 # DSA-RP Device Experiment Ledger
 
-Last consolidated: 2026-08-31.
+Last consolidated: 2026-09-01.
 
 ## Purpose
 
@@ -41,7 +41,7 @@ be pooled. Capacity sensitivity rows are not independent workloads.
 | `dsa-rp-dspark-sync-address-ablation-final.tar.gz` | five legal DsPark endpoints, two devices | The DsPark slowdown again failed to reproduce. A restored PTO handshake compiled to a byte-identical device binary and therefore was only a same-binary noise control. No causal effect was resolved. |
 | `dsa-rp-driver-first-corpus-verification-0fe01d2e-final.tar.gz` | 20 workloads, 320 logical cells, 419 correctness runs | All 20 workloads passed all four capacities and four logical policies with no placement-correctness failures. This established the first robust driver-first corpus; no timing was taken. |
 | `dsa-rp-driver-first-timing-8d8e76df-final.tar.gz` | 19 of 20 primary workloads on two device domains | Tight-capacity selection produced many physical nulls. Only `dspark/rmsnorm.py` confirmed DSA-RP over Cypress, about 2.6-3.6%. Native-map injection controls proved the timing instrument could resolve 8-33% effects in the same cells. |
-| `dsa-rp-replay-fixed-prospective-holdout-9b05800db-final.tar.gz` | eight frozen workloads, nine targets, 13,440 samples | DSA-RP beat Cypress on five targets and was never confirmed slower: about 3.2-6.1% on `rmsnorm_rope`, HC-post-prefill, split-pre-post, cache-write, and KV/cache-write. This is the strongest prospective policy result. |
+| `dsa-rp-replay-fixed-prospective-holdout-9b05800db-final.tar.gz` | eight frozen workloads, nine targets, 13,440 samples | DSA-RP beat Cypress on five targets and was never confirmed slower: about 3.2-6.1% on `rmsnorm_rope`, HC-post-prefill, split-pre-post, cache-write, and KV/cache-write. The campaign was originally prospective, but its opened timings now participate in model design and are classified as retrospective development evidence. |
 | `dsa-rp-four-candidate-physical-penalty-aeba32c70-final.tar.gz` | four new workloads, 6,400 samples | `kv_score_proj_c128` confirmed DSA-RP over Cypress by about 2.3-2.5% despite more sync sites; Gumbel's large unit-cost gap was a latency null. Critical-path coverage was incomplete. |
 | `dsa-rp-kv-gumbel-legal-ablations-2bdc441b0-final.tar.gz` | five relation families, address controls, 6,400 samples | Restoring Gumbel `(2,39)` both removed one static ELSE-arm barrier and improved latency by 2.1-2.35%; this established a causal placement-relation contrast, not that the barrier caused the speedup. `(38,42)` cost about 1.9%, `(3,38)` about 0.4%, and `(38,79)` was null. KV `(8,22)` was not causal; all translation controls were null. |
 | `dsa-rp-queue-event-model-device-validation-9217dd575-final.tar.gz` | 16 endpoints, 6,400 samples, 32 branch-profile swimlanes | The real 6-THEN/2-ELSE profile makes the `(2,39)` barrier marginal exactly zero, while the measured improvement is carried mainly by the long THEN blocks. A per-pipe barrier constant was rejected by a 4.40x calibration spread. The barrier-causality question remains unresolved pending a placement x barrier factorial. |
@@ -65,10 +65,23 @@ be pooled. Capacity sensitivity rows are not independent workloads.
 
 ## Current evidence boundary
 
-The prospective eight-workload holdout supports the claim that a structured
-penalty-aware DSA-RP policy can beat Cypress on real kernels. It does not yet
-validate the current learned/analytical penalty model. The legal ablations show
-why: pair cost is contextual and signed, and exposed latency depends on the
-complete post-InsertSync graph rather than relation or barrier counts alone.
-The next model evaluation must freeze signed post-InsertSync marginals before
-opening held-out timing.
+The replay-fixed eight-workload campaign supports the claim that a structured
+penalty-aware DSA-RP policy can beat Cypress on real kernels. It no longer
+constitutes a model holdout: its opened timings are now retrospective
+development evidence. It does not yet validate the current analytical penalty
+model. The legal ablations show why: pair cost is contextual and signed, and
+exposed latency depends on the complete placement rather than relation or
+barrier counts alone. Planner admission now requires one global weight stable
+across every leave-one-workload-out fold, both DSA-RP and Cypress directional
+wins, and correct RMS/KV/Gate/Gumbel representative outcomes. A future device
+holdout must consist of new workloads whose capacities and predictions were
+frozen before timing.
+
+A subsequent exact-pin, host-only reconstruction reproduced all 208 complete
+replay maps and every selected map digest from this archive. It also showed
+that only one of its nine timed targets is statically model-complete under the
+fail-closed complete-placement model at the frozen compiler revision. The
+remaining targets are blocked by missing duration signatures or missing
+source-loop identity, not by replay drift. This campaign therefore remains
+valid device evidence, but it currently adds no threshold-cleared directional
+case to synchronization-weight calibration.

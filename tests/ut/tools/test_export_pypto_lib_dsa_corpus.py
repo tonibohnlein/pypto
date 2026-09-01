@@ -10,6 +10,7 @@
 import csv
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,6 +49,20 @@ def test_semantic_fingerprint_ignores_only_alias_member_spelling() -> None:
 
     assert exporter.semantic_problem_fingerprint(first) == exporter.semantic_problem_fingerprint(renamed)
     assert exporter.semantic_problem_fingerprint(first) != exporter.semantic_problem_fingerprint(resized)
+
+
+def test_export_pythonpath_keeps_frozen_sources_first_and_explicit_dependencies(tmp_path: Path) -> None:
+    pypto_python = tmp_path / "pypto" / "python"
+    pypto_lib = tmp_path / "pypto-lib"
+    dependency = tmp_path / "dependencies"
+
+    result = exporter._export_pythonpath(
+        pypto_python,
+        pypto_lib,
+        os.pathsep.join([str(dependency), str(pypto_python)]),
+    )
+
+    assert result.split(os.pathsep) == [str(pypto_python), str(pypto_lib), str(dependency)]
 
 
 def test_manifest_selects_only_successful_exports(tmp_path: Path) -> None:
