@@ -52,8 +52,11 @@ recognizer：
 6. 记录 distance-zero 与 distance-one WAR/WAW handoff，并保留 route、range、loop、
    control-flow 和 ordering provenance。
 
-raw record 位于 `metadata.recognized_reuse_candidate_records_v4`。SSA 可达记录带有
-确定性的 region/statement `dag_path`，无序记录使用 `dag_path=none`。可用：
+legacy recognizer population 仍位于
+`metadata.recognized_reuse_candidate_records_v4`。扩展后的 v5 population 还包含
+pipeline-serialization provenance，并由 `recognized_reuse_candidates_v5` 单独计数。
+SSA 可达记录带有确定性的 region/statement `dag_path`，无序记录使用
+`dag_path=none`。可用：
 
 ```bash
 python -m pypto.tools.dsa_reuse_candidates PROBLEM.dsa.json
@@ -258,9 +261,44 @@ synchronization mechanism 本身的代价。零值只是 dependency lower bound�
 其拒绝为未校准。初始版本可以使用一个 architecture-level constant，后续再细化为
 pipe-pair 或 signature-specific weight；但该值必须独立于待评估 placement 冻结。
 
-遇到 dynamic loop、control-flow branch、缺失 branch node、无法解析的 access join、
-不完整的 synchronization-predictor coverage、未校准 edge weight 或过大的有限展开时，
-scorer 会 fail closed。旧 exporter 遗漏 branch node 的输出因此会标记为 `INCOMPLETE`，
+Model v5 不再拒绝所有结构化控制流。raw-PTO bridge 会为每个 `scf.if` 附加稳定的
+predicate identity 与 polarity。对同一物化 predicate 的重复测试共享一个 scenario
+variable；位于互斥路径上的 candidate site 不会生成 reuse edge。scorer 枚举可达的
+结构化路径，而不是猜测 branch frequency。
+
+只有 raw PTO 能证明 predicate 定义在所有 enclosing loop 之外（或它是 function
+argument）时，一个 scenario bit 才会跨 loop iteration 共享。对于 loop 内 predicate，bridge
+会沿 integer cast 与算术追踪 scalar SSA chain。如果它可归约为 static induction variable 与
+constant 的比较，scorer 会记录每次 iteration 的精确 Boolean sequence。runtime-loaded 或
+其他无法解析的 loop 内 branch 标记为 `INCOMPLETE`；model 不会用 all-then/all-else 路径代替
+未知的 per-iteration mixed profile。
+
+dynamic loop 使用参数模型，而不是展开到任意选定的有限 trip count。raw PTO 能证明
+lower bound、upper bound 与 step 相同的 loop 共享一个符号参数 `N`。scorer 在
+`N = 1, 2, 3, 4` 上精确计算；只有 placement extension 在这些 probe 上满足
+
+```text
+startup + (N - 1) * steady_state,  N >= 1
+```
+
+时，才可以比较所得 affine model 在 `N >= 1` 上的 dominance；但该 score 标记为
+`PARAMETRIC_ASSUMPTION`，而不是 `COMPLETE`。这明确是从四个精确 probe 进行的
+extrapolation，不是对任意 max-plus graph 在所有 trip count 上保持 affine 的证明。
+probe 非 affine、必须混同独立 dynamic parameter，或缺失 raw-PTO identity 时会 fail
+closed。静态 loop 仍使用有限展开。
+
+lowered-access join 也会区分 exporter 漏记与 lowering 消除的 access。完整 raw-PTO
+access provenance 可证明缺失的 access order 没有 materialize；但 surviving endpoint
+不共享 lowered loop 并不足以证明 loop-carried recurrence 已消失。对于 peeling、unrolling
+或 loop splitting，必须由 exporter 保留 original-loop identity，否则该 recurrence 会
+fail closed。endpoint 同时共享多个 nested lowered loop 时也需要该 identity。对于处在
+互斥 branch arm 的 distance-one handoff，recurrence scorer 还必须分别计算 source 的
+iteration `i` 与 target 的 iteration `i + 1`；同一 iteration 内互斥不足以证明该 edge
+不存在，因此当前也会 fail closed。
+
+其余 fail-closed 条件包括缺失 branch node、无法解析的 access join、没有 operation-level
+provenance 的 `pipeline_serialization` relation、未校准 edge weight、独立 dynamic loop
+parameter 或过大的展开。旧 exporter 遗漏 branch node 的输出因此标记为 `INCOMPLETE`，
 绝不会被解释为 penalty 为零的 branch-free graph。
 
 2026 年 8 月的纯主机 re-export 最初报告 complete-placement extension 全部为零，因为它把
@@ -270,40 +308,54 @@ record，并从 logical SSA/allocation root 与固定 pipe order 重建 base gra
 
 ### 全局 synchronization weight 敏感性
 
-首次纯主机 calibration sweep 使用单一全局 synchronization-edge weight，在
-`16, 24, 32, 48, 64, 80, 96, 128, 160` cycle 上重新评分 complete placement graph。
-它没有拟合 per-kernel 或 per-edge constant。只有两台设备方向一致，且每台设备
-effect 都至少为 2% 时，device ordering 才通过 evaluation threshold。机器可读输出将
-这些 row 标记为 `MULTI_DEVICE_THRESHOLD_CLEARED`；这是确定性的双设备 effect-size gate，
-不是 confidence-interval 结论。低于阈值的 row 仅作 diagnostic，绝不用于 calibration。
+当前纯主机 sweep 使用一个全局 synchronization-edge weight，在
+`16, 32, 64, 96, 128, 160` cycle 上重新评分 complete placement graph。它没有拟合
+per-kernel 或 per-edge constant。只有归档 campaign 已建立可复现双设备 effect 时，
+device ordering 才作为 label；低于阈值或无法复现的 effect 仍只作 diagnostic。
 
-leave-one-workload-out calibration 使用一个预先声明的全局 utility：strict ordering
-预测正确记 `+1`，错误记 `-1`，silent 记 `0`。utility 相同时依次优先 correct 更多、
-strict prediction 更多的 weight。这样，选择性 silent 的 1/1 predictor 不会仅因 accuracy
-为 100% 而击败覆盖面更广且总体正确的 predictor。
+该 reanalysis 覆盖之前测量的 19 个非 Gate problem-capacity cell，以及历史上的多函数
+`mtp/gate` 反例。十二个 loop-aware RMSNorm/top-k cell 在每个 weight 上仍完整。对于静态
+bound 的 induction-variable predicate，可以静态导出精确的 mixed-iteration profile。对于
+runtime-loaded predicate，则必须显式提供 `exact_runtime_branch_profile_v1`。该输入绑定
+schedule、problem、捕获 tensor/scalar 以及 loop-trip metadata 的 hash，记录每个 active
+branch occurrence，绝不会把捕获值提升为 compile-time fact。嵌套 branch 还会记录 active
+flattened occurrence index。
 
-coverage 是决定性结果。在 17 个已测且有重建 graph 输入的 problem-capacity cell 中，
-当前 straight-line/static-loop contract 只能完整分析来自两个 workload 的 12 个 cell。
-5 个 cell 因 conditional candidate endpoint 被排除，其中一个还存在不完整的历史
-access join。12 个 eligible Cypress-versus-DSA-RP comparison 中没有一个在两台设备上均通过
-2% gate，因此两个 leave-one-workload-out fold 都是
-`INSUFFICIENT_THRESHOLD_CLEARED_TRAINING_COMPARISONS`，没有校准全局 weight。
+使用归档的确定性输入后，`rmsnorm_rope_cache_write/half` 现在完整。它的两个
+runtime-loaded predicate 使用实际被测 dispatch 的精确 mixed branch profile。相同 contract
+也可以表达 `softmax_pool_c128/native`，但该 case 尚未使用捕获 profile 重新评分，因此这里
+不把它计为新证据。
 
-敏感性 sweep 在绝大多数 cell 上不产生信号。16--24 cycle 不预测任何 strict
-Cypress-versus-DSA-RP ordering。32 cycle 以及 48--160 cycle 只有一个 strict cell，即
-tight capacity 的 RMSNorm；其方向在 32 与 48 cycle 之间反转。若仅作诊断地把阈值
-降到 1%，有四个 cell 变为 device-decided，但 48--160 cycle 仍只能区分其中一个。
-表面上的 1/1 accuracy 因此只对应 25% prediction coverage，不能证明存在稳定的全局区间。
+KV 缺口已经修复。fresh export 为每个 `pipeline_serialization` penalty 记录 producer 与
+consumer access site。每个 arm 都实现 64 个 pair；Cypress 有 34 个、DSA-RP 有 40 个
+pipeline-serialization pair，其中 16 和 20 个分别 materialize 为 lowered operation edge，
+其余由唯一 raw-PTO join 证明已被消除。虽然 unit cost 相同（`64 -> 64`），complete-placement
+score 在冻结 weight grid 上给 Cypress 分别增加
+`408, 560, 1200, 1840, 2480, 3120` cycle，而 DSA-RP 始终为零。这在不读取 InsertSync 的
+情况下正确预测了已测 DSA-RP 胜出。
+
+Gate 已在冻结 compiler revision 上完成 product-faithful re-export。新的 source-loop marker
+可以穿过 PTO codegen，使 `gate_aic` 把多个 lowered loop 重新关联到原始 source loop；
+`gate_aic` 和 `x_norm_quant` 现在都完整。Pinned PTO-ISA estimate 还覆盖了 Gate 的
+`tmul(fp32, 1x4096)`、`tfree` 和 `tfillpad`，没有引入本地拟合常量。但 parent aggregate
+score 仍 fail closed：`ffn_norm`、`gate_aiv` 和 `route_sort` 分别需要尚未支持的
+`trecip`/`tabs`、`tmaxs` 和 `trowexpanddiv` signature。因此不能从两个完整 child 推断
+parent-wide Gate ordering。
+
+全局 calibration 仍无法辨识。确认的 KV 和 RMS 胜出现在整个冻结 weight grid 上都可解释，
+但 Gate 的确认 Cypress ordering 没有完整 parent score。此外，完整的 Gumbel model 在所有
+符号 branch scenario 中都预测 DSA-RP 更优，而 q1 上两台设备测得 latency null。因此可用于
+leave-one-workload-out 的确认且 model-complete 的方向 label 仍太少，不选择任何 weight。
 
 指定的代表性用例直接暴露了 model coverage 与 mechanism 缺口：
 
 | 用例 | 已有双设备证据 | Unit objective | 整函数 model 状态 |
 | ---- | -------------- | -------------- | ----------------- |
-| `rmsnorm_rope_cache_write/half` | DSA-RP 对 Cypress `-7.19%/-7.43%` | `8 -> 0` | 不合格：branch 与 dynamic loop。branch-free 局部诊断识别出 Cypress 独有的 V-to-MTE2 hazard，但它不是整函数 score。 |
-| `kv_score_proj_c128/native` | DSA-RP 对 Cypress `-2.50%/-2.30%` | `64 -> 64` | 不合格：conditional endpoint；归档 export 还遗漏了 lowered access site。unit tie 与 speedup 仍无法解释。 |
-| `mtp/gate` | Cypress 在四种 capacity 都更快，约 `1.6--4.1%` | DSA-RP 的 count 相同或更优 | 不合格：control flow。这仍是“较低 unit objective 即较低 latency”的主要反例。 |
-| `gumbel_argmax/q1` | DSA-RP 对 Cypress `+0.22%/+0.11%`，为 latency null | `14 -> 0` | 不合格：conditional endpoint。巨大结构 gap 可以完全隐藏。 |
-| `hc_post/native` | 在不同 campaign 中 effect 很弱、符号反转或无法复现 | 原始 cell 为 `33 -> 24` | 不合格：dynamic/control-flow 结构，不适合作为 calibration label。 |
+| `rmsnorm_rope_cache_write/half` | DSA-RP 对 Cypress `-7.19%/-7.43%` | `8 -> 0` | 使用精确且 digest-bound 的 runtime profile 后完整。在 `16--160` weight 上，Cypress 增加 `62, 97, 161, 354, 610, 761` cycle，DSA-RP 增加零。 |
+| `kv_score_proj_c128/native` | DSA-RP 对 Cypress `-2.50%/-2.30%` | `64 -> 64` | 完整。pipeline-serialization provenance 与修复后的 lowered-access join 在每个测试 weight 上都给 Cypress 正 critical-path extension、给 DSA-RP 零。 |
+| `mtp/gate` | Cypress 在四种 capacity 都更快，约 `1.6--4.1%` | DSA-RP 的 count 相同或更优 | 已 re-export 但 parent 不完整：source-loop identity 已修复，两个 child 完整，三个因不支持的 duration signature 而 fail closed。 |
+| `gumbel_argmax/q1` | DSA-RP 对 Cypress `+0.22%/+0.11%`，为 latency null | `14 -> 0` | 完整，但在每个 weight 上都 false-confident。将同一 predicate 的三个重复测试关联起来可删除不可能路径，却不能解释该 null。 |
+| `hc_post/native` | 在不同 campaign 中 effect 很弱、符号反转或无法复现 | 原始 cell 为 `33 -> 24` | 在一个 correlated dynamic-loop parameter 下为 `PARAMETRIC_ASSUMPTION`；预测 DSA-RP 不更差，但 extrapolated score 与 device label 都不能用于 validation。 |
 
 持久化 device 数据源是
 `dsa-rp-loop-aware-model-prospective-0820ab418-final.tar.gz`
@@ -318,23 +370,19 @@ non-materialization evidence 的 SHA-256，并记录所选 function 与 fail-clo
 python -m pypto.tools.dsa_schedule_model score-realized-grid \
   SCHEDULE.jsonl PROBLEM.dsa.json SOLUTION.dsa.solution.json \
   --function FUNCTION --model DURATION_MODEL.json \
-  --sync-latency-grid 16,24,32,48,64,80,96,128,160 -o ARM_GRID.json
+  --sync-latency-grid 16,32,64,96,128,160 -o ARM_GRID.json
 python -m pypto.tools.dsa_penalty_model_evaluation sync-weight-grid-input.tsv \
   --sync-weight-grid --split development --minimum-device-effect 0.02 \
   --required-device-count 2 -o sync-weight-grid-evaluation.json
 ```
 
-上述 2% development analysis 的 joined input TSV hash 为
-`86d5dd525cc98c01e7cf48bffeab0c623b5c4ad59dcaf421faf0492141876594`，
-evaluator 输出 hash 为
-`a0711862d013b7a2532f73da4602026a8f08cfa6de3a45d127c94da71c1b0189`。
-1% diagnostic 输出 hash 为
-`581c27397ab6cc7609b97b3412c6a996310d198043ed037f407279d79100b132`。
-
-该分析未通过 incremental critical-path planner 的 gate。planner 没有改动，也不应根据此 grid
-启动新的 device task。下一项本地工作是为这些代表性用例完成 branch-aware 与 dynamic-loop
-placement DAG，然后在足够多独立 workload 上重复同一全局 weight 评估，使 leave-one-workload-out
-calibration 真正有意义。
+该分析未通过 incremental critical-path planner 的 gate。planner 没有改动，也不应根据此
+grid 启动新的 device task。static 与精确 runtime mixed-iteration branch、source-loop
+identity、KV pipeline provenance 与 KV access join 已完成。但预先声明的 scientific gate
+仍失败：Gate 的 duration 不完整，Gumbel 在每个测试 weight 上都是 false-confident
+prediction。因此刻意没有实现 incremental greedy planner。下一项本地工作是解决这两个失败，
+并增加足够多确认且 model-complete 的独立方向用例，以支持有意义的
+leave-one-workload-out calibration。
 
 对每个 arm 的实际 post-InsertSync graph 评分，才得到预期的 analysis oracle。在同一回顾
 corpus 上，40 个 strict model ordering 全部与实测方向一致；device effect 至少 2% 的
@@ -663,11 +711,11 @@ operation candidate record。只有提供显式 `--nonmaterialized-access-eviden
 synchronization execution 与 critical-path predictor 的贡献均为零。该例外必须由证据
 驱动；没有该文件时连接仍然 fail closed。
 
-solver 提升的 `pipeline_serialization` penalty 属于另一种情况。它们描述被放松的
-pipeline stage separation，本身不携带 producer/consumer access record。logical
-objective 必须保留这些 penalty；但只要 placement 实现了其中一条 relation，基于
-access、synchronization 或 critical path 的 predictor 就必须报告 coverage 不完整。
-不能把它们当成已证明未 materialize 的 operation，也不能给它们赋予模型成本零。
+solver 提升的 `pipeline_serialization` penalty 描述被放松的 pipeline stage
+separation。v5 exporter 会同时记录 penalty reason 及 producer/consumer access
+site，因此当前 problem 可以像其他 reuse relation 一样把它们连接到 lowered
+operation。缺少这些 v5 record 的历史 export 只要实现了此类 relation 就仍为
+incomplete；绝不能把缺失 provenance 解释为 operation 未 materialize 或模型成本为零。
 
 首个 candidate-weight prototype 保留 reference schedule 中已有的全部 sync，
 并从 prior site 的 terminal macro phase 向 next site 的 initial macro phase

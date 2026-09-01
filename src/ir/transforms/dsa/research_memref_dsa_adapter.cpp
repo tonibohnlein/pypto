@@ -253,11 +253,30 @@ ExportedProblem BuildStructuredProblem(const FunctionPtr& func, const Allocation
   ConstructExperimentalPairEdges(&recognition);
   ApplyExperimentalUnitPenaltyWeights(&recognition);
   if (reuse_penalty_recognizer != DsaReusePenaltyRecognizer::Disabled) {
+    std::vector<const RecognizedReuseCandidate*> legacy_candidates;
+    std::set<std::pair<size_t, size_t>> legacy_candidate_pairs;
+    std::set<std::pair<size_t, size_t>> legacy_ordered_pairs;
+    for (const RecognizedReuseCandidate& candidate : recognition.candidates) {
+      if (candidate.pipeline_serialization) continue;
+      legacy_candidates.push_back(&candidate);
+      const auto pair = std::minmax(candidate.first_interval, candidate.second_interval);
+      legacy_candidate_pairs.insert(pair);
+      if (candidate.ordered_by_logical_dag) legacy_ordered_pairs.insert(pair);
+    }
+    const auto count_legacy = [&](auto predicate) {
+      return std::count_if(legacy_candidates.begin(), legacy_candidates.end(),
+                           [&](const RecognizedReuseCandidate* candidate) { return predicate(*candidate); });
+    };
     exported.document.metadata["reuse_penalty_recognizer"] = "quadratic_route_frontier_v3";
     exported.document.metadata["reuse_penalty_supported_allocations"] =
         std::to_string(recognition.supported_allocations);
-    exported.document.metadata["reuse_penalty_candidate_pairs"] = std::to_string(recognition.candidate_pairs);
+    exported.document.metadata["reuse_penalty_candidate_pairs"] =
+        std::to_string(legacy_candidate_pairs.size());
+    exported.document.metadata["reuse_penalty_candidate_pairs_v5"] =
+        std::to_string(recognition.candidate_pairs);
     exported.document.metadata["reuse_penalty_already_ordered_pairs"] =
+        std::to_string(legacy_ordered_pairs.size());
+    exported.document.metadata["reuse_penalty_already_ordered_pairs_v5"] =
         std::to_string(recognition.already_ordered_pairs);
     exported.document.metadata["reuse_penalty_partially_supported_allocations"] =
         std::to_string(recognition.partially_supported_allocations);
@@ -267,38 +286,59 @@ ExportedProblem BuildStructuredProblem(const FunctionPtr& func, const Allocation
       observed_routes << RecognizedAccessRouteToString(recognition.observed_routes[index]);
     }
     exported.document.metadata["recognized_access_routes_v1"] = observed_routes.str();
-    exported.document.metadata["recognized_reuse_candidates"] = std::to_string(recognition.candidates.size());
+    exported.document.metadata["recognized_reuse_candidates"] = std::to_string(legacy_candidates.size());
+    exported.document.metadata["recognized_reuse_candidates_v5"] =
+        std::to_string(recognition.candidates.size());
     exported.document.metadata["recognized_reuse_edges"] = std::to_string(recognition.edges.size());
     exported.document.metadata["recognized_cross_resource_candidates"] =
-        std::to_string(recognition.cross_resource_candidates);
+        std::to_string(count_legacy([](const RecognizedReuseCandidate& candidate) {
+          return candidate.hazard == RecognizedReuseHazard::CrossResource;
+        }));
     exported.document.metadata["recognized_same_resource_candidates"] =
-        std::to_string(recognition.same_resource_candidates);
+        std::to_string(count_legacy([](const RecognizedReuseCandidate& candidate) {
+          return candidate.hazard == RecognizedReuseHazard::SameResource;
+        }));
     // Compatibility aliases for existing experiment readers. Candidate records
     // v2 below carry the target-independent route/resource evidence.
     exported.document.metadata["recognized_cross_pipe_candidates"] =
-        std::to_string(recognition.cross_resource_candidates);
+        exported.document.metadata["recognized_cross_resource_candidates"];
     exported.document.metadata["recognized_same_pipe_candidates"] =
-        std::to_string(recognition.same_resource_candidates);
+        exported.document.metadata["recognized_same_resource_candidates"];
     exported.document.metadata["recognized_write_after_read_candidates"] =
-        std::to_string(recognition.write_after_read_candidates);
+        std::to_string(count_legacy([](const RecognizedReuseCandidate& candidate) {
+          return candidate.dependence == RecognizedReuseDependence::WriteAfterRead;
+        }));
     exported.document.metadata["recognized_write_after_write_candidates"] =
-        std::to_string(recognition.write_after_write_candidates);
+        std::to_string(count_legacy([](const RecognizedReuseCandidate& candidate) {
+          return candidate.dependence == RecognizedReuseDependence::WriteAfterWrite;
+        }));
     exported.document.metadata["recognized_ordered_evidence_candidates"] =
-        std::to_string(recognition.ordered_evidence_candidates);
+        std::to_string(count_legacy(
+            [](const RecognizedReuseCandidate& candidate) { return candidate.ordered_by_logical_dag; }));
     exported.document.metadata["recognized_alias_contract_candidates"] =
-        std::to_string(recognition.alias_contract_candidates);
+        std::to_string(count_legacy(
+            [](const RecognizedReuseCandidate& candidate) { return candidate.requires_alias_contract; }));
     exported.document.metadata["recognized_partial_access_candidates"] =
-        std::to_string(recognition.partial_access_candidates);
+        std::to_string(count_legacy(
+            [](const RecognizedReuseCandidate& candidate) { return candidate.partial_access; }));
     exported.document.metadata["recognized_incomplete_access_candidates"] =
-        std::to_string(recognition.incomplete_access_candidates);
+        std::to_string(count_legacy(
+            [](const RecognizedReuseCandidate& candidate) { return candidate.incomplete_access_set; }));
     exported.document.metadata["recognized_conservative_initial_anchor_candidates"] =
-        std::to_string(recognition.conservative_initial_anchor_candidates);
+        std::to_string(count_legacy([](const RecognizedReuseCandidate& candidate) {
+          return candidate.conservative_initial_anchor;
+        }));
     exported.document.metadata["recognized_nested_control_candidates"] =
-        std::to_string(recognition.nested_control_candidates);
+        std::to_string(count_legacy(
+            [](const RecognizedReuseCandidate& candidate) { return candidate.nested_control; }));
     exported.document.metadata["recognized_in_loop_candidates"] =
-        std::to_string(recognition.in_loop_candidates);
+        std::to_string(
+            count_legacy([](const RecognizedReuseCandidate& candidate) { return candidate.in_loop; }));
     exported.document.metadata["recognized_loop_carried_candidates"] =
-        std::to_string(recognition.loop_carried_candidates);
+        std::to_string(count_legacy(
+            [](const RecognizedReuseCandidate& candidate) { return candidate.loop_carried; }));
+    exported.document.metadata["recognized_pipeline_serialization_candidates"] =
+        std::to_string(recognition.pipeline_serialization_candidates);
     exported.document.metadata["reuse_edge_construction_policy"] = "cross_resource_completion_pair_v5";
     exported.document.metadata["reuse_penalty_weight_model"] = "unit_v1";
     exported.document.metadata["reuse_penalty_completion_exposure_model"] = "unmodeled_v1";
@@ -308,6 +348,7 @@ ExportedProblem BuildStructuredProblem(const FunctionPtr& func, const Allocation
     std::ostringstream candidate_records;
     bool first_record = true;
     for (const RecognizedReuseCandidate& candidate : recognition.candidates) {
+      if (candidate.pipeline_serialization) continue;
       const auto& first = buffer_id_by_interval[candidate.first_interval];
       const auto& second = buffer_id_by_interval[candidate.second_interval];
       if (!first || !second) continue;
@@ -326,7 +367,9 @@ ExportedProblem BuildStructuredProblem(const FunctionPtr& func, const Allocation
 
     std::ostringstream detailed_records;
     std::ostringstream witnessed_records;
+    std::ostringstream provenance_records;
     bool first_detailed_record = true;
+    bool first_provenance_record = true;
     for (const RecognizedReuseCandidate& candidate : recognition.candidates) {
       const auto& first = buffer_id_by_interval[candidate.first_interval];
       const auto& second = buffer_id_by_interval[candidate.second_interval];
@@ -353,28 +396,38 @@ ExportedProblem BuildStructuredProblem(const FunctionPtr& func, const Allocation
              << ",ranges=" << candidate.prior_byte_offset << "+" << candidate.prior_byte_size << "->"
              << candidate.next_byte_offset << "+" << candidate.next_byte_size;
       if (candidate.loop_carried) record << ",loop=" << candidate.loop_id;
-      if (!first_detailed_record) {
-        detailed_records << ";";
-        witnessed_records << ";";
+      if (!candidate.pipeline_serialization) {
+        if (!first_detailed_record) {
+          detailed_records << ";";
+          witnessed_records << ";";
+        }
+        first_detailed_record = false;
+        detailed_records << record.str();
       }
-      first_detailed_record = false;
-      detailed_records << record.str();
-      witnessed_records << record.str() << ",hazard="
-                        << (candidate.hazard == RecognizedReuseHazard::CrossResource ? "cross_resource"
-                                                                                     : "same_resource")
-                        << ",dag_path=";
+      std::ostringstream witnessed_record;
+      witnessed_record << record.str() << ",hazard="
+                       << (candidate.hazard == RecognizedReuseHazard::CrossResource ? "cross_resource"
+                                                                                    : "same_resource")
+                       << ",dag_path=";
       if (candidate.logical_order_witness.empty()) {
-        witnessed_records << "none";
+        witnessed_record << "none";
       } else {
         for (size_t index = 0; index < candidate.logical_order_witness.size(); ++index) {
-          if (index != 0) witnessed_records << ">";
+          if (index != 0) witnessed_record << ">";
           const RecognizedDependencyNode& node = candidate.logical_order_witness[index];
-          witnessed_records << "r" << node.region << "s" << node.statement_index;
+          witnessed_record << "r" << node.region << "s" << node.statement_index;
         }
       }
+      if (!candidate.pipeline_serialization) witnessed_records << witnessed_record.str();
+      if (!first_provenance_record) provenance_records << ";";
+      first_provenance_record = false;
+      provenance_records << witnessed_record.str() << ",penalty_reason="
+                         << (candidate.pipeline_serialization ? "pipeline_serialization"
+                                                              : "reuse_recognizer");
     }
     exported.document.metadata["recognized_reuse_candidate_records_v3"] = detailed_records.str();
     exported.document.metadata["recognized_reuse_candidate_records_v4"] = witnessed_records.str();
+    exported.document.metadata["recognized_reuse_candidate_records_v5"] = provenance_records.str();
 
     std::ostringstream edge_records;
     first_record = true;

@@ -131,6 +131,15 @@ inline constexpr const char* kPipelineMembershipAttr = "pipeline_membership";
 /// explicitly enabled; it never changes generated operation semantics.
 inline constexpr const char* kDsaAccessOrderAttr = "__compiler_dsa_access_order";
 
+/// Stable source-loop identity assigned alongside the research DSA access order.
+///
+/// The recognizer numbers structured controls before lowering.  Later loop
+/// transformations may clone, split, or peel a loop, so a positional join from
+/// final PTOAS loops back to the recognizer is not sound.  This attribute is
+/// preserved on every derived ForStmt and emitted only as diagnostic PTO
+/// provenance when DSA access provenance is enabled.
+inline constexpr const char* kDsaSourceLoopIdAttr = "__compiler_dsa_source_loop_id";
+
 /// Append a ``group:stage`` membership pair to a ``pipeline_membership`` string,
 /// preserving any memberships already present (an inner-loop tag survives when
 /// an enclosing loop re-tags the same tile).

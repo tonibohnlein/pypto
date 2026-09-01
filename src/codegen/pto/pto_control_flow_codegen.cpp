@@ -23,6 +23,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -647,7 +648,13 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
 
   if (!has_scalar_iter_args) {
     // Simple scf.for (no iter_args, or all iter_args are non-scalar)
-    EmitStructural("scf.for " + loop_var_name + " = " + start + " to " + stop + " step " + step + " {");
+    std::string source_loop_suffix;
+    if (emit_access_provenance_ && op->HasAttr(ir::kDsaSourceLoopIdAttr)) {
+      source_loop_suffix = " // pypto.source_loop." +
+                           std::to_string(op->GetAttr<int>(ir::kDsaSourceLoopIdAttr));
+    }
+    EmitStructural("scf.for " + loop_var_name + " = " + start + " to " + stop + " step " + step + " {" +
+                   source_loop_suffix);
     indent_level_++;
 
     fs_.yield_buffer.clear();
@@ -689,9 +696,14 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
 
     // Emit: %ret0 = scf.for %i = %start to %stop step %step
     //           iter_args(%acc = %init) -> (type) {
+    std::string source_loop_suffix;
+    if (emit_access_provenance_ && op->HasAttr(ir::kDsaSourceLoopIdAttr)) {
+      source_loop_suffix = " // pypto.source_loop." +
+                           std::to_string(op->GetAttr<int>(ir::kDsaSourceLoopIdAttr));
+    }
     EmitStructural(JoinCommaSep(return_var_names) + " = scf.for " + loop_var_name + " = " + start + " to " +
                    stop + " step " + step + " iter_args(" + JoinPairs(iter_arg_names, " = ", init_values) +
-                   ") -> (" + JoinCommaSep(iter_arg_types) + ") {");
+                   ") -> (" + JoinCommaSep(iter_arg_types) + ") {" + source_loop_suffix);
     indent_level_++;
 
     fs_.yield_buffer.clear();

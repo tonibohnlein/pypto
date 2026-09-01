@@ -102,6 +102,11 @@ struct RecognizedReuseCandidate {
   bool nested_control = false;
   bool in_loop = false;
   bool loop_carried = false;
+  /// The candidate originates from a pipeline-stage hard separation. It is
+  /// exported as access-site provenance for the explicit no-fit relaxation,
+  /// but must not be promoted independently by the ordinary cross-resource
+  /// penalty policy while that separation remains hard.
+  bool pipeline_serialization = false;
 };
 
 struct RecognizedReuseEdge {
@@ -139,6 +144,7 @@ struct ReusePenaltyRecognition {
   size_t nested_control_candidates = 0;
   size_t in_loop_candidates = 0;
   size_t loop_carried_candidates = 0;
+  size_t pipeline_serialization_candidates = 0;
 };
 
 /**

@@ -93,6 +93,7 @@ _DEBUG_EVENT_IDS_RE = re.compile(r"\beventIds=\[([^]]*)\]")
 _DEBUG_DEPENDENCY_NODE_RE = re.compile(r"\bdepNode=(\d+)\b")
 _DEBUG_FOR_END_RE = re.compile(r"\bforEnd=(\d+)\b")
 _ACCESS_LOCATION_RE = re.compile(r"pypto\.access\.(\d+)")
+_PTO_SOURCE_LOOP_RE = re.compile(r"\bpypto\.source_loop\.(\d+)\b")
 _PTO_OPERATION_RE = re.compile(r"(?<![!\w.])(pto\.[A-Za-z0-9_]+)\b")
 _PTO_CONSTANT_RE = re.compile(
     r"^\s*(%[-A-Za-z0-9_.$]+)\s*=\s*arith\.constant\s+(-?\d+)\s*:\s*(?:index|i\d+)\s*$"
@@ -103,10 +104,13 @@ _PTO_SCALAR_CONSTANT_RE = re.compile(
 )
 _PTO_SSA_VALUE_RE = re.compile(r"%[-A-Za-z0-9_.$]+")
 _PTO_FOR_RE = re.compile(
-    r"^\s*(?:%[-A-Za-z0-9_.$]+(?:#\d+)?\s*=\s*)?scf\.for\s+%\S+\s*=\s*"
-    r"(%[-A-Za-z0-9_.$]+|-?\d+)\s+to\s+"
+    r"^\s*(?:%[-A-Za-z0-9_.$]+(?:#\d+)?\s*=\s*)?scf\.for\s+"
+    r"(%[-A-Za-z0-9_.$]+)\s*=\s*(%[-A-Za-z0-9_.$]+|-?\d+)\s+to\s+"
     r"(%[-A-Za-z0-9_.$]+|-?\d+)\s+step\s+(%[-A-Za-z0-9_.$]+|-?\d+)\b"
 )
+_PTO_IF_RE = re.compile(r"^\s*(?:(%[-A-Za-z0-9_.$]+)\s*=\s*)?scf\.if\s+(%[-A-Za-z0-9_.$]+)\b")
+_PTO_ASSIGN_RE = re.compile(r"^\s*(%[-A-Za-z0-9_.$]+)\s*=\s*(.+)$")
+_PTO_YIELD_RE = re.compile(r"^\s*scf\.yield\s+(%[-A-Za-z0-9_.$]+|-?\d+)\b")
 _PTO_BRANCH_RE = re.compile(r"\b(?:scf\.(?:if|while|index_switch)|cf\.(?:br|cond_br|switch))\b")
 _PTO_TYPE_START_RE = re.compile(r"!pto\.[A-Za-z_][A-Za-z0-9_.]*<")
 _PTO_SCALAR_TYPE_RE = re.compile(
@@ -397,6 +401,8 @@ def _join_operation_name(name: str) -> str:
         "pto.tpush_to_aiv": "pto.tpush",
         "pto.tpop_from_aic": "pto.tpop",
         "pto.tpop_from_aiv": "pto.tpop",
+        "pto.tfree_from_aic": "pto.tfree",
+        "pto.tfree_from_aiv": "pto.tfree",
     }
     return aliases.get(name, name)
 
@@ -404,7 +410,7 @@ def _join_operation_name(name: str) -> str:
 def _operation_names_match(expected: str, actual: str, metadata: Mapping[str, Any]) -> bool:
     if expected == actual:
         return True
-    if expected in {"pto.tpush", "pto.tpop"} and _join_operation_name(actual) == expected:
+    if expected in {"pto.tpush", "pto.tpop", "pto.tfree"} and _join_operation_name(actual) == expected:
         return True
     if expected != "pto.tmatmul.acc" or actual != "pto.tmatmul":
         return False
@@ -414,17 +420,34 @@ def _operation_names_match(expected: str, actual: str, metadata: Mapping[str, An
     )
 
 
-def _attach_pto_access_provenance(
+def _select_raw_pto_function(pto_text: str, function: str) -> str:
+    """Select one function region from a possibly mixed PTO module."""
+    matches = list(re.finditer(r"(?m)^\s*func\.func\s+@([A-Za-z0-9_]+)\b", pto_text))
+    if not matches:
+        return pto_text
+    selected = [index for index, match in enumerate(matches) if match.group(1) == function]
+    if len(selected) != 1:
+        raise ValueError(f"raw PTO must contain exactly one function @{function}; found {len(selected)}")
+    index = selected[0]
+    start = matches[index].start()
+    end = matches[index + 1].start() if index + 1 < len(matches) else len(pto_text)
+    return pto_text[start:end]
+
+
+def _attach_pto_access_provenance(  # noqa: PLR0912 - fail-closed unique sequence alignment
     nodes: list[dict[str, Any]], pto_text: str, *, require_access_provenance: bool = True
-) -> None:
-    """Join legacy SyncIR nodes to raw-PTO access locations by exact op order.
+) -> set[int]:
+    """Join legacy SyncIR nodes to raw-PTO access locations by unique order.
 
     PTOAS's legacy text trace omits MLIR locations.  Raw PTO emitted with
     ``PYPTO_EMIT_DSA_ACCESS_PROVENANCE=1`` contains those locations, while the
-    trace preserves the same executable operation order.  Structural PTO ops
-    such as ``pto.alloc_tile`` are ignored because they do not appear among the
-    trace's operation names.  Any missing location or sequence mismatch is a
-    hard error; this bridge never guesses a coordinate.
+    trace preserves the executable operation order after lowering. Structural
+    PTO ops such as ``pto.alloc_tile`` are ignored because they do not appear
+    among the trace's operation names. PTOAS may eliminate an executable raw
+    operation. Such a gap is accepted only when the final trace has exactly one
+    monotone embedding in the raw stream; ambiguous repeated-operation joins
+    still fail closed. The returned access orders are therefore independently
+    proven non-materialized rather than guessed missing coordinates.
     """
     operation_nodes = [node for node in nodes if node.get("kind") == "operation"]
     expected_names = [str(node["op_name"]) for node in operation_nodes]
@@ -437,13 +460,19 @@ def _attach_pto_access_provenance(
     }
 
     for line_number, line in enumerate(pto_text.splitlines(), start=1):
-        names = [match.group(1) for match in _PTO_OPERATION_RE.finditer(line)]
-        names = [name for name in names if _join_operation_name(name) in traced_names]
+        locations = _ACCESS_LOCATION_RE.findall(line)
+        raw_names = [match.group(1) for match in _PTO_OPERATION_RE.finditer(line)]
+        names = [name for name in raw_names if _join_operation_name(name) in traced_names]
+        if not names and len(set(locations)) == 1:
+            # A stamped operation eliminated from the final trace is not in
+            # ``traced_names``. The first PTO token is the operation name;
+            # later tokens on the same line may be types such as
+            # ``!pto.address_space`` and must not become phantom operations.
+            names = raw_names[:1]
         if not names:
             continue
         if len(names) != 1:
             raise ValueError(f"raw PTO line {line_number} contains multiple traced operations: {names}")
-        locations = _ACCESS_LOCATION_RE.findall(line)
         if len(set(locations)) > 1 or (require_access_provenance and len(set(locations)) != 1):
             raise ValueError(
                 f"raw PTO operation {names[0]} on line {line_number} has no unambiguous "
@@ -455,26 +484,52 @@ def _attach_pto_access_provenance(
             (names[0], access_order, location_line, _operation_type_metadata(location_line, constants))
         )
 
-    actual_names = [name for name, _, _, _ in pto_operations]
-    matches = [
-        _operation_names_match(expected, actual, metadata)
-        for expected, (actual, _, _, metadata) in zip(expected_names, pto_operations, strict=False)
-    ]
-    if len(actual_names) != len(expected_names) or not all(matches):
-        mismatch = next(
-            (index for index, matched in enumerate(matches) if not matched),
-            min(len(expected_names), len(actual_names)),
-        )
-        expected = expected_names[mismatch] if mismatch < len(expected_names) else "<end>"
-        actual = actual_names[mismatch] if mismatch < len(actual_names) else "<end>"
+    expected_count = len(expected_names)
+    actual_count = len(pto_operations)
+    ways = [[0] * (actual_count + 1) for _ in range(expected_count + 1)]
+    for actual_index in range(actual_count + 1):
+        ways[expected_count][actual_index] = 1
+    for expected_index in range(expected_count - 1, -1, -1):
+        for actual_index in range(actual_count - 1, -1, -1):
+            count = ways[expected_index][actual_index + 1]
+            actual_name, _, _, metadata = pto_operations[actual_index]
+            if _operation_names_match(expected_names[expected_index], actual_name, metadata):
+                count += ways[expected_index + 1][actual_index + 1]
+            ways[expected_index][actual_index] = min(count, 2)
+
+    if ways[0][0] != 1:
         raise ValueError(
-            "raw PTO operation sequence does not match the final SyncIR trace at "
-            f"operation {mismatch}: expected {expected}, found {actual}; "
-            f"counts={len(expected_names)}->{len(actual_names)}"
+            "raw PTO operation sequence has no unique monotone join to the final SyncIR trace: "
+            f"alignments={ways[0][0]}, counts={expected_count}->{actual_count}"
         )
 
+    matched_operations: list[tuple[str, int | None, str, dict[str, Any]]] = []
+    nonmaterialized_access_orders: set[int] = set()
+    expected_index = 0
+    actual_index = 0
+    while actual_index < actual_count:
+        actual = pto_operations[actual_index]
+        matches_current = expected_index < expected_count and _operation_names_match(
+            expected_names[expected_index], actual[0], actual[3]
+        )
+        match_ways = ways[expected_index + 1][actual_index + 1] if matches_current else 0
+        skip_ways = ways[expected_index][actual_index + 1]
+        if match_ways:
+            if skip_ways:
+                raise ValueError("internal error: supposedly unique PTO operation join is ambiguous")
+            matched_operations.append(actual)
+            expected_index += 1
+        else:
+            access_order = actual[1]
+            if access_order is None:
+                raise ValueError(f"eliminated raw PTO operation {actual[0]} has no stable access provenance")
+            nonmaterialized_access_orders.add(access_order)
+        actual_index += 1
+    if expected_index != expected_count:
+        raise ValueError("internal error: unique PTO operation join did not consume the final trace")
+
     for node, (raw_name, access_order, location_line, metadata) in zip(
-        operation_nodes, pto_operations, strict=True
+        operation_nodes, matched_operations, strict=True
     ):
         operation = {
             **metadata,
@@ -484,39 +539,88 @@ def _attach_pto_access_provenance(
         if access_order is not None:
             operation["pypto_access_order"] = access_order
         node["operation"] = operation
+    return nonmaterialized_access_orders
 
 
 def _attach_pto_static_loop_bounds(nodes: list[dict[str, Any]], pto_text: str) -> int:
-    """Join statically provable raw-PTO ``scf.for`` trip counts to SyncIR loops.
+    """Join raw-PTO ``scf.for`` trip-count semantics to SyncIR loops.
 
     The legacy PTOAS debug stream identifies loop structure but reports SyncIR
     node ranges rather than iteration bounds. Raw PTO is the product-faithful
-    source for the original ``scf.for`` lower/upper/step operands. The loop
-    order is preserved by PTOAS; a count mismatch is therefore an ambiguous
-    bridge and fails closed.
+    source for the original ``scf.for`` lower/upper/step operands. Statically
+    resolved bounds become concrete trip counts. Dynamic bounds receive a
+    canonical parameter identity, so two loops proven to use the same bound
+    can share one symbolic trip-count parameter. The loop order is preserved
+    by PTOAS; a count mismatch is therefore an ambiguous bridge and fails
+    closed.
 
     Returns:
         The number of loops whose bounds are genuinely dynamic or unsupported.
     """
     constants: dict[str, int] = {}
-    raw_loops: list[tuple[int | None, str]] = []
+    expressions: dict[str, str] = {}
+    raw_loops: list[
+        tuple[str, int | None, int | None, int | None, str | None, str | None, int | None, str]
+    ] = []
 
     def resolve(operand: str) -> int | None:
         if operand.startswith("%"):
             return constants.get(operand)
         return int(operand)
 
+    def canonical_operand(operand: str) -> str:
+        value = resolve(operand)
+        if value is not None:
+            return f"int:{value}"
+        return expressions.get(operand, f"ssa:{operand}")
+
+    def canonical_expression(rhs: str) -> str:
+        rhs = re.sub(r"\s+loc\(.*$", "", rhs).strip()
+        normalized = _PTO_SSA_VALUE_RE.sub(lambda match: f"<{canonical_operand(match.group(0))}>", rhs)
+        return f"expr:{hashlib.sha256(normalized.encode()).hexdigest()}"
+
     for line in pto_text.splitlines():
         if match := _PTO_CONSTANT_RE.match(line):
-            constants[match.group(1)] = int(match.group(2))
+            name, value = match.groups()
+            constants[name] = int(value)
+            expressions[name] = f"int:{int(value)}"
             continue
-        if not (match := _PTO_FOR_RE.match(line)):
+        if match := _PTO_FOR_RE.match(line):
+            induction_variable = match.group(1)
+            raw_operands = tuple(match.group(index) for index in range(2, 5))
+            lower, upper, step = (resolve(operand) for operand in raw_operands)
+            trip_count = None
+            if lower is not None and upper is not None and step is not None and step > 0:
+                trip_count = max(0, (upper - lower + step - 1) // step)
+            parameter_identity = None
+            parameter_expression = None
+            if trip_count is None:
+                parameter_expression = (
+                    "trip(" + ",".join(canonical_operand(operand) for operand in raw_operands) + ")"
+                )
+                parameter_identity = (
+                    "loop-trip-v1:" + hashlib.sha256(parameter_expression.encode()).hexdigest()
+                )
+            raw_loops.append(
+                (
+                    induction_variable,
+                    lower,
+                    upper,
+                    step,
+                    parameter_identity,
+                    parameter_expression,
+                    (
+                        int(source_loop.group(1))
+                        if (source_loop := _PTO_SOURCE_LOOP_RE.search(line)) is not None
+                        else None
+                    ),
+                    line.strip(),
+                )
+            )
             continue
-        lower, upper, step = (resolve(match.group(index)) for index in range(1, 4))
-        trip_count = None
-        if lower is not None and upper is not None and step is not None and step > 0:
-            trip_count = max(0, (upper - lower + step - 1) // step)
-        raw_loops.append((trip_count, line.strip()))
+        if assignment := _PTO_ASSIGN_RE.match(line):
+            result, rhs = assignment.groups()
+            expressions[result] = canonical_expression(rhs)
 
     loop_begins = [
         node for node in nodes if node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_BEGIN"
@@ -527,16 +631,475 @@ def _attach_pto_static_loop_bounds(nodes: list[dict[str, Any]], pto_text: str) -
             f"counts={len(raw_loops)}->{len(loop_begins)}"
         )
 
-    trip_count_by_begin: dict[int, int | None] = {}
-    for node, (trip_count, source_line) in zip(loop_begins, raw_loops, strict=True):
+    loop_semantics_by_begin: dict[int, tuple[int | None, str | None, str | None]] = {}
+    for node, (
+        induction_variable,
+        lower,
+        upper,
+        step,
+        parameter_identity,
+        parameter_expression,
+        source_loop_id,
+        source_line,
+    ) in zip(loop_begins, raw_loops, strict=True):
+        trip_count = None
+        if lower is not None and upper is not None and step is not None and step > 0:
+            trip_count = max(0, (upper - lower + step - 1) // step)
         node["static_trip_count"] = trip_count
         node["operation"] = {"raw_pto_loop": source_line}
-        trip_count_by_begin[int(node["id"])] = trip_count
+        node["raw_pto_induction_variable"] = induction_variable
+        node["raw_pto_lower_bound"] = lower
+        node["raw_pto_step"] = step
+        if parameter_identity is not None:
+            node["dynamic_trip_count_identity"] = parameter_identity
+            node["dynamic_trip_count_expression"] = parameter_expression
+        if source_loop_id is not None:
+            node["pypto_source_loop_id"] = source_loop_id
+        loop_semantics_by_begin[int(node["id"])] = (
+            trip_count,
+            parameter_identity,
+            parameter_expression,
+        )
     for node in nodes:
         if node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_END":
-            node["static_trip_count"] = trip_count_by_begin.get(int(node["begin"]))
+            semantics = loop_semantics_by_begin.get(int(node["begin"]))
+            if semantics is None:
+                continue
+            trip_count, parameter_identity, parameter_expression = semantics
+            node["static_trip_count"] = trip_count
+            if parameter_identity is not None:
+                node["dynamic_trip_count_identity"] = parameter_identity
+                node["dynamic_trip_count_expression"] = parameter_expression
 
-    return sum(trip_count is None for trip_count, _ in raw_loops)
+    return sum(
+        lower is None or upper is None or step is None or step <= 0
+        for _, lower, upper, step, _, _, _, _ in raw_loops
+    )
+
+
+def _pto_function_arguments_and_loop_depths(lines: Sequence[str]) -> tuple[set[str], list[int]]:
+    """Return function arguments and enclosing ``scf.for`` depth per PTO line."""
+    function_arguments: set[str] = set()
+    for line in lines:
+        if "func.func" not in line or "(" not in line:
+            continue
+        signature = line.split("(", maxsplit=1)[1].split(")", maxsplit=1)[0]
+        function_arguments.update(_PTO_SSA_VALUE_RE.findall(signature))
+        break
+
+    loop_depth_by_line: list[int] = []
+    brace_depth = 0
+    loop_exit_depths: list[int] = []
+    for line in lines:
+        while loop_exit_depths and brace_depth <= loop_exit_depths[-1]:
+            loop_exit_depths.pop()
+        loop_depth_by_line.append(len(loop_exit_depths))
+        if _PTO_FOR_RE.match(line) and "{" in line:
+            loop_exit_depths.append(brace_depth)
+        brace_depth += line.count("{") - line.count("}")
+    return function_arguments, loop_depth_by_line
+
+
+def _pto_comparison_boolean_origin(
+    rhs: str,
+    integer_values: Mapping[str, int],
+    bool_origins: Mapping[str, tuple[str, bool]],
+) -> tuple[str, bool] | None:
+    """Resolve a comparison against zero to an existing boolean origin."""
+    match = re.search(r"arith\.cmpi\s+(slt|sgt|ne|eq),\s*([^,]+),\s*([^ :]+)", rhs)
+    if match is None:
+        return None
+    predicate, left, right = match.groups()
+    left, right = left.strip(), right.strip()
+    left_zero = integer_values.get(left) == 0 or left == "0"
+    right_zero = integer_values.get(right) == 0 or right == "0"
+    source: str | None = None
+    polarity = True
+    if predicate == "slt" and left_zero and right in bool_origins:
+        source = right
+    elif predicate == "sgt" and right_zero and left in bool_origins:
+        source = left
+    elif predicate in {"ne", "eq"}:
+        if left_zero and right in bool_origins:
+            source = right
+        elif right_zero and left in bool_origins:
+            source = left
+        polarity = predicate == "ne"
+    if source is None:
+        return None
+    identity, source_polarity = bool_origins[source]
+    return identity, source_polarity == polarity
+
+
+def _pto_loop_invariant_values(
+    lines: Sequence[str],
+    function_arguments: set[str],
+    loop_depth_by_line: Sequence[int],
+    selects: Sequence[tuple[str, str, str, str]],
+) -> set[str]:
+    """Prove scalar SSA values invariant across every enclosing raw-PTO loop."""
+    invariant = set(function_arguments)
+    allowed_inside_loop = (
+        "arith.constant",
+        "arith.index_cast",
+        "arith.ext",
+        "arith.trunc",
+        "arith.cmpi",
+        "arith.cmpf",
+    )
+
+    def token_is_invariant(token: str) -> bool:
+        return token.lstrip("-").isdigit() or token in invariant
+
+    changed = True
+    while changed:
+        changed = False
+        for line_index, line in enumerate(lines):
+            assignment = _PTO_ASSIGN_RE.match(line)
+            if assignment is None:
+                continue
+            result, rhs = assignment.groups()
+            if result in invariant:
+                continue
+            tokens = _PTO_SSA_VALUE_RE.findall(rhs)
+            top_level = loop_depth_by_line[line_index] == 0
+            pure_scalar = any(operation in rhs for operation in allowed_inside_loop)
+            if (top_level or pure_scalar) and all(token_is_invariant(token) for token in tokens):
+                invariant.add(result)
+                changed = True
+        for result, condition, then_value, else_value in selects:
+            if result in invariant:
+                continue
+            if all(token_is_invariant(token) for token in (condition, then_value, else_value)):
+                invariant.add(result)
+                changed = True
+    return invariant
+
+
+def _pto_boolean_origins(
+    lines: Sequence[str],
+    expressions: Mapping[str, str],
+    integer_values: Mapping[str, int],
+    selects: Sequence[tuple[str, str, str, str]],
+) -> dict[str, tuple[str, bool]]:
+    """Trace materialized boolean values to one expression and polarity."""
+    bool_origins: dict[str, tuple[str, bool]] = {}
+    for line in lines:
+        assignment = _PTO_ASSIGN_RE.match(line)
+        if assignment is None:
+            continue
+        result, rhs = assignment.groups()
+        if "arith.cmp" in rhs:
+            bool_origins[result] = (f"expr:{expressions[result]}", True)
+
+    for result, condition, then_value, else_value in selects:
+        then_int = int(then_value) if then_value.lstrip("-").isdigit() else integer_values.get(then_value)
+        else_int = int(else_value) if else_value.lstrip("-").isdigit() else integer_values.get(else_value)
+        origin = bool_origins.get(condition, (f"expr:{expressions.get(condition, f'ssa:{condition}')}", True))
+        if then_int is not None and else_int is not None:
+            if then_int != 0 and else_int == 0:
+                bool_origins[result] = origin
+            elif then_int == 0 and else_int != 0:
+                bool_origins[result] = (origin[0], not origin[1])
+
+    # Propagate recognized materializations through casts and canonical
+    # comparisons against zero.
+    for line in lines:
+        assignment = _PTO_ASSIGN_RE.match(line)
+        if assignment is None:
+            continue
+        result, rhs = assignment.groups()
+        tokens = _PTO_SSA_VALUE_RE.findall(rhs)
+        if "arith.index_cast" in rhs and len(tokens) == 1 and tokens[0] in bool_origins:
+            bool_origins[result] = bool_origins[tokens[0]]
+            continue
+        comparison_origin = _pto_comparison_boolean_origin(rhs, integer_values, bool_origins)
+        if comparison_origin is not None:
+            bool_origins[result] = comparison_origin
+    return bool_origins
+
+
+def _evaluate_static_pto_integer(  # noqa: PLR0912 - explicit fail-closed SSA subset
+    value: str,
+    definitions: Mapping[str, str],
+    integer_values: Mapping[str, int],
+    induction_values: Mapping[str, int],
+    visiting: frozenset[str] = frozenset(),
+) -> int | None:
+    """Evaluate the integer SSA subset used by static loop predicates."""
+    if value.lstrip("-").isdigit():
+        return int(value)
+    if value in induction_values:
+        return induction_values[value]
+    if value in integer_values:
+        return integer_values[value]
+    if value in visiting:
+        return None
+    rhs = definitions.get(value)
+    if rhs is None:
+        return None
+    next_visiting = visiting | {value}
+
+    cast = re.search(r"arith\.(?:index_cast|extsi|extui|trunci)\s+(%[-A-Za-z0-9_.$]+)", rhs)
+    if cast is not None:
+        return _evaluate_static_pto_integer(
+            cast.group(1), definitions, integer_values, induction_values, next_visiting
+        )
+
+    binary = re.search(
+        r"arith\.(addi|subi|muli|divsi|floordivsi|ceildivsi|remsi|minsi|maxsi)\s+"
+        r"([^,\s:]+)\s*,\s*([^\s:]+)",
+        rhs,
+    )
+    if binary is not None:
+        operation, left_operand, right_operand = binary.groups()
+        left = _evaluate_static_pto_integer(
+            left_operand, definitions, integer_values, induction_values, next_visiting
+        )
+        right = _evaluate_static_pto_integer(
+            right_operand, definitions, integer_values, induction_values, next_visiting
+        )
+        if left is None or right is None:
+            return None
+        if operation == "addi":
+            return left + right
+        if operation == "subi":
+            return left - right
+        if operation == "muli":
+            return left * right
+        if operation in {"divsi", "floordivsi"}:
+            if right == 0:
+                return None
+            quotient = abs(left) // abs(right)
+            return -quotient if (left < 0) != (right < 0) else quotient
+        if operation == "ceildivsi":
+            if right == 0:
+                return None
+            return -(left // -right)
+        if operation == "remsi":
+            if right == 0:
+                return None
+            quotient = abs(left) // abs(right)
+            quotient = -quotient if (left < 0) != (right < 0) else quotient
+            return left - quotient * right
+        if operation == "minsi":
+            return min(left, right)
+        if operation == "maxsi":
+            return max(left, right)
+
+    comparison = re.search(
+        r"arith\.cmpi\s+(eq|ne|slt|sle|sgt|sge|ult|ule|ugt|uge)\s*,\s*"
+        r"([^,\s:]+)\s*,\s*([^\s:]+)",
+        rhs,
+    )
+    if comparison is None:
+        return None
+    predicate, left_operand, right_operand = comparison.groups()
+    left = _evaluate_static_pto_integer(
+        left_operand, definitions, integer_values, induction_values, next_visiting
+    )
+    right = _evaluate_static_pto_integer(
+        right_operand, definitions, integer_values, induction_values, next_visiting
+    )
+    if left is None or right is None:
+        return None
+    if predicate.startswith("u") and (left < 0 or right < 0):
+        # Raw PTO does not retain the integer bit width in this compact SSA
+        # evaluator. Interpreting a negative value as unsigned would require
+        # that width, so fail closed instead of guessing one.
+        return None
+    comparisons = {
+        "eq": left == right,
+        "ne": left != right,
+        "slt": left < right,
+        "sle": left <= right,
+        "sgt": left > right,
+        "sge": left >= right,
+        "ult": left < right,
+        "ule": left <= right,
+        "ugt": left > right,
+        "uge": left >= right,
+    }
+    return int(comparisons[predicate])
+
+
+def _exact_branch_iteration_profile(
+    node: Mapping[str, Any],
+    condition: str,
+    definitions: Mapping[str, str],
+    integer_values: Mapping[str, int],
+    loops_by_id: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Derive an exact static-loop branch sequence from induction-variable SSA."""
+    loop_stack = node.get("loop_stack", [])
+    if not isinstance(loop_stack, list) or not loop_stack:
+        return None
+    if not all(isinstance(loop, int) for loop in loop_stack):
+        raise ValueError(f"branch node {node.get('id')} has an invalid loop stack")
+    loops: list[Mapping[str, Any]] = []
+    counts: list[int] = []
+    for loop_id in loop_stack:
+        loop = loops_by_id.get(loop_id)
+        count = loop.get("static_trip_count") if loop is not None else None
+        induction = loop.get("raw_pto_induction_variable") if loop is not None else None
+        lower = loop.get("raw_pto_lower_bound") if loop is not None else None
+        step = loop.get("raw_pto_step") if loop is not None else None
+        if (
+            not isinstance(count, int)
+            or not isinstance(induction, str)
+            or not isinstance(lower, int)
+            or not isinstance(step, int)
+            or step <= 0
+        ):
+            return None
+        loops.append(loop)
+        counts.append(count)
+    context_count = math.prod(counts)
+    if context_count > _MAX_QUEUE_EVENT_EXPANDED_NODES:
+        raise ValueError(
+            "exact branch-profile expansion exceeds the resource-safe node budget: "
+            f"branch={node.get('id')}, contexts={context_count}, "
+            f"limit={_MAX_QUEUE_EVENT_EXPANDED_NODES}"
+        )
+
+    values: list[bool] = []
+    for context in itertools.product(*(range(count) for count in counts)):
+        induction_values = {
+            str(loop["raw_pto_induction_variable"]): int(loop["raw_pto_lower_bound"])
+            + iteration * int(loop["raw_pto_step"])
+            for loop, iteration in zip(loops, context, strict=True)
+        }
+        evaluated = _evaluate_static_pto_integer(condition, definitions, integer_values, induction_values)
+        if evaluated is None:
+            return None
+        values.append(bool(evaluated))
+    return {
+        "schema_version": 1,
+        "evaluation": "static_integer_ssa_induction_profile_v1",
+        "loop_ids": list(loop_stack),
+        "iteration_counts": counts,
+        "values": values,
+    }
+
+
+def _attach_pto_branch_predicates(  # noqa: PLR0912 - fail-closed SSA predicate parser
+    nodes: list[dict[str, Any]], pto_text: str
+) -> int:
+    """Attach canonical predicate identity and polarity to structured IF nodes.
+
+    The native v0.57 schedule graph records branch structure but not the SSA
+    value controlling each branch. Treating every IF marker as independent
+    admits impossible paths when a loop-invariant predicate is re-tested. This
+    bridge follows scalar SSA definitions in the raw pre-InsertSync PTO and
+    recognizes the common ``if p then 1 else 0`` materialization plus casts and
+    comparisons against zero. Unrecognized predicates still receive a stable
+    expression identity; only proven aliases are coalesced.
+
+    Returns the number of IF markers whose predicate could not be recovered.
+    """
+    lines = pto_text.splitlines()
+    expressions: dict[str, str] = {}
+    integer_values: dict[str, int] = {}
+    definitions: dict[str, str] = {}
+    selects: list[tuple[str, str, str, str]] = []
+    branch_conditions: list[str] = []
+
+    # Record whether each raw-PTO line executes inside any scf.for body. This
+    # is deliberately scope based: one scenario bit may be reused across all
+    # dynamic occurrences only when its value is defined outside every loop
+    # that contains the IF. A function argument and a top-level definition are
+    # sufficient evidence; an unknown block argument is not.
+    function_arguments, loop_depth_by_line = _pto_function_arguments_and_loop_depths(lines)
+
+    def strip_location(text: str) -> str:
+        return re.sub(r"\s+loc\(.*$", "", text).strip()
+
+    def token_expression(token: str) -> str:
+        if token.lstrip("-").isdigit():
+            return f"int:{int(token)}"
+        return expressions.get(token, f"ssa:{token}")
+
+    def normalized_expression(rhs: str) -> str:
+        rhs = strip_location(rhs)
+        return _PTO_SSA_VALUE_RE.sub(lambda match: f"<{token_expression(match.group(0))}>", rhs)
+
+    # First pass: record stable scalar expressions, integral values, IF
+    # conditions, and result-producing IF yields.
+    for index, line in enumerate(lines):
+        if match := _PTO_IF_RE.match(line):
+            result, condition = match.groups()
+            branch_conditions.append(condition)
+            if result is not None:
+                then_value: str | None = None
+                else_value: str | None = None
+                in_else = False
+                depth = line.count("{") - line.count("}")
+                for nested in lines[index + 1 :]:
+                    if depth == 1 and re.match(r"^\s*}\s*else\s*{\s*$", nested):
+                        in_else = True
+                    elif yield_match := _PTO_YIELD_RE.match(nested):
+                        if depth == 1:
+                            if in_else:
+                                else_value = yield_match.group(1)
+                            else:
+                                then_value = yield_match.group(1)
+                    depth += nested.count("{") - nested.count("}")
+                    if depth == 0:
+                        break
+                if then_value is not None and else_value is not None:
+                    selects.append((result, condition, then_value, else_value))
+            continue
+        if constant := _PTO_CONSTANT_RE.match(line):
+            name, value = constant.groups()
+            integer_values[name] = int(value)
+            expressions[name] = f"int:{int(value)}"
+            continue
+        if assignment := _PTO_ASSIGN_RE.match(line):
+            result, rhs = assignment.groups()
+            definitions[result] = strip_location(rhs)
+            expressions[result] = hashlib.sha256(normalized_expression(rhs).encode()).hexdigest()
+            tokens = _PTO_SSA_VALUE_RE.findall(rhs)
+            if "arith.index_cast" in rhs and len(tokens) == 1 and tokens[0] in integer_values:
+                integer_values[result] = integer_values[tokens[0]]
+
+    bool_origins = _pto_boolean_origins(lines, expressions, integer_values, selects)
+    loop_invariant_values = _pto_loop_invariant_values(lines, function_arguments, loop_depth_by_line, selects)
+
+    if_begins = [
+        node for node in nodes if node.get("kind") == "branch" and node.get("branch_kind") == "IF_BEGIN"
+    ]
+    if len(branch_conditions) != len(if_begins):
+        raise ValueError(
+            "raw PTO branch sequence does not match the final SyncIR trace: "
+            f"counts={len(branch_conditions)}->{len(if_begins)}"
+        )
+    missing = 0
+    loops_by_id = {
+        int(node["id"]): node
+        for node in nodes
+        if node.get("kind") == "loop"
+        and node.get("loop_kind") == "LOOP_BEGIN"
+        and isinstance(node.get("id"), int)
+    }
+    for node, condition in zip(if_begins, branch_conditions, strict=True):
+        origin = bool_origins.get(condition)
+        if origin is None:
+            expression = token_expression(condition)
+            if expression.startswith("ssa:"):
+                missing += 1
+            origin = (f"expr:{expression}", True)
+        node["predicate_identity"], node["predicate_true_value"] = origin
+        exact_profile = _exact_branch_iteration_profile(
+            node, condition, definitions, integer_values, loops_by_id
+        )
+        if exact_profile is not None:
+            node["predicate_iteration_profile"] = exact_profile
+            node["predicate_loop_invariant"] = len(set(exact_profile["values"])) == 1
+        else:
+            node["predicate_loop_invariant"] = (
+                not node.get("loop_stack") or condition in loop_invariant_values or exact_profile is not None
+            )
+    return missing
 
 
 def enrich_native_schedule_from_pto(
@@ -555,12 +1118,17 @@ def enrich_native_schedule_from_pto(
     raw_nodes = enriched.get("nodes")
     if not isinstance(raw_nodes, list) or not all(isinstance(node, dict) for node in raw_nodes):
         raise ValueError("native schedule must contain mutable object nodes")
-    _attach_pto_access_provenance(raw_nodes, pto_text, require_access_provenance=False)
-    unresolved_loops = _attach_pto_static_loop_bounds(raw_nodes, pto_text)
+    function_pto = _select_raw_pto_function(pto_text, str(enriched.get("function", "")))
+    nonmaterialized_access_orders = _attach_pto_access_provenance(
+        raw_nodes, function_pto, require_access_provenance=False
+    )
+    unresolved_loops = _attach_pto_static_loop_bounds(raw_nodes, function_pto)
+    unresolved_predicates = _attach_pto_branch_predicates(raw_nodes, function_pto)
     enriched["export_source"] = "native_schedule_graph_v1+raw_pto_semantics_v1"
     enriched["raw_pto_source"] = pto_source
     enriched["raw_pto_sha256"] = hashlib.sha256(pto_text.encode()).hexdigest()
-    enriched["raw_pto_operation_join"] = "exact_executable_order_v1"
+    enriched["raw_pto_operation_join"] = "unique_monotone_executable_order_v2"
+    enriched["nonmaterialized_access_orders"] = sorted(nonmaterialized_access_orders)
     limitations = enriched.get("export_limitations")
     if not isinstance(limitations, Mapping):
         limitations = {}
@@ -568,6 +1136,186 @@ def enrich_native_schedule_from_pto(
         **limitations,
         "operation_metadata_missing": 0,
         "static_loop_bounds_missing": unresolved_loops,
+        "branch_predicates_missing": unresolved_predicates,
+    }
+    return enriched
+
+
+def apply_runtime_branch_profile(  # noqa: PLR0912 - fail-closed external evidence contract
+    record: Mapping[str, Any],
+    profile: Mapping[str, Any],
+    *,
+    schedule_sha256: str,
+    problem_sha256: str,
+    input_set_sha256: str,
+    trip_metadata_sha256: str,
+) -> dict[str, Any]:
+    """Apply an exact, digest-bound runtime branch profile to one schedule.
+
+    Runtime-loaded predicates cannot be inferred from raw PTO.  A profile may
+    therefore specialize the analysis to one captured input set, but only when
+    it records every branch outcome per loop occurrence and binds those values
+    to the exact schedule, DSA problem, input manifest, and loop-trip metadata.
+    Scalar values without an immutability/derivation proof are deliberately not
+    accepted as a shortcut.
+    """
+
+    if profile.get("schema_version") != 1 or profile.get("contract") != "exact_runtime_branch_profile_v1":
+        raise ValueError("runtime branch profile must use exact_runtime_branch_profile_v1")
+    bindings = profile.get("bindings")
+    if not isinstance(bindings, Mapping):
+        raise ValueError("runtime branch profile is missing bindings")
+    expected_bindings = {
+        "schedule_sha256": schedule_sha256,
+        "problem_sha256": problem_sha256,
+        "input_set_sha256": input_set_sha256,
+        "trip_metadata_sha256": trip_metadata_sha256,
+    }
+    for key, expected in expected_bindings.items():
+        actual = bindings.get(key)
+        if actual != expected:
+            raise ValueError(f"runtime branch profile {key} does not match the scored input")
+
+    enriched = copy.deepcopy(dict(record))
+    raw_nodes = enriched.get("nodes")
+    if not isinstance(raw_nodes, list) or not all(isinstance(node, dict) for node in raw_nodes):
+        raise ValueError("runtime branch profile requires mutable object nodes")
+    nodes_by_id = {
+        int(node["id"]): node for node in raw_nodes if isinstance(node.get("id"), int)
+    }
+
+    raw_trip_counts = profile.get("loop_trip_counts")
+    if not isinstance(raw_trip_counts, list):
+        raise ValueError("runtime branch profile loop_trip_counts must be a list")
+    profiled_loops: set[int] = set()
+    for item in raw_trip_counts:
+        if not isinstance(item, Mapping):
+            raise ValueError("runtime branch profile has a malformed loop trip-count entry")
+        loop_id, trip_count = item.get("loop_id"), item.get("trip_count")
+        if not isinstance(loop_id, int) or not isinstance(trip_count, int) or trip_count < 0:
+            raise ValueError("runtime loop trip counts require a non-negative integer id and count")
+        if loop_id in profiled_loops:
+            raise ValueError(f"runtime branch profile repeats loop {loop_id}")
+        loop = nodes_by_id.get(loop_id)
+        if loop is None or loop.get("kind") != "loop" or loop.get("loop_kind") != "LOOP_BEGIN":
+            raise ValueError(f"runtime branch profile references unknown LOOP_BEGIN {loop_id}")
+        compile_time_count = loop.get("static_trip_count")
+        if isinstance(compile_time_count, int) and compile_time_count != trip_count:
+            raise ValueError(
+                f"runtime trip count for loop {loop_id} contradicts its static count: "
+                f"{trip_count} != {compile_time_count}"
+            )
+        loop["compile_time_static_trip_count"] = compile_time_count
+        loop["static_trip_count"] = trip_count
+        loop["runtime_profiled_trip_count"] = True
+        profiled_loops.add(loop_id)
+
+    raw_branches = profile.get("branches")
+    if not isinstance(raw_branches, list):
+        raise ValueError("runtime branch profile branches must be a list")
+    profiled_branches: set[int] = set()
+    for item in raw_branches:
+        if not isinstance(item, Mapping):
+            raise ValueError("runtime branch profile has a malformed branch entry")
+        node_id = item.get("if_node_id")
+        predicate_identity = item.get("predicate_identity")
+        loop_ids = item.get("loop_ids")
+        counts = item.get("iteration_counts")
+        values = item.get("values")
+        active_flat_indices = item.get("active_flat_indices")
+        derivation = item.get("derivation")
+        if not isinstance(node_id, int) or node_id in profiled_branches:
+            raise ValueError("runtime branch profile requires unique integer if_node_id values")
+        node = nodes_by_id.get(node_id)
+        if node is None or node.get("kind") != "branch" or node.get("branch_kind") != "IF_BEGIN":
+            raise ValueError(f"runtime branch profile references unknown IF_BEGIN {node_id}")
+        if not isinstance(predicate_identity, str) or predicate_identity != node.get("predicate_identity"):
+            raise ValueError(f"runtime branch profile predicate identity does not match IF_BEGIN {node_id}")
+        if (
+            not isinstance(loop_ids, list)
+            or not all(isinstance(loop_id, int) for loop_id in loop_ids)
+            or loop_ids != node.get("loop_stack", [])
+            or not isinstance(counts, list)
+            or not all(isinstance(count, int) and count >= 0 for count in counts)
+            or len(loop_ids) != len(counts)
+            or not isinstance(values, list)
+            or not all(isinstance(value, bool) for value in values)
+        ):
+            raise ValueError(f"runtime branch profile for IF_BEGIN {node_id} has malformed occurrences")
+        context_count = math.prod(counts)
+        if active_flat_indices is None:
+            active_flat_indices = list(range(context_count))
+        if (
+            not isinstance(active_flat_indices, list)
+            or not all(isinstance(index, int) for index in active_flat_indices)
+            or active_flat_indices != sorted(set(active_flat_indices))
+            or any(index < 0 or index >= context_count for index in active_flat_indices)
+            or len(values) != len(active_flat_indices)
+        ):
+            raise ValueError(
+                f"runtime branch profile for IF_BEGIN {node_id} has malformed active occurrences"
+            )
+        for loop_id, count in zip(loop_ids, counts, strict=True):
+            loop = nodes_by_id.get(loop_id)
+            if loop is None or loop.get("static_trip_count") != count:
+                raise ValueError(
+                    f"runtime branch profile for IF_BEGIN {node_id} disagrees with loop {loop_id}"
+                )
+        if not isinstance(derivation, Mapping):
+            raise ValueError(f"runtime branch profile for IF_BEGIN {node_id} is missing derivation proof")
+        if derivation.get("kind") not in {
+            "captured_branch_outcomes_v1",
+            "captured_immutable_scalar_expression_v1",
+        }:
+            raise ValueError(f"runtime branch profile for IF_BEGIN {node_id} has unsupported derivation")
+        evidence_sha256 = derivation.get("evidence_sha256")
+        if not isinstance(evidence_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", evidence_sha256) is None:
+            raise ValueError(
+                f"runtime branch profile for IF_BEGIN {node_id} requires a SHA-256 derivation proof"
+            )
+        if derivation["kind"] == "captured_immutable_scalar_expression_v1" and (
+            derivation.get("immutability_proof")
+            not in {"function_argument_v1", "pre_loop_ssa_definition_v1"}
+        ):
+            raise ValueError(
+                f"runtime branch profile for IF_BEGIN {node_id} lacks a supported scalar immutability proof"
+            )
+        exact_profile = {
+            "schema_version": 1,
+            "evaluation": "exact_runtime_capture_v1",
+            "loop_ids": list(loop_ids),
+            "iteration_counts": list(counts),
+            "active_flat_indices": list(active_flat_indices),
+            "values": list(values),
+            "derivation": dict(derivation),
+        }
+        existing = node.get("predicate_iteration_profile")
+        if isinstance(existing, Mapping):
+            comparable_existing = {
+                key: existing.get(key)
+                for key in ("loop_ids", "iteration_counts", "active_flat_indices", "values")
+            }
+            comparable_runtime = {
+                key: exact_profile[key]
+                for key in ("loop_ids", "iteration_counts", "active_flat_indices", "values")
+            }
+            if comparable_existing["active_flat_indices"] is None:
+                comparable_existing["active_flat_indices"] = list(range(math.prod(counts)))
+            if comparable_existing != comparable_runtime:
+                raise ValueError(
+                    f"runtime branch profile for IF_BEGIN {node_id} contradicts static analysis"
+                )
+        node["predicate_iteration_profile"] = exact_profile
+        node["predicate_loop_invariant"] = len(set(values)) <= 1
+        profiled_branches.add(node_id)
+
+    canonical_profile = json.dumps(profile, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    enriched["runtime_branch_profile"] = {
+        "contract": "exact_runtime_branch_profile_v1",
+        "semantic_sha256": hashlib.sha256(canonical_profile).hexdigest(),
+        "bindings": dict(expected_bindings),
+        "profiled_loop_ids": sorted(profiled_loops),
+        "profiled_if_node_ids": sorted(profiled_branches),
     }
     return enriched
 
@@ -731,9 +1479,15 @@ def import_insert_sync_debug(  # noqa: PLR0912,PLR0915 - parser mirrors the debu
     missing_static_loop_bounds = sum(
         node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_BEGIN" for node in nodes
     )
-    if pto_text is not None:
-        _attach_pto_access_provenance(nodes, pto_text)
-        missing_static_loop_bounds = _attach_pto_static_loop_bounds(nodes, pto_text)
+    missing_branch_predicates = sum(
+        node.get("kind") == "branch" and node.get("branch_kind") == "IF_BEGIN" for node in nodes
+    )
+    nonmaterialized_access_orders: set[int] = set()
+    function_pto = _select_raw_pto_function(pto_text, function) if pto_text is not None else None
+    if function_pto is not None:
+        nonmaterialized_access_orders = _attach_pto_access_provenance(nodes, function_pto)
+        missing_static_loop_bounds = _attach_pto_static_loop_bounds(nodes, function_pto)
+        missing_branch_predicates = _attach_pto_branch_predicates(nodes, function_pto)
 
     sync_groups: list[dict[str, Any]] = []
     sync_edges: list[dict[str, Any]] = []
@@ -827,9 +1581,9 @@ def import_insert_sync_debug(  # noqa: PLR0912,PLR0915 - parser mirrors the debu
     # do not, so raw PTO remains the independent fail-closed check that the
     # reconstructed control-flow skeleton is complete.
     branch_nodes_missing = 0
-    if pto_text is not None:
+    if function_pto is not None:
         raw_branch_count = sum(
-            bool(_PTO_BRANCH_RE.search(line.split("//", maxsplit=1)[0])) for line in pto_text.splitlines()
+            bool(_PTO_BRANCH_RE.search(line.split("//", maxsplit=1)[0])) for line in function_pto.splitlines()
         )
         exported_if_count = sum(
             node.get("kind") == "branch" and node.get("branch_kind") == "IF_BEGIN" for node in nodes
@@ -851,11 +1605,13 @@ def import_insert_sync_debug(  # noqa: PLR0912,PLR0915 - parser mirrors the debu
             "operation_types_missing": missing_operation_types,
             "static_work_sizes_missing": missing_static_work_sizes,
             "static_loop_bounds_missing": missing_static_loop_bounds,
+            "branch_predicates_missing": missing_branch_predicates,
             "barrier_dependency_nodes_missing": omitted_barriers,
             "branch_nodes_missing": branch_nodes_missing,
             "access_provenance_missing": pto_text is None,
         },
         "nodes": nodes,
+        "nonmaterialized_access_orders": sorted(nonmaterialized_access_orders),
         "stream_edges": stream_edges,
         "sync_groups": sync_groups,
         "sync_edges": sync_edges,
@@ -1778,29 +2534,164 @@ def _compact_expanded_path(
 
 
 def _branch_alternatives(record: Mapping[str, Any]) -> tuple[list[int], dict[int, tuple[int, bool]]]:
-    """Return IF identities and the branch-stack marker interpretation."""
+    """Return canonical predicate identities and branch-marker requirements.
+
+    A final SyncIR trace identifies structured IF regions but does not, by
+    itself, say when two IFs re-test the same scalar predicate.  The raw-PTO
+    semantic bridge annotates such IF_BEGIN nodes with ``predicate_identity``
+    and the polarity under which their THEN region executes.  Collapse those
+    re-tests to one scenario bit.  Native records without the annotation keep
+    the conservative historical behavior of one independent bit per IF.
+    """
     branch_ids: list[int] = []
     markers: dict[int, tuple[int, bool]] = {}
+    representative_by_predicate: dict[str, int] = {}
+    if_marker_requirements: dict[int, tuple[int, bool]] = {}
+
+    # Establish the scenario variable represented by every IF marker first;
+    # ELSE_BEGIN records refer back to these ids and need the same canonical
+    # identity even if they appear later in the node sequence.
+    for node in record.get("nodes", []):
+        if not isinstance(node, Mapping) or node.get("kind") != "branch":
+            continue
+        node_id = node.get("id")
+        branch_kind = node.get("branch_kind")
+        if not isinstance(node_id, int) or branch_kind != "IF_BEGIN":
+            continue
+        predicate_identity = node.get("predicate_identity")
+        predicate_true_value = node.get("predicate_true_value", True)
+        iteration_profile = node.get("predicate_iteration_profile")
+        if isinstance(iteration_profile, Mapping):
+            # The profile records the actual boolean consumed by this IF for
+            # every static loop occurrence. Keep the marker local to this IF;
+            # it is not a free scenario bit and does not need polarity
+            # canonicalization through a materialized boolean alias.
+            requirement = (node_id, True)
+            if_marker_requirements[node_id] = requirement
+            markers[node_id] = requirement
+            continue
+        if not isinstance(predicate_identity, str):
+            predicate_identity = f"independent-if:{node_id}"
+        if not isinstance(predicate_true_value, bool):
+            raise ValueError(f"IF_BEGIN marker {node_id} has invalid predicate polarity")
+        representative = representative_by_predicate.get(predicate_identity)
+        if representative is None:
+            representative = node_id
+            representative_by_predicate[predicate_identity] = representative
+            branch_ids.append(representative)
+        requirement = (representative, predicate_true_value)
+        if_marker_requirements[node_id] = requirement
+        markers[node_id] = requirement
+
     for node in record.get("nodes", []):
         if not isinstance(node, Mapping) or node.get("kind") != "branch":
             continue
         node_id = node.get("id")
         begin = node.get("begin")
-        branch_kind = node.get("branch_kind")
-        if not isinstance(node_id, int) or not isinstance(begin, int):
+        if (
+            not isinstance(node_id, int)
+            or not isinstance(begin, int)
+            or node.get("branch_kind") != "ELSE_BEGIN"
+        ):
             continue
-        if branch_kind == "IF_BEGIN":
-            branch_ids.append(node_id)
-            markers[node_id] = (node_id, True)
-        elif branch_kind == "ELSE_BEGIN":
-            markers[node_id] = (begin, False)
+        requirement = if_marker_requirements.get(begin)
+        if requirement is None:
+            raise ValueError(f"ELSE_BEGIN marker {node_id} references unknown IF_BEGIN {begin}")
+        representative, then_value = requirement
+        markers[node_id] = (representative, not then_value)
     return sorted(branch_ids), markers
 
 
-def _node_active_in_branch_scenario(
-    node: Mapping[str, Any], choices: Mapping[int, bool], markers: Mapping[int, tuple[int, bool]]
+def _branch_iteration_profiles(
+    record: Mapping[str, Any],
+) -> dict[int, tuple[tuple[int, ...], tuple[int, ...], dict[int, bool]]]:
+    """Index exact per-iteration branch values by their IF marker."""
+    profiles: dict[int, tuple[tuple[int, ...], tuple[int, ...], dict[int, bool]]] = {}
+    for node in record.get("nodes", []):
+        if (
+            not isinstance(node, Mapping)
+            or node.get("kind") != "branch"
+            or node.get("branch_kind") != "IF_BEGIN"
+            or not isinstance(node.get("id"), int)
+        ):
+            continue
+        raw_profile = node.get("predicate_iteration_profile")
+        if raw_profile is None:
+            continue
+        if not isinstance(raw_profile, Mapping):
+            raise ValueError(f"IF_BEGIN marker {node['id']} has an invalid iteration profile")
+        loop_ids = raw_profile.get("loop_ids")
+        counts = raw_profile.get("iteration_counts")
+        active_flat_indices = raw_profile.get("active_flat_indices")
+        values = raw_profile.get("values")
+        if (
+            not isinstance(loop_ids, list)
+            or not all(isinstance(loop, int) for loop in loop_ids)
+            or not isinstance(counts, list)
+            or not all(isinstance(count, int) and count >= 0 for count in counts)
+            or len(loop_ids) != len(counts)
+            or not isinstance(values, list)
+            or not all(isinstance(value, bool) for value in values)
+        ):
+            raise ValueError(f"IF_BEGIN marker {node['id']} has a malformed iteration profile")
+        context_count = math.prod(counts)
+        if active_flat_indices is None:
+            active_flat_indices = list(range(context_count))
+        if (
+            not isinstance(active_flat_indices, list)
+            or not all(isinstance(index, int) for index in active_flat_indices)
+            or active_flat_indices != sorted(set(active_flat_indices))
+            or any(index < 0 or index >= context_count for index in active_flat_indices)
+            or len(values) != len(active_flat_indices)
+        ):
+            raise ValueError(f"IF_BEGIN marker {node['id']} has malformed active occurrences")
+        profiles[int(node["id"])] = (
+            tuple(loop_ids),
+            tuple(counts),
+            dict(zip(active_flat_indices, values, strict=True)),
+        )
+    return profiles
+
+
+def _branch_value_for_context(
+    branch: int,
+    choices: Mapping[int, bool],
+    profiles: Mapping[int, tuple[tuple[int, ...], tuple[int, ...], Mapping[int, bool]]],
+    context: Mapping[int, int],
 ) -> bool:
-    """Return whether a structured node executes under one all-iteration branch scenario."""
+    """Resolve one scenario or exact mixed-iteration branch value."""
+    profile = profiles.get(branch)
+    if profile is None:
+        if branch not in choices:
+            raise ValueError(f"structured branch {branch} has neither a scenario choice nor a profile")
+        return choices[branch]
+    loop_ids, counts, values = profile
+    flat_index = 0
+    for loop_id, count in zip(loop_ids, counts, strict=True):
+        iteration = context.get(loop_id)
+        if iteration is None or iteration < 0 or iteration >= count:
+            raise ValueError(
+                f"structured branch {branch} has no iteration value for loop {loop_id}: "
+                f"context={dict(context)}"
+            )
+        flat_index = flat_index * count + iteration
+    if flat_index not in values:
+        raise ValueError(
+            f"structured branch {branch} is inactive in loop context {dict(context)}"
+        )
+    return values[flat_index]
+
+
+def _node_active_in_branch_scenario(
+    node: Mapping[str, Any],
+    choices: Mapping[int, bool],
+    markers: Mapping[int, tuple[int, bool]],
+    profiles: Mapping[int, tuple[tuple[int, ...], tuple[int, ...], tuple[bool, ...]]] | None = None,
+    context: Mapping[int, int] | None = None,
+) -> bool:
+    """Return whether a structured node executes in one concrete loop context."""
+    profiles = profiles or {}
+    context = context or {}
     kind = node.get("kind")
     subkind = node.get("branch_kind") if kind == "branch" else node.get("control_subkind")
     marker_id = node.get("id") if kind == "branch" else node.get("origin_node")
@@ -1809,9 +2700,6 @@ def _node_active_in_branch_scenario(
         own_else = markers.get(marker_id)
         if own_else is None:
             raise ValueError(f"ELSE_BEGIN marker {marker_id} has no branch identity")
-        begin, expected = own_else
-        if choices.get(begin) != expected:
-            return False
     stack = node.get("branch_stack", [])
     if not isinstance(stack, list) or not all(isinstance(marker, int) for marker in stack):
         raise ValueError(f"schedule node {node.get('id')} has an invalid branch stack")
@@ -1822,9 +2710,51 @@ def _node_active_in_branch_scenario(
         begin, expected = alternative
         if own_else is not None and begin == own_else[0]:
             continue
-        if choices.get(begin) != expected:
+        if _branch_value_for_context(begin, choices, profiles, context) != expected:
+            return False
+    if own_else is not None:
+        begin, expected = own_else
+        if _branch_value_for_context(begin, choices, profiles, context) != expected:
             return False
     return True
+
+
+def _node_branch_requirements(
+    node: Mapping[str, Any], markers: Mapping[int, tuple[int, bool]]
+) -> dict[int, bool]:
+    """Return the structured branch choices required to execute ``node``.
+
+    Candidate reuse edges are meaningful only in scenarios where both access
+    endpoints execute.  Keep that predicate on the edge catalog instead of
+    treating mutually exclusive branch arms as a synchronization demand.
+    """
+    requirements: dict[int, bool] = {}
+    stack = node.get("branch_stack", [])
+    if not isinstance(stack, list) or not all(isinstance(marker, int) for marker in stack):
+        raise ValueError(f"schedule node {node.get('id')} has an invalid branch stack")
+    for marker in stack:
+        alternative = markers.get(marker)
+        if alternative is None:
+            raise ValueError(f"schedule node {node.get('id')} references unknown branch marker {marker}")
+        branch, value = alternative
+        previous = requirements.get(branch)
+        if previous is not None and previous != value:
+            raise ValueError(f"schedule node {node.get('id')} has contradictory branch requirements")
+        requirements[branch] = value
+    return requirements
+
+
+def _combined_branch_requirements(
+    source: Mapping[str, Any], target: Mapping[str, Any], markers: Mapping[int, tuple[int, bool]]
+) -> dict[int, bool] | None:
+    """Return the predicate under which both endpoints execute, or ``None``."""
+    combined = _node_branch_requirements(source, markers)
+    for branch, value in _node_branch_requirements(target, markers).items():
+        previous = combined.get(branch)
+        if previous is not None and previous != value:
+            return None
+        combined[branch] = value
+    return combined
 
 
 def _structured_operation_occurrences(
@@ -1832,14 +2762,14 @@ def _structured_operation_occurrences(
     clone_by_context: Mapping[int, Mapping[tuple[int, ...], int]],
     stacks: Mapping[int, tuple[int, ...]],
     loop_counts: Mapping[int, int],
-    active_nodes: Mapping[int, bool],
+    active_clones: Mapping[int, bool],
 ) -> list[tuple[int, Mapping[str, Any]]]:
     """Return operation clones in structured execution order.
 
     This traversal expands the original, pre-InsertSync operation stream rather
     than inferring program order from physical addresses or synchronization
-    records. It is intentionally branch-free; callers must select a concrete
-    branch scenario or fail closed before requesting the sequence.
+    records. Callers select a concrete branch scenario through ``active_nodes``;
+    structural branch markers themselves do not represent memory accesses.
     """
     nodes = [node for node in record.get("nodes", []) if isinstance(node, Mapping)]
     positions = {node["id"]: index for index, node in enumerate(nodes) if isinstance(node.get("id"), int)}
@@ -1854,7 +2784,8 @@ def _structured_operation_occurrences(
                 index += 1
                 continue
             if node.get("kind") == "branch":
-                raise ValueError("non_reusing_ssa_pipe_dag_v1 requires a branch-free operation stream")
+                index += 1
+                continue
             if node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_BEGIN":
                 end_id = node.get("end")
                 end_index = positions.get(end_id) if isinstance(end_id, int) else None
@@ -1869,7 +2800,7 @@ def _structured_operation_occurrences(
                 continue
             if node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_END":
                 raise ValueError(f"unexpected loop-end marker {node_id} in structured traversal")
-            if node.get("kind") == "operation" and active_nodes.get(node_id, False):
+            if node.get("kind") == "operation":
                 stack = stacks.get(node_id)
                 if stack is None:
                     raise ValueError(f"operation {node_id} has no expanded loop stack")
@@ -1885,7 +2816,8 @@ def _structured_operation_occurrences(
                     raise ValueError(
                         f"operation {node_id} has no clone for loop context {occurrence_context}"
                     ) from error
-                occurrences.append((clone, node))
+                if active_clones.get(clone, False):
+                    occurrences.append((clone, node))
             index += 1
 
     visit(0, len(nodes), {})
@@ -2125,6 +3057,7 @@ def _barrier_dependency_sites(record: Mapping[str, Any], model: DurationModel) -
 def _score_queue_drain_restart(record: Mapping[str, Any], model: DurationModel) -> dict[str, Any]:
     """Price barriers from queued predecessor tail and successor restart."""
     branch_ids, markers = _branch_alternatives(record)
+    branch_profiles = _branch_iteration_profiles(record)
     if len(branch_ids) > 6:
         raise ValueError(f"queue_drain_restart_v1 supports at most 6 branches, got {len(branch_ids)}")
     nodes = {
@@ -2133,6 +3066,22 @@ def _score_queue_drain_restart(record: Mapping[str, Any], model: DurationModel) 
         if isinstance(node, Mapping) and isinstance(node.get("id"), int)
     }
     sites = _barrier_dependency_sites(record, model)
+    if branch_profiles:
+        # This diagnostic model aggregates each barrier by one loop
+        # multiplier. That representation cannot preserve a predicate whose
+        # value changes between iterations: predecessor activity and drain
+        # cost must be evaluated for every concrete occurrence. The complete
+        # placement graph has that expansion, but silently reusing the
+        # aggregate here would manufacture a queue-drain estimate.
+        return {
+            "model_version": "queue_drain_successor_restart_v1",
+            "cost_definition": "barrier instruction + predecessor pending tail + successor stream restart",
+            "status": "INCOMPLETE",
+            "limitations": ["mixed_iteration_branch_profile_not_supported_v1"],
+            "scenario_count": 0,
+            "sites": sites,
+            "scenarios": [],
+        }
     scenarios: list[dict[str, Any]] = []
     for values in itertools.product((False, True), repeat=len(branch_ids)):
         choices = dict(zip(branch_ids, values, strict=True))
@@ -2176,6 +3125,8 @@ def _score_queue_drain_restart(record: Mapping[str, Any], model: DurationModel) 
     return {
         "model_version": "queue_drain_successor_restart_v1",
         "cost_definition": "barrier instruction + predecessor pending tail + successor stream restart",
+        "status": "COMPLETE",
+        "limitations": [],
         "scenario_count": len(scenarios),
         "sites": sites,
         "scenarios": scenarios,
@@ -2207,10 +3158,10 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
     subsequent pipeline restart that PTO-ISA charges when a stream is broken.
     Missing pipe calibration is reported instead of acquiring a guessed cost.
 
-    One boolean choice applies to every dynamic occurrence of a branch. This
-    gives auditable all-then/all-else path extremes. An invocation-specific mixed
-    branch profile remains a separate input that the schedule exporter does
-    not currently provide.
+    Induction-variable predicates over statically bounded loops use the exact
+    boolean value derived for each dynamic occurrence. Remaining predicates
+    use one symbolic choice for every occurrence, yielding auditable
+    all-then/all-else path extremes without inventing runtime data.
     """
     loop_counts, dynamic_loops = _loop_multipliers(record)
     if dynamic_loops:
@@ -2234,13 +3185,11 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
         node_id: _expanded_node_loop_stack(node, original_nodes) for node_id, node in prepared_nodes.items()
     }
     _, branch_markers = _branch_alternatives(record)
-    active_nodes = {
-        node_id: _node_active_in_branch_scenario(node, choices, branch_markers)
-        for node_id, node in prepared_nodes.items()
-    }
+    branch_profiles = _branch_iteration_profiles(record)
 
     clone_by_context: dict[int, dict[tuple[int, ...], int]] = {}
     clone_provenance: dict[int, tuple[int, tuple[int, ...]]] = {}
+    active_clones: dict[int, bool] = {}
     durations: dict[int, float] = {}
     next_clone = 0
     for node_id, node in prepared_nodes.items():
@@ -2249,7 +3198,7 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
         clones: dict[tuple[int, ...], int] = {}
         if node.get("kind") == "operation":
             divisor = math.prod(loop_counts[loop] for loop in stack)
-            base_duration = operation_durations[node_id] / max(divisor, 1) if active_nodes[node_id] else 0.0
+            base_duration = operation_durations[node_id] / max(divisor, 1)
         else:
             base_duration = 0.0
         for context in contexts:
@@ -2257,7 +3206,12 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
             next_clone += 1
             clones[context] = clone
             clone_provenance[clone] = (node_id, context)
-            durations[clone] = base_duration
+            iteration_context = dict(zip(stack, context, strict=True))
+            active = _node_active_in_branch_scenario(
+                node, choices, branch_markers, branch_profiles, iteration_context
+            )
+            active_clones[clone] = active
+            durations[clone] = base_duration if active else 0.0
         clone_by_context[node_id] = clones
 
     edges: list[tuple[int, int, float, str, int | None]] = []
@@ -2272,8 +3226,6 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
         latency_cycles: float = 0.0,
     ) -> None:
         if source not in clone_by_context or target not in clone_by_context:
-            return
-        if kind == "sync" and (not active_nodes[source] or not active_nodes[target]):
             return
         target_clones = clone_by_context[target]
         for source_context, source_clone in clone_by_context[source].items():
@@ -2291,6 +3243,8 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
                 raise ValueError(
                     f"expanded schedule edge {source}->{target} has no target context {target_context}"
                 )
+            if kind == "sync" and (not active_clones[source_clone] or not active_clones[target_clone]):
+                continue
             edges.append((source_clone, target_clone, latency_cycles, kind, group))
 
     for edge in prepared.get("stream_edges", []):
@@ -2332,7 +3286,7 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
     logical_memory_edge_count = 0
     if logical_memory_dependencies:
         occurrences = _structured_operation_occurrences(
-            record, clone_by_context, stacks, loop_counts, active_nodes
+            record, clone_by_context, stacks, loop_counts, active_clones
         )
         memory_edges = _expanded_logical_memory_edges(occurrences, sync_edge_latency_cycles)
         logical_memory_edge_count = len(memory_edges)
@@ -2362,16 +3316,14 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
     uncalibrated_barriers: list[dict[str, Any]] = []
     barrier_sites = _pipe_barrier_sites(record) if include_barrier_sites else []
     for target, pipe, group in barrier_sites:
-        target_node = original_nodes.get(target)
-        if target_node is None or not _node_active_in_branch_scenario(target_node, choices, branch_markers):
-            continue
         cycles = pipe_barrier_cycles.get(pipe)
         if cycles is None:
             uncalibrated_barriers.append({"node": target, "pipe": pipe, "group": group})
             continue
         calibrated_barriers += 1
         for clone in clone_by_context.get(target, {}).values():
-            full_durations[clone] += cycles
+            if active_clones[clone]:
+                full_durations[clone] += cycles
 
     baseline, _, _, baseline_path = _longest_path(durations, baseline_edges)
     full, _, _, full_path = _longest_path(full_durations, edges)
@@ -2379,8 +3331,9 @@ def _score_static_queue_event_scenario(  # noqa: PLR0912 - fail-closed graph exp
         "model_version": "static_unrolled_pipe_event_v2",
         "operation_duration_policy": "inclusive_cycles",
         "pipeline_break_policy": "calibrated_per_pipe_barrier_restart",
-        "branch_policy": "all_iteration_fixed_choice_scenario",
+        "branch_policy": "exact_static_induction_profiles_plus_symbolic_fixed_choice_scenario",
         "branch_choices": {str(node): choice for node, choice in sorted(choices.items())},
+        "exact_iteration_profile_count": len(branch_profiles),
         "expanded_node_count": len(durations),
         "expanded_stream_edge_count": pipe_order_edge_count,
         "expanded_logical_memory_edge_count": logical_memory_edge_count,
@@ -2403,6 +3356,7 @@ def _score_static_queue_event_graph(
 ) -> dict[str, Any]:
     """Score static queues over auditable all-then/all-else branch extremes."""
     branch_ids, _ = _branch_alternatives(record)
+    branch_profiles = _branch_iteration_profiles(record)
     if len(branch_ids) > 6:
         raise ValueError(
             "queue_event_v2 supports at most 6 conditional regions for exhaustive "
@@ -2448,8 +3402,9 @@ def _score_static_queue_event_graph(
     complete = all(scenario["pipeline_break_model_complete"] for scenario in scenarios)
     return {
         "model_version": "static_unrolled_pipe_event_branch_extremes_v2",
-        "branch_policy": "all_iteration_fixed_choice_extremes",
-        "mixed_iteration_branch_profile_available": False,
+        "branch_policy": ("exact_static_induction_profiles_plus_symbolic_fixed_choice_extremes"),
+        "mixed_iteration_branch_profile_available": bool(branch_profiles),
+        "exact_iteration_profile_count": len(branch_profiles),
         "scenario_count": len(scenarios),
         "expanded_node_budget": _MAX_QUEUE_EVENT_EXPANDED_NODES,
         "total_expanded_node_count": total_expanded_nodes,
@@ -3071,6 +4026,28 @@ def _site_nodes(record: Mapping[str, Any]) -> dict[tuple[int, str], list[int]]:
     return result
 
 
+def _schedule_proves_complete_access_provenance(record: Mapping[str, Any]) -> bool:
+    """Return whether absence of a ``pypto.access.N`` site proves its elimination.
+
+    A native schedule graph alone does not establish this: an exporter may
+    simply have dropped locations.  The raw-PTO semantic join is fail-closed on
+    operation order and attaches every surviving access location, so a
+    candidate access order absent from such a record was genuinely eliminated
+    before the final pre-InsertSync operation stream.
+    """
+    source = record.get("export_source")
+    if not isinstance(source, str):
+        return False
+    limitations = record.get("export_limitations", {})
+    if not isinstance(limitations, Mapping):
+        return False
+    if "raw_pto_semantics" in source:
+        return limitations.get("operation_metadata_missing", 0) == 0
+    if "pto_access_join_v3" in source:
+        return limitations.get("access_provenance_missing") is False
+    return False
+
+
 def _node_operation_name(node: Mapping[str, Any]) -> str | None:
     operation = node.get("operation")
     if isinstance(operation, Mapping):
@@ -3124,6 +4101,7 @@ def _join_candidate_access_sites(
     nodes_by_id: Mapping[int, Mapping[str, Any]],
     materialized_access_orders: set[int],
     known_nonmaterialized_access_orders: frozenset[int],
+    access_provenance_complete: bool,
 ) -> tuple[list[int], str, str | None, list[int], str, str | None] | dict[str, Any]:
     """Join both candidate sites or return an evidence-backed non-materialized row."""
     prior_route_pipe = _route_pipe(candidate.prior_route)
@@ -3157,7 +4135,10 @@ def _join_candidate_access_sites(
         }
     )
     if missing_access_orders:
-        unproven = sorted(set(missing_access_orders) - known_nonmaterialized_access_orders)
+        independently_proven = set(known_nonmaterialized_access_orders)
+        if access_provenance_complete:
+            independently_proven.update(missing_access_orders)
+        unproven = sorted(set(missing_access_orders) - independently_proven)
         if unproven:
             raise ValueError(
                 "candidate access orders are absent from the lowered schedule without "
@@ -3175,6 +4156,11 @@ def _join_candidate_access_sites(
             "next_route_pipe": next_route_pipe,
             "missing_access_orders": missing_access_orders,
             "status": "not_materialized_in_schedule",
+            "nonmaterialization_evidence": (
+                "complete_raw_pto_access_provenance"
+                if access_provenance_complete
+                else "external_digest_bound_evidence"
+            ),
             "weight_cycles": 0.0,
         }
     if not prior_nodes or not next_nodes:
@@ -3198,14 +4184,15 @@ def _deduplicate_scored_candidate_edges(
     for row in rows:
         if row.get("status") == "scored":
             distance_zero_rows[(row["source_node"], row["target_node"])].append(row)
-        elif row.get("status") == "loop_carried_scored_v1":
+        elif row.get("status") in {"loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}:
             loop_rows[(row["loop_node"], row["source_node"], row["target_node"])].append(row)
 
     distance_zero_edges: list[dict[str, Any]] = []
     for (source, target), duplicates in sorted(distance_zero_rows.items()):
         weights = {float(row["weight_cycles"]) for row in duplicates}
         pipe_pairs = {(row.get("prior_pipe"), row.get("next_pipe")) for row in duplicates}
-        if len(weights) != 1 or len(pipe_pairs) != 1:
+        predicates = {json.dumps(row.get("branch_predicate", {}), sort_keys=True) for row in duplicates}
+        if len(weights) != 1 or len(pipe_pairs) != 1 or len(predicates) != 1:
             raise ValueError(
                 "candidate records joined to one distance-zero edge but have inconsistent metadata: "
                 f"edge={source}->{target}"
@@ -3223,15 +4210,24 @@ def _deduplicate_scored_candidate_edges(
                 "target_execution_count": execution_counts[target],
                 "estimated_sync_endpoint_executions": (execution_counts[source] + execution_counts[target]),
                 "weight_cycles": duplicates[0]["weight_cycles"],
+                "branch_predicate": duplicates[0].get("branch_predicate", {}),
             }
         )
 
     loop_edges: list[dict[str, Any]] = []
     for (loop_node, source, target), duplicates in sorted(loop_rows.items()):
         weights = {float(row["weight_cycles"]) for row in duplicates}
-        recurrence_cycles = {row["candidate_recurrence_cycles"] for row in duplicates}
+        recurrence_cycles = {row.get("candidate_recurrence_cycles") for row in duplicates}
+        weight_semantics = {row.get("weight_semantics", "loop_ii_increment_v1") for row in duplicates}
         pipe_pairs = {(row.get("prior_pipe"), row.get("next_pipe")) for row in duplicates}
-        if len(weights) != 1 or len(recurrence_cycles) != 1 or len(pipe_pairs) != 1:
+        predicates = {json.dumps(row.get("branch_predicate", {}), sort_keys=True) for row in duplicates}
+        if (
+            len(weights) != 1
+            or len(recurrence_cycles) != 1
+            or len(weight_semantics) != 1
+            or len(pipe_pairs) != 1
+            or len(predicates) != 1
+        ):
             raise ValueError(
                 "candidate records joined to one recurrence edge but have inconsistent metadata: "
                 f"loop={loop_node}, edge={source}->{target}"
@@ -3251,6 +4247,12 @@ def _deduplicate_scored_candidate_edges(
                 "estimated_sync_endpoint_executions": (execution_counts[source] + execution_counts[target]),
                 "candidate_recurrence_cycles": duplicates[0]["candidate_recurrence_cycles"],
                 "weight_cycles": duplicates[0]["weight_cycles"],
+                **(
+                    {"weight_semantics": next(iter(weight_semantics))}
+                    if next(iter(weight_semantics)) != "loop_ii_increment_v1"
+                    else {}
+                ),
+                "branch_predicate": duplicates[0].get("branch_predicate", {}),
             }
         )
     return distance_zero_edges, loop_edges
@@ -3357,6 +4359,14 @@ def _score_penalty_pairs(
 
     scored: list[dict[str, Any]] = []
     for pair, pair_rows in sorted(by_pair.items()):
+        penalty_reason = promoted_penalty_reasons.get(pair) if promoted_penalty_reasons is not None else None
+        if penalty_reason == "pipeline_serialization" and not any(
+            row.get("candidate_penalty_reason") == "pipeline_serialization" for row in pair_rows
+        ):
+            raise ValueError(
+                "pipeline-serialization penalty has candidate records but none carries "
+                f"pipeline provenance: pair={pair}"
+            )
         distance_zero_edges = {
             (int(row["source_node"]), int(row["target_node"]))
             for row in pair_rows
@@ -3373,21 +4383,33 @@ def _score_penalty_pairs(
 
         loop_weights: dict[int, float] = {}
         for row in pair_rows:
-            if row.get("status") != "loop_carried_scored_v1":
+            if row.get("status") not in {"loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}:
                 continue
             loop_id = row.get("loop_node")
             weight = _as_number(row.get("weight_cycles"))
             if not isinstance(loop_id, int) or weight is None:
                 raise ValueError(f"invalid loop recurrence score for buffer pair {pair}")
             loop_weights[loop_id] = max(loop_weights.get(loop_id, 0.0), weight)
+        exact_occurrence_weights = [
+            float(row["weight_cycles"])
+            for row in pair_rows
+            if row.get("status") == "loop_carried_occurrence_profiled_v2"
+        ]
         loop_total_weight = sum(
             weight * max(loop_counts.get(loop_id, 1) - 1, 0) for loop_id, weight in loop_weights.items()
         )
+        if exact_occurrence_weights:
+            # These weights already cover every active distance-one occurrence
+            # in the captured profile and must not be multiplied by trip count
+            # a second time. Multiple records are retained conservatively as a
+            # sum in this legacy additive diagnostic; the complete-placement
+            # DAG remains the authoritative union score.
+            loop_total_weight = sum(exact_occurrence_weights)
 
         loop_schedule_edges = {
             (int(row["loop_node"]), int(row["source_node"]), int(row["target_node"]))
             for row in pair_rows
-            if row.get("status") == "loop_carried_scored_v1"
+            if row.get("status") in {"loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}
         }
         estimated_sync_executions = sum(
             int(distance_zero_edge_features[edge]["estimated_sync_endpoint_executions"])
@@ -3400,7 +4422,10 @@ def _score_penalty_pairs(
         promoted = promoted_penalties is None or pair in promoted_penalties
         unit_cost = 1.0 if promoted_penalties is None else promoted_penalties.get(pair, 0.0)
         executable_rows = [
-            row for row in pair_rows if row.get("status") in {"scored", "loop_carried_scored_v1"}
+            row
+            for row in pair_rows
+            if row.get("status")
+            in {"scored", "loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}
         ]
         not_materialized_count = sum(row.get("status") == "not_materialized_in_schedule" for row in pair_rows)
         scored.append(
@@ -3409,6 +4434,7 @@ def _score_penalty_pairs(
                 "second_buffer": pair[1],
                 "promoted_to_dsa_penalty": promoted,
                 "unit_cost": unit_cost,
+                **({"penalty_reason": penalty_reason} if penalty_reason is not None else {}),
                 "candidate_record_count": len(pair_rows),
                 "executable_candidate_record_count": len(executable_rows),
                 "not_materialized_candidate_record_count": not_materialized_count,
@@ -3650,7 +4676,8 @@ def _realized_edge_explanations(
                     "loop_ii_slack_cycles": loop_ii_slack,
                     "slack_basis": (
                         "loop_initiation_interval"
-                        if candidate.get("status") == "loop_carried_scored_v1"
+                        if candidate.get("status")
+                        in {"loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}
                         else "whole_function_dag"
                     ),
                 }
@@ -3663,7 +4690,7 @@ def _static_dependency_makespan(
     operation_durations: Mapping[int, float],
     synchronization_latency_cycles: float,
 ) -> dict[str, Any]:
-    """Evaluate one branch-free, statically bounded no-reuse graph exactly.
+    """Evaluate every structured branch scenario of one concrete loop count.
 
     Operations are cloned for every static loop occurrence. The base graph is
     rebuilt from fixed per-pipe FIFO order and logical-root RAW/WAR/WAW
@@ -3673,14 +4700,15 @@ def _static_dependency_makespan(
     model.
     """
     branch_ids, _ = _branch_alternatives(record)
-    if branch_ids:
+    if len(branch_ids) > 6:
         raise ValueError(
-            f"complete_placement_dag_v2 requires a branch-free schedule; branch nodes: {branch_ids[:8]}"
+            f"complete_placement_dag_v5 supports at most 6 symbolic structured branches; "
+            f"got {len(branch_ids)}"
         )
     loop_counts, dynamic_loops = _loop_multipliers(record)
     if dynamic_loops:
         raise ValueError(
-            "complete_placement_dag_v2 requires statically bounded loops; "
+            "complete_placement_dag_v5 requires concrete loop counts internally; "
             f"dynamic loop nodes: {dynamic_loops[:8]}"
         )
     prepared = _prepare_control_flow_record(record)
@@ -3696,21 +4724,41 @@ def _static_dependency_makespan(
         and isinstance(node.get("id"), int)
         and node.get("kind") in {"operation", "control_point"}
     )
-    if expanded_nodes > _MAX_QUEUE_EVENT_EXPANDED_NODES:
+    if expanded_nodes * (2 ** len(branch_ids)) > _MAX_QUEUE_EVENT_EXPANDED_NODES:
         raise ValueError(
-            "complete_placement_dag_v2 expansion exceeds the resource-safe node budget: "
-            f"{expanded_nodes}, limit {_MAX_QUEUE_EVENT_EXPANDED_NODES}"
+            "complete_placement_dag_v5 expansion exceeds the resource-safe node budget: "
+            f"{expanded_nodes} nodes/scenario * {2 ** len(branch_ids)} scenarios, "
+            f"limit {_MAX_QUEUE_EVENT_EXPANDED_NODES}"
         )
-    return _score_static_queue_event_scenario(
-        record,
-        operation_durations,
-        {},
-        {},
-        logical_memory_dependencies=True,
-        sync_edge_origin="realized_reuse_candidate",
-        sync_edge_latency_cycles=synchronization_latency_cycles,
-        include_barrier_sites=False,
-    )
+    scenarios = [
+        _score_static_queue_event_scenario(
+            record,
+            operation_durations,
+            {},
+            dict(zip(branch_ids, values, strict=True)),
+            logical_memory_dependencies=True,
+            sync_edge_origin="realized_reuse_candidate",
+            sync_edge_latency_cycles=synchronization_latency_cycles,
+            include_barrier_sites=False,
+        )
+        for values in itertools.product((False, True), repeat=len(branch_ids))
+    ]
+    winner = max(scenarios, key=lambda scenario: float(scenario["full_makespan_cycles"]))
+    return {
+        **winner,
+        "model_version": "complete_placement_dependency_scenarios_v5",
+        "branch_policy": "exact_static_induction_profiles_plus_symbolic_path_extremes",
+        "exact_iteration_profile_count": len(_branch_iteration_profiles(record)),
+        "scenario_count": len(scenarios),
+        "scenarios": [
+            {
+                "branch_choices": scenario["branch_choices"],
+                "full_makespan_cycles": scenario["full_makespan_cycles"],
+                "full_critical_path": scenario["full_critical_path"],
+            }
+            for scenario in scenarios
+        ],
+    }
 
 
 def _schedule_with_realized_candidate_edges(
@@ -3776,7 +4824,292 @@ def _schedule_with_realized_candidate_edges(
     return augmented
 
 
-def score_complete_placement_dag(
+def _exact_profiled_loop_candidate_score(
+    record: Mapping[str, Any],
+    operation_durations: Mapping[int, float],
+    *,
+    loop_id: int,
+    source: int,
+    target: int,
+    source_pipe: str,
+    target_pipe: str,
+    synchronization_latency_cycles: float,
+) -> dict[str, Any]:
+    """Score one distance-one edge over exact per-occurrence branch outcomes."""
+    edge = {
+        "loop_node": loop_id,
+        "source_node": source,
+        "target_node": target,
+        "source_pipe": source_pipe,
+        "target_pipe": target_pipe,
+        "synchronization_latency_cycles": synchronization_latency_cycles,
+    }
+    augmented = _schedule_with_realized_candidate_edges(record, [], [edge])
+    baseline = _static_dependency_makespan(
+        record, operation_durations, synchronization_latency_cycles
+    )
+    with_candidate = _static_dependency_makespan(
+        augmented, operation_durations, synchronization_latency_cycles
+    )
+    extensions = _scenario_extension_rows(baseline, with_candidate)
+    weights = [float(row["critical_path_extension_cycles"]) for row in extensions]
+    return {
+        "model_version": "exact_profiled_distance_one_v2",
+        "loop_node": loop_id,
+        "static_trip_count": next(
+            (
+                node.get("static_trip_count")
+                for node in record.get("nodes", [])
+                if isinstance(node, Mapping) and node.get("id") == loop_id
+            ),
+            None,
+        ),
+        "candidate_recurrence_cycles": None,
+        "candidate_recurrence_path": None,
+        "base_ii_lower_bound_cycles": None,
+        "with_candidate_ii_lower_bound_cycles": None,
+        "weight_cycles": max(weights, default=0.0),
+        "weight_semantics": "whole_execution_exact_occurrence_extension_v2",
+        "scenario_extensions": extensions,
+    }
+
+
+def _dynamic_loop_parameter_groups(
+    record: Mapping[str, Any], dynamic_loop_ids: Sequence[int]
+) -> dict[str, list[int]]:
+    """Group dynamic loops proven to share one raw-PTO trip-count expression.
+
+    A lone legacy dynamic loop remains representable by its loop id. Multiple
+    loops require raw-PTO identities: silently treating unrelated loop bounds
+    as one parameter would manufacture a runtime relationship that the IR does
+    not establish.
+    """
+    begins = {
+        int(node["id"]): node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping)
+        and node.get("kind") == "loop"
+        and node.get("loop_kind") == "LOOP_BEGIN"
+        and isinstance(node.get("id"), int)
+    }
+    groups: dict[str, list[int]] = defaultdict(list)
+    for loop_id in dynamic_loop_ids:
+        node = begins.get(loop_id)
+        if node is None:
+            raise ValueError(f"dynamic loop {loop_id} has no LOOP_BEGIN record")
+        identity = node.get("dynamic_trip_count_identity")
+        if not isinstance(identity, str):
+            if len(dynamic_loop_ids) != 1:
+                raise ValueError(
+                    f"multiple dynamic loops require raw-PTO trip-count identities: missing loop {loop_id}"
+                )
+            identity = f"legacy-loop-id:{loop_id}"
+        groups[identity].append(loop_id)
+    return {identity: sorted(loop_ids) for identity, loop_ids in sorted(groups.items())}
+
+
+def _with_concrete_dynamic_trip_count(
+    record: Mapping[str, Any], loop_ids: Sequence[int], trip_count: int
+) -> dict[str, Any]:
+    """Materialize one probe count for a correlated dynamic-loop group."""
+    requested = set(loop_ids)
+    if not requested:
+        raise ValueError("dynamic-loop concretization requires at least one loop")
+    concrete = copy.deepcopy(dict(record))
+    matched: set[int] = set()
+    for node in concrete.get("nodes", []):
+        if (
+            isinstance(node, dict)
+            and node.get("kind") == "loop"
+            and node.get("loop_kind") == "LOOP_BEGIN"
+            and node.get("id") in requested
+        ):
+            node["static_trip_count"] = trip_count
+            matched.add(int(node["id"]))
+    if matched != requested:
+        raise ValueError(
+            "dynamic-loop group did not identify every LOOP_BEGIN: "
+            f"requested={sorted(requested)}, matched={sorted(matched)}"
+        )
+    return concrete
+
+
+def _fit_affine_trip_profile(values: Sequence[float]) -> dict[str, float] | None:
+    """Fit ``startup + (N - 1) * steady`` only when all probes agree exactly."""
+    if len(values) < 3:
+        raise ValueError("an affine trip profile requires at least three probes")
+    deltas = [float(right) - float(left) for left, right in itertools.pairwise(values)]
+    tolerance = 1e-9 * max(1.0, *(abs(value) for value in values))
+    if max(deltas) - min(deltas) > tolerance:
+        return None
+    return {
+        "startup_cycles_at_trip_count_1": float(values[0]),
+        "steady_state_cycles_per_additional_iteration": statistics.mean(deltas),
+    }
+
+
+def _branch_scenario_key(choices: Mapping[str | int, Any]) -> tuple[tuple[int, bool], ...]:
+    """Return a stable key for one structured branch scenario."""
+    normalized: list[tuple[int, bool]] = []
+    for branch, value in choices.items():
+        if isinstance(branch, str) and branch.isdigit():
+            branch = int(branch)
+        if not isinstance(branch, int) or not isinstance(value, bool):
+            raise ValueError(f"invalid branch scenario choice {branch!r}={value!r}")
+        normalized.append((branch, value))
+    return tuple(sorted(normalized))
+
+
+def _scenario_makespans(result: Mapping[str, Any]) -> dict[tuple[tuple[int, bool], ...], float]:
+    """Index one concrete-loop score by the branch choices that produced it."""
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise ValueError("concrete schedule score has no branch scenarios")
+    indexed: dict[tuple[tuple[int, bool], ...], float] = {}
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping):
+            raise ValueError("branch scenario must be an object")
+        choices = scenario.get("branch_choices")
+        makespan = scenario.get("full_makespan_cycles")
+        if not isinstance(choices, Mapping) or not isinstance(makespan, (int, float)):
+            raise ValueError("branch scenario is missing choices or makespan")
+        key = _branch_scenario_key(choices)
+        if key in indexed:
+            raise ValueError(f"duplicate branch scenario {key}")
+        indexed[key] = float(makespan)
+    return indexed
+
+
+def _scenario_extension_rows(base: Mapping[str, Any], complete: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Compare base and placement makespans under identical branch choices."""
+    base_spans = _scenario_makespans(base)
+    complete_spans = _scenario_makespans(complete)
+    if base_spans.keys() != complete_spans.keys():
+        raise ValueError("base and placement expose different branch scenarios")
+    return [
+        {
+            "branch_choices": {str(branch): value for branch, value in key},
+            "base_makespan_cycles": base_spans[key],
+            "placement_makespan_cycles": complete_spans[key],
+            "critical_path_extension_cycles": max(0.0, complete_spans[key] - base_spans[key]),
+        }
+        for key in sorted(base_spans)
+    ]
+
+
+def _profile_dominance(first: Sequence[Mapping[str, Any]], second: Sequence[Mapping[str, Any]]) -> int | None:
+    """Compare fitted affine branch/loop profiles for every modeled ``N >= 1``.
+
+    Returns ``-1`` when ``first`` is never worse and is strictly better for at
+    least one scenario/trip count, ``1`` for the reverse relation, ``0`` for an
+    exact tie, and ``None`` when the ordering depends on the branch or trip
+    count under the fitted affine model. No branch frequency or runtime loop
+    count is guessed. The caller remains responsible for reporting that the
+    affine form was observed over the finite probe range rather than proved
+    for the unbounded concrete expansion.
+    """
+
+    def index(
+        rows: Sequence[Mapping[str, Any]],
+    ) -> dict[tuple[tuple[int, bool], ...], tuple[float, float]]:
+        result: dict[tuple[tuple[int, bool], ...], tuple[float, float]] = {}
+        for row in rows:
+            choices = row.get("branch_choices", {})
+            if not isinstance(choices, Mapping):
+                raise ValueError("placement profile has invalid branch choices")
+            startup = row.get("startup_cycles_at_trip_count_1")
+            steady = row.get("steady_state_cycles_per_additional_iteration")
+            if not isinstance(startup, (int, float)) or not isinstance(steady, (int, float)):
+                raise ValueError("placement profile is missing affine coefficients")
+            result[_branch_scenario_key(choices)] = (float(startup), float(steady))
+        return result
+
+    first_index = index(first)
+    second_index = index(second)
+    if first_index.keys() != second_index.keys():
+        raise ValueError("placement profiles expose different branch scenarios")
+    first_never_worse = True
+    second_never_worse = True
+    first_strict = False
+    second_strict = False
+    for key in first_index:
+        first_startup, first_steady = first_index[key]
+        second_startup, second_steady = second_index[key]
+        startup_delta = first_startup - second_startup
+        steady_delta = first_steady - second_steady
+        # An affine delta is <= 0 for every integer N >= 1 iff both its value
+        # at N=1 and its slope are <= 0.  The reverse condition is symmetric.
+        if startup_delta > 1e-9 or steady_delta > 1e-9:
+            first_never_worse = False
+        elif startup_delta < -1e-9 or steady_delta < -1e-9:
+            first_strict = True
+        if startup_delta < -1e-9 or steady_delta < -1e-9:
+            second_never_worse = False
+        elif startup_delta > 1e-9 or steady_delta > 1e-9:
+            second_strict = True
+    if first_never_worse and first_strict:
+        return -1
+    if second_never_worse and second_strict:
+        return 1
+    if first_never_worse and second_never_worse:
+        return 0
+    return None
+
+
+def compare_complete_placement_dag_scores(
+    first: Mapping[str, Any], second: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Compare two placement scores without guessing runtime control values.
+
+    The result is suitable for frozen model evaluation: ``direction`` is -1
+    when ``first`` has a lower extension for every structured branch and every
+    dynamic trip count under the fitted affine model, +1 for the reverse, 0
+    for a tie, and ``None`` when the ordering depends on runtime control flow.
+    Dynamic-loop comparisons are explicitly labelled as relying on the affine
+    extrapolation observed at trip counts one through four.
+    """
+    first_status = first.get("status")
+    second_status = second.get("status")
+    supported_statuses = {"COMPLETE", "PARAMETRIC_ASSUMPTION"}
+    if first_status not in supported_statuses or second_status not in supported_statuses:
+        return {
+            "status": "INCOMPLETE",
+            "direction": None,
+            "reason": "both placement scores must be COMPLETE or PARAMETRIC_ASSUMPTION",
+        }
+    if first_status != second_status:
+        return {
+            "status": "INCOMPLETE",
+            "direction": None,
+            "reason": "placement scores use different completeness contracts",
+        }
+    first_profiles = first.get("critical_path_extension_profiles")
+    second_profiles = second.get("critical_path_extension_profiles")
+    if not isinstance(first_profiles, list) or not isinstance(second_profiles, list):
+        raise ValueError("complete-placement score has no branch/loop extension profiles")
+    direction = _profile_dominance(first_profiles, second_profiles)
+    parametric = first_status == "PARAMETRIC_ASSUMPTION"
+    return {
+        "status": (
+            "ORDERED_UNDER_PARAMETRIC_ASSUMPTION"
+            if parametric and direction is not None
+            else "RUNTIME_CONTROL_DEPENDENT_UNDER_PARAMETRIC_ASSUMPTION"
+            if parametric
+            else "ORDERED"
+            if direction is not None
+            else "RUNTIME_CONTROL_DEPENDENT"
+        ),
+        "direction": direction,
+        "ordering_contract": ("all_structured_branches_and_affine_extrapolation_after_exact_N1_to_N4_probes"),
+        **(
+            {"parametric_assumption": "affine_extension_beyond_exact_trip_count_probes_1_to_4"}
+            if parametric
+            else {}
+        ),
+    }
+
+
+def score_complete_placement_dag(  # noqa: PLR0912 - explicit evidence and model gates
     record: Mapping[str, Any],
     model: DurationModel,
     candidate_scores: Mapping[str, Any],
@@ -3788,9 +5121,16 @@ def score_complete_placement_dag(
     SSA/allocation roots and fixed per-pipe order. Every unique distance-zero
     and loop-carried edge induced by ``realized_placement`` is then added at
     once with ``model.sync_latency_cycles``. The result is one finite,
-    statically expanded longest-path calculation rather than a sum of
-    singleton buffer-pair penalties.
+    longest-path calculation rather than a sum of singleton buffer-pair
+    penalties. Structured branches are scored as explicit path scenarios.
+    Dynamic loops proven to share one raw-PTO bound are represented by one
+    affine startup/steady-state parameter when four concrete probes agree with
+    that form; no runtime trip count is guessed. This is an explicitly labeled
+    extrapolation model, not a proof that an arbitrary max-plus graph remains
+    affine beyond the probe range. Independent dynamic parameters fail closed
+    rather than being conflated.
     """
+    model_version = "complete_placement_dag_v5"
     if candidate_scores.get("schema_version") != 2:
         raise ValueError("complete placement scoring requires candidate score schema_version=2")
     reference_record = copy.deepcopy(dict(record))
@@ -3802,9 +5142,32 @@ def score_complete_placement_dag(
     if incomplete_reference:
         return {
             "schema_version": 1,
-            "model_version": "complete_placement_dag_v2",
+            "model_version": model_version,
             "status": "INCOMPLETE",
             "limitations": incomplete_reference,
+            "critical_path_extension_cycles": None,
+        }
+    loop_variant_branches = [
+        int(node["id"])
+        for node in reference_record.get("nodes", [])
+        if isinstance(node, Mapping)
+        and node.get("kind") == "branch"
+        and node.get("branch_kind") == "IF_BEGIN"
+        and node.get("loop_stack")
+        and node.get("predicate_loop_invariant") is not True
+        and not isinstance(node.get("predicate_iteration_profile"), Mapping)
+        and isinstance(node.get("id"), int)
+    ]
+    if loop_variant_branches:
+        limitations = ["loop_variant_branch_profile_not_supported_v1"]
+        if not realized_placement.get("synchronization_predictor_coverage_complete", False):
+            limitations.append("unmodeled_pipeline_serialization")
+        return {
+            "schema_version": 1,
+            "model_version": model_version,
+            "status": "INCOMPLETE",
+            "limitations": limitations,
+            "loop_variant_branch_nodes": loop_variant_branches,
             "critical_path_extension_cycles": None,
         }
     missing_contracts = []
@@ -3815,7 +5178,7 @@ def score_complete_placement_dag(
     if missing_contracts:
         return {
             "schema_version": 1,
-            "model_version": "complete_placement_dag_v2",
+            "model_version": model_version,
             "status": "INCOMPLETE",
             "limitations": missing_contracts,
             "critical_path_extension_cycles": None,
@@ -3826,7 +5189,7 @@ def score_complete_placement_dag(
     if not realized_placement.get("synchronization_predictor_coverage_complete", False):
         return {
             "schema_version": 1,
-            "model_version": "complete_placement_dag_v2",
+            "model_version": model_version,
             "status": "INCOMPLETE",
             "limitations": ["unmodeled_pipeline_serialization"],
             "critical_path_extension_cycles": None,
@@ -3862,41 +5225,203 @@ def score_complete_placement_dag(
             f"loop={sorted(missing_loop)[:8]}"
         )
 
-    operation_durations, _, dynamic_loops = estimate_node_durations(reference_record, model)
-    if dynamic_loops:
-        raise ValueError(
-            "complete_placement_dag_v2 requires statically bounded loops; "
-            f"dynamic loop nodes: {dynamic_loops[:8]}"
-        )
+    _, _, dynamic_loops = estimate_node_durations(reference_record, model)
+    try:
+        dynamic_loop_groups = _dynamic_loop_parameter_groups(reference_record, dynamic_loops)
+    except ValueError as error:
+        return {
+            "schema_version": 1,
+            "model_version": model_version,
+            "status": "INCOMPLETE",
+            "limitations": ["dynamic_loop_parameter_identity_missing"],
+            "dynamic_loop_ids": dynamic_loops,
+            "detail": str(error),
+            "critical_path_extension_cycles": None,
+        }
+    if len(dynamic_loop_groups) > 1:
+        return {
+            "schema_version": 1,
+            "model_version": model_version,
+            "status": "INCOMPLETE",
+            "limitations": ["independent_dynamic_loop_parameters_not_supported_v1"],
+            "dynamic_loop_ids": dynamic_loops,
+            "dynamic_loop_groups": dynamic_loop_groups,
+            "critical_path_extension_cycles": None,
+        }
     selected_distance_zero = [dict(distance_zero_catalog[key]) for key in sorted(distance_zero_keys)]
     selected_loop = [dict(loop_catalog[key]) for key in sorted(loop_keys)]
     for edge in selected_distance_zero:
         edge["synchronization_latency_cycles"] = model.sync_latency_cycles
     for edge in selected_loop:
         edge["synchronization_latency_cycles"] = model.sync_latency_cycles
-    base = _static_dependency_makespan(reference_record, operation_durations, model.sync_latency_cycles)
     augmented = _schedule_with_realized_candidate_edges(
         reference_record, selected_distance_zero, selected_loop
     )
+    if dynamic_loops:
+        parameter_identity, loop_ids = next(iter(dynamic_loop_groups.items()))
+        probes: list[dict[str, Any]] = []
+        for trip_count in range(1, 5):
+            concrete_base = _with_concrete_dynamic_trip_count(reference_record, loop_ids, trip_count)
+            concrete_placement = _with_concrete_dynamic_trip_count(augmented, loop_ids, trip_count)
+            operation_durations, _, unresolved = estimate_node_durations(concrete_base, model)
+            if unresolved:
+                raise ValueError(f"dynamic-loop concretization left unresolved loops: {unresolved}")
+            base_probe = _static_dependency_makespan(
+                concrete_base, operation_durations, model.sync_latency_cycles
+            )
+            complete_probe = _static_dependency_makespan(
+                concrete_placement, operation_durations, model.sync_latency_cycles
+            )
+            scenario_extensions = _scenario_extension_rows(base_probe, complete_probe)
+            probes.append(
+                {
+                    "trip_count": trip_count,
+                    "branch_scenarios": scenario_extensions,
+                }
+            )
+        scenario_keys = [_branch_scenario_key(row["branch_choices"]) for row in probes[0]["branch_scenarios"]]
+        profiles: list[dict[str, Any]] = []
+        for scenario_index, scenario_key in enumerate(scenario_keys):
+            scenario_probes = [probe["branch_scenarios"][scenario_index] for probe in probes]
+            if any(_branch_scenario_key(row["branch_choices"]) != scenario_key for row in scenario_probes):
+                raise ValueError("dynamic loop probes changed branch-scenario order")
+            base_profile = _fit_affine_trip_profile(
+                [float(row["base_makespan_cycles"]) for row in scenario_probes]
+            )
+            placement_profile = _fit_affine_trip_profile(
+                [float(row["placement_makespan_cycles"]) for row in scenario_probes]
+            )
+            extension_profile = _fit_affine_trip_profile(
+                [float(row["critical_path_extension_cycles"]) for row in scenario_probes]
+            )
+            if extension_profile is None:
+                return {
+                    "schema_version": 1,
+                    "model_version": model_version,
+                    "status": "INCOMPLETE",
+                    "limitations": ["dynamic_loop_latency_not_affine_over_trip_counts_1_to_4"],
+                    "dynamic_loop_ids": dynamic_loops,
+                    "dynamic_loop_groups": dynamic_loop_groups,
+                    "dynamic_loop_probes": probes,
+                    "critical_path_extension_cycles": None,
+                }
+            profiles.append(
+                {
+                    "branch_choices": {str(branch): value for branch, value in scenario_key},
+                    "base_makespan_affine": base_profile,
+                    "placement_makespan_affine": placement_profile,
+                    **extension_profile,
+                }
+            )
+        if any(
+            profile["startup_cycles_at_trip_count_1"] < -1e-9
+            or profile["steady_state_cycles_per_additional_iteration"] < -1e-9
+            for profile in profiles
+        ):
+            return {
+                "schema_version": 1,
+                "model_version": model_version,
+                "status": "INCOMPLETE",
+                "limitations": ["dynamic_loop_extension_not_monotone_nonnegative"],
+                "dynamic_loop_ids": dynamic_loops,
+                "dynamic_loop_groups": dynamic_loop_groups,
+                "dynamic_loop_probes": probes,
+                "critical_path_extension_cycles": None,
+            }
+        additive_cycles = float(realized_placement.get("critical_path_realized_cost_cycles", 0.0))
+        one_profile = profiles[0] if len(profiles) == 1 else None
+        return {
+            "schema_version": 1,
+            "model_version": model_version,
+            "status": "PARAMETRIC_ASSUMPTION",
+            "reference_graph_contract": "non_reusing_logical_ssa_memory_plus_fixed_pipe_order",
+            "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+            "loop_policy": "correlated_dynamic_loop_affine_probe_model_v1",
+            "branch_policy": "exact_static_induction_profiles_plus_symbolic_path_extremes",
+            "insert_sync_policy": "not_consulted",
+            "synchronization_latency_cycles": model.sync_latency_cycles,
+            "dynamic_loop_ids": dynamic_loops,
+            "dynamic_loop_groups": dynamic_loop_groups,
+            "dynamic_trip_count_identity": parameter_identity,
+            "dynamic_trip_count_symbol": (
+                f"N{loop_ids[0]}"
+                if parameter_identity.startswith("legacy-loop-id:")
+                else f"N_{parameter_identity.removeprefix('loop-trip-v1:')[:12]}"
+            ),
+            "dynamic_loop_probes": probes,
+            "dynamic_loop_probe_trip_counts": [1, 2, 3, 4],
+            "parametric_assumption": ("placement_extension_affine_beyond_exact_trip_count_probes_1_to_4"),
+            "critical_path_extension_profiles": profiles,
+            "critical_path_extension_affine": (
+                {
+                    "startup_cycles_at_trip_count_1": one_profile["startup_cycles_at_trip_count_1"],
+                    "steady_state_cycles_per_additional_iteration": one_profile[
+                        "steady_state_cycles_per_additional_iteration"
+                    ],
+                }
+                if one_profile is not None
+                else None
+            ),
+            "parametric_ranking_key": (
+                [
+                    one_profile["steady_state_cycles_per_additional_iteration"],
+                    one_profile["startup_cycles_at_trip_count_1"],
+                ]
+                if one_profile is not None
+                else None
+            ),
+            "parametric_ranking_order": ("branch_dominance_under_fitted_affine_model_for_N_ge_1"),
+            "critical_path_extension_cycles": None,
+            "pairwise_additive_cost_cycles": additive_cycles,
+            "nonadditive_interaction_cycles": None,
+            "realized_distance_zero_edge_count": len(selected_distance_zero),
+            "realized_loop_carried_edge_count": len(selected_loop),
+            "distance_zero_edges": [
+                [int(edge["source_node"]), int(edge["target_node"])] for edge in selected_distance_zero
+            ],
+            "loop_carried_edges": [
+                [int(edge["loop_node"]), int(edge["source_node"]), int(edge["target_node"])]
+                for edge in selected_loop
+            ],
+        }
+
+    operation_durations, _, unresolved = estimate_node_durations(reference_record, model)
+    if unresolved:
+        raise ValueError(f"unexpected unresolved loops: {unresolved}")
+    base = _static_dependency_makespan(reference_record, operation_durations, model.sync_latency_cycles)
     complete = _static_dependency_makespan(augmented, operation_durations, model.sync_latency_cycles)
+    scenario_extensions = _scenario_extension_rows(base, complete)
     base_cycles = float(base["full_makespan_cycles"])
     complete_cycles = float(complete["full_makespan_cycles"])
     additive_cycles = float(realized_placement.get("critical_path_realized_cost_cycles", 0.0))
-    extension = max(0.0, complete_cycles - base_cycles)
+    extensions = [float(row["critical_path_extension_cycles"]) for row in scenario_extensions]
+    extension = extensions[0] if len(set(extensions)) == 1 else None
+    profiles = [
+        {
+            "branch_choices": row["branch_choices"],
+            "startup_cycles_at_trip_count_1": row["critical_path_extension_cycles"],
+            "steady_state_cycles_per_additional_iteration": 0.0,
+        }
+        for row in scenario_extensions
+    ]
     return {
         "schema_version": 1,
-        "model_version": "complete_placement_dag_v2",
+        "model_version": model_version,
         "status": "COMPLETE",
         "reference_graph_contract": "non_reusing_logical_ssa_memory_plus_fixed_pipe_order",
         "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
         "loop_policy": "finite_static_expansion",
+        "branch_policy": "exact_static_induction_profiles_plus_symbolic_path_extremes",
         "insert_sync_policy": "not_consulted",
         "synchronization_latency_cycles": model.sync_latency_cycles,
         "base_makespan_cycles": base_cycles,
         "placement_makespan_cycles": complete_cycles,
         "critical_path_extension_cycles": extension,
+        "critical_path_extension_range_cycles": [min(extensions), max(extensions)],
+        "critical_path_extension_profiles": profiles,
+        "branch_scenario_extensions": scenario_extensions,
         "pairwise_additive_cost_cycles": additive_cycles,
-        "nonadditive_interaction_cycles": extension - additive_cycles,
+        "nonadditive_interaction_cycles": (extension - additive_cycles if extension is not None else None),
         "realized_distance_zero_edge_count": len(selected_distance_zero),
         "realized_loop_carried_edge_count": len(selected_loop),
         "expanded_node_count": complete["expanded_node_count"],
@@ -4057,6 +5582,10 @@ def score_realized_reuse(
         for row in realized
         if not row.get("distance_zero_schedule_edges") and not row.get("loop_carried_schedule_edges")
     ]
+    realized_by_penalty_reason = Counter(str(row.get("penalty_reason", "unspecified")) for row in realized)
+    executable_realized_by_penalty_reason = Counter(
+        str(row.get("penalty_reason", "unspecified")) for row in executable_realized
+    )
     result = {
         "schema_version": 2,
         "model_version": candidate_scores.get("model_version"),
@@ -4064,8 +5593,12 @@ def score_realized_reuse(
         "solution": str(solution_source),
         "promoted_pair_count": len(rows),
         "realized_pair_count": len(realized),
+        "realized_pair_count_by_penalty_reason": dict(sorted(realized_by_penalty_reason.items())),
         "canonical_physical_reuse_group_count": len(physical_groups),
         "executable_realized_pair_count": len(executable_realized),
+        "executable_realized_pair_count_by_penalty_reason": dict(
+            sorted(executable_realized_by_penalty_reason.items())
+        ),
         "executable_canonical_physical_reuse_group_count": len(executable_physical_groups),
         "synchronization_predictor_coverage_complete": not unmodeled_pipeline_realized,
         "unmodeled_pipeline_serialization_realized_pair_count": len(unmodeled_pipeline_realized),
@@ -4099,7 +5632,7 @@ def score_realized_reuse(
     return result
 
 
-def score_reuse_candidates(
+def score_reuse_candidates(  # noqa: PLR0912, PLR0915 - explicit provenance and fail-closed gates
     record: Mapping[str, Any],
     candidates: Sequence[ReuseCandidateRecord],
     model: DurationModel,
@@ -4126,22 +5659,9 @@ def score_reuse_candidates(
     synchronization edge, but their logical unit penalty remains visible for
     comparisons with the solver objective.
     """
-    branch_ids = [
-        node.get("id")
-        for node in record.get("nodes", [])
-        if isinstance(node, Mapping) and node.get("kind") == "branch"
-    ]
-    if branch_ids:
-        raise ValueError(
-            "candidate_v1 does not lift conditional access endpoints to branch joins; "
-            "score complete post-InsertSync arm schedules for a signed marginal instead; "
-            f"branch nodes: {branch_ids[:8]}"
-        )
+    branch_ids, branch_markers = _branch_alternatives(record)
+    branch_profiles = _branch_iteration_profiles(record)
     operation_durations, provenance, dynamic_loops = estimate_node_durations(record, model)
-    if dynamic_loops:
-        raise ValueError(
-            f"duration_v0 requires statically bounded loops; dynamic loop nodes: {dynamic_loops[:8]}"
-        )
     prepared_record = _prepare_control_flow_record(record)
     durations = _schedule_graph_durations(prepared_record, operation_durations)
     node_ids = set(durations)
@@ -4162,6 +5682,14 @@ def score_reuse_candidates(
         node["id"]: node
         for node in record.get("nodes", [])
         if isinstance(node, Mapping) and node.get("kind") == "operation" and isinstance(node.get("id"), int)
+    }
+    loops_by_id = {
+        node["id"]: node
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping)
+        and node.get("kind") == "loop"
+        and node.get("loop_kind") == "LOOP_BEGIN"
+        and isinstance(node.get("id"), int)
     }
     execution_counts, _ = _node_execution_counts(record)
     actual_sync_groups_by_edge: dict[tuple[int, int], list[int]] = defaultdict(list)
@@ -4193,6 +5721,7 @@ def score_reuse_candidates(
             nodes_by_id,
             materialized_access_orders,
             known_nonmaterialized_access_orders,
+            _schedule_proves_complete_access_provenance(record),
         )
         if isinstance(joined_sites, dict):
             rows.append(joined_sites)
@@ -4209,23 +5738,84 @@ def score_reuse_candidates(
         next_route_pipe = _route_pipe(candidate.next_route)
         source = prior_nodes[-1]
         target = next_nodes[0]
+        branch_requirements = _combined_branch_requirements(
+            nodes_by_id[source], nodes_by_id[target], branch_markers
+        )
         if candidate.loop_carried:
             source_loop_stack = nodes_by_id[source].get("loop_stack", [])
             target_loops = set(nodes_by_id[target].get("loop_stack", []))
             common_loops = [loop for loop in source_loop_stack if loop in target_loops]
-            if not common_loops:
+            explicitly_identified = [
+                loop
+                for loop in common_loops
+                if loops_by_id.get(loop, {}).get("pypto_source_loop_id") == candidate.source_loop_id
+            ]
+            loops_with_source_identity = [
+                loop
+                for loop in common_loops
+                if isinstance(loops_by_id.get(loop, {}).get("pypto_source_loop_id"), int)
+            ]
+            if explicitly_identified:
+                resolved_loops = explicitly_identified
+            elif not loops_with_source_identity and len(common_loops) == 1:
+                # Backward-compatible schedules can still prove an unambiguous
+                # single-loop recurrence without relying on positional ids.
+                resolved_loops = common_loops
+            else:
+                resolved_loops = []
+            if len(resolved_loops) != 1:
                 raise ValueError(
-                    f"loop-carried candidate {index} sites do not share a PTOAS loop: edge {source}->{target}"
+                    f"loop-carried candidate {index} does not resolve to exactly one lowered loop; "
+                    "the original-loop identity was not preserved through lowering: "
+                    f"edge {source}->{target}, source_loops={source_loop_stack}, "
+                    f"target_loops={sorted(target_loops)}, source_loop_id={candidate.source_loop_id}, "
+                    f"matching_lowered_loops={explicitly_identified}"
                 )
-            recurrence = _loop_recurrence_score(
-                prepared_record,
-                operation_durations,
-                existing_edges,
-                loop_id=common_loops[-1],
-                source=source,
-                target=target,
-                candidate_latency=model.sync_latency_cycles,
+            recurrence_loop = resolved_loops[0]
+            source_requirements = _node_branch_requirements(nodes_by_id[source], branch_markers)
+            target_requirements = _node_branch_requirements(nodes_by_id[target], branch_markers)
+            contradictory_branches = {
+                branch
+                for branch, value in source_requirements.items()
+                if branch in target_requirements and target_requirements[branch] != value
+            }
+            occurrence_profiled = bool(contradictory_branches) and contradictory_branches <= set(
+                branch_profiles
             )
+            if branch_requirements is None and not occurrence_profiled:
+                raise ValueError(
+                    f"loop-carried candidate {index} crosses mutually exclusive branch arms; "
+                    "occurrence-aware source/target branch provenance is required: "
+                    f"edge {source}->{target}, loop={recurrence_loop}"
+                )
+            branch_predicate = (
+                {str(branch): value for branch, value in sorted(branch_requirements.items())}
+                if branch_requirements is not None
+                else {}
+            )
+            if occurrence_profiled:
+                recurrence = _exact_profiled_loop_candidate_score(
+                    record,
+                    operation_durations,
+                    loop_id=recurrence_loop,
+                    source=source,
+                    target=target,
+                    source_pipe=prior_pipe,
+                    target_pipe=next_pipe,
+                    synchronization_latency_cycles=model.sync_latency_cycles,
+                )
+                recurrence_status = "loop_carried_occurrence_profiled_v2"
+            else:
+                recurrence = _loop_recurrence_score(
+                    prepared_record,
+                    operation_durations,
+                    existing_edges,
+                    loop_id=recurrence_loop,
+                    source=source,
+                    target=target,
+                    candidate_latency=model.sync_latency_cycles,
+                )
+                recurrence_status = "loop_carried_scored_v1"
             rows.append(
                 {
                     "candidate_index": index,
@@ -4251,11 +5841,36 @@ def score_reuse_candidates(
                     "source_macro_nodes": prior_nodes,
                     "target_macro_nodes": next_nodes,
                     "common_loop_nodes": common_loops,
-                    "status": "loop_carried_scored_v1",
+                    "source_loop_id": candidate.source_loop_id,
+                    "resolved_recurrence_loop_node": recurrence_loop,
+                    "branch_predicate": branch_predicate,
+                    "occurrence_profiled_branch_ids": sorted(contradictory_branches),
+                    "status": recurrence_status,
                     **recurrence,
                 }
             )
             continue
+        if branch_requirements is None:
+            rows.append(
+                {
+                    "candidate_index": index,
+                    "first_buffer": candidate.first_buffer,
+                    "second_buffer": candidate.second_buffer,
+                    "prior_buffer": candidate.prior_buffer,
+                    "next_buffer": candidate.next_buffer,
+                    "prior_access_order": candidate.prior_access_order,
+                    "next_access_order": candidate.next_access_order,
+                    "prior_route_pipe": prior_route_pipe,
+                    "next_route_pipe": next_route_pipe,
+                    "source_node": source,
+                    "target_node": target,
+                    "status": "mutually_exclusive_branch_sites",
+                    "branch_predicate": None,
+                    "weight_cycles": 0.0,
+                }
+            )
+            continue
+        branch_predicate = {str(branch): value for branch, value in sorted(branch_requirements.items())}
         hypothetical = (source, target, model.sync_latency_cycles, "candidate_sync", index)
         try:
             with_candidate, forward, backward, path = _longest_path(
@@ -4292,6 +5907,7 @@ def score_reuse_candidates(
                 "actual_sync_group_ids": sorted(actual_sync_groups_by_edge[(source, target)]),
                 "source_macro_nodes": prior_nodes,
                 "target_macro_nodes": next_nodes,
+                "branch_predicate": branch_predicate,
                 "status": "scored",
                 "weight_cycles": weight,
                 "makespan_with_candidate_cycles": with_candidate,
@@ -4300,6 +5916,14 @@ def score_reuse_candidates(
                 "critical_path_with_candidate": path,
             }
         )
+
+    for row in rows:
+        candidate_index = row.get("candidate_index")
+        if not isinstance(candidate_index, int) or not 0 <= candidate_index < len(candidates):
+            raise ValueError("candidate score row has no valid source candidate index")
+        candidate_penalty_reason = candidates[candidate_index].penalty_reason
+        if candidate_penalty_reason != "reuse_recognizer":
+            row["candidate_penalty_reason"] = candidate_penalty_reason
 
     consumer_groups: list[dict[str, Any]] = []
     for target, edges in sorted(grouped_edges.items()):
@@ -4348,10 +5972,18 @@ def score_reuse_candidates(
     baseline_loop_sync_models = _existing_loop_sync_models(
         prepared_record, operation_durations, existing_edges, model.sync_latency_cycles
     )
+    if dynamic_loops:
+        pre_codegen_summary: dict[str, Any] = {
+            "status": "PARAMETRIC_DYNAMIC_LOOP",
+            "dynamic_loop_ids": dynamic_loops,
+            "detail": "static execution totals are intentionally not fabricated",
+        }
+    else:
+        pre_codegen_summary = _pre_codegen_sync_record_summary(record)
 
     return {
         "schema_version": 2,
-        "model_version": "reuse_penalty_critical_path_v1",
+        "model_version": "reuse_penalty_critical_path_v2",
         "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
         "sync_endpoint_estimator_version": "uncoalesced_source_plus_target_static_executions_v1",
         "function": record.get("function", "<unknown>"),
@@ -4360,17 +5992,25 @@ def score_reuse_candidates(
         "base_makespan_cycles": base_makespan,
         "base_critical_path": base_path,
         "dynamic_loop_ids": dynamic_loops,
+        "branch_node_ids": branch_ids,
+        "branch_edge_policy": "endpoint_predicate_intersection_v1",
         "loop_sync_model_version": "loop_sync_ii_and_boundary_v1",
         "baseline_loop_sync_models": baseline_loop_sync_models,
         **edge_diagnostics,
         **_latency_graph_completeness(prepared_record, edge_diagnostics, baseline_loop_sync_models),
         "candidate_count": len(candidates),
         "scored_candidate_count": sum(
-            row.get("status") in {"scored", "loop_carried_scored_v1"} for row in rows
+            row.get("status")
+            in {"scored", "loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}
+            for row in rows
         ),
         "scored_distance_zero_candidate_count": sum(row.get("status") == "scored" for row in rows),
         "scored_loop_carried_candidate_count": sum(
-            row.get("status") == "loop_carried_scored_v1" for row in rows
+            row.get("status") in {"loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}
+            for row in rows
+        ),
+        "occurrence_profiled_loop_carried_candidate_count": sum(
+            row.get("status") == "loop_carried_occurrence_profiled_v2" for row in rows
         ),
         "unscored_loop_carried_candidate_count": 0,
         "not_materialized_candidate_count": sum(
@@ -4385,7 +6025,7 @@ def score_reuse_candidates(
         "loop_recurrence_edges": loop_edge_groups,
         "penalty_pair_weights": penalty_pair_weights,
         "candidate_weight_summary": weight_summary,
-        "baseline_pre_codegen_sync_record_summary": _pre_codegen_sync_record_summary(record),
+        "baseline_pre_codegen_sync_record_summary": pre_codegen_summary,
         "node_durations": {str(node): value for node, value in sorted(provenance.items())},
     }
 
@@ -5430,6 +7070,11 @@ def score_post_insert_sync_marginal(
 def _queue_event_signed_marginal(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
     """Compare matching branch extremes of two queue/event scores."""
 
+    baseline_mixed = bool(baseline.get("mixed_iteration_branch_profile_available"))
+    candidate_mixed = bool(candidate.get("mixed_iteration_branch_profile_available"))
+    if baseline_mixed != candidate_mixed:
+        raise ValueError("planner arms disagree on mixed-iteration branch-profile availability")
+
     def by_choice(score: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
         scenarios = score.get("scenarios")
         if not isinstance(scenarios, list) or not scenarios:
@@ -5479,7 +7124,7 @@ def _queue_event_signed_marginal(baseline: Mapping[str, Any], candidate: Mapping
     return {
         "model_version": "static_unrolled_pipe_event_branch_extremes_v2",
         "pipeline_break_model_complete": complete,
-        "mixed_iteration_branch_profile_available": False,
+        "mixed_iteration_branch_profile_available": baseline_mixed,
         "minimum_delta_cycles": minimum,
         "maximum_delta_cycles": maximum,
         "direction_conclusion": conclusion,
@@ -5491,6 +7136,24 @@ def _queue_drain_restart_signed_marginal(
     baseline: Mapping[str, Any], candidate: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Compare only changed barrier sites, allowing a signed marginal cost."""
+
+    if baseline.get("status", "COMPLETE") != "COMPLETE" or candidate.get("status", "COMPLETE") != "COMPLETE":
+        limitations = sorted(
+            {
+                str(limitation)
+                for score in (baseline, candidate)
+                for limitation in score.get("limitations", [])
+            }
+        )
+        return {
+            "model_version": "queue_drain_successor_restart_signed_marginal_v1",
+            "complete": False,
+            "limitations": limitations or ["queue_drain_restart_model_incomplete"],
+            "minimum_delta_cycles": None,
+            "maximum_delta_cycles": None,
+            "direction_conclusion": "QUEUE_DRAIN_RESTART_MODEL_INCOMPLETE",
+            "scenarios": [],
+        }
 
     def scenarios_by_choice(score: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
         result: dict[str, Mapping[str, Any]] = {}
@@ -5937,6 +7600,55 @@ def _hashed_input(path: Path) -> dict[str, str]:
     }
 
 
+def _add_runtime_branch_profile_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--runtime-branch-profile",
+        type=Path,
+        help="exact digest-bound per-occurrence branch profile",
+    )
+    parser.add_argument(
+        "--runtime-input-manifest",
+        type=Path,
+        help="captured input manifest bound by --runtime-branch-profile",
+    )
+    parser.add_argument(
+        "--runtime-trip-metadata",
+        type=Path,
+        help="captured loop-trip metadata bound by --runtime-branch-profile",
+    )
+
+
+def _apply_runtime_profile_from_args(
+    args: argparse.Namespace,
+    record: Mapping[str, Any],
+    *,
+    schedule_path: Path,
+    problem_path: Path,
+) -> dict[str, Any]:
+    profile_path = getattr(args, "runtime_branch_profile", None)
+    input_manifest = getattr(args, "runtime_input_manifest", None)
+    trip_metadata = getattr(args, "runtime_trip_metadata", None)
+    supplied = [profile_path is not None, input_manifest is not None, trip_metadata is not None]
+    if not any(supplied):
+        return dict(record)
+    if not all(supplied):
+        raise ValueError(
+            "runtime branch specialization requires --runtime-branch-profile, "
+            "--runtime-input-manifest, and --runtime-trip-metadata together"
+        )
+    payload = json.loads(profile_path.read_text())
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{profile_path}: runtime branch profile must be an object")
+    return apply_runtime_branch_profile(
+        record,
+        payload,
+        schedule_sha256=hashlib.sha256(schedule_path.read_bytes()).hexdigest(),
+        problem_sha256=hashlib.sha256(problem_path.read_bytes()).hexdigest(),
+        input_set_sha256=hashlib.sha256(input_manifest.read_bytes()).hexdigest(),
+        trip_metadata_sha256=hashlib.sha256(trip_metadata.read_bytes()).hexdigest(),
+    )
+
+
 def _duration_model_provenance(model: DurationModel) -> dict[str, Any]:
     snapshot = model.to_json()
     canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -5990,6 +7702,12 @@ def _run_direct_model_command(args: argparse.Namespace) -> bool:
         return True
     if args.command == "score-realized-grid":
         record, function = _resolve_schedule_record(args.schedule, args.function)
+        record = _apply_runtime_profile_from_args(
+            args,
+            record,
+            schedule_path=args.schedule,
+            problem_path=args.problem,
+        )
         raw_weights = [item.strip() for item in args.sync_latency_grid.split(",")]
         try:
             weights = sorted({float(item) for item in raw_weights if item})
@@ -6055,6 +7773,16 @@ def _run_direct_model_command(args: argparse.Namespace) -> bool:
                     "unit_realized_cost": realized["unit_realized_cost"],
                     "canonical_physical_reuse_group_count": realized["canonical_physical_reuse_group_count"],
                     "unique_induced_sync_edge_count": realized["unique_induced_sync_edge_count"],
+                    "realized_pair_count": realized["realized_pair_count"],
+                    "realized_pair_count_by_penalty_reason": realized[
+                        "realized_pair_count_by_penalty_reason"
+                    ],
+                    "executable_realized_pair_count_by_penalty_reason": realized[
+                        "executable_realized_pair_count_by_penalty_reason"
+                    ],
+                    "synchronization_predictor_coverage_complete": realized[
+                        "synchronization_predictor_coverage_complete"
+                    ],
                     "score": realized["complete_placement_dag"],
                 }
             )
@@ -6071,6 +7799,21 @@ def _run_direct_model_command(args: argparse.Namespace) -> bool:
                     "nonmaterialized_access_evidence": (
                         _hashed_input(args.nonmaterialized_access_evidence)
                         if args.nonmaterialized_access_evidence is not None
+                        else None
+                    ),
+                    "runtime_branch_profile": (
+                        _hashed_input(args.runtime_branch_profile)
+                        if args.runtime_branch_profile is not None
+                        else None
+                    ),
+                    "runtime_input_manifest": (
+                        _hashed_input(args.runtime_input_manifest)
+                        if args.runtime_input_manifest is not None
+                        else None
+                    ),
+                    "runtime_trip_metadata": (
+                        _hashed_input(args.runtime_trip_metadata)
+                        if args.runtime_trip_metadata is not None
                         else None
                     ),
                     "duration_model_source": (
@@ -6103,6 +7846,7 @@ def _add_score_realized_grid_parser(subparsers: Any) -> None:
     parser.add_argument("--function")
     parser.add_argument("--sync-latency-grid", required=True)
     parser.add_argument("--nonmaterialized-access-evidence", type=Path)
+    _add_runtime_branch_profile_arguments(parser)
     _add_duration_arguments(parser)
     parser.add_argument("-o", "--output", type=Path)
 
@@ -6182,6 +7926,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         help="digest-bound proof for candidate accesses removed before the lowered schedule",
     )
+    _add_runtime_branch_profile_arguments(candidate_parser)
     candidate_parser.add_argument("-o", "--output", type=Path)
 
     rescore_parser = subparsers.add_parser(
@@ -6240,6 +7985,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "score-candidates":
             record, _ = _resolve_schedule_record(args.schedule, args.function)
+            record = _apply_runtime_profile_from_args(
+                args,
+                record,
+                schedule_path=args.schedule,
+                problem_path=args.problem,
+            )
             nonmaterialized_access_orders = _load_nonmaterialized_access_evidence(
                 args.nonmaterialized_access_evidence,
                 schedule_path=args.schedule,
@@ -6254,6 +8005,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 known_nonmaterialized_access_orders=nonmaterialized_access_orders,
                 promoted_penalty_reasons=load_promoted_reuse_penalty_reasons(args.problem),
             )
+            if isinstance(record.get("runtime_branch_profile"), Mapping):
+                result["runtime_branch_profile"] = dict(record["runtime_branch_profile"])
             if args.solution is not None:
                 result["realized_placement"] = score_realized_reuse(
                     args.problem,

@@ -39,6 +39,34 @@ def test_parse_ordered_candidate_with_dependency_witness():
     assert record.dag_path == ("r0s3", "r0s5", "r0s7")
     assert record.prior_access_order == 3
     assert record.next_access_order == 7
+    assert record.penalty_reason == "reuse_recognizer"
+
+
+def test_parse_pipeline_serialization_provenance():
+    record = dsa_reuse_candidates.parse_candidate_record(
+        _record("no_logical_order", "cross_resource", "none") + ",penalty_reason=pipeline_serialization"
+    )
+
+    assert record.penalty_reason == "pipeline_serialization"
+
+
+def test_parse_loop_carried_candidate_preserves_source_loop_identity():
+    raw = _record("no_logical_order", "cross_resource", "none").replace(
+        "distance_0", "distance_1,loop=17"
+    )
+
+    record = dsa_reuse_candidates.parse_candidate_record(raw)
+
+    assert record.loop_carried is True
+    assert record.source_loop_id == 17
+
+
+def test_parse_loop_carried_candidate_requires_source_loop_identity():
+    raw = _record("no_logical_order", "cross_resource", "none").replace(
+        "distance_0", "distance_1"
+    )
+    with pytest.raises(ValueError, match="missing loop identity"):
+        dsa_reuse_candidates.parse_candidate_record(raw)
 
 
 def test_parse_rejects_inconsistent_ordering_evidence():
@@ -91,6 +119,29 @@ def test_main_filters_raw_candidates(tmp_path, capsys):
     assert len(result) == 1
     assert result[0]["hazard"] == "cross_resource"
     assert result[0]["ordered_by_logical_dag"] is True
+
+
+def test_load_prefers_candidate_records_v5(tmp_path):
+    path = tmp_path / "problem.dsa.json"
+    path.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "recognized_reuse_candidates": "0",
+                    "recognized_reuse_candidates_v5": "1",
+                    "recognized_reuse_candidate_records_v4": _record(
+                        "no_logical_order", "same_resource", "none"
+                    ),
+                    "recognized_reuse_candidate_records_v5": _record(
+                        "no_logical_order", "same_resource", "none"
+                    )
+                    + ",penalty_reason=pipeline_serialization",
+                }
+            }
+        )
+    )
+
+    assert dsa_reuse_candidates.load_candidate_records(path)[0].penalty_reason == ("pipeline_serialization")
 
 
 if __name__ == "__main__":

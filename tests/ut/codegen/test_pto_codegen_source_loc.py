@@ -31,7 +31,7 @@ import sys
 
 import pypto.language as pl
 import pytest
-from pypto import backend, codegen, ir
+from pypto import backend, codegen, ir, passes
 from pypto.backend import BackendType
 from pypto.backend.pto_backend import emit_access_provenance_default, emit_source_loc_default
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
@@ -226,6 +226,25 @@ class TestAccessProvenance:
 
     def test_provenance_is_disabled_by_default(self):
         assert "pypto.access." not in _generate(ElementwiseProg)
+
+    def test_dsa_source_loop_identity_reaches_pto(self):
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        with passes.PassContext(
+            [],
+            memory_planner=passes.MemoryPlanner.DSA,
+            dsa_reuse_penalty_recognizer=passes.DsaReusePenaltyRecognizer.QUADRATIC,
+        ):
+            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(ControlFlowProg)
+        func = next(iter(optimized.functions.values()))
+        single = ir.Program([func], func.name, optimized.span)
+
+        with_provenance = codegen.PTOCodegen().generate(single, emit_access_provenance=True)
+        without_provenance = codegen.PTOCodegen().generate(single, emit_access_provenance=False)
+
+        assert "scf.for" in with_provenance
+        assert "// pypto.source_loop.0" in with_provenance
+        assert "pypto.source_loop" not in without_provenance
 
 
 class TestUnknownSpan:

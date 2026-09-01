@@ -854,16 +854,24 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
     conservative_initial_anchors.push_back(conservative_initial_anchor);
   }
 
-  std::set<std::pair<size_t, size_t>> separated;
+  std::set<std::pair<size_t, size_t>> hard_separated;
+  std::set<std::pair<size_t, size_t>> pipeline_only_separated;
   for (const AllocationSeparation& separation : allocation_plan.separations) {
-    separated.insert(std::minmax(separation.first, separation.second));
+    const auto pair = std::minmax(separation.first, separation.second);
+    const bool pipeline_only = !separation.reasons.empty() &&
+                               std::all_of(separation.reasons.begin(), separation.reasons.end(),
+                                           [](AllocationSeparationReason reason) {
+                                             return reason == AllocationSeparationReason::PipelineStage;
+                                           });
+    (pipeline_only ? pipeline_only_separated : hard_separated).insert(pair);
   }
 
   std::set<std::pair<size_t, size_t>> candidate_pairs;
   std::set<std::pair<size_t, size_t>> ordered_pairs;
   auto emit_handoff = [&](size_t prior, size_t next, const AccessEndpoint& terminal,
                           const AccessEndpoint& initial, bool require_adjacent,
-                          std::optional<std::pair<size_t, size_t>> crossed_loop) {
+                          std::optional<std::pair<size_t, size_t>> crossed_loop,
+                          bool pipeline_serialization) {
     const bool loop_carried = crossed_loop.has_value();
     if (!ControlPathsCompatible(terminal, initial,
                                 loop_carried ? std::optional<size_t>(crossed_loop->second) : std::nullopt)) {
@@ -922,11 +930,14 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
                                  conservative_initial_anchors[next],
                                  nested_control,
                                  !terminal.loop_stack.empty() || !initial.loop_stack.empty(),
-                                 loop_carried});
+                                 loop_carried,
+                                 pipeline_serialization});
   };
 
   auto consider = [&](size_t first, size_t second, bool require_adjacent) {
-    if (first == second || separated.count(std::minmax(first, second)) != 0) return;
+    const auto pair = std::minmax(first, second);
+    if (first == second || hard_separated.count(pair) != 0) return;
+    const bool pipeline_serialization = pipeline_only_separated.count(pair) != 0;
     const LifetimeInterval& first_lifetime = allocation_plan.intervals[first];
     const LifetimeInterval& second_lifetime = allocation_plan.intervals[second];
     if (first_lifetime.memory_space != second_lifetime.memory_space ||
@@ -939,7 +950,8 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
     if (second_lifetime.last_use_point <= first_lifetime.def_point) std::swap(earlier, later);
     for (const AccessEndpoint& terminal : terminal_frontiers[earlier]) {
       for (const AccessEndpoint& initial : initial_write_frontiers[later]) {
-        emit_handoff(earlier, later, terminal, initial, require_adjacent, std::nullopt);
+        emit_handoff(earlier, later, terminal, initial, require_adjacent, std::nullopt,
+                     pipeline_serialization);
       }
     }
 
@@ -950,7 +962,7 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
     for (const AccessEndpoint& terminal : terminal_frontiers[later]) {
       for (const AccessEndpoint& initial : initial_write_frontiers[earlier]) {
         for (const auto& context : SharedLoopContexts(terminal, initial)) {
-          emit_handoff(later, earlier, terminal, initial, false, context);
+          emit_handoff(later, earlier, terminal, initial, false, context, pipeline_serialization);
         }
       }
     }
@@ -979,7 +991,7 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
                               lhs.prior_byte_offset, lhs.prior_byte_size, lhs.next_byte_offset,
                               lhs.next_byte_size, lhs.loop_id, lhs.requires_alias_contract,
                               lhs.partial_access, lhs.incomplete_access_set, lhs.conservative_initial_anchor,
-                              lhs.nested_control, lhs.in_loop, lhs.loop_carried) <
+                              lhs.nested_control, lhs.in_loop, lhs.loop_carried, lhs.pipeline_serialization) <
                      std::tie(rhs.first_interval, rhs.second_interval, rhs.prior_interval, rhs.next_interval,
                               rhs.prior_route.source, rhs.prior_route.destination, rhs.prior_route.resource,
                               rhs.next_route.source, rhs.next_route.destination, rhs.next_route.resource,
@@ -988,7 +1000,7 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
                               rhs.prior_byte_offset, rhs.prior_byte_size, rhs.next_byte_offset,
                               rhs.next_byte_size, rhs.loop_id, rhs.requires_alias_contract,
                               rhs.partial_access, rhs.incomplete_access_set, rhs.conservative_initial_anchor,
-                              rhs.nested_control, rhs.in_loop, rhs.loop_carried);
+                              rhs.nested_control, rhs.in_loop, rhs.loop_carried, rhs.pipeline_serialization);
             });
   result.candidates.erase(
       std::unique(
@@ -1002,7 +1014,7 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
                             lhs.prior_byte_offset, lhs.prior_byte_size, lhs.next_byte_offset,
                             lhs.next_byte_size, lhs.loop_id, lhs.requires_alias_contract, lhs.partial_access,
                             lhs.incomplete_access_set, lhs.conservative_initial_anchor, lhs.nested_control,
-                            lhs.in_loop, lhs.loop_carried) ==
+                            lhs.in_loop, lhs.loop_carried, lhs.pipeline_serialization) ==
                    std::tie(rhs.first_interval, rhs.second_interval, rhs.prior_interval, rhs.next_interval,
                             rhs.prior_route.source, rhs.prior_route.destination, rhs.prior_route.resource,
                             rhs.next_route.source, rhs.next_route.destination, rhs.next_route.resource,
@@ -1011,7 +1023,7 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
                             rhs.prior_byte_offset, rhs.prior_byte_size, rhs.next_byte_offset,
                             rhs.next_byte_size, rhs.loop_id, rhs.requires_alias_contract, rhs.partial_access,
                             rhs.incomplete_access_set, rhs.conservative_initial_anchor, rhs.nested_control,
-                            rhs.in_loop, rhs.loop_carried);
+                            rhs.in_loop, rhs.loop_carried, rhs.pipeline_serialization);
           }),
       result.candidates.end());
   for (const RecognizedReuseCandidate& candidate : result.candidates) {
@@ -1035,6 +1047,7 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
     if (candidate.nested_control) ++result.nested_control_candidates;
     if (candidate.in_loop) ++result.in_loop_candidates;
     if (candidate.loop_carried) ++result.loop_carried_candidates;
+    if (candidate.pipeline_serialization) ++result.pipeline_serialization_candidates;
   }
   return result;
 }
@@ -1044,8 +1057,8 @@ void ConstructExperimentalPairEdges(ReusePenaltyRecognition* recognition) {
   recognition->edges.clear();
   std::set<std::pair<size_t, size_t>> promoted;
   for (const RecognizedReuseCandidate& candidate : recognition->candidates) {
-    if (candidate.hazard != RecognizedReuseHazard::CrossResource || candidate.requires_alias_contract ||
-        candidate.partial_access || candidate.incomplete_access_set ||
+    if (candidate.pipeline_serialization || candidate.hazard != RecognizedReuseHazard::CrossResource ||
+        candidate.requires_alias_contract || candidate.partial_access || candidate.incomplete_access_set ||
         candidate.conservative_initial_anchor) {
       continue;
     }

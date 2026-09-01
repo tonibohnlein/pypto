@@ -62,10 +62,11 @@ The recognizer:
 6. records distance-zero and distance-one WAR/WAW handoffs with route, range,
    loop, control-flow, and ordering provenance.
 
-The raw records are exported in
-`metadata.recognized_reuse_candidate_records_v4`. An SSA-reachable record has a
-deterministic region/statement `dag_path`; an unordered record uses
-`dag_path=none`. The command
+The legacy recognizer population remains exported in
+`metadata.recognized_reuse_candidate_records_v4`. The expanded v5 population
+also includes pipeline-serialization provenance and is counted separately by
+`recognized_reuse_candidates_v5`. An SSA-reachable record has a deterministic
+region/statement `dag_path`; an unordered record uses `dag_path=none`. The command
 
 ```bash
 python -m pypto.tools.dsa_reuse_candidates PROBLEM.dsa.json
@@ -314,11 +315,58 @@ may initially be one architecture-level constant and later become pipe-pair or
 signature specific, but it must be frozen independently of the placements
 being evaluated.
 
-The scorer fails closed for dynamic loops, control-flow branches, missing
-branch nodes, unresolved access joins, incomplete synchronization-predictor
-coverage, an uncalibrated edge weight, or an oversized finite expansion. An old
-export that omitted branch nodes is therefore `INCOMPLETE`; it is never treated
-as a branch-free graph with zero placement cost.
+Model v5 no longer rejects all structured control flow. The raw-PTO bridge
+attaches a stable predicate identity and polarity to every `scf.if`. Re-tests
+of the same materialized predicate share one scenario variable, and candidate
+sites on mutually exclusive paths do not create a reuse edge. The scorer
+enumerates the reachable structured paths instead of guessing branch
+frequencies.
+
+One scenario bit is shared across loop iterations only when raw PTO proves that
+the predicate is defined outside every enclosing loop (or is a function
+argument). For a loop-contained predicate, the bridge follows the scalar SSA
+chain through integer casts and arithmetic. If it reduces to a comparison of a
+static induction variable and constants, the scorer records the exact Boolean
+sequence for every iteration. A runtime-loaded or otherwise unresolved
+loop-contained branch is `INCOMPLETE`; the model never substitutes
+all-then/all-else paths for an unknown mixed per-iteration profile.
+
+Dynamic loops are parametric rather than expanded to an arbitrary finite trip
+count. Loops proven by raw PTO to share the same lower bound, upper bound, and
+step share one symbolic parameter `N`. The scorer evaluates four concrete
+probes and accepts the *placement extension* only when those probes have the
+affine form
+
+```text
+startup + (N - 1) * steady_state,  N >= 1
+```
+
+It may compare the resulting affine models by dominance for `N >= 1`, but the
+score is labelled `PARAMETRIC_ASSUMPTION`, not `COMPLETE`. This is explicitly an
+extrapolation from exact probes at `N = 1, 2, 3, 4`, not a proof that an
+arbitrary max-plus graph remains affine for all trip counts. It fails closed if
+the probes are not affine, if independent dynamic parameters would have to be
+conflated, or if the raw-PTO identity is missing. Static loops still use finite
+expansion.
+
+The lowered-access join distinguishes a missing exporter record from an access
+eliminated by lowering. Complete raw-PTO access provenance can prove that an
+absent access order is non-materialized. It cannot prove that a loop-carried
+recurrence disappeared merely because its surviving endpoints do not share a
+lowered loop. Such a recurrence fails closed until the exporter preserves its
+original-loop identity through peeling, unrolling, or loop splitting. The same
+identity is required when endpoints share multiple nested lowered loops. A
+distance-one handoff between contradictory branch arms also fails closed until
+the recurrence scorer evaluates source iteration `i` and target iteration
+`i + 1` separately; same-iteration mutual exclusion is not sufficient evidence
+to remove that edge.
+
+The remaining fail-closed conditions include missing branch nodes, unresolved
+access joins, promoted `pipeline_serialization` relations with no operation
+provenance, an uncalibrated edge weight, independent dynamic loop parameters,
+or an oversized expansion. An old export that omitted branch nodes is
+therefore `INCOMPLETE`; it is never treated as a branch-free graph with zero
+placement cost.
 
 An August 2026 host-only re-export initially reported zero complete-placement
 extension because it used the geometry endpoint's post-InsertSync graph as the
@@ -329,47 +377,67 @@ roots and fixed pipe order.
 
 ### Global synchronization-weight sensitivity
 
-The first host-only calibration sweep rescored the complete placement graph at
-one global synchronization-edge weight over `16, 24, 32, 48, 64, 80, 96, 128,
-160` cycles. It did not fit a per-kernel or per-edge constant. Device orderings
-cleared the evaluation threshold only when two devices agreed and each effect
-reached 2%. In the machine-readable output these rows are called
-`MULTI_DEVICE_THRESHOLD_CLEARED`: this is a deterministic two-device effect-size
-gate, not a confidence-interval claim. Below-threshold rows were retained as
-diagnostics but never used for calibration.
+The current host-only sweep rescored the complete placement graph at one global
+synchronization-edge weight over `16, 32, 64, 96, 128, 160` cycles. It did not
+fit a per-kernel or per-edge constant. Device orderings are labels only when the
+archived campaign established a reproducible two-device effect; below-threshold
+and non-reproducing effects remain diagnostics.
 
-Leave-one-workload-out calibration uses one predeclared global utility:
-`+1` for a correct strict ordering, `-1` for a wrong strict ordering, and `0`
-for silence. Ties prefer more correct and then more strict predictions. This
-prevents a selectively silent 1/1 predictor from defeating a broadly correct
-predictor merely because its reported accuracy is 100%.
+The reanalysis covers the 19 previously measured non-Gate problem-capacity
+cells plus the historical multi-function `mtp/gate` counterexample. The twelve
+loop-aware RMSNorm/top-k cells remain complete at every weight. Exact
+mixed-iteration profiles are derived statically for induction-variable
+predicates with static bounds. Runtime-loaded predicates instead require an
+explicit `exact_runtime_branch_profile_v1` input. That input is bound to hashes
+of the schedule, problem, captured tensors/scalars, and loop-trip metadata; it
+records each active branch occurrence and never promotes a captured value into
+a compile-time fact. Nested branches additionally record their active flattened
+occurrence indices.
 
-Coverage is the binding result. Of 17 measured problem-capacity cells with
-reconstructed graph inputs, 12 cells from only two workloads are complete under
-the current straight-line/static-loop contract. Five cells are excluded by
-conditional candidate endpoints; one of those also has an incomplete historical
-access join. None of the 12 eligible Cypress-versus-DSA-RP comparisons clears
-the 2% gate on both devices, so both leave-one-workload-out folds are
-`INSUFFICIENT_THRESHOLD_CLEARED_TRAINING_COMPARISONS` and no global weight is
-calibrated.
+Using the archived deterministic inputs,
+`rmsnorm_rope_cache_write/half` is now complete. Its two runtime-loaded
+predicates use the exact mixed branch profile of the measured dispatch. The
+same contract can represent `softmax_pool_c128/native`, but that case has not
+yet been rescored from a captured profile and is not new evidence here.
 
-The sensitivity sweep is mostly silent. Weights 16--24 cycles predict no strict
-Cypress-versus-DSA-RP ordering. At 32 cycles and at 48--160 cycles there is only
-one strict cell, RMSNorm at tight capacity; its direction flips between 32 and
-48 cycles. At a diagnostic 1% threshold, four cells become device-decided, but
-weights 48--160 distinguish only one of them. The apparent 1/1 accuracy is
-therefore 25% prediction coverage, not evidence for a stable global interval.
+The KV gap is repaired. A fresh export records producer and consumer access
+sites for every `pipeline_serialization` penalty. Of the 64 realized pairs in
+each arm, Cypress has 34 pipeline-serialization pairs and DSA-RP has 40; 16 and
+20 respectively materialize as lowered operation edges, while the remainder
+are proven eliminated by a unique raw-PTO join. Despite equal unit cost
+(`64 -> 64`), the complete-placement score assigns Cypress an extension of
+`408, 560, 1200, 1840, 2480, 3120` cycles over the frozen weight grid and DSA-RP
+zero throughout. This correctly predicts the measured DSA-RP win without
+consulting InsertSync.
+
+Gate was re-exported product-faithfully at its frozen compiler revision. The
+new source-loop marker survives PTO codegen and lets `gate_aic` join multiple
+lowered loops back to their original source loops; both `gate_aic` and
+`x_norm_quant` are now complete. Pinned PTO-ISA estimates also cover Gate's
+`tmul(fp32, 1x4096)`, `tfree`, and `tfillpad` operations without a local fitted
+constant. The aggregate parent score still fails closed: `ffn_norm`,
+`gate_aiv`, and `route_sort` require unsupported `trecip`/`tabs`, `tmaxs`, and
+`trowexpanddiv` signatures respectively. A parent-wide Gate ordering must not
+be inferred from the two complete children.
+
+Global calibration is still not identifiable. The confirmed KV and RMS wins
+are now explained over the entire frozen weight grid, but Gate's confirmed
+Cypress ordering has no complete parent score. Moreover, the complete Gumbel
+model predicts DSA-RP better in every symbolic branch scenario while both
+devices measure a latency null at q1. Leave-one-workload-out calibration
+therefore has too few confirmed, model-complete directional labels, and no
+weight is selected.
 
 The requested representative cases expose the missing model coverage and the
 remaining mechanism gap:
 
 | Case | Existing two-device evidence | Unit objective | Whole-function model status |
 | ---- | ---------------------------- | -------------- | --------------------------- |
-| `rmsnorm_rope_cache_write/half` | DSA-RP over Cypress `-7.19%/-7.43%` | `8 -> 0` | Ineligible: branches and dynamic loops. A branch-free regional diagnostic identifies a Cypress-only V-to-MTE2 hazard, but it is not a whole-function score. |
-| `kv_score_proj_c128/native` | DSA-RP over Cypress `-2.50%/-2.30%` | `64 -> 64` | Ineligible: conditional endpoints; the archived export also omitted lowered access sites. The unit tie and the speedup remain unexplained. |
-| `mtp/gate` | Cypress faster at all four capacities, approximately `1.6--4.1%` | DSA-RP ties or improves the count | Ineligible: control flow. This remains the principal counterexample to interpreting a lower unit objective as lower latency. |
-| `gumbel_argmax/q1` | DSA-RP versus Cypress `+0.22%/+0.11%`, a latency null | `14 -> 0` | Ineligible: conditional endpoints. A large structural gap can be hidden completely. |
-| `hc_post/native` | weak, sign-changing, or non-reproducing effects across campaigns | `33 -> 24` in the original cell | Ineligible: dynamic/control-flow structure and unsuitable as a calibration label. |
+| `rmsnorm_rope_cache_write/half` | DSA-RP over Cypress `-7.19%/-7.43%` | `8 -> 0` | Complete with the exact digest-bound runtime profile. Cypress adds `62, 97, 161, 354, 610, 761` cycles and DSA-RP adds zero over weights `16--160`. |
+| `kv_score_proj_c128/native` | DSA-RP over Cypress `-2.50%/-2.30%` | `64 -> 64` | Complete. Pipeline-serialization provenance and the repaired lowered-access join give Cypress a positive critical-path extension and DSA-RP zero at every tested weight. |
+| `mtp/gate` | Cypress faster at all four capacities, approximately `1.6--4.1%` | DSA-RP ties or improves the count | Re-exported but parent-incomplete: source-loop identity is repaired and two children are complete, while three fail closed on unsupported duration signatures. |
+| `gumbel_argmax/q1` | DSA-RP versus Cypress `+0.22%/+0.11%`, a latency null | `14 -> 0` | Complete and false-confident at every weight. Correlating the three re-tests of one predicate removes impossible paths but does not explain the null. |
+| `hc_post/native` | weak, sign-changing, or non-reproducing effects across campaigns | `33 -> 24` in the original cell | `PARAMETRIC_ASSUMPTION` under one correlated dynamic-loop parameter. It predicts DSA-RP no worse, but neither the extrapolated score nor the device label supports validation. |
 
 The durable device sources are
 `dsa-rp-loop-aware-model-prospective-0820ab418-final.tar.gz`
@@ -385,25 +453,22 @@ without opening latency data while scoring each frozen placement:
 python -m pypto.tools.dsa_schedule_model score-realized-grid \
   SCHEDULE.jsonl PROBLEM.dsa.json SOLUTION.dsa.solution.json \
   --function FUNCTION --model DURATION_MODEL.json \
-  --sync-latency-grid 16,24,32,48,64,80,96,128,160 -o ARM_GRID.json
+  --sync-latency-grid 16,32,64,96,128,160 -o ARM_GRID.json
 python -m pypto.tools.dsa_penalty_model_evaluation sync-weight-grid-input.tsv \
   --sync-weight-grid --split development --minimum-device-effect 0.02 \
   --required-device-count 2 -o sync-weight-grid-evaluation.json
 ```
 
-For the reported 2% development analysis, the joined input TSV hashes to
-`86d5dd525cc98c01e7cf48bffeab0c623b5c4ad59dcaf421faf0492141876594`
-and the evaluator output hashes to
-`a0711862d013b7a2532f73da4602026a8f08cfa6de3a45d127c94da71c1b0189`.
-The 1% diagnostic output hashes to
-`581c27397ab6cc7609b97b3412c6a996310d198043ed037f407279d79100b132`.
-
 This analysis fails the gate for an incremental critical-path planner. The
 planner has not been changed and no new device task is justified from this
-grid. The next local requirement is a complete branch-aware and dynamic-loop
-placement DAG for the representative cases, followed by the same global-weight
-evaluation on enough independent workloads to make leave-one-workload-out
-calibration meaningful.
+grid. Static and exact runtime mixed-iteration branches, source-loop identity,
+KV pipeline provenance, and the KV access join are complete. The predeclared
+scientific gate nevertheless fails: Gate is duration-incomplete and Gumbel is a
+false-confident prediction at every tested weight. The incremental greedy
+planner is therefore deliberately not implemented. The next local requirement
+is to resolve those two failures and obtain enough independently measured,
+model-complete directional cases for meaningful leave-one-workload-out
+calibration.
 
 Scoring each arm's actual post-InsertSync graph gives the intended analysis
 oracle. On the same retrospective corpus, every one of 40 strict model
@@ -799,13 +864,13 @@ the executable relation, physical-group, synchronization-execution, and
 critical-path predictors. This exception is evidence-driven; without it the
 join continues to fail closed.
 
-Solver-promoted `pipeline_serialization` penalties are a different case. They
-describe relaxed pipeline-stage separation and do not carry producer/consumer
-access records. The logical objective must retain them, but access-,
-synchronization-, and critical-path-based predictors must report incomplete
-coverage whenever a placement realizes one of these relations. They must not
-be treated as proven non-materialized operations or assigned a modeled cost of
-zero.
+Solver-promoted `pipeline_serialization` penalties describe relaxed
+pipeline-stage separation. The v5 exporter records their producer and consumer
+access sites alongside the penalty reason, so current problems can join them
+to lowered operations like other reuse relations. Historical exports without
+those v5 records remain incomplete whenever a placement realizes such a
+relation; the missing provenance must never be interpreted as a
+non-materialized operation or a modeled cost of zero.
 
 The first candidate-weight prototype adds a hypothetical completion edge from
 the terminal macro phase at the prior site to the initial macro phase at the
