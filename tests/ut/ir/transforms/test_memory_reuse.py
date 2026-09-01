@@ -16,6 +16,8 @@ This aligns MemRef objects consistently: if two tiles share a MemRef in
 ``After``, the corresponding tiles in ``Expected`` must also share.
 """
 
+import json
+
 import pypto.language as pl
 import pytest
 from pypto import DataType, InternalError, backend, ir, passes, testing
@@ -5753,6 +5755,52 @@ class TestCapacityGatedReuse:
         assert "PH-DSA-001" in text
         assert "1 of 1 relaxed pair(s) reuse physical storage" in text
         assert "pipeline_membership" not in ir.python_print(After)
+
+    def test_standalone_dsa_relaxed_pipeline_penalty_exports_access_provenance(self, tmp_path):
+        """A relaxed pipeline penalty retains its producer/consumer access records."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        Before = self._two_stage_matmuls(a_shape=(16, 128), b_shape=(128, 192))
+
+        with passes.PassContext(
+            [],
+            memory_planner=passes.MemoryPlanner.DSA,
+            dsa_export_dir=str(tmp_path),
+            dsa_reuse_penalty_recognizer=passes.DsaReusePenaltyRecognizer.QUADRATIC,
+        ):
+            passes.allocate_memory_addr()(passes.init_mem_ref()(Before))
+
+        problems = list(tmp_path.glob("*.dsa.json"))
+        assert len(problems) == 1
+        document = json.loads(problems[0].read_text())
+        pipeline_penalties = [
+            penalty
+            for penalty in document["problem"]["cost_model"]["reuse_penalties"]
+            if penalty["reason"] == "pipeline_serialization"
+        ]
+        assert len(pipeline_penalties) == 1
+        penalty = pipeline_penalties[0]
+        pair = {penalty["first"], penalty["second"]}
+
+        records = document["metadata"]["recognized_reuse_candidate_records_v5"].split(";")
+        legacy_records = [
+            record
+            for record in document["metadata"]["recognized_reuse_candidate_records_v4"].split(";")
+            if record
+        ]
+        provenance = [
+            record
+            for record in records
+            if "penalty_reason=pipeline_serialization" in record
+            and {int(field) for field in record.split(",")[:2]} == pair
+        ]
+        assert provenance
+        assert all("sites=" in record and "->" in record for record in provenance)
+        assert not any({int(field) for field in record.split(",")[:2]} == pair for record in legacy_records)
+        assert int(document["metadata"]["recognized_reuse_candidates_v5"]) == len(records)
+        assert int(document["metadata"]["recognized_reuse_candidates"]) + int(
+            document["metadata"]["recognized_pipeline_serialization_candidates"]
+        ) == len(records)
 
     def test_finds_max_affordable_double_buffer_depth(self):
         """Depth-aware: a 3-stage group whose full separation (3 x 32 = 96 KB)

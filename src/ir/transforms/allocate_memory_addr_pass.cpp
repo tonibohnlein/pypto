@@ -161,10 +161,11 @@ class StripPipelineMembershipMutator : public IRMutator {
 ///
 /// This traversal deliberately mirrors AccessCollector in
 /// research_reuse_penalty_recognizer.cpp: AssignStmt and EvalStmt consume one
-/// coordinate, each ReturnStmt value consumes one coordinate, and structural
-/// statements consume none. The attr is attached before later passes may
-/// change statement count/order, so PTO codegen can recover the original
-/// candidate site without reconstructing it from lowered IR.
+/// coordinate, each ReturnStmt value consumes one coordinate, and structured
+/// controls consume one source-control coordinate. The attrs are attached
+/// before later passes may change statement count/order, so PTO codegen can
+/// recover original candidate and loop sites without reconstructing them from
+/// lowered IR positions.
 class DsaAccessOrderStamper : public IRMutator {
  public:
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
@@ -201,14 +202,50 @@ class DsaAccessOrderStamper : public IRMutator {
     return result;
   }
 
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    // Keep the control numbering identical to AccessCollector.  Branch ids
+    // consume coordinates even though only loop ids are exported.
+    NextControlId(op->span_);
+    return IRMutator::VisitStmt_(op);
+  }
+
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    const int source_loop_id = NextControlId(op->span_);
+    StmtPtr visited = IRMutator::VisitStmt_(op);
+    const ForStmtPtr loop = As<ForStmt>(visited);
+    INTERNAL_CHECK_SPAN(loop, op->span_) << "Internal error: ForStmt mutator changed statement kind";
+    if (loop->HasAttr(kDsaSourceLoopIdAttr) &&
+        loop->GetAttr<int>(kDsaSourceLoopIdAttr) == source_loop_id) {
+      return visited;
+    }
+    auto result = MutableCopy(loop);
+    result->attrs_ = StripAttr(loop->attrs_, kDsaSourceLoopIdAttr);
+    result->attrs_.emplace_back(kDsaSourceLoopIdAttr, source_loop_id);
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    // While loops receive the same stable control coordinate even though
+    // duration_v0 currently rejects genuinely dynamic loop execution.
+    NextControlId(op->span_);
+    return IRMutator::VisitStmt_(op);
+  }
+
  private:
   int next_access_order_ = 0;
+  int next_control_id_ = 0;
   std::optional<int> current_access_order_;
 
   int NextAccessOrder(const Span& span) {
     INTERNAL_CHECK_SPAN(next_access_order_ < std::numeric_limits<int>::max(), span)
         << "Internal error: DSA access-order coordinate exceeds the IR attr range";
     return next_access_order_++;
+  }
+
+  int NextControlId(const Span& span) {
+    INTERNAL_CHECK_SPAN(next_control_id_ < std::numeric_limits<int>::max(), span)
+        << "Internal error: DSA source-control coordinate exceeds the IR attr range";
+    return next_control_id_++;
   }
 
   ExprPtr VisitExpr_(const CallPtr& op) override {

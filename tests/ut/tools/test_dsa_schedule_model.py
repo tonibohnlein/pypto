@@ -55,6 +55,7 @@ def _candidate(
         "ub->ub@vector_compute=>external->ub@inbound_dma,arenas=Vec->Vec,"
         "write_after_read,no_logical_order,inter_operation,full_allocation,complete_access_set,"
         f"verified_initial_write,in_loop,distance_{distance},sites={prior_site}->{next_site},"
+        f"{'loop=0,' if distance == 1 else ''}"
         "ranges=0+640->0+640,hazard=cross_resource,dag_path=none"
     )
 
@@ -75,6 +76,66 @@ def _record(*, sync_edges: list[dict] | None = None) -> dict:
             {"source": 1, "target": 3, "pipe": "PIPE_MTE2"},
         ],
         "sync_edges": sync_edges or [],
+    }
+
+
+def _mixed_iteration_record() -> dict:
+    return {
+        "schema_version": 1,
+        "function": "kernel",
+        "status": "analyzed",
+        "nodes": [
+            {
+                "id": 10,
+                "kind": "loop",
+                "loop_kind": "LOOP_BEGIN",
+                "begin": 10,
+                "end": 16,
+                "static_trip_count": 2,
+                "loop_stack": [],
+                "branch_stack": [],
+            },
+            {
+                "id": 11,
+                "kind": "branch",
+                "branch_kind": "IF_BEGIN",
+                "begin": 11,
+                "branch": 13,
+                "end": 15,
+                "loop_stack": [10],
+                "branch_stack": [],
+                "predicate_identity": "first-iteration",
+                "predicate_loop_invariant": False,
+                "predicate_iteration_profile": {
+                    "loop_ids": [10],
+                    "iteration_counts": [2],
+                    "values": [True, False],
+                },
+            },
+            {**_operation(0, "PIPE_V", "pto.tadd", [10]), "branch_stack": [11]},
+            {
+                "id": 15,
+                "kind": "branch",
+                "branch_kind": "IF_END",
+                "begin": 11,
+                "branch": 13,
+                "end": 15,
+                "loop_stack": [10],
+                "branch_stack": [],
+            },
+            {
+                "id": 16,
+                "kind": "loop",
+                "loop_kind": "LOOP_END",
+                "begin": 10,
+                "end": 16,
+                "loop_stack": [],
+                "branch_stack": [],
+            },
+        ],
+        "stream_edges": [],
+        "sync_edges": [],
+        "sync_groups": [],
     }
 
 
@@ -458,6 +519,47 @@ def test_public_manifest_evaluator_reports_queue_drain_restart_marginal(tmp_path
     assert marginal["complete"] is True
     assert marginal["minimum_delta_cycles"] == -13.0
     assert marginal["maximum_delta_cycles"] == -13.0
+
+
+def test_public_manifest_evaluator_propagates_mixed_iteration_queue_drain_incomplete(tmp_path):
+    record = _mixed_iteration_record()
+    baseline = tmp_path / "baseline.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+    baseline.write_text(json.dumps(record) + "\n")
+    candidate.write_text(json.dumps(record) + "\n")
+    manifest = tmp_path / "comparisons.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "comparisons": [
+                    {
+                        "case": "mixed-iteration",
+                        "split": "development",
+                        "baseline_arm": "baseline",
+                        "candidate_arm": "candidate",
+                        "baseline_schedule": baseline.name,
+                        "candidate_schedule": candidate.name,
+                    }
+                ],
+            }
+        )
+    )
+
+    result = dsa_schedule_model.evaluate_arm_manifest(manifest, _ten_cycle_model())
+
+    comparison = result["comparisons"][0]
+    assert comparison["queue_event_signed_marginal"]["mixed_iteration_branch_profile_available"] is True
+    assert comparison["queue_event_signed_marginal"]["direction_conclusion"] == "TIE_ALL_BRANCH_EXTREMES"
+    assert comparison["queue_drain_restart_signed_marginal"] == {
+        "model_version": "queue_drain_successor_restart_signed_marginal_v1",
+        "complete": False,
+        "limitations": ["mixed_iteration_branch_profile_not_supported_v1"],
+        "minimum_delta_cycles": None,
+        "maximum_delta_cycles": None,
+        "direction_conclusion": "QUEUE_DRAIN_RESTART_MODEL_INCOMPLETE",
+        "scenarios": [],
+    }
 
 
 def test_queue_event_model_reports_conditional_path_bounds():
@@ -979,7 +1081,7 @@ def test_candidate_score_joins_access_sites_and_derives_non_negative_weight():
     }
 
 
-def test_candidate_score_fails_closed_on_conditional_endpoint_lifting():
+def test_candidate_score_fails_closed_on_malformed_conditional_structure():
     record = _record()
     record["nodes"].extend(
         [
@@ -988,7 +1090,7 @@ def test_candidate_score_fails_closed_on_conditional_endpoint_lifting():
         ]
     )
 
-    with pytest.raises(ValueError, match="does not lift conditional access endpoints"):
+    with pytest.raises(ValueError, match="does not match IF_BEGIN"):
         dsa_schedule_model.score_reuse_candidates(record, [_candidate()], _ten_cycle_model())
 
 
@@ -1017,6 +1119,7 @@ def test_duplicate_distance_zero_candidates_do_not_inflate_group_or_summary():
             "target_execution_count": 1,
             "estimated_sync_endpoint_executions": 2,
             "weight_cycles": 20.0,
+            "branch_predicate": {},
         }
     ]
     assert result["consumer_groups"][0]["singleton_weight_sum_cycles"] == 20.0
@@ -1134,7 +1237,88 @@ def test_candidate_score_derives_loop_recurrence_ii_weight():
     ]
 
 
-def test_inner_loop_ii_removes_static_outer_and_inner_trip_multipliers():
+def test_loop_candidate_maps_mixed_iteration_then_to_else_handoff_by_occurrence():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 20,
+            "static_trip_count": 2,
+            "loop_stack": [],
+            "branch_stack": [],
+        },
+        {
+            "id": 11,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [],
+            "predicate_identity": "first-iteration",
+            "predicate_loop_invariant": False,
+            "predicate_iteration_profile": {
+                "loop_ids": [10],
+                "iteration_counts": [2],
+                "values": [True, False],
+            },
+        },
+        {
+            **_with_access(_operation(2, "PIPE_V", "pto.tmuls", [10]), 3),
+            "branch_stack": [11],
+        },
+        {
+            "id": 13,
+            "kind": "branch",
+            "branch_kind": "ELSE_BEGIN",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [11],
+        },
+        {
+            **_with_access(_operation(1, "PIPE_MTE2", "pto.tload", [10]), 7),
+            "branch_stack": [13],
+        },
+        {
+            "id": 15,
+            "kind": "branch",
+            "branch_kind": "IF_END",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [],
+        },
+        {
+            "id": 20,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 20,
+            "loop_stack": [],
+            "branch_stack": [],
+        },
+    ]
+    record["stream_edges"] = []
+
+    result = dsa_schedule_model.score_reuse_candidates(
+        record, [_candidate(distance=1)], _ten_cycle_model()
+    )
+
+    candidate = result["candidates"][0]
+    assert candidate["status"] == "loop_carried_occurrence_profiled_v2"
+    assert candidate["occurrence_profiled_branch_ids"] == [11]
+    assert candidate["weight_semantics"] == "whole_execution_exact_occurrence_extension_v2"
+    assert result["occurrence_profiled_loop_carried_candidate_count"] == 1
+
+
+def test_nested_loop_candidate_fails_closed_without_original_loop_identity():
     record = _loop_candidate_record(with_return_path=True)
     record["nodes"].insert(
         0,
@@ -1151,13 +1335,35 @@ def test_inner_loop_ii_removes_static_outer_and_inner_trip_multipliers():
         if node.get("kind") == "operation":
             node["loop_stack"] = [9, 10]
 
-    result = dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
+    with pytest.raises(ValueError, match="does not resolve to exactly one lowered loop"):
+        dsa_schedule_model.score_reuse_candidates(record, [_candidate(distance=1)], _ten_cycle_model())
 
-    candidate = result["candidates"][0]
-    assert candidate["loop_node"] == 10
-    assert candidate["pipe_work_cycles"] == {"PIPE_MTE2": 20.0, "PIPE_V": 20.0}
-    assert candidate["candidate_recurrence_cycles"] == 30.0
-    assert candidate["weight_cycles"] == 10.0
+
+def test_nested_loop_candidate_uses_original_source_loop_identity():
+    record = _loop_candidate_record(with_return_path=True)
+    record["nodes"].insert(
+        0,
+        {
+            "id": 9,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 9,
+            "end": 21,
+            "static_trip_count": 3,
+            "pypto_source_loop_id": 9,
+        },
+    )
+    for node in record["nodes"]:
+        if node.get("id") == 10:
+            node["pypto_source_loop_id"] = 0
+        if node.get("kind") == "operation":
+            node["loop_stack"] = [9, 10]
+
+    result = dsa_schedule_model.score_reuse_candidates(
+        record, [_candidate(distance=1)], _ten_cycle_model()
+    )
+
+    assert result["candidates"][0]["resolved_recurrence_loop_node"] == 10
 
 
 def test_existing_loop_recurrence_suppresses_duplicate_candidate_weight():
@@ -1224,6 +1430,7 @@ def test_duplicate_loop_candidates_collapse_to_one_scored_recurrence_edge():
             "estimated_sync_endpoint_executions": 8,
             "candidate_recurrence_cycles": 30.0,
             "weight_cycles": 10.0,
+            "branch_predicate": {},
         }
     ]
     assert result["penalty_pair_weights"][0]["estimated_sync_endpoint_executions"] == 8
@@ -1276,6 +1483,7 @@ def test_candidate_score_classifies_access_removed_before_lowered_schedule():
         "next_route_pipe": "PIPE_MTE2",
         "missing_access_orders": [3],
         "status": "not_materialized_in_schedule",
+        "nonmaterialization_evidence": "external_digest_bound_evidence",
         "weight_cycles": 0.0,
     }
     assert result["penalty_pair_weights"] == [
@@ -1363,6 +1571,35 @@ def test_candidate_score_preserves_unmodeled_pipeline_penalty_without_access_rec
     assert realized["unmodeled_pipeline_serialization_realized_cost"] == 4.0
     assert realized["unit_realized_cost"] == 5.0
     assert realized["executable_unit_realized_cost"] == 1.0
+
+
+def test_candidate_score_models_pipeline_penalty_with_exported_access_provenance():
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    candidate = dsa_reuse_candidates.parse_candidate_record(
+        ",".join(_candidate().fields) + ",penalty_reason=pipeline_serialization"
+    )
+
+    result = dsa_schedule_model.score_reuse_candidates(
+        record,
+        [candidate],
+        _ten_cycle_model(),
+        promoted_penalties={(0, 1): 4.0},
+        promoted_penalty_reasons={(0, 1): "pipeline_serialization"},
+    )
+
+    assert result["unmodeled_pipeline_serialization_pair_count"] == 0
+    assert result["candidates"][0]["candidate_penalty_reason"] == "pipeline_serialization"
+    pair = result["penalty_pair_weights"][0]
+    assert pair["penalty_reason"] == "pipeline_serialization"
+    assert pair["model_status"] == "executable"
+    assert pair["distance_zero_schedule_edges"] == [[2, 1]]
+    assert pair["critical_path_weight_cycles"] > 0
 
 
 def test_nonmaterialized_access_evidence_is_bound_to_scored_inputs(tmp_path):
@@ -1517,7 +1754,7 @@ def test_main_scores_candidate_problem(tmp_path):
     )
     result = json.loads(output.read_text())
     assert result["candidates"][0]["weight_cycles"] > 0
-    assert result["model_version"] == "reuse_penalty_critical_path_v1"
+    assert result["model_version"] == "reuse_penalty_critical_path_v2"
 
 
 def test_realized_placement_scores_only_physical_reuse(tmp_path):
@@ -1562,8 +1799,10 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
     result = dsa_schedule_model.score_realized_reuse(problem, solution, candidate_scores)
 
     assert result["realized_pair_count"] == 1
+    assert result["realized_pair_count_by_penalty_reason"] == {"unspecified": 1}
     assert result["canonical_physical_reuse_group_count"] == 1
     assert result["executable_realized_pair_count"] == 1
+    assert result["executable_realized_pair_count_by_penalty_reason"] == {"unspecified": 1}
     assert result["executable_canonical_physical_reuse_group_count"] == 1
     assert result["synchronization_predictor_coverage_complete"] is True
     assert result["unmodeled_pipeline_serialization_realized_pair_count"] == 0
@@ -1964,6 +2203,382 @@ def test_complete_placement_dag_expands_loop_carried_edges_across_iterations(tmp
     assert complete["placement_critical_path"]["node_count"] == 12
 
 
+def test_complete_placement_dag_scores_branch_predicated_reuse(tmp_path):
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 10,
+            "branch": 12,
+            "end": 14,
+            "branch_stack": [],
+            "loop_stack": [],
+        },
+        {**_with_access(_operation(2, "PIPE_V", "pto.tmuls"), 3), "branch_stack": [10]},
+        {**_with_access(_operation(1, "PIPE_MTE2", "pto.tload"), 7), "branch_stack": [10]},
+        {
+            "id": 12,
+            "kind": "branch",
+            "branch_kind": "ELSE_BEGIN",
+            "begin": 10,
+            "branch": 12,
+            "end": 14,
+            "branch_stack": [10],
+            "loop_stack": [],
+        },
+        {**_operation(0, "PIPE_V", "pto.tadd"), "branch_stack": [12]},
+        {
+            "id": 14,
+            "kind": "branch",
+            "branch_kind": "IF_END",
+            "begin": 10,
+            "branch": 12,
+            "end": 14,
+            "branch_stack": [],
+            "loop_stack": [],
+        },
+    ]
+    record["stream_edges"] = []
+    candidate_scores = dsa_schedule_model.score_reuse_candidates(
+        record, [_candidate()], _weighted_sync_model()
+    )
+    assert candidate_scores["distance_zero_edges"][0]["branch_predicate"] == {"10": True}
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(json.dumps({"problem": {"buffers": [{"id": 0, "size": 64}, {"id": 1, "size": 64}]}}))
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 0},
+                ]
+            }
+        )
+    )
+
+    complete = dsa_schedule_model.score_realized_reuse(
+        problem,
+        solution,
+        candidate_scores,
+        schedule_record=record,
+        model=_weighted_sync_model(),
+    )["complete_placement_dag"]
+
+    assert complete["status"] == "COMPLETE"
+    assert complete["branch_policy"] == ("exact_static_induction_profiles_plus_symbolic_path_extremes")
+    assert complete["critical_path_extension_cycles"] is None
+    assert complete["critical_path_extension_range_cycles"] == [0.0, 15.0]
+    assert complete["critical_path_extension_profiles"] == [
+        {
+            "branch_choices": {"10": False},
+            "startup_cycles_at_trip_count_1": 0.0,
+            "steady_state_cycles_per_additional_iteration": 0.0,
+        },
+        {
+            "branch_choices": {"10": True},
+            "startup_cycles_at_trip_count_1": 15.0,
+            "steady_state_cycles_per_additional_iteration": 0.0,
+        },
+    ]
+
+
+def test_complete_placement_score_comparison_requires_branch_and_loop_dominance():
+    def score(rows):
+        return {"status": "COMPLETE", "critical_path_extension_profiles": rows}
+
+    baseline = score(
+        [
+            {
+                "branch_choices": {"10": False},
+                "startup_cycles_at_trip_count_1": 0.0,
+                "steady_state_cycles_per_additional_iteration": 0.0,
+            },
+            {
+                "branch_choices": {"10": True},
+                "startup_cycles_at_trip_count_1": 5.0,
+                "steady_state_cycles_per_additional_iteration": 2.0,
+            },
+        ]
+    )
+    dominated = score(
+        [
+            {
+                "branch_choices": {"10": False},
+                "startup_cycles_at_trip_count_1": 0.0,
+                "steady_state_cycles_per_additional_iteration": 0.0,
+            },
+            {
+                "branch_choices": {"10": True},
+                "startup_cycles_at_trip_count_1": 8.0,
+                "steady_state_cycles_per_additional_iteration": 3.0,
+            },
+        ]
+    )
+    crossing = score(
+        [
+            {
+                "branch_choices": {"10": False},
+                "startup_cycles_at_trip_count_1": 0.0,
+                "steady_state_cycles_per_additional_iteration": 0.0,
+            },
+            {
+                "branch_choices": {"10": True},
+                "startup_cycles_at_trip_count_1": 1.0,
+                "steady_state_cycles_per_additional_iteration": 4.0,
+            },
+        ]
+    )
+
+    assert dsa_schedule_model.compare_complete_placement_dag_scores(baseline, dominated)["direction"] == -1
+    assert dsa_schedule_model.compare_complete_placement_dag_scores(baseline, crossing) == {
+        "status": "RUNTIME_CONTROL_DEPENDENT",
+        "direction": None,
+        "ordering_contract": ("all_structured_branches_and_affine_extrapolation_after_exact_N1_to_N4_probes"),
+    }
+
+
+def test_complete_placement_dag_models_one_dynamic_loop_parametrically(tmp_path):
+    record = _loop_candidate_record()
+    record["nodes"][0]["static_trip_count"] = None
+    candidate_scores = dsa_schedule_model.score_reuse_candidates(
+        record, [_candidate()], _weighted_sync_model()
+    )
+    problem = tmp_path / "problem.dsa.json"
+    solution = tmp_path / "solution.dsa.solution.json"
+    problem.write_text(json.dumps({"problem": {"buffers": [{"id": 0, "size": 64}, {"id": 1, "size": 64}]}}))
+    solution.write_text(
+        json.dumps(
+            {
+                "placements": [
+                    {"buffer": 0, "pool": 1, "offset": 0},
+                    {"buffer": 1, "pool": 1, "offset": 0},
+                ]
+            }
+        )
+    )
+
+    complete = dsa_schedule_model.score_realized_reuse(
+        problem,
+        solution,
+        candidate_scores,
+        schedule_record=record,
+        model=_weighted_sync_model(),
+    )["complete_placement_dag"]
+
+    assert complete["status"] == "PARAMETRIC_ASSUMPTION"
+    assert complete["loop_policy"] == "correlated_dynamic_loop_affine_probe_model_v1"
+    assert complete["dynamic_loop_probe_trip_counts"] == [1, 2, 3, 4]
+    assert complete["parametric_assumption"] == (
+        "placement_extension_affine_beyond_exact_trip_count_probes_1_to_4"
+    )
+    assert complete["dynamic_trip_count_symbol"] == "N10"
+    assert complete["critical_path_extension_cycles"] is None
+    assert complete["critical_path_extension_affine"] == {
+        "startup_cycles_at_trip_count_1": 25.0,
+        "steady_state_cycles_per_additional_iteration": 0.0,
+    }
+    assert complete["parametric_ranking_key"] == [0.0, 25.0]
+    assert dsa_schedule_model.compare_complete_placement_dag_scores(complete, complete) == {
+        "status": "ORDERED_UNDER_PARAMETRIC_ASSUMPTION",
+        "direction": 0,
+        "ordering_contract": ("all_structured_branches_and_affine_extrapolation_after_exact_N1_to_N4_probes"),
+        "parametric_assumption": "affine_extension_beyond_exact_trip_count_probes_1_to_4",
+    }
+
+
+def test_complete_placement_dag_models_correlated_dynamic_loops_as_one_parameter():
+    identity = "loop-trip-v1:shared"
+    record = {
+        "schema_version": 1,
+        "function": "kernel",
+        "status": "analyzed",
+        "nodes": [
+            {
+                "id": 10,
+                "kind": "loop",
+                "loop_kind": "LOOP_BEGIN",
+                "begin": 10,
+                "end": 12,
+                "static_trip_count": None,
+                "dynamic_trip_count_identity": identity,
+            },
+            _operation(0, "PIPE_V", "pto.tadd", [10]),
+            {
+                "id": 12,
+                "kind": "loop",
+                "loop_kind": "LOOP_END",
+                "begin": 10,
+                "end": 12,
+                "static_trip_count": None,
+                "dynamic_trip_count_identity": identity,
+                "loop_stack": [],
+            },
+            {
+                "id": 20,
+                "kind": "loop",
+                "loop_kind": "LOOP_BEGIN",
+                "begin": 20,
+                "end": 22,
+                "static_trip_count": None,
+                "dynamic_trip_count_identity": identity,
+            },
+            _operation(1, "PIPE_V", "pto.tadd", [20]),
+            {
+                "id": 22,
+                "kind": "loop",
+                "loop_kind": "LOOP_END",
+                "begin": 20,
+                "end": 22,
+                "static_trip_count": None,
+                "dynamic_trip_count_identity": identity,
+                "loop_stack": [],
+            },
+            _operation(2, "PIPE_MTE2", "pto.tload"),
+            _operation(3, "PIPE_MTE2", "pto.tload"),
+            _operation(4, "PIPE_MTE2", "pto.tload"),
+        ],
+        "stream_edges": [],
+        "sync_edges": [],
+    }
+    candidate_scores = {
+        "schema_version": 2,
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+    }
+    realized = {
+        "pairs": [],
+        "synchronization_predictor_coverage_complete": True,
+        "critical_path_realized_cost_cycles": 0,
+    }
+
+    result = dsa_schedule_model.score_complete_placement_dag(
+        record, _weighted_sync_model(), candidate_scores, realized
+    )
+
+    assert result["status"] == "PARAMETRIC_ASSUMPTION"
+    assert result["loop_policy"] == "correlated_dynamic_loop_affine_probe_model_v1"
+    assert result["dynamic_loop_groups"] == {identity: [10, 20]}
+    assert result["dynamic_trip_count_identity"] == identity
+    assert result["critical_path_extension_profiles"][0]["base_makespan_affine"] is None
+    assert result["critical_path_extension_affine"] == {
+        "startup_cycles_at_trip_count_1": 0.0,
+        "steady_state_cycles_per_additional_iteration": 0.0,
+    }
+
+
+def test_complete_placement_dag_rejects_independent_dynamic_parameters():
+    record = _loop_candidate_record()
+    record["nodes"][0]["static_trip_count"] = None
+    record["nodes"][0]["dynamic_trip_count_identity"] = "loop-trip-v1:first"
+    record["nodes"].extend(
+        [
+            {
+                "id": 30,
+                "kind": "loop",
+                "loop_kind": "LOOP_BEGIN",
+                "begin": 30,
+                "end": 32,
+                "static_trip_count": None,
+                "dynamic_trip_count_identity": "loop-trip-v1:second",
+            },
+            _operation(31, "PIPE_V", "pto.tadd", [30]),
+            {
+                "id": 32,
+                "kind": "loop",
+                "loop_kind": "LOOP_END",
+                "begin": 30,
+                "end": 32,
+                "static_trip_count": None,
+                "dynamic_trip_count_identity": "loop-trip-v1:second",
+                "loop_stack": [],
+            },
+        ]
+    )
+    candidate_scores = {
+        "schema_version": 2,
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+    }
+    realized = {
+        "pairs": [],
+        "synchronization_predictor_coverage_complete": True,
+        "critical_path_realized_cost_cycles": 0,
+    }
+
+    result = dsa_schedule_model.score_complete_placement_dag(
+        record, _weighted_sync_model(), candidate_scores, realized
+    )
+
+    assert result["status"] == "INCOMPLETE"
+    assert result["limitations"] == ["independent_dynamic_loop_parameters_not_supported_v1"]
+
+
+def test_complete_raw_pto_join_proves_absent_candidate_sites_nonmaterialized():
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    record["export_source"] = "native_schedule_graph_v1+raw_pto_semantics_v1"
+    record["export_limitations"] = {"operation_metadata_missing": 0}
+
+    result = dsa_schedule_model.score_reuse_candidates(
+        record,
+        [_candidate(prior_site=98, next_site=103)],
+        _weighted_sync_model(),
+    )
+
+    row = result["candidates"][0]
+    assert row["status"] == "not_materialized_in_schedule"
+    assert row["missing_access_orders"] == [98, 103]
+    assert row["nonmaterialization_evidence"] == "complete_raw_pto_access_provenance"
+
+
+def test_complete_raw_pto_join_rejects_loop_recurrence_without_lowered_loop_identity():
+    record = _record()
+    record["nodes"] = [
+        _with_access(record["nodes"][0], 1),
+        _with_access(record["nodes"][1], 7),
+        _with_access(record["nodes"][2], 3),
+        _with_access(record["nodes"][3], 9),
+    ]
+    record["export_source"] = "native_schedule_graph_v1+raw_pto_semantics_v1"
+    record["export_limitations"] = {"operation_metadata_missing": 0}
+
+    with pytest.raises(ValueError, match="original-loop identity was not preserved"):
+        dsa_schedule_model.score_reuse_candidates(
+            record,
+            [_candidate(distance=1)],
+            _weighted_sync_model(),
+        )
+
+
+def test_complete_raw_pto_join_rejects_recurrence_across_distinct_lowered_loops():
+    record = _record()
+    record["nodes"] = [
+        {**_with_access(record["nodes"][0], 1), "loop_stack": [10]},
+        {**_with_access(record["nodes"][1], 7), "loop_stack": [10]},
+        {**_with_access(record["nodes"][2], 3), "loop_stack": [20]},
+        {**_with_access(record["nodes"][3], 9), "loop_stack": [20]},
+    ]
+    record["export_source"] = "ptoas_debug_import_v0+pto_access_join_v3"
+    record["export_limitations"] = {"access_provenance_missing": False}
+
+    with pytest.raises(ValueError, match="original-loop identity was not preserved"):
+        dsa_schedule_model.score_reuse_candidates(
+            record,
+            [_candidate(distance=1)],
+            _weighted_sync_model(),
+        )
+
+
 def test_complete_placement_dag_rejects_incomplete_reference_export(tmp_path):
     record = _record()
     record["nodes"] = [
@@ -2003,7 +2618,7 @@ def test_complete_placement_dag_rejects_incomplete_reference_export(tmp_path):
     assert result["complete_placement_critical_path_cycles"] is None
     assert result["complete_placement_dag"] == {
         "schema_version": 1,
-        "model_version": "complete_placement_dag_v2",
+        "model_version": "complete_placement_dag_v5",
         "status": "INCOMPLETE",
         "limitations": ["export_limitations.branch_nodes_missing"],
         "critical_path_extension_cycles": None,
@@ -2104,7 +2719,7 @@ def test_complete_placement_dag_requires_pre_insert_sync_edges_and_positive_weig
 
     assert result == {
         "schema_version": 1,
-        "model_version": "complete_placement_dag_v2",
+        "model_version": "complete_placement_dag_v5",
         "status": "INCOMPLETE",
         "limitations": [
             "candidate_edges_not_derived_from_pre_insert_sync_access_hazards",
@@ -3339,6 +3954,8 @@ def test_import_legacy_debug_accepts_semantic_accumulating_matmul_name():
         ("pto.tpush", "pto.tpush_to_aic"),
         ("pto.tpop", "pto.tpop_from_aiv"),
         ("pto.tpop", "pto.tpop_from_aic"),
+        ("pto.tfree", "pto.tfree_from_aiv"),
+        ("pto.tfree", "pto.tfree_from_aic"),
     ],
 )
 def test_import_legacy_debug_accepts_mixed_kernel_operation_names(trace_name, raw_name):
@@ -3371,7 +3988,63 @@ def test_import_legacy_debug_rejects_non_accumulating_matmul_name_mismatch():
         'loc("pypto.access.4")'
     )
 
-    with pytest.raises(ValueError, match="operation sequence does not match"):
+    with pytest.raises(ValueError, match="no unique monotone join"):
+        dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+
+def test_import_legacy_debug_records_uniquely_eliminated_access_order():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tload [PIPE_MTE2]
+[   1] COMPOUND pto.tadd [PIPE_V]
+// ========================================= //
+"""
+    pto = """
+pto.tload ins(%arg0) outs(%tile) loc("pypto.access.3")
+pto.tmul ins(%tile, %tile) outs(%dead) loc("pypto.access.5")
+pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    assert record["nonmaterialized_access_orders"] == [5]
+    assert [node["operation"]["pypto_access_order"] for node in record["nodes"]] == [3, 7]
+
+
+def test_import_legacy_debug_selects_one_function_from_mixed_pto():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tadd [PIPE_V]
+// ========================================= //
+"""
+    pto = """
+module {
+  func.func @peer() {
+    pto.tmul ins(%tile, %tile) outs(%tile) loc("pypto.access.3")
+  }
+  func.func @kernel() {
+    pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+  }
+}
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+
+    assert record["nodes"][0]["operation"]["pypto_access_order"] == 7
+
+
+def test_import_legacy_debug_rejects_ambiguous_eliminated_access_order():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] COMPOUND pto.tload [PIPE_MTE2]
+// ========================================= //
+"""
+    pto = """
+pto.tload ins(%arg0) outs(%first) loc("pypto.access.3")
+pto.tload ins(%arg1) outs(%second) loc("pypto.access.5")
+"""
+
+    with pytest.raises(ValueError, match="alignments=2"):
         dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
 
 
@@ -3430,8 +4103,545 @@ def test_enrich_native_schedule_preserves_sync_graph_and_joins_legacy_pointer_ty
     assert "pypto_access_order" not in operation
     assert enriched["sync_edges"] == record["sync_edges"]
     assert enriched["sync_groups"] == record["sync_groups"]
-    assert enriched["raw_pto_operation_join"] == "exact_executable_order_v1"
+    assert enriched["raw_pto_operation_join"] == "unique_monotone_executable_order_v2"
     assert enriched["export_limitations"]["operation_metadata_missing"] == 0
+
+
+def test_enrich_native_schedule_correlates_retested_materialized_branch_predicate():
+    record = {
+        "schema_version": 1,
+        "function": "kernel",
+        "status": "analyzed",
+        "nodes": [
+            {
+                "id": node_id,
+                "kind": "branch",
+                "branch_kind": "IF_BEGIN",
+                "begin": node_id,
+                "branch_stack": [],
+                "loop_stack": [],
+            }
+            for node_id in (1, 12, 64)
+        ],
+        "stream_edges": [],
+        "sync_edges": [],
+    }
+    pto = """
+%c0 = arith.constant 0 : index
+%c1 = arith.constant 1 : index
+%predicate = arith.cmpf ole, %temperature, %threshold : f32
+%flag = scf.if %predicate -> (i32) {
+  %one = arith.index_cast %c1 : index to i32
+  scf.yield %one : i32
+} else {
+  %zero = arith.index_cast %c0 : index to i32
+  scf.yield %zero : i32
+}
+%flag_index_0 = arith.index_cast %flag : i32 to index
+%retest_0 = arith.cmpi slt, %c0, %flag_index_0 : index
+scf.if %retest_0 {
+}
+%flag_index_1 = arith.index_cast %flag : i32 to index
+%retest_1 = arith.cmpi slt, %c0, %flag_index_1 : index
+scf.if %retest_1 {
+}
+"""
+
+    enriched = dsa_schedule_model.enrich_native_schedule_from_pto(record, pto)
+    if_nodes = enriched["nodes"]
+
+    assert len({node["predicate_identity"] for node in if_nodes}) == 1
+    assert [node["predicate_true_value"] for node in if_nodes] == [True, True, True]
+    assert dsa_schedule_model._branch_alternatives(enriched)[0] == [1]
+    assert enriched["export_limitations"]["branch_predicates_missing"] == 0
+
+
+def test_enrich_native_schedule_preserves_inverted_branch_polarity():
+    record = {
+        "schema_version": 1,
+        "function": "kernel",
+        "status": "analyzed",
+        "nodes": [
+            {
+                "id": node_id,
+                "kind": "branch",
+                "branch_kind": "IF_BEGIN",
+                "begin": node_id,
+                "branch_stack": [],
+                "loop_stack": [],
+            }
+            for node_id in (1, 4, 7)
+        ],
+        "stream_edges": [],
+        "sync_edges": [],
+    }
+    pto = """
+%c0 = arith.constant 0 : index
+%c1 = arith.constant 1 : index
+%predicate = arith.cmpi ne, %arg0, %c0 : index
+%flag = scf.if %predicate -> (index) {
+  scf.yield %c1 : index
+} else {
+  scf.yield %c0 : index
+}
+scf.if %predicate {
+}
+%inverse = arith.cmpi eq, %flag, %c0 : index
+scf.if %inverse {
+}
+"""
+
+    enriched = dsa_schedule_model.enrich_native_schedule_from_pto(record, pto)
+
+    assert len({node["predicate_identity"] for node in enriched["nodes"]}) == 1
+    assert [node["predicate_true_value"] for node in enriched["nodes"]] == [True, True, False]
+    branch_ids, markers = dsa_schedule_model._branch_alternatives(enriched)
+    assert branch_ids == [1]
+    assert markers == {1: (1, True), 4: (1, True), 7: (1, False)}
+
+
+def test_raw_pto_loop_invariance_proves_argument_chain_but_not_induction_variable():
+    lines = """
+func.func @kernel(%arg0: index, %arg1: index) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  scf.for %i = %c0 to %arg1 step %c1 {
+    %arg_cmp = arith.cmpi ne, %arg0, %c0 : index
+    %iv_cmp = arith.cmpi ne, %i, %c0 : index
+    scf.if %arg_cmp {
+    }
+    scf.if %iv_cmp {
+    }
+  }
+}
+""".splitlines()
+    arguments, depths = dsa_schedule_model._pto_function_arguments_and_loop_depths(lines)
+
+    invariant = dsa_schedule_model._pto_loop_invariant_values(lines, arguments, depths, [])
+
+    assert "%arg_cmp" in invariant
+    assert "%iv_cmp" not in invariant
+
+
+def test_raw_pto_static_induction_predicate_has_exact_iteration_profile():
+    nodes = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 16,
+            "loop_stack": [],
+            "branch_stack": [],
+        },
+        {
+            "id": 11,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [],
+        },
+        {**_operation(0, "PIPE_V", "pto.tadd", [10]), "branch_stack": [11]},
+        {
+            "id": 15,
+            "kind": "branch",
+            "branch_kind": "IF_END",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [],
+        },
+        {
+            "id": 16,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 16,
+            "loop_stack": [],
+            "branch_stack": [],
+        },
+    ]
+    pto = """
+%c0 = arith.constant 0 : index
+%c2 = arith.constant 2 : index
+%c8 = arith.constant 8 : index
+%c512 = arith.constant 512 : index
+scf.for %kb = %c0 to %c8 step %c2 { // pypto.source_loop.17
+  %offset = arith.muli %kb, %c512 : index
+  %first = arith.cmpi eq, %offset, %c0 : index
+  scf.if %first {
+    pto.tadd ins(%left, %right) outs(%result)
+  }
+}
+"""
+
+    assert dsa_schedule_model._attach_pto_static_loop_bounds(nodes, pto) == 0
+    assert dsa_schedule_model._attach_pto_branch_predicates(nodes, pto) == 0
+
+    profile = nodes[1]["predicate_iteration_profile"]
+    assert profile["loop_ids"] == [10]
+    assert profile["iteration_counts"] == [4]
+    assert profile["values"] == [True, False, False, False]
+    assert nodes[0]["pypto_source_loop_id"] == 17
+    assert nodes[1]["predicate_loop_invariant"] is False
+    assert dsa_schedule_model._branch_alternatives({"nodes": nodes})[0] == []
+
+    record = _record()
+    record["nodes"] = nodes
+    record["stream_edges"] = []
+    record["sync_edges"] = []
+    record["sync_groups"] = []
+    queue = dsa_schedule_model._score_static_queue_event_graph(record, {0: 40.0}, {})
+    assert queue["scenario_count"] == 1
+    assert queue["mixed_iteration_branch_profile_available"] is True
+    assert queue["baseline_makespan_cycles"] == 10.0
+
+    public_score = dsa_schedule_model.score_schedule(record, _weighted_sync_model())
+    assert public_score["queue_drain_restart_model"]["status"] == "INCOMPLETE"
+    assert public_score["queue_drain_restart_model"]["limitations"] == [
+        "mixed_iteration_branch_profile_not_supported_v1"
+    ]
+
+    complete = dsa_schedule_model.score_complete_placement_dag(
+        record,
+        _weighted_sync_model(),
+        {
+            "schema_version": 2,
+            "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+            "distance_zero_edges": [],
+            "loop_recurrence_edges": [],
+        },
+        {
+            "pairs": [],
+            "synchronization_predictor_coverage_complete": True,
+            "critical_path_realized_cost_cycles": 0,
+        },
+    )
+    assert complete["status"] == "COMPLETE"
+    assert complete["critical_path_extension_cycles"] == 0.0
+
+
+def test_raw_pto_runtime_loaded_branch_remains_fail_closed():
+    nodes = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 16,
+            "loop_stack": [],
+            "branch_stack": [],
+        },
+        {
+            "id": 11,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [],
+        },
+        {
+            "id": 16,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 16,
+            "loop_stack": [],
+            "branch_stack": [],
+        },
+    ]
+    pto = """
+%c0 = arith.constant 0 : index
+%c1 = arith.constant 1 : index
+%c4 = arith.constant 4 : index
+scf.for %i = %c0 to %c4 step %c1 {
+  %runtime = pto.load_scalar %arg0[%i] : !pto.ptr<i32> -> i32
+  %predicate = arith.cmpi eq, %runtime, %c0 : i32
+  scf.if %predicate {
+  }
+}
+"""
+
+    dsa_schedule_model._attach_pto_static_loop_bounds(nodes, pto)
+    dsa_schedule_model._attach_pto_branch_predicates(nodes, pto)
+
+    assert "predicate_iteration_profile" not in nodes[1]
+    assert nodes[1]["predicate_loop_invariant"] is False
+
+
+def test_runtime_branch_profile_is_exact_and_digest_bound():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 16,
+            "static_trip_count": None,
+            "loop_stack": [],
+        },
+        {
+            "id": 11,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [],
+            "predicate_identity": "expr:runtime",
+            "predicate_loop_invariant": False,
+        },
+        {
+            "id": 16,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 16,
+            "loop_stack": [],
+        },
+    ]
+    digest_names = (
+        "schedule_sha256",
+        "problem_sha256",
+        "input_set_sha256",
+        "trip_metadata_sha256",
+    )
+    digests = {key: value * 64 for key, value in zip(digest_names, "abcd", strict=True)}
+    profile = {
+        "schema_version": 1,
+        "contract": "exact_runtime_branch_profile_v1",
+        "bindings": digests,
+        "loop_trip_counts": [{"loop_id": 10, "trip_count": 2}],
+        "branches": [
+            {
+                "if_node_id": 11,
+                "predicate_identity": "expr:runtime",
+                "loop_ids": [10],
+                "iteration_counts": [2],
+                "values": [True, False],
+                "derivation": {
+                    "kind": "captured_immutable_scalar_expression_v1",
+                    "immutability_proof": "function_argument_v1",
+                    "evidence_sha256": "e" * 64,
+                },
+            }
+        ],
+    }
+
+    enriched = dsa_schedule_model.apply_runtime_branch_profile(record, profile, **digests)
+
+    assert enriched["nodes"][0]["static_trip_count"] == 2
+    assert enriched["nodes"][1]["predicate_iteration_profile"]["values"] == [True, False]
+    assert enriched["runtime_branch_profile"]["profiled_if_node_ids"] == [11]
+    with pytest.raises(ValueError, match="input_set_sha256 does not match"):
+        dsa_schedule_model.apply_runtime_branch_profile(
+            record, profile, **{**digests, "input_set_sha256": "f" * 64}
+        )
+
+
+def test_runtime_branch_profile_supports_exact_nested_active_occurrences():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 16,
+            "static_trip_count": None,
+            "loop_stack": [],
+        },
+        {
+            "id": 11,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 11,
+            "branch": 14,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [],
+            "predicate_identity": "expr:outer",
+            "predicate_loop_invariant": False,
+        },
+        {
+            "id": 12,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 12,
+            "branch": 13,
+            "end": 13,
+            "loop_stack": [10],
+            "branch_stack": [11],
+            "predicate_identity": "expr:inner",
+            "predicate_loop_invariant": False,
+        },
+        {
+            "id": 16,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 16,
+            "loop_stack": [],
+        },
+    ]
+    digests = {
+        "schedule_sha256": "a" * 64,
+        "problem_sha256": "b" * 64,
+        "input_set_sha256": "c" * 64,
+        "trip_metadata_sha256": "d" * 64,
+    }
+    derivation = {
+        "kind": "captured_branch_outcomes_v1",
+        "evidence_sha256": "e" * 64,
+    }
+    profile = {
+        "schema_version": 1,
+        "contract": "exact_runtime_branch_profile_v1",
+        "bindings": digests,
+        "loop_trip_counts": [{"loop_id": 10, "trip_count": 4}],
+        "branches": [
+            {
+                "if_node_id": 11,
+                "predicate_identity": "expr:outer",
+                "loop_ids": [10],
+                "iteration_counts": [4],
+                "values": [False, True, False, True],
+                "derivation": derivation,
+            },
+            {
+                "if_node_id": 12,
+                "predicate_identity": "expr:inner",
+                "loop_ids": [10],
+                "iteration_counts": [4],
+                "active_flat_indices": [1, 3],
+                "values": [True, False],
+                "derivation": derivation,
+            },
+        ],
+    }
+
+    enriched = dsa_schedule_model.apply_runtime_branch_profile(record, profile, **digests)
+    profiles = dsa_schedule_model._branch_iteration_profiles(enriched)
+    assert dsa_schedule_model._branch_value_for_context(12, {}, profiles, {10: 1}) is True
+    assert dsa_schedule_model._branch_value_for_context(12, {}, profiles, {10: 3}) is False
+    with pytest.raises(ValueError, match="inactive in loop context"):
+        dsa_schedule_model._branch_value_for_context(12, {}, profiles, {10: 0})
+
+
+def test_complete_placement_dag_rejects_unproven_loop_variant_branch():
+    record = _record()
+    record["nodes"] = [
+        {
+            "id": 10,
+            "kind": "loop",
+            "loop_kind": "LOOP_BEGIN",
+            "begin": 10,
+            "end": 16,
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
+        {
+            "id": 11,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [],
+            "predicate_identity": "expr:loop-varying",
+            "predicate_true_value": True,
+            "predicate_loop_invariant": False,
+        },
+        {**_operation(0, "PIPE_V", "pto.tadd", [10]), "branch_stack": [11]},
+        {
+            "id": 15,
+            "kind": "branch",
+            "branch_kind": "IF_END",
+            "begin": 11,
+            "branch": 13,
+            "end": 15,
+            "loop_stack": [10],
+            "branch_stack": [],
+        },
+        {
+            "id": 16,
+            "kind": "loop",
+            "loop_kind": "LOOP_END",
+            "begin": 10,
+            "end": 16,
+            "static_trip_count": 4,
+            "loop_stack": [],
+        },
+    ]
+    candidate_scores = {
+        "schema_version": 2,
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+    }
+    realized = {
+        "pairs": [],
+        "synchronization_predictor_coverage_complete": True,
+        "critical_path_realized_cost_cycles": 0,
+    }
+
+    result = dsa_schedule_model.score_complete_placement_dag(
+        record, _weighted_sync_model(), candidate_scores, realized
+    )
+
+    assert result == {
+        "schema_version": 1,
+        "model_version": "complete_placement_dag_v5",
+        "status": "INCOMPLETE",
+        "limitations": ["loop_variant_branch_profile_not_supported_v1"],
+        "loop_variant_branch_nodes": [11],
+        "critical_path_extension_cycles": None,
+    }
+
+
+def test_complete_placement_dag_reports_loop_variant_branch_and_pipeline_gaps():
+    record = _record()
+    record["nodes"].insert(
+        0,
+        {
+            "id": 10,
+            "kind": "branch",
+            "branch_kind": "IF_BEGIN",
+            "begin": 10,
+            "loop_stack": [9],
+            "branch_stack": [],
+            "predicate_loop_invariant": False,
+        },
+    )
+    candidate_scores = {
+        "schema_version": 2,
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+        "distance_zero_edges": [],
+        "loop_recurrence_edges": [],
+    }
+    realized = {
+        "pairs": [],
+        "synchronization_predictor_coverage_complete": False,
+        "critical_path_realized_cost_cycles": 0,
+    }
+
+    result = dsa_schedule_model.score_complete_placement_dag(
+        record, _weighted_sync_model(), candidate_scores, realized
+    )
+
+    assert result["limitations"] == [
+        "loop_variant_branch_profile_not_supported_v1",
+        "unmodeled_pipeline_serialization",
+    ]
 
 
 def test_import_legacy_debug_extracts_scalar_outs_type():
@@ -3561,6 +4771,39 @@ scf.for %i = %c0_index to %arg0 step %c1_index {
     assert dsa_schedule_model.classify_static_schedule(record)["status"] == "DYNAMIC_LOOP_EXCLUDED"
 
 
+def test_import_legacy_debug_correlates_dynamic_loops_with_the_same_raw_bound():
+    log = """
+// === [PTOInsertSync Debug] After EventId Allocation === //
+[   0] LOOP LOOP_BEGIN (begin=0, end=2)
+  [   1] COMPOUND pto.tadd [PIPE_V]
+[   2] LOOP LOOP_END (begin=0, end=2)
+[   3] LOOP LOOP_BEGIN (begin=3, end=5)
+  [   4] COMPOUND pto.tload [PIPE_MTE2]
+[   5] LOOP LOOP_END (begin=3, end=5)
+// ========================================= //
+"""
+    pto = """
+%c0_index = arith.constant 0 : index
+%c1_index = arith.constant 1 : index
+%bound = arith.index_cast %arg0 : i32 to index
+scf.for %i = %c0_index to %bound step %c1_index {
+  pto.tadd ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
+}
+scf.for %j = %c0_index to %bound step %c1_index {
+  pto.tload ins(%arg0) outs(%tile) loc("pypto.access.8")
+}
+"""
+
+    record = dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
+    loop_begins = [
+        node for node in record["nodes"] if node["kind"] == "loop" and node["loop_kind"] == "LOOP_BEGIN"
+    ]
+
+    assert record["export_limitations"]["static_loop_bounds_missing"] == 2
+    assert len({node["dynamic_trip_count_identity"] for node in loop_begins}) == 1
+    assert len({node["dynamic_trip_count_expression"] for node in loop_begins}) == 1
+
+
 def test_import_legacy_debug_rejects_raw_pto_operation_mismatch():
     log = """
 // === [PTOInsertSync Debug] After EventId Allocation === //
@@ -3573,7 +4816,7 @@ pto.tload ins(%arg0) outs(%tile) loc("pypto.access.3")
 pto.tmul ins(%tile, %tile) outs(%tile) loc("pypto.access.7")
 """
 
-    with pytest.raises(ValueError, match="operation sequence does not match"):
+    with pytest.raises(ValueError, match="no unique monotone join"):
         dsa_schedule_model.import_insert_sync_debug(log, function="kernel", pto_text=pto)
 
 

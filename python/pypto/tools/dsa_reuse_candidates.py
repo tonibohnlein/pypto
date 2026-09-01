@@ -16,7 +16,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-_RECORDS_KEY = "recognized_reuse_candidate_records_v4"
+_RECORDS_KEYS = (
+    "recognized_reuse_candidate_records_v5",
+    "recognized_reuse_candidate_records_v4",
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,8 @@ class ReuseCandidateRecord:
     prior_access_order: int
     next_access_order: int
     loop_carried: bool
+    source_loop_id: int | None
+    penalty_reason: Literal["reuse_recognizer", "pipeline_serialization"]
     fields: tuple[str, ...]
 
 
@@ -44,11 +49,12 @@ def _split_arrow(value: str, separator: str, field: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
-def parse_candidate_record(record: str) -> ReuseCandidateRecord:
+def parse_candidate_record(record: str) -> ReuseCandidateRecord:  # noqa: PLR0912 - strict record validation
     """Parse and validate one raw reuse-candidate record.
 
     Args:
-        record: One item from ``recognized_reuse_candidate_records_v4``.
+        record: One item from ``recognized_reuse_candidate_records_v5`` (or
+            the backward-compatible v4 form without ``penalty_reason``).
 
     Returns:
         Parsed candidate with validated ordering evidence.
@@ -110,6 +116,22 @@ def parse_candidate_record(record: str) -> ReuseCandidateRecord:
     if len(distances) != 1:
         raise ValueError(f"candidate record requires exactly one distance field in '{record}'")
 
+    penalty_reason_text = keyed.get("penalty_reason", "reuse_recognizer")
+    if penalty_reason_text not in {"reuse_recognizer", "pipeline_serialization"}:
+        raise ValueError(f"invalid penalty_reason '{penalty_reason_text}' in '{record}'")
+    penalty_reason = cast(Literal["reuse_recognizer", "pipeline_serialization"], penalty_reason_text)
+    source_loop_id = None
+    if "distance_1" in distances:
+        loop_text = keyed.get("loop")
+        if loop_text is None:
+            raise ValueError(f"loop-carried candidate is missing loop identity in '{record}'")
+        try:
+            source_loop_id = int(loop_text)
+        except ValueError as error:
+            raise ValueError(f"invalid source loop identity '{loop_text}' in '{record}'") from error
+        if source_loop_id < 0:
+            raise ValueError(f"negative source loop identity '{loop_text}' in '{record}'")
+
     return ReuseCandidateRecord(
         first_buffer=first_buffer,
         second_buffer=second_buffer,
@@ -124,6 +146,8 @@ def parse_candidate_record(record: str) -> ReuseCandidateRecord:
         prior_access_order=prior_access_order,
         next_access_order=next_access_order,
         loop_carried="distance_1" in distances,
+        source_loop_id=source_loop_id,
+        penalty_reason=penalty_reason,
         fields=fields,
     )
 
@@ -149,19 +173,26 @@ def load_candidate_records(path: str | Path) -> list[ReuseCandidateRecord]:
     if not isinstance(document, dict) or not isinstance(document.get("metadata"), dict):
         raise ValueError(f"{source}: missing metadata object")
     metadata = document["metadata"]
-    encoded = metadata.get(_RECORDS_KEY)
-    if not isinstance(encoded, str):
-        raise ValueError(f"{source}: missing metadata.{_RECORDS_KEY}")
+    selected_key = next((key for key in _RECORDS_KEYS if isinstance(metadata.get(key), str)), None)
+    if selected_key is None:
+        raise ValueError(f"{source}: missing metadata.{_RECORDS_KEYS[0]} or .{_RECORDS_KEYS[1]}")
+    encoded = metadata[selected_key]
     records = [] if not encoded else [parse_candidate_record(record) for record in encoded.split(";")]
-    expected_text = metadata.get("recognized_reuse_candidates")
+    count_key = (
+        "recognized_reuse_candidates_v5"
+        if selected_key == "recognized_reuse_candidate_records_v5"
+        else "recognized_reuse_candidates"
+    )
+    expected_text = metadata.get(count_key)
     if isinstance(expected_text, str):
         try:
             expected = int(expected_text)
         except ValueError as error:
-            raise ValueError(f"{source}: invalid recognized_reuse_candidates '{expected_text}'") from error
+            raise ValueError(f"{source}: invalid {count_key} '{expected_text}'") from error
         if expected != len(records):
             raise ValueError(
-                f"{source}: candidate count mismatch: metadata={expected}, records={len(records)}"
+                f"{source}: candidate count mismatch for {count_key}: "
+                f"metadata={expected}, records={len(records)}"
             )
     return records
 

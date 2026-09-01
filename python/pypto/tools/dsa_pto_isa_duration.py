@@ -58,7 +58,7 @@ _FORMULA_OPCODE = {
 _ANY_PARAMETER_OPS = {"TEXP", "TSQRT"}
 _MATMUL_OPS = {"pto.tmatmul", "pto.tmatmul.acc"}
 _TRANSFER_OPS = {"pto.tload": "TLOAD", "pto.tstore": "TSTORE", "pto.tmov": "TMOV"}
-_SCALAR_STAGE_OPS = {"pto.load_scalar", "pto.tpush", "pto.tpop"}
+_SCALAR_STAGE_OPS = {"pto.load_scalar", "pto.tpush", "pto.tpop", "pto.tfree"}
 _PERF_SIM_DEFAULT_OPS = {
     "pto.tadd",
     "pto.tadds",
@@ -69,9 +69,14 @@ _PERF_SIM_DEFAULT_OPS = {
     "pto.tcvt",
     "pto.texpands",
     "pto.textract",
+    "pto.tfillpad",
     "pto.tgather",
     "pto.tgetval",
     "pto.tmrgsort",
+    # TMUL first consults the pinned formula table. Shapes absent from that
+    # table (including Gate's fp32 1x4096 tile) use Perf-Sim's deterministic
+    # vector fallback instead of becoming an unprincipled local constant.
+    "pto.tmul",
     "pto.tmuls",
     "pto.tneg",
     "pto.trowexpandmul",
@@ -392,6 +397,13 @@ class PtoIsaDurationProvider:
                     detail="A2/A3 lightweight matmul model uses an explicit six-cycle head",
                 )
         if op_name in _PERF_SIM_DEFAULT_OPS:
+            if op_name in _FORMULA_OPCODE and tiles:
+                tile = tiles[0]
+                if self._lookup_formula(_FORMULA_OPCODE[op_name], tile.dtype, tile.cols) is not None:
+                    # The fitted formula supplies only an inclusive duration;
+                    # it does not expose the Perf-Sim fallback's head/tail
+                    # decomposition.
+                    return None
             result_tiles = [tile for item in result_types if (tile := parse_tile_type(item)) is not None]
             operand_tiles = [tile for item in operand_types if (tile := parse_tile_type(item)) is not None]
             if op_name in _PERF_SIM_SOURCE_WORK_OPS:

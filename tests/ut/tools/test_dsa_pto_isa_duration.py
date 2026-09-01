@@ -208,6 +208,37 @@ def test_missing_formula_signature_uses_pinned_perf_sim_default():
     assert estimate.fallback is False
 
 
+def test_gate_tmul_uses_pinned_perf_sim_default_when_formula_shape_is_absent():
+    node = _node(
+        "pto.tmul",
+        "PIPE_V",
+        "!pto.tile_buf<vec, 1x4096xf32, valid=?x?>",
+        "!pto.tile_buf<vec, 1x4096xf32, valid=?x?>",
+    )
+    node["operation"]["result_types"] = ["!pto.tile_buf<vec, 1x4096xf32, valid=?x?>"]
+
+    estimate = _provider().estimate(node, work_bytes=16384)
+
+    assert estimate.cycles == 130
+    assert estimate.source == "pto_isa_perf_sim_default"
+    assert estimate.fallback is False
+    pipeline = _provider().estimate_pipeline(node)
+    assert pipeline is not None
+    assert pipeline.startup_cycles == 2
+    assert pipeline.pending_tail_cycles == 0
+
+
+def test_gate_tfillpad_uses_pinned_perf_sim_default():
+    node = _node("pto.tfillpad", "PIPE_V", "!pto.tile_buf<vec, 8x8xf32, valid=?x?>")
+    node["operation"]["result_types"] = ["!pto.tile_buf<vec, 8x8xf32, valid=?x?>"]
+
+    estimate = _provider().estimate(node, work_bytes=256)
+
+    assert estimate.cycles == 4
+    assert estimate.source == "pto_isa_perf_sim_default"
+    assert estimate.fallback is False
+
+
 def test_ttrans_uses_pinned_mte1_default_rule():
     node = _node(
         "pto.ttrans",
@@ -239,6 +270,7 @@ def test_ttrans_uses_pinned_mte1_default_rule():
         ),
         (_node("pto.tpush", "PIPE_FIX"), "pto_isa_perf_sim_scalar_stage"),
         (_node("pto.tpop", "PIPE_MTE2"), "pto_isa_perf_sim_scalar_stage"),
+        (_node("pto.tfree", "PIPE_FIX"), "pto_isa_perf_sim_scalar_stage"),
     ],
 )
 def test_scalar_stage_operations_use_pinned_perf_sim_contract(node, expected_source):
