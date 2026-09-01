@@ -402,92 +402,77 @@ maximum per-scenario extension. This distinction matters for Gumbel: two short
 ELSE instances expose a large local extension, but six long THEN instances
 remain the dispatch bottleneck before and after placement.
 
-Using the archived deterministic inputs,
-`rmsnorm_rope_cache_write/half` is now complete. Its two runtime-loaded
-predicates use the exact mixed branch profile of the measured dispatch. The
-same contract can represent `softmax_pool_c128/native`, but that case has not
-yet been rescored from a captured profile and is not new evidence here.
-
-The KV gap is repaired. A fresh export records producer and consumer access
-sites for every `pipeline_serialization` penalty. Of the 64 realized pairs in
-each arm, Cypress has 34 pipeline-serialization pairs and DSA-RP has 40; 16 and
-20 respectively materialize as lowered operation edges, while the remainder
-are proven eliminated by a unique raw-PTO join. Despite equal unit cost
-(`64 -> 64`), the complete-placement score assigns Cypress an extension of
-`408, 560, 1200, 1840, 2480, 3120` cycles over the frozen weight grid and DSA-RP
-zero throughout. This correctly predicts the measured DSA-RP win without
-consulting InsertSync.
-
-Gate's remaining duration signatures are now grounded by pinned PTO-ISA or
-serial Perf-Sim evidence, including `trecip`, `tabs`, `tmax`, `tmaxs`,
-`trowmax`, `trowexpanddiv`, `tlog`, `tmins`, and scalar store. Consequently
-`ffn_norm`, `gate_aiv`, `route_sort`, and `x_norm_quant` score at all four
-capacities for both arms. `gate_aic` still fails closed because the measured
-compiler revision did not preserve original source-loop identity. A current
-re-export carries the marker, but its operation stream has an additional
-`tmatmul`; importing that marker into the frozen endpoint would therefore mix
-compiler revisions rather than repair provenance. A parent-wide Gate ordering
-must not be inferred from the four complete children.
-
-The corrected retrospective grid contains 19 measured non-Gate cells: 16 are
-model-eligible and three fail closed on missing source-loop or runtime-branch
-provenance. The confirmed KV win is predicted at every weight. The confirmed
-RMS win crosses the predeclared 2% modeled-effect floor at `64--160` cycles.
-At those four weights the model is 2/2 on threshold-cleared two-device
-orderings, but two directional workloads are insufficient for meaningful
-leave-one-workload-out calibration. Gate's confirmed Cypress ordering still
-has no complete parent score.
-
-The Gumbel false confidence is resolved rather than calibrated away. With the
-parallel-dispatch aggregation above, Cypress adds 41 cycles to a
-`383859--421011` cycle dispatch, only `0.0097--0.0107%`; the evaluator therefore
-predicts a tie at every weight, matching the q1 device null. The previous
-strict DSA-RP prediction incorrectly took the maximum local branch extension
-and treated every non-zero difference as directional.
+Multi-function drivers require one additional, static aggregation layer. The
+`aggregate-dispatch-grid` command consumes a `static_dispatch_graph_v1`
+manifest. Functions launched by one runtime task are co-scheduled and combine
+by `max`; explicit task dependencies combine through a node-weighted longest
+path. Every declared function must appear in exactly one task, every function
+grid must use the same synchronization-weight grid, and task cycles or
+incomplete scores fail closed. Function grids must also share one semantic
+duration-model hash, use the no-fallback policy, and bind each inner score to
+its declared synchronization weight. Runtime-profile aggregation remains
+retrospective only (`planner_eligible_static=false`); planner admission accepts
+only static branch envelopes and static task structure. The representative
+RMS, KV, Gate, and Gumbel outcomes are summarized below rather than duplicated
+as per-case prose.
 
 The requested representative cases expose the missing model coverage and the
 remaining mechanism gap:
 
 | Case | Existing two-device evidence | Unit objective | Whole-function model status |
 | ---- | ---------------------------- | -------------- | --------------------------- |
-| `rmsnorm_rope_cache_write/half` | DSA-RP over Cypress `-7.19%/-7.43%` | `8 -> 0` | Complete with the exact digest-bound runtime profile. Cypress adds `62, 97, 161, 354, 610, 761` cycles and DSA-RP adds zero over weights `16--160`. |
+| `rmsnorm_rope_cache_write/half` | DSA-RP over Cypress `-7.19%/-7.43%` | `8 -> 0` | Analysis-complete with an exact digest-bound runtime profile, but not planner-eligible. Cypress adds `62, 97, 161, 354, 610, 761` cycles and DSA-RP adds zero over weights `16--160`. |
 | `kv_score_proj_c128/native` | DSA-RP over Cypress `-2.50%/-2.30%` | `64 -> 64` | Complete. Pipeline-serialization provenance and the repaired lowered-access join give Cypress a positive critical-path extension and DSA-RP zero at every tested weight. |
 | `mtp/gate` | Cypress faster at all four capacities, approximately `1.6--4.1%` | DSA-RP ties or improves the count | Duration-complete but parent-incomplete: four children score, while frozen `gate_aic` lacks source-loop provenance and a current export changes the operation stream. |
-| `gumbel_argmax/q1` | DSA-RP versus Cypress `+0.22%/+0.11%`, a latency null | `14 -> 0` | Complete and correctly tied at every weight after max-instance dispatch aggregation and the 2% modeled-effect gate. |
+| `gumbel_argmax/q1` | DSA-RP versus Cypress `+0.22%/+0.11%`, a latency null | `14 -> 0` | Analysis-complete and correctly tied after runtime max-instance aggregation, but not planner-eligible. |
 | `hc_post/native` | weak, sign-changing, or non-reproducing effects across campaigns | `33 -> 24` in the original cell | `PARAMETRIC_ASSUMPTION` under one correlated dynamic-loop parameter. It predicts DSA-RP no worse, but neither the extrapolated score nor the device label supports validation. |
 
-The durable device sources are
-`dsa-rp-loop-aware-model-prospective-0820ab418-final.tar.gz`
-(`1a7e5d5ffe93a43b260012d47af98321cb5a10156ecc8486dbc37f00767374d2`)
-and `dsa-rp-four-candidate-physical-penalty-aeba32c70-final.tar.gz`
-(`a05aad5829865d196bc7d7a415b40d8c06b3e6b566d1f80fce269352c78765a0`).
-Every `score-realized-grid` result records the SHA-256 of its schedule, problem,
-solution, duration model, and optional non-materialization evidence, plus the
-selected function and fail-closed duration policy. A grid can be reproduced
-without opening latency data while scoring each frozen placement:
+Every grid records content hashes for its schedule, problem, solution, duration
+model, and optional non-materialization evidence. The device archives and
+their hashes are indexed in the experiment ledger. Reproduction uses:
 
 ```bash
 python -m pypto.tools.dsa_schedule_model score-realized-grid \
   SCHEDULE.jsonl PROBLEM.dsa.json SOLUTION.dsa.solution.json \
   --function FUNCTION --model DURATION_MODEL.json \
   --sync-latency-grid 16,32,64,96,128,160 -o ARM_GRID.json
+python -m pypto.tools.dsa_schedule_model aggregate-dispatch-grid \
+  STATIC_DISPATCH_MANIFEST.json -o ARM_DISPATCH_GRID.json
 python -m pypto.tools.dsa_penalty_model_evaluation sync-weight-grid-input.tsv \
   --sync-weight-grid --split development --minimum-device-effect 0.02 \
   --minimum-model-effect 0.02 \
-  --required-device-count 2 -o sync-weight-grid-evaluation.json
+  --required-device-count 2 \
+  --planner-admission planner-admission.json \
+  -o sync-weight-grid-evaluation.json
 ```
 
-This analysis fails the gate for an incremental critical-path planner. The
-planner has not been changed and no new device task is justified from this
-grid. Static and exact runtime mixed-iteration branches, parallel-dispatch
-aggregation, KV pipeline provenance, and the KV access join are complete. RMS,
-KV, and Gumbel now satisfy their representative-case gates. The predeclared
-scientific gate nevertheless fails because frozen Gate lacks source-loop
-provenance and only two confirmed directional workloads are model-complete.
-The incremental greedy planner is therefore deliberately not implemented. The
-next local requirement is a product-faithful Gate graph at the measured
-compiler contract, followed by more independently measured, model-complete
-directional cases for meaningful leave-one-workload-out calibration.
+Weight selection is strict. A synchronization weight is stable only if it is
+optimal in every leave-one-workload-out training fold and in the full
+development set. The selected value is the smallest member of that
+intersection; an empty intersection blocks the planner. The predeclared
+`complete_placement_planner_admission_v1` gate additionally requires at least
+six independent threshold-cleared workload directions, including both DSA-RP
+and Cypress wins, and exact representative outcomes for RMS, KV, Gate, and
+Gumbel. Gumbel is a device null only when every device remains below the
+threshold; a mixed-threshold result cannot satisfy the tie gate. Runtime branch
+profiles remain analysis-only and cannot satisfy planner eligibility.
+
+All opened timing is now retrospective development evidence. The exact-pin
+reconstruction is recorded in
+[`data/dsa_replay_fixed_host_reconstruction_v1.json`](data/dsa_replay_fixed_host_reconstruction_v1.json):
+36 invocations, 33 semantic problems, 29 penalty-bearing problems, and 208
+rebuilt maps whose table hash exactly matches the archive. Only one of nine
+timed targets is statically model-complete; the others fail closed on missing
+durations or source-loop identity. The durable admission requirements live in
+[`data/dsa_complete_placement_planner_admission_v1.json`](data/dsa_complete_placement_planner_admission_v1.json).
+Their SHA-256 values are respectively `6dd9116deca0a2d27676424d318632a55f2ed3c28ed99684045d23f0668404b8`
+and `179500f23c08a39d772b351f45b9623a92abcda330e52371c0b6291e3d8a3c8d`.
+
+The analysis fails planner admission. Runtime-profile RMS and Gumbel scores are
+useful retrospective explanations but are not planner-eligible; frozen Gate is
+parent-incomplete; and the corpus lacks enough correctly predicted directional
+workloads, including a Cypress win. The incremental planner is therefore not
+implemented and no new device task is justified.
 
 Scoring each arm's actual post-InsertSync graph gives the intended analysis
 oracle. On the same retrospective corpus, every one of 40 strict model

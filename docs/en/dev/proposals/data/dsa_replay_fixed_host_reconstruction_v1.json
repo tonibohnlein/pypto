@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "contract": "dsa_replay_fixed_host_reconstruction_v1",
+  "input_archive": {
+    "name": "dsa-rp-replay-fixed-prospective-holdout-9b05800db-final.tar.gz",
+    "sha256": "dfa578b7b4c6e3fabee96ec77aee879c1d1b385f7d62b1335eddc5cd9f992c1f"
+  },
+  "revisions": {
+    "pypto": "9b05800db5cf49f5e69443b6e11429406114590f",
+    "pypto_lib": "2ca9f3607e38542f442944c9c1e94499f686ef21",
+    "runtime": "1bc7408606e6f74a323df884c2604df49474781d",
+    "dsa_solver": "60ac39b02b008dc3907b876ad47a1cc342aa01fa",
+    "pto_isa": "cd4a3d3f7a1a27fcfe536f617e9bca3008929664"
+  },
+  "fresh_export": {
+    "invocation_count": 36,
+    "semantic_problem_count": 33,
+    "penalty_bearing_problem_count": 29,
+    "export_status_sha256": "0ebd67d14f51a249d7e32396c0bafd8b48f06ff847a174792dfaafb97f786046",
+    "invocations_sha256": "db26f40e283df96373c41c959357f0716d0cbffb51552b049b4621d25901b30c",
+    "unique_problems_sha256": "efc89619e58a8c99c8f28be616c4fa611379779bb808866d554796ef025ccf2c"
+  },
+  "placement_reconstruction": {
+    "instance_capacity_arm_cell_count": 576,
+    "complete_map_count": 208,
+    "selected_map_digest_mismatch_count": 0,
+    "screen_results_semantic_sha256": "cb497dfa79d11c19e372a176be9c3756acf5f15aa5084d0f7bbb784394d07228",
+    "screen_results_excluded_identity_fields": [
+      "runtime_us"
+    ],
+    "archived_complete_maps_sha256": "8e0f1c5786418b262d5916f7be8aa68ef176a0d889e8382879ba69741e193129",
+    "rebuilt_complete_maps_sha256": "8e0f1c5786418b262d5916f7be8aa68ef176a0d889e8382879ba69741e193129"
+  },
+  "model_coverage": {
+    "timed_target_count": 9,
+    "statically_model_complete_target_count": 1,
+    "missing_duration_target_count": 6,
+    "missing_source_loop_identity_target_count": 2
+  }
+}

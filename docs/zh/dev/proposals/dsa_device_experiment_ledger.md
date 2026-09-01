@@ -1,6 +1,6 @@
 # DSA-RP 设备实验记录
 
-最后汇总日期：2026-08-31。
+最后汇总日期：2026-09-01。
 
 ## 用途
 
@@ -39,7 +39,7 @@ workload。
 | `dsa-rp-dspark-sync-address-ablation-final.tar.gz` | 五个合法 endpoint，双设备 | DsPark slowdown 再次未复现；恢复的 PTO handshake 编译成相同 device binary，只能作为 noise control。 |
 | `dsa-rp-driver-first-corpus-verification-0fe01d2e-final.tar.gz` | 20 workload、320 logical cell、419 correctness run | 20 个 workload 在四容量、四逻辑 policy 下全部通过，无 placement-correctness failure；没有 timing。 |
 | `dsa-rp-driver-first-timing-8d8e76df-final.tar.gz` | 19/20 primary workload，两种 device domain | tight selection 产生大量 physical null；仅 `dspark/rmsnorm.py` 确认 DSA-RP 比 Cypress 快约 2.6-3.6%。native-map control 证明 instrument 可解析 8-33% effect。 |
-| `dsa-rp-replay-fixed-prospective-holdout-9b05800db-final.tar.gz` | 八个 frozen workload、九个 target、13,440 sample | DSA-RP 在五个 target 上确认胜过 Cypress，且从未确认更慢；幅度约 3.2-6.1%。这是最强的 prospective policy 证据。 |
+| `dsa-rp-replay-fixed-prospective-holdout-9b05800db-final.tar.gz` | 八个 frozen workload、九个 target、13,440 sample | DSA-RP 在五个 target 上确认胜过 Cypress，且从未确认更慢；幅度约 3.2-6.1%。该 campaign 原为 prospective，但 timing 已用于 model 设计，因此现在归类为 retrospective development evidence。 |
 | `dsa-rp-four-candidate-physical-penalty-aeba32c70-final.tar.gz` | 四个新 workload、6,400 sample | `kv_score_proj_c128` 确认 DSA-RP 比 Cypress 快约 2.3-2.5%，尽管 sync site 更多；Gumbel 的大 unit-cost gap 是 latency null。 |
 | `dsa-rp-kv-gumbel-legal-ablations-2bdc441b0-final.tar.gz` | 五个 relation family、address control、6,400 sample | 恢复 Gumbel `(2,39)` 同时删除一个静态 ELSE-arm barrier，并提速 2.1-2.35%；这确认了 placement-relation contrast 的因果性，但没有证明 barrier 导致提速。`(38,42)` 约 +1.9%，`(3,38)` 约 +0.4%，`(38,79)` 为 null；KV `(8,22)` 非 causal。 |
 | `dsa-rp-queue-event-model-device-validation-9217dd575-final.tar.gz` | 16 个 endpoint、6,400 sample、32 个 branch-profile swimlane | 实际 6-THEN/2-ELSE profile 下，`(2,39)` 的 barrier marginal 恰为零，而实测收益主要来自较长的 THEN block。per-pipe barrier constant 因 4.40x calibration spread 被否定；barrier 因果性仍需 placement x barrier factorial 才能判断。 |
@@ -63,8 +63,16 @@ workload。
 
 ## 当前证据边界
 
-prospective 八 workload holdout 支持“结构化 penalty-aware DSA-RP 能在真实 kernel 上胜过
-Cypress”的结论，但尚未验证当前 analytical penalty model。合法 ablation 解释了原因：
-pair cost 依赖上下文且可以为负，exposed latency 取决于完整 post-InsertSync graph，而不只是
-relation 或 barrier 数量。下一次 model evaluation 必须在打开 held-out timing 前冻结带符号的
-post-InsertSync marginal。
+replay-fixed 八 workload campaign 支持“结构化 penalty-aware DSA-RP 能在真实 kernel 上胜过
+Cypress”的结论，但它已不再是 model holdout，也尚未验证当前 analytical penalty model。
+合法 ablation 表明 pair cost 依赖完整 placement，不能只按 relation 或 barrier 数量计数。
+planner admission 现在要求：一个在全部 leave-one-workload-out fold 中稳定的全局 weight、同时包含
+DSA-RP 与 Cypress 的方向性胜出、足够的正确预测 workload，以及 RMS/KV/Gate/Gumbel 代表用例。
+runtime-profile score 仅用于回顾解释，不能满足 planner eligibility。未来 holdout 必须使用新
+workload，并在打开 timing 前冻结 capacity 与 prediction。
+
+后续 exact-pin 纯主机重建复现了 archive 中全部 208 个 complete replay map，且 selected-map
+digest 全部一致；但九个 timing target 中只有一个在冻结 compiler revision 上 statically
+model-complete。其余 target 因 duration signature 或 source-loop identity 缺失而 fail closed，
+不是 replay drift。该 campaign 仍是有效 device evidence，但目前不给全局 weight calibration
+增加新的 threshold-cleared directional case。

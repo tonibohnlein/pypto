@@ -8025,7 +8025,336 @@ def _run_direct_model_command(args: argparse.Namespace) -> bool:
             },
         )
         return True
+    if args.command == "aggregate-dispatch-grid":
+        _write_json(args.output, aggregate_static_dispatch_grid(args.manifest))
+        return True
     return False
+
+
+def _dispatch_grid_score_makespans(score: Mapping[str, Any]) -> tuple[float, float, str, bool]:
+    """Resolve one function score to concrete dispatch makespans.
+
+    A captured parallel-branch profile is useful for retrospective analysis,
+    but it is not information an address planner may consult.  The returned
+    boolean therefore distinguishes a purely static score from an
+    input-profile-dependent one.
+    """
+
+    if score.get("status") != "COMPLETE":
+        raise ValueError(
+            f"static dispatch aggregation requires COMPLETE per-function scores; got {score.get('status')!r}"
+        )
+    runtime_score = score.get("runtime_parallel_dispatch_score")
+    if runtime_score is not None:
+        if not isinstance(runtime_score, Mapping):
+            raise ValueError("runtime_parallel_dispatch_score must be an object")
+        base = runtime_score.get("base_makespan_cycles")
+        placement = runtime_score.get("placement_makespan_cycles")
+        source = "runtime_parallel_branch_profile"
+        planner_eligible = False
+    else:
+        base = score.get("base_makespan_cycles")
+        placement = score.get("placement_makespan_cycles")
+        source = "static_worst_case_branch_envelope"
+        planner_eligible = True
+    if not isinstance(base, (int, float)) or not isinstance(placement, (int, float)):
+        raise ValueError("complete per-function score has no concrete base/placement makespan")
+    base_cycles = float(base)
+    placement_cycles = float(placement)
+    if not math.isfinite(base_cycles) or not math.isfinite(placement_cycles):
+        raise ValueError("per-function makespans must be finite")
+    if base_cycles <= 0 or placement_cycles <= 0:
+        raise ValueError("per-function makespans must be positive")
+    return base_cycles, placement_cycles, source, planner_eligible
+
+
+def _dispatch_dag_makespan(
+    task_durations: Mapping[str, float], edges: Sequence[tuple[str, str]]
+) -> tuple[float, list[str]]:
+    """Compute a node-weighted task-DAG makespan and one critical path."""
+
+    successors: dict[str, list[str]] = {task: [] for task in task_durations}
+    predecessors: dict[str, list[str]] = {task: [] for task in task_durations}
+    indegree = {task: 0 for task in task_durations}
+    for source, target in edges:
+        successors[source].append(target)
+        predecessors[target].append(source)
+        indegree[target] += 1
+    ready = deque(sorted(task for task, degree in indegree.items() if degree == 0))
+    finish: dict[str, float] = {}
+    critical_predecessor: dict[str, str | None] = {}
+    visited = 0
+    while ready:
+        task = ready.popleft()
+        visited += 1
+        parent = max(predecessors[task], key=finish.__getitem__) if predecessors[task] else None
+        critical_predecessor[task] = parent
+        finish[task] = task_durations[task] + (finish[parent] if parent is not None else 0.0)
+        for successor in sorted(successors[task]):
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                ready.append(successor)
+    if visited != len(task_durations):
+        raise ValueError("static dispatch graph contains a cycle")
+    last = max(finish, key=finish.__getitem__)
+    path: list[str] = []
+    cursor: str | None = last
+    while cursor is not None:
+        path.append(cursor)
+        cursor = critical_predecessor[cursor]
+    path.reverse()
+    return finish[last], path
+
+
+def _static_dispatch_duration_contract(path: Path, document: Mapping[str, Any]) -> dict[str, str]:
+    duration_model = document.get("duration_model")
+    semantic_sha256 = duration_model.get("semantic_sha256") if isinstance(duration_model, Mapping) else None
+    if not isinstance(semantic_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", semantic_sha256) is None:
+        raise ValueError(f"{path}: duration model has no valid semantic_sha256")
+    duration_policy = document.get("duration_policy")
+    if duration_policy != "fail_closed_no_fallback":
+        raise ValueError(f"{path}: duration policy must be fail_closed_no_fallback")
+    duration_coverage = document.get("duration_coverage")
+    if not isinstance(duration_coverage, Mapping):
+        raise ValueError(f"{path}: duration coverage must be an object")
+    if duration_coverage.get("fallback_node_count") != 0 or duration_coverage.get("fallback_node_ids") != []:
+        raise ValueError(f"{path}: static dispatch aggregation forbids fallback duration nodes")
+    return {"semantic_sha256": semantic_sha256, "duration_policy": duration_policy}
+
+
+def _static_dispatch_weights(path: Path, results: Sequence[Any]) -> list[float]:
+    weights: list[float] = []
+    for index, row in enumerate(results):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"{path}: result {index} must be an object")
+        weight = _as_number(row.get("sync_latency_cycles"))
+        if weight is None or weight <= 0:
+            raise ValueError(f"{path}: result {index} weight must be finite and positive")
+        score = row.get("score")
+        if not isinstance(score, Mapping):
+            raise ValueError(f"{path}: result {index} has no score object")
+        inner_weight = _as_number(score.get("synchronization_latency_cycles"))
+        if inner_weight != weight:
+            raise ValueError(
+                f"{path}: result {index} inner synchronization weight {inner_weight!r} "
+                f"does not match outer weight {weight}"
+            )
+        weights.append(weight)
+    if len(weights) != len(set(weights)) or weights != sorted(weights):
+        raise ValueError(f"{path}: placement grid weights must be unique and increasing")
+    return weights
+
+
+def _load_static_dispatch_grids(
+    manifest_path: Path, raw_functions: Mapping[str, Any]
+) -> tuple[
+    dict[str, Mapping[str, Any]],
+    dict[str, dict[str, Any]],
+    list[float],
+    dict[str, str],
+]:
+    grids: dict[str, Mapping[str, Any]] = {}
+    grid_inputs: dict[str, dict[str, Any]] = {}
+    expected_weights: list[float] | None = None
+    expected_duration_contract: dict[str, str] | None = None
+    for function, relative_path in sorted(raw_functions.items()):
+        if not isinstance(function, str) or not function or not isinstance(relative_path, str):
+            raise ValueError("static dispatch functions must map non-empty names to paths")
+        path = (manifest_path.parent / relative_path).resolve()
+        document = json.loads(path.read_text())
+        if not isinstance(document, Mapping):
+            raise ValueError(f"{path}: placement grid must be an object")
+        if (
+            document.get("schema_version") != 1
+            or document.get("model_version") != "complete_placement_dag_global_sync_weight_grid_v1"
+        ):
+            raise ValueError(f"{path}: incompatible placement-grid schema")
+        input_record = document.get("input")
+        if not isinstance(input_record, Mapping) or input_record.get("function") != function:
+            raise ValueError(f"{path}: grid function does not match manifest key {function!r}")
+        duration_contract = _static_dispatch_duration_contract(path, document)
+        if expected_duration_contract is None:
+            expected_duration_contract = duration_contract
+        elif duration_contract != expected_duration_contract:
+            raise ValueError(f"{path}: duration-model contract differs from its siblings")
+        results = document.get("results")
+        if not isinstance(results, list) or not results:
+            raise ValueError(f"{path}: placement grid has no results")
+        weights = _static_dispatch_weights(path, results)
+        if expected_weights is None:
+            expected_weights = weights
+        elif weights != expected_weights:
+            raise ValueError(f"{path}: synchronization-weight grid differs from its siblings")
+        grids[function] = document
+        grid_inputs[function] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    assert expected_weights is not None
+    assert expected_duration_contract is not None
+    return grids, grid_inputs, expected_weights, expected_duration_contract
+
+
+def _parse_static_dispatch_tasks(raw_tasks: Sequence[Any], functions: set[str]) -> dict[str, tuple[str, ...]]:
+    tasks: dict[str, tuple[str, ...]] = {}
+    function_owners: dict[str, str] = {}
+    for raw_task in raw_tasks:
+        if not isinstance(raw_task, Mapping):
+            raise ValueError("static dispatch task must be an object")
+        task_id = raw_task.get("id")
+        task_functions = raw_task.get("functions")
+        aggregation = raw_task.get("aggregation", "max")
+        if not isinstance(task_id, str) or not task_id or task_id in tasks:
+            raise ValueError("static dispatch task ids must be unique non-empty strings")
+        if aggregation != "max":
+            raise ValueError(f"task {task_id!r}: only co-scheduled max aggregation is supported")
+        if (
+            not isinstance(task_functions, list)
+            or not task_functions
+            or not all(isinstance(function, str) and function for function in task_functions)
+            or len(task_functions) != len(set(task_functions))
+        ):
+            raise ValueError(f"task {task_id!r}: functions must be a unique non-empty string array")
+        unknown = sorted(set(task_functions) - functions)
+        if unknown:
+            raise ValueError(f"task {task_id!r}: unknown functions: {', '.join(unknown)}")
+        for function in task_functions:
+            owner = function_owners.setdefault(function, task_id)
+            if owner != task_id:
+                raise ValueError(f"function {function!r} appears in multiple tasks")
+        tasks[task_id] = tuple(task_functions)
+    missing = sorted(functions - set(function_owners))
+    if missing:
+        raise ValueError(f"static dispatch graph omits functions: {', '.join(missing)}")
+    return tasks
+
+
+def _parse_static_dispatch_edges(
+    raw_edges: Sequence[Any], tasks: Mapping[str, tuple[str, ...]]
+) -> list[tuple[str, str]]:
+    edges: list[tuple[str, str]] = []
+    for raw_edge in raw_edges:
+        if (
+            not isinstance(raw_edge, list)
+            or len(raw_edge) != 2
+            or not all(isinstance(task, str) for task in raw_edge)
+        ):
+            raise ValueError("static dispatch edges must be [source, target] string pairs")
+        source_task, target_task = raw_edge
+        if source_task not in tasks or target_task not in tasks:
+            raise ValueError(f"static dispatch edge names an unknown task: {raw_edge}")
+        if source_task == target_task:
+            raise ValueError(f"static dispatch task {source_task!r} cannot depend on itself")
+        edges.append((source_task, target_task))
+    if len(edges) != len(set(edges)):
+        raise ValueError("static dispatch graph contains duplicate edges")
+    return edges
+
+
+def _aggregate_static_dispatch_weight(
+    grids: Mapping[str, Mapping[str, Any]],
+    tasks: Mapping[str, tuple[str, ...]],
+    edges: Sequence[tuple[str, str]],
+    index: int,
+    weight: float,
+) -> dict[str, Any]:
+    function_rows: dict[str, dict[str, Any]] = {}
+    planner_eligible = True
+    for function, grid in grids.items():
+        raw_result = grid["results"][index]
+        score = raw_result.get("score") if isinstance(raw_result, Mapping) else None
+        if not isinstance(score, Mapping):
+            raise ValueError(f"function {function!r} weight {weight}: missing score object")
+        base, placement, selection_source, function_planner_eligible = _dispatch_grid_score_makespans(score)
+        planner_eligible &= function_planner_eligible
+        function_rows[function] = {
+            "base_makespan_cycles": base,
+            "placement_makespan_cycles": placement,
+            "selection_source": selection_source,
+            "planner_eligible_static": function_planner_eligible,
+        }
+    base_tasks = {
+        task: max(function_rows[function]["base_makespan_cycles"] for function in functions)
+        for task, functions in tasks.items()
+    }
+    placement_tasks = {
+        task: max(function_rows[function]["placement_makespan_cycles"] for function in functions)
+        for task, functions in tasks.items()
+    }
+    base_makespan, base_path = _dispatch_dag_makespan(base_tasks, edges)
+    placement_makespan, placement_path = _dispatch_dag_makespan(placement_tasks, edges)
+    extension = placement_makespan - base_makespan
+    return {
+        "sync_latency_cycles": weight,
+        "status": "COMPLETE",
+        "planner_eligible_static": planner_eligible,
+        "analysis_only_runtime_profile_used": not planner_eligible,
+        "base_makespan_cycles": base_makespan,
+        "placement_makespan_cycles": placement_makespan,
+        "critical_path_extension_cycles": extension,
+        "relative_critical_path_extension": extension / base_makespan,
+        "base_critical_task_path": base_path,
+        "placement_critical_task_path": placement_path,
+        "base_task_durations_cycles": base_tasks,
+        "placement_task_durations_cycles": placement_tasks,
+        "functions": function_rows,
+    }
+
+
+def aggregate_static_dispatch_grid(manifest_path: str | Path) -> dict[str, Any]:
+    """Aggregate per-function placement grids over a static runtime task DAG.
+
+    The manifest describes which functions are co-scheduled in one runtime
+    task and the dependency edges between tasks.  Co-scheduled functions are
+    concurrent and therefore aggregate by ``max``.  Dependent tasks aggregate
+    through a node-weighted longest path.  Every per-function grid must use
+    the same synchronization-weight grid; incomplete or parametric scores fail
+    closed rather than being silently coerced into a concrete latency.
+    """
+
+    source = Path(manifest_path)
+    manifest = json.loads(source.read_text())
+    if not isinstance(manifest, Mapping):
+        raise ValueError("static dispatch manifest must be an object")
+    if manifest.get("schema_version") != 1 or manifest.get("contract") != "static_dispatch_graph_v1":
+        raise ValueError("static dispatch manifest must use static_dispatch_graph_v1 schema_version=1")
+    raw_functions = manifest.get("functions")
+    raw_tasks = manifest.get("tasks")
+    raw_edges = manifest.get("edges", [])
+    if not isinstance(raw_functions, Mapping) or not raw_functions:
+        raise ValueError("static dispatch manifest requires a non-empty functions object")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise ValueError("static dispatch manifest requires a non-empty tasks array")
+    if not isinstance(raw_edges, list):
+        raise ValueError("static dispatch manifest edges must be an array")
+
+    grids, grid_inputs, weights, duration_contract = _load_static_dispatch_grids(source, raw_functions)
+    tasks = _parse_static_dispatch_tasks(raw_tasks, set(grids))
+    edges = _parse_static_dispatch_edges(raw_edges, tasks)
+    aggregated_results = [
+        _aggregate_static_dispatch_weight(grids, tasks, edges, index, weight)
+        for index, weight in enumerate(weights)
+    ]
+    return {
+        "schema_version": 1,
+        "model_version": "static_dispatch_complete_placement_grid_v1",
+        "aggregation_contract": {
+            "co_scheduled_functions": "max",
+            "dependent_tasks": "node_weighted_longest_path",
+            "runtime_profiles": "analysis_only_not_planner_eligible",
+        },
+        "duration_contract": duration_contract,
+        "input": {
+            "manifest": _hashed_input(source),
+            "function_grids": grid_inputs,
+        },
+        "tasks": [
+            {"id": task, "functions": list(functions), "aggregation": "max"}
+            for task, functions in tasks.items()
+        ],
+        "edges": [list(edge) for edge in edges],
+        "results": aggregated_results,
+    }
 
 
 def _add_score_realized_grid_parser(subparsers: Any) -> None:
@@ -8041,6 +8370,15 @@ def _add_score_realized_grid_parser(subparsers: Any) -> None:
     parser.add_argument("--nonmaterialized-access-evidence", type=Path)
     _add_runtime_branch_profile_arguments(parser)
     _add_duration_arguments(parser)
+    parser.add_argument("-o", "--output", type=Path)
+
+
+def _add_aggregate_dispatch_grid_parser(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "aggregate-dispatch-grid",
+        help="aggregate per-function placement grids over a static runtime task DAG",
+    )
+    parser.add_argument("manifest", type=Path)
     parser.add_argument("-o", "--output", type=Path)
 
 
@@ -8133,6 +8471,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0912,PLR0915 - e
     rescore_parser.add_argument("-o", "--output", type=Path)
 
     _add_score_realized_grid_parser(subparsers)
+    _add_aggregate_dispatch_grid_parser(subparsers)
 
     perf_sim_parser = subparsers.add_parser(
         "validate-perf-sim", help="compare pinned formulas with Perf-Sim trace events"

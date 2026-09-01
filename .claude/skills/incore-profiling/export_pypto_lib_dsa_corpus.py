@@ -55,6 +55,14 @@ def _slug(value: str) -> str:
     return "".join(character if character.isalnum() else "_" for character in value).strip("_")
 
 
+def _export_pythonpath(pypto_python: Path, pypto_lib_root: Path, inherited: str | None) -> str:
+    """Put the frozen sources first while retaining explicit dependency roots."""
+    entries = [str(pypto_python), str(pypto_lib_root)]
+    if inherited:
+        entries.extend(item for item in inherited.split(os.pathsep) if item)
+    return os.pathsep.join(dict.fromkeys(entries))
+
+
 def inspect_driver_structure(build_root: Path) -> dict[str, int | str]:
     """Count generated orchestration submit sites and emitted kernels."""
     orchestration_files = sorted(build_root.rglob("orchestration/*.cpp"))
@@ -329,7 +337,9 @@ def export_corpus(args: argparse.Namespace) -> int:
     builds.mkdir()
 
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = os.pathsep.join([str(args.pypto_python), str(args.pypto_lib_root)])
+    environment["PYTHONPATH"] = _export_pythonpath(
+        args.pypto_python, args.pypto_lib_root, environment.get("PYTHONPATH")
+    )
     environment.update(
         {
             "PYPTO_CODEGEN_MAX_WORKERS": "1",

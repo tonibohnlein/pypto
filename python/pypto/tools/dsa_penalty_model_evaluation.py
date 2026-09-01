@@ -93,6 +93,15 @@ def _text(value: str, *, field: str) -> str:
     return result
 
 
+def _boolean(value: str, *, field: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{field} must be 'true' or 'false', got {value!r}")
+
+
 def _direction(value: float) -> int:
     return (value > 0) - (value < 0)
 
@@ -313,7 +322,9 @@ def _observed_classification(
         abs(effect) >= minimum_device_effect for effect in device_effects.values()
     ):
         return "MULTI_DEVICE_THRESHOLD_CLEARED", direction
-    return "SIGN_CONSISTENT_BELOW_THRESHOLD", direction
+    if all(abs(effect) < minimum_device_effect for effect in device_effects.values()):
+        return "ALL_DEVICES_BELOW_THRESHOLD", direction
+    return "MIXED_DEVICE_THRESHOLD", direction
 
 
 def _weight_summary(rows: Sequence[Mapping[str, Any]], observed_class: str) -> dict[str, Any]:
@@ -393,6 +404,341 @@ def _ranking_intervals(
     return intervals
 
 
+def _stable_weight_calibration(
+    folds: Sequence[Mapping[str, Any]], all_data_optimal_weights: Sequence[float]
+) -> dict[str, Any]:
+    """Intersect optimal weights across every LOOW fold and the full dataset."""
+
+    incomplete = [str(fold.get("held_out_workload")) for fold in folds if fold.get("status") != "CALIBRATED"]
+    if incomplete or not all_data_optimal_weights:
+        return {
+            "status": "INCOMPLETE",
+            "stable_weight_intersection_cycles": [],
+            "selected_weight_cycles": None,
+            "incomplete_folds": incomplete,
+        }
+    optimal_sets = [set(float(weight) for weight in all_data_optimal_weights)]
+    optimal_sets.extend(set(float(weight) for weight in fold["optimal_training_weights"]) for fold in folds)
+    intersection = sorted(set.intersection(*optimal_sets))
+    return {
+        "status": "STABLE" if intersection else "NO_STABLE_WEIGHT",
+        "stable_weight_intersection_cycles": intersection,
+        # The smallest stable weight is the deterministic conservative choice:
+        # it gives the same calibrated ordering with the least synchronization
+        # latency assigned by the provisional model.
+        "selected_weight_cycles": intersection[0] if intersection else None,
+        "incomplete_folds": [],
+    }
+
+
+def _planner_admission_limits(requirements: Mapping[str, Any]) -> dict[str, int]:
+    fields = (
+        "minimum_directional_workloads",
+        "minimum_dsa_rp_wins",
+        "minimum_cypress_wins",
+        "minimum_correct_directional_workloads",
+        "maximum_wrong_directional_workloads",
+        "minimum_calibration_utility",
+    )
+    limits: dict[str, int] = {}
+    for field in fields:
+        value = requirements.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{field} must be an explicitly declared non-negative integer")
+        limits[field] = value
+    return limits
+
+
+def _planner_directional_workloads(
+    selected_rows: Sequence[Mapping[str, Any]], failures: list[str]
+) -> tuple[dict[str, int], list[str], list[str], dict[str, Any]]:
+    directions_by_workload: dict[str, set[int]] = defaultdict(set)
+    rows_by_workload: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in selected_rows:
+        if row.get("observed_class") != "MULTI_DEVICE_THRESHOLD_CLEARED":
+            continue
+        direction = row.get("observed_direction")
+        workload = row.get("workload_id")
+        if isinstance(workload, str) and isinstance(direction, int) and not isinstance(direction, bool):
+            directions_by_workload[workload].add(direction)
+            rows_by_workload[workload].append(row)
+    ambiguous = sorted(
+        workload for workload, directions in directions_by_workload.items() if len(directions) != 1
+    )
+    if ambiguous:
+        failures.append("direction changes within workload: " + ", ".join(ambiguous))
+    directional = {
+        workload: next(iter(directions))
+        for workload, directions in directions_by_workload.items()
+        if len(directions) == 1
+    }
+    dsa_wins = sorted(workload for workload, direction in directional.items() if direction < 0)
+    cypress_wins = sorted(workload for workload, direction in directional.items() if direction > 0)
+    correct: list[str] = []
+    wrong: list[str] = []
+    silent: list[str] = []
+    for workload, observed_direction in directional.items():
+        predictions = [row.get("predicted_direction") for row in rows_by_workload[workload]]
+        if not all(
+            isinstance(prediction, int) and not isinstance(prediction, bool) and prediction in {-1, 0, 1}
+            for prediction in predictions
+        ):
+            raise ValueError(f"{workload}: predicted directions must be -1, 0, or 1")
+        if any(prediction not in {0, observed_direction} for prediction in predictions):
+            wrong.append(workload)
+        elif all(prediction == observed_direction for prediction in predictions):
+            correct.append(workload)
+        else:
+            silent.append(workload)
+    quality = {
+        "correct_workloads": sorted(correct),
+        "wrong_workloads": sorted(wrong),
+        "silent_workloads": sorted(silent),
+        "correct_count": len(correct),
+        "wrong_count": len(wrong),
+        "silent_count": len(silent),
+        "calibration_utility": len(correct) - len(wrong),
+    }
+    return directional, dsa_wins, cypress_wins, quality
+
+
+def _manifest_text(record: Mapping[str, Any], field: str, context: str) -> str:
+    value = record.get(field)
+    if not isinstance(value, str):
+        raise ValueError(f"{context}.{field} must be a non-empty string")
+    return _text(value, field=f"{context}.{field}")
+
+
+def _evaluate_planner_representative(
+    raw: Mapping[str, Any], row_index: Mapping[tuple[Any, Any, Any], Mapping[str, Any]]
+) -> tuple[dict[str, Any], str | None]:
+    name = _manifest_text(raw, "name", "representative")
+    workload = _manifest_text(raw, "workload_id", name)
+    case_id = _manifest_text(raw, "case_id", name)
+    capacity = _manifest_text(raw, "capacity", name)
+    expected = raw.get("expected_ordering")
+    valid_expected = {"dsa_rp_faster": -1, "cypress_faster": 1, "tie": 0}
+    if expected not in valid_expected:
+        raise ValueError(f"{name}: expected_ordering must be one of {sorted(valid_expected)}")
+    row = row_index.get((workload, case_id, capacity))
+    if row is None:
+        return (
+            {"name": name, "status": "MISSING", "expected_ordering": expected},
+            f"representative {name} is absent at the stable weight",
+        )
+    expected_direction = valid_expected[expected]
+    observed_class = row.get("observed_class")
+    observed_direction = row.get("observed_direction")
+    predicted_direction = row.get("predicted_direction")
+    observed_ok = (
+        observed_class in {"EXACT_TIE", "ALL_DEVICES_BELOW_THRESHOLD"}
+        if expected_direction == 0
+        else observed_class == "MULTI_DEVICE_THRESHOLD_CLEARED" and observed_direction == expected_direction
+    )
+    status = "PASS" if observed_ok and predicted_direction == expected_direction else "FAIL"
+    return (
+        {
+            "name": name,
+            "status": status,
+            "expected_ordering": expected,
+            "observed_class": observed_class,
+            "observed_direction": observed_direction,
+            "predicted_direction": predicted_direction,
+        },
+        None if status == "PASS" else f"representative {name} does not satisfy {expected}",
+    )
+
+
+def _selected_planner_rows(
+    evaluation: Mapping[str, Any], failures: list[str]
+) -> tuple[float | None, list[Mapping[str, Any]]]:
+    stable = evaluation.get("stable_weight_calibration")
+    if not isinstance(stable, Mapping) or stable.get("status") != "STABLE":
+        failures.append("no stable synchronization weight across all LOOW folds")
+        return None, []
+    selected_weight = stable.get("selected_weight_cycles")
+    if (
+        not isinstance(selected_weight, (int, float))
+        or isinstance(selected_weight, bool)
+        or not math.isfinite(float(selected_weight))
+    ):
+        failures.append("stable synchronization weight is not finite")
+        return None, []
+    rows = [
+        row
+        for row in evaluation.get("comparisons", [])
+        if isinstance(row, Mapping) and row.get("weight_cycles") == selected_weight
+    ]
+    return float(selected_weight), rows
+
+
+def _validate_planner_score_contract(selected_rows: Sequence[Mapping[str, Any]], failures: list[str]) -> None:
+    non_total_contract = sorted(
+        {
+            str(row.get("workload_id"))
+            for row in selected_rows
+            if row.get("prediction_contract") != "total_modeled_latency_relative_effect_gate_v1"
+        }
+    )
+    if non_total_contract:
+        failures.append(
+            "planner admission requires total modeled latency for workloads: " + ", ".join(non_total_contract)
+        )
+    non_static = sorted(
+        {
+            str(row.get("workload_id"))
+            for row in selected_rows
+            if row.get("planner_eligible_static") is not True
+        }
+    )
+    if non_static:
+        failures.append(
+            "planner admission requires static planner-eligible scores for workloads: "
+            + ", ".join(non_static)
+        )
+
+
+def _append_planner_minimum_failures(
+    limits: Mapping[str, int],
+    directional: Mapping[str, int],
+    dsa_wins: Sequence[str],
+    cypress_wins: Sequence[str],
+    quality: Mapping[str, Any],
+    failures: list[str],
+) -> None:
+    checks = (
+        (
+            len(directional),
+            limits["minimum_directional_workloads"],
+            "directional workloads",
+        ),
+        (len(dsa_wins), limits["minimum_dsa_rp_wins"], "DSA-RP wins"),
+        (len(cypress_wins), limits["minimum_cypress_wins"], "Cypress wins"),
+        (
+            int(quality["correct_count"]),
+            limits["minimum_correct_directional_workloads"],
+            "correctly predicted directional workloads",
+        ),
+    )
+    for actual, required, label in checks:
+        if actual < required:
+            failures.append(f"only {actual} {label}; require {required}")
+    wrong_count = int(quality["wrong_count"])
+    if wrong_count > limits["maximum_wrong_directional_workloads"]:
+        failures.append(
+            f"{wrong_count} wrongly predicted directional workloads; "
+            f"allow at most {limits['maximum_wrong_directional_workloads']}"
+        )
+    utility = int(quality["calibration_utility"])
+    if utility < limits["minimum_calibration_utility"]:
+        failures.append(f"calibration utility {utility}; require {limits['minimum_calibration_utility']}")
+
+
+def _planner_row_index(
+    selected_rows: Sequence[Mapping[str, Any]],
+) -> dict[tuple[Any, Any, Any], Mapping[str, Any]]:
+    row_index: dict[tuple[Any, Any, Any], Mapping[str, Any]] = {}
+    for row in selected_rows:
+        key = (row.get("workload_id"), row.get("case_id"), row.get("capacity"))
+        if key in row_index:
+            raise ValueError(f"duplicate planner-admission comparison row for {key}")
+        row_index[key] = row
+    return row_index
+
+
+def _planner_representative_results(
+    raw_representatives: Sequence[Any],
+    row_index: Mapping[tuple[Any, Any, Any], Mapping[str, Any]],
+    failures: list[str],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for raw in raw_representatives:
+        if not isinstance(raw, Mapping):
+            raise ValueError("planner-admission representative must be an object")
+        result, failure = _evaluate_planner_representative(raw, row_index)
+        results.append(result)
+        if failure is not None:
+            failures.append(failure)
+    return results
+
+
+def evaluate_planner_admission(
+    evaluation: Mapping[str, Any], requirements: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Apply the predeclared scientific gate before implementing a planner.
+
+    The gate intentionally uses only the stable global weight and treats a
+    device result as a null only when every device remains below threshold.
+    Representative cases must agree with both the measured class and the model
+    prediction, so a false-confident Gumbel-style result blocks admission even
+    when aggregate accuracy is high.
+    """
+
+    if requirements.get("schema_version") != 1 or requirements.get("contract") != (
+        "complete_placement_planner_admission_v1"
+    ):
+        raise ValueError(
+            "planner-admission requirements must use complete_placement_planner_admission_v1 schema_version=1"
+        )
+    limits = _planner_admission_limits(requirements)
+    raw_representatives = requirements.get("representatives")
+    if not isinstance(raw_representatives, list) or not raw_representatives:
+        raise ValueError("planner-admission requirements need representative cases")
+
+    failures: list[str] = []
+    selected_weight, selected_rows = _selected_planner_rows(evaluation, failures)
+    _validate_planner_score_contract(selected_rows, failures)
+
+    directional, dsa_wins, cypress_wins, quality = _planner_directional_workloads(selected_rows, failures)
+    _append_planner_minimum_failures(limits, directional, dsa_wins, cypress_wins, quality, failures)
+    representative_results = _planner_representative_results(
+        raw_representatives, _planner_row_index(selected_rows), failures
+    )
+
+    return {
+        "schema_version": 1,
+        "contract": "complete_placement_planner_admission_v1",
+        "status": "PASS" if not failures else "FAIL",
+        "selected_weight_cycles": selected_weight,
+        "requirements": limits,
+        "directional_workload_count": len(directional),
+        "directional_workloads": dict(sorted(directional.items())),
+        "dsa_rp_win_workloads": dsa_wins,
+        "cypress_win_workloads": cypress_wins,
+        "model_quality": quality,
+        "representatives": representative_results,
+        "failures": failures,
+    }
+
+
+def _planner_eligibility_for_cell(
+    cell_rows: Sequence[Mapping[str, str]], context: str
+) -> tuple[dict[str, bool] | None, bool | None]:
+    fields = ("cypress_planner_eligible_static", "dsa_rp_planner_eligible_static")
+    presence = [tuple(row.get(field, "") != "" for field in fields) for row in cell_rows]
+    if not any(any(row_presence) for row_presence in presence):
+        return None, None
+    if not all(all(row_presence) for row_presence in presence):
+        raise ValueError(f"{context}: planner eligibility is incomplete across devices")
+
+    def parse(row: Mapping[str, str]) -> dict[str, bool]:
+        return {
+            "cypress": _boolean(
+                row["cypress_planner_eligible_static"],
+                field="cypress_planner_eligible_static",
+            ),
+            "dsa_rp_cg": _boolean(
+                row["dsa_rp_planner_eligible_static"],
+                field="dsa_rp_planner_eligible_static",
+            ),
+        }
+
+    eligibility = parse(cell_rows[0])
+    if any(parse(row) != eligibility for row in cell_rows[1:]):
+        raise ValueError(f"{context}: planner eligibility varies by device")
+    return eligibility, all(eligibility.values())
+
+
 def _modeled_weight_comparison(
     workload: str,
     case_id: str,
@@ -432,6 +778,9 @@ def _modeled_weight_comparison(
         other_dsa = _number(row["dsa_rp_penalty_cycles"], field="dsa_rp_penalty_cycles")
         if other_cypress != cypress_score or other_dsa != dsa_score:
             raise ValueError(f"{workload}/{case_id}/{capacity}/{weight}: model score varies by device")
+
+    context = f"{workload}/{case_id}/{capacity}/{weight}"
+    planner_eligibility_by_arm, planner_eligible_static = _planner_eligibility_for_cell(cell_rows, context)
 
     modeled_latency_fields = ("cypress_modeled_latency_cycles", "dsa_rp_modeled_latency_cycles")
     modeled_latency_presence = [
@@ -495,6 +844,8 @@ def _modeled_weight_comparison(
             "raw_predicted_direction": raw_predicted_direction,
             "predicted_direction": predicted_direction,
             "prediction_contract": prediction_contract,
+            "planner_eligible_static": planner_eligible_static,
+            "planner_eligibility_by_arm": planner_eligibility_by_arm,
             "observed_class": observed_class,
             "observed_direction": observed_direction,
             "device_effects": dict(sorted(effects.items())),
@@ -622,9 +973,10 @@ def evaluate_sync_weight_grid(
         {
             "weight_cycles": weight,
             "threshold_cleared": _weight_summary(rows_by_weight[weight], "MULTI_DEVICE_THRESHOLD_CLEARED"),
-            "sign_consistent_below_threshold": _weight_summary(
-                rows_by_weight[weight], "SIGN_CONSISTENT_BELOW_THRESHOLD"
+            "all_devices_below_threshold": _weight_summary(
+                rows_by_weight[weight], "ALL_DEVICES_BELOW_THRESHOLD"
             ),
+            "mixed_device_threshold": _weight_summary(rows_by_weight[weight], "MIXED_DEVICE_THRESHOLD"),
         }
         for weight in ordered_weights
     ]
@@ -661,6 +1013,7 @@ def evaluate_sync_weight_grid(
         )
 
     best_weights, all_data_summary = _best_weight_rows(rows_by_weight)
+    stable_calibration = _stable_weight_calibration(folds, best_weights)
     intervals = _ranking_intervals(ordered_weights, rows_by_weight) if comparisons else []
     eligible_cases = {(row["workload_id"], row["case_id"], row["capacity"]) for row in comparisons}
     return {
@@ -687,6 +1040,7 @@ def evaluate_sync_weight_grid(
         "leave_one_workload_out": folds,
         "all_development_data_optimal_weights": best_weights,
         "all_development_data_summary": all_data_summary,
+        "stable_weight_calibration": stable_calibration,
         "comparisons": comparisons,
         "excluded": excluded,
     }
@@ -720,6 +1074,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=2,
         help="exact number of devices required in every grid cell (default: 2)",
     )
+    parser.add_argument(
+        "--planner-admission",
+        type=Path,
+        help="predeclared representative and corpus gate for experimental planner admission",
+    )
     parser.add_argument("-o", "--output", type=Path)
     args = parser.parse_args(argv)
     try:
@@ -732,6 +1091,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 minimum_model_effect=args.minimum_model_effect,
                 required_device_count=args.required_device_count,
             )
+            if args.planner_admission is not None:
+                requirements = json.loads(args.planner_admission.read_text())
+                if not isinstance(requirements, Mapping):
+                    raise ValueError("planner-admission requirements must be an object")
+                result["planner_admission"] = evaluate_planner_admission(result, requirements)
+                result["planner_admission_input"] = {
+                    "path": str(args.planner_admission.resolve()),
+                    "sha256": hashlib.sha256(args.planner_admission.read_bytes()).hexdigest(),
+                }
             result["split"] = args.split
         else:
             result = evaluate_rows(
