@@ -947,6 +947,25 @@ Version 0 has verified pipe mappings only for inbound/outbound DMA, L1-to-L0,
 L0-to-external, vector, matrix, and scalar resources. It rejects the remaining
 transfer-route families until their PTOAS pipeline mapping is established.
 
+### Graph conformance and the complete-placement PTOAS bridge
+
+Audit predicted reuse dependencies against the product post-InsertSync graph;
+branches, dynamic loops, non-exact recurrences, and failed joins are
+`INCOMPLETE`, never guessed. For a complete solution, emit only physically
+realized, materialized distance-zero relations as PTOAS schedule-node edges:
+
+```bash
+python -m pypto.tools.dsa_schedule_model audit-conformance \
+    schedule.jsonl problem.dsa.json placement.dsa.solution.json -o conformance.json
+python -m pypto.tools.dsa_schedule_model emit-ptoas-reuse-edges \
+    candidate-weights.json problem.dsa.json placement.dsa.solution.json \
+    ptoas-schedule-graph.txt --function kernel -o placement-reuse-edges.json
+```
+
+PyPTO owns DSA buffer identity; PTOAS owns the operation DAG. The bridge rejects
+missing provenance/access joins and opaque or non-distance-zero relations, so
+it never turns a reuse pair into a guessed graph edge.
+
 ## Remaining validation
 
 The completion-frontier factorial has been run. It confirmed that several
