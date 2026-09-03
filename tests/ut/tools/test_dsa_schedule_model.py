@@ -1877,6 +1877,25 @@ def test_realized_placement_scores_only_physical_reuse(tmp_path):
     assert no_edge_result["realized_pair_count_without_induced_sync_edge"] == 1
     assert no_edge_result["unit_realized_cost_without_induced_sync_edge"] == 3.0
 
+    unpromoted_scores = dsa_schedule_model.score_reuse_candidates(
+        record,
+        [_candidate()],
+        _ten_cycle_model(),
+        {},
+    )
+    promoted_only = dsa_schedule_model.score_realized_reuse(problem, solution, unpromoted_scores)
+    all_candidates = dsa_schedule_model.score_realized_reuse(
+        problem,
+        solution,
+        unpromoted_scores,
+        promoted_only=False,
+    )
+    assert promoted_only["candidate_pair_count"] == 0
+    assert all_candidates["pair_selection_policy"] == "all_candidate_pairs"
+    assert all_candidates["candidate_pair_count"] == 1
+    assert all_candidates["promoted_pair_count"] == 0
+    assert all_candidates["realized_pair_count"] == 1
+
     solution.write_text(
         json.dumps(
             {
@@ -5553,6 +5572,211 @@ def test_evaluate_arm_manifest_rejects_different_operation_streams(tmp_path):
 
     with pytest.raises(ValueError, match="different operation streams"):
         dsa_schedule_model.evaluate_arm_manifest(manifest, _ten_cycle_model())
+
+
+def _conformance_inputs(
+    *distance_edges: tuple[int, int],
+) -> tuple[dict, dict]:
+    candidate_scores = {
+        "schema_version": 2,
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+        "distance_zero_edges": [
+            {
+                "source_node": source,
+                "target_node": target,
+                "candidate_indices": [index],
+            }
+            for index, (source, target) in enumerate(distance_edges)
+        ],
+        "loop_recurrence_edges": [],
+    }
+    realized = {
+        "pairs": [
+            {
+                "first_buffer": 2 * index,
+                "second_buffer": 2 * index + 1,
+                "reuse_realized": True,
+                "distance_zero_schedule_edges": [[source, target]],
+                "loop_carried_schedule_edges": [],
+            }
+            for index, (source, target) in enumerate(distance_edges)
+        ]
+    }
+    return candidate_scores, realized
+
+
+def test_graph_conformance_accepts_exact_product_sync_edge():
+    candidate_scores, realized = _conformance_inputs((0, 3))
+    record = _record(sync_edges=[{"source": 0, "target": 3, "group": 4}])
+
+    result = dsa_schedule_model.audit_graph_conformance(record, candidate_scores, realized)
+
+    assert result["status"] == "PASS"
+    assert result["predicted_edges"] == [
+        {"source": 0, "target": 3, "status": "EXACT_PRODUCT_SYNC_EDGE", "candidate_indices": [0]}
+    ]
+    assert result["actual_edges"] == [{"source": 0, "target": 3, "status": "EXACT_PREDICTED_EDGE"}]
+
+
+def test_graph_conformance_accepts_predicted_edge_redundant_in_base_graph():
+    candidate_scores, realized = _conformance_inputs((0, 2))
+
+    result = dsa_schedule_model.audit_graph_conformance(_record(), candidate_scores, realized)
+
+    assert result["status"] == "PASS"
+    assert result["predicted_edges"][0]["status"] == "REDUNDANT_IN_NO_REUSE_GRAPH"
+
+
+def test_graph_conformance_follows_product_sync_through_loop_control_point():
+    candidate_scores, realized = _conformance_inputs((0, 3))
+    record = _record(
+        sync_edges=[
+            {
+                "source": 0,
+                "target": 10,
+                "src_pipe": "PIPE_V",
+                "dst_pipe": "PIPE_MTE2",
+                "group": 4,
+                "loop_carried": False,
+            }
+        ]
+    )
+    loop_begin = {
+        "id": 10,
+        "kind": "loop",
+        "loop_kind": "LOOP_BEGIN",
+        "begin": 10,
+        "end": 12,
+        "static_trip_count": 2,
+        "loop_stack": [],
+        "branch_stack": [],
+    }
+    loop_end = {
+        "id": 12,
+        "kind": "loop",
+        "loop_kind": "LOOP_END",
+        "begin": 10,
+        "end": 12,
+        "static_trip_count": 2,
+        "loop_stack": [],
+        "branch_stack": [],
+    }
+    record["nodes"][3]["loop_stack"] = [10]
+    record["nodes"] = [*record["nodes"][:3], loop_begin, record["nodes"][3], loop_end]
+    record["stream_edges"] = []
+
+    result = dsa_schedule_model.audit_graph_conformance(record, candidate_scores, realized)
+
+    assert result["status"] == "PASS"
+    assert result["predicted_edges"][0]["status"] == "IMPLIED_OR_COALESCED_BY_PRODUCT_GRAPH"
+    assert result["summary"]["structural_actual_sync_edge_count"] == 1
+
+
+def test_graph_conformance_rejects_predicted_edge_not_enforced():
+    candidate_scores, realized = _conformance_inputs((0, 3))
+
+    result = dsa_schedule_model.audit_graph_conformance(_record(), candidate_scores, realized)
+
+    assert result["status"] == "FAIL"
+    assert result["summary"]["predicted_failure_count"] == 1
+    assert result["predicted_edges"][0]["status"] == "PREDICTED_EDGE_NOT_ENFORCED"
+
+
+def test_graph_conformance_rejects_unpredicted_product_dependency():
+    candidate_scores, realized = _conformance_inputs()
+    record = _record(sync_edges=[{"source": 0, "target": 3, "group": 4}])
+
+    result = dsa_schedule_model.audit_graph_conformance(record, candidate_scores, realized)
+
+    assert result["status"] == "FAIL"
+    assert result["summary"]["actual_unexplained_dependency_count"] == 1
+    assert result["actual_edges"][0]["status"] == "COMPILER_DEPENDENCY_NOT_PREDICTED"
+
+
+def test_graph_conformance_fails_closed_on_control_flow():
+    candidate_scores, realized = _conformance_inputs()
+
+    result = dsa_schedule_model.audit_graph_conformance(_mixed_iteration_record(), candidate_scores, realized)
+
+    assert result["status"] == "INCOMPLETE"
+    assert result["limitations"] == ["branch_dependent_reachability_not_supported_v1"]
+
+
+def test_emit_ptoas_reuse_edges_joins_access_provenance(tmp_path, monkeypatch):
+    candidate_score = {
+        "schema_version": 2,
+        "function": "kernel",
+        "candidates": [
+            {
+                "candidate_index": 0,
+                "first_buffer": 0,
+                "second_buffer": 1,
+                "prior_access_order": 3,
+                "next_access_order": 7,
+                "status": "scored",
+            }
+        ],
+    }
+    graph = tmp_path / "graph.txt"
+    graph.write_text(
+        "KernelScheduleGraph @kernel nodes=2 dag_edges=0 dependencies=0\n"
+        "  node[11] op=pto.tload pypto_access_order=3\n"
+        "  node[19] op=pto.tstore pypto_access_order=7\n"
+    )
+    monkeypatch.setattr(dsa_schedule_model, "load_candidate_records", lambda _path: [_candidate()])
+    monkeypatch.setattr(
+        dsa_schedule_model,
+        "score_realized_reuse",
+        lambda *_args, **_kwargs: {
+            "pairs": [{"first_buffer": 0, "second_buffer": 1, "reuse_realized": True}]
+        },
+    )
+
+    result = dsa_schedule_model.emit_ptoas_placement_reuse_edges(
+        candidate_score, tmp_path / "problem.json", tmp_path / "solution.json", graph
+    )
+
+    assert result["function"] == "kernel"
+    assert result["edges"] == [
+        {
+            "source_node": 11,
+            "target_node": 19,
+            "kind": "war",
+            "provenance": "buffers=0,1;candidate=0;accesses=3,7",
+        }
+    ]
+
+
+def test_emit_ptoas_reuse_edges_rejects_missing_access_join(tmp_path, monkeypatch):
+    candidate_score = {
+        "schema_version": 2,
+        "function": "kernel",
+        "candidates": [
+            {
+                "candidate_index": 0,
+                "first_buffer": 0,
+                "second_buffer": 1,
+                "prior_access_order": 3,
+                "next_access_order": 7,
+                "status": "scored",
+            }
+        ],
+    }
+    graph = tmp_path / "graph.txt"
+    graph.write_text("KernelScheduleGraph @kernel nodes=1 dag_edges=0 dependencies=0\n")
+    monkeypatch.setattr(dsa_schedule_model, "load_candidate_records", lambda _path: [_candidate()])
+    monkeypatch.setattr(
+        dsa_schedule_model,
+        "score_realized_reuse",
+        lambda *_args, **_kwargs: {
+            "pairs": [{"first_buffer": 0, "second_buffer": 1, "reuse_realized": True}]
+        },
+    )
+
+    with pytest.raises(ValueError, match="no pypto_access_order"):
+        dsa_schedule_model.emit_ptoas_placement_reuse_edges(
+            candidate_score, tmp_path / "problem.json", tmp_path / "solution.json", graph
+        )
 
 
 if __name__ == "__main__":

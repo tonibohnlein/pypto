@@ -5622,8 +5622,14 @@ def score_realized_reuse(
     *,
     schedule_record: Mapping[str, Any] | None = None,
     model: DurationModel | None = None,
+    promoted_only: bool = True,
 ) -> dict[str, Any]:
-    """Score the promoted reuse pairs physically realized by one placement."""
+    """Score candidate reuse pairs physically realized by one placement.
+
+    Production scoring uses only solver-promoted penalties. Graph-conformance
+    auditing passes ``promoted_only=False`` because a complete placement graph
+    must also account for realized zero-penalty candidates.
+    """
     schema_version = candidate_scores.get("schema_version")
     if schema_version != 2:
         raise ValueError(
@@ -5663,7 +5669,9 @@ def score_realized_reuse(
 
     rows: list[dict[str, Any]] = []
     for pair_weight in pair_weights:
-        if not isinstance(pair_weight, Mapping) or not pair_weight.get("promoted_to_dsa_penalty"):
+        if not isinstance(pair_weight, Mapping):
+            continue
+        if promoted_only and not pair_weight.get("promoted_to_dsa_penalty"):
             continue
         first, second = pair_weight.get("first_buffer"), pair_weight.get("second_buffer")
         if (
@@ -5766,7 +5774,9 @@ def score_realized_reuse(
         "model_version": candidate_scores.get("model_version"),
         "problem": str(problem_source),
         "solution": str(solution_source),
-        "promoted_pair_count": len(rows),
+        "pair_selection_policy": ("solver_promoted_penalties" if promoted_only else "all_candidate_pairs"),
+        "candidate_pair_count": len(rows),
+        "promoted_pair_count": sum(bool(row.get("promoted_to_dsa_penalty")) for row in rows),
         "realized_pair_count": len(realized),
         "realized_pair_count_by_penalty_reason": dict(sorted(realized_by_penalty_reason.items())),
         "canonical_physical_reuse_group_count": len(physical_groups),
@@ -5805,6 +5815,539 @@ def score_realized_reuse(
         result["complete_placement_dag"] = complete_dag
         result["complete_placement_critical_path_cycles"] = complete_dag["critical_path_extension_cycles"]
     return result
+
+
+_PTOAS_GRAPH_FUNCTION_RE = re.compile(r"^KernelScheduleGraph @(?P<function>\S+)")
+_PTOAS_GRAPH_ACCESS_NODE_RE = re.compile(
+    r"^\s*node\[(?P<node>\d+)\].*\bpypto_access_order=(?P<access>\d+)\b"
+)
+
+
+def _load_ptoas_access_node_map(path: str | Path, *, function: str) -> dict[int, int]:
+    """Load a fail-closed PyPTO-access-order to PTOAS-node join from graph text."""
+    source = Path(path)
+    declared_function: str | None = None
+    mapping: dict[int, int] = {}
+    for line in source.read_text().splitlines():
+        if match := _PTOAS_GRAPH_FUNCTION_RE.match(line):
+            if declared_function is not None:
+                raise ValueError(f"{source}: expected exactly one KernelScheduleGraph record")
+            declared_function = match["function"]
+            continue
+        if match := _PTOAS_GRAPH_ACCESS_NODE_RE.match(line):
+            node, access = int(match["node"]), int(match["access"])
+            if access in mapping:
+                raise ValueError(f"{source}: pypto access {access} maps to multiple PTOAS nodes")
+            mapping[access] = node
+    if declared_function != function:
+        raise ValueError(f"{source}: graph function {declared_function!r} does not match {function!r}")
+    if not mapping:
+        raise ValueError(f"{source}: graph has no pypto_access_order node provenance")
+    return mapping
+
+
+def emit_ptoas_placement_reuse_edges(
+    candidate_scores: Mapping[str, Any],
+    problem_path: str | Path,
+    solution_path: str | Path,
+    ptoas_graph_path: str | Path,
+    *,
+    function: str | None = None,
+) -> dict[str, Any]:
+    """Emit one provenance-backed PTOAS reuse-edge file for a complete placement.
+
+    PyPTO owns the DSA problem/solution and therefore determines which logical
+    buffer pairs physically overlap. PTOAS owns the operation DAG and resolves
+    the resulting access-order join to its node IDs. This adapter refuses a
+    physical reuse pair whose candidate relation cannot be materialized as a
+    distance-zero RAW/WAR/WAW dependency.
+
+    Args:
+        candidate_scores: Schema-v2 result from ``score-candidates``.
+        problem_path: Exported DSA problem containing candidate provenance.
+        solution_path: Complete DSA placement solution.
+        ptoas_graph_path: Text graph from ``pto-print-kernel-schedule-graph``.
+        function: Optional expected function name.
+
+    Returns:
+        JSON document accepted by PTOAS ``--placement-reuse-edges``.
+    """
+    if candidate_scores.get("schema_version") != 2:
+        raise ValueError("PTOAS edge export requires candidate score schema_version=2")
+    candidate_function = candidate_scores.get("function")
+    if not isinstance(candidate_function, str) or not candidate_function:
+        raise ValueError("candidate scores have no function identity")
+    if function is not None and function != candidate_function:
+        raise ValueError(f"requested function {function!r} does not match {candidate_function!r}")
+    access_nodes = _load_ptoas_access_node_map(ptoas_graph_path, function=candidate_function)
+    candidates = load_candidate_records(problem_path)
+    realized = score_realized_reuse(
+        problem_path,
+        solution_path,
+        candidate_scores,
+        promoted_only=False,
+    )
+    realized_pairs = {
+        _buffer_pair(int(pair["first_buffer"]), int(pair["second_buffer"]))
+        for pair in realized["pairs"]
+        if isinstance(pair, Mapping) and pair.get("reuse_realized")
+    }
+    rows_by_pair: dict[tuple[int, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in candidate_scores.get("candidates", []):
+        if not isinstance(row, Mapping):
+            raise ValueError("candidate scores contain a non-object candidate row")
+        first, second = row.get("first_buffer"), row.get("second_buffer")
+        if isinstance(first, int) and isinstance(second, int):
+            rows_by_pair[_buffer_pair(first, second)].append(row)
+
+    by_edge: dict[tuple[int, int, str], list[str]] = defaultdict(list)
+    represented_pairs: set[tuple[int, int]] = set()
+    for pair in sorted(realized_pairs):
+        rows = rows_by_pair.get(pair, [])
+        materialized = [row for row in rows if row.get("status") == "scored"]
+        if not materialized:
+            statuses = sorted({str(row.get("status")) for row in rows})
+            raise ValueError(
+                f"realized reuse pair {pair} has no materialized distance-zero candidate; statuses={statuses}"
+            )
+        represented_pairs.add(pair)
+        for row in materialized:
+            index = row.get("candidate_index")
+            prior_access = row.get("prior_access_order")
+            next_access = row.get("next_access_order")
+            if (
+                not isinstance(index, int)
+                or not 0 <= index < len(candidates)
+                or not isinstance(prior_access, int)
+                or not isinstance(next_access, int)
+            ):
+                raise ValueError(f"realized reuse pair {pair} has incomplete candidate provenance")
+            source = access_nodes.get(prior_access)
+            target = access_nodes.get(next_access)
+            if source is None or target is None:
+                raise ValueError(
+                    f"realized reuse pair {pair} cannot join access orders "
+                    f"{prior_access}->{next_access} to PTOAS graph nodes"
+                )
+            candidate = candidates[index]
+            kind = {"write_after_read": "war", "write_after_write": "waw"}.get(candidate.dependence)
+            if kind is None:
+                raise ValueError(f"unsupported reuse dependence {candidate.dependence!r}")
+            provenance = (
+                f"buffers={pair[0]},{pair[1]};candidate={index};"
+                f"accesses={prior_access},{next_access}"
+            )
+            by_edge[(source, target, kind)].append(provenance)
+    if represented_pairs != realized_pairs:
+        raise ValueError("not every realized reuse pair was represented in the PTOAS edge file")
+    return {
+        "schema_version": 1,
+        "function": candidate_function,
+        "edges": [
+            {
+                "source_node": source,
+                "target_node": target,
+                "kind": kind,
+                "provenance": "|".join(sorted(provenances)),
+            }
+            for (source, target, kind), provenances in sorted(by_edge.items())
+        ],
+    }
+
+
+def _topology_only_duration_model(record: Mapping[str, Any]) -> DurationModel:
+    """Assign uniform durations so candidate extraction depends only on topology."""
+    operation_cycles = {
+        _operation_key(str(node["pipe"]), str(node["op_name"])): 1.0
+        for node in record.get("nodes", [])
+        if isinstance(node, Mapping)
+        and node.get("kind") == "operation"
+        and isinstance(node.get("pipe"), str)
+        and isinstance(node.get("op_name"), str)
+    }
+    return DurationModel(
+        model_version="graph_conformance_topology_only_v1",
+        calibration_status="topology_only_not_a_latency_model",
+        sync_latency_cycles=1.0,
+        operation_cycles=operation_cycles,
+    )
+
+
+def _node_level_logical_memory_edges(record: Mapping[str, Any]) -> set[tuple[int, int]]:
+    """Return branch-free logical-root RAW/WAR/WAW dependencies."""
+
+    def roots(node: Mapping[str, Any], field: str) -> set[str]:
+        accesses = node.get(field, [])
+        if not isinstance(accesses, list):
+            raise ValueError(f"schedule node {node.get('id')} has invalid {field} metadata")
+        result: set[str] = set()
+        for access in accesses:
+            if not isinstance(access, Mapping):
+                raise ValueError(f"schedule node {node.get('id')} has a non-object {field} entry")
+            root = access.get("root")
+            if not isinstance(root, str) or not root:
+                raise ValueError(f"schedule node {node.get('id')} has a {field} entry without a root")
+            result.add(root)
+        return result
+
+    last_writer: dict[str, int] = {}
+    readers_since_write: dict[str, set[int]] = defaultdict(set)
+    dependencies: set[tuple[int, int]] = set()
+    for node in record.get("nodes", []):
+        if not isinstance(node, Mapping) or node.get("kind") != "operation":
+            continue
+        node_id = node.get("id")
+        if not isinstance(node_id, int):
+            raise ValueError("schedule operation has no integer id")
+        read_roots = roots(node, "uses")
+        write_roots = roots(node, "defs")
+        for root in read_roots:
+            writer = last_writer.get(root)
+            if writer is not None and writer != node_id:
+                dependencies.add((writer, node_id))
+        for root in write_roots:
+            writer = last_writer.get(root)
+            if writer is not None and writer != node_id:
+                dependencies.add((writer, node_id))
+            dependencies.update(
+                (reader, node_id) for reader in readers_since_write[root] if reader != node_id
+            )
+        for root in write_roots:
+            last_writer[root] = node_id
+            readers_since_write[root].clear()
+        for root in read_roots - write_roots:
+            readers_since_write[root].add(node_id)
+    return dependencies
+
+
+def _edge_reachable(edges: set[tuple[int, int]], source: int, target: int) -> bool:
+    """Return whether ``target`` is reachable from ``source`` in a finite graph."""
+    if source == target:
+        return True
+    successors: dict[int, set[int]] = defaultdict(set)
+    for predecessor, successor in edges:
+        successors[predecessor].add(successor)
+    pending = [source]
+    visited = {source}
+    while pending:
+        current = pending.pop()
+        for successor in successors[current]:
+            if successor == target:
+                return True
+            if successor not in visited:
+                visited.add(successor)
+                pending.append(successor)
+    return False
+
+
+def _graph_conformance_base_edges(record: Mapping[str, Any]) -> set[tuple[int, int]]:
+    """Construct the node-level no-reuse graph used for conformance checks."""
+    prepared = _prepare_control_flow_record(record)
+    stream_edges = {
+        (int(edge["source"]), int(edge["target"]))
+        for edge in prepared.get("stream_edges", [])
+        if isinstance(edge, Mapping)
+        and isinstance(edge.get("source"), int)
+        and isinstance(edge.get("target"), int)
+    }
+    return stream_edges | _node_level_logical_memory_edges(record)
+
+
+def _realized_candidate_edge_keys(
+    candidate_scores: Mapping[str, Any], realized_placement: Mapping[str, Any]
+) -> tuple[dict[tuple[int, int], dict[str, Any]], dict[tuple[int, int, int], dict[str, Any]]]:
+    """Return the candidate catalogs selected by one complete placement."""
+    pairs = realized_placement.get("pairs")
+    if not isinstance(pairs, list) or not all(isinstance(pair, Mapping) for pair in pairs):
+        raise ValueError("realized placement must carry an array of scored pairs")
+    realized = [pair for pair in pairs if pair.get("reuse_realized")]
+    selected_distance = {
+        (int(source), int(target))
+        for pair in realized
+        for source, target in pair.get("distance_zero_schedule_edges", [])
+    }
+    selected_loops = {
+        (int(loop), int(source), int(target))
+        for pair in realized
+        for loop, source, target in pair.get("loop_carried_schedule_edges", [])
+    }
+    distance_catalog = {
+        (int(edge["source_node"]), int(edge["target_node"])): dict(edge)
+        for edge in candidate_scores.get("distance_zero_edges", [])
+        if isinstance(edge, Mapping)
+    }
+    loop_catalog = {
+        (int(edge["loop_node"]), int(edge["source_node"]), int(edge["target_node"])): dict(edge)
+        for edge in candidate_scores.get("loop_recurrence_edges", [])
+        if isinstance(edge, Mapping)
+    }
+    missing_distance = selected_distance - set(distance_catalog)
+    missing_loops = selected_loops - set(loop_catalog)
+    if missing_distance or missing_loops:
+        raise ValueError(
+            "realized placement refers to absent conformance candidate edges: "
+            f"distance_zero={sorted(missing_distance)[:8]}, loops={sorted(missing_loops)[:8]}"
+        )
+    return (
+        {key: distance_catalog[key] for key in sorted(selected_distance)},
+        {key: loop_catalog[key] for key in sorted(selected_loops)},
+    )
+
+
+def audit_graph_conformance(  # noqa: PLR0912 - explicit fail-closed classifications
+    record: Mapping[str, Any],
+    candidate_scores: Mapping[str, Any],
+    realized_placement: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compare predicted placement hazards with product post-InsertSync edges.
+
+    Version 1 deliberately accepts only branch-free schedules with statically
+    bounded loops. Distance-zero dependencies are compared modulo reachability
+    in the no-reuse and product graphs. Loop-carried dependencies require an
+    exact loop/source/target match; an unexplained product recurrence is
+    reported as incomplete rather than guessed to be placement-induced.
+    """
+    if candidate_scores.get("candidate_edge_semantics") != "pre_insert_sync_address_reuse_hazards_v1":
+        raise ValueError("graph conformance requires pre-InsertSync address-reuse hazards")
+    classification = classify_static_schedule(record)
+    limitations: list[str] = []
+    if classification["branch_node_count"]:
+        limitations.append("branch_dependent_reachability_not_supported_v1")
+    if classification["dynamic_loop_node_count"]:
+        limitations.append("dynamic_loop_reachability_not_supported_v1")
+    if limitations:
+        return {
+            "schema_version": 1,
+            "contract": "dsa_graph_conformance_v1",
+            "status": "INCOMPLETE",
+            "function": record.get("function", "<unknown>"),
+            "limitations": limitations,
+            "schedule_classification": classification,
+        }
+
+    selected_distance, selected_loops = _realized_candidate_edge_keys(candidate_scores, realized_placement)
+    normalized = _propagate_barrier_dependency_provenance(record)
+    prepared = _prepare_control_flow_record(normalized)
+    operation_ids = {
+        int(node["id"])
+        for node in normalized.get("nodes", [])
+        if isinstance(node, Mapping) and node.get("kind") == "operation" and isinstance(node.get("id"), int)
+    }
+    resolved_loop_edges = _effective_loop_carried_edge_indices(normalized)
+    actual_distance: set[tuple[int, int]] = set()
+    actual_graph_distance: set[tuple[int, int]] = set()
+    actual_loops: set[tuple[int, int, int]] = set()
+    structural_actual: list[dict[str, Any]] = []
+    sync_edges = [edge for edge in normalized.get("sync_edges", []) if isinstance(edge, Mapping)]
+    prepared_sync_edges = [edge for edge in prepared.get("sync_edges", []) if isinstance(edge, Mapping)]
+    if len(prepared_sync_edges) != len(sync_edges):
+        raise ValueError("control-flow preparation changed the number of synchronization edges")
+    for edge_index, (edge, prepared_edge) in enumerate(zip(sync_edges, prepared_sync_edges, strict=True)):
+        source, target = edge.get("source"), edge.get("target")
+        if not isinstance(source, int) or not isinstance(target, int):
+            structural_actual.append(_encoded_sync_edge(edge))
+            continue
+        recurrence_loop = resolved_loop_edges.get(edge_index)
+        if recurrence_loop is not None:
+            actual_loops.add((recurrence_loop, source, target))
+        else:
+            prepared_source, prepared_target = prepared_edge.get("source"), prepared_edge.get("target")
+            if isinstance(prepared_source, int) and isinstance(prepared_target, int):
+                actual_graph_distance.add((prepared_source, prepared_target))
+            if source in operation_ids and target in operation_ids:
+                actual_distance.add((source, target))
+            else:
+                structural_actual.append(_encoded_sync_edge(edge))
+
+    base_edges = _graph_conformance_base_edges(normalized)
+    actual_graph = base_edges | actual_graph_distance
+    predicted_graph = base_edges | set(selected_distance)
+    predicted_rows: list[dict[str, Any]] = []
+    for (source, target), edge in selected_distance.items():
+        if _edge_reachable(base_edges, source, target):
+            status = "REDUNDANT_IN_NO_REUSE_GRAPH"
+        elif (source, target) in actual_distance:
+            status = "EXACT_PRODUCT_SYNC_EDGE"
+        elif _edge_reachable(actual_graph, source, target):
+            status = "IMPLIED_OR_COALESCED_BY_PRODUCT_GRAPH"
+        else:
+            status = "PREDICTED_EDGE_NOT_ENFORCED"
+        predicted_rows.append(
+            {
+                "source": source,
+                "target": target,
+                "status": status,
+                "candidate_indices": list(edge.get("candidate_indices", [])),
+            }
+        )
+
+    actual_rows: list[dict[str, Any]] = []
+    for source, target in sorted(actual_distance):
+        if _edge_reachable(base_edges, source, target):
+            status = "BASE_GRAPH_DEPENDENCY"
+        elif (source, target) in selected_distance:
+            status = "EXACT_PREDICTED_EDGE"
+        elif _edge_reachable(predicted_graph, source, target):
+            status = "IMPLIED_BY_PREDICTED_GRAPH"
+        else:
+            status = "COMPILER_DEPENDENCY_NOT_PREDICTED"
+        actual_rows.append({"source": source, "target": target, "status": status})
+
+    predicted_loop_rows = [
+        {
+            "loop": loop,
+            "source": source,
+            "target": target,
+            "status": (
+                "EXACT_PRODUCT_LOOP_SYNC_EDGE"
+                if (loop, source, target) in actual_loops
+                else "PREDICTED_LOOP_EDGE_CONFORMANCE_UNRESOLVED_V1"
+            ),
+            "candidate_indices": list(edge.get("candidate_indices", [])),
+        }
+        for (loop, source, target), edge in selected_loops.items()
+    ]
+    if any(row["status"] == "PREDICTED_LOOP_EDGE_CONFORMANCE_UNRESOLVED_V1" for row in predicted_loop_rows):
+        limitations.append("loop_recurrence_reachability_not_supported_v1")
+    unexplained_actual_loops = sorted(actual_loops - set(selected_loops))
+    if unexplained_actual_loops:
+        limitations.append("actual_loop_recurrence_origin_unclassified_v1")
+
+    realized_pairs = [
+        pair
+        for pair in realized_placement.get("pairs", [])
+        if isinstance(pair, Mapping) and pair.get("reuse_realized")
+    ]
+    lowering_eliminations = [
+        {
+            "first_buffer": pair.get("first_buffer"),
+            "second_buffer": pair.get("second_buffer"),
+            "model_status": pair.get("model_status"),
+        }
+        for pair in realized_pairs
+        if pair.get("model_status") == "not_materialized_in_schedule"
+    ]
+    missing_provenance = [
+        {
+            "first_buffer": pair.get("first_buffer"),
+            "second_buffer": pair.get("second_buffer"),
+            "model_status": pair.get("model_status"),
+        }
+        for pair in realized_pairs
+        if pair.get("model_status") == "unmodeled_pipeline_serialization"
+    ]
+    if missing_provenance:
+        limitations.append("realized_reuse_missing_operation_provenance")
+
+    predicted_failures = [
+        row
+        for row in [*predicted_rows, *predicted_loop_rows]
+        if row["status"] == "PREDICTED_EDGE_NOT_ENFORCED"
+    ]
+    actual_failures = [row for row in actual_rows if row["status"] == "COMPILER_DEPENDENCY_NOT_PREDICTED"]
+    if predicted_failures or actual_failures:
+        status = "FAIL"
+    elif limitations:
+        status = "INCOMPLETE"
+    elif not selected_distance and not selected_loops:
+        status = "VACUOUS"
+    else:
+        status = "PASS"
+    return {
+        "schema_version": 1,
+        "contract": "dsa_graph_conformance_v1",
+        "status": status,
+        "function": normalized.get("function", "<unknown>"),
+        "limitations": limitations,
+        "schedule_classification": classification,
+        "summary": {
+            "predicted_distance_zero_edge_count": len(selected_distance),
+            "predicted_loop_edge_count": len(selected_loops),
+            "actual_operation_sync_edge_count": len(actual_distance),
+            "actual_loop_sync_edge_count": len(actual_loops),
+            "predicted_failure_count": len(predicted_failures),
+            "actual_unexplained_dependency_count": len(actual_failures),
+            "lowering_elimination_count": len(lowering_eliminations),
+            "missing_provenance_pair_count": len(missing_provenance),
+            "structural_actual_sync_edge_count": len(structural_actual),
+        },
+        "predicted_edges": predicted_rows,
+        "predicted_loop_edges": predicted_loop_rows,
+        "actual_edges": actual_rows,
+        "unexplained_actual_loop_edges": [
+            {"loop": loop, "source": source, "target": target}
+            for loop, source, target in unexplained_actual_loops
+        ],
+        "lowering_eliminations": lowering_eliminations,
+        "missing_provenance_pairs": missing_provenance,
+        "structural_actual_sync_edges": structural_actual,
+    }
+
+
+def audit_placement_graph_conformance(
+    record: Mapping[str, Any],
+    problem_path: str | Path,
+    solution_path: str | Path,
+    *,
+    known_nonmaterialized_access_orders: frozenset[int] = frozenset(),
+) -> dict[str, Any]:
+    """Build topology-only candidate evidence and audit one product schedule."""
+    classification = classify_static_schedule(record)
+    if classification["branch_node_count"] or classification["dynamic_loop_node_count"]:
+        limitations = []
+        if classification["branch_node_count"]:
+            limitations.append("branch_dependent_reachability_not_supported_v1")
+        if classification["dynamic_loop_node_count"]:
+            limitations.append("dynamic_loop_reachability_not_supported_v1")
+        return {
+            "schema_version": 1,
+            "contract": "dsa_graph_conformance_v1",
+            "status": "INCOMPLETE",
+            "function": record.get("function", "<unknown>"),
+            "limitations": limitations,
+            "schedule_classification": classification,
+        }
+    candidates = load_candidate_records(problem_path)
+    if not candidates:
+        return audit_graph_conformance(
+            record,
+            {
+                "schema_version": 2,
+                "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+                "distance_zero_edges": [],
+                "loop_recurrence_edges": [],
+            },
+            {"pairs": []},
+        )
+    promoted_penalties = load_promoted_reuse_penalties(problem_path)
+    promoted_reasons = load_promoted_reuse_penalty_reasons(problem_path)
+    model = _topology_only_duration_model(record)
+    try:
+        candidate_scores = score_reuse_candidates(
+            record,
+            candidates,
+            model,
+            promoted_penalties=promoted_penalties,
+            known_nonmaterialized_access_orders=known_nonmaterialized_access_orders,
+            promoted_penalty_reasons=promoted_reasons,
+        )
+    except ValueError as error:
+        return {
+            "schema_version": 1,
+            "contract": "dsa_graph_conformance_v1",
+            "status": "INCOMPLETE",
+            "function": record.get("function", "<unknown>"),
+            "limitations": ["candidate_edge_construction_failed"],
+            "candidate_edge_construction_error": str(error),
+            "schedule_classification": classification,
+        }
+    realized = score_realized_reuse(
+        problem_path,
+        solution_path,
+        candidate_scores,
+        promoted_only=False,
+    )
+    return audit_graph_conformance(record, candidate_scores, realized)
 
 
 def score_reuse_candidates(  # noqa: PLR0912, PLR0915 - explicit provenance and fail-closed gates
@@ -7868,6 +8411,32 @@ def _run_direct_model_command(args: argparse.Namespace) -> bool:
     if args.command == "qualify":
         _write_json(args.output, qualify_schedule_files(args.schedules))
         return True
+    if args.command == "audit-conformance":
+        record, function = _resolve_schedule_record(args.schedule, args.function)
+        nonmaterialized_access_orders = _load_nonmaterialized_access_evidence(
+            args.nonmaterialized_access_evidence,
+            schedule_path=args.schedule,
+            problem_path=args.problem,
+        )
+        result = audit_placement_graph_conformance(
+            record,
+            args.problem,
+            args.solution,
+            known_nonmaterialized_access_orders=nonmaterialized_access_orders,
+        )
+        result["input"] = {
+            "schedule": _hashed_input(args.schedule),
+            "problem": _hashed_input(args.problem),
+            "solution": _hashed_input(args.solution),
+            "function": function,
+            "nonmaterialized_access_evidence": (
+                _hashed_input(args.nonmaterialized_access_evidence)
+                if args.nonmaterialized_access_evidence is not None
+                else None
+            ),
+        }
+        _write_json(args.output, result)
+        return True
     if args.command == "rescore-realized":
         record, _ = _resolve_schedule_record(args.schedule, args.function)
         candidate_scores = json.loads(args.candidate_score.read_text())
@@ -8444,6 +9013,21 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0912,PLR0915 - e
     qualify_parser.add_argument("schedules", nargs="+", type=Path)
     qualify_parser.add_argument("-o", "--output", type=Path)
 
+    audit_parser = subparsers.add_parser(
+        "audit-conformance",
+        help="compare realized pre-InsertSync reuse hazards with product synchronization edges",
+    )
+    audit_parser.add_argument("schedule", type=Path)
+    audit_parser.add_argument("problem", type=Path)
+    audit_parser.add_argument("solution", type=Path)
+    audit_parser.add_argument("--function")
+    audit_parser.add_argument(
+        "--nonmaterialized-access-evidence",
+        type=Path,
+        help="digest-bound proof for candidate accesses removed before the lowered schedule",
+    )
+    audit_parser.add_argument("-o", "--output", type=Path)
+
     candidate_parser = subparsers.add_parser(
         "score-candidates", help="join raw DSA candidates to a schedule and derive critical-path weights"
     )
@@ -8459,6 +9043,17 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0912,PLR0915 - e
     )
     _add_runtime_branch_profile_arguments(candidate_parser)
     candidate_parser.add_argument("-o", "--output", type=Path)
+
+    ptoas_edges_parser = subparsers.add_parser(
+        "emit-ptoas-reuse-edges",
+        help="translate one complete DSA placement into PTOAS reuse-edge input",
+    )
+    ptoas_edges_parser.add_argument("candidate_score", type=Path)
+    ptoas_edges_parser.add_argument("problem", type=Path)
+    ptoas_edges_parser.add_argument("solution", type=Path)
+    ptoas_edges_parser.add_argument("ptoas_graph", type=Path)
+    ptoas_edges_parser.add_argument("--function")
+    ptoas_edges_parser.add_argument("-o", "--output", type=Path, required=True)
 
     rescore_parser = subparsers.add_parser(
         "rescore-realized",
@@ -8550,6 +9145,21 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0912,PLR0915 - e
                     model=model,
                 )
             _write_json(args.output, result)
+            return 0
+        if args.command == "emit-ptoas-reuse-edges":
+            candidate_scores = json.loads(args.candidate_score.read_text())
+            if not isinstance(candidate_scores, Mapping):
+                raise ValueError("candidate score input must be a JSON object")
+            _write_json(
+                args.output,
+                emit_ptoas_placement_reuse_edges(
+                    candidate_scores,
+                    args.problem,
+                    args.solution,
+                    args.ptoas_graph,
+                    function=args.function,
+                ),
+            )
             return 0
         if args.command == "validate-perf-sim":
             model = _model_from_args(args)

@@ -821,6 +821,24 @@ legacy SyncIR buffer identifier 与 raw PTO SSA name 不一致，因此 allocati
 和 scalar resource 提供经过验证的 pipe mapping。其余 transfer route 在 PTOAS
 pipe mapping 确认前会被拒绝。
 
+### Graph conformance 与完整 placement PTOAS bridge
+
+将预测的 reuse dependency 与产品 post-InsertSync graph 审计；branch、dynamic loop、
+非 exact recurrence 和失败 join 均为 `INCOMPLETE`，不会猜测。对于完整 solution，只把
+物理实际复用且已 materialize 的 distance-zero relation 转换为 PTOAS schedule-node edge：
+
+```bash
+python -m pypto.tools.dsa_schedule_model audit-conformance \
+    schedule.jsonl problem.dsa.json placement.dsa.solution.json -o conformance.json
+python -m pypto.tools.dsa_schedule_model emit-ptoas-reuse-edges \
+    candidate-weights.json problem.dsa.json placement.dsa.solution.json \
+    ptoas-schedule-graph.txt --function kernel -o placement-reuse-edges.json
+```
+
+PyPTO 负责 DSA buffer identity，PTOAS 负责 operation DAG。bridge 会拒绝缺失的
+provenance/access join 及 opaque 或非 distance-zero relation，因此不会把 reuse pair
+变成猜测的 graph edge。
+
 ## 剩余验证
 
 completion-frontier factorial 已经完成。它确认同一 consumer 的多个 active
