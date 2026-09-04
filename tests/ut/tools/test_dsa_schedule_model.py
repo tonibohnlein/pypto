@@ -5747,6 +5747,97 @@ def test_emit_ptoas_reuse_edges_joins_access_provenance(tmp_path, monkeypatch):
     ]
 
 
+def test_emit_ptoas_reuse_edges_preserves_loop_recurrence(tmp_path, monkeypatch):
+    candidate_score = {
+        "schema_version": 2,
+        "function": "kernel",
+        "candidates": [
+            {
+                "candidate_index": 0,
+                "first_buffer": 0,
+                "second_buffer": 1,
+                "prior_access_order": 3,
+                "next_access_order": 7,
+                "common_loop_nodes": [4, 9],
+                "resolved_recurrence_loop_node": 9,
+                "status": "loop_carried_scored_v1",
+            }
+        ],
+    }
+    graph = tmp_path / "graph.txt"
+    graph.write_text(
+        "KernelScheduleGraph @kernel nodes=2 dag_edges=0 dependencies=0\n"
+        "  node[11] op=pto.tload pypto_access_order=3\n"
+        "  node[19] op=pto.tstore pypto_access_order=7\n"
+    )
+    monkeypatch.setattr(dsa_schedule_model, "load_candidate_records", lambda _path: [_candidate()])
+    monkeypatch.setattr(
+        dsa_schedule_model,
+        "score_realized_reuse",
+        lambda *_args, **_kwargs: {
+            "pairs": [{"first_buffer": 0, "second_buffer": 1, "reuse_realized": True}]
+        },
+    )
+
+    result = dsa_schedule_model.emit_ptoas_placement_reuse_edges(
+        candidate_score, tmp_path / "problem.json", tmp_path / "solution.json", graph
+    )
+
+    assert result["edges"] == [
+        {
+            "source_node": 11,
+            "target_node": 19,
+            "kind": "war",
+            "iteration_distance": 1,
+            "recurrence_loop_depth": 2,
+            "provenance": (
+                "buffers=0,1;candidate=0;accesses=3,7;iteration_distance=1;recurrence_loop_depth=2"
+            ),
+        }
+    ]
+
+
+def test_emit_ptoas_reuse_edges_records_same_resource_as_already_ordered(tmp_path, monkeypatch):
+    candidate_score = {
+        "schema_version": 2,
+        "function": "kernel",
+        "candidates": [
+            {
+                "candidate_index": 0,
+                "first_buffer": 0,
+                "second_buffer": 1,
+                "status": "same_resource_not_scored",
+            }
+        ],
+    }
+    graph = tmp_path / "graph.txt"
+    graph.write_text(
+        "KernelScheduleGraph @kernel nodes=1 dag_edges=0 dependencies=0\n"
+        "  node[0] op=pto.tload pypto_access_order=3\n"
+    )
+    monkeypatch.setattr(dsa_schedule_model, "load_candidate_records", lambda _path: [_candidate()])
+    monkeypatch.setattr(
+        dsa_schedule_model,
+        "score_realized_reuse",
+        lambda *_args, **_kwargs: {
+            "pairs": [{"first_buffer": 0, "second_buffer": 1, "reuse_realized": True}]
+        },
+    )
+
+    result = dsa_schedule_model.emit_ptoas_placement_reuse_edges(
+        candidate_score, tmp_path / "problem.json", tmp_path / "solution.json", graph
+    )
+
+    assert result["edges"] == []
+    assert result["non_edge_reuses"] == [
+        {
+            "first_buffer": 0,
+            "second_buffer": 1,
+            "reason": "same_resource_fixed_pipe_order",
+        }
+    ]
+
+
 def test_emit_ptoas_reuse_edges_rejects_missing_access_join(tmp_path, monkeypatch):
     candidate_score = {
         "schema_version": 2,
@@ -5777,6 +5868,80 @@ def test_emit_ptoas_reuse_edges_rejects_missing_access_join(tmp_path, monkeypatc
         dsa_schedule_model.emit_ptoas_placement_reuse_edges(
             candidate_score, tmp_path / "problem.json", tmp_path / "solution.json", graph
         )
+
+
+def test_build_reuse_topology_does_not_require_operation_durations(tmp_path):
+    record = _record()
+    record["nodes"][0] = _with_access(record["nodes"][0], 3)
+    record["nodes"][0]["op_name"] = "pto.unsupported_for_latency"
+    record["nodes"][1] = _with_access(record["nodes"][1], 7)
+    problem = tmp_path / "problem.json"
+    problem.write_text(
+        json.dumps(
+            {
+                "problem": {
+                    "cost_model": {
+                        "reuse_penalties": [
+                            {"first": 0, "second": 1, "cost": 1, "reason": "reuse_recognizer"}
+                        ]
+                    }
+                }
+            }
+        )
+    )
+
+    result = dsa_schedule_model.build_reuse_topology(record, [_candidate()], problem)
+
+    assert result["topology_only"] is True
+    assert result["model_version"] == "reuse_topology_v1"
+    assert result["candidates"][0]["status"] == "scored"
+    assert result["candidates"][0]["source_node"] == 0
+    assert result["candidates"][0]["target_node"] == 1
+
+
+def test_emit_ptoas_node_durations_binds_graph_and_access_identity(tmp_path):
+    record = _record()
+    access_orders = [3, 7, 9, 11]
+    for index, access in enumerate(access_orders):
+        record["nodes"][index] = _with_access(record["nodes"][index], access)
+    graph = tmp_path / "graph.txt"
+    graph.write_text(
+        "KernelScheduleGraph @kernel nodes=4 dag_edges=2 dependencies=2\n"
+        "  node[0] op=pto.tadd pipe=PIPE_V pypto_access_order=3\n"
+        "  node[1] op=pto.tload pipe=PIPE_MTE2 pypto_access_order=7\n"
+        "  node[2] op=pto.tmuls pipe=PIPE_V pypto_access_order=9\n"
+        "  node[3] op=pto.tload pipe=PIPE_MTE2 pypto_access_order=11\n"
+        "  longest_path_cycles=2\n"
+    )
+
+    result = dsa_schedule_model.emit_ptoas_resolved_node_durations(record, _ten_cycle_model(), graph)
+
+    assert result["contract"] == "ptoas_resolved_node_durations_v1"
+    assert result["ptoas_graph_sha256"] == hashlib.sha256(graph.read_bytes()).hexdigest()
+    assert result["graph_shape"] == {
+        "node_count": 4,
+        "dag_edge_count": 2,
+        "dependency_count": 2,
+    }
+    assert [row["cycles"] for row in result["nodes"]] == [10, 10, 10, 10]
+    assert [row["pypto_access_order"] for row in result["nodes"]] == access_orders
+
+
+def test_emit_ptoas_node_durations_rejects_operation_mismatch(tmp_path):
+    record = _record()
+    for index, access in enumerate((3, 7, 9, 11)):
+        record["nodes"][index] = _with_access(record["nodes"][index], access)
+    graph = tmp_path / "graph.txt"
+    graph.write_text(
+        "KernelScheduleGraph @kernel nodes=4 dag_edges=0 dependencies=0\n"
+        "  node[0] op=pto.wrong pipe=PIPE_V pypto_access_order=3\n"
+        "  node[1] op=pto.tload pipe=PIPE_MTE2 pypto_access_order=7\n"
+        "  node[2] op=pto.tmuls pipe=PIPE_V pypto_access_order=9\n"
+        "  node[3] op=pto.tload pipe=PIPE_MTE2 pypto_access_order=11\n"
+    )
+
+    with pytest.raises(ValueError, match="operation differs"):
+        dsa_schedule_model.emit_ptoas_resolved_node_durations(record, _ten_cycle_model(), graph)
 
 
 if __name__ == "__main__":

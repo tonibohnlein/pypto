@@ -5818,8 +5818,13 @@ def score_realized_reuse(
 
 
 _PTOAS_GRAPH_FUNCTION_RE = re.compile(r"^KernelScheduleGraph @(?P<function>\S+)")
-_PTOAS_GRAPH_ACCESS_NODE_RE = re.compile(
-    r"^\s*node\[(?P<node>\d+)\].*\bpypto_access_order=(?P<access>\d+)\b"
+_PTOAS_GRAPH_HEADER_RE = re.compile(
+    r"^KernelScheduleGraph @(?P<function>\S+) nodes=(?P<nodes>\d+) "
+    r"dag_edges=(?P<dag_edges>\d+) dependencies=(?P<dependencies>\d+)$"
+)
+_PTOAS_GRAPH_ACCESS_NODE_RE = re.compile(r"^\s*node\[(?P<node>\d+)\].*\bpypto_access_order=(?P<access>\d+)\b")
+_PTOAS_GRAPH_NODE_RE = re.compile(
+    r"^\s*node\[(?P<node>\d+)\] op=(?P<op>\S+).*\bpypto_access_order=(?P<access>\d+)\b"
 )
 
 
@@ -5846,7 +5851,130 @@ def _load_ptoas_access_node_map(path: str | Path, *, function: str) -> dict[int,
     return mapping
 
 
-def emit_ptoas_placement_reuse_edges(
+def _load_ptoas_graph_nodes(
+    path: str | Path, *, function: str
+) -> tuple[dict[int, tuple[int, str]], dict[str, int]]:
+    """Load the exact PTOAS node/access contract used by external weights."""
+    source = Path(path)
+    header: dict[str, int] | None = None
+    nodes: dict[int, tuple[int, str]] = {}
+    accesses: set[int] = set()
+    for line in source.read_text().splitlines():
+        if match := _PTOAS_GRAPH_HEADER_RE.match(line):
+            if header is not None:
+                raise ValueError(f"{source}: expected exactly one KernelScheduleGraph record")
+            if match["function"] != function:
+                raise ValueError(
+                    f"{source}: graph function {match['function']!r} does not match {function!r}"
+                )
+            header = {
+                "node_count": int(match["nodes"]),
+                "dag_edge_count": int(match["dag_edges"]),
+                "dependency_count": int(match["dependencies"]),
+            }
+            continue
+        if match := _PTOAS_GRAPH_NODE_RE.match(line):
+            node, access = int(match["node"]), int(match["access"])
+            if node in nodes:
+                raise ValueError(f"{source}: PTOAS node {node} is repeated")
+            if access in accesses:
+                raise ValueError(f"{source}: pypto access {access} maps to multiple PTOAS nodes")
+            nodes[node] = (access, match["op"])
+            accesses.add(access)
+    if header is None:
+        raise ValueError(f"{source}: missing KernelScheduleGraph header for {function!r}")
+    if len(nodes) != header["node_count"]:
+        raise ValueError(
+            f"{source}: every PTOAS node needs pypto_access_order provenance: "
+            f"{len(nodes)} != {header['node_count']}"
+        )
+    if set(nodes) != set(range(header["node_count"])):
+        raise ValueError(f"{source}: PTOAS node ids are not dense from zero")
+    return nodes, header
+
+
+def emit_ptoas_resolved_node_durations(
+    record: Mapping[str, Any],
+    model: DurationModel,
+    ptoas_graph_path: str | Path,
+    *,
+    function: str | None = None,
+) -> dict[str, Any]:
+    """Resolve every PTOAS node duration through PyPTO's pinned provider.
+
+    The external document binds the duration values to the exact unweighted
+    PTOAS graph bytes and to each node's operation and ``pypto_access_order``.
+    PTOAS rechecks all of those fields before applying a weight.
+    """
+    record_function = record.get("function")
+    if not isinstance(record_function, str) or not record_function:
+        raise ValueError("schedule record has no function identity")
+    if function is not None and function != record_function:
+        raise ValueError(f"requested function {function!r} does not match {record_function!r}")
+    graph_path = Path(ptoas_graph_path)
+    ptoas_nodes, graph_shape = _load_ptoas_graph_nodes(graph_path, function=record_function)
+    _, duration_provenance, dynamic_loops = estimate_node_durations(record, model)
+
+    schedule_nodes: dict[int, tuple[int, str]] = {}
+    for node in record.get("nodes", []):
+        if not isinstance(node, Mapping) or node.get("kind") != "operation":
+            continue
+        node_id = node.get("id")
+        op_name = node.get("op_name")
+        access = _node_access_order(node)
+        if not isinstance(node_id, int) or not isinstance(op_name, str) or access is None:
+            raise ValueError("every schedule operation needs id, op_name, and pypto_access_order")
+        if access in schedule_nodes:
+            raise ValueError(f"pypto access {access} maps to multiple schedule operations")
+        schedule_nodes[access] = (node_id, op_name)
+
+    graph_accesses = {access for access, _ in ptoas_nodes.values()}
+    rows: list[dict[str, Any]] = []
+    for ptoas_node, (access, ptoas_op) in sorted(ptoas_nodes.items()):
+        schedule_node = schedule_nodes.get(access)
+        if schedule_node is None:
+            raise ValueError(f"PTOAS node {ptoas_node} access {access} has no schedule operation")
+        schedule_node_id, schedule_op = schedule_node
+        if schedule_op != ptoas_op:
+            raise ValueError(
+                f"PTOAS node {ptoas_node} operation differs at access {access}: "
+                f"{ptoas_op!r} != {schedule_op!r}"
+            )
+        provenance = duration_provenance[schedule_node_id]
+        if provenance.get("fallback") is True:
+            raise ValueError(f"PTOAS node {ptoas_node} duration for {ptoas_op} uses an unsupported fallback")
+        base_cycles = provenance.get("base_cycles")
+        if not isinstance(base_cycles, (int, float)) or not math.isfinite(base_cycles) or base_cycles <= 0:
+            raise ValueError(f"PTOAS node {ptoas_node} has invalid base duration {base_cycles!r}")
+        rows.append(
+            {
+                "node_id": ptoas_node,
+                "pypto_access_order": access,
+                "op_name": ptoas_op,
+                "cycles": int(math.floor(float(base_cycles) + 0.5)),
+                "source": provenance["source"],
+                "detail": provenance["detail"],
+            }
+        )
+    extra = sorted(set(schedule_nodes) - graph_accesses)
+    if extra:
+        raise ValueError(f"schedule operations are absent from the PTOAS graph: accesses={extra[:8]}")
+    return {
+        "schema_version": 1,
+        "contract": "ptoas_resolved_node_durations_v1",
+        "function": record_function,
+        "ptoas_graph_sha256": hashlib.sha256(graph_path.read_bytes()).hexdigest(),
+        "schedule_semantic_sha256": hashlib.sha256(
+            json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest(),
+        "graph_shape": graph_shape,
+        "duration_model": _duration_model_provenance(model),
+        "dynamic_loop_ids": dynamic_loops,
+        "nodes": rows,
+    }
+
+
+def emit_ptoas_placement_reuse_edges(  # noqa: PLR0912 - explicit fail-closed provenance gates
     candidate_scores: Mapping[str, Any],
     problem_path: str | Path,
     solution_path: str | Path,
@@ -5858,9 +5986,10 @@ def emit_ptoas_placement_reuse_edges(
 
     PyPTO owns the DSA problem/solution and therefore determines which logical
     buffer pairs physically overlap. PTOAS owns the operation DAG and resolves
-    the resulting access-order join to its node IDs. This adapter refuses a
-    physical reuse pair whose candidate relation cannot be materialized as a
-    distance-zero RAW/WAR/WAW dependency.
+    the resulting access-order join to its node IDs. Distance-zero hazards
+    become ordinary graph dependencies. Loop-carried hazards retain their
+    iteration distance and common-loop depth, so PTOAS can keep them out of
+    the acyclic per-iteration graph without losing the placement topology.
 
     Args:
         candidate_scores: Schema-v2 result from ``score-candidates``.
@@ -5900,16 +6029,30 @@ def emit_ptoas_placement_reuse_edges(
         if isinstance(first, int) and isinstance(second, int):
             rows_by_pair[_buffer_pair(first, second)].append(row)
 
-    by_edge: dict[tuple[int, int, str], list[str]] = defaultdict(list)
+    by_edge: dict[tuple[int, int, str, int, int], list[str]] = defaultdict(list)
     represented_pairs: set[tuple[int, int]] = set()
+    non_edge_reuses: list[dict[str, Any]] = []
     for pair in sorted(realized_pairs):
         rows = rows_by_pair.get(pair, [])
-        materialized = [row for row in rows if row.get("status") == "scored"]
+        materialized = [
+            row
+            for row in rows
+            if row.get("status")
+            in {"scored", "loop_carried_scored_v1", "loop_carried_occurrence_profiled_v2"}
+        ]
         if not materialized:
             statuses = sorted({str(row.get("status")) for row in rows})
-            raise ValueError(
-                f"realized reuse pair {pair} has no materialized distance-zero candidate; statuses={statuses}"
-            )
+            if statuses == ["same_resource_not_scored"]:
+                represented_pairs.add(pair)
+                non_edge_reuses.append(
+                    {
+                        "first_buffer": pair[0],
+                        "second_buffer": pair[1],
+                        "reason": "same_resource_fixed_pipe_order",
+                    }
+                )
+                continue
+            raise ValueError(f"realized reuse pair {pair} has no materialized candidate; statuses={statuses}")
         represented_pairs.add(pair)
         for row in materialized:
             index = row.get("candidate_index")
@@ -5934,23 +6077,57 @@ def emit_ptoas_placement_reuse_edges(
             if kind is None:
                 raise ValueError(f"unsupported reuse dependence {candidate.dependence!r}")
             provenance = (
-                f"buffers={pair[0]},{pair[1]};candidate={index};"
-                f"accesses={prior_access},{next_access}"
+                f"buffers={pair[0]},{pair[1]};candidate={index};accesses={prior_access},{next_access}"
             )
-            by_edge[(source, target, kind)].append(provenance)
+            loop_carried = row.get("status") in {
+                "loop_carried_scored_v1",
+                "loop_carried_occurrence_profiled_v2",
+            }
+            iteration_distance = 1 if loop_carried else 0
+            recurrence_loop_depth = 0
+            if loop_carried:
+                common_loops = row.get("common_loop_nodes")
+                recurrence_loop = row.get("resolved_recurrence_loop_node")
+                if (
+                    not isinstance(common_loops, list)
+                    or not common_loops
+                    or not isinstance(recurrence_loop, int)
+                    or recurrence_loop not in common_loops
+                ):
+                    raise ValueError(f"loop-carried reuse pair {pair} has no resolved common-loop provenance")
+                recurrence_loop_depth = common_loops.index(recurrence_loop) + 1
+                provenance += (
+                    f";iteration_distance={iteration_distance};recurrence_loop_depth={recurrence_loop_depth}"
+                )
+            by_edge[(source, target, kind, iteration_distance, recurrence_loop_depth)].append(provenance)
     if represented_pairs != realized_pairs:
         raise ValueError("not every realized reuse pair was represented in the PTOAS edge file")
     return {
         "schema_version": 1,
         "function": candidate_function,
+        "non_edge_reuses": non_edge_reuses,
         "edges": [
             {
                 "source_node": source,
                 "target_node": target,
                 "kind": kind,
                 "provenance": "|".join(sorted(provenances)),
+                **(
+                    {
+                        "iteration_distance": iteration_distance,
+                        "recurrence_loop_depth": recurrence_loop_depth,
+                    }
+                    if iteration_distance
+                    else {}
+                ),
             }
-            for (source, target, kind), provenances in sorted(by_edge.items())
+            for (
+                source,
+                target,
+                kind,
+                iteration_distance,
+                recurrence_loop_depth,
+            ), provenances in sorted(by_edge.items())
         ],
     }
 
@@ -6319,17 +6496,12 @@ def audit_placement_graph_conformance(
             },
             {"pairs": []},
         )
-    promoted_penalties = load_promoted_reuse_penalties(problem_path)
-    promoted_reasons = load_promoted_reuse_penalty_reasons(problem_path)
-    model = _topology_only_duration_model(record)
     try:
-        candidate_scores = score_reuse_candidates(
+        candidate_scores = build_reuse_topology(
             record,
             candidates,
-            model,
-            promoted_penalties=promoted_penalties,
+            problem_path,
             known_nonmaterialized_access_orders=known_nonmaterialized_access_orders,
-            promoted_penalty_reasons=promoted_reasons,
         )
     except ValueError as error:
         return {
@@ -6348,6 +6520,69 @@ def audit_placement_graph_conformance(
         promoted_only=False,
     )
     return audit_graph_conformance(record, candidate_scores, realized)
+
+
+def build_reuse_topology(
+    record: Mapping[str, Any],
+    candidates: Sequence[ReuseCandidateRecord],
+    problem_path: str | Path,
+    *,
+    known_nonmaterialized_access_orders: frozenset[int] = frozenset(),
+) -> dict[str, Any]:
+    """Build placement-reuse edge provenance without requiring durations.
+
+    Uniform internal weights are used only to exercise the existing
+    branch/loop/access join. The returned node and access identities are the
+    topology contract; its numerical candidate weights are explicitly not a
+    latency estimate and must not be used as solver costs.
+    """
+    result = score_reuse_candidates(
+        record,
+        candidates,
+        _topology_only_duration_model(record),
+        promoted_penalties=load_promoted_reuse_penalties(problem_path),
+        known_nonmaterialized_access_orders=known_nonmaterialized_access_orders,
+        promoted_penalty_reasons=load_promoted_reuse_penalty_reasons(problem_path),
+    )
+    result["model_version"] = "reuse_topology_v1"
+    result["duration_model_version"] = "topology_only_not_a_latency_model"
+    result["calibration_status"] = "topology_only_not_a_latency_model"
+    result["topology_only"] = True
+    return result
+
+
+def emit_ptoas_placement_reuse_topology(
+    record: Mapping[str, Any],
+    problem_path: str | Path,
+    solution_path: str | Path,
+    ptoas_graph_path: str | Path,
+    *,
+    function: str | None = None,
+    known_nonmaterialized_access_orders: frozenset[int] = frozenset(),
+) -> dict[str, Any]:
+    """Emit the realized placement edge set without evaluating durations."""
+    record_function = record.get("function")
+    if not isinstance(record_function, str) or not record_function:
+        raise ValueError("schedule record has no function identity")
+    if function is not None and function != record_function:
+        raise ValueError(f"requested function {function!r} does not match {record_function!r}")
+    topology = build_reuse_topology(
+        record,
+        load_candidate_records(problem_path),
+        problem_path,
+        known_nonmaterialized_access_orders=known_nonmaterialized_access_orders,
+    )
+    result = emit_ptoas_placement_reuse_edges(
+        topology,
+        problem_path,
+        solution_path,
+        ptoas_graph_path,
+        function=record_function,
+    )
+    result["contract"] = "ptoas_placement_reuse_topology_v1"
+    result["topology_only"] = True
+    result["ptoas_graph_sha256"] = hashlib.sha256(Path(ptoas_graph_path).read_bytes()).hexdigest()
+    return result
 
 
 def score_reuse_candidates(  # noqa: PLR0912, PLR0915 - explicit provenance and fail-closed gates
@@ -8437,6 +8672,51 @@ def _run_direct_model_command(args: argparse.Namespace) -> bool:
         }
         _write_json(args.output, result)
         return True
+    if args.command == "emit-ptoas-reuse-topology":
+        record, function = _resolve_schedule_record(args.schedule, args.function)
+        record = _apply_runtime_profile_from_args(
+            args,
+            record,
+            schedule_path=args.schedule,
+            problem_path=args.problem,
+        )
+        nonmaterialized_access_orders = _load_nonmaterialized_access_evidence(
+            args.nonmaterialized_access_evidence,
+            schedule_path=args.schedule,
+            problem_path=args.problem,
+        )
+        result = emit_ptoas_placement_reuse_topology(
+            record,
+            args.problem,
+            args.solution,
+            args.ptoas_graph,
+            function=function,
+            known_nonmaterialized_access_orders=nonmaterialized_access_orders,
+        )
+        result["input"] = {
+            "schedule": _hashed_input(args.schedule),
+            "problem": _hashed_input(args.problem),
+            "solution": _hashed_input(args.solution),
+            "ptoas_graph": _hashed_input(args.ptoas_graph),
+            "function": function,
+        }
+        _write_json(args.output, result)
+        return True
+    if args.command == "emit-ptoas-node-durations":
+        record, function = _resolve_schedule_record(args.schedule, args.function)
+        result = emit_ptoas_resolved_node_durations(
+            record,
+            _model_from_args(args),
+            args.ptoas_graph,
+            function=function,
+        )
+        result["input"] = {
+            "schedule": _hashed_input(args.schedule),
+            "ptoas_graph": _hashed_input(args.ptoas_graph),
+            "function": function,
+        }
+        _write_json(args.output, result)
+        return True
     if args.command == "rescore-realized":
         record, _ = _resolve_schedule_record(args.schedule, args.function)
         candidate_scores = json.loads(args.candidate_score.read_text())
@@ -9054,6 +9334,29 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0912,PLR0915 - e
     ptoas_edges_parser.add_argument("ptoas_graph", type=Path)
     ptoas_edges_parser.add_argument("--function")
     ptoas_edges_parser.add_argument("-o", "--output", type=Path, required=True)
+
+    topology_parser = subparsers.add_parser(
+        "emit-ptoas-reuse-topology",
+        help="derive and emit one placement's PTOAS reuse edges without duration scoring",
+    )
+    topology_parser.add_argument("schedule", type=Path)
+    topology_parser.add_argument("problem", type=Path)
+    topology_parser.add_argument("solution", type=Path)
+    topology_parser.add_argument("ptoas_graph", type=Path)
+    topology_parser.add_argument("--function")
+    topology_parser.add_argument("--nonmaterialized-access-evidence", type=Path)
+    _add_runtime_branch_profile_arguments(topology_parser)
+    topology_parser.add_argument("-o", "--output", type=Path, required=True)
+
+    node_duration_parser = subparsers.add_parser(
+        "emit-ptoas-node-durations",
+        help="resolve every PTOAS graph node through the pinned composite duration provider",
+    )
+    node_duration_parser.add_argument("schedule", type=Path)
+    node_duration_parser.add_argument("ptoas_graph", type=Path)
+    node_duration_parser.add_argument("--function")
+    _add_duration_arguments(node_duration_parser)
+    node_duration_parser.add_argument("-o", "--output", type=Path, required=True)
 
     rescore_parser = subparsers.add_parser(
         "rescore-realized",

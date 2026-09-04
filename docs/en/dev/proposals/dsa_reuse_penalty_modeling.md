@@ -936,9 +936,8 @@ dependency rather than becoming a spurious initiation-interval constraint.
 
 The raw-PTO join also preserves operand/result types and scalar constant
 operands, and derives `static_work_bytes` from statically shaped tile and
-partition types. This is enough to price transfers without inventing DSA
-allocation sizes: the latter
-remain marked missing because legacy SyncIR buffer identifiers do not match raw
+partition types. This prices transfers without inventing DSA allocation sizes;
+the latter remain missing because legacy SyncIR buffer identifiers do not match raw
 PTO SSA names. A trace-side `pto.tmatmul.acc` may join a raw `pto.tmatmul` only
 when the raw operation has an accumulator input; an ordinary two-input matmul
 remains distinct and fails the mismatch check.
@@ -951,20 +950,26 @@ transfer-route families until their PTOAS pipeline mapping is established.
 
 Audit predicted reuse dependencies against the product post-InsertSync graph;
 branches, dynamic loops, non-exact recurrences, and failed joins are
-`INCOMPLETE`, never guessed. For a complete solution, emit only physically
-realized, materialized distance-zero relations as PTOAS schedule-node edges:
+`INCOMPLETE`, never guessed. For a complete solution, emit physically realized
+distance-zero edges and positive-distance recurrence metadata to PTOAS:
 
 ```bash
-python -m pypto.tools.dsa_schedule_model audit-conformance \
-    schedule.jsonl problem.dsa.json placement.dsa.solution.json -o conformance.json
-python -m pypto.tools.dsa_schedule_model emit-ptoas-reuse-edges \
-    candidate-weights.json problem.dsa.json placement.dsa.solution.json \
+pto-test-opt input.pto '-pto-print-kernel-schedule-graph=format=text' -o /dev/null > ptoas-schedule-graph.txt
+python -m pypto.tools.dsa_schedule_model audit-conformance schedule.jsonl \
+    problem.dsa.json placement.dsa.solution.json -o conformance.json
+python -m pypto.tools.dsa_schedule_model emit-ptoas-reuse-topology \
+    schedule.jsonl problem.dsa.json placement.dsa.solution.json \
     ptoas-schedule-graph.txt --function kernel -o placement-reuse-edges.json
+python -m pypto.tools.dsa_schedule_model emit-ptoas-node-durations \
+    schedule.jsonl ptoas-schedule-graph.txt --model duration-model.json \
+    --function kernel -o node-durations.json
 ```
 
 PyPTO owns DSA buffer identity; PTOAS owns the operation DAG. The bridge rejects
-missing provenance/access joins and opaque or non-distance-zero relations, so
-it never turns a reuse pair into a guessed graph edge.
+missing provenance/access joins and opaque relations. Same-pipe reuse is
+recorded as already ordered rather than duplicated; loop-carried reuse retains
+its iteration distance and common-loop depth. Topology export needs no duration;
+duration export binds each exact result to function, graph hash, operation, and access order.
 
 ## Remaining validation
 

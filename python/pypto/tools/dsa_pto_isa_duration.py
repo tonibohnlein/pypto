@@ -27,6 +27,9 @@ _TRANSFER_RELATIVE_PATH = Path("include/pto/costmodel/a2a3/formula_costmodel/for
 _COMPUTE_RELATIVE_PATH = Path("include/pto/costmodel/a2a3/formula_costmodel/formula_backend_compute.hpp")
 _PERF_SIM_PROVIDER_RELATIVE_PATH = Path("include/pto/costmodel/perf_sim/costmodel_provider.hpp")
 _PERF_SIM_LATENCY_RELATIVE_PATH = Path("include/pto/costmodel/perf_sim/latency.hpp")
+_CCE_VECTOR_COMPUTE_RELATIVE_PATH = Path(
+    "include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compute.hpp"
+)
 _REQUIRED_PATHS = (
     _FORMULA_RELATIVE_PATH,
     _ARCH_RELATIVE_PATH,
@@ -35,6 +38,7 @@ _REQUIRED_PATHS = (
     _COMPUTE_RELATIVE_PATH,
     _PERF_SIM_PROVIDER_RELATIVE_PATH,
     _PERF_SIM_LATENCY_RELATIVE_PATH,
+    _CCE_VECTOR_COMPUTE_RELATIVE_PATH,
 )
 
 _FORMULA_OPCODE = {
@@ -81,6 +85,11 @@ _PERF_SIM_DEFAULT_OPS = {
     "pto.tneg",
     "pto.trowexpandmul",
     "pto.trowsum",
+    # A2/A3's CCE-backed Perf-Sim model contains an fp32 vrsqrt fit. Its source
+    # is included in the portable provider snapshot. High-precision TRSQRT
+    # lowers to several instructions and remains unsupported here; calibrated
+    # exact-signature overrides belong in the composite duration model.
+    "pto.trsqrt",
     "pto.tsetval",
     "pto.tsort32",
     "pto.tsubs",
@@ -236,7 +245,7 @@ class PtoIsaDurationProvider:
     source_sha256: dict[str, str]
     unsupported_policy: str = "error"
     fallback_cycles: float = 1.0
-    provider_version: str = "pto_isa_a2a3_v1"
+    provider_version: str = "pto_isa_a2a3_v2"
 
     @classmethod
     def from_checkout(
@@ -288,7 +297,11 @@ class PtoIsaDurationProvider:
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "PtoIsaDurationProvider":
         """Restore an embedded, portable provider snapshot."""
-        if value.get("schema_version") != 1 or value.get("provider_version") != "pto_isa_a2a3_v1":
+        provider_version = value.get("provider_version")
+        if value.get("schema_version") != 1 or provider_version not in {
+            "pto_isa_a2a3_v1",
+            "pto_isa_a2a3_v2",
+        }:
             raise ValueError("unsupported PTO-ISA duration-provider schema")
         parameters = value.get("formula_parameters")
         if not isinstance(parameters, list):
@@ -308,6 +321,7 @@ class PtoIsaDurationProvider:
             source_sha256={str(key): str(item) for key, item in hashes.items()},
             unsupported_policy=policy,
             fallback_cycles=fallback_cycles,
+            provider_version=str(provider_version),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -536,6 +550,36 @@ class PtoIsaDurationProvider:
         if work_tile is None:
             return self._unsupported(op_name, "Perf-Sim default operation has no static work tile")
         elements = work_tile.rows * work_tile.cols
+        if op_name == "pto.trsqrt":
+            high_precision_tiles = (
+                [*operand_tiles, *result_tiles]
+                if len(operand_tiles) == 2 and len(result_tiles) == 1
+                else operand_tiles
+                if len(operand_tiles) == 3 and not result_tiles
+                else []
+            )
+            if high_precision_tiles:
+                return self._unsupported(
+                    op_name,
+                    "high-precision TRSQRT requires a composite exact-signature calibration",
+                )
+            if len(result_tiles) != 1 or len(operand_tiles) != 1:
+                return self._unsupported(op_name, "unrecognized TRSQRT operand contract")
+            if work_tile.scope != "vec" or work_tile.dtype != "fp32":
+                return self._unsupported(
+                    op_name,
+                    f"unsupported A2/A3 vrsqrt tile scope={work_tile.scope}, dtype={work_tile.dtype}",
+                )
+            if _CCE_VECTOR_COMPUTE_RELATIVE_PATH.as_posix() not in self.source_sha256:
+                return self._unsupported(op_name, "A2/A3 vrsqrt source is absent from the provider snapshot")
+            repeat_elements = 256 // _DTYPE_BYTES[work_tile.dtype]
+            repeats = _ceil_div(elements, repeat_elements)
+            return DurationEstimate(
+                float(24 + repeats),
+                "pto_isa_a2a3_cce_vrsqrt",
+                f"TRSQRT:{work_tile.dtype}:{work_tile.rows}x{work_tile.cols}; "
+                f"repeat_elements={repeat_elements}; repeats={repeats}; calibrated=repeat+24",
+            )
         if op_name == "pto.ttrans":
             cycles = 1 + elements // 64
             stage = "MTE1"
