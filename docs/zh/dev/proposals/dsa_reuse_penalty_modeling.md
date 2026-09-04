@@ -824,20 +824,26 @@ pipe mapping 确认前会被拒绝。
 ### Graph conformance 与完整 placement PTOAS bridge
 
 将预测的 reuse dependency 与产品 post-InsertSync graph 审计；branch、dynamic loop、
-非 exact recurrence 和失败 join 均为 `INCOMPLETE`，不会猜测。对于完整 solution，只把
-物理实际复用且已 materialize 的 distance-zero relation 转换为 PTOAS schedule-node edge：
+非 exact recurrence 和失败 join 均为 `INCOMPLETE`，不会猜测。对于完整 solution，把
+物理实际复用的 distance-zero edge 和正 distance recurrence metadata 传给 PTOAS：
 
 ```bash
-python -m pypto.tools.dsa_schedule_model audit-conformance \
-    schedule.jsonl problem.dsa.json placement.dsa.solution.json -o conformance.json
-python -m pypto.tools.dsa_schedule_model emit-ptoas-reuse-edges \
-    candidate-weights.json problem.dsa.json placement.dsa.solution.json \
+pto-test-opt input.pto '-pto-print-kernel-schedule-graph=format=text' -o /dev/null > ptoas-schedule-graph.txt
+python -m pypto.tools.dsa_schedule_model audit-conformance schedule.jsonl \
+    problem.dsa.json placement.dsa.solution.json -o conformance.json
+python -m pypto.tools.dsa_schedule_model emit-ptoas-reuse-topology \
+    schedule.jsonl problem.dsa.json placement.dsa.solution.json \
     ptoas-schedule-graph.txt --function kernel -o placement-reuse-edges.json
+python -m pypto.tools.dsa_schedule_model emit-ptoas-node-durations \
+    schedule.jsonl ptoas-schedule-graph.txt --model duration-model.json \
+    --function kernel -o node-durations.json
 ```
 
 PyPTO 负责 DSA buffer identity，PTOAS 负责 operation DAG。bridge 会拒绝缺失的
-provenance/access join 及 opaque 或非 distance-zero relation，因此不会把 reuse pair
-变成猜测的 graph edge。
+provenance/access join 和 opaque relation。same-pipe reuse 记录为已有 ordering 而不会
+重复加边；loop-carried reuse 保留 iteration distance 和 common-loop depth。topology export
+不依赖 duration；duration export 会把 composite provider 的每个 exact 结果绑定到
+function、unweighted graph hash、operation 和 access order。
 
 ## 剩余验证
 

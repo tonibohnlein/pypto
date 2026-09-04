@@ -41,7 +41,10 @@ def _provider(*, policy: str = "error") -> dsa_pto_isa_duration.PtoIsaDurationPr
             dsa_pto_isa_duration.FormulaParameter("TMUL", "fp32", 128, 0.0325, 17.5),
             dsa_pto_isa_duration.FormulaParameter("TEXP", "any", None, 0.0314, 30.1),
         ],
-        source_sha256={"formula_params.csv": "b" * 64},
+        source_sha256={
+            "formula_params.csv": "b" * 64,
+            "include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compute.hpp": "c" * 64,
+        },
         unsupported_policy=policy,
         fallback_cycles=7.0,
     )
@@ -298,14 +301,86 @@ def test_scalar_load_fails_closed_without_pointer_and_scalar_result():
 
 
 def test_unsupported_operation_fails_closed_or_is_explicit_fallback():
-    node = _node("pto.trsqrt", "PIPE_V", "!pto.tile_buf<vec, 1x8xf32>")
-    with pytest.raises(ValueError, match="unsupported PTO-ISA duration for pto.trsqrt"):
+    node = _node("pto.unknown", "PIPE_V", "!pto.tile_buf<vec, 1x8xf32>")
+    with pytest.raises(ValueError, match="unsupported PTO-ISA duration for pto.unknown"):
         _provider().estimate(node, work_bytes=32)
 
     estimate = _provider(policy="fallback").estimate(node, work_bytes=32)
     assert estimate.cycles == 7
     assert estimate.source == "unsupported_fallback"
     assert estimate.fallback is True
+
+
+def test_basic_trsqrt_uses_pinned_a2a3_cce_vrsqrt_fit():
+    tile = "!pto.tile_buf<vec, 1x128xf32>"
+    node = _node("pto.trsqrt", "PIPE_V", tile)
+    node["operation"]["result_types"] = [tile]
+
+    estimate = _provider().estimate(node, work_bytes=512)
+
+    assert estimate.cycles == 26
+    assert estimate.source == "pto_isa_a2a3_cce_vrsqrt"
+    assert estimate.fallback is False
+
+
+def test_basic_fp16_trsqrt_fails_closed_because_pinned_fit_is_fp32_only():
+    tile = "!pto.tile_buf<vec, 1x128xf16>"
+    node = _node("pto.trsqrt", "PIPE_V", tile)
+    node["operation"]["result_types"] = [tile]
+
+    with pytest.raises(ValueError, match="unsupported A2/A3 vrsqrt.*dtype=fp16"):
+        _provider().estimate(node, work_bytes=256)
+
+
+def test_basic_trsqrt_fails_closed_without_pinned_cce_source():
+    tile = "!pto.tile_buf<vec, 1x128xf32>"
+    node = _node("pto.trsqrt", "PIPE_V", tile)
+    node["operation"]["result_types"] = [tile]
+    provider = _provider()
+    provider.source_sha256.pop("include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compute.hpp")
+
+    with pytest.raises(ValueError, match="vrsqrt source is absent"):
+        provider.estimate(node, work_bytes=512)
+
+
+def test_high_precision_trsqrt_requires_composite_exact_signature():
+    tile = "!pto.tile_buf<vec, 1x8xf32>"
+    node = _node("pto.trsqrt", "PIPE_V", tile, tile)
+    node["operation"]["result_types"] = [tile]
+
+    with pytest.raises(ValueError, match="requires a composite exact-signature calibration"):
+        _provider().estimate(node, work_bytes=32)
+
+
+def test_high_precision_trsqrt_native_dps_spelling_requires_composite_exact_signature():
+    tile = "!pto.tile_buf<vec, 1x8xf32>"
+    node = _node("pto.trsqrt", "PIPE_V", tile, tile, tile)
+
+    with pytest.raises(ValueError, match="requires a composite exact-signature calibration"):
+        _provider().estimate(node, work_bytes=32)
+
+
+def test_unmeasured_high_precision_trsqrt_shape_fails_closed():
+    tile = "!pto.tile_buf<vec, 1x128xf32>"
+    node = _node("pto.trsqrt", "PIPE_V", tile, tile)
+    node["operation"]["result_types"] = [tile]
+
+    with pytest.raises(ValueError, match="requires a composite exact-signature calibration"):
+        _provider().estimate(node, work_bytes=512)
+
+
+def test_legacy_provider_snapshot_cannot_claim_unpinned_trsqrt_support():
+    provider = _provider()
+    snapshot = provider.to_json()
+    snapshot["provider_version"] = "pto_isa_a2a3_v1"
+    snapshot["source_sha256"].pop("include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compute.hpp")
+    restored = dsa_pto_isa_duration.PtoIsaDurationProvider.from_json(snapshot)
+    tile = "!pto.tile_buf<vec, 1x128xf32>"
+    node = _node("pto.trsqrt", "PIPE_V", tile)
+    node["operation"]["result_types"] = [tile]
+
+    with pytest.raises(ValueError, match="vrsqrt source is absent"):
+        restored.estimate(node, work_bytes=512)
 
 
 def test_provider_snapshot_round_trip_is_portable():
