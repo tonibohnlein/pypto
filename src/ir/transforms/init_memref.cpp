@@ -1044,7 +1044,7 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
   // cast / sort32) + ptoas v0.60 caused packed-prefill NaN (pypto#2558 /
   // pypto-lib#1072). PTOAS is pinned to v0.57; do not synthesize those tmps until
   // the 3-arg tile.ci / PIPE_S vs PIPE_V mismatch is fixed upstream.
-  const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
+  const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : kDefaultMemoryPlanner;
   if (handler != nullptr && handler->RequiresLevel3TmpScratch() &&
       (planner == MemoryPlanner::PyPTO || planner == MemoryPlanner::DsaRP)) {
     MaterializePtoLevel3ScratchMutator materializer(/*materialize_a2a3_scratch=*/true);
@@ -1078,7 +1078,7 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
           << "\")) is not supported under memory_planner=PTOAS: ptoas owns memory planning and "
              "would be free to coalesce the allocations you separated. Declare it with "
              "pl.MemRef(slots=N) — N slots become one ptoas multi-buffer region whose slots ptoas "
-             "keeps disjoint — or compile with the default PyPTO memory planner.";
+             "keeps disjoint — or compile with the default DSA_RP memory planner.";
     }
   }
 
