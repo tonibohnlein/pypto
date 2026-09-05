@@ -253,6 +253,33 @@ ExportedProblem BuildStructuredProblem(const FunctionPtr& func, const Allocation
   ConstructExperimentalPairEdges(&recognition);
   ApplyExperimentalUnitPenaltyWeights(&recognition);
   if (reuse_penalty_recognizer != DsaReusePenaltyRecognizer::Disabled) {
+    std::ostringstream allocation_accesses;
+    allocation_accesses << '[';
+    bool first_allocation = true;
+    for (const auto& allocation : recognition.allocation_accesses) {
+      INTERNAL_CHECK(allocation.interval < buffer_id_by_interval.size());
+      const auto& buffer_id = buffer_id_by_interval[allocation.interval];
+      if (!buffer_id.has_value()) continue;
+      if (!first_allocation) allocation_accesses << ',';
+      first_allocation = false;
+      allocation_accesses << "{\"buffer\":" << *buffer_id
+                          << ",\"complete\":" << (allocation.complete ? "true" : "false")
+                          << ",\"accesses\":[";
+      bool first_access = true;
+      for (const auto& access : allocation.accesses) {
+        if (!first_access) allocation_accesses << ',';
+        first_access = false;
+        allocation_accesses << "{\"order\":" << access.access_order
+                            << ",\"pool\":" << ToPoolId(access.memory_space) << ",\"mode\":\""
+                            << (access.writes ? "write" : "read") << "\",\"resource\":\""
+                            << RecognizedAccessResourceToString(access.resource)
+                            << "\",\"offset\":" << access.byte_offset << ",\"size\":" << access.byte_size
+                            << ",\"range_known\":" << (access.range_known ? "true" : "false") << '}';
+      }
+      allocation_accesses << "]}";
+    }
+    allocation_accesses << ']';
+    exported.document.metadata["allocation_accesses_v1"] = allocation_accesses.str();
     std::vector<const RecognizedReuseCandidate*> legacy_candidates;
     std::set<std::pair<size_t, size_t>> legacy_candidate_pairs;
     std::set<std::pair<size_t, size_t>> legacy_ordered_pairs;

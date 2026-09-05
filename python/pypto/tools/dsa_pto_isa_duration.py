@@ -30,6 +30,7 @@ _PERF_SIM_LATENCY_RELATIVE_PATH = Path("include/pto/costmodel/perf_sim/latency.h
 _CCE_VECTOR_COMPUTE_RELATIVE_PATH = Path(
     "include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compute.hpp"
 )
+_INSTRUCTION_LOWERING_RELATIVE_PATH = Path("include/pto/common/pto_instr.hpp")
 _REQUIRED_PATHS = (
     _FORMULA_RELATIVE_PATH,
     _ARCH_RELATIVE_PATH,
@@ -39,6 +40,7 @@ _REQUIRED_PATHS = (
     _PERF_SIM_PROVIDER_RELATIVE_PATH,
     _PERF_SIM_LATENCY_RELATIVE_PATH,
     _CCE_VECTOR_COMPUTE_RELATIVE_PATH,
+    _INSTRUCTION_LOWERING_RELATIVE_PATH,
 )
 
 _FORMULA_OPCODE = {
@@ -56,14 +58,28 @@ _FORMULA_OPCODE = {
     "pto.tcolsum": "TCOLSUM",
     "pto.tcolmax": "TCOLMAX",
     "pto.trowexpand": "TROWEXPAND",
+    # A2/A3 implements these fused variants with the same row-broadcast
+    # traversal used to calibrate the TROWEXPAND family.  They remain labelled
+    # family approximations rather than exact instruction signatures.
+    "pto.trowexpandadd": "TROWEXPAND",
+    "pto.trowexpandsub": "TROWEXPAND",
     "pto.texp": "TEXP",
     "pto.tsqrt": "TSQRT",
 }
 _ANY_PARAMETER_OPS = {"TEXP", "TSQRT"}
+_NEAREST_FORMULA_SHAPE_OPS = {
+    "pto.trecip",
+    "pto.tmins",
+    "pto.tcolsum",
+    "pto.trowexpandadd",
+    "pto.trowexpandsub",
+    "pto.trowmax",
+}
 _MATMUL_OPS = {"pto.tmatmul", "pto.tmatmul.acc"}
 _TRANSFER_OPS = {"pto.tload": "TLOAD", "pto.tstore": "TSTORE", "pto.tmov": "TMOV"}
 _SCALAR_STAGE_OPS = {"pto.load_scalar", "pto.store_scalar", "pto.tpush", "pto.tpop", "pto.tfree"}
 _PERF_SIM_DEFAULT_OPS = {
+    "pto.tabs",
     "pto.tadd",
     "pto.tadds",
     "pto.tci",
@@ -90,6 +106,7 @@ _PERF_SIM_DEFAULT_OPS = {
     # lowers to several instructions and remains unsupported here; calibrated
     # exact-signature overrides belong in the composite duration model.
     "pto.trsqrt",
+    "pto.tscatter",
     "pto.tsetval",
     "pto.tsort32",
     "pto.tsubs",
@@ -214,6 +231,7 @@ class DurationEstimate:
     cycles: float
     source: str
     detail: str
+    evidence_class: str
     fallback: bool = False
 
 
@@ -362,9 +380,25 @@ class PtoIsaDurationProvider:
         if op_name in _SCALAR_STAGE_OPS:
             return self._estimate_scalar_stage(node, op_name, operand_types, result_types)
         if op_name in _FORMULA_OPCODE:
+            if op_name == "pto.trecip":
+                if _INSTRUCTION_LOWERING_RELATIVE_PATH.as_posix() not in self.source_sha256:
+                    return self._unsupported(op_name, "snapshot lacks pinned TRECIP-to-TDIVS lowering")
+                if operation.get("attributes", {}).get("precision_type") not in {None, "default", 0}:
+                    return self._unsupported(
+                        op_name, "non-default reciprocal needs mode-specific calibration"
+                    )
             estimate = self._estimate_formula_operation(op_name, tiles)
             if estimate is not None:
+                if op_name in {"pto.trowexpandadd", "pto.trowexpandsub"}:
+                    return DurationEstimate(
+                        estimate.cycles,
+                        "pto_isa_formula_family",
+                        f"{estimate.detail}; fused_op={op_name}; family=TROWEXPAND",
+                        "pinned_formula_family_approximation",
+                    )
                 return estimate
+        if op_name == "pto.tmaxs":
+            return self._estimate_calibrated_tmaxs(tiles)
         if op_name in _MATMUL_OPS:
             return self._estimate_matmul(op_name, tiles)
         if op_name in _TRANSFER_OPS:
@@ -470,6 +504,7 @@ class PtoIsaDurationProvider:
             "pto_isa_perf_sim_scalar_stage",
             "Perf-Sim StaticPipeStageLookup classifies scalar operations and "
             "FallbackCycles assigns one cycle",
+            "pinned_perf_sim_approximation",
         )
 
     def _estimate_formula_operation(self, op_name: str, tiles: list[TileType]) -> DurationEstimate | None:
@@ -479,6 +514,8 @@ class PtoIsaDurationProvider:
         opcode = _FORMULA_OPCODE[op_name]
         parameter = self._lookup_formula(opcode, tile.dtype, tile.cols)
         if parameter is None:
+            if op_name in _NEAREST_FORMULA_SHAPE_OPS:
+                return self._estimate_from_nearest_formula(op_name, opcode, tile)
             if op_name in _PERF_SIM_DEFAULT_OPS:
                 return None
             return self._unsupported(
@@ -490,6 +527,52 @@ class PtoIsaDurationProvider:
             float(cycles),
             "pto_isa_formula",
             f"{opcode}:{tile.dtype}:{tile.rows}x{tile.cols}; slope={parameter.slope}; bias={parameter.bias}",
+            "calibrated_formula_signature",
+        )
+
+    def _estimate_from_nearest_formula(self, op_name: str, opcode: str, tile: TileType) -> DurationEstimate:
+        """Extrapolate an absent shape from the nearest pinned formula fit.
+
+        In particular, A2/A3 lowers reciprocal to ``TDIVS(dst, 1, src)`` and
+        the pinned TDIVS table begins at 32 columns, while real RMS kernels use
+        8- and 16-column fp32 tiles. Reusing a same-dtype fit is evidence-backed
+        but explicitly remains an approximation, never an exact signature.
+        """
+        candidates = [
+            parameter
+            for parameter in self.formula_parameters
+            if parameter.op == opcode and parameter.dtype == tile.dtype and parameter.cols is not None
+        ]
+        if not candidates:
+            return self._unsupported(op_name, f"no measured {opcode} formula family for dtype={tile.dtype}")
+        nearest = min(
+            candidates,
+            key=lambda parameter: (abs(int(parameter.cols) - tile.cols), parameter.cols),
+        )
+        cycles = _round_to_cycles(nearest.slope * tile.rows * tile.cols + nearest.bias)
+        return DurationEstimate(
+            float(cycles),
+            "pto_isa_formula_nearest_shape",
+            f"{op_name} lowers to {opcode}; requested={tile.dtype}:{tile.rows}x{tile.cols}; "
+            f"nearest_calibrated_cols={nearest.cols}; slope={nearest.slope}; bias={nearest.bias}",
+            "pinned_formula_shape_approximation",
+        )
+
+    def _estimate_calibrated_tmaxs(self, tiles: list[TileType]) -> DurationEstimate:
+        """Apply the pinned A2/A3 CCE TMAXS calibration for fp32 vector tiles."""
+        if _CCE_VECTOR_COMPUTE_RELATIVE_PATH.as_posix() not in self.source_sha256:
+            return self._unsupported("pto.tmaxs", "snapshot lacks pinned A2/A3 CCE calibration source")
+        tile = tiles[0] if tiles else None
+        if tile is None or tile.scope != "vec" or tile.dtype != "fp32":
+            return self._unsupported("pto.tmaxs", "calibrated TMAXS requires one fp32 vector tile")
+        repeat_elements = 256 // _DTYPE_BYTES[tile.dtype]
+        repeats = _ceil_div(tile.rows * tile.cols, repeat_elements)
+        return DurationEstimate(
+            float(23 + repeats),
+            "pto_isa_a2a3_cce_vmaxs",
+            f"TMAXS:{tile.dtype}:{tile.rows}x{tile.cols}; repeat_elements={repeat_elements}; "
+            f"repeats={repeats}; calibrated=repeat+23",
+            "calibrated_instruction_model",
         )
 
     def _estimate_matmul(self, op_name: str, tiles: list[TileType]) -> DurationEstimate:
@@ -513,6 +596,7 @@ class PtoIsaDurationProvider:
             float(cycles),
             "pto_isa_matmul_formula",
             f"m={lhs.rows}; k={lhs.cols}; n={rhs.cols}; dtype={lhs.dtype}; repeats={repeats}",
+            "pinned_analytical_model",
         )
 
     def _estimate_transfer(self, op_name: str, tiles: list[TileType]) -> DurationEstimate:
@@ -535,6 +619,7 @@ class PtoIsaDurationProvider:
             "pto_isa_bandwidth",
             f"route={route}; bytes={transfer_bytes}; bandwidth_gib_per_s={bandwidth}; "
             f"frequency_hz={self.frequency_hz}",
+            "pinned_analytical_model",
         )
 
     def _estimate_perf_sim_default(
@@ -579,6 +664,7 @@ class PtoIsaDurationProvider:
                 "pto_isa_a2a3_cce_vrsqrt",
                 f"TRSQRT:{work_tile.dtype}:{work_tile.rows}x{work_tile.cols}; "
                 f"repeat_elements={repeat_elements}; repeats={repeats}; calibrated=repeat+24",
+                "calibrated_instruction_model",
             )
         if op_name == "pto.ttrans":
             cycles = 1 + elements // 64
@@ -591,6 +677,7 @@ class PtoIsaDurationProvider:
             "pto_isa_perf_sim_default",
             f"{op_name}:{work_tile.dtype}:{work_tile.rows}x{work_tile.cols}; "
             f"stage={stage}; pinned EstimateInstrCycles fallback",
+            "pinned_perf_sim_approximation",
         )
 
     def estimate_formula(self, op: str, dtype: str, rows: int, cols: int) -> DurationEstimate | None:
@@ -603,6 +690,7 @@ class PtoIsaDurationProvider:
             float(cycles),
             "pto_isa_formula",
             f"{op}:{dtype}:{rows}x{cols}; slope={parameter.slope}; bias={parameter.bias}",
+            "calibrated_formula_signature",
         )
 
     def _lookup_formula(self, op: str, dtype: str, cols: int) -> FormulaParameter | None:
@@ -626,6 +714,7 @@ class PtoIsaDurationProvider:
             self.fallback_cycles,
             "unsupported_fallback",
             reason,
+            "unsupported_fallback",
             fallback=True,
         )
 

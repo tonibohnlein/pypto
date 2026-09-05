@@ -5773,6 +5773,16 @@ class TestCapacityGatedReuse:
         problems = list(tmp_path.glob("*.dsa.json"))
         assert len(problems) == 1
         document = json.loads(problems[0].read_text())
+        allocation_accesses = json.loads(document["metadata"]["allocation_accesses_v1"])
+        buffer_ids = {buffer["id"] for buffer in document["problem"]["buffers"]}
+        assert {entry["buffer"] for entry in allocation_accesses} == buffer_ids
+        assert len(allocation_accesses) == len(buffer_ids)
+        assert all(entry["complete"] for entry in allocation_accesses)
+        assert all(entry["accesses"] for entry in allocation_accesses)
+        assert {access["mode"] for entry in allocation_accesses for access in entry["accesses"]} == {
+            "read",
+            "write",
+        }
         pipeline_penalties = [
             penalty
             for penalty in document["problem"]["cost_model"]["reuse_penalties"]

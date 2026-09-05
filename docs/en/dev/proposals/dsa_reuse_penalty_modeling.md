@@ -965,11 +965,48 @@ python -m pypto.tools.dsa_schedule_model emit-ptoas-node-durations \
     --function kernel -o node-durations.json
 ```
 
-PyPTO owns DSA buffer identity; PTOAS owns the operation DAG. The bridge rejects
-missing provenance/access joins and opaque relations. Same-pipe reuse is
-recorded as already ordered rather than duplicated; loop-carried reuse retains
-its iteration distance and common-loop depth. Topology export needs no duration;
-duration export binds each exact result to function, graph hash, operation, and access order.
+PyPTO owns DSA buffer identity; PTOAS owns the operation DAG. Topology export
+enumerates every physically overlapping range in the complete placement and
+joins its handoff sites through `metadata.allocation_accesses_v1`. This catalog
+records every allocation's read/write accesses before penalty-pair filtering,
+with completeness, pool, access identity, resource, and byte-range evidence. It does
+not consult the recognizer's penalty-candidate catalog, which is an objective
+input rather than a complete record of physical reuse. Lifetime-analysis
+positions and `pypto.access` identities are different coordinate systems;
+decoding a lifetime does **not** recover an emitted access ID. Old exports
+without the new catalog must be re-exported rather than patched by guessing a
+numbering offset. Missing or ambiguous joins, incomplete graph provenance, and
+operation-identity mismatches fail closed.
+
+Terminal frontiers retain outstanding accesses on each pipe and control path,
+not just the last lexical statement. Absent source accesses may be classified
+as nonmaterialized only after a complete raw-PTO join. Same-pipe reuse is recorded as already ordered rather than
+duplicated; loop-carried reuse retains its iteration distance and common-loop
+depth.
+
+Topology export needs no duration. Duration export binds every resolved result
+to function, graph hash, operation, and access order, and labels its evidence
+class. Calibrated signatures/instruction models, pinned analytical estimates,
+and generic pinned Perf-Sim approximations remain separate categories. A nearest
+TDIVS formula for `trecip` at an unmeasured shape is explicitly a shape
+approximation, not an exact calibrated signature. This uses the pinned
+`TRECIP -> TDIVS(dst, 1, src)` lowering and preserves `precisionType` so that
+non-default reciprocal modes fail closed.
+Nonnegative rounded durations, including zero, are permitted; negative,
+nonfinite, or unsupported fallback durations are refused.
+
+The current PTOAS recurrence result is a structural **lower bound**, not a
+complete invocation latency: it covers cycles with one positive-distance
+edge. Fixed pipe order, branch execution, nested-loop boundaries, trip counts,
+and cycles containing multiple recurrence edges still require conformance
+before a workload can be counted as having a complete score. A numeric bound
+and complete non-fallback duration coverage do not satisfy that gate alone.
+
+`tests/tools/dsa_reuse_bridge_host_audit.py --archive-graphs-only` checks these
+Python contracts against archived graphs without compiling or reading timing
+tables. Its results explicitly do not validate modified C++ or count complete
+invocation scores. The local validation build was stopped at an enforced
+3 GiB/no-swap ceiling; the eight-workload complete-score gate remains open.
 
 ## Remaining validation
 

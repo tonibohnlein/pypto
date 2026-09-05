@@ -2093,6 +2093,7 @@ def test_score_realized_grid_uses_each_positive_global_sync_weight(tmp_path):
         "fallback_node_count": 0,
         "fallback_node_ids": [],
         "duration_sources": {"simulator_operation_median": 4},
+        "duration_evidence_classes": {"calibrated_operation_family": 4},
         "dynamic_loop_node_ids": [],
     }
     assert result["duration_policy"] == "fail_closed_no_fallback"
@@ -3330,14 +3331,16 @@ def test_calibrate_uses_complete_signatures_instead_of_family_medians(tmp_path):
         )
     )
 
-    model = dsa_schedule_model.calibrate_from_metrics([metrics])
+    model = dsa_schedule_model.calibrate_from_metrics(
+        [metrics], dsa_schedule_model.DurationModel(calibration_sources=["pinned-base.json"])
+    )
 
     assert model.calibration_status == "simulator_complete_signature_medians"
     assert model.operation_cycles == {}
     assert model.operation_signature_cycles[dsa_schedule_model._operation_signature_key(small)] == 32.0
     assert model.operation_signature_cycles[dsa_schedule_model._operation_signature_key(large)] == 1672.0
     assert model.pipe_parameters["PIPE_MTE2"].minimum_cycles == 34.0
-    assert model.calibration_sources == [str(metrics)]
+    assert model.calibration_sources == sorted(["pinned-base.json", str(metrics)])
 
 
 def test_calibrate_rejects_family_only_samples(tmp_path):
@@ -5899,6 +5902,334 @@ def test_build_reuse_topology_does_not_require_operation_durations(tmp_path):
     assert result["candidates"][0]["target_node"] == 1
 
 
+def test_topology_export_finds_realized_pair_absent_from_candidate_catalog(tmp_path):
+    record = _record()
+    accesses = (63, 66, 103, 105)
+    pipes = ("PIPE_MTE2", "PIPE_V", "PIPE_MTE2", "PIPE_V")
+    for index, (access, pipe) in enumerate(zip(accesses, pipes, strict=True)):
+        record["nodes"][index] = _with_access(record["nodes"][index], access)
+        record["nodes"][index]["pipe"] = pipe
+        record["nodes"][index]["loop_stack"] = [8]
+        memory = {"root": f"%allocation{index // 2}", "scope": "RIGHT"}
+        record["nodes"][index]["defs"] = [memory] if index % 2 == 0 else []
+        record["nodes"][index]["uses"] = [memory] if index % 2 else []
+    problem = tmp_path / "problem.json"
+    problem.write_text(
+        json.dumps(
+            {
+                "instance": "kernel",
+                "problem_fingerprint": "fingerprint",
+                "metadata": {
+                    # Deliberately empty: topology completeness must not
+                    # depend on the reuse-penalty candidate catalog.
+                    "recognized_reuse_candidate_records_v5": "",
+                    "recognized_reuse_candidates_v5": "0",
+                    "allocation_accesses_v1": json.dumps(
+                        [
+                            {
+                                "buffer": 9,
+                                "complete": True,
+                                "accesses": [
+                                    {"order": 63, "pool": 4, "mode": "write"},
+                                    {"order": 66, "pool": 4, "mode": "read"},
+                                ],
+                            },
+                            {
+                                "buffer": 27,
+                                "complete": True,
+                                "accesses": [
+                                    {"order": 103, "pool": 4, "mode": "write"},
+                                    {"order": 105, "pool": 4, "mode": "read"},
+                                ],
+                            },
+                        ]
+                    ),
+                },
+                "problem": {
+                    "buffers": [
+                        {
+                            "id": 9,
+                            "size": 32768,
+                            "alignment": 32,
+                            "allowed_pools": [4],
+                            "live_intervals": [{"lower": 127, "upper": 134}],
+                        },
+                        {
+                            "id": 27,
+                            "size": 32768,
+                            "alignment": 32,
+                            "allowed_pools": [4],
+                            "live_intervals": [{"lower": 207, "upper": 212}],
+                        },
+                    ],
+                    "cost_model": {"reuse_penalties": []},
+                },
+            }
+        )
+    )
+    solution = tmp_path / "solution.json"
+    solution.write_text(
+        json.dumps(
+            {
+                "instance": "kernel",
+                "problem_fingerprint": "fingerprint",
+                "placements": [
+                    {"buffer": 9, "pool": 4, "offset": 0},
+                    {"buffer": 27, "pool": 4, "offset": 0},
+                ],
+            }
+        )
+    )
+    graph = tmp_path / "graph.txt"
+    graph_text = (
+        "KernelScheduleGraph @kernel nodes=4 dag_edges=0 dependencies=0\n"
+        "  node[0] op=pto.tadd pypto_access_order=63\n"
+        "  node[1] op=pto.tload pypto_access_order=66\n"
+        "  node[2] op=pto.tmuls pypto_access_order=103\n"
+        "  node[3] op=pto.tload pypto_access_order=105\n"
+    )
+    graph.write_text(graph_text)
+
+    result = dsa_schedule_model.emit_ptoas_placement_reuse_topology(record, problem, solution, graph)
+
+    assert result["realized_physical_pair_count"] == 1
+    edges = {
+        (edge["source_node"], edge["target_node"], edge["kind"], edge.get("iteration_distance", 0))
+        for edge in result["edges"]
+    }
+    assert edges == {(1, 2, "war", 0), (0, 3, "raw", 0), (3, 0, "war", 1), (2, 1, "raw", 1)}
+    assert all(
+        edge["recurrence_loop_depth"] == 1 for edge in result["edges"] if edge.get("iteration_distance")
+    )
+
+    graph.write_text(graph_text.replace("node[1] op=pto.tload", "node[1] op=pto.tstore"))
+    with pytest.raises(ValueError, match="operation differs"):
+        dsa_schedule_model.emit_ptoas_placement_reuse_topology(record, problem, solution, graph)
+
+    graph.write_text(graph_text.replace("  node[3] op=pto.tload pypto_access_order=105\n", ""))
+    with pytest.raises(ValueError, match="every PTOAS node needs pypto_access_order"):
+        dsa_schedule_model.emit_ptoas_placement_reuse_topology(record, problem, solution, graph)
+
+
+def test_allocation_frontier_retains_earlier_reader_on_another_pipe():
+    buffer = {"id": 0, "live_intervals": [{"lower": 3, "upper": 12}]}
+    memory = {"root": "%a", "scope": "UB"}
+    operations = {}
+    for order, pipe in ((1, "PIPE_MTE2"), (3, "PIPE_MTE3"), (5, "PIPE_V")):
+        node = _with_access(_operation(order, pipe, "pto.tmov"), order)
+        node["defs"] = [memory] if order == 1 else []
+        node["uses"] = [] if order == 1 else [memory]
+        operations[order] = node
+    accesses = dsa_schedule_model._allocation_lowered_accesses(
+        buffer,
+        1,
+        operations,
+        complete_access_provenance=False,
+        source_accesses=[
+            {"order": order, "mode": "write" if order == 1 else "read", "pool": 1} for order in operations
+        ],
+    )
+    terminal = dsa_schedule_model._allocation_access_frontier(accesses, terminal=True)
+    assert {(access["access"], access["mode"]) for access in terminal} == {
+        (1, "write"),
+        (3, "read"),
+        (5, "read"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("spelling", "expected"),
+    [("vec", "UB"), ("VEC", "UB"), ("ddr", "GM"), ("gm", "GM"), ("left", "LEFT")],
+)
+def test_dsa_scope_canonicalization_accepts_graph_and_type_spellings(spelling, expected):
+    assert dsa_schedule_model._canonical_dsa_scope(spelling) == expected
+
+
+def test_absent_allocation_phase_requires_complete_lowered_provenance():
+    buffer = {"id": 27, "live_intervals": [{"lower": 207, "upper": 212}]}
+    assert (
+        dsa_schedule_model._allocation_lowered_accesses(
+            buffer,
+            4,
+            {},
+            complete_access_provenance=True,
+            source_accesses=[{"order": 103, "mode": "write", "pool": 4}],
+        )
+        == []
+    )
+    with pytest.raises(ValueError, match="not proven nonmaterialized"):
+        dsa_schedule_model._allocation_lowered_accesses(
+            buffer,
+            4,
+            {},
+            complete_access_provenance=False,
+            source_accesses=[{"order": 103, "mode": "write", "pool": 4}],
+        )
+
+
+def test_surviving_access_does_not_allow_unknown_root_to_be_discarded():
+    buffer = {"id": 27, "live_intervals": [{"lower": 207, "upper": 212}]}
+    operations = {105: _with_access(_operation(0, "PIPE_M", "pto.tmatmul"), 105)}
+    with pytest.raises(ValueError, match="has no RIGHT memory operand"):
+        dsa_schedule_model._allocation_lowered_accesses(
+            buffer,
+            4,
+            operations,
+            complete_access_provenance=True,
+            source_accesses=[{"order": 105, "mode": "read", "pool": 4}],
+        )
+
+
+def test_readwrite_destination_maps_both_effects_to_defining_root():
+    buffer = {"id": 0, "live_intervals": [{"lower": 3, "upper": 12}]}
+    memory = {"root": "%acc", "scope": "LEFT"}
+    operation = _with_access(_operation(0, "PIPE_M", "pto.tmatmul"), 56)
+    operation["defs"], operation["uses"] = [memory], []
+
+    accesses = dsa_schedule_model._allocation_lowered_accesses(
+        buffer,
+        3,
+        {56: operation},
+        complete_access_provenance=True,
+        source_accesses=[
+            {"order": 56, "mode": "read", "pool": 3},
+            {"order": 56, "mode": "write", "pool": 3},
+        ],
+    )
+
+    assert [(access["mode"], access["root"]) for access in accesses] == [
+        ("read", "%acc"),
+        ("write", "%acc"),
+    ]
+
+
+def test_authoritative_access_maps_unique_renamed_alias_root():
+    buffer = {"id": 3, "live_intervals": [{"lower": 3, "upper": 12}]}
+    defining = _with_access(_operation(0, "PIPE_MTE2", "pto.tload"), 44)
+    defining["defs"], defining["uses"] = [{"root": "%before_view", "scope": "MAT"}], []
+    consuming = _with_access(_operation(1, "PIPE_MTE1", "pto.textract"), 53)
+    consuming["defs"] = [{"root": "%right", "scope": "RIGHT"}]
+    consuming["uses"] = [{"root": "%after_view", "scope": "MAT"}]
+
+    accesses = dsa_schedule_model._allocation_lowered_accesses(
+        buffer,
+        2,
+        {44: defining, 53: consuming},
+        complete_access_provenance=True,
+        source_accesses=[
+            {"order": 44, "mode": "write", "pool": 2},
+            {"order": 53, "mode": "read", "pool": 2},
+        ],
+    )
+
+    assert [(access["access"], access["root"]) for access in accesses] == [
+        (44, "%before_view"),
+        (53, "%after_view"),
+    ]
+
+
+def test_authoritative_access_retains_ambiguous_renamed_alias_at_its_operation():
+    buffer = {"id": 3, "live_intervals": [{"lower": 3, "upper": 12}]}
+    defining = _with_access(_operation(0, "PIPE_MTE2", "pto.tload"), 44)
+    defining["defs"], defining["uses"] = [{"root": "%before_view", "scope": "MAT"}], []
+    consuming = _with_access(_operation(1, "PIPE_V", "pto.tadd"), 53)
+    consuming["defs"] = [{"root": "%out", "scope": "UB"}]
+    consuming["uses"] = [
+        {"root": "%left_alias", "scope": "MAT"},
+        {"root": "%right_alias", "scope": "MAT"},
+    ]
+
+    accesses = dsa_schedule_model._allocation_lowered_accesses(
+        buffer,
+        2,
+        {44: defining, 53: consuming},
+        complete_access_provenance=True,
+        source_accesses=[
+            {"order": 44, "mode": "write", "pool": 2},
+            {"order": 53, "mode": "read", "pool": 2},
+        ],
+    )
+
+    assert accesses[-1]["access"] == 53
+    assert accesses[-1]["root"] == "source-buffer:3"
+
+
+def test_authoritative_unpaired_scratch_read_keeps_operation_endpoint():
+    buffer = {"id": 0, "live_intervals": [{"lower": 3, "upper": 12}]}
+    operation = _with_access(_operation(0, "PIPE_M", "pto.tmatmul"), 56)
+    operation["defs"], operation["uses"] = [{"root": "%acc", "scope": "LEFT"}], []
+
+    accesses = dsa_schedule_model._allocation_lowered_accesses(
+        buffer,
+        3,
+        {56: operation},
+        complete_access_provenance=True,
+        source_accesses=[{"order": 56, "mode": "read", "pool": 3}],
+    )
+
+    assert [(access["access"], access["root"]) for access in accesses] == [(56, "%acc")]
+
+
+def test_topology_refuses_to_infer_access_ids_from_lifetime_numbers():
+    with pytest.raises(ValueError, match="lifetime positions are not pypto.access identities"):
+        dsa_schedule_model._allocation_access_catalog({"metadata": {}}, {12})
+
+
+@pytest.mark.parametrize(
+    "entries, expected",
+    [
+        ([], "omits buffers"),
+        ([{"buffer": 12, "complete": False, "accesses": []}], "is incomplete"),
+        ([{"buffer": 13, "complete": True, "accesses": []}], "unknown allocation"),
+        ([{"buffer": 12, "complete": True, "accesses": []}] * 2, "duplicate"),
+    ],
+)
+def test_allocation_access_catalog_rejects_incomplete_identity(entries, expected):
+    with pytest.raises(ValueError, match=expected):
+        dsa_schedule_model._allocation_access_catalog(
+            {"metadata": {"allocation_accesses_v1": json.dumps(entries)}}, {12}
+        )
+
+
+def test_explicit_allocation_accesses_handle_different_lifetime_numbering():
+    buffer = {"id": 12, "live_intervals": [{"lower": 145, "upper": 154}]}
+    memory = {"root": "%lhs", "scope": "LEFT"}
+    defining = _operation(0, "PIPE_MTE1", "pto.textract")
+    defining["defs"], defining["uses"] = [memory], []
+    consuming = _operation(1, "PIPE_M", "pto.tmatmul")
+    consuming["defs"], consuming["uses"] = [], [memory]
+    accesses = dsa_schedule_model._allocation_lowered_accesses(
+        buffer,
+        3,
+        {71: defining, 75: consuming},
+        complete_access_provenance=True,
+        source_accesses=[{"order": 71, "mode": "write", "pool": 3}, {"order": 75, "mode": "read", "pool": 3}],
+    )
+    assert [access["access"] for access in accesses] == [71, 75]
+
+
+def test_topology_export_rejects_overlapping_lifetimes_at_one_address(tmp_path):
+    problem = {
+        "instance": "kernel",
+        "problem": {
+            "buffers": [
+                {"id": 0, "size": 32, "live_intervals": [{"lower": 1, "upper": 6}]},
+                {"id": 1, "size": 32, "live_intervals": [{"lower": 5, "upper": 8}]},
+            ]
+        },
+    }
+    solution = {
+        "instance": "kernel",
+        "placements": [
+            {"buffer": 0, "pool": 1, "offset": 0},
+            {"buffer": 1, "pool": 1, "offset": 0},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="overlapping execution lifetimes"):
+        dsa_schedule_model._realized_physical_reuse_pairs(problem, solution)
+
+
 def test_emit_ptoas_node_durations_binds_graph_and_access_identity(tmp_path):
     record = _record()
     access_orders = [3, 7, 9, 11]
@@ -5925,6 +6256,7 @@ def test_emit_ptoas_node_durations_binds_graph_and_access_identity(tmp_path):
     }
     assert [row["cycles"] for row in result["nodes"]] == [10, 10, 10, 10]
     assert [row["pypto_access_order"] for row in result["nodes"]] == access_orders
+    assert {row["evidence_class"] for row in result["nodes"]} == {"calibrated_operation_family"}
 
 
 def test_emit_ptoas_node_durations_rejects_operation_mismatch(tmp_path):

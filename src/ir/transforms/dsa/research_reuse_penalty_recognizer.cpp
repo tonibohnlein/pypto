@@ -803,6 +803,23 @@ ReusePenaltyRecognition RecognizeReusePenaltyCandidates(const FunctionPtr& func,
   AccessCollector collector(allocation_plan, std::move(interval_by_base), tuple_result_collector.Elements());
   collector.Collect(func->body_);
   const auto& summaries = collector.Summaries();
+  // Export all collected accesses before candidate/frontier filtering. In
+  // particular, allocations without a promoted penalty must remain visible to
+  // complete-placement analysis. Do not infer access ids from live intervals:
+  // the lifetime and provenance visitors count structured statements differently.
+  result.allocation_accesses.reserve(summaries.size());
+  for (size_t index = 0; index < summaries.size(); ++index) {
+    const auto& summary = summaries[index];
+    RecognizedAllocationAccesses allocation;
+    allocation.interval = index;
+    allocation.complete = summary.unsupported_accesses == 0;
+    for (const AccessEndpoint& access : summary.accesses) {
+      allocation.accesses.push_back({access.global_order, access.memory_space, access.route.resource,
+                                     access.access_kind == AccessKind::Write, access.byte_offset,
+                                     access.byte_size, access.range_known});
+    }
+    result.allocation_accesses.push_back(std::move(allocation));
+  }
   result.supported_allocations = static_cast<size_t>(
       std::count_if(summaries.begin(), summaries.end(), [](const AllocationAccessSummary& summary) {
         return summary.unsupported_accesses == 0 && !summary.accesses.empty();

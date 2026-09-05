@@ -40,9 +40,16 @@ def _provider(*, policy: str = "error") -> dsa_pto_isa_duration.PtoIsaDurationPr
         formula_parameters=[
             dsa_pto_isa_duration.FormulaParameter("TMUL", "fp32", 128, 0.0325, 17.5),
             dsa_pto_isa_duration.FormulaParameter("TEXP", "any", None, 0.0314, 30.1),
+            dsa_pto_isa_duration.FormulaParameter("TDIVS", "fp32", 32, 0.0781, 45.0),
+            dsa_pto_isa_duration.FormulaParameter("TMINS", "fp32", 32, 0.0156, 23.0),
+            dsa_pto_isa_duration.FormulaParameter("TROWEXPAND", "fp32", 128, 0.0156, 23.0),
+            dsa_pto_isa_duration.FormulaParameter("TCOLSUM", "fp32", 32, 0.6016, 15.0),
+            dsa_pto_isa_duration.FormulaParameter("TCOLSUM", "fp32", 64, 0.3047, 15.0),
+            dsa_pto_isa_duration.FormulaParameter("TROWMAX", "fp32", 336, 0.0418, 131.0),
         ],
         source_sha256={
             "formula_params.csv": "b" * 64,
+            "include/pto/common/pto_instr.hpp": "d" * 64,
             "include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compute.hpp": "c" * 64,
         },
         unsupported_policy=policy,
@@ -209,6 +216,66 @@ def test_missing_formula_signature_uses_pinned_perf_sim_default():
     assert estimate.cycles == 130
     assert estimate.source == "pto_isa_perf_sim_default"
     assert estimate.fallback is False
+
+
+@pytest.mark.parametrize(("rows", "cols", "expected_cycles"), [(1, 16, 46), (8, 8, 50)])
+def test_small_fp32_trecip_uses_nearest_measured_tdivs_shape(rows, cols, expected_cycles):
+    tile = f"!pto.tile_buf<vec, {rows}x{cols}xf32, valid=?x?>"
+    node = _node("pto.trecip", "PIPE_V", tile)
+    node["operation"]["result_types"] = [tile]
+
+    estimate = _provider().estimate(node, work_bytes=rows * cols * 4)
+
+    assert estimate.cycles == expected_cycles
+    assert estimate.source == "pto_isa_formula_nearest_shape"
+    assert estimate.evidence_class == "pinned_formula_shape_approximation"
+    assert estimate.fallback is False
+
+
+def test_raw_pto_high_precision_trecip_fails_closed():
+    tile = "!pto.tile_buf<vec, 1x16xf32, valid=?x?>"
+    raw_pto = (
+        f'"pto.trecip"(%src, %dst) '
+        f"{{precisionType = #pto<recip_precision high_precision>}} : ({tile}, {tile}) -> ()"
+    )
+    metadata = dsa_schedule_model._operation_type_metadata(raw_pto, {})
+    assert metadata["attributes"] == {"precision_type": "high_precision"}
+    node = _node("pto.trecip", "PIPE_V", tile)
+    node["operation"] = metadata
+    with pytest.raises(ValueError, match="non-default reciprocal"):
+        _provider().estimate(node, work_bytes=64)
+
+
+def test_build_bias_scalar_min_max_use_pinned_evidence():
+    tile = "!pto.tile_buf<vec, 1x512xf32, valid=?x?>"
+    tmaxs = _node("pto.tmaxs", "PIPE_V", tile, "f32")
+    tmaxs["operation"]["result_types"] = [tile]
+    tmins = _node("pto.tmins", "PIPE_V", tile, "f32")
+    tmins["operation"]["result_types"] = [tile]
+
+    maximum = _provider().estimate(tmaxs, work_bytes=2048)
+    minimum = _provider().estimate(tmins, work_bytes=2048)
+
+    assert maximum.cycles == 31
+    assert maximum.source == "pto_isa_a2a3_cce_vmaxs"
+    assert maximum.evidence_class == "calibrated_instruction_model"
+    assert minimum.source == "pto_isa_formula_nearest_shape"
+    assert minimum.evidence_class == "pinned_formula_shape_approximation"
+
+
+def test_duration_evidence_distinguishes_formula_from_perf_sim_default():
+    formula_tile = "!pto.tile_buf<vec, 8x128xf32, valid=?x?>"
+    formula_node = _node("pto.tmul", "PIPE_V", formula_tile, formula_tile)
+    formula_node["operation"]["result_types"] = [formula_tile]
+    approximate_node = _node("pto.textract", "PIPE_MTE1", formula_tile, "index", "index")
+    approximate_node["operation"]["result_types"] = ["!pto.tile_buf<left, 8x128xf32, valid=?x?>"]
+
+    assert _provider().estimate(formula_node, work_bytes=4096).evidence_class == (
+        "calibrated_formula_signature"
+    )
+    assert _provider().estimate(approximate_node, work_bytes=16384).evidence_class == (
+        "pinned_perf_sim_approximation"
+    )
 
 
 def test_gate_tmul_uses_pinned_perf_sim_default_when_formula_shape_is_absent():
@@ -404,6 +471,84 @@ def test_checked_in_integer_trowmax_calibration_is_exact_signature_only():
     assert record["cycles"] == 435.0
     assert model.operation_signature_cycles == {signature_key: 435.0}
     assert model.calibration_sources == [str(calibration)]
+
+
+@pytest.mark.parametrize("op_name", ["pto.tabs", "pto.tscatter"])
+def test_perf_sim_supported_operations_are_labelled_approximations(op_name):
+    provider = _provider(policy="error")
+    tile = "!pto.tile_buf<vec, 8x128xf32>"
+    node = _node(op_name, "PIPE_V", tile)
+    node["operation"]["result_types"] = [tile]
+
+    estimate = provider.estimate(node, work_bytes=4096)
+
+    assert estimate.cycles > 0
+    assert estimate.evidence_class == "pinned_perf_sim_approximation"
+    assert estimate.fallback is False
+
+
+@pytest.mark.parametrize("op_name", ["pto.trowexpandadd", "pto.trowexpandsub"])
+def test_fused_row_expand_uses_pinned_formula_family_approximation(op_name):
+    provider = _provider(policy="error")
+    tile = "!pto.tile_buf<vec, 8x128xf32>"
+    node = _node(op_name, "PIPE_V", tile)
+    node["operation"]["operand_types"] = [tile, "!pto.tile_buf<vec, 8x8xf32>"]
+    node["operation"]["result_types"] = [tile]
+
+    estimate = provider.estimate(node, work_bytes=4096)
+
+    assert estimate.cycles > 0
+    assert estimate.source == "pto_isa_formula_family"
+    assert estimate.evidence_class == "pinned_formula_family_approximation"
+    assert estimate.fallback is False
+
+
+def test_tcolsum_unlisted_shape_uses_nearest_pinned_formula():
+    provider = _provider(policy="error")
+    source = "!pto.tile_buf<vec, 8x40xf32>"
+    result = "!pto.tile_buf<vec, 1x40xf32>"
+    node = _node("pto.tcolsum", "PIPE_V", source)
+    node["operation"]["result_types"] = [result]
+
+    estimate = provider.estimate(node, work_bytes=1280)
+
+    assert estimate.cycles > 0
+    assert estimate.source == "pto_isa_formula_nearest_shape"
+    assert estimate.evidence_class == "pinned_formula_shape_approximation"
+    assert estimate.fallback is False
+
+
+@pytest.mark.parametrize(
+    ("op_name", "shape", "source_name", "evidence_class"),
+    [
+        (
+            "pto.trowexpandsub",
+            "8x192",
+            "pto_isa_formula_family",
+            "pinned_formula_family_approximation",
+        ),
+        (
+            "pto.trowmax",
+            "8x512",
+            "pto_isa_formula_nearest_shape",
+            "pinned_formula_shape_approximation",
+        ),
+    ],
+)
+def test_other_unlisted_formula_shapes_remain_labelled_approximations(
+    op_name, shape, source_name, evidence_class
+):
+    provider = _provider(policy="error")
+    source = f"!pto.tile_buf<vec, {shape}xf32>"
+    node = _node(op_name, "PIPE_V", source)
+    node["operation"]["result_types"] = [source]
+
+    estimate = provider.estimate(node, work_bytes=4096)
+
+    assert estimate.cycles > 0
+    assert estimate.source == source_name
+    assert estimate.evidence_class == evidence_class
+    assert estimate.fallback is False
 
 
 def test_snapshot_duration_command_writes_portable_model(tmp_path):
