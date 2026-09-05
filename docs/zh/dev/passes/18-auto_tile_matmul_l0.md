@@ -57,7 +57,8 @@ program_tiled = l0_tile_pass(program)
    - **Vec 左操作数预存（staging）** —— 当左（A）操作数为 `Vec`（PV / `score·V`）时，在 K-loop **之前**插入一次 `tile.move(lhs, target_memory=Mat)`，每次迭代的 Left `tile.extract` 从这个 Mat tile 切片（使抽取源与 QK 路径一样是 Mat）。把 Vec→Mat 这一跨界保持为 `tile.move`，可让 [`ExpandMixedKernel`](24-expand_mixed_kernel.md) 识别它（`CollectCVBoundaryMoves` 只匹配 `tile.move`）并 lower 成跨核 `tpop_from_aiv` 握手（数据落到 Mat）。若直接从 Vec tile 抽取，则会在 cube 侧留下一个悬空的跨界自由变量。
    - K-loop 标记为 `ForKind::Pipeline`，`pipeline_stages=2`。
    - **非整除 K（K 边界剥离）** —— 当所选 `k` 不整除 `K` 时，流水化循环只覆盖 `⌊K/k⌋` 个完整块（上界 `⌊K/k⌋·k`），再用一个直线展开的 `tile.matmul_acc` 剥离宽度为 `K − ⌊K/k⌋·k` 的部分尾块；当只有一个完整块（`⌊K/k⌋ == 1`）时，用「单个直线完整块 + 尾块」替代循环。`K` 与 `k` 均为 16 对齐（cube 分形），故剥离出的尾块宽度 `K − ⌊K/k⌋·k` 本身也是 16 对齐——一个普通的 `matmul_acc` 块，无需掩码。（ptoas 要求 tile 列数为 16 的倍数，故操作数维度必须 16 对齐；**不支持**非 16 对齐的 `K`。）chooser 仅在 `ChooseL0Tile` 的 `allow_k_boundary`（本 pass 已开启）下返回非整除 `k`；当整段（16 对齐的）K 能放进一个 L0 块时，chooser 返回 `k == K`（无循环）。**非 16 对齐的 `K` 会被直接拒绝**——不存在合法的 K 切分（任何剥离尾块或整段 K 块的列数都非分形），故 chooser 不返回任何候选，本 pass 以 `PH-AT-007` 提示跳过该 matmul，而非发出非法的 extract。
-6. **M/N 切分（当 `m < M` 或 `n < N`）** —— `[M, N]` 输出 Acc 的物理占用超过 L0c。
+   - **整输出 K 回退** —— 最小 wall 代价的选择可能只是为了让操作数放进 L0 而切分 M 或 N，即使完整 `[M, N]` 累加器本身能放进 L0C。若结果由逐元素/向量算子消费（例如 QK → softmax），则没有 M/N placer 可以重建消费者需要的完整 tile。本 pass 会固定 `m=M`、`n=N` 重新运行 chooser，只保留 K 作为切分轴。这样既让完整结果留在片上，也保证每个流水化 Left/Right panel 都能放进对应硬件 buffer；当完整输出本身超过 L0C 时不会使用该回退。
+6. **M/N 切分（当 `m < M` 或 `n < N`）** —— 最小 wall 代价的所选方案因 L0 容量或操作数供给成本而需要空间输出切分。
 
    对于**结果被唯一一个 2D `tile.store(c, base, out)` 消费的新 `tile.matmul` 或 `tile.matmul_bias`**，且该消费 store 是 matmul 之后第一条非 load 语句时，本 pass 把输出切分成 `ceil(M/m) × ceil(N/n)` 的网格：对每个子块原点 `(mi, ni)`，计算该 `[m, n]`（边界处为 `min(m, M-mi) × min(n, N-ni)` 的部分块）子块，并发出 `tile.store(c_sub, [base_r + mi, base_c + ni], out_prev)`。带 bias 的 matmul 还会从定义 tensor 将对应的 `[1, n]` 窗口重新 load 到 Mat，再 move 到 Bias，由 cube 将它广播到该子块的 M 行。要求 store 是第一条非 load 语句，可防止延后发射的网格跨越有副作用的操作。当 K 跨多个 L0 块时，每个子块使用独立的流水化 K-loop；当 `k == K` 时，则在可整除内部区域上发出嵌套循环，使 [`LowerPipelineLoops`](31-lower_pipeline_loops.md) 双缓冲移动操作数。外层循环持有常驻面板，output-stationary 或 A/B-stationary 的循环序遵循 chooser 的设计点。L 形边界被剥离为直线展开的部分块，因此 `m`/`n` 无需整除 `M`/`N`。这些 store 以 SSA 形式串联输出张量；最后一个 store 的结果替换下游对原 store 的引用。
 
@@ -334,7 +335,8 @@ L0/Mat 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从
 | Op | 处理方式 |
 | -- | -------- |
 | 静态 2D、右操作数为 Mat（左为 Mat 或 PV 的 Vec）、输出可放进 L0c 的 `tile.matmul` | 改写为 2 阶段流水化 K-loop（循环体为带谓词的 `tile.matmul_acc` —— 单块 Acc buffer，无 phi）；Vec 左操作数先预存到 Mat |
-| 输出超过 L0c、被唯一一个 2D `tile.store` 消费的普通 `tile.matmul`（左右均 Mat） | M/N 切分：`ceil(M/m) × ceil(N/n)` 子块网格，每个子块一个 K-loop 并直接 store 到输出（direct-store） |
+| 完整输出能放进 L0c、但最小 wall tile 切分了 M/N，且结果由无法逐子块放置的逐元素/向量算子消费的 `tile.matmul` | 固定完整 M/N 重新选择并发射只切 K 的循环，避免把超大的操作数 panel 原样留给 L0 |
+| 所选方案切分 M/N、且结果被唯一一个 2D `tile.store` 消费的普通 `tile.matmul`（左右均 Mat） | M/N 切分：`ceil(M/m) × ceil(N/n)` 子块网格，每个子块一个 K-loop 并直接 store 到输出（direct-store） |
 | 输出超过 L0c、被**完全作为矩阵乘操作数**消费（链式 matmul）、且 `[M, N]` scratch 能放进 Mat/L1 的普通 `tile.matmul` | M/N 切分到 L1/**Mat** scratch（逐子块 Acc→Mat `tile.assemble`），保留在片上供消费者读取（Mat-scratch） |
 | 输出*能放进* L0c、经 `tile.cast(c, bf16/f16)` 降精度、且 cast 结果被**完全作为矩阵乘操作数**消费（链式）的 `tile.matmul` | cast-fold：一次整窗 Acc→Mat `tile.assemble`（cube `pto.tinsert`），并删除 cast —— 无 Vector `pto.tcvt` 往返 |
 | 静态 2D、右操作数为 Mat（左为 Mat 或 PV 的 Vec）、输出可放进 L0c 的 `tile.matmul_acc` | 改写为 2 阶段流水化 K-loop（循环体统一为 `matmul_acc`） |
