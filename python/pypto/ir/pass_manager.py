@@ -290,6 +290,10 @@ class PassManager:
             # adjacent to their notify through codegen; additive InCore-only
             # insertion that touches no property.
             passes.insert_comm_fence,
+            # Materialize target-specific native-cast fragments only after
+            # physical layouts and MemRefs are final. The explicit destination
+            # views preserve parent pitch; codegen lowers each fragment 1:1.
+            passes.legalize_tile_cast_fragments,
             # Give every device-kernel valid_shape symbol that the kernel cannot
             # bind (not a physical tensor dim, not a scalar param) a leading
             # Scalar[INDEX] parameter, fed from the caller's actual valid extent.

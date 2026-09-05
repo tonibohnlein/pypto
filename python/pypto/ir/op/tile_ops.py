@@ -44,6 +44,7 @@ from ..utils import (
     _to_make_tuple,
     resolve_cast_mode,
     resolve_saturation_deviation,
+    resolve_saturation_mode,
 )
 from ._pad_value import normalize_pad_value
 
@@ -1878,6 +1879,28 @@ def cast(
         kwargs["saturation_mode"] = deviation
     args: list[Expr] = [tile] if tmp is None else [tile, tmp]
     return _ir_core.create_op_call("tile.cast", args, kwargs, actual_span)
+
+
+def cast_fragment(
+    src: Expr,
+    dst: Expr,
+    tmp: Expr | None = None,
+    *,
+    mode: str | int = "round",
+    saturation_mode: str | int | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Rebuild the compiler-internal destination-passing cast fragment.
+
+    This is a printer/parser round-trip surface for
+    ``LegalizeTileCastFragments`` output, not a user-facing DSL operation.
+    """
+    actual_span = _get_span_or_capture(span)
+    kwargs: dict[str, Any] = {"mode": resolve_cast_mode(mode)}
+    if saturation_mode is not None:
+        kwargs["saturation_mode"] = resolve_saturation_mode(saturation_mode)
+    args: list[Expr] = [src, dst] if tmp is None else [src, dst, tmp]
+    return _ir_core._create_internal_op_call("tile.cast_fragment", args, kwargs, actual_span)
 
 
 def log(tile: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:

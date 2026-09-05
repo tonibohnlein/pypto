@@ -118,14 +118,16 @@ window 参数、别名（`dv = pl.tensor.view(win); remote_store(dv)`）、循�
 ## 在流水线中的位置
 
 ```text
-... -> ClassifyIterArgCarry -> InsertCommFence -> MaterializeValidShapeSymbols   (最后)
+... -> ClassifyIterArgCarry -> InsertCommFence -> LegalizeTileCastFragments
+    -> MaterializeValidShapeSymbols   (最后)
 ```
 
 它在 Default 流水线中运行于所有会重排语句的 pass
 （`SkewCrossCorePipeline`、`LowerPipelineLoops`、`CanonicalizeIOOrder` ...）之后。插入的
 op 无操作数、无依赖边，若更早插入可能被挪离其 notify/wait；放在这里可让它们在 codegen 前
-保持相邻。它之前的 pass 只改动编排体（`Orchestration` 与 `Graph`），因此本 pass 看到的 InCore IR 正是
-codegen 最终降级的 IR。
+保持相邻。其后只有 `LegalizeTileCastFragments`（仅替换设备侧局部 `tile.cast`）和
+`MaterializeValidShapeSymbols`（仅扩展设备 kernel 签名与调用参数）；两者都不会把编排侧
+notify/wait 与 fence 分开。
 
 ## 本 pass 标记哪些写
 

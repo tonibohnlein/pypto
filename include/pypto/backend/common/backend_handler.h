@@ -13,6 +13,7 @@
 #define PYPTO_BACKEND_COMMON_BACKEND_HANDLER_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -562,6 +563,27 @@ class BackendHandler {
    * reference for the duration of a pass.
    */
   [[nodiscard]] virtual const TcvtAdjacency& GetTcvtAdjacency() const = 0;
+
+  /**
+   * @brief Safe physical-column repair granule for a native `pto.tcvt` pair.
+   *
+   * Some backends accept a conversion for arbitrary small tiles and for wider
+   * tiles made from complete hardware-width fragments, but mis-handle a wide
+   * final fragment. The late LegalizeTileCastFragments pass uses this target
+   * fact after physical layout is known. It writes one-row repair fragments
+   * directly into pitch-preserving views of the allocated destination.
+   * Individual repair fragments do not exceed this value. Small unpadded
+   * frames and wider frames composed entirely of complete granules retain the
+   * native cast; incomplete, padded, or runtime-valid frames take the explicit
+   * repair path. No temporary fragment storage is allocated.
+   *
+   * `std::nullopt` means that the backend declares no shape restriction for
+   * this conversion.
+   */
+  [[nodiscard]] virtual std::optional<uint32_t> GetTcvtSafeFragmentWidth(const DataType& source_dtype,
+                                                                         const DataType& target_dtype) const {
+    return std::nullopt;
+  }
 };
 
 }  // namespace backend

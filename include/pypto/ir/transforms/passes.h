@@ -288,6 +288,16 @@ Pass MaterializeDistTensorCtx();
 Pass MaterializeValidShapeSymbols();
 
 /**
+ * @brief Fragment target-restricted native tile casts after physical layout is known.
+ *
+ * Uses BackendHandler::GetTcvtSafeFragmentWidth to replace each unsafe
+ * tile.cast with pitch-preserving source/destination tile.slice views and
+ * explicit destination-passing tile.cast_fragment operations. Runs after
+ * storage planning and before MaterializeValidShapeSymbols.
+ */
+Pass LegalizeTileCastFragments();
+
+/**
  * @brief Replace planned device Tile storage with explicit Buffer IR.
  *
  * Runs last, after storage legalization, address placement and signature

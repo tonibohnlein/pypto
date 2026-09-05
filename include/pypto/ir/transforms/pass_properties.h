@@ -80,6 +80,15 @@ inline const PassProperties kMaterializeDistTensorCtxProperties{
     .required = {IRProperty::CommDomainScopesMaterialized, IRProperty::ReturnParamsExplicit},
     .produced = {IRProperty::CommDomainScopesMaterialized, IRProperty::DistTensorCtxMaterialized}};
 
+// Late target legalization: physical layout and MemRef identity are already
+// final. The rewrite preserves each existing allocation and represents every
+// target fragment explicitly with pitch-preserving views. It introduces no new
+// storage and keeps normalized statement structure.
+inline const PassProperties kLegalizeTileCastFragmentsProperties{
+    .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps, IRProperty::HasMemRefs,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::NormalizedStmtStructure}};
+
 // -- MaterializeValidShapeSymbols pass (runs last) ---------------------------
 //    Prepends a Scalar[INDEX] parameter per device-kernel valid_shape symbol that
 //    the kernel cannot bind, and passes the actual extent at every call site.

@@ -294,7 +294,7 @@ function attr is the single carrier, until
 across that window — later passes both append to
 ([`InjectGMPipeBuffer`](25-inject_gm_pipe_buffer.md),
 [`MaterializeDistTensorCtx`](47-materialize_dist_tensor_ctx.md)) and prepend onto
-([`MaterializeValidShapeSymbols`](52-materialize_valid_shape_symbols.md)) param
+([`MaterializeValidShapeSymbols`](53-materialize_valid_shape_symbols.md)) param
 lists. Two user errors are rejected here with `CHECK_SPAN`: a declaration naming
 a tensor the scope body does not capture (it is neither read nor written, so no parameter
 carries the policy), and `BYPASS` on a parameter `InferParamDirections` resolved

@@ -439,14 +439,10 @@ static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_
 // read through here -- an integer destination emits an explicit `satmode` even
 // when the cast said nothing, while a float destination emits none and keeps the
 // target's own IEEE overflow behavior.
-static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
-  auto& codegen = AsPto(codegen_base);
-  INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
-      << "tile.cast requires 1 or 2 arguments (src[, tmp]), but got " << op->args_.size();
-
+static std::string BuildTcvtConfigAttr(const CallPtr& op) {
   const int mode = op->GetKwarg<int>("mode");
   INTERNAL_CHECK_SPAN(mode >= 0 && mode < static_cast<int>(round_modes.size()), op->span_)
-      << "Internal error: tile.cast round mode out of range: " << mode;
+      << "Internal error: " << op->op_->name_ << " round mode out of range: " << mode;
   std::string config_attr = "{rmode = #pto<round_mode " + round_modes.at(mode) + ">";
   if (const auto saturation_mode = ir::GetSaturationMode(op)) {
     INTERNAL_CHECK_SPAN(ir::IsValidSaturationMode(*saturation_mode), op->span_)
@@ -455,6 +451,14 @@ static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
         ", satmode = #pto<saturation_mode " + ir::SaturationModeToPTOString(*saturation_mode) + ">";
   }
   config_attr += "}";
+  return config_attr;
+}
+
+static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
+      << "tile.cast requires 1 or 2 arguments (src[, tmp]), but got " << op->args_.size();
+  const std::string config_attr = BuildTcvtConfigAttr(op);
 
   if (op->args_.size() == 2 && codegen.GetBackendHandler()->RequiresLevel3TmpScratch()) {
     auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
@@ -477,6 +481,34 @@ static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
     return "";
   }
   codegen.Emit("pto.tcvt " + GenerateInsOutsClause(op, codegen, config_attr));
+  return "";
+}
+
+// Mechanical lowering of the explicit destination-passing fragment created by
+// LegalizeTileCastFragments: one IR op becomes one pto.tcvt. The source and
+// destination are already pitch-preserving pto.subview values; codegen makes no
+// shape, tail, or target-capability decision here.
+static std::string MakeTcvtFragmentCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2 || op->args_.size() == 3, op->span_)
+      << "tile.cast_fragment requires src, dst[, tmp], but got " << op->args_.size();
+  const std::string config_attr = BuildTcvtConfigAttr(op);
+  std::string src = codegen.GetExprAsCode(op->args_[0]);
+  std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+  std::string dst = codegen.GetExprAsCode(op->args_[1]);
+  std::string dst_type = codegen.GetExprTypeAnnotation(op->args_[1]);
+  std::string inputs = src;
+  std::string input_types = src_type;
+  if (op->args_.size() == 3) {
+    auto tmp_type = As<ir::TileType>(op->args_[2]->GetType());
+    INTERNAL_CHECK_SPAN(tmp_type, op->args_[2]->span_)
+        << "Internal error: tile.cast_fragment tmp operand must be a TileType";
+    RequireStaticValidShapeForPtoas(tmp_type, "tile.cast_fragment", "tmp", op->args_[2]->span_);
+    inputs += ", " + EnsureStaticViewTileSsa(op->args_[2], codegen, "tcvt_fragment_tmp_view");
+    input_types += ", " + GetTileViewTypeAnnotation(op->args_[2], codegen);
+  }
+  codegen.Emit("pto.tcvt ins(" + inputs + " " + config_attr + " : " + input_types + ") outs(" + dst + " : " +
+               dst_type + ")");
   return "";
 }
 
@@ -1238,6 +1270,15 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
           return MakeTcvtCodegenPTO(op, codegen);
         })
         .set_input_layout(0, ir::TileLayout::row_major)
+        .set_output_layout(ir::TileLayout::row_major);
+  }
+  if (exclude_ops.count("tile.cast_fragment") == 0) {
+    backend.RegisterOp("tile.cast_fragment")
+        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+          return MakeTcvtFragmentCodegenPTO(op, codegen);
+        })
+        .set_input_layout(0, ir::TileLayout::row_major)
+        .set_input_layout(1, ir::TileLayout::row_major)
         .set_output_layout(ir::TileLayout::row_major);
   }
 
