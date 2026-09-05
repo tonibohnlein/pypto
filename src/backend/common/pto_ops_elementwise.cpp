@@ -295,6 +295,96 @@ static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_
   return "";
 }
 
+// Affected native conversions must not use a strided, masked cross-row tail.
+// Write one-row fragments directly into the allocated result: casting a dense
+// temporary and then assembling it changes the row pitch at the copy boundary.
+// Views preserve both parent strides, allocate no scratch, and leave the result
+// valid_shape intact. This is a target capability, not a workload pattern.
+static bool EmitFragmentedTcvt(const CallPtr& op, codegen::PTOCodegen& codegen) {
+  auto src_type = As<ir::TileType>(op->args_[0]->GetType());
+  auto dst_type = codegen.GetCurrentResultTileType();
+  INTERNAL_CHECK_SPAN(src_type && dst_type, op->span_);
+  const auto fragment_width =
+      codegen.GetBackendHandler()->GetTcvtSafeFragmentWidth(src_type->dtype_, dst_type->dtype_);
+  if (!fragment_width) return false;
+  INTERNAL_CHECK_SPAN(*fragment_width > 0 && src_type->shape_.size() == 2, op->span_);
+  const auto cols = As<ir::ConstInt>(src_type->shape_[1]);
+  INTERNAL_CHECK_SPAN(cols, op->span_) << "tile.cast physical columns must be static";
+  const auto valid = ir::GetValidShape(src_type);
+  INTERNAL_CHECK_SPAN(valid.size() == 2, op->span_);
+  const auto valid_cols = As<ir::ConstInt>(valid[1]);
+  // Complete aligned frames (and small unpadded frames) retain the native path.
+  // Physical alignment alone is insufficient: [32,128] valid [16,112] fails too.
+  if (valid_cols && valid_cols->value_ == cols->value_ &&
+      (cols->value_ <= *fragment_width || cols->value_ % *fragment_width == 0)) {
+    return false;
+  }
+
+  const auto index = [&](int64_t value) {
+    return codegen.GetExprAsCode(std::make_shared<ir::ConstInt>(value, DataType::INDEX, op->span_));
+  };
+  const std::string zero = index(0);
+  const std::string one = index(1);
+  const std::string rows = codegen.GetExprAsCode(valid[0]);
+  const std::string source = codegen.GetExprAsCode(op->args_[0]);
+  const std::string source_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+  const std::string result = codegen.GetCurrentResultTarget();
+  const std::string result_type = codegen.GetCurrentResultTileBufTypeString();
+  const int mode = op->GetKwarg<int>("mode", 2);
+  INTERNAL_CHECK_SPAN(mode >= 0 && mode < static_cast<int>(round_modes.size()), op->span_);
+  const std::string config = " {rmode = #pto<round_mode " + round_modes.at(mode) + ">}";
+  const std::string row = codegen.NewNamedTemp("tcvt_row");
+  codegen.EmitStructural("scf.for " + row + " = " + zero + " to " + rows + " step " + one + " {");
+  codegen.IncreaseIndent();
+  for (int64_t col = 0; col < cols->value_; col += *fragment_width) {
+    const int64_t width = std::min<int64_t>(*fragment_width, cols->value_ - col);
+    const int64_t static_valid = valid_cols ? std::clamp<int64_t>(valid_cols->value_ - col, 0, width) : 0;
+    if (valid_cols && static_valid == 0) continue;
+    const std::string offset = index(col);
+    std::string fragment_valid;
+    if (valid_cols) {
+      fragment_valid = index(static_valid);
+    } else {
+      const std::string remaining = codegen.NewNamedTemp("tcvt_remaining");
+      codegen.Emit(remaining + " = arith.subi " + codegen.GetExprAsCode(valid[1]) + ", " + offset +
+                   " : index");
+      const std::string clipped = codegen.NewNamedTemp("tcvt_clipped");
+      codegen.Emit(clipped + " = arith.maxsi " + remaining + ", " + zero + " : index");
+      fragment_valid = codegen.NewNamedTemp("tcvt_valid");
+      codegen.Emit(fragment_valid + " = arith.minsi " + clipped + ", " + index(width) + " : index");
+      const std::string nonempty = codegen.NewNamedTemp("tcvt_nonempty");
+      codegen.Emit(nonempty + " = arith.cmpi sgt, " + fragment_valid + ", " + zero + " : index");
+      codegen.EmitStructural("scf.if " + nonempty + " {");
+      codegen.IncreaseIndent();
+    }
+    const auto view = [&](const std::string& base, const std::string& base_type,
+                          const ir::TileTypePtr& tile_type, const std::string& hint) {
+      const auto info = codegen::ExtractTileTypeInfo(*tile_type, codegen.GetTypeString(tile_type->dtype_));
+      const std::string type = codegen::FormatTileBufTypeString(
+          codegen::MemorySpaceToMLIR(*tile_type->memory_space_), info.dtype_str, 1, width, info.blayout,
+          info.slayout, info.fractal, info.pad, info.compact, 1, static_valid, false, !valid_cols);
+      const std::string name = codegen.NewNamedTemp(hint);
+      codegen.Emit(name + " = pto.subview " + base + "[" + row + ", " + offset + "] sizes [1, " +
+                   std::to_string(width) + "] valid [" + one + ", " + fragment_valid + "] : " + base_type +
+                   " -> " + type);
+      codegen.RegisterTileBufType(name, type);
+      codegen.RegisterTileViewName(name);
+      return std::make_pair(name, type);
+    };
+    const auto src_view = view(source, source_type, src_type, "tcvt_src_fragment");
+    const auto dst_view = view(result, result_type, dst_type, "tcvt_dst_fragment");
+    codegen.Emit("pto.tcvt ins(" + src_view.first + config + " : " + src_view.second + ") outs(" +
+                 dst_view.first + " : " + dst_view.second + ")");
+    if (!valid_cols) {
+      codegen.DecreaseIndent();
+      codegen.EmitStructural("}");
+    }
+  }
+  codegen.DecreaseIndent();
+  codegen.EmitStructural("}");
+  return true;
+}
+
 // The level3 explicit-tmp form verifies tcvt scratch against src capacity and
 // dst valid_shape. alloc_tile types keep v_row=?, v_col=?, so bridge to
 // static-valid views the same way tprelu / tcolsum do.
@@ -302,6 +392,7 @@ static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
   auto& codegen = AsPto(codegen_base);
   INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
       << "tile.cast requires 1 or 2 arguments (src[, tmp]), but got " << op->args_.size();
+  if (EmitFragmentedTcvt(op, codegen)) return "";
   if (op->args_.size() == 2 && codegen.GetBackendHandler()->RequiresLevel3TmpScratch()) {
     auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
     auto tmp_type = ir::As<ir::TileType>(op->args_[1]->GetType());

@@ -496,10 +496,11 @@ class BackendHandler {
    *
    * Some backends accept a conversion for arbitrary small tiles and for wider
    * tiles made from complete hardware-width fragments, but mis-handle a wide
-   * final fragment. Returning a value requests that LegalizeTileCast split a
-   * tile whose physical column count is greater than the value and is not an
-   * exact multiple of it. The lowering uses fragments no wider than the
-   * returned value; already-safe small and exactly aligned tiles stay intact.
+   * final fragment. PTO codegen writes one-row fragments directly into views
+   * of the allocated destination, preserving parent row pitches. Fragment
+   * widths do not exceed this value. Incomplete wide frames and padded or
+   * runtime-valid columns take this path; small unpadded and fully aligned
+   * frames retain the native cast. No temporary fragment storage is allocated.
    *
    * `std::nullopt` means that the backend declares no shape restriction for
    * this conversion.
