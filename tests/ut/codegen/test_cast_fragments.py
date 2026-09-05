@@ -19,56 +19,65 @@ from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
-def cast_program(cols: int, valid_cols: int, valid_rows: int = 16, dynamic: bool = False):
+def cast_program(
+    cols: int,
+    valid_cols: int,
+    valid_rows: int = 16,
+    dynamic: bool = False,
+    source_dtype=pl.INT32,
+    target_dtype=pl.FP16,
+    mode: str = "round",
+    saturation_mode: str | None = None,
+):
     if dynamic:
-        return _dynamic_cast_program(cols, valid_rows)
+        return _dynamic_cast_program(cols, valid_rows, source_dtype, target_dtype, mode)
 
     @pl.program
     class CastProgram:
         @pl.function(type=pl.FunctionType.InCore)
         def kernel(
             self,
-            value: pl.Tensor[[32, cols], pl.INT32],
-            output: pl.Out[pl.Tensor[[32, cols], pl.FP16]],
+            value: pl.Tensor[[32, cols], source_dtype],
+            output: pl.Out[pl.Tensor[[32, cols], target_dtype]],
             logical_cols: pl.Scalar[pl.INDEX],
-        ) -> pl.Tensor[[32, cols], pl.FP16]:
+        ) -> pl.Tensor[[32, cols], target_dtype]:
             tile = pl.load(value, [0, 0], [32, cols], valid_shape=[valid_rows, valid_cols])
-            cast = pl.cast(tile, pl.FP16, mode="round")
+            cast = pl.cast(tile, target_dtype, mode=mode, saturation_mode=saturation_mode)
             return pl.store(cast, [0, 0], output)
 
         @pl.function(type=pl.FunctionType.Orchestration)
         def main(
             self,
-            value: pl.Tensor[[32, cols], pl.INT32],
-            output: pl.Out[pl.Tensor[[32, cols], pl.FP16]],
+            value: pl.Tensor[[32, cols], source_dtype],
+            output: pl.Out[pl.Tensor[[32, cols], target_dtype]],
             logical_cols: pl.Scalar[pl.INDEX],
-        ) -> pl.Tensor[[32, cols], pl.FP16]:
+        ) -> pl.Tensor[[32, cols], target_dtype]:
             return self.kernel(value, output, logical_cols)
 
     return CastProgram
 
 
-def _dynamic_cast_program(cols: int, valid_rows: int):
+def _dynamic_cast_program(cols: int, valid_rows: int, source_dtype, target_dtype, mode: str):
     @pl.program
     class DynamicCastProgram:
         @pl.function(type=pl.FunctionType.InCore)
         def kernel(
             self,
-            value: pl.Tensor[[32, cols], pl.INT32],
-            output: pl.Out[pl.Tensor[[32, cols], pl.FP16]],
+            value: pl.Tensor[[32, cols], source_dtype],
+            output: pl.Out[pl.Tensor[[32, cols], target_dtype]],
             logical_cols: pl.Scalar[pl.INDEX],
-        ) -> pl.Tensor[[32, cols], pl.FP16]:
+        ) -> pl.Tensor[[32, cols], target_dtype]:
             tile = pl.load(value, [0, 0], [32, cols], valid_shape=[valid_rows, logical_cols])
-            cast = pl.cast(tile, pl.FP16, mode="round")
+            cast = pl.cast(tile, target_dtype, mode=mode)
             return pl.store(cast, [0, 0], output)
 
         @pl.function(type=pl.FunctionType.Orchestration)
         def main(
             self,
-            value: pl.Tensor[[32, cols], pl.INT32],
-            output: pl.Out[pl.Tensor[[32, cols], pl.FP16]],
+            value: pl.Tensor[[32, cols], source_dtype],
+            output: pl.Out[pl.Tensor[[32, cols], target_dtype]],
             logical_cols: pl.Scalar[pl.INDEX],
-        ) -> pl.Tensor[[32, cols], pl.FP16]:
+        ) -> pl.Tensor[[32, cols], target_dtype]:
             return self.kernel(value, output, logical_cols)
 
     return DynamicCastProgram
@@ -82,9 +91,17 @@ def _pto(program) -> str:
     return codegen.PTOCodegen().generate(ir.Program([func], "kernel", optimized.span))
 
 
+@pytest.mark.parametrize(
+    "source_dtype,target_dtype,mode",
+    [(pl.INT32, pl.FP16, "round"), (pl.FP16, pl.INT8, "trunc")],
+)
 @pytest.mark.parametrize("cols,valid_cols", [(224, 224), (448, 448), (128, 112), (128, 104)])
-def test_native_cast_fragments_write_destination_views(cols: int, valid_cols: int):
-    pto = _pto(cast_program(cols, valid_cols))
+def test_native_cast_fragments_write_destination_views(
+    cols: int, valid_cols: int, source_dtype, target_dtype, mode: str
+):
+    pto = _pto(
+        cast_program(cols, valid_cols, source_dtype=source_dtype, target_dtype=target_dtype, mode=mode)
+    )
     assert "scf.for %tcvt_row" in pto
     assert "tcvt_src_fragment" in pto and "tcvt_dst_fragment" in pto
     assert "sizes [1, " in pto
@@ -93,11 +110,80 @@ def test_native_cast_fragments_write_destination_views(cols: int, valid_cols: in
     assert pto.count("pto.tload ") == pto.count("pto.tstore ") == 1
 
 
+@pytest.mark.parametrize(
+    "source_dtype,target_dtype,mode",
+    [(pl.INT32, pl.FP16, "round"), (pl.FP16, pl.INT8, "trunc")],
+)
 @pytest.mark.parametrize("cols", [32, 64, 128, 256, 896])
-def test_aligned_cast_keeps_native_fast_path(cols: int):
-    pto = _pto(cast_program(cols, cols))
+def test_aligned_cast_keeps_native_fast_path(cols: int, source_dtype, target_dtype, mode: str):
+    pto = _pto(cast_program(cols, cols, source_dtype=source_dtype, target_dtype=target_dtype, mode=mode))
     assert "tcvt_row" not in pto
     assert pto.count("pto.tcvt ") == 1
+
+
+@pytest.mark.parametrize("saturation_mode", ["on", "off"])
+def test_fragmented_cast_preserves_saturation_mode(saturation_mode: str):
+    """Every fragmented tcvt keeps the authored saturation mode."""
+
+    pto = _pto(
+        cast_program(
+            224,
+            224,
+            source_dtype=pl.FP16,
+            target_dtype=pl.INT8,
+            mode="trunc",
+            saturation_mode=saturation_mode,
+        )
+    )
+    tcvt_lines = [line for line in pto.splitlines() if "pto.tcvt " in line]
+    assert tcvt_lines
+    expected = f"satmode = #pto<saturation_mode {saturation_mode.upper()}>"
+    assert all(expected in line for line in tcvt_lines)
+    assert all("rmode = #pto<round_mode TRUNC>" in line for line in tcvt_lines)
+
+
+def test_fragmented_nonsaturating_cast_threads_the_level3_scratch():
+    """Every fragment consumes the allocated level3 tmp, never PTOAS's fixed UB region.
+
+    A2/A3 materializes a tcvt scratch tile for non-saturating FP16->INT8. PTOAS's
+    no-tmp tcvt overload reaches for a fixed TMP_UB_OFFSET region that PyPTO does
+    not reserve, so a fragment that omits the operand can overwrite a live tile
+    while the reserved scratch goes unused.
+    """
+
+    pto = _pto(
+        cast_program(
+            224,
+            224,
+            source_dtype=pl.FP16,
+            target_dtype=pl.INT8,
+            mode="trunc",
+            saturation_mode="off",
+        )
+    )
+    tmp_views = [line for line in pto.splitlines() if "= pto.subview" in line and "tcvt_tmp_view" in line]
+    tmp_ssa = tmp_views[0].split("=")[0].strip() if tmp_views else "%tcvt_tmp_view"
+    tcvt_lines = [line for line in pto.splitlines() if "pto.tcvt " in line]
+    assert len(tcvt_lines) == 2, tcvt_lines
+    for line in tcvt_lines:
+        ins = line.split("ins(", 1)[1].split(")", 1)[0]
+        assert tmp_ssa in ins or "tcvt_tmp" in ins, line
+
+
+def test_saturating_cast_fragments_take_no_scratch():
+    """A saturating narrowing cast is native, so no tmp is allocated or consumed."""
+
+    pto = _pto(
+        cast_program(
+            224,
+            224,
+            source_dtype=pl.FP16,
+            target_dtype=pl.INT8,
+            mode="trunc",
+            saturation_mode="on",
+        )
+    )
+    assert "tcvt_tmp" not in pto
 
 
 @pytest.mark.parametrize("valid_rows", [0, 1, 16, 32])
@@ -109,24 +195,43 @@ def test_dynamic_cast_clips_fragments_and_guards_empty_tail(valid_rows: int):
 
 
 @pytest.mark.parametrize(
-    "cols,valid_cols,dynamic",
+    "cols,valid_cols,dynamic,source_dtype,target_dtype,mode",
     [
-        (224, 224, False),
-        (448, 448, False),
-        (128, 112, False),
-        (128, 104, False),
-        (224, 224, True),
+        (224, 224, False, pl.INT32, pl.FP16, "round"),
+        (448, 448, False, pl.INT32, pl.FP16, "round"),
+        (128, 112, False, pl.INT32, pl.FP16, "round"),
+        (128, 104, False, pl.INT32, pl.FP16, "round"),
+        (224, 224, True, pl.INT32, pl.FP16, "round"),
+        (224, 224, False, pl.FP16, pl.INT8, "trunc"),
+        (448, 448, False, pl.FP16, pl.INT8, "trunc"),
+        (128, 112, False, pl.FP16, pl.INT8, "trunc"),
+        (128, 104, False, pl.FP16, pl.INT8, "trunc"),
+        (224, 224, True, pl.FP16, pl.INT8, "trunc"),
     ],
 )
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
 def test_cast_fragments_survive_real_ptoas(
-    tmp_path: Path, cols: int, valid_cols: int, dynamic: bool, planner
+    tmp_path: Path,
+    cols: int,
+    valid_cols: int,
+    dynamic: bool,
+    source_dtype,
+    target_dtype,
+    mode: str,
+    planner,
 ):
     if find_ptoas_binary() is None:
         pytest.skip("PTOAS not installed")
     with passes.PassContext([], memory_planner=planner):
         ir.compile(
-            cast_program(cols, valid_cols, dynamic=dynamic),
+            cast_program(
+                cols,
+                valid_cols,
+                dynamic=dynamic,
+                source_dtype=source_dtype,
+                target_dtype=target_dtype,
+                mode=mode,
+            ),
             output_dir=str(tmp_path),
             dump_passes=False,
             skip_ptoas=False,
