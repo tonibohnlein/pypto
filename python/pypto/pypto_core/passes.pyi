@@ -832,6 +832,14 @@ def materialize_valid_shape_symbols() -> Pass:
     at every call/submit site.
     """
 
+def legalize_tile_cast_fragments() -> Pass:
+    """Fragment target-restricted native casts after physical layout is known.
+
+    Replaces each unsafe ``tile.cast`` with pitch-preserving source and
+    destination ``tile.slice`` views plus explicit destination-passing
+    ``tile.cast_fragment`` operations. PTO codegen lowers each fragment 1:1.
+    """
+
 def lower_tile_to_buffer() -> Pass:
     """Replace planned device Tile storage with explicit Buffer IR.
 
@@ -1120,6 +1128,7 @@ __all__ = [
     "materialize_dist_tensor_ctx",
     "legalize_graph_boundary",
     "materialize_valid_shape_symbols",
+    "legalize_tile_cast_fragments",
     "lower_tile_to_buffer",
     "flatten_call_expr",
     "inline_functions",

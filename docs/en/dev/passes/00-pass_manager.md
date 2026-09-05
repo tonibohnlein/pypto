@@ -158,6 +158,7 @@ struct PassProperties {
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
 | ClassifyIterArgCarry | CallDirectionsResolved, RuntimeScopesMaterialized | IterArgCarryClassified, RuntimeScopesMaterialized | — |
 | InsertCommFence | SplitIncoreOrch | — | — |
+| LegalizeTileCastFragments | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | NormalizedStmtStructure | — |
 | MaterializeValidShapeSymbols | — | — | — |
 
 The table lists every registered pass, in `Default`-strategy execution order. Update the row

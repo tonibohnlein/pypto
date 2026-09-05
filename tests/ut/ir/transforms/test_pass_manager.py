@@ -73,6 +73,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "MaterializeRuntimeScopes",
     "ClassifyIterArgCarry",
     "InsertCommFence",
+    "LegalizeTileCastFragments",
     "MaterializeValidShapeSymbols",
 ]
 

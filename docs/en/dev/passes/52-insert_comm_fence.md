@@ -145,7 +145,8 @@ pass stays idempotent.
 ## Position in the pipeline
 
 ```text
-... -> ClassifyIterArgCarry -> InsertCommFence -> MaterializeValidShapeSymbols   (last)
+... -> ClassifyIterArgCarry -> InsertCommFence -> LegalizeTileCastFragments
+    -> MaterializeValidShapeSymbols   (last)
 ```
 
 It runs after every statement-reordering pass in the Default pipeline
