@@ -123,7 +123,26 @@ struct RecognizedReusePenalty {
   RecognizedReuseHazard hazard;
 };
 
+/// Source access identity, independent of whether any penalty pair is emitted.
+/// Lifetime-analysis positions are NOT interchangeable with these identities.
+struct RecognizedAllocationAccess {
+  size_t access_order = 0;
+  MemorySpace memory_space = MemorySpace::ScalarLocal;
+  RecognizedAccessResource resource = RecognizedAccessResource::ScalarAccess;
+  bool writes = false;
+  uint64_t byte_offset = 0;
+  uint64_t byte_size = 0;
+  bool range_known = false;
+};
+
+struct RecognizedAllocationAccesses {
+  size_t interval = 0;
+  bool complete = false;
+  std::vector<RecognizedAllocationAccess> accesses;
+};
+
 struct ReusePenaltyRecognition {
+  std::vector<RecognizedAllocationAccesses> allocation_accesses;
   std::vector<RecognizedReuseCandidate> candidates;
   std::vector<RecognizedReuseEdge> edges;
   std::vector<RecognizedReusePenalty> penalties;

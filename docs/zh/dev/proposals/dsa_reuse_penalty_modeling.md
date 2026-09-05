@@ -839,11 +839,33 @@ python -m pypto.tools.dsa_schedule_model emit-ptoas-node-durations \
     --function kernel -o node-durations.json
 ```
 
-PyPTO 负责 DSA buffer identity，PTOAS 负责 operation DAG。bridge 会拒绝缺失的
-provenance/access join 和 opaque relation。same-pipe reuse 记录为已有 ordering 而不会
-重复加边；loop-carried reuse 保留 iteration distance 和 common-loop depth。topology export
-不依赖 duration；duration export 会把 composite provider 的每个 exact 结果绑定到
-function、unweighted graph hash、operation 和 access order。
+PyPTO 负责 DSA buffer identity，PTOAS 负责 operation DAG。topology export 会从完整
+placement 中枚举所有物理地址范围重叠，通过 `metadata.allocation_accesses_v1` 连接 handoff
+site。该 catalog 在 penalty pair 筛选前记录每个 allocation 的全部读写访问、完整性、pool、
+access identity、resource 和 byte range。它不会读取 penalty-candidate catalog；后者只是
+objective 输入，并非物理 reuse 的完整记录。lifetime statement position 与 `pypto.access`
+不是同一坐标系。缺少新 catalog 的旧输入必须重新导出，不能猜测编号偏移。缺失或歧义 join、
+不完整 graph provenance 及 operation identity mismatch 都会 fail closed。
+terminal frontier 保留每个 pipe/control path 上的未完成访问，而非只取最后一条语句。
+只有完整 raw-PTO join 才能证明 source access 没有 materialize。same-pipe reuse 记录为
+已有 ordering 而不会重复加边；loop-carried reuse 保留 iteration distance 和
+common-loop depth。
+
+topology export 不依赖 duration。duration export 会把每个已解析结果绑定到 function、
+unweighted graph hash、operation 和 access order，并记录 evidence class。经过 calibration
+的 signature/instruction model、pinned analytical estimate 和 generic pinned Perf-Sim
+approximation 会作为不同类别报告。未测量 shape 的 `trecip` 使用邻近 TDIVS formula 时，
+明确标为 shape approximation，不能称为精确校准。其依据是 pinned
+`TRECIP -> TDIVS(dst, 1, src)` lowering；`precisionType` 会被保留，非默认 reciprocal mode
+会 fail closed。
+允许有证据支持的非负舍入周期（包括零）；拒绝负值、非有限值和 unsupported fallback。
+
+PTOAS 当前 recurrence 结果仅为结构图中单一 positive-distance edge cycle 的 lower bound，
+不是完整 invocation latency。fixed pipe order、branch execution、nested-loop boundary、trip
+count 和包含多条 recurrence edge 的 cycle 仍需验证。数值可计算且 duration 非 fallback
+不等于完整 score。`tests/tools/dsa_reuse_bridge_host_audit.py --archive-graphs-only` 只验证
+Python 与归档图的连接，不编译、不读取 timing table，也不验证修改后的 C++。本机验证构建
+在 3 GiB/no-swap 上限停止；八个 workload 的完整 score 门槛尚未满足。
 
 ## 剩余验证
 

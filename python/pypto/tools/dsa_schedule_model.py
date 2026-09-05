@@ -355,6 +355,8 @@ def _operation_attributes(line: str) -> dict[str, Any]:
     attributes: dict[str, Any] = {}
     if match := re.search(r"\brmode\s*=\s*#pto<round_mode\s+([A-Z_]+)>", line):
         attributes["round_mode"] = match.group(1)
+    if match := re.search(r"\bprecisionType\s*=\s*#pto<recip_precision\s+([a-z_]+)>", line):
+        attributes["precision_type"] = match.group(1)
     for name in ("descending", "exhausted"):
         if match := re.search(rf"\b{name}\s*=\s*(true|false)\b", line):
             attributes[name] = match.group(1) == "true"
@@ -2177,22 +2179,26 @@ def estimate_node_durations(
             base = model.operation_signature_cycles[signature_key]
             source = "simulator_complete_signature_median"
             detail = f"complete operation signature {signature_key}"
+            evidence_class = "calibrated_signature"
             fallback = False
         elif compatible_override is not None:
             base, matched_key = compatible_override
             source = "simulator_complete_signature_compatible_encoding"
             detail = f"compatible complete operation signature {matched_key}"
+            evidence_class = "calibrated_compatible_encoding"
             fallback = False
         elif not model.operation_signature_cycles and key in model.operation_cycles:
             base = model.operation_cycles[key]
             source = "simulator_operation_median"
             detail = f"explicit operation override {key}"
+            evidence_class = "calibrated_operation_family"
             fallback = False
         elif model.pto_isa_provider is not None:
             estimate = model.pto_isa_provider.estimate(node, work_bytes=work_bytes)
             base = estimate.cycles
             source = estimate.source
             detail = estimate.detail
+            evidence_class = estimate.evidence_class
             fallback = estimate.fallback
         elif model.operation_signature_cycles:
             raise ValueError(
@@ -2215,6 +2221,7 @@ def estimate_node_durations(
                 f"startup={parameters.startup_cycles}; bytes_per_cycle={parameters.bytes_per_cycle}; "
                 f"minimum={parameters.minimum_cycles}"
             )
+            evidence_class = "legacy_heuristic"
             fallback = True
 
         multiplier = 1
@@ -2233,6 +2240,7 @@ def estimate_node_durations(
             "cycles": duration,
             "source": source,
             "detail": detail,
+            "evidence_class": evidence_class,
             "fallback": fallback,
         }
     return durations, provenance, dynamic_loops
@@ -4042,9 +4050,11 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
             }
         )
 
-    exact = sum(not item["fallback"] for item in provenance.values())
+    non_fallback = sum(not item["fallback"] for item in provenance.values())
+    calibrated = sum(str(item["evidence_class"]).startswith("calibrated_") for item in provenance.values())
     fallback = sum(item["fallback"] for item in provenance.values())
     source_counts = Counter(str(item["source"]) for item in provenance.values())
+    evidence_counts = Counter(str(item["evidence_class"]) for item in provenance.values())
     sync_record_summary = _pre_codegen_sync_record_summary(record)
     return {
         "schema_version": 1,
@@ -4064,10 +4074,15 @@ def score_schedule(record: Mapping[str, Any], model: DurationModel) -> dict[str,
         **edge_diagnostics,
         **_latency_graph_completeness(prepared_record, edge_diagnostics, loop_sync_models),
         "operation_nodes": len(operation_durations),
-        "exact_duration_nodes": exact,
+        "exact_duration_nodes": calibrated,
+        "non_fallback_duration_nodes": non_fallback,
         "fallback_duration_nodes": fallback,
-        "exact_duration_coverage": exact / len(operation_durations) if operation_durations else 0.0,
+        "exact_duration_coverage": (calibrated / len(operation_durations) if operation_durations else 0.0),
+        "non_fallback_duration_coverage": (
+            non_fallback / len(operation_durations) if operation_durations else 0.0
+        ),
         "duration_source_counts": dict(sorted(source_counts.items())),
+        "duration_evidence_class_counts": dict(sorted(evidence_counts.items())),
         "pto_isa_provider": (
             {
                 "revision": model.pto_isa_provider.revision,
@@ -5851,6 +5866,519 @@ def _load_ptoas_access_node_map(path: str | Path, *, function: str) -> dict[int,
     return mapping
 
 
+def _validated_ptoas_access_node_map(
+    record: Mapping[str, Any], path: str | Path, *, function: str
+) -> tuple[dict[int, int], dict[str, int]]:
+    """Bind every schedule operation to an operation-identical PTOAS node."""
+    ptoas_nodes, graph_shape = _load_ptoas_graph_nodes(path, function=function)
+    schedule_nodes: dict[int, str] = {}
+    for node in record.get("nodes", []):
+        if not isinstance(node, Mapping) or node.get("kind") != "operation":
+            continue
+        op_name = node.get("op_name")
+        access = _node_access_order(node)
+        if not isinstance(op_name, str) or access is None:
+            raise ValueError("every schedule operation needs op_name and pypto_access_order")
+        if access in schedule_nodes:
+            raise ValueError(f"pypto access {access} maps to multiple schedule operations")
+        schedule_nodes[access] = op_name
+
+    graph_accesses: dict[int, int] = {}
+    for ptoas_node, (access, ptoas_op) in ptoas_nodes.items():
+        schedule_op = schedule_nodes.get(access)
+        if schedule_op is None:
+            raise ValueError(f"PTOAS node {ptoas_node} access {access} has no schedule operation")
+        if schedule_op != ptoas_op:
+            raise ValueError(
+                f"PTOAS node {ptoas_node} operation differs at access {access}: "
+                f"{ptoas_op!r} != {schedule_op!r}"
+            )
+        graph_accesses[access] = ptoas_node
+    missing = sorted(set(schedule_nodes) - set(graph_accesses))
+    if missing:
+        raise ValueError(f"schedule operations are absent from the PTOAS graph: accesses={missing[:8]}")
+    return graph_accesses, graph_shape
+
+
+def _decode_dsa_execution_lifetime(buffer: Mapping[str, Any]) -> tuple[int, int, bool]:
+    """Recover PyPTO statement-order endpoints from one exported lifetime.
+
+    PyPTO's DSA adapter encodes statement ``p`` as read event ``2*p`` and
+    write event ``2*p+1``.  Ordinary lifetimes end after the final read; an
+    explicitly in-place-safe input may end at the write boundary instead.
+    The adapter exports one conservative interval per physical allocation, so
+    accepting any other shape here would silently invent access provenance.
+    """
+    intervals = buffer.get("live_intervals")
+    if not isinstance(intervals, list) or len(intervals) != 1 or not isinstance(intervals[0], Mapping):
+        raise ValueError(f"buffer {buffer.get('id')} needs exactly one PyPTO execution lifetime")
+    lower, upper = intervals[0].get("lower"), intervals[0].get("upper")
+    if (
+        not isinstance(lower, int)
+        or not isinstance(upper, int)
+        or lower < 1
+        or upper <= lower
+        or lower % 2 != 1
+    ):
+        raise ValueError(f"buffer {buffer.get('id')} has an invalid PyPTO execution lifetime")
+    definition = (lower - 1) // 2
+    read_before_write_boundary = upper % 2 == 1
+    final_access = (upper - (1 if read_before_write_boundary else 2)) // 2
+    if final_access < definition:
+        raise ValueError(f"buffer {buffer.get('id')} ends before its definition")
+    return definition, final_access, read_before_write_boundary
+
+
+def _schedule_operations_by_access(record: Mapping[str, Any]) -> dict[int, Mapping[str, Any]]:
+    """Index every lowered operation by its stable PyPTO access order."""
+    operations: dict[int, Mapping[str, Any]] = {}
+    for node in record.get("nodes", []):
+        if not isinstance(node, Mapping) or node.get("kind") != "operation":
+            continue
+        access = _node_access_order(node)
+        if access is None:
+            raise ValueError(f"schedule operation {node.get('id')} has no pypto_access_order")
+        if access in operations:
+            raise ValueError(f"pypto access {access} maps to multiple schedule operations")
+        operations[access] = node
+    if not operations:
+        raise ValueError("schedule record has no operation access provenance")
+    return operations
+
+
+def _common_loop_prefix(first: Mapping[str, Any], second: Mapping[str, Any]) -> tuple[int, ...]:
+    """Return the common structured loop ancestry of two operation nodes."""
+    first_stack, second_stack = first.get("loop_stack", []), second.get("loop_stack", [])
+    if (
+        not isinstance(first_stack, list)
+        or not all(isinstance(loop, int) for loop in first_stack)
+        or not isinstance(second_stack, list)
+        or not all(isinstance(loop, int) for loop in second_stack)
+    ):
+        raise ValueError("schedule operation has invalid loop provenance")
+    common: list[int] = []
+    for first_loop, second_loop in zip(first_stack, second_stack, strict=False):
+        if first_loop != second_loop:
+            break
+        common.append(first_loop)
+    return tuple(common)
+
+
+_DSA_POOL_SCOPES = {
+    0: "GM",
+    1: "UB",
+    2: "MAT",
+    3: "LEFT",
+    4: "RIGHT",
+    5: "ACC",
+    6: "BIAS",
+}
+
+
+def _allocation_access_catalog(
+    problem: Mapping[str, Any], buffer_ids: set[int]
+) -> dict[int, list[Mapping[str, Any]]]:
+    """Read authoritative per-allocation accesses, never lifetime-derived ids."""
+    metadata = problem.get("metadata")
+    serialized = metadata.get("allocation_accesses_v1") if isinstance(metadata, Mapping) else None
+    if not isinstance(serialized, str):
+        raise ValueError(
+            "complete topology requires allocation_accesses_v1; re-export source access provenance. "
+            "DSA lifetime positions are not pypto.access identities"
+        )
+    entries = json.loads(serialized)
+    if not isinstance(entries, list):
+        raise ValueError("allocation_accesses_v1 must encode an array")
+    catalog: dict[int, list[Mapping[str, Any]]] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("buffer"), int):
+            raise ValueError("allocation access entry has no integer buffer identity")
+        buffer_id = entry["buffer"]
+        if buffer_id in catalog or buffer_id not in buffer_ids:
+            raise ValueError(f"duplicate or unknown allocation access buffer {buffer_id}")
+        if entry.get("complete") is not True:
+            raise ValueError(f"buffer {buffer_id} source access collection is incomplete")
+        accesses = entry.get("accesses")
+        if not isinstance(accesses, list) or not all(isinstance(item, Mapping) for item in accesses):
+            raise ValueError(f"buffer {buffer_id} accesses must be an array of objects")
+        catalog[buffer_id] = accesses
+    if set(catalog) != buffer_ids:
+        raise ValueError(f"source access catalog omits buffers {sorted(buffer_ids - set(catalog))}")
+    return catalog
+
+
+def _canonical_dsa_scope(scope: Any) -> Any:
+    if not isinstance(scope, str):
+        return scope
+    canonical = scope.upper()
+    return {"VEC": "UB", "DDR": "GM"}.get(canonical, canonical)
+
+
+def _allocation_lowered_accesses(  # noqa: PLR0912 - explicit fail-closed provenance cases
+    buffer: Mapping[str, Any],
+    pool: int,
+    operations: Mapping[int, Mapping[str, Any]],
+    *,
+    source_accesses: Sequence[Mapping[str, Any]],
+    complete_access_provenance: bool,
+) -> list[dict[str, Any]]:
+    """Bind an allocation at its definition, then retain its lowered accesses.
+
+    A lifetime's last source statement is not a completion frontier: an
+    earlier access on another pipe can still be outstanding. Use the lifetime
+    only to delimit the allocation phase, and join reads/writes through the
+    source collector's explicit per-allocation access identities. Lowered root
+    names are retained when unambiguous but are not treated as allocation
+    identity. An entirely absent phase is retained as nonmaterialized only
+    when the raw-PTO join proves that all surviving operations have identities.
+    """
+    scope = _DSA_POOL_SCOPES.get(pool)
+    if scope is None:
+        raise ValueError(f"buffer {buffer['id']} has unsupported memory pool {pool}")
+    # Root names are useful diagnostics but are not allocation identity after
+    # view and loop lowering. The exported source-access catalog is the
+    # authority for (buffer, operation, effect, range); the strict PTOAS join
+    # separately proves that every access order names the same operation in
+    # both graphs. Never reject a real access merely because several operands
+    # in that operation share the same pool and lowered root spelling changed.
+    allocation_roots: set[str] = set()
+    for source in source_accesses:
+        if source.get("mode") != "write" or source.get("order") not in operations:
+            continue
+        node = operations[source["order"]]
+        written = {
+            item.get("root")
+            for item in node.get("defs", [])
+            if isinstance(item, Mapping)
+            and _canonical_dsa_scope(item.get("scope")) == scope
+            and isinstance(item.get("root"), str)
+        }
+        if len(written) == 1:
+            allocation_roots.update(written)
+    result: list[dict[str, Any]] = []
+    for source in source_accesses:
+        access, mode = source.get("order"), source.get("mode")
+        if not isinstance(access, int) or access < 0 or mode not in {"read", "write"}:
+            raise ValueError(f"buffer {buffer['id']} has a malformed source access")
+        if source.get("pool") != pool:
+            raise ValueError(f"buffer {buffer['id']} source access {access} has the wrong pool")
+        node = operations.get(access)
+        if node is None:
+            if complete_access_provenance:
+                continue
+            raise ValueError(f"buffer {buffer['id']} access {access} is not proven nonmaterialized")
+        field = "defs" if mode == "write" else "uses"
+        preferred = [
+            item
+            for item in node.get(field, [])
+            if isinstance(item, Mapping) and _canonical_dsa_scope(item.get("scope")) == scope
+        ]
+        all_matches = [
+            item
+            for candidate_field in ("uses", "defs")
+            for item in node.get(candidate_field, [])
+            if isinstance(item, Mapping) and _canonical_dsa_scope(item.get("scope")) == scope
+        ]
+        if not all_matches:
+            raise ValueError(f"buffer {buffer['id']} access {access} has no {scope} memory operand")
+        matches = [item for item in preferred if item.get("root") in allocation_roots]
+        if not matches:
+            matches = [item for item in all_matches if item.get("root") in allocation_roots]
+        if not matches and len(preferred) == 1:
+            matches = preferred
+        if not matches and len(all_matches) == 1:
+            matches = all_matches
+        roots = {item.get("root") for item in matches if isinstance(item.get("root"), str)}
+        if len(roots) == 1:
+            root = next(iter(roots))
+        else:
+            # The topology consumer needs the operation endpoint, not a
+            # lowered operand number. Keep the ambiguity explicit instead of
+            # choosing one same-pool root and silently dropping the access.
+            root = f"source-buffer:{buffer['id']}"
+            matches = all_matches
+        if any(item.get("aliases_unknown_range") for item in matches):
+            if source.get("range_known") is not True:
+                raise ValueError(f"buffer {buffer['id']} access {access} has unknown root aliasing")
+        result.append({"access": access, "mode": mode, "root": root, "field": field, "node": node})
+    return result
+
+
+def _allocation_access_frontier(
+    accesses: Sequence[Mapping[str, Any]],
+    *,
+    terminal: bool,
+) -> list[Mapping[str, Any]]:
+    """Keep per-pipe, per-control-path read/write frontiers in fixed issue order."""
+    frontier: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+    for access in accesses:
+        node = access["node"]
+        key = (
+            node.get("pipe"),
+            tuple(node.get("loop_stack", [])),
+            tuple(node.get("branch_stack", [])),
+            access["mode"],
+        )
+        previous = frontier.get(key)
+        if previous is None or (
+            access["access"] > previous["access"] if terminal else access["access"] < previous["access"]
+        ):
+            frontier[key] = access
+    return sorted(frontier.values(), key=lambda item: (item["access"], item["mode"]))
+
+
+def _realized_physical_reuse_pairs(
+    problem: Mapping[str, Any], solution: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Enumerate every physical overlap permitted by non-overlapping lifetimes.
+
+    This is intentionally independent of ``reuse_penalties`` and of every
+    recognizer candidate metadata field.  A complete placement is the source
+    of truth for which ranges actually share storage.
+    """
+    try:
+        buffers = _index_problem_buffers(problem["problem"]["buffers"])
+        placements = _index_solution_placements(solution["placements"])
+    except (KeyError, TypeError) as error:
+        raise ValueError("problem or solution has an invalid placement schema") from error
+    if set(placements) != set(buffers):
+        missing = sorted(set(buffers) - set(placements))
+        extra = sorted(set(placements) - set(buffers))
+        raise ValueError(f"solution is not complete: missing={missing[:8]}, extra={extra[:8]}")
+
+    problem_instance, solution_instance = problem.get("instance"), solution.get("instance")
+    if isinstance(problem_instance, str) and solution_instance != problem_instance:
+        raise ValueError(
+            f"solution instance does not match problem: {solution_instance!r} != {problem_instance!r}"
+        )
+    expected_fingerprint = problem.get("problem_fingerprint")
+    if expected_fingerprint is None and isinstance(problem_instance, Mapping):
+        expected_fingerprint = problem_instance.get("fingerprint")
+    if expected_fingerprint is not None and solution.get("problem_fingerprint") != expected_fingerprint:
+        raise ValueError("solution problem fingerprint does not match problem")
+
+    decoded_lifetimes = {
+        buffer_id: _decode_dsa_execution_lifetime(buffer) for buffer_id, buffer in buffers.items()
+    }
+    realized: list[dict[str, Any]] = []
+    for first, second in itertools.combinations(sorted(buffers), 2):
+        first_placement, second_placement = placements[first], placements[second]
+        if first_placement["pool"] != second_placement["pool"]:
+            continue
+        first_begin, second_begin = int(first_placement["offset"]), int(second_placement["offset"])
+        first_end = first_begin + int(buffers[first]["size"])
+        second_end = second_begin + int(buffers[second]["size"])
+        overlap_begin, overlap_end = max(first_begin, second_begin), min(first_end, second_end)
+        if overlap_begin >= overlap_end:
+            continue
+
+        first_interval = buffers[first]["live_intervals"][0]
+        second_interval = buffers[second]["live_intervals"][0]
+        if int(first_interval["upper"]) <= int(second_interval["lower"]):
+            prior, next_buffer = first, second
+        elif int(second_interval["upper"]) <= int(first_interval["lower"]):
+            prior, next_buffer = second, first
+        else:
+            raise ValueError(
+                f"physically overlapping buffers {first, second} have overlapping execution lifetimes"
+            )
+        realized.append(
+            {
+                "first_buffer": first,
+                "second_buffer": second,
+                "prior_buffer": prior,
+                "next_buffer": next_buffer,
+                "pool": int(first_placement["pool"]),
+                "overlap_begin": overlap_begin,
+                "overlap_end": overlap_end,
+                "overlap_bytes": overlap_end - overlap_begin,
+                "lifetime_statement_bounds": {
+                    str(buffer_id): {
+                        "definition": decoded_lifetimes[buffer_id][0],
+                        "final_access": decoded_lifetimes[buffer_id][1],
+                        "read_before_write_boundary": decoded_lifetimes[buffer_id][2],
+                    }
+                    for buffer_id in (first, second)
+                },
+            }
+        )
+    return realized
+
+
+def _emit_complete_placement_reuse_topology(
+    record: Mapping[str, Any],
+    problem_path: str | Path,
+    solution_path: str | Path,
+    ptoas_graph_path: str | Path,
+    *,
+    function: str,
+) -> dict[str, Any]:
+    """Derive the complete realized topology directly from placement ranges."""
+    problem = json.loads(Path(problem_path).read_text())
+    solution = json.loads(Path(solution_path).read_text())
+    if problem.get("instance") != function:
+        raise ValueError(f"problem instance {problem.get('instance')!r} does not match function {function!r}")
+    realized_pairs = _realized_physical_reuse_pairs(problem, solution)
+    schedule_by_access = _schedule_operations_by_access(record)
+    ptoas_by_access, _ = _validated_ptoas_access_node_map(record, ptoas_graph_path, function=function)
+    _, branch_markers = _branch_alternatives(record)
+    buffers = _index_problem_buffers(problem["problem"]["buffers"])
+    placements = _index_solution_placements(solution["placements"])
+    source_accesses = _allocation_access_catalog(problem, set(buffers))
+    involved_buffers = sorted(
+        {int(pair[key]) for pair in realized_pairs for key in ("first_buffer", "second_buffer")}
+    )
+    allocation_accesses = {
+        buffer_id: _allocation_lowered_accesses(
+            buffers[buffer_id],
+            int(placements[buffer_id]["pool"]),
+            schedule_by_access,
+            source_accesses=source_accesses[buffer_id],
+            complete_access_provenance=_schedule_proves_complete_access_provenance(record),
+        )
+        for buffer_id in involved_buffers
+    }
+
+    edges: dict[tuple[int, int, str, int, int], list[str]] = defaultdict(list)
+    non_edges: list[dict[str, Any]] = []
+
+    def add_handoff(
+        pair: Mapping[str, Any],
+        prior_buffer: int,
+        next_buffer: int,
+        prior: Mapping[str, Any],
+        following: Mapping[str, Any],
+        *,
+        iteration_distance: int,
+    ) -> None:
+        prior_access, next_access = int(prior["access"]), int(following["access"])
+        if prior["mode"] == following["mode"] == "read":
+            return
+        source_schedule = schedule_by_access.get(prior_access)
+        target_schedule = schedule_by_access.get(next_access)
+        source_node, target_node = ptoas_by_access.get(prior_access), ptoas_by_access.get(next_access)
+        if source_schedule is None or target_schedule is None or source_node is None or target_node is None:
+            raise ValueError(
+                f"realized reuse pair {(pair['first_buffer'], pair['second_buffer'])} cannot join "
+                f"lifetime access orders {prior_access}->{next_access} to both schedule graphs"
+            )
+        source_pipe, target_pipe = source_schedule.get("pipe"), target_schedule.get("pipe")
+        if not isinstance(source_pipe, str) or not isinstance(target_pipe, str):
+            raise ValueError("reuse endpoint has no execution pipe")
+        branch_requirements = _combined_branch_requirements(source_schedule, target_schedule, branch_markers)
+        if iteration_distance == 0 and branch_requirements is None:
+            non_edges.append(
+                {
+                    "first_buffer": pair["first_buffer"],
+                    "second_buffer": pair["second_buffer"],
+                    "prior_access_order": prior_access,
+                    "next_access_order": next_access,
+                    "reason": "mutually_exclusive_branch_arms",
+                }
+            )
+            return
+        common_loops = _common_loop_prefix(source_schedule, target_schedule)
+        if iteration_distance and not common_loops:
+            return
+        if source_node == target_node and iteration_distance == 0:
+            non_edges.append(
+                {
+                    "first_buffer": pair["first_buffer"],
+                    "second_buffer": pair["second_buffer"],
+                    "prior_access_order": prior_access,
+                    "next_access_order": next_access,
+                    "reason": "same_operation_explicit_inplace",
+                }
+            )
+            return
+        if source_pipe == target_pipe:
+            non_edges.append(
+                {
+                    "first_buffer": pair["first_buffer"],
+                    "second_buffer": pair["second_buffer"],
+                    "prior_access_order": prior_access,
+                    "next_access_order": next_access,
+                    "reason": "same_resource_fixed_pipe_order",
+                }
+            )
+            return
+
+        dependence = "war" if prior["mode"] == "read" else "raw" if following["mode"] == "read" else "waw"
+        recurrence_depth = len(common_loops) if iteration_distance else 0
+        requirements_text = (
+            "any"
+            if branch_requirements is None
+            else ":".join(
+                f"{branch}={'then' if value else 'else'}"
+                for branch, value in sorted(branch_requirements.items())
+            )
+            or "unconditional"
+        )
+        provenance = (
+            f"buffers={pair['first_buffer']},{pair['second_buffer']};"
+            f"handoff={prior_buffer}->{next_buffer};accesses={prior_access},{next_access};"
+            f"branches={requirements_text};loops={','.join(map(str, common_loops)) or 'none'}"
+        )
+        key = (source_node, target_node, dependence, iteration_distance, recurrence_depth)
+        edges[key].append(provenance)
+
+    for pair in realized_pairs:
+        prior, next_buffer = int(pair["prior_buffer"]), int(pair["next_buffer"])
+        if not allocation_accesses[prior] or not allocation_accesses[next_buffer]:
+            non_edges.append(
+                {
+                    "first_buffer": pair["first_buffer"],
+                    "second_buffer": pair["second_buffer"],
+                    "reason": "allocation_phase_nonmaterialized",
+                    "nonmaterialized_buffers": [
+                        bid for bid in (prior, next_buffer) if not allocation_accesses[bid]
+                    ],
+                }
+            )
+            continue
+        for source in _allocation_access_frontier(allocation_accesses[prior], terminal=True):
+            for target in _allocation_access_frontier(allocation_accesses[next_buffer], terminal=False):
+                add_handoff(pair, prior, next_buffer, source, target, iteration_distance=0)
+        # If both allocation phases recur in one source loop, the later value
+        # in iteration k must release the shared range before the earlier value
+        # in iteration k+1 acquires it. Keep this positive-distance edge out of
+        # the acyclic per-iteration graph while preserving its loop depth.
+        for source in _allocation_access_frontier(allocation_accesses[next_buffer], terminal=True):
+            for target in _allocation_access_frontier(allocation_accesses[prior], terminal=False):
+                add_handoff(pair, next_buffer, prior, source, target, iteration_distance=1)
+
+    return {
+        "schema_version": 1,
+        "function": function,
+        "topology_source": "complete_physical_placement_plus_allocation_accesses_v1",
+        "realized_physical_pair_count": len(realized_pairs),
+        "realized_physical_pairs": realized_pairs,
+        "access_binding": "explicit_source_allocation_accesses_v1",
+        "range_policy": "conservative_full_allocation",
+        "allocation_accesses_sha256": hashlib.sha256(
+            problem["metadata"]["allocation_accesses_v1"].encode()
+        ).hexdigest(),
+        "non_edge_reuses": non_edges,
+        "edges": [
+            {
+                "source_node": source,
+                "target_node": target,
+                "kind": kind,
+                "provenance": "|".join(sorted(provenance)),
+                **(
+                    {
+                        "iteration_distance": distance,
+                        "recurrence_loop_depth": loop_depth,
+                    }
+                    if distance
+                    else {}
+                ),
+            }
+            for (source, target, kind, distance, loop_depth), provenance in sorted(edges.items())
+        ],
+    }
+
+
 def _load_ptoas_graph_nodes(
     path: str | Path, *, function: str
 ) -> tuple[dict[int, tuple[int, str]], dict[str, int]]:
@@ -5944,7 +6472,7 @@ def emit_ptoas_resolved_node_durations(
         if provenance.get("fallback") is True:
             raise ValueError(f"PTOAS node {ptoas_node} duration for {ptoas_op} uses an unsupported fallback")
         base_cycles = provenance.get("base_cycles")
-        if not isinstance(base_cycles, (int, float)) or not math.isfinite(base_cycles) or base_cycles <= 0:
+        if not isinstance(base_cycles, (int, float)) or not math.isfinite(base_cycles) or base_cycles < 0:
             raise ValueError(f"PTOAS node {ptoas_node} has invalid base duration {base_cycles!r}")
         rows.append(
             {
@@ -5954,6 +6482,7 @@ def emit_ptoas_resolved_node_durations(
                 "cycles": int(math.floor(float(base_cycles) + 0.5)),
                 "source": provenance["source"],
                 "detail": provenance["detail"],
+                "evidence_class": provenance["evidence_class"],
             }
         )
     extra = sorted(set(schedule_nodes) - graph_accesses)
@@ -6560,20 +7089,25 @@ def emit_ptoas_placement_reuse_topology(
     function: str | None = None,
     known_nonmaterialized_access_orders: frozenset[int] = frozenset(),
 ) -> dict[str, Any]:
-    """Emit the realized placement edge set without evaluating durations."""
+    """Emit the complete realized placement topology without durations.
+
+    Unlike the historical candidate-scoring bridge, this path enumerates
+    physical range overlaps from the complete solution and joins handoff
+    sites from the explicit per-allocation access catalog. The penalty
+    candidate catalog is deliberately not read: it is a solver objective, not
+    a complete description of a placement's synchronization topology.
+    """
     record_function = record.get("function")
     if not isinstance(record_function, str) or not record_function:
         raise ValueError("schedule record has no function identity")
     if function is not None and function != record_function:
         raise ValueError(f"requested function {function!r} does not match {record_function!r}")
-    topology = build_reuse_topology(
+    if known_nonmaterialized_access_orders:
+        raise ValueError(
+            "complete placement topology does not accept candidate-catalog nonmaterialization hints"
+        )
+    result = _emit_complete_placement_reuse_topology(
         record,
-        load_candidate_records(problem_path),
-        problem_path,
-        known_nonmaterialized_access_orders=known_nonmaterialized_access_orders,
-    )
-    result = emit_ptoas_placement_reuse_edges(
-        topology,
         problem_path,
         solution_path,
         ptoas_graph_path,
@@ -7053,7 +7587,7 @@ def calibrate_from_metrics(paths: Sequence[str | Path], base: DurationModel | No
         operation_cycles=dict(model.operation_cycles),
         operation_signature_cycles=signature_cycles,
         operation_signature_pipeline=dict(model.operation_signature_pipeline),
-        calibration_sources=sorted(used_sources),
+        calibration_sources=sorted(set(model.calibration_sources) | set(used_sources)),
         pto_isa_provider=model.pto_isa_provider,
     )
 
@@ -8779,6 +9313,9 @@ def _run_direct_model_command(args: argparse.Namespace) -> bool:
             "fallback_node_ids": fallback_nodes,
             "duration_sources": dict(
                 sorted(Counter(str(item["source"]) for item in duration_provenance.values()).items())
+            ),
+            "duration_evidence_classes": dict(
+                sorted(Counter(str(item["evidence_class"]) for item in duration_provenance.values()).items())
             ),
             "dynamic_loop_node_ids": dynamic_loop_nodes,
         }
