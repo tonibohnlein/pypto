@@ -13,6 +13,7 @@
 #define PYPTO_BACKEND_910B_BACKEND_910B_HANDLER_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,18 @@ class Ascend910BHandler : public BackendHandler {
   /// Native single-instruction `pto.tcvt` pairs for this architecture
   /// (ISA Supported Conversions, pto-isa tcvt docs).
   [[nodiscard]] const TcvtAdjacency& GetTcvtAdjacency() const override;
+
+  [[nodiscard]] std::optional<uint32_t> GetTcvtSafeFragmentWidth(
+      const DataType& source_dtype, const DataType& target_dtype) const override {
+    // A2/A3 silently mis-lowers a wide INT32->FP16 tcvt when its final
+    // physical-column fragment is not a complete 128-element vector. Keep
+    // small and aligned tiles intact; LegalizeTileCast fragments only the
+    // unsafe tail class.
+    if (source_dtype == DataType::INT32 && target_dtype == DataType::FP16) {
+      return 128;
+    }
+    return std::nullopt;
+  }
 
   [[nodiscard]] uint32_t GetGmAccessGranularityBytes() const override { return 512; }
   [[nodiscard]] uint32_t GetL2CacheLineBytes() const override { return 512; }

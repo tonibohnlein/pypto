@@ -30,6 +30,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -47,6 +48,7 @@
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
@@ -56,6 +58,7 @@
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace ir {
@@ -241,10 +244,24 @@ ExprPtr MakeCast(const ExprPtr& x, DataType to, int mode, const Span& span) {
   return OpRegistry::GetInstance().Create("tile.cast", {x}, kw, span);
 }
 
+MakeTuplePtr MakeIndexTuple(std::initializer_list<int64_t> values, const Span& span) {
+  std::vector<ExprPtr> elements;
+  elements.reserve(values.size());
+  for (int64_t value : values) {
+    elements.push_back(std::make_shared<ConstInt>(value, DataType::INDEX, span));
+  }
+  return std::make_shared<MakeTuple>(std::move(elements), span);
+}
+
+std::string FragmentName(const VarPtr& output, const std::string& role, std::size_t index) {
+  return auto_name::BuildName(auto_name::GetBaseName(output->name_hint_), role, "tmp",
+                              static_cast<int>(index));
+}
+
 class LegalizeTileCastMutator : public IRMutator {
  public:
-  LegalizeTileCastMutator(const backend::TcvtAdjacency& table, std::string arch_name)
-      : arch_name_(std::move(arch_name)), adj_(BuildAdj(table)) {}
+  LegalizeTileCastMutator(const backend::BackendHandler& handler, std::string arch_name)
+      : handler_(handler), arch_name_(std::move(arch_name)), adj_(BuildAdj(handler.GetTcvtAdjacency())) {}
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto call = As<Call>(op->value_);
@@ -260,6 +277,12 @@ class LegalizeTileCastMutator : public IRMutator {
     DataType src = src_tile->dtype_;
     DataType dst = call->GetKwarg<DataType>("target_type");
     const int mode = call->GetKwarg<int>("mode", kCastModeRound);
+
+    if (const auto fragment_width = handler_.GetTcvtSafeFragmentWidth(src, dst)) {
+      if (auto fragmented = FragmentUnsafeTail(op, call, src_tile, dst, mode, *fragment_width)) {
+        return *fragmented;
+      }
+    }
 
     if (IsNativeCast(adj_, src, dst)) {
       return IRMutator::VisitStmt_(op);
@@ -295,6 +318,65 @@ class LegalizeTileCastMutator : public IRMutator {
   }
 
  private:
+  std::optional<StmtPtr> FragmentUnsafeTail(const AssignStmtPtr& op, const CallPtr& call,
+                                            const TileTypePtr& src_tile, DataType dst, int mode,
+                                            uint32_t fragment_width) {
+    INTERNAL_CHECK_SPAN(fragment_width > 0, op->span_)
+        << "Backend returned a zero tile.cast safe fragment width";
+    if (src_tile->shape_.size() != 2) return std::nullopt;
+    auto rows = As<ConstInt>(src_tile->shape_[0]);
+    auto cols = As<ConstInt>(src_tile->shape_[1]);
+    if (!rows || !cols || cols->value_ <= static_cast<int64_t>(fragment_width) ||
+        cols->value_ % static_cast<int64_t>(fragment_width) == 0) {
+      return std::nullopt;
+    }
+
+    auto& registry = OpRegistry::GetInstance();
+    const ExprPtr source = VisitExpr(call->args_[0]);
+    const auto valid_shape = GetValidShape(src_tile);
+    INTERNAL_CHECK_SPAN(valid_shape.size() == 2, op->span_)
+        << "LegalizeTileCast expects a 2D valid_shape after FlattenTileNdTo2D";
+
+    std::vector<StmtPtr> stmts;
+    const auto full_shape = std::make_shared<MakeTuple>(src_tile->shape_, op->span_);
+    std::vector<std::pair<std::string, std::any>> create_kwargs = {
+        {"dtype", dst},
+        {"target_memory", MemorySpace::Vec},
+    };
+    const ExprPtr create = registry.Create("tile.create", {full_shape}, create_kwargs, op->span_);
+    auto assembled = std::make_shared<Var>(FragmentName(op->var_, "cast_storage", temp_counter_++),
+                                           create->GetType(), op->span_);
+    stmts.push_back(std::make_shared<AssignStmt>(assembled, create, op->span_));
+
+    for (int64_t col = 0; col < cols->value_; col += fragment_width) {
+      const int64_t width = std::min<int64_t>(static_cast<int64_t>(fragment_width), cols->value_ - col);
+      const ExprPtr shape = MakeIndexTuple({rows->value_, width}, op->span_);
+      const ExprPtr offset = MakeIndexTuple({0, col}, op->span_);
+      const ExprPtr slice = registry.Create("tile.slice", {source, shape, offset}, op->span_);
+      auto slice_var = std::make_shared<Var>(FragmentName(op->var_, "cast_slice", temp_counter_++),
+                                             slice->GetType(), op->span_);
+      stmts.push_back(std::make_shared<AssignStmt>(slice_var, slice, op->span_));
+
+      const ExprPtr cast = MakeCast(slice_var, dst, mode, op->span_);
+      auto cast_var = std::make_shared<Var>(FragmentName(op->var_, "cast_fragment", temp_counter_++),
+                                            cast->GetType(), op->span_);
+      stmts.push_back(std::make_shared<AssignStmt>(cast_var, cast, op->span_));
+
+      const ExprPtr assemble = registry.Create("tile.assemble", {assembled, cast_var, offset}, op->span_);
+      assembled = std::make_shared<Var>(FragmentName(op->var_, "cast_assembled", temp_counter_++),
+                                        assemble->GetType(), op->span_);
+      stmts.push_back(std::make_shared<AssignStmt>(assembled, assemble, op->span_));
+    }
+
+    const ExprPtr narrowed =
+        registry.Create("tile.set_validshape", {assembled, valid_shape[0], valid_shape[1]}, op->span_);
+    auto final_assign = MutableCopy(op);
+    final_assign->value_ = narrowed;
+    stmts.push_back(std::move(final_assign));
+    return std::make_shared<SeqStmts>(std::move(stmts), op->span_);
+  }
+
+  const backend::BackendHandler& handler_;
   std::string arch_name_;
   AdjList adj_;
   std::size_t temp_counter_ = 0;
@@ -319,7 +401,7 @@ FunctionPtr TransformLegalizeTileCast(const FunctionPtr& func) {
   if (handler == nullptr) {
     return func;
   }
-  LegalizeTileCastMutator mutator(handler->GetTcvtAdjacency(), handler->GetPtoTargetArch());
+  LegalizeTileCastMutator mutator(*handler, handler->GetPtoTargetArch());
   return mutator.VisitFunction(func);
 }
 
