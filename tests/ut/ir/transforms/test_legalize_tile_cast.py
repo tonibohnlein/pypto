@@ -167,44 +167,12 @@ def _int32_to_fp16_program(cols: int, valid_rows: int = 32):
     return Before
 
 
-def _literal_tuple(expr: ir.Expr) -> tuple[int, ...]:
-    assert isinstance(expr, ir.MakeTuple)
-    values: list[int] = []
-    for element in expr.elements:
-        assert isinstance(element, ir.ConstInt)
-        values.append(element.value)
-    return tuple(values)
-
-
-def test_a2a3_int32_to_fp16_unsafe_tail_is_fragmented():
-    """A wide partial 128-element tcvt tail is split before PTO codegen."""
-
-    after = _run(_int32_to_fp16_program(224, valid_rows=16), BackendType.Ascend910B)
-    assert _cast_pairs(after) == [("int32", "fp16"), ("int32", "fp16")]
-
-    class _FragmentCollector(ir.IRVisitor):
-        def __init__(self) -> None:
-            super().__init__()
-            self.slices: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-            self.assemble_offsets: list[tuple[int, ...]] = []
-            self.final_valid_shape: tuple[int, ...] | None = None
-
-        def visit_call(self, op: ir.Call) -> None:
-            if op.op.name == ir.get_op("tile.slice").name:
-                self.slices.append((_literal_tuple(op.args[1]), _literal_tuple(op.args[2])))
-            elif op.op.name == ir.get_op("tile.assemble").name:
-                self.assemble_offsets.append(_literal_tuple(op.args[2]))
-            elif op.op.name == ir.get_op("tile.set_validshape").name:
-                self.final_valid_shape = tuple(
-                    arg.value for arg in op.args[1:] if isinstance(arg, ir.ConstInt)
-                )
-            super().visit_call(op)
-
-    collector = _FragmentCollector()
-    collector.visit_program(after)
-    assert collector.slices == [((32, 128), (0, 0)), ((32, 96), (0, 128))]
-    assert collector.assemble_offsets == [(0, 0), (0, 128)]
-    assert collector.final_valid_shape == (16, 224)
+def test_a2a3_int32_to_fp16_fragments_are_deferred_to_codegen():
+    """Legalization must not allocate dense fragments and reassemble row pitches."""
+    before = _int32_to_fp16_program(224, valid_rows=16)
+    after = _run(before, BackendType.Ascend910B)
+    assert _cast_pairs(after) == [("int32", "fp16")]
+    ir.assert_structural_equal(after, before)
 
 
 @pytest.mark.parametrize("cols", [32, 64, 128, 256, 896])
