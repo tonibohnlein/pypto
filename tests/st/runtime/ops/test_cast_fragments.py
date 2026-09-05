@@ -73,6 +73,17 @@ GEOMETRIES = [
 ]
 
 
+def valid_rectangle(rows: int, cols: int):
+    """Compare only the logical result; storage outside valid_shape is unspecified."""
+
+    def compare(actual, expected):
+        assert actual.keys() == expected.keys()
+        for name, got in actual.items():
+            torch.testing.assert_close(got[:rows, :cols], expected[name][:rows, :cols], rtol=0, atol=0)
+
+    return compare
+
+
 def stage_cases():
     stages = [
         ("f32_i32", torch.float32, torch.int32),
@@ -94,8 +105,7 @@ def stage_cases():
                     output,
                     name=f"cast_{name}_{cols}_{rows}_{valid}_seed{seed}",
                     golden=lambda _, expected=expected: expected,
-                    rtol=0,
-                    atol=0,
+                    compare=valid_rectangle(rows, valid),
                 )
 
 
@@ -115,8 +125,7 @@ def quantize_cases():
                 output,
                 name=f"quantize_{cols}_{rows}_{valid}_seed{seed}",
                 golden=lambda _, expected=expected: expected,
-                rtol=0,
-                atol=0,
+                compare=valid_rectangle(rows, valid),
             )
 
 
