@@ -13,13 +13,23 @@ For each `var = tile.cast(...)`:
 2. Already native: leave unchanged (including FIXPIPE-foldable `FP32→BF16/FP16` with `mode=rint`).
 3. Non-native: BFS for a shortest path; among equal-length paths prefer "same byte-width → float, then adjust width".
 
-The backend may also declare a safe physical-column fragment width for a native
-conversion. In that case, a wide tile with an incomplete final fragment is
-lowered to column slices, one native cast per fragment, and an assembled result.
-Small tiles and widths made entirely of complete fragments remain a single cast.
-On Ascend910B this applies to `INT32→FP16` with 128-element fragments: widths
-`32`, `64`, `128`, `256`, and `896` remain intact, while `224` becomes
-`128 + 96`. The original `valid_shape` is restored on the assembled tile.
+The backend may also declare a safe column fragment width for a native
+conversion. **PTO codegen**, not this pass, handles the layout constraint. It
+writes one-row fragments directly into subviews of the final destination,
+preserving the source and destination parent row pitches. There is no dense
+fragment allocation, reassembly `tmov`, extra GM request, or changed rounding
+mode. The result retains its original `valid_shape`.
+
+On Ascend910B this applies to `INT32→FP16` with fragments of at most 128
+elements. Full unpadded widths `32`, `64`, `128`, `256`, and `896` stay native;
+`224` becomes per-row `128 + 96`. Padded columns (for example physical
+`[32,128]`, valid `[16,112]`) also use one-row views, avoiding masked
+cross-row repeats. Runtime-valid columns are clipped per fragment and empty
+fragments are guarded; only valid rows are visited. This adds loop/instruction
+overhead without adding tile storage. Performance models must price the lowered
+sequence, not assume one original cast is one issued instruction. Real-PTOAS
+tests cover both memory ownership modes; numerical closure still requires the
+device cast-stage and quantization-chain regressions.
 
 Typical A5 results: `INT32→FP16` → `INT32→FP32→FP16`; `FP16→BF16` → `FP16→FP32→BF16`.
 
