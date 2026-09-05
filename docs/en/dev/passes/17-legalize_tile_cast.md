@@ -13,6 +13,14 @@ For each `var = tile.cast(...)`:
 2. Already native: leave unchanged (including FIXPIPE-foldable `FP32→BF16/FP16` with `mode=rint`).
 3. Non-native: BFS for a shortest path; among equal-length paths prefer "same byte-width → float, then adjust width".
 
+The backend may also declare a safe physical-column fragment width for a native
+conversion. In that case, a wide tile with an incomplete final fragment is
+lowered to column slices, one native cast per fragment, and an assembled result.
+Small tiles and widths made entirely of complete fragments remain a single cast.
+On Ascend910B this applies to `INT32→FP16` with 128-element fragments: widths
+`32`, `64`, `128`, `256`, and `896` remain intact, while `224` becomes
+`128 + 96`. The original `valid_shape` is restored on the assembled tile.
+
 Typical A5 results: `INT32→FP16` → `INT32→FP32→FP16`; `FP16→BF16` → `FP16→FP32→BF16`.
 
 Unreachable pairs hard-fail with src/dst/arch in the diagnostic.

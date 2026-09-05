@@ -13,6 +13,7 @@
 #define PYPTO_BACKEND_COMMON_BACKEND_HANDLER_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -489,6 +490,24 @@ class BackendHandler {
    * reference for the duration of a pass.
    */
   [[nodiscard]] virtual const TcvtAdjacency& GetTcvtAdjacency() const = 0;
+
+  /**
+   * @brief Safe physical-column fragment width for a native `pto.tcvt` pair.
+   *
+   * Some backends accept a conversion for arbitrary small tiles and for wider
+   * tiles made from complete hardware-width fragments, but mis-handle a wide
+   * final fragment. Returning a value requests that LegalizeTileCast split a
+   * tile whose physical column count is greater than the value and is not an
+   * exact multiple of it. The lowering uses fragments no wider than the
+   * returned value; already-safe small and exactly aligned tiles stay intact.
+   *
+   * `std::nullopt` means that the backend declares no shape restriction for
+   * this conversion.
+   */
+  [[nodiscard]] virtual std::optional<uint32_t> GetTcvtSafeFragmentWidth(const DataType& source_dtype,
+                                                                         const DataType& target_dtype) const {
+    return std::nullopt;
+  }
 };
 
 }  // namespace backend
