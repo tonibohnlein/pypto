@@ -4035,6 +4035,51 @@ class TestAutoTileMatmulL0Skips:
         After = passes.auto_tile_matmul_l0()(Before)
         ir.assert_structural_equal(After, Before)
 
+    def test_full_output_k_fallback_for_vector_consumer(self):
+        """Keep the full QK output and tile K when softmax prevents an M/N grid.
+
+        The minimum-wall chooser prefers an N-tiled ``[32, 128, 16]`` plan for
+        this FP32 ``[32, 80] @ [80, 224]`` matmul.  Its result feeds a vector
+        consumer, so the pass cannot place separate N subtiles.  Leaving the
+        original call untouched would materialize a 71,680-byte Right operand
+        in a 65,536-byte L0B.  The fallback therefore fixes M/N at ``32x224``
+        and tiles K instead.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                query: pl.Tensor[[32, 80], pl.FP32],
+                key: pl.Tensor[[224, 80], pl.FP32],
+                out: pl.Out[pl.Tensor[[32, 224], pl.FP32]],
+            ) -> pl.Tensor[[32, 224], pl.FP32]:
+                query_mat = pl.tile.load(query, [0, 0], [32, 80], target_memory=pl.Mem.Mat)
+                key_mat = pl.tile.load(key, [0, 0], [224, 80], target_memory=pl.Mem.Mat)
+                key_t = pl.tile.transpose_view(key_mat)
+                scores = pl.tile.matmul(query_mat, key_t)
+                scores_vec = pl.tile.move(scores, target_memory=pl.Mem.Vec)
+                out = pl.tile.store(scores_vec, [0, 0], out)
+                return out
+
+        after = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(after)
+
+        assert "pl.pipeline(" in printed
+        assert "pl.tile.matmul_acc(" in printed
+        assert "pl.tile.move(scores, target_memory=pl.Mem.Vec)" not in printed
+        assert "[80, 224], target_memory=pl.Mem.Right" not in printed
+        right_k_windows = [
+            int(k)
+            for k in re.findall(
+                r"pl\.tile\.extract\(key_t[^\n]*\[(\d+), 224\], target_memory=pl\.Mem\.Right",
+                printed,
+            )
+        ]
+        assert right_k_windows
+        assert max(right_k_windows) * 224 * 4 * 2 <= 64 * 1024
+
     def test_matmul_bias_n_tiling_with_bias_resident_source_is_deferred(self):
         """The architectural bias table cannot form a Bias-to-Bias N sub-window."""
         _backend.reset_for_testing()

@@ -851,7 +851,7 @@ KLoopRewrite MakeKLoop(const MatmulTiling& t, ExprPtr mi, ExprPtr ni, int64_t m_
 std::optional<MatmulTiling> AnalyzeMatmul(
     const AssignStmtPtr& assign, std::vector<Diagnostic>& hints, bool force_output_stationary = false,
     std::optional<tile_view_semantics::BoxedTileAlignment> output_box_alignment = std::nullopt,
-    const DirectDefMap* direct_defs = nullptr) {
+    const DirectDefMap* direct_defs = nullptr, bool preserve_output_shape = false) {
   auto call = As<Call>(assign->value_);
   if (!call || !call->op_) return std::nullopt;
 
@@ -1175,6 +1175,22 @@ std::optional<MatmulTiling> AnalyzeMatmul(
                            " — non-16-aligned K is unsupported; left untouched.",
                        assign->span_);
     return std::nullopt;
+  }
+
+  // A matmul whose result remains on chip may feed an elementwise/vector
+  // consumer that cannot accept separately placed M/N subtiles.  In that
+  // fallback mode preserve the complete [M, N] result and let the chooser
+  // search only K tilings.  This is legal only when the output axes already
+  // satisfy the cube fractal; unlike the ordinary grid path there is no
+  // boundary placer that could peel a partial M/N tile.
+  if (preserve_output_shape) {
+    if (M % cfg.align_m != 0 || N % cfg.align_n != 0) return std::nullopt;
+    if (cfg.max_n > 0 && N > cfg.max_n) return std::nullopt;
+    cfg.min_m = static_cast<int>(M);
+    cfg.min_n = static_cast<int>(N);
+    cfg.max_n = static_cast<int>(N);
+    cfg.max_n_pipelined = 0;
+    cfg.max_n_nested_pipelined = 0;
   }
 
   utils::L0TileResult res;
@@ -3208,15 +3224,44 @@ class AutoTileMutator : public IRMutator {
             changed = true;
             continue;
           }
-          // Output exceeds L0c — tile M/N by folding the consumer store, found
-          // via the raw (un-substituted) SiblingIndex: the matmul's result is
-          // freshly defined here, so its use count / store site are never
+          // The selected plan needs M/N tiling — place those tiles by folding
+          // the consumer store, found via the raw (un-substituted)
+          // SiblingIndex: the matmul's result is freshly defined here, so its
+          // use count / store site are never
           // affected by the running remap.
           const Var* result = assign->var_.get();
           auto uc_it = sibling_index.use_counts.find(result);
           int result_uses = uc_it == sibling_index.use_counts.end() ? 0 : uc_it->second;
           auto mo_it = sibling_index.matmul_operand_uses.find(result);
           int operand_uses = mo_it == sibling_index.matmul_operand_uses.end() ? 0 : mo_it->second;
+          auto store_it = sibling_index.store_of.find(result);
+          const AssignStmt* store_stmt =
+              store_it == sibling_index.store_of.end() ? nullptr : store_it->second;
+
+          // The selected minimum-wall tile may split M/N solely to fit an
+          // operand even though the complete output fits L0C.  Direct stores
+          // and chained matmuls have explicit M/N placers below.  For every
+          // other on-chip consumer (for example QK -> softmax), retry with the
+          // output shape fixed and K as the only tiling axis.  This prevents an
+          // otherwise legal source program from falling through with an
+          // oversized Left/Right operand merely because its consumer cannot
+          // assemble an M/N grid.
+          const bool has_direct_store = store_stmt && result_uses == 1;
+          const bool all_uses_are_matmul_operands = result_uses >= 1 && operand_uses == result_uses;
+          if (!has_direct_store && !all_uses_are_matmul_operands) {
+            std::vector<Diagnostic> discard;
+            auto k_only = AnalyzeMatmul(assign, discard, /*force_output_stationary=*/true,
+                                        /*output_box_alignment=*/std::nullopt, &direct_defs,
+                                        /*preserve_output_shape=*/true);
+            if (k_only && !k_only->needs_mn_tiling() && k_only->k < k_only->K) {
+              auto rewrite = BuildKLoopRewrite(
+                  MakeKLoop(*k_only, /*mi=*/nullptr, /*ni=*/nullptr, k_only->m, k_only->n, /*name_base=*/""));
+              remap[result] = rewrite.return_var;
+              for (auto& s : rewrite.stmts) out.push_back(std::move(s));
+              changed = true;
+              continue;
+            }
+          }
           // Mat-scratch dtype + remap target. Default: the matmul result itself at
           // its own dtype. Chained-matmul-with-downcast — `c -> tile.cast(c,
           // bf16/f16) -> matmul` — fuses the cast (the cube FIXPIPE writeback,
@@ -3293,9 +3338,6 @@ class AutoTileMutator : public IRMutator {
             changed = true;
             continue;
           }
-          auto store_it = sibling_index.store_of.find(result);
-          const AssignStmt* store_stmt =
-              store_it == sibling_index.store_of.end() ? nullptr : store_it->second;
           const bool reconstructs_bias = tiling->bias_load_def && tiling->n != tiling->N;
           const bool bias_snapshot_reaches_store =
               !reconstructs_bias || !store_stmt ||
