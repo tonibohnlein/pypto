@@ -71,11 +71,12 @@ class Ascend910BHandler : public BackendHandler {
 
   [[nodiscard]] std::optional<uint32_t> GetTcvtSafeFragmentWidth(
       const DataType& source_dtype, const DataType& target_dtype) const override {
-    // A2/A3 silently mis-lowers a wide INT32->FP16 tcvt when its final
-    // physical-column fragment is not a complete 128-element vector. Keep
-    // small and aligned tiles intact; LegalizeTileCast fragments only the
-    // unsafe tail class.
-    if (source_dtype == DataType::INT32 && target_dtype == DataType::FP16) {
+    // A2/A3 silently mis-lowers these wide narrowing conversions when their
+    // final physical-column fragment is not a complete 128-element vector.
+    // Keep small and aligned tiles intact; PTO codegen fragments only the
+    // unsafe tail class while preserving both parent row pitches.
+    if ((source_dtype == DataType::INT32 && target_dtype == DataType::FP16) ||
+        (source_dtype == DataType::FP16 && target_dtype == DataType::INT8)) {
       return 128;
     }
     return std::nullopt;
