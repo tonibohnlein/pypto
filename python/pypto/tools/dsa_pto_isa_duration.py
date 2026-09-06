@@ -39,6 +39,7 @@ _BINARY_LOWERING_PATH = Path("include/pto/npu/a2a3/TBinOp.hpp")
 _COMPARE_LOWERING_PATH = Path("include/pto/npu/a2a3/TCmps.hpp")
 _DIV_LOWERING_PATH = Path("include/pto/npu/a2a3/TDiv.hpp")
 _SELECT_LOWERING_PATH = Path("include/pto/npu/a2a3/TSel.hpp")
+_UNARY_LOWERING_PATH = Path("include/pto/npu/a2a3/TUnaryOp.hpp")
 _REQUIRED_PATHS = (
     _FORMULA_RELATIVE_PATH,
     _ARCH_RELATIVE_PATH,
@@ -57,7 +58,22 @@ _REQUIRED_PATHS = (
     _COMPARE_LOWERING_PATH,
     _DIV_LOWERING_PATH,
     _SELECT_LOWERING_PATH,
+    _UNARY_LOWERING_PATH,
 )
+
+# Perf-Sim 1216c55831fcc4ed2f096e4ca582ff75a633fbb6 records the
+# high-precision fp32 1x8 TRSQRT signature at 53 cycles on both AIV lanes in
+# three deterministic launches.  The implementation and calibrated CCE model
+# sources below are byte-identical at that revision and the current corpus pin
+# a8040450238f162985d8b596fbebeb54bfba2bf5.  Keep this deliberately narrow:
+# other shapes and operand contracts still fail closed.
+_HIGH_PRECISION_TRSQRT_1X8_CYCLES = 53.0
+_HIGH_PRECISION_TRSQRT_SOURCE_HASHES = {
+    _UNARY_LOWERING_PATH.as_posix(): "77732c7ff3cb3a7f64f8295efd98d9fe1176910a9d1b53288fcaf7fff9ded985",
+    _CCE_VECTOR_COMPUTE_RELATIVE_PATH.as_posix(): (
+        "3cc8b0337a0c1dc320db7689137b0d92f9640a9d45ee92c953fdcc5cb7e37e93"
+    ),
+}
 
 _FORMULA_OPCODE = {
     "pto.tsub": "TSUB",
@@ -279,7 +295,7 @@ class PtoIsaDurationProvider:
     source_sha256: dict[str, str]
     unsupported_policy: str = "error"
     fallback_cycles: float = 1.0
-    provider_version: str = "pto_isa_a2a3_v2"
+    provider_version: str = "pto_isa_a2a3_v3"
 
     @classmethod
     def from_checkout(
@@ -335,6 +351,7 @@ class PtoIsaDurationProvider:
         if value.get("schema_version") != 1 or provider_version not in {
             "pto_isa_a2a3_v1",
             "pto_isa_a2a3_v2",
+            "pto_isa_a2a3_v3",
         }:
             raise ValueError("unsupported PTO-ISA duration-provider schema")
         parameters = value.get("formula_parameters")
@@ -786,10 +803,35 @@ class PtoIsaDurationProvider:
                 else []
             )
             if high_precision_tiles:
-                return self._unsupported(
-                    op_name,
-                    "high-precision TRSQRT requires a composite exact-signature calibration",
+                signature_tile = high_precision_tiles[0]
+                sources_match = all(
+                    self.source_sha256.get(path) == digest
+                    for path, digest in _HIGH_PRECISION_TRSQRT_SOURCE_HASHES.items()
                 )
+                if (
+                    len(high_precision_tiles) == 3
+                    and all(tile == signature_tile for tile in high_precision_tiles[1:])
+                    and signature_tile.scope == "vec"
+                    and signature_tile.dtype == "fp32"
+                    and (signature_tile.rows, signature_tile.cols) == (1, 8)
+                    and sources_match
+                ):
+                    return DurationEstimate(
+                        _HIGH_PRECISION_TRSQRT_1X8_CYCLES,
+                        "pto_isa_perf_sim_exact_signature",
+                        "TRSQRT:high_precision:fp32:1x8; three matching vector tiles; "
+                        "Perf-Sim 1216c55831fcc4ed2f096e4ca582ff75a633fbb6; "
+                        "2 lanes x 3 launches all 53 cycles; implementation/model sources "
+                        "byte-identical at corpus pin a8040450238f162985d8b596fbebeb54bfba2bf5",
+                        "calibrated_signature",
+                    )
+                reason = (
+                    "high-precision TRSQRT exact calibration is limited to three matching "
+                    "fp32 vector tiles of shape 1x8"
+                    if sources_match
+                    else "high-precision TRSQRT calibration source hashes do not match"
+                )
+                return self._unsupported(op_name, reason)
             if len(result_tiles) != 1 or len(operand_tiles) != 1:
                 return self._unsupported(op_name, "unrecognized TRSQRT operand contract")
             if work_tile.scope != "vec" or work_tile.dtype != "fp32":

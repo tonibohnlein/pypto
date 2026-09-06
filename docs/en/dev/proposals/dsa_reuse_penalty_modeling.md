@@ -978,6 +978,15 @@ without the new catalog must be re-exported rather than patched by guessing a
 numbering offset. Missing or ambiguous joins, incomplete graph provenance, and
 operation-identity mismatches fail closed.
 
+A source access is not required to lower to exactly one PTOAS node. The bridge
+groups nodes by stable source-access identity, then joins executable operations
+one-to-one by operation name and occurrence. This preserves branch-specific
+multi-operation lowerings such as `tmatmul` plus `tmatmul.acc`. Extra
+`treshape` nodes are accepted only as metadata-only tile views, assigned zero
+cycles, and excluded as reuse-edge endpoints. Any other unmatched lowered
+operation remains an error; copying one source duration to every lowered node
+would double-count execution.
+
 Terminal frontiers retain outstanding accesses on each pipe and control path,
 not just the last lexical statement. Absent source accesses may be classified
 as nonmaterialized only after a complete raw-PTO join. Same-pipe reuse is recorded as already ordered rather than
@@ -992,6 +1001,11 @@ TDIVS formula for `trecip` at an unmeasured shape is explicitly a shape
 approximation, not an exact calibrated signature. This uses the pinned
 `TRECIP -> TDIVS(dst, 1, src)` lowering and preserves `precisionType` so that
 non-default reciprocal modes fail closed.
+High-precision `trsqrt` is similarly narrow: only the three-matching-tile
+`fp32`, `1x8` vector signature is admitted at 53 cycles. That value reproduced
+on both Perf-Sim AIV lanes over three launches, and is accepted only when the
+unary lowering and calibrated CCE model source hashes match the pinned
+evidence. Other shapes and contracts fail closed.
 Nonnegative rounded durations, including zero, are permitted; negative,
 nonfinite, or unsupported fallback durations are refused.
 
@@ -1007,6 +1021,27 @@ Python contracts against archived graphs without compiling or reading timing
 tables. Its results explicitly do not validate modified C++ or count complete
 invocation scores. The local validation build was stopped at an enforced
 3 GiB/no-swap ceiling; the eight-workload complete-score gate remains open.
+
+### Exact lowering and `trsqrt` rerun
+
+The September 2026 host-only rerun applies the operation-aware lowering join
+and the pinned `trsqrt(fp32, 1x8)` duration to the same frozen maps before
+opening their existing timing labels. Model eligibility rises from 60 to 83 of
+92 unique map/function units: 14 units are recovered by the `trsqrt` duration
+and nine by the one-source-to-many-lowered-node contract. The remaining nine
+are three missing `tcmp` durations, three missing `tpush` graph joins, and three
+official-v0.57 import failures.
+
+This fixes coverage, not discrimination. All five confirmed DSA-RP-over-Cypress
+cells are now model-eligible, but the complete-placement score explains only
+three. Both `mtp_hidden_norm_quant` cells remain exact model ties at every
+global synchronization weight from 8 through 256 cycles, despite measured
+DSA-RP wins of 9.62%/7.19% at half and 12.10%/7.89% at native. Their Cypress
+and DSA-RP reuse edges are present but remain off the modeled critical path.
+Consequently this rerun is evidence against treating missing duration or
+lowering coverage as the explanation for those two effects; it does not admit
+the incremental planner. The compact frozen result is
+[`data/dsa_complete_placement_rerun_v8.json`](data/dsa_complete_placement_rerun_v8.json).
 
 ## Remaining validation
 

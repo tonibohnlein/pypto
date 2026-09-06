@@ -5922,6 +5922,18 @@ def test_emit_ptoas_reuse_edges_rejects_missing_access_join(tmp_path, monkeypatc
         )
 
 
+def test_legacy_ptoas_reuse_edge_export_rejects_one_to_many_access_join(tmp_path):
+    graph = tmp_path / "graph.txt"
+    graph.write_text(
+        "KernelScheduleGraph @kernel nodes=2 dag_edges=0 dependencies=0\n"
+        "  node[0] op=pto.treshape pypto_access_order=3\n"
+        "  node[1] op=pto.tsort32 pypto_access_order=3\n"
+    )
+
+    with pytest.raises(ValueError, match="access 3 maps to multiple PTOAS nodes"):
+        dsa_schedule_model._load_ptoas_access_node_map(graph, function="kernel")
+
+
 def test_build_reuse_topology_does_not_require_operation_durations(tmp_path):
     record = _record()
     record["nodes"][0] = _with_access(record["nodes"][0], 3)
@@ -6306,6 +6318,89 @@ def test_emit_ptoas_node_durations_binds_graph_and_access_identity(tmp_path):
     assert [row["cycles"] for row in result["nodes"]] == [10, 10, 10, 10]
     assert [row["pypto_access_order"] for row in result["nodes"]] == access_orders
     assert {row["evidence_class"] for row in result["nodes"]} == {"calibrated_operation_family"}
+
+
+def test_ptoas_join_handles_metadata_views_and_multiple_real_lowerings(tmp_path):
+    record = _record()
+    operations = (
+        (0, 39, "PIPE_V", "pto.tsort32"),
+        (1, 40, "PIPE_M", "pto.tmatmul"),
+        (2, 40, "PIPE_M", "pto.tmatmul.acc"),
+        (3, 41, "PIPE_MTE2", "pto.tload"),
+    )
+    for index, access, pipe, op_name in operations:
+        record["nodes"][index] = _with_access(record["nodes"][index], access)
+        record["nodes"][index]["pipe"] = pipe
+        record["nodes"][index]["op_name"] = op_name
+    graph = tmp_path / "graph.txt"
+    graph.write_text(
+        "KernelScheduleGraph @kernel nodes=7 dag_edges=2 dependencies=2\n"
+        "  node[0] op=pto.treshape pipe=PIPE_S pypto_access_order=39\n"
+        "  node[1] op=pto.treshape pipe=PIPE_S pypto_access_order=39\n"
+        "  node[2] op=pto.treshape pipe=PIPE_S pypto_access_order=39\n"
+        "  node[3] op=pto.tsort32 pipe=PIPE_V pypto_access_order=39\n"
+        "  node[4] op=pto.tmatmul pipe=PIPE_M pypto_access_order=40\n"
+        "  node[5] op=pto.tmatmul.acc pipe=PIPE_M pypto_access_order=40\n"
+        "  node[6] op=pto.tload pipe=PIPE_MTE2 pypto_access_order=41\n"
+    )
+
+    joined, shape = dsa_schedule_model._validated_ptoas_access_node_map(record, graph, function="kernel")
+    model = _ten_cycle_model()
+    model.operation_cycles.update(
+        {
+            "PIPE_V:TSORT32": 10.0,
+            "PIPE_M:TMATMUL": 10.0,
+            "PIPE_M:TMATMUL_ACC": 10.0,
+        }
+    )
+    result = dsa_schedule_model.emit_ptoas_resolved_node_durations(record, model, graph)
+
+    assert joined == {0: 3, 1: 4, 2: 5, 3: 6}
+    assert shape["node_count"] == 7
+    assert [row["cycles"] for row in result["nodes"]] == [0, 0, 0, 10, 10, 10, 10]
+    assert {row["evidence_class"] for row in result["nodes"][:3]} == {"lowering_metadata_zero_cost"}
+    assert {row["evidence_class"] for row in result["nodes"][3:]} == {"calibrated_operation_family"}
+
+
+def test_ptoas_join_rejects_unmatched_executable_lowering(tmp_path):
+    record = _record()
+    for index, access in enumerate((3, 7, 9, 11)):
+        record["nodes"][index] = _with_access(record["nodes"][index], access)
+    graph = tmp_path / "graph.txt"
+    graph.write_text(
+        "KernelScheduleGraph @kernel nodes=5 dag_edges=0 dependencies=0\n"
+        "  node[0] op=pto.tadd pipe=PIPE_V pypto_access_order=3\n"
+        "  node[1] op=pto.tload pipe=PIPE_MTE2 pypto_access_order=7\n"
+        "  node[2] op=pto.tmuls pipe=PIPE_V pypto_access_order=9\n"
+        "  node[3] op=pto.tload pipe=PIPE_MTE2 pypto_access_order=11\n"
+        "  node[4] op=pto.tadd pipe=PIPE_V pypto_access_order=3\n"
+    )
+
+    with pytest.raises(ValueError, match="unmatched executable lowered operations"):
+        dsa_schedule_model._validated_ptoas_access_node_map(record, graph, function="kernel")
+
+
+def test_allocation_access_retains_branch_specific_lowered_operations():
+    buffer = {"id": 4, "live_intervals": [{"lower": 3, "upper": 12}]}
+    then_node = _with_access(_operation(1, "PIPE_M", "pto.tmatmul"), 40)
+    then_node["branch_stack"] = [10]
+    then_node["defs"], then_node["uses"] = [{"root": "%then", "scope": "LEFT"}], []
+    else_node = _with_access(_operation(2, "PIPE_M", "pto.tmatmul.acc"), 40)
+    else_node["branch_stack"] = [11]
+    else_node["defs"], else_node["uses"] = [{"root": "%else", "scope": "LEFT"}], []
+
+    accesses = dsa_schedule_model._allocation_lowered_accesses(
+        buffer,
+        3,
+        {40: (then_node, else_node)},
+        source_accesses=[{"order": 40, "mode": "write", "pool": 3}],
+        complete_access_provenance=True,
+        ptoas_nodes_by_schedule={1: 7, 2: 8},
+    )
+
+    assert [access["node"]["id"] for access in accesses] == [1, 2]
+    assert [access["ptoas_node"] for access in accesses] == [7, 8]
+    assert [access["node"]["branch_stack"] for access in accesses] == [[10], [11]]
 
 
 def test_emit_ptoas_node_durations_rejects_operation_mismatch(tmp_path):

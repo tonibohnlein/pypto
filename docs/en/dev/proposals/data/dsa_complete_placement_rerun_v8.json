@@ -1,0 +1,77 @@
+{
+  "analysis_role": "retrospective_host_only_complete_placement_prediction",
+  "analysis_source_sha256": {
+    "PTOAS/lib/PTO/Transforms/KernelScheduling/KernelScheduleGraph.cpp": "da480caec72f93d7f3bb091b8bed432c0209ff79a584cb843de537b98777a14d",
+    "python/pypto/tools/dsa_pto_isa_duration.py": "ff144cf3c05a99eb3e5d4e600ce55b4e4492a0f336c84d23c5222e2645730803",
+    "python/pypto/tools/dsa_schedule_model.py": "d8d1443193a64c46ec147752276fc489807d6ad7b26ece0de926976b81059b09"
+  },
+  "date": "2026-09-06",
+  "duration_evidence": {
+    "trsqrt_fp32_1x8_cycles": 53,
+    "trsqrt_nodes_admitted": 14,
+    "trsqrt_perf_sim_revision": "1216c55831fcc4ed2f096e4ca582ff75a633fbb6",
+    "trsqrt_repetitions": "2 AIV lanes x 3 launches",
+    "trsqrt_source_revision": "a8040450238f162985d8b596fbebeb54bfba2bf5"
+  },
+  "evaluation": {
+    "confirmed_dsa_rp_cypress_wins": 5,
+    "confirmed_wins_explained_at_32_cycles": 3,
+    "confirmed_wins_model_eligible": 5,
+    "deterministic_measured_cells": 28,
+    "model_eligible_deterministic_cells": 25,
+    "mtp_hidden_norm_quant_half": {
+      "cypress_penalty_cycles": 0,
+      "device_dsa_rp_vs_cypress_percent": [
+        9.62,
+        7.19
+      ],
+      "dsa_rp_penalty_cycles": 0,
+      "result": "MODEL_TIE"
+    },
+    "mtp_hidden_norm_quant_native": {
+      "cypress_penalty_cycles": 0,
+      "device_dsa_rp_vs_cypress_percent": [
+        12.1,
+        7.89
+      ],
+      "dsa_rp_penalty_cycles": 0,
+      "result": "MODEL_TIE"
+    }
+  },
+  "input_pins": {
+    "dsa_solver": "60ac39b02b008dc3907b876ad47a1cc342aa01fa",
+    "product_ptoas": "v0.57:4858c837e12b1b588f281207c95916dc20968a7cdc656aadd549a87658a06692",
+    "pto_isa": "a8040450238f162985d8b596fbebeb54bfba2bf5",
+    "pypto": "3eabcfd22894151cbda6c752dcb300708a34f28d",
+    "pypto_lib": "83e19f6b06eb2125eb14c06232358f342941c8d5",
+    "runtime": "4e4d3a4ad1e54c1db3d50e72decc025a9075bfa0"
+  },
+  "model_status": {
+    "after_repairs": {
+      "eligible": 83,
+      "ineligible": 9
+    },
+    "before_repairs": {
+      "eligible": 60,
+      "ineligible": 32
+    },
+    "newly_admitted_many_lowering_units": 9,
+    "newly_admitted_trsqrt_units": 14,
+    "unique_map_function_units": 92
+  },
+  "prediction_sha256": "7b2d73417b3adc08eb824c665e833a00cf74c8bb304e0f8e7de4ec659cd0968d",
+  "research_ptoas_base": "9d72b90ff49f67749ede982b21b30d98508028fb",
+  "research_ptoas_model_commit": "062d4b16f27f7a6baef91b5d6cfdcf6fe5f2f26f",
+  "remaining_ineligible": {
+    "official_v057_import_failure": 3,
+    "tcmp_duration_missing": 3,
+    "tpush_lowering_join_missing": 3
+  },
+  "result": "COVERAGE_REPAIRED_MODEL_DISCRIMINATION_UNCHANGED",
+  "schema_version": 1,
+  "tests": {
+    "ptoas_schedule_graph_unit": "PASS",
+    "pypto_focused": "243 passed",
+    "ruff": "PASS"
+  }
+}

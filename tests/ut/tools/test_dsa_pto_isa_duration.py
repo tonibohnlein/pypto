@@ -70,6 +70,21 @@ def _node(op_name: str, pipe: str, *operand_types: str) -> dict:
     }
 
 
+def _provider_with_high_precision_trsqrt_evidence() -> dsa_pto_isa_duration.PtoIsaDurationProvider:
+    provider = _provider()
+    provider.source_sha256.update(
+        {
+            "include/pto/npu/a2a3/TUnaryOp.hpp": (
+                "77732c7ff3cb3a7f64f8295efd98d9fe1176910a9d1b53288fcaf7fff9ded985"
+            ),
+            "include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compute.hpp": (
+                "3cc8b0337a0c1dc320db7689137b0d92f9640a9d45ee92c953fdcc5cb7e37e93"
+            ),
+        }
+    )
+    return provider
+
+
 def test_formula_and_any_dtype_lookup_match_pto_isa_rounding():
     provider = _provider()
     mul = provider.estimate(
@@ -488,21 +503,26 @@ def test_basic_trsqrt_fails_closed_without_pinned_cce_source():
         provider.estimate(node, work_bytes=512)
 
 
-def test_high_precision_trsqrt_requires_composite_exact_signature():
+def test_high_precision_trsqrt_uses_evidence_backed_exact_signature():
     tile = "!pto.tile_buf<vec, 1x8xf32>"
     node = _node("pto.trsqrt", "PIPE_V", tile, tile)
     node["operation"]["result_types"] = [tile]
 
-    with pytest.raises(ValueError, match="requires a composite exact-signature calibration"):
-        _provider().estimate(node, work_bytes=32)
+    estimate = _provider_with_high_precision_trsqrt_evidence().estimate(node, work_bytes=32)
+
+    assert estimate.cycles == 53
+    assert estimate.source == "pto_isa_perf_sim_exact_signature"
+    assert estimate.evidence_class == "calibrated_signature"
+    assert estimate.fallback is False
 
 
-def test_high_precision_trsqrt_native_dps_spelling_requires_composite_exact_signature():
+def test_high_precision_trsqrt_native_dps_spelling_uses_same_exact_signature():
     tile = "!pto.tile_buf<vec, 1x8xf32>"
     node = _node("pto.trsqrt", "PIPE_V", tile, tile, tile)
 
-    with pytest.raises(ValueError, match="requires a composite exact-signature calibration"):
-        _provider().estimate(node, work_bytes=32)
+    estimate = _provider_with_high_precision_trsqrt_evidence().estimate(node, work_bytes=32)
+
+    assert estimate.cycles == 53
 
 
 def test_unmeasured_high_precision_trsqrt_shape_fails_closed():
@@ -510,8 +530,17 @@ def test_unmeasured_high_precision_trsqrt_shape_fails_closed():
     node = _node("pto.trsqrt", "PIPE_V", tile, tile)
     node["operation"]["result_types"] = [tile]
 
-    with pytest.raises(ValueError, match="requires a composite exact-signature calibration"):
-        _provider().estimate(node, work_bytes=512)
+    with pytest.raises(ValueError, match="exact calibration is limited"):
+        _provider_with_high_precision_trsqrt_evidence().estimate(node, work_bytes=512)
+
+
+def test_high_precision_trsqrt_fails_closed_when_calibrated_sources_differ():
+    tile = "!pto.tile_buf<vec, 1x8xf32>"
+    node = _node("pto.trsqrt", "PIPE_V", tile, tile)
+    node["operation"]["result_types"] = [tile]
+
+    with pytest.raises(ValueError, match="calibration source hashes do not match"):
+        _provider().estimate(node, work_bytes=32)
 
 
 def test_legacy_provider_snapshot_cannot_claim_unpinned_trsqrt_support():

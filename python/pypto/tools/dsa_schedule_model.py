@@ -5891,6 +5891,7 @@ _PTOAS_GRAPH_ACCESS_NODE_RE = re.compile(r"^\s*node\[(?P<node>\d+)\].*\bpypto_ac
 _PTOAS_GRAPH_NODE_RE = re.compile(
     r"^\s*node\[(?P<node>\d+)\] op=(?P<op>\S+).*\bpypto_access_order=(?P<access>\d+)\b"
 )
+_PTOAS_ZERO_DURATION_AUXILIARY_OPS = {"pto.treshape"}
 
 
 def _load_ptoas_access_node_map(path: str | Path, *, function: str) -> dict[int, int]:
@@ -5919,9 +5920,16 @@ def _load_ptoas_access_node_map(path: str | Path, *, function: str) -> dict[int,
 def _validated_ptoas_access_node_map(
     record: Mapping[str, Any], path: str | Path, *, function: str
 ) -> tuple[dict[int, int], dict[str, int]]:
-    """Bind every schedule operation to an operation-identical PTOAS node."""
+    """Bind each schedule node to one operation-identical PTOAS node.
+
+    One source access may lower to several real operations, including
+    branch-specific operations, and to metadata-only ``treshape`` nodes.  Real
+    operations are joined one-to-one by access, operation name, and stable
+    occurrence order.  The metadata-only nodes remain in the PTOAS DAG but do
+    not consume a source operation or duration.
+    """
     ptoas_nodes, graph_shape = _load_ptoas_graph_nodes(path, function=function)
-    schedule_nodes: dict[int, str] = {}
+    schedule_nodes: dict[int, list[tuple[int, str]]] = defaultdict(list)
     for node in record.get("nodes", []):
         if not isinstance(node, Mapping) or node.get("kind") != "operation":
             continue
@@ -5929,25 +5937,42 @@ def _validated_ptoas_access_node_map(
         access = _node_access_order(node)
         if not isinstance(op_name, str) or access is None:
             raise ValueError("every schedule operation needs op_name and pypto_access_order")
-        if access in schedule_nodes:
-            raise ValueError(f"pypto access {access} maps to multiple schedule operations")
-        schedule_nodes[access] = op_name
+        schedule_nodes[access].append((int(node["id"]), op_name))
 
-    graph_accesses: dict[int, int] = {}
-    for ptoas_node, (access, ptoas_op) in ptoas_nodes.items():
-        schedule_op = schedule_nodes.get(access)
-        if schedule_op is None:
-            raise ValueError(f"PTOAS node {ptoas_node} access {access} has no schedule operation")
-        if schedule_op != ptoas_op:
-            raise ValueError(
-                f"PTOAS node {ptoas_node} operation differs at access {access}: "
-                f"{ptoas_op!r} != {schedule_op!r}"
+    graph_nodes: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    for ptoas_node, (access, ptoas_op) in sorted(ptoas_nodes.items()):
+        graph_nodes[access].append((ptoas_node, ptoas_op))
+
+    joined: dict[int, int] = {}
+    for access in sorted(set(schedule_nodes) | set(graph_nodes)):
+        source_rows = schedule_nodes.get(access, [])
+        lowered_rows = graph_nodes.get(access, [])
+        if not source_rows:
+            raise ValueError(f"PTOAS access {access} has no schedule operation")
+        unused = set(range(len(lowered_rows)))
+        for schedule_node, schedule_op in source_rows:
+            match = next(
+                (index for index in sorted(unused) if lowered_rows[index][1] == schedule_op),
+                None,
             )
-        graph_accesses[access] = ptoas_node
-    missing = sorted(set(schedule_nodes) - set(graph_accesses))
-    if missing:
-        raise ValueError(f"schedule operations are absent from the PTOAS graph: accesses={missing[:8]}")
-    return graph_accesses, graph_shape
+            if match is None:
+                lowered_ops = [lowered_rows[index][1] for index in sorted(unused)]
+                raise ValueError(
+                    f"operation differs or is absent at access {access}: schedule node "
+                    f"{schedule_node} operation {schedule_op!r} not in PTOAS {lowered_ops!r}"
+                )
+            joined[schedule_node] = lowered_rows[match][0]
+            unused.remove(match)
+        unexpected = [
+            lowered_rows[index]
+            for index in sorted(unused)
+            if lowered_rows[index][1] not in _PTOAS_ZERO_DURATION_AUXILIARY_OPS
+        ]
+        if unexpected:
+            raise ValueError(
+                f"PTOAS access {access} has unmatched executable lowered operations: {unexpected!r}"
+            )
+    return joined, graph_shape
 
 
 def _decode_dsa_execution_lifetime(buffer: Mapping[str, Any]) -> tuple[int, int, bool]:
@@ -5979,21 +6004,19 @@ def _decode_dsa_execution_lifetime(buffer: Mapping[str, Any]) -> tuple[int, int,
     return definition, final_access, read_before_write_boundary
 
 
-def _schedule_operations_by_access(record: Mapping[str, Any]) -> dict[int, Mapping[str, Any]]:
-    """Index every lowered operation by its stable PyPTO access order."""
-    operations: dict[int, Mapping[str, Any]] = {}
+def _schedule_operations_by_access(record: Mapping[str, Any]) -> dict[int, tuple[Mapping[str, Any], ...]]:
+    """Index every lowered operation group by its stable PyPTO access order."""
+    operations: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
     for node in record.get("nodes", []):
         if not isinstance(node, Mapping) or node.get("kind") != "operation":
             continue
         access = _node_access_order(node)
         if access is None:
             raise ValueError(f"schedule operation {node.get('id')} has no pypto_access_order")
-        if access in operations:
-            raise ValueError(f"pypto access {access} maps to multiple schedule operations")
-        operations[access] = node
+        operations[access].append(node)
     if not operations:
         raise ValueError("schedule record has no operation access provenance")
-    return operations
+    return {access: tuple(nodes) for access, nodes in operations.items()}
 
 
 def _common_loop_prefix(first: Mapping[str, Any], second: Mapping[str, Any]) -> tuple[int, ...]:
@@ -6067,10 +6090,11 @@ def _canonical_dsa_scope(scope: Any) -> Any:
 def _allocation_lowered_accesses(  # noqa: PLR0912 - explicit fail-closed provenance cases
     buffer: Mapping[str, Any],
     pool: int,
-    operations: Mapping[int, Mapping[str, Any]],
+    operations: Mapping[int, Mapping[str, Any] | Sequence[Mapping[str, Any]]],
     *,
     source_accesses: Sequence[Mapping[str, Any]],
     complete_access_provenance: bool,
+    ptoas_nodes_by_schedule: Mapping[int, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Bind an allocation at its definition, then retain its lowered accesses.
 
@@ -6095,16 +6119,18 @@ def _allocation_lowered_accesses(  # noqa: PLR0912 - explicit fail-closed proven
     for source in source_accesses:
         if source.get("mode") != "write" or source.get("order") not in operations:
             continue
-        node = operations[source["order"]]
-        written = {
-            item.get("root")
-            for item in node.get("defs", [])
-            if isinstance(item, Mapping)
-            and _canonical_dsa_scope(item.get("scope")) == scope
-            and isinstance(item.get("root"), str)
-        }
-        if len(written) == 1:
-            allocation_roots.update(written)
+        raw_nodes = operations[source["order"]]
+        nodes = (raw_nodes,) if isinstance(raw_nodes, Mapping) else tuple(raw_nodes)
+        for node in nodes:
+            written = {
+                item.get("root")
+                for item in node.get("defs", [])
+                if isinstance(item, Mapping)
+                and _canonical_dsa_scope(item.get("scope")) == scope
+                and isinstance(item.get("root"), str)
+            }
+            if len(written) == 1:
+                allocation_roots.update(written)
     result: list[dict[str, Any]] = []
     for source in source_accesses:
         access, mode = source.get("order"), source.get("mode")
@@ -6112,45 +6138,68 @@ def _allocation_lowered_accesses(  # noqa: PLR0912 - explicit fail-closed proven
             raise ValueError(f"buffer {buffer['id']} has a malformed source access")
         if source.get("pool") != pool:
             raise ValueError(f"buffer {buffer['id']} source access {access} has the wrong pool")
-        node = operations.get(access)
-        if node is None:
+        raw_nodes = operations.get(access)
+        if raw_nodes is None:
             if complete_access_provenance:
                 continue
             raise ValueError(f"buffer {buffer['id']} access {access} is not proven nonmaterialized")
+        nodes = (raw_nodes,) if isinstance(raw_nodes, Mapping) else tuple(raw_nodes)
         field = "defs" if mode == "write" else "uses"
-        preferred = [
-            item
-            for item in node.get(field, [])
-            if isinstance(item, Mapping) and _canonical_dsa_scope(item.get("scope")) == scope
-        ]
-        all_matches = [
-            item
-            for candidate_field in ("uses", "defs")
-            for item in node.get(candidate_field, [])
-            if isinstance(item, Mapping) and _canonical_dsa_scope(item.get("scope")) == scope
-        ]
-        if not all_matches:
+        matched_node = False
+        for node in nodes:
+            preferred = [
+                item
+                for item in node.get(field, [])
+                if isinstance(item, Mapping) and _canonical_dsa_scope(item.get("scope")) == scope
+            ]
+            all_matches = [
+                item
+                for candidate_field in ("uses", "defs")
+                for item in node.get(candidate_field, [])
+                if isinstance(item, Mapping) and _canonical_dsa_scope(item.get("scope")) == scope
+            ]
+            if not all_matches:
+                continue
+            matches = [item for item in preferred if item.get("root") in allocation_roots]
+            if not matches:
+                matches = [item for item in all_matches if item.get("root") in allocation_roots]
+            if not matches and len(preferred) == 1:
+                matches = preferred
+            if not matches and len(all_matches) == 1:
+                matches = all_matches
+            roots = {item.get("root") for item in matches if isinstance(item.get("root"), str)}
+            if len(roots) == 1:
+                root = next(iter(roots))
+            else:
+                # The topology consumer needs the operation endpoint, not a
+                # lowered operand number. Keep the ambiguity explicit instead
+                # of choosing one same-pool root and silently dropping it.
+                root = f"source-buffer:{buffer['id']}"
+                matches = all_matches
+            if any(item.get("aliases_unknown_range") for item in matches):
+                if source.get("range_known") is not True:
+                    raise ValueError(f"buffer {buffer['id']} access {access} has unknown root aliasing")
+            node_id = node.get("id")
+            if not isinstance(node_id, int):
+                raise ValueError(f"buffer {buffer['id']} access {access} has a node without integer id")
+            lowered = {
+                **source,
+                "access": access,
+                "mode": mode,
+                "root": root,
+                "field": field,
+                "node": node,
+            }
+            if ptoas_nodes_by_schedule is not None:
+                if node_id not in ptoas_nodes_by_schedule:
+                    raise ValueError(
+                        f"buffer {buffer['id']} access {access} schedule node {node_id} has no PTOAS node"
+                    )
+                lowered["ptoas_node"] = ptoas_nodes_by_schedule[node_id]
+            result.append(lowered)
+            matched_node = True
+        if not matched_node:
             raise ValueError(f"buffer {buffer['id']} access {access} has no {scope} memory operand")
-        matches = [item for item in preferred if item.get("root") in allocation_roots]
-        if not matches:
-            matches = [item for item in all_matches if item.get("root") in allocation_roots]
-        if not matches and len(preferred) == 1:
-            matches = preferred
-        if not matches and len(all_matches) == 1:
-            matches = all_matches
-        roots = {item.get("root") for item in matches if isinstance(item.get("root"), str)}
-        if len(roots) == 1:
-            root = next(iter(roots))
-        else:
-            # The topology consumer needs the operation endpoint, not a
-            # lowered operand number. Keep the ambiguity explicit instead of
-            # choosing one same-pool root and silently dropping the access.
-            root = f"source-buffer:{buffer['id']}"
-            matches = all_matches
-        if any(item.get("aliases_unknown_range") for item in matches):
-            if source.get("range_known") is not True:
-                raise ValueError(f"buffer {buffer['id']} access {access} has unknown root aliasing")
-        result.append({"access": access, "mode": mode, "root": root, "field": field, "node": node})
     return result
 
 
@@ -6169,12 +6218,20 @@ def _allocation_access_frontier(
             tuple(node.get("branch_stack", [])),
             access["mode"],
         )
+        position = (int(access["access"]), int(node.get("id", -1)))
         previous = frontier.get(key)
-        if previous is None or (
-            access["access"] > previous["access"] if terminal else access["access"] < previous["access"]
+        previous_node = previous["node"] if previous is not None else {}
+        previous_position = (
+            (int(previous["access"]), int(previous_node.get("id", -1))) if previous is not None else None
+        )
+        if previous_position is None or (
+            position > previous_position if terminal else position < previous_position
         ):
             frontier[key] = access
-    return sorted(frontier.values(), key=lambda item: (item["access"], item["mode"]))
+    return sorted(
+        frontier.values(),
+        key=lambda item: (item["access"], item["node"].get("id", -1), item["mode"]),
+    )
 
 
 def _realized_physical_reuse_pairs(
@@ -6270,7 +6327,7 @@ def _emit_complete_placement_reuse_topology(
         raise ValueError(f"problem instance {problem.get('instance')!r} does not match function {function!r}")
     realized_pairs = _realized_physical_reuse_pairs(problem, solution)
     schedule_by_access = _schedule_operations_by_access(record)
-    ptoas_by_access, _ = _validated_ptoas_access_node_map(record, ptoas_graph_path, function=function)
+    ptoas_by_schedule, _ = _validated_ptoas_access_node_map(record, ptoas_graph_path, function=function)
     _, branch_markers = _branch_alternatives(record)
     buffers = _index_problem_buffers(problem["problem"]["buffers"])
     placements = _index_solution_placements(solution["placements"])
@@ -6285,6 +6342,7 @@ def _emit_complete_placement_reuse_topology(
             schedule_by_access,
             source_accesses=source_accesses[buffer_id],
             complete_access_provenance=_schedule_proves_complete_access_provenance(record),
+            ptoas_nodes_by_schedule=ptoas_by_schedule,
         )
         for buffer_id in involved_buffers
     }
@@ -6304,10 +6362,10 @@ def _emit_complete_placement_reuse_topology(
         prior_access, next_access = int(prior["access"]), int(following["access"])
         if prior["mode"] == following["mode"] == "read":
             return
-        source_schedule = schedule_by_access.get(prior_access)
-        target_schedule = schedule_by_access.get(next_access)
-        source_node, target_node = ptoas_by_access.get(prior_access), ptoas_by_access.get(next_access)
-        if source_schedule is None or target_schedule is None or source_node is None or target_node is None:
+        source_schedule = prior["node"]
+        target_schedule = following["node"]
+        source_node, target_node = prior.get("ptoas_node"), following.get("ptoas_node")
+        if not isinstance(source_node, int) or not isinstance(target_node, int):
             raise ValueError(
                 f"realized reuse pair {(pair['first_buffer'], pair['second_buffer'])} cannot join "
                 f"lifetime access orders {prior_access}->{next_access} to both schedule graphs"
@@ -6436,7 +6494,6 @@ def _load_ptoas_graph_nodes(
     source = Path(path)
     header: dict[str, int] | None = None
     nodes: dict[int, tuple[int, str]] = {}
-    accesses: set[int] = set()
     for line in source.read_text().splitlines():
         if match := _PTOAS_GRAPH_HEADER_RE.match(line):
             if header is not None:
@@ -6455,10 +6512,7 @@ def _load_ptoas_graph_nodes(
             node, access = int(match["node"]), int(match["access"])
             if node in nodes:
                 raise ValueError(f"{source}: PTOAS node {node} is repeated")
-            if access in accesses:
-                raise ValueError(f"{source}: pypto access {access} maps to multiple PTOAS nodes")
             nodes[node] = (access, match["op"])
-            accesses.add(access)
     if header is None:
         raise ValueError(f"{source}: missing KernelScheduleGraph header for {function!r}")
     if len(nodes) != header["node_count"]:
@@ -6502,42 +6556,49 @@ def emit_ptoas_resolved_node_durations(
         access = _node_access_order(node)
         if not isinstance(node_id, int) or not isinstance(op_name, str) or access is None:
             raise ValueError("every schedule operation needs id, op_name, and pypto_access_order")
-        if access in schedule_nodes:
-            raise ValueError(f"pypto access {access} maps to multiple schedule operations")
-        schedule_nodes[access] = (node_id, op_name)
+        schedule_nodes[node_id] = (access, op_name)
 
-    graph_accesses = {access for access, _ in ptoas_nodes.values()}
+    schedule_to_ptoas, _ = _validated_ptoas_access_node_map(record, graph_path, function=record_function)
+    ptoas_to_schedule = {ptoas: schedule for schedule, ptoas in schedule_to_ptoas.items()}
     rows: list[dict[str, Any]] = []
     for ptoas_node, (access, ptoas_op) in sorted(ptoas_nodes.items()):
-        schedule_node = schedule_nodes.get(access)
-        if schedule_node is None:
-            raise ValueError(f"PTOAS node {ptoas_node} access {access} has no schedule operation")
-        schedule_node_id, schedule_op = schedule_node
-        if schedule_op != ptoas_op:
-            raise ValueError(
-                f"PTOAS node {ptoas_node} operation differs at access {access}: "
-                f"{ptoas_op!r} != {schedule_op!r}"
-            )
-        provenance = duration_provenance[schedule_node_id]
-        if provenance.get("fallback") is True:
-            raise ValueError(f"PTOAS node {ptoas_node} duration for {ptoas_op} uses an unsupported fallback")
-        base_cycles = provenance.get("base_cycles")
-        if not isinstance(base_cycles, (int, float)) or not math.isfinite(base_cycles) or base_cycles < 0:
-            raise ValueError(f"PTOAS node {ptoas_node} has invalid base duration {base_cycles!r}")
+        schedule_node_id = ptoas_to_schedule.get(ptoas_node)
+        if schedule_node_id is None:
+            if ptoas_op not in _PTOAS_ZERO_DURATION_AUXILIARY_OPS:
+                raise ValueError(f"PTOAS node {ptoas_node} access {access} has no schedule operation")
+            base_cycles = 0.0
+            source = "ptoas_metadata_only_lowering"
+            detail = f"{ptoas_op} changes only tile view metadata and emits no device instruction"
+            evidence_class = "lowering_metadata_zero_cost"
+        else:
+            schedule_access, schedule_op = schedule_nodes[schedule_node_id]
+            if (schedule_access, schedule_op) != (access, ptoas_op):
+                raise ValueError(
+                    f"PTOAS node {ptoas_node} differs from schedule node {schedule_node_id}: "
+                    f"{(access, ptoas_op)!r} != {(schedule_access, schedule_op)!r}"
+                )
+            provenance = duration_provenance[schedule_node_id]
+            if provenance.get("fallback") is True:
+                raise ValueError(
+                    f"PTOAS node {ptoas_node} duration for {ptoas_op} uses an unsupported fallback"
+                )
+            base_cycles = provenance.get("base_cycles")
+            if not isinstance(base_cycles, (int, float)) or not math.isfinite(base_cycles) or base_cycles < 0:
+                raise ValueError(f"PTOAS node {ptoas_node} has invalid base duration {base_cycles!r}")
+            source = provenance["source"]
+            detail = provenance["detail"]
+            evidence_class = provenance["evidence_class"]
         rows.append(
             {
                 "node_id": ptoas_node,
                 "pypto_access_order": access,
                 "op_name": ptoas_op,
                 "cycles": int(math.floor(float(base_cycles) + 0.5)),
-                "source": provenance["source"],
-                "detail": provenance["detail"],
-                "evidence_class": provenance["evidence_class"],
+                "source": source,
+                "detail": detail,
+                "evidence_class": evidence_class,
             }
         )
-    extra = sorted(set(schedule_nodes) - graph_accesses)
-    if extra:
-        raise ValueError(f"schedule operations are absent from the PTOAS graph: accesses={extra[:8]}")
     return {
         "schema_version": 1,
         "contract": "ptoas_resolved_node_durations_v1",
@@ -7138,7 +7199,7 @@ def _logical_access_range_known(access: Mapping[str, Any]) -> bool:
     )
 
 
-def emit_ptoas_logical_memory_topology(
+def emit_ptoas_logical_memory_topology(  # noqa: PLR0912 - explicit fail-closed provenance cases
     record: Mapping[str, Any],
     problem_path: str | Path,
     ptoas_graph_path: str | Path,
@@ -7160,7 +7221,7 @@ def emit_ptoas_logical_memory_topology(
     problem = json.loads(Path(problem_path).read_text())
     if problem.get("instance") != name:
         raise ValueError("logical-memory function differs from source allocation catalog")
-    by_access, _ = _validated_ptoas_access_node_map(record, ptoas_graph_path, function=name)
+    by_schedule, _ = _validated_ptoas_access_node_map(record, ptoas_graph_path, function=name)
     operations = _schedule_operations_by_access(record)
     buffers = _index_problem_buffers(problem["problem"]["buffers"])
     catalog = _allocation_access_catalog(problem, set(buffers))
@@ -7168,7 +7229,7 @@ def emit_ptoas_logical_memory_topology(
     edges = {}
     conservative_accesses = []
     for allocation, accesses in sorted(catalog.items()):
-        live = []
+        normalized_accesses = []
         for access in accesses:
             range_known = _logical_access_range_known(access)
             if access["order"] not in operations:
@@ -7183,7 +7244,22 @@ def emit_ptoas_logical_memory_topology(
                 # Ordering against the complete allocation is safe and explicitly
                 # conservative; it must not be described as exact range recovery.
                 access = {**access, "offset": 0, "size": buffers[allocation]["size"]}
-            live.append(access)
+            normalized_accesses.append(access)
+        placements = {
+            int(access["pool"]) for access in normalized_accesses if isinstance(access.get("pool"), int)
+        }
+        if len(placements) > 1:
+            raise ValueError(f"logical allocation {allocation} spans multiple memory pools")
+        if not placements:
+            continue
+        live = _allocation_lowered_accesses(
+            buffers[allocation],
+            next(iter(placements)),
+            operations,
+            source_accesses=normalized_accesses,
+            complete_access_provenance=_schedule_proves_complete_access_provenance(record),
+            ptoas_nodes_by_schedule=by_schedule,
+        )
         for source in live:
             for target in live:
                 if source["pool"] != target["pool"] or source["mode"] == target["mode"] == "read":
@@ -7193,7 +7269,7 @@ def emit_ptoas_logical_memory_topology(
                 ):
                     continue
                 a, b = source["order"], target["order"]
-                first, second = operations[a], operations[b]
+                first, second = source["node"], target["node"]
                 common = _common_loop_prefix(first, second)
                 distance = int(a >= b)
                 if distance and not common:
@@ -7207,7 +7283,7 @@ def emit_ptoas_logical_memory_topology(
                 )
                 depths = range(1, len(common) + 1) if distance else (0,)
                 for depth in depths:
-                    key = (by_access[a], by_access[b], kind, distance, depth)
+                    key = (source["ptoas_node"], target["ptoas_node"], kind, distance, depth)
                     edges.setdefault(key, []).append(
                         f"allocation={allocation};accesses={a},{b};pool={source['pool']}"
                     )

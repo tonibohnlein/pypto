@@ -846,6 +846,14 @@ access identity、resource 和 byte range。它不会读取 penalty-candidate ca
 objective 输入，并非物理 reuse 的完整记录。lifetime statement position 与 `pypto.access`
 不是同一坐标系。缺少新 catalog 的旧输入必须重新导出，不能猜测编号偏移。缺失或歧义 join、
 不完整 graph provenance 及 operation identity mismatch 都会 fail closed。
+
+一个 source access 不要求恰好 lowering 到一个 PTOAS node。bridge 先按稳定的 source-access
+identity 分组，再按 operation name 和 occurrence 将 executable operation 一一对应。这样会
+保留 branch-specific multi-operation lowering，例如 `tmatmul` 加 `tmatmul.acc`。额外的
+`treshape` node 仅在它是 metadata-only tile view 时才接受，赋予零周期，并排除在 reuse-edge
+endpoint 之外。其他任何未匹配的 lowered operation 仍是错误；把一个 source duration 复制到
+每个 lowered node 会重复计算 execution cost。
+
 terminal frontier 保留每个 pipe/control path 上的未完成访问，而非只取最后一条语句。
 只有完整 raw-PTO join 才能证明 source access 没有 materialize。same-pipe reuse 记录为
 已有 ordering 而不会重复加边；loop-carried reuse 保留 iteration distance 和
@@ -858,6 +866,10 @@ approximation 会作为不同类别报告。未测量 shape 的 `trecip` 使用�
 明确标为 shape approximation，不能称为精确校准。其依据是 pinned
 `TRECIP -> TDIVS(dst, 1, src)` lowering；`precisionType` 会被保留，非默认 reciprocal mode
 会 fail closed。
+高精度 `trsqrt` 的支持同样很窄：只接受三个匹配 tile 的 `fp32`、`1x8` vector signature，
+周期为 53。该值在两个 Perf-Sim AIV lane、三次 launch 中复现；仅当 unary lowering 和已校准
+CCE model 的 source hash 与 pinned evidence 一致时才接受。其他 shape 和 operand contract
+继续 fail closed。
 允许有证据支持的非负舍入周期（包括零）；拒绝负值、非有限值和 unsupported fallback。
 
 PTOAS 当前 recurrence 结果仅为结构图中单一 positive-distance edge cycle 的 lower bound，
@@ -866,6 +878,23 @@ count 和包含多条 recurrence edge 的 cycle 仍需验证。数值可计算�
 不等于完整 score。`tests/tools/dsa_reuse_bridge_host_audit.py --archive-graphs-only` 只验证
 Python 与归档图的连接，不编译、不读取 timing table，也不验证修改后的 C++。本机验证构建
 在 3 GiB/no-swap 上限停止；八个 workload 的完整 score 门槛尚未满足。
+
+### 精确 lowering 与 `trsqrt` 重跑
+
+2026 年 9 月的纯主机重跑在打开既有 timing label 前，对同一组 frozen map 应用
+operation-aware lowering join 和 pinned `trsqrt(fp32, 1x8)` duration。92 个 unique
+map/function unit 的 model eligibility 从 60 提升到 83：`trsqrt` duration 恢复 14 个，
+one-source-to-many-lowered-node contract 恢复 9 个。剩余 9 个分别是 3 个缺少 `tcmp`
+duration、3 个缺少 `tpush` graph join，以及 3 个 official-v0.57 import failure。
+
+这修复的是 coverage，而不是 discrimination。五个已确认的 DSA-RP-over-Cypress cell 现在
+都 model-eligible，但 complete-placement score 只解释其中三个。两个
+`mtp_hidden_norm_quant` cell 在全局 synchronization weight 8 到 256 周期的所有取值下仍是
+精确 model tie，尽管 half 上测得 DSA-RP win 为 9.62%/7.19%，native 上为
+12.10%/7.89%。它们的 Cypress 和 DSA-RP reuse edge 均已存在，但仍不在 modeled critical
+path 上。因此，该重跑否定了用 duration 或 lowering coverage 缺失来解释这两个 effect，
+但不足以允许实现 incremental planner。紧凑的 frozen result 位于
+[`data/dsa_complete_placement_rerun_v8.json`](../../../en/dev/proposals/data/dsa_complete_placement_rerun_v8.json)。
 
 ## 剩余验证
 
