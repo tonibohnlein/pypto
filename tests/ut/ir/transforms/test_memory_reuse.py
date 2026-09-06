@@ -3907,6 +3907,117 @@ class TestTopDownRetargeter:
             f"{planner}: first partial must initialize the handle consumed by tmatmul.acc ({acc_handle}):\n{pto}"
         )
 
+    def test_nested_accumulator_loops_in_both_if_arms_preserve_external_lineage(self):
+        """A nested branch-local seed is coalesced onto the accumulator entering the if."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 64], pl.BF16],
+                cond: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                sa = pl.tile.load(lhs, [0, 0], [16, 64], target_memory=pl.Mem.Mat)
+                sb = pl.tile.load(rhs, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+                prev = pl.tile.matmul(sa, sb)
+                if cond < 1:
+                    seed = pl.tile.create([16, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                    for k_first, (first_iter,) in pl.range(0, 2, init_values=(seed,)):
+                        first_acc = pl.tile.matmul_acc(first_iter, sa, sb, init_cond=k_first == 0)
+                        first_loop = pl.yield_(first_acc)
+                    first_alias = first_loop
+                    phi = pl.yield_(first_alias)
+                else:
+                    for _k_later, (later_iter,) in pl.range(0, 2, init_values=(prev,)):
+                        later_acc = pl.tile.matmul_acc(later_iter, sa, sb)
+                        later_loop = pl.yield_(later_acc)
+                    later_alias = later_loop
+                    phi = pl.yield_(later_alias)
+                return pl.tile.store(phi, [0, 0], out)
+
+        after = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(after)
+        lineage = ("prev", "seed", "first_acc", "later_acc")
+        assert all(name in bases for name in lineage), f"missing accumulator definitions: {bases}"
+        assert len({bases[name] for name in lineage}) == 1, (
+            f"nested accumulator lineages must share one allocation: {bases}"
+        )
+        assert not any(
+            "pl.tile.move(" in line and "target_memory=pl.Mem.Acc" in line
+            for line in ir.python_print(after).splitlines()
+        )
+
+    def test_dual_accumulator_targets_preserve_external_then_lineage(self):
+        """When both arms accumulate, the branch-local else seed moves onto the external lineage."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 64], pl.BF16],
+                cond: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                sa = pl.tile.load(lhs, [0, 0], [16, 64], target_memory=pl.Mem.Mat)
+                sb = pl.tile.load(rhs, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+                prev = pl.tile.matmul(sa, sb)
+                if cond < 1:
+                    continued = pl.tile.matmul_acc(prev, sa, sb)
+                    phi = pl.yield_(continued)
+                else:
+                    local_seed = pl.tile.create([16, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                    initialized = pl.tile.matmul_acc(local_seed, sa, sb, init_cond=cond < 0)
+                    phi = pl.yield_(initialized)
+                return pl.tile.store(phi, [0, 0], out)
+
+        after = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(after)
+        lineage = ("prev", "continued", "local_seed", "initialized")
+        assert all(name in bases for name in lineage), f"missing accumulator definitions: {bases}"
+        assert len({bases[name] for name in lineage}) == 1, (
+            f"dual accumulator targets must preserve the external lineage: {bases}"
+        )
+
+    def test_nested_branch_seed_with_same_arm_target_read_fails_closed(self):
+        """Branch-scoped retargeting must not clobber a target read inside the seed loop."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 64], pl.BF16],
+                cond: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                sa = pl.tile.load(lhs, [0, 0], [16, 64], target_memory=pl.Mem.Mat)
+                sb = pl.tile.load(rhs, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+                prev = pl.tile.matmul(sa, sb)
+                if cond < 1:
+                    seed = pl.tile.create([16, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                    for k_first, (first_iter,) in pl.range(0, 2, init_values=(seed,)):
+                        first_acc = pl.tile.matmul_acc(first_iter, sa, sb, init_cond=k_first == 0)
+                        observed_prev = pl.tile.move(prev, target_memory=pl.Mem.Mat)
+                        first_loop = pl.yield_(first_acc)
+                    first_alias = first_loop
+                    phi = pl.yield_(first_alias)
+                else:
+                    for _k_later, (later_iter,) in pl.range(0, 2, init_values=(prev,)):
+                        later_acc = pl.tile.matmul_acc(later_iter, sa, sb)
+                        later_loop = pl.yield_(later_acc)
+                    later_alias = later_loop
+                    phi = pl.yield_(later_alias)
+                return pl.tile.store(phi, [0, 0], out)
+
+        with pytest.raises(InternalError, match="cannot coalesce L0C accumulator"):
+            _run_pipeline(Before)
+
     def test_pipelined_kloop_accumulator_coalesces_to_one_acc_buffer(self):
         """A stage-2 pipelined K-loop matmul (as AutoTileMatmulL0 emits) whose
         L0C accumulator is large (176x176x4 = 121KB, fp32). After

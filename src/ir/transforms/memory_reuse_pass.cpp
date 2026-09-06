@@ -479,9 +479,10 @@ class TopDownRetargeter {
   /// onto the accumulator buffer so both branches share it and no move is emitted,
   /// matching mad_acc's shared-%dst in-place semantics.
   ///
-  /// The seed retype bypasses the *global* dead-at-assign check (the accumulator
-  /// buffer is legitimately live at the post-if phi consumer, which the global
-  /// check would treat as a conflict), but only after `TryCoalesceAccIfPhi`
+  /// The seed retype scopes the dead-at-assign check to the enclosing IfStmt
+  /// (the accumulator buffer is legitimately live at the post-if phi consumer,
+  /// which a whole-function check would treat as a conflict), but only after
+  /// `TryCoalesceAccIfPhi`
   /// verifies the two preconditions branch exclusivity actually needs: (a) the
   /// seed producer is lexically inside the branch, and (b) a branch-scoped
   /// liveness scan (`IsTargetDeadAtAssign(..., stop_at=if)`) finds no same-branch
@@ -535,6 +536,8 @@ class TopDownRetargeter {
   std::map<VarPtr, VarPtr> inplace_root_cache_;
   std::map<VarPtr, VarPtr> accumulator_input_cache_;
   std::set<VarPtr> non_accumulator_producers_;
+  std::map<VarPtr, VarPtr> accumulator_lineage_root_cache_;
+  std::map<VarPtr, VarPtr> aliased_for_return_cache_;
   std::map<const MemRef*, size_t> memref_component_;
   std::map<size_t, ReachableEventIndex> physical_access_index_;
   std::map<const Var*, VersionedReachableEventIndex> alias_read_index_;
@@ -706,6 +709,8 @@ class TopDownRetargeter {
     inplace_root_cache_.clear();
     accumulator_input_cache_.clear();
     non_accumulator_producers_.clear();
+    accumulator_lineage_root_cache_.clear();
+    aliased_for_return_cache_.clear();
 
     const auto& registry = OpRegistry::GetInstance();
     for (const auto& [var, def] : defs_) {
@@ -923,6 +928,111 @@ class TopDownRetargeter {
     return result;
   }
 
+  /// Follow aliases, loop carries, and in-place writeback operands to the
+  /// storage value that seeds an accumulator lineage. This is deliberately
+  /// semantic: it uses the op registry's writeback contract and control-flow
+  /// definitions rather than matmul names or source-level variable names.
+  VarPtr FindAccumulatorLineageRoot(const VarPtr& var) {
+    auto cached = accumulator_lineage_root_cache_.find(var);
+    if (cached != accumulator_lineage_root_cache_.end()) return cached->second;
+
+    std::vector<VarPtr> path;
+    std::set<const Var*> seen;
+    VarPtr current = var;
+    while (current) {
+      if (!seen.insert(current.get()).second) {
+        current = nullptr;
+        break;
+      }
+      auto known = accumulator_lineage_root_cache_.find(current);
+      if (known != accumulator_lineage_root_cache_.end()) {
+        current = known->second;
+        break;
+      }
+      path.push_back(current);
+      auto def = defs_.find(current);
+      if (def == defs_.end()) break;
+
+      if (def->second.kind == VarDef::kAssign) {
+        auto assign = As<AssignStmt>(def->second.assign_stmt);
+        if (!assign) {
+          current = nullptr;
+          break;
+        }
+        if (auto alias = AsVarLike(assign->value_)) {
+          current = alias;
+          continue;
+        }
+        auto call = As<Call>(assign->value_);
+        if (!call || !call->op_) break;
+        auto reuse_idx = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
+        if (!reuse_idx.has_value()) break;
+        current = AsVarLike(call->args_[*reuse_idx]);
+        continue;
+      }
+
+      if (def->second.kind == VarDef::kForReturn) {
+        auto loop = As<ForStmt>(def->second.control_stmt);
+        if (!loop || def->second.return_idx >= loop->iter_args_.size()) {
+          current = nullptr;
+          break;
+        }
+        current = AsVarLike(loop->iter_args_[def->second.return_idx]->initValue_);
+        continue;
+      }
+
+      if (def->second.kind == VarDef::kIterArg) {
+        current = def->second.iter_arg ? AsVarLike(def->second.iter_arg->initValue_) : nullptr;
+        continue;
+      }
+      current = nullptr;
+      break;
+    }
+    for (const auto& member : path) accumulator_lineage_root_cache_[member] = current;
+    accumulator_lineage_root_cache_[var] = current;
+    return current;
+  }
+
+  /// Resolve only transparent assignments leading to a ForStmt return. Unlike
+  /// ResolveAliasRoot, this deliberately stops at the loop boundary so the
+  /// caller can inspect that loop's body and initializer.
+  VarPtr FindAliasedForReturn(const VarPtr& var) {
+    auto cached = aliased_for_return_cache_.find(var);
+    if (cached != aliased_for_return_cache_.end()) return cached->second;
+
+    std::vector<VarPtr> path;
+    std::set<const Var*> seen;
+    VarPtr current = var;
+    VarPtr result;
+    while (current && seen.insert(current.get()).second) {
+      auto known = aliased_for_return_cache_.find(current);
+      if (known != aliased_for_return_cache_.end()) {
+        result = known->second;
+        break;
+      }
+      path.push_back(current);
+      auto def = defs_.find(current);
+      if (def == defs_.end()) break;
+      if (def->second.kind == VarDef::kForReturn) {
+        result = current;
+        break;
+      }
+      if (def->second.kind != VarDef::kAssign) break;
+      auto assign = As<AssignStmt>(def->second.assign_stmt);
+      auto alias = assign ? AsVarLike(assign->value_) : nullptr;
+      if (!alias) break;
+      current = alias;
+    }
+    for (const auto& member : path) aliased_for_return_cache_[member] = result;
+    aliased_for_return_cache_[var] = result;
+    return result;
+  }
+
+  bool IsDefinedInside(const VarPtr& var, const StmtPtr& scope) const {
+    auto def = defs_.find(var);
+    return def != defs_.end() && IsInside(def->second.definition_stmt, scope);
+  }
+
   /// True when ``var`` is an alias/in-place producer chain whose reused input
   /// ultimately reaches ``root``. This proves accumulator semantics without
   /// relying on the MemRefs already being coalesced: MemoryReuse may have just
@@ -937,7 +1047,9 @@ class TopDownRetargeter {
   /// be inside the branch and its seed must be outside it.
   std::optional<AccumulatorTarget> FindExternallySeededAccumulatorLoop(const VarPtr& var,
                                                                        const IfStmtPtr& branch_scope) {
-    auto it = defs_.find(var);
+    VarPtr loop_result = FindAliasedForReturn(var);
+    if (!loop_result) return std::nullopt;
+    auto it = defs_.find(loop_result);
     if (it == defs_.end() || it->second.kind != VarDef::kForReturn) return std::nullopt;
     auto loop = As<ForStmt>(it->second.control_stmt);
     if (!loop || it->second.return_idx >= loop->iter_args_.size()) return std::nullopt;
@@ -946,7 +1058,7 @@ class TopDownRetargeter {
 
     auto init = AsVarLike(loop->iter_args_[it->second.return_idx]->initValue_);
     auto init_tile = init ? CurrentTileType(init) : nullptr;
-    if (!init || !CurrentTileType(var) || !init_tile) return std::nullopt;
+    if (!init || !CurrentTileType(loop_result) || !init_tile) return std::nullopt;
 
     auto init_def = defs_.find(init);
     if (init_def != defs_.end() && IsInside(init_def->second.definition_stmt, branch_scope)) {
@@ -981,9 +1093,22 @@ class TopDownRetargeter {
       if (!then_target) then_target = FindExternallySeededAccumulatorLoop(then_var, if_stmt);
       auto else_target = FindInplaceAccumulatorProducer(else_var);
       if (!else_target) else_target = FindExternallySeededAccumulatorLoop(else_var, if_stmt);
-      if (then_target.has_value() == else_target.has_value()) continue;  // need exactly one accumulator
+      if (!then_target && !else_target) continue;
 
-      const bool then_acc = then_target.has_value();
+      bool then_acc = then_target.has_value();
+      if (then_target && else_target) {
+        // Nested K loops can leave both arms ending in matmul_acc even though
+        // only one arm continues the accumulator entering this conditional.
+        // Preserve that external lineage and retarget the branch-local seed.
+        auto then_root = FindAccumulatorLineageRoot(then_target->reused_input);
+        auto else_root = FindAccumulatorLineageRoot(else_target->reused_input);
+        if (!then_root || !else_root) continue;
+        const bool then_enters = !IsDefinedInside(then_root, if_stmt);
+        const bool else_enters = !IsDefinedInside(else_root, if_stmt);
+        if (then_enters == else_enters) continue;
+        then_acc = then_enters;
+      }
+
       const VarPtr& acc_var = then_acc ? then_var : else_var;
       const VarPtr& seed_var = then_acc ? else_var : then_var;
       const AccumulatorTarget& target = then_acc ? *then_target : *else_target;
@@ -997,7 +1122,7 @@ class TopDownRetargeter {
       auto seed_def = defs_.find(seed_var);
       if (!seed_already_shared && seed_def == defs_.end()) continue;
 
-      // The `check_liveness=false` bypass below is only sound when branch
+      // The branch-scoped liveness check below is only sound when branch
       // exclusivity actually applies, which requires BOTH:
       //  (a) the seed producer is lexically *inside* this IfStmt's branch — a
       //      pre-if value yielded through the branch runs unconditionally and
@@ -1036,9 +1161,11 @@ class TopDownRetargeter {
           << "Internal error: cannot align the accumulator branch with its canonical L0C allocation";
 
       // Now safe: (a)+(b) plus exclusivity cover every read of the target allocation, so we
-      // bypass the global liveness (which would false-decline on the legitimate
-      // post-if phi consumer). A remaining decline is a genuine "cannot coalesce
-      // this Acc phi" — fail loud, since no legal Acc->Acc move exists.
+      // stop liveness at the enclosing if (the legitimate post-if phi consumer
+      // must not count). Every recursively reached producer is still checked
+      // from its own definition to that boundary, so a same-arm read remains a
+      // hard conflict. A remaining decline is a genuine "cannot coalesce this
+      // Acc phi" — fail loud, since no legal Acc->Acc move exists.
       bool ok = seed_already_shared;
       if (!seed_already_shared) {
         if (seed_def->second.kind == VarDef::kAssign) {
@@ -1046,14 +1173,16 @@ class TopDownRetargeter {
           if (!seed_assign) continue;
           if (As<Call>(seed_assign->value_)) {
             ok = RetargetAssign(seed_var, seed_def->second, target.memref, target.memory_space,
-                                /*check_liveness=*/false);
+                                /*liveness_stop_at=*/if_stmt.get());
           } else if (AsVarLike(seed_assign->value_)) {
-            ok = TryRetargetVar(seed_var, target.memref, target.memory_space);
+            ok = TryRetargetVar(seed_var, target.memref, target.memory_space,
+                                /*liveness_stop_at=*/if_stmt.get());
           } else {
             continue;
           }
         } else if (seed_def->second.kind == VarDef::kForReturn) {
-          ok = TryRetargetVar(seed_var, target.memref, target.memory_space);
+          ok = TryRetargetVar(seed_var, target.memref, target.memory_space,
+                              /*liveness_stop_at=*/if_stmt.get());
         } else {
           continue;
         }
@@ -1092,7 +1221,9 @@ class TopDownRetargeter {
 
   /// Attempts to rewrite `var`'s MemRef to `target` by walking its producer chain.
   /// Returns true if var already has target MemRef or a rewrite was planned.
-  bool TryRetargetVar(const VarPtr& var, const MemRefPtr& target, std::optional<MemorySpace> target_memory) {
+  bool TryRetargetVar(const VarPtr& var, const MemRefPtr& target,
+                      std::optional<MemorySpace> target_memory,
+                      const Stmt* liveness_stop_at = nullptr) {
     if (SamePhysicalWindow(CurrentMemRef(var), target)) return true;  // already aligned
     if (!visiting_.insert(var).second) return false;                  // cycle
     struct Guard {
@@ -1109,13 +1240,13 @@ class TopDownRetargeter {
 
     bool retargeted = false;
     if (def.kind == VarDef::kAssign) {
-      retargeted = RetargetAssign(var, def, target, target_memory);
+      retargeted = RetargetAssign(var, def, target, target_memory, liveness_stop_at);
     } else if (def.kind == VarDef::kIfReturn) {
-      retargeted = RetargetIfReturn(var, def, target, target_memory);
+      retargeted = RetargetIfReturn(var, def, target, target_memory, liveness_stop_at);
     } else if (def.kind == VarDef::kForReturn) {
-      retargeted = RetargetForReturn(var, def, target, target_memory);
+      retargeted = RetargetForReturn(var, def, target, target_memory, liveness_stop_at);
     } else if (def.kind == VarDef::kIterArg) {
-      retargeted = RetargetIterArg(var, def, target, target_memory);
+      retargeted = RetargetIterArg(var, def, target, target_memory, liveness_stop_at);
     }
     if (retargeted) transaction.Commit();
     return retargeted;
@@ -1123,14 +1254,14 @@ class TopDownRetargeter {
 
   /// Retype a Var defined by an AssignStmt.
   ///
-  /// `check_liveness` gates the general dead-at-assign check (IsTargetDeadAtAssign).
-  /// It is true for the normal loop-carry retarget path.  It is set false only by
-  /// CoalesceAccumulatorIfPhis: coalescing an IfStmt phi's two branch yields onto one
-  /// buffer is always safe (the phi is redefined by exactly one branch at runtime, so
-  /// the branches are mutually exclusive and the target's downstream liveness cannot be
-  /// violated by a branch-local producer).  The op-legality checks below still apply.
+  /// `liveness_stop_at` restricts the dead-at-assign check to an enclosing
+  /// control-flow scope. CoalesceAccumulatorIfPhis uses the enclosing IfStmt:
+  /// mutually exclusive siblings and the post-if phi consumer are excluded,
+  /// while reads later in the same arm are still observed. The op-legality
+  /// checks below always apply.
   bool RetargetAssign(const VarPtr& var, const VarDef& def, const MemRefPtr& target,
-                      std::optional<MemorySpace> target_memory, bool check_liveness = true) {
+                      std::optional<MemorySpace> target_memory,
+                      const Stmt* liveness_stop_at = nullptr) {
     auto assign = As<AssignStmt>(def.assign_stmt);
     INTERNAL_CHECK_SPAN(assign, var->span_) << "Internal error: kAssign VarDef must carry an AssignStmt";
     auto call = As<Call>(assign->value_);
@@ -1143,7 +1274,7 @@ class TopDownRetargeter {
           !SamePhysicalWindow(GetDefinedMemRef(alias_tile), GetDefinedMemRef(var_tile))) {
         return false;
       }
-      if (!TryRetargetVar(alias, target, target_memory)) return false;
+      if (!TryRetargetVar(alias, target, target_memory, liveness_stop_at)) return false;
       PlanRewrite(var, target, target_memory);
       return true;
     }
@@ -1156,7 +1287,7 @@ class TopDownRetargeter {
       // Pinned output: can't change this stmt's LHS MemRef; recurse onto pinned input.
       auto input_var = AsVarLike(call->args_[*reuse_idx]);
       if (!input_var) return false;
-      if (!TryRetargetVar(input_var, target, target_memory)) return false;
+      if (!TryRetargetVar(input_var, target, target_memory, liveness_stop_at)) return false;
       // Also record that `var`'s MemRef should follow the pinned input to target.
       PlanRewrite(var, target, target_memory);
       return true;
@@ -1210,7 +1341,7 @@ class TopDownRetargeter {
           !SamePhysicalWindow(GetDefinedMemRef(input_tile), GetDefinedMemRef(output_tile))) {
         return false;
       }
-      if (!TryRetargetVar(input_var, target, target_memory)) return false;
+      if (!TryRetargetVar(input_var, target, target_memory, liveness_stop_at)) return false;
       PlanRewrite(var, target, target_memory);
       return true;
     }
@@ -1225,7 +1356,7 @@ class TopDownRetargeter {
 
     // Unconstrained: check liveness, then plan retype.  (Skipped for if-phi
     // branch coalescing, where branch exclusivity is a stronger guarantee.)
-    if (check_liveness && !IsTargetDeadAtAssign(def, target)) return false;
+    if (!IsTargetDeadAtAssign(def, target, liveness_stop_at)) return false;
     PlanRewrite(var, target, target_memory);
     return true;
   }
@@ -1282,7 +1413,8 @@ class TopDownRetargeter {
 
   /// Retype an IfStmt return_var: recurse into both branches' yield values.
   bool RetargetIfReturn(const VarPtr& var, const VarDef& def, const MemRefPtr& target,
-                        std::optional<MemorySpace> target_memory) {
+                        std::optional<MemorySpace> target_memory,
+                        const Stmt* liveness_stop_at) {
     auto if_stmt = As<IfStmt>(def.control_stmt);
     if (!if_stmt) return false;
     size_t idx = def.return_idx;
@@ -1292,7 +1424,7 @@ class TopDownRetargeter {
       if (!y || idx >= y->value_.size()) return false;
       auto yv = AsVarLike(y->value_[idx]);
       if (!yv) return false;
-      return TryRetargetVar(yv, target, target_memory);
+      return TryRetargetVar(yv, target, target_memory, liveness_stop_at);
     };
 
     bool then_ok = visit_branch(if_stmt->then_body_);
@@ -1310,7 +1442,8 @@ class TopDownRetargeter {
   /// match the target, and YieldFixupMutator's PatchIterArgsAndReturnVars
   /// finalises iter_arg/return_var TileType updates.
   bool RetargetForReturn(const VarPtr& var, const VarDef& def, const MemRefPtr& target,
-                         std::optional<MemorySpace> target_memory) {
+                         std::optional<MemorySpace> target_memory,
+                         const Stmt* liveness_stop_at) {
     auto for_stmt = As<ForStmt>(def.control_stmt);
     if (!for_stmt) return false;
     size_t idx = def.return_idx;
@@ -1319,14 +1452,14 @@ class TopDownRetargeter {
     if (!y || idx >= y->value_.size()) return false;
     auto yv = AsVarLike(y->value_[idx]);
     if (!yv) return false;
-    if (!TryRetargetVar(yv, target, target_memory)) return false;
+    if (!TryRetargetVar(yv, target, target_memory, liveness_stop_at)) return false;
 
     // Also retype the corresponding iter_arg's init so the next iteration's
     // loop-carried value reads from the same buffer the body just wrote.
     if (idx < for_stmt->iter_args_.size()) {
       auto ia = for_stmt->iter_args_[idx];
       auto init_var = AsVarLike(ia->initValue_);
-      if (init_var && !TryRetargetVar(init_var, target, target_memory)) return false;
+      if (init_var && !TryRetargetVar(init_var, target, target_memory, liveness_stop_at)) return false;
       // Plan rewrite for the IterArg itself (its TileType will be updated).
       PlanRewrite(std::static_pointer_cast<const Var>(ia), target, target_memory);
     }
@@ -1339,12 +1472,13 @@ class TopDownRetargeter {
   /// itself records a rewrite so RetypeApplier substitutes its TileType in
   /// body references.
   bool RetargetIterArg(const VarPtr& var, const VarDef& def, const MemRefPtr& target,
-                       std::optional<MemorySpace> target_memory) {
+                       std::optional<MemorySpace> target_memory,
+                       const Stmt* liveness_stop_at) {
     auto iter_arg = def.iter_arg;
     if (!iter_arg) return false;
     auto init_var = AsVarLike(iter_arg->initValue_);
     if (!init_var) return false;
-    if (!TryRetargetVar(init_var, target, target_memory)) return false;
+    if (!TryRetargetVar(init_var, target, target_memory, liveness_stop_at)) return false;
     PlanRewrite(var, target, target_memory);
     return true;
   }
