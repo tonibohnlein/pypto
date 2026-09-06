@@ -4,6 +4,13 @@ Last consolidated: 2026-09-01.
 
 ## Purpose
 
+Latest host-only follow-up: [logical graph repair v7](dsa_logical_graph_repair_v7.md).
+Logical-view and structured-boundary repairs rescore 51 historical endpoints
+and 60 Gate children; conservative-range cases are separately identified.
+Gate transfer/task dependencies are recovered, but invocation composition is
+incomplete and the mixed-direction scientific gate still fails. No new device
+measurements, placements or causal performance claim were added.
+
 This ledger is the durable index for DSA-RP device evidence. It records failed
 infrastructure campaigns as well as positive results so that a later analysis
 does not silently reuse a superseded number. The archive named in each row is
@@ -64,6 +71,13 @@ be pooled. Capacity sensitivity rows are not independent workloads.
 | `dsa-rp-weighted-dag-device-validation-final.tar.gz` | 34 of 75 nodes lacked exact/pinned durations | `topk_select_inactive` was the first complete existence proof; no device was touched. |
 
 ## Current evidence boundary
+
+The [2026-09-05 host-only reanalysis](dsa_host_weight_validation_v5.md) resolves
+51 endpoint graphs across 14 historical cells without new timing. At 8/16 cycles
+it orders four of five two-device magnitude-cleared wins correctly, but misses
+`kv_and_cache_write`; Gate remains whole-parent-incomplete. These are graph
+bounds with explicitly classified analytical durations, not 14 complete
+invocation-latency models or a passed mixed-direction calibration gate.
 
 The replay-fixed eight-workload campaign supports the claim that a structured
 penalty-aware DSA-RP policy can beat Cypress on real kernels. It no longer

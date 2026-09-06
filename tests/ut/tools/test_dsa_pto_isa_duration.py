@@ -246,6 +246,84 @@ def test_raw_pto_high_precision_trecip_fails_closed():
         _provider().estimate(node, work_bytes=64)
 
 
+def _comparison_provider():
+    provider = _provider()
+    for name in (
+        "costmodel/a2a3/cce_costmodel/cce_costmodel_core.hpp",
+        "costmodel/a2a3/cce_costmodel/cce_costmodel_sync.hpp",
+        "costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compare.hpp",
+        "npu/a2a3/TMax.hpp",
+        "npu/a2a3/TBinOp.hpp",
+        "npu/a2a3/TCmps.hpp",
+        "npu/a2a3/TDiv.hpp",
+        "npu/a2a3/TSel.hpp",
+    ):
+        provider.source_sha256[f"include/pto/{name}"] = "e" * 64
+    return provider
+
+
+@pytest.mark.parametrize(("rows", "cols", "cycles"), [(1, 16, 28), (16, 16, 58), (1, 64, 26)])
+def test_tmax_prices_masked_rows_and_full_repeats(rows, cols, cycles):
+    tile = f"!pto.tile_buf<vec, {rows}x{cols}xf32, valid=?x?>"
+    node = _node("pto.tmax", "PIPE_V", tile, tile)
+    node["operation"]["result_types"] = [tile]
+    estimate = _comparison_provider().estimate(node, work_bytes=0)
+    assert estimate.cycles == cycles
+    assert estimate.evidence_class == "pinned_analytical_model"
+    assert "isolated empty queue" in estimate.detail
+
+
+@pytest.mark.parametrize(("mode", "cycles"), [("eq", 40), ("ne", 69), ("lt", 40)])
+def test_tcmps_preserves_mode_and_prices_packed_mask_inversion(mode, cycles):
+    src = "!pto.tile_buf<vec, 16x64xf32, valid=?x?>"
+    dst = "!pto.tile_buf<vec, 16x32xui8, valid=?x?>"
+    line = f"pto.tcmps ins(%src, %c {{cmpMode = #pto<cmp {mode}>}} : {src}, f32) outs(%dst : {dst})"
+    node = _node("pto.tcmps", "PIPE_V")
+    node["operation"] = dsa_schedule_model._operation_type_metadata(line, {"%c": "0.0"})
+    estimate = _comparison_provider().estimate(node, work_bytes=512)
+    assert node["operation"]["attributes"]["cmp_mode"] == mode
+    assert estimate.cycles == cycles
+    assert estimate.evidence_class == "pinned_analytical_model"
+    if mode == "ne":
+        assert "inversion_repeats=2" in estimate.detail
+        assert "internal_barriers=1" in estimate.detail
+
+
+def test_comparison_estimates_reject_missing_evidence_and_mode():
+    tile = "!pto.tile_buf<vec, 1x16xf32, valid=?x?>"
+    node = _node("pto.tmax", "PIPE_V", tile, tile)
+    node["operation"]["result_types"] = [tile]
+    with pytest.raises(ValueError, match="lacks pinned"):
+        _provider().estimate(node, work_bytes=64)
+    node = _node("pto.tcmps", "PIPE_V", tile, "f32")
+    node["operation"]["result_types"] = ["!pto.tile_buf<vec, 1x32xui8, valid=?x?>"]
+    with pytest.raises(ValueError, match="cmp_mode"):
+        _comparison_provider().estimate(node, work_bytes=32)
+    node["operation"]["attributes"] = {"cmp_mode": "ne"}
+    node["operation"]["operand_types"] = [tile, tile]
+    with pytest.raises(ValueError, match="scalar fp32"):
+        _comparison_provider().estimate(node, work_bytes=32)
+
+
+def test_tsel_prices_internal_per_row_sync_and_tdiv_prices_its_own_slope():
+    src = "!pto.tile_buf<vec, 16x64xf32, valid=?x?>"
+    mask = "!pto.tile_buf<vec, 16x32xui8, valid=?x?>"
+    tmp = "!pto.tile_buf<vec, 1x32xui8, valid=?x?>"
+    node = _node("pto.tsel", "PIPE_V", mask, src, src, tmp)
+    node["operation"]["result_types"] = [src]
+    estimate = _comparison_provider().estimate(node, work_bytes=4096)
+    assert estimate.cycles == 947
+    assert "internal_barriers_per_row=2" in estimate.detail
+    assert estimate.evidence_class == "pinned_analytical_model"
+    small = "!pto.tile_buf<vec, 1x16xf32, valid=?x?>"
+    divide = _node("pto.tdiv", "PIPE_V", small, small)
+    divide["operation"]["result_types"] = [small]
+    assert _comparison_provider().estimate(divide, work_bytes=64).cycles == 36
+    divide["operation"]["attributes"]["precision_type"] = "high_precision"
+    with pytest.raises(ValueError, match="non-default division"):
+        _comparison_provider().estimate(divide, work_bytes=64)
+
+
 def test_build_bias_scalar_min_max_use_pinned_evidence():
     tile = "!pto.tile_buf<vec, 1x512xf32, valid=?x?>"
     tmaxs = _node("pto.tmaxs", "PIPE_V", tile, "f32")

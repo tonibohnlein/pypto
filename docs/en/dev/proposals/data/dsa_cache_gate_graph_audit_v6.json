@@ -1,0 +1,1539 @@
+{
+  "artifact_sha256": {
+    "build/dsa_cache_gate_audit_v6/cache-write-audit.json": "b0c5620d0c9cd34fb5e9cc61e240491589265a9c8ac82c3e99b6419c76310ce2",
+    "build/dsa_cache_gate_audit_v6/gate-reimport/predictions.json": "f4dc370f228f7afc72b76429a2dcec3eeddf35ba352890df25938dd16d5da978",
+    "build/dsa_cache_gate_audit_v6/gate-reimport/provenance.json": "327ea4c389ce081cf3071eb6f725749667ada8673e4b309048e051c4eaef537e"
+  },
+  "cache_write": {
+    "missing_required_raw": [
+      {
+        "allocation": 5,
+        "distance": 0,
+        "kind": "allocation-raw",
+        "latency": 0,
+        "source": 4,
+        "source_access": 24,
+        "target": 6,
+        "target_access": 27
+      },
+      {
+        "allocation": 9,
+        "distance": 0,
+        "kind": "allocation-raw",
+        "latency": 0,
+        "source": 8,
+        "source_access": 29,
+        "target": 10,
+        "target_access": 33
+      }
+    ],
+    "native_lp_crosschecks": [
+      {
+        "arm": "cypress",
+        "cycles": 548,
+        "weight": 0
+      },
+      {
+        "arm": "cypress",
+        "cycles": 715,
+        "weight": 128
+      },
+      {
+        "arm": "cypress",
+        "cycles": 548,
+        "weight": 16
+      },
+      {
+        "arm": "cypress",
+        "cycles": 779,
+        "weight": 160
+      },
+      {
+        "arm": "cypress",
+        "cycles": 843,
+        "weight": 192
+      },
+      {
+        "arm": "cypress",
+        "cycles": 549,
+        "weight": 24
+      },
+      {
+        "arm": "cypress",
+        "cycles": 971,
+        "weight": 256
+      },
+      {
+        "arm": "cypress",
+        "cycles": 557,
+        "weight": 32
+      },
+      {
+        "arm": "cypress",
+        "cycles": 573,
+        "weight": 48
+      },
+      {
+        "arm": "cypress",
+        "cycles": 589,
+        "weight": 64
+      },
+      {
+        "arm": "cypress",
+        "cycles": 548,
+        "weight": 8
+      },
+      {
+        "arm": "cypress",
+        "cycles": 651,
+        "weight": 96
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 548,
+        "weight": 0
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 715,
+        "weight": 128
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 548,
+        "weight": 16
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 779,
+        "weight": 160
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 843,
+        "weight": 192
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 549,
+        "weight": 24
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 971,
+        "weight": 256
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 557,
+        "weight": 32
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 573,
+        "weight": 48
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 589,
+        "weight": 64
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 548,
+        "weight": 8
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "cycles": 651,
+        "weight": 96
+      }
+    ],
+    "scope": "acyclic longest path only; dynamic invocation and recurrence composition not supplied",
+    "scores": [
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 0,
+        "placed": 548,
+        "weight": 0
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 0
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 167,
+        "placed": 715,
+        "weight": 128
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 123,
+        "placed": 977,
+        "weight": 128
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 0,
+        "placed": 548,
+        "weight": 16
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 16
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 231,
+        "placed": 779,
+        "weight": 160
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 187,
+        "placed": 1041,
+        "weight": 160
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 295,
+        "placed": 843,
+        "weight": 192
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 251,
+        "placed": 1105,
+        "weight": 192
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 1,
+        "placed": 549,
+        "weight": 24
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 24
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 423,
+        "placed": 971,
+        "weight": 256
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 379,
+        "placed": 1233,
+        "weight": 256
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 9,
+        "placed": 557,
+        "weight": 32
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 32
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 25,
+        "placed": 573,
+        "weight": 48
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 48
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 41,
+        "placed": 589,
+        "weight": 64
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 64
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 0,
+        "placed": 548,
+        "weight": 8
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 8
+      },
+      {
+        "arm": "cypress",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 103,
+        "placed": 651,
+        "weight": 96
+      },
+      {
+        "arm": "cypress",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 59,
+        "placed": 913,
+        "weight": 96
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 0,
+        "placed": 548,
+        "weight": 0
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 0
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 167,
+        "placed": 715,
+        "weight": 128
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 62,
+        "placed": 916,
+        "weight": 128
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 0,
+        "placed": 548,
+        "weight": 16
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 16
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 231,
+        "placed": 779,
+        "weight": 160
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          17
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 110,
+        "placed": 964,
+        "weight": 160
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 295,
+        "placed": 843,
+        "weight": 192
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          17
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 174,
+        "placed": 1028,
+        "weight": 192
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 1,
+        "placed": 549,
+        "weight": 24
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 24
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 423,
+        "placed": 971,
+        "weight": 256
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          17
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 302,
+        "placed": 1156,
+        "weight": 256
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 9,
+        "placed": 557,
+        "weight": 32
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 32
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 25,
+        "placed": 573,
+        "weight": 48
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 48
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 41,
+        "placed": 589,
+        "weight": 64
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 64
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          1,
+          2,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 0,
+        "placed": 548,
+        "weight": 8
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 0,
+        "placed": 854,
+        "weight": 8
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 548,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          15,
+          16
+        ],
+        "graph": "archived",
+        "penalty": 103,
+        "placed": 651,
+        "weight": 96
+      },
+      {
+        "arm": "dsa_rp_cg",
+        "baseline": 854,
+        "critical_path": [
+          0,
+          2,
+          3,
+          4,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "graph": "required_raw_added_diagnostic",
+        "penalty": 30,
+        "placed": 884,
+        "weight": 96
+      }
+    ],
+    "sources": {
+      "build/dsa_reuse_penalty_host_v4/historical-current-model-v5-complete/fresh/holdout__models_deepseek_v4_flash_dspark_decode_indexer_compressor.py__kv_and_cache_write/graph.weighted-base.txt": "77b266735f1e5672a295d52dfe7d6b18335969b197f4b03a86facdfcad6a0ed5",
+      "build/dsa_reuse_penalty_host_v4/historical-current-model-v5-complete/fresh/holdout__models_deepseek_v4_flash_dspark_decode_indexer_compressor.py__kv_and_cache_write/schedule.jsonl": "3a15cbc2151f6d2a15a8e482ef91fc0524ebc144fc280a4e14df4747d40ec28b",
+      "build/dsa_reuse_penalty_host_v4/historical-current-model-v5-complete/holdout/models_deepseek_v4_flash_dspark_decode_indexer_compressor__tight__kv_and_cache_write__cypress/instrumented-problem.json": "a19d2e6e2c184cab94e00a8436b0eaea17116a29de0aeb969fbb4754135ee838",
+      "build/dsa_reuse_penalty_host_v4/historical-current-model-v5-complete/holdout/models_deepseek_v4_flash_dspark_decode_indexer_compressor__tight__kv_and_cache_write__cypress/topology.json": "e2caf73ad4d488c9968aeec8ab0dad20f7397899baae62465f07fd3208d66f4a",
+      "build/dsa_reuse_penalty_host_v4/historical-current-model-v5-complete/holdout/models_deepseek_v4_flash_dspark_decode_indexer_compressor__tight__kv_and_cache_write__dsa_rp_cg/topology.json": "0730ccbea45ffd194e865c06f30b548d1db75c7058d0b77d470372ea012f0a13"
+    },
+    "status": "GRAPH_CONFORMANCE_FAIL_NOT_A_DEVICE_CAUSAL_EXPLANATION"
+  },
+  "decision": "NO_PLANNER_INTEGRATION: base graph conformance and mixed invocation composition remain incomplete",
+  "gate_blockers": [
+    {
+      "count": 11,
+      "reason": "schedule operations are absent from the PTOAS graph: accesses=[75]"
+    },
+    {
+      "count": 9,
+      "reason": "raw PTO operation sequence has no unique monotone join to the final SyncIR trace: alignments=0, counts=18->55"
+    },
+    {
+      "count": 1,
+      "reason": "final debug phase node count differs from its header; possible interleaving"
+    },
+    {
+      "count": 1,
+      "reason": "expected one final trace matching @gate_aiv, found 0 of 2 phases; join errors=['raw PTO operation sequence has no unique monotone join to the final SyncIR trace: alignments=2, counts=2->55', 'raw PTO operation sequence has no unique monotone join to the final SyncIR trace: alignments=0, counts=18->55']"
+    },
+    {
+      "count": 2,
+      "reason": "expected one final trace matching @gate_aiv, found 0 of 2 phases; join errors=['final debug phase node count differs from its header; possible interleaving', 'raw PTO operation sequence has no unique monotone join to the final SyncIR trace: alignments=0, counts=18->55']"
+    }
+  ],
+  "gate_function_counts": [
+    {
+      "count": 12,
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "count": 12,
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "count": 12,
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "count": 12,
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "count": 12,
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    }
+  ],
+  "gate_scores": [
+    {
+      "arm": "cypress",
+      "capacity": "native",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "native",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "native",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "native",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "native",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "native",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "native",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "native",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "native",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "native",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "native",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "native",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "native",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "native",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "native",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "half",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "half",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "half",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "half",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "half",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "half",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "half",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "half",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "half",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "half",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "half",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "half",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "half",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "half",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "half",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "q1",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "q1",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "q1",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "q1",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "q1",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "q1",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "q1",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "q1",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "q1",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "q1",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "q1",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "q1",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "q1",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "q1",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "q1",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "tight",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "tight",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "tight",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "tight",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "cypress",
+      "capacity": "tight",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "tight",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "tight",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "tight",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "tight",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "tight",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "tight",
+      "function": "ffn_norm",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "tight",
+      "function": "route_sort",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "tight",
+      "function": "x_norm_quant",
+      "status": "GRAPH_SCORE_RESOLVED"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "tight",
+      "function": "gate_aic",
+      "status": "INCOMPLETE"
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "tight",
+      "function": "gate_aiv",
+      "status": "INCOMPLETE"
+    }
+  ],
+  "new_device_runs": 0,
+  "prelude_loop_control_edges": 84,
+  "schema": "dsa_cache_gate_graph_audit_v6"
+}

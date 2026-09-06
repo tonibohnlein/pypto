@@ -3962,6 +3962,55 @@ def test_import_legacy_debug_preserves_but_does_not_activate_useless_sync():
     assert summary["useless_record_site_count"] == 1
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_import_mixed_final_phases_selects_unique_raw_function_not_last(reverse):
+    marker = "// === [PTOInsertSync Debug] After EventId Allocation === //\n"
+    end = "// ========================================= //\n"
+    load = marker + "[   0] COMPOUND pto.load_scalar [PIPE_S]\n" + end
+    store = marker + "[   0] COMPOUND pto.store_scalar [PIPE_S]\n" + end
+    pto = """module {
+  func.func @reader(%p: !pto.ptr<i32>, %i: index) {
+    %v = pto.load_scalar %p[%i] : !pto.ptr<i32> -> i32 loc("pypto.access.4")
+    return
+  }
+  func.func @writer(%p: !pto.ptr<i32>, %i: index, %v: i32) {
+    pto.store_scalar %v, %p[%i] : !pto.ptr<i32>, i32 loc("pypto.access.9")
+    return
+  }
+}"""
+    text = store + load if reverse else load + store
+    record = dsa_schedule_model.import_insert_sync_debug(text, function="reader", pto_text=pto)
+    assert record["nodes"][0]["op_name"] == "pto.load_scalar"
+    assert record["nodes"][0]["operation"]["pypto_access_order"] == 4
+    with pytest.raises(ValueError, match="require raw PTO"):
+        dsa_schedule_model.import_insert_sync_debug(text, function="reader")
+    with pytest.raises(ValueError, match="found 2"):
+        dsa_schedule_model.import_insert_sync_debug(load + load, function="reader", pto_text=pto)
+    with pytest.raises(ValueError, match="interleaved"):
+        dsa_schedule_model.import_insert_sync_debug(marker + load, function="reader", pto_text=pto)
+
+
+def test_import_final_phase_rejects_incomplete_header_count():
+    text = """// === [PTOInsertSync Debug] After EventId Allocation === //
+// nodes=2, syncGroups=0
+[   0] COMPOUND pto.load_scalar [PIPE_S]
+// ========================================= //"""
+    with pytest.raises(ValueError, match="node count differs"):
+        dsa_schedule_model.import_insert_sync_debug(text, function="reader")
+
+
+def test_import_final_phase_preserves_virtual_else_placeholder():
+    text = """// === [PTOInsertSync Debug] After EventId Allocation === //
+// nodes=2, syncGroups=0
+[   0] PLACE_HOLDER (parentScopeId=29, virtualElse)
+[   1] COMPOUND pto.load_scalar [PIPE_S]
+// ========================================= //"""
+    result = dsa_schedule_model.import_insert_sync_debug(text, function="reader")
+    assert len(result["nodes"]) == 2
+    assert result["nodes"][0]["virtual_else"] is True
+    assert result["nodes"][0]["parent_scope"] == 29
+
+
 def test_import_legacy_debug_exports_barrier_dependency_edge():
     log = """
 // === [PTOInsertSync Debug] After EventId Allocation === //

@@ -4,6 +4,11 @@
 
 ## 用途
 
+最新 host-only 后续：[逻辑图修复 v7](dsa_logical_graph_repair_v7.md)。
+逻辑 view 与结构化边界修复后重新评分 51 个历史 endpoint 和 60 个 Gate child，
+分别记录保守范围。Gate transfer/task 依赖已恢复，但 invocation 组合仍不完整，
+混合方向科学门槛未通过；没有新增设备计时、placement 或因果结论。
+
 本记录是 DSA-RP 设备证据的长期索引。它同时保留失败的基础设施 campaign 与正面结果，
 避免后续分析静默复用已被推翻的数据。每一行列出的 archive 是 source of record；正式结论
 必须从其中的表格重新读取，而不能只依赖本摘要。百分比沿用 archive 的符号约定，通常是
@@ -62,6 +67,12 @@ workload。
 | `dsa-rp-weighted-dag-device-validation-final.tar.gz` | 75 个 node 中 34 个缺 exact/pinned duration | `topk_select_inactive` 是首个完整 existence proof；未使用设备。 |
 
 ## 当前证据边界
+
+[2026-09-05 host-only 重分析](dsa_host_weight_validation_v5.md) 对 14 个历史 cell 的
+51 个 endpoint graph 完成输入解析，没有新增 timing。8/16 cycles 在五个两设备幅度达标
+胜出中正确区分四个，但遗漏 `kv_and_cache_write`；Gate 仍无完整 parent 分数。
+这些是采用明确分类 analytical duration 的 graph bound，不是 14 个完整 invocation
+latency model，也没有通过混合方向校准门槛。
 
 replay-fixed 八 workload campaign 支持“结构化 penalty-aware DSA-RP 能在真实 kernel 上胜过
 Cypress”的结论，但它已不再是 model holdout，也尚未验证当前 analytical penalty model。

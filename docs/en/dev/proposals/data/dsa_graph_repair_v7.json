@@ -1,0 +1,110 @@
+{
+  "gate_ranges": {
+    "conservative_allocation_envelope": 12,
+    "source_ranges": 48
+  },
+  "gate_status": {
+    "GRAPH_SCORE_RESOLVED": 60
+  },
+  "historical_ranges": {
+    "conservative_allocation_envelope": 8,
+    "source_ranges": 43
+  },
+  "historical_status": {
+    "GRAPH_SCORE_RESOLVED": 51
+  },
+  "invariant_gate_child_bases": 20,
+  "invariant_historical_bases": 14,
+  "invocation_model_complete": false,
+  "mixed_cells": 12,
+  "new_device_runs": 0,
+  "new_placements": 0,
+  "retrospective_development_analysis": true,
+  "sources": {
+    "gate_predictions": "3669f8eef2507abaf0f67b5ced357ad39747fda4ed07feba2569c614e7528a52",
+    "gate_provenance": "f6815f8ad3b65fb4043da417887b0f824fece0fbadbc8ac38a9676ebfdd279ac",
+    "historical_predictions": "b591cd0f7f85162709d5ee942ab3c1a2531a3221c0d2fdfd3cc79e36472655de",
+    "historical_seal": "b35e3d06e3df76157843d78883bc1d34709af099ffe111d78c277de2da941af1",
+    "mixed_transfers": "dc0b3054593287fcccaba638faf52446b34ebb9403a35c6654138f1d80757d31"
+  },
+  "weight_grid": [
+    {
+      "confirmed_cells": 5,
+      "correct": 3,
+      "tie": 1,
+      "weight": 0,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 3,
+      "tie": 1,
+      "weight": 8,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 3,
+      "tie": 1,
+      "weight": 16,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 3,
+      "tie": 1,
+      "weight": 24,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 3,
+      "tie": 1,
+      "weight": 32,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 3,
+      "tie": 1,
+      "weight": 48,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 4,
+      "weight": 64,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 4,
+      "weight": 96,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 4,
+      "weight": 128,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 4,
+      "weight": 160,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 4,
+      "weight": 192,
+      "wrong": 1
+    },
+    {
+      "confirmed_cells": 5,
+      "correct": 4,
+      "weight": 256,
+      "wrong": 1
+    }
+  ]
+}

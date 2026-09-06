@@ -1,0 +1,2706 @@
+{
+  "cells": [
+    {
+      "arm": "cypress",
+      "capacity": "half",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline43"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline49"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline46"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline43"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline32"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline67"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "546e72e3eef07a9205b584150465be17dbd5045a89ac8dec2d640ca0f629f259",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline41"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline46",
+              "xg_buf_inline43",
+              "xn_scale_buf_inline49"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline43",
+              "xn_scale_buf_inline49"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline46",
+              "xg_buf_inline43"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline32",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline67"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline32",
+              "route_scores_buf_inline67"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "bfa7e348d083e4bf71e7b963c1acf219428d3b8f7282970dd80a412032e49c43",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "half",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline44"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline46"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline52"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline44"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline64"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline54"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "dff8140645d4e45e7c6cc7dea3f12981ae64ce0e8f420ed1a7e7805f4bc24638",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline68"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline52",
+              "xg_buf_inline44",
+              "xn_scale_buf_inline46"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline44",
+              "xn_scale_buf_inline46"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline52",
+              "xg_buf_inline44"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline64",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline54"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline64",
+              "route_scores_buf_inline54"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "54dffe1fdc98d465339f54fcefa30575b1c1b86a32b5192a112fed1f5ab9b5e4",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "half",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline51"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline52"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline33"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline51"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline49"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline54"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "ea8c2d16affa6ff9776b7dba9b714fee7466bb793b2f317d83037e96fb82c6f6",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline43"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline33",
+              "xg_buf_inline51",
+              "xn_scale_buf_inline52"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline51",
+              "xn_scale_buf_inline52"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline33",
+              "xg_buf_inline51"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline49",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline54"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline49",
+              "route_scores_buf_inline54"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "2fbd6ef5b478017ca86932a6a41e254e09204c41c0cfb0e7862ca127fb807613",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "cypress",
+      "capacity": "native",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline43"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline45"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline51"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline43"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline63"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline53"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "d6fb8d95331295331bcf59f814e20dfb02a37040242142317def308ae158390e",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline67"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline51",
+              "xg_buf_inline43",
+              "xn_scale_buf_inline45"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline43",
+              "xn_scale_buf_inline45"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline51",
+              "xg_buf_inline43"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline63",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline53"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline63",
+              "route_scores_buf_inline53"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "dd1eda98634f4576bf613b0aad8997e1a997b59d8c3f08d0081bd57d294b13a7",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "native",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline43"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline49"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline46"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline43"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline32"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline68"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "c888744fa93dfadf5e1baef71d36750735da779680cf97c45262ab09d188651f",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline41"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline46",
+              "xg_buf_inline43",
+              "xn_scale_buf_inline49"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline43",
+              "xn_scale_buf_inline49"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline46",
+              "xg_buf_inline43"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline32",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline68"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline32",
+              "route_scores_buf_inline68"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "eeaefb30a5503c89432aa4325b5b443f6f7af5798bbf335d54a92671564c15d8",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "native",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline44"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline46"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline52"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline44"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline65"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline54"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "f9ac02ac35952d04ed1cd116a0f86369a477175968dee4d0195f2aa5588cc984",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline69"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline52",
+              "xg_buf_inline44",
+              "xn_scale_buf_inline46"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline44",
+              "xn_scale_buf_inline46"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline52",
+              "xg_buf_inline44"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline65",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline54"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline65",
+              "route_scores_buf_inline54"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "62059df82da9789f1d66eb12f48a4b053bed429d9da19ec1f4d17a3783f6c91d",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "cypress",
+      "capacity": "q1",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline44"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline46"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline52"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline44"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline64"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline54"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "139755c25956c3c2479d5ee94caf0246d3fe1fc28b2c4d3c8fd91f8a5714efef",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline68"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline52",
+              "xg_buf_inline44",
+              "xn_scale_buf_inline46"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline44",
+              "xn_scale_buf_inline46"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline52",
+              "xg_buf_inline44"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline64",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline54"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline64",
+              "route_scores_buf_inline54"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "41d65de7756764ca26857447c6ae1189fc17ac0af6560ed549a6833d752f6504",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "q1",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline50"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline51"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline71"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline50"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline65"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline72"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "69f4233b7b168c11904ed21ea1eb514f391890c5c24c49660fd6d0a441b34acd",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline52"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline71",
+              "xg_buf_inline50",
+              "xn_scale_buf_inline51"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline50",
+              "xn_scale_buf_inline51"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline71",
+              "xg_buf_inline50"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline65",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline72"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline65",
+              "route_scores_buf_inline72"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "c507f311a5ff2b1aa274c252da2ecf02b2a67384e2c2d30a58a10d5b1a754c07",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "q1",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline50"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline51"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline71"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline50"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline65"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline72"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "69f4233b7b168c11904ed21ea1eb514f391890c5c24c49660fd6d0a441b34acd",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline52"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline71",
+              "xg_buf_inline50",
+              "xn_scale_buf_inline51"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline50",
+              "xn_scale_buf_inline51"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline71",
+              "xg_buf_inline50"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline65",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline72"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline65",
+              "route_scores_buf_inline72"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "16cc48d16b5131a07f6703ae58aaf11ea474902bd6597d3ebbd9625d8f27a588",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "cypress",
+      "capacity": "tight",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline52"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline53"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline32"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline52"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline50"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline55"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "5842984d63784b92e11381dc5d3b1455a73982634c1ecacb0f8341e52168d060",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline43"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline32",
+              "xg_buf_inline52",
+              "xn_scale_buf_inline53"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline52",
+              "xn_scale_buf_inline53"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline32",
+              "xg_buf_inline52"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline50",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline55"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline50",
+              "route_scores_buf_inline55"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "2743a708e73df666853cb20377b54917652d100eba67f55e9d98982ca62a2c81",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "dsa_rp_cg",
+      "capacity": "tight",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline52"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline53"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline32"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline52"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline50"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline55"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "ad4f50748014cb59efae310cf12af20d3cb16d8fb0b1575db2dd63208fe8d61f",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline43"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline32",
+              "xg_buf_inline52",
+              "xn_scale_buf_inline53"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline52",
+              "xn_scale_buf_inline53"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline32",
+              "xg_buf_inline52"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline50",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline55"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline50",
+              "route_scores_buf_inline55"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "1fa9c8e1a976f4752d193a6f9375bc4ca3093146e1e330f0a99ccd27d74df113",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    },
+    {
+      "arm": "geometry_ff",
+      "capacity": "tight",
+      "channel": "gate_c2v_slot_buffer",
+      "dir_mask": 1,
+      "edges": [
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 57,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 2
+          },
+          "target": {
+            "access_order": 59,
+            "branch_stack": [
+              0
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 4
+          }
+        },
+        {
+          "kind": "mixed-c2v-availability",
+          "source": {
+            "access_order": 75,
+            "branch_stack": [],
+            "function": "gate_aic",
+            "loop_stack": [],
+            "node": 17
+          },
+          "target": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          }
+        },
+        {
+          "kind": "mixed-slot-release",
+          "source": {
+            "access_order": 92,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 27
+          },
+          "target": {
+            "access_order": 94,
+            "branch_stack": [
+              29
+            ],
+            "function": "gate_aiv",
+            "loop_stack": [],
+            "node": 29
+          }
+        }
+      ],
+      "graph_sha256": {
+        "gate_aic": "03c0a11b70d3ccda640eaf37308a91baba12a439f5503ab1cd1863bf1225c0d6",
+        "gate_aiv": "e7dc08802854f5caed8ff449d6a1adde5b5145c44e886b07ce1ee48f1743f315"
+      },
+      "invocation_model_complete": false,
+      "latency_cycles": null,
+      "orchestration": {
+        "dependencies": [
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xg_buf_inline51"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 1,
+            "tensor": "xn_scale_buf_inline52"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "inv_rms_buf_inline72"
+          },
+          {
+            "kind": "raw",
+            "source": 0,
+            "target": 3,
+            "tensor": "xg_buf_inline51"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "biased_scores_buf_inline66"
+          },
+          {
+            "kind": "raw",
+            "source": 3,
+            "target": 4,
+            "tensor": "route_scores_buf_inline73"
+          }
+        ],
+        "explicit_dummy_sites": 1,
+        "invocation_model_complete": false,
+        "omissions": [
+          "dynamic submit multiplicity",
+          "tensor aliases",
+          "explicit fence expansion",
+          "runtime core/lane assignment and contention"
+        ],
+        "source_sha256": "4853e19e9fe96e8f5169b2cffdae1b334c0f4d45a7aef4e1183a3132a74fd8cc",
+        "tasks": [
+          {
+            "args": "params_t0",
+            "kernels": [
+              "ffn_norm"
+            ],
+            "reads": [
+              "ext_x_mixed",
+              "norm_w_2d_inline53"
+            ],
+            "site": 0,
+            "writes": [
+              "ext_x_norm_scale",
+              "inv_rms_buf_inline72",
+              "xg_buf_inline51",
+              "xn_scale_buf_inline52"
+            ]
+          },
+          {
+            "args": "params_t1",
+            "kernels": [
+              "x_norm_quant"
+            ],
+            "reads": [
+              "xg_buf_inline51",
+              "xn_scale_buf_inline52"
+            ],
+            "site": 1,
+            "writes": [
+              "ext_x_norm_i8"
+            ]
+          },
+          {
+            "args": "params_t2",
+            "kernels": [
+              "gate_pre_route"
+            ],
+            "reads": [],
+            "site": 2,
+            "writes": []
+          },
+          {
+            "args": "params_t3",
+            "kernels": [
+              "gate_aic",
+              "gate_aiv",
+              "gate_aiv"
+            ],
+            "reads": [
+              "ext_gate_bias",
+              "ext_gate_w",
+              "inv_rms_buf_inline72",
+              "xg_buf_inline51"
+            ],
+            "site": 3,
+            "writes": [
+              "biased_scores_buf_inline66",
+              "gm_pipe_buffer_0",
+              "route_scores_buf_inline73"
+            ]
+          },
+          {
+            "args": "params_t4",
+            "kernels": [
+              "route_sort"
+            ],
+            "reads": [
+              "biased_scores_buf_inline66",
+              "route_scores_buf_inline73"
+            ],
+            "site": 4,
+            "writes": [
+              "ext_indices",
+              "ext_weights"
+            ]
+          }
+        ]
+      },
+      "pto_sha256": "77348a6ab136ad81831de1e4198a41be6eb7b0d02e60ee359e603cd7a480aed4",
+      "requires_runtime_lane_expansion": true,
+      "schema_version": 1,
+      "slot_num": 2,
+      "slot_size": 1024
+    }
+  ],
+  "predictions_sha256": "3669f8eef2507abaf0f67b5ced357ad39747fda4ed07feba2569c614e7528a52",
+  "timing_read": false
+}

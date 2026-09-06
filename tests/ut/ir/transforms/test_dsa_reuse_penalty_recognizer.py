@@ -7,6 +7,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import json
+
 import pypto.language as pl
 import pytest
 from pypto import DataType, ir, passes, testing
@@ -17,6 +19,43 @@ def _plan_with_dsa_rp(program):
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
         initialized = passes.init_mem_ref()(program)
         return passes.allocate_memory_addr()(initialized)
+
+
+def test_research_catalog_records_c2v_push_without_local_result(tmp_path):
+    """A sink transfer still reads the accumulator and must complete its catalog."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def main(self, a: pl.Tensor[[16, 16], pl.FP16], b: pl.Tensor[[16, 16], pl.FP16]):
+            left_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            right_mat = pl.load(b, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            left = pl.tile.move(left_mat, target_memory=pl.Mem.Left)
+            right = pl.tile.move(right_mat, target_memory=pl.Mem.Right)
+            acc = pl.tile.matmul(left, right)
+            pl.tile.tpush_to_aiv(acc, split=0)
+
+    with passes.PassContext(
+        [],
+        memory_planner=passes.MemoryPlanner.DSA,
+        dsa_export_dir=str(tmp_path),
+        dsa_reuse_penalty_recognizer=passes.DsaReusePenaltyRecognizer.QUADRATIC,
+    ):
+        passes.allocate_memory_addr()(passes.init_mem_ref()(Before))
+    files = list(tmp_path.glob("*.dsa.json"))
+    assert len(files) == 1
+    document = json.loads(files[0].read_text())
+    catalog = json.loads(document["metadata"]["allocation_accesses_v1"])
+    pushes = [
+        (entry, access)
+        for entry in catalog
+        for access in entry["accesses"]
+        if access["resource"] == "l0_to_ub"
+    ]
+    assert len(pushes) == 1
+    entry, access = pushes[0]
+    assert entry["complete"] is True
+    assert access["mode"] == "read" and access["size"] == 1024 and access["range_known"] is True
 
 
 def _recognized_edges(program) -> set[tuple[str, str, int]]:

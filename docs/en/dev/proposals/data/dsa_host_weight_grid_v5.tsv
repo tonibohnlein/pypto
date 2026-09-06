@@ -1,0 +1,13 @@
+confirmed_device_cells	correct	false_confident_on_measured_nulls	measured_null_cells	model_eligible_cells	silent_ties	strict_predictions	weight_cycles	wrong
+5	3	0	2	14	2	3	0	0
+5	4	0	2	14	1	4	8	0
+5	4	0	2	14	1	4	16	0
+5	4	1	2	14	1	4	24	0
+5	4	1	2	14	1	4	32	0
+5	4	1	2	14	1	4	48	0
+5	4	1	2	14	1	4	64	0
+5	4	2	2	14	1	4	96	0
+5	4	2	2	14	1	4	128	0
+5	4	2	2	14	1	4	160	0
+5	4	2	2	14	1	4	192	0
+5	4	2	2	14	1	4	256	0

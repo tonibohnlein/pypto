@@ -82,7 +82,9 @@ _DEBUG_BRANCH_RE = re.compile(
     r"^\s*\[\s*(\d+)\]\s+BRANCH\s+(IF_BEGIN|ELSE_BEGIN|IF_END)\s+"
     r"\(begin=(\d+),\s*branch=(\d+),\s*end=(\d+)\)"
 )
-_DEBUG_PLACEHOLDER_RE = re.compile(r"^\s*\[\s*(\d+)\]\s+PLACE_HOLDER\s+\(parentScopeId=(\d+)\)")
+_DEBUG_PLACEHOLDER_RE = re.compile(
+    r"^\s*\[\s*(\d+)\]\s+PLACE_HOLDER\s+\(parentScopeId=(\d+)(,\s*virtualElse)?\)"
+)
 _DEBUG_MEM_RE = re.compile(r"^\s*(def|use)=\[(.*)\]\s*$")
 _DEBUG_MEM_ITEM_RE = re.compile(r"(%[^,(\s]+)\(([^)]+)\)")
 _DEBUG_SYNC_RE = re.compile(
@@ -355,8 +357,10 @@ def _operation_attributes(line: str) -> dict[str, Any]:
     attributes: dict[str, Any] = {}
     if match := re.search(r"\brmode\s*=\s*#pto<round_mode\s+([A-Z_]+)>", line):
         attributes["round_mode"] = match.group(1)
-    if match := re.search(r"\bprecisionType\s*=\s*#pto<recip_precision\s+([a-z_]+)>", line):
+    if match := re.search(r"\bprecisionType\s*=\s*#pto<(?:recip|div)_precision\s+([a-z_]+)>", line):
         attributes["precision_type"] = match.group(1)
+    if match := re.search(r"\bcmpMode\s*=\s*#pto<cmp\s+([a-z_]+)>", line):
+        attributes["cmp_mode"] = match.group(1)
     for name in ("descending", "exhausted"):
         if match := re.search(rf"\b{name}\s*=\s*(true|false)\b", line):
             attributes[name] = match.group(1) == "true"
@@ -1433,7 +1437,48 @@ def apply_runtime_parallel_branch_profile(  # noqa: PLR0912 - fail-closed eviden
     return enriched
 
 
-def import_insert_sync_debug(  # noqa: PLR0912,PLR0915 - parser mirrors the debug record state machine
+def import_insert_sync_debug(text: str, *, function: str, pto_text: str | None = None) -> dict[str, Any]:
+    """Import the uniquely matching final trace of a possibly mixed module.
+
+    Legacy dumps do not label phases with function names. Select through the
+    raw-PTO operation/provenance join, never through phase order. Interleaved
+    records are refused; legacy product assemblers may lack a threading flag.
+    Multiple matching phases are ambiguous even when their bytes agree.
+    """
+    marker = "// === [PTOInsertSync Debug] After EventId Allocation === //"
+    terminator = "// ========================================= //"
+    starts = [match.start() for match in re.finditer(re.escape(marker), text)]
+    if not starts:
+        raise ValueError("debug log has no final 'After EventId Allocation' phase")
+    if len(starts) == 1:
+        return _import_final_sync_phase(text, function=function, pto_text=pto_text)
+    if pto_text is None:
+        raise ValueError("multiple final debug phases require raw PTO for function identity")
+    matches = []
+    errors = []
+    for index, start in enumerate(starts):
+        end = text.find(terminator, start + len(marker))
+        if end < 0 or (index + 1 < len(starts) and starts[index + 1] < end):
+            raise ValueError(
+                "interleaved or unterminated final debug phases; a non-interleaved export is required"
+            )
+        try:
+            matches.append(
+                _import_final_sync_phase(
+                    text[start : end + len(terminator)], function=function, pto_text=pto_text
+                )
+            )
+        except ValueError as error:
+            errors.append(str(error))
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected one final trace matching @{function}, found {len(matches)} "
+            f"of {len(starts)} phases; join errors={errors[:3]}"
+        )
+    return matches[0]
+
+
+def _import_final_sync_phase(  # noqa: PLR0912,PLR0915 - parser mirrors the debug record state machine
     text: str, *, function: str, pto_text: str | None = None
 ) -> dict[str, Any]:
     """Convert PTOAS's legacy level-3 final SyncIR dump to schema v1.
@@ -1536,7 +1581,7 @@ def import_insert_sync_debug(  # noqa: PLR0912,PLR0915 - parser mirrors the debu
                 "id": int(match.group(1)),
                 "kind": "placeholder",
                 "parent_scope": int(match.group(2)),
-                "virtual_else": False,
+                "virtual_else": match.group(3) is not None,
                 "loop_stack": list(loop_stack),
                 "branch_stack": list(branch_stack),
                 "operation": {},
@@ -1589,6 +1634,11 @@ def import_insert_sync_debug(  # noqa: PLR0912,PLR0915 - parser mirrors the debu
 
     if not any(node["kind"] == "operation" for node in nodes):
         raise ValueError("final debug phase has no operation nodes")
+    if len({node["id"] for node in nodes}) != len(nodes):
+        raise ValueError("final debug phase repeats node identities; possible interleaved functions")
+    declared_count = re.search(r"(?m)^// nodes=(\d+),", phase[:end])
+    if declared_count is not None and int(declared_count.group(1)) != len(nodes):
+        raise ValueError("final debug phase node count differs from its header; possible interleaving")
     missing_static_loop_bounds = sum(
         node.get("kind") == "loop" and node.get("loop_kind") == "LOOP_BEGIN" for node in nodes
     )
@@ -7078,6 +7128,113 @@ def build_reuse_topology(
     result["calibration_status"] = "topology_only_not_a_latency_model"
     result["topology_only"] = True
     return result
+
+
+def _logical_access_range_known(access: Mapping[str, Any]) -> bool:
+    if access.get("mode") not in {"read", "write"} or not isinstance(access.get("order"), int):
+        raise ValueError("logical allocation has an invalid access")
+    return access.get("range_known") is True and all(
+        isinstance(access.get(k), int) and access[k] >= 0 for k in ("offset", "size", "pool")
+    )
+
+
+def emit_ptoas_logical_memory_topology(
+    record: Mapping[str, Any],
+    problem_path: str | Path,
+    ptoas_graph_path: str | Path,
+    *,
+    function: str | None = None,
+    conservative_ranges: bool = False,
+) -> dict[str, Any]:
+    """Export zero-delay base dependencies from logical allocation identity.
+
+    Views of one source allocation remain related even when lowered to distinct
+    alloc_tile values. Physical placement and penalty candidates are not read.
+    This is output-sensitive pair enumeration within each allocation, not a
+    product compiler pass. Cross-branch edges retain conservative recurrence
+    evidence; finite branch/iteration execution is a separate scoring gate.
+    """
+    name = function or record.get("function")
+    if name != record.get("function"):
+        raise ValueError("logical-memory function differs from schedule")
+    problem = json.loads(Path(problem_path).read_text())
+    if problem.get("instance") != name:
+        raise ValueError("logical-memory function differs from source allocation catalog")
+    by_access, _ = _validated_ptoas_access_node_map(record, ptoas_graph_path, function=name)
+    operations = _schedule_operations_by_access(record)
+    buffers = _index_problem_buffers(problem["problem"]["buffers"])
+    catalog = _allocation_access_catalog(problem, set(buffers))
+    _, markers = _branch_alternatives(record)
+    edges = {}
+    conservative_accesses = []
+    for allocation, accesses in sorted(catalog.items()):
+        live = []
+        for access in accesses:
+            range_known = _logical_access_range_known(access)
+            if access["order"] not in operations:
+                if not _schedule_proves_complete_access_provenance(record):
+                    raise ValueError(f"logical allocation {allocation} has an unbound source access")
+                continue
+            if not range_known:
+                if not conservative_ranges or not isinstance(access.get("pool"), int):
+                    raise ValueError(f"logical allocation {allocation} has an unresolved access range")
+                conservative_accesses.append(dict(allocation=allocation, access_order=access["order"]))
+                # Source identity is known, but the accessed subrange is not.
+                # Ordering against the complete allocation is safe and explicitly
+                # conservative; it must not be described as exact range recovery.
+                access = {**access, "offset": 0, "size": buffers[allocation]["size"]}
+            live.append(access)
+        for source in live:
+            for target in live:
+                if source["pool"] != target["pool"] or source["mode"] == target["mode"] == "read":
+                    continue
+                if max(source["offset"], target["offset"]) >= min(
+                    source["offset"] + source["size"], target["offset"] + target["size"]
+                ):
+                    continue
+                a, b = source["order"], target["order"]
+                first, second = operations[a], operations[b]
+                common = _common_loop_prefix(first, second)
+                distance = int(a >= b)
+                if distance and not common:
+                    continue
+                if not distance and _combined_branch_requirements(first, second, markers) is None:
+                    continue
+                kind = (
+                    "raw"
+                    if source["mode"] == "write" and target["mode"] == "read"
+                    else ("war" if source["mode"] == "read" else "waw")
+                )
+                depths = range(1, len(common) + 1) if distance else (0,)
+                for depth in depths:
+                    key = (by_access[a], by_access[b], kind, distance, depth)
+                    edges.setdefault(key, []).append(
+                        f"allocation={allocation};accesses={a},{b};pool={source['pool']}"
+                    )
+    return {
+        "schema_version": 1,
+        "contract": "ptoas_logical_memory_topology_v1",
+        "topology_only": True,
+        "range_precision": "conservative_allocation_envelope" if conservative_accesses else "source_ranges",
+        "conservative_accesses": conservative_accesses,
+        "function": name,
+        "ptoas_graph_sha256": hashlib.sha256(Path(ptoas_graph_path).read_bytes()).hexdigest(),
+        "allocation_accesses_sha256": hashlib.sha256(
+            problem["metadata"]["allocation_accesses_v1"].encode()
+        ).hexdigest(),
+        "semantics": "same-logical-allocation RAW/WAR/WAW; no physical-address or penalty-catalog inference",
+        "edges": [
+            dict(
+                source_node=a,
+                target_node=b,
+                kind=kind,
+                iteration_distance=distance,
+                recurrence_loop_depth=depth,
+                provenance="|".join(sorted(set(provenance))),
+            )
+            for (a, b, kind, distance, depth), provenance in sorted(edges.items())
+        ],
+    }
 
 
 def emit_ptoas_placement_reuse_topology(

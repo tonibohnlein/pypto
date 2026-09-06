@@ -31,6 +31,14 @@ _CCE_VECTOR_COMPUTE_RELATIVE_PATH = Path(
     "include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compute.hpp"
 )
 _INSTRUCTION_LOWERING_RELATIVE_PATH = Path("include/pto/common/pto_instr.hpp")
+_COMPARE_MODEL_PATH = Path("include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_vector_compare.hpp")
+_CCE_CORE_PATH = Path("include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_core.hpp")
+_CCE_SYNC_PATH = Path("include/pto/costmodel/a2a3/cce_costmodel/cce_costmodel_sync.hpp")
+_MAX_LOWERING_PATH = Path("include/pto/npu/a2a3/TMax.hpp")
+_BINARY_LOWERING_PATH = Path("include/pto/npu/a2a3/TBinOp.hpp")
+_COMPARE_LOWERING_PATH = Path("include/pto/npu/a2a3/TCmps.hpp")
+_DIV_LOWERING_PATH = Path("include/pto/npu/a2a3/TDiv.hpp")
+_SELECT_LOWERING_PATH = Path("include/pto/npu/a2a3/TSel.hpp")
 _REQUIRED_PATHS = (
     _FORMULA_RELATIVE_PATH,
     _ARCH_RELATIVE_PATH,
@@ -41,6 +49,14 @@ _REQUIRED_PATHS = (
     _PERF_SIM_LATENCY_RELATIVE_PATH,
     _CCE_VECTOR_COMPUTE_RELATIVE_PATH,
     _INSTRUCTION_LOWERING_RELATIVE_PATH,
+    _COMPARE_MODEL_PATH,
+    _CCE_CORE_PATH,
+    _CCE_SYNC_PATH,
+    _MAX_LOWERING_PATH,
+    _BINARY_LOWERING_PATH,
+    _COMPARE_LOWERING_PATH,
+    _DIV_LOWERING_PATH,
+    _SELECT_LOWERING_PATH,
 )
 
 _FORMULA_OPCODE = {
@@ -399,6 +415,8 @@ class PtoIsaDurationProvider:
                 return estimate
         if op_name == "pto.tmaxs":
             return self._estimate_calibrated_tmaxs(tiles)
+        if op_name in {"pto.tmax", "pto.tdiv", "pto.tcmps", "pto.tsel"}:
+            return self._estimate_lowered_comparison(node, operand_types, result_types)
         if op_name in _MATMUL_OPS:
             return self._estimate_matmul(op_name, tiles)
         if op_name in _TRANSFER_OPS:
@@ -573,6 +591,130 @@ class PtoIsaDurationProvider:
             f"TMAXS:{tile.dtype}:{tile.rows}x{tile.cols}; repeat_elements={repeat_elements}; "
             f"repeats={repeats}; calibrated=repeat+23",
             "calibrated_instruction_model",
+        )
+
+    def _estimate_lowered_comparison(  # noqa: PLR0912 - explicit per-lowering validity gates
+        self, node: Mapping[str, Any], operand_types: list[str], result_types: list[str]
+    ) -> DurationEstimate:
+        """Price dense fp32 comparisons using pinned A2/A3 CCE lowering.
+
+        This is an isolated-operation approximation: charge an empty vector
+        queue's head and its final tail, and assume the full static tile is
+        valid. It is not an exact-signature device calibration. In particular,
+        TCMPS NE includes the internal barrier and packed-output inversion.
+        """
+        op = str(node["op_name"])
+        required = [_CCE_CORE_PATH, _CCE_SYNC_PATH, _CCE_VECTOR_COMPUTE_RELATIVE_PATH]
+        required += {
+            "pto.tmax": [_MAX_LOWERING_PATH, _BINARY_LOWERING_PATH],
+            "pto.tdiv": [_DIV_LOWERING_PATH, _BINARY_LOWERING_PATH],
+            "pto.tcmps": [_COMPARE_MODEL_PATH, _COMPARE_LOWERING_PATH],
+            "pto.tsel": [_SELECT_LOWERING_PATH],
+        }[op]
+        missing = [str(path) for path in required if path.as_posix() not in self.source_sha256]
+        if missing:
+            return self._unsupported(op, f"snapshot lacks pinned lowering/model sources: {missing}")
+        inputs = [tile for item in operand_types if (tile := parse_tile_type(item)) is not None]
+        outputs = [tile for item in result_types if (tile := parse_tile_type(item)) is not None]
+        if node.get("pipe") != "PIPE_V" or len(outputs) != 1 or not inputs:
+            return self._unsupported(op, "requires PIPE_V, explicit input tiles, and one output tile")
+        src, dst = (inputs[1] if op == "pto.tsel" and len(inputs) >= 2 else inputs[0]), outputs[0]
+        if src.scope != "vec" or src.dtype != "fp32" or src.rows <= 0 or src.cols <= 0:
+            return self._unsupported(op, "only positive-size fp32 vector inputs have supported lowering")
+        for type_name in [*operand_types, *result_types]:
+            if parse_tile_type(type_name) is not None and (
+                "column_major" in type_name
+                or "col_major" in type_name
+                or ("slayout=" in type_name and "slayout=none_box" not in type_name)
+            ):
+                return self._unsupported(op, "requires row-major tiles without boxed sub-layout")
+        if op in {"pto.tmax", "pto.tdiv"}:
+            if len(inputs) != 2 or any(tile != src for tile in [inputs[1], dst]):
+                return self._unsupported(op, "requires two matching fp32 inputs and matching output")
+            if op == "pto.tdiv" and node.get("operation", {}).get("attributes", {}).get(
+                "precision_type"
+            ) not in {None, "default", 0}:
+                return self._unsupported(op, "non-default division requires mode-specific evidence")
+            head, slope, tail = (10, 2, 14) if op == "pto.tmax" else (11, 4, 19)
+            if src.cols < 64 and src.rows <= 255:
+                # TBinOp::Bin1LNormModeSmall: one masked instruction, one
+                # repeat per row, then restore the mask (two scalar sites).
+                cycles = head + slope * src.rows + tail + 2
+                lowering = f"masked_rows={src.rows}; head={head}; slope={slope}; tail={tail}; mask_sites=2"
+            elif src.cols % 64 == 0 and src.rows * src.cols // 64 <= 255:
+                repeats = src.rows * src.cols // 64
+                cycles = head + slope * repeats + tail
+                lowering = f"repeats={repeats}; head={head}; slope={slope}; tail={tail}"
+            else:
+                return self._unsupported(
+                    op, "count-mode or split-repeat binary operation needs additional grounding"
+                )
+        elif op == "pto.tsel":
+            if len(inputs) != 4 or inputs[2] != src or dst != src:
+                return self._unsupported(
+                    op, "requires mask, two matching fp32 inputs, workspace, and matching output"
+                )
+            mask, tmp = inputs[0], inputs[3]
+            if (
+                mask.scope != "vec"
+                or mask.dtype != "u8"
+                or mask.rows != src.rows
+                or mask.cols < _ceil_div(src.cols, 8)
+                or tmp.scope != "vec"
+                or tmp.dtype != "u8"
+                or tmp.rows * tmp.cols < 8
+            ):
+                return self._unsupported(op, "packed mask or fp32 comparison workspace is too small")
+            repeats = _ceil_div(src.cols, 64)
+            # TSel materializes a mask address and drains twice per row.
+            # Charge each row in isolation: dup 11+1+13; vsel 13+2r+14;
+            # three mask/cmpmask sites + two barriers, and three outer sites.
+            cycles = 3 + src.rows * (25 + 13 + 2 * repeats + 14 + 5)
+            lowering = (
+                f"rows={src.rows}; repeats_per_row={repeats}; dup=25; "
+                "vsel_head=13; slope=2; tail=14; internal_barriers_per_row=2; "
+                "isolated_rows_upper_envelope=true"
+            )
+        else:
+            scalar_types = [item for item in operand_types if _SCALAR_TYPE_FULL_RE.fullmatch(item)]
+            mode = node.get("operation", {}).get("attributes", {}).get("cmp_mode")
+            if (
+                len(inputs) != 1
+                or scalar_types != ["f32"]
+                or mode not in {"eq", "ne", "lt", "le", "gt", "ge"}
+            ):
+                return self._unsupported(
+                    op, "requires a scalar fp32 comparator and explicit supported cmp_mode"
+                )
+            if (
+                dst.scope != "vec"
+                or dst.dtype != "u8"
+                or dst.rows != src.rows
+                or dst.cols < _ceil_div(src.cols, 8)
+            ):
+                return self._unsupported(op, "output must hold the per-row packed comparison mask")
+            repeats_per_row = _ceil_div(src.cols, 64)
+            repeats = src.rows * repeats_per_row
+            # TCmps calls vcmpvs once per row/chunk (at most 240 repeats
+            # per call). No intervening drain: only the first pays its head.
+            cycles = 2 + 6 + 2 * repeats
+            inversion = 0
+            if mode == "ne":
+                # NE is EQ followed by PIPE_V drain and count-mode vnot.
+                # The full padded mask is inverted, not the input fp32 tile.
+                inversion = _ceil_div(dst.rows * dst.cols, 256)
+                cycles += 1 + 2 + 8 + 2 * inversion + 12 + 2
+            lowering = (
+                f"mode={mode}; rows={src.rows}; repeats_per_row={repeats_per_row}; "
+                f"vcmpvs_head=6; slope=2; setup_sites=2; inversion_repeats={inversion}; "
+                f"internal_barriers={int(mode == 'ne')}"
+            )
+        return DurationEstimate(
+            float(cycles),
+            "pto_isa_a2a3_cce_lowering",
+            f"{op}:{src.dtype}:{src.rows}x{src.cols}; {lowering}; "
+            "assumes full valid tile and isolated empty queue; CCE model, not device signature",
+            "pinned_analytical_model",
         )
 
     def _estimate_matmul(self, op_name: str, tiles: list[TileType]) -> DurationEstimate:

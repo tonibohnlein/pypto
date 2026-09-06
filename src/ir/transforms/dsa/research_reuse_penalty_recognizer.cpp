@@ -327,6 +327,14 @@ std::optional<RecognizedAccessRoute> ClassifyOperationRoute(const CallPtr& call,
   const std::optional<Memory> result_class =
       result_classes.size() == 1 ? std::optional<Memory>(*result_classes.begin()) : std::nullopt;
 
+  // A frontend Cube->Vector push reads an accumulator but returns no local
+  // value. Its destination is the pipe consumer, so result-type inference
+  // alone cannot classify this real source-allocation access.
+  if (call->op_->name_ == "tile.tpush_to_aiv" && results.empty() && inputs.size() == 1 &&
+      inputs.front().second == Memory::L0) {
+    return RecognizedAccessRoute{Memory::L0, Memory::Ub, Resource::L0ToUb};
+  }
+
   const auto scalar_result = std::find_if(results.begin(), results.end(), [](const VarPtr& result) {
     return result && As<ScalarType>(result->GetType());
   });
