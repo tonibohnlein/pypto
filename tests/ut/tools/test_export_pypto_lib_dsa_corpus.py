@@ -149,6 +149,32 @@ def test_golden_patch_injects_compile_only_dsa_configuration(tmp_path: Path) -> 
     assert (tmp_path / "call-002").is_dir()
 
 
+def test_unified_golden_run_recognizes_jit_entry(tmp_path: Path) -> None:
+    calls: list[dict] = []
+
+    def fake_run(*_args, **kwargs):
+        calls.append(kwargs)
+        return "ok"
+
+    class FakeJit:
+        def compile(self):
+            pass
+
+    golden = SimpleNamespace(run=fake_run)
+    passes = SimpleNamespace(
+        MemoryPlanner=SimpleNamespace(DSA="dsa"),
+        DsaReusePenaltyRecognizer=SimpleNamespace(QUADRATIC="quadratic"),
+    )
+    exporter._patch_golden(golden, passes, tmp_path)
+
+    assert golden.run(fn=FakeJit(), config={"platform": "a2a3sim"}) == "ok"
+    assert calls[0]["config"]["platform"] == "a2a3sim"
+    assert calls[0]["config"]["codegen_only"] is True
+    assert calls[0]["config"]["memory_planner"] == "dsa"
+    assert "skip_ptoas" not in calls[0]["config"]
+    assert "compile_cfg" not in calls[0]
+
+
 def test_compile_for_test_patch_is_optional_for_current_jit_api(tmp_path: Path) -> None:
     jit_decorator = SimpleNamespace(JITFunction=type("JITFunction", (), {}))
     passes = SimpleNamespace()

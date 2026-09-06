@@ -117,7 +117,12 @@ def _patch_golden(
 ) -> None:
     call_index = 0
 
-    def wrap(original: Callable[..., Any], *, jit: bool) -> Callable[..., Any]:
+    def wrap(
+        original: Callable[..., Any],
+        *,
+        force_jit: bool | None = None,
+        unified_config: bool = False,
+    ) -> Callable[..., Any]:
         def compile_only(*args: Any, **kwargs: Any) -> Any:
             nonlocal call_index
             call_index += 1
@@ -132,19 +137,28 @@ def _patch_golden(
                     "dump_passes": False,
                 }
             )
-            if jit:
+            fn = kwargs.get("fn", args[0] if args else None)
+            is_jit = force_jit if force_jit is not None else callable(getattr(fn, "compile", None))
+            if is_jit:
                 compile_cfg["codegen_only"] = True
             else:
                 compile_cfg["skip_ptoas"] = True
-            kwargs["compile_cfg"] = compile_cfg
+            if unified_config:
+                config = dict(kwargs.get("config") or {})
+                config.update(compile_cfg)
+                kwargs["config"] = config
+            else:
+                kwargs["compile_cfg"] = compile_cfg
             kwargs["compile_only"] = True
             kwargs["save_data"] = False
             return original(*args, **kwargs)
 
         return compile_only
 
-    golden.run = wrap(golden.run, jit=False)
-    golden.run_jit = wrap(golden.run_jit, jit=True)
+    has_legacy_run_jit = hasattr(golden, "run_jit")
+    golden.run = wrap(golden.run, unified_config=not has_legacy_run_jit)
+    if has_legacy_run_jit:
+        golden.run_jit = wrap(golden.run_jit, force_jit=True)
 
 
 def _patch_compile_for_test(jit_decorator: Any, passes: Any, export_root: Path) -> bool:
