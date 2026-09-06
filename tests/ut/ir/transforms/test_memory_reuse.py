@@ -3798,6 +3798,101 @@ class TestTopDownRetargeter:
         After = _run_pipeline(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_nested_accumulator_loops_preserve_lineage_entering_if(self):
+        """Nested accumulator loops in both arms keep the pre-if lineage.
+
+        Lowered feature-round-trip kernels use an outer feature-window
+        conditional whose first arm initializes a fresh sink accumulator and
+        whose later arm continues the accumulator carried from the preceding
+        window. AutoTileMatmulL0 can introduce an inner K loop in both arms, and
+        semantic aliases can remain between each loop result and the if yield.
+        MemoryReuse must follow that full lineage: the branch-local initializer
+        is retargeted onto ``prev`` while the persistent lineage is preserved.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 64], pl.BF16],
+                cond: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                sa: pl.Tile[[16, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [16, 64], target_memory=pl.Mem.Mat
+                )
+                sb: pl.Tile[[64, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 64], target_memory=pl.Mem.Mat
+                )
+                prev: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(sa, sb)
+                if cond < 1:
+                    seed: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                        [16, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc
+                    )
+                    for k_first, (first_iter,) in pl.range(0, 2, init_values=(seed,)):
+                        first_acc: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(
+                            first_iter, sa, sb, init_cond=k_first == 0
+                        )
+                        first_loop: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(first_acc)
+                    first_alias: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = first_loop
+                    phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(first_alias)
+                else:
+                    for _k_later, (later_iter,) in pl.range(0, 2, init_values=(prev,)):
+                        later_acc: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(
+                            later_iter, sa, sb
+                        )
+                        later_loop: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(later_acc)
+                    later_alias: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = later_loop
+                    phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(later_alias)
+                result: pl.Tensor[[16, 64], pl.FP32] = pl.store(phi, [0, 0], out)
+                return result
+
+        after = _run_pipeline(Before)
+        acc_bases = {base for base in _collect_tile_memref_bases(after).values() if "acc" in base}
+        assert len(acc_bases) == 1, (
+            "nested branch-local and persistent accumulator lineages must share one allocation; "
+            f"got {sorted(acc_bases)}\n{ir.python_print(after)}"
+        )
+        assert "tile.move" not in ir.python_print(after), (
+            f"nested accumulator lineage must not require an Acc-to-Acc move:\n{ir.python_print(after)}"
+        )
+        _assert_if_phi_arms_write_the_phi_buffer(after)
+
+    def test_two_persistent_accumulator_lineages_fail_closed(self):
+        """Two distinct pre-if accumulator lineages are not silently unified."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 64], pl.BF16],
+                cond: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                sa: pl.Tile[[16, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [16, 64], target_memory=pl.Mem.Mat
+                )
+                sb: pl.Tile[[64, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 64], target_memory=pl.Mem.Mat
+                )
+                prev_a: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(sa, sb)
+                prev_b: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(sa, sb)
+                if cond < 1:
+                    next_a: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(prev_a, sa, sb)
+                    phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(next_a)
+                else:
+                    next_b: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(prev_b, sa, sb)
+                    phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(next_b)
+                result: pl.Tensor[[16, 64], pl.FP32] = pl.store(phi, [0, 0], out)
+                return result
+
+        with pytest.raises(InternalError, match="divergent L0C accumulator buffers"):
+            _run_pipeline(Before)
+
     def test_gating_vec_inplace_if_phi_is_not_acc_coalesced(self):
         """Gating: the accumulator coalescer is Acc-scoped. A structurally
         identical if-phi in Vec space -- ``else`` is an in-place

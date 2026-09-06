@@ -416,33 +416,108 @@ class TopDownRetargeter {
     }
   }
 
-  // True when `var` is produced by an in-place accumulator op: a Call whose op
-  // reuses input `k` (matmul_acc) and whose output MemRef aliases input `k`'s —
-  // i.e. mad_acc's shared %dst.  This branch's buffer is the one we keep; the
-  // other branch's producer is the seed we retarget onto it.
-  bool IsInplaceAccumulatorProducer(const VarPtr& var) {
+  struct InplaceAccumulatorProducer {
+    VarPtr reused_input;
+  };
+
+  // Find the in-place accumulator producer carried by `var`. Pipeline peeling
+  // commonly leaves one or more identity aliases between an if-arm yield and
+  // its final matmul_acc, so inspecting only the yield variable's defining
+  // assignment is insufficient.
+  std::optional<InplaceAccumulatorProducer> FindInplaceAccumulatorProducer(
+      const VarPtr& var, std::set<VarPtr>* visiting = nullptr) {
+    std::set<VarPtr> owned_visiting;
+    if (!visiting) visiting = &owned_visiting;
+    if (!visiting->insert(var).second) return std::nullopt;
+
     auto it = defs_.find(var);
-    if (it == defs_.end() || it->second.kind != VarDef::kAssign) return false;
-    auto assign = As<AssignStmt>(it->second.assign_stmt);
-    if (!assign) return false;
-    auto call = As<Call>(assign->value_);
-    if (!call || !call->op_) return false;
-    const auto& reg = OpRegistry::GetInstance();
-    if (!reg.IsRegistered(call->op_->name_)) return false;
-    auto reuse_idx = reg.GetEntry(call->op_->name_).GetOutputReusesInputArg();
-    if (!reuse_idx.has_value() || *reuse_idx >= call->args_.size()) return false;
-    auto in_var = AsVarLike(call->args_[*reuse_idx]);
-    if (!in_var) return false;
-    auto out_tile = GetTileTypeWithMemRef(var->GetType());
-    auto in_tile = GetTileTypeWithMemRef(in_var->GetType());
-    if (!out_tile || !in_tile) return false;
-    return MemRef::SameAllocation(GetDefinedMemRef(out_tile), GetDefinedMemRef(in_tile));
+    if (it == defs_.end()) return std::nullopt;
+    const auto& def = it->second;
+
+    if (def.kind == VarDef::kAssign) {
+      auto assign = As<AssignStmt>(def.assign_stmt);
+      if (!assign) return std::nullopt;
+      if (auto alias = AsVarLike(assign->value_)) {
+        return FindInplaceAccumulatorProducer(alias, visiting);
+      }
+      auto call = As<Call>(assign->value_);
+      if (!call || !call->op_) return std::nullopt;
+      const auto& reg = OpRegistry::GetInstance();
+      if (!reg.IsRegistered(call->op_->name_)) return std::nullopt;
+      auto reuse_idx = reg.GetEntry(call->op_->name_).GetOutputReusesInputArg();
+      if (!reuse_idx.has_value() || *reuse_idx >= call->args_.size()) return std::nullopt;
+      auto in_var = AsVarLike(call->args_[*reuse_idx]);
+      if (!in_var) return std::nullopt;
+      auto out_tile = GetTileTypeWithMemRef(var->GetType());
+      auto in_tile = GetTileTypeWithMemRef(in_var->GetType());
+      if (!out_tile || !in_tile ||
+          !MemRef::SameAllocation(GetDefinedMemRef(out_tile), GetDefinedMemRef(in_tile))) {
+        return std::nullopt;
+      }
+      return InplaceAccumulatorProducer{in_var};
+    }
+
+    if (def.kind == VarDef::kForReturn) {
+      auto for_stmt = As<ForStmt>(def.control_stmt);
+      auto yield = for_stmt ? FindYieldStmt(for_stmt->body_) : nullptr;
+      if (!yield || def.return_idx >= yield->value_.size()) return std::nullopt;
+      auto yielded = AsVarLike(yield->value_[def.return_idx]);
+      return yielded ? FindInplaceAccumulatorProducer(yielded, visiting) : std::nullopt;
+    }
+    return std::nullopt;
   }
 
-  // For an IfStmt whose branches yield an in-place accumulator on one side and a
-  // fresh seed on the other (a different L0C buffer), retarget the seed onto the
-  // accumulator buffer.  Scoped to Acc — the ISA case with no legal reconciling
-  // move.  A declined retarget is a hard error (see CoalesceAccumulatorIfPhis).
+  // Follow an accumulator's writeback input to the storage seed. A seed whose
+  // definition is outside an IfStmt is the persistent lineage entering that
+  // conditional; a seed defined inside an arm is branch-local initialization.
+  VarPtr FindAccumulatorLineageRoot(const VarPtr& var, std::set<VarPtr>* visiting = nullptr) {
+    std::set<VarPtr> owned_visiting;
+    if (!visiting) visiting = &owned_visiting;
+    if (!visiting->insert(var).second) return nullptr;
+
+    auto it = defs_.find(var);
+    if (it == defs_.end()) return var;  // function parameters enter every nested conditional
+    const auto& def = it->second;
+
+    if (def.kind == VarDef::kAssign) {
+      auto assign = As<AssignStmt>(def.assign_stmt);
+      if (!assign) return nullptr;
+      if (auto alias = AsVarLike(assign->value_)) return FindAccumulatorLineageRoot(alias, visiting);
+      auto call = As<Call>(assign->value_);
+      if (!call || !call->op_) return var;
+      const auto& reg = OpRegistry::GetInstance();
+      if (!reg.IsRegistered(call->op_->name_)) return var;
+      auto reuse_idx = reg.GetEntry(call->op_->name_).GetOutputReusesInputArg();
+      if (!reuse_idx.has_value() || *reuse_idx >= call->args_.size()) return var;
+      auto reused_input = AsVarLike(call->args_[*reuse_idx]);
+      return reused_input ? FindAccumulatorLineageRoot(reused_input, visiting) : nullptr;
+    }
+
+    if (def.kind == VarDef::kForReturn) {
+      auto for_stmt = As<ForStmt>(def.control_stmt);
+      if (!for_stmt || def.return_idx >= for_stmt->iter_args_.size()) return nullptr;
+      auto init = AsVarLike(for_stmt->iter_args_[def.return_idx]->initValue_);
+      return init ? FindAccumulatorLineageRoot(init, visiting) : nullptr;
+    }
+    if (def.kind == VarDef::kIterArg) {
+      auto init = def.iter_arg ? AsVarLike(def.iter_arg->initValue_) : nullptr;
+      return init ? FindAccumulatorLineageRoot(init, visiting) : nullptr;
+    }
+    return nullptr;
+  }
+
+  bool IsDefinedInside(const VarPtr& var, const StmtPtr& scope) const {
+    auto it = defs_.find(var);
+    if (it == defs_.end()) return false;
+    const auto& ancestors = it->second.ancestors;
+    return std::any_of(ancestors.begin(), ancestors.end(),
+                       [&](const StmtPtr& ancestor) { return ancestor.get() == scope.get(); });
+  }
+
+  // For an IfStmt whose branches yield divergent accumulator storage, preserve
+  // the persistent lineage and retarget a branch-local seed onto it. Scoped to
+  // Acc — the ISA case with no legal reconciling move. A declined retarget is a
+  // hard error (see CoalesceAccumulatorIfPhis).
   void TryCoalesceAccIfPhi(const IfStmtPtr& if_stmt) {
     if (!if_stmt->else_body_.has_value() || if_stmt->return_vars_.empty()) return;
     auto then_yield = FindYieldStmt(if_stmt->then_body_);
@@ -455,12 +530,30 @@ class TopDownRetargeter {
       auto else_var = AsVarLike(else_yield->value_[i]);
       if (!then_var || !else_var) continue;
 
-      const bool then_acc = IsInplaceAccumulatorProducer(then_var);
-      const bool else_acc = IsInplaceAccumulatorProducer(else_var);
-      if (then_acc == else_acc) continue;  // need exactly one in-place accumulator
+      auto then_acc = FindInplaceAccumulatorProducer(then_var);
+      auto else_acc = FindInplaceAccumulatorProducer(else_var);
+      if (!then_acc.has_value() && !else_acc.has_value()) continue;
 
-      const VarPtr& acc_var = then_acc ? then_var : else_var;
-      const VarPtr& seed_var = then_acc ? else_var : then_var;
+      VarPtr acc_var;
+      VarPtr seed_var;
+      if (then_acc.has_value() != else_acc.has_value()) {
+        acc_var = then_acc.has_value() ? then_var : else_var;
+        seed_var = then_acc.has_value() ? else_var : then_var;
+      } else {
+        // Both arms can contain in-place accumulator work after nested pipeline
+        // lowering. Preserve the lineage that enters this conditional and
+        // retarget the arm whose seed is local to it. This distinguishes
+        // continuation from initialization without relying on op names, shapes,
+        // or source-specific variable names.
+        auto then_root = FindAccumulatorLineageRoot(then_acc->reused_input);
+        auto else_root = FindAccumulatorLineageRoot(else_acc->reused_input);
+        if (!then_root || !else_root) continue;
+        const bool then_enters = !IsDefinedInside(then_root, if_stmt);
+        const bool else_enters = !IsDefinedInside(else_root, if_stmt);
+        if (then_enters == else_enters) continue;
+        acc_var = then_enters ? then_var : else_var;
+        seed_var = then_enters ? else_var : then_var;
+      }
 
       auto acc_tile = GetTileTypeWithMemRef(acc_var->GetType());
       auto seed_tile = GetTileTypeWithMemRef(seed_var->GetType());
@@ -470,7 +563,9 @@ class TopDownRetargeter {
       auto acc_memref = GetDefinedMemRef(acc_tile);
       if (MemRef::SameAllocation(acc_memref, GetDefinedMemRef(seed_tile))) continue;  // already shared
 
-      auto seed_def = defs_.find(seed_var);
+      auto seed_root = FindAccumulatorLineageRoot(seed_var);
+      if (!seed_root) continue;
+      auto seed_def = defs_.find(seed_root);
       if (seed_def == defs_.end() || seed_def->second.kind != VarDef::kAssign) continue;
       // The seed must be a Call producer we can retype; a bare-Var / tuple rename
       // cannot be retargeted. Leave the phi untouched; YieldFixup will reject
@@ -500,7 +595,7 @@ class TopDownRetargeter {
       // bypass the global liveness (which would false-decline on the legitimate
       // post-if phi consumer). A remaining decline is a genuine "cannot coalesce
       // this Acc phi" — fail loud, since no legal Acc->Acc move exists.
-      const bool ok = RetargetAssign(seed_var, seed_def->second, acc_memref, acc_tile->GetMemorySpace(),
+      const bool ok = TryRetargetVar(seed_var, acc_memref, acc_tile->GetMemorySpace(),
                                      /*check_liveness=*/false);
       INTERNAL_CHECK_SPAN(ok, seed_var->span_)
           << "Internal error: cannot coalesce L0C accumulator across a peeled if-phi — seed producer '"
@@ -521,7 +616,8 @@ class TopDownRetargeter {
 
   /// Attempts to rewrite `var`'s MemRef to `target` by walking its producer chain.
   /// Returns true if var already has target MemRef or a rewrite was planned.
-  bool TryRetargetVar(const VarPtr& var, const MemRefPtr& target, std::optional<MemorySpace> target_memory) {
+  bool TryRetargetVar(const VarPtr& var, const MemRefPtr& target, std::optional<MemorySpace> target_memory,
+                      bool check_liveness = true) {
     if (CurrentBase(var) == target->base_.get()) return true;  // already aligned
     if (!visiting_.insert(var).second) return false;           // cycle
     struct Guard {
@@ -535,16 +631,16 @@ class TopDownRetargeter {
     const auto& def = it->second;
 
     if (def.kind == VarDef::kAssign) {
-      return RetargetAssign(var, def, target, target_memory);
+      return RetargetAssign(var, def, target, target_memory, check_liveness);
     }
     if (def.kind == VarDef::kIfReturn) {
-      return RetargetIfReturn(var, def, target, target_memory);
+      return RetargetIfReturn(var, def, target, target_memory, check_liveness);
     }
     if (def.kind == VarDef::kForReturn) {
-      return RetargetForReturn(var, def, target, target_memory);
+      return RetargetForReturn(var, def, target, target_memory, check_liveness);
     }
     if (def.kind == VarDef::kIterArg) {
-      return RetargetIterArg(var, def, target, target_memory);
+      return RetargetIterArg(var, def, target, target_memory, check_liveness);
     }
     return false;
   }
@@ -561,6 +657,11 @@ class TopDownRetargeter {
                       std::optional<MemorySpace> target_memory, bool check_liveness = true) {
     auto assign = As<AssignStmt>(def.assign_stmt);
     INTERNAL_CHECK_SPAN(assign, var->span_) << "Internal error: kAssign VarDef must carry an AssignStmt";
+    if (auto alias = AsVarLike(assign->value_); alias && !check_liveness) {
+      if (!TryRetargetVar(alias, target, target_memory, check_liveness)) return false;
+      PlanRewrite(var, target, target_memory);
+      return true;
+    }
     auto call = As<Call>(assign->value_);
     if (!call) return false;
     const auto& reg = OpRegistry::GetInstance();
@@ -573,7 +674,7 @@ class TopDownRetargeter {
       if (*reuse_idx >= call->args_.size()) return false;
       auto input_var = AsVarLike(call->args_[*reuse_idx]);
       if (!input_var) return false;
-      if (!TryRetargetVar(input_var, target, target_memory)) return false;
+      if (!TryRetargetVar(input_var, target, target_memory, check_liveness)) return false;
       // Also record that `var`'s MemRef should follow the pinned input to target.
       PlanRewrite(var, target, target_memory);
       return true;
@@ -698,7 +799,7 @@ class TopDownRetargeter {
 
   /// Retype an IfStmt return_var: recurse into both branches' yield values.
   bool RetargetIfReturn(const VarPtr& var, const VarDef& def, const MemRefPtr& target,
-                        std::optional<MemorySpace> target_memory) {
+                        std::optional<MemorySpace> target_memory, bool check_liveness) {
     auto if_stmt = As<IfStmt>(def.control_stmt);
     if (!if_stmt) return false;
     size_t idx = def.return_idx;
@@ -708,7 +809,7 @@ class TopDownRetargeter {
       if (!y || idx >= y->value_.size()) return false;
       auto yv = AsVarLike(y->value_[idx]);
       if (!yv) return false;
-      return TryRetargetVar(yv, target, target_memory);
+      return TryRetargetVar(yv, target, target_memory, check_liveness);
     };
 
     bool then_ok = visit_branch(if_stmt->then_body_);
@@ -726,7 +827,7 @@ class TopDownRetargeter {
   /// match the target, and YieldFixupMutator's PatchIterArgsAndReturnVars
   /// finalises iter_arg/return_var TileType updates.
   bool RetargetForReturn(const VarPtr& var, const VarDef& def, const MemRefPtr& target,
-                         std::optional<MemorySpace> target_memory) {
+                         std::optional<MemorySpace> target_memory, bool check_liveness) {
     auto for_stmt = As<ForStmt>(def.control_stmt);
     if (!for_stmt) return false;
     size_t idx = def.return_idx;
@@ -735,14 +836,14 @@ class TopDownRetargeter {
     if (!y || idx >= y->value_.size()) return false;
     auto yv = AsVarLike(y->value_[idx]);
     if (!yv) return false;
-    if (!TryRetargetVar(yv, target, target_memory)) return false;
+    if (!TryRetargetVar(yv, target, target_memory, check_liveness)) return false;
 
     // Also retype the corresponding iter_arg's init so the next iteration's
     // loop-carried value reads from the same buffer the body just wrote.
     if (idx < for_stmt->iter_args_.size()) {
       auto ia = for_stmt->iter_args_[idx];
       auto init_var = AsVarLike(ia->initValue_);
-      if (init_var && !TryRetargetVar(init_var, target, target_memory)) return false;
+      if (init_var && !TryRetargetVar(init_var, target, target_memory, check_liveness)) return false;
       // Plan rewrite for the IterArg itself (its TileType will be updated).
       PlanRewrite(std::static_pointer_cast<const Var>(ia), target, target_memory);
     }
@@ -755,12 +856,12 @@ class TopDownRetargeter {
   /// itself records a rewrite so RetypeApplier substitutes its TileType in
   /// body references.
   bool RetargetIterArg(const VarPtr& var, const VarDef& def, const MemRefPtr& target,
-                       std::optional<MemorySpace> target_memory) {
+                       std::optional<MemorySpace> target_memory, bool check_liveness) {
     auto iter_arg = def.iter_arg;
     if (!iter_arg) return false;
     auto init_var = AsVarLike(iter_arg->initValue_);
     if (!init_var) return false;
-    if (!TryRetargetVar(init_var, target, target_memory)) return false;
+    if (!TryRetargetVar(init_var, target, target_memory, check_liveness)) return false;
     PlanRewrite(var, target, target_memory);
     return true;
   }
