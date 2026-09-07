@@ -3,6 +3,67 @@
 Host-only consolidation, 2026-09-07. No new placement or device timing.
 This is retrospective development evidence, not a prospective test.
 
+## Latency-guided placement search: implementation status
+
+The historical tables below compare four algorithms. They contain **no device
+measurements of latency-guided placements**. A separate research implementation
+now creates such placements: `python -m pypto.tools.dsa_latency_planner`.
+It starts from an explicit complete legal seed and greedily relocates allocation
+classes to aligned address boundaries. Each candidate is checked against the
+DSA hard constraints before scoring the **union of its physical reuse edges**:
+
+```text
+score(P) = LP(non-reusing SSA/pipe graph + E_reuse(P), w)
+           - LP(non-reusing SSA/pipe graph, w)
+```
+
+The implementation uses the existing complete-placement oracle, including its
+supported loop expansion. It does not invoke InsertSync, use device timings,
+or rely on the penalty-candidate catalog to enumerate physical reuse. Complete
+map scores are cached; the final score is verified uncached. This is bounded
+greedy relocation, **not** C++ canonical greedy or incremental longest-path
+maintenance. It guarantees neither a global optimum nor exhaustive address
+search. Pools and structured pipeline members stay fixed; colocation classes
+move together. Budget exhaustion is reported explicitly.
+
+```bash
+PYTHONPATH=python python -m pypto.tools.dsa_latency_planner \
+  --problem problem.json --seed-solution geometry.solution.json \
+  --objective latency --schedule schedule.jsonl --graph research-graph.txt \
+  --model duration-model.json --max-evaluations 128 \
+  --output-root build/latency-search
+```
+
+The fresh output directory contains `solution.json` and `search.json` with
+input hashes, accepted moves, budgets, scores and duration evidence classes.
+`--objective structural` uses the **same search** with the existing weighted
+reuse sum. Use the same seed and budgets for that diagnostic control; otherwise
+a comparison against structural canonical greedy changes both search and
+objective. Do not describe it as isolating the cost model alone.
+
+The latency objective requires complete non-fallback coverage and a single
+static score. Captured runtime branch profiles, unresolved dynamic scores,
+missing access provenance, input drift and unsupported geometry fail closed.
+Pinned approximations remain labelled approximations; they are not promoted to
+calibrated signatures. Each parent function must be handled explicitly before
+a complete parent replay map can be published.
+
+Three host integration canaries, with one global diagnostic weight of 16 cycles
+and 32 score evaluations per search, produced:
+
+| Function | Structural-search objective | Latency-search penalty (cycles) |
+| --- | ---: | ---: |
+| `build_bias` | 13 → 6 | 461 → 0 |
+| `mtp_hidden_norm_quant` | 30 → 29 | 1017 → 168 |
+| `split_pre_post` | 30 → 24 | 214 → 174 |
+
+These use existing exports and geometry seeds, not a newly frozen 19-workload
+five-arm panel. The searches exhausted their budgets. They demonstrate actual
+placement selection, not device speedups or weight calibration. The host-only
+reproducer is `tests/tools/run_dsa_latency_planner_audit.py`; it reads structural
+artifacts only. Device correctness and balanced timing of the new maps are
+still required.
+
 ## Tables and accounting
 
 | Artifact | Content |

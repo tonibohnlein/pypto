@@ -5,6 +5,58 @@
 [英文文档](../../../en/dev/proposals/dsa_current_paper_development.md) 为准；
 英文目录中的机器表格是唯一数据副本。
 
+## 延迟引导 placement search：实现状态
+
+下方历史表比较四个算法，**不含延迟引导 placement 的设备计时**。
+现在独立研究工具 `python -m pypto.tools.dsa_latency_planner` 可以生成这种
+placement：从显式指定的完整合法 seed 开始，将 allocation class 贪心移动到
+对齐的地址边界。每个 candidate 先验证 DSA hard constraint，再对完整物理
+reuse edge 的并集评分：
+
+```text
+score(P) = LP(non-reusing SSA/pipe graph + E_reuse(P), w)
+           - LP(non-reusing SSA/pipe graph, w)
+```
+
+工具复用现有 complete-placement oracle 及其支持的 loop expansion，不运行
+InsertSync、不读取设备 timing，也不依赖 penalty-candidate catalog 枚举物理
+reuse。缓存完整 map 的分数，最后绕过缓存复核。这是有预算的 greedy relocation，
+**不是** C++ canonical greedy，也未实现增量 longest-path 更新；不保证全局最优
+或遍历所有地址。Pool 与 structured pipeline member 保持不变；colocation class
+整体移动，并显式报告预算耗尽。
+
+```bash
+PYTHONPATH=python python -m pypto.tools.dsa_latency_planner \
+  --problem problem.json --seed-solution geometry.solution.json \
+  --objective latency --schedule schedule.jsonl --graph research-graph.txt \
+  --model duration-model.json --max-evaluations 128 \
+  --output-root build/latency-search
+```
+
+新目录包含 `solution.json` 和 `search.json`，记录输入 hash、接受的移动、预算、
+分数及 duration evidence class。`--objective structural` 使用**相同搜索**和
+原有 weighted reuse sum。诊断 control 必须采用相同 seed 和预算；与 structural
+canonical greedy 比较时，搜索算法和目标都发生变化，不能声称只隔离了 cost model。
+
+延迟目标要求完整 non-fallback coverage 和单一静态分数。Captured runtime branch
+profile、未解析 dynamic score、缺失 access provenance、输入漂移和不支持的几何
+约束均 fail closed。Pinned approximation 仍明确标记，不能称为 calibrated
+signature。发布完整 parent replay map 前，必须逐个处理所有函数。
+
+三个 host integration canary 使用统一诊断权重 16 cycles、每次搜索 32 个 score
+evaluation，结果如下：
+
+| Function | Structural-search objective | Latency-search penalty (cycles) |
+| --- | ---: | ---: |
+| `build_bias` | 13 → 6 | 461 → 0 |
+| `mtp_hidden_norm_quant` | 30 → 29 | 1017 → 168 |
+| `split_pre_post` | 30 → 24 | 214 → 174 |
+
+它们采用既有 export 与 geometry seed，不是新冻结的 19-workload 五算法 panel。
+搜索均耗尽预算。这证明实际 placement selection，不证明设备加速或完成权重校准。
+Host-only 复现工具为 `tests/tools/run_dsa_latency_planner_audit.py`，只读结构性
+artifact。新 map 仍需设备 correctness 与平衡 timing 验证。
+
 ## 数据与计数
 
 - [主表](../../../en/dev/proposals/data/current-paper-development/paper-primary.tsv)：

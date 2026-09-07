@@ -7352,6 +7352,69 @@ def emit_ptoas_placement_reuse_topology(
     return result
 
 
+def score_physical_placement_dag(
+    record: Mapping[str, Any],
+    model: DurationModel,
+    problem_path: str | Path,
+    solution_path: str | Path,
+    ptoas_graph_path: str | Path,
+) -> dict[str, Any]:
+    """Score all physical reuse through the existing complete-placement model.
+
+    This bridges the complete allocation-access topology, not the potentially
+    incomplete penalty candidate catalog, back to the logical schedule IDs.
+    Legality is the caller's responsibility. No InsertSync decisions or device
+    observations participate in scoring. Unsupported model inputs propagate.
+    """
+    topology = emit_ptoas_placement_reuse_topology(record, problem_path, solution_path, ptoas_graph_path)
+    mapping, _ = _validated_ptoas_access_node_map(record, ptoas_graph_path, function=str(record["function"]))
+    inverse = {lowered: source for source, lowered in mapping.items()}
+    nodes = {node["id"]: node for node in record["nodes"]}
+    distance_zero: dict[tuple[int, int], dict[str, Any]] = {}
+    recurrences: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for edge in topology["edges"]:
+        try:
+            source, target = inverse[edge["source_node"]], inverse[edge["target_node"]]
+        except KeyError as error:
+            raise ValueError("physical reuse endpoint has no logical schedule node") from error
+        row = {
+            "source_node": source,
+            "target_node": target,
+            "source_pipe": nodes[source]["pipe"],
+            "target_pipe": nodes[target]["pipe"],
+        }
+        distance = edge.get("iteration_distance", 0)
+        if distance:
+            loops = _common_loop_prefix(nodes[source], nodes[target])
+            depth = edge.get("recurrence_loop_depth")
+            if distance != 1 or not isinstance(depth, int) or not 0 < depth <= len(loops):
+                raise ValueError(f"unsupported physical reuse recurrence: {edge}")
+            loop = loops[depth - 1]
+            recurrences[loop, source, target] = {**row, "loop_node": loop}
+        else:
+            distance_zero[source, target] = row
+    catalog = {
+        "schema_version": 2,
+        "candidate_edge_semantics": "pre_insert_sync_address_reuse_hazards_v1",
+        "distance_zero_edges": list(distance_zero.values()),
+        "loop_recurrence_edges": list(recurrences.values()),
+    }
+    realized = {
+        "synchronization_predictor_coverage_complete": True,
+        "pairs": [
+            {
+                "reuse_realized": True,
+                "distance_zero_schedule_edges": list(distance_zero),
+                "loop_carried_schedule_edges": list(recurrences),
+            }
+        ],
+    }
+    result = score_complete_placement_dag(record, model, catalog, realized)
+    result["topology_source"] = topology["topology_source"]
+    result["realized_physical_pair_count"] = topology["realized_physical_pair_count"]
+    return result
+
+
 def score_reuse_candidates(  # noqa: PLR0912, PLR0915 - explicit provenance and fail-closed gates
     record: Mapping[str, Any],
     candidates: Sequence[ReuseCandidateRecord],
