@@ -1,10 +1,18 @@
 # DSA-RP Device Experiment Ledger
 
-Last consolidated: 2026-09-01.
+Last consolidated: 2026-09-07.
 
 ## Purpose
 
-Latest host-only follow-up: [logical graph repair v7](dsa_logical_graph_repair_v7.md).
+Latest current-corpus table: [paper development consolidation](dsa_current_paper_development.md).
+The rebased device archive `a797b5b0...` contains 19 deterministic driver/argument
+workloads after counting whole-driver measurements correctly, with 9 additional
+sensitivity configurations. All four arms and actual device IDs are retained.
+Matched predictor evaluation covers 12 primary single-function bounds; unit
+penalties capture four decided directions, the DAG three and misses hidden norm.
+This is retrospective analysis, not new device evidence or a prospective freeze.
+
+Earlier host-only follow-up: [logical graph repair v7](dsa_logical_graph_repair_v7.md).
 Logical-view and structured-boundary repairs rescore 51 historical endpoints
 and 60 Gate children; conservative-range cases are separately identified.
 Gate transfer/task dependencies are recovered, but invocation composition is

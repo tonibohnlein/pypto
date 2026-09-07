@@ -1,0 +1,30 @@
+{
+  "deterministic_configurations": 28,
+  "limitations": [
+    "three independent launches per endpoint/device; fixed order per device",
+    "capacity selection retrospective; measured configurations only",
+    "alias count and peak are Cypress proxies; relaxed-edge counts unavailable",
+    "range intersections count original allocation pairs, not contracted Cypress search nodes",
+    "reported medians are medians of launch medians; bootstrap resamples launches",
+    "strict score ordering on a measured small effect does not establish a magnitude error",
+    "DAG scoring on multi-function parents requires composition",
+    "all timing is the driver device window; no per-dispatch extraction"
+  ],
+  "prediction_sha256": "7b2d73417b3adc08eb824c665e833a00cf74c8bb304e0f8e7de4ec659cd0968d",
+  "primary_manifest_sha256": "e53a3065b8663199d1edd535c06d9a899366b49d27d3640587b4ff018b03f213",
+  "primary_measurement_modes": {
+    "PARENT_PROGRAM_WINDOW": 6,
+    "SINGLE_FUNCTION_DRIVER_WINDOW": 13
+  },
+  "primary_workloads": 19,
+  "reserved_candidate_rows": 12,
+  "reserved_families_overlapping_development": [
+    "build_bias",
+    "q_rope_prepare"
+  ],
+  "reserved_source_families": 6,
+  "source_archive": {
+    "filename": "dsa-rp-rebased-corpus-device-continuation-3eabcfd22-final.tar.gz",
+    "sha256": "a797b5b0d93fd963980197df8559c740e2ca05c4251e500dde39728e17e969e7"
+  }
+}

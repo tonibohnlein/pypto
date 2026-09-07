@@ -1,10 +1,16 @@
 # DSA-RP 设备实验记录
 
-最后汇总日期：2026-09-01。
+最后汇总日期：2026-09-07。
 
 ## 用途
 
-最新 host-only 后续：[逻辑图修复 v7](dsa_logical_graph_repair_v7.md)。
+最新当前 corpus 表：[论文开发集汇总](dsa_current_paper_development.md)。
+按真实 whole-driver 计量单位去重后，rebased 设备归档 `a797b5b0...` 包含 19 个
+确定性 driver/参数 workload，另保留 9 个敏感性配置。四个算法与实际设备编号
+均保留。12 个主单函数 bound 的匹配比较中，unit penalties 捕获四个明确方向，
+DAG 捕获三个并漏掉 hidden norm。这是回顾性分析，不是新增设备证据或 prospective freeze。
+
+此前 host-only 后续：[逻辑图修复 v7](dsa_logical_graph_repair_v7.md)。
 逻辑 view 与结构化边界修复后重新评分 51 个历史 endpoint 和 60 个 Gate child，
 分别记录保守范围。Gate transfer/task 依赖已恢复，但 invocation 组合仍不完整，
 混合方向科学门槛未通过；没有新增设备计时、placement 或因果结论。
