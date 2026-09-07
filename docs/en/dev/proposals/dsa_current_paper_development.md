@@ -64,6 +64,43 @@ reproducer is `tests/tools/run_dsa_latency_planner_audit.py`; it reads structura
 artifacts only. Device correctness and balanced timing of the new maps are
 still required.
 
+### Five-arm release preparation
+
+`tests/tools/prepare_dsa_five_arm_release.py` materializes all 95 fixed-panel
+host slots without reading timings. It preserves the four baseline maps,
+checks historical digests, and validates native and selected capacities with
+an independent pair-scan checker. The global sync weight is 16 cycles, fixed
+before search, not fitted. Each child uses a geometry-FF seed and at most 128
+score evaluations. The same-search structural diagnostic is retained. A latency
+parent map is published only if every child scores completely; no fallback.
+
+At planner commit `ae16f3a93`, **5/19 workloads** produce full five-arm maps:
+`dspark_o_lora_quant`, `mtp_dequant`, `mtp_hidden_norm_quant`, `build_bias`, and
+`split_pre_post`. The other 14 have explicit input/model exclusions: missing
+child graphs, unsupported branch/dynamic-loop scores, a `tpush` join, or a
+missing `tcmp` duration. Scorable functions inside blocked parents do not make
+the parent eligible. This is stricter than the older per-function bound
+analysis; it is not a loss of device measurability.
+
+The packet includes graph inputs and pins research PTOAS
+`062d4b16f27f7a6baef91b5d6cfdcf6fe5f2f26f`. Scoring those graphs requires no
+exporter build on the device host. An optional thin Git bundle carries that
+commit on prerequisite `9d72b90ff49f67749ede982b21b30d98508028fb`; it contains no
+uncommitted checkout changes. Product compilation remains official v0.57.
+The external task must report partial coverage, not 19 successes.
+
+Publication uses a file allowlist (128 MiB total, 25 MiB per file), an exact
+manifest, a sidecar, and fresh extraction validation. With the published
+tooling checkout, verify an extracted packet using:
+
+```bash
+PYTHONPATH=python python tests/tools/prepare_dsa_five_arm_release.py verify PACKET
+```
+
+This checks all 95 slots, every published child map against both capacity
+profiles, native fingerprints, map identities and a capacity-overflow negative
+control. It does not replace device replay/comparability/correctness checks.
+
 ## Tables and accounting
 
 | Artifact | Content |

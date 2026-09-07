@@ -57,6 +57,38 @@ evaluation，结果如下：
 Host-only 复现工具为 `tests/tools/run_dsa_latency_planner_audit.py`，只读结构性
 artifact。新 map 仍需设备 correctness 与平衡 timing 验证。
 
+### 五算法 release 准备
+
+`tests/tools/prepare_dsa_five_arm_release.py` 不读取 timing，生成固定 panel 的全部
+95 个 host slot。保留四个 baseline map，复核历史 digest，用独立 pair-scan checker
+验证 native 与 selected capacity。全局同步权重固定为 16 cycles，不拟合；每个 child
+采用 geometry-FF seed、最多 128 次 score evaluation。保留相同搜索的 structural
+control。只有所有 child 均完整可评分时，才发布 latency parent map，不使用 fallback。
+
+在 planner commit `ae16f3a93`，**5/19 workload** 有完整五算法 map：
+`dspark_o_lora_quant`、`mtp_dequant`、`mtp_hidden_norm_quant`、`build_bias`、
+`split_pre_post`。其余 14 个明确排除原因包括 child graph 缺失、不支持的 branch/
+dynamic-loop score、`tpush` join 或 `tcmp` duration 缺失。Blocked parent 内个别
+function 可评分，不等于 parent 可评分。这比之前的 per-function bound 分析严格，
+不表示失去 device measurability。
+
+Packet 携带 graph input，固定 research PTOAS
+`062d4b16f27f7a6baef91b5d6cfdcf6fe5f2f26f`。评分这些 graph 不需要在 device host
+构建 exporter。可选 thin Git bundle 以 `9d72b90ff49f67749ede982b21b30d98508028fb`
+为 prerequisite，包含该 commit，不含未提交修改。Product compiler 仍为 official
+v0.57。外部 task 必须报告 partial coverage，不能声称 19 个全部成功。
+
+发布使用 file allowlist（总计 128 MiB、单文件 25 MiB）、精确 manifest、sidecar，
+并对全新解压目录验证。使用发布的 tooling checkout：
+
+```bash
+PYTHONPATH=python python tests/tools/prepare_dsa_five_arm_release.py verify PACKET
+```
+
+该命令验证 95 个 slot、每个发布 child map 的两种 capacity profile、native fingerprint、
+map identity 和 capacity-overflow negative control；不替代设备 replay/comparability/
+correctness 检查。
+
 ## 数据与计数
 
 - [主表](../../../en/dev/proposals/data/current-paper-development/paper-primary.tsv)：
