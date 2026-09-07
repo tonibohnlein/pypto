@@ -305,7 +305,6 @@ nav:
       - Proposals:
           - en/dev/proposals/dsa_cache_gate_graph_audit_v6.md
           - en/dev/proposals/dsa_current_paper_development.md
-          - en/dev/proposals/dsa_fixed19_five_arm_device_task.md
           - en/dev/proposals/dsa_host_weight_validation_v5.md
           - en/dev/proposals/dsa_logical_graph_repair_v7.md
           - en/dev/proposals/dsa_prospective_expansion_task.md
