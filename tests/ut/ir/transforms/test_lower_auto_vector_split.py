@@ -2351,9 +2351,9 @@ def test_inline_projection_crossing_to_cube_is_gathered():
 
     printed = _lower(Before).as_python()
     # The halved [128, 16] projection is reassembled to the full [256, 16] the cube wants,
-    # along dim 0 (split=1 is UP_DOWN), and the cube placement move rides on that.
+    # along dim 0 (split=1 is UP_DOWN), directly into the authored Mat destination.
     assert "pl.tile.aic_gather(pair[0], split=1)" in printed
-    assert "mat_mat: pl.Tile[[256, 16], pl.INT32, pl.Mem.Mat]" in printed
+    assert "mat: pl.Tile[[256, 16], pl.INT32, pl.Mem.Mat]" in printed
 
 
 def test_loop_init_from_an_inline_projection_carries_the_split():

@@ -1399,10 +1399,10 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             result.push_back(std::make_shared<AssignStmt>(tmov_var, tmov_call, stmt->span_));
             push_source = tmov_var;
           }
-          result.push_back(std::make_shared<EvalStmt>(
-              CreateTpush(push_op, push_source, stmt->span_, op_split, op_lane_stride, pipe_id,
-                          is_mx_scale_boundary),
-              stmt->span_));
+          result.push_back(
+              std::make_shared<EvalStmt>(CreateTpush(push_op, push_source, stmt->span_, op_split,
+                                                     op_lane_stride, pipe_id, is_mx_scale_boundary),
+                                         stmt->span_));
         } else {
           // Op-driven pop: the half/full shape comes from the op result type and
           // the memory from this side's transfer memory; the explicit follow-on

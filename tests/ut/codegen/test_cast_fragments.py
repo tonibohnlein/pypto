@@ -27,6 +27,7 @@ def cast_program(
     source_dtype=pl.INT32,
     target_dtype=pl.FP16,
     mode: str = "round",
+    saturation_mode: str | None = None,
 ):
     if dynamic:
         return _dynamic_cast_program(cols, valid_rows, source_dtype, target_dtype, mode)
@@ -41,7 +42,7 @@ def cast_program(
             logical_cols: pl.Scalar[pl.INDEX],
         ) -> pl.Tensor[[32, cols], target_dtype]:
             tile = pl.load(value, [0, 0], [32, cols], valid_shape=[valid_rows, valid_cols])
-            cast = pl.cast(tile, target_dtype, mode=mode)
+            cast = pl.cast(tile, target_dtype, mode=mode, saturation_mode=saturation_mode)
             return pl.store(cast, [0, 0], output)
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -118,6 +119,27 @@ def test_aligned_cast_keeps_native_fast_path(cols: int, source_dtype, target_dty
     pto = _pto(cast_program(cols, cols, source_dtype=source_dtype, target_dtype=target_dtype, mode=mode))
     assert "tcvt_row" not in pto
     assert pto.count("pto.tcvt ") == 1
+
+
+@pytest.mark.parametrize("saturation_mode", ["on", "off"])
+def test_fragmented_cast_preserves_saturation_mode(saturation_mode: str):
+    """Every fragmented tcvt keeps the authored saturation mode."""
+
+    pto = _pto(
+        cast_program(
+            224,
+            224,
+            source_dtype=pl.FP16,
+            target_dtype=pl.INT8,
+            mode="trunc",
+            saturation_mode=saturation_mode,
+        )
+    )
+    tcvt_lines = [line for line in pto.splitlines() if "pto.tcvt " in line]
+    assert tcvt_lines
+    expected = f"satmode = #pto<saturation_mode {saturation_mode.upper()}>"
+    assert all(expected in line for line in tcvt_lines)
+    assert all("rmode = #pto<round_mode TRUNC>" in line for line in tcvt_lines)
 
 
 @pytest.mark.parametrize("valid_rows", [0, 1, 16, 32])

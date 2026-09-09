@@ -45,6 +45,7 @@ _AUTO_TFREE_OPS = {
 _TILE_MOVE = ir.get_op("tile.move").name
 _TILE_TRANSPOSE_VIEW = ir.get_op("tile.transpose_view").name
 _TILE_TPOP_FROM_AIV = ir.get_op("tile.tpop_from_aiv").name
+_TILE_TPUSH_TO_AIC = ir.get_op("tile.tpush_to_aic").name
 
 
 def _expand_raw(program):
@@ -1687,6 +1688,77 @@ class TestCrossCoreBoundaries:
 
         with pytest.raises(pypto.InternalError, match="full-valid final dimension"):
             _expand_raw(Before)
+
+    def test_mx_scale_v2c_preserves_explicit_pipe_id(self):
+        """MX-scale tagging and an explicit FIFO identity coexist on one push."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP32],
+                rhs_data: pl.Tensor[[64, 32], pl.FP8E4M3FN],
+                rhs_scale_data: pl.Tensor[[2, 32], pl.FP8E8M0, pl.MX_B_NN],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                pl.func_attr(
+                    {
+                        "cross_core_pipe_plan": (
+                            "1;0,2,16,64,1024,4,3,0;1,2,16,2,32,4,5,0;2,1,16,32,2048,4,7,1"
+                        )
+                    }
+                )
+                quant, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), group_axis=1)
+                quant_mat = pl.move(
+                    quant,
+                    target_memory=pl.Mem.Mat,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                lhs = pl.move(quant_mat, target_memory=pl.Mem.Left)
+                scale_mat = pl.move(
+                    scale,
+                    target_memory=pl.Mem.Mat,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                lhs_scale = pl.move(scale_mat, target_memory=pl.Mem.LeftScale)
+                rhs_mat = pl.load(rhs_data, [0, 0], [64, 32], target_memory=pl.Mem.Mat)
+                rhs = pl.move(rhs_mat, target_memory=pl.Mem.Right)
+                rhs_scale_mat = pl.load(
+                    rhs_scale_data,
+                    [0, 0],
+                    [2, 32],
+                    target_memory=pl.Mem.Mat,
+                )
+                rhs_scale = pl.move(rhs_scale_mat, target_memory=pl.Mem.RightScale)
+                result = pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
+                result_vec = pl.move(
+                    result,
+                    target_memory=pl.Mem.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                return pl.store(result_vec, [0, 0], out)
+
+        expanded = _expand_raw(Before)
+        aiv = expanded.get_function("main_incore_0_aiv")
+        assert aiv is not None
+        scale_pushes = []
+        for stmt in _flatten_top_level_stmts(aiv.body):
+            if not isinstance(stmt, ir.EvalStmt) or not isinstance(stmt.expr, ir.Call):
+                continue
+            call = stmt.expr
+            if call.op.name != _TILE_TPUSH_TO_AIC or not call.args:
+                continue
+            source_type = call.args[0].type
+            if isinstance(source_type, ir.TileType) and source_type.dtype == pl.FP8E8M0:
+                scale_pushes.append(call)
+
+        assert len(scale_pushes) == 1
+        assert scale_pushes[0].kwargs["id"] == 5
+        assert "cross_core_pipe_plan" not in ir.python_print(expanded)
 
 
 # ---------------------------------------------------------------------------
