@@ -309,6 +309,15 @@ or call `set_validshape` on the source tile before taking the view.
   (issue #2510). The rows past `validRow` stay stale in the slot, which is what a narrowed
   `valid_shape` already promises about its invalid region, and the transport moves `validRow` rows
   instead of the whole box.
+- Vector-to-Cube follows the same producer/consumer framing rule. A no-split dual-AIV producer
+  transports its logical rows across the full physical column box, so `tpop_from_aiv` uses those
+  same transport extents and then restores the Mat tile's logical `valid_shape` with a metadata-only
+  `pto.treshape` before `tmatmul` or another cube consumer sees it. A genuine split transports the
+  full box on both axes. This distinction matters for padded contraction tails: popping only the
+  logical K extent into a wider Mat frame leaves the frame partially populated and silently makes
+  every matmul output row except the first incorrect. Static empty lanes stay empty, odd splits keep
+  their per-lane operands, and dynamic extents retain the direct-TPOP path because PTO has no dynamic
+  metadata-only rebind for a pipe entry.
 - A **split** Acc-to-Vec transport of a *compact* tile keeps the producer's rows too on a backend
   whose lanes locate their own band in a GM slot (A2/A3). No lane reads a
   slot row at or past `validRow` as data — a lane's band is `clamp(V - lane * S, 0, S)` rows starting
@@ -322,7 +331,7 @@ or call `set_validshape` on the source tile before taking the view.
   differ is **rejected** there. A *runtime* row extent is transported the same way: both the
   `pl.split` and the `pl.split_aiv` forms then pop the full box (see the popped-tile rule above);
   lane 1 loads its whole half, and the rows past the valid extent are stale but never treated as data.
-- When a tpop result `TileView.valid_shape` differs from the physical tile shape, PTO codegen emits PTOAS frontend operands as `%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`. This covers dynamic expressions and static non-full shapes such as `[0, 0]`; the operands carry the logical extents used by compute and store. The full-box Cube-to-Vector transport above overrides this for a statically-shaped, non-empty partial pop, because `pto.treshape` carries no valid-row/valid-col operands and so can only restore *static* logical extents.
+- When a tpop result `TileView.valid_shape` differs from the physical tile shape, PTO codegen emits PTOAS frontend operands as `%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`. This covers dynamic expressions and static non-full shapes such as `[0, 0]`; the operands carry the logical extents used by compute and store. The framed Cube-to-Vector and Vector-to-Cube transports above override this for a statically-shaped, non-empty partial pop, because `pto.treshape` carries no valid-row/valid-col operands and so can only restore *static* logical extents.
 - For split consumers of a hand-written pop, `SplitVectorKernel` localizes those dynamic tpop
   valid-shape operands per subblock (for example global `[8, 16]` becomes
   `[8, 16]` then `[0, 16]` under up/down split of a `[16, 16]` tile). An odd
