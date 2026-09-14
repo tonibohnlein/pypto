@@ -771,15 +771,17 @@ struct MatmulTiling {
   /// for A/B-stationary (loop order comes from `stationarity`) and split-K.
   bool os_holds_a = true;
   /// True when the chooser picked dbC=2 (double-buffered L0C): the accumulator is
-  /// budgeted at L0C/2 so two co-live [m, n] Acc tiles fit, and BuildFullKPipelined
+  /// budgeted at L0C/2 so two co-live [m, n] Acc tiles fit. BuildFullKPipelined
   /// tags the moving loop with kPipelineDoubleBufferCAttr so CanonicalizeIOOrder
-  /// floats the drains past the next matmul, keeping the two tiles co-live.
+  /// floats the drains past the next matmul. The canonical split-K emitter binds
+  /// successive complete reductions to two reusable seeds and emits them in
+  /// reduction/reduction/drain/drain groups.
   /// Under PTOAS, InitMemRef keeps the overlapping-live-range buffers distinct
   /// and ptoas places them. Under PYPTO, flat depth-2 pipeline membership keeps
   /// MemoryReuse from coalescing them; DSA_RP consumes the same relation as a
   /// strict placement separation before its capacity fallback. Set from
-  /// L0TileResult::double_buffer_c; only true for full-K tiles (see the assert
-  /// in AnalyzeMatmul).
+  /// L0TileResult::double_buffer_c; only true when the chosen inner matmul tile
+  /// covers K in full (see the assert in AnalyzeMatmul).
   bool double_buffer_c = false;
   [[nodiscard]] bool is_acc() const { return kind == MatmulKind::kAccumulate; }
   /// True when the chosen L0 tile is smaller than the [M, N] output on either
@@ -1248,17 +1250,16 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   t.output_valid_n = output_valid_shape[1];
   t.stationarity = res.stationarity;
   t.os_holds_a = res.os_holds_a;
-  // dbC=2 is realized only by the full-K emitter: BuildFullKPipelined attaches
-  // kPipelineDoubleBufferCAttr, BuildSplitKGrid never does.  The chooser already
-  // guarantees dbC ⇒ k == K (l0_tile_chooser's require_full_k), and it applied the
-  // L0C/2 accumulator budget on that promise.  Assert the invariant here rather
-  // than silently clamping (`&& k == K`): a clamp would drop the attr but keep the
-  // L0C/2 budget, shipping a shrunk single-buffer tile — the exact regression this
-  // feature exists to avoid.  A future chooser change that sets dbC on a split-K
-  // tile must fail loudly instead.
+  // dbC=2 requires a full-K inner tile: BuildFullKPipelined realizes it with a
+  // pipeline attr, while the enclosing canonical split-K rewrite realizes it by
+  // pairing complete source reductions on two persistent seeds. The chooser
+  // already guarantees dbC ⇒ k == K (l0_tile_chooser's require_full_k), and it
+  // applied the L0C/2 accumulator budget on that promise. Assert the invariant
+  // rather than silently clamping (`&& k == K`): a clamp would drop the schedule
+  // but keep the L0C/2 budget, shipping a shrunk single-buffer tile.
   INTERNAL_CHECK_SPAN(!res.double_buffer_c || res.k == K, assign->span_)
       << "Internal error: chooser set double_buffer_c on a split-K tile (k=" << res.k << ", K=" << K
-      << "); dbC=2 requires the full-K emitter";
+      << "); dbC=2 requires a full-K inner tile";
   t.double_buffer_c = res.double_buffer_c;
   return t;
 }
@@ -1980,6 +1981,18 @@ struct CanonicalSplitKFold {
   VarPtr old_store_result;
 };
 
+/// One output tile of a canonical split-K reduction before its drain is
+/// appended. Keeping the reduction and drain separate lets dbC emission place
+/// two complete reductions before their two drains, making both accumulator
+/// lifetimes overlap without changing the source K-loop semantics.
+struct PendingCanonicalSplitKTile {
+  std::vector<StmtPtr> reduction;
+  VarPtr result;
+  ExprPtr row_offset;
+  ExprPtr col_offset;
+  int step = 0;
+};
+
 std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSplitKAccMatch& match,
                                                              std::vector<Diagnostic>& hints) {
   const auto output_box_alignment = GetCanonicalOutputBoxAlignment(match);
@@ -1991,18 +2004,31 @@ std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSpli
     return std::nullopt;
   }
   // The source loop already realizes output-stationary accumulation across its
-  // K blocks. Use the conservative single-Acc output-stationary chooser regime
-  // for the output grid. This rewrite clones one complete K reduction followed
-  // by its drain for each output tile; unlike BuildFullKPipelined, it does not
-  // emit the two-Acc ``matmul, matmul, drain, drain`` schedule required by a dbC
-  // candidate. Account for the same Mat boxing that RebuildLoad will apply to
+  // K blocks. Account for the same Mat boxing that RebuildLoad will apply to
   // every physical output window, so chooser capacity cannot admit a logical
-  // tile that becomes oversized after padding. The recursively visited
-  // narrowed calls independently choose their legal inner K blocking.
-  auto tiling = AnalyzeMatmul(match.shape_source(), hints, /*force_output_stationary=*/true,
-                              output_box_alignment, /*direct_defs=*/nullptr,
-                              /*disable_double_buffer_c=*/true);
+  // tile that becomes oversized after padding. When the chooser selects dbC,
+  // emission below groups two complete, independent K reductions before their
+  // two drains. That is the split-K analogue of BuildFullKPipelined's
+  // ``matmul, matmul, drain, drain`` schedule: the first result remains live
+  // while the second reduction is issued, and its drain can overlap the second
+  // reduction's cube work. The recursively visited narrowed calls independently
+  // choose their legal inner K blocking.
+  auto tiling =
+      AnalyzeMatmul(match.shape_source(), hints, /*force_output_stationary=*/true, output_box_alignment);
   if (!tiling || !tiling->needs_mn_tiling()) return std::nullopt;
+
+  // Two persistent seeds can be shared by every generated reduction only when
+  // every output window has the same physical and valid type. Boundary tiles
+  // would need a different loop-carried type, and minting another seed for each
+  // boundary geometry would bring back the allocation-root inflation this path
+  // is specifically avoiding. Re-run the chooser in its one-Acc regime instead;
+  // it may select a larger grid tile or decide that no M/N rewrite is needed.
+  if (tiling->double_buffer_c && (match.M % tiling->m != 0 || match.N % tiling->n != 0)) {
+    tiling = AnalyzeMatmul(match.shape_source(), hints, /*force_output_stationary=*/true,
+                           output_box_alignment, /*direct_defs=*/nullptr,
+                           /*disable_double_buffer_c=*/true);
+    if (!tiling || !tiling->needs_mn_tiling()) return std::nullopt;
+  }
 
   auto store_call = As<Call>(match.store->value_);
   auto offsets = As<MakeTuple>(store_call->args_[1]);
@@ -2022,6 +2048,38 @@ std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSpli
   // Output-sensitive expansion: each source statement is cloned once per
   // required output tile, matching BuildSplitKGrid. Work is O(input IR plus
   // emitted IR); there is no repeated scan of the surrounding program.
+  std::vector<PendingCanonicalSplitKTile> pending;
+  pending.reserve(tiling->double_buffer_c ? 2 : 1);
+
+  // A dbC output grid owns exactly two accumulator allocation roots for its
+  // whole lifetime. Reusing these seeds (rather than creating one seed per
+  // output tile and merely assigning equal addresses later) matters to PTOAS
+  // InsertSync, whose dependency state is keyed by alloc_tile root.
+  std::vector<VarPtr> acc_seeds;
+  if (tiling->double_buffer_c) {
+    acc_seeds.reserve(2);
+    const auto window = BuildCanonicalOutputWindow(match, tiling->m, tiling->n, *output_box_alignment);
+    for (int slot = 0; slot < 2; ++slot) {
+      auto init = BuildAccInitWithValidShape(
+          window.physical_m, window.physical_n, MakeIndex(window.valid_m, match.init->span_),
+          MakeIndex(window.valid_n, match.init->span_), out_ty->dtype_,
+          match.init->var_->name_hint_ + "_dbc" + std::to_string(slot), match.init->span_);
+      for (auto& init_stmt : init.stmts) stmts.push_back(std::move(init_stmt));
+      acc_seeds.push_back(init.value);
+    }
+  }
+  auto flush_pending = [&]() {
+    // Emit all reductions before any drain. For dbC this creates the genuine
+    // two-Acc overlap that the chooser budgets; for dbC=1 pending has one item
+    // and preserves the historical reduction-then-drain order exactly.
+    for (auto& tile : pending) {
+      for (auto& stmt : tile.reduction) stmts.push_back(std::move(stmt));
+    }
+    for (const auto& tile : pending) {
+      chain = placer.PlaceAt(stmts, tile.result, tile.row_offset, tile.col_offset, chain, tile.step);
+    }
+    pending.clear();
+  };
   int step = 0;
   for (int64_t nj = 0; nj < num_n; ++nj) {
     const int64_t ni = nj * tiling->n;
@@ -2031,27 +2089,37 @@ std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSpli
       const int64_t m_eff = std::min<int64_t>(tiling->m, match.M - mi);
       const std::string suffix = "_mn" + std::to_string(step);
       const auto window = BuildCanonicalOutputWindow(match, m_eff, n_eff, *output_box_alignment);
-      auto init = BuildAccInitWithValidShape(window.physical_m, window.physical_n,
-                                             MakeIndex(window.valid_m, match.init->span_),
-                                             MakeIndex(window.valid_n, match.init->span_), out_ty->dtype_,
-                                             match.init->var_->name_hint_ + suffix, match.init->span_);
-      for (auto& init_stmt : init.stmts) stmts.push_back(std::move(init_stmt));
+      std::vector<StmtPtr> reduction;
+      VarPtr seed_value;
+      if (tiling->double_buffer_c) {
+        seed_value = acc_seeds[static_cast<size_t>(step) % acc_seeds.size()];
+      } else {
+        auto init = BuildAccInitWithValidShape(window.physical_m, window.physical_n,
+                                               MakeIndex(window.valid_m, match.init->span_),
+                                               MakeIndex(window.valid_n, match.init->span_), out_ty->dtype_,
+                                               match.init->var_->name_hint_ + suffix, match.init->span_);
+        for (auto& init_stmt : init.stmts) reduction.push_back(std::move(init_stmt));
+        seed_value = init.value;
+      }
 
-      std::unordered_map<const Var*, ExprPtr> seed = {{match.init->var_.get(), init.value}};
+      std::unordered_map<const Var*, ExprPtr> seed = {{match.init->var_.get(), seed_value}};
       auto clone = DeepClone(match.loop, seed, /*clone_def_vars=*/true);
       auto cloned_loop = As<ForStmt>(clone.cloned_body);
       INTERNAL_CHECK_SPAN(cloned_loop, match.loop->span_)
           << "Internal error: canonical split-K loop clone is not a ForStmt";
-      CanonicalSplitKRetiler retiler(match, clone.var_map, init.value, mi, ni, window, suffix);
+      CanonicalSplitKRetiler retiler(match, clone.var_map, seed_value, mi, ni, window, suffix);
       auto narrowed = As<ForStmt>(retiler.VisitStmt(cloned_loop));
       INTERNAL_CHECK_SPAN(narrowed, match.loop->span_)
           << "Internal error: canonical split-K retiling did not return a ForStmt";
-      stmts.push_back(narrowed);
-      chain = placer.PlaceAt(stmts, narrowed->return_vars_[0], MakeIndex(mi, match.store->span_),
-                             MakeIndex(ni, match.store->span_), chain, step);
+      reduction.push_back(narrowed);
+      pending.push_back(PendingCanonicalSplitKTile{std::move(reduction), narrowed->return_vars_[0],
+                                                   MakeIndex(mi, match.store->span_),
+                                                   MakeIndex(ni, match.store->span_), step});
+      if (!tiling->double_buffer_c || pending.size() == 2) flush_pending();
       ++step;
     }
   }
+  if (!pending.empty()) flush_pending();
   return CanonicalSplitKFold{std::move(stmts), chain, match.store->var_};
 }
 

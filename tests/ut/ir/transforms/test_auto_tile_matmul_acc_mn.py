@@ -45,10 +45,9 @@ WIDE_K_TILE = 128
 COMPOSE_K_TOTAL = 768
 COMPOSE_K_TILE = 384
 
-# Qwen-like canonical split-K dimensions that previously let the DSA-RP
-# planner's automatic dbC policy shrink N from 256 to 64. The enclosing rewrite
-# emits output tiles sequentially, so that four-tile choice cannot realize the
-# two-Acc schedule the chooser scored.
+# Qwen-like canonical split-K dimensions where the DSA-RP planner's automatic
+# dbC policy shrinks N from 256 to 64. Correct emission groups the four output
+# tiles into two reduction/reduction/drain/drain pairs.
 DBC_REG_M = 16
 DBC_REG_N = 256
 DBC_REG_K_TOTAL = 1024
@@ -520,23 +519,83 @@ def test_predicated_issue_2232_loop_level_mn_tiling():
 
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.DSA_RP, passes.MemoryPlanner.PTOAS])
-def test_canonical_split_k_output_grid_does_not_select_unrealized_dbc(planner):
-    """The enclosing split-K rewrite must not size its grid from a dbC plan.
+def test_canonical_split_k_output_grid_realizes_dbc(planner):
+    """The enclosing split-K rewrite realizes the dbC plan it selects.
 
-    For this Qwen-like shape, enabling dbC in the output-grid chooser selects
-    four 16x64 output tiles so full K=256 fits the double-buffered Right pool.
-    The rewrite drains each tile before starting the next one, so it cannot
-    realize the two-Acc schedule that choice assumes. Keep the one 16x256
-    output tile and let the nested matmul calls select their legal K blocking.
+    For this Qwen-like shape, dbC selects four 16x64 output tiles. Each pair
+    must complete both source K reductions before draining either result, so
+    the two L0C accumulators are genuinely co-live and the first drain can
+    overlap the second reduction's cube work.
     """
     before = _lower_to_auto_tile_input(_jit_program(canonical_split_k_dsa_rp_dbc_regression))
     with _planner_context(planner):
         after = passes.auto_tile_matmul_l0()(before)
 
     printed = ir.python_print(after)
-    assert printed.count("pl.tile.store(") == 1
-    assert "pl.Tile[[16, 256], pl.FP32, pl.Mem.Acc]" in printed
-    assert "pl.Tile[[256, 64], pl.BF16, pl.Mem.Right]" not in printed
+    assert printed.count("pl.tile.store(") == 4
+    assert "pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc]" in printed
+
+    reductions = [
+        i for i, line in enumerate(printed.splitlines()) if "in pl.pipeline(" in line and "stage=2" in line
+    ]
+    drains = [i for i, line in enumerate(printed.splitlines()) if "pl.tile.store(" in line]
+    assert len(reductions) == 4, printed
+    assert reductions[0] < reductions[1] < drains[0] < drains[1], printed
+    assert drains[1] < reductions[2] < reductions[3] < drains[2] < drains[3], printed
+
+
+def test_canonical_split_k_dbc_allocates_exactly_two_accumulators():
+    """The full DSA-RP pipeline preserves the pair as two L0C slots."""
+    from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+    from pypto.pypto_core import codegen  # noqa: PLC0415
+
+    _backend.reset_for_testing()
+    _backend.set_backend_type(BackendType.Ascend910B)
+    with _planner_context(passes.MemoryPlanner.DSA_RP):
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
+            _jit_program(canonical_split_k_dsa_rp_dbc_regression)
+        )
+
+    acc_buffers = {
+        line.strip().split(":")[0]
+        for line in ir.python_print(optimized).splitlines()
+        if "tile.alloc(pl.Mem.Acc" in line
+    }
+    assert len(acc_buffers) == 2, sorted(acc_buffers)
+
+    incore = [func for func in optimized.functions.values() if func.func_type == pl.FunctionType.AIC]
+    assert len(incore) == 1
+    single = ir.Program([incore[0]], incore[0].name, optimized.span)
+    pto = codegen.PTOCodegen().generate(single)
+    allocs = re.findall(
+        r"(?P<name>%[\w.]+) = pto\.alloc_tile addr = (?P<addr>%[\w.]+)[^\n]*loc=acc",
+        pto,
+    )
+    assert len(allocs) == 2, pto
+    assert allocs[0][1] != allocs[1][1], allocs
+    stores = re.findall(r"pto\.tstore ins\((%[\w.]+) : !pto\.tile_buf<loc=acc", pto)
+    assert stores == [allocs[0][0], allocs[1][0], allocs[0][0], allocs[1][0]], pto
+
+
+def test_canonical_split_k_dbc_declines_nonuniform_boundary_slots():
+    """Boundary grids retain the single-Acc reduction/drain order.
+
+    A two-slot seed pair has one static TileType. This grid contains four
+    physical/valid geometries, so sharing the pair would give at least one
+    reduction the wrong loop-carried type. DSA-RP must reselect in the dbC=1
+    regime instead of minting additional allocation roots for the boundaries.
+    """
+    before = _lower_to_auto_tile_input(_jit_program(canonical_split_k_mn))
+    with _planner_context(passes.MemoryPlanner.DSA_RP):
+        after = passes.auto_tile_matmul_l0()(before)
+
+    printed = ir.python_print(after)
+    assert "_dbc" not in printed
+    reductions = [i for i, line in enumerate(printed.splitlines()) if "in pl.pipeline(" in line]
+    drains = [i for i, line in enumerate(printed.splitlines()) if "pl.tile.store(" in line]
+    assert len(reductions) == len(drains) == 4, printed
+    assert all(reduction < drain for reduction, drain in zip(reductions, drains, strict=True)), printed
+    assert all(drains[i] < reductions[i + 1] for i in range(len(drains) - 1)), printed
 
 
 def test_canonical_split_k_tiles_both_m_and_n_with_boundaries():
