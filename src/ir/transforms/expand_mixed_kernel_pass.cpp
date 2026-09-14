@@ -731,15 +731,9 @@ int BoundaryTransportSplitCode(const CVBoundaryMove& bm, const Span& span) {
 }
 
 CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0,
-                    int lane_stride = 0, std::optional<int> pipe_id = std::nullopt,
-                    bool mx_scale_v2c = false) {
-  auto call =
-      OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride, pipe_id), span);
-  if (!mx_scale_v2c) return call;
-  return std::make_shared<Call>(
-      call->op_, call->args_, call->kwargs_,
-      std::vector<std::pair<std::string, std::any>>{{kMxScaleV2CPushAttr, std::any(true)}}, call->GetType(),
-      call->span_);
+                    int lane_stride = 0, std::optional<int> pipe_id = std::nullopt) {
+  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride, pipe_id),
+                                          span);
 }
 
 std::vector<std::pair<std::string, std::any>> SetPipeId(
@@ -1753,10 +1747,9 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             result.push_back(std::make_shared<AssignStmt>(tmov_var, tmov_call, stmt->span_));
             push_source = tmov_var;
           }
-          result.push_back(
-              std::make_shared<EvalStmt>(CreateTpush(push_op, push_source, stmt->span_, op_split,
-                                                     op_lane_stride, pipe_id, is_mx_scale_boundary),
-                                         stmt->span_));
+          result.push_back(std::make_shared<EvalStmt>(
+              CreateTpush(push_op, push_source, stmt->span_, op_split, op_lane_stride, pipe_id),
+              stmt->span_));
         } else {
           // Op-driven pop: the half/full shape comes from the op result type and
           // the memory from this side's transfer memory; the explicit follow-on
