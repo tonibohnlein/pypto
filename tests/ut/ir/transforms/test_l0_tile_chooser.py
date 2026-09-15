@@ -543,6 +543,26 @@ def _load_cycles(m: int, n: int, k: int, cfg, stat: str) -> float:
     return (cfg.bytes_a * M * K * cn) / cfg.bw_a + (cfg.bytes_b * K * N * cm) / cfg.bw_b
 
 
+def _moving_load_cycles(m: int, n: int, k: int, cfg, stat: str) -> float:
+    """The streamed operand's share of C_load (mirrors C++ MovingLoadCycles).
+
+    The held (A/B-stationary) or hoisted (full-K OS) panel is extracted once per
+    outer step before the tiles that read it, so it is NOT part of the compute the
+    emitted moving loop can overlap a drain with. Split-K hoists nothing.
+    """
+    M, N, K = cfg.M, cfg.N, cfg.K
+    cn, cm = _cdiv(N, n), _cdiv(M, m)
+    a_streamed = (cfg.bytes_a * M * K * cn) / cfg.bw_a
+    b_streamed = (cfg.bytes_b * K * N * cm) / cfg.bw_b
+    if stat == _AS:
+        return b_streamed
+    if stat == _BS:
+        return a_streamed
+    if k >= K:
+        return b_streamed if _row_outer(m, n, cfg, stat) else a_streamed
+    return a_streamed + b_streamed
+
+
 def _wall_key(m: int, n: int, k: int, cfg, stat: str, dbc: bool) -> tuple:
     """Re-implement the C++ wall objective + lex tie-breaks for one design point."""
     M, N, K = cfg.M, cfg.N, cfg.K
@@ -576,13 +596,17 @@ def _wall_key(m: int, n: int, k: int, cfg, stat: str, dbc: bool) -> tuple:
     per_drain = cfg.drain_fixed_cycles + m * per_row
     drain = num_drains * per_drain
     compute = max(load, float(mad))
-    # dbC pipeline fill/drain bubble (mirrors C++ WallCycles): the first tile's compute or
-    # the last tile's drain is not overlapped, so the all-hidden T*max(C,D) roofline
-    # undercounts by one tile's non-dominant pipe -> wall = max(agg) + min(agg)/T.
+    # dbC=2 (mirrors C++ ScoreWall): the single-L0C wall minus the drain the emitted
+    # two-accumulator moving loop actually hides. Each drain except the last hides
+    # behind at most the next tile's IN-LOOP compute (moving-operand extract + MAD);
+    # the held/hoisted panel extract precedes the tiles that read it, so it never
+    # hides a drain. With no panel this is the classic max(C,D) + min(C,D)/T bubble.
     if dbc:
-        wall_f = max(compute, drain) + min(compute, drain) / num_drains
+        moving_compute = max(_moving_load_cycles(m, n, k, cfg, stat), float(mad))
+        hidden = (num_drains - 1) * min(moving_compute / num_drains, drain / num_drains)
     else:
-        wall_f = compute + drain
+        hidden = 0.0
+    wall_f = compute + drain - hidden
     wall = int(wall_f + 0.5)
     pvol = _cdiv(M, m) * m * _cdiv(N, n) * n * _cdiv(K, k) * k
     # C_load is a wall-tie-break (after padded-compute + k-blocks, before area/k):
@@ -762,6 +786,86 @@ class TestL0TilingRooflineOptimum:
         # The single-L0C path must NOT pick dbC=2 (gate respected).
         cfg.allow_double_buffer_c = False
         assert passes.l0_tile_chooser.choose_l0_tile(cfg).double_buffer_c is False
+
+    def test_dbc_excludes_the_held_panel_from_the_drain_overlap(self):
+        """A B-stationary grid whose held [K, N] panel dominates the load cannot hide
+        its drains behind that panel: the panel is extracted once, before any output
+        tile exists, so no drain is pending while it runs.
+
+        This is the DSpark ``qk_scores`` shape (64x64x512 BF16 -> FP32 on 910B). The
+        pre-fix formula ``max(compute, drain) + min(compute, drain)/T`` credited the
+        four-tile B-stationary point (16, 64, 512) with hiding its drains behind the
+        whole load-bound compute -- 60% of which is the held B panel -- and selected
+        it over the single-L0C K-only optimum. On device that schedule cost latency
+        (more Acc buffers, one more loop, more synchronization) without the modeled
+        overlap. Charging only the in-loop compute prices that point above every
+        single-L0C alternative, so it is no longer selected.
+        """
+        cfg = _default_config(M=64, N=64, K=512)
+        cfg.allow_k_boundary = True
+        cfg.allow_a_stationary = cfg.allow_b_stationary = True
+        cfg.allow_double_buffer_c = True
+        r = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        single_c = _wall_key(64, 64, 256, cfg, _OS, False)[0]  # the K-only single-L0C optimum
+        assert r.single_buffer_c_cost_cycles == single_c
+        # The formerly selected four-tile held-B point is dearer than single-L0C once
+        # only the moving loop's compute may hide a drain.
+        held_b_four_tiles = _wall_key(16, 64, 512, cfg, _BS, True)[0]
+        assert held_b_four_tiles > single_c
+        assert (r.m, r.n, r.k, r.double_buffer_c) != (16, 64, 512, True)
+        # Whatever survives must be strictly cheaper than the best single-L0C point
+        # under the same schedule-aware model, and its cost decomposition must add up.
+        if r.double_buffer_c:
+            assert r.estimated_cost_cycles < r.single_buffer_c_cost_cycles
+            assert r.hidden_drain_cycles > 0
+        else:
+            assert r.estimated_cost_cycles == r.single_buffer_c_cost_cycles
+            assert r.hidden_drain_cycles == 0
+
+    @pytest.mark.parametrize(
+        "M,N,K",
+        [(64, 64, 512), (16, 256, 128), (64, 256, 256), (512, 512, 64), (160, 160, 64), (256, 256, 256)],
+    )
+    def test_cost_breakdown_adds_up(self, M, N, K):
+        """The exported components reconstruct the ranked wall for every regime.
+
+        ``estimated_cost_cycles == max(load, mad) + drain - hidden``; ``hidden`` is
+        zero for a single-L0C point and strictly positive for dbC=2; a dbC=2 point is
+        adopted only on a strictly lower wall than the best single-L0C point, so
+        ``single_buffer_c_cost_cycles`` records that alternative.
+        """
+        cfg = _default_config(M=M, N=N, K=K)
+        cfg.allow_k_boundary = True
+        cfg.allow_a_stationary = cfg.allow_b_stationary = True
+        cfg.allow_double_buffer_c = True
+        r = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        reconstructed = max(r.load_cycles, r.mad_cycles) + r.drain_cycles - r.hidden_drain_cycles
+        # Components are rounded independently, so allow one cycle per rounded term.
+        assert abs(reconstructed - r.estimated_cost_cycles) <= 3
+        if r.double_buffer_c:
+            assert r.hidden_drain_cycles > 0
+            assert r.estimated_cost_cycles < r.single_buffer_c_cost_cycles
+            # At most one drain per tile but the last can hide, and never more
+            # than the in-loop compute (which excludes the panel extract).
+            tiles = _cdiv(M, r.m) * _cdiv(N, r.n)
+            assert r.hidden_drain_cycles <= (tiles - 1) * r.drain_cycles / tiles + 1
+            assert r.hidden_drain_cycles <= (tiles - 1) * max(r.load_cycles, r.mad_cycles) / tiles + 1
+        else:
+            assert r.hidden_drain_cycles == 0
+            assert r.estimated_cost_cycles == r.single_buffer_c_cost_cycles
+
+    @pytest.mark.parametrize(("M", "N", "K"), [(16, 256, 128), (256, 16, 128), (64, 256, 256)])
+    def test_dbc_survives_when_the_panel_is_the_small_operand(self, M, N, K):
+        """Positive dbC picks hold the SMALL operand, so excluding the panel from the
+        drain-overlap window leaves them strictly cheaper than single-L0C."""
+        cfg = _default_config(M=M, N=N, K=K)
+        cfg.allow_k_boundary = True
+        cfg.allow_a_stationary = cfg.allow_b_stationary = True
+        cfg.allow_double_buffer_c = True
+        r = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert r.double_buffer_c is True
+        assert r.k == K
+        assert r.estimated_cost_cycles < r.single_buffer_c_cost_cycles
 
     def test_default_mask_is_output_stationary(self):
         """With no gate opened the chooser emits only the realizable subset:

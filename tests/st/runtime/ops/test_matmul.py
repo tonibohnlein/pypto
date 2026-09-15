@@ -1713,12 +1713,20 @@ class TestMatmulOperations:
         "planner,m,k,n,expected_tile",
         [
             pytest.param(MemoryPlanner.PYPTO, 192, 64, 512, (64, 512, 64), id="pypto"),
-            pytest.param(MemoryPlanner.DSA_RP, 64, 80, 256, (32, 256, 80), id="dsa_rp"),
-            pytest.param(MemoryPlanner.PTOAS, 64, 80, 256, (32, 256, 80), id="ptoas"),
+            pytest.param(MemoryPlanner.DSA_RP, 64, 160, 128, (32, 128, 160), id="dsa_rp"),
+            pytest.param(MemoryPlanner.PTOAS, 64, 160, 128, (32, 128, 160), id="ptoas"),
         ],
     )
     def test_matmul_autol0_b_stationary(self, test_runner, platform, planner, m, k, n, expected_tile):
-        """Planner-pinned B-stationary schedule; sequential outer N, pipelined inner M."""
+        """Planner-pinned B-stationary schedule; sequential outer N, pipelined inner M.
+
+        The dbC planners use 64x160x128 rather than the earlier 64x80x256. Both
+        are B-stationary, but at N=256 the held [80, 256] Right panel is most of
+        the load, and the schedule-aware dbC cost no longer credits a held panel
+        with hiding a drain (it is extracted before the tiles that read it), so
+        that shape's cheapest plan became output-stationary. 64x160x128 keeps a
+        genuine B-stationary two-slot ping-pong on device.
+        """
         choice = _choose_a2a3_l0(m, k, n, planner=planner, bytes_a=2, bytes_b=2)
         assert (choice.m, choice.n, choice.k) == expected_tile
         assert choice.stationarity == _core_passes.l0_tile_chooser.Stationarity.BStationary

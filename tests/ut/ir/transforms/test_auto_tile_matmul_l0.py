@@ -2694,10 +2694,10 @@ class TestAutoTileMatmulL0MNTiling:
             (
                 passes.MemoryPlanner.PTOAS,
                 64,
-                80,
-                256,
-                256,
-                "pl.range(0, 256, 256,",
+                160,
+                128,
+                128,
+                "pl.range(0, 128, 128,",
                 "pl.pipeline(0, 64, 32,",
                 True,
             ),
@@ -2706,7 +2706,16 @@ class TestAutoTileMatmulL0MNTiling:
     def test_system_b_stationary_shapes_emit_held_b(
         self, planner, M, K, N, held_n, outer_loop, inner_loop, double_buffer_c
     ):
-        """Planner-specific B-stationary system shapes keep B in the outer loop."""
+        """Planner-specific B-stationary system shapes keep B in the outer loop.
+
+        The dbC row uses 64x160x128 rather than the earlier 64x80x256. Both are
+        B-stationary, but at N=256 the held [80, 256] Right panel is most of the
+        load, and the schedule-aware dbC cost no longer credits a held panel with
+        hiding a drain (it is extracted before the tiles that read it), so that
+        shape's cheapest plan became output-stationary. 64x160x128 holds a [160,
+        128] panel against two moving [32, 160] A tiles, which keeps a genuine
+        B-stationary ping-pong as the optimum and preserves this row's coverage.
+        """
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
 
@@ -3115,6 +3124,203 @@ class TestAutoTileMatmulL0MNTiling:
             if "pto." in mlir or "func.func" in mlir:
                 generated = True
         assert generated, "direct-store full-K must generate valid PTO MLIR"
+
+
+# The three planner configurations that can place two co-live L0C accumulators:
+# (planner, enable_pypto_l0c_double_buffer). PYPTO needs its experimental opt-in;
+# DSA_RP and PTOAS place the pair from actual lifetimes and ignore the flag.
+_DBC_PLACEMENT_PLANNERS = [
+    (passes.MemoryPlanner.PYPTO, True),
+    (passes.MemoryPlanner.DSA_RP, False),
+    (passes.MemoryPlanner.PTOAS, False),
+]
+_DBC_PLACEMENT_PARAMS = [
+    pytest.param(
+        planner, pypto_dbc, id=f"{planner}".rsplit(".", maxsplit=1)[-1] if not pypto_dbc else "PYPTO-opt-in"
+    )
+    for planner, pypto_dbc in _DBC_PLACEMENT_PLANNERS
+]
+
+
+class TestAutoTileMatmulL0DbCScheduleContract:
+    """dbC=2 is a *schedule of the full-K output grid*: the chooser enumerates it
+    only for a destination whose emitter realizes it, scores it on the schedule
+    that emitter produces, and consults the memory planner only for placement.
+    The three planners that can place two co-live accumulators therefore emit the
+    same schedule, and a destination without an output grid never receives a plan
+    it would have to discard.
+    """
+
+    @staticmethod
+    def _fresh_store_program(M: int, K: int, N: int):
+        """A fresh BF16 matmul whose sole consumer is one 2D store (direct-store)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.BF16],
+                rhs: pl.Tensor[[K, N], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.tile.store(c, [0, 0], out)
+                return out
+
+        return Before
+
+    @staticmethod
+    def _run(program, planner, pypto_dbc: bool):
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        with passes.PassContext([], memory_planner=planner, enable_pypto_l0c_double_buffer=pypto_dbc):
+            return passes.auto_tile_matmul_l0()(program)
+
+    @pytest.mark.parametrize(("planner", "pypto_dbc"), _DBC_PLACEMENT_PARAMS)
+    def test_qk_scores_shape_does_not_select_the_held_panel_grid(self, planner, pypto_dbc):
+        """DSpark ``qk_scores``: ``[64, 512] @ [512, 64]`` BF16 -> FP32 on Ascend910B.
+
+        The 16 KiB result fits L0C, so the single-L0C optimum is the K-only loop
+        (k = 256). The pre-fix chooser turned it into a B-stationary grid of four
+        [16, 64] tiles under dbC=2: the held [512, 64] Right panel is 60% of the
+        load-bound compute and is extracted before any output tile exists, so the
+        modeled drain overlap never happened, while the emitted program grew from
+        one to two Acc buffers and gained a loop and its synchronization (the
+        archived ``dspark_qk_pv`` 8->12 Acc / 4->5 loop expansion). Excluding the
+        panel from the overlap window prices that point above single-L0C.
+
+        The schedule-aware model still selects a two-tile B-stationary ping-pong
+        ([32, 512] Left tiles): one ``matmul, matmul, store, store`` chunk that
+        pipeline lowering fully unrolls, so no loop survives. Its modeled gain is
+        one hidden drain minus one extra FIXPIPE fixed cost; whether that single
+        compute/drain pair repays its second Acc buffer on device is for the
+        device-validation task (the #2131 sweep found the one-pair form tied for
+        user-authored pipelines).
+        """
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+        Before = self._fresh_store_program(64, 512, 64)
+        After = self._run(Before, planner, pypto_dbc)
+        printed = ir.python_print(After)
+        # The archived regression schedule: four [16, 512] Left tiles against a held B.
+        assert "pl.pipeline(0, 64, 16," not in printed
+        assert "[16, 512], target_memory=pl.Mem.Left" not in printed
+        # The surviving plan: B held in a 1-trip outer loop, two moving A tiles.
+        assert "pl.range(0, 64, 64," in printed
+        assert "pl.pipeline(0, 64, 32," in printed
+        assert "[32, 512], target_memory=pl.Mem.Left" in printed
+        assert "[512, 64], target_memory=pl.Mem.Right" in printed
+        assert printed.count("pipeline_double_buffer_c") == 1
+        _assert_ssa_valid(After, f"test_qk_scores_shape_{planner}")
+
+        # After the full pipeline the schedule is straight-line: two co-live Acc
+        # buffers, but none of the loop expansion the four-tile grid produced.
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        with passes.PassContext([], memory_planner=planner, enable_pypto_l0c_double_buffer=pypto_dbc):
+            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+        final = ir.python_print(optimized)
+        acc_buffers = {
+            line.strip().split(":")[0] for line in final.splitlines() if "tile.alloc(pl.Mem.Acc" in line
+        }
+        assert len(acc_buffers) == 2, f"{planner}: expected the two-slot ping-pong, got {sorted(acc_buffers)}"
+        assert "pl.range(" not in final and "pl.pipeline(" not in final, (
+            "no loop may survive the two-tile chunk"
+        )
+
+    @pytest.mark.parametrize(("planner", "pypto_dbc"), _DBC_PLACEMENT_PARAMS)
+    def test_destinations_without_an_output_grid_get_the_k_only_plan(self, planner, pypto_dbc):
+        """Qwen-like ``[16, 64] @ [64, 1024]`` matmuls whose result cannot be M/N-tiled.
+
+        With dbC open, the pre-fix chooser returned a four-tile 16x256 dbC plan for
+        this shape; the folds then rejected it (a caller-owned ``tile.matmul_acc``
+        accumulator, a Vec-resident left operand, or a result whose consumer is not
+        a store), so the plan was discarded and the K-only rewrite lost. The
+        destination now fixes the schedule capability BEFORE the chooser runs:
+        these destinations have no output-grid emitter, so the chooser plans the
+        K-only loop under every planner -- structurally the plan PYPTO emits
+        without any dbC opt-in.
+        """
+        M, K, N = 16, 64, 1024
+
+        @pl.program
+        class AccumulateBefore:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.BF16],
+                rhs: pl.Tensor[[K, N], pl.BF16],
+                acc_init: pl.Tile[[M, N], pl.FP32, pl.Mem.Acc],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul_acc(acc_init, lhs_mat, rhs_mat)
+                out = pl.tile.store(c, [0, 0], out)
+                return out
+
+        @pl.program
+        class VecLeftBefore:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.BF16],
+                rhs: pl.Tensor[[K, N], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_vec = pl.tile.load(lhs, [0, 0], [M, K], target_memory=pl.Mem.Vec)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul(lhs_vec, rhs_mat)
+                out = pl.tile.store(c, [0, 0], out)
+                return out
+
+        @pl.program
+        class NonStoreConsumerBefore:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[M, K], pl.BF16],
+                rhs: pl.Tensor[[K, N], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [K, N], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul(lhs_mat, rhs_mat)
+                c_vec = pl.tile.move(c, target_memory=pl.Mem.Vec)
+                out = pl.tile.store(c_vec, [0, 0], out)
+                return out
+
+        for label, Before in [
+            ("matmul_acc", AccumulateBefore),
+            ("vec_left", VecLeftBefore),
+            ("non_store_consumer", NonStoreConsumerBefore),
+        ]:
+            baseline = self._run(Before, passes.MemoryPlanner.PYPTO, False)
+            After = self._run(Before, planner, pypto_dbc)
+            printed = ir.python_print(After)
+            assert "pipeline_double_buffer_c" not in printed, label
+            assert "pl.range(" not in printed, label
+            assert f"pl.pipeline(0, {K}, 16," in printed, f"{label}: expected the K-only loop"
+            ir.assert_structural_equal(After, baseline)
+            _assert_ssa_valid(After, f"test_grid_less_{label}_{planner}")
+
+    def test_planners_share_the_dbc_contract_up_to_placement(self):
+        """PYPTO with its opt-in, DSA_RP and PTOAS emit the identical dbC schedule for a
+        direct-store grid, and PYPTO without the opt-in -- lacking the placement
+        capability -- keeps the single-L0C plan. 16x128x256 BF16 forms a 1x2 grid
+        that holds the small [16, 128] Left panel, so the schedule-aware model still
+        prefers dbC there."""
+        Before = self._fresh_store_program(16, 128, 256)
+        outputs = [self._run(Before, planner, pypto_dbc) for planner, pypto_dbc in _DBC_PLACEMENT_PLANNERS]
+        for other in outputs[1:]:
+            ir.assert_structural_equal(outputs[0], other)
+        assert ir.python_print(outputs[0]).count("pipeline_double_buffer_c") == 1
+        single = self._run(Before, passes.MemoryPlanner.PYPTO, False)
+        assert "pipeline_double_buffer_c" not in ir.python_print(single)
+        assert "pl.range(" not in ir.python_print(single)
 
 
 class TestAutoTileMatmulL0ExistingPipelineDbC:
@@ -4015,9 +4221,9 @@ class TestAutoTileMatmulL0Skips:
     def test_oversized_predicated_matmul_acc_mn_still_deferred(self):
         """A predicate does not unlock M/N tiling for ``tile.matmul_acc``.
 
-        ``TryFoldMNTiling`` / ``TryFoldMatScratch`` refuse every accumulate
-        tiling, so ``BuildFullKPipelined`` and ``BuildSplitKGrid`` — neither of
-        which threads a predicate — stay unreachable for the accumulate kind.
+        ``ClassifyMNDestination`` gives every accumulate call no grid
+        destination, so ``BuildFullKPipelined`` and ``BuildSplitKGrid`` — neither
+        of which threads a predicate — stay unreachable for the accumulate kind.
         If a refactor ever lets a predicated call reach them, the predicate
         would be dropped silently; this fails loudly instead.
         """

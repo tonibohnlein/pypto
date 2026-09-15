@@ -86,7 +86,11 @@ program_tiled = l0_tile_pass(program)
 `ChooseL0Tile` 通过**穷举式 roofline 搜索**挑选 L0 GEMM tile，而非闭式公式。对每个合法且对齐的 `(m, n, k)`（每维都是 `GetL0FractalAlignment()` 的倍数，L0C 预算按 `AlignUp(m, l0c_align_m) × n` 计算），它以核心 cycle 估算 wall-clock 并返回最小者：
 
 - 当 FIXPIPE 的 L0C→L1 drain 暴露在外（单 L0C）时，`wall ≈ max(C_load, C_mad) + C_drain`；
-- 当 drain 被计算掩盖（L0C 双缓冲，`T` 个输出 tile）时，`wall ≈ max(C_load, C_mad, C_drain) + min(compute, C_drain) / T`。其中 `+ min(…)/T` 是流水线的**填充/排空气泡**——第一个 tile 的计算（或最后一个 tile 的 drain）没有可重叠的对象，因此理想的全掩盖 `T·max` roofline 会少算一个 tile 的非主导流水（两个输出 tile 时为较小流水的 50%，在 2×2 网格上约为 25%）。这可避免在小网格上过度选择 dbC=2。
+- 当 drain 被双缓冲掩盖时，`wall ≈ max(C_load, C_mad) + C_drain − hidden`，其中 `hidden = (T − 1) · min(max(L_moving, C_mad)/T, C_drain/T)`，`T` 为输出 tile 数。
+
+  dbC 形式是单 L0C 的 wall **减去实际发射的调度真正掩盖掉的那部分 drain**，而不是理想化的全掩盖 roofline。每个 tile 的 drain 至多与**移动循环**在上一条 MAD 之后发射的计算重叠——即移动操作数的 extract 加上下一条 MAD——因此只有 `L_moving`（`C_load` 中流式操作数的那一份）是可掩盖的。**被钉住或被外提的面板**（`C_load − L_moving`）不可掩盖：`BuildFullKPipelined` 在外层循环体的开头就 extract 它，此时读取它的那些 tile 尚未开始、没有任何 drain 在飞行中；单缓冲的常驻面板还要等上一轮外层迭代的全部 MAD 完成。把它计为可重叠的计算，就是宣称了一个该调度无法实现的重叠；而在常驻面板主导 load 的形状上——B-stationary 的 `[K, N]` 面板——这份虚增的收益会让多 tile 的 dbC 网格压过更便宜的单 L0C 方案（见[为什么常驻面板掩盖不了 drain](#为什么常驻面板掩盖不了-drain)）。当不存在常驻面板（`L_moving = C_load`）时，该式退化为熟悉的填充/排空气泡 `max(compute, C_drain) + min(compute, C_drain)/T`：第一个 tile 的计算或最后一个 tile 的 drain 没有可重叠的对象。`T` 计入包括 peeled 边界在内的所有输出 tile；这些 tile 在流水化内部区域之后以直线形式发射，其 drain 实际上是暴露的，因此在有 peel 的网格上该项偏乐观。只按 `⌊M/m⌋·⌊N/n⌋` 个内部 tile 计费是后续的 tail-accurate 改进；它会改动 FP32 系统测试的固定几何形状，故此处刻意不采用。
+
+  `ChooseL0Tile` 会报告代价分解——`load_cycles`、`mad_cycles`、`drain_cycles`、`hidden_drain_cycles` 以及 `single_buffer_c_cost_cycles`（最优的 dbC=1 备选）——以便把某个 dbC 选择与它所声称的调度对照审计。只有当某 dbC=2 设计点的 wall **严格**低于 `single_buffer_c_cost_cycles` 时才会被采纳；chooser 在返回前断言该不变量。
 
 `C_load` 是所选循环序下 L1→L0A/L0B 的操作数流量，按 `GetL0CostModel()` 给出的各 buffer 带宽缩放（设备 MTE1 实测：`bw_l0a≈130`、`bw_l0b≈85` B/cyc，约 1.52:1）；`C_mad` 是 cube MAD 代价（每条 `TMATMUL` 的发射开销 × K-fractal 数）。`C_drain` 是 FIXPIPE 的 L0C 回写，**按每个输出 tile 计费**、且为**按 M-行**的代价：`⌈M/m⌉·⌈N/n⌉ · (drain_fixed + m·(max(drain_row, bytes_c·n/bw_drain) + drain_penalty·(odd(⌈n/N0⌉)−1)))`。这是对设备 FIXPIPE 实测的直接拟合：FIXPIPE 每次只处理 `N1 M1 M0 N0` FRACTAL_NZ 累加器的一个 M-行（故代价 ∝ `m`），每行用分组 `nburst`/`loop` 遍历 `N1 = ⌈n/N0⌉` 个 N-fractal（`N0 = 32/bytes_c = 8`，fp32 L0C）。每行代价是 `max(floor, throughput)`——一个与 N 无关的固定 burst-issue **下限** `drain_row`（窄 N 时主导），或按字节的 **吞吐** `bytes_c·n/bw_drain`（宽 N 时主导，交叉点约 n=131）——再加**非对齐**残差：非 2 的幂的 fractal 数会把奇部 `odd(N1)−1` 串行成额外 pass，每 M-行按 `drain_penalty` 计费（判据是 **`N1` 非 2 的幂**，而非字面的 `N%32`：`n=80 → odd(10)=5` 被惩罚，`n=96 → odd(12)=3` 也被惩罚，尽管 `96%32=0`；对齐的 2 的幂 `N1`（如 `n=128 → 16`）不计费）。由于 drain 数为 `⌈M/m⌉·⌈N/n⌉`，**拆分输出（M/N）会增加 drain 数，而拆分 K 不会**（部分和在单块 L0C 上累加，每个 `(m,n)` 块只回写一次）。按-M-行的形式使 chooser 倾向**宽-N / 小-M** 的 tile（每次 drain 的 FIXPIPE 行更少），并把非对齐-N tile 正确定价从而不被过度选择——例如 `320×320` 选到对齐的 `(160,128,64)`，而非 drain-bound 的 `160×80`。设备验证（drain 0.93–1.09×，load R²=0.993）。搜索对每个 `(m, n)` 的**所有**合法 `k` 都穷举（不是只取最大合法 k —— 当 `kt ≠ align_k` 时 `⌈K/k⌉·⌈k/kt⌉` 关于 `k` 非单调）。wall 平局时按 `(padded_compute, ⌈K/k⌉, C_load, …)` 字典序决出；其中 `C_load` 键在 MAD-bound 的 `(m,n)`↔`(n,m)` 平局中挑出隐藏 load 更低的那一侧（L0B 带宽更慢，故 m-block 更少者更省）。
 
@@ -95,21 +99,77 @@ program_tiled = l0_tile_pass(program)
 - **stationarity（常驻方向）** `{output, A, B}` —— 哪个操作数在 L0 网格上被钉住（常驻）。它**推导出**各操作数的双缓冲深度（`dbA`/`dbB`）：移动的操作数双缓冲（深度 2），常驻的单缓冲（深度 1）。它们不被独立搜索。
 - **dbC** `{1, 2}` —— 是否对 L0C 累加器做双缓冲，以便把 FIXPIPE drain 与下一个 tile 的计算重叠。
 
+### 调度能力：哪些设计点可以被枚举
+
 一个**可实现掩码（realizable mask）**（即 `allow_a_stationary` /
 `allow_b_stationary` / `allow_double_buffer_c`）把被枚举和发射的设计点限制为
-已有 lowering 支持的那些；关闭的轴不参与打分。本 pass 打开
-**A/B-stationary**：被钉住的操作数在移动网格上以**单缓冲**形式常驻
-（`k == K`），由 `BuildFullKPipelined` 的 `ForKind::Sequential` 外层循环实现；
-若外层流水化，则需要两倍的满 L0 预算。
+目标 destination 能够 lowering 的那些；关闭的轴不参与打分。
+
+A/B-stationary 与 dbC=2 都是**同一个 full-K 输出网格的不同调度**，因此只有会发射
+该网格的 destination 才可以枚举它们。为此，本 pass 在调用 chooser **之前**先解析每
+个 matmul 的 M/N 网格 destination（`ClassifyMNDestination`），并传入一个
+`ScheduleCapability`，指明将要消费该计划的 emitter：
+
+| `GridEmitter` | Destination | A/B-stationary | dbC=2 |
+| ------------- | ----------- | -------------- | ----- |
+| `kPipelinedFullK` | direct-store 或 Mat-scratch placer 背后的 `BuildFullKPipelined` | 是 | 是 |
+| `kSequentialClones` | 规范 split-K 改写 | 否 | 否 |
+| `kNone` | 无输出网格：仅 K 切分改写 | 否 | 否 |
+
+这为候选枚举、打分、fold 选择与最终发射建立了唯一的事实来源。需要网格的计划一定
+有对应的 emitter，因此**不会有 chooser 结果被静默丢弃**——两个方向本 pass 都有断言。
+此前这些 gate 仅由 planner 身份打开，于是无法 lowering 该结果的 destination 也会收到
+它：随后 fold 拒绝该计划，调用点要么退回到在另一种调度下选出的方案，要么为一个根本
+不会发生的重叠而把 tile 压缩到 L0C/2 的预算。
+
+另有两项**放置（placement）**能力与 emitter 相互独立，也是 memory planner 唯一介入
+的地方：
+
+- **共存累加器**——`DSA_RP` 与 `PTOAS` 始终具备；`PYPTO` 仅在
+  `PassContext(enable_pypto_l0c_double_buffer=True)` 下具备，因为 issue #1908 在某些
+  链式 Mat-scratch 布局下仍可能导致操作数缓冲溢出。
+- **常驻面板与 Mat-scratch 消费者并存**——`DSA_RP` 与 `PTOAS` 按实际生命周期放置，
+  能把消费者较小的 buffer 打包进已释放的区间；旧版 `PYPTO` allocator 无法细分该区间
+  （#1908），因此链式 Mat-scratch 生产者在该 planner 下保持 output-stationary。
+
+除此之外，资格与收益判断均与 planner 无关：三种能够放置该累加器对的配置，对同一形状
+会选出**相同**的调度。
 
 **dbC=2** 是双累加器 L0C ping-pong，即 tile *i* 的 FIXPIPE drain 与 tile
-*i+1* 的 MAD 重叠。它在 `memory_planner=DSA_RP` 与
-`memory_planner=PTOAS` 下自动开启。旧版 `PYPTO` planner 仍保留实验性显式
-开关（`PassContext(enable_pypto_l0c_double_buffer=True)`，默认关闭），因为
-issue #1908 在某些链式 Mat-scratch 布局下仍可能导致操作数缓冲溢出。
-`BuildFullKPipelined` 给移动循环加上 `kPipelineDoubleBufferCAttr`，
-`CanonicalizeIOOrder` 把两个 store 都浮到两个 matmul 之后
-（`matmul, matmul, store, store`），从而让两个累加器生命周期共存。
+*i+1* 的 MAD 重叠。`BuildFullKPipelined` 给移动循环加上
+`kPipelineDoubleBufferCAttr`，`CanonicalizeIOOrder` 把两个 store 都浮到两个 matmul
+之后（`matmul, matmul, store, store`），从而让两个累加器生命周期共存。
+
+#### 为什么常驻面板掩盖不了 drain
+
+发射出来的 full-K 网格是一个持有单个操作数面板的固定外层循环，加上一个流水化的移动
+内层循环：
+
+```python
+for o in pl.range(0, N, n):                 # 固定：常驻的 B 面板
+    b = pl.tile.extract(rhs, 0, o, [K, n], target_memory=pl.Mem.Right)
+    for i in pl.pipeline(0, M, m, stage=2, attrs={"pipeline_double_buffer_c": True}):
+        a = pl.tile.extract(lhs, i, 0, [m, K], target_memory=pl.Mem.Left)
+        c = pl.tile.matmul(a, b)            # 只有它和 `a` 能掩盖 drain
+        out = pl.tile.store(c, [i, o], out)
+```
+
+`b` 每个外层迭代只 extract 一次，且发生在任何累加器持有结果之前，因此没有任何 drain
+可与之重叠。两次 drain 之间被发射的只有 `a` 与那条 MAD。对 DSpark 的 `qk_scores`
+（`[64, 512] @ [512, 64]`，BF16 → FP32）而言，常驻的 `[512, 64]` 面板约占 load-bound
+计算的 60%；把它计入可掩盖部分，会把仅 K 切分的单 L0C 方案变成四 tile 的 B-stationary
+dbC 网格，而该网格在设备上因额外累加器、额外循环及其同步而付出延迟代价，却拿不到模型
+所声称的重叠。排除该面板后，这一设计点的定价高于所有单 L0C 备选。
+
+#### 为什么规范 split-K 不具备 dbC 资格
+
+规范 split-K 改写会**为每个输出 tile 克隆一次完整的源 K 归约及其 drain**，且按顺序执
+行。没有任何操作数面板跨 tile 常驻，也从不会有第二个累加器同时存活，因此不存在可供
+dbC 计划实现的跨 tile drain 重叠——在此开启 dbC 只会把 tile 压缩到 L0C/2 的预算。对
+Qwen 这类 `16×256×256` 的源面板，它会选出四个 `16×64` 输出 tile 而非一个 `16×256`，
+从而成倍增加 Left/Right/Mat buffer 与同步。该不具资格性源自 emitter 契约
+（`kSequentialClones`），而非某个调用点上的开关，因此对所有 planner 都成立，也不会被
+新的调用方重新引入。只有把该 emitter 改成交错执行两路归约，才可能解除这一限制。
 
 三种 planner 以不同方式保留该意图。对符合条件的 PTOAS 流水线，
 [`LowerPipelineToSlots`](30-lower_pipeline_to_slots.md) 把各 stage 表示成同一分配的
@@ -119,8 +179,8 @@ PTOAS 自行把对应 stage buffer 放到不同 offset。`PYPTO` 使用
 `MemoryReuse` 的容量门控（#1475）在可负担深度内保持 buffer 分离。`DSA_RP`
 也跳过 `MemoryReuse`；它把流水线 stage 分离表示为硬约束，
 先运行有界严格搜索，仅当该搜索未找到满足容量的放置时才把流水线意图分离放宽为软
-惩罚。dbC=2 要求 full-K，且移动的内层轴至少有两个**完整** tile；固定的外层轴
-可以只有一个 tile。发射的循环方向遵循 chooser 的 stationarity/hoist 决策，
+惩罚。dbC=2 要求使用 full-K 流水化网格 emitter、`k == K`、移动的内层轴至少有两个
+**完整** tile，且 wall 严格低于最优的单 L0C 设计点；固定的外层轴可以只有一个 tile。发射的循环方向遵循 chooser 的 stationarity/hoist 决策，
 peeled 的部分边界不计作 ping-pong stage。因此，以行作为外层时允许 1×2 网格，
 以列作为外层时允许 2×1 网格。Mat-scratch（`Acc→Mat`，`tile.assemble`）的
 drain 也以相同方式浮动。若 `PassManager` 在一个 planner
@@ -244,7 +304,7 @@ out_t1 = pl.store(c_t1, [256, 0], out_t0)  # 子块 store 到 out[256:512, 0:256
 
 边界子块（当 `m`/`n` 不整除 `M`/`N`）的逻辑尺寸为 `[min(m, M-mi), min(n, N-ni)]` —— 例如 Ascend910B 上的 256×256 FP32 matmul（chooser 选 `m = 192, n = 160`）会切成逻辑尺寸为 `192×160`、`192×96`、`64×160`、`64×96` 的四个子块。对于规范 split-K 改写，每个操作数的物理 Mat shape 会按其有效 boxed layout 粒度向上对齐，而 `valid_shape` 保留逻辑尺寸。该粒度属于 chooser 的容量合法性判断，包括逻辑整块 INT8 N=80 被补齐为物理 N=96 的情况。`tile.matmul` / `tile.matmul_acc` 将相同的物理/有效尺寸区别传播到循环携带的 Acc，`tile.store` 则仍在原逻辑偏移处只传输有效矩形。例如，N 尾块为 16 列的 INT8 Right tile 会以物理 `[K, 32]`、`valid_shape=[K, 16]` 表示，并产生物理 N=32、有效 N=16 的 Acc。
 
-对于规范 split-K 链，同一输出网格包围的是完整的**源 K 归约**，而不是切片最终 Acc。Issue #2232 中，逻辑 INT32 `[16, 1152]` 结果在 Ascend910B 上的物理占用为 `32 × 1152 × 4 = 144 KiB`，因此需要沿 N 切分。每个生成的 N 子块都会运行全部八个源 K block 并 store 结果，然后才开始下一个 N 子块。
+对于规范 split-K 链，同一输出网格包围的是完整的**源 K 归约**，而不是切片最终 Acc。Issue #2232 中，逻辑 INT32 `[16, 1152]` 结果在 Ascend910B 上的物理占用为 `32 × 1152 × 4 = 144 KiB`，因此需要沿 N 切分。每个生成的 N 子块都会运行全部八个源 K block 并 store 结果，然后才开始下一个 N 子块。由于每个 tile 在下一个开始前就已 drain，该网格在所有 planner 下都按单 Acc 的 output-stationary 方案定尺寸——见[为什么规范 split-K 不具备 dbC 资格](#为什么规范-split-k-不具备-dbc-资格)。
 
 ### Fits-L0c 链式 matmul（cast-fold）
 

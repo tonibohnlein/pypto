@@ -45,6 +45,16 @@ WIDE_K_TILE = 128
 COMPOSE_K_TOTAL = 768
 COMPOSE_K_TILE = 384
 
+# Qwen-like canonical split-K dimensions whose 16x256 output fits one L0C. A
+# dbC-open chooser once sized this grid as four 16x64 output tiles so the full
+# K=256 source panel fit the halved Right pool -- the archived Qwen regression.
+# The enclosing rewrite clones one complete reduction and drain per tile, so
+# no two-Acc overlap exists for that choice to realize.
+DBC_REG_M = 16
+DBC_REG_N = 256
+DBC_REG_K_TOTAL = 1024
+DBC_REG_K_TILE = 256
+
 # Full-pipeline counterpart to the reviewer's (656,80,768) chooser case. The
 # old logical candidate (576,48,32) boxes to physical Acc [576,64] = 144 KiB,
 # while these smaller source panels also fit together in the 512 KiB Mat arena.
@@ -170,6 +180,24 @@ def canonical_split_k_n_boundary_retiles_k_predicated(
             bt = b[k0 : k0 + COMPOSE_K_TILE, 0:WIDE_N]
             acc = pl.matmul_acc(acc, at, bt, init_cond=(k0 == 0))
         c[0:WIDE_M, 0:WIDE_N] = acc
+    return c
+
+
+@pl.jit
+def canonical_split_k_dbc_regression(
+    a: pl.Tensor[[DBC_REG_M, DBC_REG_K_TOTAL], pl.BF16],
+    b: pl.Tensor[[DBC_REG_K_TOTAL, DBC_REG_N], pl.BF16],
+    c: pl.Out[pl.Tensor[[DBC_REG_M, DBC_REG_N], pl.FP32]],
+):
+    """Qwen-like split-K chain whose full output fits one L0C accumulator."""
+    for _ in pl.spmd(1):
+        acc = pl.create_tensor([DBC_REG_M, DBC_REG_N], dtype=pl.FP32)
+        for kb in pl.pipeline(0, DBC_REG_K_TOTAL // DBC_REG_K_TILE, stage=2):
+            k0 = kb * DBC_REG_K_TILE
+            at = a[0:DBC_REG_M, k0 : k0 + DBC_REG_K_TILE]
+            bt = b[k0 : k0 + DBC_REG_K_TILE, 0:DBC_REG_N]
+            acc = pl.matmul_acc(acc, at, bt, init_cond=(k0 == 0))
+        c[0:DBC_REG_M, 0:DBC_REG_N] = acc
     return c
 
 
@@ -795,6 +823,43 @@ def test_non_seed_predicate_leaves_the_reduction_untouched(capfd):
 
     ir.assert_structural_equal(after, before)
     assert "PH-AT-006" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("planner", "pypto_dbc"),
+    [
+        pytest.param(passes.MemoryPlanner.PYPTO, True, id="PYPTO-opt-in"),
+        pytest.param(passes.MemoryPlanner.DSA_RP, False, id="DSA_RP"),
+        pytest.param(passes.MemoryPlanner.PTOAS, False, id="PTOAS"),
+    ],
+)
+def test_canonical_split_k_output_grid_never_selects_dbc(planner, pypto_dbc):
+    """The enclosing split-K rewrite has no two-Acc schedule to offer the chooser.
+
+    It clones one complete source reduction followed by its drain per output tile,
+    sequentially: no operand panel is held across tiles and no second accumulator
+    is ever live. Its schedule capability (``GridEmitter::kSequentialClones``)
+    therefore admits neither operand stationarity nor dbC, whatever the planner.
+    For this Qwen-like 16x256x256 source panel a dbC-open chooser selected four
+    16x64 output tiles so full K fit the halved Right pool; the rewrite could not
+    overlap their drains, and the emitted program multiplied its Left/Right/Mat
+    buffers and synchronization instead (the archived Qwen +10.7% regression).
+    The grid must stay one 16x256 tile with inner-K blocking -- structurally the
+    output PYPTO emits without any dbC opt-in.
+    """
+    before = _lower_to_auto_tile_input(_jit_program(canonical_split_k_dbc_regression))
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        baseline = passes.auto_tile_matmul_l0()(before)
+    with passes.PassContext([], memory_planner=planner, enable_pypto_l0c_double_buffer=pypto_dbc):
+        after = passes.auto_tile_matmul_l0()(before)
+
+    printed = ir.python_print(after)
+    assert printed.count("pl.tile.store(") == 1
+    assert "pl.Tile[[16, 256], pl.FP32, pl.Mem.Acc]" in printed
+    assert "pl.Tile[[256, 64], pl.BF16, pl.Mem.Right]" not in printed
+    assert "pipeline_double_buffer_c" not in printed
+    assert "pl.range(" not in printed
+    ir.assert_structural_equal(after, baseline)
 
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])

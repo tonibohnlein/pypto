@@ -96,8 +96,11 @@ struct Candidate {
   int64_t traffic = 0;
   int64_t cost_cycles = 0;
   int64_t padded_compute = 0;
-  double load_cycles = 0;  // C_load — a wall-tie-break (hidden under max() when MAD-bound)
-  Regime regime;           // the (stationarity, dbC) this tile was scored under
+  double load_cycles = 0;    // C_load — a wall-tie-break (hidden under max() when MAD-bound)
+  double mad_cycles = 0;     // C_mad
+  double drain_cycles = 0;   // C_drain over every output tile
+  double hidden_cycles = 0;  // drain hidden by the dbC=2 ping-pong (0 for dbC=1)
+  Regime regime;             // the (stationarity, dbC) this tile was scored under
 };
 
 // All legal k values for a fixed (m, n), ascending. k is a REAL search axis:
@@ -343,40 +346,86 @@ double DrainCycles(int m, int n, const L0TileConfig& cfg) {
   return num_drains * per_tile;
 }
 
-// Roofline wall in cycles. With a single L0C (drain_hidden=false) the FIXPIPE
-// drain is exposed -- the cube stalls on each tile's store -- so it ADDS to the
-// pipe maximum. With L0C double-buffered (drain_hidden=true) drain(i) overlaps
-// compute(i+1), so the T output-tile drains JOIN the maximum instead of adding --
-// but the pipeline is not perfectly overlapped end to end: the first tile's
-// compute (fill) and the last tile's drain (drain) have no partner to hide behind.
-// So the ideal all-hidden T*max(C,D) roofline undercounts by exactly one tile's
-// *non-dominant* pipe:
-//     wall_dbc = T*max(C_tile, D_tile) + min(C_tile, D_tile)
-//              = max(compute, drain) + min(compute, drain) / T      (T = num tiles)
-// At a 2x2 grid (T=4) this restores ~25% of the smaller pipe the old
-// all-drains-hidden form dropped, so dbC is not over-picked on small grids and is
-// not biased toward drain-heavy tiles whose exposed tail otherwise read as free.
-// The exposed pipe is the drain when compute-bound and the compute (fill) when
-// drain-bound; min() is whichever is exposed either way. The bubble uses the
-// average tile (C_tile=compute/T, D_tile=drain/T); on a peeled-tail grid the actual
-// exposed tile is smaller, so this is a slight -- and safe (conservative) --
-// over-correction. Tail-accurate pricing is a follow-up (see docs).
-int64_t WallCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
-  const double compute = std::max(LoadCycles(m, n, k, cfg, r), static_cast<double>(MadCycles(m, n, k, cfg)));
-  const double drain = DrainCycles(m, n, cfg);
-  double wall;
+// The share of C_load that the emitted full-K grid's MOVING loop issues per tile:
+// the streamed operand's extracts. The remainder -- the held (A/B-stationary) or
+// hoisted (full-K output-stationary) panel -- is extracted once per outer step,
+// BEFORE the tiles that read it (BuildFullKPipelined emits the panel extract at the
+// head of its outer body; a held panel is single-buffered, so the next panel also
+// waits for every MAD of the previous step). Split-K re-streams both operands and
+// hoists nothing, so there the whole load moves.
+double MovingLoadCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
+  const double M = cfg.M, N = cfg.N, K = cfg.K;
+  const double ceil_n = static_cast<double>(CeilDiv(cfg.N, n));
+  const double ceil_m = static_cast<double>(CeilDiv(cfg.M, m));
+  const double a_streamed = (static_cast<double>(cfg.bytes_a) * M * K * ceil_n) / cfg.bw_a;
+  const double b_streamed = (static_cast<double>(cfg.bytes_b) * K * N * ceil_m) / cfg.bw_b;
+  switch (r.stat) {
+    case Stationarity::kAStationary:
+      return b_streamed;  // A held once per outer step; B streams through the inner loop
+    case Stationarity::kBStationary:
+      return a_streamed;  // B held; A streams
+    case Stationarity::kOutputStationary:
+      if (k >= static_cast<int>(K)) return OSHoldsHoldA(m, n, cfg) ? b_streamed : a_streamed;
+      return a_streamed + b_streamed;  // split-K: nothing hoisted
+  }
+  return a_streamed + b_streamed;
+}
+
+// Per-candidate roofline components, all in core cycles.
+struct WallBreakdown {
+  double load = 0;    // C_load
+  double mad = 0;     // C_mad
+  double drain = 0;   // C_drain (every output tile)
+  double hidden = 0;  // drain hidden by the dbC=2 ping-pong (0 for dbC=1)
+  double wall = 0;
+};
+
+// Roofline wall in cycles. With a single L0C the FIXPIPE drain is exposed -- the
+// cube stalls on each tile's store -- so it ADDS to the pipe maximum:
+//     wall_1 = compute + drain,   compute = max(C_load, C_mad)
+//
+// With L0C double-buffered (dbC=2), drain(i) overlaps whatever the emitted moving
+// loop issues after MAD(i): the moving operand's extract for tile i+1 and MAD(i+1)
+// (LowerPipelineLoops + CanonicalizeIOOrder emit `extract, extract, matmul, matmul,
+// store, store` chunks). The wall is therefore the single-L0C wall minus the drain
+// that overlap actually hides. The held / hoisted panel extract (C_load - L_moving)
+// hosts no overlap and is deliberately excluded from the hideable compute: it runs
+// before the tiles that read it, when no drain is pending. For an operand-stationary
+// schedule whose held panel dominates the load (a B-stationary [K, N] panel),
+// counting it as overlappable compute claimed a drain hiding that the emitted
+// schedule cannot perform -- the DSpark qk_scores regression. Each tile except the
+// last hides at most the per-tile in-loop compute, and the per-tile drain when that
+// is smaller (drain-bound loop):
+//     hidden = (T - 1) * min(max(L_moving, C_mad) / T, C_drain / T)
+//     wall_2 = compute + drain - hidden
+// With no panel (L_moving == C_load) this reduces to the classic fill/drain-bubble
+// form max(compute, drain) + min(compute, drain)/T: the first tile's compute or the
+// last tile's drain has no partner to hide behind. T counts every output tile: the
+// peeled boundary tiles are emitted straight-line after the pipelined interior, so
+// their drains are in fact as exposed as under dbC=1 and this form is optimistic on
+// a peeled grid. Charging only the floor(M/m)*floor(N/n) interior tiles is the
+// tail-accurate follow-up; it re-pins the FP32 system-test geometries (160x160,
+// 144x144, 448x448 at K=64) and is deliberately not applied here.
+WallBreakdown ScoreWall(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
+  WallBreakdown w;
+  w.load = LoadCycles(m, n, k, cfg, r);
+  w.mad = static_cast<double>(MadCycles(m, n, k, cfg));
+  w.drain = DrainCycles(m, n, cfg);
+  const double compute = std::max(w.load, w.mad);
   if (r.dbc) {
     const double num_tiles = static_cast<double>(CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n));
-    wall = std::max(compute, drain) + std::min(compute, drain) / num_tiles;
-  } else {
-    wall = compute + drain;
+    const double moving_compute = std::max(MovingLoadCycles(m, n, k, cfg, r), w.mad);
+    w.hidden = (num_tiles - 1.0) * std::min(moving_compute / num_tiles, w.drain / num_tiles);
   }
+  w.wall = compute + w.drain - w.hidden;
   // Guard the float->int cast: a non-finite or out-of-exact-range wall would be UB.
   // Given the validated positive bandwidths and aligned-bounded dims this never fires.
-  INTERNAL_CHECK(std::isfinite(wall) && wall <= 9007199254740992.0)  // 2^53
-      << "Internal error: ChooseL0Tile wall cycles " << wall << " is non-finite or out of range";
-  return static_cast<int64_t>(std::llround(wall));
+  INTERNAL_CHECK(std::isfinite(w.wall) && w.wall >= 0.0 && w.wall <= 9007199254740992.0)  // 2^53
+      << "Internal error: ChooseL0Tile wall cycles " << w.wall << " is non-finite or out of range";
+  return w;
 }
+
+int64_t RoundCycles(double cycles) { return static_cast<int64_t>(std::llround(cycles)); }
 
 // Ordering: lower is better. Primary key is the roofline wall (cycles); ties
 // (equal cycles) break by lex (padded_compute, ceil(K/k), C_load, -m*n, -k).
@@ -430,9 +479,13 @@ std::optional<Candidate> MakeCandidate(int m, int n, int k, const L0TileConfig& 
   c.n = n;
   c.k = k;
   c.traffic = EstimateTraffic(m, n, k, cfg, regime);
-  c.cost_cycles = WallCycles(m, n, k, cfg, regime);
+  const WallBreakdown w = ScoreWall(m, n, k, cfg, regime);
+  c.cost_cycles = RoundCycles(w.wall);
   c.padded_compute = PaddedComputeVolume(m, n, k, cfg);
-  c.load_cycles = LoadCycles(m, n, k, cfg, regime);
+  c.load_cycles = w.load;
+  c.mad_cycles = w.mad;
+  c.drain_cycles = w.drain;
+  c.hidden_cycles = w.hidden;
   c.regime = regime;
   return c;
 }
@@ -609,6 +662,9 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
   // by the realizable mask and adopted only on a STRICTLY lower wall (ties keep
   // the simpler, earlier regime -- the baseline first).
   const bool is_tiled = !(best->m == cfg.M && best->n == cfg.N && best->k == cfg.K);
+  // The best single-L0C design point across the enumerated regimes: the
+  // alternative every dbC=2 candidate must beat, reported for diagnostics.
+  int64_t best_single_c_cycles = best->cost_cycles;
   if (is_tiled) {
     std::vector<Stationarity> stats = {Stationarity::kOutputStationary};
     if (cfg.allow_a_stationary) stats.push_back(Stationarity::kAStationary);
@@ -631,6 +687,7 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
         const bool require_full_k = !is_os || r.dbc;
         const bool require_inner_pair = r.dbc;
         auto cand = EnumerateBest(cfg, r, a0, b0, c0, require_inner_pair, require_full_k);
+        if (cand && !r.dbc) best_single_c_cycles = std::min(best_single_c_cycles, cand->cost_cycles);
         // Cross-regime tie policy: a non-baseline regime is adopted only on a
         // STRICTLY lower wall, so an equal-wall A/B-stationary or dbC=2 candidate
         // never displaces the already-scored output-stationary baseline. This is
@@ -648,8 +705,16 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
   result.estimated_traffic_bytes = best->traffic;
   result.estimated_cost_cycles = best->cost_cycles;
   result.padded_compute_volume = best->padded_compute;
+  result.load_cycles = RoundCycles(best->load_cycles);
+  result.mad_cycles = RoundCycles(best->mad_cycles);
+  result.drain_cycles = RoundCycles(best->drain_cycles);
+  result.hidden_drain_cycles = RoundCycles(best->hidden_cycles);
+  result.single_buffer_c_cost_cycles = best_single_c_cycles;
   result.stationarity = best->regime.stat;
   result.double_buffer_c = best->regime.dbc;
+  INTERNAL_CHECK(!result.double_buffer_c || result.estimated_cost_cycles < result.single_buffer_c_cost_cycles)
+      << "Internal error: ChooseL0Tile adopted dbC=2 at wall " << result.estimated_cost_cycles
+      << " although a single-L0C design point costs " << result.single_buffer_c_cost_cycles;
   // Record the full-K OS hoist (bandwidth-weighted held-A vs held-B) so
   // BuildFullKPipelined emits the same operand the wall was scored under. Only
   // consulted for output-stationary k == K; A/B-stationary force the loop order

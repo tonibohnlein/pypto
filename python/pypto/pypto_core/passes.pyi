@@ -1017,6 +1017,17 @@ class l0_tile_chooser:
         k: int
         estimated_traffic_bytes: int
         estimated_cost_cycles: int
+        load_cycles: int
+        """C_load: every L1->L0 operand extract, held/hoisted panel included."""
+        mad_cycles: int
+        """C_mad: cube MAD issue over the padded grid."""
+        drain_cycles: int
+        """C_drain: FIXPIPE writeback of every output tile."""
+        hidden_drain_cycles: int
+        """Drain hidden by the dbC=2 ping-pong of the pipelined interior; 0 for dbC=1."""
+        single_buffer_c_cost_cycles: int
+        """Best wall among the single-L0C (dbC=1) design points; strictly above
+        estimated_cost_cycles whenever double_buffer_c is True."""
         padded_compute_volume: int
         stationarity: l0_tile_chooser.Stationarity
         os_holds_a: bool

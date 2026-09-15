@@ -72,7 +72,7 @@ For each `tile.matmul`, `tile.matmul_acc`, or `tile.matmul_bias` in an InCore-ty
 
    The following M/N regimes remain **deferred**: an arbitrary standalone `tile.matmul_acc` with a caller-owned accumulator (it does not match the canonical chain above), a `Vec` left operand (PV path), a biased matmul whose already-`Bias`-resident source would need an unsupported Bias-to-Bias N sub-window, a Mat bias that is not a single-use 2D load with only sibling loads before the matmul, and a result consumed on-chip that is **not** consumed entirely as a matmul operand. Treating every non-load statement as a barrier preserves the original bias snapshot across intervening stores or other effects; removing the replaced full load avoids redundant traffic. A result consumed entirely as a matmul operand takes the Mat-scratch placement below.
 
-   **Placement (direct-store vs Mat-scratch).** Both grids hand each `[m, n]` Acc sub-tile to a `SubtilePlacer`. The **`DirectGmPlacer`** stores it to the DDR output (`tile.store`, above). The **`MatScratchPlacer`** instead keeps the whole `[M, N]` result on-chip in an L1/**Mat** scratch — created once with `tile.create(target_memory=Mat)` (whose implicit NZ TileView `col_major/row_major` is the matmul-operand layout), then each sub-tile is assembled in place via `tile.assemble(scratch, sub, [mi, ni])`. For the low-precision bf16/f16 scratch used by the chained path this Acc→Mat writeback lowers to FIXPIPE `pto.tinsert`; a supported same-dtype full-window assemble uses `pto.subview` + `pto.tmov`. The pass selects Mat-scratch when the matmul result's uses are **all** matmul-operand reads *and* the `[M, N]` scratch fits the backend handler's Mat capacity (`GetMatCapacityBytes()`) — a conservative necessary-condition gate that keeps oversized chained matmuls on the deferred `PH-AT-006` path instead of emitting an impossible on-chip allocation (a full packed-peak check that also accounts for coexisting Mat tensors is a follow-up). On selection it remaps the result `Var` to the scratch so the consumer reads it on-chip. `tile.assemble`'s `set_output_memory_inherit_input()` makes the chain share one Mat base, so the assemble is in place (no unsupported Mat→Mat preservation copy). Both the split-K (unrolled, constant offsets) and full-K (pipelined, loop-variable offsets) grids drive either placer.
+   **Placement (direct-store vs Mat-scratch).** The destination is resolved from the matmul's sibling index **before** the tile is chosen (`ClassifyMNDestination`), because it fixes which schedules the chooser may plan (see [Schedule capability](#schedule-capability-which-design-points-may-be-enumerated)). Both grids hand each `[m, n]` Acc sub-tile to a `SubtilePlacer`. The **`DirectGmPlacer`** stores it to the DDR output (`tile.store`, above). The **`MatScratchPlacer`** instead keeps the whole `[M, N]` result on-chip in an L1/**Mat** scratch — created once with `tile.create(target_memory=Mat)` (whose implicit NZ TileView `col_major/row_major` is the matmul-operand layout), then each sub-tile is assembled in place via `tile.assemble(scratch, sub, [mi, ni])`. For the low-precision bf16/f16 scratch used by the chained path this Acc→Mat writeback lowers to FIXPIPE `pto.tinsert`; a supported same-dtype full-window assemble uses `pto.subview` + `pto.tmov`. The pass selects Mat-scratch when the matmul result's uses are **all** matmul-operand reads *and* the `[M, N]` scratch fits the backend handler's Mat capacity (`GetMatCapacityBytes()`) — a conservative necessary-condition gate that keeps oversized chained matmuls on the deferred `PH-AT-006` path instead of emitting an impossible on-chip allocation (a full packed-peak check that also accounts for coexisting Mat tensors is a follow-up). On selection it remaps the result `Var` to the scratch so the consumer reads it on-chip. `tile.assemble`'s `set_output_memory_inherit_input()` makes the chain share one Mat base, so the assemble is in place (no unsupported Mat→Mat preservation copy). Both the split-K (unrolled, constant offsets) and full-K (pipelined, loop-variable offsets) grids drive either placer.
 
    > **Legacy-PyPTO limitation — operand-stationary chained producers + L0 packing.** A chained-matmul (Mat-scratch) producer shares L0 with its consumer (sequential; the intermediate stays in L1, never DDR — the `L0C→L1→L0A` trip). An A/B-stationary producer pins one monolithic full-L0 operand buffer while a pipelined consumer needs multiple smaller buffers. The legacy PYPTO planner's `AllocateMemoryAddr` bump-stacks reuse classes and never subdivides a freed region (for example, reusing a 64 KB producer buffer for one 32 KB consumer slot wastes 32 KB, and the other slot spills → L0 overflow), so the pass forces Mat-scratch producers to **output-stationary only under that planner**. Enabling the experimental dbC opt-in can still expose this limitation on some output-stationary chains; one current reproducer requests 96 KB from a 64 KB L0B. `DSA_RP` and `PTOAS` already place buffers from their actual lifetimes, retain the chooser's operand-stationary schedule, and pack the consumer's smaller buffers into the released full-size range. Adding equivalent lifetime-aware subdivision to the legacy allocator is tracked by [issue #1908](https://github.com/hw-native-sys/pypto/issues/1908).
 7. **Rewrite the enclosing `SeqStmts`** — substitute uses of the original matmul's `Var` (K-only) or the consumer store's result (M/N) with the new `return_var`. Substitution is scoped to the `SeqStmts` that contains the rewrite, so it does not leak into sibling regions.
@@ -86,7 +86,11 @@ The pass is a `ProgramPass` and walks each function with an `IRMutator`; functio
 `ChooseL0Tile` picks the L0 GEMM tile by an **exhaustive roofline search**, not a closed form. For every legal aligned `(m, n, k)` — each a multiple of `GetL0FractalAlignment()`, with `AlignUp(m, l0c_align_m) × n` used for the L0C budget — it estimates wall-clock in core cycles and returns the minimum:
 
 - `wall ≈ max(C_load, C_mad) + C_drain` when the FIXPIPE L0C→L1 drain is exposed (single L0C), or
-- `wall ≈ max(C_load, C_mad, C_drain) + min(compute, C_drain) / T` when the drain is hidden behind compute (double-buffered L0C, `T` output tiles). The `+ min(…)/T` term is the pipeline **fill/drain bubble** — the first tile's compute (or the last tile's drain) has no partner to overlap, so the ideal all-hidden `T·max` roofline undercounts by one tile's non-dominant pipe (50% of the smaller pipe for two output tiles and ≈25% at a 2×2 grid). This keeps dbC=2 from being over-picked on small grids.
+- `wall ≈ max(C_load, C_mad) + C_drain − hidden` when the drain is double-buffered, where `hidden = (T − 1) · min(max(L_moving, C_mad)/T, C_drain/T)` over `T` output tiles.
+
+  The dbC form is the single-L0C wall **minus the drain the emitted schedule actually hides**, not an idealised all-hidden roofline. Each tile's drain overlaps at most the compute the **moving loop** issues after the previous MAD — the moving operand's extract plus the next MAD — so only `L_moving`, the streamed operand's share of `C_load`, is hideable. The **held or hoisted panel** (`C_load − L_moving`) is not: `BuildFullKPipelined` extracts it at the head of the outer body, before the tiles that read it, when no drain is pending; a single-buffered held panel additionally waits for the previous outer step's MADs. Charging it as overlappable compute claimed an overlap the schedule cannot perform, and on a shape whose held panel dominates the load — a B-stationary `[K, N]` panel — that inflated credit selected a multi-tile dbC grid over a cheaper single-L0C plan (see [Why a held panel hides no drain](#why-a-held-panel-hides-no-drain)). With no panel (`L_moving = C_load`) the expression reduces to the familiar fill/drain bubble `max(compute, C_drain) + min(compute, C_drain)/T`: the first tile's compute, or the last tile's drain, has no partner to overlap. `T` counts every output tile including a peeled boundary; those tiles are emitted straight-line after the pipelined interior, so their drains are in fact exposed and this term is optimistic on a peeled grid. Charging only the `⌊M/m⌋·⌊N/n⌋` interior tiles is a tail-accurate follow-up; it would re-pin the FP32 system-test geometries and is deliberately not applied.
+
+  `ChooseL0Tile` reports the decomposition — `load_cycles`, `mad_cycles`, `drain_cycles`, `hidden_drain_cycles`, and `single_buffer_c_cost_cycles` (the best dbC=1 alternative) — so a dbC choice can be audited against the schedule it claims. A dbC=2 point is adopted only when its wall is **strictly** below `single_buffer_c_cost_cycles`; the chooser asserts that invariant before returning.
 
 `C_load` is the L1→L0A/L0B operand traffic under the chosen loop order, scaled by the per-buffer bandwidths from `GetL0CostModel()` (on-device MTE1 sweep: `bw_l0a≈130`, `bw_l0b≈85` B/cyc, ~1.52:1); `C_mad` is the cube MAD cost (per-`TMATMUL` issue overhead × K-fractal count). `C_drain` is the FIXPIPE L0C writeback, charged **per output tile** as a **per-M-row** cost: `⌈M/m⌉·⌈N/n⌉ · (drain_fixed + m·(max(drain_row, bytes_c·n/bw_drain) + drain_penalty·(odd(⌈n/N0⌉)−1)))`. A direct fit of an on-device FIXPIPE sweep: FIXPIPE addresses one M-row of the `N1 M1 M0 N0` FRACTAL_NZ accumulator at a time (so cost ∝ `m`), each row a grouped `nburst`/`loop` over the `N1 = ⌈n/N0⌉` N-fractals (`N0 = 32/bytes_c = 8` for the fp32 L0C). The per-row cost is `max(floor, throughput)` — a fixed burst-issue **floor** `drain_row` (row addressing/setup, N-independent) that dominates narrow N, or the fractal **throughput** `bytes_c·n/bw_drain` that dominates wide N (crossover ~n=131) — plus the **misalignment** residual: a non-power-of-two fractal count serializes the odd part `odd(N1)−1` into extra passes at `drain_penalty` per M-row (the predicate is a **non-power-of-two `N1`**, not literally `N%32`: `n=80 → odd(10)=5` is penalized, and so is `n=96 → odd(12)=3` even though `96%32=0`; aligned power-of-two `N1` such as `n=128 → 16` pays nothing). Because the drain count is `⌈M/m⌉·⌈N/n⌉`, **splitting the output (M/N) adds drains but splitting K does not** (partial sums accumulate in one L0C, drained once per `(m,n)` block). The per-M-row form makes the chooser prefer **wide-N / small-M** tiles (fewer FIXPIPE rows per drain) and correctly prices a misaligned-N tile so it is not over-selected — e.g. `320×320` lands an aligned `(160,128,64)` instead of the drain-bound `160×80`. Device-validated (drain 0.93–1.09×, loads R²=0.993). The search is exhaustive over **all** legal `k` per `(m, n)` (not the largest legal k — `⌈K/k⌉·⌈k/kt⌉` is non-monotone in `k` when `kt ≠ align_k`). Wall ties break lexicographically on `(padded_compute, ⌈K/k⌉, C_load, …)`; the `C_load` key picks the lower-hidden-load aspect among MAD-bound `(m,n)`↔`(n,m)` ties (L0B's slower bandwidth favours fewer m-blocks).
 
@@ -95,24 +99,89 @@ The search ranges over the **design space** `P = (m, n, k, stationarity, dbC)`:
 - **stationarity** `{output, A, B}` — which operand is pinned across the L0 grid. This *derives* the per-operand double-buffer depths (`dbA`/`dbB`): the moving operand(s) double-buffer (depth 2), the stationary one single-buffers (depth 1). They are not searched independently.
 - **dbC** `{1, 2}` — whether the L0C accumulator is double-buffered to overlap the FIXPIPE drain with the next tile's compute.
 
-A **realizable mask** (the `allow_a_stationary` /
-`allow_b_stationary` / `allow_double_buffer_c` config gates) restricts which
-design points are *enumerated and emitted* to those whose lowering exists. A
-gated-off axis is not scored. The pass opens the **A/B-stationary** gates: the
-held operand is pinned **single-buffered** across the moving grid (`k == K`) by
-a `ForKind::Sequential` outer loop in `BuildFullKPipelined`; a pipelined outer
-loop would require twice its full-L0 budget.
+### Schedule capability: which design points may be enumerated
+
+A **realizable mask** (the `allow_a_stationary` / `allow_b_stationary` /
+`allow_double_buffer_c` config gates) restricts which design points are
+*enumerated and emitted* to those the destination can lower. A gated-off axis is
+not scored.
+
+A/B-stationarity and dbC=2 are **alternative schedules of the full-K output
+grid**, so only a destination that emits that grid may enumerate them. The pass
+therefore resolves the M/N grid destination of each matmul **before** calling the
+chooser (`ClassifyMNDestination`) and hands it a `ScheduleCapability` naming the
+emitter that will consume the plan:
+
+| `GridEmitter` | Destination | A/B-stationary | dbC=2 |
+| ------------- | ----------- | -------------- | ----- |
+| `kPipelinedFullK` | `BuildFullKPipelined` behind a direct-store or Mat-scratch placer | yes | yes |
+| `kSequentialClones` | the canonical split-K rewrite | no | no |
+| `kNone` | no output grid: the K-only rewrite | no | no |
+
+This is one source of truth across enumeration, scoring, fold selection and
+emission. A plan that needs the grid always has an emitter, so **no chooser
+result is silently discarded** — the pass asserts both directions. Previously the
+gates were opened from planner identity alone, so a destination that could not
+lower the result still received one: the fold then rejected it and the call fell
+back to a plan that had been sized under a different schedule, or the tile was
+shrunk to an L0C/2 budget for an overlap that never happened.
+
+Two **placement** capabilities are separate from the emitter, and are the only
+place the memory planner enters:
+
+- **co-live accumulators** — `DSA_RP` and `PTOAS` always; `PYPTO` only under
+  `PassContext(enable_pypto_l0c_double_buffer=True)`, because issue #1908 can
+  still overflow operand buffers in chained Mat-scratch layouts.
+- **held panel beside a Mat-scratch consumer** — `DSA_RP` and `PTOAS` place from
+  actual lifetimes and pack the consumer's smaller buffers into the released
+  range; the legacy `PYPTO` allocator cannot subdivide it (#1908), so a chained
+  Mat-scratch producer keeps output-stationarity there.
+
+Eligibility and profitability are otherwise planner-independent: the three
+configurations that can place the pair select the *same* schedule for the same
+shape.
 
 **dbC=2** is the two-accumulator L0C ping-pong in which tile *i*'s FIXPIPE
-drain overlaps tile *i+1*'s MAD. It is enabled unconditionally for
-`memory_planner=DSA_RP` and `memory_planner=PTOAS`. The legacy `PYPTO`
-planner retains an experimental opt-in
-(`PassContext(enable_pypto_l0c_double_buffer=True)`, default off) because
-issue #1908 can still overflow operand buffers in chained Mat-scratch layouts.
-`BuildFullKPipelined` tags the moving loop with
+drain overlaps tile *i+1*'s MAD. `BuildFullKPipelined` tags the moving loop with
 `kPipelineDoubleBufferCAttr`, and `CanonicalizeIOOrder` floats both stores
 below both matmuls (`matmul, matmul, store, store`) to make the two accumulator
 lifetimes co-live.
+
+#### Why a held panel hides no drain
+
+The emitted full-K grid is a stationary outer loop carrying one operand panel and
+a pipelined moving inner loop:
+
+```python
+for o in pl.range(0, N, n):                 # stationary: held B panel
+    b = pl.tile.extract(rhs, 0, o, [K, n], target_memory=pl.Mem.Right)
+    for i in pl.pipeline(0, M, m, stage=2, attrs={"pipeline_double_buffer_c": True}):
+        a = pl.tile.extract(lhs, i, 0, [m, K], target_memory=pl.Mem.Left)
+        c = pl.tile.matmul(a, b)            # only this and `a` can hide a drain
+        out = pl.tile.store(c, [i, o], out)
+```
+
+`b` is extracted once per outer step, before any accumulator holds a result, so
+no drain is in flight to overlap with it. Only `a` and the MAD are issued between
+two drains. For DSpark's `qk_scores` (`[64, 512] @ [512, 64]` BF16 → FP32) the
+held `[512, 64]` panel is ~60% of the load-bound compute; crediting it turned a
+K-only single-L0C plan into a four-tile B-stationary dbC grid, which on device
+cost latency through extra accumulators, an extra loop and its synchronization
+without delivering the modeled overlap. Excluding the panel prices that point
+above every single-L0C alternative.
+
+#### Why canonical split-K is dbC-ineligible
+
+The canonical split-K rewrite clones **one complete source K reduction followed by
+its drain per output tile**, sequentially. No operand panel is held across tiles
+and no second accumulator is ever live, so there is no inter-tile drain overlap
+for a dbC plan to realize — enabling dbC there only shrinks the tiles to the
+L0C/2 budget. For a Qwen-like `16×256×256` source panel that selected four
+`16×64` output tiles instead of one `16×256`, multiplying the Left/Right/Mat
+buffers and the synchronization. The ineligibility follows from the emitter
+contract (`kSequentialClones`), not from a gate at one call site, so it holds for
+every planner and cannot be reintroduced by a new caller. It would be lifted only
+by changing that emitter to interleave two reductions.
 
 The planners preserve that intent differently. For eligible PTOAS pipelines,
 [`LowerPipelineToSlots`](30-lower_pipeline_to_slots.md) expresses the stages as
@@ -124,8 +193,10 @@ capacity gate (#1475) keeps the buffers distinct to the affordable depth.
 `DSA_RP` also skips `MemoryReuse`; it represents pipeline-stage separations as
 hard constraints, runs its bounded strict search first, and relaxes only
 pipeline-intent separations to soft penalties if that search finds no
-capacity-fitting placement. dbC=2 requires full-K and at least two **full**
-tiles on the moving inner axis; the stationary outer axis may have one tile.
+capacity-fitting placement. dbC=2 requires the full-K pipelined grid emitter,
+`k == K`, at least two **full** tiles on the moving inner axis, and a wall
+strictly below the best single-L0C design point; the stationary outer axis may
+have one tile.
 The emitted loop orientation follows the chooser's stationarity/hoist decision,
 and a peeled partial boundary does not count as a ping-pong stage. Thus rows
 outer admits a 1×2 grid, while columns outer admits a 2×1 grid. The Mat-scratch
@@ -261,7 +332,7 @@ out_t1 = pl.store(c_t1, [256, 0], out_t0)  # store sub-tile to out[256:512, 0:25
 
 Boundary sub-tiles (when `m`/`n` do not divide `M`/`N`) have logical extents `[min(m, M-mi), min(n, N-ni)]` — e.g. a 256×256 FP32 matmul on Ascend910B (chooser picks `m = 192, n = 160`) tiles into logical sub-tiles of `192×160`, `192×96`, `64×160`, `64×96`. For the canonical split-K rewrite, each operand's physical Mat shape is rounded up to the effective boxed-layout granularity while `valid_shape` retains the logical extent. This granularity is part of chooser capacity legality, including when a full logical tile such as INT8 N=80 boxes to physical N=96. `tile.matmul` / `tile.matmul_acc` propagate the same physical/valid distinction to the loop-carried Acc, and `tile.store` transfers only the valid rectangle at the original logical offset. For example, an INT8 Right tile with a 16-column N tail is represented physically as `[K, 32]` with `valid_shape=[K, 16]`, producing an Acc with physical N=32 and valid N=16.
 
-For a canonical split-K chain, the same grid encloses the **source** reduction rather than slicing its final Acc. In issue #2232, the logical INT32 `[16, 1152]` result occupies `32 × 1152 × 4 = 144 KiB` physically on Ascend910B, so it is split along N. Each generated N tile runs all eight source K blocks and stores its result before the next N tile starts.
+For a canonical split-K chain, the same grid encloses the **source** reduction rather than slicing its final Acc. In issue #2232, the logical INT32 `[16, 1152]` result occupies `32 × 1152 × 4 = 144 KiB` physically on Ascend910B, so it is split along N. Each generated N tile runs all eight source K blocks and stores its result before the next N tile starts. Because each tile drains before the next one begins, this grid is sized in the single-Acc output-stationary regime under every planner — see [Why canonical split-K is dbC-ineligible](#why-canonical-split-k-is-dbc-ineligible).
 
 ### Fits-L0c chained matmul (cast-fold)
 

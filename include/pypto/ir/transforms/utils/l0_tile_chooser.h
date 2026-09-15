@@ -121,6 +121,15 @@ struct L0TileConfig {
   // Allow the L0C double-buffer (dbC = 2): two accumulators ping-ponged so the
   // FIXPIPE drain overlaps the next tile's compute (half the L0C budget, drain
   // hidden). When false only single-L0C (dbC = 1) is considered.
+  //
+  // Schedule contract: a caller may open this gate only when the emitter that
+  // consumes the result realizes the full-K pipelined output grid with two
+  // co-live accumulators (BuildFullKPipelined + kPipelineDoubleBufferCAttr) and
+  // the active memory planner keeps those two buffers physically distinct. The
+  // canonical split-K rewrite (one complete reduction and drain per tile), the
+  // K-only rewrite, and any destination without an output grid must leave it
+  // closed: the chooser would otherwise shrink the tile for an overlap that the
+  // emitted schedule never performs.
   bool allow_double_buffer_c = false;
 
   // Whether the matmul reads its accumulator (C = beta * C + A @ B). When
@@ -192,10 +201,33 @@ struct L0TileResult {
   // Estimated wall-clock for the chosen tile in core cycles (the roofline
   // objective the chooser ranks by; lower is better):
   //   double_buffer_c == false : max(C_load, C_mad) + C_drain  (drain exposed)
-  //   double_buffer_c == true  : max(C_load, C_mad, C_drain)
-  //                              + min(compute, C_drain)/T      (drain hidden except
-  //                              the one-tile pipeline fill/drain bubble; T = tiles)
+  //   double_buffer_c == true  : max(C_load, C_mad) + C_drain - hidden_drain_cycles
+  // where hidden_drain_cycles is the drain the emitted two-accumulator moving
+  // loop overlaps with the next tile's compute (see that field).
   int64_t estimated_cost_cycles = 0;
+
+  // --- Cost breakdown of the chosen design point (diagnostics and tests) ------
+  // C_load: every L1->L0 operand extract, held/hoisted panel included.
+  int64_t load_cycles = 0;
+  // C_mad: cube MAD issue over the padded grid.
+  int64_t mad_cycles = 0;
+  // C_drain: FIXPIPE writeback of every output tile, boundary tiles included.
+  int64_t drain_cycles = 0;
+  // Drain hidden behind compute by the dbC=2 ping-pong; 0 for dbC=1. Each of
+  // the T output tiles except the last hides at most the per-tile compute the
+  // emitted moving loop issues after the previous MAD (the moving operand's
+  // extract and the next MAD). The held or hoisted panel extract is issued
+  // before the tiles that read it, so it never hides a drain:
+  //   hidden = (T - 1) * min(max(L_moving, C_mad) / T, C_drain / T)
+  // With no panel (L_moving == C_load) this is the classic
+  // max(compute, drain) + min(compute, drain)/T fill/drain bubble. T still
+  // counts peeled boundary tiles although they run straight-line after the
+  // pipelined interior (see ScoreWall for the tail-accurate follow-up).
+  int64_t hidden_drain_cycles = 0;
+  // Best wall among the enumerated single-L0C (dbC=1) design points. Equal to
+  // estimated_cost_cycles when double_buffer_c is false; strictly greater when
+  // it is true (dbC is adopted only on a strictly lower wall).
+  int64_t single_buffer_c_cost_cycles = 0;
 
   // Padded compute volume = ceil(M/m)*m * ceil(N/n)*n * ceil(K/k)*k.
   // Used as a tie-breaker.
@@ -222,17 +254,18 @@ struct L0TileResult {
 
   // Whether the chooser chose to double-buffer L0C (two accumulators ping-ponged
   // to overlap the FIXPIPE drain). True only when allow_double_buffer_c was set,
-  // the single-L0C optimum already tiles the output (a full [M, N, K] tile that
-  // fits one L0C is left untiled instead), the moving inner loop has at least two
-  // full interior tiles, K reduces in one pass (k == K), and the double-buffered
-  // wall was strictly lower. The stationary outer axis may have one tile.
+  // the single-L0C optimum is already tiled (a full [M, N, K] tile that fits one
+  // L0C is left untiled instead), the moving inner loop has at least two full
+  // interior tiles, K reduces in one pass (k == K), and the schedule-aware
+  // double-buffered wall (see hidden_drain_cycles) was strictly lower than every
+  // single-L0C design point. The stationary outer axis may have one tile.
   //
   // NOTE: the caller must REALIZE this with a genuine two-accumulator schedule
-  // (two co-live L0C buffers). A full-K emitter that threads the output as a
-  // single iter-arg chain yields ONE L0C buffer regardless of
-  // pipeline_overlap_stores, so it must not set allow_double_buffer_c until that
-  // lowering exists — otherwise the chooser only shrinks the tile (budgeting
-  // L0C/2) without hiding the drain, a regression.
+  // (two co-live L0C buffers) -- see the allow_double_buffer_c contract. A
+  // full-K emitter that threads the output as a single iter-arg chain yields ONE
+  // L0C buffer regardless of pipeline_overlap_stores, so it must not open the
+  // gate -- otherwise the chooser only shrinks the tile (budgeting L0C/2) without
+  // hiding the drain, a regression.
   bool double_buffer_c = false;
 
   // Empty on success. Non-empty when the chooser couldn't pick an "ideal"
@@ -285,10 +318,14 @@ struct L0TileResult {
  *          B-stat    : ba*M*K*ceil(N/n)/BW_A + bb*K*N/BW_B             (k==K, held-B)
  *        compute = max(C_load, C_mad)
  *        wall    = compute + C_drain                         (dbC == 1)
- *                = max(compute, C_drain)
- *                  + min(compute, C_drain)/T                 (dbC == 2)
- *          where T = ceil(M/m)*ceil(N/n); the second term is the one-tile
- *          pipeline fill/drain bubble.
+ *                = compute + C_drain - hidden                (dbC == 2)
+ *          hidden = (T - 1) * min(max(L_moving, C_mad)/T, C_drain/T)
+ *          where T = ceil(M/m)*ceil(N/n) output tiles and L_moving the streamed
+ *          (non-held, non-hoisted) operand's share of C_load. Each tile's drain
+ *          hides behind at most the next tile's in-loop compute; the held /
+ *          hoisted panel extract is issued before the tiles that read it and
+ *          hides nothing. With no panel this is the one-tile fill/drain bubble
+ *          form max(compute, C_drain) + min(compute, C_drain)/T.
  *      with kt = mad_k_fractal_bytes/bytes_a, cpr = bytes_a/2. Ties break by lex
  *      (padded_compute, ceil(K/k), C_load, -m*n, -k) -- the C_load key picks the
  *      lower-hidden-load aspect among MAD-bound (m,n)<->(n,m) ties.

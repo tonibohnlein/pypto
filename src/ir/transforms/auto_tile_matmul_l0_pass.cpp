@@ -737,6 +737,100 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
   return RewriteResult{std::move(out), result_var};
 }
 
+/// Which output-grid emitter will consume the plan ``AnalyzeMatmul`` returns.
+///
+/// The chooser's extended regimes -- A/B-stationary and the dbC=2 accumulator
+/// ping-pong -- are alternative *schedules of the full-K output grid*, so only a
+/// destination that emits that grid may enumerate them. Naming the emitter here
+/// (rather than passing per-regime booleans) keeps one source of truth between
+/// candidate enumeration, scoring, fold selection, and what is finally emitted.
+enum class GridEmitter {
+  /// No output grid: the whole-output K-loop is the only lowering. An accumulate
+  /// matmul, a Vec left operand, and a result without a supported M/N consumer
+  /// land here; a plan that nevertheless needs M/N tiling is deferred with a hint.
+  kNone,
+  /// The canonical split-K rewrite: one complete source reduction followed by
+  /// its drain is cloned per output tile, sequentially and output-stationary. No
+  /// panel is held across tiles and no second accumulator is ever live, so it
+  /// realizes neither operand stationarity nor dbC -- a dbC plan here would only
+  /// shrink the tiles (L0C/2 budget) without hiding any drain.
+  kSequentialClones,
+  /// ``BuildFullKPipelined`` behind a direct-store or Mat-scratch placer: a
+  /// stationary outer loop holding one panel and a pipelined moving inner loop.
+  /// This realizes A/B-stationary (Sequential outer, single-buffered held panel)
+  /// and, with ``kPipelineDoubleBufferCAttr``, the two-accumulator ping-pong. A
+  /// split-K plan (k < K) on the same destination lowers through
+  /// ``BuildSplitKGrid`` instead; the extended regimes never produce one.
+  kPipelinedFullK,
+};
+
+/// The schedule contract under which one ``AnalyzeMatmul`` call selects a plan:
+/// which output-grid emitter will consume it and what the active memory planner
+/// can place. Every regime the chooser enumerates is realizable under this
+/// contract by construction, so a returned plan is never silently discarded by
+/// its fold. Planner identity enters only through the two placement bits;
+/// eligibility and profitability are planner-independent.
+struct ScheduleCapability {
+  GridEmitter grid = GridEmitter::kNone;
+  /// The planner can pack a single-buffered held panel beside the consumer's
+  /// pipelined operand buffers. False for the legacy PyPTO allocator's chained
+  /// Mat-scratch producers (#1908): its bump-stacked reuse classes never
+  /// subdivide the released full-size panel for the consumer's smaller slots.
+  bool operand_stationary_placement = true;
+  /// The planner keeps the two ping-pong accumulators co-live and physically
+  /// distinct: DSA_RP and PTOAS always, PyPTO only with its experimental opt-in.
+  bool colive_acc_placement = false;
+
+  [[nodiscard]] bool allows_operand_stationary() const {
+    return grid == GridEmitter::kPipelinedFullK && operand_stationary_placement;
+  }
+  [[nodiscard]] bool allows_double_buffer_c() const {
+    return grid == GridEmitter::kPipelinedFullK && colive_acc_placement;
+  }
+};
+
+/// Placement capability of the active memory planner for the dbC ping-pong: can
+/// it keep two co-live L0C accumulators physically distinct? Under PTOAS,
+/// MemoryReuse is skipped, InitMemRef keeps the buffers distinct, and ptoas
+/// assigns their offsets. DSA_RP consumes the flat depth-2 pipeline membership
+/// the lowering tagger gives the dbC accumulator as a strict placement
+/// separation. The legacy PYPTO planner keeps it behind the PassContext opt-in
+/// because some chained Mat-scratch layouts still hit #1908's operand-buffer
+/// fragmentation; with the opt-in, MemoryReuse's capacity gate keeps the pair
+/// distinct through that same membership.
+///
+/// KNOWN-FRAGILE (experimental): this reads the memory planner from the *mutable*
+/// mid-pipeline PassContext, so dbC=2 behaviour depends on run-time context state
+/// rather than an immutable IR property. A nested PassContext once silently reset
+/// it (fixed by propagating memory_planner + PassManager's fail-loud planner check),
+/// but the underlying smell remains. The durable design is a first-class co-live /
+/// no-coalesce Acc-buffer-pair IR property set once at emit and honoured by BOTH
+/// planners. Tracked as a follow-up.
+bool PlannerPlacesColiveAccumulators(const PassContext* ctx) {
+  const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
+  return planner != MemoryPlanner::PyPTO || (ctx && ctx->GetEnablePyptoL0cDoubleBuffer());
+}
+
+/// Placement capability for an operand-stationary chained Mat-scratch producer:
+/// the held full-size operand panel must coexist with the consumer matmul's
+/// smaller pipelined buffers in the same L0 space. DSA_RP and PTOAS place buffers
+/// from their actual lifetimes and pack the consumer into the released range;
+/// the legacy PyPTO allocator cannot subdivide it (#1908), so such producers stay
+/// output-stationary there -- OS is always a legal fallback.
+bool PlannerPlacesHeldPanelBesideMatScratchConsumer(const PassContext* ctx) {
+  const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
+  return planner != MemoryPlanner::PyPTO;
+}
+
+/// Parse which matmul-family call this is, or nullopt for any other op.
+std::optional<MatmulKind> ClassifyMatmulKind(const CallPtr& call) {
+  if (!call || !call->op_) return std::nullopt;
+  if (IsOp(call, "tile.matmul")) return MatmulKind::kFresh;
+  if (IsOp(call, "tile.matmul_acc")) return MatmulKind::kAccumulate;
+  if (IsOp(call, "tile.matmul_bias")) return MatmulKind::kBias;
+  return std::nullopt;
+}
+
 /// Operands + chosen L0 tile shape for a tileable matmul.  Produced by
 /// ``AnalyzeMatmul``; the caller dispatches on ``needs_mn_tiling()`` to build
 /// either the whole-output K-loop or the unrolled M/N grid of sub-tiles.
@@ -781,7 +875,16 @@ struct MatmulTiling {
   /// L0TileResult::double_buffer_c; only true for full-K tiles (see the assert
   /// in AnalyzeMatmul).
   bool double_buffer_c = false;
+  /// The output-grid emitter this plan was selected for (the capability the
+  /// chooser's realizable mask was derived from). An operand-stationary or dbC
+  /// plan is only ever produced for ``GridEmitter::kPipelinedFullK``.
+  GridEmitter emitter = GridEmitter::kNone;
   [[nodiscard]] bool is_acc() const { return kind == MatmulKind::kAccumulate; }
+  /// True when the plan is one of the chooser's extended regimes, which only the
+  /// full-K pipelined grid emitter realizes.
+  [[nodiscard]] bool needs_pipelined_full_k_grid() const {
+    return double_buffer_c || stationarity != utils::Stationarity::kOutputStationary;
+  }
   /// True when the chosen L0 tile is smaller than the [M, N] output on either
   /// axis — the output Acc would overflow L0c, so the output must be tiled.
   [[nodiscard]] bool needs_mn_tiling() const { return m != M || n != N; }
@@ -846,11 +949,13 @@ KLoopRewrite MakeKLoop(const MatmulTiling& t, ExprPtr mi, ExprPtr ni, int64_t m_
 }
 
 /// Decide whether `assign` is a Mat-resident matmul we know how to tile, and if
-/// so which L0 tile shape to use.  Returns the tiling plan on success;
-/// otherwise nullopt and (when useful) appends a PerfHint.  The caller
-/// dispatches K-only vs M/N tiling on ``MatmulTiling::needs_mn_tiling()``.
+/// so which L0 tile shape to use, under the destination's ``ScheduleCapability``
+/// (the output-grid emitter that will consume the plan and the memory planner's
+/// placement abilities).  Returns the tiling plan on success; otherwise nullopt
+/// and (when useful) appends a PerfHint.  The caller dispatches K-only vs M/N
+/// tiling on ``MatmulTiling::needs_mn_tiling()``.
 std::optional<MatmulTiling> AnalyzeMatmul(
-    const AssignStmtPtr& assign, std::vector<Diagnostic>& hints, bool force_output_stationary = false,
+    const AssignStmtPtr& assign, std::vector<Diagnostic>& hints, const ScheduleCapability& capability,
     std::optional<tile_view_semantics::BoxedTileAlignment> output_box_alignment = std::nullopt,
     const DirectDefMap* direct_defs = nullptr) {
   auto call = As<Call>(assign->value_);
@@ -859,16 +964,9 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   // Plain, accumulating, and bias matmuls share the L0 tile chooser. Parse the
   // operation kind once so operand indexing and later legality decisions cannot
   // drift into inconsistent combinations of boolean flags.
-  MatmulKind kind;
-  if (IsOp(call, "tile.matmul")) {
-    kind = MatmulKind::kFresh;
-  } else if (IsOp(call, "tile.matmul_acc")) {
-    kind = MatmulKind::kAccumulate;
-  } else if (IsOp(call, "tile.matmul_bias")) {
-    kind = MatmulKind::kBias;
-  } else {
-    return std::nullopt;
-  }
+  const auto parsed_kind = ClassifyMatmulKind(call);
+  if (!parsed_kind) return std::nullopt;
+  const MatmulKind kind = *parsed_kind;
   const bool is_acc = kind == MatmulKind::kAccumulate;
   const bool is_bias = kind == MatmulKind::kBias;
   const std::string& op_name = call->op_->name_;
@@ -1120,41 +1218,26 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   // budgeted (no /2) and is loaded once per outer step (no re-stream across the
   // moving axis). The chooser adopts A/B-stationary only on a strictly lower wall,
   // so it stays output-stationary for compute-bound shapes.
-  // Chained Mat-scratch producers under the legacy PyPTO planner pass
-  // force_output_stationary=true to turn these off (see the #1908 guard at the
-  // fold site): that allocator cannot pack a single-buffered A/B-stationary
-  // producer against the consumer matmul's pipelined operands. DSA_RP and
-  // PTOAS retain the operand-stationary candidates.
-  cfg.allow_a_stationary = !force_output_stationary;
-  cfg.allow_b_stationary = !force_output_stationary;
+  //
   // L0C double-buffering (dbC=2): the chooser budgets the accumulator at L0C/2 and
-  // scores the drain-hidden wall so tile i's FIXPIPE drain overlaps tile i+1's
-  // MAD. This needs two *co-live* L0C accumulators. Under PTOAS, MemoryReuse is
-  // skipped, InitMemRef keeps the buffers distinct, and ptoas assigns their
-  // physical offsets.
+  // scores the schedule-aware drain-hidden wall so tile i's FIXPIPE drain overlaps
+  // tile i+1's in-loop compute. This needs two *co-live* L0C accumulators:
+  // BuildFullKPipelined tags the moving loop with kPipelineDoubleBufferCAttr, the
+  // pipeline-membership tagger gives the accumulator a *flat depth-2* membership
+  // (only the moving loop tags it; enclosing loops skip it since the cube
+  // serializes MADs), and CanonicalizeIOOrder floats both drains below both MADs.
   //
-  // DSA_RP enables dbC=2 automatically; the legacy PYPTO planner keeps it behind
-  // the PassContext opt-in because some chained Mat-scratch layouts still hit
-  // #1908's operand-buffer fragmentation. The pipeline-membership tagger gives the dbC accumulator
-  // a *flat depth-2* membership — only the moving (dbC) loop tags it; enclosing
-  // loops skip it since the cube serializes MADs. PYPTO's MemoryReuse uses that
-  // relation to keep two buffers, while DSA_RP initially exports it as a strict
-  // separation. DSA_RP places the resulting lifetimes without the legacy
-  // allocator's fragmentation. The co-live emit is gated on the chooser's
-  // `double_buffer_c` result below, which tags the moving loop with
-  // kPipelineDoubleBufferCAttr.
-  //
-  // KNOWN-FRAGILE (experimental): this reads the memory planner from the *mutable*
-  // mid-pipeline PassContext, so dbC=2 behaviour depends on run-time context state
-  // rather than an immutable IR property. A nested PassContext once silently reset
-  // it (fixed by propagating memory_planner + PassManager's fail-loud planner check),
-  // but the underlying smell remains. The durable design is a first-class co-live /
-  // no-coalesce Acc-buffer-pair IR property set once at emit and honoured by BOTH
-  // planners. Tracked as a follow-up.
-  const MemoryPlanner memory_planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
-  const bool pypto_dbc =
-      memory_planner == MemoryPlanner::PyPTO && ctx && ctx->GetEnablePyptoL0cDoubleBuffer();
-  cfg.allow_double_buffer_c = memory_planner != MemoryPlanner::PyPTO || pypto_dbc;
+  // Both regimes are SCHEDULES OF THE FULL-K OUTPUT GRID, so the chooser's
+  // realizable mask is exactly the caller's ScheduleCapability: the consuming
+  // emitter must be BuildFullKPipelined -- the K-only rewrite, the canonical
+  // split-K clones, and a result without a grid destination realize neither --
+  // and the memory planner must place what the schedule needs (a single-buffered
+  // held panel beside pipelined consumer buffers; two physically distinct co-live
+  // accumulators). Every enumerated regime is therefore realizable by
+  // construction and the fold that consumes this plan never has to discard it.
+  cfg.allow_a_stationary = capability.allows_operand_stationary();
+  cfg.allow_b_stationary = capability.allows_operand_stationary();
+  cfg.allow_double_buffer_c = capability.allows_double_buffer_c();
   // tile.matmul_acc threads the caller's accumulator into the K-loop's
   // iter-arg, so each invocation reads C from L1 at start and writes back at
   // end (gamma_c = 2 in the chooser's traffic model).  Plain tile.matmul
@@ -1259,6 +1342,13 @@ std::optional<MatmulTiling> AnalyzeMatmul(
       << "Internal error: chooser set double_buffer_c on a split-K tile (k=" << res.k << ", K=" << K
       << "); dbC=2 requires the full-K emitter";
   t.double_buffer_c = res.double_buffer_c;
+  t.emitter = capability.grid;
+  // The chooser must honor the realizable mask: an extended regime may only come
+  // back for a destination whose emitter realizes the full-K pipelined grid.
+  INTERNAL_CHECK_SPAN(!t.needs_pipelined_full_k_grid() || capability.grid == GridEmitter::kPipelinedFullK,
+                      assign->span_)
+      << "Internal error: chooser returned an operand-stationary or dbC=2 plan for a destination whose "
+         "emitter cannot realize the full-K pipelined output grid";
   return t;
 }
 
@@ -1990,13 +2080,19 @@ std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSpli
     return std::nullopt;
   }
   // The source loop already realizes output-stationary accumulation across its
-  // K blocks. Use the conservative output-stationary chooser regime for the
-  // output grid. Account for the same Mat boxing that RebuildLoad will apply to
-  // every physical output window, so chooser capacity cannot admit a logical
-  // tile that becomes oversized after padding. The recursively visited
+  // K blocks, and this rewrite clones one complete K reduction followed by its
+  // drain per output tile, sequentially: no operand panel is held across tiles
+  // and no second accumulator is ever live. Its schedule capability is therefore
+  // ``GridEmitter::kSequentialClones`` -- single-Acc, output-stationary -- and the
+  // chooser sizes the grid without the operand-stationary or dbC regimes it could
+  // not realize (a dbC plan here would only shrink the tiles for a drain overlap
+  // that never happens). Account for the same Mat boxing that RebuildLoad will
+  // apply to every physical output window, so chooser capacity cannot admit a
+  // logical tile that becomes oversized after padding. The recursively visited
   // narrowed calls independently choose their legal inner K blocking.
-  auto tiling =
-      AnalyzeMatmul(match.shape_source(), hints, /*force_output_stationary=*/true, output_box_alignment);
+  ScheduleCapability capability;
+  capability.grid = GridEmitter::kSequentialClones;
+  auto tiling = AnalyzeMatmul(match.shape_source(), hints, capability, output_box_alignment);
   if (!tiling || !tiling->needs_mn_tiling()) return std::nullopt;
 
   auto store_call = As<Call>(match.store->value_);
@@ -2340,42 +2436,64 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildSplitKGrid(const MatmulTiling& t, S
   return {std::move(stmts), chain};
 }
 
-/// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
-/// L0c into a ``ceil(M/m) x ceil(N/n)`` grid of sub-tile matmuls, each computing
-/// an ``[m, n]`` (partial on the boundary) Acc result.  Operands are already
-/// Mat-resident, so only the output Acc overflows; sub-tiling keeps every Acc
-/// tile within L0c. This helper handles the direct-store consumer:
+/// The M/N output-grid destination of one matmul-family call at its SeqStmts
+/// level.  Resolved from the sibling index BEFORE the tile is chosen, so the
+/// chooser's realizable mask and the fold that consumes its plan agree by
+/// construction: a plan that needs an output grid always has an emitter, and a
+/// destination that cannot emit a grid never receives an operand-stationary or
+/// dbC plan (see ``ScheduleCapability``).  Operands are already Mat-resident, so
+/// only the output Acc overflows; sub-tiling keeps every Acc tile within L0c.
 ///
 ///   * **Direct-store** — the sole consumer is a 2D ``tile.store(c, base, out)``:
 ///     each sub-tile stores straight to ``out[mi:, ni:]`` (the DDR-output case
 ///     our solver kernels need).  The store is folded in and emitted at the
 ///     store site.
+///   * **Mat-scratch** — every use is a matmul operand (a chained matmul reads
+///     the result on-chip): each sub-tile is assembled into an L1/Mat scratch.
 ///
-/// The Mat-scratch alternative is handled earlier by ``TryFoldMatScratch``.
-/// ``result_uses`` / ``store_stmt`` come from the precomputed SiblingIndex.
-/// Returns nullopt (with a PerfHint) when neither placement applies — an
-/// arbitrary ``matmul_acc`` with a caller-supplied [M, N] accumulator, a Vec
-/// left operand, and mixed/non-matmul on-chip consumers are deferred. The
+/// Neither applies to an arbitrary ``matmul_acc`` with a caller-supplied [M, N]
+/// accumulator, a Vec left operand, or mixed/non-matmul on-chip consumers; when
+/// such a plan needs a grid it is deferred with the recorded hints.  The
 /// canonical frontend split-K create/pipeline/store form is handled earlier at
 /// the enclosing-loop level.
-std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, const AssignStmt* store_stmt,
-                                      std::vector<Diagnostic>& hints) {
-  const Span sp = t.assign->span_;
-  auto skip = [&](const std::string& msg) -> std::optional<MNFold> {
-    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006", msg, sp);
-    return std::nullopt;
-  };
+struct MNDestination {
+  enum class Kind { kNone, kDirectStore, kMatScratch };
+  Kind kind = Kind::kNone;
+  int result_uses = 0;                ///< reads of the value the grid replaces (the fused cast's when fused)
+  int operand_uses = 0;               ///< of those, reads at a matmul-operand position
+  const AssignStmt* store = nullptr;  ///< kDirectStore: the consumer store; the grid emits at its site
+  DataType scratch_dtype;             ///< kMatScratch: element type of the L1/Mat scratch
+  const Var* remap_target = nullptr;  ///< kMatScratch: the Var whose uses read the scratch
+  const Var* extra_remap = nullptr;   ///< kMatScratch: fused-downcast source, also remapped; its cast dies
+  /// Why no grid destination applies, as (PerfHint code, message).  Reported only
+  /// when the chosen plan actually needs an output grid.
+  std::vector<std::pair<const char*, std::string>> deferrals;
 
-  if (t.is_acc()) {
-    return skip(
-        "oversized tile.matmul_acc does not match the canonical create -> split-K pipeline -> store "
-        "form handled by loop-level M/N tiling; slicing this caller-owned [M, N] accumulator is "
-        "unsupported, so the call is left untouched");
+  [[nodiscard]] GridEmitter emitter() const {
+    return kind == Kind::kNone ? GridEmitter::kNone : GridEmitter::kPipelinedFullK;
   }
-  if (t.stage_lhs_to_mat) {
-    return skip(
-        "tile.matmul with a Vec left operand needs M/N tiling — the PV path is deferred; left untouched");
-  }
+};
+
+/// Emit the direct-store grid of a plan that needs M/N tiling: per-sub-tile
+/// K-loops (``BuildSplitKGrid``, k < K) or the pipelined interior + straight-line
+/// tail (``BuildFullKPipelined``, k == K), each ``[m, n]`` sub-tile stored straight
+/// to the output.  The grid is emitted later at the store site, where the caller
+/// re-applies the then-current remap — so a prior fold that redefined this output
+/// is rewritten correctly (a stale-output SSA guard); resolving it here would miss
+/// folds emitted before this one.
+MNFold EmitDirectStoreGrid(const MatmulTiling& t, const AssignStmt* store_stmt) {
+  const Span sp = t.assign->span_;
+  INTERNAL_CHECK_SPAN(store_stmt && !t.is_acc() && !t.stage_lhs_to_mat, sp)
+      << "Internal error: the direct-store grid requires a fresh Mat-left matmul with a classified consumer "
+         "store";
+  auto store_call = As<Call>(store_stmt->value_);
+  INTERNAL_CHECK_SPAN(store_call, store_stmt->span_)
+      << "Internal error: SiblingIndex store_of mapped a non-Call AssignStmt";
+  auto offs = As<MakeTuple>(store_call->args_[1]);
+  auto out_in = AsVarLike(store_call->args_[2]);
+  INTERNAL_CHECK_SPAN(offs && offs->elements_.size() == 2 && out_in, store_stmt->span_)
+      << "Internal error: direct-store destination classified on a store without 2D offsets or a tensor "
+         "variable target";
   // K spans >= 2 L0 blocks → pipelined K-loop per sub-tile (BuildSplitKGrid);
   // k == K (full K fits L0a/L0b) → pipelined interior + straight-line partial
   // tail (BuildFullKPipelined).  Either grid drives the chosen SubtilePlacer;
@@ -2385,35 +2503,12 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
   // is there no K-loop.  A non-divisor k with k < K < 2k still needs the
   // K-loop+peel, so test k == K rather than the integer-division proxy K/k < 2.
   const bool full_k = t.k == t.K;
-
-  // Direct-store: the sole consumer is a 2D tile.store.  The grid is emitted
-  // later at the store site, where the caller re-applies the then-current remap
-  // — so a prior fold that redefined this output is rewritten correctly (a
-  // stale-output SSA guard); resolving it here would miss folds emitted before
-  // this one.
-  if (store_stmt && result_uses == 1) {
-    auto store_call = As<Call>(store_stmt->value_);
-    INTERNAL_CHECK_SPAN(store_call, store_stmt->span_)
-        << "Internal error: SiblingIndex store_of mapped a non-Call AssignStmt";
-    auto offs = As<MakeTuple>(store_call->args_[1]);
-    if (!offs || offs->elements_.size() != 2) {
-      return skip("tile.store offsets are not a 2D tuple — M/N fold not applicable; left untouched");
-    }
-    auto out_in = AsVarLike(store_call->args_[2]);
-    if (!out_in) {
-      return skip(
-          "tile.store target is not a simple tensor variable — M/N fold not applicable; left untouched");
-    }
-    DirectGmPlacer placer(offs->elements_[0], offs->elements_[1], out_in, store_call->kwargs_,
-                          store_call->attrs_, sp);
-    auto [stmts, last_out] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
-    return MNFold{std::move(stmts), last_out, store_stmt->var_, store_stmt};
-  }
-
-  return skip(
-      "tile.matmul output exceeds L0c but its result is not consumed by a single 2D tile.store "
-      "(direct-store) — a result consumed on-chip (chained matmul / elementwise), stored-and-reused, "
-      "or fed to a non-store consumer is deferred; left untouched");
+  INTERNAL_CHECK_SPAN(full_k || !t.needs_pipelined_full_k_grid(), sp)
+      << "Internal error: an operand-stationary or dbC=2 plan requires the full-K pipelined emitter";
+  DirectGmPlacer placer(offs->elements_[0], offs->elements_[1], out_in, store_call->kwargs_,
+                        store_call->attrs_, sp);
+  auto [stmts, last_out] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
+  return MNFold{std::move(stmts), last_out, store_stmt->var_, store_stmt};
 }
 
 /// True when a ``tile.cast`` may be folded into a cube FIXPIPE Acc->Mat writeback
@@ -2449,69 +2544,172 @@ bool CastFoldableToFixpipeMat(const CallPtr& cast, const TileTypePtr& src_ty, Da
   return !GetSaturationMode(cast).has_value();
 }
 
-/// Try to fold a Mat-resident plain ``tile.matmul`` whose [M, N] output exceeds
-/// L0c into a Mat-scratch grid when the result is consumed *entirely* at
-/// matmul-operand positions (a chained matmul reads it on-chip).  Each sub-tile is
+/// Resolve the M/N grid destination of the matmul-family ``assign`` from its
+/// SeqStmts-level sibling index (see ``MNDestination``).  Mat-scratch is checked
+/// first so its hints stay clean; direct-store second.  Every gate the emitters
+/// rely on — operand kind, left-operand residency, use classification, the
+/// backend's Mat-scratch precision and capacity limits, and the consumer store's
+/// operand shapes — is decided here, once, before the chooser runs, so the
+/// realizable mask handed to the chooser describes the fold that will actually
+/// consume its plan.
+MNDestination ClassifyMNDestination(const AssignStmtPtr& assign, const CallPtr& call, MatmulKind kind,
+                                    const SiblingIndex& sibling_index) {
+  MNDestination dest;
+  auto defer = [&](const char* code, std::string message) {
+    dest.deferrals.emplace_back(code, std::move(message));
+  };
+  const Var* result = assign->var_.get();
+  auto uc_it = sibling_index.use_counts.find(result);
+  dest.result_uses = uc_it == sibling_index.use_counts.end() ? 0 : uc_it->second;
+  auto mo_it = sibling_index.matmul_operand_uses.find(result);
+  dest.operand_uses = mo_it == sibling_index.matmul_operand_uses.end() ? 0 : mo_it->second;
+
+  // An arbitrary matmul_acc would need slices of its caller-owned [M, N]
+  // accumulator; the supported split-K case was matched as a canonical
+  // create/pipeline/store chain and tiled outside the K loop earlier.
+  if (kind == MatmulKind::kAccumulate) {
+    defer("PH-AT-006",
+          "oversized tile.matmul_acc does not match the canonical create -> split-K pipeline -> store "
+          "form handled by loop-level M/N tiling; slicing this caller-owned [M, N] accumulator is "
+          "unsupported, so the call is left untouched");
+    return dest;
+  }
+  // A Vec-resident left operand (the fused-attention PV pattern) is staged into
+  // Mat by the K-only rewrite; neither grid emitter handles it yet.
+  auto lhs = call->args_.empty() ? nullptr : AsVarLike(call->args_[0]);
+  auto lhs_ty = lhs ? As<TileType>(lhs->GetType()) : nullptr;
+  if (lhs_ty && lhs_ty->GetMemorySpace() == MemorySpace::Vec) {
+    defer("PH-AT-006",
+          "tile.matmul with a Vec left operand needs M/N tiling — the PV path is deferred; left untouched");
+    return dest;
+  }
+  auto result_ty = As<TileType>(result->GetType());
+  auto m_ci = result_ty && result_ty->shape_.size() == 2 ? As<ConstInt>(result_ty->shape_[0]) : nullptr;
+  auto n_ci = result_ty && result_ty->shape_.size() == 2 ? As<ConstInt>(result_ty->shape_[1]) : nullptr;
+  // Not a static 2D result: AnalyzeMatmul declines the call before any grid.
+  if (!m_ci || !n_ci) return dest;
+  const int64_t M = m_ci->value_;
+  const int64_t N = n_ci->value_;
+
+  // Mat-scratch dtype + remap target. Default: the matmul result itself at its
+  // own dtype. Chained-matmul-with-downcast — `c -> tile.cast(c, bf16/f16) ->
+  // matmul` — fuses the cast (the cube FIXPIPE writeback, pto.tinsert) into the
+  // scratch: the scratch holds the bf16/f16 intermediate, the per-sub-tile
+  // assemble downcasts Acc f32 -> Mat bf16, and the cast result is remapped to
+  // the scratch so the consumer matmul reads it on-chip (the cast op then goes
+  // dead).
+  dest.scratch_dtype = result_ty->dtype_;
+  dest.remap_target = result;
+  if (auto cast_it = sibling_index.cast_of.find(result); cast_it != sibling_index.cast_of.end()) {
+    const Var* cb = cast_it->second->var_.get();
+    auto cb_ty = As<TileType>(cb->GetType());
+    auto cast_call = As<Call>(cast_it->second->value_);
+    // Fold the downcast into the FIXPIPE Acc->Mat writeback only when FIXPIPE
+    // can reproduce it: f32 (the matmul Acc) -> bf16/f16, round-to-nearest.
+    // Otherwise keep the standalone Vector cast (e.g. an int accumulator, or a
+    // directional/truncating round mode FIXPIPE has no `rmode` for).
+    if (cb_ty && CastFoldableToFixpipeMat(cast_call, result_ty, cb_ty->dtype_)) {
+      auto cb_uc = sibling_index.use_counts.find(cb);
+      auto cb_mo = sibling_index.matmul_operand_uses.find(cb);
+      const int cb_uses = cb_uc == sibling_index.use_counts.end() ? 0 : cb_uc->second;
+      const int cb_mm = cb_mo == sibling_index.matmul_operand_uses.end() ? 0 : cb_mo->second;
+      // `c`'s sole use is the cast, whose result is consumed entirely as
+      // matmul operands — fold the matmul+cast into a low-precision scratch.
+      if (dest.result_uses == 1 && cb_uses >= 1 && cb_uses == cb_mm) {
+        dest.scratch_dtype = cb_ty->dtype_;
+        dest.remap_target = cb;     // consumer matmul reads the scratch
+        dest.extra_remap = result;  // c -> scratch too; the cast op goes dead
+        dest.result_uses = cb_uses;
+        dest.operand_uses = cb_mm;
+      }
+    }
+  }
+  // Mat-scratch: every use must be a matmul operand — a non-operand use (store,
+  // elementwise, matmul_acc accumulator) means substituting an upstream Mat
+  // scratch is illegal.
+  if (dest.result_uses >= 1 && dest.operand_uses == dest.result_uses) {
+    // On backends whose only offset Acc->Mat path is the FIXPIPE writeback
+    // (`pto.tinsert`), that path downcasts f32 -> bf16/f16 and cannot keep f32 — a
+    // same-dtype f32 Acc->Mat assemble lowers to subview+tmov, which the assembler
+    // rejects for a partial window. So an oversized chained-matmul scratch must be
+    // bf16/f16 there (the dtype comes from a `tile.cast(result, bf16/f16)` fused
+    // into the assemble, the cube's native operand precision); without it, defer
+    // (left whole) rather than emit an unassemblable f32 Mat scratch. A5's tinsert
+    // accepts dst=f32, so its handler returns false and an f32 scratch is kept.
+    const auto* ctx = PassContext::Current();
+    const auto* handler = ctx ? ctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+    const bool requires_low_precision = handler && handler->RequiresLowPrecisionMatScratch();
+    if (requires_low_precision && dest.scratch_dtype != DataType::BF16 &&
+        dest.scratch_dtype != DataType::FP16) {
+      defer("PH-AT-009", "chained-matmul [" + std::to_string(M) + ", " + std::to_string(N) +
+                             "] intermediate is " + dest.scratch_dtype.ToString() +
+                             "; this backend's oversized on-chip Mat scratch needs a bf16/f16 "
+                             "intermediate (cast the matmul result to bf16 before the consumer "
+                             "matmul, the cube's native operand precision) — left on the deferred path");
+    } else {
+      // Necessary capacity gate: the Mat scratch alone must fit. The allocator
+      // still performs the full live-range/packing check later.
+      const uint64_t mat_capacity = handler ? handler->GetMatCapacityBytes() : 0;
+      const uint64_t scratch_bytes =
+          static_cast<uint64_t>(M) * static_cast<uint64_t>(N) * DTypeBytes(dest.scratch_dtype);
+      if (mat_capacity > 0 && scratch_bytes > mat_capacity) {
+        defer("PH-AT-006", "chained-matmul [" + std::to_string(M) + ", " + std::to_string(N) +
+                               "] Mat scratch (" + std::to_string(scratch_bytes) +
+                               " bytes) exceeds Mat capacity (" + std::to_string(mat_capacity) +
+                               " bytes); left on the deferred path");
+      } else {
+        dest.kind = MNDestination::Kind::kMatScratch;
+        return dest;
+      }
+    }
+  }
+
+  // Direct-store: the sole consumer is a 2D tile.store.
+  auto store_it = sibling_index.store_of.find(result);
+  const AssignStmt* store_stmt = store_it == sibling_index.store_of.end() ? nullptr : store_it->second;
+  if (store_stmt && dest.result_uses == 1) {
+    auto store_call = As<Call>(store_stmt->value_);
+    INTERNAL_CHECK_SPAN(store_call, store_stmt->span_)
+        << "Internal error: SiblingIndex store_of mapped a non-Call AssignStmt";
+    auto offs = As<MakeTuple>(store_call->args_[1]);
+    if (!offs || offs->elements_.size() != 2) {
+      defer("PH-AT-006", "tile.store offsets are not a 2D tuple — M/N fold not applicable; left untouched");
+      return dest;
+    }
+    if (!AsVarLike(store_call->args_[2])) {
+      defer("PH-AT-006",
+            "tile.store target is not a simple tensor variable — M/N fold not applicable; left untouched");
+      return dest;
+    }
+    dest.kind = MNDestination::Kind::kDirectStore;
+    dest.store = store_stmt;
+    return dest;
+  }
+
+  defer("PH-AT-006",
+        "tile.matmul output exceeds L0c but its result is not consumed by a single 2D tile.store "
+        "(direct-store) — a result consumed on-chip (chained matmul / elementwise), stored-and-reused, "
+        "or fed to a non-store consumer is deferred; left untouched");
+  return dest;
+}
+
+/// Emit the Mat-scratch grid of a plan that needs M/N tiling (destination
+/// ``MNDestination::Kind::kMatScratch``): each ``[m, n]`` Acc sub-tile is
 /// assembled into an L1/Mat scratch (``MatScratchPlacer``) instead of stored to a
 /// DDR tensor, keeping the whole result on-chip; the caller remaps the matmul
-/// result Var to the returned scratch Var.  Returns the grid stmts + scratch Var.
+/// result Var (or its fused downcast) to the returned scratch Var.
 ///
 /// Both K-split (unrolled, constant offsets) and full-K (pipelined, loop-variable
 /// offsets) are supported: ``tile.assemble`` only needs a literal ``MakeTuple``
 /// offset whose *elements* may be loop variables (`ValidateIndexTupleElements`
-/// requires index-typed elements, not constants). Arbitrary ``matmul_acc`` and
-/// Vec-left stay deferred; the canonical split-K form is handled before this
-/// local call-level fold.
-std::optional<std::pair<std::vector<StmtPtr>, VarPtr>> TryFoldMatScratch(const MatmulTiling& t,
-                                                                         int result_uses, int operand_uses,
-                                                                         DataType scratch_dtype,
-                                                                         std::vector<Diagnostic>& hints) {
+/// requires index-typed elements, not constants).
+std::pair<std::vector<StmtPtr>, VarPtr> EmitMatScratchGrid(const MatmulTiling& t, const MNDestination& dest) {
   const Span sp = t.assign->span_;
-  // Arbitrary matmul_acc / Vec-left are deferred (the direct-store path already
-  // hinted these). Canonical split-K is rewritten at the enclosing-loop level.
-  if (t.is_acc() || t.stage_lhs_to_mat) return std::nullopt;
-  // Every use must be a matmul operand: a non-operand use (store, elementwise,
-  // matmul_acc accumulator) means substituting an upstream Mat scratch is illegal.
-  if (result_uses < 1 || operand_uses != result_uses) return std::nullopt;
-  // On backends whose only offset Acc->Mat path is the FIXPIPE writeback
-  // (`pto.tinsert`), that path downcasts f32 -> bf16/f16 and cannot keep f32 — a
-  // same-dtype f32 Acc->Mat assemble lowers to subview+tmov, which the assembler
-  // rejects for a partial window. So an oversized chained-matmul scratch must be
-  // bf16/f16 there (the dtype comes from a `tile.cast(result, bf16/f16)` fused
-  // into the assemble, the cube's native operand precision); without it, defer
-  // (left whole) rather than emit an unassemblable f32 Mat scratch. A5's tinsert
-  // accepts dst=f32, so its handler returns false and an f32 scratch is kept.
-  const auto* ctx = PassContext::Current();
-  const auto* handler = ctx ? ctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
-  const bool requires_low_precision = handler && handler->RequiresLowPrecisionMatScratch();
-  if (requires_low_precision && scratch_dtype != DataType::BF16 && scratch_dtype != DataType::FP16) {
-    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-009",
-                       "chained-matmul [" + std::to_string(t.M) + ", " + std::to_string(t.N) +
-                           "] intermediate is " + scratch_dtype.ToString() +
-                           "; this backend's oversized on-chip Mat scratch needs a bf16/f16 "
-                           "intermediate (cast the matmul result to bf16 before the consumer "
-                           "matmul, the cube's native operand precision) — left on the deferred path",
-                       sp);
-    return std::nullopt;
-  }
-  auto result_ty = As<TileType>(t.assign->var_->GetType());
-  INTERNAL_CHECK_SPAN(result_ty, sp) << "Internal error: matmul result is not a TileType";
-  // Necessary capacity gate: the Mat scratch alone must fit. The allocator still
-  // performs the full live-range/packing check later.
-  const uint64_t mat_capacity = handler ? handler->GetMatCapacityBytes() : 0;
-  const uint64_t scratch_bytes =
-      static_cast<uint64_t>(t.M) * static_cast<uint64_t>(t.N) * DTypeBytes(scratch_dtype);
-  if (mat_capacity > 0 && scratch_bytes > mat_capacity) {
-    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
-                       "chained-matmul [" + std::to_string(t.M) + ", " + std::to_string(t.N) +
-                           "] Mat scratch (" + std::to_string(scratch_bytes) +
-                           " bytes) exceeds Mat capacity (" + std::to_string(mat_capacity) +
-                           " bytes); left on the deferred path",
-                       sp);
-    return std::nullopt;
-  }
+  INTERNAL_CHECK_SPAN(dest.kind == MNDestination::Kind::kMatScratch && !t.is_acc() && !t.stage_lhs_to_mat, sp)
+      << "Internal error: the Mat-scratch grid requires a fresh Mat-left matmul classified for Mat-scratch "
+         "placement";
   const std::string base = t.assign->var_->name_hint_ + "_mat";
-  MatScratchPlacer placer(t.M, t.N, scratch_dtype, base, sp);
+  MatScratchPlacer placer(t.M, t.N, dest.scratch_dtype, base, sp);
   // K-split (K spans >= 2 L0 blocks) → unrolled per-sub-tile K-loop grid; full-K →
   // the pipelined interior + straight-line tail.  Both drive MatScratchPlacer,
   // which assembles each sub-tile into the L1/Mat scratch (tile.assemble accepts
@@ -2526,8 +2724,9 @@ std::optional<std::pair<std::vector<StmtPtr>, VarPtr>> TryFoldMatScratch(const M
   // never carries it.  (The Acc->Mat drain is cheaper than Acc->GM, so the hiding
   // upside is smaller here, but the mechanism is the same.)
   const bool full_k = t.k == t.K;
-  auto [stmts, scratch] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
-  return std::make_pair(std::move(stmts), scratch);
+  INTERNAL_CHECK_SPAN(full_k || !t.needs_pipelined_full_k_grid(), sp)
+      << "Internal error: an operand-stationary or dbC=2 plan requires the full-K pipelined emitter";
+  return full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
 }
 
 /// Static physical footprint of a tile, rounded exactly as the active memory
@@ -3127,11 +3326,11 @@ class AutoTileMutator : public IRMutator {
       // ``tile.assemble``) when every use of ``cb`` is a matmul operand.  This
       // routes the f32->bf16 downcast through the cube FIXPIPE (``pto.tinsert``)
       // instead of the Vector (``pto.tcvt``) — the fits-L0c analogue of the
-      // oversized per-sub-tile Mat-scratch fold (``TryFoldMatScratch``).  The
+      // oversized per-sub-tile Mat-scratch grid (``EmitMatScratchGrid``).  The
       // matmul producing ``src`` is K-tiled (or left untouched) by the dispatch
       // below; here we only redirect the cast's result onto a Mat scratch and
       // drop the now-dead cast.  Oversized chains never reach here — their cast
-      // is dropped via ``dropped`` at the matmul site (see ``TryFoldMatScratch``
+      // is dropped via ``dropped`` at the matmul site (see ``ClassifyMNDestination``
       // remap above), so this only fires for results that fit L0c.
       if (auto cast_as = std::dynamic_pointer_cast<const AssignStmt>(current)) {
         auto cast = As<Call>(cast_as->value_);
@@ -3146,7 +3345,7 @@ class AutoTileMutator : public IRMutator {
           auto m_ci = cb_ty->shape_.size() == 2 ? As<ConstInt>(cb_ty->shape_[0]) : nullptr;
           auto n_ci = cb_ty->shape_.size() == 2 ? As<ConstInt>(cb_ty->shape_[1]) : nullptr;
           // Only fold when the Acc result fits L0c.  An oversized result is
-          // Case 2's domain: ``TryFoldMatScratch`` folds the cast into per-sub-tile
+          // Case 2's domain: the Mat-scratch grid folds the cast into per-sub-tile
           // assembles (and drops it), or defers it when the scratch exceeds Mat
           // capacity — in which case the cast must stay (we must not collapse an
           // oversized [M, N] into one impossible full-window assemble here).
@@ -3200,135 +3399,105 @@ class AutoTileMutator : public IRMutator {
       // visitation happens after rewrite-rejection so nested matmuls inside
       // ForStmt bodies still get rewritten by the recursive visit.
       if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(current)) {
-        if (auto tiling = AnalyzeMatmul(assign, hints, /*force_output_stationary=*/false,
-                                        /*output_box_alignment=*/std::nullopt, &direct_defs)) {
-          if (!tiling->needs_mn_tiling()) {
-            // Whole output fits L0c — tile K only.  k < K here (k == K with
-            // m == M, n == N needs no matmul tiling and was skipped by
-            // AnalyzeMatmul); the chooser may return a non-divisor k that
-            // BuildKLoopRewrite peels.
-            INTERNAL_CHECK_SPAN(tiling->k < tiling->K, tiling->assign->span_)
-                << "Internal error: K-only tiling expects k < K (K=" << tiling->K << ", k=" << tiling->k
-                << ")";
-            auto rewrite = BuildKLoopRewrite(
-                MakeKLoop(*tiling, /*mi=*/nullptr, /*ni=*/nullptr, tiling->m, tiling->n, /*name_base=*/""));
-            remap[assign->var_.get()] = rewrite.return_var;
-            for (auto& s : rewrite.stmts) out.push_back(std::move(s));
-            changed = true;
-            continue;
-          }
-          // Output exceeds L0c — tile M/N by folding the consumer store, found
-          // via the raw (un-substituted) SiblingIndex: the matmul's result is
-          // freshly defined here, so its use count / store site are never
-          // affected by the running remap.
-          const Var* result = assign->var_.get();
-          auto uc_it = sibling_index.use_counts.find(result);
-          int result_uses = uc_it == sibling_index.use_counts.end() ? 0 : uc_it->second;
-          auto mo_it = sibling_index.matmul_operand_uses.find(result);
-          int operand_uses = mo_it == sibling_index.matmul_operand_uses.end() ? 0 : mo_it->second;
-          // Mat-scratch dtype + remap target. Default: the matmul result itself at
-          // its own dtype. Chained-matmul-with-downcast — `c -> tile.cast(c,
-          // bf16/f16) -> matmul` — fuses the cast (the cube FIXPIPE writeback,
-          // pto.tinsert) into the scratch: the scratch holds the bf16/f16
-          // intermediate, the per-sub-tile assemble downcasts Acc f32 -> Mat bf16,
-          // and the cast result is remapped to the scratch so the consumer matmul
-          // reads it on-chip (the cast op then goes dead).
-          auto result_tile_ty = As<TileType>(result->GetType());
-          DataType scratch_dtype = result_tile_ty->dtype_;
-          const Var* remap_target = result;
-          const Var* extra_remap = nullptr;
-          if (auto cast_it = sibling_index.cast_of.find(result); cast_it != sibling_index.cast_of.end()) {
-            const Var* cb = cast_it->second->var_.get();
-            auto cb_ty = As<TileType>(cb->GetType());
-            auto cast_call = As<Call>(cast_it->second->value_);
-            // Fold the downcast into the FIXPIPE Acc->Mat writeback only when FIXPIPE
-            // can reproduce it: f32 (the matmul Acc) -> bf16/f16, round-to-nearest.
-            // Otherwise keep the standalone Vector cast (e.g. an int accumulator, or a
-            // directional/truncating round mode FIXPIPE has no `rmode` for).
-            if (cb_ty && CastFoldableToFixpipeMat(cast_call, result_tile_ty, cb_ty->dtype_)) {
-              auto cb_uc = sibling_index.use_counts.find(cb);
-              auto cb_mo = sibling_index.matmul_operand_uses.find(cb);
-              const int cb_uses = cb_uc == sibling_index.use_counts.end() ? 0 : cb_uc->second;
-              const int cb_mm = cb_mo == sibling_index.matmul_operand_uses.end() ? 0 : cb_mo->second;
-              // `c`'s sole use is the cast, whose result is consumed entirely as
-              // matmul operands — fold the matmul+cast into a low-precision scratch.
-              if (result_uses == 1 && cb_uses >= 1 && cb_uses == cb_mm) {
-                scratch_dtype = cb_ty->dtype_;
-                remap_target = cb;     // consumer matmul reads the scratch
-                extra_remap = result;  // c -> scratch too; the cast op goes dead
-                result_uses = cb_uses;
-                operand_uses = cb_mm;
-              }
-            }
-          }
-          // Mat-scratch: result consumed entirely on-chip at matmul-operand
-          // positions — assemble the sub-tiles into an L1/Mat scratch and remap the
-          // matmul result (or its downcast) to it.  Emitted at the matmul site
-          // (like the K-only rewrite), with no store to defer.  Checked before the
-          // direct-store fold so its hints stay clean.
+        auto call = As<Call>(assign->value_);
+        if (auto kind = ClassifyMatmulKind(call)) {
+          // Resolve the output-grid destination BEFORE choosing the tile, from the
+          // raw (un-substituted) SiblingIndex: the matmul's result is freshly
+          // defined here, so its use count / store site are never affected by the
+          // running remap.  The destination fixes the schedule capability the
+          // chooser may plan for, so a plan that needs an output grid always has
+          // an emitter and no chooser result is ever silently discarded.
+          const MNDestination dest = ClassifyMNDestination(assign, call, *kind, sibling_index);
+          const auto* ctx = PassContext::Current();
+          ScheduleCapability capability;
+          capability.grid = dest.emitter();
           // #1908 guard: under the legacy PyPTO planner, a chained Mat-scratch
           // producer must stay output-stationary. Its opportunistic reuse classes
           // cannot subdivide an expired monolithic A/B-stationary operand panel for
           // the consumer's smaller pipelined buffers, so a later slot is allocated
           // past L0A/L0B capacity. DSA_RP and PTOAS place buffers from their actual
-          // lifetimes and can pack this layout, so preserve their chooser-selected
-          // stationarity. OS is always a legal fallback for PyPTO and the oversized
-          // producer must be tiled, so re-choose OS-only rather than defer.
-          const MatmulTiling* fold_tiling = &*tiling;
-          std::optional<MatmulTiling> os_tiling;
-          const auto* ctx = PassContext::Current();
-          const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
-          if (planner == MemoryPlanner::PyPTO &&
-              tiling->stationarity != utils::Stationarity::kOutputStationary) {
-            std::vector<Diagnostic> discard;  // the first AnalyzeMatmul already emitted the hints
-            os_tiling = AnalyzeMatmul(assign, discard, /*force_output_stationary=*/true,
-                                      /*output_box_alignment=*/std::nullopt, &direct_defs);
-            if (os_tiling) fold_tiling = &*os_tiling;
-          }
-          if (auto ms = TryFoldMatScratch(*fold_tiling, result_uses, operand_uses, scratch_dtype, hints)) {
-            // Mat-scratch may re-choose output stationarity for #1908. Base
-            // source-load removal on the schedule we actually emit: the first
-            // choice may N-tile while the forced OS choice keeps full N (or
-            // vice versa).
-            if (fold_tiling->bias_load_def && fold_tiling->n != fold_tiling->N) {
-              retroactively_dropped.insert(fold_tiling->bias_load_def->var_.get());
+          // lifetimes and can pack this layout, so they keep the operand-stationary
+          // candidates. OS is always a legal fallback for PyPTO and the oversized
+          // producer must be tiled, so PyPTO simply never enumerates them here.
+          capability.operand_stationary_placement = dest.kind != MNDestination::Kind::kMatScratch ||
+                                                    PlannerPlacesHeldPanelBesideMatScratchConsumer(ctx);
+          capability.colive_acc_placement = PlannerPlacesColiveAccumulators(ctx);
+          if (auto tiling = AnalyzeMatmul(assign, hints, capability, /*output_box_alignment=*/std::nullopt,
+                                          &direct_defs)) {
+            if (!tiling->needs_mn_tiling()) {
+              // Whole output fits L0c — tile K only.  k < K here (k == K with
+              // m == M, n == N needs no matmul tiling and was skipped by
+              // AnalyzeMatmul); the chooser may return a non-divisor k that
+              // BuildKLoopRewrite peels.
+              INTERNAL_CHECK_SPAN(tiling->k < tiling->K, tiling->assign->span_)
+                  << "Internal error: K-only tiling expects k < K (K=" << tiling->K << ", k=" << tiling->k
+                  << ")";
+              auto rewrite = BuildKLoopRewrite(
+                  MakeKLoop(*tiling, /*mi=*/nullptr, /*ni=*/nullptr, tiling->m, tiling->n, /*name_base=*/""));
+              remap[assign->var_.get()] = rewrite.return_var;
+              for (auto& s : rewrite.stmts) out.push_back(std::move(s));
+              changed = true;
+              continue;
             }
-            for (auto& s : ms->first) out.push_back(std::move(s));
-            remap[remap_target] = ms->second;
-            if (extra_remap) {
-              remap[extra_remap] = ms->second;  // c -> scratch (cast reads the scratch)
-              dropped.insert(remap_target);     // ... and drop the now-dead cast def
-            }
-            changed = true;
-            continue;
-          }
-          auto store_it = sibling_index.store_of.find(result);
-          const AssignStmt* store_stmt =
-              store_it == sibling_index.store_of.end() ? nullptr : store_it->second;
-          const bool reconstructs_bias = tiling->bias_load_def && tiling->n != tiling->N;
-          const bool bias_snapshot_reaches_store =
-              !reconstructs_bias || !store_stmt ||
-              (next_non_load[i] < op->stmts_.size() &&
-               op->stmts_[next_non_load[i]].get() == static_cast<const Stmt*>(store_stmt));
-          if (reconstructs_bias && store_stmt && !bias_snapshot_reaches_store) {
-            hints.emplace_back(
-                DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-011",
-                "tile.matmul_bias N-window loads would move to its folded consumer store across an "
-                "intervening effect; left untouched to preserve the original bias snapshot",
-                tiling->assign->span_);
-          }
-          if (bias_snapshot_reaches_store) {
-            if (auto fold = TryFoldMNTiling(*tiling, result_uses, store_stmt, hints)) {
+            // Output exceeds L0c — tile M/N through the destination resolved above.
+            // The chooser only plans an operand-stationary or dbC=2 schedule for a
+            // destination whose emitter realizes it, so such a plan can never be
+            // left untouched here.
+            INTERNAL_CHECK_SPAN(
+                dest.kind != MNDestination::Kind::kNone || !tiling->needs_pipelined_full_k_grid(),
+                tiling->assign->span_)
+                << "Internal error: an operand-stationary or dbC=2 plan reached a matmul without an "
+                   "output-grid destination";
+            if (dest.kind == MNDestination::Kind::kMatScratch) {
+              // Mat-scratch: result consumed entirely on-chip at matmul-operand
+              // positions — assemble the sub-tiles into an L1/Mat scratch and remap
+              // the matmul result (or its downcast) to it.  Emitted at the matmul
+              // site (like the K-only rewrite), with no store to defer.
+              auto [ms_stmts, scratch] = EmitMatScratchGrid(*tiling, dest);
+              // Base source-load removal on the schedule we actually emit: a
+              // full-N tile keeps the original bias load.
               if (tiling->bias_load_def && tiling->n != tiling->N) {
                 retroactively_dropped.insert(tiling->bias_load_def->var_.get());
               }
-              remap[fold->store_result_var.get()] = fold->return_var;
-              pending_folds.emplace(static_cast<const Stmt*>(fold->store), std::move(*fold));
+              for (auto& s : ms_stmts) out.push_back(std::move(s));
+              remap[dest.remap_target] = scratch;
+              if (dest.extra_remap) {
+                remap[dest.extra_remap] = scratch;  // c -> scratch (cast reads the scratch)
+                dropped.insert(dest.remap_target);  // ... and drop the now-dead cast def
+              }
               changed = true;
-              continue;  // drop the matmul; sub-tile stmts emit at the store site
+              continue;
             }
+            if (dest.kind == MNDestination::Kind::kDirectStore) {
+              // A reconstructed bias window must not move past an intervening
+              // effect on its way to the folded store site.
+              const bool reconstructs_bias = tiling->bias_load_def && tiling->n != tiling->N;
+              const bool bias_snapshot_reaches_store =
+                  !reconstructs_bias ||
+                  (next_non_load[i] < op->stmts_.size() &&
+                   op->stmts_[next_non_load[i]].get() == static_cast<const Stmt*>(dest.store));
+              if (bias_snapshot_reaches_store) {
+                MNFold fold = EmitDirectStoreGrid(*tiling, dest.store);
+                if (reconstructs_bias) retroactively_dropped.insert(tiling->bias_load_def->var_.get());
+                remap[fold.store_result_var.get()] = fold.return_var;
+                const Stmt* fold_key = fold.store;
+                pending_folds.emplace(fold_key, std::move(fold));
+                changed = true;
+                continue;  // drop the matmul; sub-tile stmts emit at the store site
+              }
+              hints.emplace_back(
+                  DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-011",
+                  "tile.matmul_bias N-window loads would move to its folded consumer store across an "
+                  "intervening effect; left untouched to preserve the original bias snapshot",
+                  tiling->assign->span_);
+            } else {
+              for (const auto& [code, message] : dest.deferrals) {
+                hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, code, message,
+                                   tiling->assign->span_);
+              }
+            }
+            // M/N tiling not applicable — fall through and leave it untouched.
           }
-          // M/N tiling not applicable — fall through and leave it untouched.
         }
       }
       auto visited = VisitStmt(current);
