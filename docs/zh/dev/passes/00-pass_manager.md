@@ -157,6 +157,7 @@ struct PassProperties {
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
 | ClassifyIterArgCarry | CallDirectionsResolved, RuntimeScopesMaterialized | IterArgCarryClassified, RuntimeScopesMaterialized | — |
 | InsertCommFence | SplitIncoreOrch | — | — |
+| LegalizeTileCastFragments | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | NormalizedStmtStructure | — |
 | MaterializeValidShapeSymbols | — | — | — |
 
 本表按 `Default` 策略的执行顺序列出全部已注册 Pass。新增 Pass 或修改属性声明时，请同步更新

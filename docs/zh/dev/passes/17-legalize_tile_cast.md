@@ -12,6 +12,10 @@
 2. 已原生：原样保留（含可被 `AutoTileMatmulL0` FIXPIPE-fold 的 `FP32→BF16/FP16` + `rint`）。
 3. 非原生：在邻接图上 BFS 求最短路径；等长路径优先「同字节转浮点 → 再调宽度」。
 
+本 Pass 刻意不处理物理宽度。受目标分片宽度限制的原生 cast 会在布局和存储规划
+确定父缓冲区行跨度后，由后置的
+[`LegalizeTileCastFragments`](52-legalize_tile_cast_fragments.md) 处理。
+
 典型结果（A5）：
 
 | 用户 Cast | 分解 |

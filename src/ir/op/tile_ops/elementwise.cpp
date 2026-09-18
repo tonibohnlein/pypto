@@ -38,6 +38,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -1496,6 +1497,58 @@ REGISTER_OP("tile.sels")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileSelsType(args, kwargs, "tile.sels");
+    });
+
+// Internal destination-passing form used only by late target legalization.
+// Both data operands are pitch-preserving tile.slice views of their parents;
+// the result aliases `dst` and exists only to keep Tile IR in SSA form. Its
+// explicit effects record the non-functional contract: read src, write dst,
+// and optionally write backend scratch.
+REGISTER_OP("tile.cast_fragment")
+    .set_op_category("TileOp")
+    .set_description("Internal pitch-preserving destination-passing tile cast fragment")
+    .set_internal_only()
+    .add_argument("src", "Source tile.slice view")
+    .add_argument("dst", "Destination tile.slice view written in place")
+    .add_argument("tmp", "Optional backend scratch tile")
+    .set_attr<int>("mode")
+    .set_attr<int>("saturation_mode")
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_input_memory(1, MemorySpace::Vec)
+    .set_input_memory(2, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .set_output_reuses_input(1)
+    .set_arg_effect(0, ArgEffect::Read)
+    .set_arg_effect(1, ArgEffect::Write)
+    .set_arg_effect(2, ArgEffect::Write)
+    .set_workspace_arg(2)
+    .forbid_output_alias(0)
+    .forbid_output_alias(2)
+    .set_lane_invariant_arg(2)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>&) {
+      CHECK(args.size() == 2 || args.size() == 3)
+          << "tile.cast_fragment requires src, dst[, tmp], but got " << args.size() << " arguments";
+      auto src = As<TileType>(args[0]->GetType());
+      auto dst = As<TileType>(args[1]->GetType());
+      CHECK(src && dst) << "tile.cast_fragment src and dst must be TileType";
+      CHECK(src->dtype_ != dst->dtype_)
+          << "tile.cast_fragment requires different source and destination dtypes";
+      const auto same_shape = [](const std::vector<ExprPtr>& lhs, const std::vector<ExprPtr>& rhs) {
+        if (lhs.size() != rhs.size()) return false;
+        for (size_t i = 0; i < lhs.size(); ++i) {
+          if (!structural_equal(lhs[i], rhs[i])) return false;
+        }
+        return true;
+      };
+      CHECK(same_shape(src->shape_, dst->shape_))
+          << "tile.cast_fragment requires matching physical source and destination shapes";
+      CHECK(same_shape(GetValidShape(src), GetValidShape(dst)))
+          << "tile.cast_fragment requires matching logical source and destination shapes";
+      if (args.size() == 3) {
+        CHECK(As<TileType>(args[2]->GetType())) << "tile.cast_fragment tmp must be TileType";
+      }
+      return args[1]->GetType();
     });
 
 // Type deduction for tile.cmp and tile.cmps (comparison operations)
