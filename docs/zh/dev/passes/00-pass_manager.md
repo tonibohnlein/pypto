@@ -156,6 +156,7 @@ struct PassProperties {
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
 | ClassifyIterArgCarry | CallDirectionsResolved, RuntimeScopesMaterialized | IterArgCarryClassified, RuntimeScopesMaterialized | — |
 | InsertCommFence | SplitIncoreOrch | — | — |
+| LegalizeTileCastFragments | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | NormalizedStmtStructure | — |
 | MaterializeValidShapeSymbols | — | — | — |
 
 本表按 `Default` 策略的执行顺序列出全部已注册 Pass。新增 Pass 或修改属性声明时，请同步更新
@@ -520,7 +521,8 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 38. [`MaterializeRuntimeScopes`](49-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit SIMPLER_SCOPE）
 39. [`ClassifyIterArgCarry`](50-classify_iter_arg_carry.md)（把每个 ForStmt iter_arg 标注为平凡别名 / 重绑定 carry，并为 manual-scope TaskId fence 数组定尺）
 40. [`InsertCommFence`](51-insert_comm_fence.md)（在每个发布性写入与释放它的 pld.system.notify 之间插入整张 tensor 的 system.cacheinvalid + GM system.fence；跑在所有语句重排 pass 之后，使插入的 op 一路到 codegen 都紧邻其 notify）
-41. [`MaterializeValidShapeSymbols`](52-materialize_valid_shape_symbols.md)（跑在最后；把设备侧 kernel 无法绑定的 valid_shape 符号转成前置的 Scalar[INDEX] 形参，由调用点传入实际有效范围）
+41. [`LegalizeTileCastFragments`](52-legalize_tile_cast_fragments.md)（在布局与存储规划完成后，将目标 cast 宽度限制物化为保留父行跨度的源/目标视图）
+42. [`MaterializeValidShapeSymbols`](53-materialize_valid_shape_symbols.md)（跑在最后；把设备侧 kernel 无法绑定的 valid_shape 符号转成前置的 Scalar[INDEX] 形参，由调用点传入实际有效范围）
 
 [`ResolveBackendOpLayouts`](22-resolve_backend_op_layouts.md) 会根据
 backend 注册的 layout 元数据修复受约束的逐元素 tile 操作。对于当前 PTO
@@ -580,7 +582,7 @@ print(p.get_produced_properties())   # {SSAForm}
 - `tests/ut/ir/transforms/test_pass_manager.py` — PassManager 向后兼容性测试
 - `tests/ut/conftest.py` — 为所有测试启用 BEFORE_AND_AFTER 验证的 autouse fixture
 
-设置 `enable_buffer_ir=True` 时，最终的 [LowerTileToBuffer](53-lower_tile_to_buffer.md)
+设置 `enable_buffer_ir=True` 时，最终的 [LowerTileToBuffer](54-lower_tile_to_buffer.md)
 位于 `MaterializeValidShapeSymbols` 之后，将完成规划的设备 Tile 存储转换为经过验证的显式 Buffer 操作。
 创建和运行 pass manager 时必须保持该迁移选项一致。
 

@@ -13,6 +13,11 @@ For each `var = tile.cast(...)`:
 2. Already native: leave unchanged (including FIXPIPE-foldable `FP32→BF16/FP16` with `mode=rint`).
 3. Non-native: BFS for a shortest path; among equal-length paths prefer "same byte-width → float, then adjust width".
 
+This pass intentionally does not make physical-width decisions. Native casts
+with target-specific fragment limits are handled later by
+[`LegalizeTileCastFragments`](52-legalize_tile_cast_fragments.md), after layout
+and storage planning have made the parent pitches explicit.
+
 Typical A5 results: `INT32→FP16` → `INT32→FP32→FP16`; `FP16→BF16` → `FP16→FP32→BF16`.
 
 Unreachable pairs hard-fail with src/dst/arch in the diagnostic.

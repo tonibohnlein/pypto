@@ -55,6 +55,12 @@ def test_legalize_tile_cast_pass_factory_exists():
     assert p.get_name() == "LegalizeTileCast"
 
 
+def test_legalize_tile_cast_fragments_pass_factory_exists():
+    p = passes.legalize_tile_cast_fragments()
+    assert p is not None
+    assert p.get_name() == "LegalizeTileCastFragments"
+
+
 def test_a5_int32_to_fp16_becomes_fp32_bridge():
     """A5 has no native I32→FP16; expand to I32→FP32→FP16."""
 
@@ -149,6 +155,40 @@ def test_a2a3_int32_to_fp16_stays_native():
     after = _run(Before, BackendType.Ascend910B)
     pairs = _cast_pairs(after)
     assert pairs == [("int32", "fp16")], pairs
+
+
+def _int32_to_fp16_program(cols: int, valid_rows: int = 32):
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[32, cols], pl.INT32],
+            out: pl.Out[pl.Tensor[[32, cols], pl.FP16]],
+        ) -> pl.Tensor[[32, cols], pl.FP16]:
+            t = pl.load(x, [0, 0], [32, cols], valid_shape=[valid_rows, cols])
+            c = pl.tile.cast(t, target_type=pl.FP16, mode="round")
+            return pl.store(c, [0, 0], out)
+
+    return Before
+
+
+def test_a2a3_int32_to_fp16_physical_fragmentation_is_deferred_to_late_pass():
+    """Dtype-pair legalization must not make a pre-layout width decision."""
+    before = _int32_to_fp16_program(224, valid_rows=16)
+    after = _run(before, BackendType.Ascend910B)
+    assert _cast_pairs(after) == [("int32", "fp16")]
+    ir.assert_structural_equal(after, before)
+
+
+@pytest.mark.parametrize("cols", [32, 64, 128, 256, 896])
+def test_a2a3_int32_to_fp16_safe_width_stays_native(cols: int):
+    """Small and complete 128-element fragments keep the single native cast."""
+
+    before = _int32_to_fp16_program(cols)
+    after = _run(before, BackendType.Ascend910B)
+    assert _cast_pairs(after) == [("int32", "fp16")]
+    ir.assert_structural_equal(after, before)
 
 
 def test_a5_fp16_to_bf16_via_fp32():

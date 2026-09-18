@@ -674,6 +674,12 @@ void BindPass(nb::module_& m) {
              "neither a physical tensor dimension nor a scalar parameter, so a precompiled kernel\n"
              "never receives it. Adds the symbol as a leading Scalar[INDEX] parameter and passes\n"
              "the caller's actual extent at every call/submit site.");
+  passes.def("legalize_tile_cast_fragments", &pass::LegalizeTileCastFragments,
+             "Fragment target-restricted native tile casts after physical layout is known.\n\n"
+             "Replaces each unsafe tile.cast with pitch-preserving source and destination\n"
+             "tile.slice views plus explicit destination-passing tile.cast_fragment ops.\n"
+             "Runs after storage planning and before MaterializeValidShapeSymbols; PTO\n"
+             "codegen lowers each fragment mechanically to one pto.tcvt.");
   passes.def("lower_tile_to_buffer", &pass::LowerTileToBuffer,
              "Replace planned device Tile storage with explicit Buffer IR.\n\n"
              "Runs last, after storage legalization, address placement and signature materialization.\n"
