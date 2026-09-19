@@ -220,6 +220,7 @@ MIGRATION_FAMILIES = (
         (
             "tile.move",
             "tile.cast",
+            "tile.cast_fragment",
             "tile.transpose",
             "tile.concat",
             "tile.extract",
@@ -271,6 +272,7 @@ MIGRATION_FAMILIES = (
             "tile.scatter",
             "tile.scatter_mask",
             "tile.gather_row",
+            "tile.load_rebased_row",
             "tile.mgather",
             "tile.mscatter",
         ),

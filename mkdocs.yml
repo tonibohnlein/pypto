@@ -341,26 +341,28 @@ nav:
           - en/dev/passes/32-canonicalize_io_order.md
           - en/dev/passes/33-materialize_tensor_strides.md
           - en/dev/passes/34-init_memref.md
-          - en/dev/passes/35-materialize_semantic_aliases.md
-          - en/dev/passes/36-memory_reuse.md
-          - en/dev/passes/37-allocate_memory_addr.md
-          - en/dev/passes/38-fold_no_op_reshape.md
-          - en/dev/passes/39-fuse_create_assemble_to_slice.md
-          - en/dev/passes/40-lower_l2_tensor_collectives.md
-          - en/dev/passes/41-legalize_spmd_launches.md
-          - en/dev/passes/42-derive_call_directions.md
-          - en/dev/passes/43-auto_derive_task_dependencies.md
-          - en/dev/passes/44-expand_manual_phase_fence.md
-          - en/dev/passes/45-synthesize_allreduce_signals.md
-          - en/dev/passes/46-materialize_comm_domain_scopes.md
-          - en/dev/passes/47-lower_host_tensor_collectives.md
-          - en/dev/passes/48-materialize_dist_tensor_ctx.md
-          - en/dev/passes/49-legalize_graph_boundary.md
-          - en/dev/passes/50-materialize_runtime_scopes.md
-          - en/dev/passes/51-classify_iter_arg_carry.md
-          - en/dev/passes/52-insert_comm_fence.md
-          - en/dev/passes/53-materialize_valid_shape_symbols.md
-          - en/dev/passes/54-lower_tile_to_buffer.md
+          - en/dev/passes/35-legalize_wide_gm_to_mat_loads.md
+          - en/dev/passes/36-materialize_semantic_aliases.md
+          - en/dev/passes/37-memory_reuse.md
+          - en/dev/passes/38-allocate_memory_addr.md
+          - en/dev/passes/39-fold_no_op_reshape.md
+          - en/dev/passes/40-fuse_create_assemble_to_slice.md
+          - en/dev/passes/41-lower_l2_tensor_collectives.md
+          - en/dev/passes/42-legalize_spmd_launches.md
+          - en/dev/passes/43-derive_call_directions.md
+          - en/dev/passes/44-auto_derive_task_dependencies.md
+          - en/dev/passes/45-expand_manual_phase_fence.md
+          - en/dev/passes/46-synthesize_allreduce_signals.md
+          - en/dev/passes/47-materialize_comm_domain_scopes.md
+          - en/dev/passes/48-lower_host_tensor_collectives.md
+          - en/dev/passes/49-materialize_dist_tensor_ctx.md
+          - en/dev/passes/50-legalize_graph_boundary.md
+          - en/dev/passes/51-materialize_runtime_scopes.md
+          - en/dev/passes/52-classify_iter_arg_carry.md
+          - en/dev/passes/53-insert_comm_fence.md
+          - en/dev/passes/54-legalize_tile_cast_fragments.md
+          - en/dev/passes/55-materialize_valid_shape_symbols.md
+          - en/dev/passes/56-lower_tile_to_buffer.md
           - en/dev/passes/91-utility_passes.md
           - en/dev/passes/92-diagnostics.md
           - en/dev/passes/99-verifier.md

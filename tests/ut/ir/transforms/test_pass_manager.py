@@ -54,6 +54,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "CanonicalizeIOOrder",
     "MaterializeTensorStrides",
     "InitMemRef",
+    "LegalizeWideGmToMatLoads",
     "MaterializeSemanticAliases",
     "MemoryReuse",
     "AllocateMemoryAddr",

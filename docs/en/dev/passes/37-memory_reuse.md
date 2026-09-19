@@ -17,8 +17,8 @@ After applying MemRef sharing, the pass also **removes redundant `tile.alloc` st
 
 **When to use**: This is the opportunistic reuse stage for
 `MemoryPlanner.PYPTO`. It runs after
-[`MaterializeSemanticAliases`](35-materialize_semantic_aliases.md) and before
-[`AllocateMemoryAddr`](37-allocate_memory_addr.md). `MemoryPlanner.DSA_RP`
+[`MaterializeSemanticAliases`](36-materialize_semantic_aliases.md) and before
+[`AllocateMemoryAddr`](38-allocate_memory_addr.md). `MemoryPlanner.DSA_RP`
 skips it so independent buffers remain visible to the DSA-RP solver;
 `MemoryPlanner.PTOAS` skips it because ptoas owns lifetime reuse.
 Semantics-required loop-carry and in-place aliases are already materialized by
@@ -176,7 +176,7 @@ MemoryReuse owns every buffer-coalescing decision, so it prevents the hazardous 
 - the writer's defining op consumes a `tile.tpop_from_aic` value, **and**
 - the buffer member it would reuse in place (whose last use is the writer's def statement) is load-derived.
 
-Both classifications are keyed on `Var` identity. An operand takes one extra step: a value can reach the writer through a **loop carry**, and an `IterArg` is never itself an `AssignStmt` def, so `Var` identity can never classify it. Since [`MaterializeSemanticAliases`](35-materialize_semantic_aliases.md) has already fused each carry chain — init value, `IterArg`, yield value — onto one MemRef base, an `IterArg` operand is classified by the taint of that base instead. Reading operands with `AsVarLike` (never `As<Var>`, which does not match `IterArg`'s own `ObjectKind`) is what makes the carry visible in the first place; without it, `down_next = tile.add(down_prev, pipe_carry)` with a carried `tpop` value silently loses the taint and the hazardous in-place reuse is formed.
+Both classifications are keyed on `Var` identity. An operand takes one extra step: a value can reach the writer through a **loop carry**, and an `IterArg` is never itself an `AssignStmt` def, so `Var` identity can never classify it. Since [`MaterializeSemanticAliases`](36-materialize_semantic_aliases.md) has already fused each carry chain — init value, `IterArg`, yield value — onto one MemRef base, an `IterArg` operand is classified by the taint of that base instead. Reading operands with `AsVarLike` (never `As<Var>`, which does not match `IterArg`'s own `ObjectKind`) is what makes the carry visible in the first place; without it, `down_next = tile.add(down_prev, pipe_carry)` with a carried `tpop` value silently loses the taint and the hazardous in-place reuse is formed.
 
 A carry also breaks program order, so the collector walks the body **twice**. The producer that taints a carry's buffer may stand *after* the use it taints — `w = tile.add(l, carry); p = tile.tpop_from_aic(); yield p` reads a tpop value in `w` from iteration 1 onwards, but a single forward walk classifies `w` before it has seen `p`. A third traversal could add nothing: the base sets are complete after the first walk (a `tile.tpop_from_aic` def is order-independent, and a view shares its source's base), so only the `Var` sets grow in the second, and those propagate in program order within it. Both walks are O(N).
 

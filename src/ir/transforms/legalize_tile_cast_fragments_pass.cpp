@@ -109,8 +109,12 @@ class LegalizeTileCastFragmentsMutator : public IRMutator {
       return IRMutator::VisitStmt_(op);
     }
 
-    INTERNAL_CHECK_SPAN(src->memref_.has_value() && dst->memref_.has_value(), op->span_)
-        << "LegalizeTileCastFragments must run after InitMemRef";
+    // HasMemRefs proves InitMemRef has run, but not every tile owns a general-pool
+    // allocation: cross-core tpop results deliberately remain MemRef-less. The
+    // fragment source is an SSA subview and therefore needs no MemRef. Only the
+    // destination must own the allocation into which the fragments write.
+    INTERNAL_CHECK_SPAN(dst->memref_.has_value(), op->span_)
+        << "LegalizeTileCastFragments requires an allocated destination after InitMemRef";
     INTERNAL_CHECK_SPAN(src->memory_space_ == MemorySpace::Vec && dst->memory_space_ == MemorySpace::Vec,
                         op->span_)
         << "LegalizeTileCastFragments supports Vec-resident native casts only";

@@ -205,7 +205,7 @@ for stack, (out_outer,) in pl.pipeline(STACKS, stage=2, init_values=(out,)):
 ```
 
 参见 [InitMemRef](../passes/34-init_memref.md#声明式分配) 与
-[MemoryReuse](../passes/36-memory_reuse.md#声明式分配)。
+[MemoryReuse](../passes/37-memory_reuse.md#声明式分配)。
 
 ### Tile 视图 (TileView)
 

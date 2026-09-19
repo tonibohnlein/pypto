@@ -383,6 +383,13 @@ class PassPipeline:
 def init_mem_ref() -> Pass:
     """Create an init memref pass."""
 
+def legalize_wide_gm_to_mat_loads() -> Pass:
+    """Legalize target-limited GM-to-Mat source row strides.
+
+    Affected loads retain their destination allocation and are filled through
+    compact pointer-rebased row views. Runs immediately after init_mem_ref.
+    """
+
 def materialize_semantic_aliases() -> Pass:
     """Create the semantic must-alias materialization pass (loop-carry / in-place)."""
 
@@ -1090,6 +1097,7 @@ __all__ = [
     "PassContext",
     "PassPipeline",
     "init_mem_ref",
+    "legalize_wide_gm_to_mat_loads",
     "memory_reuse",
     "allocate_memory_addr",
     "fuse_create_assemble_to_slice",

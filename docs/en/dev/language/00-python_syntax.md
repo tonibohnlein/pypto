@@ -229,7 +229,7 @@ for stack, (out_outer,) in pl.pipeline(STACKS, stage=2, init_values=(out,)):
 ```
 
 See [InitMemRef](../passes/34-init_memref.md#declared-allocations) and
-[MemoryReuse](../passes/36-memory_reuse.md#declared-allocations).
+[MemoryReuse](../passes/37-memory_reuse.md#declared-allocations).
 
 ### Tile Views (TileView)
 

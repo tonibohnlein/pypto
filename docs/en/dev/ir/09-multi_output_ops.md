@@ -195,4 +195,4 @@ body rescan per call.
 - [Types and Examples](02-types.md) — `TupleType` and the rest of the type system
 - [Parameter Directions](08-param-directions.md) — how an undeclared write loses its dependency edge
 - [InitMemRef](../passes/34-init_memref.md) — the pass that owns tile allocation
-- [MemoryReuse](../passes/36-memory_reuse.md) — lifetime reuse across tuple elements
+- [MemoryReuse](../passes/37-memory_reuse.md) — lifetime reuse across tuple elements
