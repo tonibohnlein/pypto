@@ -59,6 +59,7 @@ if (backend::GetBackendType() != backend::BackendType::Ascend910B) { ... }
 | `RequiresRuntimeSubblockBridge()` | 拆分 AIV 包装器是否从 runtime 上下文取 subblock id | `true` | `false` |
 | `RequiresNoSplitDualAivDispatch()` | `no_split` 混合 kernel 是否仍需在两个 AIV lane 上同时下发 | `true` | `false` |
 | `GetL0cMAlignment(dtype)` | L0C 切分、dbC 容量与分配共同使用的物理 M 行对齐 | INT32 为 32；其余为 16 | 16 |
+| `GetMaxGmToMatRowStrideElements(dtype)` | GM 到 Mat 加载可直接编码的最大源行跨度 | 65,535 个元素 | 无限制（`nullopt`） |
 | `BuildCrossCoreTransferView(dest, view)` | 跨核传输边界处的 tile 视图 | Mat/Left/Right 转 NZ；Vec 保持原样 | Mat/Left/Right 转 NZ（a5 硬件要求边界为 fractal）；Vec 保持原样 |
 
 ## 新增后端流程

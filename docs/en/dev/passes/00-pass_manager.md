@@ -140,6 +140,7 @@ struct PassProperties {
 | CanonicalizeIOOrder | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, PipelineResolved | — |
 | MaterializeTensorStrides | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, TensorViewCanonical | — |
 | InitMemRef | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred | HasMemRefs, NormalizedStmtStructure | SSAForm |
+| LegalizeWideGmToMatLoads | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, TensorViewCanonical | NormalizedStmtStructure | — |
 | MaterializeSemanticAliases | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, NormalizedStmtStructure | NormalizedStmtStructure | — |
 | MemoryReuse | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, NormalizedStmtStructure | NormalizedStmtStructure | — |
 | VerifyTileStorage | — | TileStorageLegalized | — |
@@ -505,26 +506,27 @@ The PTO-oriented tile stage of `Default` is:
 20. [`CanonicalizeIOOrder`](32-canonicalize_io_order.md)
 21. [`MaterializeTensorStrides`](33-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
 22. `InitMemRef`
-23. [`MaterializeSemanticAliases`](35-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
-24. `MemoryReuse`
-25. `AllocateMemoryAddr`
-26. [`FoldNoOpReshape`](38-fold_no_op_reshape.md)
-27. [`FuseCreateAssembleToSlice`](39-fuse_create_assemble_to_slice.md)
-28. [`LowerL2TensorCollectives`](40-lower_l2_tensor_collectives.md) (distributed: a managed collective written in a CHIP orchestration body -> one local builtin AIV task; runs here so the emitted call gets its argument directions and TensorMap task edges derived like any kernel call)
-29. [`DeriveCallDirections`](41-derive_call_directions.md)
-30. [`AutoDeriveTaskDependencies`](42-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
-31. [`ExpandManualPhaseFence`](43-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
-32. [`SynthesizeAllReduceSignals`](44-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
-33. [`MaterializeCommDomainScopes`](45-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
-34. [`LowerHostTensorCollectives`](46-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
-35. [`MaterializeDistTensorCtx`](47-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
-36. `Simplify`
-37. [`LegalizeGraphBoundary`](48-legalize_graph_boundary.md) (hoists values a Graph body derives from its boundary scalars to the call sites, and rejects the boundaries the host_build_graph runtime cannot record; no-op for programs with no Graph function)
-38. [`MaterializeRuntimeScopes`](49-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits SIMPLER_SCOPE 1:1)
-39. [`ClassifyIterArgCarry`](50-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
-40. [`InsertCommFence`](51-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs after every statement-reordering pass so the inserted ops stay adjacent to their notify through codegen)
-41. [`LegalizeTileCastFragments`](52-legalize_tile_cast_fragments.md) (after layout and storage planning, materializes target cast-width restrictions as pitch-preserving source/destination views)
-42. [`MaterializeValidShapeSymbols`](53-materialize_valid_shape_symbols.md) (runs dead last; turns each device-kernel valid_shape symbol the kernel cannot bind into a leading Scalar[INDEX] param fed from the call site's actual valid extent)
+23. [`LegalizeWideGmToMatLoads`](35-legalize_wide_gm_to_mat_loads.md) (rebases rows whose GM leading dimension exceeds the target's Mat-load field)
+24. [`MaterializeSemanticAliases`](36-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
+25. `MemoryReuse`
+26. `AllocateMemoryAddr`
+27. [`FoldNoOpReshape`](39-fold_no_op_reshape.md)
+28. [`FuseCreateAssembleToSlice`](40-fuse_create_assemble_to_slice.md)
+29. [`LowerL2TensorCollectives`](41-lower_l2_tensor_collectives.md) (distributed: a managed collective written in a CHIP orchestration body -> one local builtin AIV task; runs here so the emitted call gets its argument directions and TensorMap task edges derived like any kernel call)
+30. [`DeriveCallDirections`](42-derive_call_directions.md)
+31. [`AutoDeriveTaskDependencies`](43-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
+32. [`ExpandManualPhaseFence`](44-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
+33. [`SynthesizeAllReduceSignals`](45-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
+34. [`MaterializeCommDomainScopes`](46-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
+35. [`LowerHostTensorCollectives`](47-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
+36. [`MaterializeDistTensorCtx`](48-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
+37. `Simplify`
+38. [`LegalizeGraphBoundary`](49-legalize_graph_boundary.md) (hoists values a Graph body derives from its boundary scalars to the call sites, and rejects the boundaries the host_build_graph runtime cannot record; no-op for programs with no Graph function)
+39. [`MaterializeRuntimeScopes`](50-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits SIMPLER_SCOPE 1:1)
+40. [`ClassifyIterArgCarry`](51-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
+41. [`InsertCommFence`](52-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs after every statement-reordering pass so the inserted ops stay adjacent to their notify through codegen)
+42. [`LegalizeTileCastFragments`](53-legalize_tile_cast_fragments.md) (after layout and storage planning, materializes target cast-width restrictions as pitch-preserving source/destination views)
+43. [`MaterializeValidShapeSymbols`](54-materialize_valid_shape_symbols.md) (runs dead last; turns each device-kernel valid_shape symbol the kernel cannot bind into a leading Scalar[INDEX] param fed from the call site's actual valid extent)
 
 [`ResolveBackendOpLayouts`](22-resolve_backend_op_layouts.md) repairs
 backend-constrained elementwise tile ops using registered layout metadata.
@@ -554,7 +556,7 @@ so the call might have observable side effects. The DCE step recurses into
 `ForStmt`/`IfStmt`/`WhileStmt`/`ScopeStmt` bodies so nested dead scalars
 are cleaned up as well.
 
-With `enable_buffer_ir=True`, the final [LowerTileToBuffer](54-lower_tile_to_buffer.md)
+With `enable_buffer_ir=True`, the final [LowerTileToBuffer](55-lower_tile_to_buffer.md)
 pass runs after `MaterializeValidShapeSymbols` and replaces planned device Tile
 storage with verified explicit Buffer operations. This migration option must
 remain unchanged between constructing and running the pass manager.

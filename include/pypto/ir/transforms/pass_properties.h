@@ -396,6 +396,16 @@ inline const PassProperties kInitMemRefProperties{
     .produced = {IRProperty::HasMemRefs, IRProperty::NormalizedStmtStructure},
     .invalidated = {IRProperty::SSAForm}};
 
+// Late target legalization immediately after InitMemRef. Tensor strides and
+// memory placement are final enough to identify unsafe GM->Mat loads, while
+// semantic aliasing and lifetime planning still see the explicit DPS row
+// writes introduced by the rewrite.
+inline const PassProperties kLegalizeWideGmToMatLoadsProperties{
+    .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps, IRProperty::HasMemRefs,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure,
+                 IRProperty::TensorViewCanonical},
+    .produced = {IRProperty::NormalizedStmtStructure}};
+
 // Semantic must-alias materialization (Step 0 formerly inside MemoryReuse).
 // Same requirements as MemoryReuse; retargets MemRefs in place without adding or
 // removing structural IR properties.

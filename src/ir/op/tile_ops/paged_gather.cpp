@@ -103,5 +103,37 @@ REGISTER_OP("tile.gather_row")
       return DeduceTileGatherRowType(args, kwargs, "tile.gather_row");
     });
 
+// Internal target-legalization primitive. LegalizeWideGmToMatLoads creates one
+// instance per logical source row after physical layout and MemRefs are known.
+// Unlike tile.gather_row's ordinary lowering, codegen rebases the GM pointer to
+// the requested row and presents a compact [1, C] TensorView, so the original
+// parent leading dimension never reaches the target's bounded stride field.
+REGISTER_OP("tile.load_rebased_row")
+    .set_op_category("TileOp")
+    .set_description("Internal pointer-rebased GM row load into an allocated Mat tile")
+    .set_internal_only()
+    .add_argument("dst", "Destination Mat tile written in place")
+    .add_argument("src", "Source tensor in GM")
+    .add_argument("dst_offset", "Destination [row, col] offset")
+    .add_argument("src_offset", "Source [row, col] offset")
+    .add_argument("shapes", "Static one-row physical window")
+    .add_argument("valid_shape", "Logical one-row transfer extent")
+    .set_attr<int>("cache")
+    .set_output_reuses_input(0)
+    .set_arg_effect(0, ArgEffect::ReadWrite)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      auto result = DeduceTileGatherRowType(args, kwargs, "tile.load_rebased_row");
+      auto dst = As<TileType>(args[0]->GetType());
+      CHECK(dst && dst->memory_space_ == MemorySpace::Mat)
+          << "tile.load_rebased_row requires a Mat destination";
+      auto shapes = As<MakeTuple>(args[4]);
+      CHECK(shapes && shapes->elements_.size() == 2)
+          << "tile.load_rebased_row requires a rank-2 shapes tuple";
+      auto rows = As<ConstInt>(shapes->elements_[0]);
+      CHECK(rows && rows->value_ == 1) << "tile.load_rebased_row requires a one-row physical window";
+      return result;
+    });
+
 }  // namespace ir
 }  // namespace pypto

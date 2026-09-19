@@ -153,8 +153,8 @@ It runs after every statement-reordering pass in the Default pipeline
 (`SkewCrossCorePipeline`, `LowerPipelineLoops`, `CanonicalizeIOOrder`, ...). The
 inserted ops have no operands and no dependency edges, so an earlier insertion
 could be moved away from its notify/wait; running here keeps them adjacent through
-codegen. Only [`LegalizeTileCastFragments`](52-legalize_tile_cast_fragments.md)
-and [`MaterializeValidShapeSymbols`](53-materialize_valid_shape_symbols.md)
+codegen. Only [`LegalizeTileCastFragments`](53-legalize_tile_cast_fragments.md)
+and [`MaterializeValidShapeSymbols`](54-materialize_valid_shape_symbols.md)
 follow. The former replaces only local device `tile.cast` statements, and the
 latter only extends device-kernel signatures and call arguments; neither moves
 an orchestration notify or wait away from its fence.

@@ -584,6 +584,23 @@ class BackendHandler {
                                                                          const DataType& target_dtype) const {
     return std::nullopt;
   }
+
+  /**
+   * @brief Largest GM tensor row stride that a direct GM-to-Mat load may encode.
+   *
+   * Some targets encode the leading dimension of the source TensorView in a
+   * bounded element-count field on the fractal load path.  A value larger than
+   * this limit must be legalized into pointer-rebased row loads whose compact
+   * views no longer carry the parent stride.  The limit is expressed in
+   * elements (not bytes) and applies only to GM-to-Mat loads; ordinary GM loads
+   * and stores retain their original TensorView.
+   *
+   * `std::nullopt` means that the backend declares no such restriction.
+   */
+  [[nodiscard]] virtual std::optional<uint64_t> GetMaxGmToMatRowStrideElements(const DataType& dtype) const {
+    (void)dtype;
+    return std::nullopt;
+  }
 };
 
 }  // namespace backend

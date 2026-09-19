@@ -47,24 +47,27 @@ Developers read pass docs sequentially to understand the compilation pipeline. I
 | 32 | `32-canonicalize_io_order.md` | 32nd pass |
 | 33 | `33-materialize_tensor_strides.md` | 33rd pass (RFC #1300 P3 — wired into Default starting from P6) |
 | 34 | `34-init_memref.md` | 34th pass |
-| 35 | `35-materialize_semantic_aliases.md` | Semantics-required must-alias (loop-carry / in-place); split out of MemoryReuse (its former "Step 0"); always runs, even when MemoryReuse is skipped under `memory_planner=PTOAS` |
-| 36 | `36-memory_reuse.md` | Opportunistic lifetime reuse (also enforces the Ascend910B load + tpop_from_aic in-place hazard guard); skippable under `memory_planner=PTOAS` |
-| 37 | `37-allocate_memory_addr.md` | 37th pass (skippable under `memory_planner=PTOAS`) |
-| 38 | `38-fold_no_op_reshape.md` | 38th pass |
-| 39 | `39-fuse_create_assemble_to_slice.md` | 39th pass |
-| 40 | `40-lower_l2_tensor_collectives.md` | Rewrites a managed collective written in a CHIP orchestration body into one local builtin AIV task (no per-device fan-out, no nested L2 dispatch); runs immediately before DeriveCallDirections so the emitted call gets its argument directions and TensorMap task edges derived like any kernel call |
-| 41 | `41-derive_call_directions.md` | 41st pass (two-phase: arg directions + manual-scope lowering) |
-| 42 | `42-auto_derive_task_dependencies.md` | 42nd pass (manual-scope compiler deps; opt-in AUTO-scope analysis/emission via compile-time switch; default behavior unchanged) |
-| 43 | `43-expand_manual_phase_fence.md` | 43rd pass (manual-scope phase-fence TaskId dep compression; runs after AutoDeriveTaskDependencies) |
-| 44 | `44-synthesize_allreduce_signals.md` | 44th pass (distributed: host allreduce optional signal -> explicit internal signal IR) |
-| 45 | `45-materialize_comm_domain_scopes.md` | 45th pass (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; runs immediately before LowerHostTensorCollectives) |
-| 46 | `46-lower_host_tensor_collectives.md` | 46th pass (host-level tensor collectives -> internal builtin chip dispatches; runs after comm-domain scopes) |
-| 47 | `47-materialize_dist_tensor_ctx.md` | 47th pass (materializes explicit CommCtx params/args for DistributedTensor params; runs before the final Simplify) |
-| 48 | `48-legalize_graph_boundary.md` | Hoists the boundary scalars a `FunctionType::Graph` body derives out to its call sites (a derived scalar has no runtime argument slot, so replay would freeze the first call's value) and rejects boundaries the host_build_graph runtime could not record; runs after the final Simplify, before MaterializeRuntimeScopes |
-| 49 | `49-materialize_runtime_scopes.md` | Runs after the final Simplify; inserts AUTO RuntimeScopeStmt so orchestration codegen emits SIMPLER_SCOPE 1:1 |
-| 50 | `50-classify_iter_arg_carry.md` | Classifies each Orchestration ForStmt iter_arg (trivial alias vs materialised rebind carry) and sizes manual-scope TaskId array carries; runs after MaterializeRuntimeScopes |
-| 51 | `51-insert_comm_fence.md` | Last pass (distributed: inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs after all statement-reordering passes so the inserted ops stay adjacent to notify through codegen) |
-| 52 | `52-materialize_valid_shape_symbols.md` | Runs dead last; turns each device-kernel `valid_shape` symbol the kernel cannot bind (not a physical dim, not a scalar param) into a leading `Scalar[INDEX]` param fed from the call site's actual valid extent |
+| 35 | `35-legalize_wide_gm_to_mat_loads.md` | Rebases GM rows whose leading dimension exceeds the target's Mat-load encoding immediately after `InitMemRef` |
+| 36 | `36-materialize_semantic_aliases.md` | Semantics-required must-alias (loop-carry / in-place); split out of MemoryReuse (its former "Step 0"); always runs, even when MemoryReuse is skipped under `memory_planner=PTOAS` |
+| 37 | `37-memory_reuse.md` | Opportunistic lifetime reuse (also enforces the Ascend910B load + tpop_from_aic in-place hazard guard); skippable under `memory_planner=PTOAS` |
+| 38 | `38-allocate_memory_addr.md` | 38th pass (skippable under `memory_planner=PTOAS`) |
+| 39 | `39-fold_no_op_reshape.md` | 39th pass |
+| 40 | `40-fuse_create_assemble_to_slice.md` | 40th pass |
+| 41 | `41-lower_l2_tensor_collectives.md` | Rewrites a managed collective written in a CHIP orchestration body into one local builtin AIV task (no per-device fan-out, no nested L2 dispatch); runs immediately before DeriveCallDirections so the emitted call gets its argument directions and TensorMap task edges derived like any kernel call |
+| 42 | `42-derive_call_directions.md` | 42nd pass (two-phase: arg directions + manual-scope lowering) |
+| 43 | `43-auto_derive_task_dependencies.md` | 43rd pass (manual-scope compiler deps; opt-in AUTO-scope analysis/emission via compile-time switch; default behavior unchanged) |
+| 44 | `44-expand_manual_phase_fence.md` | 44th pass (manual-scope phase-fence TaskId dep compression; runs after AutoDeriveTaskDependencies) |
+| 45 | `45-synthesize_allreduce_signals.md` | 45th pass (distributed: host allreduce optional signal -> explicit internal signal IR) |
+| 46 | `46-materialize_comm_domain_scopes.md` | 46th pass (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; runs immediately before LowerHostTensorCollectives) |
+| 47 | `47-lower_host_tensor_collectives.md` | 47th pass (host-level tensor collectives -> internal builtin chip dispatches; runs after comm-domain scopes) |
+| 48 | `48-materialize_dist_tensor_ctx.md` | 48th pass (materializes explicit CommCtx params/args for DistributedTensor params; runs before the final Simplify) |
+| 49 | `49-legalize_graph_boundary.md` | Hoists the boundary scalars a `FunctionType::Graph` body derives out to its call sites (a derived scalar has no runtime argument slot, so replay would freeze the first call's value) and rejects boundaries the host_build_graph runtime could not record; runs after the final Simplify, before MaterializeRuntimeScopes |
+| 50 | `50-materialize_runtime_scopes.md` | Runs after the final Simplify; inserts AUTO RuntimeScopeStmt so orchestration codegen emits SIMPLER_SCOPE 1:1 |
+| 51 | `51-classify_iter_arg_carry.md` | Classifies each Orchestration ForStmt iter_arg (trivial alias vs materialised rebind carry) and sizes manual-scope TaskId array carries; runs after MaterializeRuntimeScopes |
+| 52 | `52-insert_comm_fence.md` | Inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it |
+| 53 | `53-legalize_tile_cast_fragments.md` | Materializes target-limited casts as pitch-preserving fragments after physical layout and storage planning |
+| 54 | `54-materialize_valid_shape_symbols.md` | Runs dead last in `Default`; turns each unbound device-kernel `valid_shape` symbol into a leading `Scalar[INDEX]` parameter |
+| 55 | `55-lower_tile_to_buffer.md` | Opt-in final conversion from planned Tile storage to explicit Buffer operations |
 | 91 | `91-utility_passes.md` | Not in Default strategy |
 | 99 | `99-verifier.md` | Infrastructure (not a pipeline pass) |
 

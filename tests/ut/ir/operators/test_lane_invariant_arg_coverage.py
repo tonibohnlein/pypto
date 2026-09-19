@@ -62,6 +62,8 @@ _KWARGS: dict[str, dict] = {
     "tile.tquant_mx_raw": {"group_axis": 1},
 }
 
+_CAST_FRAGMENT = ir.get_op("tile.cast_fragment").name
+
 _DTYPES = [
     DataType.FP32,
     DataType.FP16,
@@ -100,6 +102,7 @@ UNSEEDED_OPS = {
 EXPECTED_BLIND_ARGS = {
     # --- declared Scratch: hardware workspace, legal at full width beside a halved input ---
     ("tile.cast", 1),
+    ("tile.cast_fragment", 2),
     ("tile.col_sum", 1),
     ("tile.gather", 2),
     ("tile.gather_compare", 2),
@@ -162,6 +165,8 @@ def _scalar(name, dtype):
 
 
 def _deduce(op_name, args):
+    if op_name == _CAST_FRAGMENT:
+        return ir._create_internal_op_call(op_name, args, {}, SPAN).type
     return ir.create_op_call(op_name, args, _KWARGS.get(op_name, {}), SPAN).type
 
 
@@ -189,6 +194,14 @@ def _find_baseline(op_name, n_args, tile_idx):
     ``UNSEEDED_OPS``) crossed with a per-argument shape from ``_SHAPE_CANDIDATES``, which is what
     lets the row/col-expand families — whose second operand is a vector — reach a baseline.
     """
+    if op_name == _CAST_FRAGMENT:
+        args = [
+            _tile("src", BASE_SHAPE, DataType.FP16),
+            _tile("dst", BASE_SHAPE, DataType.INT8),
+            _tile("tmp", BASE_SHAPE, DataType.FP32),
+        ]
+        return args, _deduce(op_name, args)
+
     ordered = sorted(tile_idx)
     for dtype in _DTYPES:
         for shapes in itertools.product(_SHAPE_CANDIDATES, repeat=len(ordered)):

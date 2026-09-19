@@ -150,6 +150,16 @@ Pass CreateProgramPass(std::function<ProgramPtr(const ProgramPtr&)> transform, c
 Pass InitMemRef();
 
 /**
+ * @brief Legalize GM-to-Mat loads whose source row stride exceeds the target encoding.
+ *
+ * Runs immediately after InitMemRef. Affected rank-2 ND loads keep their
+ * original destination allocation and are filled by pointer-rebased compact
+ * row loads, so the oversized parent leading dimension is never encoded by
+ * the fractal tload path.
+ */
+Pass LegalizeWideGmToMatLoads();
+
+/**
  * @brief Create the semantic must-alias materialization pass
  *
  * Propagates each loop-carried iter_arg/initValue MemRef down the yield/producer

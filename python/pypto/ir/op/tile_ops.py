@@ -398,6 +398,34 @@ def gather_row(  # noqa: PLR0913
     return _ir_core.create_op_call("tile.gather_row", args, {"transpose": transpose}, actual_span)
 
 
+def load_rebased_row(  # noqa: PLR0913
+    dst: Expr,
+    src: Expr,
+    dst_offset: Sequence[int | Expr] | _ir_core.MakeTuple,
+    src_offset: Sequence[int | Expr] | _ir_core.MakeTuple,
+    shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    *,
+    cache: int = 0,
+    span: Span | None = None,
+) -> Call:
+    """Rebuild an internal pointer-rebased GM-to-Mat row load.
+
+    This is a printer/parser round-trip surface for
+    ``LegalizeWideGmToMatLoads`` output, not a user-facing DSL operation.
+    """
+    actual_span = _get_span_or_capture(span)
+    args: list[Expr] = [
+        dst,
+        src,
+        _to_make_tuple(dst_offset, actual_span),
+        _to_make_tuple(src_offset, actual_span),
+        _to_make_tuple(shapes, actual_span),
+        _to_make_tuple(valid_shape, actual_span),
+    ]
+    return _ir_core._create_internal_op_call("tile.load_rebased_row", args, {"cache": cache}, actual_span)
+
+
 def scatter_update(
     input: Expr,
     *args: Expr | int,

@@ -15,7 +15,7 @@ For each `var = tile.cast(...)`:
 
 This pass intentionally does not make physical-width decisions. Native casts
 with target-specific fragment limits are handled later by
-[`LegalizeTileCastFragments`](52-legalize_tile_cast_fragments.md), after layout
+[`LegalizeTileCastFragments`](53-legalize_tile_cast_fragments.md), after layout
 and storage planning have made the parent pitches explicit.
 
 Typical A5 results: `INT32→FP16` → `INT32→FP32→FP16`; `FP16→BF16` → `FP16→FP32→BF16`.

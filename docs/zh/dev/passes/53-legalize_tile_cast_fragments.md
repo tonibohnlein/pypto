@@ -44,5 +44,5 @@ frame，以及完全由 128 元素对齐分片组成的完整 frame，保留原�
 ## 另请参阅
 
 - [17-legalize_tile_cast.md](17-legalize_tile_cast.md) — 数据类型对合法化
-- [53-materialize_valid_shape_symbols.md](53-materialize_valid_shape_symbols.md) — 默认流水线中的下一个 Pass
+- [54-materialize_valid_shape_symbols.md](54-materialize_valid_shape_symbols.md) — 默认流水线中的下一个 Pass
 - [00-pass_manager.md](00-pass_manager.md) — 默认顺序与 Pass 属性

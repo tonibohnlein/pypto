@@ -14,7 +14,7 @@
 
 本 Pass 刻意不处理物理宽度。受目标分片宽度限制的原生 cast 会在布局和存储规划
 确定父缓冲区行跨度后，由后置的
-[`LegalizeTileCastFragments`](52-legalize_tile_cast_fragments.md) 处理。
+[`LegalizeTileCastFragments`](53-legalize_tile_cast_fragments.md) 处理。
 
 典型结果（A5）：
 

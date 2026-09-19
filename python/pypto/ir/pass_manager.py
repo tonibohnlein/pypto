@@ -227,6 +227,10 @@ class PassManager:
             # TensorView with packed canonical strides (RFC #1300 §2.4).
             passes.materialize_tensor_strides,
             passes.init_mem_ref,
+            # Target fields may not encode an arbitrarily wide GM leading
+            # dimension on the GM->Mat fractal path. Rebase affected rows into
+            # compact source views before alias/lifetime planning.
+            passes.legalize_wide_gm_to_mat_loads,
             # MaterializeSemanticAliases forces loop-carried / in-place buffers to
             # share one MemRef (semantics-required aliasing). It always runs; only
             # legacy opportunistic coalescing is skipped when DSA_RP or PTOAS owns

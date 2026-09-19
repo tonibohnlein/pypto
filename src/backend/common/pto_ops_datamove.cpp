@@ -36,6 +36,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/storage_size.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "src/backend/common/pto_ops_internal.h"
 
@@ -348,7 +349,8 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
 // because ptoas types pto.subview's `sizes` as a static I64ArrayAttr while
 // `valid_row`/`valid_col` are Optional<Index> SSA operands (PTOOps.td SubViewOp) —
 // so only the valid side, and the GM partition_view sizes, can be dynamic.
-static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base,
+                                           bool rebase_source = false) {
   auto& codegen = AsPto(codegen_base);
   INTERNAL_CHECK_SPAN(op->args_.size() == 5 || op->args_.size() == 6, op->span_)
       << "tile.gather_row requires 5-6 arguments "
@@ -514,6 +516,64 @@ static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBa
     std::vector<ExprPtr> tr_off = {soff_elems[1], soff_elems[0]};
     src_pview = EmitPartitionViewPTO(src->name_hint_, dn_view, src_view_type, partition_type,
                                      GetIndexOffsetCodes(tr_off, codegen), xfer_codes, codegen);
+  } else if (rebase_source) {
+    // The target-legalized form must not carry the parent row stride into the
+    // GM->Mat ND2NZ instruction. Rebase the raw pointer to this row and present
+    // a compact one-row view instead. The original stride is used only in
+    // index arithmetic, where it is an unbounded MLIR index value.
+    INTERNAL_CHECK_SPAN(src_tensor_type->shape_.size() == 2 && soff_elems.size() == 2, op->span_)
+        << "tile.load_rebased_row requires a rank-2 source and source offset";
+    INTERNAL_CHECK_SPAN(r_const->value_ == 1, op->span_)
+        << "tile.load_rebased_row requires a one-row physical window";
+
+    ir::TensorLayout src_layout = ir::TensorLayout::ND;
+    std::vector<ExprPtr> src_strides;
+    if (src_tensor_type->tensor_view_.has_value()) {
+      src_layout = src_tensor_type->tensor_view_->layout;
+      src_strides = src_tensor_type->tensor_view_->stride;
+    }
+    INTERNAL_CHECK_SPAN(src_layout == ir::TensorLayout::ND, op->span_)
+        << "tile.load_rebased_row supports ND source tensors only";
+    if (src_strides.empty()) {
+      src_strides =
+          ir::tensor_view_semantics::BuildLogicalStridesFromLayout(src_tensor_type->shape_, src_layout);
+    }
+    INTERNAL_CHECK_SPAN(src_strides.size() == 2, op->span_)
+        << "tile.load_rebased_row requires a rank-2 source stride";
+
+    const auto src_offsets = GetIndexOffsetCodes(soff_elems, codegen);
+    auto emit_index = [&](const ExprPtr& expr) {
+      if (auto c = ir::As<ir::ConstInt>(expr)) {
+        return codegen.GetOrEmitConstant(c->value_, DataType::INDEX);
+      }
+      return codegen.EmitCastToIndex(expr, codegen.GetExprAsCode(expr));
+    };
+    const std::string stride0 = emit_index(src_strides[0]);
+    const std::string stride1 = emit_index(src_strides[1]);
+    const std::string row_term = codegen.NewNamedTemp("rebased_row_offset");
+    codegen.Emit(row_term + " = arith.muli " + src_offsets[0] + ", " + stride0 + " : index");
+    const std::string col_term = codegen.NewNamedTemp("rebased_col_offset");
+    codegen.Emit(col_term + " = arith.muli " + src_offsets[1] + ", " + stride1 + " : index");
+    const std::string flat_offset = codegen.NewNamedTemp("rebased_flat_offset");
+    codegen.Emit(flat_offset + " = arith.addi " + row_term + ", " + col_term + " : index");
+
+    const std::string ptr_type = "!pto.ptr<" + dtype_str + ">";
+    const std::string rebased_ptr = codegen.NewNamedTemp(src->name_hint_ + "_rebased_ptr");
+    codegen.Emit(rebased_ptr + " = pto.addptr " + codegen.GetTensorBasePtr(src) + ", " + flat_offset + " : " +
+                 ptr_type + " -> " + ptr_type);
+
+    const std::string one = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    const std::string physical_cols = codegen.GetOrEmitConstant(c_const->value_, DataType::INDEX);
+    const std::string compact_view = codegen.NewNamedTemp(src->name_hint_ + "_compact_row_view");
+    codegen.Emit(compact_view + " = pto.make_tensor_view " + rebased_ptr + ", shape = [" + one + ", " +
+                 physical_cols + "], strides = [" + physical_cols + ", " + one +
+                 "] {layout = #pto.layout<nd>} : " + src_view_type);
+
+    const std::vector<std::string> zero_offsets = {
+        codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX),
+        codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX)};
+    src_pview = EmitPartitionViewPTO(src->name_hint_, compact_view, src_view_type, partition_type,
+                                     zero_offsets, xfer_codes, codegen);
   } else {
     std::string src_view = codegen.GetOrCreateTensorView(src);
     src_pview = EmitPartitionViewPTO(src->name_hint_, src_view, src_view_type, partition_type,
@@ -524,6 +584,9 @@ static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBa
   tload_line << "pto.tload ins(" << src_pview << " : " << partition_type << ") outs(" << dst_view;
   if (!view_type.empty()) tload_line << " : " << view_type;
   tload_line << ")";
+  if (static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0)) == ir::CachePolicy::kBypass) {
+    tload_line << " {cache_policy = #pto.load_cache_policy<l2_bypass>}";
+  }
   codegen.Emit(tload_line.str());
   return "";
 }
@@ -1371,6 +1434,9 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
 
   reg("tile.gather_row", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeGatherRowCodegenPTO(op, codegen);
+  });
+  reg("tile.load_rebased_row", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeGatherRowCodegenPTO(op, codegen, /*rebase_source=*/true);
   });
 
   reg("tile.extract", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {

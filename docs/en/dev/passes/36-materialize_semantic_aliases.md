@@ -16,7 +16,7 @@ Memory planning distinguishes two kinds of buffer sharing:
   lifetimes *may* share storage to save memory. This is optimization.
 
 This pass handles only the **must-alias** case. It was split out of
-[`MemoryReuse`](36-memory_reuse.md) (it is that pass's former "Step 0") so that
+[`MemoryReuse`](37-memory_reuse.md) (it is that pass's former "Step 0") so that
 the opportunistic lifetime coalescing can be skipped independently:
 
 - `MemoryPlanner.DSA_RP` keeps independent allocation identities for the
@@ -25,8 +25,8 @@ the opportunistic lifetime coalescing can be skipped independently:
 
 **When to use**: Run after [`InitMemRef`](34-init_memref.md) (which creates the
 MemRefs) and before the selected memory planner. It always runs. `PYPTO` follows
-it with [`MemoryReuse`](36-memory_reuse.md); `DSA_RP` consumes its allocation
-identities in [`AllocateMemoryAddr`](37-allocate_memory_addr.md).
+it with [`MemoryReuse`](37-memory_reuse.md); `DSA_RP` consumes its allocation
+identities in [`AllocateMemoryAddr`](38-allocate_memory_addr.md).
 
 ## API
 

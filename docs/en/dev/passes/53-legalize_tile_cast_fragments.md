@@ -54,5 +54,5 @@ boundary.
 ## See Also
 
 - [17-legalize_tile_cast.md](17-legalize_tile_cast.md) — dtype-pair legalization
-- [53-materialize_valid_shape_symbols.md](53-materialize_valid_shape_symbols.md) — the next default pass
+- [54-materialize_valid_shape_symbols.md](54-materialize_valid_shape_symbols.md) — the next default pass
 - [00-pass_manager.md](00-pass_manager.md) — default ordering and pass properties

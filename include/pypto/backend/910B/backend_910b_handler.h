@@ -114,6 +114,14 @@ class Ascend910BHandler : public BackendHandler {
     return std::nullopt;
   }
 
+  [[nodiscard]] std::optional<uint64_t> GetMaxGmToMatRowStrideElements(
+      const DataType& /*dtype*/) const override {
+    // A2/A3's GM->L1 ND2NZ path encodes the leading dimension in a 16-bit
+    // element-count field. At 2^16 the stride silently wraps to zero and every
+    // row of the loaded Mat tile aliases its leading row.
+    return (uint64_t{1} << 16) - 1;
+  }
+
   [[nodiscard]] uint32_t GetGmAccessGranularityBytes() const override { return 512; }
   [[nodiscard]] uint32_t GetL2CacheLineBytes() const override { return 512; }
   [[nodiscard]] uint32_t GetRecommendedInnermostDimBytes() const override { return 512; }

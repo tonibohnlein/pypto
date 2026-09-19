@@ -393,6 +393,10 @@ void BindPass(nb::module_& m) {
              "Create an init memref pass\n\n"
              "Initializes MemRef for all variables in functions.\n"
              "Sets memory space to UB by default, or DDR for tile.load/tile.store operands.");
+  passes.def("legalize_wide_gm_to_mat_loads", &pass::LegalizeWideGmToMatLoads,
+             "Legalize GM-to-Mat loads whose source row stride exceeds the target encoding.\n\n"
+             "Keeps the original destination allocation and fills it through compact,\n"
+             "pointer-rebased row loads. Runs immediately after InitMemRef.");
 
   passes.def("materialize_semantic_aliases", &pass::MaterializeSemanticAliases,
              "Create the semantic must-alias materialization pass\n\n"
