@@ -971,6 +971,40 @@ class TestSpmdOptimizations:
         assert "pl.CrossCoreDirection.VECTOR_TO_CUBE" in printed
         assert parse_program(printed).as_python() == printed
 
+    def test_spmd_explicit_pipe_and_dump_roundtrip(self):
+        """The integration lane preserves upstream dumps and explicit pipes together."""
+
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 32], pl.FP32]):
+                for i in pl.spmd(
+                    1,
+                    dumps=[x],
+                    optimizations=[
+                        pl.cross_core_pipe(
+                            tensor_id=0,
+                            direction=pl.CrossCoreDirection.VECTOR_TO_CUBE,
+                            valid_shape=[16, 32],
+                            slot_size_bytes=2048,
+                            slot_num=2,
+                            pipe_id=0,
+                            bundle=0,
+                        ),
+                    ],
+                ):
+                    tile = pl.load(x, [i * 16, 0], [16, 32])
+
+        main_func = list(Prog.functions.values())[0]
+        incore = _unique_descendant(main_func.body, ir.InCoreScopeStmt)
+        assert incore.attrs["cross_core_pipe_plan"] == "1;0,2,16,32,2048,2,0,0"
+        spmd = _unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        assert [var.name_hint for var in spmd.attrs["dump_vars"]] == ["x"]
+        printed = Prog.as_python()
+        assert "pl.cross_core_pipe(" in printed
+        assert "dumps=[x]" in printed
+        ir.assert_structural_equal(Prog, parse_program(printed))
+
     def test_explicit_cross_core_pipes_reject_duplicate_pipe_id(self):
         """Physical FIFO identities are unique within one core-group scope."""
 

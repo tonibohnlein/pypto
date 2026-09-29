@@ -14,6 +14,7 @@
 # pyright: reportUndefinedVariable=false
 
 import ast
+import sys
 from typing import TYPE_CHECKING, Any
 
 import pypto.language as pl
@@ -1437,7 +1438,10 @@ class TestDynamicShapeEdgeCases:
         """User typos variable name — should get a clear error."""
         shape = [128, 64]  # noqa: F841 — intentionally unused; typo below
 
-        with pytest.raises(NameError, match=r"shaep|Cannot resolve|Unknown|undefined"):
+        # Python 3.14 defers annotation evaluation, so the DSL parser diagnoses
+        # the unresolved name; older Python raises during function definition.
+        error_type = ParserTypeError if sys.version_info >= (3, 14) else NameError
+        with pytest.raises(error_type, match="shaep"):
 
             @pl.function
             def func(x: pl.Tensor[shaep, pl.FP32]) -> pl.Tensor[shaep, pl.FP32]:  # noqa: F821
