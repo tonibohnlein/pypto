@@ -2611,30 +2611,33 @@ class LifetimeAnalyzer : public IRVisitor {
     loop_scopes_.push_back({loop_start, loop_end});
   }
 
-  /// Resolve a loop carry's init to the variable that actually owns the buffer.
+  /// Resolve a loop carry or return value to the tracked allocation root.
   ///
   /// A nested loop seeds its carry from the *enclosing* loop's IterArg, and an
   /// IterArg is an alias of its own init rather than a definition in its own
   /// right -- like return_vars, iter-args are deliberately absent from
   /// `ordered_defs_` / `var_def_order_`, so they carry no lifetime of their own.
-  /// Walking the carry chain to the first non-IterArg therefore lands on the
-  /// AssignStmt-defined tile whose buffer the whole loop nest shares, which is
-  /// the variable a use of any return_var in that nest has to keep alive.
+  /// Walking IterArg init links and previously registered return-var links lands
+  /// on the AssignStmt-defined tile whose buffer the loop chain shares. This is
+  /// needed both for nested loops and for consecutive update loops.
   ///
-  /// Returns nullptr when the chain does not end at a tracked carrier; the
-  /// caller then records no mapping, exactly as before.
-  [[nodiscard]] VarPtr ResolveCarryInitCarrier(const ExprPtr& init_value) const {
-    auto var = AsVarLike(init_value);
-    // An init is always defined before its own loop, so the chain is acyclic in
-    // well-formed IR; the visited set bounds it anyway rather than hanging.
+  [[nodiscard]] std::optional<VarPtr> ResolveTrackedAllocationRoot(const ExprPtr& value) const {
+    auto var = AsVarLike(value);
     std::set<const Var*> seen;
-    while (var) {
-      auto iter_arg = As<IterArg>(var);
-      if (!iter_arg) return var;
-      if (!seen.insert(var.get()).second) return nullptr;
-      var = AsVarLike(iter_arg->initValue_);
+    while (var && var_def_order_.count(var) == 0) {
+      INTERNAL_CHECK_SPAN(seen.insert(var.get()).second, var->span_)
+          << "Internal error: cycle in loop return-variable allocation provenance at '" << var->name_hint_
+          << "'";
+      if (auto iter_arg = As<IterArg>(var)) {
+        var = AsVarLike(iter_arg->initValue_);
+        continue;
+      }
+      const auto mapped = return_var_to_init_var_.find(var);
+      if (mapped == return_var_to_init_var_.end()) return std::nullopt;
+      var = mapped->second;
     }
-    return nullptr;
+    if (!var || var_def_order_.count(var) == 0) return std::nullopt;
+    return var;
   }
 
   void RegisterReturnVars(const std::vector<IterArgPtr>& iter_args, const std::vector<VarPtr>& return_vars) {
@@ -2648,9 +2651,12 @@ class LifetimeAnalyzer : public IRVisitor {
       // We do NOT register return_vars in ordered_defs_ -- they must not
       // participate in sharing group computation, which would inflate
       // group lifetimes and block unrelated reuse opportunities.
-      auto init_var = ResolveCarryInitCarrier(iter_args[i]->initValue_);
-      if (init_var && var_def_order_.count(init_var)) {
-        return_var_to_init_var_[rv] = init_var;
+      if (auto root = ResolveTrackedAllocationRoot(iter_args[i]->initValue_)) {
+        // Store the canonical root, not merely the immediate loop return. A
+        // sequence of update loops commonly feeds one loop's return_var into
+        // the next loop. Keeping a one-hop mapping drops uses of the final
+        // return because intermediate return_vars are deliberately untracked.
+        return_var_to_init_var_[rv] = *root;
       }
     }
   }
@@ -2666,17 +2672,14 @@ class LifetimeAnalyzer : public IRVisitor {
       return;
     }
 
-    // If var is a loop return_var, redirect the use to its initValue var.
-    // YieldFixup will alias the return_var to the initValue's MemRef,
-    // so keeping the initValue live prevents premature buffer reuse.
-    auto it = return_var_to_init_var_.find(var);
-    const VarPtr& target = (it != return_var_to_init_var_.end()) ? it->second : var;
-
-    if (!var_def_order_.count(target)) {
-      return;
-    }
+    // If var is a loop return_var, redirect the use through any sequence of
+    // loop returns to the tracked allocation root. YieldFixup aliases every
+    // return value to that buffer, so the root must remain live until the final
+    // return's last read.
+    const auto target = ResolveTrackedAllocationRoot(var);
+    if (!target) return;
     // operator[] default-inserts 0 for missing keys; use_order is always >= 0.
-    var_raw_last_use_[target] = std::max(var_raw_last_use_[target], use_order);
+    var_raw_last_use_[*target] = std::max(var_raw_last_use_[*target], use_order);
   }
 
   /**
@@ -2984,10 +2987,10 @@ class HazardInputCollector : public IRVisitor {
   /// escapes `reads_tpop` and its output may be coalesced onto `l`'s buffer.
   ///
   /// Two traversals suffice, and a third could never add anything: the base
-  /// sets are complete after the first pass.  `tpop_bases_` only ever takes a
-  /// `tile.tpop_from_aic` def, which is order-independent; `load_derived_bases_`
-  /// additionally takes view outputs, and a view shares its source's base, so
-  /// marking one inserts a base that is already present.  Only the *Var* sets
+  /// sets are complete after the first pass. Direct producer defs are
+  /// order-independent; propagated views and aliases share their source's base,
+  /// so marking one inserts a base that is already present (or no base for a
+  /// buffer-less value). Only the *Var* sets
   /// grow in the second pass, and those propagate in program order within it.
   /// Both traversals are O(N), so the collector stays linear.
   void Run(const StmtPtr& body) {
@@ -2996,7 +2999,10 @@ class HazardInputCollector : public IRVisitor {
   }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
-    if (GetTileTypeWithMemRef(op->var_->GetType())) {
+    // Producer provenance is independent of general-pool ownership. InitMemRef
+    // deliberately leaves TPOP results and their zero-copy views without a
+    // MemRef: their storage belongs to the cross-core pipe instead.
+    if (As<TileType>(op->var_->GetType())) {
       if (auto call = As<Call>(op->value_)) {
         // AsVarLike, not As<Var>: an operand may be an enclosing loop's IterArg
         // — the loop-carry shape of `tile.add(x, c_iter)` / `tile.matmul_acc(
@@ -3021,13 +3027,26 @@ class HazardInputCollector : public IRVisitor {
             }
           }
         }
-        if (IsOp(call, "tile.tpop_from_aic")) MarkTpop(op->var_);
+        if (IsOp(call, "tile.tpop_from_aic")) {
+          MarkTpop(op->var_);
+        } else if (call->op_ && op_predicates::IsBufferAliasingViewOp(call->op_->name_) &&
+                   !call->args_.empty()) {
+          if (const auto source = AsVarLike(call->args_[0]); source && IsTpop(source)) {
+            MarkTpop(op->var_);
+          }
+        }
         for (const VarPtr& in : input_vars) {
           if (IsTpop(in)) {
             inputs_.reads_tpop.insert(op->var_.get());
             break;
           }
         }
+      } else if (const auto source = AsVarLike(op->value_)) {
+        // A bare SSA rename preserves the same physical value, including when
+        // neither side owns a MemRef. Do not confuse this with a data-producing
+        // operation which may independently choose a different allocation.
+        if (IsLoadDerived(source)) MarkLoadDerived(op->var_);
+        if (IsTpop(source)) MarkTpop(op->var_);
       }
     }
     IRVisitor::VisitStmt_(op);
@@ -3106,6 +3125,7 @@ class HazardInputCollector : public IRVisitor {
 // the *physical buffer* it ends up on (following both reuse-map reassignment and
 // VIEW inheritance) and blocks the output from landing there — see the use site.
 using ForbidAliasMap = AllocationForbidAliasMap;
+using SameBaseOrDisjointAliasMap = AllocationSameBaseOrDisjointMap;
 
 class ForbidAliasCollector : public IRVisitor {
  public:
@@ -3133,7 +3153,14 @@ class ForbidAliasCollector : public IRVisitor {
     if (const auto get_item = As<TupleGetItemExpr>(op->value_)) {
       if (const VarPtr tuple = AsVarLike(get_item->tuple_)) {
         const auto pending = tuple_forbidden_.find(tuple.get());
-        if (pending != tuple_forbidden_.end()) RecordForOutput(op->var_, pending->second);
+        if (pending != tuple_forbidden_.end()) {
+          RecordForOutput(op->var_, pending->second, &forbidden_, &tuple_forbidden_);
+        }
+        const auto same_base = tuple_same_base_or_disjoint_.find(tuple.get());
+        if (same_base != tuple_same_base_or_disjoint_.end()) {
+          RecordForOutput(op->var_, same_base->second, &same_base_or_disjoint_,
+                          &tuple_same_base_or_disjoint_);
+        }
       }
     }
 
@@ -3142,7 +3169,9 @@ class ForbidAliasCollector : public IRVisitor {
       if (reg.IsRegistered(call->op_->name_)) {
         const auto& entry = reg.GetEntry(call->op_->name_);
         std::vector<VarPtr> forbidden_inputs;
+        std::set<size_t> forbidden_indices;
         auto forbid_arg = [&](size_t i) {
+          forbidden_indices.insert(i);
           if (i < call->args_.size()) {
             if (auto v = AsVarLike(call->args_[i])) forbidden_inputs.push_back(v);
           }
@@ -3174,7 +3203,19 @@ class ForbidAliasCollector : public IRVisitor {
           const auto source = GetTypeMemRef(call->args_[1]->GetType()).value_or(nullptr);
           if (target && source && target->base_ != source->base_) forbid_arg(1);
         }
-        RecordForOutput(op->var_, forbidden_inputs);
+        std::vector<VarPtr> same_base_or_disjoint_inputs;
+        if (entry.IsInplaceSafe() &&
+            entry.GetExecutionMemoryAccessEvidence() == ExecutionMemoryAccessEvidence::Functional) {
+          for (size_t i = 0; i < call->args_.size(); ++i) {
+            if (forbidden_indices.count(i) != 0) continue;
+            if (auto input = AsVarLike(call->args_[i]); input && As<TileType>(input->GetType())) {
+              same_base_or_disjoint_inputs.push_back(std::move(input));
+            }
+          }
+        }
+        RecordForOutput(op->var_, forbidden_inputs, &forbidden_, &tuple_forbidden_);
+        RecordForOutput(op->var_, same_base_or_disjoint_inputs, &same_base_or_disjoint_,
+                        &tuple_same_base_or_disjoint_);
         // tile.transpose is registered not_inplace_safe(), so its output is
         // already forbidden from aliasing any input above (pto.ttrans writes
         // dst directly from src on the scalar path — dst == src corrupts).
@@ -3183,25 +3224,30 @@ class ForbidAliasCollector : public IRVisitor {
     IRVisitor::VisitStmt_(op);
   }
 
-  ForbidAliasMap Take() { return std::move(forbidden_); }
+  ForbidAliasMap TakeForbidden() { return std::move(forbidden_); }
+  SameBaseOrDisjointAliasMap TakeSameBaseOrDisjoint() { return std::move(same_base_or_disjoint_); }
 
  private:
-  void RecordForOutput(const VarPtr& output, const std::vector<VarPtr>& forbidden_inputs) {
-    if (!output || forbidden_inputs.empty()) return;
+  void RecordForOutput(const VarPtr& output, const std::vector<VarPtr>& inputs,
+                       std::map<const Var*, std::vector<VarPtr>>* recorded_by_output,
+                       std::map<const Var*, std::vector<VarPtr>>* pending_by_tuple) {
+    if (!output || inputs.empty()) return;
     if (As<TupleType>(output->GetType())) {
-      tuple_forbidden_[output.get()] = forbidden_inputs;
+      (*pending_by_tuple)[output.get()] = inputs;
       return;
     }
     if (!As<TileType>(output->GetType())) return;
     const auto rep_it = member_to_rep_.find(output.get());
     const Var* out_key = rep_it != member_to_rep_.end() ? rep_it->second : output.get();
-    auto& recorded = forbidden_[out_key];
-    recorded.insert(recorded.end(), forbidden_inputs.begin(), forbidden_inputs.end());
+    auto& recorded = (*recorded_by_output)[out_key];
+    recorded.insert(recorded.end(), inputs.begin(), inputs.end());
   }
 
   ForbidAliasMap forbidden_;
   const BufferViewAnalysis* views_;
+  SameBaseOrDisjointAliasMap same_base_or_disjoint_;
   std::map<const Var*, std::vector<VarPtr>> tuple_forbidden_;
+  std::map<const Var*, std::vector<VarPtr>> tuple_same_base_or_disjoint_;
   std::map<const Var*, const Var*> member_to_rep_;  ///< sharing-group member -> representative
 };
 
@@ -3295,8 +3341,11 @@ bool NeedsLoadTpopHazardGuard(const FunctionPtr& func) {
   if (func->func_type_ != FunctionType::AIV) return false;
   if (!backend::BackendConfig::IsConfigured()) return false;
   const auto* ctx = PassContext::Current();
-  if (ctx == nullptr) return false;
-  if (!ctx->GetBackendHandler()->RequiresSplitLoadTpopWorkaround()) return false;
+  // AllocationConstraintAnalysis is also used directly outside a pass scope.
+  // PassContext's accessor delegates to this same configured backend; absence
+  // of a context must not silently turn off a target correctness constraint.
+  const auto* handler = ctx ? ctx->GetBackendHandler() : backend::GetBackend()->GetHandler();
+  if (!handler->RequiresSplitLoadTpopWorkaround()) return false;
   // A split AIV function needs the guard. The split may be signalled either as a
   // function-level mode (single-mode / standalone kernels carry ``split``) or
   // ONLY as the mode-agnostic ``split_aiv`` marker — multi-mode explicit
@@ -5972,7 +6021,8 @@ AllocationConstraintAnalysis AnalyzeAllocationConstraints(const FunctionPtr& fun
   if (context && context->GetEnableBufferIR() && IsBufferIRSelected(func)) views.emplace(func->body_);
   ForbidAliasCollector forbid_collector(lifetimes.var_sharing_groups, views ? &*views : nullptr);
   forbid_collector.VisitStmt(func->body_);
-  result.forbid_alias = forbid_collector.Take();
+  result.forbid_alias = forbid_collector.TakeForbidden();
+  result.same_base_or_disjoint_alias = forbid_collector.TakeSameBaseOrDisjoint();
   return result;
 }
 

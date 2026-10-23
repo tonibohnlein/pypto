@@ -38,6 +38,7 @@ cleanly through the autouse print/parse fixture.
 """
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import pypto.language as pl
 import pytest
@@ -3450,6 +3451,7 @@ class TestAutoTileMatmulL0MatScratch:
         [
             (passes.MemoryPlanner.PYPTO, False, False, False),
             (passes.MemoryPlanner.DSA_RP, False, True, False),
+            (None, False, True, False),
         ],
     )
     def test_chained_mat_scratch_stationarity_matches_planner(
@@ -3489,9 +3491,26 @@ class TestAutoTileMatmulL0MatScratch:
                 out = pl.assemble(out, d, [0, 0])
                 return out
 
-        with passes.PassContext([], memory_planner=planner, enable_pypto_l0c_double_buffer=pypto_opt_in):
-            After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+        def lower_and_allocate():
+            after = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
             allocated = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+            return after, allocated
+
+        if planner is None:
+            # Escape pytest's thread-local context. Direct pass calls must use
+            # the same default planner as downstream allocation, rather than
+            # accidentally applying PYPTO's stationarity restriction.
+            def without_context():
+                assert passes.PassContext.current() is None
+                result = lower_and_allocate()
+                assert passes.PassContext.current() is None
+                return result
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                After, allocated = executor.submit(without_context).result()
+        else:
+            with passes.PassContext([], memory_planner=planner, enable_pypto_l0c_double_buffer=pypto_opt_in):
+                After, allocated = lower_and_allocate()
 
         printed = ir.python_print(After)
         assert "tile.create" in printed and "Mem.Mat" in printed, "expected a Mat output scratch"

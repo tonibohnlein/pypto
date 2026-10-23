@@ -3050,7 +3050,9 @@ class TestTileAssembleCodegen:
             pytest.skip("PTOAS is not available")
         # Checking only the logical subview types missed the failure: PTOAS
         # restores the destination's physical dimensions before verifying TMOV.
-        cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path))
+        cpp = pto_backend._compile_pto_module(
+            mlir, "kernel", str(tmp_path), memory_planner=passes.get_default_memory_planner()
+        )
         assert "TINSERT(" in cpp
 
     @pytest.mark.parametrize("dtype", [pl.INT8, pl.UINT8, pl.INT16, pl.INT32])
@@ -3075,7 +3077,9 @@ class TestTileAssembleCodegen:
         assert "pto.tinsert" not in mlir
         if find_ptoas_binary() is None:
             pytest.skip("PTOAS is not available")
-        cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path))
+        cpp = pto_backend._compile_pto_module(
+            mlir, "kernel", str(tmp_path), memory_planner=passes.get_default_memory_planner()
+        )
         assert "TMOV(" in cpp
 
     def _generate_mlir_all_incore(self, program_cls) -> str:

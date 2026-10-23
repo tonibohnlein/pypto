@@ -378,7 +378,7 @@ class PassManager:
         # Otherwise, the pass list could retain legacy planning passes while
         # execution requests a different allocation route. AutoTile also uses
         # the active planner to retain automatic dbC only for PTOAS.
-        self._construction_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        self._construction_planner = ctx.get_memory_planner() if ctx else passes.get_default_memory_planner()
         self._construction_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         skipped_mem_planning_passes: tuple[str, ...]
         if self._construction_planner == passes.MemoryPlanner.PTOAS:
@@ -433,7 +433,7 @@ class PassManager:
         IR mode also fixes which storage verifiers are present and must match.
         """
         ctx = passes.PassContext.current()
-        run_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        run_planner = ctx.get_memory_planner() if ctx else passes.get_default_memory_planner()
         run_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         if run_buffer_ir != self._construction_buffer_ir:
             raise RuntimeError(
@@ -574,7 +574,7 @@ class PassManager:
         # nested dump context. The planner must match the fixed pass list, and
         # dumping IR must not reset caller-visible context state. The flag no
         # longer enables automatic dbC, but remains stored and forwarded.
-        mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        mplan = ctx.get_memory_planner() if ctx else passes.get_default_memory_planner()
         dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
         runtime = ctx.get_runtime() if ctx else passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
         buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
@@ -627,7 +627,7 @@ class PassManager:
         # Preserve the planner, runtime ABI, and stored legacy compatibility
         # flag just as the dump path does. Profiling must not change planning
         # or reset context state; the flag no longer enables automatic dbC.
-        mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        mplan = ctx.get_memory_planner() if ctx else passes.get_default_memory_planner()
         dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
         runtime = ctx.get_runtime() if ctx else passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
         buffer_ir = ctx.get_enable_buffer_ir() if ctx else True

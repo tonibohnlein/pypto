@@ -16,6 +16,7 @@ DefFields always alpha-map; open references retain their identity by default.
 """
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import pypto.language as pl
 import pytest
@@ -39,6 +40,23 @@ def legacy_storage_context(pass_verification_instruments):
         yield
 
 
+def _planner_context(planner):
+    """Preserve the verification fixture while selecting a test's planner policy."""
+    current = passes.PassContext.current()
+    if current is None:
+        return passes.PassContext([], memory_planner=planner)
+    return passes.PassContext(
+        current.get_instruments(),
+        current.get_verification_level(),
+        current.get_diagnostic_phase(),
+        current.get_disabled_diagnostics(),
+        planner,
+        current.get_enable_pypto_l0c_double_buffer(),
+        current.get_runtime(),
+        enable_buffer_ir=current.get_enable_buffer_ir(),
+    )
+
+
 def _run_pipeline(program: ir.Program) -> ir.Program:
     """Run init_mem_ref + materialize_semantic_aliases + memory_reuse pipeline.
 
@@ -47,7 +65,8 @@ def _run_pipeline(program: ir.Program) -> ir.Program:
     memory_reuse in the real pipeline — compose all three here so these unit
     tests exercise the same combined transformation.
     """
-    return passes.memory_reuse()(passes.materialize_semantic_aliases()(passes.init_mem_ref()(program)))
+    with _planner_context(passes.MemoryPlanner.PYPTO):
+        return passes.memory_reuse()(passes.materialize_semantic_aliases()(passes.init_mem_ref()(program)))
 
 
 def _collect_allocated_tile_ranges(program: ir.Program) -> dict[str, tuple[int, int]]:
@@ -5885,6 +5904,142 @@ class TestAscend910BLoadTpopHazard:
     """
 
     @staticmethod
+    def _build_bufferless_program(tpop_path: str, split: bool) -> ir.Program:
+        """Use ordinary TPOP declarations, not synthetic general-pool MemRefs."""
+
+        @pl.program
+        class Direct:
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(self, down: pl.InOut[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                down_prev = pl.tile.load(down, [0, 0], [8, 128], target_memory=pl.Mem.Vec)
+                pipe_chunk: pl.Tile[[8, 128], pl.FP32, pl.Mem.Vec] = pl.tile.tpop_from_aic(split=1)
+                down_next = pl.tile.add(down_prev, pipe_chunk)
+                result = pl.tile.store(down_next, [0, 0], down)
+                return result
+
+        @pl.program
+        class Viewed:
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(self, down: pl.InOut[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                down_prev = pl.tile.load(down, [0, 0], [8, 128], target_memory=pl.Mem.Vec)
+                pipe_chunk: pl.Tile[[8, 128], pl.FP32, pl.Mem.Vec] = pl.tile.tpop_from_aic(split=1)
+                pipe_wide = pl.tile.reshape(pipe_chunk, [4, 256])
+                pipe_view = pl.tile.reshape(pipe_wide, [8, 128])
+                down_next = pl.tile.add(down_prev, pipe_view)
+                result = pl.tile.store(down_next, [0, 0], down)
+                return result
+
+        @pl.program
+        class Aliased:
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(self, down: pl.InOut[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                down_prev = pl.tile.load(down, [0, 0], [8, 128], target_memory=pl.Mem.Vec)
+                pipe_chunk: pl.Tile[[8, 128], pl.FP32, pl.Mem.Vec] = pl.tile.tpop_from_aic(split=1)
+                pipe_alias = pipe_chunk
+                down_next = pl.tile.add(down_prev, pipe_alias)
+                result = pl.tile.store(down_next, [0, 0], down)
+                return result
+
+        before = {"direct": Direct, "view": Viewed, "alias": Aliased}[tpop_path]
+        if split:
+            return before
+        # Keep the entire body identical for the nonsplit target control.
+        function = next(iter(before.functions.values()))
+        nonsplit = ir.Function(
+            function.name,
+            list(zip(function.params, function.param_directions, strict=True)),
+            function.return_types,
+            function.body,
+            function.span,
+            type=function.func_type,
+            attrs={key: value for key, value in function.attrs.items() if key != "split"},
+        )
+        return ir.Program([nonsplit], before.name, before.span)
+
+    @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+    @pytest.mark.parametrize("tpop_path", ["direct", "view", "alias"])
+    @pytest.mark.parametrize("split", [True, False])
+    @pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
+    def test_bufferless_tpop_keeps_target_hazard(self, planner, tpop_path, split, ascend_backend):
+        """Both planners must see TPOP provenance after real initialization."""
+        with passes.PassContext([], memory_planner=planner, enable_buffer_ir=False):
+            initialized = passes.init_mem_ref()(self._build_bufferless_program(tpop_path, split))
+            bufferless: set[str] = set()
+
+            class CheckPipeStorage(ir.IRVisitor):
+                def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
+                    if op.var.name_hint.startswith("pipe_"):
+                        assert isinstance(op.var.type, ir.TileType)
+                        assert op.var.type.memref is None
+                        bufferless.add(op.var.name_hint)
+                    super().visit_assign_stmt(op)
+
+            CheckPipeStorage().visit_stmt(next(iter(initialized.functions.values())).body)
+            expected = {"pipe_chunk"}
+            if tpop_path == "view":
+                expected |= {"pipe_wide", "pipe_view"}
+            elif tpop_path == "alias":
+                expected.add("pipe_alias")
+            assert bufferless == expected
+
+            prepared = passes.materialize_semantic_aliases()(initialized)
+            # Inspect hard constraints rather than inferring them from placement
+            # or absence of a soft edge: the completion-frontier model excludes
+            # same-operation handoffs even on unaffected targets.
+            function = next(iter(prepared.functions.values()))
+            hard_pairs = {frozenset(pair) for pair in testing.get_dsa_target_hazard_pairs(function)}
+            soft_pairs = {
+                frozenset((edge["first_name"], edge["second_name"]))
+                for edge in testing.recognize_dsa_reuse_penalties(function)
+            }
+            hazardous = ascend_backend == BackendType.Ascend910 and split
+            pair = frozenset(("down_prev", "down_next"))
+            assert (pair in hard_pairs) == hazardous
+            assert pair not in soft_pairs
+            if planner == passes.MemoryPlanner.PYPTO:
+                prepared = passes.memory_reuse()(prepared)
+                bases = _collect_tile_memref_bases(prepared)
+                assert (bases["down_prev"] != bases["down_next"]) == (
+                    ascend_backend == BackendType.Ascend910 and split
+                )
+            after = passes.allocate_memory_addr()(prepared)
+
+        ranges = _collect_allocated_tile_ranges(after)
+        load_offset, load_size = ranges["down_prev"]
+        output_offset, output_size = ranges["down_next"]
+        separate = load_offset + load_size <= output_offset or output_offset + output_size <= load_offset
+        if hazardous:
+            assert separate, ranges
+        elif planner == passes.MemoryPlanner.PYPTO:
+            assert not separate, ranges
+
+    @pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
+    def test_target_hazard_without_pass_context(self, ascend_backend):
+        """Call shared analysis directly, without a pass's internal context."""
+        before = self._build_program()
+        outer = passes.PassContext.current()
+        assert outer is not None
+        function = next(iter(before.functions.values()))
+
+        def analyze_without_context():
+            assert passes.PassContext.current() is None
+            hard_pairs = testing.get_dsa_target_hazard_pairs(function)
+            # This entry point calls BuildDsaAllocationPlan directly. In
+            # contrast, MemoryReuse installs a BufferIRFunctionScope itself.
+            assert passes.PassContext.current() is None
+            return {frozenset(pair) for pair in hard_pairs}
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            hard_pairs = executor.submit(analyze_without_context).result()
+        assert passes.PassContext.current() is outer
+        assert (frozenset(("down_prev", "down_next")) in hard_pairs) == (
+            ascend_backend == BackendType.Ascend910
+        )
+
+    @staticmethod
     def _build_program():
         """down_next = tile.add(down_prev=tile.load, pipe_chunk=tile.tpop_from_aic).
 
@@ -7059,6 +7214,12 @@ class TestCapacityGatedReuse:
     docs/en/dev/passes/35-memory_reuse.md). The operands are ``tile.move``
     results (not loads), so the legacy load-only guard never protected them either.
     """
+
+    @pytest.fixture(autouse=True)
+    def _legacy_planner_policy(self):
+        """This class tests the legacy MemoryReuse capacity gate by default."""
+        with _planner_context(passes.MemoryPlanner.PYPTO):
+            yield
 
     @staticmethod
     def _collect_bases(program: ir.Program, names: tuple[str, ...]) -> dict[str, ir.Var]:

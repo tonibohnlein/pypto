@@ -2074,7 +2074,7 @@ std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSpli
   // (e.g. M272/N384/K176, R3/stage2 overflows Left at 76 KiB).
   // This is an explicit compatibility route, not a retry after a failed plan.
   const auto* ctx = PassContext::Current();
-  const auto planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
+  const auto planner = ctx ? ctx->GetMemoryPlanner() : kDefaultMemoryPlanner;
   const bool preserve_selected_k = planner != MemoryPlanner::PtoAS;
   auto tiling = AnalyzeMatmul(
       match.shape_source(), hints, /*force_output_stationary=*/true, output_box_alignment,
@@ -3092,7 +3092,7 @@ std::unordered_set<const ForStmt*> BuildPipelineDbCPlan(const FunctionPtr& func)
   // enumeration does not enable automatic annotation of existing L0 pipelines.
   if (!kAutomaticPipelineDbcEnabled) return {};
   const auto* ctx = PassContext::Current();
-  const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
+  const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : kDefaultMemoryPlanner;
   // #2131 explicitly targets the PyPTO planner. PTOAS already gives the
   // reproduced loop four distinct Acc placements and showed no measurable
   // benefit from this source-level marker.
@@ -3431,7 +3431,7 @@ class AutoTileMutator : public IRMutator {
           const MatmulTiling* fold_tiling = &*tiling;
           std::optional<MatmulTiling> os_tiling;
           const auto* ctx = PassContext::Current();
-          const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
+          const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : kDefaultMemoryPlanner;
           if (planner == MemoryPlanner::PyPTO &&
               tiling->stationarity != utils::Stationarity::kOutputStationary) {
             std::vector<Diagnostic> discard;  // the first AnalyzeMatmul already emitted the hints

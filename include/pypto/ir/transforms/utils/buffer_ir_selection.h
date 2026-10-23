@@ -39,7 +39,7 @@ class BufferIRFunctionScope {
                  outer_ ? outer_->GetDiagnosticPhase() : DiagnosticPhase::PrePipeline,
                  outer_ ? outer_->GetDisabledDiagnostics()
                         : DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
-                 outer_ ? outer_->GetMemoryPlanner() : MemoryPlanner::PyPTO,
+                 outer_ ? outer_->GetMemoryPlanner() : kDefaultMemoryPlanner,
                  outer_ && outer_->GetEnablePyptoL0cDoubleBuffer(),
                  outer_ ? outer_->GetRuntime() : kDefaultRuntimeKind,
                  (outer_ ? outer_->GetEnableBufferIR() : function->HasAttr(kAttrBufferIrSelected)) &&
