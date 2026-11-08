@@ -18,7 +18,9 @@
  */
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>  // NOLINT(misc-include-cleaner) -- registers shared_ptr casters
 #include <nanobind/stl/string.h>      // NOLINT(misc-include-cleaner) -- registers std::string casters
 #include <nanobind/stl/tuple.h>
@@ -26,7 +28,9 @@
 
 #include <any>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -45,13 +49,141 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/transforms/dsa/allocation_plan.h"
 #include "pypto/ir/transforms/dsa/reuse_penalty_recognizer.h"
+#include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
+#include "pypto/ir/transforms/utils/finite_sync_analysis.h"
 #include "pypto/ir/type.h"
 
 namespace nb = nanobind;
 
 namespace pypto {
 namespace python {
+
+nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
+  nb::dict out;
+  out["guarantee"] = "minimum demands for declared footprints and core native chains";
+  out["realization"] = "not requested";
+  nb::list storage, regions;
+  for (const auto& s : result.input.storage) {
+    nb::dict item;
+    item["name"] = s.name;
+    item["space"] = s.space;
+    item["address"] = s.address;
+    item["rows"] = s.rows;
+    item["columns"] = s.columns;
+    item["bytes"] = s.bytes;
+    storage.append(item);
+  }
+  for (size_t r = 0; r < result.segments.size(); ++r) {
+    const auto& source = result.input.segments[r];
+    const auto& analysis = result.segments[r];
+    nb::dict region;
+    nb::list sites, families, generators;
+    region["count"] = source.count;
+    region["start"] = source.start;
+    region["step"] = source.step;
+    region["loop"] = source.original_loop;
+    for (const auto& s : source.sites) {
+      nb::dict site;
+      nb::list accesses;
+      site["original"] = s.original;
+      site["continuation"] = s.continuation;
+      site["pipe"] = s.pipe;
+      for (const auto& a : s.accesses)
+        accesses.append(nb::make_tuple(a.storage, a.write, a.row, a.column, a.row_step, a.column_step, a.rows,
+                                       a.columns, a.after_first));
+      site["accesses"] = accesses;
+      sites.append(site);
+    }
+    for (auto f : analysis.demands) families.append(nb::make_tuple(f.source, f.target, f.distance));
+    for (auto f : analysis.generators) generators.append(nb::make_tuple(f.source, f.target, f.distance));
+    region["sites"] = sites;
+    region["demands"] = families;
+    region["generators"] = generators;
+    region["distance_entries"] = analysis.distance.size() * analysis.distance.size();
+    regions.append(region);
+  }
+  out["storage"] = storage;
+  out["regions"] = regions;
+  out["crossing_demands"] = result.crossing_demands;
+  out["crossing_generators"] = result.crossing_generators;
+  out["analyzed_occurrences"] = result.analyzed_occurrences;
+  out["cells"] = result.cells;
+  out["boundary_graph_edges"] = result.graph_edges;
+  out["class_tests"] = result.class_tests;
+  out["port_pair_tests"] = result.port_pair_tests;
+  out["crossing_path_searches"] = result.crossing_path_searches;
+  out["import_seconds"] = result.import_seconds;
+  out["partition_seconds"] = result.partition_seconds;
+  out["reduction_seconds"] = result.reduction_seconds;
+  out["composition_seconds"] = result.composition_seconds;
+  return out;
+}
+nb::object CompactBoundary(const ir::sync::CompactSyncResult& result, size_t storage, int64_t row,
+                           int64_t col) {
+  auto b = result.Boundary(storage, row, col);
+  if (!b) return nb::none();
+  nb::dict out;
+  out["first_writer"] = b->first_writer;
+  out["last_writer"] = b->last_writer;
+  out["first_readers"] = b->first_readers;
+  out["last_readers"] = b->last_readers;
+  return out;
+}
+
+/// Numerical provider seam: tests supply qualified occurrences and compare
+/// against independently constructed event graphs, not compiler generators.
+nb::dict AnalyzeFiniteSyncForTesting(
+    const std::vector<std::tuple<ir::PipeType, bool, std::vector<uint64_t>, std::vector<uint64_t>>>&
+        occurrences,
+    const std::vector<uint64_t>& covered_cells, bool exact_accesses,
+    const std::vector<std::pair<size_t, size_t>>& prerequisites,
+    const std::vector<std::pair<size_t, size_t>>& native_order,
+    const std::vector<std::tuple<size_t, bool, size_t, bool>>& queries,
+    const std::vector<uint64_t>& boundary_cells) {
+  ir::sync::FiniteSyncInput input;
+  input.covered_cells = covered_cells;
+  input.exact_accesses = exact_accesses;
+  input.prerequisites = prerequisites;
+  input.native_order = native_order;
+  for (const auto& [pipe, present, reads, writes] : occurrences) {
+    input.occurrences.push_back({pipe, present, reads, writes});
+  }
+  const auto result = ir::sync::AnalyzeFiniteSync(input);
+  nb::dict output;
+  output["exact_accesses"] = result.exact_accesses;
+  output["generators"] = nb::cast(result.generators);
+  output["demands"] = nb::cast(result.demands);
+  output["starts"] = nb::cast(result.starts);
+  output["completions"] = nb::cast(result.completions);
+  nb::list answers;
+  for (const auto& [a, ac, b, bc] : queries) answers.append(result.Precedes(a, ac, b, bc));
+  output["queries"] = answers;
+  nb::list boundaries;
+  for (uint64_t cell : boundary_cells) {
+    const auto boundary = result.Boundary(cell);
+    if (!boundary) {
+      boundaries.append(nb::none());
+      continue;
+    }
+    nb::dict entry;
+    entry["first_writer"] = nb::cast(boundary->first_writer);
+    entry["last_writer"] = nb::cast(boundary->last_writer);
+    entry["first_readers"] = nb::cast(boundary->first_readers);
+    entry["last_readers"] = nb::cast(boundary->last_readers);
+    boundaries.append(entry);
+  }
+  output["boundaries"] = boundaries;
+  nb::dict work;
+  work["access_entries"] = result.work.access_entries;
+  work["cell_visits"] = result.work.cell_visits;
+  work["reader_visits"] = result.work.reader_visits;
+  work["witnesses"] = result.work.witnesses;
+  work["candidate_tests"] = result.work.candidate_tests;
+  work["demand_joins"] = result.work.demand_joins;
+  output["work"] = work;
+  return output;
+}
 
 /// Validate malformed registrations without installing them in the singleton.
 /// This exercises the exact checks used by registry creation and import.
@@ -378,6 +510,30 @@ void BindTesting(nb::module_& m) {
   testing.def("recognize_dsa_reuse_penalties", &RecognizeDsaReusePenaltiesForTesting, nb::arg("function"),
               "Return recognized DSA-RP edges without running placement");
 
+  nb::class_<ir::sync::CompactSyncResult>(testing, "CompactSyncAnalysis")
+      .def("describe", &DescribeCompactSync, "Inspect retained analysis without additional construction")
+      .def("precedes", &ir::sync::CompactSyncResult::Precedes, nb::arg("source"),
+           nb::arg("source_completion"), nb::arg("target"), nb::arg("target_completion"),
+           "Query original segment/visit/site events")
+      .def("boundary", &CompactBoundary, nb::arg("storage"), nb::arg("row"), nb::arg("column"),
+           "Exact modeled point selector, or None for unavailable domain");
+  testing.def(
+      "analyze_placed_sync",
+      [](const ir::FunctionPtr& function, bool disjoint_gm) {
+        auto start = std::chrono::steady_clock::now();
+        auto input = ir::sync::ImportPlacedSync(function, disjoint_gm);
+        double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        auto result = ir::sync::AnalyzeCompactSync(std::move(input));
+        result.import_seconds = seconds;
+        return result;
+      },
+      nb::arg("function"), nb::arg("disjoint_gm"),
+      "Read-only research analysis of qualified placed AIC Buffer IR");
+
+  testing.def("analyze_finite_sync", &AnalyzeFiniteSyncForTesting, nb::arg("occurrences"),
+              nb::arg("covered_cells"), nb::arg("exact_accesses"), nb::arg("prerequisites"),
+              nb::arg("native_order"), nb::arg("queries"), nb::arg("boundary_cells"),
+              "Analyze supplied finite physical classes without command insertion");
   testing.def("try_infer_pipe", &TryInferPipeForTesting, nb::arg("call"),
               "Return the exact backend pipe for a Call, or None");
 
