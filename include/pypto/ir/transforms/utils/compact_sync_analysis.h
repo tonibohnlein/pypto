@@ -104,5 +104,13 @@ class CompactSyncResult {
 // boundary graph uses O(P^2) edges and BFS queries; it is not a claim of a
 // linear general regional implementation. P is retained boundary port count.
 CompactSyncResult AnalyzeCompactSync(CompactSyncInput input);
+struct LogicalSyncRealization {
+  FunctionPtr function;
+  size_t record_sites = 0, wait_sites = 0, guarded_wait_sites = 0, carried_tokens = 0;
+  size_t name_scan_visits = 0, name_scan_nodes = 0;
+};
+// Research-only direct token realization of this retained owner. Never reruns
+// analysis or mutates it. Tokens are non-consuming; this is not flag allocation.
+LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis);
 }  // namespace pypto::ir::sync
 #endif  // PYPTO_IR_TRANSFORMS_UTILS_COMPACT_SYNC_ANALYSIS_H_

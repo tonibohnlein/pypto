@@ -511,6 +511,22 @@ void BindTesting(nb::module_& m) {
               "Return recognized DSA-RP edges without running placement");
 
   nb::class_<ir::sync::CompactSyncResult>(testing, "CompactSyncAnalysis")
+      .def(
+          "realize",
+          [](const ir::sync::CompactSyncResult& analysis) {
+            const auto result = ir::sync::RealizeCompactSync(analysis);
+            nb::dict out;
+            out["function"] = result.function;
+            out["record_sites"] = result.record_sites;
+            out["wait_sites"] = result.wait_sites;
+            out["guarded_wait_sites"] = result.guarded_wait_sites;
+            out["carried_tokens"] = result.carried_tokens;
+            out["name_scan_visits"] = result.name_scan_visits;
+            out["name_scan_nodes"] = result.name_scan_nodes;
+            out["guarantee"] = "equal selected order under the admitted logical-token model";
+            return out;
+          },
+          "Realize retained demands with logical completion tokens; no physical allocation")
       .def("describe", &DescribeCompactSync, "Inspect retained analysis without additional construction")
       .def("precedes", &ir::sync::CompactSyncResult::Precedes, nb::arg("source"),
            nb::arg("source_completion"), nb::arg("target"), nb::arg("target_completion"),

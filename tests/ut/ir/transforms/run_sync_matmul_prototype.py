@@ -22,6 +22,7 @@ import pypto.pypto_core as core
 from pypto import ir, testing
 from pypto.ir.printer import python_print
 
+from .sync_logical_oracle import validate_logical
 from .sync_matmul_cases import CASES, ROOT, capture, staged_fixture
 from .sync_matmul_oracle import validate
 
@@ -55,7 +56,68 @@ def summary(result):
     return out
 
 
-def run(output, draft):
+def logical_result(function, retained, output=None, *, check=True, allow_unavailable=False):
+    begin = time.perf_counter()
+    try:
+        result = retained.realize()
+    except ValueError as error:
+        if not allow_unavailable:
+            raise
+        return {
+            "status": "unavailable",
+            "reason": str(error),
+            "construction_seconds": time.perf_counter() - begin,
+        }
+    seconds = time.perf_counter() - begin
+    emitted = result.pop("function")
+    result["construction_seconds"] = seconds
+    result["status"] = "accepted"
+    if check:
+        begin = time.perf_counter()
+        result["checks"] = validate_logical(function, emitted)
+        result["oracle_seconds"] = time.perf_counter() - begin
+    if output is not None:
+        ir.serialize_to_file(emitted, str(output.with_suffix(".msgpack")))
+        output.with_suffix(".py").write_text(python_print(emitted))
+        result["output_sha256"] = sha(output.with_suffix(".msgpack"))
+    return result
+
+
+def autotile_case(k: int, logical: bool) -> dict[str, Any]:
+    """One outcome per configuration; retain analysis on export refusal.
+
+    A checker failure is never an unavailable capability: the independent
+    validations deliberately run outside the lowering/analysis refusal catch.
+    """
+    begin = time.perf_counter()
+    stage = "lowering"
+    try:
+        f = capture("ddr_split_k", (256, k, 256))
+        stage = "analysis"
+        retained = testing.analyze_placed_sync(f, True)
+    except ValueError as error:
+        return {
+            "k": k,
+            "status": "unavailable",
+            "failure_stage": stage,
+            "reason": str(error),
+            "seconds": time.perf_counter() - begin,
+        }
+    row: dict[str, Any] = {
+        "k": k,
+        "status": "accepted",
+        "seconds": time.perf_counter() - begin,
+        "analysis": summary(retained),
+        "checks": validate(f, retained),
+    }
+    if logical:
+        row["logical"] = logical_result(f, retained, allow_unavailable=True)
+        if row["logical"]["status"] == "unavailable":
+            row["status"] = "logical_unavailable"
+    return row
+
+
+def run(output, draft, logical=False):
     output.mkdir(parents=True, exist_ok=True)
     receipt: dict[str, Any] = {
         "base": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -66,7 +128,7 @@ def run(output, draft):
             "planner": "PYPTO",
             "buffer_ir": True,
             "alias_contract": "disjoint ND GM arguments",
-            "mode": "analysis only",
+            "mode": "analysis and logical token realization" if logical else "analysis only",
         },
         "originals": [],
         "scaling": [],
@@ -109,11 +171,15 @@ def run(output, draft):
                 "oracle_seconds": time.perf_counter() - begin,
             }
         )
+        if logical:
+            receipt["originals"][-1]["logical"] = logical_result(function, result, output / f"{name}-logical")
     for count in [0, 1, 2, 3, 5]:
         for visits in [1, 2, 3]:
             f = staged_fixture(count, visits=visits)
             r = testing.analyze_placed_sync(f, True)
             receipt["bounded"].append({"count": count, "visits": visits, **validate(f, r)})
+            if logical:
+                receipt["bounded"][-1]["logical"] = logical_result(f, r)
     for axis, values in [
         ("count", [2, 4, 8, 16, 64, 1024, 1000000]),
         ("stages", [1, 2, 4, 8, 16]),
@@ -121,36 +187,18 @@ def run(output, draft):
     ]:
         for value in values:
             args = {"count": 4, "stages": 2, "visits": 2, axis: value}
-            r = testing.analyze_placed_sync(staged_fixture(**args), True)
+            f = staged_fixture(**args)
+            r = testing.analyze_placed_sync(f, True)
             receipt["scaling"].append({"axis": axis, "value": value, **summary(r)})
+            if logical:
+                receipt["scaling"][-1]["logical"] = logical_result(f, r, check=False)
     # Real AutoTile may change the schedule. Report that change rather than
     # using these captures as the fixed-schedule compactness proof.
     for k in [64, 192, 256]:
-        begin = time.perf_counter()
-        try:
-            f = capture("ddr_split_k", (256, k, 256))
-            r = testing.analyze_placed_sync(f, True)
-            receipt["autotile_derivatives"].append(
-                {
-                    "k": k,
-                    "status": "accepted",
-                    "seconds": time.perf_counter() - begin,
-                    "analysis": summary(r),
-                    "checks": validate(f, r),
-                }
-            )
-        except ValueError as error:
-            receipt["autotile_derivatives"].append(
-                {
-                    "k": k,
-                    "status": "unavailable",
-                    "reason": str(error),
-                    "seconds": time.perf_counter() - begin,
-                }
-            )
+        receipt["autotile_derivatives"].append(autotile_case(k, logical))
     receipt["scope"] = {
         "guarantee": "minimum demands for declared operation footprints and core native chains",
-        "realization": "not requested",
+        "realization": "logical immutable completion tokens" if logical else "not requested",
         "allocation": "not requested",
         "device": "not available",
         "timings": "single-run descriptive, not speedup evidence",
@@ -175,5 +223,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--draft", type=Path)
+    parser.add_argument("--logical", action="store_true", help="Realize and check retained demands")
     args = parser.parse_args()
-    run(args.output, args.draft)
+    run(args.output, args.draft, args.logical)
