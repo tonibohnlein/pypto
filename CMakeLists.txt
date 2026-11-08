@@ -109,6 +109,9 @@ set(PYPTO_SOURCES
     src/core/error.cpp
 
     # IR - Core
+    src/ir/transforms/utils/finite_sync_analysis.cpp
+    src/ir/transforms/utils/compact_sync_analysis.cpp
+    src/ir/transforms/utils/placed_sync_import.cpp
     src/ir/transforms/utils/hardware_loop_analysis.cpp
     src/ir/builder.cpp
     src/ir/core.cpp
