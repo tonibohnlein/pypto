@@ -179,7 +179,8 @@ void BindPass(nb::module_& m) {
       .value("SimtValid", IRProperty::SimtValid, "Canonical SIMT helper and launch contracts")
       .value("SimtOutputsMaterialized", IRProperty::SimtOutputsMaterialized,
              "Writable SIMT Tiles have dedicated initialized output storage")
-      .value("SimtSpecialized", IRProperty::SimtSpecialized, "SIMT helper resources match their launches");
+      .value("SimtSpecialized", IRProperty::SimtSpecialized, "SIMT helper resources match their launches")
+      .value("LogicalSyncValid", IRProperty::LogicalSyncValid, "Logical completion ownership and schemas");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -360,14 +361,15 @@ void BindPass(nb::module_& m) {
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
       .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
-                    MemoryPlanner, bool, RuntimeKind, bool, bool, bool>(),
+                    MemoryPlanner, bool, RuntimeKind, bool, bool, bool, bool, bool>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
            nb::arg("memory_planner") = MemoryPlanner::PyPTO,
            nb::arg("enable_pypto_l0c_double_buffer") = false, nb::arg("runtime") = kDefaultRuntimeKind,
            nb::arg("enable_buffer_ir") = true, nb::arg("enable_software_pipeline") = false,
-           nb::arg("report_hardware_loops") = false,
+           nb::arg("report_hardware_loops") = false, nb::arg("enable_pypto_autosync") = false,
+           nb::arg("autosync_disjoint_gm") = false,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
            "optional disabled diagnostic checks, memory planner selection, the stored legacy "
            "L0C double-buffer compatibility flag, the target Simpler runtime ABI, and default-on "
@@ -393,6 +395,10 @@ void BindPass(nb::module_& m) {
           "get_backend", [](const PassContext& ctx) -> const backend::Backend* { return ctx.GetBackend(); },
           nb::rv_policy::reference,
           "Get the configured backend for operator queries; does not bind a new target")
+      .def("get_enable_pypto_autosync", &PassContext::GetEnablePyptoAutoSync,
+           "Whether to try PyPTO synchronization before PTOAS")
+      .def("get_autosync_disjoint_gm", &PassContext::GetAutoSyncDisjointGM,
+           "Get explicit disjoint GM contract")
       .def("get_memory_planner", &PassContext::GetMemoryPlanner,
            "Get the memory planner selection for this context")
       .def("get_enable_pypto_l0c_double_buffer", &PassContext::GetEnablePyptoL0cDoubleBuffer,
@@ -720,6 +726,8 @@ void BindPass(nb::module_& m) {
              "the caller's actual extent at every call/submit site.");
   passes.def("select_buffer_ir_functions", &pass::SelectBufferIRFunctions,
              "Select whole kernels for Buffer IR before storage legalization.");
+  passes.def("realize_sync", &pass::RealizeSync,
+             "Realize qualified placed demands as physical synchronization");
   passes.def("lower_tile_to_buffer", &pass::LowerTileToBuffer,
              "Replace planned device Tile storage with explicit Buffer IR.\n\n"
              "Runs last, after storage legalization, address placement and signature materialization.\n"

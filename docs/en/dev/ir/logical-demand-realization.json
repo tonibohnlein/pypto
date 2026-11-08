@@ -1,0 +1,2511 @@
+{
+  "base": "0d0b6517ab5bd3909e567263073ac642ea9829ee",
+  "python": "3.14.7",
+  "binary_sha256": "b8262abf596624753cd10023cfcba3a02aadf0e8cf3014c7a9c6a0d3ed8340fd",
+  "configuration": {
+    "target": "Ascend910/A2-A3",
+    "planner": "PYPTO",
+    "buffer_ir": true,
+    "alias_contract": "disjoint ND GM arguments",
+    "mode": "analysis and logical token realization"
+  },
+  "originals": [
+    {
+      "name": "matmul_64",
+      "source": "examples/beginner/05_matmul.py",
+      "source_sha256": "bbcafb8a14c9d19c5baf56ab368d50fb0e44f52a91b8bc8343f43feab6b5fa37",
+      "shape": [
+        64,
+        64,
+        64
+      ],
+      "input_sha256": "771cd3bae8dd4beda9127b5da2147c82032ca78a418c8db1127fa39cec2945c0",
+      "lower_seconds": 0.008245012257248163,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 6,
+        "cells": 8,
+        "boundary_graph_edges": 0,
+        "class_tests": 13,
+        "port_pair_tests": 0,
+        "crossing_path_searches": 0,
+        "import_seconds": 0.00011179,
+        "partition_seconds": 2.551e-06,
+        "reduction_seconds": 9.038e-06,
+        "composition_seconds": 0.0,
+        "storage_domains": 8,
+        "crossing_demands": 0,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 6,
+            "families": 4,
+            "generator_families": 5,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 6,
+        "covers": 4,
+        "query_checks": 144,
+        "boundary_checks": 16,
+        "access_checks": 6
+      },
+      "oracle_seconds": 0.03599861729890108,
+      "logical": {
+        "record_sites": 4,
+        "wait_sites": 4,
+        "guarded_wait_sites": 0,
+        "carried_tokens": 0,
+        "name_scan_visits": 56,
+        "name_scan_nodes": 47,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0001658317632973194,
+        "status": "accepted",
+        "checks": {
+          "payloads": 6,
+          "records": 4,
+          "waits": 4,
+          "same_pipe_waits": 0,
+          "matched_demands": 4,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 0,
+          "unused_records": 0,
+          "max_wait_fanout": 1,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.021716370712965727,
+        "output_sha256": "7b32739ac845bd883cee99212d1c19fd54d7bc547a353201ddd99a35ea00a9de"
+      }
+    },
+    {
+      "name": "matmul_acc_64",
+      "source": "examples/intermediate/04_matmul_acc.py",
+      "source_sha256": "5adf51310ea4cdf8f243f104d17e8153ba869fe1fbf5e16a410f113ca6f838fe",
+      "shape": [
+        64,
+        64,
+        64
+      ],
+      "input_sha256": "2e586073dc8121c52f2f43d32a8357a50ff692f9be8ede88b23cdbf9a92ec253",
+      "lower_seconds": 0.009404917247593403,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 11,
+        "cells": 8,
+        "boundary_graph_edges": 0,
+        "class_tests": 25,
+        "port_pair_tests": 0,
+        "crossing_path_searches": 0,
+        "import_seconds": 0.000121052,
+        "partition_seconds": 3.288e-06,
+        "reduction_seconds": 1.3399e-05,
+        "composition_seconds": 0.0,
+        "storage_domains": 8,
+        "crossing_demands": 0,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 11,
+            "families": 10,
+            "generator_families": 18,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 11,
+        "covers": 10,
+        "query_checks": 484,
+        "boundary_checks": 20,
+        "access_checks": 11
+      },
+      "oracle_seconds": 0.09200911270454526,
+      "logical": {
+        "record_sites": 9,
+        "wait_sites": 10,
+        "guarded_wait_sites": 0,
+        "carried_tokens": 0,
+        "name_scan_visits": 84,
+        "name_scan_nodes": 64,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00022017909213900566,
+        "status": "accepted",
+        "checks": {
+          "payloads": 11,
+          "records": 9,
+          "waits": 10,
+          "same_pipe_waits": 0,
+          "matched_demands": 10,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 0,
+          "unused_records": 0,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.029754103627055883,
+        "output_sha256": "ab6a3e3c58078bc4d8e447222473de5036c8ea4eea192e068b5d89503266e18c"
+      }
+    },
+    {
+      "name": "ddr_split_k",
+      "source": "examples/advanced/02_auto_tile_matmul.py",
+      "source_sha256": "311bb7473d8554030c95ceea13ce8fd33727ebaec36f168806f10671ca2d88ce",
+      "shape": [
+        256,
+        128,
+        256
+      ],
+      "input_sha256": "aa760990bf547fe13a1e460e21eb1bc0ff1f064883f2984419518c7435c55542",
+      "lower_seconds": 0.008950088173151016,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 40,
+        "cells": 11,
+        "boundary_graph_edges": 501,
+        "class_tests": 42,
+        "port_pair_tests": 1176,
+        "crossing_path_searches": 16,
+        "import_seconds": 0.000189391,
+        "partition_seconds": 3.845e-06,
+        "reduction_seconds": 5.9994e-05,
+        "composition_seconds": 3.5117e-05,
+        "storage_domains": 10,
+        "crossing_demands": 7,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 2,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 2,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 2,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 28,
+        "covers": 25,
+        "query_checks": 3136,
+        "boundary_checks": 42,
+        "access_checks": 28
+      },
+      "oracle_seconds": 1.4531495510600507,
+      "logical": {
+        "record_sites": 11,
+        "wait_sites": 19,
+        "guarded_wait_sites": 11,
+        "carried_tokens": 4,
+        "name_scan_visits": 141,
+        "name_scan_nodes": 92,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0003498508594930172,
+        "status": "accepted",
+        "checks": {
+          "payloads": 28,
+          "records": 19,
+          "waits": 25,
+          "same_pipe_waits": 6,
+          "matched_demands": 25,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 26,
+          "unused_records": 0,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 1.2616756022907794,
+        "output_sha256": "4d7b59aa2e121fed1d29091db7e9800a6ddd754b88884a7e089d0fdd5a835000"
+      }
+    }
+  ],
+  "scaling": [
+    {
+      "axis": "count",
+      "value": 2,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1235,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000185477,
+      "partition_seconds": 3.807e-06,
+      "reduction_seconds": 6.9004e-05,
+      "composition_seconds": 4.7752e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 2,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 2,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0004045460373163223,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "count",
+      "value": 4,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000155188,
+      "partition_seconds": 2.539e-06,
+      "reduction_seconds": 5.7942e-05,
+      "composition_seconds": 4.5892e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00036582816392183304,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "count",
+      "value": 8,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000160849,
+      "partition_seconds": 2.415e-06,
+      "reduction_seconds": 5.4898e-05,
+      "composition_seconds": 4.39e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 8,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 8,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0003546583466231823,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "count",
+      "value": 16,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000149152,
+      "partition_seconds": 2.298e-06,
+      "reduction_seconds": 5.1861e-05,
+      "composition_seconds": 4.7122e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 16,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 16,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0003703981637954712,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "count",
+      "value": 64,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000155317,
+      "partition_seconds": 2.539e-06,
+      "reduction_seconds": 5.6868e-05,
+      "composition_seconds": 4.3304e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 64,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 64,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00036647217348217964,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "count",
+      "value": 1024,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000167648,
+      "partition_seconds": 2.39e-06,
+      "reduction_seconds": 6.0922e-05,
+      "composition_seconds": 5.0236e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 1024,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 1024,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00037323078140616417,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "count",
+      "value": 1000000,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000136213,
+      "partition_seconds": 2.271e-06,
+      "reduction_seconds": 4.9062e-05,
+      "composition_seconds": 4.1561e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 1000000,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 1000000,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00035202736034989357,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "stages",
+      "value": 1,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 32,
+      "cells": 8,
+      "boundary_graph_edges": 379,
+      "class_tests": 28,
+      "port_pair_tests": 808,
+      "crossing_path_searches": 13,
+      "import_seconds": 0.000102219,
+      "partition_seconds": 1.853e-06,
+      "reduction_seconds": 3.2463e-05,
+      "composition_seconds": 2.091e-05,
+      "storage_domains": 8,
+      "crossing_demands": 6,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 5,
+          "families": 6,
+          "generator_families": 13,
+          "distance_entries": 100,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 5,
+          "families": 6,
+          "generator_families": 13,
+          "distance_entries": 100,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 11,
+        "wait_sites": 18,
+        "guarded_wait_sites": 10,
+        "carried_tokens": 6,
+        "name_scan_visits": 121,
+        "name_scan_nodes": 89,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.000210608821362257,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "stages",
+      "value": 2,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000150986,
+      "partition_seconds": 2.29e-06,
+      "reduction_seconds": 5.8494e-05,
+      "composition_seconds": 4.7985e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0003600139170885086,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "stages",
+      "value": 4,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 122,
+      "cells": 20,
+      "boundary_graph_edges": 5311,
+      "class_tests": 100,
+      "port_pair_tests": 12808,
+      "crossing_path_searches": 37,
+      "import_seconds": 0.000255344,
+      "partition_seconds": 3.553e-06,
+      "reduction_seconds": 0.000123635,
+      "composition_seconds": 0.000134069,
+      "storage_domains": 20,
+      "crossing_demands": 15,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 20,
+          "families": 28,
+          "generator_families": 52,
+          "distance_entries": 1600,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 20,
+          "families": 28,
+          "generator_families": 52,
+          "distance_entries": 1600,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 41,
+        "wait_sites": 71,
+        "guarded_wait_sites": 39,
+        "carried_tokens": 24,
+        "name_scan_visits": 349,
+        "name_scan_nodes": 251,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0006940308958292007,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "stages",
+      "value": 8,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 242,
+      "cells": 36,
+      "boundary_graph_edges": 20847,
+      "class_tests": 196,
+      "port_pair_tests": 51208,
+      "crossing_path_searches": 69,
+      "import_seconds": 0.000515747,
+      "partition_seconds": 5.894e-06,
+      "reduction_seconds": 0.000277312,
+      "composition_seconds": 0.000488131,
+      "storage_domains": 36,
+      "crossing_demands": 27,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 40,
+          "families": 56,
+          "generator_families": 104,
+          "distance_entries": 6400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 40,
+          "families": 56,
+          "generator_families": 104,
+          "distance_entries": 6400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 81,
+        "wait_sites": 139,
+        "guarded_wait_sites": 75,
+        "carried_tokens": 48,
+        "name_scan_visits": 653,
+        "name_scan_nodes": 467,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0011459649540483952,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "stages",
+      "value": 16,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 482,
+      "cells": 68,
+      "boundary_graph_edges": 82639,
+      "class_tests": 388,
+      "port_pair_tests": 204808,
+      "crossing_path_searches": 133,
+      "import_seconds": 0.000950298,
+      "partition_seconds": 1.0906e-05,
+      "reduction_seconds": 0.00070904,
+      "composition_seconds": 0.002379417,
+      "storage_domains": 68,
+      "crossing_demands": 51,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 80,
+          "families": 112,
+          "generator_families": 208,
+          "distance_entries": 25600,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 80,
+          "families": 112,
+          "generator_families": 208,
+          "distance_entries": 25600,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 161,
+        "wait_sites": 275,
+        "guarded_wait_sites": 147,
+        "carried_tokens": 96,
+        "name_scan_visits": 1261,
+        "name_scan_nodes": 899,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0022194539196789265,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "visits",
+      "value": 1,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 31,
+      "cells": 12,
+      "boundary_graph_edges": 678,
+      "class_tests": 26,
+      "port_pair_tests": 1604,
+      "crossing_path_searches": 1,
+      "import_seconds": 0.000209497,
+      "partition_seconds": 2.077e-06,
+      "reduction_seconds": 3.2293e-05,
+      "composition_seconds": 1.5063e-05,
+      "storage_domains": 12,
+      "crossing_demands": 1,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 10,
+        "wait_sites": 15,
+        "guarded_wait_sites": 7,
+        "carried_tokens": 6,
+        "name_scan_visits": 114,
+        "name_scan_nodes": 91,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00023228907957673073,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "visits",
+      "value": 2,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000159965,
+      "partition_seconds": 2.4e-06,
+      "reduction_seconds": 5.8005e-05,
+      "composition_seconds": 4.5178e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00036184675991535187,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "visits",
+      "value": 4,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 124,
+      "cells": 12,
+      "boundary_graph_edges": 2793,
+      "class_tests": 104,
+      "port_pair_tests": 6416,
+      "crossing_path_searches": 61,
+      "import_seconds": 0.000193504,
+      "partition_seconds": 3.763e-06,
+      "reduction_seconds": 9.9792e-05,
+      "composition_seconds": 0.000130948,
+      "storage_domains": 12,
+      "crossing_demands": 25,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 43,
+        "wait_sites": 81,
+        "guarded_wait_sites": 49,
+        "carried_tokens": 24,
+        "name_scan_visits": 363,
+        "name_scan_nodes": 247,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.000681071076542139,
+        "status": "accepted"
+      }
+    },
+    {
+      "axis": "visits",
+      "value": 8,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 248,
+      "cells": 12,
+      "boundary_graph_edges": 5613,
+      "class_tests": 208,
+      "port_pair_tests": 12832,
+      "crossing_path_searches": 141,
+      "import_seconds": 0.000284393,
+      "partition_seconds": 4.595e-06,
+      "reduction_seconds": 0.000183253,
+      "composition_seconds": 0.000421824,
+      "storage_domains": 12,
+      "crossing_demands": 57,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ],
+      "logical": {
+        "record_sites": 87,
+        "wait_sites": 169,
+        "guarded_wait_sites": 105,
+        "carried_tokens": 48,
+        "name_scan_visits": 695,
+        "name_scan_nodes": 455,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0013101319782435894,
+        "status": "accepted"
+      }
+    }
+  ],
+  "bounded": [
+    {
+      "count": 0,
+      "visits": 1,
+      "payloads": 0,
+      "covers": 0,
+      "query_checks": 0,
+      "boundary_checks": 24,
+      "access_checks": 0,
+      "logical": {
+        "record_sites": 0,
+        "wait_sites": 0,
+        "guarded_wait_sites": 0,
+        "carried_tokens": 0,
+        "name_scan_visits": 105,
+        "name_scan_nodes": 84,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 7.859291508793831e-05,
+        "status": "accepted",
+        "checks": {
+          "payloads": 0,
+          "records": 0,
+          "waits": 0,
+          "same_pipe_waits": 0,
+          "matched_demands": 0,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 0,
+          "unused_records": 0,
+          "max_wait_fanout": 0,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.000471712090075016
+      }
+    },
+    {
+      "count": 0,
+      "visits": 2,
+      "payloads": 0,
+      "covers": 0,
+      "query_checks": 0,
+      "boundary_checks": 24,
+      "access_checks": 0,
+      "logical": {
+        "record_sites": 0,
+        "wait_sites": 0,
+        "guarded_wait_sites": 0,
+        "carried_tokens": 0,
+        "name_scan_visits": 179,
+        "name_scan_nodes": 129,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 9.759888052940369e-05,
+        "status": "accepted",
+        "checks": {
+          "payloads": 0,
+          "records": 0,
+          "waits": 0,
+          "same_pipe_waits": 0,
+          "matched_demands": 0,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 0,
+          "unused_records": 0,
+          "max_wait_fanout": 0,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.0004323371686041355
+      }
+    },
+    {
+      "count": 0,
+      "visits": 3,
+      "payloads": 0,
+      "covers": 0,
+      "query_checks": 0,
+      "boundary_checks": 24,
+      "access_checks": 0,
+      "logical": {
+        "record_sites": 0,
+        "wait_sites": 0,
+        "guarded_wait_sites": 0,
+        "carried_tokens": 0,
+        "name_scan_visits": 253,
+        "name_scan_nodes": 174,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00011850427836179733,
+        "status": "accepted",
+        "checks": {
+          "payloads": 0,
+          "records": 0,
+          "waits": 0,
+          "same_pipe_waits": 0,
+          "matched_demands": 0,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 0,
+          "unused_records": 0,
+          "max_wait_fanout": 0,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.0004447977989912033
+      }
+    },
+    {
+      "count": 1,
+      "visits": 1,
+      "payloads": 11,
+      "covers": 8,
+      "query_checks": 484,
+      "boundary_checks": 28,
+      "access_checks": 11,
+      "logical": {
+        "record_sites": 8,
+        "wait_sites": 8,
+        "guarded_wait_sites": 0,
+        "carried_tokens": 1,
+        "name_scan_visits": 114,
+        "name_scan_nodes": 91,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00015318626537919044,
+        "status": "accepted",
+        "checks": {
+          "payloads": 11,
+          "records": 8,
+          "waits": 8,
+          "same_pipe_waits": 1,
+          "matched_demands": 8,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 1,
+          "unused_records": 0,
+          "max_wait_fanout": 1,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.007998756133019924
+      }
+    },
+    {
+      "count": 1,
+      "visits": 2,
+      "payloads": 22,
+      "covers": 23,
+      "query_checks": 1936,
+      "boundary_checks": 28,
+      "access_checks": 22,
+      "logical": {
+        "record_sites": 19,
+        "wait_sites": 23,
+        "guarded_wait_sites": 7,
+        "carried_tokens": 7,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00033629918470978737,
+        "status": "accepted",
+        "checks": {
+          "payloads": 22,
+          "records": 19,
+          "waits": 23,
+          "same_pipe_waits": 2,
+          "matched_demands": 23,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 9,
+          "unused_records": 0,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.33062585862353444
+      }
+    },
+    {
+      "count": 1,
+      "visits": 3,
+      "payloads": 33,
+      "covers": 38,
+      "query_checks": 4356,
+      "boundary_checks": 28,
+      "access_checks": 33,
+      "logical": {
+        "record_sites": 30,
+        "wait_sites": 38,
+        "guarded_wait_sites": 14,
+        "carried_tokens": 13,
+        "name_scan_visits": 280,
+        "name_scan_nodes": 195,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0005354639142751694,
+        "status": "accepted",
+        "checks": {
+          "payloads": 33,
+          "records": 30,
+          "waits": 38,
+          "same_pipe_waits": 3,
+          "matched_demands": 38,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 17,
+          "unused_records": 0,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.034341521095484495
+      }
+    },
+    {
+      "count": 2,
+      "visits": 1,
+      "payloads": 21,
+      "covers": 22,
+      "query_checks": 1764,
+      "boundary_checks": 36,
+      "access_checks": 21,
+      "logical": {
+        "record_sites": 10,
+        "wait_sites": 15,
+        "guarded_wait_sites": 7,
+        "carried_tokens": 6,
+        "name_scan_visits": 114,
+        "name_scan_nodes": 91,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00030800001695752144,
+        "status": "accepted",
+        "checks": {
+          "payloads": 21,
+          "records": 20,
+          "waits": 22,
+          "same_pipe_waits": 3,
+          "matched_demands": 22,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 16,
+          "unused_records": 2,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.017699438147246838
+      }
+    },
+    {
+      "count": 2,
+      "visits": 2,
+      "payloads": 42,
+      "covers": 51,
+      "query_checks": 7056,
+      "boundary_checks": 36,
+      "access_checks": 42,
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.000449115876108408,
+        "status": "accepted",
+        "checks": {
+          "payloads": 42,
+          "records": 41,
+          "waits": 51,
+          "same_pipe_waits": 6,
+          "matched_demands": 51,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 46,
+          "unused_records": 2,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.05241220910102129
+      }
+    },
+    {
+      "count": 2,
+      "visits": 3,
+      "payloads": 63,
+      "covers": 80,
+      "query_checks": 15876,
+      "boundary_checks": 36,
+      "access_checks": 63,
+      "logical": {
+        "record_sites": 32,
+        "wait_sites": 59,
+        "guarded_wait_sites": 35,
+        "carried_tokens": 18,
+        "name_scan_visits": 280,
+        "name_scan_nodes": 195,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0007784129120409489,
+        "status": "accepted",
+        "checks": {
+          "payloads": 63,
+          "records": 62,
+          "waits": 80,
+          "same_pipe_waits": 9,
+          "matched_demands": 80,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 76,
+          "unused_records": 2,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.10989258112385869
+      }
+    },
+    {
+      "count": 3,
+      "visits": 1,
+      "payloads": 31,
+      "covers": 36,
+      "query_checks": 3844,
+      "boundary_checks": 44,
+      "access_checks": 31,
+      "logical": {
+        "record_sites": 10,
+        "wait_sites": 15,
+        "guarded_wait_sites": 7,
+        "carried_tokens": 6,
+        "name_scan_visits": 114,
+        "name_scan_nodes": 91,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0003024809993803501,
+        "status": "accepted",
+        "checks": {
+          "payloads": 31,
+          "records": 30,
+          "waits": 36,
+          "same_pipe_waits": 5,
+          "matched_demands": 36,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 24,
+          "unused_records": 2,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.03146007936447859
+      }
+    },
+    {
+      "count": 3,
+      "visits": 2,
+      "payloads": 62,
+      "covers": 79,
+      "query_checks": 15376,
+      "boundary_checks": 44,
+      "access_checks": 62,
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0005551530048251152,
+        "status": "accepted",
+        "checks": {
+          "payloads": 62,
+          "records": 61,
+          "waits": 79,
+          "same_pipe_waits": 10,
+          "matched_demands": 79,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 69,
+          "unused_records": 2,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.10842511290684342
+      }
+    },
+    {
+      "count": 3,
+      "visits": 3,
+      "payloads": 93,
+      "covers": 122,
+      "query_checks": 34596,
+      "boundary_checks": 44,
+      "access_checks": 93,
+      "logical": {
+        "record_sites": 32,
+        "wait_sites": 59,
+        "guarded_wait_sites": 35,
+        "carried_tokens": 18,
+        "name_scan_visits": 280,
+        "name_scan_nodes": 195,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0006049061194062233,
+        "status": "accepted",
+        "checks": {
+          "payloads": 93,
+          "records": 92,
+          "waits": 122,
+          "same_pipe_waits": 15,
+          "matched_demands": 122,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 114,
+          "unused_records": 2,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.254487635102123
+      }
+    },
+    {
+      "count": 5,
+      "visits": 1,
+      "payloads": 51,
+      "covers": 64,
+      "query_checks": 10404,
+      "boundary_checks": 60,
+      "access_checks": 51,
+      "logical": {
+        "record_sites": 10,
+        "wait_sites": 15,
+        "guarded_wait_sites": 7,
+        "carried_tokens": 6,
+        "name_scan_visits": 114,
+        "name_scan_nodes": 91,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0002941656857728958,
+        "status": "accepted",
+        "checks": {
+          "payloads": 51,
+          "records": 50,
+          "waits": 64,
+          "same_pipe_waits": 9,
+          "matched_demands": 64,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 40,
+          "unused_records": 2,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.07711346866562963
+      }
+    },
+    {
+      "count": 5,
+      "visits": 2,
+      "payloads": 102,
+      "covers": 135,
+      "query_checks": 41616,
+      "boundary_checks": 60,
+      "access_checks": 102,
+      "logical": {
+        "record_sites": 21,
+        "wait_sites": 37,
+        "guarded_wait_sites": 21,
+        "carried_tokens": 12,
+        "name_scan_visits": 197,
+        "name_scan_nodes": 143,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0004793410189449787,
+        "status": "accepted",
+        "checks": {
+          "payloads": 102,
+          "records": 101,
+          "waits": 135,
+          "same_pipe_waits": 18,
+          "matched_demands": 135,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 115,
+          "unused_records": 2,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.30967813497409225
+      }
+    },
+    {
+      "count": 5,
+      "visits": 3,
+      "payloads": 153,
+      "covers": 206,
+      "query_checks": 93636,
+      "boundary_checks": 60,
+      "access_checks": 153,
+      "logical": {
+        "record_sites": 32,
+        "wait_sites": 59,
+        "guarded_wait_sites": 35,
+        "carried_tokens": 18,
+        "name_scan_visits": 280,
+        "name_scan_nodes": 195,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0006455769762396812,
+        "status": "accepted",
+        "checks": {
+          "payloads": 153,
+          "records": 152,
+          "waits": 206,
+          "same_pipe_waits": 27,
+          "matched_demands": 206,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 190,
+          "unused_records": 2,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.8891831338405609
+      }
+    }
+  ],
+  "autotile_derivatives": [
+    {
+      "k": 64,
+      "status": "accepted",
+      "seconds": 0.007194962818175554,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 9,
+        "cells": 10,
+        "boundary_graph_edges": 0,
+        "class_tests": 22,
+        "port_pair_tests": 0,
+        "crossing_path_searches": 0,
+        "import_seconds": 8.7428e-05,
+        "partition_seconds": 2.857e-06,
+        "reduction_seconds": 9.203e-06,
+        "composition_seconds": 0.0,
+        "storage_domains": 9,
+        "crossing_demands": 0,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 9,
+            "families": 6,
+            "generator_families": 11,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 9,
+        "covers": 6,
+        "query_checks": 324,
+        "boundary_checks": 22,
+        "access_checks": 9
+      },
+      "logical": {
+        "record_sites": 6,
+        "wait_sites": 6,
+        "guarded_wait_sites": 0,
+        "carried_tokens": 0,
+        "name_scan_visits": 81,
+        "name_scan_nodes": 62,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.00020843185484409332,
+        "status": "accepted",
+        "checks": {
+          "payloads": 9,
+          "records": 6,
+          "waits": 6,
+          "same_pipe_waits": 0,
+          "matched_demands": 6,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 0,
+          "unused_records": 0,
+          "max_wait_fanout": 1,
+          "acyclic": true
+        },
+        "oracle_seconds": 0.27810819493606687
+      }
+    },
+    {
+      "k": 192,
+      "status": "accepted",
+      "seconds": 0.009022077079862356,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 40,
+        "cells": 11,
+        "boundary_graph_edges": 525,
+        "class_tests": 42,
+        "port_pair_tests": 1176,
+        "crossing_path_searches": 16,
+        "import_seconds": 0.000112886,
+        "partition_seconds": 3.645e-06,
+        "reduction_seconds": 4.6782e-05,
+        "composition_seconds": 2.9678e-05,
+        "storage_domains": 10,
+        "crossing_demands": 7,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 2,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 3,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 3,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 40,
+        "covers": 37,
+        "query_checks": 6400,
+        "boundary_checks": 54,
+        "access_checks": 40
+      },
+      "logical": {
+        "record_sites": 11,
+        "wait_sites": 19,
+        "guarded_wait_sites": 11,
+        "carried_tokens": 4,
+        "name_scan_visits": 141,
+        "name_scan_nodes": 92,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0003534420393407345,
+        "status": "accepted",
+        "checks": {
+          "payloads": 40,
+          "records": 27,
+          "waits": 37,
+          "same_pipe_waits": 10,
+          "matched_demands": 37,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 39,
+          "unused_records": 0,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 2.235574258957058
+      }
+    },
+    {
+      "k": 256,
+      "status": "accepted",
+      "seconds": 0.009201865177601576,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 40,
+        "cells": 11,
+        "boundary_graph_edges": 525,
+        "class_tests": 42,
+        "port_pair_tests": 1176,
+        "crossing_path_searches": 16,
+        "import_seconds": 0.00011487,
+        "partition_seconds": 4.212e-06,
+        "reduction_seconds": 4.3496e-05,
+        "composition_seconds": 2.9756e-05,
+        "storage_domains": 10,
+        "crossing_demands": 7,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 2,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 4,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 4,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 52,
+        "covers": 49,
+        "query_checks": 10816,
+        "boundary_checks": 66,
+        "access_checks": 52
+      },
+      "logical": {
+        "record_sites": 11,
+        "wait_sites": 19,
+        "guarded_wait_sites": 11,
+        "carried_tokens": 4,
+        "name_scan_visits": 141,
+        "name_scan_nodes": 92,
+        "guarantee": "equal selected order under the admitted logical-token model",
+        "construction_seconds": 0.0003550006076693535,
+        "status": "accepted",
+        "checks": {
+          "payloads": 52,
+          "records": 35,
+          "waits": 49,
+          "same_pipe_waits": 14,
+          "matched_demands": 49,
+          "extra_event_pairs": 0,
+          "extra_completion_start_pairs": 0,
+          "branches_evaluated": 52,
+          "unused_records": 0,
+          "max_wait_fanout": 2,
+          "acyclic": true
+        },
+        "oracle_seconds": 3.6595604182220995
+      }
+    }
+  ],
+  "draft": "ad6c7ac5f353e1661597dfdbd4115b9da0d187a5",
+  "source_sha256": {
+    "include/pypto/ir/sync.h": "2c795bc5d2bff778282bb894e67dc8c6ea7bde6bebdadecda41eca1cb305b053",
+    "include/pypto/ir/transforms/utils/type_metadata.h": "d5010e7e950e7895eaa813579aa978f414df68d05525f95f44b08a4ea4daf9fc",
+    "include/pypto/ir/verifier/sync.h": "a4f598ea3d8a3b04c9743d7f6acac2c30ea885115b8f54ae5ac896490a6318e6",
+    "python/pypto/ir/op/sync_ops.py": "d413355163e0a66a7743be9d09b781b057911bf9e0689ab80d1d830918e85e7d",
+    "python/pypto/language/op/sync_ops.py": "d67c32d83b32fc686766fd33b7c391a37c6348e23d848bf82a68b7d0c8b07400",
+    "python/pypto/language/typing/sync_token.py": "a20095554bf6d2f2d5661a5346270c11d3b10672a9abb2cf27977c18ead65d3d",
+    "src/ir/transforms/utils/logical_sync_realization.cpp": "4c923ebcad2b295e9bb4d00cfde95a356b6daee7a37c2908975d4a026ed8b97e",
+    "src/ir/verifier/verify_sync.cpp": "5ca8e52944e6403165d165e52304a4a62990e7aafa7b7aba496886efcd8c82c9",
+    "tests/ut/codegen/test_logical_sync_boundary.py": "44c90b6362ee79833c69ea93d071a6d4600aab1e5abd2338795b96954f178247",
+    "tests/ut/ir/core/test_sync_token_type.py": "4ee027645093b4443a861f9835960bdb613b0871f2b70b098850c20f88d5166d",
+    "tests/ut/ir/operators/test_logical_sync_ops.py": "e16f1b2261c652eba7e1a6a8a9c9fc54e72378e0aaac510686f2fbcc29626ced",
+    "tests/ut/ir/transforms/sync_logical_oracle.py": "4b33ffdc4d770d5836f3bde7f7268997fe66dfb5a753d0ba096c24c1ba029115",
+    "tests/ut/ir/transforms/test_logical_sync_realization.py": "6041a43eebd8111086669393c8300d3235121a2c6cd7c96d22b942c25e6a6a10",
+    "tests/ut/ir/transforms/test_logical_sync_verifier.py": "f7d29ecbe463e0b08a2e5f5efb3d26ee4d850fc20c74146ed885952946c9891e",
+    "CMakeLists.txt": "84b5819e71f9bc1505be00b548efcf5e02ec6a5fde0975ddbe3595844897c9aa",
+    "include/pypto/ir/core.h": "e07c7ad6f319d3a749236a4475acffe7f2c7e680afceab0a2e9a155973f484ae",
+    "include/pypto/ir/kind_traits.h": "5906a329f1be353e5b0de59d84cc0f2101a7a9dc8b707f8cc5c3e67741709fba",
+    "include/pypto/ir/op_registry.h": "8db326f899faea1a8ea910f77f6b99d47770e691a9ed2e2f2a84aa1593e0ea90",
+    "include/pypto/ir/transforms/ir_property.h": "1c94a37bbffcd1fffdb4f888bed8864d78e3e86af5919ba815bc5579dd6b48e7",
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "38f80c2ae68c6a34fd6f08b80b246fae416fc86f7d0aed0161f062cdfbe2b8e5",
+    "include/pypto/ir/transforms/utils/dead_code_elimination.h": "d9058b1552701432fc4205fc1e1bd292449f6ea78953d72b380f6f3c9330759c",
+    "include/pypto/ir/transforms/utils/var_collectors.h": "89e2c28fd636193b066561bed706b35db9965d3fe30562f5c565f45bb5018f4d",
+    "include/pypto/ir/type.h": "c4ce668e18d6f739b312d05ebc8e36da2b58f759b7b191039e01f01c726f1d53",
+    "include/pypto/ir/verifier/verification_error.h": "5569c913214212458001a5852796a74f5739207614b82e37f4b8a426bd3b0cf7",
+    "include/pypto/ir/verifier/verifier.h": "3475ac13109ab22f84d071612a40b9e99a3ed4e4584161ac4c3818d0aa59b374",
+    "python/bindings/modules/ir.cpp": "68d00e22701f55a676c6f15b6ee25f6a25a02b6536e249c912027ffa84e3d9b0",
+    "python/bindings/modules/passes.cpp": "27d8893ce1b1bec82a910432f9abf5c78b25dfa4e6956493c410d5ef4686ab00",
+    "python/bindings/modules/testing.cpp": "25ed0e2cd865e1796185b81bd23165573245a6a5f9955eecca8834e3bfd6f0ff",
+    "python/pypto/ir/op/__init__.py": "8d6114d33b438dd381a2992a2cb67652f2b2859fed97ae3860d6301a4526ccfc",
+    "python/pypto/language/__init__.py": "17c3c380a02b96e4e6cd17c9754121946eaa15fcd69c126805b3f931246f0d37",
+    "python/pypto/language/dsl_api.py": "95890311e400e22c4820eb62584334a2c066500c089b7b03c75492f605571ea1",
+    "python/pypto/language/op/__init__.py": "d4d675964d1e07d23ce92a0f5e78a6afb2f604141e2bee615619dfc75a449774",
+    "python/pypto/language/parser/_dsl_invoker.py": "8e822b1cb3e758ac1be9c809143abffb41a03b73bef70ddbf52f30a3ac02b616",
+    "python/pypto/language/parser/op_parser.py": "dad339d2de43acf0d10ecc9f7b2fef17ef7b77b498f19c2c4287da4e5b1101e0",
+    "python/pypto/language/parser/type_resolver.py": "75624e22c5aab6970d23cddb121b0beb652dc0ec660a4acf4dbdbfc20ad08842",
+    "python/pypto/language/typing/__init__.py": "fc2b555f295d695ffeeff36a81db02b3e632a545e51d72ab07236b7570c4d680",
+    "python/pypto/pypto_core/ir.pyi": "ff86d0d86ac929640907a18c59bbea777751c9b38792bd5de78c4864e2f58cdf",
+    "python/pypto/pypto_core/passes.pyi": "799d6a0b76530f7e0a6470a9cf699d0498ddfc23743dbf99434bc6ae55abaa92",
+    "python/pypto/pypto_core/testing.pyi": "06dec9e48a77883a5088bb2612591c410bc70f24842b604de69035e830aa0146",
+    "src/codegen/pto/pto_codegen.cpp": "53ef9c41f25c98665da1db070faf5d37b0a783562b40150fb84be8525f0e0916",
+    "src/ir/op/sync_ops/sync.cpp": "0d0d7519ebe4a14dd86f0381700db25d834c0e990fb72d05ba23f12d572e4832",
+    "src/ir/op_registry.cpp": "5f0cf4c8b574fc3be64437994cd26ee9f7c36c94a67cf5028b559081eb7c8429",
+    "src/ir/serialization/deserializer.cpp": "bf967adc4d99d6542e02e04d961de05795ad746272ba2f42b85fe018871e181c",
+    "src/ir/serialization/serializer.cpp": "ed1bf5021d7ef603eed5a7ae0efbcc25ffce23ebddcf248b237f3fd840790f4c",
+    "src/ir/transforms/ir_property.cpp": "3ee4e40e03ff93c4302a35c91817f0e3e74cb3bb5d98ad8624a73c99babba7aa",
+    "src/ir/transforms/python_printer_expr.cpp": "1aec4950b7add89d59ab4af3f928a0a55c96e9d0349ff751245fa03f9147a94f",
+    "src/ir/transforms/python_printer_type.cpp": "c6d22a1dd3594972f2732cb5d37c77ad499dcfc3f97a4ece6e7807bb5e7905f6",
+    "src/ir/transforms/structural_comparison.cpp": "d2f46ab205274ae378ffe3f56788fccc74bbd6bbab820df1a891fb1b1c298761",
+    "src/ir/transforms/utils/dead_code_elimination.cpp": "606e4bf600c52dac854e4ff8446bb2ecf781df36c4d8ae7ae2d647deb962a26e",
+    "src/ir/type.cpp": "1e98e656d1b2ce226c30fd75a32009dff2ce29172ed356cb9bf15d5152e814c1",
+    "src/ir/verifier/property_verifier_registry.cpp": "c6748225c84c1af154bb63d96d6f88208320c0f5da3e49a0689f038b546b0aaf",
+    "src/ir/verifier/type_check_pass.cpp": "78b9feb14c371e9843de5d05f9e2c33bdba10c551545ea06bb75847beba48560",
+    "src/ir/verifier/verify_buffer_ir.cpp": "80677d76cc6b7bdd56d1d59781ce0c989ff3264bfacc5914fd794738a67d38af",
+    "tests/ut/ir/transforms/run_sync_matmul_prototype.py": "4f4c8fbc306ff5d5bf51e293c8589af43686eaf040d11fb83d5635eb5648b976",
+    "tests/ut/ir/transforms/test_hash.py": "74900333df61d2cb2e15fe4c9a705a8c7f672f163a3dd31f2c27477f72487c08",
+    "tests/ut/ir/transforms/test_type_check_pass.py": "8ff7e2c3d1a3cdad27639d9f7c1c3f3a8684d96a17a428c9f8b0a187c91a77ca"
+  },
+  "scope": {
+    "guarantee": "minimum demands and equal logical-token payload order for the admitted modeled accesses and native chains",
+    "realization": "logical immutable completion tokens",
+    "allocation": "not requested",
+    "device": "not available",
+    "timings": "single-run descriptive, not speedup evidence",
+    "oracle_dependency": "independent IR traversal and physical addresses; shared declared native/layout model",
+    "physical_realization": "not implemented; codegen explicitly rejects unlowered tokens",
+    "default_dispatch": "unchanged; opt-in testing.CompactSyncAnalysis.realize()",
+    "oracle_limit": "unique original variable names in these fixtures; original effects independent of retained generators; native/layout semantics shared assumptions"
+  },
+  "dependency": {
+    "repository": "hw-native-sys/pypto",
+    "pr": 3291,
+    "head": "5cbc3c2ac3c7a0c2be5403ec8adc028b6c1f9573",
+    "patch_sha256": "678d878d6c1e4e9921db0a327b0c7f15e2d20506c88722aaf3d5be3788d324d2",
+    "status": "prerequisite patch adapted to current SIMT and property registry in the measured working-tree snapshot"
+  },
+  "environment": {
+    "python_executable": "/usr/bin/python3",
+    "cmake_cache_sha256": "a32e166f1ec4606273d2fd39b80cb4689e468d58e9414eb4e2fbf507250fdada",
+    "worker_limit": 2,
+    "pytest_workers": 1,
+    "device_available": false,
+    "reproduction_variables": {
+      "SYNC_DRAFT": "Local paper checkout at the draft revision pinned in this receipt; machine-specific path omitted from the committed report."
+    }
+  },
+  "hook_environment": {
+    "configuration": ".pre-commit-config.yaml",
+    "default_language_version": {
+      "python": "python3.12"
+    },
+    "reason": "Existing pinned Torch 2.8 hook environment requires Python 3.12; runtime build uses Python 3.14.7",
+    "concurrency": 1
+  },
+  "source_state": {
+    "base": "0d0b6517ab5bd3909e567263073ac642ea9829ee",
+    "branch": "codex/pypto-finite-sync-demands",
+    "dirty": true,
+    "source_files": 56,
+    "build_artifacts": "excluded from source inventory; preserved in disk-backed build-py314"
+  },
+  "commands": [
+    "source .claude/skills/testing/load-env.sh",
+    "cmake --build build-py314 --parallel 2",
+    "PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python3 -m pytest tests/ut/ir/transforms/test_logical_sync_realization.py tests/ut/ir/transforms/test_compact_sync_analysis.py tests/ut/ir/transforms/test_finite_sync_analysis.py tests/ut/ir/operators/test_op_registry.py tests/ut/ir/core/test_sync_token_type.py tests/ut/ir/operators/test_logical_sync_ops.py tests/ut/ir/transforms/test_logical_sync_verifier.py tests/ut/codegen/test_logical_sync_boundary.py tests/ut/ir/transforms/test_type_check_pass.py tests/ut/ir/transforms/test_hash.py tests/ut/ir/transforms/test_serialization.py tests/ut/ir/operators/test_simt_ops.py tests/ut/language/parser/test_printer_integration.py tests/ut/ir/operators/test_prefetch_ops.py tests/ut/codegen/test_prefetch_codegen.py tests/ut/ir/statements/test_simt_launch_stmt.py -n 1 -q --junitxml=build-py314/logical-sync-prototype/accepted-tests.xml",
+    "ctest --test-dir build-py314 -R 'sync_(resource_catalog|isa_macro_resources)' --parallel 1 --output-on-failure",
+    "PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 timeout 60 python3 -m tests.ut.ir.transforms.run_sync_matmul_prototype --logical --output build-py314/logical-sync-prototype/commit-campaign --draft \"$SYNC_DRAFT\"",
+    "PRE_COMMIT_NO_CONCURRENCY=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 RAYON_NUM_THREADS=1 python3 - <<'PYHOOK'\nimport subprocess,json\nfrom pathlib import Path\npaths=json.loads(Path('build-py314/logical-sync-prototype/commit-paths.json').read_text())\nraise SystemExit(subprocess.call(['pre-commit','run','--config','build-py314/logical-sync-prototype/pre-commit-compatible.yaml','--files',*paths]))\nPYHOOK",
+    "PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python3 -m pytest tests/ut/ir/transforms/test_logical_sync_realization.py tests/ut/ir/transforms/test_logical_sync_verifier.py -n 1 -q --junitxml=build-py314/logical-sync-prototype/typed-tests.xml"
+  ],
+  "validation": {
+    "python_tests": 1163,
+    "python_failures": 0,
+    "cpp_tests": 2,
+    "cpp_failures": 0,
+    "properties": [
+      "SSAForm",
+      "UseAfterDef",
+      "TypeChecked",
+      "BufferIR",
+      "LogicalSyncValid"
+    ],
+    "mutation_checks": [
+      "missing wait",
+      "wrong carried source",
+      "late record"
+    ],
+    "review_fix_checks": [
+      "memoized name traversal on shared affine DAGs",
+      "logical export refusal retains mathematics",
+      "one diagnostic outcome per input",
+      "checker failures propagate",
+      "SIMT token escape refusal",
+      "leaf and split-AIV ownership"
+    ],
+    "hooks": {
+      "all_configured_checks_pass": true,
+      "log": "build-py314/logical-sync-prototype/commit-hooks-final.log",
+      "scope": "all 72 authorized paths, serial, no disabled checks"
+    },
+    "post_gate_annotation_only_changes": {
+      "reason": "Explicit heterogeneous report and Expr-list annotations required by Pyright",
+      "focused_rerun_passed": 138,
+      "campaign_rerun": "commit-campaign"
+    }
+  },
+  "review": {
+    "logical_ir": "accepted after SIMT/split-AIV ownership fixes and passing regressions",
+    "logical_realization": "accepted after DAG traversal and diagnostic evidence fixes and passing regressions",
+    "generality": "both independent source reviews found no kernel-name or benchmark-configuration-specific implementation paths",
+    "scope": "logical-only; physical lowering and device qualification remain unavailable"
+  },
+  "artifacts": {
+    "build-py314/logical-sync-prototype/accepted-build.log": "8c35b1682f73592d30612d7b0fabdb384fcfff35cb5a076cb48b85b1368aa794",
+    "build-py314/logical-sync-prototype/accepted-tests.xml": "93043bf38b9dae21d557875c03f857180703b955bd0904d89f2d7ca6f3c837ac",
+    "build-py314/logical-sync-prototype/accepted-tests.log": "c331f0dd3f18f15c2b85d4ef9b938e36df8168c07e4e9283bb262d5a591b9ac0",
+    "build-py314/logical-sync-prototype/accepted-ctest.log": "af51351f9e34d02c56d4ded407587bcc2fd7f07bd1fdd64623c157794ee86296",
+    "build-py314/logical-sync-prototype/accepted-campaign.log": "4885d836759377fae67020688eb735ccb5e3fd3c6be82a60226bad904142258f",
+    "build-py314/logical-sync-prototype/review-fixes.log": "15bc487899b73e7863e2e849633b6674c72033c641e645d3f2d055a089df1a6c",
+    "build-py314/logical-sync-prototype/review-prefetch.log": "919b6ee771d12eee52ed9fee5c821424dcb6eeda20f2f11afc776203a36271bc",
+    "build-py314/logical-sync-prototype/typed-tests.xml": "22fb4afc19712a890166163c851bf02750e4749c0238ffb04fa051a5f548e8b8",
+    "build-py314/logical-sync-prototype/typed-tests.log": "d3283402e5fae1462d8057345098a6a582ba9821d9b8244026631e05e5226290",
+    "build-py314/logical-sync-prototype/commit-campaign.log": "fe2866427846a72cb7a1983b5cef92ee6e9cfb50367ae66a3cb45c4bb57a8607",
+    "build-py314/logical-sync-prototype/commit-hooks-final.log": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640",
+    "build-py314/logical-sync-prototype/commit-paths.json": "6773811abbf1d7007e48aae448446ffa06b20e1c19faa0e9906df916c30f8bd9",
+    "build-py314/logical-sync-prototype/pre-commit-compatible.yaml": "f4ae4d766240d5c7b5669c14dc9ed0e34c8df48007014aa2eb8fc12344bfcbe2"
+  }
+}

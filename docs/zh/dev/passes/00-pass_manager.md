@@ -601,3 +601,11 @@ print(p.get_produced_properties())   # {SSAForm}
 
 默认 Buffer 路径在存储合法化前选择完整支持的 kernel，详见
 [整函数选择](58-lower_tile_to_buffer.md#默认整函数选择)。
+
+## 实验性混合同步（Hybrid Synchronization）
+
+[RealizeSync](59-realize_sync.md)可选地位于存储降低之后。
+`PassContext(enable_pypto_autosync=True, autosync_disjoint_gm=True)` 按完整内核
+尝试限定原型。不支持的内核保留原始主体交给 PTOAS。
+默认值为 `enable_pypto_autosync=False`；两种模式都启用 PTOAS，
+其对含显式同步的函数跳过插入。

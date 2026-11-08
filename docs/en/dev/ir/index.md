@@ -21,6 +21,11 @@ the page covering what you are changing.
 | [Multi-Output Operators](09-multi_output_ops.md) | Operators that produce several values: `TupleType` results, why destinations never become arguments, and what the registry enforces |
 | [Operator Effects](10-operator-effects.md) | Functional argument access, write channels, and core placement/replication contracts |
 | [Scalar SIMT IR](11-simt.md) | Void helpers, explicit launch results, scalar GM/UB access, and derived resources |
+| [Finite Sync Demand Analysis](12-sync-demand-analysis.md) | Numerical storage generators, minimum demands, reachability and boundary contracts |
+| [Placed Matmul Prototype](13-matmul-sync-prototype.md) | Qualified Buffer IR import, compact repetition and independent validation |
+| [Logical Demand Realization](14-logical-demand-realization.md) | Retained demand to completion-token construction and independent command checks |
+| [Physical Demand Realization](15-physical-demand-realization.md) | Qualified flag allocation, direct placement and independent reuse checks |
+| [Logical Synchronization](11-logical-sync.md) | SSA completion tokens, pipeline ordering, runtime address predicates, and VF completion boundaries |
 
 ## See Also
 

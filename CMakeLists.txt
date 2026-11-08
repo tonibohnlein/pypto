@@ -109,6 +109,11 @@ set(PYPTO_SOURCES
     src/core/error.cpp
 
     # IR - Core
+    src/ir/transforms/utils/finite_sync_analysis.cpp
+    src/ir/transforms/utils/compact_sync_analysis.cpp
+    src/ir/transforms/utils/placed_sync_import.cpp
+    src/ir/transforms/utils/logical_sync_realization.cpp
+    src/ir/transforms/utils/physical_sync_realization.cpp
     src/ir/transforms/utils/hardware_loop_analysis.cpp
     src/ir/builder.cpp
     src/ir/core.cpp
@@ -355,6 +360,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_no_nested_call_pass.cpp
     src/ir/verifier/verify_no_nested_incore.cpp
     src/ir/verifier/verify_reg_scope.cpp
+    src/ir/verifier/verify_sync.cpp
     src/ir/verifier/verify_break_continue_pass.cpp
     src/ir/verifier/verify_inline_functions_eliminated.cpp
     src/ir/verifier/verify_use_after_def.cpp

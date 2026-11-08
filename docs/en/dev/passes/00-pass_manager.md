@@ -612,3 +612,11 @@ fallback, then invalidates the lowered property. Pass order is unchanged.
 
 The default Buffer rollout selects complete supported kernels before storage
 legalization; see [whole-kernel selection](58-lower_tile_to_buffer.md#default-whole-kernel-selection).
+
+## Experimental hybrid synchronization
+
+[RealizeSync](59-realize_sync.md) optionally follows storage lowering.
+`PassContext(enable_pypto_autosync=True, autosync_disjoint_gm=True)` tries the
+qualified prototype per complete kernel. Unsupported kernels keep their bodies
+for PTOAS. The default is `enable_pypto_autosync=False`; PTOAS remains enabled
+in both modes and skips functions with explicit synchronization.

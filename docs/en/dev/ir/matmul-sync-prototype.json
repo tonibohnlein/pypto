@@ -1,0 +1,1735 @@
+{
+  "base": "1f25c43de09fe935574ffd815843dca26ccd13e9",
+  "python": "3.14.7",
+  "binary_sha256": "b3fb77ef82b71bd26e214b73e73822b48b13c92fec73611f5b5f968e5f133cd2",
+  "configuration": {
+    "target": "Ascend910/A2-A3",
+    "planner": "PYPTO",
+    "buffer_ir": true,
+    "alias_contract": "disjoint ND GM arguments",
+    "mode": "analysis only"
+  },
+  "originals": [
+    {
+      "name": "matmul_64",
+      "source": "examples/beginner/05_matmul.py",
+      "source_sha256": "bbcafb8a14c9d19c5baf56ab368d50fb0e44f52a91b8bc8343f43feab6b5fa37",
+      "shape": [
+        64,
+        64,
+        64
+      ],
+      "input_sha256": "771cd3bae8dd4beda9127b5da2147c82032ca78a418c8db1127fa39cec2945c0",
+      "lower_seconds": 0.010739585850387812,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 6,
+        "cells": 8,
+        "boundary_graph_edges": 0,
+        "class_tests": 13,
+        "port_pair_tests": 0,
+        "crossing_path_searches": 0,
+        "import_seconds": 0.00015621,
+        "partition_seconds": 3.403e-06,
+        "reduction_seconds": 1.2082e-05,
+        "composition_seconds": 0.0,
+        "storage_domains": 8,
+        "crossing_demands": 0,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 6,
+            "families": 4,
+            "generator_families": 5,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 6,
+        "covers": 4,
+        "query_checks": 144,
+        "boundary_checks": 16,
+        "access_checks": 6
+      },
+      "oracle_seconds": 0.04826376121491194
+    },
+    {
+      "name": "matmul_acc_64",
+      "source": "examples/intermediate/04_matmul_acc.py",
+      "source_sha256": "5adf51310ea4cdf8f243f104d17e8153ba869fe1fbf5e16a410f113ca6f838fe",
+      "shape": [
+        64,
+        64,
+        64
+      ],
+      "input_sha256": "2e586073dc8121c52f2f43d32a8357a50ff692f9be8ede88b23cdbf9a92ec253",
+      "lower_seconds": 0.012564877048134804,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 11,
+        "cells": 8,
+        "boundary_graph_edges": 0,
+        "class_tests": 25,
+        "port_pair_tests": 0,
+        "crossing_path_searches": 0,
+        "import_seconds": 0.000145557,
+        "partition_seconds": 3.712e-06,
+        "reduction_seconds": 1.6917e-05,
+        "composition_seconds": 0.0,
+        "storage_domains": 8,
+        "crossing_demands": 0,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 11,
+            "families": 10,
+            "generator_families": 18,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 11,
+        "covers": 10,
+        "query_checks": 484,
+        "boundary_checks": 20,
+        "access_checks": 11
+      },
+      "oracle_seconds": 0.05543653527274728
+    },
+    {
+      "name": "ddr_split_k",
+      "source": "examples/advanced/02_auto_tile_matmul.py",
+      "source_sha256": "311bb7473d8554030c95ceea13ce8fd33727ebaec36f168806f10671ca2d88ce",
+      "shape": [
+        256,
+        128,
+        256
+      ],
+      "input_sha256": "aa760990bf547fe13a1e460e21eb1bc0ff1f064883f2984419518c7435c55542",
+      "lower_seconds": 0.011550488416105509,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 40,
+        "cells": 11,
+        "boundary_graph_edges": 501,
+        "class_tests": 42,
+        "port_pair_tests": 1176,
+        "crossing_path_searches": 16,
+        "import_seconds": 0.000218742,
+        "partition_seconds": 4.863e-06,
+        "reduction_seconds": 8.035e-05,
+        "composition_seconds": 5.0818e-05,
+        "storage_domains": 10,
+        "crossing_demands": 7,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 2,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 2,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 2,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 28,
+        "covers": 25,
+        "query_checks": 3136,
+        "boundary_checks": 42,
+        "access_checks": 28
+      },
+      "oracle_seconds": 1.8273345241323113
+    }
+  ],
+  "scaling": [
+    {
+      "axis": "count",
+      "value": 2,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1235,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.0002523,
+      "partition_seconds": 4.934e-06,
+      "reduction_seconds": 0.000110527,
+      "composition_seconds": 6.9497e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 2,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 2,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "count",
+      "value": 4,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000198659,
+      "partition_seconds": 3.422e-06,
+      "reduction_seconds": 7.4811e-05,
+      "composition_seconds": 6.0074e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "count",
+      "value": 8,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000205659,
+      "partition_seconds": 3.191e-06,
+      "reduction_seconds": 7.6015e-05,
+      "composition_seconds": 5.8137e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 8,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 8,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "count",
+      "value": 16,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000208794,
+      "partition_seconds": 2.978e-06,
+      "reduction_seconds": 6.5902e-05,
+      "composition_seconds": 5.6961e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 16,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 16,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "count",
+      "value": 64,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.00020175,
+      "partition_seconds": 3.038e-06,
+      "reduction_seconds": 6.2409e-05,
+      "composition_seconds": 5.893e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 64,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 64,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "count",
+      "value": 1024,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000198894,
+      "partition_seconds": 3.053e-06,
+      "reduction_seconds": 6.6538e-05,
+      "composition_seconds": 6.0942e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 1024,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 1024,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "count",
+      "value": 1000000,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000197712,
+      "partition_seconds": 3.05e-06,
+      "reduction_seconds": 6.2389e-05,
+      "composition_seconds": 5.8789e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 1000000,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 1000000,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "stages",
+      "value": 1,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 32,
+      "cells": 8,
+      "boundary_graph_edges": 379,
+      "class_tests": 28,
+      "port_pair_tests": 808,
+      "crossing_path_searches": 13,
+      "import_seconds": 0.0001168,
+      "partition_seconds": 2.172e-06,
+      "reduction_seconds": 3.7965e-05,
+      "composition_seconds": 2.6897e-05,
+      "storage_domains": 8,
+      "crossing_demands": 6,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 5,
+          "families": 6,
+          "generator_families": 13,
+          "distance_entries": 100,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 5,
+          "families": 6,
+          "generator_families": 13,
+          "distance_entries": 100,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "stages",
+      "value": 2,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000191356,
+      "partition_seconds": 2.936e-06,
+      "reduction_seconds": 6.3601e-05,
+      "composition_seconds": 5.57e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "stages",
+      "value": 4,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 122,
+      "cells": 20,
+      "boundary_graph_edges": 5311,
+      "class_tests": 100,
+      "port_pair_tests": 12808,
+      "crossing_path_searches": 37,
+      "import_seconds": 0.000351387,
+      "partition_seconds": 4.703e-06,
+      "reduction_seconds": 0.000161647,
+      "composition_seconds": 0.000171297,
+      "storage_domains": 20,
+      "crossing_demands": 15,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 20,
+          "families": 28,
+          "generator_families": 52,
+          "distance_entries": 1600,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 20,
+          "families": 28,
+          "generator_families": 52,
+          "distance_entries": 1600,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "stages",
+      "value": 8,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 242,
+      "cells": 36,
+      "boundary_graph_edges": 20847,
+      "class_tests": 196,
+      "port_pair_tests": 51208,
+      "crossing_path_searches": 69,
+      "import_seconds": 0.000690106,
+      "partition_seconds": 9.425e-06,
+      "reduction_seconds": 0.000358073,
+      "composition_seconds": 0.000664065,
+      "storage_domains": 36,
+      "crossing_demands": 27,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 40,
+          "families": 56,
+          "generator_families": 104,
+          "distance_entries": 6400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 40,
+          "families": 56,
+          "generator_families": 104,
+          "distance_entries": 6400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "stages",
+      "value": 16,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 482,
+      "cells": 68,
+      "boundary_graph_edges": 82639,
+      "class_tests": 388,
+      "port_pair_tests": 204808,
+      "crossing_path_searches": 133,
+      "import_seconds": 0.001328719,
+      "partition_seconds": 1.4984e-05,
+      "reduction_seconds": 0.000943116,
+      "composition_seconds": 0.003328823,
+      "storage_domains": 68,
+      "crossing_demands": 51,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 80,
+          "families": 112,
+          "generator_families": 208,
+          "distance_entries": 25600,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 80,
+          "families": 112,
+          "generator_families": 208,
+          "distance_entries": 25600,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "visits",
+      "value": 1,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 31,
+      "cells": 12,
+      "boundary_graph_edges": 678,
+      "class_tests": 26,
+      "port_pair_tests": 1604,
+      "crossing_path_searches": 1,
+      "import_seconds": 0.000182269,
+      "partition_seconds": 2.576e-06,
+      "reduction_seconds": 4.3986e-05,
+      "composition_seconds": 2.3009e-05,
+      "storage_domains": 12,
+      "crossing_demands": 1,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "visits",
+      "value": 2,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 62,
+      "cells": 12,
+      "boundary_graph_edges": 1383,
+      "class_tests": 52,
+      "port_pair_tests": 3208,
+      "crossing_path_searches": 21,
+      "import_seconds": 0.000236946,
+      "partition_seconds": 3.177e-06,
+      "reduction_seconds": 8.9002e-05,
+      "composition_seconds": 6.0629e-05,
+      "storage_domains": 12,
+      "crossing_demands": 9,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "visits",
+      "value": 4,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 124,
+      "cells": 12,
+      "boundary_graph_edges": 2793,
+      "class_tests": 104,
+      "port_pair_tests": 6416,
+      "crossing_path_searches": 61,
+      "import_seconds": 0.000248214,
+      "partition_seconds": 4.317e-06,
+      "reduction_seconds": 0.000130443,
+      "composition_seconds": 0.00018306,
+      "storage_domains": 12,
+      "crossing_demands": 25,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    },
+    {
+      "axis": "visits",
+      "value": 8,
+      "guarantee": "minimum demands for declared footprints and core native chains",
+      "realization": "not requested",
+      "analyzed_occurrences": 248,
+      "cells": 12,
+      "boundary_graph_edges": 5613,
+      "class_tests": 208,
+      "port_pair_tests": 12832,
+      "crossing_path_searches": 141,
+      "import_seconds": 0.000359452,
+      "partition_seconds": 6.1e-06,
+      "reduction_seconds": 0.000245432,
+      "composition_seconds": 0.000590679,
+      "storage_domains": 12,
+      "crossing_demands": 57,
+      "regions": [
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        },
+        {
+          "count": 4,
+          "start": 0,
+          "step": 1,
+          "sites": 10,
+          "families": 14,
+          "generator_families": 26,
+          "distance_entries": 400,
+          "representation": "two-body periodic"
+        },
+        {
+          "count": 1,
+          "start": 0,
+          "step": 1,
+          "sites": 1,
+          "families": 0,
+          "generator_families": 0,
+          "distance_entries": 0,
+          "representation": "finite numerical"
+        }
+      ]
+    }
+  ],
+  "bounded": [
+    {
+      "count": 0,
+      "visits": 1,
+      "payloads": 0,
+      "covers": 0,
+      "query_checks": 0,
+      "boundary_checks": 24,
+      "access_checks": 0
+    },
+    {
+      "count": 0,
+      "visits": 2,
+      "payloads": 0,
+      "covers": 0,
+      "query_checks": 0,
+      "boundary_checks": 24,
+      "access_checks": 0
+    },
+    {
+      "count": 0,
+      "visits": 3,
+      "payloads": 0,
+      "covers": 0,
+      "query_checks": 0,
+      "boundary_checks": 24,
+      "access_checks": 0
+    },
+    {
+      "count": 1,
+      "visits": 1,
+      "payloads": 11,
+      "covers": 8,
+      "query_checks": 484,
+      "boundary_checks": 28,
+      "access_checks": 11
+    },
+    {
+      "count": 1,
+      "visits": 2,
+      "payloads": 22,
+      "covers": 23,
+      "query_checks": 1936,
+      "boundary_checks": 28,
+      "access_checks": 22
+    },
+    {
+      "count": 1,
+      "visits": 3,
+      "payloads": 33,
+      "covers": 38,
+      "query_checks": 4356,
+      "boundary_checks": 28,
+      "access_checks": 33
+    },
+    {
+      "count": 2,
+      "visits": 1,
+      "payloads": 21,
+      "covers": 22,
+      "query_checks": 1764,
+      "boundary_checks": 36,
+      "access_checks": 21
+    },
+    {
+      "count": 2,
+      "visits": 2,
+      "payloads": 42,
+      "covers": 51,
+      "query_checks": 7056,
+      "boundary_checks": 36,
+      "access_checks": 42
+    },
+    {
+      "count": 2,
+      "visits": 3,
+      "payloads": 63,
+      "covers": 80,
+      "query_checks": 15876,
+      "boundary_checks": 36,
+      "access_checks": 63
+    },
+    {
+      "count": 3,
+      "visits": 1,
+      "payloads": 31,
+      "covers": 36,
+      "query_checks": 3844,
+      "boundary_checks": 44,
+      "access_checks": 31
+    },
+    {
+      "count": 3,
+      "visits": 2,
+      "payloads": 62,
+      "covers": 79,
+      "query_checks": 15376,
+      "boundary_checks": 44,
+      "access_checks": 62
+    },
+    {
+      "count": 3,
+      "visits": 3,
+      "payloads": 93,
+      "covers": 122,
+      "query_checks": 34596,
+      "boundary_checks": 44,
+      "access_checks": 93
+    },
+    {
+      "count": 5,
+      "visits": 1,
+      "payloads": 51,
+      "covers": 64,
+      "query_checks": 10404,
+      "boundary_checks": 60,
+      "access_checks": 51
+    },
+    {
+      "count": 5,
+      "visits": 2,
+      "payloads": 102,
+      "covers": 135,
+      "query_checks": 41616,
+      "boundary_checks": 60,
+      "access_checks": 102
+    },
+    {
+      "count": 5,
+      "visits": 3,
+      "payloads": 153,
+      "covers": 206,
+      "query_checks": 93636,
+      "boundary_checks": 60,
+      "access_checks": 153
+    }
+  ],
+  "autotile_derivatives": [
+    {
+      "k": 64,
+      "status": "accepted",
+      "seconds": 0.009749880991876125,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 9,
+        "cells": 10,
+        "boundary_graph_edges": 0,
+        "class_tests": 22,
+        "port_pair_tests": 0,
+        "crossing_path_searches": 0,
+        "import_seconds": 0.000126996,
+        "partition_seconds": 3.959e-06,
+        "reduction_seconds": 1.2843e-05,
+        "composition_seconds": 0.0,
+        "storage_domains": 9,
+        "crossing_demands": 0,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 9,
+            "families": 6,
+            "generator_families": 11,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 9,
+        "covers": 6,
+        "query_checks": 324,
+        "boundary_checks": 22,
+        "access_checks": 9
+      }
+    },
+    {
+      "k": 192,
+      "status": "accepted",
+      "seconds": 0.012029717210680246,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 40,
+        "cells": 11,
+        "boundary_graph_edges": 525,
+        "class_tests": 42,
+        "port_pair_tests": 1176,
+        "crossing_path_searches": 16,
+        "import_seconds": 0.000154525,
+        "partition_seconds": 4.719e-06,
+        "reduction_seconds": 6.8357e-05,
+        "composition_seconds": 4.6398e-05,
+        "storage_domains": 10,
+        "crossing_demands": 7,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 2,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 3,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 3,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 40,
+        "covers": 37,
+        "query_checks": 6400,
+        "boundary_checks": 54,
+        "access_checks": 40
+      }
+    },
+    {
+      "k": 256,
+      "status": "accepted",
+      "seconds": 0.01217403681948781,
+      "analysis": {
+        "guarantee": "minimum demands for declared footprints and core native chains",
+        "realization": "not requested",
+        "analyzed_occurrences": 40,
+        "cells": 11,
+        "boundary_graph_edges": 525,
+        "class_tests": 42,
+        "port_pair_tests": 1176,
+        "crossing_path_searches": 16,
+        "import_seconds": 0.000176685,
+        "partition_seconds": 4.439e-06,
+        "reduction_seconds": 7.8022e-05,
+        "composition_seconds": 4.3626e-05,
+        "storage_domains": 10,
+        "crossing_demands": 7,
+        "regions": [
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 2,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 4,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          },
+          {
+            "count": 4,
+            "start": 0,
+            "step": 64,
+            "sites": 6,
+            "families": 6,
+            "generator_families": 14,
+            "distance_entries": 144,
+            "representation": "two-body periodic"
+          },
+          {
+            "count": 1,
+            "start": 0,
+            "step": 1,
+            "sites": 1,
+            "families": 0,
+            "generator_families": 0,
+            "distance_entries": 0,
+            "representation": "finite numerical"
+          }
+        ]
+      },
+      "checks": {
+        "payloads": 52,
+        "covers": 49,
+        "query_checks": 10816,
+        "boundary_checks": 66,
+        "access_checks": 52
+      }
+    }
+  ],
+  "draft": "ad6c7ac5f353e1661597dfdbd4115b9da0d187a5",
+  "source_sha256": {
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "fc4ac083cdf8ffed04851b607bb1f78c0b5b5c9d22612556156d6b27e5588065",
+    "include/pypto/ir/transforms/utils/finite_sync_analysis.h": "5b1e1588f7e157fbf5e6bd84c635c8b0de1d91ac91b244ffc1805ed3b2a1bc08",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "c82a008668f9f4978dfb68e4a7ecb7d6d2d836527517d435a402b8806cd78e0e",
+    "src/ir/transforms/utils/finite_sync_analysis.cpp": "247ea6ce7f3e236c0f3d94091b3eaf1013aaecdcb712680c1598bcf8af73458f",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "9cbc072200411c3203ca9b554eaa6ca03a940c66ec129f1a3c4479c4e0556206",
+    "tests/ut/ir/transforms/run_sync_matmul_prototype.py": "58f4b02b178edbfd16a753583076a5f2a2aeb022bbf5c24a0066b4d683eee08e",
+    "tests/ut/ir/transforms/sync_matmul_cases.py": "7fd9f4090affba434b72edba3eed8a756bd231451b9df0f16bc35284c2dfc884",
+    "tests/ut/ir/transforms/sync_matmul_oracle.py": "6df12a415e643944fe2f704a94feee48b65bf203c295ab7ecde0572f333d1a15",
+    "tests/ut/ir/transforms/test_compact_sync_analysis.py": "09399c828bdf75e65ae6e87970b16158b1ff03c3ade93d74b6c579fa381ff398",
+    "tests/ut/ir/transforms/test_finite_sync_analysis.py": "034af8cd3b3395b5f59a4648e9e429aaaa71db28c6ac3f206334559b052176e2",
+    "CMakeLists.txt": "14781bd4bbccac030cc422d46f1c87b637ac92242d33033094541cdda85de0e2",
+    "python/bindings/modules/testing.cpp": "6e4adc19f4af619f9d3e6aa45051ef70a79e75fd1f005dbb5ce29f435747bacf",
+    "python/pypto/pypto_core/testing.pyi": "9c5675178d9745081ac3cc34efeb7fce893a2e8c5c6082a9fc9938f71fb1438f"
+  },
+  "scope": {
+    "guarantee": "minimum demands for declared operation footprints and core native chains",
+    "realization": "not requested",
+    "allocation": "not requested",
+    "device": "not available",
+    "timings": "single-run descriptive, not speedup evidence",
+    "oracle_dependency": "independent IR traversal and physical addresses; shared declared native/layout model"
+  },
+  "starting_state": {
+    "base": "1f25c43de09fe935574ffd815843dca26ccd13e9",
+    "files": {
+      "docs/en/dev/ir/12-sync-demand-analysis.md": "38d2d0a5e4c809db2a325c249ae82254b3f18deff886df125f062869f10eb969",
+      "docs/zh/dev/ir/12-sync-demand-analysis.md": "fd87de69eff6cbd0273008dd0da4a764b8d1769d196b5dad2ed2f235aa85b6a9",
+      "include/pypto/ir/transforms/utils/finite_sync_analysis.h": "5b1e1588f7e157fbf5e6bd84c635c8b0de1d91ac91b244ffc1805ed3b2a1bc08",
+      "src/ir/transforms/utils/finite_sync_analysis.cpp": "a2eba65ca130b9e3e14d70e7b21f841862ddbbad3d4ba2ee9a386b57ae6e9ada",
+      "tests/ut/ir/transforms/test_finite_sync_analysis.py": "1bbc47b8ec740afae379931f41f830c3beecd5caad98c63806fce28f412b43f0",
+      "CMakeLists.txt": "fb6b0abbe3d8f506972d69a579f2484dcbb7373ceaeb65e3cd90b525908fdef1",
+      "docs/en/dev/ir/index.md": "1da3d16d2f8158c3bc3c00e2a1afd212e3b1bbdd274b1ee6d8403b187c0755e8",
+      "docs/zh/dev/ir/index.md": "94c74ea8b8d60cd78915cb6ae31d37096d9b1a5e003452c084bb90c4d9b57bff",
+      "mkdocs.yml": "bbbb9a47d6977af3685e326891c731883f51ff14578a826f0319d4798da33a78",
+      "python/bindings/modules/testing.cpp": "138bfdfe51140029971a2ec2abb4c7915fa85c140412b2db7f275d7e0bb77cc7",
+      "python/pypto/pypto_core/testing.pyi": "a48cf18c00ae24873b6b431cdb482bf76cac796fa71324bc325a891e755f50f1"
+    },
+    "patch_sha256": "199ee8c6a6524cfff2772482e189f53c8fd562a1274e9e1ab034035db146c475",
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]"
+  },
+  "commands": [
+    "source .claude/skills/testing/load-env.sh",
+    "cmake --build build-py314 --parallel 1",
+    "PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python3 -m pytest tests/ut/ir/transforms/test_compact_sync_analysis.py tests/ut/ir/transforms/test_finite_sync_analysis.py tests/ut/ir/operators/test_op_registry.py -n 1 -q --junitxml=build-py314/matmul-sync-prototype/tests.xml",
+    "ctest --test-dir build-py314 -R 'sync_(resource_catalog|isa_macro_resources)' --parallel 1 --output-on-failure",
+    "PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 timeout 60 python3 -m tests.ut.ir.transforms.run_sync_matmul_prototype --output build-py314/matmul-sync-prototype --draft \"$SYNC_DRAFT\"",
+    "PRE_COMMIT_NO_CONCURRENCY=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 pre-commit run --config build-py314/matmul-sync-prototype/pre-commit-compatible.yaml --files <exact authorized paths>"
+  ],
+  "test_gate": {
+    "python": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "300",
+        "time": "7.062",
+        "timestamp": "2026-11-08T19:42:33.652909+01:00",
+        "hostname": "toni-fedora"
+      }
+    ],
+    "cpp": {
+      "sync_resource_catalog": "passed",
+      "sync_isa_macro_resources": "passed"
+    }
+  },
+  "review": {
+    "decision": "accepted for research-only analysis",
+    "blocking_findings_resolved": [
+      "addressless allocations explicitly refused before argument access",
+      "INDEX expression chains and every affine intermediate range qualified"
+    ],
+    "additional_generality_checks": [
+      "identical local aliases",
+      "nonzero loop starts",
+      "nonunit loop steps",
+      "enclosing visit resets"
+    ],
+    "limitations": [
+      "unique variable names in bounded oracle fixtures",
+      "declared operation model, not native or device qualification",
+      "no command insertion or physical allocation"
+    ]
+  },
+  "hook_environment": {
+    "configuration": ".pre-commit-config.yaml",
+    "override": {
+      "default_language_version": {
+        "python": "python3.12"
+      }
+    },
+    "reason": "Reuse installed hook dependencies; pinned Torch 2.8 has no Python 3.14 wheel",
+    "concurrency": 1
+  }
+}

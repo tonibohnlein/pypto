@@ -263,7 +263,17 @@ def _run_pass_pipeline(  # noqa: PLR0913
         # IR selection enabled for compilations that do not request this opt-in.
         buffer_ir = not software_pipeline
     ctx = _passes.PassContext(
-        instruments, vlevel, dphase, disabled, mplan, dbc_flag, rt, buffer_ir, software_pipeline
+        instruments,
+        vlevel,
+        dphase,
+        disabled,
+        mplan,
+        dbc_flag,
+        rt,
+        buffer_ir,
+        software_pipeline,
+        enable_pypto_autosync=outer.get_enable_pypto_autosync() if outer else False,
+        autosync_disjoint_gm=outer.get_autosync_disjoint_gm() if outer else False,
     )
 
     if mplan == _passes.MemoryPlanner.PTOAS:
@@ -369,7 +379,7 @@ def compile(  # noqa: PLR0913
             (``True`` -> ``CONCISE``, ``False`` -> ``NONE``). ``EXPLICIT`` makes
             each dump self-describing for tile layouts and distributed window
             buffers (issue #2088). Default: ``True`` (``CONCISE``).
-        dump_ptoas_passes: When True, dump full-module intermediate IR after
+        dump_ptoas_passes: When True, dump pass-target intermediate IR after
             every ptoas pass under
             ``<output_dir>/ptoas_passes/<codegen-unit>/``. Default: False.
             Has no effect when ``skip_ptoas=True``.

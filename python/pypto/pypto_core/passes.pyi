@@ -75,6 +75,7 @@ class IRProperty(Enum):
     SimtValid = ...
     SimtOutputsMaterialized = ...
     SimtSpecialized = ...
+    LogicalSyncValid = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -306,6 +307,8 @@ class PassContext:
         enable_buffer_ir: bool = True,
         enable_software_pipeline: bool = False,
         report_hardware_loops: bool = False,
+        enable_pypto_autosync: bool = False,
+        autosync_disjoint_gm: bool = False,
     ) -> None:
         """Create a PassContext with instruments and pass configuration (incl. memory planner).
 
@@ -350,6 +353,12 @@ class PassContext:
     def get_backend(self) -> Backend:
         """Return the configured backend; raise ValueError when none is configured."""
         ...
+
+    def get_enable_pypto_autosync(self) -> bool:
+        """Whether to try PyPTO synchronization before PTOAS."""
+
+    def get_autosync_disjoint_gm(self) -> bool:
+        """Get the explicit distinct-GM-root disjointness contract."""
 
     def get_memory_planner(self) -> MemoryPlanner:
         """Get the memory planner selection for this context."""
@@ -865,6 +874,9 @@ def select_buffer_ir_functions() -> Pass:
     """Select supported whole kernels before Buffer storage legalization."""
     ...
 
+def realize_sync() -> Pass:
+    """Try whole-kernel physical synchronization; delegate unqualified bodies unchanged."""
+
 def lower_tile_to_buffer() -> Pass:
     """Replace planned device Tile storage with explicit Buffer IR.
 
@@ -1168,6 +1180,7 @@ __all__ = [
     "legalize_graph_boundary",
     "materialize_valid_shape_symbols",
     "lower_tile_to_buffer",
+    "realize_sync",
     "select_buffer_ir_functions",
     "flatten_call_expr",
     "inline_functions",
