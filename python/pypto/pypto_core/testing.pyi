@@ -153,11 +153,27 @@ def analyze_finite_sync(
     are minimum for that model. This helper does not import PyPTO IR effects.
     """
 
+class LogicalSyncRealization(TypedDict):
+    """Original payloads with logical tokens; no hardware lowering guarantee."""
+
+    function: Function
+    record_sites: int
+    wait_sites: int
+    guarded_wait_sites: int
+    carried_tokens: int
+    name_scan_visits: int
+    name_scan_nodes: int
+    guarantee: str
+
 class CompactSyncAnalysis:
-    """Retained research result; no synchronization or physical allocation."""
+    """Retained research analysis with opt-in logical realization; no physical allocation."""
 
     def describe(self) -> dict[str, Any]:
         """Return retained geometry, occurrence mapping, families and work counts."""
+        ...
+
+    def realize(self) -> LogicalSyncRealization:
+        """Insert logical record/wait commands from this retained result."""
         ...
 
     def precedes(

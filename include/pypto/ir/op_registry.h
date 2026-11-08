@@ -986,9 +986,11 @@ class OpRegistryEntry {
   /// SIMT operations may declare zero results: they access borrowed storage,
   /// while updated functional values are defined by SimtLaunchStmt.
   inline OpRegistryEntry& set_output_arity(size_t arity) {
-    CHECK(arity >= 1 || ir_stage_ == OpIRStage::Buffer || op_category_ == "SimtOp")
+    CHECK(arity >= 1 || ir_stage_ == OpIRStage::Buffer ||
+          (op_category_ == "SimtOp" || op_category_ == "SyncOp"))
         << "Operator '" << name_ << "' declared output arity " << arity
-        << "; functional operators produce at least one value. Select Buffer stage or SimtOp category before "
+        << "; functional operators produce at least one value. Select Buffer stage or SimtOp/SyncOp category "
+           "before "
            "declaring zero";
     output_arity_ = arity;
     output_arity_declared_ = true;
@@ -996,7 +998,8 @@ class OpRegistryEntry {
   }
 
   inline OpRegistryEntry& set_ir_stage(OpIRStage stage) {
-    CHECK(stage == OpIRStage::Buffer || output_arity_ > 0 || op_category_ == "SimtOp")
+    CHECK(stage == OpIRStage::Buffer || output_arity_ > 0 ||
+          (op_category_ == "SimtOp" || op_category_ == "SyncOp"))
         << "Operator '" << name_ << "' cannot give a zero-result operator Functional stage";
     ir_stage_ = stage;
     return *this;
