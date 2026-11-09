@@ -12,12 +12,13 @@
 from pypto.ir.op import tile_ops as _ir_ops
 from pypto.pypto_core.ir import (
     Expr,
+    TileLayout,
 )
 
 from ..typing import Scalar, Tile
 
 
-def row_max(tile: Tile, tmp_tile: Tile) -> Tile:
+def row_max(tile: Tile, tmp_tile: Tile, out_layout: TileLayout | None = None) -> Tile:
     """Row-wise max reduction.
 
     Reduces the last axis with keepdim, producing output shape
@@ -27,15 +28,26 @@ def row_max(tile: Tile, tmp_tile: Tile) -> Tile:
         tile: Input tile
         tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
             every dimension at least as large as the corresponding input dimension
+        out_layout: Optional block layout for the result tile. Defaults to
+            ``TileLayout.col_major`` (a padding-free ``[rows, 1]`` tile). Passing
+            ``TileLayout.row_major`` instead pads the physical last dim to one
+            Vec burst (e.g. 8 for FP32) and reports that whole burst as valid, so
+            ``pl.store`` can honor a destination window's row stride (issue
+            #3319). The real per-row max is column 0; columns 1..pad-1 are
+            **not currently guaranteed zero** -- ``pl.store`` writes them
+            from the tile's own padding lanes regardless of what the
+            destination held before, so a caller cannot make them safe by
+            zero-initializing the destination; treat anything landing there
+            as undefined until #3319's pad-zeroing follow-up lands.
 
     Returns:
         Tile wrapping the row_max operation
     """
-    call_expr = _ir_ops.row_max(tile.unwrap(), tmp_tile.unwrap())
+    call_expr = _ir_ops.row_max(tile.unwrap(), tmp_tile.unwrap(), out_layout=out_layout)
     return Tile(expr=call_expr)
 
 
-def row_sum(tile: Tile, tmp_tile: Tile) -> Tile:
+def row_sum(tile: Tile, tmp_tile: Tile, out_layout: TileLayout | None = None) -> Tile:
     """Row-wise sum reduction.
 
     Reduces the last axis with keepdim, producing output shape
@@ -45,15 +57,26 @@ def row_sum(tile: Tile, tmp_tile: Tile) -> Tile:
         tile: Input tile
         tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
             every dimension at least as large as the corresponding input dimension
+        out_layout: Optional block layout for the result tile. Defaults to
+            ``TileLayout.col_major`` (a padding-free ``[rows, 1]`` tile). Passing
+            ``TileLayout.row_major`` instead pads the physical last dim to one
+            Vec burst (e.g. 8 for FP32) and reports that whole burst as valid, so
+            ``pl.store`` can honor a destination window's row stride (issue
+            #3319). The real per-row sum is column 0; columns 1..pad-1 are
+            **not currently guaranteed zero** -- ``pl.store`` writes them
+            from the tile's own padding lanes regardless of what the
+            destination held before, so a caller cannot make them safe by
+            zero-initializing the destination; treat anything landing there
+            as undefined until #3319's pad-zeroing follow-up lands.
 
     Returns:
         Tile wrapping the row_sum operation
     """
-    call_expr = _ir_ops.row_sum(tile.unwrap(), tmp_tile.unwrap())
+    call_expr = _ir_ops.row_sum(tile.unwrap(), tmp_tile.unwrap(), out_layout=out_layout)
     return Tile(expr=call_expr)
 
 
-def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
+def row_min(tile: Tile, tmp_tile: Tile, out_layout: TileLayout | None = None) -> Tile:
     """Row-wise min reduction.
 
     Reduces the last axis with keepdim, producing output shape
@@ -63,15 +86,26 @@ def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
         tile: Input tile
         tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
             every dimension at least as large as the corresponding input dimension
+        out_layout: Optional block layout for the result tile. Defaults to
+            ``TileLayout.col_major`` (a padding-free ``[rows, 1]`` tile). Passing
+            ``TileLayout.row_major`` instead pads the physical last dim to one
+            Vec burst (e.g. 8 for FP32) and reports that whole burst as valid, so
+            ``pl.store`` can honor a destination window's row stride (issue
+            #3319). The real per-row min is column 0; columns 1..pad-1 are
+            **not currently guaranteed zero** -- ``pl.store`` writes them
+            from the tile's own padding lanes regardless of what the
+            destination held before, so a caller cannot make them safe by
+            zero-initializing the destination; treat anything landing there
+            as undefined until #3319's pad-zeroing follow-up lands.
 
     Returns:
         Tile wrapping the row_min operation
     """
-    call_expr = _ir_ops.row_min(tile.unwrap(), tmp_tile.unwrap())
+    call_expr = _ir_ops.row_min(tile.unwrap(), tmp_tile.unwrap(), out_layout=out_layout)
     return Tile(expr=call_expr)
 
 
-def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
+def row_prod(tile: Tile, tmp_tile: Tile, out_layout: TileLayout | None = None) -> Tile:
     """Row-wise product reduction.
 
     Reduces the last axis with keepdim, producing output shape
@@ -81,11 +115,22 @@ def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
         tile: Input tile
         tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
             every dimension at least as large as the corresponding input dimension
+        out_layout: Optional block layout for the result tile. Defaults to
+            ``TileLayout.col_major`` (a padding-free ``[rows, 1]`` tile). Passing
+            ``TileLayout.row_major`` instead pads the physical last dim to one
+            Vec burst (e.g. 8 for FP32) and reports that whole burst as valid, so
+            ``pl.store`` can honor a destination window's row stride (issue
+            #3319). The real per-row product is column 0; columns 1..pad-1 are
+            **not currently guaranteed zero** -- ``pl.store`` writes them
+            from the tile's own padding lanes regardless of what the
+            destination held before, so a caller cannot make them safe by
+            zero-initializing the destination; treat anything landing there
+            as undefined until #3319's pad-zeroing follow-up lands.
 
     Returns:
         Tile wrapping the row_prod operation
     """
-    call_expr = _ir_ops.row_prod(tile.unwrap(), tmp_tile.unwrap())
+    call_expr = _ir_ops.row_prod(tile.unwrap(), tmp_tile.unwrap(), out_layout=out_layout)
     return Tile(expr=call_expr)
 
 
