@@ -19,7 +19,7 @@ with passes.PassContext([], enable_pypto_autosync=False):
 
 PyPTO attempts the existing placed-access importer, compact minimum-demand
 analysis and physical realization only for physically placed Buffer IR on the
-qualified AIC matmul fragment and manual a2a3 macro variants. Missing placement,
+qualified AIC matmul and AIV Vec fragments, using manual a2a3 macro variants. Missing placement,
 GM disjointness, target, access, control, endpoint or resource qualifications
 leave the **original kernel body** for PTOAS. This delegation does not promise
 that PTOAS supports every input; its failures still propagate. Internal compiler
@@ -56,3 +56,40 @@ assumes fresh invocation entry and closes notifications; it does **not** prove
 that returning from the function has completed its last asynchronous payload.
 Native macro semantics and runtime invocation completion require separate
 device qualification.
+
+## Finite Vec coverage
+
+The AIV path reuses the same demand analysis, placement and flag allocator. It
+admits full-valid static rank-two Vec loads/stores and elementwise operations
+from the shared Buffer recipe catalogue. Constant scalar operands are ready;
+arbitrary scalar-producing computations are not admitted. The shared Buffer
+verifier enforces each instruction's in-place alias policy.
+
+Placed Vec allocations and static subviews share a byte-address domain. Nested
+subviews preserve the original row pitch; dense reshapes preserve their byte
+extent. Overlapping allocations remain overlapping even with different SSA
+names or element widths. Dense accesses require one interval; strided windows
+require one interval per physical row. This cost depends on static window size,
+not loop trip count. For stationary column intervals in one row band, an ordered
+index skips unrelated storage atoms. `class_tests` counts membership checks;
+`class_lookup_tests` separately counts binary-search comparisons. The shared
+analysis still enforces its existing per-visit membership and refresh premises
+before using a compact repeated result.
+
+Dynamic valid-state updates, runtime view offsets, rotating slot selections and
+noncontiguous reshapes lack the required importer/readiness certificates and
+remain delegated. GM view/stride support remains subject to the existing
+importer and emitter contracts: this extension does not turn a pitched GM view
+into a packed one or infer alias guarantees from SSA identity. Static full-valid
+local views do not establish general dynamic metadata support.
+
+A same-MTE2 demand can have valid minimum-demand analysis but no qualified local
+barrier mechanism. That is an executable-export refusal, not an empty demand.
+Native fixed event owners are reported separately as `native_reserved_ids` in
+the research physical result and excluded from the appropriate AIC/AIV pools.
+The allocator and eligible pool sizes are unchanged.
+
+Host regressions cover original add/multiply examples, overlapping allocations,
+nested pitches, in-place operations, zero and repeated visits, byte access
+agreement, actual covers, four-event queries, selectors and causal flag reuse.
+PTOAS C++ generation is a separate check; no new device qualification is implied.

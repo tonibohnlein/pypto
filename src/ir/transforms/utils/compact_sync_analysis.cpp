@@ -88,7 +88,7 @@ std::optional<std::pair<int64_t, int64_t>> Visits(const SyncAccess& a, int64_t c
   return std::make_pair(lo, hi);
 }
 CompactSegmentResult Reduce(const SyncSegment& segment, const std::vector<Atom>& atoms, size_t& inspected,
-                            size_t& class_tests) {
+                            size_t& class_tests, size_t& class_lookup_tests) {
   FiniteSyncInput model;
   model.exact_accesses = true;
   for (size_t c = 0; c < atoms.size(); ++c) model.covered_cells.push_back(c);
@@ -96,8 +96,26 @@ CompactSegmentResult Reduce(const SyncSegment& segment, const std::vector<Atom>&
   for (size_t c = 0; c < atoms.size(); ++c) by_storage[atoms[c].storage].push_back(c);
   for (const auto& site : segment.sites) {
     FiniteOccurrence occurrence{site.pipe, true, {}, {}};
-    for (const auto& a : site.accesses)
-      for (size_t c : by_storage.at(a.storage)) {
+    for (const auto& a : site.accesses) {
+      const auto& directory = by_storage.at(a.storage);
+      auto begin = directory.begin(), end = directory.end();
+      // Partition emits rows, then ordered disjoint column intervals. A single
+      // row band (in particular the shared Vec byte domain) permits indexed
+      // lookup without inspecting unrelated allocations. Keep full membership
+      // qualification below; moving intervals still use the general proof.
+      if (!directory.empty() && a.column_step == 0 &&
+          atoms[directory.front()].row == atoms[directory.back()].row) {
+        begin = std::lower_bound(begin, end, a.column, [&](size_t c, int64_t column) {
+          ++class_lookup_tests;
+          return atoms[c].column + atoms[c].columns <= column;
+        });
+        end = std::lower_bound(begin, end, a.column + a.columns, [&](size_t c, int64_t column) {
+          ++class_lookup_tests;
+          return atoms[c].column < column;
+        });
+      }
+      for (auto entry = begin; entry != end; ++entry) {
+        const auto c = *entry;
         ++class_tests;
         const auto& atom = atoms[c];
         if (atom.storage != a.storage) continue;
@@ -135,6 +153,7 @@ CompactSegmentResult Reduce(const SyncSegment& segment, const std::vector<Atom>&
         CHECK(!a.write || Contains(a, atom)) << "Write class is only partially covered";
         (a.write ? occurrence.writes : occurrence.reads).push_back(c);
       }
+    }
     model.occurrences.push_back(std::move(occurrence));
   }
   CompactSegmentResult result;
@@ -244,7 +263,8 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input) {
   auto partitioned = Clock::now();
   result.partition_seconds = std::chrono::duration<double>(partitioned - begin).count();
   for (const auto& s : result.input.segments)
-    result.segments.push_back(Reduce(s, atoms, result.analyzed_occurrences, result.class_tests));
+    result.segments.push_back(
+        Reduce(s, atoms, result.analyzed_occurrences, result.class_tests, result.class_lookup_tests));
   auto reduced = Clock::now();
   result.reduction_seconds = std::chrono::duration<double>(reduced - partitioned).count();
   // A single region already owns all queries and boundaries. Keep the

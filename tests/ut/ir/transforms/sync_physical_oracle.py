@@ -97,6 +97,15 @@ def run_physical(original, emitted, eligible=range(8)):
     effects = [(pipe, True, reads, writes) for _, _, pipe, reads, writes in calls]
     ref = reference(effects)
     state = PhysicalExecution(calls, ref[0], eligible)
+
+    class CoreOwnership(ir.IRVisitor):
+        def visit_call(self, op):
+            call = op
+            if call.op.name in {ir.get_op("system.set_flag").name, ir.get_op("system.wait_flag").name}:
+                expected = "aiv" if original.func_type == ir.FunctionType.AIV else "aic"
+                assert call.kwargs["core_type"] == expected, "flag has the wrong owning core"
+
+    CoreOwnership().visit_function(emitted)
     state.execute(emitted.body, {})
     assert state.payload_count == len(calls), "missing payload"
     assert not state.live, "outstanding notifications at invocation exit"

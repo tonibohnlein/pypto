@@ -184,6 +184,7 @@ class PhysicalSyncRealization(TypedDict):
     guard_sites: int
     reuse_queries: int
     reserved_lanes: int
+    native_reserved_ids: list[tuple[PipeType, PipeType, int]]
     finite_minimum: bool
     guarantee: str
     native_mode: str

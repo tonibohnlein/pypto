@@ -37,13 +37,13 @@ def integer(expr, env):
 
 def address_set(storage, row, col, rows, cols):
     """Independent ND/NZ/ZN element-address map (FP32 corpus)."""
-    space, base, height, width, layout, scalar_bytes = storage
+    space, base, height, width, layout, scalar_bytes, *pitch = storage
     points = set()
     for r in range(row, row + rows):
         for c in range(col, col + cols):
             assert 0 <= r < height and 0 <= c < width
             if layout is None or layout.slayout == ir.TileLayout.none_box:
-                offset = r * width + c
+                offset = r * (pitch[0] // scalar_bytes if pitch else width) + c
             else:
                 h, w = 16, layout.fractal // scalar_bytes // 16
                 outer = (
@@ -57,7 +57,12 @@ def address_set(storage, row, col, rows, cols):
                 offset = outer * h * w + inner
             # All admitted corpus accesses use identical byte-aligned FP32.
             # One address per element is sufficient for intersection checks.
-            points.add((space, base + offset * scalar_bytes))
+            if space == ir.MemorySpace.Vec:
+                # Vec aliases can reinterpret element widths. Compare every byte,
+                # independently of the compiler's interval partition.
+                points.update((space, base + offset * scalar_bytes + b) for b in range(scalar_bytes))
+            else:
+                points.add((space, base + offset * scalar_bytes))
     return points
 
 
@@ -73,22 +78,42 @@ def interpret(function):
         s = storage[arg.name_hint]
         return address_set(s, *(rect or (0, 0, s[2], s[3])))
 
+    def define_storage(stmt, env):
+        assert isinstance(stmt.value, ir.Call)
+        name = stmt.value.op.name
+        t = stmt.var.type
+        if name in {ir.get_op("buffer.subview").name, ir.get_op("buffer.reshape").name}:
+            source_arg = stmt.value.args[0]
+            assert isinstance(source_arg, ir.Var)
+            source = storage[source_arg.name_hint]
+            space, base, height, width, layout, scalar_bytes, *inherited = source
+            pitch = inherited[0] if inherited else width * scalar_bytes
+            if name == ir.get_op("buffer.subview").name:
+                offsets = stmt.value.args[1]
+                assert isinstance(offsets, ir.MakeTuple)
+                row, col = [integer(e, env) for e in offsets.elements]
+                base += row * pitch + col * scalar_bytes
+            else:
+                assert pitch == width * scalar_bytes
+                pitch = t.shape[1] * t.dtype.get_byte()
+            storage[stmt.var.name_hint] = (space, base, *t.shape, t, t.dtype.get_byte(), pitch)
+            return
+        assert name == ir.get_op("buffer.alloc").name
+        assert isinstance(t, ir.BufferType)
+        storage[stmt.var.name_hint] = (
+            t.memory_space,
+            integer(stmt.value.args[1], env),
+            *t.shape,
+            t,
+            t.dtype.get_byte(),
+        )
+
     def execute(stmt, env):
         if isinstance(stmt, ir.SeqStmts):
             for s in stmt.stmts:
                 execute(s, env)
         elif isinstance(stmt, ir.AssignStmt):
-            assert isinstance(stmt.value, ir.Call)
-            assert stmt.value.op.name == ir.get_op("buffer.alloc").name
-            t = stmt.var.type
-            assert isinstance(t, ir.BufferType)
-            storage[stmt.var.name_hint] = (
-                t.memory_space,
-                integer(stmt.value.args[1], env),
-                *t.shape,
-                t,
-                t.dtype.get_byte(),
-            )
+            define_storage(stmt, env)
         elif isinstance(stmt, ir.ForStmt):
             for value in range(integer(stmt.start, env), integer(stmt.stop, env), integer(stmt.step, env)):
                 execute(stmt.body, {**env, stmt.loop_var.name_hint: value})
@@ -107,7 +132,11 @@ def interpret(function):
             elif name == ir.get_op("buffer.store").name:
                 assert isinstance(args[1], ir.MakeTuple) and isinstance(args[2], ir.MakeTuple)
                 rect = [integer(e, env) for e in [*args[1].elements, *args[2].elements]]
-                reads, writes, pipe = access(args[0]), access(args[3], rect), ir.PipeType.FIX
+                reads, writes = access(args[0]), access(args[3], rect)
+                assert isinstance(args[0].type, ir.BufferType)
+                pipe = (
+                    ir.PipeType.MTE3 if args[0].type.memory_space == ir.MemorySpace.Vec else ir.PipeType.FIX
+                )
             elif name in {ir.get_op("buffer.copy").name, ir.get_op("buffer.extract").name}:
                 dest = args[-1]
                 assert isinstance(dest.type, ir.BufferType)
@@ -117,6 +146,16 @@ def interpret(function):
                     else None
                 )
                 reads, writes, pipe = access(args[0], rect), access(dest), ir.PipeType.MTE1
+            elif name in {
+                ir.get_op("buffer.add").name,
+                ir.get_op("buffer.mul").name,
+                ir.get_op("buffer.sub").name,
+                ir.get_op("buffer.abs").name,
+                ir.get_op("buffer.adds").name,
+                ir.get_op("buffer.recip").name,
+            }:
+                reads = set().union(*(access(a) for a in args[:-1] if isinstance(a.type, ir.BufferType)))
+                writes, pipe = access(args[-1]), ir.PipeType.V
             else:
                 assert name in {ir.get_op("buffer.matmul").name, ir.get_op("buffer.matmul_acc").name}
                 reads = access(args[0]) | access(args[1])
@@ -176,6 +215,13 @@ def validate(function, analysis, query_all=True):
     }
 
 
+def domain_addresses(domain, storage, row, col, rows, cols):
+    if domain.get("byte_coordinates", False):
+        assert row == 0 and rows == 1
+        return {(domain["space"], byte) for byte in range(col, col + cols)}
+    return address_set(storage[domain["name"]], row, col, rows, cols)
+
+
 def validate_boundaries(description, storage, effects, occurrences, analysis):
     # Boundary points include interior/exterior and corners of each extracted
     # rectangle. Point membership is looked up in the independent physical map.
@@ -194,7 +240,7 @@ def validate_boundaries(description, storage, effects, occurrences, analysis):
                                 }
                             )
         for row, col in points:
-            point = address_set(storage[domain["name"]], row, col, 1, 1)
+            point = domain_addresses(domain, storage, row, col, 1, 1)
             writers = [i for i, (_, _, w) in enumerate(effects) if not w.isdisjoint(point)]
             expected: dict[str, Any] = {
                 "first_writer": occurrences[writers[0]] if writers else None,
@@ -241,7 +287,9 @@ def check_imported_accesses(description, storage, calls):
         for sid, write, row, col, dr, dc, rows, cols, after_first in region["sites"][s]["accesses"]:
             if after_first and visit == 0:
                 continue
-            domain = storage[description["storage"][sid]["name"]]
-            modeled[write].update(address_set(domain, row + visit * dr, col + visit * dc, rows, cols))
+            domain = description["storage"][sid]
+            modeled[write].update(
+                domain_addresses(domain, storage, row + visit * dr, col + visit * dc, rows, cols)
+            )
         assert modeled == [reads, writes], (r, visit, s, "access mismatch")
     return occurrences, effects

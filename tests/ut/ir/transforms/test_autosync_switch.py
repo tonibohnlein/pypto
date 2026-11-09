@@ -150,7 +150,7 @@ def test_missing_contract_and_placement_delegate_without_insertion():
     ir.assert_structural_equal(original.body, unchanged.body)
 
 
-def test_aiv_and_tile_ir_delegate_without_insertion():
+def test_empty_aiv_and_tile_ir_delegate_without_insertion():
     span = ir.Span.unknown()
     vector = ir.Function(
         "vector",
@@ -162,7 +162,7 @@ def test_aiv_and_tile_ir_delegate_without_insertion():
         ir_stage=ir.FunctionIRStage.Buffer,
     )
     result = apply_hybrid([vector])[vector.name]
-    assert "only AIC leaves" in dict(result.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
+    assert "no SET/WAIT marker" in dict(result.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
     ir.assert_structural_equal(vector.body, result.body)
     with passes.PassContext([], enable_buffer_ir=False):
         program = load_case("matmul_64").lower(

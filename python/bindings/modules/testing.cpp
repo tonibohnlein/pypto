@@ -72,6 +72,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     item["rows"] = s.rows;
     item["columns"] = s.columns;
     item["bytes"] = s.bytes;
+    item["byte_coordinates"] = s.byte_coordinates;
     storage.append(item);
   }
   for (size_t r = 0; r < result.segments.size(); ++r) {
@@ -111,6 +112,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   out["cells"] = result.cells;
   out["boundary_graph_edges"] = result.graph_edges;
   out["class_tests"] = result.class_tests;
+  out["class_lookup_tests"] = result.class_lookup_tests;
   out["port_pair_tests"] = result.port_pair_tests;
   out["crossing_path_searches"] = result.crossing_path_searches;
   out["import_seconds"] = result.import_seconds;
@@ -540,6 +542,7 @@ void BindTesting(nb::module_& m) {
             out["guard_sites"] = result.guard_sites;
             out["reuse_queries"] = result.reuse_queries;
             out["reserved_lanes"] = result.reserved_lanes;
+            out["native_reserved_ids"] = result.native_reserved_ids;
             out["finite_minimum"] = result.finite_minimum;
             nb::list families;
             for (const auto& f : result.families) {
