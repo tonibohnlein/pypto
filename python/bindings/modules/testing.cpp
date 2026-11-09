@@ -86,13 +86,16 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     region["loop"] = source.original_loop;
     for (const auto& s : source.sites) {
       nb::dict site;
-      nb::list accesses;
+      nb::list accesses, precision;
       site["original"] = s.original;
       site["continuation"] = s.continuation;
       site["pipe"] = s.pipe;
-      for (const auto& a : s.accesses)
+      for (const auto& a : s.accesses) {
+        precision.append(a.exact_footprint ? "exact" : "enclosure");
         accesses.append(nb::make_tuple(a.storage, a.write, a.row, a.column, a.row_step, a.column_step, a.rows,
                                        a.columns, a.after_first));
+      }
+      site["access_precision"] = precision;
       site["accesses"] = accesses;
       sites.append(site);
     }

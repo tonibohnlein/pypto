@@ -514,7 +514,9 @@ void BindPass(nb::module_& m) {
       .value("BUFFER_DESCRIPTOR_MISMATCH", typecheck::ErrorType::BUFFER_DESCRIPTOR_MISMATCH,
              "Buffer descriptor or multi-buffer slot count mismatch")
       .value("TENSOR_LAYOUT_MISMATCH", typecheck::ErrorType::TENSOR_LAYOUT_MISMATCH,
-             "Call argument layout differs from the callee parameter's");
+             "Call argument layout differs from the callee parameter's")
+      .value("SYNC_TOKEN_SOURCE_MISMATCH", typecheck::ErrorType::SYNC_TOKEN_SOURCE_MISMATCH,
+             "Completion token source pipeline differs");
 
   // Bind NestedCallErrorType enum
   nb::enum_<nested_call::ErrorType>(passes, "NestedCallErrorType", "Nested call verification error types")
