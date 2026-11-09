@@ -89,7 +89,11 @@ class CommandExecution:
 
     def assign(self, stmt, env):
         call = stmt.value
-        if isinstance(call, ir.Call) and call.op.name == ir.get_op("buffer.alloc").name:
+        if isinstance(call, ir.Call) and call.op.name in {
+            ir.get_op("buffer.alloc").name,
+            ir.get_op("buffer.subview").name,
+            ir.get_op("buffer.reshape").name,
+        }:
             self.actual_allocations.append(stmt)
         elif isinstance(call, ir.Call) and call.op.name == ir.get_op("sync.record").name:
             pipe = ir.PipeType(call.kwargs["pipe"])

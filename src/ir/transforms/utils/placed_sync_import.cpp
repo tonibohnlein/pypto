@@ -11,15 +11,19 @@
 
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "pypto/ir/verifier/verifier.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -79,6 +83,51 @@ class Importer {
  public:
   CompactSyncInput result;
   std::unordered_map<const Expr*, size_t> objects;
+  // Vec descriptors retain their own geometry; all placed Vec bytes share one
+  // physical domain. SSA roots, typed aliases and gaps do not create disjointness.
+  struct VecView {
+    int64_t address, pitch;
+    BufferTypePtr type;
+  };
+  std::unordered_map<const Expr*, VecView> vec_views;
+  std::optional<size_t> vec_storage;
+  void RegisterVec(const VarPtr& var, VecView view) {
+    const auto type = view.type;
+    CHECK(type->shape_ == type->valid_shape_ && backend::DenseBufferBytes(type))
+        << "Synchronization Vec views require static full-valid dense descriptors";
+    const auto end = Checked(__int128(view.address) + __int128(type->shape_[0] - 1) * view.pitch +
+                             __int128(type->shape_[1]) * type->dtype_.GetByte());
+    if (!vec_storage) {
+      vec_storage = result.storage.size();
+      result.storage.push_back({"Vec physical bytes", MemorySpace::Vec, 0, 1, end, end, nullptr, true});
+    } else {
+      auto& domain = result.storage[*vec_storage];
+      domain.bytes = domain.columns = std::max(domain.bytes, end);
+    }
+    objects[var.get()] = *vec_storage;
+    vec_views.emplace(var.get(), std::move(view));
+  }
+  void View(const AssignStmtPtr& assign, const CallPtr& call) {
+    OpRegistry::GetInstance().ValidateBufferCall(call);
+    auto source = vec_views.find(call->args_[0].get());
+    CHECK(source != vec_views.end()) << "Synchronization view needs a qualified Vec source";
+    auto view = source->second;
+    auto type = As<BufferType>(assign->var_->GetType());
+    CHECK(type && type->shape_.size() == 2) << "Synchronization view requires rank two";
+    if (IsOp(call, "buffer.subview")) {
+      const auto offsets = As<MakeTuple>(call->args_[1]);
+      const auto row = Constant(offsets->elements_[0]), column = Constant(offsets->elements_[1]);
+      view.address = Checked(__int128(view.address) + __int128(row) * view.pitch +
+                             __int128(column) * view.type->dtype_.GetByte());
+      // Inherit the parent's pitch, including through nested subviews.
+    } else {
+      CHECK(view.pitch == Checked(__int128(view.type->shape_[1]) * view.type->dtype_.GetByte()))
+          << "Synchronization cannot reshape a noncontiguous window";
+      view.pitch = Checked(__int128(type->shape_[1]) * type->dtype_.GetByte());
+    }
+    view.type = type;
+    RegisterVec(assign->var_, view);
+  }
   size_t Storage(const ExprPtr& e) const {
     auto found = objects.find(e.get());
     CHECK(found != objects.end()) << "Synchronization access has no qualified storage identity";
@@ -86,6 +135,10 @@ class Importer {
   }
   void Allocate(const AssignStmtPtr& a) {
     auto c = As<Call>(a->value_);
+    if (c && (IsOp(c, "buffer.subview") || IsOp(c, "buffer.reshape"))) {
+      View(a, c);
+      return;
+    }
     CHECK(c && IsOp(c, "buffer.alloc"))
         << "Unavailable storage/view or scalar definition in synchronization import";
     OpRegistry::GetInstance().ValidateBufferCall(c);
@@ -100,6 +153,10 @@ class Importer {
     const auto address = Constant(c->args_[1]);
     auto bytes = Checked(__int128(t->shape_[0]) * t->shape_[1] * t->dtype_.GetByte());
     Checked(__int128(address) + bytes);
+    if (t->memory_space_ == MemorySpace::Vec) {
+      RegisterVec(a->var_, {address, Checked(__int128(t->shape_[1]) * t->dtype_.GetByte()), t});
+      return;
+    }
     // A whole boxed buffer is exact only when no partial box is present.
     if (t->slayout_ != TileLayout::none_box) {
       CHECK(t->fractal_ && t->fractal_ % (16 * t->dtype_.GetByte()) == 0) << "Unavailable fractal geometry";
@@ -138,8 +195,28 @@ class Importer {
   SyncSite Site(const CallPtr& call, const SyncSegment& segment) {
     OpRegistry::GetInstance().ValidateBufferCall(call);
     SyncSite site{call, nullptr, PipeType::ALL, {}};
+    // Track modes by operand, not storage: in-place operands can share bytes
+    // while retaining different registered read/write modes.
+    std::vector<std::pair<bool, bool>> modes(call->args_.size());
     auto whole = [&](size_t arg, bool write) {
+      (write ? modes[arg].second : modes[arg].first) = true;
       auto id = Storage(call->args_[arg]);
+      if (auto found = vec_views.find(call->args_[arg].get()); found != vec_views.end()) {
+        const auto& view = found->second;
+        const auto width = Checked(__int128(view.type->shape_[1]) * view.type->dtype_.GetByte());
+        // Dense footprints use one interval. Strided views retain one interval
+        // per physical row, never an enclosing rectangle that fills the gaps.
+        if (view.pitch == width) {
+          site.accesses.push_back(Access(id, write, {0, 0}, {view.address, 0}, 1,
+                                         Checked(__int128(width) * view.type->shape_[0]), segment));
+        } else {
+          for (int64_t row = 0; row < view.type->shape_[0]; ++row)
+            site.accesses.push_back(Access(id, write, {0, 0},
+                                           {Checked(__int128(view.address) + __int128(row) * view.pitch), 0},
+                                           1, width, segment));
+        }
+        return;
+      }
       const auto& s = result.storage[id];
       site.accesses.push_back(Access(id, write, {0, 0}, {0, 0}, s.rows, s.columns, segment));
     };
@@ -152,13 +229,18 @@ class Importer {
       site.accesses.push_back(Access(id, !load, Affine(offsets->elements_[0], segment),
                                      Affine(offsets->elements_[1], segment), Constant(shape->elements_[0]),
                                      Constant(shape->elements_[1]), segment));
-      const auto& local = result.storage[Storage(call->args_[load ? 3 : 0])];
-      CHECK(local.rows == Constant(shape->elements_[0]) && local.columns == Constant(shape->elements_[1]))
+      const auto gm_arg = load ? 0 : 3;
+      (load ? modes[gm_arg].first : modes[gm_arg].second) = true;
+      const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
+      CHECK(local && local->shape_[0] == Constant(shape->elements_[0]) &&
+            local->shape_[1] == Constant(shape->elements_[1]))
           << "Partial DMA local footprint is not qualified";
-      CHECK(load ? local.space == MemorySpace::Mat : local.space == MemorySpace::Acc)
-          << "Only GM/Mat and Acc/GM DMA contracts are qualified";
+      CHECK(local->memory_space_ == MemorySpace::Vec ||
+            (load ? local->memory_space_ == MemorySpace::Mat : local->memory_space_ == MemorySpace::Acc))
+          << "Only GM/Mat, Acc/GM and GM/Vec DMA contracts are qualified";
       whole(load ? 3 : 0, load);
-      site.pipe = load ? PipeType::MTE2 : PipeType::FIX;
+      site.pipe =
+          load ? PipeType::MTE2 : (local->memory_space_ == MemorySpace::Vec ? PipeType::MTE3 : PipeType::FIX);
     } else if (IsOp(call, "buffer.copy") || IsOp(call, "buffer.extract")) {
       const bool extract = IsOp(call, "buffer.extract");
       const auto target = extract ? 3 : 1;
@@ -177,6 +259,7 @@ class Importer {
             << "Unaligned boxed extraction requires a separate footprint contract";
       }
       site.accesses.push_back(Access(sid, false, row, column, t.rows, t.columns, segment));
+      modes[0].first = true;
       whole(target, true);
       site.pipe = PipeType::MTE1;
     } else if (IsOp(call, "buffer.matmul") || IsOp(call, "buffer.matmul_acc")) {
@@ -185,21 +268,32 @@ class Importer {
       if (IsOp(call, "buffer.matmul_acc")) whole(2, false);
       whole(2, true);
       site.pipe = PipeType::M;
+    } else if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
+      CHECK(result.owner->func_type_ == FunctionType::AIV) << "Vec synchronization requires an AIV leaf";
+      for (size_t arg = 0; arg < recipe->inputs.size(); ++arg) {
+        if (recipe->inputs[arg].kind == backend::BufferElementwiseOperandKind::Buffer) {
+          whole(arg, false);
+        } else {
+          CHECK(As<ConstFloat>(call->args_[arg]) || As<ConstInt>(call->args_[arg]))
+              << "Synchronization scalar operand readiness is unavailable";
+        }
+      }
+      whole(recipe->inputs.size(), true);
+      site.pipe = PipeType::V;
     } else {
       CHECK(false) << "Unavailable instruction contract in synchronization import: " << call->op_->name_;
     }
+    const bool vector = result.owner->func_type_ == FunctionType::AIV;
+    CHECK(vector ? (site.pipe == PipeType::MTE2 || site.pipe == PipeType::MTE3 || site.pipe == PipeType::V)
+                 : (site.pipe == PipeType::MTE2 || site.pipe == PipeType::MTE1 || site.pipe == PipeType::M ||
+                    site.pipe == PipeType::FIX))
+        << "Payload pipe is unavailable on the owning synchronization core";
     // Geometry above qualifies one explicit payload contract. Validate its
     // data modes against the registry rather than guessing other op effects.
     for (size_t arg = 0; arg < call->args_.size(); ++arg) {
       if (!As<BufferType>(call->args_[arg]->GetType())) continue;
       auto effect = OpRegistry::GetInstance().GetEntry(call->op_->name_).GetBufferArgEffect(arg).data;
-      auto id = Storage(call->args_[arg]);
-      bool reads = false, writes = false;
-      for (const auto& a : site.accesses)
-        if (a.storage == id) {
-          reads |= !a.write;
-          writes |= a.write;
-        }
+      const auto [reads, writes] = modes[arg];
       CHECK(reads == (effect == BufferAccess::Read || effect == BufferAccess::ReadWrite) &&
             writes == (effect == BufferAccess::Write || effect == BufferAccess::ReadWrite))
           << "Imported data modes disagree with registered operation contract";
@@ -239,8 +333,19 @@ class Importer {
 };
 }  // namespace
 CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm) {
-  CHECK(function && function->func_type_ == FunctionType::AIC)
-      << "Synchronization prototype requires one AIC leaf";
+  CHECK(function && (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV))
+      << "Synchronization prototype requires one AIC or AIV leaf";
+  if (function->func_type_ == FunctionType::AIV) {
+    // Reuse the production view/recipe alias verifier. Synchronization cannot
+    // repair an illegal partial in-place instruction or a malformed descriptor.
+    CHECK(function->ir_stage_ == FunctionIRStage::Buffer) << "Vec synchronization requires Buffer IR";
+    auto program =
+        std::make_shared<Program>(std::vector<FunctionPtr>{function}, function->name_, function->span_);
+    std::vector<Diagnostic> diagnostics;
+    CreateBufferIRPropertyVerifier()->Verify(program, diagnostics);
+    for (const auto& diagnostic : diagnostics)
+      CHECK(diagnostic.severity != DiagnosticSeverity::Error) << diagnostic.message;
+  }
   CHECK(disjoint_gm)
       << "Disjoint GM argument contract must be explicitly supplied; may-alias import unavailable";
   Importer importer;

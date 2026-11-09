@@ -183,3 +183,20 @@ and narrowing/overflow in affine intermediates. New regressions cover identical 
 aliases and original loop starts/steps. All configured hooks use their existing
 Python 3.12 environment (the pinned Torch 2.8 wheel is unavailable on Python 3.14);
 only the hook interpreter default changes, with no checks disabled.
+
+## Incremental AIV extension
+
+The same retained owner now also accepts the qualified static Vec fragment
+specified in [RealizeSync](../passes/58-realize_sync.md#finite-vec-coverage).
+The original matmul results above remain historical evidence. Vec byte-domain
+coordinates are identified by `byte_coordinates` in `describe()`: row zero and
+column equal to the physical Vec byte address. This avoids treating typed or
+partially overlapping placed roots as independent storage. Point queries remain
+exact for admitted footprints, including holes between strided window rows;
+no descriptor-derived enclosure is promoted into an exact access.
+
+The extension uses shared `DenseBufferBytes`, Buffer operation validation,
+elementwise recipes and the Buffer IR alias verifier. It does not import pending
+upstream GM-subview or rotating-pool designs. Metadata writers and unsupported
+coordinate frames retain explicit refusals. The original logical and physical
+realization entry points consume the owner without reconstructing analysis.
