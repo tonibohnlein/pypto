@@ -142,6 +142,8 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
     enable_buffer_ir: bool = True,
     enable_software_pipeline: bool = False,
+    enable_pypto_autosync: bool = False,
+    autosync_disjoint_gm: bool = False,
 ) -> CacheKey:
     """Build a cache key for a JIT call site.
 
@@ -247,6 +249,8 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         ("enable_buffer_ir", enable_buffer_ir),
         ("buffer_ir_version", 11 if enable_buffer_ir else 0),
         ("enable_software_pipeline", enable_software_pipeline),
+        ("enable_pypto_autosync", enable_pypto_autosync),
+        ("autosync_disjoint_gm", autosync_disjoint_gm),
     )
     return CacheKey(
         source_hash,

@@ -24,6 +24,9 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/transforms/pass_context.h"
+#include "pypto/ir/transforms/pass_properties.h"
+#include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/sync/isa_macro_resources.h"
 #include "pypto/sync/resource_catalog.h"
@@ -387,3 +390,62 @@ PhysicalSyncRealization RealizePhysicalSync(const CompactSyncResult& analysis, c
   return result;
 }
 }  // namespace pypto::ir::sync
+
+namespace pypto::ir::pass {
+namespace {
+FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::string& reason) {
+  auto attrs = function->attrs_;
+  attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
+                             [](const auto& attr) {
+                               return attr.first == kAttrPyptoAutosync ||
+                                      attr.first == kAttrAutosyncFallbackReason;
+                             }),
+              attrs.end());
+  attrs.emplace_back(kAttrPyptoAutosync, pypto);
+  if (!pypto) attrs.emplace_back(kAttrAutosyncFallbackReason, reason);
+  return std::make_shared<Function>(function->name_, function->params_, function->param_directions_,
+                                    function->return_types_, function->body_, function->span_,
+                                    function->func_type_, function->level_, function->role_, attrs,
+                                    function->requires_runtime_binding_, function->ir_stage_);
+}
+}  // namespace
+Pass RealizeSync() {
+  auto transform = [](const FunctionPtr& function) -> FunctionPtr {
+    if (!IsInCoreType(function->func_type_)) return function;
+    // These functions do not enter PTO code generation; their external owner
+    // remains responsible for synchronization. Do not claim PTOAS delegation.
+    if (function->requires_runtime_binding_ || function->HasAttr(kAttrExternalSource) ||
+        function->HasAttr(kAttrBuiltinTemplateDir))
+      return function;
+    auto* ctx = PassContext::Current();
+    CHECK(ctx && ctx->GetEnablePyptoAutoSync()) << "RealizeSync requires enable_pypto_autosync=True";
+    CHECK(!function->GetAttr<bool>(kAttrPyptoAutosync))
+        << "RealizeSync cannot reprocess an owned physical plan";
+    if (function->func_type_ != FunctionType::AIC)
+      return SyncOutcome(function, false, "PyPTO synchronization supports only AIC leaves");
+    if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS)
+      return SyncOutcome(function, false, "PyPTO synchronization requires physically placed Buffer IR");
+    if (!ctx->GetAutoSyncDisjointGM())
+      return SyncOutcome(function, false, "Disjoint GM argument contract was not supplied");
+    auto target = ctx->GetBackendHandler()->GetPtoTargetArch();
+    if (target != "a2a3")
+      return SyncOutcome(function, false, "PyPTO physical synchronization supports only manual a2a3 macros");
+    // Only publish after complete analysis AND realization. A qualification or
+    // resource refusal returns the original body, never partially emitted IR.
+    // Internal errors are deliberately not caught. The strict retained-result
+    // APIs still throw on these user-facing input/proof refusals.
+    try {
+      auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true));
+      auto physical = sync::RealizePhysicalSync(analysis, target, std::nullopt);
+      // PTOAS recognizes literal flags, not empty plans or barriers, as manual
+      // ownership. Do not fabricate a dummy flag or mix partial ownership.
+      if (!physical.set_sites || !physical.wait_sites)
+        return SyncOutcome(function, false, "Candidate has no SET/WAIT marker; delegate the original kernel");
+      return SyncOutcome(physical.function, true, "");
+    } catch (const pypto::ValueError& error) {
+      return SyncOutcome(function, false, error.what());
+    }
+  };
+  return CreateFunctionPass(transform, "RealizeSync", PassProperties{});
+}
+}  // namespace pypto::ir::pass

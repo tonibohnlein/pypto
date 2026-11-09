@@ -92,6 +92,7 @@ Keep the English and Chinese documentation synchronized.
 | 56 | [InsertCommFence](56-insert_comm_fence.md) | Marks each publishing write (region `system.cacheinvalid` + `system.fence` locally, fence only for a remote write, whole-GM for an opaque one) and each wait (whole-GM `system.cacheinvalid`); the notify itself gets no marker |
 | 57 | [MaterializeValidShapeSymbols](57-materialize_valid_shape_symbols.md) | Turns each device-kernel `valid_shape` symbol the kernel cannot bind into a leading `Scalar[INDEX]` parameter, fed the caller's actual valid extent |
 | 58 | [LowerTileToBuffer](58-lower_tile_to_buffer.md) | Final conversion of selected kernels from planned Tile storage to explicit Buffer operations |
+| 59 | [RealizeSync](59-realize_sync.md) | Experimental opt-in placed-demand synchronization; PTOAS remains the default |
 
 ## Outside the default pipeline
 

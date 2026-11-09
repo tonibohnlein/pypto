@@ -87,6 +87,7 @@ PyPTO IR 变换的参考文档，按阅读顺序组织。实际执行顺序请�
 | 56 | [InsertCommFence](56-insert_comm_fence.md) | 为每个发布性写入打标记（本地：region `system.cacheinvalid` + `system.fence`；远端写：仅 fence；opaque 写：whole-GM），并为每个 wait 插入 whole-GM `system.cacheinvalid`；notify 本身不加任何标记 |
 | 57 | [MaterializeValidShapeSymbols](57-materialize_valid_shape_symbols.md) | 将设备 kernel 中无法绑定的 `valid_shape` 符号转换为前置的 `Scalar[INDEX]` 参数，并传入调用方的实际有效范围 |
 | 58 | [LowerTileToBuffer](58-lower_tile_to_buffer.md) | 默认将选中 kernel 的已规划 Tile 存储转换为显式 Buffer 操作，其余 kernel 保留 Tile |
+| 59 | [RealizeSync](59-realize_sync.md) | 实验性显式启用的已放置需求同步；默认仍由 PTOAS 负责 |
 
 ## 默认流水线之外
 
