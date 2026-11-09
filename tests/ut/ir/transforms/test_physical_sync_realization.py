@@ -18,9 +18,9 @@ from pypto.backend.pto_backend import _run_ptoas
 
 from .sync_logical_oracle import CommandExecution
 from .sync_matmul_cases import CASES, capture, staged_fixture
-from .sync_matmul_oracle import interpret
+from .sync_matmul_oracle import hardware_reference, interpret, validate
 from .sync_physical_oracle import directional_widths, run_physical
-from .test_finite_sync_analysis import closure, reference
+from .test_finite_sync_analysis import closure
 from .test_logical_sync_realization import verify
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
@@ -36,7 +36,7 @@ def check(function, eligible=None):
     )
     # Compare the actual two emitted representations, not only their counters.
     _, calls = interpret(function)
-    ref = reference([(p, True, reads, writes) for _, _, p, reads, writes in calls])
+    ref = hardware_reference(function, calls)
     logical = CommandExecution(calls, ref[0])
     logical.execute(retained.realize()["function"].body, {})
     logical_order = closure(logical.vertices, logical.edges)
@@ -258,6 +258,185 @@ def test_physical_round_trip_preserves_ids_and_guards(tmp_path):
     assert isinstance(decoded, ir.Function)
     ir.assert_structural_equal(result["function"], decoded)
     run_physical(function, decoded)
+
+
+@pytest.mark.parametrize("shape", [(48, 48), (32, 80), (64, 64)])
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_matrix_threshold_across_visits(shape, count):
+    m, n = shape
+    function = staged_fixture(count, visits=2, m=m, n=n)
+    analysis = testing.analyze_placed_sync(function, True)
+    validate(function, analysis)
+    result, _, _, _ = check(function, list(range(6)))
+    assert result["barrier_sites"] == (
+        0 if count == 0 or (m // 16) * (n // 16) >= 10 else (2 if count == 1 else 4)
+    )
+    # Reset crossings and FIX reads still require cross-pipe handoffs.
+    if count:
+        assert result["set_sites"] > 0
+    assert "PIPE_S" not in str(result["function"])
+
+
+def test_matrix_protection_is_not_completion_before_start():
+    function = staged_fixture(3, stages=2, m=32, n=80)
+    analysis = testing.analyze_placed_sync(function, True)
+    # The two M sites can overlap. A following FIX read must nevertheless wait.
+    assert not analysis.precedes((0, 0, 4), True, (0, 0, 9), False)
+    assert analysis.precedes((0, 0, 4), True, (0, 0, 9), True)
+    assert analysis.precedes((0, 2, 9), True, (1, 0, 0), False)
+
+
+def test_matrix_protection_retains_compact_trip_counts():
+    sizes = []
+    for count in [2, 4, 64, 1000000]:
+        analysis = testing.analyze_placed_sync(staged_fixture(count, m=32, n=80), True)
+        d = analysis.describe()
+        p = analysis.realize_physical("a2a3", list(range(6)))
+        sizes.append(
+            (
+                d["analyzed_occurrences"],
+                d["cells"],
+                d["boundary_graph_edges"],
+                len(d["crossing_demands"]),
+                p["set_sites"],
+                p["wait_sites"],
+                p["barrier_sites"],
+            )
+        )
+    assert all(s == sizes[1] for s in sizes[1:])
+    assert all(s[-1] == 0 for s in sizes)
+
+
+def test_unknown_target_does_not_claim_matrix_protection():
+    function = staged_fixture(2, m=32, n=80)
+    analysis = testing.analyze_placed_sync(function, True, target="unknown")
+    validate(function, analysis)
+    assert any(a == 4 and b == 9 for a, b, _ in analysis.describe()["regions"][0]["demands"])
+    with pytest.raises(ValueError, match="hardware contract differs"):
+        analysis.realize_physical("a2a3", list(range(6)))
+
+
+@pytest.mark.parametrize("kind", ["reset", "fix_read", "physical_alias", "other_accumulator"])
+def test_matrix_chain_interference_and_aliases(kind):
+    original = staged_fixture(2, m=32, n=80)
+    span = original.span
+    assert isinstance(original.body, ir.SeqStmts)
+    definitions = [s for s in original.body.stmts if isinstance(s, ir.AssignStmt)]
+    acc = next(s.var for s in definitions if s.var.name_hint == "acc")
+    alias = ir.Var("acc_alias", acc.type, span)
+    output = original.params[2]
+
+    class Change(ir.IRMutator):
+        def visit_for_stmt(self, op):
+            assert isinstance(op.body, ir.SeqStmts)
+            stmts = list(op.body.stmts)
+            second = stmts[9]
+            assert isinstance(second, ir.EvalStmt) and isinstance(second.expr, ir.Call)
+            args = list(second.expr.args)
+            if kind in {"physical_alias", "other_accumulator"}:
+                args[2] = alias
+            name = "buffer.matmul" if kind in {"reset", "other_accumulator"} else "buffer.matmul_acc"
+            stmts[9] = ir.EvalStmt(ir.Call(ir.get_op(name), args, ir.VoidType(), span), span)
+            if kind == "fix_read":
+
+                def tup(xs):
+                    return ir.MakeTuple([ir.ConstInt(x, ir.DataType.INDEX, span) for x in xs], span)
+
+                store = ir.Call(
+                    ir.get_op("buffer.store"), [acc, tup([0, 0]), tup([32, 80]), output], ir.VoidType(), span
+                )
+                stmts.insert(5, ir.EvalStmt(store, span))
+            return ir.ForStmt(op.loop_var, op.start, op.stop, op.step, [], ir.SeqStmts(stmts, span), [], span)
+
+    function = Change().visit_function(original)
+    if kind in {"physical_alias", "other_accumulator"}:
+        assert isinstance(function.body, ir.SeqStmts)
+        shape = ir.MakeTuple([], span)
+        address = ir.ConstInt(0 if kind == "physical_alias" else 32 * 80 * 4, ir.DataType.INDEX, span)
+        allocation = ir.AssignStmt(
+            alias, ir.Call(ir.get_op("buffer.alloc"), [shape, address], acc.type, span), span
+        )
+        function = ir.Function(
+            function.name,
+            list(zip(function.params, function.param_directions)),
+            function.return_types,
+            ir.SeqStmts([allocation, *function.body.stmts], span),
+            span,
+            ir.FunctionType.AIC,
+            ir_stage=ir.FunctionIRStage.Buffer,
+        )
+    analysis = testing.analyze_placed_sync(function, True)
+    validate(function, analysis)
+    if kind == "other_accumulator":
+        # The other M operation interrupts the qualified accumulator chain.
+        assert analysis.precedes((0, 0, 4), True, (0, 1, 4), False)
+        check(function, list(range(6)))
+    else:
+        result, _, _, _ = check(function, list(range(6)))
+        if kind == "reset":
+            assert result["barrier_sites"] > 0
+        elif kind == "physical_alias":
+            # Same physical accumulator despite a different SSA name.
+            assert result["barrier_sites"] == 0
+        else:
+            assert analysis.precedes((0, 0, 4), True, (0, 0, 10), False)
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_accumulator_protection_crosses_composed_regions(count):
+    original = staged_fixture(count, visits=2, m=32, n=80)
+    assert isinstance(original.body, ir.SeqStmts)
+
+    class ContinueAccumulation(ir.IRMutator):
+        def visit_if_stmt(self, op):
+            assert op.else_body is not None
+            return op.else_body
+
+    stmts = list(original.body.stmts)
+    loops = [i for i, s in enumerate(stmts) if isinstance(s, ir.ForStmt)]
+    stmts[loops[1]] = ContinueAccumulation().visit_stmt(stmts[loops[1]])
+    # Remove the intermediate FIX read: the second complete loop continues
+    # the same accumulator while its original K coordinate resets.
+    del stmts[loops[0] + 1]
+    function = ir.Function(
+        original.name,
+        list(zip(original.params, original.param_directions)),
+        original.return_types,
+        ir.SeqStmts(stmts, original.span),
+        original.span,
+        ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    analysis = testing.analyze_placed_sync(function, True)
+    validate(function, analysis)
+    result, _, _, _ = check(function, list(range(6)))
+    assert result["barrier_sites"] == 0
+
+
+def test_nonleading_conditional_initializer_stays_conservative():
+    original = staged_fixture(3, m=32, n=80)
+
+    class LaterInitialization(ir.IRMutator):
+        def visit_for_stmt(self, op):
+            assert isinstance(op.body, ir.SeqStmts)
+            stmts = list(op.body.stmts)
+            later = stmts[9]
+            assert isinstance(later, ir.EvalStmt) and isinstance(later.expr, ir.Call)
+            init = ir.EvalStmt(
+                ir.Call(ir.get_op("buffer.matmul"), later.expr.args, ir.VoidType(), op.span), op.span
+            )
+            stmts[9] = ir.IfStmt(
+                ir.Eq(op.loop_var, op.start, ir.DataType.BOOL, op.span), init, later, [], op.span
+            )
+            return ir.ForStmt(
+                op.loop_var, op.start, op.stop, op.step, [], ir.SeqStmts(stmts, op.span), [], op.span
+            )
+
+    function = LaterInitialization().visit_function(original)
+    analysis = testing.analyze_placed_sync(function, True)
+    validate(function, analysis)
+    result, _, _, _ = check(function, list(range(6)))
+    assert result["barrier_sites"] > 0
 
 
 if __name__ == "__main__":

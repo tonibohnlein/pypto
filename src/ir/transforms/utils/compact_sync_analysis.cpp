@@ -87,8 +87,82 @@ std::optional<std::pair<int64_t, int64_t>> Visits(const SyncAccess& a, int64_t c
   if (lo > hi) return std::nullopt;
   return std::make_pair(lo, hi);
 }
-CompactSegmentResult Reduce(const SyncSegment& segment, const std::vector<Atom>& atoms, size_t& inspected,
-                            size_t& class_tests, size_t& class_lookup_tests) {
+// Sparse occurrence counters retain whole-loop multiplicities, never visits.
+// Each access/site is indexed once; pair qualification costs logarithmic lookup.
+// 128-bit counts cover size_t static sites times signed-64-bit trip counts.
+class OccurrenceCounter {
+  struct Slice {
+    size_t region;
+    __int128 before;
+    int64_t count;
+    std::vector<size_t> sites;
+  };
+  std::vector<Slice> slices_;
+
+ public:
+  void Add(size_t region, int64_t count, size_t site) {
+    if (slices_.empty() || slices_.back().region != region) {
+      __int128 before = 0;
+      if (!slices_.empty()) {
+        const auto& last = slices_.back();
+        before = last.before + __int128(last.count) * last.sites.size();
+      }
+      slices_.push_back({region, before, count, {}});
+    }
+    auto& sites = slices_.back().sites;
+    if (sites.empty() || sites.back() != site) sites.push_back(site);
+  }
+  __int128 Before(const Occurrence& occurrence) const {
+    const auto [region, visit, site] = occurrence;
+    auto it = std::upper_bound(slices_.begin(), slices_.end(), region,
+                               [](size_t r, const Slice& slice) { return r < slice.region; });
+    if (it == slices_.begin()) return 0;
+    --it;
+    if (it->region != region) return it->before + __int128(it->count) * it->sites.size();
+    return it->before + __int128(visit) * it->sites.size() +
+           (std::lower_bound(it->sites.begin(), it->sites.end(), site) - it->sites.begin());
+  }
+};
+class AccumulatorProtection {
+  const CompactSyncInput& input_;
+  OccurrenceCounter matrix_;
+  std::map<size_t, OccurrenceCounter> qualified_, interference_;
+
+ public:
+  explicit AccumulatorProtection(const CompactSyncInput& input) : input_(input) {
+    for (size_t r = 0; r < input.segments.size(); ++r) {
+      const auto& segment = input.segments[r];
+      for (size_t s = 0; s < segment.sites.size(); ++s) {
+        const auto& site = segment.sites[s];
+        if (site.pipe == PipeType::M) matrix_.Add(r, segment.count, s);
+        if (site.protected_accumulator) qualified_[*site.protected_accumulator].Add(r, segment.count, s);
+        for (const auto& access : site.accesses)
+          if (input.storage[access.storage].space == MemorySpace::Acc &&
+              site.protected_accumulator != access.storage)
+            interference_[access.storage].Add(r, segment.count, s);
+      }
+    }
+  }
+  bool Protects(const Occurrence& a, const Occurrence& b, size_t storage) const {
+    const auto [ar, av, as] = a;
+    const auto [br, bv, bs] = b;
+    const auto& source = input_.segments[ar].sites[as];
+    const auto& target = input_.segments[br].sites[bs];
+    if (source.protected_accumulator != storage || target.protected_accumulator != storage ||
+        (target.initializes_accumulator && (!target.continuation || bv == 0)))
+      return false;
+    // Every intervening M operation must be qualified on this same physical
+    // accumulator. Any other access (including a FIX read) breaks protection.
+    // This is NOT a C->I edge: consumers on other pipes still need synchronization.
+    const auto& qualified = qualified_.at(storage);
+    if (matrix_.Before(b) - matrix_.Before(a) != qualified.Before(b) - qualified.Before(a)) return false;
+    auto found = interference_.find(storage);
+    return found == interference_.end() || found->second.Before(a) == found->second.Before(b);
+  }
+};
+CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
+                            const AccumulatorProtection& protection, const std::vector<Atom>& atoms,
+                            size_t& inspected, size_t& class_tests, size_t& class_lookup_tests) {
   FiniteSyncInput model;
   model.exact_accesses = true;
   for (size_t c = 0; c < atoms.size(); ++c) model.covered_cells.push_back(c);
@@ -156,6 +230,11 @@ CompactSegmentResult Reduce(const SyncSegment& segment, const std::vector<Atom>&
     }
     model.occurrences.push_back(std::move(occurrence));
   }
+  const size_t sites = segment.sites.size();
+  model.protects_storage = [&](size_t a, size_t b, Cell cell) {
+    return protection.Protects({region, static_cast<int64_t>(a / sites), a % sites},
+                               {region, static_cast<int64_t>(b / sites), b % sites}, atoms[cell].storage);
+  };
   CompactSegmentResult result;
   result.count = segment.count;
   result.body = AnalyzeFiniteSync(model);
@@ -262,9 +341,11 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input) {
   result.cells = atoms.size();
   auto partitioned = Clock::now();
   result.partition_seconds = std::chrono::duration<double>(partitioned - begin).count();
-  for (const auto& s : result.input.segments)
-    result.segments.push_back(
-        Reduce(s, atoms, result.analyzed_occurrences, result.class_tests, result.class_lookup_tests));
+  AccumulatorProtection protection(result.input);
+  for (size_t r = 0; r < result.input.segments.size(); ++r)
+    result.segments.push_back(Reduce(result.input.segments[r], r, protection, atoms,
+                                     result.analyzed_occurrences, result.class_tests,
+                                     result.class_lookup_tests));
   auto reduced = Clock::now();
   result.reduction_seconds = std::chrono::duration<double>(reduced - partitioned).count();
   // A single region already owns all queries and boundaries. Keep the
@@ -311,14 +392,18 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input) {
     for (size_t c = 0; c < atoms.size(); ++c) {
       auto boundary = s.body.Boundary(c);
       INTERNAL_CHECK(boundary) << "Missing supplied cell";
+      auto crossing = [&](const Occurrence& a, size_t target) {
+        const Occurrence b{r, 0, target};
+        if (!protection.Protects(a, b, atoms[c].storage)) crossings.insert({a, b});
+      };
       if (writers[c]) {
-        if (boundary->first_writer) crossings.insert({*writers[c], {r, 0, *boundary->first_writer}});
+        if (boundary->first_writer) crossing(*writers[c], *boundary->first_writer);
         for (auto reader : boundary->first_readers)
-          if (reader) crossings.insert({*writers[c], {r, 0, *reader}});
+          if (reader) crossing(*writers[c], *reader);
       }
       if (boundary->first_writer) {
         for (auto reader : readers[c])
-          if (reader) crossings.insert({*reader, {r, 0, *boundary->first_writer}});
+          if (reader) crossing(*reader, *boundary->first_writer);
         writers[c] = Occurrence{r, s.count - 1, *boundary->last_writer};
         readers[c].fill(std::nullopt);
       }

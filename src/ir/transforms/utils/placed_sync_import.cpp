@@ -12,11 +12,14 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/buffer_row_recipes.h"
+#include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
@@ -93,7 +96,10 @@ class Importer {
   std::optional<size_t> vec_storage;
   void RegisterVec(const VarPtr& var, VecView view) {
     const auto type = view.type;
-    CHECK(type->shape_ == type->valid_shape_ && backend::DenseBufferBytes(type))
+    // A full-valid column vector [R,1] occupies consecutive elements in either
+    // major order. This does not admit general column-major matrices or views.
+    CHECK(type->shape_ == type->valid_shape_ &&
+          (backend::DenseBufferBytes(type) || backend::IsColumnVectorBuffer(type)))
         << "Synchronization Vec views require static full-valid dense descriptors";
     const auto end = Checked(__int128(view.address) + __int128(type->shape_[0] - 1) * view.pitch +
                              __int128(type->shape_[1]) * type->dtype_.GetByte());
@@ -268,6 +274,31 @@ class Importer {
       if (IsOp(call, "buffer.matmul_acc")) whole(2, false);
       whole(2, true);
       site.pipe = PipeType::M;
+      const auto lhs = As<BufferType>(call->args_[0]->GetType());
+      const auto rhs = As<BufferType>(call->args_[1]->GetType());
+      const auto dst = As<BufferType>(call->args_[2]->GetType());
+      // Ascend C Mmad synchronization optimization: consecutive K accumulation
+      // on the same L0C footprint needs no M barrier when floor(M/16)*floor(N/16)
+      // >= 10. Admission already validates full-valid shapes and native layouts.
+      // https://asc.gitcode.com/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute/Mmad.html
+      if (result.hardware_target == "a2a3" && lhs && rhs && dst && lhs->memory_space_ == MemorySpace::Left &&
+          rhs->memory_space_ == MemorySpace::Right && dst->memory_space_ == MemorySpace::Acc &&
+          lhs->shape_[0] > 0 && lhs->shape_[0] <= 4095 && lhs->shape_[1] > 0 && lhs->shape_[1] <= 4095 &&
+          rhs->shape_[1] > 0 && rhs->shape_[1] <= 4095 && lhs->shape_[1] == rhs->shape_[0] &&
+          dst->shape_[0] == lhs->shape_[0] && dst->shape_[1] == rhs->shape_[1] &&
+          (lhs->shape_[0] / 16) * (rhs->shape_[1] / 16) >= 10) {
+        site.protected_accumulator = Storage(call->args_[2]);
+        site.initializes_accumulator = IsOp(call, "buffer.matmul");
+      }
+    } else if (auto recipe = backend::FindBufferRowRecipe(call->op_->name_)) {
+      CHECK(result.owner->func_type_ == FunctionType::AIV) << "Row synchronization requires an AIV leaf";
+      whole(0, false);
+      // The shared contract distinguishes writable reduction scratch from a
+      // read-only broadcast column. Model the full scratch window as a write
+      // enclosure; do not claim it is the exact native scratch footprint.
+      whole(1, recipe->reduction);
+      whole(2, true);
+      site.pipe = PipeType::V;
     } else if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Vec synchronization requires an AIV leaf";
       for (size_t arg = 0; arg < recipe->inputs.size(); ++arg) {
@@ -301,11 +332,13 @@ class Importer {
     return site;
   }
   void Body(const StmtPtr& stmt, SyncSegment& segment) {
+    bool preceding_matrix = false;
     for (const auto& s : Statements(stmt)) {
       if (auto eval = As<EvalStmt>(s)) {
         auto call = As<Call>(eval->expr_);
         CHECK(call) << "Submit or non-call payload is not qualified";
         segment.sites.push_back(Site(call, segment));
+        preceding_matrix |= segment.sites.back().pipe == PipeType::M;
       } else if (auto branch = As<IfStmt>(s)) {
         auto eq = As<Eq>(branch->condition_);
         CHECK(segment.original_loop && eq && eq->left_ == segment.original_loop->loop_var_ &&
@@ -318,6 +351,10 @@ class Importer {
         auto site = Site(first, segment);
         auto continuation = Site(later, segment);
         site.continuation = later;
+        // A nonleading initialization has startup-only internal demands. Keep
+        // the existing uniform family contract conservative for that site.
+        if (preceding_matrix) site.protected_accumulator.reset();
+        preceding_matrix = true;
         for (auto a : continuation.accesses)
           if (!a.write && result.storage[a.storage].space == MemorySpace::Acc) {
             a.after_first = true;
@@ -332,7 +369,7 @@ class Importer {
   }
 };
 }  // namespace
-CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm) {
+CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target) {
   CHECK(function && (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV))
       << "Synchronization prototype requires one AIC or AIV leaf";
   if (function->func_type_ == FunctionType::AIV) {
@@ -350,6 +387,7 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm)
       << "Disjoint GM argument contract must be explicitly supplied; may-alias import unavailable";
   Importer importer;
   importer.result.owner = function;
+  importer.result.hardware_target = target;
   for (const auto& param : function->params_) {
     auto t = As<TensorType>(param->GetType());
     CHECK(t && t->shape_.size() == 2 && t->dtype_.GetBit() % 8 == 0 && !t->tensor_view_)

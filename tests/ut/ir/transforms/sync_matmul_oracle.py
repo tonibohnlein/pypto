@@ -18,7 +18,7 @@ from typing import Any
 
 from pypto import ir
 
-from .test_finite_sync_analysis import PIPES, closure
+from .test_finite_sync_analysis import PIPES, closure, reference
 
 
 def integer(expr, env):
@@ -108,6 +108,54 @@ def interpret(function):
             t.dtype.get_byte(),
         )
 
+    def payload_effects(call, env):
+        name, args = call.op.name, call.args
+        if name == ir.get_op("buffer.load").name:
+            assert isinstance(args[1], ir.MakeTuple) and isinstance(args[2], ir.MakeTuple)
+            rect = [integer(e, env) for e in [*args[1].elements, *args[2].elements]]
+            reads, writes, pipe = access(args[0], rect), access(args[3]), ir.PipeType.MTE2
+        elif name == ir.get_op("buffer.store").name:
+            assert isinstance(args[1], ir.MakeTuple) and isinstance(args[2], ir.MakeTuple)
+            rect = [integer(e, env) for e in [*args[1].elements, *args[2].elements]]
+            reads, writes = access(args[0]), access(args[3], rect)
+            assert isinstance(args[0].type, ir.BufferType)
+            pipe = ir.PipeType.MTE3 if args[0].type.memory_space == ir.MemorySpace.Vec else ir.PipeType.FIX
+        elif name in {ir.get_op("buffer.copy").name, ir.get_op("buffer.extract").name}:
+            dest = args[-1]
+            assert isinstance(dest.type, ir.BufferType)
+            rect = (
+                [integer(args[1], env), integer(args[2], env), *dest.type.shape]
+                if name == ir.get_op("buffer.extract").name
+                else None
+            )
+            reads, writes, pipe = access(args[0], rect), access(dest), ir.PipeType.MTE1
+        elif name in {ir.get_op("buffer.row_max").name, ir.get_op("buffer.row_sum").name}:
+            # Independently interpret the declared workspace effect. This
+            # is an enclosure, not a reconstruction of native scratch use.
+            reads = access(args[0])
+            writes, pipe = access(args[1]) | access(args[2]), ir.PipeType.V
+        elif name in {
+            ir.get_op("buffer.add").name,
+            ir.get_op("buffer.mul").name,
+            ir.get_op("buffer.sub").name,
+            ir.get_op("buffer.abs").name,
+            ir.get_op("buffer.adds").name,
+            ir.get_op("buffer.recip").name,
+            ir.get_op("buffer.exp").name,
+            ir.get_op("buffer.row_expand_sub").name,
+            ir.get_op("buffer.row_expand_div").name,
+        }:
+            reads = set().union(*(access(a) for a in args[:-1] if isinstance(a.type, ir.BufferType)))
+            writes, pipe = access(args[-1]), ir.PipeType.V
+        else:
+            assert name in {ir.get_op("buffer.matmul").name, ir.get_op("buffer.matmul_acc").name}
+            reads = access(args[0]) | access(args[1])
+            writes = access(args[2])
+            if name == ir.get_op("buffer.matmul_acc").name:
+                reads |= writes
+            pipe = ir.PipeType.M
+        return pipe, reads, writes
+
     def execute(stmt, env):
         if isinstance(stmt, ir.SeqStmts):
             for s in stmt.stmts:
@@ -124,51 +172,82 @@ def interpret(function):
         elif isinstance(stmt, ir.EvalStmt):
             call = stmt.expr
             assert isinstance(call, ir.Call)
-            name, args = call.op.name, call.args
-            if name == ir.get_op("buffer.load").name:
-                assert isinstance(args[1], ir.MakeTuple) and isinstance(args[2], ir.MakeTuple)
-                rect = [integer(e, env) for e in [*args[1].elements, *args[2].elements]]
-                reads, writes, pipe = access(args[0], rect), access(args[3]), ir.PipeType.MTE2
-            elif name == ir.get_op("buffer.store").name:
-                assert isinstance(args[1], ir.MakeTuple) and isinstance(args[2], ir.MakeTuple)
-                rect = [integer(e, env) for e in [*args[1].elements, *args[2].elements]]
-                reads, writes = access(args[0]), access(args[3], rect)
-                assert isinstance(args[0].type, ir.BufferType)
-                pipe = (
-                    ir.PipeType.MTE3 if args[0].type.memory_space == ir.MemorySpace.Vec else ir.PipeType.FIX
-                )
-            elif name in {ir.get_op("buffer.copy").name, ir.get_op("buffer.extract").name}:
-                dest = args[-1]
-                assert isinstance(dest.type, ir.BufferType)
-                rect = (
-                    [integer(args[1], env), integer(args[2], env), *dest.type.shape]
-                    if name == ir.get_op("buffer.extract").name
-                    else None
-                )
-                reads, writes, pipe = access(args[0], rect), access(dest), ir.PipeType.MTE1
-            elif name in {
-                ir.get_op("buffer.add").name,
-                ir.get_op("buffer.mul").name,
-                ir.get_op("buffer.sub").name,
-                ir.get_op("buffer.abs").name,
-                ir.get_op("buffer.adds").name,
-                ir.get_op("buffer.recip").name,
-            }:
-                reads = set().union(*(access(a) for a in args[:-1] if isinstance(a.type, ir.BufferType)))
-                writes, pipe = access(args[-1]), ir.PipeType.V
-            else:
-                assert name in {ir.get_op("buffer.matmul").name, ir.get_op("buffer.matmul_acc").name}
-                reads = access(args[0]) | access(args[1])
-                writes = access(args[2])
-                if name == ir.get_op("buffer.matmul_acc").name:
-                    reads |= writes
-                pipe = ir.PipeType.M
+            pipe, reads, writes = payload_effects(call, env)
             calls.append((call, env.copy(), pipe, reads, writes))
         else:
             raise AssertionError(f"Unsupported oracle statement {type(stmt)}")
 
     execute(function.body, {})
     return storage, calls
+
+
+def protected_accumulator_pairs(function, calls, target="a2a3"):
+    """Independent bounded hardware-contract check over actual byte accesses.
+
+    Matrix hazard protection supplies no event edge. All intermediate accesses
+    are inspected here; production uses sparse occurrence counters instead.
+    """
+    if target != "a2a3":
+        return set()
+    excluded = set()
+
+    class BranchScope(ir.IRVisitor):
+        def visit_for_stmt(self, op):
+            body = op.body.stmts if isinstance(op.body, ir.SeqStmts) else [op.body]
+            seen_matrix = False
+            for stmt in body:
+                if isinstance(stmt, ir.IfStmt):
+
+                    def calls_in(arm):
+                        seq = arm.stmts if isinstance(arm, ir.SeqStmts) else [arm]
+                        return [s.expr for s in seq if isinstance(s, ir.EvalStmt)]
+
+                    arms = calls_in(stmt.then_body) + calls_in(stmt.else_body)
+                    if seen_matrix:
+                        excluded.update(arms)
+                    seen_matrix = True
+                elif isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call):
+                    seen_matrix |= stmt.expr.op.name in {
+                        ir.get_op("buffer.matmul").name,
+                        ir.get_op("buffer.matmul_acc").name,
+                    }
+
+    BranchScope().visit_function(function)
+
+    def qualifies(entry):
+        call, _, pipe, _, _ = entry
+        if pipe != ir.PipeType.M or call in excluded:
+            return False
+        lhs, rhs, dst = [arg.type for arg in call.args]
+        return (
+            all(isinstance(t, ir.BufferType) for t in [lhs, rhs, dst])
+            and all(0 < d <= 4095 for d in [lhs.shape[0], lhs.shape[1], rhs.shape[1]])
+            and lhs.shape[1] == rhs.shape[0]
+            and list(dst.shape) == [lhs.shape[0], rhs.shape[1]]
+            and (lhs.shape[0] // 16) * (rhs.shape[1] // 16) >= 10
+        )
+
+    result = set()
+    for a, b in combinations(range(len(calls)), 2):
+        source, consumer = calls[a], calls[b]
+        if not qualifies(source) or not qualifies(consumer):
+            continue
+        if consumer[0].op.name != ir.get_op("buffer.matmul_acc").name or source[4] != consumer[4]:
+            continue
+        footprint = source[4]
+        if any(
+            (entry[2] == ir.PipeType.M and (not qualifies(entry) or entry[4] != footprint))
+            or (entry[2] != ir.PipeType.M and not (entry[3] | entry[4]).isdisjoint(footprint))
+            for entry in calls[a + 1 : b]
+        ):
+            continue
+        result.add((a, b))
+    return result
+
+
+def hardware_reference(function, calls, target="a2a3"):
+    effects = [(pipe, True, reads, writes) for _, _, pipe, reads, writes in calls]
+    return reference(effects, protected=protected_accumulator_pairs(function, calls, target))
 
 
 def validate(function, analysis, query_all=True):
@@ -181,11 +260,15 @@ def validate(function, analysis, query_all=True):
         same = [o for o, effect in zip(occurrences, effects) if effect[0] == pipe]
         for a, b in zip(same, same[1:]):
             base.update([((a, False), (b, False)), ((a, True), (b, True))])
+    protected = protected_accumulator_pairs(function, calls, description["hardware_target"])
     required = set(base)
     for a, b in combinations(range(len(occurrences)), 2):
         _, ar, aw = effects[a]
         _, br, bw = effects[b]
-        if not aw.isdisjoint(br) or not aw.isdisjoint(bw) or not ar.isdisjoint(bw):
+        if (not aw.isdisjoint(br) or not aw.isdisjoint(bw) or not ar.isdisjoint(bw)) and (
+            a,
+            b,
+        ) not in protected:
             required.add(((occurrences[a], True), (occurrences[b], False)))
     order = closure(vertices, required)
     assert not any(a == b for a, b in order)

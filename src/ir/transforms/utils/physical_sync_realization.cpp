@@ -23,6 +23,7 @@
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
@@ -80,15 +81,20 @@ std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, cons
           macro = "pto::TMATMUL";
         } else if (IsOp(call, "buffer.matmul_acc")) {
           macro = "pto::TMATMUL_ACC";
-        } else if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
+        } else {
           // The same recipe selects the emitted PTO operation. Resource claims
           // remain authoritative; unresolved ISA-helper ownership still refuses.
-          macro = std::string(recipe->native_op).substr(4);
+          const char* native = nullptr;
+          if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
+            native = recipe->native_op;
+          } else if (auto recipe = backend::FindBufferRowRecipe(call->op_->name_)) {
+            native = recipe->native_op;
+          }
+          CHECK(native) << "Unavailable native synchronization resource binding: " << call->op_->name_;
+          macro = std::string(native).substr(4);
           std::transform(macro.begin(), macro.end(), macro.begin(),
                          [](unsigned char c) { return std::toupper(c); });
           macro = "pto::" + macro;
-        } else {
-          CHECK(false) << "Unavailable native synchronization resource binding: " << call->op_->name_;
         }
         if (!checked.insert(macro).second) continue;
         const auto declaration = backend->FindIsaMacroResources(macro);
@@ -124,6 +130,8 @@ class Allocator {
         restricted_(restricted),
         claimed_(NativeClaims(analysis, target)) {
     CHECK(catalog_) << "Unavailable synchronization resource catalog: " << target;
+    CHECK(a_.input.hardware_target == target)
+        << "Synchronization hardware contract differs from lowering target";
     if (restricted_) {
       std::set<int> unique;
       for (int id : *restricted_)
@@ -252,6 +260,7 @@ class Allocator {
     for (const auto& f : result_.families) {
       auto [src, dst] = Pipes(a_, f);
       if (src != dst) continue;
+      CHECK(dst != PipeType::S) << "Scalar barriers are forbidden; require qualified native scalar order";
       CHECK(dst == PipeType::M || dst == PipeType::V) << "Unavailable same-pipe barrier mechanism";
       for (int64_t offset : std::set<int64_t>{0, f.count - 1}) {
         auto [r, v, s] = Target(f, offset);
@@ -349,6 +358,8 @@ class Emitter : public SyncPlacement {
     if (first) index = std::make_shared<Sub>(index, Integer(first, span), DataType::INDEX, span);
     std::vector<StmtPtr> commands;
     if (src == dst) {
+      INTERNAL_CHECK(dst == PipeType::M || dst == PipeType::V)
+          << "Only qualified M/V barriers may be emitted; scalar barriers are forbidden";
       auto call = OpRegistry::GetInstance().Create(dst == PipeType::M ? "system.bar_m" : "system.bar_v", {},
                                                    {}, span);
       commands.push_back(std::make_shared<EvalStmt>(call, span));
@@ -453,7 +464,7 @@ Pass RealizeSync() {
     // Internal errors are deliberately not caught. The strict retained-result
     // APIs still throw on these user-facing input/proof refusals.
     try {
-      auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true));
+      auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true, target));
       auto physical = sync::RealizePhysicalSync(analysis, target, std::nullopt);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.

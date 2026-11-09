@@ -50,7 +50,7 @@ def closure(vertices, edges):
     return result
 
 
-def reference(ops, prerequisites=(), native=()):
+def reference(ops, prerequisites=(), native=(), protected=()):
     """Enumerate all actual conflicts, never the implementation's generators."""
     active = [i for i, op in enumerate(ops) if op[1]]
     vertices = [(i, kind) for i in active for kind in (False, True)]
@@ -63,7 +63,7 @@ def reference(ops, prerequisites=(), native=()):
     required = set(base)
     for a, b in itertools.combinations(active, 2):
         ar, aw, br, bw = (set(x) for x in (ops[a][2], ops[a][3], ops[b][2], ops[b][3]))
-        if aw & (br | bw) or ar & bw:
+        if (aw & (br | bw) or ar & bw) and (a, b) not in protected:
             required.add(((a, True), (b, False)))
     required.update(((a, True), (b, False)) for a, b in prerequisites if a in active and b in active)
     order = closure(vertices, required)
@@ -247,6 +247,18 @@ def test_region_boundaries_reconstruct_crossings():
         assert set(composed["demands"]) == set(flat["demands"])
         assert composed["starts"] == flat["starts"]
         assert composed["completions"] == flat["completions"]
+
+
+def test_scalar_native_order_does_not_discharge_cross_pipe_readiness():
+    ops = [
+        (ir.PipeType.S, True, [], [0]),
+        (ir.PipeType.S, False, [0], [0]),
+        (ir.PipeType.V, True, [0], [1]),
+        (ir.PipeType.S, True, [0, 1], []),
+    ]
+    result = check_case(ops, native=[(0, 3)])
+    assert set(result["demands"]) == {(0, 2), (2, 3)}
+    assert not any(ops[a][0] == ops[b][0] == ir.PipeType.S for a, b in result["demands"])
 
 
 if __name__ == "__main__":

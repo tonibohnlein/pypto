@@ -52,7 +52,7 @@ def capture(name: str, shape: tuple[int, int, int] | None = None) -> ir.Function
 
 
 def staged_fixture(
-    count: int, stages: int = 2, visits: int = 1, start: int = 0, step: int = 1
+    count: int, stages: int = 2, visits: int = 1, start: int = 0, step: int = 1, m: int = 16, n: int = 16
 ) -> ir.Function:
     """Explicit placed derivative: fixed local slots, streamed GM operand chunks.
 
@@ -76,9 +76,9 @@ def staged_fixture(
         return ir.EvalStmt(call(name, args), span)
 
     k = 32 * stages * max(1, start + count * step)
-    a = ir.Var("a", ir.TensorType([16, k], fp), span)
-    b = ir.Var("b", ir.TensorType([k, 16], fp), span)
-    out = ir.Var("out", ir.TensorType([16, 16], fp), span)
+    a = ir.Var("a", ir.TensorType([m, k], fp), span)
+    b = ir.Var("b", ir.TensorType([k, n], fp), span)
+    out = ir.Var("out", ir.TensorType([m, n], fp), span)
     allocations, left, right, mat_a, mat_b = [], [], [], [], []
 
     def alloc(name, shape, space, address):
@@ -95,11 +95,11 @@ def staged_fixture(
         return var
 
     for stage in range(stages):
-        mat_a.append(alloc(f"a{stage}", [16, 32], ir.MemorySpace.Mat, stage * 4096))
-        mat_b.append(alloc(f"b{stage}", [32, 16], ir.MemorySpace.Mat, stage * 4096 + 2048))
-        left.append(alloc(f"l{stage}", [16, 32], ir.MemorySpace.Left, stage * 2048))
-        right.append(alloc(f"r{stage}", [32, 16], ir.MemorySpace.Right, stage * 2048))
-    acc = alloc("acc", [16, 16], ir.MemorySpace.Acc, 0)
+        mat_a.append(alloc(f"a{stage}", [m, 32], ir.MemorySpace.Mat, stage * (m + n) * 128))
+        mat_b.append(alloc(f"b{stage}", [32, n], ir.MemorySpace.Mat, stage * (m + n) * 128 + m * 128))
+        left.append(alloc(f"l{stage}", [m, 32], ir.MemorySpace.Left, stage * m * 128))
+        right.append(alloc(f"r{stage}", [32, n], ir.MemorySpace.Right, stage * n * 128))
+    acc = alloc("acc", [m, n], ir.MemorySpace.Acc, 0)
     body = list(allocations)
     for invocation in range(visits):
         iv = ir.Var(f"k{invocation}", ir.ScalarType(index), span)
@@ -107,8 +107,8 @@ def staged_fixture(
         for stage in range(stages):
             offset = ir.Add(ir.Mul(iv, ci(32 * stages), index, span), ci(stage * 32), index, span)
             loop_body += [
-                payload("buffer.load", [a, tup([0, offset]), tup([16, 32]), mat_a[stage]]),
-                payload("buffer.load", [b, tup([offset, 0]), tup([32, 16]), mat_b[stage]]),
+                payload("buffer.load", [a, tup([0, offset]), tup([m, 32]), mat_a[stage]]),
+                payload("buffer.load", [b, tup([offset, 0]), tup([32, n]), mat_b[stage]]),
                 payload("buffer.copy", [mat_a[stage], left[stage]]),
                 payload("buffer.copy", [mat_b[stage], right[stage]]),
             ]
@@ -132,7 +132,7 @@ def staged_fixture(
             )
         )
         if count:
-            body.append(payload("buffer.store", [acc, tup([0, 0]), tup([16, 16]), out]))
+            body.append(payload("buffer.store", [acc, tup([0, 0]), tup([m, n]), out]))
     body.append(ir.ReturnStmt([out], span))
     return ir.Function(
         "staged_matmul_derivative",
