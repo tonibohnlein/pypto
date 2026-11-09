@@ -65,6 +65,24 @@ from the shared Buffer recipe catalogue. Constant scalar operands are ready;
 arbitrary scalar-producing computations are not admitted. The shared Buffer
 verifier enforces each instruction's in-place alias policy.
 
+The same path admits the shared `row_max`, `row_sum`, `row_expand_sub` and
+`row_expand_div` recipes, including full-valid contiguous column vectors.
+Reductions read the source and write the destination plus an enclosure covering
+the whole declared scratch buffer; broadcasts read both inputs. Minimum demands
+and selectors are relative to these modeled effects, not a claim of exact native
+scratch-byte recovery. The existing verifier rejects illegal scratch overlap,
+and the resource catalogue reserves native V/S event IDs before allocation.
+General column-major matrices and partial-valid descriptors remain unavailable.
+
+The original `examples/intermediate/02_softmax.py` now selects PyPTO autosync and
+generates C++ through PTOAS. Host checks cover its modeled accesses, covers,
+queries, selectors, matching and physical reuse, plus repeated small pipelines
+with scratch reuse and counter resets. Retained sizes remain constant as the
+tested loop count grows from 4 to 1,000,000. The original RMSNorm and LayerNorm
+examples still delegate: their complete bodies are not selected for Buffer IR.
+This is an earlier lowering boundary, not an autosync allocation failure. These
+new cases have no device qualification.
+
 Placed Vec allocations and static subviews share a byte-address domain. Nested
 subviews preserve the original row pitch; dense reshapes preserve their byte
 extent. Overlapping allocations remain overlapping even with different SSA
@@ -93,3 +111,42 @@ Host regressions cover original add/multiply examples, overlapping allocations,
 nested pitches, in-place operations, zero and repeated visits, byte access
 agreement, actual covers, four-event queries, selectors and causal flag reuse.
 PTOAS C++ generation is a separate check; no new device qualification is implied.
+
+## Native accumulator protection and scalar barriers
+
+For the named manual `a2a3` target contract, consecutive Mmad operations on the
+same physical L0C accumulator may omit their storage synchronization when
+`floor(M/16) * floor(N/16) >= 10`. The importer checks effective full-valid shapes,
+compatible Left/Right/Acc operands and dimensions in `[1, 4095]`. This implements
+the [Mmad synchronization optimization](https://asc.gitcode.com/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute/Mmad.html).
+The rule is not a blanket matrix-pipe or FIX-pipe exemption.
+
+Physical accesses and boundary selectors remain unchanged. A provider certificate
+filters only protected storage witnesses before finite reduction and crossing
+reduction; explicit prerequisites are never filtered. Sparse counters establish
+that every intervening matrix operation qualifies on the same accumulator and no
+other access touches it. Counts include original loop multiplicities and counter
+resets without unfolding visits. A FIX read breaks protection. Reinitialization
+never consumes incoming protection; identical placed aliases share the same
+physical identity. The rule adds no completion-before-start event edge. The ordinary frontier scan
+remains valid: native start order carries incoming obligations forward along a
+protected writer chain, and native completion order carries its outgoing
+obligations to later consumers. Read-only WAR hazards remain explicit.
+
+First-matrix initialization followed by accumulation is supported. A conditional
+initializer after another matrix site keeps conservative treatment: its
+startup-only internal demands need a richer family activity contract. Unknown
+targets receive no exemption, and physical lowering rejects a target different
+from the retained analysis contract. Minimum-demand and order-equality statements
+refer to this selected hardware/effect contract, not every possible native
+optimization.
+
+`PIPE_S` barriers are forbidden. Physical qualification and emission admit local
+barriers only on M or V. The numerical service can consume explicitly supplied
+scalar native-order edges; these do not remove cross-pipe readiness obligations.
+Scalar payload import remains unavailable, so unsupported scalar programs retain
+the existing delegation path instead of gaining a fabricated scalar barrier.
+The [PipeBarrier specification](https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/ascendcopapi/atlasascendc_api_07_0271.html)
+states that scalar synchronization is automatic and a scalar barrier causes a
+hardware error. Host regressions validate the graph consequences under these
+contracts; they are not new device qualification.

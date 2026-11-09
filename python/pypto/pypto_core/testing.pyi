@@ -223,6 +223,6 @@ class CompactSyncAnalysis:
         """Return modeled point selectors; None is unavailable, not absence."""
         ...
 
-def analyze_placed_sync(function: Function, disjoint_gm: bool) -> CompactSyncAnalysis:
-    """Analyze qualified placed Buffer IR under an explicit GM alias contract."""
+def analyze_placed_sync(function: Function, disjoint_gm: bool, target: str = "a2a3") -> CompactSyncAnalysis:
+    """Analyze placed Buffer IR with explicit GM aliases and a named hardware contract."""
     ...

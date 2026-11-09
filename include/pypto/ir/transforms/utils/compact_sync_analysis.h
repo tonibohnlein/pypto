@@ -44,6 +44,9 @@ struct SyncSite {
   CallPtr continuation;  // Original else-arm; never replaced by the first arm.
   PipeType pipe;
   std::vector<SyncAccess> accesses;
+  // Qualified manual a2a3 Mmad accumulator footprint; no event-order promise.
+  std::optional<size_t> protected_accumulator;
+  bool initializes_accumulator = false;
 };
 struct SyncSegment {
   ForStmtPtr original_loop;
@@ -52,12 +55,14 @@ struct SyncSegment {
 };
 struct CompactSyncInput {
   FunctionPtr owner;
+  std::string hardware_target;
   std::vector<SyncStorage> storage;
   std::vector<SyncSegment> segments;
 };
 // Explicit qualification, not a default alias assumption. Unsupported input
 // throws a documented ValueError; no effects are skipped or silently enclosed.
-CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm);
+CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
+                                  const std::string& target = "a2a3");
 
 using Occurrence = std::tuple<size_t, int64_t, size_t>;  // segment, visit, site
 using Crossing = std::pair<Occurrence, Occurrence>;
