@@ -112,5 +112,26 @@ struct LogicalSyncRealization {
 // Research-only direct token realization of this retained owner. Never reruns
 // analysis or mutates it. Tokens are non-consuming; this is not flag allocation.
 LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis);
+
+// One physical handoff family; endpoint ordinals refer to the original loops.
+// A same-pipe family has no IDs. Crossings have count=1 and can span segments.
+struct PhysicalSyncFamily {
+  size_t source_region, source_site, target_region, target_site;
+  int64_t source_first, target_first, count;
+  std::vector<int> ids;  // Source ordinal relative to source_first, modulo size.
+};
+struct PhysicalSyncRealization {
+  FunctionPtr function;
+  std::vector<PhysicalSyncFamily> families;
+  size_t set_sites = 0, wait_sites = 0, barrier_sites = 0, guard_sites = 0;
+  size_t reuse_queries = 0, reserved_lanes = 0;
+  bool finite_minimum = true;
+};
+// Qualified direct realization of the retained owner, NOT general token-IR
+// LowerSync. Optional IDs restrict (never enlarge) the target's eligible pools.
+// Requires fresh entry, closed notification exit and the declared manual native
+// mode. Throws on unsupported placement, unproved reuse or fixed-plan scarcity.
+PhysicalSyncRealization RealizePhysicalSync(const CompactSyncResult& analysis, const std::string& target,
+                                            const std::optional<std::vector<int>>& eligible_ids);
 }  // namespace pypto::ir::sync
 #endif  // PYPTO_IR_TRANSFORMS_UTILS_COMPACT_SYNC_ANALYSIS_H_

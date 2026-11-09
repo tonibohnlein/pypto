@@ -107,8 +107,8 @@ PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 | 检查中的完整顺序相等及前缀有效性论证 | 物理 barrier 可能增加顺序 | 逻辑选定顺序相等，不是硬件并发保证 |
 | 命令表示不随 K 增长 | ID、扇出降低和调用完成协议 | 紧凑逻辑命令，不宣称物理可行性 |
 
-下一功能边界是经过验证的 `LowerSync`，需要分别建立物理匹配、
-资源复用、插入位置和实现顺序契约。
+后续的[物理实现原型](15-physical-demand-realization.md)分别建立匹配、资源复用、
+放置和实际顺序契约。它不是面向任意 token IR 的通用 `LowerSync`。
 
 最终针对性验证通过 **1,163 个 Python 测试及两个 C++ 测试**，
 包含逻辑 IR 所有权、Buffer IR、序列化、哈希、SIMT 注册兼容及代码生成拒绝。

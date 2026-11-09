@@ -367,6 +367,15 @@ class BufferEmissionPreflight : public ir::IRVisitor {
   }
 
   void VisitExpr_(const ir::CallPtr& call) override {
+    // Physical synchronization has no Tile/MemRef operands. Admit the existing
+    // operations here and let the ordinary backend validate/emit them; Buffer
+    // IR must not need a second flag emitter or reconstruct logical Tile IR.
+    if (ir::IsOp(call, "system.set_flag") || ir::IsOp(call, "system.wait_flag") ||
+        ir::IsOp(call, "system.bar_m") || ir::IsOp(call, "system.bar_v") ||
+        ir::IsOp(call, "system.bar_all")) {
+      IRVisitor::VisitExpr_(call);
+      return;
+    }
     uses_spmd_blocks |= ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num");
     uses_spmd_subblock |= ir::IsOp(call, "buffer.get_subblock_idx");
     if (backend::FindBufferConversionRecipe(call->op_->name_)) {

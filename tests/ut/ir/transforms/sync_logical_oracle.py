@@ -36,7 +36,7 @@ def value(expr, env):
     if isinstance(expr, ir.Var):
         assert expr in env, f"unbound value: {expr.name_hint}"
         return env[expr]
-    if isinstance(expr, (ir.Add, ir.Sub, ir.Mul, ir.FloorDiv, ir.Eq, ir.Gt)):
+    if isinstance(expr, (ir.Add, ir.Sub, ir.Mul, ir.FloorDiv, ir.FloorMod, ir.Eq, ir.Gt, ir.Ge, ir.Lt)):
         a, b = value(expr.left, env), value(expr.right, env)
         if isinstance(expr, ir.Add):
             return a + b
@@ -46,6 +46,12 @@ def value(expr, env):
             return a * b
         if isinstance(expr, ir.FloorDiv):
             return a // b
+        if isinstance(expr, ir.FloorMod):
+            return a % b
+        if isinstance(expr, ir.Ge):
+            return a >= b
+        if isinstance(expr, ir.Lt):
+            return a < b
         return a == b if isinstance(expr, ir.Eq) else a > b
     if isinstance(expr, ir.Call) and expr.op.name == ir.get_op("sync.completed").name:
         return Token(ir.PipeType(expr.kwargs["pipe"]), None, None)
