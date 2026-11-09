@@ -129,6 +129,14 @@ def interpret(function):
                 else None
             )
             reads, writes, pipe = access(args[0], rect), access(dest), ir.PipeType.MTE1
+        elif name in {ir.get_op("buffer.gather").name, ir.get_op("buffer.scatter").name}:
+            # Independently construct the declared whole-buffer model; actual
+            # indexed reads are checked separately with concrete index values.
+            reads = access(args[0]) | access(args[1])
+            writes = access(args[-1])
+            if name == ir.get_op("buffer.gather").name:
+                writes |= access(args[2])
+            pipe = ir.PipeType.V
         elif name in {ir.get_op("buffer.row_max").name, ir.get_op("buffer.row_sum").name}:
             # Independently interpret the declared workspace effect. This
             # is an enclosure, not a reconstruction of native scratch use.

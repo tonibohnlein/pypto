@@ -187,7 +187,7 @@ only the hook interpreter default changes, with no checks disabled.
 ## Incremental AIV extension
 
 The same retained owner now also accepts the qualified static Vec fragment
-specified in [RealizeSync](../passes/58-realize_sync.md#finite-vec-coverage).
+specified in [RealizeSync](../passes/59-realize_sync.md#finite-vec-coverage).
 The original matmul results above remain historical evidence. Vec byte-domain
 coordinates are identified by `byte_coordinates` in `describe()`: row zero and
 column equal to the physical Vec byte address. This avoids treating typed or

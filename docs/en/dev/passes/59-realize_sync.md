@@ -150,3 +150,22 @@ The [PipeBarrier specification](https://www.hiascend.com/doc_center/source/zh/ca
 states that scalar synchronization is automatic and a scalar barrier causes a
 hardware error. Host regressions validate the graph consequences under these
 contracts; they are not new device qualification.
+
+## Indexed Buffer contracts
+
+The opt-in importer consumes the shared `buffer.gather` and `buffer.scatter`
+recipes for full-valid, placed, dense AIV buffers. Indices are valid flattened
+physical element offsets into the supplied local buffer; this is the operation's
+caller contract, not a statically proved bound or support for arbitrary pointers.
+Gather reads use a whole-source enclosure and scratch writes use a whole-scratch
+enclosure. Scatter clears its whole destination, so that write is exact under
+the shared contract. Index reads and ordinary destination writes remain explicit.
+The retained diagnostic labels each access `exact` or `enclosure`; covers and
+boundary selectors refer to this selected model. Conservative covers need not
+be the concrete execution's minimum covers, but their closure covers its conflicts.
+
+The existing native-resource catalogue reserves manual-mode V/S helper flags;
+allocation and hybrid PTOAS delegation are unchanged. Missing placement, partial
+valid extents or illegal writable aliases still refuse transactionally. Row-major
+padded row-reduction output from PR #3333 remains outside this full-valid Buffer
+contract; integration of that API does not silently admit its padding as data.

@@ -104,3 +104,18 @@ completion-before-start 事件边。原有前沿扫描仍有效：原生启动�
 [PipeBarrier 规范](https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/ascendcopapi/atlasascendc_api_07_0271.html)
 说明标量同步由硬件保证，标量屏障会引发硬件错误。主机回归验证这些契约下的图性质，
 不代表新增设备验证。
+
+## 索引 Buffer 契约
+
+显式启用的导入器复用 `buffer.gather` 和 `buffer.scatter` 配方，只接受已放置、
+完整有效且稠密的 AIV 缓冲区。索引必须是目标局部缓冲区内有效的物理元素偏移；
+这是操作的调用方契约，并非静态范围证明，也不支持任意指针。
+Gather 的源读取与 scratch 写入使用整个缓冲区的保守包络。
+Scatter 先清空整个目标，因此在共享操作契约下目标写入是精确的。
+保留诊断逐访问标注 `exact` 或 `enclosure`；最小需求和边界选择器描述所选模型。
+保守模型的 covers 不一定是具体执行的最小 covers，但其闭包覆盖具体访问冲突。
+
+现有原生资源目录保留手动模式 V/S 辅助标志，分配算法及 PTOAS 委派保持不变。
+缺少放置、部分有效范围或非法写别名仍以事务方式拒绝。
+PR #3333 的带填充行主序归约结果尚不满足此完整有效 Buffer 契约；
+集成该 API 不会把填充区域静默视为有效数据。
