@@ -23,6 +23,7 @@
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
@@ -86,6 +87,8 @@ std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, cons
           // remain authoritative; unresolved ISA-helper ownership still refuses.
           const char* native = nullptr;
           if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
+            native = recipe->native_op;
+          } else if (auto recipe = backend::FindBufferIndexedRecipe(call->op_->name_)) {
             native = recipe->native_op;
           } else if (auto recipe = backend::FindBufferRowRecipe(call->op_->name_)) {
             native = recipe->native_op;

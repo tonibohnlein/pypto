@@ -12,6 +12,7 @@
 import importlib.util
 from pathlib import Path
 
+import pypto.language as pl
 import pytest
 import torch
 from pypto import codegen, ir, passes, testing
@@ -19,6 +20,7 @@ from pypto._function_attrs import AUTOSYNC_FALLBACK_REASON_ATTR, PYPTO_AUTOSYNC_
 from pypto.backend import BackendType
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import _run_ptoas
+from pypto.ir.pass_manager import PassManager
 from pypto.runtime import RunConfig
 
 from .sync_matmul_oracle import interpret, validate
@@ -246,6 +248,26 @@ def test_normalization_frontend_boundary_remains_explicit(name, inputs):
     ):
         program = kernel.lower(*args, config=RunConfig(arch=BackendType.Ascend910))
     function = next(f for f in program.functions.values() if f.func_type == ir.FunctionType.AIV)
+    assert not dict(function.attrs)[PYPTO_AUTOSYNC_ATTR]
+    assert "physically placed Buffer IR" in dict(function.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
+
+
+def test_padded_row_major_reduction_remains_delegated():
+    program = pl.parse_program("""
+@pl.program
+class RowMajor:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[4, 64], pl.FP32],
+               out: pl.InOut[pl.Tensor[[4, 8], pl.FP32]]) -> pl.Tensor[[4, 8], pl.FP32]:
+        x = pl.load(a, [0, 0], [4, 64])
+        scratch = pl.create_tile([4, 64], dtype=pl.FP32)
+        reduced = pl.tile.row_sum(x, scratch, out_layout=pl.TileLayout.row_major)
+        return pl.store(reduced, [0, 0], out)
+""")
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+        lowered = PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(program)
+    function = lowered.get_function("kernel")
+    assert function is not None
     assert not dict(function.attrs)[PYPTO_AUTOSYNC_ATTR]
     assert "physically placed Buffer IR" in dict(function.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
 

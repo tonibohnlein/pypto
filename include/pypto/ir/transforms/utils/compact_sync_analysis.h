@@ -37,7 +37,8 @@ struct SyncAccess {
   size_t storage;
   bool write;
   int64_t row, column, row_step, column_step, rows, columns;
-  bool after_first = false;  // Accumulator read, absent during initialization.
+  bool after_first = false;     // Accumulator read, absent during initialization.
+  bool exact_footprint = true;  // False: sound enclosure, selectors describe the selected model.
 };
 struct SyncSite {
   CallPtr original;
@@ -60,7 +61,8 @@ struct CompactSyncInput {
   std::vector<SyncSegment> segments;
 };
 // Explicit qualification, not a default alias assumption. Unsupported input
-// throws a documented ValueError; no effects are skipped or silently enclosed.
+// throws a documented ValueError; no effects are skipped. Enclosures are explicit
+// in SyncAccess and remain selected-model, not exact physical, footprints.
 CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
                                   const std::string& target = "a2a3");
 

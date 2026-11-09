@@ -132,7 +132,7 @@ PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 
 ## AIV 增量扩展
 
-同一结果所有者也接纳 [RealizeSync](../passes/58-realize_sync.md) 中限定的静态 Vec
+同一结果所有者也接纳 [RealizeSync](../passes/59-realize_sync.md) 中限定的静态 Vec
 片段；上文矩阵乘结果仍是原检查点的历史证据。`describe()` 的 `byte_coordinates`
 标识 Vec 字节域：行坐标为零，列坐标为物理字节地址。因此不同类型或部分重叠的已
 分配根不会被当作独立存储。点查询保留精确足迹，包括非连续窗口行间的空隙，不把包络

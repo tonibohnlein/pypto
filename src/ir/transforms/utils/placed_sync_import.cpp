@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
@@ -226,6 +227,11 @@ class Importer {
       const auto& s = result.storage[id];
       site.accesses.push_back(Access(id, write, {0, 0}, {0, 0}, s.rows, s.columns, segment));
     };
+    auto enclosure = [&](size_t arg, bool write) {
+      const auto first = site.accesses.size();
+      whole(arg, write);
+      for (size_t i = first; i < site.accesses.size(); ++i) site.accesses[i].exact_footprint = false;
+    };
     if (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")) {
       const bool load = IsOp(call, "buffer.load");
       auto offsets = As<MakeTuple>(call->args_[1]), shape = As<MakeTuple>(call->args_[2]);
@@ -290,13 +296,32 @@ class Importer {
         site.protected_accumulator = Storage(call->args_[2]);
         site.initializes_accumulator = IsOp(call, "buffer.matmul");
       }
+    } else if (auto recipe = backend::FindBufferIndexedRecipe(call->op_->name_)) {
+      CHECK(result.owner->func_type_ == FunctionType::AIV) << "Indexed synchronization requires an AIV leaf";
+      // The shared contract uses in-range physical element offsets into a
+      // known local buffer, not arbitrary pointers. Data-dependent gather
+      // reads and native scratch use are enclosed without inventing selectors.
+      if (recipe->scatter) {
+        whole(0, false);
+      } else {
+        enclosure(0, false);
+        enclosure(2, true);
+      }
+      whole(1, false);
+      // TSCATTER clears the entire destination before its indexed writes.
+      whole(recipe->input_count, true);
+      site.pipe = PipeType::V;
     } else if (auto recipe = backend::FindBufferRowRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Row synchronization requires an AIV leaf";
       whole(0, false);
       // The shared contract distinguishes writable reduction scratch from a
       // read-only broadcast column. Model the full scratch window as a write
       // enclosure; do not claim it is the exact native scratch footprint.
-      whole(1, recipe->reduction);
+      if (recipe->reduction) {
+        enclosure(1, true);
+      } else {
+        whole(1, false);
+      }
       whole(2, true);
       site.pipe = PipeType::V;
     } else if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
