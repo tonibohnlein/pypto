@@ -24,6 +24,7 @@ the page covering what you are changing.
 | [Finite Sync Demand Analysis](12-sync-demand-analysis.md) | Numerical storage generators, minimum demands, reachability and boundary contracts |
 | [Placed Matmul Prototype](13-matmul-sync-prototype.md) | Qualified Buffer IR import, compact repetition and independent validation |
 | [Logical Demand Realization](14-logical-demand-realization.md) | Retained demand to completion-token construction and independent command checks |
+| [Physical Demand Realization](15-physical-demand-realization.md) | Qualified flag allocation, direct placement and independent reuse checks |
 | [Logical Synchronization](11-logical-sync.md) | SSA completion tokens, pipeline ordering, runtime address predicates, and VF completion boundaries |
 
 ## See Also

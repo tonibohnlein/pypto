@@ -23,6 +23,7 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/sync_placement.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -51,9 +52,9 @@ class NameCollector : public var_collectors::VarDefUseCollector {
 
 // One indexed IR traversal, O((N+F) log(N+F)). The owner has already proved
 // invariant sites and zero/one-displacement families; no trip count is unfolded.
-class Realizer : public IRMutator {
+class Realizer : public SyncPlacement {
  public:
-  explicit Realizer(const CompactSyncResult& analysis) : analysis_(analysis) {
+  explicit Realizer(const CompactSyncResult& analysis) : SyncPlacement(analysis) {
     CHECK(analysis.input.owner) << "Logical realization requires the original occurrence owner";
     NameCollector collector;
     collector.VisitFunction(analysis.input.owner);
@@ -62,15 +63,6 @@ class Realizer : public IRMutator {
     for (const auto* var : collector.GetAllVarRefs()) names_.insert(var->name_hint_);
     for (size_t r = 0; r < analysis.input.segments.size(); ++r) {
       const auto& segment = analysis.input.segments[r];
-      if (segment.original_loop) loops_.emplace(segment.original_loop.get(), r);
-      for (size_t s = 0; s < segment.sites.size(); ++s) {
-        const auto& site = segment.sites[s];
-        CHECK(anchors_.emplace(site.original.get(), Site{r, s}).second)
-            << "Shared payload call needs a distinct occurrence anchor";
-        if (site.continuation)
-          CHECK(anchors_.emplace(site.continuation.get(), Site{r, s}).second)
-              << "Shared conditional payload needs a distinct occurrence anchor";
-      }
       for (const auto& f : analysis.segments[r].demands) {
         CHECK(f.distance == 0 || f.distance == 1) << "Unavailable logical token displacement";
         if (segment.count <= f.distance) continue;
@@ -104,27 +96,6 @@ class Realizer : public IRMutator {
   LogicalSyncRealization result;
 
  protected:
-  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
-    auto call = As<Call>(op->expr_);
-    auto it = anchors_.find(call.get());
-    INTERNAL_CHECK(it != anchors_.end()) << "Payload was not retained by the importer";
-    return Wrap(op, it->second);
-  }
-  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
-    // Both original arms denote one always-executed site. Its token definition
-    // must dominate later uses, so capture after the branch, not in one arm.
-    StmtPtr first = op->then_body_;
-    if (auto seq = As<SeqStmts>(first)) {
-      INTERNAL_CHECK(seq->stmts_.size() == 1) << "Changed admitted initialization branch";
-      first = seq->stmts_.front();
-    }
-    auto eval = As<EvalStmt>(first);
-    INTERNAL_CHECK(eval) << "Missing initialization payload";
-    auto call = As<Call>(eval->expr_);
-    auto it = anchors_.find(call.get());
-    INTERNAL_CHECK(it != anchors_.end() && Payload(it->second).continuation) << "Unqualified original branch";
-    return Wrap(op, it->second);
-  }
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     const size_t region = loops_.at(op.get());
     if (analysis_.input.segments[region].count == 0) return op;
@@ -163,9 +134,6 @@ class Realizer : public IRMutator {
   }
 
  private:
-  const CompactSyncResult& analysis_;
-  std::map<const Call*, Site> anchors_;
-  std::map<const ForStmt*, size_t> loops_;
   std::map<Site, Source> sources_;
   std::map<Site, std::vector<Incoming>> incoming_;
   std::map<size_t, std::vector<Site>> carried_;
@@ -181,11 +149,10 @@ class Realizer : public IRMutator {
     return name;
   }
   VarPtr Variable(const TypePtr& type) { return std::make_shared<Var>(Name(), type, Span::unknown()); }
-  const SyncSite& Payload(Site site) const { return analysis_.input.segments[site.first].sites[site.second]; }
   static CallPtr Token(const char* name, PipeType pipe, const Span& span) {
     return OpRegistry::GetInstance().Create(name, {}, {{"pipe", static_cast<int>(pipe)}}, span);
   }
-  StmtPtr Wrap(const StmtPtr& payload, Site site) {
+  StmtPtr Wrap(const StmtPtr& payload, Site site) override {
     std::vector<StmtPtr> statements;
     const auto& segment = analysis_.input.segments[site.first];
     for (const auto& incoming : incoming_[site]) {

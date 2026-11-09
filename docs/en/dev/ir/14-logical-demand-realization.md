@@ -137,9 +137,9 @@ PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 | Full projected order equality in checks and the stated prefix argument | Physical waits/barriers may strengthen order | Logical selected-order equality, not a hardware concurrency guarantee |
 | Command representation stays fixed with K | Event assignment, token fanout lowering and invocation completion | Compact logical commands; no physical feasibility claim |
 
-The next functional boundary is qualified `LowerSync`: materializing these
-immutable completion facts using hardware mechanisms, with separate matching,
-resource-reuse, placement and realized-order contracts.
+A subsequent [physical realization prototype](15-physical-demand-realization.md)
+materializes retained demands with separate matching, resource-reuse, placement
+and realized-order contracts. It is not a general `LowerSync` for arbitrary token IR.
 
 The final focused gate passes **1,163 Python tests and two C++ tests**. It includes
 logical IR ownership, Buffer IR, serialization, hashing, SIMT registry compatibility

@@ -527,6 +527,36 @@ void BindTesting(nb::module_& m) {
             return out;
           },
           "Realize retained demands with logical completion tokens; no physical allocation")
+      .def(
+          "realize_physical",
+          [](const ir::sync::CompactSyncResult& analysis, const std::string& target,
+             const std::optional<std::vector<int>>& eligible_ids) {
+            const auto result = ir::sync::RealizePhysicalSync(analysis, target, eligible_ids);
+            nb::dict out;
+            out["function"] = result.function;
+            out["set_sites"] = result.set_sites;
+            out["wait_sites"] = result.wait_sites;
+            out["barrier_sites"] = result.barrier_sites;
+            out["guard_sites"] = result.guard_sites;
+            out["reuse_queries"] = result.reuse_queries;
+            out["reserved_lanes"] = result.reserved_lanes;
+            out["finite_minimum"] = result.finite_minimum;
+            nb::list families;
+            for (const auto& f : result.families) {
+              nb::dict row;
+              row["source"] = nb::make_tuple(f.source_region, f.source_first, f.source_site);
+              row["target"] = nb::make_tuple(f.target_region, f.target_first, f.target_site);
+              row["count"] = f.count;
+              row["ids"] = nb::cast(f.ids);
+              families.append(row);
+            }
+            out["families"] = families;
+            out["guarantee"] = "equal selected order under qualified direct-command model";
+            out["native_mode"] = "manual a2a3; fresh flags at entry; closed notifications at exit";
+            return out;
+          },
+          nb::arg("target"), nb::arg("eligible_ids") = nb::none(),
+          "Realize retained demands with certified physical handoffs; no scarcity repair")
       .def("describe", &DescribeCompactSync, "Inspect retained analysis without additional construction")
       .def("precedes", &ir::sync::CompactSyncResult::Precedes, nb::arg("source"),
            nb::arg("source_completion"), nb::arg("target"), nb::arg("target_completion"),

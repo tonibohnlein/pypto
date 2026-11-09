@@ -165,8 +165,31 @@ class LogicalSyncRealization(TypedDict):
     name_scan_nodes: int
     guarantee: str
 
+class PhysicalSyncFamily(TypedDict):
+    """Original occurrence frame and cyclic ID list of one demand family."""
+
+    source: tuple[int, int, int]
+    target: tuple[int, int, int]
+    count: int
+    ids: list[int]
+
+class PhysicalSyncRealization(TypedDict):
+    """Qualified physical commands; native invocation premises remain explicit."""
+
+    function: Function
+    families: list[PhysicalSyncFamily]
+    set_sites: int
+    wait_sites: int
+    barrier_sites: int
+    guard_sites: int
+    reuse_queries: int
+    reserved_lanes: int
+    finite_minimum: bool
+    guarantee: str
+    native_mode: str
+
 class CompactSyncAnalysis:
-    """Retained research analysis with opt-in logical realization; no physical allocation."""
+    """Retained research analysis with opt-in logical and qualified physical realization."""
 
     def describe(self) -> dict[str, Any]:
         """Return retained geometry, occurrence mapping, families and work counts."""
@@ -174,6 +197,15 @@ class CompactSyncAnalysis:
 
     def realize(self) -> LogicalSyncRealization:
         """Insert logical record/wait commands from this retained result."""
+        ...
+
+    def realize_physical(self, target: str, eligible_ids: list[int] | None = None) -> PhysicalSyncRealization:
+        """Realize retained demands using the target's eligible directional IDs.
+
+        Optional IDs restrict the catalog. Refuse unsupported realization,
+        unproved compact allocation or proved finite fixed-plan scarcity.
+        This does not lower arbitrary frontend logical tokens.
+        """
         ...
 
     def precedes(
