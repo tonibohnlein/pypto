@@ -312,6 +312,9 @@ Pass MaterializeValidShapeSymbols();
  */
 Pass LowerTileToBuffer();
 
+/// Opt-in whole-kernel physical synchronization; qualification refusals delegate to PTOAS.
+Pass RealizeSync();
+
 /// Select whole kernels for the default Buffer rollout before storage legalization.
 Pass SelectBufferIRFunctions();
 

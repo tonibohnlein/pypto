@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 from pypto import ir, passes
 from pypto.backend import BackendType
+from pypto.jit.decorator import JITFunction
 from pypto.runtime import RunConfig
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -25,16 +26,23 @@ CASES = {
 }
 
 
-def capture(name: str, shape: tuple[int, int, int] | None = None) -> ir.Function:
-    """Run the real frontend and placement; never run PTOAS or a device."""
-    path, default_shape = CASES[name]
-    m, k, n = shape or default_shape
+def load_case(name: str) -> JITFunction:
+    """Load an original example without executing its main block."""
+    path, _ = CASES[name]
     spec = importlib.util.spec_from_file_location(name, ROOT / path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return getattr(module, name)
+
+
+def capture(name: str, shape: tuple[int, int, int] | None = None) -> ir.Function:
+    """Run the real frontend and placement; never run PTOAS or a device."""
+    _, default_shape = CASES[name]
+    m, k, n = shape or default_shape
+    kernel = load_case(name)
     with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
-        program = getattr(module, name).lower(
+        program = kernel.lower(
             torch.empty(m, k),
             torch.empty(k, n),
             torch.empty(m, n),

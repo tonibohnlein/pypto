@@ -441,6 +441,15 @@ inline ParamDirection StringToParamDirection(const std::string& str) {
  */
 inline constexpr const char* kAttrSpmdUnwrapped = "spmd_unwrapped";
 
+// Written only after RealizeSync qualifies the entire kernel. Backend consumes
+// this durable bool to report which complete plans already contain literal flags.
+// PTOAS remains enabled and skips those functions by its explicit-sync contract.
+// Retained through printing/parsing; not permission to skip analysis of new IR.
+inline constexpr const char* kAttrPyptoAutosync = "pypto_autosync";
+// RealizeSync records admission/refusal details without modifying the original
+// payload body. Backend publishes them in report/autosync.json; preserved in IR.
+inline constexpr const char* kAttrAutosyncFallbackReason = "autosync_fallback_reason";
+
 // Immutable whole-kernel selection written by SelectBufferIRFunctions before
 // storage legalization. Read by storage passes, verifiers and final lowering;
 // retained through serialization. Absence denotes a low-level pass pipeline.
