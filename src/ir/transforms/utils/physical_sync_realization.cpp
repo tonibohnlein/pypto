@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -21,6 +22,8 @@
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
@@ -49,11 +52,12 @@ Direction Pipes(const CompactSyncResult& a, const Family& f) {
 
 // This is a narrow binding of the existing native resource declarations, not
 // an inference that arbitrary missing catalog entries mean signal-free code.
-// Direct Buffer IR emits TLOAD(Mat), TSTORE(Acc), TMOV(Mat->Left/Right),
+// Direct Buffer IR emits TLOAD(Mat/Vec), TSTORE(Acc/Vec), TMOV(Mat->Left/Right),
 // TEXTRACT(Mat->Left/Right), TMATMUL and TMATMUL_ACC for these admitted calls.
 // In manual a2a3 mode those variants have no hidden AIC flags. TEXTRACT's
 // catalogued V<->S claims belong to the excluded Vec overload. Still consume
-// any applicable fixed AIC claims conservatively, and refuse unresolved owners.
+// any applicable fixed claims for the owning core conservatively, and refuse
+// unresolved owners. Vec arithmetic takes its macro from the shared recipe.
 std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, const std::string& target) {
   CHECK(target == "a2a3") << "Unsupported physical target: native variants are qualified only for a2a3";
   auto backend = backend::GetBackendInstance(backend::BackendType::Ascend910);
@@ -65,20 +69,33 @@ std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, cons
       for (const auto& call : {site.original, site.continuation}) {
         if (!call) continue;
         std::string macro;
-        if (IsOp(call, "buffer.load"))
+        if (IsOp(call, "buffer.load")) {
           macro = "pto::TLOAD";
-        else if (IsOp(call, "buffer.store"))
+        } else if (IsOp(call, "buffer.store")) {
           macro = "pto::TSTORE";
-        else if (IsOp(call, "buffer.copy"))
+        } else if (IsOp(call, "buffer.copy")) {
           macro = "pto::TMOV";
-        else if (IsOp(call, "buffer.extract"))
+        } else if (IsOp(call, "buffer.extract")) {
           macro = "pto::TEXTRACT";
-        else if (IsOp(call, "buffer.matmul"))
+        } else if (IsOp(call, "buffer.matmul")) {
           macro = "pto::TMATMUL";
-        else if (IsOp(call, "buffer.matmul_acc"))
+        } else if (IsOp(call, "buffer.matmul_acc")) {
           macro = "pto::TMATMUL_ACC";
-        else
-          CHECK(false) << "Unavailable native synchronization resource binding: " << call->op_->name_;
+        } else {
+          // The same recipe selects the emitted PTO operation. Resource claims
+          // remain authoritative; unresolved ISA-helper ownership still refuses.
+          const char* native = nullptr;
+          if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
+            native = recipe->native_op;
+          } else if (auto recipe = backend::FindBufferRowRecipe(call->op_->name_)) {
+            native = recipe->native_op;
+          }
+          CHECK(native) << "Unavailable native synchronization resource binding: " << call->op_->name_;
+          macro = std::string(native).substr(4);
+          std::transform(macro.begin(), macro.end(), macro.begin(),
+                         [](unsigned char c) { return std::toupper(c); });
+          macro = "pto::" + macro;
+        }
         if (!checked.insert(macro).second) continue;
         const auto declaration = backend->FindIsaMacroResources(macro);
         if (!declaration) continue;  // Only the enumerated, audited native variants.
@@ -91,7 +108,9 @@ std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, cons
           if (std::find(claim.modes.begin(), claim.modes.end(), IsaSyncMode::Manual) == claim.modes.end())
             continue;
           if (macro == "pto::TEXTRACT" && claim.pool.core == CoreScope::AIV) continue;
-          CHECK(claim.pool.kind == ResourceKind::PipelineEvent && claim.pool.core == CoreScope::AIC &&
+          CHECK(claim.pool.kind == ResourceKind::PipelineEvent &&
+                claim.pool.core ==
+                    (a.input.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC) &&
                 claim.source == IsaIdSource::Fixed && claim.lifetime == IsaResourceLifetime::Invocation)
               << "Unavailable native flag owner/variant binding: " << macro;
           for (auto id : claim.ids) claimed[{claim.pool.src, claim.pool.dst}].insert(static_cast<int>(id));
@@ -111,6 +130,8 @@ class Allocator {
         restricted_(restricted),
         claimed_(NativeClaims(analysis, target)) {
     CHECK(catalog_) << "Unavailable synchronization resource catalog: " << target;
+    CHECK(a_.input.hardware_target == target)
+        << "Synchronization hardware contract differs from lowering target";
     if (restricted_) {
       std::set<int> unique;
       for (int id : *restricted_)
@@ -118,6 +139,8 @@ class Allocator {
     }
   }
   PhysicalSyncRealization Run() {
+    for (const auto& [direction, ids] : claimed_)
+      for (int id : ids) result_.native_reserved_ids.emplace_back(direction.first, direction.second, id);
     for (size_t r = 0; r < a_.segments.size(); ++r) {
       const auto& segment = a_.segments[r];
       for (const auto& f : segment.demands) {
@@ -191,7 +214,8 @@ class Allocator {
     if (!fresh) return it->second;
     using pypto::sync::CoreScope;
     using pypto::sync::ResourceKind;
-    auto spec = catalog_->FindPool({ResourceKind::PipelineEvent, CoreScope::AIC, d.first, d.second});
+    const auto core = a_.input.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC;
+    auto spec = catalog_->FindPool({ResourceKind::PipelineEvent, core, d.first, d.second});
     CHECK(spec) << "Unavailable directional event pool";
     auto legal = spec->legal_ids;
     if (legal.empty()) {
@@ -236,6 +260,7 @@ class Allocator {
     for (const auto& f : result_.families) {
       auto [src, dst] = Pipes(a_, f);
       if (src != dst) continue;
+      CHECK(dst != PipeType::S) << "Scalar barriers are forbidden; require qualified native scalar order";
       CHECK(dst == PipeType::M || dst == PipeType::V) << "Unavailable same-pipe barrier mechanism";
       for (int64_t offset : std::set<int64_t>{0, f.count - 1}) {
         auto [r, v, s] = Target(f, offset);
@@ -333,6 +358,8 @@ class Emitter : public SyncPlacement {
     if (first) index = std::make_shared<Sub>(index, Integer(first, span), DataType::INDEX, span);
     std::vector<StmtPtr> commands;
     if (src == dst) {
+      INTERNAL_CHECK(dst == PipeType::M || dst == PipeType::V)
+          << "Only qualified M/V barriers may be emitted; scalar barriers are forbidden";
       auto call = OpRegistry::GetInstance().Create(dst == PipeType::M ? "system.bar_m" : "system.bar_v", {},
                                                    {}, span);
       commands.push_back(std::make_shared<EvalStmt>(call, span));
@@ -342,12 +369,14 @@ class Emitter : public SyncPlacement {
       if (f.ids.size() > 1)
         residue = std::make_shared<FloorMod>(index, Integer(f.ids.size(), span), DataType::INDEX, span);
       for (size_t i = 0; i < f.ids.size(); ++i) {
-        auto call = OpRegistry::GetInstance().Create(publish ? "system.set_flag" : "system.wait_flag", {},
-                                                     {{"src_pipe", static_cast<int>(src)},
-                                                      {"dst_pipe", static_cast<int>(dst)},
-                                                      {"event_id", f.ids[i]},
-                                                      {"core_type", std::string("aic")}},
-                                                     span);
+        auto call = OpRegistry::GetInstance().Create(
+            publish ? "system.set_flag" : "system.wait_flag", {},
+            {{"src_pipe", static_cast<int>(src)},
+             {"dst_pipe", static_cast<int>(dst)},
+             {"event_id", f.ids[i]},
+             {"core_type",
+              std::string(analysis_.input.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
+            span);
         StmtPtr command = std::make_shared<EvalStmt>(call, span);
         if (residue)
           command = Guard(std::make_shared<Eq>(residue, Integer(i, span), DataType::BOOL, span), command);
@@ -421,8 +450,8 @@ Pass RealizeSync() {
     CHECK(ctx && ctx->GetEnablePyptoAutoSync()) << "RealizeSync requires enable_pypto_autosync=True";
     CHECK(!function->GetAttr<bool>(kAttrPyptoAutosync))
         << "RealizeSync cannot reprocess an owned physical plan";
-    if (function->func_type_ != FunctionType::AIC)
-      return SyncOutcome(function, false, "PyPTO synchronization supports only AIC leaves");
+    if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV)
+      return SyncOutcome(function, false, "PyPTO synchronization supports only AIC/AIV leaves");
     if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS)
       return SyncOutcome(function, false, "PyPTO synchronization requires physically placed Buffer IR");
     if (!ctx->GetAutoSyncDisjointGM())
@@ -435,7 +464,7 @@ Pass RealizeSync() {
     // Internal errors are deliberately not caught. The strict retained-result
     // APIs still throw on these user-facing input/proof refusals.
     try {
-      auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true));
+      auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true, target));
       auto physical = sync::RealizePhysicalSync(analysis, target, std::nullopt);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.

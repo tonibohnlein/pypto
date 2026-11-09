@@ -19,8 +19,8 @@ from typing import Any
 
 from pypto import ir
 
-from .sync_matmul_oracle import interpret
-from .test_finite_sync_analysis import closure, reference
+from .sync_matmul_oracle import hardware_reference, interpret
+from .test_finite_sync_analysis import closure
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,11 @@ class CommandExecution:
 
     def assign(self, stmt, env):
         call = stmt.value
-        if isinstance(call, ir.Call) and call.op.name == ir.get_op("buffer.alloc").name:
+        if isinstance(call, ir.Call) and call.op.name in {
+            ir.get_op("buffer.alloc").name,
+            ir.get_op("buffer.subview").name,
+            ir.get_op("buffer.reshape").name,
+        }:
             self.actual_allocations.append(stmt)
         elif isinstance(call, ir.Call) and call.op.name == ir.get_op("sync.record").name:
             pipe = ir.PipeType(call.kwargs["pipe"])
@@ -192,8 +196,7 @@ class CommandExecution:
 
 def validate_logical(original, emitted, *, require_equality=True):
     _, calls = interpret(original)
-    effects = [(pipe, True, reads, writes) for _, _, pipe, reads, writes in calls]
-    reference_graph = reference(effects)
+    reference_graph = hardware_reference(original, calls)
     state = CommandExecution(calls, reference_graph[0])
     state.execute(emitted.body, {})
     assert state.payload_count == len(calls), "missing payload"

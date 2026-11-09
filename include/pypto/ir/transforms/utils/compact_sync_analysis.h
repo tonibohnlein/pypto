@@ -21,15 +21,17 @@
 #include "pypto/ir/transforms/utils/finite_sync_analysis.h"
 
 namespace pypto::ir::sync {
-// Research provider contract: static placed whole local writes, affine read
+// Research provider contract: static placed local writes, affine read
 // rectangles, disjoint ND GM arguments, sequential constant-bound loops.
-// Geometry is in logical element coordinates within an explicitly retained
-// physical allocation/layout; it is not an absolute GM address.
+// Matrix/GM geometry uses logical element coordinates in a retained layout,
+// never an absolute GM address. Placed dense Vec views instead share a physical
+// byte domain (byte_coordinates), so typed aliases cannot hide overlapping bytes.
 struct SyncStorage {
   std::string name;
   MemorySpace space;
   int64_t address, rows, columns, bytes;
-  BufferTypePtr layout;  // Null for ND GM.
+  BufferTypePtr layout;           // Null for ND GM or the Vec byte domain.
+  bool byte_coordinates = false;  // Vec: (row=0, column=physical byte address).
 };
 struct SyncAccess {
   size_t storage;
@@ -42,6 +44,9 @@ struct SyncSite {
   CallPtr continuation;  // Original else-arm; never replaced by the first arm.
   PipeType pipe;
   std::vector<SyncAccess> accesses;
+  // Qualified manual a2a3 Mmad accumulator footprint; no event-order promise.
+  std::optional<size_t> protected_accumulator;
+  bool initializes_accumulator = false;
 };
 struct SyncSegment {
   ForStmtPtr original_loop;
@@ -50,12 +55,14 @@ struct SyncSegment {
 };
 struct CompactSyncInput {
   FunctionPtr owner;
+  std::string hardware_target;
   std::vector<SyncStorage> storage;
   std::vector<SyncSegment> segments;
 };
 // Explicit qualification, not a default alias assumption. Unsupported input
 // throws a documented ValueError; no effects are skipped or silently enclosed.
-CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm);
+CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
+                                  const std::string& target = "a2a3");
 
 using Occurrence = std::tuple<size_t, int64_t, size_t>;  // segment, visit, site
 using Crossing = std::pair<Occurrence, Occurrence>;
@@ -83,7 +90,7 @@ class CompactSyncResult {
   std::vector<CompactSegmentResult> segments;
   std::vector<Crossing> crossing_generators, crossing_demands;
   size_t analyzed_occurrences = 0, cells = 0, graph_edges = 0;
-  size_t class_tests = 0, port_pair_tests = 0, crossing_path_searches = 0;
+  size_t class_tests = 0, class_lookup_tests = 0, port_pair_tests = 0, crossing_path_searches = 0;
   double import_seconds = 0;
   double partition_seconds = 0, reduction_seconds = 0, composition_seconds = 0;
   bool Precedes(const Occurrence& a, bool sc, const Occurrence& b, bool tc) const;
@@ -125,6 +132,7 @@ struct PhysicalSyncRealization {
   std::vector<PhysicalSyncFamily> families;
   size_t set_sites = 0, wait_sites = 0, barrier_sites = 0, guard_sites = 0;
   size_t reuse_queries = 0, reserved_lanes = 0;
+  std::vector<std::tuple<PipeType, PipeType, int>> native_reserved_ids;  // Fixed macro owners.
   bool finite_minimum = true;
 };
 // Qualified direct realization of the retained owner, NOT general token-IR

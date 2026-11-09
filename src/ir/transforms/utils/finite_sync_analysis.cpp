@@ -70,7 +70,12 @@ FiniteSyncResult AnalyzeFiniteSync(const FiniteSyncInput& input) {
       ++result.work.cell_visits;
       auto& frontier = frontiers.at(cell);
       auto& boundary = result.storage.at(cell);
-      if (frontier.writer) emit(*frontier.writer, b);
+      if (frontier.writer) {
+        const auto a = *frontier.writer;
+        if (!writes || input.occurrences[a].pipe != occurrence.pipe || !input.protects_storage ||
+            !input.protects_storage(a, b, cell))
+          emit(a, b);
+      }
       if (writes) {
         for (size_t reader : frontier.readers) {
           ++result.work.reader_visits;

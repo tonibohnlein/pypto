@@ -14,6 +14,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <unordered_map>
 #include <utility>
@@ -52,6 +53,11 @@ struct FiniteSyncInput {
   /// Qualified native C->I edges, e.g. scalar serialization. No hardware
   /// exemption is inferred from a pipe name in this numerical kernel.
   std::vector<Demand> native_order;
+  /// Provider-certified same-pipe writer-chain protection, NOT a native C->I
+  /// edge or an arbitrary edge-removal predicate. The certificate must preserve
+  /// frontier substitution across protected writers. Pure reader hazards and
+  /// explicit prerequisites stay mandatory. Callback work is charged separately.
+  std::function<bool(size_t, size_t, Cell)> protects_storage;
 };
 struct StorageBoundary {
   std::optional<size_t> first_writer;

@@ -20,8 +20,8 @@ from itertools import combinations
 from pypto import ir
 
 from .sync_logical_oracle import CommandExecution, same_payload
-from .sync_matmul_oracle import interpret
-from .test_finite_sync_analysis import closure, reference
+from .sync_matmul_oracle import hardware_reference, interpret
+from .test_finite_sync_analysis import closure
 
 
 class PhysicalExecution(CommandExecution):
@@ -94,9 +94,17 @@ class PhysicalExecution(CommandExecution):
 
 def run_physical(original, emitted, eligible=range(8)):
     _, calls = interpret(original)
-    effects = [(pipe, True, reads, writes) for _, _, pipe, reads, writes in calls]
-    ref = reference(effects)
+    ref = hardware_reference(original, calls)
     state = PhysicalExecution(calls, ref[0], eligible)
+
+    class CoreOwnership(ir.IRVisitor):
+        def visit_call(self, op):
+            call = op
+            if call.op.name in {ir.get_op("system.set_flag").name, ir.get_op("system.wait_flag").name}:
+                expected = "aiv" if original.func_type == ir.FunctionType.AIV else "aic"
+                assert call.kwargs["core_type"] == expected, "flag has the wrong owning core"
+
+    CoreOwnership().visit_function(emitted)
     state.execute(emitted.body, {})
     assert state.payload_count == len(calls), "missing payload"
     assert not state.live, "outstanding notifications at invocation exit"

@@ -129,3 +129,15 @@ PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 审查在修复无地址分配的准入检查及仿射中间表达式窄化/溢出问题后，接受此研究范围。
 新增回归覆盖相同物理本地别名和原始循环起点/步长。全部配置钩子使用已有 Python 3.12 环境
 （固定 Torch 2.8 不提供 Python 3.14 wheel）；仅改变钩子默认解释器，没有禁用检查。
+
+## AIV 增量扩展
+
+同一结果所有者也接纳 [RealizeSync](../passes/58-realize_sync.md) 中限定的静态 Vec
+片段；上文矩阵乘结果仍是原检查点的历史证据。`describe()` 的 `byte_coordinates`
+标识 Vec 字节域：行坐标为零，列坐标为物理字节地址。因此不同类型或部分重叠的已
+分配根不会被当作独立存储。点查询保留精确足迹，包括非连续窗口行间的空隙，不把包络
+提升为精确访问。
+
+扩展复用 `DenseBufferBytes`、Buffer 操作验证、逐元素配方及 Buffer IR 别名验证器。
+不引入尚未合并的 GM subview 或旋转池设计。元数据写入和未支持坐标框架明确拒绝。
+原有逻辑及物理实现接口直接使用保留结果，不重新构造分析。
