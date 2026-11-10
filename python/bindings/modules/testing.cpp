@@ -19,6 +19,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/array.h>
+#include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>  // NOLINT(misc-include-cleaner) -- registers shared_ptr casters
@@ -31,6 +32,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -63,6 +65,10 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   nb::dict out;
   out["guarantee"] = "minimum demands for declared footprints and core native chains";
   out["realization"] = "not requested";
+  out["parameter_bounds"] = result.input.parameter_bounds;
+  out["coordinate_nodes"] = result.input.coordinate_nodes;
+  out["coordinate_flatten_visits"] = result.input.coordinate_flatten_visits;
+  out["coordinate_coefficient_entries"] = result.input.coordinate_coefficient_entries;
   nb::list storage, regions;
   for (const auto& s : result.input.storage) {
     nb::dict item;
@@ -73,6 +79,8 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     item["columns"] = s.columns;
     item["bytes"] = s.bytes;
     item["byte_coordinates"] = s.byte_coordinates;
+    item["row_parameters"] = s.row_parameters;
+    item["column_parameters"] = s.column_parameters;
     storage.append(item);
   }
   for (size_t r = 0; r < result.segments.size(); ++r) {
@@ -126,8 +134,8 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   return out;
 }
 nb::object CompactBoundary(const ir::sync::CompactSyncResult& result, size_t storage, int64_t row,
-                           int64_t col) {
-  auto b = result.Boundary(storage, row, col);
+                           int64_t col, const std::map<size_t, int64_t>& parameters) {
+  auto b = result.BoundaryAt(storage, row, col, parameters);
   if (!b) return nb::none();
   nb::dict out;
   out["first_writer"] = b->first_writer;
@@ -569,20 +577,39 @@ void BindTesting(nb::module_& m) {
            nb::arg("source_completion"), nb::arg("target"), nb::arg("target_completion"),
            "Query original segment/visit/site events")
       .def("boundary", &CompactBoundary, nb::arg("storage"), nb::arg("row"), nb::arg("column"),
+           nb::arg("parameters") = std::map<size_t, int64_t>{},
            "Exact modeled point selector, or None for unavailable domain");
   testing.def(
       "analyze_placed_sync",
-      [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target) {
+      [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
+         const ir::sync::SyncParameterBounds& bounds) {
         auto start = std::chrono::steady_clock::now();
-        auto input = ir::sync::ImportPlacedSync(function, disjoint_gm, target);
+        auto input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds);
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         auto result = ir::sync::AnalyzeCompactSync(std::move(input));
         result.import_seconds = seconds;
         return result;
       },
       nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{},
       "Read-only research analysis of qualified placed Buffer IR under a named hardware contract");
 
+  testing.def(
+      "sync_parameter_bounds",
+      [](const ir::ProgramPtr& program) { return ir::sync::CollectSyncParameterBounds(program); },
+      nb::arg("program"), "Inspect proved direct-caller coordinate ranges without analysis or realization");
+  testing.def(
+      "sync_parameter_bounds_profile",
+      [](const ir::ProgramPtr& program) {
+        ir::sync::SyncParameterWork work;
+        auto bounds = ir::sync::CollectSyncParameterBounds(program, &work);
+        nb::dict out;
+        out["bounds"] = bounds;
+        out["expression_visits"] = work.expression_visits;
+        out["range_visits"] = work.range_visits;
+        return out;
+      },
+      nb::arg("program"), "Inspect caller proof traversal work in each bound environment");
   testing.def("analyze_finite_sync", &AnalyzeFiniteSyncForTesting, nb::arg("occurrences"),
               nb::arg("covered_cells"), nb::arg("exact_accesses"), nb::arg("prerequisites"),
               nb::arg("native_order"), nb::arg("queries"), nb::arg("boundary_cells"),

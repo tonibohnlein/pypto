@@ -141,3 +141,7 @@ PYTHONPATH=$PWD/python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 扩展复用 `DenseBufferBytes`、Buffer 操作验证、逐元素配方及 Buffer IR 别名验证器。
 不引入尚未合并的 GM subview 或旋转池设计。元数据写入和未支持坐标框架明确拒绝。
 原有逻辑及物理实现接口直接使用保留结果，不重新构造分析。
+
+[参数化 prefill 检查点](16-parameterized-prefill-checkpoint.md) 为同一 owner 增加
+调用方证明的不变 INDEX 坐标和带绑定的 GM 选择器，尚未把平坦 segment 扩展为
+嵌套重复子区域。

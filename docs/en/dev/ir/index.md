@@ -25,6 +25,7 @@ the page covering what you are changing.
 | [Placed Matmul Prototype](13-matmul-sync-prototype.md) | Qualified Buffer IR import, compact repetition and independent validation |
 | [Logical Demand Realization](14-logical-demand-realization.md) | Retained demand to completion-token construction and independent command checks |
 | [Physical Demand Realization](15-physical-demand-realization.md) | Qualified flag allocation, direct placement and independent reuse checks |
+| [Parameterized Prefill](16-parameterized-prefill-checkpoint.md) | Caller-proved invariant coordinates, binding-aware selectors and the remaining nested-composition boundary |
 | [Logical Synchronization](11-logical-sync.md) | SSA completion tokens, pipeline ordering, runtime address predicates, and VF completion boundaries |
 
 ## See Also

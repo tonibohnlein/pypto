@@ -10,8 +10,11 @@
  */
 
 #include <algorithm>
+#include <functional>
 #include <limits>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -23,10 +26,12 @@
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/verifier/verifier.h"
 
 namespace pypto::ir::sync {
@@ -46,30 +51,134 @@ void RequireIndex(const ExprPtr& e) {
   CHECK(type && type->dtype_ == DataType::INDEX)
       << "Synchronization affine coordinates require an entirely INDEX expression chain";
 }
-std::pair<int64_t, int64_t> Affine(const ExprPtr& e, const SyncSegment& segment);
-std::pair<int64_t, int64_t> AffineImpl(const ExprPtr& e, const SyncSegment& segment) {
-  if (auto c = As<ConstInt>(e)) return {Constant(c), 0};
-  if (segment.original_loop && e == segment.original_loop->loop_var_) return {segment.start, segment.step};
-  if (auto a = As<Add>(e)) {
-    auto x = Affine(a->left_, segment), y = Affine(a->right_, segment);
-    return {Checked(__int128(x.first) + y.first), Checked(__int128(x.second) + y.second)};
+struct AffineCoordinate {
+  int64_t first = 0, second = 0;
+  SyncTranslation parameters;
+};
+using ParameterIndices = std::unordered_map<const Expr*, size_t>;
+// Retain checked scalar definitions as a DAG. Coefficients are only materialized
+// for requested access roots, never for every SSA prefix definition.
+class CoordinateGraph {
+  enum class Kind { Constant, Parameter, Loop, Add, Scale };
+  struct Node {
+    Kind kind;
+    int64_t upper = 0, factor = 0, start = 0, step = 0;
+    size_t left = 0, right = 0, parameter = 0;
+    const ForStmt* frame = nullptr;
+    bool constant = false;
+  };
+  std::vector<Node> nodes_;
+  std::map<std::pair<const Expr*, const ForStmt*>, size_t> memo_;
+  std::unordered_map<const Expr*, size_t> definitions_;
+
+ public:
+  bool Defined(const ExprPtr& e) const { return definitions_.count(e.get()); }
+  size_t Build(const ExprPtr& e, const SyncSegment& segment, const ParameterIndices& parameters,
+               CompactSyncInput& input) {
+    RequireIndex(e);
+    const auto frame = segment.original_loop.get();
+    if (auto found = definitions_.find(e.get()); found != definitions_.end()) {
+      CHECK(!nodes_[found->second].frame || nodes_[found->second].frame == frame)
+          << "Coordinate definition belongs to another occurrence frame";
+      return found->second;
+    }
+    const auto key = std::make_pair(e.get(), frame);
+    if (auto found = memo_.find(key); found != memo_.end()) {
+      return found->second;
+    }
+    Node n{Kind::Constant};
+    if (auto c = As<ConstInt>(e)) {
+      n.upper = n.factor = Constant(c);
+      n.constant = true;
+    } else if (segment.original_loop && e == segment.original_loop->loop_var_) {
+      n.kind = Kind::Loop;
+      n.frame = frame;
+      n.start = segment.start;
+      n.step = segment.step;
+      n.upper = Checked(__int128(n.start) + __int128(n.step) * std::max<int64_t>(0, segment.count - 1));
+    } else if (auto it = parameters.find(e.get()); it != parameters.end()) {
+      CHECK(input.parameter_bounds.count(it->second))
+          << "Invocation coordinate has no established caller range";
+      n.kind = Kind::Parameter;
+      n.parameter = it->second;
+      n.upper = input.parameter_bounds.at(it->second).second;
+    } else {
+      ExprPtr left, right;
+      const bool multiply = static_cast<bool>(As<Mul>(e));
+      if (auto add = As<Add>(e)) {
+        left = add->left_;
+        right = add->right_;
+      } else if (auto mul = As<Mul>(e)) {
+        left = mul->left_;
+        right = mul->right_;
+      } else {
+        CHECK(false) << "Unavailable affine synchronization access";
+      }
+      n.left = Build(left, segment, parameters, input);
+      n.right = Build(right, segment, parameters, input);
+      // Copy scalar node metadata: recursive construction can reallocate nodes_.
+      auto x = nodes_[n.left], y = nodes_[n.right];
+      if (multiply) {
+        CHECK(x.constant || y.constant) << "Nonaffine synchronization access";
+        if (!y.constant) {
+          std::swap(n.left, n.right);
+          std::swap(x, y);
+        }
+        n.kind = Kind::Scale;
+        n.factor = y.upper;
+        n.upper = Checked(__int128(x.upper) * n.factor);
+        n.constant = x.constant || !n.factor;
+        n.frame = n.factor ? x.frame : nullptr;
+      } else {
+        n.kind = Kind::Add;
+        n.upper = Checked(__int128(x.upper) + y.upper);
+        n.constant = x.constant && y.constant;
+        n.frame = x.frame ? x.frame : y.frame;
+      }
+    }
+    // Each intermediate has been range-checked, including operands of zero.
+    const auto id = nodes_.size();
+    nodes_.push_back(n);
+    memo_.emplace(key, id);
+    ++input.coordinate_nodes;
+    return id;
   }
-  if (auto m = As<Mul>(e)) {
-    auto x = Affine(m->left_, segment), y = Affine(m->right_, segment);
-    CHECK(x.second == 0 || y.second == 0) << "Nonaffine synchronization access";
-    return {Checked(__int128(x.first) * y.first),
-            Checked(__int128(x.second) * y.first + __int128(y.second) * x.first)};
+  void Define(const ExprPtr& var, const ExprPtr& value, const SyncSegment& segment,
+              const ParameterIndices& parameters, CompactSyncInput& input) {
+    definitions_.emplace(var.get(), Build(value, segment, parameters, input));
   }
-  CHECK(false) << "Unavailable affine synchronization access";
-  return {};
-}
-std::pair<int64_t, int64_t> Affine(const ExprPtr& e, const SyncSegment& segment) {
-  RequireIndex(e);
-  auto result = AffineImpl(e, segment);
-  // Check every intermediate, including one hidden by a later multiplication by zero.
-  Checked(__int128(result.first) + __int128(result.second) * std::max<int64_t>(0, segment.count - 1));
-  return result;
-}
+  AffineCoordinate Flatten(size_t root, CompactSyncInput& input) const {
+    // Construction IDs are topological. Propagate aggregate weights once per
+    // reachable node, avoiding path enumeration through shared subexpressions.
+    std::map<size_t, int64_t, std::greater<size_t>> pending{{root, 1}};
+    AffineCoordinate result;
+    while (!pending.empty()) {
+      const auto [id, weight] = *pending.begin();
+      pending.erase(pending.begin());
+      ++input.coordinate_flatten_visits;
+      const auto& n = nodes_[id];
+      auto add = [&](size_t child, int64_t w) {
+        if (w) pending[child] = Checked(__int128(pending[child]) + w);
+      };
+      if (n.constant) {
+        result.first = Checked(__int128(result.first) + __int128(weight) * n.upper);
+      } else if (n.kind == Kind::Parameter) {
+        auto& coefficient = result.parameters[n.parameter];
+        coefficient = Checked(__int128(coefficient) + weight);
+      } else if (n.kind == Kind::Loop) {
+        result.first = Checked(__int128(result.first) + __int128(weight) * n.start);
+        result.second = Checked(__int128(result.second) + __int128(weight) * n.step);
+      } else if (n.kind == Kind::Scale) {
+        add(n.left, Checked(__int128(weight) * n.factor));
+      } else {
+        add(n.left, weight);
+        add(n.right, weight);
+      }
+    }
+    input.coordinate_coefficient_entries += result.parameters.size();
+    return result;
+  }
+};
 std::vector<StmtPtr> Statements(const StmtPtr& s) {
   if (auto seq = As<SeqStmts>(s)) return seq->stmts_;
   return {s};
@@ -95,6 +204,21 @@ class Importer {
   };
   std::unordered_map<const Expr*, VecView> vec_views;
   std::optional<size_t> vec_storage;
+  ParameterIndices parameters;
+  CoordinateGraph coordinates;
+  std::set<size_t> translated_storage;
+  AffineCoordinate Coordinate(const ExprPtr& e, const SyncSegment& segment) {
+    return coordinates.Flatten(coordinates.Build(e, segment, parameters, result), result);
+  }
+  void DefineCoordinate(const AssignStmtPtr& assign, const SyncSegment& segment) {
+    CHECK(As<ScalarType>(assign->var_->GetType()))
+        << "Nested or data-dependent storage/view definitions are outside this compact provider";
+    RequireIndex(assign->var_);
+    CHECK(!parameters.count(assign->var_.get()) && !coordinates.Defined(assign->var_) &&
+          (!segment.original_loop || assign->var_ != segment.original_loop->loop_var_))
+        << "Invocation and loop coordinates must retain their original single-assignment identities";
+    coordinates.Define(assign->var_, assign->value_, segment, parameters, result);
+  }
   void RegisterVec(const VarPtr& var, VecView view) {
     const auto type = view.type;
     // A full-valid column vector [R,1] occupies consecutive elements in either
@@ -188,14 +312,21 @@ class Importer {
     result.storage.push_back(
         {a->var_->name_hint_, t->memory_space_, address, t->shape_[0], t->shape_[1], bytes, t});
   }
-  SyncAccess Access(size_t storage, bool write, std::pair<int64_t, int64_t> row,
-                    std::pair<int64_t, int64_t> column, int64_t rows, int64_t columns,
-                    const SyncSegment& segment) {
+  SyncAccess Access(size_t storage, bool write, AffineCoordinate row, AffineCoordinate column, int64_t rows,
+                    int64_t columns, const SyncSegment& segment) {
     const auto& s = result.storage[storage];
     const auto last = std::max<int64_t>(0, segment.count - 1);
+    auto translation_bound = [&](const SyncTranslation& translation) {
+      int64_t upper = 0;
+      for (auto [p, coefficient] : translation)
+        upper = Checked(__int128(upper) + __int128(coefficient) * result.parameter_bounds.at(p).second);
+      return upper;
+    };
     CHECK(rows > 0 && columns > 0 &&
-          Checked(__int128(row.first) + __int128(last) * row.second + rows) <= s.rows &&
-          Checked(__int128(column.first) + __int128(last) * column.second + columns) <= s.columns)
+          Checked(__int128(row.first) + __int128(last) * row.second + rows +
+                  translation_bound(row.parameters)) <= s.rows &&
+          Checked(__int128(column.first) + __int128(last) * column.second + columns +
+                  translation_bound(column.parameters)) <= s.columns)
         << "Synchronization access exceeds its proved allocation";
     return {storage, write, row.first, column.first, row.second, column.second, rows, columns, false};
   }
@@ -238,8 +369,17 @@ class Importer {
       CHECK(offsets && shape && offsets->elements_.size() == 2 && shape->elements_.size() == 2)
           << "Synchronization DMA requires a rank-two rectangle";
       auto id = Storage(call->args_[load ? 0 : 3]);
-      site.accesses.push_back(Access(id, !load, Affine(offsets->elements_[0], segment),
-                                     Affine(offsets->elements_[1], segment), Constant(shape->elements_[0]),
+      const auto row = Coordinate(offsets->elements_[0], segment);
+      const auto column = Coordinate(offsets->elements_[1], segment);
+      auto& storage = result.storage[id];
+      if (translated_storage.insert(id).second) {
+        storage.row_parameters = row.parameters;
+        storage.column_parameters = column.parameters;
+      } else {
+        CHECK(storage.row_parameters == row.parameters && storage.column_parameters == column.parameters)
+            << "GM accesses need a common invocation translation; parameter-dependent overlap is unproved";
+      }
+      site.accesses.push_back(Access(id, !load, row, column, Constant(shape->elements_[0]),
                                      Constant(shape->elements_[1]), segment));
       const auto gm_arg = load ? 0 : 3;
       (load ? modes[gm_arg].first : modes[gm_arg].second) = true;
@@ -261,8 +401,10 @@ class Importer {
       const auto& t = result.storage[tid];
       CHECK(s.space == MemorySpace::Mat && (t.space == MemorySpace::Left || t.space == MemorySpace::Right))
           << "Only Mat to operand-buffer movement is qualified";
-      auto row = extract ? Affine(call->args_[1], segment) : std::pair<int64_t, int64_t>{0, 0};
-      auto column = extract ? Affine(call->args_[2], segment) : std::pair<int64_t, int64_t>{0, 0};
+      auto row = extract ? Coordinate(call->args_[1], segment) : AffineCoordinate{};
+      auto column = extract ? Coordinate(call->args_[2], segment) : AffineCoordinate{};
+      CHECK(row.parameters.empty() && column.parameters.empty())
+          << "Parameterized local extraction needs a separate membership and alignment certificate";
       if (!extract) CHECK(s.rows == t.rows && s.columns == t.columns) << "Partial copy is not qualified";
       if (s.layout->slayout_ != TileLayout::none_box) {
         const auto box = s.layout->fractal_ / (16 * s.layout->dtype_.GetByte());
@@ -359,7 +501,9 @@ class Importer {
   void Body(const StmtPtr& stmt, SyncSegment& segment) {
     bool preceding_matrix = false;
     for (const auto& s : Statements(stmt)) {
-      if (auto eval = As<EvalStmt>(s)) {
+      if (auto assign = As<AssignStmt>(s)) {
+        DefineCoordinate(assign, segment);
+      } else if (auto eval = As<EvalStmt>(s)) {
         auto call = As<Call>(eval->expr_);
         CHECK(call) << "Submit or non-call payload is not qualified";
         segment.sites.push_back(Site(call, segment));
@@ -393,8 +537,158 @@ class Importer {
     }
   }
 };
+// Reuse PyPTO's bound environment, but qualify integer operations before
+// accepting mathematical bounds as machine-index evidence. Saturation, unknown
+// parameters and data-loaded values remain unproved. No branch is sampled.
+class InvocationBounds : public IRVisitor {
+  using Bound = std::pair<int64_t, int64_t>;
+  arith::ConstIntBoundAnalyzer analyzer_;
+  const std::map<std::string, FunctionPtr>& functions_;
+  std::map<std::string, std::map<size_t, std::optional<Bound>>>& evidence_;
+  SyncParameterWork& work_;
+  std::unordered_map<const Expr*, std::optional<Bound>> ranges_;
+  std::set<const Expr*> visited_;
+  // Expressions may be shared across scopes; cached unknowns and successes
+  // both belong to the current bound environment, never to the entire program.
+  void Invalidate() {
+    ranges_.clear();
+    visited_.clear();
+  }
+  std::optional<Bound> Range(const ExprPtr& expression) {
+    if (auto found = ranges_.find(expression.get()); found != ranges_.end()) {
+      return found->second;
+    }
+    ++work_.range_visits;
+    auto result = ComputeRange(expression);
+    ranges_.emplace(expression.get(), result);
+    return result;
+  }
+  std::optional<Bound> ComputeRange(const ExprPtr& expression) {
+    auto scalar = As<ScalarType>(expression->GetType());
+    if (!scalar || scalar->dtype_ != DataType::INDEX) return std::nullopt;
+    if (As<Var>(expression) || As<ConstInt>(expression)) {
+      const auto b = analyzer_(expression);
+      if (b.min_value < 0 || b.max_value >= arith::ConstIntBound::kPosInf) return std::nullopt;
+      return Bound{b.min_value, b.max_value};
+    }
+    ExprPtr left, right;
+    bool multiply = false;
+    if (auto add = As<Add>(expression)) {
+      left = add->left_;
+      right = add->right_;
+    } else if (auto mul = As<Mul>(expression)) {
+      left = mul->left_;
+      right = mul->right_;
+      multiply = true;
+    } else {
+      return std::nullopt;
+    }
+    auto a = Range(left), b = Range(right);
+    if (!a || !b) return std::nullopt;
+    const __int128 lo = multiply ? __int128(a->first) * b->first : __int128(a->first) + b->first;
+    const __int128 hi = multiply ? __int128(a->second) * b->second : __int128(a->second) + b->second;
+    if (hi >= arith::ConstIntBound::kPosInf) return std::nullopt;
+    return Bound{static_cast<int64_t>(lo), static_cast<int64_t>(hi)};
+  }
+  void RecordCall(const CallPtr& call) {
+    if (auto global = As<GlobalVar>(call->op_)) {
+      auto found = functions_.find(global->name_);
+      if (found != functions_.end()) {
+        const auto& params = found->second->params_;
+        auto& callee = evidence_[global->name_];
+        for (size_t i = 0; i < params.size(); ++i) {
+          if (!As<ScalarType>(params[i]->GetType())) continue;
+          auto argument = transform_utils::CallerSuppliedArg(call, found->second, i);
+          auto bound = argument ? Range(argument) : std::nullopt;
+          auto [it, inserted] = callee.emplace(i, bound);
+          if (!inserted) {
+            if (!it->second || !bound) {
+              it->second = std::nullopt;
+            } else {
+              it->second->first = std::min(it->second->first, bound->first);
+              it->second->second = std::max(it->second->second, bound->second);
+            }
+          }
+        }
+      }
+    }
+  }
+
+ public:
+  InvocationBounds(const std::map<std::string, FunctionPtr>& functions,
+                   std::map<std::string, std::map<size_t, std::optional<Bound>>>& evidence,
+                   SyncParameterWork& work)
+      : functions_(functions), evidence_(evidence), work_(work) {}
+  void VisitExpr(const ExprPtr& expression) override {
+    if (expression && visited_.insert(expression.get()).second) {
+      ++work_.expression_visits;
+      IRVisitor::VisitExpr(expression);
+    }
+  }
+
+ protected:
+  void VisitVarLike_(const VarPtr&) override {}
+  void VisitExpr_(const CallPtr& call) override {
+    RecordCall(call);
+    IRVisitor::VisitExpr_(call);
+  }
+  void VisitExpr_(const SubmitPtr& call) override {
+    RecordCall(SubmitToCallView(call));
+    IRVisitor::VisitExpr_(call);
+  }
+  void VisitStmt_(const AssignStmtPtr& statement) override {
+    VisitExpr(statement->value_);
+    if (auto b = Range(statement->value_))
+      analyzer_.Update(statement->var_, {b->first, b->second});
+    else
+      analyzer_.Unbind(statement->var_);
+    Invalidate();
+  }
+  void VisitStmt_(const ForStmtPtr& loop) override {
+    // Calls in bounds and initial values execute outside the iteration domain.
+    // Missing one such site could incorrectly retain a narrower callee range.
+    VisitExpr(loop->start_);
+    VisitExpr(loop->stop_);
+    VisitExpr(loop->step_);
+    for (const auto& argument : loop->iter_args_) VisitExpr(argument->initValue_);
+    auto start = Range(loop->start_), stop = Range(loop->stop_), step = Range(loop->step_);
+    if (start && stop && step && step->first > 0 && stop->second > start->first &&
+        __int128(stop->second) - 1 + step->second < arith::ConstIntBound::kPosInf) {
+      int64_t last = stop->second - 1;
+      if (start->first == start->second && stop->first == stop->second && step->first == step->second)
+        last = start->first + (stop->first - start->first - 1) / step->first * step->first;
+      analyzer_.Update(loop->loop_var_, {start->first, last});
+    } else {
+      analyzer_.Unbind(loop->loop_var_);
+    }
+    // Inclusive hull is deliberately conservative for nonunit strides. Calls
+    // in empty/unknown loops do not manufacture vacuous range certificates.
+    Invalidate();
+    VisitStmt(loop->body_);
+    analyzer_.Unbind(loop->loop_var_);
+    Invalidate();
+  }
+};
 }  // namespace
-CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target) {
+std::map<std::string, SyncParameterBounds> CollectSyncParameterBounds(const ProgramPtr& program,
+                                                                      SyncParameterWork* work) {
+  SyncParameterWork local_work;
+  if (!work) work = &local_work;
+  std::map<std::string, FunctionPtr> functions;
+  for (const auto& [global, function] : program->functions_) functions.emplace(global->name_, function);
+  std::map<std::string, std::map<size_t, std::optional<std::pair<int64_t, int64_t>>>> evidence;
+  for (const auto& [name, function] : functions) {
+    InvocationBounds collector(functions, evidence, *work);
+    collector.VisitFunction(function);
+  }
+  std::map<std::string, SyncParameterBounds> result;
+  for (const auto& [name, params] : evidence)
+    for (const auto& [index, bound] : params)
+      if (bound) result[name].emplace(index, *bound);
+  return result;
+}
+CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target,
+                                  const SyncParameterBounds& parameter_bounds) {
   CHECK(function && (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV))
       << "Synchronization prototype requires one AIC or AIV leaf";
   if (function->func_type_ == FunctionType::AIV) {
@@ -413,7 +707,22 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
   Importer importer;
   importer.result.owner = function;
   importer.result.hardware_target = target;
-  for (const auto& param : function->params_) {
+  importer.result.parameter_bounds = parameter_bounds;
+  for (const auto& [index, range] : parameter_bounds) {
+    CHECK(index < function->params_.size() && As<ScalarType>(function->params_[index]->GetType()))
+        << "Invocation range must identify an original scalar parameter";
+    CHECK(range.first >= 0 && range.second >= range.first &&
+          range.second < std::numeric_limits<int64_t>::max())
+        << "Invalid invocation coordinate range";
+  }
+  for (size_t index = 0; index < function->params_.size(); ++index) {
+    const auto& param = function->params_[index];
+    if (As<ScalarType>(param->GetType())) {
+      RequireIndex(param);
+      CHECK(parameter_bounds.count(index)) << "Invocation coordinate has no established caller range";
+      importer.parameters.emplace(param.get(), index);
+      continue;
+    }
     auto t = As<TensorType>(param->GetType());
     CHECK(t && t->shape_.size() == 2 && t->dtype_.GetBit() % 8 == 0 && !t->tensor_view_)
         << "Synchronization prototype requires unviewed ND tensor arguments";
@@ -424,7 +733,11 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
   }
   for (const auto& stmt : Statements(function->body_)) {
     if (auto a = As<AssignStmt>(stmt)) {
-      importer.Allocate(a);
+      if (As<ScalarType>(a->var_->GetType())) {
+        importer.DefineCoordinate(a, SyncSegment{});
+      } else {
+        importer.Allocate(a);
+      }
       continue;
     }
     if (As<ReturnStmt>(stmt)) continue;

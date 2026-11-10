@@ -66,10 +66,15 @@ def address_set(storage, row, col, rows, cols):
     return points
 
 
-def interpret(function):
+def interpret(function, parameters=None):
+    parameters = parameters or {}
+    environment = {function.params[i].name_hint: value for i, value in parameters.items()}
     storage = {}
     for param in function.params:
         t = param.type
+        if isinstance(t, ir.ScalarType):
+            assert param.name_hint in environment, "missing invocation coordinate"
+            continue
         shape = [integer(x, {}) for x in t.shape]
         storage[param.name_hint] = (param.name_hint, 0, *shape, None, t.dtype.get_byte())
     calls = []
@@ -169,7 +174,10 @@ def interpret(function):
             for s in stmt.stmts:
                 execute(s, env)
         elif isinstance(stmt, ir.AssignStmt):
-            define_storage(stmt, env)
+            if isinstance(stmt.var.type, ir.ScalarType):
+                env[stmt.var.name_hint] = integer(stmt.value, env)
+            else:
+                define_storage(stmt, env)
         elif isinstance(stmt, ir.ForStmt):
             for value in range(integer(stmt.start, env), integer(stmt.stop, env), integer(stmt.step, env)):
                 execute(stmt.body, {**env, stmt.loop_var.name_hint: value})
@@ -185,7 +193,7 @@ def interpret(function):
         else:
             raise AssertionError(f"Unsupported oracle statement {type(stmt)}")
 
-    execute(function.body, {})
+    execute(function.body, environment)
     return storage, calls
 
 
@@ -258,9 +266,22 @@ def hardware_reference(function, calls, target="a2a3"):
     return reference(effects, protected=protected_accumulator_pairs(function, calls, target))
 
 
-def validate(function, analysis, query_all=True):
+def validate(function, analysis, query_all=True, parameters=None):
+    parameters = parameters or {}
     description = analysis.describe()
-    storage, calls = interpret(function)
+    # Translate the compiler's CLAIMED relative footprints for comparison. The
+    # independent interpreter below evaluates original accesses from the IR.
+    for region in description["regions"]:
+        for site in region["sites"]:
+            accesses = []
+            for access in site["accesses"]:
+                aid, write, row, col, dr, dc, rows, cols, after_first = access
+                domain = description["storage"][aid]
+                row += sum(parameters[p] * c for p, c in domain.get("row_parameters", {}).items())
+                col += sum(parameters[p] * c for p, c in domain.get("column_parameters", {}).items())
+                accesses.append((aid, write, row, col, dr, dc, rows, cols, after_first))
+            site["accesses"] = accesses
+    storage, calls = interpret(function, parameters)
     occurrences, effects = check_imported_accesses(description, storage, calls)
     vertices = [(o, c) for o in occurrences for c in (False, True)]
     base = {((o, False), (o, True)) for o in occurrences}
@@ -296,7 +317,7 @@ def validate(function, analysis, query_all=True):
         for a in vertices:
             for b in vertices:
                 assert analysis.precedes(a[0], a[1], b[0], b[1]) == ((a, b) in order), (a, b)
-    checks = validate_boundaries(description, storage, effects, occurrences, analysis)
+    checks = validate_boundaries(description, storage, effects, occurrences, analysis, parameters)
     return {
         "payloads": len(occurrences),
         "covers": len(covers),
@@ -313,7 +334,7 @@ def domain_addresses(domain, storage, row, col, rows, cols):
     return address_set(storage[domain["name"]], row, col, rows, cols)
 
 
-def validate_boundaries(description, storage, effects, occurrences, analysis):
+def validate_boundaries(description, storage, effects, occurrences, analysis, parameters=None):
     # Boundary points include interior/exterior and corners of each extracted
     # rectangle. Point membership is looked up in the independent physical map.
     checks = 0
@@ -349,7 +370,7 @@ def validate_boundaries(description, storage, effects, occurrences, analysis):
                 last = [i for i in readers if not writers or i > writers[-1]]
                 expected["first_readers"][int(pipe)] = occurrences[first[0]] if first else None
                 expected["last_readers"][int(pipe)] = occurrences[last[-1]] if last else None
-            assert analysis.boundary(sid, row, col) == expected
+            assert analysis.boundary(sid, row, col, parameters or {}) == expected
             checks += 1
         assert analysis.boundary(sid, domain["rows"], 0) is None
     return checks
