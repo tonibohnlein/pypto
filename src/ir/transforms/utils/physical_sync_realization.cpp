@@ -144,18 +144,26 @@ class Allocator {
   PhysicalSyncRealization Run() {
     for (const auto& [direction, ids] : claimed_)
       for (int id : ids) result_.native_reserved_ids.emplace_back(direction.first, direction.second, id);
+    const auto crossings = a_.ExportCrossingDemands();
+    CHECK(crossings.has_value())
+        << "Minimum demands are retained; shared-repetition physical endpoint scope is unavailable";
     for (size_t r = 0; r < a_.segments.size(); ++r) {
       const auto& segment = a_.segments[r];
       for (const auto& f : segment.demands) {
-        CHECK(f.distance == 0 || f.distance == 1) << "Unavailable physical displacement";
+        CHECK(f.distance >= 0 && f.source < segment.pipes.size() && f.target < segment.pipes.size())
+            << "Invalid physical demand family";
         if (segment.count <= f.distance) continue;
         result_.families.push_back({r, f.source, r, f.target, 0, f.distance, segment.count - f.distance, {}});
       }
     }
-    for (const auto& [source, target] : a_.crossing_demands) {
+    for (const auto& [source, target] : *crossings) {
       auto [sr, sv, ss] = source;
       auto [tr, tv, ts] = target;
-      CHECK(sr < tr && sv == a_.segments[sr].count - 1 && tv == 0) << "Unavailable physical crossing frame";
+      CHECK(sr < a_.segments.size() && tr < a_.segments.size() && sr < tr)
+          << "Unavailable physical crossing frame";
+      CHECK(sv >= 0 && sv < a_.segments[sr].count && tv >= 0 && tv < a_.segments[tr].count &&
+            ss < a_.segments[sr].pipes.size() && ts < a_.segments[tr].pipes.size())
+          << "Invalid physical crossing occurrence";
       result_.families.push_back({sr, ss, tr, ts, sv, tv, 1, {}});
     }
     QualifyBarriers();
@@ -168,14 +176,17 @@ class Allocator {
       if (f.count > 1) {
         result_.finite_minimum = false;
         const auto& segment = a_.segments[f.source_region];
-        INTERNAL_CHECK(f.source_region == f.target_region && !segment.distance.empty())
+        INTERNAL_CHECK(f.source_region == f.target_region)
             << "Internal error: repeated family without a periodic owner";
-        const auto distance = segment.distance[2 * f.target_site + 1][2 * f.source_site];
+        const auto distance = segment.Threshold(f.target_site, true, f.source_site, false);
         // Canonical direct placement associates WAIT(h)->SET(g) with
-        // C_consumer(h)->I_source(g). Native wrap padding makes this distance
-        // uniform for every valid visit. Unique lanes cover shorter prefixes.
-        if (distance >= 0) {
-          const __int128 period = __int128(f.target_first) - f.source_first + distance;
+        // C_consumer(h)->I_source(g). Reference-forward witnesses between valid
+        // endpoints stay inside the finite prefix. Clip before adding a wide
+        // threshold, so huge reachable distances never overflow or mean absence.
+        const int64_t displacement = f.target_first - f.source_first;
+        INTERNAL_CHECK(displacement >= 0) << "Negative direct-family displacement";
+        if (distance && *distance < f.count && displacement < f.count) {
+          const __int128 period = __int128(displacement) + *distance;
           width = static_cast<int64_t>(std::min<__int128>(f.count, std::max<__int128>(1, period)));
         }
       }

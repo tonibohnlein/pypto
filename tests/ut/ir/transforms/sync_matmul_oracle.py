@@ -13,7 +13,7 @@ Uses no compiler cells, storage generators, rank rows or quotient distances.
 It shares the declared instruction/layout model, not native qualification.
 """
 
-from itertools import combinations
+from itertools import combinations, product
 from typing import Any
 
 from pypto import ir
@@ -44,6 +44,8 @@ def integer(expr, env):
         return integer(expr.left, env) + integer(expr.right, env)
     if isinstance(expr, ir.Mul):
         return integer(expr.left, env) * integer(expr.right, env)
+    if isinstance(expr, ir.FloorMod):
+        return integer(expr.left, env) % integer(expr.right, env)
     if isinstance(expr, ir.Eq):
         return integer(expr.left, env) == integer(expr.right, env)
     raise AssertionError(f"Oracle does not interpret {type(expr)}")
@@ -80,6 +82,40 @@ def address_set(storage, row, col, rows, cols):
     return points
 
 
+def define_slot_storage(stmt, env, storage):
+    """Interpret original allocation and selection before any compiler normalization."""
+    name, t = stmt.value.op.name, stmt.var.type
+    if name == ir.get_op("buffer.alloc_multi").name:
+        assert isinstance(t, ir.MultiBufferType)
+        element = t.element_type
+        storage[stmt.var.name_hint] = (
+            element.memory_space,
+            integer(stmt.value.args[1], env),
+            *element.shape,
+            element,
+            element.dtype.get_byte(),
+        )
+        return True
+    if name == ir.get_op("buffer.slot").name:
+        parent, selector = stmt.value.args
+        assert isinstance(parent.type, ir.MultiBufferType)
+        slot = integer(selector, env)
+        assert 0 <= slot < parent.type.slot_count
+        space, base, height, width, layout, scalar_bytes = storage[parent.name_hint]
+        # Admitted whole-slot fixtures have no physical padding. Derive
+        # the pitch from original IR, never from the compiler's slot map.
+        storage[stmt.var.name_hint] = (
+            space,
+            base + slot * height * width * scalar_bytes,
+            height,
+            width,
+            layout,
+            scalar_bytes,
+        )
+        return True
+    return False
+
+
 def interpret(function, parameters=None):
     parameters = parameters or {}
     environment = {function.params[i].name_hint: value for i, value in parameters.items()}
@@ -101,6 +137,8 @@ def interpret(function, parameters=None):
         assert isinstance(stmt.value, ir.Call)
         name = stmt.value.op.name
         t = stmt.var.type
+        if define_slot_storage(stmt, env, storage):
+            return
         if name in {ir.get_op("buffer.subview").name, ir.get_op("buffer.reshape").name}:
             source_arg = stmt.value.args[0]
             assert isinstance(source_arg, ir.Var)
@@ -280,9 +318,31 @@ def hardware_reference(function, calls, target="a2a3"):
     return reference(effects, protected=protected_accumulator_pairs(function, calls, target))
 
 
+def validate_slot_descriptors(function, description):
+    """Check even untouched slots against original uniform allocation declarations."""
+    groups = {}
+
+    class Groups(ir.IRVisitor):
+        def visit_assign_stmt(self, stmt):
+            if isinstance(stmt.var.type, ir.MultiBufferType):
+                groups[stmt.var.name_hint] = stmt.var.type
+            super().visit_assign_stmt(stmt)
+
+    Groups().visit_function(function)
+    for domain in description["storage"]:
+        if domain["name"] in groups:
+            group = groups[domain["name"]]
+            element = group.element_type
+            pitch = element.shape[0] * element.shape[1] * element.dtype.get_byte()
+            assert domain["slot_count"] == group.slot_count
+            assert domain["slot_bytes"] == pitch
+            assert domain["bytes"] == pitch * group.slot_count
+
+
 def validate(function, analysis, query_all=True, parameters=None):
     parameters = parameters or {}
     description = analysis.describe()
+    validate_slot_descriptors(function, description)
     # Translate the compiler's CLAIMED relative footprints for comparison. The
     # independent interpreter below evaluates original accesses from the IR.
     for region in description["regions"]:
@@ -320,11 +380,14 @@ def validate(function, analysis, query_all=True, parameters=None):
         for a, b in order - base
         if not any((a, v) in order and (v, b) in order for v in vertices)
     }
-    selected = set(description["crossing_demands"])
-    for r, region in enumerate(description["regions"]):
-        for source, target, distance in region["demands"]:
-            for visit in range(region["count"] - distance):
-                selected.add(((r, visit, source), (r, visit + distance, target)))
+    if description.get("hierarchical"):
+        selected = set(analysis.expand_retained_demands(len(calls)))
+    else:
+        selected = set(description["crossing_demands"])
+        for r, region in enumerate(description["regions"]):
+            for source, target, distance in region["demands"]:
+                for visit in range(region["count"] - distance):
+                    selected.add(((r, visit, source), (r, visit + distance, target)))
     assert selected == covers, ("covers", selected - covers, covers - selected)
     assert closure(vertices, base | {((a, True), (b, False)) for a, b in selected}) == order
     if query_all:
@@ -341,11 +404,13 @@ def validate(function, analysis, query_all=True, parameters=None):
     }
 
 
-def domain_addresses(domain, storage, row, col, rows, cols):
+def domain_addresses(domain, storage, row, col, rows, cols, slot=0):
     if domain.get("byte_coordinates", False):
         assert row == 0 and rows == 1
         return {(domain["space"], byte) for byte in range(col, col + cols)}
-    return address_set(storage[domain["name"]], row, col, rows, cols)
+    descriptor = list(storage[domain["name"]])
+    descriptor[1] += slot * domain.get("slot_bytes", 0)
+    return address_set(descriptor, row, col, rows, cols)
 
 
 def validate_boundaries(description, storage, effects, occurrences, analysis, parameters=None):
@@ -365,14 +430,14 @@ def validate_boundaries(description, storage, effects, occurrences, analysis, pa
                                     (row + i * dr + rows - 1, col + i * dc + cols - 1),
                                 }
                             )
-        for row, col in points:
+        for slot, (row, col) in product(range(domain.get("slot_count", 1)), points):
             if domain.get("row_extent_parameter") is not None:
                 actual_rows = storage[domain["name"]][2]
                 if row >= actual_rows:
                     assert analysis.boundary(sid, row, col, parameters or {}) is None
                     checks += 1
                     continue
-            point = domain_addresses(domain, storage, row, col, 1, 1)
+            point = domain_addresses(domain, storage, row, col, 1, 1, slot)
             writers = [i for i, (_, _, w) in enumerate(effects) if not w.isdisjoint(point)]
             expected: dict[str, Any] = {
                 "first_writer": occurrences[writers[0]] if writers else None,
@@ -390,7 +455,10 @@ def validate_boundaries(description, storage, effects, occurrences, analysis, pa
                 last = [i for i in readers if not writers or i > writers[-1]]
                 expected["first_readers"][int(pipe)] = occurrences[first[0]] if first else None
                 expected["last_readers"][int(pipe)] = occurrences[last[-1]] if last else None
-            assert analysis.boundary(sid, row, col, parameters or {}) == expected
+            if domain.get("slot_bytes", 0):
+                assert analysis.boundary_slot(sid, slot, row, col, parameters or {}) == expected
+            else:
+                assert analysis.boundary(sid, row, col, parameters or {}) == expected
             checks += 1
         assert analysis.boundary(sid, domain["rows"], 0) is None
     return checks
@@ -422,12 +490,19 @@ def check_imported_accesses(description, storage, calls):
         occurrences.append((r, visit, s))
         effects.append((pipe, reads, writes))
         modeled = [set(), set()]
-        for sid, write, row, col, dr, dc, rows, cols, after_first in region["sites"][s]["accesses"]:
+        local_visit = visit % region["reset_period"] if region.get("reset_period") else visit
+        site = region["sites"][s]
+        selections = site.get("slot_selections", [(0, 0)] * len(site["accesses"]))
+        for access, selection in zip(site["accesses"], selections, strict=True):
+            sid, write, row, col, dr, dc, rows, cols, after_first = access
             if after_first and visit == 0:
                 continue
             domain = description["storage"][sid]
+            slot = (selection[0] + local_visit * selection[1]) % domain.get("slot_count", 1)
             modeled[write].update(
-                domain_addresses(domain, storage, row + visit * dr, col + visit * dc, rows, cols)
+                domain_addresses(
+                    domain, storage, row + local_visit * dr, col + local_visit * dc, rows, cols, slot
+                )
             )
         assert modeled == [reads, writes], (r, visit, s, "access mismatch")
     return occurrences, effects

@@ -196,6 +196,18 @@ class CompactSyncAnalysis:
         """Return retained geometry, occurrence mapping, families and work counts."""
         ...
 
+    def expand_retained_demands(
+        self, max_payloads: int
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        """Audit actual retained records within an explicit payload budget; no new analysis."""
+        ...
+
+    def export_crossing_demands(
+        self,
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]] | None:
+        """Return original-coordinate flat crossings, or unavailable for unsupported shared uses."""
+        ...
+
     def realize(self) -> LogicalSyncRealization:
         """Insert logical record/wait commands from this retained result."""
         ...
@@ -225,6 +237,12 @@ class CompactSyncAnalysis:
         """Return modeled point selectors; None is unavailable, not absence."""
         ...
 
+    def boundary_slot(
+        self, storage: int, slot: int, row: int, column: int, parameters: dict[int, int] = {}
+    ) -> dict[str, Any] | None:
+        """Query an explicit physical slot; unavailable differs from proven absence."""
+        ...
+
 def sync_parameter_bounds_profile(program: Program) -> dict[str, Any]:
     """Inspect proved ranges and expression/range visits per binding environment."""
     ...
@@ -238,6 +256,16 @@ def analyze_placed_sync(
     disjoint_gm: bool,
     target: str = "a2a3",
     parameter_bounds: dict[int, tuple[int, int]] = {},
+    composition_order: str = "balanced",
 ) -> CompactSyncAnalysis:
     """Analyze placed Buffer IR with explicit GM aliases and a named hardware contract."""
+    ...
+
+def describe_placed_sync_input(
+    function: Function,
+    disjoint_gm: bool,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+) -> dict:
+    """Inspect qualified physical accesses without constructing demands or exports."""
     ...

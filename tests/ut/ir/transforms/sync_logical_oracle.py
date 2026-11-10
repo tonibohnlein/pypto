@@ -89,15 +89,21 @@ class CommandExecution:
         self.records, self.waits, self.matched = [], [], set()
         self.payload_count = self.branches = self.same_pipe_waits = 0
         self.actual_allocations = []
+        self.actual_slots = []
 
     def assign(self, stmt, env):
         call = stmt.value
         if isinstance(call, ir.Call) and call.op.name in {
             ir.get_op("buffer.alloc").name,
+            ir.get_op("buffer.alloc_multi").name,
             ir.get_op("buffer.subview").name,
             ir.get_op("buffer.reshape").name,
         }:
             self.actual_allocations.append(stmt)
+        elif isinstance(call, ir.Call) and call.op.name == ir.get_op("buffer.slot").name:
+            # Selection has no payload effect. Preserve both its original IR
+            # and the selected dynamic slot across inserted command guards.
+            self.actual_slots.append((stmt, value(call.args[1], env)))
         elif isinstance(call, ir.Call) and call.op.name == ir.get_op("sync.record").name:
             pipe = ir.PipeType(call.kwargs["pipe"])
             assert pipe in self.latest_payload, "record has no source payload"
