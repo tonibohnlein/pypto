@@ -172,11 +172,19 @@ contract; integration of that API does not silently admit its padding as data.
 
 ## Ready invocation coordinates
 
-The pass gathers bounded INDEX coordinates from the compiled program's direct
+The pass gathers bounded integer coordinates from the compiled program's direct
 Call/Submit sites before analyzing kernels. It joins all sites, preserves original
 formal positions, and leaves unknown bounds unproved. The importer admits a common
 parameter translation of each GM domain with checked arithmetic and allocation
 bounds; numerical analysis is retained without specializing to one tile offset.
 Storage queries require the corresponding original coordinate bindings.
 See the [parameterized prefill contract and checkpoint](../ir/16-parameterized-prefill-checkpoint.md).
-Nested Qwen composition and dynamic GM extent qualification remain outstanding.
+Explicit bounded INDEX formals may name a dynamic leading GM extent; accesses
+must fit its smallest admitted size and selectors require its actual value.
+Original-width arithmetic and casts need nonnegative, value-preserving proofs.
+
+Perfect constant loop nests with invariant effects retain their original frames
+and use a checked mixed-radix occurrence ordinal for physical commands. This
+specialization does not cover moving inner slices or accumulator-reset branches.
+General nested Qwen composition and its implicit allocation/range relationship
+remain outstanding; nested logical-token export remains explicitly unavailable.

@@ -21,11 +21,25 @@ from pypto import ir
 from .test_finite_sync_analysis import PIPES, closure, reference
 
 
+def cast_integer(value, dtype):
+    """Machine-value cast, independently of compiler range evidence."""
+    if dtype == ir.DataType.INDEX:
+        bits, signed = 64, True
+    else:
+        assert dtype.is_signed_int() or dtype.is_unsigned_int()
+        bits, signed = dtype.get_bit(), dtype.is_signed_int()
+    result = value % (1 << bits)
+    return result - (1 << bits) if signed and result >= (1 << (bits - 1)) else result
+
+
 def integer(expr, env):
     if isinstance(expr, ir.ConstInt):
         return expr.value
     if isinstance(expr, ir.Var):
         return env[expr.name_hint]
+    if isinstance(expr, ir.Cast):
+        assert isinstance(expr.type, ir.ScalarType)
+        return cast_integer(integer(expr.operand, env), expr.type.dtype)
     if isinstance(expr, ir.Add):
         return integer(expr.left, env) + integer(expr.right, env)
     if isinstance(expr, ir.Mul):
@@ -75,7 +89,7 @@ def interpret(function, parameters=None):
         if isinstance(t, ir.ScalarType):
             assert param.name_hint in environment, "missing invocation coordinate"
             continue
-        shape = [integer(x, {}) for x in t.shape]
+        shape = [integer(x, environment) for x in t.shape]
         storage[param.name_hint] = (param.name_hint, 0, *shape, None, t.dtype.get_byte())
     calls = []
 
@@ -352,6 +366,12 @@ def validate_boundaries(description, storage, effects, occurrences, analysis, pa
                                 }
                             )
         for row, col in points:
+            if domain.get("row_extent_parameter") is not None:
+                actual_rows = storage[domain["name"]][2]
+                if row >= actual_rows:
+                    assert analysis.boundary(sid, row, col, parameters or {}) is None
+                    checks += 1
+                    continue
             point = domain_addresses(domain, storage, row, col, 1, 1)
             writers = [i for i, (_, _, w) in enumerate(effects) if not w.isdisjoint(point)]
             expected: dict[str, Any] = {
@@ -393,6 +413,12 @@ def check_imported_accesses(description, storage, calls):
             if loop is None
             else (env[loop.loop_var.name_hint] - integer(loop.start, {})) // integer(loop.step, {})
         )
+        if region.get("nested_frames"):
+            visit = 0
+            for frame, count, start, step in region["nested_frames"]:
+                digit = (env[frame.loop_var.name_hint] - start) // step
+                assert 0 <= digit < count
+                visit = visit * count + digit
         occurrences.append((r, visit, s))
         effects.append((pipe, reads, writes))
         modeled = [set(), set()]

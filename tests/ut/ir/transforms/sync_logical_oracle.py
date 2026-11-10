@@ -19,7 +19,7 @@ from typing import Any
 
 from pypto import ir
 
-from .sync_matmul_oracle import hardware_reference, interpret
+from .sync_matmul_oracle import cast_integer, hardware_reference, interpret
 from .test_finite_sync_analysis import closure
 
 
@@ -33,6 +33,9 @@ class Token:
 def value(expr, env):
     if isinstance(expr, (ir.ConstInt, ir.ConstBool)):
         return expr.value
+    if isinstance(expr, ir.Cast):
+        assert isinstance(expr.type, ir.ScalarType)
+        return cast_integer(value(expr.operand, env), expr.type.dtype)
     if isinstance(expr, ir.Var):
         assert expr in env, f"unbound value: {expr.name_hint}"
         return env[expr]

@@ -32,6 +32,7 @@ class SyncPlacement : public IRMutator {
     for (size_t r = 0; r < analysis.input.segments.size(); ++r) {
       const auto& segment = analysis.input.segments[r];
       if (segment.original_loop) loops_.emplace(segment.original_loop.get(), r);
+      for (const auto& frame : segment.nested_frames) loops_.emplace(frame.loop.get(), r);
       for (size_t s = 0; s < segment.sites.size(); ++s) {
         const auto& site = segment.sites[s];
         CHECK(anchors_.emplace(site.original.get(), SyncSiteKey{r, s}).second)

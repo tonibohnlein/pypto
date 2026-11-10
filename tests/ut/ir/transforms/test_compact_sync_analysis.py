@@ -110,7 +110,7 @@ def test_unavailable_is_not_absence():
             )
             return ir.ForStmt(op.loop_var, op.start, op.stop, op.step, [], inner, [], op.span)
 
-    with pytest.raises(ValueError, match="Nested or data-dependent"):
+    with pytest.raises(ValueError, match="Unavailable affine synchronization access"):
         testing.analyze_placed_sync(Nested().visit_function(staged_fixture(2)), True)
 
 
@@ -127,7 +127,7 @@ def test_refuses_unqualified_affine_intermediates(overflow):
                 )
             return ir.Mul(op.left, op.right, ir.DataType.INT32, op.span)
 
-    expected = "nonoverflowing" if overflow else "entirely INDEX"
+    expected = "nonoverflowing" if overflow else "matching operand types and explicit casts"
     with pytest.raises(ValueError, match=expected):
         testing.analyze_placed_sync(UnsupportedArithmetic().visit_function(staged_fixture(3)), True)
 

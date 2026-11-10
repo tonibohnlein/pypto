@@ -174,7 +174,7 @@ def test_refuse_inconsistent_domain_translation():
 
         def visit_call(self, op):
             call = op
-            if call.op.name != "buffer.load" or self.changed:
+            if call.op.name != ir.get_op("buffer.load").name or self.changed:
                 return call
             self.changed = True
             args = list(call.args)

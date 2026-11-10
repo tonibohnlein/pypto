@@ -1,6 +1,6 @@
 # Parameterized prefill checkpoint
 
-This checkpoint implements ready invocation-invariant coordinates for the existing
+The original checkpoint below implements ready invocation-invariant coordinates for the existing
 finite/periodic synchronization provider. **Nested Qwen output projection and
 gate/up composition are not implemented by this change.** It neither expands
 whole nests nor introduces another analysis or allocation backend.
@@ -195,3 +195,111 @@ rotating-view refusal diagnostic. It includes finite, compact, logical, physical
 Vec, row and indexed regressions as well as the new parameterized cases. The
 change preserves the opt-in switch, allocator, hardware exemptions and original
 fallback bodies. The larger nested-prefill milestone remains open.
+
+## Range and numerical-repetition follow-up (2026-11-10)
+
+The reviewed Buffer ABI increment is committed as `b97b6fd0`. Its separate
+928-test gate and three specialist reviews passed. Buffer selection and direct
+code generation now preserve symbolic leading GM extents; that infrastructure
+does not itself establish an access range. The earlier checkpoint and receipt
+above retain their historical scope. This follow-up extends the same importer,
+owner and physical emitter, without changing reduction or allocation algorithms.
+
+### Original-width range evidence
+
+The caller collector and coordinate DAG now admit nonnegative bounded integer
+arithmetic and explicit value-preserving casts, checking every intermediate in
+its original type. A widening cast cannot hide an earlier overflow. Narrowing
+requires the entire source interval to fit; a multiply-by-zero does not suppress
+qualification of its operands. Binary operands and results must have matching
+types unless an explicit cast intervenes. Loop updates must also fit the original
+induction type. Unknown, negative, overflowing and unsupported expressions still
+provide no evidence. This reuses the existing bound environment and call mapping.
+
+A dynamic leading GM extent is admitted only when its original shape variable is
+also an explicit INDEX formal with established bounds. This is the existing typed
+Tensor ABI relation, not a correlation inferred from parameter names or samples.
+The largest admitted extent bounds retained geometry; every access must fit the
+**smallest** admitted extent. This sufficient test deliberately does not prove
+relational bounds such as `offset + size <= rows` when independent interval hulls
+are insufficient. A storage query needs the actual, in-range extent and must lie
+inside that invocation's allocation. Outside the allocation is unavailable;
+inside it, untouched storage has an exact absence answer. Local queries remain
+available without unrelated GM bindings.
+
+The new independent cases cover original INT32-to-INDEX coordinates, safe and
+lossy narrowing, signed/unsigned loop increments, hidden overflow, invalid or
+missing extent bindings, and actual caller-derived production selection. Original
+address expressions and physical commands are checked together. Dynamic loop
+trip counts, implicit shape symbols and forwarded relational caller facts remain
+unproved. In particular, Qwen's implicit weight extent and INT32 layer offset are
+not qualified merely because the new generic fixture is.
+
+### Invariant perfect nests
+
+A perfect nest of constant sequential loops may reuse one finite body when its
+modeled access descriptions are invariant under every enclosing counter and it
+has no conditional initialization/reset. No loop has carried results. All
+original frames, starts, steps and counts are retained. A visit with normalized
+coordinates `(i_0, ..., i_d)` maps to the checked mixed-radix ordinal
+`(...((i_0 * T_1 + i_1) * T_2 + i_2)... * T_d + i_d)`.
+This is a bijection preserving reference order. Identical effects, pipes and
+prerequisites therefore give the same native and storage graph as the existing
+repeated-body representation, including crossings at inner-counter resets.
+Every product and original induction update is checked for signed-64-bit safety.
+Zero counts produce no occurrences and preserve the original empty control flow.
+
+The physical emitter computes this ordinal from the original in-scope variables;
+it keeps the original loops and payload cuts. Global first/last guards and reuse
+residues consequently do not restart at each inner loop. Existing allocation
+checks remain authoritative. This does not assert that a child exit completes
+payloads. The separate logical-token export refuses nested transport until tokens
+can be carried through every enclosing frame; it does not discard mathematics
+or block the independently qualified physical export.
+
+This is an invariant perfect-nest specialization, **not general nested regional
+composition**. Moving inner slices, outer-coordinate accesses, reset branches,
+non-perfect bodies and unavailable same-DMA-pipe barriers remain explicit
+obligations. A negative fixture retains correct mathematics after physical export
+refusal. Neither hardware exemptions nor barrier placement are weakened.
+
+At fixed depth the tested site, cell, demand, distance-table and static-command
+cardinalities stay constant as either trip count grows, through `10^6 * 10^6`
+leaf visits. Original frames and emitted ordinal arithmetic grow with depth;
+numeric coordinates need logarithmic bits and are bounded here by signed 64-bit
+arithmetic. Bounded tests include zero, singleton, repeated and three-level
+visits, nonzero starts, nonunit steps, parent accesses and repeated nests.
+They independently check accesses, actual retained covers, all event queries,
+selectors, matching, acyclicity and causal flag reuse. Source generation goes
+through PTOAS v0.72; there is no new device qualification.
+
+### Relationship to the current draft
+
+The read snapshot is draft revision `ad6c7ac5` plus working changes;
+`minimum_demands.tex` SHA-256 is
+`5e890a89ae29279a2578ec3b6ae7b05de9184ed0063404ce00e30602c6b8cb6e`.
+
+| Draft construction | Implementation at this checkpoint | Remaining obligation |
+| ------------------ | --------------------------------- | -------------------- |
+| Section 5.2 finite demands | Existing numerical reducer remains shared | Broader guarded input contracts |
+| Section 5.4 practical compact classes | Caller-range premises and existing bounded representative-body reduction | Resident slices, phase-dependent effects and richer access certificates |
+| Section 5.5 composition/repetition | Existing sequential crossings plus invariant perfect-nest occurrence normalization | General retained-child summaries, moving selectors and accumulator resets |
+| Direct realization and finite-ID reuse | Existing physical construction with original-frame ordinal translation | Nested logical-token transport; native invocation completion |
+
+The general shared numerical interface theorem and streamed/resident-child
+constructions are **not** implemented by multiplying trip counts. Those remain
+the next step for Qwen output projection, followed by gate/up. Section 6's token
+research is outside this change.
+
+The [follow-up receipt](range-nested-followup.json) records source and tool hashes,
+synthetic cases, bounded independent checks and a reanalysis of the existing Qwen
+Buffer capture. It does not replace that capture with a specialized input.
+Reproduce the focused checks with the same build and environment above:
+
+```bash
+/usr/bin/python3 -m pytest tests/ut/ir/transforms/test_sync_range_proofs.py \
+  tests/ut/ir/transforms/test_nested_sync_repetition.py -q --require-ptoas
+/usr/bin/python3 -m tests.ut.ir.transforms.qualify_sync_range_nested \
+  --output build-py314/range-nested-followup --native-source \
+  --qwen-capture build-py314/qwen-buffer-next/program.msgpack
+```

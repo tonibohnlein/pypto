@@ -48,6 +48,10 @@ struct SyncStorage {
   // Common invocation-invariant translation of EVERY access in this domain.
   // Analysis uses relative coordinates; exports must bind these original params.
   SyncTranslation row_parameters, column_parameters;
+  // Original explicit INDEX formal naming a dynamic leading allocation extent.
+  // rows retains its proved upper bound; accesses must fit its lower bound.
+  // Boundary queries require the actual extent binding, never a sampled size.
+  std::optional<size_t> row_extent_parameter;
 };
 struct SyncAccess {
   size_t storage;
@@ -65,10 +69,19 @@ struct SyncSite {
   std::optional<size_t> protected_accumulator;
   bool initializes_accumulator = false;
 };
+struct SyncLoopFrame {
+  ForStmtPtr loop;
+  int64_t count, start, step;
+};
 struct SyncSegment {
   ForStmtPtr original_loop;
   int64_t count = 1, start = 0, step = 1;
   std::vector<SyncSite> sites;
+  // Perfect numerical repetition only: invariant physical effects, no reset
+  // branch. Frames are outermost first; a checked mixed-radix ordinal is an
+  // exact occurrence bijection, not an unfolding or a new storage abstraction.
+  // Empty for the original single-loop representation.
+  std::vector<SyncLoopFrame> nested_frames;
 };
 struct CompactSyncInput {
   FunctionPtr owner;
