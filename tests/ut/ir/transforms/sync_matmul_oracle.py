@@ -21,11 +21,25 @@ from pypto import ir
 from .test_finite_sync_analysis import PIPES, closure, reference
 
 
+def cast_integer(value, dtype):
+    """Machine-value cast, independently of compiler range evidence."""
+    if dtype == ir.DataType.INDEX:
+        bits, signed = 64, True
+    else:
+        assert dtype.is_signed_int() or dtype.is_unsigned_int()
+        bits, signed = dtype.get_bit(), dtype.is_signed_int()
+    result = value % (1 << bits)
+    return result - (1 << bits) if signed and result >= (1 << (bits - 1)) else result
+
+
 def integer(expr, env):
     if isinstance(expr, ir.ConstInt):
         return expr.value
     if isinstance(expr, ir.Var):
         return env[expr.name_hint]
+    if isinstance(expr, ir.Cast):
+        assert isinstance(expr.type, ir.ScalarType)
+        return cast_integer(integer(expr.operand, env), expr.type.dtype)
     if isinstance(expr, ir.Add):
         return integer(expr.left, env) + integer(expr.right, env)
     if isinstance(expr, ir.Mul):
@@ -66,11 +80,16 @@ def address_set(storage, row, col, rows, cols):
     return points
 
 
-def interpret(function):
+def interpret(function, parameters=None):
+    parameters = parameters or {}
+    environment = {function.params[i].name_hint: value for i, value in parameters.items()}
     storage = {}
     for param in function.params:
         t = param.type
-        shape = [integer(x, {}) for x in t.shape]
+        if isinstance(t, ir.ScalarType):
+            assert param.name_hint in environment, "missing invocation coordinate"
+            continue
+        shape = [integer(x, environment) for x in t.shape]
         storage[param.name_hint] = (param.name_hint, 0, *shape, None, t.dtype.get_byte())
     calls = []
 
@@ -169,7 +188,10 @@ def interpret(function):
             for s in stmt.stmts:
                 execute(s, env)
         elif isinstance(stmt, ir.AssignStmt):
-            define_storage(stmt, env)
+            if isinstance(stmt.var.type, ir.ScalarType):
+                env[stmt.var.name_hint] = integer(stmt.value, env)
+            else:
+                define_storage(stmt, env)
         elif isinstance(stmt, ir.ForStmt):
             for value in range(integer(stmt.start, env), integer(stmt.stop, env), integer(stmt.step, env)):
                 execute(stmt.body, {**env, stmt.loop_var.name_hint: value})
@@ -185,7 +207,7 @@ def interpret(function):
         else:
             raise AssertionError(f"Unsupported oracle statement {type(stmt)}")
 
-    execute(function.body, {})
+    execute(function.body, environment)
     return storage, calls
 
 
@@ -258,9 +280,22 @@ def hardware_reference(function, calls, target="a2a3"):
     return reference(effects, protected=protected_accumulator_pairs(function, calls, target))
 
 
-def validate(function, analysis, query_all=True):
+def validate(function, analysis, query_all=True, parameters=None):
+    parameters = parameters or {}
     description = analysis.describe()
-    storage, calls = interpret(function)
+    # Translate the compiler's CLAIMED relative footprints for comparison. The
+    # independent interpreter below evaluates original accesses from the IR.
+    for region in description["regions"]:
+        for site in region["sites"]:
+            accesses = []
+            for access in site["accesses"]:
+                aid, write, row, col, dr, dc, rows, cols, after_first = access
+                domain = description["storage"][aid]
+                row += sum(parameters[p] * c for p, c in domain.get("row_parameters", {}).items())
+                col += sum(parameters[p] * c for p, c in domain.get("column_parameters", {}).items())
+                accesses.append((aid, write, row, col, dr, dc, rows, cols, after_first))
+            site["accesses"] = accesses
+    storage, calls = interpret(function, parameters)
     occurrences, effects = check_imported_accesses(description, storage, calls)
     vertices = [(o, c) for o in occurrences for c in (False, True)]
     base = {((o, False), (o, True)) for o in occurrences}
@@ -296,7 +331,7 @@ def validate(function, analysis, query_all=True):
         for a in vertices:
             for b in vertices:
                 assert analysis.precedes(a[0], a[1], b[0], b[1]) == ((a, b) in order), (a, b)
-    checks = validate_boundaries(description, storage, effects, occurrences, analysis)
+    checks = validate_boundaries(description, storage, effects, occurrences, analysis, parameters)
     return {
         "payloads": len(occurrences),
         "covers": len(covers),
@@ -313,7 +348,7 @@ def domain_addresses(domain, storage, row, col, rows, cols):
     return address_set(storage[domain["name"]], row, col, rows, cols)
 
 
-def validate_boundaries(description, storage, effects, occurrences, analysis):
+def validate_boundaries(description, storage, effects, occurrences, analysis, parameters=None):
     # Boundary points include interior/exterior and corners of each extracted
     # rectangle. Point membership is looked up in the independent physical map.
     checks = 0
@@ -331,6 +366,12 @@ def validate_boundaries(description, storage, effects, occurrences, analysis):
                                 }
                             )
         for row, col in points:
+            if domain.get("row_extent_parameter") is not None:
+                actual_rows = storage[domain["name"]][2]
+                if row >= actual_rows:
+                    assert analysis.boundary(sid, row, col, parameters or {}) is None
+                    checks += 1
+                    continue
             point = domain_addresses(domain, storage, row, col, 1, 1)
             writers = [i for i, (_, _, w) in enumerate(effects) if not w.isdisjoint(point)]
             expected: dict[str, Any] = {
@@ -349,7 +390,7 @@ def validate_boundaries(description, storage, effects, occurrences, analysis):
                 last = [i for i in readers if not writers or i > writers[-1]]
                 expected["first_readers"][int(pipe)] = occurrences[first[0]] if first else None
                 expected["last_readers"][int(pipe)] = occurrences[last[-1]] if last else None
-            assert analysis.boundary(sid, row, col) == expected
+            assert analysis.boundary(sid, row, col, parameters or {}) == expected
             checks += 1
         assert analysis.boundary(sid, domain["rows"], 0) is None
     return checks
@@ -372,6 +413,12 @@ def check_imported_accesses(description, storage, calls):
             if loop is None
             else (env[loop.loop_var.name_hint] - integer(loop.start, {})) // integer(loop.step, {})
         )
+        if region.get("nested_frames"):
+            visit = 0
+            for frame, count, start, step in region["nested_frames"]:
+                digit = (env[frame.loop_var.name_hint] - start) // step
+                assert 0 <= digit < count
+                visit = visit * count + digit
         occurrences.append((r, visit, s))
         effects.append((pipe, reads, writes))
         modeled = [set(), set()]

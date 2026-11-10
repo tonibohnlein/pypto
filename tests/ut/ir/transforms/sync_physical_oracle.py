@@ -92,8 +92,9 @@ class PhysicalExecution(CommandExecution):
         return super().execute(stmt, env)
 
 
-def run_physical(original, emitted, eligible=range(8)):
-    _, calls = interpret(original)
+def run_physical(original, emitted, eligible=range(8), parameters=None):
+    parameters = parameters or {}
+    _, calls = interpret(original, parameters)
     ref = hardware_reference(original, calls)
     state = PhysicalExecution(calls, ref[0], eligible)
 
@@ -105,7 +106,7 @@ def run_physical(original, emitted, eligible=range(8)):
                 assert call.kwargs["core_type"] == expected, "flag has the wrong owning core"
 
     CoreOwnership().visit_function(emitted)
-    state.execute(emitted.body, {})
+    state.execute(emitted.body, {original.params[i]: value for i, value in parameters.items()})
     assert state.payload_count == len(calls), "missing payload"
     assert not state.live, "outstanding notifications at invocation exit"
     assert not any(state.pending.values()), "wait has no payload consumer"
@@ -113,7 +114,8 @@ def run_physical(original, emitted, eligible=range(8)):
 
     class Allocations(ir.IRVisitor):
         def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
-            allocations.append(op)
+            if isinstance(op.var.type, ir.BufferType):
+                allocations.append(op)
 
     Allocations().visit_function(original)
     assert len(allocations) == len(state.actual_allocations)

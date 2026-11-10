@@ -138,7 +138,7 @@ class BufferKernelSupport : public IRVisitor {
         supported &= !memory->is_pinned_ && memory->slot_count_ == 1 && !memory->slot_index_;
       }
     } else if (auto tensor = As<TensorType>(type)) {
-      supported &= StaticShape(tensor->shape_) &&
+      supported &= backend::IsBufferTensorShape(tensor->shape_) &&
                    (backend::IsDenseBufferTransferDtype(tensor->dtype_) || tensor->dtype_ == DataType::INT8);
       if (supported && tensor->tensor_view_) {
         const auto& view = *tensor->tensor_view_;

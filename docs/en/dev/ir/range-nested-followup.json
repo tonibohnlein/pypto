@@ -1,0 +1,1599 @@
+{
+  "source_revision": "b97b6fd08bff451c0f38136a3065f09a60e7c21a",
+  "source_hashes": {
+    "docs/en/dev/ir/16-parameterized-prefill-checkpoint.md": "110296efd007602e571abefbaca2ceabb78361daf1f1e3076ff2a4783da6d85f",
+    "docs/en/dev/passes/59-realize_sync.md": "f2ea7098b784d246764d7d7450f8032bc4b6e3c74e6edd116472a60db524484a",
+    "docs/zh/dev/ir/16-parameterized-prefill-checkpoint.md": "36e4aa2415f3c15ceeb4040c61e26073052121a69326f99659eaa815521357d4",
+    "docs/zh/dev/passes/59-realize_sync.md": "31d32ed2b3a220c498cc14bd2e8e492d0015270bd0acbe0bda913aca733385b0",
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "f6981c9290bd329365d378cef18374ab9c9aea42b9957a59b0c6403832a3d07c",
+    "python/bindings/modules/testing.cpp": "c171374d0f540603dcef6b49d19a09ac4912049f12a22345dc7c3297e316d853",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "b6750d79113627ce97bcbd861418fd914477f702cabc2e6a050fb535c5ab2f61",
+    "src/ir/transforms/utils/logical_sync_realization.cpp": "a617c84448bc8d2d9a90be5e7978aad5b035292ffb90a48479d9dc056ba9a59a",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "df9491f8a30e672c6d46cb5b520ddc5ab05f0aa5b5055e58d889635ca0b8b327",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "e3f3ba61118755c9e5b1a19e5c6dca4b73f75f271d026377cf4a41ddf9ef743f",
+    "src/ir/transforms/utils/sync_placement.h": "574e1252d5f4e2e712ec111a29b88453a8a3b9eeffc31b7d9c49ab05e6ce630d",
+    "tests/ut/ir/transforms/qualify_sync_range_nested.py": "59437608f883e7c7ab83b0d8b0a51a52e0e5f5c3e181fbdd8a67c1a90b9798c0",
+    "tests/ut/ir/transforms/sync_logical_oracle.py": "31fa7e97790675b63250e8d69413d3502ef2e3f71aaeeef1d0714b317942cd28",
+    "tests/ut/ir/transforms/sync_matmul_oracle.py": "037d471637b7363c518056541d42bf72ef7ca4c104f167adb1029ffa9df3fad7",
+    "tests/ut/ir/transforms/test_compact_sync_analysis.py": "49ba07fdde6ea0c9cd826952c6c1ed669486f43203e5deb909a865a82be23330",
+    "tests/ut/ir/transforms/test_nested_sync_repetition.py": "7f6f935742b763782059d42e81443021049d9a30f80963118391116efa438f27",
+    "tests/ut/ir/transforms/test_parameterized_sync.py": "fb790a6357ec8e307d38cc616480ed1d92471d1f0b9d7b3f2e2eeb7cc17c51c3",
+    "tests/ut/ir/transforms/test_select_buffer_ir_functions.py": "53486ae8baaa7a4f4bfd221d5f1241971c92d2c4e907495101a721fc65f6c424",
+    "tests/ut/ir/transforms/test_sync_range_proofs.py": "03071c48ab6fbe99d55040e2e42d2709a4c04c4ea0e17baeec4cda9786b01530"
+  },
+  "extension_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "39fde84fe1fc37d0fffccd0e29a9d0f322ffb2d4afdc2bf3615fe42c83798e99"
+  },
+  "python": "3.14.7",
+  "contract": {
+    "target": "a2a3",
+    "disjoint_gm": true,
+    "directional_pool": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "scope": "explicit ranges; invariant perfect nests; no general nested child composition",
+    "device": "not run; native entry/return remains a supplied premise"
+  },
+  "timings": "single descriptive runs; detail timers are included in analysis, not additive",
+  "cases": [
+    {
+      "case": "bounded_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          32,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.0003939718008041382,
+        "physical_inclusive": 0.00018383609130978584,
+        "import_seconds": 0.00037061,
+        "partition_seconds": 3.268e-06,
+        "reduction_seconds": 9.35e-06,
+        "composition_seconds": 0.0
+      },
+      "retained": {
+        "analyzed_occurrences": 2,
+        "cells": 6,
+        "boundary_graph_edges": 0,
+        "coordinate_nodes": 3,
+        "coordinate_flatten_visits": 4,
+        "class_tests": 7,
+        "port_pair_tests": 0
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 1,
+        "wait_sites": 1,
+        "barrier_sites": 0,
+        "guard_sites": 0,
+        "reuse_queries": 1,
+        "reserved_lanes": 1
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 32
+          },
+          "payloads": 2,
+          "covers": 1,
+          "query_checks": 16,
+          "boundary_checks": 8,
+          "access_checks": 2,
+          "executed_sets": 1,
+          "executed_waits": 1,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 0,
+            "3": 64
+          },
+          "payloads": 2,
+          "covers": 1,
+          "query_checks": 16,
+          "boundary_checks": 8,
+          "access_checks": 2,
+          "executed_sets": 1,
+          "executed_waits": 1,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 0,
+            "3": 128
+          },
+          "payloads": 2,
+          "covers": 1,
+          "query_checks": 16,
+          "boundary_checks": 8,
+          "access_checks": 2,
+          "executed_sets": 1,
+          "executed_waits": 1,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 32
+          },
+          "payloads": 2,
+          "covers": 1,
+          "query_checks": 16,
+          "boundary_checks": 10,
+          "access_checks": 2,
+          "executed_sets": 1,
+          "executed_waits": 1,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 64
+          },
+          "payloads": 2,
+          "covers": 1,
+          "query_checks": 16,
+          "boundary_checks": 10,
+          "access_checks": 2,
+          "executed_sets": 1,
+          "executed_waits": 1,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 128
+          },
+          "payloads": 2,
+          "covers": 1,
+          "query_checks": 16,
+          "boundary_checks": 10,
+          "access_checks": 2,
+          "executed_sets": 1,
+          "executed_waits": 1,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.00029592402279376984,
+        "physical_inclusive": 5.7081226259469986e-05,
+        "import_seconds": 0.000260776,
+        "partition_seconds": 2.534e-06,
+        "reduction_seconds": 1.7349e-05,
+        "composition_seconds": 3.942e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 10,
+        "cells": 6,
+        "boundary_graph_edges": 15,
+        "coordinate_nodes": 6,
+        "coordinate_flatten_visits": 8,
+        "class_tests": 18,
+        "port_pair_tests": 32
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 0,
+          "frames": 2,
+          "original_frames": [
+            {
+              "count": 0,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 3,
+              "start": 2,
+              "step": 3
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 1,
+        "guard_sites": 0,
+        "reuse_queries": 3,
+        "reserved_lanes": 2
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 64
+          },
+          "payloads": 4,
+          "covers": 3,
+          "query_checks": 64,
+          "boundary_checks": 8,
+          "access_checks": 4,
+          "executed_sets": 2,
+          "executed_waits": 2,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 128
+          },
+          "payloads": 4,
+          "covers": 3,
+          "query_checks": 64,
+          "boundary_checks": 10,
+          "access_checks": 4,
+          "executed_sets": 2,
+          "executed_waits": 2,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.00027275318279862404,
+        "physical_inclusive": 5.292613059282303e-05,
+        "import_seconds": 0.000248439,
+        "partition_seconds": 2.346e-06,
+        "reduction_seconds": 1.5577e-05,
+        "composition_seconds": 4.003e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 10,
+        "cells": 6,
+        "boundary_graph_edges": 15,
+        "coordinate_nodes": 6,
+        "coordinate_flatten_visits": 8,
+        "class_tests": 18,
+        "port_pair_tests": 32
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 0,
+          "frames": 2,
+          "original_frames": [
+            {
+              "count": 2,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 0,
+              "start": 2,
+              "step": 3
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 1,
+        "guard_sites": 0,
+        "reuse_queries": 3,
+        "reserved_lanes": 2
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 64
+          },
+          "payloads": 4,
+          "covers": 3,
+          "query_checks": 64,
+          "boundary_checks": 8,
+          "access_checks": 4,
+          "executed_sets": 2,
+          "executed_waits": 2,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 128
+          },
+          "payloads": 4,
+          "covers": 3,
+          "query_checks": 64,
+          "boundary_checks": 10,
+          "access_checks": 4,
+          "executed_sets": 2,
+          "executed_waits": 2,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.00025388970971107483,
+        "physical_inclusive": 7.443036884069443e-05,
+        "import_seconds": 0.000227969,
+        "partition_seconds": 2.366e-06,
+        "reduction_seconds": 1.4193e-05,
+        "composition_seconds": 6.42e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 10,
+        "cells": 6,
+        "boundary_graph_edges": 28,
+        "coordinate_nodes": 6,
+        "coordinate_flatten_visits": 8,
+        "class_tests": 18,
+        "port_pair_tests": 48
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 1,
+          "frames": 2,
+          "original_frames": [
+            {
+              "count": 1,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 1,
+              "start": 2,
+              "step": 3
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 5,
+        "wait_sites": 5,
+        "barrier_sites": 0,
+        "guard_sites": 0,
+        "reuse_queries": 5,
+        "reserved_lanes": 5
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 64
+          },
+          "payloads": 6,
+          "covers": 5,
+          "query_checks": 144,
+          "boundary_checks": 8,
+          "access_checks": 6,
+          "executed_sets": 5,
+          "executed_waits": 5,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->1": [
+              0
+            ],
+            "1->2": [
+              0
+            ],
+            "2->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 128
+          },
+          "payloads": 6,
+          "covers": 5,
+          "query_checks": 144,
+          "boundary_checks": 10,
+          "access_checks": 6,
+          "executed_sets": 5,
+          "executed_waits": 5,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->1": [
+              0
+            ],
+            "1->2": [
+              0
+            ],
+            "2->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.0002881237305700779,
+        "physical_inclusive": 0.00010481895878911018,
+        "import_seconds": 0.000254739,
+        "partition_seconds": 2.604e-06,
+        "reduction_seconds": 1.6976e-05,
+        "composition_seconds": 7.512e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 10,
+        "cells": 6,
+        "boundary_graph_edges": 50,
+        "coordinate_nodes": 6,
+        "coordinate_flatten_visits": 8,
+        "class_tests": 18,
+        "port_pair_tests": 96
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 6,
+          "frames": 2,
+          "original_frames": [
+            {
+              "count": 2,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 3,
+              "start": 2,
+              "step": 3
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 6,
+        "wait_sites": 6,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 6,
+        "reserved_lanes": 6
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 64
+          },
+          "payloads": 16,
+          "covers": 15,
+          "query_checks": 1024,
+          "boundary_checks": 8,
+          "access_checks": 16,
+          "executed_sets": 15,
+          "executed_waits": 15,
+          "causal_reuse_checks": 9,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->1": [
+              0
+            ],
+            "1->2": [
+              0
+            ],
+            "2->1": [
+              0
+            ],
+            "2->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 128
+          },
+          "payloads": 16,
+          "covers": 15,
+          "query_checks": 1024,
+          "boundary_checks": 10,
+          "access_checks": 16,
+          "executed_sets": 15,
+          "executed_waits": 15,
+          "causal_reuse_checks": 9,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->1": [
+              0
+            ],
+            "1->2": [
+              0
+            ],
+            "2->1": [
+              0
+            ],
+            "2->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.00030120881274342537,
+        "physical_inclusive": 8.825818076729774e-05,
+        "import_seconds": 0.000261659,
+        "partition_seconds": 2.466e-06,
+        "reduction_seconds": 1.7814e-05,
+        "composition_seconds": 8.149e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 10,
+        "cells": 6,
+        "boundary_graph_edges": 50,
+        "coordinate_nodes": 6,
+        "coordinate_flatten_visits": 8,
+        "class_tests": 18,
+        "port_pair_tests": 96
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 8,
+          "frames": 3,
+          "original_frames": [
+            {
+              "count": 2,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 2,
+              "start": 2,
+              "step": 3
+            },
+            {
+              "count": 2,
+              "start": 3,
+              "step": 4
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 6,
+        "wait_sites": 6,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 6,
+        "reserved_lanes": 6
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 64
+          },
+          "payloads": 20,
+          "covers": 19,
+          "query_checks": 1600,
+          "boundary_checks": 8,
+          "access_checks": 20,
+          "executed_sets": 19,
+          "executed_waits": 19,
+          "causal_reuse_checks": 13,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->1": [
+              0
+            ],
+            "1->2": [
+              0
+            ],
+            "2->1": [
+              0
+            ],
+            "2->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 128
+          },
+          "payloads": 20,
+          "covers": 19,
+          "query_checks": 1600,
+          "boundary_checks": 10,
+          "access_checks": 20,
+          "executed_sets": 19,
+          "executed_waits": 19,
+          "causal_reuse_checks": 13,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->1": [
+              0
+            ],
+            "1->2": [
+              0
+            ],
+            "2->1": [
+              0
+            ],
+            "2->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.00025000376626849174,
+        "physical_inclusive": 4.735589027404785e-05,
+        "import_seconds": 0.000224726,
+        "partition_seconds": 2.497e-06,
+        "reduction_seconds": 1.4158e-05,
+        "composition_seconds": 4.031e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 10,
+        "cells": 6,
+        "boundary_graph_edges": 15,
+        "coordinate_nodes": 6,
+        "coordinate_flatten_visits": 8,
+        "class_tests": 18,
+        "port_pair_tests": 32
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 0,
+          "frames": 3,
+          "original_frames": [
+            {
+              "count": 2,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 0,
+              "start": 2,
+              "step": 3
+            },
+            {
+              "count": 3,
+              "start": 3,
+              "step": 4
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 1,
+        "guard_sites": 0,
+        "reuse_queries": 3,
+        "reserved_lanes": 2
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 64
+          },
+          "payloads": 4,
+          "covers": 3,
+          "query_checks": 64,
+          "boundary_checks": 8,
+          "access_checks": 4,
+          "executed_sets": 2,
+          "executed_waits": 2,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 128
+          },
+          "payloads": 4,
+          "covers": 3,
+          "query_checks": 64,
+          "boundary_checks": 10,
+          "access_checks": 4,
+          "executed_sets": 2,
+          "executed_waits": 2,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.0002902611158788204,
+        "physical_inclusive": 8.67391936480999e-05,
+        "import_seconds": 0.000259397,
+        "partition_seconds": 2.621e-06,
+        "reduction_seconds": 1.6736e-05,
+        "composition_seconds": 8.248e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 10,
+        "cells": 6,
+        "boundary_graph_edges": 50,
+        "coordinate_nodes": 6,
+        "coordinate_flatten_visits": 8,
+        "class_tests": 18,
+        "port_pair_tests": 96
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 2000,
+          "frames": 2,
+          "original_frames": [
+            {
+              "count": 2,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 1000,
+              "start": 2,
+              "step": 3
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 6,
+        "wait_sites": 6,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 6,
+        "reserved_lanes": 6
+      },
+      "checks": []
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.00020347675308585167,
+        "physical_inclusive": 4.4289976358413696e-05,
+        "import_seconds": 0.000184761,
+        "partition_seconds": 1.481e-06,
+        "reduction_seconds": 9.93e-06,
+        "composition_seconds": 5.947e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 10,
+        "cells": 6,
+        "boundary_graph_edges": 50,
+        "coordinate_nodes": 6,
+        "coordinate_flatten_visits": 8,
+        "class_tests": 18,
+        "port_pair_tests": 96
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 3000,
+          "frames": 2,
+          "original_frames": [
+            {
+              "count": 1000,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 3,
+              "start": 2,
+              "step": 3
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 6,
+        "wait_sites": 6,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 6,
+        "reserved_lanes": 6
+      },
+      "checks": []
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.0002258489839732647,
+        "physical_inclusive": 4.306109622120857e-05,
+        "import_seconds": 0.000206117,
+        "partition_seconds": 1.452e-06,
+        "reduction_seconds": 1.0418e-05,
+        "composition_seconds": 6.475e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 10,
+        "cells": 6,
+        "boundary_graph_edges": 50,
+        "coordinate_nodes": 6,
+        "coordinate_flatten_visits": 8,
+        "class_tests": 18,
+        "port_pair_tests": 96
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 1000000000000,
+          "frames": 2,
+          "original_frames": [
+            {
+              "count": 1000000,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 1000000,
+              "start": 2,
+              "step": 3
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 6,
+        "wait_sites": 6,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 6,
+        "reserved_lanes": 6
+      },
+      "checks": []
+    },
+    {
+      "case": "nested_dma",
+      "bounds": {
+        "1": [
+          0,
+          16
+        ],
+        "3": [
+          64,
+          128
+        ]
+      },
+      "seconds": {
+        "analysis_inclusive": 0.0002780621871352196,
+        "physical_inclusive": 6.515812128782272e-05,
+        "import_seconds": 0.000247051,
+        "partition_seconds": 1.369e-06,
+        "reduction_seconds": 1.5966e-05,
+        "composition_seconds": 1.2435e-05
+      },
+      "retained": {
+        "analyzed_occurrences": 18,
+        "cells": 6,
+        "boundary_graph_edges": 98,
+        "coordinate_nodes": 9,
+        "coordinate_flatten_visits": 14,
+        "class_tests": 32,
+        "port_pair_tests": 176
+      },
+      "regions": [
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 6,
+          "frames": 2,
+          "original_frames": [
+            {
+              "count": 2,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 3,
+              "start": 2,
+              "step": 3
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        },
+        {
+          "count": 6,
+          "frames": 2,
+          "original_frames": [
+            {
+              "count": 2,
+              "start": 1,
+              "step": 2
+            },
+            {
+              "count": 3,
+              "start": 2,
+              "step": 3
+            }
+          ],
+          "sites": 2,
+          "generators": 4,
+          "demands": 2,
+          "distance_entries": 16
+        },
+        {
+          "count": 1,
+          "frames": 0,
+          "original_frames": [],
+          "sites": 2,
+          "generators": 1,
+          "demands": 1,
+          "distance_entries": 0
+        }
+      ],
+      "physical": {
+        "set_sites": 11,
+        "wait_sites": 11,
+        "barrier_sites": 0,
+        "guard_sites": 8,
+        "reuse_queries": 16,
+        "reserved_lanes": 11
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 64
+          },
+          "payloads": 30,
+          "covers": 29,
+          "query_checks": 3600,
+          "boundary_checks": 8,
+          "access_checks": 30,
+          "executed_sets": 29,
+          "executed_waits": 29,
+          "causal_reuse_checks": 23,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->1": [
+              0
+            ],
+            "1->2": [
+              0
+            ],
+            "2->1": [
+              0
+            ],
+            "2->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 128
+          },
+          "payloads": 30,
+          "covers": 29,
+          "query_checks": 3600,
+          "boundary_checks": 10,
+          "access_checks": 30,
+          "executed_sets": 29,
+          "executed_waits": 29,
+          "causal_reuse_checks": 23,
+          "directional_ids": {
+            "1->4": [
+              0
+            ],
+            "4->1": [
+              0
+            ],
+            "1->2": [
+              0
+            ],
+            "2->1": [
+              0
+            ],
+            "2->4": [
+              0
+            ],
+            "4->2": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    }
+  ],
+  "native_source": [
+    {
+      "case": 0,
+      "pto_sha256": "a8d9e4dc64819ec1287af15c8e16d83ed408ddd32f525ddacab39ef078571a26",
+      "cpp_sha256": "8332f0490471a32a584a4528e895f93809ecfe8efb491a76b951969c773e1ada"
+    },
+    {
+      "case": 4,
+      "pto_sha256": "3bc5ea02f2efb77b8fe2c53b05d026c4f3077551b690c5f9b07b94e99d6d25e3",
+      "cpp_sha256": "fa9553d6a7473dfbe1beebeb7f54547717a2d99d3656dbc33cd4622420307337"
+    }
+  ],
+  "ptoas": {
+    "launcher_sha256": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+    "version": "ptoas 0.72",
+    "binaries": {
+      "ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321",
+      "ptoas/mlir/_mlir_libs/_site_initialize_0.cpython-311-x86_64-linux-gnu.so": "225c1410b394ec8cb25365b91ed53b8dc650144cae9f34c6106d477903b07274",
+      "ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+      "ptoas/mlir/_mlir_libs/_mlir.cpython-311-x86_64-linux-gnu.so": "b618a015ad07cc38b59bc07184f63a1ca3c3def80314fb8558882b7c3a1c8d48",
+      "ptoas/mlir/_mlir_libs/_mlirDialectsLLVM.cpython-311-x86_64-linux-gnu.so": "fc346a487b9cec914d77f806c6847940ec25c3d2d77d0214dd8d3e829727d75b"
+    }
+  },
+  "qwen_frozen_capture": {
+    "path": "build-py314/qwen-buffer-next/program.msgpack",
+    "sha256": "14259755a0b99f9611eb2542c66dcb65c7d037196629e9f4de3c6aa5c274b619",
+    "caller_bounds": {},
+    "outcomes": [
+      {
+        "function": "out_proj_aic",
+        "analysis": "unavailable",
+        "reason": "Invocation coordinate has no established caller range"
+      }
+    ]
+  },
+  "draft": {
+    "minimum_demands.tex": "45260c1cfe885d0021420682b7f502f3d723580cc256e626d809e28b8ec95247",
+    "direct_realization.tex": "ab3594827523fea38d59aa54c11714f5b84220b78db2ce792c28bff919c47e8e",
+    "event_id_reuse.tex": "20ee5db648fcba3f95d7c465e6d99d95b4ca9873de25a75c626862cbd3f5866b"
+  },
+  "verification": {
+    "gate": {
+      "command": [
+        "/usr/bin/python3",
+        "-m",
+        "pytest",
+        "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+        "tests/ut/ir/transforms/test_logical_sync_realization.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/ir/transforms/test_row_sync_analysis.py",
+        "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+        "tests/ut/ir/transforms/test_autosync_switch.py",
+        "tests/ut/ir/transforms/test_parameterized_sync.py",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+        "tests/ut/ir/transforms/test_select_buffer_ir_functions.py",
+        "tests/ut/ir/transforms/test_lower_tile_to_buffer.py",
+        "tests/ut/codegen/test_buffer_codegen.py",
+        "-q",
+        "--require-ptoas",
+        "--basetemp=build-py314/range-nested-accepted-gate"
+      ],
+      "exit_code": 0,
+      "result": "1549 passed in 87.79s (0:01:27)",
+      "log_sha256": "2efd71650190aceb16d0b05ada12caf9524700c6e2dd84d1694f1dd50b46f5f9"
+    },
+    "review": {
+      "architecture": "accepted",
+      "correctness": "accepted",
+      "algorithm_performance": "accepted for invariant perfect nests; general Qwen composition remains unimplemented"
+    },
+    "qualification_command": [
+      "/usr/bin/python3",
+      "-m",
+      "tests.ut.ir.transforms.qualify_sync_range_nested",
+      "--output",
+      "build-py314/range-nested-followup",
+      "--native-source",
+      "--qwen-capture",
+      "build-py314/qwen-buffer-next/program.msgpack",
+      "--draft-paper",
+      "/home/toni/work/synchronization_draft/paper"
+    ],
+    "hooks": {
+      "command": [
+        "pre-commit",
+        "run",
+        "--config",
+        "build-py314/precommit-py311.yaml",
+        "--files",
+        "docs/en/dev/ir/16-parameterized-prefill-checkpoint.md",
+        "docs/en/dev/ir/range-nested-followup.json",
+        "docs/en/dev/passes/59-realize_sync.md",
+        "docs/zh/dev/ir/16-parameterized-prefill-checkpoint.md",
+        "docs/zh/dev/passes/59-realize_sync.md",
+        "include/pypto/ir/transforms/utils/compact_sync_analysis.h",
+        "python/bindings/modules/testing.cpp",
+        "src/ir/transforms/utils/compact_sync_analysis.cpp",
+        "src/ir/transforms/utils/logical_sync_realization.cpp",
+        "src/ir/transforms/utils/physical_sync_realization.cpp",
+        "src/ir/transforms/utils/placed_sync_import.cpp",
+        "src/ir/transforms/utils/sync_placement.h",
+        "tests/ut/ir/transforms/qualify_sync_range_nested.py",
+        "tests/ut/ir/transforms/sync_logical_oracle.py",
+        "tests/ut/ir/transforms/sync_matmul_oracle.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+        "tests/ut/ir/transforms/test_parameterized_sync.py",
+        "tests/ut/ir/transforms/test_select_buffer_ir_functions.py",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py"
+      ],
+      "exit_code": 0,
+      "result": "all applicable configured hooks passed; Python 3.11 hook environments",
+      "log_sha256": "2b62d659dd4b75ba968b9871dceecb9d7cde89615ba4d73151fbf6ad8eb47bee",
+      "config_sha256": "8b4e6282c7ad89508e8dcdd30d70b6a08973c353d113e061e9137bd0a4997f45"
+    }
+  },
+  "environment": {
+    "python_executable": "/usr/bin/python3",
+    "ptoas_python_on_path": "/home/toni/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/bin",
+    "PTOAS_ROOT": "build-py314/physical-sync-prototype/ptoas-v072",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "PYPTO_CODEGEN_MAX_WORKERS": "1",
+    "host_only": true
+  },
+  "scope_limits": [
+    "Only explicitly bounded original scalar formals qualify dynamic row extents.",
+    "Invariant perfect nests do not implement general retained-child composition.",
+    "Moving slices, per-child accumulator resets and nested token transport remain unsupported.",
+    "Six-ID feasibility and modeled order checks do not establish native invocation completion."
+  ]
+}

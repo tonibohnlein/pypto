@@ -448,6 +448,44 @@ bool CompactSyncResult::Precedes(const Occurrence& a, bool sc, const Occurrence&
   return false;
 }
 std::optional<PointBoundary> CompactSyncResult::Boundary(size_t storage, int64_t row, int64_t column) const {
+  return BoundaryAt(storage, row, column, {});
+}
+std::optional<PointBoundary> CompactSyncResult::BoundaryAt(
+    size_t storage, int64_t row, int64_t column, const std::map<size_t, int64_t>& parameters) const {
+  if (storage >= input.storage.size()) return std::nullopt;
+  const auto& domain = input.storage[storage];
+  if (domain.row_extent_parameter) {
+    const auto parameter = *domain.row_extent_parameter;
+    auto value = parameters.find(parameter);
+    const auto bounds = input.parameter_bounds.at(parameter);
+    if (value == parameters.end() || value->second < bounds.first || value->second > bounds.second ||
+        row >= value->second)
+      return std::nullopt;
+  }
+  if (row < 0 || column < 0 || row >= domain.rows || column >= domain.columns) return std::nullopt;
+  auto shift = [&](const SyncTranslation& translation) -> std::optional<int64_t> {
+    int64_t value = 0;
+    for (auto [index, coefficient] : translation) {
+      auto bound = input.parameter_bounds.find(index);
+      auto supplied = parameters.find(index);
+      if (bound == input.parameter_bounds.end() || supplied == parameters.end() ||
+          supplied->second < bound->second.first || supplied->second > bound->second.second)
+        return std::nullopt;
+      const auto sum = __int128(value) + __int128(coefficient) * supplied->second;
+      if (sum > std::numeric_limits<int64_t>::max()) return std::nullopt;
+      value = static_cast<int64_t>(sum);
+    }
+    return value;
+  };
+  auto r = shift(domain.row_parameters), c = shift(domain.column_parameters);
+  if (!r || !c) return std::nullopt;
+  // The original domain is covered, but this invocation accesses only its
+  // translated footprint. A point before that footprint is proven absent.
+  if (row < *r || column < *c) return PointBoundary{};
+  return RelativeBoundary(storage, row - *r, column - *c);
+}
+std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage, int64_t row,
+                                                                 int64_t column) const {
   if (storage >= input.storage.size() || row < 0 || column < 0 || row >= input.storage[storage].rows ||
       column >= input.storage[storage].columns)
     return std::nullopt;

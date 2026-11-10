@@ -34,6 +34,20 @@ inline bool IsDenseBufferTransferDtype(DataType dtype) {
          dtype == DataType::INT32;
 }
 
+/// GM descriptor geometry admitted by Buffer selection and direct emission.
+/// A leading INDEX symbol is supplied by the existing tensor-shape ABI. The
+/// constant minor extent fixes the packed row stride; no allocation/access
+/// bound or synchronization certificate is inferred from this capability.
+inline bool IsBufferTensorShape(const std::vector<ir::ExprPtr>& shape) {
+  if (shape.size() != 2) return false;
+  const auto columns = ir::As<ir::ConstInt>(shape[1]);
+  if (!columns || columns->value_ <= 1) return false;
+  if (auto rows = ir::As<ir::ConstInt>(shape[0])) return rows->value_ > 0;
+  const auto rows = ir::As<ir::Var>(shape[0]);
+  const auto scalar = rows ? ir::As<ir::ScalarType>(rows->GetType()) : nullptr;
+  return scalar && scalar->dtype_ == DataType::INDEX;
+}
+
 /// Logical descriptor shape shared by default selection and final lowering.
 inline bool IsDenseVecBufferTile(const ir::TileTypePtr& tile, const ir::TileView& view) {
   return tile->shape_.size() == 2 &&

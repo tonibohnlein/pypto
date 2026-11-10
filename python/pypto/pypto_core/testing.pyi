@@ -15,7 +15,7 @@ Internal testing utilities (do not use in production)
 
 from typing import Any, Literal, NoReturn, TypedDict
 
-from .ir import BufferAccess, BufferResultBehavior, Call, Expr, Function, OpIRStage, PipeType, Type
+from .ir import BufferAccess, BufferResultBehavior, Call, Expr, Function, OpIRStage, PipeType, Program, Type
 
 def validate_buffer_op_contract(
     stage: OpIRStage,
@@ -219,10 +219,25 @@ class CompactSyncAnalysis:
         """Query segment/visit/site event order."""
         ...
 
-    def boundary(self, storage: int, row: int, column: int) -> dict[str, Any] | None:
+    def boundary(
+        self, storage: int, row: int, column: int, parameters: dict[int, int] = {}
+    ) -> dict[str, Any] | None:
         """Return modeled point selectors; None is unavailable, not absence."""
         ...
 
-def analyze_placed_sync(function: Function, disjoint_gm: bool, target: str = "a2a3") -> CompactSyncAnalysis:
+def sync_parameter_bounds_profile(program: Program) -> dict[str, Any]:
+    """Inspect proved ranges and expression/range visits per binding environment."""
+    ...
+
+def sync_parameter_bounds(program: Program) -> dict[str, dict[int, tuple[int, int]]]:
+    """Inspect inclusive ranges proved at all direct call/submit sites."""
+    ...
+
+def analyze_placed_sync(
+    function: Function,
+    disjoint_gm: bool,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+) -> CompactSyncAnalysis:
     """Analyze placed Buffer IR with explicit GM aliases and a named hardware contract."""
     ...

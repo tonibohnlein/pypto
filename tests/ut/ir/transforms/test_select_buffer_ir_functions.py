@@ -12,7 +12,7 @@
 import pypto.language as pl
 import pytest
 import torch
-from pypto import ir, passes
+from pypto import ir, passes, testing
 from pypto.backend import BackendType
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import _run_ptoas
@@ -1567,6 +1567,35 @@ def test_conversion_rollout_preserves_unopened_forms(planner, kind):
 def test_conversion_rollout_keeps_a5_on_tile(ascend_backend, planner):
     assert ascend_backend == BackendType.Ascend950
     assert _kernel(_lower(_conversion_program(True), planner)).ir_stage == ir.FunctionIRStage.Functional
+
+
+@pytest.mark.parametrize("planner", _PLANNERS)
+def test_symbolic_leading_gm_extent_preserves_buffer_geometry(tmp_path, planner):
+    program = pl.parse_program("""
+ROWS = pl.dynamic("ROWS")
+@pl.program
+class LeadingExtent:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, x: pl.Tensor[[ROWS, 64], pl.FP32],
+               out: pl.Out[pl.Tensor[[ROWS, 64], pl.FP32]]) -> pl.Tensor[[ROWS, 64], pl.FP32]:
+        value = pl.load(x, [0, 0], [16, 32])
+        out = pl.store(value, [0, 0], out)
+        return out
+""")
+    lowered = _lower(program, planner, True)
+    function = _kernel(lowered)
+    assert function.ir_stage == ir.FunctionIRStage.Buffer
+    assert isinstance(function.params[0].type, ir.TensorType)
+    shape = function.params[0].type.shape
+    assert isinstance(shape[0], ir.Var)
+    assert isinstance(shape[1], ir.ConstInt) and shape[1].value == 64
+    text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=planner == passes.MemoryPlanner.PYPTO)
+    assert "pto.tload" in text and "pto.tstore" in text
+    _compile_dynamic_state_native(lowered, tmp_path, planner)
+    # Selecting a Buffer descriptor is not a proof of allocation bounds for
+    # autosync. Its strict importer must preserve the missing-range refusal.
+    with pytest.raises(ValueError, match="Dynamic allocation extent has no established caller range"):
+        testing.analyze_placed_sync(function, True)
 
 
 if __name__ == "__main__":

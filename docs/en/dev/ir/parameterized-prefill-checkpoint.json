@@ -1,0 +1,1299 @@
+{
+  "scope": "stage 1; nested Qwen output and gate/up composition remain unimplemented",
+  "source_revision": "a1b56b53fbfeb586d280f8c8363647857dcd7e49",
+  "dirty_source_hashes": {
+    "docs/en/dev/ir/13-matmul-sync-prototype.md": "2a1a93014c63cad1d5ec4e92471419d83e613115e1ab6f44acaa5298f8487316",
+    "docs/en/dev/ir/index.md": "bceaf129e93c737a16269ba9d4ec416570ce08e47271a8bf589d59a86ceb3643",
+    "docs/en/dev/passes/59-realize_sync.md": "a3b415ef9ab92721ae992c7a85bc8574c0fc45640b27d7558a5db5b7622cb44d",
+    "docs/zh/dev/ir/13-matmul-sync-prototype.md": "bc9018839aadd09d1ee18dc1dec6c8f951ad2f380e5722dc85dd2bdec89a14ab",
+    "docs/zh/dev/ir/index.md": "d14d746acb5492586f605e5f199cd848e6739eede7981ed5304633578687764e",
+    "docs/zh/dev/passes/59-realize_sync.md": "6fb3d9f9e961eb033e2d2723d3fdef2b9f72a4589d2e357126c5fb61d779a722",
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "f94a645fce7cb2d9f7a2389ea7cd49443de29013e75af92b0de4e5bf19a420ff",
+    "mkdocs.yml": "235a0989cadd99962eb63168d769eabbc5825b8fd08e71aebe59d6cd0e9776f8",
+    "python/bindings/modules/testing.cpp": "d4a2b500894a86812941a1dc4f232f141abf7c387f876df5c75a0bf998b39e5a",
+    "python/pypto/pypto_core/testing.pyi": "2fa10270ce0323bf0c6d911dd5b68bfa66c31cf83a9865e971ce97f835af82ec",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "5668548fa03a749795df528b8b00d288aad26523904faeef9a4faec1a9ab6110",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "55fafe1ef0156516c24b06ce227e010af4b6e3714c6e3863612792d3ace4b619",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "098714b510a60994b71b722cb0d000270879e5949ae52bc6d2a29f4f3de4a391",
+    "tests/ut/ir/transforms/sync_matmul_oracle.py": "bdde65d3937d6a556c0fb973980bc59af976b42b8fedf5a5ec99ca396ee1d335",
+    "tests/ut/ir/transforms/sync_physical_oracle.py": "d78b3fce1bbedb9f8f19da0ea51e53e88812e006fc645509c8f8aae2591fdbf1",
+    "tests/ut/ir/transforms/qualify_parameterized_prefill.py": "9a0dbcd167f6b999e203a3c2b383504d1301db5f258c0bf4e89440181f5691da",
+    "tests/ut/ir/transforms/sync_prefill_cases.py": "87f248243da3df13e034da97422b1f16a39b3c21e9b4da29298babe1d349565e",
+    "tests/ut/ir/transforms/test_parameterized_sync.py": "c4c317dc9ea7ff1e8415f64dc2b5dc763c0aabe5d8f46d3d0fd70a09310dc406"
+  },
+  "binary_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "288415a36ae13733535fd7b4e6405c4d27339b3da4c5a0c7786834e2f05dde9f"
+  },
+  "python": "3.14.7",
+  "lib_revision": "da5350d2bfc40ce12edeaafd44b698050f6dc85b",
+  "lib_sources": {
+    "matmul": [
+      "examples/beginner/matmul.py",
+      "8316cc2f039f818f08dd5e0c2bb8c3a90e9abff19501e253de4a0b787bd95585"
+    ],
+    "gemm": [
+      "examples/intermediate/gemm.py",
+      "565faaef5ad54962c122c8a5e9f7819475832b63cc70cd74e1f270f7068be065"
+    ]
+  },
+  "contract": {
+    "target": "a2a3",
+    "disjoint_gm": true,
+    "ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "native_entry_return": "unchanged prerequisite, no new device qualification"
+  },
+  "rows": [
+    {
+      "source": "matmul",
+      "k_tiles_derivative": null,
+      "bounds": {
+        "1": [
+          0,
+          192
+        ],
+        "3": [
+          0,
+          192
+        ]
+      },
+      "timing_scope": "single descriptive measurement; analysis detail nested within analysis wall time",
+      "seconds": {
+        "frontend_placement": 0.2612888510338962,
+        "caller_evidence": 4.241755232214928e-05,
+        "analysis_inclusive": 0.00018166005611419678,
+        "physical_realization_inclusive": 0.00022869324311614037,
+        "import_seconds": 0.000156152,
+        "partition_seconds": 4.338e-06,
+        "reduction_seconds": 1.5175e-05,
+        "composition_seconds": 0.0
+      },
+      "retained": {
+        "analyzed_occurrences": 9,
+        "cells": 13,
+        "boundary_graph_edges": 0,
+        "class_tests": 24,
+        "class_lookup_tests": 40,
+        "port_pair_tests": 0,
+        "crossing_path_searches": 0,
+        "coordinate_nodes": 9,
+        "coordinate_flatten_visits": 14,
+        "coordinate_coefficient_entries": 4
+      },
+      "regions": [
+        {
+          "count": 1,
+          "sites": 9,
+          "generators": 9,
+          "demands": 5,
+          "distance_entries": 0
+        }
+      ],
+      "crossings": 0,
+      "physical": {
+        "set_sites": 5,
+        "wait_sites": 5,
+        "barrier_sites": 0,
+        "guard_sites": 0,
+        "reuse_queries": 5,
+        "reserved_lanes": 5
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 0
+          },
+          "payloads": 9,
+          "covers": 5,
+          "query_checks": 324,
+          "boundary_checks": 27,
+          "access_checks": 9,
+          "executed_sets": 5,
+          "executed_waits": 5,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->3": [
+              0,
+              1
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 64,
+            "3": 128
+          },
+          "payloads": 9,
+          "covers": 5,
+          "query_checks": 324,
+          "boundary_checks": 30,
+          "access_checks": 9,
+          "executed_sets": 5,
+          "executed_waits": 5,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->3": [
+              0,
+              1
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 192,
+            "3": 192
+          },
+          "payloads": 9,
+          "covers": 5,
+          "query_checks": 324,
+          "boundary_checks": 27,
+          "access_checks": 9,
+          "executed_sets": 5,
+          "executed_waits": 5,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->3": [
+              0,
+              1
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "source": "gemm",
+      "k_tiles_derivative": null,
+      "bounds": {
+        "1": [
+          0,
+          192
+        ],
+        "3": [
+          0,
+          192
+        ]
+      },
+      "timing_scope": "single descriptive measurement; analysis detail nested within analysis wall time",
+      "seconds": {
+        "frontend_placement": 0.011727184057235718,
+        "caller_evidence": 2.784375101327896e-05,
+        "analysis_inclusive": 0.00014661718159914017,
+        "physical_realization_inclusive": 9.759096428751945e-05,
+        "import_seconds": 0.000102023,
+        "partition_seconds": 3.635e-06,
+        "reduction_seconds": 2.5905e-05,
+        "composition_seconds": 1.0794e-05
+      },
+      "retained": {
+        "analyzed_occurrences": 16,
+        "cells": 11,
+        "boundary_graph_edges": 180,
+        "class_tests": 17,
+        "class_lookup_tests": 24,
+        "port_pair_tests": 404,
+        "crossing_path_searches": 1,
+        "coordinate_nodes": 7,
+        "coordinate_flatten_visits": 8,
+        "coordinate_coefficient_entries": 4
+      },
+      "regions": [
+        {
+          "count": 4,
+          "sites": 5,
+          "generators": 12,
+          "demands": 6,
+          "distance_entries": 100
+        },
+        {
+          "count": 1,
+          "sites": 1,
+          "generators": 0,
+          "demands": 0,
+          "distance_entries": 0
+        }
+      ],
+      "crossings": 1,
+      "physical": {
+        "set_sites": 7,
+        "wait_sites": 7,
+        "barrier_sites": 0,
+        "guard_sites": 7,
+        "reuse_queries": 7,
+        "reserved_lanes": 7
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 0
+          },
+          "payloads": 21,
+          "covers": 22,
+          "query_checks": 1764,
+          "boundary_checks": 31,
+          "access_checks": 21,
+          "executed_sets": 22,
+          "executed_waits": 22,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 15,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 64,
+            "3": 128
+          },
+          "payloads": 21,
+          "covers": 22,
+          "query_checks": 1764,
+          "boundary_checks": 34,
+          "access_checks": 21,
+          "executed_sets": 22,
+          "executed_waits": 22,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 15,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 192,
+            "3": 192
+          },
+          "payloads": 21,
+          "covers": 22,
+          "query_checks": 1764,
+          "boundary_checks": 31,
+          "access_checks": 21,
+          "executed_sets": 22,
+          "executed_waits": 22,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 15,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "source": "gemm",
+      "k_tiles_derivative": 1,
+      "bounds": {
+        "1": [
+          0,
+          192
+        ],
+        "3": [
+          0,
+          192
+        ]
+      },
+      "timing_scope": "single descriptive measurement; analysis detail nested within analysis wall time",
+      "seconds": {
+        "frontend_placement": 0.009674352128058672,
+        "caller_evidence": 2.3622997105121613e-05,
+        "analysis_inclusive": 0.00010377680882811546,
+        "physical_realization_inclusive": 6.632087752223015e-05,
+        "import_seconds": 8.782e-05,
+        "partition_seconds": 2.961e-06,
+        "reduction_seconds": 9.176e-06,
+        "composition_seconds": 0.0
+      },
+      "retained": {
+        "analyzed_occurrences": 6,
+        "cells": 11,
+        "boundary_graph_edges": 0,
+        "class_tests": 16,
+        "class_lookup_tests": 24,
+        "port_pair_tests": 0,
+        "crossing_path_searches": 0,
+        "coordinate_nodes": 3,
+        "coordinate_flatten_visits": 6,
+        "coordinate_coefficient_entries": 4
+      },
+      "regions": [
+        {
+          "count": 1,
+          "sites": 6,
+          "generators": 5,
+          "demands": 4,
+          "distance_entries": 0
+        }
+      ],
+      "crossings": 0,
+      "physical": {
+        "set_sites": 4,
+        "wait_sites": 4,
+        "barrier_sites": 0,
+        "guard_sites": 0,
+        "reuse_queries": 4,
+        "reserved_lanes": 4
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 0
+          },
+          "payloads": 6,
+          "covers": 4,
+          "query_checks": 144,
+          "boundary_checks": 19,
+          "access_checks": 6,
+          "executed_sets": 4,
+          "executed_waits": 4,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 64,
+            "3": 128
+          },
+          "payloads": 6,
+          "covers": 4,
+          "query_checks": 144,
+          "boundary_checks": 22,
+          "access_checks": 6,
+          "executed_sets": 4,
+          "executed_waits": 4,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 192,
+            "3": 192
+          },
+          "payloads": 6,
+          "covers": 4,
+          "query_checks": 144,
+          "boundary_checks": 19,
+          "access_checks": 6,
+          "executed_sets": 4,
+          "executed_waits": 4,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 0,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "source": "gemm",
+      "k_tiles_derivative": 2,
+      "bounds": {
+        "1": [
+          0,
+          192
+        ],
+        "3": [
+          0,
+          192
+        ]
+      },
+      "timing_scope": "single descriptive measurement; analysis detail nested within analysis wall time",
+      "seconds": {
+        "frontend_placement": 0.010175755713135004,
+        "caller_evidence": 2.4402979761362076e-05,
+        "analysis_inclusive": 0.0001278351992368698,
+        "physical_realization_inclusive": 8.697202429175377e-05,
+        "import_seconds": 8.8483e-05,
+        "partition_seconds": 3.031e-06,
+        "reduction_seconds": 2.3724e-05,
+        "composition_seconds": 9.365e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 16,
+        "cells": 11,
+        "boundary_graph_edges": 167,
+        "class_tests": 17,
+        "class_lookup_tests": 24,
+        "port_pair_tests": 404,
+        "crossing_path_searches": 1,
+        "coordinate_nodes": 7,
+        "coordinate_flatten_visits": 8,
+        "coordinate_coefficient_entries": 4
+      },
+      "regions": [
+        {
+          "count": 2,
+          "sites": 5,
+          "generators": 12,
+          "demands": 6,
+          "distance_entries": 100
+        },
+        {
+          "count": 1,
+          "sites": 1,
+          "generators": 0,
+          "demands": 0,
+          "distance_entries": 0
+        }
+      ],
+      "crossings": 1,
+      "physical": {
+        "set_sites": 7,
+        "wait_sites": 7,
+        "barrier_sites": 0,
+        "guard_sites": 7,
+        "reuse_queries": 7,
+        "reserved_lanes": 7
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 0
+          },
+          "payloads": 11,
+          "covers": 10,
+          "query_checks": 484,
+          "boundary_checks": 23,
+          "access_checks": 11,
+          "executed_sets": 10,
+          "executed_waits": 10,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 3,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 64,
+            "3": 128
+          },
+          "payloads": 11,
+          "covers": 10,
+          "query_checks": 484,
+          "boundary_checks": 26,
+          "access_checks": 11,
+          "executed_sets": 10,
+          "executed_waits": 10,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 3,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 192,
+            "3": 192
+          },
+          "payloads": 11,
+          "covers": 10,
+          "query_checks": 484,
+          "boundary_checks": 23,
+          "access_checks": 11,
+          "executed_sets": 10,
+          "executed_waits": 10,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 3,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "source": "gemm",
+      "k_tiles_derivative": 3,
+      "bounds": {
+        "1": [
+          0,
+          192
+        ],
+        "3": [
+          0,
+          192
+        ]
+      },
+      "timing_scope": "single descriptive measurement; analysis detail nested within analysis wall time",
+      "seconds": {
+        "frontend_placement": 0.010292001999914646,
+        "caller_evidence": 2.7189962565898895e-05,
+        "analysis_inclusive": 0.00013138912618160248,
+        "physical_realization_inclusive": 8.935388177633286e-05,
+        "import_seconds": 9.0428e-05,
+        "partition_seconds": 3.094e-06,
+        "reduction_seconds": 2.4429e-05,
+        "composition_seconds": 9.903e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 16,
+        "cells": 11,
+        "boundary_graph_edges": 180,
+        "class_tests": 17,
+        "class_lookup_tests": 24,
+        "port_pair_tests": 404,
+        "crossing_path_searches": 1,
+        "coordinate_nodes": 7,
+        "coordinate_flatten_visits": 8,
+        "coordinate_coefficient_entries": 4
+      },
+      "regions": [
+        {
+          "count": 3,
+          "sites": 5,
+          "generators": 12,
+          "demands": 6,
+          "distance_entries": 100
+        },
+        {
+          "count": 1,
+          "sites": 1,
+          "generators": 0,
+          "demands": 0,
+          "distance_entries": 0
+        }
+      ],
+      "crossings": 1,
+      "physical": {
+        "set_sites": 7,
+        "wait_sites": 7,
+        "barrier_sites": 0,
+        "guard_sites": 7,
+        "reuse_queries": 7,
+        "reserved_lanes": 7
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 0
+          },
+          "payloads": 16,
+          "covers": 16,
+          "query_checks": 1024,
+          "boundary_checks": 27,
+          "access_checks": 16,
+          "executed_sets": 16,
+          "executed_waits": 16,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 9,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 64,
+            "3": 128
+          },
+          "payloads": 16,
+          "covers": 16,
+          "query_checks": 1024,
+          "boundary_checks": 30,
+          "access_checks": 16,
+          "executed_sets": 16,
+          "executed_waits": 16,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 9,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 192,
+            "3": 192
+          },
+          "payloads": 16,
+          "covers": 16,
+          "query_checks": 1024,
+          "boundary_checks": 27,
+          "access_checks": 16,
+          "executed_sets": 16,
+          "executed_waits": 16,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 9,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "source": "gemm",
+      "k_tiles_derivative": 4,
+      "bounds": {
+        "1": [
+          0,
+          192
+        ],
+        "3": [
+          0,
+          192
+        ]
+      },
+      "timing_scope": "single descriptive measurement; analysis detail nested within analysis wall time",
+      "seconds": {
+        "frontend_placement": 0.010191502049565315,
+        "caller_evidence": 2.5439076125621796e-05,
+        "analysis_inclusive": 0.00012562796473503113,
+        "physical_realization_inclusive": 8.496595546603203e-05,
+        "import_seconds": 8.7303e-05,
+        "partition_seconds": 2.835e-06,
+        "reduction_seconds": 2.325e-05,
+        "composition_seconds": 9.078e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 16,
+        "cells": 11,
+        "boundary_graph_edges": 180,
+        "class_tests": 17,
+        "class_lookup_tests": 24,
+        "port_pair_tests": 404,
+        "crossing_path_searches": 1,
+        "coordinate_nodes": 7,
+        "coordinate_flatten_visits": 8,
+        "coordinate_coefficient_entries": 4
+      },
+      "regions": [
+        {
+          "count": 4,
+          "sites": 5,
+          "generators": 12,
+          "demands": 6,
+          "distance_entries": 100
+        },
+        {
+          "count": 1,
+          "sites": 1,
+          "generators": 0,
+          "demands": 0,
+          "distance_entries": 0
+        }
+      ],
+      "crossings": 1,
+      "physical": {
+        "set_sites": 7,
+        "wait_sites": 7,
+        "barrier_sites": 0,
+        "guard_sites": 7,
+        "reuse_queries": 7,
+        "reserved_lanes": 7
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 0
+          },
+          "payloads": 21,
+          "covers": 22,
+          "query_checks": 1764,
+          "boundary_checks": 31,
+          "access_checks": 21,
+          "executed_sets": 22,
+          "executed_waits": 22,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 15,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 64,
+            "3": 128
+          },
+          "payloads": 21,
+          "covers": 22,
+          "query_checks": 1764,
+          "boundary_checks": 34,
+          "access_checks": 21,
+          "executed_sets": 22,
+          "executed_waits": 22,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 15,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        },
+        {
+          "parameters": {
+            "1": 192,
+            "3": 192
+          },
+          "payloads": 21,
+          "covers": 22,
+          "query_checks": 1764,
+          "boundary_checks": 31,
+          "access_checks": 21,
+          "executed_sets": 22,
+          "executed_waits": 22,
+          "executed_barriers": 0,
+          "causal_reuse_checks": 15,
+          "directional_ids": {
+            "1->0": [
+              0,
+              1
+            ],
+            "0->1": [
+              0,
+              1
+            ],
+            "0->3": [
+              0
+            ],
+            "3->0": [
+              0
+            ],
+            "3->6": [
+              0
+            ]
+          },
+          "modeled_order_equality": true
+        }
+      ]
+    },
+    {
+      "source": "gemm",
+      "k_tiles_derivative": 8,
+      "bounds": {
+        "1": [
+          0,
+          192
+        ],
+        "3": [
+          0,
+          192
+        ]
+      },
+      "timing_scope": "single descriptive measurement; analysis detail nested within analysis wall time",
+      "seconds": {
+        "frontend_placement": 0.009828526061028242,
+        "caller_evidence": 2.883467823266983e-05,
+        "analysis_inclusive": 0.00012162839993834496,
+        "physical_realization_inclusive": 8.327187970280647e-05,
+        "import_seconds": 8.4375e-05,
+        "partition_seconds": 3.007e-06,
+        "reduction_seconds": 2.2201e-05,
+        "composition_seconds": 8.886e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 16,
+        "cells": 11,
+        "boundary_graph_edges": 180,
+        "class_tests": 17,
+        "class_lookup_tests": 24,
+        "port_pair_tests": 404,
+        "crossing_path_searches": 1,
+        "coordinate_nodes": 7,
+        "coordinate_flatten_visits": 8,
+        "coordinate_coefficient_entries": 4
+      },
+      "regions": [
+        {
+          "count": 8,
+          "sites": 5,
+          "generators": 12,
+          "demands": 6,
+          "distance_entries": 100
+        },
+        {
+          "count": 1,
+          "sites": 1,
+          "generators": 0,
+          "demands": 0,
+          "distance_entries": 0
+        }
+      ],
+      "crossings": 1,
+      "physical": {
+        "set_sites": 7,
+        "wait_sites": 7,
+        "barrier_sites": 0,
+        "guard_sites": 7,
+        "reuse_queries": 7,
+        "reserved_lanes": 7
+      },
+      "checks": []
+    },
+    {
+      "source": "gemm",
+      "k_tiles_derivative": 64,
+      "bounds": {
+        "1": [
+          0,
+          192
+        ],
+        "3": [
+          0,
+          192
+        ]
+      },
+      "timing_scope": "single descriptive measurement; analysis detail nested within analysis wall time",
+      "seconds": {
+        "frontend_placement": 0.00932810502126813,
+        "caller_evidence": 2.7752015739679337e-05,
+        "analysis_inclusive": 0.0001234780065715313,
+        "physical_realization_inclusive": 8.192239329218864e-05,
+        "import_seconds": 8.5291e-05,
+        "partition_seconds": 3.061e-06,
+        "reduction_seconds": 2.284e-05,
+        "composition_seconds": 9.01e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 16,
+        "cells": 11,
+        "boundary_graph_edges": 180,
+        "class_tests": 17,
+        "class_lookup_tests": 24,
+        "port_pair_tests": 404,
+        "crossing_path_searches": 1,
+        "coordinate_nodes": 7,
+        "coordinate_flatten_visits": 8,
+        "coordinate_coefficient_entries": 4
+      },
+      "regions": [
+        {
+          "count": 64,
+          "sites": 5,
+          "generators": 12,
+          "demands": 6,
+          "distance_entries": 100
+        },
+        {
+          "count": 1,
+          "sites": 1,
+          "generators": 0,
+          "demands": 0,
+          "distance_entries": 0
+        }
+      ],
+      "crossings": 1,
+      "physical": {
+        "set_sites": 7,
+        "wait_sites": 7,
+        "barrier_sites": 0,
+        "guard_sites": 7,
+        "reuse_queries": 7,
+        "reserved_lanes": 7
+      },
+      "checks": []
+    },
+    {
+      "source": "gemm",
+      "k_tiles_derivative": 1000000,
+      "bounds": {
+        "1": [
+          0,
+          192
+        ],
+        "3": [
+          0,
+          192
+        ]
+      },
+      "timing_scope": "single descriptive measurement; analysis detail nested within analysis wall time",
+      "seconds": {
+        "frontend_placement": 0.009524621069431305,
+        "caller_evidence": 2.343812957406044e-05,
+        "analysis_inclusive": 0.00011968379840254784,
+        "physical_realization_inclusive": 7.468927651643753e-05,
+        "import_seconds": 8.1779e-05,
+        "partition_seconds": 2.998e-06,
+        "reduction_seconds": 2.268e-05,
+        "composition_seconds": 9.211e-06
+      },
+      "retained": {
+        "analyzed_occurrences": 16,
+        "cells": 11,
+        "boundary_graph_edges": 180,
+        "class_tests": 17,
+        "class_lookup_tests": 24,
+        "port_pair_tests": 404,
+        "crossing_path_searches": 1,
+        "coordinate_nodes": 7,
+        "coordinate_flatten_visits": 8,
+        "coordinate_coefficient_entries": 4
+      },
+      "regions": [
+        {
+          "count": 1000000,
+          "sites": 5,
+          "generators": 12,
+          "demands": 6,
+          "distance_entries": 100
+        },
+        {
+          "count": 1,
+          "sites": 1,
+          "generators": 0,
+          "demands": 0,
+          "distance_entries": 0
+        }
+      ],
+      "crossings": 1,
+      "physical": {
+        "set_sites": 7,
+        "wait_sites": 7,
+        "barrier_sites": 0,
+        "guard_sites": 7,
+        "reuse_queries": 7,
+        "reserved_lanes": 7
+      },
+      "checks": []
+    }
+  ],
+  "native": [
+    {
+      "source": "matmul",
+      "compilation_seconds_inclusive": 0.12790218135342002,
+      "report": {
+        "downstream_autosync_enabled": true,
+        "kernels": [
+          {
+            "function": "matmul_tile",
+            "selected_route": "pypto",
+            "reason": "complete literal flag plan"
+          }
+        ]
+      },
+      "cpp_hashes": {
+        "matmul/ptoas/matmul_tile.cpp": "7f7a4ae201aa3d8ead8a3f33a645025e96488e00a9471f865585ebb3f8f2e384",
+        "matmul/orchestration/matmul.cpp": "d218d8cba9c20884b2615f07f7e9d4409dd30025c08f7522bc2db162e36d769e",
+        "matmul/kernels/aic/matmul_tile.cpp": "caa9167c7f645fe71fa5981ac0c019bc043c160a41cf0599c26c43ac8104608d"
+      }
+    },
+    {
+      "source": "gemm",
+      "compilation_seconds_inclusive": 0.07390150334686041,
+      "report": {
+        "downstream_autosync_enabled": true,
+        "kernels": [
+          {
+            "function": "gemm_tile",
+            "selected_route": "pypto",
+            "reason": "complete literal flag plan"
+          }
+        ]
+      },
+      "cpp_hashes": {
+        "gemm/ptoas/gemm_tile.cpp": "f1affb48cee461fceb15e9b66140e2ebac3b36c354a9b35d1ebcdd553d1a62ba",
+        "gemm/orchestration/gemm.cpp": "25e81f005a9a3aa8897e129547d1aca8a1f4c1b8fd1bf944227c5c15fc30b239",
+        "gemm/kernels/aic/gemm_tile.cpp": "f5dd3ec3769db23a7ba8aacca9aff9f6ad59a278dd49743d8ef0744abb95293b"
+      }
+    }
+  ],
+  "ptoas": {
+    "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+    "launcher_sha256": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+    "version": "ptoas 0.72",
+    "package_binary_hashes": {
+      "ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321",
+      "ptoas/mlir/_mlir_libs/_site_initialize_0.cpython-311-x86_64-linux-gnu.so": "225c1410b394ec8cb25365b91ed53b8dc650144cae9f34c6106d477903b07274",
+      "ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+      "ptoas/mlir/_mlir_libs/_mlir.cpython-311-x86_64-linux-gnu.so": "b618a015ad07cc38b59bc07184f63a1ca3c3def80314fb8558882b7c3a1c8d48",
+      "ptoas/mlir/_mlir_libs/_mlirDialectsLLVM.cpython-311-x86_64-linux-gnu.so": "fc346a487b9cec914d77f806c6847940ec25c3d2d77d0214dd8d3e829727d75b"
+    }
+  },
+  "complete": true,
+  "review": {
+    "architecture": "accepted",
+    "correctness": "accepted after DAG repair",
+    "algorithm_performance": "accepted after shared DAG and coefficient-map repair",
+    "scope": "parameterized coordinate checkpoint, not nested Qwen composition"
+  },
+  "verification": {
+    "focused_gate": "297 passed in 48.64s",
+    "post_lint_parameter_tests": "27 passed in 4.08s",
+    "device": "not run",
+    "absolute_paths": "recorded host provenance, use documented relative commands",
+    "hooks": "All configured hooks passed using Python 3.11; markdown delimiter correction rerun separately; no hooks bypassed.",
+    "commands": [
+      "cmake --build build-py314 --parallel 1",
+      "/usr/bin/python3 -m pytest tests/ut/ir/transforms/test_parameterized_sync.py tests/ut/ir/transforms/test_compact_sync_analysis.py tests/ut/ir/transforms/test_physical_sync_realization.py tests/ut/ir/transforms/test_autosync_switch.py tests/ut/ir/transforms/test_finite_sync_analysis.py tests/ut/ir/transforms/test_logical_sync_realization.py tests/ut/ir/transforms/test_vec_sync_analysis.py tests/ut/ir/transforms/test_row_sync_analysis.py tests/ut/ir/transforms/test_indexed_sync_analysis.py -q --require-ptoas",
+      "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_parameterized_prefill --output build-py314/prefill-coverage-20261110/commit --native"
+    ]
+  },
+  "final_reviewed_source_hashes": {
+    "docs/en/dev/ir/13-matmul-sync-prototype.md": "2a1a93014c63cad1d5ec4e92471419d83e613115e1ab6f44acaa5298f8487316",
+    "docs/en/dev/ir/16-parameterized-prefill-checkpoint.md": "4c5ec4eee904e568f5b458408a1df4c542d7acacf41d9c1c94a9001526bb7f56",
+    "docs/en/dev/ir/index.md": "bceaf129e93c737a16269ba9d4ec416570ce08e47271a8bf589d59a86ceb3643",
+    "docs/en/dev/passes/59-realize_sync.md": "a3b415ef9ab92721ae992c7a85bc8574c0fc45640b27d7558a5db5b7622cb44d",
+    "docs/zh/dev/ir/13-matmul-sync-prototype.md": "bc9018839aadd09d1ee18dc1dec6c8f951ad2f380e5722dc85dd2bdec89a14ab",
+    "docs/zh/dev/ir/16-parameterized-prefill-checkpoint.md": "fb70e6f8ee6884d2dafef73420ef1206a992ec83787422c96171fbedbe60d0d8",
+    "docs/zh/dev/ir/index.md": "d14d746acb5492586f605e5f199cd848e6739eede7981ed5304633578687764e",
+    "docs/zh/dev/passes/59-realize_sync.md": "6fb3d9f9e961eb033e2d2723d3fdef2b9f72a4589d2e357126c5fb61d779a722",
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "f94a645fce7cb2d9f7a2389ea7cd49443de29013e75af92b0de4e5bf19a420ff",
+    "mkdocs.yml": "235a0989cadd99962eb63168d769eabbc5825b8fd08e71aebe59d6cd0e9776f8",
+    "python/bindings/modules/testing.cpp": "d4a2b500894a86812941a1dc4f232f141abf7c387f876df5c75a0bf998b39e5a",
+    "python/pypto/pypto_core/testing.pyi": "2fa10270ce0323bf0c6d911dd5b68bfa66c31cf83a9865e971ce97f835af82ec",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "5668548fa03a749795df528b8b00d288aad26523904faeef9a4faec1a9ab6110",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "55fafe1ef0156516c24b06ce227e010af4b6e3714c6e3863612792d3ace4b619",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "098714b510a60994b71b722cb0d000270879e5949ae52bc6d2a29f4f3de4a391",
+    "tests/ut/ir/transforms/fixtures/prefill_lib/gemm.py.source": "565faaef5ad54962c122c8a5e9f7819475832b63cc70cd74e1f270f7068be065",
+    "tests/ut/ir/transforms/fixtures/prefill_lib/matmul.py.source": "8316cc2f039f818f08dd5e0c2bb8c3a90e9abff19501e253de4a0b787bd95585",
+    "tests/ut/ir/transforms/qualify_parameterized_prefill.py": "9a0dbcd167f6b999e203a3c2b383504d1301db5f258c0bf4e89440181f5691da",
+    "tests/ut/ir/transforms/sync_matmul_oracle.py": "bdde65d3937d6a556c0fb973980bc59af976b42b8fedf5a5ec99ca396ee1d335",
+    "tests/ut/ir/transforms/sync_physical_oracle.py": "d78b3fce1bbedb9f8f19da0ea51e53e88812e006fc645509c8f8aae2591fdbf1",
+    "tests/ut/ir/transforms/sync_prefill_cases.py": "87f248243da3df13e034da97422b1f16a39b3c21e9b4da29298babe1d349565e",
+    "tests/ut/ir/transforms/test_parameterized_sync.py": "dd3ead9d202b63dea077fd1b1b12fa182b3d5b49c2f57ddb3c6c16659bc7589a"
+  }
+}

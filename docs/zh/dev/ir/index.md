@@ -24,6 +24,7 @@ IR 定义是整个编译器的真源：pass 可以重写，IR 节点定义不可
 | [已分配矩阵乘原型](13-matmul-sync-prototype.md) | Buffer IR 导入、紧凑重复与独立验证 |
 | [逻辑需求实现](14-logical-demand-realization.md) | 保留需求到完成 token 的构造与独立命令验证 |
 | [物理需求实现](15-physical-demand-realization.md) | 限定范围内的标志分配、直接放置及独立复用检查 |
+| [参数化 Prefill](16-parameterized-prefill-checkpoint.md) | 调用方证明的不变坐标、带绑定选择器及尚未实现的嵌套组合 |
 | [逻辑同步](11-logical-sync.md) | SSA 完成凭证、流水顺序、运行时地址谓词与 VF 完成边界 |
 
 ## 另请参阅

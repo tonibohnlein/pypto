@@ -200,3 +200,8 @@ elementwise recipes and the Buffer IR alias verifier. It does not import pending
 upstream GM-subview or rotating-pool designs. Metadata writers and unsupported
 coordinate frames retain explicit refusals. The original logical and physical
 realization entry points consume the owner without reconstructing analysis.
+
+The [parameterized prefill checkpoint](16-parameterized-prefill-checkpoint.md)
+extends this same owner with caller-proved invariant INDEX coordinates and
+binding-aware GM selectors. It does not extend the flat segment structure to
+nested repeated children.
