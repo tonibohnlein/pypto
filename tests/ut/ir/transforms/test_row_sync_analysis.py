@@ -252,6 +252,43 @@ def test_normalization_frontend_boundary_remains_explicit(name, inputs):
     assert "physically placed Buffer IR" in dict(function.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
 
 
+@pytest.mark.parametrize("op", ["row_sum", "row_max"])
+def test_explicit_col_major_preserves_default_autosync_plan(op):
+    """Spelling the default layout must neither delegate nor change physical synchronization.
+
+    Consume the column locally in the supported broadcast recipe; a direct
+    column-vector GM store has a separate, unavailable Buffer transfer contract.
+    """
+    emitted = []
+    for layout in ["", ", out_layout=pl.TileLayout.col_major"]:
+        program = pl.parse_program(f"""
+@pl.program
+class ColumnReduction:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[8, 64], pl.FP32],
+               out: pl.InOut[pl.Tensor[[8, 64], pl.FP32]]) -> pl.Tensor[[8, 64], pl.FP32]:
+        x = pl.load(a, [0, 0], [8, 64])
+        scratch = pl.create_tile([8, 64], dtype=pl.FP32)
+        reduced = pl.tile.{op}(x, scratch{layout})
+        result = pl.tile.row_expand_sub(x, reduced)
+        return pl.store(result, [0, 0], out)
+""")
+        functions = []
+        for enabled in [False, True]:
+            with passes.PassContext([], enable_pypto_autosync=enabled, autosync_disjoint_gm=True):
+                lowered = PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(program)
+            function = lowered.get_function("kernel")
+            assert function is not None
+            functions.append(function)
+        original, synchronized = functions
+        assert dict(synchronized.attrs)[PYPTO_AUTOSYNC_ATTR], dict(synchronized.attrs)
+        retained = testing.analyze_placed_sync(original, True)
+        validate(original, retained)
+        run_physical(original, synchronized, range(6))
+        emitted.append(synchronized)
+    ir.assert_structural_equal(emitted[0], emitted[1])
+
+
 def test_padded_row_major_reduction_remains_delegated():
     program = pl.parse_program("""
 @pl.program

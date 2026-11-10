@@ -165,9 +165,9 @@ TypePtr DeduceTileRowReductionType(const std::vector<ExprPtr>& args,
   // destination window at all (the source's declared valid region would be
   // narrower than the window). The real per-row sum is column 0; columns
   // 1..pad_cols-1 are *not* currently guaranteed zero (issue #3319's
-  // remaining pad-zeroing gap, tracked separately -- a caller relying on a
-  // destination window wider than column 0 must zero-initialize it, or the
-  // trailing pad bytes may carry whatever the Vec buffer held before).
+  // remaining pad-zeroing gap, tracked separately). TSTORE overwrites the
+  // destination padding too, so preinitializing that destination cannot make
+  // those columns defined. Consumers may rely only on column 0.
   const auto input_valid = GetValidShape(tile_type);
   CheckReductionInputNonEmpty(input_valid, op_name, args[0]->span_);
   std::vector<ExprPtr> output_valid(input_valid.begin(), input_valid.end() - 1);
