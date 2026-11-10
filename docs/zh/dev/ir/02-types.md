@@ -83,7 +83,7 @@ Void call 应放在 `EvalStmt` 中，不能绑定变量、用作操作数、放�
 物理形状静态、列数大于一的稠密 ND 二维 FP16/BF16/FP32/INT32 Tensor。
 算术配方分别施加更窄的 dtype 契约。规范化后的 Tensor
 返回值是这些参数的别名，原生内核仍返回 void。Buffer 参数 ABI、原生函数
-结果、分形子视图、分配时的可变视图元数据、slot、helper 和其他物理布局尚未支持，会明确报错。
+结果、分形子视图、分配时的可变视图元数据、helper ABI 和其他物理布局尚未支持，会明确报错。
 Buffer 类型 dump 使用原生 `pypto.ir.BufferType(...)` 构造表达式，
 二进制序列化保留完整描述符。目前尚不支持通过 DSL parser 重新解析
 完整的 buffer 程序 dump。
@@ -127,6 +127,20 @@ valid extent，按维度顺序排列。静态描述符使用空 tuple。可选�
 两个操作数都属于非内存值，运行时值必须是整数或 `INDEX` 标量。
 常量 valid extent 必须介于零和对应物理维度之间；无法静态检查时，运行时
 extent 的边界及地址非负性属于构造调用的前置条件。
+
+`buffer.alloc_multi((), [effective_base])` 以显式 `MultiBufferType` 结果声明
+一块分配。当前契约要求槽位描述符一致且 valid extent 静态，物理槽位字节紧密排列；
+总容量为 `slot_count * PhysicalBufferBytes(element_type)`，并检查溢出。
+`buffer.slot(group, index)` 返回与元素描述符完全一致的别名。该操作只读取描述符
+元数据，不读取 payload，也不分配或初始化存储。每次执行必须满足
+`0 <= index < slot_count`；操作检查常量下标，分析单独证明动态范围。
+不同的选择句柄不构成不相交证明。动态位置未知时，保守窗口覆盖整块分配。
+
+PTO 适配器当前支持 Vec/Mat/Acc 中至多 16 个静态槽位，要求步长及基地址符合
+后端原生分配对齐。会改变所建模步长的填充必须拒绝。单槽位族降为普通分配。
+委托给 PTOAS 的轮转代码还需要既有的无符号余数规范化证明；同一最外层循环中
+共活的不同选择器需要另行认证的 PyPTO 物理同步计划。这些原生限制与 IR 类型
+能够表示的数值槽位数不同。
 
 `buffer.set_validshape(buffer, valid_extents)` 返回 `VoidType`，只写入元数据。
 其 `MakeTuple` 操作数包含**所有**维度。标记为 `-1` 的维度可在物理边界内

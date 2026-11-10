@@ -1,0 +1,271 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Slot recognition checks; no reduction is inferred from successful import."""
+
+import pytest
+from pypto import ir, testing
+
+pytestmark = pytest.mark.usefixtures("ascend_backend")
+
+
+def slot_fixture(count=5, slots=3, stride=1, phase=0, start=0, step=1, alias=False):
+    """One explicit Vec slot family; addresses and selection are original IR."""
+    span = ir.Span.unknown()
+    index, fp = ir.DataType.INDEX, ir.DataType.FP32
+
+    def ci(x):
+        return ir.ConstInt(x, index, span)
+
+    def tup(xs):
+        return ir.MakeTuple([ci(x) for x in xs], span)
+
+    def call(name, args, ty=None):
+        return ir.Call(ir.get_op(name), args, ty or ir.VoidType(), span)
+
+    ty = ir.BufferType([1, 32], fp, ir.MemorySpace.Vec)
+    group_ty = ir.MultiBufferType(ty, slots)
+    group = ir.Var("ring", group_ty, span)
+    a = ir.Var("a", ir.TensorType([1, 32], fp), span)
+    out = ir.Var("out", a.type, span)
+    definitions = [ir.AssignStmt(group, call("buffer.alloc_multi", [tup([]), ci(0)], group_ty), span)]
+    if alias:
+        group2 = ir.Var("alias", group_ty, span)
+        definitions.append(
+            ir.AssignStmt(group2, call("buffer.alloc_multi", [tup([]), ci(0)], group_ty), span)
+        )
+    else:
+        group2 = group
+    iv = ir.Var("i", ir.ScalarType(index), span)
+    expression = ir.Add(ir.Mul(iv, ci(stride), index, span), ci(phase), index, span)
+    selection = ir.FloorMod(expression, ci(slots), index, span)
+    x, y = ir.Var("x", ty, span), ir.Var("y", ty, span)
+    body = [
+        ir.AssignStmt(x, call("buffer.slot", [group, selection], ty), span),
+        ir.AssignStmt(y, call("buffer.slot", [group2, selection], ty), span),
+        ir.EvalStmt(call("buffer.load", [a, tup([0, 0]), tup([1, 32]), x]), span),
+        ir.EvalStmt(call("buffer.abs", [x, x]), span),
+        ir.EvalStmt(call("buffer.store", [y, tup([0, 0]), tup([1, 32]), out]), span),
+        ir.YieldStmt([], span),
+    ]
+    loop = ir.ForStmt(
+        iv, ci(start), ci(start + count * step), ci(step), [], ir.SeqStmts(body, span), [], span
+    )
+    return ir.Function(
+        "rotating_vec",
+        [a, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts([*definitions, loop, ir.ReturnStmt([out], span)], span),
+        span,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+
+
+@pytest.mark.parametrize(("slots", "stride", "phase"), [(1, 0, 0), (3, 1, 2), (6, 2, 3), (7, 0, 2)])
+@pytest.mark.parametrize(("count", "start", "step"), [(0, 0, 1), (1, 3, 2), (9, 1, 3)])
+def test_slot_access_description_matches_original_addresses(slots, stride, phase, count, start, step):
+    function = slot_fixture(count, slots, stride, phase, start, step, alias=True)
+    result = testing.describe_placed_sync_input(function, True)
+    assert "not requested" in result["guarantee"]
+    assert len(result["storage"]) == 3, "two handles of the same ring are one physical family"
+    ring = result["storage"][2]
+    assert (ring["slot_count"], ring["slot_bytes"], ring["bytes"]) == (slots, 128, slots * 128)
+    for site in result["regions"][0]["sites"]:
+        for access, selection in zip(site["accesses"], site["slot_selections"]):
+            if access[0] != 2:
+                continue
+            for visit in range(count):
+                # Original source formula, independent of importer normalization.
+                actual = ((start + visit * step) * stride + phase) % slots
+                selected = (selection[0] + visit * selection[1]) % slots
+                assert ring["address"] + 128 * selected == 128 * actual
+    assert not result["analysis_available"]
+    assert result["regions"][0]["demands"] is None
+
+
+def test_recognition_does_not_enumerate_slots_or_trips():
+    signatures = []
+    for count, slots in [(3, 2), (1000, 7), (1000000, 1000003)]:
+        d = testing.describe_placed_sync_input(slot_fixture(count, slots), True)
+        signatures.append((len(d["storage"]), len(d["regions"][0]["sites"]), d["coordinate_nodes"]))
+    assert len(set(signatures)) == 1
+
+
+@pytest.mark.parametrize("bad", ["overlap", "modulus", "overflow", "unbounded"])
+def test_unproved_slot_geometry_or_selection_refuses(bad):
+    class Change(ir.IRMutator):
+        def visit_call(self, call):
+            if call.op.name != ir.get_op("buffer.slot").name:
+                return super().visit_call(call)
+            span = call.span
+            index = ir.DataType.INDEX
+            selection = call.args[1]
+            if bad == "modulus":
+                selection = ir.FloorMod(selection.left, ir.ConstInt(2, index, span), index, span)
+            elif bad == "overflow":
+                selection = ir.FloorMod(
+                    ir.Mul(selection.left, ir.ConstInt(2**62, index, span), index, span),
+                    selection.right,
+                    index,
+                    span,
+                )
+            elif bad == "unbounded":
+                selection = selection.left
+            return ir.Call(call.op, [call.args[0], selection], call.type, span)
+
+        def visit_assign_stmt(self, statement):
+            if bad == "overlap" and statement.var.name_hint == "alias":
+                value = statement.value
+                address = ir.ConstInt(128, ir.DataType.INDEX, statement.span)
+                return ir.AssignStmt(
+                    statement.var,
+                    ir.Call(value.op, [value.args[0], address], value.type, value.span),
+                    statement.span,
+                )
+            return super().visit_assign_stmt(statement)
+
+    f = Change().visit_function(slot_fixture(alias=True))
+    with pytest.raises(ValueError, match="(Overlapping|modulus|nonoverflowing|Slot selection)"):
+        testing.describe_placed_sync_input(f, True)
+
+
+@pytest.mark.parametrize("ordinary_first", [False, True])
+@pytest.mark.parametrize("address", [0, 32])
+def test_one_slot_ring_never_hides_ordinary_vec_alias(ordinary_first, address):
+    # A singleton MultiBuffer is still a family-domain descriptor. Its overlap
+    # with the shared byte-domain Vec representation must not become disjoint.
+    f = slot_fixture(slots=1)
+    span = f.span
+    ty = ir.BufferType([1, 32], ir.DataType.FP32, ir.MemorySpace.Vec)
+    var = ir.Var("ordinary", ty, span)
+    call = ir.Call(
+        ir.get_op("buffer.alloc"),
+        [ir.MakeTuple([], span), ir.ConstInt(address, ir.DataType.INDEX, span)],
+        ty,
+        span,
+    )
+    statements = list(f.body.stmts)
+    statements.insert(0 if ordinary_first else 1, ir.AssignStmt(var, call, span))
+    changed = ir.Function(
+        f.name,
+        list(zip(f.params, f.param_directions)),
+        f.return_types,
+        ir.SeqStmts(statements, span),
+        span,
+        f.func_type,
+        ir_stage=f.ir_stage,
+    )
+    with pytest.raises(ValueError, match="Overlapping"):
+        testing.describe_placed_sync_input(changed, True)
+
+
+def test_narrowing_before_modulo_is_not_hidden_by_slot_bound():
+    class Narrow(ir.IRMutator):
+        def visit_floor_mod(self, expr):
+            narrow = ir.Cast(expr.left, ir.DataType.INT8, expr.span)
+            wide = ir.Cast(narrow, ir.DataType.INDEX, expr.span)
+            return ir.FloorMod(wide, expr.right, ir.DataType.INDEX, expr.span)
+
+    with pytest.raises(ValueError, match="cast may change"):
+        testing.describe_placed_sync_input(Narrow().visit_function(slot_fixture(count=200)), True)
+
+
+def test_partial_slot_view_is_unavailable():
+    class Partial(ir.IRMutator):
+        def visit_assign_stmt(self, stmt):
+            if stmt.var.name_hint != "x":
+                return super().visit_assign_stmt(stmt)
+            ty = ir.BufferType([1, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+            var = ir.Var("partial", ty, stmt.span)
+            offsets = ir.MakeTuple([ir.ConstInt(0, ir.DataType.INDEX, stmt.span)] * 2, stmt.span)
+            view = ir.Call(ir.get_op("buffer.subview"), [stmt.var, offsets], ty, stmt.span)
+            return ir.SeqStmts([stmt, ir.AssignStmt(var, view, stmt.span)], stmt.span)
+
+    with pytest.raises(ValueError, match="(storage/view|Nested or data-dependent control)"):
+        testing.describe_placed_sync_input(Partial().visit_function(slot_fixture()), True)
+
+
+def test_native_padding_cannot_change_the_imported_slot_stride():
+    span = ir.Span.unknown()
+    element = ir.BufferType([1, 4], ir.DataType.FP32, ir.MemorySpace.Vec)
+    group_type = ir.MultiBufferType(element, 2)
+    group = ir.Var("ring", group_type, span)
+    alloc = ir.Call(
+        ir.get_op("buffer.alloc_multi"),
+        [ir.MakeTuple([], span), ir.ConstInt(0, ir.DataType.INDEX, span)],
+        group_type,
+        span,
+    )
+    f = ir.Function(
+        "unaligned",
+        [],
+        [],
+        ir.AssignStmt(group, alloc, span),
+        span,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    # Native multi-tile stride rounds 16 to 32. Never report a 16-byte physical
+    # slot stride as qualified while leaving that padding unrepresented.
+    with pytest.raises(ValueError, match="aligned whole-slot"):
+        testing.describe_placed_sync_input(f, True)
+
+
+def test_selection_from_another_occurrence_frame_is_refused():
+    f = slot_fixture()
+    span = f.span
+    original = f.body.stmts[-2]
+    iv = ir.Var("other", ir.ScalarType(ir.DataType.INDEX), span)
+    # Deliberately retain a selected handle from the previous loop. Even when
+    # its descriptor and modulus agree, it is not a selection in this visit.
+    store = original.body.stmts[-2]
+    second = ir.ForStmt(
+        iv,
+        original.start,
+        original.stop,
+        original.step,
+        [],
+        ir.SeqStmts([store, ir.YieldStmt([], span)], span),
+        [],
+        span,
+    )
+    changed = ir.Function(
+        f.name,
+        list(zip(f.params, f.param_directions)),
+        f.return_types,
+        ir.SeqStmts([*f.body.stmts[:-1], second, f.body.stmts[-1]], span),
+        span,
+        f.func_type,
+        ir_stage=f.ir_stage,
+    )
+    with pytest.raises(ValueError, match="outside its defining scope"):
+        testing.describe_placed_sync_input(changed, True)
+
+
+def test_different_strides_do_not_supply_a_common_stride_certificate():
+    class Mixed(ir.IRMutator):
+        def visit_assign_stmt(self, stmt):
+            if stmt.var.name_hint != "y":
+                return super().visit_assign_stmt(stmt)
+            call = stmt.value
+            index = ir.DataType.INDEX
+            expr = call.args[1]
+            selection = ir.FloorMod(
+                ir.Mul(expr.left, ir.ConstInt(2, index, stmt.span), index, stmt.span),
+                expr.right,
+                index,
+                stmt.span,
+            )
+            return ir.AssignStmt(
+                stmt.var, ir.Call(call.op, [call.args[0], selection], call.type, stmt.span), stmt.span
+            )
+
+    with pytest.raises(ValueError, match="one common stride"):
+        testing.describe_placed_sync_input(Mixed().visit_function(slot_fixture()), True)

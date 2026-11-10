@@ -52,6 +52,9 @@ struct SyncStorage {
   // rows retains its proved upper bound; accesses must fit its lower bound.
   // Boundary queries require the actual extent binding, never a sampled size.
   std::optional<size_t> row_extent_parameter;
+  // Uniform physical slots: address + slot*slot_bytes. rows/columns describe
+  // one slot; bytes covers the whole reservation. No slot list is materialized.
+  int64_t slot_count = 1, slot_bytes = 0;
 };
 struct SyncAccess {
   size_t storage;
@@ -59,6 +62,9 @@ struct SyncAccess {
   int64_t row, column, row_step, column_step, rows, columns;
   bool after_first = false;     // Accumulator read, absent during initialization.
   bool exact_footprint = true;  // False: sound enclosure, selectors describe the selected model.
+  // Selected slot at normalized visit i is (slot_first+i*slot_step) mod the
+  // storage's slot_count. Selection is checked in its original machine type.
+  int64_t slot_first = 0, slot_step = 0;
 };
 struct SyncSite {
   CallPtr original;
@@ -82,6 +88,9 @@ struct SyncSegment {
   // exact occurrence bijection, not an unfolding or a new storage abstraction.
   // Empty for the original single-loop representation.
   std::vector<SyncLoopFrame> nested_frames;
+  // Positive: the innermost rotating body restarts every reset_period visits.
+  // count remains the total mixed-radix visit count across enclosing frames.
+  int64_t reset_period = 0;
 };
 struct CompactSyncInput {
   FunctionPtr owner;
@@ -104,6 +113,15 @@ struct DemandFamily {
   size_t source, target;
   int64_t distance;
 };
+// Sufficient disjointness of translated all-access envelopes within one
+// segment invocation. Coordinates use that domain's qualified physical units;
+// the owning segment/frame is not interchangeable with an enclosing reset.
+struct VisitOwnedStorage {
+  int64_t row_step, column_step, row_begin, row_end, column_begin, column_end;
+};
+struct RotatingSlotInfo {
+  int64_t stride = 0, gcd = 1, period = 1, inverse = 0;
+};
 struct CompactSegmentResult {
   int64_t count;
   std::vector<PipeType> pipes;
@@ -112,12 +130,28 @@ struct CompactSegmentResult {
   // Minimum nonnegative visit displacement for each event pair. A negative
   // value is unavailable reachability, not an unavailable storage domain.
   std::vector<std::vector<int64_t>> distance;
+  // The rotating strategy retains two pipe-prefix indices, never all pairs.
+  // Nonnegative scaled shortest distances are wide to preserve exactness.
+  // Missing entries mean unreachable, not an unavailable query capability.
+  bool rotating = false;
+  int64_t internal_scope_count = 0, repetitions = 1;
+  std::array<std::vector<std::optional<__int128>>, 2 * kPipeCount> frontier_distances;
+  std::vector<int64_t> ranks;
+  std::map<size_t, RotatingSlotInfo> slot_info;
+  std::map<size_t, VisitOwnedStorage> visit_owned;
+  std::map<size_t, std::vector<std::pair<size_t, size_t>>> storage_accesses;
+  std::array<int64_t, kPipeCount> pipe_sizes{};
+  size_t rotating_fragments = 0, modular_groups = 0, sort_comparisons = 0, sweep_visits = 0;
+  size_t atom_tests = 0, shortest_path_runs = 0, shortest_path_edge_visits = 0;
+  size_t retained_frontier_entries = 0, quotient_edges = 0;
+  std::optional<__int128> Threshold(size_t source, bool sc, size_t target, bool tc) const;
   bool Precedes(int64_t a, size_t source, bool sc, int64_t b, size_t target, bool tc) const;
 };
 struct PointBoundary {
   std::optional<Occurrence> first_writer, last_writer;
   std::array<std::optional<Occurrence>, kPipeCount> first_readers{}, last_readers{};
 };
+class NumericalSyncHierarchy;
 class CompactSyncResult {
  public:
   CompactSyncInput input;
@@ -125,6 +159,17 @@ class CompactSyncResult {
   std::vector<Crossing> crossing_generators, crossing_demands;
   size_t analyzed_occurrences = 0, cells = 0, graph_edges = 0;
   size_t class_tests = 0, class_lookup_tests = 0, port_pair_tests = 0, crossing_path_searches = 0;
+  std::shared_ptr<const NumericalSyncHierarchy> hierarchy;
+  size_t interface_cells = 0, interface_slot_visits = 0, interface_ports = 0, interface_entries = 0;
+  size_t interface_queries = 0, merge_nodes = 0, crossing_tests = 0;
+  size_t interface_access_visits = 0, bridge_candidates = 0, port_normalization_visits = 0;
+  size_t omitted_bridge_domains = 0;
+  mutable size_t hierarchy_query_steps = 0;
+  bool HasHierarchy() const { return bool(hierarchy); }
+  std::vector<Crossing> ExpandRetainedDemands(size_t max_payloads) const;
+  // Finite crossing records only; shared repeated scopes need a separate endpoint map.
+  // Unavailable is distinct from an available empty crossing inventory.
+  std::optional<std::vector<Crossing>> ExportCrossingDemands() const;
   double import_seconds = 0;
   double partition_seconds = 0, reduction_seconds = 0, composition_seconds = 0;
   bool Precedes(const Occurrence& a, bool sc, const Occurrence& b, bool tc) const;
@@ -132,9 +177,13 @@ class CompactSyncResult {
   std::optional<PointBoundary> Boundary(size_t storage, int64_t row, int64_t column) const;
   std::optional<PointBoundary> BoundaryAt(size_t storage, int64_t row, int64_t column,
                                           const std::map<size_t, int64_t>& parameters) const;
+  // Explicit original physical slot. Legacy Boundary cannot omit this coordinate
+  // for a multi-slot domain. Nullopt means outside/unavailable, never absence.
+  std::optional<PointBoundary> BoundarySlot(size_t storage, int64_t slot, int64_t row, int64_t column,
+                                            const std::map<size_t, int64_t>& parameters = {}) const;
 
  private:
-  friend CompactSyncResult AnalyzeCompactSync(CompactSyncInput input);
+  friend CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& composition_order);
   std::optional<PointBoundary> RelativeBoundary(size_t storage, int64_t row, int64_t column) const;
   using Event = std::pair<Occurrence, bool>;
   std::map<Event, size_t> nodes_;
@@ -142,12 +191,15 @@ class CompactSyncResult {
   size_t Node(const Event& event);
   bool Path(size_t a, size_t b, std::optional<std::pair<size_t, size_t>> skip = std::nullopt) const;
 };
-// Bounded two-body reduction: every mutable class is visited by a writer in
-// every body, so storage generators span at most one visit. Alternative paths
-// lie in the same two-body interval. No trip count is unfolded. The research
-// boundary graph uses O(P^2) edges and BFS queries; it is not a claim of a
-// linear general regional implementation. P is retained boundary port count.
-CompactSyncResult AnalyzeCompactSync(CompactSyncInput input);
+// Common retained owner with representation-specific qualified construction.
+// The legacy no-slot route uses bounded two-body reduction and a research
+// boundary graph with O(P^2) edges/BFS queries (P is retained port count).
+// Explicit-slot routes retain numerical periodic frontiers and indexed chain
+// interfaces; shared reset repetition is analyzed without unfolding visits.
+// Geometry normalization and complete interface output costs are separate from
+// the compact reduction bounds. Unsupported premises remain explicit refusals.
+CompactSyncResult AnalyzeCompactSync(CompactSyncInput input,
+                                     const std::string& composition_order = "balanced");
 struct LogicalSyncRealization {
   FunctionPtr function;
   size_t record_sites = 0, wait_sites = 0, guarded_wait_sites = 0, carried_tokens = 0;

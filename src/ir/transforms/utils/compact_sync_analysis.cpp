@@ -20,7 +20,9 @@
 #include <utility>
 #include <vector>
 
+#include "numerical_sync_hierarchy.h"
 #include "pypto/core/logging.h"
+#include "rotating_sync_analysis.h"
 namespace pypto::ir::sync {
 namespace {
 struct Atom {
@@ -300,14 +302,35 @@ CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
   return result;
 }
 }  // namespace
+std::optional<__int128> CompactSegmentResult::Threshold(size_t source, bool sc, size_t target,
+                                                        bool tc) const {
+  CHECK(source < pipes.size() && target < pipes.size()) << "Invalid compact event type";
+  if (!rotating) {
+    if (!distance.empty()) {
+      const auto value = distance[2 * source + sc][2 * target + tc];
+      return value < 0 ? std::nullopt : std::optional<int64_t>(value);
+    }
+    return (source == target && sc == tc) || body.Precedes(source, sc, target, tc) ? std::optional<int64_t>(0)
+                                                                                   : std::nullopt;
+  }
+  const size_t pipe = static_cast<size_t>(pipes[source]);
+  const auto& value = frontier_distances[pipe + (sc ? kPipeCount : 0)].at(2 * target + tc);
+  if (!value) return std::nullopt;
+  const int64_t h = pipe_sizes[pipe];
+  // ceil((rank - beta)/h), beta=h-D. Avoid adding h to a potentially
+  // large distance: this equivalent form uses quotient and remainder.
+  const __int128 numerator = *value - (h - ranks[source]);
+  const __int128 threshold = numerator / h + (numerator % h > 0);
+  INTERNAL_CHECK(threshold >= 0) << "Periodic query threshold must be nonnegative";
+  return threshold;
+}
 bool CompactSegmentResult::Precedes(int64_t a, size_t source, bool sc, int64_t b, size_t target,
                                     bool tc) const {
   CHECK(a >= 0 && b >= 0 && a < count && b < count && source < pipes.size() && target < pipes.size())
       << "Invalid compact synchronization occurrence";
   if (a > b || (a == b && source == target && sc == tc)) return false;
-  if (distance.empty()) return body.Precedes(source, sc, target, tc);
-  auto d = distance[2 * source + sc][2 * target + tc];
-  return d >= 0 && d <= b - a;
+  const auto threshold = Threshold(source, sc, target, tc);
+  return threshold && *threshold <= b - a;
 }
 size_t CompactSyncResult::Node(const Event& e) {
   auto [found, inserted] = nodes_.emplace(e, nodes_.size());
@@ -332,7 +355,22 @@ bool CompactSyncResult::Path(size_t a, size_t b, std::optional<std::pair<size_t,
   }
   return false;
 }
-CompactSyncResult AnalyzeCompactSync(CompactSyncInput input) {
+CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& composition_order) {
+  CHECK(composition_order == "balanced" || composition_order == "left" || composition_order == "right")
+      << "Unknown numerical composition order";
+  const bool rotating =
+      std::any_of(input.segments.begin(), input.segments.end(), [&](const SyncSegment& region) {
+        return std::any_of(region.sites.begin(), region.sites.end(), [&](const SyncSite& site) {
+          return std::any_of(site.accesses.begin(), site.accesses.end(), [&](const SyncAccess& access) {
+            return input.storage.at(access.storage).slot_count > 1;
+          });
+        });
+      });
+  if (rotating)
+    return input.segments.size() > 1 ||
+                   (!input.segments.empty() && !input.segments.front().nested_frames.empty())
+               ? AnalyzeNumericalSync(std::move(input), composition_order)
+               : AnalyzeRotatingSync(std::move(input));
   CompactSyncResult result;
   result.input = std::move(input);
   using Clock = std::chrono::steady_clock;
@@ -424,6 +462,7 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input) {
   return result;
 }
 bool CompactSyncResult::Precedes(const Occurrence& a, bool sc, const Occurrence& b, bool tc) const {
+  if (hierarchy) return NumericalPrecedes(*this, a, sc, b, tc);
   auto [ar, av, as] = a;
   auto [br, bv, bs] = b;
   CHECK(ar < segments.size() && br < segments.size()) << "Invalid compact region";
@@ -452,7 +491,14 @@ std::optional<PointBoundary> CompactSyncResult::Boundary(size_t storage, int64_t
 }
 std::optional<PointBoundary> CompactSyncResult::BoundaryAt(
     size_t storage, int64_t row, int64_t column, const std::map<size_t, int64_t>& parameters) const {
-  if (storage >= input.storage.size()) return std::nullopt;
+  if (storage >= input.storage.size() || input.storage[storage].slot_count != 1) return std::nullopt;
+  return BoundarySlot(storage, 0, row, column, parameters);
+}
+std::optional<PointBoundary> CompactSyncResult::BoundarySlot(
+    size_t storage, int64_t slot, int64_t row, int64_t column,
+    const std::map<size_t, int64_t>& parameters) const {
+  if (storage >= input.storage.size() || slot < 0 || slot >= input.storage[storage].slot_count)
+    return std::nullopt;
   const auto& domain = input.storage[storage];
   if (domain.row_extent_parameter) {
     const auto parameter = *domain.row_extent_parameter;
@@ -482,6 +528,9 @@ std::optional<PointBoundary> CompactSyncResult::BoundaryAt(
   // The original domain is covered, but this invocation accesses only its
   // translated footprint. A point before that footprint is proven absent.
   if (row < *r || column < *c) return PointBoundary{};
+  if (hierarchy) return QueryNumericalBoundary(*this, storage, slot, row - *r, column - *c);
+  if (segments.size() == 1 && segments.front().rotating)
+    return RotatingBoundary(input, segments.front(), storage, slot, row - *r, column - *c);
   return RelativeBoundary(storage, row - *r, column - *c);
 }
 std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage, int64_t row,
@@ -530,5 +579,11 @@ std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage,
         out.last_readers[r.pipe] = last;
     }
   return out;
+}
+std::optional<std::vector<Crossing>> CompactSyncResult::ExportCrossingDemands() const {
+  return ExportNumericalCrossings(*this);
+}
+std::vector<Crossing> CompactSyncResult::ExpandRetainedDemands(size_t max_payloads) const {
+  return ExpandNumericalDemands(*this, max_payloads);
 }
 }  // namespace pypto::ir::sync

@@ -93,7 +93,7 @@ parameters support dense ND rank-2 FP16/BF16/FP32/INT32 tensors with static
 physical shapes and more than one column. Arithmetic recipes impose their own
 narrower dtype contracts. Normalized Tensor returns alias those parameters;
 the native kernel still returns void. Buffer parameter ABI, native function
-results, boxed subviews, mutable view metadata at allocation, slots, helpers, and other physical layouts are not yet supported
+results, boxed subviews, mutable view metadata at allocation, helper ABIs, and other physical layouts are not yet supported
 and produce explicit errors. Buffer type dumps use native
 `pypto.ir.BufferType(...)` constructors; binary serialization preserves their
 complete descriptors. Reparsing complete buffer-program dumps through the
@@ -143,6 +143,26 @@ addresses, including `-1`, are rejected. Both operands are non-memory values.
 Runtime values must be integer or `INDEX` scalars. Constant valid extents must
 lie between zero and their physical extent; runtime bounds and address
 nonnegativity are preconditions when they cannot be checked statically.
+
+`buffer.alloc_multi((), [effective_base])` declares one allocation with an
+explicit `MultiBufferType` result. The initial contract uses identical static
+slot descriptors and tightly packed physical slot bytes; total capacity is
+`slot_count * PhysicalBufferBytes(element_type)`, checked for overflow.
+`buffer.slot(group, index)` returns an alias with exactly the group's element
+descriptor. It reads descriptor metadata, not payload data, and neither allocates
+nor initializes storage. The dynamic index must satisfy `0 <= index < slot_count`
+on every execution; the operator checks constant indices, while analyses must
+prove dynamic bounds separately. Different selected handles are not evidence
+of disjointness. A dynamic selection's conservative window covers the whole
+allocation when its exact position is unavailable.
+
+The PTO adapter initially supports static descriptors in Vec/Mat/Acc, at most
+16 slots, and slot stride/base aligned to the backend's native allocation
+alignment. It rejects padding that would change the modeled stride. A singleton
+family lowers to an ordinary allocation. Delegated rotating code also needs the
+existing canonical unsigned-remainder qualification; co-live selectors inside
+one outer loop require a separately qualified PyPTO physical plan. These native
+restrictions are distinct from the numerical count represented by the IR type.
 
 `buffer.set_validshape(buffer, valid_extents)` returns `VoidType` and writes
 metadata only. Its `MakeTuple` operand includes **all** dimensions. Dimensions

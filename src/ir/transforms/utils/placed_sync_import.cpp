@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
@@ -30,6 +32,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/verifier/verifier.h"
@@ -230,6 +233,11 @@ class Importer {
   };
   std::unordered_map<const Expr*, VecView> vec_views;
   std::optional<size_t> vec_storage;
+  struct SlotSelection {
+    int64_t first, step;
+    const ForStmt* frame;
+  };
+  std::unordered_map<const Expr*, SlotSelection> slots;
   ParameterIndices parameters;
   CoordinateGraph coordinates;
   std::set<size_t> translated_storage;
@@ -246,6 +254,37 @@ class Importer {
         << "Invocation and loop coordinates must retain their original single-assignment identities";
     coordinates.Define(assign->var_, assign->value_, segment, parameters, result);
   }
+  void SelectSlot(const AssignStmtPtr& assign, const SyncSegment& segment) {
+    auto call = As<Call>(assign->value_);
+    OpRegistry::GetInstance().ValidateBufferCall(call);
+    const auto id = Storage(call->args_[0]);
+    const auto count = result.storage[id].slot_count;
+    RequireIndex(call->args_[1]);
+    ExprPtr index = call->args_[1];
+    bool modulo = false;
+    if (auto mod = As<FloorMod>(index)) {
+      RequireIndex(mod->left_);
+      RequireIndex(mod->right_);
+      CHECK(Constant(mod->right_) == count) << "Slot modulus must equal the allocation slot count";
+      index = mod->left_;
+      modulo = true;
+    }
+    const auto coordinate = Coordinate(index, segment);
+    CHECK(coordinate.parameters.empty()) << "Parameterized slot phase requires an explicit phase certificate";
+    CHECK(modulo || (!coordinate.second && coordinate.first < count))
+        << "Slot selection must be a constant in range or a proved nonnegative affine rotation";
+    objects[assign->var_.get()] = id;
+    slots[assign->var_.get()] = {coordinate.first % count, coordinate.second % count,
+                                 segment.original_loop.get()};
+  }
+  void ApplySlot(SyncAccess& access, const ExprPtr& handle, const SyncSegment& segment) const {
+    if (auto slot = slots.find(handle.get()); slot != slots.end()) {
+      CHECK(!slot->second.frame || slot->second.frame == segment.original_loop.get())
+          << "Slot selection belongs to another occurrence frame";
+      access.slot_first = slot->second.first;
+      access.slot_step = slot->second.step;
+    }
+  }
   void RegisterVec(const VarPtr& var, VecView view) {
     const auto type = view.type;
     // A full-valid column vector [R,1] occupies consecutive elements in either
@@ -255,6 +294,11 @@ class Importer {
         << "Synchronization Vec views require static full-valid dense descriptors";
     const auto end = Checked(__int128(view.address) + __int128(type->shape_[0] - 1) * view.pitch +
                              __int128(type->shape_[1]) * type->dtype_.GetByte());
+    for (const auto& old : result.storage) {
+      CHECK(old.space != MemorySpace::Vec || old.byte_coordinates ||
+            view.address >= old.address + old.bytes || old.address >= end)
+          << "Overlapping slot and ordinary Vec views require a common physical-layout partition";
+    }
     if (!vec_storage) {
       vec_storage = result.storage.size();
       result.storage.push_back({"Vec physical bytes", MemorySpace::Vec, 0, 1, end, end, nullptr, true});
@@ -297,11 +341,13 @@ class Importer {
       View(a, c);
       return;
     }
-    CHECK(c && IsOp(c, "buffer.alloc"))
+    CHECK(c && (IsOp(c, "buffer.alloc") || IsOp(c, "buffer.alloc_multi")))
         << "Unavailable storage/view or scalar definition in synchronization import";
     OpRegistry::GetInstance().ValidateBufferCall(c);
     CHECK(c->args_.size() == 2) << "Synchronization import requires placed buffer allocation addresses";
-    auto t = As<BufferType>(a->var_->GetType());
+    auto multi = As<MultiBufferType>(a->var_->GetType());
+    auto t = multi ? multi->element_type_ : As<BufferType>(a->var_->GetType());
+    const auto slot_count = multi ? multi->slot_count_ : 1;
     CHECK(t && t->shape_.size() == 2 && t->shape_ == t->valid_shape_ && t->dtype_.GetBit() % 8 == 0)
         << "Synchronization import needs fully valid byte-addressable rank-two buffers";
     CHECK(t->compact_ == CompactMode::null && t->pad_ == PadValue::null)
@@ -309,9 +355,19 @@ class Importer {
     auto valid = As<MakeTuple>(c->args_[0]);
     CHECK(valid && valid->elements_.empty()) << "Dynamic valid extents are not qualified";
     const auto address = Constant(c->args_[1]);
-    auto bytes = Checked(__int128(t->shape_[0]) * t->shape_[1] * t->dtype_.GetByte());
+    const auto slot_bytes = Checked(__int128(t->shape_[0]) * t->shape_[1] * t->dtype_.GetByte());
+    if (multi && slot_count > 1) {
+      // Native multi-tile lowering rounds each slot to the target alignment.
+      // Until padded slot geometry is represented, accept only equal strides.
+      const auto context = PassContext::Current();
+      const auto* backend = context ? context->GetBackend() : backend::GetBackend();
+      const auto alignment = backend->GetMemAlignment(t->memory_space_);
+      CHECK(alignment && slot_bytes % alignment == 0 && address % alignment == 0)
+          << "Multi-buffer placement requires aligned whole-slot geometry";
+    }
+    auto bytes = Checked(__int128(slot_bytes) * slot_count);
     Checked(__int128(address) + bytes);
-    if (t->memory_space_ == MemorySpace::Vec) {
+    if (t->memory_space_ == MemorySpace::Vec && !multi) {
       RegisterVec(a->var_, {address, Checked(__int128(t->shape_[1]) * t->dtype_.GetByte()), t});
       return;
     }
@@ -327,8 +383,8 @@ class Importer {
       if (old.space != t->memory_space_ || address >= old.address + old.bytes ||
           old.address >= address + bytes)
         continue;
-      CHECK(old.address == address && old.bytes == bytes && old.layout && old.rows == t->shape_[0] &&
-            old.columns == t->shape_[1] && old.layout->dtype_ == t->dtype_ &&
+      CHECK(old.address == address && old.bytes == bytes && old.slot_count == slot_count && old.layout &&
+            old.rows == t->shape_[0] && old.columns == t->shape_[1] && old.layout->dtype_ == t->dtype_ &&
             old.layout->blayout_ == t->blayout_ && old.layout->slayout_ == t->slayout_ &&
             old.layout->fractal_ == t->fractal_)
           << "Overlapping placed buffers need a common physical-layout partition";
@@ -338,6 +394,8 @@ class Importer {
     objects[a->var_.get()] = result.storage.size();
     result.storage.push_back(
         {a->var_->name_hint_, t->memory_space_, address, t->shape_[0], t->shape_[1], bytes, t});
+    result.storage.back().slot_count = slot_count;
+    result.storage.back().slot_bytes = slot_bytes;
   }
   SyncAccess Access(size_t storage, bool write, AffineCoordinate row, AffineCoordinate column, int64_t rows,
                     int64_t columns, const SyncSegment& segment) {
@@ -385,6 +443,7 @@ class Importer {
       }
       const auto& s = result.storage[id];
       site.accesses.push_back(Access(id, write, {0, 0}, {0, 0}, s.rows, s.columns, segment));
+      ApplySlot(site.accesses.back(), call->args_[arg], segment);
     };
     auto enclosure = [&](size_t arg, bool write) {
       const auto first = site.accesses.size();
@@ -441,6 +500,9 @@ class Importer {
             << "Unaligned boxed extraction requires a separate footprint contract";
       }
       site.accesses.push_back(Access(sid, false, row, column, t.rows, t.columns, segment));
+      CHECK(!extract || result.storage[sid].slot_count == 1)
+          << "Partial rotating-slot extraction requires a within-slot atom certificate";
+      ApplySlot(site.accesses.back(), call->args_[0], segment);
       modes[0].first = true;
       whole(target, true);
       site.pipe = PipeType::MTE1;
@@ -463,6 +525,8 @@ class Importer {
           rhs->shape_[1] > 0 && rhs->shape_[1] <= 4095 && lhs->shape_[1] == rhs->shape_[0] &&
           dst->shape_[0] == lhs->shape_[0] && dst->shape_[1] == rhs->shape_[1] &&
           (lhs->shape_[0] / 16) * (rhs->shape_[1] / 16) >= 10) {
+        CHECK(result.storage[Storage(call->args_[2])].slot_count == 1)
+            << "Rotating accumulator protection requires same-physical-slot qualification";
         site.protected_accumulator = Storage(call->args_[2]);
         site.initializes_accumulator = IsOp(call, "buffer.matmul");
       }
@@ -530,7 +594,11 @@ class Importer {
     bool preceding_matrix = false;
     for (const auto& s : Statements(stmt)) {
       if (auto assign = As<AssignStmt>(s)) {
-        DefineCoordinate(assign, segment);
+        auto call = As<Call>(assign->value_);
+        if (call && IsOp(call, "buffer.slot"))
+          SelectSlot(assign, segment);
+        else
+          DefineCoordinate(assign, segment);
       } else if (auto eval = As<EvalStmt>(s)) {
         auto call = As<Call>(eval->expr_);
         CHECK(call) << "Submit or non-call payload is not qualified";
@@ -787,7 +855,9 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
   }
   for (const auto& stmt : Statements(function->body_)) {
     if (auto a = As<AssignStmt>(stmt)) {
-      if (As<ScalarType>(a->var_->GetType())) {
+      if (auto call = As<Call>(a->value_); call && IsOp(call, "buffer.slot")) {
+        importer.SelectSlot(a, SyncSegment{});
+      } else if (As<ScalarType>(a->var_->GetType())) {
         importer.DefineCoordinate(a, SyncSegment{});
       } else {
         importer.Allocate(a);
@@ -833,6 +903,12 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
             CHECK(!access.row_step && !access.column_step && !access.after_first)
                 << "Nested moving accesses require a child-boundary summary";
         }
+        const bool rotating = std::any_of(s.sites.begin(), s.sites.end(), [&](const SyncSite& site) {
+          return std::any_of(site.accesses.begin(), site.accesses.end(), [&](const SyncAccess& access) {
+            return importer.result.storage[access.storage].slot_count > 1;
+          });
+        });
+        if (rotating) s.reset_period = inner.count;
         s.count = 1;
         for (const auto& frame : frames) s.count = Checked(__int128(s.count) * frame.count);
         s.nested_frames = std::move(frames);
@@ -844,6 +920,18 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
         importer.result.segments.emplace_back();
       importer.Body(stmt, importer.result.segments.back());
     }
+  }
+  // Each leaf has one permutation of every slot family. Different offsets
+  // are permitted, but different strides do not justify a period-one graph.
+  for (const auto& segment : importer.result.segments) {
+    std::map<size_t, int64_t> strides;
+    for (const auto& site : segment.sites)
+      for (const auto& access : site.accesses) {
+        if (importer.result.storage[access.storage].slot_count == 1) continue;
+        auto [found, inserted] = strides.emplace(access.storage, access.slot_step);
+        CHECK(inserted || found->second == access.slot_step)
+            << "Rotating family requires one common stride within a region";
+      }
   }
   return std::move(importer.result);
 }
