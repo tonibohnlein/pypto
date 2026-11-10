@@ -169,3 +169,14 @@ allocation and hybrid PTOAS delegation are unchanged. Missing placement, partial
 valid extents or illegal writable aliases still refuse transactionally. Row-major
 padded row-reduction output from PR #3333 remains outside this full-valid Buffer
 contract; integration of that API does not silently admit its padding as data.
+
+## Ready invocation coordinates
+
+The pass gathers bounded INDEX coordinates from the compiled program's direct
+Call/Submit sites before analyzing kernels. It joins all sites, preserves original
+formal positions, and leaves unknown bounds unproved. The importer admits a common
+parameter translation of each GM domain with checked arithmetic and allocation
+bounds; numerical analysis is retained without specializing to one tile offset.
+Storage queries require the corresponding original coordinate bindings.
+See the [parameterized prefill contract and checkpoint](../ir/16-parameterized-prefill-checkpoint.md).
+Nested Qwen composition and dynamic GM extent qualification remain outstanding.

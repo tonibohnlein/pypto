@@ -310,6 +310,7 @@ nav:
           - en/dev/ir/13-matmul-sync-prototype.md
           - en/dev/ir/14-logical-demand-realization.md
           - en/dev/ir/15-physical-demand-realization.md
+          - en/dev/ir/16-parameterized-prefill-checkpoint.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md

@@ -18,9 +18,22 @@
 #include <vector>
 
 #include "pypto/ir/function.h"
+#include "pypto/ir/program.h"
 #include "pypto/ir/transforms/utils/finite_sync_analysis.h"
 
 namespace pypto::ir::sync {
+// Inclusive caller-established bounds, keyed by the original formal parameter
+// index. Supplying a bound is a proof contract, not a specialization sample.
+using SyncParameterBounds = std::map<size_t, std::pair<int64_t, int64_t>>;
+using SyncTranslation = std::map<size_t, int64_t>;
+// Collect all direct call/submit sites. Unknown sites invalidate the respective
+// parameter evidence; neither SSA names nor tensor dimensions imply a bound.
+struct SyncParameterWork {
+  size_t expression_visits = 0, range_visits = 0;
+};
+std::map<std::string, SyncParameterBounds> CollectSyncParameterBounds(const ProgramPtr& program,
+                                                                      SyncParameterWork* work = nullptr);
+
 // Research provider contract: static placed local writes, affine read
 // rectangles, disjoint ND GM arguments, sequential constant-bound loops.
 // Matrix/GM geometry uses logical element coordinates in a retained layout,
@@ -32,6 +45,9 @@ struct SyncStorage {
   int64_t address, rows, columns, bytes;
   BufferTypePtr layout;           // Null for ND GM or the Vec byte domain.
   bool byte_coordinates = false;  // Vec: (row=0, column=physical byte address).
+  // Common invocation-invariant translation of EVERY access in this domain.
+  // Analysis uses relative coordinates; exports must bind these original params.
+  SyncTranslation row_parameters, column_parameters;
 };
 struct SyncAccess {
   size_t storage;
@@ -59,12 +75,15 @@ struct CompactSyncInput {
   std::string hardware_target;
   std::vector<SyncStorage> storage;
   std::vector<SyncSegment> segments;
+  SyncParameterBounds parameter_bounds;
+  size_t coordinate_nodes = 0, coordinate_flatten_visits = 0, coordinate_coefficient_entries = 0;
 };
 // Explicit qualification, not a default alias assumption. Unsupported input
 // throws a documented ValueError; no effects are skipped. Enclosures are explicit
 // in SyncAccess and remain selected-model, not exact physical, footprints.
 CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
-                                  const std::string& target = "a2a3");
+                                  const std::string& target = "a2a3",
+                                  const SyncParameterBounds& parameter_bounds = {});
 
 using Occurrence = std::tuple<size_t, int64_t, size_t>;  // segment, visit, site
 using Crossing = std::pair<Occurrence, Occurrence>;
@@ -98,9 +117,12 @@ class CompactSyncResult {
   bool Precedes(const Occurrence& a, bool sc, const Occurrence& b, bool tc) const;
   // Out-of-domain -> nullopt. Covered but untouched point -> empty boundary.
   std::optional<PointBoundary> Boundary(size_t storage, int64_t row, int64_t column) const;
+  std::optional<PointBoundary> BoundaryAt(size_t storage, int64_t row, int64_t column,
+                                          const std::map<size_t, int64_t>& parameters) const;
 
  private:
   friend CompactSyncResult AnalyzeCompactSync(CompactSyncInput input);
+  std::optional<PointBoundary> RelativeBoundary(size_t storage, int64_t row, int64_t column) const;
   using Event = std::pair<Occurrence, bool>;
   std::map<Event, size_t> nodes_;
   std::vector<std::vector<size_t>> graph_;

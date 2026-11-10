@@ -442,7 +442,7 @@ FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::stri
 }
 }  // namespace
 Pass RealizeSync() {
-  auto transform = [](const FunctionPtr& function) -> FunctionPtr {
+  auto transform = [](const FunctionPtr& function, const sync::SyncParameterBounds& bounds) -> FunctionPtr {
     if (!IsInCoreType(function->func_type_)) return function;
     // These functions do not enter PTO code generation; their external owner
     // remains responsible for synchronization. Do not claim PTOAS delegation.
@@ -467,7 +467,7 @@ Pass RealizeSync() {
     // Internal errors are deliberately not caught. The strict retained-result
     // APIs still throw on these user-facing input/proof refusals.
     try {
-      auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true, target));
+      auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true, target, bounds));
       auto physical = sync::RealizePhysicalSync(analysis, target, std::nullopt);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.
@@ -478,6 +478,15 @@ Pass RealizeSync() {
       return SyncOutcome(function, false, error.what());
     }
   };
-  return CreateFunctionPass(transform, "RealizeSync", PassProperties{});
+  // Range evidence belongs to this closed program's call sites, not mutable
+  // function metadata. Do not infer bounds when the standalone API has none.
+  return CreateProgramPass(
+      [transform](const ProgramPtr& program) {
+        auto bounds = sync::CollectSyncParameterBounds(program);
+        auto functions = program->functions_;
+        for (auto& [global, function] : functions) function = transform(function, bounds[global->name_]);
+        return std::make_shared<Program>(functions, program->name_, program->span_);
+      },
+      "RealizeSync", PassProperties{});
 }
 }  // namespace pypto::ir::pass
