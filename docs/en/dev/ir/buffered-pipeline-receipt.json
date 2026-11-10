@@ -1,0 +1,3006 @@
+{
+  "baseline_revision": "d0e227e7ec63894f3c508d14efd55fd113a5405f",
+  "baseline_tracked_status": "clean before this task; build-py314 untracked",
+  "baseline_files": {
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "f6981c9290bd329365d378cef18374ab9c9aea42b9957a59b0c6403832a3d07c",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "e3f3ba61118755c9e5b1a19e5c6dca4b73f75f271d026377cf4a41ddf9ef743f",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "b6750d79113627ce97bcbd861418fd914477f702cabc2e6a050fb535c5ab2f61",
+    "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "a5d9c0f59a4bfec969a1d3f479ddb68db4dadf735174171567694c95f6a9f1a7",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "df9491f8a30e672c6d46cb5b520ddc5ab05f0aa5b5055e58d889635ca0b8b327"
+  },
+  "paper_revision": "6d3765e4189ee8fd769234a3c63967af6e065cab",
+  "stages": [
+    {
+      "stage": 1,
+      "status": "accepted",
+      "review": "architecture/performance and correctness accepted; final serial gate passed",
+      "limitations": [
+        "Alias reconciliation may take O(V*S) for static views and storage descriptions.",
+        "Existing planner alignment is a sufficient native stride/base contract; padded slot geometry remains unavailable.",
+        "Affine slot import is broader than the canonical selectors currently delegated to PTOAS.",
+        "Recognition is not demand construction; new rotating demand export remains unavailable until Stage 2."
+      ],
+      "gate": {
+        "command_source": "range-nested-followup.json verification.gate.command plus test_lower_tile_to_buffer_slots.py and test_slot_sync_import.py",
+        "result": "1599 passed in 88.37s",
+        "log": "build-py314/buffered-stage1-accepted-gate.log",
+        "log_sha256": "7167015997c3ae4006cb37011a10981cd3589a8b97a5a732e596192dd1fd7ff3"
+      },
+      "source_hashes": {
+        "docs/en/dev/codegen/00-pto_codegen.md": "8570c6b0e793471ef27bf4c9a40cd64006183173fe3f47be7624ae1651b99e09",
+        "docs/en/dev/ir/02-types.md": "6a87d23c065e927b6d2c8c87aadeec297749e6a48ad0ee0e53ad7eb025c396f5",
+        "docs/en/dev/passes/58-lower_tile_to_buffer.md": "ae6bd144d81fe07c88003d4ec3552ec4b0e7f83c08e71b656038edc98972de7a",
+        "docs/zh/dev/codegen/00-pto_codegen.md": "9af02b8b50e10decb6c2bcf04bb6e66401117ec110d36c5cfd9f455cfb46d5e6",
+        "docs/zh/dev/ir/02-types.md": "b721ad64a02e8ee618882d1f455164d1ee998a59dd0c722bbc15c427bb0dff98",
+        "docs/zh/dev/passes/58-lower_tile_to_buffer.md": "a773f52e5171c7795af7143897fe89bfa8b7856971f65322db8319eedb7f0abd",
+        "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "9151dce337785b01a289b014fc7787963e4a32f34e72e3206710f2ab24995ce2",
+        "include/pypto/ir/transforms/utils/memref_utils.h": "a766ef6bc5a7b233a9718bcaba7f553a04a74aa2709c48888c3c0416bd1994f7",
+        "python/bindings/modules/testing.cpp": "43741954750bc036e4da2e37b1ffcdd26b63fba3b71e06077cc9fed0d6e88f1c",
+        "python/pypto/pypto_core/testing.pyi": "de03d5cd2d7702d5b794b10572478d3843eeb0c3cde9af96387ccea665275e51",
+        "src/codegen/pto/pto_buffer_codegen.cpp": "6d4f85a229a156d26c77e0fd7b85401c910c7a2a8fa36c15a9bc123c8f10b8f1",
+        "src/codegen/pto/pto_codegen.cpp": "6b8428dcb384a6b03e18de0919da4270508e185d4dd04c33a61e7f0a87ba7047",
+        "src/ir/op/buffer_ops/memory.cpp": "9699d5adc7fe26ba053b83195c56afc947a4b617facfa72999ea541edacf403f",
+        "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "18900d6cfd202c47ab2c9732f3b0c5ddbea9e500274bca1ce3ac509921cd055b",
+        "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "2bc269579cc9e5a7fbe0508fd12b5f0e68afb630ee07c5bae53c5d9afc19298e",
+        "src/ir/transforms/utils/compact_sync_analysis.cpp": "1f20a3d85747cd5c7e2d4e94e1972f1790716f507c9e8605e215741ea0e1215b",
+        "src/ir/transforms/utils/placed_sync_import.cpp": "17957c72acc92094768ba3ca628cb705c6616b6f22ad7c746d4d9c467fdf39df",
+        "src/ir/verifier/verify_buffer_ir.cpp": "dc221dd3ae6d94f464c2358bcee0402976edc23da38a5b01c3f941ce560501c1",
+        "docs/en/dev/ir/17-buffered-pipeline-checkpoint.md": "728b0543a18f9efe40ca68d88f505803586af1ded1356ab57cb72eaea7411a97",
+        "docs/zh/dev/ir/17-buffered-pipeline-checkpoint.md": "984e1e978f7750e13e5bed3ae7722f1ee094c72df7b4605682f658f6f34c139a",
+        "include/pypto/ir/transforms/utils/slot_index_qualification.h": "782574ac9d8e91691f35d503626bf757cfa618569938b2c7ecb32bd1e44c812f",
+        "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py": "33d9b178d74ca1692073b77b3e4f80dcf92d4d2623f68ac2bc99151efe930f3f",
+        "tests/ut/ir/transforms/test_slot_sync_import.py": "e8ab1890bfedcfc19446a933578f186ec2b19e021f7dfe149aa6c4f528b40c6b"
+      },
+      "extension_sha256": "6bd7cc174485781a06a3e2c36cfdab4e3b7bfbc01b165d2766c8da94ff864913"
+    },
+    {
+      "stage": 2,
+      "status": "accepted",
+      "review": "Independent architecture/algorithm and correctness reviews accepted; final serial gate passed",
+      "gate": {
+        "result": "1649 passed in 87.57s",
+        "log": "build-py314/buffered-stage2-accepted-gate.log",
+        "log_sha256": "7564c2641659639fadd89bb4aaf6841e09717b360d3da077dde0810cd65df14a"
+      },
+      "scaling": {
+        "source_revision": "d0e227e7ec63894f3c508d14efd55fd113a5405f",
+        "dirty_source_hashes": {
+          "CMakeLists.txt": "9c7bae49b7e5994866725b7eb222c76d351a74ed9e1b905502240afe13552ab5",
+          "docs/en/dev/codegen/00-pto_codegen.md": "8570c6b0e793471ef27bf4c9a40cd64006183173fe3f47be7624ae1651b99e09",
+          "docs/en/dev/ir/02-types.md": "6a87d23c065e927b6d2c8c87aadeec297749e6a48ad0ee0e53ad7eb025c396f5",
+          "docs/en/dev/passes/58-lower_tile_to_buffer.md": "ae6bd144d81fe07c88003d4ec3552ec4b0e7f83c08e71b656038edc98972de7a",
+          "docs/zh/dev/codegen/00-pto_codegen.md": "9af02b8b50e10decb6c2bcf04bb6e66401117ec110d36c5cfd9f455cfb46d5e6",
+          "docs/zh/dev/ir/02-types.md": "b721ad64a02e8ee618882d1f455164d1ee998a59dd0c722bbc15c427bb0dff98",
+          "docs/zh/dev/passes/58-lower_tile_to_buffer.md": "a773f52e5171c7795af7143897fe89bfa8b7856971f65322db8319eedb7f0abd",
+          "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "da4ea797192faa6cad3dc97da889b2a6fba935ef8d93e6fd70e5f1a60988bd92",
+          "include/pypto/ir/transforms/utils/memref_utils.h": "a766ef6bc5a7b233a9718bcaba7f553a04a74aa2709c48888c3c0416bd1994f7",
+          "python/bindings/modules/testing.cpp": "01018ab0772ed6c077511f343f7b8b9ac774dc0c1a6d0422e99b212b4896e464",
+          "python/pypto/pypto_core/testing.pyi": "40d05ad7f9f5272c9f7051e3cf6132512956322d6d8767fe0d21224dc3737c5b",
+          "src/codegen/pto/pto_buffer_codegen.cpp": "6d4f85a229a156d26c77e0fd7b85401c910c7a2a8fa36c15a9bc123c8f10b8f1",
+          "src/codegen/pto/pto_codegen.cpp": "6b8428dcb384a6b03e18de0919da4270508e185d4dd04c33a61e7f0a87ba7047",
+          "src/ir/op/buffer_ops/memory.cpp": "9699d5adc7fe26ba053b83195c56afc947a4b617facfa72999ea541edacf403f",
+          "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "18900d6cfd202c47ab2c9732f3b0c5ddbea9e500274bca1ce3ac509921cd055b",
+          "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "2bc269579cc9e5a7fbe0508fd12b5f0e68afb630ee07c5bae53c5d9afc19298e",
+          "src/ir/transforms/utils/compact_sync_analysis.cpp": "fc6fe04dfa6f323d09c3240551ae6af0729375f2e78503e30152d5afd0065007",
+          "src/ir/transforms/utils/logical_sync_realization.cpp": "a5d010a48303d80b276ad84344cb5f93a922bd8b6792e6838f10a0f800e7f23b",
+          "src/ir/transforms/utils/physical_sync_realization.cpp": "b00d72de71387146f22000d40186980f5387e1c74a78d67662fcee8d583ca074",
+          "src/ir/transforms/utils/placed_sync_import.cpp": "17957c72acc92094768ba3ca628cb705c6616b6f22ad7c746d4d9c467fdf39df",
+          "src/ir/verifier/verify_buffer_ir.cpp": "dc221dd3ae6d94f464c2358bcee0402976edc23da38a5b01c3f941ce560501c1",
+          "tests/ut/ir/transforms/sync_matmul_oracle.py": "232d04b0c464dbb0e3524c06aa8b5741a335ccc70d16946a6a25f8642c533133",
+          "include/pypto/ir/transforms/utils/slot_index_qualification.h": "782574ac9d8e91691f35d503626bf757cfa618569938b2c7ecb32bd1e44c812f",
+          "src/ir/transforms/utils/rotating_sync_analysis.cpp": "cc0974e0b846936b98b45eb038be54e43d8077003007dfd5fe4df864627b736b",
+          "src/ir/transforms/utils/rotating_sync_analysis.h": "84b1c21200c63f5325bc3bdacd7529f009121d5f681b60a76e5c231c5c533be7",
+          "tests/ut/ir/transforms/qualify_buffered_sync.py": "f15869e574cf7287f6c68f6b0f555e85726e6dba3f21224f374c7e59f249d22a",
+          "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py": "33d9b178d74ca1692073b77b3e4f80dcf92d4d2623f68ac2bc99151efe930f3f",
+          "tests/ut/ir/transforms/test_rotating_sync_analysis.py": "01661e45f89545085464dbbf9eea886c91e6839f1b4a672132d674f7e7597a77",
+          "tests/ut/ir/transforms/test_slot_sync_import.py": "e8ab1890bfedcfc19446a933578f186ec2b19e021f7dfe149aa6c4f528b40c6b"
+        },
+        "extensions": {
+          "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "68cf8b4b5bf1d42e0d46eba815d7d2be267cc59bbb60c2fc86b4db7804d96ed4"
+        },
+        "python": "3.14.7",
+        "target": "a2a3",
+        "disjoint_gm": true,
+        "timing_scope": "Single descriptive host runs; detail timers included in analysis, not additive",
+        "physical_scope": "Numerical geometry; large rings need not fit native local storage",
+        "device": "not run",
+        "cases": [
+          {
+            "axis": "trips",
+            "trips": 7,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0003885519690811634,
+            "timers": {
+              "import_seconds": 0.000370355,
+              "partition_seconds": 3.528e-06,
+              "reduction_seconds": 5.534e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4,
+            "semantic_checks": {
+              "payloads": 21,
+              "covers": 24,
+              "query_checks": 1764,
+              "boundary_checks": 10,
+              "access_checks": 21
+            }
+          },
+          {
+            "axis": "trips",
+            "trips": 1000,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0003129360266029835,
+            "timers": {
+              "import_seconds": 0.000292523,
+              "partition_seconds": 3.234e-06,
+              "reduction_seconds": 5.056e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "trips",
+            "trips": 1000000,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00026296498253941536,
+            "timers": {
+              "import_seconds": 0.000253202,
+              "partition_seconds": 2.16e-06,
+              "reduction_seconds": 3.483e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00023658573627471924,
+            "timers": {
+              "import_seconds": 0.000228706,
+              "partition_seconds": 1.918e-06,
+              "reduction_seconds": 3.007e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4,
+            "semantic_checks": {
+              "payloads": 21,
+              "covers": 24,
+              "query_checks": 1764,
+              "boundary_checks": 10,
+              "access_checks": 21
+            }
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 101,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00027609197422862053,
+            "timers": {
+              "import_seconds": 0.000263811,
+              "partition_seconds": 2.805e-06,
+              "reduction_seconds": 4.323e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 1000003,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00025889603421092033,
+            "timers": {
+              "import_seconds": 0.000250273,
+              "partition_seconds": 1.955e-06,
+              "reduction_seconds": 3.16e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00032193027436733246,
+            "timers": {
+              "import_seconds": 0.000313907,
+              "partition_seconds": 1.906e-06,
+              "reduction_seconds": 3.008e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 6,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 4,
+            "analysis_inclusive_seconds": 0.0011487361043691635,
+            "timers": {
+              "import_seconds": 0.001122401,
+              "partition_seconds": 5.461e-06,
+              "reduction_seconds": 1.6165e-05,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 16,
+              "atom_tests": 24,
+              "sort_comparisons": 55,
+              "sweep_visits": 48,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 336,
+              "retained_frontier_entries": 144,
+              "quotient_edges": 56,
+              "distance_entries": 0
+            },
+            "sites": 12,
+            "generators": 20,
+            "demands": 15
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 16,
+            "analysis_inclusive_seconds": 0.0041158199310302734,
+            "timers": {
+              "import_seconds": 0.004032128,
+              "partition_seconds": 1.8996e-05,
+              "reduction_seconds": 5.448e-05,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 64,
+              "atom_tests": 96,
+              "sort_comparisons": 355,
+              "sweep_visits": 192,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 1344,
+              "retained_frontier_entries": 576,
+              "quotient_edges": 224,
+              "distance_entries": 0
+            },
+            "sites": 48,
+            "generators": 80,
+            "demands": 64
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 64,
+            "analysis_inclusive_seconds": 0.01578844478353858,
+            "timers": {
+              "import_seconds": 0.015445782,
+              "partition_seconds": 7.3317e-05,
+              "reduction_seconds": 0.000237632,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 256,
+              "atom_tests": 384,
+              "sort_comparisons": 1985,
+              "sweep_visits": 768,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 5376,
+              "retained_frontier_entries": 2304,
+              "quotient_edges": 896,
+              "distance_entries": 0
+            },
+            "sites": 192,
+            "generators": 320,
+            "demands": 254
+          }
+        ]
+      },
+      "scaling_command": [
+        "/usr/bin/python3",
+        "-m",
+        "tests.ut.ir.transforms.qualify_buffered_sync",
+        "--output",
+        "build-py314/buffered-stage2-scaling.json"
+      ],
+      "limitations": [
+        "Single invariant periodic region; multi-region export is Stage 3.",
+        "Startup-dependent effects and protected accumulator transformations remain unavailable on rotating route.",
+        "General stationary rectangle normalization is separately charged and can be cubic; whole-slot normalization has one atom.",
+        "Executable endpoints for rotating result remain unavailable until Stage 5."
+      ]
+    },
+    {
+      "stage": 3,
+      "status": "accepted",
+      "review": "Independent architecture/algorithm and correctness reviews accepted; final serial gate passed",
+      "gate": {
+        "result": "1712 passed in 87.70s",
+        "log": "build-py314/buffered-stage3-accepted-gate.log",
+        "log_sha256": "9a3450cf1cc8fd824e113a726f159b472f14c15d7aa65c68127446cb55ead0c8"
+      },
+      "scaling": {
+        "source_revision": "d0e227e7ec63894f3c508d14efd55fd113a5405f",
+        "dirty_source_hashes": {
+          "CMakeLists.txt": "6e8d2315be68a7397c32b918a3768caaa7e5c02d0e46386d2d244060b132251d",
+          "docs/en/dev/codegen/00-pto_codegen.md": "8570c6b0e793471ef27bf4c9a40cd64006183173fe3f47be7624ae1651b99e09",
+          "docs/en/dev/ir/02-types.md": "6a87d23c065e927b6d2c8c87aadeec297749e6a48ad0ee0e53ad7eb025c396f5",
+          "docs/en/dev/passes/58-lower_tile_to_buffer.md": "ae6bd144d81fe07c88003d4ec3552ec4b0e7f83c08e71b656038edc98972de7a",
+          "docs/zh/dev/codegen/00-pto_codegen.md": "9af02b8b50e10decb6c2bcf04bb6e66401117ec110d36c5cfd9f455cfb46d5e6",
+          "docs/zh/dev/ir/02-types.md": "b721ad64a02e8ee618882d1f455164d1ee998a59dd0c722bbc15c427bb0dff98",
+          "docs/zh/dev/passes/58-lower_tile_to_buffer.md": "a773f52e5171c7795af7143897fe89bfa8b7856971f65322db8319eedb7f0abd",
+          "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "96f870818ca60bf723690d3cabcbe0f5db69f341034936104050e7dadb5b2eaa",
+          "include/pypto/ir/transforms/utils/memref_utils.h": "a766ef6bc5a7b233a9718bcaba7f553a04a74aa2709c48888c3c0416bd1994f7",
+          "python/bindings/modules/testing.cpp": "276fe0f9240d9d36adb988202e06eb63611d4e22ceb657edc0bad3f5adf0233d",
+          "python/pypto/pypto_core/testing.pyi": "51cd7a707e86122afaf238e8fc88d2ecef57538af079560d293677d5c994e280",
+          "src/codegen/pto/pto_buffer_codegen.cpp": "6d4f85a229a156d26c77e0fd7b85401c910c7a2a8fa36c15a9bc123c8f10b8f1",
+          "src/codegen/pto/pto_codegen.cpp": "6b8428dcb384a6b03e18de0919da4270508e185d4dd04c33a61e7f0a87ba7047",
+          "src/ir/op/buffer_ops/memory.cpp": "9699d5adc7fe26ba053b83195c56afc947a4b617facfa72999ea541edacf403f",
+          "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "18900d6cfd202c47ab2c9732f3b0c5ddbea9e500274bca1ce3ac509921cd055b",
+          "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "2bc269579cc9e5a7fbe0508fd12b5f0e68afb630ee07c5bae53c5d9afc19298e",
+          "src/ir/transforms/utils/compact_sync_analysis.cpp": "602361c1b6211300155b8b3bed6cf55a9f252966774178c2271e90d40ecc355a",
+          "src/ir/transforms/utils/logical_sync_realization.cpp": "a5d010a48303d80b276ad84344cb5f93a922bd8b6792e6838f10a0f800e7f23b",
+          "src/ir/transforms/utils/physical_sync_realization.cpp": "b00d72de71387146f22000d40186980f5387e1c74a78d67662fcee8d583ca074",
+          "src/ir/transforms/utils/placed_sync_import.cpp": "3cda289ec70c8d055107f717efd4f0404dea5c07093850bfaf4b9331943d7ffc",
+          "src/ir/verifier/verify_buffer_ir.cpp": "dc221dd3ae6d94f464c2358bcee0402976edc23da38a5b01c3f941ce560501c1",
+          "tests/ut/ir/transforms/sync_matmul_oracle.py": "4556d0bec4766dfcd123ff2b62337a1a0fa73539dbb4a467e3a4266d81ba4c82",
+          "include/pypto/ir/transforms/utils/slot_index_qualification.h": "782574ac9d8e91691f35d503626bf757cfa618569938b2c7ecb32bd1e44c812f",
+          "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "f2fa5af74b27131bae94b3898054691e845d8cae0e1947fb2a5f82cc88935d7c",
+          "src/ir/transforms/utils/numerical_sync_hierarchy.h": "f41d76753f14cb24c13ab789dcb5a16c31d410ee350e74b3691d8bffaa08173d",
+          "src/ir/transforms/utils/numerical_sync_merge.cpp": "08a49c88433cb62080ee84d62ddfa3a463bb50c2ce743d3131dc835bc3ded511",
+          "src/ir/transforms/utils/numerical_sync_merge.h": "4f735b351eddfce72531dbbd9cdbba2000f4930a27fbe3a13985bb26feb02d05",
+          "src/ir/transforms/utils/rotating_sync_analysis.cpp": "7cfa034984198766ea08e16182dc5ba17506a68f8982015288094f215810f359",
+          "src/ir/transforms/utils/rotating_sync_analysis.h": "9791fa33cfcf1f1bbbd06257cc09d7fd51b5497c62c4bf55e452d46338d46843",
+          "tests/ut/ir/transforms/qualify_buffered_sync.py": "f2d6f7e47437711b6ad0387cf2234996e6a9e4b08ee779eff489f2b6a67ae5b3",
+          "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py": "33d9b178d74ca1692073b77b3e4f80dcf92d4d2623f68ac2bc99151efe930f3f",
+          "tests/ut/ir/transforms/test_regional_slot_composition.py": "9bf51ed8a7d654fd608a420080ac3b650e5d42e3f99eee54922bb56bb4ddade3",
+          "tests/ut/ir/transforms/test_rotating_sync_analysis.py": "9291985ef973351529e98e1ee7d9b148880060f8a086fcb7deb2f1cf08c38e6f",
+          "tests/ut/ir/transforms/test_slot_sync_import.py": "e8ab1890bfedcfc19446a933578f186ec2b19e021f7dfe149aa6c4f528b40c6b"
+        },
+        "extensions": {
+          "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "47f3f5578e7f3ad79c3af540b6c12086492b4a16fd4b2e1927e0d481687f7f83"
+        },
+        "python": "3.14.7",
+        "target": "a2a3",
+        "disjoint_gm": true,
+        "timing_scope": "Single descriptive host runs; detail timers included in analysis, not additive",
+        "physical_scope": "Numerical geometry; large rings need not fit native local storage",
+        "device": "not run",
+        "cases": [
+          {
+            "axis": "trips",
+            "trips": 7,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0003739902749657631,
+            "timers": {
+              "import_seconds": 0.000353639,
+              "partition_seconds": 4.013e-06,
+              "reduction_seconds": 5.416e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4,
+            "semantic_checks": {
+              "payloads": 21,
+              "covers": 24,
+              "query_checks": 1764,
+              "boundary_checks": 10,
+              "access_checks": 21
+            }
+          },
+          {
+            "axis": "trips",
+            "trips": 1000,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0002866871654987335,
+            "timers": {
+              "import_seconds": 0.000270877,
+              "partition_seconds": 3.363e-06,
+              "reduction_seconds": 4.809e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "trips",
+            "trips": 1000000,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0002448991872370243,
+            "timers": {
+              "import_seconds": 0.000235108,
+              "partition_seconds": 2.302e-06,
+              "reduction_seconds": 3.123e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0002668658271431923,
+            "timers": {
+              "import_seconds": 0.00025708,
+              "partition_seconds": 2.375e-06,
+              "reduction_seconds": 3.329e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4,
+            "semantic_checks": {
+              "payloads": 21,
+              "covers": 24,
+              "query_checks": 1764,
+              "boundary_checks": 10,
+              "access_checks": 21
+            }
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 101,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0002629742957651615,
+            "timers": {
+              "import_seconds": 0.000250954,
+              "partition_seconds": 2.986e-06,
+              "reduction_seconds": 3.802e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 1000003,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00024005724117159843,
+            "timers": {
+              "import_seconds": 0.000230376,
+              "partition_seconds": 2.367e-06,
+              "reduction_seconds": 3.126e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0003323890268802643,
+            "timers": {
+              "import_seconds": 0.000323515,
+              "partition_seconds": 2.022e-06,
+              "reduction_seconds": 2.772e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 6,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 4,
+            "analysis_inclusive_seconds": 0.0010318211279809475,
+            "timers": {
+              "import_seconds": 0.00100524,
+              "partition_seconds": 5.535e-06,
+              "reduction_seconds": 1.5961e-05,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 16,
+              "atom_tests": 24,
+              "sort_comparisons": 55,
+              "sweep_visits": 48,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 336,
+              "retained_frontier_entries": 144,
+              "quotient_edges": 56,
+              "distance_entries": 0
+            },
+            "sites": 12,
+            "generators": 20,
+            "demands": 15
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 16,
+            "analysis_inclusive_seconds": 0.003916531335562468,
+            "timers": {
+              "import_seconds": 0.003831845,
+              "partition_seconds": 1.9418e-05,
+              "reduction_seconds": 5.4901e-05,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 64,
+              "atom_tests": 96,
+              "sort_comparisons": 355,
+              "sweep_visits": 192,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 1344,
+              "retained_frontier_entries": 576,
+              "quotient_edges": 224,
+              "distance_entries": 0
+            },
+            "sites": 48,
+            "generators": 80,
+            "demands": 64
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 64,
+            "analysis_inclusive_seconds": 0.01565210008993745,
+            "timers": {
+              "import_seconds": 0.015326914,
+              "partition_seconds": 7.0965e-05,
+              "reduction_seconds": 0.000226478,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 256,
+              "atom_tests": 384,
+              "sort_comparisons": 1985,
+              "sweep_visits": 768,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 5376,
+              "retained_frontier_entries": 2304,
+              "quotient_edges": 896,
+              "distance_entries": 0
+            },
+            "sites": 192,
+            "generators": 320,
+            "demands": 254
+          },
+          {
+            "axis": "inner",
+            "inner": 4,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00047624390572309494,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 150,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000354875,
+              "partition_seconds": 2.548e-06,
+              "reduction_seconds": 8.571e-06,
+              "composition_seconds": 0.00010468
+            }
+          },
+          {
+            "axis": "inner",
+            "inner": 1000,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00044229114428162575,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 151,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000328208,
+              "partition_seconds": 2.316e-06,
+              "reduction_seconds": 3.367e-06,
+              "composition_seconds": 9.6598e-05
+            }
+          },
+          {
+            "axis": "inner",
+            "inner": 1000000,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00038621388375759125,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 151,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.00029732,
+              "partition_seconds": 2.102e-06,
+              "reduction_seconds": 3.095e-06,
+              "composition_seconds": 7.1736e-05
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 2,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00034029316157102585,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 32,
+              "interface_entries": 896,
+              "interface_queries": 150,
+              "merge_nodes": 1,
+              "crossing_tests": 60,
+              "interface_access_visits": 13,
+              "bridge_candidates": 12,
+              "port_normalization_visits": 156
+            },
+            "timers": {
+              "import_seconds": 0.000299623,
+              "partition_seconds": 2.005e-06,
+              "reduction_seconds": 2.845e-06,
+              "composition_seconds": 2.68e-05
+            },
+            "semantic_checks": {
+              "payloads": 24,
+              "covers": 27,
+              "query_checks": 2304,
+              "boundary_checks": 10,
+              "access_checks": 24
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0004578852094709873,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 150,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.00034287,
+              "partition_seconds": 3.198e-06,
+              "reduction_seconds": 4.496e-06,
+              "composition_seconds": 9.5743e-05
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 64,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0004834001883864403,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 112,
+              "interface_entries": 3136,
+              "interface_queries": 150,
+              "merge_nodes": 6,
+              "crossing_tests": 360,
+              "interface_access_visits": 13,
+              "bridge_candidates": 72,
+              "port_normalization_visits": 546
+            },
+            "timers": {
+              "import_seconds": 0.000325788,
+              "partition_seconds": 2.404e-06,
+              "reduction_seconds": 3.663e-06,
+              "composition_seconds": 0.000137841
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 1000000,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0008192691020667553,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 416,
+              "interface_entries": 11648,
+              "interface_queries": 150,
+              "merge_nodes": 25,
+              "crossing_tests": 1500,
+              "interface_access_visits": 13,
+              "bridge_candidates": 300,
+              "port_normalization_visits": 2028
+            },
+            "timers": {
+              "import_seconds": 0.000302939,
+              "partition_seconds": 2.404e-06,
+              "reduction_seconds": 3.508e-06,
+              "composition_seconds": 0.000494725
+            }
+          },
+          {
+            "axis": "interface_slots",
+            "inner": 7,
+            "outer": 3,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00038442714139819145,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 48,
+              "interface_entries": 1344,
+              "interface_queries": 151,
+              "merge_nodes": 2,
+              "crossing_tests": 120,
+              "interface_access_visits": 13,
+              "bridge_candidates": 24,
+              "port_normalization_visits": 234
+            },
+            "timers": {
+              "import_seconds": 0.00029932,
+              "partition_seconds": 2.279e-06,
+              "reduction_seconds": 3.275e-06,
+              "composition_seconds": 4.092e-05
+            }
+          },
+          {
+            "axis": "interface_slots",
+            "inner": 7,
+            "outer": 3,
+            "slots": 11,
+            "analysis_inclusive_seconds": 0.00042067794129252434,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 10,
+              "interface_slot_visits": 36,
+              "interface_ports": 138,
+              "interface_entries": 3864,
+              "interface_queries": 380,
+              "merge_nodes": 2,
+              "crossing_tests": 180,
+              "interface_access_visits": 13,
+              "bridge_candidates": 42,
+              "port_normalization_visits": 522
+            },
+            "timers": {
+              "import_seconds": 0.000296507,
+              "partition_seconds": 2.103e-06,
+              "reduction_seconds": 3.268e-06,
+              "composition_seconds": 0.000106177
+            }
+          },
+          {
+            "axis": "interface_slots",
+            "inner": 7,
+            "outer": 3,
+            "slots": 101,
+            "analysis_inclusive_seconds": 0.0004238840192556381,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 10,
+              "interface_slot_visits": 36,
+              "interface_ports": 138,
+              "interface_entries": 3864,
+              "interface_queries": 380,
+              "merge_nodes": 2,
+              "crossing_tests": 180,
+              "interface_access_visits": 13,
+              "bridge_candidates": 42,
+              "port_normalization_visits": 522
+            },
+            "timers": {
+              "import_seconds": 0.000307157,
+              "partition_seconds": 2.299e-06,
+              "reduction_seconds": 3.315e-06,
+              "composition_seconds": 0.000101559
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 2,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0006170999258756638,
+            "work": {
+              "analyzed_occurrences": 6,
+              "interface_cells": 4,
+              "interface_slot_visits": 32,
+              "interface_ports": 48,
+              "interface_entries": 1344,
+              "interface_queries": 300,
+              "merge_nodes": 1,
+              "crossing_tests": 60,
+              "interface_access_visits": 26,
+              "bridge_candidates": 12,
+              "port_normalization_visits": 234
+            },
+            "timers": {
+              "import_seconds": 0.000545117,
+              "partition_seconds": 4.0689999999999995e-06,
+              "reduction_seconds": 6.5219999999999996e-06,
+              "composition_seconds": 4.848e-05
+            },
+            "semantic_checks": {
+              "payloads": 24,
+              "covers": 27,
+              "query_checks": 2304,
+              "boundary_checks": 10,
+              "access_checks": 24
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 4,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0012474581599235535,
+            "work": {
+              "analyzed_occurrences": 12,
+              "interface_cells": 4,
+              "interface_slot_visits": 64,
+              "interface_ports": 112,
+              "interface_entries": 3136,
+              "interface_queries": 600,
+              "merge_nodes": 3,
+              "crossing_tests": 180,
+              "interface_access_visits": 52,
+              "bridge_candidates": 36,
+              "port_normalization_visits": 546
+            },
+            "timers": {
+              "import_seconds": 0.00108328,
+              "partition_seconds": 7.339e-06,
+              "reduction_seconds": 1.4177e-05,
+              "composition_seconds": 0.000122254
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 8,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.002377835102379322,
+            "work": {
+              "analyzed_occurrences": 24,
+              "interface_cells": 4,
+              "interface_slot_visits": 128,
+              "interface_ports": 240,
+              "interface_entries": 6720,
+              "interface_queries": 1200,
+              "merge_nodes": 7,
+              "crossing_tests": 420,
+              "interface_access_visits": 104,
+              "bridge_candidates": 84,
+              "port_normalization_visits": 1170
+            },
+            "timers": {
+              "import_seconds": 0.002053719,
+              "partition_seconds": 9.990999999999998e-06,
+              "reduction_seconds": 1.9807999999999997e-05,
+              "composition_seconds": 0.000260964
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 16,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.004651383962482214,
+            "work": {
+              "analyzed_occurrences": 48,
+              "interface_cells": 4,
+              "interface_slot_visits": 256,
+              "interface_ports": 496,
+              "interface_entries": 13888,
+              "interface_queries": 2400,
+              "merge_nodes": 15,
+              "crossing_tests": 900,
+              "interface_access_visits": 208,
+              "bridge_candidates": 180,
+              "port_normalization_visits": 2418
+            },
+            "timers": {
+              "import_seconds": 0.003979424,
+              "partition_seconds": 1.854e-05,
+              "reduction_seconds": 4.4156e-05,
+              "composition_seconds": 0.00054561
+            }
+          }
+        ]
+      },
+      "scaling_command": [
+        "/usr/bin/python3",
+        "-m",
+        "tests.ut.ir.transforms.qualify_buffered_sync",
+        "--include-hierarchy",
+        "--output",
+        "build-py314/buffered-stage3-scaling.json"
+      ]
+    },
+    {
+      "stage": 4,
+      "status": "accepted",
+      "review": "Independent architecture/algorithm and correctness reviews accepted; final serial gate passed",
+      "gate": {
+        "result": "1758 passed in 91.22s",
+        "log": "build-py314/buffered-stage4-accepted-gate.log",
+        "log_sha256": "b161f4af72f0384c8f074c1994161427a869ddea08e71f8202290ac79882c851"
+      },
+      "focused": "46 passed in 0.33s",
+      "scaling": {
+        "source_revision": "d0e227e7ec63894f3c508d14efd55fd113a5405f",
+        "dirty_source_hashes": {
+          "CMakeLists.txt": "6e8d2315be68a7397c32b918a3768caaa7e5c02d0e46386d2d244060b132251d",
+          "docs/en/dev/codegen/00-pto_codegen.md": "8570c6b0e793471ef27bf4c9a40cd64006183173fe3f47be7624ae1651b99e09",
+          "docs/en/dev/ir/02-types.md": "6a87d23c065e927b6d2c8c87aadeec297749e6a48ad0ee0e53ad7eb025c396f5",
+          "docs/en/dev/passes/58-lower_tile_to_buffer.md": "ae6bd144d81fe07c88003d4ec3552ec4b0e7f83c08e71b656038edc98972de7a",
+          "docs/zh/dev/codegen/00-pto_codegen.md": "9af02b8b50e10decb6c2bcf04bb6e66401117ec110d36c5cfd9f455cfb46d5e6",
+          "docs/zh/dev/ir/02-types.md": "b721ad64a02e8ee618882d1f455164d1ee998a59dd0c722bbc15c427bb0dff98",
+          "docs/zh/dev/passes/58-lower_tile_to_buffer.md": "a773f52e5171c7795af7143897fe89bfa8b7856971f65322db8319eedb7f0abd",
+          "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "0aa0bbbdb3695a5d8cf1af2e8ddb74a64596d251192c668a3c3643b39b6f93b9",
+          "include/pypto/ir/transforms/utils/memref_utils.h": "a766ef6bc5a7b233a9718bcaba7f553a04a74aa2709c48888c3c0416bd1994f7",
+          "python/bindings/modules/testing.cpp": "48e9e4e69598107f296c711376d1ed5c01708d4c0b04d2bdd55635e24414c8fd",
+          "python/pypto/pypto_core/testing.pyi": "51cd7a707e86122afaf238e8fc88d2ecef57538af079560d293677d5c994e280",
+          "src/codegen/pto/pto_buffer_codegen.cpp": "6d4f85a229a156d26c77e0fd7b85401c910c7a2a8fa36c15a9bc123c8f10b8f1",
+          "src/codegen/pto/pto_codegen.cpp": "6b8428dcb384a6b03e18de0919da4270508e185d4dd04c33a61e7f0a87ba7047",
+          "src/ir/op/buffer_ops/memory.cpp": "9699d5adc7fe26ba053b83195c56afc947a4b617facfa72999ea541edacf403f",
+          "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "18900d6cfd202c47ab2c9732f3b0c5ddbea9e500274bca1ce3ac509921cd055b",
+          "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "2bc269579cc9e5a7fbe0508fd12b5f0e68afb630ee07c5bae53c5d9afc19298e",
+          "src/ir/transforms/utils/compact_sync_analysis.cpp": "602361c1b6211300155b8b3bed6cf55a9f252966774178c2271e90d40ecc355a",
+          "src/ir/transforms/utils/logical_sync_realization.cpp": "a5d010a48303d80b276ad84344cb5f93a922bd8b6792e6838f10a0f800e7f23b",
+          "src/ir/transforms/utils/physical_sync_realization.cpp": "b00d72de71387146f22000d40186980f5387e1c74a78d67662fcee8d583ca074",
+          "src/ir/transforms/utils/placed_sync_import.cpp": "3cda289ec70c8d055107f717efd4f0404dea5c07093850bfaf4b9331943d7ffc",
+          "src/ir/verifier/verify_buffer_ir.cpp": "dc221dd3ae6d94f464c2358bcee0402976edc23da38a5b01c3f941ce560501c1",
+          "tests/ut/ir/transforms/sync_matmul_oracle.py": "4556d0bec4766dfcd123ff2b62337a1a0fa73539dbb4a467e3a4266d81ba4c82",
+          "include/pypto/ir/transforms/utils/slot_index_qualification.h": "782574ac9d8e91691f35d503626bf757cfa618569938b2c7ecb32bd1e44c812f",
+          "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "9411dd793ede5aeebccc28fae033c56bbd5381b14d32cf3b86f2d3be365900c7",
+          "src/ir/transforms/utils/numerical_sync_hierarchy.h": "f41d76753f14cb24c13ab789dcb5a16c31d410ee350e74b3691d8bffaa08173d",
+          "src/ir/transforms/utils/numerical_sync_merge.cpp": "08a49c88433cb62080ee84d62ddfa3a463bb50c2ce743d3131dc835bc3ded511",
+          "src/ir/transforms/utils/numerical_sync_merge.h": "4f735b351eddfce72531dbbd9cdbba2000f4930a27fbe3a13985bb26feb02d05",
+          "src/ir/transforms/utils/rotating_sync_analysis.cpp": "03c9a5392b6ee6d296b49026c51f4bae5891dbfc6759e0713969da6c0a135a08",
+          "src/ir/transforms/utils/rotating_sync_analysis.h": "9791fa33cfcf1f1bbbd06257cc09d7fd51b5497c62c4bf55e452d46338d46843",
+          "tests/ut/ir/transforms/qualify_buffered_sync.py": "3642b75f6bb171c96309eb7b0698c1c5be468e4241147fbe2ea266a963745238",
+          "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py": "33d9b178d74ca1692073b77b3e4f80dcf92d4d2623f68ac2bc99151efe930f3f",
+          "tests/ut/ir/transforms/test_regional_slot_composition.py": "9bf51ed8a7d654fd608a420080ac3b650e5d42e3f99eee54922bb56bb4ddade3",
+          "tests/ut/ir/transforms/test_rotating_sync_analysis.py": "de383675ddf93b74f876c44b1f3cf5570cbfb1f84c8004d16be3a823a11206f5",
+          "tests/ut/ir/transforms/test_slot_sync_import.py": "e8ab1890bfedcfc19446a933578f186ec2b19e021f7dfe149aa6c4f528b40c6b",
+          "tests/ut/ir/transforms/test_streamed_slot_composition.py": "7ac7b3f2fc40c69f84fa2300f0c06b8f626785b26db8c51a611aff1c1036df72"
+        },
+        "extensions": {
+          "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "17ace561a130a698871d15a07054bb0bde80d884809bc02ab4ab597dc03d7565"
+        },
+        "python": "3.14.7",
+        "target": "a2a3",
+        "disjoint_gm": true,
+        "timing_scope": "Single descriptive host runs; detail timers included in analysis, not additive",
+        "physical_scope": "Numerical geometry; large rings need not fit native local storage",
+        "device": "not run",
+        "cases": [
+          {
+            "axis": "trips",
+            "trips": 7,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00040915003046393394,
+            "timers": {
+              "import_seconds": 0.000386548,
+              "partition_seconds": 4.242e-06,
+              "reduction_seconds": 5.416e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4,
+            "semantic_checks": {
+              "payloads": 21,
+              "covers": 24,
+              "query_checks": 1764,
+              "boundary_checks": 10,
+              "access_checks": 21
+            }
+          },
+          {
+            "axis": "trips",
+            "trips": 1000,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0002939286641776562,
+            "timers": {
+              "import_seconds": 0.000275346,
+              "partition_seconds": 3.831e-06,
+              "reduction_seconds": 5.463e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "trips",
+            "trips": 1000000,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00027375388890504837,
+            "timers": {
+              "import_seconds": 0.000262558,
+              "partition_seconds": 2.672e-06,
+              "reduction_seconds": 3.645e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0002722227945923805,
+            "timers": {
+              "import_seconds": 0.000262651,
+              "partition_seconds": 2.376e-06,
+              "reduction_seconds": 3.099e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4,
+            "semantic_checks": {
+              "payloads": 21,
+              "covers": 24,
+              "query_checks": 1764,
+              "boundary_checks": 10,
+              "access_checks": 21
+            }
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 101,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0002641361206769943,
+            "timers": {
+              "import_seconds": 0.000251241,
+              "partition_seconds": 3.261e-06,
+              "reduction_seconds": 3.993e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 1000003,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00026648398488759995,
+            "timers": {
+              "import_seconds": 0.000256112,
+              "partition_seconds": 2.718e-06,
+              "reduction_seconds": 3.244e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0003484860062599182,
+            "timers": {
+              "import_seconds": 0.000338365,
+              "partition_seconds": 2.435e-06,
+              "reduction_seconds": 3.184e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 6,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 4,
+            "analysis_inclusive_seconds": 0.0010713646188378334,
+            "timers": {
+              "import_seconds": 0.001043477,
+              "partition_seconds": 5.864e-06,
+              "reduction_seconds": 1.6255e-05,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 16,
+              "atom_tests": 24,
+              "sort_comparisons": 55,
+              "sweep_visits": 48,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 336,
+              "retained_frontier_entries": 144,
+              "quotient_edges": 56,
+              "distance_entries": 0
+            },
+            "sites": 12,
+            "generators": 20,
+            "demands": 15
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 16,
+            "analysis_inclusive_seconds": 0.003998767118901014,
+            "timers": {
+              "import_seconds": 0.003916194,
+              "partition_seconds": 1.9994e-05,
+              "reduction_seconds": 5.0463e-05,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 64,
+              "atom_tests": 96,
+              "sort_comparisons": 355,
+              "sweep_visits": 192,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 1344,
+              "retained_frontier_entries": 576,
+              "quotient_edges": 224,
+              "distance_entries": 0
+            },
+            "sites": 48,
+            "generators": 80,
+            "demands": 64
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 64,
+            "analysis_inclusive_seconds": 0.01569914910942316,
+            "timers": {
+              "import_seconds": 0.015392908,
+              "partition_seconds": 6.6833e-05,
+              "reduction_seconds": 0.000215689,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 256,
+              "atom_tests": 384,
+              "sort_comparisons": 1985,
+              "sweep_visits": 768,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 5376,
+              "retained_frontier_entries": 2304,
+              "quotient_edges": 896,
+              "distance_entries": 0
+            },
+            "sites": 192,
+            "generators": 320,
+            "demands": 254
+          },
+          {
+            "axis": "inner",
+            "inner": 4,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0004625651054084301,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 150,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000346913,
+              "partition_seconds": 2.734e-06,
+              "reduction_seconds": 3.814e-06,
+              "composition_seconds": 0.000104054
+            }
+          },
+          {
+            "axis": "inner",
+            "inner": 1000,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00044060638174414635,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 151,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000328628,
+              "partition_seconds": 2.644e-06,
+              "reduction_seconds": 3.572e-06,
+              "composition_seconds": 9.2741e-05
+            }
+          },
+          {
+            "axis": "inner",
+            "inner": 1000000,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00041674496605992317,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 151,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000326755,
+              "partition_seconds": 2.447e-06,
+              "reduction_seconds": 3.257e-06,
+              "composition_seconds": 7.2255e-05
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 2,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0003620120696723461,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 32,
+              "interface_entries": 896,
+              "interface_queries": 150,
+              "merge_nodes": 1,
+              "crossing_tests": 60,
+              "interface_access_visits": 13,
+              "bridge_candidates": 12,
+              "port_normalization_visits": 156
+            },
+            "timers": {
+              "import_seconds": 0.000319126,
+              "partition_seconds": 2.374e-06,
+              "reduction_seconds": 3.047e-06,
+              "composition_seconds": 2.861e-05
+            },
+            "semantic_checks": {
+              "payloads": 24,
+              "covers": 27,
+              "query_checks": 2304,
+              "boundary_checks": 10,
+              "access_checks": 24
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00044716382399201393,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 150,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000333902,
+              "partition_seconds": 3.345e-06,
+              "reduction_seconds": 4.1e-06,
+              "composition_seconds": 9.6433e-05
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 64,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0004608691670000553,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 112,
+              "interface_entries": 3136,
+              "interface_queries": 150,
+              "merge_nodes": 6,
+              "crossing_tests": 360,
+              "interface_access_visits": 13,
+              "bridge_candidates": 72,
+              "port_normalization_visits": 546
+            },
+            "timers": {
+              "import_seconds": 0.000312307,
+              "partition_seconds": 2.857e-06,
+              "reduction_seconds": 3.4e-06,
+              "composition_seconds": 0.000130431
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 1000000,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0008232393302023411,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 416,
+              "interface_entries": 11648,
+              "interface_queries": 150,
+              "merge_nodes": 25,
+              "crossing_tests": 1500,
+              "interface_access_visits": 13,
+              "bridge_candidates": 300,
+              "port_normalization_visits": 2028
+            },
+            "timers": {
+              "import_seconds": 0.000307763,
+              "partition_seconds": 2.506e-06,
+              "reduction_seconds": 3.371e-06,
+              "composition_seconds": 0.000495296
+            }
+          },
+          {
+            "axis": "interface_slots",
+            "inner": 7,
+            "outer": 3,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0003882339224219322,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 48,
+              "interface_entries": 1344,
+              "interface_queries": 151,
+              "merge_nodes": 2,
+              "crossing_tests": 120,
+              "interface_access_visits": 13,
+              "bridge_candidates": 24,
+              "port_normalization_visits": 234
+            },
+            "timers": {
+              "import_seconds": 0.000302503,
+              "partition_seconds": 2.528e-06,
+              "reduction_seconds": 3.244e-06,
+              "composition_seconds": 4.2104e-05
+            }
+          },
+          {
+            "axis": "interface_slots",
+            "inner": 7,
+            "outer": 3,
+            "slots": 11,
+            "analysis_inclusive_seconds": 0.0004295129328966141,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 10,
+              "interface_slot_visits": 36,
+              "interface_ports": 138,
+              "interface_entries": 3864,
+              "interface_queries": 380,
+              "merge_nodes": 2,
+              "crossing_tests": 180,
+              "interface_access_visits": 13,
+              "bridge_candidates": 42,
+              "port_normalization_visits": 522
+            },
+            "timers": {
+              "import_seconds": 0.000306757,
+              "partition_seconds": 2.381e-06,
+              "reduction_seconds": 3.124e-06,
+              "composition_seconds": 0.000107961
+            }
+          },
+          {
+            "axis": "interface_slots",
+            "inner": 7,
+            "outer": 3,
+            "slots": 101,
+            "analysis_inclusive_seconds": 0.00042366189882159233,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 10,
+              "interface_slot_visits": 36,
+              "interface_ports": 138,
+              "interface_entries": 3864,
+              "interface_queries": 380,
+              "merge_nodes": 2,
+              "crossing_tests": 180,
+              "interface_access_visits": 13,
+              "bridge_candidates": 42,
+              "port_normalization_visits": 522
+            },
+            "timers": {
+              "import_seconds": 0.0003056,
+              "partition_seconds": 2.399e-06,
+              "reduction_seconds": 3.379e-06,
+              "composition_seconds": 0.000101134
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 2,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0006531341932713985,
+            "work": {
+              "analyzed_occurrences": 6,
+              "interface_cells": 4,
+              "interface_slot_visits": 32,
+              "interface_ports": 48,
+              "interface_entries": 1344,
+              "interface_queries": 300,
+              "merge_nodes": 1,
+              "crossing_tests": 60,
+              "interface_access_visits": 26,
+              "bridge_candidates": 12,
+              "port_normalization_visits": 234
+            },
+            "timers": {
+              "import_seconds": 0.00057907,
+              "partition_seconds": 4.52e-06,
+              "reduction_seconds": 6.367e-06,
+              "composition_seconds": 4.8216e-05
+            },
+            "semantic_checks": {
+              "payloads": 24,
+              "covers": 27,
+              "query_checks": 2304,
+              "boundary_checks": 10,
+              "access_checks": 24
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 4,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0012228148989379406,
+            "work": {
+              "analyzed_occurrences": 12,
+              "interface_cells": 4,
+              "interface_slot_visits": 64,
+              "interface_ports": 112,
+              "interface_entries": 3136,
+              "interface_queries": 600,
+              "merge_nodes": 3,
+              "crossing_tests": 180,
+              "interface_access_visits": 52,
+              "bridge_candidates": 36,
+              "port_normalization_visits": 546
+            },
+            "timers": {
+              "import_seconds": 0.001077152,
+              "partition_seconds": 7.5840000000000006e-06,
+              "reduction_seconds": 1.2591000000000002e-05,
+              "composition_seconds": 0.000110106
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 8,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.002402331680059433,
+            "work": {
+              "analyzed_occurrences": 24,
+              "interface_cells": 4,
+              "interface_slot_visits": 128,
+              "interface_ports": 240,
+              "interface_entries": 6720,
+              "interface_queries": 1200,
+              "merge_nodes": 7,
+              "crossing_tests": 420,
+              "interface_access_visits": 104,
+              "bridge_candidates": 84,
+              "port_normalization_visits": 1170
+            },
+            "timers": {
+              "import_seconds": 0.002058417,
+              "partition_seconds": 1.0889e-05,
+              "reduction_seconds": 2.0417999999999997e-05,
+              "composition_seconds": 0.000288681
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 16,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.004669475369155407,
+            "work": {
+              "analyzed_occurrences": 48,
+              "interface_cells": 4,
+              "interface_slot_visits": 256,
+              "interface_ports": 496,
+              "interface_entries": 13888,
+              "interface_queries": 2400,
+              "merge_nodes": 15,
+              "crossing_tests": 900,
+              "interface_access_visits": 208,
+              "bridge_candidates": 180,
+              "port_normalization_visits": 2418
+            },
+            "timers": {
+              "import_seconds": 0.00399695,
+              "partition_seconds": 1.7188e-05,
+              "reduction_seconds": 3.572800000000001e-05,
+              "composition_seconds": 0.000576536
+            }
+          },
+          {
+            "axis": "streamed_trips",
+            "trips": 7,
+            "analysis_inclusive_seconds": 0.0005694720894098282,
+            "work": {
+              "analyzed_occurrences": 5,
+              "interface_cells": 3,
+              "interface_slot_visits": 19,
+              "interface_entries": 2128,
+              "merge_nodes": 2,
+              "omitted_bridge_domains": 1
+            },
+            "owned_domains": 1,
+            "semantic_checks": {
+              "payloads": 23,
+              "covers": 20,
+              "query_checks": 2116,
+              "boundary_checks": 34,
+              "access_checks": 23
+            }
+          },
+          {
+            "axis": "streamed_trips",
+            "trips": 1000,
+            "analysis_inclusive_seconds": 0.0006145001389086246,
+            "work": {
+              "analyzed_occurrences": 5,
+              "interface_cells": 3,
+              "interface_slot_visits": 19,
+              "interface_entries": 2128,
+              "merge_nodes": 2,
+              "omitted_bridge_domains": 1
+            },
+            "owned_domains": 1
+          },
+          {
+            "axis": "streamed_trips",
+            "trips": 1000000,
+            "analysis_inclusive_seconds": 0.0005701961927115917,
+            "work": {
+              "analyzed_occurrences": 5,
+              "interface_cells": 3,
+              "interface_slot_visits": 19,
+              "interface_entries": 2128,
+              "merge_nodes": 2,
+              "omitted_bridge_domains": 1
+            },
+            "owned_domains": 1
+          }
+        ]
+      },
+      "scaling_command": [
+        "/usr/bin/python3",
+        "-m",
+        "tests.ut.ir.transforms.qualify_buffered_sync",
+        "--include-hierarchy",
+        "--include-streamed",
+        "--output",
+        "build-py314/buffered-stage4-scaling.json"
+      ],
+      "failed_attempt_logs": [
+        "build-py314/buffered-stage4-baseline-tests.log",
+        "build-py314/buffered-stage4-focused.log"
+      ]
+    },
+    {
+      "stage": 5,
+      "status": "accepted",
+      "review": "Independent architecture/algorithm and correctness reviewers accepted after the distinct-selector native case; broad gate passed",
+      "gate": {
+        "command": [
+          "/usr/bin/python3",
+          "-m",
+          "pytest",
+          "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+          "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+          "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+          "tests/ut/ir/transforms/test_logical_sync_realization.py",
+          "tests/ut/ir/transforms/test_physical_sync_realization.py",
+          "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+          "tests/ut/ir/transforms/test_row_sync_analysis.py",
+          "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+          "tests/ut/ir/transforms/test_autosync_switch.py",
+          "tests/ut/ir/transforms/test_parameterized_sync.py",
+          "tests/ut/ir/transforms/test_sync_range_proofs.py",
+          "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+          "tests/ut/ir/transforms/test_select_buffer_ir_functions.py",
+          "tests/ut/ir/transforms/test_lower_tile_to_buffer.py",
+          "tests/ut/codegen/test_buffer_codegen.py",
+          "-q",
+          "--require-ptoas",
+          "--basetemp=build-py314/buffered-stage5-gate",
+          "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py",
+          "tests/ut/ir/transforms/test_slot_sync_import.py",
+          "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+          "tests/ut/ir/transforms/test_regional_slot_composition.py",
+          "tests/ut/ir/transforms/test_streamed_slot_composition.py",
+          "tests/ut/ir/transforms/test_buffered_sync_realization.py"
+        ],
+        "result": "1796 passed in 94.44s",
+        "log": "build-py314/buffered-stage5-accepted-gate.log",
+        "log_sha256": "1fb366aeb237a4084c924b5749568b0d9c1053414e7ed5459cb570c48e98c9be"
+      },
+      "focused": {
+        "result": "38 passed in 0.87s",
+        "native_cpp_cases": 4,
+        "log": "build-py314/buffered-final-smoke.log",
+        "log_sha256": "b2e04f80457c0062817b7c055ca701f0655aaef68ab3e7401da4e6619df0d510"
+      },
+      "scaling": {
+        "source_revision": "d0e227e7ec63894f3c508d14efd55fd113a5405f",
+        "dirty_source_hashes": {
+          "CMakeLists.txt": "6e8d2315be68a7397c32b918a3768caaa7e5c02d0e46386d2d244060b132251d",
+          "docs/en/dev/codegen/00-pto_codegen.md": "8570c6b0e793471ef27bf4c9a40cd64006183173fe3f47be7624ae1651b99e09",
+          "docs/en/dev/ir/02-types.md": "6a87d23c065e927b6d2c8c87aadeec297749e6a48ad0ee0e53ad7eb025c396f5",
+          "docs/en/dev/passes/58-lower_tile_to_buffer.md": "ae6bd144d81fe07c88003d4ec3552ec4b0e7f83c08e71b656038edc98972de7a",
+          "docs/zh/dev/codegen/00-pto_codegen.md": "9af02b8b50e10decb6c2bcf04bb6e66401117ec110d36c5cfd9f455cfb46d5e6",
+          "docs/zh/dev/ir/02-types.md": "b721ad64a02e8ee618882d1f455164d1ee998a59dd0c722bbc15c427bb0dff98",
+          "docs/zh/dev/passes/58-lower_tile_to_buffer.md": "a773f52e5171c7795af7143897fe89bfa8b7856971f65322db8319eedb7f0abd",
+          "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "ca47f9863c46cd535df58545c09c05420d108b421da9efdfcbf33cc116e7e122",
+          "include/pypto/ir/transforms/utils/memref_utils.h": "a766ef6bc5a7b233a9718bcaba7f553a04a74aa2709c48888c3c0416bd1994f7",
+          "python/bindings/modules/testing.cpp": "3ba2b299638be20bea5752932333d10aba9d371bcb82ebdf339372e42156b077",
+          "python/pypto/pypto_core/testing.pyi": "21b7c702dd3fb070551c78d4ddfe9519130ec669f00c602989b0c4c37217cc2d",
+          "src/codegen/pto/pto_buffer_codegen.cpp": "6d4f85a229a156d26c77e0fd7b85401c910c7a2a8fa36c15a9bc123c8f10b8f1",
+          "src/codegen/pto/pto_codegen.cpp": "6b8428dcb384a6b03e18de0919da4270508e185d4dd04c33a61e7f0a87ba7047",
+          "src/ir/op/buffer_ops/memory.cpp": "9699d5adc7fe26ba053b83195c56afc947a4b617facfa72999ea541edacf403f",
+          "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "18900d6cfd202c47ab2c9732f3b0c5ddbea9e500274bca1ce3ac509921cd055b",
+          "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "2bc269579cc9e5a7fbe0508fd12b5f0e68afb630ee07c5bae53c5d9afc19298e",
+          "src/ir/transforms/utils/compact_sync_analysis.cpp": "e53eefc1d00e767734f553c84d2e4d0accbf7891115d352f346f29bde50fd4ce",
+          "src/ir/transforms/utils/logical_sync_realization.cpp": "a5d010a48303d80b276ad84344cb5f93a922bd8b6792e6838f10a0f800e7f23b",
+          "src/ir/transforms/utils/physical_sync_realization.cpp": "1a3adc5df137dc55d87066aa04775daed963c4d698a9ab22a3665e6993ed6e0f",
+          "src/ir/transforms/utils/placed_sync_import.cpp": "3cda289ec70c8d055107f717efd4f0404dea5c07093850bfaf4b9331943d7ffc",
+          "src/ir/verifier/verify_buffer_ir.cpp": "dc221dd3ae6d94f464c2358bcee0402976edc23da38a5b01c3f941ce560501c1",
+          "tests/ut/ir/transforms/sync_logical_oracle.py": "71ee21c9704e93c1216b80e4bc3f8d0f18e8498d98de2aaa03a7d6454dbe51f7",
+          "tests/ut/ir/transforms/sync_matmul_oracle.py": "4556d0bec4766dfcd123ff2b62337a1a0fa73539dbb4a467e3a4266d81ba4c82",
+          "tests/ut/ir/transforms/sync_physical_oracle.py": "390baeacc5d2dd619dab32a1db770d0c88684b20210750f9a958c0c055ae0796",
+          "include/pypto/ir/transforms/utils/slot_index_qualification.h": "782574ac9d8e91691f35d503626bf757cfa618569938b2c7ecb32bd1e44c812f",
+          "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "20399d98c6c690e80461002dc29195a234ca122a61a2abb39e5c37122f90d17c",
+          "src/ir/transforms/utils/numerical_sync_hierarchy.h": "b746b5eb02a6bee641ab6af38eb2f41c5cb0c05e5ea3ef8c36dd78cf8f477fb5",
+          "src/ir/transforms/utils/numerical_sync_merge.cpp": "08a49c88433cb62080ee84d62ddfa3a463bb50c2ce743d3131dc835bc3ded511",
+          "src/ir/transforms/utils/numerical_sync_merge.h": "4f735b351eddfce72531dbbd9cdbba2000f4930a27fbe3a13985bb26feb02d05",
+          "src/ir/transforms/utils/rotating_sync_analysis.cpp": "03c9a5392b6ee6d296b49026c51f4bae5891dbfc6759e0713969da6c0a135a08",
+          "src/ir/transforms/utils/rotating_sync_analysis.h": "9791fa33cfcf1f1bbbd06257cc09d7fd51b5497c62c4bf55e452d46338d46843",
+          "tests/ut/ir/transforms/qualify_buffered_sync.py": "7957dc267f4c1e4e1725f8749b899ab615472f20ad10362ecf03605bc21dd24a",
+          "tests/ut/ir/transforms/test_buffered_sync_realization.py": "539389bcf67d86745ecb3e1fbb289dde23e6a15c53239d89abaa3eef60683efe",
+          "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py": "33d9b178d74ca1692073b77b3e4f80dcf92d4d2623f68ac2bc99151efe930f3f",
+          "tests/ut/ir/transforms/test_regional_slot_composition.py": "9bf51ed8a7d654fd608a420080ac3b650e5d42e3f99eee54922bb56bb4ddade3",
+          "tests/ut/ir/transforms/test_rotating_sync_analysis.py": "de383675ddf93b74f876c44b1f3cf5570cbfb1f84c8004d16be3a823a11206f5",
+          "tests/ut/ir/transforms/test_slot_sync_import.py": "e8ab1890bfedcfc19446a933578f186ec2b19e021f7dfe149aa6c4f528b40c6b",
+          "tests/ut/ir/transforms/test_streamed_slot_composition.py": "7c9a7a9d24ae8bb78a9a0f081fad5861425e386999b86362ebbf4ffaa0ee016c"
+        },
+        "extensions": {
+          "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "c60feab9fe5fec24c030e74db6905b4f2a334fdd0fef58f351352ea1c77daeff"
+        },
+        "python": "3.14.7",
+        "target": "a2a3",
+        "disjoint_gm": true,
+        "timing_scope": "Single descriptive host runs; detail timers included in analysis, not additive",
+        "physical_scope": "Numerical geometry; large rings need not fit native local storage",
+        "device": "not run",
+        "cases": [
+          {
+            "axis": "trips",
+            "trips": 7,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0003956402651965618,
+            "timers": {
+              "import_seconds": 0.000374482,
+              "partition_seconds": 4.184e-06,
+              "reduction_seconds": 5.295e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4,
+            "semantic_checks": {
+              "payloads": 21,
+              "covers": 24,
+              "query_checks": 1764,
+              "boundary_checks": 10,
+              "access_checks": 21
+            }
+          },
+          {
+            "axis": "trips",
+            "trips": 1000,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0002842326648533344,
+            "timers": {
+              "import_seconds": 0.000268372,
+              "partition_seconds": 3.573e-06,
+              "reduction_seconds": 4.879e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "trips",
+            "trips": 1000000,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.000260921660810709,
+            "timers": {
+              "import_seconds": 0.000250894,
+              "partition_seconds": 2.461e-06,
+              "reduction_seconds": 3.113e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 3,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00024359067901968956,
+            "timers": {
+              "import_seconds": 0.000234712,
+              "partition_seconds": 2.045e-06,
+              "reduction_seconds": 2.959e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4,
+            "semantic_checks": {
+              "payloads": 21,
+              "covers": 24,
+              "query_checks": 1764,
+              "boundary_checks": 10,
+              "access_checks": 21
+            }
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 101,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00026673777028918266,
+            "timers": {
+              "import_seconds": 0.000254512,
+              "partition_seconds": 3.137e-06,
+              "reduction_seconds": 3.813e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "slots",
+            "trips": 7,
+            "slots": 1000003,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.0002384418621659279,
+            "timers": {
+              "import_seconds": 0.000228669,
+              "partition_seconds": 2.377e-06,
+              "reduction_seconds": 3.068e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 5,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 1,
+            "analysis_inclusive_seconds": 0.00032277172431349754,
+            "timers": {
+              "import_seconds": 0.000313383,
+              "partition_seconds": 2.234e-06,
+              "reduction_seconds": 2.986e-06,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 4,
+              "atom_tests": 6,
+              "sort_comparisons": 4,
+              "sweep_visits": 12,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 84,
+              "retained_frontier_entries": 36,
+              "quotient_edges": 14,
+              "distance_entries": 0
+            },
+            "sites": 3,
+            "generators": 5,
+            "demands": 4
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 4,
+            "analysis_inclusive_seconds": 0.0010768482461571693,
+            "timers": {
+              "import_seconds": 0.001049287,
+              "partition_seconds": 6.193e-06,
+              "reduction_seconds": 1.5747e-05,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 16,
+              "atom_tests": 24,
+              "sort_comparisons": 55,
+              "sweep_visits": 48,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 336,
+              "retained_frontier_entries": 144,
+              "quotient_edges": 56,
+              "distance_entries": 0
+            },
+            "sites": 12,
+            "generators": 20,
+            "demands": 15
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 16,
+            "analysis_inclusive_seconds": 0.004044701810926199,
+            "timers": {
+              "import_seconds": 0.003959014,
+              "partition_seconds": 1.9144e-05,
+              "reduction_seconds": 5.4968e-05,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 64,
+              "atom_tests": 96,
+              "sort_comparisons": 355,
+              "sweep_visits": 192,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 1344,
+              "retained_frontier_entries": 576,
+              "quotient_edges": 224,
+              "distance_entries": 0
+            },
+            "sites": 48,
+            "generators": 80,
+            "demands": 64
+          },
+          {
+            "axis": "stages",
+            "trips": 1000,
+            "slots": 5,
+            "stages": 64,
+            "analysis_inclusive_seconds": 0.015585120301693678,
+            "timers": {
+              "import_seconds": 0.015279268,
+              "partition_seconds": 6.7555e-05,
+              "reduction_seconds": 0.00021326,
+              "composition_seconds": 0.0
+            },
+            "work": {
+              "rotating_fragments": 256,
+              "atom_tests": 384,
+              "sort_comparisons": 1985,
+              "sweep_visits": 768,
+              "shortest_path_runs": 6,
+              "shortest_path_edge_visits": 5376,
+              "retained_frontier_entries": 2304,
+              "quotient_edges": 896,
+              "distance_entries": 0
+            },
+            "sites": 192,
+            "generators": 320,
+            "demands": 254
+          },
+          {
+            "axis": "inner",
+            "inner": 4,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00045515596866607666,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 150,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000336639,
+              "partition_seconds": 2.623e-06,
+              "reduction_seconds": 4.248e-06,
+              "composition_seconds": 0.000106449
+            }
+          },
+          {
+            "axis": "inner",
+            "inner": 1000,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0004123244434595108,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 151,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000303796,
+              "partition_seconds": 2.318e-06,
+              "reduction_seconds": 3.358e-06,
+              "composition_seconds": 9.059e-05
+            }
+          },
+          {
+            "axis": "inner",
+            "inner": 1000000,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00038605835288763046,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 151,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000301824,
+              "partition_seconds": 2.137e-06,
+              "reduction_seconds": 3.232e-06,
+              "composition_seconds": 6.8215e-05
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 2,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00034872395917773247,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 32,
+              "interface_entries": 896,
+              "interface_queries": 150,
+              "merge_nodes": 1,
+              "crossing_tests": 60,
+              "interface_access_visits": 13,
+              "bridge_candidates": 12,
+              "port_normalization_visits": 156
+            },
+            "timers": {
+              "import_seconds": 0.000301401,
+              "partition_seconds": 2.146e-06,
+              "reduction_seconds": 3.346e-06,
+              "composition_seconds": 3.3152e-05
+            },
+            "semantic_checks": {
+              "payloads": 24,
+              "covers": 27,
+              "query_checks": 2304,
+              "boundary_checks": 10,
+              "access_checks": 24
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 7,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00044041965156793594,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 80,
+              "interface_entries": 2240,
+              "interface_queries": 150,
+              "merge_nodes": 4,
+              "crossing_tests": 240,
+              "interface_access_visits": 13,
+              "bridge_candidates": 48,
+              "port_normalization_visits": 390
+            },
+            "timers": {
+              "import_seconds": 0.000328952,
+              "partition_seconds": 3.363e-06,
+              "reduction_seconds": 4.048e-06,
+              "composition_seconds": 9.458e-05
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 64,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00045620696619153023,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 112,
+              "interface_entries": 3136,
+              "interface_queries": 150,
+              "merge_nodes": 6,
+              "crossing_tests": 360,
+              "interface_access_visits": 13,
+              "bridge_candidates": 72,
+              "port_normalization_visits": 546
+            },
+            "timers": {
+              "import_seconds": 0.000305307,
+              "partition_seconds": 2.441e-06,
+              "reduction_seconds": 3.472e-06,
+              "composition_seconds": 0.000134549
+            }
+          },
+          {
+            "axis": "outer",
+            "inner": 4,
+            "outer": 1000000,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0008579930290579796,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 416,
+              "interface_entries": 11648,
+              "interface_queries": 150,
+              "merge_nodes": 25,
+              "crossing_tests": 1500,
+              "interface_access_visits": 13,
+              "bridge_candidates": 300,
+              "port_normalization_visits": 2028
+            },
+            "timers": {
+              "import_seconds": 0.000307962,
+              "partition_seconds": 2.354e-06,
+              "reduction_seconds": 3.433e-06,
+              "composition_seconds": 0.000529775
+            }
+          },
+          {
+            "axis": "interface_slots",
+            "inner": 7,
+            "outer": 3,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.00040946202352643013,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 4,
+              "interface_slot_visits": 16,
+              "interface_ports": 48,
+              "interface_entries": 1344,
+              "interface_queries": 151,
+              "merge_nodes": 2,
+              "crossing_tests": 120,
+              "interface_access_visits": 13,
+              "bridge_candidates": 24,
+              "port_normalization_visits": 234
+            },
+            "timers": {
+              "import_seconds": 0.000312187,
+              "partition_seconds": 2.317e-06,
+              "reduction_seconds": 3.145e-06,
+              "composition_seconds": 4.1579e-05
+            }
+          },
+          {
+            "axis": "interface_slots",
+            "inner": 7,
+            "outer": 3,
+            "slots": 11,
+            "analysis_inclusive_seconds": 0.0004726261831820011,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 10,
+              "interface_slot_visits": 36,
+              "interface_ports": 138,
+              "interface_entries": 3864,
+              "interface_queries": 380,
+              "merge_nodes": 2,
+              "crossing_tests": 180,
+              "interface_access_visits": 13,
+              "bridge_candidates": 42,
+              "port_normalization_visits": 522
+            },
+            "timers": {
+              "import_seconds": 0.000338429,
+              "partition_seconds": 2.391e-06,
+              "reduction_seconds": 3.32e-06,
+              "composition_seconds": 0.00011866
+            }
+          },
+          {
+            "axis": "interface_slots",
+            "inner": 7,
+            "outer": 3,
+            "slots": 101,
+            "analysis_inclusive_seconds": 0.0004829429090023041,
+            "work": {
+              "analyzed_occurrences": 3,
+              "interface_cells": 10,
+              "interface_slot_visits": 36,
+              "interface_ports": 138,
+              "interface_entries": 3864,
+              "interface_queries": 380,
+              "merge_nodes": 2,
+              "crossing_tests": 180,
+              "interface_access_visits": 13,
+              "bridge_candidates": 42,
+              "port_normalization_visits": 522
+            },
+            "timers": {
+              "import_seconds": 0.000340172,
+              "partition_seconds": 2.418e-06,
+              "reduction_seconds": 3.617e-06,
+              "composition_seconds": 0.000123409
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 2,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0006737080402672291,
+            "work": {
+              "analyzed_occurrences": 6,
+              "interface_cells": 4,
+              "interface_slot_visits": 32,
+              "interface_ports": 48,
+              "interface_entries": 1344,
+              "interface_queries": 300,
+              "merge_nodes": 1,
+              "crossing_tests": 60,
+              "interface_access_visits": 26,
+              "bridge_candidates": 12,
+              "port_normalization_visits": 234
+            },
+            "timers": {
+              "import_seconds": 0.000601491,
+              "partition_seconds": 4.209e-06,
+              "reduction_seconds": 6.2399999999999995e-06,
+              "composition_seconds": 4.8431e-05
+            },
+            "semantic_checks": {
+              "payloads": 24,
+              "covers": 27,
+              "query_checks": 2304,
+              "boundary_checks": 10,
+              "access_checks": 24
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 4,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.0012904410250484943,
+            "work": {
+              "analyzed_occurrences": 12,
+              "interface_cells": 4,
+              "interface_slot_visits": 64,
+              "interface_ports": 112,
+              "interface_entries": 3136,
+              "interface_queries": 600,
+              "merge_nodes": 3,
+              "crossing_tests": 180,
+              "interface_access_visits": 52,
+              "bridge_candidates": 36,
+              "port_normalization_visits": 546
+            },
+            "timers": {
+              "import_seconds": 0.001138259,
+              "partition_seconds": 7.699999999999999e-06,
+              "reduction_seconds": 1.236e-05,
+              "composition_seconds": 0.000115355
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 8,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.002480995375663042,
+            "work": {
+              "analyzed_occurrences": 24,
+              "interface_cells": 4,
+              "interface_slot_visits": 128,
+              "interface_ports": 240,
+              "interface_entries": 6720,
+              "interface_queries": 1200,
+              "merge_nodes": 7,
+              "crossing_tests": 420,
+              "interface_access_visits": 104,
+              "bridge_candidates": 84,
+              "port_normalization_visits": 1170
+            },
+            "timers": {
+              "import_seconds": 0.002118797,
+              "partition_seconds": 1.1046000000000002e-05,
+              "reduction_seconds": 2.1447e-05,
+              "composition_seconds": 0.000305489
+            }
+          },
+          {
+            "axis": "regions",
+            "inner": 4,
+            "outer": 16,
+            "slots": 3,
+            "analysis_inclusive_seconds": 0.004650179296731949,
+            "work": {
+              "analyzed_occurrences": 48,
+              "interface_cells": 4,
+              "interface_slot_visits": 256,
+              "interface_ports": 496,
+              "interface_entries": 13888,
+              "interface_queries": 2400,
+              "merge_nodes": 15,
+              "crossing_tests": 900,
+              "interface_access_visits": 208,
+              "bridge_candidates": 180,
+              "port_normalization_visits": 2418
+            },
+            "timers": {
+              "import_seconds": 0.003997137,
+              "partition_seconds": 1.9365999999999997e-05,
+              "reduction_seconds": 4.0936e-05,
+              "composition_seconds": 0.000549823
+            }
+          },
+          {
+            "axis": "streamed_trips",
+            "trips": 7,
+            "analysis_inclusive_seconds": 0.0005651162937283516,
+            "work": {
+              "analyzed_occurrences": 5,
+              "interface_cells": 3,
+              "interface_slot_visits": 19,
+              "interface_entries": 2128,
+              "merge_nodes": 2,
+              "omitted_bridge_domains": 1
+            },
+            "owned_domains": 1,
+            "semantic_checks": {
+              "payloads": 23,
+              "covers": 20,
+              "query_checks": 2116,
+              "boundary_checks": 34,
+              "access_checks": 23
+            }
+          },
+          {
+            "axis": "streamed_trips",
+            "trips": 1000,
+            "analysis_inclusive_seconds": 0.0006167073734104633,
+            "work": {
+              "analyzed_occurrences": 5,
+              "interface_cells": 3,
+              "interface_slot_visits": 19,
+              "interface_entries": 2128,
+              "merge_nodes": 2,
+              "omitted_bridge_domains": 1
+            },
+            "owned_domains": 1
+          },
+          {
+            "axis": "streamed_trips",
+            "trips": 1000000,
+            "analysis_inclusive_seconds": 0.0005639339797198772,
+            "work": {
+              "analyzed_occurrences": 5,
+              "interface_cells": 3,
+              "interface_slot_visits": 19,
+              "interface_entries": 2128,
+              "merge_nodes": 2,
+              "omitted_bridge_domains": 1
+            },
+            "owned_domains": 1
+          },
+          {
+            "axis": "physical_trips",
+            "form": "streamed",
+            "trips": 7,
+            "analysis_seconds": 0.0003184247761964798,
+            "physical_preparation_allocation_emission_seconds": 0.00013895099982619286,
+            "ordinary_production_inclusive_seconds": 0.0003896299749612808,
+            "source_ir_seconds": 0.0007372112013399601,
+            "static": {
+              "set_sites": 9,
+              "wait_sites": 9,
+              "barrier_sites": 0,
+              "guard_sites": 20,
+              "reserved_lanes": 9,
+              "reuse_queries": 9
+            },
+            "families": 3,
+            "source_arithmetic_operations": 76,
+            "source_bytes": 7940,
+            "bounded": {
+              "payloads": 21,
+              "sets": 18,
+              "waits": 18,
+              "barriers": 0,
+              "causal_reuses": 9,
+              "directional_ids": {
+                "1->4": [
+                  0,
+                  1,
+                  2
+                ],
+                "4->2": [
+                  0,
+                  1,
+                  2
+                ],
+                "2->1": [
+                  0,
+                  1,
+                  2
+                ]
+              },
+              "directional_width": {
+                "1->4": 3,
+                "4->2": 3,
+                "2->1": 3
+              },
+              "extra_payload_pairs": 0
+            }
+          },
+          {
+            "axis": "physical_trips",
+            "form": "streamed",
+            "trips": 1000,
+            "analysis_seconds": 0.0003483640030026436,
+            "physical_preparation_allocation_emission_seconds": 6.114598363637924e-05,
+            "ordinary_production_inclusive_seconds": 0.00037566525861620903,
+            "source_ir_seconds": 0.000559595413506031,
+            "static": {
+              "set_sites": 9,
+              "wait_sites": 9,
+              "barrier_sites": 0,
+              "guard_sites": 20,
+              "reserved_lanes": 9,
+              "reuse_queries": 9
+            },
+            "families": 3,
+            "source_arithmetic_operations": 76,
+            "source_bytes": 7961
+          },
+          {
+            "axis": "physical_trips",
+            "form": "streamed",
+            "trips": 1000000,
+            "analysis_seconds": 0.00031693559139966965,
+            "physical_preparation_allocation_emission_seconds": 5.220901221036911e-05,
+            "ordinary_production_inclusive_seconds": 0.00038601597771048546,
+            "source_ir_seconds": 0.0005318918265402317,
+            "static": {
+              "set_sites": 9,
+              "wait_sites": 9,
+              "barrier_sites": 0,
+              "guard_sites": 20,
+              "reserved_lanes": 9,
+              "reuse_queries": 9
+            },
+            "families": 3,
+            "source_arithmetic_operations": 76,
+            "source_bytes": 7985
+          },
+          {
+            "axis": "physical_trips",
+            "form": "resident_streamed_sequence",
+            "trips": 7,
+            "analysis_seconds": 0.0007564853876829147,
+            "physical_preparation_allocation_emission_seconds": 8.016219362616539e-05,
+            "ordinary_production_inclusive_seconds": 0.0008172867819666862,
+            "source_ir_seconds": 0.0008803443051874638,
+            "static": {
+              "set_sites": 12,
+              "wait_sites": 12,
+              "barrier_sites": 0,
+              "guard_sites": 22,
+              "reserved_lanes": 12,
+              "reuse_queries": 13
+            },
+            "families": 6,
+            "source_arithmetic_operations": 97,
+            "source_bytes": 11554,
+            "bounded": {
+              "payloads": 24,
+              "sets": 21,
+              "waits": 21,
+              "barriers": 0,
+              "causal_reuses": 10,
+              "directional_ids": {
+                "1->4": [
+                  0,
+                  1,
+                  2
+                ],
+                "4->1": [
+                  0
+                ],
+                "4->2": [
+                  0,
+                  1,
+                  2
+                ],
+                "2->1": [
+                  0,
+                  1,
+                  2
+                ],
+                "2->4": [
+                  0
+                ]
+              },
+              "directional_width": {
+                "1->4": 3,
+                "4->1": 1,
+                "4->2": 3,
+                "2->1": 3,
+                "2->4": 1
+              },
+              "extra_payload_pairs": 0
+            }
+          },
+          {
+            "axis": "physical_trips",
+            "form": "resident_streamed_sequence",
+            "trips": 1000,
+            "analysis_seconds": 0.0007462031207978725,
+            "physical_preparation_allocation_emission_seconds": 8.345209062099457e-05,
+            "ordinary_production_inclusive_seconds": 0.000793681014329195,
+            "source_ir_seconds": 0.0008249278180301189,
+            "static": {
+              "set_sites": 12,
+              "wait_sites": 12,
+              "barrier_sites": 0,
+              "guard_sites": 22,
+              "reserved_lanes": 12,
+              "reuse_queries": 13
+            },
+            "families": 6,
+            "source_arithmetic_operations": 97,
+            "source_bytes": 11581
+          },
+          {
+            "axis": "physical_trips",
+            "form": "resident_streamed_sequence",
+            "trips": 1000000,
+            "analysis_seconds": 0.0006931540556252003,
+            "physical_preparation_allocation_emission_seconds": 7.731933146715164e-05,
+            "ordinary_production_inclusive_seconds": 0.0007804897613823414,
+            "source_ir_seconds": 0.0008260798640549183,
+            "static": {
+              "set_sites": 12,
+              "wait_sites": 12,
+              "barrier_sites": 0,
+              "guard_sites": 22,
+              "reserved_lanes": 12,
+              "reuse_queries": 13
+            },
+            "families": 6,
+            "source_arithmetic_operations": 97,
+            "source_bytes": 11614
+          }
+        ]
+      },
+      "scaling_command": [
+        "/usr/bin/python3",
+        "-m",
+        "tests.ut.ir.transforms.qualify_buffered_sync",
+        "--include-hierarchy",
+        "--include-streamed",
+        "--include-physical",
+        "--output",
+        "build-py314/buffered-final-scaling.json"
+      ],
+      "limitations": [
+        "Shared reset repetition retains exact mathematics but repeated physical-family transport is unavailable.",
+        "An outside read/write invalidates streamed single-owner interface omission; no reset disjointness is inferred.",
+        "Writer-only prologue requiring a same-DMA-pipe barrier remains unavailable; the qualified resident-reader fixture is a separate original program.",
+        "Logical-token transport for new rotating displacement families remains unavailable; the specialized physical route does not lower arbitrary tokens.",
+        "Selected-model exactness depends on qualified physical layout and alias contracts; native entry/return and device behavior are unqualified.",
+        "No broad Qwen prefill or general guarded/indirect pipeline coverage is claimed."
+      ],
+      "failed_attempt_logs": [
+        "build-py314/buffered-stage5-focused.log"
+      ]
+    }
+  ],
+  "policy": {
+    "aggregate_workers": 2,
+    "device": "not available",
+    "allocation": "unchanged",
+    "default_dispatch": "unchanged",
+    "whole_nest_expansion": false
+  },
+  "baseline_extension": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "39fde84fe1fc37d0fffccd0e29a9d0f322ffb2d4afdc2bf3615fe42c83798e99"
+  },
+  "python": {
+    "version": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "executable": "/usr/bin/python3"
+  },
+  "baseline_binary_note": "Captured before first successful build/link; initial build stopped at operation validator compilation",
+  "paper_files": {
+    "sections/minimum_demands.tex": "0588d7346f534cd3b90b58872e143b30153d8e91f33424fef2c25fac9562c58e",
+    "appendices/compact_analysis_details.tex": "0a2792505c22128469919e85e894953c9ebc533be25c309e4414a4a008356789",
+    "sections/direct_realization.tex": "ab3594827523fea38d59aa54c11714f5b84220b78db2ce792c28bff919c47e8e"
+  },
+  "final_build": {
+    "command": [
+      "cmake",
+      "--build",
+      "build-py314",
+      "--parallel",
+      "1"
+    ],
+    "log": "build-py314/buffered-final-build.log",
+    "log_sha256": "1d2dee596beaa18edf26f346b3ee4df2ed047967134a21b2fbf91e68ea38eecb",
+    "note": "Final rebuild after header comments clarified representation scope; executable behavior unchanged. Final 38-test smoke and scaling use this binary."
+  },
+  "environment": {
+    "build_python": "/usr/bin/python3",
+    "build_python_version": "3.14.7",
+    "launcher_python_bin": "/home/toni/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/bin",
+    "launcher_python_version": "3.11.15",
+    "PYTHONPATH": "$PWD/python",
+    "PTOAS_ROOT": "$PWD/build-py314/physical-sync-prototype/ptoas-v072",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "PYPTO_CODEGEN_MAX_WORKERS": "1",
+    "resource_loader": ".claude/skills/testing/load-env.sh"
+  },
+  "tools": {
+    "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+    "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "c60feab9fe5fec24c030e74db6905b4f2a334fdd0fef58f351352ea1c77daeff"
+  },
+  "final_paper_files": {
+    "sections/minimum_demands.tex": "9c7e26d62efa0f2da590364bb4da5c0b4af46ca68964326aa278558f2eabd451",
+    "appendices/regional_composition_details.tex": "90b371612b622c97e389011ce21610913c784c53972131e9c60ed6ad05bff3d7",
+    "sections/direct_realization.tex": "ab3594827523fea38d59aa54c11714f5b84220b78db2ce792c28bff919c47e8e"
+  },
+  "paper_note": "Paper HEAD unchanged; section content changed independently during implementation. Original and final file hashes are distinct evidence.",
+  "review_policy": "Each stage accepted by independent architecture/algorithm and correctness reviewers, then its serial compatibility gate, before the next stage implementation.",
+  "final_style": {
+    "log": "build-py314/buffered-final-style.log",
+    "result": "ruff check, ruff format --check, clang-format --dry-run --Werror, git diff --check passed"
+  },
+  "commit_status": "uncommitted; no push performed",
+  "final_report_sha256": "8445055a789a2402dd5710ed7b99dcf99958471d3cab7131e8cbd57952e2a521"
+}

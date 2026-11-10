@@ -1,0 +1,795 @@
+{
+  "stage": "M4 scoped physical transport; ordinary production is M5",
+  "source_revision": "62ab48ed54325ee3cddfdb8b8579410aaa87d108",
+  "source_hashes": {
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "fa54de39f9ad65c0d36a573bf7b9f7a6c49ed380c9b1580945f56a78c013e82f",
+    "python/bindings/modules/testing.cpp": "f0e3cffe3c1cba00297d6e4963888baeebde3c6fd900c6ac054cce374db0a365",
+    "python/pypto/pypto_core/testing.pyi": "6256a6a88b0d67b1b58a3817788db5a7589610e2498b97f013cdbac1ccd8dab0",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "5085e3f3fa962deb76d90aeecf671e812cf34534545531cc7604e911065f0af5",
+    "src/ir/transforms/utils/invocation_sync_analysis.cpp": "ad7f87f0c8146964acdd25755facaa30c906e2c5daf4642318f65913990c5c47",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "d24054e97a9bea0b693e115851e2dbe93f583f481b859d82b222f475391ed8bf",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.h": "61c1fd47da5412ca5cd9ddcd81b7cab24f2bbd5694ffbed27e25461c8d89e7b5",
+    "src/ir/transforms/utils/numerical_sync_merge.cpp": "19cf7035a818bbd8b0b6da0200fa54f85b380f75ce027fb5bdde2fe1b66e4a54",
+    "src/ir/transforms/utils/numerical_sync_merge.h": "54b731ff9197125a34d73d6693ee18574a15d791ab862e91425e0925f0948444",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "2e93afafe8e71a7328714a81bc38b9441929c7f4ec8e6fbb5135ed52219f7548",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "b0092036cfb4181605d59e3872901dbc3dffa33bcf65ad02d7ad07c6a4acd0c1",
+    "src/ir/transforms/utils/rotating_sync_analysis.cpp": "79368aad849919fb4fb49e1bc5c8f9967c597a20c1a4dfca09b2f7980c23b1c0",
+    "src/ir/transforms/utils/rotating_sync_analysis.h": "e2df0be6ca1e48bd68c23387f2b69203bbdcbbd3ffca6e4215fb731e267a45c9",
+    "src/ir/transforms/utils/sync_placement.h": "c560ba871894966816301f844b96601d5412ddc0945242175838dc1c711a9611",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/config.py.source": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/configured_callers.py.source": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/constants.py.source": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/gate_up_projection.py.source": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/manifest.json": "e9c334a72af5af3553a50cea113cd560d1eace26599a894fa901fbc561e21898",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/output_projection.py.source": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/prefill_fwd.py.source": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/rms_lm_head.py.source": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77",
+    "tests/ut/ir/transforms/qualify_qwen_physical.py": "52bc51b9b28fd2b03ca7d9e6183b3eebbe2f8f65a9e7d7bb3571746564cd2495",
+    "tests/ut/ir/transforms/qualify_qwen_prefill.py": "e53d79d3f237a4f0f3406e8cf3ddc493d4333a9241178b5de829390196739b81",
+    "tests/ut/ir/transforms/sync_logical_oracle.py": "2e127faa6b7c6002cdda42b0afb7351e0a5b386936ae7c9e58dd0d9400ffdd46",
+    "tests/ut/ir/transforms/sync_matmul_oracle.py": "f7901eb546fcb6456698cf460c0cd85e260dc6397d8493040768518f4fd23482",
+    "tests/ut/ir/transforms/sync_physical_oracle.py": "07e3b3e28705c9ac3a4621c884ed6d54a4f12a904c5bbeedf75d5c6301179c1c",
+    "tests/ut/ir/transforms/sync_qwen_prefill_cases.py": "978daff489ea6bcafb12ca8b5111c156922efeab1b735ffae48f5967e5c6a667",
+    "tests/ut/ir/transforms/test_nested_sync_repetition.py": "215df7adf4a6fc4a882c7469e1a0f1ed13e1b5989c26a62d679d13034706666a",
+    "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "93cdb67b3e12b0856913503468fe4d106732ff3e380f6fc8628cf168eb8ba451",
+    "tests/ut/ir/transforms/test_scoped_physical_sync.py": "d63e8363ae1fc5ec4cd186e563c04bc8f9115bcc197f40ea31d9e7c851816bb5",
+    "tests/ut/ir/transforms/test_sync_range_proofs.py": "33c2fde1c80c32420f83e4c2adfaad0e2b70527df0597c0672cafaf8e4fc14d0"
+  },
+  "extension_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "5a29b5f5ec354154869ced42c70f91151ae099abc3be6cb14dfe155861c3ee68"
+  },
+  "python": "3.14.7",
+  "input_manifest": {
+    "revision": "f2c80074c0b06ab5bf87fc2bfb06db417fcd35f1",
+    "sources": {
+      "prefill_fwd.py": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "rms_lm_head.py": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77"
+    },
+    "gate_up_extraction": {
+      "source_lines": [
+        1369,
+        1405
+      ],
+      "body_ast_sha256": "344ebf0fc0b70335f24e153ec757bb0521a67d5bffa1ef5d0028420b4afcad07",
+      "adapter_sha256": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+      "adaptations": [
+        "Ready input tensors replace the external post_norm_ready task dependency at standalone invocation entry.",
+        "The original enclosing band_ob0 and band_core_rot assignments are retained; band remains an explicit parameter.",
+        "Allocate output in the caller; preserve both original projection loops and original launch width."
+      ]
+    },
+    "output_extraction": {
+      "source_lines": [
+        932,
+        953
+      ],
+      "adapter_sha256": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+      "adaptations": [
+        "No compute-body changes; standalone entry changes the JIT role only.",
+        "Configured tests explicitly replace the dynamic layer-row annotation by LAYERS*HIDDEN before parsing."
+      ]
+    },
+    "configured_caller_sha256": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe"
+  },
+  "ptoas": {
+    "launcher_hash": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+    "version": "ptoas 0.72"
+  },
+  "measurements": [
+    {
+      "name": "output",
+      "band": 3,
+      "hidden": 512,
+      "analysis_seconds": 0.0005508549511432648,
+      "physical_seconds": 0.00017749331891536713,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 6,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        },
+        {
+          "analyzed_occurrences": 0,
+          "source_region_nodes": 2,
+          "merge_nodes": 0,
+          "interface_entries": 0,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 0
+        }
+      ],
+      "set_sites": 13,
+      "wait_sites": 13,
+      "barrier_sites": 0,
+      "guard_sites": 36
+    },
+    {
+      "name": "output",
+      "band": 3,
+      "hidden": 1024,
+      "analysis_seconds": 0.0007198601961135864,
+      "physical_seconds": 0.0002246936783194542,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        },
+        {
+          "analyzed_occurrences": 0,
+          "source_region_nodes": 2,
+          "merge_nodes": 0,
+          "interface_entries": 0,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 0
+        }
+      ],
+      "set_sites": 17,
+      "wait_sites": 17,
+      "barrier_sites": 0,
+      "guard_sites": 55
+    },
+    {
+      "name": "output",
+      "band": 3,
+      "hidden": 5120,
+      "analysis_seconds": 0.0008112862706184387,
+      "physical_seconds": 0.00023657595738768578,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        }
+      ],
+      "set_sites": 17,
+      "wait_sites": 17,
+      "barrier_sites": 0,
+      "guard_sites": 26
+    },
+    {
+      "name": "gate_up",
+      "band": 0,
+      "hidden": 512,
+      "analysis_seconds": 0.0015231892466545105,
+      "physical_seconds": 0.0005538882687687874,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 11,
+          "merge_nodes": 7,
+          "interface_entries": 10696,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 16
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        }
+      ],
+      "set_sites": 57,
+      "wait_sites": 57,
+      "barrier_sites": 0,
+      "guard_sites": 156
+    },
+    {
+      "name": "gate_up",
+      "band": 0,
+      "hidden": 1024,
+      "analysis_seconds": 0.002141005825251341,
+      "physical_seconds": 0.000591672956943512,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 9,
+          "interface_entries": 16632,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 40
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        }
+      ],
+      "set_sites": 73,
+      "wait_sites": 73,
+      "barrier_sites": 0,
+      "guard_sites": 235
+    },
+    {
+      "name": "gate_up",
+      "band": 0,
+      "hidden": 5120,
+      "analysis_seconds": 0.003110676072537899,
+      "physical_seconds": 0.0008173282258212566,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 17,
+          "interface_entries": 29624,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 48
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        }
+      ],
+      "set_sites": 73,
+      "wait_sites": 73,
+      "barrier_sites": 0,
+      "guard_sites": 235
+    },
+    {
+      "name": "gate_up",
+      "band": 1,
+      "hidden": 512,
+      "analysis_seconds": 0.0022432650439441204,
+      "physical_seconds": 0.0006476636044681072,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 11,
+          "merge_nodes": 7,
+          "interface_entries": 10696,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 16
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        }
+      ],
+      "set_sites": 70,
+      "wait_sites": 70,
+      "barrier_sites": 0,
+      "guard_sites": 192
+    },
+    {
+      "name": "gate_up",
+      "band": 1,
+      "hidden": 1024,
+      "analysis_seconds": 0.002515892032533884,
+      "physical_seconds": 0.0008563660085201263,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 9,
+          "interface_entries": 16632,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 40
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        }
+      ],
+      "set_sites": 90,
+      "wait_sites": 90,
+      "barrier_sites": 0,
+      "guard_sites": 290
+    },
+    {
+      "name": "gate_up",
+      "band": 1,
+      "hidden": 5120,
+      "analysis_seconds": 0.004024876747280359,
+      "physical_seconds": 0.0009383768774569035,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 17,
+          "interface_entries": 29624,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 48
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        }
+      ],
+      "set_sites": 90,
+      "wait_sites": 90,
+      "barrier_sites": 0,
+      "guard_sites": 290
+    },
+    {
+      "name": "gate_up",
+      "band": 2,
+      "hidden": 512,
+      "analysis_seconds": 0.0025338130071759224,
+      "physical_seconds": 0.0008283131755888462,
+      "cases": [
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 11,
+          "merge_nodes": 7,
+          "interface_entries": 10696,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 16
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 11,
+          "merge_nodes": 7,
+          "interface_entries": 10696,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 16
+        }
+      ],
+      "set_sites": 88,
+      "wait_sites": 88,
+      "barrier_sites": 0,
+      "guard_sites": 240
+    },
+    {
+      "name": "gate_up",
+      "band": 2,
+      "hidden": 1024,
+      "analysis_seconds": 0.0029377471655607224,
+      "physical_seconds": 0.0011325920931994915,
+      "cases": [
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 9,
+          "interface_entries": 16632,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 40
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 9,
+          "interface_entries": 16632,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 40
+        }
+      ],
+      "set_sites": 112,
+      "wait_sites": 112,
+      "barrier_sites": 0,
+      "guard_sites": 360
+    },
+    {
+      "name": "gate_up",
+      "band": 2,
+      "hidden": 5120,
+      "analysis_seconds": 0.004663348197937012,
+      "physical_seconds": 0.0010940958745777607,
+      "cases": [
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 17,
+          "interface_entries": 29624,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 48
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 17,
+          "interface_entries": 29624,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 48
+        }
+      ],
+      "set_sites": 112,
+      "wait_sites": 112,
+      "barrier_sites": 0,
+      "guard_sites": 360
+    },
+    {
+      "name": "gate_up",
+      "band": 3,
+      "hidden": 512,
+      "analysis_seconds": 0.0023254849947988987,
+      "physical_seconds": 0.0008662622421979904,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 11,
+          "merge_nodes": 7,
+          "interface_entries": 10696,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 16
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 7,
+          "merge_nodes": 3,
+          "interface_entries": 4480,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 8
+        }
+      ],
+      "set_sites": 70,
+      "wait_sites": 70,
+      "barrier_sites": 0,
+      "guard_sites": 192
+    },
+    {
+      "name": "gate_up",
+      "band": 3,
+      "hidden": 1024,
+      "analysis_seconds": 0.002486840821802616,
+      "physical_seconds": 0.0009289663285017014,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 9,
+          "interface_entries": 16632,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 40
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 4,
+          "interface_entries": 7392,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 20
+        }
+      ],
+      "set_sites": 90,
+      "wait_sites": 90,
+      "barrier_sites": 0,
+      "guard_sites": 290
+    },
+    {
+      "name": "gate_up",
+      "band": 3,
+      "hidden": 5120,
+      "analysis_seconds": 0.0035153613425791264,
+      "physical_seconds": 0.0011366619728505611,
+      "cases": [
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        },
+        {
+          "analyzed_occurrences": 82,
+          "source_region_nodes": 13,
+          "merge_nodes": 17,
+          "interface_entries": 29624,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 48
+        },
+        {
+          "analyzed_occurrences": 41,
+          "source_region_nodes": 8,
+          "merge_nodes": 8,
+          "interface_entries": 13888,
+          "scoped_export_builds": 1,
+          "scoped_reuse_queries": 24
+        }
+      ],
+      "set_sites": 90,
+      "wait_sites": 90,
+      "barrier_sites": 0,
+      "guard_sites": 290
+    }
+  ],
+  "synthetic_scaling": [
+    {
+      "K_and_replay": 3,
+      "analysis_seconds": 0.0007626153528690338,
+      "physical_seconds": 0.00043630320578813553,
+      "analyzed_occurrences": 31,
+      "merge_nodes": 6,
+      "scoped_reuse_queries": 29,
+      "set_sites": 17,
+      "wait_sites": 17,
+      "barrier_sites": 0,
+      "guard_sites": 22,
+      "reuse_queries": 17
+    },
+    {
+      "K_and_replay": 16,
+      "analysis_seconds": 0.0007551428861916065,
+      "physical_seconds": 0.0001888582482933998,
+      "analyzed_occurrences": 31,
+      "merge_nodes": 13,
+      "scoped_reuse_queries": 29,
+      "set_sites": 17,
+      "wait_sites": 17,
+      "barrier_sites": 0,
+      "guard_sites": 22,
+      "reuse_queries": 17
+    },
+    {
+      "K_and_replay": 1024,
+      "analysis_seconds": 0.0009915800765156746,
+      "physical_seconds": 0.00018919538706541061,
+      "analyzed_occurrences": 31,
+      "merge_nodes": 31,
+      "scoped_reuse_queries": 29,
+      "set_sites": 17,
+      "wait_sites": 17,
+      "barrier_sites": 0,
+      "guard_sites": 22,
+      "reuse_queries": 17
+    },
+    {
+      "K_and_replay": 1000000,
+      "analysis_seconds": 0.0016156421042978764,
+      "physical_seconds": 0.00022909604012966156,
+      "analyzed_occurrences": 31,
+      "merge_nodes": 58,
+      "scoped_reuse_queries": 29,
+      "set_sites": 17,
+      "wait_sites": 17,
+      "barrier_sites": 0,
+      "guard_sites": 22,
+      "reuse_queries": 17
+    }
+  ],
+  "cpp": [
+    {
+      "name": "output",
+      "downstream_autosync": false,
+      "seconds": 0.10000529605895281,
+      "pto_hash": "99ac469e73e645ed9ab4b343de24faaa655dd3366735754ac30deffb921625e6",
+      "cpp_hash": "f77883e326f4eb2a44b421682d9c4552c3a1e8aa7d80a3cd16c4772c29f796fb"
+    },
+    {
+      "name": "output",
+      "downstream_autosync": true,
+      "seconds": 0.06082359002903104,
+      "pto_hash": "99ac469e73e645ed9ab4b343de24faaa655dd3366735754ac30deffb921625e6",
+      "cpp_hash": "f77883e326f4eb2a44b421682d9c4552c3a1e8aa7d80a3cd16c4772c29f796fb"
+    },
+    {
+      "name": "gate_up",
+      "downstream_autosync": false,
+      "seconds": 0.07638444611802697,
+      "pto_hash": "8c2f670698b8b9e7fa9edbeef08ff23f6c21e9454bb483b4ad8a2cf6de2a6686",
+      "cpp_hash": "509785206bf562099017f1042bcf68777ac9b7b996619c3b97d892d29e43743a"
+    },
+    {
+      "name": "gate_up",
+      "downstream_autosync": true,
+      "seconds": 0.07758004404604435,
+      "pto_hash": "8c2f670698b8b9e7fa9edbeef08ff23f6c21e9454bb483b4ad8a2cf6de2a6686",
+      "cpp_hash": "509785206bf562099017f1042bcf68777ac9b7b996619c3b97d892d29e43743a"
+    }
+  ],
+  "timing_claim": "Single serial descriptive timings; no speedup claim. Analysis and physical times are disjoint.",
+  "native_invocation_completion": "Unqualified beyond existing runtime/manual-mode contract",
+  "device": "Not run",
+  "complete": true,
+  "commands": [
+    "source .claude/skills/testing/load-env.sh",
+    "cmake --build build-py314 --parallel 1",
+    "timeout --signal=INT --kill-after=5s 240s /usr/bin/python3 -m tests.ut.ir.transforms.qualify_qwen_physical --output build-py314/qwen-prefill-m4"
+  ],
+  "reviews": {
+    "architecture": "accepted; initial gate plus complete affected-file rerun recorded",
+    "correctness": "accepted; initial gate plus complete affected-file rerun recorded",
+    "algorithm": "accepted; initial gate plus complete affected-file rerun recorded"
+  },
+  "validation": {
+    "initial_gate": {
+      "passed": 535,
+      "failed": 4,
+      "seconds": 322.05,
+      "log": "build-py314/qwen-prefill-m4-gate.log",
+      "junit": "build-py314/qwen-prefill-m4-gate.xml"
+    },
+    "affected_files_rerun": {
+      "passed": 128,
+      "failed": 0,
+      "seconds": 31.73,
+      "log": "build-py314/qwen-prefill-m4-affected.log",
+      "junit": "build-py314/qwen-prefill-m4-affected.xml"
+    },
+    "aggregate_unique_tests_passed": 539,
+    "fresh_all_green_run": false,
+    "repair": "Test oracle: identity-first occurrence validation, unique active name fallback after serialization/separate compilation. No compiler change."
+  },
+  "pre_oracle_fix_hash": "be3e3f4f9a57bddf33b6b8b87b39036ad86a7938c43aca4b88917b1af72ebda4"
+}

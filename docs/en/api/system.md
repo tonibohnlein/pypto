@@ -3,7 +3,7 @@
 Synchronization, cache and cross-core primitives. These are side-effecting statements
 rather than value-producing operators — most return nothing.
 
-Use `pl.system.barrier(pipe=...)` with any `pl.PipeType` member for a pipeline
+Use `pl.system.barrier(pipe=...)` with any `pl.PipeType` member except `S` for a pipeline
 barrier. A barrier is pipe-scoped: it drains whatever was issued on that pipe,
 so the pipe a transfer rides decides which barrier orders it — `MTE2` the
 GM → UB/L1 loads, `MTE3` the UB → GM stores and the A5 UB → L1 route, `MTE1` the

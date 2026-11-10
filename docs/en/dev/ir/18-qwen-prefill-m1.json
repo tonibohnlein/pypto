@@ -1,0 +1,1331 @@
+{
+  "stage": "M1 input qualification; M2-M5 not implemented",
+  "source_revision": "62ab48ed54325ee3cddfdb8b8579410aaa87d108",
+  "source_hashes": {
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "050e5c8e5248b85bc5da94eefe99dfd2d711637f85b6867d9ccc40d319931230",
+    "python/bindings/modules/testing.cpp": "9a4081d02f469b001581e1ffe3dca6d3883b3c1e9eb54c2f9930a5aabe0d49d2",
+    "python/pypto/pypto_core/testing.pyi": "d6667699055258eb4be277b65f70dfb07fe7c77e47d4cb5cef469c349c46dcbf",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "022fbc4b95f17a257ea6f93e0db132f93f7b654dea8779335fde3ec2231f9eee",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/config.py.source": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/configured_callers.py.source": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/constants.py.source": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/gate_up_projection.py.source": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/manifest.json": "e9c334a72af5af3553a50cea113cd560d1eace26599a894fa901fbc561e21898",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/output_projection.py.source": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/prefill_fwd.py.source": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/rms_lm_head.py.source": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77",
+    "tests/ut/ir/transforms/qualify_qwen_prefill.py": "788fa6b444a27201a2987d5bc8b834b0b904618f090d6513ba5273f0158afa99",
+    "tests/ut/ir/transforms/sync_matmul_oracle.py": "e38f98fd7b8ff3d1a8a8b4371234fb17f7c4ae44d9a1c4adfac11f8e8b9348cd",
+    "tests/ut/ir/transforms/sync_qwen_prefill_cases.py": "978daff489ea6bcafb12ca8b5111c156922efeab1b735ffae48f5967e5c6a667",
+    "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "834f9ed3ca613e00c1338824a01b2adf514754b5a864c6cc5a7741071d26fb99",
+    "tests/ut/ir/transforms/test_sync_range_proofs.py": "33c2fde1c80c32420f83e4c2adfaad0e2b70527df0597c0672cafaf8e4fc14d0",
+    "docs/en/dev/ir/18-qwen-prefill-pipeline.md": "6e44055e4307ae33945663622bb0b831c68c0c0f2c85fabde078e45057ca2065",
+    "docs/zh/dev/ir/18-qwen-prefill-pipeline.md": "1c14396ec46aeb287bc6763f2516119d44f2867180d4a1c15ab46f2688479747"
+  },
+  "extension_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "97d9270066e76bc24083e20d19e689b6ecaa560aa1c7868f88f24b9073252c8f"
+  },
+  "python": "3.14.7",
+  "input_manifest": {
+    "revision": "f2c80074c0b06ab5bf87fc2bfb06db417fcd35f1",
+    "sources": {
+      "prefill_fwd.py": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "rms_lm_head.py": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77"
+    },
+    "gate_up_extraction": {
+      "source_lines": [
+        1369,
+        1405
+      ],
+      "body_ast_sha256": "344ebf0fc0b70335f24e153ec757bb0521a67d5bffa1ef5d0028420b4afcad07",
+      "adapter_sha256": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+      "adaptations": [
+        "Ready input tensors replace the external post_norm_ready task dependency at standalone invocation entry.",
+        "The original enclosing band_ob0 and band_core_rot assignments are retained; band remains an explicit parameter.",
+        "Allocate output in the caller; preserve both original projection loops and original launch width."
+      ]
+    },
+    "output_extraction": {
+      "source_lines": [
+        932,
+        953
+      ],
+      "adapter_sha256": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+      "adaptations": [
+        "No compute-body changes; standalone entry changes the JIT role only.",
+        "Configured tests explicitly replace the dynamic layer-row annotation by LAYERS*HIDDEN before parsing."
+      ]
+    },
+    "configured_caller_sha256": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe"
+  },
+  "contract": {
+    "target": "a2a3",
+    "disjoint_gm": true,
+    "ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "entry": "standalone ready inputs, statically sized layer allocations",
+    "device": "not run",
+    "native_entry_return": "unqualified"
+  },
+  "measurements": [
+    {
+      "name": "output",
+      "hidden": 512,
+      "layers": 2,
+      "band": 3,
+      "seconds": {
+        "frontend_placement": 0.026152013801038265,
+        "caller_evidence": 6.622029468417168e-05
+      },
+      "evidence": {
+        "parameters": {
+          "out_proj_aic": {
+            "3": [
+              0,
+              1
+            ]
+          },
+          "out_proj_aic_spmd": {
+            "3": [
+              0,
+              1
+            ]
+          }
+        },
+        "block_indices": {
+          "out_proj_aic": [
+            0,
+            19
+          ],
+          "out_proj_aic_spmd": [
+            0,
+            19
+          ]
+        },
+        "call_graph_expression_visits": 143,
+        "call_graph_nodes": 3,
+        "call_graph_edges": 2,
+        "processed_functions": 3,
+        "expression_visits": 164,
+        "range_visits": 34
+      },
+      "timing_claim": "single descriptive measurement",
+      "analysis": {
+        "status": "unavailable",
+        "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+      }
+    },
+    {
+      "name": "output",
+      "hidden": 1024,
+      "layers": 2,
+      "band": 3,
+      "seconds": {
+        "frontend_placement": 0.021989600732922554,
+        "caller_evidence": 5.7796016335487366e-05
+      },
+      "evidence": {
+        "parameters": {
+          "out_proj_aic": {
+            "3": [
+              0,
+              1
+            ]
+          },
+          "out_proj_aic_spmd": {
+            "3": [
+              0,
+              1
+            ]
+          }
+        },
+        "block_indices": {
+          "out_proj_aic": [
+            0,
+            19
+          ],
+          "out_proj_aic_spmd": [
+            0,
+            19
+          ]
+        },
+        "call_graph_expression_visits": 156,
+        "call_graph_nodes": 3,
+        "call_graph_edges": 2,
+        "processed_functions": 3,
+        "expression_visits": 180,
+        "range_visits": 45
+      },
+      "timing_claim": "single descriptive measurement",
+      "analysis": {
+        "status": "unavailable",
+        "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+      }
+    },
+    {
+      "name": "output",
+      "hidden": 5120,
+      "layers": 2,
+      "band": 3,
+      "seconds": {
+        "frontend_placement": 0.019661339931190014,
+        "caller_evidence": 5.897087976336479e-05
+      },
+      "evidence": {
+        "parameters": {
+          "out_proj_aic": {
+            "3": [
+              0,
+              1
+            ]
+          },
+          "out_proj_aic_spmd": {
+            "3": [
+              0,
+              1
+            ]
+          }
+        },
+        "block_indices": {
+          "out_proj_aic": [
+            0,
+            19
+          ],
+          "out_proj_aic_spmd": [
+            0,
+            19
+          ]
+        },
+        "call_graph_expression_visits": 156,
+        "call_graph_nodes": 3,
+        "call_graph_edges": 2,
+        "processed_functions": 3,
+        "expression_visits": 180,
+        "range_visits": 45
+      },
+      "timing_claim": "single descriptive measurement",
+      "analysis": {
+        "status": "unavailable",
+        "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+      }
+    },
+    {
+      "name": "output",
+      "hidden": 51200,
+      "layers": 2,
+      "band": 3,
+      "seconds": {
+        "frontend_placement": 0.019539120141416788,
+        "caller_evidence": 6.114598363637924e-05
+      },
+      "evidence": {
+        "parameters": {
+          "out_proj_aic": {
+            "3": [
+              0,
+              1
+            ]
+          },
+          "out_proj_aic_spmd": {
+            "3": [
+              0,
+              1
+            ]
+          }
+        },
+        "block_indices": {
+          "out_proj_aic": [
+            0,
+            19
+          ],
+          "out_proj_aic_spmd": [
+            0,
+            19
+          ]
+        },
+        "call_graph_expression_visits": 156,
+        "call_graph_nodes": 3,
+        "call_graph_edges": 2,
+        "processed_functions": 3,
+        "expression_visits": 180,
+        "range_visits": 45
+      },
+      "timing_claim": "single descriptive measurement",
+      "analysis": {
+        "status": "unavailable",
+        "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+      }
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "layers": 2,
+      "band": 3,
+      "seconds": {
+        "frontend_placement": 0.03147282171994448,
+        "caller_evidence": 7.482431828975677e-05
+      },
+      "evidence": {
+        "parameters": {
+          "gate_up_proj": {
+            "3": [
+              0,
+              1
+            ]
+          },
+          "gate_up_proj_spmd": {
+            "3": [
+              0,
+              1
+            ]
+          }
+        },
+        "block_indices": {
+          "gate_up_proj": [
+            0,
+            23
+          ],
+          "gate_up_proj_spmd": [
+            0,
+            23
+          ]
+        },
+        "call_graph_expression_visits": 230,
+        "call_graph_nodes": 3,
+        "call_graph_edges": 2,
+        "processed_functions": 3,
+        "expression_visits": 284,
+        "range_visits": 60
+      },
+      "timing_claim": "single descriptive measurement",
+      "analysis": {
+        "status": "unavailable",
+        "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+      }
+    },
+    {
+      "name": "gate_up",
+      "hidden": 1024,
+      "layers": 2,
+      "band": 3,
+      "seconds": {
+        "frontend_placement": 0.031910428777337074,
+        "caller_evidence": 9.632902219891548e-05
+      },
+      "evidence": {
+        "parameters": {
+          "gate_up_proj": {
+            "3": [
+              0,
+              1
+            ]
+          },
+          "gate_up_proj_spmd": {
+            "3": [
+              0,
+              1
+            ]
+          }
+        },
+        "block_indices": {
+          "gate_up_proj": [
+            0,
+            23
+          ],
+          "gate_up_proj_spmd": [
+            0,
+            23
+          ]
+        },
+        "call_graph_expression_visits": 256,
+        "call_graph_nodes": 3,
+        "call_graph_edges": 2,
+        "processed_functions": 3,
+        "expression_visits": 316,
+        "range_visits": 82
+      },
+      "timing_claim": "single descriptive measurement",
+      "analysis": {
+        "status": "unavailable",
+        "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+      }
+    },
+    {
+      "name": "gate_up",
+      "hidden": 5120,
+      "layers": 2,
+      "band": 3,
+      "seconds": {
+        "frontend_placement": 0.031857462134212255,
+        "caller_evidence": 9.42060723900795e-05
+      },
+      "evidence": {
+        "parameters": {
+          "gate_up_proj": {
+            "3": [
+              0,
+              1
+            ]
+          },
+          "gate_up_proj_spmd": {
+            "3": [
+              0,
+              1
+            ]
+          }
+        },
+        "block_indices": {
+          "gate_up_proj": [
+            0,
+            23
+          ],
+          "gate_up_proj_spmd": [
+            0,
+            23
+          ]
+        },
+        "call_graph_expression_visits": 256,
+        "call_graph_nodes": 3,
+        "call_graph_edges": 2,
+        "processed_functions": 3,
+        "expression_visits": 316,
+        "range_visits": 82
+      },
+      "timing_claim": "single descriptive measurement",
+      "analysis": {
+        "status": "unavailable",
+        "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+      }
+    },
+    {
+      "name": "gate_up",
+      "hidden": 51200,
+      "layers": 2,
+      "band": 3,
+      "seconds": {
+        "frontend_placement": 0.031389562878757715,
+        "caller_evidence": 8.478714153170586e-05
+      },
+      "evidence": {
+        "parameters": {
+          "gate_up_proj": {
+            "3": [
+              0,
+              1
+            ]
+          },
+          "gate_up_proj_spmd": {
+            "3": [
+              0,
+              1
+            ]
+          }
+        },
+        "block_indices": {
+          "gate_up_proj": [
+            0,
+            23
+          ],
+          "gate_up_proj_spmd": [
+            0,
+            23
+          ]
+        },
+        "call_graph_expression_visits": 256,
+        "call_graph_nodes": 3,
+        "call_graph_edges": 2,
+        "processed_functions": 3,
+        "expression_visits": 316,
+        "range_visits": 82
+      },
+      "timing_claim": "single descriptive measurement",
+      "analysis": {
+        "status": "unavailable",
+        "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+      }
+    }
+  ],
+  "call_graph_scaling": [
+    {
+      "depth": 8,
+      "parameters": {
+        "f0": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f1": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f2": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f3": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f4": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f5": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f6": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f7": {
+          "0": [
+            0,
+            5120
+          ]
+        }
+      },
+      "block_indices": {
+        "f0": [
+          0,
+          23
+        ]
+      },
+      "call_graph_expression_visits": 22,
+      "call_graph_nodes": 9,
+      "call_graph_edges": 8,
+      "processed_functions": 9,
+      "expression_visits": 22,
+      "range_visits": 11
+    },
+    {
+      "depth": 16,
+      "parameters": {
+        "f0": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f1": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f10": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f11": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f12": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f13": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f14": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f15": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f2": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f3": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f4": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f5": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f6": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f7": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f8": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f9": {
+          "0": [
+            0,
+            5120
+          ]
+        }
+      },
+      "block_indices": {
+        "f0": [
+          0,
+          23
+        ]
+      },
+      "call_graph_expression_visits": 38,
+      "call_graph_nodes": 17,
+      "call_graph_edges": 16,
+      "processed_functions": 17,
+      "expression_visits": 38,
+      "range_visits": 19
+    },
+    {
+      "depth": 32,
+      "parameters": {
+        "f0": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f1": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f10": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f11": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f12": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f13": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f14": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f15": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f16": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f17": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f18": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f19": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f2": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f20": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f21": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f22": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f23": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f24": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f25": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f26": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f27": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f28": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f29": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f3": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f30": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f31": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f4": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f5": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f6": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f7": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f8": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f9": {
+          "0": [
+            0,
+            5120
+          ]
+        }
+      },
+      "block_indices": {
+        "f0": [
+          0,
+          23
+        ]
+      },
+      "call_graph_expression_visits": 70,
+      "call_graph_nodes": 33,
+      "call_graph_edges": 32,
+      "processed_functions": 33,
+      "expression_visits": 70,
+      "range_visits": 35
+    },
+    {
+      "depth": 64,
+      "parameters": {
+        "f0": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f1": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f10": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f11": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f12": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f13": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f14": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f15": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f16": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f17": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f18": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f19": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f2": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f20": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f21": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f22": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f23": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f24": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f25": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f26": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f27": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f28": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f29": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f3": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f30": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f31": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f32": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f33": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f34": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f35": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f36": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f37": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f38": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f39": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f4": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f40": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f41": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f42": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f43": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f44": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f45": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f46": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f47": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f48": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f49": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f5": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f50": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f51": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f52": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f53": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f54": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f55": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f56": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f57": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f58": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f59": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f6": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f60": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f61": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f62": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f63": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f7": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f8": {
+          "0": [
+            0,
+            5120
+          ]
+        },
+        "f9": {
+          "0": [
+            0,
+            5120
+          ]
+        }
+      },
+      "block_indices": {
+        "f0": [
+          0,
+          23
+        ]
+      },
+      "call_graph_expression_visits": 134,
+      "call_graph_nodes": 65,
+      "call_graph_edges": 64,
+      "processed_functions": 65,
+      "expression_visits": 134,
+      "range_visits": 67
+    }
+  ],
+  "native_source": [
+    {
+      "name": "output",
+      "seconds_inclusive": 0.1248138970695436,
+      "report": {
+        "downstream_autosync_enabled": true,
+        "kernels": [
+          {
+            "function": "out_proj_aic",
+            "selected_route": "ptoas",
+            "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+          }
+        ]
+      },
+      "cpp_hashes": {
+        "output/ptoas/out_proj_aic.cpp": "0ac3ac7b21d66bfd5d2eb13eaad0d00cb6dd5117fdb7636e2a49b5423d3d1835",
+        "output/orchestration/output_projection_caller.cpp": "0846ba67927b2e54005466cd4fc807abf23c78a8f7de7069df386c51e0ab7527",
+        "output/kernels/aic/out_proj_aic.cpp": "a34fdedb9b33617c30787b1e1f01a69262152ec1aa809f993a1c0d5aff378d6d"
+      }
+    },
+    {
+      "name": "gate_up",
+      "seconds_inclusive": 0.09474645229056478,
+      "report": {
+        "downstream_autosync_enabled": true,
+        "kernels": [
+          {
+            "function": "gate_up_proj",
+            "selected_route": "ptoas",
+            "reason": "Unavailable affine synchronization access\nCheck failed: false at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/placed_sync_import.cpp:139"
+          }
+        ]
+      },
+      "cpp_hashes": {
+        "gate_up/ptoas/gate_up_proj.cpp": "5bc2e06d9ce8cafdc11fdaeb5a14d822918ff67ab32b3e777cd6ac10731b0f87",
+        "gate_up/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+        "gate_up/kernels/aic/gate_up_proj.cpp": "e7a9f82c3571f581e50ef0f11eb1ea01ca50986cc89959166e2c001986b51c03"
+      }
+    }
+  ],
+  "ptoas": {
+    "launcher_hash": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+    "version": "ptoas 0.72",
+    "binary_hashes": {
+      "ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321",
+      "ptoas/mlir/_mlir_libs/_site_initialize_0.cpython-311-x86_64-linux-gnu.so": "225c1410b394ec8cb25365b91ed53b8dc650144cae9f34c6106d477903b07274",
+      "ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+      "ptoas/mlir/_mlir_libs/_mlir.cpython-311-x86_64-linux-gnu.so": "b618a015ad07cc38b59bc07184f63a1ca3c3def80314fb8558882b7c3a1c8d48",
+      "ptoas/mlir/_mlir_libs/_mlirDialectsLLVM.cpython-311-x86_64-linux-gnu.so": "fc346a487b9cec914d77f806c6847940ec25c3d2d77d0214dd8d3e829727d75b"
+    }
+  },
+  "complete": true,
+  "validation": {
+    "gate": {
+      "passed": 250,
+      "failed": 0,
+      "warnings": 11,
+      "seconds": 27.33
+    },
+    "control_executions": 232,
+    "access_executions": 12,
+    "lint": "ruff check, clang-format-21 dry-run and git diff --check pass",
+    "review": {
+      "architecture": "accepted; source/evidence review, did not rerun tests",
+      "correctness": "accepted; source/evidence review, did not rerun tests",
+      "algorithm_performance": "accepted; source/evidence review, did not rerun tests"
+    },
+    "reviewed_importer_sha256": "022fbc4b95f17a257ea6f93e0db132f93f7b654dea8779335fde3ec2231f9eee"
+  },
+  "commands": {
+    "build": "cmake --build build-py314 --parallel 1",
+    "gate": "/usr/bin/python3 -m pytest tests/ut/ir/transforms/{test_qwen_prefill_pipeline,test_sync_range_proofs,test_parameterized_sync,test_nested_sync_repetition,test_buffered_sync_realization,test_regional_slot_composition,test_streamed_slot_composition}.py -q",
+    "campaign": "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_qwen_prefill --output build-py314/qwen-prefill-m1 --native-source"
+  },
+  "tools": {
+    "python_executable": "/usr/bin/python3",
+    "ptoas_launcher_python": "3.11.15",
+    "ruff": "ruff 0.14.8",
+    "clang_format": "clang-format version 21.1.8 (Fedora 21.1.8-6.fc43)"
+  },
+  "logs": {
+    "build-py314/qwen-prefill-m1-gate-final.log": "920533ea6cee0790c64446ff7db9571591f7b3fe33c77ff44ad716f40a07c16d",
+    "build-py314/qwen-prefill-m1-build-final.log": "1d2dee596beaa18edf26f346b3ee4df2ed047967134a21b2fbf91e68ea38eecb",
+    "build-py314/qwen-prefill-m1-gate-final.xml": "01b1501453cbcb7d71c053bdd28da4549c4a8f48cc2a6ef4ba6983903053ad56"
+  }
+}

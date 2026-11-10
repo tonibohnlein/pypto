@@ -92,9 +92,9 @@ class PhysicalExecution(CommandExecution):
         return super().execute(stmt, env)
 
 
-def run_physical(original, emitted, eligible=range(8), parameters=None):
+def run_physical(original, emitted, eligible=range(8), parameters=None, *, block_index=None):
     parameters = parameters or {}
-    _, calls = interpret(original, parameters)
+    _, calls = interpret(original, parameters, block_index=block_index)
     ref = hardware_reference(original, calls)
     state = PhysicalExecution(calls, ref[0], eligible)
 
@@ -106,21 +106,27 @@ def run_physical(original, emitted, eligible=range(8), parameters=None):
                 assert call.kwargs["core_type"] == expected, "flag has the wrong owning core"
 
     CoreOwnership().visit_function(emitted)
-    state.execute(emitted.body, {original.params[i]: value for i, value in parameters.items()})
+    environment = {original.params[i]: value for i, value in parameters.items()}
+    if block_index is not None:
+        environment["__block_index__"] = block_index
+    state.execute(emitted.body, dict(environment))
     assert state.payload_count == len(calls), "missing payload"
     assert not state.live, "outstanding notifications at invocation exit"
     assert not any(state.pending.values()), "wait has no payload consumer"
-    allocations = []
-
-    class Allocations(ir.IRVisitor):
-        def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
-            if isinstance(op.var.type, ir.BufferType):
-                allocations.append(op)
-
-    Allocations().visit_function(original)
-    assert len(allocations) == len(state.actual_allocations)
-    for a, b in zip(allocations, state.actual_allocations):
+    # Run the original descriptor statements under their original loops.
+    # This checks per-visit slot selection, including zero/short invocations;
+    # a static assignment count cannot establish that preservation.
+    descriptor_reference = CommandExecution(calls, ref[0])
+    descriptor_reference.execute(original.body, dict(environment))
+    assert len(descriptor_reference.actual_allocations) == len(state.actual_allocations)
+    for a, b in zip(descriptor_reference.actual_allocations, state.actual_allocations, strict=True):
         same_payload(a, b)
+    assert len(descriptor_reference.actual_slots) == len(state.actual_slots)
+    for (before, selected), (after, actual) in zip(
+        descriptor_reference.actual_slots, state.actual_slots, strict=True
+    ):
+        same_payload(before, after)
+        assert selected == actual, "changed original slot selection"
     order = closure(state.vertices, state.edges)
     assert not any(a == b for a, b in order), "cyclic physical command graph"
     assert all(pair in order for pair in state.reuses), "consumption does not causally precede republication"

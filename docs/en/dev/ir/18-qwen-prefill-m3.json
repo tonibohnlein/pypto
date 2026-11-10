@@ -1,0 +1,1985 @@
+{
+  "stage": "M3 scoped demand/coordinate exports; physical transport remains M4",
+  "source_revision": "62ab48ed54325ee3cddfdb8b8579410aaa87d108",
+  "source_hashes": {
+    "CMakeLists.txt": "213aa6478ecb2685fa53090917c44ae43c9d913a2d2046eadab087c241878fe7",
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "d2eb870a145c415bde1a44d7854508f3ad07ccdda5347b3613aebec191754b1c",
+    "python/bindings/modules/testing.cpp": "126f4971849940062d9c64e4459534f683df7587857362f4d8eeecc2b39faf2b",
+    "python/pypto/pypto_core/testing.pyi": "ae5de3ad55e160d7b68435a7b3cf6dfa78ac485fd7c31731302391c6c317293f",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "94cf8fc14e30bbf2ca26b77f99db7bde1b1ae7c01b564658d6d95b9527e1b1bd",
+    "src/ir/transforms/utils/invocation_sync_analysis.cpp": "ad7f87f0c8146964acdd25755facaa30c906e2c5daf4642318f65913990c5c47",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "909097b47bddf2c3776acb2f2059b0b3124057f886f6c81a1b5899ea76228bfa",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.h": "232e6371e358f1a4339d6752e024432e95199e3e1820880d81dc4b58346acc62",
+    "src/ir/transforms/utils/numerical_sync_merge.cpp": "19cf7035a818bbd8b0b6da0200fa54f85b380f75ce027fb5bdde2fe1b66e4a54",
+    "src/ir/transforms/utils/numerical_sync_merge.h": "8a2e2bfdb6994b74c8125830be90c4fd755a14a46304ba46d4fb3e13572525d4",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "d1ce1a09678dd61a7c977bf0fcfce7017af5ac973704df0aaa3599bc154d5e8b",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "b0092036cfb4181605d59e3872901dbc3dffa33bcf65ad02d7ad07c6a4acd0c1",
+    "src/ir/transforms/utils/rotating_sync_analysis.cpp": "79368aad849919fb4fb49e1bc5c8f9967c597a20c1a4dfca09b2f7980c23b1c0",
+    "src/ir/transforms/utils/rotating_sync_analysis.h": "e2df0be6ca1e48bd68c23387f2b69203bbdcbbd3ffca6e4215fb731e267a45c9",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/config.py.source": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/configured_callers.py.source": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/constants.py.source": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/gate_up_projection.py.source": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/manifest.json": "e9c334a72af5af3553a50cea113cd560d1eace26599a894fa901fbc561e21898",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/output_projection.py.source": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/prefill_fwd.py.source": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/rms_lm_head.py.source": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77",
+    "tests/ut/ir/transforms/qualify_qwen_prefill.py": "e53d79d3f237a4f0f3406e8cf3ddc493d4333a9241178b5de829390196739b81",
+    "tests/ut/ir/transforms/sync_logical_oracle.py": "9df1b6243bf43998ab969c1de2abc8e3410aed449ad31c17f51a0fb6de6a3735",
+    "tests/ut/ir/transforms/sync_matmul_oracle.py": "f7901eb546fcb6456698cf460c0cd85e260dc6397d8493040768518f4fd23482",
+    "tests/ut/ir/transforms/sync_qwen_prefill_cases.py": "978daff489ea6bcafb12ca8b5111c156922efeab1b735ffae48f5967e5c6a667",
+    "tests/ut/ir/transforms/test_nested_sync_repetition.py": "10d2673f79c9873d4b142e1643e9ad77e91eade380db81eb269708c48d80dd44",
+    "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "f9fc7c50897ddb13a3f721b2f0b356625160f5c00dd5bbb3e131c1831f7dfce4",
+    "tests/ut/ir/transforms/test_sync_range_proofs.py": "33c2fde1c80c32420f83e4c2adfaad0e2b70527df0597c0672cafaf8e4fc14d0"
+  },
+  "extension_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "463011ab0ca33bf189cd4d20d158247449c9fc899619a1c73acb12cc489008b4"
+  },
+  "python": "3.14.7",
+  "input_manifest": {
+    "revision": "f2c80074c0b06ab5bf87fc2bfb06db417fcd35f1",
+    "sources": {
+      "prefill_fwd.py": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "rms_lm_head.py": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77"
+    },
+    "gate_up_extraction": {
+      "source_lines": [
+        1369,
+        1405
+      ],
+      "body_ast_sha256": "344ebf0fc0b70335f24e153ec757bb0521a67d5bffa1ef5d0028420b4afcad07",
+      "adapter_sha256": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+      "adaptations": [
+        "Ready input tensors replace the external post_norm_ready task dependency at standalone invocation entry.",
+        "The original enclosing band_ob0 and band_core_rot assignments are retained; band remains an explicit parameter.",
+        "Allocate output in the caller; preserve both original projection loops and original launch width."
+      ]
+    },
+    "output_extraction": {
+      "source_lines": [
+        932,
+        953
+      ],
+      "adapter_sha256": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+      "adaptations": [
+        "No compute-body changes; standalone entry changes the JIT role only.",
+        "Configured tests explicitly replace the dynamic layer-row annotation by LAYERS*HIDDEN before parsing."
+      ]
+    },
+    "configured_caller_sha256": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe"
+  },
+  "contract": {
+    "target": "a2a3",
+    "disjoint_gm": true,
+    "ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "entry": "standalone ready inputs, statically sized layer allocations",
+    "device": "not run",
+    "native_entry_return": "unqualified"
+  },
+  "measurements": [
+    {
+      "name": "output",
+      "hidden": 512,
+      "band": 0,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            1
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 17,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 6,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 6,
+          "scoped_merge_visits": 3
+        },
+        {
+          "bounds": [
+            2,
+            19
+          ],
+          "analyzed_occurrences": 0,
+          "cells": 16,
+          "interface_entries": 0,
+          "interface_ports": 0,
+          "merge_nodes": 0,
+          "source_region_nodes": 2,
+          "source_coordinate_entries": 0,
+          "scoped_families": 0,
+          "scoped_axis_entries": 0,
+          "scoped_source_visits": 1,
+          "scoped_merge_visits": 0
+        }
+      ],
+      "case_count": 2,
+      "coordinate_nodes": 4,
+      "coordinate_pieces": 4,
+      "retained_sum": {
+        "analyzed_occurrences": 41,
+        "cells": 33,
+        "interface_entries": 4480,
+        "interface_ports": 160,
+        "merge_nodes": 3,
+        "source_region_nodes": 8,
+        "source_coordinate_entries": 12,
+        "scoped_families": 13,
+        "scoped_axis_entries": 21,
+        "scoped_source_visits": 7,
+        "scoped_merge_visits": 3
+      },
+      "analysis_seconds_inclusive": 0.0006366530433297157,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "output",
+      "hidden": 1024,
+      "band": 0,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            3
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 17,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            4,
+            19
+          ],
+          "analyzed_occurrences": 0,
+          "cells": 16,
+          "interface_entries": 0,
+          "interface_ports": 0,
+          "merge_nodes": 0,
+          "source_region_nodes": 2,
+          "source_coordinate_entries": 0,
+          "scoped_families": 0,
+          "scoped_axis_entries": 0,
+          "scoped_source_visits": 1,
+          "scoped_merge_visits": 0
+        }
+      ],
+      "case_count": 2,
+      "coordinate_nodes": 4,
+      "coordinate_pieces": 4,
+      "retained_sum": {
+        "analyzed_occurrences": 41,
+        "cells": 33,
+        "interface_entries": 7392,
+        "interface_ports": 264,
+        "merge_nodes": 4,
+        "source_region_nodes": 9,
+        "source_coordinate_entries": 15,
+        "scoped_families": 17,
+        "scoped_axis_entries": 41,
+        "scoped_source_visits": 8,
+        "scoped_merge_visits": 4
+      },
+      "analysis_seconds_inclusive": 0.0008512339554727077,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "output",
+      "hidden": 5120,
+      "band": 0,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            19
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 17,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 4
+        }
+      ],
+      "case_count": 1,
+      "coordinate_nodes": 4,
+      "coordinate_pieces": 4,
+      "retained_sum": {
+        "analyzed_occurrences": 41,
+        "cells": 17,
+        "interface_entries": 13888,
+        "interface_ports": 496,
+        "merge_nodes": 8,
+        "source_region_nodes": 7,
+        "source_coordinate_entries": 15,
+        "scoped_families": 17,
+        "scoped_axis_entries": 41,
+        "scoped_source_visits": 7,
+        "scoped_merge_visits": 4
+      },
+      "analysis_seconds_inclusive": 0.0008500088006258011,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 0,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            6
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        },
+        {
+          "bounds": [
+            7,
+            16
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 10696,
+          "interface_ports": 382,
+          "merge_nodes": 7,
+          "source_region_nodes": 11,
+          "source_coordinate_entries": 24,
+          "scoped_families": 31,
+          "scoped_axis_entries": 42,
+          "scoped_source_visits": 11,
+          "scoped_merge_visits": 7
+        },
+        {
+          "bounds": [
+            17,
+            23
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        }
+      ],
+      "case_count": 3,
+      "coordinate_nodes": 14,
+      "coordinate_pieces": 16,
+      "retained_sum": {
+        "analyzed_occurrences": 164,
+        "cells": 66,
+        "interface_entries": 19656,
+        "interface_ports": 702,
+        "merge_nodes": 13,
+        "source_region_nodes": 25,
+        "source_coordinate_entries": 48,
+        "scoped_families": 57,
+        "scoped_axis_entries": 84,
+        "scoped_source_visits": 25,
+        "scoped_merge_visits": 13
+      },
+      "analysis_seconds_inclusive": 0.0018970351666212082,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 1,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            0
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        },
+        {
+          "bounds": [
+            1,
+            10
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 10696,
+          "interface_ports": 382,
+          "merge_nodes": 7,
+          "source_region_nodes": 11,
+          "source_coordinate_entries": 24,
+          "scoped_families": 31,
+          "scoped_axis_entries": 42,
+          "scoped_source_visits": 11,
+          "scoped_merge_visits": 7
+        },
+        {
+          "bounds": [
+            11,
+            17
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        },
+        {
+          "bounds": [
+            18,
+            23
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        }
+      ],
+      "case_count": 4,
+      "coordinate_nodes": 16,
+      "coordinate_pieces": 23,
+      "retained_sum": {
+        "analyzed_occurrences": 205,
+        "cells": 88,
+        "interface_entries": 24136,
+        "interface_ports": 862,
+        "merge_nodes": 16,
+        "source_region_nodes": 32,
+        "source_coordinate_entries": 60,
+        "scoped_families": 70,
+        "scoped_axis_entries": 105,
+        "scoped_source_visits": 32,
+        "scoped_merge_visits": 16
+      },
+      "analysis_seconds_inclusive": 0.0023704618215560913,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 2,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            4
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 26,
+          "interface_entries": 10696,
+          "interface_ports": 382,
+          "merge_nodes": 7,
+          "source_region_nodes": 11,
+          "source_coordinate_entries": 24,
+          "scoped_families": 31,
+          "scoped_axis_entries": 42,
+          "scoped_source_visits": 11,
+          "scoped_merge_visits": 7
+        },
+        {
+          "bounds": [
+            5,
+            11
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        },
+        {
+          "bounds": [
+            12,
+            18
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        },
+        {
+          "bounds": [
+            19,
+            23
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 10696,
+          "interface_ports": 382,
+          "merge_nodes": 7,
+          "source_region_nodes": 11,
+          "source_coordinate_entries": 24,
+          "scoped_families": 31,
+          "scoped_axis_entries": 42,
+          "scoped_source_visits": 11,
+          "scoped_merge_visits": 7
+        }
+      ],
+      "case_count": 4,
+      "coordinate_nodes": 16,
+      "coordinate_pieces": 23,
+      "retained_sum": {
+        "analyzed_occurrences": 246,
+        "cells": 92,
+        "interface_entries": 30352,
+        "interface_ports": 1084,
+        "merge_nodes": 20,
+        "source_region_nodes": 36,
+        "source_coordinate_entries": 72,
+        "scoped_families": 88,
+        "scoped_axis_entries": 126,
+        "scoped_source_visits": 36,
+        "scoped_merge_visits": 20
+      },
+      "analysis_seconds_inclusive": 0.0025553773157298565,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            5
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        },
+        {
+          "bounds": [
+            6,
+            12
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        },
+        {
+          "bounds": [
+            13,
+            22
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 10696,
+          "interface_ports": 382,
+          "merge_nodes": 7,
+          "source_region_nodes": 11,
+          "source_coordinate_entries": 24,
+          "scoped_families": 31,
+          "scoped_axis_entries": 42,
+          "scoped_source_visits": 11,
+          "scoped_merge_visits": 7
+        },
+        {
+          "bounds": [
+            23,
+            23
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 4480,
+          "interface_ports": 160,
+          "merge_nodes": 3,
+          "source_region_nodes": 7,
+          "source_coordinate_entries": 12,
+          "scoped_families": 13,
+          "scoped_axis_entries": 21,
+          "scoped_source_visits": 7,
+          "scoped_merge_visits": 3
+        }
+      ],
+      "case_count": 4,
+      "coordinate_nodes": 16,
+      "coordinate_pieces": 23,
+      "retained_sum": {
+        "analyzed_occurrences": 205,
+        "cells": 88,
+        "interface_entries": 24136,
+        "interface_ports": 862,
+        "merge_nodes": 16,
+        "source_region_nodes": 32,
+        "source_coordinate_entries": 60,
+        "scoped_families": 70,
+        "scoped_axis_entries": 105,
+        "scoped_source_visits": 32,
+        "scoped_merge_visits": 16
+      },
+      "analysis_seconds_inclusive": 0.0022242008708417416,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 1024,
+      "band": 0,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            6
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            7,
+            16
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 16632,
+          "interface_ports": 594,
+          "merge_nodes": 9,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        },
+        {
+          "bounds": [
+            17,
+            23
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        }
+      ],
+      "case_count": 3,
+      "coordinate_nodes": 14,
+      "coordinate_pieces": 16,
+      "retained_sum": {
+        "analyzed_occurrences": 164,
+        "cells": 66,
+        "interface_entries": 31416,
+        "interface_ports": 1122,
+        "merge_nodes": 17,
+        "source_region_nodes": 29,
+        "source_coordinate_entries": 60,
+        "scoped_families": 73,
+        "scoped_axis_entries": 164,
+        "scoped_source_visits": 29,
+        "scoped_merge_visits": 17
+      },
+      "analysis_seconds_inclusive": 0.0020641759037971497,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 1024,
+      "band": 1,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            0
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            1,
+            10
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 16632,
+          "interface_ports": 594,
+          "merge_nodes": 9,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        },
+        {
+          "bounds": [
+            11,
+            17
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            18,
+            23
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        }
+      ],
+      "case_count": 4,
+      "coordinate_nodes": 16,
+      "coordinate_pieces": 23,
+      "retained_sum": {
+        "analyzed_occurrences": 205,
+        "cells": 88,
+        "interface_entries": 38808,
+        "interface_ports": 1386,
+        "merge_nodes": 21,
+        "source_region_nodes": 37,
+        "source_coordinate_entries": 75,
+        "scoped_families": 90,
+        "scoped_axis_entries": 205,
+        "scoped_source_visits": 37,
+        "scoped_merge_visits": 21
+      },
+      "analysis_seconds_inclusive": 0.0025478568859398365,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 1024,
+      "band": 2,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            4
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 26,
+          "interface_entries": 16632,
+          "interface_ports": 594,
+          "merge_nodes": 9,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        },
+        {
+          "bounds": [
+            5,
+            11
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            12,
+            18
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            19,
+            23
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 16632,
+          "interface_ports": 594,
+          "merge_nodes": 9,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        }
+      ],
+      "case_count": 4,
+      "coordinate_nodes": 16,
+      "coordinate_pieces": 23,
+      "retained_sum": {
+        "analyzed_occurrences": 246,
+        "cells": 92,
+        "interface_entries": 48048,
+        "interface_ports": 1716,
+        "merge_nodes": 26,
+        "source_region_nodes": 42,
+        "source_coordinate_entries": 90,
+        "scoped_families": 112,
+        "scoped_axis_entries": 246,
+        "scoped_source_visits": 42,
+        "scoped_merge_visits": 26
+      },
+      "analysis_seconds_inclusive": 0.0028321449644863605,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 1024,
+      "band": 3,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            5
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            6,
+            12
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            13,
+            22
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 16632,
+          "interface_ports": 594,
+          "merge_nodes": 9,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        },
+        {
+          "bounds": [
+            23,
+            23
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 7392,
+          "interface_ports": 264,
+          "merge_nodes": 4,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        }
+      ],
+      "case_count": 4,
+      "coordinate_nodes": 16,
+      "coordinate_pieces": 23,
+      "retained_sum": {
+        "analyzed_occurrences": 205,
+        "cells": 88,
+        "interface_entries": 38808,
+        "interface_ports": 1386,
+        "merge_nodes": 21,
+        "source_region_nodes": 37,
+        "source_coordinate_entries": 75,
+        "scoped_families": 90,
+        "scoped_axis_entries": 205,
+        "scoped_source_visits": 37,
+        "scoped_merge_visits": 21
+      },
+      "analysis_seconds_inclusive": 0.0024783448316156864,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 5120,
+      "band": 0,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            6
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            7,
+            16
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 29624,
+          "interface_ports": 1058,
+          "merge_nodes": 17,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        },
+        {
+          "bounds": [
+            17,
+            23
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        }
+      ],
+      "case_count": 3,
+      "coordinate_nodes": 14,
+      "coordinate_pieces": 16,
+      "retained_sum": {
+        "analyzed_occurrences": 164,
+        "cells": 66,
+        "interface_entries": 57400,
+        "interface_ports": 2050,
+        "merge_nodes": 33,
+        "source_region_nodes": 29,
+        "source_coordinate_entries": 60,
+        "scoped_families": 73,
+        "scoped_axis_entries": 164,
+        "scoped_source_visits": 29,
+        "scoped_merge_visits": 17
+      },
+      "analysis_seconds_inclusive": 0.00272438395768404,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 5120,
+      "band": 1,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            0
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            1,
+            10
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 29624,
+          "interface_ports": 1058,
+          "merge_nodes": 17,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        },
+        {
+          "bounds": [
+            11,
+            17
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            18,
+            23
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        }
+      ],
+      "case_count": 4,
+      "coordinate_nodes": 16,
+      "coordinate_pieces": 23,
+      "retained_sum": {
+        "analyzed_occurrences": 205,
+        "cells": 88,
+        "interface_entries": 71288,
+        "interface_ports": 2546,
+        "merge_nodes": 41,
+        "source_region_nodes": 37,
+        "source_coordinate_entries": 75,
+        "scoped_families": 90,
+        "scoped_axis_entries": 205,
+        "scoped_source_visits": 37,
+        "scoped_merge_visits": 21
+      },
+      "analysis_seconds_inclusive": 0.003269036766141653,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 5120,
+      "band": 2,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            4
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 26,
+          "interface_entries": 29624,
+          "interface_ports": 1058,
+          "merge_nodes": 17,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        },
+        {
+          "bounds": [
+            5,
+            11
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            12,
+            18
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            19,
+            23
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 29624,
+          "interface_ports": 1058,
+          "merge_nodes": 17,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        }
+      ],
+      "case_count": 4,
+      "coordinate_nodes": 16,
+      "coordinate_pieces": 23,
+      "retained_sum": {
+        "analyzed_occurrences": 246,
+        "cells": 92,
+        "interface_entries": 87024,
+        "interface_ports": 3108,
+        "merge_nodes": 50,
+        "source_region_nodes": 42,
+        "source_coordinate_entries": 90,
+        "scoped_families": 112,
+        "scoped_axis_entries": 246,
+        "scoped_source_visits": 42,
+        "scoped_merge_visits": 26
+      },
+      "analysis_seconds_inclusive": 0.0039753480814397335,
+      "physical": "not requested; scoped transport remains M4"
+    },
+    {
+      "name": "gate_up",
+      "hidden": 5120,
+      "band": 3,
+      "cases": [
+        {
+          "bounds": [
+            0,
+            5
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            6,
+            12
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 20,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        },
+        {
+          "bounds": [
+            13,
+            22
+          ],
+          "analyzed_occurrences": 82,
+          "cells": 24,
+          "interface_entries": 29624,
+          "interface_ports": 1058,
+          "merge_nodes": 17,
+          "source_region_nodes": 13,
+          "source_coordinate_entries": 30,
+          "scoped_families": 39,
+          "scoped_axis_entries": 82,
+          "scoped_source_visits": 13,
+          "scoped_merge_visits": 9
+        },
+        {
+          "bounds": [
+            23,
+            23
+          ],
+          "analyzed_occurrences": 41,
+          "cells": 22,
+          "interface_entries": 13888,
+          "interface_ports": 496,
+          "merge_nodes": 8,
+          "source_region_nodes": 8,
+          "source_coordinate_entries": 15,
+          "scoped_families": 17,
+          "scoped_axis_entries": 41,
+          "scoped_source_visits": 8,
+          "scoped_merge_visits": 4
+        }
+      ],
+      "case_count": 4,
+      "coordinate_nodes": 16,
+      "coordinate_pieces": 23,
+      "retained_sum": {
+        "analyzed_occurrences": 205,
+        "cells": 88,
+        "interface_entries": 71288,
+        "interface_ports": 2546,
+        "merge_nodes": 41,
+        "source_region_nodes": 37,
+        "source_coordinate_entries": 75,
+        "scoped_families": 90,
+        "scoped_axis_entries": 205,
+        "scoped_source_visits": 37,
+        "scoped_merge_visits": 21
+      },
+      "analysis_seconds_inclusive": 0.003388454671949148,
+      "physical": "not requested; scoped transport remains M4"
+    }
+  ],
+  "call_graph_scaling": [],
+  "native_source": [],
+  "resumed_checkpoint_sha256": "0f7999021e4aeb8fcf06c850ff10fc9592ae61abe3f27f5b3eb5139de3c479e4",
+  "resume_scope": "Identical production, input, extension and independent-oracle hashes",
+  "semantic_checks": [
+    {
+      "name": "output",
+      "hidden": 512,
+      "band": 0,
+      "block": 0,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 94,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.714455685112625
+    },
+    {
+      "name": "output",
+      "hidden": 512,
+      "band": 0,
+      "block": 1,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 94,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.559314745943993
+    },
+    {
+      "name": "output",
+      "hidden": 512,
+      "band": 0,
+      "block": 2,
+      "layer": 0,
+      "checks": {
+        "payloads": 0,
+        "covers": 0,
+        "query_checks": 0,
+        "boundary_checks": 32,
+        "access_checks": 0
+      },
+      "scoped_records": 0,
+      "oracle_seconds": 0.00041937781497836113
+    },
+    {
+      "name": "output",
+      "hidden": 512,
+      "band": 0,
+      "block": 19,
+      "layer": 1,
+      "checks": {
+        "payloads": 0,
+        "covers": 0,
+        "query_checks": 0,
+        "boundary_checks": 32,
+        "access_checks": 0
+      },
+      "scoped_records": 0,
+      "oracle_seconds": 0.0003476780839264393
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 0,
+      "block": 0,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 96,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.6580310221761465
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 0,
+      "block": 6,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.738556875381619
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 0,
+      "block": 7,
+      "layer": 0,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 103,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 13.924314042087644
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 0,
+      "block": 16,
+      "layer": 1,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 104,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 14.204470682423562
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 0,
+      "block": 17,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.519394505769014
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 0,
+      "block": 23,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 97,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.8139811106957495
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 1,
+      "block": 0,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.639787498861551
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 1,
+      "block": 0,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.757742810063064
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 1,
+      "block": 1,
+      "layer": 0,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 104,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 13.764096240978688
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 1,
+      "block": 10,
+      "layer": 1,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 104,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 14.12818682892248
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 1,
+      "block": 11,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.674169166944921
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 1,
+      "block": 17,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 97,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.574010537005961
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 1,
+      "block": 18,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 97,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.705395683646202
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 1,
+      "block": 23,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.587915565818548
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 2,
+      "block": 0,
+      "layer": 0,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 104,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 14.269591884221882
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 2,
+      "block": 4,
+      "layer": 1,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 104,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 13.897115466650575
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 2,
+      "block": 5,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 5.092178469058126
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 2,
+      "block": 11,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 97,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.829270846676081
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 2,
+      "block": 12,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 97,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.952114691026509
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 2,
+      "block": 18,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.986796027980745
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 2,
+      "block": 19,
+      "layer": 0,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 104,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 14.355660628993064
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 2,
+      "block": 23,
+      "layer": 1,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 104,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 13.939988693222404
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "block": 0,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.68951925681904
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "block": 5,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 96,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.744092284236103
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "block": 6,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 97,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.617786746006459
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "block": 12,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.737932252697647
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "block": 13,
+      "layer": 0,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 104,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 14.047128728125244
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "block": 22,
+      "layer": 1,
+      "checks": {
+        "payloads": 106,
+        "covers": 71,
+        "query_checks": 44944,
+        "boundary_checks": 103,
+        "access_checks": 106
+      },
+      "scoped_records": 71,
+      "oracle_seconds": 14.082534528337419
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "block": 23,
+      "layer": 0,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.645650172140449
+    },
+    {
+      "name": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "block": 23,
+      "layer": 1,
+      "checks": {
+        "payloads": 53,
+        "covers": 33,
+        "query_checks": 11236,
+        "boundary_checks": 98,
+        "access_checks": 53
+      },
+      "scoped_records": 33,
+      "oracle_seconds": 4.468591218814254
+    }
+  ],
+  "trip_scaling": [
+    {
+      "outer_and_replay": 1,
+      "analyzed_occurrences": 14,
+      "cells": 8,
+      "interface_entries": 1736,
+      "interface_ports": 62,
+      "merge_nodes": 2,
+      "source_region_nodes": 6,
+      "source_coordinate_entries": 10,
+      "scoped_families": 7,
+      "scoped_axis_entries": 11,
+      "scoped_source_visits": 6,
+      "scoped_merge_visits": 2,
+      "seconds_inclusive": 0.0004124036058783531
+    },
+    {
+      "outer_and_replay": 2,
+      "analyzed_occurrences": 14,
+      "cells": 8,
+      "interface_entries": 2744,
+      "interface_ports": 98,
+      "merge_nodes": 4,
+      "source_region_nodes": 6,
+      "source_coordinate_entries": 10,
+      "scoped_families": 12,
+      "scoped_axis_entries": 17,
+      "scoped_source_visits": 6,
+      "scoped_merge_visits": 4,
+      "seconds_inclusive": 0.0004214690998196602
+    },
+    {
+      "outer_and_replay": 10,
+      "analyzed_occurrences": 14,
+      "cells": 8,
+      "interface_entries": 5768,
+      "interface_ports": 206,
+      "merge_nodes": 10,
+      "source_region_nodes": 6,
+      "source_coordinate_entries": 10,
+      "scoped_families": 12,
+      "scoped_axis_entries": 17,
+      "scoped_source_visits": 6,
+      "scoped_merge_visits": 4,
+      "seconds_inclusive": 0.000598536804318428
+    },
+    {
+      "outer_and_replay": 1000,
+      "analyzed_occurrences": 14,
+      "cells": 8,
+      "interface_entries": 15848,
+      "interface_ports": 566,
+      "merge_nodes": 30,
+      "source_region_nodes": 6,
+      "source_coordinate_entries": 10,
+      "scoped_families": 12,
+      "scoped_axis_entries": 17,
+      "scoped_source_visits": 6,
+      "scoped_merge_visits": 4,
+      "seconds_inclusive": 0.0009950301609933376
+    },
+    {
+      "outer_and_replay": 1000000,
+      "analyzed_occurrences": 14,
+      "cells": 8,
+      "interface_entries": 26936,
+      "interface_ports": 962,
+      "merge_nodes": 52,
+      "source_region_nodes": 6,
+      "source_coordinate_entries": 10,
+      "scoped_families": 12,
+      "scoped_axis_entries": 17,
+      "scoped_source_visits": 6,
+      "scoped_merge_visits": 4,
+      "seconds_inclusive": 0.0012861741706728935
+    }
+  ],
+  "progress": {
+    "stage": "repeat_scaling",
+    "count": 1000000
+  },
+  "timing_claim": "Single descriptive measurements; per-case mathematics is charged in aggregate",
+  "complete": true,
+  "validation_gate": {
+    "log": "build-py314/qwen-prefill-m3-gate.log",
+    "junit": "build-py314/qwen-prefill-m3-gate.xml",
+    "passed": 372,
+    "failed": 0,
+    "warnings": 18,
+    "scope": "Fresh focused gate before equivalent test-only set-union optimization; campaign checks final oracle"
+  },
+  "campaign_history": [
+    "Initial uninstrumented campaign interrupted without acceptance evidence.",
+    "Instrumented campaign hit aggregate240s watchdog inside independent protected-accumulator oracle after32 completed executions; original log and partial receipt retained.",
+    "Resumed remaining checks with identical production/input/extension/oracle hashes and same240s watchdog; completed34 executions. No kernel-analysis watchdog increased."
+  ],
+  "commands": [
+    "source .claude/skills/testing/load-env.sh",
+    "cmake --build build-py314 --parallel 1",
+    "PYTHONPATH=\"$PWD/python\" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYPTO_CODEGEN_MAX_WORKERS=1 timeout --signal=INT --kill-after=5s 240s /usr/bin/python3 -m tests.ut.ir.transforms.qualify_qwen_prefill --output build-py314/qwen-prefill-m3 --crossings",
+    "same campaign with --resume to continue pinned completed oracle cases"
+  ],
+  "draft": {
+    "path": "/home/toni/work/synchronization_draft/paper/sections/minimum_demands.tex",
+    "sha256": "65d6fc7966eaa8f53deb17056117baeaf5bc4be99de5acca538d68944ac9455b",
+    "scope": "Numerical resident/repeated composition and exact scoped interfaces; not universal symbolic rotating crossing realization"
+  },
+  "reviews": {
+    "architecture": "accepted mathematical analysis and scoped export; physical transport remains M4",
+    "correctness": "accepted mathematical analysis and scoped export; physical transport remains M4",
+    "algorithm_performance": "accepted mathematical analysis and scoped export; physical transport remains M4"
+  },
+  "final_gate": {
+    "passed": 372,
+    "failed": 0,
+    "warnings": 18,
+    "seconds": 94.52,
+    "log": "build-py314/qwen-prefill-m3-final-gate.log",
+    "junit": "build-py314/qwen-prefill-m3-final-gate.xml"
+  }
+}

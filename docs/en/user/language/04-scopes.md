@@ -376,9 +376,9 @@ preserve their authored order, so PyPTO rejects either flag in such a loop.
 Use `pl.range` when manually synchronizing work inside a loop.
 
 For a pipeline barrier, use `pl.system.barrier(*, pipe)`. The required keyword
-accepts any `pl.PipeType` member. A single-pipe barrier orders preceding and
-following work on that pipeline, which is the cheap way to order a buffer reuse
-against an in-flight transfer without spending an event slot. A barrier drains
+accepts any `pl.PipeType` member except `S`. A single-pipe barrier orders preceding and
+following work on that pipeline. It can order same-pipe buffer reuse against an
+in-flight transfer without spending an event slot. A barrier drains
 a *pipe*, not an operation, so pick the pipe your transfer rides: `MTE2` for
 GM → UB/L1 loads, `MTE3` for UB → GM stores (and the A5 UB → L1 route), `MTE1`
 for the L1 → L0A/L0B operand feed, `FIX` for the L0C writeback. `ALL` waits for
@@ -429,10 +429,9 @@ Two distinctions are worth keeping straight:
   core, arrival only*. Neither implies the other, and neither makes GM writes visible —
   that is `fence()` plus cache maintenance.
 
-`PipeType.S` is accepted for completeness but orders nothing in practice: both of
-PTOAS's synchronization allocators treat a scalar-to-scalar pair as already ordered
-on every architecture, so the scalar pipe sequences its own operations. It is
-expressible and reaches the emitted code; it just buys you nothing.
+`PipeType.S` is rejected. Scalar operations are ordered by hardware, and
+[the A2/A3 PipeBarrier contract](https://www.hiascend.com/doc_center/source/zh/canncommercial/850/API/ascendcopapi/atlasascendc_api_07_0271.html)
+states that an explicit scalar-pipeline barrier causes a hardware error.
 
 Barriers are **rejected inside `pl.pipeline`**, exactly as explicit flags are: a barrier
 has no operand, so pipeline scheduling has no dependency edge to hold it in place and

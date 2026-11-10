@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -41,12 +42,21 @@ namespace {
 using Direction = std::pair<PipeType, PipeType>;
 using Family = PhysicalSyncFamily;
 
-Occurrence Source(const Family& f, int64_t ordinal) {
-  return {f.source_region, f.source_first + ordinal, f.source_site};
+Occurrence Endpoint(const Family& f, int64_t ordinal, bool publish) {
+  auto visit = publish ? f.source_first : f.target_first;
+  if (f.axes.empty()) {
+    visit += ordinal;
+  } else {
+    for (auto axis = f.axes.rbegin(); axis != f.axes.rend(); ++axis) {
+      visit += (ordinal % axis->count) * (publish ? axis->source_stride : axis->target_stride);
+      ordinal /= axis->count;
+    }
+    INTERNAL_CHECK(!ordinal) << "Internal error: scoped physical record exceeds domain";
+  }
+  return {publish ? f.source_region : f.target_region, visit, publish ? f.source_site : f.target_site};
 }
-Occurrence Target(const Family& f, int64_t ordinal) {
-  return {f.target_region, f.target_first + ordinal, f.target_site};
-}
+Occurrence Source(const Family& f, int64_t ordinal) { return Endpoint(f, ordinal, true); }
+Occurrence Target(const Family& f, int64_t ordinal) { return Endpoint(f, ordinal, false); }
 Direction Pipes(const CompactSyncResult& a, const Family& f) {
   return {a.segments[f.source_region].pipes[f.source_site], a.segments[f.target_region].pipes[f.target_site]};
 }
@@ -144,19 +154,44 @@ class Allocator {
   PhysicalSyncRealization Run() {
     for (const auto& [direction, ids] : claimed_)
       for (int id : ids) result_.native_reserved_ids.emplace_back(direction.first, direction.second, id);
-    for (size_t r = 0; r < a_.segments.size(); ++r) {
-      const auto& segment = a_.segments[r];
-      for (const auto& f : segment.demands) {
-        CHECK(f.distance == 0 || f.distance == 1) << "Unavailable physical displacement";
-        if (segment.count <= f.distance) continue;
-        result_.families.push_back({r, f.source, r, f.target, 0, f.distance, segment.count - f.distance, {}});
+    if (a_.input.region_tree) {
+      result_.finite_minimum = false;  // Sufficient whole-span assignment, not a minimum-ID proof.
+      const auto owned = a_.ExportScopedDemands();
+      CHECK(owned) << "Scoped endpoint export is unavailable";
+      for (const auto& schema : owned->families) {
+        const auto [sr, sv, ss] = schema.source;
+        const auto [tr, tv, ts] = schema.target;
+        __int128 count = 1;
+        for (const auto& axis : schema.axes) {
+          count *= axis.count;
+          CHECK(count <= std::numeric_limits<int64_t>::max()) << "Scoped physical record domain overflow";
+        }
+        result_.families.push_back({sr, ss, tr, ts, sv, tv, static_cast<int64_t>(count), {}, schema.axes});
       }
-    }
-    for (const auto& [source, target] : a_.crossing_demands) {
-      auto [sr, sv, ss] = source;
-      auto [tr, tv, ts] = target;
-      CHECK(sr < tr && sv == a_.segments[sr].count - 1 && tv == 0) << "Unavailable physical crossing frame";
-      result_.families.push_back({sr, ss, tr, ts, sv, tv, 1, {}});
+    } else {
+      const auto crossings = a_.ExportCrossingDemands();
+      CHECK(crossings.has_value())
+          << "Minimum demands are retained; shared-repetition physical endpoint scope is unavailable";
+      for (size_t r = 0; r < a_.segments.size(); ++r) {
+        const auto& segment = a_.segments[r];
+        for (const auto& f : segment.demands) {
+          CHECK(f.distance >= 0 && f.source < segment.pipes.size() && f.target < segment.pipes.size())
+              << "Invalid physical demand family";
+          if (segment.count <= f.distance) continue;
+          result_.families.push_back(
+              {r, f.source, r, f.target, 0, f.distance, segment.count - f.distance, {}});
+        }
+      }
+      for (const auto& [source, target] : *crossings) {
+        auto [sr, sv, ss] = source;
+        auto [tr, tv, ts] = target;
+        CHECK(sr < a_.segments.size() && tr < a_.segments.size() && sr < tr)
+            << "Unavailable physical crossing frame";
+        CHECK(sv >= 0 && sv < a_.segments[sr].count && tv >= 0 && tv < a_.segments[tr].count &&
+              ss < a_.segments[sr].pipes.size() && ts < a_.segments[tr].pipes.size())
+            << "Invalid physical crossing occurrence";
+        result_.families.push_back({sr, ss, tr, ts, sv, tv, 1, {}});
+      }
     }
     QualifyBarriers();
     for (size_t index = 0; index < result_.families.size(); ++index) {
@@ -165,17 +200,25 @@ class Allocator {
       if (direction.first == direction.second) continue;
       const auto& ids = Eligible(direction);
       int64_t width = f.count;
-      if (f.count > 1) {
+      if (f.count > 1 && a_.input.region_tree) {
+        result_.finite_minimum = false;
+        CHECK(a_.ScopedConsecutiveReuse(index))
+            << "Scoped period-one physical reuse is unproved; no capacity obstruction established";
+        width = 1;
+      } else if (f.count > 1) {
         result_.finite_minimum = false;
         const auto& segment = a_.segments[f.source_region];
-        INTERNAL_CHECK(f.source_region == f.target_region && !segment.distance.empty())
+        INTERNAL_CHECK(f.source_region == f.target_region)
             << "Internal error: repeated family without a periodic owner";
-        const auto distance = segment.distance[2 * f.target_site + 1][2 * f.source_site];
+        const auto distance = segment.Threshold(f.target_site, true, f.source_site, false);
         // Canonical direct placement associates WAIT(h)->SET(g) with
-        // C_consumer(h)->I_source(g). Native wrap padding makes this distance
-        // uniform for every valid visit. Unique lanes cover shorter prefixes.
-        if (distance >= 0) {
-          const __int128 period = __int128(f.target_first) - f.source_first + distance;
+        // C_consumer(h)->I_source(g). Reference-forward witnesses between valid
+        // endpoints stay inside the finite prefix. Clip before adding a wide
+        // threshold, so huge reachable distances never overflow or mean absence.
+        const int64_t displacement = f.target_first - f.source_first;
+        INTERNAL_CHECK(displacement >= 0) << "Negative direct-family displacement";
+        if (distance && *distance < f.count && displacement < f.count) {
+          const __int128 period = __int128(displacement) + *distance;
           width = static_cast<int64_t>(std::min<__int128>(f.count, std::max<__int128>(1, period)));
         }
       }
@@ -243,6 +286,16 @@ class Allocator {
     return it->second;
   }
   void QualifyBarriers() {
+    if (a_.input.region_tree) {
+      for (size_t i = 0; i < result_.families.size(); ++i) {
+        const auto [source, target] = Pipes(a_, result_.families[i]);
+        if (source != target) continue;
+        CHECK(target == PipeType::M || target == PipeType::V)
+            << "Scoped same-pipe barrier mechanism is unavailable; scalar barriers are forbidden";
+        CHECK(a_.ScopedAdjacentBarrier(i)) << "Scoped same-pipe barrier adjacency is unproved";
+      }
+      return;
+    }
     // Predecessor lookup is indexed by region and pipe. For repeated bodies,
     // check both startup and steady-state; no trip count is unfolded.
     std::vector<std::array<std::optional<Occurrence>, kPipeCount>> before(a_.segments.size());
@@ -283,15 +336,16 @@ class Allocator {
     // Sort two boundary chains once, then sweep the monotone first-reuse
     // suffix. Queries are charged separately (the retained regional oracle
     // need not be constant-time). No quadratic directory scan or K unfolding.
-    auto by_source = [](const Lane& x, const Lane& y) {
-      return std::tie(x.first, x.family, x.residue) < std::tie(y.first, y.family, y.residue);
+    auto by_source = [&](const Lane& x, const Lane& y) {
+      if (x.first != y.first) return a_.ReferenceBefore(x.first, y.first);
+      return std::tie(x.family, x.residue) < std::tie(y.family, y.residue);
     };
     std::sort(lanes.begin(), lanes.end(), by_source);
     std::vector<size_t> waits(lanes.size()), release(lanes.size());
     std::iota(waits.begin(), waits.end(), 0);
     std::sort(waits.begin(), waits.end(), [&](size_t x, size_t y) {
-      return std::tie(lanes[x].last, lanes[x].family, lanes[x].residue) <
-             std::tie(lanes[y].last, lanes[y].family, lanes[y].residue);
+      if (lanes[x].last != lanes[y].last) return a_.ReferenceBefore(lanes[x].last, lanes[y].last);
+      return std::tie(lanes[x].family, lanes[x].residue) < std::tie(lanes[y].family, lanes[y].residue);
     });
     size_t next = 0;
     for (auto i : waits) {
@@ -323,6 +377,11 @@ class Allocator {
   }
 };
 
+struct PhysicalCuts {
+  std::vector<StmtPtr> before, after;
+};
+using CutInventory = std::map<const Call*, std::shared_ptr<PhysicalCuts>>;
+
 class Emitter : public SyncPlacement {
  public:
   Emitter(const CompactSyncResult& a, PhysicalSyncRealization& result) : SyncPlacement(a), result_(result) {
@@ -330,6 +389,35 @@ class Emitter : public SyncPlacement {
       const auto& f = result.families[i];
       incoming_[{f.target_region, f.target_site}].push_back(i);
       if (!f.ids.empty()) outgoing_[{f.source_region, f.source_site}].push_back(i);
+    }
+  }
+
+  void AppendCuts(CutInventory& inventory, const ExprPtr& guard) {
+    for (size_t r = 0; r < analysis_.input.segments.size(); ++r) {
+      const auto& region = analysis_.input.segments[r];
+      if (!region.count) continue;
+      for (size_t s = 0; s < region.sites.size(); ++s) {
+        const auto& site = region.sites[s];
+        auto commands = Commands({r, s}, site.original->span_);
+        if (commands.before.empty() && commands.after.empty()) continue;
+        auto& retained = inventory[site.original.get()];
+        if (!retained) retained = std::make_shared<PhysicalCuts>();
+        if (site.continuation) {
+          auto& continuation = inventory[site.continuation.get()];
+          INTERNAL_CHECK(!continuation || continuation == retained)
+              << "Internal error: incompatible original initialization cut";
+          continuation = retained;
+        }
+        auto append = [&](std::vector<StmtPtr>& target, const std::vector<StmtPtr>& source) {
+          if (source.empty()) return;
+          if (guard)
+            target.push_back(Guard(guard, std::make_shared<SeqStmts>(source, site.original->span_)));
+          else
+            target.insert(target.end(), source.begin(), source.end());
+        };
+        append(retained->before, commands.before);
+        append(retained->after, commands.after);
+      }
     }
   }
 
@@ -362,6 +450,49 @@ class Emitter : public SyncPlacement {
       ordinal = std::make_shared<FloorDiv>(ordinal, Integer(s.step, span), DataType::INDEX, span);
     return ordinal;
   }
+  ExprPtr FrameDigit(const SyncLoopFrame& frame, const Span& span) {
+    // This original loop has exactly one admitted visit regardless of its
+    // invocation-dependent start. No normalized placeholder is read as an IV.
+    if (frame.count == 1) return Integer(0, span);
+    ExprPtr value = frame.loop->loop_var_;
+    if (frame.start_expression || frame.start)
+      value = std::make_shared<Sub>(
+          value, frame.start_expression ? frame.start_expression : Integer(frame.start, span),
+          DataType::INDEX, span);
+    if (frame.step != 1)
+      value = std::make_shared<FloorDiv>(value, Integer(frame.step, span), DataType::INDEX, span);
+    return value;
+  }
+  std::vector<ExprPtr> ScopedGuards(const Family& family, bool publish, const Span& span) {
+    const auto region = publish ? family.source_region : family.target_region;
+    auto base = publish ? family.source_first : family.target_first;
+    const auto& frames = analysis_.input.segments[region].nested_frames;
+    std::vector<int64_t> digits(frames.size());
+    for (size_t i = frames.size(); i-- > 0;) {
+      INTERNAL_CHECK(frames[i].count > 0) << "Internal error: physical endpoint in absent frame";
+      digits[i] = base % frames[i].count;
+      base /= frames[i].count;
+    }
+    INTERNAL_CHECK(!base && family.axes.size() <= frames.size()) << "Internal error: physical scope arity";
+    std::vector<ExprPtr> guards;
+    for (size_t i = 0; i < frames.size(); ++i) {
+      const auto count = i < family.axes.size() ? family.axes[i].count : 1;
+      if (i < family.axes.size())
+        INTERNAL_CHECK(family.axes[i].frame == frames[i].loop) << "Internal error: physical scope identity";
+      if (!digits[i] && count == frames[i].count) continue;
+      const auto value = FrameDigit(frames[i], span);
+      if (count == 1) {
+        guards.push_back(std::make_shared<Eq>(value, Integer(digits[i], span), DataType::BOOL, span));
+      } else {
+        if (digits[i])
+          guards.push_back(std::make_shared<Ge>(value, Integer(digits[i], span), DataType::BOOL, span));
+        if (digits[i] + count < frames[i].count)
+          guards.push_back(
+              std::make_shared<Lt>(value, Integer(digits[i] + count, span), DataType::BOOL, span));
+      }
+    }
+    return guards;
+  }
   StmtPtr Guard(ExprPtr condition, StmtPtr body) {
     ++result_.guard_sites;
     return std::make_shared<IfStmt>(condition, body, std::nullopt, std::vector<VarPtr>{}, body->span_);
@@ -370,9 +501,13 @@ class Emitter : public SyncPlacement {
     const auto [src, dst] = Pipes(analysis_, f);
     const size_t r = publish ? f.source_region : f.target_region;
     const int64_t first = publish ? f.source_first : f.target_first;
-    const auto ordinal = Ordinal(r, span);
+    const bool scoped = analysis_.input.region_tree.has_value();
+    // The initial scoped certificate deliberately proves period one. Keep
+    // physical table coordinates separate from the full logical record tuple.
+    INTERNAL_CHECK(!scoped || f.ids.size() <= 1) << "Internal error: unsupported scoped physical period";
+    const auto ordinal = scoped ? Integer(0, span) : Ordinal(r, span);
     ExprPtr index = ordinal;
-    if (first) index = std::make_shared<Sub>(index, Integer(first, span), DataType::INDEX, span);
+    if (!scoped && first) index = std::make_shared<Sub>(index, Integer(first, span), DataType::INDEX, span);
     std::vector<StmtPtr> commands;
     if (src == dst) {
       INTERNAL_CHECK(dst == PipeType::M || dst == PipeType::V)
@@ -407,26 +542,86 @@ class Emitter : public SyncPlacement {
     StmtPtr body = std::make_shared<SeqStmts>(commands, span);
     // The range guard surrounds residue arithmetic: no absent predecessor is
     // evaluated/consumed. Final-only exports never publish on earlier visits.
+    if (scoped) {
+      auto guards = ScopedGuards(f, publish, span);
+      for (auto guard = guards.rbegin(); guard != guards.rend(); ++guard) body = Guard(*guard, body);
+      return body;
+    }
     if (first + f.count < analysis_.segments[r].count)
       body = Guard(std::make_shared<Lt>(ordinal, Integer(first + f.count, span), DataType::BOOL, span), body);
     if (first) body = Guard(std::make_shared<Ge>(ordinal, Integer(first, span), DataType::BOOL, span), body);
     return body;
   }
+  PhysicalCuts Commands(SyncSiteKey site, const Span& span) {
+    PhysicalCuts cuts;
+    // Preserve the common direct protocol: local barrier, incoming WAITs,
+    // payload, outgoing SETs. Case aggregation never interleaves active cases.
+    for (auto i : incoming_[site])
+      if (result_.families[i].ids.empty()) cuts.before.push_back(Command(result_.families[i], false, span));
+    for (auto i : incoming_[site])
+      if (!result_.families[i].ids.empty()) cuts.before.push_back(Command(result_.families[i], false, span));
+    for (auto i : outgoing_[site]) cuts.after.push_back(Command(result_.families[i], true, span));
+    return cuts;
+  }
   StmtPtr Wrap(const StmtPtr& payload, SyncSiteKey site) override {
-    std::vector<StmtPtr> statements;
-    // Barrier precedes incoming WAITs. Outgoing SETs remain immediately after
-    // their payload, hence before the next payload's barrier and WAIT group.
-    for (auto i : incoming_[site])
-      if (result_.families[i].ids.empty())
-        statements.push_back(Command(result_.families[i], false, payload->span_));
-    for (auto i : incoming_[site])
-      if (!result_.families[i].ids.empty())
-        statements.push_back(Command(result_.families[i], false, payload->span_));
-    statements.push_back(payload);
-    for (auto i : outgoing_[site]) statements.push_back(Command(result_.families[i], true, payload->span_));
-    return std::make_shared<SeqStmts>(statements, payload->span_);
+    auto cuts = Commands(site, payload->span_);
+    cuts.before.push_back(payload);
+    cuts.before.insert(cuts.before.end(), cuts.after.begin(), cuts.after.end());
+    return std::make_shared<SeqStmts>(cuts.before, payload->span_);
   }
 };
+// The command builder above owns all protocol mechanics. This adapter only
+// installs already-qualified case cuts in the unchanged original payload tree.
+class InvocationEmitter : public IRMutator {
+  const CutInventory& inventory_;
+  StmtPtr Wrap(const StmtPtr& payload, const PhysicalCuts& cuts) {
+    auto statements = cuts.before;
+    statements.push_back(payload);
+    statements.insert(statements.end(), cuts.after.begin(), cuts.after.end());
+    return std::make_shared<SeqStmts>(statements, payload->span_);
+  }
+  static const Call* ArmCall(StmtPtr arm) {
+    if (auto seq = As<SeqStmts>(arm)) {
+      if (seq->stmts_.size() != 1) return nullptr;
+      arm = seq->stmts_.front();
+    }
+    const auto eval = As<EvalStmt>(arm);
+    return eval ? As<Call>(eval->expr_).get() : nullptr;
+  }
+  StmtPtr VisitStmt_(const EvalStmtPtr& statement) override {
+    const auto call = As<Call>(statement->expr_);
+    const auto found = inventory_.find(call.get());
+    return found == inventory_.end() ? statement : Wrap(statement, *found->second);
+  }
+  StmtPtr VisitStmt_(const IfStmtPtr& statement) override {
+    const auto found = inventory_.find(ArmCall(statement->then_body_));
+    if (found == inventory_.end()) return IRMutator::VisitStmt_(statement);
+    CHECK(statement->else_body_) << "Invocation cut requires the original initialization alternatives";
+    const auto other = inventory_.find(ArmCall(*statement->else_body_));
+    CHECK(other != inventory_.end() && other->second == found->second)
+        << "Invocation initialization alternatives have incompatible command cuts";
+    return Wrap(statement, *found->second);
+  }
+
+ public:
+  explicit InvocationEmitter(const CutInventory& inventory) : inventory_(inventory) {}
+};
+ExprPtr DominatingBlock(const FunctionPtr& owner) {
+  const auto sequence = As<SeqStmts>(owner->body_);
+  if (!sequence) return nullptr;
+  for (const auto& statement : sequence->stmts_) {
+    const auto assign = As<AssignStmt>(statement);
+    if (!assign) break;  // A later/nested definition does not dominate every payload cut.
+    const auto call = As<Call>(assign->value_);
+    if (call && IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
+      const auto type = As<ScalarType>(assign->var_->GetType());
+      CHECK(type && type->dtype_ == DataType::INDEX) << "Invocation guard needs the original index binding";
+      return assign->var_;
+    }
+  }
+  return nullptr;
+}
+
 }  // namespace
 PhysicalSyncRealization RealizePhysicalSync(const CompactSyncResult& analysis, const std::string& target,
                                             const std::optional<std::vector<int>>& eligible_ids) {
@@ -435,6 +630,48 @@ PhysicalSyncRealization RealizePhysicalSync(const CompactSyncResult& analysis, c
   result.function = emitter.VisitFunction(analysis.input.owner);
   return result;
 }
+PhysicalSyncInvocation RealizePhysicalInvocation(const SyncInvocationAnalysis& analysis,
+                                                 const std::string& target,
+                                                 const std::optional<std::vector<int>>& eligible_ids) {
+  CHECK(analysis.owner && !analysis.cases.empty()) << "Missing complete invocation case owner";
+  const auto block = analysis.cases.size() > 1 ? DominatingBlock(analysis.owner) : nullptr;
+  CHECK(analysis.cases.size() == 1 || block) << "Original dominating invocation block binding is unavailable";
+  PhysicalSyncInvocation result{analysis, nullptr, {}};
+  auto next = analysis.block_bounds.first;
+  for (const auto& item : analysis.cases) {
+    CHECK(item.mathematics && item.block_first == next && item.block_last >= item.block_first &&
+          item.block_last < std::numeric_limits<int64_t>::max() &&
+          item.mathematics->input.owner == analysis.owner &&
+          item.mathematics->input.parameter_bounds == analysis.parameter_bounds &&
+          item.mathematics->input.block_bounds == std::make_pair(item.block_first, item.block_last))
+        << "Invocation cases must retain exhaustive original owners and contracts";
+    next = item.block_last + 1;
+    result.cases.push_back(Allocator(*item.mathematics, target, eligible_ids).Run());
+  }
+  CHECK(next == analysis.block_bounds.second + 1) << "Incomplete invocation activation domain";
+  CutInventory cuts;
+  for (size_t i = 0; i < analysis.cases.size(); ++i) {
+    const auto& item = analysis.cases[i];
+    ExprPtr guard;
+    const auto span = analysis.owner->span_;
+    if (item.block_first > analysis.block_bounds.first)
+      guard = std::make_shared<Ge>(block, std::make_shared<ConstInt>(item.block_first, DataType::INDEX, span),
+                                   DataType::BOOL, span);
+    if (item.block_last < analysis.block_bounds.second) {
+      ExprPtr upper =
+          std::make_shared<Lt>(block, std::make_shared<ConstInt>(item.block_last + 1, DataType::INDEX, span),
+                               DataType::BOOL, span);
+      guard = guard ? std::make_shared<And>(guard, upper, DataType::BOOL, span) : upper;
+    }
+    Emitter(*item.mathematics, result.cases[i]).AppendCuts(cuts, guard);
+  }
+  // No source mutation or payload cloning was needed to qualify the cases.
+  // Exclusive cases can share palettes within this invocation only. Fresh entry
+  // and closed notifications at exit remain the existing native contract.
+  result.function = InvocationEmitter(cuts).VisitFunction(analysis.owner);
+  return result;
+}
+
 }  // namespace pypto::ir::sync
 
 namespace pypto::ir::pass {
@@ -456,7 +693,8 @@ FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::stri
 }
 }  // namespace
 Pass RealizeSync() {
-  auto transform = [](const FunctionPtr& function, const sync::SyncParameterBounds& bounds) -> FunctionPtr {
+  auto transform = [](const FunctionPtr& function, const sync::SyncParameterBounds& bounds,
+                      const std::optional<std::pair<int64_t, int64_t>>& block_bounds) -> FunctionPtr {
     if (!IsInCoreType(function->func_type_)) return function;
     // These functions do not enter PTO code generation; their external owner
     // remains responsible for synchronization. Do not claim PTOAS delegation.
@@ -481,13 +719,30 @@ Pass RealizeSync() {
     // Internal errors are deliberately not caught. The strict retained-result
     // APIs still throw on these user-facing input/proof refusals.
     try {
-      auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true, target, bounds));
-      auto physical = sync::RealizePhysicalSync(analysis, target, std::nullopt);
+      FunctionPtr emitted;
+      size_t set_sites = 0, wait_sites = 0;
+      if (block_bounds) {
+        // The complete invocation owner qualifies all activation cases before
+        // any command cuts are published. Do not pick one sampled worker.
+        auto analysis = sync::AnalyzeSyncInvocation(function, true, target, bounds, *block_bounds);
+        auto physical = sync::RealizePhysicalInvocation(analysis, target, std::nullopt);
+        emitted = physical.function;
+        for (const auto& item : physical.cases) {
+          set_sites += item.set_sites;
+          wait_sites += item.wait_sites;
+        }
+      } else {
+        auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true, target, bounds));
+        auto physical = sync::RealizePhysicalSync(analysis, target, std::nullopt);
+        emitted = physical.function;
+        set_sites = physical.set_sites;
+        wait_sites = physical.wait_sites;
+      }
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.
-      if (!physical.set_sites || !physical.wait_sites)
+      if (!set_sites || !wait_sites)
         return SyncOutcome(function, false, "Candidate has no SET/WAIT marker; delegate the original kernel");
-      return SyncOutcome(physical.function, true, "");
+      return SyncOutcome(emitted, true, "");
     } catch (const pypto::ValueError& error) {
       return SyncOutcome(function, false, error.what());
     }
@@ -496,9 +751,14 @@ Pass RealizeSync() {
   // function metadata. Do not infer bounds when the standalone API has none.
   return CreateProgramPass(
       [transform](const ProgramPtr& program) {
-        auto bounds = sync::CollectSyncParameterBounds(program);
+        auto evidence = sync::CollectSyncInvocationEvidence(program);
         auto functions = program->functions_;
-        for (auto& [global, function] : functions) function = transform(function, bounds[global->name_]);
+        for (auto& [global, function] : functions) {
+          auto block = evidence.block_indices.find(global->name_);
+          function = transform(
+              function, evidence.parameters[global->name_],
+              block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second));
+        }
         return std::make_shared<Program>(functions, program->name_, program->span_);
       },
       "RealizeSync", PassProperties{});

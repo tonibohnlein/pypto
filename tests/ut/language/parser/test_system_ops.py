@@ -143,7 +143,6 @@ class TestSystemOpsParsing:
             pl.PipeType.MTE3,
             pl.PipeType.M,
             pl.PipeType.V,
-            pl.PipeType.S,
             pl.PipeType.FIX,
             pl.PipeType.ALL,
         ],
@@ -170,7 +169,6 @@ class TestSystemOpsParsing:
             pl.PipeType.MTE3,
             pl.PipeType.M,
             pl.PipeType.V,
-            pl.PipeType.S,
             pl.PipeType.FIX,
             pl.PipeType.ALL,
         ],
@@ -189,7 +187,6 @@ class TestSystemOpsParsing:
             (pl.PipeType.MTE3, "system.bar_mte3"),
             (pl.PipeType.M, "system.bar_m"),
             (pl.PipeType.V, "system.bar_v"),
-            (pl.PipeType.S, "system.bar_s"),
             (pl.PipeType.FIX, "system.bar_fix"),
             (pl.PipeType.ALL, "system.bar_all"),
         ],
@@ -297,16 +294,20 @@ class Before:
             assert call.kwargs["core_type"] == lane
 
     @pytest.mark.parametrize("barrier_api", [pl.system.barrier, system_ops.barrier], ids=["dsl", "ir"])
-    def test_barrier_accepts_every_pipe_type(self, barrier_api):
-        """Every PipeType member maps to a registered operator.
-
-        The op table in ``system_ops.barrier`` must stay exhaustive over the enum:
-        a member without an entry would raise KeyError, not the documented
-        TypeError, so a new PipeType must arrive with its system.bar_* operator.
-        """
+    def test_barrier_accepts_only_supported_pipe_types(self, barrier_api):
+        """Reject scalar barriers before constructing an unsupported instruction."""
         for pipe in pl.PipeType.__members__.values():
-            call = barrier_api(pipe=pipe)
-            assert call.op.name.startswith("system.bar_")
+            if pipe == pl.PipeType.S:
+                with pytest.raises(ValueError, match="system.barrier pipe must be one of"):
+                    barrier_api(pipe=pipe)
+            else:
+                call = barrier_api(pipe=pipe)
+                assert call.op.name.startswith("system.bar_")
+
+    def test_scalar_barrier_has_no_raw_ir_operator(self):
+        """Raw calls cannot bypass the public API's scalar hardware restriction."""
+        with pytest.raises(ValueError, match="not found in registry"):
+            ir.create_op_call("system.bar_s", [], {}, ir.Span.unknown())
 
     @pytest.mark.parametrize("barrier_api", [pl.system.barrier, system_ops.barrier], ids=["dsl", "ir"])
     def test_barrier_requires_pipe_keyword(self, barrier_api):
@@ -315,7 +316,7 @@ class Before:
         with pytest.raises(TypeError, match="positional"):
             barrier_api(pl.PipeType.V)
 
-    @pytest.mark.parametrize("pipe", ["MTE1", "MTE2", "MTE3", "M", "V", "S", "FIX", "ALL"])
+    @pytest.mark.parametrize("pipe", ["MTE1", "MTE2", "MTE3", "M", "V", "FIX", "ALL"])
     def test_barrier_compiler_attrs_round_trip(self, pipe):
         """Canonical barrier printing preserves attrs attached by compiler passes."""
         source = f"""

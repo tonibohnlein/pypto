@@ -616,8 +616,8 @@ void IRPythonPrinter::PrintCall(const CallPtr& op) {
   // and are printed in parseable format like "pl.tensor.adds"
   std::string op_name = op->op_->name_;
   // Keep the existing barrier IR while presenting its parameterized public
-  // API. The native ops have no operands or kwargs; retain the legacy call
-  // spelling for noncanonical calls rather than silently dropping metadata.
+  // API. The native ops have no operands; retain the legacy call spelling
+  // for noncanonical calls rather than silently dropping metadata.
   // `core_type` is part of the public barrier spelling, so it does NOT make the
   // call noncanonical; any other kwarg does, and falls through to generic Call
   // printing rather than being silently dropped.
@@ -636,8 +636,6 @@ void IRPythonPrinter::PrintCall(const CallPtr& op) {
       barrier_pipe = "M";
     } else if (IsOp(op, "system.bar_v")) {
       barrier_pipe = "V";
-    } else if (IsOp(op, "system.bar_s")) {
-      barrier_pipe = "S";
     } else if (IsOp(op, "system.bar_fix")) {
       barrier_pipe = "FIX";
     } else if (IsOp(op, "system.bar_all")) {

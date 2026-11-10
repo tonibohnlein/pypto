@@ -111,7 +111,11 @@ set(PYPTO_SOURCES
     # IR - Core
     src/ir/transforms/utils/finite_sync_analysis.cpp
     src/ir/transforms/utils/compact_sync_analysis.cpp
+    src/ir/transforms/utils/rotating_sync_analysis.cpp
+    src/ir/transforms/utils/numerical_sync_hierarchy.cpp
+    src/ir/transforms/utils/numerical_sync_merge.cpp
     src/ir/transforms/utils/placed_sync_import.cpp
+    src/ir/transforms/utils/invocation_sync_analysis.cpp
     src/ir/transforms/utils/logical_sync_realization.cpp
     src/ir/transforms/utils/physical_sync_realization.cpp
     src/ir/transforms/utils/hardware_loop_analysis.cpp

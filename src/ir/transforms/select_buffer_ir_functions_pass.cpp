@@ -49,6 +49,7 @@
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_view_analysis.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/slot_index_qualification.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
@@ -135,7 +136,8 @@ class BufferKernelSupport : public IRVisitor {
         }
       }
       if (const auto memory = tile->memref_.value_or(nullptr)) {
-        supported &= !memory->is_pinned_ && memory->slot_count_ == 1 && !memory->slot_index_;
+        supported &= !memory->is_pinned_;
+        if (memory->slot_count_ > 1 || memory->slot_index_) supported &= QualifySlot(tile, memory);
       }
     } else if (auto tensor = As<TensorType>(type)) {
       supported &= backend::IsBufferTensorShape(tensor->shape_) &&
@@ -160,7 +162,8 @@ class BufferKernelSupport : public IRVisitor {
       supported = false;
       return;
     }
-    CheckType(expr->GetType());
+    const auto physical_result = assigned_slot_types_.find(expr.get());
+    CheckType(physical_result == assigned_slot_types_.end() ? expr->GetType() : physical_result->second);
     if (const auto var = AsVarLike(expr)) {
       if (const auto tile = As<TileType>(var->GetType())) {
         if (const auto memory = tile->memref_.value_or(nullptr)) {
@@ -168,8 +171,17 @@ class BufferKernelSupport : public IRVisitor {
           const auto view = views_.Get(var);
           // Only a slice with a known typed parent can carry a symbolic
           // member offset. Allocation origins themselves remain static.
-          supported &= offset ? offset->value_ >= 0 && offset->value_ % 32 == 0
-                              : view.window && view.root && view.row_bytes.has_value();
+          if (memory->slot_count_ > 1 || memory->slot_index_) {
+            supported &= !view.window;
+            if (supported && !loop_slots_.empty()) {
+              const auto index = *memory->slot_index_;
+              auto [entry, inserted] = loop_slots_.front().emplace(memory->base_.get(), index);
+              supported &= inserted || structural_equal(entry->second, index);
+            }
+          } else {
+            supported &= offset ? offset->value_ >= 0 && offset->value_ % 32 == 0
+                                : view.window && view.root && view.row_bytes.has_value();
+          }
         }
       }
     }
@@ -210,6 +222,54 @@ class BufferKernelSupport : public IRVisitor {
   }
 
   void VisitStmt_(const AssignStmtPtr& assign) override {
+    if (const auto call = As<Call>(assign->value_)) {
+      const auto source = As<TileType>(call->GetType());
+      const auto result = As<TileType>(assign->var_->GetType());
+      const auto source_memory = source ? source->memref_.value_or(nullptr) : nullptr;
+      const auto result_memory = result ? result->memref_.value_or(nullptr) : nullptr;
+      if (source_memory && source_memory->slot_index_ && source_memory->size_ == 0) {
+        // InitMemRef resolves assignment destinations, while operation result
+        // types may retain their frontend slot template. Lowering obtains the
+        // physical descriptor from that destination. Accept only an identical
+        // logical template bound to the same resolved family and selector.
+        // The template may remain pinned: InitMemRef clears that declaration
+        // marker only on the destination and preserves isolation on tile.alloc.
+        if (!ConstantEquals(source_memory->byte_offset_, 0) || !result_memory ||
+            !result_memory->slot_index_ || source_memory->base_ != result_memory->base_ ||
+            source_memory->slot_count_ != result_memory->slot_count_ ||
+            !structural_equal(*source_memory->slot_index_, *result_memory->slot_index_) ||
+            !structural_equal(CloneTypeWithoutMemRef(source), CloneTypeWithoutMemRef(result))) {
+          supported = false;
+          return;
+        }
+        assigned_slot_types_.emplace(call.get(), result);
+      }
+    }
+    if (auto call = As<Call>(assign->value_); IsOp(call, "tile.matmul_acc") && call->args_.size() >= 3) {
+      const auto output = As<TileType>(assign->var_->GetType());
+      const auto memory = output ? output->memref_.value_or(nullptr) : nullptr;
+      if (memory && (memory->slot_count_ > 1 || memory->slot_index_)) {
+        const auto lhs = As<TileType>(call->args_[1]->GetType());
+        const auto rhs = As<TileType>(call->args_[2]->GetType());
+        if (!lhs || !rhs) {
+          supported = false;
+          return;
+        }
+        const auto output_valid = ValidShape(output);
+        const auto lhs_valid = ValidShape(lhs);
+        const auto rhs_valid = ValidShape(rhs);
+        // A narrowed product needs a write view; the initial slot adapter keeps
+        // one complete descriptor rather than manufacturing partial slot aliases.
+        supported &= output_valid.size() == 2 && lhs_valid.size() == 2 && rhs_valid.size() == 2 &&
+                     structural_equal(output_valid[0], lhs_valid[0]) &&
+                     structural_equal(output_valid[1], rhs_valid[1]);
+      }
+    }
+    if (auto call = As<Call>(assign->value_); IsOp(call, "tile.alloc") && call->args_.size() == 2) {
+      if (auto capacity = As<ConstInt>(call->args_[1]); capacity && capacity->value_ > 0) {
+        allocation_capacities_.emplace(assign->var_.get(), static_cast<uint64_t>(capacity->value_));
+      }
+    }
     IRVisitor::VisitStmt_(assign);
     if (!supported) return;
     if (As<ScalarType>(assign->var_->GetType())) {
@@ -314,16 +374,35 @@ class BufferKernelSupport : public IRVisitor {
     }
     const auto step = transform_utils::EvalConstInt(loop->step_);
     supported &= step && *step > 0;
+    loop_slots_.emplace_back();
     CheckLoop(loop);
+    loop_slots_.pop_back();
   }
 
-  void VisitStmt_(const WhileStmtPtr& loop) override { CheckLoop(loop); }
+  void VisitStmt_(const WhileStmtPtr& loop) override {
+    loop_slots_.emplace_back();
+    CheckLoop(loop);
+    loop_slots_.pop_back();
+  }
 
   void VisitExpr_(const SubmitPtr&) override { supported = false; }
   void VisitExpr_(const CallPtr& call) override {
     if (As<GlobalVar>(call->op_)) {
       supported = false;
       return;
+    }
+    const bool view_operation = IsOp(call, "tile.slice") || IsOp(call, "tile.assemble") ||
+                                IsOp(call, "tile.reshape") || IsOp(call, "tile.reinterpret_view") ||
+                                IsOp(call, "tile.transpose_view") || IsOp(call, "tile.set_validshape");
+    if (view_operation) {
+      for (const auto& arg : call->args_) {
+        const auto tile = As<TileType>(arg->GetType());
+        const auto memory = tile ? tile->memref_.value_or(nullptr) : nullptr;
+        if (memory && (memory->slot_count_ > 1 || memory->slot_index_)) {
+          supported = false;
+          return;
+        }
+      }
     }
     // Selection must reject metadata that the final lowering cannot carry.
     if (!StripAttr(call->attrs_, kPipelineMembershipAttr).empty()) {
@@ -511,6 +590,35 @@ class BufferKernelSupport : public IRVisitor {
     }
   }
 
+  bool QualifySlot(const TileTypePtr& tile, const MemRefPtr& memory) {
+    const auto space = tile->GetMemorySpace();
+    if (!space || (*space != MemorySpace::Vec && *space != MemorySpace::Mat && *space != MemorySpace::Acc) ||
+        !memory->base_ || !memory->slot_index_ || !*memory->slot_index_ || memory->slot_count_ == 0 ||
+        memory->slot_count_ > 16)
+      return false;
+    const auto capacity = allocation_capacities_.find(memory->base_.get());
+    const auto bytes = TileBytes(tile);
+    const auto origin = FixedMultiBufferBase(memory);
+    const auto* context = PassContext::Current();
+    const auto* target = context ? context->GetBackend() : backend::GetBackend();
+    const auto alignment = target->GetMemAlignment(*space);
+    if (!bytes || !origin || *origin != 0 || !alignment || *bytes % alignment != 0 ||
+        memory->size_ != *bytes || capacity == allocation_capacities_.end() ||
+        capacity->second / memory->slot_count_ != *bytes || capacity->second % memory->slot_count_ != 0) {
+      return false;
+    }
+    const auto valid = ValidShape(tile);
+    for (const auto& value : valid) {
+      if (!As<ConstInt>(value) || As<ConstInt>(value)->value_ <= 0) return false;
+    }
+    // Earlier shape qualification proves whole dense/fractal boxes. Their
+    // physical bytes equal this dense byte count. Keep every layout/valid field
+    // identical across the family; later lowering rechecks final placement.
+    auto descriptor = CloneTypeWithoutMemRef(tile);
+    auto [entry, inserted] = slot_descriptors_.emplace(memory->base_.get(), descriptor);
+    return inserted || structural_equal(entry->second, descriptor);
+  }
+
   static std::optional<uint64_t> TileBytes(const TileTypePtr& tile) {
     if (!tile || !StaticShape(tile->shape_)) return std::nullopt;
     const std::vector<int64_t> shape{As<ConstInt>(tile->shape_[0])->value_,
@@ -592,6 +700,10 @@ class BufferKernelSupport : public IRVisitor {
   void CheckRegionType(const TypePtr& type) {
     supported &= As<TileType>(type) || As<TensorType>(type) || As<ScalarType>(type);
     CheckType(type);
+    if (auto tile = As<TileType>(type)) {
+      const auto memory = tile->memref_.value_or(nullptr);
+      supported &= !memory || (memory->slot_count_ == 1 && !memory->slot_index_);
+    }
   }
 
   void CheckRegionValid(const TypePtr& source, const TypePtr& destination) {
@@ -693,6 +805,9 @@ class BufferKernelSupport : public IRVisitor {
     supported &= load ? direction != ParamDirection::Out : direction != ParamDirection::In;
   }
 
+  std::unordered_map<const Var*, uint64_t> allocation_capacities_;
+  std::unordered_map<const Var*, TypePtr> slot_descriptors_;
+  std::vector<std::unordered_map<const Var*, ExprPtr>> loop_slots_;
   Region* region_ = nullptr;
   const std::vector<TypePtr>& return_types_;
   BufferViewAnalysis views_;
@@ -704,6 +819,7 @@ class BufferKernelSupport : public IRVisitor {
   std::unordered_map<const Var*, VarPtr> tensor_aliases_;
   std::unordered_map<const Var*, VarPtr> matrix_aliases_;
   std::unordered_set<const Type*> checked_types_;
+  std::unordered_map<const Expr*, TypePtr> assigned_slot_types_;
 };
 
 FunctionPtr SelectBufferFunction(const FunctionPtr& function, bool device_helper) {
@@ -729,6 +845,13 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& function, bool device_helper
     support.CheckType(type);
   }
   support.VisitStmt(function->body_);
+  if (support.supported) {
+    // Selecting Buffer must remain executable even when optional autosync later
+    // declines. Share the existing downstream canonical-slot qualification.
+    CanonicalSlotCollector slots;
+    slots.VisitStmt(function->body_);
+    support.supported = slots.unsupported_bases.empty();
+  }
   if (support.supported) support.supported = BufferValidAnalysis(function->body_).supported();
   auto selected = std::make_shared<Function>(*function);
   selected->attrs_.emplace_back(kAttrBufferIrSelected, support.supported &&

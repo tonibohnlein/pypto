@@ -196,6 +196,25 @@ class CompactSyncAnalysis:
         """Return retained geometry, occurrence mapping, families and work counts."""
         ...
 
+    def expand_retained_demands(
+        self, max_payloads: int
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        """Audit actual retained records within an explicit payload budget; no new analysis."""
+        ...
+
+    def export_crossing_demands(
+        self,
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]] | None:
+        """Return original-coordinate flat crossings, or unavailable for unsupported shared uses."""
+        ...
+
+    def scoped_consecutive_reuse(self, family: int) -> bool:
+        """Uniform period-one reuse of an owned schema; False is unproved, not scarcity."""
+        ...
+    def export_scoped_demands(self) -> dict[str, Any] | None:
+        """Return cached original-frame Cartesian demand families, or unavailable."""
+        ...
+
     def realize(self) -> LogicalSyncRealization:
         """Insert logical record/wait commands from this retained result."""
         ...
@@ -220,9 +239,26 @@ class CompactSyncAnalysis:
         ...
 
     def boundary(
-        self, storage: int, row: int, column: int, parameters: dict[int, int] = {}
+        self,
+        storage: int,
+        row: int,
+        column: int,
+        parameters: dict[int, int] = {},
+        block_index: int | None = None,
     ) -> dict[str, Any] | None:
         """Return modeled point selectors; None is unavailable, not absence."""
+        ...
+
+    def boundary_slot(
+        self,
+        storage: int,
+        slot: int,
+        row: int,
+        column: int,
+        parameters: dict[int, int] = {},
+        block_index: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Query an explicit physical slot; unavailable differs from proven absence."""
         ...
 
 def sync_parameter_bounds_profile(program: Program) -> dict[str, Any]:
@@ -230,7 +266,15 @@ def sync_parameter_bounds_profile(program: Program) -> dict[str, Any]:
     ...
 
 def sync_parameter_bounds(program: Program) -> dict[str, dict[int, tuple[int, int]]]:
-    """Inspect inclusive ranges proved at all direct call/submit sites."""
+    """Inspect inclusive ranges joined at all callers through an acyclic call graph."""
+    ...
+
+def sync_invocation_evidence(program: Program) -> dict[str, Any]:
+    """Inspect formal bounds, launch-index hulls and static call-graph traversal work.
+
+    Missing entries are unproved. Launch indices are not formal ABI parameters.
+    Recursive components and their descendants remain unavailable.
+    """
     ...
 
 def analyze_placed_sync(
@@ -238,6 +282,39 @@ def analyze_placed_sync(
     disjoint_gm: bool,
     target: str = "a2a3",
     parameter_bounds: dict[int, tuple[int, int]] = {},
+    composition_order: str = "balanced",
+    block_bounds: tuple[int, int] | None = None,
 ) -> CompactSyncAnalysis:
     """Analyze placed Buffer IR with explicit GM aliases and a named hardware contract."""
+    ...
+
+def describe_placed_sync_input(
+    function: Function,
+    disjoint_gm: bool,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+    block_bounds: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    """Inspect qualified physical accesses without constructing demands or exports."""
+    ...
+
+class SyncInvocationAnalysis:
+    def realize_physical(self, target: str, eligible_ids: list[int] | None = None) -> dict[str, Any]:
+        """Qualify all cases and aggregate guarded command cuts in the original IR."""
+        ...
+    def select_case(self, block_index: int, parameters: dict[int, int]) -> CompactSyncAnalysis | None:
+        """Return retained mathematics only for an admitted fully bound invocation."""
+        ...
+    def describe(self) -> dict[str, Any]:
+        """Inspect exhaustive disjoint cases and construction work."""
+        ...
+
+def analyze_sync_invocation(
+    function: Function,
+    disjoint_gm: bool,
+    target: str,
+    parameter_bounds: dict[int, tuple[int, int]],
+    block_bounds: tuple[int, int],
+) -> SyncInvocationAnalysis:
+    """Construct qualified cases over the entire supplied launch contract."""
     ...

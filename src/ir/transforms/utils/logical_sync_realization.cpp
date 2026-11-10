@@ -191,6 +191,9 @@ class Realizer : public SyncPlacement {
 };
 }  // namespace
 LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis) {
+  for (const auto& segment : analysis.segments)
+    CHECK(!segment.rotating)
+        << "Rotating minimum demands are retained; logical endpoint export is unavailable";
   for (const auto& segment : analysis.input.segments)
     CHECK(segment.nested_frames.empty()) << "Nested repetition requires token transport across every "
                                             "enclosing frame; physical export is available";

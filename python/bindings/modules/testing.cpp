@@ -65,6 +65,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   nb::dict out;
   out["guarantee"] = "minimum demands for declared footprints and core native chains";
   out["realization"] = "not requested";
+  out["analysis_available"] = result.segments.size() == result.input.segments.size();
   out["parameter_bounds"] = result.input.parameter_bounds;
   out["coordinate_nodes"] = result.input.coordinate_nodes;
   out["coordinate_flatten_visits"] = result.input.coordinate_flatten_visits;
@@ -79,51 +80,90 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     item["row_extent_parameter"] = s.row_extent_parameter;
     item["columns"] = s.columns;
     item["bytes"] = s.bytes;
+    item["slot_count"] = s.slot_count;
+    item["slot_bytes"] = s.slot_bytes;
     item["byte_coordinates"] = s.byte_coordinates;
     item["row_parameters"] = s.row_parameters;
     item["column_parameters"] = s.column_parameters;
+    item["row_block"] = s.row_block;
+    item["column_block"] = s.column_block;
+    item["block_origin"] = result.input.block_bounds ? result.input.block_bounds->first : 0;
     storage.append(item);
   }
-  for (size_t r = 0; r < result.segments.size(); ++r) {
+  for (size_t r = 0; r < result.input.segments.size(); ++r) {
     const auto& source = result.input.segments[r];
-    const auto& analysis = result.segments[r];
+    const auto* analysis = r < result.segments.size() ? &result.segments[r] : nullptr;
     nb::dict region;
     nb::list sites, families, generators;
     region["count"] = source.count;
     region["start"] = source.start;
     region["step"] = source.step;
+    region["reset_period"] = source.reset_period;
     region["loop"] = source.original_loop;
     nb::list frames;
     for (const auto& frame : source.nested_frames)
       frames.append(nb::make_tuple(frame.loop, frame.count, frame.start, frame.step));
     region["nested_frames"] = frames;
+    nb::list start_expressions;
+    for (const auto& frame : source.nested_frames) start_expressions.append(frame.start_expression);
+    region["frame_start_expressions"] = start_expressions;
     for (const auto& s : source.sites) {
       nb::dict site;
-      nb::list accesses, precision;
+      nb::list accesses, precision, slots, access_frames;
       site["original"] = s.original;
       site["continuation"] = s.continuation;
+      site["initialization_scope"] = s.initialization_scope;
       site["pipe"] = s.pipe;
       for (const auto& a : s.accesses) {
+        access_frames.append(a.coordinate_frame);
+        slots.append(nb::make_tuple(a.slot_first, a.slot_step));
         precision.append(a.exact_footprint ? "exact" : "enclosure");
         accesses.append(nb::make_tuple(a.storage, a.write, a.row, a.column, a.row_step, a.column_step, a.rows,
                                        a.columns, a.after_first));
       }
+      site["slot_selections"] = slots;
       site["access_precision"] = precision;
       site["accesses"] = accesses;
+      site["access_frames"] = access_frames;
       sites.append(site);
     }
-    for (auto f : analysis.demands) families.append(nb::make_tuple(f.source, f.target, f.distance));
-    for (auto f : analysis.generators) generators.append(nb::make_tuple(f.source, f.target, f.distance));
+    if (analysis) {
+      for (auto f : analysis->demands) families.append(nb::make_tuple(f.source, f.target, f.distance));
+      for (auto f : analysis->generators) generators.append(nb::make_tuple(f.source, f.target, f.distance));
+    }
     region["sites"] = sites;
-    region["demands"] = families;
-    region["generators"] = generators;
-    region["distance_entries"] = analysis.distance.size() * analysis.distance.size();
+    region["demands"] = analysis ? nb::object(families) : nb::object(nb::none());
+    region["generators"] = analysis ? nb::object(generators) : nb::object(nb::none());
+    region["distance_entries"] = analysis ? analysis->distance.size() * analysis->distance.size() : 0;
+    if (analysis) {
+      region["rotating"] = analysis->rotating;
+      region["core_frontiers"] = analysis->core_frontiers;
+      region["internal_scope_count"] = analysis->internal_scope_count;
+      region["repetitions"] = analysis->repetitions;
+      nb::dict ownership;
+      for (const auto& [storage, proof] : analysis->visit_owned) {
+        ownership[nb::int_(storage)] = nb::make_tuple(proof.row_step, proof.column_step, proof.row_begin,
+                                                      proof.row_end, proof.column_begin, proof.column_end);
+      }
+      region["visit_owned"] = ownership;
+      region["rotating_fragments"] = analysis->rotating_fragments;
+      region["atom_tests"] = analysis->atom_tests;
+      region["quotient_edges"] = analysis->quotient_edges;
+      region["modular_groups"] = analysis->modular_groups;
+      region["sort_comparisons"] = analysis->sort_comparisons;
+      region["sweep_visits"] = analysis->sweep_visits;
+      region["shortest_path_runs"] = analysis->shortest_path_runs;
+      region["shortest_path_edge_visits"] = analysis->shortest_path_edge_visits;
+      region["retained_frontier_entries"] = analysis->retained_frontier_entries;
+    }
     regions.append(region);
   }
   out["storage"] = storage;
   out["regions"] = regions;
-  out["crossing_demands"] = result.crossing_demands;
-  out["crossing_generators"] = result.crossing_generators;
+  out["crossing_demands"] =
+      result.HasHierarchy() ? nb::object(nb::none()) : nb::cast(result.crossing_demands);
+  out["crossing_generators"] =
+      result.HasHierarchy() ? nb::object(nb::none()) : nb::cast(result.crossing_generators);
   out["analyzed_occurrences"] = result.analyzed_occurrences;
   out["hardware_target"] = result.input.hardware_target;
   out["cells"] = result.cells;
@@ -136,17 +176,48 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   out["partition_seconds"] = result.partition_seconds;
   out["reduction_seconds"] = result.reduction_seconds;
   out["composition_seconds"] = result.composition_seconds;
+  out["hierarchical"] = result.HasHierarchy();
+  out["source_region_nodes"] = result.source_region_nodes;
+  out["source_coordinate_entries"] = result.source_coordinate_entries;
+  out["scoped_export_builds"] = result.scoped_export_builds;
+  out["scoped_reuse_queries"] = result.scoped_reuse_queries;
+  out["point_selector_access_visits"] = result.point_selector_access_visits;
+  out["interface_cells"] = result.interface_cells;
+  out["omitted_bridge_domains"] = result.omitted_bridge_domains;
+  out["interface_slot_visits"] = result.interface_slot_visits;
+  out["interface_ports"] = result.interface_ports;
+  out["interface_entries"] = result.interface_entries;
+  out["interface_queries"] = result.interface_queries;
+  out["merge_nodes"] = result.merge_nodes;
+  out["crossing_tests"] = result.crossing_tests;
+  out["hierarchy_query_steps"] = result.hierarchy_query_steps;
+  out["interface_access_visits"] = result.interface_access_visits;
+  out["bridge_candidates"] = result.bridge_candidates;
+  out["port_normalization_visits"] = result.port_normalization_visits;
   return out;
 }
 nb::object CompactBoundary(const ir::sync::CompactSyncResult& result, size_t storage, int64_t row,
-                           int64_t col, const std::map<size_t, int64_t>& parameters) {
-  auto b = result.BoundaryAt(storage, row, col, parameters);
+                           int64_t col, const std::map<size_t, int64_t>& parameters,
+                           std::optional<int64_t> block_index) {
+  auto b = result.BoundaryAt(storage, row, col, parameters, block_index);
   if (!b) return nb::none();
   nb::dict out;
   out["first_writer"] = b->first_writer;
   out["last_writer"] = b->last_writer;
   out["first_readers"] = b->first_readers;
   out["last_readers"] = b->last_readers;
+  return out;
+}
+nb::object CompactSlotBoundary(const ir::sync::CompactSyncResult& result, size_t storage, int64_t slot,
+                               int64_t row, int64_t col, const std::map<size_t, int64_t>& parameters,
+                               std::optional<int64_t> block_index) {
+  auto boundary = result.BoundarySlot(storage, slot, row, col, parameters, block_index);
+  if (!boundary) return nb::none();
+  nb::dict out;
+  out["first_writer"] = boundary->first_writer;
+  out["last_writer"] = boundary->last_writer;
+  out["first_readers"] = boundary->first_readers;
+  out["last_readers"] = boundary->last_readers;
   return out;
 }
 
@@ -476,6 +547,36 @@ bool IsNoDuplicateOpForTesting(const std::string& op_name) {
 // Module binding
 // ============================================================================
 
+nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
+  nb::dict out;
+  out["function"] = result.function;
+  out["set_sites"] = result.set_sites;
+  out["wait_sites"] = result.wait_sites;
+  out["barrier_sites"] = result.barrier_sites;
+  out["guard_sites"] = result.guard_sites;
+  out["reuse_queries"] = result.reuse_queries;
+  out["reserved_lanes"] = result.reserved_lanes;
+  out["native_reserved_ids"] = result.native_reserved_ids;
+  out["finite_minimum"] = result.finite_minimum;
+  nb::list families;
+  for (const auto& f : result.families) {
+    nb::dict row;
+    row["source"] = nb::make_tuple(f.source_region, f.source_first, f.source_site);
+    row["target"] = nb::make_tuple(f.target_region, f.target_first, f.target_site);
+    row["count"] = f.count;
+    row["ids"] = nb::cast(f.ids);
+    nb::list axes;
+    for (const auto& axis : f.axes)
+      axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));
+    row["axes"] = axes;
+    families.append(row);
+  }
+  out["families"] = families;
+  out["guarantee"] = "equal selected order under qualified direct-command model";
+  out["native_mode"] = "manual a2a3; fresh flags at entry; closed notifications at exit";
+  return out;
+}
+
 void BindTesting(nb::module_& m) {
   // Create a protected submodule for testing utilities
   // This will be accessible as pypto.testing in Python
@@ -530,6 +631,8 @@ void BindTesting(nb::module_& m) {
               "Return recognized DSA-RP edges without running placement");
 
   nb::class_<ir::sync::CompactSyncResult>(testing, "CompactSyncAnalysis")
+      .def("export_crossing_demands", &ir::sync::CompactSyncResult::ExportCrossingDemands,
+           "Export retained crossings for a flat regional use; unavailable is distinct from empty")
       .def(
           "realize",
           [](const ir::sync::CompactSyncResult& analysis) {
@@ -551,58 +654,155 @@ void BindTesting(nb::module_& m) {
           [](const ir::sync::CompactSyncResult& analysis, const std::string& target,
              const std::optional<std::vector<int>>& eligible_ids) {
             const auto result = ir::sync::RealizePhysicalSync(analysis, target, eligible_ids);
-            nb::dict out;
-            out["function"] = result.function;
-            out["set_sites"] = result.set_sites;
-            out["wait_sites"] = result.wait_sites;
-            out["barrier_sites"] = result.barrier_sites;
-            out["guard_sites"] = result.guard_sites;
-            out["reuse_queries"] = result.reuse_queries;
-            out["reserved_lanes"] = result.reserved_lanes;
-            out["native_reserved_ids"] = result.native_reserved_ids;
-            out["finite_minimum"] = result.finite_minimum;
-            nb::list families;
-            for (const auto& f : result.families) {
-              nb::dict row;
-              row["source"] = nb::make_tuple(f.source_region, f.source_first, f.source_site);
-              row["target"] = nb::make_tuple(f.target_region, f.target_first, f.target_site);
-              row["count"] = f.count;
-              row["ids"] = nb::cast(f.ids);
-              families.append(row);
-            }
-            out["families"] = families;
-            out["guarantee"] = "equal selected order under qualified direct-command model";
-            out["native_mode"] = "manual a2a3; fresh flags at entry; closed notifications at exit";
-            return out;
+            return DescribePhysicalSync(result);
           },
           nb::arg("target"), nb::arg("eligible_ids") = nb::none(),
           "Realize retained demands with certified physical handoffs; no scarcity repair")
       .def("describe", &DescribeCompactSync, "Inspect retained analysis without additional construction")
+      .def("expand_retained_demands", &ir::sync::CompactSyncResult::ExpandRetainedDemands,
+           nb::arg("max_payloads"), "Bounded audit expansion of retained records; never reruns analysis")
+      .def(
+          "export_scoped_demands",
+          [](const ir::sync::CompactSyncResult& result) -> nb::object {
+            const auto owned = result.ExportScopedDemands();
+            if (!owned) return nb::none();
+            nb::dict out;
+            nb::list families;
+            for (const auto& family : owned->families) {
+              nb::dict item;
+              item["source"] = family.source;
+              item["target"] = family.target;
+              nb::list axes;
+              for (const auto& axis : family.axes)
+                axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));
+              item["axes"] = axes;
+              families.append(item);
+            }
+            out["families"] = families;
+            out["visited_source_nodes"] = owned->visited_source_nodes;
+            out["visited_merge_nodes"] = owned->visited_merge_nodes;
+            out["coordinate_entries"] = owned->coordinate_entries;
+            return out;
+          },
+          "Export cached compact demand families in original source frames; not a physical certificate")
+      .def("scoped_consecutive_reuse", &ir::sync::CompactSyncResult::ScopedConsecutiveReuse,
+           nb::arg("family"), "Certify all carry classes for an owned original scoped family")
       .def("precedes", &ir::sync::CompactSyncResult::Precedes, nb::arg("source"),
            nb::arg("source_completion"), nb::arg("target"), nb::arg("target_completion"),
            "Query original segment/visit/site events")
       .def("boundary", &CompactBoundary, nb::arg("storage"), nb::arg("row"), nb::arg("column"),
-           nb::arg("parameters") = std::map<size_t, int64_t>{},
-           "Exact modeled point selector, or None for unavailable domain");
+           nb::arg("parameters") = std::map<size_t, int64_t>{}, nb::arg("block_index") = nb::none(),
+           "Exact modeled point selector, or None for unavailable domain")
+      .def("boundary_slot", &CompactSlotBoundary, nb::arg("storage"), nb::arg("slot"), nb::arg("row"),
+           nb::arg("column"), nb::arg("parameters") = std::map<size_t, int64_t>{},
+           nb::arg("block_index") = nb::none(),
+           "Exact modeled point selector with explicit physical slot identity");
+  nb::class_<ir::sync::SyncInvocationAnalysis>(testing, "SyncInvocationAnalysis")
+      .def(
+          "realize_physical",
+          [](const ir::sync::SyncInvocationAnalysis& analysis, const std::string& target,
+             const std::optional<std::vector<int>>& eligible_ids) {
+            const auto result = ir::sync::RealizePhysicalInvocation(analysis, target, eligible_ids);
+            nb::dict out;
+            out["function"] = result.function;
+            nb::list cases;
+            size_t sets = 0, waits = 0, barriers = 0, guards = 0;
+            for (size_t i = 0; i < result.cases.size(); ++i) {
+              auto row = DescribePhysicalSync(result.cases[i]);
+              row["block_bounds"] =
+                  nb::make_tuple(analysis.cases[i].block_first, analysis.cases[i].block_last);
+              cases.append(row);
+              sets += result.cases[i].set_sites;
+              waits += result.cases[i].wait_sites;
+              barriers += result.cases[i].barrier_sites;
+              guards += result.cases[i].guard_sites;
+            }
+            out["cases"] = cases;
+            out["set_sites"] = sets;
+            out["wait_sites"] = waits;
+            out["barrier_sites"] = barriers;
+            out["guard_sites"] = guards;
+            return out;
+          },
+          nb::arg("target"), nb::arg("eligible_ids") = nb::none(),
+          "Realize all qualified cases into one original payload tree transactionally")
+      .def("select_case", &ir::sync::SyncInvocationAnalysis::SelectCase, nb::arg("block_index"),
+           nb::arg("parameters"), "Retained case for a fully bound admitted invocation, or None")
+      .def(
+          "describe",
+          [](const ir::sync::SyncInvocationAnalysis& result) {
+            nb::dict out;
+            out["block_bounds"] = result.block_bounds;
+            out["parameter_bounds"] = result.parameter_bounds;
+            out["coordinate_nodes"] = result.coordinate_nodes;
+            out["coordinate_pieces"] = result.coordinate_pieces;
+            nb::list cases;
+            for (const auto& item : result.cases) {
+              nb::dict row;
+              row["block_bounds"] = nb::make_tuple(item.block_first, item.block_last);
+              row["analysis"] = DescribeCompactSync(*item.mathematics);
+              cases.append(row);
+            }
+            out["cases"] = cases;
+            return out;
+          },
+          "Inspect exhaustive invocation partition without constructing exports");
+  testing.def("analyze_sync_invocation", &ir::sync::AnalyzeSyncInvocation, nb::arg("function"),
+              nb::arg("disjoint_gm"), nb::arg("target"), nb::arg("parameter_bounds"), nb::arg("block_bounds"),
+              "Analyze an exhaustive analytic partition of a proved launch domain");
+  testing.def(
+      "describe_placed_sync_input",
+      [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
+         const ir::sync::SyncParameterBounds& bounds,
+         const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
+        ir::sync::CompactSyncResult imported;
+        imported.input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds);
+        auto description = DescribeCompactSync(imported);
+        description["guarantee"] = "qualified access description; demand analysis not requested";
+        description["analysis_available"] = false;
+        return description;
+      },
+      nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
+      "Inspect normalized physical access and slot certificates without constructing demands");
   testing.def(
       "analyze_placed_sync",
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
-         const ir::sync::SyncParameterBounds& bounds) {
+         const ir::sync::SyncParameterBounds& bounds, const std::string& composition_order,
+         const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
         auto start = std::chrono::steady_clock::now();
-        auto input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds);
+        auto input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds);
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        auto result = ir::sync::AnalyzeCompactSync(std::move(input));
+        auto result = ir::sync::AnalyzeCompactSync(std::move(input), composition_order);
         result.import_seconds = seconds;
         return result;
       },
       nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target") = "a2a3",
       nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{},
+      nb::arg("composition_order") = "balanced", nb::arg("block_bounds") = nb::none(),
       "Read-only research analysis of qualified placed Buffer IR under a named hardware contract");
 
   testing.def(
       "sync_parameter_bounds",
       [](const ir::ProgramPtr& program) { return ir::sync::CollectSyncParameterBounds(program); },
-      nb::arg("program"), "Inspect proved direct-caller coordinate ranges without analysis or realization");
+      nb::arg("program"), "Inspect proved caller coordinate ranges without analysis or realization");
+  testing.def(
+      "sync_invocation_evidence",
+      [](const ir::ProgramPtr& program) {
+        ir::sync::SyncParameterWork work;
+        const auto evidence = ir::sync::CollectSyncInvocationEvidence(program, &work);
+        nb::dict out;
+        out["parameters"] = evidence.parameters;
+        out["block_indices"] = evidence.block_indices;
+        out["call_graph_expression_visits"] = work.call_graph_expression_visits;
+        out["call_graph_nodes"] = work.call_graph_nodes;
+        out["call_graph_edges"] = work.call_graph_edges;
+        out["processed_functions"] = work.processed_functions;
+        out["expression_visits"] = work.expression_visits;
+        out["range_visits"] = work.range_visits;
+        return out;
+      },
+      nb::arg("program"), "Read-only scalar and launch evidence; missing facts remain unavailable");
   testing.def(
       "sync_parameter_bounds_profile",
       [](const ir::ProgramPtr& program) {

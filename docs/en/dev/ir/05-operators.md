@@ -677,20 +677,15 @@ The existing `system.*` operations below retain their physical/query contracts:
 **Location**: `src/ir/op/sync_ops/` — `sync.cpp` (barriers), `task.cpp` (TaskId), `launch.cpp` (launch-shape queries)
 **Python API**: `from pypto.ir.op import system`
 
-The public Python barrier API is `pl.system.barrier(*, pipe, core_type=None)`,
-accepting every `pl.PipeType` member. It constructs the operand-free
-`system.bar_*` operators below — there is no `system.barrier` IR operator and no
-`pipe` IR attr — and the printer renders them back as
-`pl.system.barrier(pipe=...)`. The old `bar_v()` / `bar_m()` / `bar_all()` Python
-APIs have been removed. Barriers consume no event slot, and `ALL` orders all
-pipelines on the current core, not arrivals across cores. A barrier is
-**rejected inside `pl.pipeline`**: having no operand, it gets no def-use edge to
-hold it in place and could be ordered before the transfer it was written to
-follow — the restriction `set_flag` / `wait_flag` already carry.
+The public API `pl.system.barrier(*, pipe, core_type=None)` accepts every `pl.PipeType` member except `S` (native scalar ordering). It constructs the
+operand-free `system.bar_*` operators below; the printer restores `pl.system.barrier(pipe=...)`. There is no `system.barrier` IR operator or `pipe` IR
+attr. The old `bar_v()` / `bar_m()` / `bar_all()` Python APIs have been removed. Barriers consume no event slot; `ALL` orders all pipelines on this
+core, not arrivals across cores. Like explicit flags, barriers are **rejected inside `pl.pipeline`**: the operand-free call has no def-use edge to
+prevent scheduling it before its preceding transfer.
 
 | Operation | Description | Kwargs |
 | --------- | ----------- | ------ |
-| `system.bar_*` | Drain one hardware pipeline (`pto.barrier <PIPE_*>`). One op per `PipeType`: `bar_mte1` MTE1 (L1 → L0A/L0B), `bar_mte2` MTE2 (GM → UB load), `bar_mte3` MTE3 (UB → GM store), `bar_m` Matrix, `bar_v` Vector, `bar_s` Scalar, `bar_fix` Fix (L0C writeback), `bar_all` every pipeline on this core | `core_type` (`"aic"` \| `"aiv"`), optional — pins the barrier to one lane of a mixed kernel; omitted leaves it SHARED, i.e. in both |
+| `system.bar_*` | Drain one hardware pipeline (`pto.barrier <PIPE_*>`). One op per supported pipe: `bar_mte1` MTE1 (L1 → L0A/L0B), `bar_mte2` MTE2 (GM → UB load), `bar_mte3` MTE3 (UB → GM store), `bar_m` Matrix, `bar_v` Vector, `bar_fix` Fix (L0C writeback), `bar_all` every pipeline on this core | `core_type` (`"aic"` \| `"aiv"`), optional — pins the barrier to one lane of a mixed kernel; omitted leaves it SHARED, i.e. in both |
 | `system.fence` | Memory barrier over global memory (lowers to `pto.fence.barrier_all #pto.fence_scope<gm>`) | None |
 | `system.cacheinvalid` | Invalidate the cache line containing a tensor sub-region's base address. Args: `tensor`, `shapes` (N-D), `offsets` (N-D). Every region size — a single element included — lowers to `pto.partition_view` + `pto.cmo.cacheinvalid %payload_view single_cache_line : !pto.partition_tensor_view<...>`; `shapes` does not make it walk every cache line. The no-argument form invalidates all GM. | None |
 | `system.syncall` | Cross-core all-participant barrier (`pto::SYNCALL`). Attr `mode` `"hard"` (FFTS, no operands) or `"soft"` (GM-polling, operands) | `core_type` (`"aiv_only"` \| `"aic_only"` \| `"mix"`), `mode` (`"hard"` \| `"soft"`) |
@@ -702,18 +697,13 @@ follow — the restriction `set_flag` / `wait_flag` already carry.
 | `system.available_cluster_count` | This run's MIX cluster (= AIC) count, read from the device. Result `Scalar[INT32]` | None |
 | `system.available_aiv_count` | This run's standalone AIV core count, read from the device. Result `Scalar[INT32]` | None |
 
-The explicit flag calls have `UnknownType` and are retained as `EvalStmt(Call)`.
-`src_pipe` and `dst_pipe` are distinct concrete `PipeType` values (not `ALL`).
-Exactly one event form is present: a literal `event_id` in `[0, 7]`, or one
-`ScalarType(INDEX)` operand whose runtime value must stay in that range.
-`core_type` is optional `"aic"` / `"aiv"` IR metadata for mixed-kernel placement.
-Codegen emits `pto.set_flag` / `pto.wait_flag`, or the `_dyn` variants for an
-INDEX operand. A dynamic operand folded to a constant remains an operand and
-still emits the `_dyn` form; IR printing preserves it with `pl._dump.call`.
-The calls do not represent cross-core synchronization.
-The `PipelineLoopValid` verifier rejects either call inside a `ForKind::Pipeline`
-loop before pipeline scheduling. The scheduling passes also reject this placement
-when optional IR verification is disabled. Explicit flags work in ordinary loops.
+The explicit flag calls have `UnknownType` and are retained as `EvalStmt(Call)`. `src_pipe` and `dst_pipe` are distinct concrete `PipeType` values
+(not `ALL`). Exactly one event form is present: a literal `event_id` in `[0, 7]`, or one `ScalarType(INDEX)` operand whose runtime value must stay in
+that range. `core_type` is optional `"aic"` / `"aiv"` IR metadata for mixed-kernel placement. Codegen emits `pto.set_flag` / `pto.wait_flag`, or the
+`_dyn` variants for an INDEX operand. A dynamic operand folded to a constant remains an operand and still emits the `_dyn` form; IR printing preserves
+it with `pl._dump.call`. The calls do not represent cross-core synchronization. The `PipelineLoopValid` verifier rejects either call inside a
+`ForKind::Pipeline` loop before pipeline scheduling. The scheduling passes also reject this placement when optional IR verification is disabled.
+Explicit flags work in ordinary loops.
 
 `system.syncall` has two modes, selected by its `mode` **IR attribute**; the Python surfaces spell them as `pl.SyncAllMode` members instead (see below). The **hard** form (attr `"hard"`, the default) emits an FFTS barrier that waits for **all** physical cores of the selected `core_type`; the kernel must be launched at full occupancy (one block per physical core) **and with `sync_start=True`** (so all blocks are co-resident — a non-sync_start launch may dispatch blocks in waves and deadlock the barrier), or it deadlocks (AICore error 507018). The **soft** form (attr `"soft"`) polls a shared GM workspace and so works at **partial** occupancy. `gm_workspace` is a shared, zero-initialized GM `INT32` tensor containing at least 16 elements (64 bytes). Pass it as a kernel parameter so all blocks share one buffer; it must occupy an exclusive cache line and be zero-initialized before its first use.
 

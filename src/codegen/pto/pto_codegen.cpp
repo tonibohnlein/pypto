@@ -62,6 +62,7 @@
 #include "pypto/ir/transforms/utils/l0c_footprint.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/slot_index_qualification.h"
 #include "pypto/ir/transforms/utils/tile_buf_signature.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/type_metadata.h"
@@ -373,136 +374,6 @@ class CoLiveSlotCollector : public ir::IRVisitor {
   int loop_depth_ = 0;
   std::set<const ir::Var*> per_loop_seen_;
 };
-
-// PTOAS recognizes remui(iv + nonnegative_constant, slot_count). Restrict the
-// unsigned spelling to slot metadata whose loop bounds prove that equivalence;
-// ordinary FloorMod expressions retain their existing lowering.
-class CanonicalSlotCollector : public ir::IRVisitor {
- public:
-  std::set<const ir::Expr*> remainders;
-  std::set<const ir::Var*> unsupported_bases;
-  std::set<const ir::Var*> verified_bases;
-
-  void VisitStmt_(const ir::ForStmtPtr& op) override {
-    loops_.emplace(op->loop_var_.get(), op);
-    const bool verified = op->HasAttr(ir::kSoftwarePipelineSlotsAttr);
-    if (verified) ++verified_depth_;
-    ir::IRVisitor::VisitStmt_(op);
-    if (verified) --verified_depth_;
-    loops_.erase(op->loop_var_.get());
-  }
-
-  void VisitStmt_(const ir::AssignStmtPtr& op) override {
-    if (As<ScalarType>(op->var_->GetType())) {
-      definitions_.emplace(op->var_.get(), op->value_);
-      analyzer_.const_int_bound.Update(op->var_, analyzer_.const_int_bound(op->value_));
-    }
-    auto tile = ir::GetTileTypeWithMemRef(op->var_->GetType());
-    if (tile) {
-      const auto memref = ir::GetDefinedMemRef(tile);
-      if (memref->slot_count_ > 1 && memref->slot_index_.has_value()) {
-        if (verified_depth_) verified_bases.insert(memref->base_.get());
-        ExprPtr index = *memref->slot_index_;
-        if (ir::AsVarLike(index)) index = ResolveScalarAlias(index);
-        if (!IsCanonical(index, memref->slot_count_)) {
-          unsupported_bases.insert(memref->base_.get());
-        } else if (As<ir::FloorMod>(index)) {
-          remainders.insert(index.get());
-        }
-      }
-    }
-    ir::IRVisitor::VisitStmt_(op);
-  }
-
- private:
-  static bool IsIndex(const ExprPtr& expr) {
-    const auto scalar = expr ? As<ScalarType>(expr->GetType()) : nullptr;
-    return scalar && scalar->dtype_ == DataType::INDEX;
-  }
-
-  ExprPtr ResolveScalarAlias(ExprPtr expr) const {
-    // A fixed bound keeps canonical-form recognition linear in program size.
-    // Shared affine ordinals are emitted once and referenced by several slots.
-    for (int i = 0; i < 8; ++i) {
-      if (!IsIndex(expr)) return nullptr;
-      auto var = ir::AsVarLike(expr);
-      if (!var) break;
-      auto it = definitions_.find(var.get());
-      if (it == definitions_.end()) break;
-      expr = it->second;
-    }
-    return IsIndex(expr) ? expr : nullptr;
-  }
-
-  bool IsCanonical(const ExprPtr& index, uint64_t count) {
-    if (auto constant = As<ir::ConstInt>(index)) {
-      return constant->value_ >= 0 && static_cast<uint64_t>(constant->value_) < count;
-    }
-    auto mod = As<ir::FloorMod>(index);
-    // An INDEX result can still hide narrowing in an operand or alias. Only
-    // an entirely INDEX affine chain supports the unsigned slot proof.
-    if (!mod || !IsIndex(mod) || !IsIndex(mod->right_)) return false;
-    auto divisor = As<ir::ConstInt>(mod->right_);
-    if (!divisor || divisor->value_ <= 0 || static_cast<uint64_t>(divisor->value_) != count) return false;
-    ExprPtr induction = ResolveScalarAlias(mod->left_);
-    if (!induction) return false;
-    int64_t offset = 0;
-    if (auto add = As<ir::Add>(induction)) {
-      auto constant = As<ir::ConstInt>(add->right_);
-      if (!constant || !IsIndex(constant) || constant->value_ < 0) return false;
-      induction = ResolveScalarAlias(add->left_);
-      offset = constant->value_;
-    }
-    auto found = loops_.find(ir::AsVarLike(induction).get());
-    if (found == loops_.end()) return false;
-    const auto& loop = found->second;
-    if (!IsIndex(loop->start_) || !IsIndex(loop->stop_) || !IsIndex(loop->step_)) return false;
-    if (!As<ir::ConstInt>(loop->stop_) && !loop->HasAttr(ir::kSoftwarePipelineSlotsAttr)) return false;
-    auto start = As<ir::ConstInt>(loop->start_);
-    const auto stop_bound = analyzer_.const_int_bound(loop->stop_);
-    auto step = As<ir::ConstInt>(loop->step_);
-    return start && step && start->value_ >= 0 && step->value_ > 0 &&
-           (offset == 0 || stop_bound.max_value <= std::numeric_limits<int64_t>::max() - offset);
-  }
-
-  std::map<const ir::Var*, ir::ForStmtPtr> loops_;
-  std::map<const ir::Var*, ExprPtr> definitions_;
-  ir::arith::Analyzer analyzer_;
-  unsigned verified_depth_ = 0;
-};
-
-// InitMemRef derives offset = slot_index * slot_size; AllocateMemoryAddr adds
-// the allocation base. Recover only that exact representation, rejecting views
-// and extra offsets rather than silently moving a slot onto different bytes.
-std::optional<int64_t> FixedMultiBufferBase(const ir::MemRefPtr& memref) {
-  if (!memref->slot_index_ || !*memref->slot_index_ || memref->size_ == 0 ||
-      memref->size_ > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-    return std::nullopt;
-  }
-  const auto& index = *memref->slot_index_;
-  const auto stride = static_cast<int64_t>(memref->size_);
-  if (auto constant = As<ir::ConstInt>(index)) {
-    auto address = As<ir::ConstInt>(memref->byte_offset_);
-    if (!address || constant->value_ < 0 || constant->value_ > std::numeric_limits<int64_t>::max() / stride) {
-      return std::nullopt;
-    }
-    const int64_t relative = constant->value_ * stride;
-    if (address->value_ < relative) return std::nullopt;
-    return address->value_ - relative;
-  }
-  auto matches_slot_offset = [&](const ExprPtr& expr) {
-    auto product = As<ir::Mul>(expr);
-    if (!product) return false;
-    auto factor = As<ir::ConstInt>(product->right_);
-    return factor && factor->value_ == stride && ir::AreExprsEqual(product->left_, index);
-  };
-  if (matches_slot_offset(memref->byte_offset_)) return 0;
-  auto address = As<ir::Add>(memref->byte_offset_);
-  if (!address) return std::nullopt;
-  auto base = As<ir::ConstInt>(address->left_);
-  if (!base || base->value_ < 0 || !matches_slot_offset(address->right_)) return std::nullopt;
-  return base->value_;
-}
 
 // The (valid_row, valid_col) extents a tile declares, when both are compile-time.
 //
@@ -2153,7 +2024,7 @@ void PTOCodegen::PlanMultiBufferRegions(const FunctionPtr& func) {
 
   TilePhiBaseCollector phi_collector;
   CoLiveSlotCollector colive_collector;
-  CanonicalSlotCollector canonical_collector;
+  ir::CanonicalSlotCollector canonical_collector;
   if (func->body_) {
     phi_collector.VisitStmt(func->body_);
     colive_collector.VisitStmt(func->body_);
@@ -2295,7 +2166,7 @@ void PTOCodegen::PlanMultiBufferRegions(const FunctionPtr& func) {
       const auto space = *tile_type->memory_space_;
       const auto size = ir::utils::StaticPhysicalAllocationBytes(tile_type, space, GetBackendHandler());
       const auto alignment = backend_->GetMemAlignment(space);
-      const auto base = FixedMultiBufferBase(memref);
+      const auto base = ir::FixedMultiBufferBase(memref);
       // Start with the flat Vec representation used by the software-pipeline
       // lowering. Packed carriers and matrix padding need a separate stride proof.
       const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);

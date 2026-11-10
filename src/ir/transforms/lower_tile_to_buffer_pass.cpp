@@ -13,6 +13,7 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -26,6 +27,7 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
@@ -188,12 +190,10 @@ class StorageIndex : public IRVisitor {
     if (auto tile = variable ? As<TileType>(variable->GetType()) : nullptr;
         tile && !windows.count(tile.get()) && types_.insert(tile.get()).second) {
       auto memory = GetDefinedMemRef(tile);
-      CHECK_SPAN(memory && memory->base_ && !memory->is_pinned_ && memory->slot_count_ == 1 &&
-                     !memory->slot_index_.has_value(),
-                 expr->span_)
-          << "LowerTileToBuffer: tile storage must be planned; multi-slot storage needs its own recipe";
+      CHECK_SPAN(memory && memory->base_ && !memory->is_pinned_, expr->span_)
+          << "LowerTileToBuffer: tile storage must be planned";
       auto offset = As<ConstInt>(memory->byte_offset_);
-      CHECK_SPAN(offset && offset->value_ >= 0, expr->span_)
+      CHECK_SPAN(memory->slot_index_ || (offset && offset->value_ >= 0), expr->span_)
           << "LowerTileToBuffer: expected a static nonnegative storage window address";
       roots[memory->base_.get()].members.push_back(
           {tile, memory, StorageDescriptor(tile, expr->span_), expr->span_});
@@ -209,6 +209,11 @@ class StorageIndex : public IRVisitor {
 
   std::unordered_map<const Var*, BufferStorage> roots;
   std::unordered_map<const TileType*, VarPtr> handles;
+  struct SlotSelection {
+    VarPtr group;
+    ExprPtr index;
+  };
+  std::unordered_map<const TileType*, SlotSelection> slots;
   std::unordered_map<const Call*, VarPtr> write_views;
   // Tiles that are use-site windows of another handle (slices, relabels and
   // aliases). Their storage is the source's; lowering defines them in place.
@@ -320,6 +325,12 @@ class StorageIndex : public IRVisitor {
           << "Internal error: a planned tile's memory space differs from its allocation";
     }
     const auto capacity = static_cast<uint64_t>(size->value_);
+    if (std::any_of(storage.members.begin(), storage.members.end(), [](const auto& member) {
+          return member.memory->slot_count_ > 1 || member.memory->slot_index_.has_value();
+        })) {
+      FinalizeSlots(base, storage, capacity, span);
+      return;
+    }
     // Address placement rebases each member. Only a full-capacity member can
     // establish the origin; guessing the minimum interior address loses bytes.
     std::optional<int64_t> origin = addressed_ ? std::nullopt : std::optional<int64_t>(0);
@@ -494,6 +505,54 @@ class StorageIndex : public IRVisitor {
     }
   }
 
+  // Keep the allocation and its selectors explicit. A containing reservation
+  // alone does not prove slot stride: compare each member's resolved address
+  // against exactly base + index * physical-slot-bytes.
+  void FinalizeSlots(const Var* base, BufferStorage& storage, uint64_t capacity, const Span& span) {
+    const auto& first = storage.members.front();
+    const auto descriptor = first.descriptor;
+    const auto bytes = backend::PhysicalBufferBytes(descriptor);
+    const auto count = first.memory->slot_count_;
+    CHECK_SPAN(bytes && count > 0 && count <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) &&
+                   *bytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / count &&
+                   *bytes * count == capacity,
+               span)
+        << "LowerTileToBuffer: uniform slots must exactly fill their planned allocation";
+    CHECK_SPAN(!HasDynamicValid(descriptor), span)
+        << "LowerTileToBuffer: slot metadata must have static valid extents";
+    std::optional<int64_t> origin;
+    for (const auto& member : storage.members) {
+      CHECK_SPAN(member.tile && member.memory->slot_index_ && member.memory->slot_count_ == count &&
+                     member.memory->size_ == *bytes && structural_equal(member.descriptor, descriptor) &&
+                     !window_sources_.count(member.tile.get()),
+                 member.span)
+          << "LowerTileToBuffer: slots require identical whole-slot descriptors and no partial write views";
+      const auto member_origin = FixedMultiBufferBase(member.memory);
+      CHECK_SPAN(
+          member_origin && (!origin || *origin == *member_origin) && (addressed_ || *member_origin == 0),
+          member.span)
+          << "LowerTileToBuffer: slot offset must equal allocation base plus index times slot stride";
+      origin = member_origin;
+    }
+    const auto* context = PassContext::Current();
+    const auto* target = context ? context->GetBackend() : backend::GetBackend();
+    const auto alignment = target->GetMemAlignment(descriptor->memory_space_);
+    CHECK_SPAN(count == 1 || (alignment > 0 && *bytes % alignment == 0 &&
+                              static_cast<uint64_t>(*origin) % alignment == 0),
+               span)
+        << "LowerTileToBuffer: uniform slots require native-aligned stride and allocation base";
+    auto multi = std::make_shared<MultiBufferType>(descriptor, static_cast<int64_t>(count));
+    storage.handle = std::make_shared<Var>(base->name_hint_ + "_slots", multi, span);
+    std::vector<ExprPtr> args{std::make_shared<MakeTuple>(std::vector<ExprPtr>{}, span)};
+    if (addressed_) args.push_back(std::make_shared<ConstInt>(*origin, DataType::INDEX, span));
+    storage.definitions.push_back(std::make_shared<AssignStmt>(
+        storage.handle, OpRegistry::GetInstance().CreateInternal("buffer.alloc_multi", args, {}, multi, span),
+        span));
+    for (const auto& member : storage.members) {
+      slots.emplace(member.tile.get(), SlotSelection{storage.handle, *member.memory->slot_index_});
+    }
+  }
+
   // Every descriptor field except the root's shared memory space.
   using TypedKey = std::tuple<uint64_t, std::string, std::vector<int64_t>, std::vector<int64_t>, int, int,
                               uint64_t, int, int>;
@@ -658,7 +717,17 @@ class TileToBufferMutator : public IRMutator {
         indexed_(body) {}
 
   StmtPtr VisitStmt(const StmtPtr& stmt) override {
+    auto previous_slots = std::move(slot_handles_);
+    auto previous_definitions = std::move(slot_definitions_);
+    slot_handles_.clear();
+    slot_definitions_.clear();
     auto lowered = IRMutator::VisitStmt(stmt);
+    if (!slot_definitions_.empty()) {
+      slot_definitions_.push_back(lowered);
+      lowered = std::make_shared<SeqStmts>(std::move(slot_definitions_), stmt->span_);
+    }
+    slot_handles_ = std::move(previous_slots);
+    slot_definitions_ = std::move(previous_definitions);
     auto prefix = local_definitions_.find(stmt.get());
     if (prefix == local_definitions_.end()) return lowered;
     auto definitions = std::move(prefix->second);
@@ -840,6 +909,10 @@ class TileToBufferMutator : public IRMutator {
       auto initial = VisitExpr(argument->initValue_);
       initial_values[i] = initial;
       if (As<TileType>(argument->GetType())) {
+        CHECK_SPAN(!storage_.slots.count(As<TileType>(argument->GetType()).get()) &&
+                       !storage_.slots.count(As<TileType>(result->GetType()).get()),
+                   loop->span_)
+            << "LowerTileToBuffer: slot handles cannot be carried across loop visits";
         INTERNAL_CHECK_SPAN(initial == Handle(argument) && initial == Handle(result), loop->span_)
             << "Internal error: Tile storage legalization left an implicit loop entry transfer";
       } else if (As<TensorType>(argument->GetType())) {
@@ -878,6 +951,27 @@ class TileToBufferMutator : public IRMutator {
   VarPtr Handle(const ExprPtr& value) {
     auto tile = As<TileType>(value->GetType());
     INTERNAL_CHECK_SPAN(tile, value->span_) << "Internal error: Buffer conversion expected a Tile operand";
+    if (auto slot = storage_.slots.find(tile.get()); slot != storage_.slots.end()) {
+      const auto& selection = slot->second;
+      // Selection is rebuilt at its actual use, where original loop coordinates
+      // are in scope. Only this statement's aliases share the handle; it cannot
+      // escape a branch, loop visit, or counter reset.
+      auto index = VisitExpr(selection.index);
+      const auto key = std::make_pair(selection.group.get(), structural_hash(index));
+      auto& candidates = slot_handles_[key];
+      for (const auto& [existing, handle] : candidates) {
+        if (structural_equal(existing, index)) return handle;
+      }
+      auto element = As<MultiBufferType>(selection.group->GetType())->element_type_;
+      auto handle = std::make_shared<Var>(selection.group->name_hint_ + "_slot", element, value->span_);
+      slot_definitions_.push_back(std::make_shared<AssignStmt>(
+          handle,
+          OpRegistry::GetInstance().CreateInternal("buffer.slot", {selection.group, index}, {}, element,
+                                                   value->span_),
+          value->span_));
+      candidates.emplace_back(index, handle);
+      return handle;
+    }
     if (auto deferred = deferred_windows_.find(tile.get()); deferred != deferred_windows_.end()) {
       auto found = use_windows_.find(tile.get());
       if (found != use_windows_.end()) return found->second;
@@ -1431,6 +1525,8 @@ class TileToBufferMutator : public IRMutator {
   bool guarded_valid_;
   std::unordered_map<const TileType*, CallPtr> window_recipes_;
   std::unordered_map<const TileType*, std::pair<CallPtr, VarPtr>> deferred_windows_;
+  std::map<std::pair<const Var*, uint64_t>, std::vector<std::pair<ExprPtr, VarPtr>>> slot_handles_;
+  std::vector<StmtPtr> slot_definitions_;
   std::unordered_map<const TileType*, VarPtr> use_windows_;
   std::vector<StmtPtr> use_definitions_;
   const LocalAccumulatorIndex* local_accumulators_;

@@ -126,10 +126,26 @@ class BufferIRVisitor : public IRVisitor {
     statement_assigns_result_ = true;
     IRVisitor::VisitStmt_(op);
     statement_call_ = nullptr;
-    if (auto call = As<Call>(op->value_); IsOp(call, "buffer.alloc") && valid_calls_.count(call.get())) {
+    if (auto call = As<Call>(op->value_);
+        (IsOp(call, "buffer.alloc") || IsOp(call, "buffer.alloc_multi")) && valid_calls_.count(call.get())) {
       allocations_[op->var_.get()] = Allocation{
           call->args_.size() == 1, call->args_.size() == 2 ? ConstantAddress(call->args_[1]) : nullptr};
-      RegisterWindow(op->var_, op->var_.get(), 0);
+      if (As<BufferType>(op->var_->GetType())) RegisterWindow(op->var_, op->var_.get(), 0);
+    } else if (IsOp(call, "buffer.slot") && valid_calls_.count(call.get())) {
+      const auto group = AsVarLike(call->args_[0]);
+      const auto multi = As<MultiBufferType>(call->args_[0]->GetType());
+      const auto bytes = PhysicalBytes(multi->element_type_);
+      if (!group || !allocations_.count(group.get()) || !bytes) {
+        Error("Buffer slot requires proven multi-buffer allocation provenance", call->span_);
+      } else {
+        const auto index = As<ConstInt>(call->args_[1]);
+        RegisterWindow(op->var_, group.get(), index ? static_cast<uint64_t>(index->value_) * *bytes : 0);
+        if (!index) {
+          auto& window = windows_.at(op->var_.get());
+          window.known_offset = false;
+          window.bytes = *bytes * static_cast<uint64_t>(multi->slot_count_);
+        }
+      }
     } else if (call && valid_calls_.count(call.get()) &&
                (IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape"))) {
       const auto source = AsVarLike(call->args_[0]);
