@@ -23,6 +23,19 @@ valid extents may be static partial rectangles or supported runtime rectangles w
 Elementwise Tile operands and their destination must have matching physical shapes
 and valid extents; matching valid extents alone do not qualify.
 
+Packed ND GM tensors may have a leading `INDEX` shape symbol and a static
+minor extent greater than one. The original runtime extent is preserved; the
+minor extent still determines the row stride. Selection and direct emission
+share this geometry check. Dynamic minor extents, nontrivial leading shape
+expressions and narrower integer shape symbols remain outside this capability.
+
+The direct Buffer emitter uses the existing tensor-shape ABI: tensor pointers,
+explicit scalar arguments, deduplicated implicit shape symbols, then SPMD
+identities. A shape symbol already passed explicitly is not appended again.
+This descriptor support does not prove access bounds or synchronization demands;
+the caller must satisfy the original tensor/window contract, and autosync still
+requires its separate range, access and occurrence proofs.
+
 Stores with an explicit `shapes` operand retain Tile IR. The default Buffer
 store recipe accepts only the three-operand form; selection rejects the explicit
 partition form before storage planning rather than failing during final lowering.
