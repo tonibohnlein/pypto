@@ -191,6 +191,9 @@ class Realizer : public SyncPlacement {
 };
 }  // namespace
 LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis) {
+  for (const auto& segment : analysis.input.segments)
+    CHECK(segment.nested_frames.empty()) << "Nested repetition requires token transport across every "
+                                            "enclosing frame; physical export is available";
   Realizer realizer(analysis);
   realizer.result.function = realizer.VisitFunction(analysis.input.owner);
   CheckLogicalSync(realizer.result.function);

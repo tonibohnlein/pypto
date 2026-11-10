@@ -76,6 +76,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     item["space"] = s.space;
     item["address"] = s.address;
     item["rows"] = s.rows;
+    item["row_extent_parameter"] = s.row_extent_parameter;
     item["columns"] = s.columns;
     item["bytes"] = s.bytes;
     item["byte_coordinates"] = s.byte_coordinates;
@@ -92,6 +93,10 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     region["start"] = source.start;
     region["step"] = source.step;
     region["loop"] = source.original_loop;
+    nb::list frames;
+    for (const auto& frame : source.nested_frames)
+      frames.append(nb::make_tuple(frame.loop, frame.count, frame.start, frame.step));
+    region["nested_frames"] = frames;
     for (const auto& s : source.sites) {
       nb::dict site;
       nb::list accesses, precision;

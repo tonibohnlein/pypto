@@ -454,6 +454,14 @@ std::optional<PointBoundary> CompactSyncResult::BoundaryAt(
     size_t storage, int64_t row, int64_t column, const std::map<size_t, int64_t>& parameters) const {
   if (storage >= input.storage.size()) return std::nullopt;
   const auto& domain = input.storage[storage];
+  if (domain.row_extent_parameter) {
+    const auto parameter = *domain.row_extent_parameter;
+    auto value = parameters.find(parameter);
+    const auto bounds = input.parameter_bounds.at(parameter);
+    if (value == parameters.end() || value->second < bounds.first || value->second > bounds.second ||
+        row >= value->second)
+      return std::nullopt;
+  }
   if (row < 0 || column < 0 || row >= domain.rows || column >= domain.columns) return std::nullopt;
   auto shift = [&](const SyncTranslation& translation) -> std::optional<int64_t> {
     int64_t value = 0;

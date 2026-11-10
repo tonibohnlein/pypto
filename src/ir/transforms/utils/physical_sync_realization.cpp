@@ -342,6 +342,20 @@ class Emitter : public SyncPlacement {
   ExprPtr Ordinal(size_t region, const Span& span) {
     const auto& s = analysis_.input.segments[region];
     if (!s.original_loop) return Integer(0, span);
+    if (!s.nested_frames.empty()) {
+      ExprPtr ordinal = Integer(0, span);
+      for (const auto& frame : s.nested_frames) {
+        ExprPtr digit = frame.loop->loop_var_;
+        if (frame.start)
+          digit = std::make_shared<Sub>(digit, Integer(frame.start, span), DataType::INDEX, span);
+        if (frame.step != 1)
+          digit = std::make_shared<FloorDiv>(digit, Integer(frame.step, span), DataType::INDEX, span);
+        ordinal = std::make_shared<Add>(
+            std::make_shared<Mul>(ordinal, Integer(frame.count, span), DataType::INDEX, span), digit,
+            DataType::INDEX, span);
+      }
+      return ordinal;
+    }
     ExprPtr ordinal = s.original_loop->loop_var_;
     if (s.start) ordinal = std::make_shared<Sub>(ordinal, Integer(s.start, span), DataType::INDEX, span);
     if (s.step != 1)

@@ -1594,7 +1594,7 @@ class LeadingExtent:
     _compile_dynamic_state_native(lowered, tmp_path, planner)
     # Selecting a Buffer descriptor is not a proof of allocation bounds for
     # autosync. Its strict importer must preserve the missing-range refusal.
-    with pytest.raises(ValueError, match="constant extent/address"):
+    with pytest.raises(ValueError, match="Dynamic allocation extent has no established caller range"):
         testing.analyze_placed_sync(function, True)
 
 
