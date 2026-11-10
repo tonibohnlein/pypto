@@ -106,10 +106,10 @@ void CheckBufferTensorParameter(const ir::TensorTypePtr& tensor, const ir::Span&
                                             backend::IsCubeOperandDtype(tensor->dtype_)),
              span)
       << "Direct Buffer IR GM parameters currently require rank-2 FP16/BF16/FP32/INT32/INT8 tensors";
-  auto rows = As<ir::ConstInt>(tensor->shape_[0]);
   auto cols = As<ir::ConstInt>(tensor->shape_[1]);
-  CHECK_SPAN(rows && cols && rows->value_ > 0 && cols->value_ > 1, span)
-      << "Direct Buffer IR GM parameters currently require static physical shapes with columns > 1";
+  CHECK_SPAN(backend::IsBufferTensorShape(tensor->shape_), span)
+      << "Direct Buffer IR GM parameters require static columns > 1 and positive static rows or an "
+         "INDEX row symbol";
   if (tensor->tensor_view_) {
     const auto& view = *tensor->tensor_view_;
     CHECK_SPAN(view.layout == ir::TensorLayout::ND && view.pad == ir::PadValue::null, span)
@@ -476,8 +476,8 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
   fs_.buffer_ir = true;
   fs_.current_function = func;
   // Match PTOParam's existing GM ABI: tensor pointers precede scalar values,
-  // regardless of IR parameter order. The first GM recipe has static shapes,
-  // so it needs no implicit trailing dynamic-shape parameters.
+  // regardless of IR parameter order. Dynamic shape symbols follow the user
+  // payload in exactly the shared wrapper order, before runtime SPMD identities.
   std::vector<ir::VarPtr> parameters;
   for (const auto& param : func->params_) {
     if (As<ir::TensorType>(param->GetType())) parameters.push_back(param);
@@ -499,9 +499,20 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
       stream_ << GetTypeString(As<ir::ScalarType>(parameters[i]->GetType())->dtype_);
     }
   }
+  // Use the same identity-based collector as the wrapper and Tile emitter.
+  // Explicit scalar dimensions are already bound; shared implicit dimensions
+  // get one trailing INDEX argument even when multiple tensors reference them.
+  const auto dynamic_dimensions = CollectTensorShapeDynVars(func);
+  for (size_t i = 0; i < dynamic_dimensions.size(); ++i) {
+    const std::string name = "%arg" + std::to_string(parameters.size() + i);
+    fs_.used_ssa_names.insert(name.substr(1));
+    BindVarToMlir(dynamic_dimensions[i], name);
+    if (!parameters.empty() || i) stream_ << ", ";
+    stream_ << name << ": index";
+  }
   // The wrapper supplies SPMD identities after all user parameters. Detect
   // these scalar queries during preflight, without legacy storage discovery.
-  bool has_parameters = !parameters.empty();
+  bool has_parameters = !parameters.empty() || !dynamic_dimensions.empty();
   const auto append_identity = [&](std::string& binding, const char* name) {
     binding = std::string("%") + name;
     fs_.used_ssa_names.insert(name);

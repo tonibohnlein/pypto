@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from pypto import DataType, ir, passes
 from pypto.backend._ptoas_locate import find_ptoas_binary
-from pypto.backend.pto_backend import _run_ptoas
+from pypto.backend.pto_backend import _generate_arg_unpacking, _generate_kernel_wrapper, _run_ptoas
 from pypto.pypto_core import codegen
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
@@ -286,7 +286,7 @@ def test_gm_transfers_reject_reduction_columns(name):
             ir.TensorType([16, 32], DataType.FP32, None, ir.TensorView([64, 1], ir.TensorLayout.ND)),
             "packed row-major",
         ),
-        (ir.TensorType([_scalar("rows"), _int(32)], DataType.FP32), "static physical shapes"),
+        (ir.TensorType([_int(32), _scalar("columns")], DataType.FP32), "static columns > 1"),
     ],
 )
 def test_unsupported_gm_parameter_recipes_fail_before_emission(tensor_type, message):
@@ -873,6 +873,84 @@ def test_matrix_descriptor_rejects_types_the_cube_cannot_hold():
     _, allocation = _alloc("operand", _matrix_type(ir.MemorySpace.Acc, (32, 64), DataType.FP16))
     with pytest.raises(ValueError, match="cube operands or FP32/INT32 accumulators in Acc"):
         _emit(_program([allocation], ir_stage=ir.FunctionIRStage.Buffer))
+
+
+@pytest.mark.parametrize("dimension_mode", ["shared", "explicit", "distinct"])
+@pytest.mark.parametrize("spmd", [False, True])
+def test_dynamic_leading_gm_extent_uses_shared_wrapper_abi(tmp_path, dimension_mode, spmd):
+    """Metadata stays symbolic; shared shapes and explicit scalars never duplicate ABI slots."""
+    rows = _scalar("rows")
+    explicit_dimension = dimension_mode == "explicit"
+    other_rows = _scalar("other_rows") if dimension_mode == "distinct" else rows
+    tensor = ir.TensorType([rows, _int(64)], DataType.FP32)
+    source = ir.Var("source", tensor, SPAN)
+    output = ir.Var("output", ir.TensorType([other_rows, _int(64)], DataType.FP32), SPAN)
+    marker = _scalar("marker", DataType.INT32)
+    buffer, allocate = _alloc("tile", address=_int(0))
+    statements: list[ir.Stmt] = [allocate]
+    if spmd:
+        block = _scalar("block")
+        statements.append(ir.AssignStmt(block, _call("buffer.get_block_idx", [], block.type), SPAN))
+    statements.extend(
+        [
+            _eval("buffer.load", source, _window(0, 0), _window(16, 32), buffer),
+            _eval("buffer.store", buffer, _window(0, 0), _window(16, 32), output),
+        ]
+    )
+    # Interleaving scalar and tensor formals must not change PTOParam ordering.
+    params = [marker, source, (output, ir.ParamDirection.Out)]
+    if explicit_dimension:
+        params.insert(0, rows)
+    program = _program(statements, params, ir.FunctionIRStage.Buffer)
+    function = next(iter(program.functions.values()))
+    text = _emit(program)
+    signature = next(line for line in text.splitlines() if "func.func @kernel(" in line)
+    assert signature.count("!pto.ptr<f32>") == 2
+    assert signature.count(": index") == (2 if dimension_mode == "distinct" else 1)
+    assert signature.count(": i32") == (3 if spmd else 1)
+    assert "%__pypto_spmd_block_idx" in signature if spmd else "__pypto_spmd" not in signature
+    # Production wrapper and emitter use the same collector, including explicit
+    # scalar dimensions and first-seen deduplication across tensor parameters.
+    dimensions = codegen.collect_tensor_shape_dyn_vars(function)
+    assert len(dimensions) == (0 if explicit_dimension else 2 if dimension_mode == "distinct" else 1)
+    if dimensions:
+        assert dimensions[0].same_as(rows)
+    if dimension_mode == "distinct":
+        assert dimensions[1].same_as(other_rows)
+    unpacking, names = _generate_arg_unpacking(function)
+    expected = (
+        ["source", "output", "rows", "marker"]
+        if explicit_dimension
+        else ["source", "output", "marker", "rows"]
+    )
+    if dimension_mode == "distinct":
+        expected.append("other_rows")
+    assert names == expected
+    assert unpacking.count("->shapes[0]") == len(dimensions)
+    _compile_native(tmp_path, text, True)
+    wrapper = _generate_kernel_wrapper(function, (tmp_path / "buffers.cpp").read_text())
+    if spmd:
+        expected.extend(["__pypto_spmd_block_idx", "__pypto_spmd_block_num"])
+    assert f"kernel({', '.join(expected)});" in wrapper
+
+
+@pytest.mark.parametrize("kind", ["dynamic_columns", "row_expression", "narrow_rows"])
+def test_unsupported_dynamic_gm_geometry_remains_unavailable(kind):
+    rows = _scalar("rows", DataType.INT32 if kind == "narrow_rows" else DataType.INDEX)
+    shape: list[ir.Expr] = [rows, _int(64)]
+    if kind == "dynamic_columns":
+        shape = [_int(32), rows]
+    elif kind == "row_expression":
+        shape[0] = ir.Mul(rows, _int(2), DataType.INDEX, SPAN)
+    source = ir.Var("source", ir.TensorType(shape, DataType.FP32), SPAN)
+    buffer, allocate = _alloc("tile", address=_int(0))
+    program = _program(
+        [allocate, _eval("buffer.load", source, _window(0, 0), _window(16, 32), buffer)],
+        [source],
+        ir.FunctionIRStage.Buffer,
+    )
+    with pytest.raises(ValueError, match="static columns > 1"):
+        _emit(program)
 
 
 if __name__ == "__main__":
