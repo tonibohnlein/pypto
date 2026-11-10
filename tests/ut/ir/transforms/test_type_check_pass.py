@@ -708,6 +708,11 @@ def test_type_check_sync_token_phi_preserves_source_pipeline(nested):
         first = ir.TupleType([first])
         second = ir.TupleType([second])
     diagnostics = _typecheck_diagnostics(_if_with_types(first, second, first))
+    assert diagnostics
+    assert all(
+        diagnostic.error_code == passes.TypeCheckErrorType.SYNC_TOKEN_SOURCE_MISMATCH.value
+        for diagnostic in diagnostics
+    )
     assert any("SyncToken source-pipeline mismatch" in diagnostic.message for diagnostic in diagnostics)
 
 

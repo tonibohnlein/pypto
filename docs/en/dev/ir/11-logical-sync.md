@@ -102,10 +102,14 @@ pl.sync.wait(selected, pl.PipeType.V)
 ```
 
 Tokens cannot cross SIMT launches or unresolved split-AIV execution domains.
+SIMT scopes cannot capture or create outer-pipeline tokens; scope-local token
+definitions never escape into the enclosing function.
 Programs without logical synchronization retain their existing launch behavior.
 
 Loop-carried values identify the dynamic execution's completion facts. Zero
 iterations return the initial fact; multiple iterations carry the previous one.
+Numeric induction variables cannot have a token type, including a tuple containing
+a token. Only explicit loop carries transport completion facts across iterations.
 
 ```python
 initial = pl.sync.completed(pl.PipeType.V)

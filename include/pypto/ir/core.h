@@ -125,7 +125,6 @@ enum class ObjectKind {
   PrefetchAsyncContextType,
   AsyncEventType,
   AsyncSessionType,
-  SyncTokenType,
   RegType,
 
   // Other IR node kinds
@@ -139,7 +138,8 @@ enum class ObjectKind {
 
   // Append new kinds to preserve existing serialized numeric kind values.
   SimtLaunchStmt,
-  SimtScopeStmt
+  SimtScopeStmt,
+  SyncTokenType
 };
 
 /**

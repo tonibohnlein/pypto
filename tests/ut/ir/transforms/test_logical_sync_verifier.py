@@ -81,6 +81,7 @@ def test_specialized_device_completion_and_multiple_waits_are_valid(kind):
         ir.FunctionType.Spmd,
         ir.FunctionType.Inline,
         ir.FunctionType.Graph,
+        ir.FunctionType.SIMT,
     ],
 )
 def test_logical_completion_requires_a_specialized_function(kind):
@@ -522,7 +523,7 @@ def test_shared_completion_expression_respects_definition_order(form):
 
 
 @pytest.mark.parametrize("form", ["join", "tuple"])
-@pytest.mark.parametrize("escape", ["sibling_branch", "after_loop", "metadata", "vf"])
+@pytest.mark.parametrize("escape", ["sibling_branch", "after_loop", "metadata", "vf", "simt"])
 def test_shared_completion_expression_rechecks_each_use_context(form, escape):
     """A cached legal use cannot authorize the same DAG in a different scope."""
     ready = _token()
@@ -548,6 +549,9 @@ def test_shared_completion_expression_rechecks_each_use_context(form, escape):
         metadata_use = ir.EvalStmt(_raw("system.bar_all", attrs={"hidden": shared}), SPAN)
         body = _seq(_record(ready), use, metadata_use)
         message = "metadata"
+    elif escape == "simt":
+        body = _seq(_record(ready), use, ir.SimtScopeStmt([_index(32), _index(1), _index(1)], use, SPAN))
+        message = "requires a specialized AIC/AIV function after inlining and outlining"
     else:
         body = _seq(_record(ready), use, ir.RegScopeStmt("vf", use, SPAN))
         message = "cannot enter a RegScope"
@@ -606,6 +610,64 @@ def test_shared_completion_dag_verification_does_not_expand_paths_exponentially(
         [sys.executable, "-c", script, form], capture_output=True, text=True, check=False, timeout=20
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_simt_helper_and_scope_without_logical_sync_remain_valid():
+    """Checking completion boundaries must preserve ordinary SIMT authoring and launches."""
+    dims: list[ir.Expr] = [_index(32), _index(1), _index(1)]
+    scope = ir.SimtScopeStmt(dims, _seq(), SPAN)
+    assert _verify(_program(scope)) == []
+    helper = ir.Function("helper", [], [], ir.ReturnStmt([], SPAN), SPAN, type=ir.FunctionType.SIMT)
+    launch = ir.SimtLaunchStmt(ir.GlobalVar("helper"), dims, [], [], [], SPAN)
+    caller = ir.Function("kernel", [], [], launch, SPAN, type=ir.FunctionType.AIV)
+    assert _verify(ir.Program([helper, caller], "LogicalSync", SPAN)) == []
+
+
+@pytest.mark.parametrize("direction", ["capture", "create"])
+def test_outer_tokens_cannot_enter_or_be_created_in_simt_scope(direction):
+    """An enclosing AIV annotation cannot authorize completion facts in the SIMT domain."""
+    ready = _token()
+    region = ir.SimtScopeStmt(
+        [_index(32), _index(1), _index(1)], _wait(ready) if direction == "capture" else _record(ready), SPAN
+    )
+    body = _seq(_record(ready), region) if direction == "capture" else region
+    _assert_error(_program(body), "requires a specialized AIC/AIV function after inlining and outlining")
+
+
+def test_simt_scope_local_completion_cannot_gain_an_outer_lifetime():
+    """Even invalid region-local definitions must expire when leaving the SIMT body."""
+    ready = _token()
+    region = ir.SimtScopeStmt([_index(32), _index(1), _index(1)], _record(ready), SPAN)
+    _assert_error(_program(_seq(region, _wait(ready))), "same lexical scope")
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("used", [False, True])
+def test_for_induction_variable_cannot_manufacture_completion(nested, used):
+    """Raw IR must not turn a numeric induction binding into a completion fact."""
+    token_type = ir.SyncTokenType(ir.PipeType.MTE2)
+    induction_type = (
+        ir.TupleType([ir.ScalarType(DataType.INDEX), ir.TupleType([token_type])]) if nested else token_type
+    )
+    induction = ir.Var("i", induction_type, SPAN)
+    token = ir.TupleGetItemExpr(ir.TupleGetItemExpr(induction, 1, SPAN), 0, SPAN) if nested else induction
+    # No record, completed value or incoming carry provides this token. Reject
+    # the induction type even when unused, before any wait can legitimize it.
+    loop = ir.ForStmt(
+        induction, _index(0), _index(4), _index(1), [], _wait(token) if used else _seq(), [], SPAN
+    )
+    _assert_error(_program(loop), "induction variable cannot contain SyncToken")
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_completion_cannot_cross_simt_launch_arguments(nested):
+    """A launch statement must enforce the same token boundary as ordinary calls."""
+    ready = _token()
+    argument = ir.MakeTuple([_index(1), ir.MakeTuple([ready], SPAN)], SPAN) if nested else ready
+    launch = ir.SimtLaunchStmt(
+        ir.GlobalVar("helper"), [_index(32), _index(1), _index(1)], [argument], [], [], SPAN
+    )
+    _assert_error(_program(_seq(_record(ready), launch)), "SIMT launch boundary")
 
 
 if __name__ == "__main__":

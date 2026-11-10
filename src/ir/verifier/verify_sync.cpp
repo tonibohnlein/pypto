@@ -81,11 +81,11 @@ class LogicalSyncChecker : public IRVisitor {
     VisitMetadata(function_->attrs_);
     if (function_->body_) VisitStmt(function_->body_);
     CheckExpressionUses();
-    if (has_logical_sync_ && nonlocal_call_) {
+    if (has_logical_sync_ && nonlocal_invocation_) {
       Error(
           "Logical synchronization requires a leaf AIC/AIV function; inline function calls and "
           "eliminate Submit and SIMT launches before inserting synchronization",
-          nonlocal_call_->span_);
+          nonlocal_invocation_->span_);
     }
   }
 
@@ -120,7 +120,7 @@ class LogicalSyncChecker : public IRVisitor {
       RevalidateCall(call);
     } else {
       RejectCallTokens(call->args_, call->GetType(), call->span_);
-      if (IsA<GlobalVar>(call->op_)) nonlocal_call_ = call;
+      if (IsA<GlobalVar>(call->op_)) nonlocal_invocation_ = call;
     }
     for (const auto& argument : call->args_) VisitExpr(argument);
     VisitMetadata(call->attrs_);
@@ -132,7 +132,7 @@ class LogicalSyncChecker : public IRVisitor {
       Error("Logical synchronization operations require Call; Submit launches a task", submit->span_);
     }
     RejectCallTokens(submit->args_, submit->GetType(), submit->span_);
-    nonlocal_call_ = submit;
+    nonlocal_invocation_ = submit;
     IRVisitor::VisitExpr_(submit);
     VisitMetadata(submit->kwargs_);
   }
@@ -140,7 +140,7 @@ class LogicalSyncChecker : public IRVisitor {
   void VisitStmt_(const SimtLaunchStmtPtr& statement) override {
     // A SIMT launch crosses execution ownership just like a helper call; an
     // enclosing AIV annotation cannot make it a local token consumer/producer.
-    nonlocal_call_ = statement;
+    nonlocal_invocation_ = statement;
     if (AnyToken(statement->args_) || AnyToken(statement->block_dims_) || AnyToken(statement->results_)) {
       Error("SyncToken cannot cross a SIMT launch boundary", statement->span_);
     }
@@ -262,6 +262,7 @@ class LogicalSyncChecker : public IRVisitor {
   void VisitStmt_(const RuntimeScopeStmtPtr& statement) override { VisitBlockedScope(statement); }
   void VisitStmt_(const GraphScopeStmtPtr& statement) override { VisitBlockedScope(statement); }
   void VisitStmt_(const CommDomainScopeStmtPtr& statement) override { VisitBlockedScope(statement); }
+  void VisitStmt_(const SimtScopeStmtPtr& statement) override { VisitBlockedScope(statement); }
 
  private:
   static constexpr size_t kNoUse = std::numeric_limits<size_t>::max();
@@ -600,7 +601,14 @@ class LogicalSyncChecker : public IRVisitor {
     }
     const auto checkpoint = introduced_.size();
     for (const auto& argument : arguments) Define(argument);
-    if (induction) Define(induction);
+    if (induction) {
+      // Numeric induction bindings cannot provide completion provenance. Only
+      // explicit loop carries may import tokens; still inspect type metadata.
+      VisitTypeMetadata(induction->GetType());
+      if (ContainsToken(induction->GetType())) {
+        Error("ForStmt induction variable cannot contain SyncToken", induction->span_);
+      }
+    }
     if (condition) {
       VisitExpr(condition);
       RejectConditionToken(condition);
@@ -646,7 +654,7 @@ class LogicalSyncChecker : public IRVisitor {
   const YieldStmt* terminal_yield_ = nullptr;
   const Call* assignment_root_ = nullptr;
   const Call* evaluation_root_ = nullptr;
-  IRNodePtr nonlocal_call_;
+  IRNodePtr nonlocal_invocation_;
   bool has_logical_sync_ = false;
   bool in_vf_ = false;
   bool blocked_ = false;

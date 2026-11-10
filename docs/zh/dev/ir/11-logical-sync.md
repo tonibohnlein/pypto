@@ -97,6 +97,8 @@ pl.sync.wait(selected, pl.PipeType.V)
 
 循环携带值标识动态执行中的完成事实。
 零次执行返回初值，多次执行则将前一轮的凭证传递给下一轮。
+数值归纳变量不能具有 token 类型，也不能是包含 token 的元组；
+只有显式循环携带值才能跨迭代传递完成事实。
 
 ```python
 initial = pl.sync.completed(pl.PipeType.V)
@@ -184,4 +186,5 @@ token 不能藏在存储元数据中，包括 MemRef 字段，以及通过分布
 另见[类型](02-types.md)与[算子](05-operators.md)。
 
 逻辑 token 不能跨越 SIMT 启动或尚未解决的 split-AIV 执行域。
+SIMT 作用域不能捕获或创建外部流水的 token，作用域内的 token 定义不能逃逸到外围函数。
 不含逻辑同步的程序保留既有启动行为。
