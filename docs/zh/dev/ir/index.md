@@ -34,3 +34,5 @@ IR 定义是整个编译器的真源：pass 可以重写，IR 节点定义不可
 - [IR 验证器](../passes/99-verifier.md) —— 在 pass 之间检查 IR 合法性的属性验证器。
 
 See [RFC token pipeline checkpoint](18-token-pipeline-checkpoint.md) for finite logical-to-physical migration evidence.
+
+- [Canonical loop-token checkpoint](19-structured-token-checkpoint.md)

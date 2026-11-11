@@ -20,9 +20,11 @@
 
 namespace pypto::ir::sync {
 bool HasLogicalSync(const FunctionPtr& function);
-// Interpret actual logical token uses. This finite adapter does not compute or
-// substitute minimum demands. families is empty: token cuts are not original
-// payload occurrence pairs; function and command/resource counters are valid.
+PhysicalSyncRealization LowerStructuredLogicalSync(const FunctionPtr& function, const std::string& target,
+                                                   const std::optional<std::vector<int>>& eligible_ids);
+// Interpret actual logical token uses without substituting minimum demands.
+// The finite adapter keeps actual command cuts and has no payload families;
+// canonical structured transport certifies and retains direct-cut families.
 PhysicalSyncRealization LowerLogicalSync(const FunctionPtr& function, const std::string& target,
                                          const std::optional<std::vector<int>>& eligible_ids);
 }  // namespace pypto::ir::sync

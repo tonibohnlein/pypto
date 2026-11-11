@@ -262,11 +262,17 @@ def test_insert_sync_rejects_already_logical_input():
         _apply(passes.insert_sync, logical)
 
 
-def test_finite_lowering_refuses_structured_token_transport_without_mutation():
+def test_noncanonical_structured_guard_refuses_without_mutation():
     original = staged_fixture(2)
     logical = _apply(passes.insert_sync, original)
+
+    class ChangeGuard(ir.IRMutator):
+        def visit_gt(self, op):
+            return ir.Ge(op.left, op.right, ir.DataType.BOOL, op.span)
+
+    logical = ChangeGuard().visit_function(logical)
     before = str(logical)
-    with pytest.raises(ValueError, match="LowerSync.*structured"):
+    with pytest.raises(ValueError, match="Unsupported token guard"):
         _apply(passes.lower_sync, logical)
     assert str(logical) == before
 

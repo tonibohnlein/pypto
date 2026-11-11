@@ -35,6 +35,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/sync_statement_rewrite.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -91,31 +92,11 @@ class FiniteStatements : public IRMutator {
 
  protected:
   StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
-    // Gather nested sequences once. Flattening separately at every level
-    // would repeatedly copy the growing prefix for deeply nested input IR.
-    std::vector<StmtPtr> statements;
-    for (const auto& child : op->stmts_) Append(child, statements);
-    return std::make_shared<SeqStmts>(statements, op->span_);
+    return RewriteSyncSequence(op, [this](const StmtPtr& child) { return VisitStmt(child); });
   }
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override { return op; }
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override { return op; }
   StmtPtr VisitStmt_(const ReturnStmtPtr& op) override { return op; }
-
- private:
-  void Append(const StmtPtr& statement, std::vector<StmtPtr>& output) {
-    if (auto sequence = As<SeqStmts>(statement)) {
-      for (const auto& child : sequence->stmts_) Append(child, output);
-      return;
-    }
-    auto rewritten = VisitStmt(statement);
-    if (auto sequence = As<SeqStmts>(rewritten)) {
-      // Leaf replacements contain only generated commands (or are empty),
-      // never original nested regions requiring another transformation.
-      output.insert(output.end(), sequence->stmts_.begin(), sequence->stmts_.end());
-    } else {
-      output.push_back(std::move(rewritten));
-    }
-  }
 };
 
 // Erasure supplies only the payload/native-variant importer. It never escapes
@@ -364,6 +345,16 @@ PhysicalSyncRealization LowerLogicalSync(const FunctionPtr& function, const std:
     return result;
   }
   FindLogical(true).VisitFunction(function);
+  class Structure : public IRVisitor {
+   public:
+    bool loop = false;
+
+   protected:
+    void VisitStmt_(const ForStmtPtr&) override { loop = true; }
+    void VisitExpr(const ExprPtr&) override {}
+  } structure;
+  structure.VisitFunction(function);
+  if (structure.loop) return LowerStructuredLogicalSync(function, target, eligible_ids);
   auto stripped = StripTokens().VisitFunction(function);
   // Only the payload pipe/native-variant inventory is consumed here. The
   // importer's GM partition is not used for conflicts, selectors or reuse;

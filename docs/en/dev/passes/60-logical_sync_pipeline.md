@@ -38,8 +38,8 @@ feasibility.
 
 ## LowerSync
 
-The first lowering subset is straight-line finite token programs over admitted
-static placed Buffer payloads. The operation/footprint importer is reused for
+Lowering supports straight-line finite token programs and the canonical
+zero/one-distance loop form described below, over admitted placed Buffer payloads. The operation/footprint importer is reused for
 pipe and native-resource qualification; its admission restrictions and access-
 recovery costs still apply. Standalone lowering does not yet transport caller
 parameter or block-bound evidence. It interprets actual `sync.record`, `sync.completed`,
@@ -83,6 +83,41 @@ statement occurrences and token uses, with a fixed number of pipes. Indexed
 lookups and coloring add logarithmic factors. Shared joins are memoized and
 nested statement sequences are gathered once. Access recovery and native-variant
 qualification still run through the existing importer and are charged separately.
+
+## Canonical structured transport
+
+The structured adapter accepts records immediately after an original payload
+(or the whole qualified initialization/accumulation branch), and waits in the
+contiguous block before their destination payload. It retains every actual use,
+including repeated waits. It accepts completed-initialized loop carries that
+unconditionally yield that invocation's current record. Such a carried fact
+selects the previous visit; the exact original `iv > start` guard excludes the
+empty entry fact. A final loop result selects the final source visit. A crossing
+into another loop must use the exact `iv == start` guard. Zero-trip outputs
+remain completed. Starts, positive steps, types and normalized counts come from
+the existing checked importer; no representative execution supplies a premise.
+
+These checks justify translating each use to a direct completion-to-start
+family. The order owner constructs periodic frontiers from those supplied
+families without extracting covers. The original physical emitter consumes the
+same families; same-pipe barriers still require the established placement proof.
+For reuse, a proved `C_consumer(h) -> I_source(g)` yields
+`WAIT(h) -> C_consumer(h) -> I_source(g) -> SET(g)` at the certified cuts.
+This sufficient test can refuse feasible plans; structured lowering does not
+claim a minimum physical ID count. Accumulator storage forwarding is not added
+as a completion-to-start edge.
+
+The periodic core takes `O(k(m+u) log(m+u))` work for `m` sites, `u` token-use
+families and `k` pipes. It does not enumerate visits. Single-segment programs
+need no boundary graph. Multiple segments share the existing explicit first/
+final-port graph: construction is quadratic in child port counts, and each
+cross-region query takes `O(P+E)` graph work plus child queries. These costs are
+separate from import, allocation and emission; compactness in trip count is not
+a claim of linear total compilation cost.
+
+Nested token frames, arbitrary structured joins, non-completed carry entry,
+old-history yields, noncanonical guards and unavailable caller range evidence
+remain explicit refusals. Existing production coverage is unchanged.
 
 ## Migration and guarantees
 

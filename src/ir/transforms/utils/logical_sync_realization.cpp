@@ -54,7 +54,7 @@ class NameCollector : public var_collectors::VarDefUseCollector {
 // invariant sites and zero/one-displacement families; no trip count is unfolded.
 class Realizer : public SyncPlacement {
  public:
-  explicit Realizer(const CompactSyncResult& analysis) : SyncPlacement(analysis) {
+  explicit Realizer(const CompactSyncResult& analysis) : SyncPlacement(analysis.input) {
     CHECK(analysis.input.owner) << "Logical realization requires the original occurrence owner";
     NameCollector collector;
     collector.VisitFunction(analysis.input.owner);
@@ -98,7 +98,7 @@ class Realizer : public SyncPlacement {
  protected:
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     const size_t region = loops_.at(op.get());
-    if (analysis_.input.segments[region].count == 0) return op;
+    if (input_.segments[region].count == 0) return op;
     std::vector<StmtPtr> statements;
     std::vector<IterArgPtr> arguments;
     std::vector<VarPtr> outputs;
@@ -154,7 +154,7 @@ class Realizer : public SyncPlacement {
   }
   StmtPtr Wrap(const StmtPtr& payload, Site site) override {
     std::vector<StmtPtr> statements;
-    const auto& segment = analysis_.input.segments[site.first];
+    const auto& segment = input_.segments[site.first];
     for (const auto& incoming : incoming_[site]) {
       const auto& source = sources_.at(incoming.source);
       ExprPtr token = source.current;

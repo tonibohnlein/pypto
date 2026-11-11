@@ -223,6 +223,7 @@ struct SyncStorageAccessIndex {
   bool written = false, enclosing_motion = false;
 };
 class NumericalSyncHierarchy;
+class SyncBoundaryGraph;
 class CompactSyncResult {
  public:
   CompactSyncInput input;
@@ -280,11 +281,7 @@ class CompactSyncResult {
   friend CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& composition_order);
   std::optional<PointBoundary> RelativeBoundary(size_t storage, int64_t row, int64_t column,
                                                 std::optional<size_t> leaf = std::nullopt) const;
-  using Event = std::pair<Occurrence, bool>;
-  std::map<Event, size_t> nodes_;
-  std::vector<std::vector<size_t>> graph_;
-  size_t Node(const Event& event);
-  bool Path(size_t a, size_t b, std::optional<std::pair<size_t, size_t>> skip = std::nullopt) const;
+  std::shared_ptr<SyncBoundaryGraph> boundary_order_;
 };
 // Common retained owner with representation-specific qualified construction.
 // The legacy no-slot route uses bounded two-body reduction and a research

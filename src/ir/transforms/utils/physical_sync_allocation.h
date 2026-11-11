@@ -26,6 +26,23 @@ namespace pypto::ir::sync {
 using SyncDirection = std::pair<PipeType, PipeType>;
 using SyncNativeReservations = std::map<SyncDirection, std::set<int>>;
 
+// Qualified direct-cut order provider. The command inventory is independent
+// of minimum-demand analysis: token clients retain every actual use. Callbacks
+// are consumed synchronously while their immutable owner is alive.
+struct DirectSyncOrder {
+  // Sufficient C(source) -> I(target) proof, not generic event precedence.
+  std::function<bool(const Occurrence&, const Occurrence&)> precedes;
+  std::function<bool(const Occurrence&, const Occurrence&)> reference_before;
+  // Minimum uniform C(source)->I(target) displacement within one region.
+  std::function<std::optional<__int128>(size_t, size_t, size_t)> threshold;
+  std::function<bool(size_t)> scoped_reuse, scoped_barrier;
+  bool finite_minimum = false;
+};
+PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input,
+                                          std::vector<PhysicalSyncFamily> families,
+                                          const DirectSyncOrder& order, const std::string& target,
+                                          const std::optional<std::vector<int>>& restricted);
+
 // Shared native-owner and target eligibility policy. Neither helper computes
 // demands or assumes that a logical token owns a consuming hardware event.
 SyncNativeReservations SyncNativeClaims(const CompactSyncInput& input, const std::string& target);

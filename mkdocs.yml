@@ -313,6 +313,7 @@ nav:
           - en/dev/ir/16-parameterized-prefill-checkpoint.md
           - en/dev/ir/17-buffered-pipeline-checkpoint.md
           - en/dev/ir/18-token-pipeline-checkpoint.md
+          - en/dev/ir/19-structured-token-checkpoint.md
           - en/dev/ir/18-qwen-prefill-pipeline.md
       - Passes:
           - en/dev/passes/index.md

@@ -22,7 +22,7 @@ from typing import Any
 from pypto import backend, codegen, ir, passes, testing
 from pypto.backend import BackendType
 
-from .sync_matmul_cases import capture
+from .sync_matmul_cases import capture, staged_fixture
 from .test_token_sync_lowering import _check_actual_tokens
 from .test_vec_sync_analysis import vec_fixture
 
@@ -65,6 +65,7 @@ def measure(function, tokens):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--structured", action="store_true")
     args = parser.parse_args()
     backend.set_backend_type(BackendType.Ascend910)
     root = Path(__file__).resolve().parents[4]
@@ -97,21 +98,35 @@ def main():
         "device": "not run",
         "cases": [],
     }
-    for name in ["matmul_64", "matmul_acc_64", "finite_vec"]:
-        function = vec_fixture() if name == "finite_vec" else capture(name)
+    names = (
+        ["ddr_split_k", "structured_k2", "structured_k1024", "structured_k1000000"]
+        if args.structured
+        else ["matmul_64", "matmul_acc_64", "finite_vec"]
+    )
+    if args.structured:
+        receipt["scope"] = "canonical structured standalone token stages; production remains unchanged"
+    for name in names:
+        count = int(name.removeprefix("structured_k")) if name.startswith("structured_k") else None
+        function = (
+            staged_fixture(count, visits=2)
+            if count is not None
+            else (vec_fixture() if name == "finite_vec" else capture(name))
+        )
+        bounded = count is None or count <= 5
         row: dict[str, Any] = {
             "name": name,
             "input_sha256": hashlib.sha256(ir.python_print(function, format=False).encode()).hexdigest(),
             "pairs": [],
         }
         outputs = {}
+        logical = None
         for pair in range(3):
             samples = {}
             for route in [False, True] if pair != 1 else [True, False]:
                 sample, logical, emitted = measure(function, route)
                 samples["tokens" if route else "direct"] = sample
                 outputs[route] = emitted
-                if route:
+                if route and bounded:
                     _, _, state = _check_actual_tokens(function, logical, emitted)
                     row["executed_commands"] = {
                         "set": len(state.records),
@@ -122,12 +137,14 @@ def main():
                         f"{a.name}->{b.name}": sorted(ids) for (a, b), ids in state.ids.items()
                     }
             row["pairs"].append(samples)
+        assert logical is not None
         row["median_paired_total_ratio"] = statistics.median(
             p["tokens"]["total_seconds"] / p["direct"]["total_seconds"] for p in row["pairs"]
         )
         # Compare actual physical payload order for both constructions against
         # the same independently interpreted logical program, not just counts.
-        _check_actual_tokens(function, logical, outputs[False])
+        if bounded:
+            _check_actual_tokens(function, logical, outputs[False])
         texts = [
             codegen.PTOCodegen().generate(
                 ir.Program([outputs[route]], "TokenQualification", function.span),
@@ -145,7 +162,13 @@ def main():
             }
             for t in texts
         ]
-        row["semantic"] = "equal token/flag payload relations, access coverage, matching, causal reuse, width"
+        row["semantic"] = (
+            "equal token/flag payload relations, access coverage, matching, causal reuse, width"
+            if bounded
+            else "size/timing only; bounded variants checked independently"
+        )
+        row["token_text_bytes"] = len(ir.python_print(logical, format=False))
+        row["physical_pto_bytes"] = [len(t) for t in texts]
         receipt["cases"].append(row)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(receipt, indent=2) + "\n")

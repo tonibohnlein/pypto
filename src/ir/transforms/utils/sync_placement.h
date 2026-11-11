@@ -20,6 +20,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "src/ir/transforms/utils/sync_statement_rewrite.h"
 
 namespace pypto::ir::sync {
 using SyncSiteKey = std::pair<size_t, size_t>;
@@ -29,9 +30,9 @@ using SyncSiteKey = std::pair<size_t, size_t>;
 // entire branch, never publish from only one arm. Zero-trip bodies are untouched.
 class SyncPlacement : public IRMutator {
  public:
-  explicit SyncPlacement(const CompactSyncResult& analysis) : analysis_(analysis) {
-    CHECK(analysis.input.owner) << "Synchronization realization requires the original occurrence owner";
-    if (analysis.input.region_tree) {
+  explicit SyncPlacement(const CompactSyncInput& input) : input_(input) {
+    CHECK(input.owner) << "Synchronization realization requires the original occurrence owner";
+    if (input.region_tree) {
       std::function<void(const SyncRegion&)> collect = [&](const SyncRegion& region) {
         if (region.repetition && !region.repetition->count) {
           absent_loops_.insert(region.repetition->loop.get());
@@ -39,10 +40,10 @@ class SyncPlacement : public IRMutator {
         }
         for (const auto& child : region.children) collect(child);
       };
-      collect(*analysis.input.region_tree);
+      collect(*input.region_tree);
     }
-    for (size_t r = 0; r < analysis.input.segments.size(); ++r) {
-      const auto& segment = analysis.input.segments[r];
+    for (size_t r = 0; r < input.segments.size(); ++r) {
+      const auto& segment = input.segments[r];
       if (segment.original_loop) loops_.emplace(segment.original_loop.get(), r);
       for (const auto& frame : segment.nested_frames) loops_.emplace(frame.loop.get(), r);
       for (size_t s = 0; s < segment.sites.size(); ++s) {
@@ -57,10 +58,11 @@ class SyncPlacement : public IRMutator {
   }
 
  protected:
-  const CompactSyncResult& analysis_;
+  const CompactSyncInput& input_;
   std::map<const ForStmt*, size_t> loops_;
-  const SyncSite& Payload(SyncSiteKey site) const {
-    return analysis_.input.segments[site.first].sites[site.second];
+  const SyncSite& Payload(SyncSiteKey site) const { return input_.segments[site.first].sites[site.second]; }
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    return RewriteSyncSequence(op, [this](const StmtPtr& child) { return VisitStmt(child); });
   }
   virtual StmtPtr Wrap(const StmtPtr& payload, SyncSiteKey site) = 0;
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
@@ -84,7 +86,7 @@ class SyncPlacement : public IRMutator {
   }
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     if (absent_loops_.count(op.get())) return op;
-    if (!analysis_.input.segments[loops_.at(op.get())].count) return op;
+    if (!input_.segments[loops_.at(op.get())].count) return op;
     return IRMutator::VisitStmt_(op);
   }
 

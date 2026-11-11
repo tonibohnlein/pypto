@@ -35,3 +35,5 @@ the page covering what you are changing.
 - [IR Verifier](../passes/99-verifier.md) — the property verifiers that check IR legality between passes.
 
 See [RFC token pipeline checkpoint](18-token-pipeline-checkpoint.md) for finite logical-to-physical migration evidence.
+
+- [Canonical loop-token checkpoint](19-structured-token-checkpoint.md)
