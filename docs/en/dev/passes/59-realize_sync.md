@@ -186,5 +186,20 @@ Original-width arithmetic and casts need nonnegative, value-preserving proofs.
 Perfect constant loop nests with invariant effects retain their original frames
 and use a checked mixed-radix occurrence ordinal for physical commands. This
 specialization does not cover moving inner slices or accumulator-reset branches.
-General nested Qwen composition and its implicit allocation/range relationship
-remain outstanding; nested logical-token export remains explicitly unavailable.
+The qualified nested projection construction below extends this baseline when
+caller, access and scoped endpoint evidence is available. Arbitrary symbolic
+nesting and nested logical-token export remain unavailable.
+
+## Parameterized nested projections
+
+The configured Qwen output and combined gate/up projections use the same
+opt-in pass. Closed-program caller and launch evidence qualify ready invariant
+coordinates; numerical regional composition preserves resident operands,
+accumulator initialization and counter resets. Every activation case must
+qualify before the original payload body receives guarded command cuts.
+Six-ID allocation uses the existing sufficient certificate. Unsupported
+coordinates, same-pipe mechanisms or resource evidence still delegate.
+See the [pipeline checkpoint](../ir/18-qwen-prefill-pipeline.md) for exact
+premises, independent bounded checks and remaining selection limitations.
+This does not qualify arbitrary symbolic nesting, the full prefill model,
+native invocation completion or device behavior.

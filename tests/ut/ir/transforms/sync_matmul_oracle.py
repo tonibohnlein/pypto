@@ -42,7 +42,7 @@ def integer(expr, env):
     if isinstance(expr, ir.ConstInt):
         return expr.value
     if isinstance(expr, ir.Var):
-        return env[expr.name_hint]
+        return env[expr] if expr in env else env[expr.name_hint]
     if isinstance(expr, ir.Cast):
         assert isinstance(expr.type, ir.ScalarType)
         return cast_integer(integer(expr.operand, env), expr.type.dtype)
@@ -52,6 +52,14 @@ def integer(expr, env):
         return integer(expr.left, env) * integer(expr.right, env)
     if isinstance(expr, ir.FloorMod):
         return integer(expr.left, env) % integer(expr.right, env)
+    if isinstance(expr, ir.FloorDiv):
+        return integer(expr.left, env) // integer(expr.right, env)
+    if isinstance(expr, ir.And):
+        return bool(integer(expr.left, env)) and bool(integer(expr.right, env))
+    if isinstance(expr, ir.Or):
+        return bool(integer(expr.left, env)) or bool(integer(expr.right, env))
+    if isinstance(expr, ir.Call) and expr.op.name == ir.get_op("buffer.get_block_idx").name:
+        return env["__block_index__"]
     if isinstance(expr, ir.Eq):
         return integer(expr.left, env) == integer(expr.right, env)
     raise AssertionError(f"Oracle does not interpret {type(expr)}")
@@ -122,9 +130,17 @@ def define_slot_storage(stmt, env, storage):
     return False
 
 
-def interpret(function, parameters=None):
+def interpret(function, parameters=None, *, block_index=None, shape_parameters=None):
     parameters = parameters or {}
     environment = {function.params[i].name_hint: value for i, value in parameters.items()}
+    # Execution inputs, independently supplied by the test's caller contract.
+    # They are never read from the compiler's retained proof or phase tree.
+    if shape_parameters:
+        assert not environment.keys() & shape_parameters.keys()
+        environment.update(shape_parameters)
+    if block_index is not None:
+        assert block_index >= 0
+        environment["__block_index__"] = block_index
     storage = {}
     for param in function.params:
         t = param.type
@@ -233,12 +249,12 @@ def interpret(function, parameters=None):
                 execute(s, env)
         elif isinstance(stmt, ir.AssignStmt):
             if isinstance(stmt.var.type, ir.ScalarType):
-                env[stmt.var.name_hint] = integer(stmt.value, env)
+                env[stmt.var] = integer(stmt.value, env)
             else:
                 define_storage(stmt, env)
         elif isinstance(stmt, ir.ForStmt):
             for value in range(integer(stmt.start, env), integer(stmt.stop, env), integer(stmt.step, env)):
-                execute(stmt.body, {**env, stmt.loop_var.name_hint: value})
+                execute(stmt.body, {**env, stmt.loop_var: value})
         elif isinstance(stmt, ir.IfStmt):
             execute(stmt.then_body if integer(stmt.condition, env) else stmt.else_body, env)
         elif isinstance(stmt, (ir.YieldStmt, ir.ReturnStmt)):
@@ -311,7 +327,10 @@ def protected_accumulator_pairs(function, calls, target="a2a3"):
         footprint = source[4]
         if any(
             (entry[2] == ir.PipeType.M and (not qualifies(entry) or entry[4] != footprint))
-            or (entry[2] != ir.PipeType.M and not (entry[3] | entry[4]).isdisjoint(footprint))
+            or (
+                entry[2] != ir.PipeType.M
+                and (not entry[3].isdisjoint(footprint) or not entry[4].isdisjoint(footprint))
+            )
             for entry in calls[a + 1 : b]
         ):
             continue
@@ -345,10 +364,7 @@ def validate_slot_descriptors(function, description):
             assert domain["bytes"] == pitch * group.slot_count
 
 
-def validate(function, analysis, query_all=True, parameters=None):
-    parameters = parameters or {}
-    description = analysis.describe()
-    validate_slot_descriptors(function, description)
+def translate_access_description(description, parameters, block_index):
     # Translate the compiler's CLAIMED relative footprints for comparison. The
     # independent interpreter below evaluates original accesses from the IR.
     for region in description["regions"]:
@@ -359,9 +375,20 @@ def validate(function, analysis, query_all=True, parameters=None):
                 domain = description["storage"][aid]
                 row += sum(parameters[p] * c for p, c in domain.get("row_parameters", {}).items())
                 col += sum(parameters[p] * c for p, c in domain.get("column_parameters", {}).items())
+                if domain.get("row_block") or domain.get("column_block"):
+                    assert block_index is not None
+                    row += domain["row_block"] * (block_index - domain.get("block_origin", 0))
+                    col += domain["column_block"] * (block_index - domain.get("block_origin", 0))
                 accesses.append((aid, write, row, col, dr, dc, rows, cols, after_first))
             site["accesses"] = accesses
-    storage, calls = interpret(function, parameters)
+
+
+def validate(function, analysis, query_all=True, parameters=None, *, block_index=None):
+    parameters = parameters or {}
+    description = analysis.describe()
+    validate_slot_descriptors(function, description)
+    translate_access_description(description, parameters, block_index)
+    storage, calls = interpret(function, parameters, block_index=block_index)
     occurrences, effects = check_imported_accesses(description, storage, calls)
     vertices = [(o, c) for o in occurrences for c in (False, True)]
     base = {((o, False), (o, True)) for o in occurrences}
@@ -400,7 +427,9 @@ def validate(function, analysis, query_all=True, parameters=None):
         for a in vertices:
             for b in vertices:
                 assert analysis.precedes(a[0], a[1], b[0], b[1]) == ((a, b) in order), (a, b)
-    checks = validate_boundaries(description, storage, effects, occurrences, analysis, parameters)
+    checks = validate_boundaries(
+        description, storage, effects, occurrences, analysis, parameters, block_index
+    )
     return {
         "payloads": len(occurrences),
         "covers": len(covers),
@@ -419,7 +448,9 @@ def domain_addresses(domain, storage, row, col, rows, cols, slot=0):
     return address_set(descriptor, row, col, rows, cols)
 
 
-def validate_boundaries(description, storage, effects, occurrences, analysis, parameters=None):
+def validate_boundaries(
+    description, storage, effects, occurrences, analysis, parameters=None, block_index=None
+):
     # Boundary points include interior/exterior and corners of each extracted
     # rectangle. Point membership is looked up in the independent physical map.
     checks = 0
@@ -427,9 +458,19 @@ def validate_boundaries(description, storage, effects, occurrences, analysis, pa
         points = {(0, 0), (domain["rows"] - 1, domain["columns"] - 1)}
         for r in description["regions"]:
             for site in r["sites"]:
-                for aid, _, row, col, dr, dc, rows, cols, _ in site["accesses"]:
+                for access_index, (aid, _, row, col, dr, dc, rows, cols, _) in enumerate(site["accesses"]):
                     if aid == sid:
-                        for i in range(r["count"]):
+                        for visit in range(r["count"]):
+                            i = visit % r["reset_period"] if r.get("reset_period") else visit
+                            frame = site.get("access_frames", [None] * len(site["accesses"]))[access_index]
+                            if frame is not None and r.get("nested_frames"):
+                                remaining = visit
+                                for f, count, _, _ in reversed(r["nested_frames"]):
+                                    digit = remaining % count
+                                    remaining //= count
+                                    if f.same_as(frame):
+                                        i = digit
+                                        break
                             points.update(
                                 {
                                     (row + i * dr, col + i * dc),
@@ -440,7 +481,7 @@ def validate_boundaries(description, storage, effects, occurrences, analysis, pa
             if domain.get("row_extent_parameter") is not None:
                 actual_rows = storage[domain["name"]][2]
                 if row >= actual_rows:
-                    assert analysis.boundary(sid, row, col, parameters or {}) is None
+                    assert analysis.boundary(sid, row, col, parameters or {}, block_index) is None
                     checks += 1
                     continue
             point = domain_addresses(domain, storage, row, col, 1, 1, slot)
@@ -462,9 +503,9 @@ def validate_boundaries(description, storage, effects, occurrences, analysis, pa
                 expected["first_readers"][int(pipe)] = occurrences[first[0]] if first else None
                 expected["last_readers"][int(pipe)] = occurrences[last[-1]] if last else None
             if domain.get("slot_bytes", 0):
-                assert analysis.boundary_slot(sid, slot, row, col, parameters or {}) == expected
+                assert analysis.boundary_slot(sid, slot, row, col, parameters or {}, block_index) == expected
             else:
-                assert analysis.boundary(sid, row, col, parameters or {}) == expected
+                assert analysis.boundary(sid, row, col, parameters or {}, block_index) == expected
             checks += 1
         assert analysis.boundary(sid, domain["rows"], 0) is None
     return checks
@@ -485,12 +526,12 @@ def check_imported_accesses(description, storage, calls):
         visit = (
             0
             if loop is None
-            else (env[loop.loop_var.name_hint] - integer(loop.start, {})) // integer(loop.step, {})
+            else (integer(loop.loop_var, env) - integer(loop.start, env)) // integer(loop.step, env)
         )
         if region.get("nested_frames"):
             visit = 0
             for frame, count, start, step in region["nested_frames"]:
-                digit = (env[frame.loop_var.name_hint] - start) // step
+                digit = (integer(frame.loop_var, env) - integer(frame.start, env)) // step
                 assert 0 <= digit < count
                 visit = visit * count + digit
         occurrences.append((r, visit, s))
@@ -498,17 +539,40 @@ def check_imported_accesses(description, storage, calls):
         modeled = [set(), set()]
         local_visit = visit % region["reset_period"] if region.get("reset_period") else visit
         site = region["sites"][s]
+        initializing = local_visit == 0
+        if site.get("initialization_scope") is not None:
+            scoped = False
+            initializing = True
+            for frame, _, start, _ in region["nested_frames"]:
+                scoped |= frame.same_as(site["initialization_scope"])
+                if scoped:
+                    initializing &= integer(frame.loop_var, env) == start
         selections = site.get("slot_selections", [(0, 0)] * len(site["accesses"]))
-        for access, selection in zip(site["accesses"], selections, strict=True):
+        for access_index, (access, selection) in enumerate(zip(site["accesses"], selections, strict=True)):
             sid, write, row, col, dr, dc, rows, cols, after_first = access
-            if after_first and visit == 0:
+            if after_first and initializing:
                 continue
             domain = description["storage"][sid]
+            access_visit = local_visit
+            frame = site.get("access_frames", [None] * len(site["accesses"]))[access_index]
+            if frame is not None:
+                access_visit = (integer(frame.loop_var, env) - integer(frame.start, env)) // integer(
+                    frame.step, env
+                )
             slot = (selection[0] + local_visit * selection[1]) % domain.get("slot_count", 1)
             modeled[write].update(
                 domain_addresses(
-                    domain, storage, row + local_visit * dr, col + local_visit * dc, rows, cols, slot
+                    domain, storage, row + access_visit * dr, col + access_visit * dc, rows, cols, slot
                 )
             )
-        assert modeled == [reads, writes], (r, visit, s, "access mismatch")
+        assert modeled == [reads, writes], (
+            r,
+            visit,
+            s,
+            "access mismatch",
+            [
+                (len(m), len(a), sorted(m - a, key=repr)[:3], sorted(a - m, key=repr)[:3])
+                for m, a in zip(modeled, [reads, writes], strict=True)
+            ],
+        )
     return occurrences, effects

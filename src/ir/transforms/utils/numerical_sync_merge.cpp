@@ -9,11 +9,15 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "numerical_sync_merge.h"
+#include "src/ir/transforms/utils/numerical_sync_merge.h"
 
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <memory>
+#include <set>
 #include <tuple>
+#include <vector>
 
 #include "pypto/core/logging.h"
 namespace pypto::ir::sync {
@@ -123,8 +127,9 @@ struct TwoMinimum {
     if (!first || value < first->first) {
       second = first;
       first = {{value, identity}};
-    } else if (!second || value < second->first)
+    } else if (!second || value < second->first) {
       second = {{value, identity}};
+    }
   }
   bool OtherAtMost(size_t identity, int64_t limit) const {
     const auto& chosen = first && first->second != identity ? first : second;
@@ -211,7 +216,26 @@ std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const N
     const auto& right = b->storage[cell];
     node->storage.push_back(MergeNumericalBoundary(left, right, a->length));
     if (left.last_writer) {
-      if (right.first_writer) add(*left.last_writer, true, *right.first_writer, false, false);
+      if (right.first_writer) {
+        const auto matrix = static_cast<size_t>(PipeType::M);
+        // This is footprint protection, never a manufactured C->I edge. The
+        // selected writers must be adjacent on the combined native M chain,
+        // share the qualified physical accumulator, and have no intervening
+        // read of it. Storage summaries retain such reads (including FIX).
+        // Empty children preserve these facts; initialization clears the
+        // target qualification even if its source site is otherwise protected.
+        bool protected_pair = false;
+        if (result.input.region_tree && a->last_m_qualified &&
+            a->last_m_qualified == b->first_m_continuation &&
+            *a->last_m_qualified == result.storage_classes.at(cell).storage &&
+            left.last_writer == a->last[matrix] && right.first_writer == b->first[matrix]) {
+          protected_pair = std::none_of(left.last_readers.begin(), left.last_readers.end(),
+                                        [](const auto& value) { return value.has_value(); }) &&
+                           std::none_of(right.first_readers.begin(), right.first_readers.end(),
+                                        [](const auto& value) { return value.has_value(); });
+        }
+        if (!protected_pair) add(*left.last_writer, true, *right.first_writer, false, false);
+      }
       for (const auto& reader : right.first_readers)
         if (reader) add(*left.last_writer, true, *reader, false, false);
     }
@@ -231,6 +255,9 @@ std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const N
       add(*a->last[p], true, *b->first[p], true, true);
     }
   }
+  const auto matrix = static_cast<size_t>(PipeType::M);
+  node->first_m_continuation = a->first[matrix] ? a->first_m_continuation : b->first_m_continuation;
+  node->last_m_qualified = b->last[matrix] ? b->last_m_qualified : a->last_m_qualified;
   std::vector<NumericalCrossing> all;
   for (const auto& [edge, native] : edges)
     all.push_back({a->positions.at(edge.first), b->positions.at(edge.second), native});

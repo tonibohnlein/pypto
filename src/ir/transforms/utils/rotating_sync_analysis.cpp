@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "rotating_sync_analysis.h"
+#include "src/ir/transforms/utils/rotating_sync_analysis.h"
 
 #include <algorithm>
 #include <chrono>
@@ -240,7 +240,7 @@ struct BestTwo {
     return entry ? std::optional<Wide>(entry->value) : std::nullopt;
   }
 };
-size_t Reduce(CompactSegmentResult& result) {
+size_t Reduce(CompactSegmentResult& result, bool extract_covers = true) {
   const size_t sites = result.pipes.size(), vertices = 2 * sites;
   std::array<std::vector<size_t>, kPipeCount> pipes;
   result.ranks.resize(sites);
@@ -299,7 +299,7 @@ size_t Reduce(CompactSegmentResult& result) {
           }
         }
       }
-      if (!completion) continue;
+      if (!completion || !extract_covers) continue;
       std::vector<BestTwo> best(vertices);
       for (size_t id = 0; id < edges.size(); ++id) {
         const auto& e = edges[id];
@@ -314,8 +314,10 @@ size_t Reduce(CompactSegmentResult& result) {
       }
     }
   }
-  for (size_t i = 0; i < result.generators.size(); ++i)
-    if (!redundant[i]) result.demands.push_back(result.generators[i]);
+  if (extract_covers) {
+    for (size_t i = 0; i < result.generators.size(); ++i)
+      if (!redundant[i]) result.demands.push_back(result.generators[i]);
+  }
   return edges.size();
 }
 Wide Floor(Wide numerator, int64_t denominator) {
@@ -349,6 +351,7 @@ std::optional<std::pair<int64_t, int64_t>> Progression(int64_t low, int64_t high
   return std::make_pair(static_cast<int64_t>(first), static_cast<int64_t>(last));
 }
 }  // namespace
+size_t BuildPeriodicCoreFrontiers(CompactSegmentResult& result) { return Reduce(result, false); }
 
 CompactSyncResult AnalyzeRotatingSync(CompactSyncInput input) {
   CHECK(input.segments.size() == 1)

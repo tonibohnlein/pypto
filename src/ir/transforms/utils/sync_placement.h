@@ -12,7 +12,9 @@
 #ifndef SRC_IR_TRANSFORMS_UTILS_SYNC_PLACEMENT_H_
 #define SRC_IR_TRANSFORMS_UTILS_SYNC_PLACEMENT_H_
 
+#include <functional>
 #include <map>
+#include <set>
 #include <utility>
 
 #include "pypto/core/logging.h"
@@ -29,6 +31,16 @@ class SyncPlacement : public IRMutator {
  public:
   explicit SyncPlacement(const CompactSyncResult& analysis) : analysis_(analysis) {
     CHECK(analysis.input.owner) << "Synchronization realization requires the original occurrence owner";
+    if (analysis.input.region_tree) {
+      std::function<void(const SyncRegion&)> collect = [&](const SyncRegion& region) {
+        if (region.repetition && !region.repetition->count) {
+          absent_loops_.insert(region.repetition->loop.get());
+          return;
+        }
+        for (const auto& child : region.children) collect(child);
+      };
+      collect(*analysis.input.region_tree);
+    }
     for (size_t r = 0; r < analysis.input.segments.size(); ++r) {
       const auto& segment = analysis.input.segments[r];
       if (segment.original_loop) loops_.emplace(segment.original_loop.get(), r);
@@ -71,12 +83,14 @@ class SyncPlacement : public IRMutator {
     return Wrap(op, it->second);
   }
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    if (absent_loops_.count(op.get())) return op;
     if (!analysis_.input.segments[loops_.at(op.get())].count) return op;
     return IRMutator::VisitStmt_(op);
   }
 
  private:
   std::map<const Call*, SyncSiteKey> anchors_;
+  std::set<const ForStmt*> absent_loops_;
 };
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_SYNC_PLACEMENT_H_

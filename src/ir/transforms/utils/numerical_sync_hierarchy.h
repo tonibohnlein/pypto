@@ -9,16 +9,25 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef PYPTO_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_HIERARCHY_H_
-#define PYPTO_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_HIERARCHY_H_
+#ifndef SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_HIERARCHY_H_
+#define SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_HIERARCHY_H_
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 namespace pypto::ir::sync {
+CompactSyncResult AnalyzeInvariantSyncLeaves(CompactSyncInput input);
 CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string& order);
+bool NumericalReferenceBefore(const CompactSyncResult& result, const Occurrence& a, const Occurrence& b);
+bool CertifyNumericalAdjacentBarrier(const CompactSyncResult& result, size_t family);
+bool CertifyNumericalConsecutiveReuse(const CompactSyncResult& result, size_t family);
 bool NumericalPrecedes(const CompactSyncResult& result, const Occurrence& a, bool sc, const Occurrence& b,
                        bool tc);
 PointBoundary QueryNumericalBoundary(const CompactSyncResult& result, size_t storage, int64_t slot,
                                      int64_t row, int64_t column);
 std::optional<std::vector<Crossing>> ExportNumericalCrossings(const CompactSyncResult& result);
+std::shared_ptr<const ScopedSyncDemands> ExportNumericalScopedDemands(const CompactSyncResult& result);
 std::vector<Crossing> ExpandNumericalDemands(const CompactSyncResult& result, size_t maximum);
 }  // namespace pypto::ir::sync
-#endif
+#endif  // SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_HIERARCHY_H_

@@ -202,3 +202,169 @@ def test_caller_loop_increment_is_checked_in_original_width(dtype, stop, overflo
     caller = ir.Function("main", [], [], loop, span, ir.FunctionType.Orchestration)
     program = ir.Program([child, caller], "NarrowLoop", span)
     assert testing.sync_parameter_bounds(program).get("child", {}) == ({} if overflow else {0: (0, stop - 2)})
+
+
+def invocation_chain(depth=3, unknown=False, cycle=False, launches=(20, 24), submit=False):
+    """Multiple real launch sites forward a parameter and logical block identity."""
+    span, index = ir.Span.unknown(), ir.DataType.INDEX
+    ty = ir.ScalarType(index)
+
+    def ci(value):
+        return ir.ConstInt(value, index, span)
+
+    functions = []
+    for number in range(depth):
+        value = ir.Var(f"value{number}", ty, span)
+        if number + 1 < depth:
+            call = ir.Call(ir.GlobalVar(f"f{number + 1}"), [value], ir.VoidType(), span)
+            body = ir.EvalStmt(call, span)
+        else:
+            body = ir.ReturnStmt([], span)
+        if cycle and number == depth - 1:
+            body = ir.EvalStmt(ir.Call(ir.GlobalVar("f0"), [value], ir.VoidType(), span), span)
+        functions.append(
+            ir.Function(
+                f"f{number}",
+                [value],
+                [],
+                body,
+                span,
+                ir.FunctionType.AIC if number == depth - 1 else ir.FunctionType.Spmd,
+            )
+        )
+    external = ir.Var("unknown", ty, span)
+    calls = []
+    for i, count in enumerate(launches):
+        argument = external if unknown and i == len(launches) - 1 else ci(i * 5120)
+        attrs = {} if count is None else {"core_num": ci(count)}
+        if submit:
+            call = ir.Submit(
+                ir.GlobalVar("f0"),
+                [argument],
+                [],
+                {},
+                {},
+                ir.TupleType([ir.ScalarType(ir.DataType.TASK_ID)]),
+                span,
+                core_num=None if count is None else ci(count),
+            )
+        else:
+            call = ir.Call(ir.GlobalVar("f0"), [argument], {}, attrs, ir.VoidType(), span)
+        calls.append(ir.EvalStmt(call, span))
+    functions.append(
+        ir.Function("main", [external], [], ir.SeqStmts(calls, span), span, ir.FunctionType.Orchestration)
+    )
+    return ir.Program(functions, "ForwardedEvidence", span)
+
+
+@pytest.mark.parametrize("submit", [False, True])
+@pytest.mark.parametrize("unknown", [False, True])
+def test_forwarded_ranges_join_all_original_callers(submit, unknown):
+    evidence = testing.sync_invocation_evidence(invocation_chain(2, unknown=unknown, submit=submit))
+    for name in ["f0", "f1"]:
+        assert evidence["parameters"].get(name, {}) == ({} if unknown else {0: (0, 5120)})
+        assert evidence["block_indices"][name] == (0, 23)
+    assert evidence["call_graph_nodes"] == 3
+    assert evidence["call_graph_edges"] == 2
+    assert evidence["processed_functions"] == 3
+
+
+@pytest.mark.parametrize("launches", [(20, None), (20, 0), (20, -1)])
+def test_unknown_launch_does_not_inherit_another_callers_width(launches):
+    evidence = testing.sync_invocation_evidence(invocation_chain(2, launches=launches))
+    assert evidence["block_indices"] == {}
+    assert evidence["parameters"]["f1"] == {0: (0, 5120)}
+
+
+def test_recursive_invocation_evidence_remains_unproved():
+    evidence = testing.sync_invocation_evidence(invocation_chain(3, cycle=True))
+    assert evidence["parameters"] == {}
+    assert evidence["block_indices"] == {}
+    assert evidence["processed_functions"] == 1
+
+
+def test_wrapper_proof_work_tracks_static_call_graph():
+    counts = []
+    for depth in [8, 16, 32]:
+        evidence = testing.sync_invocation_evidence(invocation_chain(depth))
+        assert evidence["parameters"][f"f{depth - 1}"] == {0: (0, 5120)}
+        assert evidence["call_graph_nodes"] == depth + 1
+        assert evidence["call_graph_edges"] == depth
+        counts.append(evidence["expression_visits"])
+    assert counts[1] <= 2 * counts[0] and counts[2] <= 2 * counts[1]
+
+
+@pytest.mark.parametrize("override,expected", [(None, 19), (8, 7), (0, None)])
+def test_launch_call_override_and_function_default(override, expected):
+    span, dtype = ir.Span.unknown(), ir.DataType.INDEX
+
+    def ci(value):
+        return ir.ConstInt(value, dtype, span)
+
+    worker = ir.Function("worker", [], [], ir.ReturnStmt([], span), span, ir.FunctionType.AIC)
+    wrapper = ir.Function(
+        "wrapper",
+        [],
+        [],
+        ir.EvalStmt(ir.Call(ir.GlobalVar("worker"), [], ir.VoidType(), span), span),
+        span,
+        ir.FunctionType.Spmd,
+        attrs={"core_num": ci(20)},
+    )
+    attrs = {} if override is None else {"core_num": ci(override)}
+    call = ir.Call(ir.GlobalVar("wrapper"), [], {}, attrs, ir.VoidType(), span)
+    root = ir.Function("main", [], [], ir.EvalStmt(call, span), span, ir.FunctionType.Orchestration)
+    evidence = testing.sync_invocation_evidence(ir.Program([root, wrapper, worker], "launch", span))
+    assert evidence["block_indices"] == (
+        {} if expected is None else {"wrapper": (0, expected), "worker": (0, expected)}
+    )
+    # A second direct orchestration->AIC call has no established block semantics.
+    root = ir.Function(
+        "main",
+        [],
+        [],
+        ir.SeqStmts(
+            [
+                ir.EvalStmt(call, span),
+                ir.EvalStmt(ir.Call(ir.GlobalVar("worker"), [], ir.VoidType(), span), span),
+            ],
+            span,
+        ),
+        span,
+        ir.FunctionType.Orchestration,
+    )
+    evidence = testing.sync_invocation_evidence(ir.Program([root, wrapper, worker], "direct", span))
+    assert "worker" not in evidence["block_indices"]
+
+
+@pytest.mark.parametrize(
+    "divisor,offset,expected",
+    [(24, 6, (0, 23)), (48, 6, (6, 29)), (0, 6, None), (-1, 6, None), (24, 2**63 - 24, None)],
+)
+def test_launch_coordinate_modulo_preserves_original_width(divisor, offset, expected):
+    span, dtype = ir.Span.unknown(), ir.DataType.INDEX
+
+    def ci(value):
+        return ir.ConstInt(value, dtype, span)
+
+    ty = ir.ScalarType(dtype)
+    coordinate = ir.Var("coordinate", ty, span)
+    worker = ir.Function("worker", [coordinate], [], ir.ReturnStmt([], span), span, ir.FunctionType.AIC)
+    block = ir.Call(ir.get_op("buffer.get_block_idx"), [], ty, span)
+    expression = ir.FloorMod(ir.Add(block, ci(offset), dtype, span), ci(divisor), dtype, span)
+    wrapper = ir.Function(
+        "wrapper",
+        [],
+        [],
+        ir.EvalStmt(ir.Call(ir.GlobalVar("worker"), [expression], ir.VoidType(), span), span),
+        span,
+        ir.FunctionType.Spmd,
+    )
+    call = ir.Call(ir.GlobalVar("wrapper"), [], {}, {"core_num": ci(24)}, ir.VoidType(), span)
+    root = ir.Function("main", [], [], ir.EvalStmt(call, span), span, ir.FunctionType.Orchestration)
+    evidence = testing.sync_invocation_evidence(ir.Program([root, wrapper, worker], "modulo", span))
+    assert evidence["parameters"].get("worker", {}) == ({} if expected is None else {0: expected})
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

@@ -39,6 +39,12 @@ def value(expr, env):
     if isinstance(expr, ir.Var):
         assert expr in env, f"unbound value: {expr.name_hint}"
         return env[expr]
+    if isinstance(expr, ir.Call) and expr.op.name == ir.get_op("buffer.get_block_idx").name:
+        return env["__block_index__"]
+    if isinstance(expr, ir.And):
+        return bool(value(expr.left, env)) and bool(value(expr.right, env))
+    if isinstance(expr, ir.Or):
+        return bool(value(expr.left, env)) or bool(value(expr.right, env))
     if isinstance(expr, (ir.Add, ir.Sub, ir.Mul, ir.FloorDiv, ir.FloorMod, ir.Eq, ir.Gt, ir.Ge, ir.Lt)):
         a, b = value(expr.left, env), value(expr.right, env)
         if isinstance(expr, ir.Add):
@@ -144,8 +150,18 @@ class CommandExecution:
         assert self.payload_count < len(self.calls), "extra payload"
         original_call, coordinates, pipe, _, _ = self.calls[self.payload_count]
         same_payload(call, original_call)
-        for name, expected in coordinates.items():
-            values = [v for var, v in env.items() if var.name_hint == name]
+        for coordinate, expected in coordinates.items():
+            # Original scalar definitions can share a name_hint after inlining.
+            # Their SSA identity, not the printer's disambiguated name, matters.
+            name = coordinate.name_hint if isinstance(coordinate, ir.Var) else coordinate
+            # Serialization or a separate compilation can replace SSA objects.
+            # Only a unique active lexical name may bridge that identity change;
+            # ambiguous duplicate names still fail the occurrence check.
+            values = (
+                [env[coordinate]]
+                if coordinate in env
+                else [v for var, v in env.items() if isinstance(var, ir.Var) and var.name_hint == name]
+            )
             assert values == [expected], "changed original occurrence coordinates"
         start, completion = (self.payload_count, False), (self.payload_count, True)
         self.edges.add((start, completion))

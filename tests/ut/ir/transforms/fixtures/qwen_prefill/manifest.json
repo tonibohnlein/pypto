@@ -1,0 +1,34 @@
+{
+  "revision": "f2c80074c0b06ab5bf87fc2bfb06db417fcd35f1",
+  "sources": {
+    "prefill_fwd.py": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+    "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+    "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+    "rms_lm_head.py": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77"
+  },
+  "gate_up_extraction": {
+    "source_lines": [
+      1369,
+      1405
+    ],
+    "body_ast_sha256": "344ebf0fc0b70335f24e153ec757bb0521a67d5bffa1ef5d0028420b4afcad07",
+    "adapter_sha256": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+    "adaptations": [
+      "Ready input tensors replace the external post_norm_ready task dependency at standalone invocation entry.",
+      "The original enclosing band_ob0 and band_core_rot assignments are retained; band remains an explicit parameter.",
+      "Allocate output in the caller; preserve both original projection loops and original launch width."
+    ]
+  },
+  "output_extraction": {
+    "source_lines": [
+      932,
+      953
+    ],
+    "adapter_sha256": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+    "adaptations": [
+      "No compute-body changes; standalone entry changes the JIT role only.",
+      "Configured tests explicitly replace the dynamic layer-row annotation by LAYERS*HIDDEN before parsing."
+    ]
+  },
+  "configured_caller_sha256": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe"
+}

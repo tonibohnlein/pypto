@@ -9,8 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef PYPTO_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_MERGE_H_
-#define PYPTO_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_MERGE_H_
+#ifndef SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_MERGE_H_
+#define SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_MERGE_H_
 #include <array>
 #include <map>
 #include <memory>
@@ -47,6 +47,12 @@ struct NumericalNode {
   size_t leaf = 0;
   std::shared_ptr<const NumericalNode> left, right;
   std::vector<NumericalBoundary> storage;
+  // Original native site positions; populated only on leaves for predecessor
+  // queries. Shared repeat nodes do not duplicate or enumerate their visits.
+  std::array<std::vector<size_t>, kPipeCount> native_sites;
+  // Existing Mmad footprint protection at native M-chain boundary events.
+  // The target must be a continuation; an initialization cannot inherit it.
+  std::optional<size_t> first_m_continuation, last_m_qualified;
   std::array<std::optional<NumericalOrdinal>, kPipeCount> first{}, last{};
   std::array<std::vector<NumericalOrdinal>, kNumericalChains> chains;
   std::array<std::vector<NumericalRow>, kNumericalChains> forward, reverse;
@@ -55,11 +61,31 @@ struct NumericalNode {
   std::array<std::array<NumericalCrossIndex, kNumericalChains>, kNumericalChains> crossing_index;
   std::array<std::vector<int64_t>, kNumericalChains> left_projection, right_projection;
 };
+// Source identities use this unshared layout, not the merge DAG. Summary
+// doubling may reuse a node, but each source leaf has one occurrence path.
+struct NumericalSourceLayout {
+  std::optional<size_t> leaf;
+  ForStmtPtr frame;
+  int64_t count = 1;
+  NumericalOrdinal body_length = 0, length = 0;
+  // Existing summary objects used by one source body and its adjacent-visit
+  // seam. Export traverses this source tree, never every use of the repeat DAG.
+  std::shared_ptr<const NumericalNode> body, summary, seam;
+  std::vector<NumericalSourceLayout> children;
+  std::vector<NumericalOrdinal> offsets;
+};
+struct NumericalOccurrencePath {
+  NumericalOrdinal first = 0;
+  // Outermost first: radix and reference-order payload stride.
+  std::vector<std::pair<int64_t, NumericalOrdinal>> frames;
+};
 class NumericalSyncHierarchy {
  public:
   std::shared_ptr<const NumericalNode> root;
   std::vector<NumericalCell> cells;
   std::vector<NumericalOrdinal> segment_offsets;
+  std::optional<NumericalSourceLayout> source_layout;
+  std::vector<NumericalOccurrencePath> source_paths;
 };
 NumericalOrdinal NumericalAdd(NumericalOrdinal a, NumericalOrdinal b);
 NumericalBoundary MergeNumericalBoundary(const NumericalBoundary& a, const NumericalBoundary& b,
@@ -72,4 +98,4 @@ std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const N
                                                          std::shared_ptr<const NumericalNode> b,
                                                          CompactSyncResult& result);
 }  // namespace pypto::ir::sync
-#endif
+#endif  // SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_MERGE_H_
