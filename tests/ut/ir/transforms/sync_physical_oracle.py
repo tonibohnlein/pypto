@@ -92,9 +92,9 @@ class PhysicalExecution(CommandExecution):
         return super().execute(stmt, env)
 
 
-def run_physical(original, emitted, eligible=range(8), parameters=None):
+def run_physical(original, emitted, eligible=range(8), parameters=None, *, block_index=None):
     parameters = parameters or {}
-    _, calls = interpret(original, parameters)
+    _, calls = interpret(original, parameters, block_index=block_index)
     ref = hardware_reference(original, calls)
     state = PhysicalExecution(calls, ref[0], eligible)
 
@@ -106,7 +106,10 @@ def run_physical(original, emitted, eligible=range(8), parameters=None):
                 assert call.kwargs["core_type"] == expected, "flag has the wrong owning core"
 
     CoreOwnership().visit_function(emitted)
-    state.execute(emitted.body, {original.params[i]: value for i, value in parameters.items()})
+    environment = {original.params[i]: value for i, value in parameters.items()}
+    if block_index is not None:
+        environment["__block_index__"] = block_index
+    state.execute(emitted.body, dict(environment))
     assert state.payload_count == len(calls), "missing payload"
     assert not state.live, "outstanding notifications at invocation exit"
     assert not any(state.pending.values()), "wait has no payload consumer"
@@ -114,9 +117,7 @@ def run_physical(original, emitted, eligible=range(8), parameters=None):
     # This checks per-visit slot selection, including zero/short invocations;
     # a static assignment count cannot establish that preservation.
     descriptor_reference = CommandExecution(calls, ref[0])
-    descriptor_reference.execute(
-        original.body, {original.params[i]: value for i, value in parameters.items()}
-    )
+    descriptor_reference.execute(original.body, dict(environment))
     assert len(descriptor_reference.actual_allocations) == len(state.actual_allocations)
     for a, b in zip(descriptor_reference.actual_allocations, state.actual_allocations, strict=True):
         same_payload(a, b)

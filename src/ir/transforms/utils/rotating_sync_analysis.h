@@ -9,15 +9,18 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef PYPTO_IR_TRANSFORMS_UTILS_ROTATING_SYNC_ANALYSIS_H_
-#define PYPTO_IR_TRANSFORMS_UTILS_ROTATING_SYNC_ANALYSIS_H_
+#ifndef SRC_IR_TRANSFORMS_UTILS_ROTATING_SYNC_ANALYSIS_H_
+#define SRC_IR_TRANSFORMS_UTILS_ROTATING_SYNC_ANALYSIS_H_
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 
 namespace pypto::ir::sync {
+// Shared numerical event-frontier construction for supplied exact generators.
+// Does not change the caller's retained demand inventory.
+size_t BuildPeriodicCoreFrontiers(CompactSegmentResult& result);
 CompactSyncResult AnalyzeRotatingSync(CompactSyncInput input);
 CompactSegmentResult AnalyzeRotatingSegment(const CompactSyncInput& input, size_t region, int64_t count,
                                             CompactSyncResult& work);
 PointBoundary RotatingBoundary(const CompactSyncInput& input, const CompactSegmentResult& segment,
                                size_t storage, int64_t slot, int64_t row, int64_t column, size_t region = 0);
 }  // namespace pypto::ir::sync
-#endif  // PYPTO_IR_TRANSFORMS_UTILS_ROTATING_SYNC_ANALYSIS_H_
+#endif  // SRC_IR_TRANSFORMS_UTILS_ROTATING_SYNC_ANALYSIS_H_

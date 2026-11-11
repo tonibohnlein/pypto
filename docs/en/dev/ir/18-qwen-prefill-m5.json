@@ -1,0 +1,371 @@
+{
+  "stage": "M5 ordinary opt-in production and C++",
+  "source_revision": "62ab48ed54325ee3cddfdb8b8579410aaa87d108",
+  "source_hashes": {
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "fa54de39f9ad65c0d36a573bf7b9f7a6c49ed380c9b1580945f56a78c013e82f",
+    "python/bindings/modules/testing.cpp": "f0e3cffe3c1cba00297d6e4963888baeebde3c6fd900c6ac054cce374db0a365",
+    "python/pypto/pypto_core/testing.pyi": "6256a6a88b0d67b1b58a3817788db5a7589610e2498b97f013cdbac1ccd8dab0",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "5085e3f3fa962deb76d90aeecf671e812cf34534545531cc7604e911065f0af5",
+    "src/ir/transforms/utils/invocation_sync_analysis.cpp": "121c0abd749b63ff50fa61e25019abdda0c3e24fb89322a62286a06348d78377",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "d24054e97a9bea0b693e115851e2dbe93f583f481b859d82b222f475391ed8bf",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.h": "61c1fd47da5412ca5cd9ddcd81b7cab24f2bbd5694ffbed27e25461c8d89e7b5",
+    "src/ir/transforms/utils/numerical_sync_merge.cpp": "19cf7035a818bbd8b0b6da0200fa54f85b380f75ce027fb5bdde2fe1b66e4a54",
+    "src/ir/transforms/utils/numerical_sync_merge.h": "54b731ff9197125a34d73d6693ee18574a15d791ab862e91425e0925f0948444",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "7ef41b582497d5c307102abe82b30165b0fe23e6fa4834fec33ff9c615d68e1a",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "b0092036cfb4181605d59e3872901dbc3dffa33bcf65ad02d7ad07c6a4acd0c1",
+    "src/ir/transforms/utils/rotating_sync_analysis.cpp": "79368aad849919fb4fb49e1bc5c8f9967c597a20c1a4dfca09b2f7980c23b1c0",
+    "src/ir/transforms/utils/rotating_sync_analysis.h": "e2df0be6ca1e48bd68c23387f2b69203bbdcbbd3ffca6e4215fb731e267a45c9",
+    "src/ir/transforms/utils/sync_placement.h": "c560ba871894966816301f844b96601d5412ddc0945242175838dc1c711a9611",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/config.py.source": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/configured_callers.py.source": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/constants.py.source": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/gate_up_projection.py.source": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/manifest.json": "e9c334a72af5af3553a50cea113cd560d1eace26599a894fa901fbc561e21898",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/output_projection.py.source": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/prefill_fwd.py.source": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/rms_lm_head.py.source": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77",
+    "tests/ut/ir/transforms/qualify_qwen_physical.py": "52bc51b9b28fd2b03ca7d9e6183b3eebbe2f8f65a9e7d7bb3571746564cd2495",
+    "tests/ut/ir/transforms/qualify_qwen_prefill.py": "e53d79d3f237a4f0f3406e8cf3ddc493d4333a9241178b5de829390196739b81",
+    "tests/ut/ir/transforms/qualify_qwen_production.py": "eb1ac3bcabd88c9f6c6ec8af7002e4ba82cfb665964a390dc0a0e8eb4a9f6414",
+    "tests/ut/ir/transforms/sync_logical_oracle.py": "2e127faa6b7c6002cdda42b0afb7351e0a5b386936ae7c9e58dd0d9400ffdd46",
+    "tests/ut/ir/transforms/sync_matmul_oracle.py": "f7901eb546fcb6456698cf460c0cd85e260dc6397d8493040768518f4fd23482",
+    "tests/ut/ir/transforms/sync_physical_oracle.py": "07e3b3e28705c9ac3a4621c884ed6d54a4f12a904c5bbeedf75d5c6301179c1c",
+    "tests/ut/ir/transforms/sync_qwen_prefill_cases.py": "978daff489ea6bcafb12ca8b5111c156922efeab1b735ffae48f5967e5c6a667",
+    "tests/ut/ir/transforms/test_nested_sync_repetition.py": "215df7adf4a6fc4a882c7469e1a0f1ed13e1b5989c26a62d679d13034706666a",
+    "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "93cdb67b3e12b0856913503468fe4d106732ff3e380f6fc8628cf168eb8ba451",
+    "tests/ut/ir/transforms/test_qwen_prefill_production.py": "81e36e2574475dd0c1eb8017a3fa864e7b74b8dd2a6ec80f55dd626b81bd30da",
+    "tests/ut/ir/transforms/test_scoped_physical_sync.py": "d63e8363ae1fc5ec4cd186e563c04bc8f9115bcc197f40ea31d9e7c851816bb5",
+    "tests/ut/ir/transforms/test_sync_range_proofs.py": "33c2fde1c80c32420f83e4c2adfaad0e2b70527df0597c0672cafaf8e4fc14d0"
+  },
+  "extension_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "d941ca4b5d0f23b40fed707874541566d4b3be8210387b6e7b3eaabe3a2c2ca5"
+  },
+  "python": "3.14.7",
+  "input_manifest": {
+    "revision": "f2c80074c0b06ab5bf87fc2bfb06db417fcd35f1",
+    "sources": {
+      "prefill_fwd.py": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "rms_lm_head.py": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77"
+    },
+    "gate_up_extraction": {
+      "source_lines": [
+        1369,
+        1405
+      ],
+      "body_ast_sha256": "344ebf0fc0b70335f24e153ec757bb0521a67d5bffa1ef5d0028420b4afcad07",
+      "adapter_sha256": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+      "adaptations": [
+        "Ready input tensors replace the external post_norm_ready task dependency at standalone invocation entry.",
+        "The original enclosing band_ob0 and band_core_rot assignments are retained; band remains an explicit parameter.",
+        "Allocate output in the caller; preserve both original projection loops and original launch width."
+      ]
+    },
+    "output_extraction": {
+      "source_lines": [
+        932,
+        953
+      ],
+      "adapter_sha256": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+      "adaptations": [
+        "No compute-body changes; standalone entry changes the JIT role only.",
+        "Configured tests explicitly replace the dynamic layer-row annotation by LAYERS*HIDDEN before parsing."
+      ]
+    },
+    "configured_caller_sha256": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe"
+  },
+  "ptoas": {
+    "launcher_hash": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+    "version": "ptoas 0.72",
+    "native_hashes": {
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/_site_initialize_0.cpython-311-x86_64-linux-gnu.so": "225c1410b394ec8cb25365b91ed53b8dc650144cae9f34c6106d477903b07274",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/_mlir.cpython-311-x86_64-linux-gnu.so": "b618a015ad07cc38b59bc07184f63a1ca3c3def80314fb8558882b7c3a1c8d48",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/_mlirDialectsLLVM.cpython-311-x86_64-linux-gnu.so": "fc346a487b9cec914d77f806c6847940ec25c3d2d77d0214dd8d3e829727d75b"
+    }
+  },
+  "measurements": [
+    {
+      "kernel": "output",
+      "band": 3,
+      "pypto_enabled": false,
+      "compile_seconds_inclusive": 0.147606969345361,
+      "realize_sync_seconds_included": null,
+      "report": null,
+      "cpp_hashes": {
+        "output-band3-ptoas/ptoas/out_proj_aic.cpp": "061894919344785ecf4a2eb724b42b2d5e8e56cd3f713a0de519f0a98f644227",
+        "output-band3-ptoas/orchestration/output_projection_caller.cpp": "0846ba67927b2e54005466cd4fc807abf23c78a8f7de7069df386c51e0ab7527",
+        "output-band3-ptoas/kernels/aic/out_proj_aic.cpp": "5c122bfb4524a33e51c5d41730e8256a2df4412053a8fd0085df2fd625dc19a0"
+      }
+    },
+    {
+      "kernel": "output",
+      "band": 3,
+      "pypto_enabled": true,
+      "compile_seconds_inclusive": 0.08836701698601246,
+      "realize_sync_seconds_included": 0.0010892427526414394,
+      "report": {
+        "downstream_autosync_enabled": true,
+        "kernels": [
+          {
+            "function": "out_proj_aic",
+            "selected_route": "pypto",
+            "reason": "complete literal flag plan"
+          }
+        ]
+      },
+      "cpp_hashes": {
+        "output-band3-pypto/ptoas/out_proj_aic.cpp": "5041b704b9455bda046c6219b75c8bd16edfc46ff3a2a029401b081179d52a01",
+        "output-band3-pypto/orchestration/output_projection_caller.cpp": "0846ba67927b2e54005466cd4fc807abf23c78a8f7de7069df386c51e0ab7527",
+        "output-band3-pypto/kernels/aic/out_proj_aic.cpp": "8501ac85a16730893682685780444071ecb0113eb34ed8f2881a892d8ba329df"
+      }
+    },
+    {
+      "kernel": "gate_up",
+      "band": 0,
+      "pypto_enabled": false,
+      "compile_seconds_inclusive": 0.10471439780667424,
+      "realize_sync_seconds_included": null,
+      "report": null,
+      "cpp_hashes": {
+        "gate_up-band0-ptoas/ptoas/gate_up_proj.cpp": "a383f6ecfb18272404ea437af4c8cc1a9e5ee67e0f2c9c15a6e444fe8687c01b",
+        "gate_up-band0-ptoas/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+        "gate_up-band0-ptoas/kernels/aic/gate_up_proj.cpp": "e5e72e322986e9f3084c8c4a3b8744a7718558adad2a711bf95bb53904d42360"
+      }
+    },
+    {
+      "kernel": "gate_up",
+      "band": 0,
+      "pypto_enabled": true,
+      "compile_seconds_inclusive": 0.12267909990623593,
+      "realize_sync_seconds_included": 0.003669594880193472,
+      "report": {
+        "downstream_autosync_enabled": true,
+        "kernels": [
+          {
+            "function": "gate_up_proj",
+            "selected_route": "pypto",
+            "reason": "complete literal flag plan"
+          }
+        ]
+      },
+      "cpp_hashes": {
+        "gate_up-band0-pypto/ptoas/gate_up_proj.cpp": "14cd85551d8c31142b158ee3d8bbd35a7227835d7da9b3464bc9985ce520841e",
+        "gate_up-band0-pypto/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+        "gate_up-band0-pypto/kernels/aic/gate_up_proj.cpp": "bcd5d23ae5cb7193f40f9729ca44e113fac6e24fb0f867f75e0dc937a17a3319"
+      }
+    },
+    {
+      "kernel": "gate_up",
+      "band": 1,
+      "pypto_enabled": false,
+      "compile_seconds_inclusive": 0.09346833592280746,
+      "realize_sync_seconds_included": null,
+      "report": null,
+      "cpp_hashes": {
+        "gate_up-band1-ptoas/ptoas/gate_up_proj.cpp": "60c972d7c6bb3307858d81bacbd12dad0badbde32326fe3aab419deef034ea12",
+        "gate_up-band1-ptoas/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+        "gate_up-band1-ptoas/kernels/aic/gate_up_proj.cpp": "1366733ce776eaf05693ce9969df2c35e9e5c14b550825ba5f2f402d63126583"
+      }
+    },
+    {
+      "kernel": "gate_up",
+      "band": 1,
+      "pypto_enabled": true,
+      "compile_seconds_inclusive": 0.13194016180932522,
+      "realize_sync_seconds_included": 0.004537294153124094,
+      "report": {
+        "downstream_autosync_enabled": true,
+        "kernels": [
+          {
+            "function": "gate_up_proj",
+            "selected_route": "pypto",
+            "reason": "complete literal flag plan"
+          }
+        ]
+      },
+      "cpp_hashes": {
+        "gate_up-band1-pypto/ptoas/gate_up_proj.cpp": "3d818eb9fd03bcada61e3d8d722d54b5bf683172ea4c017c4ef87773a3926bb8",
+        "gate_up-band1-pypto/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+        "gate_up-band1-pypto/kernels/aic/gate_up_proj.cpp": "014d59fa3cc516a0968712364bbb6176796d9b292f2b5ca56f37d8a26f0981e1"
+      }
+    },
+    {
+      "kernel": "gate_up",
+      "band": 2,
+      "pypto_enabled": false,
+      "compile_seconds_inclusive": 0.0944424569606781,
+      "realize_sync_seconds_included": null,
+      "report": null,
+      "cpp_hashes": {
+        "gate_up-band2-ptoas/ptoas/gate_up_proj.cpp": "6bfae084f0cc7ce736ef9b75dd5b3ab97e2277967bd9577f0aeeae3d84c0ca90",
+        "gate_up-band2-ptoas/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+        "gate_up-band2-ptoas/kernels/aic/gate_up_proj.cpp": "bd05a40cf174bd4ac88268f11452dcf1f9d8eaf62198a50eb14a51d5ecf34f51"
+      }
+    },
+    {
+      "kernel": "gate_up",
+      "band": 2,
+      "pypto_enabled": true,
+      "compile_seconds_inclusive": 0.13697938481345773,
+      "realize_sync_seconds_included": 0.005275635048747063,
+      "report": {
+        "downstream_autosync_enabled": true,
+        "kernels": [
+          {
+            "function": "gate_up_proj",
+            "selected_route": "pypto",
+            "reason": "complete literal flag plan"
+          }
+        ]
+      },
+      "cpp_hashes": {
+        "gate_up-band2-pypto/ptoas/gate_up_proj.cpp": "1dd34bea48afaf0478471d9f6b08fc6818d78b5a64f595dc341726e58d59cfdc",
+        "gate_up-band2-pypto/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+        "gate_up-band2-pypto/kernels/aic/gate_up_proj.cpp": "8c6c1cae1fc7b7698cd54d87a367fa48e4dfdde7e33f596e22537de9c854e3dc"
+      }
+    },
+    {
+      "kernel": "gate_up",
+      "band": 3,
+      "pypto_enabled": false,
+      "compile_seconds_inclusive": 0.0937637910246849,
+      "realize_sync_seconds_included": null,
+      "report": null,
+      "cpp_hashes": {
+        "gate_up-band3-ptoas/ptoas/gate_up_proj.cpp": "5bc2e06d9ce8cafdc11fdaeb5a14d822918ff67ab32b3e777cd6ac10731b0f87",
+        "gate_up-band3-ptoas/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+        "gate_up-band3-ptoas/kernels/aic/gate_up_proj.cpp": "e7a9f82c3571f581e50ef0f11eb1ea01ca50986cc89959166e2c001986b51c03"
+      }
+    },
+    {
+      "kernel": "gate_up",
+      "band": 3,
+      "pypto_enabled": true,
+      "compile_seconds_inclusive": 0.1270682387985289,
+      "realize_sync_seconds_included": 0.004154236055910587,
+      "report": {
+        "downstream_autosync_enabled": true,
+        "kernels": [
+          {
+            "function": "gate_up_proj",
+            "selected_route": "pypto",
+            "reason": "complete literal flag plan"
+          }
+        ]
+      },
+      "cpp_hashes": {
+        "gate_up-band3-pypto/ptoas/gate_up_proj.cpp": "509785206bf562099017f1042bcf68777ac9b7b996619c3b97d892d29e43743a",
+        "gate_up-band3-pypto/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+        "gate_up-band3-pypto/kernels/aic/gate_up_proj.cpp": "d9ff2ae476f3114d6c16443c0b302030ba9e8bac3ae0200cbd7b02908072f2d1"
+      }
+    }
+  ],
+  "complete": true,
+  "timing_claim": "Single descriptive times; pass time is included in compile time, not additive",
+  "device": "Not run",
+  "native_invocation_completion": "Not established",
+  "environment": {
+    "platform": "Linux-7.2.5-100.fc43.x86_64-x86_64-with-glibc2.42",
+    "host_python": "/usr/bin/python3",
+    "launcher_python": "CPython3.11.15 on PATH",
+    "workers": 1
+  },
+  "commands": [
+    "source .claude/skills/testing/load-env.sh",
+    "cmake --build build-py314 --parallel 1",
+    "timeout --signal=INT --kill-after=5s 240s /usr/bin/python3 -m tests.ut.ir.transforms.qualify_qwen_production --output build-py314/qwen-prefill-m5-final"
+  ],
+  "focused_tests": {
+    "passed": 550,
+    "failed": 0,
+    "warnings": 26,
+    "seconds": 367.13,
+    "fresh_all_green_run": true,
+    "log": "build-py314/qwen-prefill-m5-gate.log",
+    "junit": "build-py314/qwen-prefill-m5-gate.xml",
+    "scope": "12 focused synchronization test files, serial; original upstream inline direction warnings"
+  },
+  "reviews": {
+    "architecture": "accepted; final fresh550/550 gate satisfies review condition",
+    "correctness": "accepted; final fresh550/550 gate satisfies review condition",
+    "algorithm": "accepted; final fresh550/550 gate satisfies review condition"
+  },
+  "handoff": {
+    "task": "/home/toni/work/pypto3_sync_more/device-agent-task-qwen-prefill-20261111.md",
+    "source_archive": "/home/toni/work/pypto3_sync_more/pypto-qwen-prefill-source-20261111.tar.gz",
+    "state": "uncommitted working tree; no push",
+    "base_bundle_prerequisite": "a1b56b53fbfeb586d280f8c8363647857dcd7e49",
+    "base_bundle_sha256": "d9fa1c9a853c0fdd47fd8b0b573e8cb38e573eadcbf56558972a98186aec4f4a"
+  },
+  "post_rebase_validation": {
+    "baseline_revision": "f77afaff43427a40729dc2d43e37f0dfba99a5f1",
+    "focused_tests": {
+      "status": "passed",
+      "exit_code": 0,
+      "summary": {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "1465",
+        "time": "472.921",
+        "timestamp": "2026-11-11T12:12:54.695690+01:00",
+        "hostname": "toni-fedora"
+      },
+      "log": "build-py314/pr3381-review/gate-fixes-final.log",
+      "command": [
+        "/usr/bin/python3",
+        "-m",
+        "pytest",
+        "tests/ut/ir/core/test_var.py",
+        "tests/ut/backend/test_buffer_migration_inventory.py",
+        "tests/ut/codegen/test_pto_codegen_ops.py",
+        "tests/ut/ir/transforms/test_autosync_switch.py",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_core_affinity.py",
+        "tests/ut/ir/transforms/test_expand_mixed_kernel_a2a3.py",
+        "tests/ut/ir/transforms/test_expand_mixed_kernel_a5.py",
+        "tests/ut/ir/transforms/test_expand_mixed_kernel_split_aiv.py",
+        "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+        "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+        "tests/ut/ir/transforms/test_parameterized_sync.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_pipeline_flag_placement.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+        "tests/ut/ir/transforms/test_regional_slot_composition.py",
+        "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+        "tests/ut/ir/transforms/test_row_sync_analysis.py",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+        "tests/ut/ir/transforms/test_slot_sync_import.py",
+        "tests/ut/ir/transforms/test_streamed_slot_composition.py",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/language/parser/test_system_ops.py",
+        "-q",
+        "--junitxml=build-py314/pr3381-review/gate-fixes-final.xml"
+      ]
+    },
+    "typing_changes": {
+      "python/pypto/pypto_core/testing.pyi": "9db6c740389681ad127547341e9473c72e9abc5a3d5bd453c16c0e6a553b7bb1",
+      "tests/ut/ir/transforms/qualify_qwen_physical.py": "f67b7123c25ab86b9e0aa6b2f7590ec4fc7164b043269cc6aaa5c139f71a0d53",
+      "tests/ut/ir/transforms/qualify_qwen_prefill.py": "11e4c7d5176eb87641c2fcee4fbd3ebf53b8a506ae26758621d33a7ee106cab4",
+      "tests/ut/ir/transforms/qualify_qwen_production.py": "0895888a6474b6cb2726418c790e9badd4d07f458175d65c0e4567b1d93cd427",
+      "tests/ut/ir/transforms/sync_matmul_oracle.py": "5876e8dd912c945a083e63c6961b85ea6eac4014d9d968b320cfe423205bda9b",
+      "tests/ut/ir/transforms/test_nested_sync_repetition.py": "ff2a98385e30b24803858b942e19b20c810cf761ac505b8da7e0fe44b6962702",
+      "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "412deb95fec4af136a0dfd518be8fcda0b58aa95f5ec0e086141ab1e5e822805",
+      "tests/ut/ir/transforms/test_qwen_prefill_production.py": "7a93b1a4debc25b669cbcf9615326fea6a0172c811600b5f27186f35e2cacfaa",
+      "tests/ut/ir/transforms/test_scoped_physical_sync.py": "e46a5d888d2c71e14f1458c30a6d8b7fa30339acc37b177d9849f2bfcf96cf5a"
+    },
+    "device": "Not run",
+    "note": "Historical M5 receipts remain unchanged above; this records later typing and navigation qualification.",
+    "workspace_receipt": "build-py314/pr3381-review/check-fixes-receipt.json",
+    "native_m5_source_hashes_unchanged_before_commit_cleanup": true,
+    "commit_cleanup": "Direct includes, private header guards, explicit braces, Boolean cast, Markdown alignment and stale documentation; no algorithm changes."
+  }
+}

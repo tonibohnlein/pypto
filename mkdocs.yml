@@ -312,6 +312,7 @@ nav:
           - en/dev/ir/15-physical-demand-realization.md
           - en/dev/ir/16-parameterized-prefill-checkpoint.md
           - en/dev/ir/17-buffered-pipeline-checkpoint.md
+          - en/dev/ir/18-qwen-prefill-pipeline.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md

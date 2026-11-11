@@ -16,19 +16,18 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
-#include "numerical_sync_hierarchy.h"
 #include "pypto/core/logging.h"
-#include "rotating_sync_analysis.h"
+#include "src/ir/transforms/utils/numerical_sync_hierarchy.h"
+#include "src/ir/transforms/utils/rotating_sync_analysis.h"
 namespace pypto::ir::sync {
 namespace {
-struct Atom {
-  size_t storage;
-  int64_t row, column, rows, columns;
-};
+using Atom = SyncStorageClass;
 bool Intersects(const SyncAccess& a, const Atom& c, int64_t i) {
   const auto r = __int128(a.row) + __int128(i) * a.row_step;
   const auto s = __int128(a.column) + __int128(i) * a.column_step;
@@ -88,6 +87,32 @@ std::optional<std::pair<int64_t, int64_t>> Visits(const SyncAccess& a, int64_t c
   restrict(col, a.column, a.column_step, a.columns);
   if (lo > hi) return std::nullopt;
   return std::make_pair(lo, hi);
+}
+// Exact first/last matching coordinates in a repeated rectangular visit box.
+// Only its innermost coordinate moves the read footprint; enclosing coordinates
+// repeat the same generation. Min/max outer corners preserve the original
+// mixed-radix identity without treating gaps between inner ranges as accesses.
+std::optional<std::pair<int64_t, int64_t>> PointVisits(const SyncAccess& access, const SyncSegment& segment,
+                                                       int64_t row, int64_t column) {
+  if (!segment.count) return std::nullopt;
+  if (access.coordinate_frame && !segment.nested_frames.empty()) {
+    int64_t stride = 1;
+    for (auto frame = segment.nested_frames.rbegin(); frame != segment.nested_frames.rend(); ++frame) {
+      if (frame->loop == access.coordinate_frame) {
+        auto visits = Visits(access, frame->count, row, column);
+        if (!visits) return std::nullopt;
+        return std::make_pair(visits->first * stride,
+                              segment.count - 1 - (frame->count - 1 - visits->second) * stride);
+      }
+      INTERNAL_CHECK(!__builtin_mul_overflow(stride, frame->count, &stride))
+          << "Internal error: access coordinate stride overflow";
+    }
+    INTERNAL_CHECK(false) << "Internal error: missing original access frame";
+  }
+  const auto scope = segment.reset_period ? segment.reset_period : segment.count;
+  auto visits = Visits(access, scope, row, column);
+  if (visits) visits->second += segment.count - scope;
+  return visits;
 }
 // Sparse occurrence counters retain whole-loop multiplicities, never visits.
 // Each access/site is indexed once; pair qualification costs logarithmic lookup.
@@ -164,7 +189,9 @@ class AccumulatorProtection {
 };
 CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
                             const AccumulatorProtection& protection, const std::vector<Atom>& atoms,
-                            size_t& inspected, size_t& class_tests, size_t& class_lookup_tests) {
+                            size_t& inspected, size_t& class_tests, size_t& class_lookup_tests,
+                            bool core_frontiers) {
+  const auto scope_count = segment.reset_period ? segment.reset_period : segment.count;
   FiniteSyncInput model;
   model.exact_accesses = true;
   for (size_t c = 0; c < atoms.size(); ++c) model.covered_cells.push_back(c);
@@ -173,6 +200,10 @@ CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
   for (const auto& site : segment.sites) {
     FiniteOccurrence occurrence{site.pipe, true, {}, {}};
     for (const auto& a : site.accesses) {
+      int64_t access_count = scope_count;
+      if (a.coordinate_frame)
+        for (const auto& frame : segment.nested_frames)
+          if (frame.loop == a.coordinate_frame) access_count = frame.count;
       const auto& directory = by_storage.at(a.storage);
       auto begin = directory.begin(), end = directory.end();
       // Partition emits rows, then ordered disjoint column intervals. A single
@@ -196,10 +227,10 @@ CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
         const auto& atom = atoms[c];
         if (atom.storage != a.storage) continue;
         bool first = Intersects(a, atom, 0),
-             last = Intersects(a, atom, std::max<int64_t>(0, segment.count - 1));
+             last = Intersects(a, atom, std::max<int64_t>(0, access_count - 1));
         // Nonnegative affine coordinates yield a single interval of intersecting
         // visits. Check the full interval, not just equal endpoint samples.
-        int64_t lo = 0, hi = std::max<int64_t>(0, segment.count - 1);
+        int64_t lo = 0, hi = std::max<int64_t>(0, access_count - 1);
         auto intersect_axis = [&](int64_t x, int64_t extent, int64_t origin, int64_t stride, int64_t size) {
           const __int128 lower = __int128(x) - size + 1 - origin;
           const __int128 upper = __int128(x) + extent - 1 - origin;
@@ -239,6 +270,7 @@ CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
   };
   CompactSegmentResult result;
   result.count = segment.count;
+  result.internal_scope_count = segment.original_loop ? scope_count : 1;
   result.body = AnalyzeFiniteSync(model);
   const size_t m = model.occurrences.size();
   for (const auto& site : segment.sites) result.pipes.push_back(site.pipe);
@@ -263,6 +295,11 @@ CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
   if (m) {
     result.generators = families(witness.generators);
     result.demands = families(witness.demands);
+  }
+  if (core_frontiers) {
+    result.core_frontiers = true;
+    result.quotient_edges = BuildPeriodicCoreFrontiers(result);
+    return result;
   }
   // Weighted periodic event graph. A path's weight is the visit displacement.
   // Native wrap wires allow padding a path by any number of full visits at
@@ -305,7 +342,7 @@ CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
 std::optional<__int128> CompactSegmentResult::Threshold(size_t source, bool sc, size_t target,
                                                         bool tc) const {
   CHECK(source < pipes.size() && target < pipes.size()) << "Invalid compact event type";
-  if (!rotating) {
+  if (!rotating && !core_frontiers) {
     if (!distance.empty()) {
       const auto value = distance[2 * source + sc][2 * target + tc];
       return value < 0 ? std::nullopt : std::optional<int64_t>(value);
@@ -355,6 +392,39 @@ bool CompactSyncResult::Path(size_t a, size_t b, std::optional<std::pair<size_t,
   }
   return false;
 }
+CompactSyncResult AnalyzeInvariantSyncLeaves(CompactSyncInput input) {
+  CompactSyncResult result;
+  result.input = std::move(input);
+  using Clock = std::chrono::steady_clock;
+  auto begin = Clock::now();
+  result.storage_access_index.resize(result.input.storage.size());
+  for (size_t r = 0; r < result.input.segments.size(); ++r) {
+    const auto& segment = result.input.segments[r];
+    for (size_t s = 0; s < segment.sites.size(); ++s)
+      for (size_t a = 0; a < segment.sites[s].accesses.size(); ++a) {
+        const auto& access = segment.sites[s].accesses[a];
+        auto& index = result.storage_access_index.at(access.storage);
+        index.accesses.emplace_back(r, s, a);
+        index.written |= access.write;
+        index.enclosing_motion |= access.coordinate_frame && access.coordinate_frame != segment.original_loop;
+      }
+  }
+  auto atoms = Partition(result.input);
+  result.cells = atoms.size();
+  result.storage_classes = atoms;
+  auto partitioned = Clock::now();
+  result.partition_seconds = std::chrono::duration<double>(partitioned - begin).count();
+  AccumulatorProtection protection(result.input);
+  for (size_t r = 0; r < result.input.segments.size(); ++r)
+    result.segments.push_back(Reduce(result.input.segments[r], r, protection, atoms,
+                                     result.analyzed_occurrences, result.class_tests,
+                                     result.class_lookup_tests, result.input.region_tree.has_value()));
+  if (result.input.region_tree)
+    for (auto& segment : result.segments) segment.count = segment.internal_scope_count;
+  auto reduced = Clock::now();
+  result.reduction_seconds = std::chrono::duration<double>(reduced - partitioned).count();
+  return result;
+}
 CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& composition_order) {
   CHECK(composition_order == "balanced" || composition_order == "left" || composition_order == "right")
       << "Unknown numerical composition order";
@@ -366,29 +436,20 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
           });
         });
       });
+  if (input.region_tree) return AnalyzeNumericalSync(std::move(input), composition_order);
   if (rotating)
     return input.segments.size() > 1 ||
                    (!input.segments.empty() && !input.segments.front().nested_frames.empty())
                ? AnalyzeNumericalSync(std::move(input), composition_order)
                : AnalyzeRotatingSync(std::move(input));
-  CompactSyncResult result;
-  result.input = std::move(input);
+  auto result = AnalyzeInvariantSyncLeaves(std::move(input));
+  const auto& atoms = result.storage_classes;
   using Clock = std::chrono::steady_clock;
-  auto begin = Clock::now();
-  auto atoms = Partition(result.input);
-  result.cells = atoms.size();
-  auto partitioned = Clock::now();
-  result.partition_seconds = std::chrono::duration<double>(partitioned - begin).count();
-  AccumulatorProtection protection(result.input);
-  for (size_t r = 0; r < result.input.segments.size(); ++r)
-    result.segments.push_back(Reduce(result.input.segments[r], r, protection, atoms,
-                                     result.analyzed_occurrences, result.class_tests,
-                                     result.class_lookup_tests));
-  auto reduced = Clock::now();
-  result.reduction_seconds = std::chrono::duration<double>(reduced - partitioned).count();
+  const auto reduced = Clock::now();
   // A single region already owns all queries and boundaries. Keep the
   // concrete numerical fast path free of a redundant all-pairs port graph.
   if (result.segments.size() == 1) return result;
+  AccumulatorProtection protection(result.input);
   // A child is contiguous. Crossings can only touch its first/last storage
   // accesses; queries through a child use its retained periodic event graph.
   for (size_t r = 0; r < result.segments.size(); ++r) {
@@ -489,14 +550,16 @@ bool CompactSyncResult::Precedes(const Occurrence& a, bool sc, const Occurrence&
 std::optional<PointBoundary> CompactSyncResult::Boundary(size_t storage, int64_t row, int64_t column) const {
   return BoundaryAt(storage, row, column, {});
 }
-std::optional<PointBoundary> CompactSyncResult::BoundaryAt(
-    size_t storage, int64_t row, int64_t column, const std::map<size_t, int64_t>& parameters) const {
+std::optional<PointBoundary> CompactSyncResult::BoundaryAt(size_t storage, int64_t row, int64_t column,
+                                                           const std::map<size_t, int64_t>& parameters,
+                                                           std::optional<int64_t> block_index) const {
   if (storage >= input.storage.size() || input.storage[storage].slot_count != 1) return std::nullopt;
-  return BoundarySlot(storage, 0, row, column, parameters);
+  return BoundarySlot(storage, 0, row, column, parameters, block_index);
 }
-std::optional<PointBoundary> CompactSyncResult::BoundarySlot(
-    size_t storage, int64_t slot, int64_t row, int64_t column,
-    const std::map<size_t, int64_t>& parameters) const {
+std::optional<PointBoundary> CompactSyncResult::BoundarySlot(size_t storage, int64_t slot, int64_t row,
+                                                             int64_t column,
+                                                             const std::map<size_t, int64_t>& parameters,
+                                                             std::optional<int64_t> block_index) const {
   if (storage >= input.storage.size() || slot < 0 || slot >= input.storage[storage].slot_count)
     return std::nullopt;
   const auto& domain = input.storage[storage];
@@ -525,16 +588,49 @@ std::optional<PointBoundary> CompactSyncResult::BoundarySlot(
   };
   auto r = shift(domain.row_parameters), c = shift(domain.column_parameters);
   if (!r || !c) return std::nullopt;
+  if (domain.row_block || domain.column_block) {
+    if (!block_index || !input.block_bounds || *block_index < input.block_bounds->first ||
+        *block_index > input.block_bounds->second)
+      return std::nullopt;
+    const auto coordinate = *block_index - input.block_bounds->first;
+    const auto row_shift = __int128(*r) + __int128(domain.row_block) * coordinate;
+    const auto column_shift = __int128(*c) + __int128(domain.column_block) * coordinate;
+    if (row_shift > std::numeric_limits<int64_t>::max() || column_shift > std::numeric_limits<int64_t>::max())
+      return std::nullopt;
+    r = static_cast<int64_t>(row_shift);
+    c = static_cast<int64_t>(column_shift);
+  }
   // The original domain is covered, but this invocation accesses only its
   // translated footprint. A point before that footprint is proven absent.
   if (row < *r || column < *c) return PointBoundary{};
+  if (hierarchy && input.region_tree) {
+    const auto& index = storage_access_index.at(storage);
+    if (index.enclosing_motion) {
+      if (index.written) return std::nullopt;  // No invented absence for an unsupported selector.
+      PointBoundary out;
+      for (const auto& [leaf, site, access_index] : index.accesses) {
+        ++point_selector_access_visits;
+        const auto& segment = input.segments[leaf];
+        const auto& access = segment.sites[site].accesses[access_index];
+        auto visits = PointVisits(access, segment, row - *r, column - *c);
+        if (!visits) continue;
+        const auto pipe = static_cast<size_t>(segment.sites[site].pipe);
+        const Occurrence first{leaf, visits->first, site}, last{leaf, visits->second, site};
+        if (!out.first_readers[pipe] || Precedes(first, false, *out.first_readers[pipe], false))
+          out.first_readers[pipe] = first;
+        if (!out.last_readers[pipe] || Precedes(*out.last_readers[pipe], false, last, false))
+          out.last_readers[pipe] = last;
+      }
+      return out;
+    }
+  }
   if (hierarchy) return QueryNumericalBoundary(*this, storage, slot, row - *r, column - *c);
   if (segments.size() == 1 && segments.front().rotating)
     return RotatingBoundary(input, segments.front(), storage, slot, row - *r, column - *c);
   return RelativeBoundary(storage, row - *r, column - *c);
 }
-std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage, int64_t row,
-                                                                 int64_t column) const {
+std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage, int64_t row, int64_t column,
+                                                                 std::optional<size_t> leaf) const {
   if (storage >= input.storage.size() || row < 0 || column < 0 || row >= input.storage[storage].rows ||
       column >= input.storage[storage].columns)
     return std::nullopt;
@@ -546,18 +642,21 @@ std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage,
     PipeType pipe;
   };
   std::vector<Range> ranges;
-  for (size_t r = 0; r < input.segments.size(); ++r)
+  for (size_t r = leaf.value_or(0); r < (leaf ? *leaf + 1 : input.segments.size()); ++r)
     for (size_t s = 0; s < input.segments[r].sites.size(); ++s) {
       const auto& site = input.segments[r].sites[s];
       for (const auto& a : site.accesses)
         if (a.storage == storage) {
-          auto v = Visits(a, input.segments[r].count, row, column);
+          auto visits = [&](const SyncAccess& access) {
+            return leaf ? Visits(access, segments[r].internal_scope_count, row, column)
+                        : PointVisits(access, input.segments[r], row, column);
+          };
+          auto v = visits(a);
           if (!v) continue;
           // A read-modify-write contributes a writer, not a read-only boundary.
           bool rmw =
               !a.write && std::any_of(site.accesses.begin(), site.accesses.end(), [&](const SyncAccess& w) {
-                return w.write && w.storage == storage &&
-                       Visits(w, input.segments[r].count, row, column).has_value();
+                return w.write && w.storage == storage && visits(w).has_value();
               });
           if (rmw) continue;
           ranges.push_back({r, s, v->first, v->second, a.write, site.pipe});
@@ -580,8 +679,41 @@ std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage,
     }
   return out;
 }
+PointBoundary CompactSyncResult::LeafBoundary(size_t region, size_t storage, int64_t row,
+                                              int64_t column) const {
+  CHECK(region < segments.size()) << "Invalid compact leaf";
+  for (const auto& site : input.segments[region].sites)
+    for (const auto& access : site.accesses)
+      CHECK(access.storage != storage || !access.coordinate_frame ||
+            access.coordinate_frame == input.segments[region].original_loop)
+          << "Leaf point selector requires its enclosing occurrence binding";
+  auto result = RelativeBoundary(storage, row, column, region);
+  CHECK(result) << "Leaf storage point outside the supplied domain";
+  return *result;
+}
 std::optional<std::vector<Crossing>> CompactSyncResult::ExportCrossingDemands() const {
   return ExportNumericalCrossings(*this);
+}
+std::shared_ptr<const ScopedSyncDemands> CompactSyncResult::ExportScopedDemands() const {
+  if (!scoped_demands_) {
+    scoped_demands_ = ExportNumericalScopedDemands(*this);
+    if (scoped_demands_) ++scoped_export_builds;
+  }
+  return scoped_demands_;
+}
+bool CompactSyncResult::ScopedConsecutiveReuse(size_t family) const {
+  if (auto found = scoped_reuse_.find(family); found != scoped_reuse_.end()) {
+    return found->second;
+  }
+  const bool certified = CertifyNumericalConsecutiveReuse(*this, family);
+  scoped_reuse_.emplace(family, certified);
+  return certified;
+}
+bool CompactSyncResult::ScopedAdjacentBarrier(size_t family) const {
+  return CertifyNumericalAdjacentBarrier(*this, family);
+}
+bool CompactSyncResult::ReferenceBefore(const Occurrence& a, const Occurrence& b) const {
+  return hierarchy ? NumericalReferenceBefore(*this, a, b) : a < b;
 }
 std::vector<Crossing> CompactSyncResult::ExpandRetainedDemands(size_t max_payloads) const {
   return ExpandNumericalDemands(*this, max_payloads);

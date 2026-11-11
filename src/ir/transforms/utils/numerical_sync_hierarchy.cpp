@@ -9,19 +9,24 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "numerical_sync_hierarchy.h"
+#include "src/ir/transforms/utils/numerical_sync_hierarchy.h"
 
 #include <algorithm>
 #include <chrono>
 #include <functional>
 #include <limits>
+#include <map>
+#include <memory>
 #include <numeric>
 #include <set>
+#include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
-#include "numerical_sync_merge.h"
 #include "pypto/core/logging.h"
-#include "rotating_sync_analysis.h"
+#include "src/ir/transforms/utils/numerical_sync_merge.h"
+#include "src/ir/transforms/utils/rotating_sync_analysis.h"
 namespace pypto::ir::sync {
 namespace {
 using Ordinal = NumericalOrdinal;
@@ -45,8 +50,10 @@ int64_t Mod(Ordinal value, int64_t modulus) {
   return static_cast<int64_t>(residue < 0 ? residue + modulus : residue);
 }
 NumericalBoundary LeafBoundary(const CompactSyncResult& result, size_t leaf, const NumericalCell& cell) {
-  const auto selected = RotatingBoundary(result.input, result.segments[leaf], cell.storage, cell.slot,
-                                         cell.row, cell.column, leaf);
+  const auto selected = result.segments[leaf].rotating
+                            ? RotatingBoundary(result.input, result.segments[leaf], cell.storage, cell.slot,
+                                               cell.row, cell.column, leaf)
+                            : result.LeafBoundary(leaf, cell.storage, cell.row, cell.column);
   const size_t sites = result.input.segments[leaf].sites.size();
   auto ordinal = [&](const std::optional<Occurrence>& occurrence) -> std::optional<Ordinal> {
     if (!occurrence) return std::nullopt;
@@ -139,13 +146,45 @@ NodePtr BuildLeaf(CompactSyncResult& result, const std::vector<NumericalCell>& c
   const auto& input = result.input.segments[leaf];
   const auto count = result.segments[leaf].internal_scope_count;
   node->length = Length(count, input.sites.size());
-  for (const auto& cell : cells) node->storage.push_back(LeafBoundary(result, leaf, cell));
+  for (size_t c = 0; c < cells.size(); ++c) {
+    if (result.segments[leaf].rotating) {
+      node->storage.push_back(LeafBoundary(result, leaf, cells[c]));
+    } else {
+      // Composition consumes exact conflict-class boundaries. A moving read
+      // can intersect a whole-write class without touching its representative
+      // point; point selectors below must NOT replace this class summary.
+      const auto boundary = result.segments[leaf].body.Boundary(c);
+      INTERNAL_CHECK(boundary) << "Invariant leaf omitted a supplied class";
+      NumericalBoundary out;
+      auto at = [&](const std::optional<size_t>& site, bool last) -> std::optional<Ordinal> {
+        return site && count
+                   ? std::optional<Ordinal>(Length(last ? count - 1 : 0, input.sites.size()) + *site)
+                   : std::nullopt;
+      };
+      out.first_writer = at(boundary->first_writer, false);
+      out.last_writer = at(boundary->last_writer, true);
+      for (size_t p = 0; p < kPipeCount; ++p) {
+        out.first_readers[p] = at(boundary->first_readers[p], false);
+        out.last_readers[p] = at(boundary->last_readers[p], true);
+      }
+      node->storage.push_back(out);
+    }
+  }
   if (count) {
     for (size_t s = 0; s < input.sites.size(); ++s) {
       const auto p = input.sites[s].pipe;
+      node->native_sites[p].push_back(s);
       if (!node->first[p]) node->first[p] = s;
       node->last[p] = Length(count - 1, input.sites.size()) + s;
     }
+  }
+  const auto matrix = static_cast<size_t>(PipeType::M);
+  if (node->first[matrix]) {
+    const auto first_site = static_cast<size_t>(*node->first[matrix] % input.sites.size());
+    const auto last_site = static_cast<size_t>(*node->last[matrix] % input.sites.size());
+    const auto& first = input.sites[first_site];
+    if (!first.initializes_accumulator) node->first_m_continuation = first.protected_accumulator;
+    node->last_m_qualified = input.sites[last_site].protected_accumulator;
   }
   for (const auto& event : NumericalPorts(*node, result.port_normalization_visits)) {
     const auto site = static_cast<size_t>(event.first % input.sites.size());
@@ -171,13 +210,16 @@ NodePtr BuildLeaf(CompactSyncResult& result, const std::vector<NumericalCell>& c
   CountNumericalInterface(*node, result);
   return node;
 }
-NodePtr Repeat(NodePtr body, int64_t count, CompactSyncResult& result) {
+NodePtr Repeat(NodePtr body, int64_t count, CompactSyncResult& result, NodePtr* seam = nullptr) {
   NodePtr output = std::make_shared<Node>();
   if (!count || !body->length) return output;
   while (count) {
     if (count & 1) output = MergeNumericalNodes(output, body, result);
     count /= 2;
-    if (count) body = MergeNumericalNodes(body, body, result);
+    if (count) {
+      body = MergeNumericalNodes(body, body, result);
+      if (seam && !*seam) *seam = body;
+    }
   }
   return output;
 }
@@ -199,7 +241,119 @@ NodePtr Compose(const std::vector<NodePtr>& nodes, size_t begin, size_t end, con
   return MergeNumericalNodes(Compose(nodes, begin, middle, order, result),
                              Compose(nodes, middle, end, order, result), result);
 }
+NumericalSourceLayout BuildSourceLayout(const SyncRegion& source, CompactSyncResult& result,
+                                        std::set<size_t>& leaves) {
+  ++result.source_region_nodes;
+  NumericalSourceLayout out;
+  if (source.leaf) {
+    CHECK(source.children.empty() && !source.repetition && *source.leaf < result.segments.size())
+        << "Invalid source region leaf";
+    CHECK(leaves.insert(*source.leaf).second) << "Source leaf has more than one original occurrence path";
+    out.leaf = source.leaf;
+    out.length = out.body_length = Length(result.segments[*source.leaf].internal_scope_count,
+                                          result.input.segments[*source.leaf].sites.size());
+  } else {
+    if (source.repetition) {
+      CHECK(source.repetition->count >= 0) << "Negative source repetition count";
+      out.count = source.repetition->count;
+      out.frame = source.repetition->loop;
+    }
+    out.offsets.push_back(0);
+    for (const auto& child : source.children) {
+      out.children.push_back(BuildSourceLayout(child, result, leaves));
+      out.body_length = NumericalAdd(out.body_length, out.children.back().length);
+      out.offsets.push_back(out.body_length);
+    }
+    CHECK(!__builtin_mul_overflow(out.body_length, Ordinal(out.count), &out.length))
+        << "Source repetition length exceeds wide range";
+  }
+  return out;
+}
+void IndexSourcePaths(const NumericalSourceLayout& source, NumericalOccurrencePath& path,
+                      NumericalSyncHierarchy& hierarchy, CompactSyncResult& result) {
+  if (source.leaf) {
+    const auto leaf = *source.leaf;
+    path.frames.emplace_back(result.segments[leaf].internal_scope_count,
+                             result.input.segments[leaf].sites.size());
+    Ordinal visits = 1;
+    for (const auto& [count, stride] : path.frames) {
+      CHECK(!__builtin_mul_overflow(visits, Ordinal(count), &visits)) << "Source visit count overflow";
+    }
+    CHECK(visits == result.input.segments[leaf].count) << "Source path disagrees with leaf visit inventory";
+    result.source_coordinate_entries += path.frames.size();
+    hierarchy.source_paths.at(leaf) = path;
+    path.frames.pop_back();
+    return;
+  }
+  const auto first = path.first;
+  path.frames.emplace_back(source.count, source.body_length);
+  for (size_t i = 0; i < source.children.size(); ++i) {
+    path.first = NumericalAdd(first, source.offsets[i]);
+    IndexSourcePaths(source.children[i], path, hierarchy, result);
+  }
+  path.frames.pop_back();
+  path.first = first;
+}
+NodePtr BuildSourceNode(const SyncRegion& source, NumericalSourceLayout& layout,
+                        const std::vector<NodePtr>& leaves, const std::string& order,
+                        CompactSyncResult& result) {
+  if (source.leaf) {
+    layout.body = layout.summary = leaves.at(*source.leaf);
+    return layout.summary;
+  }
+  std::vector<NodePtr> children;
+  for (size_t i = 0; i < source.children.size(); ++i)
+    children.push_back(BuildSourceNode(source.children[i], layout.children[i], leaves, order, result));
+  auto body = Compose(children, 0, children.size(), order, result);
+  layout.body = body;
+  if (source.startup && source.repetition && source.repetition->count > 1 && body->length) {
+    const auto [leaf, site] = *source.startup;
+    const auto& initializer = result.input.segments[leaf].sites[site];
+    // First-touch qualification proves that the first RMW read has no internal
+    // predecessor, so the rows/covers are identical. Only incoming footprint
+    // protection differs. Keep the startup node immutable, including when the
+    // enclosing invocation repeats or a summary is shared by binary doubling.
+    // An empty initializer leaf cannot establish a continuation entry.
+    if (result.segments[leaf].internal_scope_count) {
+      auto continuation = std::make_shared<Node>(*body);
+      continuation->first_m_continuation = initializer.protected_accumulator;
+      auto tail = Repeat(continuation, source.repetition->count - 1, result, &layout.seam);
+      layout.summary = MergeNumericalNodes(body, tail, result);
+      // With only two visits the final merge is the seam. Otherwise the
+      // continuation double already supplies it: startup and continuation
+      // have identical internal rows, exit evidence and storage boundaries.
+      // Only their incoming first-M qualification differs, irrelevant on the
+      // seam's left side. The right side is continuation in either case.
+      if (!layout.seam) layout.seam = layout.summary;
+      return layout.summary;
+    }
+  }
+  layout.summary = source.repetition ? Repeat(body, source.repetition->count, result, &layout.seam) : body;
+  return layout.summary;
+}
+Occurrence DecodeSource(const CompactSyncResult& result, Ordinal ordinal) {
+  const auto* node = &*result.hierarchy->source_layout;
+  CHECK(ordinal >= 0 && ordinal < node->length) << "Invalid original source occurrence ordinal";
+  Ordinal visit = 0;
+  while (!node->leaf) {
+    INTERNAL_CHECK(node->body_length) << "Nonempty source use has an empty body";
+    visit = visit * node->count + ordinal / node->body_length;
+    ordinal %= node->body_length;
+    const auto upper = std::upper_bound(node->offsets.begin(), node->offsets.end(), ordinal);
+    INTERNAL_CHECK(upper != node->offsets.begin() && upper != node->offsets.end())
+        << "Invalid source child position";
+    const auto index = static_cast<size_t>(upper - node->offsets.begin() - 1);
+    ordinal -= node->offsets[index];
+    node = &node->children[index];
+  }
+  const auto leaf = *node->leaf;
+  const auto sites = result.input.segments[leaf].sites.size();
+  visit = visit * result.segments[leaf].internal_scope_count + ordinal / sites;
+  CHECK(visit < result.input.segments[leaf].count) << "Decoded source visit outside original frame";
+  return {leaf, static_cast<int64_t>(visit), static_cast<size_t>(ordinal % sites)};
+}
 Occurrence Decode(const CompactSyncResult& result, Ordinal ordinal) {
+  if (result.hierarchy->source_layout) return DecodeSource(result, ordinal);
   const auto& offsets = result.hierarchy->segment_offsets;
   const auto upper = std::upper_bound(offsets.begin(), offsets.end(), ordinal);
   CHECK(upper != offsets.begin() && upper != offsets.end()) << "Invalid numerical occurrence ordinal";
@@ -216,6 +370,18 @@ Ordinal Encode(const CompactSyncResult& result, const Occurrence& occurrence) {
   const auto& segment = result.input.segments[region];
   CHECK(visit >= 0 && visit < segment.count && site < segment.sites.size())
       << "Invalid numerical synchronization occurrence";
+  if (result.hierarchy->source_layout) {
+    const auto& path = result.hierarchy->source_paths[region];
+    auto ordinal = NumericalAdd(path.first, site);
+    auto remaining = visit;
+    for (auto frame = path.frames.rbegin(); frame != path.frames.rend(); ++frame) {
+      CHECK(frame->first > 0) << "Occurrence in an empty original frame";
+      ordinal = NumericalAdd(ordinal, Ordinal(remaining % frame->first) * frame->second);
+      remaining /= frame->first;
+    }
+    CHECK(!remaining) << "Occurrence exceeds original coordinate arity";
+    return ordinal;
+  }
   return NumericalAdd(result.hierarchy->segment_offsets[region], Length(visit, segment.sites.size()) + site);
 }
 void ExpandNodeDemands(const CompactSyncResult& result, const NodePtr& node, Ordinal offset,
@@ -258,6 +424,111 @@ void ExportNodeCrossings(const CompactSyncResult& result, const NodePtr& node, O
     out.emplace_back(Decode(result, a), Decode(result, b));
   }
 }
+// Export the unshared SOURCE tree once. A record's Cartesian axes name original
+// loops; per-leaf strides encode the different numbers of inner visits on each
+// side. Never walk every occurrence of a shared binary-repeat summary.
+class ScopedExporter {
+  struct Axis {
+    ForStmtPtr frame;
+    int64_t count;
+  };
+  const CompactSyncResult& result_;
+  std::shared_ptr<ScopedSyncDemands> output_ = std::make_shared<ScopedSyncDemands>();
+  std::vector<std::map<const ForStmt*, int64_t>> strides_;
+  std::vector<Axis> axes_;
+
+  void Record(Ordinal source, Ordinal target) {
+    ScopedDemandFamily family{DecodeSource(result_, source), DecodeSource(result_, target), {}};
+    const auto sr = std::get<0>(family.source), tr = std::get<0>(family.target);
+    for (const auto& axis : axes_) {
+      INTERNAL_CHECK(axis.count > 0) << "Internal error: empty scoped demand domain";
+      family.axes.push_back({axis.frame, axis.count, strides_.at(sr).at(axis.frame.get()),
+                             strides_.at(tr).at(axis.frame.get())});
+      ++output_->coordinate_entries;
+    }
+    // Both maps must be injective. Otherwise publication multiplicity needs a
+    // different matching contract, not a first-label or first-endpoint shortcut.
+    Ordinal source_span = 0, target_span = 0;
+    for (auto axis = family.axes.rbegin(); axis != family.axes.rend(); ++axis) {
+      INTERNAL_CHECK(axis->source_stride > source_span && axis->target_stride > target_span)
+          << "Internal error: noninjective scoped endpoint map";
+      source_span += Ordinal(axis->count - 1) * axis->source_stride;
+      target_span += Ordinal(axis->count - 1) * axis->target_stride;
+    }
+    INTERNAL_CHECK(Ordinal(std::get<1>(family.source)) + source_span < result_.input.segments[sr].count &&
+                   Ordinal(std::get<1>(family.target)) + target_span < result_.input.segments[tr].count)
+        << "Internal error: scoped endpoint exceeds original invocation domain";
+    output_->families.push_back(std::move(family));
+  }
+  void Crossings(const NodePtr& node, Ordinal offset) {
+    if (!node->left) return;
+    ++output_->visited_merge_nodes;
+    const auto right = NumericalAdd(offset, node->left->length);
+    for (const auto& crossing : node->crossings) {
+      if (crossing.native) continue;
+      Record(NumericalAdd(offset, node->left->chains[crossing.source.first][crossing.source.second]),
+             NumericalAdd(right, node->right->chains[crossing.target.first][crossing.target.second]));
+    }
+  }
+  void Sequence(const NodePtr& node, Ordinal offset, const std::set<const Node*>& children) {
+    if (!node->length || children.count(node.get()) || !node->left) return;
+    Sequence(node->left, offset, children);
+    Sequence(node->right, NumericalAdd(offset, node->left->length), children);
+    Crossings(node, offset);
+  }
+  void Visit(const NumericalSourceLayout& source, Ordinal offset) {
+    ++output_->visited_source_nodes;
+    if (!source.length) return;
+    if (source.leaf) {
+      const auto leaf = *source.leaf;
+      const auto& segment = result_.input.segments[leaf];
+      const auto& analysis = result_.segments[leaf];
+      for (const auto& demand : analysis.demands) {
+        const auto count = analysis.internal_scope_count - demand.distance;
+        if (count <= 0) continue;
+        if (segment.original_loop) axes_.push_back({segment.original_loop, count});
+        Record(NumericalAdd(offset, demand.source),
+               NumericalAdd(offset, Length(demand.distance, segment.sites.size()) + demand.target));
+        if (segment.original_loop) axes_.pop_back();
+      }
+      return;
+    }
+    if (source.frame) axes_.push_back({source.frame, source.count});
+    std::set<const Node*> child_summaries;
+    for (size_t i = 0; i < source.children.size(); ++i) {
+      child_summaries.insert(source.children[i].summary.get());
+      Visit(source.children[i], NumericalAdd(offset, source.offsets[i]));
+    }
+    // Use complete retained sequence merges. An untouched/empty sibling can
+    // carry obligations from a more distant preceding child.
+    Sequence(source.body, offset, child_summaries);
+    if (source.frame) axes_.pop_back();
+    if (source.count > 1) {
+      INTERNAL_CHECK(source.frame && source.seam) << "Internal error: missing retained repeat seam";
+      axes_.push_back({source.frame, source.count - 1});
+      Crossings(source.seam, offset);
+      axes_.pop_back();
+    }
+  }
+
+ public:
+  explicit ScopedExporter(const CompactSyncResult& result) : result_(result) {
+    for (const auto& segment : result.input.segments) {
+      strides_.emplace_back();
+      Ordinal stride = 1;
+      for (auto frame = segment.nested_frames.rbegin(); frame != segment.nested_frames.rend(); ++frame) {
+        INTERNAL_CHECK(stride <= std::numeric_limits<int64_t>::max())
+            << "Internal error: source coordinate stride overflow";
+        strides_.back().emplace(frame->loop.get(), static_cast<int64_t>(stride));
+        stride *= frame->count;
+      }
+    }
+  }
+  std::shared_ptr<const ScopedSyncDemands> Run() {
+    Visit(*result_.hierarchy->source_layout, 0);
+    return output_;
+  }
+};
 Row EmptyForward(const Node& node) {
   Row out;
   for (size_t c = 0; c < kNumericalChains; ++c) out[c] = node.chains[c].size();
@@ -302,9 +573,9 @@ Row ProjectForward(const Node& node, const Row& left, const Row& right) {
     const auto& l = node.left_projection[c];
     const auto& r = node.right_projection[c];
     const auto lp = std::lower_bound(l.begin(), l.end(), left[c]);
-    if (lp != l.end())
+    if (lp != l.end()) {
       out[c] = lp - l.begin();
-    else {
+    } else {
       const auto rp = std::lower_bound(r.begin(), r.end(), right[c]);
       if (rp != r.end()) out[c] = l.size() + (rp - r.begin());
     }
@@ -317,9 +588,9 @@ Row ProjectReverse(const Node& node, const Row& left, const Row& right) {
     const auto& l = node.left_projection[c];
     const auto& r = node.right_projection[c];
     const auto rp = std::upper_bound(r.begin(), r.end(), right[c]);
-    if (rp != r.begin())
+    if (rp != r.begin()) {
       out[c] = l.size() + (rp - r.begin()) - 1;
-    else {
+    } else {
       const auto lp = std::upper_bound(l.begin(), l.end(), left[c]);
       if (lp != l.begin()) out[c] = (lp - l.begin()) - 1;
     }
@@ -348,11 +619,13 @@ Row Reachable(const CompactSyncResult& result, const NodePtr& node, Ordinal even
     left = Reachable(result, node->left, event, completion);
     const auto entered = AcrossForward(*node, left, result);
     for (size_t c = 0; c < kNumericalChains; ++c)
-      if (entered[c] < static_cast<int64_t>(node->right->chains[c].size()))
+      if (entered[c] < static_cast<int64_t>(node->right->chains[c].size())) {
         for (size_t d = 0; d < kNumericalChains; ++d)
           right[d] = std::min(right[d], node->right->forward[c][entered[c]][d]);
-  } else
+      }
+  } else {
     right = Reachable(result, node->right, event - node->left->length, completion);
+  }
   return ProjectForward(*node, left, right);
 }
 Row Ancestors(const CompactSyncResult& result, const NodePtr& node, Ordinal event, bool completion) {
@@ -377,11 +650,13 @@ Row Ancestors(const CompactSyncResult& result, const NodePtr& node, Ordinal even
     right = Ancestors(result, node->right, event - node->left->length, completion);
     const auto entered = AcrossReverse(*node, right, result);
     for (size_t c = 0; c < kNumericalChains; ++c)
-      if (entered[c] >= 0)
+      if (entered[c] >= 0) {
         for (size_t d = 0; d < kNumericalChains; ++d)
           left[d] = std::max(left[d], node->left->reverse[c][entered[c]][d]);
-  } else
+      }
+  } else {
     left = Ancestors(result, node->left, event, completion);
+  }
   return ProjectReverse(*node, left, right);
 }
 bool Query(const CompactSyncResult& result, const NodePtr& node, Ordinal source, bool sc, Ordinal target,
@@ -418,25 +693,52 @@ NumericalBoundary Point(const CompactSyncResult& result, const NodePtr& node, co
 }  // namespace
 
 CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string& order) {
+  const bool structured = input.region_tree.has_value();
   CompactSyncResult result;
-  result.input = std::move(input);
+  if (structured) {
+    // The initial structured adapter accepts invariant conflict classes only.
+    // Slot geometry still needs its own scoped interface proof.
+    for (const auto& storage : input.storage)
+      CHECK(storage.slot_count == 1) << "Structured rotating source export is not yet qualified";
+    result = AnalyzeInvariantSyncLeaves(std::move(input));
+  } else {
+    result.input = std::move(input);
+    for (size_t r = 0; r < result.input.segments.size(); ++r) {
+      const auto& original = result.input.segments[r];
+      result.segments.push_back(AnalyzeRotatingSegment(result.input, r, Scope(original), result));
+      result.segments.back().repetitions = Repetitions(original);
+    }
+  }
   auto hierarchy = std::make_shared<NumericalSyncHierarchy>();
   hierarchy->segment_offsets.push_back(0);
-  for (size_t r = 0; r < result.input.segments.size(); ++r) {
-    const auto& original = result.input.segments[r];
-    result.segments.push_back(AnalyzeRotatingSegment(result.input, r, Scope(original), result));
-    result.segments.back().repetitions = Repetitions(original);
+  for (const auto& original : result.input.segments)
     hierarchy->segment_offsets.push_back(
         NumericalAdd(hierarchy->segment_offsets.back(), Length(original.count, original.sites.size())));
-  }
   const auto start = std::chrono::steady_clock::now();
-  hierarchy->cells = InterfaceCells(result);
+  if (structured) {
+    for (const auto& cell : result.storage_classes)
+      hierarchy->cells.push_back({cell.storage, 0, cell.row, cell.column});
+    result.interface_cells = hierarchy->cells.size();
+  } else {
+    hierarchy->cells = InterfaceCells(result);
+  }
   std::vector<NodePtr> nodes;
   for (size_t r = 0; r < result.segments.size(); ++r) {
     auto leaf = BuildLeaf(result, hierarchy->cells, r);
     nodes.push_back(Repeat(leaf, result.segments[r].repetitions, result));
   }
-  hierarchy->root = Compose(nodes, 0, nodes.size(), order, result);
+  if (structured) {
+    std::set<size_t> leaves;
+    hierarchy->source_layout = BuildSourceLayout(*result.input.region_tree, result, leaves);
+    CHECK(leaves.size() == result.segments.size()) << "Source tree omitted retained leaves";
+    hierarchy->source_paths.resize(result.segments.size());
+    NumericalOccurrencePath path;
+    IndexSourcePaths(*hierarchy->source_layout, path, *hierarchy, result);
+    hierarchy->root =
+        BuildSourceNode(*result.input.region_tree, *hierarchy->source_layout, nodes, order, result);
+  } else {
+    hierarchy->root = Compose(nodes, 0, nodes.size(), order, result);
+  }
   INTERNAL_CHECK(hierarchy->root->length == hierarchy->segment_offsets.back())
       << "Numerical repetition lost original occurrence coordinates";
   result.hierarchy = hierarchy;
@@ -445,6 +747,101 @@ CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string
   result.composition_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   return result;
+}
+bool NumericalReferenceBefore(const CompactSyncResult& result, const Occurrence& a, const Occurrence& b) {
+  return Encode(result, a) < Encode(result, b);
+}
+namespace {
+const ScopedDemandFamily* QualifiedScopedFamily(const CompactSyncResult& result, size_t family_index) {
+  // The immutable source layout is produced only by the invariant numerical
+  // constructor. It certifies equal internal event relations/exit rows across
+  // repeated uses, including first-touch startup, and the correct reset seams.
+  // Injective affine endpoint maps ALONE would not justify this translation.
+  if (!result.input.region_tree || !result.hierarchy || !result.hierarchy->source_layout) return nullptr;
+  const auto owned = result.ExportScopedDemands();
+  CHECK(owned && family_index < owned->families.size()) << "Invalid owned scoped family";
+  const auto& family = owned->families[family_index];
+  const auto& source = result.input.segments[std::get<0>(family.source)].nested_frames;
+  const auto& target = result.input.segments[std::get<0>(family.target)].nested_frames;
+  auto qualify = [&](const std::vector<SyncLoopFrame>& frames, int64_t base, bool publish) {
+    if (family.axes.size() > frames.size()) return false;
+    int64_t stride = 1;
+    for (size_t i = frames.size(); i-- > 0;) {
+      if (frames[i].count <= 0) return false;
+      const auto digit = base % frames[i].count;
+      base /= frames[i].count;
+      if (i < family.axes.size()) {
+        const auto& axis = family.axes[i];
+        if (axis.frame != frames[i].loop || axis.count <= 0 || axis.count > frames[i].count - digit ||
+            (publish ? axis.source_stride : axis.target_stride) != stride)
+          return false;
+        // All varying axes are the same original enclosing prefix. Only the
+        // innermost can be shifted/clipped (a leaf distance or adjacent seam).
+        if (i + 1 < family.axes.size() && (digit || axis.count != frames[i].count)) return false;
+      }
+      const auto product = __int128(stride) * frames[i].count;
+      if (product > std::numeric_limits<int64_t>::max()) return false;
+      stride = static_cast<int64_t>(product);
+    }
+    return base == 0;
+  };
+  if (!qualify(source, std::get<1>(family.source), true) ||
+      !qualify(target, std::get<1>(family.target), false))
+    return nullptr;
+  return &family;
+}
+std::optional<Ordinal> NativePrevious(const CompactSyncResult& result, const NodePtr& node, Ordinal at,
+                                      PipeType pipe) {
+  if (at <= 0 || !node->first[pipe]) return std::nullopt;
+  if (at >= node->length) return node->last[pipe];
+  if (!node->left) {
+    const auto sites = result.input.segments[node->leaf].sites.size();
+    const auto& positions = node->native_sites[pipe];
+    auto visit = at / sites;
+    const auto found = std::lower_bound(positions.begin(), positions.end(), static_cast<size_t>(at % sites));
+    if (found != positions.begin()) return visit * sites + *std::prev(found);
+    if (!visit) return std::nullopt;
+    return (visit - 1) * sites + positions.back();
+  }
+  if (at <= node->left->length) return NativePrevious(result, node->left, at, pipe);
+  const auto right = NativePrevious(result, node->right, at - node->left->length, pipe);
+  return right ? std::optional<Ordinal>(*right + node->left->length) : node->left->last[pipe];
+}
+}  // namespace
+bool CertifyNumericalAdjacentBarrier(const CompactSyncResult& result, size_t family_index) {
+  const auto family = QualifiedScopedFamily(result, family_index);
+  if (!family) return false;
+  const auto [sr, sv, ss] = family->source;
+  const auto [tr, tv, ts] = family->target;
+  const auto pipe = result.segments[sr].pipes[ss];
+  if (pipe != result.segments[tr].pipes[ts]) return false;
+  // Fixed presence and common original axes give identical affine native-rank
+  // coefficients for both endpoints. Thus their rank difference is invariant;
+  // adjacency at this base proves adjacency for the whole Cartesian family.
+  const auto previous = NativePrevious(result, result.hierarchy->root, Encode(result, family->target), pipe);
+  return previous && *previous == Encode(result, family->source);
+}
+bool CertifyNumericalConsecutiveReuse(const CompactSyncResult& result, size_t family_index) {
+  const auto qualified = QualifiedScopedFamily(result, family_index);
+  if (!qualified) return false;
+  const auto& family = *qualified;
+  int64_t lower_target = 0;
+  for (size_t j = family.axes.size(); j-- > 0;) {
+    if (family.axes[j].count == 1) continue;
+    auto consumed = family.target, next = family.source;
+    std::get<1>(consumed) += lower_target;
+    lower_target += (family.axes[j].count - 1) * family.axes[j].target_stride;
+    std::get<1>(next) += family.axes[j].source_stride;
+    // This covers one COMPLETE mixed-radix carry class, not sampled trips:
+    // lower digits are last->zero, the carrying digit is t->t+1, and higher
+    // digits denote a common enclosing invocation. All other members translate
+    // the same contiguous interval through equal body/seam relations. A
+    // forward witness cannot leave that interval and return, so it cannot
+    // depend on incoming startup-only edges outside the translated interval.
+    ++result.scoped_reuse_queries;
+    if (!NumericalPrecedes(result, consumed, true, next, false)) return false;
+  }
+  return true;
 }
 bool NumericalPrecedes(const CompactSyncResult& result, const Occurrence& a, bool sc, const Occurrence& b,
                        bool tc) {
@@ -469,6 +866,7 @@ PointBoundary QueryNumericalBoundary(const CompactSyncResult& result, size_t sto
   return out;
 }
 std::optional<std::vector<Crossing>> ExportNumericalCrossings(const CompactSyncResult& result) {
+  if (result.input.region_tree) return std::nullopt;
   // Check the complete scope before exposing any records. A repeated DAG use
   // cannot be represented by the ordinary single-interval family coordinates.
   for (size_t r = 0; r < result.segments.size(); ++r) {
@@ -482,15 +880,19 @@ std::optional<std::vector<Crossing>> ExportNumericalCrossings(const CompactSyncR
   out.erase(std::unique(out.begin(), out.end()), out.end());
   return out;
 }
+std::shared_ptr<const ScopedSyncDemands> ExportNumericalScopedDemands(const CompactSyncResult& result) {
+  if (!result.hierarchy || !result.hierarchy->source_layout) return nullptr;
+  return ScopedExporter(result).Run();
+}
 std::vector<Crossing> ExpandNumericalDemands(const CompactSyncResult& result, size_t maximum) {
   Ordinal count = 0;
   for (const auto& segment : result.input.segments)
     count = NumericalAdd(count, Length(segment.count, segment.sites.size()));
   CHECK(count <= maximum) << "Retained-demand audit exceeds its requested payload bound";
   std::vector<Crossing> out;
-  if (result.hierarchy)
+  if (result.hierarchy) {
     ExpandNodeDemands(result, result.hierarchy->root, 0, out);
-  else {
+  } else {
     out = result.crossing_demands;
     for (size_t r = 0; r < result.segments.size(); ++r) {
       const auto& segment = result.segments[r];
