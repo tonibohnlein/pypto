@@ -1492,7 +1492,6 @@ def _register_ops() -> None:  # noqa: PLR0915
         "system.bar_mte2",
         "system.bar_mte3",
         "system.bar_fix",
-        "system.bar_s",
         "system.bar_all",
         "system.fence",
         "system.cacheinvalid",

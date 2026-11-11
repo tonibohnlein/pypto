@@ -387,17 +387,6 @@ REGISTER_OP("system.bar_v")
       return DeduceBarrierType(args, kwargs, "system.bar_v");
     });
 
-// Register system.bar_s (Scalar Barrier)
-// Attributes: core_type (optional; pins the barrier to one lane of a mixed kernel)
-REGISTER_OP("system.bar_s")
-    .set_description("Scalar unit pipeline barrier")
-    .set_op_category("SyncOp")
-    .set_attr<std::string>("core_type")
-    .no_argument()
-    .f_deduce_type([](const auto& args, const auto& kwargs) {
-      return DeduceBarrierType(args, kwargs, "system.bar_s");
-    });
-
 // Register system.bar_fix (FIX Barrier)
 // Attributes: core_type (optional; pins the barrier to one lane of a mixed kernel)
 REGISTER_OP("system.bar_fix")

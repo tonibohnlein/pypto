@@ -383,7 +383,6 @@ pl.system.sync_src(set_pipe=pl.PipeType.MTE2, wait_pipe=pl.PipeType.V, event_id=
 pl.system.sync_dst(set_pipe=pl.PipeType.MTE2, wait_pipe=pl.PipeType.V, event_id=0)
 pl.system.barrier(pipe=pl.PipeType.V)     # Vector pipeline barrier
 pl.system.barrier(pipe=pl.PipeType.M)     # Matrix pipeline barrier
-pl.system.barrier(pipe=pl.PipeType.S)     # Scalar pipeline barrier
 pl.system.barrier(pipe=pl.PipeType.MTE1)  # L1 -> L0A/L0B operand feed
 pl.system.barrier(pipe=pl.PipeType.MTE2)  # GM -> UB/L1 load pipeline barrier
 pl.system.barrier(pipe=pl.PipeType.MTE3)  # UB -> GM store pipeline barrier
@@ -411,8 +410,7 @@ pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=512, i
 pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf, dir_mask=2, slot_size=512, slot_num=16, local_slot_num=4)
 ```
 
-`pl.system.barrier(*, pipe, core_type=None)` requires a `pl.PipeType` member; every
-member is accepted. `core_type` (`pl.KernelType.AIC` / `.AIV`) pins the barrier to one
+`pl.system.barrier(*, pipe, core_type=None)` requires a `pl.PipeType` member; all members except `S` are accepted. `core_type` (`pl.KernelType.AIC` / `.AIV`) pins the barrier to one
 lane when a mixed InCore function is expanded into an AIC and an AIV kernel — the two
 lanes own different pipelines, and an operand-free barrier is otherwise duplicated into
 both. Omit it in an already typed AIC/AIV function. A barrier is rejected inside
