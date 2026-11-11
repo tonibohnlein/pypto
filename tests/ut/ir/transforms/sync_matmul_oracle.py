@@ -21,6 +21,12 @@ from pypto import ir
 from .test_finite_sync_analysis import PIPES, closure, reference
 
 
+def sequence_stmts(stmt: ir.Stmt) -> list[ir.Stmt]:
+    """Require a sequence without flattening or changing occurrence structure."""
+    assert isinstance(stmt, ir.SeqStmts)
+    return stmt.stmts
+
+
 def cast_integer(value, dtype):
     """Machine-value cast, independently of compiler range evidence."""
     if dtype == ir.DataType.INDEX:
@@ -323,10 +329,10 @@ def validate_slot_descriptors(function, description):
     groups = {}
 
     class Groups(ir.IRVisitor):
-        def visit_assign_stmt(self, stmt):
-            if isinstance(stmt.var.type, ir.MultiBufferType):
-                groups[stmt.var.name_hint] = stmt.var.type
-            super().visit_assign_stmt(stmt)
+        def visit_assign_stmt(self, op):
+            if isinstance(op.var.type, ir.MultiBufferType):
+                groups[op.var.name_hint] = op.var.type
+            super().visit_assign_stmt(op)
 
     Groups().visit_function(function)
     for domain in description["storage"]:

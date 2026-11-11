@@ -78,6 +78,7 @@ def test_rotating_tile_pipeline_preserves_one_allocation_and_lexical_selection()
         index = selection.value.args[1]
         assert isinstance(index, ir.FloorMod)
         assert index.left.same_as(loops[0].loop_var)
+        assert isinstance(index.right, ir.ConstInt)
         assert index.right.value == 3
     assert ir.serialize(SlottedCopy) == original
     ir.assert_structural_equal(ir.deserialize(ir.serialize(lowered)), lowered)
@@ -92,9 +93,11 @@ def test_multibuffer_operation_preserves_numerical_count_without_enumeration(slo
     element = ir.BufferType([1, 32], DataType.FP32, ir.MemorySpace.Vec)
     multi = ir.MultiBufferType(element, slots)
     call = internal("buffer.alloc_multi", [ir.MakeTuple([], SPAN), integer(512)], multi)
+    assert isinstance(call.type, ir.MultiBufferType)
     assert call.type.slot_count == slots
     group = ir.Var("ring", multi, SPAN)
     selected = internal("buffer.slot", [group, integer(slots - 1)], element)
+    assert isinstance(selected.args[1], ir.ConstInt)
     assert selected.args[1].value == slots - 1
 
 
@@ -343,6 +346,8 @@ def test_resolved_singleton_selection_needs_the_same_index_proof_as_emission(
     )
     with passes.PassContext([], enable_buffer_ir=True):
         selected = passes.select_buffer_ir_functions()(ir.Program([function], "Singleton", SPAN))
-    assert selected.get_function("kernel").attrs["buffer_ir_selected"] is (
+    selected_function = selected.get_function("kernel")
+    assert selected_function is not None
+    assert selected_function.attrs["buffer_ir_selected"] is (
         proved_zero and template_count == 1 and template_offset == 0
     )
