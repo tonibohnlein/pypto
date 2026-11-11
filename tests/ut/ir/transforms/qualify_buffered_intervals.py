@@ -17,10 +17,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pypto import backend, ir, testing
+from pypto import backend, codegen, ir, testing
 from pypto.backend import BackendType
 
-from .sync_matmul_oracle import validate
+from .sync_logical_oracle import CommandExecution
+from .sync_matmul_oracle import interpret, validate
 from .sync_physical_oracle import directional_widths, run_physical
 from .test_collective_sync_interface import collective_fixture
 from .test_collective_sync_realization import repeat_collective
@@ -74,10 +75,31 @@ def qualify_collective(receipt, realization=False):
             row["physical_ir_sha256"] = hashlib.sha256(
                 ir.python_print(physical["function"], format=False).encode()
             ).hexdigest()
+            start = time.perf_counter()
+            texts = [
+                codegen.PTOCodegen().generate(
+                    ir.Program([f], "collective", f.span), emit_tile_addr=True, emit_source_loc=False
+                )
+                for f in [function, physical["function"]]
+            ]
+            row["source_ir_seconds_original_and_physical"] = time.perf_counter() - start
+            row["source_ir"] = {
+                "added_arithmetic_operations": texts[1].count("arith.") - texts[0].count("arith."),
+                "physical_bytes": len(texts[1].encode()),
+                "physical_sha256": hashlib.sha256(texts[1].encode()).hexdigest(),
+                "scope": "PTO IR before downstream folding, not device instructions",
+            }
             if rows <= 8 and phases <= 8:
                 state, order, projected = run_physical(function, physical["function"], range(6))
+                _, calls = interpret(function)
+                original = CommandExecution(calls, [])
+                original.execute(function.body, {})
                 row["emitted_checks"] = {
                     "executed_handoffs": len(state.records),
+                    "executed_waits": len(state.waits),
+                    "executed_barriers": len(state.barriers),
+                    "executed_added_guard_tests": state.branches - original.branches,
+                    "causal_reuses": len(state.reuses),
                     "payload_order_pairs": len(projected),
                     "directional_widths": {str(k): v for k, v in directional_widths(state, order).items()},
                     "ids": {str(k): sorted(v) for k, v in state.ids.items()},

@@ -73,11 +73,21 @@ def test_partial_phase_repeat_cannot_inherit_full_phase_certificate(visits):
 
 def test_collective_repetition_and_row_growth_preserve_command_size():
     signatures = []
+    row_interfaces = []
     for rows, visits in [(5, 3), (1000, 3), (1000000, 3), (5, 1000), (5, 1000000)]:
         retained = testing.analyze_placed_sync(repeat_collective(rows, visits), True)
         physical = retained.realize_physical("a2a3", list(range(6)))
         d = retained.describe()
         assert d["collective_witnesses"] == 2
+        assert d["source_coordinate_entries"] == 6
+        # Repetition uses a binary summary, not one retained node per visit.
+        # Keep this separate from the constant physical command schema below.
+        assert d["merge_nodes"] <= 2 * visits.bit_length()
+        assert d["interface_entries"] <= 672 * visits.bit_length()
+        if visits == 3:
+            row_interfaces.append(
+                tuple(d[k] for k in ["interface_entries", "interface_queries", "merge_nodes"])
+            )
         signatures.append(
             tuple(
                 physical[k]
@@ -85,6 +95,7 @@ def test_collective_repetition_and_row_growth_preserve_command_size():
             )
         )
     assert len(set(signatures)) == 1
+    assert len(set(row_interfaces)) == 1
 
 
 @pytest.mark.ptoas_compile

@@ -68,7 +68,9 @@ agreement, negative alias/geometry cases and native PTOAS C++ generation.
 Earlier failing gates are retained in the workspace receipt logs. Source and
 binary hashes identify the accepted dirty worktree; no commit is implied.
 
-All five scoped stages are implemented and independently accepted. See [receipt](buffered-pipeline-receipt.json).
+The earlier five-stage baseline was implemented and independently accepted. See
+[its historical receipt](buffered-pipeline-receipt.json). The interval and collective
+follow-up below has a separate M1–M5 acceptance record.
 No device validation.
 
 ## Stage 2: rotating generators and numerical queries
@@ -300,8 +302,7 @@ PYTHONPATH="$PWD/python" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
   --output build-py314/buffered-final-scaling.json
 ```
 
-The receipt retains each accepted stage and the earlier failed attempts. The
-implementation is uncommitted at this checkpoint. Default dispatch, the resource
+The receipt retains each accepted stage and the earlier failed attempts. That receipt predates the baseline commit. Default dispatch, the resource
 pool, allocation algorithm and hardware exemptions are unchanged.
 
 ## Interval and collective-interface follow-up
@@ -481,3 +482,57 @@ specialize separately. This establishes row independence and logarithmic repeat
 summary growth for the tested contract, not constant total representation size.
 
 M4 accepted by the architecture, correctness and algorithm/performance reviewers.
+
+### M5: qualification and conformance
+
+The final campaign uses the committed M4 implementation, with the qualification
+driver and structural bounds pinned separately. It checks the existing finite,
+logical, rotating, numerical, nested and physical paths as well as Buffer view,
+slot, serialization and lowering regressions. The new regression bounds distinguish
+constant command schemas from logarithmic retained repeat summaries.
+
+| Draft construction | Production component and evidence | Remaining scope |
+| ------------------ | --------------------------------- | --------------- |
+| Qualified physical interval descriptions | `placed_sync_import.cpp`; exact contiguous byte spans, physical aliases and original frame checks | Native instruction footprints remain a separate premise; noncontiguous/partial boxed views cannot borrow interval evidence |
+| Rotating interval generators | `rotating_sync_analysis.cpp`; per-pipe range sweeps, common-stride phase normalization and existing quotient reducer | The supplied-interval bound excludes access recovery and unsupported-domain atomization |
+| Collective row and resident boundaries | `CollectiveDomain` and original point selectors; independently checked actual covers, all four event queries and unsampled rows | Complete-domain fill/read coverage required; global witnesses can cost phases times reader endpoints; no adjacency-local interface bound claimed |
+| Numerical composition and repeats | Existing source-layout and numerical merge services; complete-phase boundaries, mixed-radix resets and read-only GM selectors | General symbolic crossing selectors, partial-phase repeats and unqualified moving written domains remain unavailable |
+| Direct physical realization | Existing endpoint/reuse services; independently checked command matching, acyclicity, order equality and causal reuse on bounded qualified fixtures | Six-ID certification is separate from minimum demands; unsupported DMA same-pipe mechanisms retain refusal; native entry/return is not proved |
+
+The five original ring cases retain exactly the baseline reduced demands and
+physical refusal. The sweep retains nine generators rather than five in the
+small ring example: its per-pipe witnesses need not be the smallest generating
+set. Joint reduction still returns the same four covers. The demonstrated gain
+is avoiding interval/atom incidence expansion, not fewer generators on every input.
+
+For complete collective phases, static control remains small as rows/visits grow:
+the measured repeated cases add 9–10 PTO arithmetic operations and retain two SET
+and two WAIT sites. The 5-row, 3-visit execution has five SETs, five WAITs, three
+causal reuses and 43 added `IfStmt` guard tests (not loop tests or scalar
+operations within predicates). Its projected order equals the
+independently recovered access order. This is finite validation under the command
+model, not a uniform native proof, and compact static code does not imply constant
+executed control work. Large shapes/counts are host scaling derivatives only.
+
+Configured Qwen output projection and all four gate/up bands still select PyPTO
+in ordinary opt-in production and produce C++. All ten PyPTO/PTOAS-mode output
+sets match the earlier retained Qwen production receipt byte-for-byte. Its revision
+and dirty-source hashes are recorded in the final receipt: this is an artifact
+regression comparison, not a fresh baseline timing campaign. These kernels retain
+their existing nested route; they do not establish that the new collective provider
+covers arbitrary attention or partial-write phases.
+
+Every timing here is a descriptive single run. Import/reduction/composition detail
+timers are included in total analysis time and must not be summed with it.
+Physical preparation, allocation and emission share one measured call; they are
+not separately attributed. PTO arithmetic counts precede downstream folding.
+No device work, return-boundary change, allocation change or automatic fallback
+policy change belongs to this campaign.
+
+M5 accepted by all three reviewers. The final autosync gate passed **889 tests**
+with 28 existing deprecation warnings; the separate Buffer/slot companion gate
+passed **398 tests**. All **1,287 tests passed**, and ten configured Qwen mode
+cells generated C++. [The final receipt](buffered-intervals-m5.json) contains
+source/tool/input hashes, exact commands, scaling samples and the historical
+artifact comparison. This completes all five scoped follow-up milestones; the
+limitations in the table remain explicit.

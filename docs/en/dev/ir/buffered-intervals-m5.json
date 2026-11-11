@@ -1,0 +1,1783 @@
+{
+  "stage": "M5 final interval and collective qualification",
+  "source_revision": "4fcb9f2d92f1e83213924e58e86faef1059e47ed",
+  "baseline_revision": "e10d882b23480d170377dd6fa227831354db8d49",
+  "draft_revision": "3a7c65bef9b0edf2ec10990c4720dfa95895cec2",
+  "branch": "codex/pypto-buffered-intervals",
+  "dirty_source_hashes": {
+    "tests/ut/ir/transforms/qualify_buffered_intervals.py": "569f3fec36d1122f880e9df796582af6a192058e57ed1c7a5f9a78767d8a2d49",
+    "tests/ut/ir/transforms/test_collective_sync_realization.py": "2bbae8aa44be6c0c9f32436e97073af2af60073127b2b6888511e468077eb96f"
+  },
+  "extension_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "d3c77d461f3dd850153771abef592ba978a5d123e1ee052b847e7a752b0a9054"
+  },
+  "environment": {
+    "platform": "Linux-7.2.5-100.fc43.x86_64-x86_64-with-glibc2.42",
+    "python": "3.14.7",
+    "python_command": "/usr/bin/python3",
+    "ptoas": {
+      "launcher_hash": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+      "version": "ptoas 0.72",
+      "native_artifact_hashes": {
+        "ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321",
+        "ptoas/mlir/_mlir_libs/_site_initialize_0.cpython-311-x86_64-linux-gnu.so": "225c1410b394ec8cb25365b91ed53b8dc650144cae9f34c6106d477903b07274",
+        "ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+        "ptoas/mlir/_mlir_libs/_mlir.cpython-311-x86_64-linux-gnu.so": "b618a015ad07cc38b59bc07184f63a1ca3c3def80314fb8558882b7c3a1c8d48",
+        "ptoas/mlir/_mlir_libs/_mlirDialectsLLVM.cpython-311-x86_64-linux-gnu.so": "fc346a487b9cec914d77f806c6847940ec25c3d2d77d0214dd8d3e829727d75b"
+      }
+    },
+    "ptoas_python": "3.11.15 selected on PATH",
+    "target": "a2a3",
+    "alias_contract": "disjoint distinct GM roots explicitly supplied",
+    "eligible_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "intensive_workers": "aggregate maximum two; serial test processes"
+  },
+  "commands": {
+    "environment": [
+      "source .claude/skills/testing/load-env.sh",
+      "export PYTHONPATH=\"$PWD/python\" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYPTO_CODEGEN_MAX_WORKERS=1",
+      "export PTOAS_ROOT=\"$PWD/build-py314/physical-sync-prototype/ptoas-v072\"",
+      "Prepend the pinned Python 3.11 interpreter directory to PATH for the PTOAS launcher; host tests use explicit /usr/bin/python3"
+    ],
+    "build": "cmake --build build-py314 --parallel 1 (M4; M5 changes tests/measurement/docs only)",
+    "autosync_gate": [
+      "/usr/bin/python3",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/ut/ir/transforms/test_autosync_switch.py",
+      "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+      "tests/ut/ir/transforms/test_collective_sync_interface.py",
+      "tests/ut/ir/transforms/test_collective_sync_realization.py",
+      "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+      "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+      "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+      "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+      "tests/ut/ir/transforms/test_logical_sync_realization.py",
+      "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+      "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+      "tests/ut/ir/transforms/test_parameterized_sync.py",
+      "tests/ut/ir/transforms/test_physical_sync_realization.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+      "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+      "tests/ut/ir/transforms/test_row_sync_analysis.py",
+      "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+      "tests/ut/ir/transforms/test_slot_sync_import.py",
+      "tests/ut/ir/transforms/test_sync_range_proofs.py",
+      "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+      "tests/ut/ir/transforms/test_verify_hard_syncall_occupancy.py"
+    ],
+    "buffer_gate": "/usr/bin/python3 -m pytest -q tests/ut/ir/transforms/test_regional_slot_composition.py tests/ut/ir/transforms/test_streamed_slot_composition.py tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py tests/ut/ir/operators/test_buffer_views.py tests/ut/ir/operators/test_buffer_alloc.py tests/ut/codegen/test_multi_buffer_codegen.py tests/ut/codegen/test_buffer_view_codegen.py tests/ut/ir/transforms/test_buffer_serialization.py",
+    "measurements": [
+      "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_buffered_intervals --output build-py314/interval-m5-rings.json",
+      "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_buffered_intervals --partial --output build-py314/interval-m5-partial.json",
+      "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_buffered_intervals --collective --realization --output build-py314/interval-m5-collective.json",
+      "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_buffered_sync --include-hierarchy --include-streamed --include-physical --output build-py314/interval-m5-legacy.json",
+      "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_qwen_production --output build-py314/interval-m5-qwen"
+    ]
+  },
+  "tests": {
+    "autosync_gate": {
+      "status": "passed",
+      "log": "build-py314/interval-m5-gate.log",
+      "passed": 889,
+      "warnings": 28,
+      "seconds": 422.83
+    },
+    "buffer_gate": {
+      "passed": 398,
+      "seconds": 8.34,
+      "log": "build-py314/interval-m5-buffer-gate.log",
+      "status": "passed"
+    },
+    "cpp_mode_cells": 10,
+    "enabled_qwen_routes_accepted": 5,
+    "total_passed": 1287
+  },
+  "ring_baseline_comparison": [
+    {
+      "count": 7,
+      "slots": 3,
+      "same_reduced_demands": true,
+      "same_physical_outcome": true,
+      "baseline_generators": 5,
+      "candidate_generators": 9,
+      "covers": 4
+    },
+    {
+      "count": 1000,
+      "slots": 3,
+      "same_reduced_demands": true,
+      "same_physical_outcome": true,
+      "baseline_generators": 5,
+      "candidate_generators": 9,
+      "covers": 4
+    },
+    {
+      "count": 1000000,
+      "slots": 3,
+      "same_reduced_demands": true,
+      "same_physical_outcome": true,
+      "baseline_generators": 5,
+      "candidate_generators": 9,
+      "covers": 4
+    },
+    {
+      "count": 7,
+      "slots": 101,
+      "same_reduced_demands": true,
+      "same_physical_outcome": true,
+      "baseline_generators": 5,
+      "candidate_generators": 9,
+      "covers": 4
+    },
+    {
+      "count": 7,
+      "slots": 1000003,
+      "same_reduced_demands": true,
+      "same_physical_outcome": true,
+      "baseline_generators": 5,
+      "candidate_generators": 9,
+      "covers": 4
+    }
+  ],
+  "interval_scaling": [
+    {
+      "count": 7,
+      "readers": 4,
+      "slots": 3,
+      "analysis_seconds_inclusive": 0.00029460061341524124,
+      "interval_access_visits": 10,
+      "qualified_intervals": 10,
+      "atom_tests": 0,
+      "interval_domains": 6,
+      "interval_fragments": 10,
+      "interval_endpoints": 16,
+      "interval_queries": 30,
+      "interval_updates": 30,
+      "interval_node_visits": 126,
+      "interval_tree_entries": 120,
+      "rotating_fragments": 0,
+      "sort_comparisons": 53,
+      "sweep_visits": 20,
+      "shortest_path_edge_visits": 100,
+      "retained_frontier_entries": 40,
+      "physical": "Unavailable same-pipe barrier mechanism",
+      "physical_seconds": 0.17577162571251392,
+      "generator_count": 10,
+      "demand_count": 4
+    },
+    {
+      "count": 7,
+      "readers": 16,
+      "slots": 3,
+      "analysis_seconds_inclusive": 0.000783856026828289,
+      "interval_access_visits": 34,
+      "qualified_intervals": 34,
+      "atom_tests": 0,
+      "interval_domains": 18,
+      "interval_fragments": 34,
+      "interval_endpoints": 52,
+      "interval_queries": 102,
+      "interval_updates": 102,
+      "interval_node_visits": 654,
+      "interval_tree_entries": 408,
+      "rotating_fragments": 0,
+      "sort_comparisons": 323,
+      "sweep_visits": 68,
+      "shortest_path_edge_visits": 340,
+      "retained_frontier_entries": 136,
+      "physical": "Unavailable same-pipe barrier mechanism",
+      "physical_seconds": 5.558505654335022e-05,
+      "generator_count": 34,
+      "demand_count": 4
+    },
+    {
+      "count": 7,
+      "readers": 64,
+      "slots": 3,
+      "analysis_seconds_inclusive": 0.0024972688406705856,
+      "interval_access_visits": 130,
+      "qualified_intervals": 130,
+      "atom_tests": 0,
+      "interval_domains": 66,
+      "interval_fragments": 130,
+      "interval_endpoints": 196,
+      "interval_queries": 390,
+      "interval_updates": 390,
+      "interval_node_visits": 3558,
+      "interval_tree_entries": 1560,
+      "rotating_fragments": 0,
+      "sort_comparisons": 1625,
+      "sweep_visits": 260,
+      "shortest_path_edge_visits": 1300,
+      "retained_frontier_entries": 520,
+      "physical": "Unavailable same-pipe barrier mechanism",
+      "physical_seconds": 4.9097929149866104e-05,
+      "generator_count": 130,
+      "demand_count": 4
+    },
+    {
+      "count": 7,
+      "readers": 128,
+      "slots": 3,
+      "analysis_seconds_inclusive": 0.004963448271155357,
+      "interval_access_visits": 258,
+      "qualified_intervals": 258,
+      "atom_tests": 0,
+      "interval_domains": 130,
+      "interval_fragments": 258,
+      "interval_endpoints": 388,
+      "interval_queries": 774,
+      "interval_updates": 774,
+      "interval_node_visits": 8178,
+      "interval_tree_entries": 3096,
+      "rotating_fragments": 0,
+      "sort_comparisons": 3411,
+      "sweep_visits": 516,
+      "shortest_path_edge_visits": 2580,
+      "retained_frontier_entries": 1032,
+      "physical": "Unavailable same-pipe barrier mechanism",
+      "physical_seconds": 0.00010579917579889297,
+      "generator_count": 258,
+      "demand_count": 5
+    }
+  ],
+  "collective_scaling": [
+    {
+      "rows": 5,
+      "visits": 0,
+      "analysis_seconds_inclusive": 0.0004966468550264835,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 2,
+      "interface_queries": 15,
+      "interface_ports": 12,
+      "merge_nodes": 1,
+      "source_coordinate_entries": 6,
+      "interface_entries": 336,
+      "analyzed_occurrences": 2,
+      "semantic": {
+        "payloads": 0,
+        "covers": 0,
+        "query_checks": 0,
+        "boundary_checks": 6,
+        "access_checks": 0
+      },
+      "physical": {
+        "set_sites": 0,
+        "wait_sites": 0,
+        "barrier_sites": 0,
+        "guard_sites": 0,
+        "reuse_queries": 0,
+        "reserved_lanes": 0,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 7.032603025436401e-05,
+      "physical_ir_sha256": "6291839ce22c08d7e4fb019c7ecab7723220ddf9e09f5e6db377ac895c61debb",
+      "source_ir_seconds_original_and_physical": 0.0009318822994828224,
+      "source_ir": {
+        "added_arithmetic_operations": 0,
+        "physical_bytes": 2476,
+        "physical_sha256": "fb9b97efdf2210940246d92716dd3e248da9203160bf0d5ebff9e5200c77bc3d",
+        "scope": "PTO IR before downstream folding, not device instructions"
+      },
+      "emitted_checks": {
+        "executed_handoffs": 0,
+        "executed_waits": 0,
+        "executed_barriers": 0,
+        "executed_added_guard_tests": 0,
+        "causal_reuses": 0,
+        "payload_order_pairs": 0,
+        "directional_widths": {},
+        "ids": {},
+        "excess_pairs": 0
+      }
+    },
+    {
+      "rows": 5,
+      "visits": 1,
+      "analysis_seconds_inclusive": 0.00040153786540031433,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 12,
+      "merge_nodes": 1,
+      "source_coordinate_entries": 6,
+      "interface_entries": 336,
+      "analyzed_occurrences": 2,
+      "semantic": {
+        "payloads": 6,
+        "covers": 1,
+        "query_checks": 144,
+        "boundary_checks": 22,
+        "access_checks": 6
+      },
+      "physical": {
+        "set_sites": 1,
+        "wait_sites": 1,
+        "barrier_sites": 0,
+        "guard_sites": 1,
+        "reuse_queries": 1,
+        "reserved_lanes": 1,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 0.00018075760453939438,
+      "physical_ir_sha256": "12e00f919622a9738618e46fda5527261c58754469e6a7789fbb3a5493c219ba",
+      "source_ir_seconds_original_and_physical": 0.0007570832967758179,
+      "source_ir": {
+        "added_arithmetic_operations": 2,
+        "physical_bytes": 2749,
+        "physical_sha256": "7e622f12049391c246b6a06f2d3dd4176da8cd5f5192065c8e26541392c31dbd",
+        "scope": "PTO IR before downstream folding, not device instructions"
+      },
+      "emitted_checks": {
+        "executed_handoffs": 1,
+        "executed_waits": 1,
+        "executed_barriers": 0,
+        "executed_added_guard_tests": 5,
+        "causal_reuses": 0,
+        "payload_order_pairs": 56,
+        "directional_widths": {
+          "(PipeType.MTE2, PipeType.MTE3)": 1
+        },
+        "ids": {
+          "(PipeType.MTE2, PipeType.MTE3)": [
+            0
+          ]
+        },
+        "excess_pairs": 0
+      }
+    },
+    {
+      "rows": 5,
+      "visits": 3,
+      "analysis_seconds_inclusive": 0.0003953101113438606,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 36,
+      "merge_nodes": 3,
+      "source_coordinate_entries": 6,
+      "interface_entries": 1008,
+      "analyzed_occurrences": 2,
+      "semantic": {
+        "payloads": 18,
+        "covers": 5,
+        "query_checks": 1296,
+        "boundary_checks": 22,
+        "access_checks": 18
+      },
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 9.280582889914513e-05,
+      "physical_ir_sha256": "2a8c2d9fbe52ed22e6ae70c255d67af11c16e50fa0ee30f5fee437dd1e89271b",
+      "source_ir_seconds_original_and_physical": 0.0007732128724455833,
+      "source_ir": {
+        "added_arithmetic_operations": 9,
+        "physical_bytes": 3280,
+        "physical_sha256": "83b02914f8a80e6e49e5d4157751acd73ea129d88c71dd75797503cdcf22df5b",
+        "scope": "PTO IR before downstream folding, not device instructions"
+      },
+      "emitted_checks": {
+        "executed_handoffs": 5,
+        "executed_waits": 5,
+        "executed_barriers": 0,
+        "executed_added_guard_tests": 43,
+        "causal_reuses": 3,
+        "payload_order_pairs": 600,
+        "directional_widths": {
+          "(PipeType.MTE2, PipeType.MTE3)": 1,
+          "(PipeType.MTE3, PipeType.MTE2)": 1
+        },
+        "ids": {
+          "(PipeType.MTE2, PipeType.MTE3)": [
+            0
+          ],
+          "(PipeType.MTE3, PipeType.MTE2)": [
+            0
+          ]
+        },
+        "excess_pairs": 0
+      }
+    },
+    {
+      "rows": 5,
+      "visits": 1000,
+      "analysis_seconds_inclusive": 0.0004461142234504223,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 180,
+      "merge_nodes": 15,
+      "source_coordinate_entries": 6,
+      "interface_entries": 5040,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 6.38151541352272e-05,
+      "physical_ir_sha256": "7beda0ad7added618296914437b7a8050c595382b92ed18073732b9b3e527349",
+      "source_ir_seconds_original_and_physical": 0.0005339081399142742,
+      "source_ir": {
+        "added_arithmetic_operations": 10,
+        "physical_bytes": 3334,
+        "physical_sha256": "7ff20466597e2dd3f8ea8e6c0208906792e5eca92a12ac1306551fba8443a385",
+        "scope": "PTO IR before downstream folding, not device instructions"
+      }
+    },
+    {
+      "rows": 5,
+      "visits": 1000000,
+      "analysis_seconds_inclusive": 0.0005127829499542713,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 312,
+      "merge_nodes": 26,
+      "source_coordinate_entries": 6,
+      "interface_entries": 8736,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 4.5655760914087296e-05,
+      "physical_ir_sha256": "de803f77e94d5ace9a900d076a3904f14bb629995d18c3db7f460bec81ae5334",
+      "source_ir_seconds_original_and_physical": 0.0004915390163660049,
+      "source_ir": {
+        "added_arithmetic_operations": 10,
+        "physical_bytes": 3352,
+        "physical_sha256": "bac17905685c2420eb11babda9ea59a502c48677ae0f003edaf320a89c677b5f",
+        "scope": "PTO IR before downstream folding, not device instructions"
+      }
+    },
+    {
+      "rows": 1000,
+      "visits": 3,
+      "analysis_seconds_inclusive": 0.0002746651880443096,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 36,
+      "merge_nodes": 3,
+      "source_coordinate_entries": 6,
+      "interface_entries": 1008,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 4.439288750290871e-05,
+      "physical_ir_sha256": "e3e076a48adb08710e579fb8eb31836ed2ac1680a56b69941daf981adfeb67a3",
+      "source_ir_seconds_original_and_physical": 0.00046582380309700966,
+      "source_ir": {
+        "added_arithmetic_operations": 9,
+        "physical_bytes": 3343,
+        "physical_sha256": "db447153975d9c0776e455895b0a3937007e0b18b97b9c68e9d34d6dc440f443",
+        "scope": "PTO IR before downstream folding, not device instructions"
+      }
+    },
+    {
+      "rows": 1000000,
+      "visits": 3,
+      "analysis_seconds_inclusive": 0.00024836696684360504,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 36,
+      "merge_nodes": 3,
+      "source_coordinate_entries": 6,
+      "interface_entries": 1008,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 4.397612065076828e-05,
+      "physical_ir_sha256": "5ceb2bece8e7567bf7a742f01663b41c007f9a88e72f99081f748d0afe91573e",
+      "source_ir_seconds_original_and_physical": 0.0004739491268992424,
+      "source_ir": {
+        "added_arithmetic_operations": 9,
+        "physical_bytes": 3409,
+        "physical_sha256": "8daba8f9ff9a0d257128dd76181debd23aaf4d58b6278127659709f6770f3b94",
+        "scope": "PTO IR before downstream folding, not device instructions"
+      }
+    }
+  ],
+  "existing_route_scaling": [
+    {
+      "axis": "trips",
+      "trips": 7,
+      "slots": 3,
+      "stages": 1,
+      "analysis_inclusive_seconds": 0.0004088599234819412,
+      "timers": {
+        "import_seconds": 0.000382659,
+        "partition_seconds": 9.076e-06,
+        "reduction_seconds": 6.933e-06,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 30,
+        "sweep_visits": 12,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 108,
+        "retained_frontier_entries": 36,
+        "quotient_edges": 18,
+        "distance_entries": 0
+      },
+      "sites": 3,
+      "generators": 9,
+      "demands": 4,
+      "semantic_checks": {
+        "payloads": 21,
+        "covers": 24,
+        "query_checks": 1764,
+        "boundary_checks": 10,
+        "access_checks": 21
+      }
+    },
+    {
+      "axis": "trips",
+      "trips": 1000,
+      "slots": 3,
+      "stages": 1,
+      "analysis_inclusive_seconds": 0.0002905488945543766,
+      "timers": {
+        "import_seconds": 0.000268798,
+        "partition_seconds": 7.323e-06,
+        "reduction_seconds": 6.229e-06,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 30,
+        "sweep_visits": 12,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 108,
+        "retained_frontier_entries": 36,
+        "quotient_edges": 18,
+        "distance_entries": 0
+      },
+      "sites": 3,
+      "generators": 9,
+      "demands": 4
+    },
+    {
+      "axis": "trips",
+      "trips": 1000000,
+      "slots": 3,
+      "stages": 1,
+      "analysis_inclusive_seconds": 0.0002519390545785427,
+      "timers": {
+        "import_seconds": 0.000236916,
+        "partition_seconds": 5.136e-06,
+        "reduction_seconds": 4.142e-06,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 30,
+        "sweep_visits": 12,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 108,
+        "retained_frontier_entries": 36,
+        "quotient_edges": 18,
+        "distance_entries": 0
+      },
+      "sites": 3,
+      "generators": 9,
+      "demands": 4
+    },
+    {
+      "axis": "slots",
+      "trips": 7,
+      "slots": 3,
+      "stages": 1,
+      "analysis_inclusive_seconds": 0.00023497221991419792,
+      "timers": {
+        "import_seconds": 0.000221804,
+        "partition_seconds": 4.808e-06,
+        "reduction_seconds": 3.612e-06,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 30,
+        "sweep_visits": 12,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 108,
+        "retained_frontier_entries": 36,
+        "quotient_edges": 18,
+        "distance_entries": 0
+      },
+      "sites": 3,
+      "generators": 9,
+      "demands": 4,
+      "semantic_checks": {
+        "payloads": 21,
+        "covers": 24,
+        "query_checks": 1764,
+        "boundary_checks": 10,
+        "access_checks": 21
+      }
+    },
+    {
+      "axis": "slots",
+      "trips": 7,
+      "slots": 101,
+      "stages": 1,
+      "analysis_inclusive_seconds": 0.00031053880229592323,
+      "timers": {
+        "import_seconds": 0.000290676,
+        "partition_seconds": 6.967e-06,
+        "reduction_seconds": 5.47e-06,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 30,
+        "sweep_visits": 12,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 108,
+        "retained_frontier_entries": 36,
+        "quotient_edges": 18,
+        "distance_entries": 0
+      },
+      "sites": 3,
+      "generators": 9,
+      "demands": 4
+    },
+    {
+      "axis": "slots",
+      "trips": 7,
+      "slots": 1000003,
+      "stages": 1,
+      "analysis_inclusive_seconds": 0.0002551767975091934,
+      "timers": {
+        "import_seconds": 0.000240566,
+        "partition_seconds": 4.932e-06,
+        "reduction_seconds": 4.216e-06,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 30,
+        "sweep_visits": 12,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 108,
+        "retained_frontier_entries": 36,
+        "quotient_edges": 18,
+        "distance_entries": 0
+      },
+      "sites": 3,
+      "generators": 9,
+      "demands": 4
+    },
+    {
+      "axis": "stages",
+      "trips": 1000,
+      "slots": 5,
+      "stages": 1,
+      "analysis_inclusive_seconds": 0.00033089611679315567,
+      "timers": {
+        "import_seconds": 0.000312391,
+        "partition_seconds": 9.682e-06,
+        "reduction_seconds": 3.642e-06,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 40,
+        "sweep_visits": 14,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 108,
+        "retained_frontier_entries": 36,
+        "quotient_edges": 18,
+        "distance_entries": 0
+      },
+      "sites": 3,
+      "generators": 9,
+      "demands": 4
+    },
+    {
+      "axis": "stages",
+      "trips": 1000,
+      "slots": 5,
+      "stages": 4,
+      "analysis_inclusive_seconds": 0.001148437149822712,
+      "timers": {
+        "import_seconds": 0.001097892,
+        "partition_seconds": 2.0788e-05,
+        "reduction_seconds": 2.0387e-05,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 278,
+        "sweep_visits": 56,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 432,
+        "retained_frontier_entries": 144,
+        "quotient_edges": 72,
+        "distance_entries": 0
+      },
+      "sites": 12,
+      "generators": 36,
+      "demands": 15
+    },
+    {
+      "axis": "stages",
+      "trips": 1000,
+      "slots": 5,
+      "stages": 16,
+      "analysis_inclusive_seconds": 0.004077475052326918,
+      "timers": {
+        "import_seconds": 0.003938125,
+        "partition_seconds": 6.2152e-05,
+        "reduction_seconds": 6.0742e-05,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 1788,
+        "sweep_visits": 224,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 1728,
+        "retained_frontier_entries": 576,
+        "quotient_edges": 288,
+        "distance_entries": 0
+      },
+      "sites": 48,
+      "generators": 144,
+      "demands": 64
+    },
+    {
+      "axis": "stages",
+      "trips": 1000,
+      "slots": 5,
+      "stages": 64,
+      "analysis_inclusive_seconds": 0.01602540723979473,
+      "timers": {
+        "import_seconds": 0.015539329,
+        "partition_seconds": 0.00021215,
+        "reduction_seconds": 0.000229385,
+        "composition_seconds": 0.0
+      },
+      "work": {
+        "rotating_fragments": 0,
+        "atom_tests": 0,
+        "sort_comparisons": 9701,
+        "sweep_visits": 896,
+        "shortest_path_runs": 6,
+        "shortest_path_edge_visits": 6912,
+        "retained_frontier_entries": 2304,
+        "quotient_edges": 1152,
+        "distance_entries": 0
+      },
+      "sites": 192,
+      "generators": 576,
+      "demands": 254
+    },
+    {
+      "axis": "inner",
+      "inner": 4,
+      "outer": 7,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.0004773559048771858,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 4,
+        "interface_slot_visits": 16,
+        "interface_ports": 80,
+        "interface_entries": 2240,
+        "interface_queries": 150,
+        "merge_nodes": 4,
+        "crossing_tests": 240,
+        "interface_access_visits": 13,
+        "bridge_candidates": 48,
+        "port_normalization_visits": 390
+      },
+      "timers": {
+        "import_seconds": 0.000355217,
+        "partition_seconds": 6.166e-06,
+        "reduction_seconds": 4.674e-06,
+        "composition_seconds": 0.00010467
+      }
+    },
+    {
+      "axis": "inner",
+      "inner": 1000,
+      "outer": 7,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.00043053505942225456,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 4,
+        "interface_slot_visits": 16,
+        "interface_ports": 80,
+        "interface_entries": 2240,
+        "interface_queries": 151,
+        "merge_nodes": 4,
+        "crossing_tests": 240,
+        "interface_access_visits": 13,
+        "bridge_candidates": 48,
+        "port_normalization_visits": 390
+      },
+      "timers": {
+        "import_seconds": 0.000324834,
+        "partition_seconds": 6.17e-06,
+        "reduction_seconds": 4.262e-06,
+        "composition_seconds": 8.1865e-05
+      }
+    },
+    {
+      "axis": "inner",
+      "inner": 1000000,
+      "outer": 7,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.0004032254219055176,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 4,
+        "interface_slot_visits": 16,
+        "interface_ports": 80,
+        "interface_entries": 2240,
+        "interface_queries": 151,
+        "merge_nodes": 4,
+        "crossing_tests": 240,
+        "interface_access_visits": 13,
+        "bridge_candidates": 48,
+        "port_normalization_visits": 390
+      },
+      "timers": {
+        "import_seconds": 0.000305951,
+        "partition_seconds": 5.631e-06,
+        "reduction_seconds": 3.807e-06,
+        "composition_seconds": 7.389e-05
+      }
+    },
+    {
+      "axis": "outer",
+      "inner": 4,
+      "outer": 2,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.00035866396501660347,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 4,
+        "interface_slot_visits": 16,
+        "interface_ports": 32,
+        "interface_entries": 896,
+        "interface_queries": 150,
+        "merge_nodes": 1,
+        "crossing_tests": 60,
+        "interface_access_visits": 13,
+        "bridge_candidates": 12,
+        "port_normalization_visits": 156
+      },
+      "timers": {
+        "import_seconds": 0.000307444,
+        "partition_seconds": 5.384e-06,
+        "reduction_seconds": 3.571e-06,
+        "composition_seconds": 3.1477e-05
+      },
+      "semantic_checks": {
+        "payloads": 24,
+        "covers": 27,
+        "query_checks": 2304,
+        "boundary_checks": 10,
+        "access_checks": 24
+      }
+    },
+    {
+      "axis": "outer",
+      "inner": 4,
+      "outer": 7,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.0004680883139371872,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 4,
+        "interface_slot_visits": 16,
+        "interface_ports": 80,
+        "interface_entries": 2240,
+        "interface_queries": 150,
+        "merge_nodes": 4,
+        "crossing_tests": 240,
+        "interface_access_visits": 13,
+        "bridge_candidates": 48,
+        "port_normalization_visits": 390
+      },
+      "timers": {
+        "import_seconds": 0.000343419,
+        "partition_seconds": 6.964e-06,
+        "reduction_seconds": 4.892e-06,
+        "composition_seconds": 0.000100341
+      }
+    },
+    {
+      "axis": "outer",
+      "inner": 4,
+      "outer": 64,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.0004890630953013897,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 4,
+        "interface_slot_visits": 16,
+        "interface_ports": 112,
+        "interface_entries": 3136,
+        "interface_queries": 150,
+        "merge_nodes": 6,
+        "crossing_tests": 360,
+        "interface_access_visits": 13,
+        "bridge_candidates": 72,
+        "port_normalization_visits": 546
+      },
+      "timers": {
+        "import_seconds": 0.000328639,
+        "partition_seconds": 6.012e-06,
+        "reduction_seconds": 4.211e-06,
+        "composition_seconds": 0.000136087
+      }
+    },
+    {
+      "axis": "outer",
+      "inner": 4,
+      "outer": 1000000,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.000880054198205471,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 4,
+        "interface_slot_visits": 16,
+        "interface_ports": 416,
+        "interface_entries": 11648,
+        "interface_queries": 150,
+        "merge_nodes": 25,
+        "crossing_tests": 1500,
+        "interface_access_visits": 13,
+        "bridge_candidates": 300,
+        "port_normalization_visits": 2028
+      },
+      "timers": {
+        "import_seconds": 0.000318671,
+        "partition_seconds": 5.897e-06,
+        "reduction_seconds": 4.336e-06,
+        "composition_seconds": 0.000534659
+      }
+    },
+    {
+      "axis": "interface_slots",
+      "inner": 7,
+      "outer": 3,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.00041582807898521423,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 4,
+        "interface_slot_visits": 16,
+        "interface_ports": 48,
+        "interface_entries": 1344,
+        "interface_queries": 151,
+        "merge_nodes": 2,
+        "crossing_tests": 120,
+        "interface_access_visits": 13,
+        "bridge_candidates": 24,
+        "port_normalization_visits": 234
+      },
+      "timers": {
+        "import_seconds": 0.00031658,
+        "partition_seconds": 6.195e-06,
+        "reduction_seconds": 3.978e-06,
+        "composition_seconds": 4.4606e-05
+      }
+    },
+    {
+      "axis": "interface_slots",
+      "inner": 7,
+      "outer": 3,
+      "slots": 11,
+      "analysis_inclusive_seconds": 0.00044821109622716904,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 10,
+        "interface_slot_visits": 36,
+        "interface_ports": 138,
+        "interface_entries": 3864,
+        "interface_queries": 380,
+        "merge_nodes": 2,
+        "crossing_tests": 180,
+        "interface_access_visits": 13,
+        "bridge_candidates": 42,
+        "port_normalization_visits": 522
+      },
+      "timers": {
+        "import_seconds": 0.000317376,
+        "partition_seconds": 5.761e-06,
+        "reduction_seconds": 3.878e-06,
+        "composition_seconds": 0.000109083
+      }
+    },
+    {
+      "axis": "interface_slots",
+      "inner": 7,
+      "outer": 3,
+      "slots": 101,
+      "analysis_inclusive_seconds": 0.0004395432770252228,
+      "work": {
+        "analyzed_occurrences": 3,
+        "interface_cells": 10,
+        "interface_slot_visits": 36,
+        "interface_ports": 138,
+        "interface_entries": 3864,
+        "interface_queries": 380,
+        "merge_nodes": 2,
+        "crossing_tests": 180,
+        "interface_access_visits": 13,
+        "bridge_candidates": 42,
+        "port_normalization_visits": 522
+      },
+      "timers": {
+        "import_seconds": 0.000320584,
+        "partition_seconds": 5.534e-06,
+        "reduction_seconds": 3.635e-06,
+        "composition_seconds": 9.6536e-05
+      }
+    },
+    {
+      "axis": "regions",
+      "inner": 4,
+      "outer": 2,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.0007065311074256897,
+      "work": {
+        "analyzed_occurrences": 6,
+        "interface_cells": 4,
+        "interface_slot_visits": 32,
+        "interface_ports": 48,
+        "interface_entries": 1344,
+        "interface_queries": 300,
+        "merge_nodes": 1,
+        "crossing_tests": 60,
+        "interface_access_visits": 26,
+        "bridge_candidates": 12,
+        "port_normalization_visits": 234
+      },
+      "timers": {
+        "import_seconds": 0.000610937,
+        "partition_seconds": 1.2689999999999999e-05,
+        "reduction_seconds": 8.511999999999999e-06,
+        "composition_seconds": 5.5436e-05
+      },
+      "semantic_checks": {
+        "payloads": 24,
+        "covers": 27,
+        "query_checks": 2304,
+        "boundary_checks": 10,
+        "access_checks": 24
+      }
+    },
+    {
+      "axis": "regions",
+      "inner": 4,
+      "outer": 4,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.0013354201801121235,
+      "work": {
+        "analyzed_occurrences": 12,
+        "interface_cells": 4,
+        "interface_slot_visits": 64,
+        "interface_ports": 112,
+        "interface_entries": 3136,
+        "interface_queries": 600,
+        "merge_nodes": 3,
+        "crossing_tests": 180,
+        "interface_access_visits": 52,
+        "bridge_candidates": 36,
+        "port_normalization_visits": 546
+      },
+      "timers": {
+        "import_seconds": 0.001156877,
+        "partition_seconds": 1.9733e-05,
+        "reduction_seconds": 1.6888e-05,
+        "composition_seconds": 0.000120381
+      }
+    },
+    {
+      "axis": "regions",
+      "inner": 4,
+      "outer": 8,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.0025083241052925587,
+      "work": {
+        "analyzed_occurrences": 24,
+        "interface_cells": 4,
+        "interface_slot_visits": 128,
+        "interface_ports": 240,
+        "interface_entries": 6720,
+        "interface_queries": 1200,
+        "merge_nodes": 7,
+        "crossing_tests": 420,
+        "interface_access_visits": 104,
+        "bridge_candidates": 84,
+        "port_normalization_visits": 1170
+      },
+      "timers": {
+        "import_seconds": 0.002105553,
+        "partition_seconds": 2.4835000000000002e-05,
+        "reduction_seconds": 2.2610999999999997e-05,
+        "composition_seconds": 0.000321114
+      }
+    },
+    {
+      "axis": "regions",
+      "inner": 4,
+      "outer": 16,
+      "slots": 3,
+      "analysis_inclusive_seconds": 0.004899335093796253,
+      "work": {
+        "analyzed_occurrences": 48,
+        "interface_cells": 4,
+        "interface_slot_visits": 256,
+        "interface_ports": 496,
+        "interface_entries": 13888,
+        "interface_queries": 2400,
+        "merge_nodes": 15,
+        "crossing_tests": 900,
+        "interface_access_visits": 208,
+        "bridge_candidates": 180,
+        "port_normalization_visits": 2418
+      },
+      "timers": {
+        "import_seconds": 0.004203326,
+        "partition_seconds": 4.2148000000000004e-05,
+        "reduction_seconds": 4.1877e-05,
+        "composition_seconds": 0.00053389
+      }
+    },
+    {
+      "axis": "streamed_trips",
+      "trips": 7,
+      "analysis_inclusive_seconds": 0.0006476752460002899,
+      "work": {
+        "analyzed_occurrences": 5,
+        "interface_cells": 3,
+        "interface_slot_visits": 19,
+        "interface_entries": 2128,
+        "merge_nodes": 2,
+        "omitted_bridge_domains": 1
+      },
+      "owned_domains": 1,
+      "semantic_checks": {
+        "payloads": 23,
+        "covers": 20,
+        "query_checks": 2116,
+        "boundary_checks": 34,
+        "access_checks": 23
+      }
+    },
+    {
+      "axis": "streamed_trips",
+      "trips": 1000,
+      "analysis_inclusive_seconds": 0.0007205228321254253,
+      "work": {
+        "analyzed_occurrences": 5,
+        "interface_cells": 3,
+        "interface_slot_visits": 19,
+        "interface_entries": 2128,
+        "merge_nodes": 2,
+        "omitted_bridge_domains": 1
+      },
+      "owned_domains": 1
+    },
+    {
+      "axis": "streamed_trips",
+      "trips": 1000000,
+      "analysis_inclusive_seconds": 0.0006023207679390907,
+      "work": {
+        "analyzed_occurrences": 5,
+        "interface_cells": 3,
+        "interface_slot_visits": 19,
+        "interface_entries": 2128,
+        "merge_nodes": 2,
+        "omitted_bridge_domains": 1
+      },
+      "owned_domains": 1
+    },
+    {
+      "axis": "physical_trips",
+      "form": "streamed",
+      "trips": 7,
+      "analysis_seconds": 0.00033566681668162346,
+      "physical_preparation_allocation_emission_seconds": 0.00013506505638360977,
+      "ordinary_production_inclusive_seconds": 0.000412927009165287,
+      "source_ir_seconds": 0.0006544282659888268,
+      "static": {
+        "set_sites": 9,
+        "wait_sites": 9,
+        "barrier_sites": 0,
+        "guard_sites": 20,
+        "reserved_lanes": 9,
+        "reuse_queries": 9
+      },
+      "families": 3,
+      "source_arithmetic_operations": 76,
+      "source_bytes": 7940,
+      "bounded": {
+        "payloads": 21,
+        "sets": 18,
+        "waits": 18,
+        "barriers": 0,
+        "causal_reuses": 9,
+        "directional_ids": {
+          "1->4": [
+            0,
+            1,
+            2
+          ],
+          "4->2": [
+            0,
+            1,
+            2
+          ],
+          "2->1": [
+            0,
+            1,
+            2
+          ]
+        },
+        "directional_width": {
+          "1->4": 3,
+          "4->2": 3,
+          "2->1": 3
+        },
+        "extra_payload_pairs": 0
+      }
+    },
+    {
+      "axis": "physical_trips",
+      "form": "streamed",
+      "trips": 1000,
+      "analysis_seconds": 0.0003991052508354187,
+      "physical_preparation_allocation_emission_seconds": 8.769286796450615e-05,
+      "ordinary_production_inclusive_seconds": 0.00042921677231788635,
+      "source_ir_seconds": 0.0005847727879881859,
+      "static": {
+        "set_sites": 9,
+        "wait_sites": 9,
+        "barrier_sites": 0,
+        "guard_sites": 20,
+        "reserved_lanes": 9,
+        "reuse_queries": 9
+      },
+      "families": 3,
+      "source_arithmetic_operations": 76,
+      "source_bytes": 7961
+    },
+    {
+      "axis": "physical_trips",
+      "form": "streamed",
+      "trips": 1000000,
+      "analysis_seconds": 0.00033167097717523575,
+      "physical_preparation_allocation_emission_seconds": 6.187800318002701e-05,
+      "ordinary_production_inclusive_seconds": 0.0004334659315645695,
+      "source_ir_seconds": 0.0005444567650556564,
+      "static": {
+        "set_sites": 9,
+        "wait_sites": 9,
+        "barrier_sites": 0,
+        "guard_sites": 20,
+        "reserved_lanes": 9,
+        "reuse_queries": 9
+      },
+      "families": 3,
+      "source_arithmetic_operations": 76,
+      "source_bytes": 7985
+    },
+    {
+      "axis": "physical_trips",
+      "form": "resident_streamed_sequence",
+      "trips": 7,
+      "analysis_seconds": 0.0007219696417450905,
+      "physical_preparation_allocation_emission_seconds": 9.311968460679054e-05,
+      "ordinary_production_inclusive_seconds": 0.0008308910764753819,
+      "source_ir_seconds": 0.0008812588639557362,
+      "static": {
+        "set_sites": 12,
+        "wait_sites": 12,
+        "barrier_sites": 0,
+        "guard_sites": 22,
+        "reserved_lanes": 12,
+        "reuse_queries": 13
+      },
+      "families": 6,
+      "source_arithmetic_operations": 97,
+      "source_bytes": 11554,
+      "bounded": {
+        "payloads": 24,
+        "sets": 21,
+        "waits": 21,
+        "barriers": 0,
+        "causal_reuses": 10,
+        "directional_ids": {
+          "1->4": [
+            0,
+            1,
+            2
+          ],
+          "4->1": [
+            0
+          ],
+          "4->2": [
+            0,
+            1,
+            2
+          ],
+          "2->1": [
+            0,
+            1,
+            2
+          ],
+          "2->4": [
+            0
+          ]
+        },
+        "directional_width": {
+          "1->4": 3,
+          "4->1": 1,
+          "4->2": 3,
+          "2->1": 3,
+          "2->4": 1
+        },
+        "extra_payload_pairs": 0
+      }
+    },
+    {
+      "axis": "physical_trips",
+      "form": "resident_streamed_sequence",
+      "trips": 1000,
+      "analysis_seconds": 0.0007969308644533157,
+      "physical_preparation_allocation_emission_seconds": 0.00010934891179203987,
+      "ordinary_production_inclusive_seconds": 0.0008319756016135216,
+      "source_ir_seconds": 0.0008814600296318531,
+      "static": {
+        "set_sites": 12,
+        "wait_sites": 12,
+        "barrier_sites": 0,
+        "guard_sites": 22,
+        "reserved_lanes": 12,
+        "reuse_queries": 13
+      },
+      "families": 6,
+      "source_arithmetic_operations": 97,
+      "source_bytes": 11581
+    },
+    {
+      "axis": "physical_trips",
+      "form": "resident_streamed_sequence",
+      "trips": 1000000,
+      "analysis_seconds": 0.0007175551727414131,
+      "physical_preparation_allocation_emission_seconds": 7.996289059519768e-05,
+      "ordinary_production_inclusive_seconds": 0.0008032312616705894,
+      "source_ir_seconds": 0.0008123447187244892,
+      "static": {
+        "set_sites": 12,
+        "wait_sites": 12,
+        "barrier_sites": 0,
+        "guard_sites": 22,
+        "reserved_lanes": 12,
+        "reuse_queries": 13
+      },
+      "families": 6,
+      "source_arithmetic_operations": 97,
+      "source_bytes": 11614
+    }
+  ],
+  "qwen": {
+    "input_manifest": {
+      "revision": "f2c80074c0b06ab5bf87fc2bfb06db417fcd35f1",
+      "sources": {
+        "prefill_fwd.py": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+        "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+        "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+        "rms_lm_head.py": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77"
+      },
+      "gate_up_extraction": {
+        "source_lines": [
+          1369,
+          1405
+        ],
+        "body_ast_sha256": "344ebf0fc0b70335f24e153ec757bb0521a67d5bffa1ef5d0028420b4afcad07",
+        "adapter_sha256": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+        "adaptations": [
+          "Ready input tensors replace the external post_norm_ready task dependency at standalone invocation entry.",
+          "The original enclosing band_ob0 and band_core_rot assignments are retained; band remains an explicit parameter.",
+          "Allocate output in the caller; preserve both original projection loops and original launch width."
+        ]
+      },
+      "output_extraction": {
+        "source_lines": [
+          932,
+          953
+        ],
+        "adapter_sha256": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+        "adaptations": [
+          "No compute-body changes; standalone entry changes the JIT role only.",
+          "Configured tests explicitly replace the dynamic layer-row annotation by LAYERS*HIDDEN before parsing."
+        ]
+      },
+      "configured_caller_sha256": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe"
+    },
+    "measurements": [
+      {
+        "kernel": "output",
+        "band": 3,
+        "pypto_enabled": false,
+        "compile_seconds_inclusive": 0.16467807302251458,
+        "realize_sync_seconds_included": null,
+        "report": null,
+        "cpp_hashes": {
+          "output-band3-ptoas/ptoas/out_proj_aic.cpp": "061894919344785ecf4a2eb724b42b2d5e8e56cd3f713a0de519f0a98f644227",
+          "output-band3-ptoas/orchestration/output_projection_caller.cpp": "0846ba67927b2e54005466cd4fc807abf23c78a8f7de7069df386c51e0ab7527",
+          "output-band3-ptoas/kernels/aic/out_proj_aic.cpp": "8ee9d16bbcf807fa6eff2de4bae6821e22ad49bad0d68d48116cddb2432945d7"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      },
+      {
+        "kernel": "output",
+        "band": 3,
+        "pypto_enabled": true,
+        "compile_seconds_inclusive": 0.09190310910344124,
+        "realize_sync_seconds_included": 0.0009901868179440498,
+        "report": {
+          "downstream_autosync_enabled": true,
+          "kernels": [
+            {
+              "function": "out_proj_aic",
+              "selected_route": "pypto",
+              "reason": "complete literal flag plan"
+            }
+          ]
+        },
+        "cpp_hashes": {
+          "output-band3-pypto/ptoas/out_proj_aic.cpp": "5041b704b9455bda046c6219b75c8bd16edfc46ff3a2a029401b081179d52a01",
+          "output-band3-pypto/orchestration/output_projection_caller.cpp": "0846ba67927b2e54005466cd4fc807abf23c78a8f7de7069df386c51e0ab7527",
+          "output-band3-pypto/kernels/aic/out_proj_aic.cpp": "13eb18e2094c21f572950e887ecf19c378dfb834733d29244f75277f0e1fd079"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      },
+      {
+        "kernel": "gate_up",
+        "band": 0,
+        "pypto_enabled": false,
+        "compile_seconds_inclusive": 0.10628533875569701,
+        "realize_sync_seconds_included": null,
+        "report": null,
+        "cpp_hashes": {
+          "gate_up-band0-ptoas/ptoas/gate_up_proj.cpp": "a383f6ecfb18272404ea437af4c8cc1a9e5ee67e0f2c9c15a6e444fe8687c01b",
+          "gate_up-band0-ptoas/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+          "gate_up-band0-ptoas/kernels/aic/gate_up_proj.cpp": "133d208050119628bb0514ab44612b98f260cb4435e16023811c6eae346de33a"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      },
+      {
+        "kernel": "gate_up",
+        "band": 0,
+        "pypto_enabled": true,
+        "compile_seconds_inclusive": 0.12620774377137423,
+        "realize_sync_seconds_included": 0.0036332462914288044,
+        "report": {
+          "downstream_autosync_enabled": true,
+          "kernels": [
+            {
+              "function": "gate_up_proj",
+              "selected_route": "pypto",
+              "reason": "complete literal flag plan"
+            }
+          ]
+        },
+        "cpp_hashes": {
+          "gate_up-band0-pypto/ptoas/gate_up_proj.cpp": "14cd85551d8c31142b158ee3d8bbd35a7227835d7da9b3464bc9985ce520841e",
+          "gate_up-band0-pypto/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+          "gate_up-band0-pypto/kernels/aic/gate_up_proj.cpp": "9a0663a6c14d8bad7ea3e38c356960ad28a333199a8a8df893f2f82c1728463b"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      },
+      {
+        "kernel": "gate_up",
+        "band": 1,
+        "pypto_enabled": false,
+        "compile_seconds_inclusive": 0.10688757291063666,
+        "realize_sync_seconds_included": null,
+        "report": null,
+        "cpp_hashes": {
+          "gate_up-band1-ptoas/ptoas/gate_up_proj.cpp": "60c972d7c6bb3307858d81bacbd12dad0badbde32326fe3aab419deef034ea12",
+          "gate_up-band1-ptoas/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+          "gate_up-band1-ptoas/kernels/aic/gate_up_proj.cpp": "43e638fa7764b503a597fadefe5f0baa87934ec794e7f242a08d961d32fac435"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      },
+      {
+        "kernel": "gate_up",
+        "band": 1,
+        "pypto_enabled": true,
+        "compile_seconds_inclusive": 0.13466946175321937,
+        "realize_sync_seconds_included": 0.0044869850389659405,
+        "report": {
+          "downstream_autosync_enabled": true,
+          "kernels": [
+            {
+              "function": "gate_up_proj",
+              "selected_route": "pypto",
+              "reason": "complete literal flag plan"
+            }
+          ]
+        },
+        "cpp_hashes": {
+          "gate_up-band1-pypto/ptoas/gate_up_proj.cpp": "3d818eb9fd03bcada61e3d8d722d54b5bf683172ea4c017c4ef87773a3926bb8",
+          "gate_up-band1-pypto/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+          "gate_up-band1-pypto/kernels/aic/gate_up_proj.cpp": "1c9bcb6629b62211613ef61f41c03b60a2e01cc179ee622c782049d0d4262edb"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      },
+      {
+        "kernel": "gate_up",
+        "band": 2,
+        "pypto_enabled": false,
+        "compile_seconds_inclusive": 0.09287002915516496,
+        "realize_sync_seconds_included": null,
+        "report": null,
+        "cpp_hashes": {
+          "gate_up-band2-ptoas/ptoas/gate_up_proj.cpp": "6bfae084f0cc7ce736ef9b75dd5b3ab97e2277967bd9577f0aeeae3d84c0ca90",
+          "gate_up-band2-ptoas/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+          "gate_up-band2-ptoas/kernels/aic/gate_up_proj.cpp": "b776ea60477f61d60f44134809cbd8901e23036d719241d9e4395b5b7175ef10"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      },
+      {
+        "kernel": "gate_up",
+        "band": 2,
+        "pypto_enabled": true,
+        "compile_seconds_inclusive": 0.12245883094146848,
+        "realize_sync_seconds_included": 0.00501873018220067,
+        "report": {
+          "downstream_autosync_enabled": true,
+          "kernels": [
+            {
+              "function": "gate_up_proj",
+              "selected_route": "pypto",
+              "reason": "complete literal flag plan"
+            }
+          ]
+        },
+        "cpp_hashes": {
+          "gate_up-band2-pypto/ptoas/gate_up_proj.cpp": "1dd34bea48afaf0478471d9f6b08fc6818d78b5a64f595dc341726e58d59cfdc",
+          "gate_up-band2-pypto/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+          "gate_up-band2-pypto/kernels/aic/gate_up_proj.cpp": "435517f84f4ea9c3661b4739074fe708d5b699cf5373f3d4e6821bc45496617d"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      },
+      {
+        "kernel": "gate_up",
+        "band": 3,
+        "pypto_enabled": false,
+        "compile_seconds_inclusive": 0.09153495822101831,
+        "realize_sync_seconds_included": null,
+        "report": null,
+        "cpp_hashes": {
+          "gate_up-band3-ptoas/ptoas/gate_up_proj.cpp": "5bc2e06d9ce8cafdc11fdaeb5a14d822918ff67ab32b3e777cd6ac10731b0f87",
+          "gate_up-band3-ptoas/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+          "gate_up-band3-ptoas/kernels/aic/gate_up_proj.cpp": "bb8dd2185b9baa0aeb106982c90c03b40a348ca23a08ac6cbbdd1f081e4e4ccc"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      },
+      {
+        "kernel": "gate_up",
+        "band": 3,
+        "pypto_enabled": true,
+        "compile_seconds_inclusive": 0.11705999681726098,
+        "realize_sync_seconds_included": 0.004150121007114649,
+        "report": {
+          "downstream_autosync_enabled": true,
+          "kernels": [
+            {
+              "function": "gate_up_proj",
+              "selected_route": "pypto",
+              "reason": "complete literal flag plan"
+            }
+          ]
+        },
+        "cpp_hashes": {
+          "gate_up-band3-pypto/ptoas/gate_up_proj.cpp": "509785206bf562099017f1042bcf68777ac9b7b996619c3b97d892d29e43743a",
+          "gate_up-band3-pypto/orchestration/gate_up_projection_caller.cpp": "5f4515b4c49f25410dbb6eb30cffcd12f208cd5a982127b5cb9b044f76152fe3",
+          "gate_up-band3-pypto/kernels/aic/gate_up_proj.cpp": "1a8de9e86af23dfa5c8c7b934fb9af1edf09f757a4c60a529ca91a8f27333d16"
+        },
+        "cpp_byte_identical_to_retained_baseline": true
+      }
+    ],
+    "retained_comparison_baseline": {
+      "receipt": "build-py314/rebase-autosync-20261111/qwen-production-cold/receipt.json",
+      "sha256": "cf7e817c733c5af83d8a259453f767d26fd277e5f0bbff2ec3bdc86b9f5ffbd7",
+      "source_revision": "f078143a4314512128e558078683e65fbd390a67",
+      "dirty_source_hashes": {
+        "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "fa54de39f9ad65c0d36a573bf7b9f7a6c49ed380c9b1580945f56a78c013e82f",
+        "python/bindings/modules/testing.cpp": "f0e3cffe3c1cba00297d6e4963888baeebde3c6fd900c6ac054cce374db0a365",
+        "python/pypto/pypto_core/testing.pyi": "6256a6a88b0d67b1b58a3817788db5a7589610e2498b97f013cdbac1ccd8dab0",
+        "src/ir/transforms/utils/compact_sync_analysis.cpp": "5085e3f3fa962deb76d90aeecf671e812cf34534545531cc7604e911065f0af5",
+        "src/ir/transforms/utils/invocation_sync_analysis.cpp": "121c0abd749b63ff50fa61e25019abdda0c3e24fb89322a62286a06348d78377",
+        "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "d24054e97a9bea0b693e115851e2dbe93f583f481b859d82b222f475391ed8bf",
+        "src/ir/transforms/utils/numerical_sync_hierarchy.h": "61c1fd47da5412ca5cd9ddcd81b7cab24f2bbd5694ffbed27e25461c8d89e7b5",
+        "src/ir/transforms/utils/numerical_sync_merge.cpp": "19cf7035a818bbd8b0b6da0200fa54f85b380f75ce027fb5bdde2fe1b66e4a54",
+        "src/ir/transforms/utils/numerical_sync_merge.h": "54b731ff9197125a34d73d6693ee18574a15d791ab862e91425e0925f0948444",
+        "src/ir/transforms/utils/physical_sync_realization.cpp": "7ef41b582497d5c307102abe82b30165b0fe23e6fa4834fec33ff9c615d68e1a",
+        "src/ir/transforms/utils/placed_sync_import.cpp": "b0092036cfb4181605d59e3872901dbc3dffa33bcf65ad02d7ad07c6a4acd0c1",
+        "src/ir/transforms/utils/rotating_sync_analysis.cpp": "79368aad849919fb4fb49e1bc5c8f9967c597a20c1a4dfca09b2f7980c23b1c0",
+        "src/ir/transforms/utils/rotating_sync_analysis.h": "e2df0be6ca1e48bd68c23387f2b69203bbdcbbd3ffca6e4215fb731e267a45c9",
+        "src/ir/transforms/utils/sync_placement.h": "c560ba871894966816301f844b96601d5412ddc0945242175838dc1c711a9611",
+        "tests/ut/ir/transforms/fixtures/qwen_prefill/config.py.source": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+        "tests/ut/ir/transforms/fixtures/qwen_prefill/configured_callers.py.source": "14e7370c89d88f0bece3d000ddf56d339e0686977f0d2d94aa0eef7ac7245efe",
+        "tests/ut/ir/transforms/fixtures/qwen_prefill/constants.py.source": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+        "tests/ut/ir/transforms/fixtures/qwen_prefill/gate_up_projection.py.source": "222af46dbd5d0c1143a939e3fa815e8abdb19393c72ec399a623e2ae0fefc31b",
+        "tests/ut/ir/transforms/fixtures/qwen_prefill/manifest.json": "e9c334a72af5af3553a50cea113cd560d1eace26599a894fa901fbc561e21898",
+        "tests/ut/ir/transforms/fixtures/qwen_prefill/output_projection.py.source": "8eeaf18b1620d5ca5e63017a3bd7eea1e73b00946dbb8390c4ddb528b489b576",
+        "tests/ut/ir/transforms/fixtures/qwen_prefill/prefill_fwd.py.source": "4423da03298fb4ab8be67f105d99f5b1d7da8a2cb1459a52cc837a2b9a635563",
+        "tests/ut/ir/transforms/fixtures/qwen_prefill/rms_lm_head.py.source": "ff3d0c62eaa4aa7ad60db3806b8c7af20ad3bbe81bbdc3f8bddcc277d9df3c77",
+        "tests/ut/ir/transforms/qualify_qwen_physical.py": "52bc51b9b28fd2b03ca7d9e6183b3eebbe2f8f65a9e7d7bb3571746564cd2495",
+        "tests/ut/ir/transforms/qualify_qwen_prefill.py": "e53d79d3f237a4f0f3406e8cf3ddc493d4333a9241178b5de829390196739b81",
+        "tests/ut/ir/transforms/qualify_qwen_production.py": "eb1ac3bcabd88c9f6c6ec8af7002e4ba82cfb665964a390dc0a0e8eb4a9f6414",
+        "tests/ut/ir/transforms/sync_logical_oracle.py": "2e127faa6b7c6002cdda42b0afb7351e0a5b386936ae7c9e58dd0d9400ffdd46",
+        "tests/ut/ir/transforms/sync_matmul_oracle.py": "f7901eb546fcb6456698cf460c0cd85e260dc6397d8493040768518f4fd23482",
+        "tests/ut/ir/transforms/sync_physical_oracle.py": "07e3b3e28705c9ac3a4621c884ed6d54a4f12a904c5bbeedf75d5c6301179c1c",
+        "tests/ut/ir/transforms/sync_qwen_prefill_cases.py": "978daff489ea6bcafb12ca8b5111c156922efeab1b735ffae48f5967e5c6a667",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py": "215df7adf4a6fc4a882c7469e1a0f1ed13e1b5989c26a62d679d13034706666a",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "93cdb67b3e12b0856913503468fe4d106732ff3e380f6fc8628cf168eb8ba451",
+        "tests/ut/ir/transforms/test_qwen_prefill_production.py": "81e36e2574475dd0c1eb8017a3fa864e7b74b8dd2a6ec80f55dd626b81bd30da",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py": "d63e8363ae1fc5ec4cd186e563c04bc8f9115bcc197f40ea31d9e7c851816bb5",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py": "33c2fde1c80c32420f83e4c2adfaad0e2b70527df0597c0672cafaf8e4fc14d0"
+      },
+      "extension_hashes": {
+        "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "0c947fcf45f45b659840f2b79c519a0385c420e7c9815008faa9c0a0418ea595"
+      },
+      "ptoas": {
+        "launcher_hash": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+        "version": "ptoas 0.72"
+      },
+      "scope": "Historical pinned dirty-source artifact comparison, not a fresh baseline timing campaign",
+      "input_manifest_matches_current": true,
+      "ptoas_identity_matches_current": true
+    }
+  },
+  "measurement_scope": {
+    "times": "Single descriptive samples, no speedup claim. Inclusive analysis includes detail timers; physical timer combines preparation/allocation/emission.",
+    "guards": "Executed added IfStmt tests; excludes loop tests and arithmetic internal to predicates.",
+    "physical": "Independent command graph and modeled access agreement on bounded cases; large cases are host-only representation measurements, not native memory feasibility."
+  },
+  "reviews": {
+    "architecture": "accepted",
+    "correctness": "accepted",
+    "algorithm_performance": "accepted"
+  },
+  "device": "not run; existing device campaign stays pinned to baseline",
+  "limitations": [
+    "General symbolic rotating crossing selectors remain unavailable.",
+    "Collective interfaces use a global witness directory; no adjacency-local interface bound.",
+    "Point selectors still inspect retained access lists.",
+    "Collective fixture coverage is MTE2 fills/MTE3 readers; broader reader pipes are not claimed here.",
+    "Moving written GM/reset domains without existing evidence and incomplete fill/read phases refuse.",
+    "Partial Mat interval cases retain missing same-pipe mechanism refusal.",
+    "Native instruction-footprint qualification and entry/return semantics remain separate."
+  ],
+  "build_log": "build-py314/interval-m4-build.log",
+  "log_sha256": {
+    "build-py314/interval-m4-build.log": "1c590a852ef2a71db9c2224c4ad0d3042b9e6bd154d26aa78ec0b9210517296c",
+    "build-py314/interval-m5-gate.log": "71c50f5578af1e95132d338286b858a0667fe29e23a866a112386aaa0655ee1b",
+    "build-py314/interval-m5-buffer-gate.log": "d754fd0f49973d455f7b9bba32d3a28b434b6fd815ce90031054cb57c1a94698"
+  }
+}
