@@ -312,6 +312,7 @@ nav:
           - en/dev/ir/15-physical-demand-realization.md
           - en/dev/ir/16-parameterized-prefill-checkpoint.md
           - en/dev/ir/17-buffered-pipeline-checkpoint.md
+          - en/dev/ir/18-token-pipeline-checkpoint.md
           - en/dev/ir/18-qwen-prefill-pipeline.md
       - Passes:
           - en/dev/passes/index.md
@@ -375,6 +376,7 @@ nav:
           - en/dev/passes/57-materialize_valid_shape_symbols.md
           - en/dev/passes/58-lower_tile_to_buffer.md
           - en/dev/passes/59-realize_sync.md
+          - en/dev/passes/60-logical_sync_pipeline.md
           - en/dev/passes/91-utility_passes.md
           - en/dev/passes/92-diagnostics.md
           - en/dev/passes/99-verifier.md

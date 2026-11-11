@@ -1,0 +1,40 @@
+# 逻辑同步阶段（实验性）
+
+`insert_sync`、`optimize_sync` 和 `lower_sync` 将最小需求分析、逻辑完成令牌
+（completion token）和物理事件分配分开。它们在物理地址分配及 Buffer 降低后
+显式调用，不改变默认编译流程。
+
+```python
+from pypto import passes
+
+with passes.PassContext([], autosync_disjoint_gm=True):
+    logical = passes.insert_sync()(placed_program)
+    logical = passes.optimize_sync()(logical)
+    physical = passes.lower_sync()(logical)
+```
+
+`autosync_disjoint_gm=True` 是调用者提供的不同 GM 参数分配互不重叠的契约。
+`InsertSync` 复用现有访问导入器、最小需求分析及原始坐标令牌导出。
+当前仍对旋转和嵌套导出报告不可用。`OptimizeSync` 验证后原样返回。
+
+`LowerSync` 首先支持直线有限令牌程序：record、completed、join 和 wait。
+它解释实际令牌定义及使用，不重新分析存储来替换手写依赖。记录包含该管线
+此前导入的等待。令牌不消耗，多次使用必须分别建立匹配的物理交接。
+物理 ID 复用要求证明先前消费到后续发布的因果路径。它复用现有资源目录、
+原生保留 ID 及通道着色算法。控制流或同管线放置证明不足时明确拒绝，不能
+把这些拒绝视为物理容量不足。
+
+有限直线程序中，每条管线的等待构成有序链。分析为每个事件保留各管线
+可达的最大等待序号，并分别传播开始、完成和等待状态。记录合并完成状态
+及此前导入的等待。同管线记录的前缀单调，因此 join 等于最新前缀。
+只有前一消费的序号可达后一发布时才复用 ID。这为现有生命周期着色算法
+提供有序后缀关系；最小性仅针对所选逐使用交接方案，不针对所有令牌实现。
+
+共享表达式按不同节点缓存，嵌套语句序列只收集一次。访问恢复仍使用原有
+导入器，其限制及成本单独计入；当前独立降低尚未传递调用者参数范围证据。
+
+迁移完成前 `realize_sync()` 保留原生产路径。最终将成为三个阶段的事务式
+协调器，保持原有启用开关及整核 PTOAS 委托。逻辑匹配和物理复用不证明
+异步负载在函数返回时已完成；原生语义和设备验证仍是独立义务。
+
+完整的当前支持范围见[英文契约](../../../en/dev/passes/60-logical_sync_pipeline.md)。

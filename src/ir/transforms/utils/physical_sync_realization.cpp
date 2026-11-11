@@ -35,6 +35,7 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/sync/isa_macro_resources.h"
 #include "pypto/sync/resource_catalog.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/sync_placement.h"
 
 namespace pypto::ir::sync {
@@ -69,12 +70,12 @@ Direction Pipes(const CompactSyncResult& a, const Family& f) {
 // catalogued V<->S claims belong to the excluded Vec overload. Still consume
 // any applicable fixed claims for the owning core conservatively, and refuse
 // unresolved owners. Vec arithmetic takes its macro from the shared recipe.
-std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, const std::string& target) {
+std::map<Direction, std::set<int>> NativeClaims(const CompactSyncInput& a, const std::string& target) {
   CHECK(target == "a2a3") << "Unsupported physical target: native variants are qualified only for a2a3";
   auto backend = backend::GetBackendInstance(backend::BackendType::Ascend910);
   std::map<Direction, std::set<int>> claimed;
   std::set<std::string> checked;
-  for (const auto& segment : a.input.segments) {
+  for (const auto& segment : a.segments) {
     if (!segment.count) continue;
     for (const auto& site : segment.sites) {
       for (const auto& call : {site.original, site.continuation}) {
@@ -123,7 +124,7 @@ std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, cons
           if (macro == "pto::TEXTRACT" && claim.pool.core == CoreScope::AIV) continue;
           CHECK(claim.pool.kind == ResourceKind::PipelineEvent &&
                 claim.pool.core ==
-                    (a.input.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC) &&
+                    (a.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC) &&
                 claim.source == IsaIdSource::Fixed && claim.lifetime == IsaResourceLifetime::Invocation)
               << "Unavailable native flag owner/variant binding: " << macro;
           for (auto id : claim.ids) claimed[{claim.pool.src, claim.pool.dst}].insert(static_cast<int>(id));
@@ -141,7 +142,7 @@ class Allocator {
       : a_(analysis),
         catalog_(pypto::sync::FindResourceCatalog(target)),
         restricted_(restricted),
-        claimed_(NativeClaims(analysis, target)) {
+        claimed_(SyncNativeClaims(analysis.input, target)) {
     CHECK(catalog_) << "Unavailable synchronization resource catalog: " << target;
     CHECK(a_.input.hardware_target == target)
         << "Synchronization hardware contract differs from lowering target";
@@ -258,31 +259,7 @@ class Allocator {
   const std::vector<int>& Eligible(Direction d) {
     auto [it, fresh] = eligible_.try_emplace(d);
     if (!fresh) return it->second;
-    using pypto::sync::CoreScope;
-    using pypto::sync::ResourceKind;
-    const auto core = a_.input.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC;
-    auto spec = catalog_->FindPool({ResourceKind::PipelineEvent, core, d.first, d.second});
-    CHECK(spec) << "Unavailable directional event pool";
-    auto legal = spec->legal_ids;
-    if (legal.empty()) {
-      legal.resize(spec->capacity);
-      std::iota(legal.begin(), legal.end(), 0);
-    }
-    std::set<int> available;
-    for (auto id : legal)
-      if (std::find(spec->reserved_ids.begin(), spec->reserved_ids.end(), id) == spec->reserved_ids.end() &&
-          !claimed_[d].count(static_cast<int>(id)))
-        available.insert(static_cast<int>(id));
-    if (restricted_) {
-      for (int id : *restricted_) {
-        CHECK(id < static_cast<int>(spec->capacity) &&
-              std::find(legal.begin(), legal.end(), id) != legal.end())
-            << "Requested ID is outside the legal target pool";
-        if (available.count(id)) it->second.push_back(id);
-      }
-    } else {
-      it->second.assign(available.begin(), available.end());
-    }
+    it->second = SyncEligibleIds(a_.input, a_.input.hardware_target, d, restricted_, claimed_);
     return it->second;
   }
   void QualifyBarriers() {
@@ -341,38 +318,17 @@ class Allocator {
       return std::tie(x.family, x.residue) < std::tie(y.family, y.residue);
     };
     std::sort(lanes.begin(), lanes.end(), by_source);
-    std::vector<size_t> waits(lanes.size()), release(lanes.size());
-    std::iota(waits.begin(), waits.end(), 0);
-    std::sort(waits.begin(), waits.end(), [&](size_t x, size_t y) {
-      if (lanes[x].last != lanes[y].last) return a_.ReferenceBefore(lanes[x].last, lanes[y].last);
-      return std::tie(lanes[x].family, lanes[x].residue) < std::tie(lanes[y].family, lanes[y].residue);
-    });
-    size_t next = 0;
-    for (auto i : waits) {
-      while (next < lanes.size() && !Reaches(lanes[i].last, lanes[next].first)) ++next;
-      release[i] = next;
-      INTERNAL_CHECK(next > i) << "Internal error: cyclic physical lane span";
-    }
-    std::vector<std::vector<int>> buckets(lanes.size() + 1);
-    std::vector<int> free;
-    const auto& eligible = Eligible(direction);
-    size_t colors = 0;
+    const auto colors = ColorOrderedSyncLanes(
+        lanes.size(), direction,
+        [&](size_t x, size_t y) {
+          if (lanes[x].last != lanes[y].last) return a_.ReferenceBefore(lanes[x].last, lanes[y].last);
+          return std::tie(lanes[x].family, lanes[x].residue) < std::tie(lanes[y].family, lanes[y].residue);
+        },
+        [&](size_t x, size_t y) { return Reaches(lanes[x].last, lanes[y].first); }, Eligible(direction),
+        result_.finite_minimum);
     for (size_t i = 0; i < lanes.size(); ++i) {
-      free.insert(free.end(), buckets[i].begin(), buckets[i].end());
-      if (free.empty()) {
-        CHECK(colors < eligible.size())
-            << (result_.finite_minimum ? "Fixed-plan scarcity"
-                                       : "Allocation unproved by whole-span reservation")
-            << ": direction=" << PipeTypeToString(direction.first) << "->"
-            << PipeTypeToString(direction.second) << " overlap_at_publication=" << i
-            << " required_at_least=" << colors + 1 << " eligible=" << eligible.size();
-        free.push_back(eligible[colors++]);
-      }
-      int id = free.back();
-      free.pop_back();
       const auto& lane = lanes[i];
-      result_.families[lane.family].ids[lane.residue] = id;
-      buckets[release[i]].push_back(id);
+      result_.families[lane.family].ids[lane.residue] = colors[i];
     }
   }
 };
@@ -623,6 +579,78 @@ ExprPtr DominatingBlock(const FunctionPtr& owner) {
 }
 
 }  // namespace
+SyncNativeReservations SyncNativeClaims(const CompactSyncInput& input, const std::string& target) {
+  return NativeClaims(input, target);
+}
+std::vector<int> SyncEligibleIds(const CompactSyncInput& input, const std::string& target,
+                                 SyncDirection direction, const std::optional<std::vector<int>>& restricted,
+                                 const SyncNativeReservations& claimed) {
+  using pypto::sync::CoreScope;
+  using pypto::sync::ResourceKind;
+  const auto* catalog = pypto::sync::FindResourceCatalog(target);
+  CHECK(catalog) << "Unavailable synchronization resource catalog: " << target;
+  CHECK(input.hardware_target == target) << "Synchronization hardware contract differs from lowering target";
+  const auto core = input.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC;
+  auto spec = catalog->FindPool({ResourceKind::PipelineEvent, core, direction.first, direction.second});
+  CHECK(spec) << "Unavailable directional event pool";
+  auto legal = spec->legal_ids;
+  if (legal.empty()) {
+    legal.resize(spec->capacity);
+    std::iota(legal.begin(), legal.end(), 0);
+  }
+  std::set<int> available;
+  const auto owners = claimed.find(direction);
+  for (auto id : legal)
+    if (std::find(spec->reserved_ids.begin(), spec->reserved_ids.end(), id) == spec->reserved_ids.end() &&
+        (owners == claimed.end() || !owners->second.count(static_cast<int>(id))))
+      available.insert(static_cast<int>(id));
+  std::vector<int> result;
+  if (restricted) {
+    std::set<int> unique;
+    for (int id : *restricted) {
+      CHECK(id >= 0 && unique.insert(id).second) << "Invalid/duplicate eligible ID";
+      CHECK(id < static_cast<int>(spec->capacity) && std::find(legal.begin(), legal.end(), id) != legal.end())
+          << "Requested ID is outside the legal target pool";
+      if (available.count(id)) result.push_back(id);
+    }
+  } else {
+    result.assign(available.begin(), available.end());
+  }
+  return result;
+}
+std::vector<int> ColorOrderedSyncLanes(size_t count, SyncDirection direction,
+                                       const std::function<bool(size_t, size_t)>& wait_before,
+                                       const std::function<bool(size_t, size_t)>& reusable,
+                                       const std::vector<int>& eligible, bool finite_minimum) {
+  std::vector<size_t> waits(count), release(count);
+  std::iota(waits.begin(), waits.end(), 0);
+  std::sort(waits.begin(), waits.end(), wait_before);
+  size_t next = 0;
+  for (auto i : waits) {
+    while (next < count && !reusable(i, next)) ++next;
+    release[i] = next;
+    INTERNAL_CHECK(next > i) << "Internal error: cyclic physical lane span";
+  }
+  std::vector<std::vector<int>> buckets(count + 1);
+  std::vector<int> free, result(count);
+  size_t colors = 0;
+  for (size_t i = 0; i < count; ++i) {
+    free.insert(free.end(), buckets[i].begin(), buckets[i].end());
+    if (free.empty()) {
+      CHECK(colors < eligible.size())
+          << (finite_minimum ? "Fixed-plan scarcity" : "Allocation unproved by whole-span reservation")
+          << ": direction=" << PipeTypeToString(direction.first) << "->" << PipeTypeToString(direction.second)
+          << " overlap_at_publication=" << i << " required_at_least=" << colors + 1
+          << " eligible=" << eligible.size();
+      free.push_back(eligible[colors++]);
+    }
+    const int id = free.back();
+    free.pop_back();
+    result[i] = id;
+    buckets[release[i]].push_back(id);
+  }
+  return result;
+}
 PhysicalSyncRealization RealizePhysicalSync(const CompactSyncResult& analysis, const std::string& target,
                                             const std::optional<std::vector<int>>& eligible_ids) {
   auto result = Allocator(analysis, target, eligible_ids).Run();

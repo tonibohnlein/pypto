@@ -33,3 +33,5 @@ the page covering what you are changing.
 - [Passes](../passes/index.md) — the transformations that run over this IR.
 - [Python IR Syntax Specification](../language/00-python_syntax.md) — the surface syntax the parser accepts.
 - [IR Verifier](../passes/99-verifier.md) — the property verifiers that check IR legality between passes.
+
+See [RFC token pipeline checkpoint](18-token-pipeline-checkpoint.md) for finite logical-to-physical migration evidence.

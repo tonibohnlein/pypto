@@ -93,6 +93,7 @@ PyPTO IR 变换的参考文档，按阅读顺序组织。实际执行顺序请�
 
 | 页面 | 内容 |
 | ---- | ---- |
+| [逻辑同步阶段](60-logical_sync_pipeline.md) | 实验性独立 InsertSync、OptimizeSync 和 LowerSync |
 | [工具 Pass](91-utility_passes.md) | 在流水线多个位置运行的归一化与清理 pass |
 | [诊断系统](92-diagnostics.md) | 编译期警告与性能提示的统一咨询通道 |
 | [IR 验证器](99-verifier.md) | 在 pass 之间校验 IR 正确性的可插拔属性验证器 |
