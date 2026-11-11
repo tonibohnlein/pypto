@@ -44,6 +44,49 @@ int64_t Checked(__int128 value) {
       << "Synchronization import requires nonnegative nonoverflowing index arithmetic";
   return static_cast<int64_t>(value);
 }
+// Exact contiguous byte evidence for both admission and retained exports.
+// No enclosure or partial boxed layout is flattened into an exact interval.
+std::optional<std::pair<int64_t, int64_t>> PhysicalInterval(const SyncStorage& storage,
+                                                            const SyncAccess& access) {
+  if (!access.exact_footprint || access.row_step || access.column_step || access.after_first ||
+      !storage.row_parameters.empty() || !storage.column_parameters.empty() || storage.row_block ||
+      storage.column_block || storage.row_extent_parameter)
+    return std::nullopt;
+  const auto row_end = __int128(access.row) + access.rows;
+  const auto column_end = __int128(access.column) + access.columns;
+  if (access.row < 0 || access.column < 0 || access.rows <= 0 || access.columns <= 0 ||
+      row_end > storage.rows || column_end > storage.columns)
+    return std::nullopt;
+  __int128 begin = 0, end = 0;
+  if (storage.byte_coordinates) {
+    if (access.row != 0 || access.rows != 1) return std::nullopt;
+    begin = access.column;
+    end = column_end;
+  } else {
+    const auto elements = __int128(storage.rows) * storage.columns;
+    const auto slot_bytes = storage.slot_count == 1 ? storage.bytes : storage.slot_bytes;
+    if (elements <= 0 || slot_bytes <= 0 || slot_bytes % elements) return std::nullopt;
+    const auto bytes = slot_bytes / elements;
+    if (storage.layout && storage.layout->slayout_ != TileLayout::none_box) {
+      // Whole qualified fractal tiles are contiguous; partial logical
+      // rectangles need a layout-specific interval proof, not flattening.
+      if (access.row || access.column || access.rows != storage.rows || access.columns != storage.columns)
+        return std::nullopt;
+      end = slot_bytes;
+    } else if (!storage.layout || storage.layout->blayout_ == TileLayout::row_major) {
+      if (access.rows != 1 && (access.column || access.columns != storage.columns)) return std::nullopt;
+      begin = (__int128(access.row) * storage.columns + access.column) * bytes;
+      end = begin + __int128(access.rows) * access.columns * bytes;
+    } else if (storage.layout->blayout_ == TileLayout::col_major) {
+      if (access.columns != 1 && (access.row || access.rows != storage.rows)) return std::nullopt;
+      begin = (__int128(access.column) * storage.rows + access.row) * bytes;
+      end = begin + __int128(access.rows) * access.columns * bytes;
+    } else {
+      return std::nullopt;
+    }
+  }
+  return std::make_pair(Checked(begin), Checked(end));
+}
 int64_t Constant(const ExprPtr& e) {
   auto c = As<ConstInt>(e);
   CHECK(c) << "Synchronization import requires a constant extent/address";
@@ -277,6 +320,10 @@ class Importer {
   struct VecView {
     int64_t address, pitch;
     BufferTypePtr type;
+    // Byte translation in one original counted-loop frame. The maximum
+    // displacement is proved against the parent view, not sampled at visit 0.
+    int64_t step = 0, last_displacement = 0;
+    ForStmtPtr frame;
   };
   std::unordered_map<const Expr*, VecView> vec_views;
   std::optional<size_t> vec_storage;
@@ -350,8 +397,9 @@ class Importer {
     CHECK(type->shape_ == type->valid_shape_ &&
           (backend::DenseBufferBytes(type) || backend::IsColumnVectorBuffer(type)))
         << "Synchronization Vec views require static full-valid dense descriptors";
-    const auto end = Checked(__int128(view.address) + __int128(type->shape_[0] - 1) * view.pitch +
-                             __int128(type->shape_[1]) * type->dtype_.GetByte());
+    const auto end =
+        Checked(__int128(view.address) + view.last_displacement + __int128(type->shape_[0] - 1) * view.pitch +
+                __int128(type->shape_[1]) * type->dtype_.GetByte());
     for (const auto& old : result.storage) {
       CHECK(old.space != MemorySpace::Vec || old.byte_coordinates ||
             view.address >= old.address + old.bytes || old.address >= end)
@@ -367,18 +415,39 @@ class Importer {
     objects[var.get()] = *vec_storage;
     vec_views.emplace(var.get(), std::move(view));
   }
-  void View(const AssignStmtPtr& assign, const CallPtr& call) {
+  void View(const AssignStmtPtr& assign, const CallPtr& call, const SyncSegment& segment = {}) {
     OpRegistry::GetInstance().ValidateBufferCall(call);
     auto source = vec_views.find(call->args_[0].get());
-    CHECK(source != vec_views.end()) << "Synchronization view needs a qualified Vec source";
+    CHECK(source != vec_views.end()) << "Synchronization storage/view needs a qualified Vec source";
     auto view = source->second;
     auto type = As<BufferType>(assign->var_->GetType());
     CHECK(type && type->shape_.size() == 2) << "Synchronization view requires rank two";
     if (IsOp(call, "buffer.subview")) {
       const auto offsets = As<MakeTuple>(call->args_[1]);
-      const auto row = Constant(offsets->elements_[0]), column = Constant(offsets->elements_[1]);
-      view.address = Checked(__int128(view.address) + __int128(row) * view.pitch +
-                             __int128(column) * view.type->dtype_.GetByte());
+      const auto row = As<ConstInt>(offsets->elements_[0])
+                           ? AffineCoordinate{Constant(offsets->elements_[0]), 0}
+                           : Coordinate(offsets->elements_[0], segment);
+      const auto column = As<ConstInt>(offsets->elements_[1])
+                              ? AffineCoordinate{Constant(offsets->elements_[1]), 0}
+                              : Coordinate(offsets->elements_[1], segment);
+      CHECK(row.parameters.empty() && column.parameters.empty() && row.frames.empty() &&
+            column.frames.empty() && !row.block && !column.block)
+          << "Vec subview translation needs one original loop frame";
+      CHECK(!view.frame || view.frame == segment.original_loop)
+          << "Vec subview belongs to another occurrence frame";
+      const auto last = std::max<int64_t>(0, segment.count - 1);
+      CHECK(__int128(row.first) + __int128(last) * row.second + type->shape_[0] <= view.type->shape_[0] &&
+            __int128(column.first) + __int128(last) * column.second + type->shape_[1] <= view.type->shape_[1])
+          << "Vec subview exceeds its proved parent window";
+      view.address = Checked(__int128(view.address) + __int128(row.first) * view.pitch +
+                             __int128(column.first) * view.type->dtype_.GetByte());
+      view.step = Checked(__int128(view.step) + __int128(row.second) * view.pitch +
+                          __int128(column.second) * view.type->dtype_.GetByte());
+      if (view.step) {
+        CHECK(segment.original_loop) << "Moving Vec view has no original counted frame";
+        view.frame = segment.original_loop;
+        view.last_displacement = Checked(__int128(last) * view.step);
+      }
       // Inherit the parent's pitch, including through nested subviews.
     } else {
       CHECK(view.pitch == Checked(__int128(view.type->shape_[1]) * view.type->dtype_.GetByte()))
@@ -518,17 +587,19 @@ class Importer {
       auto id = Storage(call->args_[arg]);
       if (auto found = vec_views.find(call->args_[arg].get()); found != vec_views.end()) {
         const auto& view = found->second;
+        CHECK(!view.frame || view.frame == segment.original_loop)
+            << "Vec view use belongs to another occurrence frame";
         const auto width = Checked(__int128(view.type->shape_[1]) * view.type->dtype_.GetByte());
         // Dense footprints use one interval. Strided views retain one interval
         // per physical row, never an enclosing rectangle that fills the gaps.
         if (view.pitch == width) {
-          site.accesses.push_back(Access(id, write, {0, 0}, {view.address, 0}, 1,
+          site.accesses.push_back(Access(id, write, {0, 0}, {view.address, view.step}, 1,
                                          Checked(__int128(width) * view.type->shape_[0]), segment));
         } else {
           for (int64_t row = 0; row < view.type->shape_[0]; ++row)
-            site.accesses.push_back(Access(id, write, {0, 0},
-                                           {Checked(__int128(view.address) + __int128(row) * view.pitch), 0},
-                                           1, width, segment));
+            site.accesses.push_back(Access(
+                id, write, {0, 0}, {Checked(__int128(view.address) + __int128(row) * view.pitch), view.step},
+                1, width, segment));
         }
         return;
       }
@@ -594,8 +665,8 @@ class Importer {
             << "Unaligned boxed extraction requires a separate footprint contract";
       }
       site.accesses.push_back(Access(sid, false, row, column, t.rows, t.columns, segment));
-      CHECK(!extract || result.storage[sid].slot_count == 1)
-          << "Partial rotating-slot extraction requires a within-slot atom certificate";
+      CHECK(!extract || s.slot_count == 1 || PhysicalInterval(s, site.accesses.back()))
+          << "Rotating-slot extraction requires an exact contiguous within-slot interval";
       ApplySlot(site.accesses.back(), call->args_[0], segment);
       modes[0].first = true;
       whole(target, true);
@@ -691,6 +762,8 @@ class Importer {
         auto call = As<Call>(assign->value_);
         if (call && IsOp(call, "buffer.slot"))
           SelectSlot(assign, segment);
+        else if (call && (IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape")))
+          View(assign, call, segment);
         else
           DefineCoordinate(assign, segment);
       } else if (auto eval = As<EvalStmt>(s)) {
@@ -1224,6 +1297,23 @@ std::map<std::string, SyncParameterBounds> CollectSyncParameterBounds(const Prog
                                                                       SyncParameterWork* work) {
   return CollectSyncInvocationEvidence(program, work).parameters;
 }
+// Qualify only already recovered exact geometry. This is one pass over static
+// access descriptions: a noncontiguous rectangle is not expanded into rows and
+// no enclosing interval is substituted for its footprint. Coordinates are
+// relative to the canonical storage identity (including the Vec byte domain).
+static void QualifyPhysicalIntervals(CompactSyncInput& input) {
+  for (auto& segment : input.segments) {
+    for (auto& site : segment.sites) {
+      for (auto& access : site.accesses) {
+        ++input.interval_access_visits;
+        const auto& storage = input.storage.at(access.storage);
+        access.physical_interval = PhysicalInterval(storage, access);
+        if (access.physical_interval) ++input.qualified_intervals;
+      }
+    }
+  }
+}
+
 CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target,
                                   const SyncParameterBounds& parameter_bounds,
                                   const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
@@ -1297,6 +1387,7 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
     importer.result.region_tree = ImportStructuredBody(importer, function->body_, frames, nested);
     CHECK(QualifyStartupScopes(*importer.result.region_tree, importer.result).pending.empty())
         << "Initialization scope is outside the retained source tree";
+    QualifyPhysicalIntervals(importer.result);
     return std::move(importer.result);
   }
   for (const auto& stmt : Statements(function->body_)) {
@@ -1381,6 +1472,7 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
             << "Rotating family requires one common stride within a region";
       }
   }
+  QualifyPhysicalIntervals(importer.result);
   return std::move(importer.result);
 }
 }  // namespace pypto::ir::sync

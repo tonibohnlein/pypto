@@ -295,7 +295,13 @@ def describe_placed_sync_input(
     parameter_bounds: dict[int, tuple[int, int]] = {},
     block_bounds: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
-    """Inspect qualified physical accesses without constructing demands or exports."""
+    """Inspect accesses and optional exact byte intervals without constructing demands.
+
+    A missing physical_intervals entry denotes unavailable interval geometry,
+    not absence. interval_access_visits counts static qualification work.
+    An analyzed region also reports interval tree work separately from atom tests.
+    collective_witnesses counts certified crossing points, not a complete cell partition.
+    """
     ...
 
 class SyncInvocationAnalysis:

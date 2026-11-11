@@ -202,9 +202,9 @@ def test_static_stage_growth_is_charged_in_normalized_fragments(stages):
     result = testing.analyze_placed_sync(rotating_fixture(1000, [(5, 1)], schedule), True)
     description = result.describe()
     region = description["regions"][0]
-    sites, fragments = len(region["sites"]), region["rotating_fragments"]
+    sites, fragments = len(region["sites"]), region["rotating_fragments"] + region["interval_fragments"]
     assert sites == 3 * stages
-    assert len(region["generators"]) <= 2 * fragments
+    assert len(region["generators"]) <= 7 * sites
     assert region["sweep_visits"] <= 4 * fragments
     assert region["sort_comparisons"] <= 12 * fragments * math.ceil(math.log2(fragments + 1))
     assert region["retained_frontier_entries"] <= 4 * 7 * sites

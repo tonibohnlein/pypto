@@ -84,6 +84,9 @@ struct SyncAccess {
   // Original normalized coordinate controlling row_step/column_step. Null
   // means invariant geometry. It may be an enclosing frame of a finite leaf.
   ForStmtPtr coordinate_frame;
+  // Exact half-open physical byte range within the canonical slot. Missing
+  // means this geometry has no admitted interval export, never an empty effect.
+  std::optional<std::pair<int64_t, int64_t>> physical_interval;
 };
 struct SyncSite {
   CallPtr original;
@@ -140,6 +143,7 @@ struct CompactSyncInput {
   std::optional<std::pair<int64_t, int64_t>> block_bounds;
   std::optional<SyncRegion> region_tree;
   size_t coordinate_nodes = 0, coordinate_flatten_visits = 0, coordinate_coefficient_entries = 0;
+  size_t interval_access_visits = 0, qualified_intervals = 0;
 };
 // Explicit qualification, not a default alias assumption. Unsupported input
 // throws a documented ValueError; no effects are skipped. Enclosures are explicit
@@ -200,6 +204,10 @@ struct CompactSegmentResult {
   std::map<size_t, std::vector<std::pair<size_t, size_t>>> storage_accesses;
   std::array<int64_t, kPipeCount> pipe_sizes{};
   size_t rotating_fragments = 0, modular_groups = 0, sort_comparisons = 0, sweep_visits = 0;
+  // Interval extraction work, separate from legacy atom incidences. Tree
+  // entries count total allocated nodes across groups, not peak live bytes.
+  size_t interval_domains = 0, interval_fragments = 0, interval_endpoints = 0;
+  size_t interval_queries = 0, interval_updates = 0, interval_node_visits = 0, interval_tree_entries = 0;
   size_t atom_tests = 0, shortest_path_runs = 0, shortest_path_edge_visits = 0;
   size_t retained_frontier_entries = 0, quotient_edges = 0;
   std::optional<__int128> Threshold(size_t source, bool sc, size_t target, bool tc) const;
@@ -225,6 +233,7 @@ class CompactSyncResult {
   size_t analyzed_occurrences = 0, cells = 0, graph_edges = 0;
   size_t class_tests = 0, class_lookup_tests = 0, port_pair_tests = 0, crossing_path_searches = 0;
   std::shared_ptr<const NumericalSyncHierarchy> hierarchy;
+  size_t collective_domains = 0, collective_witnesses = 0, collective_access_visits = 0;
   size_t interface_cells = 0, interface_slot_visits = 0, interface_ports = 0, interface_entries = 0;
   size_t interface_queries = 0, merge_nodes = 0, crossing_tests = 0;
   size_t interface_access_visits = 0, bridge_candidates = 0, port_normalization_visits = 0;

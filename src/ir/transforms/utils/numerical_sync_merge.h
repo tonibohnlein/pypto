@@ -79,10 +79,19 @@ struct NumericalOccurrencePath {
   // Outermost first: radix and reference-order payload stride.
   std::vector<std::pair<int64_t, NumericalOrdinal>> frames;
 };
+// Complete schedule proof for a byte domain: full monotone row fills followed
+// by finite interval readers covering every row. Witnesses suffice for crossing
+// generation; they are NOT a materialized cell partition or a selector answer.
+struct CollectiveSyncDomain {
+  int64_t row_bytes = 0, rows = 0;
+  std::vector<size_t> fill_leaves;
+  std::vector<int64_t> witness_columns;
+};
 class NumericalSyncHierarchy {
  public:
   std::shared_ptr<const NumericalNode> root;
   std::vector<NumericalCell> cells;
+  std::map<size_t, CollectiveSyncDomain> collective_domains;
   std::vector<NumericalOrdinal> segment_offsets;
   std::optional<NumericalSourceLayout> source_layout;
   std::vector<NumericalOccurrencePath> source_paths;

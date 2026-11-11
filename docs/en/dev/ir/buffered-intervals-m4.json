@@ -1,0 +1,296 @@
+{
+  "source_revision": "af9cfa8bb85ecdea4b5dd728ea53b8244c238534",
+  "source_hashes": {
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "a8ec50a10a4a1ffdc24e90cbd7feb02bb2a50a24d224fd4438b6a9bcd1d00eba",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "ed5b36f929d1f0b208e617ab1bf0203d6547db39d877b302e8ef1ff3ca89ca45",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.h": "31474d5f6e6cae3d3979d2b68822913d9b879b5599e8480af7c2d4c90e3fe436",
+    "tests/ut/ir/transforms/qualify_buffered_intervals.py": "4f44cb412f53b26fd46343fc6bdd95228e2e8708be2dd77201c9d220ae442ab3",
+    "tests/ut/ir/transforms/test_collective_sync_realization.py": "4a0887786a36dfc534b002eea22fe840ffed3c74031b0c7434a92cb33c6f41ef"
+  },
+  "extension_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "d3c77d461f3dd850153771abef592ba978a5d123e1ee052b847e7a752b0a9054"
+  },
+  "device": "not run",
+  "timing": "single descriptive samples; no speedup claim",
+  "cases": [
+    {
+      "rows": 5,
+      "visits": 0,
+      "analysis_seconds_inclusive": 0.0004088659770786762,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 2,
+      "interface_queries": 15,
+      "interface_ports": 12,
+      "merge_nodes": 1,
+      "source_coordinate_entries": 6,
+      "interface_entries": 336,
+      "analyzed_occurrences": 2,
+      "semantic": {
+        "payloads": 0,
+        "covers": 0,
+        "query_checks": 0,
+        "boundary_checks": 6,
+        "access_checks": 0
+      },
+      "physical": {
+        "set_sites": 0,
+        "wait_sites": 0,
+        "barrier_sites": 0,
+        "guard_sites": 0,
+        "reuse_queries": 0,
+        "reserved_lanes": 0,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 4.976987838745117e-05,
+      "physical_ir_sha256": "6291839ce22c08d7e4fb019c7ecab7723220ddf9e09f5e6db377ac895c61debb",
+      "emitted_checks": {
+        "executed_handoffs": 0,
+        "payload_order_pairs": 0,
+        "directional_widths": {},
+        "ids": {},
+        "excess_pairs": 0
+      }
+    },
+    {
+      "rows": 5,
+      "visits": 1,
+      "analysis_seconds_inclusive": 0.00026785023510456085,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 12,
+      "merge_nodes": 1,
+      "source_coordinate_entries": 6,
+      "interface_entries": 336,
+      "analyzed_occurrences": 2,
+      "semantic": {
+        "payloads": 6,
+        "covers": 1,
+        "query_checks": 144,
+        "boundary_checks": 22,
+        "access_checks": 6
+      },
+      "physical": {
+        "set_sites": 1,
+        "wait_sites": 1,
+        "barrier_sites": 0,
+        "guard_sites": 1,
+        "reuse_queries": 1,
+        "reserved_lanes": 1,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 0.00013074325397610664,
+      "physical_ir_sha256": "12e00f919622a9738618e46fda5527261c58754469e6a7789fbb3a5493c219ba",
+      "emitted_checks": {
+        "executed_handoffs": 1,
+        "payload_order_pairs": 56,
+        "directional_widths": {
+          "(PipeType.MTE2, PipeType.MTE3)": 1
+        },
+        "ids": {
+          "(PipeType.MTE2, PipeType.MTE3)": [
+            0
+          ]
+        },
+        "excess_pairs": 0
+      }
+    },
+    {
+      "rows": 5,
+      "visits": 3,
+      "analysis_seconds_inclusive": 0.00035075098276138306,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 36,
+      "merge_nodes": 3,
+      "source_coordinate_entries": 6,
+      "interface_entries": 1008,
+      "analyzed_occurrences": 2,
+      "semantic": {
+        "payloads": 18,
+        "covers": 5,
+        "query_checks": 1296,
+        "boundary_checks": 22,
+        "access_checks": 18
+      },
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 8.138874545693398e-05,
+      "physical_ir_sha256": "2a8c2d9fbe52ed22e6ae70c255d67af11c16e50fa0ee30f5fee437dd1e89271b",
+      "emitted_checks": {
+        "executed_handoffs": 5,
+        "payload_order_pairs": 600,
+        "directional_widths": {
+          "(PipeType.MTE2, PipeType.MTE3)": 1,
+          "(PipeType.MTE3, PipeType.MTE2)": 1
+        },
+        "ids": {
+          "(PipeType.MTE2, PipeType.MTE3)": [
+            0
+          ],
+          "(PipeType.MTE3, PipeType.MTE2)": [
+            0
+          ]
+        },
+        "excess_pairs": 0
+      }
+    },
+    {
+      "rows": 5,
+      "visits": 1000,
+      "analysis_seconds_inclusive": 0.0005486239679157734,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 180,
+      "merge_nodes": 15,
+      "source_coordinate_entries": 6,
+      "interface_entries": 5040,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 7.660919800400734e-05,
+      "physical_ir_sha256": "7beda0ad7added618296914437b7a8050c595382b92ed18073732b9b3e527349"
+    },
+    {
+      "rows": 5,
+      "visits": 1000000,
+      "analysis_seconds_inclusive": 0.0006597847677767277,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 312,
+      "merge_nodes": 26,
+      "source_coordinate_entries": 6,
+      "interface_entries": 8736,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 5.95911405980587e-05,
+      "physical_ir_sha256": "de803f77e94d5ace9a900d076a3904f14bb629995d18c3db7f460bec81ae5334"
+    },
+    {
+      "rows": 1000,
+      "visits": 3,
+      "analysis_seconds_inclusive": 0.00035460107028484344,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 36,
+      "merge_nodes": 3,
+      "source_coordinate_entries": 6,
+      "interface_entries": 1008,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 5.495408549904823e-05,
+      "physical_ir_sha256": "e3e076a48adb08710e579fb8eb31836ed2ac1680a56b69941daf981adfeb67a3"
+    },
+    {
+      "rows": 1000000,
+      "visits": 3,
+      "analysis_seconds_inclusive": 0.0002822889946401119,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_ports": 36,
+      "merge_nodes": 3,
+      "source_coordinate_entries": 6,
+      "interface_entries": 1008,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": {
+        "set_sites": 2,
+        "wait_sites": 2,
+        "barrier_sites": 0,
+        "guard_sites": 4,
+        "reuse_queries": 2,
+        "reserved_lanes": 2,
+        "native_reserved_ids": [],
+        "finite_minimum": false,
+        "guarantee": "equal selected order under qualified direct-command model",
+        "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit"
+      },
+      "physical_seconds": 5.7684723287820816e-05,
+      "physical_ir_sha256": "5ceb2bece8e7567bf7a742f01663b41c007f9a88e72f99081f748d0afe91573e"
+    }
+  ],
+  "stage": "M4",
+  "tests": {
+    "passed": 289,
+    "warnings": 20,
+    "seconds": 314.93,
+    "log": "build-py314/interval-m4-gate.log",
+    "command": "/usr/bin/python3 -m pytest -q tests/ut/ir/transforms/test_collective_sync_realization.py tests/ut/ir/transforms/test_collective_sync_interface.py tests/ut/ir/transforms/test_nested_sync_repetition.py tests/ut/ir/transforms/test_scoped_physical_sync.py tests/ut/ir/transforms/test_buffered_sync_realization.py tests/ut/ir/transforms/test_qwen_prefill_pipeline.py"
+  },
+  "reviews": {
+    "architecture": "accepted",
+    "correctness": "accepted",
+    "algorithm_performance": "accepted"
+  },
+  "reproduce": "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_buffered_intervals --collective --realization --output build-py314/buffered-intervals-m4-raw.json"
+}

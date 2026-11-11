@@ -1,0 +1,136 @@
+{
+  "source_revision": "fe2d51d902d1ceaea38b65cd0043c17ffd66c353",
+  "source_hashes": {
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "ad27f5678e1782b7a4caa96ebccb0c1499fd86318c2b085c36302f0cf2a55b6f",
+    "python/bindings/modules/testing.cpp": "1897abd0b65ac2920895ae64b8a6725493618911633002244830bca598620914",
+    "python/pypto/pypto_core/testing.pyi": "376097f208d954f897fdc65b3f40f83acb9b87975305a018aebb8652461ca740",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "d546c23edad58c839a2b4dc3d6caa0fef3189ef56498fe3ea816e7ad45c0ece4",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "95904321c25b78e59d1a2d361b36405b760e8dea4228f3cd53a3e17c6ee30986",
+    "src/ir/transforms/utils/numerical_sync_merge.h": "651a690c75f70b94c5c3df9c5cc2c48608fdf0889e91d1ebe9fb0e6172badf31",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "b5e61d8e233bfdeaf5d8085a45b92769f2f7a0d22e49307b3cdcde3442d217f1",
+    "tests/ut/ir/transforms/qualify_buffered_intervals.py": "5c968ffb219bb293700abae583c3cafe31999f6399fa7d996e4919d5b7a999dd",
+    "tests/ut/ir/transforms/test_collective_sync_interface.py": "331d15a4a3b143f503296e6a68cff5c55732e25ab0e15bac6328001635fbd921",
+    "tests/ut/ir/transforms/test_vec_sync_analysis.py": "d8f2200da22ab3275a197309eaa898eb1c4e5789a835446e39c6fd3e4a5f3784"
+  },
+  "extension_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "659266f551c88dc28cb25c57020208018bda155b7d8d21279609fc03e339d404"
+  },
+  "device": "not run",
+  "timing": "single descriptive samples; no speedup claim",
+  "cases": [
+    {
+      "rows": 8,
+      "static_phases": 1,
+      "analysis_seconds_inclusive": 0.0003423010930418968,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_entries": 336,
+      "analyzed_occurrences": 2,
+      "semantic": {
+        "payloads": 9,
+        "covers": 1,
+        "query_checks": 324,
+        "boundary_checks": 34,
+        "access_checks": 9
+      },
+      "physical": "not requested in M3"
+    },
+    {
+      "rows": 1000,
+      "static_phases": 1,
+      "analysis_seconds_inclusive": 0.00019845599308609962,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_entries": 336,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": "not requested in M3"
+    },
+    {
+      "rows": 1000000,
+      "static_phases": 1,
+      "analysis_seconds_inclusive": 0.00017032213509082794,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 4,
+      "interface_cells": 3,
+      "interface_queries": 15,
+      "interface_entries": 336,
+      "analyzed_occurrences": 2,
+      "semantic": "scaling only",
+      "physical": "not requested in M3"
+    },
+    {
+      "rows": 8,
+      "static_phases": 2,
+      "analysis_seconds_inclusive": 0.0003034682013094425,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 8,
+      "interface_cells": 3,
+      "interface_queries": 30,
+      "interface_entries": 1008,
+      "analyzed_occurrences": 4,
+      "semantic": {
+        "payloads": 18,
+        "covers": 3,
+        "query_checks": 1296,
+        "boundary_checks": 34,
+        "access_checks": 18
+      },
+      "physical": "not requested in M3"
+    },
+    {
+      "rows": 8,
+      "static_phases": 8,
+      "analysis_seconds_inclusive": 0.0011156247928738594,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 32,
+      "interface_cells": 3,
+      "interface_queries": 120,
+      "interface_entries": 5040,
+      "analyzed_occurrences": 16,
+      "semantic": {
+        "payloads": 72,
+        "covers": 15,
+        "query_checks": 20736,
+        "boundary_checks": 34,
+        "access_checks": 72
+      },
+      "physical": "not requested in M3"
+    },
+    {
+      "rows": 8,
+      "static_phases": 32,
+      "analysis_seconds_inclusive": 0.004046272952109575,
+      "collective_domains": 1,
+      "collective_witnesses": 2,
+      "collective_access_visits": 128,
+      "interface_cells": 3,
+      "interface_queries": 480,
+      "interface_entries": 21168,
+      "analyzed_occurrences": 64,
+      "semantic": "scaling only",
+      "physical": "not requested in M3"
+    }
+  ],
+  "stage": "M3",
+  "tests": {
+    "passed": 404,
+    "warnings": 18,
+    "log": "build-py314/interval-m3-gate.log",
+    "scope": "collective, Vec, interval, rotating, slot, buffered physical/C++, regional/streamed composition, parameterized and Qwen pipeline"
+  },
+  "reviews": {
+    "architecture": "accepted",
+    "correctness": "accepted",
+    "algorithm_performance": "accepted"
+  }
+}

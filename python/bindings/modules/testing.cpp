@@ -63,6 +63,11 @@ namespace python {
 
 nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   nb::dict out;
+  out["interval_access_visits"] = result.input.interval_access_visits;
+  out["collective_domains"] = result.collective_domains;
+  out["collective_witnesses"] = result.collective_witnesses;
+  out["collective_access_visits"] = result.collective_access_visits;
+  out["qualified_intervals"] = result.input.qualified_intervals;
   out["guarantee"] = "minimum demands for declared footprints and core native chains";
   out["realization"] = "not requested";
   out["analysis_available"] = result.segments.size() == result.input.segments.size();
@@ -109,18 +114,20 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     region["frame_start_expressions"] = start_expressions;
     for (const auto& s : source.sites) {
       nb::dict site;
-      nb::list accesses, precision, slots, access_frames;
+      nb::list accesses, precision, slots, access_frames, intervals;
       site["original"] = s.original;
       site["continuation"] = s.continuation;
       site["initialization_scope"] = s.initialization_scope;
       site["pipe"] = s.pipe;
       for (const auto& a : s.accesses) {
         access_frames.append(a.coordinate_frame);
+        intervals.append(nb::cast(a.physical_interval));
         slots.append(nb::make_tuple(a.slot_first, a.slot_step));
         precision.append(a.exact_footprint ? "exact" : "enclosure");
         accesses.append(nb::make_tuple(a.storage, a.write, a.row, a.column, a.row_step, a.column_step, a.rows,
                                        a.columns, a.after_first));
       }
+      site["physical_intervals"] = intervals;
       site["slot_selections"] = slots;
       site["access_precision"] = precision;
       site["accesses"] = accesses;
@@ -148,6 +155,13 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
       region["visit_owned"] = ownership;
       region["rotating_fragments"] = analysis->rotating_fragments;
       region["atom_tests"] = analysis->atom_tests;
+      region["interval_domains"] = analysis->interval_domains;
+      region["interval_fragments"] = analysis->interval_fragments;
+      region["interval_endpoints"] = analysis->interval_endpoints;
+      region["interval_queries"] = analysis->interval_queries;
+      region["interval_updates"] = analysis->interval_updates;
+      region["interval_node_visits"] = analysis->interval_node_visits;
+      region["interval_tree_entries"] = analysis->interval_tree_entries;
       region["quotient_edges"] = analysis->quotient_edges;
       region["modular_groups"] = analysis->modular_groups;
       region["sort_comparisons"] = analysis->sort_comparisons;

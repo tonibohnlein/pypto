@@ -9,7 +9,7 @@ review acceptance before implementation of the next. Passing recognition is not
 passing analysis, executable realization, allocation, or native qualification.
 
 | Stage | Production construction | Required review evidence |
-| --- | --- | --- |
+| ----- | ----------------------- | ------------------------ |
 | 1 | Existing MultiBuffer allocation/selection operations, Tile-to-Buffer adapter, physical slot descriptors | Physical address agreement, aliases, serialization, verification, codegen and negative geometry/range tests |
 | 2 | Common-stride modular extraction and periodic reduction | Independently extracted closure, actual covers, queries/selectors; no slot/visit expansion |
 | 3 | Numerical chain interfaces and shared regional composition | Actual covers and queries across partitions/resets; indexed boundary work and retained-size bounds |
@@ -68,7 +68,9 @@ agreement, negative alias/geometry cases and native PTOAS C++ generation.
 Earlier failing gates are retained in the workspace receipt logs. Source and
 binary hashes identify the accepted dirty worktree; no commit is implied.
 
-All five scoped stages are implemented and independently accepted. See [receipt](buffered-pipeline-receipt.json).
+The earlier five-stage baseline was implemented and independently accepted. See
+[its historical receipt](buffered-pipeline-receipt.json). The interval and collective
+follow-up below has a separate M1–M5 acceptance record.
 No device validation.
 
 ## Stage 2: rotating generators and numerical queries
@@ -243,7 +245,6 @@ model. Closed notifications do not establish native payload completion at return
 Native slot eligibility and C++ generation are reported separately from analysis
 and flag allocation; no device qualification is implied.
 
-
 Stage 5 accepted: **1,796 tests passed** (94.44 seconds), including **38 focused
 physical tests and four PTOAS C++ cases**. Both independent architecture/algorithm
 and correctness reviewers accepted the source and focused evidence before the
@@ -281,7 +282,7 @@ actual intervening vector operation and qualifies through cross-pipe demands.
 No payload was inserted into the original case and no hardware rule was changed.
 
 | Draft construction | Established evidence | Remaining boundary |
-| --- | --- | --- |
+| ------------------ | -------------------- | ------------------ |
 | Common-stride rotating demands | Exact selected-model covers, four event queries, modular selectors; no trip or joint-period expansion | General alias/layout recovery and startup-dependent rotating effects |
 | Numerical regional composition | Independent flat/composed covers, queries and selectors across contiguous regions and resets | Complete interface output may enumerate physical slot support |
 | Shared reset repetition | Retained mathematics and logarithmic shared-node growth | Physical repeated-family transport is explicitly unavailable |
@@ -301,6 +302,237 @@ PYTHONPATH="$PWD/python" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
   --output build-py314/buffered-final-scaling.json
 ```
 
-The receipt retains each accepted stage and the earlier failed attempts. The
-implementation is uncommitted at this checkpoint. Default dispatch, the resource
+The receipt retains each accepted stage and the earlier failed attempts. That receipt predates the baseline commit. Default dispatch, the resource
 pool, allocation algorithm and hardware exemptions are unchanged.
+
+## Interval and collective-interface follow-up
+
+The next implementation starts from compiler `e10d882b2348` and draft
+`3a7c65b`, on a separate branch from the pinned device campaign. Its five
+review gates cover exact interval evidence, interval-sweep generation,
+collective-row boundaries, numerical composition/realization and final
+qualification. General symbolic crossing selectors and allocation changes
+remain outside this work.
+
+### M1: exact interval evidence
+
+`SyncAccess::physical_interval` is an optional half-open byte range inside
+its canonical slot. The existing Vec byte domain uses its canonical byte
+coordinates. Modes, slot selection and occurrence frames remain separate.
+The importer qualifies whole boxed tiles, dense row/column-major contiguous
+rectangles and existing exact byte intervals. Partial boxed footprints,
+noncontiguous rectangles, moving/parameter-translated accesses and enclosures
+retain their original effects without an interval certificate. Missing evidence
+is not absence. No demand, merge, endpoint or allocation algorithm changes.
+
+Qualification visits each supplied static access once. Existing Vec access
+recovery can already enumerate strided rows; these input intervals are retained,
+not merged across gaps. Thus M1 does not claim row-independent access recovery
+or the full draft interval-list recognizer. Native footprint qualification
+remains the existing operation contract.
+
+Run `python -m tests.ut.ir.transforms.qualify_buffered_intervals --output
+build-py314/interval-m1-baseline.json` for the pre-sweep baseline, using the
+worktree-built extension. It records source/binary hashes, inspected work,
+retained demands, physical outcomes and physical IR hashes when available.
+The five baseline ring cases retain their existing same-pipe realization refusal;
+this is not a capacity witness. Timing samples are descriptive.
+The first test attempt used an obsolete default PTOAS launcher; all four C++
+failures were environment failures. Reruns use pinned PTOAS v0.72 with its
+compatible Python on PATH. No source or expectation was changed to repair them.
+
+M1 accepted by architecture, correctness and algorithm/performance reviewers.
+The focused gate passed **206 tests** with 18 existing inline-annotation warnings.
+
+### M2: interval-sweep extraction
+
+The existing rotating service now queries latest-writer/latest-access range
+assignment trees on compressed physical endpoints. It batches all fragments of
+one canonical occurrence before updates, sweeps two circular copies and compares
+candidates across families by original relative source identities. Only the
+latest conflicting source on each pipe is retained for each target. Earlier
+sources reach it through native completion order; finite clipping preserves the
+selected source whenever an earlier source is present. The existing quotient
+reducer and physical-point selectors consume these generators unchanged.
+
+A whole domain takes this path only when every access has exact stationary
+interval evidence. Other domains keep their existing geometry construction and
+separate costs. The `km` generator bound applies to fully interval-qualified
+storage generation, not the union with arbitrary fallback contributions.
+Temporary range trees are extraction scratch; neither trips nor slots are
+enumerated. Counters distinguish input fragments, compressed endpoints, tree
+queries/updates/node visits and allocated tree entries. The entry counter is
+total allocation across groups, not peak live memory.
+
+Partial rotating Mat extracts now use the same contiguous-interval qualification
+as retained access export. Partial boxed/noncontiguous extracts remain
+unavailable. Independent original-address tests cover nested, disjoint and
+partly overlapping views, equal-key RMW batching, different offsets at one
+payload, and different-period families sharing a source pipe. No verifier or
+alias contract was relaxed: dynamically different Vec slots remain unavailable
+as potentially overlapping in-place operands unless the operation contract
+establishes legality.
+
+For 4/16/64/128 nested-prefix readers the new path retains 10/34/130/258
+generators and inspects 126/654/3558/8178 tree nodes, with zero atom/access tests.
+The old atom partition would inspect every prefix at every row partition.
+Existing ring baseline demands and physical refusals are unchanged. The new
+partial Mat fixtures also retain the explicit `Unavailable same-pipe barrier
+mechanism` refusal; C++ generation is therefore unavailable for those fixtures.
+This is an executable-contract boundary, not an ID-capacity result or a demand
+failure. Existing accepted physical routes are checked separately.
+
+Reproduce the interval campaign with the M1 runner plus `--partial`. Receipts
+record descriptive single-run times, not paired speedup evidence. Access
+recovery, native footprint qualification and interface enumeration retain their
+previous scope. General symbolic crossings and allocation changes remain out
+of scope.
+
+M2 accepted by the architecture, correctness and algorithm/performance reviewers.
+The focused gate passed **329 tests**, including existing physical/C++ and Qwen
+regressions, with 18 existing inline-annotation warnings.
+
+### M3 design: certified collective crossing witnesses
+
+The next scoped provider consumes a complete sequence of full increasing row
+fills and finite row-interval reader phases over one qualified Vec byte domain.
+Every fill writes each row exactly once; readers on other pipes cover all rows
+before the next fill. All other operation effects remain in ordinary exact
+interfaces. Dynamic subview origins must retain their original loop frame,
+inherited pitch and proved containment. This uses the existing runtime-offset
+`buffer.subview` contract, not a new operation or buffer model.
+
+The domain certificate retains first/last rows and every reader interval's first
+and last row as crossing witnesses. Fill-to-reader requirements factor through
+the last overlapping fill by native completion order. Reader-to-fill requirements
+factor through the first protected fill by native start order. Full reader
+coverage supplies omitted write/write requirements. These are generators and
+are reduced jointly with other domains; they are not automatically covers.
+Point selectors retain their original formulas, including unsampled rows.
+Witnesses are explicitly tagged and never advertised as a complete cell partition.
+
+The initial global witness directory can cost the product of phase count and
+reader endpoints. It removes the physical-row factor but does not implement the
+draft's stronger adjacency-local frame bound. Point queries still inspect the
+original access list; no logarithmic selector claim is made. Full reader/native
+ports and all other-domain endpoints must remain available. Unknown siblings,
+partial fills, skipped writes and incomplete reader coverage cannot inherit this
+certificate.
+
+M3 evidence currently exercises MTE2 row fills and MTE3 interval readers with
+real GM output effects. A vector reader writing a different Vec buffer does not
+qualify merely because the resident part does: all placed Vec bytes share the
+canonical domain and its additional writes must satisfy the complete-domain
+contract. Multiple reader-pipe collective fixtures and general nested collective
+composition are not established by this milestone. The existing generic numerical
+native-boundary tests remain authoritative for pipes used only in middle children.
+Other domains retain their explicit interface costs.
+
+For 8, 1,000 and 1,000,000 rows, the simple one-phase case retains two collective
+witnesses, three total interface points, 336 interface entries and 15 leaf query
+construction steps. The large shapes are host-only scaling derivatives, not
+native-memory feasibility claims. Eight static phases at eight rows pass 20,736
+all-event queries plus actual-cover, access and boundary checks. Nested static
+subviews and reshape aliases of the moving row retain the original frame and
+pitch. The initial C++ failures used the wrong PTOAS launcher; the pinned rerun
+restores the established environment without changing semantics.
+
+M3 accepted by all three reviewers; **404 tests passed**, with 18 existing warnings.
+
+### M4: complete-phase repetition and direct physical export
+
+A structured repeat may use the collective certificate only when its touched
+source interval starts and ends on complete, already coverage-checked phases.
+The check visits every repeated ancestor, including zero/one-count constructs.
+The row-fill loop itself is an original leaf, not an exemption for a fill-only
+repeated ancestor. Empty complete phases can disappear; skipped partial phases
+cannot inherit an intervening-reader argument.
+
+The existing source tree owns repetition. Row-fill leaves analyze their local
+row count; finite reader leaves analyze one local visit. Numerical merges share
+repeated summaries and retain original mixed-radix coordinates. The source-layout
+invariance premise used by scoped endpoint/reuse certification holds for these
+complete phases. The physical exporter, matching policy and allocator are
+unchanged. One initial integration failure exposed the absent original-access
+index on this newly structured route; index construction is now shared with the
+invariant constructor and requires a fresh result. Enclosing-motion read-only GM
+selectors keep their original path. Written moving domains without a reset
+certificate retain their explicit refusal.
+
+Bounded validation includes zero/one/multiple invocations, two enclosing frames,
+counter resets, original GM and local selectors, actual covers, every event-kind
+query and emitted matching/causal ID reuse. Complete-phase commands are compared
+to independently recovered actual-access order, not only to retained generators.
+Partial-phase repeated ancestors are negative cases. Large row/visit counts test
+representation growth, not native capacity. Static command constancy is distinct
+from logarithmic growth of repeated numerical summaries.
+
+This is the existing opt-in production route. Fresh notifications at entry,
+closed matching at exit, payload completion, native instruction qualification and
+device validation remain separate contracts. No return-boundary rule, barrier
+exemption, allocation rule or expert protocol changes here.
+
+M4's broader gate passed **289 tests** with 20 existing warnings. The
+[receipt](buffered-intervals-m4.json) records independent bounded emitted checks
+and descriptive timings. At three visits, 5/1,000/1,000,000 rows retain 1,008
+interface entries. At five rows, 3/1,000/1,000,000 visits retain
+1,008/5,040/8,736 entries and 3/15/26 merge nodes. Emitted sites remain two SETs,
+two WAITs, four guards and no barriers for these repeated cases; zero/one visits
+specialize separately. This establishes row independence and logarithmic repeat
+summary growth for the tested contract, not constant total representation size.
+
+M4 accepted by the architecture, correctness and algorithm/performance reviewers.
+
+### M5: qualification and conformance
+
+The final campaign uses the committed M4 implementation, with the qualification
+driver and structural bounds pinned separately. It checks the existing finite,
+logical, rotating, numerical, nested and physical paths as well as Buffer view,
+slot, serialization and lowering regressions. The new regression bounds distinguish
+constant command schemas from logarithmic retained repeat summaries.
+
+| Draft construction | Production component and evidence | Remaining scope |
+| ------------------ | --------------------------------- | --------------- |
+| Qualified physical interval descriptions | `placed_sync_import.cpp`; exact contiguous byte spans, physical aliases and original frame checks | Native instruction footprints remain a separate premise; noncontiguous/partial boxed views cannot borrow interval evidence |
+| Rotating interval generators | `rotating_sync_analysis.cpp`; per-pipe range sweeps, common-stride phase normalization and existing quotient reducer | The supplied-interval bound excludes access recovery and unsupported-domain atomization |
+| Collective row and resident boundaries | `CollectiveDomain` and original point selectors; independently checked actual covers, all four event queries and unsampled rows | Complete-domain fill/read coverage required; global witnesses can cost phases times reader endpoints; no adjacency-local interface bound claimed |
+| Numerical composition and repeats | Existing source-layout and numerical merge services; complete-phase boundaries, mixed-radix resets and read-only GM selectors | General symbolic crossing selectors, partial-phase repeats and unqualified moving written domains remain unavailable |
+| Direct physical realization | Existing endpoint/reuse services; independently checked command matching, acyclicity, order equality and causal reuse on bounded qualified fixtures | Six-ID certification is separate from minimum demands; unsupported DMA same-pipe mechanisms retain refusal; native entry/return is not proved |
+
+The five original ring cases retain exactly the baseline reduced demands and
+physical refusal. The sweep retains nine generators rather than five in the
+small ring example: its per-pipe witnesses need not be the smallest generating
+set. Joint reduction still returns the same four covers. The demonstrated gain
+is avoiding interval/atom incidence expansion, not fewer generators on every input.
+
+For complete collective phases, static control remains small as rows/visits grow:
+the measured repeated cases add 9–10 PTO arithmetic operations and retain two SET
+and two WAIT sites. The 5-row, 3-visit execution has five SETs, five WAITs, three
+causal reuses and 43 added `IfStmt` guard tests (not loop tests or scalar
+operations within predicates). Its projected order equals the
+independently recovered access order. This is finite validation under the command
+model, not a uniform native proof, and compact static code does not imply constant
+executed control work. Large shapes/counts are host scaling derivatives only.
+
+Configured Qwen output projection and all four gate/up bands still select PyPTO
+in ordinary opt-in production and produce C++. All ten PyPTO/PTOAS-mode output
+sets match the earlier retained Qwen production receipt byte-for-byte. Its revision
+and dirty-source hashes are recorded in the final receipt: this is an artifact
+regression comparison, not a fresh baseline timing campaign. These kernels retain
+their existing nested route; they do not establish that the new collective provider
+covers arbitrary attention or partial-write phases.
+
+Every timing here is a descriptive single run. Import/reduction/composition detail
+timers are included in total analysis time and must not be summed with it.
+Physical preparation, allocation and emission share one measured call; they are
+not separately attributed. PTO arithmetic counts precede downstream folding.
+No device work, return-boundary change, allocation change or automatic fallback
+policy change belongs to this campaign.
+
+M5 accepted by all three reviewers. The final autosync gate passed **889 tests**
+with 28 existing deprecation warnings; the separate Buffer/slot companion gate
+passed **398 tests**. All **1,287 tests passed**, and ten configured Qwen mode
+cells generated C++. [The final receipt](buffered-intervals-m5.json) contains
+source/tool/input hashes, exact commands, scaling samples and the historical
+artifact comparison. This completes all five scoped follow-up milestones; the
+limitations in the table remain explicit.
