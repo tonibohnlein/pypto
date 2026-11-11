@@ -320,6 +320,10 @@ class Importer {
   struct VecView {
     int64_t address, pitch;
     BufferTypePtr type;
+    // Byte translation in one original counted-loop frame. The maximum
+    // displacement is proved against the parent view, not sampled at visit 0.
+    int64_t step = 0, last_displacement = 0;
+    ForStmtPtr frame;
   };
   std::unordered_map<const Expr*, VecView> vec_views;
   std::optional<size_t> vec_storage;
@@ -393,8 +397,9 @@ class Importer {
     CHECK(type->shape_ == type->valid_shape_ &&
           (backend::DenseBufferBytes(type) || backend::IsColumnVectorBuffer(type)))
         << "Synchronization Vec views require static full-valid dense descriptors";
-    const auto end = Checked(__int128(view.address) + __int128(type->shape_[0] - 1) * view.pitch +
-                             __int128(type->shape_[1]) * type->dtype_.GetByte());
+    const auto end =
+        Checked(__int128(view.address) + view.last_displacement + __int128(type->shape_[0] - 1) * view.pitch +
+                __int128(type->shape_[1]) * type->dtype_.GetByte());
     for (const auto& old : result.storage) {
       CHECK(old.space != MemorySpace::Vec || old.byte_coordinates ||
             view.address >= old.address + old.bytes || old.address >= end)
@@ -410,18 +415,39 @@ class Importer {
     objects[var.get()] = *vec_storage;
     vec_views.emplace(var.get(), std::move(view));
   }
-  void View(const AssignStmtPtr& assign, const CallPtr& call) {
+  void View(const AssignStmtPtr& assign, const CallPtr& call, const SyncSegment& segment = {}) {
     OpRegistry::GetInstance().ValidateBufferCall(call);
     auto source = vec_views.find(call->args_[0].get());
-    CHECK(source != vec_views.end()) << "Synchronization view needs a qualified Vec source";
+    CHECK(source != vec_views.end()) << "Synchronization storage/view needs a qualified Vec source";
     auto view = source->second;
     auto type = As<BufferType>(assign->var_->GetType());
     CHECK(type && type->shape_.size() == 2) << "Synchronization view requires rank two";
     if (IsOp(call, "buffer.subview")) {
       const auto offsets = As<MakeTuple>(call->args_[1]);
-      const auto row = Constant(offsets->elements_[0]), column = Constant(offsets->elements_[1]);
-      view.address = Checked(__int128(view.address) + __int128(row) * view.pitch +
-                             __int128(column) * view.type->dtype_.GetByte());
+      const auto row = As<ConstInt>(offsets->elements_[0])
+                           ? AffineCoordinate{Constant(offsets->elements_[0]), 0}
+                           : Coordinate(offsets->elements_[0], segment);
+      const auto column = As<ConstInt>(offsets->elements_[1])
+                              ? AffineCoordinate{Constant(offsets->elements_[1]), 0}
+                              : Coordinate(offsets->elements_[1], segment);
+      CHECK(row.parameters.empty() && column.parameters.empty() && row.frames.empty() &&
+            column.frames.empty() && !row.block && !column.block)
+          << "Vec subview translation needs one original loop frame";
+      CHECK(!view.frame || view.frame == segment.original_loop)
+          << "Vec subview belongs to another occurrence frame";
+      const auto last = std::max<int64_t>(0, segment.count - 1);
+      CHECK(__int128(row.first) + __int128(last) * row.second + type->shape_[0] <= view.type->shape_[0] &&
+            __int128(column.first) + __int128(last) * column.second + type->shape_[1] <= view.type->shape_[1])
+          << "Vec subview exceeds its proved parent window";
+      view.address = Checked(__int128(view.address) + __int128(row.first) * view.pitch +
+                             __int128(column.first) * view.type->dtype_.GetByte());
+      view.step = Checked(__int128(view.step) + __int128(row.second) * view.pitch +
+                          __int128(column.second) * view.type->dtype_.GetByte());
+      if (view.step) {
+        CHECK(segment.original_loop) << "Moving Vec view has no original counted frame";
+        view.frame = segment.original_loop;
+        view.last_displacement = Checked(__int128(last) * view.step);
+      }
       // Inherit the parent's pitch, including through nested subviews.
     } else {
       CHECK(view.pitch == Checked(__int128(view.type->shape_[1]) * view.type->dtype_.GetByte()))
@@ -561,17 +587,19 @@ class Importer {
       auto id = Storage(call->args_[arg]);
       if (auto found = vec_views.find(call->args_[arg].get()); found != vec_views.end()) {
         const auto& view = found->second;
+        CHECK(!view.frame || view.frame == segment.original_loop)
+            << "Vec view use belongs to another occurrence frame";
         const auto width = Checked(__int128(view.type->shape_[1]) * view.type->dtype_.GetByte());
         // Dense footprints use one interval. Strided views retain one interval
         // per physical row, never an enclosing rectangle that fills the gaps.
         if (view.pitch == width) {
-          site.accesses.push_back(Access(id, write, {0, 0}, {view.address, 0}, 1,
+          site.accesses.push_back(Access(id, write, {0, 0}, {view.address, view.step}, 1,
                                          Checked(__int128(width) * view.type->shape_[0]), segment));
         } else {
           for (int64_t row = 0; row < view.type->shape_[0]; ++row)
-            site.accesses.push_back(Access(id, write, {0, 0},
-                                           {Checked(__int128(view.address) + __int128(row) * view.pitch), 0},
-                                           1, width, segment));
+            site.accesses.push_back(Access(
+                id, write, {0, 0}, {Checked(__int128(view.address) + __int128(row) * view.pitch), view.step},
+                1, width, segment));
         }
         return;
       }
@@ -734,6 +762,8 @@ class Importer {
         auto call = As<Call>(assign->value_);
         if (call && IsOp(call, "buffer.slot"))
           SelectSlot(assign, segment);
+        else if (call && (IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape")))
+          View(assign, call, segment);
         else
           DefineCoordinate(assign, segment);
       } else if (auto eval = As<EvalStmt>(s)) {

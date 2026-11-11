@@ -432,7 +432,9 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
       std::any_of(input.segments.begin(), input.segments.end(), [&](const SyncSegment& region) {
         return std::any_of(region.sites.begin(), region.sites.end(), [&](const SyncSite& site) {
           return std::any_of(site.accesses.begin(), site.accesses.end(), [&](const SyncAccess& access) {
-            return input.storage.at(access.storage).slot_count > 1;
+            const auto& storage = input.storage.at(access.storage);
+            return storage.slot_count > 1 ||
+                   (storage.byte_coordinates && access.write && (access.row_step || access.column_step));
           });
         });
       });

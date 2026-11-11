@@ -345,17 +345,18 @@ def test_unavailable_metadata_and_coordinate_contracts_delegate(kind):
             stmts.insert(1, ir.EvalStmt(call, span))
             expected = "instruction contract"
         else:
-            # The existing Buffer IR supports an offset operand, but this
-            # importer has no phase/slot membership certificate for it.
+            # Ready affine views are now supported, but every visit must fit
+            # the parent. A two-row window at its last row exceeds capacity.
             iv = ir.Var("slot", ir.ScalarType(ir.DataType.INDEX), span)
             ty = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
             var = ir.Var("slot_view", ty, span)
             offsets = ir.MakeTuple([iv, ir.ConstInt(0, ir.DataType.INDEX, span)], span)
             call = ir.Call(ir.get_op("buffer.subview"), [root, offsets], ty, span)
             inner = ir.SeqStmts([ir.AssignStmt(var, call, span), ir.YieldStmt([], span)], span)
-            values = [ir.ConstInt(x, ir.DataType.INDEX, span) for x in [0, 2, 1]]
+            assert isinstance(root.type, ir.BufferType)
+            values = [ir.ConstInt(x, ir.DataType.INDEX, span) for x in [0, root.type.shape[0], 1]]
             stmts.insert(1, ir.ForStmt(iv, *values, [], inner, [], span))
-            expected = "Nested or data-dependent"
+            expected = "proved parent window"
     function = ir.Function(
         original.name,
         list(zip(original.params, original.param_directions)),

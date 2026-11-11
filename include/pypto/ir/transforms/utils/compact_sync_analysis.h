@@ -233,6 +233,7 @@ class CompactSyncResult {
   size_t analyzed_occurrences = 0, cells = 0, graph_edges = 0;
   size_t class_tests = 0, class_lookup_tests = 0, port_pair_tests = 0, crossing_path_searches = 0;
   std::shared_ptr<const NumericalSyncHierarchy> hierarchy;
+  size_t collective_domains = 0, collective_witnesses = 0, collective_access_visits = 0;
   size_t interface_cells = 0, interface_slot_visits = 0, interface_ports = 0, interface_entries = 0;
   size_t interface_queries = 0, merge_nodes = 0, crossing_tests = 0;
   size_t interface_access_visits = 0, bridge_candidates = 0, port_normalization_visits = 0;

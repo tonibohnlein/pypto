@@ -64,6 +64,9 @@ namespace python {
 nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   nb::dict out;
   out["interval_access_visits"] = result.input.interval_access_visits;
+  out["collective_domains"] = result.collective_domains;
+  out["collective_witnesses"] = result.collective_witnesses;
+  out["collective_access_visits"] = result.collective_access_visits;
   out["qualified_intervals"] = result.input.qualified_intervals;
   out["guarantee"] = "minimum demands for declared footprints and core native chains";
   out["realization"] = "not requested";

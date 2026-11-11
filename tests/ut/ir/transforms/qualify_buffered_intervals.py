@@ -20,14 +20,43 @@ from typing import Any
 from pypto import backend, ir, testing
 from pypto.backend import BackendType
 
+from .sync_matmul_oracle import validate
+from .test_collective_sync_interface import collective_fixture
 from .test_interval_sync_analysis import interval_pipeline
 from .test_slot_sync_import import slot_fixture
+
+
+def qualify_collective(receipt):
+    """Measure certified witness frames; large rows are host-only derivatives."""
+    for rows, phases in [(8, 1), (1000, 1), (1000000, 1), (8, 2), (8, 8), (8, 32)]:
+        function = collective_fixture(rows, [[(0, rows)]] * phases)
+        start = time.perf_counter()
+        result = testing.analyze_placed_sync(function, True)
+        elapsed = time.perf_counter() - start
+        description = result.describe()
+        row: dict[str, Any] = {"rows": rows, "static_phases": phases, "analysis_seconds_inclusive": elapsed}
+        for key in [
+            "collective_domains",
+            "collective_witnesses",
+            "collective_access_visits",
+            "interface_cells",
+            "interface_queries",
+            "retained_ports",
+            "interface_entries",
+            "analyzed_occurrences",
+        ]:
+            if key in description:
+                row[key] = description[key]
+        row["semantic"] = validate(function, result) if rows <= 8 and phases <= 8 else "scaling only"
+        row["physical"] = "not requested in M3"
+        receipt["cases"].append(row)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--partial", action="store_true", help="Measure exact nested interval views")
+    parser.add_argument("--collective", action="store_true", help="Measure collective crossing witnesses")
     args = parser.parse_args()
     backend.set_backend_type(BackendType.Ascend910)
     root = Path.cwd()
@@ -51,6 +80,11 @@ def main():
         "timing": "single descriptive samples; no speedup claim",
         "cases": [],
     }
+    if args.collective:
+        qualify_collective(receipt)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(receipt, indent=2) + "\n")
+        return
     cases = (
         [(7, 3, n) for n in [4, 16, 64, 128]]
         if args.partial

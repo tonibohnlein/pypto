@@ -68,7 +68,81 @@ NumericalBoundary LeafBoundary(const CompactSyncResult& result, size_t leaf, con
   }
   return out;
 }
-std::vector<NumericalCell> InterfaceCells(CompactSyncResult& result) {
+// Check a complete domain schedule before replacing explicit cells by finite
+// crossing witnesses. Every writing phase must fill [0, rows*row_bytes) once;
+// intervening finite readers cover every row. Other domains are untouched.
+std::optional<CollectiveSyncDomain> CollectiveDomain(const CompactSyncInput& input, size_t storage,
+                                                     CompactSyncResult& work) {
+  const auto& domain = input.storage[storage];
+  if (!domain.byte_coordinates || domain.slot_count != 1 || input.region_tree) return std::nullopt;
+  CollectiveSyncDomain proof;
+  std::optional<PipeType> fill_pipe;
+  std::vector<std::pair<int64_t, int64_t>> reads;
+  std::set<int64_t> witnesses;
+  auto covered = [&]() {
+    if (reads.empty()) return false;
+    std::sort(reads.begin(), reads.end());
+    int64_t end = 0;
+    for (const auto& interval : reads) {
+      if (interval.first > end) return false;
+      end = std::max(end, interval.second);
+    }
+    return end == domain.columns;
+  };
+  for (size_t leaf = 0; leaf < input.segments.size(); ++leaf) {
+    const auto& segment = input.segments[leaf];
+    if (!segment.nested_frames.empty()) return std::nullopt;
+    std::vector<std::pair<const SyncSite*, const SyncAccess*>> effects;
+    size_t writes = 0;
+    for (const auto& site : segment.sites)
+      for (const auto& access : site.accesses) {
+        ++work.collective_access_visits;
+        if (access.storage == storage) {
+          effects.emplace_back(&site, &access);
+          writes += access.write;
+        }
+      }
+    if (effects.empty()) continue;
+    if (writes) {
+      if (effects.size() != 1 || writes != 1 || segment.sites.size() != 1 || segment.count <= 0)
+        return std::nullopt;
+      const auto& [site, pointer] = effects.front();
+      const auto& access = *pointer;
+      if (!access.exact_footprint || access.after_first || access.row || access.rows != 1 || access.column ||
+          access.row_step || access.column_step != access.columns || access.columns <= 0 ||
+          Ordinal(access.columns) * segment.count != domain.columns ||
+          access.coordinate_frame != segment.original_loop)
+        return std::nullopt;
+      if (fill_pipe && (*fill_pipe != site->pipe || proof.row_bytes != access.columns || !covered()))
+        return std::nullopt;
+      fill_pipe = site->pipe;
+      proof.row_bytes = access.columns;
+      proof.rows = segment.count;
+      proof.fill_leaves.push_back(leaf);
+      reads.clear();
+    } else {
+      if (!fill_pipe || segment.count != 1) return std::nullopt;
+      for (const auto& [site, pointer] : effects) {
+        const auto& access = *pointer;
+        if (site->pipe == *fill_pipe || !access.exact_footprint || access.after_first || access.row ||
+            access.rows != 1 || access.row_step || access.column_step || access.column < 0 ||
+            access.columns <= 0 || access.column % proof.row_bytes || access.columns % proof.row_bytes ||
+            Ordinal(access.column) + access.columns > domain.columns)
+          return std::nullopt;
+        const auto end = access.column + access.columns;
+        reads.emplace_back(access.column, end);
+        witnesses.insert(access.column);
+        witnesses.insert(end - proof.row_bytes);
+      }
+    }
+  }
+  if (!fill_pipe || !covered()) return std::nullopt;
+  witnesses.insert(0);
+  witnesses.insert(domain.columns - proof.row_bytes);
+  proof.witness_columns.assign(witnesses.begin(), witnesses.end());
+  return proof;
+}
+std::vector<NumericalCell> InterfaceCells(CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
   const auto& input = result.input;
   std::vector<bool> written(input.storage.size());
   using Effect = std::pair<const SyncSegment*, const SyncAccess*>;
@@ -80,15 +154,29 @@ std::vector<NumericalCell> InterfaceCells(CompactSyncResult& result) {
         if (access.write) written.at(access.storage) = true;
         effects[access.storage].emplace_back(&segment, &access);
       }
+  for (const auto& [storage, domain_effects] : effects) {
+    if (!written[storage]) continue;
+    if (auto proof = CollectiveDomain(input, storage, result)) {
+      ++result.collective_domains;
+      result.collective_witnesses += proof->witness_columns.size();
+      hierarchy.collective_domains.emplace(storage, std::move(*proof));
+    }
+  }
   std::map<size_t, size_t> private_owner;
   for (size_t region = 0; region < result.segments.size(); ++region)
     for (const auto& [storage, certificate] : result.segments[region].visit_owned) {
+      if (hierarchy.collective_domains.count(storage)) continue;
       const auto [owner, inserted] = private_owner.emplace(storage, region);
       CHECK(inserted || owner->second == region)
           << "Visit-owned storage has multiple region owners; cross-reset selector export unavailable";
     }
   std::vector<NumericalCell> cells;
   for (const auto& [storage, domain_effects] : effects) {
+    if (const auto proof = hierarchy.collective_domains.find(storage);
+        proof != hierarchy.collective_domains.end()) {
+      for (auto column : proof->second.witness_columns) cells.push_back({storage, 0, 0, column});
+      continue;
+    }
     if (const auto owner = private_owner.find(storage); owner != private_owner.end()) {
       const auto& region = input.segments[owner->second];
       CHECK(region.nested_frames.empty())
@@ -720,7 +808,7 @@ CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string
       hierarchy->cells.push_back({cell.storage, 0, cell.row, cell.column});
     result.interface_cells = hierarchy->cells.size();
   } else {
-    hierarchy->cells = InterfaceCells(result);
+    hierarchy->cells = InterfaceCells(result, *hierarchy);
   }
   std::vector<NodePtr> nodes;
   for (size_t r = 0; r < result.segments.size(); ++r) {

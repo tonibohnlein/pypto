@@ -390,3 +390,50 @@ of scope.
 M2 accepted by the architecture, correctness and algorithm/performance reviewers.
 The focused gate passed **329 tests**, including existing physical/C++ and Qwen
 regressions, with 18 existing inline-annotation warnings.
+
+### M3 design: certified collective crossing witnesses
+
+The next scoped provider consumes a complete sequence of full increasing row
+fills and finite row-interval reader phases over one qualified Vec byte domain.
+Every fill writes each row exactly once; readers on other pipes cover all rows
+before the next fill. All other operation effects remain in ordinary exact
+interfaces. Dynamic subview origins must retain their original loop frame,
+inherited pitch and proved containment. This uses the existing runtime-offset
+`buffer.subview` contract, not a new operation or buffer model.
+
+The domain certificate retains first/last rows and every reader interval's first
+and last row as crossing witnesses. Fill-to-reader requirements factor through
+the last overlapping fill by native completion order. Reader-to-fill requirements
+factor through the first protected fill by native start order. Full reader
+coverage supplies omitted write/write requirements. These are generators and
+are reduced jointly with other domains; they are not automatically covers.
+Point selectors retain their original formulas, including unsampled rows.
+Witnesses are explicitly tagged and never advertised as a complete cell partition.
+
+The initial global witness directory can cost the product of phase count and
+reader endpoints. It removes the physical-row factor but does not implement the
+draft's stronger adjacency-local frame bound. Point queries still inspect the
+original access list; no logarithmic selector claim is made. Full reader/native
+ports and all other-domain endpoints must remain available. Unknown siblings,
+partial fills, skipped writes and incomplete reader coverage cannot inherit this
+certificate.
+
+M3 evidence currently exercises MTE2 row fills and MTE3 interval readers with
+real GM output effects. A vector reader writing a different Vec buffer does not
+qualify merely because the resident part does: all placed Vec bytes share the
+canonical domain and its additional writes must satisfy the complete-domain
+contract. Multiple reader-pipe collective fixtures and general nested collective
+composition are not established by this milestone. The existing generic numerical
+native-boundary tests remain authoritative for pipes used only in middle children.
+Other domains retain their explicit interface costs.
+
+For 8, 1,000 and 1,000,000 rows, the simple one-phase case retains two collective
+witnesses, three total interface points, 336 interface entries and 15 leaf query
+construction steps. The large shapes are host-only scaling derivatives, not
+native-memory feasibility claims. Eight static phases at eight rows pass 20,736
+all-event queries plus actual-cover, access and boundary checks. Nested static
+subviews and reshape aliases of the moving row retain the original frame and
+pitch. The initial C++ failures used the wrong PTOAS launcher; the pinned rerun
+restores the established environment without changing semantics.
+
+M3 accepted by all three reviewers; **404 tests passed**, with 18 existing warnings.
