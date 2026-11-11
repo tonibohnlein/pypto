@@ -122,6 +122,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/sync_boundary_graph.cpp
     src/ir/transforms/utils/token_sync_lowering.cpp
     src/ir/transforms/utils/logical_sync_realization.cpp
+    src/ir/transforms/utils/scoped_logical_sync.cpp
     src/ir/transforms/utils/physical_sync_realization.cpp
     src/ir/transforms/utils/hardware_loop_analysis.cpp
     src/ir/builder.cpp

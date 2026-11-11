@@ -1,0 +1,282 @@
+{
+  "revision": "6c3984247709a8356cbe73832133e9b39a8b2e24",
+  "source_sha256": {
+    "src/ir/transforms/utils/scoped_logical_sync.cpp": "844005bea6f816c5e5214e7fd1a93d7cad9b93ed5891839cc4d7cde1639fee96",
+    "src/ir/transforms/utils/scoped_logical_sync.h": "d4e529bb5a90216653a2180823f77e054b1e7e36a6d7ff61b89a754ee0a44cde",
+    "src/ir/transforms/utils/sync_token_names.h": "adfffb4c37c5068e1ca962e07985fec173f12fd9ef93951d2705d8de6d5e5ccd",
+    "src/ir/transforms/utils/sync_placement.h": "76435dece779714b38202c55bd2dd75b0a75d32ccb5a1b8e6c5c22b7c2598821",
+    "src/ir/transforms/utils/logical_sync_realization.cpp": "90db307e4f471282fec576aa5f04b849d823417b57cb2b394287b41c21b882db",
+    "tests/ut/ir/transforms/test_scoped_logical_sync.py": "1f34ebddc0492beb02c59ad422843c00aef1a407757623cbd8ef9171f0ccf36b",
+    "tests/ut/ir/transforms/qualify_scoped_token_insertion.py": "9e57229b4e4125ad35cf723b51f1354f09a3ffc887f758507ef254e9a05f0e38",
+    "tests/ut/ir/transforms/test_collective_sync_realization.py": "2bbae8aa44be6c0c9f32436e97073af2af60073127b2b6888511e468077eb96f"
+  },
+  "extension_sha256": "de6b6622546952fd19747d05a7f8a6cefde154720d599276baa98ad9b31ec44b",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "alias_contract": "disjoint distinct GM roots",
+  "target": "a2a3",
+  "scope": "M3 scoped logical insertion only; actual-token nested physical lowering pending",
+  "command": [
+    "/usr/bin/python3",
+    "-m",
+    "tests.ut.ir.transforms.qualify_scoped_token_insertion",
+    "--output",
+    "build-py314/token-m3b-qualification.json"
+  ],
+  "cases": [
+    {
+      "rows": 3,
+      "counts": [
+        2,
+        3
+      ],
+      "input_sha256": "e0c63bf34a07cdb1f62790d4e90fd27533362a536acb6d7c42f3f0036dd6b440",
+      "diagnostic_analysis_seconds": 0.000371451023966074,
+      "diagnostic_logical_export_seconds": 0.00015213200822472572,
+      "production_insert_seconds": 0.0004339180886745453,
+      "timing_scope": "separate single runs; descriptive, no speedup claim; do not sum inclusive times",
+      "logical_inventory": {
+        "record_sites": 2,
+        "wait_sites": 3,
+        "guarded_wait_sites": 2,
+        "carried_tokens": 4,
+        "name_scan_visits": 44,
+        "name_scan_nodes": 39,
+        "guarantee": "equal selected order under the admitted logical-token model"
+      },
+      "mathematical_inventory": {
+        "merge_nodes": 4,
+        "interface_entries": 1344,
+        "source_coordinate_entries": 8,
+        "collective_witnesses": 2
+      },
+      "production_same_tokens": true,
+      "physical_lowering": "unavailable: nested token frames; no allocation or C++ claim",
+      "device": "not run",
+      "independent_semantics": {
+        "payloads": 24,
+        "records": 24,
+        "waits": 11,
+        "same_pipe_waits": 0,
+        "matched_demands": 11,
+        "extra_event_pairs": 0,
+        "extra_completion_start_pairs": 0,
+        "branches_evaluated": 36,
+        "unused_records": 13,
+        "max_wait_fanout": 1,
+        "acyclic": true
+      }
+    },
+    {
+      "rows": 1000,
+      "counts": [
+        2,
+        3
+      ],
+      "input_sha256": "c1e7c9d496670f1c48c3e5129d7c6490e5053092360caa71f91352c396383770",
+      "diagnostic_analysis_seconds": 0.0002653631381690502,
+      "diagnostic_logical_export_seconds": 0.00011052098125219345,
+      "production_insert_seconds": 0.00038405973464250565,
+      "timing_scope": "separate single runs; descriptive, no speedup claim; do not sum inclusive times",
+      "logical_inventory": {
+        "record_sites": 2,
+        "wait_sites": 3,
+        "guarded_wait_sites": 2,
+        "carried_tokens": 4,
+        "name_scan_visits": 44,
+        "name_scan_nodes": 39,
+        "guarantee": "equal selected order under the admitted logical-token model"
+      },
+      "mathematical_inventory": {
+        "merge_nodes": 4,
+        "interface_entries": 1344,
+        "source_coordinate_entries": 8,
+        "collective_witnesses": 2
+      },
+      "production_same_tokens": true,
+      "physical_lowering": "unavailable: nested token frames; no allocation or C++ claim",
+      "device": "not run",
+      "independent_semantics": "large size check only; no unfolded execution"
+    },
+    {
+      "rows": 1000000,
+      "counts": [
+        2,
+        3
+      ],
+      "input_sha256": "36b5ab4a2651cd5b7eb18cd2c78f6cc59fc599d8763b9cdb393c92c6cbdb3c69",
+      "diagnostic_analysis_seconds": 0.00023768609389662743,
+      "diagnostic_logical_export_seconds": 0.00010430207476019859,
+      "production_insert_seconds": 0.0003788340836763382,
+      "timing_scope": "separate single runs; descriptive, no speedup claim; do not sum inclusive times",
+      "logical_inventory": {
+        "record_sites": 2,
+        "wait_sites": 3,
+        "guarded_wait_sites": 2,
+        "carried_tokens": 4,
+        "name_scan_visits": 44,
+        "name_scan_nodes": 39,
+        "guarantee": "equal selected order under the admitted logical-token model"
+      },
+      "mathematical_inventory": {
+        "merge_nodes": 4,
+        "interface_entries": 1344,
+        "source_coordinate_entries": 8,
+        "collective_witnesses": 2
+      },
+      "production_same_tokens": true,
+      "physical_lowering": "unavailable: nested token frames; no allocation or C++ claim",
+      "device": "not run",
+      "independent_semantics": "large size check only; no unfolded execution"
+    },
+    {
+      "rows": 3,
+      "counts": [
+        1000,
+        3
+      ],
+      "input_sha256": "3992a8ff1f32f567fefb28615924f7d7f912ec32eb072aee52c708f9deb1d212",
+      "diagnostic_analysis_seconds": 0.00037662312388420105,
+      "diagnostic_logical_export_seconds": 0.00010701082646846771,
+      "production_insert_seconds": 0.0004950137808918953,
+      "timing_scope": "separate single runs; descriptive, no speedup claim; do not sum inclusive times",
+      "logical_inventory": {
+        "record_sites": 2,
+        "wait_sites": 3,
+        "guarded_wait_sites": 2,
+        "carried_tokens": 4,
+        "name_scan_visits": 44,
+        "name_scan_nodes": 39,
+        "guarantee": "equal selected order under the admitted logical-token model"
+      },
+      "mathematical_inventory": {
+        "merge_nodes": 17,
+        "interface_entries": 5712,
+        "source_coordinate_entries": 8,
+        "collective_witnesses": 2
+      },
+      "production_same_tokens": true,
+      "physical_lowering": "unavailable: nested token frames; no allocation or C++ claim",
+      "device": "not run",
+      "independent_semantics": "large size check only; no unfolded execution"
+    },
+    {
+      "rows": 3,
+      "counts": [
+        2,
+        1000000
+      ],
+      "input_sha256": "a0d19078ebad0ae4233782c48348b41b4d3c66fa8229b47a1d61a813839471b0",
+      "diagnostic_analysis_seconds": 0.0004659648984670639,
+      "diagnostic_logical_export_seconds": 0.0001041097566485405,
+      "production_insert_seconds": 0.0006176372990012169,
+      "timing_scope": "separate single runs; descriptive, no speedup claim; do not sum inclusive times",
+      "logical_inventory": {
+        "record_sites": 2,
+        "wait_sites": 3,
+        "guarded_wait_sites": 2,
+        "carried_tokens": 4,
+        "name_scan_visits": 44,
+        "name_scan_nodes": 39,
+        "guarantee": "equal selected order under the admitted logical-token model"
+      },
+      "mathematical_inventory": {
+        "merge_nodes": 27,
+        "interface_entries": 9072,
+        "source_coordinate_entries": 8,
+        "collective_witnesses": 2
+      },
+      "production_same_tokens": true,
+      "physical_lowering": "unavailable: nested token frames; no allocation or C++ claim",
+      "device": "not run",
+      "independent_semantics": "large size check only; no unfolded execution"
+    }
+  ],
+  "broad_gate": {
+    "passed": 1148,
+    "warnings": 28,
+    "seconds": 435.7,
+    "command": [
+      "/usr/bin/python3",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/ut/ir/transforms/test_scoped_logical_sync.py",
+      "tests/ut/ir/transforms/test_crossing_token_sync.py",
+      "tests/ut/ir/transforms/test_regional_slot_composition.py",
+      "tests/ut/ir/transforms/test_streamed_slot_composition.py",
+      "tests/ut/ir/transforms/test_rotating_token_sync.py",
+      "tests/ut/ir/transforms/test_autosync_switch.py",
+      "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+      "tests/ut/ir/transforms/test_collective_sync_interface.py",
+      "tests/ut/ir/transforms/test_collective_sync_realization.py",
+      "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+      "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+      "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+      "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+      "tests/ut/ir/transforms/test_logical_sync_realization.py",
+      "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+      "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+      "tests/ut/ir/transforms/test_parameterized_sync.py",
+      "tests/ut/ir/transforms/test_physical_sync_realization.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+      "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+      "tests/ut/ir/transforms/test_row_sync_analysis.py",
+      "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+      "tests/ut/ir/transforms/test_slot_sync_import.py",
+      "tests/ut/ir/transforms/test_sync_range_proofs.py",
+      "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+      "tests/ut/ir/transforms/test_verify_hard_syncall_occupancy.py",
+      "tests/ut/ir/transforms/test_token_sync_lowering.py",
+      "tests/ut/ir/transforms/test_structured_token_sync.py",
+      "--basetemp=build-py314/pytest-token-m3b-gate",
+      "--junitxml=build-py314/token-m3b-gate.xml",
+      "--tb=short"
+    ],
+    "source_before_format": {
+      "CMakeLists.txt": "b98f02beba05516eb8ccb75a5442c3019d4791774b119a3f868157229ec9cadc",
+      "src/ir/transforms/utils/logical_sync_realization.cpp": "3b155def994012946f5ee0c841861caebe3f7dc229928e085b235caeb0892630",
+      "src/ir/transforms/utils/scoped_logical_sync.cpp": "11b6515e638daca01d3ef57491d9f0b2d467cddadbfd7b20bf2237ceb2100c7c",
+      "src/ir/transforms/utils/scoped_logical_sync.h": "d4e529bb5a90216653a2180823f77e054b1e7e36a6d7ff61b89a754ee0a44cde",
+      "src/ir/transforms/utils/sync_token_names.h": "adfffb4c37c5068e1ca962e07985fec173f12fd9ef93951d2705d8de6d5e5ccd",
+      "src/ir/transforms/utils/sync_placement.h": "76435dece779714b38202c55bd2dd75b0a75d32ccb5a1b8e6c5c22b7c2598821",
+      "tests/ut/ir/transforms/test_scoped_logical_sync.py": "66538047695cdaefd1d39080883d2bf4d50a615991107b6d895edad6e9266778"
+    },
+    "log_sha256": "1b90e4abf461d920d46ca5f0a521c0e841c132be2a5902dc329bf046b3dfb491"
+  },
+  "post_format_gate": {
+    "passed": 150,
+    "seconds": 9.21,
+    "files": [
+      "test_scoped_logical_sync.py",
+      "test_token_sync_lowering.py",
+      "test_structured_token_sync.py",
+      "test_rotating_token_sync.py",
+      "test_crossing_token_sync.py"
+    ],
+    "log_sha256": "fd4341bb321e0d42fa38422ba67cfae1db116154780d6484ee1b0c11a1c7162a"
+  },
+  "focused_scope": {
+    "passed": 29,
+    "seconds": 0.67,
+    "log_sha256": "d4edf3b5485f87f9ef40fcf36d6b54861b41b480a7069178b4ed04d33107501c"
+  },
+  "build_command": "cmake --build build-py314 --parallel 1",
+  "reviews": {
+    "architecture": "accepted",
+    "correctness": "accepted",
+    "algorithm": "accepted"
+  },
+  "hooks": {
+    "implementation": "passed",
+    "qualification_runner": "passed",
+    "final_log_sha256": "af71c40188397c0e73563709fb2b0f748fd5fd0857903f6da87b7cfe8547dd19"
+  },
+  "plan_status": {
+    "M1": "accepted and committed",
+    "M2": "accepted and committed",
+    "M3": "logical scoped insertion accepted; nested physical lowering pending",
+    "M4": "pending",
+    "M5": "pending"
+  }
+}

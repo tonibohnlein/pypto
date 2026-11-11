@@ -64,6 +64,9 @@ class SyncPlacement : public IRMutator {
   StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
     return RewriteSyncSequence(op, [this](const StmtPtr& child) { return VisitStmt(child); });
   }
+  // Placement adds commands at supplied cuts; it does not rewrite original
+  // scalar/allocation expressions or revisit their shared expression DAGs.
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override { return op; }
   virtual StmtPtr Wrap(const StmtPtr& payload, SyncSiteKey site) = 0;
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
     auto call = As<Call>(op->expr_);

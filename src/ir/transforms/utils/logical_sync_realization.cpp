@@ -23,9 +23,10 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
-#include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/scoped_logical_sync.h"
 #include "src/ir/transforms/utils/sync_placement.h"
+#include "src/ir/transforms/utils/sync_token_names.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -48,18 +49,6 @@ struct Incoming {
   int64_t source_visit = 0, target_visit = 0;
 };
 
-// Name reservation is context-independent. Reuse definition/use collection,
-// but inspect a shared operand DAG only once instead of expanding its paths.
-class NameCollector : public var_collectors::VarDefUseCollector {
- public:
-  void VisitExpr(const ExprPtr& expression) override {
-    ++visits;
-    if (expression && seen.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
-  }
-  size_t visits = 0;
-  std::set<const Expr*> seen;
-};
-
 // One indexed IR traversal, O((N+F+H) log(N+F+H)), including H history
 // carry/result/yield nodes; F includes supplied crossing records. Capture state
 // adds O(B) nodes for B distinct demanded source occurrences (B <= F).
@@ -69,13 +58,11 @@ class NameCollector : public var_collectors::VarDefUseCollector {
 // compact-in-binary-period token container; mathematical reduction stays compact.
 class Realizer : public SyncPlacement {
  public:
-  explicit Realizer(const CompactSyncResult& analysis) : SyncPlacement(analysis.input) {
+  explicit Realizer(const CompactSyncResult& analysis)
+      : SyncPlacement(analysis.input), names_(analysis.input.owner) {
     CHECK(analysis.input.owner) << "Logical realization requires the original occurrence owner";
-    NameCollector collector;
-    collector.VisitFunction(analysis.input.owner);
-    result.name_scan_visits = collector.visits;
-    result.name_scan_nodes = collector.seen.size();
-    for (const auto* var : collector.GetAllVarRefs()) names_.insert(var->name_hint_);
+    result.name_scan_visits = names_.visits;
+    result.name_scan_nodes = names_.Nodes();
     for (size_t r = 0; r < analysis.input.segments.size(); ++r) {
       const auto& segment = analysis.input.segments[r];
       for (const auto& f : analysis.segments[r].demands) {
@@ -180,16 +167,8 @@ class Realizer : public SyncPlacement {
   std::map<Site, std::vector<Incoming>> incoming_;
   std::map<size_t, std::vector<Site>> carried_;
   std::optional<size_t> active_loop_;
-  std::set<std::string> names_;
-  size_t next_name_ = 0;
-  std::string Name() {
-    // Monotone counter avoids repeatedly searching all earlier suffixes.
-    std::string name;
-    do {
-      name = "sync_completion_" + std::to_string(next_name_++);
-    } while (!names_.insert(name).second);
-    return name;
-  }
+  SyncTokenNames names_;
+  std::string Name() { return names_.Next(); }
   VarPtr Variable(const TypePtr& type) { return std::make_shared<Var>(Name(), type, Span::unknown()); }
   static CallPtr Token(const char* name, PipeType pipe, const Span& span) {
     return OpRegistry::GetInstance().Create(name, {}, {{"pipe", static_cast<int>(pipe)}}, span);
@@ -258,7 +237,7 @@ class Realizer : public SyncPlacement {
 };
 }  // namespace
 LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis) {
-  CHECK(!analysis.input.region_tree) << "Nested/phase logical token transport is unavailable";
+  if (analysis.input.region_tree) return RealizeScopedLogicalSync(analysis);
   for (const auto& segment : analysis.input.segments)
     CHECK(segment.nested_frames.empty()) << "Nested repetition requires token transport across every "
                                             "enclosing frame; physical export is available";

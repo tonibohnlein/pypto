@@ -22,7 +22,9 @@ analysis and original-coordinate logical exporter. It creates non-consuming
 completion tokens, with records after producers and waits before consumers.
 Its exporter supports qualified repeated bodies and single-region rotating
 slot streams using scalar token histories. Finite numerical crossing exports
-use occurrence captures as described below. Nested exports remain unavailable. Unsupported inputs raise; standalone insertion does not delegate.
+use occurrence captures as described below. Qualified constant nested frames
+also support scoped logical insertion; nested physical lowering remains unavailable.
+Unsupported inputs raise; standalone insertion does not delegate.
 A new insertion request must not contain existing synchronization.
 
 Exactness is relative to the admitted access model. Scratch enclosures, native
@@ -162,6 +164,46 @@ delegated slot restrictions and native multi-buffer size limits still apply.
 Nested token frames, arbitrary structured joins, non-completed carry entry,
 cyclic histories, live older-result crossings, noncanonical guards and unavailable caller range evidence
 remain explicit refusals. Existing production coverage is unchanged.
+
+## Scoped nested insertion
+
+For a retained original-region tree, insertion consumes its existing scoped
+Cartesian demand families. Each endpoint retains its original frame identity and
+mixed-radix coordinates. Axes must be a common enclosing prefix with exact
+strides and bounds. The supported seam advances the last varying common axis by
+one visit; longer lags and differing fixed common-frame coordinates without such
+a seam remain unavailable.
+
+A source fact exits each source-only inner frame through a completed-initialized
+carry. A final-visit source uses an ordinary yield; an interior source uses a pure
+token selection at the selected coordinate. Results are lifted outward one frame
+at a time. For an adjacent enclosing seam, the outer loop carries that selected
+fact into the next visit. Inner source and target counters may then reset to
+different fixed coordinates. Initialization stays at the owning invocation entry.
+
+The consumer guard is exactly its original Cartesian occurrence domain, excluding
+empty entry facts. Records follow the entire qualified payload macro. Source
+records may be shared as immutable completion facts; uses keep distinct identities.
+The logical verifier checks SSA dominance in addition to the coordinate contract.
+
+The construction adds `O(FD)` state and guard nodes for F supplied families and
+frame depth D, plus indexed lookups and original-DAG name reservation. It does not
+unfold row or trip counts. Upstream mathematical export construction is separate.
+Constant original frame bounds are required; dynamic starts remain unavailable
+without invalidating retained mathematics. These are logical insertion guarantees,
+not a consuming-flag assignment. Nested `LowerSync` remains explicitly refused.
+
+The [scoped insertion receipt](../ir/token-pipeline-m3b.json) records 29 focused
+semantic/refusal cases, a 1,148-test broad gate, and a 150-test rebuilt token gate.
+A nested collective derivative retains two record sites, three wait sites and
+four carried facts as either row count or visit count grows to one million.
+Numerical summary work still grows with logarithmic repetition composition.
+Single-run production insertion measurements are descriptive, not speedup evidence.
+
+```bash
+/usr/bin/python3 -m tests.ut.ir.transforms.qualify_scoped_token_insertion \
+  --output build-py314/token-m3b-qualification.json
+```
 
 ## Migration and guarantees
 
