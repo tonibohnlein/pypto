@@ -217,6 +217,152 @@ void Extract(const std::vector<Fragment>& fragments, const RotatingSlotInfo& slo
     }
   }
 }
+// Range assignment/maximum over compressed endpoints, never over bytes or
+// interval/atom incidences. Zero is the absent key; positive keys increase in
+// circular sweep order. A pending assignment covers this entire tree node.
+class IntervalPredecessors {
+ public:
+  IntervalPredecessors(size_t size, CompactSegmentResult& work) : size_(size), work_(work), nodes_(4 * size) {
+    work_.interval_tree_entries += nodes_.size();
+  }
+  void Assign(size_t begin, size_t end, size_t key) {
+    ++work_.interval_updates;
+    Assign(1, 0, size_, begin, end, key);
+  }
+  size_t Maximum(size_t begin, size_t end) {
+    ++work_.interval_queries;
+    return Maximum(1, 0, size_, begin, end);
+  }
+
+ private:
+  struct Node {
+    size_t maximum = 0;
+    std::optional<size_t> assignment;
+  };
+  void Set(size_t node, size_t key) { nodes_[node] = {key, key}; }
+  void Push(size_t node) {
+    if (!nodes_[node].assignment) return;
+    Set(2 * node, *nodes_[node].assignment);
+    Set(2 * node + 1, *nodes_[node].assignment);
+    nodes_[node].assignment.reset();
+  }
+  void Assign(size_t node, size_t lo, size_t hi, size_t begin, size_t end, size_t key) {
+    ++work_.interval_node_visits;
+    if (begin <= lo && hi <= end) {
+      Set(node, key);
+      return;
+    }
+    Push(node);
+    const size_t mid = lo + (hi - lo) / 2;
+    if (begin < mid) Assign(2 * node, lo, mid, begin, end, key);
+    if (end > mid) Assign(2 * node + 1, mid, hi, begin, end, key);
+    nodes_[node].maximum = std::max(nodes_[2 * node].maximum, nodes_[2 * node + 1].maximum);
+  }
+  size_t Maximum(size_t node, size_t lo, size_t hi, size_t begin, size_t end) {
+    ++work_.interval_node_visits;
+    if (begin <= lo && hi <= end) return nodes_[node].maximum;
+    Push(node);
+    const size_t mid = lo + (hi - lo) / 2;
+    size_t answer = 0;
+    if (begin < mid) answer = Maximum(2 * node, lo, mid, begin, end);
+    if (end > mid) answer = std::max(answer, Maximum(2 * node + 1, mid, hi, begin, end));
+    return answer;
+  }
+  size_t size_;
+  CompactSegmentResult& work_;
+  std::vector<Node> nodes_;
+};
+struct IntervalKey {
+  int64_t phase;
+  size_t site;
+  bool write;
+  int64_t begin, end;
+  size_t lo = 0, hi = 0;
+};
+// Target/source-pipe -> (distance, source). Compare reconstructed source
+// identities (-distance, site), never phases from different families.
+using IntervalCandidates = std::map<std::pair<size_t, PipeType>, std::pair<int64_t, size_t>>;
+void ExtractIntervals(const SyncStorage& storage, const std::vector<AccessRef>& accesses,
+                      const RotatingSlotInfo& slot, CompactSegmentResult& result,
+                      IntervalCandidates& candidates) {
+  ++result.interval_domains;
+  std::map<int64_t, std::vector<IntervalKey>> groups;
+  for (const auto& [site, access] : accesses) {
+    const int64_t offset = Mod(access->slot_first, storage.slot_count);
+    const auto [begin, end] = *access->physical_interval;
+    INTERNAL_CHECK(begin >= 0 && begin < end) << "Invalid retained exact physical interval";
+    groups[offset % slot.gcd].push_back(
+        {Mod(-Wide(slot.inverse) * (offset / slot.gcd), slot.period), site, access->write, begin, end});
+    ++result.interval_fragments;
+  }
+  for (auto& [residue, keys] : groups) {
+    ++result.modular_groups;
+    std::vector<int64_t> endpoints;
+    std::set<PipeType> pipes;
+    for (const auto& key : keys) {
+      endpoints.push_back(key.begin);
+      endpoints.push_back(key.end);
+      pipes.insert(result.pipes[key.site]);
+    }
+    std::sort(endpoints.begin(), endpoints.end(), [&](int64_t a, int64_t b) {
+      ++result.sort_comparisons;
+      return a < b;
+    });
+    endpoints.erase(std::unique(endpoints.begin(), endpoints.end()), endpoints.end());
+    result.interval_endpoints += endpoints.size();
+    for (auto& key : keys) {
+      key.lo = std::lower_bound(endpoints.begin(), endpoints.end(), key.begin) - endpoints.begin();
+      key.hi = std::lower_bound(endpoints.begin(), endpoints.end(), key.end) - endpoints.begin();
+    }
+    std::sort(keys.begin(), keys.end(), [&](const IntervalKey& a, const IntervalKey& b) {
+      ++result.sort_comparisons;
+      return std::tie(a.phase, a.site) < std::tie(b.phase, b.site);
+    });
+    std::map<PipeType, std::pair<IntervalPredecessors, IntervalPredecessors>> trees;
+    for (auto pipe : pipes)
+      trees.emplace(pipe, std::make_pair(IntervalPredecessors(endpoints.size() - 1, result),
+                                         IntervalPredecessors(endpoints.size() - 1, result)));
+    // The first copy supplies all wraparound predecessors. Equal (phase,site)
+    // fragments form one occurrence: query every mode/view before any update.
+    // Different offsets at one site may denote different canonical visits.
+    for (size_t copy = 0; copy < 2; ++copy) {
+      for (size_t first = 0; first < keys.size();) {
+        size_t last = first + 1;
+        while (last < keys.size() && keys[last].phase == keys[first].phase &&
+               keys[last].site == keys[first].site)
+          ++last;
+        for (size_t index = first; index < last; ++index) {
+          const auto& target = keys[index];
+          ++result.sweep_visits;
+          for (auto& [pipe, pair] : trees) {
+            const size_t answer = (target.write ? pair.second : pair.first).Maximum(target.lo, target.hi);
+            if (!copy || !answer) continue;
+            const size_t ordinal = answer - 1;
+            const auto& source = keys[ordinal % keys.size()];
+            const Wide distance =
+                Wide(target.phase) + slot.period - source.phase - Wide(ordinal / keys.size()) * slot.period;
+            INTERNAL_CHECK(distance >= 0 && distance <= slot.period)
+                << "Interval predecessor is outside the preceding orbit";
+            const auto candidate = std::make_pair(static_cast<int64_t>(distance), source.site);
+            const auto name = std::make_pair(target.site, pipe);
+            auto found = candidates.find(name);
+            if (found == candidates.end() || candidate.first < found->second.first ||
+                (candidate.first == found->second.first && candidate.second > found->second.second))
+              candidates[name] = candidate;
+          }
+        }
+        for (size_t index = first; index < last; ++index) {
+          const auto& key = keys[index];
+          auto& pair = trees.at(result.pipes[key.site]);
+          const size_t ordinal = 1 + copy * keys.size() + index;
+          pair.second.Assign(key.lo, key.hi, ordinal);
+          if (key.write) pair.first.Assign(key.lo, key.hi, ordinal);
+        }
+        first = last;
+      }
+    }
+  }
+}
 struct Edge {
   size_t source, target;
   int64_t weight;
@@ -398,6 +544,7 @@ CompactSegmentResult AnalyzeRotatingSegment(const CompactSyncInput& input, size_
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
   std::set<Generator> generators;
+  IntervalCandidates interval_candidates;
   for (const auto& [storage, fragments] : accesses) {
     const auto& domain = input.storage[storage];
     CHECK(domain.slot_count > 0) << "Invalid rotating slot count";
@@ -408,6 +555,14 @@ CompactSegmentResult AnalyzeRotatingSegment(const CompactSyncInput& input, size_
     slot.inverse = Inverse(slot.stride / slot.gcd, slot.period);
     const auto ownership = VisitOwnership(domain, fragments, count);
     if (ownership) output.visit_owned.emplace(storage, *ownership);
+    // A partial or unqualified domain stays on its established exact modeled
+    // geometry path. Never omit its accesses or fabricate interval evidence.
+    if (!ownership && std::all_of(fragments.begin(), fragments.end(), [](const AccessRef& access) {
+          return access.second->physical_interval.has_value();
+        })) {
+      ExtractIntervals(domain, fragments, slot, output, interval_candidates);
+      continue;
+    }
     auto atoms = Normalize(domain, fragments, output, ownership.has_value());
     work.cells += atoms.size();
     for (const auto& atom : atoms) {
@@ -417,6 +572,8 @@ CompactSegmentResult AnalyzeRotatingSegment(const CompactSyncInput& input, size_
         Extract(atom, slot, output, generators);
     }
   }
+  for (const auto& [target_pipe, source] : interval_candidates)
+    generators.emplace(source.second, target_pipe.first, source.first);
   for (const auto& [source, target, distance] : generators) {
     CHECK(distance >= 0 && (distance > 0 || source < target))
         << "Rotating generator is not reference-forward";

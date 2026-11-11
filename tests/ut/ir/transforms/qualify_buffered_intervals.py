@@ -20,12 +20,14 @@ from typing import Any
 from pypto import backend, ir, testing
 from pypto.backend import BackendType
 
+from .test_interval_sync_analysis import interval_pipeline
 from .test_slot_sync_import import slot_fixture
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--partial", action="store_true", help="Measure exact nested interval views")
     args = parser.parse_args()
     backend.set_backend_type(BackendType.Ascend910)
     root = Path.cwd()
@@ -49,8 +51,17 @@ def main():
         "timing": "single descriptive samples; no speedup claim",
         "cases": [],
     }
-    for count, slots in [(7, 3), (1000, 3), (1000000, 3), (7, 101), (7, 1000003)]:
-        function = slot_fixture(count, slots, alias=True)
+    cases = (
+        [(7, 3, n) for n in [4, 16, 64, 128]]
+        if args.partial
+        else [(count, slots, 0) for count, slots in [(7, 3), (1000, 3), (1000000, 3), (7, 101), (7, 1000003)]]
+    )
+    for count, slots, readers in cases:
+        function = (
+            interval_pipeline(count, readers, slots)
+            if args.partial
+            else slot_fixture(count, slots, alias=True)
+        )
         start = time.perf_counter()
         result = testing.analyze_placed_sync(function, True)
         elapsed = time.perf_counter() - start
@@ -58,6 +69,7 @@ def main():
         region = description["regions"][0]
         row = {
             "count": count,
+            "readers": readers,
             "slots": slots,
             "analysis_seconds_inclusive": elapsed,
             "interval_access_visits": description["interval_access_visits"],
@@ -65,6 +77,13 @@ def main():
         }
         for key in [
             "atom_tests",
+            "interval_domains",
+            "interval_fragments",
+            "interval_endpoints",
+            "interval_queries",
+            "interval_updates",
+            "interval_node_visits",
+            "interval_tree_entries",
             "rotating_fragments",
             "sort_comparisons",
             "sweep_visits",

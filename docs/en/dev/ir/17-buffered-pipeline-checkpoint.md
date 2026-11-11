@@ -342,3 +342,51 @@ compatible Python on PATH. No source or expectation was changed to repair them.
 
 M1 accepted by architecture, correctness and algorithm/performance reviewers.
 The focused gate passed **206 tests** with 18 existing inline-annotation warnings.
+
+### M2: interval-sweep extraction
+
+The existing rotating service now queries latest-writer/latest-access range
+assignment trees on compressed physical endpoints. It batches all fragments of
+one canonical occurrence before updates, sweeps two circular copies and compares
+candidates across families by original relative source identities. Only the
+latest conflicting source on each pipe is retained for each target. Earlier
+sources reach it through native completion order; finite clipping preserves the
+selected source whenever an earlier source is present. The existing quotient
+reducer and physical-point selectors consume these generators unchanged.
+
+A whole domain takes this path only when every access has exact stationary
+interval evidence. Other domains keep their existing geometry construction and
+separate costs. The `km` generator bound applies to fully interval-qualified
+storage generation, not the union with arbitrary fallback contributions.
+Temporary range trees are extraction scratch; neither trips nor slots are
+enumerated. Counters distinguish input fragments, compressed endpoints, tree
+queries/updates/node visits and allocated tree entries. The entry counter is
+total allocation across groups, not peak live memory.
+
+Partial rotating Mat extracts now use the same contiguous-interval qualification
+as retained access export. Partial boxed/noncontiguous extracts remain
+unavailable. Independent original-address tests cover nested, disjoint and
+partly overlapping views, equal-key RMW batching, different offsets at one
+payload, and different-period families sharing a source pipe. No verifier or
+alias contract was relaxed: dynamically different Vec slots remain unavailable
+as potentially overlapping in-place operands unless the operation contract
+establishes legality.
+
+For 4/16/64/128 nested-prefix readers the new path retains 10/34/130/258
+generators and inspects 126/654/3558/8178 tree nodes, with zero atom/access tests.
+The old atom partition would inspect every prefix at every row partition.
+Existing ring baseline demands and physical refusals are unchanged. The new
+partial Mat fixtures also retain the explicit `Unavailable same-pipe barrier
+mechanism` refusal; C++ generation is therefore unavailable for those fixtures.
+This is an executable-contract boundary, not an ID-capacity result or a demand
+failure. Existing accepted physical routes are checked separately.
+
+Reproduce the interval campaign with the M1 runner plus `--partial`. Receipts
+record descriptive single-run times, not paired speedup evidence. Access
+recovery, native footprint qualification and interface enumeration retain their
+previous scope. General symbolic crossings and allocation changes remain out
+of scope.
+
+M2 accepted by the architecture, correctness and algorithm/performance reviewers.
+The focused gate passed **329 tests**, including existing physical/C++ and Qwen
+regressions, with 18 existing inline-annotation warnings.

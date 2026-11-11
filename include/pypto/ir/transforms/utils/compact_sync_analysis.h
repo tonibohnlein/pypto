@@ -204,6 +204,10 @@ struct CompactSegmentResult {
   std::map<size_t, std::vector<std::pair<size_t, size_t>>> storage_accesses;
   std::array<int64_t, kPipeCount> pipe_sizes{};
   size_t rotating_fragments = 0, modular_groups = 0, sort_comparisons = 0, sweep_visits = 0;
+  // Interval extraction work, separate from legacy atom incidences. Tree
+  // entries count total allocated nodes across groups, not peak live bytes.
+  size_t interval_domains = 0, interval_fragments = 0, interval_endpoints = 0;
+  size_t interval_queries = 0, interval_updates = 0, interval_node_visits = 0, interval_tree_entries = 0;
   size_t atom_tests = 0, shortest_path_runs = 0, shortest_path_edge_visits = 0;
   size_t retained_frontier_entries = 0, quotient_edges = 0;
   std::optional<__int128> Threshold(size_t source, bool sc, size_t target, bool tc) const;

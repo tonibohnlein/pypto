@@ -299,6 +299,7 @@ def describe_placed_sync_input(
 
     A missing physical_intervals entry denotes unavailable interval geometry,
     not absence. interval_access_visits counts static qualification work.
+    An analyzed region also reports interval tree work separately from atom tests.
     """
     ...
 

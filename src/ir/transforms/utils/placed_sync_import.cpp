@@ -44,6 +44,49 @@ int64_t Checked(__int128 value) {
       << "Synchronization import requires nonnegative nonoverflowing index arithmetic";
   return static_cast<int64_t>(value);
 }
+// Exact contiguous byte evidence for both admission and retained exports.
+// No enclosure or partial boxed layout is flattened into an exact interval.
+std::optional<std::pair<int64_t, int64_t>> PhysicalInterval(const SyncStorage& storage,
+                                                            const SyncAccess& access) {
+  if (!access.exact_footprint || access.row_step || access.column_step || access.after_first ||
+      !storage.row_parameters.empty() || !storage.column_parameters.empty() || storage.row_block ||
+      storage.column_block || storage.row_extent_parameter)
+    return std::nullopt;
+  const auto row_end = __int128(access.row) + access.rows;
+  const auto column_end = __int128(access.column) + access.columns;
+  if (access.row < 0 || access.column < 0 || access.rows <= 0 || access.columns <= 0 ||
+      row_end > storage.rows || column_end > storage.columns)
+    return std::nullopt;
+  __int128 begin = 0, end = 0;
+  if (storage.byte_coordinates) {
+    if (access.row != 0 || access.rows != 1) return std::nullopt;
+    begin = access.column;
+    end = column_end;
+  } else {
+    const auto elements = __int128(storage.rows) * storage.columns;
+    const auto slot_bytes = storage.slot_count == 1 ? storage.bytes : storage.slot_bytes;
+    if (elements <= 0 || slot_bytes <= 0 || slot_bytes % elements) return std::nullopt;
+    const auto bytes = slot_bytes / elements;
+    if (storage.layout && storage.layout->slayout_ != TileLayout::none_box) {
+      // Whole qualified fractal tiles are contiguous; partial logical
+      // rectangles need a layout-specific interval proof, not flattening.
+      if (access.row || access.column || access.rows != storage.rows || access.columns != storage.columns)
+        return std::nullopt;
+      end = slot_bytes;
+    } else if (!storage.layout || storage.layout->blayout_ == TileLayout::row_major) {
+      if (access.rows != 1 && (access.column || access.columns != storage.columns)) return std::nullopt;
+      begin = (__int128(access.row) * storage.columns + access.column) * bytes;
+      end = begin + __int128(access.rows) * access.columns * bytes;
+    } else if (storage.layout->blayout_ == TileLayout::col_major) {
+      if (access.columns != 1 && (access.row || access.rows != storage.rows)) return std::nullopt;
+      begin = (__int128(access.column) * storage.rows + access.row) * bytes;
+      end = begin + __int128(access.rows) * access.columns * bytes;
+    } else {
+      return std::nullopt;
+    }
+  }
+  return std::make_pair(Checked(begin), Checked(end));
+}
 int64_t Constant(const ExprPtr& e) {
   auto c = As<ConstInt>(e);
   CHECK(c) << "Synchronization import requires a constant extent/address";
@@ -594,8 +637,8 @@ class Importer {
             << "Unaligned boxed extraction requires a separate footprint contract";
       }
       site.accesses.push_back(Access(sid, false, row, column, t.rows, t.columns, segment));
-      CHECK(!extract || result.storage[sid].slot_count == 1)
-          << "Partial rotating-slot extraction requires a within-slot atom certificate";
+      CHECK(!extract || s.slot_count == 1 || PhysicalInterval(s, site.accesses.back()))
+          << "Rotating-slot extraction requires an exact contiguous within-slot interval";
       ApplySlot(site.accesses.back(), call->args_[0], segment);
       modes[0].first = true;
       whole(target, true);
@@ -1234,46 +1277,8 @@ static void QualifyPhysicalIntervals(CompactSyncInput& input) {
       for (auto& access : site.accesses) {
         ++input.interval_access_visits;
         const auto& storage = input.storage.at(access.storage);
-        if (!access.exact_footprint || access.row_step || access.column_step || access.after_first ||
-            !storage.row_parameters.empty() || !storage.column_parameters.empty() || storage.row_block ||
-            storage.column_block || storage.row_extent_parameter)
-          continue;
-        const auto row_end = __int128(access.row) + access.rows;
-        const auto column_end = __int128(access.column) + access.columns;
-        if (access.row < 0 || access.column < 0 || access.rows <= 0 || access.columns <= 0 ||
-            row_end > storage.rows || column_end > storage.columns)
-          continue;
-        __int128 begin = 0, end = 0;
-        if (storage.byte_coordinates) {
-          if (access.row != 0 || access.rows != 1) continue;
-          begin = access.column;
-          end = column_end;
-        } else {
-          const auto elements = __int128(storage.rows) * storage.columns;
-          const auto slot_bytes = storage.slot_count == 1 ? storage.bytes : storage.slot_bytes;
-          if (elements <= 0 || slot_bytes <= 0 || slot_bytes % elements) continue;
-          const auto bytes = slot_bytes / elements;
-          if (storage.layout && storage.layout->slayout_ != TileLayout::none_box) {
-            // Whole qualified fractal tiles are contiguous; partial logical
-            // rectangles need a layout-specific interval proof, not flattening.
-            if (access.row || access.column || access.rows != storage.rows ||
-                access.columns != storage.columns)
-              continue;
-            end = slot_bytes;
-          } else if (!storage.layout || storage.layout->blayout_ == TileLayout::row_major) {
-            if (access.rows != 1 && (access.column || access.columns != storage.columns)) continue;
-            begin = (__int128(access.row) * storage.columns + access.column) * bytes;
-            end = begin + __int128(access.rows) * access.columns * bytes;
-          } else if (storage.layout->blayout_ == TileLayout::col_major) {
-            if (access.columns != 1 && (access.row || access.rows != storage.rows)) continue;
-            begin = (__int128(access.column) * storage.rows + access.row) * bytes;
-            end = begin + __int128(access.rows) * access.columns * bytes;
-          } else {
-            continue;
-          }
-        }
-        access.physical_interval = std::make_pair(Checked(begin), Checked(end));
-        ++input.qualified_intervals;
+        access.physical_interval = PhysicalInterval(storage, access);
+        if (access.physical_interval) ++input.qualified_intervals;
       }
     }
   }

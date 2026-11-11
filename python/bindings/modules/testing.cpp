@@ -152,6 +152,13 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
       region["visit_owned"] = ownership;
       region["rotating_fragments"] = analysis->rotating_fragments;
       region["atom_tests"] = analysis->atom_tests;
+      region["interval_domains"] = analysis->interval_domains;
+      region["interval_fragments"] = analysis->interval_fragments;
+      region["interval_endpoints"] = analysis->interval_endpoints;
+      region["interval_queries"] = analysis->interval_queries;
+      region["interval_updates"] = analysis->interval_updates;
+      region["interval_node_visits"] = analysis->interval_node_visits;
+      region["interval_tree_entries"] = analysis->interval_tree_entries;
       region["quotient_edges"] = analysis->quotient_edges;
       region["modular_groups"] = analysis->modular_groups;
       region["sort_comparisons"] = analysis->sort_comparisons;
