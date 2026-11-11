@@ -73,7 +73,7 @@ def _project(vertices, edges, payload_vertices):
     return order, {(a, b) for a, b in order if a in payloads and b in payloads}
 
 
-def _check_actual_tokens(original, logical, physical, *, check_codegen=True):
+def _check_actual_tokens(original, logical, physical, *, check_codegen=True, require_access_coverage=True):
     """Check all token-induced order, matching and reuse without compiler families."""
     _, calls = interpret(original)
     reference = hardware_reference(original, calls)
@@ -88,7 +88,8 @@ def _check_actual_tokens(original, logical, physical, *, check_codegen=True):
     assert len(flag_state.records) == len(flag_state.waits)
     assert all(pair in order for pair in flag_state.reuses), "unsafe physical flag reuse"
     assert actual == expected, ("token lowering changed payload order", actual - expected, expected - actual)
-    assert reference[2] <= actual, ("missing modeled access coverage", reference[2] - actual)
+    if require_access_coverage:
+        assert reference[2] <= actual, ("missing modeled access coverage", reference[2] - actual)
     assert not any(flag_state.pending.values()), "physical wait lacks its intended payload consumer"
     assert all(ids <= set(range(6)) for ids in flag_state.ids.values())
     # The fixed graph is acyclic and matched, so the directional chain-width

@@ -51,7 +51,8 @@ size_t SyncBoundaryGraph::Edges() const {
   for (const auto& edges : graph_) result += edges.size();
   return result;
 }
-SyncBoundaryGraph::SyncBoundaryGraph(const std::vector<CompactSegmentResult>& segments)
+SyncBoundaryGraph::SyncBoundaryGraph(const std::vector<CompactSegmentResult>& segments,
+                                     const std::vector<Occurrence>& extra_ports)
     : ports_(segments.size()) {
   for (size_t r = 0; r < segments.size(); ++r) {
     const auto& s = segments[r];
@@ -59,6 +60,12 @@ SyncBoundaryGraph::SyncBoundaryGraph(const std::vector<CompactSegmentResult>& se
     for (int64_t i : std::set<int64_t>{0, s.count - 1})
       for (size_t p = 0; p < s.pipes.size(); ++p)
         for (bool c : {false, true}) Node({{r, i, p}, c});
+  }
+  for (const auto& occurrence : extra_ports) {
+    const auto [r, v, s] = occurrence;
+    CHECK(r < segments.size() && v >= 0 && v < segments[r].count && s < segments[r].pipes.size())
+        << "Crossing port outside original occurrence domain";
+    for (bool completion : {false, true}) Node({occurrence, completion});
   }
   for (const auto& [event, index] : nodes_) ports_[std::get<0>(event.first)].emplace_back(event, index);
   for (const auto& child : ports_)

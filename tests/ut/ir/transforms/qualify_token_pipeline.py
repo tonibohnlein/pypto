@@ -23,6 +23,7 @@ from pypto import backend, codegen, ir, passes, testing
 from pypto.backend import BackendType
 
 from .sync_matmul_cases import capture, staged_fixture
+from .test_buffered_sync_realization import local_sequence
 from .test_streamed_slot_composition import streamed_fixture
 from .test_token_sync_lowering import _check_actual_tokens
 from .test_vec_sync_analysis import vec_fixture
@@ -69,12 +70,37 @@ def measure(function, tokens, *, production=False):
     return result, logical_function, emitted
 
 
+def token_inventory(function):
+    pending = [function.body]
+    carries = captures = records = waits = 0
+    while pending:
+        statement = pending.pop()
+        if isinstance(statement, ir.SeqStmts):
+            pending.extend(statement.stmts)
+        elif isinstance(statement, ir.ForStmt):
+            carries += len(statement.iter_args)
+            pending.append(statement.body)
+        elif isinstance(statement, ir.IfStmt):
+            captures += int(
+                bool(statement.return_vars) and isinstance(statement.return_vars[0].type, ir.SyncTokenType)
+            )
+            pending.append(statement.then_body)
+            if statement.else_body is not None:
+                pending.append(statement.else_body)
+        elif isinstance(statement, ir.AssignStmt) and isinstance(statement.value, ir.Call):
+            records += int(statement.value.op.name == ir.get_op("sync.record").name)
+        elif isinstance(statement, ir.EvalStmt) and isinstance(statement.expr, ir.Call):
+            waits += int(statement.expr.op.name == ir.get_op("sync.wait").name)
+    return {"carried_facts": carries, "capture_sites": captures, "record_sites": records, "wait_sites": waits}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--structured", action="store_true")
     modes.add_argument("--rotating", action="store_true")
+    modes.add_argument("--crossings", action="store_true")
     args = parser.parse_args()
     backend.set_backend_type(BackendType.Ascend910)
     root = Path(__file__).resolve().parents[4]
@@ -117,17 +143,23 @@ def main():
     if args.rotating:
         names = ["rotating_k4", "rotating_k7", "rotating_k1024", "rotating_k1000000"]
         receipt["scope"] = "single-region rotating token stages vs unchanged production; fixed lag three"
+    if args.crossings:
+        names = ["crossing_k6", "crossing_k9", "crossing_k1023", "crossing_k999999"]
+        receipt["scope"] = "rotating occurrence captures vs unchanged production; three slots, two regions"
     for name in names:
         count = None
         if args.rotating:
             count = int(name.removeprefix("rotating_k"))
             function = streamed_fixture(count)
+        elif args.crossings:
+            count = int(name.removeprefix("crossing_k"))
+            function = local_sequence((count, 5))
         elif name.startswith("structured_k"):
             count = int(name.removeprefix("structured_k"))
             function = staged_fixture(count, visits=2)
         else:
             function = vec_fixture() if name == "finite_vec" else capture(name)
-        bounded = count is None or count <= 7
+        bounded = count is None or count <= 9
         row: dict[str, Any] = {
             "name": name,
             "input_sha256": hashlib.sha256(ir.python_print(function, format=False).encode()).hexdigest(),
@@ -138,7 +170,9 @@ def main():
         for pair in range(3):
             samples = {}
             for route in [False, True] if pair != 1 else [True, False]:
-                sample, logical, emitted = measure(function, route, production=args.rotating)
+                sample, logical, emitted = measure(
+                    function, route, production=args.rotating or args.crossings
+                )
                 samples["tokens" if route else "direct"] = sample
                 outputs[route] = emitted
                 if route and bounded:
@@ -182,6 +216,7 @@ def main():
             if bounded
             else "size/timing only; bounded variants checked independently"
         )
+        row["token_inventory"] = token_inventory(logical)
         row["token_text_bytes"] = len(ir.python_print(logical, format=False))
         row["physical_pto_bytes"] = [len(t) for t in texts]
         receipt["cases"].append(row)

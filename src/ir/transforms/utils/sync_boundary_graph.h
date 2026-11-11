@@ -23,11 +23,13 @@ namespace pypto::ir::sync {
 // structured-token interpretation. Contains only supplied child order, native
 // chain boundaries and explicitly added crossings. No access analysis.
 // O(sum P_child^2) construction and O(P+E) graph search; child query costs are
-// separate. Ports are first/final visits, never an unfolding of trip counts.
+// separate. Ports are first/final visits and supplied crossing endpoints, never
+// an unfolding of trip counts. Supplied interface size is charged separately.
 class SyncBoundaryGraph {
  public:
   using Event = std::pair<Occurrence, bool>;
-  explicit SyncBoundaryGraph(const std::vector<CompactSegmentResult>& segments);
+  explicit SyncBoundaryGraph(const std::vector<CompactSegmentResult>& segments,
+                             const std::vector<Occurrence>& extra_ports = {});
   size_t Node(const Event& event);
   void Add(const Event& source, const Event& target);
   bool Path(size_t source, size_t target, std::optional<std::pair<size_t, size_t>> skip = std::nullopt) const;

@@ -21,8 +21,8 @@ Insertion uses the existing placed-access importer, retained minimum-demand
 analysis and original-coordinate logical exporter. It creates non-consuming
 completion tokens, with records after producers and waits before consumers.
 Its exporter supports qualified repeated bodies and single-region rotating
-slot streams using scalar token histories. Rotating crossings and nested exports
-remain unavailable during the migration. Unsupported inputs raise; standalone insertion does not delegate.
+slot streams using scalar token histories. Finite numerical crossing exports
+use occurrence captures as described below. Nested exports remain unavailable. Unsupported inputs raise; standalone insertion does not delegate.
 A new insertion request must not contain existing synchronization.
 
 Exactness is relative to the admitted access model. Scratch enclosures, native
@@ -97,7 +97,7 @@ empty history. Yield updates are simultaneous. A three-visit history yields
 resolver follows variable identities, not the ordering of carries, and rejects
 cycles or histories rooted in another invocation. Only the first history output selects the final source visit; nonempty older
 outputs are not accepted as final-source crossings. A crossing
-into another loop must use the exact `iv == start` guard. Zero-trip outputs
+into another loop must use an exact original-coordinate equality guard. Zero-trip outputs
 remain completed. Starts, positive steps, types and normalized counts come from
 the existing checked importer; no representative execution supplies a premise.
 
@@ -113,11 +113,38 @@ as a completion-to-start edge.
 
 The periodic core takes `O(k(m+u) log(m+u))` work for `m` sites, `u` token-use
 families and `k` pipes. It does not enumerate visits. Single-segment programs
-need no boundary graph. Multiple segments share the existing explicit first/
-final-port graph: construction is quadratic in child port counts, and each
+need no boundary graph. Multiple segments share the existing explicit boundary graph (first/final ports
+plus actual crossing endpoints): construction is quadratic in child port counts, and each
 cross-region query takes `O(P+E)` graph work plus child queries. These costs are
 separate from import, allocation and emission; compactness in trip count is not
 a claim of linear total compilation cost.
+
+### Numerical occurrence captures
+
+A crossing may refer to an interior occurrence. Insertion retains one scalar
+capture per distinct selected source occurrence. For source visit `v`, a
+completed-initialized loop carry chooses the current source record under
+`iv == start + v*step`, and otherwise preserves that same carry. Its final loop
+result is exactly the selected completion fact. This differs from a shift
+history: state is constant per capture, independent of the distance to loop exit.
+
+Lowering verifies both pure token-yield arms, the same-carry recurrence, the
+original invocation, record pipe and coordinate calculation. A capture may be
+used only through its loop result; using its intermediate state remains
+unavailable. A provably absent selected occurrence exports completed, not a
+fabricated access-absence answer. Missing mathematical crossing export is still
+unavailable. Multiple consumer uses share capture state but retain separate
+physical publications and consumptions.
+
+A point consumer uses `iv == start + w*step`. Each actual crossing endpoint is
+registered as a port before the boundary graph constructs child-internal links.
+Reference-forward paths across contiguous children decompose into these links
+and supplied crossings/native boundaries; no path leaves and reenters a child.
+Thus interior prefixes are preserved in token-order and physical-reuse queries.
+The existing quadratic port-link construction is charged on the enlarged port
+inventory. With B distinct captures, scalar state is `O(H+B)`; supplied exports
+may themselves enumerate slots or rows. This is not a universal compact-interface
+bound. The crossing adapter does not require or introduce new token operations.
 
 Scalar history state is `H = sum(maximum active lag per source)`. Insertion
 constructs `O(H)` carry/result/yield nodes and does not allocate history for a

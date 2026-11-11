@@ -40,6 +40,16 @@ bool EmptyBody(const StmtPtr& body) {
   const auto seq = As<SeqStmts>(body);
   return seq && seq->stmts_.empty();
 }
+ExprPtr TokenYield(StmtPtr body) {
+  while (auto sequence = As<SeqStmts>(body)) {
+    if (sequence->stmts_.size() != 1) return nullptr;
+    body = sequence->stmts_.front();
+  }
+  auto yield = As<YieldStmt>(body);
+  if (!yield || yield->value_.size() != 1 || !As<SyncTokenType>(yield->value_.front()->GetType()))
+    return nullptr;
+  return yield->value_.front();
+}
 PipeType Pipe(const CallPtr& call, const char* key) {
   for (const auto& [name, value] : call->kwargs_)
     if (name == key) return static_cast<PipeType>(AnyCast<int>(value, name));
@@ -63,6 +73,13 @@ class Erase : public IRMutator {
     return IsOp(As<Call>(op->expr_), "sync.wait") ? Empty(op->span_) : op;
   }
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    for (const auto& result : op->return_vars_) {
+      if (!As<SyncTokenType>(result->GetType())) continue;
+      CHECK(op->return_vars_.size() == 1 && op->else_body_ && TokenYield(op->then_body_) &&
+            TokenYield(*op->else_body_))
+          << "Token capture cannot contain payload or scalar effects";
+      return Empty(op->span_);  // Pure token selection; the parser must qualify its recurrence.
+    }
     auto body = VisitStmt(op->then_body_);
     auto other = op->else_body_ ? VisitStmt(*op->else_body_) : nullptr;
     if (EmptyBody(body) && (!other || EmptyBody(other))) return Empty(op->span_);
@@ -95,18 +112,25 @@ class Erase : public IRMutator {
  private:
   bool active_ = false;
 };
-enum class BindingKind { Completed, Current, Previous, Final };
+enum class BindingKind { Completed, Current, Previous, Final, Captured };
 struct Binding {
   BindingKind kind = BindingKind::Completed;
   Site site{};
   int64_t lag = 0;
+  int64_t visit = 0;
 };
-enum class Guard { Always, First, Later };
+enum class Guard { Always, Point, Later };
 struct Wait {
   ExprPtr token;
   PipeType destination;
   Guard guard;
   int64_t lag = 0;
+  int64_t visit = 0;
+};
+struct CaptureEquation {
+  Binding record;
+  const Var* previous;
+  int64_t visit;
 };
 struct Use {
   Wait wait;
@@ -166,11 +190,14 @@ class Parse {
         count = source.count - target_first;
       } else {
         CHECK(sr < tr && ((binding.kind == BindingKind::Final && binding.lag == 1) ||
+                          binding.kind == BindingKind::Captured ||
                           (binding.kind == BindingKind::Current && !source.original_loop)))
             << "Unavailable cross-invocation token frame";
-        CHECK(use.wait.guard == (target.original_loop ? Guard::First : Guard::Always))
-            << "Crossing token requires the first target visit";
-        first = source.count - 1;
+        CHECK(use.wait.guard == (target.original_loop ? Guard::Point : Guard::Always))
+            << "Crossing token requires an exact target visit";
+        first = binding.kind == BindingKind::Captured ? binding.visit : source.count - 1;
+        target_first = use.wait.visit;
+        if (target_first >= target.count) continue;
         count = 1;
       }
       if (count <= 0) continue;
@@ -187,6 +214,7 @@ class Parse {
   std::map<const Var*, Binding> bindings_;
   std::map<const Var*, ExprPtr> aliases_;
   std::map<const Var*, std::pair<size_t, ExprPtr>> shifts_;
+  std::map<const Var*, CaptureEquation> captures_;
   std::vector<Use> uses_;
   Binding Resolve(const ExprPtr& expression) {
     // Each equation has one successor. Resolve iteratively, then memoize the
@@ -203,6 +231,7 @@ class Parse {
         binding = bound->second;
         break;
       }
+      CHECK(!captures_.count(var.get())) << "Captured token may only be used through its final loop result";
       CHECK(seen.insert(var.get()).second) << "Cyclic token history does not establish a current record";
       const auto shift = shifts_.find(var.get());
       if (shift != shifts_.end()) {
@@ -239,15 +268,15 @@ class Parse {
     }
     return nullptr;
   }
-  void Waits(const StmtPtr& stmt, Guard guard, Cursor& cursor, int64_t lag = 0) {
+  void Waits(const StmtPtr& stmt, Guard guard, Cursor& cursor, int64_t lag = 0, int64_t visit = 0) {
     if (auto seq = As<SeqStmts>(stmt)) {
-      for (const auto& child : seq->stmts_) Waits(child, guard, cursor, lag);
+      for (const auto& child : seq->stmts_) Waits(child, guard, cursor, lag, visit);
       return;
     }
     auto eval = As<EvalStmt>(stmt);
     auto call = eval ? As<Call>(eval->expr_) : nullptr;
     CHECK(IsOp(call, "sync.wait")) << "Unsupported conditional token operation";
-    cursor.pending.push_back({call->args_.at(0), Pipe(call, "dst_pipe"), guard, lag});
+    cursor.pending.push_back({call->args_.at(0), Pipe(call, "dst_pipe"), guard, lag, visit});
     cursor.last.reset();
   }
   void Read(const StmtPtr& stmt, Cursor& cursor) {
@@ -275,23 +304,39 @@ class Parse {
       return;
     }
     if (auto branch = As<IfStmt>(stmt)) {
-      CHECK(cursor.loop && !branch->else_body_ && branch->return_vars_.empty())
-          << "Unsupported conditional token transport";
+      CHECK(cursor.loop) << "Conditional token transport requires its original loop";
       const auto& segment = input_.segments[*cursor.loop];
       auto binary = As<BinaryExpr>(branch->condition_);
       const auto start = binary ? As<ConstInt>(binary->right_) : nullptr;
       CHECK(binary && start && binary->left_ == segment.original_loop->loop_var_ &&
             (As<Eq>(branch->condition_) || As<Gt>(branch->condition_)))
           << "Unsupported token guard: original first/later coordinate proof is unavailable";
+      const __int128 offset = __int128(start->value_) - segment.start;
+      CHECK(segment.step > 0 && offset >= 0 && offset % segment.step == 0 &&
+            offset / segment.step < std::numeric_limits<int64_t>::max())
+          << "Unsupported token guard: normalized coordinate is unproved";
+      const int64_t visit = static_cast<int64_t>(offset / segment.step);
+      if (!branch->return_vars_.empty()) {
+        CHECK(cursor.pending.empty() && branch->return_vars_.size() == 1 && branch->else_body_ &&
+              As<Eq>(branch->condition_))
+            << "Unavailable token capture control";
+        const auto current = TokenYield(branch->then_body_);
+        const auto previous = TokenYield(*branch->else_body_);
+        CHECK(current && previous && AsVarLike(previous))
+            << "Capture must select a current record or its carry";
+        auto record = Resolve(current);
+        CHECK(record.kind == BindingKind::Current && record.site.first == *cursor.loop)
+            << "Capture needs this invocation's unconditional current record";
+        captures_.emplace(branch->return_vars_.front().get(),
+                          CaptureEquation{record, AsVarLike(previous).get(), visit});
+        cursor.last.reset();
+        return;
+      }
+      CHECK(!branch->else_body_) << "Unsupported conditional token transport";
       if (As<Eq>(branch->condition_)) {
-        CHECK(start->value_ == segment.start) << "Unsupported first-visit token guard";
-        Waits(branch->then_body_, Guard::First, cursor);
+        Waits(branch->then_body_, Guard::Point, cursor, 0, visit);
       } else {
-        const __int128 offset = __int128(start->value_) - segment.start;
-        CHECK(segment.step > 0 && offset >= 0 && offset % segment.step == 0 &&
-              offset / segment.step < std::numeric_limits<int64_t>::max())
-            << "Unsupported token guard: normalized lag is unproved";
-        Waits(branch->then_body_, Guard::Later, cursor, static_cast<int64_t>(offset / segment.step) + 1);
+        Waits(branch->then_body_, Guard::Later, cursor, visit + 1);
       }
       return;
     }
@@ -333,10 +378,25 @@ class Parse {
             (body.yield && body.yield->value_.size() == loop->iter_args_.size()))
           << "Unavailable unconditional token yield";
       if (count) {
-        for (size_t i = 0; i < loop->iter_args_.size(); ++i)
-          shifts_.emplace(loop->iter_args_[i].get(), std::make_pair(region, body.yield->value_[i]));
+        for (size_t i = 0; i < loop->iter_args_.size(); ++i) {
+          const auto yielded = AsVarLike(body.yield->value_[i]);
+          const auto captured = yielded ? captures_.find(yielded.get()) : captures_.end();
+          if (captured == captures_.end()) {
+            shifts_.emplace(loop->iter_args_[i].get(), std::make_pair(region, body.yield->value_[i]));
+          } else {
+            const auto& capture = captured->second;
+            CHECK(capture.previous == loop->iter_args_[i].get() && capture.record.site.first == region)
+                << "Capture must preserve its own original invocation carry";
+            auto binding = capture.record;
+            binding.kind = BindingKind::Captured;
+            binding.visit = capture.visit;
+            if (capture.visit >= count) binding = Binding{};
+            bindings_.emplace(loop->return_vars_[i].get(), binding);
+          }
+        }
       }
       for (size_t i = 0; i < loop->iter_args_.size(); ++i) {
+        if (bindings_.count(loop->return_vars_[i].get())) continue;
         auto binding = count ? Resolve(loop->iter_args_[i]) : Binding{};
         if (count && binding.lag <= count)
           binding.kind = BindingKind::Final;
@@ -376,7 +436,15 @@ class Order {
         segments_[f.source_region].generators.push_back(
             {f.source_site, f.target_site, f.target_first - f.source_first});
     for (auto& segment : segments_) BuildPeriodicCoreFrontiers(segment);
-    if (segments_.size() > 1) graph_ = std::make_unique<SyncBoundaryGraph>(segments_);
+    if (segments_.size() > 1) {
+      std::vector<Occurrence> ports;
+      for (const auto& family : families) {
+        if (family.source_region == family.target_region) continue;
+        ports.emplace_back(family.source_region, family.source_first, family.source_site);
+        ports.emplace_back(family.target_region, family.target_first, family.target_site);
+      }
+      graph_ = std::make_unique<SyncBoundaryGraph>(segments_, ports);
+    }
     for (const auto& f : families)
       if (f.source_region != f.target_region)
         graph_->Add({{f.source_region, f.source_first, f.source_site}, true},

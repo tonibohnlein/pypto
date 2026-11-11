@@ -30,16 +30,22 @@
 namespace pypto::ir::sync {
 namespace {
 using Site = std::pair<size_t, size_t>;  // Original segment and static site.
+struct Capture {
+  IterArgPtr previous;
+  VarPtr selected, exported;
+};
 struct Source {
   VarPtr current, initial;
   std::vector<VarPtr> exported;
   std::vector<IterArgPtr> previous;
   int64_t history = 0;
+  std::map<int64_t, Capture> captures;
 };
 struct Incoming {
   Site source;
   int64_t distance = 0;
   bool crossing = false;
+  int64_t source_visit = 0, target_visit = 0;
 };
 
 // Name reservation is context-independent. Reuse definition/use collection,
@@ -55,7 +61,9 @@ class NameCollector : public var_collectors::VarDefUseCollector {
 };
 
 // One indexed IR traversal, O((N+F+H) log(N+F+H)), including H history
-// carry/result/yield nodes. The owner has already proved
+// carry/result/yield nodes; F includes supplied crossing records. Capture state
+// adds O(B) nodes for B distinct demanded source occurrences (B <= F).
+// The owner has already proved
 // invariant sites and supplied displacement families; no trip count is unfolded.
 // Scalar RFC carries cost O(sum maximum live lag per source). This is not a
 // compact-in-binary-period token container; mathematical reduction stays compact.
@@ -83,26 +91,36 @@ class Realizer : public SyncPlacement {
     for (const auto& [a, b] : *crossings) {
       auto [ar, av, as] = a;
       auto [br, bv, bs] = b;
-      CHECK(ar < br && av == analysis.input.segments[ar].count - 1 && bv == 0)
-          << "Crossing token export requires final-source/first-target coordinates";
+      CHECK(ar < br && br < analysis.input.segments.size() && av >= 0 && bv >= 0 &&
+            av < analysis.input.segments[ar].count && bv < analysis.input.segments[br].count)
+          << "Crossing token export requires qualified original occurrence coordinates";
       Site source{ar, as};
       auto& retained = sources_[source];
-      if (analysis.input.segments[ar].original_loop)
-        retained.history = std::max<int64_t>(retained.history, 1);
-      incoming_[{br, bs}].push_back({source, 0, true});
+      if (analysis.input.segments[ar].original_loop) {
+        if (av == analysis.input.segments[ar].count - 1)
+          retained.history = std::max<int64_t>(retained.history, 1);
+        else
+          retained.captures.try_emplace(av);
+      }
+      incoming_[{br, bs}].push_back({source, 0, true, av, bv});
     }
     for (auto& [site, source] : sources_) {
       const auto pipe = Payload(site).pipe;
       const auto type = std::make_shared<SyncTokenType>(pipe);
       source.current = Variable(type);
-      if (source.history) {
+      if (source.history || !source.captures.empty()) {
         source.initial = Variable(type);
         for (int64_t lag = 0; lag < source.history; ++lag) {
           source.previous.push_back(std::make_shared<IterArg>(Name(), type, source.initial, Span::unknown()));
           source.exported.push_back(Variable(type));
         }
+        for (auto& [visit, capture] : source.captures) {
+          capture.previous = std::make_shared<IterArg>(Name(), type, source.initial, Span::unknown());
+          capture.selected = Variable(type);
+          capture.exported = Variable(type);
+        }
         carried_[site.first].push_back(site);
-        result.carried_tokens += source.previous.size();
+        result.carried_tokens += source.previous.size() + source.captures.size();
       }
     }
   }
@@ -121,6 +139,10 @@ class Realizer : public SyncPlacement {
           source.initial, Token("sync.completed", Payload(site).pipe, op->span_), op->span_));
       arguments.insert(arguments.end(), source.previous.begin(), source.previous.end());
       outputs.insert(outputs.end(), source.exported.begin(), source.exported.end());
+      for (const auto& [visit, capture] : source.captures) {
+        arguments.push_back(capture.previous);
+        outputs.push_back(capture.exported);
+      }
     }
     active_loop_ = region;
     auto body = VisitStmt(op->body_);
@@ -144,10 +166,11 @@ class Realizer : public SyncPlacement {
     std::vector<ExprPtr> values;
     for (auto site : carried_[*active_loop_]) {
       const auto& source = sources_.at(site);
-      values.push_back(source.current);
+      if (source.history) values.push_back(source.current);
       // Yield is simultaneous: older entries see the previous visit, never
       // the current record shifted sequentially through all positions.
       for (size_t lag = 1; lag < source.previous.size(); ++lag) values.push_back(source.previous[lag - 1]);
+      for (const auto& [visit, capture] : source.captures) values.push_back(capture.selected);
     }
     return std::make_shared<YieldStmt>(values, op->span_, op->leading_comments_);
   }
@@ -178,14 +201,21 @@ class Realizer : public SyncPlacement {
       const auto& source = sources_.at(incoming.source);
       ExprPtr token = source.current;
       if (incoming.distance) token = source.previous.at(incoming.distance - 1);
-      if (incoming.crossing && source.history) token = source.exported.front();
+      if (incoming.crossing) {
+        auto capture = source.captures.find(incoming.source_visit);
+        if (capture != source.captures.end())
+          token = capture->second.exported;
+        else if (source.history)
+          token = source.exported.front();
+      }
       auto wait = OpRegistry::GetInstance().Create(
           "sync.wait", {token}, {{"dst_pipe", static_cast<int>(Payload(site).pipe)}}, payload->span_);
       StmtPtr statement = std::make_shared<EvalStmt>(wait, payload->span_);
       ++result.wait_sites;
       if (segment.original_loop && (incoming.distance || incoming.crossing)) {
-        const __int128 cut = __int128(segment.start) +
-                             (incoming.distance ? __int128(incoming.distance - 1) * segment.step : 0);
+        const __int128 cut =
+            __int128(segment.start) +
+            __int128(incoming.distance ? incoming.distance - 1 : incoming.target_visit) * segment.step;
         CHECK(cut >= 0 && cut <= std::numeric_limits<int64_t>::max())
             << "Logical history activation coordinate overflows";
         auto start = std::make_shared<ConstInt>(static_cast<int64_t>(cut), DataType::INDEX, payload->span_);
@@ -208,6 +238,20 @@ class Realizer : public SyncPlacement {
       statements.push_back(std::make_shared<AssignStmt>(
           source->second.current, Token("sync.record", Payload(site).pipe, payload->span_), payload->span_));
       ++result.record_sites;
+      for (const auto& [visit, capture] : source->second.captures) {
+        const __int128 coordinate = __int128(segment.start) + __int128(visit) * segment.step;
+        CHECK(segment.original_loop && coordinate >= 0 && coordinate <= std::numeric_limits<int64_t>::max())
+            << "Crossing capture coordinate overflows";
+        auto condition = std::make_shared<Eq>(
+            segment.original_loop->loop_var_,
+            std::make_shared<ConstInt>(static_cast<int64_t>(coordinate), DataType::INDEX, payload->span_),
+            DataType::BOOL, payload->span_);
+        auto selected =
+            std::make_shared<YieldStmt>(std::vector<ExprPtr>{source->second.current}, payload->span_);
+        auto retained = std::make_shared<YieldStmt>(std::vector<ExprPtr>{capture.previous}, payload->span_);
+        statements.push_back(std::make_shared<IfStmt>(condition, selected, retained,
+                                                      std::vector<VarPtr>{capture.selected}, payload->span_));
+      }
     }
     return std::make_shared<SeqStmts>(statements, payload->span_);
   }
@@ -215,9 +259,6 @@ class Realizer : public SyncPlacement {
 }  // namespace
 LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis) {
   CHECK(!analysis.input.region_tree) << "Nested/phase logical token transport is unavailable";
-  for (const auto& segment : analysis.segments)
-    CHECK(!segment.rotating || analysis.segments.size() == 1)
-        << "Rotating crossing token selectors are unavailable";
   for (const auto& segment : analysis.input.segments)
     CHECK(segment.nested_frames.empty()) << "Nested repetition requires token transport across every "
                                             "enclosing frame; physical export is available";

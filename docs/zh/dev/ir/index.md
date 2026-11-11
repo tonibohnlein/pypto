@@ -38,3 +38,5 @@ See [RFC token pipeline checkpoint](18-token-pipeline-checkpoint.md) for finite 
 - [Canonical loop-token checkpoint](19-structured-token-checkpoint.md)
 
 - [Rotating token-history checkpoint](20-rotating-token-checkpoint.md)
+
+- [Numerical crossing-token checkpoint](21-crossing-token-checkpoint.md)
