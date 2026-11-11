@@ -1,0 +1,100 @@
+{
+  "scope": "M3 preparatory shared supplied-order service; nested transport not enabled",
+  "baseline": "f0ad5a36a4c372182dd35e9ec81e6a8d5d9bfa2e",
+  "native_oracle": {
+    "cases": 2000,
+    "event_query_comparisons": 1396352,
+    "status": "passed"
+  },
+  "broad_gate": {
+    "passed": 1119,
+    "warnings": 28,
+    "seconds": 399.76,
+    "command": [
+      "/usr/bin/python3",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/ut/ir/transforms/test_crossing_token_sync.py",
+      "tests/ut/ir/transforms/test_regional_slot_composition.py",
+      "tests/ut/ir/transforms/test_streamed_slot_composition.py",
+      "tests/ut/ir/transforms/test_rotating_token_sync.py",
+      "tests/ut/ir/transforms/test_autosync_switch.py",
+      "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+      "tests/ut/ir/transforms/test_collective_sync_interface.py",
+      "tests/ut/ir/transforms/test_collective_sync_realization.py",
+      "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+      "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+      "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+      "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+      "tests/ut/ir/transforms/test_logical_sync_realization.py",
+      "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+      "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+      "tests/ut/ir/transforms/test_parameterized_sync.py",
+      "tests/ut/ir/transforms/test_physical_sync_realization.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+      "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+      "tests/ut/ir/transforms/test_row_sync_analysis.py",
+      "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+      "tests/ut/ir/transforms/test_slot_sync_import.py",
+      "tests/ut/ir/transforms/test_sync_range_proofs.py",
+      "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+      "tests/ut/ir/transforms/test_verify_hard_syncall_occupancy.py",
+      "tests/ut/ir/transforms/test_token_sync_lowering.py",
+      "tests/ut/ir/transforms/test_structured_token_sync.py",
+      "--basetemp=build-py314/pytest-token-m3a-gate",
+      "--junitxml=build-py314/token-m3a-gate.xml",
+      "--tb=short"
+    ],
+    "source_snapshot": "source_before_format",
+    "log_sha256": "1972d3c1c7660e4997e959a8b9863bd101c0f4af57a541ab220aac609e227770"
+  },
+  "review": {
+    "architecture": "accepted",
+    "correctness": "accepted",
+    "algorithm": "accepted"
+  },
+  "device": "not run",
+  "source_before_format": {
+    "baseline": "f0ad5a36a4c372182dd35e9ec81e6a8d5d9bfa2e",
+    "sources": {
+      "CMakeLists.txt": "a7508e319d69927ae3edf9610357dba58db19c3a61de4b2041d2db3a9a490303",
+      "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "26b4657e1802a1afec7805fc10c82479810bc9256d5a7c69292efcf3589e4aff",
+      "src/ir/transforms/utils/numerical_sync_merge.cpp": "d722c7b65700094614bb436a6e00522841edfdd6d79c034dc77bf9c2ca0ba942",
+      "src/ir/transforms/utils/numerical_sync_merge.h": "0b79011031259cbbfd9fc1acc9477ce6d2d9dce906934c6faa6d9d87028d6463",
+      "src/ir/transforms/utils/numerical_sync_order.cpp": "4504fc353c47baecbdb28ca980ffff1d398070bdf985d5dbb1bc7a5066f0a351",
+      "tests/ut/cpp/CMakeLists.txt": "13b55f91565b0ec383b54f8bf0c0a15234140eac9c4ec78b53db4c5434da007b",
+      "tests/ut/cpp/numerical_sync_order_test.cpp": "515ef3e457e540730ada10d968be491d02f9050014f8d6a914e82dcf16649786"
+    }
+  },
+  "post_format_gate": {
+    "passed": 96,
+    "warnings": 2,
+    "seconds": 187.44,
+    "files": [
+      "tests/ut/ir/transforms/test_collective_sync_realization.py",
+      "tests/ut/ir/transforms/test_crossing_token_sync.py",
+      "tests/ut/ir/transforms/test_scoped_physical_sync.py"
+    ],
+    "log_sha256": "949b5316cd2fbd314deddccdb70192c0bdcea6d4e5b8f489493be413fea3c330"
+  },
+  "final_source_sha256": {
+    "CMakeLists.txt": "a7508e319d69927ae3edf9610357dba58db19c3a61de4b2041d2db3a9a490303",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "e0340b00a0418741c36d8a7fafff2f569987ea3e16ccb25ee5b7b7f2491fd43b",
+    "src/ir/transforms/utils/numerical_sync_merge.cpp": "83f0fb0e2629575af18682bfcae24d240df50e023d0ec9ae1caed517f1260ad1",
+    "src/ir/transforms/utils/numerical_sync_merge.h": "b39d918660b7e601429a7b370c1802c30fb3733aea384dc62fbfa9c8821d9c55",
+    "src/ir/transforms/utils/numerical_sync_order.cpp": "a7c08ca1ebd9c75746e6b88cb6f980bd1070bb65760cd9c9fa152fb5feb0fe39",
+    "tests/ut/cpp/CMakeLists.txt": "13b55f91565b0ec383b54f8bf0c0a15234140eac9c4ec78b53db4c5434da007b",
+    "tests/ut/cpp/numerical_sync_order_test.cpp": "6b052d627da94ab112089fdbd2e1d4c9e22d57d2086e73d66b475fde247d8b4b"
+  },
+  "extension_sha256": "db37dad503602833508839062e3dba4ba0caa68b22a66e54c8617a721c2de586",
+  "native_test_sha256": "bca78ada37a87677c77ebf9004e019c1b18d94c399eec05bd8bb1ee951877b4a",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "build": "cmake --build build-py314 --parallel 1",
+  "hooks": {
+    "status": "passed",
+    "configuration": "repository hooks; pyright environment Python 3.11 compatibility override only; no Python files in this package",
+    "log_sha256": "0d2c9201eacc9f908d5b5939bfd171595a28fd28ec521122b011ae2faa152198"
+  }
+}

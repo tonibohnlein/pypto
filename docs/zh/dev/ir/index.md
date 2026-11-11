@@ -40,3 +40,5 @@ See [RFC token pipeline checkpoint](18-token-pipeline-checkpoint.md) for finite 
 - [Rotating token-history checkpoint](20-rotating-token-checkpoint.md)
 
 - [Numerical crossing-token checkpoint](21-crossing-token-checkpoint.md)
+
+- [Supplied numerical-order service checkpoint](22-token-order-service-checkpoint.md)

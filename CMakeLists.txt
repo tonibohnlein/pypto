@@ -114,6 +114,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/rotating_sync_analysis.cpp
     src/ir/transforms/utils/numerical_sync_hierarchy.cpp
     src/ir/transforms/utils/numerical_sync_merge.cpp
+    src/ir/transforms/utils/numerical_sync_order.cpp
     src/ir/transforms/utils/placed_sync_import.cpp
     src/ir/transforms/utils/invocation_sync_analysis.cpp
     src/ir/transforms/token_sync.cpp

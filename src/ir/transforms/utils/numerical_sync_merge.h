@@ -12,6 +12,7 @@
 #ifndef SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_MERGE_H_
 #define SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_MERGE_H_
 #include <array>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -103,6 +104,27 @@ std::set<NumericalEvent> NumericalPorts(const NumericalNode& node, size_t& visit
 void IndexNumericalPositions(NumericalNode& node);
 void InvertNumericalRows(NumericalNode& node);
 void CountNumericalInterface(const NumericalNode& node, CompactSyncResult& result);
+// Order-only service: supplied child order, complete parent ports and explicit
+// crossing edges. It performs no access recovery, storage bridging or reduction.
+// Children have sorted original-event chains and exact monotone forward/reverse
+// rows. Supplied edges include native chain links across the boundary; parent
+// ports retain every event needed by later joins. The parent must be fresh with
+// left/right/length initialized. The indexed row kernel costs O(k P + k^2 E);
+// map/set indexing adds O(P log P), separately from interface construction.
+// P counts all inspected child and parent ports, including discarded ports.
+void BuildNumericalMergeOrder(const std::shared_ptr<NumericalNode>& node,
+                              const std::set<NumericalEvent>& ports,
+                              std::vector<NumericalCrossing> crossings);
+// Leaf answers are reflexive event reachability and monotone on each supplied
+// native start/completion chain. They must describe the same order as the leaf
+// rows. The callback and work counter are borrowed for this synchronous query.
+struct NumericalOrderQuery {
+  std::function<bool(size_t, NumericalOrdinal, bool, NumericalOrdinal, bool)> leaf;
+  size_t& steps;
+};
+bool QueryNumericalOrder(const NumericalOrderQuery& query, const std::shared_ptr<const NumericalNode>& root,
+                         NumericalOrdinal source, bool source_completion, NumericalOrdinal target,
+                         bool target_completion);
 std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const NumericalNode> a,
                                                          std::shared_ptr<const NumericalNode> b,
                                                          CompactSyncResult& result);
