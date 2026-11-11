@@ -114,7 +114,9 @@ def test_previous_record_yield_is_not_assumed_to_be_current():
 
     invalid = PreviousYield().visit_function(logical)
     before = str(invalid)
-    with pytest.raises(ValueError, match="structured token binding|unconditional current record"):
+    with pytest.raises(
+        ValueError, match="structured token binding|unconditional current record|Cyclic token history"
+    ):
         _apply(passes.lower_sync, invalid)
     assert str(invalid) == before
 

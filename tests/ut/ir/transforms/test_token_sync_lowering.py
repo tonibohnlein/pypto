@@ -73,7 +73,7 @@ def _project(vertices, edges, payload_vertices):
     return order, {(a, b) for a, b in order if a in payloads and b in payloads}
 
 
-def _check_actual_tokens(original, logical, physical):
+def _check_actual_tokens(original, logical, physical, *, check_codegen=True):
     """Check all token-induced order, matching and reuse without compiler families."""
     _, calls = interpret(original)
     reference = hardware_reference(original, calls)
@@ -98,8 +98,9 @@ def _check_actual_tokens(original, logical, physical):
     }
     assert len(token_state.actual_allocations) == len(flag_state.actual_allocations)
     program = verify(physical)
-    text = codegen.PTOCodegen().generate(program)
-    assert "sync.record" not in text and "!pto.sync_token" not in text
+    if check_codegen:
+        text = codegen.PTOCodegen().generate(program)
+        assert "sync.record" not in text and "!pto.sync_token" not in text
     return actual, reference[2], flag_state
 
 

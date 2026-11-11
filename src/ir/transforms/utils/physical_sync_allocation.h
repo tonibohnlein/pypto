@@ -43,6 +43,10 @@ PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input,
                                           const DirectSyncOrder& order, const std::string& target,
                                           const std::optional<std::vector<int>>& restricted);
 
+// Publish only an established complete physical owner (literal SET and WAIT),
+// or an explicit delegation outcome. This does not qualify or allocate a plan.
+FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::string& reason);
+
 // Shared native-owner and target eligibility policy. Neither helper computes
 // demands or assumes that a logical token owns a consuming hardware event.
 SyncNativeReservations SyncNativeClaims(const CompactSyncInput& input, const std::string& target);

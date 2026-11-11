@@ -37,3 +37,5 @@ the page covering what you are changing.
 See [RFC token pipeline checkpoint](18-token-pipeline-checkpoint.md) for finite logical-to-physical migration evidence.
 
 - [Canonical loop-token checkpoint](19-structured-token-checkpoint.md)
+
+- [Rotating token-history checkpoint](20-rotating-token-checkpoint.md)

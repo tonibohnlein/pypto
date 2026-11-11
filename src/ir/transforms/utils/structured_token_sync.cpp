@@ -12,9 +12,11 @@
 // Canonical direct-cut token transport. This parser proves the relation
 // between actual SSA token uses and original payload occurrences; it does not
 // regenerate storage demands. Numerical frontiers and allocation are shared.
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -97,12 +99,14 @@ enum class BindingKind { Completed, Current, Previous, Final };
 struct Binding {
   BindingKind kind = BindingKind::Completed;
   Site site{};
+  int64_t lag = 0;
 };
 enum class Guard { Always, First, Later };
 struct Wait {
   ExprPtr token;
   PipeType destination;
   Guard guard;
+  int64_t lag = 0;
 };
 struct Use {
   Wait wait;
@@ -154,13 +158,14 @@ class Parse {
         CHECK(binding.kind == BindingKind::Current || binding.kind == BindingKind::Previous)
             << "Token result re-enters its own invocation";
         const bool previous = binding.kind == BindingKind::Previous;
-        CHECK(use.wait.guard == (previous ? Guard::Later : Guard::Always))
+        CHECK(use.wait.guard == (previous ? Guard::Later : Guard::Always) &&
+              (!previous || use.wait.lag == binding.lag))
             << "Unsupported token activation: expected exact current/previous visit guard";
         CHECK(previous || ss < ts) << "Logical token does not precede its direct consumer";
-        target_first = previous ? 1 : 0;
+        target_first = previous ? binding.lag : 0;
         count = source.count - target_first;
       } else {
-        CHECK(sr < tr && (binding.kind == BindingKind::Final ||
+        CHECK(sr < tr && ((binding.kind == BindingKind::Final && binding.lag == 1) ||
                           (binding.kind == BindingKind::Current && !source.original_loop)))
             << "Unavailable cross-invocation token frame";
         CHECK(use.wait.guard == (target.original_loop ? Guard::First : Guard::Always))
@@ -168,7 +173,7 @@ class Parse {
         first = source.count - 1;
         count = 1;
       }
-      if (!count) continue;
+      if (count <= 0) continue;
       families.push_back({sr, ss, tr, ts, first, target_first, count, {}});
     }
     return families;
@@ -181,16 +186,45 @@ class Parse {
   std::map<const ForStmt*, size_t> loops_;
   std::map<const Var*, Binding> bindings_;
   std::map<const Var*, ExprPtr> aliases_;
+  std::map<const Var*, std::pair<size_t, ExprPtr>> shifts_;
   std::vector<Use> uses_;
   Binding Resolve(const ExprPtr& expression) {
-    const auto var = AsVarLike(expression);
-    CHECK(var) << "Structured token transport requires named completion facts";
-    const auto bound = bindings_.find(var.get());
-    if (bound != bindings_.end()) return bound->second;
-    const auto alias = aliases_.find(var.get());
-    CHECK(alias != aliases_.end()) << "Unavailable structured token binding";
-    auto binding = Resolve(alias->second);
-    bindings_.emplace(var.get(), binding);
+    // Each equation has one successor. Resolve iteratively, then memoize the
+    // path in reverse; explicit large histories do not consume the C++ stack.
+    std::vector<std::pair<const Var*, std::optional<size_t>>> path;
+    std::set<const Var*> seen;
+    ExprPtr next = expression;
+    Binding binding;
+    while (true) {
+      const auto var = AsVarLike(next);
+      CHECK(var) << "Structured token transport requires named completion facts";
+      const auto bound = bindings_.find(var.get());
+      if (bound != bindings_.end()) {
+        binding = bound->second;
+        break;
+      }
+      CHECK(seen.insert(var.get()).second) << "Cyclic token history does not establish a current record";
+      const auto shift = shifts_.find(var.get());
+      if (shift != shifts_.end()) {
+        path.emplace_back(var.get(), shift->second.first);
+        next = shift->second.second;
+      } else {
+        const auto alias = aliases_.find(var.get());
+        CHECK(alias != aliases_.end()) << "Unavailable structured token binding";
+        path.emplace_back(var.get(), std::nullopt);
+        next = alias->second;
+      }
+    }
+    for (auto step = path.rbegin(); step != path.rend(); ++step) {
+      if (step->second) {
+        CHECK((binding.kind == BindingKind::Current || binding.kind == BindingKind::Previous) &&
+              binding.site.first == *step->second && binding.lag < std::numeric_limits<int64_t>::max())
+            << "Token history must end at this invocation's unconditional current record";
+        ++binding.lag;
+        binding.kind = BindingKind::Previous;
+      }
+      bindings_.emplace(step->first, binding);
+    }
     return binding;
   }
   CallPtr Payload(const StmtPtr& stmt) const {
@@ -205,15 +239,15 @@ class Parse {
     }
     return nullptr;
   }
-  void Waits(const StmtPtr& stmt, Guard guard, Cursor& cursor) {
+  void Waits(const StmtPtr& stmt, Guard guard, Cursor& cursor, int64_t lag = 0) {
     if (auto seq = As<SeqStmts>(stmt)) {
-      for (const auto& child : seq->stmts_) Waits(child, guard, cursor);
+      for (const auto& child : seq->stmts_) Waits(child, guard, cursor, lag);
       return;
     }
     auto eval = As<EvalStmt>(stmt);
     auto call = eval ? As<Call>(eval->expr_) : nullptr;
     CHECK(IsOp(call, "sync.wait")) << "Unsupported conditional token operation";
-    cursor.pending.push_back({call->args_.at(0), Pipe(call, "dst_pipe"), guard});
+    cursor.pending.push_back({call->args_.at(0), Pipe(call, "dst_pipe"), guard, lag});
     cursor.last.reset();
   }
   void Read(const StmtPtr& stmt, Cursor& cursor) {
@@ -246,11 +280,19 @@ class Parse {
       const auto& segment = input_.segments[*cursor.loop];
       auto binary = As<BinaryExpr>(branch->condition_);
       const auto start = binary ? As<ConstInt>(binary->right_) : nullptr;
-      CHECK(binary && start && start->value_ == segment.start &&
-            binary->left_ == segment.original_loop->loop_var_ &&
+      CHECK(binary && start && binary->left_ == segment.original_loop->loop_var_ &&
             (As<Eq>(branch->condition_) || As<Gt>(branch->condition_)))
           << "Unsupported token guard: original first/later coordinate proof is unavailable";
-      Waits(branch->then_body_, As<Eq>(branch->condition_) ? Guard::First : Guard::Later, cursor);
+      if (As<Eq>(branch->condition_)) {
+        CHECK(start->value_ == segment.start) << "Unsupported first-visit token guard";
+        Waits(branch->then_body_, Guard::First, cursor);
+      } else {
+        const __int128 offset = __int128(start->value_) - segment.start;
+        CHECK(segment.step > 0 && offset >= 0 && offset % segment.step == 0 &&
+              offset / segment.step < std::numeric_limits<int64_t>::max())
+            << "Unsupported token guard: normalized lag is unproved";
+        Waits(branch->then_body_, Guard::Later, cursor, static_cast<int64_t>(offset / segment.step) + 1);
+      }
       return;
     }
     if (auto assign = As<AssignStmt>(stmt)) {
@@ -290,13 +332,16 @@ class Parse {
       CHECK(!count || (loop->iter_args_.empty() && (!body.yield || body.yield->value_.empty())) ||
             (body.yield && body.yield->value_.size() == loop->iter_args_.size()))
           << "Unavailable unconditional token yield";
+      if (count) {
+        for (size_t i = 0; i < loop->iter_args_.size(); ++i)
+          shifts_.emplace(loop->iter_args_[i].get(), std::make_pair(region, body.yield->value_[i]));
+      }
       for (size_t i = 0; i < loop->iter_args_.size(); ++i) {
-        auto binding = count ? Resolve(body.yield->value_[i]) : Binding{};
-        CHECK(!count || (binding.kind == BindingKind::Current && binding.site.first == region))
-            << "Token carry must yield this invocation's unconditional current record";
-        if (count) binding.kind = BindingKind::Previous;
-        bindings_.emplace(loop->iter_args_[i].get(), binding);
-        if (count) binding.kind = BindingKind::Final;
+        auto binding = count ? Resolve(loop->iter_args_[i]) : Binding{};
+        if (count && binding.lag <= count)
+          binding.kind = BindingKind::Final;
+        else
+          binding = Binding{};
         bindings_.emplace(loop->return_vars_[i].get(), binding);
       }
       return;

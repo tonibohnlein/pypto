@@ -20,9 +20,9 @@ with passes.PassContext([], autosync_disjoint_gm=True):
 Insertion uses the existing placed-access importer, retained minimum-demand
 analysis and original-coordinate logical exporter. It creates non-consuming
 completion tokens, with records after producers and waits before consumers.
-Its current exporter supports the previously qualified zero/one-distance
-repeated bodies. Rotating and nested exports remain unavailable during the
-migration. Unsupported inputs raise; standalone insertion does not delegate.
+Its exporter supports qualified repeated bodies and single-region rotating
+slot streams using scalar token histories. Rotating crossings and nested exports
+remain unavailable during the migration. Unsupported inputs raise; standalone insertion does not delegate.
 A new insertion request must not contain existing synchronization.
 
 Exactness is relative to the admitted access model. Scratch enclosures, native
@@ -39,7 +39,7 @@ feasibility.
 ## LowerSync
 
 Lowering supports straight-line finite token programs and the canonical
-zero/one-distance loop form described below, over admitted placed Buffer payloads. The operation/footprint importer is reused for
+constant-lag loop form described below, over admitted placed Buffer payloads. The operation/footprint importer is reused for
 pipe and native-resource qualification; its admission restrictions and access-
 recovery costs still apply. Standalone lowering does not yet transport caller
 parameter or block-bound evidence. It interprets actual `sync.record`, `sync.completed`,
@@ -90,9 +90,13 @@ The structured adapter accepts records immediately after an original payload
 (or the whole qualified initialization/accumulation branch), and waits in the
 contiguous block before their destination payload. It retains every actual use,
 including repeated waits. It accepts completed-initialized loop carries that
-unconditionally yield that invocation's current record. Such a carried fact
-selects the previous visit; the exact original `iv > start` guard excludes the
-empty entry fact. A final loop result selects the final source visit. A crossing
+unconditionally shift facts from that invocation's current record. For lag `d`,
+the exact original `iv > start + (d - 1) * step` guard excludes the initially
+empty history. Yield updates are simultaneous. A three-visit history yields
+`[current, previous_1, previous_2]`, starting from three completed facts. The
+resolver follows variable identities, not the ordering of carries, and rejects
+cycles or histories rooted in another invocation. Only the first history output selects the final source visit; nonempty older
+outputs are not accepted as final-source crossings. A crossing
 into another loop must use the exact `iv == start` guard. Zero-trip outputs
 remain completed. Starts, positive steps, types and normalized counts come from
 the existing checked importer; no representative execution supplies a premise.
@@ -115,8 +119,21 @@ cross-region query takes `O(P+E)` graph work plus child queries. These costs are
 separate from import, allocation and emission; compactness in trip count is not
 a claim of linear total compilation cost.
 
+Scalar history state is `H = sum(maximum active lag per source)`. Insertion
+constructs `O(H)` carry/result/yield nodes and does not allocate history for a
+family with no admitted uses. Indexed traversal costs
+`O((N+F+H) log(N+F+H))`; interpretation is iterative and memoized. This retains
+fixed-lag compactness as trip counts grow, not compactness in a binary-encoded
+period. Mathematical demand/frontier storage keeps its existing representation.
+
+After complete lowering with literal SET and WAIT sites, the pass publishes
+the existing physical-ownership attribute used by Buffer codegen. This marks
+ownership of the supplied logical protocol, not independent storage coverage
+for handwritten tokens. Empty plans do not receive a fabricated marker. Existing
+delegated slot restrictions and native multi-buffer size limits still apply.
+
 Nested token frames, arbitrary structured joins, non-completed carry entry,
-old-history yields, noncanonical guards and unavailable caller range evidence
+cyclic histories, live older-result crossings, noncanonical guards and unavailable caller range evidence
 remain explicit refusals. Existing production coverage is unchanged.
 
 ## Migration and guarantees

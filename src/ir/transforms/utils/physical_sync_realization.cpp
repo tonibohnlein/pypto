@@ -762,10 +762,6 @@ PhysicalSyncInvocation RealizePhysicalInvocation(const SyncInvocationAnalysis& a
   return result;
 }
 
-}  // namespace pypto::ir::sync
-
-namespace pypto::ir::pass {
-namespace {
 FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::string& reason) {
   auto attrs = function->attrs_;
   attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
@@ -781,7 +777,9 @@ FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::stri
                                     function->func_type_, function->level_, function->role_, attrs,
                                     function->requires_runtime_binding_, function->ir_stage_);
 }
-}  // namespace
+}  // namespace pypto::ir::sync
+
+namespace pypto::ir::pass {
 Pass RealizeSync() {
   auto transform = [](const FunctionPtr& function, const sync::SyncParameterBounds& bounds,
                       const std::optional<std::pair<int64_t, int64_t>>& block_bounds) -> FunctionPtr {
@@ -796,14 +794,15 @@ Pass RealizeSync() {
     CHECK(!function->GetAttr<bool>(kAttrPyptoAutosync))
         << "RealizeSync cannot reprocess an owned physical plan";
     if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV)
-      return SyncOutcome(function, false, "PyPTO synchronization supports only AIC/AIV leaves");
+      return sync::SyncOutcome(function, false, "PyPTO synchronization supports only AIC/AIV leaves");
     if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS)
-      return SyncOutcome(function, false, "PyPTO synchronization requires physically placed Buffer IR");
+      return sync::SyncOutcome(function, false, "PyPTO synchronization requires physically placed Buffer IR");
     if (!ctx->GetAutoSyncDisjointGM())
-      return SyncOutcome(function, false, "Disjoint GM argument contract was not supplied");
+      return sync::SyncOutcome(function, false, "Disjoint GM argument contract was not supplied");
     auto target = ctx->GetBackendHandler()->GetPtoTargetArch();
     if (target != "a2a3")
-      return SyncOutcome(function, false, "PyPTO physical synchronization supports only manual a2a3 macros");
+      return sync::SyncOutcome(function, false,
+                               "PyPTO physical synchronization supports only manual a2a3 macros");
     // Only publish after complete analysis AND realization. A qualification or
     // resource refusal returns the original body, never partially emitted IR.
     // Internal errors are deliberately not caught. The strict retained-result
@@ -831,10 +830,11 @@ Pass RealizeSync() {
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.
       if (!set_sites || !wait_sites)
-        return SyncOutcome(function, false, "Candidate has no SET/WAIT marker; delegate the original kernel");
-      return SyncOutcome(emitted, true, "");
+        return sync::SyncOutcome(function, false,
+                                 "Candidate has no SET/WAIT marker; delegate the original kernel");
+      return sync::SyncOutcome(emitted, true, "");
     } catch (const pypto::ValueError& error) {
-      return SyncOutcome(function, false, error.what());
+      return sync::SyncOutcome(function, false, error.what());
     }
   };
   // Range evidence belongs to this closed program's call sites, not mutable

@@ -23,6 +23,7 @@ from pypto import backend, codegen, ir, passes, testing
 from pypto.backend import BackendType
 
 from .sync_matmul_cases import capture, staged_fixture
+from .test_streamed_slot_composition import streamed_fixture
 from .test_token_sync_lowering import _check_actual_tokens
 from .test_vec_sync_analysis import vec_fixture
 
@@ -31,10 +32,10 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def measure(function, tokens):
+def measure(function, tokens, *, production=False):
     program = ir.Program([function], "TokenQualification", function.span)
     result = {}
-    with passes.PassContext([], autosync_disjoint_gm=True):
+    with passes.PassContext([], autosync_disjoint_gm=True, enable_pypto_autosync=production):
         begin = time.perf_counter()
         if tokens:
             logical = passes.insert_sync()(program)
@@ -49,6 +50,12 @@ def measure(function, tokens):
                 lower_seconds=end - checked,
             )
             logical_function = next(iter(logical.functions.values()))
+            emitted = next(iter(physical.functions.values()))
+        elif production:
+            physical = passes.realize_sync()(program)
+            end = time.perf_counter()
+            result["production_seconds"] = end - begin
+            logical_function = None
             emitted = next(iter(physical.functions.values()))
         else:
             retained = testing.analyze_placed_sync(function, True)
@@ -65,7 +72,9 @@ def measure(function, tokens):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--structured", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--structured", action="store_true")
+    modes.add_argument("--rotating", action="store_true")
     args = parser.parse_args()
     backend.set_backend_type(BackendType.Ascend910)
     root = Path(__file__).resolve().parents[4]
@@ -105,14 +114,20 @@ def main():
     )
     if args.structured:
         receipt["scope"] = "canonical structured standalone token stages; production remains unchanged"
+    if args.rotating:
+        names = ["rotating_k4", "rotating_k7", "rotating_k1024", "rotating_k1000000"]
+        receipt["scope"] = "single-region rotating token stages vs unchanged production; fixed lag three"
     for name in names:
-        count = int(name.removeprefix("structured_k")) if name.startswith("structured_k") else None
-        function = (
-            staged_fixture(count, visits=2)
-            if count is not None
-            else (vec_fixture() if name == "finite_vec" else capture(name))
-        )
-        bounded = count is None or count <= 5
+        count = None
+        if args.rotating:
+            count = int(name.removeprefix("rotating_k"))
+            function = streamed_fixture(count)
+        elif name.startswith("structured_k"):
+            count = int(name.removeprefix("structured_k"))
+            function = staged_fixture(count, visits=2)
+        else:
+            function = vec_fixture() if name == "finite_vec" else capture(name)
+        bounded = count is None or count <= 7
         row: dict[str, Any] = {
             "name": name,
             "input_sha256": hashlib.sha256(ir.python_print(function, format=False).encode()).hexdigest(),
@@ -123,7 +138,7 @@ def main():
         for pair in range(3):
             samples = {}
             for route in [False, True] if pair != 1 else [True, False]:
-                sample, logical, emitted = measure(function, route)
+                sample, logical, emitted = measure(function, route, production=args.rotating)
                 samples["tokens" if route else "direct"] = sample
                 outputs[route] = emitted
                 if route and bounded:

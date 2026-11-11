@@ -18,6 +18,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::pass {
@@ -75,9 +76,12 @@ Pass LowerSync() {
         if (!IsOwnedLeaf(function)) return function;
         auto* context = PassContext::Current();
         CHECK(context) << "LowerSync requires a target PassContext";
-        return sync::LowerLogicalSync(function, context->GetBackendHandler()->GetPtoTargetArch(),
-                                      std::nullopt)
-            .function;
+        auto result =
+            sync::LowerLogicalSync(function, context->GetBackendHandler()->GetPtoTargetArch(), std::nullopt);
+        // Codegen may use the placed-access qualification only after all actual
+        // token uses have been lowered and the downstream manual marker exists.
+        if (result.set_sites && result.wait_sites) return sync::SyncOutcome(result.function, true, "");
+        return result.function;
       },
       "LowerSync", PassProperties{.produced = {IRProperty::LogicalSyncValid}});
 }
