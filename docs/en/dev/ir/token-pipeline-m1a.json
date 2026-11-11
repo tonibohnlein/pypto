@@ -1,0 +1,313 @@
+{
+  "revision": "40f6bca81a169722cc84e4b683bb37cb517d23a0",
+  "dirty_source_sha256": {
+    "CMakeLists.txt": "f911e2ede2dddfb453612fde4ddccb323e0e045bacd7f5a83a0adb020076aad8",
+    "include/pypto/ir/transforms/passes.h": "562b6de3f21b86ae830fa21d6f8cd50101099ccdcc9fa4536e91d0c0bb15d2dd",
+    "python/bindings/modules/passes.cpp": "c088c3be0271d8b077957695e10a600569172023080e1c34b48c229f5e97a20f",
+    "python/pypto/pypto_core/passes.pyi": "501eb4b204d673918930c99232fe53abc7cccdd94cedc145b017d5516b8e960c",
+    "src/ir/transforms/token_sync.cpp": "c745fa642e8336e93b5c198a51e5361e608a903689b6cf890f25693a02d9a906",
+    "src/ir/transforms/utils/physical_sync_allocation.h": "a9cc0be70ef0b19c3a032cc2fe2184ae17620e7cf5f82d93f8ca183b458e8c3c",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "442562659b161df3eafa831bb7e33e36e6ab1c2bce96255603440e84e7edea3f",
+    "src/ir/transforms/utils/token_sync_lowering.cpp": "3a2b6a456196ea4693f0f8cfba357fc7d3a3f08aed37060b1af22ca313777411",
+    "src/ir/transforms/utils/token_sync_lowering.h": "3a804c54a363f988130201d29b8cf04b099bebb828cf608e774a45f0359f7ec3",
+    "tests/ut/ir/transforms/qualify_token_pipeline.py": "6f5bcbfdf058fe75c99ece749a00dae1539c4b162072005de06ecd5ab40dc9d5",
+    "tests/ut/ir/transforms/test_token_sync_lowering.py": "9bca370d55c3bec8ec79be07b258e82604148cc469d387ea81ce56bda4a18338"
+  },
+  "tracked_diff_sha256": "4bd816e9c023ed4c4f66ac2af92119b83e7177f2d8f8dec77f6b3976cff47a38",
+  "extension_sha256": "0782711198fdaad9f3705a484f25a3b13713da7c3025d5e879724d2a1822e64f",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "scope": "finite standalone RFC stages; ordinary production remains unchanged",
+  "timing": "three interleaved pairs; access recovery is included, no speedup claim",
+  "alias_contract": "disjoint distinct GM roots",
+  "target": "a2a3",
+  "device": "not run",
+  "cases": [
+    {
+      "name": "matmul_64",
+      "input_sha256": "64f79b98fe11f248d74192adf641d4c01ff40794046dc208bc9286148f39bfcc",
+      "pairs": [
+        {
+          "direct": {
+            "analysis_seconds": 0.00010049203410744667,
+            "realization_seconds": 0.00012963125482201576,
+            "total_seconds": 0.00023012328892946243
+          },
+          "tokens": {
+            "insert_seconds": 0.00022335397079586983,
+            "optimize_seconds": 5.518598482012749e-05,
+            "lower_seconds": 0.0002131182700395584,
+            "total_seconds": 0.0004916582256555557
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.0002241157926619053,
+            "optimize_seconds": 4.720315337181091e-05,
+            "lower_seconds": 0.00022749882191419601,
+            "total_seconds": 0.0004988177679479122
+          },
+          "direct": {
+            "analysis_seconds": 0.00012551294639706612,
+            "realization_seconds": 6.726384162902832e-05,
+            "total_seconds": 0.00019277678802609444
+          }
+        },
+        {
+          "direct": {
+            "analysis_seconds": 9.099394083023071e-05,
+            "realization_seconds": 3.280211240053177e-05,
+            "total_seconds": 0.00012379605323076248
+          },
+          "tokens": {
+            "insert_seconds": 0.00023642880842089653,
+            "optimize_seconds": 5.2968040108680725e-05,
+            "lower_seconds": 0.00021889200434088707,
+            "total_seconds": 0.0005082888528704643
+          }
+        }
+      ],
+      "executed_commands": {
+        "set": 4,
+        "wait": 4,
+        "barrier": 0
+      },
+      "directional_ids": {
+        "MTE2->MTE1": [
+          0,
+          1
+        ],
+        "MTE1->M": [
+          0
+        ],
+        "M->FIX": [
+          0
+        ]
+      },
+      "median_paired_total_ratio": 2.5875406113748083,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 4,
+          "wait": 4,
+          "arithmetic": 5
+        },
+        {
+          "set": 4,
+          "wait": 4,
+          "arithmetic": 5
+        }
+      ],
+      "semantic": "equal token/flag payload relations, access coverage, matching, causal reuse, width"
+    },
+    {
+      "name": "matmul_acc_64",
+      "input_sha256": "9497890ca5e0e728e9dc8f03946a806011dbb5f9579c039de7b3fc3cb5efcf56",
+      "pairs": [
+        {
+          "direct": {
+            "analysis_seconds": 0.00011787004768848419,
+            "realization_seconds": 7.452815771102905e-05,
+            "total_seconds": 0.00019239820539951324
+          },
+          "tokens": {
+            "insert_seconds": 0.0003343159332871437,
+            "optimize_seconds": 8.622696623206139e-05,
+            "lower_seconds": 0.0003110179677605629,
+            "total_seconds": 0.000731560867279768
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.00037685781717300415,
+            "optimize_seconds": 8.666329085826874e-05,
+            "lower_seconds": 0.00030536483973264694,
+            "total_seconds": 0.0007688859477639198
+          },
+          "direct": {
+            "analysis_seconds": 0.00012325961142778397,
+            "realization_seconds": 9.538931772112846e-05,
+            "total_seconds": 0.00021864892914891243
+          }
+        },
+        {
+          "direct": {
+            "analysis_seconds": 0.0001091519370675087,
+            "realization_seconds": 5.450192838907242e-05,
+            "total_seconds": 0.00016365386545658112
+          },
+          "tokens": {
+            "insert_seconds": 0.0002780649811029434,
+            "optimize_seconds": 8.090212941169739e-05,
+            "lower_seconds": 0.00031083496287465096,
+            "total_seconds": 0.0006698020733892918
+          }
+        }
+      ],
+      "executed_commands": {
+        "set": 10,
+        "wait": 10,
+        "barrier": 0
+      },
+      "directional_ids": {
+        "MTE2->MTE1": [
+          0,
+          1
+        ],
+        "MTE1->MTE2": [
+          0,
+          1
+        ],
+        "MTE1->M": [
+          0
+        ],
+        "M->MTE1": [
+          0
+        ],
+        "M->FIX": [
+          0
+        ]
+      },
+      "median_paired_total_ratio": 3.8023268759741704,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 10,
+          "wait": 10,
+          "arithmetic": 6
+        },
+        {
+          "set": 10,
+          "wait": 10,
+          "arithmetic": 6
+        }
+      ],
+      "semantic": "equal token/flag payload relations, access coverage, matching, causal reuse, width"
+    },
+    {
+      "name": "finite_vec",
+      "input_sha256": "986de7eb699ac9dfac690b0fe427c038fa5ccea8737fb8422d2d62ce8acf32b0",
+      "pairs": [
+        {
+          "direct": {
+            "analysis_seconds": 0.0003010248765349388,
+            "realization_seconds": 5.367910489439964e-05,
+            "total_seconds": 0.00035470398142933846
+          },
+          "tokens": {
+            "insert_seconds": 0.00041127391159534454,
+            "optimize_seconds": 4.5034103095531464e-05,
+            "lower_seconds": 0.0003949068486690521,
+            "total_seconds": 0.0008512148633599281
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.0003604418598115444,
+            "optimize_seconds": 3.835698589682579e-05,
+            "lower_seconds": 0.00039264000952243805,
+            "total_seconds": 0.0007914388552308083
+          },
+          "direct": {
+            "analysis_seconds": 0.00033070938661694527,
+            "realization_seconds": 4.12939116358757e-05,
+            "total_seconds": 0.00037200329825282097
+          }
+        },
+        {
+          "direct": {
+            "analysis_seconds": 0.00024983612820506096,
+            "realization_seconds": 2.222880721092224e-05,
+            "total_seconds": 0.0002720649354159832
+          },
+          "tokens": {
+            "insert_seconds": 0.0003999699838459492,
+            "optimize_seconds": 3.9311591535806656e-05,
+            "lower_seconds": 0.00034285522997379303,
+            "total_seconds": 0.0007821368053555489
+          }
+        }
+      ],
+      "executed_commands": {
+        "set": 2,
+        "wait": 2,
+        "barrier": 1
+      },
+      "directional_ids": {
+        "MTE2->V": [
+          0
+        ],
+        "V->MTE3": [
+          0
+        ]
+      },
+      "median_paired_total_ratio": 2.399789424211752,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 2,
+          "wait": 2,
+          "arithmetic": 7
+        },
+        {
+          "set": 2,
+          "wait": 2,
+          "arithmetic": 7
+        }
+      ],
+      "semantic": "equal token/flag payload relations, access coverage, matching, causal reuse, width"
+    }
+  ],
+  "starting_checkpoint": {
+    "source_revision": "40f6bca81a169722cc84e4b683bb37cb517d23a0",
+    "starting_tracked_state": "clean (before token migration edits)",
+    "preexisting_untracked": [
+      "build-py314/"
+    ],
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "extension": "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so",
+    "extension_sha256": "d3c77d461f3dd850153771abef592ba978a5d123e1ee052b847e7a752b0a9054",
+    "mode": "host only",
+    "production_changed": false
+  },
+  "milestone": "M1a finite foundation only; M1 structured-token acceptance remains open",
+  "reviews": {
+    "architecture": "accepted finite M1a; no blocking findings",
+    "correctness": "accepted finite M1a; no blocking findings",
+    "algorithm_performance": "accepted finite M1a; no blocking findings"
+  },
+  "validation": {
+    "baseline": {
+      "passed": 89,
+      "deselected": 3
+    },
+    "broad": {
+      "passed": 913,
+      "warnings": 28,
+      "scope": "before final linear sequence-gathering repair"
+    },
+    "final_focused": {
+      "passed": 122,
+      "seconds": 35.72,
+      "scope": "final C++ sources, finite token plus existing logical and physical suites; includes PTOAS C++ generation"
+    }
+  },
+  "commands": [
+    "cmake --build build-py314 --parallel 1",
+    "/usr/bin/python3 -m pytest -q --tb=short tests/ut/ir/transforms/test_token_sync_lowering.py tests/ut/ir/transforms/test_logical_sync_realization.py tests/ut/ir/transforms/test_physical_sync_realization.py --basetemp=build-py314/pytest-token-m1-final --junitxml=build-py314/token-m1-final.xml",
+    "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_token_pipeline --output build-py314/token-m1-qualification.json"
+  ],
+  "environment": {
+    "PYTHONPATH": "$PWD/python",
+    "PTOAS_ROOT": "$PWD/build-py314/physical-sync-prototype/ptoas-v072",
+    "ptoas_launcher_python": "3.11 via PATH; host extension interpreter /usr/bin/python3 3.14.7",
+    "workers": 1,
+    "hook_environment": "unmodified checks; pyright interpreter overridden to python3.11 in a local config because pinned torch2.8.0 has no python3.14 wheel"
+  },
+  "limitations": [
+    "finite straight-line token lowering only",
+    "standalone lowering does not consume caller parameter or block evidence",
+    "production RealizeSync remains unchanged",
+    "no device or native invocation-boundary qualification",
+    "timings are descriptive, not a speedup result"
+  ]
+}

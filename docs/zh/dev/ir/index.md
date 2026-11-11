@@ -32,3 +32,13 @@ IR 定义是整个编译器的真源：pass 可以重写，IR 节点定义不可
 - [Passes](../passes/index.md) —— 运行在该 IR 之上的各种变换。
 - [Python IR 语法规范](../language/00-python_syntax.md) —— parser 接受的表层语法。
 - [IR 验证器](../passes/99-verifier.md) —— 在 pass 之间检查 IR 合法性的属性验证器。
+
+See [RFC token pipeline checkpoint](18-token-pipeline-checkpoint.md) for finite logical-to-physical migration evidence.
+
+- [Canonical loop-token checkpoint](19-structured-token-checkpoint.md)
+
+- [Rotating token-history checkpoint](20-rotating-token-checkpoint.md)
+
+- [Numerical crossing-token checkpoint](21-crossing-token-checkpoint.md)
+
+- [Supplied numerical-order service checkpoint](22-token-order-service-checkpoint.md)

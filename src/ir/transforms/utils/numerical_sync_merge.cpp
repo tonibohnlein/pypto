@@ -17,6 +17,7 @@
 #include <memory>
 #include <set>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "pypto/core/logging.h"
@@ -196,6 +197,71 @@ void BuildCrossIndex(NumericalNode& node) {
   }
 }
 }  // namespace
+void BuildNumericalMergeOrder(const std::shared_ptr<NumericalNode>& node,
+                              const std::set<NumericalEvent>& ports,
+                              std::vector<NumericalCrossing> crossings) {
+  CHECK(node && node->left && node->right && node->positions.empty())
+      << "Numerical order merge requires a fresh parent and supplied children";
+  const auto& a = node->left;
+  const auto& b = node->right;
+  CHECK(node->length == NumericalAdd(a->length, b->length)) << "Numerical order merge length mismatch";
+  for (const auto& edge : crossings) {
+    CHECK(edge.source.first < kNumericalChains && edge.target.first < kNumericalChains &&
+          edge.source.second < a->chains[edge.source.first].size() &&
+          edge.target.second < b->chains[edge.target.first].size())
+        << "Numerical order crossing is outside supplied child ports";
+  }
+  node->crossings = std::move(crossings);
+  const auto& all = node->crossings;
+  for (size_t c = 0; c < kNumericalChains; ++c) {
+    for (size_t i = 0; i < a->chains[c].size(); ++i)
+      if (ports.count({a->chains[c][i], c % 2 != 0})) {
+        node->chains[c].push_back(a->chains[c][i]);
+        node->left_projection[c].push_back(i);
+      }
+    for (size_t i = 0; i < b->chains[c].size(); ++i) {
+      const auto ordinal = NumericalAdd(a->length, b->chains[c][i]);
+      if (ports.count({ordinal, c % 2 != 0})) {
+        node->chains[c].push_back(ordinal);
+        node->right_projection[c].push_back(i);
+      }
+    }
+  }
+  IndexNumericalPositions(*node);
+  CHECK(node->positions.size() == ports.size()) << "Numerical order projection omitted a supplied port";
+  const auto left = Project(*a, *node, node->left_projection, false);
+  const auto right = Project(*b, *node, node->right_projection, true);
+  for (size_t c = 0; c < kNumericalChains; ++c) {
+    node->forward[c].resize(node->chains[c].size(), EmptyRow(*node));
+    for (size_t i = 0; i < node->left_projection[c].size(); ++i)
+      for (size_t d = 0; d < kNumericalChains; ++d)
+        node->forward[c][i][d] = left.next[d][a->forward[c][node->left_projection[c][i]][d]];
+    for (size_t i = 0; i < node->right_projection[c].size(); ++i)
+      for (size_t d = 0; d < kNumericalChains; ++d)
+        node->forward[c][i + node->left_projection[c].size()][d] =
+            right.next[d][b->forward[c][node->right_projection[c][i]][d]];
+    std::vector<std::vector<size_t>> activation(node->left_projection[c].size());
+    for (size_t i = 0; i < all.size(); ++i) {
+      const auto& source = all[i].source;
+      const auto ancestor = a->reverse[source.first][source.second][c];
+      if (ancestor < 0) continue;
+      const auto last_source = left.previous[c][ancestor];
+      if (last_source >= 0) activation[last_source].push_back(i);
+    }
+    auto active = EmptyRow(*node);
+    for (size_t i = activation.size(); i-- > 0;) {
+      for (size_t edge : activation[i]) {
+        const auto& target = all[edge].target;
+        for (size_t d = 0; d < kNumericalChains; ++d)
+          active[d] = std::min(active[d], right.next[d][b->forward[target.first][target.second][d]]);
+      }
+      for (size_t d = 0; d < kNumericalChains; ++d)
+        node->forward[c][i][d] = std::min(node->forward[c][i][d], active[d]);
+    }
+  }
+  InvertNumericalRows(*node);
+  BuildCrossIndex(*node);
+}
 std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const NumericalNode> a,
                                                          std::shared_ptr<const NumericalNode> b,
                                                          CompactSyncResult& result) {
@@ -263,54 +329,10 @@ std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const N
     all.push_back({a->positions.at(edge.first), b->positions.at(edge.second), native});
   // Parent ports are selected child ports, never synthetic completion events.
   const auto ports = NumericalPorts(*node, result.port_normalization_visits);
-  for (size_t c = 0; c < kNumericalChains; ++c) {
-    for (size_t i = 0; i < a->chains[c].size(); ++i)
-      if (ports.count({a->chains[c][i], c % 2 != 0})) {
-        node->chains[c].push_back(a->chains[c][i]);
-        node->left_projection[c].push_back(i);
-      }
-    for (size_t i = 0; i < b->chains[c].size(); ++i) {
-      const auto ordinal = NumericalAdd(a->length, b->chains[c][i]);
-      if (ports.count({ordinal, c % 2 != 0})) {
-        node->chains[c].push_back(ordinal);
-        node->right_projection[c].push_back(i);
-      }
-    }
-  }
-  IndexNumericalPositions(*node);
-  const auto left = Project(*a, *node, node->left_projection, false);
-  const auto right = Project(*b, *node, node->right_projection, true);
-  for (size_t c = 0; c < kNumericalChains; ++c) {
-    node->forward[c].resize(node->chains[c].size(), EmptyRow(*node));
-    for (size_t i = 0; i < node->left_projection[c].size(); ++i)
-      for (size_t d = 0; d < kNumericalChains; ++d)
-        node->forward[c][i][d] = left.next[d][a->forward[c][node->left_projection[c][i]][d]];
-    for (size_t i = 0; i < node->right_projection[c].size(); ++i)
-      for (size_t d = 0; d < kNumericalChains; ++d)
-        node->forward[c][i + node->left_projection[c].size()][d] =
-            right.next[d][b->forward[c][node->right_projection[c][i]][d]];
-    std::vector<std::vector<size_t>> activation(node->left_projection[c].size());
-    for (size_t i = 0; i < all.size(); ++i) {
-      const auto& source = all[i].source;
-      const auto ancestor = a->reverse[source.first][source.second][c];
-      if (ancestor < 0) continue;
-      const auto last_source = left.previous[c][ancestor];
-      if (last_source >= 0) activation[last_source].push_back(i);
-    }
-    auto active = EmptyRow(*node);
-    for (size_t i = activation.size(); i-- > 0;) {
-      for (size_t edge : activation[i]) {
-        const auto& target = all[edge].target;
-        for (size_t d = 0; d < kNumericalChains; ++d)
-          active[d] = std::min(active[d], right.next[d][b->forward[target.first][target.second][d]]);
-      }
-      for (size_t d = 0; d < kNumericalChains; ++d)
-        node->forward[c][i][d] = std::min(node->forward[c][i][d], active[d]);
-    }
-  }
-  InvertNumericalRows(*node);
-  node->crossings = ReduceCrossings(*a, *b, all, result);
-  BuildCrossIndex(*node);
+  // Demand proposal/reduction remains owned by this storage-analysis caller.
+  // The supplied reduced crossings preserve the full order and the existing
+  // compact query index; token clients instead supply their actual-use edges.
+  BuildNumericalMergeOrder(node, ports, ReduceCrossings(*a, *b, all, result));
   CountNumericalInterface(*node, result);
   ++result.merge_nodes;
   return node;

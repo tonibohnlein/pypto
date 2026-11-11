@@ -25,6 +25,7 @@
 #include "pypto/core/logging.h"
 #include "src/ir/transforms/utils/numerical_sync_hierarchy.h"
 #include "src/ir/transforms/utils/rotating_sync_analysis.h"
+#include "src/ir/transforms/utils/sync_boundary_graph.h"
 namespace pypto::ir::sync {
 namespace {
 using Atom = SyncStorageClass;
@@ -369,29 +370,7 @@ bool CompactSegmentResult::Precedes(int64_t a, size_t source, bool sc, int64_t b
   const auto threshold = Threshold(source, sc, target, tc);
   return threshold && *threshold <= b - a;
 }
-size_t CompactSyncResult::Node(const Event& e) {
-  auto [found, inserted] = nodes_.emplace(e, nodes_.size());
-  if (inserted) graph_.emplace_back();
-  return found->second;
-}
-bool CompactSyncResult::Path(size_t a, size_t b, std::optional<std::pair<size_t, size_t>> skip) const {
-  std::vector<bool> seen(graph_.size());
-  std::vector<size_t> queue{a};
-  seen[a] = true;
-  while (!queue.empty()) {
-    auto x = queue.back();
-    queue.pop_back();
-    for (auto y : graph_[x]) {
-      if (skip && skip->first == x && skip->second == y) continue;
-      if (y == b) return true;
-      if (!seen[y]) {
-        seen[y] = true;
-        queue.push_back(y);
-      }
-    }
-  }
-  return false;
-}
+
 void IndexSyncStorageAccesses(CompactSyncResult& result) {
   INTERNAL_CHECK(result.storage_access_index.empty()) << "Original access index requires a fresh result";
   result.storage_access_index.resize(result.input.storage.size());
@@ -456,44 +435,14 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
   // concrete numerical fast path free of a redundant all-pairs port graph.
   if (result.segments.size() == 1) return result;
   AccumulatorProtection protection(result.input);
-  // A child is contiguous. Crossings can only touch its first/last storage
-  // accesses; queries through a child use its retained periodic event graph.
-  for (size_t r = 0; r < result.segments.size(); ++r) {
-    const auto& s = result.segments[r];
-    if (!s.count) continue;
-    for (int64_t i : std::set<int64_t>{0, s.count - 1})
-      for (size_t p = 0; p < s.pipes.size(); ++p)
-        for (bool c : {false, true}) result.Node({{r, i, p}, c});
-  }
-  std::vector<std::vector<std::pair<CompactSyncResult::Event, size_t>>> ports(result.segments.size());
-  for (const auto& [event, index] : result.nodes_) ports[std::get<0>(event.first)].emplace_back(event, index);
-  for (const auto& child : ports)
-    for (const auto& [a, ai] : child)
-      for (const auto& [b, bi] : child) {
-        ++result.port_pair_tests;
-        auto [ar, av, as] = a.first;
-        auto [br, bv, bs] = b.first;
-        if (result.segments[ar].Precedes(av, as, a.second, bv, bs, b.second)) result.graph_[ai].push_back(bi);
-      }
-  std::array<std::optional<Occurrence>, kPipeCount> previous{};
+  result.boundary_order_ = std::make_shared<SyncBoundaryGraph>(result.segments);
+  result.port_pair_tests = result.boundary_order_->pair_tests;
   std::vector<std::optional<Occurrence>> writers(atoms.size());
   std::vector<std::array<std::optional<Occurrence>, kPipeCount>> readers(atoms.size());
   std::set<Crossing> crossings;
   for (size_t r = 0; r < result.segments.size(); ++r) {
     const auto& s = result.segments[r];
     if (!s.count || s.pipes.empty()) continue;
-    std::array<std::optional<size_t>, kPipeCount> first{}, last{};
-    for (size_t p = 0; p < s.pipes.size(); ++p) {
-      if (!first[s.pipes[p]]) first[s.pipes[p]] = p;
-      last[s.pipes[p]] = p;
-    }
-    for (size_t p = 0; p < kPipeCount; ++p)
-      if (first[p]) {
-        if (previous[p])
-          for (bool c : {false, true})
-            result.graph_[result.Node({*previous[p], c})].push_back(result.Node({{r, 0, *first[p]}, c}));
-        previous[p] = Occurrence{r, s.count - 1, *last[p]};
-      }
     for (size_t c = 0; c < atoms.size(); ++c) {
       auto boundary = s.body.Boundary(c);
       INTERNAL_CHECK(boundary) << "Missing supplied cell";
@@ -517,14 +466,14 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
     }
   }
   result.crossing_generators.assign(crossings.begin(), crossings.end());
-  for (const auto& e : crossings)
-    result.graph_[result.Node({e.first, true})].push_back(result.Node({e.second, false}));
+  for (const auto& e : crossings) result.boundary_order_->Add({e.first, true}, {e.second, false});
   for (const auto& e : crossings) {
     ++result.crossing_path_searches;
-    auto a = result.Node({e.first, true}), b = result.Node({e.second, false});
-    if (!result.Path(a, b, std::make_pair(a, b))) result.crossing_demands.push_back(e);
+    auto a = result.boundary_order_->Node({e.first, true}),
+         b = result.boundary_order_->Node({e.second, false});
+    if (!result.boundary_order_->Path(a, b, std::make_pair(a, b))) result.crossing_demands.push_back(e);
   }
-  for (const auto& g : result.graph_) result.graph_edges += g.size();
+  result.graph_edges = result.boundary_order_->Edges();
   result.composition_seconds = std::chrono::duration<double>(Clock::now() - reduced).count();
   return result;
 }
@@ -538,20 +487,8 @@ bool CompactSyncResult::Precedes(const Occurrence& a, bool sc, const Occurrence&
   segments[br].Precedes(bv, bs, tc, bv, bs, tc);
   if (ar == br) return segments[ar].Precedes(av, as, sc, bv, bs, tc);
   if (ar > br) return false;
-  std::vector<size_t> starts, ends;
-  for (const auto& [event, node] : nodes_) {
-    auto [r, v, s] = event.first;
-    if (r == ar &&
-        ((event.first == a && event.second == sc) || segments[ar].Precedes(av, as, sc, v, s, event.second)))
-      starts.push_back(node);
-    if (r == br &&
-        ((event.first == b && event.second == tc) || segments[br].Precedes(v, s, event.second, bv, bs, tc)))
-      ends.push_back(node);
-  }
-  for (auto x : starts)
-    for (auto y : ends)
-      if (Path(x, y)) return true;
-  return false;
+  INTERNAL_CHECK(boundary_order_) << "Missing original boundary order";
+  return boundary_order_->Precedes(segments, a, sc, b, tc);
 }
 std::optional<PointBoundary> CompactSyncResult::Boundary(size_t storage, int64_t row, int64_t column) const {
   return BoundaryAt(storage, row, column, {});

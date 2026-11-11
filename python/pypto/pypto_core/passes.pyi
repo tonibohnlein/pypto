@@ -875,6 +875,23 @@ def select_buffer_ir_functions() -> Pass:
     """Select supported whole kernels before Buffer storage legalization."""
     ...
 
+def insert_sync() -> Pass:
+    """Insert logical tokens after placement using the explicit disjoint-GM contract.
+
+    Unsupported analysis or token exports raise without modifying the input.
+    This standalone stage does not require enable_pypto_autosync.
+    """
+
+def optimize_sync() -> Pass:
+    """Verify logical synchronization and return it unchanged."""
+
+def lower_sync() -> Pass:
+    """Lower supported logical token programs to certified physical commands.
+
+    Consumes token definitions and uses, including manually supplied dependencies.
+    Unsupported token control flow or insufficient physical evidence raises.
+    """
+
 def realize_sync() -> Pass:
     """Try whole-kernel physical synchronization; delegate unqualified bodies unchanged."""
 

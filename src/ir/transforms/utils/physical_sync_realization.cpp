@@ -22,19 +22,17 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
-#include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
-#include "pypto/ir/transforms/pass_context.h"
-#include "pypto/ir/transforms/pass_properties.h"
-#include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/sync/isa_macro_resources.h"
 #include "pypto/sync/resource_catalog.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/sync_invocation_domains.h"
 #include "src/ir/transforms/utils/sync_placement.h"
 
 namespace pypto::ir::sync {
@@ -57,8 +55,9 @@ Occurrence Endpoint(const Family& f, int64_t ordinal, bool publish) {
 }
 Occurrence Source(const Family& f, int64_t ordinal) { return Endpoint(f, ordinal, true); }
 Occurrence Target(const Family& f, int64_t ordinal) { return Endpoint(f, ordinal, false); }
-Direction Pipes(const CompactSyncResult& a, const Family& f) {
-  return {a.segments[f.source_region].pipes[f.source_site], a.segments[f.target_region].pipes[f.target_site]};
+Direction Pipes(const CompactSyncInput& a, const Family& f) {
+  return {a.segments[f.source_region].sites[f.source_site].pipe,
+          a.segments[f.target_region].sites[f.target_site].pipe};
 }
 
 // This is a narrow binding of the existing native resource declarations, not
@@ -69,12 +68,12 @@ Direction Pipes(const CompactSyncResult& a, const Family& f) {
 // catalogued V<->S claims belong to the excluded Vec overload. Still consume
 // any applicable fixed claims for the owning core conservatively, and refuse
 // unresolved owners. Vec arithmetic takes its macro from the shared recipe.
-std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, const std::string& target) {
+std::map<Direction, std::set<int>> NativeClaims(const CompactSyncInput& a, const std::string& target) {
   CHECK(target == "a2a3") << "Unsupported physical target: native variants are qualified only for a2a3";
   auto backend = backend::GetBackendInstance(backend::BackendType::Ascend910);
   std::map<Direction, std::set<int>> claimed;
   std::set<std::string> checked;
-  for (const auto& segment : a.input.segments) {
+  for (const auto& segment : a.segments) {
     if (!segment.count) continue;
     for (const auto& site : segment.sites) {
       for (const auto& call : {site.original, site.continuation}) {
@@ -123,7 +122,7 @@ std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, cons
           if (macro == "pto::TEXTRACT" && claim.pool.core == CoreScope::AIV) continue;
           CHECK(claim.pool.kind == ResourceKind::PipelineEvent &&
                 claim.pool.core ==
-                    (a.input.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC) &&
+                    (a.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC) &&
                 claim.source == IsaIdSource::Fixed && claim.lifetime == IsaResourceLifetime::Invocation)
               << "Unavailable native flag owner/variant binding: " << macro;
           for (auto id : claim.ids) claimed[{claim.pool.src, claim.pool.dst}].insert(static_cast<int>(id));
@@ -136,14 +135,55 @@ std::map<Direction, std::set<int>> NativeClaims(const CompactSyncResult& a, cons
 
 class Allocator {
  public:
-  Allocator(const CompactSyncResult& analysis, const std::string& target,
-            const std::optional<std::vector<int>>& restricted)
-      : a_(analysis),
+  Allocator(const CompactSyncInput& input, std::vector<Family> families, const DirectSyncOrder& order,
+            const std::string& target, const std::optional<std::vector<int>>& restricted)
+      : input_(input),
+        order_(order),
         catalog_(pypto::sync::FindResourceCatalog(target)),
         restricted_(restricted),
-        claimed_(NativeClaims(analysis, target)) {
+        claimed_(SyncNativeClaims(input, target)) {
+    result_.families = std::move(families);
+    result_.finite_minimum = order_.finite_minimum && !input_.region_tree;
+    CHECK(order_.precedes && order_.reference_before && order_.threshold)
+        << "Missing direct synchronization order proof";
+    for (const auto& f : result_.families) {
+      CHECK(f.source_region < input_.segments.size() && f.target_region < input_.segments.size())
+          << "Invalid direct family region";
+      const auto& source = input_.segments[f.source_region];
+      const auto& target_segment = input_.segments[f.target_region];
+      CHECK(f.source_site < source.sites.size() && f.target_site < target_segment.sites.size() &&
+            f.source_first >= 0 && f.target_first >= 0 && f.count > 0 && f.ids.empty())
+          << "Invalid direct family endpoint or preassigned IDs";
+      __int128 last_source = f.source_first, last_target = f.target_first, volume = 1;
+      if (f.axes.empty()) {
+        last_source += f.count - 1;
+        last_target += f.count - 1;
+      } else {
+        CHECK(f.axes.size() <= source.nested_frames.size() &&
+              f.axes.size() <= target_segment.nested_frames.size())
+            << "Invalid direct family arity";
+        for (size_t i = 0; i < f.axes.size(); ++i) {
+          const auto& axis = f.axes[i];
+          CHECK(axis.frame == source.nested_frames[i].loop &&
+                axis.frame == target_segment.nested_frames[i].loop && axis.count > 0 &&
+                axis.count <= source.nested_frames[i].count &&
+                axis.count <= target_segment.nested_frames[i].count && axis.source_stride >= 0 &&
+                axis.target_stride >= 0)
+              << "Invalid direct family scope";
+          volume *= axis.count;
+          CHECK(volume <= std::numeric_limits<int64_t>::max()) << "Direct family volume overflow";
+          last_source += __int128(axis.count - 1) * axis.source_stride;
+          last_target += __int128(axis.count - 1) * axis.target_stride;
+          CHECK(last_source < source.count && last_target < target_segment.count)
+              << "Direct family axis exceeds occurrence domain";
+        }
+        CHECK(volume == f.count) << "Inconsistent direct family volume";
+      }
+      CHECK(last_source < source.count && last_target < target_segment.count)
+          << "Direct family endpoint exceeds occurrence domain";
+    }
     CHECK(catalog_) << "Unavailable synchronization resource catalog: " << target;
-    CHECK(a_.input.hardware_target == target)
+    CHECK(input_.hardware_target == target)
         << "Synchronization hardware contract differs from lowering target";
     if (restricted_) {
       std::set<int> unique;
@@ -154,63 +194,23 @@ class Allocator {
   PhysicalSyncRealization Run() {
     for (const auto& [direction, ids] : claimed_)
       for (int id : ids) result_.native_reserved_ids.emplace_back(direction.first, direction.second, id);
-    if (a_.input.region_tree) {
-      result_.finite_minimum = false;  // Sufficient whole-span assignment, not a minimum-ID proof.
-      const auto owned = a_.ExportScopedDemands();
-      CHECK(owned) << "Scoped endpoint export is unavailable";
-      for (const auto& schema : owned->families) {
-        const auto [sr, sv, ss] = schema.source;
-        const auto [tr, tv, ts] = schema.target;
-        __int128 count = 1;
-        for (const auto& axis : schema.axes) {
-          count *= axis.count;
-          CHECK(count <= std::numeric_limits<int64_t>::max()) << "Scoped physical record domain overflow";
-        }
-        result_.families.push_back({sr, ss, tr, ts, sv, tv, static_cast<int64_t>(count), {}, schema.axes});
-      }
-    } else {
-      const auto crossings = a_.ExportCrossingDemands();
-      CHECK(crossings.has_value())
-          << "Minimum demands are retained; shared-repetition physical endpoint scope is unavailable";
-      for (size_t r = 0; r < a_.segments.size(); ++r) {
-        const auto& segment = a_.segments[r];
-        for (const auto& f : segment.demands) {
-          CHECK(f.distance >= 0 && f.source < segment.pipes.size() && f.target < segment.pipes.size())
-              << "Invalid physical demand family";
-          if (segment.count <= f.distance) continue;
-          result_.families.push_back(
-              {r, f.source, r, f.target, 0, f.distance, segment.count - f.distance, {}});
-        }
-      }
-      for (const auto& [source, target] : *crossings) {
-        auto [sr, sv, ss] = source;
-        auto [tr, tv, ts] = target;
-        CHECK(sr < a_.segments.size() && tr < a_.segments.size() && sr < tr)
-            << "Unavailable physical crossing frame";
-        CHECK(sv >= 0 && sv < a_.segments[sr].count && tv >= 0 && tv < a_.segments[tr].count &&
-              ss < a_.segments[sr].pipes.size() && ts < a_.segments[tr].pipes.size())
-            << "Invalid physical crossing occurrence";
-        result_.families.push_back({sr, ss, tr, ts, sv, tv, 1, {}});
-      }
-    }
     QualifyBarriers();
     for (size_t index = 0; index < result_.families.size(); ++index) {
       auto& f = result_.families[index];
-      const auto direction = Pipes(a_, f);
+      const auto direction = Pipes(input_, f);
       if (direction.first == direction.second) continue;
       const auto& ids = Eligible(direction);
       int64_t width = f.count;
-      if (f.count > 1 && a_.input.region_tree) {
+      if (f.count > 1 && input_.region_tree) {
         result_.finite_minimum = false;
-        CHECK(a_.ScopedConsecutiveReuse(index))
+        CHECK(order_.scoped_reuse && order_.scoped_reuse(index))
             << "Scoped period-one physical reuse is unproved; no capacity obstruction established";
         width = 1;
       } else if (f.count > 1) {
         result_.finite_minimum = false;
-        const auto& segment = a_.segments[f.source_region];
         INTERNAL_CHECK(f.source_region == f.target_region)
             << "Internal error: repeated family without a periodic owner";
-        const auto distance = segment.Threshold(f.target_site, true, f.source_site, false);
+        const auto distance = order_.threshold(f.source_region, f.target_site, f.source_site);
         // Canonical direct placement associates WAIT(h)->SET(g) with
         // C_consumer(h)->I_source(g). Reference-forward witnesses between valid
         // endpoints stay inside the finite prefix. Clip before adding a wide
@@ -244,7 +244,8 @@ class Allocator {
     size_t family, residue;
     Occurrence first, last;
   };
-  const CompactSyncResult& a_;
+  const CompactSyncInput& input_;
+  const DirectSyncOrder& order_;
   const pypto::sync::ResourceCatalog* catalog_;
   const std::optional<std::vector<int>>& restricted_;
   std::map<Direction, std::set<int>> claimed_;
@@ -253,68 +254,45 @@ class Allocator {
   PhysicalSyncRealization result_;
   bool Reaches(const Occurrence& a, const Occurrence& b) {
     ++result_.reuse_queries;
-    return a_.Precedes(a, true, b, false);
+    return order_.precedes(a, b);
   }
   const std::vector<int>& Eligible(Direction d) {
     auto [it, fresh] = eligible_.try_emplace(d);
     if (!fresh) return it->second;
-    using pypto::sync::CoreScope;
-    using pypto::sync::ResourceKind;
-    const auto core = a_.input.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC;
-    auto spec = catalog_->FindPool({ResourceKind::PipelineEvent, core, d.first, d.second});
-    CHECK(spec) << "Unavailable directional event pool";
-    auto legal = spec->legal_ids;
-    if (legal.empty()) {
-      legal.resize(spec->capacity);
-      std::iota(legal.begin(), legal.end(), 0);
-    }
-    std::set<int> available;
-    for (auto id : legal)
-      if (std::find(spec->reserved_ids.begin(), spec->reserved_ids.end(), id) == spec->reserved_ids.end() &&
-          !claimed_[d].count(static_cast<int>(id)))
-        available.insert(static_cast<int>(id));
-    if (restricted_) {
-      for (int id : *restricted_) {
-        CHECK(id < static_cast<int>(spec->capacity) &&
-              std::find(legal.begin(), legal.end(), id) != legal.end())
-            << "Requested ID is outside the legal target pool";
-        if (available.count(id)) it->second.push_back(id);
-      }
-    } else {
-      it->second.assign(available.begin(), available.end());
-    }
+    it->second = SyncEligibleIds(input_, input_.hardware_target, d, restricted_, claimed_);
     return it->second;
   }
   void QualifyBarriers() {
-    if (a_.input.region_tree) {
+    if (input_.region_tree) {
       for (size_t i = 0; i < result_.families.size(); ++i) {
-        const auto [source, target] = Pipes(a_, result_.families[i]);
+        const auto [source, target] = Pipes(input_, result_.families[i]);
         if (source != target) continue;
         CHECK(target == PipeType::M || target == PipeType::V)
             << "Scoped same-pipe barrier mechanism is unavailable; scalar barriers are forbidden";
-        CHECK(a_.ScopedAdjacentBarrier(i)) << "Scoped same-pipe barrier adjacency is unproved";
+        CHECK(order_.scoped_barrier && order_.scoped_barrier(i))
+            << "Scoped same-pipe barrier adjacency is unproved";
       }
       return;
     }
     // Predecessor lookup is indexed by region and pipe. For repeated bodies,
     // check both startup and steady-state; no trip count is unfolded.
-    std::vector<std::array<std::optional<Occurrence>, kPipeCount>> before(a_.segments.size());
+    std::vector<std::array<std::optional<Occurrence>, kPipeCount>> before(input_.segments.size());
     std::array<std::optional<Occurrence>, kPipeCount> previous{};
-    std::vector<std::vector<std::optional<size_t>>> local(a_.segments.size());
-    std::vector<std::array<std::optional<size_t>, kPipeCount>> last(a_.segments.size());
-    for (size_t r = 0; r < a_.segments.size(); ++r) {
+    std::vector<std::vector<std::optional<size_t>>> local(input_.segments.size());
+    std::vector<std::array<std::optional<size_t>, kPipeCount>> last(input_.segments.size());
+    for (size_t r = 0; r < input_.segments.size(); ++r) {
       before[r] = previous;
-      local[r].resize(a_.segments[r].pipes.size());
-      if (!a_.segments[r].count) continue;
-      for (size_t s = 0; s < a_.segments[r].pipes.size(); ++s) {
-        auto pipe = a_.segments[r].pipes[s];
+      local[r].resize(input_.segments[r].sites.size());
+      if (!input_.segments[r].count) continue;
+      for (size_t s = 0; s < input_.segments[r].sites.size(); ++s) {
+        auto pipe = input_.segments[r].sites[s].pipe;
         local[r][s] = last[r][pipe];
         last[r][pipe] = s;
-        previous[pipe] = Occurrence{r, a_.segments[r].count - 1, s};
+        previous[pipe] = Occurrence{r, input_.segments[r].count - 1, s};
       }
     }
     for (const auto& f : result_.families) {
-      auto [src, dst] = Pipes(a_, f);
+      auto [src, dst] = Pipes(input_, f);
       if (src != dst) continue;
       CHECK(dst != PipeType::S) << "Scalar barriers are forbidden; require qualified native scalar order";
       CHECK(dst == PipeType::M || dst == PipeType::V) << "Unavailable same-pipe barrier mechanism";
@@ -337,42 +315,21 @@ class Allocator {
     // suffix. Queries are charged separately (the retained regional oracle
     // need not be constant-time). No quadratic directory scan or K unfolding.
     auto by_source = [&](const Lane& x, const Lane& y) {
-      if (x.first != y.first) return a_.ReferenceBefore(x.first, y.first);
+      if (x.first != y.first) return order_.reference_before(x.first, y.first);
       return std::tie(x.family, x.residue) < std::tie(y.family, y.residue);
     };
     std::sort(lanes.begin(), lanes.end(), by_source);
-    std::vector<size_t> waits(lanes.size()), release(lanes.size());
-    std::iota(waits.begin(), waits.end(), 0);
-    std::sort(waits.begin(), waits.end(), [&](size_t x, size_t y) {
-      if (lanes[x].last != lanes[y].last) return a_.ReferenceBefore(lanes[x].last, lanes[y].last);
-      return std::tie(lanes[x].family, lanes[x].residue) < std::tie(lanes[y].family, lanes[y].residue);
-    });
-    size_t next = 0;
-    for (auto i : waits) {
-      while (next < lanes.size() && !Reaches(lanes[i].last, lanes[next].first)) ++next;
-      release[i] = next;
-      INTERNAL_CHECK(next > i) << "Internal error: cyclic physical lane span";
-    }
-    std::vector<std::vector<int>> buckets(lanes.size() + 1);
-    std::vector<int> free;
-    const auto& eligible = Eligible(direction);
-    size_t colors = 0;
+    const auto colors = ColorOrderedSyncLanes(
+        lanes.size(), direction,
+        [&](size_t x, size_t y) {
+          if (lanes[x].last != lanes[y].last) return order_.reference_before(lanes[x].last, lanes[y].last);
+          return std::tie(lanes[x].family, lanes[x].residue) < std::tie(lanes[y].family, lanes[y].residue);
+        },
+        [&](size_t x, size_t y) { return Reaches(lanes[x].last, lanes[y].first); }, Eligible(direction),
+        result_.finite_minimum);
     for (size_t i = 0; i < lanes.size(); ++i) {
-      free.insert(free.end(), buckets[i].begin(), buckets[i].end());
-      if (free.empty()) {
-        CHECK(colors < eligible.size())
-            << (result_.finite_minimum ? "Fixed-plan scarcity"
-                                       : "Allocation unproved by whole-span reservation")
-            << ": direction=" << PipeTypeToString(direction.first) << "->"
-            << PipeTypeToString(direction.second) << " overlap_at_publication=" << i
-            << " required_at_least=" << colors + 1 << " eligible=" << eligible.size();
-        free.push_back(eligible[colors++]);
-      }
-      int id = free.back();
-      free.pop_back();
       const auto& lane = lanes[i];
-      result_.families[lane.family].ids[lane.residue] = id;
-      buckets[release[i]].push_back(id);
+      result_.families[lane.family].ids[lane.residue] = colors[i];
     }
   }
 };
@@ -384,7 +341,8 @@ using CutInventory = std::map<const Call*, std::shared_ptr<PhysicalCuts>>;
 
 class Emitter : public SyncPlacement {
  public:
-  Emitter(const CompactSyncResult& a, PhysicalSyncRealization& result) : SyncPlacement(a), result_(result) {
+  Emitter(const CompactSyncInput& input, PhysicalSyncRealization& result)
+      : SyncPlacement(input), result_(result) {
     for (size_t i = 0; i < result.families.size(); ++i) {
       const auto& f = result.families[i];
       incoming_[{f.target_region, f.target_site}].push_back(i);
@@ -393,8 +351,8 @@ class Emitter : public SyncPlacement {
   }
 
   void AppendCuts(CutInventory& inventory, const ExprPtr& guard) {
-    for (size_t r = 0; r < analysis_.input.segments.size(); ++r) {
-      const auto& region = analysis_.input.segments[r];
+    for (size_t r = 0; r < input_.segments.size(); ++r) {
+      const auto& region = input_.segments[r];
       if (!region.count) continue;
       for (size_t s = 0; s < region.sites.size(); ++s) {
         const auto& site = region.sites[s];
@@ -428,7 +386,7 @@ class Emitter : public SyncPlacement {
     return std::make_shared<ConstInt>(n, DataType::INDEX, span);
   }
   ExprPtr Ordinal(size_t region, const Span& span) {
-    const auto& s = analysis_.input.segments[region];
+    const auto& s = input_.segments[region];
     if (!s.original_loop) return Integer(0, span);
     if (!s.nested_frames.empty()) {
       ExprPtr ordinal = Integer(0, span);
@@ -466,7 +424,7 @@ class Emitter : public SyncPlacement {
   std::vector<ExprPtr> ScopedGuards(const Family& family, bool publish, const Span& span) {
     const auto region = publish ? family.source_region : family.target_region;
     auto base = publish ? family.source_first : family.target_first;
-    const auto& frames = analysis_.input.segments[region].nested_frames;
+    const auto& frames = input_.segments[region].nested_frames;
     std::vector<int64_t> digits(frames.size());
     for (size_t i = frames.size(); i-- > 0;) {
       INTERNAL_CHECK(frames[i].count > 0) << "Internal error: physical endpoint in absent frame";
@@ -498,10 +456,10 @@ class Emitter : public SyncPlacement {
     return std::make_shared<IfStmt>(condition, body, std::nullopt, std::vector<VarPtr>{}, body->span_);
   }
   StmtPtr Command(const Family& f, bool publish, const Span& span) {
-    const auto [src, dst] = Pipes(analysis_, f);
+    const auto [src, dst] = Pipes(input_, f);
     const size_t r = publish ? f.source_region : f.target_region;
     const int64_t first = publish ? f.source_first : f.target_first;
-    const bool scoped = analysis_.input.region_tree.has_value();
+    const bool scoped = input_.region_tree.has_value();
     // The initial scoped certificate deliberately proves period one. Keep
     // physical table coordinates separate from the full logical record tuple.
     INTERNAL_CHECK(!scoped || f.ids.size() <= 1) << "Internal error: unsupported scoped physical period";
@@ -526,8 +484,7 @@ class Emitter : public SyncPlacement {
             {{"src_pipe", static_cast<int>(src)},
              {"dst_pipe", static_cast<int>(dst)},
              {"event_id", f.ids[i]},
-             {"core_type",
-              std::string(analysis_.input.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
+             {"core_type", std::string(input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
             span);
         StmtPtr command = std::make_shared<EvalStmt>(call, span);
         if (residue)
@@ -547,7 +504,7 @@ class Emitter : public SyncPlacement {
       for (auto guard = guards.rbegin(); guard != guards.rend(); ++guard) body = Guard(*guard, body);
       return body;
     }
-    if (first + f.count < analysis_.segments[r].count)
+    if (first + f.count < input_.segments[r].count)
       body = Guard(std::make_shared<Lt>(ordinal, Integer(first + f.count, span), DataType::BOOL, span), body);
     if (first) body = Guard(std::make_shared<Ge>(ordinal, Integer(first, span), DataType::BOOL, span), body);
     return body;
@@ -606,76 +563,192 @@ class InvocationEmitter : public IRMutator {
  public:
   explicit InvocationEmitter(const CutInventory& inventory) : inventory_(inventory) {}
 };
-ExprPtr DominatingBlock(const FunctionPtr& owner) {
-  const auto sequence = As<SeqStmts>(owner->body_);
-  if (!sequence) return nullptr;
-  for (const auto& statement : sequence->stmts_) {
-    const auto assign = As<AssignStmt>(statement);
-    if (!assign) break;  // A later/nested definition does not dominate every payload cut.
-    const auto call = As<Call>(assign->value_);
-    if (call && IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
-      const auto type = As<ScalarType>(assign->var_->GetType());
-      CHECK(type && type->dtype_ == DataType::INDEX) << "Invocation guard needs the original index binding";
-      return assign->var_;
+
+std::vector<Family> DirectFamilies(const CompactSyncResult& analysis) {
+  PhysicalSyncRealization result_;
+  if (analysis.input.region_tree) {
+    result_.finite_minimum = false;  // Sufficient whole-span assignment, not a minimum-ID proof.
+    const auto owned = analysis.ExportScopedDemands();
+    CHECK(owned) << "Scoped endpoint export is unavailable";
+    for (const auto& schema : owned->families) {
+      const auto [sr, sv, ss] = schema.source;
+      const auto [tr, tv, ts] = schema.target;
+      __int128 count = 1;
+      for (const auto& axis : schema.axes) {
+        count *= axis.count;
+        CHECK(count <= std::numeric_limits<int64_t>::max()) << "Scoped physical record domain overflow";
+      }
+      result_.families.push_back({sr, ss, tr, ts, sv, tv, static_cast<int64_t>(count), {}, schema.axes});
+    }
+  } else {
+    const auto crossings = analysis.ExportCrossingDemands();
+    CHECK(crossings.has_value())
+        << "Minimum demands are retained; shared-repetition physical endpoint scope is unavailable";
+    for (size_t r = 0; r < analysis.segments.size(); ++r) {
+      const auto& segment = analysis.segments[r];
+      for (const auto& f : segment.demands) {
+        CHECK(f.distance >= 0 && f.source < segment.pipes.size() && f.target < segment.pipes.size())
+            << "Invalid physical demand family";
+        if (segment.count <= f.distance) continue;
+        result_.families.push_back({r, f.source, r, f.target, 0, f.distance, segment.count - f.distance, {}});
+      }
+    }
+    for (const auto& [source, target] : *crossings) {
+      auto [sr, sv, ss] = source;
+      auto [tr, tv, ts] = target;
+      CHECK(sr < analysis.segments.size() && tr < analysis.segments.size() && sr < tr)
+          << "Unavailable physical crossing frame";
+      CHECK(sv >= 0 && sv < analysis.segments[sr].count && tv >= 0 && tv < analysis.segments[tr].count &&
+            ss < analysis.segments[sr].pipes.size() && ts < analysis.segments[tr].pipes.size())
+          << "Invalid physical crossing occurrence";
+      result_.families.push_back({sr, ss, tr, ts, sv, tv, 1, {}});
     }
   }
-  return nullptr;
+  return std::move(result_.families);
+}
+DirectSyncOrder MathematicalOrder(const CompactSyncResult& analysis) {
+  return {[&](const Occurrence& a, const Occurrence& b) { return analysis.Precedes(a, true, b, false); },
+          [&](const Occurrence& a, const Occurrence& b) { return analysis.ReferenceBefore(a, b); },
+          [&](size_t r, size_t a, size_t b) { return analysis.segments[r].Threshold(a, true, b, false); },
+          [&](size_t i) { return analysis.ScopedConsecutiveReuse(i); },
+          [&](size_t i) { return analysis.ScopedAdjacentBarrier(i); },
+          true};
 }
 
 }  // namespace
+SyncNativeReservations SyncNativeClaims(const CompactSyncInput& input, const std::string& target) {
+  return NativeClaims(input, target);
+}
+std::vector<int> SyncEligibleIds(const CompactSyncInput& input, const std::string& target,
+                                 SyncDirection direction, const std::optional<std::vector<int>>& restricted,
+                                 const SyncNativeReservations& claimed) {
+  using pypto::sync::CoreScope;
+  using pypto::sync::ResourceKind;
+  const auto* catalog = pypto::sync::FindResourceCatalog(target);
+  CHECK(catalog) << "Unavailable synchronization resource catalog: " << target;
+  CHECK(input.hardware_target == target) << "Synchronization hardware contract differs from lowering target";
+  const auto core = input.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC;
+  auto spec = catalog->FindPool({ResourceKind::PipelineEvent, core, direction.first, direction.second});
+  CHECK(spec) << "Unavailable directional event pool";
+  auto legal = spec->legal_ids;
+  if (legal.empty()) {
+    legal.resize(spec->capacity);
+    std::iota(legal.begin(), legal.end(), 0);
+  }
+  std::set<int> available;
+  const auto owners = claimed.find(direction);
+  for (auto id : legal)
+    if (std::find(spec->reserved_ids.begin(), spec->reserved_ids.end(), id) == spec->reserved_ids.end() &&
+        (owners == claimed.end() || !owners->second.count(static_cast<int>(id))))
+      available.insert(static_cast<int>(id));
+  std::vector<int> result;
+  if (restricted) {
+    std::set<int> unique;
+    for (int id : *restricted) {
+      CHECK(id >= 0 && unique.insert(id).second) << "Invalid/duplicate eligible ID";
+      CHECK(id < static_cast<int>(spec->capacity) && std::find(legal.begin(), legal.end(), id) != legal.end())
+          << "Requested ID is outside the legal target pool";
+      if (available.count(id)) result.push_back(id);
+    }
+  } else {
+    result.assign(available.begin(), available.end());
+  }
+  return result;
+}
+std::vector<int> ColorOrderedSyncLanes(size_t count, SyncDirection direction,
+                                       const std::function<bool(size_t, size_t)>& wait_before,
+                                       const std::function<bool(size_t, size_t)>& reusable,
+                                       const std::vector<int>& eligible, bool finite_minimum) {
+  std::vector<size_t> waits(count), release(count);
+  std::iota(waits.begin(), waits.end(), 0);
+  std::sort(waits.begin(), waits.end(), wait_before);
+  size_t next = 0;
+  for (auto i : waits) {
+    while (next < count && !reusable(i, next)) ++next;
+    release[i] = next;
+    INTERNAL_CHECK(next > i) << "Internal error: cyclic physical lane span";
+  }
+  std::vector<std::vector<int>> buckets(count + 1);
+  std::vector<int> free, result(count);
+  size_t colors = 0;
+  for (size_t i = 0; i < count; ++i) {
+    free.insert(free.end(), buckets[i].begin(), buckets[i].end());
+    if (free.empty()) {
+      CHECK(colors < eligible.size())
+          << (finite_minimum ? "Fixed-plan scarcity" : "Allocation unproved by whole-span reservation")
+          << ": direction=" << PipeTypeToString(direction.first) << "->" << PipeTypeToString(direction.second)
+          << " overlap_at_publication=" << i << " required_at_least=" << colors + 1
+          << " eligible=" << eligible.size();
+      free.push_back(eligible[colors++]);
+    }
+    const int id = free.back();
+    free.pop_back();
+    result[i] = id;
+    buckets[release[i]].push_back(id);
+  }
+  return result;
+}
+PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input, std::vector<Family> families,
+                                           const DirectSyncOrder& order, const std::string& target,
+                                           const std::optional<std::vector<int>>& restricted) {
+  return Allocator(input, std::move(families), order, target, restricted).Run();
+}
+PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input, std::vector<Family> families,
+                                          const DirectSyncOrder& order, const std::string& target,
+                                          const std::optional<std::vector<int>>& restricted) {
+  auto result = AllocateDirectSync(input, std::move(families), order, target, restricted);
+  result.function = Emitter(input, result).VisitFunction(input.owner);
+  return result;
+}
 PhysicalSyncRealization RealizePhysicalSync(const CompactSyncResult& analysis, const std::string& target,
                                             const std::optional<std::vector<int>>& eligible_ids) {
-  auto result = Allocator(analysis, target, eligible_ids).Run();
-  Emitter emitter(analysis, result);
-  result.function = emitter.VisitFunction(analysis.input.owner);
-  return result;
+  return RealizeDirectSync(analysis.input, DirectFamilies(analysis), MathematicalOrder(analysis), target,
+                           eligible_ids);
+}
+FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterBounds& parameters,
+                                  std::pair<int64_t, int64_t> blocks,
+                                  const std::vector<AssignedSyncCase>& cases) {
+  CHECK(owner && !cases.empty()) << "Missing complete invocation case owner";
+  const auto block = cases.size() > 1 ? DominatingSyncBlock(owner) : nullptr;
+  CutInventory cuts;
+  auto next = blocks.first;
+  for (const auto& item : cases) {
+    CHECK(item.input && item.plan && item.input->owner == owner &&
+          item.input->parameter_bounds == parameters && item.input->block_bounds &&
+          item.input->block_bounds->first == next && item.input->block_bounds->second >= next &&
+          item.input->block_bounds->second < std::numeric_limits<int64_t>::max())
+        << "Invocation cases must retain exhaustive original owners and contracts";
+    next = item.input->block_bounds->second + 1;
+    const auto guard = SyncInvocationGuard(block, blocks, *item.input->block_bounds, owner->span_);
+    Emitter(*item.input, *item.plan).AppendCuts(cuts, guard);
+  }
+  CHECK(next == blocks.second + 1) << "Incomplete invocation activation domain";
+  // Exclusive cases share palettes only within this original invocation.
+  // Guarded cuts contain endpoint/ID arithmetic as well as SET/WAIT commands.
+  return InvocationEmitter(cuts).VisitFunction(owner);
 }
 PhysicalSyncInvocation RealizePhysicalInvocation(const SyncInvocationAnalysis& analysis,
                                                  const std::string& target,
                                                  const std::optional<std::vector<int>>& eligible_ids) {
-  CHECK(analysis.owner && !analysis.cases.empty()) << "Missing complete invocation case owner";
-  const auto block = analysis.cases.size() > 1 ? DominatingBlock(analysis.owner) : nullptr;
-  CHECK(analysis.cases.size() == 1 || block) << "Original dominating invocation block binding is unavailable";
+  // Qualify executable case selection before spending work on allocation.
+  CHECK(analysis.cases.size() <= 1 || DominatingSyncBlock(analysis.owner))
+      << "Original dominating invocation block binding is unavailable";
   PhysicalSyncInvocation result{analysis, nullptr, {}};
-  auto next = analysis.block_bounds.first;
+  result.cases.reserve(analysis.cases.size());
+  std::vector<AssignedSyncCase> cases;
   for (const auto& item : analysis.cases) {
-    CHECK(item.mathematics && item.block_first == next && item.block_last >= item.block_first &&
-          item.block_last < std::numeric_limits<int64_t>::max() &&
-          item.mathematics->input.owner == analysis.owner &&
-          item.mathematics->input.parameter_bounds == analysis.parameter_bounds &&
+    CHECK(item.mathematics &&
           item.mathematics->input.block_bounds == std::make_pair(item.block_first, item.block_last))
-        << "Invocation cases must retain exhaustive original owners and contracts";
-    next = item.block_last + 1;
-    result.cases.push_back(Allocator(*item.mathematics, target, eligible_ids).Run());
+        << "Missing original invocation analysis";
+    result.cases.push_back(AllocateDirectSync(item.mathematics->input, DirectFamilies(*item.mathematics),
+                                              MathematicalOrder(*item.mathematics), target, eligible_ids));
+    cases.push_back({&item.mathematics->input, &result.cases.back()});
   }
-  CHECK(next == analysis.block_bounds.second + 1) << "Incomplete invocation activation domain";
-  CutInventory cuts;
-  for (size_t i = 0; i < analysis.cases.size(); ++i) {
-    const auto& item = analysis.cases[i];
-    ExprPtr guard;
-    const auto span = analysis.owner->span_;
-    if (item.block_first > analysis.block_bounds.first)
-      guard = std::make_shared<Ge>(block, std::make_shared<ConstInt>(item.block_first, DataType::INDEX, span),
-                                   DataType::BOOL, span);
-    if (item.block_last < analysis.block_bounds.second) {
-      ExprPtr upper =
-          std::make_shared<Lt>(block, std::make_shared<ConstInt>(item.block_last + 1, DataType::INDEX, span),
-                               DataType::BOOL, span);
-      guard = guard ? std::make_shared<And>(guard, upper, DataType::BOOL, span) : upper;
-    }
-    Emitter(*item.mathematics, result.cases[i]).AppendCuts(cuts, guard);
-  }
-  // No source mutation or payload cloning was needed to qualify the cases.
-  // Exclusive cases can share palettes within this invocation only. Fresh entry
-  // and closed notifications at exit remain the existing native contract.
-  result.function = InvocationEmitter(cuts).VisitFunction(analysis.owner);
+  result.function =
+      EmitAssignedSyncCases(analysis.owner, analysis.parameter_bounds, analysis.block_bounds, cases);
   return result;
 }
 
-}  // namespace pypto::ir::sync
-
-namespace pypto::ir::pass {
-namespace {
 FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::string& reason) {
   auto attrs = function->attrs_;
   attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
@@ -691,76 +764,4 @@ FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::stri
                                     function->func_type_, function->level_, function->role_, attrs,
                                     function->requires_runtime_binding_, function->ir_stage_);
 }
-}  // namespace
-Pass RealizeSync() {
-  auto transform = [](const FunctionPtr& function, const sync::SyncParameterBounds& bounds,
-                      const std::optional<std::pair<int64_t, int64_t>>& block_bounds) -> FunctionPtr {
-    if (!IsInCoreType(function->func_type_)) return function;
-    // These functions do not enter PTO code generation; their external owner
-    // remains responsible for synchronization. Do not claim PTOAS delegation.
-    if (function->requires_runtime_binding_ || function->HasAttr(kAttrExternalSource) ||
-        function->HasAttr(kAttrBuiltinTemplateDir))
-      return function;
-    auto* ctx = PassContext::Current();
-    CHECK(ctx && ctx->GetEnablePyptoAutoSync()) << "RealizeSync requires enable_pypto_autosync=True";
-    CHECK(!function->GetAttr<bool>(kAttrPyptoAutosync))
-        << "RealizeSync cannot reprocess an owned physical plan";
-    if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV)
-      return SyncOutcome(function, false, "PyPTO synchronization supports only AIC/AIV leaves");
-    if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS)
-      return SyncOutcome(function, false, "PyPTO synchronization requires physically placed Buffer IR");
-    if (!ctx->GetAutoSyncDisjointGM())
-      return SyncOutcome(function, false, "Disjoint GM argument contract was not supplied");
-    auto target = ctx->GetBackendHandler()->GetPtoTargetArch();
-    if (target != "a2a3")
-      return SyncOutcome(function, false, "PyPTO physical synchronization supports only manual a2a3 macros");
-    // Only publish after complete analysis AND realization. A qualification or
-    // resource refusal returns the original body, never partially emitted IR.
-    // Internal errors are deliberately not caught. The strict retained-result
-    // APIs still throw on these user-facing input/proof refusals.
-    try {
-      FunctionPtr emitted;
-      size_t set_sites = 0, wait_sites = 0;
-      if (block_bounds) {
-        // The complete invocation owner qualifies all activation cases before
-        // any command cuts are published. Do not pick one sampled worker.
-        auto analysis = sync::AnalyzeSyncInvocation(function, true, target, bounds, *block_bounds);
-        auto physical = sync::RealizePhysicalInvocation(analysis, target, std::nullopt);
-        emitted = physical.function;
-        for (const auto& item : physical.cases) {
-          set_sites += item.set_sites;
-          wait_sites += item.wait_sites;
-        }
-      } else {
-        auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true, target, bounds));
-        auto physical = sync::RealizePhysicalSync(analysis, target, std::nullopt);
-        emitted = physical.function;
-        set_sites = physical.set_sites;
-        wait_sites = physical.wait_sites;
-      }
-      // PTOAS recognizes literal flags, not empty plans or barriers, as manual
-      // ownership. Do not fabricate a dummy flag or mix partial ownership.
-      if (!set_sites || !wait_sites)
-        return SyncOutcome(function, false, "Candidate has no SET/WAIT marker; delegate the original kernel");
-      return SyncOutcome(emitted, true, "");
-    } catch (const pypto::ValueError& error) {
-      return SyncOutcome(function, false, error.what());
-    }
-  };
-  // Range evidence belongs to this closed program's call sites, not mutable
-  // function metadata. Do not infer bounds when the standalone API has none.
-  return CreateProgramPass(
-      [transform](const ProgramPtr& program) {
-        auto evidence = sync::CollectSyncInvocationEvidence(program);
-        auto functions = program->functions_;
-        for (auto& [global, function] : functions) {
-          auto block = evidence.block_indices.find(global->name_);
-          function = transform(
-              function, evidence.parameters[global->name_],
-              block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second));
-        }
-        return std::make_shared<Program>(functions, program->name_, program->span_);
-      },
-      "RealizeSync", PassProperties{});
-}
-}  // namespace pypto::ir::pass
+}  // namespace pypto::ir::sync

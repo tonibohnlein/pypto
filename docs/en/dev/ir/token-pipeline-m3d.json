@@ -1,0 +1,255 @@
+{
+  "revision": "121e15506c4ee2caa49ef980a2a1723abb7d2d29",
+  "source_sha256": {
+    "src/ir/transforms/utils/scoped_token_order.cpp": "4e4462224e67d2bbc41edf052ae64424d5d74c28f6a2d7e18a70f8dfdfd57632",
+    "src/ir/transforms/utils/scoped_token_order.h": "5f5062383d3f443248e47bfac600b369b35cb19fc084cb24104c878da6c0fc57",
+    "src/ir/transforms/utils/scoped_token_families.cpp": "622a52e2436c17842004d5e67e9d0e9bf863f59b88e1b2ee9c98fdb7543d1bb5",
+    "src/ir/transforms/utils/structured_token_sync.cpp": "1e102304f31266ef08bb2b4819836d86074699ba07e69e12c14d7e573508bce7",
+    "tests/ut/ir/transforms/test_scoped_token_order.py": "c2c21a73ac799676ec8d3edfe8aa7bef1daa40f49ed6d2f30af87f54328ee463",
+    "tests/ut/ir/transforms/qualify_scoped_token_order.py": "8a85b0d1052023c7be07c96366976e11e530d667b6f8b5f24bb585c08fb9f0f9",
+    "tests/ut/ir/transforms/test_collective_sync_realization.py": "2bbae8aa44be6c0c9f32436e97073af2af60073127b2b6888511e468077eb96f"
+  },
+  "extension_sha256": "594177f4e3cdadb6bd5b91f3c9bc477699e2c0be26faf19bd84953e7476c61e1",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "alias_contract": "disjoint distinct GM roots",
+  "target": "a2a3",
+  "command": [
+    "/usr/bin/python3",
+    "-m",
+    "tests.ut.ir.transforms.qualify_scoped_token_order",
+    "--output",
+    "build-py314/token-m3d-qualification.json"
+  ],
+  "cases": [
+    {
+      "rows": 3,
+      "counts": [
+        3,
+        3
+      ],
+      "input_sha256": "bb1b8f1692fb01197d967a2d1f3f6d157999523815e097c7de94df0594d0dc97",
+      "logical_sha256": "eb92b2fcf5217565dfec3310f5962c1a3828d2d9cd7f8f35c6f68c914ec9a203",
+      "timings_seconds": {
+        "production_insert": 0.0006697583012282848,
+        "diagnostic_import_parse_order": 0.0003415001556277275,
+        "diagnostic_allocation_emission": 0.00015495996922254562,
+        "production_lower_inclusive": 0.00045363884419202805
+      },
+      "timing_scope": "single descriptive runs; do not sum overlapping columns or infer speedup",
+      "distinct_nonempty_summary_nodes": 9,
+      "distinct_row_entries": 1400,
+      "families": 3,
+      "axes": 5,
+      "pto_set_sites": 3,
+      "pto_wait_sites": 3,
+      "pto_arithmetic_sites": 24,
+      "physical": "shared default six-ID catalog; accepted",
+      "independent_semantics": "all event queries, proof inclusion, reuse, emitted matching/order",
+      "device": "not run"
+    },
+    {
+      "rows": 1023,
+      "counts": [
+        3,
+        3
+      ],
+      "input_sha256": "f7dbf237edf5b23d8755316967706996cd4558a4abf438427fa4546480258179",
+      "logical_sha256": "84b501b7451a7d3bc8c84535d6e15cc07ac41b130d111084ce03f8c1797a3838",
+      "timings_seconds": {
+        "production_insert": 0.00047028716653585434,
+        "diagnostic_import_parse_order": 0.0004060491919517517,
+        "diagnostic_allocation_emission": 6.634881719946861e-05,
+        "production_lower_inclusive": 0.0005315039306879044
+      },
+      "timing_scope": "single descriptive runs; do not sum overlapping columns or infer speedup",
+      "distinct_nonempty_summary_nodes": 25,
+      "distinct_row_entries": 3192,
+      "families": 3,
+      "axes": 5,
+      "pto_set_sites": 3,
+      "pto_wait_sites": 3,
+      "pto_arithmetic_sites": 26,
+      "physical": "shared default six-ID catalog; accepted",
+      "independent_semantics": "large representation-size check; not unfolded",
+      "device": "not run"
+    },
+    {
+      "rows": 1048575,
+      "counts": [
+        3,
+        3
+      ],
+      "input_sha256": "f986b701fa49841749d0b10142a480780d71bfd29ce7a47ea947eaa4a91f2d9c",
+      "logical_sha256": "85330d38e69a28b0b7fdc866de3d61a070f5467bd5e5f93be079463bfe78ddc9",
+      "timings_seconds": {
+        "production_insert": 0.00041297124698758125,
+        "diagnostic_import_parse_order": 0.0004727337509393692,
+        "diagnostic_allocation_emission": 7.031997665762901e-05,
+        "production_lower_inclusive": 0.0006109699606895447
+      },
+      "timing_scope": "single descriptive runs; do not sum overlapping columns or infer speedup",
+      "distinct_nonempty_summary_nodes": 45,
+      "distinct_row_entries": 5432,
+      "families": 3,
+      "axes": 5,
+      "pto_set_sites": 3,
+      "pto_wait_sites": 3,
+      "pto_arithmetic_sites": 26,
+      "physical": "shared default six-ID catalog; accepted",
+      "independent_semantics": "large representation-size check; not unfolded",
+      "device": "not run"
+    },
+    {
+      "rows": 3,
+      "counts": [
+        1023,
+        3
+      ],
+      "input_sha256": "5bb3079c692cd8bfda8e24835bb1589864fcc42de26a4d2bd04f29137b79938b",
+      "logical_sha256": "c5598c11e366662b54e6f4f27cb4a1172d2b06282ffd5054650b505bfb38da0f",
+      "timings_seconds": {
+        "production_insert": 0.000595953781157732,
+        "diagnostic_import_parse_order": 0.00044631632044911385,
+        "diagnostic_allocation_emission": 4.314817488193512e-05,
+        "production_lower_inclusive": 0.0005432930774986744
+      },
+      "timing_scope": "single descriptive runs; do not sum overlapping columns or infer speedup",
+      "distinct_nonempty_summary_nodes": 25,
+      "distinct_row_entries": 4984,
+      "families": 3,
+      "axes": 5,
+      "pto_set_sites": 3,
+      "pto_wait_sites": 3,
+      "pto_arithmetic_sites": 26,
+      "physical": "shared default six-ID catalog; accepted",
+      "independent_semantics": "large representation-size check; not unfolded",
+      "device": "not run"
+    },
+    {
+      "rows": 3,
+      "counts": [
+        1048575,
+        3
+      ],
+      "input_sha256": "cf9095882bdbc36b0f37d59a003f8a2058f5ec680540dad3872f5549834c5704",
+      "logical_sha256": "36c6aadc2501265af4a65756876f1d4ab302430a2774240d43676c9a236aabaf",
+      "timings_seconds": {
+        "production_insert": 0.0007630619220435619,
+        "diagnostic_import_parse_order": 0.0005850070156157017,
+        "diagnostic_allocation_emission": 4.1476916521787643e-05,
+        "production_lower_inclusive": 0.0006842692382633686
+      },
+      "timing_scope": "single descriptive runs; do not sum overlapping columns or infer speedup",
+      "distinct_nonempty_summary_nodes": 45,
+      "distinct_row_entries": 9464,
+      "families": 3,
+      "axes": 5,
+      "pto_set_sites": 3,
+      "pto_wait_sites": 3,
+      "pto_arithmetic_sites": 26,
+      "physical": "shared default six-ID catalog; accepted",
+      "independent_semantics": "large representation-size check; not unfolded",
+      "device": "not run"
+    },
+    {
+      "rows": 3,
+      "counts": [
+        3,
+        1048575
+      ],
+      "input_sha256": "95b5d2ee9bad0850ef80d73c4ea34b8d70f430ccc5f0ea631b0f17ca01da9aae",
+      "logical_sha256": "2ad73506c9f6b7c22af61bee0506472ede6c41858dba2d959d58fe099494cb5a",
+      "timings_seconds": {
+        "production_insert": 0.000817387830466032,
+        "diagnostic_import_parse_order": 0.000575243029743433,
+        "diagnostic_allocation_emission": 5.810009315609932e-05,
+        "production_lower_inclusive": 0.0006987801752984524
+      },
+      "timing_scope": "single descriptive runs; do not sum overlapping columns or infer speedup",
+      "distinct_nonempty_summary_nodes": 45,
+      "distinct_row_entries": 9464,
+      "families": 3,
+      "axes": 5,
+      "pto_set_sites": 3,
+      "pto_wait_sites": 3,
+      "pto_arithmetic_sites": 25,
+      "physical": "shared default six-ID catalog; accepted",
+      "independent_semantics": "large representation-size check; not unfolded",
+      "device": "not run"
+    }
+  ],
+  "scope": "Qualified standalone nested token lowering; default production orchestration unchanged",
+  "reviews": {
+    "architecture": "accepted for constant original-region tree subset",
+    "correctness": "accepted for constant original-region tree subset",
+    "algorithm": "accepted for constant original-region tree subset"
+  },
+  "focused_gate": {
+    "passed": 36,
+    "seconds": 0.86,
+    "includes": "two serialized public-token-to-C++ cases; actual token order and flag reuse independently checked"
+  },
+  "plan_status": {
+    "M1": "accepted and committed",
+    "M2": "accepted and committed",
+    "M3": "constant scoped insertion and lowering accepted; caller/block evidence and full Qwen token migration pending",
+    "M4": "pending",
+    "M5": "pending"
+  },
+  "broad_gate": {
+    "passed": 1227,
+    "warnings": 28,
+    "seconds": 396.37,
+    "command": [
+      "/usr/bin/python3",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/ut/ir/transforms/test_scoped_token_order.py",
+      "tests/ut/ir/transforms/test_scoped_token_families.py",
+      "tests/ut/ir/transforms/test_scoped_logical_sync.py",
+      "tests/ut/ir/transforms/test_crossing_token_sync.py",
+      "tests/ut/ir/transforms/test_regional_slot_composition.py",
+      "tests/ut/ir/transforms/test_streamed_slot_composition.py",
+      "tests/ut/ir/transforms/test_rotating_token_sync.py",
+      "tests/ut/ir/transforms/test_autosync_switch.py",
+      "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+      "tests/ut/ir/transforms/test_collective_sync_interface.py",
+      "tests/ut/ir/transforms/test_collective_sync_realization.py",
+      "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+      "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+      "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+      "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+      "tests/ut/ir/transforms/test_logical_sync_realization.py",
+      "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+      "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+      "tests/ut/ir/transforms/test_parameterized_sync.py",
+      "tests/ut/ir/transforms/test_physical_sync_realization.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+      "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+      "tests/ut/ir/transforms/test_row_sync_analysis.py",
+      "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+      "tests/ut/ir/transforms/test_slot_sync_import.py",
+      "tests/ut/ir/transforms/test_sync_range_proofs.py",
+      "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+      "tests/ut/ir/transforms/test_verify_hard_syncall_occupancy.py",
+      "tests/ut/ir/transforms/test_token_sync_lowering.py",
+      "tests/ut/ir/transforms/test_structured_token_sync.py",
+      "--basetemp=build-py314/pytest-token-m3d-gate",
+      "--junitxml=build-py314/token-m3d-gate.xml",
+      "--tb=short"
+    ],
+    "log_sha256": "fa1e006991f2e89dd38b3c782a8abfcaf592c32e7f92e0bf87ee0eeb392765d2"
+  },
+  "final_gate": {
+    "passed": 229,
+    "seconds": 10.07,
+    "log_sha256": "355adfbb555138337e8733400c9c3cca74ffe43e597ff85aa3e0e049b2f7a8ee"
+  },
+  "hooks": {
+    "result": "all applicable hooks passed",
+    "pyright_environment": "Python 3.11; repository-configured torch version unavailable on host Python 3.14",
+    "log_sha256": "2b62d659dd4b75ba968b9871dceecb9d7cde89615ba4d73151fbf6ad8eb47bee"
+  }
+}

@@ -114,9 +114,17 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/rotating_sync_analysis.cpp
     src/ir/transforms/utils/numerical_sync_hierarchy.cpp
     src/ir/transforms/utils/numerical_sync_merge.cpp
+    src/ir/transforms/utils/numerical_sync_order.cpp
     src/ir/transforms/utils/placed_sync_import.cpp
     src/ir/transforms/utils/invocation_sync_analysis.cpp
+    src/ir/transforms/token_sync.cpp
+    src/ir/transforms/utils/structured_token_sync.cpp
+    src/ir/transforms/utils/sync_boundary_graph.cpp
+    src/ir/transforms/utils/token_sync_lowering.cpp
     src/ir/transforms/utils/logical_sync_realization.cpp
+    src/ir/transforms/utils/scoped_logical_sync.cpp
+    src/ir/transforms/utils/scoped_token_families.cpp
+    src/ir/transforms/utils/scoped_token_order.cpp
     src/ir/transforms/utils/physical_sync_realization.cpp
     src/ir/transforms/utils/hardware_loop_analysis.cpp
     src/ir/builder.cpp

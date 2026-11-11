@@ -1,0 +1,422 @@
+{
+  "revision": "572d6e61bd74e3d02e524b15b7965257c4de9303",
+  "dirty_source_sha256": {
+    "src/ir/transforms/utils/logical_sync_realization.cpp": "43494944387621ea71fdba86aeda23709d2c14ca2e4ab232c12abc5b1ed3a8bb",
+    "src/ir/transforms/utils/structured_token_sync.cpp": "e179c1ca12096969867225572504530eade954526fdd43c6641cfe5949c4a908",
+    "src/ir/transforms/utils/sync_boundary_graph.cpp": "0e5c2f416474f5660869f4a0ee090b3051f45a5076ea7d9c4b19a6b176a3d9f8",
+    "src/ir/transforms/utils/sync_boundary_graph.h": "7bd629708a032f952473051a65eb29b4c5683225f29f73e6dec2ce347af26e52",
+    "tests/ut/ir/transforms/qualify_token_pipeline.py": "f91d610fe6cdb895e394fe231509e9993a4b3106da57e9519e943419bf5945be",
+    "tests/ut/ir/transforms/test_crossing_token_sync.py": "cf9282072349db0d5783800f76a4b6418a9506c8978ca41446c4743b9cd59ec3",
+    "tests/ut/ir/transforms/test_token_sync_lowering.py": "02ea175a7058506bea291d536b8c783a02d44ef284e30c79f263168abb303a13"
+  },
+  "tracked_diff_sha256": "fb313a6ecbcb0ec438955ce385157783e1a28f7d2d351d127f4a03e328ff2089",
+  "extension_sha256": "ee8b017059cdb32bd7c9514ee84bc2e5fbc1eeb9cf0f75505144a89e74ba61f0",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "scope": "rotating occurrence captures vs unchanged production; three slots, two regions",
+  "timing": "three interleaved pairs; access recovery is included, no speedup claim",
+  "alias_contract": "disjoint distinct GM roots",
+  "target": "a2a3",
+  "device": "not run",
+  "cases": [
+    {
+      "name": "crossing_k6",
+      "input_sha256": "88052bd90e555e036c2a76e961e0b0b7726b372ebb5fe154906e83da0744ab9c",
+      "pairs": [
+        {
+          "direct": {
+            "production_seconds": 0.0008307150565087795,
+            "total_seconds": 0.0008307150565087795
+          },
+          "tokens": {
+            "insert_seconds": 0.0007304418832063675,
+            "optimize_seconds": 8.399086073040962e-05,
+            "lower_seconds": 0.0006973152048885822,
+            "total_seconds": 0.0015117479488253593
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.0007014242000877857,
+            "optimize_seconds": 7.76839442551136e-05,
+            "lower_seconds": 0.0007375846616923809,
+            "total_seconds": 0.0015166928060352802
+          },
+          "direct": {
+            "production_seconds": 0.0006197961047291756,
+            "total_seconds": 0.0006197961047291756
+          }
+        },
+        {
+          "direct": {
+            "production_seconds": 0.0005860477685928345,
+            "total_seconds": 0.0005860477685928345
+          },
+          "tokens": {
+            "insert_seconds": 0.0006692479364573956,
+            "optimize_seconds": 7.651280611753464e-05,
+            "lower_seconds": 0.0006820103153586388,
+            "total_seconds": 0.001427771057933569
+          }
+        }
+      ],
+      "executed_commands": {
+        "set": 19,
+        "wait": 19,
+        "barrier": 0
+      },
+      "directional_ids": {
+        "MTE2->V": [
+          0,
+          1,
+          2
+        ],
+        "V->MTE2": [
+          0,
+          1,
+          2
+        ]
+      },
+      "median_paired_total_ratio": 2.436270786188309,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 14,
+          "wait": 14,
+          "arithmetic": 111
+        },
+        {
+          "set": 14,
+          "wait": 14,
+          "arithmetic": 111
+        }
+      ],
+      "semantic": "equal token/flag payload relations, access coverage, matching, causal reuse, width",
+      "token_inventory": {
+        "carried_facts": 8,
+        "capture_sites": 2,
+        "record_sites": 4,
+        "wait_sites": 7
+      },
+      "token_text_bytes": 4642,
+      "physical_pto_bytes": [
+        11499,
+        11499
+      ]
+    },
+    {
+      "name": "crossing_k9",
+      "input_sha256": "011d5d0bea2f4f845c121d2af68a7bb0b28d944d0c6caca0b63bbd289cb0cc5b",
+      "pairs": [
+        {
+          "direct": {
+            "production_seconds": 0.0006301696412265301,
+            "total_seconds": 0.0006301696412265301
+          },
+          "tokens": {
+            "insert_seconds": 0.0006648199632763863,
+            "optimize_seconds": 8.330168202519417e-05,
+            "lower_seconds": 0.0007406929507851601,
+            "total_seconds": 0.0014888145960867405
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.0007304390892386436,
+            "optimize_seconds": 8.23349691927433e-05,
+            "lower_seconds": 0.00068705715239048,
+            "total_seconds": 0.001499831210821867
+          },
+          "direct": {
+            "production_seconds": 0.0006755199283361435,
+            "total_seconds": 0.0006755199283361435
+          }
+        },
+        {
+          "direct": {
+            "production_seconds": 0.0005791778676211834,
+            "total_seconds": 0.0005791778676211834
+          },
+          "tokens": {
+            "insert_seconds": 0.0006967317312955856,
+            "optimize_seconds": 7.538730278611183e-05,
+            "lower_seconds": 0.0007091970182955265,
+            "total_seconds": 0.001481316052377224
+          }
+        }
+      ],
+      "executed_commands": {
+        "set": 25,
+        "wait": 25,
+        "barrier": 0
+      },
+      "directional_ids": {
+        "MTE2->V": [
+          0,
+          1,
+          2
+        ],
+        "V->MTE2": [
+          0,
+          1,
+          2
+        ]
+      },
+      "median_paired_total_ratio": 2.3625616003795225,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 14,
+          "wait": 14,
+          "arithmetic": 113
+        },
+        {
+          "set": 14,
+          "wait": 14,
+          "arithmetic": 113
+        }
+      ],
+      "semantic": "equal token/flag payload relations, access coverage, matching, causal reuse, width",
+      "token_inventory": {
+        "carried_facts": 8,
+        "capture_sites": 2,
+        "record_sites": 4,
+        "wait_sites": 7
+      },
+      "token_text_bytes": 4642,
+      "physical_pto_bytes": [
+        11577,
+        11577
+      ]
+    },
+    {
+      "name": "crossing_k1023",
+      "input_sha256": "e5b90071e8378e4fe809f1f6089345f64f69b846b4e035c847bb9dafc69044b1",
+      "pairs": [
+        {
+          "direct": {
+            "production_seconds": 0.000677797943353653,
+            "total_seconds": 0.000677797943353653
+          },
+          "tokens": {
+            "insert_seconds": 0.0007010628469288349,
+            "optimize_seconds": 7.739802822470665e-05,
+            "lower_seconds": 0.0006749378517270088,
+            "total_seconds": 0.0014533987268805504
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.0006958399899303913,
+            "optimize_seconds": 8.25156457722187e-05,
+            "lower_seconds": 0.0006929719820618629,
+            "total_seconds": 0.001471327617764473
+          },
+          "direct": {
+            "production_seconds": 0.0005666487850248814,
+            "total_seconds": 0.0005666487850248814
+          }
+        },
+        {
+          "direct": {
+            "production_seconds": 0.0005688737146556377,
+            "total_seconds": 0.0005688737146556377
+          },
+          "tokens": {
+            "insert_seconds": 0.0006584320217370987,
+            "optimize_seconds": 7.840897887945175e-05,
+            "lower_seconds": 0.0006666248664259911,
+            "total_seconds": 0.0014034658670425415
+          }
+        }
+      ],
+      "median_paired_total_ratio": 2.4670956503801835,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 14,
+          "wait": 14,
+          "arithmetic": 113
+        },
+        {
+          "set": 14,
+          "wait": 14,
+          "arithmetic": 113
+        }
+      ],
+      "semantic": "size/timing only; bounded variants checked independently",
+      "token_inventory": {
+        "carried_facts": 8,
+        "capture_sites": 2,
+        "record_sites": 4,
+        "wait_sites": 7
+      },
+      "token_text_bytes": 4651,
+      "physical_pto_bytes": [
+        11622,
+        11622
+      ]
+    },
+    {
+      "name": "crossing_k999999",
+      "input_sha256": "bc9d76432dce9d563135837b9248c16cdba3fc370e5f3a377907d4ff523b9ee1",
+      "pairs": [
+        {
+          "direct": {
+            "production_seconds": 0.0006017750129103661,
+            "total_seconds": 0.0006017750129103661
+          },
+          "tokens": {
+            "insert_seconds": 0.0006719501689076424,
+            "optimize_seconds": 7.556378841400146e-05,
+            "lower_seconds": 0.0006617922335863113,
+            "total_seconds": 0.0014093061909079552
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.0006563318893313408,
+            "optimize_seconds": 7.43987038731575e-05,
+            "lower_seconds": 0.0006865151226520538,
+            "total_seconds": 0.0014172457158565521
+          },
+          "direct": {
+            "production_seconds": 0.0005575660616159439,
+            "total_seconds": 0.0005575660616159439
+          }
+        },
+        {
+          "direct": {
+            "production_seconds": 0.0005610063672065735,
+            "total_seconds": 0.0005610063672065735
+          },
+          "tokens": {
+            "insert_seconds": 0.0006695780903100967,
+            "optimize_seconds": 7.801922038197517e-05,
+            "lower_seconds": 0.000661142636090517,
+            "total_seconds": 0.001408739946782589
+          }
+        }
+      ],
+      "median_paired_total_ratio": 2.511094399511269,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 14,
+          "wait": 14,
+          "arithmetic": 113
+        },
+        {
+          "set": 14,
+          "wait": 14,
+          "arithmetic": 113
+        }
+      ],
+      "semantic": "size/timing only; bounded variants checked independently",
+      "token_inventory": {
+        "carried_facts": 8,
+        "capture_sites": 2,
+        "record_sites": 4,
+        "wait_sites": 7
+      },
+      "token_text_bytes": 4657,
+      "physical_pto_bytes": [
+        11652,
+        11652
+      ]
+    }
+  ],
+  "milestone": "M2 finite numerical crossing token transport; nested M3 and production migration pending",
+  "reviews": {
+    "architecture": "ACCEPT final source/tests/docs; all final release checks passed",
+    "correctness": "ACCEPT final source/tests/docs; all final release checks passed",
+    "algorithm_performance": "ACCEPT final source/tests/docs; all final release checks passed"
+  },
+  "final_source_sha256": {
+    "src/ir/transforms/utils/logical_sync_realization.cpp": "43494944387621ea71fdba86aeda23709d2c14ca2e4ab232c12abc5b1ed3a8bb",
+    "src/ir/transforms/utils/structured_token_sync.cpp": "e179c1ca12096969867225572504530eade954526fdd43c6641cfe5949c4a908",
+    "src/ir/transforms/utils/sync_boundary_graph.cpp": "0e5c2f416474f5660869f4a0ee090b3051f45a5076ea7d9c4b19a6b176a3d9f8",
+    "src/ir/transforms/utils/sync_boundary_graph.h": "7bd629708a032f952473051a65eb29b4c5683225f29f73e6dec2ce347af26e52",
+    "tests/ut/ir/transforms/qualify_token_pipeline.py": "f91d610fe6cdb895e394fe231509e9993a4b3106da57e9519e943419bf5945be",
+    "tests/ut/ir/transforms/test_crossing_token_sync.py": "cf9282072349db0d5783800f76a4b6418a9506c8978ca41446c4743b9cd59ec3",
+    "tests/ut/ir/transforms/test_token_sync_lowering.py": "02ea175a7058506bea291d536b8c783a02d44ef284e30c79f263168abb303a13"
+  },
+  "final_extension_sha256": "ee8b017059cdb32bd7c9514ee84bc2e5fbc1eeb9cf0f75505144a89e74ba61f0",
+  "validation": {
+    "focused": {
+      "passed": 121,
+      "seconds": 8.59,
+      "command": [
+        "/usr/bin/python3",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py",
+        "tests/ut/ir/transforms/test_structured_token_sync.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "--basetemp=build-py314/pytest-token-m2b-final",
+        "--junitxml=build-py314/token-m2b-final.xml"
+      ],
+      "log": "build-py314/token-m2b-final.log"
+    },
+    "broad": {
+      "passed": 1117,
+      "warnings": 28,
+      "seconds": 429.04,
+      "command": [
+        "/usr/bin/python3",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py",
+        "tests/ut/ir/transforms/test_regional_slot_composition.py",
+        "tests/ut/ir/transforms/test_streamed_slot_composition.py",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py",
+        "tests/ut/ir/transforms/test_autosync_switch.py",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+        "tests/ut/ir/transforms/test_collective_sync_interface.py",
+        "tests/ut/ir/transforms/test_collective_sync_realization.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+        "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+        "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+        "tests/ut/ir/transforms/test_logical_sync_realization.py",
+        "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+        "tests/ut/ir/transforms/test_parameterized_sync.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+        "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+        "tests/ut/ir/transforms/test_row_sync_analysis.py",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+        "tests/ut/ir/transforms/test_slot_sync_import.py",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/ir/transforms/test_verify_hard_syncall_occupancy.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "tests/ut/ir/transforms/test_structured_token_sync.py",
+        "--basetemp=build-py314/pytest-token-m2b-gate",
+        "--junitxml=build-py314/token-m2b-gate.xml",
+        "--tb=short"
+      ],
+      "log": "build-py314/token-m2b-gate.log",
+      "scope": "Before final formatting and two additional shortened-target parameters; final rebuilt focused gate includes both."
+    },
+    "hooks": {
+      "status": "passed",
+      "log": "build-py314/token-m2b-hooks-final.log",
+      "config": "build-py314/token-pre-commit-compatible.yaml",
+      "difference": "Only pyright Python3.11 replaces unavailable Python3.14 torch2.8 wheel; all configured checks run"
+    }
+  },
+  "limitations": [
+    "Nested source frames still unavailable",
+    "Scalar history O(H) plus distinct occurrence captures O(B)",
+    "Explicit interface ports and quadratic boundary links charged separately",
+    "Standalone caller range/block evidence not transported",
+    "Edited token programs may not cover the edited access problem; LowerSync preserves supplied semantics",
+    "No production dispatch, physical allocation, hardware rule or pool changes",
+    "No device validation"
+  ]
+}

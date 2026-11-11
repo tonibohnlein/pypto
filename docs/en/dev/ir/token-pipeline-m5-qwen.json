@@ -1,0 +1,397 @@
+[
+  {
+    "name": "qwen_output_3",
+    "input_sha256": "85511ce48a58cfb06e91c86d2c3ea1b4136fb2c8cd25b0d3413f9d0184b52c24",
+    "production_seconds": 0.0019795550033450127,
+    "standalone_stage_seconds": {
+      "insert": 0.0009595849551260471,
+      "optimize": 0.00017476314678788185,
+      "lower": 0.0012211231514811516
+    },
+    "paired_seconds": [
+      {
+        "audit": 0.0009306753054261208,
+        "production": 0.001955290324985981
+      },
+      {
+        "production": 0.0019509317353367805,
+        "audit": 0.0007314789108932018
+      },
+      {
+        "audit": 0.0007001380436122417,
+        "production": 0.0019290726631879807
+      }
+    ],
+    "outputs": [
+      {
+        "function": "out_proj_aic",
+        "logical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 4,
+            "sync.record": 12,
+            "sync.completed": 5,
+            "sync.wait": 13,
+            "buffer.extract": 8,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 4,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 4,
+            "system.set_flag": 13,
+            "system.wait_flag": 13,
+            "buffer.extract": 8,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 4,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "audit_physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 4,
+            "system.set_flag": 13,
+            "system.wait_flag": 13,
+            "buffer.extract": 8,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 4,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "arithmetic_sites": 83,
+        "audit_arithmetic_sites": 83,
+        "audit_pto_sha256": "8addc5c27e6c9494a83a7c5daa1847965e0aad18d6e1e223bcb3e0af5a1d6e2d",
+        "pto_sha256": "8addc5c27e6c9494a83a7c5daa1847965e0aad18d6e1e223bcb3e0af5a1d6e2d",
+        "cpp_sha256": "e41f178bef09b3a758667249635b72d6e67f6bff9eb68b8b96e5be4d6353c0c0"
+      }
+    ],
+    "independent_checks": [],
+    "independent_reference": "token-pipeline-m4.json: full Qwen actual-token gate, same layers=2/hidden=512/bands"
+  },
+  {
+    "name": "qwen_gate_up_0",
+    "input_sha256": "a363a12bbac630d1b3d04efc83c046dd9a872fa61eab28bef6ec674e5f9e9bcc",
+    "production_seconds": 0.005169305019080639,
+    "standalone_stage_seconds": {
+      "insert": 0.002450800035148859,
+      "optimize": 0.0005042818374931812,
+      "lower": 0.003141932189464569
+    },
+    "paired_seconds": [
+      {
+        "audit": 0.002238036599010229,
+        "production": 0.005169866140931845
+      },
+      {
+        "production": 0.0051701730117201805,
+        "audit": 0.002073044888675213
+      },
+      {
+        "audit": 0.00201765401288867,
+        "production": 0.005140927154570818
+      }
+    ],
+    "outputs": [
+      {
+        "function": "gate_up_proj",
+        "logical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 29,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 57,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        },
+        "physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 8,
+            "system.set_flag": 57,
+            "system.wait_flag": 57,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 0
+        },
+        "audit_physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 8,
+            "system.set_flag": 57,
+            "system.wait_flag": 57,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 0
+        },
+        "arithmetic_sites": 380,
+        "audit_arithmetic_sites": 380,
+        "audit_pto_sha256": "0d32df7c04fd92c84c1b297e171be51d6de1c416d3321797861905ba97b7cc4e",
+        "pto_sha256": "0d32df7c04fd92c84c1b297e171be51d6de1c416d3321797861905ba97b7cc4e",
+        "cpp_sha256": "9552134db8d228c6e51b709bb6011152356efdb512c704494f2be79140178a21"
+      }
+    ],
+    "independent_checks": [],
+    "independent_reference": "token-pipeline-m4.json: full Qwen actual-token gate, same layers=2/hidden=512/bands"
+  },
+  {
+    "name": "qwen_gate_up_1",
+    "input_sha256": "7d8ae3de450ee48bc796e2b3af358709bb644b82fb81f58268787b61cca644d4",
+    "production_seconds": 0.00628296984359622,
+    "standalone_stage_seconds": {
+      "insert": 0.0028670597821474075,
+      "optimize": 0.0005342881195247173,
+      "lower": 0.003842536825686693
+    },
+    "paired_seconds": [
+      {
+        "audit": 0.0026953532360494137,
+        "production": 0.00813681399449706
+      },
+      {
+        "production": 0.006472723092883825,
+        "audit": 0.0024656690657138824
+      },
+      {
+        "audit": 0.0023995758965611458,
+        "production": 0.0064305029809474945
+      }
+    ],
+    "outputs": [
+      {
+        "function": "gate_up_proj",
+        "logical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 34,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        },
+        "physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 8,
+            "system.set_flag": 70,
+            "system.wait_flag": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 0
+        },
+        "audit_physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 8,
+            "system.set_flag": 70,
+            "system.wait_flag": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 0
+        },
+        "arithmetic_sites": 480,
+        "audit_arithmetic_sites": 480,
+        "audit_pto_sha256": "ea915fcb4e45fcfe407007f2c7dca534024d229b9115e901387f097043e94f4d",
+        "pto_sha256": "ea915fcb4e45fcfe407007f2c7dca534024d229b9115e901387f097043e94f4d",
+        "cpp_sha256": "91774dedfb4ca110d8dfe56503370660bdfcc94218459962398099e31e232420"
+      }
+    ],
+    "independent_checks": [],
+    "independent_reference": "token-pipeline-m4.json: full Qwen actual-token gate, same layers=2/hidden=512/bands"
+  },
+  {
+    "name": "qwen_gate_up_2",
+    "input_sha256": "c277b57f2663306f6ec2d9cc88f64495397005cee6ac09618a26e917cd588cd4",
+    "production_seconds": 0.007221202831715345,
+    "standalone_stage_seconds": {
+      "insert": 0.003366303164511919,
+      "optimize": 0.0006275060586631298,
+      "lower": 0.0044010537676513195
+    },
+    "paired_seconds": [
+      {
+        "audit": 0.0031805019825696945,
+        "production": 0.007269266992807388
+      },
+      {
+        "production": 0.007370371837168932,
+        "audit": 0.0027772262692451477
+      },
+      {
+        "audit": 0.0027908296324312687,
+        "production": 0.007275392301380634
+      }
+    ],
+    "outputs": [
+      {
+        "function": "gate_up_proj",
+        "logical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 48,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 88,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 10
+        },
+        "physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 8,
+            "system.set_flag": 88,
+            "system.wait_flag": 88,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 0
+        },
+        "audit_physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 8,
+            "system.set_flag": 88,
+            "system.wait_flag": 88,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 0
+        },
+        "arithmetic_sites": 487,
+        "audit_arithmetic_sites": 487,
+        "audit_pto_sha256": "ca190e3875a5178768ec09797cbdd9141f3a62362538fd834a0c91f9dd5dc8d7",
+        "pto_sha256": "ca190e3875a5178768ec09797cbdd9141f3a62362538fd834a0c91f9dd5dc8d7",
+        "cpp_sha256": "bfaa26046370b9cd08c87bd8f64a3093f5edf161b1ee4286dc3cf0718d4d38d8"
+      }
+    ],
+    "independent_checks": [],
+    "independent_reference": "token-pipeline-m4.json: full Qwen actual-token gate, same layers=2/hidden=512/bands"
+  },
+  {
+    "name": "qwen_gate_up_3",
+    "input_sha256": "3475d0c9deba619c241636e52f789f8337a7a68698ac0da323d754c5a300ed34",
+    "production_seconds": 0.006270619109272957,
+    "standalone_stage_seconds": {
+      "insert": 0.002872984856367111,
+      "optimize": 0.0005350783467292786,
+      "lower": 0.003848377149552107
+    },
+    "paired_seconds": [
+      {
+        "audit": 0.002762697171419859,
+        "production": 0.006221263203769922
+      },
+      {
+        "production": 0.0064427172765135765,
+        "audit": 0.0025144899263978004
+      },
+      {
+        "audit": 0.0024562436155974865,
+        "production": 0.006210150197148323
+      }
+    ],
+    "outputs": [
+      {
+        "function": "gate_up_proj",
+        "logical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 34,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        },
+        "physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 8,
+            "system.set_flag": 70,
+            "system.wait_flag": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 0
+        },
+        "audit_physical": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 8,
+            "system.set_flag": 70,
+            "system.wait_flag": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 0
+        },
+        "arithmetic_sites": 482,
+        "audit_arithmetic_sites": 482,
+        "audit_pto_sha256": "35abcd50a8373cc9aa8d33e61b1ed7e119f4784c4ffedcecff76ac2a0d8402fa",
+        "pto_sha256": "35abcd50a8373cc9aa8d33e61b1ed7e119f4784c4ffedcecff76ac2a0d8402fa",
+        "cpp_sha256": "c3a219a84df2ff746380a170d6e2c1b105212fb447489a5a7e3ec4b0edea6e08"
+      }
+    ],
+    "independent_checks": [],
+    "independent_reference": "token-pipeline-m4.json: full Qwen actual-token gate, same layers=2/hidden=512/bands"
+  }
+]

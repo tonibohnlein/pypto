@@ -17,14 +17,25 @@ with passes.PassContext([], enable_pypto_autosync=False):
     baseline = kernel.compile(a, b, c, config=config)
 ```
 
-PyPTO attempts the existing placed-access importer, compact minimum-demand
-analysis and physical realization only for physically placed Buffer IR on the
+PyPTO runs the shared `InsertSync` producer, logical verification (the current
+`OptimizeSync` stage), and actual-token `LowerSync` consumer for physically placed Buffer IR on the
 qualified AIC matmul and AIV Vec fragments, using manual a2a3 macro variants. Missing placement,
 GM disjointness, target, access, control, endpoint or resource qualifications
 leave the **original kernel body** for PTOAS. This delegation does not promise
 that PTOAS supports every input; its failures still propagate. Internal compiler
 errors are not converted into fallback. The retained-analysis research APIs
-remain strict and report qualification failures directly.
+remain strict and report qualification failures directly. The former direct
+mathematics-to-physical APIs remain explicit audit tools; production never uses
+them to bypass a token-export refusal. Preexisting logical synchronization and
+already-owned physical plans are rejected before any eligibility/delegation
+exit. Use standalone `LowerSync` for existing token IR.
+
+The transaction collects caller evidence once. Logical insertion preserves the
+original call graph, signatures, scalar definitions and payload control, so its
+own lowering can reuse that evidence. Standalone `LowerSync` re-establishes it
+from its current Program, including serialized or edited tokens. A later failure
+publishes no intermediate token IR. Empty or barrier-only candidates retain the
+existing whole-kernel delegation policy.
 
 A successful attempt publishes its complete body and the boolean
 `pypto_autosync=True` attribute. PTOAS skips insertion independently for each
@@ -188,7 +199,8 @@ and use a checked mixed-radix occurrence ordinal for physical commands. This
 specialization does not cover moving inner slices or accumulator-reset branches.
 The qualified nested projection construction below extends this baseline when
 caller, access and scoped endpoint evidence is available. Arbitrary symbolic
-nesting and nested logical-token export remain unavailable.
+nesting remains unavailable; qualified nested token transport is described in
+the [logical pipeline](60-logical_sync_pipeline.md).
 
 ## Parameterized nested projections
 

@@ -9,6 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -21,75 +23,91 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
-#include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/scoped_logical_sync.h"
 #include "src/ir/transforms/utils/sync_placement.h"
+#include "src/ir/transforms/utils/sync_token_names.h"
 
 namespace pypto::ir::sync {
 namespace {
 using Site = std::pair<size_t, size_t>;  // Original segment and static site.
-struct Source {
-  VarPtr current, initial, exported;
+struct Capture {
   IterArgPtr previous;
-  bool carry = false;
+  VarPtr selected, exported;
+};
+struct Source {
+  VarPtr current, initial;
+  std::vector<VarPtr> exported;
+  std::vector<IterArgPtr> previous;
+  int64_t history = 0;
+  std::map<int64_t, Capture> captures;
 };
 struct Incoming {
   Site source;
-  bool previous = false, crossing = false;
+  int64_t distance = 0;
+  bool crossing = false;
+  int64_t source_visit = 0, target_visit = 0;
 };
 
-// Name reservation is context-independent. Reuse definition/use collection,
-// but inspect a shared operand DAG only once instead of expanding its paths.
-class NameCollector : public var_collectors::VarDefUseCollector {
- public:
-  void VisitExpr(const ExprPtr& expression) override {
-    ++visits;
-    if (expression && seen.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
-  }
-  size_t visits = 0;
-  std::set<const Expr*> seen;
-};
-
-// One indexed IR traversal, O((N+F) log(N+F)). The owner has already proved
-// invariant sites and zero/one-displacement families; no trip count is unfolded.
+// One indexed IR traversal, O((N+F+H) log(N+F+H)), including H history
+// carry/result/yield nodes; F includes supplied crossing records. Capture state
+// adds O(B) nodes for B distinct demanded source occurrences (B <= F).
+// The owner has already proved
+// invariant sites and supplied displacement families; no trip count is unfolded.
+// Scalar RFC carries cost O(sum maximum live lag per source). This is not a
+// compact-in-binary-period token container; mathematical reduction stays compact.
 class Realizer : public SyncPlacement {
  public:
-  explicit Realizer(const CompactSyncResult& analysis) : SyncPlacement(analysis) {
+  explicit Realizer(const CompactSyncResult& analysis)
+      : SyncPlacement(analysis.input), names_(analysis.input.owner) {
     CHECK(analysis.input.owner) << "Logical realization requires the original occurrence owner";
-    NameCollector collector;
-    collector.VisitFunction(analysis.input.owner);
-    result.name_scan_visits = collector.visits;
-    result.name_scan_nodes = collector.seen.size();
-    for (const auto* var : collector.GetAllVarRefs()) names_.insert(var->name_hint_);
+    result.name_scan_visits = names_.visits;
+    result.name_scan_nodes = names_.Nodes();
     for (size_t r = 0; r < analysis.input.segments.size(); ++r) {
       const auto& segment = analysis.input.segments[r];
       for (const auto& f : analysis.segments[r].demands) {
-        CHECK(f.distance == 0 || f.distance == 1) << "Unavailable logical token displacement";
+        CHECK(f.distance >= 0) << "Invalid logical token displacement";
         if (segment.count <= f.distance) continue;
         Site source{r, f.source}, target{r, f.target};
-        sources_[source].carry |= f.distance != 0;
-        incoming_[target].push_back({source, f.distance != 0, false});
+        sources_[source].history = std::max(sources_[source].history, f.distance);
+        incoming_[target].push_back({source, f.distance, false});
       }
     }
-    for (const auto& [a, b] : analysis.crossing_demands) {
+    const auto crossings = analysis.ExportCrossingDemands();
+    CHECK(crossings) << "Logical crossing token scope is unavailable";
+    for (const auto& [a, b] : *crossings) {
       auto [ar, av, as] = a;
       auto [br, bv, bs] = b;
-      CHECK(ar < br && av == analysis.input.segments[ar].count - 1 && bv == 0)
-          << "Crossing token export requires final-source/first-target coordinates";
+      CHECK(ar < br && br < analysis.input.segments.size() && av >= 0 && bv >= 0 &&
+            av < analysis.input.segments[ar].count && bv < analysis.input.segments[br].count)
+          << "Crossing token export requires qualified original occurrence coordinates";
       Site source{ar, as};
-      sources_[source].carry |= analysis.input.segments[ar].original_loop != nullptr;
-      incoming_[{br, bs}].push_back({source, false, true});
+      auto& retained = sources_[source];
+      if (analysis.input.segments[ar].original_loop) {
+        if (av == analysis.input.segments[ar].count - 1)
+          retained.history = std::max<int64_t>(retained.history, 1);
+        else
+          retained.captures.try_emplace(av);
+      }
+      incoming_[{br, bs}].push_back({source, 0, true, av, bv});
     }
     for (auto& [site, source] : sources_) {
       const auto pipe = Payload(site).pipe;
       const auto type = std::make_shared<SyncTokenType>(pipe);
       source.current = Variable(type);
-      if (source.carry) {
+      if (source.history || !source.captures.empty()) {
         source.initial = Variable(type);
-        source.previous = std::make_shared<IterArg>(Name(), type, source.initial, Span::unknown());
-        source.exported = Variable(type);
+        for (int64_t lag = 0; lag < source.history; ++lag) {
+          source.previous.push_back(std::make_shared<IterArg>(Name(), type, source.initial, Span::unknown()));
+          source.exported.push_back(Variable(type));
+        }
+        for (auto& [visit, capture] : source.captures) {
+          capture.previous = std::make_shared<IterArg>(Name(), type, source.initial, Span::unknown());
+          capture.selected = Variable(type);
+          capture.exported = Variable(type);
+        }
         carried_[site.first].push_back(site);
-        ++result.carried_tokens;
+        result.carried_tokens += source.previous.size() + source.captures.size();
       }
     }
   }
@@ -98,7 +116,7 @@ class Realizer : public SyncPlacement {
  protected:
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     const size_t region = loops_.at(op.get());
-    if (analysis_.input.segments[region].count == 0) return op;
+    if (input_.segments[region].count == 0) return op;
     std::vector<StmtPtr> statements;
     std::vector<IterArgPtr> arguments;
     std::vector<VarPtr> outputs;
@@ -106,8 +124,12 @@ class Realizer : public SyncPlacement {
       const auto& source = sources_.at(site);
       statements.push_back(std::make_shared<AssignStmt>(
           source.initial, Token("sync.completed", Payload(site).pipe, op->span_), op->span_));
-      arguments.push_back(source.previous);
-      outputs.push_back(source.exported);
+      arguments.insert(arguments.end(), source.previous.begin(), source.previous.end());
+      outputs.insert(outputs.end(), source.exported.begin(), source.exported.end());
+      for (const auto& [visit, capture] : source.captures) {
+        arguments.push_back(capture.previous);
+        outputs.push_back(capture.exported);
+      }
     }
     active_loop_ = region;
     auto body = VisitStmt(op->body_);
@@ -129,7 +151,14 @@ class Realizer : public SyncPlacement {
   StmtPtr VisitStmt_(const YieldStmtPtr& op) override {
     INTERNAL_CHECK(active_loop_ && op->value_.empty()) << "Unexpected original yield";
     std::vector<ExprPtr> values;
-    for (auto site : carried_[*active_loop_]) values.push_back(sources_.at(site).current);
+    for (auto site : carried_[*active_loop_]) {
+      const auto& source = sources_.at(site);
+      if (source.history) values.push_back(source.current);
+      // Yield is simultaneous: older entries see the previous visit, never
+      // the current record shifted sequentially through all positions.
+      for (size_t lag = 1; lag < source.previous.size(); ++lag) values.push_back(source.previous[lag - 1]);
+      for (const auto& [visit, capture] : source.captures) values.push_back(capture.selected);
+    }
     return std::make_shared<YieldStmt>(values, op->span_, op->leading_comments_);
   }
 
@@ -138,36 +167,39 @@ class Realizer : public SyncPlacement {
   std::map<Site, std::vector<Incoming>> incoming_;
   std::map<size_t, std::vector<Site>> carried_;
   std::optional<size_t> active_loop_;
-  std::set<std::string> names_;
-  size_t next_name_ = 0;
-  std::string Name() {
-    // Monotone counter avoids repeatedly searching all earlier suffixes.
-    std::string name;
-    do {
-      name = "sync_completion_" + std::to_string(next_name_++);
-    } while (!names_.insert(name).second);
-    return name;
-  }
+  SyncTokenNames names_;
+  std::string Name() { return names_.Next(); }
   VarPtr Variable(const TypePtr& type) { return std::make_shared<Var>(Name(), type, Span::unknown()); }
   static CallPtr Token(const char* name, PipeType pipe, const Span& span) {
     return OpRegistry::GetInstance().Create(name, {}, {{"pipe", static_cast<int>(pipe)}}, span);
   }
   StmtPtr Wrap(const StmtPtr& payload, Site site) override {
     std::vector<StmtPtr> statements;
-    const auto& segment = analysis_.input.segments[site.first];
+    const auto& segment = input_.segments[site.first];
     for (const auto& incoming : incoming_[site]) {
       const auto& source = sources_.at(incoming.source);
       ExprPtr token = source.current;
-      if (incoming.previous) token = source.previous;
-      if (incoming.crossing && source.carry) token = source.exported;
+      if (incoming.distance) token = source.previous.at(incoming.distance - 1);
+      if (incoming.crossing) {
+        auto capture = source.captures.find(incoming.source_visit);
+        if (capture != source.captures.end())
+          token = capture->second.exported;
+        else if (source.history)
+          token = source.exported.front();
+      }
       auto wait = OpRegistry::GetInstance().Create(
           "sync.wait", {token}, {{"dst_pipe", static_cast<int>(Payload(site).pipe)}}, payload->span_);
       StmtPtr statement = std::make_shared<EvalStmt>(wait, payload->span_);
       ++result.wait_sites;
-      if (segment.original_loop && (incoming.previous || incoming.crossing)) {
-        auto start = std::make_shared<ConstInt>(segment.start, DataType::INDEX, payload->span_);
+      if (segment.original_loop && (incoming.distance || incoming.crossing)) {
+        const __int128 cut =
+            __int128(segment.start) +
+            __int128(incoming.distance ? incoming.distance - 1 : incoming.target_visit) * segment.step;
+        CHECK(cut >= 0 && cut <= std::numeric_limits<int64_t>::max())
+            << "Logical history activation coordinate overflows";
+        auto start = std::make_shared<ConstInt>(static_cast<int64_t>(cut), DataType::INDEX, payload->span_);
         ExprPtr condition;
-        if (incoming.previous)
+        if (incoming.distance)
           condition =
               std::make_shared<Gt>(segment.original_loop->loop_var_, start, DataType::BOOL, payload->span_);
         else
@@ -185,15 +217,27 @@ class Realizer : public SyncPlacement {
       statements.push_back(std::make_shared<AssignStmt>(
           source->second.current, Token("sync.record", Payload(site).pipe, payload->span_), payload->span_));
       ++result.record_sites;
+      for (const auto& [visit, capture] : source->second.captures) {
+        const __int128 coordinate = __int128(segment.start) + __int128(visit) * segment.step;
+        CHECK(segment.original_loop && coordinate >= 0 && coordinate <= std::numeric_limits<int64_t>::max())
+            << "Crossing capture coordinate overflows";
+        auto condition = std::make_shared<Eq>(
+            segment.original_loop->loop_var_,
+            std::make_shared<ConstInt>(static_cast<int64_t>(coordinate), DataType::INDEX, payload->span_),
+            DataType::BOOL, payload->span_);
+        auto selected =
+            std::make_shared<YieldStmt>(std::vector<ExprPtr>{source->second.current}, payload->span_);
+        auto retained = std::make_shared<YieldStmt>(std::vector<ExprPtr>{capture.previous}, payload->span_);
+        statements.push_back(std::make_shared<IfStmt>(condition, selected, retained,
+                                                      std::vector<VarPtr>{capture.selected}, payload->span_));
+      }
     }
     return std::make_shared<SeqStmts>(statements, payload->span_);
   }
 };
 }  // namespace
 LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis) {
-  for (const auto& segment : analysis.segments)
-    CHECK(!segment.rotating)
-        << "Rotating minimum demands are retained; logical endpoint export is unavailable";
+  if (analysis.input.region_tree) return RealizeScopedLogicalSync(analysis);
   for (const auto& segment : analysis.input.segments)
     CHECK(segment.nested_frames.empty()) << "Nested repetition requires token transport across every "
                                             "enclosing frame; physical export is available";

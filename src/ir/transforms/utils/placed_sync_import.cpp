@@ -1316,7 +1316,8 @@ static void QualifyPhysicalIntervals(CompactSyncInput& input) {
 
 CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target,
                                   const SyncParameterBounds& parameter_bounds,
-                                  const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
+                                  const std::optional<std::pair<int64_t, int64_t>>& block_bounds,
+                                  SyncOccurrenceLayout layout) {
   CHECK(function && (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV))
       << "Synchronization prototype requires one AIC or AIV leaf";
   if (function->func_type_ == FunctionType::AIV) {
@@ -1382,7 +1383,11 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
     importer.result.storage.back().row_extent_parameter = row_parameter;
   }
   std::map<const ForStmt*, bool> nested;
-  if (NestedShape(function->body_, nested).second) {
+  const auto shape = NestedShape(function->body_, nested);
+  const bool original_frames =
+      layout == SyncOccurrenceLayout::OriginalFrames &&
+      std::any_of(nested.begin(), nested.end(), [](const auto& entry) { return entry.second; });
+  if (shape.second || original_frames) {
     std::vector<SyncLoopFrame> frames;
     importer.result.region_tree = ImportStructuredBody(importer, function->body_, frames, nested);
     CHECK(QualifyStartupScopes(*importer.result.region_tree, importer.result).pending.empty())

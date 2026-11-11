@@ -49,10 +49,13 @@ def test_pypto_lib_invocation_coordinates(name):
                     translated += 1
     assert translated
     physical = retained.realize_physical("a2a3", list(range(6)))
+    baseline_orders = {}
     for row, col in [(0, 0), (64, 128), (192, 192)]:
         parameters = {1: row, 3: col}
         validate(original, retained, parameters=parameters)
-        run_physical(original, physical["function"], range(6), parameters=parameters)
+        baseline_orders[row, col] = run_physical(
+            original, physical["function"], range(6), parameters=parameters
+        )[2]
     assert retained.boundary(0, 0, 0) is None
     assert retained.boundary(0, 0, 0, {1: 256}) is None
     absent = retained.boundary(0, 0, 0, {1: 64})
@@ -62,7 +65,10 @@ def test_pypto_lib_invocation_coordinates(name):
         synchronized = passes.realize_sync()(program)
     selected = next(f for f in synchronized.functions.values() if f.name == original.name)
     assert dict(selected.attrs)["pypto_autosync"]
-    ir.assert_structural_equal(selected.body, physical["function"].body)
+    # The actual-token emitter may flatten statement containers differently.
+    # Compare complete payload prerequisite relations, not container identity.
+    for (row, col), baseline in baseline_orders.items():
+        assert run_physical(original, selected, range(6), parameters={1: row, 3: col})[2] == baseline
     with pytest.raises(ValueError, match="exceeds its proved allocation"):
         testing.analyze_placed_sync(original, True, parameter_bounds={1: (0, 193), 3: (0, 192)})
 

@@ -1,0 +1,617 @@
+{
+  "revision": "c58f5db15630644db4096ca10328c5486ba185f8",
+  "source_sha256": {
+    "docs/en/dev/passes/59-realize_sync.md": "895db68c4971aaf1571328734c91652b1961c8dd22b8e9a7e2bd58bface9c5c7",
+    "docs/en/dev/passes/60-logical_sync_pipeline.md": "0aac74485a74997c8697bdd87e0c6e69659e64112e09ba64aec73c05d195a73a",
+    "docs/zh/dev/passes/59-realize_sync.md": "140ae5f6ba3b58931a278e625a3edc351fb4b6ad3d5e7083a068fd0ecd7559f3",
+    "docs/zh/dev/passes/60-logical_sync_pipeline.md": "7a686d342fffacc33fc2c380b481249e2c68fbf03e19f9fa3e47c40e80126538",
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "e3683d2d8c13ed51fad67c158f6ac126662585e21f8e663a096c9bb3f9dde993",
+    "python/bindings/modules/testing.cpp": "e226fddde349104548ec3c687d0405ea73d8e3f78dc639a890ddd8048bb1b677",
+    "python/pypto/pypto_core/testing.pyi": "d75e2dc89976f2580f1aa1f987621c17cedd6bf3a640c196c11430621c8e3f0e",
+    "src/ir/transforms/token_sync.cpp": "af9c7ae0d8a5abdcb94f2b822535c9a4e19caff0cabdbffcd5c465fc096d9e51",
+    "src/ir/transforms/utils/invocation_sync_analysis.cpp": "a458c1ccfc7c648ec03e8371b22c9c0a52eef95520724977bf5b9ed0ef68973a",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "8d982961f4dba81845e32f29f951c40802aed7298af9665774d0c81ed4616217",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "2a335a61d5cfb437358ca27e5f321eb7657af9be111ff6884f7d01345eb9022c",
+    "src/ir/transforms/utils/structured_token_sync.cpp": "e8ac37465ac2a6cef59eae2670b27a1eeb1b51aa9bd4e2c7107901a5314740eb",
+    "tests/ut/ir/transforms/qualify_invocation_tokens.py": "a955023344edc66ea407da79047c378affac0c117afdce3cd551fe610612f67a",
+    "tests/ut/ir/transforms/test_autosync_switch.py": "fb7a1a79433a9697e4ced9865447ae11a60d06ffd3e603394368bf2bdec034c3",
+    "tests/ut/ir/transforms/test_parameterized_sync.py": "a315e3a82b361e0915e607f61f9e509c324e6d2d5f6e36bb2e71e39ac5c226e7",
+    "tests/ut/ir/transforms/test_parameterized_token_sync.py": "df473a06adee94433b0b5bbe2d95ba56a89aa5ea525c4438bd452bf52f43f409",
+    "src/ir/transforms/utils/sync_invocation_domains.h": "a0867e90da9ea12e74c1aa3c3b5519cb52df187a6d519cd7e3090333f19be6cf",
+    "tests/ut/ir/transforms/test_invocation_token_sync.py": "a49dc48fd160a38fd4be2d13041355277d13d95cc8de146dc2eaba720daeba6d"
+  },
+  "extension_sha256": "ac1e5e3eb3aa17246061df26a948f375f2acadef54691d28ebb730ac004a8972",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "command": [
+    "/usr/bin/python3",
+    "-m",
+    "tests.ut.ir.transforms.qualify_invocation_tokens",
+    "--output",
+    "build-py314/token-m4-qualification.json"
+  ],
+  "cases": [
+    {
+      "kernel": "output",
+      "hidden": 512,
+      "band": 3,
+      "layers": 2,
+      "input_sha256": "85511ce48a58cfb06e91c86d2c3ea1b4136fb2c8cd25b0d3413f9d0184b52c24",
+      "logical_sha256": "a6129fdda7dbb2b619c8c71d18212ea0eb1aac65a7ca8e44c0cb6e7ef5ffcbb4",
+      "timings_seconds": {
+        "insert_inclusive": 0.001082973089069128,
+        "optimize": 0.00020749540999531746,
+        "lower_inclusive": 0.0012327688746154308,
+        "baseline_direct_inclusive": 0.0008113752119243145
+      },
+      "timing_scope": "single descriptive samples; no speedup claim or sum of inclusive/audit work",
+      "cases": [
+        {
+          "blocks": [
+            0,
+            1
+          ],
+          "work": {
+            "read_statement_visits": 73,
+            "waits_inspected": 13,
+            "inactive_waits": 0,
+            "families": 13
+          },
+          "families": 13,
+          "axes": 16,
+          "audit_import_parse_seconds": 0.0004652119241654873
+        },
+        {
+          "blocks": [
+            2,
+            19
+          ],
+          "work": {
+            "read_statement_visits": 17,
+            "waits_inspected": 0,
+            "inactive_waits": 0,
+            "families": 0
+          },
+          "families": 0,
+          "axes": 0,
+          "audit_import_parse_seconds": 0.00033769477158784866
+        }
+      ],
+      "code": {
+        "tokens": {
+          "set": 13,
+          "wait": 13,
+          "barrier": 0,
+          "arithmetic": 83,
+          "physical_pto_sha256": "8addc5c27e6c9494a83a7c5daa1847965e0aad18d6e1e223bcb3e0af5a1d6e2d",
+          "physical_ownership_marker": true
+        },
+        "direct": {
+          "set": 13,
+          "wait": 13,
+          "barrier": 0,
+          "arithmetic": 83,
+          "physical_pto_sha256": "8addc5c27e6c9494a83a7c5daa1847965e0aad18d6e1e223bcb3e0af5a1d6e2d",
+          "physical_ownership_marker": false
+        }
+      },
+      "interleaved_pairs_seconds": [
+        {
+          "direct": 0.0006972802802920341,
+          "tokens": 0.002316267229616642
+        },
+        {
+          "tokens": 0.00233486108481884,
+          "direct": 0.000763588584959507
+        },
+        {
+          "direct": 0.0007407311350107193,
+          "tokens": 0.0024213441647589207
+        }
+      ]
+    },
+    {
+      "kernel": "output",
+      "hidden": 2048,
+      "band": 3,
+      "layers": 2,
+      "input_sha256": "3d1ee994bf5799cce5ac905940f2ac00833edab1d45ad5d85550a6821d54b4d0",
+      "logical_sha256": "f8ab78a499eea6de1d9284e23d6cfc4ab63afc68a2fb8c4477fdb13e1da36494",
+      "timings_seconds": {
+        "insert_inclusive": 0.0013501872308552265,
+        "optimize": 0.0002503851428627968,
+        "lower_inclusive": 0.0015261098742485046,
+        "baseline_direct_inclusive": 0.0010197865776717663
+      },
+      "timing_scope": "single descriptive samples; no speedup claim or sum of inclusive/audit work",
+      "cases": [
+        {
+          "blocks": [
+            0,
+            7
+          ],
+          "work": {
+            "read_statement_visits": 93,
+            "waits_inspected": 17,
+            "inactive_waits": 0,
+            "families": 17
+          },
+          "families": 17,
+          "axes": 40,
+          "audit_import_parse_seconds": 0.0005384283140301704
+        },
+        {
+          "blocks": [
+            8,
+            19
+          ],
+          "work": {
+            "read_statement_visits": 17,
+            "waits_inspected": 0,
+            "inactive_waits": 0,
+            "families": 0
+          },
+          "families": 0,
+          "axes": 0,
+          "audit_import_parse_seconds": 0.00039162812754511833
+        }
+      ],
+      "code": {
+        "tokens": {
+          "set": 17,
+          "wait": 17,
+          "barrier": 0,
+          "arithmetic": 122,
+          "physical_pto_sha256": "77ed32749fe4173250fefd287f0cc722cd5e780a6070a685b5c1041470ed0975",
+          "physical_ownership_marker": true
+        },
+        "direct": {
+          "set": 17,
+          "wait": 17,
+          "barrier": 0,
+          "arithmetic": 122,
+          "physical_pto_sha256": "b44ba3f2f3bd08dded5a204b0c20c67115e63b6b17d72d3c975a86f5de558228",
+          "physical_ownership_marker": false
+        }
+      },
+      "interleaved_pairs_seconds": [
+        {
+          "direct": 0.0010463809594511986,
+          "tokens": 0.0031634019687771797
+        },
+        {
+          "tokens": 0.0029771458357572556,
+          "direct": 0.0009792931377887726
+        },
+        {
+          "direct": 0.0009436481632292271,
+          "tokens": 0.003013034351170063
+        }
+      ]
+    },
+    {
+      "kernel": "output",
+      "hidden": 8192,
+      "band": 3,
+      "layers": 2,
+      "input_sha256": "6acc67600c2c367bc07509e65f416b81e49eeab4ea37664171ce827ef7038cc1",
+      "insertion_refusal": "Invocation activation has more than one visit per case",
+      "insertion_seconds": 0.17343588639050722,
+      "baseline_accepted": false,
+      "baseline_refusal": "Invocation activation has more than one visit per case"
+    },
+    {
+      "kernel": "gate_up",
+      "hidden": 512,
+      "band": 3,
+      "layers": 2,
+      "input_sha256": "3cd2ef700e48504af0c35e914774e9e5dd7ead7e10f975eba7e728c2d31c31e2",
+      "logical_sha256": "28f244e0c953526ddd46adc46fe1a2aa00827afcae582a23d9f5263c08c9a7d4",
+      "timings_seconds": {
+        "insert_inclusive": 0.0034388317726552486,
+        "optimize": 0.0005622231401503086,
+        "lower_inclusive": 0.0038254759274423122,
+        "baseline_direct_inclusive": 0.00267709419131279
+      },
+      "timing_scope": "single descriptive samples; no speedup claim or sum of inclusive/audit work",
+      "cases": [
+        {
+          "blocks": [
+            0,
+            5
+          ],
+          "work": {
+            "read_statement_visits": 122,
+            "waits_inspected": 44,
+            "inactive_waits": 31,
+            "families": 13
+          },
+          "families": 13,
+          "axes": 16,
+          "audit_import_parse_seconds": 0.0009215204045176506
+        },
+        {
+          "blocks": [
+            6,
+            12
+          ],
+          "work": {
+            "read_statement_visits": 106,
+            "waits_inspected": 26,
+            "inactive_waits": 13,
+            "families": 13
+          },
+          "families": 13,
+          "axes": 16,
+          "audit_import_parse_seconds": 0.0008174548856914043
+        },
+        {
+          "blocks": [
+            13,
+            22
+          ],
+          "work": {
+            "read_statement_visits": 203,
+            "waits_inspected": 70,
+            "inactive_waits": 39,
+            "families": 31
+          },
+          "families": 31,
+          "axes": 32,
+          "audit_import_parse_seconds": 0.0008859517984092236
+        },
+        {
+          "blocks": [
+            23,
+            23
+          ],
+          "work": {
+            "read_statement_visits": 122,
+            "waits_inspected": 44,
+            "inactive_waits": 31,
+            "families": 13
+          },
+          "families": 13,
+          "axes": 16,
+          "audit_import_parse_seconds": 0.0008028289303183556
+        }
+      ],
+      "code": {
+        "tokens": {
+          "set": 70,
+          "wait": 70,
+          "barrier": 0,
+          "arithmetic": 482,
+          "physical_pto_sha256": "b462c81694d9e34f89911b3c4634ade32669b0b7abcbfb73d1d7773036f2b1c1",
+          "physical_ownership_marker": true
+        },
+        "direct": {
+          "set": 70,
+          "wait": 70,
+          "barrier": 0,
+          "arithmetic": 482,
+          "physical_pto_sha256": "b462c81694d9e34f89911b3c4634ade32669b0b7abcbfb73d1d7773036f2b1c1",
+          "physical_ownership_marker": false
+        }
+      },
+      "interleaved_pairs_seconds": [
+        {
+          "direct": 0.0025570779107511044,
+          "tokens": 0.007380814291536808
+        },
+        {
+          "tokens": 0.007120312191545963,
+          "direct": 0.0024825786240398884
+        },
+        {
+          "direct": 0.002543632872402668,
+          "tokens": 0.007183418609201908
+        }
+      ]
+    },
+    {
+      "kernel": "gate_up",
+      "hidden": 2048,
+      "band": 3,
+      "layers": 2,
+      "input_sha256": "4263da0f06f8f7ca4cdac647343bffabe08409f643611411b66b8ca07139256e",
+      "logical_sha256": "b890bac90fbde74b838e1a22fd849444b06a21f1a062d2c436b9fce0c815e339",
+      "timings_seconds": {
+        "insert_inclusive": 0.00433553708717227,
+        "optimize": 0.0008296710439026356,
+        "lower_inclusive": 0.005447263829410076,
+        "baseline_direct_inclusive": 0.003832465037703514
+      },
+      "timing_scope": "single descriptive samples; no speedup claim or sum of inclusive/audit work",
+      "cases": [
+        {
+          "blocks": [
+            0,
+            5
+          ],
+          "work": {
+            "read_statement_visits": 168,
+            "waits_inspected": 56,
+            "inactive_waits": 39,
+            "families": 17
+          },
+          "families": 17,
+          "axes": 40,
+          "audit_import_parse_seconds": 0.0012116879224777222
+        },
+        {
+          "blocks": [
+            6,
+            12
+          ],
+          "work": {
+            "read_statement_visits": 141,
+            "waits_inspected": 34,
+            "inactive_waits": 17,
+            "families": 17
+          },
+          "families": 17,
+          "axes": 40,
+          "audit_import_parse_seconds": 0.0011155088432133198
+        },
+        {
+          "blocks": [
+            13,
+            22
+          ],
+          "work": {
+            "read_statement_visits": 284,
+            "waits_inspected": 90,
+            "inactive_waits": 51,
+            "families": 39
+          },
+          "families": 39,
+          "axes": 80,
+          "audit_import_parse_seconds": 0.0012168362736701965
+        },
+        {
+          "blocks": [
+            23,
+            23
+          ],
+          "work": {
+            "read_statement_visits": 168,
+            "waits_inspected": 56,
+            "inactive_waits": 39,
+            "families": 17
+          },
+          "families": 17,
+          "axes": 40,
+          "audit_import_parse_seconds": 0.00111720385029912
+        }
+      ],
+      "code": {
+        "tokens": {
+          "set": 90,
+          "wait": 90,
+          "barrier": 0,
+          "arithmetic": 692,
+          "physical_pto_sha256": "48cd6400190c3c71ca95a5ae0d7a813b4dc910a9a10d58080b2169e1f558df93",
+          "physical_ownership_marker": true
+        },
+        "direct": {
+          "set": 90,
+          "wait": 90,
+          "barrier": 0,
+          "arithmetic": 692,
+          "physical_pto_sha256": "70cadc69dd2e9ef05bca11d227a40292103ab40ef52ff58ea1c62444a260779f",
+          "physical_ownership_marker": false
+        }
+      },
+      "interleaved_pairs_seconds": [
+        {
+          "direct": 0.00362160662189126,
+          "tokens": 0.01056656101718545
+        },
+        {
+          "tokens": 0.010390875861048698,
+          "direct": 0.0035765930078923702
+        },
+        {
+          "direct": 0.003468227107077837,
+          "tokens": 0.010497752111405134
+        }
+      ]
+    },
+    {
+      "kernel": "gate_up",
+      "hidden": 8192,
+      "band": 3,
+      "layers": 2,
+      "input_sha256": "3f5123bff4dd49ce7135ea3a1ca75f3c8e1a5ae7443d76f757ca77879c4cbbf7",
+      "logical_sha256": "c4401917a335460543f5d1efc476c37891630db05ed0ae1bc803fbf9e5ed1d3c",
+      "timings_seconds": {
+        "insert_inclusive": 0.005334899295121431,
+        "optimize": 0.0008030892349779606,
+        "lower_inclusive": 0.005831026006489992,
+        "baseline_direct_inclusive": 0.004497956950217485
+      },
+      "timing_scope": "single descriptive samples; no speedup claim or sum of inclusive/audit work",
+      "cases": [
+        {
+          "blocks": [
+            0,
+            5
+          ],
+          "work": {
+            "read_statement_visits": 168,
+            "waits_inspected": 56,
+            "inactive_waits": 39,
+            "families": 17
+          },
+          "families": 17,
+          "axes": 40,
+          "audit_import_parse_seconds": 0.001263217069208622
+        },
+        {
+          "blocks": [
+            6,
+            12
+          ],
+          "work": {
+            "read_statement_visits": 141,
+            "waits_inspected": 34,
+            "inactive_waits": 17,
+            "families": 17
+          },
+          "families": 17,
+          "axes": 40,
+          "audit_import_parse_seconds": 0.001149762887507677
+        },
+        {
+          "blocks": [
+            13,
+            22
+          ],
+          "work": {
+            "read_statement_visits": 284,
+            "waits_inspected": 90,
+            "inactive_waits": 51,
+            "families": 39
+          },
+          "families": 39,
+          "axes": 80,
+          "audit_import_parse_seconds": 0.0012610657140612602
+        },
+        {
+          "blocks": [
+            23,
+            23
+          ],
+          "work": {
+            "read_statement_visits": 168,
+            "waits_inspected": 56,
+            "inactive_waits": 39,
+            "families": 17
+          },
+          "families": 17,
+          "axes": 40,
+          "audit_import_parse_seconds": 0.0011189840734004974
+        }
+      ],
+      "code": {
+        "tokens": {
+          "set": 90,
+          "wait": 90,
+          "barrier": 0,
+          "arithmetic": 692,
+          "physical_pto_sha256": "30e9eaed38e47e985fa9b094d025bf3000d0567f18f64689cd63cbaf4900f62c",
+          "physical_ownership_marker": true
+        },
+        "direct": {
+          "set": 90,
+          "wait": 90,
+          "barrier": 0,
+          "arithmetic": 692,
+          "physical_pto_sha256": "2a9c672d0afcfeaa0c8713a218cc7e7b8f04dcaa5035d450b86a29395614f72c",
+          "physical_ownership_marker": false
+        }
+      },
+      "interleaved_pairs_seconds": [
+        {
+          "direct": 0.004438726231455803,
+          "tokens": 0.011905615217983723
+        },
+        {
+          "tokens": 0.01183952996507287,
+          "direct": 0.004507285077124834
+        },
+        {
+          "direct": 0.004517935216426849,
+          "tokens": 0.012066985946148634
+        }
+      ]
+    }
+  ],
+  "alias_contract": "disjoint GM roots",
+  "eligible_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "device": "not run",
+  "default_dispatch": "off; opt-in production uses tokens",
+  "baseline": "explicit direct audit API, not production RealizeSync",
+  "semantics": "separate bounded test gate",
+  "milestone": "M4 production token migration accepted; M5 final qualification pending",
+  "validation": {
+    "fresh_broad_gate": {
+      "command": [
+        "/usr/bin/python3",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/ut/ir/transforms/test_scoped_token_order.py",
+        "tests/ut/ir/transforms/test_scoped_token_families.py",
+        "tests/ut/ir/transforms/test_scoped_logical_sync.py",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py",
+        "tests/ut/ir/transforms/test_regional_slot_composition.py",
+        "tests/ut/ir/transforms/test_streamed_slot_composition.py",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py",
+        "tests/ut/ir/transforms/test_autosync_switch.py",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+        "tests/ut/ir/transforms/test_collective_sync_interface.py",
+        "tests/ut/ir/transforms/test_collective_sync_realization.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+        "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+        "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+        "tests/ut/ir/transforms/test_logical_sync_realization.py",
+        "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+        "tests/ut/ir/transforms/test_parameterized_sync.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+        "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+        "tests/ut/ir/transforms/test_row_sync_analysis.py",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+        "tests/ut/ir/transforms/test_slot_sync_import.py",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/ir/transforms/test_verify_hard_syncall_occupancy.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "tests/ut/ir/transforms/test_structured_token_sync.py",
+        "--basetemp=build-py314/pytest-token-m4-reviewed",
+        "--junitxml=build-py314/token-m4-reviewed.xml",
+        "--tb=short",
+        "tests/ut/ir/transforms/test_parameterized_token_sync.py",
+        "tests/ut/ir/transforms/test_invocation_token_sync.py"
+      ],
+      "passed": 1269,
+      "failed": 0,
+      "warnings": 32,
+      "seconds": 796.53
+    },
+    "perfect_nested_focused": {
+      "passed": 27,
+      "seconds": 4.23,
+      "coverage": "independent flat/scoped accesses, actual covers, all event queries, storage selectors, zero/singleton/reset/nonunit frames; actual token/flag order, matching and reuse"
+    },
+    "hooks": "all applicable repository hooks passed; host-compatible pyright configuration retained"
+  },
+  "reviews": {
+    "architecture": "accepted including original-frame repair",
+    "correctness": "accepted including original-frame repair",
+    "algorithm_performance": "accepted including original-frame repair"
+  },
+  "production_calls": {
+    "RealizePhysicalSync": "definition plus testing binding only",
+    "RealizePhysicalInvocation": "definition plus testing binding only",
+    "RealizeSync": "shared InsertLogicalSync, CheckLogicalSync, LowerLogicalSync"
+  },
+  "remaining_limits": [
+    "Default autosync opt-in remains false",
+    "OptimizeSync verifies without rewriting",
+    "OriginalFrames uses existing structured premises, not arbitrary nested rotating storage",
+    "Native entry/return and device validation separate",
+    "Allocation algorithms and six-ID pool unchanged"
+  ]
+}

@@ -284,8 +284,13 @@ def analyze_placed_sync(
     parameter_bounds: dict[int, tuple[int, int]] = {},
     composition_order: str = "balanced",
     block_bounds: tuple[int, int] | None = None,
+    original_frames: bool = False,
 ) -> CompactSyncAnalysis:
-    """Analyze placed Buffer IR with explicit GM aliases and a named hardware contract."""
+    """Analyze placed Buffer IR with explicit GM aliases and a named hardware contract.
+
+    original_frames requests the existing structured representation for perfect
+    multi-frame nests, matching logical token insertion's occurrence contract.
+    """
     ...
 
 def describe_placed_sync_input(
@@ -324,3 +329,31 @@ def analyze_sync_invocation(
 ) -> SyncInvocationAnalysis:
     """Construct qualified cases over the entire supplied launch contract."""
     ...
+
+def inspect_scoped_token_families(
+    function: Function,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+    block_bounds: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    """Inspect actual token families with disjoint GM roots; no reduction or allocation."""
+    ...
+
+class ScopedTokenOrder:
+    @property
+    def summary_nodes(self) -> int: ...
+    @property
+    def interface_entries(self) -> int: ...
+    def precedes(
+        self,
+        source: tuple[int, int, int],
+        source_completion: bool,
+        target: tuple[int, int, int],
+        target_completion: bool,
+    ) -> bool: ...
+    def uniform(self, family: int) -> bool: ...
+    def reuse(self, family: int) -> bool: ...
+    def barrier(self, family: int) -> bool: ...
+    def realize(self, target: str = "a2a3") -> Function: ...
+
+def analyze_scoped_token_order(function: Function, target: str = "a2a3") -> ScopedTokenOrder: ...

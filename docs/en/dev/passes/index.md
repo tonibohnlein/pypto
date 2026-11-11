@@ -98,6 +98,7 @@ Keep the English and Chinese documentation synchronized.
 
 | Page | What it covers |
 | ---- | -------------- |
+| [Logical synchronization stages](60-logical_sync_pipeline.md) | Experimental standalone InsertSync, OptimizeSync and LowerSync |
 | [Utility Passes](91-utility_passes.md) | Normalization and cleanup passes that run at several pipeline positions |
 | [Diagnostics](92-diagnostics.md) | The advisory channel for compile-time warnings and performance hints |
 | [IR Verifier](99-verifier.md) | Pluggable property verifiers that validate IR correctness between passes |

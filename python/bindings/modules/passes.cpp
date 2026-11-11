@@ -728,6 +728,13 @@ void BindPass(nb::module_& m) {
              "the caller's actual extent at every call/submit site.");
   passes.def("select_buffer_ir_functions", &pass::SelectBufferIRFunctions,
              "Select whole kernels for Buffer IR before storage legalization.");
+  passes.def(
+      "insert_sync", &pass::InsertSync,
+      "Insert logical completion tokens for qualified placed Buffer demands; refuses missing exports.");
+  passes.def("optimize_sync", &pass::OptimizeSync,
+             "Verify logical synchronization; initially an identity optimization stage.");
+  passes.def("lower_sync", &pass::LowerSync,
+             "Lower supported logical tokens using certified directional event resources.");
   passes.def("realize_sync", &pass::RealizeSync,
              "Realize qualified placed demands as physical synchronization");
   passes.def("lower_tile_to_buffer", &pass::LowerTileToBuffer,

@@ -1,0 +1,432 @@
+{
+  "revision": "0611a9e07995197e8e06bba2fcf416ef3583a6b3",
+  "dirty_source_sha256": {
+    "CMakeLists.txt": "0f6ec23c94fab82a6bbf0927f12fc2aa68135b231687418de73882462f0b39da",
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "89edb72340e49e7cbd4c51f056ac32584b4cf587613da035b3409d72fbd7e679",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "de6489d0a666a712a4e1a93e8543f846dc1a49a412b67dc975a957ebb7314b25",
+    "src/ir/transforms/utils/logical_sync_realization.cpp": "dbb20d613833b0b4648077f5f1c1cdcac02159c027a5e4c7c69cfcb5dcafe8f5",
+    "src/ir/transforms/utils/physical_sync_allocation.h": "35f0bd1f5aa6b8f0857c82b4fdcbf710c4ff2ee6f3d4ae5ae2d80e1023a2d752",
+    "src/ir/transforms/utils/physical_sync_realization.cpp": "349c42b55d20cdb7d79ea53fffe294079624b77cdb740292e377805ba5fa5d4e",
+    "src/ir/transforms/utils/structured_token_sync.cpp": "2e1be51f51daca8c4232e19df60f3012ad7eee16799cfa02727dc4c659e628bb",
+    "src/ir/transforms/utils/sync_boundary_graph.cpp": "6eb05c520f812d6978d49ab88648d406d2fe77c08592e9637d24d1e25d1144e0",
+    "src/ir/transforms/utils/sync_boundary_graph.h": "bf7152575c8e9e8687eadc5abb07b0bfa7f57c02471778c22d49e29599dae979",
+    "src/ir/transforms/utils/sync_placement.h": "8c29e8d25c8983ca0a389714eedf31a0657fa49b01b7d73456339effdd9c8ee3",
+    "src/ir/transforms/utils/sync_statement_rewrite.h": "4ff67a25f14d5b3de96e784696acf51c5bde8fb6695e0931ba6e5ccbfde8470a",
+    "src/ir/transforms/utils/token_sync_lowering.cpp": "0869feb1fa064e32a5cf4aa5eede49f252a82f0a7dda7222e2fd8cba0f3ab18f",
+    "src/ir/transforms/utils/token_sync_lowering.h": "d3ae4b9fc12e2ad365e40d9a49609fb58e9bd6d1cbbef3d40012d173f4cf2a82",
+    "tests/ut/ir/transforms/qualify_token_pipeline.py": "5042774fd806a5568dd3ff0bd2ce4aa090993da962ee8a48707c6acb03d8b718",
+    "tests/ut/ir/transforms/test_structured_token_sync.py": "047e2af6c3e3049cbddaa45dd2e879e545fed2c2b861fffc56da94f0fec21495",
+    "tests/ut/ir/transforms/test_token_sync_lowering.py": "d9944f5b12a1fa732dd41ad868b5da06e39865a8f26ad8c2c2a97e9d1a0b2047"
+  },
+  "tracked_diff_sha256": "b82442b8371a7a2a1f0c1bcd83cf6d92df1b53e806e49d3167fc33baa26fadd5",
+  "extension_sha256": "e911bcb24f33df02e92f3189facea4ba0b2aac377487bb7a666ff344ea01b225",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "scope": "canonical structured standalone token stages; production remains unchanged",
+  "timing": "three interleaved pairs; access recovery is included, no speedup claim",
+  "alias_contract": "disjoint distinct GM roots",
+  "target": "a2a3",
+  "device": "not run",
+  "cases": [
+    {
+      "name": "ddr_split_k",
+      "input_sha256": "7ec4a3588bc4d338fc3d6db036dd366525a396c92c609b29aa500ab77b34d9be",
+      "pairs": [
+        {
+          "direct": {
+            "analysis_seconds": 0.00022603990510106087,
+            "realization_seconds": 0.00018876418471336365,
+            "total_seconds": 0.0004148040898144245
+          },
+          "tokens": {
+            "insert_seconds": 0.0005573099479079247,
+            "optimize_seconds": 0.00014458410441875458,
+            "lower_seconds": 0.0005856109783053398,
+            "total_seconds": 0.001287505030632019
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.0005865101702511311,
+            "optimize_seconds": 0.0001755538396537304,
+            "lower_seconds": 0.0006618602201342583,
+            "total_seconds": 0.0014239242300391197
+          },
+          "direct": {
+            "analysis_seconds": 0.00034469692036509514,
+            "realization_seconds": 0.00015182094648480415,
+            "total_seconds": 0.0004965178668498993
+          }
+        },
+        {
+          "direct": {
+            "analysis_seconds": 0.00022517191246151924,
+            "realization_seconds": 9.208917617797852e-05,
+            "total_seconds": 0.00031726108863949776
+          },
+          "tokens": {
+            "insert_seconds": 0.0005550929345190525,
+            "optimize_seconds": 0.00014929380267858505,
+            "lower_seconds": 0.0006721829995512962,
+            "total_seconds": 0.0013765697367489338
+          }
+        }
+      ],
+      "executed_commands": {
+        "set": 19,
+        "wait": 19,
+        "barrier": 0
+      },
+      "directional_ids": {
+        "MTE2->MTE1": [
+          0,
+          1
+        ],
+        "MTE1->M": [
+          0,
+          1
+        ],
+        "M->MTE1": [
+          0,
+          1
+        ],
+        "M->FIX": [
+          0
+        ],
+        "FIX->M": [
+          0
+        ]
+      },
+      "median_paired_total_ratio": 3.103887020998333,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 15,
+          "wait": 15,
+          "arithmetic": 50
+        },
+        {
+          "set": 15,
+          "wait": 15,
+          "arithmetic": 50
+        }
+      ],
+      "semantic": "equal token/flag payload relations, access coverage, matching, causal reuse, width",
+      "token_text_bytes": 7852,
+      "physical_pto_bytes": [
+        15248,
+        15248
+      ]
+    },
+    {
+      "name": "structured_k2",
+      "input_sha256": "d463184fb9683eb96468e1a4cd6aba6fa9a9c7c025ae543775036182d050aafb",
+      "pairs": [
+        {
+          "direct": {
+            "analysis_seconds": 0.0003408379852771759,
+            "realization_seconds": 0.00017477385699748993,
+            "total_seconds": 0.0005156118422746658
+          },
+          "tokens": {
+            "insert_seconds": 0.0009005698375403881,
+            "optimize_seconds": 0.0002801562659442425,
+            "lower_seconds": 0.0010324311442673206,
+            "total_seconds": 0.0022131572477519512
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.000968697015196085,
+            "optimize_seconds": 0.0002867160364985466,
+            "lower_seconds": 0.001077794935554266,
+            "total_seconds": 0.0023332079872488976
+          },
+          "direct": {
+            "analysis_seconds": 0.00035520410165190697,
+            "realization_seconds": 0.00022092508152127266,
+            "total_seconds": 0.0005761291831731796
+          }
+        },
+        {
+          "direct": {
+            "analysis_seconds": 0.0002943999134004116,
+            "realization_seconds": 0.00013479217886924744,
+            "total_seconds": 0.00042919209226965904
+          },
+          "tokens": {
+            "insert_seconds": 0.0008042100816965103,
+            "optimize_seconds": 0.000275603961199522,
+            "lower_seconds": 0.0010123010724782944,
+            "total_seconds": 0.0020921151153743267
+          }
+        }
+      ],
+      "executed_commands": {
+        "set": 45,
+        "wait": 45,
+        "barrier": 6
+      },
+      "directional_ids": {
+        "MTE2->MTE1": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "MTE1->MTE2": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "MTE1->M": [
+          0,
+          1
+        ],
+        "M->MTE1": [
+          0,
+          1
+        ],
+        "M->FIX": [
+          0
+        ],
+        "FIX->M": [
+          0
+        ]
+      },
+      "median_paired_total_ratio": 4.292293284010737,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 33,
+          "wait": 33,
+          "arithmetic": 70
+        },
+        {
+          "set": 33,
+          "wait": 33,
+          "arithmetic": 70
+        }
+      ],
+      "semantic": "equal token/flag payload relations, access coverage, matching, causal reuse, width",
+      "token_text_bytes": 11688,
+      "physical_pto_bytes": [
+        19841,
+        19841
+      ]
+    },
+    {
+      "name": "structured_k1024",
+      "input_sha256": "da80e0547c7d70721909f8ec300041360219c00f9e1bf1711de07b72bb0bd5c8",
+      "pairs": [
+        {
+          "direct": {
+            "analysis_seconds": 0.0003356318920850754,
+            "realization_seconds": 0.00017839111387729645,
+            "total_seconds": 0.0005140230059623718
+          },
+          "tokens": {
+            "insert_seconds": 0.0008138129487633705,
+            "optimize_seconds": 0.0002742959186434746,
+            "lower_seconds": 0.001052062027156353,
+            "total_seconds": 0.002140170894563198
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.0007953043095767498,
+            "optimize_seconds": 0.00026880763471126556,
+            "lower_seconds": 0.0010091033764183521,
+            "total_seconds": 0.0020732153207063675
+          },
+          "direct": {
+            "analysis_seconds": 0.0003180992789566517,
+            "realization_seconds": 0.0001406497322022915,
+            "total_seconds": 0.0004587490111589432
+          }
+        },
+        {
+          "direct": {
+            "analysis_seconds": 0.00028241099789738655,
+            "realization_seconds": 0.00013113394379615784,
+            "total_seconds": 0.0004135449416935444
+          },
+          "tokens": {
+            "insert_seconds": 0.0007969331927597523,
+            "optimize_seconds": 0.00028118398040533066,
+            "lower_seconds": 0.0010384018532931805,
+            "total_seconds": 0.0021165190264582634
+          }
+        }
+      ],
+      "median_paired_total_ratio": 4.519280195217814,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 33,
+          "wait": 33,
+          "arithmetic": 71
+        },
+        {
+          "set": 33,
+          "wait": 33,
+          "arithmetic": 71
+        }
+      ],
+      "semantic": "size/timing only; bounded variants checked independently",
+      "token_text_bytes": 11698,
+      "physical_pto_bytes": [
+        19968,
+        19968
+      ]
+    },
+    {
+      "name": "structured_k1000000",
+      "input_sha256": "f19f3586f256e32e1471087fd2e72a6ea16aec48a68bd113ad382293ba882956",
+      "pairs": [
+        {
+          "direct": {
+            "analysis_seconds": 0.000327087938785553,
+            "realization_seconds": 0.00015277136117219925,
+            "total_seconds": 0.00047985929995775223
+          },
+          "tokens": {
+            "insert_seconds": 0.0008125416934490204,
+            "optimize_seconds": 0.00027428800240159035,
+            "lower_seconds": 0.0010088109411299229,
+            "total_seconds": 0.0020956406369805336
+          }
+        },
+        {
+          "tokens": {
+            "insert_seconds": 0.0007715588435530663,
+            "optimize_seconds": 0.0002686413936316967,
+            "lower_seconds": 0.0009819366969168186,
+            "total_seconds": 0.0020221369341015816
+          },
+          "direct": {
+            "analysis_seconds": 0.0003010248765349388,
+            "realization_seconds": 0.00014157220721244812,
+            "total_seconds": 0.00044259708374738693
+          }
+        },
+        {
+          "direct": {
+            "analysis_seconds": 0.00029341597110033035,
+            "realization_seconds": 0.00013277586549520493,
+            "total_seconds": 0.0004261918365955353
+          },
+          "tokens": {
+            "insert_seconds": 0.0007898779585957527,
+            "optimize_seconds": 0.0002739490009844303,
+            "lower_seconds": 0.0009980229660868645,
+            "total_seconds": 0.0020618499256670475
+          }
+        }
+      ],
+      "median_paired_total_ratio": 4.568798594379623,
+      "physical_pto_byte_equal": true,
+      "static_counts": [
+        {
+          "set": 33,
+          "wait": 33,
+          "arithmetic": 71
+        },
+        {
+          "set": 33,
+          "wait": 33,
+          "arithmetic": 71
+        }
+      ],
+      "semantic": "size/timing only; bounded variants checked independently",
+      "token_text_bytes": 11710,
+      "physical_pto_bytes": [
+        20039,
+        20039
+      ]
+    }
+  ],
+  "milestone": "M1 complete for original three matmuls; rotating/nested/production migration pending",
+  "validation": {
+    "broad": {
+      "passed": 947,
+      "warnings": 28,
+      "seconds": 472.94,
+      "scope": "includes existing nested/Qwen/scopedphysical; before final format and early axis bound check"
+    },
+    "final_rebuilt": {
+      "passed": 218,
+      "warnings": 2,
+      "seconds": 226.38,
+      "scope": "token, structured, logical, physical, scoped physical and collective realization; C++ generation included"
+    }
+  },
+  "commands": {
+    "build": "cmake --build build-py314 --parallel 1",
+    "broad": [
+      "/usr/bin/python3",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/ut/ir/transforms/test_autosync_switch.py",
+      "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+      "tests/ut/ir/transforms/test_collective_sync_interface.py",
+      "tests/ut/ir/transforms/test_collective_sync_realization.py",
+      "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+      "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+      "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+      "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+      "tests/ut/ir/transforms/test_logical_sync_realization.py",
+      "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+      "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+      "tests/ut/ir/transforms/test_parameterized_sync.py",
+      "tests/ut/ir/transforms/test_physical_sync_realization.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+      "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+      "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+      "tests/ut/ir/transforms/test_row_sync_analysis.py",
+      "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+      "tests/ut/ir/transforms/test_slot_sync_import.py",
+      "tests/ut/ir/transforms/test_sync_range_proofs.py",
+      "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+      "tests/ut/ir/transforms/test_verify_hard_syncall_occupancy.py",
+      "tests/ut/ir/transforms/test_token_sync_lowering.py",
+      "tests/ut/ir/transforms/test_structured_token_sync.py",
+      "--basetemp=build-py314/pytest-token-m1b-gate",
+      "--junitxml=build-py314/token-m1b-gate.xml",
+      "--tb=short"
+    ],
+    "final": "/usr/bin/python3 -m pytest -q --tb=short tests/ut/ir/transforms/test_token_sync_lowering.py tests/ut/ir/transforms/test_structured_token_sync.py tests/ut/ir/transforms/test_logical_sync_realization.py tests/ut/ir/transforms/test_physical_sync_realization.py tests/ut/ir/transforms/test_scoped_physical_sync.py tests/ut/ir/transforms/test_collective_sync_realization.py --basetemp=build-py314/pytest-token-m1b-final --junitxml=build-py314/token-m1b-final.xml",
+    "measure": "/usr/bin/python3 -m tests.ut.ir.transforms.qualify_token_pipeline --structured --output build-py314/token-m1b-qualification.json"
+  },
+  "reviews": {
+    "architecture": "accepted qualified M1b source; final focused/broad evidence provided separately",
+    "correctness": "accepted qualified M1b source; final focused/broad evidence provided separately",
+    "algorithm_performance": "accepted qualified M1b source; final focused/broad evidence provided separately"
+  },
+  "environment": {
+    "workers": 1,
+    "PYTHONPATH": "$PWD/python",
+    "PTOAS_ROOT": "$PWD/build-py314/physical-sync-prototype/ptoas-v072",
+    "ptoas_python": "3.11 via PATH",
+    "host_python": "/usr/bin/python3 3.14.7",
+    "hooks": "same checks using local pyright interpreter override python3.11 for pinned torch dependency"
+  },
+  "ptoas_sha256": {
+    "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+    "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_cli.py": "d02e236f0f221fb67c65cd0997eb0179d84ea75385c4788e91005724578363e4"
+  },
+  "log_sha256": {
+    "token-m1b-gate.log": "c7f28ed0f6c457a3984cfa94fec5d28e9924c3333eb3cfd61e4cd40643898914",
+    "token-m1b-final.log": "1deb1397900c886ea312fb82fa3ada3f4bcc4e332f5d882379df00c4061be891",
+    "token-m1b-build-final.log": "18161321ada74409f448aaf60c1790a2e54b96af7df0da22faf59d49f895092d"
+  },
+  "limitations": [
+    "canonical direct cuts and unconditional current-record carries only",
+    "no nested token frames or rotating lag>1 export yet",
+    "single-region periodic frontiers avoid boundary graph; multi-region ports may scale quadratically in static size",
+    "no minimum-ID claim for structured allocation",
+    "ordinary production dispatch remains unchanged",
+    "no device or invocation-boundary qualification"
+  ]
+}

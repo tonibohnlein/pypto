@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -55,6 +56,10 @@
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/finite_sync_analysis.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/scoped_token_families.h"
+#include "src/ir/transforms/utils/scoped_token_order.h"
+#include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace nb = nanobind;
 
@@ -711,6 +716,82 @@ void BindTesting(nb::module_& m) {
            nb::arg("column"), nb::arg("parameters") = std::map<size_t, int64_t>{},
            nb::arg("block_index") = nb::none(),
            "Exact modeled point selector with explicit physical slot identity");
+  nb::class_<ir::sync::ScopedTokenOrder>(testing, "ScopedTokenOrder")
+      .def("precedes", &ir::sync::ScopedTokenOrder::Precedes)
+      .def("uniform", &ir::sync::ScopedTokenOrder::Uniform)
+      .def_prop_ro("summary_nodes", &ir::sync::ScopedTokenOrder::SummaryNodes)
+      .def_prop_ro("interface_entries", &ir::sync::ScopedTokenOrder::InterfaceEntries)
+      .def("reuse",
+           [](const ir::sync::ScopedTokenOrder& order, size_t i) { return order.View().scoped_reuse(i); })
+      .def("barrier",
+           [](const ir::sync::ScopedTokenOrder& order, size_t i) { return order.View().scoped_barrier(i); })
+      .def(
+          "realize",
+          [](const ir::sync::ScopedTokenOrder& order, const std::string& target) {
+            return ir::sync::RealizeDirectSync(order.Input(), order.Families(), order.View(), target,
+                                               std::nullopt)
+                .function;
+          },
+          nb::arg("target") = "a2a3");
+  testing.def(
+      "analyze_scoped_token_order",
+      [](const ir::FunctionPtr& function, const std::string& target) {
+        ir::CheckLogicalSync(function);
+        auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
+        auto input = ir::sync::ImportPlacedSync(stripped.function, true, target, {}, std::nullopt,
+                                                ir::sync::SyncOccurrenceLayout::OriginalFrames);
+        auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops);
+        return std::make_shared<ir::sync::ScopedTokenOrder>(std::move(input), std::move(families));
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3");
+  testing.def(
+      "inspect_scoped_token_families",
+      [](const ir::FunctionPtr& function, const std::string& target,
+         const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks) {
+        ir::CheckLogicalSync(function);
+        auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
+        const auto input = ir::sync::ImportPlacedSync(stripped.function, true, target, parameters, blocks,
+                                                      ir::sync::SyncOccurrenceLayout::OriginalFrames);
+        ir::sync::ScopedTokenWork work;
+        const auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops, &work);
+        nb::dict out;
+        out["function"] = stripped.function;
+        nb::dict counts;
+        counts["read_statement_visits"] = work.statements;
+        counts["waits_inspected"] = work.waits_inspected;
+        counts["inactive_waits"] = work.inactive_waits;
+        counts["families"] = work.families;
+        out["work"] = counts;
+        nb::list rows, regions;
+        for (const auto& family : families) {
+          nb::dict row;
+          row["source"] = nb::make_tuple(family.source_region, family.source_first, family.source_site);
+          row["target"] = nb::make_tuple(family.target_region, family.target_first, family.target_site);
+          row["count"] = family.count;
+          nb::list axes;
+          for (const auto& axis : family.axes)
+            axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));
+          row["axes"] = axes;
+          rows.append(row);
+        }
+        for (const auto& segment : input.segments) {
+          nb::dict region;
+          nb::list sites, frames;
+          for (const auto& site : segment.sites)
+            sites.append(nb::make_tuple(site.original, site.continuation));
+          for (const auto& frame : segment.nested_frames)
+            frames.append(nb::make_tuple(frame.loop, frame.count, frame.start, frame.step));
+          region["sites"] = sites;
+          region["frames"] = frames;
+          regions.append(region);
+        }
+        out["families"] = rows;
+        out["regions"] = regions;
+        return out;
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
+      "Inspect actual scoped token handoffs under the explicit disjoint-GM test contract; no allocation");
   nb::class_<ir::sync::SyncInvocationAnalysis>(testing, "SyncInvocationAnalysis")
       .def(
           "realize_physical",
@@ -761,9 +842,14 @@ void BindTesting(nb::module_& m) {
             return out;
           },
           "Inspect exhaustive invocation partition without constructing exports");
-  testing.def("analyze_sync_invocation", &ir::sync::AnalyzeSyncInvocation, nb::arg("function"),
-              nb::arg("disjoint_gm"), nb::arg("target"), nb::arg("parameter_bounds"), nb::arg("block_bounds"),
-              "Analyze an exhaustive analytic partition of a proved launch domain");
+  testing.def(
+      "analyze_sync_invocation",
+      [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
+         const ir::sync::SyncParameterBounds& parameters, std::pair<int64_t, int64_t> blocks) {
+        return ir::sync::AnalyzeSyncInvocation(function, disjoint_gm, target, parameters, blocks);
+      },
+      nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target"), nb::arg("parameter_bounds"),
+      nb::arg("block_bounds"), "Analyze an exhaustive analytic partition of a proved launch domain");
   testing.def(
       "describe_placed_sync_input",
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
@@ -783,9 +869,12 @@ void BindTesting(nb::module_& m) {
       "analyze_placed_sync",
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
          const ir::sync::SyncParameterBounds& bounds, const std::string& composition_order,
-         const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
+         const std::optional<std::pair<int64_t, int64_t>>& block_bounds, bool original_frames) {
         auto start = std::chrono::steady_clock::now();
-        auto input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds);
+        auto input =
+            ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds,
+                                       original_frames ? ir::sync::SyncOccurrenceLayout::OriginalFrames
+                                                       : ir::sync::SyncOccurrenceLayout::Automatic);
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         auto result = ir::sync::AnalyzeCompactSync(std::move(input), composition_order);
         result.import_seconds = seconds;
@@ -794,6 +883,7 @@ void BindTesting(nb::module_& m) {
       nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target") = "a2a3",
       nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{},
       nb::arg("composition_order") = "balanced", nb::arg("block_bounds") = nb::none(),
+      nb::arg("original_frames") = false,
       "Read-only research analysis of qualified placed Buffer IR under a named hardware contract");
 
   testing.def(

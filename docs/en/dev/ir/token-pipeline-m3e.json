@@ -1,0 +1,239 @@
+{
+  "revision": "819673953e951bcf7b50fce8fdf3ef07196e3b9f",
+  "source_sha256": {
+    "docs/en/dev/passes/60-logical_sync_pipeline.md": "477770868ca4b2565cd3dae9553d7b7852b421a651e715483e530006bff84fe1",
+    "docs/zh/dev/passes/60-logical_sync_pipeline.md": "d68cde04087bb3b2ea5ebe6891e4443458fbf2dd22130491f517acf8aff5e528",
+    "src/ir/transforms/token_sync.cpp": "7d320807bf1a6b1aa0c66ef65f1cedfe2490e9fa11d128f9bcb3e1fa0fee1b82",
+    "src/ir/transforms/utils/scoped_logical_sync.cpp": "f7475de2261f0bfe89b36eade69eb1cf3e41ed7c17cf4601fccc8a4b8274da67",
+    "src/ir/transforms/utils/scoped_token_families.cpp": "e4b03740b31af8d73655bf51a085eac6e147e6d2f0a2f86c546dc6b4fc6b020d",
+    "src/ir/transforms/utils/structured_token_sync.cpp": "f43846f5f3f9d0d118e28d86bb743fb2f6cff948f6cf06156924a7e7f5ae070f",
+    "src/ir/transforms/utils/token_sync_lowering.cpp": "fdc7922b0f1337a590bf0a67c2f5358e85dc0a6258ef5147858e4a477da4f25b",
+    "src/ir/transforms/utils/token_sync_lowering.h": "92ff4c48d470fee8f492c7158765e8c5a675a5f076d1bd260405e8a0e1724207",
+    "tests/ut/ir/transforms/test_scoped_logical_sync.py": "1fef55696872b90b01f1276e7f67f1fec19fc99182b2a678cce4fabbeb227cde",
+    "tests/ut/ir/transforms/qualify_parameterized_tokens.py": "ca9603e4fbddcc114613710333b4cce420ee13d8629152e3614f03078f546800",
+    "tests/ut/ir/transforms/test_parameterized_token_sync.py": "473af9caadf8dfb59f44109d3941558a324721044531976b831dee09a54fddbd"
+  },
+  "extension_sha256": "42430bbf1a9828bfb305d41a2f9193e9704736271519126d4508f898a6191e7f",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "command": [
+    "/usr/bin/python3",
+    "-m",
+    "tests.ut.ir.transforms.qualify_parameterized_tokens",
+    "--output",
+    "build-py314/token-m3e-qualification.json"
+  ],
+  "cases": [
+    {
+      "kernel": "matmul",
+      "K_tiles": null,
+      "input_sha256": "c3b5ccdcff89f9af1e699a1ab9f6b45ade70fa81089ec8b70dbb7e5dbb771f83",
+      "logical_sha256": "33366d2a34bc61629a0aacf2f6902bc723c8d585984e2dd7d1f4c0b2d804e268",
+      "caller_evidence": {
+        "parameters": {
+          "matmul_tile": {
+            "1": [
+              0,
+              192
+            ],
+            "3": [
+              0,
+              192
+            ]
+          }
+        },
+        "block_indices": {},
+        "call_graph_expression_visits": 78,
+        "call_graph_nodes": 2,
+        "call_graph_edges": 1,
+        "processed_functions": 2,
+        "expression_visits": 88,
+        "range_visits": 16
+      },
+      "timings_seconds": {
+        "diagnostic_caller_evidence": 3.130501136183739e-05,
+        "production_insert_inclusive": 0.0003677140921354294,
+        "production_lower_inclusive": 0.0004513300955295563
+      },
+      "timing_scope": "single descriptive runs; inclusive stages overlap; no speedup claim",
+      "static_ops": {
+        "buffer.alloc": 7,
+        "buffer.load": 2,
+        "system.set_flag": 5,
+        "system.wait_flag": 5,
+        "buffer.extract": 4,
+        "buffer.matmul": 1,
+        "buffer.matmul_acc": 1,
+        "buffer.store": 1
+      },
+      "independent_validation": "three coordinate valuations"
+    },
+    {
+      "kernel": "gemm",
+      "K_tiles": 4,
+      "input_sha256": "dd6417148f089e6da8c57d8d7a3b4ac420e4105136d075de35d4f6805e5591eb",
+      "logical_sha256": "8e16c5e58a003b3364645a5610ac4b4f398c18affff81421c7d550d7c58ddfaa",
+      "caller_evidence": {
+        "parameters": {
+          "gemm_tile": {
+            "1": [
+              0,
+              192
+            ],
+            "3": [
+              0,
+              192
+            ]
+          }
+        },
+        "block_indices": {},
+        "call_graph_expression_visits": 70,
+        "call_graph_nodes": 2,
+        "call_graph_edges": 1,
+        "processed_functions": 2,
+        "expression_visits": 84,
+        "range_visits": 20
+      },
+      "timings_seconds": {
+        "diagnostic_caller_evidence": 3.09208407998085e-05,
+        "production_insert_inclusive": 0.00035721808671951294,
+        "production_lower_inclusive": 0.0004528476856648922
+      },
+      "timing_scope": "single descriptive runs; inclusive stages overlap; no speedup claim",
+      "static_ops": {
+        "buffer.alloc": 5,
+        "system.wait_flag": 7,
+        "buffer.load": 2,
+        "system.set_flag": 7,
+        "buffer.copy": 2,
+        "buffer.matmul": 1,
+        "buffer.matmul_acc": 1,
+        "buffer.store": 1
+      },
+      "independent_validation": "three coordinate valuations"
+    },
+    {
+      "kernel": "gemm",
+      "K_tiles": 64,
+      "input_sha256": "37142cdc933ece69b56beea6565a58c789dd8a05a5850b5c0f311c29c54b5876",
+      "logical_sha256": "a2293287ca2e403c51602423a027feb5ae8e4172c0c27302ac3d60789e874b04",
+      "caller_evidence": {
+        "parameters": {
+          "gemm_tile": {
+            "1": [
+              0,
+              192
+            ],
+            "3": [
+              0,
+              192
+            ]
+          }
+        },
+        "block_indices": {},
+        "call_graph_expression_visits": 70,
+        "call_graph_nodes": 2,
+        "call_graph_edges": 1,
+        "processed_functions": 2,
+        "expression_visits": 84,
+        "range_visits": 20
+      },
+      "timings_seconds": {
+        "diagnostic_caller_evidence": 3.200676292181015e-05,
+        "production_insert_inclusive": 0.0003712107427418232,
+        "production_lower_inclusive": 0.0004176478832960129
+      },
+      "timing_scope": "single descriptive runs; inclusive stages overlap; no speedup claim",
+      "static_ops": {
+        "buffer.alloc": 5,
+        "system.wait_flag": 7,
+        "buffer.load": 2,
+        "system.set_flag": 7,
+        "buffer.copy": 2,
+        "buffer.matmul": 1,
+        "buffer.matmul_acc": 1,
+        "buffer.store": 1
+      },
+      "independent_validation": "representation scaling only; no unfolding"
+    },
+    {
+      "kernel": "gemm",
+      "K_tiles": 1000000,
+      "input_sha256": "ab79b1382e5a10203a5871df63b93eee4fa2648d2a5e7a957c938b32c6b53cf3",
+      "logical_sha256": "b98e4deffbdb1b25889de0452462f8adffdffa29c66d96b1ad253dd04263c0c1",
+      "caller_evidence": {
+        "parameters": {
+          "gemm_tile": {
+            "1": [
+              0,
+              192
+            ],
+            "3": [
+              0,
+              192
+            ]
+          }
+        },
+        "block_indices": {},
+        "call_graph_expression_visits": 70,
+        "call_graph_nodes": 2,
+        "call_graph_edges": 1,
+        "processed_functions": 2,
+        "expression_visits": 84,
+        "range_visits": 20
+      },
+      "timings_seconds": {
+        "diagnostic_caller_evidence": 3.0928757041692734e-05,
+        "production_insert_inclusive": 0.00034274300560355186,
+        "production_lower_inclusive": 0.00042826496064662933
+      },
+      "timing_scope": "single descriptive runs; inclusive stages overlap; no speedup claim",
+      "static_ops": {
+        "buffer.alloc": 5,
+        "system.wait_flag": 7,
+        "buffer.load": 2,
+        "system.set_flag": 7,
+        "buffer.copy": 2,
+        "buffer.matmul": 1,
+        "buffer.matmul_acc": 1,
+        "buffer.store": 1
+      },
+      "independent_validation": "representation scaling only; no unfolding"
+    }
+  ],
+  "alias_contract": "disjoint GM roots",
+  "eligible_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "limitations": [
+    "uniform caller hull only; no activation partition",
+    "actual-token lowering does not restore coverage after caller edits",
+    "default production route unchanged",
+    "no device run"
+  ],
+  "reviews": {
+    "architecture": "accepted after independent read-only review",
+    "correctness": "accepted after independent read-only review",
+    "algorithm": "accepted after independent read-only review"
+  },
+  "gate": {
+    "passed": 317,
+    "warnings": 6,
+    "seconds": 68.39
+  },
+  "final_gate": {
+    "passed": 123,
+    "seconds": 5.69
+  },
+  "hooks": "All applicable repository checks passed with Python3.11 pyright environment",
+  "log_sha256": {
+    "token-m3e-gate.log": "57a543e5fcfb3c20fd26d18f3eb35ac4184034a3908313afd193243a84f8b508",
+    "token-m3e-final-tests.log": "706e564a8525d449317539811c47d21a24150e8d9ad077bf232b521d4397ef43",
+    "token-m3e-hooks.log": "2b62d659dd4b75ba968b9871dceecb9d7cde89615ba4d73151fbf6ad8eb47bee"
+  },
+  "status": "M3 caller evidence increment accepted; full Qwen activation and M4/M5 pending"
+}
