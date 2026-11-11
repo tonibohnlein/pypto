@@ -392,11 +392,8 @@ bool CompactSyncResult::Path(size_t a, size_t b, std::optional<std::pair<size_t,
   }
   return false;
 }
-CompactSyncResult AnalyzeInvariantSyncLeaves(CompactSyncInput input) {
-  CompactSyncResult result;
-  result.input = std::move(input);
-  using Clock = std::chrono::steady_clock;
-  auto begin = Clock::now();
+void IndexSyncStorageAccesses(CompactSyncResult& result) {
+  INTERNAL_CHECK(result.storage_access_index.empty()) << "Original access index requires a fresh result";
   result.storage_access_index.resize(result.input.storage.size());
   for (size_t r = 0; r < result.input.segments.size(); ++r) {
     const auto& segment = result.input.segments[r];
@@ -409,6 +406,13 @@ CompactSyncResult AnalyzeInvariantSyncLeaves(CompactSyncInput input) {
         index.enclosing_motion |= access.coordinate_frame && access.coordinate_frame != segment.original_loop;
       }
   }
+}
+CompactSyncResult AnalyzeInvariantSyncLeaves(CompactSyncInput input) {
+  CompactSyncResult result;
+  result.input = std::move(input);
+  using Clock = std::chrono::steady_clock;
+  auto begin = Clock::now();
+  IndexSyncStorageAccesses(result);
   auto atoms = Partition(result.input);
   result.cells = atoms.size();
   result.storage_classes = atoms;

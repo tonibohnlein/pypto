@@ -437,3 +437,47 @@ pitch. The initial C++ failures used the wrong PTOAS launcher; the pinned rerun
 restores the established environment without changing semantics.
 
 M3 accepted by all three reviewers; **404 tests passed**, with 18 existing warnings.
+
+### M4: complete-phase repetition and direct physical export
+
+A structured repeat may use the collective certificate only when its touched
+source interval starts and ends on complete, already coverage-checked phases.
+The check visits every repeated ancestor, including zero/one-count constructs.
+The row-fill loop itself is an original leaf, not an exemption for a fill-only
+repeated ancestor. Empty complete phases can disappear; skipped partial phases
+cannot inherit an intervening-reader argument.
+
+The existing source tree owns repetition. Row-fill leaves analyze their local
+row count; finite reader leaves analyze one local visit. Numerical merges share
+repeated summaries and retain original mixed-radix coordinates. The source-layout
+invariance premise used by scoped endpoint/reuse certification holds for these
+complete phases. The physical exporter, matching policy and allocator are
+unchanged. One initial integration failure exposed the absent original-access
+index on this newly structured route; index construction is now shared with the
+invariant constructor and requires a fresh result. Enclosing-motion read-only GM
+selectors keep their original path. Written moving domains without a reset
+certificate retain their explicit refusal.
+
+Bounded validation includes zero/one/multiple invocations, two enclosing frames,
+counter resets, original GM and local selectors, actual covers, every event-kind
+query and emitted matching/causal ID reuse. Complete-phase commands are compared
+to independently recovered actual-access order, not only to retained generators.
+Partial-phase repeated ancestors are negative cases. Large row/visit counts test
+representation growth, not native capacity. Static command constancy is distinct
+from logarithmic growth of repeated numerical summaries.
+
+This is the existing opt-in production route. Fresh notifications at entry,
+closed matching at exit, payload completion, native instruction qualification and
+device validation remain separate contracts. No return-boundary rule, barrier
+exemption, allocation rule or expert protocol changes here.
+
+M4's broader gate passed **289 tests** with 20 existing warnings. The
+[receipt](buffered-intervals-m4.json) records independent bounded emitted checks
+and descriptive timings. At three visits, 5/1,000/1,000,000 rows retain 1,008
+interface entries. At five rows, 3/1,000/1,000,000 visits retain
+1,008/5,040/8,736 entries and 3/15/26 merge nodes. Emitted sites remain two SETs,
+two WAITs, four guards and no barriers for these repeated cases; zero/one visits
+specialize separately. This establishes row independence and logarithmic repeat
+summary growth for the tested contract, not constant total representation size.
+
+M4 accepted by the architecture, correctness and algorithm/performance reviewers.

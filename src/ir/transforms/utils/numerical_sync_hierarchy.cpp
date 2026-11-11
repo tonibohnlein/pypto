@@ -35,6 +35,7 @@ using NodePtr = std::shared_ptr<const Node>;
 using Row = NumericalRow;
 Ordinal Length(int64_t count, size_t sites) { return Ordinal(count) * sites; }
 int64_t Scope(const SyncSegment& segment) {
+  if (!segment.original_loop) return 1;
   return segment.nested_frames.empty() ? segment.count : segment.nested_frames.back().count;
 }
 int64_t Repetitions(const SyncSegment& segment) {
@@ -74,11 +75,13 @@ NumericalBoundary LeafBoundary(const CompactSyncResult& result, size_t leaf, con
 std::optional<CollectiveSyncDomain> CollectiveDomain(const CompactSyncInput& input, size_t storage,
                                                      CompactSyncResult& work) {
   const auto& domain = input.storage[storage];
-  if (!domain.byte_coordinates || domain.slot_count != 1 || input.region_tree) return std::nullopt;
+  if (!domain.byte_coordinates || domain.slot_count != 1) return std::nullopt;
   CollectiveSyncDomain proof;
   std::optional<PipeType> fill_pipe;
   std::vector<std::pair<int64_t, int64_t>> reads;
   std::set<int64_t> witnesses;
+  std::set<size_t> starts, ends, touched;
+  size_t last_reader = 0;
   auto covered = [&]() {
     if (reads.empty()) return false;
     std::sort(reads.begin(), reads.end());
@@ -91,7 +94,7 @@ std::optional<CollectiveSyncDomain> CollectiveDomain(const CompactSyncInput& inp
   };
   for (size_t leaf = 0; leaf < input.segments.size(); ++leaf) {
     const auto& segment = input.segments[leaf];
-    if (!segment.nested_frames.empty()) return std::nullopt;
+    const auto count = Scope(segment);
     std::vector<std::pair<const SyncSite*, const SyncAccess*>> effects;
     size_t writes = 0;
     for (const auto& site : segment.sites)
@@ -103,25 +106,27 @@ std::optional<CollectiveSyncDomain> CollectiveDomain(const CompactSyncInput& inp
         }
       }
     if (effects.empty()) continue;
+    touched.insert(leaf);
     if (writes) {
-      if (effects.size() != 1 || writes != 1 || segment.sites.size() != 1 || segment.count <= 0)
-        return std::nullopt;
+      if (effects.size() != 1 || writes != 1 || segment.sites.size() != 1 || count <= 0) return std::nullopt;
       const auto& [site, pointer] = effects.front();
       const auto& access = *pointer;
       if (!access.exact_footprint || access.after_first || access.row || access.rows != 1 || access.column ||
           access.row_step || access.column_step != access.columns || access.columns <= 0 ||
-          Ordinal(access.columns) * segment.count != domain.columns ||
+          Ordinal(access.columns) * count != domain.columns ||
           access.coordinate_frame != segment.original_loop)
         return std::nullopt;
       if (fill_pipe && (*fill_pipe != site->pipe || proof.row_bytes != access.columns || !covered()))
         return std::nullopt;
+      if (fill_pipe) ends.insert(last_reader);
+      starts.insert(leaf);
       fill_pipe = site->pipe;
       proof.row_bytes = access.columns;
-      proof.rows = segment.count;
+      proof.rows = count;
       proof.fill_leaves.push_back(leaf);
       reads.clear();
     } else {
-      if (!fill_pipe || segment.count != 1) return std::nullopt;
+      if (!fill_pipe || count != 1) return std::nullopt;
       for (const auto& [site, pointer] : effects) {
         const auto& access = *pointer;
         if (site->pipe == *fill_pipe || !access.exact_footprint || access.after_first || access.row ||
@@ -134,9 +139,36 @@ std::optional<CollectiveSyncDomain> CollectiveDomain(const CompactSyncInput& inp
         witnesses.insert(access.column);
         witnesses.insert(end - proof.row_bytes);
       }
+      last_reader = leaf;
     }
   }
   if (!fill_pipe || !covered()) return std::nullopt;
+  ends.insert(last_reader);
+  if (input.region_tree) {
+    // Every source repeat touching this domain must contain whole phases.
+    // The original row-fill loop is already a leaf; no repeated ancestor is
+    // exempt. Even a zero/one-count partial phase cannot borrow the proof.
+    bool qualified = true;
+    using Range = std::optional<std::pair<size_t, size_t>>;
+    std::function<Range(const SyncRegion&)> check = [&](const SyncRegion& region) -> Range {
+      if (region.leaf)
+        return touched.count(*region.leaf) ? Range{{*region.leaf, *region.leaf}} : std::nullopt;
+      Range range;
+      for (const auto& child : region.children) {
+        const auto part = check(child);
+        if (!part) continue;
+        if (!range) range = part;
+        range->second = part->second;
+      }
+      // starts/ends delimit phases whose ENTIRE intervening reader coverage
+      // was checked above. Source intervals are contiguous original regions.
+      if (range && region.repetition && (!starts.count(range->first) || !ends.count(range->second)))
+        qualified = false;
+      return range;
+    };
+    check(*input.region_tree);
+    if (!qualified) return std::nullopt;
+  }
   witnesses.insert(0);
   witnesses.insert(domain.columns - proof.row_bytes);
   proof.witness_columns.assign(witnesses.begin(), witnesses.end());
@@ -782,8 +814,15 @@ NumericalBoundary Point(const CompactSyncResult& result, const NodePtr& node, co
 
 CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string& order) {
   const bool structured = input.region_tree.has_value();
+  bool moving_vec_write = false;
+  for (const auto& segment : input.segments)
+    for (const auto& site : segment.sites)
+      for (const auto& access : site.accesses)
+        moving_vec_write |= input.storage[access.storage].byte_coordinates && access.write &&
+                            (access.row_step || access.column_step);
+  const bool invariant_leaves = structured && !moving_vec_write;
   CompactSyncResult result;
-  if (structured) {
+  if (invariant_leaves) {
     // The initial structured adapter accepts invariant conflict classes only.
     // Slot geometry still needs its own scoped interface proof.
     for (const auto& storage : input.storage)
@@ -791,10 +830,13 @@ CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string
     result = AnalyzeInvariantSyncLeaves(std::move(input));
   } else {
     result.input = std::move(input);
+    IndexSyncStorageAccesses(result);
     for (size_t r = 0; r < result.input.segments.size(); ++r) {
       const auto& original = result.input.segments[r];
       result.segments.push_back(AnalyzeRotatingSegment(result.input, r, Scope(original), result));
-      result.segments.back().repetitions = Repetitions(original);
+      // SourceLayout owns structured repetition; do not duplicate visits in
+      // leaf mathematics or mistake a finite reader for its enclosing loop.
+      result.segments.back().repetitions = structured ? 1 : Repetitions(original);
     }
   }
   auto hierarchy = std::make_shared<NumericalSyncHierarchy>();
@@ -803,7 +845,7 @@ CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string
     hierarchy->segment_offsets.push_back(
         NumericalAdd(hierarchy->segment_offsets.back(), Length(original.count, original.sites.size())));
   const auto start = std::chrono::steady_clock::now();
-  if (structured) {
+  if (invariant_leaves) {
     for (const auto& cell : result.storage_classes)
       hierarchy->cells.push_back({cell.storage, 0, cell.row, cell.column});
     result.interface_cells = hierarchy->cells.size();
@@ -841,8 +883,8 @@ bool NumericalReferenceBefore(const CompactSyncResult& result, const Occurrence&
 }
 namespace {
 const ScopedDemandFamily* QualifiedScopedFamily(const CompactSyncResult& result, size_t family_index) {
-  // The immutable source layout is produced only by the invariant numerical
-  // constructor. It certifies equal internal event relations/exit rows across
+  // The immutable source layout is produced by invariant numerical leaves or
+  // certified complete collective phases. Both retain equal internal rows across
   // repeated uses, including first-touch startup, and the correct reset seams.
   // Injective affine endpoint maps ALONE would not justify this translation.
   if (!result.input.region_tree || !result.hierarchy || !result.hierarchy->source_layout) return nullptr;

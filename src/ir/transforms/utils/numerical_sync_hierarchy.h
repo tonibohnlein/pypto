@@ -17,6 +17,9 @@
 
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 namespace pypto::ir::sync {
+// Construct once on a fresh result: original-access directory for selectors
+// across enclosing frames. Does not rebuild mathematics or mutate source facts.
+void IndexSyncStorageAccesses(CompactSyncResult& result);
 CompactSyncResult AnalyzeInvariantSyncLeaves(CompactSyncInput input);
 CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string& order);
 bool NumericalReferenceBefore(const CompactSyncResult& result, const Occurrence& a, const Occurrence& b);
