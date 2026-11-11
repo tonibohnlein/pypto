@@ -1224,6 +1224,61 @@ std::map<std::string, SyncParameterBounds> CollectSyncParameterBounds(const Prog
                                                                       SyncParameterWork* work) {
   return CollectSyncInvocationEvidence(program, work).parameters;
 }
+// Qualify only already recovered exact geometry. This is one pass over static
+// access descriptions: a noncontiguous rectangle is not expanded into rows and
+// no enclosing interval is substituted for its footprint. Coordinates are
+// relative to the canonical storage identity (including the Vec byte domain).
+static void QualifyPhysicalIntervals(CompactSyncInput& input) {
+  for (auto& segment : input.segments) {
+    for (auto& site : segment.sites) {
+      for (auto& access : site.accesses) {
+        ++input.interval_access_visits;
+        const auto& storage = input.storage.at(access.storage);
+        if (!access.exact_footprint || access.row_step || access.column_step || access.after_first ||
+            !storage.row_parameters.empty() || !storage.column_parameters.empty() || storage.row_block ||
+            storage.column_block || storage.row_extent_parameter)
+          continue;
+        const auto row_end = __int128(access.row) + access.rows;
+        const auto column_end = __int128(access.column) + access.columns;
+        if (access.row < 0 || access.column < 0 || access.rows <= 0 || access.columns <= 0 ||
+            row_end > storage.rows || column_end > storage.columns)
+          continue;
+        __int128 begin = 0, end = 0;
+        if (storage.byte_coordinates) {
+          if (access.row != 0 || access.rows != 1) continue;
+          begin = access.column;
+          end = column_end;
+        } else {
+          const auto elements = __int128(storage.rows) * storage.columns;
+          const auto slot_bytes = storage.slot_count == 1 ? storage.bytes : storage.slot_bytes;
+          if (elements <= 0 || slot_bytes <= 0 || slot_bytes % elements) continue;
+          const auto bytes = slot_bytes / elements;
+          if (storage.layout && storage.layout->slayout_ != TileLayout::none_box) {
+            // Whole qualified fractal tiles are contiguous; partial logical
+            // rectangles need a layout-specific interval proof, not flattening.
+            if (access.row || access.column || access.rows != storage.rows ||
+                access.columns != storage.columns)
+              continue;
+            end = slot_bytes;
+          } else if (!storage.layout || storage.layout->blayout_ == TileLayout::row_major) {
+            if (access.rows != 1 && (access.column || access.columns != storage.columns)) continue;
+            begin = (__int128(access.row) * storage.columns + access.column) * bytes;
+            end = begin + __int128(access.rows) * access.columns * bytes;
+          } else if (storage.layout->blayout_ == TileLayout::col_major) {
+            if (access.columns != 1 && (access.row || access.rows != storage.rows)) continue;
+            begin = (__int128(access.column) * storage.rows + access.row) * bytes;
+            end = begin + __int128(access.rows) * access.columns * bytes;
+          } else {
+            continue;
+          }
+        }
+        access.physical_interval = std::make_pair(Checked(begin), Checked(end));
+        ++input.qualified_intervals;
+      }
+    }
+  }
+}
+
 CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target,
                                   const SyncParameterBounds& parameter_bounds,
                                   const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
@@ -1297,6 +1352,7 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
     importer.result.region_tree = ImportStructuredBody(importer, function->body_, frames, nested);
     CHECK(QualifyStartupScopes(*importer.result.region_tree, importer.result).pending.empty())
         << "Initialization scope is outside the retained source tree";
+    QualifyPhysicalIntervals(importer.result);
     return std::move(importer.result);
   }
   for (const auto& stmt : Statements(function->body_)) {
@@ -1381,6 +1437,7 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
             << "Rotating family requires one common stride within a region";
       }
   }
+  QualifyPhysicalIntervals(importer.result);
   return std::move(importer.result);
 }
 }  // namespace pypto::ir::sync

@@ -9,7 +9,7 @@ review acceptance before implementation of the next. Passing recognition is not
 passing analysis, executable realization, allocation, or native qualification.
 
 | Stage | Production construction | Required review evidence |
-| --- | --- | --- |
+| ----- | ----------------------- | ------------------------ |
 | 1 | Existing MultiBuffer allocation/selection operations, Tile-to-Buffer adapter, physical slot descriptors | Physical address agreement, aliases, serialization, verification, codegen and negative geometry/range tests |
 | 2 | Common-stride modular extraction and periodic reduction | Independently extracted closure, actual covers, queries/selectors; no slot/visit expansion |
 | 3 | Numerical chain interfaces and shared regional composition | Actual covers and queries across partitions/resets; indexed boundary work and retained-size bounds |
@@ -243,7 +243,6 @@ model. Closed notifications do not establish native payload completion at return
 Native slot eligibility and C++ generation are reported separately from analysis
 and flag allocation; no device qualification is implied.
 
-
 Stage 5 accepted: **1,796 tests passed** (94.44 seconds), including **38 focused
 physical tests and four PTOAS C++ cases**. Both independent architecture/algorithm
 and correctness reviewers accepted the source and focused evidence before the
@@ -281,7 +280,7 @@ actual intervening vector operation and qualifies through cross-pipe demands.
 No payload was inserted into the original case and no hardware rule was changed.
 
 | Draft construction | Established evidence | Remaining boundary |
-| --- | --- | --- |
+| ------------------ | -------------------- | ------------------ |
 | Common-stride rotating demands | Exact selected-model covers, four event queries, modular selectors; no trip or joint-period expansion | General alias/layout recovery and startup-dependent rotating effects |
 | Numerical regional composition | Independent flat/composed covers, queries and selectors across contiguous regions and resets | Complete interface output may enumerate physical slot support |
 | Shared reset repetition | Retained mathematics and logarithmic shared-node growth | Physical repeated-family transport is explicitly unavailable |
@@ -304,3 +303,42 @@ PYTHONPATH="$PWD/python" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 The receipt retains each accepted stage and the earlier failed attempts. The
 implementation is uncommitted at this checkpoint. Default dispatch, the resource
 pool, allocation algorithm and hardware exemptions are unchanged.
+
+## Interval and collective-interface follow-up
+
+The next implementation starts from compiler `e10d882b2348` and draft
+`3a7c65b`, on a separate branch from the pinned device campaign. Its five
+review gates cover exact interval evidence, interval-sweep generation,
+collective-row boundaries, numerical composition/realization and final
+qualification. General symbolic crossing selectors and allocation changes
+remain outside this work.
+
+### M1: exact interval evidence
+
+`SyncAccess::physical_interval` is an optional half-open byte range inside
+its canonical slot. The existing Vec byte domain uses its canonical byte
+coordinates. Modes, slot selection and occurrence frames remain separate.
+The importer qualifies whole boxed tiles, dense row/column-major contiguous
+rectangles and existing exact byte intervals. Partial boxed footprints,
+noncontiguous rectangles, moving/parameter-translated accesses and enclosures
+retain their original effects without an interval certificate. Missing evidence
+is not absence. No demand, merge, endpoint or allocation algorithm changes.
+
+Qualification visits each supplied static access once. Existing Vec access
+recovery can already enumerate strided rows; these input intervals are retained,
+not merged across gaps. Thus M1 does not claim row-independent access recovery
+or the full draft interval-list recognizer. Native footprint qualification
+remains the existing operation contract.
+
+Run `python -m tests.ut.ir.transforms.qualify_buffered_intervals --output
+build-py314/interval-m1-baseline.json` for the pre-sweep baseline, using the
+worktree-built extension. It records source/binary hashes, inspected work,
+retained demands, physical outcomes and physical IR hashes when available.
+The five baseline ring cases retain their existing same-pipe realization refusal;
+this is not a capacity witness. Timing samples are descriptive.
+The first test attempt used an obsolete default PTOAS launcher; all four C++
+failures were environment failures. Reruns use pinned PTOAS v0.72 with its
+compatible Python on PATH. No source or expectation was changed to repair them.
+
+M1 accepted by architecture, correctness and algorithm/performance reviewers.
+The focused gate passed **206 tests** with 18 existing inline-annotation warnings.

@@ -84,6 +84,9 @@ struct SyncAccess {
   // Original normalized coordinate controlling row_step/column_step. Null
   // means invariant geometry. It may be an enclosing frame of a finite leaf.
   ForStmtPtr coordinate_frame;
+  // Exact half-open physical byte range within the canonical slot. Missing
+  // means this geometry has no admitted interval export, never an empty effect.
+  std::optional<std::pair<int64_t, int64_t>> physical_interval;
 };
 struct SyncSite {
   CallPtr original;
@@ -140,6 +143,7 @@ struct CompactSyncInput {
   std::optional<std::pair<int64_t, int64_t>> block_bounds;
   std::optional<SyncRegion> region_tree;
   size_t coordinate_nodes = 0, coordinate_flatten_visits = 0, coordinate_coefficient_entries = 0;
+  size_t interval_access_visits = 0, qualified_intervals = 0;
 };
 // Explicit qualification, not a default alias assumption. Unsupported input
 // throws a documented ValueError; no effects are skipped. Enclosures are explicit

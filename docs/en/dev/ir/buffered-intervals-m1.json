@@ -1,0 +1,339 @@
+{
+  "source_revision": "e10d882b23480d170377dd6fa227831354db8d49",
+  "source_hashes": {
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "db7fd180662f45665cd02f0f1f0394622094ab0185c4948e6f1af9a289181c4f",
+    "python/bindings/modules/testing.cpp": "88ef1fa30c9f9f5cb96b4d6da4e0a5c86cd9686e634f6a3e01e96efc9efb4bf0",
+    "python/pypto/pypto_core/testing.pyi": "ddcf3052f2dbc8a3d3801e322e3bf5c91ace2bc20cdd14b622f9a49a6905d43d",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "ed69e0e98bc20d153f74bb262103d824fb5912da777416ac0dfb16dba336dd2d",
+    "tests/ut/ir/transforms/qualify_buffered_intervals.py": "00b44b13edc98bb14288a494d4bbdfbc740847a67264dbf1086f9f4daa5e0ff3",
+    "tests/ut/ir/transforms/test_parameterized_sync.py": "ef28df1205c299e1090e70a27c44e82f9b842a4e6ac0cee0ffbbbce7aecf01b2",
+    "tests/ut/ir/transforms/test_slot_sync_import.py": "aa0e89c7f56787cb1507f8e79e011e00d08fb0fc207db51073b0702688b2cef8"
+  },
+  "extension_hashes": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "22c2b559e2ef834a30f73d2a5f7f1a2e38c62a48c3479dd13e679ae54d01eb66"
+  },
+  "device": "not run",
+  "timing": "single descriptive samples; no speedup claim",
+  "cases": [
+    {
+      "count": 7,
+      "slots": 3,
+      "analysis_seconds_inclusive": 0.0006381319835782051,
+      "interval_access_visits": 6,
+      "qualified_intervals": 6,
+      "atom_tests": 5,
+      "rotating_fragments": 4,
+      "sort_comparisons": 4,
+      "sweep_visits": 12,
+      "shortest_path_edge_visits": 84,
+      "retained_frontier_entries": 36,
+      "generators": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          0,
+          3
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          3
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "demands": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          3
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "physical": "Unavailable same-pipe barrier mechanism",
+      "physical_seconds": 0.18038567388430238
+    },
+    {
+      "count": 1000,
+      "slots": 3,
+      "analysis_seconds_inclusive": 0.00037971511483192444,
+      "interval_access_visits": 6,
+      "qualified_intervals": 6,
+      "atom_tests": 5,
+      "rotating_fragments": 4,
+      "sort_comparisons": 4,
+      "sweep_visits": 12,
+      "shortest_path_edge_visits": 84,
+      "retained_frontier_entries": 36,
+      "generators": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          0,
+          3
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          3
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "demands": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          3
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "physical": "Unavailable same-pipe barrier mechanism",
+      "physical_seconds": 4.56920824944973e-05
+    },
+    {
+      "count": 1000000,
+      "slots": 3,
+      "analysis_seconds_inclusive": 0.00032202480360865593,
+      "interval_access_visits": 6,
+      "qualified_intervals": 6,
+      "atom_tests": 5,
+      "rotating_fragments": 4,
+      "sort_comparisons": 4,
+      "sweep_visits": 12,
+      "shortest_path_edge_visits": 84,
+      "retained_frontier_entries": 36,
+      "generators": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          0,
+          3
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          3
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "demands": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          3
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "physical": "Unavailable same-pipe barrier mechanism",
+      "physical_seconds": 2.6001129299402237e-05
+    },
+    {
+      "count": 7,
+      "slots": 101,
+      "analysis_seconds_inclusive": 0.000290790107101202,
+      "interval_access_visits": 6,
+      "qualified_intervals": 6,
+      "atom_tests": 5,
+      "rotating_fragments": 4,
+      "sort_comparisons": 4,
+      "sweep_visits": 12,
+      "shortest_path_edge_visits": 84,
+      "retained_frontier_entries": 36,
+      "generators": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          0,
+          101
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          101
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "demands": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          101
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "physical": "Unavailable same-pipe barrier mechanism",
+      "physical_seconds": 2.139480784535408e-05
+    },
+    {
+      "count": 7,
+      "slots": 1000003,
+      "analysis_seconds_inclusive": 0.0002846228890120983,
+      "interval_access_visits": 6,
+      "qualified_intervals": 6,
+      "atom_tests": 5,
+      "rotating_fragments": 4,
+      "sort_comparisons": 4,
+      "sweep_visits": 12,
+      "shortest_path_edge_visits": 84,
+      "retained_frontier_entries": 36,
+      "generators": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          0,
+          1000003
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          1000003
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "demands": [
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          1000003
+        ],
+        [
+          2,
+          2,
+          1
+        ]
+      ],
+      "physical": "Unavailable same-pipe barrier mechanism",
+      "physical_seconds": 1.988699659705162e-05
+    }
+  ]
+}

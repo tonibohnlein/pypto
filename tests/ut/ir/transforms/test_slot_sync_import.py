@@ -12,7 +12,10 @@
 import pytest
 from pypto import ir, testing
 
+from .sync_matmul_cases import staged_fixture
 from .sync_matmul_oracle import sequence_stmts
+from .test_indexed_sync_analysis import indexed_fixture
+from .test_vec_sync_analysis import vec_fixture
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
@@ -90,6 +93,111 @@ def test_slot_access_description_matches_original_addresses(slots, stride, phase
                 assert ring["address"] + 128 * selected == 128 * actual
     assert not result["analysis_available"]
     assert result["regions"][0]["demands"] is None
+
+
+@pytest.mark.parametrize("count, slots", [(0, 3), (7, 6), (1000000, 1000003)])
+def test_exact_interval_evidence_retains_physical_aliases(count, slots):
+    description = testing.describe_placed_sync_input(slot_fixture(count, slots, alias=True), True)
+    visits = 0
+    for site in description["regions"][0]["sites"]:
+        for access, interval in zip(site["accesses"], site["physical_intervals"], strict=True):
+            visits += 1
+            # All accesses in this original fixture cover 32 contiguous FP32
+            # elements. Aliasing handles retain the same family and byte range.
+            assert interval == (0, 128)
+    assert description["interval_access_visits"] == visits
+    assert description["qualified_intervals"] == visits
+    assert not description["analysis_available"]
+
+
+def interval_extract_fixture(major, boxed, shape, offset):
+    """Ready full Mat fill followed by an original partial operand extraction."""
+    span = ir.Span.unknown()
+    index, fp = ir.DataType.INDEX, ir.DataType.FP32
+
+    def ci(x):
+        return ir.ConstInt(x, index, span)
+
+    def tup(xs):
+        return ir.MakeTuple([ci(x) for x in xs], span)
+
+    def call(name, args, ty=None):
+        return ir.Call(ir.get_op(name), args, ty or ir.VoidType(), span)
+
+    minor = ir.TileLayout.row_major if boxed else ir.TileLayout.none_box
+    source_type = ir.BufferType([32, 32], fp, ir.MemorySpace.Mat, blayout=major, slayout=minor, fractal=512)
+    target_type = ir.BufferType(shape, fp, ir.MemorySpace.Left, blayout=major, slayout=minor, fractal=512)
+    source, target = ir.Var("source", source_type, span), ir.Var("target", target_type, span)
+    arg = ir.Var("arg", ir.TensorType([32, 32], fp), span)
+    statements: list[ir.Stmt] = [
+        ir.AssignStmt(source, call("buffer.alloc", [tup([]), ci(0)], source_type), span),
+        ir.AssignStmt(target, call("buffer.alloc", [tup([]), ci(0)], target_type), span),
+        ir.EvalStmt(call("buffer.load", [arg, tup([0, 0]), tup([32, 32]), source]), span),
+        ir.EvalStmt(call("buffer.extract", [source, ci(offset[0]), ci(offset[1]), target]), span),
+        ir.ReturnStmt([], span),
+    ]
+    return ir.Function(
+        "interval_extract",
+        [arg],
+        [],
+        ir.SeqStmts(statements, span),
+        span,
+        ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+
+
+@pytest.mark.parametrize(
+    "major, boxed, shape, offset, expected",
+    [
+        (ir.TileLayout.row_major, False, [16, 32], [16, 0], (2048, 4096)),
+        (ir.TileLayout.col_major, False, [32, 16], [0, 16], (2048, 4096)),
+        (ir.TileLayout.row_major, False, [16, 16], [16, 16], None),
+        (ir.TileLayout.col_major, False, [16, 16], [16, 16], None),
+        (ir.TileLayout.col_major, True, [16, 16], [16, 16], None),
+        (ir.TileLayout.col_major, True, [32, 32], [0, 0], (0, 4096)),
+    ],
+)
+def test_partial_intervals_require_exact_layout(major, boxed, shape, offset, expected):
+    description = testing.describe_placed_sync_input(
+        interval_extract_fixture(major, boxed, shape, offset), True
+    )
+    source_access = description["regions"][0]["sites"][-1]
+    assert source_access["physical_intervals"][0] == expected
+    assert source_access["access_precision"][0] == "exact"
+    assert source_access["accesses"][0][2:4] == tuple(offset)
+    if expected is not None and not boxed:
+        # Independent element-address enumeration; no compiler cell partition.
+        addresses = set()
+        for row in range(offset[0], offset[0] + shape[0]):
+            for col in range(offset[1], offset[1] + shape[1]):
+                element = row * 32 + col if major == ir.TileLayout.row_major else col * 32 + row
+                addresses.update(range(4 * element, 4 * element + 4))
+        assert addresses == set(range(*expected))
+
+
+def test_interval_unavailability_preserves_enclosed_and_moving_effects():
+    enclosed = testing.describe_placed_sync_input(indexed_fixture(), True)
+    moving = testing.describe_placed_sync_input(staged_fixture(2), True)
+    counts = [0, 0]
+    for kind, description in enumerate([enclosed, moving]):
+        for region in description["regions"]:
+            for site in region["sites"]:
+                for access, precision, interval in zip(
+                    site["accesses"], site["access_precision"], site["physical_intervals"], strict=True
+                ):
+                    if (kind == 0 and precision == "enclosure") or (kind == 1 and any(access[4:6])):
+                        assert interval is None
+                        assert access[6] > 0 and access[7] > 0
+                        counts[kind] += 1
+    assert all(counts)
+
+
+def test_interval_offsets_preserve_strided_view_gaps():
+    description = testing.describe_placed_sync_input(vec_fixture(view="nested"), True)
+    # Existing recovery lists the two rows. Qualification must not fill the gap.
+    site = description["regions"][0]["sites"][2]
+    assert site["physical_intervals"][:2] == [(288, 320), (416, 448)]
 
 
 def test_recognition_does_not_enumerate_slots_or_trips():

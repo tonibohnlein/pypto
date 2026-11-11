@@ -38,6 +38,16 @@ def test_pypto_lib_invocation_coordinates(name):
     with pytest.raises(ValueError, match="established caller range"):
         testing.analyze_placed_sync(original, True)
     retained = testing.analyze_placed_sync(original, True, parameter_bounds=bounds)
+    description = retained.describe()
+    translated = 0
+    for region in description["regions"]:
+        for site in region["sites"]:
+            for access, interval in zip(site["accesses"], site["physical_intervals"], strict=True):
+                storage = description["storage"][access[0]]
+                if storage["row_parameters"] or storage["column_parameters"]:
+                    assert interval is None  # A relative offset is not a fixed physical interval.
+                    translated += 1
+    assert translated
     physical = retained.realize_physical("a2a3", list(range(6)))
     for row, col in [(0, 0), (64, 128), (192, 192)]:
         parameters = {1: row, 3: col}
