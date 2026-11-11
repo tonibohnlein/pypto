@@ -12,7 +12,7 @@
 System operations handle hardware synchronization and cross-core communication:
 - sync_src / sync_dst: Set/Wait flag-based synchronization between pipes
 - set_ffts / sync_set / sync_wait: Explicit Cube/Vector cross-core event synchronization
-- barrier: Barrier synchronization for vector, matrix, or all pipelines on one core
+- barrier: Barrier synchronization for a supported hardware pipeline, or all pipelines, on one core
 - tpush_to_aiv / tpush_to_aic: Push tile data across cores
 - tpop_from_aic / tpop_from_aiv: Pop tile data from cross-core pipe
 - aic_initialize_pipe / aiv_initialize_pipe: Initialize cross-core pipes
@@ -175,15 +175,20 @@ def _create_sync_op(
     return _ir_core.create_op_call(op_name, [], kwargs, actual_span)
 
 
-def _create_barrier_op(op_name: str, *, span: Span | None) -> Call:
+def _create_barrier_op(op_name: str, *, core_type_attr: str | None = None, span: Span | None) -> Call:
     """Create a barrier synchronization operation.
 
     Args:
         op_name: Operation name (e.g., "system.bar_v")
+        core_type_attr: Already-validated IR spelling of the kernel to pin the
+            barrier to (``"aic"`` / ``"aiv"``); ``None`` leaves it in both.
+            Validated by the caller, which knows the public API name to blame
+            -- these ops are reached as ``system.barrier``, not by op name.
         span: Optional source span for debugging
     """
     actual_span = _get_span_or_capture(span, frame_offset=2)
-    return _ir_core.create_op_call(op_name, [], {}, actual_span)
+    kwargs: dict[str, Any] = {} if core_type_attr is None else {"core_type": core_type_attr}
+    return _ir_core.create_op_call(op_name, [], kwargs, actual_span)
 
 
 def sync_src(
@@ -384,31 +389,75 @@ def sync_wait(
     )
 
 
-def barrier(*, pipe: PipeType, span: Span | None = None) -> Call:
-    """Order work across a vector, matrix, or all-pipeline barrier on one core.
+def barrier(*, pipe: PipeType, core_type: KernelType | None = None, span: Span | None = None) -> Call:
+    """Order work on one pipeline, or across all of them, on one core.
+
+    Every ``PipeType`` member except ``S`` is accepted. A barrier is pipe-scoped rather than
+    operation-scoped: it drains whatever was issued on that pipe, so the pipe a
+    transfer rides decides which barrier orders it. On A5 that mapping is
+    ``Backend::InferTransferPipe`` -- GM <-> UB and GM -> L1 ride MTE2/MTE3,
+    UB -> L1 also rides MTE3, L1 -> L0A/L0B rides MTE1, and the L0C writeback
+    rides FIX.
 
     Args:
-        pipe: ``PipeType.V``, ``PipeType.M``, or ``PipeType.ALL``. A single-pipe
-            barrier orders that pipeline's preceding and following work; ALL
-            waits for preceding work across all pipelines on the current core.
+        pipe: The pipeline to drain, or ``PipeType.ALL`` for every pipeline on
+            the current core. A single-pipe barrier orders that pipeline's
+            preceding and following work and spends no event slot. It is NOT a
+            drop-in replacement for a ``set_flag`` / ``wait_flag`` pair: a
+            barrier drains one pipe, where a flag pair orders one producer ->
+            consumer dependency BETWEEN two pipes. Use a flag pair (or ``ALL``)
+            for a cross-pipeline handoff, which matters most in a function
+            carrying static flags, where PTOAS skips automatic synchronization.
+        core_type: Which kernel the barrier lands in when a mixed InCore
+            function is expanded into an AIC and an AIV kernel. The two lanes
+            own different pipelines -- FIX and MTE1 are cube-side, V is
+            vector-side -- so a mixed kernel should pin a single-pipe barrier to
+            the lane that owns the pipe. Omit it to leave the barrier in both,
+            which is what an explicitly typed AIC/AIV function wants.
         span: Optional source span for debugging (auto-captured if not provided).
 
     Returns:
         Barrier call expression with no result value.
 
+    ``PipeType.S`` is rejected: scalar ordering is automatic, and an explicit
+    scalar barrier is documented to cause a hardware error on A2/A3.
+
+    A barrier is rejected inside ``pl.pipeline``, as explicit flags are: it has
+    no operand, so pipeline scheduling has no dependency edge to hold it in
+    place and could order it before the transfer it was written to follow.
+
     Raises:
-        TypeError: If pipe is not a PipeType member.
-        ValueError: If pipe is not V, M, or ALL.
+        TypeError: If pipe is not a PipeType member, or core_type is not a
+            KernelType member.
+        ValueError: If pipe is PipeType.S, or core_type is KernelType.MIX, which names a participant
+            set rather than one kernel; omit it to reach both lanes.
     """
     # Preserve the established IR and native PTO barrier lowering. Barriers
     # have no event ID and must not allocate or consume pipeline event slots.
+    # Validate membership before lookup. Scalar ordering is native; exposing
+    # PIPE_S would emit an unsupported instruction on A2/A3.
     op_names = {
-        PipeType.V: "system.bar_v",
+        PipeType.MTE1: "system.bar_mte1",
+        PipeType.MTE2: "system.bar_mte2",
+        PipeType.MTE3: "system.bar_mte3",
         PipeType.M: "system.bar_m",
+        PipeType.V: "system.bar_v",
+        PipeType.FIX: "system.bar_fix",
         PipeType.ALL: "system.bar_all",
     }
     _check_enum(pipe, PipeType, "pipe", "system.barrier", allowed=tuple(op_names))
-    return _create_barrier_op(op_names[pipe], span=span)
+    core_type_attr = None
+    if core_type is not None:
+        _check_enum(
+            core_type,
+            KernelType,
+            "core_type",
+            "system.barrier",
+            allowed=_SYNC_EVENT_KERNELS,
+            hint=_SYNC_EVENT_MIX_HINT,
+        )
+        core_type_attr = _SYNC_EVENT_CORE_TYPE[core_type]
+    return _create_barrier_op(op_names[pipe], core_type_attr=core_type_attr, span=span)
 
 
 def fence(*, span: Span | None = None) -> Call:
