@@ -13,7 +13,7 @@ import pytest
 from pypto import ir, testing
 
 from .sync_matmul_cases import staged_fixture
-from .sync_matmul_oracle import validate
+from .sync_matmul_oracle import sequence_stmts, validate
 from .test_rotating_sync_analysis import rotating_fixture
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
@@ -34,32 +34,36 @@ def regional_fixture(counts, slots=3, start=0, step=1, schedules=None):
         for i, count in enumerate(counts)
     ]
     first = functions[0]
-    allocations = list(first.body.stmts[:-2])
+    allocations = list(sequence_stmts(first.body)[:-2])
     shared = {var.name_hint: var for var in first.params}
-    shared.update({stmt.var.name_hint: stmt.var for stmt in allocations})
+    for stmt in allocations:
+        assert isinstance(stmt, ir.AssignStmt)
+        shared[stmt.var.name_hint] = stmt.var
 
     class Bind(ir.IRMutator):
-        def visit_var(self, var):
-            return shared.get(var.name_hint, var)
+        def visit_var(self, op):
+            return shared.get(op.name_hint, op)
 
     loops = []
     for count, function in zip(counts, functions, strict=True):
-        loop = Bind().visit_stmt(function.body.stmts[-2])
+        loop = Bind().visit_stmt(sequence_stmts(function.body)[-2])
+        assert isinstance(loop, ir.ForStmt)
         if count is not None:
             loops.append(loop)
         else:
+            loop_start, loop_var = loop.start, loop.loop_var
 
             class Resolve(ir.IRMutator):
-                def visit_var(self, var):
-                    return loop.start if var.name_hint == loop.loop_var.name_hint else var
+                def visit_var(self, op):
+                    return loop_start if op.name_hint == loop_var.name_hint else op
 
-            finite = Resolve().visit_stmt(ir.SeqStmts(list(loop.body.stmts[:-1]), loop.span))
-            loops.extend(finite.stmts)
+            finite = Resolve().visit_stmt(ir.SeqStmts(list(sequence_stmts(loop.body)[:-1]), loop.span))
+            loops.extend(sequence_stmts(finite))
     return ir.Function(
         "rotating_sequence",
         [first.params[0], (first.params[1], ir.ParamDirection.InOut)],
         first.return_types,
-        ir.SeqStmts([*allocations, *loops, first.body.stmts[-1]], first.span),
+        ir.SeqStmts([*allocations, *loops, sequence_stmts(first.body)[-1]], first.span),
         first.span,
         ir.FunctionType.AIV,
         ir_stage=ir.FunctionIRStage.Buffer,
@@ -77,7 +81,7 @@ def repeated_fixture(inner, outer, slots=3, inner_start=0, inner_step=1):
         ir.ConstInt(2 + outer * 3, index, span),
         ir.ConstInt(3, index, span),
         [],
-        ir.SeqStmts([function.body.stmts[-2], ir.YieldStmt([], span)], span),
+        ir.SeqStmts([sequence_stmts(function.body)[-2], ir.YieldStmt([], span)], span),
         [],
         span,
     )
@@ -85,7 +89,7 @@ def repeated_fixture(inner, outer, slots=3, inner_start=0, inner_step=1):
         "rotating_replay",
         [function.params[0], (function.params[1], ir.ParamDirection.InOut)],
         function.return_types,
-        ir.SeqStmts([*function.body.stmts[:-2], loop, function.body.stmts[-1]], span),
+        ir.SeqStmts([*sequence_stmts(function.body)[:-2], loop, sequence_stmts(function.body)[-1]], span),
         span,
         ir.FunctionType.AIV,
         ir_stage=ir.FunctionIRStage.Buffer,
@@ -196,7 +200,7 @@ def test_unused_slot_allocation_does_not_change_protected_matmul_route():
         original.name,
         [*original.params[:-1], (original.params[-1], ir.ParamDirection.InOut)],
         original.return_types,
-        ir.SeqStmts([allocation, *original.body.stmts], span),
+        ir.SeqStmts([allocation, *sequence_stmts(original.body)], span),
         span,
         ir.FunctionType.AIC,
         ir_stage=ir.FunctionIRStage.Buffer,

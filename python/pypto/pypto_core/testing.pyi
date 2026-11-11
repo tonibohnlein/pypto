@@ -266,6 +266,6 @@ def describe_placed_sync_input(
     disjoint_gm: bool,
     target: str = "a2a3",
     parameter_bounds: dict[int, tuple[int, int]] = {},
-) -> dict:
+) -> dict[str, Any]:
     """Inspect qualified physical accesses without constructing demands or exports."""
     ...

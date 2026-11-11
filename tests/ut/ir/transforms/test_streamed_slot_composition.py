@@ -12,7 +12,7 @@
 import pytest
 from pypto import ir, testing
 
-from .sync_matmul_oracle import validate
+from .sync_matmul_oracle import sequence_stmts, validate
 from .test_rotating_sync_analysis import rotating_fixture
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
@@ -33,20 +33,22 @@ def streamed_fixture(count, start=0, step=1, shared=False, shift=0, duplicate_st
     )
 
     class Share(ir.IRMutator):
-        def visit_var(self, var):
-            return output if any(var.same_as(p) for p in function.params) else var
+        def visit_var(self, op):
+            return output if any(op.same_as(p) for p in function.params) else op
 
-        def visit_call(self, call):
-            call = super().visit_call(call)
-            if shift and call.op.name == ir.get_op("buffer.load").name:
-                args = list(call.args)
+        def visit_call(self, op):
+            op = super().visit_call(op)
+            assert isinstance(op, ir.Call)
+            if shift and op.op.name == ir.get_op("buffer.load").name:
+                args = list(op.args)
+                assert isinstance(args[1], ir.MakeTuple)
                 offsets = list(args[1].elements)
                 offsets[0] = ir.Add(
-                    offsets[0], ir.ConstInt(shift, ir.DataType.INDEX, call.span), ir.DataType.INDEX, call.span
+                    offsets[0], ir.ConstInt(shift, ir.DataType.INDEX, op.span), ir.DataType.INDEX, op.span
                 )
-                args[1] = ir.MakeTuple(offsets, call.span)
-                return ir.Call(call.op, args, call.type, call.span)
-            return call
+                args[1] = ir.MakeTuple(offsets, op.span)
+                return ir.Call(op.op, args, op.type, op.span)
+            return op
 
     return ir.Function(
         function.name,
@@ -63,24 +65,31 @@ def streamed_sequence(count, outside_reader=False, resident_reader=False):
     """Resident local prologue/tail surrounding one owning streamed child."""
     function = streamed_fixture(count)
     shared = {v.name_hint: v for v in function.params}
-    shared.update({s.var.name_hint: s.var for s in function.body.stmts[:-2]})
+    for stmt in sequence_stmts(function.body)[:-2]:
+        assert isinstance(stmt, ir.AssignStmt)
+        shared[stmt.var.name_hint] = stmt.var
 
     def finite_body(operation, suffix, read_output=False):
         other = rotating_fixture(1, [(3, 1)], [(operation, 0, 0)], suffix=suffix)
-        loop = other.body.stmts[-2]
+        loop = sequence_stmts(other.body)[-2]
+        assert isinstance(loop, ir.ForStmt)
 
         class Bind(ir.IRMutator):
-            def visit_var(self, var):
-                if var.name_hint == loop.loop_var.name_hint:
+            def visit_var(self, op):
+                if op.name_hint == loop.loop_var.name_hint:
                     return loop.start
-                if read_output and var.name_hint == "a":
+                if read_output and op.name_hint == "a":
                     return function.params[1]
-                return shared.get(var.name_hint, var)
+                return shared.get(op.name_hint, op)
 
-        body = ir.SeqStmts(list(loop.body.stmts[:-1]), function.span)
-        return list(Bind().visit_stmt(body).stmts)
+        body = ir.SeqStmts(list(sequence_stmts(loop.body)[:-1]), function.span)
+        return list(sequence_stmts(Bind().visit_stmt(body)))
 
-    roots = [*function.body.stmts[:-2], *finite_body("load", "_prologue"), function.body.stmts[-2]]
+    roots = [
+        *sequence_stmts(function.body)[:-2],
+        *finite_body("load", "_prologue"),
+        sequence_stmts(function.body)[-2],
+    ]
     if resident_reader:
         # Separate qualified fixture: the prologue reader creates the needed
         # cross-pipe release before the next DMA overwrites its resident slot.
@@ -91,7 +100,7 @@ def streamed_sequence(count, outside_reader=False, resident_reader=False):
         "streamed_sequence",
         [function.params[0], (function.params[1], ir.ParamDirection.InOut)],
         function.return_types,
-        ir.SeqStmts([*roots, function.body.stmts[-1]], function.span),
+        ir.SeqStmts([*roots, sequence_stmts(function.body)[-1]], function.span),
         function.span,
         ir.FunctionType.AIV,
         ir_stage=ir.FunctionIRStage.Buffer,
@@ -108,7 +117,7 @@ def streamed_reset(inner, outer):
         ir.ConstInt(outer, index, span),
         ir.ConstInt(1, index, span),
         [],
-        ir.SeqStmts([function.body.stmts[-2], ir.YieldStmt([], span)], span),
+        ir.SeqStmts([sequence_stmts(function.body)[-2], ir.YieldStmt([], span)], span),
         [],
         span,
     )
@@ -116,7 +125,7 @@ def streamed_reset(inner, outer):
         "streamed_reset",
         [function.params[0], (function.params[1], ir.ParamDirection.InOut)],
         function.return_types,
-        ir.SeqStmts([*function.body.stmts[:-2], loop, function.body.stmts[-1]], span),
+        ir.SeqStmts([*sequence_stmts(function.body)[:-2], loop, sequence_stmts(function.body)[-1]], span),
         span,
         ir.FunctionType.AIV,
         ir_stage=ir.FunctionIRStage.Buffer,
@@ -138,8 +147,12 @@ def test_original_stride_and_absent_rows(count):
     validate(function, result)
     absent = result.boundary(1, 0, 0)
     assert absent is not None and absent["first_writer"] is None
-    assert result.boundary(1, 1, 0)["first_writer"] is not None
-    assert result.boundary(1, 2, 0)["first_writer"] is None
+    present = result.boundary(1, 1, 0)
+    assert present is not None
+    assert present["first_writer"] is not None
+    absent_writer = result.boundary(1, 2, 0)
+    assert absent_writer is not None
+    assert absent_writer["first_writer"] is None
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 5])
@@ -180,21 +193,24 @@ def test_streamed_output_does_not_materialize_one_cell_per_visit(count):
     assert desc["interface_entries"] == baseline["interface_entries"]
     assert desc["interface_entries"] <= 4096
     assert desc["merge_nodes"] <= 3
-    assert result.boundary(1, count - 1, 0)["last_writer"] is not None
+    boundary = result.boundary(1, count - 1, 0)
+    assert boundary is not None
+    assert boundary["last_writer"] is not None
 
 
 def test_mismatched_read_write_translation_refuses():
     function = streamed_fixture(3, shared=True)
 
     class StationaryRead(ir.IRMutator):
-        def visit_call(self, call):
-            call = super().visit_call(call)
-            if call.op.name == ir.get_op("buffer.load").name:
-                args = list(call.args)
-                zero = ir.ConstInt(0, ir.DataType.INDEX, call.span)
-                args[1] = ir.MakeTuple([zero, zero], call.span)
-                return ir.Call(call.op, args, call.type, call.span)
-            return call
+        def visit_call(self, op):
+            op = super().visit_call(op)
+            assert isinstance(op, ir.Call)
+            if op.op.name == ir.get_op("buffer.load").name:
+                args = list(op.args)
+                zero = ir.ConstInt(0, ir.DataType.INDEX, op.span)
+                args[1] = ir.MakeTuple([zero, zero], op.span)
+                return ir.Call(op.op, args, op.type, op.span)
+            return op
 
     with pytest.raises(ValueError, match="common translation"):
         testing.analyze_placed_sync(StationaryRead().visit_function(function), True)
@@ -207,22 +223,24 @@ def test_column_translation_agrees_with_original_accesses(count):
     replacements = {p.name_hint: ir.Var(p.name_hint, tensor, function.span) for p in function.params}
 
     class Columns(ir.IRMutator):
-        def visit_var(self, var):
-            return replacements.get(var.name_hint, var)
+        def visit_var(self, op):
+            return replacements.get(op.name_hint, op)
 
-        def visit_call(self, call):
-            call = super().visit_call(call)
-            if call.op.name in {ir.get_op("buffer.load").name, ir.get_op("buffer.store").name}:
-                args = list(call.args)
+        def visit_call(self, op):
+            op = super().visit_call(op)
+            assert isinstance(op, ir.Call)
+            if op.op.name in {ir.get_op("buffer.load").name, ir.get_op("buffer.store").name}:
+                args = list(op.args)
+                assert isinstance(args[1], ir.MakeTuple)
                 column = ir.Mul(
                     args[1].elements[0],
-                    ir.ConstInt(32, ir.DataType.INDEX, call.span),
+                    ir.ConstInt(32, ir.DataType.INDEX, op.span),
                     ir.DataType.INDEX,
-                    call.span,
+                    op.span,
                 )
-                args[1] = ir.MakeTuple([ir.ConstInt(0, ir.DataType.INDEX, call.span), column], call.span)
-                return ir.Call(call.op, args, call.type, call.span)
-            return call
+                args[1] = ir.MakeTuple([ir.ConstInt(0, ir.DataType.INDEX, op.span), column], op.span)
+                return ir.Call(op.op, args, op.type, op.span)
+            return op
 
     a, output = (replacements[p.name_hint] for p in function.params)
     modified = ir.Function(

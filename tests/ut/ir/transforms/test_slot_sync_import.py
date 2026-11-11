@@ -12,6 +12,8 @@
 import pytest
 from pypto import ir, testing
 
+from .sync_matmul_oracle import sequence_stmts
+
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 
@@ -46,7 +48,7 @@ def slot_fixture(count=5, slots=3, stride=1, phase=0, start=0, step=1, alias=Fal
     expression = ir.Add(ir.Mul(iv, ci(stride), index, span), ci(phase), index, span)
     selection = ir.FloorMod(expression, ci(slots), index, span)
     x, y = ir.Var("x", ty, span), ir.Var("y", ty, span)
-    body = [
+    body: list[ir.Stmt] = [
         ir.AssignStmt(x, call("buffer.slot", [group, selection], ty), span),
         ir.AssignStmt(y, call("buffer.slot", [group2, selection], ty), span),
         ir.EvalStmt(call("buffer.load", [a, tup([0, 0]), tup([1, 32]), x]), span),
@@ -101,12 +103,13 @@ def test_recognition_does_not_enumerate_slots_or_trips():
 @pytest.mark.parametrize("bad", ["overlap", "modulus", "overflow", "unbounded"])
 def test_unproved_slot_geometry_or_selection_refuses(bad):
     class Change(ir.IRMutator):
-        def visit_call(self, call):
-            if call.op.name != ir.get_op("buffer.slot").name:
-                return super().visit_call(call)
-            span = call.span
+        def visit_call(self, op):
+            if op.op.name != ir.get_op("buffer.slot").name:
+                return super().visit_call(op)
+            span = op.span
             index = ir.DataType.INDEX
-            selection = call.args[1]
+            selection = op.args[1]
+            assert isinstance(selection, ir.FloorMod)
             if bad == "modulus":
                 selection = ir.FloorMod(selection.left, ir.ConstInt(2, index, span), index, span)
             elif bad == "overflow":
@@ -118,18 +121,19 @@ def test_unproved_slot_geometry_or_selection_refuses(bad):
                 )
             elif bad == "unbounded":
                 selection = selection.left
-            return ir.Call(call.op, [call.args[0], selection], call.type, span)
+            return ir.Call(op.op, [op.args[0], selection], op.type, span)
 
-        def visit_assign_stmt(self, statement):
-            if bad == "overlap" and statement.var.name_hint == "alias":
-                value = statement.value
-                address = ir.ConstInt(128, ir.DataType.INDEX, statement.span)
+        def visit_assign_stmt(self, op):
+            if bad == "overlap" and op.var.name_hint == "alias":
+                value = op.value
+                assert isinstance(value, ir.Call)
+                address = ir.ConstInt(128, ir.DataType.INDEX, op.span)
                 return ir.AssignStmt(
-                    statement.var,
+                    op.var,
                     ir.Call(value.op, [value.args[0], address], value.type, value.span),
-                    statement.span,
+                    op.span,
                 )
-            return super().visit_assign_stmt(statement)
+            return super().visit_assign_stmt(op)
 
     f = Change().visit_function(slot_fixture(alias=True))
     with pytest.raises(ValueError, match="(Overlapping|modulus|nonoverflowing|Slot selection)"):
@@ -151,7 +155,7 @@ def test_one_slot_ring_never_hides_ordinary_vec_alias(ordinary_first, address):
         ty,
         span,
     )
-    statements = list(f.body.stmts)
+    statements = list(sequence_stmts(f.body))
     statements.insert(0 if ordinary_first else 1, ir.AssignStmt(var, call, span))
     changed = ir.Function(
         f.name,
@@ -168,10 +172,10 @@ def test_one_slot_ring_never_hides_ordinary_vec_alias(ordinary_first, address):
 
 def test_narrowing_before_modulo_is_not_hidden_by_slot_bound():
     class Narrow(ir.IRMutator):
-        def visit_floor_mod(self, expr):
-            narrow = ir.Cast(expr.left, ir.DataType.INT8, expr.span)
-            wide = ir.Cast(narrow, ir.DataType.INDEX, expr.span)
-            return ir.FloorMod(wide, expr.right, ir.DataType.INDEX, expr.span)
+        def visit_floor_mod(self, op):
+            narrow = ir.Cast(op.left, ir.DataType.INT8, op.span)
+            wide = ir.Cast(narrow, ir.DataType.INDEX, op.span)
+            return ir.FloorMod(wide, op.right, ir.DataType.INDEX, op.span)
 
     with pytest.raises(ValueError, match="cast may change"):
         testing.describe_placed_sync_input(Narrow().visit_function(slot_fixture(count=200)), True)
@@ -179,14 +183,14 @@ def test_narrowing_before_modulo_is_not_hidden_by_slot_bound():
 
 def test_partial_slot_view_is_unavailable():
     class Partial(ir.IRMutator):
-        def visit_assign_stmt(self, stmt):
-            if stmt.var.name_hint != "x":
-                return super().visit_assign_stmt(stmt)
+        def visit_assign_stmt(self, op):
+            if op.var.name_hint != "x":
+                return super().visit_assign_stmt(op)
             ty = ir.BufferType([1, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
-            var = ir.Var("partial", ty, stmt.span)
-            offsets = ir.MakeTuple([ir.ConstInt(0, ir.DataType.INDEX, stmt.span)] * 2, stmt.span)
-            view = ir.Call(ir.get_op("buffer.subview"), [stmt.var, offsets], ty, stmt.span)
-            return ir.SeqStmts([stmt, ir.AssignStmt(var, view, stmt.span)], stmt.span)
+            var = ir.Var("partial", ty, op.span)
+            offsets = ir.MakeTuple([ir.ConstInt(0, ir.DataType.INDEX, op.span)] * 2, op.span)
+            view = ir.Call(ir.get_op("buffer.subview"), [op.var, offsets], ty, op.span)
+            return ir.SeqStmts([op, ir.AssignStmt(var, view, op.span)], op.span)
 
     with pytest.raises(ValueError, match="(storage/view|Nested or data-dependent control)"):
         testing.describe_placed_sync_input(Partial().visit_function(slot_fixture()), True)
@@ -221,11 +225,12 @@ def test_native_padding_cannot_change_the_imported_slot_stride():
 def test_selection_from_another_occurrence_frame_is_refused():
     f = slot_fixture()
     span = f.span
-    original = f.body.stmts[-2]
+    original = sequence_stmts(f.body)[-2]
+    assert isinstance(original, ir.ForStmt)
     iv = ir.Var("other", ir.ScalarType(ir.DataType.INDEX), span)
     # Deliberately retain a selected handle from the previous loop. Even when
     # its descriptor and modulus agree, it is not a selection in this visit.
-    store = original.body.stmts[-2]
+    store = sequence_stmts(original.body)[-2]
     second = ir.ForStmt(
         iv,
         original.start,
@@ -240,7 +245,7 @@ def test_selection_from_another_occurrence_frame_is_refused():
         f.name,
         list(zip(f.params, f.param_directions)),
         f.return_types,
-        ir.SeqStmts([*f.body.stmts[:-1], second, f.body.stmts[-1]], span),
+        ir.SeqStmts([*sequence_stmts(f.body)[:-1], second, sequence_stmts(f.body)[-1]], span),
         span,
         f.func_type,
         ir_stage=f.ir_stage,
@@ -251,20 +256,22 @@ def test_selection_from_another_occurrence_frame_is_refused():
 
 def test_different_strides_do_not_supply_a_common_stride_certificate():
     class Mixed(ir.IRMutator):
-        def visit_assign_stmt(self, stmt):
-            if stmt.var.name_hint != "y":
-                return super().visit_assign_stmt(stmt)
-            call = stmt.value
+        def visit_assign_stmt(self, op):
+            if op.var.name_hint != "y":
+                return super().visit_assign_stmt(op)
+            call = op.value
+            assert isinstance(call, ir.Call)
             index = ir.DataType.INDEX
             expr = call.args[1]
+            assert isinstance(expr, ir.FloorMod)
             selection = ir.FloorMod(
-                ir.Mul(expr.left, ir.ConstInt(2, index, stmt.span), index, stmt.span),
+                ir.Mul(expr.left, ir.ConstInt(2, index, op.span), index, op.span),
                 expr.right,
                 index,
-                stmt.span,
+                op.span,
             )
             return ir.AssignStmt(
-                stmt.var, ir.Call(call.op, [call.args[0], selection], call.type, stmt.span), stmt.span
+                op.var, ir.Call(call.op, [call.args[0], selection], call.type, op.span), op.span
             )
 
     with pytest.raises(ValueError, match="one common stride"):

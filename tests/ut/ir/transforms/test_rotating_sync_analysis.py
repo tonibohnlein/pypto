@@ -147,7 +147,9 @@ def test_duplicate_rmw_witnesses_and_read_only_orbits():
         )
         result = testing.analyze_placed_sync(function, True)
         validate(function, result)
-        assert result.boundary_slot(2, 1, 0, 0)["first_writer"] is None
+        boundary = result.boundary_slot(2, 1, 0, 0)
+        assert boundary is not None
+        assert boundary["first_writer"] is None
 
 
 def test_retained_periodic_queries_do_not_rebuild():
@@ -162,22 +164,27 @@ def test_retained_periodic_queries_do_not_rebuild():
 @pytest.mark.parametrize("count", [0, 1, 5, 8])
 def test_shared_physical_family_preserves_distinct_handle_phases(count):
     class ShiftAlias(ir.IRMutator):
-        def visit_call(self, call):
-            if call.op.name == ir.get_op("buffer.slot").name and call.args[0].name_hint == "alias":
-                original = call.args[1]
+        def visit_call(self, op):
+            if (
+                op.op.name == ir.get_op("buffer.slot").name
+                and isinstance(op.args[0], ir.Var)
+                and op.args[0].name_hint == "alias"
+            ):
+                original = op.args[1]
+                assert isinstance(original, ir.FloorMod)
                 shifted = ir.FloorMod(
                     ir.Add(
                         original.left,
-                        ir.ConstInt(2, ir.DataType.INDEX, call.span),
+                        ir.ConstInt(2, ir.DataType.INDEX, op.span),
                         ir.DataType.INDEX,
-                        call.span,
+                        op.span,
                     ),
                     original.right,
                     ir.DataType.INDEX,
-                    call.span,
+                    op.span,
                 )
-                return ir.Call(call.op, [call.args[0], shifted], call.type, call.span)
-            return super().visit_call(call)
+                return ir.Call(op.op, [op.args[0], shifted], op.type, op.span)
+            return super().visit_call(op)
 
     function = ShiftAlias().visit_function(slot_fixture(count, 5, alias=True))
     validate(function, testing.analyze_placed_sync(function, True))
