@@ -738,7 +738,8 @@ void BindTesting(nb::module_& m) {
       [](const ir::FunctionPtr& function, const std::string& target) {
         ir::CheckLogicalSync(function);
         auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
-        auto input = ir::sync::ImportPlacedSync(stripped.function, true, target);
+        auto input = ir::sync::ImportPlacedSync(stripped.function, true, target, {}, std::nullopt,
+                                                ir::sync::SyncOccurrenceLayout::OriginalFrames);
         auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops);
         return std::make_shared<ir::sync::ScopedTokenOrder>(std::move(input), std::move(families));
       },
@@ -749,7 +750,8 @@ void BindTesting(nb::module_& m) {
          const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks) {
         ir::CheckLogicalSync(function);
         auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
-        const auto input = ir::sync::ImportPlacedSync(stripped.function, true, target, parameters, blocks);
+        const auto input = ir::sync::ImportPlacedSync(stripped.function, true, target, parameters, blocks,
+                                                      ir::sync::SyncOccurrenceLayout::OriginalFrames);
         ir::sync::ScopedTokenWork work;
         const auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops, &work);
         nb::dict out;
@@ -840,9 +842,14 @@ void BindTesting(nb::module_& m) {
             return out;
           },
           "Inspect exhaustive invocation partition without constructing exports");
-  testing.def("analyze_sync_invocation", &ir::sync::AnalyzeSyncInvocation, nb::arg("function"),
-              nb::arg("disjoint_gm"), nb::arg("target"), nb::arg("parameter_bounds"), nb::arg("block_bounds"),
-              "Analyze an exhaustive analytic partition of a proved launch domain");
+  testing.def(
+      "analyze_sync_invocation",
+      [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
+         const ir::sync::SyncParameterBounds& parameters, std::pair<int64_t, int64_t> blocks) {
+        return ir::sync::AnalyzeSyncInvocation(function, disjoint_gm, target, parameters, blocks);
+      },
+      nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target"), nb::arg("parameter_bounds"),
+      nb::arg("block_bounds"), "Analyze an exhaustive analytic partition of a proved launch domain");
   testing.def(
       "describe_placed_sync_input",
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
@@ -862,9 +869,12 @@ void BindTesting(nb::module_& m) {
       "analyze_placed_sync",
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
          const ir::sync::SyncParameterBounds& bounds, const std::string& composition_order,
-         const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
+         const std::optional<std::pair<int64_t, int64_t>>& block_bounds, bool original_frames) {
         auto start = std::chrono::steady_clock::now();
-        auto input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds);
+        auto input =
+            ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds,
+                                       original_frames ? ir::sync::SyncOccurrenceLayout::OriginalFrames
+                                                       : ir::sync::SyncOccurrenceLayout::Automatic);
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         auto result = ir::sync::AnalyzeCompactSync(std::move(input), composition_order);
         result.import_seconds = seconds;
@@ -873,6 +883,7 @@ void BindTesting(nb::module_& m) {
       nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target") = "a2a3",
       nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{},
       nb::arg("composition_order") = "balanced", nb::arg("block_bounds") = nb::none(),
+      nb::arg("original_frames") = false,
       "Read-only research analysis of qualified placed Buffer IR under a named hardware contract");
 
   testing.def(

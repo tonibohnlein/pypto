@@ -145,13 +145,17 @@ struct CompactSyncInput {
   size_t coordinate_nodes = 0, coordinate_flatten_visits = 0, coordinate_coefficient_entries = 0;
   size_t interval_access_visits = 0, qualified_intervals = 0;
 };
+// Token transport needs original enclosing frames even for perfect nests.
+// Automatic retains the cheaper flattened representation for other consumers.
+enum class SyncOccurrenceLayout { Automatic, OriginalFrames };
 // Explicit qualification, not a default alias assumption. Unsupported input
 // throws a documented ValueError; no effects are skipped. Enclosures are explicit
 // in SyncAccess and remain selected-model, not exact physical, footprints.
 CompactSyncInput ImportPlacedSync(
     const FunctionPtr& function, bool disjoint_gm, const std::string& target = "a2a3",
     const SyncParameterBounds& parameter_bounds = {},
-    const std::optional<std::pair<int64_t, int64_t>>& block_bounds = std::nullopt);
+    const std::optional<std::pair<int64_t, int64_t>>& block_bounds = std::nullopt,
+    SyncOccurrenceLayout layout = SyncOccurrenceLayout::Automatic);
 
 using Occurrence = std::tuple<size_t, int64_t, size_t>;  // segment, visit, site
 using Crossing = std::pair<Occurrence, Occurrence>;
@@ -310,7 +314,8 @@ struct SyncInvocationAnalysis {
 };
 SyncInvocationAnalysis AnalyzeSyncInvocation(const FunctionPtr& function, bool disjoint_gm,
                                              const std::string& target, const SyncParameterBounds& parameters,
-                                             std::pair<int64_t, int64_t> block_bounds);
+                                             std::pair<int64_t, int64_t> block_bounds,
+                                             SyncOccurrenceLayout layout = SyncOccurrenceLayout::Automatic);
 struct LogicalSyncRealization {
   FunctionPtr function;
   size_t record_sites = 0, wait_sites = 0, guarded_wait_sites = 0, carried_tokens = 0;

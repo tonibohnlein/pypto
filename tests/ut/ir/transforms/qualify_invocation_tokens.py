@@ -21,7 +21,26 @@ from pypto import backend, codegen, ir, passes, pypto_core, testing
 
 from .sync_qwen_prefill_cases import capture_qwen_projection
 from .test_parameterized_token_sync import apply, worker
-from .test_qwen_prefill_production import realize
+
+
+def direct_audit(program):
+    """Old direct construction, explicitly requested outside production dispatch."""
+    evidence = testing.sync_invocation_evidence(program)
+    functions = []
+    for function in program.functions.values():
+        if function.func_type != ir.FunctionType.AIC:
+            functions.append(function)
+            continue
+        analysis = testing.analyze_sync_invocation(
+            function,
+            True,
+            "a2a3",
+            evidence["parameters"][function.name],
+            evidence["block_indices"][function.name],
+        )
+        physical = analysis.realize_physical("a2a3")["function"]
+        functions.append(physical)
+    return ir.Program(functions, program.name, program.span)
 
 
 def measure(name, hidden):
@@ -37,7 +56,11 @@ def measure(name, hidden):
         # Enlarging hidden also changes the output grid, not only K. Preserve
         # the existing multi-visit activation refusal as a measured outcome.
         elapsed = time.perf_counter() - start
-        baseline = worker(realize(program), original.name)
+        try:
+            direct_audit(program)
+            baseline_refusal = None
+        except ValueError as baseline_error:
+            baseline_refusal = str(baseline_error).split("\n", 1)[0]
         return {
             "kernel": name,
             "hidden": hidden,
@@ -46,8 +69,8 @@ def measure(name, hidden):
             "input_sha256": hashlib.sha256(ir.serialize(program)).hexdigest(),
             "insertion_refusal": str(error).split("\n", 1)[0],
             "insertion_seconds": elapsed,
-            "baseline_owned": bool(dict(baseline.attrs).get("pypto_autosync")),
-            "baseline_refusal": dict(baseline.attrs).get("autosync_fallback_reason"),
+            "baseline_accepted": baseline_refusal is None,
+            "baseline_refusal": baseline_refusal,
         }
     insertion = time.perf_counter() - start
     start = time.perf_counter()
@@ -57,7 +80,7 @@ def measure(name, hidden):
     physical = apply(passes.lower_sync, optimized)
     lowering = time.perf_counter() - start
     start = time.perf_counter()
-    direct = realize(program)
+    direct = direct_audit(program)
     direct_time = time.perf_counter() - start
     pairs = []
     for pair in range(3):
@@ -65,7 +88,7 @@ def measure(name, hidden):
         for route in ("direct", "tokens") if pair != 1 else ("tokens", "direct"):
             start = time.perf_counter()
             if route == "direct":
-                realize(program)
+                direct_audit(program)
             else:
                 apply(passes.lower_sync, apply(passes.optimize_sync, apply(passes.insert_sync, program)))
             elapsed[route] = time.perf_counter() - start
@@ -98,7 +121,7 @@ def measure(name, hidden):
             "barrier": text.count("pto.barrier"),
             "arithmetic": text.count("arith."),
             "physical_pto_sha256": hashlib.sha256(text.encode()).hexdigest(),
-            "owned": bool(dict(selected.attrs).get("pypto_autosync")),
+            "physical_ownership_marker": bool(dict(selected.attrs).get("pypto_autosync")),
         }
     return {
         "kernel": name,
@@ -148,7 +171,8 @@ def main():
         "alias_contract": "disjoint GM roots",
         "eligible_ids": list(range(6)),
         "device": "not run",
-        "default_dispatch": "unchanged",
+        "default_dispatch": "off; opt-in production uses tokens",
+        "baseline": "explicit direct audit API, not production RealizeSync",
         "semantics": "separate bounded test gate",
     }
     args.output.write_text(json.dumps(receipt, indent=2) + "\n")

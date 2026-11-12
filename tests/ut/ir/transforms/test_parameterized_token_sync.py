@@ -18,7 +18,7 @@ from .sync_matmul_cases import capture
 from .sync_matmul_oracle import hardware_reference, interpret, validate
 from .sync_physical_oracle import PhysicalExecution
 from .sync_prefill_cases import capture_prefill
-from .test_nested_sync_repetition import resident_pipeline_tree
+from .test_nested_sync_repetition import BOUNDS, caller_program, nested_fixture, resident_pipeline_tree
 from .test_scoped_logical_sync import dynamic_collective
 from .test_scoped_token_families import Uses
 from .test_token_sync_lowering import _apply, _project
@@ -51,7 +51,9 @@ def check(original, logical, physical, parameters, *, block=None, minimum_protoc
     assert reference[2] <= actual
     assert tokens.payload_count == flags.payload_count == len(calls)
     assert not flags.live and not any(flags.pending.values())
-    assert len(flags.records) == len(flags.waits) == sum(tokens.uses.values())
+    # Same-pipe logical uses lower to a qualified barrier, not a flag pair.
+    cross_pipe_uses = sum(n for (a, b), n in tokens.uses.items() if calls[a][2] != calls[b][2])
+    assert len(flags.records) == len(flags.waits) == cross_pipe_uses
     assert all(pair in graph for pair in flags.reuses)
     assert all(ids <= set(range(6)) for ids in flags.ids.values())
     # Reuse this independently constructed concrete reference; recomputing its
@@ -348,3 +350,38 @@ def test_caller_reactivation_does_not_regenerate_missing_tokens():
     _, actual = _project(flags.vertices, flags.edges, reference[0])
     assert reference[2] - actual
     assert not dict(lowered.attrs).get("pypto_autosync", False)
+
+
+@pytest.mark.parametrize("counts", [(0, 2), (2, 0), (1, 1), (2, 3), (2, 1, 3)])
+@pytest.mark.parametrize("repeats", [1, 2])
+def test_perfect_nested_frames_use_scoped_token_transport(counts, repeats):
+    original = nested_fixture(counts, repeats=repeats)
+    parameters = {1: 16, 3: 128}
+    # Both representations are checked against original byte effects, actual
+    # covers, all four queries and storage boundaries, not against each other.
+    flat = testing.analyze_placed_sync(original, True, parameter_bounds=BOUNDS)
+    scoped = testing.analyze_placed_sync(original, True, parameter_bounds=BOUNDS, original_frames=True)
+    validate(original, flat, parameters=parameters)
+    validate(original, scoped, parameters=parameters)
+    program = caller_program(original)
+    logical = apply(passes.insert_sync, program)
+    physical = apply(passes.lower_sync, logical)
+    production = apply(passes.realize_sync, program)
+    ir.assert_structural_equal(physical, production)
+    check(original, worker(logical, original.name), worker(physical, original.name), parameters)
+
+
+def test_perfect_nested_token_transport_size_does_not_unfold_counts():
+    inventories = []
+    for counts in [(2, 3), (2, 1000), (1000, 3), (1000000, 1000000)]:
+        original = nested_fixture(counts)
+        logical = apply(passes.insert_sync, caller_program(original))
+        selected = worker(logical, original.name)
+        info = testing.inspect_scoped_token_families(selected, parameter_bounds=BOUNDS)
+        physical = apply(passes.lower_sync, logical)
+        assert dict(worker(physical, original.name).attrs)["pypto_autosync"]
+        inventories.append((len(info["families"]), sum(len(f["axes"]) for f in info["families"])))
+    # A singleton carry interval elides its axis at the smallest count. The
+    # retained family bound remains fixed; growing visits add no occurrences.
+    assert all(families == 7 and axes <= 5 for families, axes in inventories)
+    assert inventories[-1] == inventories[-2]

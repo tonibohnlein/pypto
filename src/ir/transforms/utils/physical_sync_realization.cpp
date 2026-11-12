@@ -22,16 +22,12 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
-#include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
-#include "pypto/ir/transforms/pass_context.h"
-#include "pypto/ir/transforms/pass_properties.h"
-#include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/sync/isa_macro_resources.h"
 #include "pypto/sync/resource_catalog.h"
@@ -769,79 +765,3 @@ FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::stri
                                     function->requires_runtime_binding_, function->ir_stage_);
 }
 }  // namespace pypto::ir::sync
-
-namespace pypto::ir::pass {
-Pass RealizeSync() {
-  auto transform = [](const FunctionPtr& function, const sync::SyncParameterBounds& bounds,
-                      const std::optional<std::pair<int64_t, int64_t>>& block_bounds) -> FunctionPtr {
-    if (!IsInCoreType(function->func_type_)) return function;
-    // These functions do not enter PTO code generation; their external owner
-    // remains responsible for synchronization. Do not claim PTOAS delegation.
-    if (function->requires_runtime_binding_ || function->HasAttr(kAttrExternalSource) ||
-        function->HasAttr(kAttrBuiltinTemplateDir))
-      return function;
-    auto* ctx = PassContext::Current();
-    CHECK(ctx && ctx->GetEnablePyptoAutoSync()) << "RealizeSync requires enable_pypto_autosync=True";
-    CHECK(!function->GetAttr<bool>(kAttrPyptoAutosync))
-        << "RealizeSync cannot reprocess an owned physical plan";
-    if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV)
-      return sync::SyncOutcome(function, false, "PyPTO synchronization supports only AIC/AIV leaves");
-    if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS)
-      return sync::SyncOutcome(function, false, "PyPTO synchronization requires physically placed Buffer IR");
-    if (!ctx->GetAutoSyncDisjointGM())
-      return sync::SyncOutcome(function, false, "Disjoint GM argument contract was not supplied");
-    auto target = ctx->GetBackendHandler()->GetPtoTargetArch();
-    if (target != "a2a3")
-      return sync::SyncOutcome(function, false,
-                               "PyPTO physical synchronization supports only manual a2a3 macros");
-    // Only publish after complete analysis AND realization. A qualification or
-    // resource refusal returns the original body, never partially emitted IR.
-    // Internal errors are deliberately not caught. The strict retained-result
-    // APIs still throw on these user-facing input/proof refusals.
-    try {
-      FunctionPtr emitted;
-      size_t set_sites = 0, wait_sites = 0;
-      if (block_bounds) {
-        // The complete invocation owner qualifies all activation cases before
-        // any command cuts are published. Do not pick one sampled worker.
-        auto analysis = sync::AnalyzeSyncInvocation(function, true, target, bounds, *block_bounds);
-        auto physical = sync::RealizePhysicalInvocation(analysis, target, std::nullopt);
-        emitted = physical.function;
-        for (const auto& item : physical.cases) {
-          set_sites += item.set_sites;
-          wait_sites += item.wait_sites;
-        }
-      } else {
-        auto analysis = sync::AnalyzeCompactSync(sync::ImportPlacedSync(function, true, target, bounds));
-        auto physical = sync::RealizePhysicalSync(analysis, target, std::nullopt);
-        emitted = physical.function;
-        set_sites = physical.set_sites;
-        wait_sites = physical.wait_sites;
-      }
-      // PTOAS recognizes literal flags, not empty plans or barriers, as manual
-      // ownership. Do not fabricate a dummy flag or mix partial ownership.
-      if (!set_sites || !wait_sites)
-        return sync::SyncOutcome(function, false,
-                                 "Candidate has no SET/WAIT marker; delegate the original kernel");
-      return sync::SyncOutcome(emitted, true, "");
-    } catch (const pypto::ValueError& error) {
-      return sync::SyncOutcome(function, false, error.what());
-    }
-  };
-  // Range evidence belongs to this closed program's call sites, not mutable
-  // function metadata. Do not infer bounds when the standalone API has none.
-  return CreateProgramPass(
-      [transform](const ProgramPtr& program) {
-        auto evidence = sync::CollectSyncInvocationEvidence(program);
-        auto functions = program->functions_;
-        for (auto& [global, function] : functions) {
-          auto block = evidence.block_indices.find(global->name_);
-          function = transform(
-              function, evidence.parameters[global->name_],
-              block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second));
-        }
-        return std::make_shared<Program>(functions, program->name_, program->span_);
-      },
-      "RealizeSync", PassProperties{});
-}
-}  // namespace pypto::ir::pass

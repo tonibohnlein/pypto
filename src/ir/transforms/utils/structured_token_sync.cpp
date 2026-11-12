@@ -494,7 +494,8 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
       std::vector<AssignedSyncCase> cases;
       LoweredLogicalSync result;
       for (const auto& domain : partition.intervals) {
-        auto input = ImportPlacedSync(stripped.function, true, target, parameters, domain);
+        auto input = ImportPlacedSync(stripped.function, true, target, parameters, domain,
+                                      SyncOccurrenceLayout::OriginalFrames);
         auto families = ParseScopedTokenFamilies(function, input, stripped.loops);
         owners.push_back(std::make_unique<ScopedTokenOrder>(std::move(input), std::move(families)));
         const auto& order = *owners.back();
@@ -509,7 +510,8 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
       return result;
     }
   }
-  auto input = ImportPlacedSync(stripped.function, true, target, parameters, blocks);
+  auto input = ImportPlacedSync(stripped.function, true, target, parameters, blocks,
+                                SyncOccurrenceLayout::OriginalFrames);
   if (input.region_tree) {
     auto families = ParseScopedTokenFamilies(function, input, stripped.loops);
     ScopedTokenOrder order(std::move(input), std::move(families));

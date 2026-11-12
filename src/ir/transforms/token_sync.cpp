@@ -10,6 +10,8 @@
  */
 
 #include <memory>
+#include <optional>
+#include <string>
 #include <utility>
 
 #include "pypto/backend/common/backend_handler.h"
@@ -28,6 +30,20 @@ bool IsOwnedLeaf(const FunctionPtr& function) {
   return (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV) &&
          !function->requires_runtime_binding_ && !function->HasAttr(kAttrExternalSource) &&
          !function->HasAttr(kAttrBuiltinTemplateDir);
+}
+FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& target,
+                              const sync::SyncParameterBounds& parameters,
+                              std::optional<std::pair<int64_t, int64_t>> blocks) {
+  if (blocks) {
+    const auto invocation = sync::AnalyzeSyncInvocation(function, true, target, parameters, *blocks,
+                                                        sync::SyncOccurrenceLayout::OriginalFrames);
+    return invocation.cases.size() == 1
+               ? sync::RealizeCompactSync(*invocation.cases.front().mathematics).function
+               : sync::RealizeLogicalInvocation(invocation).function;
+  }
+  auto input = sync::ImportPlacedSync(function, true, target, parameters, blocks,
+                                      sync::SyncOccurrenceLayout::OriginalFrames);
+  return sync::RealizeCompactSync(sync::AnalyzeCompactSync(std::move(input))).function;
 }
 }  // namespace
 
@@ -55,16 +71,7 @@ Pass InsertSync() {
           auto block = evidence.block_indices.find(global->name_);
           const auto blocks =
               block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
-          if (blocks) {
-            const auto invocation = sync::AnalyzeSyncInvocation(function, true, target, parameters, *blocks);
-            function = invocation.cases.size() == 1
-                           ? sync::RealizeCompactSync(*invocation.cases.front().mathematics).function
-                           : sync::RealizeLogicalInvocation(invocation).function;
-            continue;
-          }
-          auto input = sync::ImportPlacedSync(function, true, target, parameters, blocks);
-          auto analysis = sync::AnalyzeCompactSync(std::move(input));
-          function = sync::RealizeCompactSync(analysis).function;
+          function = InsertLogicalSync(function, target, parameters, blocks);
         }
         return std::make_shared<Program>(functions, program->name_, program->span_);
       },
@@ -108,5 +115,72 @@ Pass LowerSync() {
         return std::make_shared<Program>(functions, program->name_, program->span_);
       },
       "LowerSync", PassProperties{.produced = {IRProperty::LogicalSyncValid}});
+}
+
+Pass RealizeSync() {
+  auto transform = [](const FunctionPtr& function, const sync::SyncParameterBounds& bounds,
+                      const std::optional<std::pair<int64_t, int64_t>>& block_bounds) -> FunctionPtr {
+    if (!IsInCoreType(function->func_type_)) return function;
+    // These functions do not enter PTO code generation; their external owner
+    // remains responsible for synchronization. Do not claim PTOAS delegation.
+    if (function->requires_runtime_binding_ || function->HasAttr(kAttrExternalSource) ||
+        function->HasAttr(kAttrBuiltinTemplateDir))
+      return function;
+    auto* ctx = PassContext::Current();
+    CHECK(ctx && ctx->GetEnablePyptoAutoSync()) << "RealizeSync requires enable_pypto_autosync=True";
+    if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV)
+      return sync::SyncOutcome(function, false, "PyPTO synchronization supports only AIC/AIV leaves");
+    if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS)
+      return sync::SyncOutcome(function, false, "PyPTO synchronization requires physically placed Buffer IR");
+    if (!ctx->GetAutoSyncDisjointGM())
+      return sync::SyncOutcome(function, false, "Disjoint GM argument contract was not supplied");
+    auto target = ctx->GetBackendHandler()->GetPtoTargetArch();
+    if (target != "a2a3")
+      return sync::SyncOutcome(function, false,
+                               "PyPTO physical synchronization supports only manual a2a3 macros");
+    // Only publish after complete analysis AND realization. A qualification or
+    // resource refusal returns the original body, never partially emitted IR.
+    // Internal errors are deliberately not caught. The strict retained-result
+    // APIs still throw on these user-facing input/proof refusals.
+    try {
+      // The same logical producer and actual-token consumer as the public
+      // stages. Insertion preserves callers, payloads and scalar coordinates,
+      // so this transaction may reuse its own freshly collected evidence.
+      const auto logical = InsertLogicalSync(function, target, bounds, block_bounds);
+      CheckLogicalSync(logical);  // OptimizeSync currently verifies without rewriting.
+      const auto physical = sync::LowerLogicalSync(logical, target, std::nullopt, bounds, block_bounds);
+      // PTOAS recognizes literal flags, not empty plans or barriers, as manual
+      // ownership. Do not fabricate a dummy flag or mix partial ownership.
+      if (!physical.set_sites || !physical.wait_sites)
+        return sync::SyncOutcome(function, false,
+                                 "Candidate has no SET/WAIT marker; delegate the original kernel");
+      return sync::SyncOutcome(physical.function, true, "");
+    } catch (const pypto::ValueError& error) {
+      return sync::SyncOutcome(function, false, error.what());
+    }
+  };
+  // Range evidence belongs to this closed program's call sites, not mutable
+  // function metadata. Do not infer bounds when the standalone API has none.
+  return CreateProgramPass(
+      [transform](const ProgramPtr& program) {
+        // Never delegate unresolved logical IR or reprocess an owned physical
+        // plan, even when an earlier eligibility test would skip that function.
+        for (const auto& [global, function] : program->functions_) {
+          CHECK(!sync::HasLogicalSync(function))
+              << "RealizeSync refuses preexisting logical synchronization; use LowerSync";
+          CHECK(!function->GetAttr<bool>(kAttrPyptoAutosync))
+              << "RealizeSync cannot reprocess an owned physical plan";
+        }
+        auto evidence = sync::CollectSyncInvocationEvidence(program);
+        auto functions = program->functions_;
+        for (auto& [global, function] : functions) {
+          auto block = evidence.block_indices.find(global->name_);
+          function = transform(
+              function, evidence.parameters[global->name_],
+              block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second));
+        }
+        return std::make_shared<Program>(functions, program->name_, program->span_);
+      },
+      "RealizeSync", PassProperties{});
 }
 }  // namespace pypto::ir::pass

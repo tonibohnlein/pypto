@@ -285,9 +285,15 @@ def test_late_realization_refusal_keeps_original_body():
     with pytest.raises(ValueError, match="order-equal same-pipe barrier"):
         retained.realize_physical("a2a3")
     assert retained.describe() == before
+    # Insertion succeeds; physical consumption of its actual tokens refuses.
+    # The production transaction must discard those intermediate tokens.
+    with context():
+        logical = passes.insert_sync()(ir.Program([original], "late", original.span))
+        with pytest.raises(ValueError, match="[Ss]ame.pipe|[Pp]refix"):
+            passes.lower_sync()(logical)
     result = apply_hybrid([original])[original.name]
     assert not dict(result.attrs)[PYPTO_AUTOSYNC_ATTR]
-    assert "order-equal same-pipe barrier" in dict(result.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
+    assert dict(result.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
     ir.assert_structural_equal(original.body, result.body)
 
 
@@ -314,6 +320,62 @@ def test_owned_plan_reprocessing_is_not_silently_delegated():
     result = apply_hybrid([original])[original.name]
     with pytest.raises(ValueError, match="reprocess"):
         apply_hybrid([result])
+
+
+@pytest.mark.parametrize("name", CASES)
+def test_production_is_serialized_token_pipeline(name, tmp_path):
+    original = capture(name)
+    program = ir.Program([original], "P", original.span)
+    with context():
+        logical = passes.insert_sync()(program)
+        archive = tmp_path / "tokens.msgpack"
+        ir.serialize_to_file(logical, str(archive))
+        restored = ir.deserialize_from_file(str(archive))
+        assert isinstance(restored, ir.Program)
+        expected = passes.lower_sync()(passes.optimize_sync()(restored))
+        actual = passes.realize_sync()(program)
+    ir.assert_structural_equal(actual, expected)
+    run_physical(original, next(iter(actual.functions.values())), range(6))
+
+
+@pytest.mark.parametrize("refusal", ["alias", "placement", "external", "kind"])
+def test_preexisting_tokens_never_delegate_on_early_exit(refusal):
+    original = capture("matmul_64")
+    with context():
+        logical = passes.insert_sync()(ir.Program([original], "P", original.span))
+    function = next(iter(logical.functions.values()))
+    if refusal == "kind":
+        function = ir.Function(
+            function.name,
+            list(zip(function.params, function.param_directions)),
+            function.return_types,
+            function.body,
+            function.span,
+            ir.FunctionType.InCore,
+            ir_stage=function.ir_stage,
+        )
+    if refusal == "external":
+        function = ir.Function(
+            function.name,
+            list(zip(function.params, function.param_directions)),
+            function.return_types,
+            function.body,
+            function.span,
+            function.func_type,
+            attrs={"external_source": "owned"},
+            ir_stage=function.ir_stage,
+        )
+    program = ir.Program([function], "P", function.span)
+    before = ir.serialize(program)
+    with passes.PassContext(
+        [],
+        enable_pypto_autosync=True,
+        autosync_disjoint_gm=refusal != "alias",
+        memory_planner=passes.MemoryPlanner.PTOAS if refusal == "placement" else passes.MemoryPlanner.PYPTO,
+    ):
+        with pytest.raises(ValueError, match="preexisting logical synchronization"):
+            passes.realize_sync()(program)
+    assert ir.serialize(program) == before
 
 
 if __name__ == "__main__":

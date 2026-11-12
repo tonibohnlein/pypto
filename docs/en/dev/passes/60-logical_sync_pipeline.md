@@ -164,7 +164,7 @@ delegated slot restrictions and native multi-buffer size limits still apply.
 
 Nested token frames without the scoped certificate below, arbitrary structured joins, non-completed carry entry,
 cyclic histories, live older-result crossings, noncanonical guards and unavailable caller range evidence
-remain explicit refusals. Existing production coverage is unchanged.
+remain explicit refusals. The opt-in production wrapper uses these same stages.
 
 ## Scoped nested insertion
 
@@ -277,8 +277,8 @@ an independent immediate native-predecessor check in the complete payload schedu
 The actual family inventory, including duplicates and exceptional uses, reaches
 the unchanged allocator. No commands are removed to satisfy a proof or pool limit.
 The owner survives through allocation and emission; its query callbacks borrow
-that owner. Refusal preserves the immutable input. Default `RealizeSync` dispatch
-still uses the previously qualified direct route.
+that owner. Refusal preserves the immutable input. The opt-in `RealizeSync` wrapper now uses this actual-token route. Explicit
+direct-realization APIs remain audit tools only.
 
 Summary depth is logarithmic in repeat counts. B concrete external endpoints
 propagate through `O(B log K)` paths; symbolic families do not expand into K ports.
@@ -308,10 +308,22 @@ the existing physical mechanism refuses.
 
 ## Migration and guarantees
 
-`realize_sync()` retains the existing production implementation until all
-currently accepted compact cases have migrated and passed review. The intended
-final role is a transactional orchestrator for these three stages, with the
-same opt-in switch and whole-kernel PTOAS delegation.
+`realize_sync()` is a transactional orchestrator of the same insertion,
+verification and actual-token lowering services. The opt-in switch remains off
+by default, and PTOAS remains enabled for delegated original kernels. A token
+export or allocation refusal returns the original unsynchronized body; there is
+no hidden direct-mathematics realization fallback. Preexisting logical tokens
+and already-owned physical plans refuse before all delegation exits.
+
+The wrapper collects caller evidence once because its own insertion preserves
+callers, scalar definitions, payloads and control. Public `LowerSync` continues
+to collect fresh evidence from its current input. `OptimizeSync` currently
+verifies without rewriting tokens. No additional token simplification or
+hardware exemption is introduced by this orchestration change.
+
+The historical direct construction is available through explicit testing APIs.
+The invocation qualification driver uses those APIs for its baseline, so it does
+not accidentally compare the new production path with itself.
 
 No successful logical or physical result proves native invocation completion.
 The existing fresh-entry and native macro assumptions still apply. Device
@@ -386,6 +398,24 @@ inspected, invocation-case-disabled waits and emitted families. Read visits excl
 the nested wait-only traversal, whose wait leaves are counted separately; skipped
 zero-trip bodies and empty loop-coordinate domains are not case-disabled waits. No visit count is unfolded.
 
-Default production orchestration still uses its established route during this
-migration. Standalone activation transport does not establish native return
-completion or device correctness.
+Opt-in production orchestration uses the same activation transport. Neither
+route establishes native return completion or device correctness.
+
+## Perfect nests and original frames
+
+Token insertion and payload reimport request `SyncOccurrenceLayout::OriginalFrames`.
+This selects the existing structured importer only when the original source has
+multiple loop frames that the automatic path would flatten. Finite and single-loop
+selection is unchanged. The public mathematical audit API keeps its automatic
+default; `original_frames=True` explicitly requests the token producer's layout.
+Invocation-case import propagates the same request. No second analysis is tried.
+
+Original loop objects, nonzero starts, nonunit steps, zero visits and counter resets
+remain owned by that tree. Existing access, control and startup qualifications
+still apply; this does not admit arbitrary nested rotating slots or symbolic trips.
+The existing numerical merge supplies covers and boundaries before logical export,
+and actual-token order supplies physical reuse afterward. Numerical interface
+construction can cost more than the flattened periodic form. Count sweeps retain
+seven families and at most five axes in the nested-DMA regression; a singleton
+carry interval may omit an axis. This is a fixture bound, not a universal linear
+bound for numerical interfaces.
