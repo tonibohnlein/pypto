@@ -336,15 +336,26 @@ bool HasLogicalSync(const FunctionPtr& function) {
   logical.VisitFunction(function);
   return logical.found;
 }
+void CheckGeneratedLogicalSync(const FunctionPtr& function) {
+  std::vector<Diagnostic> diagnostics;
+  VerifyLogicalSync(function, diagnostics);
+  if (!diagnostics.empty()) {
+    INTERNAL_CHECK_SPAN(false, diagnostics.front().span)
+        << "Internal error: synchronization insertion produced invalid logical IR: "
+        << diagnostics.front().message;
+  }
+}
 LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::string& target,
                                     const std::optional<std::vector<int>>& eligible_ids,
                                     const SyncParameterBounds& parameters,
-                                    std::optional<std::pair<int64_t, int64_t>> blocks) {
+                                    std::optional<std::pair<int64_t, int64_t>> blocks,
+                                    const SyncSchedulePolicy& policy) {
   CheckLogicalSync(function);
   if (!HasLogicalSync(function)) {
-    LoweredLogicalSync result;
+    PhysicalSyncRealization result;
     result.function = function;
-    return result;
+    FinishSyncScheduleReceipt(function, result, policy);
+    return {function, 0, 0, {std::move(result)}};
   }
   FindLogical(true).VisitFunction(function);
   class Structure : public IRVisitor {
@@ -356,13 +367,14 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
     void VisitExpr(const ExprPtr&) override {}
   } structure;
   structure.VisitFunction(function);
-  if (structure.loop) return LowerStructuredLogicalSync(function, target, eligible_ids, parameters, blocks);
+  if (structure.loop)
+    return LowerStructuredLogicalSync(function, target, eligible_ids, parameters, blocks, policy);
   auto stripped = StripTokens().VisitFunction(function);
-  // Only the payload pipe/native-variant inventory is consumed here. The
-  // importer's GM partition is not used for conflicts, selectors or reuse;
-  // token IR, including any manually supplied extra ordering, is authoritative.
-  auto input = ImportPlacedSync(stripped, true, target, parameters, blocks);
+  // No storage-demand importer or GM partition authorizes this lowering.
+  // Actual token uses, including manually supplied ordering, are authoritative.
+  auto input = ImportSyncPayloads(stripped, target, parameters, blocks);
   auto result = FiniteLowering(function, std::move(input), target, eligible_ids).Run();
-  return {result.function, result.set_sites, result.wait_sites};
+  FinishSyncScheduleReceipt(result.function, result, policy);
+  return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};
 }
 }  // namespace pypto::ir::sync

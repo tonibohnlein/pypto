@@ -41,9 +41,14 @@ feasibility.
 ## LowerSync
 
 Lowering supports straight-line finite token programs and the canonical
-constant-lag loop form and qualified constant nested frames described below, over admitted placed Buffer payloads. The operation/footprint importer is reused for
-pipe and native-resource qualification; its admission restrictions and access-
-recovery costs still apply. Insertion and lowering each collect caller parameter
+constant-lag loop form and qualified constant nested frames described below, over admitted placed Buffer payloads. Lowering uses a separate payload qualification entry point sharing
+descriptor, coordinate, control, pipe and native-resource checks with insertion.
+It does not construct dependence footprints, a GM alias partition, physical
+interval exports or storage startup summaries. Unused scalar formals need no
+range proof, and unused tensor formals need no access-model geometry. Native
+layout, placement, extraction and arithmetic qualifications remain required;
+coordinates actually used by those checks still require current caller evidence.
+Insertion and lowering each collect caller parameter
 and block-bound evidence from their current Program, through the existing closed
 call/submit graph collector. Lowering never retains insertion's old proof domain. It interprets actual `sync.record`, `sync.completed`,
 `sync.join` and `sync.wait` definitions and uses. A record captures the source
@@ -84,8 +89,9 @@ whole completed prefix equals the token prefix; older prefixes refuse.
 New token interpretation costs are proportional to distinct expression nodes,
 statement occurrences and token uses, with a fixed number of pipes. Indexed
 lookups and coloring add logarithmic factors. Shared joins are memoized and
-nested statement sequences are gathered once. Access recovery and native-variant
-qualification still run through the existing importer and are charged separately.
+nested statement sequences are gathered once. Shared descriptor/control and
+native-variant qualification costs are charged separately. Dependence access
+recovery belongs to insertion, not token lowering.
 
 ## Canonical structured transport
 
@@ -210,9 +216,9 @@ Single-run production insertion measurements are descriptive, not speedup eviden
 ### Interpreting scoped token uses
 
 The diagnostic `testing.inspect_scoped_token_families` interprets the actual
-scoped SSA program under an explicit disjoint-GM test contract. It verifies
-logical SSA, strips only qualified pure token constructs, and reuses the placed
-importer to identify original payloads and frames. No storage-demand reducer is
+scoped SSA program without a GM alias assumption. It verifies
+logical SSA, strips only qualified pure token constructs, and uses current
+payload qualification to identify original payloads and frames. No storage-demand reducer is
 called. The returned direct-cut families have no assigned physical IDs.
 
 A token pattern retains its source and original mixed-radix coordinates. Its
@@ -391,7 +397,7 @@ algorithm or hardware exception changes. A failing case refuses the whole result
 
 For C cases, N original statements and T total overlaid token state, repeated
 case traversal has an `O(C(N+T))` input cost; T can itself grow with C. Frame-depth,
-guard-domain processing, numerical order summaries, access import and allocation
+guard-domain processing, numerical order summaries, payload qualification and allocation
 retain their separate costs. This is not a constant-cost claim for arbitrary
 activation partitions. The diagnostic token inventory reports parser Read visits, waits
 inspected, invocation-case-disabled waits and emitted families. Read visits exclude

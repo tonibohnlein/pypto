@@ -109,6 +109,10 @@ def test_large_trip_counts_do_not_expand_command_sites(factory):
     for count in [7, 1000, 1000000]:
         retained = testing.analyze_placed_sync(factory(count), True)
         physical = retained.realize_physical("a2a3", list(range(6)))
+        # One P=3 steady body and at most three guarded boundary bodies.
+        assert physical["regular_schedule_body_copies"] <= 6
+        assert physical["set_sites"] <= 4 * physical["reserved_lanes"]
+        assert physical["wait_sites"] <= 4 * physical["reserved_lanes"]
         records.append(
             tuple(
                 physical[key]
@@ -121,7 +125,10 @@ def test_large_trip_counts_do_not_expand_command_sites(factory):
                 ]
             )
         )
-    assert len(set(records)) == 1
+    # Short trips can omit phases or retain guarded lowering. Once all phases
+    # are present, increasing trips by three orders does not enlarge the plan.
+    assert records[1] == records[2]
+    assert all(a <= b for a, b in zip(records[0], records[1], strict=True))
 
 
 @pytest.mark.ptoas_compile

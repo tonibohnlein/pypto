@@ -1,0 +1,5226 @@
+{
+  "revision": "4f5fdfeada1085841de6cb5bfd7637d391a9663e",
+  "extension_sha256": "91322ca7e5b56f3fe6fc3d278841eae52b2b7fe6bcdfae1358c29df605b8cde4",
+  "driver_sha256": "a22b3af6e3bf969bcde74666f70bd869e7a0913fb3697bb7312185b3e8f41860",
+  "command": [
+    "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_sync_accounting.py",
+    "--output",
+    "build-py314/sync-accounting"
+  ],
+  "cases": [
+    {
+      "name": "matmul_64",
+      "input_sha256": "5b5176ea7001f3a804d7b95b47536d72bb1f8109ba09b9ca93df26ceb09f60ea",
+      "production_seconds_single_run": 0.0007111569866538048,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0002987552434206009,
+        "optimize": 7.705111056566238e-05,
+        "lower": 0.00031208666041493416
+      },
+      "reconstruction_audit_seconds": 0.00038625113666057587,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 5,
+            "buffer.load": 2,
+            "sync.record": 4,
+            "sync.wait": 4,
+            "buffer.copy": 2,
+            "buffer.matmul": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 5,
+            "buffer.load": 2,
+            "sync.record": 4,
+            "sync.wait": 4,
+            "buffer.copy": 2,
+            "buffer.matmul": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 4,
+        "system.wait_flag": 4,
+        "distinct_guard_expressions": 0
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 6,
+          "internal_generators": 5,
+          "internal_demands": 4,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 4,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 4,
+            "wait_sites": 4,
+            "guard_sites": 0
+          },
+          "id_widths": {
+            "1": 4
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 4,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 4,
+      "distinct_original_endpoint_pairs_ignoring_domains": 4,
+      "distinct_encoded_endpoint_descriptors": 8,
+      "distinct_colored_endpoint_descriptors": 8,
+      "guard_dependencies": {
+        "static": {},
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {},
+            "false": {}
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "payloads": 6,
+          "nonnative_covers": 4,
+          "cross_pipe_covers": 4,
+          "executed_set_wait_pairs": 4,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "system.set_flag": 4,
+            "system.wait_flag": 4
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "matmul_acc_64",
+      "input_sha256": "02d52a390b8643c140b9554efc9e10088fa317297350311e722966da04973230",
+      "production_seconds_single_run": 0.0006290338933467865,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0002792780287563801,
+        "optimize": 7.506273686885834e-05,
+        "lower": 0.0003434307873249054
+      },
+      "reconstruction_audit_seconds": 0.0003271871246397495,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 5,
+            "buffer.load": 4,
+            "sync.record": 9,
+            "sync.wait": 10,
+            "buffer.copy": 4,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 5,
+            "buffer.load": 4,
+            "sync.record": 9,
+            "sync.wait": 10,
+            "buffer.copy": 4,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 10,
+        "system.wait_flag": 10,
+        "distinct_guard_expressions": 0
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 11,
+          "internal_generators": 17,
+          "internal_demands": 10,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 10,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 10,
+            "wait_sites": 10,
+            "guard_sites": 0
+          },
+          "id_widths": {
+            "1": 10
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 10,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 10,
+      "distinct_original_endpoint_pairs_ignoring_domains": 10,
+      "distinct_encoded_endpoint_descriptors": 20,
+      "distinct_colored_endpoint_descriptors": 20,
+      "guard_dependencies": {
+        "static": {},
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {},
+            "false": {}
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "payloads": 11,
+          "nonnative_covers": 10,
+          "cross_pipe_covers": 10,
+          "executed_set_wait_pairs": 10,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "system.set_flag": 10,
+            "system.wait_flag": 10
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "ddr_split_k",
+      "input_sha256": "efb9bf6cbcb403638db2b80e4df84ad75eec56c977346b4b7431490d6e971db1",
+      "production_seconds_single_run": 0.00205275509506464,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0005230847746133804,
+        "optimize": 0.00013463525101542473,
+        "lower": 0.0016029281541705132
+      },
+      "reconstruction_audit_seconds": 0.001435672864317894,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 7,
+            "buffer.load": 2,
+            "sync.record": 11,
+            "sync.completed": 4,
+            "sync.wait": 15,
+            "buffer.extract": 8,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 4,
+            "buffer.store": 2
+          },
+          "token_carries": 4
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 7,
+            "buffer.load": 2,
+            "sync.record": 11,
+            "sync.completed": 4,
+            "sync.wait": 15,
+            "buffer.extract": 8,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 4,
+            "buffer.store": 2
+          },
+          "token_carries": 4
+        }
+      },
+      "original_static": {
+        "if_sites": 2,
+        "guard_expression_visits": 6,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 2
+      },
+      "physical_static": {
+        "system.set_flag": 15,
+        "if_sites": 18,
+        "guard_expression_visits": 68,
+        "largest_guard_nodes": 5,
+        "system.wait_flag": 15,
+        "distinct_guard_expressions": 6
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 5,
+          "sites": 16,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": [
+            [
+              [
+                0,
+                0,
+                0
+              ],
+              [
+                1,
+                0,
+                0
+              ]
+            ],
+            [
+              [
+                0,
+                0,
+                1
+              ],
+              [
+                1,
+                0,
+                1
+              ]
+            ],
+            [
+              [
+                1,
+                1,
+                4
+              ],
+              [
+                3,
+                0,
+                0
+              ]
+            ],
+            [
+              [
+                1,
+                1,
+                5
+              ],
+              [
+                2,
+                0,
+                0
+              ]
+            ],
+            [
+              [
+                1,
+                1,
+                5
+              ],
+              [
+                3,
+                0,
+                2
+              ]
+            ],
+            [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                3,
+                0,
+                4
+              ]
+            ],
+            [
+              [
+                3,
+                1,
+                5
+              ],
+              [
+                4,
+                0,
+                0
+              ]
+            ]
+          ],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 15,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 15,
+            "wait_sites": 15,
+            "guard_sites": 16
+          },
+          "id_widths": {
+            "1": 15
+          },
+          "cross_segment_families": 7,
+          "dynamic_handoffs": 19,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 15,
+      "distinct_original_endpoint_pairs_ignoring_domains": 15,
+      "distinct_encoded_endpoint_descriptors": 30,
+      "distinct_colored_endpoint_descriptors": 30,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 16,
+          "original_condition": 2
+        },
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {
+              "iteration": 32,
+              "original_condition": 4
+            },
+            "false": {
+              "iteration": 16,
+              "original_condition": 2
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "payloads": 28,
+          "nonnative_covers": 19,
+          "cross_pipe_covers": 19,
+          "executed_set_wait_pairs": 19,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "system.set_flag": 19,
+            "conditions": 36,
+            "inactive_conditions": 18,
+            "condition_nodes": 136,
+            "system.wait_flag": 19
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "vec",
+      "input_sha256": "c08b85f7a9a7592a8753e32c72463bd7b6bebdea0113931242fa67187b340e21",
+      "production_seconds_single_run": 0.0007060952484607697,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0003318795934319496,
+        "optimize": 3.536790609359741e-05,
+        "lower": 0.000339423306286335
+      },
+      "reconstruction_audit_seconds": 0.00042412662878632545,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 3,
+            "buffer.load": 2,
+            "sync.record": 3,
+            "sync.wait": 3,
+            "buffer.add": 1,
+            "buffer.abs": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 3,
+            "buffer.load": 2,
+            "sync.record": 3,
+            "sync.wait": 3,
+            "buffer.add": 1,
+            "buffer.abs": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 2,
+        "system.wait_flag": 2,
+        "system.bar_v": 1,
+        "distinct_guard_expressions": 0
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 5,
+          "internal_generators": 4,
+          "internal_demands": 3,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 3,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 2,
+            "wait_sites": 2,
+            "guard_sites": 0
+          },
+          "id_widths": {
+            "1": 2,
+            "0": 1
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 2,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 3,
+      "distinct_original_endpoint_pairs_ignoring_domains": 3,
+      "distinct_encoded_endpoint_descriptors": 6,
+      "distinct_colored_endpoint_descriptors": 6,
+      "guard_dependencies": {
+        "static": {},
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {},
+            "false": {}
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "payloads": 5,
+          "nonnative_covers": 3,
+          "cross_pipe_covers": 2,
+          "executed_set_wait_pairs": 2,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "system.set_flag": 2,
+            "system.wait_flag": 2,
+            "system.bar_v": 1
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "rotating7",
+      "input_sha256": "bfa36657fbdd669941e138f3b4a694960e0a4bda15ff7f5947d57a0618bf6362",
+      "production_seconds_single_run": 0.0014228313229978085,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0004447069950401783,
+        "optimize": 5.192635580897331e-05,
+        "lower": 0.000851659569889307
+      },
+      "reconstruction_audit_seconds": 0.0008399379439651966,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 1,
+            "buffer.slot": 3,
+            "sync.wait": 3,
+            "buffer.load": 1,
+            "sync.record": 3,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 1,
+            "buffer.slot": 3,
+            "sync.wait": 3,
+            "buffer.load": 1,
+            "sync.record": 3,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "if_sites": 20,
+        "guard_expression_visits": 102,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 9,
+        "system.set_flag": 9,
+        "distinct_guard_expressions": 8
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 3,
+          "internal_generators": 8,
+          "internal_demands": 3,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 3,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 9,
+            "wait_sites": 9,
+            "guard_sites": 20
+          },
+          "id_widths": {
+            "3": 3
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 18,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 3,
+      "distinct_original_endpoint_pairs_ignoring_domains": 3,
+      "distinct_encoded_endpoint_descriptors": 6,
+      "distinct_colored_endpoint_descriptors": 6,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 2,
+          "iteration+modulo": 18
+        },
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {
+              "iteration": 14,
+              "iteration+modulo": 66
+            },
+            "false": {
+              "iteration": 6,
+              "iteration+modulo": 30
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "payloads": 21,
+          "nonnative_covers": 18,
+          "cross_pipe_covers": 18,
+          "executed_set_wait_pairs": 18,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "conditions": 80,
+            "inactive_conditions": 36,
+            "condition_nodes": 386,
+            "system.set_flag": 18,
+            "system.wait_flag": 18
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "crossings",
+      "input_sha256": "e574bc0772bab4b8e61ae384d1e8ccbefa8ae8e4a8def195c5d419946894509a",
+      "production_seconds_single_run": 0.0023310729302465916,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0006925947964191437,
+        "optimize": 8.068326860666275e-05,
+        "lower": 0.001599564217031002
+      },
+      "reconstruction_audit_seconds": 0.17412463016808033,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 2,
+            "buffer.slot": 4,
+            "sync.wait": 7,
+            "buffer.load": 2,
+            "sync.record": 4,
+            "buffer.add": 2
+          },
+          "token_carries": 8
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 2,
+            "buffer.slot": 4,
+            "sync.wait": 7,
+            "buffer.load": 2,
+            "sync.record": 4,
+            "buffer.add": 2
+          },
+          "token_carries": 8
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "if_sites": 36,
+        "guard_expression_visits": 162,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 14,
+        "system.set_flag": 14,
+        "distinct_guard_expressions": 25
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 2,
+          "sites": 4,
+          "internal_generators": 8,
+          "internal_demands": 4,
+          "flat_crossings": null,
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 7,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 14,
+            "wait_sites": 14,
+            "guard_sites": 36
+          },
+          "id_widths": {
+            "3": 3,
+            "2": 1,
+            "1": 3
+          },
+          "cross_segment_families": 3,
+          "dynamic_handoffs": 19,
+          "retained": {
+            "interface_cells": 3,
+            "interface_ports": 48,
+            "interface_entries": 1344,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 7,
+      "distinct_original_endpoint_pairs_ignoring_domains": 5,
+      "distinct_encoded_endpoint_descriptors": 14,
+      "distinct_colored_endpoint_descriptors": 14,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 14,
+          "iteration+modulo": 22
+        },
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {
+              "iteration": 67,
+              "iteration+modulo": 60
+            },
+            "false": {
+              "iteration": 39,
+              "iteration+modulo": 28
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "payloads": 22,
+          "nonnative_covers": 19,
+          "cross_pipe_covers": 19,
+          "executed_set_wait_pairs": 19,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "conditions": 127,
+            "inactive_conditions": 67,
+            "condition_nodes": 519,
+            "system.set_flag": 19,
+            "system.wait_flag": 19
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "collective",
+      "input_sha256": "0adc630d207f65a8e5d1689a728ad05537fc08dcf10317f4a579dffc2db1278d",
+      "production_seconds_single_run": 0.001004271674901247,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.00032290490344166756,
+        "optimize": 4.511885344982147e-05,
+        "lower": 0.0005345032550394535
+      },
+      "reconstruction_audit_seconds": 0.0007850918918848038,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 1,
+            "sync.completed": 2,
+            "buffer.subview": 2,
+            "sync.wait": 2,
+            "buffer.load": 1,
+            "sync.record": 2,
+            "buffer.store": 1
+          },
+          "token_carries": 1
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 1,
+            "sync.completed": 2,
+            "buffer.subview": 2,
+            "sync.wait": 2,
+            "buffer.load": 1,
+            "sync.record": 2,
+            "buffer.store": 1
+          },
+          "token_carries": 1
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 1,
+        "scalar_expression_visits": 1,
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "scalar_definitions": 1,
+        "scalar_expression_visits": 1,
+        "if_sites": 4,
+        "guard_expression_visits": 16,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 2,
+        "system.set_flag": 2,
+        "distinct_guard_expressions": 4
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 2,
+          "sites": 2,
+          "internal_generators": 1,
+          "internal_demands": 1,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 2,
+          "token_families": 2,
+          "physical_families": 2,
+          "token_parse": {
+            "read_statement_visits": 20,
+            "waits_inspected": 2,
+            "inactive_waits": 0,
+            "families": 2
+          },
+          "physical_sites": {
+            "set_sites": 2,
+            "wait_sites": 2,
+            "guard_sites": 4
+          },
+          "id_widths": {
+            "1": 2
+          },
+          "cross_segment_families": 2,
+          "dynamic_handoffs": 5,
+          "retained": {
+            "interface_cells": 3,
+            "interface_ports": 36,
+            "interface_entries": 1008,
+            "source_region_nodes": 4
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 2,
+      "distinct_original_endpoint_pairs_ignoring_domains": 2,
+      "distinct_encoded_endpoint_descriptors": 4,
+      "distinct_colored_endpoint_descriptors": 4,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 4
+        },
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {
+              "iteration": 43
+            },
+            "false": {
+              "iteration": 26
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "payloads": 18,
+          "nonnative_covers": 5,
+          "cross_pipe_covers": 5,
+          "executed_set_wait_pairs": 5,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 3,
+            "scalar_value_nodes": 3,
+            "conditions": 43,
+            "inactive_conditions": 26,
+            "condition_nodes": 189,
+            "system.set_flag": 5,
+            "system.wait_flag": 5
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "softmax",
+      "input_sha256": "1318c22d858e94cd460a0ff87294108a8d180a54ad0d0d2b76bd924897165e03",
+      "production_seconds_single_run": 0.0009594191797077656,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.00040492089465260506,
+        "optimize": 6.516324356198311e-05,
+        "lower": 0.00048467423766851425
+      },
+      "reconstruction_audit_seconds": 0.000534961000084877,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 3,
+            "buffer.load": 1,
+            "sync.record": 6,
+            "sync.wait": 6,
+            "buffer.row_max": 1,
+            "buffer.row_expand_sub": 1,
+            "buffer.exp": 1,
+            "buffer.row_sum": 1,
+            "buffer.row_expand_div": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 3,
+            "buffer.load": 1,
+            "sync.record": 6,
+            "sync.wait": 6,
+            "buffer.row_max": 1,
+            "buffer.row_expand_sub": 1,
+            "buffer.exp": 1,
+            "buffer.row_sum": 1,
+            "buffer.row_expand_div": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 2,
+        "system.wait_flag": 2,
+        "system.bar_v": 4,
+        "distinct_guard_expressions": 0
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 7,
+          "internal_generators": 10,
+          "internal_demands": 6,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 6,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 2,
+            "wait_sites": 2,
+            "guard_sites": 0
+          },
+          "id_widths": {
+            "1": 2,
+            "0": 4
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 2,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 6,
+      "distinct_original_endpoint_pairs_ignoring_domains": 6,
+      "distinct_encoded_endpoint_descriptors": 12,
+      "distinct_colored_endpoint_descriptors": 12,
+      "guard_dependencies": {
+        "static": {},
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {},
+            "false": {}
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "payloads": 7,
+          "nonnative_covers": 6,
+          "cross_pipe_covers": 2,
+          "executed_set_wait_pairs": 2,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "system.set_flag": 2,
+            "system.wait_flag": 2,
+            "system.bar_v": 4
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "nested",
+      "input_sha256": "aa9cdb3428dda25bcd928943ba4561b79d6098ff874115a60ffe67b68941efd5",
+      "production_seconds_single_run": 0.0018661832436919212,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0004538632929325104,
+        "optimize": 0.00010017119348049164,
+        "lower": 0.001222182996571064
+      },
+      "reconstruction_audit_seconds": 0.0015171431005001068,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 1,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 7,
+            "buffer.abs": 2,
+            "sync.completed": 5,
+            "buffer.store": 2
+          },
+          "token_carries": 2
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 1,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 7,
+            "buffer.abs": 2,
+            "sync.completed": 5,
+            "buffer.store": 2
+          },
+          "token_carries": 2
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 10,
+        "guard_expression_visits": 66,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 6
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 3,
+          "sites": 6,
+          "internal_generators": 6,
+          "internal_demands": 4,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 7,
+          "token_families": 7,
+          "physical_families": 7,
+          "token_parse": {
+            "read_statement_visits": 32,
+            "waits_inspected": 7,
+            "inactive_waits": 0,
+            "families": 7
+          },
+          "physical_sites": {
+            "set_sites": 7,
+            "wait_sites": 7,
+            "guard_sites": 10
+          },
+          "id_widths": {
+            "1": 7
+          },
+          "cross_segment_families": 2,
+          "dynamic_handoffs": 15,
+          "retained": {
+            "interface_cells": 6,
+            "interface_ports": 46,
+            "interface_entries": 1288,
+            "source_region_nodes": 5
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 7,
+      "distinct_original_endpoint_pairs_ignoring_domains": 6,
+      "distinct_encoded_endpoint_descriptors": 14,
+      "distinct_colored_endpoint_descriptors": 14,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 10
+        },
+        "executions": [
+          {
+            "parameters": {
+              "1": 0,
+              "3": 128
+            },
+            "block": null,
+            "evaluated": {
+              "iteration": 48
+            },
+            "false": {
+              "iteration": 24
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 128
+          },
+          "block": null,
+          "payloads": 16,
+          "nonnative_covers": 15,
+          "cross_pipe_covers": 15,
+          "executed_set_wait_pairs": 15,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "system.set_flag": 15,
+            "system.wait_flag": 15,
+            "conditions": 48,
+            "inactive_conditions": 24,
+            "condition_nodes": 312
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "lib_matmul",
+      "input_sha256": "c3b5ccdcff89f9af1e699a1ab9f6b45ade70fa81089ec8b70dbb7e5dbb771f83",
+      "production_seconds_single_run": 0.0005892002955079079,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.00028312671929597855,
+        "optimize": 7.058307528495789e-05,
+        "lower": 0.00029515568166971207
+      },
+      "reconstruction_audit_seconds": 0.0003309110179543495,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 7,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 5,
+            "buffer.extract": 4,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 7,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 5,
+            "buffer.extract": 4,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 5,
+        "system.wait_flag": 5,
+        "distinct_guard_expressions": 0
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 9,
+          "internal_generators": 9,
+          "internal_demands": 5,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 5,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 5,
+            "wait_sites": 5,
+            "guard_sites": 0
+          },
+          "id_widths": {
+            "1": 5
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 5,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 5,
+      "distinct_original_endpoint_pairs_ignoring_domains": 5,
+      "distinct_encoded_endpoint_descriptors": 10,
+      "distinct_colored_endpoint_descriptors": 10,
+      "guard_dependencies": {
+        "static": {},
+        "executions": [
+          {
+            "parameters": {
+              "1": 0,
+              "3": 0
+            },
+            "block": null,
+            "evaluated": {},
+            "false": {}
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 0
+          },
+          "block": null,
+          "payloads": 9,
+          "nonnative_covers": 5,
+          "cross_pipe_covers": 5,
+          "executed_set_wait_pairs": 5,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "system.set_flag": 5,
+            "system.wait_flag": 5
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "lib_gemm",
+      "input_sha256": "dd6417148f089e6da8c57d8d7a3b4ac420e4105136d075de35d4f6805e5591eb",
+      "production_seconds_single_run": 0.0009149876423180103,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0003150207921862602,
+        "optimize": 8.995272219181061e-05,
+        "lower": 0.0005978620611131191
+      },
+      "reconstruction_audit_seconds": 0.000520000234246254,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 5,
+            "sync.completed": 3,
+            "sync.wait": 7,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "buffer.copy": 2,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 5,
+            "sync.completed": 3,
+            "sync.wait": 7,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "buffer.copy": 2,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 1,
+        "scalar_expression_visits": 3,
+        "if_sites": 1,
+        "guard_expression_visits": 3,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 1
+      },
+      "physical_static": {
+        "scalar_definitions": 1,
+        "scalar_expression_visits": 3,
+        "if_sites": 8,
+        "guard_expression_visits": 24,
+        "largest_guard_nodes": 3,
+        "system.wait_flag": 7,
+        "system.set_flag": 7,
+        "distinct_guard_expressions": 4
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 2,
+          "sites": 6,
+          "internal_generators": 12,
+          "internal_demands": 6,
+          "flat_crossings": [
+            [
+              [
+                0,
+                3,
+                4
+              ],
+              [
+                1,
+                0,
+                0
+              ]
+            ]
+          ],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 7,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 7,
+            "wait_sites": 7,
+            "guard_sites": 7
+          },
+          "id_widths": {
+            "1": 7
+          },
+          "cross_segment_families": 1,
+          "dynamic_handoffs": 22,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 7,
+      "distinct_original_endpoint_pairs_ignoring_domains": 7,
+      "distinct_encoded_endpoint_descriptors": 14,
+      "distinct_colored_endpoint_descriptors": 14,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 7,
+          "original_condition": 1
+        },
+        "executions": [
+          {
+            "parameters": {
+              "1": 0,
+              "3": 0
+            },
+            "block": null,
+            "evaluated": {
+              "iteration": 28,
+              "original_condition": 4
+            },
+            "false": {
+              "iteration": 9,
+              "original_condition": 3
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 0
+          },
+          "block": null,
+          "payloads": 21,
+          "nonnative_covers": 22,
+          "cross_pipe_covers": 22,
+          "executed_set_wait_pairs": 22,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 4,
+            "scalar_value_nodes": 12,
+            "conditions": 32,
+            "inactive_conditions": 12,
+            "condition_nodes": 96,
+            "system.set_flag": 22,
+            "system.wait_flag": 22
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_output_b3_h512",
+      "input_sha256": "85511ce48a58cfb06e91c86d2c3ea1b4136fb2c8cd25b0d3413f9d0184b52c24",
+      "production_seconds_single_run": 0.0029555601067841053,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0010155467316508293,
+        "optimize": 0.00018201302736997604,
+        "lower": 0.002007194794714451
+      },
+      "reconstruction_audit_seconds": 0.0027523497119545937,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 4,
+            "sync.record": 12,
+            "sync.completed": 5,
+            "sync.wait": 13,
+            "buffer.extract": 8,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 4,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "buffer.load": 4,
+            "sync.record": 12,
+            "sync.completed": 5,
+            "sync.wait": 13,
+            "buffer.extract": 8,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 4,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 2,
+        "scalar_expression_visits": 4,
+        "if_sites": 1,
+        "guard_expression_visits": 3,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 1
+      },
+      "physical_static": {
+        "scalar_definitions": 4,
+        "scalar_expression_visits": 10,
+        "system.set_flag": 13,
+        "if_sites": 14,
+        "guard_expression_visits": 52,
+        "largest_guard_nodes": 5,
+        "system.wait_flag": 13,
+        "distinct_guard_expressions": 12
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 73,
+            "waits_inspected": 13,
+            "inactive_waits": 0,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 17,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 6
+          },
+          "block_bounds": [
+            0,
+            1
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 0,
+          "sites": 0,
+          "internal_generators": 0,
+          "internal_demands": 0,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 0,
+          "token_families": 0,
+          "physical_families": 0,
+          "token_parse": {
+            "read_statement_visits": 17,
+            "waits_inspected": 0,
+            "inactive_waits": 0,
+            "families": 0
+          },
+          "physical_sites": {
+            "set_sites": 0,
+            "wait_sites": 0,
+            "guard_sites": 0
+          },
+          "id_widths": {},
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 0,
+          "retained": {
+            "interface_cells": 16,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 2
+          },
+          "block_bounds": [
+            2,
+            19
+          ]
+        }
+      ],
+      "family_instances_across_cases": 13,
+      "distinct_original_endpoint_pairs_ignoring_domains": 13,
+      "distinct_encoded_endpoint_descriptors": 26,
+      "distinct_colored_endpoint_descriptors": 26,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 13,
+          "original_condition": 1
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "iteration": 52,
+              "original_condition": 4
+            },
+            "false": {
+              "iteration": 23,
+              "original_condition": 3
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 19,
+            "evaluated": {},
+            "false": {}
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {
+            "3": 0
+          },
+          "block": 0,
+          "payloads": 53,
+          "nonnative_covers": 33,
+          "cross_pipe_covers": 33,
+          "executed_set_wait_pairs": 33,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 10,
+            "scalar_value_nodes": 28,
+            "system.set_flag": 33,
+            "conditions": 56,
+            "inactive_conditions": 26,
+            "condition_nodes": 208,
+            "system.wait_flag": 33
+          }
+        },
+        {
+          "parameters": {
+            "3": 1
+          },
+          "block": 19,
+          "payloads": 0,
+          "nonnative_covers": 0,
+          "cross_pipe_covers": 0,
+          "executed_set_wait_pairs": 0,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 1,
+            "scalar_value_nodes": 1
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_gate_up_b0_h512",
+      "input_sha256": "a363a12bbac630d1b3d04efc83c046dd9a872fa61eab28bef6ec674e5f9e9bcc",
+      "production_seconds_single_run": 0.011979531962424517,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0027345027774572372,
+        "optimize": 0.0005479929968714714,
+        "lower": 0.009246532339602709
+      },
+      "reconstruction_audit_seconds": 0.01220723520964384,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 29,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 57,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 29,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 57,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 15,
+        "if_sites": 2,
+        "guard_expression_visits": 6,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 2
+      },
+      "physical_static": {
+        "scalar_definitions": 11,
+        "scalar_expression_visits": 33,
+        "system.set_flag": 41,
+        "if_sites": 82,
+        "guard_expression_visits": 280,
+        "largest_guard_nodes": 5,
+        "system.wait_flag": 41,
+        "distinct_guard_expressions": 33
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 106,
+            "waits_inspected": 26,
+            "inactive_waits": 13,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 20,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            0,
+            6
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 31,
+          "token_families": 31,
+          "physical_families": 31,
+          "token_parse": {
+            "read_statement_visits": 185,
+            "waits_inspected": 57,
+            "inactive_waits": 26,
+            "families": 31
+          },
+          "physical_sites": {
+            "set_sites": 31,
+            "wait_sites": 31,
+            "guard_sites": 31
+          },
+          "id_widths": {
+            "1": 31
+          },
+          "cross_segment_families": 15,
+          "dynamic_handoffs": 71,
+          "retained": {
+            "interface_cells": 24,
+            "interface_ports": 382,
+            "interface_entries": 10696,
+            "source_region_nodes": 11
+          },
+          "block_bounds": [
+            7,
+            16
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 104,
+            "waits_inspected": 31,
+            "inactive_waits": 18,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            17,
+            23
+          ]
+        }
+      ],
+      "family_instances_across_cases": 57,
+      "distinct_original_endpoint_pairs_ignoring_domains": 31,
+      "distinct_encoded_endpoint_descriptors": 62,
+      "distinct_colored_endpoint_descriptors": 78,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 37,
+          "launch": 43,
+          "original_condition": 2
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "iteration": 52,
+              "launch": 25,
+              "original_condition": 4
+            },
+            "false": {
+              "iteration": 23,
+              "launch": 17,
+              "original_condition": 3
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 23,
+            "evaluated": {
+              "launch": 108,
+              "iteration": 52,
+              "original_condition": 4
+            },
+            "false": {
+              "launch": 56,
+              "iteration": 23,
+              "original_condition": 3
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {
+            "3": 0
+          },
+          "block": 0,
+          "payloads": 53,
+          "nonnative_covers": 33,
+          "cross_pipe_covers": 33,
+          "executed_set_wait_pairs": 33,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 12,
+            "scalar_value_nodes": 36,
+            "system.set_flag": 33,
+            "conditions": 81,
+            "inactive_conditions": 43,
+            "condition_nodes": 283,
+            "system.wait_flag": 33
+          }
+        },
+        {
+          "parameters": {
+            "3": 1
+          },
+          "block": 23,
+          "payloads": 53,
+          "nonnative_covers": 33,
+          "cross_pipe_covers": 33,
+          "executed_set_wait_pairs": 33,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 12,
+            "scalar_value_nodes": 36,
+            "conditions": 164,
+            "inactive_conditions": 82,
+            "condition_nodes": 532,
+            "system.set_flag": 33,
+            "system.wait_flag": 33
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_gate_up_b1_h512",
+      "input_sha256": "7d8ae3de450ee48bc796e2b3af358709bb644b82fb81f58268787b61cca644d4",
+      "production_seconds_single_run": 0.01942873327061534,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.004267716780304909,
+        "optimize": 0.0008037458173930645,
+        "lower": 0.015171142295002937
+      },
+      "reconstruction_audit_seconds": 0.020188975147902966,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 34,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 34,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 21,
+        "if_sites": 2,
+        "guard_expression_visits": 6,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 2
+      },
+      "physical_static": {
+        "scalar_definitions": 11,
+        "scalar_expression_visits": 39,
+        "system.set_flag": 43,
+        "if_sites": 84,
+        "guard_expression_visits": 306,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 41,
+        "distinct_guard_expressions": 34
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 124,
+            "waits_inspected": 39,
+            "inactive_waits": 26,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            0,
+            0
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 31,
+          "token_families": 31,
+          "physical_families": 31,
+          "token_parse": {
+            "read_statement_visits": 203,
+            "waits_inspected": 70,
+            "inactive_waits": 39,
+            "families": 31
+          },
+          "physical_sites": {
+            "set_sites": 31,
+            "wait_sites": 31,
+            "guard_sites": 31
+          },
+          "id_widths": {
+            "1": 31
+          },
+          "cross_segment_families": 15,
+          "dynamic_handoffs": 71,
+          "retained": {
+            "interface_cells": 24,
+            "interface_ports": 382,
+            "interface_entries": 10696,
+            "source_region_nodes": 11
+          },
+          "block_bounds": [
+            1,
+            10
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 104,
+            "waits_inspected": 31,
+            "inactive_waits": 18,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            11,
+            17
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 124,
+            "waits_inspected": 39,
+            "inactive_waits": 26,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 20,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            18,
+            23
+          ]
+        }
+      ],
+      "family_instances_across_cases": 70,
+      "distinct_original_endpoint_pairs_ignoring_domains": 31,
+      "distinct_encoded_endpoint_descriptors": 62,
+      "distinct_colored_endpoint_descriptors": 78,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 37,
+          "launch": 45,
+          "original_condition": 2
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "iteration": 52,
+              "launch": 33,
+              "original_condition": 4
+            },
+            "false": {
+              "iteration": 23,
+              "launch": 25,
+              "original_condition": 3
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 23,
+            "evaluated": {
+              "iteration": 52,
+              "launch": 33,
+              "original_condition": 4
+            },
+            "false": {
+              "iteration": 23,
+              "launch": 25,
+              "original_condition": 3
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {
+            "3": 0
+          },
+          "block": 0,
+          "payloads": 53,
+          "nonnative_covers": 33,
+          "cross_pipe_covers": 33,
+          "executed_set_wait_pairs": 33,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 12,
+            "scalar_value_nodes": 40,
+            "system.set_flag": 33,
+            "conditions": 89,
+            "inactive_conditions": 51,
+            "condition_nodes": 375,
+            "system.wait_flag": 33
+          }
+        },
+        {
+          "parameters": {
+            "3": 1
+          },
+          "block": 23,
+          "payloads": 53,
+          "nonnative_covers": 33,
+          "cross_pipe_covers": 33,
+          "executed_set_wait_pairs": 33,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 12,
+            "scalar_value_nodes": 40,
+            "system.set_flag": 33,
+            "conditions": 89,
+            "inactive_conditions": 51,
+            "condition_nodes": 375,
+            "system.wait_flag": 33
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_gate_up_b2_h512",
+      "input_sha256": "c277b57f2663306f6ec2d9cc88f64495397005cee6ac09618a26e917cd588cd4",
+      "production_seconds_single_run": 0.023460324853658676,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.005194144789129496,
+        "optimize": 0.0009459410794079304,
+        "lower": 0.018917850218713284
+      },
+      "reconstruction_audit_seconds": 0.025243543088436127,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 48,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 88,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 10
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 48,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 88,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 10
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 21,
+        "if_sites": 2,
+        "guard_expression_visits": 6,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 2
+      },
+      "physical_static": {
+        "scalar_definitions": 13,
+        "scalar_expression_visits": 45,
+        "system.set_flag": 56,
+        "if_sites": 118,
+        "guard_expression_visits": 474,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 56,
+        "distinct_guard_expressions": 37
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 31,
+          "token_families": 31,
+          "physical_families": 31,
+          "token_parse": {
+            "read_statement_visits": 235,
+            "waits_inspected": 88,
+            "inactive_waits": 57,
+            "families": 31
+          },
+          "physical_sites": {
+            "set_sites": 31,
+            "wait_sites": 31,
+            "guard_sites": 31
+          },
+          "id_widths": {
+            "1": 31
+          },
+          "cross_segment_families": 15,
+          "dynamic_handoffs": 71,
+          "retained": {
+            "interface_cells": 26,
+            "interface_ports": 382,
+            "interface_entries": 10696,
+            "source_region_nodes": 11
+          },
+          "block_bounds": [
+            0,
+            4
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 132,
+            "waits_inspected": 49,
+            "inactive_waits": 36,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            5,
+            11
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 133,
+            "waits_inspected": 39,
+            "inactive_waits": 26,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 20,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            12,
+            18
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 31,
+          "token_families": 31,
+          "physical_families": 31,
+          "token_parse": {
+            "read_statement_visits": 235,
+            "waits_inspected": 88,
+            "inactive_waits": 57,
+            "families": 31
+          },
+          "physical_sites": {
+            "set_sites": 31,
+            "wait_sites": 31,
+            "guard_sites": 31
+          },
+          "id_widths": {
+            "1": 31
+          },
+          "cross_segment_families": 15,
+          "dynamic_handoffs": 71,
+          "retained": {
+            "interface_cells": 24,
+            "interface_ports": 382,
+            "interface_entries": 10696,
+            "source_region_nodes": 11
+          },
+          "block_bounds": [
+            19,
+            23
+          ]
+        }
+      ],
+      "family_instances_across_cases": 88,
+      "distinct_original_endpoint_pairs_ignoring_domains": 31,
+      "distinct_encoded_endpoint_descriptors": 62,
+      "distinct_colored_endpoint_descriptors": 78,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 48,
+          "launch": 68,
+          "original_condition": 2
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "iteration": 124,
+              "launch": 206,
+              "original_condition": 8
+            },
+            "false": {
+              "iteration": 61,
+              "launch": 133,
+              "original_condition": 6
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 23,
+            "evaluated": {
+              "iteration": 124,
+              "launch": 206,
+              "original_condition": 8
+            },
+            "false": {
+              "iteration": 61,
+              "launch": 133,
+              "original_condition": 6
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {
+            "3": 0
+          },
+          "block": 0,
+          "payloads": 106,
+          "nonnative_covers": 71,
+          "cross_pipe_covers": 71,
+          "executed_set_wait_pairs": 71,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 21,
+            "scalar_value_nodes": 69,
+            "system.set_flag": 71,
+            "conditions": 338,
+            "inactive_conditions": 200,
+            "condition_nodes": 1374,
+            "system.wait_flag": 71
+          }
+        },
+        {
+          "parameters": {
+            "3": 1
+          },
+          "block": 23,
+          "payloads": 106,
+          "nonnative_covers": 71,
+          "cross_pipe_covers": 71,
+          "executed_set_wait_pairs": 71,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 21,
+            "scalar_value_nodes": 69,
+            "system.set_flag": 71,
+            "conditions": 338,
+            "inactive_conditions": 200,
+            "condition_nodes": 1374,
+            "system.wait_flag": 71
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_gate_up_b3_h512",
+      "input_sha256": "3475d0c9deba619c241636e52f789f8337a7a68698ac0da323d754c5a300ed34",
+      "production_seconds_single_run": 0.016958332154899836,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.003772151656448841,
+        "optimize": 0.0006916681304574013,
+        "lower": 0.013669183943420649
+      },
+      "reconstruction_audit_seconds": 0.017976119183003902,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 34,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 34,
+            "buffer.load": 8,
+            "sync.record": 27,
+            "sync.wait": 70,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 21,
+        "if_sites": 2,
+        "guard_expression_visits": 6,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 2
+      },
+      "physical_static": {
+        "scalar_definitions": 13,
+        "scalar_expression_visits": 45,
+        "system.set_flag": 49,
+        "if_sites": 104,
+        "guard_expression_visits": 430,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 51,
+        "distinct_guard_expressions": 38
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 122,
+            "waits_inspected": 44,
+            "inactive_waits": 31,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            0,
+            5
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 106,
+            "waits_inspected": 26,
+            "inactive_waits": 13,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 20,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            6,
+            12
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 31,
+          "token_families": 31,
+          "physical_families": 31,
+          "token_parse": {
+            "read_statement_visits": 203,
+            "waits_inspected": 70,
+            "inactive_waits": 39,
+            "families": 31
+          },
+          "physical_sites": {
+            "set_sites": 31,
+            "wait_sites": 31,
+            "guard_sites": 31
+          },
+          "id_widths": {
+            "1": 31
+          },
+          "cross_segment_families": 15,
+          "dynamic_handoffs": 71,
+          "retained": {
+            "interface_cells": 24,
+            "interface_ports": 382,
+            "interface_entries": 10696,
+            "source_region_nodes": 11
+          },
+          "block_bounds": [
+            13,
+            22
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 13,
+          "token_families": 13,
+          "physical_families": 13,
+          "token_parse": {
+            "read_statement_visits": 122,
+            "waits_inspected": 44,
+            "inactive_waits": 31,
+            "families": 13
+          },
+          "physical_sites": {
+            "set_sites": 13,
+            "wait_sites": 13,
+            "guard_sites": 13
+          },
+          "id_widths": {
+            "1": 13
+          },
+          "cross_segment_families": 5,
+          "dynamic_handoffs": 33,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 160,
+            "interface_entries": 4480,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            23,
+            23
+          ]
+        }
+      ],
+      "family_instances_across_cases": 70,
+      "distinct_original_endpoint_pairs_ignoring_domains": 31,
+      "distinct_encoded_endpoint_descriptors": 62,
+      "distinct_colored_endpoint_descriptors": 78,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 43,
+          "launch": 59,
+          "original_condition": 2
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "launch": 160,
+              "iteration": 52,
+              "original_condition": 4
+            },
+            "false": {
+              "launch": 108,
+              "iteration": 23,
+              "original_condition": 3
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 23,
+            "evaluated": {
+              "launch": 160,
+              "iteration": 52,
+              "original_condition": 4
+            },
+            "false": {
+              "launch": 108,
+              "iteration": 23,
+              "original_condition": 3
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "parameters": {
+            "3": 0
+          },
+          "block": 0,
+          "payloads": 53,
+          "nonnative_covers": 33,
+          "cross_pipe_covers": 33,
+          "executed_set_wait_pairs": 33,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 12,
+            "scalar_value_nodes": 40,
+            "conditions": 216,
+            "inactive_conditions": 134,
+            "condition_nodes": 912,
+            "system.set_flag": 33,
+            "system.wait_flag": 33
+          }
+        },
+        {
+          "parameters": {
+            "3": 1
+          },
+          "block": 23,
+          "payloads": 53,
+          "nonnative_covers": 33,
+          "cross_pipe_covers": 33,
+          "executed_set_wait_pairs": 33,
+          "excess_prerequisites": 0,
+          "ordering": "equal",
+          "executed_control": {
+            "scalar_evaluations": 12,
+            "scalar_value_nodes": 40,
+            "conditions": 216,
+            "inactive_conditions": 134,
+            "condition_nodes": 912,
+            "system.set_flag": 33,
+            "system.wait_flag": 33
+          }
+        }
+      ],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_output_b3_h5120",
+      "input_sha256": "656a5e8757778cd67da8d50f357a7aac5695849ed2c2f45adfb849cb5e6a9387",
+      "production_seconds_single_run": 0.005058654118329287,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0015157992020249367,
+        "optimize": 0.0003071497194468975,
+        "lower": 0.003600969910621643
+      },
+      "reconstruction_audit_seconds": 0.004016290418803692,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 14,
+            "sync.wait": 17,
+            "buffer.load": 4,
+            "sync.record": 14,
+            "buffer.extract": 8,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 4,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 14,
+            "sync.wait": 17,
+            "buffer.load": 4,
+            "sync.record": 14,
+            "buffer.extract": 8,
+            "buffer.matmul": 1,
+            "buffer.matmul_acc": 4,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 4,
+        "scalar_expression_visits": 12,
+        "if_sites": 1,
+        "guard_expression_visits": 7,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 1
+      },
+      "physical_static": {
+        "scalar_definitions": 6,
+        "scalar_expression_visits": 18,
+        "if_sites": 27,
+        "guard_expression_visits": 113,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 17,
+        "system.set_flag": 17,
+        "distinct_guard_expressions": 16
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 93,
+            "waits_inspected": 17,
+            "inactive_waits": 0,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 17,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 7
+          },
+          "block_bounds": [
+            0,
+            19
+          ]
+        }
+      ],
+      "family_instances_across_cases": 17,
+      "distinct_original_endpoint_pairs_ignoring_domains": 17,
+      "distinct_encoded_endpoint_descriptors": 34,
+      "distinct_colored_endpoint_descriptors": 34,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 26,
+          "original_condition": 1
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "iteration": 868,
+              "original_condition": 40
+            },
+            "false": {
+              "iteration": 367,
+              "original_condition": 39
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 19,
+            "evaluated": {
+              "iteration": 868,
+              "original_condition": 40
+            },
+            "false": {
+              "iteration": 367,
+              "original_condition": 39
+            }
+          }
+        ]
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_gate_up_b0_h5120",
+      "input_sha256": "3ef6b23966b5a8a3ef37f8eddb412157fa0227daf5e594b457ba70f96085a41f",
+      "production_seconds_single_run": 0.024328951258212328,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.004607025999575853,
+        "optimize": 0.0009502018801867962,
+        "lower": 0.019949923269450665
+      },
+      "reconstruction_audit_seconds": 0.022968944162130356,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 69,
+            "sync.wait": 73,
+            "buffer.load": 8,
+            "sync.record": 29,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 69,
+            "sync.wait": 73,
+            "buffer.load": 8,
+            "sync.record": 29,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 31,
+        "if_sites": 2,
+        "guard_expression_visits": 14,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 2
+      },
+      "physical_static": {
+        "scalar_definitions": 19,
+        "scalar_expression_visits": 61,
+        "if_sites": 159,
+        "guard_expression_visits": 585,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 55,
+        "system.set_flag": 60,
+        "distinct_guard_expressions": 49
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 141,
+            "waits_inspected": 34,
+            "inactive_waits": 17,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 20,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            0,
+            6
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 39,
+          "token_families": 39,
+          "physical_families": 39,
+          "token_parse": {
+            "read_statement_visits": 253,
+            "waits_inspected": 73,
+            "inactive_waits": 34,
+            "families": 39
+          },
+          "physical_sites": {
+            "set_sites": 39,
+            "wait_sites": 39,
+            "guard_sites": 66
+          },
+          "id_widths": {
+            "1": 39
+          },
+          "cross_segment_families": 23,
+          "dynamic_handoffs": 719,
+          "retained": {
+            "interface_cells": 24,
+            "interface_ports": 1058,
+            "interface_entries": 29624,
+            "source_region_nodes": 13
+          },
+          "block_bounds": [
+            7,
+            16
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 137,
+            "waits_inspected": 39,
+            "inactive_waits": 22,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            17,
+            23
+          ]
+        }
+      ],
+      "family_instances_across_cases": 73,
+      "distinct_original_endpoint_pairs_ignoring_domains": 39,
+      "distinct_encoded_endpoint_descriptors": 78,
+      "distinct_colored_endpoint_descriptors": 102,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 96,
+          "launch": 61,
+          "original_condition": 2
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "iteration": 868,
+              "launch": 321,
+              "original_condition": 40
+            },
+            "false": {
+              "iteration": 367,
+              "launch": 161,
+              "original_condition": 39
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 23,
+            "evaluated": {
+              "launch": 1600,
+              "iteration": 868,
+              "original_condition": 40
+            },
+            "false": {
+              "launch": 800,
+              "iteration": 367,
+              "original_condition": 39
+            }
+          }
+        ]
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_gate_up_b1_h5120",
+      "input_sha256": "e5536ad35664e54cc6d4c19a45bdc0a0c078379c829528912868e35895bb3bed",
+      "production_seconds_single_run": 0.02917654998600483,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0058163609355688095,
+        "optimize": 0.0010044840164482594,
+        "lower": 0.02369172079488635
+      },
+      "reconstruction_audit_seconds": 0.02868823893368244,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 83,
+            "sync.wait": 90,
+            "buffer.load": 8,
+            "sync.record": 29,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 83,
+            "sync.wait": 90,
+            "buffer.load": 8,
+            "sync.record": 29,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 37,
+        "if_sites": 2,
+        "guard_expression_visits": 14,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 2
+      },
+      "physical_static": {
+        "scalar_definitions": 19,
+        "scalar_expression_visits": 67,
+        "if_sites": 171,
+        "guard_expression_visits": 649,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 55,
+        "system.set_flag": 66,
+        "distinct_guard_expressions": 50
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 172,
+            "waits_inspected": 51,
+            "inactive_waits": 34,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            0,
+            0
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 39,
+          "token_families": 39,
+          "physical_families": 39,
+          "token_parse": {
+            "read_statement_visits": 284,
+            "waits_inspected": 90,
+            "inactive_waits": 51,
+            "families": 39
+          },
+          "physical_sites": {
+            "set_sites": 39,
+            "wait_sites": 39,
+            "guard_sites": 66
+          },
+          "id_widths": {
+            "1": 39
+          },
+          "cross_segment_families": 23,
+          "dynamic_handoffs": 719,
+          "retained": {
+            "interface_cells": 24,
+            "interface_ports": 1058,
+            "interface_entries": 29624,
+            "source_region_nodes": 13
+          },
+          "block_bounds": [
+            1,
+            10
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 137,
+            "waits_inspected": 39,
+            "inactive_waits": 22,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            11,
+            17
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 172,
+            "waits_inspected": 51,
+            "inactive_waits": 34,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 20,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            18,
+            23
+          ]
+        }
+      ],
+      "family_instances_across_cases": 90,
+      "distinct_original_endpoint_pairs_ignoring_domains": 39,
+      "distinct_encoded_endpoint_descriptors": 78,
+      "distinct_colored_endpoint_descriptors": 102,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 104,
+          "launch": 65,
+          "original_condition": 2
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "iteration": 868,
+              "launch": 481,
+              "original_condition": 40
+            },
+            "false": {
+              "iteration": 367,
+              "launch": 321,
+              "original_condition": 39
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 23,
+            "evaluated": {
+              "iteration": 868,
+              "launch": 481,
+              "original_condition": 40
+            },
+            "false": {
+              "iteration": 367,
+              "launch": 321,
+              "original_condition": 39
+            }
+          }
+        ]
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_gate_up_b2_h5120",
+      "input_sha256": "6c0502a503774a90c80a6641e3add8ba21456c4820f6014af60d4f30ee816bc6",
+      "production_seconds_single_run": 0.03634584788233042,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.006747748702764511,
+        "optimize": 0.0012654396705329418,
+        "lower": 0.030621544923633337
+      },
+      "reconstruction_audit_seconds": 0.03621522290632129,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 110,
+            "sync.wait": 112,
+            "buffer.load": 8,
+            "sync.record": 29,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 10
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 110,
+            "sync.wait": 112,
+            "buffer.load": 8,
+            "sync.record": 29,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 10
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 37,
+        "if_sites": 2,
+        "guard_expression_visits": 14,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 2
+      },
+      "physical_static": {
+        "scalar_definitions": 25,
+        "scalar_expression_visits": 85,
+        "if_sites": 234,
+        "guard_expression_visits": 974,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 76,
+        "system.set_flag": 86,
+        "distinct_guard_expressions": 61
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 39,
+          "token_families": 39,
+          "physical_families": 39,
+          "token_parse": {
+            "read_statement_visits": 333,
+            "waits_inspected": 112,
+            "inactive_waits": 73,
+            "families": 39
+          },
+          "physical_sites": {
+            "set_sites": 39,
+            "wait_sites": 39,
+            "guard_sites": 66
+          },
+          "id_widths": {
+            "1": 39
+          },
+          "cross_segment_families": 23,
+          "dynamic_handoffs": 719,
+          "retained": {
+            "interface_cells": 26,
+            "interface_ports": 1058,
+            "interface_entries": 29624,
+            "source_region_nodes": 13
+          },
+          "block_bounds": [
+            0,
+            4
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 178,
+            "waits_inspected": 61,
+            "inactive_waits": 44,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            5,
+            11
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 185,
+            "waits_inspected": 51,
+            "inactive_waits": 34,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 20,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            12,
+            18
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 39,
+          "token_families": 39,
+          "physical_families": 39,
+          "token_parse": {
+            "read_statement_visits": 333,
+            "waits_inspected": 112,
+            "inactive_waits": 73,
+            "families": 39
+          },
+          "physical_sites": {
+            "set_sites": 39,
+            "wait_sites": 39,
+            "guard_sites": 66
+          },
+          "id_widths": {
+            "1": 39
+          },
+          "cross_segment_families": 23,
+          "dynamic_handoffs": 719,
+          "retained": {
+            "interface_cells": 24,
+            "interface_ports": 1058,
+            "interface_entries": 29624,
+            "source_region_nodes": 13
+          },
+          "block_bounds": [
+            19,
+            23
+          ]
+        }
+      ],
+      "family_instances_across_cases": 112,
+      "distinct_original_endpoint_pairs_ignoring_domains": 39,
+      "distinct_encoded_endpoint_descriptors": 78,
+      "distinct_colored_endpoint_descriptors": 102,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 140,
+          "launch": 92,
+          "original_condition": 2
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "iteration": 1996,
+              "launch": 2882,
+              "original_condition": 80
+            },
+            "false": {
+              "iteration": 965,
+              "launch": 1921,
+              "original_condition": 78
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 23,
+            "evaluated": {
+              "iteration": 1996,
+              "launch": 2882,
+              "original_condition": 80
+            },
+            "false": {
+              "iteration": 965,
+              "launch": 1921,
+              "original_condition": 78
+            }
+          }
+        ]
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "qwen_gate_up_b3_h5120",
+      "input_sha256": "fa3e1d8068d4d2854c0ab85afceb5f57ad3912467e241facfcd6b2dbd56b6ac5",
+      "production_seconds_single_run": 0.030720712151378393,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.005828598979860544,
+        "optimize": 0.0010595768690109253,
+        "lower": 0.02488218294456601
+      },
+      "reconstruction_audit_seconds": 0.02978661796078086,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 83,
+            "sync.wait": 90,
+            "buffer.load": 8,
+            "sync.record": 29,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 13,
+            "buffer.get_block_idx": 1,
+            "sync.completed": 83,
+            "sync.wait": 90,
+            "buffer.load": 8,
+            "sync.record": 29,
+            "buffer.extract": 16,
+            "buffer.matmul": 2,
+            "buffer.matmul_acc": 8,
+            "buffer.store": 2
+          },
+          "token_carries": 5
+        }
+      },
+      "original_static": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 37,
+        "if_sites": 2,
+        "guard_expression_visits": 14,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 2
+      },
+      "physical_static": {
+        "scalar_definitions": 21,
+        "scalar_expression_visits": 73,
+        "if_sites": 207,
+        "guard_expression_visits": 857,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 71,
+        "system.set_flag": 75,
+        "distinct_guard_expressions": 54
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 168,
+            "waits_inspected": 56,
+            "inactive_waits": 39,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            0,
+            5
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 141,
+            "waits_inspected": 34,
+            "inactive_waits": 17,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 20,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            6,
+            12
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 8,
+          "sites": 34,
+          "internal_generators": 48,
+          "internal_demands": 16,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 39,
+          "token_families": 39,
+          "physical_families": 39,
+          "token_parse": {
+            "read_statement_visits": 284,
+            "waits_inspected": 90,
+            "inactive_waits": 51,
+            "families": 39
+          },
+          "physical_sites": {
+            "set_sites": 39,
+            "wait_sites": 39,
+            "guard_sites": 66
+          },
+          "id_widths": {
+            "1": 39
+          },
+          "cross_segment_families": 23,
+          "dynamic_handoffs": 719,
+          "retained": {
+            "interface_cells": 24,
+            "interface_ports": 1058,
+            "interface_entries": 29624,
+            "source_region_nodes": 13
+          },
+          "block_bounds": [
+            13,
+            22
+          ]
+        },
+        {
+          "hierarchical": true,
+          "segment_count": 4,
+          "sites": 17,
+          "internal_generators": 24,
+          "internal_demands": 8,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 17,
+          "token_families": 17,
+          "physical_families": 17,
+          "token_parse": {
+            "read_statement_visits": 168,
+            "waits_inspected": 56,
+            "inactive_waits": 39,
+            "families": 17
+          },
+          "physical_sites": {
+            "set_sites": 17,
+            "wait_sites": 17,
+            "guard_sites": 26
+          },
+          "id_widths": {
+            "1": 17
+          },
+          "cross_segment_families": 9,
+          "dynamic_handoffs": 357,
+          "retained": {
+            "interface_cells": 22,
+            "interface_ports": 496,
+            "interface_entries": 13888,
+            "source_region_nodes": 8
+          },
+          "block_bounds": [
+            23,
+            23
+          ]
+        }
+      ],
+      "family_instances_across_cases": 90,
+      "distinct_original_endpoint_pairs_ignoring_domains": 39,
+      "distinct_encoded_endpoint_descriptors": 78,
+      "distinct_colored_endpoint_descriptors": 102,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 118,
+          "launch": 87,
+          "original_condition": 2
+        },
+        "executions": [
+          {
+            "parameters": {
+              "3": 0
+            },
+            "block": 0,
+            "evaluated": {
+              "launch": 2400,
+              "iteration": 868,
+              "original_condition": 40
+            },
+            "false": {
+              "launch": 1600,
+              "iteration": 367,
+              "original_condition": 39
+            }
+          },
+          {
+            "parameters": {
+              "3": 1
+            },
+            "block": 23,
+            "evaluated": {
+              "launch": 2400,
+              "iteration": 868,
+              "original_condition": 40
+            },
+            "false": {
+              "launch": 1600,
+              "iteration": 367,
+              "original_condition": 39
+            }
+          }
+        ]
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "rotating1",
+      "input_sha256": "b27e1a0cf806f2abf71b106cc0078c23d817b29234c231477437bee6f086c1c4",
+      "production_seconds_single_run": 0.0012668161652982235,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0005153710953891277,
+        "optimize": 4.296330735087395e-05,
+        "lower": 0.0005899793468415737
+      },
+      "reconstruction_audit_seconds": 0.0005858279764652252,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "buffer.slot": 3,
+            "buffer.load": 1,
+            "sync.record": 2,
+            "sync.wait": 2,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "buffer.slot": 3,
+            "buffer.load": 1,
+            "sync.record": 2,
+            "sync.wait": 2,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 0
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 2,
+        "system.wait_flag": 2,
+        "distinct_guard_expressions": 0
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 3,
+          "internal_generators": 8,
+          "internal_demands": 3,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 2,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 2,
+            "wait_sites": 2,
+            "guard_sites": 0
+          },
+          "id_widths": {
+            "1": 2
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 2,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 2,
+      "distinct_original_endpoint_pairs_ignoring_domains": 2,
+      "distinct_encoded_endpoint_descriptors": 4,
+      "distinct_colored_endpoint_descriptors": 4,
+      "guard_dependencies": {
+        "static": {},
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {},
+            "false": {}
+          }
+        ]
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "rotating70",
+      "input_sha256": "71140f6b402a78a629e53e702b0861c3439094c25ae6445cfff5ce290300651b",
+      "production_seconds_single_run": 0.0017738551832735538,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0005469131283462048,
+        "optimize": 5.857134237885475e-05,
+        "lower": 0.001085831318050623
+      },
+      "reconstruction_audit_seconds": 0.0010222680866718292,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 1,
+            "buffer.slot": 3,
+            "sync.wait": 3,
+            "buffer.load": 1,
+            "sync.record": 3,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 1,
+            "buffer.slot": 3,
+            "sync.wait": 3,
+            "buffer.load": 1,
+            "sync.record": 3,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "if_sites": 20,
+        "guard_expression_visits": 102,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 9,
+        "system.set_flag": 9,
+        "distinct_guard_expressions": 8
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 3,
+          "internal_generators": 8,
+          "internal_demands": 3,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 3,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 9,
+            "wait_sites": 9,
+            "guard_sites": 20
+          },
+          "id_widths": {
+            "3": 3
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 207,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 3,
+      "distinct_original_endpoint_pairs_ignoring_domains": 3,
+      "distinct_encoded_endpoint_descriptors": 6,
+      "distinct_colored_endpoint_descriptors": 6,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 2,
+          "iteration+modulo": 18
+        },
+        "executions": [
+          {
+            "parameters": {},
+            "block": null,
+            "evaluated": {
+              "iteration": 140,
+              "iteration+modulo": 822
+            },
+            "false": {
+              "iteration": 6,
+              "iteration+modulo": 408
+            }
+          }
+        ]
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "rotating7000",
+      "input_sha256": "923ddbb0bc55df0303e37733b7eb4c2f396846895d50ca2c1b64f2ce6e093637",
+      "production_seconds_single_run": 0.001734298188239336,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0005317209288477898,
+        "optimize": 6.465800106525421e-05,
+        "lower": 0.0010650446638464928
+      },
+      "reconstruction_audit_seconds": 0.0010374831035733223,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 1,
+            "buffer.slot": 3,
+            "sync.wait": 3,
+            "buffer.load": 1,
+            "sync.record": 3,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 1,
+            "buffer.slot": 3,
+            "sync.wait": 3,
+            "buffer.load": 1,
+            "sync.record": 3,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "if_sites": 20,
+        "guard_expression_visits": 102,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 9,
+        "system.set_flag": 9,
+        "distinct_guard_expressions": 8
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 3,
+          "internal_generators": 8,
+          "internal_demands": 3,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 3,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 9,
+            "wait_sites": 9,
+            "guard_sites": 20
+          },
+          "id_widths": {
+            "3": 3
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 20997,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 3,
+      "distinct_original_endpoint_pairs_ignoring_domains": 3,
+      "distinct_encoded_endpoint_descriptors": 6,
+      "distinct_colored_endpoint_descriptors": 6,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 2,
+          "iteration+modulo": 18
+        },
+        "executions": []
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "rotating1000000",
+      "input_sha256": "f5b550b639854de657c85dd50d111fcc5c14fb9f1e5bdc11b133e71993aa6cb9",
+      "production_seconds_single_run": 0.0016941293142735958,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0005261017940938473,
+        "optimize": 5.813920870423317e-05,
+        "lower": 0.0010640686377882957
+      },
+      "reconstruction_audit_seconds": 0.0010580080561339855,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 1,
+            "buffer.slot": 3,
+            "sync.wait": 3,
+            "buffer.load": 1,
+            "sync.record": 3,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc_multi": 1,
+            "sync.completed": 1,
+            "buffer.slot": 3,
+            "sync.wait": 3,
+            "buffer.load": 1,
+            "sync.record": 3,
+            "buffer.add": 1,
+            "buffer.store": 1
+          },
+          "token_carries": 3
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "if_sites": 20,
+        "guard_expression_visits": 102,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 9,
+        "system.set_flag": 9,
+        "distinct_guard_expressions": 8
+      },
+      "cases": [
+        {
+          "hierarchical": false,
+          "segment_count": 1,
+          "sites": 3,
+          "internal_generators": 8,
+          "internal_demands": 3,
+          "flat_crossings": [],
+          "scoped_mathematical_families": null,
+          "token_families": null,
+          "physical_families": 3,
+          "token_parse": {
+            "unavailable": "Flat transport does not use the scoped-token inspection interface"
+          },
+          "physical_sites": {
+            "set_sites": 9,
+            "wait_sites": 9,
+            "guard_sites": 20
+          },
+          "id_widths": {
+            "3": 3
+          },
+          "cross_segment_families": 0,
+          "dynamic_handoffs": 2999997,
+          "retained": {
+            "interface_cells": 0,
+            "interface_ports": 0,
+            "interface_entries": 0,
+            "source_region_nodes": 0
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 3,
+      "distinct_original_endpoint_pairs_ignoring_domains": 3,
+      "distinct_encoded_endpoint_descriptors": 6,
+      "distinct_colored_endpoint_descriptors": 6,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 2,
+          "iteration+modulo": 18
+        },
+        "executions": []
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "nested_(2, 1000)",
+      "input_sha256": "1b4426ee7f28787b8d881827038d74041478dbecab38f00b1f1a2b99a4bee3be",
+      "production_seconds_single_run": 0.002396075986325741,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0006073620170354843,
+        "optimize": 0.00010090088471770287,
+        "lower": 0.0017313039861619473
+      },
+      "reconstruction_audit_seconds": 0.001881332602351904,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 1,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 7,
+            "buffer.abs": 2,
+            "sync.completed": 5,
+            "buffer.store": 2
+          },
+          "token_carries": 2
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 1,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 7,
+            "buffer.abs": 2,
+            "sync.completed": 5,
+            "buffer.store": 2
+          },
+          "token_carries": 2
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 10,
+        "guard_expression_visits": 66,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 6
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 3,
+          "sites": 6,
+          "internal_generators": 6,
+          "internal_demands": 4,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 7,
+          "token_families": 7,
+          "physical_families": 7,
+          "token_parse": {
+            "read_statement_visits": 32,
+            "waits_inspected": 7,
+            "inactive_waits": 0,
+            "families": 7
+          },
+          "physical_sites": {
+            "set_sites": 7,
+            "wait_sites": 7,
+            "guard_sites": 10
+          },
+          "id_widths": {
+            "1": 7
+          },
+          "cross_segment_families": 2,
+          "dynamic_handoffs": 4003,
+          "retained": {
+            "interface_cells": 6,
+            "interface_ports": 46,
+            "interface_entries": 1288,
+            "source_region_nodes": 5
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 7,
+      "distinct_original_endpoint_pairs_ignoring_domains": 6,
+      "distinct_encoded_endpoint_descriptors": 14,
+      "distinct_colored_endpoint_descriptors": 14,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 10
+        },
+        "executions": []
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "nested_(1000, 3)",
+      "input_sha256": "8bdd6cc73354b9b3d7d6013bac0459450adaa7648370c0e63dd84a111b750252",
+      "production_seconds_single_run": 0.0025162631645798683,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0007622279226779938,
+        "optimize": 0.00010025780647993088,
+        "lower": 0.0016542170196771622
+      },
+      "reconstruction_audit_seconds": 0.0020175091922283173,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 1,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 7,
+            "buffer.abs": 2,
+            "sync.completed": 5,
+            "buffer.store": 2
+          },
+          "token_carries": 2
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 1,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 7,
+            "buffer.abs": 2,
+            "sync.completed": 5,
+            "buffer.store": 2
+          },
+          "token_carries": 2
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 10,
+        "guard_expression_visits": 62,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 8
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 3,
+          "sites": 6,
+          "internal_generators": 6,
+          "internal_demands": 4,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 7,
+          "token_families": 7,
+          "physical_families": 7,
+          "token_parse": {
+            "read_statement_visits": 32,
+            "waits_inspected": 7,
+            "inactive_waits": 0,
+            "families": 7
+          },
+          "physical_sites": {
+            "set_sites": 7,
+            "wait_sites": 7,
+            "guard_sites": 10
+          },
+          "id_widths": {
+            "1": 7
+          },
+          "cross_segment_families": 2,
+          "dynamic_handoffs": 6003,
+          "retained": {
+            "interface_cells": 6,
+            "interface_ports": 150,
+            "interface_entries": 4200,
+            "source_region_nodes": 5
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 7,
+      "distinct_original_endpoint_pairs_ignoring_domains": 6,
+      "distinct_encoded_endpoint_descriptors": 14,
+      "distinct_colored_endpoint_descriptors": 14,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 10
+        },
+        "executions": []
+      },
+      "checks": [],
+      "status": "checked"
+    },
+    {
+      "name": "nested_(1000000, 1000000)",
+      "input_sha256": "434285b87d0908dba3ef901171c25b4856974f898722c58addf9c492151b076a",
+      "production_seconds_single_run": 0.0032039000652730465,
+      "standalone_stage_seconds_single_run": {
+        "insert": 0.0009479778818786144,
+        "optimize": 0.00010108994320034981,
+        "lower": 0.002164378296583891
+      },
+      "reconstruction_audit_seconds": 0.00215616961941123,
+      "logical_inventory": {
+        "insert": {
+          "calls": {
+            "buffer.alloc": 1,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 7,
+            "buffer.abs": 2,
+            "sync.completed": 5,
+            "buffer.store": 2
+          },
+          "token_carries": 2
+        },
+        "optimize": {
+          "calls": {
+            "buffer.alloc": 1,
+            "buffer.load": 2,
+            "sync.record": 5,
+            "sync.wait": 7,
+            "buffer.abs": 2,
+            "sync.completed": 5,
+            "buffer.store": 2
+          },
+          "token_carries": 2
+        }
+      },
+      "original_static": {
+        "distinct_guard_expressions": 0
+      },
+      "physical_static": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 10,
+        "guard_expression_visits": 62,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 8
+      },
+      "cases": [
+        {
+          "hierarchical": true,
+          "segment_count": 3,
+          "sites": 6,
+          "internal_generators": 6,
+          "internal_demands": 4,
+          "flat_crossings": null,
+          "scoped_mathematical_families": 7,
+          "token_families": 7,
+          "physical_families": 7,
+          "token_parse": {
+            "read_statement_visits": 32,
+            "waits_inspected": 7,
+            "inactive_waits": 0,
+            "families": 7
+          },
+          "physical_sites": {
+            "set_sites": 7,
+            "wait_sites": 7,
+            "guard_sites": 10
+          },
+          "id_widths": {
+            "1": 7
+          },
+          "cross_segment_families": 2,
+          "dynamic_handoffs": 2000000000003,
+          "retained": {
+            "interface_cells": 6,
+            "interface_ports": 238,
+            "interface_entries": 6664,
+            "source_region_nodes": 5
+          },
+          "block_bounds": null
+        }
+      ],
+      "family_instances_across_cases": 7,
+      "distinct_original_endpoint_pairs_ignoring_domains": 6,
+      "distinct_encoded_endpoint_descriptors": 14,
+      "distinct_colored_endpoint_descriptors": 14,
+      "guard_dependencies": {
+        "static": {
+          "iteration": 10
+        },
+        "executions": []
+      },
+      "checks": [],
+      "status": "checked"
+    }
+  ],
+  "scope": "Host audit; production unchanged; cross-case equality is not a merge proof.",
+  "artifact": {
+    "path": "build-py314/sync-accounting/accounting.json",
+    "sha256": "0d502952e65c6fd6c0683dd6e19a2aca977682306642ac8953647a2549ab8dbb",
+    "contains": "Complete case-local endpoint families, coordinate axes and assigned IDs"
+  },
+  "comparison": {
+    "scope": "Fresh reexecution of pinned existing host trace binaries; order proofs and C++ generation reused from cut-control campaign, no device execution.",
+    "ordering_sha256": "a87b92a9cbc975510e284e48e539c97a490ccd2e0eaa3c7a2a520e8f952f076b",
+    "cases": [
+      {
+        "name": "matmul_64",
+        "execution": 0,
+        "parameters": {},
+        "block": null,
+        "relation": "equal",
+        "removed_pairs": 0,
+        "added_pairs": 0,
+        "excess_ptoas": 0,
+        "excess_pypto": 0,
+        "sources": {
+          "matmul_64-ptoas.cpp": "ec1c218d42dcb9372f210c23b319f9111e6202fd61f62e97a110dc7dfbbb9a7a",
+          "matmul_64.cpp": "8e22e513cfd0b53786af732eb64a531e747ea1974bd17ce7b1ac4b3a6eb9f4c9"
+        },
+        "ptoas": {
+          "binary_sha256": "d3494f1afb74cb82ca63b3187f97b600ede4db949070ea6ac44f973ad8fd9b8f",
+          "counts": {
+            "payload": 6,
+            "set_flag": 4,
+            "wait_flag": 4,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "190f06f7917d525c136fcdd327eef7de81a314f9d38eac7a8b37e2d376c55607",
+          "counts": {
+            "payload": 6,
+            "set_flag": 4,
+            "wait_flag": 4
+          }
+        }
+      },
+      {
+        "name": "matmul_acc_64",
+        "execution": 0,
+        "parameters": {},
+        "block": null,
+        "relation": "equal",
+        "removed_pairs": 0,
+        "added_pairs": 0,
+        "excess_ptoas": 0,
+        "excess_pypto": 0,
+        "sources": {
+          "matmul_acc_64-ptoas.cpp": "89be0b5528780de99b5e9531843770609ebffee18630d13196131c3934ab3d5d",
+          "matmul_acc_64.cpp": "304b35c614c81bbcafa8027ea6798f436e3d2dc88f3c9a6505017e989a10e365"
+        },
+        "ptoas": {
+          "binary_sha256": "fd9eb64954cb366fa93e38327801e19d044f41848ba21198e790e01e20e84de4",
+          "counts": {
+            "payload": 11,
+            "set_flag": 10,
+            "wait_flag": 10,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "d7196b7356320dadefc0508d285a0e09d1c65fdf59586531270c12afb193e24d",
+          "counts": {
+            "payload": 11,
+            "set_flag": 10,
+            "wait_flag": 10
+          }
+        }
+      },
+      {
+        "name": "ddr_split_k",
+        "execution": 0,
+        "parameters": {},
+        "block": null,
+        "relation": "after-dominates",
+        "removed_pairs": 21,
+        "added_pairs": 0,
+        "excess_ptoas": 21,
+        "excess_pypto": 0,
+        "sources": {
+          "ddr_split_k-ptoas.cpp": "af77b7ffcfd94fdf06ed7d908dda59d4ef7439dce6b6516f4046c99ec6052780",
+          "ddr_split_k.cpp": "653df72648a6cc9ea03c31b7777fe126b4e4d927971f29ad544a2717fd8e0585"
+        },
+        "ptoas": {
+          "binary_sha256": "571ce879b77c939a185339f5fdd9f0c5ca4a27b818e5666f2ad18f76f4648148",
+          "counts": {
+            "set_flag": 25,
+            "payload": 28,
+            "wait_flag": 25,
+            "barrier": 12,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "babe7ef3776375ffdfb10828fceb11553b6ea5729afa1b775cac7da41d228489",
+          "counts": {
+            "payload": 28,
+            "set_flag": 19,
+            "wait_flag": 19
+          }
+        }
+      },
+      {
+        "name": "lib_matmul",
+        "execution": 0,
+        "parameters": {
+          "1": 0,
+          "3": 0
+        },
+        "block": null,
+        "relation": "after-dominates",
+        "removed_pairs": 1,
+        "added_pairs": 0,
+        "excess_ptoas": 1,
+        "excess_pypto": 0,
+        "sources": {
+          "lib_matmul-ptoas.cpp": "51d8ea535b9faa19ac6cd24e8e7dbca7ffba4804868cf9b8d4f4515660399ab8",
+          "lib_matmul.cpp": "7f7a4ae201aa3d8ead8a3f33a645025e96488e00a9471f865585ebb3f8f2e384"
+        },
+        "ptoas": {
+          "binary_sha256": "35f88fe55a871e6b487d9cddf991aff11b5d7f99ec43b22438ef8a13dcc0fc3e",
+          "counts": {
+            "payload": 9,
+            "set_flag": 5,
+            "wait_flag": 5,
+            "barrier": 1,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "2b6f9f6f486b2d4087d6c5f4585a77216b1821ba6976a39a6512d5adbaaa45f3",
+          "counts": {
+            "payload": 9,
+            "set_flag": 5,
+            "wait_flag": 5
+          }
+        }
+      },
+      {
+        "name": "lib_gemm",
+        "execution": 0,
+        "parameters": {
+          "1": 0,
+          "3": 0
+        },
+        "block": null,
+        "relation": "equal",
+        "removed_pairs": 0,
+        "added_pairs": 0,
+        "excess_ptoas": 0,
+        "excess_pypto": 0,
+        "sources": {
+          "lib_gemm-ptoas.cpp": "797db8e43901c7711f51b14aa50e2d61a85949356c679cd7bb68c9a85715ea7b",
+          "lib_gemm.cpp": "f1affb48cee461fceb15e9b66140e2ebac3b36c354a9b35d1ebcdd553d1a62ba"
+        },
+        "ptoas": {
+          "binary_sha256": "59870c7556dc12449055f16ab5caf6e374cdf86a75900b9dc572bc3325812cc7",
+          "counts": {
+            "set_flag": 28,
+            "wait_flag": 28,
+            "payload": 21,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "9aa43b5fe9da46cd756e67b18299c1b9488d8287485fa0184aac4c4324621695",
+          "counts": {
+            "payload": 21,
+            "set_flag": 22,
+            "wait_flag": 22
+          }
+        }
+      },
+      {
+        "name": "qwen_output_b3_h512",
+        "execution": 0,
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "relation": "after-dominates",
+        "removed_pairs": 32,
+        "added_pairs": 0,
+        "excess_ptoas": 32,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_output_b3_h512-ptoas.cpp": "a3053281664e6235da1d5e8356869c32b81632bc66dda0e96297fa401d6721c4",
+          "qwen_output_b3_h512.cpp": "888c521aaeada5d1ddaf2396a81c737c410e4aff4f67c1f0d0081d9530ad13a2"
+        },
+        "ptoas": {
+          "binary_sha256": "dcf3e3c1eac8789ac95fc125312537846e7cc08b0886044685ac47070ffd4cca",
+          "counts": {
+            "set_flag": 45,
+            "wait_flag": 45,
+            "payload": 53,
+            "barrier": 21,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "0141132e21da497fef59a9f1089ce51fb302c89af791c08d3893274e7ac43764",
+          "counts": {
+            "payload": 53,
+            "set_flag": 33,
+            "wait_flag": 33
+          }
+        }
+      },
+      {
+        "name": "qwen_output_b3_h512",
+        "execution": 1,
+        "parameters": {
+          "3": 1
+        },
+        "block": 19,
+        "relation": "equal",
+        "removed_pairs": 0,
+        "added_pairs": 0,
+        "excess_ptoas": 0,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_output_b3_h512-ptoas.cpp": "a3053281664e6235da1d5e8356869c32b81632bc66dda0e96297fa401d6721c4",
+          "qwen_output_b3_h512.cpp": "888c521aaeada5d1ddaf2396a81c737c410e4aff4f67c1f0d0081d9530ad13a2"
+        },
+        "ptoas": {
+          "binary_sha256": "a71a0affaf49ea23f2eb3b6bd37e874daf5555337610769d3efc4b01d22580b5",
+          "counts": {
+            "set_flag": 7,
+            "wait_flag": 7,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "a9aa4ba2ea98b57355089785ca4bb412b4a62a8065043c3680cc4a48ff5696c0",
+          "counts": {}
+        }
+      },
+      {
+        "name": "qwen_gate_up_b0_h512",
+        "execution": 0,
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "relation": "after-dominates",
+        "removed_pairs": 56,
+        "added_pairs": 0,
+        "excess_ptoas": 56,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_gate_up_b0_h512-ptoas.cpp": "4566f33dc82ea55e84191f197d5ab9962c04a84c19331defbc213a5333f92093",
+          "qwen_gate_up_b0_h512.cpp": "b5611f3092ca14210810a3aa469d1cadd9ee0899bdefe72a5b931d454387da45"
+        },
+        "ptoas": {
+          "binary_sha256": "37f1a59f401c79584f8fcdcac8892f596a227e2e0cdd956ae35c3bd6af915525",
+          "counts": {
+            "set_flag": 51,
+            "wait_flag": 51,
+            "payload": 53,
+            "barrier": 21,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "2257fe593a6a91560e217bfcb358f38d35436db167d9299c867ef5f34818c89f",
+          "counts": {
+            "payload": 53,
+            "set_flag": 33,
+            "wait_flag": 33
+          }
+        }
+      },
+      {
+        "name": "qwen_gate_up_b0_h512",
+        "execution": 1,
+        "parameters": {
+          "3": 1
+        },
+        "block": 23,
+        "relation": "after-dominates",
+        "removed_pairs": 56,
+        "added_pairs": 0,
+        "excess_ptoas": 56,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_gate_up_b0_h512-ptoas.cpp": "4566f33dc82ea55e84191f197d5ab9962c04a84c19331defbc213a5333f92093",
+          "qwen_gate_up_b0_h512.cpp": "b5611f3092ca14210810a3aa469d1cadd9ee0899bdefe72a5b931d454387da45"
+        },
+        "ptoas": {
+          "binary_sha256": "f085455a717431b909215e69b88f80aceaa841ffdad7949afb74707b6ef06afc",
+          "counts": {
+            "set_flag": 51,
+            "wait_flag": 51,
+            "payload": 53,
+            "barrier": 21,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "b2ddd1d4f65b8e08575088cbaa57f65cb89ae279f3824b2d7252f516a75bcc61",
+          "counts": {
+            "payload": 53,
+            "set_flag": 33,
+            "wait_flag": 33
+          }
+        }
+      },
+      {
+        "name": "qwen_gate_up_b1_h512",
+        "execution": 0,
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "relation": "after-dominates",
+        "removed_pairs": 56,
+        "added_pairs": 0,
+        "excess_ptoas": 56,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_gate_up_b1_h512-ptoas.cpp": "2e7d7f1a0d3dbccd6e185cd362ad36263957488daaee1f698530adf8cb514279",
+          "qwen_gate_up_b1_h512.cpp": "53320085a83a25da7dc147de4637d4aceef7dd10e4bef9ff6b9b798415c0ed51"
+        },
+        "ptoas": {
+          "binary_sha256": "8e60c76054553a442cf14ed4ced39f18747a3b61a74f64966b765d7f8c94d48e",
+          "counts": {
+            "set_flag": 51,
+            "wait_flag": 51,
+            "payload": 53,
+            "barrier": 21,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "49245a77c049e43b7282b158d1b84dd3c88ac6d91cb9e9a96ff9c72400ce7392",
+          "counts": {
+            "payload": 53,
+            "set_flag": 33,
+            "wait_flag": 33
+          }
+        }
+      },
+      {
+        "name": "qwen_gate_up_b1_h512",
+        "execution": 1,
+        "parameters": {
+          "3": 1
+        },
+        "block": 23,
+        "relation": "after-dominates",
+        "removed_pairs": 56,
+        "added_pairs": 0,
+        "excess_ptoas": 56,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_gate_up_b1_h512-ptoas.cpp": "2e7d7f1a0d3dbccd6e185cd362ad36263957488daaee1f698530adf8cb514279",
+          "qwen_gate_up_b1_h512.cpp": "53320085a83a25da7dc147de4637d4aceef7dd10e4bef9ff6b9b798415c0ed51"
+        },
+        "ptoas": {
+          "binary_sha256": "3cf9dd3c7ff91c6617747be6947f32a59fffd7b1375a9a1a8a7cc9fa62eb31cf",
+          "counts": {
+            "set_flag": 51,
+            "wait_flag": 51,
+            "payload": 53,
+            "barrier": 21,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "63da6d61ab889d76a13314b6a7aa08a4dede03c9764271ef2a7b34059329c970",
+          "counts": {
+            "payload": 53,
+            "set_flag": 33,
+            "wait_flag": 33
+          }
+        }
+      },
+      {
+        "name": "qwen_gate_up_b2_h512",
+        "execution": 0,
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "relation": "after-dominates",
+        "removed_pairs": 202,
+        "added_pairs": 0,
+        "excess_ptoas": 202,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_gate_up_b2_h512-ptoas.cpp": "1f3d8057b5c46f1c8663e881f1b7c9d22088bf08a8fb3bd074778d97b04357bc",
+          "qwen_gate_up_b2_h512.cpp": "27f1c16a429f454c3ee94ae21deff4ada114d36a1f561d4972cbc7246726ecfc"
+        },
+        "ptoas": {
+          "binary_sha256": "f47a6d78a0a71adefcc448e4b84b09bd59e17d3cddf902d58754a9f67aba1c2d",
+          "counts": {
+            "set_flag": 93,
+            "wait_flag": 93,
+            "payload": 106,
+            "barrier": 42,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "4ae0bd5d2ef0d6509da560ce915a70da5091279d68c3ff0b7951a1aec8be50d6",
+          "counts": {
+            "payload": 106,
+            "set_flag": 71,
+            "wait_flag": 71
+          }
+        }
+      },
+      {
+        "name": "qwen_gate_up_b2_h512",
+        "execution": 1,
+        "parameters": {
+          "3": 1
+        },
+        "block": 23,
+        "relation": "after-dominates",
+        "removed_pairs": 202,
+        "added_pairs": 0,
+        "excess_ptoas": 202,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_gate_up_b2_h512-ptoas.cpp": "1f3d8057b5c46f1c8663e881f1b7c9d22088bf08a8fb3bd074778d97b04357bc",
+          "qwen_gate_up_b2_h512.cpp": "27f1c16a429f454c3ee94ae21deff4ada114d36a1f561d4972cbc7246726ecfc"
+        },
+        "ptoas": {
+          "binary_sha256": "e548e999f4a30aa5beb247376fa2354d89f774fecaefda8419b709796eb8331b",
+          "counts": {
+            "set_flag": 93,
+            "wait_flag": 93,
+            "payload": 106,
+            "barrier": 42,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "0670726bc79fb62629ce3af702c3727ca5d5c66b779ab25fc75059a0959596bb",
+          "counts": {
+            "payload": 106,
+            "set_flag": 71,
+            "wait_flag": 71
+          }
+        }
+      },
+      {
+        "name": "qwen_gate_up_b3_h512",
+        "execution": 0,
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "relation": "after-dominates",
+        "removed_pairs": 56,
+        "added_pairs": 0,
+        "excess_ptoas": 56,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_gate_up_b3_h512-ptoas.cpp": "5570af82ee503ea75afd02ec40cc6c36884310c15526ec155bdc41c78c02f8fa",
+          "qwen_gate_up_b3_h512.cpp": "1f5a76735485993a11360a9d08407c373465294adb26afc3213d1e1fb7270e5c"
+        },
+        "ptoas": {
+          "binary_sha256": "2f3eeb0531994f402c1375c4b0041da82bf169635da13d75d86c400ccd38ea38",
+          "counts": {
+            "set_flag": 51,
+            "wait_flag": 51,
+            "payload": 53,
+            "barrier": 21,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "4d1256af06b839277ef17ef2286981fedb553b27e3c6339c65a0012dbda4566e",
+          "counts": {
+            "payload": 53,
+            "set_flag": 33,
+            "wait_flag": 33
+          }
+        }
+      },
+      {
+        "name": "qwen_gate_up_b3_h512",
+        "execution": 1,
+        "parameters": {
+          "3": 1
+        },
+        "block": 23,
+        "relation": "after-dominates",
+        "removed_pairs": 56,
+        "added_pairs": 0,
+        "excess_ptoas": 56,
+        "excess_pypto": 0,
+        "sources": {
+          "qwen_gate_up_b3_h512-ptoas.cpp": "5570af82ee503ea75afd02ec40cc6c36884310c15526ec155bdc41c78c02f8fa",
+          "qwen_gate_up_b3_h512.cpp": "1f5a76735485993a11360a9d08407c373465294adb26afc3213d1e1fb7270e5c"
+        },
+        "ptoas": {
+          "binary_sha256": "eafe1738e8f4f3fb57f51dd13b9e3e30fc879f9b2a534310f4f1b25175c0e385",
+          "counts": {
+            "set_flag": 51,
+            "wait_flag": 51,
+            "payload": 53,
+            "barrier": 21,
+            "return_barrier": 1
+          }
+        },
+        "pypto": {
+          "binary_sha256": "ff081ceffd240bfb0f1a24f8729cdf78c3585a4836224e5353a40bddca86d755",
+          "counts": {
+            "payload": 53,
+            "set_flag": 33,
+            "wait_flag": 33
+          }
+        }
+      }
+    ],
+    "reexecution_command": "For each checked case and execution in build-py314/cut-control/ordering/ordering.json, execute build-py314/cut-control/ordering/{name}-{index}-{ptoas|pypto}-trace; count the first whitespace-delimited field on each output line. Verify source and input SHA256 against the pinned ordering receipt before reuse."
+  },
+  "validation": {
+    "focused_tests": {
+      "passed": 11,
+      "warnings": 1,
+      "command": "/usr/bin/python3 -m pytest tests/ut/ir/transforms/test_sync_cut_control.py -q"
+    },
+    "ruff": "passed on both changed Python files",
+    "pyright": "0 errors, 0 warnings; --pythonpath /usr/bin/python3 outside sandbox",
+    "production_changes": false,
+    "fresh_cpp_generation": false,
+    "device_validation": false,
+    "prior_full_gate": {
+      "passed": 1551,
+      "fresh": false
+    }
+  },
+  "source_files_sha256": {
+    "tests/ut/ir/transforms/qualify_sync_accounting.py": "a22b3af6e3bf969bcde74666f70bd869e7a0913fb3697bb7312185b3e8f41860",
+    "tests/ut/ir/transforms/test_sync_cut_control.py": "f7b796e43a9a5ff73bfa38d759b26db174cebd0bb7285ac40b6d91d2f40c6013",
+    "tests/ut/ir/transforms/qualify_sync_control.py": "0098add4ac37e42b169479237823b735563ac7722db87693ff3bb2bb7d6286fb",
+    "docs/en/dev/ir/cut-aware-sync-control.json": "abafdbfe8e2abc2d4d7203750607ba403f8ed2abd68220e45e57cc9563f8a53b"
+  },
+  "limits": [
+    "The audit reconstructs retained analyses separately; it does not inspect actual production owner memory.",
+    "Family equality is checked where scoped-token inspection is available. Unavailable flat inspection is explicit.",
+    "Large Qwen cases are not independently unfolded for full command-graph verification in this audit.",
+    "Endpoint census omits activation predicates and paired endpoints; it does not authorize merging.",
+    "Single-run inclusive stage timings and separate production/audit runs must not be added.",
+    "Native footprint, issue and invocation-boundary qualification remains separate."
+  ]
+}

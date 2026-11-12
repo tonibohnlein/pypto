@@ -146,7 +146,16 @@ def test_full_output_projection_admits_proved_singleton_launch_frame():
     assert retained.describe()["hierarchical"]
     assert retained.export_scoped_demands() is not None
     physical = retained.realize_physical("a2a3", list(range(6)))
+    assert physical["schedule_policy"]["no_clone"]
     assert physical["set_sites"] == physical["wait_sites"] == 17
+    specialized = retained.realize_physical(
+        "a2a3",
+        list(range(6)),
+        schedule_policy=testing.SyncSchedulePolicy(mode="boundary", no_clone=False),
+    )
+    # Explicitly requested boundary phases keep the same allocated handoffs.
+    assert specialized["set_sites"] == specialized["wait_sites"] == 29
+    assert specialized["families"] == physical["families"]
 
 
 @pytest.mark.parametrize("block,layer", [(0, 0), (3, 1)])

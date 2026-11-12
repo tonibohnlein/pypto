@@ -74,12 +74,28 @@ def compare(logical):
         sr, sv, ss = family["source"]
         tr, tv, ts = family["target"]
         count = 0
+        selected_source, selected_target = set(), set()
         for digits in product(*(range(axis[1]) for axis in family["axes"])):
             source = sv + sum(digit * axis[2] for digit, axis in zip(digits, family["axes"]))
             target = tv + sum(digit * axis[3] for digit, axis in zip(digits, family["axes"]))
+            selected_source.add(source)
+            selected_target.add(target)
             expanded[occurrences[sr, source, ss], occurrences[tr, target, ts]] += 1
             count += 1
         assert count == family["count"]
+        for key, region, selected in [
+            ("source_domain", sr, selected_source),
+            ("target_domain", tr, selected_target),
+        ]:
+            retained = set()
+            frames = result["regions"][region]["frames"]
+            for digits in product(*(range(lo, hi) for lo, hi in family[key])):
+                ordinal = 0
+                for digit, (_, size, _, _) in zip(digits, frames, strict=True):
+                    assert 0 <= digit < size
+                    ordinal = ordinal * size + digit
+                retained.add(ordinal)
+            assert retained == selected
     assert expanded == state.uses, (expanded - state.uses, state.uses - expanded)
     return result, state
 

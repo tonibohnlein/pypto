@@ -193,7 +193,9 @@ def test_vec_compact_counts_do_not_expand():
                 physical["wait_sites"],
             )
         )
-    assert all(s == sizes[0] for s in sizes)
+    assert all(s[:3] == sizes[0][:3] for s in sizes)
+    assert sizes[-1][3:] == sizes[-2][3:]
+    assert all(s[3] <= sizes[-1][3] and s[4] <= sizes[-1][4] for s in sizes)
 
 
 def test_partial_inplace_is_an_instruction_refusal():

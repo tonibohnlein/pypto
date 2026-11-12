@@ -25,6 +25,9 @@ from .test_finite_sync_analysis import closure
 
 
 class PhysicalExecution(CommandExecution):
+    original_calls: list
+    required_reference: tuple
+
     def __init__(self, calls, vertices, eligible):
         super().__init__(calls, vertices)
         self.eligible = set(eligible)
@@ -92,11 +95,61 @@ class PhysicalExecution(CommandExecution):
         return super().execute(stmt, env)
 
 
+def checked_payload_calls(original, emitted, parameters=None, *, block_index=None):
+    """Validate each executed operand independently across schedule cloning."""
+    parameters = parameters or {}
+    original_signatures, emitted_signatures = [], []
+    _, calls = interpret(
+        original, parameters, block_index=block_index, operand_signatures=original_signatures
+    )
+
+    class PayloadOnly(ir.IRMutator):
+        def visit_eval_stmt(self, op):
+            stmt = op
+            if isinstance(stmt.expr, ir.Call) and stmt.expr.op.name in {
+                ir.get_op(n).name
+                for n in ("system.set_flag", "system.wait_flag", "system.bar_m", "system.bar_v")
+            }:
+                return ir.SeqStmts([], stmt.span)
+            return stmt
+
+    payload_program = PayloadOnly().visit_function(emitted)
+    _, emitted_calls = interpret(
+        payload_program,
+        parameters,
+        block_index=block_index,
+        operand_signatures=emitted_signatures,
+        enumerate_effects=False,
+    )
+
+    def same_signature(a, b):
+        if isinstance(a, ir.Type) or isinstance(b, ir.Type):
+            return isinstance(a, ir.Type) and isinstance(b, ir.Type) and ir.structural_equal(a, b)
+        if isinstance(a, (tuple, list)):
+            return (
+                isinstance(b, type(a))
+                and len(a) == len(b)
+                and all(same_signature(x, y) for x, y in zip(a, b, strict=True))
+            )
+        return a == b
+
+    assert same_signature(original_signatures, emitted_signatures), "changed executed payload operands"
+    # Equal operation/attributes and each operand's evaluated physical geometry
+    # establish equal effects under this interpreter. Do not construct the same
+    # potentially huge byte sets a second time merely to compare them.
+    assert [c[2] for c in calls] == [c[2] for c in emitted_calls], "changed payload pipe"
+    return calls, emitted_calls
+
+
 def run_physical(original, emitted, eligible=range(8), parameters=None, *, block_index=None):
     parameters = parameters or {}
-    _, calls = interpret(original, parameters, block_index=block_index)
+    calls, emitted_calls = checked_payload_calls(original, emitted, parameters, block_index=block_index)
     ref = hardware_reference(original, calls)
-    state = PhysicalExecution(calls, ref[0], eligible)
+    state = PhysicalExecution(emitted_calls, ref[0], eligible)
+    # Reporters must use original Call identities for hardware exemptions and
+    # original byte effects. Candidate calls only drive transformed execution.
+    state.original_calls = calls
+    state.required_reference = ref
 
     class CoreOwnership(ir.IRVisitor):
         def visit_call(self, op):
@@ -106,7 +159,7 @@ def run_physical(original, emitted, eligible=range(8), parameters=None, *, block
                 assert call.kwargs["core_type"] == expected, "flag has the wrong owning core"
 
     CoreOwnership().visit_function(emitted)
-    environment = {original.params[i]: value for i, value in parameters.items()}
+    environment = {emitted.params[i]: value for i, value in parameters.items()}
     if block_index is not None:
         environment["__block_index__"] = block_index
     state.execute(emitted.body, dict(environment))
@@ -125,7 +178,10 @@ def run_physical(original, emitted, eligible=range(8), parameters=None, *, block
     for (before, selected), (after, actual) in zip(
         descriptor_reference.actual_slots, state.actual_slots, strict=True
     ):
-        same_payload(before, after)
+        # SSA result names and coordinate expressions may change when the
+        # schedule clones visits. The allocation root and evaluated slot do not.
+        same_payload(before.value.args[0], after.value.args[0])
+        ir.assert_structural_equal(before.var.type, after.var.type)
         assert selected == actual, "changed original slot selection"
     order = closure(state.vertices, state.edges)
     assert not any(a == b for a, b in order), "cyclic physical command graph"

@@ -14,6 +14,8 @@ meaning comes only from executed record/wait calls, branches and loop carries.
 This tests logical completion prefixes, not consuming flags or native lowering.
 """
 
+import operator
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +30,21 @@ class Token:
     pipe: ir.PipeType
     node: tuple | None
     source: int | None
+
+
+_BINARY_VALUES: dict[type, Callable[[Any, Any], Any]] = {
+    ir.Add: operator.add,
+    ir.Sub: operator.sub,
+    ir.Mul: operator.mul,
+    ir.FloorDiv: operator.floordiv,
+    ir.FloorMod: operator.mod,
+    ir.Eq: operator.eq,
+    ir.Ne: operator.ne,
+    ir.Gt: operator.gt,
+    ir.Ge: operator.ge,
+    ir.Lt: operator.lt,
+    ir.Le: operator.le,
+}
 
 
 def value(expr, env):
@@ -45,23 +62,9 @@ def value(expr, env):
         return bool(value(expr.left, env)) and bool(value(expr.right, env))
     if isinstance(expr, ir.Or):
         return bool(value(expr.left, env)) or bool(value(expr.right, env))
-    if isinstance(expr, (ir.Add, ir.Sub, ir.Mul, ir.FloorDiv, ir.FloorMod, ir.Eq, ir.Gt, ir.Ge, ir.Lt)):
-        a, b = value(expr.left, env), value(expr.right, env)
-        if isinstance(expr, ir.Add):
-            return a + b
-        if isinstance(expr, ir.Sub):
-            return a - b
-        if isinstance(expr, ir.Mul):
-            return a * b
-        if isinstance(expr, ir.FloorDiv):
-            return a // b
-        if isinstance(expr, ir.FloorMod):
-            return a % b
-        if isinstance(expr, ir.Ge):
-            return a >= b
-        if isinstance(expr, ir.Lt):
-            return a < b
-        return a == b if isinstance(expr, ir.Eq) else a > b
+    if type(expr) in _BINARY_VALUES:
+        assert isinstance(expr, ir.BinaryExpr)
+        return _BINARY_VALUES[type(expr)](value(expr.left, env), value(expr.right, env))
     if isinstance(expr, ir.Call) and expr.op.name == ir.get_op("sync.completed").name:
         return Token(ir.PipeType(expr.kwargs["pipe"]), None, None)
     raise AssertionError(f"Unsupported logical oracle expression: {type(expr)}")
@@ -162,7 +165,7 @@ class CommandExecution:
                 if coordinate in env
                 else [v for var, v in env.items() if isinstance(var, ir.Var) and var.name_hint == name]
             )
-            assert values == [expected], "changed original occurrence coordinates"
+            assert values == [expected], ("changed original occurrence coordinates", name, values, expected)
         start, completion = (self.payload_count, False), (self.payload_count, True)
         self.edges.add((start, completion))
         if pipe in self.latest_payload:

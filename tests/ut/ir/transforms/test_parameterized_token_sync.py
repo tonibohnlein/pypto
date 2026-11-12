@@ -16,7 +16,7 @@ from pypto.backend.pto_backend import _run_ptoas
 from .sync_logical_oracle import CommandExecution, same_payload
 from .sync_matmul_cases import capture
 from .sync_matmul_oracle import hardware_reference, interpret, validate
-from .sync_physical_oracle import PhysicalExecution
+from .sync_physical_oracle import PhysicalExecution, checked_payload_calls
 from .sync_prefill_cases import capture_prefill
 from .test_nested_sync_repetition import BOUNDS, caller_program, nested_fixture, resident_pipeline_tree
 from .test_scoped_logical_sync import dynamic_collective
@@ -36,10 +36,10 @@ def worker(program, name):
 
 
 def check(original, logical, physical, parameters, *, block=None, minimum_protocol=True):
-    _, calls = interpret(original, parameters, block_index=block)
+    calls, emitted_calls = checked_payload_calls(original, physical, parameters, block_index=block)
     reference = hardware_reference(original, calls)
     tokens = Uses(calls, reference[0])
-    flags = PhysicalExecution(calls, reference[0], range(6))
+    flags = PhysicalExecution(emitted_calls, reference[0], range(6))
     for function, state in [(logical, tokens), (physical, flags)]:
         environment = {function.params[i]: v for i, v in parameters.items()}
         if block is not None:
@@ -73,7 +73,8 @@ def check(original, logical, physical, parameters, *, block=None, minimum_protoc
     for (before, selected), (after, actual_slot) in zip(
         descriptors.actual_slots, flags.actual_slots, strict=True
     ):
-        same_payload(before, after)
+        same_payload(before.value.args[0], after.value.args[0])
+        ir.assert_structural_equal(before.var.type, after.var.type)
         assert selected == actual_slot
 
 

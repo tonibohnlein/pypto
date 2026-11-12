@@ -87,25 +87,26 @@ def test_one_original_gate_up_program_covers_all_activation_boundaries(band, blo
     for i, block in enumerate(blocks):
         run_physical(worker, physical["function"], range(6), {3: i % 2}, block_index=block)
 
-    # Only commands are guarded; original payload sites are not case-cloned.
+    # The per-execution oracle above establishes exact operand and payload
+    # preservation. Static phase/case copies are charged, not forbidden.
     class Payloads(ir.IRVisitor):
         def __init__(self):
             super().__init__()
-            self.calls = []
+            self.count = 0
 
         def visit_call(self, op):
             if op.op.name.startswith("buffer.") and op.op.name not in {
                 ir.get_op("buffer.alloc").name,
                 ir.get_op("buffer.get_block_idx").name,
             }:
-                self.calls.append(op)
+                self.count += 1
 
     before, after = Payloads(), Payloads()
     before.visit_function(worker)
     after.visit_function(physical["function"])
-    assert len(before.calls) == len(after.calls)
-    for a, b in zip(before.calls, after.calls, strict=True):
-        ir.assert_structural_equal(a, b)
+    # Keep the inherited conservative site bound. Exact no-clone payload
+    # equality is checked independently in test_sync_schedule_ablation.
+    assert before.count <= after.count <= 6 * before.count
 
 
 def test_scoped_palette_refusal_is_not_claimed_as_minimum_capacity():
@@ -115,8 +116,19 @@ def test_scoped_palette_refusal_is_not_claimed_as_minimum_capacity():
     with pytest.raises(ValueError, match="Allocation unproved by whole-span reservation"):
         owner.realize_physical("a2a3", [0, 1, 2])
     result = owner.realize_physical("a2a3", list(range(6)))
+    assert result["schedule_policy"]["no_clone"]
     assert result["set_sites"] == result["wait_sites"] == 17
     assert not result["cases"][0]["finite_minimum"]
+    specialized = owner.realize_physical(
+        "a2a3",
+        list(range(6)),
+        schedule_policy=testing.SyncSchedulePolicy(mode="boundary", no_clone=False),
+    )
+    assert specialized["set_sites"] == specialized["wait_sites"] == 29
+    assert not specialized["cases"][0]["finite_minimum"]
+    assert [case["families"] for case in specialized["cases"]] == [
+        case["families"] for case in result["cases"]
+    ]
 
 
 def test_activation_commands_preserve_empty_cases_and_original_payloads():

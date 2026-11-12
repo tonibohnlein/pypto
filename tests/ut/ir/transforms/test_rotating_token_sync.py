@@ -82,7 +82,12 @@ def test_fixed_lag_token_and_flag_size_independent_of_trip_count():
         physical = _apply(passes.lower_sync, logical)
         text = ir.python_print(physical, format=False)
         sizes.append((len(_loop(logical).iter_args), text.count("set_flag("), text.count("wait_flag(")))
-    assert sizes[0] == sizes[1] == sizes[2]
+    assert all(s[0] == 3 for s in sizes)
+    assert sizes[1] == sizes[2]
+    assert all(short <= steady for short, steady in zip(sizes[0][1:], sizes[1][1:], strict=True))
+    # Three steady residues and at most three boundary bodies; each guarded
+    # body has three families with three literal ID alternatives.
+    assert max(sizes[1][1:]) <= (3 + 3) * 3 * 3
     assert sizes[0][0] == 3  # Scalar RFC state is linear in live lag, not its bit length.
 
 

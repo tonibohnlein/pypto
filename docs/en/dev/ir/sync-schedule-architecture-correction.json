@@ -1,0 +1,836 @@
+{
+  "milestone": "synchronization architecture correction",
+  "status": "Stages 1–4 implemented and independently accepted within their recorded scopes",
+  "architecture_acceptance": {
+    "status": "accepted",
+    "scope": "Design only; implementation and device correctness are separate gates"
+  },
+  "baseline": {
+    "revision": "868fdd471d34a0e8259e84e6d21c57258601a7c5",
+    "starting_tracked_patch": "build-py314/architecture-correction/starting.patch",
+    "starting_tracked_patch_sha256": "05369bb2751e90ff7fde4df3c58b80c5aec4b3a3a937199ab294f3491eac6fa2",
+    "prior_receipt": "docs/en/dev/ir/regional-sync-schedules.json"
+  },
+  "stages": [
+    {
+      "stage": 1,
+      "scope": [
+        "generated-token internal-error boundary",
+        "token-lowering payload qualification without dependence footprint recovery",
+        "shared function-owned name reservation"
+      ],
+      "build": {
+        "command": "cmake --build build-py314 --parallel 1",
+        "log": "stage1-build-final.log",
+        "result": "passed"
+      },
+      "focused": {
+        "passed": 153,
+        "seconds": 10.59,
+        "log": "stage1-focused-final.log"
+      },
+      "broad": {
+        "passed": 1552,
+        "warnings": 37,
+        "seconds": 846.83,
+        "log": "stage1-broad.log",
+        "selection": "/test_.*(sync|token|slot|interval|numerical|qwen_prefill|streamed|nested|buffered).*\\.py$"
+      },
+      "environment": {
+        "python": "/usr/bin/python3 (3.14)",
+        "ptoas": "0.72 via local Python3.11 launcher",
+        "workers": 1,
+        "omp_openblas_mkl_threads": 1
+      },
+      "initial_environment_failure": "Initial focused run had 146 passes and 6 PTOAS loader failures; rerun with the pinned v0.72 launcher passed 153 tests, including the added GM-translation regression.",
+      "source_patch_sha256": "0663339b70083f074886b41d0540f45fc9218bfa1863f65c166eea1caba56a89",
+      "source_manifest_sha256": "2d8da156ced52b7c017ad101ba009b87e670f5e5147b6e0f0edb6bb9bafebf04",
+      "status": "accepted",
+      "reviewer": "/root/schedule_architecture_challenge",
+      "review_scope": "Compiler-error boundary, current payload/native qualification and shared function-owned name reservation; not complete candidate planning or device behavior",
+      "review_correction": "Restored original slot-frame qualification for payload-only whole accesses and extraction/copy sources before acceptance",
+      "source_sha256": {
+        "docs/en/dev/ir/30-structured-sync-schedules.md": "39fbb2ead17498c476d3f26a67066a39da0ba562ee6f3b1f909e1ee9b71c2b89",
+        "docs/en/dev/ir/31-regional-sync-schedule-plan.md": "7e039f3ca9f3d3020fd32d0ecf1029ddf936262d7f314bda8fa600cbfd97dd5e",
+        "docs/en/dev/ir/regional-sync-schedules.json": "76f3ff8ed69e45fc9868052290e776048f23500d7ab065010a72c4fab0fb7ad7",
+        "docs/en/dev/ir/structured-sync-control.json": "f24173b19485668c5de2331686d4a2679529fc8620f2cb013fc702182fd66373",
+        "docs/en/dev/passes/59-realize_sync.md": "c279f7b84d8ed4f936ba42923bec5b0c146b2ff8c13f1c5780f4d1f5bc48583e",
+        "docs/en/dev/passes/60-logical_sync_pipeline.md": "4be325fef4a4422b703369af9cfb0df9ced914ba5e55c6233d473102ce663a9b",
+        "docs/zh/dev/ir/30-structured-sync-schedules.md": "b4f93f183a0b4a9d3be4f201800b5ba7f3a080ab90f53b39f886047f60743f49",
+        "docs/zh/dev/ir/31-regional-sync-schedule-plan.md": "599460096682501001ccc632ddface0a5ad519bd52140ffd2fdf1280ea018757",
+        "docs/zh/dev/passes/59-realize_sync.md": "e609435d20c4d5002af3ed3b7057d80f92311ab232909644fa512221be854d3f",
+        "docs/zh/dev/passes/60-logical_sync_pipeline.md": "c2f5bd8422052ed3e8925585de0225f964bcee97a26864bb95c8c652eed93cb9",
+        "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "a2c67819a6e82b6b6e8145d33314ba8ed39bbd5abbc04b7db21ccb607a46d72b",
+        "mkdocs.yml": "f3a2d52a860aca680d2aee71d47bce1aa339ba5c69356ce220a4a07a362fed4c",
+        "python/bindings/modules/testing.cpp": "346d492d1ae21979c94219e53bfd45d2267b4b45c123041a8417121d2f079e74",
+        "python/pypto/pypto_core/testing.pyi": "fb809d66f44bbf06a075b9e00bd6d00c422488592ca37ef0d1a09f07cca533ba",
+        "src/ir/transforms/token_sync.cpp": "75c033634e3606bbd24cdb82176bd93105625d3f8231e4cac5ac1bdc23c5812a",
+        "src/ir/transforms/utils/physical_sync_allocation.h": "8c0d8050fa2b54a5ea5f37c3bbcc2ef3aa4ef069d09f00262bce1fa2e2b3c730",
+        "src/ir/transforms/utils/physical_sync_realization.cpp": "3c791dc1334ac7381e63134369e1b4a658e0afc88ccdd870483ed682a0df3ed4",
+        "src/ir/transforms/utils/placed_sync_import.cpp": "44b172d989333134b0e3093c8c66eed99e1126c98e14a7dfe7366ea35aef6e2e",
+        "src/ir/transforms/utils/structured_token_sync.cpp": "568f1821bef7798bd00c396585123592aed952717e97281a9dc064163f727630",
+        "src/ir/transforms/utils/token_sync_lowering.cpp": "fc2bf43d2e3c5ca4d10ba4570bd325683f7d42510d0f6b98feb4dd9dd4f82b73",
+        "src/ir/transforms/utils/token_sync_lowering.h": "d4f06304556298240c770a5b0feb2c563037c59d8213c2a7df30d711e97bac28",
+        "tests/ut/ir/transforms/qualify_sync_accounting.py": "12b92d8b8aa94c784d43e5c6d4d79a96959535e055e84c7ec0e8cdad0c756751",
+        "tests/ut/ir/transforms/qualify_sync_control.py": "969230211d4e860c7ffda9ab06708c315500a3ccc658a6cda752986e44419513",
+        "tests/ut/ir/transforms/sync_control_metrics.py": "e1867d450603160ea907580c75ec797b8fe0afd6d2345d5aa19b0872f6dac5ba",
+        "tests/ut/ir/transforms/sync_logical_oracle.py": "7bf782e372b90eeeaf90501ff7fbbd251c812a2cb1f2291770a47eaa6c3b6b70",
+        "tests/ut/ir/transforms/sync_matmul_oracle.py": "3fe09d610312055adfad06799e10a01ea81e352c8c133aca5cbf6c585350971a",
+        "tests/ut/ir/transforms/sync_physical_oracle.py": "1b0b6b1a6e8e3eae76d533347370941b32fd5da9e8b9308f1e7d7dfe3347daf3",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py": "37e6c1852641bcb937272a939d4df32d171cc6d5d5d1521cc21633b944f65f79",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py": "74ddd904e3225a110d8ee9667883ac2e2a77fc51e0f7358cf19ffe647d1d28b6",
+        "tests/ut/ir/transforms/test_parameterized_token_sync.py": "62957ff5d9c320c4631e10de2d682ab97441df19d69da45bcdd3bd77388c58cf",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py": "392d824103ceb3f3793617f246a37877d786d80cfbbce4770a23a38d1d8d30da",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "e8e406fa9f17224cb2d569ef96660d352b8b31a7e57efae978d6aa32f6d1d196",
+        "tests/ut/ir/transforms/test_regional_sync_schedule.py": "6d1292443c8718eb60730d3eb32e0fb3c2773d979ec20570db6c8ff9138055df",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py": "cb617ea4092ea448d9642223c38348822b29cd6e416b3ffa5d73c863141e3d8c",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py": "01a561876fa3acd1969bbf6165eaf8e7981dee2c5162799ded4df4a51a41d5a9",
+        "tests/ut/ir/transforms/test_scoped_token_order.py": "103da725851dad77ca915ed1067966f14e3da368ddf667ff859f9c67fb8f9cf5",
+        "tests/ut/ir/transforms/test_structured_token_sync.py": "a72a99f0a6ffc92003873d7ce20b2b624b5fd90cb2774c058e539301863056a7",
+        "tests/ut/ir/transforms/test_sync_boundary_schedule.py": "2a74fb890b9232fd3a469a9e92ac6d916f0b384b6cd5147a8969f362782d65a9",
+        "tests/ut/ir/transforms/test_sync_command_control.py": "3c26418f4910e90dd3ae78b9bd1c2e9fde89ce6e5df56b0fa824861c3e693f37",
+        "tests/ut/ir/transforms/test_sync_lowering_qualification.py": "42238f911ffc1aab9728edd438b824444b3d4892839c94a162d1e24ba4eb78b6",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py": "03fc6f102fd2aa25b306518e33fb0f8c1524a932edc9fa3892e61f793c21830e",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py": "e2c14aa3ceff7f2cf836cb47ec4aabf7620fdc14ab64673e2308cc95e3a0ce86"
+      },
+      "focused_files": [
+        "tests/ut/ir/transforms/test_sync_lowering_qualification.py",
+        "tests/ut/ir/transforms/test_regional_sync_schedule.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "tests/ut/ir/transforms/test_structured_token_sync.py",
+        "tests/ut/ir/transforms/test_scoped_token_order.py"
+      ],
+      "broad_files": [
+        "tests/ut/ir/transforms/test_autosync_switch.py",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+        "tests/ut/ir/transforms/test_collective_sync_interface.py",
+        "tests/ut/ir/transforms/test_collective_sync_realization.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_cross_core_local_slots.py",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py",
+        "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+        "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+        "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+        "tests/ut/ir/transforms/test_invocation_token_sync.py",
+        "tests/ut/ir/transforms/test_logical_sync_realization.py",
+        "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+        "tests/ut/ir/transforms/test_lower_composite_ops_numerical.py",
+        "tests/ut/ir/transforms/test_lower_pipeline_to_slots.py",
+        "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+        "tests/ut/ir/transforms/test_parameterized_sync.py",
+        "tests/ut/ir/transforms/test_parameterized_token_sync.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+        "tests/ut/ir/transforms/test_regional_slot_composition.py",
+        "tests/ut/ir/transforms/test_regional_sync_schedule.py",
+        "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py",
+        "tests/ut/ir/transforms/test_row_sync_analysis.py",
+        "tests/ut/ir/transforms/test_scoped_logical_sync.py",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+        "tests/ut/ir/transforms/test_scoped_token_families.py",
+        "tests/ut/ir/transforms/test_scoped_token_order.py",
+        "tests/ut/ir/transforms/test_slot_sync_import.py",
+        "tests/ut/ir/transforms/test_streamed_slot_composition.py",
+        "tests/ut/ir/transforms/test_structured_token_sync.py",
+        "tests/ut/ir/transforms/test_sync_boundary_schedule.py",
+        "tests/ut/ir/transforms/test_sync_command_control.py",
+        "tests/ut/ir/transforms/test_sync_cpp_order.py",
+        "tests/ut/ir/transforms/test_sync_cut_control.py",
+        "tests/ut/ir/transforms/test_sync_lowering_qualification.py",
+        "tests/ut/ir/transforms/test_sync_order_metrics.py",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/ir/transforms/test_verify_hard_syncall_occupancy.py",
+        "tests/ut/ir/transforms/test_verify_no_nested_call_pass.py"
+      ],
+      "pytest_options": [
+        "-n",
+        "0",
+        "-q"
+      ],
+      "lint": [
+        "ruff check new qualification test and testing.pyi: passed",
+        "ruff format --check same files: passed",
+        "git diff --check: passed"
+      ],
+      "artifacts": {
+        "stage1-working.patch": {
+          "path": "build-py314/architecture-correction/stage1-working.patch",
+          "sha256": "0663339b70083f074886b41d0540f45fc9218bfa1863f65c166eea1caba56a89"
+        },
+        "stage1-source-sha256.json": {
+          "path": "build-py314/architecture-correction/stage1-source-sha256.json",
+          "sha256": "2d8da156ced52b7c017ad101ba009b87e670f5e5147b6e0f0edb6bb9bafebf04"
+        },
+        "stage1-build-final.log": {
+          "path": "build-py314/architecture-correction/stage1-build-final.log",
+          "sha256": "8cb66d6f2a227487a14bd070742af09f19425804b801f71a765d09595400fcad"
+        },
+        "stage1-focused.log": {
+          "path": "build-py314/architecture-correction/stage1-focused.log",
+          "sha256": "94b29608192d44d5678d3f0d8247a3efc0baead65d97aecc0da4c0da1684e000"
+        },
+        "stage1-focused-final.log": {
+          "path": "build-py314/architecture-correction/stage1-focused-final.log",
+          "sha256": "a8c707b91148e02edf903e7729299c378091ef367e99fd26fb531d1a647ec4ed"
+        },
+        "stage1-broad.log": {
+          "path": "build-py314/architecture-correction/stage1-broad.log",
+          "sha256": "6495c7bfedee8f1166bfdaab54e8758f0c41a878305ff93bb6175fa981ec724a"
+        },
+        "stage1-validation.json": {
+          "path": "build-py314/architecture-correction/stage1-validation.json",
+          "sha256": "0153431699f72b0d9e3bf029961990cf4525bc067d0baabf2aecca0ea9c11395"
+        }
+      }
+    },
+    {
+      "stage": 2,
+      "status": "accepted",
+      "scope": "stage2 identity/case-only preparation and decision-free materializer; legacy B/P policy intentionally transitional",
+      "reviewer": "/root/prototype_architecture_audit",
+      "sources": {
+        "src/ir/transforms/utils/physical_sync_realization.cpp": "0663aa1bf6709db72f3d9379fb8bf317e887704f8528d71b2b2c0118735052d4",
+        "python/bindings/modules/testing.cpp": "f7c3a4d50eac54e029fa4912243a3950f18199896251c045aed096927165d28d",
+        "python/pypto/pypto_core/testing.pyi": "b61d04d16d178b5b59ce8a19e1927e5ecbc463a7e60829da469c1dfe0c61d3de",
+        "tests/ut/ir/transforms/test_sync_case_only_schedule.py": "018c304fb18205e68ae33432f079d1db8f979eab0733f422cf276c843a3bc253",
+        "docs/en/dev/ir/31-regional-sync-schedule-plan.md": "e370bf63ac5ac346db5f4d18bf0bdef90d9e56d6e326d2d6198273e2b10bacce",
+        "docs/zh/dev/ir/31-regional-sync-schedule-plan.md": "e8323e485dd1f87c3fe1eb47cbe3fe6a4bfc39da057aa7e6366ecb59414339b9"
+      },
+      "extension_sha256": "7c2e2d51ddf7c488d2b5d96f0f0bd373a69a1ea7076f15a94f3c0a5643239bf1",
+      "build": {
+        "command": "cmake --build build-py314 --parallel 2",
+        "result": "passed"
+      },
+      "focused": {
+        "passed": 62,
+        "seconds": 1.87,
+        "files": [
+          "test_sync_case_only_schedule.py",
+          "test_regional_sync_schedule.py",
+          "test_sync_boundary_schedule.py"
+        ]
+      },
+      "existing_invocation_gate": {
+        "passed": 70,
+        "warnings": 4,
+        "seconds": 381.04,
+        "timing": "Before diagnostic-only binding addition and formatting"
+      },
+      "style": "ruff check and format --check on new test/testing.pyi; clang-format-diff against pinned stage1 for changed C++; git diff --check",
+      "limitations": [
+        "identity case-only conservatively deferred when incumbent extracts boundary commands",
+        "legacy B/P qualification and local cost model retained until stage 3",
+        "AIV case-only diagnostic supplies explicit launch bounds; existing AIC tests cover production caller recollection"
+      ],
+      "artifacts": {
+        "stage2-validation.json": {
+          "path": "build-py314/architecture-correction/stage2-validation.json",
+          "sha256": "b43a5fceaccb937d2ecf07d9f39409b8ff3dca29bba51c5842d33f8802ab1ba8"
+        },
+        "stage2-build-final.log": {
+          "path": "build-py314/architecture-correction/stage2-build-final.log",
+          "sha256": "e57844ebe76afeb7dbef89994d6ef8b097ba64e7eea80d98d02e37e79ced8071"
+        },
+        "stage2-focused-final.log": {
+          "path": "build-py314/architecture-correction/stage2-focused-final.log",
+          "sha256": "d65e2ccc99535102e5cf90cd6a49a95d861055f4f4ecf518bebfce522f6ae796"
+        },
+        "stage2-initial-tests.log": {
+          "path": "build-py314/architecture-correction/stage2-initial-tests.log",
+          "sha256": "d704d335592a50428a74a1786eaa3876a107ff46c8621ef8ed7b68bb13d49b5b"
+        }
+      }
+    },
+    {
+      "stage": 3,
+      "status": "accepted",
+      "scope": "Stage3 fixed independent C/B/P catalogue, complete candidate selector, finite conservative budgets, no-clone production default; independently accepted. Stage4 broader qualification remains separate.",
+      "sources": {
+        "src/ir/transforms/utils/physical_sync_realization.cpp": "62659d2a7beedead5bf68cf5a094b687cdb06727d558bae7b4b53238a922446e",
+        "src/ir/transforms/utils/physical_sync_allocation.h": "2f23c232d5a49fc4e6fcc54cf5b1ca0fef8d976008d90b8f2601d77ca4be9ec5",
+        "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "01a8c7f05ccba8e6a2b29484c56eb64e557f502fc71d947c932567506cc5d288",
+        "src/ir/transforms/utils/structured_token_sync.cpp": "2b7ae5a8b412498ea0562c32f7700e6700806a0be3c3f1dc7784e214514221b3",
+        "src/ir/transforms/utils/token_sync_lowering.cpp": "6c2a6ffeaaa6955ca53014c4edba3181b871e4b44e6ca9fd3cb3fea9e5584d19",
+        "src/ir/transforms/utils/token_sync_lowering.h": "b57b040301995e4620446efb7664fef868399b746e9ee747fae11e2a4c5b94c7",
+        "python/bindings/modules/testing.cpp": "19fab853977719a9f74f3416400418d22ce74d18d5f629ec1ad751cec25c3062",
+        "python/pypto/pypto_core/testing.pyi": "5bca76b5d6991a3d326e029a2afe8370b782448dab7ec962b2a4cc5cd022e9f6",
+        "tests/ut/ir/transforms/test_regional_sync_schedule.py": "3aa36acc06a1a79b84824afb49aef83b122d7e2784f4fd0945f18d2e983de2f9",
+        "tests/ut/ir/transforms/test_sync_case_only_schedule.py": "e0c0095069bca2f9c6f5acdee037f0f4d909eaae25250f72bfdec3b0e83f941e",
+        "tests/ut/ir/transforms/test_sync_schedule_ablation.py": "a1125fee5ff893c384b3f235918ae1addaefcb5dcbf0c4c8417d0123d66a5cf2",
+        "docs/en/dev/ir/31-regional-sync-schedule-plan.md": "0bab9737f1005c2c8a79e17cd2af8b1623df80381a7da5db3fb22a9f57a1a9a6",
+        "docs/zh/dev/ir/31-regional-sync-schedule-plan.md": "84fa7b670d71b93a72297ba287c6131f638c036df88fe622a509339fca1da9ff"
+      },
+      "extension": "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so",
+      "extension_sha256": "59f15597e939ca0876f3ef8daf1d32dcbfadfec46f0864b28a4f5c7ab8df85f6",
+      "build": {
+        "command": "source .claude/skills/testing/load-env.sh\ncmake --build build-py314 --parallel 2",
+        "log": "stage3-build-complete.log",
+        "log_sha256": "4d9fe76ebc9eec69407317ccd8282f04f78ff4142bdcbde5b8178e0ab15cb68d",
+        "exit_code": 0
+      },
+      "focused": {
+        "command": "source .claude/skills/testing/load-env.sh\nPTOAS_ROOT=\"$PWD/build-py314/architecture-correction/ptoas-launcher\" PYTHONPATH=python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 /usr/bin/python3 -m pytest -n 0 tests/ut/ir/transforms/test_sync_schedule_ablation.py tests/ut/ir/transforms/test_sync_case_only_schedule.py tests/ut/ir/transforms/test_regional_sync_schedule.py tests/ut/ir/transforms/test_sync_boundary_schedule.py --basetemp=build-py314/architecture-correction/pytest-stage3-complete -q",
+        "result": "136 passed in 5.66s",
+        "log": "stage3-focused-complete.log",
+        "log_sha256": "b9d0a0162f28c692de24cdeb0174b2491e2317ec598235f788cc976e51d6b85d"
+      },
+      "style": "Changed C++ regions clang-format-diff; Ruff check and format --check on testing.pyi and three touched test files; git diff --check all passed.",
+      "policy": {
+        "mode": "auto",
+        "no_clone": true,
+        "boundary_motion": true,
+        "max_extra_payload_sites": 4096,
+        "max_extra_control_nodes": 65536,
+        "units": "Payload debit is exact positive emitted EvalStmt/Call payload-site growth per selected transformed loop. Control debit is the full conservative expanded replacement bound, using zero baseline lower bound; stricter than actual extra IR growth, safe under source wrapper flattening. Positive debits accumulate in source loop preorder; forced modes enforce the same budgets.",
+        "rationale": "Finite uncalibrated compiler-policy caps, not device-derived weights or theoretical speedup bounds. Duplication requires explicit no_clone=False; production retains no extra payload copies."
+      },
+      "cost": {
+        "components": [
+          "arithmetic",
+          "comparisons",
+          "Boolean operators",
+          "decisions",
+          "loop headers",
+          "generated SSA bindings"
+        ],
+        "weights": "Unit source-work count, no device calibration. Each complete candidate compared against identical guarded incumbent per case; mixed unsupported decisions are cost_unproved.",
+        "model_exact": "Exact generated-control descriptor model under shared CommandValues scope rules, not full function work or device cycles.",
+        "case_work": "LaunchCostProfile interval partitioning and range additions, no full forest traversal per case.",
+        "tie": "Smaller payload-site count, smaller expanded node bound, fewer C/B/P transformations, then fixed catalogue order."
+      },
+      "legality": [
+        "Existing actual token domains, family/case identities and assigned ID maps unchanged.",
+        "B supplies only intervals; P supplies only optional congruence and owns remainder. P-only keeps endpoint guards. Identity and C retain original bounds.",
+        "No nontrivial C+P extension to scoped nonunit tokens; forced unavailable combinations report ineligible plus guarded fallback.",
+        "Boundary motion policy held constant and proof regenerated for every complete version.",
+        "RegularBody excludes nested loops; selected candidate bodies cannot multiply another selected loop transformation."
+      ],
+      "deletion_ledger": [
+        "CollectRegularLoops no longer uses B/P profitability to determine shared loop inventory.",
+        "Legacy per-phase transformation choice removed from production; fixed catalogue selection precedes materialization.",
+        "ScheduleMaterializer consumes selected versions and boundary descriptors only.",
+        "Legacy launch-only local costing remains solely in the existing testing inspector adapter.",
+        "No allocator, ID-map, token authority or footprint analysis backend replaced."
+      ],
+      "known_limits": [
+        "No device speedup claim.",
+        "Production defaults to no clone; duplication modes are explicit diagnostics with caps.",
+        "At the stage-3 gate, cumulative-budget/determinism, geometric source scaling and broader corpus qualification were deferred to stage 4; that separate gate is now accepted."
+      ],
+      "reviewer": "/root/prototype_architecture_audit",
+      "receipt": {
+        "path": "build-py314/architecture-correction/stage3-validation.json",
+        "sha256": "c7d066f4ca8caeb8de81e03d03d69fad5e552b5734595a3856ea075446f209af"
+      }
+    },
+    {
+      "stage": 4,
+      "status": "accepted",
+      "scope": "Independent eight-mode semantic ablation, construction scaling and emitted-code receipt",
+      "campaign": {
+        "path": "build-py314/architecture-correction/stage4/qualification.json",
+        "sha256": "8c1f94b4e5187d70c07a8fdaafabb41cb9a1b3ab65ade171bd9a171ed3cf0360"
+      },
+      "fixtures": 20,
+      "policy_rows": 200,
+      "emitted_cpp_files": 90,
+      "execution_comparisons": 110,
+      "mode_counts": {
+        "guarded": {
+          "all_reported_loops": 20,
+          "some_reported_loops": 0,
+          "none": 0
+        },
+        "case": {
+          "all_reported_loops": 6,
+          "some_reported_loops": 0,
+          "none": 14
+        },
+        "boundary": {
+          "all_reported_loops": 13,
+          "some_reported_loops": 0,
+          "none": 7
+        },
+        "periodic": {
+          "all_reported_loops": 12,
+          "some_reported_loops": 0,
+          "none": 8
+        },
+        "case_boundary": {
+          "all_reported_loops": 1,
+          "some_reported_loops": 0,
+          "none": 19
+        },
+        "case_periodic": {
+          "all_reported_loops": 0,
+          "some_reported_loops": 0,
+          "none": 20
+        },
+        "boundary_periodic": {
+          "all_reported_loops": 10,
+          "some_reported_loops": 0,
+          "none": 10
+        },
+        "combined": {
+          "all_reported_loops": 0,
+          "some_reported_loops": 0,
+          "none": 20
+        }
+      },
+      "mode_count_unit": "Fixture requests; partial means selection by only some reported loops.",
+      "prior_comparison_counts": {
+        "compared": 2,
+        "missing_artifact": 18,
+        "not_requested": 0
+      },
+      "predicate_sharing": {
+        "scope": "emitter-only control measurement; not protocol certification or case versioning",
+        "payload_sites_before": 1,
+        "payload_sites_after": 1,
+        "executions": [
+          {
+            "coordinate": -1,
+            "before": [
+              3,
+              3,
+              0,
+              3,
+              0,
+              0
+            ],
+            "after": [
+              1,
+              3,
+              0,
+              3,
+              0,
+              1
+            ]
+          },
+          {
+            "coordinate": 0,
+            "before": [
+              3,
+              3,
+              0,
+              3,
+              0,
+              0
+            ],
+            "after": [
+              1,
+              3,
+              0,
+              3,
+              0,
+              1
+            ]
+          },
+          {
+            "coordinate": 3,
+            "before": [
+              3,
+              3,
+              0,
+              3,
+              0,
+              0
+            ],
+            "after": [
+              1,
+              3,
+              0,
+              3,
+              0,
+              1
+            ]
+          },
+          {
+            "coordinate": 8,
+            "before": [
+              3,
+              3,
+              0,
+              3,
+              0,
+              0
+            ],
+            "after": [
+              1,
+              3,
+              0,
+              3,
+              0,
+              1
+            ]
+          },
+          {
+            "coordinate": 10,
+            "before": [
+              3,
+              3,
+              0,
+              3,
+              0,
+              0
+            ],
+            "after": [
+              1,
+              3,
+              0,
+              3,
+              0,
+              1
+            ]
+          }
+        ]
+      },
+      "focused": {
+        "passed": 79,
+        "seconds": 5.44,
+        "log": "build-py314/architecture-correction/stage4-focused.log"
+      },
+      "default_tradeoff": [
+        {
+          "name": "rotating7",
+          "input_sha256": "bfa36657fbdd669941e138f3b4a694960e0a4bda15ff7f5947d57a0618bf6362",
+          "input_hash_equal": true,
+          "prior_ir_sha256": "efb2eb60d6f5e10aea2547a17f266138fd1aa9b26e41004950ecbd520791412b",
+          "prior_cpp": {
+            "source_sha256": "594b1bca09960287ee57cf1e345e2840f5bbedcd2422f8cfeacb69f77a13e7c1",
+            "bytes": 13464,
+            "body_if_sites": 19,
+            "body_set_sites": 18,
+            "body_wait_sites": 15,
+            "body_barrier_sites": 0
+          },
+          "default_cpp": {
+            "source_sha256": "024c7cc28e8224233186f8b7a5a47191e81448ab817c9e03afc29d2e12cef8bc",
+            "bytes": 7754,
+            "body_if_sites": 20,
+            "body_set_sites": 9,
+            "body_wait_sites": 9,
+            "body_barrier_sites": 0
+          },
+          "opt_in_auto_cpp": {
+            "source_sha256": "21608d62446dbf8f0becd582f703c76e86073675631f9c1584a7c4e3c81388b8",
+            "bytes": 13624,
+            "body_if_sites": 6,
+            "body_set_sites": 11,
+            "body_wait_sites": 12,
+            "body_barrier_sites": 0
+          },
+          "prior_work": [
+            141
+          ],
+          "default_work": [
+            249
+          ],
+          "opt_in_auto_work": [
+            58
+          ],
+          "selected_opt_in_modes": [
+            "periodic"
+          ],
+          "claim": "Measured source work and generated size, not device timing. New default intentionally may increase source work."
+        },
+        {
+          "name": "qwen_output_b3_h512",
+          "input_sha256": "85511ce48a58cfb06e91c86d2c3ea1b4136fb2c8cd25b0d3413f9d0184b52c24",
+          "input_hash_equal": true,
+          "prior_ir_sha256": "53623add499a46385d1a28f7a5f80981daafe1366298b5f288b0c3c95271e990",
+          "prior_cpp": {
+            "source_sha256": "a76d2358c84a2f3ac7e140ced03b6dd9103212d8728917ec344f3786cf22f9a6",
+            "bytes": 17889,
+            "body_if_sites": 1,
+            "body_set_sites": 25,
+            "body_wait_sites": 25,
+            "body_barrier_sites": 0
+          },
+          "default_cpp": {
+            "source_sha256": "7a6da96f8c22aa2b004c6340c86b0b4a9b0256b7c31b146af93da620e74502e6",
+            "bytes": 14992,
+            "body_if_sites": 11,
+            "body_set_sites": 13,
+            "body_wait_sites": 13,
+            "body_barrier_sites": 0
+          },
+          "opt_in_auto_cpp": {
+            "source_sha256": "a76d2358c84a2f3ac7e140ced03b6dd9103212d8728917ec344f3786cf22f9a6",
+            "bytes": 17889,
+            "body_if_sites": 1,
+            "body_set_sites": 25,
+            "body_wait_sites": 25,
+            "body_barrier_sites": 0
+          },
+          "prior_work": [
+            43,
+            3
+          ],
+          "default_work": [
+            115,
+            3
+          ],
+          "opt_in_auto_work": [
+            43,
+            3
+          ],
+          "selected_opt_in_modes": [
+            "boundary",
+            "boundary"
+          ],
+          "claim": "Measured source work and generated size, not device timing. New default intentionally may increase source work."
+        }
+      ],
+      "construction_scaling": [
+        {
+          "name": "trip_scaling_70",
+          "mode": "boundary_periodic",
+          "source_nodes": 85,
+          "retained_cases": 1,
+          "retained_families": 3,
+          "descriptor_visits": 1027,
+          "expression_visits": 5064,
+          "payload_sites": 18,
+          "command_sites": 66,
+          "expanded_ir_nodes": 906
+        },
+        {
+          "name": "trip_scaling_7000",
+          "mode": "boundary_periodic",
+          "source_nodes": 85,
+          "retained_cases": 1,
+          "retained_families": 3,
+          "descriptor_visits": 1027,
+          "expression_visits": 5064,
+          "payload_sites": 18,
+          "command_sites": 66,
+          "expanded_ir_nodes": 906
+        },
+        {
+          "name": "trip_scaling_1000000",
+          "mode": "boundary_periodic",
+          "source_nodes": 85,
+          "retained_cases": 1,
+          "retained_families": 3,
+          "descriptor_visits": 1027,
+          "expression_visits": 5064,
+          "payload_sites": 18,
+          "command_sites": 66,
+          "expanded_ir_nodes": 906
+        },
+        {
+          "name": "case_scaling_2",
+          "mode": "case",
+          "source_nodes": 112,
+          "retained_cases": 2,
+          "retained_families": 11,
+          "descriptor_visits": 598,
+          "expression_visits": 324,
+          "payload_sites": 12,
+          "command_sites": 22,
+          "expanded_ir_nodes": 231,
+          "distinct_complete_schedules": 2,
+          "scope": "Retained cases and empty activation-prefix source both grow; only two distinct output schedules."
+        },
+        {
+          "name": "case_scaling_4",
+          "mode": "case",
+          "source_nodes": 126,
+          "retained_cases": 4,
+          "retained_families": 21,
+          "descriptor_visits": 742,
+          "expression_visits": 324,
+          "payload_sites": 12,
+          "command_sites": 22,
+          "expanded_ir_nodes": 245,
+          "distinct_complete_schedules": 2,
+          "scope": "Retained cases and empty activation-prefix source both grow; only two distinct output schedules."
+        },
+        {
+          "name": "case_scaling_8",
+          "mode": "case",
+          "source_nodes": 154,
+          "retained_cases": 8,
+          "retained_families": 41,
+          "descriptor_visits": 1030,
+          "expression_visits": 324,
+          "payload_sites": 12,
+          "command_sites": 22,
+          "expanded_ir_nodes": 273,
+          "distinct_complete_schedules": 2,
+          "scope": "Retained cases and empty activation-prefix source both grow; only two distinct output schedules."
+        },
+        {
+          "name": "case_scaling_16",
+          "mode": "case",
+          "source_nodes": 210,
+          "retained_cases": 16,
+          "retained_families": 81,
+          "descriptor_visits": 1606,
+          "expression_visits": 324,
+          "payload_sites": 12,
+          "command_sites": 22,
+          "expanded_ir_nodes": 329,
+          "distinct_complete_schedules": 2,
+          "scope": "Retained cases and empty activation-prefix source both grow; only two distinct output schedules."
+        },
+        {
+          "name": "source_scaling_1",
+          "mode": "boundary_periodic",
+          "source_nodes": 85,
+          "retained_cases": 1,
+          "retained_families": 3,
+          "descriptor_visits": 1067,
+          "expression_visits": 5384,
+          "payload_sites": 18,
+          "command_sites": 66,
+          "expanded_ir_nodes": 906
+        },
+        {
+          "name": "source_scaling_2",
+          "mode": "boundary_periodic",
+          "source_nodes": 101,
+          "retained_cases": 1,
+          "retained_families": 4,
+          "descriptor_visits": 1185,
+          "expression_visits": 5419,
+          "payload_sites": 24,
+          "command_sites": 72,
+          "expanded_ir_nodes": 1014
+        },
+        {
+          "name": "source_scaling_4",
+          "mode": "boundary_periodic",
+          "source_nodes": 133,
+          "retained_cases": 1,
+          "retained_families": 6,
+          "descriptor_visits": 1421,
+          "expression_visits": 5489,
+          "payload_sites": 36,
+          "command_sites": 84,
+          "expanded_ir_nodes": 1230
+        },
+        {
+          "name": "source_scaling_8",
+          "mode": "boundary_periodic",
+          "source_nodes": 197,
+          "retained_cases": 1,
+          "retained_families": 10,
+          "descriptor_visits": 1893,
+          "expression_visits": 5629,
+          "payload_sites": 60,
+          "command_sites": 108,
+          "expanded_ir_nodes": 1662
+        }
+      ],
+      "limits": [
+        "No nontrivial actual-token case+periodic or combined mode is admitted under existing scoped period-one allocation.",
+        "Standalone diagnostic launch bounds do not extend production caller evidence admission.",
+        "Cost profiles are conditional per-loop-entry generated-control costs, not complete invocation work.",
+        "Case scaling has two distinct complete schedules; arbitrary distinct-group scaling is not established by that fixture.",
+        "Only two prior-default artifacts match campaign names and input hashes; eighteen missing artifacts are counted.",
+        "No device timing, native return-completion proof, or allocator extension."
+      ],
+      "reviewer": "/root/schedule_architecture_challenge",
+      "broad": {
+        "passed": 1629,
+        "failed": 3,
+        "warnings": 37,
+        "seconds": 546.23,
+        "exit_code": 1,
+        "selection": "rg --files tests/ut/ir/transforms | rg '/test_.*(sync|token|slot|interval|numerical|qwen_prefill|streamed|nested|buffered).*\\.py$' | sort",
+        "workers": 2,
+        "failure_classification": "Three obsolete implicit-cloning shape expectations; exact assertions repaired, independent access/token/flag/trace and allocation checks retained; no production change."
+      },
+      "affected_full_files": {
+        "passed": 91,
+        "warnings": 24,
+        "seconds": 190.61,
+        "exit_code": 0,
+        "workers": 2,
+        "files": [
+          "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+          "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+          "tests/ut/ir/transforms/test_sync_command_control.py"
+        ]
+      },
+      "coverage_interpretation": "1632 distinct broad-selected tests covered across initial broad run plus affected-file rerun; no claim of a fresh all-pass broad run.",
+      "logs": {
+        "stage4-focused.log": {
+          "path": "build-py314/architecture-correction/stage4-focused.log",
+          "sha256": "a93838fc94dc4a140f3dfb538034b02edcd795759dbd410ca1098290216555e5"
+        },
+        "stage4-campaign.log": {
+          "path": "build-py314/architecture-correction/stage4-campaign.log",
+          "sha256": "90de1a695858937f578610688f527ad94d00974f38986b8986bc78cdc56213c9"
+        },
+        "stage4-broad.log": {
+          "path": "build-py314/architecture-correction/stage4-broad.log",
+          "sha256": "73c208e7d711a50cf084f93c1025bf6fe54f8ca6954182aab1dcb5352a69c324"
+        },
+        "stage4-affected.log": {
+          "path": "build-py314/architecture-correction/stage4-affected.log",
+          "sha256": "b5d3220050bb08e4ba1671d64de2b08af44f46420008b387f8ac98ff41a8a29c"
+        }
+      },
+      "final_sources": {
+        "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "01a8c7f05ccba8e6a2b29484c56eb64e557f502fc71d947c932567506cc5d288",
+        "python/bindings/modules/testing.cpp": "19fab853977719a9f74f3416400418d22ce74d18d5f629ec1ad751cec25c3062",
+        "python/pypto/pypto_core/testing.pyi": "5bca76b5d6991a3d326e029a2afe8370b782448dab7ec962b2a4cc5cd022e9f6",
+        "src/ir/transforms/token_sync.cpp": "75c033634e3606bbd24cdb82176bd93105625d3f8231e4cac5ac1bdc23c5812a",
+        "src/ir/transforms/utils/physical_sync_allocation.h": "2f23c232d5a49fc4e6fcc54cf5b1ca0fef8d976008d90b8f2601d77ca4be9ec5",
+        "src/ir/transforms/utils/physical_sync_realization.cpp": "62659d2a7beedead5bf68cf5a094b687cdb06727d558bae7b4b53238a922446e",
+        "src/ir/transforms/utils/placed_sync_import.cpp": "44b172d989333134b0e3093c8c66eed99e1126c98e14a7dfe7366ea35aef6e2e",
+        "src/ir/transforms/utils/structured_token_sync.cpp": "2b7ae5a8b412498ea0562c32f7700e6700806a0be3c3f1dc7784e214514221b3",
+        "src/ir/transforms/utils/token_sync_lowering.cpp": "6c2a6ffeaaa6955ca53014c4edba3181b871e4b44e6ca9fd3cb3fea9e5584d19",
+        "src/ir/transforms/utils/token_sync_lowering.h": "b57b040301995e4620446efb7664fef868399b746e9ee747fae11e2a4c5b94c7",
+        "tests/ut/ir/transforms/qualify_sync_accounting.py": "12b92d8b8aa94c784d43e5c6d4d79a96959535e055e84c7ec0e8cdad0c756751",
+        "tests/ut/ir/transforms/qualify_sync_control.py": "969230211d4e860c7ffda9ab06708c315500a3ccc658a6cda752986e44419513",
+        "tests/ut/ir/transforms/qualify_sync_schedule_ablation.py": "21189540c00d26c13fb3af1414afed25326331967b1b1e498a84073be6e6af15",
+        "tests/ut/ir/transforms/sync_control_metrics.py": "e1867d450603160ea907580c75ec797b8fe0afd6d2345d5aa19b0872f6dac5ba",
+        "tests/ut/ir/transforms/sync_logical_oracle.py": "7bf782e372b90eeeaf90501ff7fbbd251c812a2cb1f2291770a47eaa6c3b6b70",
+        "tests/ut/ir/transforms/sync_matmul_oracle.py": "3fe09d610312055adfad06799e10a01ea81e352c8c133aca5cbf6c585350971a",
+        "tests/ut/ir/transforms/sync_physical_oracle.py": "1b0b6b1a6e8e3eae76d533347370941b32fd5da9e8b9308f1e7d7dfe3347daf3",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py": "37e6c1852641bcb937272a939d4df32d171cc6d5d5d1521cc21633b944f65f79",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py": "74ddd904e3225a110d8ee9667883ac2e2a77fc51e0f7358cf19ffe647d1d28b6",
+        "tests/ut/ir/transforms/test_parameterized_token_sync.py": "62957ff5d9c320c4631e10de2d682ab97441df19d69da45bcdd3bd77388c58cf",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py": "392d824103ceb3f3793617f246a37877d786d80cfbbce4770a23a38d1d8d30da",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "6830872636fb90e253558b6372132059a1b5c2912de1fd1f98bb143ae3b66a35",
+        "tests/ut/ir/transforms/test_regional_sync_schedule.py": "3aa36acc06a1a79b84824afb49aef83b122d7e2784f4fd0945f18d2e983de2f9",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py": "cb617ea4092ea448d9642223c38348822b29cd6e416b3ffa5d73c863141e3d8c",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py": "c5cdab18862debc84a221a3539bc66776bcf8b86855316a81427296cb1dac1b9",
+        "tests/ut/ir/transforms/test_scoped_token_order.py": "103da725851dad77ca915ed1067966f14e3da368ddf667ff859f9c67fb8f9cf5",
+        "tests/ut/ir/transforms/test_structured_token_sync.py": "a72a99f0a6ffc92003873d7ce20b2b624b5fd90cb2774c058e539301863056a7",
+        "tests/ut/ir/transforms/test_sync_boundary_schedule.py": "2a74fb890b9232fd3a469a9e92ac6d916f0b384b6cd5147a8969f362782d65a9",
+        "tests/ut/ir/transforms/test_sync_case_only_schedule.py": "e0c0095069bca2f9c6f5acdee037f0f4d909eaae25250f72bfdec3b0e83f941e",
+        "tests/ut/ir/transforms/test_sync_command_control.py": "a2fdf87dd1948bb722afce60ca006f3d013e086836f30c3dd163fe71b6c8bb10",
+        "tests/ut/ir/transforms/test_sync_lowering_qualification.py": "42238f911ffc1aab9728edd438b824444b3d4892839c94a162d1e24ba4eb78b6",
+        "tests/ut/ir/transforms/test_sync_schedule_ablation.py": "090e758b126ec7d1e909f86cfaace8cb61f0b1ab57f057768e5c98030242c758",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py": "03fc6f102fd2aa25b306518e33fb0f8c1524a932edc9fa3892e61f793c21830e",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py": "e2c14aa3ceff7f2cf836cb47ec4aabf7620fdc14ab64673e2308cc95e3a0ce86"
+      },
+      "extension_sha256": "59f15597e939ca0876f3ef8daf1d32dcbfadfec46f0864b28a4f5c7ab8df85f6",
+      "style": [
+        "ruff check: all 5 stage4 driver/test and repaired files passed",
+        "ruff format --check: 5 files already formatted",
+        "git diff --check: passed"
+      ],
+      "receipt": {
+        "path": "build-py314/architecture-correction/stage4-validation.json",
+        "sha256": "055b46f9d0485d799cc018201b1a9ee05084a195d4b1ea548c5b4d55bd3b5ed6"
+      },
+      "independent_acceptance": "All final source, extension, campaign and log hashes verified; EN/ZH results and three test repairs accepted. No fresh broad-green or device-performance claim."
+    }
+  ],
+  "limits": [
+    "Host semantic and native code-generation checks are not device execution or timing evidence",
+    "No new allocator, protocol, native exemption or invocation-return guarantee",
+    "Source traversal costs remain separate from relation/output-sensitive mathematical work"
+  ]
+}

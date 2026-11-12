@@ -26,6 +26,11 @@ namespace pypto::ir::sync {
 using SyncDirection = std::pair<PipeType, PipeType>;
 using SyncNativeReservations = std::map<SyncDirection, std::set<int>>;
 
+// Record emitted occurrence counts and explicit guarded fallback when no loop
+// candidate exists. This census neither changes IR nor reconstructs demands.
+void FinishSyncScheduleReceipt(const FunctionPtr& function, PhysicalSyncRealization& result,
+                               const SyncSchedulePolicy& policy);
+
 // Qualified direct-cut order provider. The command inventory is independent
 // of minimum-demand analysis: token clients retain every actual use. Callbacks
 // are consumed synchronously while their immutable owner is alive.
@@ -41,7 +46,8 @@ struct DirectSyncOrder {
 PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input,
                                           std::vector<PhysicalSyncFamily> families,
                                           const DirectSyncOrder& order, const std::string& target,
-                                          const std::optional<std::vector<int>>& restricted);
+                                          const std::optional<std::vector<int>>& restricted,
+                                          const SyncSchedulePolicy& policy = {});
 
 // Separate allocation from shared cut application for mutually exclusive cases.
 PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input,
@@ -56,11 +62,51 @@ struct AssignedSyncCase {
 // the same original owner and exhaust its supplied invocation domain.
 FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterBounds& parameters,
                                   std::pair<int64_t, int64_t> blocks,
-                                  const std::vector<AssignedSyncCase>& cases);
+                                  const std::vector<AssignedSyncCase>& cases,
+                                  const SyncSchedulePolicy& policy = {});
+
+// Internal emitter utility, not a general IR canonicalizer. Inputs contain
+// only physical command leaves, sequences and guards over ready immutable
+// original coordinates; no definitions, payloads or effectful conditions.
+// Counters must already include the input guards. Else-bearing trees are opaque.
+std::vector<StmtPtr> ShareSyncCommandGuards(const std::vector<StmtPtr>& commands,
+                                            PhysicalSyncRealization& counters);
+struct SyncCommandCase {
+  std::pair<int64_t, int64_t> blocks;
+  StmtPtr body;
+};
+// Testing only: inspect production structural grouping of complete command
+// descriptors. This does not select a candidate, cost it, or certify a protocol.
+std::pair<std::vector<std::vector<std::pair<int64_t, int64_t>>>, PhysicalSyncRealization>
+InspectSyncInvocationGroups(const FunctionPtr& owner, const std::vector<SyncCommandCase>& cases);
+// possible is a normalized conservative upper domain of the original cut.
+// Use the entire launch domain when evidence is unavailable, never an empty list.
+// Like ShareSyncCommandGuards, bodies contain only ready, immutable-coordinate
+// guards and physical commands. Factoring preserves each case's ordered trace;
+// no definition/payload may move and assignments are never recolored.
+// uniform_variables is optional original-cut evidence: only literal-bound,
+// positive-step IVs with a launch-independent domain at this cut may be named.
+// Omit it when original control or nested bounds do not establish that fact.
+std::vector<StmtPtr> EmitSyncCommandCases(const ExprPtr& block,
+                                          const std::vector<std::pair<int64_t, int64_t>>& possible,
+                                          const std::vector<SyncCommandCase>& cases,
+                                          PhysicalSyncRealization& work, const Span& span,
+                                          const std::set<const Var*>& uniform_variables = {});
+// Same emitter-only precondition as ShareSyncCommandGuards. The owner supplies
+// name reservations; definitions stay inside the original command scope.
+StmtPtr MaterializeSyncCommandValues(const FunctionPtr& owner, const StmtPtr& commands);
+
+// Internal emitter diagnostic: supplied cuts are already-qualified pure command
+// fragments. This helper does not establish demand coverage or flag matching.
+PhysicalSyncRealization EmitSyncBoundaryCommands(
+    const FunctionPtr& owner, const std::vector<std::tuple<CallPtr, StmtPtr, StmtPtr>>& cuts, bool enabled);
 
 // Publish only an established complete physical owner (literal SET and WAIT),
 // or an explicit delegation outcome. This does not qualify or allocate a plan.
 FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::string& reason);
+
+// Read the already-qualified endpoint pipe pair; no access recovery or policy selection.
+SyncDirection SyncFamilyPipes(const CompactSyncInput& input, const PhysicalSyncFamily& family);
 
 // Shared native-owner and target eligibility policy. Neither helper computes
 // demands or assumes that a logical token owns a consuming hardware event.

@@ -1,5 +1,8 @@
 # RealizeSync（实验性）
 
+插入生成的逻辑令牌若未通过验证，则报告内部编译器错误（internal compiler error），
+不会转为 PTOAS 委托；独立 `LowerSync` 的非法用户令牌仍报告输入验证错误。
+
 此可选 Pass 在存储降低之后按完整内核尝试 PyPTO 同步。
 **两种模式都保持 PTOAS 自动同步启用。** 默认编译仍将同步交给 PTOAS。
 

@@ -267,10 +267,13 @@ def test_matrix_threshold_across_visits(shape, count):
     function = staged_fixture(count, visits=2, m=m, n=n)
     analysis = testing.analyze_placed_sync(function, True)
     validate(function, analysis)
-    result, _, _, _ = check(function, list(range(6)))
-    assert result["barrier_sites"] == (
-        0 if count == 0 or (m // 16) * (n // 16) >= 10 else (2 if count == 1 else 4)
-    )
+    result, state, _, _ = check(function, list(range(6)))
+    # There are two M operations per iteration and two separate invocations.
+    # Scheduling can duplicate static sites into bounded phase bodies; the
+    # hardware exemption and executed adjacent barriers must stay unchanged.
+    expected = 0 if count == 0 or (m // 16) * (n // 16) >= 10 else 2 * (2 * count - 1)
+    assert len(state.barriers) == expected
+    assert bool(result["barrier_sites"]) == bool(expected)
     # Reset crossings and FIX reads still require cross-pipe handoffs.
     if count:
         assert result["set_sites"] > 0

@@ -20,6 +20,17 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 
 namespace pypto::ir::sync {
+// Current payload/control/native qualification for token lowering. This does
+// not recover dependence footprints or assert a GM alias partition. Geometry
+// needed to qualify a native instruction or original control remains checked.
+CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::string& target,
+                                    const SyncParameterBounds& parameters = {},
+                                    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt);
+
+// Insertion owns its generated SSA: malformed output is a compiler error,
+// never an unsupported-input reason for downstream delegation.
+void CheckGeneratedLogicalSync(const FunctionPtr& function);
+
 // Original payload/native import for token consumers. The returned loop map
 // preserves correspondence to the token IR; it does not retain demand analysis.
 struct StrippedLogicalSync {
@@ -33,17 +44,20 @@ bool HasLogicalSync(const FunctionPtr& function);
 struct LoweredLogicalSync {
   FunctionPtr function;
   size_t set_sites = 0, wait_sites = 0;
+  // Diagnostic allocation receipts stay separated by their original case.
+  std::vector<PhysicalSyncRealization> physical_cases;
 };
 LoweredLogicalSync LowerStructuredLogicalSync(
     const FunctionPtr& function, const std::string& target,
     const std::optional<std::vector<int>>& eligible_ids, const SyncParameterBounds& parameters = {},
-    std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt);
+    std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt, const SyncSchedulePolicy& policy = {});
 // Interpret actual logical token uses without substituting minimum demands.
 // The finite adapter keeps actual command cuts and has no payload families;
 // canonical structured transport certifies and retains direct-cut families.
 LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::string& target,
                                     const std::optional<std::vector<int>>& eligible_ids,
                                     const SyncParameterBounds& parameters = {},
-                                    std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt);
+                                    std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt,
+                                    const SyncSchedulePolicy& policy = {});
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_TOKEN_SYNC_LOWERING_H_
