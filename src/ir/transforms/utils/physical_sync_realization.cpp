@@ -26,14 +26,18 @@
 #include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/sync/isa_macro_resources.h"
 #include "pypto/sync/resource_catalog.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/sync_invocation_domains.h"
 #include "src/ir/transforms/utils/sync_placement.h"
+#include "src/ir/transforms/utils/sync_token_names.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -334,10 +338,361 @@ class Allocator {
   }
 };
 
+// Equality is optional optimization evidence. An unsupported comparison must
+// preserve the accepted unfactored plan, rather than become an export refusal.
+bool SameControl(const IRNodePtr& left, const IRNodePtr& right) {
+  try {
+    return structural_equal(left, right, false);
+  } catch (const StructuralComparisonUnsupported&) {
+    return false;
+  }
+}
+
+// Only generated predicates enter this simplifier. Original payload/control
+// expressions are never rewritten. Bounds come from the retained occurrence
+// frame, with a fresh analyzer per cut so facts cannot leak across resets.
+class CommandConditions : public IRMutator {
+  arith::Analyzer analyzer_;
+  StmtPtr VisitStmt_(const IfStmtPtr& branch) override {
+    ExprPtr condition = branch->condition_;
+    try {
+      condition = analyzer_.Simplify(condition);
+    } catch (const StructuralComparisonUnsupported&) {
+      // Arithmetic simplification is optional; retained realization stays valid.
+    }
+    if (auto known = As<ConstBool>(condition)) {
+      if (known->value_) return VisitStmt(branch->then_body_);
+      return branch->else_body_ ? VisitStmt(*branch->else_body_)
+                                : std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, branch->span_);
+    }
+    return std::make_shared<IfStmt>(
+        condition, VisitStmt(branch->then_body_),
+        branch->else_body_ ? std::optional<StmtPtr>(VisitStmt(*branch->else_body_)) : std::nullopt,
+        branch->return_vars_, branch->span_);
+  }
+
+ public:
+  explicit CommandConditions(const SyncSegment& segment) {
+    auto bind = [&](const ForStmtPtr& loop) {
+      const auto start = As<ConstInt>(loop->start_), stop = As<ConstInt>(loop->stop_),
+                 step = As<ConstInt>(loop->step_);
+      if (start && stop && step && step->value_ > 0 && start->value_ < stop->value_)
+        analyzer_.Bind(loop->loop_var_, start->value_, stop->value_);
+    };
+    if (!segment.nested_frames.empty()) {
+      for (const auto& frame : segment.nested_frames) bind(frame.loop);
+    } else if (segment.original_loop) {
+      bind(segment.original_loop);
+    }
+  }
+};
+
+// Scope-local value numbering for generated command predicates. Count only
+// strict, pure expression trees in conditions at this sequence level. Insert
+// a definition at its FIRST evaluation, never at a loop preheader or outside
+// a guard. Children have independent tables; no branch-private value escapes.
+// Hash collisions lose sharing rather than inducing an all-pairs search.
+class CommandValues : public IRMutator {
+  SyncTokenNames& names_;
+  PhysicalSyncRealization& work_;
+  struct Entry {
+    ExprPtr expression;
+    size_t uses = 0;
+    VarPtr value;
+  };
+  using Table = std::map<uint64_t, Entry>;
+  static bool Candidate(const ExprPtr& expression) {
+    const auto binary = As<BinaryExpr>(expression);
+    if (!binary) return false;
+    if (As<FloorDiv>(expression) && As<Var>(binary->left_) && As<ConstInt>(binary->right_)) return true;
+    const auto type = As<ScalarType>(expression->GetType());
+    const auto left = As<ScalarType>(binary->left_->GetType());
+    const auto right = As<ScalarType>(binary->right_->GetType());
+    // Hash whole comparisons and constant-size normalized IV quotients only.
+    // Hashing every nested arithmetic subtree would hide quadratic traversal.
+    return type && left && right && type->dtype_ == DataType::BOOL && left->dtype_ == DataType::INDEX &&
+           right->dtype_ == DataType::INDEX;
+  }
+  bool Pure(const ExprPtr& expression) {
+    ++work_.control_expression_visits;
+    const auto type = As<ScalarType>(expression->GetType());
+    if (!type || (type->dtype_ != DataType::INDEX && type->dtype_ != DataType::BOOL)) return false;
+    if (As<Var>(expression) || As<ConstInt>(expression) || As<ConstBool>(expression)) return true;
+    const auto binary = As<BinaryExpr>(expression);
+    if (!binary || As<And>(expression) || As<Or>(expression)) return false;
+    if (As<FloorDiv>(expression) || As<FloorMod>(expression)) {
+      auto divisor = As<ConstInt>(binary->right_);
+      if (!divisor || divisor->value_ <= 0) return false;
+    }
+    return Pure(binary->left_) && Pure(binary->right_);
+  }
+  void Count(const ExprPtr& expression, Table& table) {
+    ++work_.control_expression_visits;
+    const auto binary = As<BinaryExpr>(expression);
+    if (!binary) return;
+    if (Candidate(expression)) {
+      const auto key = structural_hash(expression, false);
+      auto& entry = table[key];
+      if (!entry.expression) entry.expression = expression;
+      if (SameControl(entry.expression, expression)) ++entry.uses;
+    }
+    Count(binary->left_, table);
+    Count(binary->right_, table);
+  }
+  class Values : public IRMutator {
+    Table& table_;
+    SyncTokenNames& names_;
+    std::vector<StmtPtr>& definitions_;
+    PhysicalSyncRealization& work_;
+
+   public:
+    Values(Table& table, SyncTokenNames& names, std::vector<StmtPtr>& definitions,
+           PhysicalSyncRealization& work)
+        : table_(table), names_(names), definitions_(definitions), work_(work) {}
+    ExprPtr VisitBinaryExpr_(const BinaryExprPtr& expression) override {
+      ++work_.control_expression_visits;
+      auto found = Candidate(expression) ? table_.find(structural_hash(expression, false)) : table_.end();
+      Entry* entry =
+          found != table_.end() && found->second.uses > 1 && SameControl(found->second.expression, expression)
+              ? &found->second
+              : nullptr;
+      if (entry && entry->value) return entry->value;
+      auto rewritten = IRMutator::VisitBinaryExpr_(expression);
+      if (!entry) return rewritten;
+      entry->value =
+          std::make_shared<Var>(names_.Next("sync_control_"), expression->GetType(), expression->span_);
+      definitions_.push_back(std::make_shared<AssignStmt>(entry->value, rewritten, expression->span_));
+      ++work_.shared_control_values;
+      return entry->value;
+    }
+  };
+  StmtPtr VisitStmt_(const SeqStmtsPtr& sequence) override {
+    Table table;
+    for (const auto& statement : sequence->stmts_)
+      if (auto branch = As<IfStmt>(statement); branch && Pure(branch->condition_))
+        Count(branch->condition_, table);
+    std::vector<StmtPtr> output;
+    for (const auto& statement : sequence->stmts_) {
+      if (auto branch = As<IfStmt>(statement); branch && Pure(branch->condition_)) {
+        const auto condition = Values(table, names_, output, work_).VisitExpr(branch->condition_);
+        output.push_back(std::make_shared<IfStmt>(
+            condition, VisitStmt(branch->then_body_),
+            branch->else_body_ ? std::optional<StmtPtr>(VisitStmt(*branch->else_body_)) : std::nullopt,
+            branch->return_vars_, branch->span_));
+      } else {
+        output.push_back(VisitStmt(statement));
+      }
+    }
+    return std::make_shared<SeqStmts>(output, sequence->span_);
+  }
+
+ public:
+  CommandValues(SyncTokenNames& names, PhysicalSyncRealization& work) : names_(names), work_(work) {}
+};
+
+std::vector<StmtPtr> MaterializeCommandValues(const std::vector<StmtPtr>& commands, SyncTokenNames& names,
+                                              PhysicalSyncRealization& work) {
+  const auto sequence = std::make_shared<SeqStmts>(commands, Span::unknown());
+  const auto previous = work.shared_control_values;
+  try {
+    return As<SeqStmts>(CommandValues(names, work).VisitStmt(sequence))->stmts_;
+  } catch (const StructuralComparisonUnsupported&) {
+    work.shared_control_values = previous;
+    return commands;  // Optional value numbering cannot invalidate a plan.
+  }
+}
+
+size_t CountCommandGuards(const StmtPtr& statement) {
+  size_t result = 0;
+  if (auto sequence = As<SeqStmts>(statement))
+    for (const auto& child : sequence->stmts_) result += CountCommandGuards(child);
+  if (auto branch = As<IfStmt>(statement)) {
+    result += 1 + CountCommandGuards(branch->then_body_);
+    if (branch->else_body_) result += CountCommandGuards(*branch->else_body_);
+  }
+  return result;
+}
+
+// Only emitter-created forests enter this builder: no payloads, definitions,
+// effectful conditions or result-bearing branches. Share consecutive equal
+// guard prefixes, preserving every leaf and its order. Mutable child vectors
+// avoid repeatedly copying a growing immutable body. Work is linear in visited
+// control occurrences plus structural-comparison traversal (not distinct DAGs).
+class CommandGuards {
+  struct Node {
+    ExprPtr condition;
+    StmtPtr leaf;
+    std::vector<Node> children;
+  };
+  std::vector<Node> roots_;
+  size_t shared_ = 0, visits_ = 0;
+
+  void Append(std::vector<Node>& nodes, const StmtPtr& statement) {
+    ++visits_;
+    if (auto sequence = As<SeqStmts>(statement)) {
+      for (const auto& child : sequence->stmts_) Append(nodes, child);
+    } else if (auto branch = As<IfStmt>(statement);
+               branch && !branch->else_body_ && branch->return_vars_.empty()) {
+      if (nodes.empty() || !nodes.back().condition ||
+          !SameControl(nodes.back().condition, branch->condition_)) {
+        nodes.push_back({branch->condition_, nullptr, {}});
+      } else {
+        ++shared_;
+      }
+      Append(nodes.back().children, branch->then_body_);
+    } else {
+      // In particular, ID decision chains are opaque. Sharing must not move
+      // a later command into one arm, or collect A/B/A into A/A/B.
+      nodes.push_back({nullptr, statement, {}});
+    }
+  }
+  static std::vector<StmtPtr> Freeze(const std::vector<Node>& nodes) {
+    std::vector<StmtPtr> result;
+    result.reserve(nodes.size());
+    for (const auto& node : nodes) {
+      if (node.condition) {
+        const auto span = node.condition->span_;
+        auto body = std::make_shared<SeqStmts>(Freeze(node.children), span);
+        result.push_back(
+            std::make_shared<IfStmt>(node.condition, body, std::nullopt, std::vector<VarPtr>{}, span));
+      } else {
+        result.push_back(node.leaf);
+      }
+    }
+    return result;
+  }
+
+ public:
+  std::vector<StmtPtr> Build(const std::vector<StmtPtr>& commands, PhysicalSyncRealization& result) {
+    for (const auto& command : commands) Append(roots_, command);
+    INTERNAL_CHECK(result.guard_sites >= shared_) << "Internal error: command guard accounting";
+    result.guard_sites -= shared_;
+    result.shared_guard_sites += shared_;
+    result.control_statement_visits += visits_;
+    return Freeze(roots_);
+  }
+};
+
+using CaseCommands = SyncCommandCase;
 struct PhysicalCuts {
   std::vector<StmtPtr> before, after;
+  std::vector<CaseCommands> before_cases, after_cases;
+  // Upper bound on the invocation coordinates reaching this ORIGINAL cut.
+  // Only a retained zero-visit proof removes coordinates. Missing evidence
+  // leaves the full domain; a present cut with no commands is never absence.
+  std::vector<std::pair<int64_t, int64_t>> domain;
 };
+// Compare each newly supplied complete sequence only with its predecessor.
+// The accumulated interval is constant-size; its body is never concatenated.
+// Missing cases remain numeric gaps, even when both neighboring bodies match.
+void AppendCase(std::vector<CaseCommands>& cases, std::pair<int64_t, int64_t> blocks,
+                const std::vector<StmtPtr>& commands, const Span& span) {
+  if (commands.empty()) return;
+  auto body = std::make_shared<SeqStmts>(commands, span);
+  if (!cases.empty() && cases.back().blocks.second < std::numeric_limits<int64_t>::max() &&
+      cases.back().blocks.second + 1 == blocks.first && SameControl(cases.back().body, body)) {
+    cases.back().blocks.second = blocks.second;
+  } else {
+    cases.push_back({blocks, body});
+  }
+}
 using CutInventory = std::map<const Call*, std::shared_ptr<PhysicalCuts>>;
+
+using Intervals = std::vector<std::pair<int64_t, int64_t>>;
+using AbsentLoops = std::map<const ForStmt*, Intervals>;
+
+void RetainAbsentLoops(const SyncRegion& region, std::pair<int64_t, int64_t> blocks, AbsentLoops& absent) {
+  if (region.repetition && !region.repetition->count) {
+    auto& ranges = absent[region.repetition->loop.get()];
+    // Cases arrive in increasing order; retain a normalized union without
+    // visiting any dynamic occurrence or the body of an absent loop.
+    if (!ranges.empty() && ranges.back().second + 1 == blocks.first)
+      ranges.back().second = blocks.second;
+    else
+      ranges.push_back(blocks);
+    return;
+  }
+  for (const auto& child : region.children) RetainAbsentLoops(child, blocks, absent);
+}
+
+Intervals SubtractIntervals(const Intervals& domain, const Intervals& absent) {
+  Intervals result;
+  size_t j = 0;
+  for (auto [lo, hi] : domain) {
+    while (j < absent.size() && absent[j].second < lo) ++j;
+    for (size_t k = j; k < absent.size() && absent[k].first <= hi; ++k) {
+      if (lo < absent[k].first) result.emplace_back(lo, absent[k].first - 1);
+      lo = std::max(lo, absent[k].second + 1);
+      if (lo > hi) break;
+    }
+    if (lo <= hi) result.emplace_back(lo, hi);
+  }
+  return result;
+}
+
+// One original-tree traversal transports supplied absence evidence to cuts.
+// Work includes the interval pieces propagated through nested scopes, not just
+// distinct source nodes. It is independent of launch size and loop trip counts.
+class CutDomains : public IRVisitor {
+  const AbsentLoops& absent_;
+  CutInventory& cuts_;
+  Intervals domain_;
+  PhysicalSyncRealization& work_;
+  void VisitStmt_(const ForStmtPtr& loop) override {
+    auto saved = domain_;
+    work_.cut_domain_interval_visits += domain_.size();
+    if (auto found = absent_.find(loop.get()); found != absent_.end()) {
+      work_.cut_domain_interval_visits += found->second.size();
+      domain_ = SubtractIntervals(domain_, found->second);
+    }
+    VisitStmt(loop->body_);
+    domain_ = std::move(saved);
+  }
+  void VisitStmt_(const AssignStmtPtr&) override {}
+  void VisitStmt_(const IfStmtPtr& branch) override {
+    VisitStmt(branch->then_body_);
+    if (branch->else_body_) VisitStmt(*branch->else_body_);
+  }
+  void VisitStmt_(const EvalStmtPtr& statement) override {
+    const auto call = As<Call>(statement->expr_);
+    if (auto found = cuts_.find(call.get()); found != cuts_.end()) {
+      work_.cut_domain_interval_visits += domain_.size();
+      found->second->domain = domain_;
+    }
+  }
+
+ public:
+  CutDomains(const AbsentLoops& absent, CutInventory& cuts, std::pair<int64_t, int64_t> blocks,
+             PhysicalSyncRealization& work)
+      : absent_(absent), cuts_(cuts), domain_{blocks}, work_(work) {
+    for (auto& [anchor, cut] : cuts_) cut->domain = domain_;
+  }
+};
+
+bool DomainIntersects(const Intervals& domain, int64_t lo, int64_t hi) {
+  if (lo > hi) return false;
+  const auto next =
+      std::lower_bound(domain.begin(), domain.end(), lo,
+                       [](const auto& interval, int64_t value) { return interval.second < value; });
+  return next != domain.end() && next->first <= hi;
+}
+
+std::vector<CaseCommands> CoalesceCutCases(const std::vector<CaseCommands>& source, const Intervals& domain,
+                                           PhysicalSyncRealization& work) {
+  std::vector<CaseCommands> result;
+  for (const auto& item : source) {
+    ++work.cut_case_comparisons;
+    if (!result.empty() &&
+        !DomainIntersects(domain, result.back().blocks.second + 1, item.blocks.first - 1) &&
+        SameControl(result.back().body, item.body)) {
+      result.back().blocks.second = item.blocks.second;
+      ++work.coalesced_cut_cases;
+    } else {
+      result.push_back(item);
+    }
+  }
+  return result;
+}
 
 class Emitter : public SyncPlacement {
  public:
@@ -350,7 +705,7 @@ class Emitter : public SyncPlacement {
     }
   }
 
-  void AppendCuts(CutInventory& inventory, const ExprPtr& guard) {
+  void AppendCuts(CutInventory& inventory, std::pair<int64_t, int64_t> blocks) {
     for (size_t r = 0; r < input_.segments.size(); ++r) {
       const auto& region = input_.segments[r];
       if (!region.count) continue;
@@ -366,21 +721,15 @@ class Emitter : public SyncPlacement {
               << "Internal error: incompatible original initialization cut";
           continuation = retained;
         }
-        auto append = [&](std::vector<StmtPtr>& target, const std::vector<StmtPtr>& source) {
-          if (source.empty()) return;
-          if (guard)
-            target.push_back(Guard(guard, std::make_shared<SeqStmts>(source, site.original->span_)));
-          else
-            target.insert(target.end(), source.begin(), source.end());
-        };
-        append(retained->before, commands.before);
-        append(retained->after, commands.after);
+        AppendCase(retained->before_cases, blocks, commands.before, site.original->span_);
+        AppendCase(retained->after_cases, blocks, commands.after, site.original->span_);
       }
     }
   }
 
  private:
   PhysicalSyncRealization& result_;
+  std::unique_ptr<SyncTokenNames> names_;
   std::map<SyncSiteKey, std::vector<size_t>> incoming_, outgoing_;
   ExprPtr Integer(int64_t n, const Span& span) {
     return std::make_shared<ConstInt>(n, DataType::INDEX, span);
@@ -478,7 +827,11 @@ class Emitter : public SyncPlacement {
       ExprPtr residue;
       if (f.ids.size() > 1)
         residue = std::make_shared<FloorMod>(index, Integer(f.ids.size(), span), DataType::INDEX, span);
-      for (size_t i = 0; i < f.ids.size(); ++i) {
+      StmtPtr selection;
+      // Distinct residue tests are mutually exclusive. Keep the last equality
+      // too: no extra exhaustiveness/range premise is needed for this rewrite.
+      // All selection arithmetic stays beneath the original presence guards.
+      for (size_t i = f.ids.size(); i-- > 0;) {
         auto call = OpRegistry::GetInstance().Create(
             publish ? "system.set_flag" : "system.wait_flag", {},
             {{"src_pipe", static_cast<int>(src)},
@@ -487,14 +840,19 @@ class Emitter : public SyncPlacement {
              {"core_type", std::string(input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
             span);
         StmtPtr command = std::make_shared<EvalStmt>(call, span);
-        if (residue)
-          command = Guard(std::make_shared<Eq>(residue, Integer(i, span), DataType::BOOL, span), command);
-        commands.push_back(command);
+        if (residue) {
+          ++result_.guard_sites;
+          command = std::make_shared<IfStmt>(
+              std::make_shared<Eq>(residue, Integer(i, span), DataType::BOOL, span), command,
+              selection ? std::optional<StmtPtr>(selection) : std::nullopt, std::vector<VarPtr>{}, span);
+        }
+        selection = command;
         if (publish)
           ++result_.set_sites;
         else
           ++result_.wait_sites;
       }
+      if (selection) commands.push_back(selection);
     }
     StmtPtr body = std::make_shared<SeqStmts>(commands, span);
     // The range guard surrounds residue arithmetic: no absent predecessor is
@@ -511,6 +869,7 @@ class Emitter : public SyncPlacement {
   }
   PhysicalCuts Commands(SyncSiteKey site, const Span& span) {
     PhysicalCuts cuts;
+    const auto previous_guards = result_.guard_sites;
     // Preserve the common direct protocol: local barrier, incoming WAITs,
     // payload, outgoing SETs. Case aggregation never interleaves active cases.
     for (auto i : incoming_[site])
@@ -518,10 +877,25 @@ class Emitter : public SyncPlacement {
     for (auto i : incoming_[site])
       if (!result_.families[i].ids.empty()) cuts.before.push_back(Command(result_.families[i], false, span));
     for (auto i : outgoing_[site]) cuts.after.push_back(Command(result_.families[i], true, span));
+    CommandConditions conditions(input_.segments[site.first]);
+    size_t remaining = 0;
+    for (auto* commands : {&cuts.before, &cuts.after})
+      for (auto& statement : *commands) {
+        statement = conditions.VisitStmt(statement);
+        remaining += CountCommandGuards(statement);
+      }
+    INTERNAL_CHECK(result_.guard_sites >= previous_guards + remaining) << "Unexpected new command guards";
+    result_.simplified_guard_sites += result_.guard_sites - previous_guards - remaining;
+    result_.guard_sites = previous_guards + remaining;
+    cuts.before = ShareSyncCommandGuards(cuts.before, result_);
+    cuts.after = ShareSyncCommandGuards(cuts.after, result_);
     return cuts;
   }
   StmtPtr Wrap(const StmtPtr& payload, SyncSiteKey site) override {
     auto cuts = Commands(site, payload->span_);
+    if (!names_) names_ = std::make_unique<SyncTokenNames>(input_.owner);
+    cuts.before = MaterializeCommandValues(cuts.before, *names_, result_);
+    cuts.after = MaterializeCommandValues(cuts.after, *names_, result_);
     cuts.before.push_back(payload);
     cuts.before.insert(cuts.before.end(), cuts.after.begin(), cuts.after.end());
     return std::make_shared<SeqStmts>(cuts.before, payload->span_);
@@ -531,10 +905,13 @@ class Emitter : public SyncPlacement {
 // installs already-qualified case cuts in the unchanged original payload tree.
 class InvocationEmitter : public IRMutator {
   const CutInventory& inventory_;
+  SyncTokenNames names_;
+  PhysicalSyncRealization& work_;
   StmtPtr Wrap(const StmtPtr& payload, const PhysicalCuts& cuts) {
-    auto statements = cuts.before;
+    auto statements = MaterializeCommandValues(cuts.before, names_, work_);
     statements.push_back(payload);
-    statements.insert(statements.end(), cuts.after.begin(), cuts.after.end());
+    const auto after = MaterializeCommandValues(cuts.after, names_, work_);
+    statements.insert(statements.end(), after.begin(), after.end());
     return std::make_shared<SeqStmts>(statements, payload->span_);
   }
   static const Call* ArmCall(StmtPtr arm) {
@@ -561,7 +938,8 @@ class InvocationEmitter : public IRMutator {
   }
 
  public:
-  explicit InvocationEmitter(const CutInventory& inventory) : inventory_(inventory) {}
+  InvocationEmitter(const CutInventory& inventory, const FunctionPtr& owner, PhysicalSyncRealization& work)
+      : inventory_(inventory), names_(owner), work_(work) {}
 };
 
 std::vector<Family> DirectFamilies(const CompactSyncResult& analysis) {
@@ -616,6 +994,45 @@ DirectSyncOrder MathematicalOrder(const CompactSyncResult& analysis) {
 }
 
 }  // namespace
+StmtPtr MaterializeSyncCommandValues(const FunctionPtr& owner, const StmtPtr& commands) {
+  SyncTokenNames names(owner);
+  PhysicalSyncRealization work;
+  return std::make_shared<SeqStmts>(MaterializeCommandValues({commands}, names, work), commands->span_);
+}
+std::vector<StmtPtr> EmitSyncCommandCases(const ExprPtr& block, const Intervals& possible,
+                                          const std::vector<SyncCommandCase>& cases,
+                                          PhysicalSyncRealization& work, const Span& span) {
+  std::vector<StmtPtr> target;
+  if (possible.empty()) return target;
+  int64_t previous = -1;
+  for (const auto& [lo, hi] : possible) {
+    CHECK(lo > previous && hi >= lo && hi < std::numeric_limits<int64_t>::max())
+        << "Invalid cut execution domain";
+    previous = hi;
+  }
+  previous = -1;
+  for (const auto& item : cases) {
+    CHECK(item.blocks.first > previous && item.blocks.second >= item.blocks.first &&
+          item.blocks.second < std::numeric_limits<int64_t>::max())
+        << "Invalid ordered command cases";
+    previous = item.blocks.second;
+  }
+  const auto context = std::make_pair(possible.front().first, possible.back().second);
+  for (const auto& item : CoalesceCutCases(cases, possible, work)) {
+    const auto selected = std::make_pair(std::max(context.first, item.blocks.first),
+                                         std::min(context.second, item.blocks.second));
+    if (selected.first > selected.second) continue;
+    const auto guard = SyncInvocationGuard(block, context, selected, span);
+    target.push_back(
+        guard ? std::make_shared<IfStmt>(guard, item.body, std::nullopt, std::vector<VarPtr>{}, span)
+              : item.body);
+  }
+  return target;
+}
+std::vector<StmtPtr> ShareSyncCommandGuards(const std::vector<StmtPtr>& commands,
+                                            PhysicalSyncRealization& counters) {
+  return CommandGuards().Build(commands, counters);
+}
 SyncNativeReservations SyncNativeClaims(const CompactSyncInput& input, const std::string& target) {
   return NativeClaims(input, target);
 }
@@ -711,6 +1128,7 @@ FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterB
   CHECK(owner && !cases.empty()) << "Missing complete invocation case owner";
   const auto block = cases.size() > 1 ? DominatingSyncBlock(owner) : nullptr;
   CutInventory cuts;
+  AbsentLoops absent;
   auto next = blocks.first;
   for (const auto& item : cases) {
     CHECK(item.input && item.plan && item.input->owner == owner &&
@@ -719,13 +1137,29 @@ FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterB
           item.input->block_bounds->second < std::numeric_limits<int64_t>::max())
         << "Invocation cases must retain exhaustive original owners and contracts";
     next = item.input->block_bounds->second + 1;
-    const auto guard = SyncInvocationGuard(block, blocks, *item.input->block_bounds, owner->span_);
-    Emitter(*item.input, *item.plan).AppendCuts(cuts, guard);
+    if (item.input->region_tree)
+      RetainAbsentLoops(*item.input->region_tree, *item.input->block_bounds, absent);
+    Emitter(*item.input, *item.plan).AppendCuts(cuts, *item.input->block_bounds);
   }
   CHECK(next == blocks.second + 1) << "Incomplete invocation activation domain";
+  auto& control_work = *cases.front().plan;
+  CutDomains(absent, cuts, blocks, control_work).VisitStmt(owner->body_);
+  // Original initialization/accumulation calls can name the same cut. Freeze
+  // it once, after all domains have been checked. A union guard is omitted only
+  // when the identical sequence covers the cut's entire possible execution
+  // domain. Unknown domains retain the previous whole-invocation behavior.
+  std::set<const PhysicalCuts*> finalized;
+  for (const auto& [anchor, cut] : cuts) {
+    if (!finalized.insert(cut.get()).second) continue;
+    auto emit = [&](const std::vector<CaseCommands>& source, std::vector<StmtPtr>& target) {
+      target = EmitSyncCommandCases(block, cut->domain, source, control_work, owner->span_);
+    };
+    emit(cut->before_cases, cut->before);
+    emit(cut->after_cases, cut->after);
+  }
   // Exclusive cases share palettes only within this original invocation.
   // Guarded cuts contain endpoint/ID arithmetic as well as SET/WAIT commands.
-  return InvocationEmitter(cuts).VisitFunction(owner);
+  return InvocationEmitter(cuts, owner, control_work).VisitFunction(owner);
 }
 PhysicalSyncInvocation RealizePhysicalInvocation(const SyncInvocationAnalysis& analysis,
                                                  const std::string& target,

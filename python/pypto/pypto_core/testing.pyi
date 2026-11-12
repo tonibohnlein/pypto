@@ -15,7 +15,18 @@ Internal testing utilities (do not use in production)
 
 from typing import Any, Literal, NoReturn, TypedDict
 
-from .ir import BufferAccess, BufferResultBehavior, Call, Expr, Function, OpIRStage, PipeType, Program, Type
+from .ir import (
+    BufferAccess,
+    BufferResultBehavior,
+    Call,
+    Expr,
+    Function,
+    OpIRStage,
+    PipeType,
+    Program,
+    Stmt,
+    Type,
+)
 
 def validate_buffer_op_contract(
     stage: OpIRStage,
@@ -182,6 +193,9 @@ class PhysicalSyncRealization(TypedDict):
     wait_sites: int
     barrier_sites: int
     guard_sites: int
+    constructed_guard_sites: int
+    shared_guard_sites: int
+    control_statement_visits: int
     reuse_queries: int
     reserved_lanes: int
     native_reserved_ids: list[tuple[PipeType, PipeType, int]]
@@ -311,7 +325,7 @@ def describe_placed_sync_input(
 
 class SyncInvocationAnalysis:
     def realize_physical(self, target: str, eligible_ids: list[int] | None = None) -> dict[str, Any]:
-        """Qualify all cases and aggregate guarded command cuts in the original IR."""
+        """Qualify cases and emit cuts; case_sites precede coalescing, top-level counts follow it."""
         ...
     def select_case(self, block_index: int, parameters: dict[int, int]) -> CompactSyncAnalysis | None:
         """Return retained mathematics only for an admitted fully bound invocation."""
@@ -357,3 +371,16 @@ class ScopedTokenOrder:
     def realize(self, target: str = "a2a3") -> Function: ...
 
 def analyze_scoped_token_order(function: Function, target: str = "a2a3") -> ScopedTokenOrder: ...
+def share_sync_command_guards(commands: Stmt) -> Stmt:
+    """Test emitter-only pure coordinate-guarded physical commands, with no definitions or payloads."""
+    ...
+
+def materialize_sync_command_values(owner: Function, commands: Stmt) -> Stmt:
+    """Test sharing of pure emitter-owned predicates inside their original command scope."""
+    ...
+
+def emit_sync_command_cases(
+    block: Expr, possible: list[tuple[int, int]], cases: list[tuple[int, int, Stmt]]
+) -> Stmt:
+    """Test command cases against a supplied possible cut domain; unknown requires the full domain."""
+    ...

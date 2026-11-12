@@ -30,10 +30,10 @@ class SyncTokenNames : public var_collectors::VarDefUseCollector {
     ++visits;
     if (expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
   }
-  std::string Next() {
+  std::string Next(const std::string& prefix = "sync_completion_") {
     std::string name;
     do {
-      name = "sync_completion_" + std::to_string(next_++);
+      name = prefix + std::to_string(next_++);
     } while (!names_.insert(name).second);
     return name;
   }

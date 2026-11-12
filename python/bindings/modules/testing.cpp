@@ -50,6 +50,7 @@
 #include "pypto/ir/function.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/dsa/allocation_plan.h"
 #include "pypto/ir/transforms/dsa/reuse_penalty_recognizer.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
@@ -57,6 +58,7 @@
 #include "pypto/ir/transforms/utils/finite_sync_analysis.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/scoped_token_families.h"
 #include "src/ir/transforms/utils/scoped_token_order.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
@@ -566,6 +568,25 @@ bool IsNoDuplicateOpForTesting(const std::string& op_name) {
 // Module binding
 // ============================================================================
 
+// Diagnostics count final emitted sites separately from per-case construction.
+// Original payload guards are included in if_sites, but excluded from the
+// added guard_sites field below by subtracting the unchanged owner's census.
+class PhysicalControlCensus : public ir::IRVisitor {
+ public:
+  size_t sets = 0, waits = 0, barriers = 0, branches = 0;
+  void VisitStmt_(const ir::IfStmtPtr& statement) override {
+    ++branches;
+    ir::IRVisitor::VisitStmt_(statement);
+  }
+  void VisitStmt_(const ir::EvalStmtPtr& statement) override {
+    const auto call = ir::As<ir::Call>(statement->expr_);
+    if (ir::IsOp(call, "system.set_flag")) ++sets;
+    if (ir::IsOp(call, "system.wait_flag")) ++waits;
+    if (ir::IsOp(call, "system.bar_m") || ir::IsOp(call, "system.bar_v")) ++barriers;
+    ir::IRVisitor::VisitStmt_(statement);
+  }
+};
+
 nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   nb::dict out;
   out["function"] = result.function;
@@ -573,6 +594,16 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   out["wait_sites"] = result.wait_sites;
   out["barrier_sites"] = result.barrier_sites;
   out["guard_sites"] = result.guard_sites;
+  out["constructed_guard_sites"] =
+      result.guard_sites + result.shared_guard_sites + result.simplified_guard_sites;
+  out["shared_guard_sites"] = result.shared_guard_sites;
+  out["control_statement_visits"] = result.control_statement_visits;
+  out["simplified_guard_sites"] = result.simplified_guard_sites;
+  out["shared_control_values"] = result.shared_control_values;
+  out["cut_domain_interval_visits"] = result.cut_domain_interval_visits;
+  out["cut_case_comparisons"] = result.cut_case_comparisons;
+  out["coalesced_cut_cases"] = result.coalesced_cut_cases;
+  out["control_expression_visits"] = result.control_expression_visits;
   out["reuse_queries"] = result.reuse_queries;
   out["reserved_lanes"] = result.reserved_lanes;
   out["native_reserved_ids"] = result.native_reserved_ids;
@@ -600,6 +631,34 @@ void BindTesting(nb::module_& m) {
   // Create a protected submodule for testing utilities
   // This will be accessible as pypto.testing in Python
   nb::module_ testing = m.def_submodule("testing", "Internal testing utilities (do not use in production)");
+
+  testing.def(
+      "share_sync_command_guards",
+      [](const ir::StmtPtr& commands) {
+        PhysicalControlCensus census;
+        census.VisitStmt(commands);
+        ir::sync::PhysicalSyncRealization counters;
+        counters.guard_sites = census.branches;
+        const auto output = ir::sync::ShareSyncCommandGuards({commands}, counters);
+        return std::make_shared<ir::SeqStmts>(output, commands->span_);
+      },
+      nb::arg("commands"),
+      "Test the emitter helper on pure coordinate-guarded physical commands; not arbitrary IR");
+  testing.def("materialize_sync_command_values", &ir::sync::MaterializeSyncCommandValues, nb::arg("owner"),
+              nb::arg("commands"), "Emitter-only pure command value sharing");
+  testing.def(
+      "emit_sync_command_cases",
+      [](const ir::ExprPtr& block, const std::vector<std::pair<int64_t, int64_t>>& possible,
+         const std::vector<std::tuple<int64_t, int64_t, ir::StmtPtr>>& supplied) {
+        std::vector<ir::sync::SyncCommandCase> cases;
+        for (const auto& [lo, hi, body] : supplied) cases.push_back({{lo, hi}, body});
+        ir::sync::PhysicalSyncRealization work;
+        return std::make_shared<ir::SeqStmts>(
+            ir::sync::EmitSyncCommandCases(block, possible, cases, work, ir::Span::unknown()),
+            ir::Span::unknown());
+      },
+      nb::arg("block"), nb::arg("possible"), nb::arg("cases"),
+      "Emitter-only case aggregation under a supplied possible cut domain; unknown means full domain");
 
   testing.def("validate_buffer_op_contract", &ValidateBufferOpContractForTesting, nb::arg("stage"),
               nb::arg("arity").none(), nb::arg("args"), nb::arg("result_type"), nb::arg("effects"),
@@ -813,10 +872,22 @@ void BindTesting(nb::module_& m) {
               guards += result.cases[i].guard_sites;
             }
             out["cases"] = cases;
-            out["set_sites"] = sets;
-            out["wait_sites"] = waits;
-            out["barrier_sites"] = barriers;
-            out["guard_sites"] = guards;
+            nb::dict case_sites;
+            case_sites["set_sites"] = sets;
+            case_sites["wait_sites"] = waits;
+            case_sites["barrier_sites"] = barriers;
+            case_sites["guard_sites"] = guards;
+            out["case_sites"] = case_sites;
+            PhysicalControlCensus emitted, original;
+            emitted.VisitFunction(result.function);
+            original.VisitFunction(analysis.owner);
+            INTERNAL_CHECK(emitted.branches >= original.branches)
+                << "Internal error: invocation payload guards changed";
+            out["set_sites"] = emitted.sets;
+            out["wait_sites"] = emitted.waits;
+            out["barrier_sites"] = emitted.barriers;
+            out["guard_sites"] = emitted.branches - original.branches;
+            out["if_sites"] = emitted.branches;
             return out;
           },
           nb::arg("target"), nb::arg("eligible_ids") = nb::none(),

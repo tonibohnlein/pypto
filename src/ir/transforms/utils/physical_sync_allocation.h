@@ -58,6 +58,26 @@ FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterB
                                   std::pair<int64_t, int64_t> blocks,
                                   const std::vector<AssignedSyncCase>& cases);
 
+// Internal emitter utility, not a general IR canonicalizer. Inputs contain
+// only physical command leaves, sequences and guards over ready immutable
+// original coordinates; no definitions, payloads or effectful conditions.
+// Counters must already include the input guards. Else-bearing trees are opaque.
+std::vector<StmtPtr> ShareSyncCommandGuards(const std::vector<StmtPtr>& commands,
+                                            PhysicalSyncRealization& counters);
+struct SyncCommandCase {
+  std::pair<int64_t, int64_t> blocks;
+  StmtPtr body;
+};
+// possible is a normalized conservative upper domain of the original cut.
+// Use the entire launch domain when evidence is unavailable, never an empty list.
+std::vector<StmtPtr> EmitSyncCommandCases(const ExprPtr& block,
+                                          const std::vector<std::pair<int64_t, int64_t>>& possible,
+                                          const std::vector<SyncCommandCase>& cases,
+                                          PhysicalSyncRealization& work, const Span& span);
+// Same emitter-only precondition as ShareSyncCommandGuards. The owner supplies
+// name reservations; definitions stay inside the original command scope.
+StmtPtr MaterializeSyncCommandValues(const FunctionPtr& owner, const StmtPtr& commands);
+
 // Publish only an established complete physical owner (literal SET and WAIT),
 // or an explicit delegation outcome. This does not qualify or allocate a plan.
 FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::string& reason);

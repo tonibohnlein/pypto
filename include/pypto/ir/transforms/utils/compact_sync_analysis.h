@@ -339,6 +339,14 @@ struct PhysicalSyncRealization {
   FunctionPtr function;
   std::vector<PhysicalSyncFamily> families;
   size_t set_sites = 0, wait_sites = 0, barrier_sites = 0, guard_sites = 0;
+  // Per-case command sites after local prefix sharing, before invocation-case
+  // coalescing. The invocation diagnostic separately counts final emitted IR.
+  size_t shared_guard_sites = 0, control_statement_visits = 0;
+  size_t simplified_guard_sites = 0, shared_control_values = 0;
+  // Invocation-wide domain/materialization work is charged to the first case.
+  // Expression visits count our inspections, not internals of the arith analyzer.
+  size_t cut_domain_interval_visits = 0, cut_case_comparisons = 0, coalesced_cut_cases = 0;
+  size_t control_expression_visits = 0;
   size_t reuse_queries = 0, reserved_lanes = 0;
   std::vector<std::tuple<PipeType, PipeType, int>> native_reserved_ids;  // Fixed macro owners.
   bool finite_minimum = true;
