@@ -31,6 +31,18 @@ FIXTURES = Path(__file__).parent / "fixtures" / "qwen_prefill"
 MANIFEST = json.loads((FIXTURES / "manifest.json").read_text())
 
 
+def source_body_ast(tree: ast.AST) -> str:
+    """Pin empty fields explicitly instead of inheriting ast.dump defaults.
+
+    Python 3.13 added show_empty and later defaults omit empty fields. Older
+    interpreters always include them. Keep the fixture fingerprint identical
+    across the host and device Python versions without removing AST content.
+    """
+    if sys.version_info >= (3, 13):
+        return ast.dump(tree, include_attributes=False, show_empty=True)
+    return ast.dump(tree, include_attributes=False)
+
+
 def _load(name: str, path: Path, namespace: dict[str, Any] | None = None) -> ModuleType:
     spec = importlib.util.spec_from_loader(name, SourceFileLoader(name, str(path)))
     assert spec is not None and spec.loader is not None
@@ -139,7 +151,7 @@ def assert_gate_up_body_identity() -> None:
                 )
                 for item in node.items
             ):
-                return ast.dump(ast.Module(body=node.body, type_ignores=[]), include_attributes=False)
+                return source_body_ast(ast.Module(body=node.body, type_ignores=[]))
         raise AssertionError("Missing original combined gate/up launch")
 
     assert body(original) == body(adapted)
