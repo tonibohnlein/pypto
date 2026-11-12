@@ -60,6 +60,7 @@ PipeType Pipe(const CallPtr& call, const char* key) {
 // the parser certifies all actual token cuts, for shared direct-cut emission.
 class Erase : public IRMutator {
  public:
+  explicit Erase(bool allow_nested = false) : allow_nested_(allow_nested) {}
   std::map<const ForStmt*, ForStmtPtr> loops;
 
  protected:
@@ -87,15 +88,16 @@ class Erase : public IRMutator {
     return op;
   }
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
-    CHECK(!active_) << "LowerSync nested token frames are unavailable";
+    CHECK(allow_nested_ || !active_) << "LowerSync nested token frames are unavailable";
     CHECK(op->iter_args_.size() == op->return_vars_.size()) << "Token loop result arity mismatch";
     for (const auto& arg : op->iter_args_)
       CHECK(As<SyncTokenType>(arg->GetType())) << "LowerSync non-token loop carries are unavailable";
     for (const auto& var : op->return_vars_)
       CHECK(As<SyncTokenType>(var->GetType())) << "LowerSync non-token loop results are unavailable";
+    const bool parent = active_;
     active_ = true;
     auto body = VisitStmt(op->body_);
-    active_ = false;
+    active_ = parent;
     auto loop =
         std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_, std::vector<IterArgPtr>{},
                                   body, std::vector<VarPtr>{}, op->span_, op->kind_, op->attrs_,
@@ -111,6 +113,7 @@ class Erase : public IRMutator {
 
  private:
   bool active_ = false;
+  bool allow_nested_;
 };
 enum class BindingKind { Completed, Current, Previous, Final, Captured };
 struct Binding {
@@ -469,12 +472,16 @@ class Order {
   std::unique_ptr<SyncBoundaryGraph> graph_;
 };
 }  // namespace
+StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool allow_nested) {
+  Erase erase(allow_nested);
+  auto stripped = erase.VisitFunction(function);
+  return {std::move(stripped), std::move(erase.loops)};
+}
 PhysicalSyncRealization LowerStructuredLogicalSync(const FunctionPtr& function, const std::string& target,
                                                    const std::optional<std::vector<int>>& eligible) {
-  Erase erase;
-  auto stripped = erase.VisitFunction(function);
-  auto input = ImportPlacedSync(stripped, true, target);
-  auto families = Parse(function, input, erase.loops).Run();
+  auto stripped = StripStructuredLogicalSync(function, false);
+  auto input = ImportPlacedSync(stripped.function, true, target);
+  auto families = Parse(function, input, stripped.loops).Run();
   Order order(input, families);
   return RealizeDirectSync(input, std::move(families), order.View(), target, eligible);
 }

@@ -1,0 +1,80 @@
+{
+  "checkpoint": "M3c actual scoped-token family interpretation",
+  "parent": "a65b0cadc4eea9254deebf6d762ebcb20c689d89",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "scope": "diagnostic consumer; nested production LowerSync remains unavailable",
+  "input_fixtures": "test_scoped_token_families.py: collective, nested resets, resident operands, nonunit frames and manual token amendments",
+  "gate": {
+    "passed": 232,
+    "warnings": 2,
+    "seconds": 191.29,
+    "files": [
+      "test_scoped_token_families.py",
+      "test_scoped_logical_sync.py",
+      "test_token_sync_lowering.py",
+      "test_structured_token_sync.py",
+      "test_rotating_token_sync.py",
+      "test_crossing_token_sync.py",
+      "test_scoped_physical_sync.py"
+    ],
+    "log_sha256": "8b074684f5246e3084810ff255c0685f51aac1d3f54f6e887202edcf293e33a9",
+    "command": "PYTHONPATH=python OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 /usr/bin/python3 -m pytest <files under tests/ut/ir/transforms/> -q --basetemp=build-py314/pytest-token-m3c --junitxml=build-py314/token-m3c-tests.xml"
+  },
+  "build_command": "cmake --build build-py314 --parallel 1",
+  "reviews": {
+    "architecture": "accepted for interpretation only",
+    "correctness": "accepted for interpretation only",
+    "algorithm": "accepted for interpretation only"
+  },
+  "scaling": {
+    "rows": [
+      3,
+      1000,
+      1000000
+    ],
+    "outer_visits": [
+      3,
+      1000
+    ],
+    "inner_visits": [
+      3,
+      1000000
+    ],
+    "families": 3,
+    "axes": 5,
+    "claim": "bounded interface size; no timing speedup claim"
+  },
+  "validation": "expanded family-use multiset equals independently executed actual SSA uses, including edited capture/guard/duplicate cases; no compiler demand edges used",
+  "allocation": "unchanged; not qualified for nested token path",
+  "device": "not run",
+  "source_before_format": {
+    "python/bindings/modules/testing.cpp": "44a53d90906b0f136d2a784c24f45bb928cb38664f9ed55f61ab68069f322b25",
+    "python/pypto/pypto_core/testing.pyi": "4d231dda836a7a642383a5c79159513cfda21ed45fee03018f929013d200c5b3",
+    "src/ir/transforms/utils/structured_token_sync.cpp": "267913ff2e1da87473d30cd66699ab0d5c5e6f3cfc30104e8fe7085eb5df0692",
+    "src/ir/transforms/utils/token_sync_lowering.h": "7731d3739cbee14926896554e57d35dbf2613dca41c1ab6ef9f8c9bf19a0b3b6",
+    "src/ir/transforms/utils/scoped_token_families.cpp": "ef793c4e20cdb1930eb9165f8d0d48afa51ab5326a90270e8da7e642fe4273f0",
+    "src/ir/transforms/utils/scoped_token_families.h": "6af6e270c07c6271d3bfae7ceee6d23ae289111e5ecc17e34e68f167e29e3a9a",
+    "tests/ut/ir/transforms/test_scoped_token_families.py": "94dca99d9f4564d4018259144da49bc5e0418a467d6313eee7e42c5c6005f08a"
+  },
+  "extension_before_format_sha256": "132bcffbb1cca0c80b4ef10148e2712b18a9ba942f50c0c6c91f03ac4e78f538",
+  "post_format_gate": {
+    "passed": 193,
+    "seconds": 9.86,
+    "log_sha256": "aee215c8db3be7faed302e890a7df388d74157a66eee8a42a38115aa5840130c"
+  },
+  "final_source": {
+    "python/bindings/modules/testing.cpp": "730b8e26bb11604d065d8060ebd3425b49cc07465fcee4894b7914af29defbe4",
+    "python/pypto/pypto_core/testing.pyi": "4d231dda836a7a642383a5c79159513cfda21ed45fee03018f929013d200c5b3",
+    "src/ir/transforms/utils/structured_token_sync.cpp": "267913ff2e1da87473d30cd66699ab0d5c5e6f3cfc30104e8fe7085eb5df0692",
+    "src/ir/transforms/utils/token_sync_lowering.h": "7731d3739cbee14926896554e57d35dbf2613dca41c1ab6ef9f8c9bf19a0b3b6",
+    "src/ir/transforms/utils/scoped_token_families.cpp": "622a52e2436c17842004d5e67e9d0e9bf863f59b88e1b2ee9c98fdb7543d1bb5",
+    "src/ir/transforms/utils/scoped_token_families.h": "6af6e270c07c6271d3bfae7ceee6d23ae289111e5ecc17e34e68f167e29e3a9a",
+    "tests/ut/ir/transforms/test_scoped_token_families.py": "5f0824876b64ffe056f17f91877a1f4629996deb48fe834c07c6afb1ceb3ad0d"
+  },
+  "extension_sha256": "05f01aeb1b2efe0a2c02b6f44a2dd8901aa8f22f198c03462f7de9c419f6a8e2",
+  "hooks": {
+    "result": "passed",
+    "log_sha256": "2b62d659dd4b75ba968b9871dceecb9d7cde89615ba4d73151fbf6ad8eb47bee",
+    "pyright_environment": "Python3.11 compatible hook config; no skipped checks"
+  }
+}

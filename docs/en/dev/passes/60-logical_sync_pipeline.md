@@ -205,6 +205,38 @@ Single-run production insertion measurements are descriptive, not speedup eviden
   --output build-py314/token-m3b-qualification.json
 ```
 
+### Interpreting scoped token uses
+
+The diagnostic `testing.inspect_scoped_token_families` interprets the actual
+scoped SSA program under an explicit disjoint-GM test contract. It verifies
+logical SSA, strips only qualified pure token constructs, and reuses the placed
+importer to identify original payloads and frames. No storage-demand reducer is
+called. The returned direct-cut families have no assigned physical IDs.
+
+A token pattern retains its source and original mixed-radix coordinates. Its
+validity domain is exactly where it is non-completed. Completed initialization,
+simultaneous carries and pure own-carry captures establish this invariant.
+Consequently, intersecting an actual wait guard with that domain removes only
+waits on completed facts. Guard conditions must describe exact rectangular
+intervals in active original frames. Duplicated waits remain duplicated handoffs.
+Source fanout that cannot be expressed by an injective common-prefix family is
+unavailable, as are intermediate capture uses and displaced direct cuts.
+
+The unary equation resolver is iterative and memoized. With T equations, U uses
+and depth D, pattern storage/copying is `O(TD)` plus indexed lookups, and family
+construction is `O(UD log(D+2))`. Payload scope checks visit D frames. Guard work
+is charged per condition, including repeated use of a shared guard and copying
+nested domain maps; there is no global guard-DAG-linear claim. No trip count is
+unfolded. Separate importer and verifier costs still apply.
+
+This interpretation can describe clipped intervals and longer histories than the
+current insertion subset. It does **not** certify uniform repeated order or
+physical reuse. Those require separate proofs before nested physical lowering
+can be enabled. The independent tests compare every expanded family use with
+actual SSA execution, including changed captures, narrowed or removed guards,
+completed entry, duplicate waits, serialization and resets. The
+[interpretation receipt](../ir/token-pipeline-m3c.json) pins the tested increment.
+
 ## Migration and guarantees
 
 `realize_sync()` retains the existing production implementation until all

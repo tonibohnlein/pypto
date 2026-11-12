@@ -324,3 +324,7 @@ def analyze_sync_invocation(
 ) -> SyncInvocationAnalysis:
     """Construct qualified cases over the entire supplied launch contract."""
     ...
+
+def inspect_scoped_token_families(function: Function, target: str = "a2a3") -> dict[str, Any]:
+    """Inspect actual token families with disjoint GM roots; no reduction or allocation."""
+    ...

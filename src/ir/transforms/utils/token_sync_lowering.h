@@ -12,6 +12,7 @@
 #ifndef SRC_IR_TRANSFORMS_UTILS_TOKEN_SYNC_LOWERING_H_
 #define SRC_IR_TRANSFORMS_UTILS_TOKEN_SYNC_LOWERING_H_
 
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,6 +20,13 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 
 namespace pypto::ir::sync {
+// Original payload/native import for token consumers. The returned loop map
+// preserves correspondence to the token IR; it does not retain demand analysis.
+struct StrippedLogicalSync {
+  FunctionPtr function;
+  std::map<const ForStmt*, ForStmtPtr> loops;
+};
+StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool allow_nested);
 bool HasLogicalSync(const FunctionPtr& function);
 PhysicalSyncRealization LowerStructuredLogicalSync(const FunctionPtr& function, const std::string& target,
                                                    const std::optional<std::vector<int>>& eligible_ids);

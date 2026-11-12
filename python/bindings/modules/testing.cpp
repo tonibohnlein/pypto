@@ -55,6 +55,9 @@
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/finite_sync_analysis.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/scoped_token_families.h"
+#include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace nb = nanobind;
 
@@ -711,6 +714,44 @@ void BindTesting(nb::module_& m) {
            nb::arg("column"), nb::arg("parameters") = std::map<size_t, int64_t>{},
            nb::arg("block_index") = nb::none(),
            "Exact modeled point selector with explicit physical slot identity");
+  testing.def(
+      "inspect_scoped_token_families",
+      [](const ir::FunctionPtr& function, const std::string& target) {
+        ir::CheckLogicalSync(function);
+        auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
+        const auto input = ir::sync::ImportPlacedSync(stripped.function, true, target);
+        const auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops);
+        nb::dict out;
+        out["function"] = stripped.function;
+        nb::list rows, regions;
+        for (const auto& family : families) {
+          nb::dict row;
+          row["source"] = nb::make_tuple(family.source_region, family.source_first, family.source_site);
+          row["target"] = nb::make_tuple(family.target_region, family.target_first, family.target_site);
+          row["count"] = family.count;
+          nb::list axes;
+          for (const auto& axis : family.axes)
+            axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));
+          row["axes"] = axes;
+          rows.append(row);
+        }
+        for (const auto& segment : input.segments) {
+          nb::dict region;
+          nb::list sites, frames;
+          for (const auto& site : segment.sites)
+            sites.append(nb::make_tuple(site.original, site.continuation));
+          for (const auto& frame : segment.nested_frames)
+            frames.append(nb::make_tuple(frame.loop, frame.count, frame.start, frame.step));
+          region["sites"] = sites;
+          region["frames"] = frames;
+          regions.append(region);
+        }
+        out["families"] = rows;
+        out["regions"] = regions;
+        return out;
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3",
+      "Inspect actual scoped token handoffs under the explicit disjoint-GM test contract; no allocation");
   nb::class_<ir::sync::SyncInvocationAnalysis>(testing, "SyncInvocationAnalysis")
       .def(
           "realize_physical",
