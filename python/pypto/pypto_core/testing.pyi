@@ -325,7 +325,12 @@ def analyze_sync_invocation(
     """Construct qualified cases over the entire supplied launch contract."""
     ...
 
-def inspect_scoped_token_families(function: Function, target: str = "a2a3") -> dict[str, Any]:
+def inspect_scoped_token_families(
+    function: Function,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+    block_bounds: tuple[int, int] | None = None,
+) -> dict[str, Any]:
     """Inspect actual token families with disjoint GM roots; no reduction or allocation."""
     ...
 

@@ -13,9 +13,10 @@ import pytest
 from pypto import codegen, ir, passes, testing
 from pypto.backend.pto_backend import _run_ptoas
 
+from .sync_logical_oracle import CommandExecution, same_payload
 from .sync_matmul_cases import capture
 from .sync_matmul_oracle import hardware_reference, interpret, validate
-from .sync_physical_oracle import PhysicalExecution, run_physical
+from .sync_physical_oracle import PhysicalExecution
 from .sync_prefill_cases import capture_prefill
 from .test_nested_sync_repetition import resident_pipeline_tree
 from .test_scoped_logical_sync import dynamic_collective
@@ -53,8 +54,25 @@ def check(original, logical, physical, parameters, *, block=None, minimum_protoc
     assert len(flags.records) == len(flags.waits) == sum(tokens.uses.values())
     assert all(pair in graph for pair in flags.reuses)
     assert all(ids <= set(range(6)) for ids in flags.ids.values())
+    # Reuse this independently constructed concrete reference; recomputing its
+    # byte conflicts and covers through run_physical would only duplicate work.
     if minimum_protocol:
-        run_physical(original, physical, range(6), parameters, block_index=block)
+        assert actual == reference[2]
+        expected_pairs = {(a, b) for a, b in reference[3] if calls[a][2] != calls[b][2]}
+        assert flags.matched == expected_pairs
+        assert len(flags.waits) == len(expected_pairs)
+    descriptors = CommandExecution(calls, reference[0])
+    environment = {original.params[i]: v for i, v in parameters.items()}
+    if block is not None:
+        environment["__block_index__"] = block
+    descriptors.execute(original.body, environment)
+    for before, after in zip(descriptors.actual_allocations, flags.actual_allocations, strict=True):
+        same_payload(before, after)
+    for (before, selected), (after, actual_slot) in zip(
+        descriptors.actual_slots, flags.actual_slots, strict=True
+    ):
+        same_payload(before, after)
+        assert selected == actual_slot
 
 
 def callers(function, starts=(0, 8), *, unknown=False, blocks=None):
@@ -214,8 +232,7 @@ def test_dynamic_coordinate_guard_does_not_use_placeholder_zero():
         apply(passes.lower_sync, modified)
 
 
-@pytest.mark.parametrize("blocks", [8, 10])
-def test_block_dependent_start_requires_uniform_activation(blocks):
+def block_resident(blocks=10):
     original = resident_pipeline_tree(2, 2, 1)
     span = original.span
     parameter = ir.Var("unused_start", ir.ScalarType(ir.DataType.INDEX), span)
@@ -247,10 +264,25 @@ def test_block_dependent_start_requires_uniform_activation(blocks):
     )
     # The unused scalar parameter remains qualified; the block start now needs
     # its own explicit launch range. Eight blocks are all active; ten straddle.
-    program = callers(function, blocks=blocks)
+    return function, callers(function, blocks=blocks)
+
+
+@pytest.mark.parametrize("blocks", [8, 10])
+def test_block_dependent_start_requires_uniform_activation(blocks):
+    function, program = block_resident(blocks)
     if blocks == 10:
-        with pytest.raises(ValueError, match="guarded regional activation"):
-            apply(passes.insert_sync, program)
+        # Activation case transport is now explicit: both the active and
+        # empty intervals must lower from the same actual token program.
+        logical = apply(passes.insert_sync, program)
+        physical = apply(passes.lower_sync, logical)
+        for block in (0, 8, 9):
+            check(
+                function,
+                worker(logical, function.name),
+                worker(physical, function.name),
+                {len(function.params) - 1: 0},
+                block=block,
+            )
     else:
         logical = apply(passes.insert_sync, program)
         physical = apply(passes.lower_sync, logical)

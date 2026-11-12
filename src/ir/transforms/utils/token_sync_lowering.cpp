@@ -336,13 +336,13 @@ bool HasLogicalSync(const FunctionPtr& function) {
   logical.VisitFunction(function);
   return logical.found;
 }
-PhysicalSyncRealization LowerLogicalSync(const FunctionPtr& function, const std::string& target,
-                                         const std::optional<std::vector<int>>& eligible_ids,
-                                         const SyncParameterBounds& parameters,
-                                         std::optional<std::pair<int64_t, int64_t>> blocks) {
+LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::string& target,
+                                    const std::optional<std::vector<int>>& eligible_ids,
+                                    const SyncParameterBounds& parameters,
+                                    std::optional<std::pair<int64_t, int64_t>> blocks) {
   CheckLogicalSync(function);
   if (!HasLogicalSync(function)) {
-    PhysicalSyncRealization result;
+    LoweredLogicalSync result;
     result.function = function;
     return result;
   }
@@ -362,6 +362,7 @@ PhysicalSyncRealization LowerLogicalSync(const FunctionPtr& function, const std:
   // importer's GM partition is not used for conflicts, selectors or reuse;
   // token IR, including any manually supplied extra ordering, is authoritative.
   auto input = ImportPlacedSync(stripped, true, target, parameters, blocks);
-  return FiniteLowering(function, std::move(input), target, eligible_ids).Run();
+  auto result = FiniteLowering(function, std::move(input), target, eligible_ids).Run();
+  return {result.function, result.set_sites, result.wait_sites};
 }
 }  // namespace pypto::ir::sync

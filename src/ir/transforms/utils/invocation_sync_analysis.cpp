@@ -23,6 +23,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "src/ir/transforms/utils/sync_invocation_domains.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -237,18 +238,59 @@ class ActivationPartition {
   size_t PieceCount() const { return pieces_; }
 };
 }  // namespace
+SyncInvocationDomains PartitionSyncInvocation(const FunctionPtr& owner, const SyncParameterBounds& parameters,
+                                              std::pair<int64_t, int64_t> blocks) {
+  CHECK(owner && blocks.first >= 0 && blocks.second >= blocks.first &&
+        blocks.second < std::numeric_limits<int64_t>::max())
+      << "Invalid invocation launch contract";
+  ActivationPartition partition(owner, parameters, blocks);
+  auto intervals = partition.Build();
+  return {std::move(intervals), partition.Nodes(), partition.PieceCount()};
+}
+ExprPtr DominatingSyncBlock(const FunctionPtr& owner) {
+  const auto sequence = As<SeqStmts>(owner->body_);
+  if (!sequence) return nullptr;
+  for (const auto& statement : sequence->stmts_) {
+    const auto assign = As<AssignStmt>(statement);
+    if (!assign) break;
+    const auto call = As<Call>(assign->value_);
+    if (call && IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
+      const auto type = As<ScalarType>(assign->var_->GetType());
+      CHECK(type && type->dtype_ == DataType::INDEX) << "Invocation guard needs the original index binding";
+      return assign->var_;
+    }
+  }
+  return nullptr;
+}
+ExprPtr SyncInvocationGuard(const ExprPtr& block, std::pair<int64_t, int64_t> all,
+                            std::pair<int64_t, int64_t> selected, const Span& span) {
+  CHECK(all.first >= 0 && selected.first >= all.first && selected.second >= selected.first &&
+        selected.second <= all.second && all.second < std::numeric_limits<int64_t>::max())
+      << "Invalid invocation guard domain";
+  if (selected == all) return nullptr;
+  CHECK(block) << "Original dominating invocation block binding is unavailable";
+  ExprPtr guard;
+  if (selected.first > all.first)
+    guard = std::make_shared<Ge>(block, std::make_shared<ConstInt>(selected.first, DataType::INDEX, span),
+                                 DataType::BOOL, span);
+  if (selected.second < all.second) {
+    ExprPtr upper = std::make_shared<Lt>(
+        block, std::make_shared<ConstInt>(selected.second + 1, DataType::INDEX, span), DataType::BOOL, span);
+    guard = guard ? std::make_shared<And>(guard, upper, DataType::BOOL, span) : upper;
+  }
+  return guard;
+}
 SyncInvocationAnalysis AnalyzeSyncInvocation(const FunctionPtr& function, bool disjoint_gm,
                                              const std::string& target, const SyncParameterBounds& parameters,
                                              std::pair<int64_t, int64_t> blocks) {
   CHECK(function && blocks.first >= 0 && blocks.second >= blocks.first &&
         blocks.second < std::numeric_limits<int64_t>::max())
       << "Invalid invocation launch contract";
-  ActivationPartition partition(function, parameters, blocks);
-  const auto domains = partition.Build();
+  const auto domains = PartitionSyncInvocation(function, parameters, blocks);
   SyncInvocationAnalysis result{function, parameters, blocks, {}};
-  result.coordinate_nodes = partition.Nodes();
-  result.coordinate_pieces = partition.PieceCount();
-  for (const auto& domain : domains) {
+  result.coordinate_nodes = domains.coordinate_nodes;
+  result.coordinate_pieces = domains.coordinate_pieces;
+  for (const auto& domain : domains.intervals) {
     // Publish the whole owner only when EVERY nonempty case is qualified.
     // No successful subcase is a substitute for the original caller contract.
     auto input = ImportPlacedSync(function, disjoint_gm, target, parameters, domain);

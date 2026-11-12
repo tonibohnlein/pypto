@@ -18,6 +18,11 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 
 namespace pypto::ir::sync {
+struct ScopedTokenWork {
+  // Read() visits include enclosing nodes; nested wait-only traversal is
+  // counted separately at its wait leaves, not as additional Read() visits.
+  size_t statements = 0, waits_inspected = 0, inactive_waits = 0, families = 0;
+};
 // Interpret actual SSA token uses in original constant frames. Returned IDs are
 // empty: these are handoff identities/domains, not a physical certificate.
 // Precondition: logical SSA/schema is verified; input is imported from the
@@ -26,6 +31,6 @@ namespace pypto::ir::sync {
 // establishes neither translation-invariant order nor legal physical reuse.
 std::vector<PhysicalSyncFamily> ParseScopedTokenFamilies(
     const FunctionPtr& function, const CompactSyncInput& input,
-    const std::map<const ForStmt*, ForStmtPtr>& stripped_loops);
+    const std::map<const ForStmt*, ForStmtPtr>& stripped_loops, ScopedTokenWork* work = nullptr);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_SCOPED_TOKEN_FAMILIES_H_

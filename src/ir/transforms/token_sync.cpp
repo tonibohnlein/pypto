@@ -19,6 +19,7 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/scoped_logical_sync.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::pass {
@@ -54,6 +55,13 @@ Pass InsertSync() {
           auto block = evidence.block_indices.find(global->name_);
           const auto blocks =
               block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
+          if (blocks) {
+            const auto invocation = sync::AnalyzeSyncInvocation(function, true, target, parameters, *blocks);
+            function = invocation.cases.size() == 1
+                           ? sync::RealizeCompactSync(*invocation.cases.front().mathematics).function
+                           : sync::RealizeLogicalInvocation(invocation).function;
+            continue;
+          }
           auto input = sync::ImportPlacedSync(function, true, target, parameters, blocks);
           auto analysis = sync::AnalyzeCompactSync(std::move(input));
           function = sync::RealizeCompactSync(analysis).function;

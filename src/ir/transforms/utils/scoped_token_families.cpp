@@ -30,6 +30,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "src/ir/transforms/utils/sync_invocation_domains.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -100,8 +101,8 @@ CallPtr Payload(const StmtPtr& statement) {
 class Parser {
  public:
   Parser(const FunctionPtr& function, const CompactSyncInput& input,
-         const std::map<const ForStmt*, ForStmtPtr>& stripped)
-      : function_(function), input_(input) {
+         const std::map<const ForStmt*, ForStmtPtr>& stripped, ScopedTokenWork& work)
+      : function_(function), input_(input), work_(work) {
     CHECK(input.region_tree) << "Scoped token interpretation requires an original region tree";
     for (size_t r = 0; r < input.segments.size(); ++r) {
       const auto& segment = input.segments[r];
@@ -111,6 +112,7 @@ class Parser {
             << "Scoped token payload anchors must be distinct";
     }
     Register(*input.region_tree);
+    block_ = DominatingSyncBlock(function);
     for (const auto& [original, erased] : stripped) {
       // Import deliberately omits bodies of proved zero-trip frames. A
       // reachable missing frame is still rejected by Read, before its body.
@@ -128,14 +130,19 @@ class Parser {
       auto pattern = Resolve(use.wait.token);
       if (!pattern.source) continue;
       auto family = Family(pattern, use);
-      if (family) output.push_back(std::move(*family));
+      if (family) {
+        output.push_back(std::move(*family));
+        ++work_.families;
+      }
     }
     return output;
   }
 
  private:
   FunctionPtr function_;
+  ExprPtr block_;
   const CompactSyncInput& input_;
+  ScopedTokenWork& work_;
   std::map<const Call*, Site> sites_;
   std::map<const ForStmt*, SyncLoopFrame> frames_;
   std::map<const Var*, const ForStmt*> variables_;
@@ -194,7 +201,42 @@ class Parser {
         << "Scoped token guard has an unavailable normalized coordinate";
     return {found->second, static_cast<int64_t>(delta / frame.step)};
   }
-  void Guard(const ExprPtr& condition, Domain& domain) const {
+  // Only the original dominating launch value may qualify invocation guards.
+  // A guard varying inside the complete case interval remains unproved.
+  std::optional<bool> InvocationPredicate(const ExprPtr& expression) const {
+    const auto binary = As<BinaryExpr>(expression);
+    const auto constant = binary ? As<ConstInt>(binary->right_) : nullptr;
+    if (!binary || !constant || !block_ || binary->left_ != block_) return std::nullopt;
+    CHECK(input_.block_bounds) << "Scoped invocation guard has no caller domain";
+    const auto [lo, hi] = *input_.block_bounds;
+    const auto n = constant->value_;
+    std::optional<bool> result;
+    if (As<Ge>(expression)) {
+      if (lo >= n)
+        result = true;
+      else if (hi < n)
+        result = false;
+    } else if (As<Lt>(expression)) {
+      if (hi < n)
+        result = true;
+      else if (lo >= n)
+        result = false;
+    } else if (As<Gt>(expression)) {
+      if (lo > n)
+        result = true;
+      else if (hi <= n)
+        result = false;
+    } else if (As<Eq>(expression)) {
+      if (lo == hi && lo == n)
+        result = true;
+      else if (n < lo || n > hi)
+        result = false;
+    }
+    CHECK(result.has_value()) << "Scoped invocation guard is not uniform over the complete case";
+    return result;
+  }
+  bool Guard(const ExprPtr& condition, Domain& domain) const {
+    bool enabled = true;
     std::vector<ExprPtr> pending{condition};
     std::set<const Expr*> seen;
     while (!pending.empty()) {
@@ -204,6 +246,10 @@ class Parser {
       if (auto both = As<And>(expression)) {
         pending.push_back(both->left_);
         pending.push_back(both->right_);
+        continue;
+      }
+      if (auto selected = InvocationPredicate(expression)) {
+        enabled &= *selected;
         continue;
       }
       const auto [frame, digit] = Coordinate(expression);
@@ -216,26 +262,30 @@ class Parser {
       else
         CHECK(false) << "Scoped token guard is not an exact supported interval";
     }
+    return enabled;
   }
-  void Waits(const StmtPtr& statement, const Domain& domain, Cursor& cursor) {
+  void Waits(const StmtPtr& statement, const Domain& domain, Cursor& cursor, bool enabled = true) {
     if (auto sequence = As<SeqStmts>(statement)) {
-      for (const auto& child : sequence->stmts_) Waits(child, domain, cursor);
+      for (const auto& child : sequence->stmts_) Waits(child, domain, cursor, enabled);
       return;
     }
     if (auto branch = As<IfStmt>(statement)) {
       CHECK(branch->return_vars_.empty() && !branch->else_body_) << "Unsupported scoped wait branch";
       auto selected = domain;
-      Guard(branch->condition_, selected);
-      Waits(branch->then_body_, selected, cursor);
+      const bool selected_case = Guard(branch->condition_, selected);
+      Waits(branch->then_body_, selected, cursor, enabled && selected_case);
       return;
     }
     const auto eval = As<EvalStmt>(statement);
     const auto call = eval ? As<Call>(eval->expr_) : nullptr;
     CHECK(IsOp(call, "sync.wait")) << "Conditional scoped token statement is not a wait";
-    cursor.pending.push_back({call->args_.at(0), Pipe(call, "dst_pipe"), domain});
+    ++work_.waits_inspected;
+    if (!enabled) ++work_.inactive_waits;
+    if (enabled) cursor.pending.push_back({call->args_.at(0), Pipe(call, "dst_pipe"), domain});
     cursor.last.reset();
   }
   void Read(const StmtPtr& statement, Cursor& cursor) {
+    ++work_.statements;
     if (auto sequence = As<SeqStmts>(statement)) {
       for (const auto& child : sequence->stmts_) Read(child, cursor);
       return;
@@ -489,7 +539,8 @@ class Parser {
 }  // namespace
 std::vector<PhysicalSyncFamily> ParseScopedTokenFamilies(
     const FunctionPtr& function, const CompactSyncInput& input,
-    const std::map<const ForStmt*, ForStmtPtr>& stripped_loops) {
-  return Parser(function, input, stripped_loops).Run();
+    const std::map<const ForStmt*, ForStmtPtr>& stripped_loops, ScopedTokenWork* work) {
+  ScopedTokenWork local;
+  return Parser(function, input, stripped_loops, work ? *work : local).Run();
 }
 }  // namespace pypto::ir::sync

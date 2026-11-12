@@ -320,9 +320,9 @@ qualification and the runtime return-boundary contract remain separate.
 ## Caller evidence and dynamic singleton frames
 
 Both passes consume explicit caller ranges, including the complete logical
-block-index hull. A scope is admitted only when that whole hull supports the
-same imported representation. This increment does not split activation cases;
-a hull straddling an active/inactive boundary remains unavailable.
+block-index hull. A uniform scope is admitted when the whole hull supports the same imported
+representation. Block-dependent hulls straddling activation boundaries use the
+analytic partition described below; other varying domains remain unavailable.
 
 For an invocation-invariant dynamic start, the existing importer can prove
 uniform zero or one visits. Scoped token insertion and lowering preserve the
@@ -345,5 +345,47 @@ twice. Existing expression-cache invalidations and call-graph work are included;
 there is no global one-visit-per-expression cost claim. No loop visits or caller
 values are enumerated. The unchanged PyPTO-lib matmul/GEMM, dynamic zero/singleton
 frames, changed caller refusals, edited uses and original coordinates have bounded
-independent token/flag checks. Full Qwen activation partition transport remains
-separate from this uniform-hull support.
+independent token/flag checks. The activation transport described below extends this uniform-hull support.
+
+## Invocation activation cases
+
+The existing analytic activation partition is now shared independently of demand
+analysis. It provides exhaustive, disjoint block-index intervals with checked
+original-type arithmetic. Insertion qualifies each interval, then merges its
+source-keyed token cuts and loop transports onto one original payload tree.
+Records at the same original payload macro share a completion fact; each case's
+carry/capture variables remain distinct. Every wait, including same-pipe waits,
+has its exact invocation guard. Records and state updates are non-consuming.
+
+Unused case state must still be defined over the full invocation domain. Records
+remain after dominating original payload macros, carries start completed, and
+zero-trip results stay completed. Captures compare original constant coordinates;
+a proved dynamic singleton exports its original start expression. No record is
+moved inside one initialization arm. These restrictions make inactive state total
+without evaluating skipped payload work or manufacturing branch history.
+
+Lowering strips tokens only to import the original payload/native contract and
+re-establish activation domains. For each domain it interprets actual SSA uses.
+A comparison of the original dominating block value is accepted only when proved
+true or false over the complete interval. Nonuniform edited guards refuse; no
+case label, token name or insertion sidecar supplies semantics. Inactive waits
+produce no physical families, while actual duplicate uses remain distinct.
+
+Each case uses the existing allocator with its own immutable coordinate owner.
+Shared cut emission guards both commands and endpoint arithmetic. Exhaustive
+exclusive invocation guards permit palettes to be shared between cases, under
+the unchanged fresh-entry/closed-notification native contract. No allocation
+algorithm or hardware exception changes. A failing case refuses the whole result.
+
+For C cases, N original statements and T total overlaid token state, repeated
+case traversal has an `O(C(N+T))` input cost; T can itself grow with C. Frame-depth,
+guard-domain processing, numerical order summaries, access import and allocation
+retain their separate costs. This is not a constant-cost claim for arbitrary
+activation partitions. The diagnostic token inventory reports parser Read visits, waits
+inspected, invocation-case-disabled waits and emitted families. Read visits exclude
+the nested wait-only traversal, whose wait leaves are counted separately; skipped
+zero-trip bodies and empty loop-coordinate domains are not case-disabled waits. No visit count is unfolded.
+
+Default production orchestration still uses its established route during this
+migration. Standalone activation transport does not establish native return
+completion or device correctness.

@@ -26,14 +26,15 @@
 
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/verifier/sync.h"
-#include "src/ir/transforms/utils/sync_placement.h"
+#include "src/ir/transforms/utils/sync_invocation_domains.h"
+#include "src/ir/transforms/utils/sync_statement_rewrite.h"
 #include "src/ir/transforms/utils/sync_token_names.h"
 
 namespace pypto::ir::sync {
 namespace {
-using Site = SyncSiteKey;
 struct Coordinates {
   std::vector<int64_t> digits, strides;
 };
@@ -77,34 +78,64 @@ struct Incoming {
   ExprPtr token, condition;
 };
 
-class ScopedRealizer : public SyncPlacement {
+struct LogicalCut {
+  PipeType pipe;
+  VarPtr record;
+  std::vector<Incoming> incoming;
+};
+class ScopedRealizer : public IRMutator {
  public:
-  explicit ScopedRealizer(const CompactSyncResult& analysis)
-      : SyncPlacement(analysis.input), names_(analysis.input.owner) {
+  explicit ScopedRealizer(const FunctionPtr& owner) : names_(owner) {
     result.name_scan_visits = names_.visits;
     result.name_scan_nodes = names_.Nodes();
-    std::function<void(const SyncRegion&)> collect = [&](const SyncRegion& region) {
-      if (region.repetition && !region.repetition->count) absent_.insert(region.repetition->loop.get());
-      for (const auto& child : region.children) collect(child);
-    };
-    collect(*analysis.input.region_tree);
-    for (const auto& segment : input_.segments)
+  }
+  void Append(const CompactSyncResult& analysis, const ExprPtr& guard = nullptr) {
+    CHECK(analysis.input.region_tree) << "Scoped logical transport requires an original region tree";
+    for (const auto& segment : analysis.input.segments)
       for (const auto& frame : segment.nested_frames)
-        if (!frame.count) absent_.insert(frame.loop.get());
+        if (frame.count) active_loops_.insert(frame.loop.get());
     const auto families = analysis.ExportScopedDemands();
     CHECK(families) << "Original-frame logical demand export is unavailable";
     for (const auto& family : families->families) {
       CHECK(analysis.ReferenceBefore(family.source, family.target))
           << "Scoped token source must precede its consumer in the original invocation";
-      Add(family);
+      Add(analysis.input, family, guard);
     }
   }
   LogicalSyncRealization result;
 
  protected:
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    return RewriteSyncSequence(op, [this](const StmtPtr& child) { return VisitStmt(child); });
+  }
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override { return op; }
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    const auto call = As<Call>(op->expr_);
+    auto found = cuts_.find(call.get());
+    return found == cuts_.end() ? op : Wrap(op, *found->second);
+  }
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    // Qualified initialization/accumulation is one payload macro. Never move
+    // a case record into an arm where its SSA fact would become conditional.
+    auto arm = [](StmtPtr body) -> const Call* {
+      while (auto sequence = As<SeqStmts>(body)) {
+        if (sequence->stmts_.size() != 1) return nullptr;
+        body = sequence->stmts_.front();
+      }
+      const auto eval = As<EvalStmt>(body);
+      return eval ? As<Call>(eval->expr_).get() : nullptr;
+    };
+    auto found = cuts_.find(arm(op->then_body_));
+    if (found == cuts_.end()) return op;
+    CHECK(op->else_body_) << "Scoped logical macro requires original initialization alternatives";
+    const auto other = cuts_.find(arm(*op->else_body_));
+    CHECK(other != cuts_.end() && other->second == found->second)
+        << "Scoped logical initialization alternatives have incompatible cuts";
+    return Wrap(op, *found->second);
+  }
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     // Inventories are keyed by actual loop identity, not a representative leaf.
-    if (absent_.count(op.get())) return op;
+    if (!active_loops_.count(op.get())) return op;
     const auto previous = active_;
     active_ = op.get();
     auto body = VisitStmt(op->body_);
@@ -158,9 +189,8 @@ class ScopedRealizer : public SyncPlacement {
  private:
   SyncTokenNames names_;
   const ForStmt* active_ = nullptr;
-  std::set<const ForStmt*> absent_;
-  std::map<Site, VarPtr> records_;
-  std::map<Site, std::vector<Incoming>> incoming_;
+  std::set<const ForStmt*> active_loops_;
+  std::map<const Call*, std::shared_ptr<LogicalCut>> cuts_;
   std::map<const ForStmt*, std::vector<Transport>> transports_;
 
   VarPtr Variable(PipeType pipe) {
@@ -178,11 +208,22 @@ class ScopedRealizer : public SyncPlacement {
     ++result.carried_tokens;
     return out;
   }
-  void Add(const ScopedDemandFamily& family) {
+  LogicalCut& Cut(const SyncSite& site) {
+    auto& cut = cuts_[site.original.get()];
+    if (!cut) cut = std::make_shared<LogicalCut>(LogicalCut{site.pipe, {}, {}});
+    CHECK(cut->pipe == site.pipe) << "Invocation cases disagree on original payload pipe";
+    if (site.continuation) {
+      auto& continuation = cuts_[site.continuation.get()];
+      CHECK(!continuation || continuation == cut) << "Invocation cases disagree on original macro cut";
+      continuation = cut;
+    }
+    return *cut;
+  }
+  void Add(const CompactSyncInput& input, const ScopedDemandFamily& family, const ExprPtr& case_guard) {
     const auto [sr, sv, ss] = family.source;
     const auto [tr, tv, ts] = family.target;
-    const auto& source = input_.segments.at(sr).nested_frames;
-    const auto& target = input_.segments.at(tr).nested_frames;
+    const auto& source = input.segments.at(sr).nested_frames;
+    const auto& target = input.segments.at(tr).nested_frames;
     const auto a = Decode(source, sv), b = Decode(target, tv);
     size_t common = 0;
     while (common < source.size() && common < target.size() && source[common].loop == target[common].loop)
@@ -210,8 +251,9 @@ class ScopedRealizer : public SyncPlacement {
             << "Scoped logical tokens cannot transport differing fixed common-frame occurrences";
       }
     }
-    auto& record = records_[{sr, ss}];
-    if (!record) record = Variable(Payload({sr, ss}).pipe);
+    auto& source_cut = Cut(input.segments.at(sr).sites.at(ss));
+    auto& record = source_cut.record;
+    if (!record) record = Variable(source_cut.pipe);
     ExprPtr fact = record;
     const size_t keep = shift ? *shift + 1 : common;
     for (size_t i = source.size(); i-- > keep;) {
@@ -222,7 +264,7 @@ class ScopedRealizer : public SyncPlacement {
       fact = Carry(source[i], fact, capture).exported;
     }
     if (shift) fact = Carry(source[*shift], fact, {}).previous;
-    ExprPtr guard;
+    ExprPtr guard = case_guard;
     auto add_guard = [&](ExprPtr condition) {
       guard = guard ? std::make_shared<And>(guard, condition, DataType::BOOL, Span::unknown()) : condition;
     };
@@ -244,14 +286,13 @@ class ScopedRealizer : public SyncPlacement {
                                          DataType::BOOL, frame.loop->span_));
       }
     }
-    incoming_[{tr, ts}].push_back({fact, guard});
+    Cut(input.segments.at(tr).sites.at(ts)).incoming.push_back({fact, guard});
   }
-  StmtPtr Wrap(const StmtPtr& payload, Site site) override {
+  StmtPtr Wrap(const StmtPtr& payload, const LogicalCut& cut) {
     std::vector<StmtPtr> statements;
-    for (const auto& incoming : incoming_[site]) {
-      const auto wait = OpRegistry::GetInstance().Create("sync.wait", {incoming.token},
-                                                         {{"dst_pipe", static_cast<int>(Payload(site).pipe)}},
-                                                         payload->span_);
+    for (const auto& incoming : cut.incoming) {
+      const auto wait = OpRegistry::GetInstance().Create(
+          "sync.wait", {incoming.token}, {{"dst_pipe", static_cast<int>(cut.pipe)}}, payload->span_);
       StmtPtr statement = std::make_shared<EvalStmt>(wait, payload->span_);
       if (incoming.condition) {
         statement = std::make_shared<IfStmt>(incoming.condition, statement, std::nullopt,
@@ -262,10 +303,9 @@ class ScopedRealizer : public SyncPlacement {
       ++result.wait_sites;
     }
     statements.push_back(payload);
-    const auto record = records_.find(site);
-    if (record != records_.end()) {
+    if (cut.record) {
       statements.push_back(std::make_shared<AssignStmt>(
-          record->second, Token("sync.record", Payload(site).pipe, payload->span_), payload->span_));
+          cut.record, Token("sync.record", cut.pipe, payload->span_), payload->span_));
       ++result.record_sites;
     }
     return SeqStmts::Flatten(statements, payload->span_);
@@ -274,8 +314,35 @@ class ScopedRealizer : public SyncPlacement {
 }  // namespace
 LogicalSyncRealization RealizeScopedLogicalSync(const CompactSyncResult& analysis) {
   CHECK(analysis.input.region_tree) << "Scoped logical transport requires an original region tree";
-  ScopedRealizer realizer(analysis);
+  ScopedRealizer realizer(analysis.input.owner);
+  realizer.Append(analysis);
   realizer.result.function = realizer.VisitFunction(analysis.input.owner);
+  CheckLogicalSync(realizer.result.function);
+  return realizer.result;
+}
+LogicalSyncRealization RealizeLogicalInvocation(const SyncInvocationAnalysis& analysis) {
+  CHECK(analysis.owner && !analysis.cases.empty()) << "Missing logical invocation owner";
+  ScopedRealizer realizer(analysis.owner);
+  const auto block = DominatingSyncBlock(analysis.owner);
+  auto next = analysis.block_bounds.first;
+  for (const auto& item : analysis.cases) {
+    CHECK(item.mathematics && item.mathematics->input.owner == analysis.owner &&
+          item.mathematics->input.parameter_bounds == analysis.parameter_bounds &&
+          item.mathematics->input.block_bounds == std::make_pair(item.block_first, item.block_last) &&
+          item.block_first == next && item.block_last >= next &&
+          item.block_last < std::numeric_limits<int64_t>::max())
+        << "Incomplete logical invocation cases";
+    next = item.block_last + 1;
+    auto guard = SyncInvocationGuard(block, analysis.block_bounds, {item.block_first, item.block_last},
+                                     analysis.owner->span_);
+    realizer.Append(*item.mathematics, guard);
+  }
+  CHECK(next == analysis.block_bounds.second + 1) << "Incomplete logical invocation domain";
+  // All records are after original payload macros, and every carry starts
+  // completed. Case-independent captures use constant original coordinates;
+  // dynamic singleton exits use only the original available start expression.
+  // Thus unused case state is total even outside its case. Only waits add order.
+  realizer.result.function = realizer.VisitFunction(analysis.owner);
   CheckLogicalSync(realizer.result.function);
   return realizer.result;
 }

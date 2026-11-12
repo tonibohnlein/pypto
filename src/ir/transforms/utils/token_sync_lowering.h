@@ -28,16 +28,22 @@ struct StrippedLogicalSync {
 };
 StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool allow_nested);
 bool HasLogicalSync(const FunctionPtr& function);
-PhysicalSyncRealization LowerStructuredLogicalSync(
+// Executable summary only. Case-specific family coordinates are never flattened
+// into one misleading inventory; their immutable owners live through emission.
+struct LoweredLogicalSync {
+  FunctionPtr function;
+  size_t set_sites = 0, wait_sites = 0;
+};
+LoweredLogicalSync LowerStructuredLogicalSync(
     const FunctionPtr& function, const std::string& target,
     const std::optional<std::vector<int>>& eligible_ids, const SyncParameterBounds& parameters = {},
     std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt);
 // Interpret actual logical token uses without substituting minimum demands.
 // The finite adapter keeps actual command cuts and has no payload families;
 // canonical structured transport certifies and retains direct-cut families.
-PhysicalSyncRealization LowerLogicalSync(const FunctionPtr& function, const std::string& target,
-                                         const std::optional<std::vector<int>>& eligible_ids,
-                                         const SyncParameterBounds& parameters = {},
-                                         std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt);
+LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::string& target,
+                                    const std::optional<std::vector<int>>& eligible_ids,
+                                    const SyncParameterBounds& parameters = {},
+                                    std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_TOKEN_SYNC_LOWERING_H_

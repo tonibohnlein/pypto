@@ -18,5 +18,6 @@ namespace pypto::ir::sync {
 // Existing scoped demand export -> original-frame RFC carries/captures. This
 // constructs logical facts only; it does not certify physical flag reuse.
 LogicalSyncRealization RealizeScopedLogicalSync(const CompactSyncResult& analysis);
+LogicalSyncRealization RealizeLogicalInvocation(const SyncInvocationAnalysis& analysis);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_SCOPED_LOGICAL_SYNC_H_

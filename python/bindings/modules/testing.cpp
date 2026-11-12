@@ -745,13 +745,21 @@ void BindTesting(nb::module_& m) {
       nb::arg("function"), nb::arg("target") = "a2a3");
   testing.def(
       "inspect_scoped_token_families",
-      [](const ir::FunctionPtr& function, const std::string& target) {
+      [](const ir::FunctionPtr& function, const std::string& target,
+         const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks) {
         ir::CheckLogicalSync(function);
         auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
-        const auto input = ir::sync::ImportPlacedSync(stripped.function, true, target);
-        const auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops);
+        const auto input = ir::sync::ImportPlacedSync(stripped.function, true, target, parameters, blocks);
+        ir::sync::ScopedTokenWork work;
+        const auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops, &work);
         nb::dict out;
         out["function"] = stripped.function;
+        nb::dict counts;
+        counts["read_statement_visits"] = work.statements;
+        counts["waits_inspected"] = work.waits_inspected;
+        counts["inactive_waits"] = work.inactive_waits;
+        counts["families"] = work.families;
+        out["work"] = counts;
         nb::list rows, regions;
         for (const auto& family : families) {
           nb::dict row;
@@ -780,6 +788,7 @@ void BindTesting(nb::module_& m) {
         return out;
       },
       nb::arg("function"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
       "Inspect actual scoped token handoffs under the explicit disjoint-GM test contract; no allocation");
   nb::class_<ir::sync::SyncInvocationAnalysis>(testing, "SyncInvocationAnalysis")
       .def(

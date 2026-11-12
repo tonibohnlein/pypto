@@ -36,6 +36,7 @@
 #include "pypto/sync/isa_macro_resources.h"
 #include "pypto/sync/resource_catalog.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/sync_invocation_domains.h"
 #include "src/ir/transforms/utils/sync_placement.h"
 
 namespace pypto::ir::sync {
@@ -566,21 +567,6 @@ class InvocationEmitter : public IRMutator {
  public:
   explicit InvocationEmitter(const CutInventory& inventory) : inventory_(inventory) {}
 };
-ExprPtr DominatingBlock(const FunctionPtr& owner) {
-  const auto sequence = As<SeqStmts>(owner->body_);
-  if (!sequence) return nullptr;
-  for (const auto& statement : sequence->stmts_) {
-    const auto assign = As<AssignStmt>(statement);
-    if (!assign) break;  // A later/nested definition does not dominate every payload cut.
-    const auto call = As<Call>(assign->value_);
-    if (call && IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
-      const auto type = As<ScalarType>(assign->var_->GetType());
-      CHECK(type && type->dtype_ == DataType::INDEX) << "Invocation guard needs the original index binding";
-      return assign->var_;
-    }
-  }
-  return nullptr;
-}
 
 std::vector<Family> DirectFamilies(const CompactSyncResult& analysis) {
   PhysicalSyncRealization result_;
@@ -706,10 +692,15 @@ std::vector<int> ColorOrderedSyncLanes(size_t count, SyncDirection direction,
   }
   return result;
 }
+PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input, std::vector<Family> families,
+                                           const DirectSyncOrder& order, const std::string& target,
+                                           const std::optional<std::vector<int>>& restricted) {
+  return Allocator(input, std::move(families), order, target, restricted).Run();
+}
 PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input, std::vector<Family> families,
                                           const DirectSyncOrder& order, const std::string& target,
                                           const std::optional<std::vector<int>>& restricted) {
-  auto result = Allocator(input, std::move(families), order, target, restricted).Run();
+  auto result = AllocateDirectSync(input, std::move(families), order, target, restricted);
   result.function = Emitter(input, result).VisitFunction(input.owner);
   return result;
 }
@@ -718,47 +709,47 @@ PhysicalSyncRealization RealizePhysicalSync(const CompactSyncResult& analysis, c
   return RealizeDirectSync(analysis.input, DirectFamilies(analysis), MathematicalOrder(analysis), target,
                            eligible_ids);
 }
+FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterBounds& parameters,
+                                  std::pair<int64_t, int64_t> blocks,
+                                  const std::vector<AssignedSyncCase>& cases) {
+  CHECK(owner && !cases.empty()) << "Missing complete invocation case owner";
+  const auto block = cases.size() > 1 ? DominatingSyncBlock(owner) : nullptr;
+  CutInventory cuts;
+  auto next = blocks.first;
+  for (const auto& item : cases) {
+    CHECK(item.input && item.plan && item.input->owner == owner &&
+          item.input->parameter_bounds == parameters && item.input->block_bounds &&
+          item.input->block_bounds->first == next && item.input->block_bounds->second >= next &&
+          item.input->block_bounds->second < std::numeric_limits<int64_t>::max())
+        << "Invocation cases must retain exhaustive original owners and contracts";
+    next = item.input->block_bounds->second + 1;
+    const auto guard = SyncInvocationGuard(block, blocks, *item.input->block_bounds, owner->span_);
+    Emitter(*item.input, *item.plan).AppendCuts(cuts, guard);
+  }
+  CHECK(next == blocks.second + 1) << "Incomplete invocation activation domain";
+  // Exclusive cases share palettes only within this original invocation.
+  // Guarded cuts contain endpoint/ID arithmetic as well as SET/WAIT commands.
+  return InvocationEmitter(cuts).VisitFunction(owner);
+}
 PhysicalSyncInvocation RealizePhysicalInvocation(const SyncInvocationAnalysis& analysis,
                                                  const std::string& target,
                                                  const std::optional<std::vector<int>>& eligible_ids) {
-  CHECK(analysis.owner && !analysis.cases.empty()) << "Missing complete invocation case owner";
-  const auto block = analysis.cases.size() > 1 ? DominatingBlock(analysis.owner) : nullptr;
-  CHECK(analysis.cases.size() == 1 || block) << "Original dominating invocation block binding is unavailable";
+  // Qualify executable case selection before spending work on allocation.
+  CHECK(analysis.cases.size() <= 1 || DominatingSyncBlock(analysis.owner))
+      << "Original dominating invocation block binding is unavailable";
   PhysicalSyncInvocation result{analysis, nullptr, {}};
-  auto next = analysis.block_bounds.first;
+  result.cases.reserve(analysis.cases.size());
+  std::vector<AssignedSyncCase> cases;
   for (const auto& item : analysis.cases) {
-    CHECK(item.mathematics && item.block_first == next && item.block_last >= item.block_first &&
-          item.block_last < std::numeric_limits<int64_t>::max() &&
-          item.mathematics->input.owner == analysis.owner &&
-          item.mathematics->input.parameter_bounds == analysis.parameter_bounds &&
+    CHECK(item.mathematics &&
           item.mathematics->input.block_bounds == std::make_pair(item.block_first, item.block_last))
-        << "Invocation cases must retain exhaustive original owners and contracts";
-    next = item.block_last + 1;
-    result.cases.push_back(Allocator(item.mathematics->input, DirectFamilies(*item.mathematics),
-                                     MathematicalOrder(*item.mathematics), target, eligible_ids)
-                               .Run());
+        << "Missing original invocation analysis";
+    result.cases.push_back(AllocateDirectSync(item.mathematics->input, DirectFamilies(*item.mathematics),
+                                              MathematicalOrder(*item.mathematics), target, eligible_ids));
+    cases.push_back({&item.mathematics->input, &result.cases.back()});
   }
-  CHECK(next == analysis.block_bounds.second + 1) << "Incomplete invocation activation domain";
-  CutInventory cuts;
-  for (size_t i = 0; i < analysis.cases.size(); ++i) {
-    const auto& item = analysis.cases[i];
-    ExprPtr guard;
-    const auto span = analysis.owner->span_;
-    if (item.block_first > analysis.block_bounds.first)
-      guard = std::make_shared<Ge>(block, std::make_shared<ConstInt>(item.block_first, DataType::INDEX, span),
-                                   DataType::BOOL, span);
-    if (item.block_last < analysis.block_bounds.second) {
-      ExprPtr upper =
-          std::make_shared<Lt>(block, std::make_shared<ConstInt>(item.block_last + 1, DataType::INDEX, span),
-                               DataType::BOOL, span);
-      guard = guard ? std::make_shared<And>(guard, upper, DataType::BOOL, span) : upper;
-    }
-    Emitter(item.mathematics->input, result.cases[i]).AppendCuts(cuts, guard);
-  }
-  // No source mutation or payload cloning was needed to qualify the cases.
-  // Exclusive cases can share palettes within this invocation only. Fresh entry
-  // and closed notifications at exit remain the existing native contract.
-  result.function = InvocationEmitter(cuts).VisitFunction(analysis.owner);
+  result.function =
+      EmitAssignedSyncCases(analysis.owner, analysis.parameter_bounds, analysis.block_bounds, cases);
   return result;
 }
 

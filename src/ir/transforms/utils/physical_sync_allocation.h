@@ -43,6 +43,21 @@ PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input,
                                           const DirectSyncOrder& order, const std::string& target,
                                           const std::optional<std::vector<int>>& restricted);
 
+// Separate allocation from shared cut application for mutually exclusive cases.
+PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input,
+                                           std::vector<PhysicalSyncFamily> families,
+                                           const DirectSyncOrder& order, const std::string& target,
+                                           const std::optional<std::vector<int>>& restricted);
+struct AssignedSyncCase {
+  const CompactSyncInput* input;
+  PhysicalSyncRealization* plan;
+};
+// Borrowed owners live through this synchronous call. All inputs must refer to
+// the same original owner and exhaust its supplied invocation domain.
+FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterBounds& parameters,
+                                  std::pair<int64_t, int64_t> blocks,
+                                  const std::vector<AssignedSyncCase>& cases);
+
 // Publish only an established complete physical owner (literal SET and WAIT),
 // or an explicit delegation outcome. This does not qualify or allocate a plan.
 FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::string& reason);
