@@ -48,6 +48,24 @@ def expression_nodes(expression):
         yield from expression_nodes(expression.operand)
 
 
+def scalar_work(expression):
+    """Count represented eager scalar operators, excluding loads/native calls.
+
+    Both operands of And/Or contribute: scalar codegen emits arith.andi/ori,
+    even though the value-only oracle can short-circuit those pure expressions.
+    These are source-operation counts, not optimized device instructions.
+    """
+    counts = Counter()
+    for node in expression_nodes(expression):
+        if isinstance(node, (ir.Eq, ir.Ne, ir.Lt, ir.Le, ir.Gt, ir.Ge)):
+            counts["scalar_comparisons"] += 1
+        elif isinstance(node, (ir.And, ir.Or, ir.Not)):
+            counts["scalar_boolean_ops"] += 1
+        elif isinstance(node, (ir.Add, ir.Sub, ir.Mul, ir.FloorDiv, ir.FloorMod)):
+            counts["scalar_arithmetic_ops"] += 1
+    return counts
+
+
 def static_control(function):
     """Return static branch and physical-command counts for the actual function."""
     counts = Counter()
@@ -85,12 +103,14 @@ class ControlTrace(CommandExecution):
 
     def assign(self, stmt, env):
         if isinstance(stmt.var.type, ir.ScalarType):
+            self.counts.update(scalar_work(stmt.value))
             self.counts["scalar_evaluations"] += 1
             self.counts["scalar_value_nodes"] += sum(1 for _ in expression_nodes(stmt.value))
             env[stmt.var] = value(stmt.value, env)
 
     def execute(self, stmt, env):
         if isinstance(stmt, ir.IfStmt):
+            self.counts.update(scalar_work(stmt.condition))
             self.counts["conditions"] += 1
             self.counts["inactive_conditions"] += not value(stmt.condition, env)
             self.counts["condition_nodes"] += sum(1 for _ in expression_nodes(stmt.condition))

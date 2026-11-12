@@ -145,6 +145,15 @@ def examine(name, program, valuations, independent, output, baseline):
             "cut_domain_interval_visits",
             "cut_case_comparisons",
             "coalesced_cut_cases",
+            "case_sequence_visits",
+            "case_sequence_comparisons",
+            "factored_case_cuts",
+            "shared_disjoint_case_cuts",
+            "endpoint_domain_entries",
+            "normalized_endpoint_bounds",
+            "endpoint_predicates_constructed",
+            "control_descriptors",
+            "materialized_control_statements",
             "control_expression_visits",
         ):
             construction[field] = (

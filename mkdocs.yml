@@ -321,6 +321,9 @@ nav:
           - en/dev/ir/24-qwen-device-investigation.md
           - en/dev/ir/25-compact-sync-control.md
           - en/dev/ir/26-cut-aware-sync-control.md
+          - en/dev/ir/27-sync-expansion-accounting.md
+          - en/dev/ir/28-shared-case-command-sequences.md
+          - en/dev/ir/29-direct-sync-control.md
           - en/dev/ir/18-qwen-prefill-pipeline.md
       - Passes:
           - en/dev/passes/index.md

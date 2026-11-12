@@ -146,13 +146,22 @@ def test_residue_selection_stays_compact_and_matches_original_accesses(count):
         assert state.counts["conditions"] == 80  # Previous independent residue tests: 122.
 
 
-@pytest.mark.parametrize("band,bound", [(0, 159), (1, 171), (2, 234), (3, 207)])
+@pytest.mark.parametrize("band,bound", [(0, 111), (1, 115), (2, 147), (3, 149)])
 def test_qwen_whole_cut_coalescing_reduces_control_without_new_coloring(band, bound):
     program = capture_qwen_projection("gate_up", layers=2, hidden=5120, band=band)
     original = next(f for f in program.functions.values() if f.func_type == ir.FunctionType.AIC)
     physical = worker(apply(passes.realize_sync, program), original.name)
     stats = static_control(physical)
     assert stats["if_sites"] <= bound
+    # Case decisions now share ordered prefixes/suffixes without changing IDs.
+    command_bound = [51, 51, 64, 63][band]
+    assert stats["system.set_flag"] <= command_bound
+    assert stats["system.wait_flag"] <= command_bound
+    if band == 2:
+        # The nested A/B/A cut shares its complete residual sequence, including
+        # last-K/last-inner guards, without filling the inactive block interval.
+        assert stats["system.set_flag"] <= 63
+        assert stats["guard_expression_visits"] <= 485
     source = codegen.PTOCodegen().generate(program_of(physical))
     assert source.count("scf.if") == stats["if_sites"]
     # Large cases use source-control enumeration here. Bounded independent

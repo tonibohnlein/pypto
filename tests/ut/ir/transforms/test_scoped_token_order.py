@@ -15,6 +15,7 @@ import pytest
 from pypto import codegen, ir, passes, testing
 from pypto.backend.pto_backend import _run_ptoas
 
+from .sync_control_metrics import expression_nodes, statements
 from .sync_matmul_oracle import hardware_reference, interpret
 from .sync_physical_oracle import PhysicalExecution
 from .test_collective_sync_realization import nested_collective, repeat_collective
@@ -89,6 +90,57 @@ def check_order(logical, *, physical=True):
         text = codegen.PTOCodegen().generate(ir.Program([lowered], "Scoped", lowered.span))
         assert "sync.record" not in text
     return result, order
+
+
+@pytest.mark.parametrize(
+    "start,step,trips,trim",
+    [
+        (0, 64, 4, 0),
+        (-7, 3, 3, 1),
+        (-(1 << 62), 1 << 62, 3, 1),  # Endpoints fit, normalized subtraction does not.
+        (7, 3, 3, 1),
+        (5, 4, 1, 2),
+        (9, 5, 0, 0),
+        ((1 << 63) - 22, 3, 3, 1),
+    ],
+)
+def test_original_lattice_bounds_preserve_matching_and_reset(start, step, trips, trim):
+    original = wrapped_collective(trips)
+
+    class Bounds(ir.IRMutator):
+        def visit_for_stmt(self, op):
+            if op.loop_var.name_hint != "outer":
+                return super().visit_for_stmt(op)
+
+            def ci(n):
+                return ir.ConstInt(n, ir.DataType.INDEX, op.span)
+
+            return ir.ForStmt(
+                op.loop_var,
+                ci(start),
+                ci(start + step * trips - trim),
+                ci(step),
+                op.iter_args,
+                op.body,
+                op.return_vars,
+                op.span,
+            )
+
+    original = Bounds().visit_function(original)
+    if start < 0:
+        # Import admission is unchanged. Do not broaden it merely to exercise
+        # the emitter's signed arithmetic guard.
+        with pytest.raises(ValueError, match="nonnegative nonoverflowing"):
+            _apply(passes.insert_sync, original)
+        return
+    logical = _apply(passes.insert_sync, original)
+    check_order(logical)
+    lowered = _apply(passes.lower_sync, logical)
+    # On the qualified original lattice all threshold guards use the IV
+    # directly. In particular, last is start+(trips-1)*step, not stop-step.
+    for stmt in statements(lowered.body):
+        if isinstance(stmt, ir.IfStmt):
+            assert not any(isinstance(node, ir.FloorDiv) for node in expression_nodes(stmt.condition))
 
 
 @pytest.mark.parametrize("rows", [1, 2, 5])

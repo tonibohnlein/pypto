@@ -603,6 +603,15 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   out["cut_domain_interval_visits"] = result.cut_domain_interval_visits;
   out["cut_case_comparisons"] = result.cut_case_comparisons;
   out["coalesced_cut_cases"] = result.coalesced_cut_cases;
+  out["case_sequence_visits"] = result.case_sequence_visits;
+  out["case_sequence_comparisons"] = result.case_sequence_comparisons;
+  out["factored_case_cuts"] = result.factored_case_cuts;
+  out["shared_disjoint_case_cuts"] = result.shared_disjoint_case_cuts;
+  out["endpoint_domain_entries"] = result.endpoint_domain_entries;
+  out["normalized_endpoint_bounds"] = result.normalized_endpoint_bounds;
+  out["endpoint_predicates_constructed"] = result.endpoint_predicates_constructed;
+  out["control_descriptors"] = result.control_descriptors;
+  out["materialized_control_statements"] = result.materialized_control_statements;
   out["control_expression_visits"] = result.control_expression_visits;
   out["reuse_queries"] = result.reuse_queries;
   out["reserved_lanes"] = result.reserved_lanes;
@@ -827,6 +836,8 @@ void BindTesting(nb::module_& m) {
           row["source"] = nb::make_tuple(family.source_region, family.source_first, family.source_site);
           row["target"] = nb::make_tuple(family.target_region, family.target_first, family.target_site);
           row["count"] = family.count;
+          row["source_domain"] = nb::cast(family.source_domain->ranges);
+          row["target_domain"] = nb::cast(family.target_domain->ranges);
           nb::list axes;
           for (const auto& axis : family.axes)
             axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));

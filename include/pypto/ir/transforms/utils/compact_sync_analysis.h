@@ -325,6 +325,19 @@ struct LogicalSyncRealization {
 // analysis or mutates it. Tokens are non-consuming; this is not flag allocation.
 LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis);
 
+// Immutable original-frame context shared by endpoint domains in one region.
+// Blocks are the admitted invocation case, not a new run-time assumption.
+struct SyncEndpointFrame {
+  FunctionPtr owner;
+  std::optional<std::pair<int64_t, int64_t>> blocks;
+  size_t region;
+  std::vector<SyncLoopFrame> loops;
+};
+struct SyncEndpointDomain {
+  std::shared_ptr<const SyncEndpointFrame> frame;
+  // Half-open normalized digit intervals, in original outer-to-inner order.
+  std::vector<std::pair<int64_t, int64_t>> ranges;
+};
 // One physical handoff family; endpoint ordinals refer to the original loops.
 // A same-pipe family has no IDs. Crossings have count=1 and can span segments.
 struct PhysicalSyncFamily {
@@ -334,6 +347,7 @@ struct PhysicalSyncFamily {
   // Empty on the original flat route; otherwise exact cached source-frame axes.
   // This inventory is constructed/consumed with the same retained case owner.
   std::vector<ScopedDemandAxis> axes;
+  std::shared_ptr<const SyncEndpointDomain> source_domain, target_domain;
 };
 struct PhysicalSyncRealization {
   FunctionPtr function;
@@ -346,6 +360,12 @@ struct PhysicalSyncRealization {
   // Invocation-wide domain/materialization work is charged to the first case.
   // Expression visits count our inspections, not internals of the arith analyzer.
   size_t cut_domain_interval_visits = 0, cut_case_comparisons = 0, coalesced_cut_cases = 0;
+  // Includes rejected decision-tree candidates. Comparisons charge whole opaque
+  // command trees separately from visits to their case/sequence inventories.
+  size_t case_sequence_visits = 0, case_sequence_comparisons = 0, factored_case_cuts = 0;
+  size_t shared_disjoint_case_cuts = 0;
+  size_t endpoint_domain_entries = 0, endpoint_predicates_constructed = 0, normalized_endpoint_bounds = 0;
+  size_t control_descriptors = 0, materialized_control_statements = 0;
   size_t control_expression_visits = 0;
   size_t reuse_queries = 0, reserved_lanes = 0;
   std::vector<std::tuple<PipeType, PipeType, int>> native_reserved_ids;  // Fixed macro owners.

@@ -350,28 +350,19 @@ bool SameControl(const IRNodePtr& left, const IRNodePtr& right) {
 
 // Only generated predicates enter this simplifier. Original payload/control
 // expressions are never rewritten. Bounds come from the retained occurrence
-// frame, with a fresh analyzer per cut so facts cannot leak across resets.
-class CommandConditions : public IRMutator {
+// frame. Each region caches an analyzer containing only immutable original-loop
+// bounds; it never learns branch-local assumptions or a previous visit's values.
+class CommandConditions {
   arith::Analyzer analyzer_;
-  StmtPtr VisitStmt_(const IfStmtPtr& branch) override {
-    ExprPtr condition = branch->condition_;
-    try {
-      condition = analyzer_.Simplify(condition);
-    } catch (const StructuralComparisonUnsupported&) {
-      // Arithmetic simplification is optional; retained realization stays valid.
-    }
-    if (auto known = As<ConstBool>(condition)) {
-      if (known->value_) return VisitStmt(branch->then_body_);
-      return branch->else_body_ ? VisitStmt(*branch->else_body_)
-                                : std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, branch->span_);
-    }
-    return std::make_shared<IfStmt>(
-        condition, VisitStmt(branch->then_body_),
-        branch->else_body_ ? std::optional<StmtPtr>(VisitStmt(*branch->else_body_)) : std::nullopt,
-        branch->return_vars_, branch->span_);
-  }
 
  public:
+  ExprPtr Simplify(const ExprPtr& expression) {
+    try {
+      return analyzer_.Simplify(expression);
+    } catch (const StructuralComparisonUnsupported&) {
+      return expression;
+    }
+  }
   explicit CommandConditions(const SyncSegment& segment) {
     auto bind = [&](const ForStmtPtr& loop) {
       const auto start = As<ConstInt>(loop->start_), stop = As<ConstInt>(loop->stop_),
@@ -502,93 +493,174 @@ std::vector<StmtPtr> MaterializeCommandValues(const std::vector<StmtPtr>& comman
   }
 }
 
-size_t CountCommandGuards(const StmtPtr& statement) {
-  size_t result = 0;
-  if (auto sequence = As<SeqStmts>(statement))
-    for (const auto& child : sequence->stmts_) result += CountCommandGuards(child);
-  if (auto branch = As<IfStmt>(statement)) {
-    result += 1 + CountCommandGuards(branch->then_body_);
-    if (branch->else_body_) result += CountCommandGuards(*branch->else_body_);
+// Lowering-owned control descriptors. No scalar statement is created while
+// competing schedules are built or costed. Each forest belongs to one original
+// payload cut and side; expressions retain original SSA/frame identity. Leaves
+// retain the allocator's exact action, direction and literal ID in their Call.
+struct CommandControl;
+using ControlPtr = std::shared_ptr<const CommandControl>;
+using ControlForest = std::vector<ControlPtr>;
+struct CommandControl {
+  ExprPtr condition, command;
+  ControlForest body, alternative;
+  Span span;
+};
+ControlPtr ControlSequence(ControlForest body, const Span& span, PhysicalSyncRealization& work) {
+  ++work.control_descriptors;
+  return std::make_shared<CommandControl>(CommandControl{nullptr, nullptr, std::move(body), {}, span});
+}
+ControlPtr ControlBranch(ExprPtr condition, ControlPtr body, std::optional<ControlPtr> alternative,
+                         const Span& span, PhysicalSyncRealization& work) {
+  if (auto known = As<ConstBool>(condition))
+    return known->value_ ? body : alternative ? *alternative : ControlSequence({}, span, work);
+  ++work.control_descriptors;
+  return std::make_shared<CommandControl>(
+      CommandControl{std::move(condition),
+                     nullptr,
+                     {std::move(body)},
+                     alternative ? ControlForest{*alternative} : ControlForest{},
+                     span});
+}
+ControlPtr ControlCommand(ExprPtr command, const Span& span, PhysicalSyncRealization& work) {
+  ++work.control_descriptors;
+  return std::make_shared<CommandControl>(CommandControl{nullptr, std::move(command), {}, {}, span});
+}
+bool SameControl(const ControlPtr& a, const ControlPtr& b) {
+  if (a == b) return true;
+  if (static_cast<bool>(a->condition) != static_cast<bool>(b->condition) ||
+      static_cast<bool>(a->command) != static_cast<bool>(b->command) || a->body.size() != b->body.size() ||
+      a->alternative.size() != b->alternative.size())
+    return false;
+  if (a->condition && !SameControl(a->condition, b->condition)) return false;
+  if (a->command && !SameControl(a->command, b->command)) return false;
+  for (size_t i = 0; i < a->body.size(); ++i)
+    if (!SameControl(a->body[i], b->body[i])) return false;
+  for (size_t i = 0; i < a->alternative.size(); ++i)
+    if (!SameControl(a->alternative[i], b->alternative[i])) return false;
+  return true;
+}
+ControlPtr ImportControl(const StmtPtr& stmt, PhysicalSyncRealization& work) {
+  if (auto sequence = As<SeqStmts>(stmt)) {
+    ControlForest children;
+    for (const auto& child : sequence->stmts_) children.push_back(ImportControl(child, work));
+    return ControlSequence(std::move(children), stmt->span_, work);
+  }
+  if (auto branch = As<IfStmt>(stmt)) {
+    CHECK(branch->return_vars_.empty()) << "Command schedule cannot move definitions";
+    return ControlBranch(branch->condition_, ImportControl(branch->then_body_, work),
+                         branch->else_body_
+                             ? std::optional<ControlPtr>(ImportControl(*branch->else_body_, work))
+                             : std::nullopt,
+                         stmt->span_, work);
+  }
+  auto command = As<EvalStmt>(stmt);
+  CHECK(command) << "Command schedule requires command-only input";
+  return ControlCommand(command->expr_, stmt->span_, work);
+}
+std::vector<StmtPtr> MaterializeControl(const ControlForest& forest, PhysicalSyncRealization& work) {
+  std::vector<StmtPtr> result;
+  for (const auto& node : forest) {
+    if (node->command) {
+      ++work.materialized_control_statements;
+      result.push_back(std::make_shared<EvalStmt>(node->command, node->span));
+    } else {
+      auto body = MaterializeControl(node->body, work);
+      auto sequence = [&](std::vector<StmtPtr> statements) -> StmtPtr {
+        if (statements.size() == 1 && As<SeqStmts>(statements.front())) return statements.front();
+        ++work.materialized_control_statements;
+        return std::make_shared<SeqStmts>(std::move(statements), node->span);
+      };
+      if (!node->condition) {
+        result.push_back(sequence(std::move(body)));
+      } else {
+        std::optional<StmtPtr> alternative;
+        if (!node->alternative.empty()) alternative = sequence(MaterializeControl(node->alternative, work));
+        ++work.materialized_control_statements;
+        result.push_back(std::make_shared<IfStmt>(node->condition, sequence(std::move(body)), alternative,
+                                                  std::vector<VarPtr>{}, node->span));
+      }
+    }
   }
   return result;
 }
+void VisitControlExpressions(const ControlPtr& node, IRVisitor& visitor) {
+  if (node->condition) visitor.VisitExpr(node->condition);
+  if (node->command) visitor.VisitExpr(node->command);
+  for (const auto& child : node->body) VisitControlExpressions(child, visitor);
+  for (const auto& child : node->alternative) VisitControlExpressions(child, visitor);
+}
 
-// Only emitter-created forests enter this builder: no payloads, definitions,
-// effectful conditions or result-bearing branches. Share consecutive equal
-// guard prefixes, preserving every leaf and its order. Mutable child vectors
-// avoid repeatedly copying a growing immutable body. Work is linear in visited
-// control occurrences plus structural-comparison traversal (not distinct DAGs).
+// Share adjacent guard prefixes directly in descriptors. ID decision chains
+// remain opaque; no command crosses an alternative or a payload boundary.
 class CommandGuards {
   struct Node {
     ExprPtr condition;
-    StmtPtr leaf;
+    ControlPtr leaf;
     std::vector<Node> children;
   };
   std::vector<Node> roots_;
   size_t shared_ = 0, visits_ = 0;
-
-  void Append(std::vector<Node>& nodes, const StmtPtr& statement) {
+  void Append(std::vector<Node>& nodes, const ControlPtr& statement) {
     ++visits_;
-    if (auto sequence = As<SeqStmts>(statement)) {
-      for (const auto& child : sequence->stmts_) Append(nodes, child);
-    } else if (auto branch = As<IfStmt>(statement);
-               branch && !branch->else_body_ && branch->return_vars_.empty()) {
+    if (!statement->condition && !statement->command) {
+      for (const auto& child : statement->body) Append(nodes, child);
+    } else if (statement->condition && statement->alternative.empty()) {
       if (nodes.empty() || !nodes.back().condition ||
-          !SameControl(nodes.back().condition, branch->condition_)) {
-        nodes.push_back({branch->condition_, nullptr, {}});
-      } else {
+          !SameControl(nodes.back().condition, statement->condition))
+        nodes.push_back({statement->condition, nullptr, {}});
+      else
         ++shared_;
-      }
-      Append(nodes.back().children, branch->then_body_);
+      for (const auto& child : statement->body) Append(nodes.back().children, child);
     } else {
-      // In particular, ID decision chains are opaque. Sharing must not move
-      // a later command into one arm, or collect A/B/A into A/A/B.
       nodes.push_back({nullptr, statement, {}});
     }
   }
-  static std::vector<StmtPtr> Freeze(const std::vector<Node>& nodes) {
-    std::vector<StmtPtr> result;
-    result.reserve(nodes.size());
+  static ControlForest Freeze(const std::vector<Node>& nodes, PhysicalSyncRealization& work) {
+    ControlForest result;
     for (const auto& node : nodes) {
-      if (node.condition) {
-        const auto span = node.condition->span_;
-        auto body = std::make_shared<SeqStmts>(Freeze(node.children), span);
-        result.push_back(
-            std::make_shared<IfStmt>(node.condition, body, std::nullopt, std::vector<VarPtr>{}, span));
-      } else {
+      if (node.condition)
+        result.push_back(ControlBranch(
+            node.condition, ControlSequence(Freeze(node.children, work), node.condition->span_, work),
+            std::nullopt, node.condition->span_, work));
+      else
         result.push_back(node.leaf);
-      }
     }
     return result;
   }
 
  public:
-  std::vector<StmtPtr> Build(const std::vector<StmtPtr>& commands, PhysicalSyncRealization& result) {
+  ControlForest Build(const ControlForest& commands, PhysicalSyncRealization& result) {
     for (const auto& command : commands) Append(roots_, command);
     INTERNAL_CHECK(result.guard_sites >= shared_) << "Internal error: command guard accounting";
     result.guard_sites -= shared_;
     result.shared_guard_sites += shared_;
     result.control_statement_visits += visits_;
-    return Freeze(roots_);
+    return Freeze(roots_, result);
   }
 };
 
-using CaseCommands = SyncCommandCase;
+struct CaseCommands {
+  std::pair<int64_t, int64_t> blocks;
+  ControlPtr body;
+};
+
 struct PhysicalCuts {
-  std::vector<StmtPtr> before, after;
+  ControlForest before, after;
   std::vector<CaseCommands> before_cases, after_cases;
   // Upper bound on the invocation coordinates reaching this ORIGINAL cut.
   // Only a retained zero-visit proof removes coordinates. Missing evidence
   // leaves the full domain; a present cut with no commands is never absence.
   std::vector<std::pair<int64_t, int64_t>> domain;
+  std::set<const Var*> uniform_variables;
+  bool uniform_checked = false;
 };
 // Compare each newly supplied complete sequence only with its predecessor.
 // The accumulated interval is constant-size; its body is never concatenated.
 // Missing cases remain numeric gaps, even when both neighboring bodies match.
 void AppendCase(std::vector<CaseCommands>& cases, std::pair<int64_t, int64_t> blocks,
-                const std::vector<StmtPtr>& commands, const Span& span) {
+                const ControlForest& commands, const Span& span, PhysicalSyncRealization& work) {
   if (commands.empty()) return;
-  auto body = std::make_shared<SeqStmts>(commands, span);
+  auto body = ControlSequence(commands, span, work);
   if (!cases.empty() && cases.back().blocks.second < std::numeric_limits<int64_t>::max() &&
       cases.back().blocks.second + 1 == blocks.first && SameControl(cases.back().body, body)) {
     cases.back().blocks.second = blocks.second;
@@ -638,6 +710,8 @@ class CutDomains : public IRVisitor {
   CutInventory& cuts_;
   Intervals domain_;
   PhysicalSyncRealization& work_;
+  std::set<const Var*> uniform_variables_;
+  size_t conditional_depth_ = 0;
   void VisitStmt_(const ForStmtPtr& loop) override {
     auto saved = domain_;
     work_.cut_domain_interval_visits += domain_.size();
@@ -645,19 +719,44 @@ class CutDomains : public IRVisitor {
       work_.cut_domain_interval_visits += found->second.size();
       domain_ = SubtractIntervals(domain_, found->second);
     }
+    const auto start = As<ConstInt>(loop->start_), stop = As<ConstInt>(loop->stop_),
+               step = As<ConstInt>(loop->step_);
+    const bool uniform = start && stop && step && step->value_ > 0;
+    auto saved_variables = uniform_variables_;
+    if (!uniform) uniform_variables_.clear();
+    if (uniform) uniform_variables_.insert(loop->loop_var_.get());
     VisitStmt(loop->body_);
+    uniform_variables_ = std::move(saved_variables);
     domain_ = std::move(saved);
   }
   void VisitStmt_(const AssignStmtPtr&) override {}
   void VisitStmt_(const IfStmtPtr& branch) override {
+    ++conditional_depth_;
     VisitStmt(branch->then_body_);
     if (branch->else_body_) VisitStmt(*branch->else_body_);
+    --conditional_depth_;
   }
   void VisitStmt_(const EvalStmtPtr& statement) override {
     const auto call = As<Call>(statement->expr_);
     if (auto found = cuts_.find(call.get()); found != cuts_.end()) {
       work_.cut_domain_interval_visits += domain_.size();
       found->second->domain = domain_;
+      // A branch could correlate a loop digit with the launch coordinate.
+      // Without that branch, literal-bound IV domains are identical in every
+      // launch case that reaches this cut. Do not infer this from sample runs.
+      auto& cut = *found->second;
+      const auto qualified = conditional_depth_ ? std::set<const Var*>{} : uniform_variables_;
+      if (!cut.uniform_checked) {
+        cut.uniform_variables = qualified;
+      } else {
+        for (auto it = cut.uniform_variables.begin(); it != cut.uniform_variables.end();) {
+          if (!qualified.count(*it))
+            it = cut.uniform_variables.erase(it);
+          else
+            ++it;
+        }
+      }
+      cut.uniform_checked = true;
     }
   }
 
@@ -694,6 +793,355 @@ std::vector<CaseCommands> CoalesceCutCases(const std::vector<CaseCommands>& sour
   return result;
 }
 
+void FlattenControlSequence(const ControlPtr& node, ControlForest& commands, PhysicalSyncRealization& work) {
+  ++work.case_sequence_visits;
+  if (!node->condition && !node->command) {
+    for (const auto& child : node->body) FlattenControlSequence(child, commands, work);
+  } else {
+    commands.push_back(node);
+  }
+}
+
+// The tree only rearranges mutually exclusive case decisions at ONE original
+// cut. Prefix/suffix commands shared by every descendant execute once, in their
+// original order. Missing executing cases are explicit empty leaves; only a
+// proved-absent interval may be omitted. Inner guarded commands remain opaque,
+// so skipped predicates, SSA identity, command multiplicity and IDs survive.
+//
+// Balanced splitting bounds depth by log(C). Each level inspects at most the
+// supplied sequence entries: O(S log(C+1)) plus structural comparison work on
+// their opaque trees. No LCS/all-pairs search, dynamic visits or payload cloning.
+class CaseSequenceTree {
+  struct Slice {
+    int64_t last;
+    ControlForest commands;
+    size_t begin = 0, end = 0;
+  };
+  std::vector<Slice> slices_;
+  ExprPtr block_;
+  Span span_;
+  PhysicalSyncRealization& work_;
+
+  void Append(int64_t first, int64_t last, const ControlPtr& body, const Intervals& possible) {
+    if (!DomainIntersects(possible, first, last)) return;
+    Slice slice{last, {}};
+    if (body) FlattenControlSequence(body, slice.commands, work_);
+    slice.end = slice.commands.size();
+    slices_.push_back(std::move(slice));
+  }
+
+  bool Common(size_t first, size_t last, bool suffix) {
+    const auto& base = slices_[first];
+    if (base.begin == base.end) return false;
+    const auto& command = base.commands[suffix ? base.end - 1 : base.begin];
+    for (size_t i = first + 1; i < last; ++i) {
+      ++work_.case_sequence_visits;
+      const auto& slice = slices_[i];
+      if (slice.begin == slice.end) return false;
+      ++work_.case_sequence_comparisons;
+      if (!SameControl(command, slice.commands[suffix ? slice.end - 1 : slice.begin])) return false;
+    }
+    return true;
+  }
+
+  ControlPtr Body(ControlForest commands) const { return ControlSequence(std::move(commands), span_, work_); }
+
+  ControlForest Build(size_t first, size_t last) {
+    if (first == last) return {};
+    if (last - first == 1) {
+      const auto& slice = slices_[first];
+      return {slice.commands.begin() + slice.begin, slice.commands.begin() + slice.end};
+    }
+    ControlForest result, suffix;
+    while (Common(first, last, false)) {
+      result.push_back(slices_[first].commands[slices_[first].begin]);
+      for (size_t i = first; i < last; ++i) ++slices_[i].begin;
+    }
+    while (Common(first, last, true)) {
+      suffix.push_back(slices_[first].commands[slices_[first].end - 1]);
+      for (size_t i = first; i < last; ++i) --slices_[i].end;
+    }
+    const auto middle = first + (last - first) / 2;
+    auto left = Build(first, middle);
+    auto right = Build(middle, last);
+    const auto bound = std::make_shared<ConstInt>(slices_[middle - 1].last, DataType::INDEX, span_);
+    if (!left.empty()) {
+      auto condition = std::make_shared<Le>(block_, bound, DataType::BOOL, span_);
+      std::optional<ControlPtr> alternative;
+      if (!right.empty()) alternative = Body(std::move(right));
+      result.push_back(ControlBranch(condition, Body(std::move(left)), alternative, span_, work_));
+    } else if (!right.empty()) {
+      auto condition = std::make_shared<Gt>(block_, bound, DataType::BOOL, span_);
+      result.push_back(ControlBranch(condition, Body(std::move(right)), std::nullopt, span_, work_));
+    }
+    result.insert(result.end(), suffix.rbegin(), suffix.rend());
+    return result;
+  }
+
+ public:
+  CaseSequenceTree(const ExprPtr& block, const Span& span, PhysicalSyncRealization& work)
+      : block_(block), span_(span), work_(work) {}
+
+  ControlForest Build(const std::vector<CaseCommands>& cases, const Intervals& possible) {
+    const auto end = possible.back().second;
+    auto next = possible.front().first;
+    for (const auto& item : cases) {
+      ++work_.case_sequence_visits;
+      const auto first = std::max(next, item.blocks.first);
+      const auto last = std::min(end, item.blocks.second);
+      if (first > last) continue;
+      Append(next, first - 1, nullptr, possible);
+      Append(first, last, item.body, possible);
+      next = last + 1;  // Validated upper bounds exclude INT64_MAX.
+    }
+    Append(next, end, nullptr, possible);
+    return Build(0, slices_.size());
+  }
+};
+
+// Accept only a Pareto improvement in static commands, conditions and expression
+// occurrences. This is a code-construction metric, not a device latency model.
+// Walk both candidates once; include rejected construction in the work receipt.
+class CaseCodeSize {
+  class Expressions : public IRVisitor {
+   public:
+    size_t count = 0;
+    void VisitExpr(const ExprPtr& expression) override {
+      ++count;
+      IRVisitor::VisitExpr(expression);
+    }
+  };
+  void Visit(const ControlPtr& node) {
+    ++statements;
+    if (node->command) ++commands;
+    if (node->condition) ++guards;
+    Expressions counter;
+    if (node->condition) counter.VisitExpr(node->condition);
+    if (node->command) counter.VisitExpr(node->command);
+    expressions += counter.count;
+    for (const auto& child : node->body) Visit(child);
+    for (const auto& child : node->alternative) Visit(child);
+  }
+
+ public:
+  size_t commands = 0, guards = 0, expressions = 0, statements = 0;
+  explicit CaseCodeSize(const ControlForest& body) {
+    for (const auto& node : body) Visit(node);
+  }
+  bool Improves(const CaseCodeSize& old) const {
+    return commands <= old.commands && guards <= old.guards && expressions <= old.expressions &&
+           (commands < old.commands || guards < old.guards || expressions < old.expressions);
+  }
+};
+
+// Sufficient uniformity certificate for cancelling unchanged inner-control
+// cost. Unknown SSA values (including the launch coordinate) lose this optional
+// optimization. Physical calls have literal attributes and no value operands.
+class UniformCommandBody : public IRVisitor {
+  const std::set<const Var*>& variables_;
+
+ public:
+  bool valid = true;
+  explicit UniformCommandBody(const std::set<const Var*>& variables) : variables_(variables) {}
+  void VisitExpr_(const VarPtr& variable) override { valid &= variables_.count(variable.get()) != 0; }
+  void VisitStmt_(const AssignStmtPtr&) override { valid = false; }
+};
+
+// Exact cost of generated launch decisions: comparisons, eager Boolean ops,
+// and branch decisions each cost one. Opaque inner guards are unchanged and
+// cancelled only under UniformCommandBody's original-frame certificate.
+class CaseDispatchCost {
+  const ExprPtr& block_;
+  int64_t value_;
+  size_t cost_ = 0;
+  bool valid_ = true;
+  std::optional<bool> Condition(const ExprPtr& expression) {
+    if (auto known = As<ConstBool>(expression)) return known->value_;
+    const auto binary = As<BinaryExpr>(expression);
+    if (!binary) return std::nullopt;
+    if (As<And>(expression) || As<Or>(expression)) {
+      auto left = Condition(binary->left_), right = Condition(binary->right_);
+      if (!left || !right) return std::nullopt;
+      ++cost_;  // Both operands are evaluated by scalar code generation.
+      return As<And>(expression) ? *left && *right : *left || *right;
+    }
+    const auto bound = As<ConstInt>(binary->right_);
+    if (binary->left_ != block_ || !bound) return std::nullopt;
+    ++cost_;
+    if (As<Le>(expression)) return value_ <= bound->value_;
+    if (As<Lt>(expression)) return value_ < bound->value_;
+    if (As<Ge>(expression)) return value_ >= bound->value_;
+    if (As<Gt>(expression)) return value_ > bound->value_;
+    if (As<Eq>(expression)) return value_ == bound->value_;
+    valid_ = false;
+    return std::nullopt;
+  }
+  void Visit(const ControlPtr& stmt) {
+    if (!stmt->condition) {
+      for (const auto& child : stmt->body) Visit(child);
+    } else {
+      const auto saved = cost_;
+      auto selected = Condition(stmt->condition);
+      if (!selected) {
+        cost_ = saved;
+        return;
+      }
+      ++cost_;
+      for (const auto& child : *selected ? stmt->body : stmt->alternative) Visit(child);
+    }
+  }
+
+ public:
+  CaseDispatchCost(const ExprPtr& block, int64_t value) : block_(block), value_(value) {}
+  std::optional<size_t> Measure(const ControlForest& body) {
+    for (const auto& stmt : body) Visit(stmt);
+    return valid_ ? std::optional<size_t>(cost_) : std::nullopt;
+  }
+};
+
+// Two disjoint intervals are the initial supported union subclass. This is a
+// constant-size decision problem, independent of launch size and trip counts;
+// it does not perform an all-pairs sequence search. More elaborate unions keep
+// the balanced sequence tree. In particular, a gap is never replaced by a hull.
+ControlForest ShareDisjointSequence(const ExprPtr& block, const Intervals& possible,
+                                    const std::vector<CaseCommands>& cases, const ControlForest& incumbent,
+                                    const std::set<const Var*>& uniform_variables,
+                                    PhysicalSyncRealization& work, const Span& span) {
+  if (cases.size() != 2 || !block || !SameControl(cases[0].body, cases[1].body)) return incumbent;
+  UniformCommandBody uniform(uniform_variables);
+  VisitControlExpressions(cases[0].body, uniform);
+  if (!uniform.valid) return incumbent;
+  const auto context = std::make_pair(possible.front().first, possible.back().second);
+  std::vector<ExprPtr> predicates;
+  std::set<int64_t> boundaries{context.first, context.second + 1};
+  for (const auto& item : cases) {
+    const auto lo = std::max(context.first, item.blocks.first);
+    const auto hi = std::min(context.second, item.blocks.second);
+    if (lo > hi) return incumbent;
+    predicates.push_back(SyncInvocationGuard(block, context, {lo, hi}, span));
+    boundaries.insert(lo);
+    boundaries.insert(hi + 1);
+  }
+  if (!predicates[0] || !predicates[1]) return incumbent;
+  const auto predicate = std::make_shared<Or>(predicates[0], predicates[1], DataType::BOOL, span);
+  ControlForest candidate{ControlBranch(predicate, cases[0].body, std::nullopt, span, work)};
+  const CaseCodeSize old_size(incumbent), new_size(candidate);
+  work.case_sequence_visits += old_size.statements + new_size.statements;
+  work.control_expression_visits += old_size.expressions + new_size.expressions;
+  if (!new_size.Improves(old_size)) return incumbent;
+  std::array<size_t, 2> old_max{}, new_max{};
+  // Predicates are constant on these atoms. Intersecting possible intervals is
+  // exact even when an atom begins in a proved-absent part of the launch domain.
+  for (auto it = boundaries.begin(), next = std::next(it); next != boundaries.end(); ++it, ++next) {
+    if (!DomainIntersects(possible, *it, *next - 1)) continue;
+    const bool active = (*it >= cases[0].blocks.first && *it <= cases[0].blocks.second) ||
+                        (*it >= cases[1].blocks.first && *it <= cases[1].blocks.second);
+    const auto before = CaseDispatchCost(block, *it).Measure(incumbent);
+    const auto after = CaseDispatchCost(block, *it).Measure(candidate);
+    if (!before || !after) return incumbent;
+    old_max[active] = std::max(old_max[active], *before);
+    new_max[active] = std::max(new_max[active], *after);
+  }
+  if (new_max[0] > old_max[0] || new_max[1] > old_max[1]) return incumbent;
+  ++work.shared_disjoint_case_cuts;
+  return candidate;
+}
+
+// Reuse the same union rule after stripping an ordered common prefix/suffix
+// from three exhaustive cases A/B/A. The middle residual must be empty. Thus
+// this is still a two-interval union, not symbolic family or phase unification.
+ControlForest ShareResidualSequence(const ExprPtr& block, const Intervals& possible,
+                                    const std::vector<CaseCommands>& cases, const ControlForest& incumbent,
+                                    const std::set<const Var*>& uniform_variables,
+                                    PhysicalSyncRealization& work, const Span& span) {
+  if (cases.size() != 3 || !block) return incumbent;
+  Intervals covered;
+  std::array<ControlForest, 3> bodies;
+  UniformCommandBody uniform(uniform_variables);
+  for (size_t i = 0; i < 3; ++i) {
+    covered.push_back(cases[i].blocks);
+    VisitControlExpressions(cases[i].body, uniform);
+    FlattenControlSequence(cases[i].body, bodies[i], work);
+  }
+  // Prefix/suffix work also enters the inner maximum being cancelled, so its
+  // valuation domain must be uniform. Coverage is required before hoisting it.
+  if (!uniform.valid || !SubtractIntervals(possible, covered).empty()) return incumbent;
+  size_t prefix = 0, suffix = 0;
+  auto same = [&](size_t i, bool back) {
+    if (prefix + suffix >= bodies[i].size()) return false;
+    ++work.case_sequence_comparisons;
+    return SameControl(bodies[0][back ? bodies[0].size() - 1 - suffix : prefix],
+                       bodies[i][back ? bodies[i].size() - 1 - suffix : prefix]);
+  };
+  while (prefix + suffix < bodies[0].size() && same(1, false) && same(2, false)) ++prefix;
+  while (prefix + suffix < bodies[0].size() && same(1, true) && same(2, true)) ++suffix;
+  if (prefix + suffix != bodies[1].size() || prefix + suffix >= bodies[0].size() ||
+      prefix + suffix >= bodies[2].size())
+    return incumbent;
+  std::vector<CaseCommands> residual;
+  for (size_t i : {size_t{0}, size_t{2}})
+    residual.push_back({cases[i].blocks,
+                        ControlSequence({bodies[i].begin() + prefix, bodies[i].end() - suffix}, span, work)});
+  const auto previous = work.shared_disjoint_case_cuts;
+  // Certify against the actual selected incumbent, not a newly reconstructed
+  // tree. The omitted shared prefix/suffix contain no launch-dependent work,
+  // so reattaching them leaves this dispatch comparison exactly unchanged.
+  auto middle = ShareDisjointSequence(block, possible, residual, incumbent, uniform_variables, work, span);
+  if (work.shared_disjoint_case_cuts == previous) return incumbent;
+  ControlForest candidate(bodies[0].begin(), bodies[0].begin() + prefix);
+  candidate.insert(candidate.end(), middle.begin(), middle.end());
+  candidate.insert(candidate.end(), bodies[0].end() - suffix, bodies[0].end());
+  const CaseCodeSize old_size(incumbent), new_size(candidate);
+  work.case_sequence_visits += old_size.statements + new_size.statements;
+  work.control_expression_visits += old_size.expressions + new_size.expressions;
+  if (!new_size.Improves(old_size)) {
+    work.shared_disjoint_case_cuts = previous;
+    return incumbent;
+  }
+  return candidate;
+}
+
+ControlForest ScheduleCommandCases(const ExprPtr& block, const Intervals& possible,
+                                   const std::vector<CaseCommands>& cases, PhysicalSyncRealization& work,
+                                   const Span& span, const std::set<const Var*>& uniform_variables) {
+  ControlForest target;
+  if (possible.empty()) return target;
+  int64_t previous = -1;
+  for (const auto& [lo, hi] : possible) {
+    CHECK(lo > previous && hi >= lo && hi < std::numeric_limits<int64_t>::max())
+        << "Invalid cut execution domain";
+    previous = hi;
+  }
+  previous = -1;
+  for (const auto& item : cases) {
+    CHECK(item.blocks.first > previous && item.blocks.second >= item.blocks.first &&
+          item.blocks.second < std::numeric_limits<int64_t>::max())
+        << "Invalid ordered command cases";
+    previous = item.blocks.second;
+  }
+  const auto context = std::make_pair(possible.front().first, possible.back().second);
+  const auto coalesced = CoalesceCutCases(cases, possible, work);
+  for (const auto& item : coalesced) {
+    const auto selected = std::make_pair(std::max(context.first, item.blocks.first),
+                                         std::min(context.second, item.blocks.second));
+    if (selected.first > selected.second) continue;
+    const auto guard = SyncInvocationGuard(block, context, selected, span);
+    target.push_back(guard ? ControlBranch(guard, item.body, std::nullopt, span, work) : item.body);
+  }
+  if (coalesced.size() > 1) {
+    auto candidate = CaseSequenceTree(block, span, work).Build(coalesced, possible);
+    const CaseCodeSize old_size(target), new_size(candidate);
+    work.case_sequence_visits += old_size.statements + new_size.statements;
+    work.control_expression_visits += old_size.expressions + new_size.expressions;
+    if (new_size.Improves(old_size)) {
+      ++work.factored_case_cuts;
+      target = std::move(candidate);
+    }
+  }
+  target = ShareDisjointSequence(block, possible, coalesced, target, uniform_variables, work, span);
+  return ShareResidualSequence(block, possible, coalesced, target, uniform_variables, work, span);
+}
+
 class Emitter : public SyncPlacement {
  public:
   Emitter(const CompactSyncInput& input, PhysicalSyncRealization& result)
@@ -721,8 +1169,8 @@ class Emitter : public SyncPlacement {
               << "Internal error: incompatible original initialization cut";
           continuation = retained;
         }
-        AppendCase(retained->before_cases, blocks, commands.before, site.original->span_);
-        AppendCase(retained->after_cases, blocks, commands.after, site.original->span_);
+        AppendCase(retained->before_cases, blocks, commands.before, site.original->span_, result_);
+        AppendCase(retained->after_cases, blocks, commands.after, site.original->span_, result_);
       }
     }
   }
@@ -731,10 +1179,70 @@ class Emitter : public SyncPlacement {
   PhysicalSyncRealization& result_;
   std::unique_ptr<SyncTokenNames> names_;
   std::map<SyncSiteKey, std::vector<size_t>> incoming_, outgoing_;
+  std::map<size_t, std::shared_ptr<const SyncEndpointFrame>> endpoint_frames_;
+  using EndpointKey = std::pair<size_t, std::vector<std::pair<int64_t, int64_t>>>;
+  std::map<EndpointKey, std::shared_ptr<const SyncEndpointDomain>> endpoint_domains_;
+  std::map<const SyncEndpointDomain*, std::vector<ExprPtr>> endpoint_guards_;
+  std::map<size_t, std::unique_ptr<CommandConditions>> conditions_;
+  std::map<size_t, ExprPtr> ordinals_;
+  CommandConditions& Conditions(size_t region) {
+    auto& value = conditions_[region];
+    if (!value) value = std::make_unique<CommandConditions>(input_.segments[region]);
+    return *value;
+  }
+  std::shared_ptr<const SyncEndpointDomain> EndpointDomain(const Family& f, bool publish) {
+    const auto r = publish ? f.source_region : f.target_region;
+    auto retained = publish ? f.source_domain : f.target_domain;
+    const auto& frames = input_.segments[r].nested_frames;
+    if (retained) {
+      const auto& context = *retained->frame;
+      INTERNAL_CHECK(context.owner == input_.owner && context.blocks == input_.block_bounds &&
+                     context.region == r && context.loops.size() == frames.size() &&
+                     retained->ranges.size() == frames.size())
+          << "Foreign endpoint domain";
+      for (size_t i = 0; i < frames.size(); ++i)
+        INTERNAL_CHECK(context.loops[i].loop == frames[i].loop && context.loops[i].count == frames[i].count &&
+                       context.loops[i].start == frames[i].start && context.loops[i].step == frames[i].step &&
+                       context.loops[i].start_expression == frames[i].start_expression)
+            << "Incompatible original endpoint frame";
+      return retained;
+    }
+    // Mathematics-only clients use the same domain representation. Decode once
+    // at this compatibility boundary; actual-token clients never take this path.
+    auto base = publish ? f.source_first : f.target_first;
+    std::vector<std::pair<int64_t, int64_t>> ranges(frames.size());
+    for (size_t i = frames.size(); i-- > 0;) {
+      INTERNAL_CHECK(frames[i].count > 0) << "Physical endpoint in absent frame";
+      const auto first = base % frames[i].count;
+      base /= frames[i].count;
+      const auto count = i < f.axes.size() ? f.axes[i].count : 1;
+      INTERNAL_CHECK(i >= f.axes.size() || f.axes[i].frame == frames[i].loop) << "Physical scope identity";
+      INTERNAL_CHECK(count > 0 && count <= frames[i].count - first) << "Physical endpoint range";
+      ranges[i] = {first, first + count};
+    }
+    INTERNAL_CHECK(!base && f.axes.size() <= frames.size()) << "Physical scope arity";
+    EndpointKey key{r, std::move(ranges)};
+    if (auto found = endpoint_domains_.find(key); found != endpoint_domains_.end()) {
+      return found->second;
+    }
+    auto& frame = endpoint_frames_[r];
+    if (!frame)
+      frame = std::make_shared<SyncEndpointFrame>(
+          SyncEndpointFrame{input_.owner, input_.block_bounds, r, frames});
+    auto domain = std::make_shared<SyncEndpointDomain>(SyncEndpointDomain{frame, key.second});
+    endpoint_domains_.emplace(std::move(key), domain);
+    return domain;
+  }
+
   ExprPtr Integer(int64_t n, const Span& span) {
     return std::make_shared<ConstInt>(n, DataType::INDEX, span);
   }
   ExprPtr Ordinal(size_t region, const Span& span) {
+    auto& value = ordinals_[region];
+    if (!value) value = BuildOrdinal(region, span);
+    return value;
+  }
+  ExprPtr BuildOrdinal(size_t region, const Span& span) {
     const auto& s = input_.segments[region];
     if (!s.original_loop) return Integer(0, span);
     if (!s.nested_frames.empty()) {
@@ -770,41 +1278,68 @@ class Emitter : public SyncPlacement {
       value = std::make_shared<FloorDiv>(value, Integer(frame.step, span), DataType::INDEX, span);
     return value;
   }
-  std::vector<ExprPtr> ScopedGuards(const Family& family, bool publish, const Span& span) {
-    const auto region = publish ? family.source_region : family.target_region;
-    auto base = publish ? family.source_first : family.target_first;
-    const auto& frames = input_.segments[region].nested_frames;
-    std::vector<int64_t> digits(frames.size());
-    for (size_t i = frames.size(); i-- > 0;) {
-      INTERNAL_CHECK(frames[i].count > 0) << "Internal error: physical endpoint in absent frame";
-      digits[i] = base % frames[i].count;
-      base /= frames[i].count;
-    }
-    INTERNAL_CHECK(!base && family.axes.size() <= frames.size()) << "Internal error: physical scope arity";
+  // Rewrite only on the original positive-step lattice. In addition to each
+  // threshold, prove the normalized subtraction itself cannot wrap: endpoints
+  // can both fit int64 while their difference does not. A symbolic start keeps
+  // the established quotient expression; no new range assumption is introduced.
+  std::optional<int64_t> OriginalBoundary(const SyncLoopFrame& frame, int64_t digit) const {
+    const auto start = As<ConstInt>(frame.loop->start_), step = As<ConstInt>(frame.loop->step_);
+    if (!start || !step || frame.start_expression || frame.step <= 0 || frame.count <= 0 ||
+        start->value_ != frame.start || step->value_ != frame.step || digit < 0 || digit >= frame.count)
+      return std::nullopt;
+    const auto extent = __int128(frame.count - 1) * frame.step;
+    const auto last = __int128(frame.start) + extent;
+    const auto bound = __int128(frame.start) + __int128(digit) * frame.step;
+    if (extent > std::numeric_limits<int64_t>::max() || last > std::numeric_limits<int64_t>::max() ||
+        last < std::numeric_limits<int64_t>::min() || bound > std::numeric_limits<int64_t>::max() ||
+        bound < std::numeric_limits<int64_t>::min())
+      return std::nullopt;
+    return static_cast<int64_t>(bound);
+  }
+  const std::vector<ExprPtr>& ScopedGuards(const Family& family, bool publish, const Span& span) {
+    const auto domain = EndpointDomain(family, publish);
+    if (auto found = endpoint_guards_.find(domain.get()); found != endpoint_guards_.end())
+      return found->second;
+    const auto& frames = domain->frame->loops;
+    result_.endpoint_domain_entries += domain->ranges.size();
     std::vector<ExprPtr> guards;
     for (size_t i = 0; i < frames.size(); ++i) {
-      const auto count = i < family.axes.size() ? family.axes[i].count : 1;
-      if (i < family.axes.size())
-        INTERNAL_CHECK(family.axes[i].frame == frames[i].loop) << "Internal error: physical scope identity";
-      if (!digits[i] && count == frames[i].count) continue;
-      const auto value = FrameDigit(frames[i], span);
-      if (count == 1) {
-        guards.push_back(std::make_shared<Eq>(value, Integer(digits[i], span), DataType::BOOL, span));
+      const auto [first, end] = domain->ranges[i];
+      INTERNAL_CHECK(first >= 0 && end > first && end <= frames[i].count) << "Invalid endpoint interval";
+      if (!first && end == frames[i].count) continue;
+      // Each requested threshold is within the admitted frame, including
+      // nondivisible stop values. Never substitute stop-step for the last IV.
+      const auto first_bound = OriginalBoundary(frames[i], first);
+      const auto end_bound = end < frames[i].count ? OriginalBoundary(frames[i], end) : first_bound;
+      const bool original = first_bound && end_bound;
+      const auto value = original ? frames[i].loop->loop_var_ : FrameDigit(frames[i], span);
+      auto boundary = [&](int64_t digit) {
+        if (original) {
+          ++result_.normalized_endpoint_bounds;
+          return Integer(*OriginalBoundary(frames[i], digit), span);
+        }
+        return Integer(digit, span);
+      };
+      if (end - first == 1) {
+        guards.push_back(std::make_shared<Eq>(value, boundary(first), DataType::BOOL, span));
       } else {
-        if (digits[i])
-          guards.push_back(std::make_shared<Ge>(value, Integer(digits[i], span), DataType::BOOL, span));
-        if (digits[i] + count < frames[i].count)
-          guards.push_back(
-              std::make_shared<Lt>(value, Integer(digits[i] + count, span), DataType::BOOL, span));
+        if (first) guards.push_back(std::make_shared<Ge>(value, boundary(first), DataType::BOOL, span));
+        if (end < frames[i].count)
+          guards.push_back(std::make_shared<Lt>(value, boundary(end), DataType::BOOL, span));
       }
     }
-    return guards;
+    result_.endpoint_predicates_constructed += guards.size();
+    for (auto& guard : guards) guard = Conditions(domain->frame->region).Simplify(guard);
+    return endpoint_guards_.emplace(domain.get(), std::move(guards)).first->second;
   }
-  StmtPtr Guard(ExprPtr condition, StmtPtr body) {
+  ControlPtr Guard(ExprPtr condition, ControlPtr body) {
     ++result_.guard_sites;
-    return std::make_shared<IfStmt>(condition, body, std::nullopt, std::vector<VarPtr>{}, body->span_);
+    if (auto known = As<ConstBool>(condition)) {
+      return known->value_ ? body : ControlSequence({}, body->span, result_);
+    }
+    return ControlBranch(condition, body, std::nullopt, body->span, result_);
   }
-  StmtPtr Command(const Family& f, bool publish, const Span& span) {
+  ControlPtr Command(const Family& f, bool publish, const Span& span) {
     const auto [src, dst] = Pipes(input_, f);
     const size_t r = publish ? f.source_region : f.target_region;
     const int64_t first = publish ? f.source_first : f.target_first;
@@ -815,19 +1350,19 @@ class Emitter : public SyncPlacement {
     const auto ordinal = scoped ? Integer(0, span) : Ordinal(r, span);
     ExprPtr index = ordinal;
     if (!scoped && first) index = std::make_shared<Sub>(index, Integer(first, span), DataType::INDEX, span);
-    std::vector<StmtPtr> commands;
+    ControlForest commands;
     if (src == dst) {
       INTERNAL_CHECK(dst == PipeType::M || dst == PipeType::V)
           << "Only qualified M/V barriers may be emitted; scalar barriers are forbidden";
       auto call = OpRegistry::GetInstance().Create(dst == PipeType::M ? "system.bar_m" : "system.bar_v", {},
                                                    {}, span);
-      commands.push_back(std::make_shared<EvalStmt>(call, span));
+      commands.push_back(ControlCommand(call, span, result_));
       ++result_.barrier_sites;
     } else {
       ExprPtr residue;
       if (f.ids.size() > 1)
         residue = std::make_shared<FloorMod>(index, Integer(f.ids.size(), span), DataType::INDEX, span);
-      StmtPtr selection;
+      ControlPtr selection;
       // Distinct residue tests are mutually exclusive. Keep the last equality
       // too: no extra exhaustiveness/range premise is needed for this rewrite.
       // All selection arithmetic stays beneath the original presence guards.
@@ -839,12 +1374,12 @@ class Emitter : public SyncPlacement {
              {"event_id", f.ids[i]},
              {"core_type", std::string(input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
             span);
-        StmtPtr command = std::make_shared<EvalStmt>(call, span);
+        ControlPtr command = ControlCommand(call, span, result_);
         if (residue) {
           ++result_.guard_sites;
-          command = std::make_shared<IfStmt>(
-              std::make_shared<Eq>(residue, Integer(i, span), DataType::BOOL, span), command,
-              selection ? std::optional<StmtPtr>(selection) : std::nullopt, std::vector<VarPtr>{}, span);
+          command = ControlBranch(
+              Conditions(r).Simplify(std::make_shared<Eq>(residue, Integer(i, span), DataType::BOOL, span)),
+              command, selection ? std::optional<ControlPtr>(selection) : std::nullopt, span, result_);
         }
         selection = command;
         if (publish)
@@ -854,17 +1389,22 @@ class Emitter : public SyncPlacement {
       }
       if (selection) commands.push_back(selection);
     }
-    StmtPtr body = std::make_shared<SeqStmts>(commands, span);
+    ControlPtr body = ControlSequence(commands, span, result_);
     // The range guard surrounds residue arithmetic: no absent predecessor is
     // evaluated/consumed. Final-only exports never publish on earlier visits.
     if (scoped) {
-      auto guards = ScopedGuards(f, publish, span);
+      const auto& guards = ScopedGuards(f, publish, span);
       for (auto guard = guards.rbegin(); guard != guards.rend(); ++guard) body = Guard(*guard, body);
       return body;
     }
     if (first + f.count < input_.segments[r].count)
-      body = Guard(std::make_shared<Lt>(ordinal, Integer(first + f.count, span), DataType::BOOL, span), body);
-    if (first) body = Guard(std::make_shared<Ge>(ordinal, Integer(first, span), DataType::BOOL, span), body);
+      body = Guard(Conditions(r).Simplify(
+                       std::make_shared<Lt>(ordinal, Integer(first + f.count, span), DataType::BOOL, span)),
+                   body);
+    if (first)
+      body = Guard(
+          Conditions(r).Simplify(std::make_shared<Ge>(ordinal, Integer(first, span), DataType::BOOL, span)),
+          body);
     return body;
   }
   PhysicalCuts Commands(SyncSiteKey site, const Span& span) {
@@ -877,28 +1417,22 @@ class Emitter : public SyncPlacement {
     for (auto i : incoming_[site])
       if (!result_.families[i].ids.empty()) cuts.before.push_back(Command(result_.families[i], false, span));
     for (auto i : outgoing_[site]) cuts.after.push_back(Command(result_.families[i], true, span));
-    CommandConditions conditions(input_.segments[site.first]);
-    size_t remaining = 0;
-    for (auto* commands : {&cuts.before, &cuts.after})
-      for (auto& statement : *commands) {
-        statement = conditions.VisitStmt(statement);
-        remaining += CountCommandGuards(statement);
-      }
+    const auto remaining = CaseCodeSize(cuts.before).guards + CaseCodeSize(cuts.after).guards;
     INTERNAL_CHECK(result_.guard_sites >= previous_guards + remaining) << "Unexpected new command guards";
     result_.simplified_guard_sites += result_.guard_sites - previous_guards - remaining;
     result_.guard_sites = previous_guards + remaining;
-    cuts.before = ShareSyncCommandGuards(cuts.before, result_);
-    cuts.after = ShareSyncCommandGuards(cuts.after, result_);
+    cuts.before = CommandGuards().Build(cuts.before, result_);
+    cuts.after = CommandGuards().Build(cuts.after, result_);
     return cuts;
   }
   StmtPtr Wrap(const StmtPtr& payload, SyncSiteKey site) override {
     auto cuts = Commands(site, payload->span_);
     if (!names_) names_ = std::make_unique<SyncTokenNames>(input_.owner);
-    cuts.before = MaterializeCommandValues(cuts.before, *names_, result_);
-    cuts.after = MaterializeCommandValues(cuts.after, *names_, result_);
-    cuts.before.push_back(payload);
-    cuts.before.insert(cuts.before.end(), cuts.after.begin(), cuts.after.end());
-    return std::make_shared<SeqStmts>(cuts.before, payload->span_);
+    auto before = MaterializeCommandValues(MaterializeControl(cuts.before, result_), *names_, result_);
+    const auto after = MaterializeCommandValues(MaterializeControl(cuts.after, result_), *names_, result_);
+    before.push_back(payload);
+    before.insert(before.end(), after.begin(), after.end());
+    return std::make_shared<SeqStmts>(before, payload->span_);
   }
 };
 // The command builder above owns all protocol mechanics. This adapter only
@@ -908,9 +1442,9 @@ class InvocationEmitter : public IRMutator {
   SyncTokenNames names_;
   PhysicalSyncRealization& work_;
   StmtPtr Wrap(const StmtPtr& payload, const PhysicalCuts& cuts) {
-    auto statements = MaterializeCommandValues(cuts.before, names_, work_);
+    auto statements = MaterializeCommandValues(MaterializeControl(cuts.before, work_), names_, work_);
     statements.push_back(payload);
-    const auto after = MaterializeCommandValues(cuts.after, names_, work_);
+    const auto after = MaterializeCommandValues(MaterializeControl(cuts.after, work_), names_, work_);
     statements.insert(statements.end(), after.begin(), after.end());
     return std::make_shared<SeqStmts>(statements, payload->span_);
   }
@@ -1001,37 +1535,18 @@ StmtPtr MaterializeSyncCommandValues(const FunctionPtr& owner, const StmtPtr& co
 }
 std::vector<StmtPtr> EmitSyncCommandCases(const ExprPtr& block, const Intervals& possible,
                                           const std::vector<SyncCommandCase>& cases,
-                                          PhysicalSyncRealization& work, const Span& span) {
-  std::vector<StmtPtr> target;
-  if (possible.empty()) return target;
-  int64_t previous = -1;
-  for (const auto& [lo, hi] : possible) {
-    CHECK(lo > previous && hi >= lo && hi < std::numeric_limits<int64_t>::max())
-        << "Invalid cut execution domain";
-    previous = hi;
-  }
-  previous = -1;
-  for (const auto& item : cases) {
-    CHECK(item.blocks.first > previous && item.blocks.second >= item.blocks.first &&
-          item.blocks.second < std::numeric_limits<int64_t>::max())
-        << "Invalid ordered command cases";
-    previous = item.blocks.second;
-  }
-  const auto context = std::make_pair(possible.front().first, possible.back().second);
-  for (const auto& item : CoalesceCutCases(cases, possible, work)) {
-    const auto selected = std::make_pair(std::max(context.first, item.blocks.first),
-                                         std::min(context.second, item.blocks.second));
-    if (selected.first > selected.second) continue;
-    const auto guard = SyncInvocationGuard(block, context, selected, span);
-    target.push_back(
-        guard ? std::make_shared<IfStmt>(guard, item.body, std::nullopt, std::vector<VarPtr>{}, span)
-              : item.body);
-  }
-  return target;
+                                          PhysicalSyncRealization& work, const Span& span,
+                                          const std::set<const Var*>& uniform_variables) {
+  std::vector<CaseCommands> descriptors;
+  for (const auto& item : cases) descriptors.push_back({item.blocks, ImportControl(item.body, work)});
+  return MaterializeControl(ScheduleCommandCases(block, possible, descriptors, work, span, uniform_variables),
+                            work);
 }
 std::vector<StmtPtr> ShareSyncCommandGuards(const std::vector<StmtPtr>& commands,
                                             PhysicalSyncRealization& counters) {
-  return CommandGuards().Build(commands, counters);
+  ControlForest descriptors;
+  for (const auto& command : commands) descriptors.push_back(ImportControl(command, counters));
+  return MaterializeControl(CommandGuards().Build(descriptors, counters), counters);
 }
 SyncNativeReservations SyncNativeClaims(const CompactSyncInput& input, const std::string& target) {
   return NativeClaims(input, target);
@@ -1151,8 +1666,9 @@ FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterB
   std::set<const PhysicalCuts*> finalized;
   for (const auto& [anchor, cut] : cuts) {
     if (!finalized.insert(cut.get()).second) continue;
-    auto emit = [&](const std::vector<CaseCommands>& source, std::vector<StmtPtr>& target) {
-      target = EmitSyncCommandCases(block, cut->domain, source, control_work, owner->span_);
+    auto emit = [&](const std::vector<CaseCommands>& source, ControlForest& target) {
+      target = ScheduleCommandCases(block, cut->domain, source, control_work, owner->span_,
+                                    cut->uniform_variables);
     };
     emit(cut->before_cases, cut->before);
     emit(cut->after_cases, cut->after);

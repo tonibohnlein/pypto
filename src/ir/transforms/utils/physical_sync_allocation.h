@@ -70,10 +70,17 @@ struct SyncCommandCase {
 };
 // possible is a normalized conservative upper domain of the original cut.
 // Use the entire launch domain when evidence is unavailable, never an empty list.
+// Like ShareSyncCommandGuards, bodies contain only ready, immutable-coordinate
+// guards and physical commands. Factoring preserves each case's ordered trace;
+// no definition/payload may move and assignments are never recolored.
+// uniform_variables is optional original-cut evidence: only literal-bound,
+// positive-step IVs with a launch-independent domain at this cut may be named.
+// Omit it when original control or nested bounds do not establish that fact.
 std::vector<StmtPtr> EmitSyncCommandCases(const ExprPtr& block,
                                           const std::vector<std::pair<int64_t, int64_t>>& possible,
                                           const std::vector<SyncCommandCase>& cases,
-                                          PhysicalSyncRealization& work, const Span& span);
+                                          PhysicalSyncRealization& work, const Span& span,
+                                          const std::set<const Var*>& uniform_variables = {});
 // Same emitter-only precondition as ShareSyncCommandGuards. The owner supplies
 // name reservations; definitions stay inside the original command scope.
 StmtPtr MaterializeSyncCommandValues(const FunctionPtr& owner, const StmtPtr& commands);

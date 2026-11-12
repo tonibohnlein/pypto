@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <utility>
@@ -463,7 +464,23 @@ class Parser {
     }
     return result;
   }
-  std::optional<PhysicalSyncFamily> Family(const Pattern& pattern, const Use& use) const {
+  std::map<size_t, std::shared_ptr<const SyncEndpointFrame>> endpoint_frames_;
+  using EndpointKey = std::pair<size_t, std::vector<Interval>>;
+  std::map<EndpointKey, std::shared_ptr<const SyncEndpointDomain>> endpoint_domains_;
+  std::shared_ptr<const SyncEndpointDomain> Endpoint(size_t region, std::vector<Interval> ranges) {
+    EndpointKey key{region, std::move(ranges)};
+    if (auto found = endpoint_domains_.find(key); found != endpoint_domains_.end()) {
+      return found->second;
+    }
+    auto& frame = endpoint_frames_[region];
+    if (!frame)
+      frame = std::make_shared<SyncEndpointFrame>(SyncEndpointFrame{input_.owner, input_.block_bounds, region,
+                                                                    input_.segments[region].nested_frames});
+    auto domain = std::make_shared<SyncEndpointDomain>(SyncEndpointDomain{frame, key.second});
+    endpoint_domains_.emplace(std::move(key), domain);
+    return domain;
+  }
+  std::optional<PhysicalSyncFamily> Family(const Pattern& pattern, const Use& use) {
     const auto [sr, ss] = *pattern.source;
     const auto [tr, ts] = use.target;
     const auto& source = input_.segments[sr].nested_frames;
@@ -499,6 +516,7 @@ class Parser {
     strides(source, source_strides);
     strides(target, target_strides);
     __int128 source_base = 0, target_base = 0, count = 1;
+    std::vector<Interval> source_ranges, target_ranges;
     for (size_t i = 0; i < source.size(); ++i) {
       const auto& digit = pattern.digits[i];
       __int128 value = digit.offset;
@@ -512,10 +530,14 @@ class Parser {
       }
       CHECK(value >= 0 && value < source[i].count) << "Scoped token source has no active occurrence";
       source_base += value * source_strides[i];
+      const auto width =
+          digit.variable ? ranges.at(digit.variable).second - ranges.at(digit.variable).first : 1;
+      source_ranges.emplace_back(static_cast<int64_t>(value), static_cast<int64_t>(value) + width);
     }
     PhysicalSyncFamily out{sr, ss, tr, ts, 0, 0, 1, {}};
     for (size_t i = 0; i < target.size(); ++i) {
       const auto interval = ranges.at(target[i].loop.get());
+      target_ranges.push_back(interval);
       const auto axis_count = interval.second - interval.first;
       target_base += __int128(interval.first) * target_strides[i];
       if (last_axis && i <= *last_axis) {
@@ -533,6 +555,8 @@ class Parser {
     out.source_first = static_cast<int64_t>(source_base);
     out.target_first = static_cast<int64_t>(target_base);
     out.count = static_cast<int64_t>(count);
+    out.source_domain = Endpoint(sr, std::move(source_ranges));
+    out.target_domain = Endpoint(tr, std::move(target_ranges));
     return out;
   }
 };
