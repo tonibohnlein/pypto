@@ -1,0 +1,270 @@
+{
+  "trip_counts": [
+    {
+      "counts": [
+        2,
+        3
+      ],
+      "production_seconds": 0.001162863802164793,
+      "families": 7,
+      "axes": 4,
+      "parse_work": {
+        "read_statement_visits": 32,
+        "waits_inspected": 7,
+        "inactive_waits": 0,
+        "families": 7
+      },
+      "logical": {
+        "calls": {
+          "buffer.alloc": 1,
+          "buffer.load": 2,
+          "sync.record": 5,
+          "sync.wait": 7,
+          "buffer.abs": 2,
+          "sync.completed": 5,
+          "buffer.store": 2
+        },
+        "token_carries": 2
+      },
+      "physical": {
+        "calls": {
+          "buffer.alloc": 1,
+          "buffer.load": 2,
+          "system.set_flag": 7,
+          "system.wait_flag": 7,
+          "buffer.abs": 2,
+          "buffer.store": 2
+        },
+        "token_carries": 0
+      },
+      "mathematical_interface": {
+        "source_region_nodes": 5,
+        "interface_cells": 6,
+        "interface_ports": 46,
+        "interface_entries": 1288,
+        "merge_nodes": 3
+      }
+    },
+    {
+      "counts": [
+        2,
+        1000
+      ],
+      "production_seconds": 0.0011356840841472149,
+      "families": 7,
+      "axes": 4,
+      "parse_work": {
+        "read_statement_visits": 32,
+        "waits_inspected": 7,
+        "inactive_waits": 0,
+        "families": 7
+      },
+      "logical": {
+        "calls": {
+          "buffer.alloc": 1,
+          "buffer.load": 2,
+          "sync.record": 5,
+          "sync.wait": 7,
+          "buffer.abs": 2,
+          "sync.completed": 5,
+          "buffer.store": 2
+        },
+        "token_carries": 2
+      },
+      "physical": {
+        "calls": {
+          "buffer.alloc": 1,
+          "buffer.load": 2,
+          "system.set_flag": 7,
+          "system.wait_flag": 7,
+          "buffer.abs": 2,
+          "buffer.store": 2
+        },
+        "token_carries": 0
+      },
+      "mathematical_interface": {
+        "source_region_nodes": 5,
+        "interface_cells": 6,
+        "interface_ports": 46,
+        "interface_entries": 1288,
+        "merge_nodes": 3
+      }
+    },
+    {
+      "counts": [
+        1000,
+        3
+      ],
+      "production_seconds": 0.0014378572814166546,
+      "families": 7,
+      "axes": 5,
+      "parse_work": {
+        "read_statement_visits": 32,
+        "waits_inspected": 7,
+        "inactive_waits": 0,
+        "families": 7
+      },
+      "logical": {
+        "calls": {
+          "buffer.alloc": 1,
+          "buffer.load": 2,
+          "sync.record": 5,
+          "sync.wait": 7,
+          "buffer.abs": 2,
+          "sync.completed": 5,
+          "buffer.store": 2
+        },
+        "token_carries": 2
+      },
+      "physical": {
+        "calls": {
+          "buffer.alloc": 1,
+          "buffer.load": 2,
+          "system.set_flag": 7,
+          "system.wait_flag": 7,
+          "buffer.abs": 2,
+          "buffer.store": 2
+        },
+        "token_carries": 0
+      },
+      "mathematical_interface": {
+        "source_region_nodes": 5,
+        "interface_cells": 6,
+        "interface_ports": 150,
+        "interface_entries": 4200,
+        "merge_nodes": 16
+      }
+    },
+    {
+      "counts": [
+        1000000,
+        1000000
+      ],
+      "production_seconds": 0.0017775529995560646,
+      "families": 7,
+      "axes": 5,
+      "parse_work": {
+        "read_statement_visits": 32,
+        "waits_inspected": 7,
+        "inactive_waits": 0,
+        "families": 7
+      },
+      "logical": {
+        "calls": {
+          "buffer.alloc": 1,
+          "buffer.load": 2,
+          "sync.record": 5,
+          "sync.wait": 7,
+          "buffer.abs": 2,
+          "sync.completed": 5,
+          "buffer.store": 2
+        },
+        "token_carries": 2
+      },
+      "physical": {
+        "calls": {
+          "buffer.alloc": 1,
+          "buffer.load": 2,
+          "system.set_flag": 7,
+          "system.wait_flag": 7,
+          "buffer.abs": 2,
+          "buffer.store": 2
+        },
+        "token_carries": 0
+      },
+      "mathematical_interface": {
+        "source_region_nodes": 5,
+        "interface_cells": 6,
+        "interface_ports": 238,
+        "interface_entries": 6664,
+        "merge_nodes": 27
+      }
+    }
+  ],
+  "activation_hulls_same_payload_body": [
+    {
+      "blocks": 1,
+      "case_count": 1,
+      "parse_work": [
+        {
+          "read_statement_visits": 47,
+          "waits_inspected": 8,
+          "inactive_waits": 0,
+          "families": 8
+        }
+      ],
+      "logical": {
+        "calls": {
+          "buffer.get_block_idx": 1,
+          "buffer.alloc": 5,
+          "buffer.load": 4,
+          "sync.record": 5,
+          "sync.completed": 9,
+          "sync.wait": 8,
+          "buffer.extract": 2,
+          "buffer.matmul": 1,
+          "buffer.store": 1
+        },
+        "token_carries": 0
+      }
+    },
+    {
+      "blocks": 8,
+      "case_count": 1,
+      "parse_work": [
+        {
+          "read_statement_visits": 47,
+          "waits_inspected": 8,
+          "inactive_waits": 0,
+          "families": 8
+        }
+      ],
+      "logical": {
+        "calls": {
+          "buffer.get_block_idx": 1,
+          "buffer.alloc": 5,
+          "buffer.load": 4,
+          "sync.record": 5,
+          "sync.completed": 9,
+          "sync.wait": 8,
+          "buffer.extract": 2,
+          "buffer.matmul": 1,
+          "buffer.store": 1
+        },
+        "token_carries": 0
+      }
+    },
+    {
+      "blocks": 10,
+      "case_count": 2,
+      "parse_work": [
+        {
+          "read_statement_visits": 47,
+          "waits_inspected": 8,
+          "inactive_waits": 0,
+          "families": 8
+        },
+        {
+          "read_statement_visits": 9,
+          "waits_inspected": 0,
+          "inactive_waits": 0,
+          "families": 0
+        }
+      ],
+      "logical": {
+        "calls": {
+          "buffer.get_block_idx": 1,
+          "buffer.alloc": 5,
+          "buffer.load": 4,
+          "sync.record": 5,
+          "sync.completed": 9,
+          "sync.wait": 8,
+          "buffer.extract": 2,
+          "buffer.matmul": 1,
+          "buffer.store": 1
+        },
+        "token_carries": 0
+      }
+    }
+  ]
+}

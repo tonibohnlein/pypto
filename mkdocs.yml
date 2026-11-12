@@ -317,6 +317,7 @@ nav:
           - en/dev/ir/20-rotating-token-checkpoint.md
           - en/dev/ir/21-crossing-token-checkpoint.md
           - en/dev/ir/22-token-order-service-checkpoint.md
+          - en/dev/ir/23-token-production-checkpoint.md
           - en/dev/ir/18-qwen-prefill-pipeline.md
       - Passes:
           - en/dev/passes/index.md

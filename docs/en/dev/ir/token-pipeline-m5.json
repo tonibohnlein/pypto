@@ -1,0 +1,651 @@
+{
+  "revision": "421b91fa703ce429429529d3aedef2e5742078d4",
+  "source_sha256": {
+    "tests/ut/ir/transforms/qualify_token_production.py": "3d65bc8d624f753d24e6e3f3afd2c3294f103c83cc069d2f1bf5e70472ebc4f2"
+  },
+  "extension_sha256": "ac1e5e3eb3aa17246061df26a948f375f2acadef54691d28ebb730ac004a8972",
+  "ptoas_sha256": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "command": [
+    "/usr/bin/python3",
+    "-m",
+    "tests.ut.ir.transforms.qualify_token_production",
+    "--output",
+    "build-py314/token-m5-qualification.json"
+  ],
+  "cases": [
+    {
+      "name": "matmul_64",
+      "input_sha256": "5b5176ea7001f3a804d7b95b47536d72bb1f8109ba09b9ca93df26ceb09f60ea",
+      "production_seconds": 0.0004124930128455162,
+      "standalone_stage_seconds": {
+        "insert": 0.0001878160983324051,
+        "optimize": 5.0167087465524673e-05,
+        "lower": 0.000276914332062006
+      },
+      "paired_seconds": [
+        {
+          "audit": 0.0002735620364546776,
+          "production": 0.00044180871918797493
+        },
+        {
+          "production": 0.00034882407635450363,
+          "audit": 0.00012737605720758438
+        },
+        {
+          "audit": 0.00011828821152448654,
+          "production": 0.00036554597318172455
+        }
+      ],
+      "outputs": [
+        {
+          "function": "matmul_64_incore_0",
+          "logical": {
+            "calls": {
+              "buffer.alloc": 5,
+              "buffer.load": 2,
+              "sync.record": 4,
+              "sync.wait": 4,
+              "buffer.copy": 2,
+              "buffer.matmul": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "physical": {
+            "calls": {
+              "buffer.alloc": 5,
+              "buffer.load": 2,
+              "system.set_flag": 4,
+              "system.wait_flag": 4,
+              "buffer.copy": 2,
+              "buffer.matmul": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "audit_physical": {
+            "calls": {
+              "buffer.alloc": 5,
+              "buffer.load": 2,
+              "system.set_flag": 4,
+              "system.wait_flag": 4,
+              "buffer.copy": 2,
+              "buffer.matmul": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "arithmetic_sites": 5,
+          "audit_arithmetic_sites": 5,
+          "audit_pto_sha256": "6d92efbd06e5ec9a9b8714fbc979a39adf380f7de55c88e2f390731677e6f5b7",
+          "pto_sha256": "6d92efbd06e5ec9a9b8714fbc979a39adf380f7de55c88e2f390731677e6f5b7",
+          "cpp_sha256": "8e22e513cfd0b53786af732eb64a531e747ea1974bd17ce7b1ac4b3a6eb9f4c9"
+        }
+      ],
+      "independent_checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "added_pairs": 0,
+          "removed_pairs": 0,
+          "old_executed_sets": 4,
+          "new_executed_sets": 4
+        }
+      ],
+      "independent_reference": "fresh checks above"
+    },
+    {
+      "name": "matmul_acc_64",
+      "input_sha256": "02d52a390b8643c140b9554efc9e10088fa317297350311e722966da04973230",
+      "production_seconds": 0.0005508796311914921,
+      "standalone_stage_seconds": {
+        "insert": 0.0002520410344004631,
+        "optimize": 8.583208546042442e-05,
+        "lower": 0.00040715374052524567
+      },
+      "paired_seconds": [
+        {
+          "audit": 0.00032097287476062775,
+          "production": 0.0005799857899546623
+        },
+        {
+          "production": 0.0005493811331689358,
+          "audit": 0.00017101876437664032
+        },
+        {
+          "audit": 0.0001663542352616787,
+          "production": 0.0005583157762885094
+        }
+      ],
+      "outputs": [
+        {
+          "function": "matmul_acc_64_incore_0",
+          "logical": {
+            "calls": {
+              "buffer.alloc": 5,
+              "buffer.load": 4,
+              "sync.record": 9,
+              "sync.wait": 10,
+              "buffer.copy": 4,
+              "buffer.matmul": 1,
+              "buffer.matmul_acc": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "physical": {
+            "calls": {
+              "buffer.alloc": 5,
+              "buffer.load": 4,
+              "system.set_flag": 10,
+              "system.wait_flag": 10,
+              "buffer.copy": 4,
+              "buffer.matmul": 1,
+              "buffer.matmul_acc": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "audit_physical": {
+            "calls": {
+              "buffer.alloc": 5,
+              "buffer.load": 4,
+              "system.set_flag": 10,
+              "system.wait_flag": 10,
+              "buffer.copy": 4,
+              "buffer.matmul": 1,
+              "buffer.matmul_acc": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "arithmetic_sites": 6,
+          "audit_arithmetic_sites": 6,
+          "audit_pto_sha256": "5dcefb399da14b85756166d0bc3ed08021946305d7ecdb6f315495a686326a3d",
+          "pto_sha256": "5dcefb399da14b85756166d0bc3ed08021946305d7ecdb6f315495a686326a3d",
+          "cpp_sha256": "304b35c614c81bbcafa8027ea6798f436e3d2dc88f3c9a6505017e989a10e365"
+        }
+      ],
+      "independent_checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "added_pairs": 0,
+          "removed_pairs": 0,
+          "old_executed_sets": 10,
+          "new_executed_sets": 10
+        }
+      ],
+      "independent_reference": "fresh checks above"
+    },
+    {
+      "name": "ddr_split_k",
+      "input_sha256": "efb9bf6cbcb403638db2b80e4df84ad75eec56c977346b4b7431490d6e971db1",
+      "production_seconds": 0.0010629999451339245,
+      "standalone_stage_seconds": {
+        "insert": 0.0005193487741053104,
+        "optimize": 0.00013860687613487244,
+        "lower": 0.0006752349436283112
+      },
+      "paired_seconds": [
+        {
+          "audit": 0.0005063125863671303,
+          "production": 0.0010478137992322445
+        },
+        {
+          "production": 0.0010142424143850803,
+          "audit": 0.00034806691110134125
+        },
+        {
+          "audit": 0.00033172406256198883,
+          "production": 0.0010085231624543667
+        }
+      ],
+      "outputs": [
+        {
+          "function": "ddr_split_k_ddr_split_k",
+          "logical": {
+            "calls": {
+              "buffer.alloc": 7,
+              "buffer.load": 2,
+              "sync.record": 11,
+              "sync.completed": 4,
+              "sync.wait": 15,
+              "buffer.extract": 8,
+              "buffer.matmul": 2,
+              "buffer.matmul_acc": 4,
+              "buffer.store": 2
+            },
+            "token_carries": 4
+          },
+          "physical": {
+            "calls": {
+              "buffer.alloc": 7,
+              "buffer.load": 2,
+              "system.set_flag": 15,
+              "system.wait_flag": 15,
+              "buffer.extract": 8,
+              "buffer.matmul": 2,
+              "buffer.matmul_acc": 4,
+              "buffer.store": 2
+            },
+            "token_carries": 0
+          },
+          "audit_physical": {
+            "calls": {
+              "buffer.alloc": 7,
+              "buffer.load": 2,
+              "system.set_flag": 15,
+              "system.wait_flag": 15,
+              "buffer.extract": 8,
+              "buffer.matmul": 2,
+              "buffer.matmul_acc": 4,
+              "buffer.store": 2
+            },
+            "token_carries": 0
+          },
+          "arithmetic_sites": 50,
+          "audit_arithmetic_sites": 50,
+          "audit_pto_sha256": "90c33f78fbca95e6d03ca8f41c3b1b64ff76ec45239a7536e7f43bc5aa335100",
+          "pto_sha256": "90c33f78fbca95e6d03ca8f41c3b1b64ff76ec45239a7536e7f43bc5aa335100",
+          "cpp_sha256": "3c04e5829cd86a376394a0df41478425a716401f3b01372dfc03f9640d4dc10a"
+        }
+      ],
+      "independent_checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "added_pairs": 0,
+          "removed_pairs": 0,
+          "old_executed_sets": 19,
+          "new_executed_sets": 19
+        }
+      ],
+      "independent_reference": "fresh checks above"
+    },
+    {
+      "name": "vec",
+      "input_sha256": "c08b85f7a9a7592a8753e32c72463bd7b6bebdea0113931242fa67187b340e21",
+      "production_seconds": 0.0006845379248261452,
+      "standalone_stage_seconds": {
+        "insert": 0.0003308323211967945,
+        "optimize": 3.4951139241456985e-05,
+        "lower": 0.00042011775076389313
+      },
+      "paired_seconds": [
+        {
+          "audit": 0.00044646207243204117,
+          "production": 0.0006917528808116913
+        },
+        {
+          "production": 0.000634689349681139,
+          "audit": 0.0002842126414179802
+        },
+        {
+          "audit": 0.0002687494270503521,
+          "production": 0.0006434917449951172
+        }
+      ],
+      "outputs": [
+        {
+          "function": "finite_vec",
+          "logical": {
+            "calls": {
+              "buffer.alloc": 3,
+              "buffer.load": 2,
+              "sync.record": 3,
+              "sync.wait": 3,
+              "buffer.add": 1,
+              "buffer.abs": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "physical": {
+            "calls": {
+              "buffer.alloc": 3,
+              "buffer.load": 2,
+              "system.set_flag": 2,
+              "system.wait_flag": 2,
+              "buffer.add": 1,
+              "system.bar_v": 1,
+              "buffer.abs": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "audit_physical": {
+            "calls": {
+              "buffer.alloc": 3,
+              "buffer.load": 2,
+              "system.set_flag": 2,
+              "system.wait_flag": 2,
+              "buffer.add": 1,
+              "system.bar_v": 1,
+              "buffer.abs": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "arithmetic_sites": 7,
+          "audit_arithmetic_sites": 7,
+          "audit_pto_sha256": "e35ef36b5dad84123ed40fbcf66198f784a027e780f5d8976645621c5de7db73",
+          "pto_sha256": "e35ef36b5dad84123ed40fbcf66198f784a027e780f5d8976645621c5de7db73",
+          "cpp_sha256": "02452e29dff1cf692814c41a20df0de06a294dd11ec7f83ad56213a740f81c39"
+        }
+      ],
+      "independent_checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "added_pairs": 0,
+          "removed_pairs": 0,
+          "old_executed_sets": 2,
+          "new_executed_sets": 2
+        }
+      ],
+      "independent_reference": "fresh checks above"
+    },
+    {
+      "name": "rotating",
+      "input_sha256": "bfa36657fbdd669941e138f3b4a694960e0a4bda15ff7f5947d57a0618bf6362",
+      "production_seconds": 0.0008654976263642311,
+      "standalone_stage_seconds": {
+        "insert": 0.00040218932554125786,
+        "optimize": 4.508206620812416e-05,
+        "lower": 0.0005365121178328991
+      },
+      "paired_seconds": [
+        {
+          "audit": 0.0005678771995007992,
+          "production": 0.0008948068134486675
+        },
+        {
+          "production": 0.000846383161842823,
+          "audit": 0.0003761160187423229
+        },
+        {
+          "audit": 0.00036195898428559303,
+          "production": 0.0008359481580555439
+        }
+      ],
+      "outputs": [
+        {
+          "function": "rotating",
+          "logical": {
+            "calls": {
+              "buffer.alloc_multi": 1,
+              "sync.completed": 1,
+              "buffer.slot": 3,
+              "sync.wait": 3,
+              "buffer.load": 1,
+              "sync.record": 3,
+              "buffer.add": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 3
+          },
+          "physical": {
+            "calls": {
+              "buffer.alloc_multi": 1,
+              "buffer.slot": 3,
+              "system.wait_flag": 9,
+              "buffer.load": 1,
+              "system.set_flag": 9,
+              "buffer.add": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "audit_physical": {
+            "calls": {
+              "buffer.alloc_multi": 1,
+              "buffer.slot": 3,
+              "system.wait_flag": 9,
+              "buffer.load": 1,
+              "system.set_flag": 9,
+              "buffer.add": 1,
+              "buffer.store": 1
+            },
+            "token_carries": 0
+          },
+          "arithmetic_sites": 76,
+          "audit_arithmetic_sites": 76,
+          "audit_pto_sha256": "8ddf6a29ebb87c668b6790d6d5a9f82850f3de864b3db3b347a8532b765a086c",
+          "pto_sha256": "8ddf6a29ebb87c668b6790d6d5a9f82850f3de864b3db3b347a8532b765a086c",
+          "cpp_sha256": "fca7e30e6e8659b6cc1533f021dcff5bcbb8b55893ebd42405479c2719cf84c8"
+        }
+      ],
+      "independent_checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "added_pairs": 0,
+          "removed_pairs": 0,
+          "old_executed_sets": 18,
+          "new_executed_sets": 18
+        }
+      ],
+      "independent_reference": "fresh checks above"
+    },
+    {
+      "name": "crossings",
+      "input_sha256": "e574bc0772bab4b8e61ae384d1e8ccbefa8ae8e4a8def195c5d419946894509a",
+      "production_seconds": 0.0013237269595265388,
+      "standalone_stage_seconds": {
+        "insert": 0.0006314138881862164,
+        "optimize": 7.414072751998901e-05,
+        "lower": 0.0008518393151462078
+      },
+      "paired_seconds": [
+        {
+          "audit": 0.0007729367353022099,
+          "production": 0.0014256429858505726
+        },
+        {
+          "production": 0.0013602571561932564,
+          "audit": 0.0006484822370111942
+        },
+        {
+          "audit": 0.0005664587952196598,
+          "production": 0.0013768160715699196
+        }
+      ],
+      "outputs": [
+        {
+          "function": "rotating_sequence",
+          "logical": {
+            "calls": {
+              "buffer.alloc_multi": 1,
+              "sync.completed": 2,
+              "buffer.slot": 4,
+              "sync.wait": 7,
+              "buffer.load": 2,
+              "sync.record": 4,
+              "buffer.add": 2
+            },
+            "token_carries": 8
+          },
+          "physical": {
+            "calls": {
+              "buffer.alloc_multi": 1,
+              "buffer.slot": 4,
+              "system.wait_flag": 14,
+              "buffer.load": 2,
+              "system.set_flag": 14,
+              "buffer.add": 2
+            },
+            "token_carries": 0
+          },
+          "audit_physical": {
+            "calls": {
+              "buffer.alloc_multi": 1,
+              "buffer.slot": 4,
+              "system.wait_flag": 14,
+              "buffer.load": 2,
+              "system.set_flag": 14,
+              "buffer.add": 2
+            },
+            "token_carries": 0
+          },
+          "arithmetic_sites": 111,
+          "audit_arithmetic_sites": 111,
+          "audit_pto_sha256": "03bffb0ad5c2cc99f6de96d5ac3cf473d1143c29e8899d371120562bed5bfdeb",
+          "pto_sha256": "03bffb0ad5c2cc99f6de96d5ac3cf473d1143c29e8899d371120562bed5bfdeb",
+          "cpp_sha256": "52e2d944796b1c5e270ede21144085ac31320cd82e1c155f82b08da51613ff7b"
+        }
+      ],
+      "independent_checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "added_pairs": 0,
+          "removed_pairs": 0,
+          "old_executed_sets": 19,
+          "new_executed_sets": 19
+        }
+      ],
+      "independent_reference": "fresh checks above"
+    },
+    {
+      "name": "nested",
+      "input_sha256": "aa9cdb3428dda25bcd928943ba4561b79d6098ff874115a60ffe67b68941efd5",
+      "production_seconds": 0.0009897206909954548,
+      "standalone_stage_seconds": {
+        "insert": 0.00047993892803788185,
+        "optimize": 9.204307571053505e-05,
+        "lower": 0.000663211103528738
+      },
+      "paired_seconds": [
+        {
+          "audit": 0.00043718330562114716,
+          "production": 0.000973929651081562
+        },
+        {
+          "production": 0.0009092590771615505,
+          "audit": 0.0003221370279788971
+        },
+        {
+          "audit": 0.0002917749807238579,
+          "production": 0.0008973539806902409
+        }
+      ],
+      "outputs": [
+        {
+          "function": "nested_dma",
+          "logical": {
+            "calls": {
+              "buffer.alloc": 1,
+              "buffer.load": 2,
+              "sync.record": 5,
+              "sync.wait": 7,
+              "buffer.abs": 2,
+              "sync.completed": 5,
+              "buffer.store": 2
+            },
+            "token_carries": 2
+          },
+          "physical": {
+            "calls": {
+              "buffer.alloc": 1,
+              "buffer.load": 2,
+              "system.set_flag": 7,
+              "system.wait_flag": 7,
+              "buffer.abs": 2,
+              "buffer.store": 2
+            },
+            "token_carries": 0
+          },
+          "audit_physical": {
+            "calls": {
+              "buffer.alloc": 1,
+              "buffer.load": 2,
+              "system.set_flag": 6,
+              "system.wait_flag": 6,
+              "buffer.abs": 2,
+              "buffer.store": 2
+            },
+            "token_carries": 0
+          },
+          "arithmetic_sites": 44,
+          "audit_arithmetic_sites": 50,
+          "audit_pto_sha256": "3bc5ea02f2efb77b8fe2c53b05d026c4f3077551b690c5f9b07b94e99d6d25e3",
+          "pto_sha256": "a86a50b446ca743c68e2249b8ebdbaecfdbaac0284d29f5898eda23f7d97bc67",
+          "cpp_sha256": "438ead492bb97280e3f28e5b1b347529cecbe4b9bafd9fec010365a4841f47f3"
+        }
+      ],
+      "independent_checks": [
+        {
+          "parameters": {
+            "1": 0,
+            "3": 128
+          },
+          "block": null,
+          "added_pairs": 0,
+          "removed_pairs": 0,
+          "old_executed_sets": 15,
+          "new_executed_sets": 15
+        },
+        {
+          "parameters": {
+            "1": 16,
+            "3": 64
+          },
+          "block": null,
+          "added_pairs": 0,
+          "removed_pairs": 0,
+          "old_executed_sets": 15,
+          "new_executed_sets": 15
+        }
+      ],
+      "independent_reference": "fresh checks above"
+    }
+  ],
+  "timing_scope": "Three interleaved pairs; audit includes Python API boundaries; no device/speedup claim. Standalone stage timings include separate evidence collection; they are not parts of production total.",
+  "contracts": {
+    "target": "a2a3",
+    "eligible_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "disjoint_gm": true
+  },
+  "device": "not run",
+  "default_enabled": false,
+  "companions": {
+    "token-pipeline-m5-scaling.json": "432fb10a357d4a0bbc1c978062e18cb85ebe1e190d538da77ced5aae3eb5e8e9",
+    "token-pipeline-m5-qwen.json": "1bd3857bf0a430e0bc2dfeecef39f8f5f08dde6ce638042cd4f8fed98173d2b9"
+  },
+  "full_local_receipt": {
+    "path": "build-py314/token-m5-qualification.json",
+    "sha256": "2c451c68992f2e48b2b2ecb9895ee599cede377b8221431c7e6a1cf8bc7de92c"
+  },
+  "validation": {
+    "fresh_sync_gate": {
+      "receipt": "token-pipeline-m4.json",
+      "passed": 1269,
+      "failed": 0
+    },
+    "fresh_candidate_cpp": 12,
+    "fresh_independent_execution_comparisons": 8,
+    "qwen_independent_evidence": "M4 full Qwen test gate; same layers=2/hidden=512/bands; new production/serialized equality and candidate CPP here",
+    "hooks": "Qualification driver passed (build-py314/token-m5-final-driver-hooks.log); documentation checks recorded in build-py314/token-m5-doc-hooks.log"
+  },
+  "milestones": {
+    "M1": "qualified finite actual-token interpretation/lowering",
+    "M2": "qualified rotating histories and cross-region captures",
+    "M3": "scoped numerical token order, caller evidence and activation cases",
+    "M4": "opt-in production migrated to shared token services; original perfect-nest frames preserved",
+    "M5": "host qualification complete in documented scope; review recorded before commit"
+  },
+  "reviews": {
+    "architecture": "ACCEPT; read-only review, no independent test rerun",
+    "correctness": "ACCEPT; read-only review, no independent test rerun",
+    "algorithm_performance": "ACCEPT; read-only review, no independent test rerun"
+  }
+}
