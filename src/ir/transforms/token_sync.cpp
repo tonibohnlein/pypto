@@ -51,7 +51,10 @@ Pass InsertSync() {
           auto bounds = evidence.parameters.find(global->name_);
           const auto parameters =
               bounds == evidence.parameters.end() ? sync::SyncParameterBounds{} : bounds->second;
-          auto input = sync::ImportPlacedSync(function, true, target, parameters);
+          auto block = evidence.block_indices.find(global->name_);
+          const auto blocks =
+              block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
+          auto input = sync::ImportPlacedSync(function, true, target, parameters, blocks);
           auto analysis = sync::AnalyzeCompactSync(std::move(input));
           function = sync::RealizeCompactSync(analysis).function;
         }
@@ -70,18 +73,31 @@ Pass OptimizeSync() {
 }
 
 Pass LowerSync() {
-  return CreateFunctionPass(
-      [](const FunctionPtr& function) {
-        CheckLogicalSync(function);
-        if (!IsOwnedLeaf(function)) return function;
+  return CreateProgramPass(
+      [](const ProgramPtr& program) {
+        // Re-establish caller facts from this token program. Neither insertion's
+        // old analysis nor a process-global sidecar authorizes physical lowering.
+        for (const auto& [global, function] : program->functions_) CheckLogicalSync(function);
+        const auto evidence = sync::CollectSyncInvocationEvidence(program);
         auto* context = PassContext::Current();
         CHECK(context) << "LowerSync requires a target PassContext";
-        auto result =
-            sync::LowerLogicalSync(function, context->GetBackendHandler()->GetPtoTargetArch(), std::nullopt);
-        // Codegen may use the placed-access qualification only after all actual
-        // token uses have been lowered and the downstream manual marker exists.
-        if (result.set_sites && result.wait_sites) return sync::SyncOutcome(result.function, true, "");
-        return result.function;
+        auto functions = program->functions_;
+        for (auto& [global, function] : functions) {
+          if (!IsOwnedLeaf(function)) continue;
+          auto bound = evidence.parameters.find(global->name_);
+          const auto parameters =
+              bound == evidence.parameters.end() ? sync::SyncParameterBounds{} : bound->second;
+          auto block = evidence.block_indices.find(global->name_);
+          const auto blocks =
+              block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
+          auto result = sync::LowerLogicalSync(function, context->GetBackendHandler()->GetPtoTargetArch(),
+                                               std::nullopt, parameters, blocks);
+          // Mark only a complete physical plan. Functions without commands
+          // continue to receive downstream PTOAS synchronization as before.
+          function = result.set_sites && result.wait_sites ? sync::SyncOutcome(result.function, true, "")
+                                                           : result.function;
+        }
+        return std::make_shared<Program>(functions, program->name_, program->span_);
       },
       "LowerSync", PassProperties{.produced = {IRProperty::LogicalSyncValid}});
 }

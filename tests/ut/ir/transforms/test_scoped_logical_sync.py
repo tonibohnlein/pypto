@@ -132,7 +132,7 @@ def test_nonfinal_row_capture_and_outer_seam_reset(visits):
         assert visitor.found > 0, "fixture must retain an interior row completion"
 
 
-def test_dynamic_start_refusal_preserves_retained_mathematics():
+def dynamic_collective():
     original = repeat_collective(3, 1)
     assert isinstance(original.body, ir.SeqStmts)
     definition, loop, ret = original.body.stmts
@@ -158,10 +158,16 @@ def test_dynamic_start_refusal_preserves_retained_mathematics():
         original.func_type,
         ir_stage=original.ir_stage,
     )
+    return function
+
+
+def test_dynamic_start_tokens_preserve_retained_mathematics():
+    function = dynamic_collective()
+    span = function.span
     retained = testing.analyze_placed_sync(function, True, parameter_bounds={2: (0, 8)})
     covers = retained.expand_retained_demands(32)
     snapshot = ir.serialize(ir.Program([function], "Dynamic", span))
-    with pytest.raises(ValueError, match="constant original frame bounds"):
-        retained.realize()
+    logical = retained.realize()["function"]
+    verify(logical)
     assert retained.expand_retained_demands(32) == covers
     assert ir.serialize(ir.Program([function], "Dynamic", span)) == snapshot

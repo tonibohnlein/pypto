@@ -480,9 +480,11 @@ StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool
   return {std::move(stripped), std::move(erase.loops)};
 }
 PhysicalSyncRealization LowerStructuredLogicalSync(const FunctionPtr& function, const std::string& target,
-                                                   const std::optional<std::vector<int>>& eligible) {
+                                                   const std::optional<std::vector<int>>& eligible,
+                                                   const SyncParameterBounds& parameters,
+                                                   std::optional<std::pair<int64_t, int64_t>> blocks) {
   auto stripped = StripStructuredLogicalSync(function, true);
-  auto input = ImportPlacedSync(stripped.function, true, target);
+  auto input = ImportPlacedSync(stripped.function, true, target, parameters, blocks);
   if (input.region_tree) {
     auto families = ParseScopedTokenFamilies(function, input, stripped.loops);
     ScopedTokenOrder order(std::move(input), std::move(families));

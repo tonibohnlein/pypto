@@ -112,8 +112,9 @@ class Parser {
     }
     Register(*input.region_tree);
     for (const auto& [original, erased] : stripped) {
-      CHECK(frames_.count(erased.get())) << "Missing scoped token original frame";
-      loops_.emplace(original, erased.get());
+      // Import deliberately omits bodies of proved zero-trip frames. A
+      // reachable missing frame is still rejected by Read, before its body.
+      if (frames_.count(erased.get())) loops_.emplace(original, erased.get());
     }
   }
   std::vector<PhysicalSyncFamily> Run() {
@@ -147,8 +148,8 @@ class Parser {
   std::vector<Use> uses_;
 
   void Register(const SyncLoopFrame& frame) {
-    CHECK(!frame.start_expression || As<ConstInt>(frame.start_expression))
-        << "Scoped token lowering requires constant original frame bounds";
+    CHECK(!frame.start_expression || As<ConstInt>(frame.start_expression) || frame.count <= 1)
+        << "Scoped token lowering requires constant or proved zero/singleton frames";
     CHECK(frame.count >= 0 && frame.start >= 0 && frame.step > 0) << "Invalid scoped token frame";
     frames_.emplace(frame.loop.get(), frame);
     variables_.emplace(frame.loop->loop_var_.get(), frame.loop.get());
@@ -186,6 +187,8 @@ class Parser {
     CHECK(binary && constant && found != variables_.end() && active_frames_.count(found->second))
         << "Scoped token guard requires an active original coordinate";
     const auto& frame = frames_.at(found->second);
+    CHECK(!frame.start_expression || As<ConstInt>(frame.start_expression))
+        << "Scoped token guard on a dynamic original frame is unavailable";
     const __int128 delta = __int128(constant->value_) - frame.start;
     CHECK(delta >= 0 && delta % frame.step == 0 && delta / frame.step < std::numeric_limits<int64_t>::max())
         << "Scoped token guard has an unavailable normalized coordinate";
@@ -296,6 +299,7 @@ class Parser {
     CHECK(cursor.pending.empty()) << "Scoped wait crosses an unsupported control cut";
     cursor.last.reset();
     if (auto loop = As<ForStmt>(statement)) {
+      CHECK(loops_.count(loop.get())) << "Missing scoped token original frame";
       const auto frame = loops_.at(loop.get());
       const auto count = frames_.at(frame).count;
       CHECK(loop->iter_args_.size() == loop->return_vars_.size()) << "Scoped token loop arity mismatch";

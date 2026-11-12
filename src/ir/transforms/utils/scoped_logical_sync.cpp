@@ -55,8 +55,12 @@ Coordinates Decode(const std::vector<SyncLoopFrame>& frames, int64_t ordinal) {
   return out;
 }
 ExprPtr Coordinate(const SyncLoopFrame& frame, int64_t ordinal) {
-  CHECK(!frame.start_expression || As<ConstInt>(frame.start_expression))
-      << "Scoped logical tokens require constant original frame bounds";
+  if (frame.start_expression && !As<ConstInt>(frame.start_expression)) {
+    // Import has proved this original invocation executes exactly once for
+    // every admitted caller. Its numerical start is only a placeholder.
+    CHECK(frame.count == 1 && ordinal == 0) << "Scoped token dynamic frame is not a proved singleton";
+    return frame.start_expression;
+  }
   const auto value = __int128(frame.start) + __int128(ordinal) * frame.step;
   CHECK(frame.start >= 0 && frame.step > 0 && value >= 0 && value <= std::numeric_limits<int64_t>::max())
       << "Scoped token original coordinate overflows";

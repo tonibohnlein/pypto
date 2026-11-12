@@ -43,8 +43,9 @@ feasibility.
 Lowering supports straight-line finite token programs and the canonical
 constant-lag loop form and qualified constant nested frames described below, over admitted placed Buffer payloads. The operation/footprint importer is reused for
 pipe and native-resource qualification; its admission restrictions and access-
-recovery costs still apply. Standalone lowering does not yet transport caller
-parameter or block-bound evidence. It interprets actual `sync.record`, `sync.completed`,
+recovery costs still apply. Insertion and lowering each collect caller parameter
+and block-bound evidence from their current Program, through the existing closed
+call/submit graph collector. Lowering never retains insertion's old proof domain. It interprets actual `sync.record`, `sync.completed`,
 `sync.join` and `sync.wait` definitions and uses. A record captures the source
 pipe prefix, including prior imported waits. Same-pipe joins denote conjunction;
 for finite ordered records, the latest prefix subsumes earlier prefixes.
@@ -189,7 +190,7 @@ The logical verifier checks SSA dominance in addition to the coordinate contract
 The construction adds `O(FD)` state and guard nodes for F supplied families and
 frame depth D, plus indexed lookups and original-DAG name reservation. It does not
 unfold row or trip counts. Upstream mathematical export construction is separate.
-Constant original frame bounds are required; dynamic starts remain unavailable
+Constant original frame bounds or proved dynamic zero/singleton starts are required; other dynamic starts remain unavailable
 without invalidating retained mathematics. These are logical insertion guarantees,
 not by themselves a consuming-flag assignment. The scoped order certificate below
 supplies a separate sufficient physical qualification.
@@ -295,8 +296,8 @@ records scaling to 1,048,575 rows or visits: three SET sites, three WAIT sites a
 24–26 arithmetic sites, with logarithmic summary growth. Single-run timings are
 descriptive. Native/device and invocation-return qualification remain separate.
 
-Unsupported DMA same-pipe mechanisms, dynamic original-frame bounds, general
-nonrectangular control and standalone caller/block evidence remain explicit limits.
+Unsupported DMA same-pipe mechanisms, nonuniform dynamic original-frame bounds, general
+nonrectangular control and missing caller/block evidence remain explicit limits.
 Resident replay/zero-inner cases retain their required logical ordering even when
 the existing physical mechanism refuses.
 
@@ -315,3 +316,34 @@ same opt-in switch and whole-kernel PTOAS delegation.
 No successful logical or physical result proves native invocation completion.
 The existing fresh-entry and native macro assumptions still apply. Device
 qualification and the runtime return-boundary contract remain separate.
+
+## Caller evidence and dynamic singleton frames
+
+Both passes consume explicit caller ranges, including the complete logical
+block-index hull. A scope is admitted only when that whole hull supports the
+same imported representation. This increment does not split activation cases;
+a hull straddling an active/inactive boundary remains unavailable.
+
+For an invocation-invariant dynamic start, the existing importer can prove
+uniform zero or one visits. Scoped token insertion and lowering preserve the
+original start expression and ordinal zero. The numerical placeholder start
+is never used as an executable coordinate. Zero-trip bodies need no descendant
+frame export; any reachable missing frame still refuses. Arbitrary guards on
+a dynamic frame remain unavailable, even if a literal guard happens to hold
+for one sampled start. Flat loop transport continues to require constant bounds.
+
+Fresh evidence proves coordinate validity, not fresh dependence coverage after
+arbitrary program edits. For example, changing a caller to activate a body
+that was absent during insertion can invalidate its supplied token protocol.
+LowerSync still interprets that protocol; it does not insert missing demands.
+Transformations changing payload/control/access semantics must preserve or
+re-establish synchronization before lowering. The physical ownership marker
+continues to certify only the supplied protocol, including manually edited uses.
+
+Evidence collection is charged once per pass, so the complete pipeline runs it
+twice. Existing expression-cache invalidations and call-graph work are included;
+there is no global one-visit-per-expression cost claim. No loop visits or caller
+values are enumerated. The unchanged PyPTO-lib matmul/GEMM, dynamic zero/singleton
+frames, changed caller refusals, edited uses and original coordinates have bounded
+independent token/flag checks. Full Qwen activation partition transport remains
+separate from this uniform-hull support.
