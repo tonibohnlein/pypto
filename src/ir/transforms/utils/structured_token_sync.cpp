@@ -28,6 +28,8 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/rotating_sync_analysis.h"
+#include "src/ir/transforms/utils/scoped_token_families.h"
+#include "src/ir/transforms/utils/scoped_token_order.h"
 #include "src/ir/transforms/utils/sync_boundary_graph.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
@@ -479,8 +481,15 @@ StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool
 }
 PhysicalSyncRealization LowerStructuredLogicalSync(const FunctionPtr& function, const std::string& target,
                                                    const std::optional<std::vector<int>>& eligible) {
-  auto stripped = StripStructuredLogicalSync(function, false);
+  auto stripped = StripStructuredLogicalSync(function, true);
   auto input = ImportPlacedSync(stripped.function, true, target);
+  if (input.region_tree) {
+    auto families = ParseScopedTokenFamilies(function, input, stripped.loops);
+    ScopedTokenOrder order(std::move(input), std::move(families));
+    // The callbacks borrow this owner until shared allocation/emission finishes.
+    // An unavailable proof refuses; it never substitutes a new demand analysis.
+    return RealizeDirectSync(order.Input(), order.Families(), order.View(), target, eligible);
+  }
   auto families = Parse(function, input, stripped.loops).Run();
   Order order(input, families);
   return RealizeDirectSync(input, std::move(families), order.View(), target, eligible);

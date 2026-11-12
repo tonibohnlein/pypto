@@ -48,10 +48,9 @@ def test_collective_tokens_match_actual_covers(rows, visits):
     assert checked["extra_event_pairs"] == 0
     inserted = _apply(passes.insert_sync, original)
     ir.assert_structural_equal(inserted, logical["function"])
-    # This increment qualifies token insertion, not nested consuming flags.
-    if visits and rows > 1:
-        with pytest.raises(ValueError, match="nested token frames"):
-            _apply(passes.lower_sync, inserted)
+    # Scoped lowering consumes these actual tokens; emitted matching and reuse
+    # are checked independently in test_scoped_token_order.
+    verify(_apply(passes.lower_sync, inserted))
 
 
 @pytest.mark.parametrize("counts", [(0, 2), (2, 0), (1, 1), (2, 3), (2, 2, 2)])
@@ -95,8 +94,8 @@ def test_scoped_token_serialization_and_repeat_preparation(tmp_path):
     check_graph(state, reference, require_equality=True)
 
 
-def wrapped_collective(visits=2):
-    original = collective_fixture(5, [[(0, 2), (2, 5)]])
+def wrapped_collective(visits=2, patterns=None):
+    original = collective_fixture(5, patterns or [[(0, 2), (2, 5)]])
     assert isinstance(original.body, ir.SeqStmts)
     definition, *body, ret = original.body.stmts
     span = original.span

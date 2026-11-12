@@ -23,7 +23,7 @@ completion tokens, with records after producers and waits before consumers.
 Its exporter supports qualified repeated bodies and single-region rotating
 slot streams using scalar token histories. Finite numerical crossing exports
 use occurrence captures as described below. Qualified constant nested frames
-also support scoped logical insertion; nested physical lowering remains unavailable.
+also support scoped logical insertion and qualified physical lowering as described below.
 Unsupported inputs raise; standalone insertion does not delegate.
 A new insertion request must not contain existing synchronization.
 
@@ -41,7 +41,7 @@ feasibility.
 ## LowerSync
 
 Lowering supports straight-line finite token programs and the canonical
-constant-lag loop form described below, over admitted placed Buffer payloads. The operation/footprint importer is reused for
+constant-lag loop form and qualified constant nested frames described below, over admitted placed Buffer payloads. The operation/footprint importer is reused for
 pipe and native-resource qualification; its admission restrictions and access-
 recovery costs still apply. Standalone lowering does not yet transport caller
 parameter or block-bound evidence. It interprets actual `sync.record`, `sync.completed`,
@@ -161,7 +161,7 @@ ownership of the supplied logical protocol, not independent storage coverage
 for handwritten tokens. Empty plans do not receive a fabricated marker. Existing
 delegated slot restrictions and native multi-buffer size limits still apply.
 
-Nested token frames, arbitrary structured joins, non-completed carry entry,
+Nested token frames without the scoped certificate below, arbitrary structured joins, non-completed carry entry,
 cyclic histories, live older-result crossings, noncanonical guards and unavailable caller range evidence
 remain explicit refusals. Existing production coverage is unchanged.
 
@@ -191,7 +191,8 @@ frame depth D, plus indexed lookups and original-DAG name reservation. It does n
 unfold row or trip counts. Upstream mathematical export construction is separate.
 Constant original frame bounds are required; dynamic starts remain unavailable
 without invalidating retained mathematics. These are logical insertion guarantees,
-not a consuming-flag assignment. Nested `LowerSync` remains explicitly refused.
+not by themselves a consuming-flag assignment. The scoped order certificate below
+supplies a separate sufficient physical qualification.
 
 The [scoped insertion receipt](../ir/token-pipeline-m3b.json) records 29 focused
 semantic/refusal cases, a 1,148-test broad gate, and a 150-test rebuilt token gate.
@@ -232,10 +233,77 @@ unfolded. Separate importer and verifier costs still apply.
 This interpretation can describe clipped intervals and longer histories than the
 current insertion subset. It does **not** certify uniform repeated order or
 physical reuse. Those require separate proofs before nested physical lowering
-can be enabled. The independent tests compare every expanded family use with
+is admitted. The independent tests compare every expanded family use with
 actual SSA execution, including changed captures, narrowed or removed guards,
 completed entry, duplicate waits, serialization and resets. The
 [interpretation receipt](../ir/token-pipeline-m3c.json) pins the tested increment.
+
+## Scoped numerical order and reuse
+
+For an original region tree, `LowerSync` now interprets its actual scoped tokens
+and constructs an order owner. It shares `BuildNumericalMergeOrder`,
+`QueryNumericalOrder` and the existing direct physical allocator/emitter. It does
+not call access conflict extraction, crossing generation or minimum-demand reduction.
+
+The owner normalizes the supplied original schedule into static leaves,
+contiguous joins and named repeats. It admits a token edge to its **proof graph**
+only when that edge is active throughout all repetitions of its owning region.
+A body-local edge requires full common ancestor domains. An adjacent seam requires
+the original last-left/first-right body coordinates and the complete seam domain;
+fixed suffix coordinates remain fixed after reset. First-only, last-only and other
+clipped edges remain actual handoff obligations but are omitted from this proof graph.
+Thus a positive query proves actual order; a negative query means unproved, not
+absence from the complete token program.
+
+Every join retains native start/start and completion/completion links plus its
+supplied token crossings. Every crossing endpoint is exported before composing.
+Binary repetition translates a seam between adjacent **original bodies**, even
+when the children summarize many bodies. Caches belong to immutable body/seam
+owners and include count and requested relative ports. Equal-sized distinct reset
+bodies cannot share incompatible summaries. No accumulator footprint exemption
+is converted into a completion-before-start edge.
+
+A repeated handoff uses one reuse query for each mixed-radix successor carry
+class: lower digits move last-to-first and one digit advances. All proof edges
+are uniform at their named frame; a reference-forward path inside a contiguous
+repeat cannot leave it and return. Translating that representative path therefore
+proves every successor in the class. A clipped handoff can use such a uniform
+witness even when its own edge was excluded from the proof graph. At direct cuts,
+`C_consumer(h) -> I_source(g)` establishes `WAIT(h) -> SET(g)`. Failure reports
+insufficient evidence and does not establish scarcity. Same-pipe barriers require
+an independent immediate native-predecessor check in the complete payload schedule.
+
+The actual family inventory, including duplicates and exceptional uses, reaches
+the unchanged allocator. No commands are removed to satisfy a proof or pool limit.
+The owner survives through allocation and emission; its query callbacks borrow
+that owner. Refusal preserves the immutable input. Default `RealizeSync` dispatch
+still uses the previously qualified direct route.
+
+Summary depth is logarithmic in repeat counts. B concrete external endpoints
+propagate through `O(B log K)` paths; symbolic families do not expand into K ports.
+The indexed merge kernel, port-set copying/comparison, source frame paths,
+leaf-query construction and interface sizes remain separate costs. Counters report
+distinct nonempty summary nodes and retained row entries, excluding cache aliases;
+they are not a byte count for all owner/cache storage.
+
+The bounded oracle expands the selected proof edges independently, checks all four
+event queries and inclusion in the actual SSA order, and checks every accepted
+reuse/barrier certificate. The physical oracle checks actual matching, causal flag
+reuse, six-ID eligibility and equality to the selected token order. Serialization
+and C++ generation are covered separately. The [receipt](../ir/token-pipeline-m3d.json)
+records scaling to 1,048,575 rows or visits: three SET sites, three WAIT sites and
+24–26 arithmetic sites, with logarithmic summary growth. Single-run timings are
+descriptive. Native/device and invocation-return qualification remain separate.
+
+Unsupported DMA same-pipe mechanisms, dynamic original-frame bounds, general
+nonrectangular control and standalone caller/block evidence remain explicit limits.
+Resident replay/zero-inner cases retain their required logical ordering even when
+the existing physical mechanism refuses.
+
+```bash
+/usr/bin/python3 -m tests.ut.ir.transforms.qualify_scoped_token_order \
+  --output build-py314/token-m3d-qualification.json
+```
 
 ## Migration and guarantees
 

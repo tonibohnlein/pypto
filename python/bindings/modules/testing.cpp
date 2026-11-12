@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -57,6 +58,7 @@
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/scoped_token_families.h"
+#include "src/ir/transforms/utils/scoped_token_order.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace nb = nanobind;
@@ -714,6 +716,33 @@ void BindTesting(nb::module_& m) {
            nb::arg("column"), nb::arg("parameters") = std::map<size_t, int64_t>{},
            nb::arg("block_index") = nb::none(),
            "Exact modeled point selector with explicit physical slot identity");
+  nb::class_<ir::sync::ScopedTokenOrder>(testing, "ScopedTokenOrder")
+      .def("precedes", &ir::sync::ScopedTokenOrder::Precedes)
+      .def("uniform", &ir::sync::ScopedTokenOrder::Uniform)
+      .def_prop_ro("summary_nodes", &ir::sync::ScopedTokenOrder::SummaryNodes)
+      .def_prop_ro("interface_entries", &ir::sync::ScopedTokenOrder::InterfaceEntries)
+      .def("reuse",
+           [](const ir::sync::ScopedTokenOrder& order, size_t i) { return order.View().scoped_reuse(i); })
+      .def("barrier",
+           [](const ir::sync::ScopedTokenOrder& order, size_t i) { return order.View().scoped_barrier(i); })
+      .def(
+          "realize",
+          [](const ir::sync::ScopedTokenOrder& order, const std::string& target) {
+            return ir::sync::RealizeDirectSync(order.Input(), order.Families(), order.View(), target,
+                                               std::nullopt)
+                .function;
+          },
+          nb::arg("target") = "a2a3");
+  testing.def(
+      "analyze_scoped_token_order",
+      [](const ir::FunctionPtr& function, const std::string& target) {
+        ir::CheckLogicalSync(function);
+        auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
+        auto input = ir::sync::ImportPlacedSync(stripped.function, true, target);
+        auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops);
+        return std::make_shared<ir::sync::ScopedTokenOrder>(std::move(input), std::move(families));
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3");
   testing.def(
       "inspect_scoped_token_families",
       [](const ir::FunctionPtr& function, const std::string& target) {

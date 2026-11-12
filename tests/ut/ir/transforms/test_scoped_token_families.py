@@ -36,17 +36,7 @@ class Uses(FiniteTokenExecution):
         super().payload(call, env)
 
 
-def compare(logical):
-    snapshot = ir.serialize(ir.Program([logical], "Before", logical.span))
-    result = testing.inspect_scoped_token_families(logical)
-    assert snapshot == ir.serialize(ir.Program([logical], "Before", logical.span))
-    original = result["function"]
-    _, calls = interpret(original)
-    reference = hardware_reference(original, calls)
-    state = Uses(calls, reference[0])
-    state.execute(logical.body, {})
-    assert state.payload_count == len(calls)
-    assert not any(state.pending.values())
+def occurrence_indices(result, calls):
     sites = {}
     for r, region in enumerate(result["regions"]):
         for s, (first, continuation) in enumerate(region["sites"]):
@@ -64,6 +54,21 @@ def compare(logical):
             visit = visit * count + digit
         assert (r, visit, s) not in occurrences
         occurrences[r, visit, s] = index
+    return occurrences
+
+
+def compare(logical):
+    snapshot = ir.serialize(ir.Program([logical], "Before", logical.span))
+    result = testing.inspect_scoped_token_families(logical)
+    assert snapshot == ir.serialize(ir.Program([logical], "Before", logical.span))
+    original = result["function"]
+    _, calls = interpret(original)
+    reference = hardware_reference(original, calls)
+    state = Uses(calls, reference[0])
+    state.execute(logical.body, {})
+    assert state.payload_count == len(calls)
+    assert not any(state.pending.values())
+    occurrences = occurrence_indices(result, calls)
     expanded = Counter()
     for family in result["families"]:
         sr, sv, ss = family["source"]

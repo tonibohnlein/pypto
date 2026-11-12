@@ -124,6 +124,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/logical_sync_realization.cpp
     src/ir/transforms/utils/scoped_logical_sync.cpp
     src/ir/transforms/utils/scoped_token_families.cpp
+    src/ir/transforms/utils/scoped_token_order.cpp
     src/ir/transforms/utils/physical_sync_realization.cpp
     src/ir/transforms/utils/hardware_loop_analysis.cpp
     src/ir/builder.cpp

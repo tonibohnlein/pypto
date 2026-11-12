@@ -72,7 +72,7 @@ def measure(rows, counts):
             ]
         },
         "production_same_tokens": True,
-        "physical_lowering": "unavailable: nested token frames; no allocation or C++ claim",
+        "physical_lowering": "not requested by this insertion-only campaign; no allocation or C++ claim",
         "device": "not run",
     }
     if rows <= 5 and max(counts) <= 3:
@@ -95,7 +95,7 @@ def main():
         "python": sys.version,
         "alias_contract": "disjoint distinct GM roots",
         "target": "a2a3",
-        "scope": "M3 scoped logical insertion only; actual-token nested physical lowering pending",
+        "scope": "M3 scoped logical insertion only; physical lowering not requested",
         "command": [
             sys.executable,
             "-m",
