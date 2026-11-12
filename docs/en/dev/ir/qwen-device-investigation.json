@@ -1,0 +1,742 @@
+{
+  "archive_sha256": "eb8a434f0be74a7521d74ecc3aa015d2dcfa690959c6351c8a0434827bae6d81",
+  "manifest_entries_verified": 4176,
+  "device_revision": "e10d882b23480d170377dd6fa227831354db8d49",
+  "host_review_revision": "9ffd2e5877f924e49dff1e4f351e52fdc6c62f5d",
+  "device_results": "Archived evidence: 50 mode-specific cells / 1734 checked invocations; not rerun",
+  "new_device_execution": false,
+  "fingerprint": {
+    "old_python314_default": "344ebf0fc0b70335f24e153ec757bb0521a67d5bffa1ef5d0028420b4afcad07",
+    "explicit_empty_fields": "d12d89fd0779f08ae9b18d74630b790be5d914b8b28d2282d9dab8f3b62089cd",
+    "fresh_body_checks": [
+      "3.11.15",
+      "3.12.13",
+      "3.14.7"
+    ],
+    "pytest": "2 passed, 36 deselected"
+  },
+  "census_scope": "Original H5120 L1 generated cube bodies, blocks0..19(output) /0..23(gateup), all four gateup bands. Host scalar control only; per-operation payload counts agree, not a native/dependency/sequence/address oracle. Predicate counts are evaluated source if conditions, not loop tests or optimized branch instructions.",
+  "commands": [
+    "python3 tests/ut/ir/transforms/qualify_qwen_device_commands.py build-py314/device-20261111/qwen-prefill-device-20261111 build-py314/device-command-census-final",
+    "PYTHONPATH=python python3 -m pytest -q tests/ut/ir/transforms/test_qwen_prefill_pipeline.py -k 'body_is_unchanged or fingerprint'"
+  ],
+  "census": [
+    {
+      "case": "output-b0-pypto",
+      "source": "results/t-b1-output-h5120-l1-b0-pypto/kernels/aic/out_proj_aic.cpp",
+      "source_sha256": "8356f605ed64a601cb08f819feae94026a89d2238e65ffa6fa9c65d1ca667bd4",
+      "control_sha256": "1a7843cd0a1bf8f933331c2ac7f7aef6413fbe5bc65e8bba93502c9667a16267",
+      "groups": [
+        {
+          "workers": 20,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "predicate": 908,
+            "set_flag": 357,
+            "wait_flag": 357
+          }
+        }
+      ]
+    },
+    {
+      "case": "output-b0-ptoas",
+      "source": "results/t-b1-output-h5120-l1-b0-ptoas/kernels/aic/out_proj_aic.cpp",
+      "source_sha256": "b75b466b1e1236a0c384b9701b2708b81313211da3971a06023a171c8b81d422",
+      "control_sha256": "8a1ffa1d4b6e19d14bed9e71ca9989ac4aad170fe2d83979b89e90f76e348256",
+      "groups": [
+        {
+          "workers": 20,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "pipe_barrier": 202,
+            "predicate": 40,
+            "set_flag": 369,
+            "wait_flag": 369
+          }
+        }
+      ]
+    },
+    {
+      "case": "gate_up-b0-pypto",
+      "source": "results/t-b1-gate_up-h5120-l1-b0-pypto/kernels/aic/gate_up_proj.cpp",
+      "source_sha256": "f1128709f1348bc70dfbef6717ed832a0db82dd8e2c19da8d455db8b85379fd4",
+      "control_sha256": "713ce86b4911ebfcc56d84a877b491a3020f897994ba975253f4aac9e5275c92",
+      "groups": [
+        {
+          "workers": 7,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "predicate": 2671,
+            "set_flag": 357,
+            "wait_flag": 357
+          }
+        },
+        {
+          "workers": 10,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 640,
+            "TLOAD": 80,
+            "TMATMUL": 2,
+            "TMATMUL_ACC": 318,
+            "TSTORE": 2,
+            "predicate": 5601,
+            "set_flag": 719,
+            "wait_flag": 719
+          }
+        },
+        {
+          "workers": 7,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "predicate": 2670,
+            "set_flag": 357,
+            "wait_flag": 357
+          }
+        }
+      ]
+    },
+    {
+      "case": "gate_up-b0-ptoas",
+      "source": "results/t-b1-gate_up-h5120-l1-b0-ptoas/kernels/aic/gate_up_proj.cpp",
+      "source_sha256": "00c6a923b021b439fec9f6b7453447f92a89db08162e87fa8a33204b4d06b77f",
+      "control_sha256": "127d247694b11a683447691aae802987fe55ddaea17797887cff97bc04921545",
+      "groups": [
+        {
+          "workers": 14,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "pipe_barrier": 202,
+            "predicate": 40,
+            "set_flag": 411,
+            "wait_flag": 411
+          }
+        },
+        {
+          "workers": 10,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 640,
+            "TLOAD": 80,
+            "TMATMUL": 2,
+            "TMATMUL_ACC": 318,
+            "TSTORE": 2,
+            "pipe_barrier": 403,
+            "predicate": 80,
+            "set_flag": 813,
+            "wait_flag": 813
+          }
+        }
+      ]
+    },
+    {
+      "case": "gate_up-b1-pypto",
+      "source": "results/t-b1-gate_up-h5120-l1-b1-pypto/kernels/aic/gate_up_proj.cpp",
+      "source_sha256": "23561ffbb73973747e52ce52f4e992299aeee8bfa839a8512f51624fc13bc177",
+      "control_sha256": "f732420d168a11c2d8aecc7970a9e2a6cd301a2f87ad0cb9f49ba90b1b8291da",
+      "groups": [
+        {
+          "workers": 7,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "predicate": 3552,
+            "set_flag": 357,
+            "wait_flag": 357
+          }
+        },
+        {
+          "workers": 10,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 640,
+            "TLOAD": 80,
+            "TMATMUL": 2,
+            "TMATMUL_ACC": 318,
+            "TSTORE": 2,
+            "predicate": 6482,
+            "set_flag": 719,
+            "wait_flag": 719
+          }
+        },
+        {
+          "workers": 7,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "predicate": 2670,
+            "set_flag": 357,
+            "wait_flag": 357
+          }
+        }
+      ]
+    },
+    {
+      "case": "gate_up-b1-ptoas",
+      "source": "results/t-b1-gate_up-h5120-l1-b1-ptoas/kernels/aic/gate_up_proj.cpp",
+      "source_sha256": "b9427b40846cb1f5893acf4198dd0fa30742d80238de246f61b997b0371dc092",
+      "control_sha256": "3612384e0985297db41818ea4300a2b1311fcec2591ee8012f289408846b6dbe",
+      "groups": [
+        {
+          "workers": 14,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "pipe_barrier": 202,
+            "predicate": 40,
+            "set_flag": 411,
+            "wait_flag": 411
+          }
+        },
+        {
+          "workers": 10,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 640,
+            "TLOAD": 80,
+            "TMATMUL": 2,
+            "TMATMUL_ACC": 318,
+            "TSTORE": 2,
+            "pipe_barrier": 403,
+            "predicate": 80,
+            "set_flag": 813,
+            "wait_flag": 813
+          }
+        }
+      ]
+    },
+    {
+      "case": "gate_up-b2-pypto",
+      "source": "results/t-b1-gate_up-h5120-l1-b2-pypto/kernels/aic/gate_up_proj.cpp",
+      "source_sha256": "b389f49cafd2a120a1d47fbb81b8c0e6470bca9802a1da507a6951eb6078721e",
+      "control_sha256": "c51c702c4f4634a926f4b2afe9fa4235f221e52eed17f74efb04d723a4517486",
+      "groups": [
+        {
+          "workers": 10,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 640,
+            "TLOAD": 80,
+            "TMATMUL": 2,
+            "TMATMUL_ACC": 318,
+            "TSTORE": 2,
+            "predicate": 7364,
+            "set_flag": 719,
+            "wait_flag": 719
+          }
+        },
+        {
+          "workers": 7,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "predicate": 3551,
+            "set_flag": 357,
+            "wait_flag": 357
+          }
+        },
+        {
+          "workers": 7,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "predicate": 3553,
+            "set_flag": 357,
+            "wait_flag": 357
+          }
+        }
+      ]
+    },
+    {
+      "case": "gate_up-b2-ptoas",
+      "source": "results/t-b1-gate_up-h5120-l1-b2-ptoas/kernels/aic/gate_up_proj.cpp",
+      "source_sha256": "7b11d14dde325c5dbfcff7a517e23a8694b70dbaae4b2d2f33d6bc1d5055402a",
+      "control_sha256": "59668fdcbba154b7a9f4f493f99b269f9fc6ce51bc33299eaf07429301acea0d",
+      "groups": [
+        {
+          "workers": 10,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 640,
+            "TLOAD": 80,
+            "TMATMUL": 2,
+            "TMATMUL_ACC": 318,
+            "TSTORE": 2,
+            "pipe_barrier": 403,
+            "predicate": 80,
+            "set_flag": 813,
+            "wait_flag": 813
+          }
+        },
+        {
+          "workers": 14,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "pipe_barrier": 202,
+            "predicate": 40,
+            "set_flag": 411,
+            "wait_flag": 411
+          }
+        }
+      ]
+    },
+    {
+      "case": "gate_up-b3-pypto",
+      "source": "results/t-b1-gate_up-h5120-l1-b3-pypto/kernels/aic/gate_up_proj.cpp",
+      "source_sha256": "e29b94dcbcd40361018d086c88f3a3208906b2710064e8edc46ef65135d7f2cd",
+      "control_sha256": "10c70946eb05c9dd0b9e95f0f352b53ffbaaedd1fd8163393f529e8d6a63e6b7",
+      "groups": [
+        {
+          "workers": 7,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "predicate": 3551,
+            "set_flag": 357,
+            "wait_flag": 357
+          }
+        },
+        {
+          "workers": 7,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "predicate": 2671,
+            "set_flag": 357,
+            "wait_flag": 357
+          }
+        },
+        {
+          "workers": 10,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 640,
+            "TLOAD": 80,
+            "TMATMUL": 2,
+            "TMATMUL_ACC": 318,
+            "TSTORE": 2,
+            "predicate": 6482,
+            "set_flag": 719,
+            "wait_flag": 719
+          }
+        }
+      ]
+    },
+    {
+      "case": "gate_up-b3-ptoas",
+      "source": "results/t-b1-gate_up-h5120-l1-b3-ptoas/kernels/aic/gate_up_proj.cpp",
+      "source_sha256": "cc0b7cf803e54db06a7953e0daa341de4d8df58809b52b7adf0ecadf7249590d",
+      "control_sha256": "87b90db6496f1b2beddcbc8c0f6da08379c7c6c0a1ba84b75ce8c4b54fddd2c4",
+      "groups": [
+        {
+          "workers": 14,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 320,
+            "TLOAD": 40,
+            "TMATMUL": 1,
+            "TMATMUL_ACC": 159,
+            "TSTORE": 1,
+            "pipe_barrier": 202,
+            "predicate": 40,
+            "set_flag": 411,
+            "wait_flag": 411
+          }
+        },
+        {
+          "workers": 10,
+          "counts": {
+            "TASSIGN": 13,
+            "TEXTRACT": 640,
+            "TLOAD": 80,
+            "TMATMUL": 2,
+            "TMATMUL_ACC": 318,
+            "TSTORE": 2,
+            "pipe_barrier": 403,
+            "predicate": 80,
+            "set_flag": 813,
+            "wait_flag": 813
+          }
+        }
+      ]
+    }
+  ],
+  "timing_summary": [
+    {
+      "config": "output-h5120-l1-b0",
+      "kind": "qwen_caller",
+      "workers": [
+        20
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 54.18,
+      "kernel_pypto_mad": 1.38,
+      "kernel_ptoas_median": 56.68,
+      "kernel_ptoas_mad": 1.38,
+      "kernel_n_pypto": 1980,
+      "kernel_n_ptoas": 1980,
+      "kernel_pct": -4.41,
+      "kernel_batch_ratios": [
+        0.9533,
+        0.9684,
+        0.9465
+      ],
+      "makespan_pypto_median": 60.32,
+      "makespan_ptoas_median": 62.82,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -3.98,
+      "makespan_batch_ratios": [
+        0.9584,
+        0.9699,
+        0.9517
+      ]
+    },
+    {
+      "config": "output-h5120-l2-b0",
+      "kind": "qwen_caller",
+      "workers": [
+        40
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 52.11,
+      "kernel_pypto_mad": 2.61,
+      "kernel_ptoas_median": 53.95,
+      "kernel_ptoas_mad": 2.91,
+      "kernel_n_pypto": 3960,
+      "kernel_n_ptoas": 3960,
+      "kernel_pct": -3.41,
+      "kernel_batch_ratios": [
+        0.9605,
+        0.9629,
+        0.9718
+      ],
+      "makespan_pypto_median": 118.78,
+      "makespan_ptoas_median": 123.86,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -4.1,
+      "makespan_batch_ratios": [
+        0.9559,
+        0.9554,
+        0.9627
+      ]
+    },
+    {
+      "config": "gate_up-h5120-l1-b0",
+      "kind": "qwen_caller",
+      "workers": [
+        24
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 90.41,
+      "kernel_pypto_mad": 32.55,
+      "kernel_ptoas_median": 93.07,
+      "kernel_ptoas_mad": 31.89,
+      "kernel_n_pypto": 2376,
+      "kernel_n_ptoas": 2376,
+      "kernel_pct": -2.86,
+      "kernel_batch_ratios": [
+        0.9782,
+        0.9642,
+        0.9686
+      ],
+      "makespan_pypto_median": 149.38,
+      "makespan_ptoas_median": 152.68,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -2.16,
+      "makespan_batch_ratios": [
+        0.9798,
+        0.9767,
+        0.9762
+      ]
+    },
+    {
+      "config": "gate_up-h5120-l1-b1",
+      "kind": "qwen_caller",
+      "workers": [
+        24
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 91.54,
+      "kernel_pypto_mad": 34.46,
+      "kernel_ptoas_median": 92.52,
+      "kernel_ptoas_mad": 32.9,
+      "kernel_n_pypto": 2376,
+      "kernel_n_ptoas": 2376,
+      "kernel_pct": -1.06,
+      "kernel_batch_ratios": [
+        1.0055,
+        0.9799,
+        0.9894
+      ],
+      "makespan_pypto_median": 148.88,
+      "makespan_ptoas_median": 150.88,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -1.33,
+      "makespan_batch_ratios": [
+        0.9948,
+        0.9864,
+        0.9789
+      ]
+    },
+    {
+      "config": "gate_up-h5120-l1-b2",
+      "kind": "qwen_caller",
+      "workers": [
+        24
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 89.51,
+      "kernel_pypto_mad": 32.93,
+      "kernel_ptoas_median": 90.8,
+      "kernel_ptoas_mad": 31.28,
+      "kernel_n_pypto": 2376,
+      "kernel_n_ptoas": 2376,
+      "kernel_pct": -1.42,
+      "kernel_batch_ratios": [
+        0.9627,
+        1.0008,
+        0.9906
+      ],
+      "makespan_pypto_median": 148.12,
+      "makespan_ptoas_median": 150.6,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -1.65,
+      "makespan_batch_ratios": [
+        0.9756,
+        0.9845,
+        0.9834
+      ]
+    },
+    {
+      "config": "gate_up-h5120-l1-b3",
+      "kind": "qwen_caller",
+      "workers": [
+        24
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 88.22,
+      "kernel_pypto_mad": 30.7,
+      "kernel_ptoas_median": 88.95,
+      "kernel_ptoas_mad": 29.67,
+      "kernel_n_pypto": 2376,
+      "kernel_n_ptoas": 2376,
+      "kernel_pct": -0.82,
+      "kernel_batch_ratios": [
+        0.9916,
+        0.9913,
+        0.9923
+      ],
+      "makespan_pypto_median": 149.44,
+      "makespan_ptoas_median": 151.48,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -1.35,
+      "makespan_batch_ratios": [
+        0.9981,
+        0.9841,
+        0.9799
+      ]
+    },
+    {
+      "config": "gate_up-h5120-l2-b0",
+      "kind": "qwen_caller",
+      "workers": [
+        48
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 94.28,
+      "kernel_pypto_mad": 41.67,
+      "kernel_ptoas_median": 96.71,
+      "kernel_ptoas_mad": 41.72,
+      "kernel_n_pypto": 4752,
+      "kernel_n_ptoas": 4752,
+      "kernel_pct": -2.51,
+      "kernel_batch_ratios": [
+        0.9703,
+        0.9724,
+        0.9801
+      ],
+      "makespan_pypto_median": 304.14,
+      "makespan_ptoas_median": 311.64,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -2.41,
+      "makespan_batch_ratios": [
+        0.9753,
+        0.9766,
+        0.9798
+      ]
+    },
+    {
+      "config": "gate_up-h5120-l2-b1",
+      "kind": "qwen_caller",
+      "workers": [
+        48
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 93.84,
+      "kernel_pypto_mad": 41.0,
+      "kernel_ptoas_median": 95.87,
+      "kernel_ptoas_mad": 40.84,
+      "kernel_n_pypto": 4752,
+      "kernel_n_ptoas": 4752,
+      "kernel_pct": -2.12,
+      "kernel_batch_ratios": [
+        0.9683,
+        0.9866,
+        0.9835
+      ],
+      "makespan_pypto_median": 300.78,
+      "makespan_ptoas_median": 306.94,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -2.01,
+      "makespan_batch_ratios": [
+        0.975,
+        0.9813,
+        0.9835
+      ]
+    },
+    {
+      "config": "gate_up-h5120-l2-b2",
+      "kind": "qwen_caller",
+      "workers": [
+        48
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 93.49,
+      "kernel_pypto_mad": 40.17,
+      "kernel_ptoas_median": 95.28,
+      "kernel_ptoas_mad": 40.07,
+      "kernel_n_pypto": 4752,
+      "kernel_n_ptoas": 4752,
+      "kernel_pct": -1.88,
+      "kernel_batch_ratios": [
+        0.9804,
+        0.9845,
+        0.9787
+      ],
+      "makespan_pypto_median": 301.2,
+      "makespan_ptoas_median": 307.0,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -1.89,
+      "makespan_batch_ratios": [
+        0.981,
+        0.9829,
+        0.9772
+      ]
+    },
+    {
+      "config": "gate_up-h5120-l2-b3",
+      "kind": "qwen_caller",
+      "workers": [
+        48
+      ],
+      "batches": 3,
+      "kernel_pypto_median": 93.2,
+      "kernel_pypto_mad": 40.44,
+      "kernel_ptoas_median": 95.31,
+      "kernel_ptoas_mad": 40.43,
+      "kernel_n_pypto": 4752,
+      "kernel_n_ptoas": 4752,
+      "kernel_pct": -2.21,
+      "kernel_batch_ratios": [
+        0.9845,
+        0.9683,
+        0.9824
+      ],
+      "makespan_pypto_median": 303.72,
+      "makespan_ptoas_median": 310.44,
+      "makespan_n_pypto": 99,
+      "makespan_n_ptoas": 99,
+      "makespan_pct": -2.16,
+      "makespan_batch_ratios": [
+        0.9799,
+        0.9766,
+        0.9797
+      ]
+    }
+  ],
+  "limitations": [
+    "Static reachable sites in original report were mislabeled executed.",
+    "Caller span includes setup; kernel-duration-us excludes it.",
+    "No equal-boundary tail ablation; tail dominance is a hypothesis.",
+    "No repeatable caller regression established; no logical block IDs in timings.",
+    "Archive native/device results do not qualify newer token commits."
+  ],
+  "sources": {
+    "tests/ut/ir/transforms/qualify_qwen_device_commands.py": "543c9c67075d96648dae04b6e5ade7ab1cb02e877d49665c8b3cd7f1178cb5f6",
+    "tests/ut/ir/transforms/sync_qwen_prefill_cases.py": "c63fce5430ba60e1e6e43d5e175dbf167a5a68a6b6a857982cda16100defb850",
+    "tests/ut/ir/transforms/fixtures/qwen_prefill/manifest.json": "19cfd3dba43df30782da6ac097104677369a0246498307515081af18e87b1bbb",
+    "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "1809a39557bced8f8cc93787824e12f6d99011b8163bc0688de5a4b449f16dc7"
+  },
+  "reviews": {
+    "architecture": "ACCEPT",
+    "correctness": "ACCEPT fingerprint portability fix",
+    "algorithm_performance": "ACCEPT investigation and pinned census"
+  }
+}

@@ -10,6 +10,8 @@
 
 """Original Qwen projection input contracts and staged qualification."""
 
+import ast
+
 import pytest
 from pypto import ir, testing
 
@@ -19,6 +21,7 @@ from .sync_qwen_prefill_cases import (
     assert_output_body_identity,
     capture_qwen_projection,
     original_control_trace,
+    source_body_ast,
 )
 from .test_nested_sync_repetition import expand_scoped_families
 from .test_sync_range_proofs import range_fixture
@@ -29,6 +32,18 @@ pytestmark = pytest.mark.usefixtures("ascend_backend")
 def test_original_gate_up_compute_body_is_unchanged():
     assert_gate_up_body_identity()
     assert_output_body_identity()
+
+
+def test_source_body_fingerprint_preserves_empty_fields_and_control():
+    # Empty call keywords/else arms disappeared from the default dump on the
+    # newer host interpreter, although the device still included them.
+    tree = ast.parse("if ready:\n    consume()\n")
+    fingerprint = source_body_ast(tree)
+    assert "keywords=[]" in fingerprint
+    assert "orelse=[]" in fingerprint
+    assert "type_ignores=[]" in fingerprint
+    assert fingerprint != source_body_ast(ast.parse("if not ready:\n    consume()\n"))
+    assert fingerprint != source_body_ast(ast.parse("if ready:\n    publish()\n"))
 
 
 @pytest.mark.parametrize("name,blocks", [("output", 20), ("gate_up", 24)])
