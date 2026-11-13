@@ -23,6 +23,19 @@ valid extents may be static partial rectangles or supported runtime rectangles w
 Elementwise Tile operands and their destination must have matching physical shapes
 and valid extents; matching valid extents alone do not qualify.
 
+Packed ND GM tensors may have a leading `INDEX` shape symbol and a static
+minor extent greater than one. The original runtime extent is preserved; the
+minor extent still determines the row stride. Selection and direct emission
+share this geometry check. Dynamic minor extents, nontrivial leading shape
+expressions and narrower integer shape symbols remain outside this capability.
+
+The direct Buffer emitter uses the existing tensor-shape ABI: tensor pointers,
+explicit scalar arguments, deduplicated implicit shape symbols, then SPMD
+identities. A shape symbol already passed explicitly is not appended again.
+This descriptor support does not prove access bounds or synchronization demands;
+the caller must satisfy the original tensor/window contract, and autosync still
+requires its separate range, access and occurrence proofs.
+
 Stores with an explicit `shapes` operand retain Tile IR. The default Buffer
 store recipe accepts only the three-operand form; selection rejects the explicit
 partition form before storage planning rather than failing during final lowering.
@@ -142,14 +155,14 @@ operands accumulate in FP32; INT8 operands accumulate in INT32. Literal and
 runtime `init_cond` select initializing or accumulating writes. Wider Acc valid
 regions use a product-shaped descriptor over the same storage. Matrix region
 carries must preserve one storage alias; arbitrary matrix carry copies, MX,
-FIFO, slots, scaled/quantized writeback and other workspace operations remain excluded.
+FIFO, slot carries, scaled/quantized writeback and other workspace operations remain excluded.
 Torch debugging models fractal layouts and shared addressed matrix storage,
 including transpose relabels and product views. Only complete untouched Acc
 boxes have defined preservation outside a partially valid product.
 
 A5 retains Tile IR until its default rollout has clean runtime acceptance.
 Other reductions, runtime-offset relabels, window region carries, strided relabels,
-assemble with incompatible pitches or window targets, slots, helper ABIs and
+assemble with incompatible pitches or window targets, unsupported slot forms, helper ABIs and
 cross-core resources remain Tile in the normal pipeline. A symbolic allocation
 requiring several differently shaped or typed window parents also remains Tile,
 as does slicing a relabelled window. Existing production
@@ -532,12 +545,43 @@ FP16/FP32/INT32; BF16 transfer support does not imply arithmetic support.
 Scalar recipe inputs are converted explicitly to the destination dtype before
 Buffer calls are constructed; fill shape/dtype select the destination descriptor.
 
-Helper calls, alternate layouts, slots, and
+Helper calls, alternate layouts, partial slot views, and
 other operation recipes are added in subsequent migration slices. Explicit
 low-level conversion diagnoses unsupported forms. The normal pipeline applies the narrower whole-kernel selection described above.
 
 Binary serialization preserves the explicit representation and function stage.
 The current Python diagnostic printer is not a Buffer DSL parser round trip.
+
+## Uniform explicit slots
+
+The normal pipeline and explicit lowering API accept qualified uniform slot families. It uses
+one `buffer.alloc_multi` and use-site `buffer.slot` aliases, retaining the original
+selection expression rather than allocating each selected slot independently:
+
+```text
+# Planned Tile member: base=B, size=S, slot_count=3,
+# byte_offset=B + (i % 3)*S, slot_index=i % 3
+ring = buffer.alloc_multi((), B) : MultiBuffer[Buffer[[1,32], FP32, Vec], 3]
+for i in range(K):
+    current = buffer.slot(ring, i % 3)
+    buffer.load(input, (i,0), (1,32), current)
+```
+
+Every member must have the same whole-slot descriptor and static valid extents.
+The original allocation capacity must equal count times the descriptor's physical
+bytes, and the existing fixed-slot-base proof must recover one shared base from
+every member. Native alignment must not introduce a different stride. Partial
+write views, mixed descriptors, unresolved offsets and slot loop carries remain
+unavailable. Selections are emitted at their lexical uses, preserving enclosing
+coordinates and branch guards; they are not hoisted above the loop.
+
+Normal whole-kernel selection additionally requires at most 16 slots in
+Vec/Mat/Acc and the existing canonical nonnegative slot-index proof, with one
+selector per family throughout an outermost loop. It checks capacity and the
+unplaced slot geometry before storage rewriting; lowering rechecks final
+placement. Other slot forms retain Tile IR. Native slot emission and autosync
+admission have additional independent contracts; successful Buffer conversion
+does not imply an executable sync plan.
 
 ## Tests
 

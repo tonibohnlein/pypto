@@ -90,6 +90,15 @@ ABI。Tensor 返回值保留在 IR 中供编排处理别名，不产生原生返
 存在时才发射地址，不受旧发射标志影响。GM 传输不创建 buffer、不推导
 valid 状态更新，也不重建逻辑 Tile。
 
+统一槽位通过 `buffer.alloc_multi`/`buffer.slot` 发射为一条
+`pto.alloc_multi_tile` 和位于词法使用点的 `pto.multi_tile_get` 别名。单槽位族
+规范化为 `pto.alloc_tile`。发射前检查静态描述符、原生对齐的步长和基地址，以及
+Vec/Mat/Acc 至多 16 个槽位的原生限制；动态基地址的对齐没有证明则拒绝。
+共享的规范槽位检查器仅在原始 INDEX 算术非负且不溢出已证明时保留
+`arith.remui`。在经过认证的 PyPTO 物理计划取得同步所有权前，同一最外层
+循环内对一个组使用不同选择器会因既有 PTOAS 共活槽位限制而拒绝；这也可能
+保守拒绝兄弟嵌套循环中的不同选择器。该限制不代表需求不可实现或物理容量不足。
+
 默认 `enable_buffer_ir=True` 时，流水线仅对选中完整 kernel 执行 `LowerTileToBuffer`。
 未支持 kernel 保持 Functional Tile IR；`False` 对所有 kernel 使用 Tile 路径。
 描述符、方向、动态窗口和 ABI 限制见 [Buffer 契约](../ir/02-types.md#buffer-算子契约)。

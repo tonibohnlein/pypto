@@ -106,6 +106,19 @@ from a `buffer.alloc` in the same scope; an address is emitted exactly when its
 operand is present, independently of the legacy emission flag. GM transfers
 never create a buffer, infer valid-state updates, or reconstruct a logical Tile.
 
+Uniform slots use `buffer.alloc_multi`/`buffer.slot`, emitting one
+`pto.alloc_multi_tile` plus lexical `pto.multi_tile_get` aliases. One-slot
+families normalize to `pto.alloc_tile`. Static descriptors, native-aligned
+stride and base, and the native 16-slot Vec/Mat/Acc limit are checked before
+emission. Unproved dynamic-base alignment is refused. The shared canonical-slot
+checker preserves `arith.remui` only when the original INDEX arithmetic is
+proved nonnegative and nonoverflowing. Until a qualified PyPTO physical plan
+owns synchronization, distinct selectors for one group anywhere within an
+outermost loop are refused because of the established PTOAS co-live-slot
+limitation. Different sibling nested selectors may therefore be conservatively
+refused. This restriction does not infer either demand infeasibility or a lack
+of physical capacity.
+
 With the default `enable_buffer_ir=True`, the pipeline runs `LowerTileToBuffer`
 for selected whole kernels before entering this direct path. Unsupported kernels
 retain Functional Tile IR; `False` keeps all kernels on that path. See [Buffer contracts](../ir/02-types.md#buffer-operator-contracts)

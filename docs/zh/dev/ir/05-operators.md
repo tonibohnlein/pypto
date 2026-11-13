@@ -13,7 +13,7 @@
 | **TensorOp** | TensorType | 支持广播的 N 维张量 (Tensor) 操作 | `src/ir/op/tensor_ops/` |
 | **TileOp** | TileType | 硬件优化的 Tile 操作 | `src/ir/op/tile_ops/` |
 | **BufferOp** | BufferType, VoidType | 内部显式存储与目标写入 | `src/ir/op/buffer_ops/` |
-| **SyncOp** | UnknownType（屏障）；ScalarType（task / 启动形状查询） | 流水线屏障、同步、TaskId 与 SPMD 启动形状查询 | `src/ir/op/sync_ops/` |
+| **SyncOp** | SyncTokenType、VoidType、ScalarType；旧 UnknownType | 逻辑完成依赖、屏障、TaskId 与启动形状查询 | `src/ir/op/sync_ops/` |
 | **CrossCoreOp** | UnknownType/TileType | AIC↔AIV 跨核通信 | `src/ir/op/sync_ops/cross_core.cpp` |
 | **PrefetchOp** | 不透明句柄 (opaque handle) | GM→L2 异步预取 | `src/ir/op/prefetch/prefetch_async.cpp` |
 
@@ -138,7 +138,9 @@ auto dynamic_dim = make_int(kDynamicDim);
 | **TensorType** | N 维 | 通用张量、函数参数/返回值 | DDR（可选 MemRef） |
 | **TileType** | N 维 | 统一缓冲区中的硬件优化 Tile | 统一缓冲区（可选 MemRef） |
 | **ScalarType** | 0 维 | 标量值 | 寄存器 |
-| **UnknownType** | 无 | 无返回值（同步操作） | 无 |
+| **SyncTokenType** | 无 | 不可变流水完成事实 | 无 |
+| **VoidType** | 无 | 明确声明没有 SSA 结果 | 无 |
+| **UnknownType** | 无 | 旧同步操作的结果占位符 | 无 |
 
 ## REGISTER_OP 流式 API
 
@@ -593,13 +595,22 @@ UINT32 + INT32 → INT32 (signed precedence)
 
 ## SyncOp：同步操作
 
+`sync.*` 逻辑操作使用 `SyncTokenType` 表达完成事实，
+`ScalarType(BOOL)` 表达地址重叠谓词，`VoidType` 表达等待与 VF 屏障。
+语句形式的 SyncOp 即使处于 Functional 阶段，也可以声明 `set_output_arity(0)`；
+它们通过 `EvalStmt` 执行，不能赋值。这个例外不改变普通 Functional 数据算子
+必须至少产生一个结果的要求。完整契约见[逻辑同步 IR](11-logical-sync.md)。
+未降低的逻辑同步不能编译。
+
+下面已有的 `system.*` 操作保留各自的物理同步／查询契约：
+
 **用途**：硬件同步与屏障，以及共用 `system.` 命名空间的 TaskId 与 SPMD 启动形状查询
 **类型**：屏障类为 `UnknownType`（无返回值，在 `EvalStmt` 中使用）；查询类为 `ScalarType`，会绑定一个值（`task_invalid`、`task_is_valid`、`available_cluster_count`、`available_aiv_count`）
 **位置**：`src/ir/op/sync_ops/` —— `sync.cpp`（屏障）、`task.cpp`（TaskId）、`launch.cpp`（启动形状查询）
 **Python API**：`from pypto.ir.op import system`
 
 公开 Python 屏障接口为 `pl.system.barrier(*, pipe, core_type=None)`，接受
-`pl.PipeType` 的全部成员。它构造下表中的无操作数 IR
+`pl.PipeType` 中除 `S` 外的成员（标量操作由硬件保证顺序）。它构造下表中的无操作数 IR
 算子，不新增 `system.barrier` IR 算子或 `pipe` IR 属性。每个 `system.bar_*`
 算子注册一个可选字符串 kwarg `core_type`（`"aic"` / `"aiv"`），用于在
 ExpandMixedKernel 拆分混合 InCore 函数时把屏障钉到单个 lane；省略则保持
@@ -612,7 +623,7 @@ SHARED，两个 kernel 中都会出现。屏障在 **`pl.pipeline` 内被拒绝*
 
 | 操作 | 描述 | Kwargs |
 | ---- | ---- | ------ |
-| `system.bar_*` | 排空一条硬件流水（`pto.barrier <PIPE_*>`）。每个 `PipeType` 一个算子：`bar_mte1` MTE1（L1 → L0A/L0B）、`bar_mte2` MTE2（GM → UB 搬入）、`bar_mte3` MTE3（UB → GM 搬出）、`bar_m` 矩阵、`bar_v` 向量、`bar_s` 标量、`bar_fix` Fix（L0C 写回）、`bar_all` 当前核全部流水 | `core_type`（`"aic"` \| `"aiv"`，可选）—— 把屏障钉到混合核的单个 lane；省略则保持 SHARED，两边都有 |
+| `system.bar_*` | 排空一条硬件流水（`pto.barrier <PIPE_*>`）。每条受支持流水一个算子：`bar_mte1` MTE1（L1 → L0A/L0B）、`bar_mte2` MTE2（GM → UB 搬入）、`bar_mte3` MTE3（UB → GM 搬出）、`bar_m` 矩阵、`bar_v` 向量、`bar_fix` Fix（L0C 写回）、`bar_all` 当前核全部流水 | `core_type`（`"aic"` \| `"aiv"`，可选）—— 把屏障钉到混合核的单个 lane；省略则保持 SHARED，两边都有 |
 | `system.fence` | 全局内存屏障（下降为 `pto.fence.barrier_all #pto.fence_scope<gm>`） | 无 |
 | `system.cacheinvalid` | 使 tensor 子区域基地址所在的那一条 cache line 失效。参数：`tensor`、`shapes`（N 维）、`offsets`（N 维）。任意区域大小（包括单个元素）都下降为 `pto.partition_view` + `pto.cmo.cacheinvalid %payload_view single_cache_line : !pto.partition_tensor_view<...>`；`shapes` 不会让它遍历区域内的所有 cache line。无参数形式使全部 GM cache 失效。 | 无 |
 | `system.syncall` | 跨核全员屏障（`pto::SYNCALL`）。属性 `mode` 取 `"hard"`（FFTS，无 operand）或 `"soft"`（GM 轮询，带 operand） | `core_type`（`"aiv_only"` \| `"aic_only"` \| `"mix"`）、`mode`（`"hard"` \| `"soft"`） |

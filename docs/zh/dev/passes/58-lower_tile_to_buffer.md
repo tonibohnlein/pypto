@@ -17,6 +17,15 @@ PTO codegen 直接接收分配句柄和目标操作数。
 物理行须按 32 字节对齐；valid 可以是物理 shape 内的静态部分矩形或已支持的运行时矩形。
 逐元素运算的 Tile 输入与目标必须具有一致的物理 shape 和 valid 范围；仅 valid 相同不足以入选。
 
+紧密 ND GM 张量可以使用首维 `INDEX` 形状符号，次维必须是大于一的静态常量。
+运行时首维保留不变，次维继续确定行步长；选择与直接发射共用几何检查。
+动态次维、首维复合表达式和较窄整数形状符号仍不在此能力范围内。
+
+直接 Buffer 发射复用已有 ABI：张量指针、显式标量、去重后的隐式形状符号，
+最后是 SPMD 身份参数。已显式传入的形状符号不会再次追加。
+描述符支持不证明访问边界或同步需求；调用方仍须满足原始张量和窗口契约，
+autosync 仍须独立建立范围、访问与出现坐标的证明。
+
 带显式 `shapes` 操作数的 store 保持 Tile IR。默认 Buffer store 配方仅接受三个操作数的形式；
 选择阶段在存储规划前排除显式分区形式，避免在最终 lowering 阶段失败。
 
@@ -101,13 +110,13 @@ assemble 目标的对齐，包括带显式 valid shape 的 slice。无法证明�
 `transpose_view`、`matmul` 和 `matmul_acc`。FP16/BF16/FP32 输入以 FP32 累加，
 INT8 输入以 INT32 累加。常量或运行时 `init_cond` 选择初始化或累加写入。
 较宽的 Acc valid 区域通过同一存储上的乘积视图写入。矩阵区域 carry 必须保持
-同一存储别名；任意矩阵 carry 复制、MX、FIFO、槽位、缩放/量化写回和其他 workspace
+同一存储别名；任意矩阵 carry 复制、MX、FIFO、槽位 carry、缩放/量化写回和其他 workspace
 操作仍不在默认范围。Torch 调试模拟分形布局及共享的已寻址矩阵存储，保留
 转置重标记和乘积视图；部分有效乘积之外仅完整未触及的 Acc box 保证保留。
 
 A5 在默认流水线保持 Tile，待取得运行时验收后再开放。
 其他 reduction、运行时 offset 的 relabel、窗口区域 carry、非连续 relabel、行距不兼容或目标为窗口的
-assemble、槽位、helper ABI 和跨核资源在正常流水线保持 Tile。同一符号分配需要多个不同形状或
+assemble、未支持的槽位形式、helper ABI 和跨核资源在正常流水线保持 Tile。同一符号分配需要多个不同形状或
 类型的窗口父视图时也保持 Tile；对已 relabel 的窗口再 slice 同样尚未开放。已有生产配方可通过显式底层 pass 流水线开发和测试，
 配方存在本身不代表默认支持。
 
@@ -422,10 +431,37 @@ Mat 到 Left/Right 的拷贝与 extract、matmul/matmul_acc 以及 Acc store。
 GM load/store 保留匹配的元素类型，不插入转换。`add`/`mul` 支持 FP16/FP32/INT32；
 BF16 传输支持不代表算术支持。
 
-辅助函数调用、其他布局、多槽位和其他操作转换由后续迁移切片补齐。
+辅助函数调用、其他布局、部分槽位视图和其他操作转换由后续迁移切片补齐。
 显式底层转换对未支持形式报错；正常流水线将未支持的完整 kernel 保留为 Tile。
 
 二进制序列化保留显式表示和函数阶段。当前 Python 诊断打印器不支持 Buffer DSL 解析往返。
+
+## 统一显式槽位
+
+正常流水线和显式 lowering API 支持经过资格检查的统一槽位族：一条 `buffer.alloc_multi` 声明整块
+分配，每个使用点通过 `buffer.slot` 建立别名，保留原始选择表达式，不为各次
+选择建立独立分配：
+
+```text
+# Planned Tile member: base=B, size=S, slot_count=3,
+# byte_offset=B + (i % 3)*S, slot_index=i % 3
+ring = buffer.alloc_multi((), B) : MultiBuffer[Buffer[[1,32], FP32, Vec], 3]
+for i in range(K):
+    current = buffer.slot(ring, i % 3)
+    buffer.load(input, (i,0), (1,32), current)
+```
+
+所有成员必须具有相同的完整槽位描述符和静态 valid extent。原分配容量必须等于
+槽位数乘描述符物理字节数；既有固定槽位基地址证明必须从每个成员恢复同一个
+基地址。原生对齐不能改变步长。部分写视图、不同描述符、未解析偏移和槽位循环
+carry 继续拒绝。选择操作在原始词法使用点发射，保留外层坐标与分支 guard，
+不能提升到循环之前。
+
+正常整核选择还要求 Vec/Mat/Acc 中至多 16 个槽位，以及既有规范非负槽位下标
+证明；同一最外层循环中每个族只能使用一个选择器。在存储改写前检查容量及
+尚未放置的槽位几何，lowering 再检查最终放置。其他槽位形式继续保持 Tile IR。
+原生槽位发射和 autosync admission 另有独立契约；Buffer 转换成功不意味着同步
+计划已经可执行。
 
 ## 测试
 
