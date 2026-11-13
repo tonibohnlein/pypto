@@ -12,7 +12,7 @@
 System operations handle hardware synchronization and cross-core communication:
 - sync_src / sync_dst: Set/Wait flag-based synchronization between pipes
 - set_ffts / sync_set / sync_wait: Explicit Cube/Vector cross-core event synchronization
-- barrier: Barrier synchronization for any one hardware pipeline, or all of them, on one core
+- barrier: Barrier synchronization for a supported hardware pipeline, or all pipelines, on one core
 - tpush_to_aiv / tpush_to_aic: Push tile data across cores
 - tpop_from_aic / tpop_from_aiv: Pop tile data from cross-core pipe
 - aic_initialize_pipe / aiv_initialize_pipe: Initialize cross-core pipes
@@ -392,7 +392,7 @@ def sync_wait(
 def barrier(*, pipe: PipeType, core_type: KernelType | None = None, span: Span | None = None) -> Call:
     """Order work on one pipeline, or across all of them, on one core.
 
-    Every ``PipeType`` member is accepted. A barrier is pipe-scoped rather than
+    Every ``PipeType`` member except ``S`` is accepted. A barrier is pipe-scoped rather than
     operation-scoped: it drains whatever was issued on that pipe, so the pipe a
     transfer rides decides which barrier orders it. On A5 that mapping is
     ``Backend::InferTransferPipe`` -- GM <-> UB and GM -> L1 ride MTE2/MTE3,
@@ -419,9 +419,8 @@ def barrier(*, pipe: PipeType, core_type: KernelType | None = None, span: Span |
     Returns:
         Barrier call expression with no result value.
 
-    ``PipeType.S`` is accepted for completeness but orders nothing in practice:
-    both of PTOAS's synchronization allocators treat a scalar-to-scalar pair as
-    already ordered on every architecture.
+    ``PipeType.S`` is rejected: scalar ordering is automatic, and an explicit
+    scalar barrier is documented to cause a hardware error on A2/A3.
 
     A barrier is rejected inside ``pl.pipeline``, as explicit flags are: it has
     no operand, so pipeline scheduling has no dependency edge to hold it in
@@ -430,20 +429,19 @@ def barrier(*, pipe: PipeType, core_type: KernelType | None = None, span: Span |
     Raises:
         TypeError: If pipe is not a PipeType member, or core_type is not a
             KernelType member.
-        ValueError: If core_type is KernelType.MIX, which names a participant
+        ValueError: If pipe is PipeType.S, or core_type is KernelType.MIX, which names a participant
             set rather than one kernel; omit it to reach both lanes.
     """
     # Preserve the established IR and native PTO barrier lowering. Barriers
     # have no event ID and must not allocate or consume pipeline event slots.
-    # Keep this table exhaustive over PipeType: a member without an entry would
-    # raise KeyError below rather than the TypeError the signature promises.
+    # Validate membership before lookup. Scalar ordering is native; exposing
+    # PIPE_S would emit an unsupported instruction on A2/A3.
     op_names = {
         PipeType.MTE1: "system.bar_mte1",
         PipeType.MTE2: "system.bar_mte2",
         PipeType.MTE3: "system.bar_mte3",
         PipeType.M: "system.bar_m",
         PipeType.V: "system.bar_v",
-        PipeType.S: "system.bar_s",
         PipeType.FIX: "system.bar_fix",
         PipeType.ALL: "system.bar_all",
     }

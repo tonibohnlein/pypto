@@ -313,7 +313,6 @@ MIGRATION_FAMILIES = (
             "system.bar_mte1",
             "system.bar_mte2",
             "system.bar_mte3",
-            "system.bar_s",
             "system.bar_v",
             "system.fence",
             "system.cacheinvalid",

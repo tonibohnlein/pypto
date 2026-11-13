@@ -188,6 +188,9 @@ class Expr(IRNode):
     def __pow__(self, other: ScalarExprType) -> Expr:
         """Power operator (self ** other). Only works with ScalarType variables."""
 
+    def __hash__(self) -> int:
+        """Python wrapper identity hash, inherited from object by the native binding."""
+
     # Comparison operators (only work with ScalarType)
     def __eq__(self, other: ScalarExprType) -> Expr:  # type: ignore[override]
         """Equality operator (self == other). Only works with ScalarType variables."""
@@ -1107,6 +1110,13 @@ class PrefetchAsyncContextType(Type):
     def get() -> PrefetchAsyncContextType:
         """Get the shared singleton PrefetchAsyncContextType instance."""
         ...
+
+class SyncTokenType(Type):
+    """Immutable pipeline completion fact; waits do not consume it."""
+
+    pipe: Final[PipeType]
+
+    def __init__(self, pipe: PipeType) -> None: ...
 
 class AsyncEventType(Type):
     """Singleton marker type for ``prefetch.async_prefetch`` outputs.

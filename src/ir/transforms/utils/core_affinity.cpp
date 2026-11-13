@@ -91,8 +91,8 @@ bool IsNoDuplicateCall(const CallPtr& call) {
 /// infer a lane from.
 bool IsPipeBarrier(const CallPtr& call) {
   return IsOp(call, "system.bar_mte1") || IsOp(call, "system.bar_mte2") || IsOp(call, "system.bar_mte3") ||
-         IsOp(call, "system.bar_m") || IsOp(call, "system.bar_v") || IsOp(call, "system.bar_s") ||
-         IsOp(call, "system.bar_fix") || IsOp(call, "system.bar_all");
+         IsOp(call, "system.bar_m") || IsOp(call, "system.bar_v") || IsOp(call, "system.bar_fix") ||
+         IsOp(call, "system.bar_all");
 }
 
 bool HasStatedLane(const CallPtr& call) {

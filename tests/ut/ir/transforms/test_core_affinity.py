@@ -225,5 +225,14 @@ def test_add_has_vector_affinity():
     assert testing.classify_call_affinity(add) == "vector"
 
 
+@pytest.mark.parametrize("pipe", ["MTE1", "MTE2", "MTE3", "M", "V", "FIX", "ALL"])
+@pytest.mark.parametrize("core_type, expected", [(None, "shared"), ("aic", "cube"), ("aiv", "vector")])
+def test_pipe_barrier_respects_explicit_core_ownership(pipe, core_type, expected):
+    """Operand-free barriers need explicit ownership when splitting a mixed kernel."""
+    kwargs = {} if core_type is None else {"core_type": core_type}
+    call = ir.create_op_call(f"system.bar_{pipe.lower()}", [], kwargs, ir.Span.unknown())
+    assert testing.classify_call_affinity(call) == expected
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
