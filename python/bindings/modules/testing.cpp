@@ -18,7 +18,10 @@
  */
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>  // NOLINT(misc-include-cleaner) -- registers shared_ptr casters
 #include <nanobind/stl/string.h>      // NOLINT(misc-include-cleaner) -- registers std::string casters
 #include <nanobind/stl/tuple.h>
@@ -26,7 +29,11 @@
 
 #include <any>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -43,15 +50,253 @@
 #include "pypto/ir/function.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/dsa/allocation_plan.h"
 #include "pypto/ir/transforms/dsa/reuse_penalty_recognizer.h"
+#include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
+#include "pypto/ir/transforms/utils/finite_sync_analysis.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/physical_sync_commands.h"
+#include "src/ir/transforms/utils/scoped_token_families.h"
+#include "src/ir/transforms/utils/scoped_token_order.h"
+#include "src/ir/transforms/utils/token_sync_lowering.h"
+#include "testing_sync_support.h"
 
 namespace nb = nanobind;
 
 namespace pypto {
 namespace python {
+
+nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
+  nb::dict out;
+  out["interval_access_visits"] = result.input.interval_access_visits;
+  out["collective_domains"] = result.collective_domains;
+  out["collective_witnesses"] = result.collective_witnesses;
+  out["collective_access_visits"] = result.collective_access_visits;
+  out["qualified_intervals"] = result.input.qualified_intervals;
+  out["guarantee"] = "minimum demands for declared footprints and core native chains";
+  out["realization"] = "not requested";
+  out["analysis_available"] = result.segments.size() == result.input.segments.size();
+  out["parameter_bounds"] = result.input.parameter_bounds;
+  out["coordinate_nodes"] = result.input.coordinate_nodes;
+  out["coordinate_flatten_visits"] = result.input.coordinate_flatten_visits;
+  out["coordinate_coefficient_entries"] = result.input.coordinate_coefficient_entries;
+  nb::list storage, regions;
+  for (const auto& s : result.input.storage) {
+    nb::dict item;
+    item["name"] = s.name;
+    item["space"] = s.space;
+    item["address"] = s.address;
+    item["rows"] = s.rows;
+    item["row_extent_parameter"] = s.row_extent_parameter;
+    item["columns"] = s.columns;
+    item["bytes"] = s.bytes;
+    item["slot_count"] = s.slot_count;
+    item["slot_bytes"] = s.slot_bytes;
+    item["byte_coordinates"] = s.byte_coordinates;
+    item["row_parameters"] = s.row_parameters;
+    item["column_parameters"] = s.column_parameters;
+    item["row_block"] = s.row_block;
+    item["column_block"] = s.column_block;
+    item["block_origin"] = result.input.block_bounds ? result.input.block_bounds->first : 0;
+    storage.append(item);
+  }
+  for (size_t r = 0; r < result.input.segments.size(); ++r) {
+    const auto& source = result.input.segments[r];
+    const auto* analysis = r < result.segments.size() ? &result.segments[r] : nullptr;
+    nb::dict region;
+    nb::list sites, families, generators;
+    region["count"] = source.count;
+    region["start"] = source.start;
+    region["step"] = source.step;
+    region["reset_period"] = source.reset_period;
+    region["loop"] = source.original_loop;
+    nb::list frames;
+    for (const auto& frame : source.nested_frames)
+      frames.append(nb::make_tuple(frame.loop, frame.count, frame.start, frame.step));
+    region["nested_frames"] = frames;
+    nb::list start_expressions;
+    for (const auto& frame : source.nested_frames) start_expressions.append(frame.start_expression);
+    region["frame_start_expressions"] = start_expressions;
+    for (const auto& s : source.sites) {
+      nb::dict site;
+      nb::list accesses, precision, slots, access_frames, intervals;
+      site["original"] = s.original;
+      site["continuation"] = s.continuation;
+      site["initialization_scope"] = s.initialization_scope;
+      site["pipe"] = s.pipe;
+      for (const auto& a : s.accesses) {
+        access_frames.append(a.coordinate_frame);
+        intervals.append(nb::cast(a.physical_interval));
+        slots.append(nb::make_tuple(a.slot_first, a.slot_step));
+        precision.append(a.exact_footprint ? "exact" : "enclosure");
+        accesses.append(nb::make_tuple(a.storage, a.write, a.row, a.column, a.row_step, a.column_step, a.rows,
+                                       a.columns, a.after_first));
+      }
+      site["physical_intervals"] = intervals;
+      site["slot_selections"] = slots;
+      site["access_precision"] = precision;
+      site["accesses"] = accesses;
+      site["access_frames"] = access_frames;
+      sites.append(site);
+    }
+    if (analysis) {
+      for (auto f : analysis->demands) families.append(nb::make_tuple(f.source, f.target, f.distance));
+      for (auto f : analysis->generators) generators.append(nb::make_tuple(f.source, f.target, f.distance));
+    }
+    region["sites"] = sites;
+    region["demands"] = analysis ? nb::object(families) : nb::object(nb::none());
+    region["generators"] = analysis ? nb::object(generators) : nb::object(nb::none());
+    region["distance_entries"] = analysis ? analysis->distance.size() * analysis->distance.size() : 0;
+    if (analysis) {
+      region["rotating"] = analysis->rotating;
+      region["core_frontiers"] = analysis->core_frontiers;
+      region["internal_scope_count"] = analysis->internal_scope_count;
+      region["repetitions"] = analysis->repetitions;
+      nb::dict ownership;
+      for (const auto& [storage, proof] : analysis->visit_owned) {
+        ownership[nb::int_(storage)] = nb::make_tuple(proof.row_step, proof.column_step, proof.row_begin,
+                                                      proof.row_end, proof.column_begin, proof.column_end);
+      }
+      region["visit_owned"] = ownership;
+      region["rotating_fragments"] = analysis->rotating_fragments;
+      region["atom_tests"] = analysis->atom_tests;
+      region["interval_domains"] = analysis->interval_domains;
+      region["interval_fragments"] = analysis->interval_fragments;
+      region["interval_endpoints"] = analysis->interval_endpoints;
+      region["interval_queries"] = analysis->interval_queries;
+      region["interval_updates"] = analysis->interval_updates;
+      region["interval_node_visits"] = analysis->interval_node_visits;
+      region["interval_tree_entries"] = analysis->interval_tree_entries;
+      region["quotient_edges"] = analysis->quotient_edges;
+      region["modular_groups"] = analysis->modular_groups;
+      region["sort_comparisons"] = analysis->sort_comparisons;
+      region["sweep_visits"] = analysis->sweep_visits;
+      region["shortest_path_runs"] = analysis->shortest_path_runs;
+      region["shortest_path_edge_visits"] = analysis->shortest_path_edge_visits;
+      region["retained_frontier_entries"] = analysis->retained_frontier_entries;
+    }
+    regions.append(region);
+  }
+  out["storage"] = storage;
+  out["regions"] = regions;
+  out["crossing_demands"] =
+      result.HasHierarchy() ? nb::object(nb::none()) : nb::cast(result.crossing_demands);
+  out["crossing_generators"] =
+      result.HasHierarchy() ? nb::object(nb::none()) : nb::cast(result.crossing_generators);
+  out["analyzed_occurrences"] = result.analyzed_occurrences;
+  out["hardware_target"] = result.input.hardware_target;
+  out["cells"] = result.cells;
+  out["boundary_graph_edges"] = result.graph_edges;
+  out["class_tests"] = result.class_tests;
+  out["class_lookup_tests"] = result.class_lookup_tests;
+  out["port_pair_tests"] = result.port_pair_tests;
+  out["crossing_path_searches"] = result.crossing_path_searches;
+  out["import_seconds"] = result.import_seconds;
+  out["partition_seconds"] = result.partition_seconds;
+  out["reduction_seconds"] = result.reduction_seconds;
+  out["composition_seconds"] = result.composition_seconds;
+  out["hierarchical"] = result.HasHierarchy();
+  out["source_region_nodes"] = result.source_region_nodes;
+  out["source_coordinate_entries"] = result.source_coordinate_entries;
+  out["scoped_export_builds"] = result.scoped_export_builds;
+  out["scoped_reuse_queries"] = result.scoped_reuse_queries;
+  out["point_selector_access_visits"] = result.point_selector_access_visits;
+  out["interface_cells"] = result.interface_cells;
+  out["omitted_bridge_domains"] = result.omitted_bridge_domains;
+  out["interface_slot_visits"] = result.interface_slot_visits;
+  out["interface_ports"] = result.interface_ports;
+  out["interface_entries"] = result.interface_entries;
+  out["interface_queries"] = result.interface_queries;
+  out["merge_nodes"] = result.merge_nodes;
+  out["crossing_tests"] = result.crossing_tests;
+  out["hierarchy_query_steps"] = result.hierarchy_query_steps;
+  out["interface_access_visits"] = result.interface_access_visits;
+  out["bridge_candidates"] = result.bridge_candidates;
+  out["port_normalization_visits"] = result.port_normalization_visits;
+  return out;
+}
+nb::object CompactBoundary(const ir::sync::CompactSyncResult& result, size_t storage, int64_t row,
+                           int64_t col, const std::map<size_t, int64_t>& parameters,
+                           std::optional<int64_t> block_index) {
+  auto b = result.BoundaryAt(storage, row, col, parameters, block_index);
+  if (!b) return nb::none();
+  nb::dict out;
+  out["first_writer"] = b->first_writer;
+  out["last_writer"] = b->last_writer;
+  out["first_readers"] = b->first_readers;
+  out["last_readers"] = b->last_readers;
+  return out;
+}
+nb::object CompactSlotBoundary(const ir::sync::CompactSyncResult& result, size_t storage, int64_t slot,
+                               int64_t row, int64_t col, const std::map<size_t, int64_t>& parameters,
+                               std::optional<int64_t> block_index) {
+  auto boundary = result.BoundarySlot(storage, slot, row, col, parameters, block_index);
+  if (!boundary) return nb::none();
+  nb::dict out;
+  out["first_writer"] = boundary->first_writer;
+  out["last_writer"] = boundary->last_writer;
+  out["first_readers"] = boundary->first_readers;
+  out["last_readers"] = boundary->last_readers;
+  return out;
+}
+
+/// Numerical provider seam: tests supply qualified occurrences and compare
+/// against independently constructed event graphs, not compiler generators.
+nb::dict AnalyzeFiniteSyncForTesting(
+    const std::vector<std::tuple<ir::PipeType, bool, std::vector<uint64_t>, std::vector<uint64_t>>>&
+        occurrences,
+    const std::vector<uint64_t>& covered_cells, bool exact_accesses,
+    const std::vector<std::pair<size_t, size_t>>& prerequisites,
+    const std::vector<std::pair<size_t, size_t>>& native_order,
+    const std::vector<std::tuple<size_t, bool, size_t, bool>>& queries,
+    const std::vector<uint64_t>& boundary_cells) {
+  ir::sync::FiniteSyncInput input;
+  input.covered_cells = covered_cells;
+  input.exact_accesses = exact_accesses;
+  input.prerequisites = prerequisites;
+  input.native_order = native_order;
+  for (const auto& [pipe, present, reads, writes] : occurrences) {
+    input.occurrences.push_back({pipe, present, reads, writes});
+  }
+  const auto result = ir::sync::AnalyzeFiniteSync(input);
+  nb::dict output;
+  output["exact_accesses"] = result.exact_accesses;
+  output["generators"] = nb::cast(result.generators);
+  output["demands"] = nb::cast(result.demands);
+  output["starts"] = nb::cast(result.starts);
+  output["completions"] = nb::cast(result.completions);
+  nb::list answers;
+  for (const auto& [a, ac, b, bc] : queries) answers.append(result.Precedes(a, ac, b, bc));
+  output["queries"] = answers;
+  nb::list boundaries;
+  for (uint64_t cell : boundary_cells) {
+    const auto boundary = result.Boundary(cell);
+    if (!boundary) {
+      boundaries.append(nb::none());
+      continue;
+    }
+    nb::dict entry;
+    entry["first_writer"] = nb::cast(boundary->first_writer);
+    entry["last_writer"] = nb::cast(boundary->last_writer);
+    entry["first_readers"] = nb::cast(boundary->first_readers);
+    entry["last_readers"] = nb::cast(boundary->last_readers);
+    boundaries.append(entry);
+  }
+  output["boundaries"] = boundaries;
+  nb::dict work;
+  work["access_entries"] = result.work.access_entries;
+  work["cell_visits"] = result.work.cell_visits;
+  work["reader_visits"] = result.work.reader_visits;
+  work["witnesses"] = result.work.witnesses;
+  work["candidate_tests"] = result.work.candidate_tests;
+  work["demand_joins"] = result.work.demand_joins;
+  output["work"] = work;
+  return output;
+}
 
 /// Validate malformed registrations without installing them in the singleton.
 /// This exercises the exact checks used by registry creation and import.
@@ -325,10 +570,251 @@ bool IsNoDuplicateOpForTesting(const std::string& op_name) {
 // Module binding
 // ============================================================================
 
+// Diagnostics count final emitted sites separately from per-case construction.
+// Original payload guards are included in if_sites, but excluded from the
+// added guard_sites field below by subtracting the unchanged owner's census.
+class PhysicalControlCensus : public ir::IRVisitor {
+ public:
+  size_t sets = 0, waits = 0, barriers = 0, branches = 0;
+  void VisitStmt_(const ir::IfStmtPtr& statement) override {
+    ++branches;
+    ir::IRVisitor::VisitStmt_(statement);
+  }
+  void VisitStmt_(const ir::EvalStmtPtr& statement) override {
+    const auto call = ir::As<ir::Call>(statement->expr_);
+    if (ir::IsOp(call, "system.set_flag")) ++sets;
+    if (ir::IsOp(call, "system.wait_flag")) ++waits;
+    if (ir::IsOp(call, "system.bar_m") || ir::IsOp(call, "system.bar_v")) ++barriers;
+    ir::IRVisitor::VisitStmt_(statement);
+  }
+};
+
+nb::dict DescribeSchedulePolicy(const ir::sync::SyncSchedulePolicy& policy) {
+  nb::dict out;
+  out["mode"] = policy.mode;
+  out["max_extra_payload_sites"] = policy.max_extra_payload_sites;
+  out["max_extra_control_nodes"] = policy.max_extra_control_nodes;
+  out["no_clone"] = policy.no_clone;
+  out["boundary_motion"] = policy.boundary_motion;
+  return out;
+}
+nb::dict DescribeSchedule(const ir::sync::PhysicalSyncRealization& result) {
+  nb::dict out;
+  nb::list choices;
+  for (const auto& choice : result.schedule_choices) {
+    nb::dict row;
+    row["loop"] = choice.loop;
+    row["mode"] = choice.mode;
+    row["status"] = choice.status;
+    row["reason"] = choice.reason;
+    row["payload_sites"] = choice.payload_sites;
+    row["control_node_bound"] = choice.control_node_bound;
+    row["command_sites"] = choice.command_sites;
+    nb::list costs;
+    for (const auto& cost : choice.model_cost)
+      costs.append(nb::make_tuple(cost[0], cost[1], cost[2], cost[3], cost[4], cost[5]));
+    row["model_cost"] = costs;
+    row["model_scope"] = "standalone_candidate_before_parent_gap_composition";
+    row["model_comparable"] = choice.model_comparable;
+    row["model_exact"] = choice.model_exact;
+    row["selected"] = choice.selected;
+    choices.append(row);
+  }
+  out["choices"] = choices;
+  nb::list gaps;
+  for (const auto& gap : result.schedule_parent_gaps) {
+    nb::dict row;
+    row["loop"] = gap.loop;
+    row["command_sites"] = gap.command_sites;
+    row["before"] = nb::cast(gap.before);
+    row["after"] = nb::cast(gap.after);
+    row["count_order"] = nb::make_tuple("guards", "expressions", "statements");
+    row["scope"] = "parent_gap_after_candidate_selection";
+    gaps.append(row);
+  }
+  out["parent_gaps"] = gaps;
+  out["inspected_descriptors"] = result.schedule_inspected_descriptors;
+  out["inspected_expressions"] = result.schedule_inspected_expressions;
+  out["emitted_payload_sites"] = result.schedule_emitted_payload_sites;
+  out["emitted_control_nodes"] = result.schedule_emitted_control_nodes;
+  return out;
+}
+nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
+  nb::dict out;
+  out["function"] = result.function;
+  out["schedule"] = DescribeSchedule(result);
+  out["set_sites"] = result.set_sites;
+  out["wait_sites"] = result.wait_sites;
+  out["barrier_sites"] = result.barrier_sites;
+  out["guard_sites"] = result.guard_sites;
+  out["constructed_guard_sites"] =
+      result.guard_sites + result.shared_guard_sites + result.simplified_guard_sites;
+  out["shared_guard_sites"] = result.shared_guard_sites;
+  out["shared_composed_guard_sites"] = result.shared_composed_guard_sites;
+  out["control_statement_visits"] = result.control_statement_visits;
+  out["simplified_guard_sites"] = result.simplified_guard_sites;
+  out["shared_control_values"] = result.shared_control_values;
+  out["cut_domain_interval_visits"] = result.cut_domain_interval_visits;
+  out["cut_case_comparisons"] = result.cut_case_comparisons;
+  out["coalesced_cut_cases"] = result.coalesced_cut_cases;
+  out["case_sequence_visits"] = result.case_sequence_visits;
+  out["case_sequence_comparisons"] = result.case_sequence_comparisons;
+  out["factored_case_cuts"] = result.factored_case_cuts;
+  out["shared_disjoint_case_cuts"] = result.shared_disjoint_case_cuts;
+  out["endpoint_domain_entries"] = result.endpoint_domain_entries;
+  out["normalized_endpoint_bounds"] = result.normalized_endpoint_bounds;
+  out["endpoint_predicates_constructed"] = result.endpoint_predicates_constructed;
+  out["control_descriptors"] = result.control_descriptors;
+  out["invocation_scheduled_loops"] = result.invocation_scheduled_loops;
+  out["invocation_schedule_groups"] = result.invocation_schedule_groups;
+  out["invocation_schedule_visits"] = result.invocation_schedule_visits;
+  out["invocation_schedule_comparisons"] = result.invocation_schedule_comparisons;
+  out["invocation_schedule_model_saving"] = result.invocation_schedule_model_saving;
+  out["schedule_name_scans"] = result.schedule_name_scans;
+  out["schedule_name_visits"] = result.schedule_name_visits;
+  out["regular_schedule_candidates"] = result.regular_schedule_candidates;
+  out["regular_schedule_loops"] = result.regular_schedule_loops;
+  out["regular_schedule_boundaries"] = result.regular_schedule_boundaries;
+  out["regular_schedule_body_copies"] = result.regular_schedule_body_copies;
+  out["regular_schedule_payload_copies"] = result.regular_schedule_payload_copies;
+  out["regular_schedule_model_saving"] = result.regular_schedule_model_saving;
+  out["assigned_schedule_endpoints"] = result.assigned_schedule_endpoints;
+  out["schedule_candidates"] = result.schedule_candidates;
+  out["scheduled_loops"] = result.scheduled_loops;
+  out["schedule_boundary_commands"] = result.schedule_boundary_commands;
+  out["schedule_size_refusals"] = result.schedule_size_refusals;
+  out["schedule_body_visits"] = result.schedule_body_visits;
+  out["schedule_descriptor_visits"] = result.schedule_descriptor_visits;
+  out["schedule_original_nodes"] = result.schedule_original_nodes;
+  out["schedule_candidate_nodes"] = result.schedule_candidate_nodes;
+
+  out["materialized_control_statements"] = result.materialized_control_statements;
+  out["control_expression_visits"] = result.control_expression_visits;
+  out["reuse_queries"] = result.reuse_queries;
+  out["reserved_lanes"] = result.reserved_lanes;
+  out["native_reserved_ids"] = result.native_reserved_ids;
+  out["finite_minimum"] = result.finite_minimum;
+  nb::list families;
+  for (const auto& f : result.Families()) {
+    nb::dict row;
+    row["source"] = nb::make_tuple(f.source_region, f.source_first, f.source_site);
+    row["target"] = nb::make_tuple(f.target_region, f.target_first, f.target_site);
+    row["count"] = f.count;
+    row["ids"] = nb::cast(f.ids);
+    nb::list axes;
+    for (const auto& axis : f.axes)
+      axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));
+    row["axes"] = axes;
+    families.append(row);
+  }
+  out["families"] = families;
+  out["guarantee"] = "equal selected order under qualified direct-command model";
+  out["native_mode"] = "manual a2a3; fresh flags at entry; closed notifications at exit";
+  return out;
+}
+
 void BindTesting(nb::module_& m) {
   // Create a protected submodule for testing utilities
   // This will be accessible as pypto.testing in Python
   nb::module_ testing = m.def_submodule("testing", "Internal testing utilities (do not use in production)");
+  nb::class_<ir::sync::SyncSchedulePolicy>(testing, "SyncSchedulePolicy")
+      .def(
+          "__init__",
+          [](ir::sync::SyncSchedulePolicy* self, std::string mode, size_t payloads, size_t controls,
+             bool no_clone, bool boundary_motion) {
+            new (self)
+                ir::sync::SyncSchedulePolicy{std::move(mode), payloads, controls, no_clone, boundary_motion};
+          },
+          nb::arg("mode") = "auto", nb::arg("max_extra_payload_sites") = 4096,
+          nb::arg("max_extra_control_nodes") = 65536, nb::arg("no_clone") = true,
+          nb::arg("boundary_motion") = true);
+
+  testing.def(
+      "share_sync_command_guards",
+      [](const ir::StmtPtr& commands) {
+        PhysicalControlCensus census;
+        census.VisitStmt(commands);
+        ir::sync::PhysicalSyncRealization counters;
+        counters.guard_sites = census.branches;
+        const auto output = sync_testing::ShareGuards({commands}, counters);
+        return std::make_shared<ir::SeqStmts>(output, commands->span_);
+      },
+      nb::arg("commands"),
+      "Test the emitter helper on pure coordinate-guarded physical commands; not arbitrary IR");
+  testing.def(
+      "inspect_sync_scalar_plan",
+      [](const ir::StmtPtr& commands) {
+        using namespace ir::sync::physical;
+        ir::sync::PhysicalSyncRealization work;
+        ControlForest forest{sync_testing::ImportCommands(commands, work)};
+        const auto plan = FreezeCommandForest(forest, work);
+        std::map<std::string, size_t> result;
+        const auto expressions = work.control_expression_visits;
+        result["same_instance"] = FreezeCommandForest(forest, work) == plan;
+        auto copy = forest;
+        result["copy_reuses"] = FreezeCommandForest(copy, work) == plan;
+        result["reuse_expression_visits"] = work.control_expression_visits - expressions;
+        auto moved = std::move(copy);
+        result["move_reuses"] = FreezeCommandForest(moved, work) == plan;
+        moved.push_back(ControlSequence({}, commands->span_, work));
+        const auto extended = FreezeCommandForest(moved, work);
+        result["append_invalidates"] = extended != plan;
+        std::swap(moved.front(), moved.back());
+        result["reorder_invalidates"] = FreezeCommandForest(moved, work) != extended;
+        moved.clear();
+        result["clear_invalidates"] = FreezeCommandForest(moved, work)->commands.empty();
+        auto count = [&](auto&& self, const FrozenCommandForest& scope) -> void {
+          for (const auto& command : scope.commands) {
+            for (size_t i = 0; i < command.scalar_cost.size(); ++i)
+              result["cost_" + std::to_string(i)] += command.scalar_cost[i];
+            if (command.body) self(self, *command.body);
+            if (command.alternative) self(self, *command.alternative);
+          }
+        };
+        count(count, *plan);
+        return result;
+      },
+      nb::arg("commands"));
+  testing.def("materialize_sync_command_values", &sync_testing::MaterializeValues, nb::arg("owner"),
+              nb::arg("commands"), "Emitter-only pure command value sharing");
+  testing.def(
+      "emit_sync_command_cases",
+      [](const ir::ExprPtr& block, const std::vector<std::pair<int64_t, int64_t>>& possible,
+         const std::vector<std::tuple<int64_t, int64_t, ir::StmtPtr>>& supplied) {
+        std::vector<sync_testing::CommandCase> cases;
+        for (const auto& [lo, hi, body] : supplied) cases.push_back({{lo, hi}, body});
+        ir::sync::PhysicalSyncRealization work;
+        return std::make_shared<ir::SeqStmts>(
+            sync_testing::EmitCases(block, possible, cases, work, ir::Span::unknown()), ir::Span::unknown());
+      },
+      nb::arg("block"), nb::arg("possible"), nb::arg("cases"),
+      "Emitter-only case aggregation under a supplied possible cut domain; unknown means full domain");
+
+  testing.def(
+      "inspect_sync_invocation_groups",
+      [](const ir::FunctionPtr& owner,
+         const std::vector<std::tuple<int64_t, int64_t, ir::StmtPtr>>& supplied) {
+        std::vector<sync_testing::CommandCase> cases;
+        for (const auto& [lo, hi, body] : supplied) cases.push_back({{lo, hi}, body});
+        auto [groups, work] = sync_testing::InspectGroups(owner, cases);
+        nb::dict out;
+        out["descriptor_nodes"] = work.control_descriptors;
+        out["comparisons"] = work.invocation_schedule_comparisons;
+        out["groups"] = nb::cast(groups);
+        return out;
+      },
+      nb::arg("owner"), nb::arg("cases"),
+      "Inspect structural complete-schedule groups only; no profitability or protocol certification");
+
+  testing.def(
+      "emit_sync_boundary_commands",
+      [](const ir::FunctionPtr& owner,
+         const std::vector<std::tuple<ir::CallPtr, ir::StmtPtr, ir::StmtPtr>>& cuts, bool enabled,
+         bool validate_scope) {
+        return DescribePhysicalSync(sync_testing::EmitBoundaries(owner, cuts, enabled, validate_scope));
+      },
+      nb::arg("owner"), nb::arg("cuts"), nb::arg("enabled") = true, nb::arg("validate_scope") = false,
+      "Emitter-only boundary schedule for qualified original cuts; does not qualify a protocol");
 
   testing.def("validate_buffer_op_contract", &ValidateBufferOpContractForTesting, nb::arg("stage"),
               nb::arg("arity").none(), nb::arg("args"), nb::arg("result_type"), nb::arg("effects"),
@@ -378,6 +864,368 @@ void BindTesting(nb::module_& m) {
   testing.def("recognize_dsa_reuse_penalties", &RecognizeDsaReusePenaltiesForTesting, nb::arg("function"),
               "Return recognized DSA-RP edges without running placement");
 
+  testing.def(
+      "check_sync_assignment_contract",
+      [](const ir::FunctionPtr& function, const std::string& change) {
+        auto analysis = ir::sync::AnalyzeCompactSync(ir::sync::ImportPlacedSync(function, true));
+        const auto result = sync_testing::RealizeDemandPlan(analysis, "a2a3", std::nullopt);
+        const auto& assignment = result.assignment;
+        INTERNAL_CHECK(assignment) << "Missing completed assignment";
+        const auto copy = result;
+        nb::dict out;
+        out["shared_family_storage"] = &result.Families() == &copy.Families();
+        out["families"] = result.Families().size();
+        if (change == "foreign_input") {
+          const auto foreign = analysis.input;
+          assignment->ValidateFor(foreign, "a2a3");
+        } else if (change == "preassigned_ids") {
+          auto families = result.Families();  // Deliberate invalid test input, not production copying.
+          CHECK(!families.empty()) << "Expected a nonempty diagnostic plan";
+          families.front().ids = {99};
+          const ir::sync::DirectSyncOrder order{
+              [](const auto&, const auto&) { return false; }, [](const auto&, const auto&) { return false; },
+              [](size_t, size_t, size_t) -> std::optional<__int128> { return {}; }};
+          ir::sync::AllocateDirectSync(analysis.input, std::move(families), order, "a2a3", std::nullopt);
+        } else {
+          std::string target = "a2a3";
+          if (change == "owner")
+            analysis.input.owner = nullptr;
+          else if (change == "target")
+            target = "a5";
+          else if (change == "domain")
+            analysis.input.block_bounds = std::make_pair(123, 456);
+          else if (change == "frame")
+            ++analysis.input.segments.front().count;
+          else
+            CHECK(change == "none") << "Unknown assignment diagnostic mutation";
+          assignment->ValidateFor(analysis.input, target);
+        }
+        return out;
+      },
+      nb::arg("function"), nb::arg("change") = "none",
+      "Test immutable assignment storage and rejection of foreign or changed synchronous contexts");
+
+  nb::class_<ir::sync::CompactSyncResult>(testing, "CompactSyncAnalysis")
+      .def("export_crossing_demands", &ir::sync::CompactSyncResult::ExportCrossingDemands,
+           "Export retained crossings for a flat regional use; unavailable is distinct from empty")
+      .def(
+          "realize",
+          [](const ir::sync::CompactSyncResult& analysis) {
+            const auto result = ir::sync::RealizeCompactSync(analysis);
+            nb::dict out;
+            out["function"] = result.function;
+            out["record_sites"] = result.record_sites;
+            out["wait_sites"] = result.wait_sites;
+            out["guarded_wait_sites"] = result.guarded_wait_sites;
+            out["carried_tokens"] = result.carried_tokens;
+            out["name_scan_visits"] = result.name_scan_visits;
+            out["name_scan_nodes"] = result.name_scan_nodes;
+            out["guarantee"] = "equal selected order under the admitted logical-token model";
+            return out;
+          },
+          "Realize retained demands with logical completion tokens; no physical allocation")
+      .def(
+          "realize_physical",
+          [](const ir::sync::CompactSyncResult& analysis, const std::string& target,
+             const std::optional<std::vector<int>>& eligible_ids,
+             const ir::sync::SyncSchedulePolicy& policy) {
+            const auto result = sync_testing::RealizeDemandPlan(analysis, target, eligible_ids, policy);
+            auto out = DescribePhysicalSync(result);
+            out["schedule_policy"] = DescribeSchedulePolicy(policy);
+            return out;
+          },
+          nb::arg("target"), nb::arg("eligible_ids") = nb::none(), nb::kw_only(),
+          nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
+          "Test supplied-demand adapter; does not exercise actual-token interpretation")
+      .def("describe", &DescribeCompactSync, "Inspect retained analysis without additional construction")
+      .def("expand_retained_demands", &ir::sync::CompactSyncResult::ExpandRetainedDemands,
+           nb::arg("max_payloads"), "Bounded audit expansion of retained records; never reruns analysis")
+      .def(
+          "export_scoped_demands",
+          [](const ir::sync::CompactSyncResult& result) -> nb::object {
+            const auto owned = result.ExportScopedDemands();
+            if (!owned) return nb::none();
+            nb::dict out;
+            nb::list families;
+            for (const auto& family : owned->families) {
+              nb::dict item;
+              item["source"] = family.source;
+              item["target"] = family.target;
+              nb::list axes;
+              for (const auto& axis : family.axes)
+                axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));
+              item["axes"] = axes;
+              families.append(item);
+            }
+            out["families"] = families;
+            out["visited_source_nodes"] = owned->visited_source_nodes;
+            out["visited_merge_nodes"] = owned->visited_merge_nodes;
+            out["coordinate_entries"] = owned->coordinate_entries;
+            return out;
+          },
+          "Export cached compact demand families in original source frames; not a physical certificate")
+      .def("scoped_consecutive_reuse", &ir::sync::CompactSyncResult::ScopedConsecutiveReuse,
+           nb::arg("family"), "Certify all carry classes for an owned original scoped family")
+      .def("precedes", &ir::sync::CompactSyncResult::Precedes, nb::arg("source"),
+           nb::arg("source_completion"), nb::arg("target"), nb::arg("target_completion"),
+           "Query original segment/visit/site events")
+      .def("boundary", &CompactBoundary, nb::arg("storage"), nb::arg("row"), nb::arg("column"),
+           nb::arg("parameters") = std::map<size_t, int64_t>{}, nb::arg("block_index") = nb::none(),
+           "Exact modeled point selector, or None for unavailable domain")
+      .def("boundary_slot", &CompactSlotBoundary, nb::arg("storage"), nb::arg("slot"), nb::arg("row"),
+           nb::arg("column"), nb::arg("parameters") = std::map<size_t, int64_t>{},
+           nb::arg("block_index") = nb::none(),
+           "Exact modeled point selector with explicit physical slot identity");
+  nb::class_<ir::sync::ScopedTokenOrder>(testing, "ScopedTokenOrder")
+      .def("precedes", &ir::sync::ScopedTokenOrder::Precedes)
+      .def("uniform", &ir::sync::ScopedTokenOrder::Uniform)
+      .def_prop_ro("summary_nodes", &ir::sync::ScopedTokenOrder::SummaryNodes)
+      .def_prop_ro("interface_entries", &ir::sync::ScopedTokenOrder::InterfaceEntries)
+      .def("reuse",
+           [](const ir::sync::ScopedTokenOrder& order, size_t i) { return order.View().scoped_reuse(i); })
+      .def("barrier",
+           [](const ir::sync::ScopedTokenOrder& order, size_t i) { return order.View().scoped_barrier(i); })
+      .def(
+          "realize",
+          [](const ir::sync::ScopedTokenOrder& order, const std::string& target) {
+            return ir::sync::RealizeDirectSync(order.Input(), order.Families(), order.View(), target,
+                                               std::nullopt)
+                .function;
+          },
+          nb::arg("target") = "a2a3");
+  testing.def("check_generated_logical_sync", &ir::sync::CheckGeneratedLogicalSync, nb::arg("function"),
+              "Check insertion-owned logical IR using the production internal-error boundary");
+  testing.def(
+      "lower_sync_schedule",
+      [](const ir::FunctionPtr& function, const std::string& target,
+         const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks,
+         const ir::sync::SyncSchedulePolicy& policy) {
+        const auto result =
+            ir::sync::LowerLogicalSync(function, target, std::nullopt, parameters, blocks, policy);
+        nb::dict out;
+        out["function"] = result.function;
+        out["set_sites"] = result.set_sites;
+        out["wait_sites"] = result.wait_sites;
+        nb::list cases;
+        for (const auto& item : result.physical_cases) cases.append(DescribePhysicalSync(item));
+        out["physical_cases"] = cases;
+        out["schedule"] = DescribeSchedule(result.physical_cases.empty() ? ir::sync::PhysicalSyncRealization{}
+                                                                         : result.physical_cases.front());
+        out["schedule_policy"] = DescribeSchedulePolicy(policy);
+        return out;
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
+      nb::kw_only(), nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
+      "Run the production actual-token lowering with explicit current invocation evidence");
+  testing.def(
+      "analyze_scoped_token_order",
+      [](const ir::FunctionPtr& function, const std::string& target) {
+        ir::CheckLogicalSync(function);
+        auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
+        auto input = ir::sync::ImportSyncPayloads(stripped.function, target);
+        auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops);
+        return std::make_shared<ir::sync::ScopedTokenOrder>(std::move(input), std::move(families));
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3");
+  testing.def(
+      "inspect_scoped_token_families",
+      [](const ir::FunctionPtr& function, const std::string& target,
+         const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks) {
+        ir::CheckLogicalSync(function);
+        auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
+        const auto input = ir::sync::ImportSyncPayloads(stripped.function, target, parameters, blocks);
+        ir::sync::ScopedTokenWork work;
+        const auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops, &work);
+        nb::dict out;
+        out["function"] = stripped.function;
+        nb::dict counts;
+        counts["read_statement_visits"] = work.statements;
+        counts["waits_inspected"] = work.waits_inspected;
+        counts["inactive_waits"] = work.inactive_waits;
+        counts["families"] = work.families;
+        out["work"] = counts;
+        nb::list rows, regions;
+        for (const auto& family : families) {
+          nb::dict row;
+          row["source"] = nb::make_tuple(family.source_region, family.source_first, family.source_site);
+          row["target"] = nb::make_tuple(family.target_region, family.target_first, family.target_site);
+          row["count"] = family.count;
+          row["source_domain"] = nb::cast(family.source_domain->ranges);
+          row["target_domain"] = nb::cast(family.target_domain->ranges);
+          nb::list axes;
+          for (const auto& axis : family.axes)
+            axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));
+          row["axes"] = axes;
+          rows.append(row);
+        }
+        for (const auto& segment : input.segments) {
+          nb::dict region;
+          nb::list sites, frames;
+          for (const auto& site : segment.sites)
+            sites.append(nb::make_tuple(site.original, site.continuation));
+          for (const auto& frame : segment.nested_frames)
+            frames.append(nb::make_tuple(frame.loop, frame.count, frame.start, frame.step));
+          region["sites"] = sites;
+          region["frames"] = frames;
+          regions.append(region);
+        }
+        out["families"] = rows;
+        out["regions"] = regions;
+        return out;
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
+      "Inspect actual scoped token handoffs under the explicit disjoint-GM test contract; no allocation");
+  nb::class_<ir::sync::SyncInvocationAnalysis>(testing, "SyncInvocationAnalysis")
+      .def(
+          "realize_physical",
+          [](const ir::sync::SyncInvocationAnalysis& analysis, const std::string& target,
+             const std::optional<std::vector<int>>& eligible_ids,
+             const ir::sync::SyncSchedulePolicy& policy) {
+            const auto result = sync_testing::RealizeDemandInvocation(analysis, target, eligible_ids, policy);
+            nb::dict out;
+            out["function"] = result.function;
+            nb::list cases;
+            size_t sets = 0, waits = 0, barriers = 0, guards = 0;
+            for (size_t i = 0; i < result.cases.size(); ++i) {
+              auto row = DescribePhysicalSync(result.cases[i]);
+              row["block_bounds"] =
+                  nb::make_tuple(analysis.cases[i].block_first, analysis.cases[i].block_last);
+              cases.append(row);
+              sets += result.cases[i].set_sites;
+              waits += result.cases[i].wait_sites;
+              barriers += result.cases[i].barrier_sites;
+              guards += result.cases[i].guard_sites;
+            }
+            out["cases"] = cases;
+            out["schedule"] = DescribeSchedule(result.cases.front());
+            out["schedule_policy"] = DescribeSchedulePolicy(policy);
+            nb::dict case_sites;
+            case_sites["set_sites"] = sets;
+            case_sites["wait_sites"] = waits;
+            case_sites["barrier_sites"] = barriers;
+            case_sites["guard_sites"] = guards;
+            out["case_sites"] = case_sites;
+            PhysicalControlCensus emitted, original;
+            emitted.VisitFunction(result.function);
+            original.VisitFunction(analysis.owner);
+            INTERNAL_CHECK(emitted.branches >= original.branches)
+                << "Internal error: invocation payload guards changed";
+            out["set_sites"] = emitted.sets;
+            out["wait_sites"] = emitted.waits;
+            out["barrier_sites"] = emitted.barriers;
+            out["guard_sites"] = emitted.branches - original.branches;
+            out["if_sites"] = emitted.branches;
+            return out;
+          },
+          nb::arg("target"), nb::arg("eligible_ids") = nb::none(), nb::kw_only(),
+          nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
+          "Test supplied-demand case adapter; does not exercise actual-token interpretation")
+      .def("select_case", &ir::sync::SyncInvocationAnalysis::SelectCase, nb::arg("block_index"),
+           nb::arg("parameters"), "Retained case for a fully bound admitted invocation, or None")
+      .def(
+          "describe",
+          [](const ir::sync::SyncInvocationAnalysis& result) {
+            nb::dict out;
+            out["block_bounds"] = result.block_bounds;
+            out["parameter_bounds"] = result.parameter_bounds;
+            out["coordinate_nodes"] = result.coordinate_nodes;
+            out["coordinate_pieces"] = result.coordinate_pieces;
+            nb::list cases;
+            for (const auto& item : result.cases) {
+              nb::dict row;
+              row["block_bounds"] = nb::make_tuple(item.block_first, item.block_last);
+              row["analysis"] = DescribeCompactSync(*item.mathematics);
+              cases.append(row);
+            }
+            out["cases"] = cases;
+            return out;
+          },
+          "Inspect exhaustive invocation partition without constructing exports");
+  testing.def(
+      "analyze_sync_invocation",
+      [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
+         const ir::sync::SyncParameterBounds& parameters, std::pair<int64_t, int64_t> blocks) {
+        return ir::sync::AnalyzeSyncInvocation(function, disjoint_gm, target, parameters, blocks);
+      },
+      nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target"), nb::arg("parameter_bounds"),
+      nb::arg("block_bounds"), "Analyze an exhaustive analytic partition of a proved launch domain");
+  testing.def(
+      "describe_placed_sync_input",
+      [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
+         const ir::sync::SyncParameterBounds& bounds,
+         const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
+        ir::sync::CompactSyncResult imported;
+        imported.input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds);
+        auto description = DescribeCompactSync(imported);
+        description["guarantee"] = "qualified access description; demand analysis not requested";
+        description["analysis_available"] = false;
+        return description;
+      },
+      nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
+      "Inspect normalized physical access and slot certificates without constructing demands");
+  testing.def(
+      "analyze_placed_sync",
+      [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
+         const ir::sync::SyncParameterBounds& bounds, const std::string& composition_order,
+         const std::optional<std::pair<int64_t, int64_t>>& block_bounds, bool original_frames) {
+        auto start = std::chrono::steady_clock::now();
+        auto input =
+            ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds,
+                                       original_frames ? ir::sync::SyncOccurrenceLayout::OriginalFrames
+                                                       : ir::sync::SyncOccurrenceLayout::Automatic);
+        double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        auto result = ir::sync::AnalyzeCompactSync(std::move(input), composition_order);
+        result.import_seconds = seconds;
+        return result;
+      },
+      nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{},
+      nb::arg("composition_order") = "balanced", nb::arg("block_bounds") = nb::none(),
+      nb::arg("original_frames") = false,
+      "Read-only research analysis of qualified placed Buffer IR under a named hardware contract");
+
+  testing.def(
+      "sync_parameter_bounds",
+      [](const ir::ProgramPtr& program) {
+        return ir::sync::CollectSyncInvocationEvidence(program).parameters;
+      },
+      nb::arg("program"), "Inspect proved caller coordinate ranges without analysis or realization");
+  testing.def(
+      "sync_invocation_evidence",
+      [](const ir::ProgramPtr& program) {
+        ir::sync::SyncParameterWork work;
+        const auto evidence = ir::sync::CollectSyncInvocationEvidence(program, &work);
+        nb::dict out;
+        out["parameters"] = evidence.parameters;
+        out["block_indices"] = evidence.block_indices;
+        out["call_graph_expression_visits"] = work.call_graph_expression_visits;
+        out["call_graph_nodes"] = work.call_graph_nodes;
+        out["call_graph_edges"] = work.call_graph_edges;
+        out["processed_functions"] = work.processed_functions;
+        out["expression_visits"] = work.expression_visits;
+        out["range_visits"] = work.range_visits;
+        return out;
+      },
+      nb::arg("program"), "Read-only scalar and launch evidence; missing facts remain unavailable");
+  testing.def(
+      "sync_parameter_bounds_profile",
+      [](const ir::ProgramPtr& program) {
+        ir::sync::SyncParameterWork work;
+        auto bounds = ir::sync::CollectSyncInvocationEvidence(program, &work).parameters;
+        nb::dict out;
+        out["bounds"] = bounds;
+        out["expression_visits"] = work.expression_visits;
+        out["range_visits"] = work.range_visits;
+        return out;
+      },
+      nb::arg("program"), "Inspect caller proof traversal work in each bound environment");
+  testing.def("analyze_finite_sync", &AnalyzeFiniteSyncForTesting, nb::arg("occurrences"),
+              nb::arg("covered_cells"), nb::arg("exact_accesses"), nb::arg("prerequisites"),
+              nb::arg("native_order"), nb::arg("queries"), nb::arg("boundary_cells"),
+              "Analyze supplied finite physical classes without command insertion");
   testing.def("try_infer_pipe", &TryInferPipeForTesting, nb::arg("call"),
               "Return the exact backend pipe for a Call, or None");
 

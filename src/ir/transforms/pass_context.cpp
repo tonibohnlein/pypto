@@ -309,7 +309,7 @@ PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, Verificatio
                          DiagnosticPhase diagnostic_phase, DiagnosticCheckSet disabled_diagnostics,
                          MemoryPlanner memory_planner, bool enable_pypto_l0c_double_buffer,
                          RuntimeKind runtime, bool enable_buffer_ir, bool enable_software_pipeline,
-                         bool report_hardware_loops)
+                         bool report_hardware_loops, bool enable_pypto_autosync, bool autosync_disjoint_gm)
     : report_hardware_loops_(report_hardware_loops),
       instruments_(std::move(instruments)),
       verification_level_(verification_level),
@@ -320,6 +320,8 @@ PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, Verificatio
       runtime_(runtime),
       enable_buffer_ir_(enable_buffer_ir),
       enable_software_pipeline_(enable_software_pipeline),
+      enable_pypto_autosync_(enable_pypto_autosync),
+      autosync_disjoint_gm_(autosync_disjoint_gm),
       previous_(nullptr) {
   CHECK(!enable_software_pipeline_ || memory_planner_ == MemoryPlanner::PyPTO)
       << "enable_software_pipeline requires memory_planner=PYPTO";
@@ -330,6 +332,10 @@ PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, Verificatio
 VerificationLevel PassContext::GetVerificationLevel() const { return verification_level_; }
 
 MemoryPlanner PassContext::GetMemoryPlanner() const { return memory_planner_; }
+
+bool PassContext::GetEnablePyptoAutoSync() const { return enable_pypto_autosync_; }
+
+bool PassContext::GetAutoSyncDisjointGM() const { return autosync_disjoint_gm_; }
 
 RuntimeKind PassContext::GetRuntime() const { return runtime_; }
 

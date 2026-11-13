@@ -176,6 +176,8 @@ class TestMakeCacheKey:
             ("enable_buffer_ir", False),
             ("buffer_ir_version", 0),
             ("enable_software_pipeline", False),
+            ("enable_pypto_autosync", False),
+            ("autosync_disjoint_gm", False),
         )
 
     def test_tensor_shape_in_key(self):
@@ -659,6 +661,16 @@ class TestGlobalDependencies:
 
         monkeypatch.setattr(importlib.import_module("pypto.ir.compile"), "compile", compile_program)
         return programs
+
+    def test_autosync_owner_invalidates_memory_cache(self, compile_programs):
+        kernel = pl.jit(_global_slice)
+        baseline = kernel.compile()
+        with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+            manual = kernel.compile()
+            assert kernel.compile() is manual
+        assert manual is not baseline
+        assert kernel.compile() is baseline
+        assert len(compile_programs) == 2
 
     def test_global_change_invalidates_memory_cache(self, compile_programs, monkeypatch):
         kernel = pl.jit(_global_slice)

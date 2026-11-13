@@ -316,7 +316,8 @@ class PassContext {
                        MemoryPlanner memory_planner = MemoryPlanner::PyPTO,
                        bool enable_pypto_l0c_double_buffer = false, RuntimeKind runtime = kDefaultRuntimeKind,
                        bool enable_buffer_ir = true, bool enable_software_pipeline = false,
-                       bool report_hardware_loops = false);
+                       bool report_hardware_loops = false, bool enable_pypto_autosync = false,
+                       bool autosync_disjoint_gm = false);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -373,6 +374,11 @@ class PassContext {
    * @brief Get the memory planner selection for this context
    */
   [[nodiscard]] MemoryPlanner GetMemoryPlanner() const;
+
+  /// Try whole-kernel PyPTO synchronization before downstream PTOAS.
+  [[nodiscard]] bool GetEnablePyptoAutoSync() const;
+  /// Explicit caller contract: distinct GM roots denote disjoint allocations.
+  [[nodiscard]] bool GetAutoSyncDisjointGM() const;
 
   /**
    * @brief Return the legacy flag; it does not override the planner's dbC policy.
@@ -439,6 +445,8 @@ class PassContext {
   RuntimeKind runtime_;
   bool enable_buffer_ir_;
   bool enable_software_pipeline_;
+  bool enable_pypto_autosync_;
+  bool autosync_disjoint_gm_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

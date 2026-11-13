@@ -312,6 +312,20 @@ Pass MaterializeValidShapeSymbols();
  */
 Pass LowerTileToBuffer();
 
+/// Insert logical completion tokens for qualified placed Buffer demands.
+/// Strict standalone stage: unsupported exports raise without modifying input.
+Pass InsertSync();
+
+/// Verify logical completion IR; initially an identity optimization stage.
+Pass OptimizeSync();
+
+/// Lower the supported logical token subset using certified physical resources.
+/// This consumes token semantics, not a recomputed minimum-demand inventory.
+Pass LowerSync();
+
+/// Opt-in whole-kernel physical synchronization; qualification refusals delegate to PTOAS.
+Pass RealizeSync();
+
 /// Select whole kernels for the default Buffer rollout before storage legalization.
 Pass SelectBufferIRFunctions();
 

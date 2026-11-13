@@ -80,3 +80,20 @@ target_include_directories(pypto_sync_isa_macro_resources_test PRIVATE
 target_link_libraries(pypto_sync_isa_macro_resources_test PRIVATE libbacktrace)
 target_compile_options(pypto_sync_isa_macro_resources_test PRIVATE -UNDEBUG)
 add_test(NAME pypto_sync_isa_macro_resources_test COMMAND pypto_sync_isa_macro_resources_test)
+
+# Supplied-edge numerical composition is independent of storage-demand analysis.
+add_executable(pypto_numerical_sync_order_test
+    numerical_sync_order_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/ir/transforms/utils/numerical_sync_merge.cpp
+    ${CMAKE_SOURCE_DIR}/src/ir/transforms/utils/numerical_sync_order.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/backtrace.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/ir/core.cpp
+)
+target_include_directories(pypto_numerical_sync_order_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(pypto_numerical_sync_order_test PRIVATE libbacktrace)
+target_compile_options(pypto_numerical_sync_order_test PRIVATE -UNDEBUG)
+add_test(NAME pypto_numerical_sync_order_test COMMAND pypto_numerical_sync_order_test)

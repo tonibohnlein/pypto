@@ -45,11 +45,13 @@ from typing import Any
 
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, decode_external_include_dirs
 from pypto._function_attrs import (
+    AUTOSYNC_FALLBACK_REASON_ATTR,
     BUILTIN_TEMPLATE_DIR_ATTR,
     BUILTIN_TEMPLATE_VARS_ATTR,
     DUAL_AIV_DISPATCH_ATTR,
     EXTERNAL_PREFLIGHT_SOURCE_ATTR,
     EXTERNAL_SOURCE_ATTR,
+    PYPTO_AUTOSYNC_ATTR,
 )
 from pypto.backend._host_tensor_args import host_tensor_indices as _host_tensor_indices
 from pypto.backend._ptoas_config import PTOAS_TIMEOUT_ENV as _PTOAS_TIMEOUT_ENV
@@ -1678,7 +1680,7 @@ def _get_ptoas_flags(
     addresses in PyPTO and trust them (``--pto-level=level3``);
     ``MemoryPlanner.PTOAS`` emits no addresses and lets the ptoas PlanMemory
     pass allocate (``--pto-level=level2``). When ``passes_dump_dir`` is set,
-    request full-module IR snapshots after every ptoas pass.
+    request pass-target IR snapshots after every ptoas pass.
     """
     level = "level2" if memory_planner == _passes.MemoryPlanner.PTOAS else "level3"
     flags = [
@@ -1688,8 +1690,9 @@ def _get_ptoas_flags(
     if passes_dump_dir is not None:
         flags.extend(
             [
+                # Dump each pass target. Full-module printing requires a serial
+                # MLIR context, which the pinned PTOAS CLI cannot configure.
                 "--mlir-print-ir-after-all",
-                "--mlir-print-ir-module-scope",
                 f"--mlir-print-ir-tree-dir={passes_dump_dir}",
             ]
         )
@@ -2172,7 +2175,7 @@ def generate(
             MLIR ``loc("file":line:col)`` from the IR Span so ptoas diagnostics
             name the user's source. None reads the ``PYPTO_EMIT_PTO_LOC``
             environment default (on).
-        dump_ptoas_passes: When True, dump full-module IR after every ptoas pass
+        dump_ptoas_passes: When True, dump pass-target IR after every ptoas pass
             under ``<output_dir>/ptoas_passes/<codegen-unit>/``. Has no effect
             when ``skip_ptoas=True``.
         runtime: Simpler runtime ABI to target; its wire name is written to
@@ -2592,6 +2595,31 @@ def _validate_external_bridge_runtime(program: _ir_core.Program, runtime: _passe
         raise ValueError("External runtime bridge requires TENSORMAP_AND_RINGBUFFER")
 
 
+def _autosync_report(transformed_program: _ir_core.Program) -> dict[str, str]:
+    """Report retained selection without changing downstream synchronization."""
+    result_files: dict[str, str] = {}
+    sync_reports: list[dict[str, Any]] = []
+    for function in transformed_program.functions.values():
+        attrs = dict(function.attrs)
+        if PYPTO_AUTOSYNC_ATTR not in attrs:
+            continue
+        owner = attrs[PYPTO_AUTOSYNC_ATTR]
+        if type(owner) is not bool:
+            raise ValueError("pypto_autosync ownership must be a boolean")
+        sync_reports.append(
+            {
+                "function": function.name,
+                "selected_route": "pypto" if owner else "ptoas",
+                "reason": attrs.get(AUTOSYNC_FALLBACK_REASON_ATTR, "complete literal flag plan"),
+            }
+        )
+    if sync_reports:
+        result_files["report/autosync.json"] = (
+            json.dumps({"downstream_autosync_enabled": True, "kernels": sync_reports}, indent=2) + "\n"
+        )
+    return result_files
+
+
 def _generate_single_chip(
     transformed_program: _ir_core.Program,
     output_dir: str,
@@ -2609,7 +2637,7 @@ def _generate_single_chip(
     (called from the top-level :func:`generate` dispatcher), so each
     sub-program reaching this function has exactly one orch.
     """
-    result_files: dict[str, str] = {}
+    result_files = _autosync_report(transformed_program)
     errors: list[tuple[str, Exception]] = []
     prof = CompileProfiler.current()
 

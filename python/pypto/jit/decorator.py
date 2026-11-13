@@ -1166,6 +1166,9 @@ class JITFunction:
         # compile-time value is part of what gets compiled, so the key has to
         # identify it too.
         constexpr_bindings = self._resolve_constexpr_bindings(specialization.constexpr_values)
+        from pypto.pypto_core import passes as sync_passes  # noqa: PLC0415
+
+        sync_context = sync_passes.PassContext.current()
         key = make_cache_key(
             source_hash=_request_source_hash(
                 self._get_source_hash(), self._constexpr_identity_records(constexpr_bindings)
@@ -1190,6 +1193,8 @@ class JITFunction:
                 compile_kwargs.get("enable_software_pipeline")
             ),
             runtime=_resolve_runtime(),
+            enable_pypto_autosync=sync_context.get_enable_pypto_autosync() if sync_context else False,
+            autosync_disjoint_gm=sync_context.get_autosync_disjoint_gm() if sync_context else False,
         )
 
         with self._cache_lock:
