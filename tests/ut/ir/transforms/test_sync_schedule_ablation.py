@@ -475,3 +475,51 @@ def test_growth_budget_is_cumulative_and_source_order_is_stable_after_serializat
     assert result["schedule"]["choices"] == repeated["schedule"]["choices"]
     for block in (0, 1):
         check(original, logical, result["function"], {4: 0}, block=block, minimum_protocol=False)
+
+
+@pytest.mark.parametrize("block", [0, 1])
+def test_complete_case_cost_delta_matches_independent_active_execution(block):
+    original, logical = case_only_fixture()
+    evidence = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 1)}
+    baseline = lower(logical, "guarded", **evidence)
+    candidate = lower(logical, "case", **evidence)
+    before_rows, after_rows = selected(baseline), selected(candidate)
+    assert len(before_rows) == len(after_rows) == 1
+    before, after = before_rows[0], after_rows[0]
+    assert after["mode"] == "case" and after["model_comparable"]
+    assert before["model_exact"] and after["model_exact"]
+    # The main loop executes once in both valuations. Common prefix/payload
+    # work cancels; a conditional per-entry model is not an invocation total.
+    old, old_work = emitted_work(baseline["function"], {4: 0}, block)
+    new, new_work = emitted_work(candidate["function"], {4: 0}, block)
+    assert old.trace == new.trace
+    expected = sum(before["model_cost"][block]) - sum(after["model_cost"][block])
+    assert expected > 0
+    assert sum(old_work) - sum(new_work) == expected
+    check(original, logical, candidate["function"], {4: 0}, block=block, minimum_protocol=False)
+
+
+@pytest.mark.parametrize("mode", ["auto", "case"])
+def test_actual_token_lowering_refuses_interior_launch_predicate_before_scheduling(mode):
+    _, logical = case_only_fixture()
+    block = logical.body.stmts[0].var
+
+    class InteriorPredicate(ir.IRMutator):
+        def visit_if_stmt(self, op):
+            condition = op.condition
+            if isinstance(condition, ir.Lt) and condition.left.same_as(block):
+                condition = ir.Eq(
+                    block, ir.ConstInt(2, ir.DataType.INDEX, op.span), ir.DataType.BOOL, op.span
+                )
+            return ir.IfStmt(condition, op.then_body, op.else_body, op.return_vars, op.span)
+
+    logical = InteriorPredicate().visit_function(logical)
+    # The activation prefix partitions [0,3] into [0,0] and [1,3]. Equality
+    # at 2 splits the latter's interior; neither endpoint sample proves it.
+    # Actual-token qualification refuses before candidate costing, even forced.
+    with pytest.raises(ValueError, match="Scoped invocation guard is not uniform over the complete case"):
+        lower(logical, mode, parameter_bounds={4: (0, 0)}, block_bounds=(0, 3))
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

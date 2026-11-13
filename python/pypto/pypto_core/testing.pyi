@@ -443,8 +443,13 @@ def emit_sync_boundary_commands(
     """Test boundary scheduling of qualified command cuts; does not qualify matching or coverage."""
     ...
 
-def inspect_sync_invocation_schedules(
-    owner: Function, cases: list[tuple[int, int, Stmt]], trips: int
-) -> dict:
-    """Inspect production schedule grouping and cost; no coverage or protocol certification."""
+class SyncInvocationGroups(TypedDict):
+    groups: list[list[tuple[int, int]]]
+    descriptor_nodes: int
+    comparisons: int
+
+def inspect_sync_invocation_groups(
+    owner: Function, cases: list[tuple[int, int, Stmt]]
+) -> SyncInvocationGroups:
+    """Inspect structural groups only; no profitability, coverage or protocol certification."""
     ...

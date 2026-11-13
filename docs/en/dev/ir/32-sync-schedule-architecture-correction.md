@@ -270,6 +270,40 @@ run. The original failure log remains pinned alongside the rerun. Independent
 review accepted all four log hashes, the campaign, 34 final code/test hashes, the
 unchanged stage-3 extension, both language documents and the three test repairs.
 
+## Diagnostic cleanup checkpoint
+
+The former `inspect_sync_invocation_schedules(owner, cases, trips)` diagnostic
+retained its own launch-only profitability rule after the production selector
+was replaced. That rule and its cost accumulator are now deleted. The renamed
+`inspect_sync_invocation_groups(owner, cases)` calls shared structural grouping
+only and returns groups, descriptor count and equality-comparison count. It
+preserves predicates inside each group; it neither proves their truth nor
+selects a profitable loop transformation. Identical schedules can therefore
+form one group even when no versioning would be useful.
+
+Profitability tests now call `lower_sync_schedule` on actual-token fixtures and
+compare complete per-entry model differences with independently executed control
+work on active valuations. The production partition helper retains its exact
+interval and interior-split rules; all cost accounting belongs to the complete
+candidate selector. No production policy, ID map, token authority or no-clone
+default changes in this checkpoint.
+
+The diagnostic caller audit retains these distinct test responsibilities:
+
+| Entry point | Retained responsibility |
+| --- | --- |
+| `inspect_sync_invocation_groups` | Structural equality and interval-union grouping, including holes and retained predicates |
+| `emit_sync_command_cases` | Shared command dispatch/factoring under supplied cut domains |
+| `share_sync_command_guards` | Local ordered guard factoring |
+| `materialize_sync_command_values` | Scope-local pure predicate sharing without payload duplication |
+| `emit_sync_boundary_commands` | Boundary readiness/effect proof and deterministic command motion |
+| `lower_sync_schedule` | Actual-token production lowering and complete policy selection |
+| Retained-analysis `realize_physical` diagnostics | Existing demand/map diagnostics; never a substitute for actual-token lowering |
+
+Independent access, token, physical-flag and scalar-trace interpreters remain
+separate from these compiler entry points. Historical receipts above describe
+their pinned implementation and are not rewritten as cleanup measurements.
+
 ## Limits and references
 
 This correction changes neither the allocator nor the admitted hardware

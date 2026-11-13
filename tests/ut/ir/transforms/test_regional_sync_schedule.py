@@ -18,7 +18,7 @@ from .sync_matmul_oracle import hardware_reference, interpret
 from .sync_physical_oracle import run_physical
 from .test_rotating_sync_analysis import rotating_fixture
 from .test_streamed_slot_composition import streamed_fixture
-from .test_sync_command_control import SPAN, command, evaluate, guarded, seq
+from .test_sync_command_control import SPAN, command, guarded, seq
 from .test_sync_cut_control import ci, owner, variable
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
@@ -119,46 +119,48 @@ def invocation_owner():
 def test_complete_case_schedule_group_preserves_holes_and_empty_commands(middle):
     _, function = invocation_owner()
     a, b = seq(command(0)), seq(command(1)) if middle == "different_id" else seq()
-    result = testing.inspect_sync_invocation_schedules(function, [(0, 1, a), (2, 3, b), (4, 5, a)], 20)
+    result = testing.inspect_sync_invocation_groups(function, [(0, 1, a), (2, 3, b), (4, 5, a)])
     assert result["groups"] == [[(0, 1), (4, 5)], [(2, 3)]]
-    assert result["invocation_schedule_model_saving"] > 0
 
 
-def test_retained_launch_predicate_is_not_counted_as_removed_work():
+def test_grouping_preserves_identical_retained_launch_predicates():
     block, function = invocation_owner()
     body = guarded(ir.Lt(block, ci(2), ir.DataType.BOOL, SPAN), command())
-    result = testing.inspect_sync_invocation_schedules(function, [(0, 1, body), (2, 3, body)], 100)
-    assert result["groups"] == []
-    assert result["invocation_schedule_model_saving"] == 0
+    result = testing.inspect_sync_invocation_groups(function, [(0, 1, body), (2, 3, body)])
+    assert result["groups"] == [[(0, 3)]]
+    assert set(result) == {"groups", "descriptor_nodes", "comparisons"}
 
 
-def test_launch_predicate_must_be_constant_on_the_complete_supplied_case():
+def test_grouping_retains_predicates_that_split_the_interior_of_a_case():
     block, function = invocation_owner()
     body = guarded(ir.Eq(block, ci(3), ir.DataType.BOOL, SPAN), command())
-    result = testing.inspect_sync_invocation_schedules(function, [(0, 6, body), (7, 8, seq(command(1)))], 100)
-    assert result["groups"] == []  # Equal endpoint samples cannot prove the interior.
+    result = testing.inspect_sync_invocation_groups(function, [(0, 6, body), (7, 8, seq(command(1)))])
+    # Structural grouping keeps the equality guard intact; it cannot prove
+    # its interior truth value or make a profitability decision.
+    assert result["groups"] == [[(0, 6)], [(7, 8)]]
 
 
 def test_missing_dominating_launch_value_keeps_cut_dispatch():
-    result = testing.inspect_sync_invocation_schedules(
-        owner(seq()), [(0, 0, seq(command(0))), (1, 1, seq(command(1)))], 100
+    result = testing.inspect_sync_invocation_groups(
+        owner(seq()), [(0, 0, seq(command(0))), (1, 1, seq(command(1)))]
     )
     assert result["groups"] == []
 
 
 @pytest.mark.parametrize("count", [2, 4, 8, 16, 32])
-def test_case_profile_inspects_interval_decisions_without_launch_enumeration(count):
+def test_structural_grouping_does_not_enumerate_launch_values(count):
     _, function = invocation_owner()
     cases: list[tuple[int, int, ir.Stmt]] = [
         (i * 1000000, (i + 1) * 1000000 - 1, seq(command(i % 2))) for i in range(count)
     ]
-    result = testing.inspect_sync_invocation_schedules(function, cases, 1000)
+    result = testing.inspect_sync_invocation_groups(function, cases)
     assert len(result["groups"]) == 2
     assert sum(map(len, result["groups"])) == count
-    assert result["invocation_schedule_visits"] < 150 * count * count.bit_length()
+    assert result["descriptor_nodes"] == 2 * count
+    assert result["comparisons"] <= 2 * count
 
 
-def test_interval_cost_profile_matches_independent_eager_scalar_execution():
+def test_grouping_preserves_boolean_predicates_and_merges_only_equal_schedules():
     block, function = invocation_owner()
     retained = ir.Or(
         ir.Lt(block, ci(2), ir.DataType.BOOL, SPAN),
@@ -172,30 +174,9 @@ def test_interval_cost_profile_matches_independent_eager_scalar_execution():
         SPAN,
     )
     a, b = guarded(retained, command(0)), seq(command(1))
-    # Split at every retained equality boundary, including its singleton.
     cases: list[tuple[int, int, ir.Stmt]] = [(0, 1, a), (2, 3, b), (4, 4, a), (5, 5, a)]
-    trips = 20
-    result = testing.inspect_sync_invocation_schedules(function, cases, trips)
+    result = testing.inspect_sync_invocation_groups(function, cases)
     assert result["groups"] == [[(0, 1), (4, 5)], [(2, 3)]]
-    incumbent = testing.emit_sync_command_cases(block, [(0, 5)], cases)
-    dispatch = guarded(
-        ir.Or(
-            ir.Le(block, ci(1), ir.DataType.BOOL, SPAN),
-            ir.Ge(block, ci(4), ir.DataType.BOOL, SPAN),
-            ir.DataType.BOOL,
-            SPAN,
-        )
-    )
-
-    def work(stmt, index):
-        counts = evaluate(stmt, {block: index}).counts
-        return sum(counts[k] for k in ("conditions", "scalar_comparisons", "scalar_boolean_ops"))
-
-    savings = [
-        trips * (work(incumbent, i) - work(a if i < 2 or i >= 4 else b, i)) - work(dispatch, i)
-        for i in range(6)
-    ]
-    assert result["invocation_schedule_model_saving"] == min(savings)
 
 
 @pytest.mark.parametrize("stages", [1, 2, 4, 8])
@@ -237,3 +218,7 @@ def test_schedule_name_inventory_is_shared_across_emitted_copies():
         visits.append(result["schedule_name_visits"])
     assert visits[0] > 0
     assert len(set(visits)) == 1
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

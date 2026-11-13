@@ -742,18 +742,20 @@ void BindTesting(nb::module_& m) {
       "Emitter-only case aggregation under a supplied possible cut domain; unknown means full domain");
 
   testing.def(
-      "inspect_sync_invocation_schedules",
-      [](const ir::FunctionPtr& owner, const std::vector<std::tuple<int64_t, int64_t, ir::StmtPtr>>& supplied,
-         int64_t trips) {
+      "inspect_sync_invocation_groups",
+      [](const ir::FunctionPtr& owner,
+         const std::vector<std::tuple<int64_t, int64_t, ir::StmtPtr>>& supplied) {
         std::vector<ir::sync::SyncCommandCase> cases;
         for (const auto& [lo, hi, body] : supplied) cases.push_back({{lo, hi}, body});
-        auto [groups, work] = ir::sync::InspectSyncInvocationSchedules(owner, cases, trips);
-        auto out = DescribePhysicalSync(work);
+        auto [groups, work] = ir::sync::InspectSyncInvocationGroups(owner, cases);
+        nb::dict out;
+        out["descriptor_nodes"] = work.control_descriptors;
+        out["comparisons"] = work.invocation_schedule_comparisons;
         out["groups"] = nb::cast(groups);
         return out;
       },
-      nb::arg("owner"), nb::arg("cases"), nb::arg("trips"),
-      "Test production complete-schedule grouping; supplied commands are not protocol certification");
+      nb::arg("owner"), nb::arg("cases"),
+      "Inspect structural complete-schedule groups only; no profitability or protocol certification");
 
   testing.def(
       "emit_sync_boundary_commands",

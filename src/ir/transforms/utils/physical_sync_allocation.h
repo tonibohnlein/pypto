@@ -75,11 +75,10 @@ struct SyncCommandCase {
   std::pair<int64_t, int64_t> blocks;
   StmtPtr body;
 };
-// Testing only: inspect the production grouping/cost rule on supplied complete
-// command descriptors. This does not establish demand coverage or ID reuse.
+// Testing only: inspect production structural grouping of complete command
+// descriptors. This does not select a candidate, cost it, or certify a protocol.
 std::pair<std::vector<std::vector<std::pair<int64_t, int64_t>>>, PhysicalSyncRealization>
-InspectSyncInvocationSchedules(const FunctionPtr& owner, const std::vector<SyncCommandCase>& cases,
-                               int64_t trips);
+InspectSyncInvocationGroups(const FunctionPtr& owner, const std::vector<SyncCommandCase>& cases);
 // possible is a normalized conservative upper domain of the original cut.
 // Use the entire launch domain when evidence is unavailable, never an empty list.
 // Like ShareSyncCommandGuards, bodies contain only ready, immutable-coordinate

@@ -2028,25 +2028,19 @@ size_t ScheduleHash(const ControlPtr& node, std::map<const CommandControl*, size
   cache[node.get()] = result;
   return result;
 }
-// Compute guaranteed launch-control work over all supplied cases together.
-// Range additions charge a decision to an interval without visiting each case;
-// only its selected interval reaches each child. Unknown coordinate predicates
-// stop the walk. Ordinary independent case tests therefore take O(S log(C+1))
-// indexing work, not C complete walks of an S-node dispatch. Fragmented Boolean
-// domains additionally pay for their explicitly represented interval pieces.
-class LaunchCostProfile {
+// Partition launch predicates over complete supplied cases without enumerating
+// block values. The production cost model owns range-addition accounting; this
+// helper only provides exact case intervals and rejects interior case splits.
+class InvocationCasePartition {
  public:
   struct Decision {
     Intervals yes;
-    size_t operators;
   };
 
  private:
   ExprPtr block_;
   std::vector<int64_t> splits_;
-  std::vector<__int128> difference_;
   PhysicalSyncRealization& work_;
-  bool valid_ = true;
   Intervals all_;
   static Intervals Intersect(const Intervals& a, const Intervals& b) {
     Intervals out;
@@ -2065,15 +2059,12 @@ class LaunchCostProfile {
     if (value <= splits_.front()) return 0;
     if (value >= splits_.back()) return static_cast<int64_t>(splits_.size() - 1);
     auto found = std::lower_bound(splits_.begin(), splits_.end(), static_cast<int64_t>(value));
-    if (*found != value) {
-      valid_ = false;
-      return {};
-    }
+    if (*found != value) return {};
     return found - splits_.begin();
   }
   std::optional<Decision> Condition(const ExprPtr& expression) {
     ++work_.invocation_schedule_visits;
-    if (auto known = As<ConstBool>(expression)) return Decision{known->value_ ? all_ : Intervals{}, 0};
+    if (auto known = As<ConstBool>(expression)) return Decision{known->value_ ? all_ : Intervals{}};
     const auto binary = As<BinaryExpr>(expression);
     if (!binary) return {};
     if (As<And>(expression) || As<Or>(expression)) {
@@ -2082,7 +2073,7 @@ class LaunchCostProfile {
       auto yes = As<And>(expression) ? Intersect(a->yes, b->yes)
                                      : SubtractIntervals(all_, Intersect(SubtractIntervals(all_, a->yes),
                                                                          SubtractIntervals(all_, b->yes)));
-      return Decision{std::move(yes), a->operators + b->operators + 1};
+      return Decision{std::move(yes)};
     }
     const auto bound = As<ConstInt>(binary->right_);
     if (binary->left_ != block_ || !bound) return {};
@@ -2101,33 +2092,13 @@ class LaunchCostProfile {
     } else if (*split < size) {
       yes.emplace_back(*split, size - 1);
     }
-    return Decision{std::move(yes), 1};
-  }
-  void Visit(const ControlPtr& node, const Intervals& active, __int128 weight) {
-    if (active.empty()) return;
-    ++work_.invocation_schedule_visits;
-    if (!node->condition) {
-      for (const auto& child : node->body) Visit(child, active, weight);
-      return;
-    }
-    const auto condition = Condition(node->condition);
-    if (!condition) return;
-    for (const auto& [lo, hi] : active) {
-      difference_[lo] += weight * (condition->operators + 1);
-      difference_[hi + 1] -= weight * (condition->operators + 1);
-      ++work_.invocation_schedule_visits;
-    }
-    const auto yes = Intersect(active, condition->yes), no = SubtractIntervals(active, condition->yes);
-    for (const auto& child : node->body) Visit(child, yes, weight);
-    for (const auto& child : node->alternative) Visit(child, no, weight);
+    return Decision{std::move(yes)};
   }
 
  public:
-  LaunchCostProfile(ExprPtr block, const AssignedRegionSchedule& assigned, PhysicalSyncRealization& work)
-      : block_(std::move(block)),
-        difference_(assigned.cases.size() + 1, 0),
-        work_(work),
-        all_{{0, static_cast<int64_t>(assigned.cases.size() - 1)}} {
+  InvocationCasePartition(ExprPtr block, const AssignedRegionSchedule& assigned,
+                          PhysicalSyncRealization& work)
+      : block_(std::move(block)), work_(work), all_{{0, static_cast<int64_t>(assigned.cases.size() - 1)}} {
     for (const auto& c : assigned.cases) splits_.push_back(c.input->block_bounds->first);
     splits_.push_back(assigned.cases.back().input->block_bounds->second + 1);
   }
@@ -2142,24 +2113,10 @@ class LaunchCostProfile {
     }
     return result;
   }
-  void Add(const ControlForest& nodes, __int128 weight, std::optional<size_t> selected = {}) {
-    const auto active = selected ? Intervals{{*selected, *selected}} : all_;
-    for (const auto& node : nodes) Visit(node, active, weight);
-  }
-  std::optional<std::vector<__int128>> Costs() const {
-    if (!valid_) return {};
-    std::vector<__int128> values;
-    __int128 sum = 0;
-    for (size_t i = 0; i + 1 < difference_.size(); ++i) {
-      sum += difference_[i];
-      values.push_back(sum);
-    }
-    return values;
-  }
 };
 std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
     const std::vector<PreparedSchedulePhase>& phases, const AssignedRegionSchedule& assigned,
-    std::pair<int64_t, int64_t> blocks, PhysicalSyncRealization& work) {
+    PhysicalSyncRealization& work) {
   if (assigned.cases.size() < 2) return {};
   const auto block = assigned.block;
   if (!block) return {};
@@ -2217,58 +2174,6 @@ std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
   return groups;
 }
 
-// Test adapter only; production has one whole-candidate selector.
-std::vector<InvocationScheduleGroup> PlanInvocationSchedules(const std::vector<PreparedSchedulePhase>& phases,
-                                                             const AssignedRegionSchedule& assigned,
-                                                             std::pair<int64_t, int64_t> blocks,
-                                                             PhysicalSyncRealization& work) {
-  if (assigned.cases.size() < 2) return {};
-  const auto block = assigned.block;
-  if (!block) return {};
-  auto groups = GroupInvocationSchedules(phases, assigned, blocks, work);
-  if (groups.empty()) return {};
-  LaunchCostProfile profile(block, assigned, work);
-  for (const auto& phase : phases)
-    for (const auto& inventory : phase.visits) {
-      std::set<const PhysicalCuts*> seen;
-      for (const auto& [anchor, cut] : inventory) {
-        if (!seen.insert(cut.get()).second) continue;
-        const auto visits = (phase.end - phase.first) / phase.period;
-        profile.Add(cut->before, visits);
-        profile.Add(cut->after, visits);
-        for (size_t c = 0; c < assigned.cases.size(); ++c) {
-          const auto domain = *assigned.cases[c].input->block_bounds;
-          const auto before_leaf = CaseLeaf(cut->before_cases, domain);
-          const auto after_leaf = CaseLeaf(cut->after_cases, domain);
-          // Retained leaf predicates still execute in the candidate. They
-          // cannot be charged as removed dispatch, even if they test block.
-          if (before_leaf) profile.Add({before_leaf}, -__int128(visits), c);
-          if (after_leaf) profile.Add({after_leaf}, -__int128(visits), c);
-        }
-      }
-    }
-  const auto savings = profile.Costs();
-  if (!savings) return {};
-  ControlPtr dispatch = ControlSequence({}, assigned.owner->span_, work);
-  for (size_t i = groups.size() - 1; i-- > 0;)
-    dispatch = ControlBranch(InvocationGroupGuard(block, blocks, groups[i].intervals, assigned.owner->span_),
-                             ControlSequence({}, assigned.owner->span_, work), dispatch,
-                             assigned.owner->span_, work);
-  LaunchCostProfile dispatch_cost(block, assigned, work);
-  dispatch_cost.Add({dispatch}, 1);
-  const auto overhead = dispatch_cost.Costs();
-  if (!overhead) return {};
-  __int128 saving = std::numeric_limits<int64_t>::max();
-  for (size_t c = 0; c < assigned.cases.size(); ++c) {
-    if ((*savings)[c] <= (*overhead)[c]) return {};
-    saving = std::min(saving, (*savings)[c] - (*overhead)[c]);
-  }
-  if (saving > std::numeric_limits<size_t>::max() - work.invocation_schedule_model_saving) return {};
-  ++work.invocation_scheduled_loops;
-  work.invocation_schedule_groups += groups.size();
-  work.invocation_schedule_model_saving += static_cast<size_t>(saving);
-  return groups;
-}
 CutInventory SelectInvocationSchedule(const CutInventory& inventory, std::pair<int64_t, int64_t> domain) {
   CutInventory selected;
   std::map<const PhysicalCuts*, std::shared_ptr<PhysicalCuts>> owners;
@@ -2478,7 +2383,7 @@ class ScheduleCostModel {
   const RegularLoopSchedule& loop_;
   ExprPtr block_;
   PhysicalSyncRealization& work_;
-  std::unique_ptr<LaunchCostProfile> partition_;
+  std::unique_ptr<InvocationCasePartition> partition_;
   size_t cases_;
   int64_t first_ = 0, last_ = 0, stride_ = 1;
   std::pair<int64_t, int64_t> blocks_{};
@@ -2651,7 +2556,7 @@ class ScheduleCostModel {
         profile.valid = false;
         return;
       }
-      yes = LaunchCostProfile::Intersection(active, partition->yes);
+      yes = InvocationCasePartition::Intersection(active, partition->yes);
     }
     ScheduleCost local;
     Values unshared;
@@ -2669,7 +2574,7 @@ class ScheduleCostModel {
       : loop_(loop), block_(assigned.block), work_(work), cases_(assigned.cases.size()), blocks_(blocks) {
     if (block_ && std::all_of(assigned.cases.begin(), assigned.cases.end(),
                               [](const auto& c) { return c.input->block_bounds.has_value(); }))
-      partition_ = std::make_unique<LaunchCostProfile>(block_, assigned, work);
+      partition_ = std::make_unique<InvocationCasePartition>(block_, assigned, work);
   }
   Intervals AllCases() const { return {{0, static_cast<int64_t>(cases_ - 1)}}; }
   Intervals CaseIndices(const Intervals& ranges) {
@@ -2709,7 +2614,7 @@ CandidateSchedule PrepareCandidate(const RegularLoopSchedule& loop, unsigned mod
   candidate.plan.identity = !(mode & 6);
   candidate.plan.mode = mode;
   auto phases = PrepareLoopSchedule(loop, mode, assigned, domains, blocks, candidate.work);
-  if (mode & 1) candidate.plan.groups = GroupInvocationSchedules(phases, assigned, blocks, candidate.work);
+  if (mode & 1) candidate.plan.groups = GroupInvocationSchedules(phases, assigned, candidate.work);
   const auto versions = std::max<size_t>(1, candidate.plan.groups.size());
   for (size_t v = 0; v < versions; ++v) {
     auto selected = phases;
@@ -3302,9 +3207,8 @@ void FinishSyncScheduleReceipt(const FunctionPtr& function, PhysicalSyncRealizat
   }
 }
 std::pair<std::vector<std::vector<std::pair<int64_t, int64_t>>>, PhysicalSyncRealization>
-InspectSyncInvocationSchedules(const FunctionPtr& owner, const std::vector<SyncCommandCase>& supplied,
-                               int64_t trips) {
-  CHECK(!supplied.empty() && trips > 0) << "Expected nonempty schedule cases and positive trips";
+InspectSyncInvocationGroups(const FunctionPtr& owner, const std::vector<SyncCommandCase>& supplied) {
+  CHECK(!supplied.empty()) << "Expected nonempty schedule cases";
   std::vector<CompactSyncInput> inputs(supplied.size());
   std::vector<PhysicalSyncRealization> plans(supplied.size());
   std::vector<AssignedSyncCase> cases;
@@ -3322,12 +3226,9 @@ InspectSyncInvocationSchedules(const FunctionPtr& owner, const std::vector<SyncC
     cases.push_back({&inputs[c], &plans[c]});
     cut->before_cases.push_back({supplied[c].blocks, ImportControl(supplied[c].body, work)});
   }
-  const auto block = DominatingSyncBlock(owner);
-  if (!block) return {{}, work};
-  cut->before = ScheduleCommandCases(block, {blocks}, cut->before_cases, work, owner->span_, {});
   AssignedRegionSchedule assigned(owner, cases);
-  const std::vector<PreparedSchedulePhase> phases{{0, trips, 1, true, {CutInventory{{nullptr, cut}}}}};
-  const auto grouped = PlanInvocationSchedules(phases, assigned, blocks, work);
+  const std::vector<PreparedSchedulePhase> phases{{0, 1, 1, false, {CutInventory{{nullptr, cut}}}}};
+  const auto grouped = GroupInvocationSchedules(phases, assigned, work);
   std::vector<std::vector<std::pair<int64_t, int64_t>>> domains;
   for (const auto& group : grouped) domains.push_back(group.intervals);
   return {std::move(domains), std::move(work)};
