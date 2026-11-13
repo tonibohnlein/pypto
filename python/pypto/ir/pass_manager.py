@@ -378,6 +378,8 @@ class PassManager:
         # Otherwise, the pass list could retain legacy planning passes while
         # execution requests a different allocation route. AutoTile also uses
         # the active planner to retain automatic dbC only for PTOAS.
+        self._construction_autosync = ctx.get_enable_pypto_autosync() if ctx else False
+        self._construction_sync_contract = ctx.get_autosync_disjoint_gm() if ctx else False
         self._construction_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         self._construction_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         skipped_mem_planning_passes: tuple[str, ...]
@@ -420,6 +422,8 @@ class PassManager:
         self._pipeline.add_pass(passes.run_verifier(phase_properties))
         if self._construction_buffer_ir:
             self._pipeline.add_pass(passes.lower_tile_to_buffer())
+        if self._construction_autosync:
+            self._pipeline.add_pass(passes.realize_sync())
 
     @property
     def passes(self) -> tuple[passes.Pass, ...]:
@@ -443,6 +447,10 @@ class PassManager:
         IR mode also fixes which storage verifiers are present and must match.
         """
         ctx = passes.PassContext.current()
+        run_autosync = ctx.get_enable_pypto_autosync() if ctx else False
+        run_contract = ctx.get_autosync_disjoint_gm() if ctx else False
+        if (run_autosync, run_contract) != (self._construction_autosync, self._construction_sync_contract):
+            raise RuntimeError("PassManager autosync contract changed after construction")
         run_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         run_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         if run_buffer_ir != self._construction_buffer_ir:
@@ -605,6 +613,8 @@ class PassManager:
             runtime,
             buffer_ir,
             software_pipeline,
+            enable_pypto_autosync=ctx.get_enable_pypto_autosync() if ctx else False,
+            autosync_disjoint_gm=ctx.get_autosync_disjoint_gm() if ctx else False,
         ):
             try:
                 return self._pipeline.run(input_ir)
@@ -661,6 +671,8 @@ class PassManager:
             runtime,
             buffer_ir,
             software_pipeline,
+            enable_pypto_autosync=ctx.get_enable_pypto_autosync() if ctx else False,
+            autosync_disjoint_gm=ctx.get_autosync_disjoint_gm() if ctx else False,
         ):
             try:
                 return self._pipeline.run(input_ir)

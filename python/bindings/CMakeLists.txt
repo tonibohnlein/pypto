@@ -16,6 +16,7 @@ set(PYPTO_BINDING_SOURCES
     modules/core.cpp
     modules/logging.cpp
     modules/testing.cpp
+    modules/testing_sync_support.cpp
     modules/ir.cpp
     modules/ir_builder.cpp
     modules/passes.cpp

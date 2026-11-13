@@ -1,0 +1,41 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
+
+"""Explicit standalone caller contracts, separate from the original model ABI.
+
+Layer count, hidden dimension and selected band are configuration constants.
+Weights have statically declared allocation extents. The original phase body
+receives a runtime layer offset bounded by this caller's loop.
+"""
+
+@pl.jit(auto_scope=False)
+def output_projection_caller(
+    out: pl.Out[pl.Tensor[[TOK_TILE, HIDDEN], pl.FP32]],
+    attn: pl.Tensor[[TOK_TILE, HIDDEN], pl.BF16],
+    weight: pl.Tensor[[LAYERS * HIDDEN, HIDDEN], pl.BF16],
+) -> pl.Tensor[[TOK_TILE, HIDDEN], pl.FP32]:
+    for layer in pl.range(LAYERS):
+        out = output_phase(out, attn, weight, pl.cast(layer * HIDDEN, pl.INT32))
+    return out
+
+
+@pl.jit(auto_scope=False)
+def gate_up_projection_caller(
+    out: pl.Out[pl.Tensor[[2 * MLP_M_TILE, MLP_BAND_WIDTH], pl.FP32]],
+    post_norm: pl.Tensor[[MLP_M_TILE, HIDDEN], pl.BF16],
+    gate_weight: pl.Tensor[[LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+    up_weight: pl.Tensor[[LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+) -> pl.Tensor[[2 * MLP_M_TILE, MLP_BAND_WIDTH], pl.FP32]:
+    for layer in pl.range(LAYERS):
+        out = gate_up_phase(
+            out, post_norm, gate_weight, up_weight,
+            pl.cast(layer * HIDDEN, pl.INT32), BAND,
+        )
+    return out

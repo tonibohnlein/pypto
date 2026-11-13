@@ -1,0 +1,32 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
+
+@pl.jit.inline(auto_scope=False)
+def _out_proj_aic_phase(
+    out_proj_tile: pl.Tensor[[TOK_TILE, HIDDEN], pl.FP32],
+    attn_tile: pl.Tensor[[TOK_TILE, HIDDEN], pl.BF16],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    layer_hidden_base: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[TOK_TILE, HIDDEN], pl.FP32]:
+    with pl.spmd(
+        OUT_PROJ_SPMD_BLOCKS,
+        name_hint="out_proj_aic_spmd",
+    ):
+        out_core = pl.tile.get_block_idx()
+        for ob in pl.range(out_core, Q_OUT_BLOCKS, OUT_PROJ_SPMD_BLOCKS):
+            o0 = ob * Q_OUT_CHUNK
+            o_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+            for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
+                k0 = kb * K_CHUNK
+                tile_a_i = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                tile_w_i = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
+                o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i, init_cond=(kb == 0))
+            out_proj_tile = pl.assemble(out_proj_tile, o_acc, [0, o0])
+    return out_proj_tile
