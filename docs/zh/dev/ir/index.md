@@ -21,9 +21,22 @@ IR 定义是整个编译器的真源：pass 可以重写，IR 节点定义不可
 | [算子效应](10-operator-effects.md) | Functional 参数访问、写通道及核放置/复制契约 |
 | [标量 SIMT IR](11-simt.md) | 无返回值 helper、显式 launch 输出、GM/UB 标量访问及自动资源推导 |
 | [块内跨核同步（intra-block synchronization）](12-intra-block-sync.md) | 同一执行块内 AIC/AIV 的事件同步、流水线顺序、核归属及事件资源 |
+| [有限同步需求分析](12-sync-demand-analysis.md) | 数值存储生成边、最小需求、可达性与边界契约 |
+| [逻辑需求实现](14-logical-demand-realization.md) | 保留需求到完成 token 的构造与独立命令验证 |
+| [物理需求实现](15-physical-demand-realization.md) | 限定范围内的标志分配、直接放置及独立复用检查 |
+| [逻辑同步](11-logical-sync.md) | SSA 完成凭证、流水顺序、运行时地址谓词与 VF 完成边界 |
 
 ## 另请参阅
 
 - [Passes](../passes/index.md) —— 运行在该 IR 之上的各种变换。
 - [Python IR 语法规范](../language/00-python_syntax.md) —— parser 接受的表层语法。
 - [IR 验证器](../passes/99-verifier.md) —— 在 pass 之间检查 IR 合法性的属性验证器。
+
+
+
+
+
+
+- [自动同步架构契约](33-sync-architecture-contracts.md) —— 共享逻辑阶段、已限定描述符、分配方案和标量绑定所有权。
+
+- [Autosync branch layout](34-autosync-branch-layout.md)

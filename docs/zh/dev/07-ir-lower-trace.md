@@ -47,12 +47,15 @@ ir.compile(
 ```
 
 JIT 和 runtime 调用方也可以通过 `RunConfig(dump_ptoas_passes=True)` 使用该
-选项。PyPTO 会让 ptoas 在每个 Pass 后转储完整 module IR，并把每个 codegen
+选项。PyPTO 会让 ptoas 在每个 Pass 后转储该 Pass 目标的 IR，并把每个 codegen
 单元写入独立目录：
 
 ```text
 build/my_program/ptoas_passes/<kernel-or-group>/
 ```
+
+模块 Pass 转储模块，函数 Pass 转储函数。这避免在线程化函数 Pass 中检查完整
+模块；PTOAS v0.72 的 CLI 无法关闭其线程模式。
 
 独立目录可以避免并行 ptoas 调用互相覆盖。目录内的文件名和组织方式由
 ptoas/MLIR 决定。`skip_ptoas=True` 时不会运行 ptoas Pass 流水线，因此该选项
