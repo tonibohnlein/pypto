@@ -612,12 +612,25 @@ nb::dict DescribeSchedule(const ir::sync::PhysicalSyncRealization& result) {
     for (const auto& cost : choice.model_cost)
       costs.append(nb::make_tuple(cost[0], cost[1], cost[2], cost[3], cost[4], cost[5]));
     row["model_cost"] = costs;
+    row["model_scope"] = "standalone_candidate_before_parent_gap_composition";
     row["model_comparable"] = choice.model_comparable;
     row["model_exact"] = choice.model_exact;
     row["selected"] = choice.selected;
     choices.append(row);
   }
   out["choices"] = choices;
+  nb::list gaps;
+  for (const auto& gap : result.schedule_parent_gaps) {
+    nb::dict row;
+    row["loop"] = gap.loop;
+    row["command_sites"] = gap.command_sites;
+    row["before"] = nb::cast(gap.before);
+    row["after"] = nb::cast(gap.after);
+    row["count_order"] = nb::make_tuple("guards", "expressions", "statements");
+    row["scope"] = "parent_gap_after_candidate_selection";
+    gaps.append(row);
+  }
+  out["parent_gaps"] = gaps;
   out["inspected_descriptors"] = result.schedule_inspected_descriptors;
   out["inspected_expressions"] = result.schedule_inspected_expressions;
   out["emitted_payload_sites"] = result.schedule_emitted_payload_sites;

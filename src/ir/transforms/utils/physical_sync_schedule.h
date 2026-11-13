@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <map>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,7 @@ struct InvocationScheduleGroup {
 };
 struct PreparedLoopSchedule {
   RegularLoopSchedule loop;
+  std::string receipt_label;  // Stable original-loop label, not a generated SSA name.
   // Every version already owns its projected cuts and proved boundary motion.
   // Descriptor sharing does not reduce the emitted multiplicity charged here.
   std::vector<std::vector<PreparedSchedulePhase>> versions;

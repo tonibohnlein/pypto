@@ -179,6 +179,16 @@ def selected(result):
 def assert_receipt(result, requested):
     rows = result["schedule"]["choices"]
     assert selected(result)
+    for row in rows:
+        assert row["model_scope"] == "standalone_candidate_before_parent_gap_composition"
+    labels = {row["loop"] for row in selected(result)}
+    for gap in result["schedule"]["parent_gaps"]:
+        assert gap["loop"] in labels
+        assert gap["scope"] == "parent_gap_after_candidate_selection"
+        assert gap["count_order"] == ("guards", "expressions", "statements")
+        assert gap["command_sites"] > 0
+        assert gap["after"][0] < gap["before"][0]
+        assert all(a <= b for a, b in zip(gap["after"], gap["before"], strict=True))
     for row in selected(result):
         assert row["status"] in ("selected", "selected_forced", "fallback")
         if requested != "auto" and row["mode"] != requested:
@@ -519,6 +529,46 @@ def test_actual_token_lowering_refuses_interior_launch_predicate_before_scheduli
     # Actual-token qualification refuses before candidate costing, even forced.
     with pytest.raises(ValueError, match="Scoped invocation guard is not uniform over the complete case"):
         lower(logical, mode, parameter_bounds={4: (0, 0)}, block_bounds=(0, 3))
+
+
+@pytest.mark.parametrize("kind", ["versioned", "multiphase"])
+def test_parent_gap_does_not_cross_dispatch_or_multiple_phases(kind):
+    if kind == "versioned":
+        original, logical = case_only_fixture()
+        mode = "case"
+        evidence = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 1)}
+        values = [({4: 0}, block) for block in (0, 1)]
+    else:
+        original = streamed_fixture(7, start=5, step=2)
+        logical = _apply(passes.insert_sync, original)
+        mode, evidence, values = "boundary_periodic", {}, [({}, None)]
+    result = lower(logical, mode, **evidence)
+    assert_receipt(result, mode)
+    assert any(row["mode"] == mode for row in selected(result))
+    assert not result["schedule"]["parent_gaps"]
+    for parameters, block in values:
+        check(
+            original,
+            logical,
+            result["function"],
+            parameters,
+            block=block,
+            minimum_protocol=kind != "versioned",
+        )
+
+
+def test_repeated_static_loop_pointer_is_rejected_before_parent_composition():
+    _, logical = case_only_fixture()
+    loop = logical.body.stmts[-2]
+    repeated = clone(
+        logical, body=ir.SeqStmts([*logical.body.stmts[:-1], loop, logical.body.stmts[-1]], logical.span)
+    )
+    snapshot = ir.serialize(repeated)
+    # This malformed actual-token program fails SSA admission first. It does
+    # not directly exercise the defensive static-loop census in the planner.
+    with pytest.raises(ValueError, match="multiple SSA definitions"):
+        lower(repeated, "guarded", parameter_bounds={4: (0, 0)}, block_bounds=(0, 1))
+    assert ir.serialize(repeated) == snapshot
 
 
 if __name__ == "__main__":

@@ -1291,30 +1291,52 @@ class CommandSeams {
   CutInventory& cuts_;
   PhysicalSyncRealization& work_;
   BoundarySchedules* boundaries_;
-  const PreparedLoops* loops_;
+  PreparedLoops* loops_;
   BoundarySchedule* boundary_ = nullptr;
   ControlForest* pending_ = nullptr;
   std::map<const PhysicalCuts*, size_t> uses_;
+  std::map<const ForStmt*, size_t> loop_uses_;
 
-  void Join(ControlForest& before) {
+  void Join(ControlForest& before, const std::string& selected_loop = {}) {
     if (!pending_ || pending_->empty() || before.empty() || pending_ == &before) return;
     ControlForest joined = *pending_;
     joined.insert(joined.end(), before.begin(), before.end());
+    const auto previous_shared = work_.shared_composed_guard_sites;
     auto shared = ShareCommandGuards(joined, work_, false);
-    // Keep original cut ownership if no decision was actually removed.
-    if (CaseCodeSize(shared).guards < CaseCodeSize(joined).guards) {
+    const CaseCodeSize original(joined), replacement(shared);
+    // Charge inspections even on refusal. Crossing a selected-candidate
+    // boundary additionally preserves its charged raw descriptor bound. Ordinary
+    // gap sharing keeps its existing policy: arm sequence wrappers can grow
+    // even when fewer statements will be materialized.
+    work_.schedule_inspected_descriptors += original.statements + replacement.statements;
+    work_.schedule_inspected_expressions += original.expressions + replacement.expressions;
+    const bool within_budget = selected_loop.empty() || (replacement.expressions <= original.expressions &&
+                                                         replacement.statements <= original.statements);
+    if (replacement.commands == original.commands && replacement.guards < original.guards && within_budget) {
+      if (!selected_loop.empty())
+        work_.schedule_parent_gaps.push_back(
+            {selected_loop,
+             original.commands,
+             {original.guards, original.expressions, original.statements},
+             {replacement.guards, replacement.expressions, replacement.statements}});
       *pending_ = std::move(shared);
       before.clear();
+    } else {
+      work_.shared_composed_guard_sites = previous_shared;
     }
   }
 
  public:
   CommandSeams(CutInventory& cuts, PhysicalSyncRealization& work, BoundarySchedules* boundaries = nullptr,
-               const PreparedLoops* loops = nullptr)
+               PreparedLoops* loops = nullptr)
       : cuts_(cuts), work_(work), boundaries_(boundaries), loops_(loops) {}
   void Run(const StmtPtr& body) {
     class Uses : public IRVisitor {
       CommandSeams& owner_;
+      void VisitStmt_(const ForStmtPtr& loop) override {
+        ++owner_.loop_uses_[loop.get()];
+        IRVisitor::VisitStmt_(loop);
+      }
       void VisitStmt_(const IfStmtPtr& branch) override {
         const auto first = owner_.cuts_.find(SingletonCall(branch->then_body_));
         const auto second =
@@ -1351,9 +1373,15 @@ class CommandSeams {
       if (loops_) {
         auto found = loops_->find(loop.get());
         if (found != loops_->end()) {
-          // A selected loop is a complete, already costed candidate. Its
-          // internal seams were normalized before costing; do not move commands
-          // into/out of that candidate after selection.
+          auto& plan = found->second;
+          // This is a parent-gap composition, not candidate re-selection. With
+          // one unversioned phase, its proved entry precedes the loop header
+          // directly. Dispatch/multiple phases remain fences. A shared AST loop
+          // cannot lose its entry at only one of its static occurrences.
+          if (loop_uses_[loop.get()] == 1 && plan.groups.empty() && plan.versions.size() == 1 &&
+              plan.versions.front().size() == 1)
+            Join(plan.versions.front().front().entry, plan.receipt_label);
+          // Do not mutate candidate internals or export its exit for sharing.
           pending_ = nullptr;
           return;
         }
@@ -1982,6 +2010,7 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
       if (saving > 0 && saving <= std::numeric_limits<size_t>::max() - work.regular_schedule_model_saving)
         work.regular_schedule_model_saving += static_cast<size_t>(saving);
     }
+    accepted.plan.receipt_label = label;
     selected.emplace(key, std::move(accepted.plan));
   }
   return selected;
@@ -2115,7 +2144,7 @@ PhysicalSyncRealization EmitSyncBoundaryCommands(
   SyncTokenNames names(owner);
   ++work.schedule_name_scans;
   work.schedule_name_visits += names.visits;
-  const PreparedLoops loops;
+  PreparedLoops loops;
   BoundaryScheduleCollector boundary(inventory, loops, work);
   if (enabled) {
     boundary.VisitStmt(owner->body_);

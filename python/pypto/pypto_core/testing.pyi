@@ -201,6 +201,7 @@ class PhysicalSyncRealization(TypedDict):
 
     schedule_name_scans: int
     schedule_name_visits: int
+    # choices carry standalone model_scope; parent_gaps certify subsequent sharing.
     schedule: dict[str, Any]
     schedule_policy: dict[str, Any]
 
@@ -410,6 +411,7 @@ class SyncScheduleLoweringResult(TypedDict):
     set_sites: int
     wait_sites: int
     physical_cases: list[dict[str, Any]]
+    # choices carry standalone model_scope; parent_gaps certify subsequent sharing.
     schedule: dict[str, Any]
     schedule_policy: dict[str, Any]
 

@@ -373,7 +373,7 @@ After case composition, adjacent outgoing/incoming forests may occupy the same
 executable gap. The planner combines only these gaps, with original definitions,
 payloads, arbitrary control and loop headers as fences. Shared initialization and
 accumulation anchors are one wrapped payload cut; multiply placed anchors are not
-rewritten. Independently selected loop candidates remain boundaries. Internal gap
+rewritten. At this checkpoint, independently selected loop candidates remained boundaries. Internal gap
 sharing happens before complete-candidate costing and growth qualification. The
 materializer continues to consume descriptors without selecting an optimization.
 `shared_composed_guard_sites` accounts for sharing after case composition separately
@@ -419,9 +419,51 @@ The changes are not a new device qualification.
 
 Independent review accepted the production patch. The review-only addition of
 `pytest.main` entry points passed all 41 affected tests; the production snapshot
-and 352-test gate remain unchanged. One obvious repetition remains in small
+and 352-test gate remain unchanged. At that checkpoint, one obvious repetition remained in small
 band-2 gate/up: adjacent SET and WAIT alternatives repeat the same condition
 across a selected-loop entry boundary. Removing it requires extending descriptor
 ownership and complete-candidate cost accounting, not an emitter-local rewrite.
 This is nonblocking for this patch; it is not evidence that all remaining guards
 are necessary or that control minimization is complete.
+
+
+## Qualified selected-loop entry composition
+
+The follow-up closes the small band-2 gate/up boundary case above. After candidate
+selection, the existing command-gap planner may join the predecessor's outgoing
+forest with a selected loop's already-proved entry forest. Eligibility requires
+one static occurrence of that loop, no invocation dispatch groups, one version
+and one phase. Internal loop cuts and exit forests remain untouched. The same
+immutable-condition and ordered-arm rules apply; commands, guards, coordinates,
+physical assignments and protocol identities are preserved.
+
+The entry already executes before the loop header. Joining two adjacent forests
+therefore preserves the ordered command trace. The original statement fences
+still apply. The composition additionally requires equal command counts, fewer
+guards, and nonincreasing descriptor expression and statement counts. Refusal
+retains both forests. This is a generic descriptor rule, with no kernel names or
+shape tests in production.
+
+Candidate model costs now explicitly describe the standalone candidate before
+parent-gap composition. Separate `parent_gaps` receipts name the selected loop
+and record guards, expressions and statements before and after composition.
+Original complete-candidate budgets still charge each command once; the final
+parent composition can only shrink the combined descriptor inventory. It neither
+reselects candidates nor adds an emitter-local optimization.
+
+For small gate/up, the combined forest changes from (4,18,14) to (2,12,12), with
+six command sites unchanged. C++ has one fewer `if` (68 to 67) and 66 fewer bytes.
+This is removal of the diagnosed duplicate decision, not a device speedup claim
+or a proof that every remaining guard is necessary. Versioned and multiphase
+loops remain fences. Duplicate-loop SSA and unsupported control regressions
+exercise earlier admission refusal; executable-gap tests separately check retained
+statement fences. See [the pinned receipt](sync-parent-gap.json) for final tests
+and generated-code comparisons. No device validation is implied.
+
+
+Review found a separate opportunity in the generated small gate/up loop: three
+case alternatives repeat the same first-iteration guard. Factoring a common guard
+across alternatives is different from adjacent-tree sharing and requires a separate
+qualified rule. It does not block device correctness qualification of this patch.
+
+Final qualification: **357 tests passed** (nine deprecation warnings). All 235 ordered command traces across 16 kernels match the prior checkpoint; nine small independent access/order/matching/reuse graphs pass. Only the small band-2 gate/up C++ changes; the other 15 outputs retain their size and command counts. The actual-token positive regression additionally checks two Qwen executions independently.

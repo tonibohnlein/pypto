@@ -16,7 +16,7 @@ from .qualify_token_production import program_of
 from .sync_control_metrics import ControlTrace, static_control, trace_control
 from .sync_physical_oracle import run_physical
 from .sync_qwen_prefill_cases import capture_qwen_projection
-from .test_parameterized_token_sync import apply, worker
+from .test_parameterized_token_sync import apply, check, worker
 from .test_qwen_prefill_pipeline import activation_fixture
 from .test_streamed_slot_composition import streamed_fixture
 
@@ -255,6 +255,61 @@ def test_qwen_whole_cut_coalescing_reduces_control_without_new_coloring(band, bo
         assert (
             state.counts[ir.get_op("system.set_flag").name]
             == state.counts[ir.get_op("system.wait_flag").name]
+        )
+
+
+def test_qwen_selected_loop_entry_shares_decision_without_changing_actual_tokens():
+    program = capture_qwen_projection("gate_up", layers=2, hidden=512, band=2)
+    original = next(f for f in program.functions.values() if f.func_type == ir.FunctionType.AIC)
+    logical = worker(apply(passes.insert_sync, program), original.name)
+    evidence = testing.sync_invocation_evidence(program)
+    options = {
+        "parameter_bounds": evidence["parameters"][original.name],
+        "block_bounds": tuple(evidence["block_indices"][original.name]),
+    }
+    result = testing.lower_sync_schedule(logical, **options)
+    # Without boundary extraction the command remains inside the first visit;
+    # ordered payload/command traces still provide an independent placement check.
+    unhoisted = testing.lower_sync_schedule(
+        logical, **options, schedule_policy=testing.SyncSchedulePolicy(boundary_motion=False)
+    )
+    assert not unhoisted["schedule"]["parent_gaps"]
+    gaps = result["schedule"]["parent_gaps"]
+    assert len(gaps) == 1
+    assert gaps[0]["before"] == [4, 18, 14]
+    assert gaps[0]["after"] == [2, 12, 12]
+    assert gaps[0]["command_sites"] == 6
+    chosen = {row["loop"]: row for row in result["schedule"]["choices"] if row["selected"]}
+    assert chosen[gaps[0]["loop"]]["model_scope"] == "standalone_candidate_before_parent_gap_composition"
+    assert static_control(result["function"])["if_sites"] == 67
+    for layer in (0, 1):
+        for block in range(24):
+            actual = trace_control(result["function"], {3: layer}, block)
+            assert actual.trace == trace_control(unhoisted["function"], {3: layer}, block).trace
+        check(original, logical, result["function"], {3: layer}, block=0 if layer == 0 else 23)
+
+
+def test_unsupported_control_before_loop_remains_unavailable():
+    program = capture_qwen_projection("gate_up", layers=2, hidden=512, band=2)
+    original = next(f for f in program.functions.values() if f.func_type == ir.FunctionType.AIC)
+    logical = worker(apply(passes.insert_sync, program), original.name)
+    evidence = testing.sync_invocation_evidence(program)
+
+    class FenceLoops(ir.IRMutator):
+        def visit_for_stmt(self, op):
+            nested = super().visit_for_stmt(op)
+            constant = ir.ConstInt(0, ir.DataType.INDEX, SPAN)
+            return seq(guarded(ir.Eq(logical.params[3], constant, ir.DataType.BOOL, SPAN)), nested)
+
+    fenced = FenceLoops().visit_function(logical)
+    # This guard is rejected by scoped-token admission, before parent-gap
+    # planning. Retained statement fences are tested independently by the
+    # executable-gap tests in test_sync_boundary_schedule.
+    with pytest.raises(ValueError, match="Scoped token guard requires an active original coordinate"):
+        testing.lower_sync_schedule(
+            fenced,
+            parameter_bounds=evidence["parameters"][original.name],
+            block_bounds=tuple(evidence["block_indices"][original.name]),
         )
 
 

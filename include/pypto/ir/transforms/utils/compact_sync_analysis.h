@@ -368,9 +368,18 @@ struct SyncScheduleCandidateReceipt {
   size_t payload_sites = 0, control_node_bound = 0, command_sites = 0;
   // Arithmetic, comparisons, Boolean operators, decisions, loop headers, SSA
   // coordinate and shared-value bindings. Unresolved mixed decisions make
-  // profitability unproved; exact means exact modeled generated control only.
+  // profitability unproved; exact means exact modeled generated control for
+  // this standalone candidate, before any certified parent-gap composition.
   std::vector<std::array<int64_t, 6>> model_cost;
   bool model_comparable = false, model_exact = false, selected = false;
+};
+// A parent-gap composition preserves ordered commands and can only shrink the
+// combined forest. Counts are guards, expression occurrences and statements.
+// Original selection costs/budgets remain scoped to standalone candidates.
+struct SyncScheduleParentGapReceipt {
+  std::string loop;
+  size_t command_sites = 0;
+  std::array<size_t, 3> before{}, after{};
 };
 struct PhysicalSyncRealization {
   FunctionPtr function;
@@ -394,6 +403,7 @@ struct PhysicalSyncRealization {
          invocation_schedule_comparisons = 0, invocation_schedule_model_saving = 0;
   size_t schedule_name_scans = 0, schedule_name_visits = 0;
   std::vector<SyncScheduleCandidateReceipt> schedule_choices;
+  std::vector<SyncScheduleParentGapReceipt> schedule_parent_gaps;
   size_t schedule_inspected_descriptors = 0, schedule_inspected_expressions = 0;
   size_t schedule_emitted_payload_sites = 0, schedule_emitted_control_nodes = 0;
   size_t regular_schedule_candidates = 0, regular_schedule_loops = 0, regular_schedule_boundaries = 0;
