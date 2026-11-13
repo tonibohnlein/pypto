@@ -123,6 +123,15 @@ All 16 production C++ outputs remain byte-identical, with 235 ordered traces and
 nine independent semantic fixtures passing. These checks preserve the prior
 protocol; they are not a device result.
 
+The follow-up audit removes the diagnostic-only perfect-nest flattening mode.
+All access inspection now uses the production original-frame representation;
+finite and simple-loop production paths remain. Independent reset, selector and
+cover checks are retained. Deep synthetic nests that only the deleted diagnostic
+layout could allocate now explicitly test the production certificate refusal;
+that refusal does not prove physical infeasibility. The shared rotating-reset
+fixture now reports its production original-frame export refusal rather than
+exposing mathematics available only in the deleted diagnostic mode.
+
 ## Review and validation
 
 All four stages passed independent review before progression. The focused gates

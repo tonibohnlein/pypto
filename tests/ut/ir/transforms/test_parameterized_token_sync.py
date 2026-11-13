@@ -358,11 +358,9 @@ def test_caller_reactivation_does_not_regenerate_missing_tokens():
 def test_perfect_nested_frames_use_scoped_token_transport(counts, repeats):
     original = nested_fixture(counts, repeats=repeats)
     parameters = {1: 16, 3: 128}
-    # Both representations are checked against original byte effects, actual
-    # covers, all four queries and storage boundaries, not against each other.
-    flat = testing.analyze_placed_sync(original, True, parameter_bounds=BOUNDS)
-    scoped = testing.analyze_placed_sync(original, True, parameter_bounds=BOUNDS, original_frames=True)
-    validate(original, flat, parameters=parameters)
+    # Check the production representation against original byte effects, actual
+    # covers, all four queries and storage boundaries.
+    scoped = testing.analyze_placed_sync(original, True, parameter_bounds=BOUNDS)
     validate(original, scoped, parameters=parameters)
     program = caller_program(original)
     logical = apply(passes.insert_sync, program)

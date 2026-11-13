@@ -228,7 +228,7 @@ def measure(name, program, valuations, independent):
         allocations = allocation["cases"]
         mathematics = [owner.select_case(b[0], {i: v[0] for i, v in parameters.items()}) for b in bounds]
     else:
-        owner = testing.analyze_placed_sync(original, True, parameter_bounds=parameters, original_frames=True)
+        owner = testing.analyze_placed_sync(original, True, parameter_bounds=parameters)
         bounds = [None]
         allocation = owner.realize_physical("a2a3", list(range(6)))
         allocations = [allocation]
