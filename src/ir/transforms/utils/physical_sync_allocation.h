@@ -105,6 +105,9 @@ PhysicalSyncRealization EmitSyncBoundaryCommands(
 // or an explicit delegation outcome. This does not qualify or allocate a plan.
 FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::string& reason);
 
+// Read the already-qualified endpoint pipe pair; no access recovery or policy selection.
+SyncDirection SyncFamilyPipes(const CompactSyncInput& input, const PhysicalSyncFamily& family);
+
 // Shared native-owner and target eligibility policy. Neither helper computes
 // demands or assumes that a logical token owns a consuming hardware event.
 SyncNativeReservations SyncNativeClaims(const CompactSyncInput& input, const std::string& target);

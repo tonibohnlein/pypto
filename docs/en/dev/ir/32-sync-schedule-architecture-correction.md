@@ -304,6 +304,39 @@ Independent access, token, physical-flag and scalar-trace interpreters remain
 separate from these compiler entry points. Historical receipts above describe
 their pinned implementation and are not rewritten as cleanup measurements.
 
+## Physical realization responsibilities
+
+The implementation is divided by ownership and decision responsibility. These
+are private translation units under `src/ir/transforms/utils/`; public entry
+points and diagnostic result shapes stay unchanged by the split.
+
+| File | Responsibility |
+| --- | --- |
+| `physical_sync_allocation.cpp` | Native reservations, eligible pools, lane reuse and allocation using the supplied order proof |
+| `physical_sync_commands.cpp` | Immutable command descriptors, exact equality, cut-case factoring, and local guard/scalar sharing |
+| `physical_sync_schedule.cpp` | Assigned endpoint inventory, current original-cut facts, candidate legality, boundary proofs, complete costs and function-wide growth selection |
+| `physical_sync_materialization.cpp` | Install already selected descriptors and refresh copied SSA names; no selection or analysis recovery |
+| `physical_sync_realization.cpp` | Direct/retained/invocation integration and established ownership or delegation outcomes |
+
+The two private headers contain descriptor fields and function declarations;
+assigned inventory owners, cost models and proof visitors remain implementation
+classes. The materializer receives the cached launch expression and selected
+cuts, phases and groups. It cannot query the assigned analysis owner. One
+stack-owned name reservation stays alive through the synchronous planning/emission
+transaction and is shared by every copied body. Allocation callbacks and endpoint
+maps retain their original owner lifetimes. Predicate admission and expanded
+command-size counting each retain one shared implementation.
+
+This source split does not add a recovery pass, cache, public policy or new
+mathematical proof. The earlier campaign and checkpoint receipts remain evidence
+for their pinned trees; cleanup validation records its own pre/post comparisons. The split builds and
+passes 344 targeted tests (seven existing warnings). Forty-four physical IR
+serializations, including generated names, are byte-identical across finite,
+rotating, scoped and Qwen fixtures. Fifty complete diagnostic records match
+exactly; two refusal records differ only in the relocated CHECK source-file/line
+suffix, with raw messages retained. These comparisons cover policy receipts,
+allocation/native maps and retained counters; they are not new device evidence.
+
 ## Limits and references
 
 This correction changes neither the allocator nor the admitted hardware
