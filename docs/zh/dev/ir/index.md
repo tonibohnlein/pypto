@@ -42,3 +42,5 @@ See [RFC token pipeline checkpoint](18-token-pipeline-checkpoint.md) for finite 
 - [Numerical crossing-token checkpoint](21-crossing-token-checkpoint.md)
 
 - [Supplied numerical-order service checkpoint](22-token-order-service-checkpoint.md)
+
+- [自动同步架构契约](33-sync-architecture-contracts.md) —— 共享逻辑阶段、已限定描述符、分配方案和标量绑定所有权。

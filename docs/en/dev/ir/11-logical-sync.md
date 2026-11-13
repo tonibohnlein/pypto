@@ -6,10 +6,20 @@ of a specialized AIC or AIV leaf function. It uses ordinary `Call`, `AssignStmt`
 value type. The enclosing function supplies the core and execution-instance
 identity; tokens do not carry a duplicated core attribute.
 
-These operations support IR construction, verification and round trips. Hardware
-lowering (`LowerSync`) is not implemented: code generation rejects unlowered
-logical synchronization. This interface does not enable automatic insertion or
-introduce a JIT option. Existing physical flag and FIFO operations remain distinct.
+These operations support construction, verification and serialization. `InsertSync`
+produces logical tokens from qualified placed Buffer accesses; `OptimizeSync`
+uses the same logical service as production `RealizeSync` (currently verification
+only); `LowerSync` interprets actual token uses and assigns physical handoffs.
+Code generation rejects tokens left unlowered. The opt-in production wrapper
+publishes only a complete physical plan, otherwise retaining the original kernel
+for PTOAS. Existing physical flag and FIFO operations remain distinct.
+
+Logical validity does not imply executable support: structured lowering currently
+requires qualified numerical frames, supported interval guards and captures.
+General symbolic histories and joins can remain unavailable. Unsupported lowering
+must not replace the chosen token order by newly computed minimum demands.
+See [the production checkpoint](23-token-production-checkpoint.md) and
+[assigned-command scheduling](32-sync-schedule-architecture-correction.md).
 
 ## Operations
 

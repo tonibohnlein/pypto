@@ -85,6 +85,7 @@ class CutDomains : public IRVisitor {
   Intervals domain_;
   PhysicalSyncRealization& work_;
   std::set<const Var*> uniform_variables_;
+  CommandPredicateScope scope_;
   size_t conditional_depth_ = 0;
   void VisitStmt_(const ForStmtPtr& loop) override {
     auto saved = domain_;
@@ -99,7 +100,9 @@ class CutDomains : public IRVisitor {
     auto saved_variables = uniform_variables_;
     if (!uniform) uniform_variables_.clear();
     if (uniform) uniform_variables_.insert(loop->loop_var_.get());
+    const bool inserted = scope_.ready.insert(loop->loop_var_.get()).second;
     VisitStmt(loop->body_);
+    if (inserted) scope_.ready.erase(loop->loop_var_.get());
     uniform_variables_ = std::move(saved_variables);
     domain_ = std::move(saved);
   }
@@ -119,6 +122,18 @@ class CutDomains : public IRVisitor {
       // Without that branch, literal-bound IV domains are identical in every
       // launch case that reaches this cut. Do not infer this from sample runs.
       auto& cut = *found->second;
+      if (!cut.predicate_scope) {
+        cut.predicate_scope = scope_;
+      } else {
+        // Repeated static anchors can only use coordinates ready at every use.
+        auto& ready = cut.predicate_scope->ready;
+        for (auto it = ready.begin(); it != ready.end();) {
+          if (!scope_.ready.count(*it))
+            it = ready.erase(it);
+          else
+            ++it;
+        }
+      }
       const auto qualified = conditional_depth_ ? std::set<const Var*>{} : uniform_variables_;
       if (!cut.uniform_checked) {
         cut.uniform_variables = qualified;
@@ -135,9 +150,19 @@ class CutDomains : public IRVisitor {
   }
 
  public:
-  CutDomains(const AbsentLoops& absent, CutInventory& cuts, std::pair<int64_t, int64_t> blocks,
-             PhysicalSyncRealization& work)
-      : absent_(absent), cuts_(cuts), domain_{blocks}, work_(work) {
+  CutDomains(const FunctionPtr& owner, const AbsentLoops& absent, CutInventory& cuts,
+             std::pair<int64_t, int64_t> blocks, PhysicalSyncRealization& work)
+      : absent_(absent), cuts_(cuts), domain_{blocks}, work_(work), scope_{owner, nullptr, {}} {
+    auto entry = std::make_shared<std::set<const Var*>>();
+    for (const auto& parameter : owner->params_) {
+      const auto type = As<ScalarType>(parameter->GetType());
+      if (type && (type->dtype_ == DataType::INDEX || type->dtype_ == DataType::BOOL))
+        entry->insert(parameter.get());
+    }
+    // This helper returns only the original leading launch lookup, which
+    // dominates every payload. Other scalar assignments confer no evidence.
+    if (auto block = As<Var>(DominatingSyncBlock(owner))) entry->insert(block.get());
+    scope_.entry_ready = std::move(entry);
     for (auto& [anchor, cut] : cuts_) cut->domain = domain_;
   }
 };
@@ -168,16 +193,21 @@ class ScheduleDomains {
     auto retained = publish ? f.source_domain : f.target_domain;
     const auto& frames = input_.segments[r].nested_frames;
     if (retained) {
+      INTERNAL_CHECK(retained->frame) << "Missing original endpoint frame";
       const auto& context = *retained->frame;
       INTERNAL_CHECK(context.owner == input_.owner && context.blocks == input_.block_bounds &&
                      context.region == r && context.loops.size() == frames.size() &&
                      retained->ranges.size() == frames.size())
           << "Foreign endpoint domain";
-      for (size_t i = 0; i < frames.size(); ++i)
+      for (size_t i = 0; i < frames.size(); ++i) {
+        const auto [first, end] = retained->ranges[i];
+        INTERNAL_CHECK(first >= 0 && first < end && end <= frames[i].count)
+            << "Invalid retained endpoint interval";
         INTERNAL_CHECK(context.loops[i].loop == frames[i].loop && context.loops[i].count == frames[i].count &&
                        context.loops[i].start == frames[i].start && context.loops[i].step == frames[i].step &&
                        context.loops[i].start_expression == frames[i].start_expression)
             << "Incompatible original endpoint frame";
+      }
       return retained;
     }
     // Mathematics-only clients use the same domain representation. Decode once
@@ -216,14 +246,17 @@ class AssignedRegionSchedule {
   AssignedRegionSchedule(FunctionPtr function, std::vector<AssignedSyncCase> supplied)
       : owner(std::move(function)), block(DominatingSyncBlock(owner)), cases(std::move(supplied)) {
     for (size_t c = 0; c < cases.size(); ++c) {
-      CHECK(cases[c].input && cases[c].plan) << "Missing assigned schedule case";
+      CHECK(cases[c].input && cases[c].assignment && cases[c].work) << "Missing assigned schedule case";
       const auto& input = *cases[c].input;
-      auto& work = *cases[c].plan;
+      auto& work = *cases[c].work;
+      CHECK(work.assignment == cases[c].assignment) << "Assigned schedule accounting belongs to another plan";
+      cases[c].assignment->ValidateFor(input, input.hardware_target);
+      const auto& families = cases[c].assignment->Families();
       INTERNAL_CHECK(input.owner == owner) << "Foreign assigned schedule owner";
       ScheduleDomains domains(input);
       std::map<SyncSiteKey, std::vector<size_t>> incoming, outgoing;
-      for (size_t f = 0; f < work.families.size(); ++f) {
-        const auto& family = work.families[f];
+      for (size_t f = 0; f < families.size(); ++f) {
+        const auto& family = families[f];
         incoming[{family.target_region, family.target_site}].push_back(f);
         if (!family.ids.empty()) outgoing[{family.source_region, family.source_site}].push_back(f);
       }
@@ -235,14 +268,14 @@ class AssignedRegionSchedule {
           const auto& payload = region.sites[site];
           AssignedCut cut{c, payload.original, payload.continuation, {}, {}};
           auto append = [&](size_t f, bool publish, std::vector<AssignedEndpoint>& target) {
-            const auto& family = work.families[f];
+            const auto& family = families[f];
             target.push_back({c, f, publish, input.region_tree ? domains.Get(family, publish) : nullptr});
             ++work.assigned_schedule_endpoints;
           };
           for (auto f : incoming[key])
-            if (work.families[f].ids.empty()) append(f, false, cut.before);
+            if (families[f].ids.empty()) append(f, false, cut.before);
           for (auto f : incoming[key])
-            if (!work.families[f].ids.empty()) append(f, false, cut.before);
+            if (!families[f].ids.empty()) append(f, false, cut.before);
           for (auto f : outgoing[key]) append(f, true, cut.after);
           if (cut.before.empty() && cut.after.empty()) continue;
           cuts.push_back(std::move(cut));
@@ -251,7 +284,7 @@ class AssignedRegionSchedule {
     }
   }
   const Family& Record(const AssignedEndpoint& endpoint) const {
-    return cases[endpoint.case_index].plan->families[endpoint.family_index];
+    return cases[endpoint.case_index].assignment->Families()[endpoint.family_index];
   }
 };
 const Call* SingletonCall(StmtPtr body) {
@@ -734,10 +767,17 @@ CutInventory LowerScheduleCuts(const AssignedRegionSchedule& schedule, const Cut
   for (const auto& [anchor, cut] : cuts) {
     if (!seen.insert(cut.get()).second) continue;
     const auto& facts = *domains.at(anchor);
+    INTERNAL_CHECK(facts.predicate_scope && facts.predicate_scope->owner == schedule.owner)
+        << "Missing original-cut predicate qualification";
+    cut->predicate_scope = facts.predicate_scope;
+    for (const auto& item : cut->before_cases) RequireCommandScope({item.body}, *cut->predicate_scope, work);
+    for (const auto& item : cut->after_cases) RequireCommandScope({item.body}, *cut->predicate_scope, work);
     cut->before = ScheduleCommandCases(block, facts.domain, cut->before_cases, work, schedule.owner->span_,
                                        facts.uniform_variables);
     cut->after = ScheduleCommandCases(block, facts.domain, cut->after_cases, work, schedule.owner->span_,
                                       facts.uniform_variables);
+    RequireCommandScope(cut->before, *cut->predicate_scope, work);
+    RequireCommandScope(cut->after, *cut->predicate_scope, work);
   }
   return cuts;
 }
@@ -834,9 +874,8 @@ class BoundarySpecializer {
         out.insert(out.end(), body.begin(), body.end());
         continue;
       }
-      ++work_.control_descriptors;
-      out.push_back(std::make_shared<CommandControl>(
-          CommandControl{node->condition, nullptr, std::move(body), std::move(alternative), node->span}));
+      out.push_back(
+          RebuildControl(node, node->condition, nullptr, std::move(body), std::move(alternative), work_));
     }
     return out;
   }
@@ -855,11 +894,9 @@ class BindBoundary : public IRMutator {
   ControlForest Run(const ControlForest& forest, PhysicalSyncRealization& work) {
     ControlForest out;
     for (const auto& node : forest) {
-      ++work.control_descriptors;
-      out.push_back(std::make_shared<CommandControl>(
-          CommandControl{node->condition ? VisitExpr(node->condition) : nullptr,
-                         node->command ? VisitExpr(node->command) : nullptr, Run(node->body, work),
-                         Run(node->alternative, work), node->span}));
+      out.push_back(RebuildControl(node, node->condition ? VisitExpr(node->condition) : nullptr,
+                                   node->command ? VisitExpr(node->command) : nullptr, Run(node->body, work),
+                                   Run(node->alternative, work), work));
     }
     return out;
   }
@@ -1082,20 +1119,19 @@ class InvocationCasePartition {
   }
 };
 std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
-    const std::vector<PreparedSchedulePhase>& phases, const AssignedRegionSchedule& assigned,
-    PhysicalSyncRealization& work) {
-  if (assigned.cases.size() < 2) return {};
-  const auto block = assigned.block;
+    const std::vector<PreparedSchedulePhase>& phases, const ExprPtr& block,
+    const std::vector<std::pair<int64_t, int64_t>>& domains, PhysicalSyncRealization& work) {
+  if (domains.size() < 2) return {};
   if (!block) return {};
-  std::vector<std::vector<ControlPtr>> signatures(assigned.cases.size());
+  std::vector<std::vector<ControlPtr>> signatures(domains.size());
   std::map<const CommandControl*, size_t> hashes;
   for (const auto& phase : phases)
     for (const auto& inventory : phase.visits) {
       std::set<const PhysicalCuts*> seen;
       for (const auto& [anchor, cut] : inventory) {
         if (!seen.insert(cut.get()).second) continue;
-        for (size_t c = 0; c < assigned.cases.size(); ++c) {
-          const auto domain = *assigned.cases[c].input->block_bounds;
+        for (size_t c = 0; c < domains.size(); ++c) {
+          const auto domain = domains[c];
           const auto before_leaf = CaseLeaf(cut->before_cases, domain);
           const auto after_leaf = CaseLeaf(cut->after_cases, domain);
           signatures[c].push_back(before_leaf);
@@ -1105,7 +1141,7 @@ std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
     }
   std::vector<InvocationScheduleGroup> groups;
   std::map<size_t, std::vector<size_t>> buckets;
-  for (size_t c = 0; c < assigned.cases.size(); ++c) {
+  for (size_t c = 0; c < domains.size(); ++c) {
     size_t hash = 0;
     try {
       for (const auto& node : signatures[c])
@@ -1132,7 +1168,7 @@ std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
       groups.push_back({c, {}});
     }
     auto& intervals = groups[group].intervals;
-    const auto domain = *assigned.cases[c].input->block_bounds;
+    const auto domain = domains[c];
     if (!intervals.empty() && intervals.back().second + 1 == domain.first)
       intervals.back().second = domain.second;
     else
@@ -1472,12 +1508,6 @@ class ScheduleCostModel {
   struct Range {
     __int128 lo, hi, stride;
   };
-  struct Value {
-    ExprPtr expression;
-    size_t uses = 0;
-    bool evaluated = false;
-  };
-  using Values = std::map<uint64_t, Value>;
   const RegularLoopSchedule& loop_;
   ExprPtr block_;
   PhysicalSyncRealization& work_;
@@ -1582,63 +1612,18 @@ class ScheduleCostModel {
     }
     return truth ? Range{*truth, *truth, 0} : std::optional<Range>{};
   }
-  void Count(const ExprPtr& expression, Values& values) {
-    ++work_.schedule_inspected_expressions;
-    const auto binary = As<BinaryExpr>(expression);
-    if (!binary) return;
-    if (CommandValueCandidate(expression)) {
-      auto& entry = values[structural_hash(expression, false)];
-      if (!entry.expression) entry.expression = expression;
-      if (SameControl(entry.expression, expression)) ++entry.uses;
-    }
-    Count(binary->left_, values);
-    Count(binary->right_, values);
-  }
-  void Operators(const ExprPtr& expression, ScheduleCost& cost, __int128 weight, Values& values) {
-    ++work_.schedule_inspected_expressions;
-    if (const auto binary = As<BinaryExpr>(expression)) {
-      Value* shared = nullptr;
-      if (CommandValueCandidate(expression)) {
-        auto found = values.find(structural_hash(expression, false));
-        if (found != values.end() && found->second.uses > 1 &&
-            SameControl(found->second.expression, expression))
-          shared = &found->second;
-      }
-      if (shared && shared->evaluated) return;
-      const size_t kind = (As<And>(expression) || As<Or>(expression)) ? 2
-                          : (As<Lt>(expression) || As<Le>(expression) || As<Gt>(expression) ||
-                             As<Ge>(expression) || As<Eq>(expression))
-                              ? 1
-                              : 0;
-      cost.value[kind] += weight;
-      Operators(binary->left_, cost, weight, values);
-      Operators(binary->right_, cost, weight, values);
-      if (shared) {
-        shared->evaluated = true;
-        cost.value[5] += weight;
-      }
-    }
-  }
-  void Forest(const ControlForest& forest, ScheduleCostProfile& profile, __int128 weight,
+  void Forest(const FrozenCommandForest& forest, ScheduleCostProfile& profile, __int128 weight,
               const Intervals& active) {
     if (active.empty()) return;
-    Values values;
-    try {
-      for (const auto& node : forest) {
-        if (node->condition && PureCommandExpression(node->condition, &work_.schedule_inspected_expressions))
-          Count(node->condition, values);
-      }
-      for (const auto& node : forest) Visit(node, profile, weight, values, active);
-    } catch (const StructuralComparisonUnsupported&) {
-      profile.valid = false;
-    }
+    for (const auto& command : forest.commands) Visit(command, profile, weight, active);
   }
-  void Visit(const ControlPtr& node, ScheduleCostProfile& profile, __int128 weight, Values& values,
+  void Visit(const FrozenCommand& command, ScheduleCostProfile& profile, __int128 weight,
              const Intervals& active) {
     if (active.empty()) return;
     ++work_.schedule_inspected_descriptors;
+    const auto& node = command.original;
     if (!node->condition) {
-      Forest(node->body, profile, weight, active);
+      if (command.body) Forest(*command.body, profile, weight, active);
       return;
     }
     Intervals yes;
@@ -1656,13 +1641,10 @@ class ScheduleCostModel {
       yes = InvocationCasePartition::Intersection(active, partition->yes);
     }
     ScheduleCost local;
-    Values unshared;
-    const bool pure = PureCommandExpression(node->condition, &work_.schedule_inspected_expressions);
-    Operators(node->condition, local, weight, pure ? values : unshared);
-    local.value[3] += weight;
+    for (size_t i = 0; i < command.scalar_cost.size(); ++i) local.value[i] = weight * command.scalar_cost[i];
     profile.Add(local, active);
-    Forest(node->body, profile, weight, yes);
-    Forest(node->alternative, profile, weight, SubtractIntervals(active, yes));
+    Forest(*command.body, profile, weight, yes);
+    Forest(*command.alternative, profile, weight, SubtractIntervals(active, yes));
   }
 
  public:
@@ -1684,7 +1666,7 @@ class ScheduleCostModel {
     last_ = last;
     stride_ = stride;
     const __int128 weight = (last - first) / stride + 1;
-    Forest(forest, profile, weight, active);
+    Forest(*FreezeCommandForest(forest, work_), profile, weight, active);
   }
 };
 
@@ -1711,7 +1693,11 @@ CandidateSchedule PrepareCandidate(const RegularLoopSchedule& loop, unsigned mod
   candidate.plan.identity = !(mode & 6);
   candidate.plan.mode = mode;
   auto phases = PrepareLoopSchedule(loop, mode, assigned, domains, blocks, candidate.work);
-  if (mode & 1) candidate.plan.groups = GroupInvocationSchedules(phases, assigned, candidate.work);
+  if (mode & 1) {
+    std::vector<std::pair<int64_t, int64_t>> domains;
+    for (const auto& item : assigned.cases) domains.push_back(*item.input->block_bounds);
+    candidate.plan.groups = GroupInvocationSchedules(phases, assigned.block, domains, candidate.work);
+  }
   const auto versions = std::max<size_t>(1, candidate.plan.groups.size());
   for (size_t v = 0; v < versions; ++v) {
     auto selected = phases;
@@ -1732,7 +1718,7 @@ CandidateSchedule PrepareCandidate(const RegularLoopSchedule& loop, unsigned mod
 
 // This conservative expanded bound includes every payload operand occurrence,
 // not just descriptors or operation sites. Three times the command tree covers
-// sequence wrappers and first-use SSA bindings introduced by CommandValues.
+// sequence wrappers and first-use SSA bindings retained by the frozen scalar plan.
 bool BoundCandidate(CandidateSchedule& candidate, const ScheduleTreeSize& body,
                     const AssignedRegionSchedule& assigned, std::pair<int64_t, int64_t> blocks) {
   __int128 nodes = 0, payloads = 0, commands = 0;
@@ -2040,7 +2026,7 @@ FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vec
                                         std::pair<int64_t, int64_t> blocks,
                                         const SyncSchedulePolicy& policy) {
   AssignedRegionSchedule schedule(owner, cases);
-  auto& work = *schedule.cases.front().plan;
+  auto& work = *schedule.cases.front().work;
   CutInventory domains;
   AbsentLoops absent;
   for (const auto& c : schedule.cases)
@@ -2051,7 +2037,7 @@ FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vec
     if (!facts) facts = std::make_shared<PhysicalCuts>();
     if (cut.continuation) domains[cut.continuation.get()] = facts;
   }
-  CutDomains(absent, domains, blocks, work).VisitStmt(schedule.owner->body_);
+  CutDomains(schedule.owner, absent, domains, blocks, work).VisitStmt(schedule.owner->body_);
   const auto inventory = CollectRegularLoops(schedule, work);
   auto plans = PlanLoopSchedules(schedule, domains, inventory, blocks, work, policy);
   std::set<const Call*> specialized;
@@ -2106,9 +2092,7 @@ void FinishSyncScheduleReceipt(const FunctionPtr& function, PhysicalSyncRealizat
 std::pair<std::vector<std::vector<std::pair<int64_t, int64_t>>>, PhysicalSyncRealization>
 InspectSyncInvocationGroups(const FunctionPtr& owner, const std::vector<SyncCommandCase>& supplied) {
   CHECK(!supplied.empty()) << "Expected nonempty schedule cases";
-  std::vector<CompactSyncInput> inputs(supplied.size());
-  std::vector<PhysicalSyncRealization> plans(supplied.size());
-  std::vector<AssignedSyncCase> cases;
+  std::vector<std::pair<int64_t, int64_t>> domains;
   auto cut = std::make_shared<PhysicalCuts>();
   PhysicalSyncRealization work;
   const auto blocks = std::make_pair(supplied.front().blocks.first, supplied.back().blocks.second);
@@ -2118,28 +2102,34 @@ InspectSyncInvocationGroups(const FunctionPtr& owner, const std::vector<SyncComm
           supplied[c].blocks.second < std::numeric_limits<int64_t>::max())
         << "Non-exhaustive cases";
     next = supplied[c].blocks.second + 1;
-    inputs[c].owner = owner;
-    inputs[c].block_bounds = supplied[c].blocks;
-    cases.push_back({&inputs[c], &plans[c]});
-    cut->before_cases.push_back({supplied[c].blocks, ImportControl(supplied[c].body, work)});
+    domains.push_back(supplied[c].blocks);
+    cut->before_cases.push_back({supplied[c].blocks, ImportDiagnosticControl(supplied[c].body, work)});
   }
-  AssignedRegionSchedule assigned(owner, cases);
   const std::vector<PreparedSchedulePhase> phases{{0, 1, 1, false, {CutInventory{{nullptr, cut}}}}};
-  const auto grouped = GroupInvocationSchedules(phases, assigned, work);
-  std::vector<std::vector<std::pair<int64_t, int64_t>>> domains;
-  for (const auto& group : grouped) domains.push_back(group.intervals);
-  return {std::move(domains), std::move(work)};
+  const auto grouped = GroupInvocationSchedules(phases, DominatingSyncBlock(owner), domains, work);
+  std::vector<std::vector<std::pair<int64_t, int64_t>>> result;
+  for (const auto& group : grouped) result.push_back(group.intervals);
+  return {std::move(result), std::move(work)};
 }
 PhysicalSyncRealization EmitSyncBoundaryCommands(
     const FunctionPtr& owner, const std::vector<std::tuple<CallPtr, StmtPtr, StmtPtr>>& supplied,
-    bool enabled) {
+    bool enabled, bool validate_scope) {
   PhysicalSyncRealization work;
   CutInventory inventory;
   for (const auto& [call, before, after] : supplied) {
     auto cut = std::make_shared<PhysicalCuts>();
-    cut->before = {ImportControl(before, work)};
-    cut->after = {ImportControl(after, work)};
+    cut->before = {ImportDiagnosticControl(before, work)};
+    cut->after = {ImportDiagnosticControl(after, work)};
     CHECK(inventory.emplace(call.get(), std::move(cut)).second) << "Duplicate diagnostic command cut";
+  }
+  if (validate_scope) {
+    const AbsentLoops absent;
+    CutDomains(owner, absent, inventory, {0, 0}, work).VisitStmt(owner->body_);
+    for (const auto& [call, cut] : inventory) {
+      CHECK(cut->predicate_scope) << "Diagnostic cut has no original owner scope";
+      RequireCommandScope(cut->before, *cut->predicate_scope, work);
+      RequireCommandScope(cut->after, *cut->predicate_scope, work);
+    }
   }
   SyncTokenNames names(owner);
   ++work.schedule_name_scans;

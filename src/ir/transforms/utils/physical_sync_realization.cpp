@@ -26,9 +26,8 @@ namespace pypto::ir::sync {
 namespace {
 using Family = PhysicalSyncFamily;
 std::vector<Family> DirectFamilies(const CompactSyncResult& analysis) {
-  PhysicalSyncRealization result_;
+  std::vector<Family> families;
   if (analysis.input.region_tree) {
-    result_.finite_minimum = false;  // Sufficient whole-span assignment, not a minimum-ID proof.
     const auto owned = analysis.ExportScopedDemands();
     CHECK(owned) << "Scoped endpoint export is unavailable";
     for (const auto& schema : owned->families) {
@@ -39,7 +38,7 @@ std::vector<Family> DirectFamilies(const CompactSyncResult& analysis) {
         count *= axis.count;
         CHECK(count <= std::numeric_limits<int64_t>::max()) << "Scoped physical record domain overflow";
       }
-      result_.families.push_back({sr, ss, tr, ts, sv, tv, static_cast<int64_t>(count), {}, schema.axes});
+      families.push_back({sr, ss, tr, ts, sv, tv, static_cast<int64_t>(count), {}, schema.axes});
     }
   } else {
     const auto crossings = analysis.ExportCrossingDemands();
@@ -51,7 +50,7 @@ std::vector<Family> DirectFamilies(const CompactSyncResult& analysis) {
         CHECK(f.distance >= 0 && f.source < segment.pipes.size() && f.target < segment.pipes.size())
             << "Invalid physical demand family";
         if (segment.count <= f.distance) continue;
-        result_.families.push_back({r, f.source, r, f.target, 0, f.distance, segment.count - f.distance, {}});
+        families.push_back({r, f.source, r, f.target, 0, f.distance, segment.count - f.distance, {}});
       }
     }
     for (const auto& [source, target] : *crossings) {
@@ -62,10 +61,10 @@ std::vector<Family> DirectFamilies(const CompactSyncResult& analysis) {
       CHECK(sv >= 0 && sv < analysis.segments[sr].count && tv >= 0 && tv < analysis.segments[tr].count &&
             ss < analysis.segments[sr].pipes.size() && ts < analysis.segments[tr].pipes.size())
           << "Invalid physical crossing occurrence";
-      result_.families.push_back({sr, ss, tr, ts, sv, tv, 1, {}});
+      families.push_back({sr, ss, tr, ts, sv, tv, 1, {}});
     }
   }
-  return std::move(result_.families);
+  return families;
 }
 DirectSyncOrder MathematicalOrder(const CompactSyncResult& analysis) {
   return {[&](const Occurrence& a, const Occurrence& b) { return analysis.Precedes(a, true, b, false); },
@@ -83,7 +82,7 @@ PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input, std::ve
                                           const SyncSchedulePolicy& policy) {
   auto result = AllocateDirectSync(input, std::move(families), order, target, restricted);
   result.function = physical::CompileAssignedSyncSchedule(
-      input.owner, {{&input, &result}},
+      input.owner, {{&input, result.assignment, &result}},
       input.block_bounds.value_or(std::make_pair(static_cast<int64_t>(0), static_cast<int64_t>(0))), policy);
   return result;
 }
@@ -100,7 +99,7 @@ FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterB
   CHECK(owner && !cases.empty()) << "Missing complete invocation case owner";
   auto next = blocks.first;
   for (const auto& item : cases) {
-    CHECK(item.input && item.plan && item.input->owner == owner &&
+    CHECK(item.input && item.assignment && item.work && item.input->owner == owner &&
           item.input->parameter_bounds == parameters && item.input->block_bounds &&
           item.input->block_bounds->first == next && item.input->block_bounds->second >= next &&
           item.input->block_bounds->second < std::numeric_limits<int64_t>::max())
@@ -127,7 +126,7 @@ PhysicalSyncInvocation RealizePhysicalInvocation(const SyncInvocationAnalysis& a
         << "Missing original invocation analysis";
     result.cases.push_back(AllocateDirectSync(item.mathematics->input, DirectFamilies(*item.mathematics),
                                               MathematicalOrder(*item.mathematics), target, eligible_ids));
-    cases.push_back({&item.mathematics->input, &result.cases.back()});
+    cases.push_back({&item.mathematics->input, result.cases.back().assignment, &result.cases.back()});
   }
   result.function =
       EmitAssignedSyncCases(analysis.owner, analysis.parameter_bounds, analysis.block_bounds, cases, policy);

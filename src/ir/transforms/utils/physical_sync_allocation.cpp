@@ -134,11 +134,11 @@ class Allocator {
         catalog_(pypto::sync::FindResourceCatalog(target)),
         restricted_(restricted),
         claimed_(SyncNativeClaims(input, target)) {
-    result_.families = std::move(families);
+    families_ = std::move(families);
     result_.finite_minimum = order_.finite_minimum && !input_.region_tree;
     CHECK(order_.precedes && order_.reference_before && order_.threshold)
         << "Missing direct synchronization order proof";
-    for (const auto& f : result_.families) {
+    for (const auto& f : families_) {
       CHECK(f.source_region < input_.segments.size() && f.target_region < input_.segments.size())
           << "Invalid direct family region";
       const auto& source = input_.segments[f.source_region];
@@ -187,8 +187,8 @@ class Allocator {
     for (const auto& [direction, ids] : claimed_)
       for (int id : ids) result_.native_reserved_ids.emplace_back(direction.first, direction.second, id);
     QualifyBarriers();
-    for (size_t index = 0; index < result_.families.size(); ++index) {
-      auto& f = result_.families[index];
+    for (size_t index = 0; index < families_.size(); ++index) {
+      auto& f = families_[index];
       const auto direction = SyncFamilyPipes(input_, f);
       if (direction.first == direction.second) continue;
       const auto& ids = Eligible(direction);
@@ -244,6 +244,14 @@ class Allocator {
   std::map<Direction, std::vector<int>> eligible_;
   std::map<Direction, std::vector<Lane>> lanes_;
   PhysicalSyncRealization result_;
+
+  std::vector<Family> families_;
+
+ public:
+  std::vector<Family> TakeFamilies() { return std::move(families_); }
+  std::map<Direction, std::vector<int>> TakeEligible() { return std::move(eligible_); }
+
+ private:
   bool Reaches(const Occurrence& a, const Occurrence& b) {
     ++result_.reuse_queries;
     return order_.precedes(a, b);
@@ -256,8 +264,8 @@ class Allocator {
   }
   void QualifyBarriers() {
     if (input_.region_tree) {
-      for (size_t i = 0; i < result_.families.size(); ++i) {
-        const auto [source, target] = SyncFamilyPipes(input_, result_.families[i]);
+      for (size_t i = 0; i < families_.size(); ++i) {
+        const auto [source, target] = SyncFamilyPipes(input_, families_[i]);
         if (source != target) continue;
         CHECK(target == PipeType::M || target == PipeType::V)
             << "Scoped same-pipe barrier mechanism is unavailable; scalar barriers are forbidden";
@@ -283,7 +291,7 @@ class Allocator {
         previous[pipe] = Occurrence{r, input_.segments[r].count - 1, s};
       }
     }
-    for (const auto& f : result_.families) {
+    for (const auto& f : families_) {
       auto [src, dst] = SyncFamilyPipes(input_, f);
       if (src != dst) continue;
       CHECK(dst != PipeType::S) << "Scalar barriers are forbidden; require qualified native scalar order";
@@ -321,7 +329,7 @@ class Allocator {
         result_.finite_minimum);
     for (size_t i = 0; i < lanes.size(); ++i) {
       const auto& lane = lanes[i];
-      result_.families[lane.family].ids[lane.residue] = colors[i];
+      families_[lane.family].ids[lane.residue] = colors[i];
     }
   }
 };
@@ -403,10 +411,106 @@ std::vector<int> ColorOrderedSyncLanes(size_t count, SyncDirection direction,
   }
   return result;
 }
+namespace {
+using FrameKey = std::tuple<ForStmtPtr, int64_t, int64_t, int64_t, ExprPtr>;
+FrameKey AssignmentFrame(const SyncLoopFrame& frame) {
+  return {frame.loop, frame.count, frame.start, frame.step, frame.start_expression};
+}
+using SiteKey = std::tuple<CallPtr, CallPtr, PipeType, ForStmtPtr>;
+using SegmentKey =
+    std::tuple<ForStmtPtr, int64_t, int64_t, int64_t, int64_t, std::vector<FrameKey>, std::vector<SiteKey>>;
+std::vector<SegmentKey> AssignmentSegments(const CompactSyncInput& input) {
+  std::vector<SegmentKey> result;
+  for (const auto& segment : input.segments) {
+    std::vector<FrameKey> frames;
+    for (const auto& frame : segment.nested_frames) frames.push_back(AssignmentFrame(frame));
+    std::vector<SiteKey> sites;
+    for (const auto& site : segment.sites)
+      sites.emplace_back(site.original, site.continuation, site.pipe, site.initialization_scope);
+    result.emplace_back(segment.original_loop, segment.count, segment.start, segment.step,
+                        segment.reset_period, std::move(frames), std::move(sites));
+  }
+  return result;
+}
+using RegionKey = std::tuple<std::optional<size_t>, size_t, std::optional<FrameKey>,
+                             std::optional<std::pair<size_t, size_t>>>;
+std::vector<RegionKey> AssignmentRegions(const CompactSyncInput& input) {
+  std::vector<RegionKey> result;
+  auto visit = [&](auto&& self, const SyncRegion& region) -> void {
+    result.emplace_back(
+        region.leaf, region.children.size(),
+        region.repetition ? std::make_optional(AssignmentFrame(*region.repetition)) : std::nullopt,
+        region.startup);
+    for (const auto& child : region.children) self(self, child);
+  };
+  if (input.region_tree) visit(visit, *input.region_tree);
+  return result;
+}
+}  // namespace
+
+struct AssignedSyncPlan::State {
+  const CompactSyncInput* input;
+  FunctionPtr owner;
+  std::string target;
+  SyncParameterBounds parameters;
+  std::optional<std::pair<int64_t, int64_t>> blocks;
+  std::vector<SegmentKey> segments;
+  std::vector<RegionKey> regions;
+  std::vector<PhysicalSyncFamily> families;
+  std::map<SyncDirection, std::vector<int>> eligible;
+  std::vector<std::tuple<PipeType, PipeType, int>> reservations;
+};
+AssignedSyncPlan::AssignedSyncPlan(const CompactSyncInput& input, std::vector<PhysicalSyncFamily> families,
+                                   std::map<SyncDirection, std::vector<int>> eligible,
+                                   std::vector<std::tuple<PipeType, PipeType, int>> reservations)
+    : state_(std::make_shared<State>(State{&input, input.owner, input.hardware_target, input.parameter_bounds,
+                                           input.block_bounds, AssignmentSegments(input),
+                                           AssignmentRegions(input), std::move(families), std::move(eligible),
+                                           std::move(reservations)})) {
+  // Allocation established matching/lifetime proofs. Freezing checks the assigned
+  // resource inventory, not a second coloring or reconstructed order analysis.
+  for (const auto& family : state_->families) {
+    const auto direction = SyncFamilyPipes(input, family);
+    if (direction.first == direction.second) {
+      INTERNAL_CHECK(family.ids.empty()) << "Same-pipe family has physical flag IDs";
+      continue;
+    }
+    const auto found = state_->eligible.find(direction);
+    INTERNAL_CHECK(found != state_->eligible.end() && !family.ids.empty()) << "Missing assigned palette";
+    for (int id : family.ids) {
+      INTERNAL_CHECK(std::find(found->second.begin(), found->second.end(), id) != found->second.end())
+          << "Assigned flag is outside the qualified directional pool";
+      INTERNAL_CHECK(std::find(state_->reservations.begin(), state_->reservations.end(),
+                               std::make_tuple(direction.first, direction.second, id)) ==
+                     state_->reservations.end())
+          << "Assigned flag collides with a native owner";
+    }
+  }
+}
+const std::vector<PhysicalSyncFamily>& AssignedSyncPlan::Families() const { return state_->families; }
+void AssignedSyncPlan::ValidateFor(const CompactSyncInput& input, const std::string& target) const {
+  CHECK(state_->input == &input) << "Assigned synchronization plan belongs to a different input case";
+  CHECK(state_->owner == input.owner) << "Assigned synchronization plan has a foreign original owner";
+  CHECK(state_->target == target && input.hardware_target == target)
+      << "Assigned synchronization target differs from its certificate";
+  CHECK(state_->parameters == input.parameter_bounds && state_->blocks == input.block_bounds)
+      << "Assigned synchronization invocation domain changed";
+  CHECK(state_->segments == AssignmentSegments(input) && state_->regions == AssignmentRegions(input))
+      << "Assigned synchronization occurrence frame changed";
+}
+const std::vector<PhysicalSyncFamily>& PhysicalSyncRealization::Families() const {
+  static const std::vector<PhysicalSyncFamily> empty;
+  return assignment ? assignment->Families() : empty;  // Unassigned command diagnostics only.
+}
+
 PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input, std::vector<Family> families,
                                            const DirectSyncOrder& order, const std::string& target,
                                            const std::optional<std::vector<int>>& restricted) {
-  return Allocator(input, std::move(families), order, target, restricted).Run();
+  Allocator allocator(input, std::move(families), order, target, restricted);
+  auto result = allocator.Run();
+  result.assignment = std::shared_ptr<const AssignedSyncPlan>(new AssignedSyncPlan(
+      input, allocator.TakeFamilies(), allocator.TakeEligible(), result.native_reserved_ids));
+  return result;
 }
 
 }  // namespace pypto::ir::sync

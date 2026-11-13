@@ -59,6 +59,7 @@
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/physical_sync_commands.h"
 #include "src/ir/transforms/utils/scoped_token_families.h"
 #include "src/ir/transforms/utils/scoped_token_order.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
@@ -693,7 +694,7 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   out["native_reserved_ids"] = result.native_reserved_ids;
   out["finite_minimum"] = result.finite_minimum;
   nb::list families;
-  for (const auto& f : result.families) {
+  for (const auto& f : result.Families()) {
     nb::dict row;
     row["source"] = nb::make_tuple(f.source_region, f.source_first, f.source_site);
     row["target"] = nb::make_tuple(f.target_region, f.target_first, f.target_site);
@@ -739,6 +740,40 @@ void BindTesting(nb::module_& m) {
       },
       nb::arg("commands"),
       "Test the emitter helper on pure coordinate-guarded physical commands; not arbitrary IR");
+  testing.def(
+      "inspect_sync_scalar_plan",
+      [](const ir::StmtPtr& commands) {
+        using namespace ir::sync::physical;
+        ir::sync::PhysicalSyncRealization work;
+        ControlForest forest{ImportDiagnosticControl(commands, work)};
+        const auto plan = FreezeCommandForest(forest, work);
+        std::map<std::string, size_t> result;
+        const auto expressions = work.control_expression_visits;
+        result["same_instance"] = FreezeCommandForest(forest, work) == plan;
+        auto copy = forest;
+        result["copy_reuses"] = FreezeCommandForest(copy, work) == plan;
+        result["reuse_expression_visits"] = work.control_expression_visits - expressions;
+        auto moved = std::move(copy);
+        result["move_reuses"] = FreezeCommandForest(moved, work) == plan;
+        moved.push_back(ControlSequence({}, commands->span_, work));
+        const auto extended = FreezeCommandForest(moved, work);
+        result["append_invalidates"] = extended != plan;
+        std::swap(moved.front(), moved.back());
+        result["reorder_invalidates"] = FreezeCommandForest(moved, work) != extended;
+        moved.clear();
+        result["clear_invalidates"] = FreezeCommandForest(moved, work)->commands.empty();
+        auto count = [&](auto&& self, const FrozenCommandForest& scope) -> void {
+          for (const auto& command : scope.commands) {
+            for (size_t i = 0; i < command.scalar_cost.size(); ++i)
+              result["cost_" + std::to_string(i)] += command.scalar_cost[i];
+            if (command.body) self(self, *command.body);
+            if (command.alternative) self(self, *command.alternative);
+          }
+        };
+        count(count, *plan);
+        return result;
+      },
+      nb::arg("commands"));
   testing.def("materialize_sync_command_values", &ir::sync::MaterializeSyncCommandValues, nb::arg("owner"),
               nb::arg("commands"), "Emitter-only pure command value sharing");
   testing.def(
@@ -774,10 +809,11 @@ void BindTesting(nb::module_& m) {
   testing.def(
       "emit_sync_boundary_commands",
       [](const ir::FunctionPtr& owner,
-         const std::vector<std::tuple<ir::CallPtr, ir::StmtPtr, ir::StmtPtr>>& cuts, bool enabled) {
-        return DescribePhysicalSync(ir::sync::EmitSyncBoundaryCommands(owner, cuts, enabled));
+         const std::vector<std::tuple<ir::CallPtr, ir::StmtPtr, ir::StmtPtr>>& cuts, bool enabled,
+         bool validate_scope) {
+        return DescribePhysicalSync(ir::sync::EmitSyncBoundaryCommands(owner, cuts, enabled, validate_scope));
       },
-      nb::arg("owner"), nb::arg("cuts"), nb::arg("enabled") = true,
+      nb::arg("owner"), nb::arg("cuts"), nb::arg("enabled") = true, nb::arg("validate_scope") = false,
       "Emitter-only boundary schedule for qualified original cuts; does not qualify a protocol");
 
   testing.def("validate_buffer_op_contract", &ValidateBufferOpContractForTesting, nb::arg("stage"),
@@ -827,6 +863,47 @@ void BindTesting(nb::module_& m) {
 
   testing.def("recognize_dsa_reuse_penalties", &RecognizeDsaReusePenaltiesForTesting, nb::arg("function"),
               "Return recognized DSA-RP edges without running placement");
+
+  testing.def(
+      "check_sync_assignment_contract",
+      [](const ir::FunctionPtr& function, const std::string& change) {
+        auto analysis = ir::sync::AnalyzeCompactSync(ir::sync::ImportPlacedSync(function, true));
+        const auto result = ir::sync::RealizePhysicalSync(analysis, "a2a3", std::nullopt);
+        const auto& assignment = result.assignment;
+        INTERNAL_CHECK(assignment) << "Missing completed assignment";
+        const auto copy = result;
+        nb::dict out;
+        out["shared_family_storage"] = &result.Families() == &copy.Families();
+        out["families"] = result.Families().size();
+        if (change == "foreign_input") {
+          const auto foreign = analysis.input;
+          assignment->ValidateFor(foreign, "a2a3");
+        } else if (change == "preassigned_ids") {
+          auto families = result.Families();  // Deliberate invalid test input, not production copying.
+          CHECK(!families.empty()) << "Expected a nonempty diagnostic plan";
+          families.front().ids = {99};
+          const ir::sync::DirectSyncOrder order{
+              [](const auto&, const auto&) { return false; }, [](const auto&, const auto&) { return false; },
+              [](size_t, size_t, size_t) -> std::optional<__int128> { return {}; }};
+          ir::sync::AllocateDirectSync(analysis.input, std::move(families), order, "a2a3", std::nullopt);
+        } else {
+          std::string target = "a2a3";
+          if (change == "owner")
+            analysis.input.owner = nullptr;
+          else if (change == "target")
+            target = "a5";
+          else if (change == "domain")
+            analysis.input.block_bounds = std::make_pair(123, 456);
+          else if (change == "frame")
+            ++analysis.input.segments.front().count;
+          else
+            CHECK(change == "none") << "Unknown assignment diagnostic mutation";
+          assignment->ValidateFor(analysis.input, target);
+        }
+        return out;
+      },
+      nb::arg("function"), nb::arg("change") = "none",
+      "Test immutable assignment storage and rejection of foreign or changed synchronous contexts");
 
   nb::class_<ir::sync::CompactSyncResult>(testing, "CompactSyncAnalysis")
       .def("export_crossing_demands", &ir::sync::CompactSyncResult::ExportCrossingDemands,

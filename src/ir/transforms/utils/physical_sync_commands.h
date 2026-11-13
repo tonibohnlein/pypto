@@ -12,6 +12,7 @@
 #ifndef SRC_IR_TRANSFORMS_UTILS_PHYSICAL_SYNC_COMMANDS_H_
 #define SRC_IR_TRANSFORMS_UTILS_PHYSICAL_SYNC_COMMANDS_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -33,12 +34,59 @@ namespace pypto::ir::sync::physical {
 using Intervals = std::vector<std::pair<int64_t, int64_t>>;
 struct CommandControl;
 using ControlPtr = std::shared_ptr<const CommandControl>;
-using ControlForest = std::vector<ControlPtr>;
+struct FrozenCommandForest;
+struct ControlForest : std::vector<ControlPtr> {
+  using std::vector<ControlPtr>::vector;
+  mutable std::shared_ptr<const FrozenCommandForest> frozen;
+};
 struct CommandControl {
   ExprPtr condition, command;
   ControlForest body, alternative;
   Span span;
+  // Cached requirements of this node's validated predicate, not readiness
+  // evidence. Production must bind them to an original-cut scope below.
+  std::vector<const Var*> predicate_inputs;
+  // False only for diagnostic pure syntax whose arithmetic premise is absent.
+  // Such a predicate stays opaque; production scope qualification rejects it.
+  bool predicate_qualified = true;
 };
+// No generated SSA values are allocated while planning. A slot belongs only to
+// one effective sequence scope; definitions appear at their first evaluation.
+struct ScalarRecipe {
+  ExprPtr original;
+  std::shared_ptr<const ScalarRecipe> left, right;
+  std::optional<size_t> slot;
+};
+using ScalarRecipePtr = std::shared_ptr<const ScalarRecipe>;
+struct ScalarBinding {
+  size_t slot;
+  ScalarRecipePtr value;
+};
+struct FrozenCommand {
+  ControlPtr original;
+  ScalarRecipePtr condition;
+  std::vector<ScalarBinding> definitions;
+  std::array<size_t, 6> scalar_cost{};
+  std::shared_ptr<const FrozenCommandForest> body, alternative;
+};
+struct FrozenCommandForest {
+  std::vector<ControlPtr> roots;
+  std::vector<FrozenCommand> commands;
+};
+std::shared_ptr<const FrozenCommandForest> FreezeCommandForest(const ControlForest& forest,
+                                                               PhysicalSyncRealization& work);
+std::vector<StmtPtr> MaterializeFrozenCommands(const ControlForest& forest, SyncTokenNames& names,
+                                               PhysicalSyncRealization& work);
+struct CommandPredicateScope {
+  FunctionPtr owner;
+  // Share entry facts once per owner, rather than copying every formal at
+  // every cut. Local facts contain only active original loop IVs.
+  std::shared_ptr<const std::set<const Var*>> entry_ready;
+  std::set<const Var*> ready;
+  // Arbitrary SSA definitions and branch-private values are not admitted.
+};
+void RequireCommandScope(const ControlForest& forest, const CommandPredicateScope& scope,
+                         PhysicalSyncRealization& work);
 struct CaseCommands {
   std::pair<int64_t, int64_t> blocks;
   ControlPtr body;
@@ -53,6 +101,9 @@ struct PhysicalCuts {
   std::vector<std::pair<int64_t, int64_t>> domain;
   std::set<const Var*> uniform_variables;
   bool uniform_checked = false;
+  // Present for production inventories. Diagnostic-only imports explicitly
+  // supply readiness externally and do not manufacture production evidence.
+  std::optional<CommandPredicateScope> predicate_scope;
 };
 using CutInventory = std::map<const Call*, std::shared_ptr<PhysicalCuts>>;
 
@@ -64,11 +115,15 @@ ControlPtr ControlSequence(ControlForest body, const Span& span, PhysicalSyncRea
 ControlPtr ControlBranch(ExprPtr condition, ControlPtr body, std::optional<ControlPtr> alternative,
                          const Span& span, PhysicalSyncRealization& work);
 ControlPtr ControlCommand(ExprPtr command, const Span& span, PhysicalSyncRealization& work);
+// Rebuilding preserves tree shape. Changed predicates renew their requirements;
+// unchanged predicates retain the original qualification, including refusal.
+ControlPtr RebuildControl(const ControlPtr& original, ExprPtr condition, ExprPtr command, ControlForest body,
+                          ControlForest alternative, PhysicalSyncRealization& work);
 void FlattenControlSequence(const ControlPtr& node, ControlForest& commands, PhysicalSyncRealization& work);
-ControlPtr ImportControl(const StmtPtr& stmt, PhysicalSyncRealization& work);
+// Diagnostic trust boundary: caller supplies ready immutable free variables;
+// this still rejects effectful predicates and non-synchronization leaves.
+ControlPtr ImportDiagnosticControl(const StmtPtr& stmt, PhysicalSyncRealization& work);
 std::vector<StmtPtr> MaterializeControl(const ControlForest& forest, PhysicalSyncRealization& work);
-std::vector<StmtPtr> MaterializeCommandValues(const std::vector<StmtPtr>& commands, SyncTokenNames& names,
-                                              PhysicalSyncRealization& work);
 // Endpoint accounting applies only before invocation-case composition.
 ControlForest ShareCommandGuards(const ControlForest& commands, PhysicalSyncRealization& work,
                                  bool endpoint = true);

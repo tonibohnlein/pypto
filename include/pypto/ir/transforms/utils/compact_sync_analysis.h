@@ -322,7 +322,7 @@ struct LogicalSyncRealization {
   size_t record_sites = 0, wait_sites = 0, guarded_wait_sites = 0, carried_tokens = 0;
   size_t name_scan_visits = 0, name_scan_nodes = 0;
 };
-// Research-only direct token realization of this retained owner. Never reruns
+// Logical token producer for this retained owner, used by InsertSync. Never reruns
 // analysis or mutates it. Tokens are non-consuming; this is not flag allocation.
 LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis);
 
@@ -349,6 +349,27 @@ struct PhysicalSyncFamily {
   // This inventory is constructed/consumed with the same retained case owner.
   std::vector<ScopedDemandAxis> axes;
   std::shared_ptr<const SyncEndpointDomain> source_domain, target_domain;
+};
+struct DirectSyncOrder;
+struct PhysicalSyncRealization;
+// Allocator-produced immutable assignment. Families and their ID tables are moved
+// once, never copied by schedule or diagnostic consumers. Emission is synchronous:
+// the exact, unchanged input used for allocation must outlive ValidateFor/emission.
+// Retaining this handle permits diagnostic reads, not later reuse of borrowed input.
+class AssignedSyncPlan {
+ public:
+  const std::vector<PhysicalSyncFamily>& Families() const;
+  void ValidateFor(const CompactSyncInput& input, const std::string& target) const;
+
+ private:
+  struct State;
+  std::shared_ptr<const State> state_;
+  AssignedSyncPlan(const CompactSyncInput& input, std::vector<PhysicalSyncFamily> families,
+                   std::map<std::pair<PipeType, PipeType>, std::vector<int>> eligible,
+                   std::vector<std::tuple<PipeType, PipeType, int>> reservations);
+  friend PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput&, std::vector<PhysicalSyncFamily>,
+                                                    const DirectSyncOrder&, const std::string&,
+                                                    const std::optional<std::vector<int>>&);
 };
 // Immutable defaults for production; explicit overrides are diagnostic inputs
 // to the same compiler. Forced modes bypass profitability, never qualification
@@ -383,7 +404,8 @@ struct SyncScheduleParentGapReceipt {
 };
 struct PhysicalSyncRealization {
   FunctionPtr function;
-  std::vector<PhysicalSyncFamily> families;
+  std::shared_ptr<const AssignedSyncPlan> assignment;
+  const std::vector<PhysicalSyncFamily>& Families() const;
   size_t set_sites = 0, wait_sites = 0, barrier_sites = 0, guard_sites = 0;
   // Per-case command sites after local prefix sharing, before invocation-case
   // coalescing. The invocation diagnostic separately counts final emitted IR.

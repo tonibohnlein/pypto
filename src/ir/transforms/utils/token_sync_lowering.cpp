@@ -345,6 +345,12 @@ void CheckGeneratedLogicalSync(const FunctionPtr& function) {
         << diagnostics.front().message;
   }
 }
+FunctionPtr OptimizeLogicalSync(const FunctionPtr& function) {
+  CheckLogicalSync(function);
+  // No logical rewrites are enabled yet. Assigned-ID control optimization is
+  // deliberately later, after physical handoffs and resource proofs exist.
+  return function;
+}
 LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::string& target,
                                     const std::optional<std::vector<int>>& eligible_ids,
                                     const SyncParameterBounds& parameters,

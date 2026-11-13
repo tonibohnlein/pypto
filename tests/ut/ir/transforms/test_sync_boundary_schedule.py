@@ -206,5 +206,49 @@ def test_decision_sharing_only_across_one_executable_command_gap(fence):
     assert result["shared_composed_guard_sites"] == int(fence == "none")
 
 
+@pytest.mark.parametrize("kind", ["active", "foreign", "definition", "private", "wrong_cut"])
+def test_command_scope_uses_original_ready_coordinates(kind):
+    i, other, scalar = variable("i"), variable("i"), variable("loaded")
+    a = payload()
+    predicate = eq(i if kind in ("active", "wrong_cut") else other if kind == "foreign" else scalar, 0)
+    body = loop(i, 0, 3, 1, seq(a))
+    if kind == "definition":
+        body = seq(ir.AssignStmt(scalar, ci(0), SPAN), body)
+    elif kind == "private":
+        body = seq(guarded(eq(i, 0), ir.AssignStmt(scalar, ci(0), SPAN)), body)
+    cut = payload().expr if kind == "wrong_cut" else a.expr
+    supplied = [(cut, guarded(predicate, command()), seq())]
+    if kind == "active":
+        result = testing.emit_sync_boundary_commands(owner(body), supplied, validate_scope=True)
+        assert result["scheduled_loops"] == 1
+    else:
+        reason = "no original owner scope" if kind == "wrong_cut" else "unavailable original-cut coordinate"
+        with pytest.raises(ValueError, match=reason):
+            testing.emit_sync_boundary_commands(owner(body), supplied, validate_scope=True)
+
+
+def test_command_descriptors_reject_effectful_guards_and_payload_leaves():
+    a = payload()
+    effect = ir.Call(ir.get_op("buffer.get_block_idx"), [], {}, ir.ScalarType(ir.DataType.INDEX), SPAN)
+    with pytest.raises(ValueError, match="pure supported coordinate expression"):
+        emit(seq(a), [(a.expr, guarded(eq(effect, 0), command()), seq())])
+    with pytest.raises(ValueError, match="physical synchronization leaf"):
+        emit(seq(a), [(a.expr, seq(payload()), seq())])
+
+
+def test_unproved_arithmetic_stays_opaque_and_cannot_gain_production_scope():
+    i, divisor = variable("i"), variable("divisor")
+    condition = eq(ir.FloorMod(i, divisor, ir.DataType.INDEX, SPAN), 0)
+    commands = seq(guarded(condition, command(0)), guarded(condition, command(1)))
+    # Even a then-only tree cannot bypass the missing positive-divisor proof.
+    # Diagnostic comparison preserves the original plan; production refuses it.
+    assert len(testing.share_sync_command_guards(commands).stmts) == 2
+    a = payload()
+    with pytest.raises(ValueError, match="Unproved command predicate arithmetic"):
+        testing.emit_sync_boundary_commands(
+            owner(loop(i, 0, 3, 1, seq(a))), [(a.expr, commands, seq())], validate_scope=True
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pypto/core/logging.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
@@ -73,95 +74,244 @@ bool PureCommandExpression(const ExprPtr& expression, size_t* inspections) {
          PureCommandExpression(binary->right_, inspections);
 }
 
-class CommandValues : public IRMutator {
-  SyncTokenNames& names_;
+namespace {
+class ScalarBindingPlanner {
   PhysicalSyncRealization& work_;
-  struct Entry {
+  bool share_;
+  struct Value {
     ExprPtr expression;
     size_t uses = 0;
-    VarPtr value;
+    std::optional<size_t> slot;
   };
-  using Table = std::map<uint64_t, Entry>;
-
- private:
-  bool Pure(const ExprPtr& expression) {
-    return PureCommandExpression(expression, &work_.control_expression_visits);
-  }
-  void Count(const ExprPtr& expression, Table& table) {
+  using Values = std::map<uint64_t, Value>;
+  void Count(const ExprPtr& expression, Values& values) {
     ++work_.control_expression_visits;
     const auto binary = As<BinaryExpr>(expression);
     if (!binary) return;
     if (CommandValueCandidate(expression)) {
-      const auto key = structural_hash(expression, false);
-      auto& entry = table[key];
+      auto& entry = values[structural_hash(expression, false)];
       if (!entry.expression) entry.expression = expression;
       if (SameControl(entry.expression, expression)) ++entry.uses;
     }
-    Count(binary->left_, table);
-    Count(binary->right_, table);
+    Count(binary->left_, values);
+    Count(binary->right_, values);
   }
-  class Values : public IRMutator {
-    Table& table_;
-    SyncTokenNames& names_;
-    std::vector<StmtPtr>& definitions_;
-    PhysicalSyncRealization& work_;
-
-   public:
-    Values(Table& table, SyncTokenNames& names, std::vector<StmtPtr>& definitions,
-           PhysicalSyncRealization& work)
-        : table_(table), names_(names), definitions_(definitions), work_(work) {}
-    ExprPtr VisitBinaryExpr_(const BinaryExprPtr& expression) override {
-      ++work_.control_expression_visits;
-      auto found =
-          CommandValueCandidate(expression) ? table_.find(structural_hash(expression, false)) : table_.end();
-      Entry* entry =
-          found != table_.end() && found->second.uses > 1 && SameControl(found->second.expression, expression)
-              ? &found->second
-              : nullptr;
-      if (entry && entry->value) return entry->value;
-      auto rewritten = IRMutator::VisitBinaryExpr_(expression);
-      if (!entry) return rewritten;
-      entry->value =
-          std::make_shared<Var>(names_.Next("sync_control_"), expression->GetType(), expression->span_);
-      definitions_.push_back(std::make_shared<AssignStmt>(entry->value, rewritten, expression->span_));
-      ++work_.shared_control_values;
-      return entry->value;
+  ScalarRecipePtr Expression(const ExprPtr& expression, Values& values, size_t& slots,
+                             std::vector<ScalarBinding>& definitions) {
+    ++work_.control_expression_visits;
+    Value* entry = nullptr;
+    if (share_ && CommandValueCandidate(expression)) {
+      const auto found = values.find(structural_hash(expression, false));
+      if (found != values.end() && found->second.uses > 1 &&
+          SameControl(found->second.expression, expression))
+        entry = &found->second;
     }
-  };
-  StmtPtr VisitStmt_(const SeqStmtsPtr& sequence) override {
-    Table table;
-    for (const auto& statement : sequence->stmts_)
-      if (auto branch = As<IfStmt>(statement); branch && Pure(branch->condition_))
-        Count(branch->condition_, table);
-    std::vector<StmtPtr> output;
-    for (const auto& statement : sequence->stmts_) {
-      if (auto branch = As<IfStmt>(statement); branch && Pure(branch->condition_)) {
-        const auto condition = Values(table, names_, output, work_).VisitExpr(branch->condition_);
-        output.push_back(std::make_shared<IfStmt>(
-            condition, VisitStmt(branch->then_body_),
-            branch->else_body_ ? std::optional<StmtPtr>(VisitStmt(*branch->else_body_)) : std::nullopt,
-            branch->return_vars_, branch->span_));
-      } else {
-        output.push_back(VisitStmt(statement));
-      }
+    if (entry && entry->slot)
+      return std::make_shared<ScalarRecipe>(ScalarRecipe{expression, {}, {}, entry->slot});
+    auto recipe = std::make_shared<ScalarRecipe>();
+    recipe->original = expression;
+    if (auto binary = As<BinaryExpr>(expression)) {
+      recipe->left = Expression(binary->left_, values, slots, definitions);
+      recipe->right = Expression(binary->right_, values, slots, definitions);
     }
-    return std::make_shared<SeqStmts>(output, sequence->span_);
+    if (!entry) return recipe;
+    entry->slot = slots++;
+    definitions.push_back({*entry->slot, recipe});
+    return std::make_shared<ScalarRecipe>(ScalarRecipe{expression, {}, {}, entry->slot});
+  }
+  static void Cost(const ScalarRecipePtr& expression, std::array<size_t, 6>& cost) {
+    if (!expression || expression->slot || !As<BinaryExpr>(expression->original)) return;
+    const auto& e = expression->original;
+    const size_t kind = (As<And>(e) || As<Or>(e))                                         ? 2
+                        : (As<Lt>(e) || As<Le>(e) || As<Gt>(e) || As<Ge>(e) || As<Eq>(e)) ? 1
+                                                                                          : 0;
+    ++cost[kind];
+    Cost(expression->left, cost);
+    Cost(expression->right, cost);
+  }
+  // MaterializeControl removes a sole sequence wrapper inside each arm.
+  static const ControlForest& Arm(const ControlForest& forest) {
+    if (forest.size() == 1 && !forest.front()->command && !forest.front()->condition)
+      return Arm(forest.front()->body);
+    return forest;
   }
 
  public:
-  CommandValues(SyncTokenNames& names, PhysicalSyncRealization& work) : names_(names), work_(work) {}
-};
-
-std::vector<StmtPtr> MaterializeCommandValues(const std::vector<StmtPtr>& commands, SyncTokenNames& names,
-                                              PhysicalSyncRealization& work) {
-  const auto sequence = std::make_shared<SeqStmts>(commands, Span::unknown());
-  const auto previous = work.shared_control_values;
-  try {
-    return As<SeqStmts>(CommandValues(names, work).VisitStmt(sequence))->stmts_;
-  } catch (const StructuralComparisonUnsupported&) {
-    work.shared_control_values = previous;
-    return commands;  // Optional value numbering cannot invalidate a plan.
+  ScalarBindingPlanner(PhysicalSyncRealization& work, bool share) : work_(work), share_(share) {}
+  std::shared_ptr<const FrozenCommandForest> Build(const ControlForest& forest) {
+    auto result = std::make_shared<FrozenCommandForest>();
+    result->roots.assign(forest.begin(), forest.end());
+    Values values;
+    size_t slots = 0;
+    if (share_)
+      for (const auto& node : forest)
+        if (node->condition && PureCommandExpression(node->condition, &work_.control_expression_visits))
+          Count(node->condition, values);
+    for (const auto& node : forest) {
+      ++work_.control_statement_visits;
+      FrozenCommand command;
+      command.original = node;
+      if (node->condition) {
+        Values unshared;
+        const bool pure = share_ && PureCommandExpression(node->condition, &work_.control_expression_visits);
+        command.condition = Expression(node->condition, pure ? values : unshared, slots, command.definitions);
+        for (const auto& binding : command.definitions) {
+          Cost(binding.value, command.scalar_cost);
+          ++command.scalar_cost[5];
+        }
+        Cost(command.condition, command.scalar_cost);
+        ++command.scalar_cost[3];
+      }
+      if (!node->command) {
+        command.body = Build(Arm(node->body));
+        command.alternative = Build(Arm(node->alternative));
+      }
+      result->commands.push_back(std::move(command));
+    }
+    return result;
   }
+};
+class ScalarRecipeEmitter : public IRMutator {
+  ExprPtr left_, right_;
+  ExprPtr VisitBinaryExpr_(const BinaryExprPtr& expression) override {
+    class Children : public IRMutator {
+      const BinaryExprPtr& root_;
+      ExprPtr left_, right_;
+
+     public:
+      Children(const BinaryExprPtr& root, ExprPtr left, ExprPtr right)
+          : root_(root), left_(std::move(left)), right_(std::move(right)) {}
+      ExprPtr VisitBinaryExpr_(const BinaryExprPtr& expression) override {
+        if (expression == root_->left_) return left_;
+        if (expression == root_->right_) return right_;
+        return IRMutator::VisitBinaryExpr_(expression);
+      }
+      ExprPtr Build() { return IRMutator::VisitBinaryExpr_(root_); }
+    };
+    return Children(expression, left_, right_).Build();
+  }
+
+ public:
+  ScalarRecipeEmitter(ExprPtr left, ExprPtr right) : left_(std::move(left)), right_(std::move(right)) {}
+};
+ExprPtr EmitScalarRecipe(const ScalarRecipePtr& recipe, const std::map<size_t, VarPtr>& slots) {
+  if (recipe->slot) return slots.at(*recipe->slot);
+  if (!recipe->left) return recipe->original;
+  return ScalarRecipeEmitter(EmitScalarRecipe(recipe->left, slots), EmitScalarRecipe(recipe->right, slots))
+      .VisitExpr(recipe->original);
+}
+std::vector<StmtPtr> EmitFrozen(const FrozenCommandForest& plan, SyncTokenNames& names,
+                                PhysicalSyncRealization& work) {
+  std::vector<StmtPtr> output;
+  std::map<size_t, VarPtr> slots;
+  for (const auto& command : plan.commands) {
+    const auto& node = command.original;
+    for (const auto& binding : command.definitions) {
+      auto expression = EmitScalarRecipe(binding.value, slots);
+      auto variable =
+          std::make_shared<Var>(names.Next("sync_control_"), expression->GetType(), expression->span_);
+      slots.emplace(binding.slot, variable);
+      output.push_back(std::make_shared<AssignStmt>(variable, expression, expression->span_));
+      ++work.shared_control_values;
+    }
+    if (node->command) {
+      output.push_back(std::make_shared<EvalStmt>(node->command, node->span));
+      ++work.materialized_control_statements;
+      continue;
+    }
+    auto body = std::make_shared<SeqStmts>(EmitFrozen(*command.body, names, work), node->span);
+    ++work.materialized_control_statements;
+    if (!node->condition) {
+      output.push_back(body);
+      continue;
+    }
+    std::optional<StmtPtr> alternative;
+    if (!node->alternative.empty()) {
+      alternative = std::make_shared<SeqStmts>(EmitFrozen(*command.alternative, names, work), node->span);
+      ++work.materialized_control_statements;
+    }
+    output.push_back(std::make_shared<IfStmt>(EmitScalarRecipe(command.condition, slots), body, alternative,
+                                              std::vector<VarPtr>{}, node->span));
+    ++work.materialized_control_statements;
+  }
+  return output;
+}
+}  // namespace
+std::shared_ptr<const FrozenCommandForest> FreezeCommandForest(const ControlForest& forest,
+                                                               PhysicalSyncRealization& work) {
+  work.control_statement_visits += forest.size();
+  if (forest.frozen && forest.frozen->roots.size() == forest.size() &&
+      std::equal(forest.begin(), forest.end(), forest.frozen->roots.begin()))
+    return forest.frozen;
+  try {
+    forest.frozen = ScalarBindingPlanner(work, true).Build(forest);
+  } catch (const StructuralComparisonUnsupported&) {
+    forest.frozen = ScalarBindingPlanner(work, false).Build(forest);
+  }
+  return forest.frozen;
+}
+std::vector<StmtPtr> MaterializeFrozenCommands(const ControlForest& forest, SyncTokenNames& names,
+                                               PhysicalSyncRealization& work) {
+  return EmitFrozen(*FreezeCommandForest(forest, work), names, work);
+}
+
+namespace {
+// This grammar admits only total coordinate calculations already qualified by
+// the producer's integer/range model. Boolean trees remain short-circuit trees;
+// syntax validation never evaluates or hoists either operand. Readiness is a
+// separate original-cut check, not inferred from a Var having scalar type.
+std::vector<const Var*> PredicateInputs(const ExprPtr& predicate, PhysicalSyncRealization& work,
+                                        bool& qualified) {
+  CHECK(predicate) << "Missing command predicate";
+  const auto type = As<ScalarType>(predicate->GetType());
+  CHECK(type && type->dtype_ == DataType::BOOL) << "Command predicate must be Boolean";
+  std::set<const Var*> variables;
+  std::set<const Expr*> visited;
+  const auto visit = [&](const auto& self, const ExprPtr& value) -> void {
+    if (!visited.insert(value.get()).second) return;
+    ++work.control_expression_visits;
+    const auto scalar = As<ScalarType>(value->GetType());
+    CHECK(scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_ == DataType::BOOL))
+        << "Command predicate requires INDEX/BOOL coordinate expressions";
+    if (const auto variable = As<Var>(value)) {
+      variables.insert(variable.get());
+      return;
+    }
+    if (As<ConstInt>(value) || As<ConstBool>(value)) return;
+    const auto binary = As<BinaryExpr>(value);
+    CHECK(binary && (As<Add>(value) || As<Sub>(value) || As<Mul>(value) || As<FloorDiv>(value) ||
+                     As<FloorMod>(value) || As<Eq>(value) || As<Ne>(value) || As<Lt>(value) ||
+                     As<Le>(value) || As<Gt>(value) || As<Ge>(value) || As<And>(value) || As<Or>(value)))
+        << "Command predicate is not a pure supported coordinate expression";
+    if (As<FloorDiv>(value) || As<FloorMod>(value)) {
+      const auto divisor = As<ConstInt>(binary->right_);
+      qualified &= divisor && divisor->value_ > 0;
+    }
+    self(self, binary->left_);
+    self(self, binary->right_);
+  };
+  visit(visit, predicate);
+  return {variables.begin(), variables.end()};
+}
+}  // namespace
+
+void RequireCommandScope(const ControlForest& forest, const CommandPredicateScope& scope,
+                         PhysicalSyncRealization& work) {
+  CHECK(scope.owner && scope.entry_ready) << "Command predicate scope has no original owner";
+  std::set<const CommandControl*> visited;
+  const auto visit = [&](const auto& self, const ControlPtr& node) -> void {
+    if (!visited.insert(node.get()).second) return;
+    ++work.schedule_inspected_descriptors;
+    CHECK(node->predicate_qualified) << "Unproved command predicate arithmetic";
+    for (const auto* variable : node->predicate_inputs) {
+      ++work.schedule_inspected_expressions;
+      CHECK(scope.ready.count(variable) || scope.entry_ready->count(variable))
+          << "Command predicate uses an unavailable original-cut coordinate";
+    }
+    for (const auto& child : node->body) self(self, child);
+    for (const auto& child : node->alternative) self(self, child);
+  };
+  for (const auto& node : forest) visit(visit, node);
 }
 
 // Lowering-owned control descriptors. No scalar statement is created while
@@ -174,6 +324,8 @@ ControlPtr ControlSequence(ControlForest body, const Span& span, PhysicalSyncRea
 }
 ControlPtr ControlBranch(ExprPtr condition, ControlPtr body, std::optional<ControlPtr> alternative,
                          const Span& span, PhysicalSyncRealization& work) {
+  bool qualified = true;
+  auto inputs = PredicateInputs(condition, work, qualified);
   if (auto known = As<ConstBool>(condition))
     return known->value_ ? body : alternative ? *alternative : ControlSequence({}, span, work);
   ++work.control_descriptors;
@@ -182,11 +334,34 @@ ControlPtr ControlBranch(ExprPtr condition, ControlPtr body, std::optional<Contr
                      nullptr,
                      {std::move(body)},
                      alternative ? ControlForest{*alternative} : ControlForest{},
-                     span});
+                     span,
+                     std::move(inputs),
+                     qualified});
 }
 ControlPtr ControlCommand(ExprPtr command, const Span& span, PhysicalSyncRealization& work) {
+  const auto call = As<Call>(command);
+  CHECK(call && (IsOp(call, "system.set_flag") || IsOp(call, "system.wait_flag") ||
+                 IsOp(call, "system.bar_m") || IsOp(call, "system.bar_v")))
+      << "Command descriptor requires a qualified physical synchronization leaf";
+  CHECK(call->args_.empty()) << "Command descriptor requires literal physical assignments";
   ++work.control_descriptors;
   return std::make_shared<CommandControl>(CommandControl{nullptr, std::move(command), {}, {}, span});
+}
+ControlPtr RebuildControl(const ControlPtr& original, ExprPtr condition, ExprPtr command, ControlForest body,
+                          ControlForest alternative, PhysicalSyncRealization& work) {
+  auto inputs = original->predicate_inputs;
+  bool qualified = original->predicate_qualified;
+  if (condition != original->condition) {
+    qualified = true;
+    inputs = condition ? PredicateInputs(condition, work, qualified) : std::vector<const Var*>{};
+  }
+  // Current coordinate substitution cannot change literal command operands.
+  INTERNAL_CHECK(command == original->command || SameControl(command, original->command))
+      << "Descriptor rebuild cannot replace physical assignments";
+  ++work.control_descriptors;
+  return std::make_shared<CommandControl>(CommandControl{std::move(condition), std::move(command),
+                                                         std::move(body), std::move(alternative),
+                                                         original->span, std::move(inputs), qualified});
 }
 bool SameControl(const ControlPtr& a, const ControlPtr& b) {
   if (a == b) return true;
@@ -202,17 +377,17 @@ bool SameControl(const ControlPtr& a, const ControlPtr& b) {
     if (!SameControl(a->alternative[i], b->alternative[i])) return false;
   return true;
 }
-ControlPtr ImportControl(const StmtPtr& stmt, PhysicalSyncRealization& work) {
+ControlPtr ImportDiagnosticControl(const StmtPtr& stmt, PhysicalSyncRealization& work) {
   if (auto sequence = As<SeqStmts>(stmt)) {
     ControlForest children;
-    for (const auto& child : sequence->stmts_) children.push_back(ImportControl(child, work));
+    for (const auto& child : sequence->stmts_) children.push_back(ImportDiagnosticControl(child, work));
     return ControlSequence(std::move(children), stmt->span_, work);
   }
   if (auto branch = As<IfStmt>(stmt)) {
     CHECK(branch->return_vars_.empty()) << "Command schedule cannot move definitions";
-    return ControlBranch(branch->condition_, ImportControl(branch->then_body_, work),
+    return ControlBranch(branch->condition_, ImportDiagnosticControl(branch->then_body_, work),
                          branch->else_body_
-                             ? std::optional<ControlPtr>(ImportControl(*branch->else_body_, work))
+                             ? std::optional<ControlPtr>(ImportDiagnosticControl(*branch->else_body_, work))
                              : std::nullopt,
                          stmt->span_, work);
   }
@@ -270,8 +445,9 @@ class CommandGuards {
     ++visits_;
     if (!statement->condition && !statement->command) {
       for (const auto& child : statement->body) Append(nodes, child);
-    } else if (statement->condition && (statement->alternative.empty() ||
-                                        PureCommandExpression(statement->condition, &expressions_))) {
+    } else if (statement->condition && statement->predicate_qualified &&
+               (statement->alternative.empty() ||
+                PureCommandExpression(statement->condition, &expressions_))) {
       if (nodes.empty() || !nodes.back().condition ||
           !SameControl(nodes.back().condition, statement->condition))
         nodes.push_back({statement->condition, nullptr, {}, {}});
@@ -736,21 +912,23 @@ using namespace physical;
 StmtPtr MaterializeSyncCommandValues(const FunctionPtr& owner, const StmtPtr& commands) {
   SyncTokenNames names(owner);
   PhysicalSyncRealization work;
-  return std::make_shared<SeqStmts>(MaterializeCommandValues({commands}, names, work), commands->span_);
+  ControlForest forest{ImportDiagnosticControl(commands, work)};
+  return std::make_shared<SeqStmts>(MaterializeFrozenCommands(forest, names, work), commands->span_);
 }
 std::vector<StmtPtr> EmitSyncCommandCases(const ExprPtr& block, const Intervals& possible,
                                           const std::vector<SyncCommandCase>& cases,
                                           PhysicalSyncRealization& work, const Span& span,
                                           const std::set<const Var*>& uniform_variables) {
   std::vector<CaseCommands> descriptors;
-  for (const auto& item : cases) descriptors.push_back({item.blocks, ImportControl(item.body, work)});
+  for (const auto& item : cases)
+    descriptors.push_back({item.blocks, ImportDiagnosticControl(item.body, work)});
   return MaterializeControl(ScheduleCommandCases(block, possible, descriptors, work, span, uniform_variables),
                             work);
 }
 std::vector<StmtPtr> ShareSyncCommandGuards(const std::vector<StmtPtr>& commands,
                                             PhysicalSyncRealization& counters) {
   ControlForest descriptors;
-  for (const auto& command : commands) descriptors.push_back(ImportControl(command, counters));
+  for (const auto& command : commands) descriptors.push_back(ImportDiagnosticControl(command, counters));
   return MaterializeControl(CommandGuards().Build(descriptors, counters), counters);
 }
 

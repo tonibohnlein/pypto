@@ -30,6 +30,10 @@ CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::stri
 // Insertion owns its generated SSA: malformed output is a compiler error,
 // never an unsupported-input reason for downstream delegation.
 void CheckGeneratedLogicalSync(const FunctionPtr& function);
+// Shared public/production logical stage. Rewrites belong here, never only in
+// the pass wrapper. Invalid caller input is a qualification error; invalid
+// output after a future rewrite is a compiler error.
+FunctionPtr OptimizeLogicalSync(const FunctionPtr& function);
 
 // Original payload/native import for token consumers. The returned loop map
 // preserves correspondence to the token IR; it does not retain demand analysis.

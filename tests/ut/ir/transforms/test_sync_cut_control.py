@@ -372,5 +372,48 @@ def test_generated_case_sequences_match_on_holes_empty_paths_and_resets():
                 assert evaluate(result, {block: b}).trace == evaluate(reference, {block: b}).trace
 
 
+def test_frozen_scalar_plan_reuses_and_invalidates_by_immutable_roots():
+    index = variable("i")
+    quotient = ir.FloorDiv(index, ci(4), ir.DataType.INDEX, SPAN)
+    original = seq(
+        guarded(ir.Lt(quotient, ci(2), ir.DataType.BOOL, SPAN), command(0)),
+        guarded(ir.Lt(quotient, ci(3), ir.DataType.BOOL, SPAN), command(1)),
+    )
+    audit = testing.inspect_sync_scalar_plan(original)
+    for key in (
+        "same_instance",
+        "copy_reuses",
+        "move_reuses",
+        "append_invalidates",
+        "reorder_invalidates",
+        "clear_invalidates",
+    ):
+        assert audit[key] == 1
+    assert audit["reuse_expression_visits"] == 0
+    assert [audit[f"cost_{i}"] for i in range(6)] == [1, 2, 0, 2, 0, 1]
+    output = testing.materialize_sync_command_values(owner(original), original)
+    assert len([s for s in statements(output) if isinstance(s, ir.AssignStmt)]) == 1
+    for i in (0, 7, 8, 11, 12):
+        assert evaluate(output, {index: i}).trace == evaluate(original, {index: i}).trace
+
+
+def test_frozen_scalar_plan_preserves_single_sequence_arm_scope():
+    index = variable("i")
+    active = ir.Var("active", ir.ScalarType(ir.DataType.BOOL), SPAN)
+    condition = ir.Lt(index, ci(3), ir.DataType.BOOL, SPAN)
+    inner = seq(guarded(condition, command(0)), guarded(condition, command(1)))
+    original = seq(guarded(active, seq(seq(inner))))
+    audit = testing.inspect_sync_scalar_plan(original)
+    assert audit["cost_1"] == 1
+    assert audit["cost_5"] == 1
+    output = testing.materialize_sync_command_values(owner(original), original)
+    assert evaluate(output, {active: False}).trace == []
+    for i in (0, 3):
+        assert (
+            evaluate(output, {active: True, index: i}).trace
+            == evaluate(original, {active: True, index: i}).trace
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

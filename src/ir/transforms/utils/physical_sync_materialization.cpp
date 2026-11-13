@@ -92,10 +92,10 @@ class ScheduleMaterializer : public IRMutator {
                 : std::make_shared<ConstInt>(period * plan.step, DataType::INDEX, plan.loop->span_),
             std::vector<IterArgPtr>{}, SeqStmts::Flatten(std::move(bodies), plan.loop->span_),
             std::vector<VarPtr>{}, plan.loop->span_, ForKind::Sequential);
-        const auto entry = MaterializeCommandValues(MaterializeControl(prepared.entry, work_), names_, work_);
+        const auto entry = MaterializeFrozenCommands(prepared.entry, names_, work_);
         output.insert(output.end(), entry.begin(), entry.end());
         output.push_back(loop);
-        const auto exit = MaterializeCommandValues(MaterializeControl(prepared.exit, work_), names_, work_);
+        const auto exit = MaterializeFrozenCommands(prepared.exit, names_, work_);
         output.insert(output.end(), exit.begin(), exit.end());
       };
       for (const auto& phase : phases) emit(phase);
@@ -113,11 +113,9 @@ class ScheduleMaterializer : public IRMutator {
   StmtPtr Wrap(const StmtPtr& payload, const PhysicalCuts& cuts) {
     const auto found = schedule_ ? schedule_->cuts.find(&cuts) : decltype(schedule_->cuts)::const_iterator{};
     const auto* selected = schedule_ && found != schedule_->cuts.end() ? &found->second : nullptr;
-    auto statements = MaterializeCommandValues(
-        MaterializeControl(selected ? selected->first : cuts.before, work_), names_, work_);
+    auto statements = MaterializeFrozenCommands(selected ? selected->first : cuts.before, names_, work_);
     statements.push_back(payload);
-    const auto after = MaterializeCommandValues(
-        MaterializeControl(selected ? selected->second : cuts.after, work_), names_, work_);
+    const auto after = MaterializeFrozenCommands(selected ? selected->second : cuts.after, names_, work_);
     statements.insert(statements.end(), after.begin(), after.end());
     return std::make_shared<SeqStmts>(statements, payload->span_);
   }
@@ -130,7 +128,7 @@ class ScheduleMaterializer : public IRMutator {
     const auto found = boundary_ ? boundary_->find(loop.get()) : BoundarySchedules::const_iterator{};
     if (!boundary_ || found == boundary_->end()) return IRMutator::VisitStmt_(loop);
     const auto& plan = found->second;
-    auto output = MaterializeCommandValues(MaterializeControl(plan.entry, work_), names_, work_);
+    auto output = MaterializeFrozenCommands(plan.entry, names_, work_);
     const auto* previous = schedule_;
     schedule_ = &plan;
     auto body = VisitStmt(loop->body_);
@@ -138,7 +136,7 @@ class ScheduleMaterializer : public IRMutator {
     output.push_back(std::make_shared<ForStmt>(
         loop->loop_var_, loop->start_, loop->stop_, loop->step_, loop->iter_args_, body, loop->return_vars_,
         loop->span_, loop->kind_, loop->attrs_, loop->leading_comments_, loop->hardware_loop_policy_));
-    auto exit = MaterializeCommandValues(MaterializeControl(plan.exit, work_), names_, work_);
+    auto exit = MaterializeFrozenCommands(plan.exit, names_, work_);
     output.insert(output.end(), exit.begin(), exit.end());
     return SeqStmts::Flatten(std::move(output), loop->span_);
   }

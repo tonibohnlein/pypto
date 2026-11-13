@@ -43,3 +43,5 @@ See [RFC token pipeline checkpoint](18-token-pipeline-checkpoint.md) for finite 
 - [Numerical crossing-token checkpoint](21-crossing-token-checkpoint.md)
 
 - [Supplied numerical-order service checkpoint](22-token-order-service-checkpoint.md)
+
+- [Autosync architecture contracts](33-sync-architecture-contracts.md) — shared logical stage, qualified descriptors, assigned plans and scalar-binding ownership.

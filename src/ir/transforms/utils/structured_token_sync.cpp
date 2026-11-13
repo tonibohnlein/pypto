@@ -500,7 +500,7 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
         owners.push_back(std::make_unique<ScopedTokenOrder>(std::move(input), std::move(families)));
         const auto& order = *owners.back();
         plans.push_back(AllocateDirectSync(order.Input(), order.Families(), order.View(), target, eligible));
-        cases.push_back({&order.Input(), &plans.back()});
+        cases.push_back({&order.Input(), plans.back().assignment, &plans.back()});
       }
       result.function = EmitAssignedSyncCases(stripped.function, parameters, *blocks, cases, policy);
       for (const auto& plan : plans) {

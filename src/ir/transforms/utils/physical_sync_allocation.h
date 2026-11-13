@@ -56,7 +56,8 @@ PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input,
                                            const std::optional<std::vector<int>>& restricted);
 struct AssignedSyncCase {
   const CompactSyncInput* input;
-  PhysicalSyncRealization* plan;
+  std::shared_ptr<const AssignedSyncPlan> assignment;
+  PhysicalSyncRealization* work;
 };
 // Borrowed owners live through this synchronous call. All inputs must refer to
 // the same original owner and exhaust its supplied invocation domain.
@@ -98,8 +99,11 @@ StmtPtr MaterializeSyncCommandValues(const FunctionPtr& owner, const StmtPtr& co
 
 // Internal emitter diagnostic: supplied cuts are already-qualified pure command
 // fragments. This helper does not establish demand coverage or flag matching.
+// validate_scope exercises production original-cut readiness; otherwise the
+// diagnostic caller explicitly supplies readiness of its free variables.
 PhysicalSyncRealization EmitSyncBoundaryCommands(
-    const FunctionPtr& owner, const std::vector<std::tuple<CallPtr, StmtPtr, StmtPtr>>& cuts, bool enabled);
+    const FunctionPtr& owner, const std::vector<std::tuple<CallPtr, StmtPtr, StmtPtr>>& cuts, bool enabled,
+    bool validate_scope = false);
 
 // Publish only an established complete physical owner (literal SET and WAIT),
 // or an explicit delegation outcome. This does not qualify or allocate a plan.

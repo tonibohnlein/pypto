@@ -5,9 +5,15 @@
 新增值类型 `SyncTokenType(pipe)`。所属函数确定核与执行实例的身份；
 token 不重复携带核属性。
 
-这些操作支持 IR 构造、验证和往返。硬件降低（`LowerSync`）尚未实现，
-代码生成会拒绝未降低的逻辑同步。本接口不启用自动插同步，
-也不引入 JIT 选项。已有物理 flag 和 FIFO 操作保持各自的语义。
+这些操作支持构造、验证和序列化。`InsertSync` 从已限定的已放置 Buffer 访问生成逻辑 token；
+`OptimizeSync` 与生产 `RealizeSync` 使用同一逻辑服务（当前仅验证）；`LowerSync` 解释实际
+使用的 token 并分配物理握手。代码生成拒绝尚未降低的 token。可选生产封装仅发布完整物理方案，
+否则保留原始内核交给 PTOAS。已有物理 flag 和 FIFO 操作保持独立。
+
+逻辑有效并不等于能够降低：结构化降低目前要求已限定的数值坐标框架、支持的区间条件与捕获。
+一般符号历史和合取可能仍不可用。降低失败不能用重新计算的最小需求替换已有 token 顺序。
+参见[生产检查点](23-token-production-checkpoint.md)和
+[已分配命令调度](32-sync-schedule-architecture-correction.md)。
 
 ## 操作
 

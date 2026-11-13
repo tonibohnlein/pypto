@@ -82,8 +82,9 @@ Pass InsertSync() {
 Pass OptimizeSync() {
   return CreateProgramPass(
       [](const ProgramPtr& program) {
-        for (const auto& [global, function] : program->functions_) CheckLogicalSync(function);
-        return program;
+        auto functions = program->functions_;
+        for (auto& [global, function] : functions) function = sync::OptimizeLogicalSync(function);
+        return std::make_shared<Program>(functions, program->name_, program->span_);
       },
       "OptimizeSync", PassProperties{.produced = {IRProperty::LogicalSyncValid}});
 }
@@ -149,7 +150,9 @@ Pass RealizeSync() {
       // so this transaction may reuse its own freshly collected evidence.
       const auto logical = InsertLogicalSync(function, target, bounds, block_bounds);
       sync::CheckGeneratedLogicalSync(logical);
-      const auto physical = sync::LowerLogicalSync(logical, target, std::nullopt, bounds, block_bounds);
+      const auto optimized = sync::OptimizeLogicalSync(logical);
+      sync::CheckGeneratedLogicalSync(optimized);
+      const auto physical = sync::LowerLogicalSync(optimized, target, std::nullopt, bounds, block_bounds);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.
       if (!physical.set_sites || !physical.wait_sites)

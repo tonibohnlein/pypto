@@ -222,6 +222,10 @@ class PhysicalSyncRealization(TypedDict):
     guarantee: str
     native_mode: str
 
+def check_sync_assignment_contract(function: Function, change: str = "none") -> dict[str, Any]:
+    """Test assignment storage identity and synchronous-context rejection."""
+    ...
+
 class CompactSyncAnalysis:
     """Retained research analysis with opt-in logical and qualified physical realization."""
 
@@ -430,6 +434,10 @@ def share_sync_command_guards(commands: Stmt) -> Stmt:
     """Test emitter-only pure coordinate-guarded physical commands, with no definitions or payloads."""
     ...
 
+def inspect_sync_scalar_plan(commands: Stmt) -> dict[str, int]:
+    """Inspect immutable scalar-plan reuse and its static scalar costs."""
+    ...
+
 def materialize_sync_command_values(owner: Function, commands: Stmt) -> Stmt:
     """Test sharing of pure emitter-owned predicates inside their original command scope."""
     ...
@@ -441,9 +449,12 @@ def emit_sync_command_cases(
     ...
 
 def emit_sync_boundary_commands(
-    owner: Function, cuts: list[tuple[Call, Stmt, Stmt]], enabled: bool = True
+    owner: Function,
+    cuts: list[tuple[Call, Stmt, Stmt]],
+    enabled: bool = True,
+    validate_scope: bool = False,
 ) -> dict:
-    """Test boundary scheduling of qualified command cuts; does not qualify matching or coverage."""
+    """Test command cuts; optionally check original-cut readiness, never matching or coverage."""
     ...
 
 class SyncInvocationGroups(TypedDict):

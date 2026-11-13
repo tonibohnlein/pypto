@@ -442,5 +442,30 @@ def test_nonleading_conditional_initializer_stays_conservative():
     assert result["barrier_sites"] > 0
 
 
+def test_assigned_family_storage_is_shared_read_only():
+    result = testing.check_sync_assignment_contract(capture("matmul_64"))
+    assert result["shared_family_storage"]
+    assert result["families"] > 0
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ("foreign_input", "different input case"),
+        ("owner", "foreign original owner"),
+        ("target", "target differs"),
+        ("domain", "invocation domain changed"),
+        ("frame", "occurrence frame changed"),
+        ("preassigned_ids", "preassigned IDs"),
+    ],
+)
+def test_assignment_rejects_uncertified_context(change, message):
+    function = capture("matmul_64")
+    before = ir.serialize(function)
+    with pytest.raises(ValueError, match=message):
+        testing.check_sync_assignment_contract(function, change)
+    assert ir.serialize(function) == before
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
