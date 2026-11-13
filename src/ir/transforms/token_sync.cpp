@@ -35,14 +35,12 @@ FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& ta
                               const sync::SyncParameterBounds& parameters,
                               std::optional<std::pair<int64_t, int64_t>> blocks) {
   if (blocks) {
-    const auto invocation = sync::AnalyzeSyncInvocation(function, true, target, parameters, *blocks,
-                                                        sync::SyncOccurrenceLayout::OriginalFrames);
+    const auto invocation = sync::AnalyzeSyncInvocation(function, true, target, parameters, *blocks);
     return invocation.cases.size() == 1
                ? sync::RealizeCompactSync(*invocation.cases.front().mathematics).function
                : sync::RealizeLogicalInvocation(invocation).function;
   }
-  auto input = sync::ImportPlacedSync(function, true, target, parameters, blocks,
-                                      sync::SyncOccurrenceLayout::OriginalFrames);
+  auto input = sync::ImportPlacedSync(function, true, target, parameters, blocks);
   return sync::RealizeCompactSync(sync::AnalyzeCompactSync(std::move(input))).function;
 }
 }  // namespace

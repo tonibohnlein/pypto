@@ -1170,12 +1170,9 @@ void BindTesting(nb::module_& m) {
       "analyze_placed_sync",
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
          const ir::sync::SyncParameterBounds& bounds, const std::string& composition_order,
-         const std::optional<std::pair<int64_t, int64_t>>& block_bounds, bool original_frames) {
+         const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
         auto start = std::chrono::steady_clock::now();
-        auto input =
-            ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds,
-                                       original_frames ? ir::sync::SyncOccurrenceLayout::OriginalFrames
-                                                       : ir::sync::SyncOccurrenceLayout::Automatic);
+        auto input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds);
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         auto result = ir::sync::AnalyzeCompactSync(std::move(input), composition_order);
         result.import_seconds = seconds;
@@ -1184,7 +1181,6 @@ void BindTesting(nb::module_& m) {
       nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target") = "a2a3",
       nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{},
       nb::arg("composition_order") = "balanced", nb::arg("block_bounds") = nb::none(),
-      nb::arg("original_frames") = false,
       "Read-only research analysis of qualified placed Buffer IR under a named hardware contract");
 
   testing.def(

@@ -850,20 +850,16 @@ class Importer {
     }
   }
 };
-// Discover source shape in one postorder traversal. The existing flat/perfect
-// path remains the cheap default; a nonperfect nest uses the same retained
-// leaf mathematics through an explicit sequence/repetition ownership tree.
+// Discover source shape in one postorder traversal. Nested loops retain their
+// original sequence/repetition tree; flat constant loops use the leaf path.
 std::pair<bool, bool> NestedShape(const StmtPtr& statement, std::map<const ForStmt*, bool>& nested) {
   if (!statement) return {false, false};
   if (auto loop = As<ForStmt>(statement)) {
     const auto child = NestedShape(loop->body_, nested);
     nested.emplace(loop.get(), child.first);
-    auto body = Statements(loop->body_);
-    if (!body.empty() && As<YieldStmt>(body.back())) body.pop_back();
     // Invocation-varying starts need the source-frame-aware numerical path,
     // including a nonnested zero/one loop after analytic case qualification.
-    return {true, !As<ConstInt>(loop->start_) || child.second ||
-                      (child.first && (body.size() != 1 || !As<ForStmt>(body.front())))};
+    return {true, !As<ConstInt>(loop->start_) || child.second || child.first};
   }
   std::pair<bool, bool> result{};
   auto join = [&](const StmtPtr& child) {
@@ -1335,7 +1331,7 @@ static void QualifyPhysicalIntervals(CompactSyncInput& input) {
 static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const std::string& target,
                                             const SyncParameterBounds& parameter_bounds,
                                             const std::optional<std::pair<int64_t, int64_t>>& block_bounds,
-                                            SyncOccurrenceLayout layout, bool recover_accesses) {
+                                            bool recover_accesses) {
   CHECK(function && (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV))
       << "Synchronization prototype requires one AIC or AIV leaf";
   if (function->func_type_ == FunctionType::AIV) {
@@ -1403,10 +1399,7 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
   }
   std::map<const ForStmt*, bool> nested;
   const auto shape = NestedShape(function->body_, nested);
-  const bool original_frames =
-      layout == SyncOccurrenceLayout::OriginalFrames &&
-      std::any_of(nested.begin(), nested.end(), [](const auto& entry) { return entry.second; });
-  if (shape.second || original_frames) {
+  if (shape.second) {
     std::vector<SyncLoopFrame> frames;
     importer.result.region_tree = ImportStructuredBody(importer, function->body_, frames, nested);
     if (recover_accesses) {
@@ -1430,54 +1423,21 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
     if (As<ReturnStmt>(stmt)) continue;
     if (auto loop = As<ForStmt>(stmt)) {
       SyncSegment s;
-      std::vector<SyncLoopFrame> frames;
-      auto child = loop;
-      while (true) {
-        RequireIndex(child->loop_var_);
-        RequireIndex(child->start_);
-        RequireIndex(child->stop_);
-        RequireIndex(child->step_);
-        CHECK(child->kind_ == ForKind::Sequential && child->iter_args_.empty() && child->return_vars_.empty())
-            << "Only sequential coordinate-only loops are qualified";
-        const auto start = Constant(child->start_), step = Constant(child->step_),
-                   stop = Constant(child->stop_);
-        CHECK(step > 0) << "Nonpositive loop step is not qualified";
-        const auto count = stop <= start ? 0 : 1 + (stop - start - 1) / step;
-        Checked(__int128(start) + __int128(count) * step);
-        frames.push_back({child, count, start, step});
-        auto body = Statements(child->body_);
-        if (!body.empty() && As<YieldStmt>(body.back())) body.pop_back();
-        if (body.size() != 1 || !As<ForStmt>(body.front())) break;
-        child = As<ForStmt>(body.front());
-      }
-      const auto& inner = frames.back();
-      s.original_loop = inner.loop;
-      s.start = inner.start;
-      s.step = inner.step;
-      s.count = inner.count;
-      importer.Body(inner.loop->body_, s);
-      if (frames.size() > 1) {
-        // Repeat one conflict-class body without unfolding visits. Read slices
-        // may reset: reduction must prove their class membership invariant
-        // over the inner scope and point selectors retain the reset below.
-        // Moving writes and first-visit initialization need a richer summary.
-        for (const auto& site : s.sites) {
-          CHECK(!site.continuation) << "Nested initialization requires a per-invocation summary";
-          for (const auto& access : site.accesses)
-            CHECK((!access.write || (!access.row_step && !access.column_step)) && !access.after_first)
-                << "Nested moving writes require a child-boundary summary";
-        }
-        const bool resets_access = std::any_of(s.sites.begin(), s.sites.end(), [&](const SyncSite& site) {
-          return std::any_of(site.accesses.begin(), site.accesses.end(), [&](const SyncAccess& access) {
-            return importer.result.storage[access.storage].slot_count > 1 || access.row_step ||
-                   access.column_step;
-          });
-        });
-        if (resets_access) s.reset_period = inner.count;
-        s.count = 1;
-        for (const auto& frame : frames) s.count = Checked(__int128(s.count) * frame.count);
-        s.nested_frames = std::move(frames);
-      }
+      RequireIndex(loop->loop_var_);
+      RequireIndex(loop->start_);
+      RequireIndex(loop->stop_);
+      RequireIndex(loop->step_);
+      CHECK(loop->kind_ == ForKind::Sequential && loop->iter_args_.empty() && loop->return_vars_.empty())
+          << "Only sequential coordinate-only loops are qualified";
+      const auto start = Constant(loop->start_), step = Constant(loop->step_), stop = Constant(loop->stop_);
+      CHECK(step > 0) << "Nonpositive loop step is not qualified";
+      const auto count = stop <= start ? 0 : 1 + (stop - start - 1) / step;
+      Checked(__int128(start) + __int128(count) * step);
+      s.original_loop = loop;
+      s.start = start;
+      s.step = step;
+      s.count = count;
+      importer.Body(loop->body_, s);
       importer.result.segments.push_back(std::move(s));
     } else {
       // Keep maximal adjacent finite statements in one numerical region.
@@ -1503,16 +1463,14 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
 }
 CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target,
                                   const SyncParameterBounds& parameters,
-                                  const std::optional<std::pair<int64_t, int64_t>>& blocks,
-                                  SyncOccurrenceLayout layout) {
+                                  const std::optional<std::pair<int64_t, int64_t>>& blocks) {
   CHECK(disjoint_gm)
       << "Disjoint GM argument contract must be explicitly supplied; may-alias import unavailable";
-  return ImportQualifiedSync(function, target, parameters, blocks, layout, true);
+  return ImportQualifiedSync(function, target, parameters, blocks, true);
 }
 CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::string& target,
                                     const SyncParameterBounds& parameters,
                                     const std::optional<std::pair<int64_t, int64_t>>& blocks) {
-  return ImportQualifiedSync(function, target, parameters, blocks, SyncOccurrenceLayout::OriginalFrames,
-                             false);
+  return ImportQualifiedSync(function, target, parameters, blocks, false);
 }
 }  // namespace pypto::ir::sync
