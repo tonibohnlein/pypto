@@ -48,12 +48,16 @@ ir.compile(
 ```
 
 The same option is available to JIT and runtime callers through
-`RunConfig(dump_ptoas_passes=True)`. PyPTO invokes ptoas with full-module IR
-printing after every pass and writes each codegen unit to its own directory:
+`RunConfig(dump_ptoas_passes=True)`. PyPTO invokes ptoas with IR
+printing of each pass target after every pass and writes each codegen unit to its own directory:
 
 ```text
 build/my_program/ptoas_passes/<kernel-or-group>/
 ```
+
+Module passes dump the module; function passes dump their function. This avoids
+forcing full-module inspection during threaded function passes, which PTOAS
+v0.72 cannot disable through its CLI.
 
 Per-unit directories keep parallel ptoas invocations from colliding. The files
 inside are named and organized by ptoas/MLIR. This option has no effect with

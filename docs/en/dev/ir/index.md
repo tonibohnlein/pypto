@@ -21,9 +21,22 @@ the page covering what you are changing.
 | [Multi-Output Operators](09-multi_output_ops.md) | Operators that produce several values: `TupleType` results, why destinations never become arguments, and what the registry enforces |
 | [Operator Effects](10-operator-effects.md) | Functional argument access, write channels, and core placement/replication contracts |
 | [Scalar SIMT IR](11-simt.md) | Void helpers, explicit launch results, scalar GM/UB access, and derived resources |
+| [Finite Sync Demand Analysis](12-sync-demand-analysis.md) | Numerical storage generators, minimum demands, reachability and boundary contracts |
+| [Logical Demand Realization](14-logical-demand-realization.md) | Retained demand to completion-token construction and independent command checks |
+| [Physical Demand Realization](15-physical-demand-realization.md) | Qualified flag allocation, direct placement and independent reuse checks |
+| [Logical Synchronization](11-logical-sync.md) | SSA completion tokens, pipeline ordering, runtime address predicates, and VF completion boundaries |
 
 ## See Also
 
 - [Passes](../passes/index.md) — the transformations that run over this IR.
 - [Python IR Syntax Specification](../language/00-python_syntax.md) — the surface syntax the parser accepts.
 - [IR Verifier](../passes/99-verifier.md) — the property verifiers that check IR legality between passes.
+
+
+
+
+
+
+- [Autosync architecture contracts](33-sync-architecture-contracts.md) — shared logical stage, qualified descriptors, assigned plans and scalar-binding ownership.
+
+- [Autosync branch layout](34-autosync-branch-layout.md)

@@ -87,11 +87,13 @@ PyPTO IR 变换的参考文档，按阅读顺序组织。实际执行顺序请�
 | 56 | [InsertCommFence](56-insert_comm_fence.md) | 为每个发布性写入打标记（本地：region `system.cacheinvalid` + `system.fence`；远端写：仅 fence；opaque 写：whole-GM），并为每个 wait 插入 whole-GM `system.cacheinvalid`；notify 本身不加任何标记 |
 | 57 | [MaterializeValidShapeSymbols](57-materialize_valid_shape_symbols.md) | 将设备 kernel 中无法绑定的 `valid_shape` 符号转换为前置的 `Scalar[INDEX]` 参数，并传入调用方的实际有效范围 |
 | 58 | [LowerTileToBuffer](58-lower_tile_to_buffer.md) | 默认将选中 kernel 的已规划 Tile 存储转换为显式 Buffer 操作，其余 kernel 保留 Tile |
+| 59 | [RealizeSync](59-realize_sync.md) | 实验性显式启用的已放置需求同步；默认仍由 PTOAS 负责 |
 
 ## 默认流水线之外
 
 | 页面 | 内容 |
 | ---- | ---- |
+| [逻辑同步阶段](60-logical_sync_pipeline.md) | 实验性独立 InsertSync、OptimizeSync 和 LowerSync |
 | [工具 Pass](91-utility_passes.md) | 在流水线多个位置运行的归一化与清理 pass |
 | [诊断系统](92-diagnostics.md) | 编译期警告与性能提示的统一咨询通道 |
 | [IR 验证器](99-verifier.md) | 在 pass 之间校验 IR 正确性的可插拔属性验证器 |
