@@ -18,6 +18,7 @@
 
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/pto_native_ops.h"
+#include "pypto/core/any_cast.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -135,12 +136,24 @@ const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::B
   return nullptr;
 }
 
+// out_layout=col_major is the row-reduction recipe's only supported result
+// layout, and is also its implicit default when omitted. Reject only kwargs the
+// recipe does not support (issue #3319).
+bool HasSupportedKwargs(const BufferAxisRecipe& recipe, const ir::CallPtr& call) {
+  if (call->kwargs_.empty()) return true;
+  if (!(recipe.reduction && recipe.axis == 1)) return false;
+  for (const auto& [key, value] : call->kwargs_) {
+    if (key != "out_layout" || AnyCast<ir::TileLayout>(value) != ir::TileLayout::col_major) return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 bool SupportsLogicalBufferAxis(const BufferAxisRecipe& recipe, const ir::CallPtr& call) {
   // Binary-tree col_sum and optional-scratch/packed row_expand_add have
   // separate storage contracts and remain on Tile.
-  if (call->args_.size() != recipe.InputCount() || !call->kwargs_.empty()) return false;
+  if (call->args_.size() != recipe.InputCount() || !HasSupportedKwargs(recipe, call)) return false;
   std::vector<ir::BufferTypePtr> types;
   for (const auto& arg : call->args_) types.push_back(StaticLogicalBufferDescriptor(arg->GetType()));
   types.push_back(StaticLogicalBufferDescriptor(call->GetType()));

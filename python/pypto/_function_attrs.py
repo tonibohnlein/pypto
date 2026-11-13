@@ -23,6 +23,12 @@ other.
 # Immutable whole-kernel selection, retained through storage and lowering (bool).
 BUFFER_IR_SELECTED_ATTR = "buffer_ir_selected"
 
+# Whole-kernel physical synchronization owned by RealizeSync (bool).
+PYPTO_AUTOSYNC_ATTR = "pypto_autosync"
+
+# Whole-kernel delegation reason recorded by RealizeSync (str).
+AUTOSYNC_FALLBACK_REASON_ATTR = "autosync_fallback_reason"
+
 # AIV kernel running on BOTH vector sub-lanes of a mixed kernel (bool).
 DUAL_AIV_DISPATCH_ATTR = "dual_aiv_dispatch"
 
@@ -66,6 +72,7 @@ AUTO_SCOPE_ATTR = "auto_scope"
 
 __all__ = [
     "AUTO_SCOPE_ATTR",
+    "AUTOSYNC_FALLBACK_REASON_ATTR",
     "BUFFER_IR_SELECTED_ATTR",
     "BUILTIN_TEMPLATE_DIR_ATTR",
     "BUILTIN_TEMPLATE_VARS_ATTR",
@@ -74,6 +81,7 @@ __all__ = [
     "EXTERNAL_PREFLIGHT_SYMBOL_ATTR",
     "EXTERNAL_RETURN_PARAMS_ATTR",
     "EXTERNAL_SOURCE_ATTR",
+    "PYPTO_AUTOSYNC_ATTR",
     "REQUIRE_CONTIGUOUS_OPERANDS_ATTR",
     "SPLIT_AIV_ATTR",
 ]

@@ -44,6 +44,39 @@
 
 namespace pypto::ir {
 
+// InitMemRef derives offset = slot_index * slot_size; AllocateMemoryAddr adds
+// the allocation base. Recover only that exact representation, rejecting views
+// and extra offsets rather than silently moving a slot onto different bytes.
+inline std::optional<int64_t> FixedMultiBufferBase(const MemRefPtr& memref) {
+  if (!memref->slot_index_ || !*memref->slot_index_ || memref->size_ == 0 ||
+      memref->size_ > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    return std::nullopt;
+  }
+  const auto& index = *memref->slot_index_;
+  const auto stride = static_cast<int64_t>(memref->size_);
+  if (auto constant = As<ConstInt>(index)) {
+    auto address = As<ConstInt>(memref->byte_offset_);
+    if (!address || constant->value_ < 0 || constant->value_ > std::numeric_limits<int64_t>::max() / stride) {
+      return std::nullopt;
+    }
+    const int64_t relative = constant->value_ * stride;
+    if (address->value_ < relative) return std::nullopt;
+    return address->value_ - relative;
+  }
+  auto matches_slot_offset = [&](const ExprPtr& expr) {
+    auto product = As<Mul>(expr);
+    if (!product) return false;
+    auto factor = As<ConstInt>(product->right_);
+    return factor && factor->value_ == stride && AreExprsEqual(product->left_, index);
+  };
+  if (matches_slot_offset(memref->byte_offset_)) return 0;
+  auto address = As<Add>(memref->byte_offset_);
+  if (!address) return std::nullopt;
+  auto base = As<ConstInt>(address->left_);
+  if (!base || base->value_ < 0 || !matches_slot_offset(address->right_)) return std::nullopt;
+  return base->value_;
+}
+
 // Re-export FindYieldStmt from transform_utils so existing consumers compile unchanged.
 using transform_utils::FindYieldStmt;
 
