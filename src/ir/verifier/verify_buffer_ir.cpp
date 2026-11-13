@@ -39,7 +39,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
-#include "pypto/ir/transforms/utils/var_collectors.h"
+#include "pypto/ir/transforms/utils/type_metadata.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -126,10 +126,26 @@ class BufferIRVisitor : public IRVisitor {
     statement_assigns_result_ = true;
     IRVisitor::VisitStmt_(op);
     statement_call_ = nullptr;
-    if (auto call = As<Call>(op->value_); IsOp(call, "buffer.alloc") && valid_calls_.count(call.get())) {
+    if (auto call = As<Call>(op->value_);
+        (IsOp(call, "buffer.alloc") || IsOp(call, "buffer.alloc_multi")) && valid_calls_.count(call.get())) {
       allocations_[op->var_.get()] = Allocation{
           call->args_.size() == 1, call->args_.size() == 2 ? ConstantAddress(call->args_[1]) : nullptr};
-      RegisterWindow(op->var_, op->var_.get(), 0);
+      if (As<BufferType>(op->var_->GetType())) RegisterWindow(op->var_, op->var_.get(), 0);
+    } else if (IsOp(call, "buffer.slot") && valid_calls_.count(call.get())) {
+      const auto group = AsVarLike(call->args_[0]);
+      const auto multi = As<MultiBufferType>(call->args_[0]->GetType());
+      const auto bytes = PhysicalBytes(multi->element_type_);
+      if (!group || !allocations_.count(group.get()) || !bytes) {
+        Error("Buffer slot requires proven multi-buffer allocation provenance", call->span_);
+      } else {
+        const auto index = As<ConstInt>(call->args_[1]);
+        RegisterWindow(op->var_, group.get(), index ? static_cast<uint64_t>(index->value_) * *bytes : 0);
+        if (!index) {
+          auto& window = windows_.at(op->var_.get());
+          window.known_offset = false;
+          window.bytes = *bytes * static_cast<uint64_t>(multi->slot_count_);
+        }
+      }
     } else if (call && valid_calls_.count(call.get()) &&
                (IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape"))) {
       const auto source = AsVarLike(call->args_[0]);
@@ -515,35 +531,51 @@ class BufferIRVisitor : public IRVisitor {
     // The base visitor treats windows as leaves. Check shared back-references
     // once, whether reached through tensor metadata or as ordinary expressions.
     auto previous_context = std::exchange(attribute_context_, "WindowBuffer metadata");
-    VisitStorageBase(window->base_);
-    VisitExpr(window->size_);
+    type_metadata::ForEachStorageMetadataExpr(
+        window, [this](const ExprPtr& expression, type_metadata::StorageMetadataField field) {
+          if (field == type_metadata::StorageMetadataField::Base) {
+            VisitStorageBase(expression);
+          } else {
+            VisitExpr(expression);
+          }
+        });
     attribute_context_ = std::move(previous_context);
   }
 
   void CheckTypeMetadata(const TypePtr& type) {
     if (!type || !checked_metadata_types_.insert(type.get()).second) return;
-    // Traverse tuple elements through this memoized entry point: a shared
-    // nested tuple must not repeatedly expand all of its metadata fields.
-    if (auto tuple = As<TupleType>(type)) {
-      for (const auto& element : tuple->types_) CheckTypeMetadata(element);
-      return;
-    }
+    // Preserve the previous geometry coverage while sharing its field list:
+    // bare ShapedType and ArrayType were not inspected by the narrow SSA walk.
+    if (!AsTensorTypeLike(type) && !As<TileType>(type) && !As<TupleType>(type)) return;
     auto previous_context = std::exchange(attribute_context_, "Type metadata");
-    // The utility visits shape/view and MemRef slot expressions, not the GM
-    // MemRef carrier itself. Scalar metadata remains legal; handles must be
-    // ordinary buffer operands, never implicit type-dynamic definitions.
-    var_collectors::VisitTypeExprFields(*this, type);
-    if (auto tensor = AsTensorTypeLike(type); tensor && tensor->memref_ && *tensor->memref_) {
-      const auto& memref = *tensor->memref_;
-      if (checked_gm_memrefs_.insert(memref.get()).second) {
-        VisitStorageBase(memref->base_);
-        VisitExpr(memref->byte_offset_);
-      }
-    }
-    if (auto tensor = As<DistributedTensorType>(type);
-        tensor && tensor->window_buffer_ && *tensor->window_buffer_) {
-      CheckWindowBuffer(*tensor->window_buffer_);
-    }
+    type_metadata::ForEachTypeMetadataChild(
+        type,
+        // Re-enter the memoized boundary for shared nested tuple types.
+        [this](const TypePtr& element) { CheckTypeMetadata(element); },
+        [this](const ExprPtr& expression) { VisitExpr(expression); },
+        [this, &type](const ExprPtr& descriptor) {
+          if (const auto window = As<WindowBuffer>(descriptor)) {
+            CheckWindowBuffer(window);
+            return;
+          }
+          const auto memref = As<MemRef>(descriptor);
+          if (!memref) return;
+          const bool inspect_all_fields = AsTensorTypeLike(type) != nullptr;
+          if (inspect_all_fields && !checked_gm_memrefs_.insert(memref.get()).second) return;
+          type_metadata::ForEachStorageMetadataExpr(
+              descriptor, [this, inspect_all_fields](const ExprPtr& expression,
+                                                     type_metadata::StorageMetadataField field) {
+                // Tensor storage is metadata, not a device-buffer SSA operand.
+                // Tile metadata keeps its old slot-only policy: its logical
+                // representation is already rejected by CheckType.
+                if (!inspect_all_fields && field != type_metadata::StorageMetadataField::SlotIndex) return;
+                if (field == type_metadata::StorageMetadataField::Base) {
+                  VisitStorageBase(expression);
+                } else {
+                  VisitExpr(expression);
+                }
+              });
+        });
     attribute_context_ = std::move(previous_context);
   }
 

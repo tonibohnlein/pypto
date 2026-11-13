@@ -20,12 +20,14 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/codegen/pto/pto_type_utils.h"
 #include "pypto/core/error.h"
@@ -43,7 +45,9 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/slot_index_qualification.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
@@ -106,10 +110,10 @@ void CheckBufferTensorParameter(const ir::TensorTypePtr& tensor, const ir::Span&
                                             backend::IsCubeOperandDtype(tensor->dtype_)),
              span)
       << "Direct Buffer IR GM parameters currently require rank-2 FP16/BF16/FP32/INT32/INT8 tensors";
-  auto rows = As<ir::ConstInt>(tensor->shape_[0]);
   auto cols = As<ir::ConstInt>(tensor->shape_[1]);
-  CHECK_SPAN(rows && cols && rows->value_ > 0 && cols->value_ > 1, span)
-      << "Direct Buffer IR GM parameters currently require static physical shapes with columns > 1";
+  CHECK_SPAN(backend::IsBufferTensorShape(tensor->shape_), span)
+      << "Direct Buffer IR GM parameters require static columns > 1 and positive static rows or an "
+         "INDEX row symbol";
   if (tensor->tensor_view_) {
     const auto& view = *tensor->tensor_view_;
     CHECK_SPAN(view.layout == ir::TensorLayout::ND && view.pad == ir::PadValue::null, span)
@@ -212,8 +216,9 @@ class BufferEmissionPreflight : public ir::IRVisitor {
  public:
   bool uses_spmd_blocks = false;
   bool uses_spmd_subblock = false;
-  explicit BufferEmissionPreflight(ir::FunctionPtr function, bool conversion_supported)
-      : function_(std::move(function)), conversion_supported_(conversion_supported) {
+  explicit BufferEmissionPreflight(ir::FunctionPtr function, bool conversion_supported,
+                                   const backend::Backend* backend)
+      : function_(std::move(function)), conversion_supported_(conversion_supported), backend_(backend) {
     for (size_t i = 0; i < function_->params_.size(); ++i) {
       if (auto tensor = As<ir::TensorType>(function_->params_[i]->GetType())) {
         CheckBufferTensorParameter(tensor, function_->params_[i]->span_);
@@ -279,8 +284,18 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     if (auto type = As<ir::BufferType>(expr->GetType())) {
       if (descriptors_.insert(type.get()).second) BufferTypeString(type, expr->span_);
     }
-    CHECK_SPAN(!As<ir::MultiBufferType>(expr->GetType()), expr->span_)
-        << "Direct Buffer IR codegen does not yet support multi-buffer allocations";
+    if (auto multi = As<ir::MultiBufferType>(expr->GetType())) {
+      const auto space = multi->element_type_->memory_space_;
+      CHECK_SPAN(multi->slot_count_ <= 16 && (space == ir::MemorySpace::Vec ||
+                                              space == ir::MemorySpace::Mat || space == ir::MemorySpace::Acc),
+                 expr->span_)
+          << "Direct Buffer multi-buffer emission requires at most 16 slots in Vec, Mat or Acc";
+      BufferTypeString(multi->element_type_, expr->span_);
+      const auto bytes = backend::PhysicalBufferBytes(multi->element_type_);
+      const auto alignment = backend_->GetMemAlignment(space);
+      CHECK_SPAN(multi->slot_count_ == 1 || (bytes && alignment > 0 && *bytes % alignment == 0), expr->span_)
+          << "Direct Buffer multi-buffer requires native-aligned physical slot stride";
+    }
     CHECK_SPAN(!As<ir::Submit>(expr) && !As<ir::TupleGetItemExpr>(expr), expr->span_)
         << "Direct Buffer IR codegen does not yet support task submissions or tuple projections";
     IRVisitor::VisitExpr(expr);
@@ -309,7 +324,9 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       returned_ = true;
     }
     if (auto assign = As<ir::AssignStmt>(stmt)) {
-      CHECK_SPAN(As<ir::BufferType>(assign->var_->GetType()) || As<ir::ScalarType>(assign->var_->GetType()),
+      CHECK_SPAN(As<ir::BufferType>(assign->var_->GetType()) ||
+                     As<ir::MultiBufferType>(assign->var_->GetType()) ||
+                     As<ir::ScalarType>(assign->var_->GetType()),
                  assign->span_)
           << "Direct Buffer IR codegen supports only scalar or buffer assignments";
     }
@@ -334,9 +351,12 @@ class BufferEmissionPreflight : public ir::IRVisitor {
           << "Direct Buffer IR codegen requires a provably positive constant for-loop step; "
              "rewrite the loop with a positive constant step before emission";
     }
+    const bool loop_scope = As<ir::ForStmt>(stmt) || As<ir::WhileStmt>(stmt);
+    if (loop_scope) loop_slots_.emplace_back();
     if (region) ++depth_;
     IRVisitor::VisitStmt(stmt);
     if (region) --depth_;
+    if (loop_scope) loop_slots_.pop_back();
   }
 
  protected:
@@ -368,6 +388,15 @@ class BufferEmissionPreflight : public ir::IRVisitor {
   }
 
   void VisitExpr_(const ir::CallPtr& call) override {
+    // Physical synchronization has no Tile/MemRef operands. Admit the existing
+    // operations here and let the ordinary backend validate/emit them; Buffer
+    // IR must not need a second flag emitter or reconstruct logical Tile IR.
+    if (ir::IsOp(call, "system.set_flag") || ir::IsOp(call, "system.wait_flag") ||
+        ir::IsOp(call, "system.bar_m") || ir::IsOp(call, "system.bar_v") ||
+        ir::IsOp(call, "system.bar_all")) {
+      IRVisitor::VisitExpr_(call);
+      return;
+    }
     uses_spmd_blocks |= ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num");
     uses_spmd_subblock |= ir::IsOp(call, "buffer.get_subblock_idx");
     if (backend::FindBufferConversionRecipe(call->op_->name_) ||
@@ -379,6 +408,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     CHECK_SPAN(recipe || backend::FindBufferRowRecipe(call->op_->name_) ||
                    backend::FindBufferConversionRecipe(call->op_->name_) ||
                    backend::FindBufferIndexedRecipe(call->op_->name_) || ir::IsOp(call, "buffer.alloc") ||
+                   ir::IsOp(call, "buffer.alloc_multi") || ir::IsOp(call, "buffer.slot") ||
                    ir::IsOp(call, "buffer.copy") || ir::IsOp(call, "buffer.subview") ||
                    ir::IsOp(call, "buffer.reshape") || ir::IsOp(call, "buffer.load") ||
                    ir::IsOp(call, "buffer.store") || ir::IsOp(call, "buffer.set_validshape") ||
@@ -387,6 +417,29 @@ class BufferEmissionPreflight : public ir::IRVisitor {
                    ir::IsOp(call, "buffer.matmul_acc") || ir::IsOp(call, "buffer.extract"),
                call->span_)
         << "Operation '" << call->op_->name_ << "' is not supported by direct Buffer IR codegen";
+    if (ir::IsOp(call, "buffer.alloc_multi") && call->args_.size() == 2) {
+      const auto multi = As<ir::MultiBufferType>(call->GetType());
+      const auto alignment = backend_->GetMemAlignment(multi->element_type_->memory_space_);
+      const auto address = As<ir::ConstInt>(call->args_[1]);
+      CHECK_SPAN(multi->slot_count_ == 1 ||
+                     (address && alignment > 0 && static_cast<uint64_t>(address->value_) % alignment == 0),
+                 call->span_)
+          << "Direct Buffer multi-buffer requires a proved native-aligned allocation base";
+    }
+    if (ir::IsOp(call, "buffer.slot") && !loop_slots_.empty() &&
+        !function_->GetAttr<bool>(ir::kAttrPyptoAutosync)) {
+      const auto group = ir::AsVarLike(call->args_[0]);
+      auto [entry, inserted] = loop_slots_.front().emplace(group.get(), call->args_[1]);
+      // Record in the outermost active loop: selections nested under it can
+      // still be co-live with selections in its enclosing or sibling bodies.
+      // This deliberately conservative single lookup avoids rescanning ancestors.
+      // PTOAS #1519 does not qualify automatic synchronization for co-live
+      // prefetch slots. A PyPTO-owned physical plan bypasses that downstream
+      // analysis; otherwise retain the established conservative restriction.
+      CHECK_SPAN(inserted || ir::structural_equal(entry->second, call->args_[1]), call->span_)
+          << "Direct Buffer multi-buffer with distinct co-live loop slots requires qualified "
+             "PyPTO synchronization (PTOAS #1519)";
+    }
     if (ir::IsOp(call, "buffer.load") || ir::IsOp(call, "buffer.store")) {
       const bool load = ir::IsOp(call, "buffer.load");
       const auto buffer = As<ir::BufferType>(call->args_[load ? 3 : 0]->GetType());
@@ -429,8 +482,10 @@ class BufferEmissionPreflight : public ir::IRVisitor {
 
   bool returned_ = false;
   size_t depth_ = 0;
+  std::vector<std::unordered_map<const ir::Var*, ir::ExprPtr>> loop_slots_;
   ir::FunctionPtr function_;
   bool conversion_supported_;
+  const backend::Backend* backend_;
   std::unordered_map<const ir::Var*, ir::ParamDirection> tensor_parameters_;
   std::unordered_set<const ir::BufferType*> descriptors_;
 };
@@ -459,16 +514,22 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
         << "Direct Buffer IR codegen currently supports only scalar and ordinary GM tensor parameters; "
            "the device buffer-parameter ABI is not yet implemented";
   }
-  BufferEmissionPreflight preflight(func, GetBackendHandler()->GetPtoTargetArch() == "a2a3");
+  BufferEmissionPreflight preflight(func, GetBackendHandler()->GetPtoTargetArch() == "a2a3", backend_);
   preflight.VisitFunction(func);
   preflight.CheckReturns();
 
+  ir::CanonicalSlotCollector canonical_slots;
+  canonical_slots.VisitFunction(func);
+  CHECK_SPAN(func->GetAttr<bool>(ir::kAttrPyptoAutosync) || canonical_slots.unsupported_bases.empty(),
+             func->span_)
+      << "Direct Buffer delegated slot selection requires a qualified nonnegative canonical modulo";
   fs_.Reset();
+  fs_.unsigned_slot_remainders = std::move(canonical_slots.remainders);
   fs_.buffer_ir = true;
   fs_.current_function = func;
   // Match PTOParam's existing GM ABI: tensor pointers precede scalar values,
-  // regardless of IR parameter order. The first GM recipe has static shapes,
-  // so it needs no implicit trailing dynamic-shape parameters.
+  // regardless of IR parameter order. Dynamic shape symbols follow the user
+  // payload in exactly the shared wrapper order, before runtime SPMD identities.
   std::vector<ir::VarPtr> parameters;
   for (const auto& param : func->params_) {
     if (As<ir::TensorType>(param->GetType())) parameters.push_back(param);
@@ -490,9 +551,20 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
       stream_ << GetTypeString(As<ir::ScalarType>(parameters[i]->GetType())->dtype_);
     }
   }
+  // Use the same identity-based collector as the wrapper and Tile emitter.
+  // Explicit scalar dimensions are already bound; shared implicit dimensions
+  // get one trailing INDEX argument even when multiple tensors reference them.
+  const auto dynamic_dimensions = CollectTensorShapeDynVars(func);
+  for (size_t i = 0; i < dynamic_dimensions.size(); ++i) {
+    const std::string name = "%arg" + std::to_string(parameters.size() + i);
+    fs_.used_ssa_names.insert(name.substr(1));
+    BindVarToMlir(dynamic_dimensions[i], name);
+    if (!parameters.empty() || i) stream_ << ", ";
+    stream_ << name << ": index";
+  }
   // The wrapper supplies SPMD identities after all user parameters. Detect
   // these scalar queries during preflight, without legacy storage discovery.
-  bool has_parameters = !parameters.empty();
+  bool has_parameters = !parameters.empty() || !dynamic_dimensions.empty();
   const auto append_identity = [&](std::string& binding, const char* name) {
     binding = std::string("%") + name;
     fs_.used_ssa_names.insert(name);
@@ -601,6 +673,41 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     const auto name = NewNamedTemp(result->name_hint_);
     Emit(name + " = arith.index_cast " + argument + " : i32 to index");
     BindVarToMlir(result, name);
+  } else if (ir::IsOp(call, "buffer.alloc_multi")) {
+    INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: multi-buffer allocation needs an SSA result";
+    const auto multi = As<ir::MultiBufferType>(result->GetType());
+    INTERNAL_CHECK_SPAN(multi, call->span_) << "Internal error: multi-buffer allocation has wrong result";
+    const std::string address =
+        call->args_.size() == 2 ? EmitBufferIntegerOperand(call->args_[1], DataType::INT64) : "";
+    const std::string name = NewNamedTemp(result->name_hint_);
+    const std::string element = BufferTypeString(multi->element_type_, call->span_);
+    // A one-slot family is still useful to the analysis, but PTOAS's multi
+    // descriptor requires count >= 2. Its unique slot is the ordinary allocation.
+    const std::string descriptor =
+        multi->slot_count_ == 1
+            ? element
+            : FormatMultiTileBufTypeString(element, static_cast<uint64_t>(multi->slot_count_));
+    Emit(name + (multi->slot_count_ == 1 ? " = pto.alloc_tile" : " = pto.alloc_multi_tile") +
+         (address.empty() ? "" : " addr = " + address) + " : " + descriptor);
+    BindVarToMlir(result, name);
+    RegisterTileBufType(name, descriptor);
+  } else if (ir::IsOp(call, "buffer.slot")) {
+    INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: slot selection needs an SSA result";
+    const auto multi = As<ir::MultiBufferType>(call->args_[0]->GetType());
+    INTERNAL_CHECK_SPAN(multi, call->span_) << "Internal error: slot selection requires a multi-buffer";
+    const std::string source = GetExprAsCode(call->args_[0]);
+    const std::string element = BufferTypeString(multi->element_type_, call->span_);
+    if (multi->slot_count_ == 1) {
+      BindVarToMlir(result, source);
+    } else {
+      const std::string index = EmitBufferIntegerOperand(call->args_[1], DataType::INDEX);
+      const std::string name = NewNamedTemp(result->name_hint_);
+      Emit(name + " = pto.multi_tile_get " + source + "[" + index +
+           "] : " + FormatMultiTileBufTypeString(element, static_cast<uint64_t>(multi->slot_count_)) +
+           " -> " + element);
+      BindVarToMlir(result, name);
+      RegisterTileBufType(name, element);
+    }
   } else if (ir::IsOp(call, "buffer.alloc")) {
     INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: buffer.alloc needs its explicit SSA result";
     const auto type = As<ir::BufferType>(result->GetType());
