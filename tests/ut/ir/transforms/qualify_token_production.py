@@ -191,9 +191,7 @@ def scaling():
         logical = worker(apply(passes.insert_sync, original), function.name)
         parsed = testing.inspect_scoped_token_families(logical, parameter_bounds=BOUNDS)
         # Diagnostic construction is outside the production timing.
-        description = testing.analyze_placed_sync(
-            function, True, parameter_bounds=BOUNDS, original_frames=True
-        ).describe()
+        description = testing.analyze_placed_sync(function, True, parameter_bounds=BOUNDS).describe()
         rows.append(
             {
                 "counts": counts,

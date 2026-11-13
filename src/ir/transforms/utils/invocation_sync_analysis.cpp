@@ -282,8 +282,7 @@ ExprPtr SyncInvocationGuard(const ExprPtr& block, std::pair<int64_t, int64_t> al
 }
 SyncInvocationAnalysis AnalyzeSyncInvocation(const FunctionPtr& function, bool disjoint_gm,
                                              const std::string& target, const SyncParameterBounds& parameters,
-                                             std::pair<int64_t, int64_t> blocks,
-                                             SyncOccurrenceLayout layout) {
+                                             std::pair<int64_t, int64_t> blocks) {
   CHECK(function && blocks.first >= 0 && blocks.second >= blocks.first &&
         blocks.second < std::numeric_limits<int64_t>::max())
       << "Invalid invocation launch contract";
@@ -294,7 +293,7 @@ SyncInvocationAnalysis AnalyzeSyncInvocation(const FunctionPtr& function, bool d
   for (const auto& domain : domains.intervals) {
     // Publish the whole owner only when EVERY nonempty case is qualified.
     // No successful subcase is a substitute for the original caller contract.
-    auto input = ImportPlacedSync(function, disjoint_gm, target, parameters, domain, layout);
+    auto input = ImportPlacedSync(function, disjoint_gm, target, parameters, domain);
     auto mathematics = std::make_shared<CompactSyncResult>(AnalyzeCompactSync(std::move(input)));
     result.cases.push_back({domain.first, domain.second, std::move(mathematics)});
   }

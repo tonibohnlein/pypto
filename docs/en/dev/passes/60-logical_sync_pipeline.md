@@ -409,12 +409,11 @@ route establishes native return completion or device correctness.
 
 ## Perfect nests and original frames
 
-Token insertion and payload reimport request `SyncOccurrenceLayout::OriginalFrames`.
-This selects the existing structured importer only when the original source has
-multiple loop frames that the automatic path would flatten. Finite and single-loop
-selection is unchanged. The public mathematical audit API keeps its automatic
-default; `original_frames=True` explicitly requests the token producer's layout.
-Invocation-case import propagates the same request. No second analysis is tried.
+Token insertion, payload reimport and mathematical inspection use the same
+original-frame importer. Nested loops retain the structured source tree; finite
+and constant single-loop inputs keep their existing leaf route. The obsolete
+perfect-nest flattening option has been removed, so inspection exercises the
+production representation. Invocation-case import follows the same contract.
 
 Original loop objects, nonzero starts, nonunit steps, zero visits and counter resets
 remain owned by that tree. Existing access, control and startup qualifications

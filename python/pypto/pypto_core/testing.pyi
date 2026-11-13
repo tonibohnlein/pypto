@@ -328,12 +328,10 @@ def analyze_placed_sync(
     parameter_bounds: dict[int, tuple[int, int]] = {},
     composition_order: str = "balanced",
     block_bounds: tuple[int, int] | None = None,
-    original_frames: bool = False,
 ) -> CompactSyncAnalysis:
     """Analyze placed Buffer IR with explicit GM aliases and a named hardware contract.
 
-    original_frames requests the existing structured representation for perfect
-    multi-frame nests, matching logical token insertion's occurrence contract.
+    Nested regions retain original frames, matching production token insertion.
     """
     ...
 

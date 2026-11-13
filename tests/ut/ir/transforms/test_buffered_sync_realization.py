@@ -79,14 +79,12 @@ def test_flat_region_resets_bind_actual_boundary_occurrences(counts):
         ), "fixture must exercise interior-to-interior crossings"
 
 
-def test_shared_reset_export_refuses_without_losing_mathematics():
+def test_shared_reset_original_frame_export_refuses_transactionally():
     function = repeated_fixture(4, 3)
-    retained = testing.analyze_placed_sync(function, True)
-    expected = retained.expand_retained_demands(64)
-    with pytest.raises(ValueError, match="(scope|repet|crossing|reset)"):
-        retained.realize_physical("a2a3", list(range(6)))
-    assert retained.expand_retained_demands(64) == expected
-    validate(function, retained)
+    # Production retains original source frames. The removed flattened audit
+    # mode could analyze this shape but could not supply executable transport.
+    with pytest.raises(ValueError, match="Structured rotating source export is not yet qualified"):
+        testing.analyze_placed_sync(function, True)
     delegated = apply_hybrid([function])[function.name]
     assert not dict(delegated.attrs)[PYPTO_AUTOSYNC_ATTR]
     assert dict(delegated.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]

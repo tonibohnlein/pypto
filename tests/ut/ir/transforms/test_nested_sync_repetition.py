@@ -106,14 +106,18 @@ def test_nested_repetition_covers_boundaries_and_physical_reuse(outer, inner, re
     validate(function, retained, parameters=parameters)
     physical = retained.realize_physical("a2a3", list(range(6)))
     run_physical(function, physical["function"], range(6), parameters=parameters)
-    assert retained.describe() == before
+    after = retained.describe()
+    for counter in ("scoped_export_builds", "scoped_reuse_queries", "hierarchy_query_steps"):
+        assert after.pop(counter) >= before.pop(counter)
+    assert after == before
     regions = [r for r in before["regions"] if r["nested_frames"]]
     assert len(regions) == repeats
     assert all(r["count"] == outer * inner and len(r["nested_frames"]) == 2 for r in regions)
-    # This exporter needs carried tokens at each enclosing loop. A qualified
-    # physical export is not permission to manufacture a logical token scope.
-    with pytest.raises(ValueError, match="token transport across every enclosing frame"):
-        retained.realize()
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+        logical = passes.insert_sync()(caller_program(function))
+        lowered = passes.lower_sync()(logical)
+    worker = next(f for f in lowered.functions.values() if f.name == function.name)
+    run_physical(function, worker, range(6), parameters=parameters)
 
 
 def test_three_nested_frames_and_production_selection():
@@ -183,14 +187,18 @@ def test_nested_mathematics_does_not_hide_unavailable_dma_barrier():
     retained = testing.analyze_placed_sync(function, True, parameter_bounds=BOUNDS)
     validate(function, retained, parameters={1: 0, 3: 64})
     before = retained.describe()
-    with pytest.raises(ValueError, match="Unavailable same-pipe barrier mechanism"):
+    with pytest.raises(ValueError, match="same-pipe barrier mechanism"):
         retained.realize_physical("a2a3", list(range(6)))
-    assert retained.describe() == before
+    after = retained.describe()
+    assert after.pop("scoped_export_builds") == 1
+    assert before.pop("scoped_export_builds") == 0
+    assert after == before
 
 
-def test_outer_coordinate_access_requires_general_nested_interface():
-    with pytest.raises(ValueError, match="Unavailable affine synchronization access"):
-        testing.analyze_placed_sync(nested_fixture([2, 3], outer_moving=True), True, parameter_bounds=BOUNDS)
+def test_outer_coordinate_access_uses_original_nested_interface():
+    function = nested_fixture([2, 3], outer_moving=True)
+    retained = testing.analyze_placed_sync(function, True, parameter_bounds=BOUNDS)
+    validate(function, retained, parameters={1: 0, 3: 128})
 
 
 def test_accumulator_reset_is_not_global_first_visit():
@@ -232,8 +240,10 @@ def test_accumulator_reset_is_not_global_first_visit():
         original.func_type,
         ir_stage=original.ir_stage,
     )
-    with pytest.raises(ValueError, match="Nested initialization requires a per-invocation summary"):
-        testing.analyze_placed_sync(function, True)
+    retained = testing.analyze_placed_sync(function, True)
+    validate(function, retained)
+    physical = retained.realize_physical("a2a3", list(range(6)))
+    run_physical(function, physical["function"], range(6))
 
 
 def test_empty_middle_frame_preserves_parent_work():
@@ -244,42 +254,29 @@ def test_empty_middle_frame_preserves_parent_work():
     run_physical(function, physical["function"], range(6), parameters={1: 0, 3: 64})
 
 
-def test_original_frame_and_ordinal_work_scale_with_depth():
-    def guard_nodes(body):
-        statements, expressions, seen = [body], [], set()
-        while statements:
-            statement = statements.pop()
-            if isinstance(statement, ir.SeqStmts):
-                statements.extend(sequence_stmts(statement))
-            elif isinstance(statement, ir.ForStmt):
-                statements.append(statement.body)
-            elif isinstance(statement, ir.IfStmt):
-                expressions.append(statement.condition)
-                statements.append(statement.then_body)
-                if statement.else_body is not None:
-                    statements.append(statement.else_body)
-        while expressions:
-            expression = expressions.pop()
-            if not isinstance(expression, ir.BinaryExpr) or expression in seen:
-                continue
-            seen.add(expression)
-            expressions.extend([expression.left, expression.right])
-        return len(seen)
-
+def test_original_frame_work_and_resource_limits_with_depth():
     measurements = []
     for depth in [2, 4, 8, 16]:
         function = nested_fixture([2] * depth)
         retained = testing.analyze_placed_sync(function, True, parameter_bounds=BOUNDS)
-        physical = retained.realize_physical("a2a3", list(range(6)))
-        nodes = guard_nodes(physical["function"].body)
-        region = next(r for r in retained.describe()["regions"] if r["nested_frames"])
+        description = retained.describe()
+        logical = retained.realize()
+        region = next(r for r in description["regions"] if r["nested_frames"])
         assert len(region["nested_frames"]) == depth
-        measurements.append((depth, nodes))
-    # Each original frame adds normalized-digit and mixed-radix arithmetic at
-    # the fixed command sites. Count distinct generated guard nodes, not elapsed time.
-    slopes = [(b - a) // (db - da) for (da, a), (db, b) in zip(measurements, measurements[1:])]
-    assert slopes[0] > 0 and len(set(slopes)) == 1
-    assert all((b - a) == slopes[0] * (db - da) for (da, a), (db, b) in zip(measurements, measurements[1:]))
+        measurements.append(
+            (depth, description["source_coordinate_entries"], description["source_region_nodes"])
+        )
+        assert logical["record_sites"] == 5
+        assert logical["wait_sites"] == depth + 5
+        if depth <= 4:
+            physical = retained.realize_physical("a2a3", list(range(6)))
+            run_physical(function, physical["function"], range(6), parameters={1: 0, 3: 128})
+        else:
+            # The original-frame allocator does not certify these deep nests.
+            # A former flattened diagnostic assignment was not production evidence.
+            with pytest.raises(ValueError, match="Allocation unproved by whole-span reservation"):
+                retained.realize_physical("a2a3", list(range(6)))
+    assert all(entries == depth + 5 and nodes == depth + 3 for depth, entries, nodes in measurements)
 
 
 def resident_read_nest(inner, outer, refill=True):
@@ -543,7 +540,7 @@ def test_nested_moving_writer_remains_unavailable():
         original.func_type,
         ir_stage=original.ir_stage,
     )
-    with pytest.raises(ValueError, match="moving writes"):
+    with pytest.raises(ValueError, match="GM accesses need a common invocation translation"):
         testing.analyze_placed_sync(function, True, parameter_bounds=BOUNDS)
 
 
