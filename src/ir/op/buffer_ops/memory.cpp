@@ -13,12 +13,14 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -26,6 +28,7 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -80,6 +83,38 @@ void ValidateBufferAlloc(const std::vector<ExprPtr>& args, const TypePtr& result
              "allocation";
     }
   }
+}
+
+// Uniform slots share one allocation; the selector is an alias, never a new
+// allocation. Initially all slot metadata is static so selecting one slot cannot
+// read or change another slot's valid extents.
+void ValidateMultiAlloc(const std::vector<ExprPtr>& args, const TypePtr& result_type) {
+  auto multi = As<MultiBufferType>(result_type);
+  CHECK(multi) << "buffer.alloc_multi result must have MultiBufferType";
+  ValidateBufferAlloc(args, multi->element_type_);
+  const auto& element = multi->element_type_;
+  CHECK(std::none_of(element->valid_shape_.begin(), element->valid_shape_.end(), [](int64_t value) {
+    return value < 0;
+  })) << "buffer.alloc_multi currently requires static slot valid extents";
+  const auto bytes = backend::PhysicalBufferBytes(element);
+  CHECK(bytes && *bytes > 0 &&
+        *bytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                      static_cast<uint64_t>(multi->slot_count_))
+      << "buffer.alloc_multi requires representable uniform physical slot storage";
+}
+
+void ValidateSlot(const std::vector<ExprPtr>& args, const TypePtr& result_type) {
+  CHECK(args.size() == 2 && args[0] && args[1]) << "buffer.slot requires a multi-buffer and a slot index";
+  const auto multi = As<MultiBufferType>(args[0]->GetType());
+  CHECK(multi && structural_equal(result_type, multi->element_type_))
+      << "buffer.slot result must equal its multi-buffer element descriptor";
+  CheckIntegerOperand(args[1], "buffer.slot index");
+  if (auto index = As<ConstInt>(args[1])) {
+    CHECK_SPAN(index->value_ >= 0 && index->value_ < multi->slot_count_, index->span_)
+        << "buffer.slot index must lie in [0, " << multi->slot_count_ << ")";
+  }
+  // Dynamic range is an execution precondition, not established by the type.
+  // Consumers requiring a proof (including autosync) must qualify it separately.
 }
 
 TypePtr DeduceSetValidShape(const std::vector<ExprPtr>& args) {
@@ -189,6 +224,36 @@ REGISTER_OP("buffer.alloc")
     .f_validate_explicit_type([](const std::vector<ExprPtr>& args,
                                  const std::vector<std::pair<std::string, std::any>>&,
                                  const TypePtr& result_type) { ValidateBufferAlloc(args, result_type); });
+
+REGISTER_OP("buffer.alloc_multi")
+    .set_description("Declare one allocation of uniform buffer slots")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .add_argument("valid_extents", "Empty tuple for the initially supported static slot descriptors")
+    .add_argument("address", "Optional effective base of the entire allocation")
+    .set_output_arity(1)
+    .set_buffer_non_memory_arg(0)
+    .set_buffer_non_memory_arg(1)
+    .set_buffer_result_behavior(BufferResultBehavior::Allocate)
+    .f_validate_explicit_type([](const std::vector<ExprPtr>& args,
+                                 const std::vector<std::pair<std::string, std::any>>&,
+                                 const TypePtr& result) { ValidateMultiAlloc(args, result); });
+
+REGISTER_OP("buffer.slot")
+    .set_description("Alias one uniform slot without accessing payload storage")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .add_argument("source", "Uniform multi-buffer allocation")
+    .add_argument("index", "Slot index with an execution precondition of 0 <= index < count")
+    .set_output_arity(1)
+    .set_buffer_arg_effect(0, BufferAccess::None, BufferAccess::Read)
+    .set_buffer_non_memory_arg(1)
+    .set_buffer_result_behavior(BufferResultBehavior::Alias, 0)
+    .f_validate_explicit_type([](const std::vector<ExprPtr>& args,
+                                 const std::vector<std::pair<std::string, std::any>>&,
+                                 const TypePtr& result) { ValidateSlot(args, result); });
 
 // Runtime valid state belongs to the handle. Updating it does not create a
 // second handle or write data, and must not change immutable descriptor fields.
