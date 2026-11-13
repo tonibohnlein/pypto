@@ -56,6 +56,8 @@ def pass_verification_context(monkeypatch, pass_verification_instruments):
             outer.get_runtime(),
             outer.get_enable_buffer_ir(),
             outer.get_enable_software_pipeline(),
+            enable_pypto_autosync=outer.get_enable_pypto_autosync(),
+            autosync_disjoint_gm=outer.get_autosync_disjoint_gm(),
         ):
             return run_passes(self, *args, **kwargs)
 

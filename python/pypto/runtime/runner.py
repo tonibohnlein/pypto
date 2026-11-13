@@ -209,7 +209,7 @@ class RunConfig:
             (``NONE`` / ``CONCISE`` / ``EXPLICIT``) or a ``bool``
             (``True`` -> ``CONCISE``, ``False`` -> ``NONE``). ``EXPLICIT`` resolves
             implicit tile layouts and distributed window buffers in the dump.
-        dump_ptoas_passes: If ``True``, dump full-module intermediate IR after
+        dump_ptoas_passes: If ``True``, dump pass-target intermediate IR after
             every ptoas pass under
             ``<output_dir>/ptoas_passes/<codegen-unit>/``. Has no effect when
             ptoas is unavailable and compilation stops at raw ``.pto`` output.

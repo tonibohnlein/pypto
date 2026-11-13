@@ -13,9 +13,20 @@ Type stubs for pypto.testing submodule
 Internal testing utilities (do not use in production)
 """
 
-from typing import Literal, NoReturn, TypedDict
+from typing import Any, Literal, NoReturn, TypedDict
 
-from .ir import BufferAccess, BufferResultBehavior, Call, Expr, Function, OpIRStage, Type
+from .ir import (
+    BufferAccess,
+    BufferResultBehavior,
+    Call,
+    Expr,
+    Function,
+    OpIRStage,
+    PipeType,
+    Program,
+    Stmt,
+    Type,
+)
 
 def validate_buffer_op_contract(
     stage: OpIRStage,
@@ -40,6 +51,18 @@ def validate_op_type_registration(
 
 def validate_buffer_call(call: Call) -> None:
     """Validate a stored Buffer call without changing its arguments or result type."""
+
+class SyncSchedulePolicy:
+    """Finite compiler growth caps; forced modes bypass profitability only."""
+
+    def __init__(
+        self,
+        mode: str = "auto",
+        max_extra_payload_sites: int = 4096,
+        max_extra_control_nodes: int = 65536,
+        no_clone: bool = True,
+        boundary_motion: bool = True,
+    ) -> None: ...
 
 class DsaReusePenaltyEdge(TypedDict):
     """One internal pre-solver DSA-RP recognizer result."""
@@ -114,3 +137,334 @@ def classify_call_affinity(call: Call) -> Literal["cube", "vector", "shared", "m
     special cases, output memory spec, first tile argument, result tile
     memory), so the answer depends on how far the call has been lowered.
     """
+
+class FiniteSyncBoundary(TypedDict):
+    """Original occurrence indices; None inside an available boundary proves absence."""
+
+    first_writer: int | None
+    last_writer: int | None
+    first_readers: list[int | None]
+    last_readers: list[int | None]
+
+class FiniteSyncResult(TypedDict):
+    """Numerical demand analysis; no executable or allocation guarantee."""
+
+    exact_accesses: bool
+    generators: list[tuple[int, int]]
+    demands: list[tuple[int, int]]
+    starts: list[list[int]]
+    completions: list[list[int]]
+    queries: list[bool]
+    boundaries: list[FiniteSyncBoundary | None]
+    work: dict[str, int]
+
+def analyze_finite_sync(
+    occurrences: list[tuple[PipeType, bool, list[int], list[int]]],
+    covered_cells: list[int],
+    exact_accesses: bool,
+    prerequisites: list[tuple[int, int]],
+    native_order: list[tuple[int, int]],
+    queries: list[tuple[int, bool, int, bool]],
+    boundary_cells: list[int],
+) -> FiniteSyncResult:
+    """Analyze resolved occurrences over provider-certified physical classes.
+
+    Each occurrence is (pipe, present, reads, writes). Queries are
+    (source, source_is_completion, target, target_is_completion), strictly
+    ordered. An unavailable storage query returns None, never empty selectors.
+    False exact_accesses denotes a sound conservative model; returned covers
+    are minimum for that model. This helper does not import PyPTO IR effects.
+    """
+
+class LogicalSyncRealization(TypedDict):
+    """Original payloads with logical tokens; no hardware lowering guarantee."""
+
+    function: Function
+    record_sites: int
+    wait_sites: int
+    guarded_wait_sites: int
+    carried_tokens: int
+    name_scan_visits: int
+    name_scan_nodes: int
+    guarantee: str
+
+class PhysicalSyncFamily(TypedDict):
+    """Original occurrence frame and cyclic ID list of one demand family."""
+
+    source: tuple[int, int, int]
+    target: tuple[int, int, int]
+    count: int
+    ids: list[int]
+
+class PhysicalSyncRealization(TypedDict):
+    """Qualified physical commands; native invocation premises remain explicit."""
+
+    schedule_name_scans: int
+    schedule_name_visits: int
+    # choices carry standalone model_scope; parent_gaps certify subsequent sharing.
+    schedule: dict[str, Any]
+    schedule_policy: dict[str, Any]
+
+    function: Function
+    families: list[PhysicalSyncFamily]
+    set_sites: int
+    wait_sites: int
+    barrier_sites: int
+    guard_sites: int
+    constructed_guard_sites: int
+    shared_guard_sites: int
+    shared_composed_guard_sites: int
+    control_statement_visits: int
+    reuse_queries: int
+    reserved_lanes: int
+    native_reserved_ids: list[tuple[PipeType, PipeType, int]]
+    finite_minimum: bool
+    guarantee: str
+    native_mode: str
+
+def check_sync_assignment_contract(function: Function, change: str = "none") -> dict[str, Any]:
+    """Test assignment storage identity and synchronous-context rejection."""
+    ...
+
+class CompactSyncAnalysis:
+    """Retained research analysis with opt-in logical and qualified physical realization."""
+
+    def describe(self) -> dict[str, Any]:
+        """Return retained geometry, occurrence mapping, families and work counts."""
+        ...
+
+    def expand_retained_demands(
+        self, max_payloads: int
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        """Audit actual retained records within an explicit payload budget; no new analysis."""
+        ...
+
+    def export_crossing_demands(
+        self,
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]] | None:
+        """Return original-coordinate flat crossings, or unavailable for unsupported shared uses."""
+        ...
+
+    def scoped_consecutive_reuse(self, family: int) -> bool:
+        """Uniform period-one reuse of an owned schema; False is unproved, not scarcity."""
+        ...
+    def export_scoped_demands(self) -> dict[str, Any] | None:
+        """Return cached original-frame Cartesian demand families, or unavailable."""
+        ...
+
+    def realize(self) -> LogicalSyncRealization:
+        """Insert logical record/wait commands from this retained result."""
+        ...
+
+    def realize_physical(
+        self,
+        target: str,
+        eligible_ids: list[int] | None = None,
+        *,
+        schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
+    ) -> PhysicalSyncRealization:
+        """Test supplied-demand allocation using the target's eligible directional IDs.
+
+        Optional IDs restrict the catalog. Refuse unsupported realization,
+        unproved compact allocation or proved finite fixed-plan scarcity.
+        This bypasses actual-token interpretation; use LowerSync/RealizeSync tests
+        for production coverage.
+        """
+        ...
+
+    def precedes(
+        self,
+        source: tuple[int, int, int],
+        source_completion: bool,
+        target: tuple[int, int, int],
+        target_completion: bool,
+    ) -> bool:
+        """Query segment/visit/site event order."""
+        ...
+
+    def boundary(
+        self,
+        storage: int,
+        row: int,
+        column: int,
+        parameters: dict[int, int] = {},
+        block_index: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return modeled point selectors; None is unavailable, not absence."""
+        ...
+
+    def boundary_slot(
+        self,
+        storage: int,
+        slot: int,
+        row: int,
+        column: int,
+        parameters: dict[int, int] = {},
+        block_index: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Query an explicit physical slot; unavailable differs from proven absence."""
+        ...
+
+def sync_parameter_bounds_profile(program: Program) -> dict[str, Any]:
+    """Inspect proved ranges and expression/range visits per binding environment."""
+    ...
+
+def sync_parameter_bounds(program: Program) -> dict[str, dict[int, tuple[int, int]]]:
+    """Inspect inclusive ranges joined at all callers through an acyclic call graph."""
+    ...
+
+def sync_invocation_evidence(program: Program) -> dict[str, Any]:
+    """Inspect formal bounds, launch-index hulls and static call-graph traversal work.
+
+    Missing entries are unproved. Launch indices are not formal ABI parameters.
+    Recursive components and their descendants remain unavailable.
+    """
+    ...
+
+def analyze_placed_sync(
+    function: Function,
+    disjoint_gm: bool,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+    composition_order: str = "balanced",
+    block_bounds: tuple[int, int] | None = None,
+    original_frames: bool = False,
+) -> CompactSyncAnalysis:
+    """Analyze placed Buffer IR with explicit GM aliases and a named hardware contract.
+
+    original_frames requests the existing structured representation for perfect
+    multi-frame nests, matching logical token insertion's occurrence contract.
+    """
+    ...
+
+def describe_placed_sync_input(
+    function: Function,
+    disjoint_gm: bool,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+    block_bounds: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    """Inspect accesses and optional exact byte intervals without constructing demands.
+
+    A missing physical_intervals entry denotes unavailable interval geometry,
+    not absence. interval_access_visits counts static qualification work.
+    An analyzed region also reports interval tree work separately from atom tests.
+    collective_witnesses counts certified crossing points, not a complete cell partition.
+    """
+    ...
+
+class SyncInvocationAnalysis:
+    def realize_physical(
+        self,
+        target: str,
+        eligible_ids: list[int] | None = None,
+        *,
+        schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
+    ) -> dict[str, Any]:
+        """Test supplied-demand cases, bypassing actual-token interpretation."""
+        ...
+    def select_case(self, block_index: int, parameters: dict[int, int]) -> CompactSyncAnalysis | None:
+        """Return retained mathematics only for an admitted fully bound invocation."""
+        ...
+    def describe(self) -> dict[str, Any]:
+        """Inspect exhaustive disjoint cases and construction work."""
+        ...
+
+def analyze_sync_invocation(
+    function: Function,
+    disjoint_gm: bool,
+    target: str,
+    parameter_bounds: dict[int, tuple[int, int]],
+    block_bounds: tuple[int, int],
+) -> SyncInvocationAnalysis:
+    """Construct qualified cases over the entire supplied launch contract."""
+    ...
+
+def inspect_scoped_token_families(
+    function: Function,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+    block_bounds: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    """Inspect actual token families using payload qualification; no access recovery or allocation."""
+    ...
+
+class ScopedTokenOrder:
+    @property
+    def summary_nodes(self) -> int: ...
+    @property
+    def interface_entries(self) -> int: ...
+    def precedes(
+        self,
+        source: tuple[int, int, int],
+        source_completion: bool,
+        target: tuple[int, int, int],
+        target_completion: bool,
+    ) -> bool: ...
+    def uniform(self, family: int) -> bool: ...
+    def reuse(self, family: int) -> bool: ...
+    def barrier(self, family: int) -> bool: ...
+    def realize(self, target: str = "a2a3") -> Function: ...
+
+def analyze_scoped_token_order(function: Function, target: str = "a2a3") -> ScopedTokenOrder: ...
+def check_generated_logical_sync(function: Function) -> None:
+    """Test the production compiler-error boundary for insertion-owned logical IR."""
+    ...
+
+class SyncScheduleLoweringResult(TypedDict):
+    function: Function
+    set_sites: int
+    wait_sites: int
+    physical_cases: list[dict[str, Any]]
+    # choices carry standalone model_scope; parent_gaps certify subsequent sharing.
+    schedule: dict[str, Any]
+    schedule_policy: dict[str, Any]
+
+def lower_sync_schedule(
+    function: Function,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+    block_bounds: tuple[int, int] | None = None,
+    *,
+    schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
+) -> SyncScheduleLoweringResult:
+    """Run production token lowering with explicit current invocation evidence."""
+    ...
+
+def share_sync_command_guards(commands: Stmt) -> Stmt:
+    """Test emitter-only pure coordinate-guarded physical commands, with no definitions or payloads."""
+    ...
+
+def inspect_sync_scalar_plan(commands: Stmt) -> dict[str, int]:
+    """Inspect immutable scalar-plan reuse and its static scalar costs."""
+    ...
+
+def materialize_sync_command_values(owner: Function, commands: Stmt) -> Stmt:
+    """Test sharing of pure emitter-owned predicates inside their original command scope."""
+    ...
+
+def emit_sync_command_cases(
+    block: Expr, possible: list[tuple[int, int]], cases: list[tuple[int, int, Stmt]]
+) -> Stmt:
+    """Test command cases against a supplied possible cut domain; unknown requires the full domain."""
+    ...
+
+def emit_sync_boundary_commands(
+    owner: Function,
+    cuts: list[tuple[Call, Stmt, Stmt]],
+    enabled: bool = True,
+    validate_scope: bool = False,
+) -> dict:
+    """Test command cuts; optionally check original-cut readiness, never matching or coverage."""
+    ...
+
+class SyncInvocationGroups(TypedDict):
+    groups: list[list[tuple[int, int]]]
+    descriptor_nodes: int
+    comparisons: int
+
+def inspect_sync_invocation_groups(
+    owner: Function, cases: list[tuple[int, int, Stmt]]
+) -> SyncInvocationGroups:
+    """Inspect structural groups only; no profitability, coverage or protocol certification."""
+    ...
