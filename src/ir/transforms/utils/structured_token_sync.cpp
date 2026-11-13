@@ -483,7 +483,8 @@ StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool
 LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const std::string& target,
                                               const std::optional<std::vector<int>>& eligible,
                                               const SyncParameterBounds& parameters,
-                                              std::optional<std::pair<int64_t, int64_t>> blocks) {
+                                              std::optional<std::pair<int64_t, int64_t>> blocks,
+                                              const SyncSchedulePolicy& policy) {
   auto stripped = StripStructuredLogicalSync(function, true);
   if (blocks) {
     const auto partition = PartitionSyncInvocation(stripped.function, parameters, *blocks);
@@ -494,35 +495,34 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
       std::vector<AssignedSyncCase> cases;
       LoweredLogicalSync result;
       for (const auto& domain : partition.intervals) {
-        auto input = ImportPlacedSync(stripped.function, true, target, parameters, domain,
-                                      SyncOccurrenceLayout::OriginalFrames);
+        auto input = ImportSyncPayloads(stripped.function, target, parameters, domain);
         auto families = ParseScopedTokenFamilies(function, input, stripped.loops);
         owners.push_back(std::make_unique<ScopedTokenOrder>(std::move(input), std::move(families)));
         const auto& order = *owners.back();
         plans.push_back(AllocateDirectSync(order.Input(), order.Families(), order.View(), target, eligible));
         cases.push_back({&order.Input(), &plans.back()});
       }
-      result.function = EmitAssignedSyncCases(stripped.function, parameters, *blocks, cases);
+      result.function = EmitAssignedSyncCases(stripped.function, parameters, *blocks, cases, policy);
       for (const auto& plan : plans) {
         result.set_sites += plan.set_sites;
         result.wait_sites += plan.wait_sites;
       }
+      result.physical_cases = std::move(plans);
       return result;
     }
   }
-  auto input = ImportPlacedSync(stripped.function, true, target, parameters, blocks,
-                                SyncOccurrenceLayout::OriginalFrames);
+  auto input = ImportSyncPayloads(stripped.function, target, parameters, blocks);
   if (input.region_tree) {
     auto families = ParseScopedTokenFamilies(function, input, stripped.loops);
     ScopedTokenOrder order(std::move(input), std::move(families));
     // The callbacks borrow this owner until shared allocation/emission finishes.
     // An unavailable proof refuses; it never substitutes a new demand analysis.
-    auto result = RealizeDirectSync(order.Input(), order.Families(), order.View(), target, eligible);
-    return {result.function, result.set_sites, result.wait_sites};
+    auto result = RealizeDirectSync(order.Input(), order.Families(), order.View(), target, eligible, policy);
+    return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};
   }
   auto families = Parse(function, input, stripped.loops).Run();
   Order order(input, families);
-  auto result = RealizeDirectSync(input, std::move(families), order.View(), target, eligible);
-  return {result.function, result.set_sites, result.wait_sites};
+  auto result = RealizeDirectSync(input, std::move(families), order.View(), target, eligible, policy);
+  return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};
 }
 }  // namespace pypto::ir::sync

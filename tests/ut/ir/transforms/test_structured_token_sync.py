@@ -95,7 +95,9 @@ def test_trip_counts_do_not_expand_physical_or_token_schemas():
         sizes.append(
             (token_text.count("pl.sync."), flag_text.count("set_flag("), flag_text.count("wait_flag("))
         )
-    assert sizes[0] == sizes[1] == sizes[2]
+    assert all(s[0] == sizes[0][0] for s in sizes)  # Same retained token schema.
+    assert sizes[1] == sizes[2]  # Bounded steady-state physical schema.
+    assert all(short <= steady for short, steady in zip(sizes[0][1:], sizes[1][1:], strict=True))
 
 
 def test_previous_record_yield_is_not_assumed_to_be_current():

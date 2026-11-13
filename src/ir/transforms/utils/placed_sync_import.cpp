@@ -36,6 +36,7 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/verifier/verifier.h"
+#include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -313,6 +314,10 @@ CallPtr SingleCall(const StmtPtr& s) {
 }
 class Importer {
  public:
+  // Native instruction, descriptor and control qualification is shared. Only
+  // dependence clients construct storage effects and their selector evidence.
+  explicit Importer(bool recover_accesses) : recover_accesses(recover_accesses) {}
+  const bool recover_accesses;
   CompactSyncInput result;
   std::unordered_map<const Expr*, size_t> objects;
   // Vec descriptors retain their own geometry; all placed Vec bytes share one
@@ -382,10 +387,15 @@ class Importer {
     slots[assign->var_.get()] = {coordinate.first % count, coordinate.second % count,
                                  segment.original_loop.get()};
   }
-  void ApplySlot(SyncAccess& access, const ExprPtr& handle, const SyncSegment& segment) const {
+  void QualifySlot(const ExprPtr& handle, const SyncSegment& segment) const {
     if (auto slot = slots.find(handle.get()); slot != slots.end()) {
       CHECK(!slot->second.frame || slot->second.frame == segment.original_loop.get())
           << "Slot selection belongs to another occurrence frame";
+    }
+  }
+  void ApplySlot(SyncAccess& access, const ExprPtr& handle, const SyncSegment& segment) const {
+    QualifySlot(handle, segment);
+    if (auto slot = slots.find(handle.get()); slot != slots.end()) {
       access.slot_first = slot->second.first;
       access.slot_step = slot->second.step;
     }
@@ -589,6 +599,7 @@ class Importer {
         const auto& view = found->second;
         CHECK(!view.frame || view.frame == segment.original_loop)
             << "Vec view use belongs to another occurrence frame";
+        if (!recover_accesses) return;
         const auto width = Checked(__int128(view.type->shape_[1]) * view.type->dtype_.GetByte());
         // Dense footprints use one interval. Strided views retain one interval
         // per physical row, never an enclosing rectangle that fills the gaps.
@@ -601,6 +612,10 @@ class Importer {
                 id, write, {0, 0}, {Checked(__int128(view.address) + __int128(row) * view.pitch), view.step},
                 1, width, segment));
         }
+        return;
+      }
+      if (!recover_accesses) {
+        QualifySlot(call->args_[arg], segment);
         return;
       }
       const auto& s = result.storage[id];
@@ -617,22 +632,26 @@ class Importer {
       auto offsets = As<MakeTuple>(call->args_[1]), shape = As<MakeTuple>(call->args_[2]);
       CHECK(offsets && shape && offsets->elements_.size() == 2 && shape->elements_.size() == 2)
           << "Synchronization DMA requires a rank-two rectangle";
-      auto id = Storage(call->args_[load ? 0 : 3]);
+      // Coordinate readiness and checked arithmetic remain native admission
+      // evidence even when no dependence footprint is requested.
       const auto row = Coordinate(offsets->elements_[0], segment);
       const auto column = Coordinate(offsets->elements_[1], segment);
-      auto& storage = result.storage[id];
-      if (translated_storage.insert(id).second) {
-        storage.row_parameters = row.parameters;
-        storage.column_parameters = column.parameters;
-        storage.row_block = row.block;
-        storage.column_block = column.block;
-      } else {
-        CHECK(storage.row_parameters == row.parameters && storage.column_parameters == column.parameters &&
-              storage.row_block == row.block && storage.column_block == column.block)
-            << "GM accesses need a common invocation translation; parameter-dependent overlap is unproved";
+      if (recover_accesses) {
+        auto id = Storage(call->args_[load ? 0 : 3]);
+        auto& storage = result.storage[id];
+        if (translated_storage.insert(id).second) {
+          storage.row_parameters = row.parameters;
+          storage.column_parameters = column.parameters;
+          storage.row_block = row.block;
+          storage.column_block = column.block;
+        } else {
+          CHECK(storage.row_parameters == row.parameters && storage.column_parameters == column.parameters &&
+                storage.row_block == row.block && storage.column_block == column.block)
+              << "GM accesses need a common invocation translation; parameter-dependent overlap is unproved";
+        }
+        site.accesses.push_back(Access(id, !load, row, column, Constant(shape->elements_[0]),
+                                       Constant(shape->elements_[1]), segment));
       }
-      site.accesses.push_back(Access(id, !load, row, column, Constant(shape->elements_[0]),
-                                     Constant(shape->elements_[1]), segment));
       const auto gm_arg = load ? 0 : 3;
       (load ? modes[gm_arg].first : modes[gm_arg].second) = true;
       const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
@@ -664,10 +683,13 @@ class Importer {
               column.second % box == 0 && t.columns % box == 0)
             << "Unaligned boxed extraction requires a separate footprint contract";
       }
-      site.accesses.push_back(Access(sid, false, row, column, t.rows, t.columns, segment));
-      CHECK(!extract || s.slot_count == 1 || PhysicalInterval(s, site.accesses.back()))
+      auto source_access = Access(sid, false, row, column, t.rows, t.columns, segment);
+      CHECK(!extract || s.slot_count == 1 || PhysicalInterval(s, source_access))
           << "Rotating-slot extraction requires an exact contiguous within-slot interval";
-      ApplySlot(site.accesses.back(), call->args_[0], segment);
+      ApplySlot(source_access, call->args_[0], segment);
+      if (recover_accesses) {
+        site.accesses.push_back(std::move(source_access));
+      }
       modes[0].first = true;
       whole(target, true);
       site.pipe = PipeType::MTE1;
@@ -1314,10 +1336,10 @@ static void QualifyPhysicalIntervals(CompactSyncInput& input) {
   }
 }
 
-CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target,
-                                  const SyncParameterBounds& parameter_bounds,
-                                  const std::optional<std::pair<int64_t, int64_t>>& block_bounds,
-                                  SyncOccurrenceLayout layout) {
+static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const std::string& target,
+                                            const SyncParameterBounds& parameter_bounds,
+                                            const std::optional<std::pair<int64_t, int64_t>>& block_bounds,
+                                            SyncOccurrenceLayout layout, bool recover_accesses) {
   CHECK(function && (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV))
       << "Synchronization prototype requires one AIC or AIV leaf";
   if (function->func_type_ == FunctionType::AIV) {
@@ -1331,9 +1353,7 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
     for (const auto& diagnostic : diagnostics)
       CHECK(diagnostic.severity != DiagnosticSeverity::Error) << diagnostic.message;
   }
-  CHECK(disjoint_gm)
-      << "Disjoint GM argument contract must be explicitly supplied; may-alias import unavailable";
-  Importer importer;
+  Importer importer(recover_accesses);
   importer.result.owner = function;
   importer.result.hardware_target = target;
   importer.result.parameter_bounds = parameter_bounds;
@@ -1354,12 +1374,15 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
   for (size_t index = 0; index < function->params_.size(); ++index) {
     const auto& param = function->params_[index];
     if (As<ScalarType>(param->GetType())) {
-      CHECK(SyncCoordinateMaximum(param)) << "Unavailable invocation coordinate type";
-      CHECK(parameter_bounds.count(index)) << "Invocation coordinate has no established caller range";
+      if (recover_accesses) {
+        CHECK(SyncCoordinateMaximum(param)) << "Unavailable invocation coordinate type";
+        CHECK(parameter_bounds.count(index)) << "Invocation coordinate has no established caller range";
+      }
       importer.parameters.emplace(param.get(), index);
     }
   }
   for (const auto& param : function->params_) {
+    if (!recover_accesses) break;  // GM allocation geometry is not token-order evidence.
     if (As<ScalarType>(param->GetType())) continue;
     auto t = As<TensorType>(param->GetType());
     CHECK(t && t->shape_.size() == 2 && t->dtype_.GetBit() % 8 == 0 && !t->tensor_view_)
@@ -1390,9 +1413,11 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
   if (shape.second || original_frames) {
     std::vector<SyncLoopFrame> frames;
     importer.result.region_tree = ImportStructuredBody(importer, function->body_, frames, nested);
-    CHECK(QualifyStartupScopes(*importer.result.region_tree, importer.result).pending.empty())
-        << "Initialization scope is outside the retained source tree";
-    QualifyPhysicalIntervals(importer.result);
+    if (recover_accesses) {
+      CHECK(QualifyStartupScopes(*importer.result.region_tree, importer.result).pending.empty())
+          << "Initialization scope is outside the retained source tree";
+      QualifyPhysicalIntervals(importer.result);
+    }
     return std::move(importer.result);
   }
   for (const auto& stmt : Statements(function->body_)) {
@@ -1477,7 +1502,21 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
             << "Rotating family requires one common stride within a region";
       }
   }
-  QualifyPhysicalIntervals(importer.result);
+  if (recover_accesses) QualifyPhysicalIntervals(importer.result);
   return std::move(importer.result);
+}
+CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target,
+                                  const SyncParameterBounds& parameters,
+                                  const std::optional<std::pair<int64_t, int64_t>>& blocks,
+                                  SyncOccurrenceLayout layout) {
+  CHECK(disjoint_gm)
+      << "Disjoint GM argument contract must be explicitly supplied; may-alias import unavailable";
+  return ImportQualifiedSync(function, target, parameters, blocks, layout, true);
+}
+CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::string& target,
+                                    const SyncParameterBounds& parameters,
+                                    const std::optional<std::pair<int64_t, int64_t>>& blocks) {
+  return ImportQualifiedSync(function, target, parameters, blocks, SyncOccurrenceLayout::OriginalFrames,
+                             false);
 }
 }  // namespace pypto::ir::sync

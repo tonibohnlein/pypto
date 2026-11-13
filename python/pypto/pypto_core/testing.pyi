@@ -52,6 +52,18 @@ def validate_op_type_registration(
 def validate_buffer_call(call: Call) -> None:
     """Validate a stored Buffer call without changing its arguments or result type."""
 
+class SyncSchedulePolicy:
+    """Finite compiler growth caps; forced modes bypass profitability only."""
+
+    def __init__(
+        self,
+        mode: str = "auto",
+        max_extra_payload_sites: int = 4096,
+        max_extra_control_nodes: int = 65536,
+        no_clone: bool = True,
+        boundary_motion: bool = True,
+    ) -> None: ...
+
 class DsaReusePenaltyEdge(TypedDict):
     """One internal pre-solver DSA-RP recognizer result."""
 
@@ -187,6 +199,11 @@ class PhysicalSyncFamily(TypedDict):
 class PhysicalSyncRealization(TypedDict):
     """Qualified physical commands; native invocation premises remain explicit."""
 
+    schedule_name_scans: int
+    schedule_name_visits: int
+    schedule: dict[str, Any]
+    schedule_policy: dict[str, Any]
+
     function: Function
     families: list[PhysicalSyncFamily]
     set_sites: int
@@ -233,7 +250,13 @@ class CompactSyncAnalysis:
         """Insert logical record/wait commands from this retained result."""
         ...
 
-    def realize_physical(self, target: str, eligible_ids: list[int] | None = None) -> PhysicalSyncRealization:
+    def realize_physical(
+        self,
+        target: str,
+        eligible_ids: list[int] | None = None,
+        *,
+        schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
+    ) -> PhysicalSyncRealization:
         """Realize retained demands using the target's eligible directional IDs.
 
         Optional IDs restrict the catalog. Refuse unsupported realization,
@@ -324,7 +347,13 @@ def describe_placed_sync_input(
     ...
 
 class SyncInvocationAnalysis:
-    def realize_physical(self, target: str, eligible_ids: list[int] | None = None) -> dict[str, Any]:
+    def realize_physical(
+        self,
+        target: str,
+        eligible_ids: list[int] | None = None,
+        *,
+        schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
+    ) -> dict[str, Any]:
         """Qualify cases and emit cuts; case_sites precede coalescing, top-level counts follow it."""
         ...
     def select_case(self, block_index: int, parameters: dict[int, int]) -> CompactSyncAnalysis | None:
@@ -350,7 +379,7 @@ def inspect_scoped_token_families(
     parameter_bounds: dict[int, tuple[int, int]] = {},
     block_bounds: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
-    """Inspect actual token families with disjoint GM roots; no reduction or allocation."""
+    """Inspect actual token families using payload qualification; no access recovery or allocation."""
     ...
 
 class ScopedTokenOrder:
@@ -371,6 +400,29 @@ class ScopedTokenOrder:
     def realize(self, target: str = "a2a3") -> Function: ...
 
 def analyze_scoped_token_order(function: Function, target: str = "a2a3") -> ScopedTokenOrder: ...
+def check_generated_logical_sync(function: Function) -> None:
+    """Test the production compiler-error boundary for insertion-owned logical IR."""
+    ...
+
+class SyncScheduleLoweringResult(TypedDict):
+    function: Function
+    set_sites: int
+    wait_sites: int
+    physical_cases: list[dict[str, Any]]
+    schedule: dict[str, Any]
+    schedule_policy: dict[str, Any]
+
+def lower_sync_schedule(
+    function: Function,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+    block_bounds: tuple[int, int] | None = None,
+    *,
+    schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
+) -> SyncScheduleLoweringResult:
+    """Run production token lowering with explicit current invocation evidence."""
+    ...
+
 def share_sync_command_guards(commands: Stmt) -> Stmt:
     """Test emitter-only pure coordinate-guarded physical commands, with no definitions or payloads."""
     ...
@@ -383,4 +435,16 @@ def emit_sync_command_cases(
     block: Expr, possible: list[tuple[int, int]], cases: list[tuple[int, int, Stmt]]
 ) -> Stmt:
     """Test command cases against a supplied possible cut domain; unknown requires the full domain."""
+    ...
+
+def emit_sync_boundary_commands(
+    owner: Function, cuts: list[tuple[Call, Stmt, Stmt]], enabled: bool = True
+) -> dict:
+    """Test boundary scheduling of qualified command cuts; does not qualify matching or coverage."""
+    ...
+
+def inspect_sync_invocation_schedules(
+    owner: Function, cases: list[tuple[int, int, Stmt]], trips: int
+) -> dict:
+    """Inspect production schedule grouping and cost; no coverage or protocol certification."""
     ...

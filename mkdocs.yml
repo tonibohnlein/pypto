@@ -324,6 +324,9 @@ nav:
           - en/dev/ir/27-sync-expansion-accounting.md
           - en/dev/ir/28-shared-case-command-sequences.md
           - en/dev/ir/29-direct-sync-control.md
+          - en/dev/ir/30-structured-sync-schedules.md
+          - en/dev/ir/31-regional-sync-schedule-plan.md
+          - en/dev/ir/32-sync-schedule-architecture-correction.md
           - en/dev/ir/18-qwen-prefill-pipeline.md
       - Passes:
           - en/dev/passes/index.md

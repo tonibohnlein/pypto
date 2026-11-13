@@ -11,6 +11,7 @@
 
 #ifndef PYPTO_IR_TRANSFORMS_UTILS_COMPACT_SYNC_ANALYSIS_H_
 #define PYPTO_IR_TRANSFORMS_UTILS_COMPACT_SYNC_ANALYSIS_H_
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -349,6 +350,28 @@ struct PhysicalSyncFamily {
   std::vector<ScopedDemandAxis> axes;
   std::shared_ptr<const SyncEndpointDomain> source_domain, target_domain;
 };
+// Immutable defaults for production; explicit overrides are diagnostic inputs
+// to the same compiler. Forced modes bypass profitability, never qualification
+// or these finite growth limits. Control bounds count expanded IR occurrences,
+// including cloned scalar definitions and payload operand expressions. These
+// caps are compiler policy, not device-derived weights or performance bounds.
+// Production defaults to no extra payload copies until duplication is calibrated.
+struct SyncSchedulePolicy {
+  std::string mode = "auto";
+  size_t max_extra_payload_sites = 4096;
+  size_t max_extra_control_nodes = 65536;
+  bool no_clone = true;
+  bool boundary_motion = true;
+};
+struct SyncScheduleCandidateReceipt {
+  std::string loop, mode, status, reason;
+  size_t payload_sites = 0, control_node_bound = 0, command_sites = 0;
+  // Arithmetic, comparisons, Boolean operators, decisions, loop headers, SSA
+  // coordinate and shared-value bindings. Unresolved mixed decisions make
+  // profitability unproved; exact means exact modeled generated control only.
+  std::vector<std::array<int64_t, 6>> model_cost;
+  bool model_comparable = false, model_exact = false, selected = false;
+};
 struct PhysicalSyncRealization {
   FunctionPtr function;
   std::vector<PhysicalSyncFamily> families;
@@ -366,6 +389,20 @@ struct PhysicalSyncRealization {
   size_t shared_disjoint_case_cuts = 0;
   size_t endpoint_domain_entries = 0, endpoint_predicates_constructed = 0, normalized_endpoint_bounds = 0;
   size_t control_descriptors = 0, materialized_control_statements = 0;
+  size_t invocation_scheduled_loops = 0, invocation_schedule_groups = 0, invocation_schedule_visits = 0,
+         invocation_schedule_comparisons = 0, invocation_schedule_model_saving = 0;
+  size_t schedule_name_scans = 0, schedule_name_visits = 0;
+  std::vector<SyncScheduleCandidateReceipt> schedule_choices;
+  size_t schedule_inspected_descriptors = 0, schedule_inspected_expressions = 0;
+  size_t schedule_emitted_payload_sites = 0, schedule_emitted_control_nodes = 0;
+  size_t regular_schedule_candidates = 0, regular_schedule_loops = 0, regular_schedule_boundaries = 0;
+  size_t regular_schedule_body_copies = 0, regular_schedule_payload_copies = 0,
+         regular_schedule_model_saving = 0;
+  size_t assigned_schedule_endpoints = 0;  // Symbolic uses before ID/guard expansion.
+  size_t schedule_candidates = 0, scheduled_loops = 0, schedule_boundary_commands = 0,
+         schedule_size_refusals = 0;
+  size_t schedule_body_visits = 0, schedule_descriptor_visits = 0;
+  size_t schedule_original_nodes = 0, schedule_candidate_nodes = 0;
   size_t control_expression_visits = 0;
   size_t reuse_queries = 0, reserved_lanes = 0;
   std::vector<std::tuple<PipeType, PipeType, int>> native_reserved_ids;  // Fixed macro owners.
@@ -383,12 +420,14 @@ struct PhysicalSyncInvocation {
 };
 PhysicalSyncInvocation RealizePhysicalInvocation(const SyncInvocationAnalysis& analysis,
                                                  const std::string& target,
-                                                 const std::optional<std::vector<int>>& eligible_ids);
+                                                 const std::optional<std::vector<int>>& eligible_ids,
+                                                 const SyncSchedulePolicy& policy = {});
 // Qualified direct realization of the retained owner, NOT general token-IR
 // LowerSync. Optional IDs restrict (never enlarge) the target's eligible pools.
 // Requires fresh entry, closed notification exit and the declared manual native
 // mode. Throws on unsupported placement, unproved reuse or fixed-plan scarcity.
 PhysicalSyncRealization RealizePhysicalSync(const CompactSyncResult& analysis, const std::string& target,
-                                            const std::optional<std::vector<int>>& eligible_ids);
+                                            const std::optional<std::vector<int>>& eligible_ids,
+                                            const SyncSchedulePolicy& policy = {});
 }  // namespace pypto::ir::sync
 #endif  // PYPTO_IR_TRANSFORMS_UTILS_COMPACT_SYNC_ANALYSIS_H_

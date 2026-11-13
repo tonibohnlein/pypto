@@ -72,6 +72,7 @@ Pass InsertSync() {
           const auto blocks =
               block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
           function = InsertLogicalSync(function, target, parameters, blocks);
+          sync::CheckGeneratedLogicalSync(function);
         }
         return std::make_shared<Program>(functions, program->name_, program->span_);
       },
@@ -147,7 +148,7 @@ Pass RealizeSync() {
       // stages. Insertion preserves callers, payloads and scalar coordinates,
       // so this transaction may reuse its own freshly collected evidence.
       const auto logical = InsertLogicalSync(function, target, bounds, block_bounds);
-      CheckLogicalSync(logical);  // OptimizeSync currently verifies without rewriting.
+      sync::CheckGeneratedLogicalSync(logical);
       const auto physical = sync::LowerLogicalSync(logical, target, std::nullopt, bounds, block_bounds);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.

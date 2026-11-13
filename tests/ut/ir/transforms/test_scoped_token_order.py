@@ -17,7 +17,7 @@ from pypto.backend.pto_backend import _run_ptoas
 
 from .sync_control_metrics import expression_nodes, statements
 from .sync_matmul_oracle import hardware_reference, interpret
-from .sync_physical_oracle import PhysicalExecution
+from .sync_physical_oracle import PhysicalExecution, checked_payload_calls
 from .test_collective_sync_realization import nested_collective, repeat_collective
 from .test_finite_sync_analysis import closure
 from .test_nested_sync_repetition import resident_pipeline_tree
@@ -77,7 +77,8 @@ def check_order(logical, *, physical=True):
         lowered = _apply(passes.lower_sync, logical)
         # Production adds ownership metadata; commands must remain identical.
         assert ir.python_print(diagnostic.body, format=False) == ir.python_print(lowered.body, format=False)
-        flags = PhysicalExecution(calls, reference[0], range(6))
+        _, emitted_calls = checked_payload_calls(original, lowered)
+        flags = PhysicalExecution(emitted_calls, reference[0], range(6))
         flags.execute(lowered.body, {})
         graph, projection = _project(flags.vertices, flags.edges, reference[0])
         assert flags.payload_count == len(calls)

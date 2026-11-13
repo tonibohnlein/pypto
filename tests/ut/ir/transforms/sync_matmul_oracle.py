@@ -39,7 +39,7 @@ def cast_integer(value, dtype):
 
 
 def integer(expr, env):
-    if isinstance(expr, ir.ConstInt):
+    if isinstance(expr, (ir.ConstInt, ir.ConstBool)):
         return expr.value
     if isinstance(expr, ir.Var):
         return env[expr] if expr in env else env[expr.name_hint]
@@ -48,6 +48,8 @@ def integer(expr, env):
         return cast_integer(integer(expr.operand, env), expr.type.dtype)
     if isinstance(expr, ir.Add):
         return integer(expr.left, env) + integer(expr.right, env)
+    if isinstance(expr, ir.Sub):
+        return integer(expr.left, env) - integer(expr.right, env)
     if isinstance(expr, ir.Mul):
         return integer(expr.left, env) * integer(expr.right, env)
     if isinstance(expr, ir.FloorMod):
@@ -62,6 +64,15 @@ def integer(expr, env):
         return env["__block_index__"]
     if isinstance(expr, ir.Eq):
         return integer(expr.left, env) == integer(expr.right, env)
+    for kind, compare in (
+        (ir.Lt, lambda a, b: a < b),
+        (ir.Le, lambda a, b: a <= b),
+        (ir.Gt, lambda a, b: a > b),
+        (ir.Ge, lambda a, b: a >= b),
+        (ir.Ne, lambda a, b: a != b),
+    ):
+        if isinstance(expr, kind):
+            return compare(integer(expr.left, env), integer(expr.right, env))
     raise AssertionError(f"Oracle does not interpret {type(expr)}")
 
 
@@ -130,7 +141,29 @@ def define_slot_storage(stmt, env, storage):
     return False
 
 
-def interpret(function, parameters=None, *, block_index=None, shape_parameters=None):
+def operand_signature(expr, env, storage):
+    if isinstance(expr, ir.MakeTuple):
+        return tuple(operand_signature(x, env, storage) for x in expr.elements)
+    if isinstance(expr.type, ir.ScalarType):
+        if isinstance(expr, ir.ConstFloat):
+            return (expr.type, float(expr.value).hex())
+        return (expr.type, integer(expr, env))
+    assert isinstance(expr, ir.Var)
+    # Keep each operand separately: unioned effects alone would miss a
+    # swapped matrix operand or a changed scalar computation.
+    descriptor = storage[expr.name_hint]
+    return tuple(descriptor)
+
+
+def interpret(
+    function,
+    parameters=None,
+    *,
+    block_index=None,
+    shape_parameters=None,
+    operand_signatures=None,
+    enumerate_effects=True,
+):
     parameters = parameters or {}
     environment = {function.params[i].name_hint: value for i, value in parameters.items()}
     # Execution inputs, independently supplied by the test's caller contract.
@@ -153,7 +186,7 @@ def interpret(function, parameters=None, *, block_index=None, shape_parameters=N
 
     def access(arg, rect=None):
         s = storage[arg.name_hint]
-        return address_set(s, *(rect or (0, 0, s[2], s[3])))
+        return address_set(s, *(rect or (0, 0, s[2], s[3]))) if enumerate_effects else set()
 
     def define_storage(stmt, env):
         assert isinstance(stmt.value, ir.Call)
@@ -256,14 +289,18 @@ def interpret(function, parameters=None, *, block_index=None, shape_parameters=N
             for value in range(integer(stmt.start, env), integer(stmt.stop, env), integer(stmt.step, env)):
                 execute(stmt.body, {**env, stmt.loop_var: value})
         elif isinstance(stmt, ir.IfStmt):
-            execute(stmt.then_body if integer(stmt.condition, env) else stmt.else_body, env)
-        elif isinstance(stmt, (ir.YieldStmt, ir.ReturnStmt)):
+            execute(stmt.then_body if integer(stmt.condition, env) else stmt.else_body, dict(env))
+        elif stmt is None or isinstance(stmt, (ir.YieldStmt, ir.ReturnStmt)):
             return
         elif isinstance(stmt, ir.EvalStmt):
             call = stmt.expr
             assert isinstance(call, ir.Call)
             pipe, reads, writes = payload_effects(call, env)
             calls.append((call, env.copy(), pipe, reads, writes))
+            if operand_signatures is not None:
+                operand_signatures.append(
+                    (call.op.name, call.kwargs, tuple(operand_signature(a, env, storage) for a in call.args))
+                )
         else:
             raise AssertionError(f"Unsupported oracle statement {type(stmt)}")
 

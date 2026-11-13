@@ -1,0 +1,2819 @@
+{
+  "milestone": "qualified regional synchronization schedule lowering",
+  "status": "All five stages implemented and reviewer accepted",
+  "baseline": {
+    "revision": "868fdd471d34a0e8259e84e6d21c57258601a7c5",
+    "dirty_source_sha256": {
+      "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "4dacb49f48b6f4257180a78e4f52d0412d82d3a6dd6d61c33e3085991892c2e6",
+      "mkdocs.yml": "4454b49fc30dec691b595cd362f26be6300f9029d7dfee6e4fdaf997853aa5ce",
+      "python/bindings/modules/testing.cpp": "add50912cfb57832f4e224a8c86df28ab8faffc2f478b846536a4c75e254cfa7",
+      "python/pypto/pypto_core/testing.pyi": "c962135ab1e318ca4aa97f9143354a47d612a56253c3af8aedc7a07a23957d6c",
+      "src/ir/transforms/utils/physical_sync_allocation.h": "3e14cd26a4162eed17f3ad38802550f714c0912a0165a383dc45c98747e3c405",
+      "src/ir/transforms/utils/physical_sync_realization.cpp": "042245275a9edd189ff326c4030e0c0aa2edce66ccef4a8912cc8d3619bb4366",
+      "tests/ut/ir/transforms/qualify_sync_control.py": "718dfd69fc503242455bd7baea95ca5901b1f8e7b7ad074dbef5e8f5fd14f9f4",
+      "docs/en/dev/ir/30-structured-sync-schedules.md": "4c7430fa3b7e8d20f1bb79b287b303c8e0b581dd36988f52f81b04787c76dcab",
+      "docs/en/dev/ir/structured-sync-control.json": "f24173b19485668c5de2331686d4a2679529fc8620f2cb013fc702182fd66373",
+      "docs/zh/dev/ir/30-structured-sync-schedules.md": "062479f5721861239c3154d7b6c5f216e36fb1cb78f739d46d49d9ca4b3f6756",
+      "tests/ut/ir/transforms/test_sync_boundary_schedule.py": "2a74fb890b9232fd3a469a9e92ac6d916f0b384b6cd5147a8969f362782d65a9"
+    },
+    "extension_sha256": "91fb022e534d6300696afca8463f164e3fd3881d9e68acf18e32451d8ce69293",
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "reused_qualification": "build-py314/structured-control/final/qualification.json",
+    "reused_qualification_sha256": "64a8b6d7144f5a77c79a1b236418775bc6b44d5bbe202b828ec2a290796cd1f9",
+    "reused_validation": "docs/en/dev/ir/structured-sync-control.json"
+  },
+  "stages": [
+    {
+      "stage": 1,
+      "fixtures": 28,
+      "traces": 477,
+      "pto_byte_identical": true,
+      "cpp_byte_identical": true,
+      "focused_tests": 95,
+      "review": "accepted by compact_sync_design_review",
+      "qualification_sha256": "d940d2947182108f85adbfdc223b03e16de01ca7ec0c211b9850fbd38786aef8"
+    },
+    {
+      "stage": 2,
+      "review": "source accepted conditional on gates; gates passed",
+      "focused_tests": 116,
+      "fixtures": 28,
+      "trace_comparisons": 477,
+      "source_sha256": "ce6f1767108802b3c7ba7738e4f8624aacdc8531dacaea62d9ccc3e7893366f5",
+      "qualification": "m2-final/qualification.json"
+    },
+    {
+      "stage": 3,
+      "review": "accepted for advancement; long actual-token gate remains final qualification",
+      "schedule_tests": 36,
+      "fixtures": 28,
+      "trace_comparisons": 477,
+      "cpp_outputs": 56,
+      "source_sha256": "ddbb5f8c587bf26569b955c945d17512f2c4a2ff42f17268f11805c98a3255d6"
+    },
+    {
+      "stage": 4,
+      "review": "accepted",
+      "focused_tests": 127,
+      "trace_comparisons": 477,
+      "byte_identical_pto_and_cpp": 56
+    },
+    {
+      "stage": 5,
+      "review": "accepted",
+      "reviewer": "/root/compact_sync_design_review",
+      "acceptance": "Host correctness and stated compactness/control-work contracts; not device/cache performance, native return semantics, or unsupported scheduling classes."
+    }
+  ],
+  "implementation": {
+    "owner": "AssignedRegionSchedule",
+    "planner": "PlanRegularSchedules / PlanInvocationSchedules",
+    "production_materializer": "CompileAssignedSchedule / ScheduleMaterializer",
+    "unchanged": [
+      "actual token parser authority",
+      "demand analysis",
+      "protocol",
+      "allocation",
+      "native exemptions",
+      "entry/return assumptions"
+    ],
+    "limitations": [
+      "literal positive INDEX loops without carried values",
+      "common nonunit ID period only; scoped nonunit schedules retain guarded lowering",
+      "no ID renaming",
+      "body/source growth is explicitly charged but not target-cache calibrated",
+      "no device qualification"
+    ]
+  },
+  "model_work_fields": [
+    "scalar_arithmetic_ops",
+    "scalar_comparisons",
+    "scalar_boolean_ops",
+    "conditions",
+    "scalar_evaluations",
+    "loop_header_work"
+  ],
+  "validation": {
+    "broad_gate": {
+      "command": [
+        "/usr/bin/python3",
+        "-m",
+        "pytest",
+        "tests/ut/ir/transforms/test_autosync_switch.py",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+        "tests/ut/ir/transforms/test_collective_sync_interface.py",
+        "tests/ut/ir/transforms/test_collective_sync_realization.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_cross_core_local_slots.py",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py",
+        "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+        "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+        "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+        "tests/ut/ir/transforms/test_invocation_token_sync.py",
+        "tests/ut/ir/transforms/test_logical_sync_realization.py",
+        "tests/ut/ir/transforms/test_logical_sync_verifier.py",
+        "tests/ut/ir/transforms/test_lower_host_tensor_collectives.py",
+        "tests/ut/ir/transforms/test_lower_l2_tensor_collectives.py",
+        "tests/ut/ir/transforms/test_lower_pipeline_to_slots.py",
+        "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+        "tests/ut/ir/transforms/test_parameterized_sync.py",
+        "tests/ut/ir/transforms/test_parameterized_token_sync.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+        "tests/ut/ir/transforms/test_regional_slot_composition.py",
+        "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py",
+        "tests/ut/ir/transforms/test_row_sync_analysis.py",
+        "tests/ut/ir/transforms/test_scoped_logical_sync.py",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+        "tests/ut/ir/transforms/test_scoped_token_families.py",
+        "tests/ut/ir/transforms/test_scoped_token_order.py",
+        "tests/ut/ir/transforms/test_slot_sync_import.py",
+        "tests/ut/ir/transforms/test_streamed_slot_composition.py",
+        "tests/ut/ir/transforms/test_structured_token_sync.py",
+        "tests/ut/ir/transforms/test_sync_command_control.py",
+        "tests/ut/ir/transforms/test_sync_cpp_order.py",
+        "tests/ut/ir/transforms/test_sync_cut_control.py",
+        "tests/ut/ir/transforms/test_sync_order_metrics.py",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/ir/transforms/test_verify_hard_syncall_occupancy.py",
+        "tests/ut/ir/transforms/test_sync_boundary_schedule.py",
+        "tests/ut/ir/transforms/test_regional_sync_schedule.py",
+        "-q"
+      ],
+      "returncode": 1,
+      "seconds": 1036.7685585138388,
+      "passed": 1614,
+      "failed": 21,
+      "warnings": 37,
+      "scope": "Initial full gate before Python oracle/expectation repairs; complete affected-file results below are separate.",
+      "log_sha256": "4944820c96d08b4f227b44bad5046361ed627bcae94ab0a870c4f5fb28fee125"
+    },
+    "reporting_fix": "Fixed original-frame reference retention in both qualification reporters. Refreshed final/qualification.json supersedes ordering rows in qualification-before-reference-fix.json. Generated code and internal coverage checks were unchanged.",
+    "emitted_cpp": {
+      "checks": 15,
+      "unavailable": [
+        {
+          "name": "vec",
+          "reason": "#if defined(__DAV_VEC__)"
+        },
+        {
+          "name": "rotating7",
+          "reason": "Direct Buffer delegated slot selection requires a qualified nonnegative canonical modulo\nCheck failed: func->GetAttr<bool>(ir::kAttrPyptoAutosync) || canonical_slots.unsupported_bases.empty() at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/codegen/pto/pto_buffer_codegen.cpp:523"
+        },
+        {
+          "name": "crossings",
+          "reason": "Direct Buffer delegated slot selection requires a qualified nonnegative canonical modulo\nCheck failed: func->GetAttr<bool>(ir::kAttrPyptoAutosync) || canonical_slots.unsupported_bases.empty() at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/codegen/pto/pto_buffer_codegen.cpp:523"
+        },
+        {
+          "name": "collective",
+          "reason": "#if defined(__DAV_VEC__)"
+        },
+        {
+          "name": "softmax",
+          "reason": "#if defined(__DAV_VEC__)"
+        },
+        {
+          "name": "nested",
+          "reason": "#if defined(__DAV_VEC__)"
+        }
+      ],
+      "receipt_sha256": "d6aa31ca0a3fa461c756a9f1bf557d7c37739fa68a23b997095367a58d09956a",
+      "scope": "Existing emitted-C++ checks are tied by source hashes to the byte-identical final build."
+    },
+    "differential": {
+      "fixtures": 28,
+      "ordered_traces": 477,
+      "independent_access_order_matching_reuse_executions": 9,
+      "cpp_outputs": 56,
+      "command": [
+        "/usr/bin/python3",
+        "-m",
+        "tests.ut.ir.transforms.qualify_sync_control",
+        "--baseline",
+        "build-py314/regional-schedule/m1",
+        "--output",
+        "build-py314/regional-schedule/final",
+        "--emit-cpp"
+      ],
+      "receipt_sha256": "ffae67616cfd80a4046d6385bfa08022bcc668d0ebe230fd1fb451ce4f380335",
+      "all_total_model_work_nonincreasing": true,
+      "generated_cpp_unchanged_after_oracle_repair": true,
+      "final_build_unchanged_after_style_repair": true
+    },
+    "affected_file_recheck": {
+      "passed": 373,
+      "warnings": 24,
+      "seconds": 341.32,
+      "original_failure_cases_rechecked": [
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py::test_large_trip_counts_do_not_expand_command_sites[streamed_fixture]",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py::test_large_trip_counts_do_not_expand_command_sites[resident_streamed_sequence]",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py::test_fixed_slot_interface_does_not_shift_entire_trip_history",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py::test_matrix_threshold_across_visits[3-shape0]",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py::test_full_output_projection_admits_proved_singleton_launch_frame",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py::test_fixed_lag_token_and_flag_size_independent_of_trip_count",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py::test_one_original_gate_up_program_covers_all_activation_boundaries[0-blocks0]",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py::test_one_original_gate_up_program_covers_all_activation_boundaries[3-blocks1]",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py::test_scoped_palette_refusal_is_not_claimed_as_minimum_capacity",
+        "tests/ut/ir/transforms/test_structured_token_sync.py::test_trip_counts_do_not_expand_physical_or_token_schemas",
+        "tests/ut/ir/transforms/test_sync_command_control.py::test_residue_selection_stays_compact_and_matches_original_accesses[7]",
+        "tests/ut/ir/transforms/test_sync_command_control.py::test_residue_selection_stays_compact_and_matches_original_accesses[70]",
+        "tests/ut/ir/transforms/test_sync_command_control.py::test_residue_selection_stays_compact_and_matches_original_accesses[7000]",
+        "tests/ut/ir/transforms/test_sync_command_control.py::test_residue_selection_stays_compact_and_matches_original_accesses[1000000]",
+        "tests/ut/ir/transforms/test_sync_command_control.py::test_qwen_whole_cut_coalescing_reduces_control_without_new_coloring[0-111]",
+        "tests/ut/ir/transforms/test_sync_command_control.py::test_qwen_whole_cut_coalescing_reduces_control_without_new_coloring[1-115]",
+        "tests/ut/ir/transforms/test_sync_command_control.py::test_qwen_whole_cut_coalescing_reduces_control_without_new_coloring[2-147]",
+        "tests/ut/ir/transforms/test_sync_command_control.py::test_qwen_whole_cut_coalescing_reduces_control_without_new_coloring[3-149]",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py::test_shared_recipe_modes_and_inplace[False-buffer.adds]",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py::test_shared_recipe_modes_and_inplace[True-buffer.adds]",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py::test_vec_compact_counts_do_not_expand"
+      ],
+      "new_tests": 2,
+      "log_sha256": "a595b503108896640fe80e83855daf7dd490c954d2ff6c300f6bb89e4194848c",
+      "junit_sha256": "a286909631612c9bfc0cf046a0f76bb79d35187ff2ea9b1fe09e885df81bcceb",
+      "command": [
+        "/usr/bin/python3",
+        "-m",
+        "pytest",
+        "tests/ut/ir/transforms/test_regional_sync_schedule.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+        "tests/ut/ir/transforms/test_structured_token_sync.py",
+        "tests/ut/ir/transforms/test_sync_command_control.py",
+        "-q",
+        "--junitxml=build-py314/regional-schedule/m5-affected-final.xml"
+      ],
+      "qualification": "Complete affected files; not a fresh all-green full-suite run. No production semantic changes were needed for initial failures."
+    },
+    "accounting": {
+      "fixtures": 28,
+      "independent_checks": 21,
+      "all_checked": true,
+      "command": [
+        "/usr/bin/python3",
+        "-m",
+        "tests.ut.ir.transforms.qualify_sync_accounting",
+        "--output",
+        "build-py314/regional-schedule/accounting"
+      ],
+      "receipt_sha256": "a88d3fb5de251874226c02248513b1ad8491b0c7cc91003b3a10b57fce96040b",
+      "scope": "Separate audit reconstruction/production timings; not additive. Ran before style-only rebuild, whose inventories and commands are identical."
+    },
+    "static_checks": {
+      "ruff": "passed",
+      "clang_format": "passed",
+      "cpplint": "passed",
+      "markdownlint": "four EN/ZH pages passed",
+      "pyright": "0 errors,0 warnings; repository checking policy with explicit installed Python3.14 site-packages path",
+      "git_diff_check": "passed",
+      "pyright_config_sha256": "ab4d5c9b5552cc832fccffff5e13523584c6716e58451805f4ce760a98099f44"
+    },
+    "final_style_rebuild": {
+      "changes": "Explicit integer casts and braces only in C++; test annotations and integer loop-bound assertion; documentation table formatting.",
+      "build_command": [
+        "cmake",
+        "--build",
+        "build-py314",
+        "--parallel",
+        "1"
+      ],
+      "extension_sha256": "7830b40dce7074863db71fb5e7d1c8ef9951c10bd61355641663bfc30f9cf9b0",
+      "focused_passed": 104,
+      "warnings": 4,
+      "seconds": 2.88,
+      "test_command": [
+        "/usr/bin/python3",
+        "-m",
+        "pytest",
+        "tests/ut/ir/transforms/test_regional_sync_schedule.py",
+        "tests/ut/ir/transforms/test_sync_boundary_schedule.py",
+        "tests/ut/ir/transforms/test_sync_command_control.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "-q"
+      ],
+      "test_log_sha256": "a7fdeda6ee0bc08cd5f6b0d7dda9c22d116d097037c3ecc698cc8db16d9d0e4e",
+      "build_log_sha256": "4d9fe76ebc9eec69407317ccd8282f04f78ff4142bdcbde5b8178e0ab15cb68d",
+      "generated_cpp_byte_identical": 56,
+      "unchanged_inventories_and_audits": 28,
+      "identical_trace_metrics_and_ordering": 477
+    },
+    "static_check_logs": {
+      "m5-cpplint.log": "88b0808f6d8a234b637e4be6a9dc71b05999b50d410a704e8eff391d2df101e2",
+      "m5-markdownlint.log": "bd79267a674f1d4381265480292e13bcddb9f44f8530d9b22af69387a9e94ddc",
+      "m5-pyright.log": "6d88a1b220adb7a3d62092b6e38431f0b3fe8babe9864fab90e5849766260332",
+      "m5-ruff.log": "18574f3cdcb6f41ca7c41bee5d17496dc46c80fe90f246b849331293b664f63a"
+    },
+    "m3_actual_token_gate": {
+      "passed": 151,
+      "warnings": 4,
+      "seconds": 484.6,
+      "log_sha256": "49aac5c543ebf2633f6fc07688a17ef0b0c588bc9798fc3d67090a1ee6dbcd30",
+      "scope": "Recorded preceding stage actual-token gate; final source changes separately qualified."
+    }
+  },
+  "artifacts": "build-py314/regional-schedule",
+  "device_validation": false,
+  "measurements": [
+    {
+      "name": "matmul_64",
+      "input_sha256": "5b5176ea7001f3a804d7b95b47536d72bb1f8109ba09b9ca93df26ceb09f60ea",
+      "production_seconds_single_run": 0.0005278810858726501,
+      "before": {
+        "system.set_flag": 4,
+        "system.wait_flag": 4,
+        "distinct_guard_expressions": 0
+      },
+      "after": {
+        "system.set_flag": 4,
+        "system.wait_flag": 4,
+        "distinct_guard_expressions": 0
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "8e22e513cfd0b53786af732eb64a531e747ea1974bd17ce7b1ac4b3a6eb9f4c9",
+        "bytes": 6723,
+        "body_if_sites": 0,
+        "body_set_sites": 4,
+        "body_wait_sites": 4,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "8e22e513cfd0b53786af732eb64a531e747ea1974bd17ce7b1ac4b3a6eb9f4c9",
+        "bytes": 6723,
+        "body_if_sites": 0,
+        "body_set_sites": 4,
+        "body_wait_sites": 4,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": true,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "system.set_flag": 4,
+            "system.wait_flag": 4
+          },
+          "total_model_work": 0
+        },
+        "after": {
+          "counts": {
+            "system.set_flag": 4,
+            "system.wait_flag": 4
+          },
+          "total_model_work": 0
+        }
+      }
+    },
+    {
+      "name": "matmul_acc_64",
+      "input_sha256": "02d52a390b8643c140b9554efc9e10088fa317297350311e722966da04973230",
+      "production_seconds_single_run": 0.0006324327550828457,
+      "before": {
+        "system.set_flag": 10,
+        "system.wait_flag": 10,
+        "distinct_guard_expressions": 0
+      },
+      "after": {
+        "system.set_flag": 10,
+        "system.wait_flag": 10,
+        "distinct_guard_expressions": 0
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "304b35c614c81bbcafa8027ea6798f436e3d2dc88f3c9a6505017e989a10e365",
+        "bytes": 8430,
+        "body_if_sites": 0,
+        "body_set_sites": 10,
+        "body_wait_sites": 10,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "304b35c614c81bbcafa8027ea6798f436e3d2dc88f3c9a6505017e989a10e365",
+        "bytes": 8430,
+        "body_if_sites": 0,
+        "body_set_sites": 10,
+        "body_wait_sites": 10,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": true,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "system.set_flag": 10,
+            "system.wait_flag": 10
+          },
+          "total_model_work": 0
+        },
+        "after": {
+          "counts": {
+            "system.set_flag": 10,
+            "system.wait_flag": 10
+          },
+          "total_model_work": 0
+        }
+      }
+    },
+    {
+      "name": "ddr_split_k",
+      "input_sha256": "efb9bf6cbcb403638db2b80e4df84ad75eec56c977346b4b7431490d6e971db1",
+      "production_seconds_single_run": 0.0013448330573737621,
+      "before": {
+        "system.set_flag": 15,
+        "if_sites": 18,
+        "guard_expression_visits": 68,
+        "largest_guard_nodes": 5,
+        "system.wait_flag": 15,
+        "distinct_guard_expressions": 6
+      },
+      "after": {
+        "system.set_flag": 19,
+        "system.wait_flag": 19,
+        "if_sites": 4,
+        "guard_expression_visits": 12,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 4
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "653df72648a6cc9ea03c31b7777fe126b4e4d927971f29ad544a2717fd8e0585",
+        "bytes": 11361,
+        "body_if_sites": 18,
+        "body_set_sites": 15,
+        "body_wait_sites": 15,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "7d2a9c9fdf7ce755f4a7838dce52656a983fd6ec36371817bf9accaff2a2c75c",
+        "bytes": 11629,
+        "body_if_sites": 0,
+        "body_set_sites": 19,
+        "body_wait_sites": 19,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": true,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "system.set_flag": 19,
+            "loop_entries": 2,
+            "loop_iterations": 4,
+            "loop_header_work": 12,
+            "scalar_comparisons": 36,
+            "scalar_arithmetic_ops": 14,
+            "conditions": 36,
+            "inactive_conditions": 18,
+            "condition_nodes": 136,
+            "system.wait_flag": 19
+          },
+          "total_model_work": 98
+        },
+        "after": {
+          "counts": {
+            "system.set_flag": 19,
+            "loop_entries": 4,
+            "loop_iterations": 4,
+            "loop_header_work": 16,
+            "system.wait_flag": 19,
+            "scalar_comparisons": 4,
+            "conditions": 4,
+            "inactive_conditions": 2,
+            "condition_nodes": 12
+          },
+          "total_model_work": 24
+        }
+      }
+    },
+    {
+      "name": "vec",
+      "input_sha256": "c08b85f7a9a7592a8753e32c72463bd7b6bebdea0113931242fa67187b340e21",
+      "production_seconds_single_run": 0.0006932779215276241,
+      "before": {
+        "system.set_flag": 2,
+        "system.wait_flag": 2,
+        "system.bar_v": 1,
+        "distinct_guard_expressions": 0
+      },
+      "after": {
+        "system.set_flag": 2,
+        "system.wait_flag": 2,
+        "system.bar_v": 1,
+        "distinct_guard_expressions": 0
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "02452e29dff1cf692814c41a20df0de06a294dd11ec7f83ad56213a740f81c39",
+        "bytes": 5720,
+        "body_if_sites": 0,
+        "body_set_sites": 2,
+        "body_wait_sites": 2,
+        "body_barrier_sites": 1
+      },
+      "cpp_after": {
+        "source_sha256": "02452e29dff1cf692814c41a20df0de06a294dd11ec7f83ad56213a740f81c39",
+        "bytes": 5720,
+        "body_if_sites": 0,
+        "body_set_sites": 2,
+        "body_wait_sites": 2,
+        "body_barrier_sites": 1
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": true,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "system.set_flag": 2,
+            "system.wait_flag": 2,
+            "system.bar_v": 1
+          },
+          "total_model_work": 0
+        },
+        "after": {
+          "counts": {
+            "system.set_flag": 2,
+            "system.wait_flag": 2,
+            "system.bar_v": 1
+          },
+          "total_model_work": 0
+        }
+      }
+    },
+    {
+      "name": "rotating7",
+      "input_sha256": "bfa36657fbdd669941e138f3b4a694960e0a4bda15ff7f5947d57a0618bf6362",
+      "production_seconds_single_run": 0.00209415378049016,
+      "before": {
+        "if_sites": 20,
+        "guard_expression_visits": 102,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 9,
+        "system.set_flag": 9,
+        "distinct_guard_expressions": 8
+      },
+      "after": {
+        "system.set_flag": 18,
+        "system.wait_flag": 15,
+        "scalar_definitions": 2,
+        "scalar_expression_visits": 6,
+        "if_sites": 19,
+        "guard_expression_visits": 99,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 7
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "c3d2430023b7a95f0298ec29cfc4b8a00002099a46e0bb6dd322c0cb32966cc3",
+        "bytes": 7650,
+        "body_if_sites": 20,
+        "body_set_sites": 9,
+        "body_wait_sites": 9,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "594b1bca09960287ee57cf1e345e2840f5bbedcd2422f8cfeacb69f77a13e7c1",
+        "bytes": 13464,
+        "body_if_sites": 19,
+        "body_set_sites": 18,
+        "body_wait_sites": 15,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": true,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "loop_entries": 1,
+            "loop_iterations": 7,
+            "loop_header_work": 16,
+            "scalar_comparisons": 80,
+            "conditions": 80,
+            "inactive_conditions": 36,
+            "condition_nodes": 386,
+            "scalar_arithmetic_ops": 73,
+            "system.set_flag": 18,
+            "system.wait_flag": 18
+          },
+          "total_model_work": 249
+        },
+        "after": {
+          "counts": {
+            "loop_entries": 2,
+            "loop_iterations": 5,
+            "loop_header_work": 14,
+            "system.set_flag": 18,
+            "system.wait_flag": 18,
+            "scalar_arithmetic_ops": 45,
+            "scalar_evaluations": 2,
+            "scalar_value_nodes": 6,
+            "scalar_comparisons": 40,
+            "conditions": 40,
+            "inactive_conditions": 18,
+            "condition_nodes": 206
+          },
+          "total_model_work": 141
+        }
+      }
+    },
+    {
+      "name": "crossings",
+      "input_sha256": "e574bc0772bab4b8e61ae384d1e8ccbefa8ae8e4a8def195c5d419946894509a",
+      "production_seconds_single_run": 0.00295077683404088,
+      "before": {
+        "if_sites": 36,
+        "guard_expression_visits": 162,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 14,
+        "system.set_flag": 14,
+        "distinct_guard_expressions": 25
+      },
+      "after": {
+        "system.set_flag": 17,
+        "system.wait_flag": 17,
+        "scalar_definitions": 2,
+        "scalar_expression_visits": 6,
+        "if_sites": 30,
+        "guard_expression_visits": 138,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 23
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "bd7fe69c15641a9e94ddf960c29d2538732a27c57ec88abc32da74d48f8a9fb1",
+        "bytes": 9048,
+        "body_if_sites": 36,
+        "body_set_sites": 14,
+        "body_wait_sites": 14,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "19a5a22c341c5adc54c596be795416c72ede213ee511c1174e140413c12acf38",
+        "bytes": 9906,
+        "body_if_sites": 30,
+        "body_set_sites": 17,
+        "body_wait_sites": 17,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": true,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "loop_entries": 2,
+            "loop_iterations": 11,
+            "loop_header_work": 26,
+            "scalar_comparisons": 127,
+            "conditions": 127,
+            "inactive_conditions": 67,
+            "condition_nodes": 519,
+            "scalar_arithmetic_ops": 69,
+            "system.set_flag": 19,
+            "system.wait_flag": 19
+          },
+          "total_model_work": 349
+        },
+        "after": {
+          "counts": {
+            "loop_entries": 3,
+            "loop_iterations": 9,
+            "loop_header_work": 24,
+            "system.set_flag": 19,
+            "system.wait_flag": 19,
+            "scalar_arithmetic_ops": 53,
+            "scalar_evaluations": 2,
+            "scalar_value_nodes": 6,
+            "scalar_comparisons": 85,
+            "conditions": 85,
+            "inactive_conditions": 43,
+            "condition_nodes": 357
+          },
+          "total_model_work": 249
+        }
+      }
+    },
+    {
+      "name": "collective",
+      "input_sha256": "0adc630d207f65a8e5d1689a728ad05537fc08dcf10317f4a579dffc2db1278d",
+      "production_seconds_single_run": 0.0010395939461886883,
+      "before": {
+        "scalar_definitions": 1,
+        "scalar_expression_visits": 1,
+        "if_sites": 4,
+        "guard_expression_visits": 12,
+        "largest_guard_nodes": 3,
+        "system.wait_flag": 2,
+        "system.set_flag": 2,
+        "distinct_guard_expressions": 4
+      },
+      "after": {
+        "scalar_definitions": 1,
+        "scalar_expression_visits": 1,
+        "if_sites": 4,
+        "guard_expression_visits": 12,
+        "largest_guard_nodes": 3,
+        "system.wait_flag": 2,
+        "system.set_flag": 2,
+        "distinct_guard_expressions": 4
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "0ff3064a19ccd49dcd680b4a633e89e4d046304bd2e54eb2413cfd76332ab29a",
+        "bytes": 5251,
+        "body_if_sites": 4,
+        "body_set_sites": 2,
+        "body_wait_sites": 2,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "0ff3064a19ccd49dcd680b4a633e89e4d046304bd2e54eb2413cfd76332ab29a",
+        "bytes": 5251,
+        "body_if_sites": 4,
+        "body_set_sites": 2,
+        "body_wait_sites": 2,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": true,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "loop_entries": 4,
+            "loop_iterations": 18,
+            "loop_header_work": 44,
+            "scalar_evaluations": 3,
+            "scalar_value_nodes": 3,
+            "scalar_comparisons": 43,
+            "conditions": 43,
+            "inactive_conditions": 26,
+            "condition_nodes": 129,
+            "system.set_flag": 5,
+            "system.wait_flag": 5
+          },
+          "total_model_work": 133
+        },
+        "after": {
+          "counts": {
+            "loop_entries": 4,
+            "loop_iterations": 18,
+            "loop_header_work": 44,
+            "scalar_evaluations": 3,
+            "scalar_value_nodes": 3,
+            "scalar_comparisons": 43,
+            "conditions": 43,
+            "inactive_conditions": 26,
+            "condition_nodes": 129,
+            "system.set_flag": 5,
+            "system.wait_flag": 5
+          },
+          "total_model_work": 133
+        }
+      }
+    },
+    {
+      "name": "softmax",
+      "input_sha256": "1318c22d858e94cd460a0ff87294108a8d180a54ad0d0d2b76bd924897165e03",
+      "production_seconds_single_run": 0.0008443989790976048,
+      "before": {
+        "system.set_flag": 2,
+        "system.wait_flag": 2,
+        "system.bar_v": 4,
+        "distinct_guard_expressions": 0
+      },
+      "after": {
+        "system.set_flag": 2,
+        "system.wait_flag": 2,
+        "system.bar_v": 4,
+        "distinct_guard_expressions": 0
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "dd3e495aff3789b9abf79ac2c32773c4045db5774614ec6e0f138db1715d1cfb",
+        "bytes": 5050,
+        "body_if_sites": 0,
+        "body_set_sites": 2,
+        "body_wait_sites": 2,
+        "body_barrier_sites": 4
+      },
+      "cpp_after": {
+        "source_sha256": "dd3e495aff3789b9abf79ac2c32773c4045db5774614ec6e0f138db1715d1cfb",
+        "bytes": 5050,
+        "body_if_sites": 0,
+        "body_set_sites": 2,
+        "body_wait_sites": 2,
+        "body_barrier_sites": 4
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": true,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "system.set_flag": 2,
+            "system.wait_flag": 2,
+            "system.bar_v": 4
+          },
+          "total_model_work": 0
+        },
+        "after": {
+          "counts": {
+            "system.set_flag": 2,
+            "system.wait_flag": 2,
+            "system.bar_v": 4
+          },
+          "total_model_work": 0
+        }
+      }
+    },
+    {
+      "name": "nested",
+      "input_sha256": "aa9cdb3428dda25bcd928943ba4561b79d6098ff874115a60ffe67b68941efd5",
+      "production_seconds_single_run": 0.0015360661782324314,
+      "before": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 10,
+        "guard_expression_visits": 30,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 6
+      },
+      "after": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 6,
+        "guard_expression_visits": 18,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 4
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "e8b430e3d24b872a29f081db3ffdc80d0b1628ab6273eddb418f580bac869ab7",
+        "bytes": 6695,
+        "body_if_sites": 10,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "479e1f7213c9ae8cc4e6f0122015b850675545d9d9b15d3415b7e45e52e33c2f",
+        "bytes": 6387,
+        "body_if_sites": 6,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": true,
+      "representative": {
+        "parameters": {
+          "1": 0,
+          "3": 128
+        },
+        "block": null,
+        "before": {
+          "counts": {
+            "system.set_flag": 15,
+            "system.wait_flag": 15,
+            "loop_entries": 3,
+            "loop_iterations": 8,
+            "loop_header_work": 22,
+            "scalar_comparisons": 48,
+            "conditions": 48,
+            "inactive_conditions": 24,
+            "condition_nodes": 144
+          },
+          "total_model_work": 118
+        },
+        "after": {
+          "counts": {
+            "system.set_flag": 15,
+            "system.wait_flag": 15,
+            "loop_entries": 3,
+            "loop_iterations": 8,
+            "loop_header_work": 22,
+            "scalar_comparisons": 20,
+            "conditions": 20,
+            "inactive_conditions": 8,
+            "condition_nodes": 60
+          },
+          "total_model_work": 62
+        }
+      }
+    },
+    {
+      "name": "lib_matmul",
+      "input_sha256": "c3b5ccdcff89f9af1e699a1ab9f6b45ade70fa81089ec8b70dbb7e5dbb771f83",
+      "production_seconds_single_run": 0.0005669756792485714,
+      "before": {
+        "system.set_flag": 5,
+        "system.wait_flag": 5,
+        "distinct_guard_expressions": 0
+      },
+      "after": {
+        "system.set_flag": 5,
+        "system.wait_flag": 5,
+        "distinct_guard_expressions": 0
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "7f7a4ae201aa3d8ead8a3f33a645025e96488e00a9471f865585ebb3f8f2e384",
+        "bytes": 8351,
+        "body_if_sites": 0,
+        "body_set_sites": 5,
+        "body_wait_sites": 5,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "7f7a4ae201aa3d8ead8a3f33a645025e96488e00a9471f865585ebb3f8f2e384",
+        "bytes": 8351,
+        "body_if_sites": 0,
+        "body_set_sites": 5,
+        "body_wait_sites": 5,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "1": 0,
+          "3": 0
+        },
+        "block": null,
+        "before": {
+          "counts": {
+            "system.set_flag": 5,
+            "system.wait_flag": 5
+          },
+          "total_model_work": 0
+        },
+        "after": {
+          "counts": {
+            "system.set_flag": 5,
+            "system.wait_flag": 5
+          },
+          "total_model_work": 0
+        }
+      }
+    },
+    {
+      "name": "lib_gemm",
+      "input_sha256": "dd6417148f089e6da8c57d8d7a3b4ac420e4105136d075de35d4f6805e5591eb",
+      "production_seconds_single_run": 0.0009031030349433422,
+      "before": {
+        "scalar_definitions": 1,
+        "scalar_expression_visits": 3,
+        "if_sites": 8,
+        "guard_expression_visits": 24,
+        "largest_guard_nodes": 3,
+        "system.wait_flag": 7,
+        "system.set_flag": 7,
+        "distinct_guard_expressions": 4
+      },
+      "after": {
+        "scalar_definitions": 1,
+        "scalar_expression_visits": 3,
+        "if_sites": 8,
+        "guard_expression_visits": 24,
+        "largest_guard_nodes": 3,
+        "system.wait_flag": 7,
+        "system.set_flag": 7,
+        "distinct_guard_expressions": 4
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "f1affb48cee461fceb15e9b66140e2ebac3b36c354a9b35d1ebcdd553d1a62ba",
+        "bytes": 8336,
+        "body_if_sites": 8,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "f1affb48cee461fceb15e9b66140e2ebac3b36c354a9b35d1ebcdd553d1a62ba",
+        "bytes": 8336,
+        "body_if_sites": 8,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "1": 0,
+          "3": 0
+        },
+        "block": null,
+        "before": {
+          "counts": {
+            "loop_entries": 1,
+            "loop_iterations": 4,
+            "loop_header_work": 10,
+            "scalar_arithmetic_ops": 4,
+            "scalar_evaluations": 4,
+            "scalar_value_nodes": 12,
+            "scalar_comparisons": 32,
+            "conditions": 32,
+            "inactive_conditions": 12,
+            "condition_nodes": 96,
+            "system.set_flag": 22,
+            "system.wait_flag": 22
+          },
+          "total_model_work": 82
+        },
+        "after": {
+          "counts": {
+            "loop_entries": 1,
+            "loop_iterations": 4,
+            "loop_header_work": 10,
+            "scalar_arithmetic_ops": 4,
+            "scalar_evaluations": 4,
+            "scalar_value_nodes": 12,
+            "scalar_comparisons": 32,
+            "conditions": 32,
+            "inactive_conditions": 12,
+            "condition_nodes": 96,
+            "system.set_flag": 22,
+            "system.wait_flag": 22
+          },
+          "total_model_work": 82
+        }
+      }
+    },
+    {
+      "name": "qwen_output_b3_h512",
+      "input_sha256": "85511ce48a58cfb06e91c86d2c3ea1b4136fb2c8cd25b0d3413f9d0184b52c24",
+      "production_seconds_single_run": 0.002709232736378908,
+      "before": {
+        "scalar_definitions": 2,
+        "scalar_expression_visits": 4,
+        "system.set_flag": 13,
+        "system.wait_flag": 13,
+        "if_sites": 11,
+        "guard_expression_visits": 33,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 6
+      },
+      "after": {
+        "scalar_definitions": 2,
+        "scalar_expression_visits": 4,
+        "system.set_flag": 25,
+        "system.wait_flag": 25,
+        "if_sites": 3,
+        "guard_expression_visits": 9,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 3
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 25,
+          "wait_sites": 25,
+          "barrier_sites": 0,
+          "guard_sites": 0
+        },
+        "constructed_guard_sites": 0,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 118,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 22,
+        "cut_case_comparisons": 50,
+        "coalesced_cut_cases": 0,
+        "case_sequence_visits": 0,
+        "case_sequence_comparisons": 0,
+        "factored_case_cuts": 0,
+        "shared_disjoint_case_cuts": 0,
+        "endpoint_domain_entries": 36,
+        "normalized_endpoint_bounds": 0,
+        "endpoint_predicates_constructed": 0,
+        "control_descriptors": 174,
+        "assigned_schedule_endpoints": 26,
+        "invocation_scheduled_loops": 0,
+        "invocation_schedule_groups": 0,
+        "invocation_schedule_visits": 190,
+        "invocation_schedule_comparisons": 0,
+        "invocation_schedule_model_saving": 0,
+        "regular_schedule_candidates": 2,
+        "regular_schedule_loops": 2,
+        "regular_schedule_boundaries": 8,
+        "regular_schedule_body_copies": 6,
+        "regular_schedule_payload_copies": 36,
+        "regular_schedule_model_saving": 16,
+        "materialized_control_statements": 100,
+        "control_expression_visits": 0,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 0,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "237999c27a17113a32d7c867ac37cac90886abd3d2637f208f2e68a8fa36f260",
+        "bytes": 14992,
+        "body_if_sites": 11,
+        "body_set_sites": 13,
+        "body_wait_sites": 13,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "a76d2358c84a2f3ac7e140ced03b6dd9103212d8728917ec344f3786cf22f9a6",
+        "bytes": 17889,
+        "body_if_sites": 1,
+        "body_set_sites": 25,
+        "body_wait_sites": 25,
+        "body_barrier_sites": 0
+      },
+      "executions": 40,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 2,
+            "scalar_value_nodes": 4,
+            "loop_entries": 3,
+            "loop_iterations": 9,
+            "loop_header_work": 24,
+            "scalar_arithmetic_ops": 1,
+            "system.set_flag": 33,
+            "system.wait_flag": 33,
+            "scalar_comparisons": 44,
+            "conditions": 44,
+            "inactive_conditions": 17,
+            "condition_nodes": 132
+          },
+          "total_model_work": 115
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 2,
+            "scalar_value_nodes": 4,
+            "loop_entries": 7,
+            "loop_iterations": 9,
+            "loop_header_work": 32,
+            "scalar_arithmetic_ops": 1,
+            "system.set_flag": 33,
+            "system.wait_flag": 33,
+            "scalar_comparisons": 4,
+            "conditions": 4,
+            "inactive_conditions": 3,
+            "condition_nodes": 12
+          },
+          "total_model_work": 43
+        }
+      }
+    },
+    {
+      "name": "qwen_gate_up_b0_h512",
+      "input_sha256": "a363a12bbac630d1b3d04efc83c046dd9a872fa61eab28bef6ec674e5f9e9bcc",
+      "production_seconds_single_run": 0.010367671959102154,
+      "before": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 15,
+        "system.set_flag": 39,
+        "system.wait_flag": 39,
+        "if_sites": 54,
+        "guard_expression_visits": 162,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 18
+      },
+      "after": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 15,
+        "system.set_flag": 80,
+        "system.wait_flag": 79,
+        "if_sites": 29,
+        "guard_expression_visits": 95,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 18
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 105,
+          "wait_sites": 105,
+          "barrier_sites": 0,
+          "guard_sites": 0
+        },
+        "constructed_guard_sites": 0,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 502,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 44,
+        "cut_case_comparisons": 141,
+        "coalesced_cut_cases": 0,
+        "case_sequence_visits": 649,
+        "case_sequence_comparisons": 66,
+        "factored_case_cuts": 34,
+        "shared_disjoint_case_cuts": 0,
+        "endpoint_domain_entries": 146,
+        "normalized_endpoint_bounds": 0,
+        "endpoint_predicates_constructed": 0,
+        "control_descriptors": 904,
+        "assigned_schedule_endpoints": 114,
+        "invocation_scheduled_loops": 2,
+        "invocation_schedule_groups": 6,
+        "invocation_schedule_visits": 750,
+        "invocation_schedule_comparisons": 0,
+        "invocation_schedule_model_saving": 60,
+        "regular_schedule_candidates": 4,
+        "regular_schedule_loops": 4,
+        "regular_schedule_boundaries": 16,
+        "regular_schedule_body_copies": 24,
+        "regular_schedule_payload_copies": 144,
+        "regular_schedule_model_saving": 32,
+        "materialized_control_statements": 328,
+        "control_expression_visits": 576,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 0,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "f7807f7a06298b88524689c83f60903e6a30f68cc6ffc25eedb698b57362ecaa",
+        "bytes": 26812,
+        "body_if_sites": 51,
+        "body_set_sites": 39,
+        "body_wait_sites": 39,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "2e7ba080e0126c65c3748788a72f586cc1110408d02be2b2a7e5e2dbf8ef263f",
+        "bytes": 42814,
+        "body_if_sites": 20,
+        "body_set_sites": 80,
+        "body_wait_sites": 79,
+        "body_barrier_sites": 0
+      },
+      "executions": 48,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 4,
+            "scalar_value_nodes": 12,
+            "scalar_arithmetic_ops": 4,
+            "loop_entries": 4,
+            "loop_iterations": 9,
+            "loop_header_work": 26,
+            "system.set_flag": 33,
+            "system.wait_flag": 33,
+            "scalar_comparisons": 61,
+            "conditions": 61,
+            "inactive_conditions": 34,
+            "condition_nodes": 183
+          },
+          "total_model_work": 156
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 4,
+            "scalar_value_nodes": 12,
+            "scalar_arithmetic_ops": 4,
+            "loop_entries": 8,
+            "loop_iterations": 9,
+            "loop_header_work": 34,
+            "system.set_flag": 33,
+            "system.wait_flag": 33,
+            "scalar_comparisons": 9,
+            "conditions": 9,
+            "inactive_conditions": 8,
+            "condition_nodes": 27
+          },
+          "total_model_work": 60
+        }
+      }
+    },
+    {
+      "name": "qwen_gate_up_b1_h512",
+      "input_sha256": "7d8ae3de450ee48bc796e2b3af358709bb644b82fb81f58268787b61cca644d4",
+      "production_seconds_single_run": 0.012714666780084372,
+      "before": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 21,
+        "system.set_flag": 39,
+        "system.wait_flag": 39,
+        "if_sites": 56,
+        "guard_expression_visits": 180,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 18
+      },
+      "after": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 21,
+        "system.set_flag": 80,
+        "system.wait_flag": 79,
+        "if_sites": 31,
+        "guard_expression_visits": 121,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 17
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 130,
+          "wait_sites": 130,
+          "barrier_sites": 0,
+          "guard_sites": 0
+        },
+        "constructed_guard_sites": 0,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 620,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 65,
+        "cut_case_comparisons": 191,
+        "coalesced_cut_cases": 48,
+        "case_sequence_visits": 685,
+        "case_sequence_comparisons": 72,
+        "factored_case_cuts": 34,
+        "shared_disjoint_case_cuts": 0,
+        "endpoint_domain_entries": 182,
+        "normalized_endpoint_bounds": 0,
+        "endpoint_predicates_constructed": 0,
+        "control_descriptors": 1078,
+        "assigned_schedule_endpoints": 140,
+        "invocation_scheduled_loops": 2,
+        "invocation_schedule_groups": 6,
+        "invocation_schedule_visits": 860,
+        "invocation_schedule_comparisons": 144,
+        "invocation_schedule_model_saving": 56,
+        "regular_schedule_candidates": 4,
+        "regular_schedule_loops": 4,
+        "regular_schedule_boundaries": 16,
+        "regular_schedule_body_copies": 24,
+        "regular_schedule_payload_copies": 144,
+        "regular_schedule_model_saving": 32,
+        "materialized_control_statements": 332,
+        "control_expression_visits": 594,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 0,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "44bc52e793d0e8735535ed9563ff2cf95a52442e696a83cbde15755b44609964",
+        "bytes": 27260,
+        "body_if_sites": 53,
+        "body_set_sites": 39,
+        "body_wait_sites": 39,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "5159459935e70a8e8c4ca82a7106064cdcb48f1d9104552f1fcaa2ab636bc1e8",
+        "bytes": 43255,
+        "body_if_sites": 22,
+        "body_set_sites": 80,
+        "body_wait_sites": 79,
+        "body_barrier_sites": 0
+      },
+      "executions": 48,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 4,
+            "scalar_value_nodes": 16,
+            "scalar_arithmetic_ops": 6,
+            "loop_entries": 4,
+            "loop_iterations": 9,
+            "loop_header_work": 26,
+            "system.set_flag": 33,
+            "system.wait_flag": 33,
+            "scalar_comparisons": 70,
+            "conditions": 61,
+            "inactive_conditions": 34,
+            "condition_nodes": 219,
+            "scalar_boolean_ops": 9
+          },
+          "total_model_work": 176
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 4,
+            "scalar_value_nodes": 16,
+            "scalar_arithmetic_ops": 6,
+            "loop_entries": 8,
+            "loop_iterations": 9,
+            "loop_header_work": 34,
+            "system.set_flag": 33,
+            "system.wait_flag": 33,
+            "scalar_comparisons": 12,
+            "conditions": 9,
+            "inactive_conditions": 8,
+            "condition_nodes": 39,
+            "scalar_boolean_ops": 3
+          },
+          "total_model_work": 68
+        }
+      }
+    },
+    {
+      "name": "qwen_gate_up_b2_h512",
+      "input_sha256": "c277b57f2663306f6ec2d9cc88f64495397005cee6ac09618a26e917cd588cd4",
+      "production_seconds_single_run": 0.016275012865662575,
+      "before": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 21,
+        "system.set_flag": 47,
+        "system.wait_flag": 48,
+        "if_sites": 73,
+        "guard_expression_visits": 255,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 17
+      },
+      "after": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 21,
+        "system.set_flag": 84,
+        "system.wait_flag": 79,
+        "if_sites": 33,
+        "guard_expression_visits": 151,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 16
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 160,
+          "wait_sites": 160,
+          "barrier_sites": 0,
+          "guard_sites": 0
+        },
+        "constructed_guard_sites": 0,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 768,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 84,
+        "cut_case_comparisons": 248,
+        "coalesced_cut_cases": 66,
+        "case_sequence_visits": 1532,
+        "case_sequence_comparisons": 200,
+        "factored_case_cuts": 34,
+        "shared_disjoint_case_cuts": 9,
+        "endpoint_domain_entries": 220,
+        "normalized_endpoint_bounds": 0,
+        "endpoint_predicates_constructed": 0,
+        "control_descriptors": 1468,
+        "assigned_schedule_endpoints": 176,
+        "invocation_scheduled_loops": 2,
+        "invocation_schedule_groups": 6,
+        "invocation_schedule_visits": 1122,
+        "invocation_schedule_comparisons": 144,
+        "invocation_schedule_model_saving": 64,
+        "regular_schedule_candidates": 4,
+        "regular_schedule_loops": 4,
+        "regular_schedule_boundaries": 16,
+        "regular_schedule_body_copies": 24,
+        "regular_schedule_payload_copies": 144,
+        "regular_schedule_model_saving": 32,
+        "materialized_control_statements": 344,
+        "control_expression_visits": 1250,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 0,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "4f5a8c336dbb08250495af22fc6db7eb26a2f271ed8473a63c1885f3e327034c",
+        "bytes": 29691,
+        "body_if_sites": 70,
+        "body_set_sites": 47,
+        "body_wait_sites": 48,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "03ec2f762a957d932b89ba110c05fb91702ee06b8a26bcc6ccca23a5964e0220",
+        "bytes": 43588,
+        "body_if_sites": 24,
+        "body_set_sites": 84,
+        "body_wait_sites": 79,
+        "body_barrier_sites": 0
+      },
+      "executions": 48,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 5,
+            "scalar_value_nodes": 21,
+            "scalar_arithmetic_ops": 8,
+            "loop_entries": 6,
+            "loop_iterations": 18,
+            "loop_header_work": 48,
+            "system.set_flag": 71,
+            "system.wait_flag": 71,
+            "scalar_comparisons": 196,
+            "conditions": 175,
+            "inactive_conditions": 49,
+            "condition_nodes": 609,
+            "scalar_boolean_ops": 21
+          },
+          "total_model_work": 453
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 5,
+            "scalar_value_nodes": 21,
+            "scalar_arithmetic_ops": 8,
+            "loop_entries": 14,
+            "loop_iterations": 18,
+            "loop_header_work": 64,
+            "system.set_flag": 71,
+            "system.wait_flag": 71,
+            "scalar_comparisons": 34,
+            "conditions": 23,
+            "inactive_conditions": 6,
+            "condition_nodes": 113,
+            "scalar_boolean_ops": 11
+          },
+          "total_model_work": 145
+        }
+      }
+    },
+    {
+      "name": "qwen_gate_up_b3_h512",
+      "input_sha256": "3475d0c9deba619c241636e52f789f8337a7a68698ac0da323d754c5a300ed34",
+      "production_seconds_single_run": 0.013946839608252048,
+      "before": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 21,
+        "system.set_flag": 47,
+        "system.wait_flag": 47,
+        "if_sites": 72,
+        "guard_expression_visits": 232,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 19
+      },
+      "after": {
+        "scalar_definitions": 5,
+        "scalar_expression_visits": 21,
+        "system.set_flag": 84,
+        "system.wait_flag": 79,
+        "if_sites": 33,
+        "guard_expression_visits": 131,
+        "largest_guard_nodes": 7,
+        "distinct_guard_expressions": 19
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 130,
+          "wait_sites": 130,
+          "barrier_sites": 0,
+          "guard_sites": 0
+        },
+        "constructed_guard_sites": 0,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 620,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 65,
+        "cut_case_comparisons": 191,
+        "coalesced_cut_cases": 18,
+        "case_sequence_visits": 1226,
+        "case_sequence_comparisons": 194,
+        "factored_case_cuts": 34,
+        "shared_disjoint_case_cuts": 0,
+        "endpoint_domain_entries": 182,
+        "normalized_endpoint_bounds": 0,
+        "endpoint_predicates_constructed": 0,
+        "control_descriptors": 1200,
+        "assigned_schedule_endpoints": 140,
+        "invocation_scheduled_loops": 2,
+        "invocation_schedule_groups": 6,
+        "invocation_schedule_visits": 1016,
+        "invocation_schedule_comparisons": 144,
+        "invocation_schedule_model_saving": 64,
+        "regular_schedule_candidates": 4,
+        "regular_schedule_loops": 4,
+        "regular_schedule_boundaries": 16,
+        "regular_schedule_body_copies": 24,
+        "regular_schedule_payload_copies": 144,
+        "regular_schedule_model_saving": 32,
+        "materialized_control_statements": 344,
+        "control_expression_visits": 968,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 0,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "9bb20f55399a4ffa04b333b168f1b4af95907bc6d0ca04e1cd9f98fde3bd781f",
+        "bytes": 29569,
+        "body_if_sites": 69,
+        "body_set_sites": 47,
+        "body_wait_sites": 47,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "0f4e652ad8cad3eefe9bdceed149a1a031f532623aade6a806d2554717a221a3",
+        "bytes": 43768,
+        "body_if_sites": 24,
+        "body_set_sites": 84,
+        "body_wait_sites": 79,
+        "body_barrier_sites": 0
+      },
+      "executions": 48,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 4,
+            "scalar_value_nodes": 16,
+            "scalar_arithmetic_ops": 6,
+            "loop_entries": 4,
+            "loop_iterations": 9,
+            "loop_header_work": 26,
+            "scalar_boolean_ops": 4,
+            "scalar_comparisons": 98,
+            "conditions": 94,
+            "inactive_conditions": 21,
+            "condition_nodes": 298,
+            "system.set_flag": 33,
+            "system.wait_flag": 33
+          },
+          "total_model_work": 232
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 4,
+            "scalar_value_nodes": 16,
+            "scalar_arithmetic_ops": 6,
+            "loop_entries": 8,
+            "loop_iterations": 9,
+            "loop_header_work": 34,
+            "scalar_boolean_ops": 6,
+            "scalar_comparisons": 20,
+            "conditions": 14,
+            "inactive_conditions": 7,
+            "condition_nodes": 66,
+            "system.set_flag": 33,
+            "system.wait_flag": 33
+          },
+          "total_model_work": 84
+        }
+      }
+    },
+    {
+      "name": "qwen_output_b3_h5120",
+      "input_sha256": "656a5e8757778cd67da8d50f357a7aac5695849ed2c2f45adfb849cb5e6a9387",
+      "production_seconds_single_run": 0.003111046738922596,
+      "before": {
+        "scalar_definitions": 4,
+        "scalar_expression_visits": 12,
+        "if_sites": 27,
+        "guard_expression_visits": 85,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 17,
+        "system.set_flag": 17,
+        "distinct_guard_expressions": 12
+      },
+      "after": {
+        "scalar_definitions": 4,
+        "scalar_expression_visits": 12,
+        "if_sites": 12,
+        "guard_expression_visits": 48,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 29,
+        "system.set_flag": 29,
+        "distinct_guard_expressions": 6
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 29,
+          "wait_sites": 29,
+          "barrier_sites": 0,
+          "guard_sites": 9
+        },
+        "constructed_guard_sites": 9,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 151,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 22,
+        "cut_case_comparisons": 56,
+        "coalesced_cut_cases": 0,
+        "case_sequence_visits": 0,
+        "case_sequence_comparisons": 0,
+        "factored_case_cuts": 0,
+        "shared_disjoint_case_cuts": 0,
+        "endpoint_domain_entries": 62,
+        "normalized_endpoint_bounds": 4,
+        "endpoint_predicates_constructed": 4,
+        "control_descriptors": 225,
+        "assigned_schedule_endpoints": 34,
+        "invocation_scheduled_loops": 0,
+        "invocation_schedule_groups": 0,
+        "invocation_schedule_visits": 0,
+        "invocation_schedule_comparisons": 0,
+        "invocation_schedule_model_saving": 0,
+        "regular_schedule_candidates": 2,
+        "regular_schedule_loops": 2,
+        "regular_schedule_boundaries": 8,
+        "regular_schedule_body_copies": 6,
+        "regular_schedule_payload_copies": 36,
+        "regular_schedule_model_saving": 16,
+        "materialized_control_statements": 132,
+        "control_expression_visits": 90,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 10,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "98bf32f99d61e5c74317af98e1777d41da1ba1cdac4633840671b27fad8f05ad",
+        "bytes": 17307,
+        "body_if_sites": 27,
+        "body_set_sites": 17,
+        "body_wait_sites": 17,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "3495ba8d035a8682cf33eae136b00d49d55e21e91015c1a7f31e2a87d3983ee2",
+        "bytes": 19812,
+        "body_if_sites": 11,
+        "body_set_sites": 29,
+        "body_wait_sites": 29,
+        "body_barrier_sites": 0
+      },
+      "executions": 40,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 22,
+            "scalar_value_nodes": 84,
+            "loop_entries": 22,
+            "loop_iterations": 91,
+            "loop_header_work": 226,
+            "scalar_arithmetic_ops": 31,
+            "scalar_comparisons": 948,
+            "conditions": 908,
+            "inactive_conditions": 406,
+            "condition_nodes": 2884,
+            "system.set_flag": 357,
+            "system.wait_flag": 357,
+            "scalar_boolean_ops": 40
+          },
+          "total_model_work": 2175
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 22,
+            "scalar_value_nodes": 84,
+            "loop_entries": 62,
+            "loop_iterations": 91,
+            "loop_header_work": 306,
+            "scalar_arithmetic_ops": 31,
+            "scalar_comparisons": 170,
+            "conditions": 130,
+            "inactive_conditions": 56,
+            "condition_nodes": 550,
+            "system.set_flag": 357,
+            "system.wait_flag": 357,
+            "scalar_boolean_ops": 40
+          },
+          "total_model_work": 699
+        }
+      }
+    },
+    {
+      "name": "qwen_gate_up_b0_h5120",
+      "input_sha256": "3ef6b23966b5a8a3ef37f8eddb412157fa0227daf5e594b457ba70f96085a41f",
+      "production_seconds_single_run": 0.015960292890667915,
+      "before": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 31,
+        "if_sites": 107,
+        "guard_expression_visits": 329,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 51,
+        "system.set_flag": 51,
+        "distinct_guard_expressions": 28
+      },
+      "after": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 31,
+        "if_sites": 61,
+        "guard_expression_visits": 239,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 87,
+        "system.set_flag": 92,
+        "distinct_guard_expressions": 24
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 121,
+          "wait_sites": 121,
+          "barrier_sites": 0,
+          "guard_sites": 45
+        },
+        "constructed_guard_sites": 45,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 643,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 46,
+        "cut_case_comparisons": 169,
+        "coalesced_cut_cases": 0,
+        "case_sequence_visits": 1195,
+        "case_sequence_comparisons": 108,
+        "factored_case_cuts": 56,
+        "shared_disjoint_case_cuts": 0,
+        "endpoint_domain_entries": 256,
+        "normalized_endpoint_bounds": 19,
+        "endpoint_predicates_constructed": 19,
+        "control_descriptors": 1251,
+        "assigned_schedule_endpoints": 146,
+        "invocation_scheduled_loops": 2,
+        "invocation_schedule_groups": 6,
+        "invocation_schedule_visits": 902,
+        "invocation_schedule_comparisons": 0,
+        "invocation_schedule_model_saving": 108,
+        "regular_schedule_candidates": 4,
+        "regular_schedule_loops": 4,
+        "regular_schedule_boundaries": 16,
+        "regular_schedule_body_copies": 24,
+        "regular_schedule_payload_copies": 144,
+        "regular_schedule_model_saving": 32,
+        "materialized_control_statements": 420,
+        "control_expression_visits": 1344,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 20,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "6bf42bc3b8146406f4efca326e456f063daae8d3d493ac4cc6e7ad6196e2ca20",
+        "bytes": 33519,
+        "body_if_sites": 101,
+        "body_set_sites": 51,
+        "body_wait_sites": 51,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "17ff6f74cd04e9f8be779d737f460f91ba2aac4cbef826361b17bf702c78b25b",
+        "bytes": 48829,
+        "body_if_sites": 55,
+        "body_set_sites": 92,
+        "body_wait_sites": 87,
+        "body_barrier_sites": 0
+      },
+      "executions": 48,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 24,
+            "scalar_value_nodes": 92,
+            "scalar_arithmetic_ops": 34,
+            "loop_entries": 23,
+            "loop_iterations": 91,
+            "loop_header_work": 228,
+            "scalar_comparisons": 995,
+            "conditions": 955,
+            "inactive_conditions": 477,
+            "condition_nodes": 3025,
+            "system.set_flag": 357,
+            "system.wait_flag": 357,
+            "scalar_boolean_ops": 40
+          },
+          "total_model_work": 2276
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 24,
+            "scalar_value_nodes": 92,
+            "scalar_arithmetic_ops": 34,
+            "loop_entries": 63,
+            "loop_iterations": 91,
+            "loop_header_work": 308,
+            "scalar_comparisons": 211,
+            "conditions": 171,
+            "inactive_conditions": 97,
+            "condition_nodes": 673,
+            "system.set_flag": 357,
+            "system.wait_flag": 357,
+            "scalar_boolean_ops": 40
+          },
+          "total_model_work": 788
+        }
+      }
+    },
+    {
+      "name": "qwen_gate_up_b1_h5120",
+      "input_sha256": "e5536ad35664e54cc6d4c19a45bdc0a0c078379c829528912868e35895bb3bed",
+      "production_seconds_single_run": 0.019921107217669487,
+      "before": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 37,
+        "if_sites": 111,
+        "guard_expression_visits": 345,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 51,
+        "system.set_flag": 51,
+        "distinct_guard_expressions": 28
+      },
+      "after": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 37,
+        "if_sites": 65,
+        "guard_expression_visits": 263,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 87,
+        "system.set_flag": 92,
+        "distinct_guard_expressions": 23
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 150,
+          "wait_sites": 150,
+          "barrier_sites": 0,
+          "guard_sites": 54
+        },
+        "constructed_guard_sites": 54,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 794,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 68,
+        "cut_case_comparisons": 225,
+        "coalesced_cut_cases": 52,
+        "case_sequence_visits": 1287,
+        "case_sequence_comparisons": 126,
+        "factored_case_cuts": 56,
+        "shared_disjoint_case_cuts": 0,
+        "endpoint_domain_entries": 318,
+        "normalized_endpoint_bounds": 23,
+        "endpoint_predicates_constructed": 23,
+        "control_descriptors": 1488,
+        "assigned_schedule_endpoints": 180,
+        "invocation_scheduled_loops": 2,
+        "invocation_schedule_groups": 6,
+        "invocation_schedule_visits": 1027,
+        "invocation_schedule_comparisons": 144,
+        "invocation_schedule_model_saving": 104,
+        "regular_schedule_candidates": 4,
+        "regular_schedule_loops": 4,
+        "regular_schedule_boundaries": 16,
+        "regular_schedule_body_copies": 24,
+        "regular_schedule_payload_copies": 144,
+        "regular_schedule_model_saving": 32,
+        "materialized_control_statements": 428,
+        "control_expression_visits": 1434,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 20,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "9eb867f3c01d906e91255bfadd674089dacfb6d5ea375d3198a38db24b9aed71",
+        "bytes": 34150,
+        "body_if_sites": 105,
+        "body_set_sites": 51,
+        "body_wait_sites": 51,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "dc90f5ba21f0c77d8373ba01ad3a487585b7e194cfc49403395448e80b84c940",
+        "bytes": 49414,
+        "body_if_sites": 59,
+        "body_set_sites": 92,
+        "body_wait_sites": 87,
+        "body_barrier_sites": 0
+      },
+      "executions": 48,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 24,
+            "scalar_value_nodes": 96,
+            "scalar_arithmetic_ops": 36,
+            "loop_entries": 23,
+            "loop_iterations": 91,
+            "loop_header_work": 228,
+            "scalar_comparisons": 996,
+            "conditions": 955,
+            "inactive_conditions": 477,
+            "condition_nodes": 3029,
+            "system.set_flag": 357,
+            "system.wait_flag": 357,
+            "scalar_boolean_ops": 41
+          },
+          "total_model_work": 2280
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 24,
+            "scalar_value_nodes": 96,
+            "scalar_arithmetic_ops": 36,
+            "loop_entries": 63,
+            "loop_iterations": 91,
+            "loop_header_work": 308,
+            "scalar_comparisons": 212,
+            "conditions": 171,
+            "inactive_conditions": 97,
+            "condition_nodes": 677,
+            "system.set_flag": 357,
+            "system.wait_flag": 357,
+            "scalar_boolean_ops": 41
+          },
+          "total_model_work": 792
+        }
+      }
+    },
+    {
+      "name": "qwen_gate_up_b2_h5120",
+      "input_sha256": "6c0502a503774a90c80a6641e3add8ba21456c4820f6014af60d4f30ee816bc6",
+      "production_seconds_single_run": 0.025519818998873234,
+      "before": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 37,
+        "if_sites": 143,
+        "guard_expression_visits": 473,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 64,
+        "system.set_flag": 63,
+        "distinct_guard_expressions": 28
+      },
+      "after": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 37,
+        "if_sites": 65,
+        "guard_expression_visits": 295,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 87,
+        "system.set_flag": 96,
+        "distinct_guard_expressions": 23
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 184,
+          "wait_sites": 184,
+          "barrier_sites": 0,
+          "guard_sites": 72
+        },
+        "constructed_guard_sites": 72,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 984,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 88,
+        "cut_case_comparisons": 282,
+        "coalesced_cut_cases": 56,
+        "case_sequence_visits": 2684,
+        "case_sequence_comparisons": 334,
+        "factored_case_cuts": 56,
+        "shared_disjoint_case_cuts": 9,
+        "endpoint_domain_entries": 388,
+        "normalized_endpoint_bounds": 30,
+        "endpoint_predicates_constructed": 30,
+        "control_descriptors": 2014,
+        "assigned_schedule_endpoints": 224,
+        "invocation_scheduled_loops": 2,
+        "invocation_schedule_groups": 6,
+        "invocation_schedule_visits": 1396,
+        "invocation_schedule_comparisons": 144,
+        "invocation_schedule_model_saving": 112,
+        "regular_schedule_candidates": 4,
+        "regular_schedule_loops": 4,
+        "regular_schedule_boundaries": 16,
+        "regular_schedule_body_copies": 24,
+        "regular_schedule_payload_copies": 144,
+        "regular_schedule_model_saving": 32,
+        "materialized_control_statements": 436,
+        "control_expression_visits": 2616,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 20,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "a34807e0166b388968d70213d6d8a1b5a0b819e72dbf72fdfa9e370e2ed4f5d8",
+        "bytes": 38729,
+        "body_if_sites": 137,
+        "body_set_sites": 63,
+        "body_wait_sites": 64,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "1d0e0c5c86f34df927ac33f0e00029a13161f169bcca68d39aa0c7e3218dbac3",
+        "bytes": 49669,
+        "body_if_sites": 59,
+        "body_set_sites": 96,
+        "body_wait_sites": 87,
+        "body_barrier_sites": 0
+      },
+      "executions": 48,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 45,
+            "scalar_value_nodes": 181,
+            "scalar_arithmetic_ops": 68,
+            "loop_entries": 44,
+            "loop_iterations": 182,
+            "loop_header_work": 452,
+            "scalar_comparisons": 3170,
+            "conditions": 2889,
+            "inactive_conditions": 923,
+            "condition_nodes": 9791,
+            "system.set_flag": 719,
+            "system.wait_flag": 719,
+            "scalar_boolean_ops": 281
+          },
+          "total_model_work": 6905
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 45,
+            "scalar_value_nodes": 181,
+            "scalar_arithmetic_ops": 68,
+            "loop_entries": 124,
+            "loop_iterations": 182,
+            "loop_header_work": 612,
+            "scalar_comparisons": 672,
+            "conditions": 491,
+            "inactive_conditions": 193,
+            "condition_nodes": 2197,
+            "system.set_flag": 719,
+            "system.wait_flag": 719,
+            "scalar_boolean_ops": 181
+          },
+          "total_model_work": 2069
+        }
+      }
+    },
+    {
+      "name": "qwen_gate_up_b3_h5120",
+      "input_sha256": "fa3e1d8068d4d2854c0ab85afceb5f57ad3912467e241facfcd6b2dbd56b6ac5",
+      "production_seconds_single_run": 0.02212954591959715,
+      "before": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 37,
+        "if_sites": 145,
+        "guard_expression_visits": 443,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 63,
+        "system.set_flag": 63,
+        "distinct_guard_expressions": 30
+      },
+      "after": {
+        "scalar_definitions": 9,
+        "scalar_expression_visits": 37,
+        "if_sites": 69,
+        "guard_expression_visits": 271,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 87,
+        "system.set_flag": 96,
+        "distinct_guard_expressions": 26
+      },
+      "construction_audit": {
+        "case_sites": {
+          "set_sites": 150,
+          "wait_sites": 150,
+          "barrier_sites": 0,
+          "guard_sites": 54
+        },
+        "constructed_guard_sites": 54,
+        "shared_guard_sites": 0,
+        "control_statement_visits": 794,
+        "simplified_guard_sites": 0,
+        "shared_control_values": 0,
+        "cut_domain_interval_visits": 68,
+        "cut_case_comparisons": 225,
+        "coalesced_cut_cases": 4,
+        "case_sequence_visits": 2148,
+        "case_sequence_comparisons": 316,
+        "factored_case_cuts": 56,
+        "shared_disjoint_case_cuts": 0,
+        "endpoint_domain_entries": 318,
+        "normalized_endpoint_bounds": 23,
+        "endpoint_predicates_constructed": 23,
+        "control_descriptors": 1680,
+        "assigned_schedule_endpoints": 180,
+        "invocation_scheduled_loops": 2,
+        "invocation_schedule_groups": 6,
+        "invocation_schedule_visits": 1275,
+        "invocation_schedule_comparisons": 144,
+        "invocation_schedule_model_saving": 112,
+        "regular_schedule_candidates": 4,
+        "regular_schedule_loops": 4,
+        "regular_schedule_boundaries": 16,
+        "regular_schedule_body_copies": 24,
+        "regular_schedule_payload_copies": 144,
+        "regular_schedule_model_saving": 32,
+        "materialized_control_statements": 444,
+        "control_expression_visits": 2064,
+        "schedule_candidates": 0,
+        "scheduled_loops": 0,
+        "schedule_boundary_commands": 0,
+        "schedule_size_refusals": 0,
+        "schedule_body_visits": 20,
+        "schedule_descriptor_visits": 0,
+        "schedule_original_nodes": 0,
+        "schedule_candidate_nodes": 0
+      },
+      "cpp_before": {
+        "source_sha256": "f7a1fcd49d979a206c666f6fdf84dfc9ad94dbeef090c3f2d4e0fd8de82d0e88",
+        "bytes": 38675,
+        "body_if_sites": 139,
+        "body_set_sites": 63,
+        "body_wait_sites": 63,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "e6b3c051c5853b4501b75596d52adb31df6c1c5d6339775fcdff47fbd455ae94",
+        "bytes": 50013,
+        "body_if_sites": 63,
+        "body_set_sites": 96,
+        "body_wait_sites": 87,
+        "body_barrier_sites": 0
+      },
+      "executions": 48,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {
+          "3": 0
+        },
+        "block": 0,
+        "before": {
+          "counts": {
+            "scalar_evaluations": 24,
+            "scalar_value_nodes": 96,
+            "scalar_arithmetic_ops": 36,
+            "loop_entries": 23,
+            "loop_iterations": 91,
+            "loop_header_work": 228,
+            "scalar_comparisons": 1714,
+            "conditions": 1674,
+            "inactive_conditions": 416,
+            "condition_nodes": 5182,
+            "system.set_flag": 357,
+            "system.wait_flag": 357,
+            "scalar_boolean_ops": 40
+          },
+          "total_model_work": 3716
+        },
+        "after": {
+          "counts": {
+            "scalar_evaluations": 24,
+            "scalar_value_nodes": 96,
+            "scalar_arithmetic_ops": 36,
+            "loop_entries": 63,
+            "loop_iterations": 91,
+            "loop_header_work": 308,
+            "scalar_comparisons": 290,
+            "conditions": 230,
+            "inactive_conditions": 96,
+            "condition_nodes": 930,
+            "system.set_flag": 357,
+            "scalar_boolean_ops": 60,
+            "system.wait_flag": 357
+          },
+          "total_model_work": 948
+        }
+      }
+    },
+    {
+      "name": "rotating1",
+      "input_sha256": "b27e1a0cf806f2abf71b106cc0078c23d817b29234c231477437bee6f086c1c4",
+      "production_seconds_single_run": 0.001077077817171812,
+      "before": {
+        "system.set_flag": 2,
+        "system.wait_flag": 2,
+        "distinct_guard_expressions": 0
+      },
+      "after": {
+        "system.set_flag": 2,
+        "system.wait_flag": 2,
+        "distinct_guard_expressions": 0
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "473d4ac3cbe6143f3894f2ae16a8a3c677dc6ab4c51e00dafe400e03c429ba97",
+        "bytes": 4376,
+        "body_if_sites": 0,
+        "body_set_sites": 2,
+        "body_wait_sites": 2,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "473d4ac3cbe6143f3894f2ae16a8a3c677dc6ab4c51e00dafe400e03c429ba97",
+        "bytes": 4376,
+        "body_if_sites": 0,
+        "body_set_sites": 2,
+        "body_wait_sites": 2,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "loop_entries": 1,
+            "loop_iterations": 1,
+            "loop_header_work": 4,
+            "system.set_flag": 2,
+            "system.wait_flag": 2
+          },
+          "total_model_work": 4
+        },
+        "after": {
+          "counts": {
+            "loop_entries": 1,
+            "loop_iterations": 1,
+            "loop_header_work": 4,
+            "system.set_flag": 2,
+            "system.wait_flag": 2
+          },
+          "total_model_work": 4
+        }
+      }
+    },
+    {
+      "name": "rotating70",
+      "input_sha256": "71140f6b402a78a629e53e702b0861c3439094c25ae6445cfff5ce290300651b",
+      "production_seconds_single_run": 0.003530388232320547,
+      "before": {
+        "if_sites": 20,
+        "guard_expression_visits": 102,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 9,
+        "system.set_flag": 9,
+        "distinct_guard_expressions": 8
+      },
+      "after": {
+        "if_sites": 48,
+        "guard_expression_visits": 252,
+        "largest_guard_nodes": 7,
+        "system.set_flag": 33,
+        "system.wait_flag": 33,
+        "scalar_definitions": 2,
+        "scalar_expression_visits": 6,
+        "distinct_guard_expressions": 15
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "197d282952d71af916bf51c797bed4cffe01fa2a05d1f52f0b938e83252c6368",
+        "bytes": 7654,
+        "body_if_sites": 20,
+        "body_set_sites": 9,
+        "body_wait_sites": 9,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "9fa2226f7921bdaee58de103aeebd468038a6e6908b68d7cd698e42728f8a28b",
+        "bytes": 21964,
+        "body_if_sites": 30,
+        "body_set_sites": 27,
+        "body_wait_sites": 27,
+        "body_barrier_sites": 0
+      },
+      "executions": 1,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": {
+        "parameters": {},
+        "block": null,
+        "before": {
+          "counts": {
+            "loop_entries": 1,
+            "loop_iterations": 70,
+            "loop_header_work": 142,
+            "scalar_comparisons": 962,
+            "conditions": 962,
+            "inactive_conditions": 414,
+            "condition_nodes": 4796,
+            "scalar_arithmetic_ops": 955,
+            "system.set_flag": 207,
+            "system.wait_flag": 207
+          },
+          "total_model_work": 3021
+        },
+        "after": {
+          "counts": {
+            "loop_entries": 4,
+            "loop_iterations": 28,
+            "loop_header_work": 64,
+            "scalar_comparisons": 66,
+            "scalar_arithmetic_ops": 115,
+            "conditions": 66,
+            "inactive_conditions": 30,
+            "condition_nodes": 344,
+            "system.set_flag": 207,
+            "system.wait_flag": 207,
+            "scalar_evaluations": 42,
+            "scalar_value_nodes": 126
+          },
+          "total_model_work": 353
+        }
+      }
+    },
+    {
+      "name": "rotating7000",
+      "input_sha256": "923ddbb0bc55df0303e37733b7eb4c2f396846895d50ca2c1b64f2ce6e093637",
+      "production_seconds_single_run": 0.00379757396876812,
+      "before": {
+        "if_sites": 20,
+        "guard_expression_visits": 102,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 9,
+        "system.set_flag": 9,
+        "distinct_guard_expressions": 8
+      },
+      "after": {
+        "if_sites": 48,
+        "guard_expression_visits": 252,
+        "largest_guard_nodes": 7,
+        "system.set_flag": 33,
+        "system.wait_flag": 33,
+        "scalar_definitions": 2,
+        "scalar_expression_visits": 6,
+        "distinct_guard_expressions": 15
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "0a9665bfa2f629fe69d849631f7338503c2d08de82a5fc2bf099beee9db82e81",
+        "bytes": 7662,
+        "body_if_sites": 20,
+        "body_set_sites": 9,
+        "body_wait_sites": 9,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "fdd4199fba2fcb1e44c2854827ef2a9d10c5321e4842b9b56f9022c455a6ddcb",
+        "bytes": 21980,
+        "body_if_sites": 30,
+        "body_set_sites": 27,
+        "body_wait_sites": 27,
+        "body_barrier_sites": 0
+      },
+      "executions": 0,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": null
+    },
+    {
+      "name": "rotating1000000",
+      "input_sha256": "f5b550b639854de657c85dd50d111fcc5c14fb9f1e5bdc11b133e71993aa6cb9",
+      "production_seconds_single_run": 0.003546637948602438,
+      "before": {
+        "if_sites": 20,
+        "guard_expression_visits": 102,
+        "largest_guard_nodes": 7,
+        "system.wait_flag": 9,
+        "system.set_flag": 9,
+        "distinct_guard_expressions": 8
+      },
+      "after": {
+        "if_sites": 48,
+        "guard_expression_visits": 252,
+        "largest_guard_nodes": 7,
+        "system.set_flag": 33,
+        "system.wait_flag": 33,
+        "scalar_definitions": 2,
+        "scalar_expression_visits": 6,
+        "distinct_guard_expressions": 15
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "ee38d691ed3d07fc84a2644077585496d6c98197e2c168ff5bf5f87543197672",
+        "bytes": 7672,
+        "body_if_sites": 20,
+        "body_set_sites": 9,
+        "body_wait_sites": 9,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "347c37e0f032b8647cd524485a2258f81840bae368d02b274d6221a202b390c9",
+        "bytes": 21998,
+        "body_if_sites": 30,
+        "body_set_sites": 27,
+        "body_wait_sites": 27,
+        "body_barrier_sites": 0
+      },
+      "executions": 0,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": null
+    },
+    {
+      "name": "nested_(2, 1000)",
+      "input_sha256": "1b4426ee7f28787b8d881827038d74041478dbecab38f00b1f1a2b99a4bee3be",
+      "production_seconds_single_run": 0.0017765602096915245,
+      "before": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 10,
+        "guard_expression_visits": 30,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 6
+      },
+      "after": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 6,
+        "guard_expression_visits": 18,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 4
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "57465ee11ff484df4bb5c17f2459a7c4493c7d81a51110439f98f38750a4bbf3",
+        "bytes": 6705,
+        "body_if_sites": 10,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "49e643847d56a3a6cd533238610aa221d6c7d94885ee30d282d2e3024b9fdd41",
+        "bytes": 6397,
+        "body_if_sites": 6,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "executions": 0,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": null
+    },
+    {
+      "name": "nested_(1000, 3)",
+      "input_sha256": "8bdd6cc73354b9b3d7d6013bac0459450adaa7648370c0e63dd84a111b750252",
+      "production_seconds_single_run": 0.0019394252449274063,
+      "before": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 10,
+        "guard_expression_visits": 30,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 8
+      },
+      "after": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 6,
+        "guard_expression_visits": 18,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 6
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "91d93e55a031789f82fc72b5673bb8e4b17595e634e67aac1da6a1c8bd3a0ff7",
+        "bytes": 6819,
+        "body_if_sites": 10,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "38f77fbb0e306e406f37a94fd73907b4a329c3eafaf3f1346da415cffe190611",
+        "bytes": 6505,
+        "body_if_sites": 6,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "executions": 0,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": null
+    },
+    {
+      "name": "nested_(1000000, 1000000)",
+      "input_sha256": "434285b87d0908dba3ef901171c25b4856974f898722c58addf9c492151b076a",
+      "production_seconds_single_run": 0.00259816600009799,
+      "before": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 10,
+        "guard_expression_visits": 30,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 8
+      },
+      "after": {
+        "system.set_flag": 7,
+        "system.wait_flag": 7,
+        "if_sites": 6,
+        "guard_expression_visits": 18,
+        "largest_guard_nodes": 3,
+        "distinct_guard_expressions": 6
+      },
+      "construction_audit": null,
+      "cpp_before": {
+        "source_sha256": "c3cc8064670bc85d3658c502deb29bd859e47ac033af6ef70b07ce0d788aacb3",
+        "bytes": 6853,
+        "body_if_sites": 10,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "cpp_after": {
+        "source_sha256": "96d4f8b088ad773a0354926e239137651f6eab8c2b373c242170df3bfcce1612",
+        "bytes": 6539,
+        "body_if_sites": 6,
+        "body_set_sites": 7,
+        "body_wait_sites": 7,
+        "body_barrier_sites": 0
+      },
+      "executions": 0,
+      "trace_equal": true,
+      "independent_access_order_matching_reuse": false,
+      "representative": null
+    }
+  ],
+  "pins": {
+    "revision": "868fdd471d34a0e8259e84e6d21c57258601a7c5",
+    "dirty_source_sha256": {
+      "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "aca87503d4a61dc202b6a19483b85823a0229c442719414ff61c2ee88c0c6110",
+      "mkdocs.yml": "f3a2d52a860aca680d2aee71d47bce1aa339ba5c69356ce220a4a07a362fed4c",
+      "python/bindings/modules/testing.cpp": "c4cd6d16819708b59d7b8249ee12cbb609d8e87ccf8ede4f7352b1d79dea7b6d",
+      "python/pypto/pypto_core/testing.pyi": "0f203b65ed6da9423e25a1a7816739b8efb8e834081999ccd892733166b4e42a",
+      "src/ir/transforms/utils/physical_sync_allocation.h": "8c0d8050fa2b54a5ea5f37c3bbcc2ef3aa4ef069d09f00262bce1fa2e2b3c730",
+      "src/ir/transforms/utils/physical_sync_realization.cpp": "7389d4051dec1bfa67bd469e2e9cb014e2c7ea43104f2a5a2433497b3678e74a",
+      "tests/ut/ir/transforms/qualify_sync_accounting.py": "12b92d8b8aa94c784d43e5c6d4d79a96959535e055e84c7ec0e8cdad0c756751",
+      "tests/ut/ir/transforms/qualify_sync_control.py": "969230211d4e860c7ffda9ab06708c315500a3ccc658a6cda752986e44419513",
+      "tests/ut/ir/transforms/sync_control_metrics.py": "e1867d450603160ea907580c75ec797b8fe0afd6d2345d5aa19b0872f6dac5ba",
+      "tests/ut/ir/transforms/sync_logical_oracle.py": "7bf782e372b90eeeaf90501ff7fbbd251c812a2cb1f2291770a47eaa6c3b6b70",
+      "tests/ut/ir/transforms/sync_matmul_oracle.py": "3fe09d610312055adfad06799e10a01ea81e352c8c133aca5cbf6c585350971a",
+      "tests/ut/ir/transforms/sync_physical_oracle.py": "1b0b6b1a6e8e3eae76d533347370941b32fd5da9e8b9308f1e7d7dfe3347daf3",
+      "tests/ut/ir/transforms/test_buffered_sync_realization.py": "37e6c1852641bcb937272a939d4df32d171cc6d5d5d1521cc21633b944f65f79",
+      "tests/ut/ir/transforms/test_crossing_token_sync.py": "74ddd904e3225a110d8ee9667883ac2e2a77fc51e0f7358cf19ffe647d1d28b6",
+      "tests/ut/ir/transforms/test_parameterized_token_sync.py": "62957ff5d9c320c4631e10de2d682ab97441df19d69da45bcdd3bd77388c58cf",
+      "tests/ut/ir/transforms/test_physical_sync_realization.py": "392d824103ceb3f3793617f246a37877d786d80cfbbce4770a23a38d1d8d30da",
+      "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "e8e406fa9f17224cb2d569ef96660d352b8b31a7e57efae978d6aa32f6d1d196",
+      "tests/ut/ir/transforms/test_rotating_token_sync.py": "cb617ea4092ea448d9642223c38348822b29cd6e416b3ffa5d73c863141e3d8c",
+      "tests/ut/ir/transforms/test_scoped_physical_sync.py": "01a561876fa3acd1969bbf6165eaf8e7981dee2c5162799ded4df4a51a41d5a9",
+      "tests/ut/ir/transforms/test_scoped_token_order.py": "103da725851dad77ca915ed1067966f14e3da368ddf667ff859f9c67fb8f9cf5",
+      "tests/ut/ir/transforms/test_structured_token_sync.py": "a72a99f0a6ffc92003873d7ce20b2b624b5fd90cb2774c058e539301863056a7",
+      "tests/ut/ir/transforms/test_sync_command_control.py": "3c26418f4910e90dd3ae78b9bd1c2e9fde89ce6e5df56b0fa824861c3e693f37",
+      "tests/ut/ir/transforms/test_token_sync_lowering.py": "03fc6f102fd2aa25b306518e33fb0f8c1524a932edc9fa3892e61f793c21830e",
+      "tests/ut/ir/transforms/test_vec_sync_analysis.py": "e2c14aa3ceff7f2cf836cb47ec4aabf7620fdc14ab64673e2308cc95e3a0ce86",
+      "tests/ut/ir/transforms/qualify_sync_order.py": "484147913b3290385b06ce4f716f8e53b99a8669dcc807c55e4bbdeb775cf361",
+      "tests/ut/ir/transforms/test_regional_sync_schedule.py": "1b19e0700deabbead0ab44a7583ec47ff09112db2536e3e0e27a7a07a93b30cc",
+      "tests/ut/ir/transforms/test_sync_boundary_schedule.py": "2a74fb890b9232fd3a469a9e92ac6d916f0b384b6cd5147a8969f362782d65a9",
+      "tests/ut/ir/transforms/sync_cpp_order.py": "7e10f125249de101da0926f7f88a1b9ee47aac9ad86e8754ea200f60f267d6f9",
+      "tests/ut/ir/transforms/sync_order_metrics.py": "22ec8d85fa13d22b3864f1ec06af1c2741ccc214efe292839f3c0a2398ae9343",
+      "tests/ut/ir/transforms/test_sync_cut_control.py": "4252d193908d4835d1c8305d7bad464c82919bc271229bd92e5cb725fdf65cf0",
+      "tests/ut/ir/transforms/test_sync_cpp_order.py": "b72344142a936cd66ddaae121e5b29ca2af64a6ddfb84bd6a0281a6ace6943fa",
+      "tests/ut/ir/transforms/test_sync_order_metrics.py": "f8156df223ee3558fd36b20a58be79e05725b35cd2c42d5042f1ad3816aafc10"
+    },
+    "extension_sha256": "7830b40dce7074863db71fb5e7d1c8ef9951c10bd61355641663bfc30f9cf9b0",
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "ptoas_launcher_sha256": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+    "final_review_source_sha256": {
+      "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "aca87503d4a61dc202b6a19483b85823a0229c442719414ff61c2ee88c0c6110",
+      "mkdocs.yml": "f3a2d52a860aca680d2aee71d47bce1aa339ba5c69356ce220a4a07a362fed4c",
+      "python/bindings/modules/testing.cpp": "c4cd6d16819708b59d7b8249ee12cbb609d8e87ccf8ede4f7352b1d79dea7b6d",
+      "python/pypto/pypto_core/testing.pyi": "0f203b65ed6da9423e25a1a7816739b8efb8e834081999ccd892733166b4e42a",
+      "src/ir/transforms/utils/physical_sync_allocation.h": "8c0d8050fa2b54a5ea5f37c3bbcc2ef3aa4ef069d09f00262bce1fa2e2b3c730",
+      "src/ir/transforms/utils/physical_sync_realization.cpp": "7389d4051dec1bfa67bd469e2e9cb014e2c7ea43104f2a5a2433497b3678e74a",
+      "tests/ut/ir/transforms/qualify_sync_accounting.py": "12b92d8b8aa94c784d43e5c6d4d79a96959535e055e84c7ec0e8cdad0c756751",
+      "tests/ut/ir/transforms/qualify_sync_control.py": "969230211d4e860c7ffda9ab06708c315500a3ccc658a6cda752986e44419513",
+      "tests/ut/ir/transforms/sync_control_metrics.py": "e1867d450603160ea907580c75ec797b8fe0afd6d2345d5aa19b0872f6dac5ba",
+      "tests/ut/ir/transforms/sync_logical_oracle.py": "7bf782e372b90eeeaf90501ff7fbbd251c812a2cb1f2291770a47eaa6c3b6b70",
+      "tests/ut/ir/transforms/sync_matmul_oracle.py": "3fe09d610312055adfad06799e10a01ea81e352c8c133aca5cbf6c585350971a",
+      "tests/ut/ir/transforms/sync_physical_oracle.py": "1b0b6b1a6e8e3eae76d533347370941b32fd5da9e8b9308f1e7d7dfe3347daf3",
+      "tests/ut/ir/transforms/test_buffered_sync_realization.py": "37e6c1852641bcb937272a939d4df32d171cc6d5d5d1521cc21633b944f65f79",
+      "tests/ut/ir/transforms/test_crossing_token_sync.py": "74ddd904e3225a110d8ee9667883ac2e2a77fc51e0f7358cf19ffe647d1d28b6",
+      "tests/ut/ir/transforms/test_parameterized_token_sync.py": "62957ff5d9c320c4631e10de2d682ab97441df19d69da45bcdd3bd77388c58cf",
+      "tests/ut/ir/transforms/test_physical_sync_realization.py": "392d824103ceb3f3793617f246a37877d786d80cfbbce4770a23a38d1d8d30da",
+      "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py": "e8e406fa9f17224cb2d569ef96660d352b8b31a7e57efae978d6aa32f6d1d196",
+      "tests/ut/ir/transforms/test_rotating_token_sync.py": "cb617ea4092ea448d9642223c38348822b29cd6e416b3ffa5d73c863141e3d8c",
+      "tests/ut/ir/transforms/test_scoped_physical_sync.py": "01a561876fa3acd1969bbf6165eaf8e7981dee2c5162799ded4df4a51a41d5a9",
+      "tests/ut/ir/transforms/test_scoped_token_order.py": "103da725851dad77ca915ed1067966f14e3da368ddf667ff859f9c67fb8f9cf5",
+      "tests/ut/ir/transforms/test_structured_token_sync.py": "a72a99f0a6ffc92003873d7ce20b2b624b5fd90cb2774c058e539301863056a7",
+      "tests/ut/ir/transforms/test_sync_command_control.py": "3c26418f4910e90dd3ae78b9bd1c2e9fde89ce6e5df56b0fa824861c3e693f37",
+      "tests/ut/ir/transforms/test_token_sync_lowering.py": "03fc6f102fd2aa25b306518e33fb0f8c1524a932edc9fa3892e61f793c21830e",
+      "tests/ut/ir/transforms/test_vec_sync_analysis.py": "e2c14aa3ceff7f2cf836cb47ec4aabf7620fdc14ab64673e2308cc95e3a0ce86",
+      "tests/ut/ir/transforms/test_regional_sync_schedule.py": "1b19e0700deabbead0ab44a7583ec47ff09112db2536e3e0e27a7a07a93b30cc",
+      "tests/ut/ir/transforms/test_sync_boundary_schedule.py": "2a74fb890b9232fd3a469a9e92ac6d916f0b384b6cd5147a8969f362782d65a9",
+      "docs/en/dev/ir/31-regional-sync-schedule-plan.md": "7e039f3ca9f3d3020fd32d0ecf1029ddf936262d7f314bda8fa600cbfd97dd5e",
+      "docs/zh/dev/ir/31-regional-sync-schedule-plan.md": "599460096682501001ccc632ddface0a5ad519bd52140ffd2fdf1280ea018757",
+      "docs/en/dev/ir/30-structured-sync-schedules.md": "39fbb2ead17498c476d3f26a67066a39da0ba562ee6f3b1f909e1ee9b71c2b89",
+      "docs/zh/dev/ir/30-structured-sync-schedules.md": "b4f93f183a0b4a9d3be4f201800b5ba7f3a080ab90f53b39f886047f60743f49"
+    }
+  },
+  "measurements_scope": "Final rebuilt ordinary production samples; inclusive and single-run, not speedup measurements."
+}

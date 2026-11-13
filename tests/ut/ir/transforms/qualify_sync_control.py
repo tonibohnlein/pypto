@@ -28,7 +28,6 @@ from pypto.backend.pto_backend import _run_ptoas
 from .qualify_token_production import program_of
 from .sync_control_metrics import static_control, trace_control
 from .sync_matmul_cases import CASES, capture
-from .sync_matmul_oracle import hardware_reference
 from .sync_order_metrics import compare_order
 from .sync_physical_oracle import run_physical
 from .sync_prefill_cases import capture_prefill
@@ -107,7 +106,7 @@ def examine(name, program, valuations, independent, output, baseline):
                 run_physical(original, old, range(6), parameters, block_index=block)[2] if old else order
             )
             ordering = compare_order(
-                [c[2] for c in state.calls], hardware_reference(original, state.calls)[2], old_order, order
+                [c[2] for c in state.original_calls], state.required_reference[2], old_order, order
             )
         else:
             ordering = None
@@ -153,8 +152,28 @@ def examine(name, program, valuations, independent, output, baseline):
             "normalized_endpoint_bounds",
             "endpoint_predicates_constructed",
             "control_descriptors",
+            "assigned_schedule_endpoints",
+            "invocation_scheduled_loops",
+            "invocation_schedule_groups",
+            "invocation_schedule_visits",
+            "invocation_schedule_comparisons",
+            "invocation_schedule_model_saving",
+            "regular_schedule_candidates",
+            "regular_schedule_loops",
+            "regular_schedule_boundaries",
+            "regular_schedule_body_copies",
+            "regular_schedule_payload_copies",
+            "regular_schedule_model_saving",
             "materialized_control_statements",
             "control_expression_visits",
+            "schedule_candidates",
+            "scheduled_loops",
+            "schedule_boundary_commands",
+            "schedule_size_refusals",
+            "schedule_body_visits",
+            "schedule_descriptor_visits",
+            "schedule_original_nodes",
+            "schedule_candidate_nodes",
         ):
             construction[field] = (
                 sum(c[field] for c in diagnostic["cases"])
@@ -223,6 +242,10 @@ def main():
             "qualify_sync_control.py",
             "qualify_sync_order.py",
             "sync_control_metrics.py",
+            "test_regional_sync_schedule.py",
+            "test_sync_boundary_schedule.py",
+            "sync_physical_oracle.py",
+            "sync_matmul_oracle.py",
             "sync_cpp_order.py",
             "sync_order_metrics.py",
             "test_sync_command_control.py",

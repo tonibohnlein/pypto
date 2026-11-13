@@ -183,7 +183,11 @@ def test_fixed_slot_interface_does_not_shift_entire_trip_history():
         loops = [s for s in sequence_stmts(logical.body) if isinstance(s, ir.ForStmt)]
         text = ir.python_print(physical, format=False)
         sizes.append((captures, sum(len(s.iter_args) for s in loops), text.count("set_flag(")))
-    assert sizes[0] == sizes[1] == sizes[2]
+    assert sizes[0][:2] == sizes[1][:2] == sizes[2][:2]
+    # Phase-specialized output can use a smaller short-trip layout. Retained
+    # captures stay constant, and steady output does not grow with trips.
+    assert sizes[1][2] == sizes[2][2]
+    assert sizes[0][2] <= sizes[1][2]
     assert sizes[0][0] > 0
 
 

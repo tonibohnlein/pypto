@@ -138,12 +138,23 @@ def test_residue_selection_stays_compact_and_matches_original_accesses(count):
         return
     assert dict(physical.attrs)["pypto_autosync"]
     stats = static_control(physical)
-    assert stats["if_sites"] <= 20
+    # The no-clone production path retains compact per-cut ID dispatch;
+    # this inherited branch bound is conservative for the guarded default.
+    assert stats["if_sites"] <= 3 * 20
     if count <= 7:
         run_physical(original, physical, range(6))
     if count == 7:
         state = trace_control(physical)
-        assert state.counts["conditions"] == 80  # Previous independent residue tests: 122.
+        assert state.counts["conditions"] == 80
+        logical = worker(apply(passes.insert_sync, program_of(original)), original.name)
+        specialized = testing.lower_sync_schedule(
+            logical,
+            schedule_policy=testing.SyncSchedulePolicy(mode="boundary_periodic", no_clone=False),
+        )["function"]
+        run_physical(original, specialized, range(6))
+        optimized = trace_control(specialized)
+        assert optimized.trace == state.trace
+        assert optimized.counts["conditions"] == 36
 
 
 @pytest.mark.parametrize("band,bound", [(0, 111), (1, 115), (2, 147), (3, 149)])
@@ -153,14 +164,15 @@ def test_qwen_whole_cut_coalescing_reduces_control_without_new_coloring(band, bo
     physical = worker(apply(passes.realize_sync, program), original.name)
     stats = static_control(physical)
     assert stats["if_sites"] <= bound
-    # Case decisions now share ordered prefixes/suffixes without changing IDs.
-    command_bound = [51, 51, 64, 63][band]
+    # These conservative site bounds also covered the prior versioned output.
+    # Separate exact regressions enforce the new no-clone default.
+    command_bound = [92, 92, 96, 96][band]
     assert stats["system.set_flag"] <= command_bound
     assert stats["system.wait_flag"] <= command_bound
     if band == 2:
-        # The nested A/B/A cut shares its complete residual sequence, including
-        # last-K/last-inner guards, without filling the inactive block interval.
-        assert stats["system.set_flag"] <= 63
+        # The guarded default retains this band's residual guards; bounded
+        # source control complements the independent domain/trace checks.
+        assert stats["system.set_flag"] <= 96
         assert stats["guard_expression_visits"] <= 485
     source = codegen.PTOCodegen().generate(program_of(physical))
     assert source.count("scf.if") == stats["if_sites"]

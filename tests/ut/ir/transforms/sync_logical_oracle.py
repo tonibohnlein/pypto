@@ -165,7 +165,7 @@ class CommandExecution:
                 if coordinate in env
                 else [v for var, v in env.items() if isinstance(var, ir.Var) and var.name_hint == name]
             )
-            assert values == [expected], "changed original occurrence coordinates"
+            assert values == [expected], ("changed original occurrence coordinates", name, values, expected)
         start, completion = (self.payload_count, False), (self.payload_count, True)
         self.edges.add((start, completion))
         if pipe in self.latest_payload:

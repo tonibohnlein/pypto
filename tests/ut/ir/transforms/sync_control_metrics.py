@@ -109,6 +109,17 @@ class ControlTrace(CommandExecution):
             env[stmt.var] = value(stmt.value, env)
 
     def execute(self, stmt, env):
+        if isinstance(stmt, ir.ForStmt):
+            start, stop, step = (value(expr, env) for expr in (stmt.start, stmt.stop, stmt.step))
+            assert isinstance(start, int) and isinstance(stop, int) and isinstance(step, int)
+            trips = len(range(start, stop, step))
+            self.counts["loop_entries"] += 1
+            self.counts["loop_iterations"] += trips
+            # Stated source unit-work model: initialization, N+1 comparisons,
+            # N increments. It is not target latency or optimized instruction count.
+            self.counts["loop_header_work"] += 2 * trips + 2
+            for expr in (stmt.start, stmt.stop, stmt.step):
+                self.counts.update(scalar_work(expr))
         if isinstance(stmt, ir.IfStmt):
             self.counts.update(scalar_work(stmt.condition))
             self.counts["conditions"] += 1

@@ -23,7 +23,9 @@ qualified AIC matmul and AIV Vec fragments, using manual a2a3 macro variants. Mi
 GM disjointness, target, access, control, endpoint or resource qualifications
 leave the **original kernel body** for PTOAS. This delegation does not promise
 that PTOAS supports every input; its failures still propagate. Internal compiler
-errors are not converted into fallback. The retained-analysis research APIs
+errors are not converted into fallback. Verification of insertion-owned logical output preserves this boundary:
+malformed generated tokens raise an internal compiler error. Standalone malformed
+user tokens continue to report validation errors. The retained-analysis research APIs
 remain strict and report qualification failures directly. The former direct
 mathematics-to-physical APIs remain explicit audit tools; production never uses
 them to bypass a token-export refusal. Preexisting logical synchronization and

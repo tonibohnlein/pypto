@@ -31,7 +31,6 @@ from .qualify_sync_control import fixtures
 from .qualify_token_production import inventory
 from .sync_control_metrics import ControlTrace, statements, static_control, trace_control
 from .sync_logical_oracle import value
-from .sync_matmul_oracle import hardware_reference
 from .sync_order_metrics import compare_order
 from .sync_physical_oracle import run_physical
 from .test_parameterized_token_sync import apply, worker
@@ -274,9 +273,11 @@ def measure(name, program, valuations, independent):
         selected_values = valuations if len(valuations) <= 2 else [valuations[0], valuations[-1]]
         for parameters_at, block in selected_values:
             state, _, order = run_physical(original, selected, range(6), parameters_at, block_index=block)
-            reference = hardware_reference(original, state.calls)
-            metric = compare_order([c[2] for c in state.calls], reference[2], reference[2], order)
-            cross_covers = sum(state.calls[a][2] != state.calls[b][2] for a, b in reference[3])
+            reference = state.required_reference
+            metric = compare_order([c[2] for c in state.original_calls], reference[2], reference[2], order)
+            cross_covers = sum(
+                state.original_calls[a][2] != state.original_calls[b][2] for a, b in reference[3]
+            )
             assert cross_covers == len(state.records) == len(state.waits)
             trace = trace_control(selected, parameters_at, block)
             case = next(
@@ -289,7 +290,7 @@ def measure(name, program, valuations, independent):
                 {
                     "parameters": parameters_at,
                     "block": block,
-                    "payloads": len(state.calls),
+                    "payloads": len(state.original_calls),
                     "nonnative_covers": len(reference[3]),
                     "cross_pipe_covers": cross_covers,
                     "executed_set_wait_pairs": len(state.records),

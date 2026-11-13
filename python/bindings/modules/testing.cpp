@@ -587,9 +587,47 @@ class PhysicalControlCensus : public ir::IRVisitor {
   }
 };
 
+nb::dict DescribeSchedulePolicy(const ir::sync::SyncSchedulePolicy& policy) {
+  nb::dict out;
+  out["mode"] = policy.mode;
+  out["max_extra_payload_sites"] = policy.max_extra_payload_sites;
+  out["max_extra_control_nodes"] = policy.max_extra_control_nodes;
+  out["no_clone"] = policy.no_clone;
+  out["boundary_motion"] = policy.boundary_motion;
+  return out;
+}
+nb::dict DescribeSchedule(const ir::sync::PhysicalSyncRealization& result) {
+  nb::dict out;
+  nb::list choices;
+  for (const auto& choice : result.schedule_choices) {
+    nb::dict row;
+    row["loop"] = choice.loop;
+    row["mode"] = choice.mode;
+    row["status"] = choice.status;
+    row["reason"] = choice.reason;
+    row["payload_sites"] = choice.payload_sites;
+    row["control_node_bound"] = choice.control_node_bound;
+    row["command_sites"] = choice.command_sites;
+    nb::list costs;
+    for (const auto& cost : choice.model_cost)
+      costs.append(nb::make_tuple(cost[0], cost[1], cost[2], cost[3], cost[4], cost[5]));
+    row["model_cost"] = costs;
+    row["model_comparable"] = choice.model_comparable;
+    row["model_exact"] = choice.model_exact;
+    row["selected"] = choice.selected;
+    choices.append(row);
+  }
+  out["choices"] = choices;
+  out["inspected_descriptors"] = result.schedule_inspected_descriptors;
+  out["inspected_expressions"] = result.schedule_inspected_expressions;
+  out["emitted_payload_sites"] = result.schedule_emitted_payload_sites;
+  out["emitted_control_nodes"] = result.schedule_emitted_control_nodes;
+  return out;
+}
 nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   nb::dict out;
   out["function"] = result.function;
+  out["schedule"] = DescribeSchedule(result);
   out["set_sites"] = result.set_sites;
   out["wait_sites"] = result.wait_sites;
   out["barrier_sites"] = result.barrier_sites;
@@ -611,6 +649,29 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   out["normalized_endpoint_bounds"] = result.normalized_endpoint_bounds;
   out["endpoint_predicates_constructed"] = result.endpoint_predicates_constructed;
   out["control_descriptors"] = result.control_descriptors;
+  out["invocation_scheduled_loops"] = result.invocation_scheduled_loops;
+  out["invocation_schedule_groups"] = result.invocation_schedule_groups;
+  out["invocation_schedule_visits"] = result.invocation_schedule_visits;
+  out["invocation_schedule_comparisons"] = result.invocation_schedule_comparisons;
+  out["invocation_schedule_model_saving"] = result.invocation_schedule_model_saving;
+  out["schedule_name_scans"] = result.schedule_name_scans;
+  out["schedule_name_visits"] = result.schedule_name_visits;
+  out["regular_schedule_candidates"] = result.regular_schedule_candidates;
+  out["regular_schedule_loops"] = result.regular_schedule_loops;
+  out["regular_schedule_boundaries"] = result.regular_schedule_boundaries;
+  out["regular_schedule_body_copies"] = result.regular_schedule_body_copies;
+  out["regular_schedule_payload_copies"] = result.regular_schedule_payload_copies;
+  out["regular_schedule_model_saving"] = result.regular_schedule_model_saving;
+  out["assigned_schedule_endpoints"] = result.assigned_schedule_endpoints;
+  out["schedule_candidates"] = result.schedule_candidates;
+  out["scheduled_loops"] = result.scheduled_loops;
+  out["schedule_boundary_commands"] = result.schedule_boundary_commands;
+  out["schedule_size_refusals"] = result.schedule_size_refusals;
+  out["schedule_body_visits"] = result.schedule_body_visits;
+  out["schedule_descriptor_visits"] = result.schedule_descriptor_visits;
+  out["schedule_original_nodes"] = result.schedule_original_nodes;
+  out["schedule_candidate_nodes"] = result.schedule_candidate_nodes;
+
   out["materialized_control_statements"] = result.materialized_control_statements;
   out["control_expression_visits"] = result.control_expression_visits;
   out["reuse_queries"] = result.reuse_queries;
@@ -640,6 +701,17 @@ void BindTesting(nb::module_& m) {
   // Create a protected submodule for testing utilities
   // This will be accessible as pypto.testing in Python
   nb::module_ testing = m.def_submodule("testing", "Internal testing utilities (do not use in production)");
+  nb::class_<ir::sync::SyncSchedulePolicy>(testing, "SyncSchedulePolicy")
+      .def(
+          "__init__",
+          [](ir::sync::SyncSchedulePolicy* self, std::string mode, size_t payloads, size_t controls,
+             bool no_clone, bool boundary_motion) {
+            new (self)
+                ir::sync::SyncSchedulePolicy{std::move(mode), payloads, controls, no_clone, boundary_motion};
+          },
+          nb::arg("mode") = "auto", nb::arg("max_extra_payload_sites") = 4096,
+          nb::arg("max_extra_control_nodes") = 65536, nb::arg("no_clone") = true,
+          nb::arg("boundary_motion") = true);
 
   testing.def(
       "share_sync_command_guards",
@@ -668,6 +740,29 @@ void BindTesting(nb::module_& m) {
       },
       nb::arg("block"), nb::arg("possible"), nb::arg("cases"),
       "Emitter-only case aggregation under a supplied possible cut domain; unknown means full domain");
+
+  testing.def(
+      "inspect_sync_invocation_schedules",
+      [](const ir::FunctionPtr& owner, const std::vector<std::tuple<int64_t, int64_t, ir::StmtPtr>>& supplied,
+         int64_t trips) {
+        std::vector<ir::sync::SyncCommandCase> cases;
+        for (const auto& [lo, hi, body] : supplied) cases.push_back({{lo, hi}, body});
+        auto [groups, work] = ir::sync::InspectSyncInvocationSchedules(owner, cases, trips);
+        auto out = DescribePhysicalSync(work);
+        out["groups"] = nb::cast(groups);
+        return out;
+      },
+      nb::arg("owner"), nb::arg("cases"), nb::arg("trips"),
+      "Test production complete-schedule grouping; supplied commands are not protocol certification");
+
+  testing.def(
+      "emit_sync_boundary_commands",
+      [](const ir::FunctionPtr& owner,
+         const std::vector<std::tuple<ir::CallPtr, ir::StmtPtr, ir::StmtPtr>>& cuts, bool enabled) {
+        return DescribePhysicalSync(ir::sync::EmitSyncBoundaryCommands(owner, cuts, enabled));
+      },
+      nb::arg("owner"), nb::arg("cuts"), nb::arg("enabled") = true,
+      "Emitter-only boundary schedule for qualified original cuts; does not qualify a protocol");
 
   testing.def("validate_buffer_op_contract", &ValidateBufferOpContractForTesting, nb::arg("stage"),
               nb::arg("arity").none(), nb::arg("args"), nb::arg("result_type"), nb::arg("effects"),
@@ -739,11 +834,15 @@ void BindTesting(nb::module_& m) {
       .def(
           "realize_physical",
           [](const ir::sync::CompactSyncResult& analysis, const std::string& target,
-             const std::optional<std::vector<int>>& eligible_ids) {
-            const auto result = ir::sync::RealizePhysicalSync(analysis, target, eligible_ids);
-            return DescribePhysicalSync(result);
+             const std::optional<std::vector<int>>& eligible_ids,
+             const ir::sync::SyncSchedulePolicy& policy) {
+            const auto result = ir::sync::RealizePhysicalSync(analysis, target, eligible_ids, policy);
+            auto out = DescribePhysicalSync(result);
+            out["schedule_policy"] = DescribeSchedulePolicy(policy);
+            return out;
           },
-          nb::arg("target"), nb::arg("eligible_ids") = nb::none(),
+          nb::arg("target"), nb::arg("eligible_ids") = nb::none(), nb::kw_only(),
+          nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
           "Realize retained demands with certified physical handoffs; no scarcity repair")
       .def("describe", &DescribeCompactSync, "Inspect retained analysis without additional construction")
       .def("expand_retained_demands", &ir::sync::CompactSyncResult::ExpandRetainedDemands,
@@ -801,13 +900,37 @@ void BindTesting(nb::module_& m) {
                 .function;
           },
           nb::arg("target") = "a2a3");
+  testing.def("check_generated_logical_sync", &ir::sync::CheckGeneratedLogicalSync, nb::arg("function"),
+              "Check insertion-owned logical IR using the production internal-error boundary");
+  testing.def(
+      "lower_sync_schedule",
+      [](const ir::FunctionPtr& function, const std::string& target,
+         const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks,
+         const ir::sync::SyncSchedulePolicy& policy) {
+        const auto result =
+            ir::sync::LowerLogicalSync(function, target, std::nullopt, parameters, blocks, policy);
+        nb::dict out;
+        out["function"] = result.function;
+        out["set_sites"] = result.set_sites;
+        out["wait_sites"] = result.wait_sites;
+        nb::list cases;
+        for (const auto& item : result.physical_cases) cases.append(DescribePhysicalSync(item));
+        out["physical_cases"] = cases;
+        out["schedule"] = DescribeSchedule(result.physical_cases.empty() ? ir::sync::PhysicalSyncRealization{}
+                                                                         : result.physical_cases.front());
+        out["schedule_policy"] = DescribeSchedulePolicy(policy);
+        return out;
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
+      nb::kw_only(), nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
+      "Run the production actual-token lowering with explicit current invocation evidence");
   testing.def(
       "analyze_scoped_token_order",
       [](const ir::FunctionPtr& function, const std::string& target) {
         ir::CheckLogicalSync(function);
         auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
-        auto input = ir::sync::ImportPlacedSync(stripped.function, true, target, {}, std::nullopt,
-                                                ir::sync::SyncOccurrenceLayout::OriginalFrames);
+        auto input = ir::sync::ImportSyncPayloads(stripped.function, target);
         auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops);
         return std::make_shared<ir::sync::ScopedTokenOrder>(std::move(input), std::move(families));
       },
@@ -818,8 +941,7 @@ void BindTesting(nb::module_& m) {
          const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks) {
         ir::CheckLogicalSync(function);
         auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
-        const auto input = ir::sync::ImportPlacedSync(stripped.function, true, target, parameters, blocks,
-                                                      ir::sync::SyncOccurrenceLayout::OriginalFrames);
+        const auto input = ir::sync::ImportSyncPayloads(stripped.function, target, parameters, blocks);
         ir::sync::ScopedTokenWork work;
         const auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops, &work);
         nb::dict out;
@@ -866,8 +988,9 @@ void BindTesting(nb::module_& m) {
       .def(
           "realize_physical",
           [](const ir::sync::SyncInvocationAnalysis& analysis, const std::string& target,
-             const std::optional<std::vector<int>>& eligible_ids) {
-            const auto result = ir::sync::RealizePhysicalInvocation(analysis, target, eligible_ids);
+             const std::optional<std::vector<int>>& eligible_ids,
+             const ir::sync::SyncSchedulePolicy& policy) {
+            const auto result = ir::sync::RealizePhysicalInvocation(analysis, target, eligible_ids, policy);
             nb::dict out;
             out["function"] = result.function;
             nb::list cases;
@@ -883,6 +1006,8 @@ void BindTesting(nb::module_& m) {
               guards += result.cases[i].guard_sites;
             }
             out["cases"] = cases;
+            out["schedule"] = DescribeSchedule(result.cases.front());
+            out["schedule_policy"] = DescribeSchedulePolicy(policy);
             nb::dict case_sites;
             case_sites["set_sites"] = sets;
             case_sites["wait_sites"] = waits;
@@ -901,7 +1026,8 @@ void BindTesting(nb::module_& m) {
             out["if_sites"] = emitted.branches;
             return out;
           },
-          nb::arg("target"), nb::arg("eligible_ids") = nb::none(),
+          nb::arg("target"), nb::arg("eligible_ids") = nb::none(), nb::kw_only(),
+          nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
           "Realize all qualified cases into one original payload tree transactionally")
       .def("select_case", &ir::sync::SyncInvocationAnalysis::SelectCase, nb::arg("block_index"),
            nb::arg("parameters"), "Retained case for a fully bound admitted invocation, or None")

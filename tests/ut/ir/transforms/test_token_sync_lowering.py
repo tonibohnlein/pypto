@@ -23,8 +23,8 @@ from pypto.ir.op import sync
 
 from .sync_logical_oracle import CommandExecution, Token, value
 from .sync_matmul_cases import capture, staged_fixture
-from .sync_matmul_oracle import hardware_reference, interpret
-from .sync_physical_oracle import PhysicalExecution, directional_widths
+from .sync_matmul_oracle import hardware_reference
+from .sync_physical_oracle import PhysicalExecution, checked_payload_calls, directional_widths
 from .test_autosync_switch import clone
 from .test_finite_sync_analysis import closure
 from .test_logical_sync_realization import verify
@@ -75,12 +75,12 @@ def _project(vertices, edges, payload_vertices):
 
 def _check_actual_tokens(original, logical, physical, *, check_codegen=True, require_access_coverage=True):
     """Check all token-induced order, matching and reuse without compiler families."""
-    _, calls = interpret(original)
+    calls, emitted_calls = checked_payload_calls(original, physical)
     reference = hardware_reference(original, calls)
     token_state = FiniteTokenExecution(calls, reference[0])
     token_state.execute(logical.body, {})
     _, expected = _project(token_state.vertices, token_state.edges, reference[0])
-    flag_state = PhysicalExecution(calls, reference[0], range(6))
+    flag_state = PhysicalExecution(emitted_calls, reference[0], range(6))
     flag_state.execute(physical.body, {})
     order, actual = _project(flag_state.vertices, flag_state.edges, reference[0])
     assert token_state.payload_count == flag_state.payload_count == len(calls)
