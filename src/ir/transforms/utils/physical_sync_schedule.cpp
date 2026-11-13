@@ -651,9 +651,11 @@ class AssignedCommandLowering {
       if (f.ids.size() > 1 && !literal_residue)
         residue = std::make_shared<FloorMod>(index, Integer(f.ids.size(), span), DataType::INDEX, span);
       ControlPtr selection;
-      // Distinct residue tests are mutually exclusive. Keep the last equality
-      // too: no extra exhaustiveness/range premise is needed for this rewrite.
-      // All selection arithmetic stays beneath the original presence guards.
+      // This is the complete table for FloorMod(index, positive table size),
+      // whose range is [0, size). After excluding residues 0..size-2, the last
+      // entry is exhaustive. This proof belongs to this table constructor,
+      // not arbitrary conditional trees. Keep the entire selection beneath
+      // the original presence guards, including lower bounds on index.
       for (size_t i = f.ids.size(); i-- > 0;) {
         if (literal_residue) {
           const auto period = static_cast<int64_t>(f.ids.size());
@@ -669,7 +671,7 @@ class AssignedCommandLowering {
              {"core_type", std::string(input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
             span);
         ControlPtr command = ControlCommand(call, span, result_);
-        if (residue) {
+        if (residue && i + 1 < f.ids.size()) {
           ++result_.guard_sites;
           command = ControlBranch(
               Conditions(r).Simplify(std::make_shared<Eq>(residue, Integer(i, span), DataType::BOOL, span)),
@@ -1163,6 +1165,7 @@ void AccumulateScheduleWork(PhysicalSyncRealization& result, const PhysicalSyncR
                       &PhysicalSyncRealization::barrier_sites,
                       &PhysicalSyncRealization::guard_sites,
                       &PhysicalSyncRealization::shared_guard_sites,
+                      &PhysicalSyncRealization::shared_composed_guard_sites,
                       &PhysicalSyncRealization::simplified_guard_sites,
                       &PhysicalSyncRealization::endpoint_domain_entries,
                       &PhysicalSyncRealization::endpoint_predicates_constructed,
@@ -1278,6 +1281,120 @@ void PrepareBoundaryMotion(const RegularLoopSchedule& loop, PreparedSchedulePhas
   phase.entry = std::move(entry);
   phase.exit = std::move(exit);
 }
+
+// Adjacent after/before forests denote the same executable gap when no original
+// statement separates them. Join only those gaps, before scalar materialization.
+// Definitions, unsupported control, and loop headers are fences. The only loop
+// boundary commands admitted here have already been proved movable by planning.
+// Each nonempty forest is joined at most once; payloads and their order are untouched.
+class CommandSeams {
+  CutInventory& cuts_;
+  PhysicalSyncRealization& work_;
+  BoundarySchedules* boundaries_;
+  const PreparedLoops* loops_;
+  BoundarySchedule* boundary_ = nullptr;
+  ControlForest* pending_ = nullptr;
+  std::map<const PhysicalCuts*, size_t> uses_;
+
+  void Join(ControlForest& before) {
+    if (!pending_ || pending_->empty() || before.empty() || pending_ == &before) return;
+    ControlForest joined = *pending_;
+    joined.insert(joined.end(), before.begin(), before.end());
+    auto shared = ShareCommandGuards(joined, work_, false);
+    // Keep original cut ownership if no decision was actually removed.
+    if (CaseCodeSize(shared).guards < CaseCodeSize(joined).guards) {
+      *pending_ = std::move(shared);
+      before.clear();
+    }
+  }
+
+ public:
+  CommandSeams(CutInventory& cuts, PhysicalSyncRealization& work, BoundarySchedules* boundaries = nullptr,
+               const PreparedLoops* loops = nullptr)
+      : cuts_(cuts), work_(work), boundaries_(boundaries), loops_(loops) {}
+  void Run(const StmtPtr& body) {
+    class Uses : public IRVisitor {
+      CommandSeams& owner_;
+      void VisitStmt_(const IfStmtPtr& branch) override {
+        const auto first = owner_.cuts_.find(SingletonCall(branch->then_body_));
+        const auto second =
+            branch->else_body_ ? owner_.cuts_.find(SingletonCall(*branch->else_body_)) : owner_.cuts_.end();
+        if (branch->return_vars_.empty() && first != owner_.cuts_.end() && second != owner_.cuts_.end() &&
+            first->second == second->second) {
+          // Initialization/accumulation alternatives are one wrapped payload
+          // cut in the materializer, not two independently placed occurrences.
+          ++owner_.uses_[first->second.get()];
+          return;
+        }
+        IRVisitor::VisitStmt_(branch);
+      }
+      void VisitExpr_(const CallPtr& call) override {
+        ++owner_.work_.schedule_body_visits;
+        if (auto found = owner_.cuts_.find(call.get()); found != owner_.cuts_.end())
+          ++owner_.uses_[found->second.get()];
+        IRVisitor::VisitExpr_(call);
+      }
+
+     public:
+      explicit Uses(CommandSeams& owner) : owner_(owner) {}
+    };
+    Uses(*this).VisitStmt(body);
+    Visit(body);
+  }
+  void Visit(const StmtPtr& stmt) {
+    ++work_.schedule_body_visits;
+    if (auto seq = As<SeqStmts>(stmt)) {
+      for (const auto& child : seq->stmts_) Visit(child);
+      return;
+    }
+    if (auto loop = As<ForStmt>(stmt)) {
+      if (loops_) {
+        auto found = loops_->find(loop.get());
+        if (found != loops_->end()) {
+          // A selected loop is a complete, already costed candidate. Its
+          // internal seams were normalized before costing; do not move commands
+          // into/out of that candidate after selection.
+          pending_ = nullptr;
+          return;
+        }
+      }
+      auto found = boundaries_ ? boundaries_->find(loop.get()) : BoundarySchedules::iterator{};
+      auto* plan = boundaries_ && found != boundaries_->end() ? &found->second : nullptr;
+      if (plan) Join(plan->entry);
+      pending_ = nullptr;
+      auto* previous = boundary_;
+      boundary_ = plan;
+      Visit(loop->body_);
+      boundary_ = previous;
+      pending_ = plan ? &plan->exit : nullptr;
+      return;
+    }
+    auto found = cuts_.find(SingletonCall(stmt));
+    const auto branch = As<IfStmt>(stmt);
+    if (branch) {
+      found = cuts_.find(SingletonCall(branch->then_body_));
+      const auto other = branch->else_body_ ? cuts_.find(SingletonCall(*branch->else_body_)) : cuts_.end();
+      if (!branch->return_vars_.empty() || found == cuts_.end() || other == cuts_.end() ||
+          found->second != other->second)
+        found = cuts_.end();
+    }
+    if (found != cuts_.end() && uses_[found->second.get()] == 1) {
+      auto& cut = *found->second;
+      auto changed = boundary_ ? boundary_->cuts.find(&cut) : decltype(boundary_->cuts)::iterator{};
+      auto* override = boundary_ && changed != boundary_->cuts.end() ? &changed->second : nullptr;
+      Join(override ? override->first : cut.before);
+      pending_ = override ? &override->second : &cut.after;
+      return;
+    }
+    pending_ = nullptr;
+    if (branch) {
+      Visit(branch->then_body_);
+      pending_ = nullptr;
+      if (branch->else_body_) Visit(*branch->else_body_);
+      pending_ = nullptr;
+    }
+  }
+};
 
 class ScheduleTreeSize : public IRVisitor {
  public:
@@ -1578,6 +1695,7 @@ CandidateSchedule PrepareCandidate(const RegularLoopSchedule& loop, unsigned mod
                    : CopyScheduleCuts(cuts);
       }
       if (policy.boundary_motion) PrepareBoundaryMotion(loop, phase, candidate.work);
+      for (auto& cuts : phase.visits) CommandSeams(cuts, candidate.work).Run(loop.loop->body_);
     }
     candidate.plan.versions.push_back(std::move(selected));
   }
@@ -1906,7 +2024,7 @@ FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vec
   }
   CutDomains(absent, domains, blocks, work).VisitStmt(schedule.owner->body_);
   const auto inventory = CollectRegularLoops(schedule, work);
-  const auto plans = PlanLoopSchedules(schedule, domains, inventory, blocks, work, policy);
+  auto plans = PlanLoopSchedules(schedule, domains, inventory, blocks, work, policy);
   std::set<const Call*> specialized;
   for (const auto& [loop, plan] : plans)
     specialized.insert(plan.loop.anchors.begin(), plan.loop.anchors.end());
@@ -1920,6 +2038,7 @@ FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vec
   work.schedule_name_visits += names.visits;
   BoundaryScheduleCollector boundary(cuts, plans, work);
   if (policy.boundary_motion) boundary.VisitStmt(schedule.owner->body_);
+  CommandSeams(cuts, work, &boundary.plans, &plans).Run(schedule.owner->body_);
   auto function = MaterializeSelectedSchedule(schedule.owner, schedule.block, cuts, plans, boundary.plans,
                                               blocks, work, names);
   FinishSyncScheduleReceipt(function, work, policy);
@@ -1998,7 +2117,10 @@ PhysicalSyncRealization EmitSyncBoundaryCommands(
   work.schedule_name_visits += names.visits;
   const PreparedLoops loops;
   BoundaryScheduleCollector boundary(inventory, loops, work);
-  if (enabled) boundary.VisitStmt(owner->body_);
+  if (enabled) {
+    boundary.VisitStmt(owner->body_);
+    CommandSeams(inventory, work, &boundary.plans, &loops).Run(owner->body_);
+  }
   work.function =
       MaterializeSelectedSchedule(owner, nullptr, inventory, loops, boundary.plans, {}, work, names);
   return work;

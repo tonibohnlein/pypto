@@ -358,3 +358,70 @@ materializes asynchronous dependencies in IR before separate canonicalization
 and scheduling stages. It is a precedent for making the protocol explicit before
 optimization, not a proof that AIR tokens and this target's flags have identical
 semantics.
+
+
+## Adjacent decisions and exhaustive ID tables
+
+Assigned-command construction shares adjacent decisions with structurally equal
+immutable conditions, including their `else` arms. It appends each arm in original
+command order; it neither deduplicates commands nor fills holes in activity domains.
+Unsupported condition equality retains the separate decisions. The streaming builder
+visits supplied descriptors once and freezes each accumulated arm once, avoiding
+repeated copying of a growing command sequence.
+
+After case composition, adjacent outgoing/incoming forests may occupy the same
+executable gap. The planner combines only these gaps, with original definitions,
+payloads, arbitrary control and loop headers as fences. Shared initialization and
+accumulation anchors are one wrapped payload cut; multiply placed anchors are not
+rewritten. Independently selected loop candidates remain boundaries. Internal gap
+sharing happens before complete-candidate costing and growth qualification. The
+materializer continues to consume descriptors without selecting an optimization.
+`shared_composed_guard_sites` accounts for sharing after case composition separately
+from endpoint-only `shared_guard_sites`.
+
+For a complete physical-ID table of positive size `p`, the producer builds selection
+from `floor_mod(index, p)`. Its range is `[0,p)`, so after testing residues `0` through
+`p-2`, the last arm needs no test. This proof is local to complete table construction;
+partial residue ladders remain guarded. All endpoint-presence conditions still
+surround the selection. Original coordinates, frame bindings, directions, assigned
+IDs and command multiplicity are unchanged. These changes do not introduce peeling,
+periodic expansion, a new allocation policy, or a new native completion premise.
+
+
+The [follow-up receipt](sync-decision-sharing.json) pins the uncommitted source
+snapshot, extension and commands against `61f57a62f`. All 16 fixture input hashes
+match the earlier audit. All 235 bounded ordered physical-command traces match;
+the nine small independent access/order/matching/reuse graph checks retain equal
+payload relations and zero excess completion-to-start pairs. Larger Qwen trace
+checks are not a uniform proof of its native footprints or return semantics.
+
+| Generated C++ body | Before `if` sites | After `if` sites | Before/after source bytes |
+| --- | ---: | ---: | ---: |
+| Rotating, 7 visits | 20 | 14 | 7,754 / 7,308 |
+| Rotating crossings | 36 | 28 | 9,204 / 8,590 |
+| Qwen gate/up, band 2, H=512 | 70 | 68 | 29,690 / 29,542 |
+| Qwen gate/up, band 2, H=5120 | 137 | 131 | 38,729 / 38,237 |
+
+The remaining 12 cases have unchanged C++ size. SET, WAIT and barrier site counts
+are unchanged in every case. Large gate/up removes up to 480 executed condition
+tests per checked invocation. Smaller band-0 gate/up improves IR control but its
+C++ is unchanged because downstream compilation already removed that redundancy.
+The seven-visit rotating check with nonzero start and nonunit step drops from 80
+to 70 executed tests; the explicitly requested boundary/periodic schedule drops
+from 36 to 31. No new peeling or periodic expansion is enabled. Single compiler
+measurements in the receipt are descriptive, not speedup evidence; no device run
+was performed.
+
+Final focused gate: **352 passed**, with seven existing inline-helper deprecation
+warnings. This includes the eight scheduling combinations, original-coordinate
+and reset tests, matching/reuse checks, and trip-count compactness regressions.
+The changes are not a new device qualification.
+
+Independent review accepted the production patch. The review-only addition of
+`pytest.main` entry points passed all 41 affected tests; the production snapshot
+and 352-test gate remain unchanged. One obvious repetition remains in small
+band-2 gate/up: adjacent SET and WAIT alternatives repeat the same condition
+across a selected-loop entry boundary. Removing it requires extending descriptor
+ownership and complete-candidate cost accounting, not an emitter-local rewrite.
+This is nonblocking for this patch; it is not evidence that all remaining guards
+are necessary or that control minimization is complete.

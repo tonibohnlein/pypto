@@ -184,3 +184,27 @@ def test_negative_step_keeps_original_lowering():
     i, a = variable("i"), payload()
     result = compare(loop(i, 4, 0, -1, seq(a)), [(a.expr, guarded(eq(i, 4), command(1)), seq())])
     assert result["scheduled_loops"] == 0
+
+
+@pytest.mark.parametrize("fence", ["none", "definition", "payload", "branch", "duplicate"])
+def test_decision_sharing_only_across_one_executable_command_gap(fence):
+    a, b, unrelated = payload(), payload(), payload()
+    choice = variable("choice")
+    condition = eq(choice, 1)
+    left = ir.IfStmt(condition, command(0), command(1), [], SPAN)
+    right = ir.IfStmt(condition, command(2), command(3), [], SPAN)
+    between = {
+        "none": [],
+        "definition": [ir.AssignStmt(variable("local"), ci(1), SPAN)],
+        "payload": [unrelated],
+        "branch": [guarded(condition, unrelated)],
+        "duplicate": [a],
+    }[fence]
+    body = seq(a, *between, b)
+    cuts = [(a.expr, seq(), left), (b.expr, right, seq())]
+    result = compare(body, cuts, [{choice: value} for value in (0, 1, 2)])
+    assert result["shared_composed_guard_sites"] == int(fence == "none")
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

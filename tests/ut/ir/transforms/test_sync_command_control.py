@@ -86,17 +86,87 @@ def test_consecutive_prefixes_keep_duplicate_leaves_and_guard_order():
             assert after.counts["conditions"] <= before.counts["conditions"]
 
 
-def test_free_variable_identity_and_opaque_else():
+def test_free_variable_identity_and_shared_else():
     a = ir.Var("same", ir.ScalarType(ir.DataType.BOOL), SPAN)
     b = ir.Var("same", a.type, SPAN)
     choice = ir.IfStmt(a, command(1), command(2), [], SPAN)
     original = seq(guarded(a, command()), guarded(b, command()), choice, guarded(a, command(3)))
     output = testing.share_sync_command_guards(original)
     assert isinstance(output, ir.SeqStmts)
-    assert len(output.stmts) == 4
+    assert len(output.stmts) == 3
     for av in (False, True):
         for bv in (False, True):
             assert evaluate(original, {a: av, b: bv}).trace == evaluate(output, {a: av, b: bv}).trace
+
+
+def test_adjacent_nested_decisions_share_both_arms_without_deduplication():
+    a = ir.Var("outer", ir.ScalarType(ir.DataType.BOOL), SPAN)
+    b = ir.Var("inner", a.type, SPAN)
+
+    def choice(condition, yes, no):
+        return ir.IfStmt(condition, yes, no, [], SPAN)
+
+    original = seq(
+        choice(a, command(0), choice(b, command(1), command(2))),
+        choice(a, command(0), choice(b, command(3), guarded(a, command(4)))),
+        choice(a, command(5), guarded(b, command(1))),
+    )
+    output = testing.share_sync_command_guards(original)
+    assert len(output.stmts) == 1
+    assert len(output.stmts[0].then_body.stmts) == 3
+    assert len(output.stmts[0].else_body.stmts) == 1
+    for av in (False, True):
+        for bv in (False, True):
+            before, after = evaluate(original, {a: av, b: bv}), evaluate(output, {a: av, b: bv})
+            assert before.trace == after.trace
+            assert after.counts["conditions"] < before.counts["conditions"]
+
+
+def test_unconditional_command_fences_decision_sharing():
+    a = ir.Var("a", ir.ScalarType(ir.DataType.BOOL), SPAN)
+    decision = ir.IfStmt(a, command(1), command(2), [], SPAN)
+    original = seq(decision, command(3), decision)
+    output = testing.share_sync_command_guards(original)
+    assert len(output.stmts) == 3
+    for av in (False, True):
+        assert evaluate(original, {a: av}).trace == evaluate(output, {a: av}).trace
+
+
+def test_partial_residue_decisions_do_not_acquire_an_exhaustive_else():
+    # Only the ID-table producer knows that every residue was enumerated.
+    # The generic sharing service must preserve holes even for modulo syntax.
+    x = ir.Var("x", ir.ScalarType(ir.DataType.INDEX), SPAN)
+
+    def literal(value):
+        return ir.ConstInt(value, ir.DataType.INDEX, SPAN)
+
+    residue = ir.FloorMod(x, literal(3), ir.DataType.INDEX, SPAN)
+    zero = ir.Eq(residue, literal(0), ir.DataType.BOOL, SPAN)
+    two = ir.Eq(residue, literal(2), ir.DataType.BOOL, SPAN)
+    decision = ir.IfStmt(zero, command(0), guarded(two, command(2)), [], SPAN)
+    original = seq(decision, decision)
+    output = testing.share_sync_command_guards(original)
+    for value in range(9):
+        before, after = evaluate(original, {x: value}), evaluate(output, {x: value})
+        assert before.trace == after.trace
+        if value % 3 == 1:
+            assert not after.trace
+
+
+def test_unproved_decision_expression_keeps_separate_trees():
+    x = ir.Var("x", ir.ScalarType(ir.DataType.INDEX), SPAN)
+    divisor = ir.Var("divisor", x.type, SPAN)
+    residue = ir.FloorMod(x, divisor, ir.DataType.INDEX, SPAN)
+    condition = ir.Eq(residue, ir.ConstInt(0, ir.DataType.INDEX, SPAN), ir.DataType.BOOL, SPAN)
+    choice = ir.IfStmt(condition, command(0), command(1), [], SPAN)
+    original = seq(choice, choice)
+    output = testing.share_sync_command_guards(original)
+    # The descriptor service has no positive-divisor premise for this value.
+    assert len(output.stmts) == 2
+    for value in range(6):
+        for period in (1, 2, 3):
+            env = {x: value, divisor: period}
+            assert evaluate(original, env).trace == evaluate(output, env).trace
 
 
 def test_unavailable_structural_comparison_keeps_unfactored_plan():
@@ -145,7 +215,9 @@ def test_residue_selection_stays_compact_and_matches_original_accesses(count):
         run_physical(original, physical, range(6))
     if count == 7:
         state = trace_control(physical)
-        assert state.counts["conditions"] == 80
+        # Ten executions reach the exhaustive final ID arm; its equality
+        # test is no longer constructed. Endpoint presence tests remain.
+        assert state.counts["conditions"] == 70
         logical = worker(apply(passes.insert_sync, program_of(original)), original.name)
         specialized = testing.lower_sync_schedule(
             logical,
@@ -154,7 +226,7 @@ def test_residue_selection_stays_compact_and_matches_original_accesses(count):
         run_physical(original, specialized, range(6))
         optimized = trace_control(specialized)
         assert optimized.trace == state.trace
-        assert optimized.counts["conditions"] == 36
+        assert optimized.counts["conditions"] == 31
 
 
 @pytest.mark.parametrize("band,bound", [(0, 111), (1, 115), (2, 147), (3, 149)])
@@ -184,3 +256,7 @@ def test_qwen_whole_cut_coalescing_reduces_control_without_new_coloring(band, bo
             state.counts[ir.get_op("system.set_flag").name]
             == state.counts[ir.get_op("system.wait_flag").name]
         )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

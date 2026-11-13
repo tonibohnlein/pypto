@@ -69,7 +69,9 @@ ControlPtr ImportControl(const StmtPtr& stmt, PhysicalSyncRealization& work);
 std::vector<StmtPtr> MaterializeControl(const ControlForest& forest, PhysicalSyncRealization& work);
 std::vector<StmtPtr> MaterializeCommandValues(const std::vector<StmtPtr>& commands, SyncTokenNames& names,
                                               PhysicalSyncRealization& work);
-ControlForest ShareCommandGuards(const ControlForest& commands, PhysicalSyncRealization& work);
+// Endpoint accounting applies only before invocation-case composition.
+ControlForest ShareCommandGuards(const ControlForest& commands, PhysicalSyncRealization& work,
+                                 bool endpoint = true);
 void AppendCase(std::vector<CaseCommands>& cases, std::pair<int64_t, int64_t> blocks,
                 const ControlForest& commands, const Span& span, PhysicalSyncRealization& work);
 Intervals SubtractIntervals(const Intervals& domain, const Intervals& absent);

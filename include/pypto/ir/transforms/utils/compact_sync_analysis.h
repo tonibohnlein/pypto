@@ -379,6 +379,7 @@ struct PhysicalSyncRealization {
   // Per-case command sites after local prefix sharing, before invocation-case
   // coalescing. The invocation diagnostic separately counts final emitted IR.
   size_t shared_guard_sites = 0, control_statement_visits = 0;
+  size_t shared_composed_guard_sites = 0;  // Sharing composed cases and adjacent command gaps.
   size_t simplified_guard_sites = 0, shared_control_values = 0;
   // Invocation-wide domain/materialization work is charged to the first case.
   // Expression visits count our inspections, not internals of the arith analyzer.

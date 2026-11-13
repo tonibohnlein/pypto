@@ -138,6 +138,7 @@ def examine(name, program, valuations, independent, output, baseline):
         for field in (
             "constructed_guard_sites",
             "shared_guard_sites",
+            "shared_composed_guard_sites",
             "control_statement_visits",
             "simplified_guard_sites",
             "shared_control_values",
@@ -220,11 +221,15 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--emit-cpp", action="store_true")
+    parser.add_argument("--case", action="append", help="Run only these existing fixture names (repeatable)")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     backend.set_backend_type(backend.BackendType.Ascend910B)
     rows = []
+    selected = set(args.case or [])
     for name, program, values, independent in fixtures():
+        if selected and name not in selected:
+            continue
         row = examine(name, program, values, independent, args.output, args.baseline)
         if args.emit_cpp:
             row["cpp_after"] = compile_cpp(args.output / f"{name}.pto", args.output / f"{name}.cpp")
@@ -234,6 +239,8 @@ def main():
                 )
         rows.append(row)
         print(name, row["after"], flush=True)
+    if selected - {row["name"] for row in rows}:
+        raise ValueError(f"Unknown fixtures: {sorted(selected - {row['name'] for row in rows})}")
     tracked = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
     paths = [Path(p) for p in tracked if Path(p).is_file()]
     paths += [

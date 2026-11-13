@@ -253,51 +253,70 @@ void VisitControlExpressions(const ControlPtr& node, IRVisitor& visitor) {
   for (const auto& child : node->alternative) VisitControlExpressions(child, visitor);
 }
 
-// Share adjacent guard prefixes directly in descriptors. ID decision chains
-// remain opaque; no command crosses an alternative or a payload boundary.
+// Share adjacent decisions directly in descriptors. For an immutable condition
+// c, (if c A else B); (if c C else D) is (if c A;C else B;D).
+// Append each supplied arm once and freeze once: never copy a growing prefix.
+// Empty arms and duplicate command leaves retain their original meaning. This
+// operates only within one command forest; payloads and definitions are fences.
 class CommandGuards {
   struct Node {
     ExprPtr condition;
     ControlPtr leaf;
-    std::vector<Node> children;
+    std::vector<Node> children, alternative;
   };
   std::vector<Node> roots_;
-  size_t shared_ = 0, visits_ = 0;
+  size_t shared_ = 0, visits_ = 0, expressions_ = 0;
   void Append(std::vector<Node>& nodes, const ControlPtr& statement) {
     ++visits_;
     if (!statement->condition && !statement->command) {
       for (const auto& child : statement->body) Append(nodes, child);
-    } else if (statement->condition && statement->alternative.empty()) {
+    } else if (statement->condition && (statement->alternative.empty() ||
+                                        PureCommandExpression(statement->condition, &expressions_))) {
       if (nodes.empty() || !nodes.back().condition ||
           !SameControl(nodes.back().condition, statement->condition))
-        nodes.push_back({statement->condition, nullptr, {}});
+        nodes.push_back({statement->condition, nullptr, {}, {}});
       else
         ++shared_;
       for (const auto& child : statement->body) Append(nodes.back().children, child);
+      for (const auto& child : statement->alternative) Append(nodes.back().alternative, child);
     } else {
-      nodes.push_back({nullptr, statement, {}});
+      nodes.push_back({nullptr, statement, {}, {}});
     }
   }
   static ControlForest Freeze(const std::vector<Node>& nodes, PhysicalSyncRealization& work) {
     ControlForest result;
     for (const auto& node : nodes) {
-      if (node.condition)
+      if (node.condition) {
+        std::optional<ControlPtr> alternative;
+        if (!node.alternative.empty())
+          alternative = ControlSequence(Freeze(node.alternative, work), node.condition->span_, work);
         result.push_back(ControlBranch(
             node.condition, ControlSequence(Freeze(node.children, work), node.condition->span_, work),
-            std::nullopt, node.condition->span_, work));
-      else
+            alternative, node.condition->span_, work));
+      } else {
         result.push_back(node.leaf);
+      }
     }
     return result;
   }
 
  public:
-  ControlForest Build(const ControlForest& commands, PhysicalSyncRealization& result) {
+  ControlForest Build(const ControlForest& commands, PhysicalSyncRealization& result, bool endpoint = true) {
     for (const auto& command : commands) Append(roots_, command);
-    INTERNAL_CHECK(result.guard_sites >= shared_) << "Internal error: command guard accounting";
-    result.guard_sites -= shared_;
-    result.shared_guard_sites += shared_;
+    if (endpoint) {
+      INTERNAL_CHECK(result.guard_sites >= shared_) << "Internal error: command guard accounting";
+      result.guard_sites -= shared_;
+      result.shared_guard_sites += shared_;
+    } else {
+      // Case decisions were constructed after endpoint accounting. Do not
+      // subtract them from the endpoint-only inventory.
+      result.shared_composed_guard_sites += shared_;
+    }
+    result.control_expression_visits += expressions_;
     result.control_statement_visits += visits_;
+    // Composed forests are already canonical sequences. Reuse their immutable
+    // descriptors when inspection found no sharing; do not reconstruct them.
+    if (!endpoint && !shared_) return commands;
     return Freeze(roots_, result);
   }
 };
@@ -702,11 +721,13 @@ ControlForest ScheduleCommandCases(const ExprPtr& block, const Intervals& possib
     }
   }
   target = ShareDisjointSequence(block, possible, coalesced, target, uniform_variables, work, span);
-  return ShareResidualSequence(block, possible, coalesced, target, uniform_variables, work, span);
+  target = ShareResidualSequence(block, possible, coalesced, target, uniform_variables, work, span);
+  return CommandGuards().Build(target, work, false);
 }
 
-ControlForest ShareCommandGuards(const ControlForest& commands, PhysicalSyncRealization& work) {
-  return CommandGuards().Build(commands, work);
+ControlForest ShareCommandGuards(const ControlForest& commands, PhysicalSyncRealization& work,
+                                 bool endpoint) {
+  return CommandGuards().Build(commands, work, endpoint);
 }
 
 }  // namespace physical

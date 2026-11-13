@@ -635,6 +635,7 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   out["constructed_guard_sites"] =
       result.guard_sites + result.shared_guard_sites + result.simplified_guard_sites;
   out["shared_guard_sites"] = result.shared_guard_sites;
+  out["shared_composed_guard_sites"] = result.shared_composed_guard_sites;
   out["control_statement_visits"] = result.control_statement_visits;
   out["simplified_guard_sites"] = result.simplified_guard_sites;
   out["shared_control_values"] = result.shared_control_values;

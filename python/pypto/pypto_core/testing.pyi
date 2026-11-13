@@ -212,6 +212,7 @@ class PhysicalSyncRealization(TypedDict):
     guard_sites: int
     constructed_guard_sites: int
     shared_guard_sites: int
+    shared_composed_guard_sites: int
     control_statement_visits: int
     reuse_queries: int
     reserved_lanes: int
