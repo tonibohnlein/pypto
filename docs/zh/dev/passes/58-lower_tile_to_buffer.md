@@ -61,7 +61,10 @@ FP32 行配方支持 allocation-backed 的稠密矩阵和正静态 valid。归�
 
 cast/compare/select 链也支持正静态 valid 和 allocation-backed 稠密操作数。
 `cast` 支持 FP16→FP32 和 FP32→FP16，舍入模式为 `none`/`rint`，饱和模式为 off；
-A2/A3 上两个方向的源和目的地都必须互不重叠。其他 dtype 对、模式和显式 cast scratch 保留 Tile。
+A2/A3 上两个方向的源和目的地都必须互不重叠。BF16→FP32 和 FP32→BF16 也支持
+`none`/`rint`，并额外支持 `round`（最近值，平局时远离零）；BF16 扩展为 FP32 是精确的。
+这些转换仍要求饱和模式 off、匹配的物理和有效形状，以及互不重叠的源和目的地，且不需要
+转换 scratch。其他 dtype 对、模式和显式 cast scratch 保留 Tile。
 
 `cmp`/`cmps` 支持 FP32 和六种比较模式。UINT8 谓词每个值占一位，低位在前：
 物理列数为 `round_up(ceil(C / 8), 32)`，有效列数为 `ceil(valid_C / 8)`，

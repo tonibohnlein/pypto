@@ -417,7 +417,8 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
           return std::any_of(site.accesses.begin(), site.accesses.end(), [&](const SyncAccess& access) {
             const auto& storage = input.storage.at(access.storage);
             return storage.slot_count > 1 ||
-                   (storage.byte_coordinates && access.write && (access.row_step || access.column_step));
+                   ((storage.byte_coordinates || storage.space == MemorySpace::DDR) && access.write &&
+                    (access.row_step || access.column_step));
           });
         });
       });

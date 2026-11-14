@@ -57,10 +57,17 @@ Coordinates Decode(const std::vector<SyncLoopFrame>& frames, int64_t ordinal) {
 }
 ExprPtr Coordinate(const SyncLoopFrame& frame, int64_t ordinal) {
   if (frame.start_expression && !As<ConstInt>(frame.start_expression)) {
-    // Import has proved this original invocation executes exactly once for
-    // every admitted caller. Its numerical start is only a placeholder.
-    CHECK(frame.count == 1 && ordinal == 0) << "Scoped token dynamic frame is not a proved singleton";
-    return frame.start_expression;
+    // The importer proves a uniform ordinal domain and original-width range
+    // for every caller. Reconstruct the original IV, retaining its SSA start.
+    const auto offset = __int128(ordinal) * frame.step;
+    CHECK(ordinal >= 0 && ordinal < frame.count && frame.step > 0 &&
+          offset <= std::numeric_limits<int64_t>::max())
+        << "Scoped token dynamic coordinate exceeds its proved frame";
+    if (!offset) return frame.start_expression;
+    return std::make_shared<Add>(
+        frame.start_expression,
+        std::make_shared<ConstInt>(static_cast<int64_t>(offset), DataType::INDEX, frame.loop->span_),
+        DataType::INDEX, frame.loop->span_);
   }
   const auto value = __int128(frame.start) + __int128(ordinal) * frame.step;
   CHECK(frame.start >= 0 && frame.step > 0 && value >= 0 && value <= std::numeric_limits<int64_t>::max())

@@ -218,11 +218,19 @@ class ActivationPartition {
         cuts.insert(piece.lo);
         cuts.insert(piece.hi + 1);
         const auto lo = piece.At(piece.lo), hi = piece.At(piece.hi);
-        CHECK(lo >= stop->value_ || Wide(stop->value_) - lo <= step->value_)
-            << "Invocation activation has more than one visit per case";
-        if (lo < stop->value_ && hi >= stop->value_) {
-          CHECK(piece.coefficient == 1) << "Nonunit activation threshold needs an exact quotient certificate";
-          cuts.insert(static_cast<int64_t>(Wide(stop->value_) - piece.constant));
+        // A launch piece narrower than one stride crosses at most one
+        // quotient threshold. Construct that threshold analytically, without
+        // enumerating workers or iterations.
+        const auto count = [&](Wide start) -> Wide {
+          return start >= stop->value_ ? 0 : 1 + (Wide(stop->value_) - start - 1) / step->value_;
+        };
+        if (count(lo) != count(hi)) {
+          CHECK(piece.coefficient == 1 && hi - lo < step->value_)
+              << "Varying activation needs a unit-stride start range narrower than one loop stride";
+          const auto threshold = Wide(stop->value_) - (count(lo) - 1) * step->value_;
+          const auto cut = threshold - piece.constant;
+          CHECK(cut > piece.lo && cut <= piece.hi) << "Invalid invocation quotient threshold";
+          cuts.insert(static_cast<int64_t>(cut));
         }
       }
     }

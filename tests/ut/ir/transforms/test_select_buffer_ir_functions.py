@@ -1480,14 +1480,14 @@ class ColumnStore:
     assert _kernel(_lower(program, planner)).ir_stage == ir.FunctionIRStage.Functional
 
 
-def _conversion_program(scalar, mode=4, valid=(8, 64), cast_mode="rint"):
+def _conversion_program(scalar, mode=4, valid=(8, 64), cast_mode="rint", dtype="FP16"):
     rows, cols = valid
     compare = f"pl.tile.cmps(x, 0.0, cmp_type={mode})" if scalar else f"pl.tile.cmp(x, y, cmp_type={mode})"
     scratch = (
         "pl.create_tile([1, 64], dtype=pl.FP32)" if scalar else "pl.create_tile([1, 16], dtype=pl.UINT32)"
     )
     select = "pl.tile.sels(mask, x, scratch, -3.0)" if scalar else "pl.tile.sel(mask, x, y, scratch)"
-    return pl.parse_program(f"""
+    source = f"""
 @pl.program
 class ConversionChain:
     @pl.function(type=pl.FunctionType.InCore)
@@ -1504,7 +1504,22 @@ class ConversionChain:
         out = pl.store(result, [0, 0], out)
         out = pl.store(a_tile, [8, 0], out)
         return pl.store(b_tile, [16, 0], out)
-""")
+"""
+    return pl.parse_program(source.replace("pl.FP16", f"pl.{dtype}"))
+
+
+@pytest.mark.parametrize("cast_mode", ["rint", "round"])
+@pytest.mark.parametrize("valid", [(8, 64), (7, 61)])
+def test_bfloat_conversion_pipeline(tmp_path, cast_mode, valid):
+    program = _conversion_program(False, valid=valid, cast_mode=cast_mode, dtype="BF16")
+    lowered = _lower(program, passes.MemoryPlanner.PYPTO)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    source = codegen.PTOCodegen().generate(lowered)
+    assert "round_mode " + cast_mode.upper() in source
+    assert "bf16" in source
+    path = tmp_path / "bfloat.pto"
+    path.write_text(source)
+    _run_ptoas(str(path), str(tmp_path / "bfloat.cpp"), ["--pto-arch=a2", "--pto-level=level3"])
 
 
 @pytest.mark.parametrize("planner", _PLANNERS)

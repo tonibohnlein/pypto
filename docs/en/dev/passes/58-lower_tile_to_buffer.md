@@ -82,7 +82,11 @@ IR. Empty reduction axes do not inherit the elementwise no-data behavior.
 Cast/compare/select chains also qualify with positive static valid extents and
 allocation-backed dense operands. `cast` supports FP16 to FP32 and FP32 to FP16
 with `none`/`rint` rounding and saturation off; both directions require disjoint
-storage on A2/A3. Other dtype pairs, modes, and explicit cast scratch remain Tile.
+storage on A2/A3. BF16 to FP32 and FP32 to BF16 also support `none`/`rint`,
+and additionally `round` (nearest, ties away from zero). Widening BF16 is exact.
+These paths keep saturation off, matching physical/valid shapes and disjoint
+source/destination storage; they require no conversion scratch. Other dtype
+pairs, modes, and explicit cast scratch remain Tile.
 
 `cmp`/`cmps` support FP32 and all six comparison modes. Their UINT8 predicate
 has one bit per value, least-significant bit first: physical columns are
