@@ -232,7 +232,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     region["sites"] = sites;
     region["demands"] = analysis ? nb::object(families) : nb::object(nb::none());
     region["generators"] = analysis ? nb::object(generators) : nb::object(nb::none());
-    region["distance_entries"] = analysis ? analysis->distance.size() * analysis->distance.size() : 0;
+    region["distance_entries"] = 0;
     if (analysis) {
       region["rotating"] = analysis->rotating;
       region["core_frontiers"] = analysis->core_frontiers;

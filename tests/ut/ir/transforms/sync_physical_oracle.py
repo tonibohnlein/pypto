@@ -38,9 +38,29 @@ class PhysicalExecution(CommandExecution):
         self.handoffs = []
         self.ids = defaultdict(set)
         self.barriers = []
+        self.exits = []
+        self.last_completion = None
+
+    def complete_all_pipes(self):
+        # Existing target ALL-pipe contract. Unlike a WAIT, completion is
+        # established for every preceding payload, including a final store.
+        node = ("all_completion", len(self.barriers))
+        self.vertices.add(node)
+        for payload in self.latest_payload.values():
+            self.edges.add(((payload, True), node))
+        for commands in self.commands.values():
+            self.edges.update((command, node) for command in commands)
+        for pipe in self.latest_payload:
+            self.commands[pipe].append(node)
+            self.gate[pipe] = node
+        self.barriers.append(node)
+        self.last_completion = node
 
     def command(self, call):
         name = call.op.name
+        if name == ir.get_op("system.bar_all").name:
+            self.complete_all_pipes()
+            return
         is_set = name == ir.get_op("system.set_flag").name
         is_wait = name == ir.get_op("system.wait_flag").name
         if is_set or is_wait:
@@ -85,10 +105,23 @@ class PhysicalExecution(CommandExecution):
         self.commands[pipe].append(node)
 
     def execute(self, stmt, env):
+        if isinstance(stmt, ir.ReturnStmt):
+            node = ("return", len(self.exits))
+            self.vertices.add(node)
+            self.exits.append(node)
+            if self.last_completion is not None:
+                self.edges.add((self.last_completion, node))
+            return ()
         if isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call):
             if stmt.expr.op.name in {
                 ir.get_op(name).name
-                for name in ["system.set_flag", "system.wait_flag", "system.bar_m", "system.bar_v"]
+                for name in [
+                    "system.set_flag",
+                    "system.wait_flag",
+                    "system.bar_m",
+                    "system.bar_v",
+                    "system.bar_all",
+                ]
             }:
                 self.command(stmt.expr)
                 return None
@@ -108,7 +141,13 @@ def checked_payload_calls(original, emitted, parameters=None, *, block_index=Non
             stmt = op
             if isinstance(stmt.expr, ir.Call) and stmt.expr.op.name in {
                 ir.get_op(n).name
-                for n in ("system.set_flag", "system.wait_flag", "system.bar_m", "system.bar_v")
+                for n in (
+                    "system.set_flag",
+                    "system.wait_flag",
+                    "system.bar_m",
+                    "system.bar_v",
+                    "system.bar_all",
+                )
             }:
                 return ir.SeqStmts([], stmt.span)
             return stmt
@@ -154,7 +193,11 @@ def run_physical(original, emitted, eligible=range(8), parameters=None, *, block
     class CoreOwnership(ir.IRVisitor):
         def visit_call(self, op):
             call = op
-            if call.op.name in {ir.get_op("system.set_flag").name, ir.get_op("system.wait_flag").name}:
+            if call.op.name in {
+                ir.get_op("system.set_flag").name,
+                ir.get_op("system.wait_flag").name,
+                ir.get_op("system.bar_all").name,
+            }:
                 expected = "aiv" if original.func_type == ir.FunctionType.AIV else "aic"
                 assert call.kwargs["core_type"] == expected, "flag has the wrong owning core"
 

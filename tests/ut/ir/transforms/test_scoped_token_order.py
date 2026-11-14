@@ -90,13 +90,42 @@ def check_order(logical, *, physical=True):
     if physical and calls:
         diagnostic = order.realize()
         lowered = _apply(passes.lower_sync, logical)
-        # Production adds ownership metadata; commands must remain identical.
-        assert ir.python_print(diagnostic.body, format=False) == ir.python_print(lowered.body, format=False)
+
+        # Whole-kernel ownership adds a terminal drain; child lowering must
+        # retain pending payloads. Permit only that precise boundary difference.
+        class TerminalDrain(ir.IRMutator):
+            removed = 0
+
+            def visit_seq_stmts(self, op):
+                updated = super().visit_seq_stmts(op)
+                assert isinstance(updated, ir.SeqStmts)
+                kept = []
+                for i, child in enumerate(updated.stmts):
+                    if (
+                        isinstance(child, ir.EvalStmt)
+                        and isinstance(child.expr, ir.Call)
+                        and child.expr.op.name == ir.get_op("system.bar_all").name
+                    ):
+                        assert i + 1 < len(updated.stmts)
+                        assert isinstance(updated.stmts[i + 1], ir.ReturnStmt)
+                        self.removed += 1
+                    else:
+                        kept.append(child)
+                return ir.SeqStmts(kept, updated.span)
+
+        boundary = TerminalDrain()
+        internal = boundary.visit_function(lowered)
+        assert ir.python_print(diagnostic.body, format=False) == ir.python_print(internal.body, format=False)
         _, emitted_calls = checked_payload_calls(original, lowered)
         flags = PhysicalExecution(emitted_calls, reference[0], range(6))
         flags.execute(lowered.body, {})
         graph, projection = _project(flags.vertices, flags.edges, reference[0])
         assert flags.payload_count == len(calls)
+        assert boundary.removed == bool(flags.records and flags.waits)
+        if boundary.removed:
+            assert flags.exits and all(
+                ((p, True), exit_node) in graph for p in range(len(calls)) for exit_node in flags.exits
+            )
         assert not flags.live and not any(flags.pending.values())
         assert len(flags.records) == len(flags.waits)
         assert all(pair in graph for pair in flags.reuses)

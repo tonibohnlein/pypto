@@ -12,7 +12,6 @@
 #include "src/ir/transforms/utils/sync_boundary_graph.h"
 
 #include <array>
-#include <set>
 #include <vector>
 
 #include "pypto/core/logging.h"
@@ -57,9 +56,24 @@ SyncBoundaryGraph::SyncBoundaryGraph(const std::vector<CompactSegmentResult>& se
   for (size_t r = 0; r < segments.size(); ++r) {
     const auto& s = segments[r];
     if (!s.count) continue;
-    for (int64_t i : std::set<int64_t>{0, s.count - 1})
-      for (size_t p = 0; p < s.pipes.size(); ++p)
-        for (bool c : {false, true}) Node({{r, i, p}, c});
+    // A child can enter/leave a cross-region path only through a native
+    // pipe boundary or an explicitly supplied crossing. Internal paths remain
+    // exact child queries; exposing every site's first/final visit would make
+    // even a constant-size storage interface quadratic in the body's size.
+    std::array<std::optional<size_t>, kPipeCount> first{}, last{};
+    for (size_t site = 0; site < s.pipes.size(); ++site) {
+      const auto pipe = s.pipes[site];
+      if (!first[pipe]) first[pipe] = site;
+      last[pipe] = site;
+    }
+    for (size_t pipe = 0; pipe < kPipeCount; ++pipe) {
+      if (first[pipe]) {
+        for (bool completion : {false, true}) {
+          Node({{r, 0, *first[pipe]}, completion});
+          Node({{r, s.count - 1, *last[pipe]}, completion});
+        }
+      }
+    }
   }
   for (const auto& occurrence : extra_ports) {
     const auto [r, v, s] = occurrence;

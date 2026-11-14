@@ -13,7 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
-#include <deque>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -48,23 +48,44 @@ std::vector<Atom> Partition(const CompactSyncInput& input) {
         if (access.write) writes.at(access.storage).push_back(&access);
   for (size_t s = 0; s < input.storage.size(); ++s) {
     const auto& storage = input.storage[s];
-    std::set<int64_t> rows{0, storage.rows}, cols{0, storage.columns};
+    // Complete row-sweep partition: only writers active in a row band split
+    // its columns. Keep holes and read-only domains covered. Global Cartesian
+    // cuts would create quadratic empty cells even for disjoint diagonal writes.
+    // W write rectangles cost O(W log W + C) for C emitted cells. General
+    // overlapping rectangles can still have quadratic output; this is not an
+    // interval-only linear-size claim.
+    std::map<int64_t, std::vector<std::pair<int64_t, int>>> events;
+    events[0];
+    events[storage.rows];
     for (const auto* access : writes[s]) {
       const auto& a = *access;
       CHECK(a.row_step == 0 && a.column_step == 0)
           << "Moving writes need a rotating/visit-owned storage certificate";
-      rows.insert(a.row);
-      rows.insert(a.row + a.rows);
-      cols.insert(a.column);
-      cols.insert(a.column + a.columns);
+      if (!a.rows || !a.columns) continue;
+      for (int64_t column : {a.column, a.column + a.columns}) {
+        events[a.row].emplace_back(column, 1);
+        events[a.row + a.rows].emplace_back(column, -1);
+      }
     }
-    // Only static write boundaries split classes. Read-only changing slices
-    // do not enumerate trip counts or bytes. Below we prove membership of each
-    // read against every class is invariant, or refuse that abstraction.
-    std::vector<int64_t> r(rows.begin(), rows.end()), c(cols.begin(), cols.end());
-    for (size_t i = 1; i < r.size(); ++i)
-      for (size_t j = 1; j < c.size(); ++j)
-        atoms.push_back({s, r[i - 1], c[j - 1], r[i] - r[i - 1], c[j] - c[j - 1]});
+    std::map<int64_t, size_t> columns{{0, 1}, {storage.columns, 1}};
+    for (auto row = events.begin(); row != events.end(); ++row) {
+      // Multiplicity matters when several writes share a boundary. Applying
+      // both additions and removals before the next band gives half-open cells.
+      for (auto [column, delta] : row->second) {
+        if (delta > 0) {
+          ++columns[column];
+        } else {
+          auto found = columns.find(column);
+          INTERNAL_CHECK(found != columns.end() && found->second) << "Unbalanced storage sweep";
+          if (!--found->second) columns.erase(found);
+        }
+      }
+      auto next_row = std::next(row);
+      if (next_row == events.end()) break;
+      for (auto column = columns.begin(), next = std::next(column); next != columns.end(); ++column, ++next)
+        atoms.push_back(
+            {s, row->first, column->first, next_row->first - row->first, next->first - column->first});
+    }
   }
   return atoms;
 }
@@ -116,16 +137,33 @@ std::optional<std::pair<int64_t, int64_t>> PointVisits(const SyncAccess& access,
   if (visits) visits->second += segment.count - scope;
   return visits;
 }
+// One immutable directory per analysis, shared by every leaf. Cells are
+// contiguous within each row band, and columns are ordered and disjoint.
+struct RowBand {
+  int64_t first, end;
+  size_t begin_cell, end_cell;
+};
+using StorageIndex = std::vector<std::vector<RowBand>>;
+StorageIndex IndexClasses(const CompactSyncInput& input, const std::vector<Atom>& atoms) {
+  StorageIndex index(input.storage.size());
+  for (size_t c = 0; c < atoms.size(); ++c) {
+    const auto& atom = atoms[c];
+    auto& bands = index.at(atom.storage);
+    if (bands.empty() || bands.back().first != atom.row)
+      bands.push_back({atom.row, atom.row + atom.rows, c, c + 1});
+    else
+      bands.back().end_cell = c + 1;
+  }
+  return index;
+}
 CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
                             const AccumulatorProtection& protection, const std::vector<Atom>& atoms,
-                            size_t& inspected, size_t& class_tests, size_t& class_lookup_tests,
-                            bool core_frontiers) {
+                            const StorageIndex& index, size_t& inspected, size_t& class_tests,
+                            size_t& class_lookup_tests) {
   const auto scope_count = segment.reset_period ? segment.reset_period : segment.count;
   FiniteSyncInput model;
   model.exact_accesses = true;
   for (size_t c = 0; c < atoms.size(); ++c) model.covered_cells.push_back(c);
-  std::map<size_t, std::vector<size_t>> by_storage;
-  for (size_t c = 0; c < atoms.size(); ++c) by_storage[atoms[c].storage].push_back(c);
   for (const auto& site : segment.sites) {
     FiniteOccurrence occurrence{site.pipe, true, {}, {}};
     for (const auto& a : site.accesses) {
@@ -133,61 +171,72 @@ CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
       if (a.coordinate_frame)
         for (const auto& frame : segment.nested_frames)
           if (frame.loop == a.coordinate_frame) access_count = frame.count;
-      const auto& directory = by_storage.at(a.storage);
-      auto begin = directory.begin(), end = directory.end();
-      // Partition emits rows, then ordered disjoint column intervals. A single
-      // row band (in particular the shared Vec byte domain) permits indexed
-      // lookup without inspecting unrelated allocations. Keep full membership
-      // qualification below; moving intervals still use the general proof.
-      if (!directory.empty() && a.column_step == 0 &&
-          atoms[directory.front()].row == atoms[directory.back()].row) {
-        begin = std::lower_bound(begin, end, a.column, [&](size_t c, int64_t column) {
-          ++class_lookup_tests;
-          return atoms[c].column + atoms[c].columns <= column;
-        });
-        end = std::lower_bound(begin, end, a.column + a.columns, [&](size_t c, int64_t column) {
-          ++class_lookup_tests;
-          return atoms[c].column < column;
-        });
+      const auto& bands = index.at(a.storage);
+      // Query the full affine envelope, not just visit zero. Envelope lookup
+      // only filters candidates: the exact all-visits proof below still refuses
+      // changing membership. Wide arithmetic preserves admitted coordinates.
+      const auto last_visit = std::max<int64_t>(0, access_count - 1);
+      const __int128 row_end = __int128(a.row) + __int128(last_visit) * a.row_step + a.rows;
+      const __int128 column_end = __int128(a.column) + __int128(last_visit) * a.column_step + a.columns;
+      auto first_band = bands.begin();
+      // One band covers the whole row domain; the common Vec byte domain
+      // needs no row search.
+      if (bands.size() > 1) {
+        first_band =
+            std::lower_bound(bands.begin(), bands.end(), a.row, [&](const RowBand& band, int64_t row) {
+              ++class_lookup_tests;
+              return band.end <= row;
+            });
       }
-      for (auto entry = begin; entry != end; ++entry) {
-        const auto c = *entry;
-        ++class_tests;
-        const auto& atom = atoms[c];
-        if (atom.storage != a.storage) continue;
-        bool first = Intersects(a, atom, 0),
-             last = Intersects(a, atom, std::max<int64_t>(0, access_count - 1));
-        // Nonnegative affine coordinates yield a single interval of intersecting
-        // visits. Check the full interval, not just equal endpoint samples.
-        int64_t lo = 0, hi = std::max<int64_t>(0, access_count - 1);
-        auto intersect_axis = [&](int64_t x, int64_t extent, int64_t origin, int64_t stride, int64_t size) {
-          const __int128 lower = __int128(x) - size + 1 - origin;
-          const __int128 upper = __int128(x) + extent - 1 - origin;
-          if (!stride) {
-            if (lower > 0 || upper < 0) hi = -1;
-            return;
-          }
-          if (upper < 0) {
-            hi = -1;
-            return;
-          }
-          hi = static_cast<int64_t>(std::min<__int128>(hi, upper / stride));
-          if (lower > 0) {
-            const auto minimum = (lower + stride - 1) / stride;
-            if (minimum > hi)
+      for (auto band = first_band; band != bands.end() && band->first < row_end; ++band) {
+        auto begin = atoms.begin() + band->begin_cell, end = atoms.begin() + band->end_cell;
+        begin = std::lower_bound(begin, end, a.column, [&](const Atom& atom, int64_t column) {
+          ++class_lookup_tests;
+          return atom.column + atom.columns <= column;
+        });
+        end = std::lower_bound(begin, end, column_end, [&](const Atom& atom, __int128 column) {
+          ++class_lookup_tests;
+          return atom.column < column;
+        });
+        for (auto entry = begin; entry != end; ++entry) {
+          const auto c = static_cast<size_t>(entry - atoms.begin());
+          ++class_tests;
+          const auto& atom = atoms[c];
+          if (atom.storage != a.storage) continue;
+          bool first = Intersects(a, atom, 0),
+               last = Intersects(a, atom, std::max<int64_t>(0, access_count - 1));
+          // Nonnegative affine coordinates yield a single interval of intersecting
+          // visits. Check the full interval, not just equal endpoint samples.
+          int64_t lo = 0, hi = std::max<int64_t>(0, access_count - 1);
+          auto intersect_axis = [&](int64_t x, int64_t extent, int64_t origin, int64_t stride, int64_t size) {
+            const __int128 lower = __int128(x) - size + 1 - origin;
+            const __int128 upper = __int128(x) + extent - 1 - origin;
+            if (!stride) {
+              if (lower > 0 || upper < 0) hi = -1;
+              return;
+            }
+            if (upper < 0) {
               hi = -1;
-            else
-              lo = std::max(lo, static_cast<int64_t>(minimum));
-          }
-        };
-        intersect_axis(atom.row, atom.rows, a.row, a.row_step, a.rows);
-        intersect_axis(atom.column, atom.columns, a.column, a.column_step, a.columns);
-        const bool any = lo <= hi;
-        CHECK((first && last) || !any)
-            << "Storage membership varies across visits; selector partition unavailable";
-        if (!first) continue;
-        CHECK(!a.write || Contains(a, atom)) << "Write class is only partially covered";
-        (a.write ? occurrence.writes : occurrence.reads).push_back(c);
+              return;
+            }
+            hi = static_cast<int64_t>(std::min<__int128>(hi, upper / stride));
+            if (lower > 0) {
+              const auto minimum = (lower + stride - 1) / stride;
+              if (minimum > hi)
+                hi = -1;
+              else
+                lo = std::max(lo, static_cast<int64_t>(minimum));
+            }
+          };
+          intersect_axis(atom.row, atom.rows, a.row, a.row_step, a.rows);
+          intersect_axis(atom.column, atom.columns, a.column, a.column_step, a.columns);
+          const bool any = lo <= hi;
+          CHECK((first && last) || !any)
+              << "Storage membership varies across visits; selector partition unavailable";
+          if (!first) continue;
+          CHECK(!a.write || Contains(a, atom)) << "Write class is only partially covered";
+          (a.write ? occurrence.writes : occurrence.reads).push_back(c);
+        }
       }
     }
     model.occurrences.push_back(std::move(occurrence));
@@ -225,46 +274,11 @@ CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
     result.generators = families(witness.generators);
     result.demands = families(witness.demands);
   }
-  if (core_frontiers) {
-    result.core_frontiers = true;
-    result.quotient_edges = BuildPeriodicCoreFrontiers(result);
-    return result;
-  }
-  // Weighted periodic event graph. A path's weight is the visit displacement.
-  // Native wrap wires allow padding a path by any number of full visits at
-  // its source, hence a minimum weight answers every later compatible visit.
-  std::vector<std::vector<std::pair<size_t, int64_t>>> graph(2 * m);
-  std::array<std::vector<size_t>, kPipeCount> pipes;
-  for (size_t s = 0; s < m; ++s) {
-    graph[2 * s].emplace_back(2 * s + 1, 0);
-    pipes[result.pipes[s]].push_back(s);
-  }
-  for (const auto& pipe : pipes)
-    for (size_t i = 0; i < pipe.size(); ++i) {
-      auto a = pipe[i], b = pipe[(i + 1) % pipe.size()];
-      auto delta = i + 1 == pipe.size() ? 1 : 0;
-      graph[2 * a].emplace_back(2 * b, delta);
-      graph[2 * a + 1].emplace_back(2 * b + 1, delta);
-    }
-  for (auto f : result.generators) graph[2 * f.source + 1].emplace_back(2 * f.target, f.distance);
-  for (size_t source = 0; source < 2 * m; ++source) {
-    std::vector<int64_t> distances(2 * m, -1);
-    distances[source] = 0;
-    std::deque<size_t> queue{source};
-    while (!queue.empty()) {
-      auto a = queue.front();
-      queue.pop_front();
-      for (auto [b, w] : graph[a])
-        if (distances[b] < 0 || distances[b] > distances[a] + w) {
-          distances[b] = distances[a] + w;
-          if (w)
-            queue.push_back(b);
-          else
-            queue.push_front(b);
-        }
-    }
-    result.distance.push_back(std::move(distances));
-  }
+  // Invariant membership, native pipe order and nonnegative wrap generators
+  // establish the same periodic query contract for flat and nested leaves.
+  // Retain two rows per participating pipe, not one row per event.
+  result.core_frontiers = true;
+  result.quotient_edges = BuildPeriodicCoreFrontiers(result);
   return result;
 }
 }  // namespace
@@ -279,10 +293,6 @@ std::optional<__int128> CompactSegmentResult::Threshold(size_t source, bool sc, 
                                                         bool tc) const {
   CHECK(source < pipes.size() && target < pipes.size()) << "Invalid compact event type";
   if (!rotating && !core_frontiers) {
-    if (!distance.empty()) {
-      const auto value = distance[2 * source + sc][2 * target + tc];
-      return value < 0 ? std::nullopt : std::optional<int64_t>(value);
-    }
     return (source == target && sc == tc) || body.Precedes(source, sc, target, tc) ? std::optional<int64_t>(0)
                                                                                    : std::nullopt;
   }
@@ -331,13 +341,14 @@ CompactSyncResult AnalyzeInvariantSyncLeaves(CompactSyncInput input) {
   auto atoms = Partition(result.input);
   result.cells = atoms.size();
   result.storage_classes = atoms;
+  const auto index = IndexClasses(result.input, atoms);
   auto partitioned = Clock::now();
   result.partition_seconds = std::chrono::duration<double>(partitioned - begin).count();
   AccumulatorProtection protection(result.input);
   for (size_t r = 0; r < result.input.segments.size(); ++r)
-    result.segments.push_back(Reduce(result.input.segments[r], r, protection, atoms,
+    result.segments.push_back(Reduce(result.input.segments[r], r, protection, atoms, index,
                                      result.analyzed_occurrences, result.class_tests,
-                                     result.class_lookup_tests, result.input.region_tree.has_value()));
+                                     result.class_lookup_tests));
   if (result.input.region_tree)
     for (auto& segment : result.segments) segment.count = segment.internal_scope_count;
   auto reduced = Clock::now();
@@ -376,8 +387,6 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
   // concrete numerical fast path free of a redundant all-pairs port graph.
   if (result.segments.size() == 1) return result;
   AccumulatorProtection protection(result.input);
-  result.boundary_order_ = std::make_shared<SyncBoundaryGraph>(result.segments);
-  result.port_pair_tests = result.boundary_order_->pair_tests;
   std::vector<std::optional<Occurrence>> writers(atoms.size());
   std::vector<std::array<std::optional<Occurrence>, kPipeCount>> readers(atoms.size());
   std::set<Crossing> crossings;
@@ -407,6 +416,15 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
     }
   }
   result.crossing_generators.assign(crossings.begin(), crossings.end());
+  // Supply every generator endpoint before the immutable port index is built.
+  // Reduction must query the required graph, not an already reduced subset.
+  std::vector<Occurrence> ports;
+  for (const auto& crossing : crossings) {
+    ports.push_back(crossing.first);
+    ports.push_back(crossing.second);
+  }
+  result.boundary_order_ = std::make_shared<SyncBoundaryGraph>(result.segments, ports);
+  result.port_pair_tests = result.boundary_order_->pair_tests;
   for (const auto& e : crossings) result.boundary_order_->Add({e.first, true}, {e.second, false});
   for (const auto& e : crossings) {
     ++result.crossing_path_searches;
